@@ -699,29 +699,29 @@ describe("GraphDB MVCC Integration", () => {
     await closeGraphDB(db);
   });
 
-  test("transaction operations update version chains when concurrent", async () => {
+  test("transaction operations update version chains", async () => {
     const db = await openGraphDB(testDir, { mvcc: true });
 
-    // First transaction creates a node (no concurrent tx, so no version chain needed)
+    // First transaction creates a node - version chain always created in MVCC mode
     const tx1 = beginTx(db);
     const nodeId = createNode(tx1, { key: "test" });
     await commit(tx1);
     
-    // Without concurrent transactions, version chain is skipped for performance
+    // In MVCC mode, version chains are always created for proper snapshot isolation
     const mvcc = db._mvcc as MvccManager;
     const versionAfterSingle = mvcc.versionChain.getNodeVersion(nodeId);
-    expect(versionAfterSingle).toBeNull(); // Optimization: skipped for single tx
+    expect(versionAfterSingle).not.toBeNull(); // Version chain should exist
     
-    // But the node should still exist via delta fallback
+    // The node should exist
     expect(dbNodeExists(db, nodeId)).toBe(true);
     
-    // Now test with concurrent transactions - version chain should be created
+    // Test with concurrent transactions - version chain should also be created
     const tx2 = beginTx(db); // Start a reader transaction
     const tx3 = beginTx(db); // Start another transaction that will commit
     const nodeId2 = createNode(tx3, { key: "test2" });
     await commit(tx3); // Commit while tx2 is still active
     
-    // Version chain should exist because tx2 was active during commit
+    // Version chain should exist
     const versionAfterConcurrent = mvcc.versionChain.getNodeVersion(nodeId2);
     expect(versionAfterConcurrent).not.toBeNull();
     

@@ -409,7 +409,7 @@ export interface EdgeVersionData {
 
 export interface VersionChainStore {
   nodeVersions: Map<NodeID, VersionedRecord<NodeVersionData>>;
-  edgeVersions: Map<string, VersionedRecord<EdgeVersionData>>;
+  edgeVersions: Map<bigint, VersionedRecord<EdgeVersionData>>; // key: numeric composite (src << 40 | etype << 20 | dst)
   nodePropVersions: Map<string, VersionedRecord<PropValue | null>>; // key: "nodeId:propKeyId"
   edgePropVersions: Map<string, VersionedRecord<PropValue | null>>; // key: "src:etype:dst:propKeyId"
 }

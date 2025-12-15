@@ -111,105 +111,99 @@ export async function commit(handle: TxHandle): Promise<void> {
   if (mvcc) {
     mvcc.conflictDetector.validateCommit(tx.txid);
     
-    // Check if version chains are needed BEFORE committing
-    // If no other active transactions exist, we can skip version chain creation
-    // because there are no concurrent readers who need historical versions
-    const needsVersionChains = mvcc.txManager.hasOtherActiveTransactions(tx.txid);
-    
     // Commit in MVCC manager (assigns commit timestamp)
     // Note: writes are already recorded during transaction operations (createNode, etc.)
     const commitTs = mvcc.txManager.commitTx(tx.txid);
     
-    // Only create version chains if there are concurrent transactions that might need them
-    // This is the most common fast path - single transaction commits without overhead
-    if (needsVersionChains) {
-      const vc = mvcc.versionChain;
-      
-      // Node creations
-      if (tx.pendingCreatedNodes.size > 0) {
-        for (const [nodeId, nodeDelta] of tx.pendingCreatedNodes) {
-          vc.appendNodeVersion(
-            nodeId,
-            { nodeId, delta: nodeDelta },
+    // Always create version chains in MVCC mode
+    // This ensures proper snapshot isolation - transactions can read consistent
+    // snapshots even when concurrent transactions commit changes
+    const vc = mvcc.versionChain;
+    
+    // Node creations
+    if (tx.pendingCreatedNodes.size > 0) {
+      for (const [nodeId, nodeDelta] of tx.pendingCreatedNodes) {
+        vc.appendNodeVersion(
+          nodeId,
+          { nodeId, delta: nodeDelta },
+          tx.txid,
+          commitTs,
+        );
+      }
+    }
+    
+    // Node deletions
+    if (tx.pendingDeletedNodes.size > 0) {
+      for (const nodeId of tx.pendingDeletedNodes) {
+        vc.deleteNodeVersion(nodeId, tx.txid, commitTs);
+      }
+    }
+    
+    // Edge additions
+    if (tx.pendingOutAdd.size > 0) {
+      for (const [src, patches] of tx.pendingOutAdd) {
+        for (const patch of patches) {
+          vc.appendEdgeVersion(
+            src,
+            patch.etype,
+            patch.other,
+            true,
             tx.txid,
             commitTs,
           );
         }
       }
-      
-      // Node deletions
-      if (tx.pendingDeletedNodes.size > 0) {
-        for (const nodeId of tx.pendingDeletedNodes) {
-          vc.deleteNodeVersion(nodeId, tx.txid, commitTs);
+    }
+    
+    // Edge deletions
+    if (tx.pendingOutDel.size > 0) {
+      for (const [src, patches] of tx.pendingOutDel) {
+        for (const patch of patches) {
+          vc.appendEdgeVersion(
+            src,
+            patch.etype,
+            patch.other,
+            false,
+            tx.txid,
+            commitTs,
+          );
         }
       }
-      
-      // Edge additions
-      if (tx.pendingOutAdd.size > 0) {
-        for (const [src, patches] of tx.pendingOutAdd) {
-          for (const patch of patches) {
-            vc.appendEdgeVersion(
-              src,
-              patch.etype,
-              patch.other,
-              true,
-              tx.txid,
-              commitTs,
-            );
-          }
+    }
+    
+    // Node property changes
+    if (tx.pendingNodeProps.size > 0) {
+      for (const [nodeId, props] of tx.pendingNodeProps) {
+        for (const [keyId, value] of props) {
+          vc.appendNodePropVersion(
+            nodeId,
+            keyId,
+            value,
+            tx.txid,
+            commitTs,
+          );
         }
       }
-      
-      // Edge deletions
-      if (tx.pendingOutDel.size > 0) {
-        for (const [src, patches] of tx.pendingOutDel) {
-          for (const patch of patches) {
-            vc.appendEdgeVersion(
-              src,
-              patch.etype,
-              patch.other,
-              false,
-              tx.txid,
-              commitTs,
-            );
-          }
-        }
-      }
-      
-      // Node property changes
-      if (tx.pendingNodeProps.size > 0) {
-        for (const [nodeId, props] of tx.pendingNodeProps) {
-          for (const [keyId, value] of props) {
-            vc.appendNodePropVersion(
-              nodeId,
-              keyId,
-              value,
-              tx.txid,
-              commitTs,
-            );
-          }
-        }
-      }
-      
-      // Edge property changes
-      if (tx.pendingEdgeProps.size > 0) {
-        for (const [edgeKey, props] of tx.pendingEdgeProps) {
-          const [srcStr, etypeStr, dstStr] = edgeKey.split(":");
-          const src = BigInt(srcStr!);
-          const etype = Number.parseInt(etypeStr!, 10);
-          const dst = BigInt(dstStr!);
-          
-          for (const [keyId, value] of props) {
-            vc.appendEdgePropVersion(
-              src,
-              etype,
-              dst,
-              keyId,
-              value,
-              tx.txid,
-              commitTs,
-            );
-          }
+    }
+    
+    // Edge property changes
+    if (tx.pendingEdgeProps.size > 0) {
+      for (const [edgeKey, props] of tx.pendingEdgeProps) {
+        const [srcStr, etypeStr, dstStr] = edgeKey.split(":");
+        const src = BigInt(srcStr!);
+        const etype = Number.parseInt(etypeStr!, 10);
+        const dst = BigInt(dstStr!);
+        
+        for (const [keyId, value] of props) {
+          vc.appendEdgePropVersion(
+            src,
+            etype,
+            dst,
+            keyId,
+            value,
+            tx.txid,
+            commitTs,
+          );
         }
       }
     }

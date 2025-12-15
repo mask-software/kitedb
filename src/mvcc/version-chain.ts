@@ -28,6 +28,15 @@ export class VersionChainManager {
   }
 
   /**
+   * Compute numeric composite key for edge lookups
+   * Uses bit packing: src (20 bits) | etype (20 bits) | dst (20 bits)
+   * Supports NodeID/ETypeID up to ~1M values each
+   */
+  private edgeKey(src: NodeID, etype: ETypeID, dst: NodeID): bigint {
+    return (BigInt(src) << 40n) | (BigInt(etype) << 20n) | BigInt(dst);
+  }
+
+  /**
    * Append a new version to a node's version chain
    */
   appendNodeVersion(
@@ -77,7 +86,7 @@ export class VersionChainManager {
     txid: bigint,
     commitTs: bigint,
   ): void {
-    const key = `${src}:${etype}:${dst}`;
+    const key = this.edgeKey(src, etype, dst);
     const existing = this.store.edgeVersions.get(key);
     const newVersion: VersionedRecord<EdgeVersionData> = {
       data: { src, etype, dst, added },
@@ -150,7 +159,7 @@ export class VersionChainManager {
     etype: ETypeID,
     dst: NodeID,
   ): VersionedRecord<EdgeVersionData> | null {
-    const key = `${src}:${etype}:${dst}`;
+    const key = this.edgeKey(src, etype, dst);
     return this.store.edgeVersions.get(key) || null;
   }
 
@@ -278,6 +287,14 @@ export class VersionChainManager {
     }
     
     return prunedCount;
+  }
+
+  /**
+   * Check if any edge versions exist (for fast-path optimization)
+   * O(1) check to skip version chain lookups when no edges have been versioned
+   */
+  hasAnyEdgeVersions(): boolean {
+    return this.store.edgeVersions.size > 0;
   }
 
   /**
