@@ -347,6 +347,7 @@ export async function openGraphDB(
     _lockFd: lockFd,
     _cache: cache,
     _mvcc: mvcc,
+    _mvccEnabled: mvcc !== null,
   };
 }
 

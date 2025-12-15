@@ -484,6 +484,7 @@ export interface GraphDB {
   _lockFd: unknown; // LockHandle from util/lock.ts or null
   _cache?: unknown; // CacheManager instance (opaque to users)
   _mvcc?: unknown; // MVCC manager instance (opaque to users)
+  _mvccEnabled?: boolean; // Cached MVCC enabled flag for fast checks
 }
 
 export interface TxHandle {

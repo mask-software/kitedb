@@ -55,35 +55,20 @@ export function getVisibleVersion<T>(
   }
 
   let current: VersionedRecord<T> | null = head;
-  let visible: VersionedRecord<T> | null = null;
 
   // Walk the chain from newest to oldest
   while (current) {
     if (isVisible(current, txSnapshotTs, txid)) {
-      // Found a visible version
-      visible = current;
-      
-      // If it's our own write, we can stop (own writes are always newest for us)
-      if (current.txid === txid) {
-        break;
-      }
-      
-      // If it's deleted and not our own deletion, we need to check older versions
-      // to see if the item existed before
-      if (current.deleted && current.txid !== txid) {
-        current = current.prev;
-        continue;
-      }
-      
-      // Found a non-deleted visible version, this is what we want
-      break;
+      // Found a visible version - return it immediately
+      // (whether deleted or not, this is the authoritative version for this snapshot)
+      return current;
     }
     
     // This version is not visible, check older versions
     current = current.prev;
   }
 
-  return visible;
+  return null;
 }
 
 /**
@@ -99,29 +84,19 @@ export function nodeExists(
     return false;
   }
   
-  // If it's our own deletion, it doesn't exist
-  if (visible.deleted && visible.txid === txid) {
-    return false;
-  }
-  
-  // If it's deleted by another transaction, check if it existed before
-  if (visible.deleted) {
-    // Walk back to find a non-deleted version
-    let current = visible.prev;
-    while (current) {
-      if (isVisible(current, txSnapshotTs, txid) && !current.deleted) {
-        return true;
-      }
-      current = current.prev;
-    }
-    return false;
-  }
-  
-  return true;
+  // Node exists if the visible version is not deleted
+  return !visible.deleted;
 }
 
 /**
  * Check if an edge exists (is visible and was added, not deleted)
+ * 
+ * For edges, the `added` field directly indicates the edge state:
+ * - added=true means the edge exists
+ * - added=false means the edge was deleted
+ * 
+ * Unlike nodes which use tombstone markers, edges encode their existence
+ * state directly in the `added` field, so we simply return that value.
  */
 export function edgeExists(
   version: VersionedRecord<any> | null,
@@ -133,51 +108,9 @@ export function edgeExists(
     return false;
   }
   
-  // For edges, check the 'added' flag in the data
+  // For edges, the 'added' flag directly indicates existence
   if (visible.data && typeof visible.data === 'object' && 'added' in visible.data) {
-    const edgeData = visible.data as { added: boolean };
-    
-    // If it's our own write, use the current state
-    if (visible.txid === txid) {
-      return edgeData.added;
-    }
-    
-    // For other transactions, check if it was added
-    if (edgeData.added) {
-      // Check if there's a newer deletion
-      if (visible.deleted) {
-        // Walk back to see if it was added before
-        let current = visible.prev;
-        while (current) {
-          if (isVisible(current, txSnapshotTs, txid)) {
-            if (current.deleted) {
-              return false;
-            }
-            if (current.data && typeof current.data === 'object' && 'added' in current.data) {
-              return (current.data as { added: boolean }).added;
-            }
-          }
-          current = current.prev;
-        }
-        return false;
-      }
-      return true;
-    }
-    
-    // Was deleted, check if it existed before
-    let current = visible.prev;
-    while (current) {
-      if (isVisible(current, txSnapshotTs, txid)) {
-        if (current.deleted) {
-          return false;
-        }
-        if (current.data && typeof current.data === 'object' && 'added' in current.data) {
-          return (current.data as { added: boolean }).added;
-        }
-      }
-      current = current.prev;
-    }
-    return false;
+    return (visible.data as { added: boolean }).added;
   }
   
   return false;

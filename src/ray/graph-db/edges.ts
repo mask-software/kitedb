@@ -41,6 +41,12 @@ export function addEdge(
   }
   inPatches.push({ etype, other: src });
 
+  // Record write for MVCC conflict detection
+  const mvcc = getMvccManager(db);
+  if (mvcc) {
+    mvcc.txManager.recordWrite(tx.txid, `edge:${src}:${etype}:${dst}`);
+  }
+
   // Write-through cache invalidation (immediate)
   const cache = getCache(db);
   if (cache) {
@@ -82,6 +88,12 @@ export function deleteEdge(
           if (inIdx >= 0) inPatches.splice(inIdx, 1);
         }
 
+        // Record write for MVCC conflict detection
+        const mvcc = getMvccManager(db);
+        if (mvcc) {
+          mvcc.txManager.recordWrite(tx.txid, `edge:${src}:${etype}:${dst}`);
+        }
+
         // Write-through cache invalidation
         const cache = getCache(db);
         if (cache) {
@@ -110,6 +122,12 @@ export function deleteEdge(
     tx.pendingInDel.set(dst, inPatches);
   }
   inPatches.push({ etype, other: src });
+
+  // Record write for MVCC conflict detection
+  const mvcc = getMvccManager(db);
+  if (mvcc) {
+    mvcc.txManager.recordWrite(tx.txid, `edge:${src}:${etype}:${dst}`);
+  }
 
   // Write-through cache invalidation (immediate)
   const cache = getCache(db);
@@ -205,27 +223,34 @@ export function edgeExists(
   etype: ETypeID,
   dst: NodeID,
 ): boolean {
-  const mvcc = getMvccManager(db);
-  
   // MVCC mode: use version chains for visibility
-  if (mvcc && isMvccEnabled(db)) {
-    // Get current transaction snapshot
-    let txSnapshotTs = mvcc.txManager.getNextCommitTs();
-    let txid = 0n;
-    
-    if (db._currentTx) {
-      const mvccTx = mvcc.txManager.getTx(db._currentTx.txid);
-      if (mvccTx) {
-        txSnapshotTs = mvccTx.startTs;
-        txid = mvccTx.txid;
-        // Track read for conflict detection
-        mvcc.txManager.recordRead(txid, `edge:${src}:${etype}:${dst}`);
-      }
+  if (db._mvccEnabled) {
+    // Fast path: if not in a transaction, just check current state
+    // (no need for snapshot isolation or read tracking)
+    if (!db._currentTx) {
+      // Check delta first for recent changes
+      const deltaResult = hasEdgeMerged(db._snapshot, db._delta, src, etype, dst);
+      return deltaResult;
     }
+    
+    const mvcc = getMvccManager(db);
+    if (!mvcc) return hasEdgeMerged(db._snapshot, db._delta, src, etype, dst);
+    
+    // In-transaction path: need full MVCC visibility
+    const mvccTx = mvcc.txManager.getTx(db._currentTx.txid);
+    if (!mvccTx) {
+      return hasEdgeMerged(db._snapshot, db._delta, src, etype, dst);
+    }
+    
+    const txSnapshotTs = mvccTx.startTs;
+    const txid = mvccTx.txid;
+    
+    // Track read for conflict detection
+    mvcc.txManager.recordRead(txid, `edge:${src}:${etype}:${dst}`);
     
     // Check version chain
     const edgeVersion = mvcc.versionChain.getEdgeVersion(src, etype, dst);
-    if (mvccEdgeExists(edgeVersion, txSnapshotTs, txid)) {
+    if (edgeVersion && mvccEdgeExists(edgeVersion, txSnapshotTs, txid)) {
       return true;
     }
     
@@ -258,6 +283,12 @@ export function setEdgeProp(
   }
   props.set(keyId, value);
 
+  // Record write for MVCC conflict detection
+  const mvcc = getMvccManager(db);
+  if (mvcc && isMvccEnabled(db)) {
+    mvcc.txManager.recordWrite(tx.txid, `edgeprop:${edgeKey}:${keyId}`);
+  }
+
   // Write-through cache invalidation (immediate)
   const cache = getCache(db);
   if (cache) {
@@ -285,6 +316,12 @@ export function delEdgeProp(
   }
   props.set(keyId, null);
 
+  // Record write for MVCC conflict detection
+  const mvcc = getMvccManager(db);
+  if (mvcc && isMvccEnabled(db)) {
+    mvcc.txManager.recordWrite(tx.txid, `edgeprop:${edgeKey}:${keyId}`);
+  }
+
   // Write-through cache invalidation (immediate)
   const cache = getCache(db);
   if (cache) {
@@ -303,87 +340,89 @@ export function getEdgeProp(
   dst: NodeID,
   keyId: PropKeyID,
 ): PropValue | null {
-  const mvcc = getMvccManager(db);
   const cache = getCache(db);
   
   // MVCC mode: use version chains for visibility
-  if (mvcc && isMvccEnabled(db)) {
-    // Get current transaction snapshot
-    let txSnapshotTs = mvcc.txManager.getNextCommitTs();
-    let txid = 0n;
-    
-    if (db._currentTx) {
-      const mvccTx = mvcc.txManager.getTx(db._currentTx.txid);
-      if (mvccTx) {
-        txSnapshotTs = mvccTx.startTs;
-        txid = mvccTx.txid;
-        // Track read for conflict detection
-        mvcc.txManager.recordRead(txid, `edgeprop:${src}:${etype}:${dst}:${keyId}`);
+  if (db._mvccEnabled) {
+    const mvcc = getMvccManager(db);
+    if (mvcc) {
+      // Get current transaction snapshot
+      let txSnapshotTs = mvcc.txManager.getNextCommitTs();
+      let txid = 0n;
+      
+      if (db._currentTx) {
+        const mvccTx = mvcc.txManager.getTx(db._currentTx.txid);
+        if (mvccTx) {
+          txSnapshotTs = mvccTx.startTs;
+          txid = mvccTx.txid;
+          // Track read for conflict detection
+          mvcc.txManager.recordRead(txid, `edgeprop:${src}:${etype}:${dst}:${keyId}`);
+        }
       }
-    }
-    
-    // Check cache first
-    if (cache) {
-      const cached = cache.getEdgeProp(src, etype, dst, keyId);
-      if (cached !== undefined) {
-        return cached;
-      }
-    }
-    
-    // Get visible version from version chain
-    const propVersion = mvcc.versionChain.getEdgePropVersion(src, etype, dst, keyId);
-    const visibleVersion = getVisibleVersion(propVersion, txSnapshotTs, txid);
-    
-    if (visibleVersion) {
-      const value = visibleVersion.data;
+      
+      // Check cache first
       if (cache) {
-        cache.setEdgeProp(src, etype, dst, keyId, value);
+        const cached = cache.getEdgeProp(src, etype, dst, keyId);
+        if (cached !== undefined) {
+          return cached;
+        }
       }
-      return value;
-    }
-    
-    // Fall back to snapshot/delta check
-    // Check if endpoints are deleted
-    if (isNodeDeleted(db._delta, src) || isNodeDeleted(db._delta, dst)) {
+      
+      // Get visible version from version chain
+      const propVersion = mvcc.versionChain.getEdgePropVersion(src, etype, dst, keyId);
+      const visibleVersion = getVisibleVersion(propVersion, txSnapshotTs, txid);
+      
+      if (visibleVersion) {
+        const value = visibleVersion.data;
+        if (cache) {
+          cache.setEdgeProp(src, etype, dst, keyId, value);
+        }
+        return value;
+      }
+      
+      // Fall back to snapshot/delta check
+      // Check if endpoints are deleted
+      if (isNodeDeleted(db._delta, src) || isNodeDeleted(db._delta, dst)) {
+        if (cache) {
+          cache.setEdgeProp(src, etype, dst, keyId, null);
+        }
+        return null;
+      }
+
+      // Check delta first
+      const key = edgePropKey(src, etype, dst);
+      const deltaProps = db._delta.edgeProps.get(key);
+      if (deltaProps) {
+        const deltaValue = deltaProps.get(keyId);
+        if (deltaValue !== undefined) {
+          if (cache) {
+            cache.setEdgeProp(src, etype, dst, keyId, deltaValue);
+          }
+          return deltaValue;
+        }
+      }
+
+      // Fall back to snapshot
+      if (db._snapshot) {
+        const srcPhys = getPhysNode(db._snapshot, src);
+        const dstPhys = getPhysNode(db._snapshot, dst);
+        if (srcPhys >= 0 && dstPhys >= 0) {
+          const edgeIdx = findEdgeIndex(db._snapshot, srcPhys, etype, dstPhys);
+          if (edgeIdx >= 0) {
+            const value = snapshotGetEdgeProp(db._snapshot, edgeIdx, keyId);
+            if (cache) {
+              cache.setEdgeProp(src, etype, dst, keyId, value);
+            }
+            return value;
+          }
+        }
+      }
+
       if (cache) {
         cache.setEdgeProp(src, etype, dst, keyId, null);
       }
       return null;
     }
-
-    // Check delta first
-    const key = edgePropKey(src, etype, dst);
-    const deltaProps = db._delta.edgeProps.get(key);
-    if (deltaProps) {
-      const deltaValue = deltaProps.get(keyId);
-      if (deltaValue !== undefined) {
-        if (cache) {
-          cache.setEdgeProp(src, etype, dst, keyId, deltaValue);
-        }
-        return deltaValue;
-      }
-    }
-
-    // Fall back to snapshot
-    if (db._snapshot) {
-      const srcPhys = getPhysNode(db._snapshot, src);
-      const dstPhys = getPhysNode(db._snapshot, dst);
-      if (srcPhys >= 0 && dstPhys >= 0) {
-        const edgeIdx = findEdgeIndex(db._snapshot, srcPhys, etype, dstPhys);
-        if (edgeIdx >= 0) {
-          const value = snapshotGetEdgeProp(db._snapshot, edgeIdx, keyId);
-          if (cache) {
-            cache.setEdgeProp(src, etype, dst, keyId, value);
-          }
-          return value;
-        }
-      }
-    }
-
-    if (cache) {
-      cache.setEdgeProp(src, etype, dst, keyId, null);
-    }
-    return null;
   }
   
   // Non-MVCC mode: original logic

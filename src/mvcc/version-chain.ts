@@ -187,49 +187,46 @@ export class VersionChainManager {
 
     // Prune node versions
     for (const [nodeId, version] of this.store.nodeVersions.entries()) {
-      const prunedChain = this.pruneChain(version, horizonTs);
-      if (prunedChain === null) {
+      const prunedCount = this.pruneChain(version, horizonTs);
+      if (prunedCount === -1) {
+        // Entire chain was pruned
         this.store.nodeVersions.delete(nodeId);
         pruned++;
-      } else if (prunedChain !== version) {
-        this.store.nodeVersions.set(nodeId, prunedChain);
-        pruned++;
+      } else {
+        pruned += prunedCount;
       }
     }
 
     // Prune edge versions
     for (const [key, version] of this.store.edgeVersions.entries()) {
-      const prunedChain = this.pruneChain(version, horizonTs);
-      if (prunedChain === null) {
+      const prunedCount = this.pruneChain(version, horizonTs);
+      if (prunedCount === -1) {
         this.store.edgeVersions.delete(key);
         pruned++;
-      } else if (prunedChain !== version) {
-        this.store.edgeVersions.set(key, prunedChain);
-        pruned++;
+      } else {
+        pruned += prunedCount;
       }
     }
 
     // Prune node property versions
     for (const [key, version] of this.store.nodePropVersions.entries()) {
-      const prunedChain = this.pruneChain(version, horizonTs);
-      if (prunedChain === null) {
+      const prunedCount = this.pruneChain(version, horizonTs);
+      if (prunedCount === -1) {
         this.store.nodePropVersions.delete(key);
         pruned++;
-      } else if (prunedChain !== version) {
-        this.store.nodePropVersions.set(key, prunedChain);
-        pruned++;
+      } else {
+        pruned += prunedCount;
       }
     }
 
     // Prune edge property versions
     for (const [key, version] of this.store.edgePropVersions.entries()) {
-      const prunedChain = this.pruneChain(version, horizonTs);
-      if (prunedChain === null) {
+      const prunedCount = this.pruneChain(version, horizonTs);
+      if (prunedCount === -1) {
         this.store.edgePropVersions.delete(key);
         pruned++;
-      } else if (prunedChain !== version) {
-        this.store.edgePropVersions.set(key, prunedChain);
-        pruned++;
+      } else {
+        pruned += prunedCount;
       }
     }
 
@@ -238,38 +235,49 @@ export class VersionChainManager {
 
   /**
    * Prune a version chain, removing versions older than horizonTs
-   * that have newer committed successors
+   * Returns: -1 if entire chain should be deleted, otherwise count of pruned versions
    */
   private pruneChain<T>(
     version: VersionedRecord<T>,
     horizonTs: bigint,
-  ): VersionedRecord<T> | null {
-    // Walk the chain to find the newest version older than horizon
+  ): number {
+    // Find the first version we need to keep (newest version < horizonTs)
+    // and count versions to prune
     let current: VersionedRecord<T> | null = version;
-    let newestOld: VersionedRecord<T> | null = null;
+    let keepPoint: VersionedRecord<T> | null = null;
+    let prunedCount = 0;
 
+    // Walk to find the boundary
     while (current) {
       if (current.commitTs < horizonTs) {
-        if (!newestOld || current.commitTs > newestOld.commitTs) {
-          newestOld = current;
+        // This is an old version
+        if (!keepPoint) {
+          // Keep the newest old version as the boundary
+          keepPoint = current;
+        } else {
+          // This is older than keepPoint, will be pruned
+          prunedCount++;
         }
       }
       current = current.prev;
     }
 
-    // If no old version found, keep the entire chain
-    if (!newestOld) {
-      return version;
+    // If no old version found, nothing to prune
+    if (!keepPoint) {
+      return 0;
     }
 
-    // If newestOld is the head, we can remove everything
-    if (newestOld === version) {
-      return null;
+    // If keepPoint is the head and all versions are old, delete entire chain
+    if (keepPoint === version && version.commitTs < horizonTs) {
+      return -1;
     }
 
-    // Otherwise, truncate the chain at newestOld
-    newestOld.prev = null;
-    return version;
+    // Truncate the chain at keepPoint (remove versions older than keepPoint)
+    if (keepPoint.prev !== null) {
+      keepPoint.prev = null;
+    }
+    
+    return prunedCount;
   }
 
   /**

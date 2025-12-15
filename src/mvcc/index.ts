@@ -69,8 +69,14 @@ export function getMvccManager(db: GraphDB): MvccManager | null {
 
 /**
  * Check if MVCC is enabled for a database
+ * Uses cached flag for fast checks
  */
 export function isMvccEnabled(db: GraphDB): boolean {
+  // Use cached flag if available (set at open time)
+  if (db._mvccEnabled !== undefined) {
+    return db._mvccEnabled;
+  }
+  // Fallback for backwards compatibility
   return db._mvcc !== undefined && db._mvcc !== null;
 }
 
