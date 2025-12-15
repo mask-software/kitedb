@@ -80,6 +80,10 @@ export class GarbageCollector {
       // Prune old versions
       const pruned = this.versionChain.pruneOldVersions(horizonTs);
 
+      // Clean up old committed transactions
+      // This ensures activeTxs doesn't grow unboundedly in concurrent workloads
+      this.cleanupOldTransactions(horizonTs);
+
       // Update stats
       this.stats.versionsPruned += BigInt(pruned);
       this.stats.gcRuns++;
@@ -87,6 +91,26 @@ export class GarbageCollector {
     } catch (error) {
       // Log error but don't crash
       console.error("GC error:", error);
+    }
+  }
+
+  /**
+   * Clean up committed transactions that are older than the horizon
+   * These transactions are no longer needed for visibility calculations
+   */
+  private cleanupOldTransactions(horizonTs: bigint): void {
+    const txsToRemove: bigint[] = [];
+    
+    for (const [txid, tx] of this.txManager.getAllTxs()) {
+      // Only remove committed transactions older than horizon
+      if (tx.status === 'committed' && tx.commitTs !== null && tx.commitTs < horizonTs) {
+        txsToRemove.push(txid);
+      }
+    }
+    
+    // Remove in a separate loop to avoid iterator invalidation
+    for (const txid of txsToRemove) {
+      this.txManager.removeTx(txid);
     }
   }
 
