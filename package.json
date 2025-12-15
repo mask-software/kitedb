@@ -1,6 +1,6 @@
 {
   "name": "@ray-db/ray",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "High-performance embedded graph database for Bun/TypeScript",
   "module": "src/index.ts",
   "main": "src/index.ts",
