@@ -6,17 +6,14 @@
 
 import type { MvccTransaction } from "../types.ts";
 
-interface CommittedWrite {
-  txid: bigint;
-  commitTs: bigint;
-}
-
 export class TxManager {
   private activeTxs: Map<bigint, MvccTransaction> = new Map();
   private nextTxId: bigint;
   private nextCommitTs: bigint;
-  // Inverted index: key -> array of transactions that wrote it (recent writes only)
-  private committedWrites: Map<string, CommittedWrite[]> = new Map();
+  // Inverted index: key -> max commitTs for conflict detection
+  private committedWrites: Map<string, bigint> = new Map();
+  // O(1) tracking of active transaction count
+  private activeCount: number = 0;
 
   constructor(initialTxId: bigint = 1n, initialCommitTs: bigint = 1n) {
     this.nextTxId = initialTxId;
@@ -59,6 +56,7 @@ export class TxManager {
     };
 
     this.activeTxs.set(txid, tx);
+    this.activeCount++;
     return { txid, startTs };
   }
 
@@ -110,29 +108,39 @@ export class TxManager {
       throw new Error(`Transaction ${txid} is not active (status: ${tx.status})`);
     }
 
+    this.activeCount--;
     const commitTs = this.nextCommitTs++;
     tx.commitTs = commitTs;
     tx.status = 'committed';
 
     // Index writes for fast conflict detection
-    // Pre-create the write record once to avoid repeated object creation
-    const writeRecord: CommittedWrite = { txid, commitTs };
+    // Store only the max commitTs per key (simpler and faster than array)
     const writeSet = tx.writeSet;
     const committedWrites = this.committedWrites;
     
     for (const key of writeSet) {
-      let writes = committedWrites.get(key);
-      if (!writes) {
-        // For single write, use single-element array directly
-        committedWrites.set(key, [writeRecord]);
-      } else {
-        writes.push(writeRecord);
+      const existing = committedWrites.get(key);
+      if (existing === undefined || commitTs > existing) {
+        committedWrites.set(key, commitTs);
       }
     }
 
-    // Keep transaction in map for GC visibility calculation
-    // Will be removed when GC determines it's safe
+    // Eager cleanup: if no other active transactions, clean up immediately
+    // This prevents unbounded growth of activeTxs in serial workloads
+    if (this.activeCount === 0) {
+      this.cleanupCommittedTx(txid, tx);
+    }
+
     return commitTs;
+  }
+
+  /**
+   * Clean up a committed transaction immediately (eager cleanup path)
+   */
+  private cleanupCommittedTx(txid: bigint, tx: MvccTransaction): void {
+    // Clear the write set since we stored max commitTs, not per-tx writes
+    // No need to clean committedWrites since it only stores max timestamp
+    this.activeTxs.delete(txid);
   }
 
   /**
@@ -144,6 +152,9 @@ export class TxManager {
       return; // Already removed or never existed
     }
 
+    if (tx.status === 'active') {
+      this.activeCount--;
+    }
     tx.status = 'aborted';
     tx.commitTs = null;
     // Remove immediately on abort
@@ -156,21 +167,10 @@ export class TxManager {
   removeTx(txid: bigint): void {
     const tx = this.activeTxs.get(txid);
     if (tx) {
-      // Clean up committed writes index
-      for (const key of tx.writeSet) {
-        const writes = this.committedWrites.get(key);
-        if (writes) {
-          // Remove this transaction's entry
-          const index = writes.findIndex(w => w.txid === txid);
-          if (index >= 0) {
-            writes.splice(index, 1);
-          }
-          // Remove empty arrays to save memory
-          if (writes.length === 0) {
-            this.committedWrites.delete(key);
-          }
-        }
+      if (tx.status === 'active') {
+        this.activeCount--;
       }
+      // No need to clean committedWrites since it only stores max timestamp
     }
     this.activeTxs.delete(txid);
   }
@@ -185,27 +185,20 @@ export class TxManager {
   }
 
   /**
-   * Get transaction count
+   * Get transaction count (O(1) using tracked counter)
    */
   getActiveCount(): number {
-    let count = 0;
-    for (const tx of this.activeTxs.values()) {
-      if (tx.status === 'active') count++;
-    }
-    return count;
+    return this.activeCount;
   }
 
   /**
    * Check if there are other active transactions besides the given one
    * Fast path for determining if version chains are needed
+   * O(1) using tracked counter
    */
   hasOtherActiveTransactions(excludeTxid: bigint): boolean {
-    for (const tx of this.activeTxs.values()) {
-      if (tx.status === 'active' && tx.txid !== excludeTxid) {
-        return true;
-      }
-    }
-    return false;
+    // Fast path: if only 0 or 1 active, no need to iterate
+    return this.activeCount > 1;
   }
 
   /**
@@ -225,34 +218,24 @@ export class TxManager {
 
   /**
    * Get committed writes for a key (for conflict detection)
-   * Returns array of transactions that wrote this key with commitTs >= minCommitTs
+   * Returns the max commitTs for the key if >= minCommitTs, otherwise null
    */
-  getCommittedWrites(key: string, minCommitTs: bigint): CommittedWrite[] {
-    const writes = this.committedWrites.get(key);
-    if (!writes) {
-      return [];
+  getCommittedWriteTs(key: string, minCommitTs: bigint): bigint | null {
+    const maxTs = this.committedWrites.get(key);
+    if (maxTs === undefined || maxTs < minCommitTs) {
+      return null;
     }
-    // Filter to only concurrent writes (commitTs >= minCommitTs)
-    return writes.filter(w => w.commitTs >= minCommitTs);
+    return maxTs;
   }
 
   /**
    * Check if there's a conflicting write for a key (fast path for conflict detection)
-   * Returns true if any transaction (other than currentTxid) wrote this key with commitTs >= minCommitTs
+   * Returns true if any transaction wrote this key with commitTs >= minCommitTs
+   * Note: currentTxid is no longer needed since we track max timestamp, not per-tx writes
    */
-  hasConflictingWrite(key: string, minCommitTs: bigint, currentTxid: bigint): boolean {
-    const writes = this.committedWrites.get(key);
-    if (!writes) {
-      return false;
-    }
-    // Check for any concurrent write (without allocating arrays)
-    for (let i = 0; i < writes.length; i++) {
-      const w = writes[i]!;
-      if (w.commitTs >= minCommitTs && w.txid !== currentTxid) {
-        return true;
-      }
-    }
-    return false;
+  hasConflictingWrite(key: string, minCommitTs: bigint, _currentTxid?: bigint): boolean {
+    const maxTs = this.committedWrites.get(key);
+    return maxTs !== undefined && maxTs >= minCommitTs;
   }
 
   /**
@@ -261,6 +244,7 @@ export class TxManager {
   clear(): void {
     this.activeTxs.clear();
     this.committedWrites.clear();
+    this.activeCount = 0;
   }
 }
 
