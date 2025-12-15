@@ -29,7 +29,16 @@
     "access": "public"
   },
   "scripts": {
-    "test": "bun test",
+    "test": "bun test --ignore '**/stress/**'",
+    "test:all": "bun test",
+    "test:stress": "bun test tests/stress --timeout 300000",
+    "test:stress:quick": "STRESS_QUICK=1 bun test tests/stress --timeout 60000",
+    "test:stress:concurrency": "bun test tests/stress/concurrency.stress.test.ts --timeout 300000",
+    "test:stress:isolation": "bun test tests/stress/isolation.stress.test.ts --timeout 300000",
+    "test:stress:durability": "bun test tests/stress/durability.stress.test.ts --timeout 300000",
+    "test:stress:vchain": "bun test tests/stress/version-chain.stress.test.ts --timeout 300000",
+    "test:stress:edge": "bun test tests/stress/edge-cases.stress.test.ts --timeout 300000",
+    "bench:mvcc:v2": "bun run bench/benchmark-mvcc-v2.ts",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
