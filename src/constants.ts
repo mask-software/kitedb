@@ -60,30 +60,30 @@ export const INITIAL_WAL_SEG = 1n;
  * Format snapshot filename from generation
  */
 export function snapshotFilename(gen: bigint): string {
-	return `snap_${gen.toString().padStart(16, "0")}${EXT_SNAPSHOT}`;
+  return `snap_${gen.toString().padStart(16, "0")}${EXT_SNAPSHOT}`;
 }
 
 /**
  * Format WAL filename from segment ID
  */
 export function walFilename(seg: bigint): string {
-	return `wal_${seg.toString().padStart(16, "0")}${EXT_WAL}`;
+  return `wal_${seg.toString().padStart(16, "0")}${EXT_WAL}`;
 }
 
 /**
  * Parse generation from snapshot filename
  */
 export function parseSnapshotGen(filename: string): bigint | null {
-	const match = filename.match(/^snap_(\d{16})\.gds$/);
-	if (!match?.[1]) return null;
-	return BigInt(match[1]);
+  const match = filename.match(/^snap_(\d{16})\.gds$/);
+  if (!match?.[1]) return null;
+  return BigInt(match[1]);
 }
 
 /**
  * Parse segment ID from WAL filename
  */
 export function parseWalSeg(filename: string): bigint | null {
-	const match = filename.match(/^wal_(\d{16})\.gdw$/);
-	if (!match?.[1]) return null;
-	return BigInt(match[1]);
+  const match = filename.match(/^wal_(\d{16})\.gdw$/);
+  if (!match?.[1]) return null;
+  return BigInt(match[1]);
 }

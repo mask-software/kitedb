@@ -13,18 +13,23 @@
 // ============================================================================
 
 export type {
-	NodeID,
-	ETypeID,
-	LabelID,
-	PropKeyID,
-	PropValue,
-	Edge,
-	GraphDB,
-	TxHandle,
-	OpenOptions,
-	NodeOpts,
-	DbStats,
-	CheckResult,
+  NodeID,
+  ETypeID,
+  LabelID,
+  PropKeyID,
+  PropValue,
+  Edge,
+  GraphDB,
+  TxHandle,
+  OpenOptions,
+  NodeOpts,
+  DbStats,
+  CheckResult,
+  CacheOptions,
+  CacheStats,
+  PropertyCacheConfig,
+  TraversalCacheConfig,
+  QueryCacheConfig,
 } from "./types.ts";
 
 export { PropValueTag } from "./types.ts";
@@ -33,77 +38,74 @@ export { PropValueTag } from "./types.ts";
 // Database lifecycle
 // ============================================================================
 
-export {
-	openGraphDB,
-	closeGraphDB,
-} from "./ray/graph-db.ts";
+export { openGraphDB, closeGraphDB } from "./ray/__graph-db.ts";
 
 // ============================================================================
 // Transactions
 // ============================================================================
 
-export {
-	beginTx,
-	commit,
-	rollback,
-} from "./ray/graph-db.ts";
+export { beginTx, commit, rollback } from "./ray/__graph-db.ts";
 
 // ============================================================================
 // Node operations
 // ============================================================================
 
 export {
-	createNode,
-	deleteNode,
-	getNodeByKey,
-	nodeExists,
-} from "./ray/graph-db.ts";
+  createNode,
+  deleteNode,
+  getNodeByKey,
+  nodeExists,
+} from "./ray/__graph-db.ts";
 
 // ============================================================================
 // Edge operations
 // ============================================================================
 
 export {
-	addEdge,
-	deleteEdge,
-	getNeighborsOut,
-	getNeighborsIn,
-	edgeExists,
-} from "./ray/graph-db.ts";
+  addEdge,
+  deleteEdge,
+  getNeighborsOut,
+  getNeighborsIn,
+  edgeExists,
+} from "./ray/__graph-db.ts";
 
 // ============================================================================
 // Property operations
 // ============================================================================
 
 export {
-	setNodeProp,
-	delNodeProp,
-	setEdgeProp,
-	delEdgeProp,
-	getNodeProp,
-	getNodeProps,
-	getEdgeProp,
-	getEdgeProps,
-} from "./ray/graph-db.ts";
+  setNodeProp,
+  delNodeProp,
+  setEdgeProp,
+  delEdgeProp,
+  getNodeProp,
+  getNodeProps,
+  getEdgeProp,
+  getEdgeProps,
+} from "./ray/__graph-db.ts";
 
 // ============================================================================
 // Schema definitions
 // ============================================================================
 
-export {
-	defineLabel,
-	defineEtype,
-	definePropkey,
-} from "./ray/graph-db.ts";
+export { defineLabel, defineEtype, definePropkey } from "./ray/__graph-db.ts";
 
 // ============================================================================
 // Maintenance
 // ============================================================================
 
+export { stats, check } from "./ray/__graph-db.ts";
+
+// ============================================================================
+// Cache API
+// ============================================================================
+
 export {
-	stats,
-	check,
-} from "./ray/graph-db.ts";
+  invalidateNodeCache,
+  invalidateEdgeCache,
+  clearCache,
+  getCacheStats,
+} from "./ray/__graph-db.ts";
 
 export { optimize, type OptimizeOptions } from "./core/compactor.ts";
 
@@ -118,9 +120,9 @@ export { checkSnapshot } from "./check/checker.ts";
 // ============================================================================
 
 export {
-	CompressionType,
-	type CompressionOptions,
-	DEFAULT_COMPRESSION_OPTIONS,
+  CompressionType,
+  type CompressionOptions,
+  DEFAULT_COMPRESSION_OPTIONS,
 } from "./util/compression.ts";
 
 // ============================================================================
@@ -128,46 +130,52 @@ export {
 // ============================================================================
 
 export {
-	// Main entry
-	ray,
-	Ray,
-	type RayOptions,
-	type TransactionContext,
-	// Schema builders
-	defineNode,
-	defineEdge,
-	prop,
-	optional,
-	type NodeDef,
-	type EdgeDef,
-	type PropDef,
-	type PropBuilder,
-	type OptionalPropDef,
-	type PropsSchema,
-	type EdgePropsSchema,
-	type InferNode,
-	type InferNodeInsert,
-	type InferEdge,
-	type InferEdgeProps,
-	type RaySchema,
-	// Query builders
-	type InsertBuilder,
-	type InsertExecutor,
-	type UpdateBuilder,
-	type UpdateExecutor,
-	type UpdateByRefBuilder,
-	type UpdateByRefExecutor,
-	type DeleteBuilder,
-	type DeleteExecutor,
-	type LinkExecutor,
-	type UpdateEdgeBuilder,
-	type UpdateEdgeExecutor,
-	type NodeRef,
-	type WhereCondition,
-	// Traversal
-	type TraversalBuilder,
-	type TraverseOptions,
-	type TraversalDirection,
-	type AsyncTraversalResult,
-	type EdgeResult,
+  // Main entry
+  ray,
+  Ray,
+  type RayOptions,
+  type TransactionContext,
+  // Schema builders
+  defineNode,
+  defineEdge,
+  prop,
+  optional,
+  type NodeDef,
+  type EdgeDef,
+  type PropDef,
+  type PropBuilder,
+  type OptionalPropDef,
+  type PropsSchema,
+  type EdgePropsSchema,
+  type InferNode,
+  type InferNodeInsert,
+  type InferEdge,
+  type InferEdgeProps,
+  type RaySchema,
+  // Query builders
+  type InsertBuilder,
+  type InsertExecutor,
+  type UpdateBuilder,
+  type UpdateExecutor,
+  type UpdateByRefBuilder,
+  type UpdateByRefExecutor,
+  type DeleteBuilder,
+  type DeleteExecutor,
+  type LinkExecutor,
+  type UpdateEdgeBuilder,
+  type UpdateEdgeExecutor,
+  type NodeRef,
+  type WhereCondition,
+  // Traversal
+  type TraversalBuilder,
+  type TraverseOptions,
+  type TraversalDirection,
+  type AsyncTraversalResult,
+  type EdgeResult,
+  // Pathfinding
+  type PathFindingBuilder,
+  type PathExecutor,
+  type PathResult,
+  type WeightSpec,
+  type Heuristic,
 } from "./api/index.ts";

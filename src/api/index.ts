@@ -26,17 +26,33 @@
  */
 
 /**
+ * Query builders for CRUD operations
+ * Fluent API for insert, update, delete with where conditions
+ * @see {@link InsertBuilder}
+ * @see {@link UpdateBuilder}
+ * @see {@link DeleteBuilder}
+ */
+export type {
+  DeleteBuilder,
+  DeleteExecutor,
+  InsertBuilder,
+  InsertExecutor,
+  LinkExecutor,
+  NodeRef,
+  UpdateBuilder,
+  UpdateByRefBuilder,
+  UpdateByRefExecutor,
+  UpdateEdgeBuilder,
+  UpdateEdgeExecutor,
+  UpdateExecutor,
+  WhereCondition,
+} from "./builders.ts";
+/**
  * Main database context
  * @see {@link ray}
  * @see {@link Ray}
  */
-export {
-	ray,
-	Ray,
-	type RayOptions,
-	type TransactionContext,
-} from "./ray.ts";
-
+export { Ray, type RayOptions, ray, type TransactionContext } from "./ray.ts";
 /**
  * Schema definition builders
  * Define node and edge types with properties and type inference
@@ -45,46 +61,23 @@ export {
  * @see {@link prop}
  */
 export {
-	defineNode,
-	defineEdge,
-	prop,
-	optional,
-	type NodeDef,
-	type EdgeDef,
-	type PropDef,
-	type PropBuilder,
-	type OptionalPropDef,
-	type PropsSchema,
-	type EdgePropsSchema,
-	type InferNode,
-	type InferNodeInsert,
-	type InferEdge,
-	type InferEdgeProps,
-	type RaySchema,
+  defineEdge,
+  defineNode,
+  type EdgeDef,
+  type EdgePropsSchema,
+  type InferEdge,
+  type InferEdgeProps,
+  type InferNode,
+  type InferNodeInsert,
+  type NodeDef,
+  type OptionalPropDef,
+  optional,
+  type PropBuilder,
+  type PropDef,
+  type PropsSchema,
+  prop,
+  type RaySchema,
 } from "./schema.ts";
-
-/**
- * Query builders for CRUD operations
- * Fluent API for insert, update, delete with where conditions
- * @see {@link InsertBuilder}
- * @see {@link UpdateBuilder}
- * @see {@link DeleteBuilder}
- */
-export type {
-	InsertBuilder,
-	InsertExecutor,
-	UpdateBuilder,
-	UpdateExecutor,
-	UpdateByRefBuilder,
-	UpdateByRefExecutor,
-	DeleteBuilder,
-	DeleteExecutor,
-	LinkExecutor,
-	UpdateEdgeBuilder,
-	UpdateEdgeExecutor,
-	NodeRef,
-	WhereCondition,
-} from "./builders.ts";
 
 /**
  * Graph traversal with filtering and aggregation
@@ -92,9 +85,22 @@ export type {
  * @see {@link TraversalBuilder}
  */
 export type {
-	TraversalBuilder,
-	TraverseOptions,
-	TraversalDirection,
-	AsyncTraversalResult,
-	EdgeResult,
+  AsyncTraversalResult,
+  EdgeResult,
+  TraversalBuilder,
+  TraversalDirection,
+  TraverseOptions,
 } from "./traversal.ts";
+
+/**
+ * Path finding algorithms (Dijkstra, A*)
+ * Find shortest paths between nodes with weighted edges
+ * @see {@link PathFindingBuilder}
+ */
+export type {
+  Heuristic,
+  PathExecutor,
+  PathFindingBuilder,
+  PathResult,
+  WeightSpec,
+} from "./pathfinding.ts";
