@@ -364,11 +364,25 @@ bun test tests/mvcc.test.ts
 
 # Run benchmarks
 bun run bench/benchmark.ts
-bun run bench/benchmark-mvcc.ts
+bun run bench/benchmark-mvcc-v2.ts
 
 # Type check
 bun run tsc --noEmit
 ```
+
+### Benchmark memory usage
+
+The MVCC v2 benchmark (`bench/benchmark-mvcc-v2.ts`) includes a `scale` scenario
+that deliberately builds a ~1M node / 5M edge graph fully in memory to stress
+snapshot layout and MVCC. On typical machines this will use several GB of RAM.
+For local runs, you can reduce memory pressure by lowering `--scale-nodes`
+(e.g. `--scale-nodes 200000`) or disabling the `scale` scenario via
+`--scenarios warm,contested,version-chain`.
+
+This benchmark measures the in-memory engine; it does **not** mean your
+application must keep all data resident. You can `closeGraphDB(db)` to flush and
+unmap the snapshot/WAL files, and later `openGraphDB` on the same path to read
+from the embedded on-disk snapshot again.
 
 ## License
 
