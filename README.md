@@ -6,16 +6,22 @@ A high-performance embedded graph database for Bun/TypeScript with:
 - **Reliable writes** via WAL (Write-Ahead Log) + in-memory delta overlay
 - **Stable node IDs** that never change or get reused
 - **Periodic compaction** to merge snapshots with deltas
+- **MVCC** for concurrent transaction isolation
+- **Pathfinding** with Dijkstra and A* algorithms
+- **Caching** for frequently accessed nodes, edges, and properties
 
 ## Features
 
 - Zero-copy mmap reading of snapshot files
 - ACID transactions with commit/rollback
+- **MVCC (Multi-Version Concurrency Control)** for snapshot isolation
 - Efficient CSR format for graph traversal
 - Binary search for edge existence checks
 - Key-based node lookup with hash index
 - Node and edge properties
 - In/out edge traversal
+- **Graph pathfinding** (shortest path, weighted paths)
+- **Query result caching** with automatic invalidation
 - Snapshot integrity checking
 
 ## Installation
@@ -88,9 +94,11 @@ await closeGraphDB(db);
 ```typescript
 // Open a database
 const db = await openGraphDB(path, {
-  readOnly?: boolean,      // Open in read-only mode
+  readOnly?: boolean,        // Open in read-only mode
   createIfMissing?: boolean, // Create if doesn't exist (default: true)
-  lockFile?: boolean,      // Use file locking (default: true)
+  lockFile?: boolean,        // Use file locking (default: true)
+  mvcc?: boolean,            // Enable MVCC for concurrent transactions
+  cache?: boolean,           // Enable caching (default: false)
 });
 
 // Close the database
@@ -100,7 +108,7 @@ await closeGraphDB(db);
 ### Transactions
 
 ```typescript
-// Begin a transaction (single-writer)
+// Begin a transaction
 const tx = beginTx(db);
 
 // Commit changes
@@ -108,6 +116,10 @@ await commit(tx);
 
 // Or rollback
 rollback(tx);
+
+// With MVCC enabled, concurrent transactions are supported:
+const tx1 = beginTx(db);  // Transaction 1
+const tx2 = beginTx(db);  // Transaction 2 (concurrent)
 ```
 
 ### Node Operations
@@ -212,6 +224,100 @@ if (!result.valid) {
 await optimize(db);
 ```
 
+### MVCC (Multi-Version Concurrency Control)
+
+MVCC enables concurrent read and write transactions with snapshot isolation:
+
+```typescript
+// Open database with MVCC enabled
+const db = await openGraphDB('./my-graph', { mvcc: true });
+
+// Start concurrent transactions
+const reader = beginTx(db);
+const writer = beginTx(db);
+
+// Reader sees consistent snapshot from its start time
+const node = getNodeByKey(db, 'user:alice');
+
+// Writer can modify data
+setNodeProp(writer, nodeId, nameProp, { tag: PropValueTag.STRING, value: 'Updated' });
+await commit(writer);
+
+// Reader still sees old data (snapshot isolation)
+// ...
+
+// Conflict detection prevents lost updates
+const tx1 = beginTx(db);
+const tx2 = beginTx(db);
+setNodeProp(tx1, nodeId, prop, value1);
+setNodeProp(tx2, nodeId, prop, value2);
+await commit(tx1);  // Succeeds
+await commit(tx2);  // Throws ConflictError
+```
+
+### Pathfinding
+
+Find shortest paths between nodes:
+
+```typescript
+import { ray, defineNode, defineEdge, prop } from './src/api';
+
+const db = await ray('./my-graph', { nodes: [...], edges: [...] });
+
+// Shortest path (unweighted)
+const path = await db
+  .from(startNode)
+  .shortestPath(endNode)
+  .via(edgeType)
+  .maxDepth(10)
+  .execute();
+
+// Weighted shortest path (Dijkstra)
+const weightedPath = await db
+  .from(startNode)
+  .shortestPath(endNode)
+  .via(edgeType)
+  .weight({ prop: distanceProp })
+  .execute();
+
+// A* pathfinding with heuristic
+const astarPath = await db
+  .from(startNode)
+  .shortestPath(endNode)
+  .via(edgeType)
+  .weight({ prop: distanceProp })
+  .heuristic((node) => estimateDistance(node, endNode))
+  .execute();
+```
+
+### Caching
+
+Enable caching for read-heavy workloads:
+
+```typescript
+import { 
+  invalidateNodeCache, 
+  invalidateEdgeCache, 
+  clearCache, 
+  getCacheStats 
+} from './src/index.ts';
+
+// Open with caching enabled
+const db = await openGraphDB('./my-graph', { cache: true });
+
+// Cache is automatically populated on reads and invalidated on writes
+
+// Manual cache management
+invalidateNodeCache(db, nodeId);
+invalidateEdgeCache(db, srcId, etypeId, dstId);
+clearCache(db);
+
+// Get cache statistics
+const cacheStats = getCacheStats(db);
+console.log('Cache hits:', cacheStats.hits);
+console.log('Cache misses:', cacheStats.misses);
+```
+
 ## File Format
 
 The database stores files in the following structure:
@@ -252,6 +358,13 @@ bun test
 
 # Run specific test file
 bun test tests/snapshot.test.ts
+
+# Run MVCC tests
+bun test tests/mvcc.test.ts
+
+# Run benchmarks
+bun run bench/benchmark.ts
+bun run bench/benchmark-mvcc.ts
 
 # Type check
 bun run tsc --noEmit

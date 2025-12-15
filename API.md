@@ -15,14 +15,29 @@ Ray is organized into several key layers:
 │  High-Level API (src/api/)              │
 │  - Type-safe schema definitions         │
 │  - Fluent query builders                │
-│  - Graph traversal                      │
+│  - Graph traversal & pathfinding        │
 └──────────────────┬──────────────────────┘
                    │
 ┌──────────────────▼──────────────────────┐
-│  Core Database (src/db/)                │
+│  Core Database (src/ray/graph-db/)      │
 │  - Low-level CRUD operations            │
 │  - Transaction management               │
 │  - Node/edge IDs                        │
+└──────────────────┬──────────────────────┘
+                   │
+┌──────────────────▼──────────────────────┐
+│  MVCC Layer (src/mvcc/)                 │
+│  - Version chains                       │
+│  - Transaction isolation                │
+│  - Conflict detection                   │
+│  - Garbage collection                   │
+└──────────────────┬──────────────────────┘
+                   │
+┌──────────────────▼──────────────────────┐
+│  Cache Layer (src/cache/)               │
+│  - Property cache                       │
+│  - Query cache                          │
+│  - Traversal cache                      │
 └──────────────────┬──────────────────────┘
                    │
 ┌──────────────────▼──────────────────────┐
@@ -51,6 +66,7 @@ Features:
 - Type-safe schema definitions (`defineNode`, `defineEdge`)
 - Fluent query builders (insert, update, delete)
 - Graph traversal with filtering
+- **Pathfinding** (Dijkstra, A*)
 - Automatic type inference
 - Transaction support
 - Property type validation
@@ -60,6 +76,7 @@ Features:
 - `schema.ts` - Schema builders
 - `builders.ts` - Query builders
 - `traversal.ts` - Graph traversal
+- `pathfinding.ts` - Shortest path algorithms
 - `index.ts` - Public exports
 
 **Example:**
@@ -73,7 +90,7 @@ const db = await ray('./db', { nodes: [user], edges: [] });
 const alice = await db.insert(user).values({ key: 'alice', name: 'Alice' }).returning();
 ```
 
-### 2. Low-Level API (`src/db/`)
+### 2. Low-Level API (`src/ray/graph-db/`)
 
 **For advanced users and framework builders** - Direct database access.
 
@@ -84,6 +101,7 @@ Provides:
 - Property access (get/set)
 - Edge queries and traversal
 - Database maintenance
+- **MVCC transaction support**
 
 **Key types:**
 - `NodeID` - Numeric node identifier (bigint)
@@ -105,7 +123,35 @@ addEdge(tx, alice, knows, bob);
 await commit(tx);
 ```
 
-### 3. Core Storage (`src/core/`)
+### 3. MVCC Layer (`src/mvcc/`)
+
+**Internal** - Provides Multi-Version Concurrency Control.
+
+Components:
+- `tx-manager.ts` - Transaction lifecycle and ID assignment
+- `version-chain.ts` - Version history for nodes/edges/properties
+- `visibility.ts` - Snapshot isolation visibility rules
+- `conflict-detector.ts` - Read-write and write-write conflict detection
+- `gc.ts` - Garbage collection of old versions
+- `index.ts` - MvccManager coordinator
+
+**Key concepts:**
+- **Snapshot Isolation** - Each transaction sees a consistent snapshot
+- **Version Chains** - Historical versions linked in a chain
+- **Conflict Detection** - Prevents lost updates on concurrent modifications
+- **Garbage Collection** - Automatically prunes old versions
+
+### 4. Cache Layer (`src/cache/`)
+
+**Internal** - Provides caching for read-heavy workloads.
+
+Components:
+- `property-cache.ts` - Caches node and edge properties
+- `query-cache.ts` - Caches query results
+- `traversal-cache.ts` - Caches traversal results
+- `index.ts` - CacheManager coordinator
+
+### 5. Core Storage (`src/core/`)
 
 **Internal** - Handles persistence and optimization.
 
@@ -126,13 +172,28 @@ src/
 │   ├── schema.ts          # Schema definitions
 │   ├── builders.ts        # Query builders
 │   ├── traversal.ts       # Graph traversal
+│   ├── pathfinding.ts     # Shortest path algorithms
 │   └── index.ts           # Exports
 │
-├── db/                    # Low-level database
-│   ├── graph-db.ts        # Core operations
-│   ├── iterators.ts       # Edge traversal
-│   ├── key-index.ts       # Key lookup
-│   ├── types.ts           # Type definitions
+├── ray/graph-db/          # Low-level database
+│   ├── nodes.ts           # Node operations
+│   ├── edges.ts           # Edge operations
+│   ├── tx.ts              # Transaction management
+│   ├── lifecycle.ts       # DB open/close
+│   └── index.ts           # Exports
+│
+├── mvcc/                  # MVCC layer
+│   ├── tx-manager.ts      # Transaction management
+│   ├── version-chain.ts   # Version history
+│   ├── visibility.ts      # Snapshot isolation
+│   ├── conflict-detector.ts # Conflict detection
+│   ├── gc.ts              # Garbage collection
+│   └── index.ts           # Exports
+│
+├── cache/                 # Caching layer
+│   ├── property-cache.ts  # Property caching
+│   ├── query-cache.ts     # Query result caching
+│   ├── traversal-cache.ts # Traversal caching
 │   └── index.ts           # Exports
 │
 ├── core/                  # Storage layer
@@ -150,18 +211,14 @@ src/
 │   ├── crc.ts             # Checksums
 │   ├── hash.ts            # Hashing
 │   ├── lock.ts            # File locks
+│   ├── lru.ts             # LRU cache
 │   └── index.ts           # Exports
 │
 ├── check/                 # Verification
-│   ├── checker.ts         # Integrity checking
-│   └── constants.ts       # Error codes
+│   └── checker.ts         # Integrity checking
 │
-├── api.ts                 # (Legacy?) API exports
-├── ray.ts                 # (Legacy?) Main export
 ├── index.ts               # Main entry point
-├── schema.ts              # (Legacy?) Schema
-├── types.ts               # Type definitions
-└── traversal.ts           # (Legacy?) Traversal
+└── types.ts               # Type definitions
 ```
 
 ## Choosing the Right API
@@ -178,16 +235,17 @@ src/
 import { ray, defineNode, defineEdge, prop } from './src/api';
 ```
 
-### Use Low-Level API (`src/db/`)
+### Use Low-Level API (`src/ray/graph-db/`)
 
 ✅ You're building a framework or tool
 ✅ You need maximum control
 ✅ You want to work with numeric IDs directly
 ✅ You're implementing custom traversal logic
 ✅ You need escape-hatch access to raw operations
+✅ You need MVCC transaction control
 
 ```typescript
-import { openGraphDB, createNode, addEdge } from './src/db/graph-db';
+import { openGraphDB, createNode, addEdge } from './src/ray/graph-db';
 ```
 
 ### Use Raw Database via Escape Hatch
@@ -324,6 +382,116 @@ Optional properties can be omitted or set to `undefined`.
 - **Edge existence**: O(log n) binary search on CSR
 - **Traversal**: O(k) where k = number of edges
 - **Snapshot read**: Zero-copy mmap
+- **MVCC overhead**: ~0% for single transactions, minimal for concurrent
+- **Pathfinding**: O((V + E) log V) for Dijkstra/A*
+
+## MVCC Details
+
+### Snapshot Isolation
+
+Each transaction sees a consistent snapshot of the database from its start time:
+
+```typescript
+const db = await openGraphDB('./db', { mvcc: true });
+
+const tx1 = beginTx(db);  // Snapshot at time T1
+const tx2 = beginTx(db);  // Snapshot at time T1 (same)
+
+// tx2 modifies data
+setNodeProp(tx2, node, prop, newValue);
+await commit(tx2);  // Commits at time T2
+
+// tx1 still sees data from T1 (before tx2's changes)
+const value = getNodeProp(db, node, prop);  // Old value
+```
+
+### Conflict Detection
+
+MVCC uses optimistic concurrency control with conflict detection at commit:
+
+```typescript
+// Write-write conflict
+const tx1 = beginTx(db);
+const tx2 = beginTx(db);
+
+setNodeProp(tx1, node, prop, 'value1');
+setNodeProp(tx2, node, prop, 'value2');
+
+await commit(tx1);  // Succeeds
+await commit(tx2);  // Throws ConflictError
+
+// Read-write conflict (if tx reads then another tx writes and commits)
+const txReader = beginTx(db);
+getNodeProp(db, node, prop);  // Reads value
+
+const txWriter = beginTx(db);
+setNodeProp(txWriter, node, prop, 'new');
+await commit(txWriter);  // Commits
+
+setNodeProp(txReader, node, prop, 'other');
+await commit(txReader);  // Throws ConflictError (read was invalidated)
+```
+
+### Performance Optimizations
+
+MVCC includes several optimizations:
+- **Fast path for single transactions**: Skips version chain creation when no concurrent readers
+- **Cached MVCC flag**: O(1) check for MVCC mode
+- **Inverted write index**: O(1) conflict detection
+- **Background garbage collection**: Prunes old versions automatically
+
+## Pathfinding
+
+### Shortest Path (Unweighted)
+
+```typescript
+const path = await db
+  .from(startNode)
+  .shortestPath(endNode)
+  .via(edgeType)
+  .execute();
+
+// Returns: { nodes: [...], edges: [...], distance: number }
+```
+
+### Weighted Shortest Path (Dijkstra)
+
+```typescript
+const path = await db
+  .from(startNode)
+  .shortestPath(endNode)
+  .via(edgeType)
+  .weight({ prop: distanceProp })  // Use edge property as weight
+  .execute();
+```
+
+### A* Pathfinding
+
+```typescript
+const path = await db
+  .from(startNode)
+  .shortestPath(endNode)
+  .via(edgeType)
+  .weight({ prop: distanceProp })
+  .heuristic((node) => {
+    // Estimate remaining distance (must be admissible)
+    return estimateDistance(node, endNode);
+  })
+  .execute();
+```
+
+### Path Options
+
+```typescript
+const path = await db
+  .from(startNode)
+  .shortestPath(endNode)
+  .via(edgeType)
+  .maxDepth(10)           // Limit search depth
+  .direction('out')       // 'out', 'in', or 'both'
+  .filter((node) => ...)  // Filter nodes during traversal
+  .execute();
+```
 
 ## File Formats
 
