@@ -2,6 +2,9 @@
  * Property Cache
  *
  * Caches node and edge property lookups to avoid repeated delta/snapshot reads.
+ * 
+ * Optimization: Uses targeted invalidation instead of clearing entire cache.
+ * Maintains a reverse index from node/edge to their cache keys for O(1) invalidation.
  */
 
 import type { ETypeID, NodeID, PropKeyID, PropValue } from "../types.ts";
@@ -18,10 +21,19 @@ interface PropertyCacheConfig {
 
 /**
  * Property cache for node and edge properties
+ * 
+ * Uses targeted invalidation via reverse index mapping:
+ * - nodeKeyIndex: Maps NodeID -> Set<NodePropKey> for O(1) node invalidation
+ * - edgeKeyIndex: Maps "src:etype:dst" -> Set<EdgePropKey> for O(1) edge invalidation
  */
 export class PropertyCache {
   private readonly nodeCache: LRUCache<NodePropKey, PropValue | null>;
   private readonly edgeCache: LRUCache<EdgePropKey, PropValue | null>;
+  
+  // Reverse index for targeted invalidation
+  private readonly nodeKeyIndex: Map<NodeID, Set<NodePropKey>> = new Map();
+  private readonly edgeKeyIndex: Map<string, Set<EdgePropKey>> = new Map();
+  
   private hits = 0;
   private misses = 0;
 
@@ -54,6 +66,14 @@ export class PropertyCache {
   ): void {
     const key = this.nodePropKey(nodeId, propKeyId);
     this.nodeCache.set(key, value);
+    
+    // Track which keys belong to this node for targeted invalidation
+    let keys = this.nodeKeyIndex.get(nodeId);
+    if (!keys) {
+      keys = new Set();
+      this.nodeKeyIndex.set(nodeId, keys);
+    }
+    keys.add(key);
   }
 
   /**
@@ -87,31 +107,42 @@ export class PropertyCache {
   ): void {
     const key = this.edgePropKey(src, etype, dst, propKeyId);
     this.edgeCache.set(key, value);
+    
+    // Track which keys belong to this edge for targeted invalidation
+    const edgeIndexKey = this.edgeIndexKey(src, etype, dst);
+    let keys = this.edgeKeyIndex.get(edgeIndexKey);
+    if (!keys) {
+      keys = new Set();
+      this.edgeKeyIndex.set(edgeIndexKey, keys);
+    }
+    keys.add(key);
   }
 
   /**
-   * Invalidate all properties for a node
+   * Invalidate all properties for a node (targeted O(k) where k = props for node)
    */
   invalidateNode(nodeId: NodeID): void {
-    // We need to iterate through all keys to find ones matching this node
-    // This is O(n) but necessary for proper invalidation
-    const nodePrefix = `n:${nodeId}:`;
-    const keysToDelete: NodePropKey[] = [];
-    
-    // Collect keys to delete (can't delete during iteration)
-    // Note: LRUCache doesn't expose iteration, so we'll clear node cache
-    // This is a trade-off: clearing is O(1) but loses all cached node props
-    // For better performance, we could track node->keys mapping, but that adds complexity
-    this.nodeCache.clear();
+    const keys = this.nodeKeyIndex.get(nodeId);
+    if (keys) {
+      for (const key of keys) {
+        this.nodeCache.delete(key);
+      }
+      this.nodeKeyIndex.delete(nodeId);
+    }
   }
 
   /**
-   * Invalidate a specific edge property
+   * Invalidate a specific edge property (targeted O(k) where k = props for edge)
    */
   invalidateEdge(src: NodeID, etype: ETypeID, dst: NodeID): void {
-    // Similar to invalidateNode, we clear the entire edge cache
-    // Could be optimized with edge->keys mapping
-    this.edgeCache.clear();
+    const edgeIndexKey = this.edgeIndexKey(src, etype, dst);
+    const keys = this.edgeKeyIndex.get(edgeIndexKey);
+    if (keys) {
+      for (const key of keys) {
+        this.edgeCache.delete(key);
+      }
+      this.edgeKeyIndex.delete(edgeIndexKey);
+    }
   }
 
   /**
@@ -120,6 +151,8 @@ export class PropertyCache {
   clear(): void {
     this.nodeCache.clear();
     this.edgeCache.clear();
+    this.nodeKeyIndex.clear();
+    this.edgeKeyIndex.clear();
     this.hits = 0;
     this.misses = 0;
   }
@@ -156,5 +189,11 @@ export class PropertyCache {
   ): EdgePropKey {
     return `e:${src}:${etype}:${dst}:${propKeyId}`;
   }
+  
+  /**
+   * Generate index key for edge (without propKeyId)
+   */
+  private edgeIndexKey(src: NodeID, etype: ETypeID, dst: NodeID): string {
+    return `${src}:${etype}:${dst}`;
+  }
 }
-

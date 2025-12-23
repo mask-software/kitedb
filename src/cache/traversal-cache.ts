@@ -2,6 +2,9 @@
  * Traversal Cache
  *
  * Caches neighbor iteration results to avoid repeated graph traversals.
+ * 
+ * Optimization: Uses targeted invalidation instead of clearing entire cache.
+ * Maintains a reverse index from node to their cache keys for O(1) invalidation.
  */
 
 import type { ETypeID, NodeID } from "../types.ts";
@@ -22,10 +25,26 @@ interface CachedNeighbors {
 
 /**
  * Traversal cache for neighbor lookups
+ * 
+ * Uses targeted invalidation via reverse index mapping:
+ * - nodeKeyIndex: Maps NodeID -> Set<TraversalKey> for O(1) node invalidation
+ * 
+ * When a node changes, we invalidate:
+ * - All outgoing traversals from that node
+ * - All incoming traversals to that node
+ * 
+ * When an edge changes (src -> dst), we invalidate:
+ * - Outgoing traversals from src (affected by edge addition/removal)
+ * - Incoming traversals to dst (affected by edge addition/removal)
  */
 export class TraversalCache {
   private readonly cache: LRUCache<TraversalKey, CachedNeighbors>;
   private readonly maxNeighborsPerEntry: number;
+  
+  // Reverse index for targeted invalidation
+  // Maps NodeID to all cache keys that reference this node (as src or dst)
+  private readonly nodeKeyIndex: Map<NodeID, Set<TraversalKey>> = new Map();
+  
   private hits = 0;
   private misses = 0;
 
@@ -85,25 +104,69 @@ export class TraversalCache {
       neighbors: cachedNeighbors,
       truncated,
     });
+    
+    // Track which keys belong to this node for targeted invalidation
+    this.addToNodeIndex(nodeId, key);
   }
 
   /**
-   * Invalidate all cached traversals for a node
+   * Invalidate all cached traversals for a node (targeted O(k) where k = traversals for node)
    */
   invalidateNode(nodeId: NodeID): void {
-    // Clear all entries for this node (both directions, all edge types)
-    // Similar to property cache, we clear entire cache for simplicity
-    // Could be optimized with node->keys mapping
-    this.cache.clear();
+    const keys = this.nodeKeyIndex.get(nodeId);
+    if (keys) {
+      for (const key of keys) {
+        this.cache.delete(key);
+      }
+      this.nodeKeyIndex.delete(nodeId);
+    }
   }
 
   /**
-   * Invalidate traversals involving a specific edge
+   * Invalidate traversals involving a specific edge (targeted invalidation)
+   * 
+   * When an edge (src, etype, dst) is added/removed:
+   * - Outgoing traversals from src are affected
+   * - Incoming traversals to dst are affected
    */
   invalidateEdge(src: NodeID, etype: ETypeID, dst: NodeID): void {
-    // Clear cache entries for both src (out) and dst (in) with this edge type
-    // For simplicity, clear entire cache
-    this.cache.clear();
+    // Invalidate outgoing traversals from src
+    this.invalidateNodeTraversals(src, "out", etype);
+    
+    // Invalidate incoming traversals to dst
+    this.invalidateNodeTraversals(dst, "in", etype);
+  }
+  
+  /**
+   * Invalidate specific traversals for a node
+   */
+  private invalidateNodeTraversals(nodeId: NodeID, direction: "out" | "in", etype: ETypeID): void {
+    const keys = this.nodeKeyIndex.get(nodeId);
+    if (!keys) return;
+    
+    const keysToDelete: TraversalKey[] = [];
+    
+    // Find keys that match this direction and etype (or 'all')
+    const specificKey = this.traversalKey(nodeId, etype, direction);
+    const allKey = this.traversalKey(nodeId, undefined, direction);
+    
+    if (keys.has(specificKey)) {
+      keysToDelete.push(specificKey);
+    }
+    if (keys.has(allKey)) {
+      keysToDelete.push(allKey);
+    }
+    
+    // Delete matched keys
+    for (const key of keysToDelete) {
+      this.cache.delete(key);
+      keys.delete(key);
+    }
+    
+    // Clean up empty index entries
+    if (keys.size === 0) {
+      this.nodeKeyIndex.delete(nodeId);
+    }
   }
 
   /**
@@ -111,6 +174,7 @@ export class TraversalCache {
    */
   clear(): void {
     this.cache.clear();
+    this.nodeKeyIndex.clear();
     this.hits = 0;
     this.misses = 0;
   }
@@ -140,5 +204,16 @@ export class TraversalCache {
     const etypeStr = etype === undefined ? "all" : String(etype);
     return `${nodeId}:${etypeStr}:${direction}`;
   }
+  
+  /**
+   * Add a key to the node index
+   */
+  private addToNodeIndex(nodeId: NodeID, key: TraversalKey): void {
+    let keys = this.nodeKeyIndex.get(nodeId);
+    if (!keys) {
+      keys = new Set();
+      this.nodeKeyIndex.set(nodeId, keys);
+    }
+    keys.add(key);
+  }
 }
-

@@ -1,7 +1,7 @@
 /**
  * Cache Manager
  *
- * Coordinates property cache, traversal cache, and query cache.
+ * Coordinates property cache, traversal cache, query cache, and key lookup cache.
  * Provides unified invalidation and statistics APIs.
  */
 
@@ -17,6 +17,7 @@ import type { Edge } from "../types.ts";
 import { PropertyCache } from "./property-cache.ts";
 import { QueryCache } from "./query-cache.ts";
 import { TraversalCache } from "./traversal-cache.ts";
+import { LRUCache } from "../util/lru.ts";
 
 const DEFAULT_PROPERTY_CACHE_CONFIG = {
   maxNodeProps: 10000,
@@ -32,6 +33,8 @@ const DEFAULT_QUERY_CACHE_CONFIG = {
   maxEntries: 1000,
 };
 
+const DEFAULT_KEY_CACHE_SIZE = 10000;
+
 /**
  * Cache manager coordinating all caches
  */
@@ -39,6 +42,10 @@ export class CacheManager {
   private readonly propertyCache: PropertyCache;
   private readonly traversalCache: TraversalCache;
   private readonly queryCache: QueryCache;
+  
+  // Key lookup cache: string key -> NodeID (or null for negative caches)
+  private readonly keyCache: LRUCache<string, NodeID | null>;
+  
   private readonly enabled: boolean;
 
   constructor(options: CacheOptions = {}) {
@@ -61,11 +68,13 @@ export class CacheManager {
       this.propertyCache = new PropertyCache(propConfig);
       this.traversalCache = new TraversalCache(travConfig);
       this.queryCache = new QueryCache(queryConfig);
+      this.keyCache = new LRUCache(DEFAULT_KEY_CACHE_SIZE);
     } else {
       // Create disabled caches (no-ops)
       this.propertyCache = new PropertyCache(DEFAULT_PROPERTY_CACHE_CONFIG);
       this.traversalCache = new TraversalCache(DEFAULT_TRAVERSAL_CACHE_CONFIG);
       this.queryCache = new QueryCache(DEFAULT_QUERY_CACHE_CONFIG);
+      this.keyCache = new LRUCache(DEFAULT_KEY_CACHE_SIZE);
     }
   }
 
@@ -178,6 +187,36 @@ export class CacheManager {
   generateQueryKey(params: Record<string, unknown> | string): string {
     return QueryCache.generateKey(params);
   }
+  
+  // ============================================================================
+  // Key Lookup Cache API
+  // ============================================================================
+  
+  /**
+   * Get a node ID from cache by key
+   * Returns undefined if not cached, null if key was looked up but not found
+   */
+  getNodeByKey(key: string): NodeID | null | undefined {
+    if (!this.enabled) return undefined;
+    return this.keyCache.get(key);
+  }
+  
+  /**
+   * Set a node ID in cache by key
+   * Pass null to cache a "not found" result
+   */
+  setNodeByKey(key: string, nodeId: NodeID | null): void {
+    if (!this.enabled) return;
+    this.keyCache.set(key, nodeId);
+  }
+  
+  /**
+   * Invalidate a cached key lookup
+   */
+  invalidateKey(key: string): void {
+    if (!this.enabled) return;
+    this.keyCache.delete(key);
+  }
 
   // ============================================================================
   // Invalidation API
@@ -191,6 +230,7 @@ export class CacheManager {
     this.propertyCache.invalidateNode(nodeId);
     this.traversalCache.invalidateNode(nodeId);
     // Query cache is not invalidated by node (queries are content-addressed)
+    // Key cache is not invalidated here - handled by invalidateKey()
   }
 
   /**
@@ -211,6 +251,7 @@ export class CacheManager {
     this.propertyCache.clear();
     this.traversalCache.clear();
     this.queryCache.clear();
+    this.keyCache.clear();
   }
 
   /**
@@ -219,6 +260,14 @@ export class CacheManager {
   clearQueryCache(): void {
     if (!this.enabled) return;
     this.queryCache.clear();
+  }
+  
+  /**
+   * Clear only key cache (useful after checkpoint)
+   */
+  clearKeyCache(): void {
+    if (!this.enabled) return;
+    this.keyCache.clear();
   }
 
   // ============================================================================
