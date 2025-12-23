@@ -146,6 +146,17 @@ export interface WalRecord {
 }
 
 /**
+ * Estimate the size of a WAL record without actually building it
+ * This avoids the double memory allocation and CRC computation
+ */
+export function estimateWalRecordSize(record: WalRecord): number {
+  const headerSize = WAL_RECORD_HEADER_SIZE;
+  const crcSize = 4;
+  const unpadded = headerSize + record.payload.length + crcSize;
+  return alignUp(unpadded, WAL_RECORD_ALIGNMENT);
+}
+
+/**
  * Build a WAL record with proper framing
  */
 export function buildWalRecord(record: WalRecord): Uint8Array {

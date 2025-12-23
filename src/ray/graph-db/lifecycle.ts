@@ -1,8 +1,10 @@
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import {
   COMPACT_EDGE_RATIO,
   COMPACT_NODE_RATIO,
   COMPACT_WAL_SIZE,
+  EXT_RAYDB,
   INITIAL_ETYPE_ID,
   INITIAL_LABEL_ID,
   INITIAL_NODE_ID,
@@ -41,22 +43,73 @@ import {
 import type {
   GraphDB,
   OpenOptions,
-  LockHandle,
 } from "../../types.ts";
 import { WalRecordType } from "../../types.ts";
 import {
   acquireExclusiveLock,
   acquireSharedLock,
   releaseLock,
+  type LockHandle,
 } from "../../util/lock.ts";
 import { CacheManager } from "../../cache/index.ts";
 import { replayWalRecord } from "./wal-replay.ts";
 import { MvccManager } from "../../mvcc/index.ts";
+import { openSingleFileDB, closeSingleFileDB, isSingleFilePath } from "./single-file.ts";
+import { releaseFileLock, type SingleFileLockHandle } from "../../util/lock.ts";
+import type { FilePager } from "../../core/pager.ts";
 
 /**
  * Open a graph database
+ * Automatically detects format based on path:
+ * - If path ends with .raydb or is an existing .raydb file: single-file format
+ * - If path is an existing directory with manifest.gdm: multi-file format
+ * - If path is an existing directory (without manifest): use multi-file format (backward compat)
+ * - Otherwise: new database uses single-file format by default
  */
 export async function openGraphDB(
+  path: string,
+  options: OpenOptions = {},
+): Promise<GraphDB> {
+  const { readOnly = false, createIfMissing = true, lockFile = true } = options;
+
+  // Check if path is an existing directory (multi-file format)
+  // This includes directories with manifest.gdm and empty directories
+  // for backward compatibility with existing code that creates empty tmp dirs
+  const fs = await import("node:fs");
+  if (existsSync(path)) {
+    try {
+      const stat = fs.statSync(path);
+      if (stat.isDirectory()) {
+        // Existing directory - use multi-file format
+        return openMultiFileDB(path, options);
+      }
+    } catch {
+      // Ignore stat errors, continue with single-file detection
+    }
+  }
+  
+  // Check if path already ends with .raydb or exists as a .raydb file
+  let dbPath = path;
+  if (!path.endsWith(EXT_RAYDB)) {
+    const raydbPath = path + EXT_RAYDB;
+    if (existsSync(raydbPath)) {
+      // Existing single-file database without extension in path
+      dbPath = raydbPath;
+    } else {
+      // New database - use single-file format by default
+      dbPath = raydbPath;
+    }
+  }
+  
+  // Single-file format
+  return openSingleFileDB(dbPath, options);
+}
+
+/**
+ * Open a multi-file graph database (directory format)
+ * @internal
+ */
+async function openMultiFileDB(
   path: string,
   options: OpenOptions = {},
 ): Promise<GraphDB> {
@@ -131,7 +184,7 @@ export async function openGraphDB(
   let nextPropkeyId = INITIAL_PROPKEY_ID;
 
   if (snapshot) {
-    nextNodeId = snapshot.header.maxNodeId + 1;
+    nextNodeId = Number(snapshot.header.maxNodeId) + 1;
     nextLabelId = Number(snapshot.header.numLabels) + 1;
     nextEtypeId = Number(snapshot.header.numEtypes) + 1;
     nextPropkeyId = Number(snapshot.header.numPropkeys) + 1;
@@ -334,11 +387,23 @@ export async function openGraphDB(
   return {
     path,
     readOnly,
+    _isSingleFile: false,
+    
+    // Multi-file fields
     _manifest: manifest,
     _snapshot: snapshot,
-    _delta: delta,
     _walFd: null,
     _walOffset: walOffset,
+    
+    // Single-file fields (null for multi-file)
+    _header: null,
+    _pager: null,
+    _snapshotMmap: null,
+    _snapshotCache: null,
+    _walWritePos: 0,
+    
+    // Shared fields
+    _delta: delta,
     _nextNodeId: nextNodeId,
     _nextLabelId: nextLabelId,
     _nextEtypeId: nextEtypeId,
@@ -356,22 +421,28 @@ export async function openGraphDB(
  * Close the database
  */
 export async function closeGraphDB(db: GraphDB): Promise<void> {
-  // Stop MVCC GC thread
-  if (db._mvcc) {
-    const mvcc = db._mvcc as MvccManager;
-    mvcc.stop();
-  }
+  if (db._isSingleFile) {
+    // Single-file format
+    await closeSingleFileDB(db);
+  } else {
+    // Multi-file format
+    // Stop MVCC GC thread
+    if (db._mvcc) {
+      const mvcc = db._mvcc as MvccManager;
+      mvcc.stop();
+    }
 
-  // Close snapshot
-  if (db._snapshot) {
-    closeSnapshot(db._snapshot);
-    db._snapshot = null;
-  }
+    // Close snapshot
+    if (db._snapshot) {
+      closeSnapshot(db._snapshot);
+      (db as { _snapshot: null })._snapshot = null;
+    }
 
-  // Release lock
-  if (db._lockFd) {
-    releaseLock(db._lockFd as LockHandle);
-    db._lockFd = null;
+    // Release lock
+    if (db._lockFd) {
+      releaseLock(db._lockFd as LockHandle);
+      (db as { _lockFd: null })._lockFd = null;
+    }
   }
 }
 

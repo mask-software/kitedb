@@ -73,6 +73,14 @@ export async function optimize(
   db: GraphDB,
   options?: OptimizeOptions,
 ): Promise<void> {
+  if (db._isSingleFile) {
+    throw new Error("optimize() is for multi-file databases. Use optimizeSingleFile() for .raydb files.");
+  }
+  
+  if (!db._manifest) {
+    throw new Error("Multi-file database has no manifest");
+  }
+  
   if (db.readOnly) {
     throw new Error("Cannot compact read-only database");
   }
@@ -290,6 +298,9 @@ export async function optimize(
   }
 
   // Build new snapshot
+  if (!db._manifest) {
+    throw new Error("optimize() only works with multi-file databases");
+  }
   const newGen = db._manifest.activeSnapshotGen + 1n;
   const newWalSeg = db._manifest.activeWalSeg + 1n;
 

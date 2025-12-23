@@ -1,11 +1,14 @@
 /**
  * Optional file locking for cross-process safety
- * Uses file descriptors with flock() for OS-level advisory locking
+ * Supports both multi-file (legacy) and single-file (SQLite-style) locking
+ * 
+ * Multi-file: Uses a separate lock file with flock()
+ * Single-file: Uses byte-range locking at offset 2^30 (SQLite compatible)
  */
 
-import { closeSync, openSync, unlinkSync } from "node:fs";
+import { closeSync, openSync, unlinkSync, readSync, writeSync, fstatSync } from "node:fs";
 import { join } from "node:path";
-import { LOCK_FILENAME } from "../constants.ts";
+import { LOCK_FILENAME, LOCK_BYTE_OFFSET, LOCK_BYTE_RANGE } from "../constants.ts";
 
 // Lazy-load fs-ext for proper flock support, fallback to basic fd locking
 let flockSync: ((fd: number, flags: string) => void) | null = null;
@@ -147,4 +150,202 @@ export function releaseLock(lock: LockHandle): void {
       console.warn(`Failed to remove lock file ${lock.path}: ${err}`);
     }
   }
+}
+
+// ============================================================================
+// Single-file (SQLite-style) byte-range locking
+// ============================================================================
+
+// Lazy-load fcntl for byte-range locking
+let fcntlSync: ((fd: number, cmd: number, arg: FcntlLockStruct) => number) | null = null;
+let fcntlSyncLoaded = false;
+
+interface FcntlLockStruct {
+  type: number;
+  whence: number;
+  start: bigint;
+  len: bigint;
+}
+
+// fcntl commands
+const F_SETLK = 6;  // Set lock, return error if blocked
+const F_SETLKW = 7; // Set lock, wait if blocked
+const F_GETLK = 5;  // Get lock info
+
+// Lock types  
+const F_RDLCK = 0;  // Shared (read) lock
+const F_WRLCK = 1;  // Exclusive (write) lock
+const F_UNLCK = 2;  // Unlock
+
+async function loadFcntlSync(): Promise<void> {
+  if (fcntlSyncLoaded) return;
+  fcntlSyncLoaded = true;
+
+  try {
+    // @ts-ignore - fs-ext may not have types
+    const fsExt = await import("fs-ext");
+    if (fsExt.fcntl) {
+      fcntlSync = (fd: number, cmd: number, arg: FcntlLockStruct) => {
+        return fsExt.fcntl(fd, cmd, arg);
+      };
+    }
+  } catch {
+    // fs-ext not available, will fallback to flock
+  }
+}
+
+/**
+ * Single-file lock handle
+ */
+export interface SingleFileLockHandle {
+  fd: number;
+  exclusive: boolean;
+}
+
+/**
+ * Acquire exclusive lock on a single database file (SQLite-style)
+ * Uses byte-range locking at offset 2^30
+ */
+export async function acquireExclusiveFileLock(
+  fd: number,
+): Promise<SingleFileLockHandle | null> {
+  await loadFcntlSync();
+  await loadFlockSync();
+
+  // Try fcntl byte-range lock first (more precise)
+  if (fcntlSync) {
+    try {
+      const lockInfo: FcntlLockStruct = {
+        type: F_WRLCK,
+        whence: 0, // SEEK_SET
+        start: BigInt(LOCK_BYTE_OFFSET),
+        len: BigInt(LOCK_BYTE_RANGE),
+      };
+      
+      const result = fcntlSync(fd, F_SETLK, lockInfo);
+      if (result === 0) {
+        return { fd, exclusive: true };
+      }
+    } catch {
+      // fcntl failed, try flock fallback
+    }
+  }
+
+  // Fallback to flock (whole-file lock)
+  if (flockSync) {
+    try {
+      flockSync(fd, "exnb"); // Exclusive, non-blocking
+      return { fd, exclusive: true };
+    } catch {
+      return null; // Lock already held
+    }
+  }
+
+  // No locking available, proceed without lock (not ideal but works)
+  return { fd, exclusive: true };
+}
+
+/**
+ * Acquire shared lock on a single database file (SQLite-style)
+ * Uses byte-range locking at offset 2^30
+ */
+export async function acquireSharedFileLock(
+  fd: number,
+): Promise<SingleFileLockHandle | null> {
+  await loadFcntlSync();
+  await loadFlockSync();
+
+  // Try fcntl byte-range lock first
+  if (fcntlSync) {
+    try {
+      const lockInfo: FcntlLockStruct = {
+        type: F_RDLCK,
+        whence: 0, // SEEK_SET
+        start: BigInt(LOCK_BYTE_OFFSET),
+        len: BigInt(LOCK_BYTE_RANGE),
+      };
+      
+      const result = fcntlSync(fd, F_SETLK, lockInfo);
+      if (result === 0) {
+        return { fd, exclusive: false };
+      }
+    } catch {
+      // fcntl failed, try flock fallback
+    }
+  }
+
+  // Fallback to flock (whole-file lock)
+  if (flockSync) {
+    try {
+      flockSync(fd, "shnb"); // Shared, non-blocking
+      return { fd, exclusive: false };
+    } catch {
+      return null; // Could not acquire lock
+    }
+  }
+
+  // No locking available
+  return { fd, exclusive: false };
+}
+
+/**
+ * Release a single-file lock
+ * Note: The file descriptor is NOT closed - caller is responsible
+ */
+export async function releaseFileLock(lock: SingleFileLockHandle): Promise<void> {
+  await loadFcntlSync();
+  await loadFlockSync();
+
+  // Try fcntl unlock first
+  if (fcntlSync) {
+    try {
+      const lockInfo: FcntlLockStruct = {
+        type: F_UNLCK,
+        whence: 0,
+        start: BigInt(LOCK_BYTE_OFFSET),
+        len: BigInt(LOCK_BYTE_RANGE),
+      };
+      fcntlSync(lock.fd, F_SETLK, lockInfo);
+      return;
+    } catch {
+      // Try flock fallback
+    }
+  }
+
+  // Fallback to flock unlock
+  if (flockSync) {
+    try {
+      flockSync(lock.fd, "un");
+    } catch {
+      // Ignore unlock errors
+    }
+  }
+}
+
+/**
+ * Check if we can acquire an exclusive lock (without actually acquiring it)
+ */
+export async function canAcquireExclusiveLock(fd: number): Promise<boolean> {
+  await loadFcntlSync();
+
+  if (fcntlSync) {
+    try {
+      const lockInfo: FcntlLockStruct = {
+        type: F_WRLCK,
+        whence: 0,
+        start: BigInt(LOCK_BYTE_OFFSET),
+        len: BigInt(LOCK_BYTE_RANGE),
+      };
+      
+      // F_GETLK checks if a lock COULD be acquired
+      // If it returns our own lock type, we can acquire
+      const result = fcntlSync(fd, F_GETLK, lockInfo);
+      return lockInfo.type === F_UNLCK;
+    } catch {
+      return false;
+    }
+  }
+
+  // Without fcntl, we can't check without trying
+  return true;
 }

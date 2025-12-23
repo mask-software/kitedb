@@ -12,9 +12,10 @@ import {
   setNodeProp as deltaSetNodeProp,
   isNodeCreated,
 } from "../../core/delta.ts";
-import type { ParsedWalRecord, DeltaState } from "../../types.ts";
+import type { DeltaState } from "../../types.ts";
 import { WalRecordType } from "../../types.ts";
 import {
+  type ParsedWalRecord,
   parseAddEdgePayload,
   parseCreateNodePayload,
   parseDefineEtypePayload,
