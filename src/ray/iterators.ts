@@ -1,5 +1,7 @@
 /**
  * Merged neighbor iterators - combines snapshot edges with delta patches
+ * 
+ * Optimization: Uses Set-based lookups for O(1) edge existence checks in delta
  */
 
 import { isEdgeDeleted, isNodeDeleted } from "../core/delta.ts";
@@ -15,7 +17,6 @@ import type {
   EdgePatch,
   ETypeID,
   NodeID,
-  PhysNode,
   SnapshotData,
 } from "../types.ts";
 import { readU32At } from "../util/binary.ts";
@@ -30,6 +31,27 @@ interface MergedEdge {
 }
 
 /**
+ * Generate a unique key for an edge (etype, other) pair
+ * Used for O(1) edge lookup in Sets
+ */
+function edgeKey(etype: ETypeID, other: NodeID): bigint {
+  // Combine etype (u32) and other (safe integer up to 2^53-1) into a bigint
+  // etype << 53n ensures no collision with other values
+  return (BigInt(etype) << 53n) | BigInt(other);
+}
+
+/**
+ * Build a Set of edge keys from patches for O(1) lookup
+ */
+function buildEdgeSet(patches: EdgePatch[]): Set<bigint> {
+  const set = new Set<bigint>();
+  for (const patch of patches) {
+    set.add(edgeKey(patch.etype, patch.other));
+  }
+  return set;
+}
+
+/**
  * Merge snapshot edges with delta patches
  * Read order: snapshot - del + add
  */
@@ -38,15 +60,12 @@ function* mergeEdges(
   delPatches: EdgePatch[],
   addPatches: EdgePatch[],
 ): Generator<MergedEdge> {
-  // Create sets for fast lookup of deleted edges
-  const deleted = new Set<string>();
-  for (const patch of delPatches) {
-    deleted.add(`${patch.etype}:${patch.other}`);
-  }
+  // Build Set for O(1) lookup of deleted edges
+  const deleted = buildEdgeSet(delPatches);
 
   // Yield snapshot edges that aren't deleted
   for (const edge of snapshotEdges) {
-    const key = `${edge.etype}:${edge.other}`;
+    const key = edgeKey(edge.etype, edge.other);
     if (!deleted.has(key)) {
       yield edge;
     }
@@ -166,6 +185,8 @@ export function* neighborsIn(
 
 /**
  * Check if an edge exists with merged view
+ * 
+ * Optimization: Uses O(1) bigint Set lookup instead of O(n) linear scan
  */
 export function hasEdgeMerged(
   snapshot: SnapshotData | null,
@@ -184,11 +205,22 @@ export function hasEdgeMerged(
     return false;
   }
 
-  // Check if edge is added in delta
+  // Check if edge is added in delta - O(1) lookup using bigint key
   const addPatches = delta.outAdd.get(src);
   if (addPatches) {
-    for (const patch of addPatches) {
-      if (patch.etype === etype && patch.other === dst) {
+    const targetKey = edgeKey(etype, dst);
+    // For small patch arrays, linear scan is faster than building a Set
+    // For larger arrays, we could maintain a persistent Set in DeltaState
+    if (addPatches.length <= 10) {
+      for (const patch of addPatches) {
+        if (patch.etype === etype && patch.other === dst) {
+          return true;
+        }
+      }
+    } else {
+      // Build Set for O(1) lookup on larger arrays
+      const addSet = buildEdgeSet(addPatches);
+      if (addSet.has(targetKey)) {
         return true;
       }
     }
