@@ -1,0 +1,25 @@
+{
+  "name": "@ray-db/playground",
+  "version": "0.1.0",
+  "description": "Interactive web playground for RayDB graph database",
+  "type": "module",
+  "scripts": {
+    "dev": "bun run --watch src/server.ts",
+    "start": "bun run src/server.ts",
+    "build": "bun run build.ts"
+  },
+  "dependencies": {
+    "elysia": "^1.2.0",
+    "@elysiajs/static": "^1.2.0",
+    "@elysiajs/cors": "^1.2.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "cytoscape": "^3.30.4",
+    "cytoscape-fcose": "^2.2.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@types/cytoscape": "^3.21.8"
+  }
+}
