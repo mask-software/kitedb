@@ -344,6 +344,151 @@ console.log('Cache hits:', cacheStats.hits);
 console.log('Cache misses:', cacheStats.misses);
 ```
 
+## Fluent API
+
+The fluent API provides a type-safe, ergonomic interface for graph operations with schema definitions:
+
+```typescript
+import { ray, defineNode, defineEdge, prop, optional } from '@ray-db/ray';
+
+// Define schema
+const user = defineNode('user', {
+  key: (id: string) => `user:${id}`,
+  props: {
+    name: prop.string('name'),
+    email: prop.string('email'),
+    age: optional(prop.int('age')),
+  },
+});
+
+const knows = defineEdge('knows', {
+  since: prop.int('since'),
+});
+
+// Initialize database with schema
+const db = await ray('./my-graph', {
+  nodes: [user],
+  edges: [knows],
+});
+
+// Insert nodes
+const alice = await db
+  .insert(user)
+  .values({ key: 'alice', name: 'Alice', email: 'alice@example.com', age: 30n })
+  .returning();
+
+const bob = await db
+  .insert(user)
+  .values({ key: 'bob', name: 'Bob', email: 'bob@example.com' })
+  .returning();
+
+// Create edges
+await db.link(alice).to(bob).via(knows).props({ since: 2024n }).execute();
+
+// Query nodes
+const foundUser = await db.get(user, 'alice');
+
+// Lightweight reference lookup (no property loading)
+const userRef = await db.getRef(user, 'alice');
+
+// Traverse the graph
+const friends = await db.from(alice).out(knows).toArray();
+const friendCount = await db.from(alice).out(knows).count();
+
+// Multi-hop traversal
+const friendsOfFriends = await db
+  .from(alice)
+  .out(knows)
+  .out(knows)
+  .toArray();
+
+// Traverse with depth range
+const network = await db
+  .from(alice)
+  .traverse(knows, { direction: 'out', minDepth: 1, maxDepth: 3 })
+  .toArray();
+
+// Selective property loading
+const namesOnly = await db
+  .from(alice)
+  .out(knows)
+  .select(['name'])
+  .toArray();
+
+// Raw edge iteration (zero-copy)
+for (const edge of db.from(alice).out(knows).rawEdges()) {
+  console.log(edge.src, '->', edge.dst);
+}
+
+// Close database
+await db.close();
+```
+
+### Listing and Counting
+
+```typescript
+// List all nodes of a type (lazy async generator)
+for await (const u of db.all(user)) {
+  console.log(u.name, u.email);
+}
+
+// Collect to array
+const allUsers: typeof user[] = [];
+for await (const u of db.all(user)) {
+  allUsers.push(u);
+}
+
+// Count all nodes in database (O(1) - fast)
+const totalNodes = await db.count();
+
+// Count nodes of specific type (requires iteration)
+const userCount = await db.count(user);
+
+// List all edges (lazy async generator)
+for await (const e of db.allEdges()) {
+  console.log(`${e.src.$key} -> ${e.dst.$key}`);
+}
+
+// List edges of specific type with properties
+for await (const e of db.allEdges(knows)) {
+  console.log(`${e.src.$key} knows ${e.dst.$key} since ${e.props.since}`);
+}
+
+// Count all edges (O(1) - fast)
+const totalEdges = await db.countEdges();
+
+// Count edges of specific type
+const knowsCount = await db.countEdges(knows);
+```
+
+### Performance Characteristics
+
+The fluent API is optimized for minimal overhead compared to raw graph operations:
+
+| Operation | Raw | Fluent | Overhead |
+|-----------|-----|--------|----------|
+| Insert (single) | 62µs | 65µs | **1.05x** |
+| Key lookup (`getRef`) | 125ns | 250ns | **2.00x** |
+| Key lookup (`get`) | 125ns | 1.5µs | 12x |
+| 1-hop traversal `.count()` | 1.1µs | 2.0µs | **1.85x** |
+
+**Performance tips:**
+
+- Use `getRef()` instead of `get()` when you only need the node reference (not properties)
+- Use `.count()` instead of `.toArray().length` for counting (optimized fast path)
+- Use `.select(['prop1', 'prop2'])` to load only needed properties
+- Use `.rawEdges()` for zero-copy edge iteration when you don't need node properties
+
+### Running Benchmarks
+
+```bash
+# Full benchmark suite
+bun run bench/benchmark-api-vs-raw.ts
+
+# Custom parameters
+bun run bench/benchmark-api-vs-raw.ts --nodes 10000 --edges 50000 --iterations 10000
+```
+
 ## File Formats
 
 Ray supports two storage formats:

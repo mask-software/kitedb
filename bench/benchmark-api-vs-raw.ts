@@ -396,6 +396,25 @@ async function benchmarkFluentKeyLookups(
   return tracker.getStats();
 }
 
+async function benchmarkFluentGetRef(
+  db: Awaited<ReturnType<typeof ray>>,
+  keyArgs: string[],
+  iterations: number,
+): Promise<LatencyStats> {
+  const tracker = new LatencyTracker();
+  const n = keyArgs.length;
+
+  for (let i = 0; i < iterations; i++) {
+    const idx = Math.floor(Math.random() * n);
+    const keyArg = keyArgs[idx]!;
+    const start = Bun.nanoseconds();
+    await db.getRef(user, keyArg);
+    tracker.record(Bun.nanoseconds() - start);
+  }
+
+  return tracker.getStats();
+}
+
 function benchmarkRawTraversal(
   db: GraphDB,
   nodeIds: NodeID[],
@@ -508,6 +527,13 @@ async function runBenchmarks(config: BenchConfig): Promise<void> {
       config.iterations,
     );
 
+    logger.log("Running getRef benchmarks...");
+    const fluentGetRefStats = await benchmarkFluentGetRef(
+      db,
+      graph.userKeyArgs,
+      config.iterations,
+    );
+
     logger.log("Running 1-hop traversal benchmarks...");
     const rawTravStats = benchmarkRawTraversal(
       db.$raw,
@@ -523,7 +549,8 @@ async function runBenchmarks(config: BenchConfig): Promise<void> {
 
     logger.log("\n=== Results (lower is better) ===");
     printComparison("Insert (single)", rawInsertStats, fluentInsertStats);
-    printComparison("Key lookup", rawKeyStats, fluentKeyStats);
+    printComparison("Key lookup (get)", rawKeyStats, fluentKeyStats);
+    printComparison("Key lookup (getRef)", rawKeyStats, fluentGetRefStats);
     printComparison("1-hop traversal", rawTravStats, fluentTravStats);
 
     await db.close();
