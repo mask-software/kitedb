@@ -1,0 +1,16 @@
+services:
+  memgraph:
+    image: memgraph/memgraph:latest
+    container_name: raydb-bench-memgraph
+    ports:
+      - "7687:7687"
+    command: >
+      --memory-limit=2048
+      --log-level=WARNING
+      --also-log-to-stderr=false
+    healthcheck:
+      test: ["CMD-SHELL", "echo > /dev/tcp/localhost/7687"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
