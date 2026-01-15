@@ -1,0 +1,1166 @@
+/**
+ * Tests for the vector embeddings module
+ */
+
+import { describe, expect, test } from "bun:test";
+
+import {
+  // Types and constants
+  DEFAULT_VECTOR_CONFIG,
+  DEFAULT_IVF_CONFIG,
+  // Normalization
+  l2Norm,
+  normalizeInPlace,
+  normalize,
+  isNormalized,
+  normalizeRowGroup,
+  normalizeVectorAt,
+  // Distance functions
+  dotProduct,
+  cosineDistance,
+  cosineSimilarity,
+  squaredEuclidean,
+  euclideanDistance,
+  dotProductAt,
+  batchCosineDistance,
+  distanceToSimilarity,
+  findKNearest,
+  MinHeap,
+  MaxHeap,
+  // Row group operations
+  createRowGroup,
+  rowGroupAppend,
+  rowGroupGet,
+  rowGroupGetCopy,
+  rowGroupIsFull,
+  rowGroupTrim,
+  // Fragment operations
+  createFragment,
+  fragmentAppend,
+  fragmentDelete,
+  fragmentIsDeleted,
+  fragmentSeal,
+  fragmentShouldSeal,
+  fragmentGetVector,
+  fragmentLiveCount,
+  // Columnar store
+  createVectorStore,
+  vectorStoreInsert,
+  vectorStoreDelete,
+  vectorStoreGet,
+  vectorStoreHas,
+  vectorStoreIterator,
+  vectorStoreBatchInsert,
+  vectorStoreStats,
+  vectorStoreClear,
+  vectorStoreClone,
+  // IVF index
+  createIvfIndex,
+  ivfAddTrainingVectors,
+  ivfTrain,
+  ivfInsert,
+  ivfSearch,
+  ivfBuildFromStore,
+  ivfStats,
+  // Compaction
+  findFragmentsToCompact,
+  compactFragments,
+  applyCompaction,
+  getCompactionStats,
+  // Serialization
+  serializeIvf,
+  deserializeIvf,
+  serializeManifest,
+  deserializeManifest,
+} from "../src/vector/index.ts";
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/**
+ * Create a random vector
+ */
+function randomVector(dimensions: number): Float32Array {
+  const v = new Float32Array(dimensions);
+  for (let i = 0; i < dimensions; i++) {
+    v[i] = Math.random() * 2 - 1; // Range [-1, 1]
+  }
+  return v;
+}
+
+/**
+ * Create a random normalized vector
+ */
+function randomNormalizedVector(dimensions: number): Float32Array {
+  const v = randomVector(dimensions);
+  normalizeInPlace(v);
+  return v;
+}
+
+/**
+ * Create a vector with specific pattern for testing
+ */
+function patternVector(dimensions: number, pattern: number): Float32Array {
+  const v = new Float32Array(dimensions);
+  for (let i = 0; i < dimensions; i++) {
+    v[i] = Math.sin(i * pattern) + Math.cos(i * pattern * 0.5);
+  }
+  return normalize(v);
+}
+
+// ============================================================================
+// Normalization Tests
+// ============================================================================
+
+describe("Vector Normalization", () => {
+  test("l2Norm computes correct norm", () => {
+    const v = new Float32Array([3, 4]);
+    expect(l2Norm(v)).toBeCloseTo(5, 5);
+
+    const v2 = new Float32Array([1, 0, 0]);
+    expect(l2Norm(v2)).toBeCloseTo(1, 5);
+
+    const v3 = new Float32Array([1, 1, 1, 1]);
+    expect(l2Norm(v3)).toBeCloseTo(2, 5);
+  });
+
+  test("normalizeInPlace normalizes vector", () => {
+    const v = new Float32Array([3, 4]);
+    const norm = normalizeInPlace(v);
+
+    expect(norm).toBeCloseTo(5, 5);
+    expect(l2Norm(v)).toBeCloseTo(1, 5);
+    expect(v[0]).toBeCloseTo(0.6, 5);
+    expect(v[1]).toBeCloseTo(0.8, 5);
+  });
+
+  test("normalize returns new array", () => {
+    const v = new Float32Array([3, 4]);
+    const normalized = normalize(v);
+
+    // Original unchanged
+    expect(v[0]).toBe(3);
+    expect(v[1]).toBe(4);
+
+    // New array is normalized
+    expect(l2Norm(normalized)).toBeCloseTo(1, 5);
+  });
+
+  test("isNormalized checks normalization", () => {
+    const normalized = normalize(new Float32Array([3, 4]));
+    expect(isNormalized(normalized)).toBe(true);
+
+    const notNormalized = new Float32Array([3, 4]);
+    expect(isNormalized(notNormalized)).toBe(false);
+  });
+
+  test("normalizeRowGroup normalizes multiple vectors", () => {
+    const dimensions = 4;
+    const count = 3;
+    const data = new Float32Array(dimensions * count);
+
+    // Set up 3 vectors
+    data.set([1, 2, 3, 4], 0);
+    data.set([5, 6, 7, 8], 4);
+    data.set([9, 10, 11, 12], 8);
+
+    normalizeRowGroup(data, dimensions, count);
+
+    // Check each vector is normalized
+    for (let i = 0; i < count; i++) {
+      let sum = 0;
+      for (let d = 0; d < dimensions; d++) {
+        sum += data[i * dimensions + d] ** 2;
+      }
+      expect(Math.sqrt(sum)).toBeCloseTo(1, 5);
+    }
+  });
+
+  test("normalizeVectorAt normalizes single vector in row group", () => {
+    const dimensions = 4;
+    const data = new Float32Array([1, 2, 3, 4, 5, 6, 7, 8]); // 2 vectors
+
+    normalizeVectorAt(data, dimensions, 1);
+
+    // First vector unchanged
+    expect(data[0]).toBe(1);
+
+    // Second vector normalized
+    let sum = 0;
+    for (let d = 0; d < dimensions; d++) {
+      sum += data[4 + d] ** 2;
+    }
+    expect(Math.sqrt(sum)).toBeCloseTo(1, 5);
+  });
+});
+
+// ============================================================================
+// Distance Function Tests
+// ============================================================================
+
+describe("Distance Functions", () => {
+  test("dotProduct computes correct value", () => {
+    const a = new Float32Array([1, 2, 3]);
+    const b = new Float32Array([4, 5, 6]);
+    expect(dotProduct(a, b)).toBe(32); // 1*4 + 2*5 + 3*6 = 32
+  });
+
+  test("cosineDistance for normalized vectors", () => {
+    const a = normalize(new Float32Array([1, 0]));
+    const b = normalize(new Float32Array([0, 1]));
+
+    // Orthogonal vectors: cosine similarity = 0, distance = 1
+    expect(cosineDistance(a, b)).toBeCloseTo(1, 5);
+
+    // Same direction: distance = 0
+    expect(cosineDistance(a, a)).toBeCloseTo(0, 5);
+
+    // Opposite direction: distance = 2
+    const c = normalize(new Float32Array([-1, 0]));
+    expect(cosineDistance(a, c)).toBeCloseTo(2, 5);
+  });
+
+  test("cosineSimilarity is 1 - distance", () => {
+    const a = normalize(new Float32Array([1, 2, 3]));
+    const b = normalize(new Float32Array([4, 5, 6]));
+
+    const dist = cosineDistance(a, b);
+    const sim = cosineSimilarity(a, b);
+
+    expect(dist + sim).toBeCloseTo(1, 5);
+  });
+
+  test("squaredEuclidean computes correct value", () => {
+    const a = new Float32Array([1, 2, 3]);
+    const b = new Float32Array([4, 6, 8]);
+
+    // (4-1)^2 + (6-2)^2 + (8-3)^2 = 9 + 16 + 25 = 50
+    expect(squaredEuclidean(a, b)).toBe(50);
+  });
+
+  test("euclideanDistance is sqrt of squared", () => {
+    const a = new Float32Array([0, 0]);
+    const b = new Float32Array([3, 4]);
+
+    expect(euclideanDistance(a, b)).toBeCloseTo(5, 5);
+  });
+
+  test("dotProductAt computes distance in row group", () => {
+    const query = normalize(new Float32Array([1, 0, 0, 0]));
+    const dimensions = 4;
+
+    // Row group with 2 vectors
+    const rowGroupData = new Float32Array(8);
+    rowGroupData.set(normalize(new Float32Array([1, 0, 0, 0])), 0);
+    rowGroupData.set(normalize(new Float32Array([0, 1, 0, 0])), 4);
+
+    expect(dotProductAt(query, rowGroupData, dimensions, 0)).toBeCloseTo(1, 5);
+    expect(dotProductAt(query, rowGroupData, dimensions, 1)).toBeCloseTo(0, 5);
+  });
+
+  test("batchCosineDistance computes multiple distances", () => {
+    const dimensions = 4;
+    const query = normalize(new Float32Array([1, 0, 0, 0]));
+
+    const rowGroupData = new Float32Array(12); // 3 vectors
+    rowGroupData.set(normalize(new Float32Array([1, 0, 0, 0])), 0);
+    rowGroupData.set(normalize(new Float32Array([0, 1, 0, 0])), 4);
+    rowGroupData.set(normalize(new Float32Array([-1, 0, 0, 0])), 8);
+
+    const distances = batchCosineDistance(query, rowGroupData, dimensions, 0, 3);
+
+    expect(distances[0]).toBeCloseTo(0, 5); // Same direction
+    expect(distances[1]).toBeCloseTo(1, 5); // Orthogonal
+    expect(distances[2]).toBeCloseTo(2, 5); // Opposite
+  });
+
+  test("distanceToSimilarity converts correctly", () => {
+    expect(distanceToSimilarity(0, "cosine")).toBeCloseTo(1, 5);
+    expect(distanceToSimilarity(1, "cosine")).toBeCloseTo(0, 5);
+
+    expect(distanceToSimilarity(0, "euclidean")).toBeCloseTo(1, 5);
+    expect(distanceToSimilarity(4, "euclidean")).toBeCloseTo(1 / 3, 5);
+  });
+
+  test("findKNearest returns sorted results", () => {
+    const distances = new Float32Array([0.5, 0.1, 0.9, 0.3]);
+    const nearest = findKNearest(distances, 2);
+
+    expect(nearest.length).toBe(2);
+    expect(nearest[0].index).toBe(1);
+    expect(nearest[0].distance).toBeCloseTo(0.1, 5);
+    expect(nearest[1].index).toBe(3);
+    expect(nearest[1].distance).toBeCloseTo(0.3, 5);
+  });
+});
+
+// ============================================================================
+// Heap Tests
+// ============================================================================
+
+describe("Heap Data Structures", () => {
+  test("MinHeap maintains min order", () => {
+    const heap = new MinHeap();
+
+    heap.push(1, 0.5);
+    heap.push(2, 0.1);
+    heap.push(3, 0.9);
+
+    expect(heap.peek()?.id).toBe(2);
+    expect(heap.peek()?.distance).toBeCloseTo(0.1, 5);
+
+    const first = heap.pop();
+    expect(first?.id).toBe(2);
+
+    const second = heap.pop();
+    expect(second?.id).toBe(1);
+
+    const third = heap.pop();
+    expect(third?.id).toBe(3);
+  });
+
+  test("MaxHeap maintains max order", () => {
+    const heap = new MaxHeap();
+
+    heap.push(1, 0.5);
+    heap.push(2, 0.1);
+    heap.push(3, 0.9);
+
+    expect(heap.peek()?.id).toBe(3);
+    expect(heap.peek()?.distance).toBeCloseTo(0.9, 5);
+
+    const first = heap.pop();
+    expect(first?.id).toBe(3);
+
+    const second = heap.pop();
+    expect(second?.id).toBe(1);
+
+    const third = heap.pop();
+    expect(third?.id).toBe(2);
+  });
+});
+
+// ============================================================================
+// Row Group Tests
+// ============================================================================
+
+describe("Row Group Operations", () => {
+  const dimensions = 8;
+  const capacity = 100;
+
+  test("createRowGroup initializes correctly", () => {
+    const rg = createRowGroup(0, dimensions, capacity);
+
+    expect(rg.id).toBe(0);
+    expect(rg.count).toBe(0);
+    expect(rg.data.length).toBe(dimensions * capacity);
+  });
+
+  test("rowGroupAppend adds vectors", () => {
+    const rg = createRowGroup(0, dimensions, capacity);
+    const v1 = randomVector(dimensions);
+    const v2 = randomVector(dimensions);
+
+    const idx1 = rowGroupAppend(rg, v1, dimensions, false);
+    const idx2 = rowGroupAppend(rg, v2, dimensions, false);
+
+    expect(idx1).toBe(0);
+    expect(idx2).toBe(1);
+    expect(rg.count).toBe(2);
+  });
+
+  test("rowGroupAppend normalizes when requested", () => {
+    const rg = createRowGroup(0, dimensions, capacity);
+    const v = randomVector(dimensions);
+
+    rowGroupAppend(rg, v, dimensions, true);
+
+    const stored = rowGroupGet(rg, 0, dimensions);
+    expect(isNormalized(stored)).toBe(true);
+  });
+
+  test("rowGroupGet returns correct vector", () => {
+    const rg = createRowGroup(0, dimensions, capacity);
+    const v = new Float32Array([1, 2, 3, 4, 5, 6, 7, 8]);
+
+    rowGroupAppend(rg, v, dimensions, false);
+
+    const retrieved = rowGroupGet(rg, 0, dimensions);
+    expect(retrieved.length).toBe(dimensions);
+    expect(retrieved[0]).toBe(1);
+    expect(retrieved[7]).toBe(8);
+  });
+
+  test("rowGroupGetCopy returns independent copy", () => {
+    const rg = createRowGroup(0, dimensions, capacity);
+    const v = new Float32Array([1, 2, 3, 4, 5, 6, 7, 8]);
+
+    rowGroupAppend(rg, v, dimensions, false);
+
+    const copy = rowGroupGetCopy(rg, 0, dimensions);
+    copy[0] = 999;
+
+    // Original should be unchanged
+    const original = rowGroupGet(rg, 0, dimensions);
+    expect(original[0]).toBe(1);
+  });
+
+  test("rowGroupIsFull detects full row group", () => {
+    const smallCapacity = 2;
+    const rg = createRowGroup(0, dimensions, smallCapacity);
+
+    expect(rowGroupIsFull(rg, dimensions, smallCapacity)).toBe(false);
+
+    rowGroupAppend(rg, randomVector(dimensions), dimensions, false);
+    expect(rowGroupIsFull(rg, dimensions, smallCapacity)).toBe(false);
+
+    rowGroupAppend(rg, randomVector(dimensions), dimensions, false);
+    expect(rowGroupIsFull(rg, dimensions, smallCapacity)).toBe(true);
+  });
+
+  test("rowGroupTrim reduces size", () => {
+    const rg = createRowGroup(0, dimensions, capacity);
+    rowGroupAppend(rg, randomVector(dimensions), dimensions, false);
+    rowGroupAppend(rg, randomVector(dimensions), dimensions, false);
+
+    const trimmed = rowGroupTrim(rg, dimensions);
+
+    expect(trimmed.data.length).toBe(2 * dimensions);
+    expect(trimmed.count).toBe(2);
+  });
+});
+
+// ============================================================================
+// Fragment Tests
+// ============================================================================
+
+describe("Fragment Operations", () => {
+  const config = {
+    dimensions: 8,
+    metric: "cosine" as const,
+    rowGroupSize: 10,
+    fragmentTargetSize: 100,
+    normalize: true,
+  };
+
+  test("createFragment initializes correctly", () => {
+    const fragment = createFragment(0, config);
+
+    expect(fragment.id).toBe(0);
+    expect(fragment.state).toBe("active");
+    expect(fragment.rowGroups.length).toBe(1);
+    expect(fragment.totalVectors).toBe(0);
+    expect(fragment.deletedCount).toBe(0);
+  });
+
+  test("fragmentAppend adds vectors", () => {
+    const fragment = createFragment(0, config);
+    const v1 = randomVector(config.dimensions);
+    const v2 = randomVector(config.dimensions);
+
+    const idx1 = fragmentAppend(fragment, v1, config);
+    const idx2 = fragmentAppend(fragment, v2, config);
+
+    expect(idx1).toBe(0);
+    expect(idx2).toBe(1);
+    expect(fragment.totalVectors).toBe(2);
+  });
+
+  test("fragmentAppend creates new row groups when needed", () => {
+    const fragment = createFragment(0, config);
+
+    // Add more vectors than row group size
+    for (let i = 0; i < 15; i++) {
+      fragmentAppend(fragment, randomVector(config.dimensions), config);
+    }
+
+    expect(fragment.rowGroups.length).toBe(2);
+    expect(fragment.totalVectors).toBe(15);
+  });
+
+  test("fragmentDelete marks vectors as deleted", () => {
+    const fragment = createFragment(0, config);
+    fragmentAppend(fragment, randomVector(config.dimensions), config);
+    fragmentAppend(fragment, randomVector(config.dimensions), config);
+
+    expect(fragmentDelete(fragment, 0)).toBe(true);
+    expect(fragment.deletedCount).toBe(1);
+    expect(fragmentIsDeleted(fragment, 0)).toBe(true);
+    expect(fragmentIsDeleted(fragment, 1)).toBe(false);
+
+    // Can't delete twice
+    expect(fragmentDelete(fragment, 0)).toBe(false);
+    expect(fragment.deletedCount).toBe(1);
+  });
+
+  test("fragmentSeal marks fragment as sealed", () => {
+    const fragment = createFragment(0, config);
+    fragmentAppend(fragment, randomVector(config.dimensions), config);
+
+    fragmentSeal(fragment);
+
+    expect(fragment.state).toBe("sealed");
+  });
+
+  test("fragmentAppend throws on sealed fragment", () => {
+    const fragment = createFragment(0, config);
+    fragmentSeal(fragment);
+
+    expect(() =>
+      fragmentAppend(fragment, randomVector(config.dimensions), config)
+    ).toThrow();
+  });
+
+  test("fragmentShouldSeal returns true when at target size", () => {
+    const smallConfig = { ...config, fragmentTargetSize: 5 };
+    const fragment = createFragment(0, smallConfig);
+
+    for (let i = 0; i < 4; i++) {
+      fragmentAppend(fragment, randomVector(smallConfig.dimensions), smallConfig);
+    }
+    expect(fragmentShouldSeal(fragment, smallConfig)).toBe(false);
+
+    fragmentAppend(fragment, randomVector(smallConfig.dimensions), smallConfig);
+    expect(fragmentShouldSeal(fragment, smallConfig)).toBe(true);
+  });
+
+  test("fragmentGetVector returns null for deleted vectors", () => {
+    const fragment = createFragment(0, config);
+    fragmentAppend(fragment, randomVector(config.dimensions), config);
+
+    expect(fragmentGetVector(fragment, 0, config.dimensions)).not.toBeNull();
+
+    fragmentDelete(fragment, 0);
+    expect(fragmentGetVector(fragment, 0, config.dimensions)).toBeNull();
+  });
+
+  test("fragmentLiveCount returns correct count", () => {
+    const fragment = createFragment(0, config);
+
+    for (let i = 0; i < 5; i++) {
+      fragmentAppend(fragment, randomVector(config.dimensions), config);
+    }
+
+    expect(fragmentLiveCount(fragment)).toBe(5);
+
+    fragmentDelete(fragment, 1);
+    fragmentDelete(fragment, 3);
+
+    expect(fragmentLiveCount(fragment)).toBe(3);
+  });
+});
+
+// ============================================================================
+// Columnar Store Tests
+// ============================================================================
+
+describe("Columnar Vector Store", () => {
+  const dimensions = 16;
+
+  test("createVectorStore initializes correctly", () => {
+    const store = createVectorStore(dimensions);
+
+    expect(store.config.dimensions).toBe(dimensions);
+    expect(store.fragments.length).toBe(1);
+    expect(store.totalVectors).toBe(0);
+    expect(store.nextVectorId).toBe(0);
+  });
+
+  test("vectorStoreInsert adds vectors", () => {
+    const store = createVectorStore(dimensions);
+
+    const id1 = vectorStoreInsert(store, 100, randomVector(dimensions));
+    const id2 = vectorStoreInsert(store, 101, randomVector(dimensions));
+
+    expect(id1).toBe(0);
+    expect(id2).toBe(1);
+    expect(store.totalVectors).toBe(2);
+    expect(vectorStoreHas(store, 100)).toBe(true);
+    expect(vectorStoreHas(store, 101)).toBe(true);
+  });
+
+  test("vectorStoreInsert replaces existing vector", () => {
+    const store = createVectorStore(dimensions);
+    const v1 = randomVector(dimensions);
+    const v2 = randomVector(dimensions);
+
+    vectorStoreInsert(store, 100, v1);
+    vectorStoreInsert(store, 100, v2);
+
+    // Should have only 1 vector (replacement)
+    expect(store.nodeIdToVectorId.size).toBe(1);
+  });
+
+  test("vectorStoreDelete removes vectors", () => {
+    const store = createVectorStore(dimensions);
+    vectorStoreInsert(store, 100, randomVector(dimensions));
+
+    expect(vectorStoreDelete(store, 100)).toBe(true);
+    expect(vectorStoreHas(store, 100)).toBe(false);
+    expect(store.totalDeleted).toBe(1);
+  });
+
+  test("vectorStoreGet retrieves vectors", () => {
+    const store = createVectorStore(dimensions);
+    const v = randomNormalizedVector(dimensions);
+    vectorStoreInsert(store, 100, v);
+
+    const retrieved = vectorStoreGet(store, 100);
+    expect(retrieved).not.toBeNull();
+
+    // Check values match (normalized)
+    for (let i = 0; i < dimensions; i++) {
+      expect(retrieved![i]).toBeCloseTo(v[i], 3);
+    }
+  });
+
+  test("vectorStoreIterator yields all live vectors", () => {
+    const store = createVectorStore(dimensions);
+
+    vectorStoreInsert(store, 100, randomVector(dimensions));
+    vectorStoreInsert(store, 101, randomVector(dimensions));
+    vectorStoreInsert(store, 102, randomVector(dimensions));
+    vectorStoreDelete(store, 101);
+
+    const results = [...vectorStoreIterator(store)];
+    expect(results.length).toBe(2);
+
+    const nodeIds = results.map((r) => r[1]);
+    expect(nodeIds).toContain(100);
+    expect(nodeIds).toContain(102);
+    expect(nodeIds).not.toContain(101);
+  });
+
+  test("vectorStoreBatchInsert adds multiple vectors", () => {
+    const store = createVectorStore(dimensions);
+
+    const entries = Array.from({ length: 50 }, (_, i) => ({
+      nodeId: i,
+      vector: randomVector(dimensions),
+    }));
+
+    const ids = vectorStoreBatchInsert(store, entries);
+
+    expect(ids.length).toBe(50);
+    expect(store.totalVectors).toBe(50);
+  });
+
+  test("vectorStoreStats returns correct statistics", () => {
+    const store = createVectorStore(dimensions);
+
+    for (let i = 0; i < 10; i++) {
+      vectorStoreInsert(store, i, randomVector(dimensions));
+    }
+    vectorStoreDelete(store, 5);
+
+    const stats = vectorStoreStats(store);
+
+    expect(stats.totalVectors).toBe(10);
+    expect(stats.totalDeleted).toBe(1);
+    expect(stats.liveVectors).toBe(9);
+    expect(stats.dimensions).toBe(dimensions);
+  });
+
+  test("vectorStoreClear removes all data", () => {
+    const store = createVectorStore(dimensions);
+
+    for (let i = 0; i < 10; i++) {
+      vectorStoreInsert(store, i, randomVector(dimensions));
+    }
+
+    vectorStoreClear(store);
+
+    expect(store.totalVectors).toBe(0);
+    expect(store.nodeIdToVectorId.size).toBe(0);
+  });
+
+  test("vectorStoreClone creates independent copy", () => {
+    const store = createVectorStore(dimensions);
+    vectorStoreInsert(store, 100, randomVector(dimensions));
+
+    const clone = vectorStoreClone(store);
+    vectorStoreDelete(clone, 100);
+
+    // Original should be unchanged
+    expect(vectorStoreHas(store, 100)).toBe(true);
+    expect(vectorStoreHas(clone, 100)).toBe(false);
+  });
+});
+
+// ============================================================================
+// IVF Index Tests
+// ============================================================================
+
+describe("IVF Index", () => {
+  const dimensions = 32;
+
+  test("createIvfIndex initializes correctly", () => {
+    const index = createIvfIndex(dimensions);
+
+    expect(index.trained).toBe(false);
+    expect(index.config.nClusters).toBe(DEFAULT_IVF_CONFIG.nClusters);
+    expect(index.centroids.length).toBe(DEFAULT_IVF_CONFIG.nClusters * dimensions);
+  });
+
+  test("ivfTrain trains the index", () => {
+    const index = createIvfIndex(dimensions, { nClusters: 8 });
+
+    // Add training vectors
+    const trainingData = new Float32Array(100 * dimensions);
+    for (let i = 0; i < 100; i++) {
+      const v = randomNormalizedVector(dimensions);
+      trainingData.set(v, i * dimensions);
+    }
+
+    ivfAddTrainingVectors(index, trainingData, dimensions, 100);
+    ivfTrain(index, dimensions);
+
+    expect(index.trained).toBe(true);
+    expect(index.invertedLists.size).toBe(8);
+  });
+
+  test("ivfTrain requires enough training vectors", () => {
+    const index = createIvfIndex(dimensions, { nClusters: 100 });
+
+    const trainingData = new Float32Array(10 * dimensions);
+    ivfAddTrainingVectors(index, trainingData, dimensions, 10);
+
+    expect(() => ivfTrain(index, dimensions)).toThrow();
+  });
+
+  test("ivfInsert adds vectors to index", () => {
+    const index = createIvfIndex(dimensions, { nClusters: 4 });
+
+    // Train first
+    const trainingData = new Float32Array(50 * dimensions);
+    for (let i = 0; i < 50; i++) {
+      trainingData.set(randomNormalizedVector(dimensions), i * dimensions);
+    }
+    ivfAddTrainingVectors(index, trainingData, dimensions, 50);
+    ivfTrain(index, dimensions);
+
+    // Insert vectors
+    const v = randomNormalizedVector(dimensions);
+    ivfInsert(index, 0, v, dimensions);
+
+    const stats = ivfStats(index);
+    expect(stats.totalVectors).toBe(1);
+  });
+
+  test("ivfSearch finds nearest neighbors", () => {
+    const store = createVectorStore(dimensions);
+    // Use only 2 clusters since we have few vectors
+    const index = createIvfIndex(dimensions, { nClusters: 2, nProbe: 2 });
+
+    // Create vectors with known patterns
+    const baseVector = patternVector(dimensions, 1.0);
+    const similarVector = patternVector(dimensions, 1.1);
+    const differentVector = patternVector(dimensions, 5.0);
+
+    vectorStoreInsert(store, 1, baseVector);
+    vectorStoreInsert(store, 2, similarVector);
+    vectorStoreInsert(store, 3, differentVector);
+
+    // Build index
+    ivfBuildFromStore(index, store);
+
+    // Search for similar to base
+    const results = ivfSearch(index, store, baseVector, 2);
+
+    expect(results.length).toBe(2);
+    // Base vector should be most similar to itself
+    expect(results[0].nodeId).toBe(1);
+    // Similar vector should be second
+    expect(results[1].nodeId).toBe(2);
+  });
+
+  test("ivfSearch respects filter", () => {
+    const store = createVectorStore(dimensions);
+    const index = createIvfIndex(dimensions, { nClusters: 4, nProbe: 4 });
+
+    // Add vectors
+    for (let i = 0; i < 20; i++) {
+      vectorStoreInsert(store, i, randomNormalizedVector(dimensions));
+    }
+
+    ivfBuildFromStore(index, store);
+
+    const query = randomNormalizedVector(dimensions);
+
+    // Filter to only even node IDs
+    const results = ivfSearch(index, store, query, 10, {
+      filter: (nodeId) => nodeId % 2 === 0,
+    });
+
+    for (const result of results) {
+      expect(result.nodeId % 2).toBe(0);
+    }
+  });
+
+  test("ivfSearch respects threshold", () => {
+    const store = createVectorStore(dimensions);
+    const index = createIvfIndex(dimensions, { nClusters: 4, nProbe: 4 });
+
+    // Add vectors
+    for (let i = 0; i < 20; i++) {
+      vectorStoreInsert(store, i, randomNormalizedVector(dimensions));
+    }
+
+    ivfBuildFromStore(index, store);
+
+    const query = randomNormalizedVector(dimensions);
+
+    // High threshold should return fewer results
+    const resultsHigh = ivfSearch(index, store, query, 20, {
+      threshold: 0.9,
+    });
+
+    const resultsLow = ivfSearch(index, store, query, 20, {
+      threshold: 0.1,
+    });
+
+    // All results should meet the threshold
+    for (const result of resultsHigh) {
+      expect(result.similarity).toBeGreaterThanOrEqual(0.9);
+    }
+  });
+
+  test("ivfStats returns correct statistics", () => {
+    const index = createIvfIndex(dimensions, { nClusters: 4 });
+
+    const trainingData = new Float32Array(50 * dimensions);
+    for (let i = 0; i < 50; i++) {
+      trainingData.set(randomNormalizedVector(dimensions), i * dimensions);
+    }
+    ivfAddTrainingVectors(index, trainingData, dimensions, 50);
+    ivfTrain(index, dimensions);
+
+    // Add some vectors
+    for (let i = 0; i < 20; i++) {
+      ivfInsert(index, i, randomNormalizedVector(dimensions), dimensions);
+    }
+
+    const stats = ivfStats(index);
+
+    expect(stats.trained).toBe(true);
+    expect(stats.nClusters).toBe(4);
+    expect(stats.totalVectors).toBe(20);
+    expect(stats.avgVectorsPerCluster).toBe(5);
+  });
+});
+
+// ============================================================================
+// Compaction Tests
+// ============================================================================
+
+describe("Compaction", () => {
+  const dimensions = 16;
+
+  test("findFragmentsToCompact identifies candidates", () => {
+    const store = createVectorStore(dimensions, {
+      fragmentTargetSize: 10,
+      rowGroupSize: 5,
+    });
+
+    // Create and fill a fragment
+    for (let i = 0; i < 10; i++) {
+      vectorStoreInsert(store, i, randomVector(dimensions));
+    }
+
+    // Force seal the first fragment and create a new active one
+    store.fragments[0].state = "sealed";
+    store.fragments.push(createFragment(1, store.config));
+    store.activeFragmentId = 1;
+
+    // Delete 40% from the sealed fragment (above threshold)
+    vectorStoreDelete(store, 0);
+    vectorStoreDelete(store, 1);
+    vectorStoreDelete(store, 2);
+    vectorStoreDelete(store, 3);
+
+    // Use custom strategy with lower minVectorsToCompact
+    const candidates = findFragmentsToCompact(store, {
+      minDeletionRatio: 0.3,
+      maxFragmentsPerCompaction: 4,
+      minVectorsToCompact: 1, // Low threshold for test
+    });
+    expect(candidates).toContain(0);
+  });
+
+  test("compactFragments creates new fragment", () => {
+    const store = createVectorStore(dimensions, {
+      fragmentTargetSize: 10,
+      rowGroupSize: 5,
+    });
+
+    // Add vectors
+    for (let i = 0; i < 10; i++) {
+      vectorStoreInsert(store, i, randomVector(dimensions));
+    }
+
+    // Seal and delete some
+    store.fragments[0].state = "sealed";
+    vectorStoreDelete(store, 0);
+    vectorStoreDelete(store, 5);
+
+    const { newFragment, updatedLocations } = compactFragments(store, [0]);
+
+    expect(newFragment.totalVectors).toBe(8);
+    expect(newFragment.deletedCount).toBe(0);
+    expect(updatedLocations.size).toBe(8);
+  });
+
+  test("applyCompaction updates manifest", () => {
+    const store = createVectorStore(dimensions, {
+      fragmentTargetSize: 10,
+      rowGroupSize: 5,
+    });
+
+    // Add vectors
+    for (let i = 0; i < 10; i++) {
+      vectorStoreInsert(store, i, randomVector(dimensions));
+    }
+
+    store.fragments[0].state = "sealed";
+    vectorStoreDelete(store, 0);
+    vectorStoreDelete(store, 5);
+
+    const { newFragment, updatedLocations } = compactFragments(store, [0]);
+    applyCompaction(store, [0], newFragment, updatedLocations);
+
+    expect(store.fragments.length).toBe(2); // Original + new
+    expect(store.totalDeleted).toBe(0); // Deleted vectors removed
+
+    // Original fragment should be cleared
+    expect(store.fragments[0].totalVectors).toBe(0);
+  });
+
+  test("getCompactionStats returns correct info", () => {
+    const store = createVectorStore(dimensions, {
+      fragmentTargetSize: 10,
+      rowGroupSize: 5,
+    });
+
+    for (let i = 0; i < 10; i++) {
+      vectorStoreInsert(store, i, randomVector(dimensions));
+    }
+
+    store.fragments[0].state = "sealed";
+    vectorStoreDelete(store, 0);
+    vectorStoreDelete(store, 1);
+    vectorStoreDelete(store, 2);
+    vectorStoreDelete(store, 3);
+
+    const stats = getCompactionStats(store);
+
+    expect(stats.fragmentsNeedingCompaction).toBe(1);
+    expect(stats.totalDeletedVectors).toBe(4);
+    expect(stats.averageDeletionRatio).toBeCloseTo(0.4, 5);
+  });
+});
+
+// ============================================================================
+// Serialization Tests
+// ============================================================================
+
+describe("Serialization", () => {
+  const dimensions = 16;
+
+  test("IVF index serialization roundtrip", () => {
+    const index = createIvfIndex(dimensions, { nClusters: 4 });
+
+    // Train
+    const trainingData = new Float32Array(50 * dimensions);
+    for (let i = 0; i < 50; i++) {
+      trainingData.set(randomNormalizedVector(dimensions), i * dimensions);
+    }
+    ivfAddTrainingVectors(index, trainingData, dimensions, 50);
+    ivfTrain(index, dimensions);
+
+    // Add vectors
+    for (let i = 0; i < 10; i++) {
+      ivfInsert(index, i, randomNormalizedVector(dimensions), dimensions);
+    }
+
+    // Serialize
+    const serialized = serializeIvf(index, dimensions);
+    expect(serialized.length).toBeGreaterThan(0);
+
+    // Deserialize
+    const { index: restored, dimensions: restoredDims } =
+      deserializeIvf(serialized);
+
+    expect(restoredDims).toBe(dimensions);
+    expect(restored.trained).toBe(index.trained);
+    expect(restored.config.nClusters).toBe(index.config.nClusters);
+
+    // Check centroids
+    for (let i = 0; i < index.centroids.length; i++) {
+      expect(restored.centroids[i]).toBeCloseTo(index.centroids[i], 5);
+    }
+
+    // Check inverted lists
+    expect(restored.invertedLists.size).toBe(index.invertedLists.size);
+  });
+
+  test("Manifest serialization roundtrip", () => {
+    const store = createVectorStore(dimensions);
+
+    // Add vectors
+    for (let i = 0; i < 20; i++) {
+      vectorStoreInsert(store, i * 10, randomVector(dimensions));
+    }
+
+    // Delete some
+    vectorStoreDelete(store, 50);
+    vectorStoreDelete(store, 100);
+
+    // Serialize
+    const serialized = serializeManifest(store);
+    expect(serialized.length).toBeGreaterThan(0);
+
+    // Deserialize
+    const restored = deserializeManifest(serialized);
+
+    expect(restored.config.dimensions).toBe(store.config.dimensions);
+    expect(restored.totalVectors).toBe(store.totalVectors);
+    expect(restored.totalDeleted).toBe(store.totalDeleted);
+    expect(restored.nextVectorId).toBe(store.nextVectorId);
+
+    // Check node ID mappings
+    expect(restored.nodeIdToVectorId.size).toBe(store.nodeIdToVectorId.size);
+
+    for (const [nodeId, vectorId] of store.nodeIdToVectorId) {
+      expect(restored.nodeIdToVectorId.get(nodeId)).toBe(vectorId);
+    }
+
+    // Check vector data
+    for (const [vectorId, nodeId, vector] of vectorStoreIterator(store)) {
+      const restoredVec = vectorStoreGet(restored, nodeId);
+      expect(restoredVec).not.toBeNull();
+
+      for (let i = 0; i < dimensions; i++) {
+        expect(restoredVec![i]).toBeCloseTo(vector[i], 5);
+      }
+    }
+  });
+
+  test("Empty store serialization", () => {
+    const store = createVectorStore(dimensions);
+
+    const serialized = serializeManifest(store);
+    const restored = deserializeManifest(serialized);
+
+    expect(restored.totalVectors).toBe(0);
+    expect(restored.nodeIdToVectorId.size).toBe(0);
+  });
+});
+
+// ============================================================================
+// Integration Tests
+// ============================================================================
+
+describe("Integration", () => {
+  const dimensions = 64;
+
+  test("Full workflow: insert, build index, search, delete, compact", () => {
+    // Create store
+    const store = createVectorStore(dimensions, {
+      fragmentTargetSize: 50,
+      rowGroupSize: 10,
+    });
+
+    // Insert vectors
+    const vectors: Map<number, Float32Array> = new Map();
+    for (let i = 0; i < 100; i++) {
+      const v = randomNormalizedVector(dimensions);
+      vectors.set(i, v);
+      vectorStoreInsert(store, i, v);
+    }
+
+    expect(store.totalVectors).toBe(100);
+    expect(store.fragments.length).toBeGreaterThan(1); // Should have sealed fragments
+
+    // Build index
+    const index = createIvfIndex(dimensions, { nClusters: 8, nProbe: 4 });
+    ivfBuildFromStore(index, store);
+
+    expect(index.trained).toBe(true);
+
+    // Search
+    const queryNodeId = 42;
+    const queryVector = vectors.get(queryNodeId)!;
+    const results = ivfSearch(index, store, queryVector, 5);
+
+    expect(results.length).toBe(5);
+    expect(results[0].nodeId).toBe(queryNodeId); // Should find itself first
+
+    // Delete some vectors (every 3rd starting from 0)
+    const deletedNodeIds = new Set<number>();
+    for (let i = 0; i < 30; i++) {
+      const nodeId = i * 3;
+      if (vectorStoreDelete(store, nodeId)) {
+        deletedNodeIds.add(nodeId);
+      }
+    }
+
+    expect(store.totalDeleted).toBe(deletedNodeIds.size);
+
+    // Check compaction stats - totalDeleted in store should match
+    const compactionStats = getCompactionStats(store);
+    // Note: compactionStats only counts deleted in sealed fragments
+    expect(compactionStats.totalDeletedVectors).toBeGreaterThan(0);
+
+    // Search again - deleted vectors should not appear
+    const resultsAfterDelete = ivfSearch(index, store, queryVector, 10);
+
+    for (const result of resultsAfterDelete) {
+      expect(deletedNodeIds.has(result.nodeId)).toBe(false);
+    }
+  });
+
+  test("Large scale test", () => {
+    const largeDimensions = 128;
+    const numVectors = 1000;
+
+    const store = createVectorStore(largeDimensions, {
+      fragmentTargetSize: 500,
+      rowGroupSize: 100,
+    });
+
+    // Batch insert
+    const entries = Array.from({ length: numVectors }, (_, i) => ({
+      nodeId: i,
+      vector: randomNormalizedVector(largeDimensions),
+    }));
+
+    vectorStoreBatchInsert(store, entries);
+
+    expect(store.totalVectors).toBe(numVectors);
+
+    // Build index
+    const index = createIvfIndex(largeDimensions, {
+      nClusters: 32,
+      nProbe: 8,
+    });
+    ivfBuildFromStore(index, store);
+
+    // Search should complete in reasonable time
+    const query = randomNormalizedVector(largeDimensions);
+    const startTime = performance.now();
+
+    const results = ivfSearch(index, store, query, 10);
+
+    const elapsed = performance.now() - startTime;
+    expect(elapsed).toBeLessThan(1000); // Should be fast
+
+    expect(results.length).toBe(10);
+
+    // All results should have valid similarity scores
+    for (const result of results) {
+      expect(result.similarity).toBeGreaterThan(0);
+      expect(result.similarity).toBeLessThanOrEqual(1);
+    }
+  });
+});

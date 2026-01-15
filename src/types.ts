@@ -165,6 +165,12 @@ export enum WalRecordType {
   DEL_NODE_PROP = 52,
   SET_EDGE_PROP = 53,
   DEL_EDGE_PROP = 54,
+  // Vector embeddings operations
+  SET_NODE_VECTOR = 60,
+  DEL_NODE_VECTOR = 61,
+  BATCH_VECTORS = 62,
+  SEAL_FRAGMENT = 63,
+  COMPACT_FRAGMENTS = 64,
 }
 
 export interface WalRecordHeader {
@@ -188,6 +194,7 @@ export enum PropValueTag {
   I64 = 2,
   F64 = 3,
   STRING = 4,
+  VECTOR_F32 = 5, // Normalized float32 vector for embeddings
 }
 
 export type PropValue =
@@ -195,7 +202,8 @@ export type PropValue =
   | { tag: PropValueTag.BOOL; value: boolean }
   | { tag: PropValueTag.I64; value: bigint }
   | { tag: PropValueTag.F64; value: number }
-  | { tag: PropValueTag.STRING; value: string };
+  | { tag: PropValueTag.STRING; value: string }
+  | { tag: PropValueTag.VECTOR_F32; value: Float32Array };
 
 /** Fixed-width disk encoding for properties (16 bytes) */
 export interface PropValueDisk {
