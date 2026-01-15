@@ -53,6 +53,17 @@ pub fn edge_exists(handle: &TxHandle, src: NodeId, etype: ETypeId, dst: NodeId) 
 
 /// Internal edge existence check
 fn edge_exists_internal(db: &super::db::GraphDB, src: NodeId, etype: ETypeId, dst: NodeId) -> bool {
+  edge_exists_db(db, src, etype, dst)
+}
+
+// ============================================================================
+// Direct Read Functions (No Transaction Required)
+// ============================================================================
+// These functions read directly from snapshot + delta without transaction
+// overhead, matching the TypeScript implementation pattern.
+
+/// Check if an edge exists (direct read, no transaction)
+pub fn edge_exists_db(db: &super::db::GraphDB, src: NodeId, etype: ETypeId, dst: NodeId) -> bool {
   let delta = db.delta.read();
 
   // Check if deleted in delta
@@ -67,7 +78,6 @@ fn edge_exists_internal(db: &super::db::GraphDB, src: NodeId, etype: ETypeId, ds
 
   // Check snapshot
   if let Some(ref snapshot) = db.snapshot {
-    // Get physical node indices
     if let (Some(src_phys), Some(dst_phys)) =
       (snapshot.get_phys_node(src), snapshot.get_phys_node(dst))
     {
@@ -76,6 +86,205 @@ fn edge_exists_internal(db: &super::db::GraphDB, src: NodeId, etype: ETypeId, ds
   }
 
   false
+}
+
+/// Get outgoing neighbors for a node (direct read, no transaction)
+pub fn get_neighbors_out_db(
+  db: &super::db::GraphDB,
+  src: NodeId,
+  etype: Option<ETypeId>,
+) -> Vec<NodeId> {
+  let delta = db.delta.read();
+  let mut neighbors = Vec::new();
+
+  let deleted_set = delta.out_del.get(&src);
+
+  // Get from snapshot first
+  if let Some(ref snapshot) = db.snapshot {
+    if let Some(src_phys) = snapshot.get_phys_node(src) {
+      for (dst_phys, edge_etype) in snapshot.iter_out_edges(src_phys) {
+        if etype.is_some() && etype != Some(edge_etype) {
+          continue;
+        }
+
+        if let Some(dst_id) = snapshot.get_node_id(dst_phys) {
+          let is_deleted = deleted_set
+            .map(|set| {
+              set.contains(&crate::types::EdgePatch {
+                etype: edge_etype,
+                other: dst_id,
+              })
+            })
+            .unwrap_or(false);
+
+          if !is_deleted {
+            neighbors.push(dst_id);
+          }
+        }
+      }
+    }
+  }
+
+  // Get from delta additions
+  if let Some(add_set) = delta.out_add.get(&src) {
+    for patch in add_set {
+      if etype.is_none() || etype == Some(patch.etype) {
+        if !neighbors.contains(&patch.other) {
+          neighbors.push(patch.other);
+        }
+      }
+    }
+  }
+
+  neighbors
+}
+
+/// Get incoming neighbors for a node (direct read, no transaction)
+pub fn get_neighbors_in_db(
+  db: &super::db::GraphDB,
+  dst: NodeId,
+  etype: Option<ETypeId>,
+) -> Vec<NodeId> {
+  let delta = db.delta.read();
+  let mut neighbors = Vec::new();
+
+  let deleted_set = delta.in_del.get(&dst);
+
+  // Get from snapshot first
+  if let Some(ref snapshot) = db.snapshot {
+    if let Some(dst_phys) = snapshot.get_phys_node(dst) {
+      for (src_phys, edge_etype, _out_idx) in snapshot.iter_in_edges(dst_phys) {
+        if etype.is_some() && etype != Some(edge_etype) {
+          continue;
+        }
+
+        if let Some(src_id) = snapshot.get_node_id(src_phys) {
+          let is_deleted = deleted_set
+            .map(|set| {
+              set.contains(&crate::types::EdgePatch {
+                etype: edge_etype,
+                other: src_id,
+              })
+            })
+            .unwrap_or(false);
+
+          if !is_deleted {
+            neighbors.push(src_id);
+          }
+        }
+      }
+    }
+  }
+
+  // Get from delta additions
+  if let Some(add_set) = delta.in_add.get(&dst) {
+    for patch in add_set {
+      if etype.is_none() || etype == Some(patch.etype) {
+        if !neighbors.contains(&patch.other) {
+          neighbors.push(patch.other);
+        }
+      }
+    }
+  }
+
+  neighbors
+}
+
+/// Get an edge property (direct read, no transaction)
+pub fn get_edge_prop_db(
+  db: &super::db::GraphDB,
+  src: NodeId,
+  etype: ETypeId,
+  dst: NodeId,
+  key_id: PropKeyId,
+) -> Option<PropValue> {
+  let delta = db.delta.read();
+
+  if delta.is_edge_deleted(src, etype, dst) {
+    return None;
+  }
+
+  // Check delta first
+  if let Some(delta_props) = delta.edge_props.get(&(src, etype, dst)) {
+    if let Some(value) = delta_props.get(&key_id) {
+      return value.clone();
+    }
+  }
+
+  let edge_added_in_delta = delta.is_edge_added(src, etype, dst);
+
+  // Fall back to snapshot
+  if let Some(ref snapshot) = db.snapshot {
+    if let Some(src_phys) = snapshot.get_phys_node(src) {
+      if let Some(dst_phys) = snapshot.get_phys_node(dst) {
+        if let Some(edge_idx) = snapshot.find_edge_index(src_phys, etype, dst_phys) {
+          if let Some(snapshot_props) = snapshot.get_edge_props(edge_idx) {
+            if let Some(value) = snapshot_props.get(&key_id) {
+              return Some(value.clone());
+            }
+          }
+        } else if !edge_added_in_delta {
+          return None;
+        }
+      }
+    }
+  }
+
+  None
+}
+
+/// Get all edge properties (direct read, no transaction)
+pub fn get_edge_props_db(
+  db: &super::db::GraphDB,
+  src: NodeId,
+  etype: ETypeId,
+  dst: NodeId,
+) -> Option<std::collections::HashMap<PropKeyId, PropValue>> {
+  use std::collections::HashMap;
+
+  let delta = db.delta.read();
+
+  if delta.is_edge_deleted(src, etype, dst) {
+    return None;
+  }
+
+  let mut props = HashMap::new();
+  let edge_added_in_delta = delta.is_edge_added(src, etype, dst);
+  let mut edge_exists_in_snapshot = false;
+
+  // Check snapshot
+  if let Some(ref snapshot) = db.snapshot {
+    if let Some(src_phys) = snapshot.get_phys_node(src) {
+      if let Some(dst_phys) = snapshot.get_phys_node(dst) {
+        if let Some(edge_idx) = snapshot.find_edge_index(src_phys, etype, dst_phys) {
+          edge_exists_in_snapshot = true;
+          if let Some(snapshot_props) = snapshot.get_edge_props(edge_idx) {
+            props = snapshot_props;
+          }
+        }
+      }
+    }
+  }
+
+  if !edge_added_in_delta && !edge_exists_in_snapshot {
+    return None;
+  }
+
+  // Apply delta modifications
+  if let Some(delta_props) = delta.edge_props.get(&(src, etype, dst)) {
+    for (&key_id, value) in delta_props {
+      match value {
+        Some(v) => {
+          props.insert(key_id, v.clone());
+        }
+        None => {
+          props.remove(&key_id);
+        }
+      }
+    }
+  }
+
+  Some(props)
 }
 
 /// Get outgoing neighbors for a node

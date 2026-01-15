@@ -116,6 +116,17 @@ pub fn node_exists(handle: &TxHandle, node_id: NodeId) -> bool {
 
 /// Internal node existence check (on GraphDB directly)
 fn node_exists_internal(db: &super::db::GraphDB, node_id: NodeId) -> bool {
+  node_exists_db(db, node_id)
+}
+
+// ============================================================================
+// Direct Read Functions (No Transaction Required)
+// ============================================================================
+// These functions read directly from snapshot + delta without transaction
+// overhead, matching the TypeScript implementation pattern.
+
+/// Check if a node exists (direct read, no transaction)
+pub fn node_exists_db(db: &super::db::GraphDB, node_id: NodeId) -> bool {
   let delta = db.delta.read();
 
   if delta.is_node_deleted(node_id) {
@@ -132,6 +143,87 @@ fn node_exists_internal(db: &super::db::GraphDB, node_id: NodeId) -> bool {
   }
 
   false
+}
+
+/// Get a node by its key (direct read, no transaction)
+pub fn get_node_by_key_db(db: &super::db::GraphDB, key: &str) -> Option<NodeId> {
+  let delta = db.delta.read();
+
+  // Check if key was deleted in delta
+  if delta.key_index_deleted.contains(key) {
+    return None;
+  }
+
+  // Check if key exists in delta
+  if let Some(node_id) = delta.get_node_by_key(key) {
+    // Make sure the node isn't deleted
+    if !delta.is_node_deleted(node_id) {
+      return Some(node_id);
+    }
+  }
+
+  // Check snapshot
+  if let Some(ref snapshot) = db.snapshot {
+    if let Some(node_id) = snapshot.lookup_by_key(key) {
+      // Make sure node wasn't deleted in delta
+      if !delta.is_node_deleted(node_id) {
+        return Some(node_id);
+      }
+    }
+  }
+
+  None
+}
+
+/// Get a node property (direct read, no transaction)
+pub fn get_node_prop_db(
+  db: &super::db::GraphDB,
+  node_id: NodeId,
+  key_id: PropKeyId,
+) -> Option<PropValue> {
+  let delta = db.delta.read();
+
+  // Check if node is deleted
+  if delta.is_node_deleted(node_id) {
+    return None;
+  }
+
+  // Check delta for property (Some(Some(v)) = set, Some(None) = deleted)
+  if let Some(value_opt) = delta.get_node_prop(node_id, key_id) {
+    return value_opt.cloned();
+  }
+
+  // Check snapshot
+  if let Some(ref snapshot) = db.snapshot {
+    if let Some(phys) = snapshot.get_phys_node(node_id) {
+      return snapshot.get_node_prop(phys, key_id);
+    }
+  }
+
+  None
+}
+
+/// Count total nodes in the database (direct read, no transaction)
+pub fn count_nodes_db(db: &super::db::GraphDB) -> u64 {
+  let delta = db.delta.read();
+
+  // Start with snapshot count
+  let snapshot_count = db.snapshot.as_ref().map(|s| s.header.num_nodes).unwrap_or(0);
+
+  // Count nodes created in delta
+  let created = delta.created_nodes.len() as u64;
+
+  // Count nodes deleted in delta that existed in snapshot
+  let mut deleted_from_snapshot = 0u64;
+  if let Some(ref snapshot) = db.snapshot {
+    for &node_id in &delta.deleted_nodes {
+      if !delta.created_nodes.contains_key(&node_id) && snapshot.has_node(node_id) {
+        deleted_from_snapshot += 1;
+      }
+    }
+  }
+
+  snapshot_count + created - deleted_from_snapshot
 }
 
 /// Set a node property

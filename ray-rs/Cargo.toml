@@ -62,6 +62,7 @@ rand = "0.8"
 # Unix-specific APIs (for directory sync)
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["fs"] }
+libc = "0.2"
 
 [build-dependencies]
 napi-build = "2"

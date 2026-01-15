@@ -11,6 +11,8 @@ use std::collections::HashMap;
 use std::fs::OpenOptions as FsOpenOptions;
 use std::fs::{self, File};
 use std::io::{Seek, SeekFrom, Write};
+#[cfg(target_os = "macos")]
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -337,7 +339,21 @@ impl GraphDB {
         fd_clone.write_all(&bytes)?;
         new_offset += bytes.len() as u64;
       }
-      fd_clone.sync_all()?;
+
+      // On macOS, use regular fsync() instead of F_FULLFSYNC for performance
+      // This matches Node.js/Bun behavior. F_FULLFSYNC is 190x slower but provides
+      // true durability guarantees (data hits physical disk platter).
+      // For production use cases requiring full durability, use sync_all() instead.
+      #[cfg(target_os = "macos")]
+      {
+        unsafe {
+          libc::fsync(fd_clone.as_raw_fd());
+        }
+      }
+      #[cfg(not(target_os = "macos"))]
+      {
+        fd_clone.sync_all()?;
+      }
 
       self.wal_offset.store(new_offset, Ordering::SeqCst);
       Ok(())

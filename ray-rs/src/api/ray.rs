@@ -16,11 +16,15 @@ use crate::graph::db::{close_graph_db, open_graph_db, GraphDB, OpenOptions};
 use crate::graph::edges::{
   add_edge, del_edge_prop, delete_edge, edge_exists, get_edge_prop, get_edge_props,
   get_neighbors_in, get_neighbors_out, set_edge_prop,
+  // Direct read functions (no transaction)
+  edge_exists_db, get_edge_prop_db, get_edge_props_db, get_neighbors_in_db, get_neighbors_out_db,
 };
 use crate::graph::iterators::{count_edges, count_nodes, list_edges, list_nodes, FullEdge, ListEdgesOptions};
 use crate::graph::nodes::{
   create_node, del_node_prop, delete_node, get_node_by_key, get_node_prop, node_exists,
   set_node_prop, NodeOpts,
+  // Direct read functions (no transaction)
+  count_nodes_db, get_node_by_key_db, get_node_prop_db, node_exists_db,
 };
 use crate::graph::tx::{begin_tx, commit, rollback, TxHandle};
 use crate::types::*;
@@ -389,8 +393,8 @@ impl Ray {
     })
   }
 
-  /// Get a node by key
-  pub fn get(&mut self, node_type: &str, key_suffix: &str) -> Result<Option<NodeRef>> {
+  /// Get a node by key (direct read, no transaction overhead)
+  pub fn get(&self, node_type: &str, key_suffix: &str) -> Result<Option<NodeRef>> {
     let node_def = self
       .nodes
       .get(node_type)
@@ -398,9 +402,8 @@ impl Ray {
 
     let full_key = node_def.key(key_suffix);
 
-    let mut handle = begin_tx(&mut self.db)?;
-    let node_id = get_node_by_key(&handle, &full_key);
-    commit(&mut handle)?;
+    // Direct read without transaction
+    let node_id = get_node_by_key_db(&self.db, &full_key);
 
     match node_id {
       Some(id) => Ok(Some(NodeRef::new(id, Some(full_key), node_type))),
@@ -408,11 +411,10 @@ impl Ray {
     }
   }
 
-  /// Get a node by ID
-  pub fn get_by_id(&mut self, node_id: NodeId) -> Result<Option<NodeRef>> {
-    let mut handle = begin_tx(&mut self.db)?;
-    let exists = node_exists(&handle, node_id);
-    commit(&mut handle)?;
+  /// Get a node by ID (direct read, no transaction overhead)
+  pub fn get_by_id(&self, node_id: NodeId) -> Result<Option<NodeRef>> {
+    // Direct read without transaction
+    let exists = node_exists_db(&self.db, node_id);
 
     if exists {
       // Try to determine node type from key
@@ -423,12 +425,10 @@ impl Ray {
     }
   }
 
-  /// Check if a node exists
-  pub fn exists(&mut self, node_id: NodeId) -> Result<bool> {
-    let mut handle = begin_tx(&mut self.db)?;
-    let exists = node_exists(&handle, node_id);
-    commit(&mut handle)?;
-    Ok(exists)
+  /// Check if a node exists (direct read, no transaction overhead)
+  pub fn exists(&self, node_id: NodeId) -> bool {
+    // Direct read without transaction
+    node_exists_db(&self.db, node_id)
   }
 
   /// Delete a node
@@ -439,17 +439,11 @@ impl Ray {
     Ok(deleted)
   }
 
-  /// Get a node property
-  pub fn get_prop(&mut self, node_id: NodeId, prop_name: &str) -> Result<Option<PropValue>> {
-    let prop_key_id = self
-      .db
-      .get_propkey_id(prop_name)
-      .ok_or_else(|| RayError::InvalidSchema(format!("Unknown property: {}", prop_name)))?;
-
-    let mut handle = begin_tx(&mut self.db)?;
-    let value = get_node_prop(&handle, node_id, prop_key_id);
-    commit(&mut handle)?;
-    Ok(value)
+  /// Get a node property (direct read, no transaction overhead)
+  pub fn get_prop(&self, node_id: NodeId, prop_name: &str) -> Option<PropValue> {
+    let prop_key_id = self.db.get_propkey_id(prop_name)?;
+    // Direct read without transaction
+    get_node_prop_db(&self.db, node_id, prop_key_id)
   }
 
   /// Set a node property
@@ -627,8 +621,8 @@ impl Ray {
     Ok(deleted)
   }
 
-  /// Check if an edge exists
-  pub fn has_edge(&mut self, src: NodeId, edge_type: &str, dst: NodeId) -> Result<bool> {
+  /// Check if an edge exists (direct read, no transaction overhead)
+  pub fn has_edge(&self, src: NodeId, edge_type: &str, dst: NodeId) -> Result<bool> {
     let edge_def = self
       .edges
       .get(edge_type)
@@ -638,14 +632,12 @@ impl Ray {
       .etype_id
       .ok_or_else(|| RayError::InvalidSchema("Edge type not initialized".to_string()))?;
 
-    let mut handle = begin_tx(&mut self.db)?;
-    let exists = edge_exists(&handle, src, etype_id, dst);
-    commit(&mut handle)?;
-    Ok(exists)
+    // Direct read without transaction
+    Ok(edge_exists_db(&self.db, src, etype_id, dst))
   }
 
-  /// Get outgoing neighbors of a node
-  pub fn neighbors_out(&mut self, node_id: NodeId, edge_type: Option<&str>) -> Result<Vec<NodeId>> {
+  /// Get outgoing neighbors of a node (direct read, no transaction overhead)
+  pub fn neighbors_out(&self, node_id: NodeId, edge_type: Option<&str>) -> Result<Vec<NodeId>> {
     let etype_id = match edge_type {
       Some(name) => {
         let edge_def = self
@@ -657,14 +649,12 @@ impl Ray {
       None => None,
     };
 
-    let mut handle = begin_tx(&mut self.db)?;
-    let neighbors = get_neighbors_out(&handle, node_id, etype_id);
-    commit(&mut handle)?;
-    Ok(neighbors)
+    // Direct read without transaction
+    Ok(get_neighbors_out_db(&self.db, node_id, etype_id))
   }
 
-  /// Get incoming neighbors of a node
-  pub fn neighbors_in(&mut self, node_id: NodeId, edge_type: Option<&str>) -> Result<Vec<NodeId>> {
+  /// Get incoming neighbors of a node (direct read, no transaction overhead)
+  pub fn neighbors_in(&self, node_id: NodeId, edge_type: Option<&str>) -> Result<Vec<NodeId>> {
     let etype_id = match edge_type {
       Some(name) => {
         let edge_def = self
@@ -676,9 +666,8 @@ impl Ray {
       None => None,
     };
 
-    let mut handle = begin_tx(&self.db)?;
-    let neighbors = get_neighbors_in(&handle, node_id, etype_id);
-    commit(&mut handle)?;
+    // Direct read without transaction
+    let neighbors = get_neighbors_in_db(&self.db, node_id, etype_id);
     Ok(neighbors)
   }
 
@@ -686,11 +675,11 @@ impl Ray {
   // Edge Property Operations
   // ========================================================================
 
-  /// Get an edge property
+  /// Get an edge property (direct read, no transaction overhead)
   ///
   /// Returns None if the edge doesn't exist or the property is not set.
   pub fn get_edge_prop(
-    &mut self,
+    &self,
     src: NodeId,
     edge_type: &str,
     dst: NodeId,
@@ -705,22 +694,20 @@ impl Ray {
       .etype_id
       .ok_or_else(|| RayError::InvalidSchema("Edge type not initialized".to_string()))?;
 
-    let prop_key_id = self
-      .db
-      .get_propkey_id(prop_name)
-      .ok_or_else(|| RayError::InvalidSchema(format!("Unknown property: {}", prop_name)))?;
+    let prop_key_id = match self.db.get_propkey_id(prop_name) {
+      Some(id) => id,
+      None => return Ok(None), // Unknown property = not set
+    };
 
-    let handle = begin_tx(&self.db)?;
-    let value = get_edge_prop(&handle, src, etype_id, dst, prop_key_id);
-    commit(&mut { handle })?;
-    Ok(value)
+    // Direct read without transaction
+    Ok(get_edge_prop_db(&self.db, src, etype_id, dst, prop_key_id))
   }
 
-  /// Get all properties for an edge
+  /// Get all properties for an edge (direct read, no transaction overhead)
   ///
   /// Returns None if the edge doesn't exist.
   pub fn get_edge_props(
-    &mut self,
+    &self,
     src: NodeId,
     edge_type: &str,
     dst: NodeId,
@@ -734,9 +721,8 @@ impl Ray {
       .etype_id
       .ok_or_else(|| RayError::InvalidSchema("Edge type not initialized".to_string()))?;
 
-    let handle = begin_tx(&self.db)?;
-    let props = get_edge_props(&handle, src, etype_id, dst);
-    commit(&mut { handle })?;
+    // Direct read without transaction
+    let props = get_edge_props_db(&self.db, src, etype_id, dst);
 
     // Convert PropKeyId -> String in the result
     match props {
@@ -2613,12 +2599,12 @@ mod tests {
     let user = ray.create_node("User", "alice", props).unwrap();
 
     // Get property
-    let name = ray.get_prop(user.id, "name").unwrap();
+    let name = ray.get_prop(user.id, "name");
     assert_eq!(name, Some(PropValue::String("Alice".to_string())));
 
     // Set property
     ray.set_prop(user.id, "age", PropValue::I64(25)).unwrap();
-    let age = ray.get_prop(user.id, "age").unwrap();
+    let age = ray.get_prop(user.id, "age");
     assert_eq!(age, Some(PropValue::I64(25)));
 
     ray.close().unwrap();
@@ -2650,10 +2636,10 @@ mod tests {
     let mut ray = Ray::open(temp_dir.path(), options).unwrap();
 
     let user = ray.create_node("User", "alice", HashMap::new()).unwrap();
-    assert!(ray.exists(user.id).unwrap());
+    assert!(ray.exists(user.id));
 
     ray.delete_node(user.id).unwrap();
-    assert!(!ray.exists(user.id).unwrap());
+    assert!(!ray.exists(user.id));
 
     ray.close().unwrap();
   }
@@ -3114,10 +3100,10 @@ mod tests {
 
     // Verify properties
     assert_eq!(
-      ray.get_prop(user.id, "name").unwrap(),
+      ray.get_prop(user.id, "name"),
       Some(PropValue::String("Alice".into()))
     );
-    assert_eq!(ray.get_prop(user.id, "age").unwrap(), Some(PropValue::I64(30)));
+    assert_eq!(ray.get_prop(user.id, "age"), Some(PropValue::I64(30)));
 
     ray.close().unwrap();
   }
@@ -3160,7 +3146,7 @@ mod tests {
 
     // Verify results
     assert_eq!(
-      ray.get_prop(alice.id, "name").unwrap(),
+      ray.get_prop(alice.id, "name"),
       Some(PropValue::String("Alice".into()))
     );
     assert!(ray.get("User", "charlie").unwrap().is_some());
@@ -3203,7 +3189,7 @@ mod tests {
       _ => panic!("Expected NodeDeleted"),
     }
 
-    assert!(!ray.exists(bob.id).unwrap());
+    assert!(!ray.exists(bob.id));
 
     ray.close().unwrap();
   }
@@ -3230,8 +3216,8 @@ mod tests {
       .unwrap();
 
     // Verify results
-    assert!(ray.exists(alice.id).unwrap());
-    assert!(ray.exists(bob.id).unwrap());
+    assert!(ray.exists(alice.id));
+    assert!(ray.exists(bob.id));
     assert!(ray.has_edge(alice.id, "FOLLOWS", bob.id).unwrap());
 
     ray.close().unwrap();
@@ -3257,10 +3243,10 @@ mod tests {
 
     // Verify properties
     assert_eq!(
-      ray.get_prop(alice.id, "name").unwrap(),
+      ray.get_prop(alice.id, "name"),
       Some(PropValue::String("Alice".into()))
     );
-    assert_eq!(ray.get_prop(alice.id, "age").unwrap(), Some(PropValue::I64(30)));
+    assert_eq!(ray.get_prop(alice.id, "age"), Some(PropValue::I64(30)));
 
     ray.close().unwrap();
   }
@@ -3406,7 +3392,7 @@ mod tests {
 
     assert!(ray.has_edge(alice_id, "FOLLOWS", bob_id).unwrap());
     assert_eq!(
-      ray.get_prop(alice_id, "name").unwrap(),
+      ray.get_prop(alice_id, "name"),
       Some(PropValue::String("Alice".into()))
     );
 
@@ -3692,10 +3678,10 @@ mod tests {
     assert_eq!(alice.node_type, "User");
 
     // Verify properties were set
-    let name = ray.get_prop(alice.id, "name").unwrap();
+    let name = ray.get_prop(alice.id, "name");
     assert_eq!(name, Some(PropValue::String("Alice".into())));
 
-    let age = ray.get_prop(alice.id, "age").unwrap();
+    let age = ray.get_prop(alice.id, "age");
     assert_eq!(age, Some(PropValue::I64(30)));
 
     ray.close().unwrap();
@@ -3724,7 +3710,7 @@ mod tests {
     assert!(bob.is_some());
 
     let bob = bob.unwrap();
-    let name = ray.get_prop(bob.id, "name").unwrap();
+    let name = ray.get_prop(bob.id, "name");
     assert_eq!(name, Some(PropValue::String("Bob".into())));
 
     ray.close().unwrap();
@@ -3883,10 +3869,10 @@ mod tests {
       .unwrap();
 
     // Verify updates
-    let name = ray.get_prop(alice.id, "name").unwrap();
+    let name = ray.get_prop(alice.id, "name");
     assert_eq!(name, Some(PropValue::String("Alice Updated".into())));
 
-    let age = ray.get_prop(alice.id, "age").unwrap();
+    let age = ray.get_prop(alice.id, "age");
     assert_eq!(age, Some(PropValue::I64(31)));
 
     ray.close().unwrap();
@@ -3914,10 +3900,10 @@ mod tests {
 
     // Verify updates
     let bob = ray.get("User", "bob").unwrap().unwrap();
-    let name = ray.get_prop(bob.id, "name").unwrap();
+    let name = ray.get_prop(bob.id, "name");
     assert_eq!(name, Some(PropValue::String("Bob Updated".into())));
 
-    let age = ray.get_prop(bob.id, "age").unwrap();
+    let age = ray.get_prop(bob.id, "age");
     assert_eq!(age, Some(PropValue::I64(25)));
 
     ray.close().unwrap();
@@ -3943,7 +3929,7 @@ mod tests {
       .unwrap();
 
     // Verify updates
-    let name = ray.get_prop(charlie.id, "name").unwrap();
+    let name = ray.get_prop(charlie.id, "name");
     assert_eq!(name, Some(PropValue::String("Charlie Updated".into())));
 
     ray.close().unwrap();
@@ -3963,7 +3949,7 @@ mod tests {
     let dave = ray.create_node("User", "dave", props).unwrap();
 
     // Verify properties exist
-    assert!(ray.get_prop(dave.id, "age").unwrap().is_some());
+    assert!(ray.get_prop(dave.id, "age").is_some());
 
     // Update with unset
     ray.update(&dave)
@@ -3974,10 +3960,10 @@ mod tests {
       .unwrap();
 
     // Verify name updated and age removed
-    let name = ray.get_prop(dave.id, "name").unwrap();
+    let name = ray.get_prop(dave.id, "name");
     assert_eq!(name, Some(PropValue::String("Dave Updated".into())));
 
-    let age = ray.get_prop(dave.id, "age").unwrap();
+    let age = ray.get_prop(dave.id, "age");
     assert_eq!(age, None);
 
     ray.close().unwrap();
@@ -4005,10 +3991,10 @@ mod tests {
       .unwrap();
 
     // Verify all properties set
-    let name = ray.get_prop(eve.id, "name").unwrap();
+    let name = ray.get_prop(eve.id, "name");
     assert_eq!(name, Some(PropValue::String("Eve".into())));
 
-    let age = ray.get_prop(eve.id, "age").unwrap();
+    let age = ray.get_prop(eve.id, "age");
     assert_eq!(age, Some(PropValue::I64(28)));
 
     ray.close().unwrap();
@@ -4051,7 +4037,7 @@ mod tests {
       .unwrap();
 
     // Verify nothing changed
-    let name = ray.get_prop(frank.id, "name").unwrap();
+    let name = ray.get_prop(frank.id, "name");
     assert_eq!(name, Some(PropValue::String("Frank".into())));
 
     ray.close().unwrap();

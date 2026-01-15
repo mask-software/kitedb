@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use tempfile::tempdir;
 
 extern crate raydb_core;
-use raydb_core::api::ray::{EdgeDef, NodeDef, PropDef, Ray, RayOptions};
+use raydb_core::api::ray::{BatchOp, EdgeDef, NodeDef, PropDef, Ray, RayOptions};
 use raydb_core::types::PropValue;
 
 fn create_test_schema() -> RayOptions {
@@ -482,9 +482,41 @@ fn bench_count(c: &mut Criterion) {
   ray.close().unwrap();
 }
 
+fn bench_batch_create_node(c: &mut Criterion) {
+  let mut group = c.benchmark_group("node_create_batched");
+  group.sample_size(20);
+
+  for count in [10, 100, 1000].iter() {
+    group.throughput(Throughput::Elements(*count as u64));
+
+    group.bench_with_input(BenchmarkId::new("count", count), count, |bencher, &count| {
+      let temp_dir = tempdir().unwrap();
+      let mut ray = Ray::open(temp_dir.path(), create_test_schema()).unwrap();
+      let mut batch_num = 0;
+
+      bencher.iter(|| {
+        let ops: Vec<BatchOp> = (0..count)
+          .map(|i| BatchOp::CreateNode {
+            node_type: "User".to_string(),
+            key_suffix: format!("batch{}_{}", batch_num, i),
+            props: HashMap::new(),
+          })
+          .collect();
+        batch_num += 1;
+        let _ = black_box(ray.batch(ops));
+      });
+
+      ray.close().unwrap();
+    });
+  }
+
+  group.finish();
+}
+
 criterion_group!(
   benches,
   bench_create_node,
+  bench_batch_create_node,
   bench_get_node_by_key,
   bench_node_exists,
   bench_link,
