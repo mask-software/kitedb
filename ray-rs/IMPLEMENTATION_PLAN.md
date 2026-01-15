@@ -15,6 +15,7 @@ A comprehensive plan to port RayDB (TypeScript/Bun embedded graph database) to R
 9. [Phase 7: Testing & Benchmarks](#phase-7-testing--benchmarks)
 10. [Dependencies](#dependencies)
 11. [Binary Compatibility](#binary-compatibility)
+12. [Phase 8: Language Bindings](#phase-8-language-bindings)
 
 ---
 
@@ -2480,3 +2481,662 @@ All multi-byte integers are stored **little-endian** (same as TypeScript DataVie
 2. **Concurrent access**: Use `parking_lot` for lower overhead
 3. **File locking**: Use `fs2` for cross-platform locks
 4. **Crash recovery**: Validate all data on load
+
+---
+
+## Phase 8: Language Bindings
+
+> **Note**: This phase should only be started after the full Rust implementation is complete and stable. Language bindings depend on a finalized API surface.
+
+### 8.1 Overview
+
+Once RayDB is fully ported to Rust, we expose it to other languages via native bindings:
+
+| Language | Binding Technology | Package Name |
+|----------|-------------------|--------------|
+| TypeScript/JavaScript | [NAPI-RS](https://napi.rs/) | `@raydb/core` |
+| Python | [PyO3](https://pyo3.rs/) + [Maturin](https://www.maturin.rs/) | `raydb` |
+
+### 8.2 Project Structure
+
+```
+ray-rs/
+├── Cargo.toml              # Workspace root
+├── crates/
+│   ├── raydb-core/         # Core Rust library (existing)
+│   │   └── Cargo.toml
+│   ├── raydb-napi/         # Node.js/Bun bindings
+│   │   ├── Cargo.toml
+│   │   ├── src/
+│   │   │   ├── lib.rs
+│   │   │   ├── db.rs       # Database handle wrapper
+│   │   │   ├── node.rs     # Node operations
+│   │   │   ├── edge.rs     # Edge operations
+│   │   │   ├── query.rs    # Query builders
+│   │   │   ├── vector.rs   # Vector search
+│   │   │   └── types.rs    # Type conversions
+│   │   ├── index.d.ts      # TypeScript declarations
+│   │   └── package.json
+│   └── raydb-python/       # Python bindings
+│       ├── Cargo.toml
+│       ├── src/
+│       │   ├── lib.rs
+│       │   ├── db.rs
+│       │   ├── node.rs
+│       │   ├── edge.rs
+│       │   ├── query.rs
+│       │   ├── vector.rs
+│       │   └── types.rs
+│       ├── python/
+│       │   └── raydb/
+│       │       ├── __init__.py
+│       │       └── py.typed  # PEP 561 marker
+│       └── pyproject.toml
+```
+
+### 8.3 TypeScript/JavaScript Bindings (NAPI-RS)
+
+#### Dependencies (`raydb-napi/Cargo.toml`)
+
+```toml
+[package]
+name = "raydb-napi"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+raydb-core = { path = "../raydb-core" }
+napi = { version = "2", features = ["async", "serde-json"] }
+napi-derive = "2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[build-dependencies]
+napi-build = "2"
+```
+
+#### Core Bindings (`raydb-napi/src/lib.rs`)
+
+```rust
+#![deny(clippy::all)]
+
+use napi::bindgen_prelude::*;
+use napi_derive::napi;
+use raydb_core::{GraphDB, OpenOptions as CoreOptions};
+use std::sync::Arc;
+use parking_lot::RwLock;
+
+mod db;
+mod node;
+mod edge;
+mod query;
+mod vector;
+mod types;
+
+pub use db::*;
+pub use node::*;
+pub use edge::*;
+pub use query::*;
+pub use vector::*;
+```
+
+#### Database Handle (`raydb-napi/src/db.rs`)
+
+```rust
+use napi::bindgen_prelude::*;
+use napi_derive::napi;
+use raydb_core::{GraphDB, OpenOptions as CoreOptions};
+use std::sync::Arc;
+use parking_lot::RwLock;
+
+/// Database open options
+#[napi(object)]
+pub struct OpenOptions {
+    pub read_only: Option<bool>,
+    pub create_if_missing: Option<bool>,
+    pub mvcc: Option<bool>,
+    pub mvcc_gc_interval_ms: Option<u32>,
+    pub mvcc_retention_ms: Option<u32>,
+    pub auto_checkpoint: Option<bool>,
+    pub checkpoint_threshold: Option<f64>,
+}
+
+/// RayDB database handle
+#[napi]
+pub struct RayDB {
+    inner: Arc<RwLock<GraphDB>>,
+}
+
+#[napi]
+impl RayDB {
+    /// Open or create a database
+    #[napi(factory)]
+    pub fn open(path: String, options: Option<OpenOptions>) -> Result<Self> {
+        let opts = options.map(|o| CoreOptions {
+            read_only: o.read_only.unwrap_or(false),
+            create_if_missing: o.create_if_missing.unwrap_or(true),
+            mvcc: o.mvcc.unwrap_or(false),
+            mvcc_gc_interval_ms: o.mvcc_gc_interval_ms.unwrap_or(60000) as u64,
+            mvcc_retention_ms: o.mvcc_retention_ms.unwrap_or(300000) as u64,
+            auto_checkpoint: o.auto_checkpoint.unwrap_or(true),
+            checkpoint_threshold: o.checkpoint_threshold.unwrap_or(0.1),
+            ..Default::default()
+        }).unwrap_or_default();
+
+        let db = GraphDB::open(&path, opts)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+
+        Ok(Self {
+            inner: Arc::new(RwLock::new(db)),
+        })
+    }
+
+    /// Close the database
+    #[napi]
+    pub fn close(&self) -> Result<()> {
+        // Note: Actual close happens on drop
+        Ok(())
+    }
+
+    /// Create a node
+    #[napi]
+    pub fn create_node(&self, key: Option<String>, props: Option<serde_json::Value>) -> Result<i64> {
+        let mut db = self.inner.write();
+        let mut tx = raydb_core::begin_tx(&db);
+        
+        let node_id = raydb_core::create_node(&mut tx, raydb_core::NodeOpts {
+            key,
+            props: props.map(|p| types::json_to_props(&db, p)).transpose()?,
+            ..Default::default()
+        });
+        
+        raydb_core::commit(tx)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        
+        Ok(node_id as i64)
+    }
+
+    /// Get node by key
+    #[napi]
+    pub fn get_node_by_key(&self, key: String) -> Option<i64> {
+        let db = self.inner.read();
+        raydb_core::get_node_by_key(&db, &key).map(|id| id as i64)
+    }
+
+    /// Add an edge
+    #[napi]
+    pub fn add_edge(&self, src: i64, edge_type: String, dst: i64) -> Result<()> {
+        let mut db = self.inner.write();
+        let mut tx = raydb_core::begin_tx(&db);
+        
+        let etype = raydb_core::get_or_create_etype(&mut tx, &edge_type);
+        raydb_core::add_edge(&mut tx, src as u64, etype, dst as u64);
+        
+        raydb_core::commit(tx)
+            .map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    /// Get neighbors
+    #[napi]
+    pub fn get_neighbors(&self, node_id: i64, direction: String, edge_type: Option<String>) -> Result<Vec<i64>> {
+        let db = self.inner.read();
+        let etype = edge_type.map(|et| raydb_core::get_etype_id(&db, &et)).flatten();
+        
+        let neighbors: Vec<i64> = match direction.as_str() {
+            "out" => raydb_core::get_neighbors_out(&db, node_id as u64, etype)
+                .map(|e| e.dst as i64)
+                .collect(),
+            "in" => raydb_core::get_neighbors_in(&db, node_id as u64, etype)
+                .map(|e| e.src as i64)
+                .collect(),
+            "both" => {
+                let mut result: Vec<i64> = raydb_core::get_neighbors_out(&db, node_id as u64, etype)
+                    .map(|e| e.dst as i64)
+                    .collect();
+                result.extend(
+                    raydb_core::get_neighbors_in(&db, node_id as u64, etype)
+                        .map(|e| e.src as i64)
+                );
+                result
+            }
+            _ => return Err(Error::from_reason("Invalid direction: use 'in', 'out', or 'both'")),
+        };
+        
+        Ok(neighbors)
+    }
+
+    /// Vector search
+    #[napi]
+    pub fn vector_search(
+        &self,
+        query: Vec<f64>,
+        k: u32,
+        options: Option<VectorSearchOptions>,
+    ) -> Result<Vec<VectorSearchResult>> {
+        let db = self.inner.read();
+        let query_f32: Vec<f32> = query.into_iter().map(|v| v as f32).collect();
+        
+        let results = raydb_core::vector_search(&db, &query_f32, k as usize, options.map(Into::into))
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        
+        Ok(results.into_iter().map(Into::into).collect())
+    }
+}
+
+#[napi(object)]
+pub struct VectorSearchOptions {
+    pub n_probe: Option<u32>,
+    pub ef_search: Option<u32>,
+}
+
+#[napi(object)]
+pub struct VectorSearchResult {
+    pub node_id: i64,
+    pub distance: f64,
+    pub similarity: f64,
+}
+```
+
+#### TypeScript Declarations (`raydb-napi/index.d.ts`)
+
+```typescript
+export interface OpenOptions {
+  readOnly?: boolean;
+  createIfMissing?: boolean;
+  mvcc?: boolean;
+  mvccGcIntervalMs?: number;
+  mvccRetentionMs?: number;
+  autoCheckpoint?: boolean;
+  checkpointThreshold?: number;
+}
+
+export interface VectorSearchOptions {
+  nProbe?: number;
+  efSearch?: number;
+}
+
+export interface VectorSearchResult {
+  nodeId: number;
+  distance: number;
+  similarity: number;
+}
+
+export class RayDB {
+  static open(path: string, options?: OpenOptions): RayDB;
+  close(): void;
+  createNode(key?: string, props?: Record<string, unknown>): number;
+  getNodeByKey(key: string): number | null;
+  addEdge(src: number, edgeType: string, dst: number): void;
+  getNeighbors(nodeId: number, direction: 'in' | 'out' | 'both', edgeType?: string): number[];
+  vectorSearch(query: number[], k: number, options?: VectorSearchOptions): VectorSearchResult[];
+}
+```
+
+### 8.4 Python Bindings (PyO3)
+
+#### Dependencies (`raydb-python/Cargo.toml`)
+
+```toml
+[package]
+name = "raydb-python"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "raydb"
+crate-type = ["cdylib"]
+
+[dependencies]
+raydb-core = { path = "../raydb-core" }
+pyo3 = { version = "0.20", features = ["extension-module"] }
+numpy = "0.20"  # For efficient array handling
+
+[build-dependencies]
+pyo3-build-config = "0.20"
+```
+
+#### Core Bindings (`raydb-python/src/lib.rs`)
+
+```rust
+use pyo3::prelude::*;
+use pyo3::exceptions::PyValueError;
+use raydb_core::{GraphDB, OpenOptions as CoreOptions};
+use std::sync::Arc;
+use parking_lot::RwLock;
+use numpy::{PyArray1, PyReadonlyArray1};
+
+mod db;
+mod node;
+mod edge;
+mod query;
+mod vector;
+mod types;
+
+/// RayDB Python module
+#[pymodule]
+fn raydb(_py: Python, m: &PyModule) -> PyResult<()> {
+    m.add_class::<RayDB>()?;
+    m.add_class::<OpenOptions>()?;
+    m.add_class::<VectorSearchResult>()?;
+    Ok(())
+}
+```
+
+#### Database Handle (`raydb-python/src/db.rs`)
+
+```rust
+use pyo3::prelude::*;
+use pyo3::exceptions::PyValueError;
+use raydb_core::{GraphDB, OpenOptions as CoreOptions};
+use std::sync::Arc;
+use parking_lot::RwLock;
+use numpy::{PyArray1, PyReadonlyArray1};
+
+/// Database open options
+#[pyclass]
+#[derive(Clone, Default)]
+pub struct OpenOptions {
+    #[pyo3(get, set)]
+    pub read_only: bool,
+    #[pyo3(get, set)]
+    pub create_if_missing: bool,
+    #[pyo3(get, set)]
+    pub mvcc: bool,
+    #[pyo3(get, set)]
+    pub mvcc_gc_interval_ms: u64,
+    #[pyo3(get, set)]
+    pub mvcc_retention_ms: u64,
+    #[pyo3(get, set)]
+    pub auto_checkpoint: bool,
+    #[pyo3(get, set)]
+    pub checkpoint_threshold: f64,
+}
+
+#[pymethods]
+impl OpenOptions {
+    #[new]
+    fn new() -> Self {
+        Self {
+            read_only: false,
+            create_if_missing: true,
+            mvcc: false,
+            mvcc_gc_interval_ms: 60000,
+            mvcc_retention_ms: 300000,
+            auto_checkpoint: true,
+            checkpoint_threshold: 0.1,
+        }
+    }
+}
+
+/// RayDB database handle
+#[pyclass]
+pub struct RayDB {
+    inner: Arc<RwLock<GraphDB>>,
+}
+
+#[pymethods]
+impl RayDB {
+    /// Open or create a database
+    #[new]
+    #[pyo3(signature = (path, options=None))]
+    fn new(path: &str, options: Option<OpenOptions>) -> PyResult<Self> {
+        let opts = options.map(|o| CoreOptions {
+            read_only: o.read_only,
+            create_if_missing: o.create_if_missing,
+            mvcc: o.mvcc,
+            mvcc_gc_interval_ms: o.mvcc_gc_interval_ms,
+            mvcc_retention_ms: o.mvcc_retention_ms,
+            auto_checkpoint: o.auto_checkpoint,
+            checkpoint_threshold: o.checkpoint_threshold,
+            ..Default::default()
+        }).unwrap_or_default();
+
+        let db = GraphDB::open(path, opts)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+        Ok(Self {
+            inner: Arc::new(RwLock::new(db)),
+        })
+    }
+
+    /// Close the database
+    fn close(&self) -> PyResult<()> {
+        Ok(())
+    }
+
+    /// Create a node
+    #[pyo3(signature = (key=None, props=None))]
+    fn create_node(&self, key: Option<String>, props: Option<&PyDict>) -> PyResult<i64> {
+        let mut db = self.inner.write();
+        let mut tx = raydb_core::begin_tx(&db);
+        
+        let node_id = raydb_core::create_node(&mut tx, raydb_core::NodeOpts {
+            key,
+            props: props.map(|p| types::dict_to_props(&db, p)).transpose()?,
+            ..Default::default()
+        });
+        
+        raydb_core::commit(tx)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        
+        Ok(node_id as i64)
+    }
+
+    /// Get node by key
+    fn get_node_by_key(&self, key: &str) -> Option<i64> {
+        let db = self.inner.read();
+        raydb_core::get_node_by_key(&db, key).map(|id| id as i64)
+    }
+
+    /// Add an edge
+    fn add_edge(&self, src: i64, edge_type: &str, dst: i64) -> PyResult<()> {
+        let mut db = self.inner.write();
+        let mut tx = raydb_core::begin_tx(&db);
+        
+        let etype = raydb_core::get_or_create_etype(&mut tx, edge_type);
+        raydb_core::add_edge(&mut tx, src as u64, etype, dst as u64);
+        
+        raydb_core::commit(tx)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    /// Get neighbors
+    #[pyo3(signature = (node_id, direction, edge_type=None))]
+    fn get_neighbors(&self, node_id: i64, direction: &str, edge_type: Option<&str>) -> PyResult<Vec<i64>> {
+        let db = self.inner.read();
+        let etype = edge_type.map(|et| raydb_core::get_etype_id(&db, et)).flatten();
+        
+        let neighbors: Vec<i64> = match direction {
+            "out" => raydb_core::get_neighbors_out(&db, node_id as u64, etype)
+                .map(|e| e.dst as i64)
+                .collect(),
+            "in" => raydb_core::get_neighbors_in(&db, node_id as u64, etype)
+                .map(|e| e.src as i64)
+                .collect(),
+            "both" => {
+                let mut result: Vec<i64> = raydb_core::get_neighbors_out(&db, node_id as u64, etype)
+                    .map(|e| e.dst as i64)
+                    .collect();
+                result.extend(
+                    raydb_core::get_neighbors_in(&db, node_id as u64, etype)
+                        .map(|e| e.src as i64)
+                );
+                result
+            }
+            _ => return Err(PyValueError::new_err("Invalid direction: use 'in', 'out', or 'both'")),
+        };
+        
+        Ok(neighbors)
+    }
+
+    /// Vector search with numpy array support
+    #[pyo3(signature = (query, k, n_probe=None))]
+    fn vector_search<'py>(
+        &self,
+        py: Python<'py>,
+        query: PyReadonlyArray1<f32>,
+        k: usize,
+        n_probe: Option<usize>,
+    ) -> PyResult<Vec<VectorSearchResult>> {
+        let db = self.inner.read();
+        let query_slice = query.as_slice()?;
+        
+        let results = raydb_core::vector_search(&db, query_slice, k, n_probe.map(|np| raydb_core::VectorSearchOpts { n_probe: np, ..Default::default() }))
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        
+        Ok(results.into_iter().map(Into::into).collect())
+    }
+
+    /// Context manager support
+    fn __enter__(slf: PyRef<Self>) -> PyRef<Self> {
+        slf
+    }
+
+    fn __exit__(&self, _exc_type: Option<&PyAny>, _exc_val: Option<&PyAny>, _exc_tb: Option<&PyAny>) -> bool {
+        let _ = self.close();
+        false
+    }
+}
+
+#[pyclass]
+pub struct VectorSearchResult {
+    #[pyo3(get)]
+    pub node_id: i64,
+    #[pyo3(get)]
+    pub distance: f64,
+    #[pyo3(get)]
+    pub similarity: f64,
+}
+```
+
+#### Python Type Stubs (`raydb-python/python/raydb/__init__.pyi`)
+
+```python
+from typing import Optional, Dict, Any, List, Literal
+import numpy as np
+import numpy.typing as npt
+
+class OpenOptions:
+    read_only: bool
+    create_if_missing: bool
+    mvcc: bool
+    mvcc_gc_interval_ms: int
+    mvcc_retention_ms: int
+    auto_checkpoint: bool
+    checkpoint_threshold: float
+    
+    def __init__(self) -> None: ...
+
+class VectorSearchResult:
+    node_id: int
+    distance: float
+    similarity: float
+
+class RayDB:
+    def __init__(self, path: str, options: Optional[OpenOptions] = None) -> None: ...
+    def close(self) -> None: ...
+    def create_node(self, key: Optional[str] = None, props: Optional[Dict[str, Any]] = None) -> int: ...
+    def get_node_by_key(self, key: str) -> Optional[int]: ...
+    def add_edge(self, src: int, edge_type: str, dst: int) -> None: ...
+    def get_neighbors(
+        self, 
+        node_id: int, 
+        direction: Literal["in", "out", "both"], 
+        edge_type: Optional[str] = None
+    ) -> List[int]: ...
+    def vector_search(
+        self,
+        query: npt.NDArray[np.float32],
+        k: int,
+        n_probe: Optional[int] = None,
+    ) -> List[VectorSearchResult]: ...
+    
+    def __enter__(self) -> "RayDB": ...
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> bool: ...
+```
+
+### 8.5 Build & Distribution
+
+#### Node.js/Bun (via npm)
+
+```bash
+# Install napi-rs CLI
+npm install -g @napi-rs/cli
+
+# Build for current platform
+cd crates/raydb-napi
+napi build --release
+
+# Build for all platforms (CI)
+napi build --release --platform
+```
+
+**Supported targets:**
+- `x86_64-apple-darwin` (macOS Intel)
+- `aarch64-apple-darwin` (macOS Apple Silicon)
+- `x86_64-unknown-linux-gnu` (Linux x64)
+- `aarch64-unknown-linux-gnu` (Linux ARM64)
+- `x86_64-pc-windows-msvc` (Windows x64)
+
+#### Python (via maturin)
+
+```bash
+# Install maturin
+pip install maturin
+
+# Build wheel for current platform
+cd crates/raydb-python
+maturin build --release
+
+# Build and install locally
+maturin develop
+
+# Publish to PyPI
+maturin publish
+```
+
+### 8.6 Implementation Timeline
+
+| Task | Duration | Dependencies |
+|------|----------|--------------|
+| Setup workspace structure | 1 day | Rust implementation complete |
+| NAPI-RS scaffolding | 2 days | - |
+| Core JS bindings (open, close, CRUD) | 3 days | NAPI scaffolding |
+| JS vector search bindings | 2 days | Core JS bindings |
+| JS TypeScript declarations | 1 day | All JS bindings |
+| PyO3 scaffolding | 2 days | - |
+| Core Python bindings | 3 days | PyO3 scaffolding |
+| Python numpy integration | 2 days | Core Python bindings |
+| Python type stubs | 1 day | All Python bindings |
+| CI/CD for multi-platform builds | 2 days | All bindings |
+| Documentation & examples | 2 days | All bindings |
+| **Total** | **~3 weeks** | |
+
+### 8.7 Milestones Update
+
+Add to the existing milestones:
+
+#### Milestone 7: Language Bindings (3 weeks)
+
+> **Prerequisites**: Milestones 1-6 complete and API stable
+
+1. **Week 1**: NAPI-RS bindings
+   - Project scaffolding
+   - Core operations (open, create node, add edge)
+   - Query and traversal
+   - TypeScript declarations
+
+2. **Week 2**: PyO3 bindings
+   - Project scaffolding with maturin
+   - Core operations
+   - NumPy integration for vectors
+   - Type stubs (`.pyi` files)
+
+3. **Week 3**: Polish & Distribution
+   - Multi-platform CI builds
+   - npm/PyPI publishing
+   - Documentation
+   - Examples in both languages
