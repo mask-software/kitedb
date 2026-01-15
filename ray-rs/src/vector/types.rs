@@ -6,6 +6,8 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::types::NodeId;
 
 // ============================================================================
@@ -13,7 +15,7 @@ use crate::types::NodeId;
 // ============================================================================
 
 /// Distance metric for vector similarity
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum DistanceMetric {
   /// Cosine similarity (converted to distance as 1 - similarity)
   #[default]
@@ -52,7 +54,7 @@ impl DistanceMetric {
 ///
 /// When searching with multiple query vectors, this determines how
 /// distances from different queries are combined for each candidate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum MultiQueryAggregation {
   /// Use minimum distance (best match across any query)
   #[default]
@@ -86,7 +88,7 @@ impl MultiQueryAggregation {
 // ============================================================================
 
 /// Configuration for vector store
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorStoreConfig {
   /// Number of dimensions per vector
   pub dimensions: usize,
@@ -151,7 +153,7 @@ impl VectorStoreConfig {
 // ============================================================================
 
 /// A row group containing a batch of vectors in columnar format
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RowGroup {
   /// Row group ID within fragment
   pub id: usize,
@@ -200,7 +202,7 @@ impl RowGroup {
 // ============================================================================
 
 /// Fragment state
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum FragmentState {
   /// Fragment is still accepting writes
   #[default]
@@ -210,7 +212,7 @@ pub enum FragmentState {
 }
 
 /// A fragment containing multiple row groups
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Fragment {
   /// Fragment ID
   pub id: usize,
@@ -289,7 +291,7 @@ impl Fragment {
 // ============================================================================
 
 /// Location of a vector in the store
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct VectorLocation {
   /// Fragment ID
   pub fragment_id: usize,
@@ -302,7 +304,7 @@ pub struct VectorLocation {
 // ============================================================================
 
 /// Manifest for the vector store
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorManifest {
   /// Store configuration
   pub config: VectorStoreConfig,
@@ -366,7 +368,7 @@ impl VectorManifest {
 // ============================================================================
 
 /// Configuration for IVF (Inverted File) index
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IvfConfig {
   /// Number of clusters (centroids)
   pub n_clusters: usize,
@@ -413,7 +415,7 @@ impl IvfConfig {
 // ============================================================================
 
 /// Configuration for Product Quantization
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PqConfig {
   /// Number of subspaces (M). Dimensions must be divisible by M
   pub num_subspaces: usize,
@@ -438,7 +440,7 @@ impl Default for PqConfig {
 // ============================================================================
 
 /// Vector search result
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorSearchResult {
   /// Vector ID
   pub vector_id: u64,
