@@ -10,7 +10,7 @@ use crate::graph::db::{close_graph_db, open_graph_db, GraphDB, OpenOptions};
 use crate::graph::edges::{
   add_edge, delete_edge, edge_exists, get_neighbors_in, get_neighbors_out,
 };
-use crate::graph::iterators::{count_edges, count_nodes, list_nodes};
+use crate::graph::iterators::{count_edges, count_nodes, list_edges, list_nodes, FullEdge, ListEdgesOptions};
 use crate::graph::nodes::{
   create_node, delete_node, get_node_by_key, get_node_prop, node_exists, set_node_prop, NodeOpts,
 };
@@ -517,9 +517,34 @@ impl Ray {
   // Listing and Counting
   // ========================================================================
 
-  /// Count all nodes
+  /// Count all nodes in the database
+  ///
+  /// This is an O(1) operation when possible, using cached counts.
   pub fn count_nodes(&self) -> u64 {
     count_nodes(&self.db)
+  }
+
+  /// Count nodes of a specific type
+  ///
+  /// This requires iteration to filter by key prefix.
+  pub fn count_nodes_by_type(&self, node_type: &str) -> Result<u64> {
+    let node_def = self
+      .nodes
+      .get(node_type)
+      .ok_or_else(|| RayError::InvalidSchema(format!("Unknown node type: {}", node_type)))?;
+
+    let prefix = &node_def.key_prefix;
+    let mut count = 0u64;
+
+    for node_id in list_nodes(&self.db) {
+      if let Some(key) = self.get_node_key(node_id) {
+        if key.starts_with(prefix) {
+          count += 1;
+        }
+      }
+    }
+
+    Ok(count)
   }
 
   /// Count all edges
@@ -527,9 +552,133 @@ impl Ray {
     count_edges(&self.db, None)
   }
 
+  /// Count edges of a specific type
+  pub fn count_edges_by_type(&self, edge_type: &str) -> Result<u64> {
+    let edge_def = self
+      .edges
+      .get(edge_type)
+      .ok_or_else(|| RayError::InvalidSchema(format!("Unknown edge type: {}", edge_type)))?;
+
+    let etype_id = edge_def
+      .etype_id
+      .ok_or_else(|| RayError::InvalidSchema("Edge type not initialized".to_string()))?;
+
+    Ok(count_edges(&self.db, Some(etype_id)))
+  }
+
   /// List all node IDs
   pub fn list_nodes(&self) -> Vec<NodeId> {
     list_nodes(&self.db)
+  }
+
+  /// Iterate over all nodes of a specific type
+  ///
+  /// Returns an iterator that yields `NodeRef` for each matching node.
+  /// Filters nodes by matching their key prefix.
+  ///
+  /// # Example
+  /// ```ignore
+  /// for node_ref in ray.all("User")? {
+  ///     println!("User: {:?}", node_ref.id);
+  /// }
+  /// ```
+  pub fn all(&self, node_type: &str) -> Result<impl Iterator<Item = NodeRef> + '_> {
+    let node_def = self
+      .nodes
+      .get(node_type)
+      .ok_or_else(|| RayError::InvalidSchema(format!("Unknown node type: {}", node_type)))?
+      .clone();
+
+    let prefix = node_def.key_prefix.clone();
+    let node_type_str = node_type.to_string();
+
+    Ok(list_nodes(&self.db).into_iter().filter_map(move |node_id| {
+      let key = self.get_node_key(node_id)?;
+      if key.starts_with(&prefix) {
+        Some(NodeRef::new(node_id, Some(key), &node_type_str))
+      } else {
+        None
+      }
+    }))
+  }
+
+  /// List all edges in the database
+  pub fn list_all_edges(&self) -> Vec<FullEdge> {
+    list_edges(&self.db, ListEdgesOptions::default())
+  }
+
+  /// Iterate over all edges, optionally filtered by type
+  ///
+  /// Returns an iterator that yields edge information.
+  ///
+  /// # Example
+  /// ```ignore
+  /// for edge in ray.all_edges(Some("FOLLOWS"))? {
+  ///     println!("{} -> {}", edge.src, edge.dst);
+  /// }
+  /// ```
+  pub fn all_edges(&self, edge_type: Option<&str>) -> Result<impl Iterator<Item = FullEdge> + '_> {
+    let etype_id = match edge_type {
+      Some(name) => {
+        let edge_def = self
+          .edges
+          .get(name)
+          .ok_or_else(|| RayError::InvalidSchema(format!("Unknown edge type: {}", name)))?;
+        edge_def.etype_id
+      }
+      None => None,
+    };
+
+    let options = ListEdgesOptions { etype: etype_id };
+    Ok(list_edges(&self.db, options).into_iter())
+  }
+
+  /// Get a lightweight node reference without loading properties
+  ///
+  /// This is faster than `get()` when you only need the node reference
+  /// for traversals or edge operations.
+  ///
+  /// # Example
+  /// ```ignore
+  /// let user_ref = ray.get_ref("User", "alice")?;
+  /// if let Some(node) = user_ref {
+  ///     // Can now use node.id for edges, traversals, etc.
+  /// }
+  /// ```
+  pub fn get_ref(&mut self, node_type: &str, key_suffix: &str) -> Result<Option<NodeRef>> {
+    let node_def = self
+      .nodes
+      .get(node_type)
+      .ok_or_else(|| RayError::InvalidSchema(format!("Unknown node type: {}", node_type)))?;
+
+    let full_key = node_def.key(key_suffix);
+
+    let mut handle = begin_tx(&mut self.db)?;
+    let node_id = get_node_by_key(&handle, &full_key);
+    commit(&mut handle)?;
+
+    match node_id {
+      Some(id) => Ok(Some(NodeRef::new(id, Some(full_key), node_type))),
+      None => Ok(None),
+    }
+  }
+
+  /// Helper to get node key from database
+  fn get_node_key(&self, node_id: NodeId) -> Option<String> {
+    // Try to get from delta first, then snapshot
+    let delta = self.db.delta.read();
+    if let Some(node_delta) = delta.created_nodes.get(&node_id) {
+      return node_delta.key.clone();
+    }
+
+    // Try snapshot
+    if let Some(ref snapshot) = self.db.snapshot {
+      if let Some(phys) = snapshot.get_phys_node(node_id) {
+        return snapshot.get_node_key(phys);
+      }
+    }
+
+    None
   }
 
   // ========================================================================
@@ -733,6 +882,123 @@ mod tests {
 
     ray.delete_node(user.id).unwrap();
     assert!(!ray.exists(user.id).unwrap());
+
+    ray.close().unwrap();
+  }
+
+  #[test]
+  fn test_get_ref() {
+    let temp_dir = tempdir().unwrap();
+    let options = create_test_schema();
+
+    let mut ray = Ray::open(temp_dir.path(), options).unwrap();
+
+    // Create a user
+    let user = ray.create_node("User", "alice", HashMap::new()).unwrap();
+
+    // Get lightweight reference
+    let node_ref = ray.get_ref("User", "alice").unwrap();
+    assert!(node_ref.is_some());
+    let node_ref = node_ref.unwrap();
+    assert_eq!(node_ref.id, user.id);
+    assert_eq!(node_ref.key, Some("user:alice".to_string()));
+
+    // Non-existent user
+    let not_found = ray.get_ref("User", "bob").unwrap();
+    assert!(not_found.is_none());
+
+    ray.close().unwrap();
+  }
+
+  #[test]
+  fn test_all_nodes_by_type() {
+    let temp_dir = tempdir().unwrap();
+    let options = create_test_schema();
+
+    let mut ray = Ray::open(temp_dir.path(), options).unwrap();
+
+    // Create some users and posts
+    ray.create_node("User", "alice", HashMap::new()).unwrap();
+    ray.create_node("User", "bob", HashMap::new()).unwrap();
+    ray.create_node("Post", "post1", HashMap::new()).unwrap();
+
+    // Iterate all users
+    let users: Vec<_> = ray.all("User").unwrap().collect();
+    assert_eq!(users.len(), 2);
+
+    // Iterate all posts
+    let posts: Vec<_> = ray.all("Post").unwrap().collect();
+    assert_eq!(posts.len(), 1);
+
+    ray.close().unwrap();
+  }
+
+  #[test]
+  fn test_count_nodes_by_type() {
+    let temp_dir = tempdir().unwrap();
+    let options = create_test_schema();
+
+    let mut ray = Ray::open(temp_dir.path(), options).unwrap();
+
+    // Create some users and posts
+    ray.create_node("User", "alice", HashMap::new()).unwrap();
+    ray.create_node("User", "bob", HashMap::new()).unwrap();
+    ray.create_node("Post", "post1", HashMap::new()).unwrap();
+
+    // Count by type
+    assert_eq!(ray.count_nodes_by_type("User").unwrap(), 2);
+    assert_eq!(ray.count_nodes_by_type("Post").unwrap(), 1);
+    assert_eq!(ray.count_nodes(), 3);
+
+    ray.close().unwrap();
+  }
+
+  #[test]
+  fn test_all_edges() {
+    let temp_dir = tempdir().unwrap();
+    let options = create_test_schema();
+
+    let mut ray = Ray::open(temp_dir.path(), options).unwrap();
+
+    // Create nodes and edges
+    let alice = ray.create_node("User", "alice", HashMap::new()).unwrap();
+    let bob = ray.create_node("User", "bob", HashMap::new()).unwrap();
+    let post = ray.create_node("Post", "post1", HashMap::new()).unwrap();
+
+    ray.link(alice.id, "FOLLOWS", bob.id).unwrap();
+    ray.link(alice.id, "AUTHORED", post.id).unwrap();
+
+    // List all edges
+    let all_edges: Vec<_> = ray.all_edges(None).unwrap().collect();
+    assert_eq!(all_edges.len(), 2);
+
+    // List FOLLOWS edges only
+    let follows_edges: Vec<_> = ray.all_edges(Some("FOLLOWS")).unwrap().collect();
+    assert_eq!(follows_edges.len(), 1);
+    assert_eq!(follows_edges[0].src, alice.id);
+    assert_eq!(follows_edges[0].dst, bob.id);
+
+    ray.close().unwrap();
+  }
+
+  #[test]
+  fn test_count_edges_by_type() {
+    let temp_dir = tempdir().unwrap();
+    let options = create_test_schema();
+
+    let mut ray = Ray::open(temp_dir.path(), options).unwrap();
+
+    let alice = ray.create_node("User", "alice", HashMap::new()).unwrap();
+    let bob = ray.create_node("User", "bob", HashMap::new()).unwrap();
+    let post = ray.create_node("Post", "post1", HashMap::new()).unwrap();
+
+    ray.link(alice.id, "FOLLOWS", bob.id).unwrap();
+    ray.link(alice.id, "AUTHORED", post.id).unwrap();
+
+    // Count by type
+    assert_eq!(ray.count_edges_by_type("FOLLOWS").unwrap(), 1);
+    assert_eq!(ray.count_edges_by_type("AUTHORED").unwrap(), 1);
+    assert_eq!(ray.count_edges(), 2);
 
     ray.close().unwrap();
   }

@@ -380,6 +380,89 @@ pub fn list_in_edges(db: &GraphDB, dst: NodeId) -> Vec<Edge> {
   edges
 }
 
+/// Full edge with source, destination, and type
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FullEdge {
+  pub src: NodeId,
+  pub etype: ETypeId,
+  pub dst: NodeId,
+}
+
+/// Options for listing edges
+#[derive(Debug, Clone, Default)]
+pub struct ListEdgesOptions {
+  /// Filter by edge type
+  pub etype: Option<ETypeId>,
+}
+
+/// List all edges in the database
+///
+/// This iterates over all nodes and their outgoing edges.
+/// Optionally filter by edge type.
+pub fn list_edges(db: &GraphDB, options: ListEdgesOptions) -> Vec<FullEdge> {
+  let delta = db.delta.read();
+  let mut edges = Vec::new();
+  let mut seen_nodes = std::collections::HashSet::new();
+
+  // From snapshot
+  if let Some(ref snapshot) = db.snapshot {
+    for phys in 0..snapshot.header.num_nodes as u32 {
+      if let Some(src) = snapshot.get_node_id(phys) {
+        if delta.deleted_nodes.contains(&src) {
+          continue;
+        }
+        seen_nodes.insert(src);
+
+        for (dst_phys, etype) in snapshot.iter_out_edges(phys) {
+          if let Some(dst) = snapshot.get_node_id(dst_phys) {
+            // Apply etype filter
+            if let Some(filter_etype) = options.etype {
+              if etype != filter_etype {
+                continue;
+              }
+            }
+
+            // Skip deleted edges
+            if delta.is_edge_deleted(src, etype, dst) {
+              continue;
+            }
+
+            edges.push(FullEdge { src, etype, dst });
+          }
+        }
+      }
+    }
+  }
+
+  // From delta created nodes and added edges
+  for (&src, _) in &delta.created_nodes {
+    if delta.deleted_nodes.contains(&src) {
+      continue;
+    }
+    seen_nodes.insert(src);
+  }
+
+  // Add delta edges
+  for (&src, add_set) in &delta.out_add {
+    for patch in add_set {
+      // Apply etype filter
+      if let Some(filter_etype) = options.etype {
+        if patch.etype != filter_etype {
+          continue;
+        }
+      }
+
+      edges.push(FullEdge {
+        src,
+        etype: patch.etype,
+        dst: patch.other,
+      });
+    }
+  }
+
+  edges
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
