@@ -55,10 +55,11 @@ works_at = define_edge("worksAt", {
 def main():
     # Create a temporary directory for the database
     dir = tempfile.mkdtemp(prefix="ray-example-")
+    db_path = f"{dir}/example.raydb"
     
     try:
         # Open database with schema
-        db = ray(dir, nodes=[user, company], edges=[knows, works_at])
+        db = ray(db_path, nodes=[user, company], edges=[knows, works_at])
         
         try:
             # Insert Alice
@@ -105,15 +106,37 @@ def main():
             db.update(alice).set(age=31).execute()
             print("Updated Alice's age via node reference")
             
-            # Traverse: find Alice's young friends (age < 35)
+            # =============================================================
+            # Traversal Examples (with lazy loading optimization)
+            # =============================================================
+            
+            # Fastest: get just IDs
+            friend_ids = db.from_(alice).out(knows).ids()
+            print(f"Friend IDs: {friend_ids}")
+            
+            # Fast: get keys only
+            friend_keys = db.from_(alice).out(knows).keys()
+            print(f"Friend keys: {friend_keys}")
+            
+            # Default: NodeRefs without properties (fast)
+            friends = db.from_(alice).out(knows).to_list()
+            print(f"Friends (no props): {[f.key for f in friends]}")
+            
+            # With specific properties (selective loading)
+            friends_with_name = db.from_(alice).out(knows).load_props("name").to_list()
+            print(f"Friends with name: {[(f.key, f.name) for f in friends_with_name]}")
+            
+            # With all properties (slower but complete)
+            friends_full = db.from_(alice).out(knows).with_props().to_list()
+            print(f"Friends full: {[(f.key, f.name, f.age) for f in friends_full]}")
+            
+            # With filter (automatically loads properties for predicate)
             young_friends = (
                 db.from_(alice)
                 .out(knows)
                 .where_node(lambda n: n.age is not None and n.age < 35)
-                .nodes()
                 .to_list()
             )
-            
             print(f"Young friends: {[f.key for f in young_friends]}")
             
             # Verify Bob's age

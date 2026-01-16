@@ -1,18 +1,26 @@
 """
 Traversal Builder for RayDB
 
-Provides a fluent API for graph traversals, similar to the TypeScript API.
+Provides a fluent API for graph traversals with lazy property loading.
+
+By default, traversals are fast and don't load properties. Use `.load_props()`
+or `.with_props()` to opt-in to property loading when needed.
 
 Example:
-    >>> # Find friends of alice
-    >>> friends = db.from_(alice).out(knows).nodes().to_list()
+    >>> # Fast traversal - no properties loaded (just IDs and keys)
+    >>> friend_ids = db.from_(alice).out(knows).to_list()
     >>> 
-    >>> # Find friends who are under 35
+    >>> # Opt-in to load properties when you need them
+    >>> friends_with_props = db.from_(alice).out(knows).with_props().to_list()
+    >>> 
+    >>> # Load specific properties only
+    >>> friends = db.from_(alice).out(knows).load_props("name", "age").to_list()
+    >>> 
+    >>> # Filter requires properties - auto-loads them
     >>> young_friends = (
     ...     db.from_(alice)
     ...     .out(knows)
     ...     .where_node(lambda n: n.age is not None and n.age < 35)
-    ...     .nodes()
     ...     .to_list()
     ... )
 """
@@ -31,6 +39,8 @@ from typing import (
     List,
     Literal,
     Optional,
+    Set,
+    Tuple,
     TypeVar,
     Union,
 )
@@ -74,6 +84,44 @@ TraversalStep = Union[OutStep, InStep, BothStep]
 
 
 # ============================================================================
+# Property Loading Strategy
+# ============================================================================
+
+@dataclass
+class PropLoadStrategy:
+    """Strategy for loading properties."""
+    load_all: bool = False
+    prop_names: Optional[Set[str]] = None
+    
+    @staticmethod
+    def none() -> PropLoadStrategy:
+        """Don't load any properties."""
+        return PropLoadStrategy(load_all=False, prop_names=None)
+    
+    @staticmethod
+    def all() -> PropLoadStrategy:
+        """Load all properties."""
+        return PropLoadStrategy(load_all=True, prop_names=None)
+    
+    @staticmethod
+    def only(*names: str) -> PropLoadStrategy:
+        """Load only specified properties."""
+        return PropLoadStrategy(load_all=False, prop_names=set(names))
+    
+    def should_load(self, prop_name: str) -> bool:
+        """Check if a property should be loaded."""
+        if self.load_all:
+            return True
+        if self.prop_names is not None:
+            return prop_name in self.prop_names
+        return False
+    
+    def needs_any_props(self) -> bool:
+        """Check if any properties need to be loaded."""
+        return self.load_all or (self.prop_names is not None and len(self.prop_names) > 0)
+
+
+# ============================================================================
 # Traversal Result
 # ============================================================================
 
@@ -83,6 +131,10 @@ class TraversalResult(Generic[N]):
     
     This is a lazy iterator - it doesn't execute until you call
     to_list(), first(), or iterate over it.
+    
+    By default, no properties are loaded for performance. Use:
+    - `.with_props()` to load all properties
+    - `.load_props("name", "age")` to load specific properties
     """
     
     def __init__(
@@ -94,7 +146,7 @@ class TraversalResult(Generic[N]):
         resolve_etype_id: Callable[[EdgeDef], int],
         resolve_prop_key_id: Callable[[NodeDef, str], int],
         get_node_def: Callable[[int], Optional[NodeDef]],
-        include_edges: bool = False,
+        prop_strategy: PropLoadStrategy,
     ):
         self._db = db
         self._start_nodes = start_nodes
@@ -103,19 +155,24 @@ class TraversalResult(Generic[N]):
         self._resolve_etype_id = resolve_etype_id
         self._resolve_prop_key_id = resolve_prop_key_id
         self._get_node_def = get_node_def
-        self._include_edges = include_edges
+        self._prop_strategy = prop_strategy
     
     def _load_node_props(self, node_id: int, node_def: NodeDef) -> Dict[str, Any]:
-        """Load all properties for a node."""
+        """Load properties for a node based on strategy."""
         props: Dict[str, Any] = {}
+        
+        if not self._prop_strategy.needs_any_props():
+            return props
+        
         for prop_name, prop_def in node_def.props.items():
-            prop_key_id = self._resolve_prop_key_id(node_def, prop_name)
-            prop_value = self._db.get_node_prop(node_id, prop_key_id)
-            if prop_value is not None:
-                props[prop_name] = from_prop_value(prop_value)
+            if self._prop_strategy.should_load(prop_name):
+                prop_key_id = self._resolve_prop_key_id(node_def, prop_name)
+                prop_value = self._db.get_node_prop(node_id, prop_key_id)
+                if prop_value is not None:
+                    props[prop_name] = from_prop_value(prop_value)
         return props
     
-    def _create_node_ref(self, node_id: int) -> Optional[NodeRef[Any]]:
+    def _create_node_ref(self, node_id: int, load_props: bool = False) -> Optional[NodeRef[Any]]:
         """Create a NodeRef from a node ID."""
         node_def = self._get_node_def(node_id)
         if node_def is None:
@@ -125,46 +182,70 @@ class TraversalResult(Generic[N]):
         if key is None:
             key = f"node:{node_id}"
         
-        props = self._load_node_props(node_id, node_def)
+        if load_props:
+            props = self._load_node_props(node_id, node_def)
+        else:
+            props = {}
+        
         return NodeRef(id=node_id, key=key, node_def=node_def, props=props)
     
-    def _execute(self) -> Generator[NodeRef[Any], None, None]:
-        """Execute the traversal and yield results."""
-        current_nodes = list(self._start_nodes)
+    def _create_node_ref_fast(self, node_id: int, node_def: NodeDef) -> NodeRef[Any]:
+        """Create a minimal NodeRef without loading key or properties."""
+        return NodeRef(id=node_id, key="", node_def=node_def, props={})
+    
+    def _execute_fast(self) -> Generator[int, None, None]:
+        """Execute traversal and yield only node IDs (fastest path)."""
+        current_ids: List[int] = [node.id for node in self._start_nodes]
         
         for step in self._steps:
-            next_nodes: List[NodeRef[Any]] = []
-            visited: set[int] = set()
+            next_ids: List[int] = []
+            visited: Set[int] = set()
             
-            for node in current_nodes:
-                # Get the edge type ID if specified
-                etype_id = None
-                if step.edge_def is not None:
-                    etype_id = self._resolve_etype_id(step.edge_def)
-                
-                # Execute the traversal step
+            etype_id = None
+            if step.edge_def is not None:
+                etype_id = self._resolve_etype_id(step.edge_def)
+            
+            for node_id in current_ids:
                 if step.type == "out":
-                    neighbor_ids = self._db.traverse_out(node.id, etype_id)
+                    neighbor_ids = self._db.traverse_out(node_id, etype_id)
                 elif step.type == "in":
-                    neighbor_ids = self._db.traverse_in(node.id, etype_id)
+                    neighbor_ids = self._db.traverse_in(node_id, etype_id)
                 else:  # both
-                    out_ids = self._db.traverse_out(node.id, etype_id)
-                    in_ids = self._db.traverse_in(node.id, etype_id)
+                    out_ids = self._db.traverse_out(node_id, etype_id)
+                    in_ids = self._db.traverse_in(node_id, etype_id)
                     neighbor_ids = list(set(out_ids) | set(in_ids))
                 
                 for neighbor_id in neighbor_ids:
                     if neighbor_id not in visited:
                         visited.add(neighbor_id)
-                        neighbor_ref = self._create_node_ref(neighbor_id)
-                        if neighbor_ref is not None:
-                            next_nodes.append(neighbor_ref)
+                        next_ids.append(neighbor_id)
             
-            current_nodes = next_nodes
+            current_ids = next_ids
         
-        # Apply filter and yield results
-        for node in current_nodes:
-            if self._node_filter is None or self._node_filter(node):
-                yield node
+        for node_id in current_ids:
+            yield node_id
+    
+    def _execute(self) -> Generator[NodeRef[Any], None, None]:
+        """Execute the traversal and yield results."""
+        # Fast path: no filter and no properties needed
+        needs_filter = self._node_filter is not None
+        needs_props = self._prop_strategy.needs_any_props()
+        
+        if not needs_filter and not needs_props:
+            # Ultra-fast path: just yield minimal NodeRefs
+            for node_id in self._execute_fast():
+                node_def = self._get_node_def(node_id)
+                if node_def is not None:
+                    key = self._db.get_node_key(node_id)
+                    yield NodeRef(id=node_id, key=key or f"node:{node_id}", node_def=node_def, props={})
+            return
+        
+        # Standard path: may need to load properties
+        for node_id in self._execute_fast():
+            node_ref = self._create_node_ref(node_id, load_props=needs_props or needs_filter)
+            if node_ref is not None:
+                if self._node_filter is None or self._node_filter(node_ref):
+                    yield node_ref
     
     def __iter__(self) -> Iterator[NodeRef[Any]]:
         """Iterate over the traversal results."""
@@ -194,10 +275,40 @@ class TraversalResult(Generic[N]):
         """
         Execute the traversal and count results.
         
+        This is optimized to not load properties when counting.
+        
         Returns:
             Number of matching nodes
         """
-        return sum(1 for _ in self._execute())
+        if self._node_filter is None:
+            # Fast count - just count IDs
+            return sum(1 for _ in self._execute_fast())
+        else:
+            # Need to check filter - must load props
+            return sum(1 for _ in self._execute())
+    
+    def ids(self) -> List[int]:
+        """
+        Get just the node IDs (fastest possible).
+        
+        Returns:
+            List of node IDs
+        """
+        return list(self._execute_fast())
+    
+    def keys(self) -> List[str]:
+        """
+        Get just the node keys.
+        
+        Returns:
+            List of node keys
+        """
+        result = []
+        for node_id in self._execute_fast():
+            key = self._db.get_node_key(node_id)
+            if key:
+                result.append(key)
+        return result
 
 
 # ============================================================================
@@ -208,21 +319,23 @@ class TraversalBuilder(Generic[N]):
     """
     Builder for graph traversals.
     
+    By default, traversals are fast and don't load properties.
+    Use `.with_props()` or `.load_props()` to opt-in to loading.
+    
     Example:
-        >>> # Find all friends
-        >>> friends = db.from_(alice).out(knows).nodes().to_list()
+        >>> # Fast: no properties loaded
+        >>> friend_ids = db.from_(alice).out(knows).ids()
+        >>> friend_keys = db.from_(alice).out(knows).keys()
+        >>> friend_refs = db.from_(alice).out(knows).to_list()
         >>> 
-        >>> # Find friends of friends
-        >>> fof = db.from_(alice).out(knows).out(knows).nodes().to_list()
+        >>> # Load all properties
+        >>> friends = db.from_(alice).out(knows).with_props().to_list()
         >>> 
-        >>> # Find young friends
-        >>> young = (
-        ...     db.from_(alice)
-        ...     .out(knows)
-        ...     .where_node(lambda n: n.age < 35)
-        ...     .nodes()
-        ...     .to_list()
-        ... )
+        >>> # Load specific properties only
+        >>> friends = db.from_(alice).out(knows).load_props("name").to_list()
+        >>> 
+        >>> # Filter automatically loads properties
+        >>> young = db.from_(alice).out(knows).where_node(lambda n: n.age < 35).to_list()
     """
     
     def __init__(
@@ -240,6 +353,7 @@ class TraversalBuilder(Generic[N]):
         self._get_node_def = get_node_def
         self._steps: List[TraversalStep] = []
         self._node_filter: Optional[Callable[[NodeRef[Any]], bool]] = None
+        self._prop_strategy: PropLoadStrategy = PropLoadStrategy.none()
     
     def out(self, edge: Optional[EdgeDef] = None) -> TraversalBuilder[N]:
         """
@@ -282,11 +396,50 @@ class TraversalBuilder(Generic[N]):
         self._steps.append(BothStep(edge_def=edge))
         return self
     
+    def with_props(self) -> TraversalBuilder[N]:
+        """
+        Load all properties for traversed nodes.
+        
+        This is slower but gives you access to all node properties.
+        
+        Returns:
+            Self for chaining
+        
+        Example:
+            >>> friends = db.from_(alice).out(knows).with_props().to_list()
+            >>> for f in friends:
+            ...     print(f.name, f.email)
+        """
+        self._prop_strategy = PropLoadStrategy.all()
+        return self
+    
+    def load_props(self, *prop_names: str) -> TraversalBuilder[N]:
+        """
+        Load only specific properties for traversed nodes.
+        
+        This is faster than with_props() when you only need a few properties.
+        
+        Args:
+            *prop_names: Names of properties to load
+        
+        Returns:
+            Self for chaining
+        
+        Example:
+            >>> friends = db.from_(alice).out(knows).load_props("name").to_list()
+            >>> for f in friends:
+            ...     print(f.name)  # Available
+            ...     print(f.email)  # Will be None
+        """
+        self._prop_strategy = PropLoadStrategy.only(*prop_names)
+        return self
+    
     def where_node(self, predicate: Callable[[NodeRef[Any]], bool]) -> TraversalBuilder[N]:
         """
         Filter nodes by a predicate.
         
-        The predicate receives a NodeRef with all properties loaded.
+        Note: Using a filter will automatically load all properties
+        since the predicate may access any property.
         
         Args:
             predicate: Function that returns True for nodes to include
@@ -295,22 +448,20 @@ class TraversalBuilder(Generic[N]):
             Self for chaining
         
         Example:
-            >>> # Filter by property value
-            >>> .where_node(lambda n: n.age < 35)
-            >>> 
-            >>> # Filter by property existence
-            >>> .where_node(lambda n: n.email is not None)
+            >>> young_friends = (
+            ...     db.from_(alice)
+            ...     .out(knows)
+            ...     .where_node(lambda n: n.age is not None and n.age < 35)
+            ...     .to_list()
+            ... )
         """
         self._node_filter = predicate
+        # Filter needs properties to work, so enable loading all
+        self._prop_strategy = PropLoadStrategy.all()
         return self
     
-    def nodes(self) -> TraversalResult[N]:
-        """
-        Return node results.
-        
-        Returns:
-            TraversalResult that can be iterated or collected
-        """
+    def _build_result(self) -> TraversalResult[N]:
+        """Build the traversal result."""
         return TraversalResult(
             db=self._db,
             start_nodes=self._start_nodes,
@@ -319,8 +470,17 @@ class TraversalBuilder(Generic[N]):
             resolve_etype_id=self._resolve_etype_id,
             resolve_prop_key_id=self._resolve_prop_key_id,
             get_node_def=self._get_node_def,
-            include_edges=False,
+            prop_strategy=self._prop_strategy,
         )
+    
+    def nodes(self) -> TraversalResult[N]:
+        """
+        Return node results.
+        
+        Returns:
+            TraversalResult that can be iterated or collected
+        """
+        return self._build_result()
     
     def to_list(self) -> List[NodeRef[N]]:
         """
@@ -329,7 +489,7 @@ class TraversalBuilder(Generic[N]):
         Returns:
             List of NodeRef objects
         """
-        return self.nodes().to_list()
+        return self._build_result().to_list()
     
     def first(self) -> Optional[NodeRef[N]]:
         """
@@ -338,16 +498,37 @@ class TraversalBuilder(Generic[N]):
         Returns:
             First NodeRef or None
         """
-        return self.nodes().first()
+        return self._build_result().first()
     
     def count(self) -> int:
         """
         Shortcut for .nodes().count()
         
+        This is optimized to not load properties when counting
+        (unless a filter is set).
+        
         Returns:
             Number of matching nodes
         """
-        return self.nodes().count()
+        return self._build_result().count()
+    
+    def ids(self) -> List[int]:
+        """
+        Get just the node IDs (fastest possible).
+        
+        Returns:
+            List of node IDs
+        """
+        return self._build_result().ids()
+    
+    def keys(self) -> List[str]:
+        """
+        Get just the node keys.
+        
+        Returns:
+            List of node keys
+        """
+        return self._build_result().keys()
 
 
 # ============================================================================
@@ -403,6 +584,7 @@ class PathFindingBuilder(Generic[N]):
         self._edge_type: Optional[EdgeDef] = None
         self._max_depth: Optional[int] = None
         self._direction: str = "out"
+        self._load_props: bool = False
     
     def to(self, target: NodeRef[Any]) -> PathFindingBuilder[N]:
         """Set the target node."""
@@ -424,6 +606,11 @@ class PathFindingBuilder(Generic[N]):
         self._direction = dir
         return self
     
+    def with_props(self) -> PathFindingBuilder[N]:
+        """Load properties for nodes in the path."""
+        self._load_props = True
+        return self
+    
     def _create_node_ref(self, node_id: int) -> Optional[NodeRef[Any]]:
         """Create a NodeRef from a node ID."""
         node_def = self._get_node_def(node_id)
@@ -434,13 +621,13 @@ class PathFindingBuilder(Generic[N]):
         if key is None:
             key = f"node:{node_id}"
         
-        # Load properties
         props: Dict[str, Any] = {}
-        for prop_name, prop_def in node_def.props.items():
-            prop_key_id = self._resolve_prop_key_id(node_def, prop_name)
-            prop_value = self._db.get_node_prop(node_id, prop_key_id)
-            if prop_value is not None:
-                props[prop_name] = from_prop_value(prop_value)
+        if self._load_props:
+            for prop_name, prop_def in node_def.props.items():
+                prop_key_id = self._resolve_prop_key_id(node_def, prop_name)
+                prop_value = self._db.get_node_prop(node_id, prop_key_id)
+                if prop_value is not None:
+                    props[prop_name] = from_prop_value(prop_value)
         
         return NodeRef(id=node_id, key=key, node_def=node_def, props=props)
     
@@ -547,6 +734,7 @@ __all__ = [
     "TraversalResult",
     "PathFindingBuilder",
     "PathResult",
+    "PropLoadStrategy",
     "OutStep",
     "InStep",
     "BothStep",
