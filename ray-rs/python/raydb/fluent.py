@@ -663,6 +663,39 @@ class Ray:
         return self._db
     
     # ==========================================================================
+    # Transaction Batching
+    # ==========================================================================
+    
+    @contextmanager
+    def transaction(self) -> Generator[Ray, None, None]:
+        """
+        Context manager for batching multiple operations in a single transaction.
+        
+        This is more efficient than letting each operation auto-commit.
+        
+        Example:
+            >>> with db.transaction():
+            ...     alice = db.insert(user).values(key="alice", name="Alice").returning()
+            ...     bob = db.insert(user).values(key="bob", name="Bob").returning()
+            ...     db.link(alice, knows, bob, since=2024)
+            ...     # All operations commit together on exit
+        
+        Note:
+            If an exception occurs, the transaction is rolled back.
+        """
+        self._db.begin()
+        try:
+            yield self
+            self._db.commit()
+        except Exception:
+            self._db.rollback()
+            raise
+    
+    def in_transaction(self) -> bool:
+        """Check if currently in a transaction."""
+        return self._db.has_transaction()
+    
+    # ==========================================================================
     # Context Manager
     # ==========================================================================
     

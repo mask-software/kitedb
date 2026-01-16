@@ -364,6 +364,19 @@ class TraversalResult(Generic[N]):
         Returns:
             List of NodeRef objects
         """
+        # Direct path without generator overhead when possible
+        needs_filter = self._node_filter is not None
+        needs_props = self._prop_strategy.needs_any_props()
+        
+        if not needs_filter and not needs_props:
+            # Fast path: build list directly
+            results: List[NodeRef[N]] = []
+            for node_id, key in self._execute_fast_with_keys():
+                node_def = self._get_node_def(node_id)
+                if node_def is not None:
+                    results.append(NodeRef(id=node_id, key=key, node_def=node_def, props={}))  # type: ignore
+            return results
+        
         return list(self._execute())  # type: ignore
     
     def first(self) -> Optional[NodeRef[N]]:

@@ -156,6 +156,43 @@ def main():
             user_count = db.count(user)
             print(f"Remaining users: {user_count}")
             
+            # =============================================================
+            # Transaction Batching Example
+            # =============================================================
+            print("\n--- Transaction Batching ---")
+            
+            # Test transaction context manager (batches multiple operations)
+            with db.transaction():
+                carol = db.insert(user).values(
+                    key="carol",
+                    name="Carol",
+                    email="carol@example.com",
+                    age=28,
+                ).returning()
+                print(f"Created Carol in transaction: {carol.key}")
+                
+                dave = db.insert(user).values(
+                    key="dave",
+                    name="Dave",
+                    email="dave@example.com",
+                    age=35,
+                ).returning()
+                print(f"Created Dave in transaction: {dave.key}")
+                
+                # This should work now - link inside transaction
+                db.link(carol, knows, dave, since=2023)
+                print("Linked Carol -> Dave inside transaction")
+                
+                # Update inside transaction
+                db.update(carol).set(age=29).execute()
+                print("Updated Carol's age inside transaction")
+            
+            print("Transaction committed successfully!")
+            
+            # Verify the data persisted
+            final_count = db.count(user)
+            print(f"Final user count: {final_count}")
+            
         finally:
             db.close()
             

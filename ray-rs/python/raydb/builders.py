@@ -147,20 +147,29 @@ class InsertExecutor(Generic[N]):
         node_def: N,
         data: Union[Dict[str, Any], List[Dict[str, Any]]],
         resolve_prop_key_id: Callable[[NodeDef, str], int],
+        use_batch: bool = False,
     ):
         self._db = db
         self._node_def = node_def
         self._data = data if isinstance(data, list) else [data]
         self._is_single = not isinstance(data, list)
         self._resolve_prop_key_id = resolve_prop_key_id
+        self._use_batch = use_batch
     
     def returning(self) -> Union[NodeRef[N], List[NodeRef[N]]]:
         """Execute insert and return the created node(s)."""
         from raydb._raydb import PropValue
         
+        # For batch inserts with many items, use Rust batch API
+        if self._use_batch and len(self._data) > 1:
+            return self._returning_batch()
+        
         results: List[NodeRef[N]] = []
         
-        self._db.begin()
+        # Check if we're already in a transaction
+        in_tx = self._db.has_transaction()
+        if not in_tx:
+            self._db.begin()
         try:
             for item in self._data:
                 key_arg = item.pop("key", None)
@@ -191,10 +200,59 @@ class InsertExecutor(Generic[N]):
                     props=item,
                 ))
             
-            self._db.commit()
+            if not in_tx:
+                self._db.commit()
         except Exception:
-            self._db.rollback()
+            if not in_tx:
+                self._db.rollback()
             raise
+        
+        return results[0] if self._is_single else results
+    
+    def _returning_batch(self) -> Union[NodeRef[N], List[NodeRef[N]]]:
+        """Execute batch insert using Rust batch API."""
+        from raydb._raydb import PropValue
+        
+        # Prepare batch data: list of (key, [(prop_key_id, PropValue)])
+        batch_nodes = []
+        items_for_results = []
+        
+        for item in self._data:
+            item_copy = dict(item)  # Copy to preserve for results
+            key_arg = item_copy.pop("key", None)
+            if key_arg is None:
+                raise ValueError("Insert requires a 'key' field")
+            
+            full_key = self._node_def.key_fn(key_arg)
+            
+            # Build props list
+            props_list = []
+            for prop_name, value in item_copy.items():
+                if value is None:
+                    continue
+                prop_def = self._node_def.props.get(prop_name)
+                if prop_def is None:
+                    continue
+                
+                prop_key_id = self._resolve_prop_key_id(self._node_def, prop_name)
+                prop_value = to_prop_value(prop_def, value, PropValue)
+                props_list.append((prop_key_id, prop_value))
+            
+            batch_nodes.append((full_key, props_list))
+            items_for_results.append((full_key, item_copy))
+        
+        # Execute batch insert in Rust
+        node_ids = self._db.batch_create_nodes(batch_nodes)
+        
+        # Build results
+        results = []
+        for node_id, (full_key, item) in zip(node_ids, items_for_results):
+            results.append(NodeRef(
+                id=node_id,
+                key=full_key,
+                node_def=self._node_def,
+                props=item,
+            ))
         
         return results[0] if self._is_single else results
     
@@ -259,21 +317,30 @@ class InsertBuilder(Generic[N]):
             resolve_prop_key_id=self._resolve_prop_key_id,
         )
     
-    def values_many(self, data: List[Dict[str, Any]]) -> InsertExecutor[N]:
+    def values_many(self, data: List[Dict[str, Any]], *, batch: bool = True) -> InsertExecutor[N]:
         """
         Insert multiple nodes at once.
         
         Args:
             data: List of dictionaries with property values
+            batch: Use Rust batch API for better performance (default True)
         
         Returns:
             InsertExecutor for executing the batch insert
+        
+        Example:
+            >>> users = db.insert(user).values_many([
+            ...     {"key": "alice", "name": "Alice"},
+            ...     {"key": "bob", "name": "Bob"},
+            ...     {"key": "carol", "name": "Carol"},
+            ... ]).returning()
         """
         return InsertExecutor(
             db=self._db,
             node_def=self._node_def,
             data=data,
             resolve_prop_key_id=self._resolve_prop_key_id,
+            use_batch=batch,
         )
 
 
@@ -335,7 +402,10 @@ class UpdateExecutor(Generic[N]):
         
         resolved_node_id: int = node_id  # Now guaranteed non-None
         
-        self._db.begin()
+        # Check if we're already in a transaction
+        in_tx = self._db.has_transaction()
+        if not in_tx:
+            self._db.begin()
         try:
             for prop_name, value in self._data.items():
                 prop_def = self._node_def.props.get(prop_name)
@@ -350,9 +420,11 @@ class UpdateExecutor(Generic[N]):
                     prop_value = to_prop_value(prop_def, value, PropValue)
                     self._db.set_node_prop(resolved_node_id, prop_key_id, prop_value)
             
-            self._db.commit()
+            if not in_tx:
+                self._db.commit()
         except Exception:
-            self._db.rollback()
+            if not in_tx:
+                self._db.rollback()
             raise
 
 
@@ -375,7 +447,10 @@ class UpdateByRefExecutor:
         """Execute the update."""
         from raydb._raydb import PropValue
         
-        self._db.begin()
+        # Check if we're already in a transaction
+        in_tx = self._db.has_transaction()
+        if not in_tx:
+            self._db.begin()
         try:
             for prop_name, value in self._data.items():
                 prop_def = self._node_ref.node_def.props.get(prop_name)
@@ -390,9 +465,11 @@ class UpdateByRefExecutor:
                     prop_value = to_prop_value(prop_def, value, PropValue)
                     self._db.set_node_prop(self._node_ref.id, prop_key_id, prop_value)
             
-            self._db.commit()
+            if not in_tx:
+                self._db.commit()
         except Exception:
-            self._db.rollback()
+            if not in_tx:
+                self._db.rollback()
             raise
 
 
@@ -536,13 +613,18 @@ class DeleteExecutor:
         
         resolved_node_id: int = node_id  # Now guaranteed non-None
         
-        self._db.begin()
+        # Check if we're already in a transaction
+        in_tx = self._db.has_transaction()
+        if not in_tx:
+            self._db.begin()
         try:
             self._db.delete_node(resolved_node_id)
-            self._db.commit()
+            if not in_tx:
+                self._db.commit()
             return True
         except Exception:
-            self._db.rollback()
+            if not in_tx:
+                self._db.rollback()
             raise
 
 
@@ -607,7 +689,10 @@ def create_link(
     
     etype_id = resolve_etype_id(edge_def)
     
-    db.begin()
+    # Check if we're already in a transaction (e.g., from db.transaction() context)
+    in_tx = db.has_transaction()
+    if not in_tx:
+        db.begin()
     try:
         db.add_edge(src.id, etype_id, dst.id)
         
@@ -624,9 +709,11 @@ def create_link(
                 prop_value = to_prop_value(prop_def, value, PropValue)
                 db.set_edge_prop(src.id, etype_id, dst.id, prop_key_id, prop_value)
         
-        db.commit()
+        if not in_tx:
+            db.commit()
     except Exception:
-        db.rollback()
+        if not in_tx:
+            db.rollback()
         raise
 
 
@@ -649,12 +736,17 @@ def delete_link(
     """
     etype_id = resolve_etype_id(edge_def)
     
-    db.begin()
+    # Check if we're already in a transaction
+    in_tx = db.has_transaction()
+    if not in_tx:
+        db.begin()
     try:
         db.delete_edge(src.id, etype_id, dst.id)
-        db.commit()
+        if not in_tx:
+            db.commit()
     except Exception:
-        db.rollback()
+        if not in_tx:
+            db.rollback()
         raise
 
 
@@ -689,7 +781,10 @@ class UpdateEdgeExecutor:
         
         etype_id = self._resolve_etype_id(self._edge_def)
         
-        self._db.begin()
+        # Check if we're already in a transaction
+        in_tx = self._db.has_transaction()
+        if not in_tx:
+            self._db.begin()
         try:
             for prop_name, value in self._data.items():
                 prop_def = self._edge_def.props.get(prop_name)
@@ -708,9 +803,11 @@ class UpdateEdgeExecutor:
                         self._src.id, etype_id, self._dst.id, prop_key_id, prop_value
                     )
             
-            self._db.commit()
+            if not in_tx:
+                self._db.commit()
         except Exception:
-            self._db.rollback()
+            if not in_tx:
+                self._db.rollback()
             raise
 
 

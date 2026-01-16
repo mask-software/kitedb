@@ -630,6 +630,56 @@ impl PyDatabase {
     Ok(node_id as i64)
   }
 
+  /// Batch create multiple nodes with properties in a single transaction
+  ///
+  /// This is optimized for bulk inserts - creates all nodes and sets all properties
+  /// in a single transaction with minimal FFI overhead.
+  ///
+  /// Args:
+  ///   nodes: List of (key, props) tuples where props is a list of (prop_key_id, PropValue)
+  ///
+  /// Returns:
+  ///   List of created node IDs
+  fn batch_create_nodes(&self, nodes: Vec<(String, Vec<(u32, PyPropValue)>)>) -> PyResult<Vec<i64>> {
+    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let db = guard
+      .as_ref()
+      .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
+    
+    let mut node_ids = Vec::with_capacity(nodes.len());
+    
+    db.begin(false)
+      .map_err(|e| PyRuntimeError::new_err(format!("Failed to begin transaction: {e}")))?;
+    
+    let result: Result<(), pyo3::PyErr> = (|| {
+      for (key, props) in nodes {
+        let node_id = db
+          .create_node(Some(&key))
+          .map_err(|e| PyRuntimeError::new_err(format!("Failed to create node: {e}")))?;
+        
+        for (prop_key_id, value) in props {
+          db.set_node_prop(node_id, prop_key_id as PropKeyId, value.into())
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to set property: {e}")))?;
+        }
+        
+        node_ids.push(node_id as i64);
+      }
+      Ok(())
+    })();
+    
+    match result {
+      Ok(()) => {
+        db.commit()
+          .map_err(|e| PyRuntimeError::new_err(format!("Failed to commit: {e}")))?;
+        Ok(node_ids)
+      }
+      Err(e) => {
+        let _ = db.rollback();
+        Err(e)
+      }
+    }
+  }
+
   /// Delete a node
   fn delete_node(&self, node_id: i64) -> PyResult<()> {
     let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -939,6 +989,110 @@ impl PyDatabase {
       db.get_node_prop(node_id as NodeId, key_id as PropKeyId)
         .map(|v| v.into()),
     )
+  }
+
+  // ========================================================================
+  // Direct Property Type Methods (skip PropValue wrapper for performance)
+  // ========================================================================
+
+  /// Get a string property directly (faster than get_node_prop)
+  fn get_node_prop_string(&self, node_id: i64, key_id: u32) -> PyResult<Option<String>> {
+    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let db = guard
+      .as_ref()
+      .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
+    Ok(
+      db.get_node_prop(node_id as NodeId, key_id as PropKeyId)
+        .and_then(|v| match v {
+          PropValue::String(s) => Some(s),
+          _ => None,
+        })
+    )
+  }
+
+  /// Get an integer property directly (faster than get_node_prop)
+  fn get_node_prop_int(&self, node_id: i64, key_id: u32) -> PyResult<Option<i64>> {
+    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let db = guard
+      .as_ref()
+      .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
+    Ok(
+      db.get_node_prop(node_id as NodeId, key_id as PropKeyId)
+        .and_then(|v| match v {
+          PropValue::I64(i) => Some(i),
+          _ => None,
+        })
+    )
+  }
+
+  /// Get a float property directly (faster than get_node_prop)
+  fn get_node_prop_float(&self, node_id: i64, key_id: u32) -> PyResult<Option<f64>> {
+    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let db = guard
+      .as_ref()
+      .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
+    Ok(
+      db.get_node_prop(node_id as NodeId, key_id as PropKeyId)
+        .and_then(|v| match v {
+          PropValue::F64(f) => Some(f),
+          _ => None,
+        })
+    )
+  }
+
+  /// Get a bool property directly (faster than get_node_prop)
+  fn get_node_prop_bool(&self, node_id: i64, key_id: u32) -> PyResult<Option<bool>> {
+    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let db = guard
+      .as_ref()
+      .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
+    Ok(
+      db.get_node_prop(node_id as NodeId, key_id as PropKeyId)
+        .and_then(|v| match v {
+          PropValue::Bool(b) => Some(b),
+          _ => None,
+        })
+    )
+  }
+
+  /// Set a string property directly (faster than set_node_prop)
+  fn set_node_prop_string(&self, node_id: i64, key_id: u32, value: String) -> PyResult<()> {
+    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let db = guard
+      .as_ref()
+      .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
+    db.set_node_prop(node_id as NodeId, key_id as PropKeyId, PropValue::String(value))
+      .map_err(|e| PyRuntimeError::new_err(format!("Failed to set property: {e}")))
+  }
+
+  /// Set an integer property directly (faster than set_node_prop)
+  fn set_node_prop_int(&self, node_id: i64, key_id: u32, value: i64) -> PyResult<()> {
+    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let db = guard
+      .as_ref()
+      .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
+    db.set_node_prop(node_id as NodeId, key_id as PropKeyId, PropValue::I64(value))
+      .map_err(|e| PyRuntimeError::new_err(format!("Failed to set property: {e}")))
+  }
+
+  /// Set a float property directly (faster than set_node_prop)
+  fn set_node_prop_float(&self, node_id: i64, key_id: u32, value: f64) -> PyResult<()> {
+    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let db = guard
+      .as_ref()
+      .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
+    db.set_node_prop(node_id as NodeId, key_id as PropKeyId, PropValue::F64(value))
+      .map_err(|e| PyRuntimeError::new_err(format!("Failed to set property: {e}")))
+  }
+
+  /// Set a bool property directly (faster than set_node_prop)
+  fn set_node_prop_bool(&self, node_id: i64, key_id: u32, value: bool) -> PyResult<()> {
+    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let db = guard
+      .as_ref()
+      .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
+    db.set_node_prop(node_id as NodeId, key_id as PropKeyId, PropValue::Bool(value))
+      .map_err(|e| PyRuntimeError::new_err(format!("Failed to set property: {e}")))
   }
 
   /// Get all properties for a node
