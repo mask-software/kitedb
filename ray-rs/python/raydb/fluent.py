@@ -226,13 +226,22 @@ class Ray:
         return None
     
     def _load_node_props(self, node_id: int, node_def: NodeDef[Any]) -> Dict[str, Any]:
-        """Load all properties for a node."""
+        """Load all properties for a node using single FFI call."""
         props: Dict[str, Any] = {}
-        for prop_name in node_def.props:
-            prop_key_id = self._resolve_prop_key_id(node_def, prop_name)
-            prop_value = self._db.get_node_prop(node_id, prop_key_id)
-            if prop_value is not None:
-                props[prop_name] = from_prop_value(prop_value)
+        # Use get_node_props() for single FFI call instead of per-property calls
+        all_props = self._db.get_node_props(node_id)
+        if all_props is None:
+            return props
+        
+        # Build reverse mapping: prop_key_id -> prop_name
+        # This is cached on node_def._prop_key_ids
+        key_id_to_name = {v: k for k, v in node_def._prop_key_ids.items()}
+        
+        for node_prop in all_props:
+            prop_name = key_id_to_name.get(node_prop.key_id)
+            if prop_name is not None:
+                props[prop_name] = from_prop_value(node_prop.value)
+        
         return props
     
     # ==========================================================================
@@ -580,16 +589,17 @@ class Ray:
             >>> for user in db.all(user):
             ...     print(user.name)
         """
-        # Get key prefix for filtering
+        # Get key prefix for filtering using Rust prefix-based listing
         try:
             test_key = node_def.key_fn("__test__")
             key_prefix = test_key.replace("__test__", "")
         except Exception:
             key_prefix = ""
         
-        for node_id in self._db.list_nodes():
+        # Use Rust prefix-based filtering
+        for node_id in self._db.list_nodes_with_prefix(key_prefix):
             key = self._db.get_node_key(node_id)
-            if key and key.startswith(key_prefix):
+            if key:
                 props = self._load_node_props(node_id, node_def)
                 yield NodeRef(id=node_id, key=key, node_def=node_def, props=props)
     
@@ -606,19 +616,14 @@ class Ray:
         if node_def is None:
             return self._db.count_nodes()
         
-        # Filter by type
+        # Filter by type using Rust prefix-based count
         try:
             test_key = node_def.key_fn("__test__")
             key_prefix = test_key.replace("__test__", "")
         except Exception:
             return 0
         
-        count = 0
-        for node_id in self._db.list_nodes():
-            key = self._db.get_node_key(node_id)
-            if key and key.startswith(key_prefix):
-                count += 1
-        return count
+        return self._db.count_nodes_with_prefix(key_prefix)
     
     def count_edges(self, edge_def: Optional[EdgeDef] = None) -> int:
         """

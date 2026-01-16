@@ -245,10 +245,12 @@ class InsertBuilder(Generic[N]):
             >>> # Using kwargs
             >>> db.insert(user).values(key="alice", name="Alice")
         """
+        # Avoid unnecessary dict copy
         if data is None:
             data = kwargs
-        else:
+        elif kwargs:
             data = {**data, **kwargs}
+        # else: use data as-is
         
         return InsertExecutor(
             db=self._db,
@@ -423,10 +425,12 @@ class UpdateBuilder(Generic[N]):
         Returns:
             UpdateExecutor for setting where condition and executing
         """
+        # Avoid unnecessary dict copy
         if data is None:
             data = kwargs
-        else:
+        elif kwargs:
             data = {**data, **kwargs}
+        # else: use data as-is
         
         return UpdateExecutor(
             db=self._db,
@@ -465,10 +469,12 @@ class UpdateByRefBuilder:
         Returns:
             UpdateByRefExecutor for executing
         """
+        # Avoid unnecessary dict copy
         if data is None:
             data = kwargs
-        else:
+        elif kwargs:
             data = {**data, **kwargs}
+        # else: use data as-is
         
         return UpdateByRefExecutor(
             db=self._db,

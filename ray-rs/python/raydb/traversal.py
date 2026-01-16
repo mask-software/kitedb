@@ -158,18 +158,25 @@ class TraversalResult(Generic[N]):
         self._prop_strategy = prop_strategy
     
     def _load_node_props(self, node_id: int, node_def: NodeDef) -> Dict[str, Any]:
-        """Load properties for a node based on strategy."""
+        """Load properties for a node based on strategy using single FFI call."""
         props: Dict[str, Any] = {}
         
         if not self._prop_strategy.needs_any_props():
             return props
         
-        for prop_name, prop_def in node_def.props.items():
-            if self._prop_strategy.should_load(prop_name):
-                prop_key_id = self._resolve_prop_key_id(node_def, prop_name)
-                prop_value = self._db.get_node_prop(node_id, prop_key_id)
-                if prop_value is not None:
-                    props[prop_name] = from_prop_value(prop_value)
+        # Use get_node_props() for single FFI call instead of per-property calls
+        all_props = self._db.get_node_props(node_id)
+        if all_props is None:
+            return props
+        
+        # Build reverse mapping: prop_key_id -> prop_name
+        key_id_to_name = {v: k for k, v in node_def._prop_key_ids.items()}
+        
+        for node_prop in all_props:
+            prop_name = key_id_to_name.get(node_prop.key_id)
+            if prop_name is not None and self._prop_strategy.should_load(prop_name):
+                props[prop_name] = from_prop_value(node_prop.value)
+        
         return props
     
     def _create_node_ref(self, node_id: int, load_props: bool = False) -> Optional[NodeRef[Any]]:
@@ -193,76 +200,84 @@ class TraversalResult(Generic[N]):
         """Create a minimal NodeRef without loading key or properties."""
         return NodeRef(id=node_id, key="", node_def=node_def, props={})
     
+    def _build_steps_for_rust(self) -> List[Tuple[str, Optional[int]]]:
+        """Build step tuples for Rust traverse_multi call."""
+        rust_steps = []
+        for step in self._steps:
+            etype_id = None
+            if step.edge_def is not None:
+                etype_id = step.edge_def._etype_id
+                if etype_id is None:
+                    etype_id = self._resolve_etype_id(step.edge_def)
+            rust_steps.append((step.type, etype_id))
+        return rust_steps
+    
     def _execute_fast(self) -> Generator[int, None, None]:
         """Execute traversal and yield only node IDs (fastest path)."""
-        current_ids: List[int] = [node.id for node in self._start_nodes]
+        if not self._steps:
+            for node in self._start_nodes:
+                yield node.id
+            return
         
-        for step in self._steps:
-            next_ids: List[int] = []
-            visited: Set[int] = set()
-            
-            # Get cached etype_id directly from EdgeDef if available
+        # For single step, use direct call (lower overhead)
+        # For multi-step, use Rust batch traversal
+        if len(self._steps) == 1:
+            step = self._steps[0]
             etype_id = None
             if step.edge_def is not None:
                 etype_id = step.edge_def._etype_id
                 if etype_id is None:
                     etype_id = self._resolve_etype_id(step.edge_def)
             
-            # Process all current nodes
-            step_type = step.type  # Cache for inner loop
-            for node_id in current_ids:
-                if step_type == "out":
-                    neighbor_ids = self._db.traverse_out(node_id, etype_id)
-                elif step_type == "in":
-                    neighbor_ids = self._db.traverse_in(node_id, etype_id)
+            visited: Set[int] = set()
+            for node in self._start_nodes:
+                if step.type == "out":
+                    neighbor_ids = self._db.traverse_out(node.id, etype_id)
+                elif step.type == "in":
+                    neighbor_ids = self._db.traverse_in(node.id, etype_id)
                 else:  # both
-                    out_ids = self._db.traverse_out(node_id, etype_id)
-                    in_ids = self._db.traverse_in(node_id, etype_id)
+                    out_ids = self._db.traverse_out(node.id, etype_id)
+                    in_ids = self._db.traverse_in(node.id, etype_id)
                     neighbor_ids = list(set(out_ids) | set(in_ids))
                 
                 for neighbor_id in neighbor_ids:
                     if neighbor_id not in visited:
                         visited.add(neighbor_id)
-                        next_ids.append(neighbor_id)
-            
-            current_ids = next_ids
-        
-        for node_id in current_ids:
-            yield node_id
+                        yield neighbor_id
+        else:
+            # Multi-step: use Rust batch traversal
+            start_ids = [node.id for node in self._start_nodes]
+            rust_steps = self._build_steps_for_rust()
+            results = self._db.traverse_multi(start_ids, rust_steps)
+            for node_id, _ in results:
+                yield node_id
     
     def _execute_fast_with_keys(self) -> Generator[Tuple[int, str], None, None]:
-        """Execute traversal and yield (node_id, key) pairs using batch operations."""
+        """Execute traversal and yield (node_id, key) pairs."""
         # No steps - just yield start nodes
         if not self._steps:
             for node in self._start_nodes:
                 yield (node.id, node.key)
             return
         
-        current_ids: List[int] = [node.id for node in self._start_nodes]
-        next_pairs: List[Tuple[int, str]] = []
-        
-        for step in self._steps:
-            next_pairs = []
-            visited: Set[int] = set()
-            
-            # Get cached etype_id directly from EdgeDef if available
+        # For single step, use direct batch call (lower overhead)
+        if len(self._steps) == 1:
+            step = self._steps[0]
             etype_id = None
             if step.edge_def is not None:
                 etype_id = step.edge_def._etype_id
                 if etype_id is None:
                     etype_id = self._resolve_etype_id(step.edge_def)
             
-            step_type = step.type
-            for node_id in current_ids:
-                if step_type == "out":
-                    # Use batch operation that returns (id, key) pairs
-                    pairs = self._db.traverse_out_with_keys(node_id, etype_id)
-                elif step_type == "in":
-                    pairs = self._db.traverse_in_with_keys(node_id, etype_id)
+            visited: Set[int] = set()
+            for node in self._start_nodes:
+                if step.type == "out":
+                    pairs = self._db.traverse_out_with_keys(node.id, etype_id)
+                elif step.type == "in":
+                    pairs = self._db.traverse_in_with_keys(node.id, etype_id)
                 else:  # both
-                    out_pairs = self._db.traverse_out_with_keys(node_id, etype_id)
-                    in_pairs = self._db.traverse_in_with_keys(node_id, etype_id)
-                    # Deduplicate by ID
+                    out_pairs = self._db.traverse_out_with_keys(node.id, etype_id)
+                    in_pairs = self._db.traverse_in_with_keys(node.id, etype_id)
                     seen = set()
                     pairs = []
                     for nid, key in out_pairs + in_pairs:
@@ -273,48 +288,49 @@ class TraversalResult(Generic[N]):
                 for neighbor_id, key in pairs:
                     if neighbor_id not in visited:
                         visited.add(neighbor_id)
-                        next_pairs.append((neighbor_id, key or f"node:{neighbor_id}"))
-            
-            current_ids = [nid for nid, _ in next_pairs]
-        
-        # Yield final results
-        for nid, key in next_pairs:
-            yield (nid, key)
+                        yield (neighbor_id, key or f"node:{neighbor_id}")
+        else:
+            # Multi-step: use Rust batch traversal
+            start_ids = [node.id for node in self._start_nodes]
+            rust_steps = self._build_steps_for_rust()
+            results = self._db.traverse_multi(start_ids, rust_steps)
+            for node_id, key in results:
+                yield (node_id, key or f"node:{node_id}")
     
     def _execute_fast_count(self) -> int:
-        """Execute traversal and return just the count (most optimized)."""
-        current_ids: List[int] = [node.id for node in self._start_nodes]
+        """Execute traversal and return just the count."""
+        if not self._steps:
+            return len(self._start_nodes)
         
-        for step in self._steps:
-            next_ids: List[int] = []
-            visited: Set[int] = set()
-            
-            # Get cached etype_id
+        # For single step, count directly
+        if len(self._steps) == 1:
+            step = self._steps[0]
             etype_id = None
             if step.edge_def is not None:
                 etype_id = step.edge_def._etype_id
                 if etype_id is None:
                     etype_id = self._resolve_etype_id(step.edge_def)
             
-            step_type = step.type
-            for node_id in current_ids:
-                if step_type == "out":
-                    neighbor_ids = self._db.traverse_out(node_id, etype_id)
-                elif step_type == "in":
-                    neighbor_ids = self._db.traverse_in(node_id, etype_id)
+            visited: Set[int] = set()
+            for node in self._start_nodes:
+                if step.type == "out":
+                    neighbor_ids = self._db.traverse_out(node.id, etype_id)
+                elif step.type == "in":
+                    neighbor_ids = self._db.traverse_in(node.id, etype_id)
                 else:  # both
-                    out_ids = self._db.traverse_out(node_id, etype_id)
-                    in_ids = self._db.traverse_in(node_id, etype_id)
+                    out_ids = self._db.traverse_out(node.id, etype_id)
+                    in_ids = self._db.traverse_in(node.id, etype_id)
                     neighbor_ids = list(set(out_ids) | set(in_ids))
                 
                 for neighbor_id in neighbor_ids:
-                    if neighbor_id not in visited:
-                        visited.add(neighbor_id)
-                        next_ids.append(neighbor_id)
+                    visited.add(neighbor_id)
             
-            current_ids = next_ids
-        
-        return len(current_ids)
+            return len(visited)
+        else:
+            # Multi-step: use Rust batch traversal count
+            start_ids = [node.id for node in self._start_nodes]
+            rust_steps = self._build_steps_for_rust()
+            return self._db.traverse_multi_count(start_ids, rust_steps)
     
     def _execute(self) -> Generator[NodeRef[Any], None, None]:
         """Execute the traversal and yield results."""

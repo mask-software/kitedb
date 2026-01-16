@@ -676,6 +676,51 @@ impl PyDatabase {
     Ok(db.list_nodes().into_iter().map(|id| id as i64).collect())
   }
 
+  /// List node IDs with keys matching a prefix
+  ///
+  /// This is optimized for filtering by node type (e.g., "user:" prefix).
+  fn list_nodes_with_prefix(&self, prefix: String) -> PyResult<Vec<i64>> {
+    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let db = guard
+      .as_ref()
+      .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
+    
+    let results: Vec<i64> = db.list_nodes()
+      .into_iter()
+      .filter(|&id| {
+        if let Some(key) = db.get_node_key(id) {
+          key.starts_with(&prefix)
+        } else {
+          false
+        }
+      })
+      .map(|id| id as i64)
+      .collect();
+    Ok(results)
+  }
+
+  /// Count nodes with keys matching a prefix
+  ///
+  /// This is optimized for counting by node type (e.g., "user:" prefix).
+  fn count_nodes_with_prefix(&self, prefix: String) -> PyResult<i64> {
+    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let db = guard
+      .as_ref()
+      .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
+    
+    let count = db.list_nodes()
+      .into_iter()
+      .filter(|&id| {
+        if let Some(key) = db.get_node_key(id) {
+          key.starts_with(&prefix)
+        } else {
+          false
+        }
+      })
+      .count();
+    Ok(count as i64)
+  }
+
   /// Count all nodes
   fn count_nodes(&self) -> PyResult<i64> {
     let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -1537,6 +1582,143 @@ impl PyDatabase {
       // Count all - use optimized degree function
       Ok(db.get_in_degree(node_id as NodeId) as i64)
     }
+  }
+
+  /// Execute a multi-step traversal entirely in Rust
+  ///
+  /// This is optimized for the fluent API - executes all steps in a single FFI call.
+  /// Each step is a tuple of (direction, etype) where direction is "out", "in", or "both".
+  ///
+  /// Args:
+  ///   start_ids: Starting node IDs
+  ///   steps: List of (direction, etype) tuples
+  ///
+  /// Returns:
+  ///   List of (node_id, key) tuples for final results
+  #[pyo3(signature = (start_ids, steps))]
+  fn traverse_multi(&self, start_ids: Vec<i64>, steps: Vec<(String, Option<u32>)>) -> PyResult<Vec<(i64, Option<String>)>> {
+    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let db = guard.as_ref().ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
+    
+    let mut current_ids: Vec<NodeId> = start_ids.iter().map(|&id| id as NodeId).collect();
+    
+    for (direction, etype) in steps {
+      let mut next_ids: Vec<NodeId> = Vec::new();
+      let mut visited: HashSet<NodeId> = HashSet::new();
+      
+      for node_id in &current_ids {
+        let neighbors: Vec<NodeId> = match direction.as_str() {
+          "out" => {
+            db.get_out_edges(*node_id)
+              .into_iter()
+              .filter(|(e, _)| etype.is_none() || etype == Some(*e))
+              .map(|(_, dst)| dst)
+              .collect()
+          }
+          "in" => {
+            db.get_in_edges(*node_id)
+              .into_iter()
+              .filter(|(e, _)| etype.is_none() || etype == Some(*e))
+              .map(|(_, src)| src)
+              .collect()
+          }
+          _ => {  // "both"
+            let mut out: Vec<NodeId> = db.get_out_edges(*node_id)
+              .into_iter()
+              .filter(|(e, _)| etype.is_none() || etype == Some(*e))
+              .map(|(_, dst)| dst)
+              .collect();
+            let in_edges: Vec<NodeId> = db.get_in_edges(*node_id)
+              .into_iter()
+              .filter(|(e, _)| etype.is_none() || etype == Some(*e))
+              .map(|(_, src)| src)
+              .collect();
+            out.extend(in_edges);
+            out
+          }
+        };
+        
+        for neighbor_id in neighbors {
+          if !visited.contains(&neighbor_id) {
+            visited.insert(neighbor_id);
+            next_ids.push(neighbor_id);
+          }
+        }
+      }
+      
+      current_ids = next_ids;
+    }
+    
+    // Get keys for final results
+    let results: Vec<(i64, Option<String>)> = current_ids
+      .into_iter()
+      .map(|id| {
+        let key = db.get_node_key(id);
+        (id as i64, key)
+      })
+      .collect();
+    
+    Ok(results)
+  }
+
+  /// Execute a multi-step traversal and return just the count
+  ///
+  /// This is the fastest option when you only need the count.
+  #[pyo3(signature = (start_ids, steps))]
+  fn traverse_multi_count(&self, start_ids: Vec<i64>, steps: Vec<(String, Option<u32>)>) -> PyResult<i64> {
+    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let db = guard.as_ref().ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
+    
+    let mut current_ids: Vec<NodeId> = start_ids.iter().map(|&id| id as NodeId).collect();
+    
+    for (direction, etype) in steps {
+      let mut next_ids: Vec<NodeId> = Vec::new();
+      let mut visited: HashSet<NodeId> = HashSet::new();
+      
+      for node_id in &current_ids {
+        let neighbors: Vec<NodeId> = match direction.as_str() {
+          "out" => {
+            db.get_out_edges(*node_id)
+              .into_iter()
+              .filter(|(e, _)| etype.is_none() || etype == Some(*e))
+              .map(|(_, dst)| dst)
+              .collect()
+          }
+          "in" => {
+            db.get_in_edges(*node_id)
+              .into_iter()
+              .filter(|(e, _)| etype.is_none() || etype == Some(*e))
+              .map(|(_, src)| src)
+              .collect()
+          }
+          _ => {  // "both"
+            let mut out: Vec<NodeId> = db.get_out_edges(*node_id)
+              .into_iter()
+              .filter(|(e, _)| etype.is_none() || etype == Some(*e))
+              .map(|(_, dst)| dst)
+              .collect();
+            let in_edges: Vec<NodeId> = db.get_in_edges(*node_id)
+              .into_iter()
+              .filter(|(e, _)| etype.is_none() || etype == Some(*e))
+              .map(|(_, src)| src)
+              .collect();
+            out.extend(in_edges);
+            out
+          }
+        };
+        
+        for neighbor_id in neighbors {
+          if !visited.contains(&neighbor_id) {
+            visited.insert(neighbor_id);
+            next_ids.push(neighbor_id);
+          }
+        }
+      }
+      
+      current_ids = next_ids;
+    }
+    
+    Ok(current_ids.len() as i64)
   }
 
   /// Variable-depth traversal from a node
