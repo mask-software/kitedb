@@ -5,13 +5,19 @@
  * 
  * Optimization: Uses targeted invalidation instead of clearing entire cache.
  * Maintains a reverse index from node to their cache keys for O(1) invalidation.
+ * 
+ * Improvement: Now tracks both source and destination nodes for correct cache
+ * invalidation when any node in a cached traversal result changes.
  */
 
 import type { ETypeID, NodeID } from "../types.ts";
 import type { Edge } from "../types.ts";
 import { LRUCache } from "../util/lru.ts";
 
-type TraversalKey = string; // Format: `${NodeID}:${ETypeID | 'all'}:${'out' | 'in'}`
+// Use bigint keys for faster comparison and hashing
+// Pack: nodeId (53 bits) | etype (10 bits) | direction (1 bit)
+// With etype=0x3FF meaning "all"
+type TraversalKey = bigint;
 
 interface TraversalCacheConfig {
   maxEntries: number;
@@ -32,6 +38,7 @@ interface CachedNeighbors {
  * When a node changes, we invalidate:
  * - All outgoing traversals from that node
  * - All incoming traversals to that node
+ * - All traversals that include this node in their results (as a destination)
  * 
  * When an edge changes (src -> dst), we invalidate:
  * - Outgoing traversals from src (affected by edge addition/removal)
@@ -42,7 +49,7 @@ export class TraversalCache {
   private readonly maxNeighborsPerEntry: number;
   
   // Reverse index for targeted invalidation
-  // Maps NodeID to all cache keys that reference this node (as src or dst)
+  // Maps NodeID to all cache keys that reference this node (as source OR destination)
   private readonly nodeKeyIndex: Map<NodeID, Set<TraversalKey>> = new Map();
   
   private hits = 0;
@@ -105,8 +112,15 @@ export class TraversalCache {
       truncated,
     });
     
-    // Track which keys belong to this node for targeted invalidation
+    // Track source node for invalidation
     this.addToNodeIndex(nodeId, key);
+    
+    // Track destination nodes for invalidation
+    // This ensures that when a destination node changes, this cache entry is invalidated
+    for (const edge of cachedNeighbors) {
+      const destId = direction === "out" ? edge.dst : edge.src;
+      this.addToNodeIndex(destId, key);
+    }
   }
 
   /**
@@ -194,15 +208,21 @@ export class TraversalCache {
   }
 
   /**
-   * Generate cache key for traversal
+   * Generate cache key for traversal using bigint packing for faster comparison
+   * 
+   * Pack: nodeId (53 bits) | etype (10 bits) | direction (1 bit)
+   * With etype=0x3FF meaning "all types"
    */
   private traversalKey(
     nodeId: NodeID,
     etype: ETypeID | undefined,
     direction: "out" | "in",
   ): TraversalKey {
-    const etypeStr = etype === undefined ? "all" : String(etype);
-    return `${nodeId}:${etypeStr}:${direction}`;
+    // Use 0x3FF (1023) to represent "all" edge types
+    const etypeVal = etype === undefined ? 0x3FFn : BigInt(etype);
+    const dirVal = direction === "out" ? 0n : 1n;
+    // nodeId << 11 | etype << 1 | direction
+    return (BigInt(nodeId) << 11n) | (etypeVal << 1n) | dirVal;
   }
   
   /**

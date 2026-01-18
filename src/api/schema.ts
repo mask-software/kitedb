@@ -45,8 +45,9 @@ import type { PropValueTag } from "../types.ts";
  * - "int" → stores 64-bit signed integers (bigint), maps to PropValueTag.I64
  * - "float" → stores 64-bit floats, maps to PropValueTag.F64
  * - "bool" → stores booleans, maps to PropValueTag.BOOL
+ * - "vector" → stores float32 vectors for embeddings, maps to PropValueTag.VECTOR_F32
  */
-export type PropType = "string" | "int" | "float" | "bool";
+export type PropType = "string" | "int" | "float" | "bool" | "vector";
 
 /**
  * Maps PropType strings to their corresponding TypeScript types:
@@ -54,6 +55,7 @@ export type PropType = "string" | "int" | "float" | "bool";
  * - "int" → bigint
  * - "float" → number
  * - "bool" → boolean
+ * - "vector" → Float32Array
  */
 export type PropTypeToTS<T extends PropType> = T extends "string"
   ? string
@@ -63,7 +65,9 @@ export type PropTypeToTS<T extends PropType> = T extends "string"
       ? number
       : T extends "bool"
         ? boolean
-        : never;
+        : T extends "vector"
+          ? Float32Array
+          : never;
 
 /**
  * A property definition with type and optionality information.
@@ -176,6 +180,30 @@ export const prop = {
    * @returns Property builder that can be chained with `.optional()`
    */
   bool: (name: string): PropBuilder<"bool"> => createPropBuilder(name, "bool"),
+
+  /**
+   * Vector property for embeddings
+   * Stored as Float32Array (maps to PropValueTag.VECTOR_F32)
+   *
+   * Note: Vector properties require separate handling via the vector store API.
+   * This type definition enables type inference for vector properties.
+   *
+   * @param name - Property name
+   * @returns Property builder that can be chained with `.optional()`
+   *
+   * @example
+   * ```ts
+   * const document = defineNode('document', {
+   *   key: (id: string) => `doc:${id}`,
+   *   props: {
+   *     title: prop.string('title'),
+   *     embedding: prop.vector('embedding'),
+   *   },
+   * });
+   * ```
+   */
+  vector: (name: string): PropBuilder<"vector"> =>
+    createPropBuilder(name, "vector"),
 };
 
 /**
@@ -538,6 +566,8 @@ export function propTypeToTag(type: PropType): PropValueTag {
       return 3; // PropValueTag.F64
     case "bool":
       return 1; // PropValueTag.BOOL
+    case "vector":
+      return 5; // PropValueTag.VECTOR_F32
   }
 }
 

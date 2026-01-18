@@ -35,11 +35,14 @@ import {
   acquireExclusiveFileLock,
   acquireSharedFileLock,
   releaseFileLock,
+  isProperLockingAvailable,
   type SingleFileLockHandle,
 } from "../../util/lock.ts";
 import { CacheManager } from "../../cache/index.ts";
-import { replayWalRecord } from "./wal-replay.ts";
+import { replayWalRecord, replayVectorRecord } from "./wal-replay.ts";
 import { MvccManager } from "../../mvcc/index.ts";
+import type { PropKeyID } from "../../types.ts";
+import type { VectorManifest } from "../../vector/types.ts";
 import {
   parseCreateNodePayload,
   parseDefineEtypePayload,
@@ -53,6 +56,7 @@ import {
   parseSetEdgePropPayload,
   parseDelEdgePropPayload,
 } from "../../core/wal.ts";
+import { checkpointLogger } from "../../util/logger.ts";
 
 /**
  * Open a single-file database (.raydb format)
@@ -66,12 +70,23 @@ export async function openSingleFileDB(
     readOnly = false,
     createIfMissing = true,
     lockFile = true,
+    requireLocking = false,
     pageSize = DEFAULT_PAGE_SIZE,
     walSize = WAL_DEFAULT_SIZE,
     autoCheckpoint = true,
     checkpointThreshold = 0.8,
     cacheSnapshot = true,
   } = options;
+
+  // Check if strict locking is required but not available
+  if (requireLocking && lockFile) {
+    if (!isProperLockingAvailable()) {
+      throw new Error(
+        "requireLocking is enabled but proper file locking is not available. " +
+        "This may happen if Bun FFI cannot load the system's libc."
+      );
+    }
+  }
 
   // Validate page size
   if (!isValidPageSize(pageSize)) {
@@ -146,6 +161,9 @@ export async function openSingleFileDB(
   // Initialize delta
   const delta = createDelta();
 
+  // Initialize vector stores
+  const vectorStores: Map<PropKeyID, VectorManifest> = new Map();
+
   // Initialize ID allocators
   let nextNodeId = INITIAL_NODE_ID;
   let nextLabelId = INITIAL_LABEL_ID;
@@ -167,13 +185,16 @@ export async function openSingleFileDB(
     // Crash during background checkpoint - replay both regions
     // The primary region has committed data, secondary has writes during checkpoint
     // Both need to be replayed to restore full state
-    console.warn(`[RayDB] Recovering from interrupted background checkpoint at ${path}`);
+    checkpointLogger.warn(`Recovering from interrupted background checkpoint`, { path });
   }
 
   // Replay WAL for recovery (getRecordsForRecovery handles dual-region)
   const walRecords = walBuffer.getRecordsForRecovery();
   const committed = extractCommittedTransactions(walRecords);
   let nextCommitTs = 1n;
+
+  // Create a temporary db object for vector replay (only needs _vectorStores)
+  const tempDbForVectorReplay = { _vectorStores: vectorStores } as GraphDB;
 
   for (const [txid, records] of committed) {
     if (Number(txid) >= nextTxId) {
@@ -186,6 +207,12 @@ export async function openSingleFileDB(
     // Replay each record
     for (const record of records) {
       replayWalRecord(record, delta);
+      
+      // Also replay vector records
+      if (record.type === WalRecordType.SET_NODE_VECTOR || 
+          record.type === WalRecordType.DEL_NODE_VECTOR) {
+        replayVectorRecord(record, tempDbForVectorReplay);
+      }
 
       // Update ID allocators
       updateAllocatorsFromRecord(record, {
@@ -281,6 +308,10 @@ export async function openSingleFileDB(
     _autoCheckpoint: autoCheckpoint,
     _checkpointThreshold: checkpointThreshold,
     _cacheSnapshot: cacheSnapshot,
+    
+    // Vector embeddings storage
+    _vectorStores: vectorStores,
+    _vectorIndexes: new Map(),
   };
 }
 

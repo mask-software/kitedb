@@ -29,12 +29,12 @@ describe("Delta Node Operations", () => {
   test("create node", () => {
     const delta = createDelta();
 
-    createNode(delta, 1n, "user:alice");
+    createNode(delta, 1, "user:alice");
 
-    expect(isNodeCreated(delta, 1n)).toBe(true);
-    expect(isNodeCreated(delta, 2n)).toBe(false);
+    expect(isNodeCreated(delta, 1)).toBe(true);
+    expect(isNodeCreated(delta, 2)).toBe(false);
 
-    const nodeDelta = getNodeDelta(delta, 1n);
+    const nodeDelta = getNodeDelta(delta, 1);
     expect(nodeDelta).not.toBeNull();
     expect(nodeDelta!.key).toBe("user:alice");
   });
@@ -42,49 +42,49 @@ describe("Delta Node Operations", () => {
   test("delete created node", () => {
     const delta = createDelta();
 
-    createNode(delta, 1n, "user:alice");
-    expect(isNodeCreated(delta, 1n)).toBe(true);
+    createNode(delta, 1, "user:alice");
+    expect(isNodeCreated(delta, 1)).toBe(true);
 
-    deleteNode(delta, 1n);
-    expect(isNodeCreated(delta, 1n)).toBe(false);
-    expect(isNodeDeleted(delta, 1n)).toBe(false); // Was never committed
+    deleteNode(delta, 1);
+    expect(isNodeCreated(delta, 1)).toBe(false);
+    expect(isNodeDeleted(delta, 1)).toBe(false); // Was never committed
   });
 
   test("delete existing node", () => {
     const delta = createDelta();
 
     // Simulate deleting a node that exists in snapshot
-    deleteNode(delta, 100n);
+    deleteNode(delta, 100);
 
-    expect(isNodeDeleted(delta, 100n)).toBe(true);
+    expect(isNodeDeleted(delta, 100)).toBe(true);
   });
 
   test("node properties", () => {
     const delta = createDelta();
 
-    createNode(delta, 1n);
+    createNode(delta, 1);
 
     setNodeProp(
       delta,
-      1n,
+      1,
       1,
       { tag: PropValueTag.STRING, value: "Alice" },
       true,
     );
-    setNodeProp(delta, 1n, 2, { tag: PropValueTag.I64, value: 30n }, true);
+    setNodeProp(delta, 1, 2, { tag: PropValueTag.I64, value: 30n }, true);
 
-    const nodeDelta = getNodeDelta(delta, 1n);
-    expect(nodeDelta!.props.get(1)).toEqual({
+    const nodeDelta = getNodeDelta(delta, 1);
+    expect(nodeDelta?.props?.get(1)).toEqual({
       tag: PropValueTag.STRING,
       value: "Alice",
     });
-    expect(nodeDelta!.props.get(2)).toEqual({
+    expect(nodeDelta?.props?.get(2)).toEqual({
       tag: PropValueTag.I64,
       value: 30n,
     });
 
-    deleteNodeProp(delta, 1n, 1, true);
-    expect(nodeDelta!.props.get(1)).toBeNull();
+    deleteNodeProp(delta, 1, 1, true);
+    expect(nodeDelta?.props?.get(1)).toBeNull();
   });
 });
 
@@ -92,46 +92,46 @@ describe("Delta Edge Operations", () => {
   test("add edge", () => {
     const delta = createDelta();
 
-    addEdge(delta, 1n, 1, 2n);
+    addEdge(delta, 1, 1, 2);
 
-    expect(isEdgeAdded(delta, 1n, 1, 2n)).toBe(true);
-    expect(isEdgeAdded(delta, 1n, 1, 3n)).toBe(false);
+    expect(isEdgeAdded(delta, 1, 1, 2)).toBe(true);
+    expect(isEdgeAdded(delta, 1, 1, 3)).toBe(false);
   });
 
   test("delete edge cancels add", () => {
     const delta = createDelta();
 
-    addEdge(delta, 1n, 1, 2n);
-    expect(isEdgeAdded(delta, 1n, 1, 2n)).toBe(true);
+    addEdge(delta, 1, 1, 2);
+    expect(isEdgeAdded(delta, 1, 1, 2)).toBe(true);
 
-    deleteEdge(delta, 1n, 1, 2n);
-    expect(isEdgeAdded(delta, 1n, 1, 2n)).toBe(false);
-    expect(isEdgeDeleted(delta, 1n, 1, 2n)).toBe(false); // Cancelled, not deleted
+    deleteEdge(delta, 1, 1, 2);
+    expect(isEdgeAdded(delta, 1, 1, 2)).toBe(false);
+    expect(isEdgeDeleted(delta, 1, 1, 2)).toBe(false); // Cancelled, not deleted
   });
 
   test("add edge cancels delete", () => {
     const delta = createDelta();
 
     // Simulate deleting an edge from snapshot
-    deleteEdge(delta, 1n, 1, 2n);
-    expect(isEdgeDeleted(delta, 1n, 1, 2n)).toBe(true);
+    deleteEdge(delta, 1, 1, 2);
+    expect(isEdgeDeleted(delta, 1, 1, 2)).toBe(true);
 
     // Re-add the edge
-    addEdge(delta, 1n, 1, 2n);
-    expect(isEdgeDeleted(delta, 1n, 1, 2n)).toBe(false); // Cancelled
-    expect(isEdgeAdded(delta, 1n, 1, 2n)).toBe(false); // Not added, just restored
+    addEdge(delta, 1, 1, 2);
+    expect(isEdgeDeleted(delta, 1, 1, 2)).toBe(false); // Cancelled
+    expect(isEdgeAdded(delta, 1, 1, 2)).toBe(false); // Not added, just restored
   });
 
   test("multiple edges from same node", () => {
     const delta = createDelta();
 
-    addEdge(delta, 1n, 1, 2n);
-    addEdge(delta, 1n, 1, 3n);
-    addEdge(delta, 1n, 2, 2n);
+    addEdge(delta, 1, 1, 2);
+    addEdge(delta, 1, 1, 3);
+    addEdge(delta, 1, 2, 2);
 
-    expect(isEdgeAdded(delta, 1n, 1, 2n)).toBe(true);
-    expect(isEdgeAdded(delta, 1n, 1, 3n)).toBe(true);
-    expect(isEdgeAdded(delta, 1n, 2, 2n)).toBe(true);
+    expect(isEdgeAdded(delta, 1, 1, 2)).toBe(true);
+    expect(isEdgeAdded(delta, 1, 1, 3)).toBe(true);
+    expect(isEdgeAdded(delta, 1, 2, 2)).toBe(true);
 
     const stats = getDeltaStats(delta);
     expect(stats.edgesAdded).toBe(3);
@@ -141,12 +141,12 @@ describe("Delta Edge Operations", () => {
     const delta = createDelta();
 
     // Add edges in random order
-    addEdge(delta, 1n, 2, 5n);
-    addEdge(delta, 1n, 1, 3n);
-    addEdge(delta, 1n, 2, 2n);
-    addEdge(delta, 1n, 1, 1n);
+    addEdge(delta, 1, 2, 5);
+    addEdge(delta, 1, 1, 3);
+    addEdge(delta, 1, 2, 2);
+    addEdge(delta, 1, 1, 1);
 
-    const patches = delta.outAdd.get(1n)!;
+    const patches = delta.outAdd.get(1)!;
 
     // Should be sorted by (etype, other)
     for (let i = 1; i < patches.length; i++) {
@@ -211,13 +211,13 @@ describe("Delta Statistics", () => {
   test("stats after operations", () => {
     const delta = createDelta();
 
-    createNode(delta, 1n);
-    createNode(delta, 2n);
-    deleteNode(delta, 100n);
+    createNode(delta, 1);
+    createNode(delta, 2);
+    deleteNode(delta, 100);
 
-    addEdge(delta, 1n, 1, 2n);
-    addEdge(delta, 1n, 2, 2n);
-    deleteEdge(delta, 100n, 1, 101n);
+    addEdge(delta, 1, 1, 2);
+    addEdge(delta, 1, 2, 2);
+    deleteEdge(delta, 100, 1, 101);
 
     const stats = getDeltaStats(delta);
 
@@ -232,10 +232,10 @@ describe("Delta Clear", () => {
   test("clear resets all state", () => {
     const delta = createDelta();
 
-    createNode(delta, 1n, "test");
-    addEdge(delta, 1n, 1, 2n);
-    deleteNode(delta, 100n);
-    deleteEdge(delta, 100n, 1, 101n);
+    createNode(delta, 1, "test");
+    addEdge(delta, 1, 1, 2);
+    deleteNode(delta, 100);
+    deleteEdge(delta, 100, 1, 101);
     defineLabel(delta, 1, "Test");
 
     clearDelta(delta);

@@ -183,6 +183,10 @@ export class FilePager implements Pager {
     ftruncateSync(this.fd, newSize);
     this._fileSize = newSize;
     
+    // Invalidate mmap cache since file size changed
+    // Existing mmaps may now be referencing potentially invalid regions
+    this.invalidateMmapCache();
+    
     return startPage;
   }
 
@@ -236,6 +240,10 @@ export class FilePager implements Pager {
     const copyForward = srcPage < dstPage;
     const buffer = new Uint8Array(this.pageSize);
     
+    // Invalidate all cached mmaps upfront since this operation modifies multiple pages
+    // This ensures any subsequent mmap access gets fresh data
+    this.invalidateMmapCache();
+
     if (copyForward) {
       // Copy from end to start to avoid overwriting
       for (let i = pageCount - 1; i >= 0; i--) {
@@ -276,9 +284,6 @@ export class FilePager implements Pager {
     
     // Mark old pages as free
     this.freePages(srcPage, pageCount);
-    
-    // Invalidate any cached mmaps that overlap with source or destination
-    this.invalidateMmapCache();
   }
 
   /**

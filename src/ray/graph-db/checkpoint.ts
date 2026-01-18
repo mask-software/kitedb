@@ -71,7 +71,14 @@ export function getCheckpointState(db: GraphDB): CheckpointState {
  */
 export function isCheckpointRunning(db: GraphDB): boolean {
   const state = getCheckpointState(db);
-  return state.status === 'running' || state.status === 'completing';
+  return state.status === 'running' || state.status === 'completing' || state.status === 'merging';
+}
+
+/**
+ * Check if the merge lock is held (commits should wait)
+ */
+export function isCheckpointMerging(db: GraphDB): boolean {
+  return db._checkpointMergeLock === true;
 }
 
 /**
@@ -193,13 +200,15 @@ async function backgroundCheckpoint(db: GraphDB): Promise<void> {
     
     await writeSnapshotPages(pager, Number(newSnapshotStartPage), snapshotBuffer, header.pageSize);
     
-    // Step 6: Completing phase - brief lock for final updates
-    db._checkpointState = { status: 'completing' };
+    // Step 6: Merging phase - acquire merge lock to prevent concurrent commits
+    // This is the critical section where we must atomically:
+    // 1. Read the current secondary head
+    // 2. Merge secondary records into primary
+    // The lock prevents commits from writing to secondary during this window
+    db._checkpointState = { status: 'merging' };
+    db._checkpointMergeLock = true;
     
-    // Merge secondary records into primary
-    // IMPORTANT: Must use CURRENT db._header.walSecondaryHead (not stale local header)
-    // because concurrent commits may have written to secondary region while we were
-    // building the snapshot. Using stale header would miss those records = DATA LOSS!
+    // Now safe to read secondary head - no concurrent writes can occur
     const mergeHeader = {
       ...header,
       walSecondaryHead: db._header!.walSecondaryHead,
@@ -207,6 +216,9 @@ async function backgroundCheckpoint(db: GraphDB): Promise<void> {
     const finalWalBuffer = createWalBuffer(pager, mergeHeader);
     finalWalBuffer.mergeSecondaryIntoPrimary();
     finalWalBuffer.flushPendingWrites();
+    
+    // Update state to completing (still under merge lock)
+    db._checkpointState = { status: 'completing' };
     
     // Update header with new snapshot and cleared WAL
     const newHeader = updateHeaderForCompaction(
@@ -231,6 +243,9 @@ async function backgroundCheckpoint(db: GraphDB): Promise<void> {
     
     await writeHeader(pager, finalHeader);
     db._header = finalHeader;
+    
+    // Release merge lock - commits can proceed now (they'll write to primary)
+    db._checkpointMergeLock = false;
     
     // Re-mmap the new snapshot
     if (finalHeader.snapshotPageCount > 0n) {
@@ -264,6 +279,7 @@ async function backgroundCheckpoint(db: GraphDB): Promise<void> {
   } catch (error) {
     // On error, try to recover by clearing checkpointInProgress flag
     // This allows normal checkpoint to clean up
+    db._checkpointMergeLock = false; // Release lock on error
     try {
       const recoveryHeader = {
         ...header,
@@ -277,7 +293,8 @@ async function backgroundCheckpoint(db: GraphDB): Promise<void> {
     }
     throw error;
   } finally {
-    // Step 7: Mark checkpoint as complete
+    // Step 7: Mark checkpoint as complete and ensure lock is released
+    db._checkpointMergeLock = false;
     db._checkpointState = { status: 'idle' };
   }
 }

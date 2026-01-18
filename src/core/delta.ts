@@ -195,6 +195,8 @@ function getOrCreatePatches(
 /**
  * Add an edge with proper cancellation
  * Rule: if in del set, cancel delete; else add to add set
+ * 
+ * Optimization: Maintains reverse index for O(k) edge cleanup on node deletion
  */
 export function addEdge(
   delta: DeltaState,
@@ -223,6 +225,17 @@ export function addEdge(
     const inAddPatches = getOrCreatePatches(delta.inAdd, dst);
     insertEdgePatch(inAddPatches, etype, src);
   }
+
+  // Track reverse index for fast edge cleanup on node deletion
+  if (!delta.incomingEdgeSources) {
+    delta.incomingEdgeSources = new Map();
+  }
+  let sources = delta.incomingEdgeSources.get(dst);
+  if (!sources) {
+    sources = new Set();
+    delta.incomingEdgeSources.set(dst, sources);
+  }
+  sources.add(src);
 }
 
 /**
@@ -308,6 +321,9 @@ export function createNode(
 
 /**
  * Remove edges involving a node from all edge maps
+ * 
+ * Optimization: Uses reverse index when available for O(k) complexity
+ * where k = number of incoming edges, instead of O(n) where n = total edges.
  */
 function removeEdgesInvolving(delta: DeltaState, nodeId: NodeID): void {
   // Remove edges FROM this node
@@ -316,26 +332,69 @@ function removeEdgesInvolving(delta: DeltaState, nodeId: NodeID): void {
   delta.inAdd.delete(nodeId);
   delta.inDel.delete(nodeId);
 
-  // Remove edges TO this node (from other nodes' outAdd/outDel)
-  for (const [src, patches] of delta.outAdd) {
-    const filtered = patches.filter((p) => p.other !== nodeId);
-    if (filtered.length === 0) {
-      delta.outAdd.delete(src);
-    } else if (filtered.length !== patches.length) {
-      delta.outAdd.set(src, filtered);
+  // Fast path: use reverse index if available
+  if (delta.incomingEdgeSources) {
+    // Remove edges TO this node using reverse index
+    const sources = delta.incomingEdgeSources.get(nodeId);
+    if (sources) {
+      for (const src of sources) {
+        // Remove from outAdd
+        const outAdd = delta.outAdd.get(src);
+        if (outAdd) {
+          const filtered = outAdd.filter(p => p.other !== nodeId);
+          if (filtered.length === 0) {
+            delta.outAdd.delete(src);
+          } else if (filtered.length !== outAdd.length) {
+            delta.outAdd.set(src, filtered);
+          }
+        }
+        // Remove from outDel
+        const outDel = delta.outDel.get(src);
+        if (outDel) {
+          const filtered = outDel.filter(p => p.other !== nodeId);
+          if (filtered.length === 0) {
+            delta.outDel.delete(src);
+          } else if (filtered.length !== outDel.length) {
+            delta.outDel.set(src, filtered);
+          }
+        }
+      }
+      delta.incomingEdgeSources.delete(nodeId);
     }
-  }
 
-  for (const [src, patches] of delta.outDel) {
-    const filtered = patches.filter((p) => p.other !== nodeId);
-    if (filtered.length === 0) {
-      delta.outDel.delete(src);
-    } else if (filtered.length !== patches.length) {
-      delta.outDel.set(src, filtered);
+    // Also clean up this node from the reverse index (it might be a source for other nodes)
+    for (const [dst, srcs] of delta.incomingEdgeSources) {
+      if (srcs.has(nodeId)) {
+        srcs.delete(nodeId);
+        if (srcs.size === 0) {
+          delta.incomingEdgeSources.delete(dst);
+        }
+      }
+    }
+  } else {
+    // Slow path: iterate all edge maps (fallback)
+    // Remove edges TO this node (from other nodes' outAdd/outDel)
+    for (const [src, patches] of delta.outAdd) {
+      const filtered = patches.filter((p) => p.other !== nodeId);
+      if (filtered.length === 0) {
+        delta.outAdd.delete(src);
+      } else if (filtered.length !== patches.length) {
+        delta.outAdd.set(src, filtered);
+      }
+    }
+
+    for (const [src, patches] of delta.outDel) {
+      const filtered = patches.filter((p) => p.other !== nodeId);
+      if (filtered.length === 0) {
+        delta.outDel.delete(src);
+      } else if (filtered.length !== patches.length) {
+        delta.outDel.set(src, filtered);
+      }
     }
   }
 
   // Remove in-edges FROM this node (from other nodes' inAdd/inDel)
+  // This needs the slow path regardless since we don't have a reverse index for outgoing edges
   for (const [dst, patches] of delta.inAdd) {
     const filtered = patches.filter((p) => p.other !== nodeId);
     if (filtered.length === 0) {
@@ -673,4 +732,9 @@ export function clearDelta(delta: DeltaState): void {
   delta.newPropkeys.clear();
   delta.keyIndex.clear();
   delta.keyIndexDeleted.clear();
+  // Clear reverse index
+  delta.incomingEdgeSources?.clear();
+  // Clear edge Set caches
+  delta.outAddSets?.clear();
+  delta.outDelSets?.clear();
 }

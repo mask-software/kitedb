@@ -226,6 +226,7 @@ export function createTraversalBuilder<N extends NodeDef>(
   }
 
   // Fast count for simple traversals without filters
+  // Optimization: Uses Set for deduplication to get accurate unique node counts
   function countFast(): number {
     // Can only use fast path if no filters are set
     if (edgeFilter !== null || nodeFilter !== null) {
@@ -239,15 +240,16 @@ export function createTraversalBuilder<N extends NodeDef>(
       }
     }
 
-    let currentNodeIds: NodeID[] = startNodes.map(n => n.$id);
+    // Use Set for deduplication to get accurate counts for graphs with multiple paths
+    let currentNodeIds = new Set<NodeID>(startNodes.map(n => n.$id));
 
     for (const step of steps) {
       const etypeId = resolveEtypeId(step.edgeDef);
-      const nextNodeIds: NodeID[] = [];
+      const nextNodeIds = new Set<NodeID>();
 
       for (const nodeId of currentNodeIds) {
         for (const neighborId of iterateSingleHopIds(nodeId, step.type as "out" | "in" | "both", etypeId)) {
-          nextNodeIds.push(neighborId);
+          nextNodeIds.add(neighborId);
         }
       }
 
@@ -255,11 +257,11 @@ export function createTraversalBuilder<N extends NodeDef>(
     }
 
     // Apply limit if set
-    if (limit !== null && currentNodeIds.length > limit) {
+    if (limit !== null && currentNodeIds.size > limit) {
       return limit;
     }
 
-    return currentNodeIds.length;
+    return currentNodeIds.size;
   }
 
   // ============================================================================
@@ -331,6 +333,7 @@ export function createTraversalBuilder<N extends NodeDef>(
   }
 
   // Execute variable-depth traversal (BFS)
+  // Optimization: Uses index-based queue for O(1) dequeue instead of O(n) Array.shift()
   async function* executeTraverse(
     startNode: NodeRef,
     step: TraversalStep,
@@ -347,10 +350,20 @@ export function createTraversalBuilder<N extends NodeDef>(
     }
 
     // BFS queue: [nodeRef, depth]
-    const queue: [NodeRef, number][] = [[startNode, 0]];
+    // Use index-based approach for O(1) dequeue (Array.shift is O(n))
+    // Compact the queue periodically to prevent unbounded memory growth
+    let queue: [NodeRef, number][] = [[startNode, 0]];
+    let queueHead = 0;
+    const COMPACT_THRESHOLD = 1000; // Compact when head exceeds this
 
-    while (queue.length > 0) {
-      const [currentNode, depth] = queue.shift()!;
+    while (queueHead < queue.length) {
+      const [currentNode, depth] = queue[queueHead++]!;
+
+      // Compact the queue to free memory from processed items
+      if (queueHead >= COMPACT_THRESHOLD && queueHead > queue.length / 2) {
+        queue = queue.slice(queueHead);
+        queueHead = 0;
+      }
 
       if (depth >= maxDepth) continue;
 
@@ -486,12 +499,23 @@ export function createTraversalBuilder<N extends NodeDef>(
           }
 
           const etypeId = resolveEtypeId(step.edgeDef);
+          const directions: ("out" | "in")[] =
+            step.type === "both" ? ["out", "in"] : [step.type as "out" | "in"];
           const nextNodeIds: NodeID[] = [];
 
           for (const nodeId of currentNodeIds) {
-            for (const neighborId of iterateSingleHopIds(nodeId, step.type as "out" | "in" | "both", etypeId)) {
-              yield { src: nodeId, dst: neighborId, etype: etypeId };
-              nextNodeIds.push(neighborId);
+            for (const dir of directions) {
+              const neighbors =
+                dir === "out"
+                  ? getNeighborsOut(db, nodeId, etypeId)
+                  : getNeighborsIn(db, nodeId, etypeId);
+
+              for (const edge of neighbors) {
+                // Yield correct edge direction (src is always the source, dst is always the target)
+                yield { src: edge.src, dst: edge.dst, etype: edge.etype };
+                // Track neighbor for next hop
+                nextNodeIds.push(dir === "out" ? edge.dst : edge.src);
+              }
             }
           }
 

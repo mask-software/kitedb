@@ -131,7 +131,6 @@ function buildOutEdgesCSR(
   // Fill edge arrays (sort by etype, dst within each node)
   const dst = new Uint32Array(numEdges);
   const etype = new Uint32Array(numEdges);
-  const positions = offsets.slice(0, numNodes); // Current write position per node
 
   // Group edges by source node
   const edgesByNode: Map<PhysNode, { etype: ETypeID; dstPhys: PhysNode }[]> =
@@ -193,7 +192,6 @@ function buildInEdgesCSR(
   const src = new Uint32Array(numEdges);
   const etype = new Uint32Array(numEdges);
   const outIndex = new Uint32Array(numEdges);
-  const positions = offsets.slice(0, numNodes);
 
   // Collect in-edges with their out-edge indices
   const inEdgesByNode: Map<
@@ -324,6 +322,16 @@ function encodePropValue(value: PropValue): { tag: number; payload: bigint } {
       throw new Error(
         "String props must be converted to StringID before encoding",
       );
+    case PropValueTag.VECTOR_F32:
+      // Vector values are stored separately in vector store
+      throw new Error(
+        "Vector props must be stored in vector store, not in snapshot properties",
+      );
+    default: {
+      // Exhaustive check - should never reach here
+      const _exhaustive: never = value;
+      throw new Error(`Unknown property value tag: ${(_exhaustive as PropValue).tag}`);
+    }
   }
 }
 

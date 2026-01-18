@@ -6,10 +6,10 @@
 
 import { isEdgeDeleted, isNodeDeleted } from "../core/delta.ts";
 import {
-  getInEdges,
   getNodeId,
-  getOutEdges,
   getPhysNode,
+  iterateInEdges,
+  iterateOutEdges,
 } from "../core/snapshot-reader.ts";
 import type {
   DeltaState,
@@ -79,6 +79,8 @@ function* mergeEdges(
 
 /**
  * Get out-neighbors with merged view (snapshot + delta)
+ * 
+ * Optimization: Uses generator-based iterateOutEdges to avoid intermediate array allocation
  */
 export function* neighborsOut(
   snapshot: SnapshotData | null,
@@ -91,14 +93,14 @@ export function* neighborsOut(
     return;
   }
 
-  // Get snapshot edges
+  // Get snapshot edges using generator (avoids intermediate array allocation)
   const snapshotEdges: { etype: ETypeID; other: NodeID }[] = [];
 
   if (snapshot) {
     const phys = getPhysNode(snapshot, nodeId);
     if (phys >= 0) {
-      const edges = getOutEdges(snapshot, phys);
-      for (const edge of edges) {
+      // Use generator instead of getOutEdges to avoid array allocation
+      for (const edge of iterateOutEdges(snapshot, phys)) {
         const dstNodeId = getNodeId(snapshot, edge.dst);
         // Skip if destination node is deleted
         if (!isNodeDeleted(delta, dstNodeId)) {
@@ -131,6 +133,8 @@ export function* neighborsOut(
 
 /**
  * Get in-neighbors with merged view (snapshot + delta)
+ * 
+ * Optimization: Uses generator-based iterateInEdges to avoid intermediate array allocation
  */
 export function* neighborsIn(
   snapshot: SnapshotData | null,
@@ -143,20 +147,18 @@ export function* neighborsIn(
     return;
   }
 
-  // Get snapshot edges
+  // Get snapshot edges using generator (avoids intermediate array allocation)
   const snapshotEdges: { etype: ETypeID; other: NodeID }[] = [];
 
   if (snapshot) {
     const phys = getPhysNode(snapshot, nodeId);
     if (phys >= 0) {
-      const edges = getInEdges(snapshot, phys);
-      if (edges) {
-        for (const edge of edges) {
-          const srcNodeId = getNodeId(snapshot, edge.src);
-          // Skip if source node is deleted
-          if (!isNodeDeleted(delta, srcNodeId)) {
-            snapshotEdges.push({ etype: edge.etype, other: srcNodeId });
-          }
+      // Use generator instead of getInEdges to avoid array allocation
+      for (const edge of iterateInEdges(snapshot, phys)) {
+        const srcNodeId = getNodeId(snapshot, edge.src);
+        // Skip if source node is deleted
+        if (!isNodeDeleted(delta, srcNodeId)) {
+          snapshotEdges.push({ etype: edge.etype, other: srcNodeId });
         }
       }
     }
@@ -183,10 +185,47 @@ export function* neighborsIn(
   }
 }
 
+// Threshold for when to build and cache edge Sets
+const EDGE_SET_THRESHOLD = 32;
+
+/**
+ * Get or build cached edge Set for a node's patches
+ * 
+ * Optimization: Caches built Sets in DeltaState for repeated lookups
+ */
+function getOrBuildEdgeSet(
+  delta: DeltaState,
+  nodeId: NodeID,
+  type: 'add' | 'del',
+): Set<bigint> | null {
+  const patches = type === 'add' 
+    ? delta.outAdd.get(nodeId) 
+    : delta.outDel.get(nodeId);
+  
+  if (!patches || patches.length < EDGE_SET_THRESHOLD) {
+    return null;
+  }
+  
+  // Check cache
+  const cache = type === 'add' ? delta.outAddSets : delta.outDelSets;
+  if (cache?.has(nodeId)) {
+    return cache.get(nodeId)!;
+  }
+  
+  // Build and cache
+  const set = buildEdgeSet(patches);
+  if (!delta.outAddSets) delta.outAddSets = new Map();
+  if (!delta.outDelSets) delta.outDelSets = new Map();
+  (type === 'add' ? delta.outAddSets : delta.outDelSets).set(nodeId, set);
+  
+  return set;
+}
+
 /**
  * Check if an edge exists with merged view
  * 
- * Optimization: Uses O(1) bigint Set lookup instead of O(n) linear scan
+ * Optimization: Uses O(1) bigint Set lookup instead of O(n) linear scan.
+ * Caches built Sets for nodes with many edges.
  */
 export function hasEdgeMerged(
   snapshot: SnapshotData | null,
@@ -205,23 +244,23 @@ export function hasEdgeMerged(
     return false;
   }
 
-  // Check if edge is added in delta - O(1) lookup using bigint key
+  // Check if edge is added in delta
   const addPatches = delta.outAdd.get(src);
   if (addPatches) {
     const targetKey = edgeKey(etype, dst);
-    // For small patch arrays, linear scan is faster than building a Set
-    // For larger arrays, we could maintain a persistent Set in DeltaState
-    if (addPatches.length <= 10) {
+    
+    // Try cached Set first for large patch arrays
+    const cachedSet = getOrBuildEdgeSet(delta, src, 'add');
+    if (cachedSet) {
+      if (cachedSet.has(targetKey)) {
+        return true;
+      }
+    } else {
+      // Linear scan for small arrays (faster than Set construction overhead)
       for (const patch of addPatches) {
         if (patch.etype === etype && patch.other === dst) {
           return true;
         }
-      }
-    } else {
-      // Build Set for O(1) lookup on larger arrays
-      const addSet = buildEdgeSet(addPatches);
-      if (addSet.has(targetKey)) {
-        return true;
       }
     }
   }

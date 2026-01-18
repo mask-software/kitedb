@@ -1,33 +1,100 @@
 /**
- * Optional file locking for cross-process safety
- * Supports both multi-file (legacy) and single-file (SQLite-style) locking
+ * File locking for cross-process safety
+ * 
+ * Uses native flock() via Bun FFI - no external dependencies required.
+ * Supports both multi-file (legacy) and single-file (SQLite-style) locking.
  * 
  * Multi-file: Uses a separate lock file with flock()
- * Single-file: Uses byte-range locking at offset 2^30 (SQLite compatible)
+ * Single-file: Uses flock() on the database file itself
  */
 
-import { closeSync, openSync, unlinkSync, readSync, writeSync, fstatSync } from "node:fs";
+import { closeSync, openSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
-import { LOCK_FILENAME, LOCK_BYTE_OFFSET, LOCK_BYTE_RANGE } from "../constants.ts";
+import { dlopen, FFIType, suffix } from "bun:ffi";
+import { LOCK_FILENAME } from "../constants.ts";
+import { lockLogger } from "./logger.ts";
 
-// Lazy-load fs-ext for proper flock support, fallback to basic fd locking
-let flockSync: ((fd: number, flags: string) => void) | null = null;
-let flockSyncLoaded = false;
+// ============================================================================
+// Native flock() via Bun FFI
+// ============================================================================
 
-async function loadFlockSync(): Promise<void> {
-  if (flockSyncLoaded) return;
-  flockSyncLoaded = true;
+// flock() operation flags
+const LOCK_SH = 1;  // Shared lock
+const LOCK_EX = 2;  // Exclusive lock
+const LOCK_NB = 4;  // Non-blocking
+const LOCK_UN = 8;  // Unlock
+
+// Native flock function - loaded lazily
+let nativeFlock: ((fd: number, operation: number) => number) | null = null;
+let flockLoadAttempted = false;
+let flockLoadError: string | null = null;
+
+/**
+ * Load native flock() function via FFI
+ * Works on macOS and Linux without any npm dependencies
+ */
+function loadNativeFlock(): boolean {
+  if (flockLoadAttempted) {
+    return nativeFlock !== null;
+  }
+  flockLoadAttempted = true;
 
   try {
-    // @ts-ignore - fs-ext may not have types
-    const fsExt = await import("fs-ext");
-    if (fsExt.flockSync) {
-      flockSync = fsExt.flockSync;
-    }
-  } catch {
-    // fs-ext not available, will use basic fd-based locking
+    // On macOS and Linux, flock is in libc
+    // macOS: /usr/lib/libc.dylib or libSystem.B.dylib
+    // Linux: libc.so.6
+    const libPath = process.platform === "darwin" 
+      ? "/usr/lib/libSystem.B.dylib"
+      : `libc.so.6`;
+
+    const lib = dlopen(libPath, {
+      flock: {
+        args: [FFIType.i32, FFIType.i32],
+        returns: FFIType.i32,
+      },
+    });
+
+    nativeFlock = (fd: number, operation: number): number => {
+      return lib.symbols.flock(fd, operation) as number;
+    };
+
+    return true;
+  } catch (err) {
+    flockLoadError = String(err);
+    // FFI not available - will use fallback
+    return false;
   }
 }
+
+/**
+ * Check if proper file locking is available
+ * Returns true if native flock() is available via FFI
+ */
+export function isProperLockingAvailable(): boolean {
+  return loadNativeFlock();
+}
+
+// For backwards compatibility - async version
+export async function isProperLockingAvailableAsync(): Promise<boolean> {
+  return isProperLockingAvailable();
+}
+
+// Track if we've already warned about missing locking (avoid log spam)
+let warnedAboutMissingLocking = false;
+
+function warnNoLocking(): void {
+  if (!warnedAboutMissingLocking) {
+    warnedAboutMissingLocking = true;
+    lockLogger.warn(
+      `No locking mechanism available${flockLoadError ? `: ${flockLoadError}` : ""}. ` +
+      "Concurrent access from multiple processes may cause data corruption."
+    );
+  }
+}
+
+// ============================================================================
+// Multi-file locking (directory-based databases)
+// ============================================================================
 
 export interface LockHandle {
   fd: number;
@@ -52,24 +119,21 @@ export async function acquireExclusiveLock(
       await Bun.write(lockPath, `${pid}\n`);
     }
 
-    // Try to load flock support if not already loaded
-    await loadFlockSync();
-
     // Open file descriptor for locking
     const fd = openSync(lockPath, "r+");
 
-    // Acquire OS-level exclusive lock using flock
-    if (flockSync) {
-      try {
-        flockSync(fd, "exnb"); // Exclusive, non-blocking
-      } catch (err) {
+    // Try native flock
+    if (loadNativeFlock() && nativeFlock) {
+      const result = nativeFlock(fd, LOCK_EX | LOCK_NB);
+      if (result !== 0) {
         closeSync(fd);
-        return null; // Lock already held
+        return null; // Lock already held or error
       }
+      return { fd, path: lockPath };
     }
-    // If flockSync not available, fd being open provides basic protection
-    // (file can't be deleted while fd is open)
 
+    // No locking available - fd provides minimal protection
+    warnNoLocking();
     return { fd, path: lockPath };
   } catch (err) {
     // Lock file might already exist or permission denied
@@ -94,23 +158,21 @@ export async function acquireSharedLock(
       return null;
     }
 
-    // Try to load flock support if not already loaded
-    await loadFlockSync();
-
     // Open file descriptor for locking
     const fd = openSync(lockPath, "r");
 
-    // Acquire OS-level shared lock using flock
-    if (flockSync) {
-      try {
-        flockSync(fd, "shnb"); // Shared, non-blocking
-      } catch (err) {
+    // Try native flock
+    if (loadNativeFlock() && nativeFlock) {
+      const result = nativeFlock(fd, LOCK_SH | LOCK_NB);
+      if (result !== 0) {
         closeSync(fd);
         return null; // Could not acquire lock
       }
+      return { fd, path: lockPath };
     }
-    // If flockSync not available, fd being open provides basic protection
 
+    // No locking available
+    warnNoLocking();
     return { fd, path: lockPath };
   } catch {
     // Lock file might not exist or permission denied
@@ -122,12 +184,12 @@ export async function acquireSharedLock(
  * Release a lock
  */
 export function releaseLock(lock: LockHandle): void {
-  // Unlock the file first (if using flock)
-  if (flockSync && lock.fd >= 0) {
+  // Unlock the file first
+  if (nativeFlock && lock.fd >= 0) {
     try {
-      flockSync(lock.fd, "un");
+      nativeFlock(lock.fd, LOCK_UN);
     } catch (err) {
-      console.warn(`Failed to unlock ${lock.path}: ${err}`);
+      lockLogger.warn(`Failed to unlock`, { path: lock.path, error: String(err) });
     }
   }
 
@@ -136,7 +198,7 @@ export function releaseLock(lock: LockHandle): void {
     try {
       closeSync(lock.fd);
     } catch (err) {
-      console.warn(`Failed to close lock fd for ${lock.path}: ${err}`);
+      lockLogger.warn(`Failed to close lock fd`, { path: lock.path, error: String(err) });
     }
   }
 
@@ -147,52 +209,14 @@ export function releaseLock(lock: LockHandle): void {
     // ENOENT is fine (file already removed), log others
     const errno = err as NodeJS.ErrnoException;
     if (errno.code !== "ENOENT") {
-      console.warn(`Failed to remove lock file ${lock.path}: ${err}`);
+      lockLogger.warn(`Failed to remove lock file`, { path: lock.path, error: String(err) });
     }
   }
 }
 
 // ============================================================================
-// Single-file (SQLite-style) byte-range locking
+// Single-file locking (SQLite-style)
 // ============================================================================
-
-// Lazy-load fcntl for byte-range locking
-let fcntlSync: ((fd: number, cmd: number, arg: FcntlLockStruct) => number) | null = null;
-let fcntlSyncLoaded = false;
-
-interface FcntlLockStruct {
-  type: number;
-  whence: number;
-  start: bigint;
-  len: bigint;
-}
-
-// fcntl commands
-const F_SETLK = 6;  // Set lock, return error if blocked
-const F_SETLKW = 7; // Set lock, wait if blocked
-const F_GETLK = 5;  // Get lock info
-
-// Lock types  
-const F_RDLCK = 0;  // Shared (read) lock
-const F_WRLCK = 1;  // Exclusive (write) lock
-const F_UNLCK = 2;  // Unlock
-
-async function loadFcntlSync(): Promise<void> {
-  if (fcntlSyncLoaded) return;
-  fcntlSyncLoaded = true;
-
-  try {
-    // @ts-ignore - fs-ext may not have types
-    const fsExt = await import("fs-ext");
-    if (fsExt.fcntl) {
-      fcntlSync = (fd: number, cmd: number, arg: FcntlLockStruct) => {
-        return fsExt.fcntl(fd, cmd, arg);
-      };
-    }
-  } catch {
-    // fs-ext not available, will fallback to flock
-  }
-}
 
 /**
  * Single-file lock handle
@@ -203,88 +227,44 @@ export interface SingleFileLockHandle {
 }
 
 /**
- * Acquire exclusive lock on a single database file (SQLite-style)
- * Uses byte-range locking at offset 2^30
+ * Acquire exclusive lock on a single database file
+ * Uses flock() for whole-file locking
  */
 export async function acquireExclusiveFileLock(
   fd: number,
 ): Promise<SingleFileLockHandle | null> {
-  await loadFcntlSync();
-  await loadFlockSync();
-
-  // Try fcntl byte-range lock first (more precise)
-  if (fcntlSync) {
-    try {
-      const lockInfo: FcntlLockStruct = {
-        type: F_WRLCK,
-        whence: 0, // SEEK_SET
-        start: BigInt(LOCK_BYTE_OFFSET),
-        len: BigInt(LOCK_BYTE_RANGE),
-      };
-      
-      const result = fcntlSync(fd, F_SETLK, lockInfo);
-      if (result === 0) {
-        return { fd, exclusive: true };
-      }
-    } catch {
-      // fcntl failed, try flock fallback
+  // Try native flock
+  if (loadNativeFlock() && nativeFlock) {
+    const result = nativeFlock(fd, LOCK_EX | LOCK_NB);
+    if (result !== 0) {
+      return null; // Lock already held or error
     }
+    return { fd, exclusive: true };
   }
 
-  // Fallback to flock (whole-file lock)
-  if (flockSync) {
-    try {
-      flockSync(fd, "exnb"); // Exclusive, non-blocking
-      return { fd, exclusive: true };
-    } catch {
-      return null; // Lock already held
-    }
-  }
-
-  // No locking available, proceed without lock (not ideal but works)
+  // No locking available
+  warnNoLocking();
   return { fd, exclusive: true };
 }
 
 /**
- * Acquire shared lock on a single database file (SQLite-style)
- * Uses byte-range locking at offset 2^30
+ * Acquire shared lock on a single database file
+ * Uses flock() for whole-file locking
  */
 export async function acquireSharedFileLock(
   fd: number,
 ): Promise<SingleFileLockHandle | null> {
-  await loadFcntlSync();
-  await loadFlockSync();
-
-  // Try fcntl byte-range lock first
-  if (fcntlSync) {
-    try {
-      const lockInfo: FcntlLockStruct = {
-        type: F_RDLCK,
-        whence: 0, // SEEK_SET
-        start: BigInt(LOCK_BYTE_OFFSET),
-        len: BigInt(LOCK_BYTE_RANGE),
-      };
-      
-      const result = fcntlSync(fd, F_SETLK, lockInfo);
-      if (result === 0) {
-        return { fd, exclusive: false };
-      }
-    } catch {
-      // fcntl failed, try flock fallback
-    }
-  }
-
-  // Fallback to flock (whole-file lock)
-  if (flockSync) {
-    try {
-      flockSync(fd, "shnb"); // Shared, non-blocking
-      return { fd, exclusive: false };
-    } catch {
+  // Try native flock
+  if (loadNativeFlock() && nativeFlock) {
+    const result = nativeFlock(fd, LOCK_SH | LOCK_NB);
+    if (result !== 0) {
       return null; // Could not acquire lock
     }
+    return { fd, exclusive: false };
   }
 
   // No locking available
+  warnNoLocking();
   return { fd, exclusive: false };
 }
 
@@ -293,29 +273,9 @@ export async function acquireSharedFileLock(
  * Note: The file descriptor is NOT closed - caller is responsible
  */
 export async function releaseFileLock(lock: SingleFileLockHandle): Promise<void> {
-  await loadFcntlSync();
-  await loadFlockSync();
-
-  // Try fcntl unlock first
-  if (fcntlSync) {
+  if (nativeFlock) {
     try {
-      const lockInfo: FcntlLockStruct = {
-        type: F_UNLCK,
-        whence: 0,
-        start: BigInt(LOCK_BYTE_OFFSET),
-        len: BigInt(LOCK_BYTE_RANGE),
-      };
-      fcntlSync(lock.fd, F_SETLK, lockInfo);
-      return;
-    } catch {
-      // Try flock fallback
-    }
-  }
-
-  // Fallback to flock unlock
-  if (flockSync) {
-    try {
-      flockSync(lock.fd, "un");
+      nativeFlock(lock.fd, LOCK_UN);
     } catch {
       // Ignore unlock errors
     }
@@ -324,28 +284,18 @@ export async function releaseFileLock(lock: SingleFileLockHandle): Promise<void>
 
 /**
  * Check if we can acquire an exclusive lock (without actually acquiring it)
+ * Note: This actually acquires and immediately releases the lock
  */
 export async function canAcquireExclusiveLock(fd: number): Promise<boolean> {
-  await loadFcntlSync();
-
-  if (fcntlSync) {
-    try {
-      const lockInfo: FcntlLockStruct = {
-        type: F_WRLCK,
-        whence: 0,
-        start: BigInt(LOCK_BYTE_OFFSET),
-        len: BigInt(LOCK_BYTE_RANGE),
-      };
-      
-      // F_GETLK checks if a lock COULD be acquired
-      // If it returns our own lock type, we can acquire
-      const result = fcntlSync(fd, F_GETLK, lockInfo);
-      return lockInfo.type === F_UNLCK;
-    } catch {
-      return false;
-    }
+  if (!loadNativeFlock() || !nativeFlock) {
+    return true; // Can't check, assume yes
   }
 
-  // Without fcntl, we can't check without trying
-  return true;
+  // Try to acquire, then immediately release
+  const result = nativeFlock(fd, LOCK_EX | LOCK_NB);
+  if (result === 0) {
+    nativeFlock(fd, LOCK_UN);
+    return true;
+  }
+  return false;
 }

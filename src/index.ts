@@ -41,6 +41,99 @@ export { PropValueTag } from "./types.ts";
 export { openGraphDB, closeGraphDB } from "./ray/graph-db/index.ts";
 
 // ============================================================================
+// Locking utilities
+// ============================================================================
+
+/**
+ * Check if proper OS-level file locking is available.
+ * Uses native flock() via Bun FFI - no external dependencies required.
+ * 
+ * @example
+ * ```ts
+ * if (!isProperLockingAvailable()) {
+ *   console.warn("File locking not available on this platform");
+ * }
+ * 
+ * const db = await openGraphDB("./mydb", {
+ *   requireLocking: true, // Throws if locking unavailable
+ * });
+ * ```
+ */
+export { isProperLockingAvailable } from "./util/lock.ts";
+
+// ============================================================================
+// Backup and Restore
+// ============================================================================
+
+export {
+  createBackup,
+  restoreBackup,
+  getBackupInfo,
+  createOfflineBackup,
+  type BackupOptions,
+  type RestoreOptions,
+  type BackupResult,
+} from "./backup/index.ts";
+
+// ============================================================================
+// Streaming and Pagination
+// ============================================================================
+
+export {
+  streamNodes,
+  streamNodesWithProps,
+  streamEdges,
+  streamEdgesWithProps,
+  getNodesPage,
+  getEdgesPage,
+  collectStream,
+  processStream,
+  mapStream,
+  filterStream,
+  takeStream,
+  skipStream,
+  type StreamOptions,
+  type PaginationOptions,
+  type Page,
+  type NodeWithProps,
+  type EdgeWithProps,
+} from "./streaming/index.ts";
+
+// ============================================================================
+// Export and Import
+// ============================================================================
+
+export {
+  exportToJSON,
+  exportToObject,
+  exportToJSONL,
+  importFromJSON,
+  importFromObject,
+  type ExportOptions,
+  type ImportOptions,
+  type ExportedDatabase,
+  type ExportedNode,
+  type ExportedEdge,
+} from "./export/index.ts";
+
+// ============================================================================
+// Metrics and Observability
+// ============================================================================
+
+export {
+  collectMetrics,
+  formatMetrics,
+  metricsToJSON,
+  healthCheck,
+  type DatabaseMetrics,
+  type DataMetrics,
+  type CacheMetrics,
+  type MvccMetrics,
+  type MemoryMetrics,
+  type HealthCheckResult,
+} from "./metrics/index.ts";
+
+// ============================================================================
 // Transactions
 // ============================================================================
 
@@ -99,6 +192,19 @@ export { defineLabel, defineEtype, definePropkey } from "./ray/graph-db/index.ts
 // ============================================================================
 
 export { stats, check } from "./ray/graph-db/index.ts";
+
+// ============================================================================
+// Vector operations (low-level)
+// ============================================================================
+
+export {
+  setNodeVector,
+  getNodeVector,
+  delNodeVector,
+  hasNodeVector,
+  getVectorStore,
+  getVectorStats,
+} from "./ray/graph-db/index.ts";
 
 // ============================================================================
 // Cache API
@@ -206,3 +312,110 @@ export {
   type WeightSpec,
   type Heuristic,
 } from "./api/index.ts";
+
+// ============================================================================
+// Vector Embeddings (Lance-style columnar storage with IVF index)
+// ============================================================================
+
+export {
+  // Types
+  type VectorStoreConfig,
+  type IvfConfig,
+  type RowGroup,
+  type Fragment,
+  type VectorManifest,
+  type IvfIndex,
+  type VectorSearchResult,
+  type VectorSearchOptions,
+  type MultiVectorSearchOptions,
+  type BatchInsertOptions,
+  type VectorDeltaState,
+  type CompactionStrategy,
+  // Constants
+  DEFAULT_VECTOR_CONFIG,
+  DEFAULT_IVF_CONFIG,
+  DEFAULT_COMPACTION_STRATEGY,
+  // Normalization
+  l2Norm,
+  normalizeInPlace,
+  normalize,
+  isNormalized,
+  normalizeRowGroup,
+  // Distance functions
+  dotProduct,
+  cosineDistance,
+  cosineSimilarity,
+  squaredEuclidean,
+  euclideanDistance,
+  batchCosineDistance,
+  batchSquaredEuclidean,
+  getDistanceFunction,
+  getBatchDistanceFunction,
+  distanceToSimilarity,
+  findKNearest,
+  MinHeap,
+  MaxHeap,
+  // Row group operations
+  createRowGroup,
+  rowGroupAppend,
+  rowGroupGet,
+  rowGroupGetCopy,
+  rowGroupIsFull,
+  rowGroupTrim,
+  // Fragment operations
+  createFragment,
+  fragmentAppend,
+  fragmentDelete,
+  fragmentIsDeleted,
+  fragmentSeal,
+  fragmentShouldSeal,
+  fragmentGetVector,
+  fragmentLiveCount,
+  // Columnar store
+  createVectorStore,
+  vectorStoreInsert,
+  vectorStoreDelete,
+  vectorStoreGet,
+  vectorStoreGetById,
+  vectorStoreHas,
+  vectorStoreIterator,
+  vectorStoreBatchInsert,
+  vectorStoreStats,
+  vectorStoreFragmentStats,
+  vectorStoreSealActive,
+  vectorStoreGetAllVectors,
+  vectorStoreClear,
+  vectorStoreClone,
+  // IVF index
+  createIvfIndex,
+  ivfAddTrainingVectors,
+  ivfTrain,
+  ivfInsert,
+  ivfDelete,
+  ivfSearch,
+  ivfSearchMulti,
+  ivfBuildFromStore,
+  ivfStats,
+  ivfClear,
+  // Compaction
+  findFragmentsToCompact,
+  compactFragments,
+  applyCompaction,
+  runCompactionIfNeeded,
+  getCompactionStats,
+  forceFullCompaction,
+  // Serialization
+  serializeIvf,
+  deserializeIvf,
+  serializeManifest,
+  deserializeManifest,
+} from "./vector/index.ts";
+
+// High-level vector search API
+export {
+  VectorIndex,
+  createVectorIndex,
+  type VectorIndexOptions,
+  type SimilarOptions,
+  type VectorSearchHit,
+} from "./api/vector-search.ts";

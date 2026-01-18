@@ -1,0 +1,186 @@
+//! Vector operations for SingleFileDB
+//!
+//! Handles vector embedding storage and retrieval for nodes.
+
+use crate::core::wal::record::{
+  build_del_node_vector_payload, build_set_node_vector_payload, WalRecord,
+};
+use crate::error::{RayError, Result};
+use crate::types::*;
+use crate::vector::store::{
+  create_vector_store, vector_store_delete, vector_store_get, vector_store_has, vector_store_insert,
+};
+use crate::vector::types::VectorStoreConfig;
+
+use super::SingleFileDB;
+
+impl SingleFileDB {
+  /// Set a vector embedding for a node
+  ///
+  /// Each property key can have its own vector store with different dimensions.
+  /// The first vector set for a property key determines the dimension.
+  pub fn set_node_vector(
+    &self,
+    node_id: NodeId,
+    prop_key_id: PropKeyId,
+    vector: &[f32],
+  ) -> Result<()> {
+    let txid = self.require_write_tx()?;
+
+    // Check dimensions if store already exists
+    {
+      let stores = self.vector_stores.read();
+      if let Some(store) = stores.get(&prop_key_id) {
+        if store.config.dimensions != vector.len() {
+          return Err(RayError::VectorDimensionMismatch {
+            expected: store.config.dimensions,
+            got: vector.len(),
+          });
+        }
+      }
+    }
+
+    // Write WAL record
+    let record = WalRecord::new(
+      WalRecordType::SetNodeVector,
+      txid,
+      build_set_node_vector_payload(node_id, prop_key_id, vector),
+    );
+    self.write_wal(record)?;
+
+    // Queue in delta for commit
+    self
+      .delta
+      .write()
+      .pending_vectors
+      .insert((node_id, prop_key_id), Some(vector.to_vec()));
+
+    Ok(())
+  }
+
+  /// Delete a vector embedding for a node
+  ///
+  /// Returns Ok(()) even if the vector doesn't exist (idempotent).
+  pub fn delete_node_vector(&self, node_id: NodeId, prop_key_id: PropKeyId) -> Result<()> {
+    let txid = self.require_write_tx()?;
+
+    // Write WAL record
+    let record = WalRecord::new(
+      WalRecordType::DelNodeVector,
+      txid,
+      build_del_node_vector_payload(node_id, prop_key_id),
+    );
+    self.write_wal(record)?;
+
+    // Queue delete in delta
+    self
+      .delta
+      .write()
+      .pending_vectors
+      .insert((node_id, prop_key_id), None); // None means delete
+
+    Ok(())
+  }
+
+  /// Get a vector embedding for a node
+  ///
+  /// Checks pending operations first, then falls back to committed storage.
+  pub fn get_node_vector(&self, node_id: NodeId, prop_key_id: PropKeyId) -> Option<Vec<f32>> {
+    let delta = self.delta.read();
+
+    // Check if node is deleted
+    if delta.is_node_deleted(node_id) {
+      return None;
+    }
+
+    // Check pending operations first
+    if let Some(pending) = delta.pending_vectors.get(&(node_id, prop_key_id)) {
+      // Some(vec) = set, None = delete
+      return pending.clone();
+    }
+
+    // Fall back to committed storage
+    let stores = self.vector_stores.read();
+    let store = stores.get(&prop_key_id)?;
+    vector_store_get(store, node_id).map(|v| v.to_vec())
+  }
+
+  /// Check if a node has a vector embedding
+  pub fn has_node_vector(&self, node_id: NodeId, prop_key_id: PropKeyId) -> bool {
+    let delta = self.delta.read();
+
+    // Check if node is deleted
+    if delta.is_node_deleted(node_id) {
+      return false;
+    }
+
+    // Check pending operations first
+    if let Some(pending) = delta.pending_vectors.get(&(node_id, prop_key_id)) {
+      return pending.is_some();
+    }
+
+    // Fall back to committed storage
+    let stores = self.vector_stores.read();
+    if let Some(store) = stores.get(&prop_key_id) {
+      return vector_store_has(store, node_id);
+    }
+
+    false
+  }
+
+  /// Get or create a vector store for a property key
+  ///
+  /// Creates a new store with the given dimensions if it doesn't exist.
+  pub fn get_or_create_vector_store(
+    &self,
+    prop_key_id: PropKeyId,
+    dimensions: usize,
+  ) -> Result<()> {
+    let mut stores = self.vector_stores.write();
+    if stores.contains_key(&prop_key_id) {
+      let store = stores.get(&prop_key_id).unwrap();
+      if store.config.dimensions != dimensions {
+        return Err(RayError::VectorDimensionMismatch {
+          expected: store.config.dimensions,
+          got: dimensions,
+        });
+      }
+      return Ok(());
+    }
+
+    let config = VectorStoreConfig::new(dimensions);
+    let manifest = create_vector_store(config);
+    stores.insert(prop_key_id, manifest);
+    Ok(())
+  }
+
+  /// Apply pending vector operations (called during commit)
+  pub(crate) fn apply_pending_vectors(&self) {
+    let mut delta = self.delta.write();
+    let pending: Vec<_> = delta.pending_vectors.drain().collect();
+    drop(delta);
+
+    let mut stores = self.vector_stores.write();
+
+    for ((node_id, prop_key_id), operation) in pending {
+      match operation {
+        Some(vector) => {
+          // Set operation - get or create store
+          let store = stores.entry(prop_key_id).or_insert_with(|| {
+            let config = VectorStoreConfig::new(vector.len());
+            create_vector_store(config)
+          });
+
+          // Insert (this handles replacement of existing vectors)
+          let _ = vector_store_insert(store, node_id, &vector);
+        }
+        None => {
+          // Delete operation
+          if let Some(store) = stores.get_mut(&prop_key_id) {
+            vector_store_delete(store, node_id);
+          }
+        }
+      }
+    }
+  }
+}

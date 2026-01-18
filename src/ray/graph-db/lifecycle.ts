@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { join, normalize, isAbsolute, resolve } from "node:path";
 import {
   COMPACT_EDGE_RATIO,
   COMPACT_NODE_RATIO,
@@ -24,6 +24,7 @@ import {
   writeManifest,
 } from "../../core/manifest.ts";
 import { closeSnapshot, loadSnapshot } from "../../core/snapshot-reader.ts";
+import { snapshotLogger } from "../../util/logger.ts";
 import {
   createWalSegment,
   extractCommittedTransactions,
@@ -49,14 +50,55 @@ import {
   acquireExclusiveLock,
   acquireSharedLock,
   releaseLock,
+  isProperLockingAvailable,
   type LockHandle,
 } from "../../util/lock.ts";
 import { CacheManager } from "../../cache/index.ts";
-import { replayWalRecord } from "./wal-replay.ts";
+import { replayWalRecord, replayVectorRecord } from "./wal-replay.ts";
 import { MvccManager } from "../../mvcc/index.ts";
+import type { PropKeyID } from "../../types.ts";
+import type { VectorManifest } from "../../vector/types.ts";
 import { openSingleFileDB, closeSingleFileDB, isSingleFilePath } from "./single-file.ts";
 import { releaseFileLock, type SingleFileLockHandle } from "../../util/lock.ts";
 import type { FilePager } from "../../core/pager.ts";
+
+/**
+ * Validate a database path for security
+ * Prevents path traversal attacks and other unsafe path patterns
+ * 
+ * @param path The path to validate
+ * @throws Error if the path is invalid or potentially dangerous
+ */
+function validateDbPath(path: string): void {
+  if (!path || typeof path !== 'string') {
+    throw new Error("Database path must be a non-empty string");
+  }
+
+  // Normalize the path to resolve . and .. 
+  const normalizedPath = normalize(path);
+  
+  // Check for path traversal attempts (.. sequences that escape)
+  // After normalization, if the path starts with .. it's trying to go above the base
+  if (normalizedPath.startsWith('..') || normalizedPath.includes('/..') || normalizedPath.includes('\\..')) {
+    throw new Error("Database path contains invalid path traversal sequence");
+  }
+
+  // Check for null bytes (path injection attack)
+  if (path.includes('\0')) {
+    throw new Error("Database path contains null bytes");
+  }
+
+  // Check for excessively long paths (platform-specific limits, but 4096 is reasonable)
+  if (path.length > 4096) {
+    throw new Error("Database path is too long");
+  }
+
+  // On non-Windows, check for problematic control characters
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x1f]/.test(path)) {
+    throw new Error("Database path contains control characters");
+  }
+}
 
 /**
  * Open a graph database
@@ -70,6 +112,9 @@ export async function openGraphDB(
   path: string,
   options: OpenOptions = {},
 ): Promise<GraphDB> {
+  // Validate path for security before any filesystem operations
+  validateDbPath(path);
+
   const { readOnly = false, createIfMissing = true, lockFile = true } = options;
 
   // Check if path is an existing directory (multi-file format)
@@ -113,7 +158,17 @@ async function openMultiFileDB(
   path: string,
   options: OpenOptions = {},
 ): Promise<GraphDB> {
-  const { readOnly = false, createIfMissing = true, lockFile = true } = options;
+  const { readOnly = false, createIfMissing = true, lockFile = true, requireLocking = false } = options;
+
+  // Check if strict locking is required but not available
+  if (requireLocking && lockFile) {
+    if (!isProperLockingAvailable()) {
+      throw new Error(
+        "requireLocking is enabled but proper file locking is not available. " +
+        "This may happen if Bun FFI cannot load the system's libc."
+      );
+    }
+  }
 
   // Ensure directory exists
   const fs = await import("node:fs/promises");
@@ -170,12 +225,15 @@ async function openMultiFileDB(
     try {
       snapshot = await loadSnapshot(path, manifest.activeSnapshotGen);
     } catch (err) {
-      console.warn(`Failed to load snapshot: ${err}`);
+      snapshotLogger.warn(`Failed to load snapshot`, { error: String(err), path });
     }
   }
 
   // Initialize delta
   const delta = createDelta();
+
+  // Initialize vector stores
+  const vectorStores: Map<PropKeyID, VectorManifest> = new Map();
 
   // Initialize ID allocators
   let nextNodeId = INITIAL_NODE_ID;
@@ -215,6 +273,9 @@ async function openMultiFileDB(
   let nextTxId = INITIAL_TX_ID;
   let nextCommitTs = 1n;
 
+  // Create a temporary db object for vector replay (only needs _vectorStores)
+  const tempDbForVectorReplay = { _vectorStores: vectorStores } as GraphDB;
+
   if (walData) {
     const committed = extractCommittedTransactions(walData.records);
 
@@ -229,6 +290,12 @@ async function openMultiFileDB(
       // Replay each record
       for (const record of records) {
         replayWalRecord(record, delta);
+        
+        // Also replay vector records
+        if (record.type === WalRecordType.SET_NODE_VECTOR || 
+            record.type === WalRecordType.DEL_NODE_VECTOR) {
+          replayVectorRecord(record, tempDbForVectorReplay);
+        }
 
         // Update ID allocators
         if (record.type === WalRecordType.CREATE_NODE) {
@@ -414,6 +481,10 @@ async function openMultiFileDB(
     _cache: cache,
     _mvcc: mvcc,
     _mvccEnabled: mvcc !== null,
+    
+    // Vector embeddings storage
+    _vectorStores: vectorStores,
+    _vectorIndexes: new Map(),
   };
 }
 

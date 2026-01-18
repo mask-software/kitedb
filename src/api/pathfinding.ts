@@ -334,7 +334,7 @@ function reconstructPath<N extends NodeDef>(
 export async function dijkstra<N extends NodeDef>(
   db: GraphDB,
   config: PathFindingConfig,
-  nodeDef: NodeDef,
+  nodeDef: N,
   resolveEtypeId: (edgeDef: EdgeDef) => ETypeID,
   resolvePropKeyId: (def: NodeDef | EdgeDef, propName: string) => PropKeyID,
   getNodeDef: (nodeId: NodeID) => NodeDef | null,
@@ -407,7 +407,9 @@ export async function dijkstra<N extends NodeDef>(
       for (const edge of neighbors) {
         const neighborId = dir === "out" ? edge.dst : edge.src;
 
-        if (visited.has(neighborId) || !nodeExists(db, neighborId)) {
+        // Optimization: removed redundant nodeExists check
+        // getNeighborsOut/In already filters out deleted nodes in the merged view
+        if (visited.has(neighborId)) {
           continue;
         }
 
@@ -458,12 +460,26 @@ export async function dijkstra<N extends NodeDef>(
 // ============================================================================
 
 /**
+ * A* node state - consolidated for better cache locality and fewer Map lookups
+ */
+interface AStarNodeState {
+  gScore: number;      // Actual cost from source
+  fScore: number;      // g(n) + h(n)
+  depth: number;       // Hop count
+  parent: NodeID | null;
+  edge: EdgeResult | null;
+}
+
+/**
  * Execute A* shortest path algorithm with heuristic
+ * 
+ * Optimization: Uses a single consolidated state Map instead of four separate Maps
+ * for better cache locality and fewer lookups.
  */
 export async function aStar<N extends NodeDef>(
   db: GraphDB,
   config: PathFindingConfig,
-  nodeDef: NodeDef,
+  nodeDef: N,
   heuristic: Heuristic<N>,
   resolveEtypeId: (edgeDef: EdgeDef) => ETypeID,
   resolvePropKeyId: (def: NodeDef | EdgeDef, propName: string) => PropKeyID,
@@ -473,25 +489,20 @@ export async function aStar<N extends NodeDef>(
   const sourceId = config.source.$id;
   const targetIds = new Set(config.targets.map((t) => t.$id));
 
-  // g(n) = actual cost from source
-  const gScores = new Map<NodeID, number>();
-  // f(n) = g(n) + h(n)
-  const fScores = new Map<NodeID, number>();
-  // Parent pointers and edges
-  const parents = new Map<NodeID, { parent: NodeID | null; edge: EdgeResult | null }>();
+  // Consolidated node state - single Map lookup instead of four
+  const states = new Map<NodeID, AStarNodeState>();
   const visited = new Set<NodeID>();
-
   const queue = new MinHeap<NodeID>();
 
-  // Track depth for A* as well
-  const depths = new Map<NodeID, number>();
-  depths.set(sourceId, 0);
-
   // Initialize source
-  gScores.set(sourceId, 0);
   const sourceHeuristic = heuristic(config.source as NodeRef<N>, config.targets[0] as NodeRef<N>);
-  fScores.set(sourceId, sourceHeuristic);
-  parents.set(sourceId, { parent: null, edge: null });
+  states.set(sourceId, {
+    gScore: 0,
+    fScore: sourceHeuristic,
+    depth: 0,
+    parent: null,
+    edge: null,
+  });
   queue.insert(sourceId, sourceHeuristic);
 
   const etypeId = resolveEtypeId(edgeDef);
@@ -511,20 +522,19 @@ export async function aStar<N extends NodeDef>(
 
     // Check if we reached a target
     if (targetIds.has(currentId)) {
-      // Reconstruct path
-      const states = new Map<NodeID, PathState>();
-      for (const [nodeId, g] of gScores) {
-        const parentInfo = parents.get(nodeId);
-        states.set(nodeId, {
+      // Reconstruct path using consolidated states
+      const pathStates = new Map<NodeID, PathState>();
+      for (const [nodeId, state] of states) {
+        pathStates.set(nodeId, {
           nodeId,
-          cost: g,
-          depth: depths.get(nodeId) ?? 0,
-          parent: parentInfo?.parent ?? null,
-          edge: parentInfo?.edge ?? null,
+          cost: state.gScore,
+          depth: state.depth,
+          parent: state.parent,
+          edge: state.edge,
         });
       }
       return reconstructPath(
-        states,
+        pathStates,
         currentId,
         sourceId,
         db,
@@ -534,9 +544,8 @@ export async function aStar<N extends NodeDef>(
       );
     }
 
-    const currentG = gScores.get(currentId)!;
-    const currentDepth = depths.get(currentId)!;
-    if (currentDepth >= config.maxDepth) {
+    const currentState = states.get(currentId)!;
+    if (currentState.depth >= config.maxDepth) {
       continue;
     }
 
@@ -553,7 +562,9 @@ export async function aStar<N extends NodeDef>(
       for (const edge of neighbors) {
         const neighborId = dir === "out" ? edge.dst : edge.src;
 
-        if (visited.has(neighborId) || !nodeExists(db, neighborId)) {
+        // Optimization: removed redundant nodeExists check
+        // getNeighborsOut/In already filters out deleted nodes in the merged view
+        if (visited.has(neighborId)) {
           continue;
         }
 
@@ -568,13 +579,10 @@ export async function aStar<N extends NodeDef>(
         );
 
         const weight = weightFn(edgeResult);
-        const tentativeG = currentG + weight;
+        const tentativeG = currentState.gScore + weight;
 
-        const existingG = gScores.get(neighborId);
-        if (existingG === undefined || tentativeG < existingG) {
-          gScores.set(neighborId, tentativeG);
-          depths.set(neighborId, currentDepth + 1);
-
+        const existingState = states.get(neighborId);
+        if (!existingState || tentativeG < existingState.gScore) {
           // Calculate heuristic for this neighbor
           const neighborRef = loadNodeRef(
             db,
@@ -587,11 +595,17 @@ export async function aStar<N extends NodeDef>(
 
           const h = heuristic(neighborRef as NodeRef<N>, config.targets[0] as NodeRef<N>);
           const f = tentativeG + h;
-          fScores.set(neighborId, f);
 
-          parents.set(neighborId, { parent: currentId, edge: edgeResult });
+          // Single state update instead of four Map updates
+          states.set(neighborId, {
+            gScore: tentativeG,
+            fScore: f,
+            depth: currentState.depth + 1,
+            parent: currentId,
+            edge: edgeResult,
+          });
 
-          if (existingG !== undefined) {
+          if (existingState) {
             queue.decreasePriority(neighborId, f);
           } else {
             queue.insert(neighborId, f);
@@ -698,10 +712,10 @@ export function createPathFindingBuilder<N extends NodeDef>(
         );
       },
 
-      async* allPaths(_maxPaths?: number) {
+      async* allPaths(_maxPaths?: number): AsyncGenerator<PathResult<N>, void, unknown> {
         // For now, just return the shortest path
         // Full implementation would require more complex algorithm
-        const result = await dijkstra(
+        const result = await dijkstra<N>(
           db,
           config,
           nodeDef,

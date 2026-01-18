@@ -165,6 +165,12 @@ export enum WalRecordType {
   DEL_NODE_PROP = 52,
   SET_EDGE_PROP = 53,
   DEL_EDGE_PROP = 54,
+  // Vector embeddings operations
+  SET_NODE_VECTOR = 60,
+  DEL_NODE_VECTOR = 61,
+  BATCH_VECTORS = 62,
+  SEAL_FRAGMENT = 63,
+  COMPACT_FRAGMENTS = 64,
 }
 
 export interface WalRecordHeader {
@@ -188,6 +194,7 @@ export enum PropValueTag {
   I64 = 2,
   F64 = 3,
   STRING = 4,
+  VECTOR_F32 = 5, // Normalized float32 vector for embeddings
 }
 
 export type PropValue =
@@ -195,7 +202,8 @@ export type PropValue =
   | { tag: PropValueTag.BOOL; value: boolean }
   | { tag: PropValueTag.I64; value: bigint }
   | { tag: PropValueTag.F64; value: number }
-  | { tag: PropValueTag.STRING; value: string };
+  | { tag: PropValueTag.STRING; value: string }
+  | { tag: PropValueTag.VECTOR_F32; value: Float32Array };
 
 /** Fixed-width disk encoding for properties (16 bytes) */
 export interface PropValueDisk {
@@ -260,6 +268,16 @@ export interface DeltaState {
   // Key index delta
   keyIndex: Map<string, NodeID>;
   keyIndexDeleted: Set<string>;
+
+  // Reverse index for efficient edge cleanup on node deletion
+  // Maps destination node -> set of source nodes with edges to it
+  // Only populated lazily when edges are added
+  incomingEdgeSources?: Map<NodeID, Set<NodeID>>;
+
+  // Cached edge Sets for O(1) edge existence checks (lazily populated)
+  // Only populated when patch arrays exceed EDGE_SET_THRESHOLD
+  outAddSets?: Map<NodeID, Set<bigint>>;
+  outDelSets?: Map<NodeID, Set<bigint>>;
 }
 
 // ============================================================================
@@ -269,7 +287,18 @@ export interface DeltaState {
 export interface OpenOptions {
   readOnly?: boolean;
   createIfMissing?: boolean;
+  /** 
+   * Enable file locking for cross-process safety. Default: true
+   * Set to false to disable locking entirely (useful for single-process scenarios)
+   */
   lockFile?: boolean;
+  /**
+   * Require proper OS-level file locking (via fs-ext). Default: false
+   * When true, opening the database will fail if fs-ext is not installed.
+   * This provides strict guarantees against multi-process data corruption.
+   * Install fs-ext with: `bun add fs-ext`
+   */
+  requireLocking?: boolean;
   cache?: CacheOptions;
   mvcc?: boolean; // Enable MVCC mode (default: false for backward compatibility)
   mvccGcInterval?: number; // GC interval in ms (default: 5000)
@@ -382,6 +411,10 @@ export interface TxState {
   pendingNewPropkeys: Map<PropKeyID, string>;
   pendingKeyUpdates: Map<string, NodeID>;
   pendingKeyDeletes: Set<string>;
+  // Vector embeddings pending operations
+  // Key format: "nodeId:propKeyId"
+  pendingVectorSets: Map<string, { nodeId: NodeID; propKeyId: PropKeyID; vector: Float32Array }>;
+  pendingVectorDeletes: Set<string>; // Set of "nodeId:propKeyId" keys
 }
 
 // ============================================================================
@@ -506,6 +539,10 @@ export interface GraphDB {
   _mvcc?: unknown; // MVCC manager instance (opaque to users)
   _mvccEnabled?: boolean; // Cached MVCC enabled flag for fast checks
 
+  // Vector embeddings storage (keyed by propKeyId for the vector property)
+  _vectorStores?: Map<PropKeyID, unknown>; // Map<PropKeyID, VectorManifest>
+  _vectorIndexes?: Map<PropKeyID, unknown>; // Map<PropKeyID, IvfIndex>
+
   // Single-file options
   _autoCheckpoint?: boolean;
   _checkpointThreshold?: number;
@@ -513,6 +550,10 @@ export interface GraphDB {
   
   // Background checkpoint state
   _checkpointState?: CheckpointState;
+  
+  // Checkpoint merge lock - prevents concurrent commits during WAL merge
+  // When true, commits must wait for merge to complete
+  _checkpointMergeLock?: boolean;
 }
 
 export interface TxHandle {
@@ -640,7 +681,8 @@ export const DB_HEADER_V2_FIELDS_SIZE = 8 + 8 + 1 + 1; // 18 bytes
 export type CheckpointState = 
   | { status: 'idle' }
   | { status: 'running'; promise: Promise<void> }
-  | { status: 'completing' };
+  | { status: 'completing' }
+  | { status: 'merging' };
 
 /**
  * WAL buffer full error - thrown when circular buffer is exhausted

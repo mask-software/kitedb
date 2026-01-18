@@ -14,6 +14,7 @@ import {
   deleteNode,
   delNodeProp,
   getNodeByKey,
+  rollback,
   setEdgeProp,
   setNodeProp,
 } from "../ray/graph-db/index.ts";
@@ -119,34 +120,42 @@ export function createInsertBuilder<N extends NodeDef>(
       const handle = tx ?? beginTx(db);
       const results: (NodeRef<N> & InferNode<N>)[] = [];
 
-      for (const item of dataArray) {
-        const { key: keyArg, ...props } = item as {
-          key: string | number;
-        } & Record<string, unknown>;
-        const fullKey = nodeDef.keyFn(keyArg as never);
+      try {
+        for (const item of dataArray) {
+          const { key: keyArg, ...props } = item as {
+            key: string | number;
+          } & Record<string, unknown>;
+          const fullKey = nodeDef.keyFn(keyArg as never);
 
-        // Create the node
-        const nodeId = createNode(handle, { key: fullKey });
+          // Create the node
+          const nodeId = createNode(handle, { key: fullKey });
 
-        // Set properties
-        for (const [propName, value] of Object.entries(props)) {
-          if (value === undefined) continue;
-          const propDef = nodeDef.props[propName];
-          if (!propDef) continue;
+          // Set properties
+          for (const [propName, value] of Object.entries(props)) {
+            if (value === undefined) continue;
+            const propDef = nodeDef.props[propName];
+            if (!propDef) continue;
 
-          const propKeyId = resolvePropKeyId(nodeDef, propName);
-          const propValue = toPropValue(propDef, value);
-          setNodeProp(handle, nodeId, propKeyId, propValue);
+            const propKeyId = resolvePropKeyId(nodeDef, propName);
+            const propValue = toPropValue(propDef, value);
+            setNodeProp(handle, nodeId, propKeyId, propValue);
+          }
+
+          results.push(createNodeRef(nodeDef, nodeId, fullKey, props));
         }
 
-        results.push(createNodeRef(nodeDef, nodeId, fullKey, props));
-      }
+        if (ownTx) {
+          await commit(handle);
+        }
 
-      if (ownTx) {
-        await commit(handle);
+        return results;
+      } catch (error) {
+        // Rollback if we own the transaction and an error occurred
+        if (ownTx) {
+          rollback(handle);
+        }
+        throw error;
       }
-
-      return results;
     };
 
     if (isSingle) {
@@ -561,7 +570,7 @@ export function createUpdateEdgeBuilder<E extends EdgeDef>(
 // ============================================================================
 
 interface PropDefLike {
-  type: "string" | "int" | "float" | "bool";
+  type: "string" | "int" | "float" | "bool" | "vector";
 }
 
 function toPropValue(propDef: PropDefLike, value: unknown): PropValue {
@@ -574,7 +583,9 @@ function toPropValue(propDef: PropDefLike, value: unknown): PropValue {
       return { tag: PropValueTag.F64, value: value as number };
     case "bool":
       return { tag: PropValueTag.BOOL, value: value as boolean };
+    case "vector":
+      return { tag: PropValueTag.VECTOR_F32, value: value as Float32Array };
     default:
-      throw new Error(`Unknown prop type: ${propDef.type}`);
+      throw new Error(`Unknown prop type: ${(propDef as { type: string }).type}`);
   }
 }

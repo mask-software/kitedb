@@ -54,3 +54,13 @@ export {
 // Stats and maintenance
 export { stats, check } from "./stats.ts";
 
+// Vector operations
+export {
+  setNodeVector,
+  getNodeVector,
+  delNodeVector,
+  hasNodeVector,
+  getVectorStore,
+  getVectorStats,
+} from "./vectors.ts";
+

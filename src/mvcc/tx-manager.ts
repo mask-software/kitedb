@@ -6,6 +6,11 @@
 
 import type { MvccTransaction } from "../types.ts";
 
+/** Maximum number of entries in committedWrites before pruning */
+const MAX_COMMITTED_WRITES = 100_000;
+/** Prune entries older than this when over limit (relative to minActiveTs) */
+const PRUNE_THRESHOLD_ENTRIES = 50_000;
+
 export class TxManager {
   private activeTxs: Map<bigint, MvccTransaction> = new Map();
   private nextTxId: bigint;
@@ -14,6 +19,11 @@ export class TxManager {
   private committedWrites: Map<string, bigint> = new Map();
   // O(1) tracking of active transaction count
   private activeCount: number = 0;
+  // Track entries pruned for statistics
+  private totalPruned: number = 0;
+  // Track commit timestamp -> wall clock time mapping for GC retention
+  // This allows converting from commit timestamps to wall clock time for retention calculations
+  private commitTsToWallClock: Map<bigint, number> = new Map();
 
   constructor(initialTxId: bigint = 1n, initialCommitTs: bigint = 1n) {
     this.nextTxId = initialTxId;
@@ -36,6 +46,39 @@ export class TxManager {
       }
     }
     return min;
+  }
+
+  /**
+   * Get the oldest commit timestamp that is newer than the retention period
+   * This converts a wall-clock retention period to a commit timestamp for GC
+   * 
+   * @param retentionMs Retention period in milliseconds
+   * @returns The commit timestamp corresponding to the retention cutoff, or nextCommitTs if none
+   */
+  getRetentionHorizonTs(retentionMs: number): bigint {
+    const cutoffTime = Date.now() - retentionMs;
+    let oldestWithinRetention = this.nextCommitTs;
+    
+    // Find the oldest commit timestamp that is within the retention period
+    for (const [commitTs, wallClock] of this.commitTsToWallClock) {
+      if (wallClock >= cutoffTime && commitTs < oldestWithinRetention) {
+        oldestWithinRetention = commitTs;
+      }
+    }
+    
+    return oldestWithinRetention;
+  }
+
+  /**
+   * Prune old wall clock mappings that are older than the given commit timestamp
+   * Called during GC to prevent unbounded growth
+   */
+  pruneWallClockMappings(horizonTs: bigint): void {
+    for (const [commitTs] of this.commitTsToWallClock) {
+      if (commitTs < horizonTs) {
+        this.commitTsToWallClock.delete(commitTs);
+      }
+    }
   }
 
   /**
@@ -113,6 +156,9 @@ export class TxManager {
     tx.commitTs = commitTs;
     tx.status = 'committed';
 
+    // Record wall clock time for this commit timestamp (used for GC retention)
+    this.commitTsToWallClock.set(commitTs, Date.now());
+
     // Index writes for fast conflict detection
     // Store only the max commitTs per key (simpler and faster than array)
     const writeSet = tx.writeSet;
@@ -123,6 +169,11 @@ export class TxManager {
       if (existing === undefined || commitTs > existing) {
         committedWrites.set(key, commitTs);
       }
+    }
+    
+    // Prune old entries if over limit to prevent unbounded growth
+    if (committedWrites.size > MAX_COMMITTED_WRITES) {
+      this.pruneCommittedWrites();
     }
 
     // Eager cleanup: if no other active transactions, clean up immediately
@@ -239,12 +290,56 @@ export class TxManager {
   }
 
   /**
+   * Prune old entries from committedWrites to prevent unbounded growth
+   * Removes entries with commitTs older than minActiveTs (safe to remove)
+   */
+  private pruneCommittedWrites(): void {
+    const minTs = this.minActiveTs;
+    const entries = Array.from(this.committedWrites.entries());
+    
+    // Sort by commitTs (oldest first)
+    entries.sort((a, b) => Number(a[1] - b[1]));
+    
+    // Remove oldest entries until we're under the prune threshold
+    const targetSize = MAX_COMMITTED_WRITES - PRUNE_THRESHOLD_ENTRIES;
+    let pruned = 0;
+    
+    for (const [key, commitTs] of entries) {
+      if (this.committedWrites.size <= targetSize) {
+        break;
+      }
+      
+      // Only prune entries older than minActiveTs (safe - no active reader needs them)
+      if (commitTs < minTs) {
+        this.committedWrites.delete(key);
+        pruned++;
+      } else {
+        // Once we hit entries >= minTs, stop pruning (they might be needed)
+        break;
+      }
+    }
+    
+    this.totalPruned += pruned;
+  }
+
+  /**
+   * Get statistics about committed writes
+   */
+  getCommittedWritesStats(): { size: number; pruned: number } {
+    return {
+      size: this.committedWrites.size,
+      pruned: this.totalPruned,
+    };
+  }
+
+  /**
    * Clear all transactions (for testing/recovery)
    */
   clear(): void {
     this.activeTxs.clear();
     this.committedWrites.clear();
     this.activeCount = 0;
+    this.totalPruned = 0;
   }
 }
 

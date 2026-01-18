@@ -18,6 +18,7 @@ import { getCache } from "./cache-helper.ts";
 import { getMvccManager, isMvccEnabled } from "../../mvcc/index.ts";
 import { getVisibleVersion, nodeExists as mvccNodeExists } from "../../mvcc/visibility.ts";
 import { getSnapshot } from "./snapshot-helper.ts";
+import type { VectorManifest } from "../../vector/types.ts";
 
 /**
  * Helper to detect if argument is a TxHandle (duck-typing)
@@ -87,6 +88,13 @@ export function deleteNode(handle: TxHandle, nodeId: NodeID): boolean {
     tx.pendingOutDel.delete(nodeId);
     tx.pendingInAdd.delete(nodeId);
     tx.pendingInDel.delete(nodeId);
+    
+    // Also clean up any pending vector sets for this node
+    for (const key of tx.pendingVectorSets.keys()) {
+      if (key.startsWith(`${nodeId}:`)) {
+        tx.pendingVectorSets.delete(key);
+      }
+    }
 
     // Write-through cache invalidation
     const cache = getCache(db);
@@ -111,6 +119,15 @@ export function deleteNode(handle: TxHandle, nodeId: NodeID): boolean {
   }
 
   tx.pendingDeletedNodes.add(nodeId);
+  
+  // Cascade delete: mark all vectors for this node as deleted
+  if (db._vectorStores) {
+    for (const [propKeyId, store] of db._vectorStores as Map<PropKeyID, VectorManifest>) {
+      if (store.nodeIdToVectorId.has(nodeId)) {
+        tx.pendingVectorDeletes.add(`${nodeId}:${propKeyId}`);
+      }
+    }
+  }
 
   // Record write for MVCC conflict detection
   const mvcc = getMvccManager(db);

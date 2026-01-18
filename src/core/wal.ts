@@ -339,6 +339,23 @@ function serializePropValue(value: PropValue): Uint8Array {
       buf.set(strBytes, 5);
       return buf;
     }
+    case PropValueTag.VECTOR_F32: {
+      // Format: tag(1) + dimensions(4) + float32 data (dimensions * 4)
+      const dimensions = value.value.length;
+      const buf = new Uint8Array(1 + 4 + dimensions * 4);
+      const view = viewOf(buf);
+      buf[0] = 5;
+      view.setUint32(1, dimensions, true);
+      // Copy float32 data
+      const floatView = new Float32Array(buf.buffer, buf.byteOffset + 5, dimensions);
+      floatView.set(value.value);
+      return buf;
+    }
+    default: {
+      // Exhaustive check - should never reach here
+      const _exhaustive: never = value;
+      return new Uint8Array([0]);
+    }
   }
 }
 
@@ -401,6 +418,119 @@ export function buildDelEdgePropPayload(
 }
 
 // ============================================================================
+// Vector Embedding WAL Payload Builders
+// ============================================================================
+
+/**
+ * Build payload for SET_NODE_VECTOR WAL record
+ * Format: nodeId(8) + propKeyId(4) + dimensions(4) + vector_data(dimensions * 4)
+ */
+export function buildSetNodeVectorPayload(
+  nodeId: NodeID,
+  propKeyId: PropKeyID,
+  vector: Float32Array,
+): Uint8Array {
+  const dimensions = vector.length;
+  const buffer = new Uint8Array(8 + 4 + 4 + dimensions * 4);
+  const view = viewOf(buffer);
+
+  writeU64(view, 0, BigInt(nodeId));
+  writeU32(view, 8, propKeyId);
+  writeU32(view, 12, dimensions);
+
+  // Copy vector data
+  const floatView = new Float32Array(buffer.buffer, buffer.byteOffset + 16, dimensions);
+  floatView.set(vector);
+
+  return buffer;
+}
+
+/**
+ * Build payload for DEL_NODE_VECTOR WAL record
+ * Format: nodeId(8) + propKeyId(4)
+ */
+export function buildDelNodeVectorPayload(
+  nodeId: NodeID,
+  propKeyId: PropKeyID,
+): Uint8Array {
+  const buffer = new Uint8Array(8 + 4);
+  const view = viewOf(buffer);
+  writeU64(view, 0, BigInt(nodeId));
+  writeU32(view, 8, propKeyId);
+  return buffer;
+}
+
+/**
+ * Build payload for BATCH_VECTORS WAL record
+ * Format: propKeyId(4) + dimensions(4) + count(4) + entries[count]
+ *   where each entry is: nodeId(8) + vector_data(dimensions * 4)
+ */
+export function buildBatchVectorsPayload(
+  propKeyId: PropKeyID,
+  dimensions: number,
+  entries: Array<{ nodeId: NodeID; vector: Float32Array }>,
+): Uint8Array {
+  const entrySize = 8 + dimensions * 4;
+  const buffer = new Uint8Array(4 + 4 + 4 + entries.length * entrySize);
+  const view = viewOf(buffer);
+
+  writeU32(view, 0, propKeyId);
+  writeU32(view, 4, dimensions);
+  writeU32(view, 8, entries.length);
+
+  let offset = 12;
+  for (const entry of entries) {
+    writeU64(view, offset, BigInt(entry.nodeId));
+    offset += 8;
+
+    // Copy vector data
+    const floatView = new Float32Array(buffer.buffer, buffer.byteOffset + offset, dimensions);
+    floatView.set(entry.vector);
+    offset += dimensions * 4;
+  }
+
+  return buffer;
+}
+
+/**
+ * Build payload for SEAL_FRAGMENT WAL record
+ * Format: fragmentId(4) + newFragmentId(4)
+ */
+export function buildSealFragmentPayload(
+  fragmentId: number,
+  newFragmentId: number,
+): Uint8Array {
+  const buffer = new Uint8Array(4 + 4);
+  const view = viewOf(buffer);
+  writeU32(view, 0, fragmentId);
+  writeU32(view, 4, newFragmentId);
+  return buffer;
+}
+
+/**
+ * Build payload for COMPACT_FRAGMENTS WAL record
+ * Format: targetFragmentId(4) + sourceCount(4) + sourceFragmentIds[sourceCount]
+ */
+export function buildCompactFragmentsPayload(
+  sourceFragmentIds: number[],
+  targetFragmentId: number,
+): Uint8Array {
+  const buffer = new Uint8Array(4 + 4 + sourceFragmentIds.length * 4);
+  const view = viewOf(buffer);
+
+  writeU32(view, 0, targetFragmentId);
+  writeU32(view, 4, sourceFragmentIds.length);
+
+  let offset = 8;
+  for (const sourceId of sourceFragmentIds) {
+    writeU32(view, offset, sourceId);
+    offset += 4;
+  }
+
+  return buffer;
+}
+
+// ============================================================================
 // WAL Reading and Recovery
 // ============================================================================
 
@@ -410,6 +540,38 @@ export interface ParsedWalRecord {
   txid: bigint;
   payload: Uint8Array;
   recordEnd: number; // Offset after this record (including padding)
+}
+
+// Set of valid WAL record type values for O(1) lookup
+const VALID_WAL_RECORD_TYPES = new Set<number>([
+  WalRecordType.BEGIN,
+  WalRecordType.COMMIT,
+  WalRecordType.ROLLBACK,
+  WalRecordType.CREATE_NODE,
+  WalRecordType.DELETE_NODE,
+  WalRecordType.ADD_EDGE,
+  WalRecordType.DELETE_EDGE,
+  WalRecordType.DEFINE_LABEL,
+  WalRecordType.ADD_NODE_LABEL,
+  WalRecordType.REMOVE_NODE_LABEL,
+  WalRecordType.DEFINE_ETYPE,
+  WalRecordType.DEFINE_PROPKEY,
+  WalRecordType.SET_NODE_PROP,
+  WalRecordType.DEL_NODE_PROP,
+  WalRecordType.SET_EDGE_PROP,
+  WalRecordType.DEL_EDGE_PROP,
+  WalRecordType.SET_NODE_VECTOR,
+  WalRecordType.DEL_NODE_VECTOR,
+  WalRecordType.BATCH_VECTORS,
+  WalRecordType.SEAL_FRAGMENT,
+  WalRecordType.COMPACT_FRAGMENTS,
+]);
+
+/**
+ * Check if a WAL record type is valid
+ */
+function isValidWalRecordType(type: number): boolean {
+  return VALID_WAL_RECORD_TYPES.has(type);
 }
 
 /**
@@ -440,6 +602,9 @@ export function parseWalRecord(
   const reserved = readU16(view, 6);
   const txid = readU64(view, 8);
   const payloadLen = readU32(view, 16);
+
+  // Validate record type against known enum values
+  if (!isValidWalRecordType(type)) return null;
 
   // Validate payload length
   if (WAL_RECORD_HEADER_SIZE + payloadLen + 4 !== recLen) return null;
@@ -667,6 +832,22 @@ function parsePropValue(
         bytesRead: 5 + strLen,
       };
     }
+    case PropValueTag.VECTOR_F32: {
+      const view = viewOf(payload, offset + 1);
+      const dimensions = view.getUint32(0, true);
+      // Create a copy of the vector data (not a view, to avoid issues with buffer reuse)
+      const vectorData = new Float32Array(dimensions);
+      const sourceView = new Float32Array(
+        payload.buffer,
+        payload.byteOffset + offset + 5,
+        dimensions,
+      );
+      vectorData.set(sourceView);
+      return {
+        value: { tag: PropValueTag.VECTOR_F32, value: vectorData },
+        bytesRead: 5 + dimensions * 4,
+      };
+    }
     default:
       return { value: { tag: PropValueTag.NULL }, bytesRead: 1 };
   }
@@ -732,6 +913,117 @@ export function parseDelEdgePropPayload(payload: Uint8Array): DelEdgePropData {
     dst: Number(readU64(view, 12)),
     keyId: readU32(view, 20),
   };
+}
+
+// ============================================================================
+// Vector Embedding WAL Payload Parsers
+// ============================================================================
+
+export interface SetNodeVectorData {
+  nodeId: NodeID;
+  propKeyId: PropKeyID;
+  dimensions: number;
+  vector: Float32Array;
+}
+
+export function parseSetNodeVectorPayload(payload: Uint8Array): SetNodeVectorData {
+  const view = viewOf(payload);
+  const nodeId = Number(readU64(view, 0));
+  const propKeyId = readU32(view, 8);
+  const dimensions = readU32(view, 12);
+
+  // Create a copy of the vector data
+  const vector = new Float32Array(dimensions);
+  const sourceView = new Float32Array(
+    payload.buffer,
+    payload.byteOffset + 16,
+    dimensions,
+  );
+  vector.set(sourceView);
+
+  return { nodeId, propKeyId, dimensions, vector };
+}
+
+export interface DelNodeVectorData {
+  nodeId: NodeID;
+  propKeyId: PropKeyID;
+}
+
+export function parseDelNodeVectorPayload(payload: Uint8Array): DelNodeVectorData {
+  const view = viewOf(payload);
+  return {
+    nodeId: Number(readU64(view, 0)),
+    propKeyId: readU32(view, 8),
+  };
+}
+
+export interface BatchVectorsData {
+  propKeyId: PropKeyID;
+  dimensions: number;
+  entries: Array<{ nodeId: NodeID; vector: Float32Array }>;
+}
+
+export function parseBatchVectorsPayload(payload: Uint8Array): BatchVectorsData {
+  const view = viewOf(payload);
+  const propKeyId = readU32(view, 0);
+  const dimensions = readU32(view, 4);
+  const count = readU32(view, 8);
+
+  const entries: Array<{ nodeId: NodeID; vector: Float32Array }> = [];
+  const entrySize = 8 + dimensions * 4;
+
+  let offset = 12;
+  for (let i = 0; i < count; i++) {
+    const nodeId = Number(readU64(view, offset));
+    offset += 8;
+
+    // Create a copy of the vector data
+    const vector = new Float32Array(dimensions);
+    const sourceView = new Float32Array(
+      payload.buffer,
+      payload.byteOffset + offset,
+      dimensions,
+    );
+    vector.set(sourceView);
+    offset += dimensions * 4;
+
+    entries.push({ nodeId, vector });
+  }
+
+  return { propKeyId, dimensions, entries };
+}
+
+export interface SealFragmentData {
+  fragmentId: number;
+  newFragmentId: number;
+}
+
+export function parseSealFragmentPayload(payload: Uint8Array): SealFragmentData {
+  const view = viewOf(payload);
+  return {
+    fragmentId: readU32(view, 0),
+    newFragmentId: readU32(view, 4),
+  };
+}
+
+export interface CompactFragmentsData {
+  targetFragmentId: number;
+  sourceFragmentIds: number[];
+}
+
+export function parseCompactFragmentsPayload(payload: Uint8Array): CompactFragmentsData {
+  const view = viewOf(payload);
+  const targetFragmentId = readU32(view, 0);
+  const sourceCount = readU32(view, 4);
+
+  const sourceFragmentIds: number[] = [];
+  let offset = 8;
+  for (let i = 0; i < sourceCount; i++) {
+    sourceFragmentIds.push(readU32(view, offset));
+    offset += 4;
+  }
+
+  return { targetFragmentId, sourceFragmentIds };
 }
 
 // ============================================================================

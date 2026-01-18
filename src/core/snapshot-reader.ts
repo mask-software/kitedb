@@ -70,7 +70,23 @@ export async function loadSnapshot(
  * Options for parsing a snapshot
  */
 export interface ParseSnapshotOptions {
-  /** Skip CRC validation (for performance when reading cached/trusted data) */
+  /**
+   * Skip CRC validation for performance when reading cached/trusted data.
+   * 
+   * **SECURITY WARNING**: Enabling this option allows loading potentially
+   * corrupted or tampered snapshot data. Only use this when:
+   * 
+   * 1. The snapshot has already been validated (e.g., cached in memory)
+   * 2. The snapshot source is fully trusted (e.g., just written by this process)
+   * 3. Performance is critical and data integrity risks are acceptable
+   * 
+   * **Risks when enabled**:
+   * - Corrupted data may cause crashes or undefined behavior
+   * - Maliciously crafted snapshots could exploit parsing vulnerabilities
+   * - Silent data corruption may go undetected
+   * 
+   * **Default**: false (CRC validation enabled)
+   */
   skipCrcValidation?: boolean;
 }
 
@@ -796,14 +812,65 @@ export function findEdgeIndex(
 
 /**
  * Close/release a snapshot (let GC clean up mmap)
+ * Clears all DataView references to allow the underlying buffer to be GC'd
  */
 export function closeSnapshot(snapshot: SnapshotData): void {
-  // Setting to null allows GC to clean up the mmap
+  // Setting all references to null allows GC to clean up the mmap
   // Bun will automatically unmap when the buffer is garbage collected
   const mutableSnapshot = snapshot as {
     buffer: Uint8Array | null;
     view: DataView | null;
+    physToNodeId: DataView | null;
+    nodeIdToPhys: DataView | null;
+    outOffsets: DataView | null;
+    outDst: DataView | null;
+    outEtype: DataView | null;
+    inOffsets: DataView | null;
+    inSrc: DataView | null;
+    inEtype: DataView | null;
+    inOutIndex: DataView | null;
+    stringOffsets: DataView | null;
+    stringBytes: Uint8Array | null;
+    labelStringIds: DataView | null;
+    etypeStringIds: DataView | null;
+    propkeyStringIds: DataView | null;
+    nodeKeyString: DataView | null;
+    keyEntries: DataView | null;
+    keyBuckets: DataView | null;
+    nodePropOffsets: DataView | null;
+    nodePropKeys: DataView | null;
+    nodePropVals: DataView | null;
+    edgePropOffsets: DataView | null;
+    edgePropKeys: DataView | null;
+    edgePropVals: DataView | null;
   };
+
+  // Clear main buffer and view
   mutableSnapshot.buffer = null;
   mutableSnapshot.view = null;
+
+  // Clear all cached section DataViews
+  mutableSnapshot.physToNodeId = null;
+  mutableSnapshot.nodeIdToPhys = null;
+  mutableSnapshot.outOffsets = null;
+  mutableSnapshot.outDst = null;
+  mutableSnapshot.outEtype = null;
+  mutableSnapshot.inOffsets = null;
+  mutableSnapshot.inSrc = null;
+  mutableSnapshot.inEtype = null;
+  mutableSnapshot.inOutIndex = null;
+  mutableSnapshot.stringOffsets = null;
+  mutableSnapshot.stringBytes = null;
+  mutableSnapshot.labelStringIds = null;
+  mutableSnapshot.etypeStringIds = null;
+  mutableSnapshot.propkeyStringIds = null;
+  mutableSnapshot.nodeKeyString = null;
+  mutableSnapshot.keyEntries = null;
+  mutableSnapshot.keyBuckets = null;
+  mutableSnapshot.nodePropOffsets = null;
+  mutableSnapshot.nodePropKeys = null;
+  mutableSnapshot.nodePropVals = null;
+  mutableSnapshot.edgePropOffsets = null;
+  mutableSnapshot.edgePropKeys = null;
+  mutableSnapshot.edgePropVals = null;
 }

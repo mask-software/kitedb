@@ -26,6 +26,17 @@ import {
   parseWalRecord,
   scanWal,
   serializeWalHeader,
+  // Vector WAL functions
+  buildSetNodeVectorPayload,
+  buildDelNodeVectorPayload,
+  buildBatchVectorsPayload,
+  buildSealFragmentPayload,
+  buildCompactFragmentsPayload,
+  parseSetNodeVectorPayload,
+  parseDelNodeVectorPayload,
+  parseBatchVectorsPayload,
+  parseSealFragmentPayload,
+  parseCompactFragmentsPayload,
 } from "../src/core/wal.ts";
 import { WAL_HEADER_SIZE, WalRecordType } from "../src/types.ts";
 
@@ -247,5 +258,163 @@ describe("WAL File Operations", () => {
 
     const loaded = await loadWalSegment(testDir, 1n);
     expect(loaded!.records).toHaveLength(3);
+  });
+});
+
+// ============================================================================
+// Vector WAL Payload Tests
+// ============================================================================
+
+describe("Vector WAL Payloads", () => {
+  test("SET_NODE_VECTOR roundtrip", () => {
+    const nodeId = 12345;
+    const propKeyId = 42;
+    const vector = new Float32Array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]);
+
+    const payload = buildSetNodeVectorPayload(nodeId, propKeyId, vector);
+    const parsed = parseSetNodeVectorPayload(payload);
+
+    expect(parsed.nodeId).toBe(nodeId);
+    expect(parsed.propKeyId).toBe(propKeyId);
+    expect(parsed.dimensions).toBe(8);
+    expect(parsed.vector.length).toBe(8);
+    expect(parsed.vector[0]).toBeCloseTo(0.1, 5);
+    expect(parsed.vector[7]).toBeCloseTo(0.8, 5);
+  });
+
+  test("SET_NODE_VECTOR with large vector (768 dims)", () => {
+    const nodeId = 999;
+    const propKeyId = 1;
+    const vector = new Float32Array(768);
+    for (let i = 0; i < 768; i++) {
+      vector[i] = i / 768;
+    }
+
+    const payload = buildSetNodeVectorPayload(nodeId, propKeyId, vector);
+    const parsed = parseSetNodeVectorPayload(payload);
+
+    expect(parsed.nodeId).toBe(nodeId);
+    expect(parsed.propKeyId).toBe(propKeyId);
+    expect(parsed.dimensions).toBe(768);
+    expect(parsed.vector.length).toBe(768);
+    expect(parsed.vector[0]).toBeCloseTo(0 / 768, 5);
+    expect(parsed.vector[767]).toBeCloseTo(767 / 768, 5);
+  });
+
+  test("DEL_NODE_VECTOR roundtrip", () => {
+    const nodeId = 54321;
+    const propKeyId = 99;
+
+    const payload = buildDelNodeVectorPayload(nodeId, propKeyId);
+    const parsed = parseDelNodeVectorPayload(payload);
+
+    expect(parsed.nodeId).toBe(nodeId);
+    expect(parsed.propKeyId).toBe(propKeyId);
+  });
+
+  test("BATCH_VECTORS roundtrip", () => {
+    const propKeyId = 5;
+    const dimensions = 4;
+    const entries = [
+      { nodeId: 1, vector: new Float32Array([1.0, 2.0, 3.0, 4.0]) },
+      { nodeId: 2, vector: new Float32Array([5.0, 6.0, 7.0, 8.0]) },
+      { nodeId: 3, vector: new Float32Array([9.0, 10.0, 11.0, 12.0]) },
+    ];
+
+    const payload = buildBatchVectorsPayload(propKeyId, dimensions, entries);
+    const parsed = parseBatchVectorsPayload(payload);
+
+    expect(parsed.propKeyId).toBe(propKeyId);
+    expect(parsed.dimensions).toBe(dimensions);
+    expect(parsed.entries.length).toBe(3);
+
+    expect(parsed.entries[0]!.nodeId).toBe(1);
+    expect(parsed.entries[0]!.vector[0]).toBeCloseTo(1.0, 5);
+    expect(parsed.entries[0]!.vector[3]).toBeCloseTo(4.0, 5);
+
+    expect(parsed.entries[1]!.nodeId).toBe(2);
+    expect(parsed.entries[1]!.vector[0]).toBeCloseTo(5.0, 5);
+
+    expect(parsed.entries[2]!.nodeId).toBe(3);
+    expect(parsed.entries[2]!.vector[3]).toBeCloseTo(12.0, 5);
+  });
+
+  test("BATCH_VECTORS with large batch", () => {
+    const propKeyId = 1;
+    const dimensions = 768;
+    const entries: Array<{ nodeId: number; vector: Float32Array }> = [];
+    
+    for (let i = 0; i < 100; i++) {
+      const vector = new Float32Array(dimensions);
+      for (let d = 0; d < dimensions; d++) {
+        vector[d] = (i * dimensions + d) / 1000;
+      }
+      entries.push({ nodeId: i + 1, vector });
+    }
+
+    const payload = buildBatchVectorsPayload(propKeyId, dimensions, entries);
+    const parsed = parseBatchVectorsPayload(payload);
+
+    expect(parsed.entries.length).toBe(100);
+    expect(parsed.entries[0]!.nodeId).toBe(1);
+    expect(parsed.entries[99]!.nodeId).toBe(100);
+  });
+
+  test("SEAL_FRAGMENT roundtrip", () => {
+    const fragmentId = 42;
+    const newFragmentId = 43;
+
+    const payload = buildSealFragmentPayload(fragmentId, newFragmentId);
+    const parsed = parseSealFragmentPayload(payload);
+
+    expect(parsed.fragmentId).toBe(fragmentId);
+    expect(parsed.newFragmentId).toBe(newFragmentId);
+  });
+
+  test("COMPACT_FRAGMENTS roundtrip", () => {
+    const sourceFragmentIds = [1, 2, 3, 4, 5];
+    const targetFragmentId = 10;
+
+    const payload = buildCompactFragmentsPayload(sourceFragmentIds, targetFragmentId);
+    const parsed = parseCompactFragmentsPayload(payload);
+
+    expect(parsed.targetFragmentId).toBe(targetFragmentId);
+    expect(parsed.sourceFragmentIds).toEqual(sourceFragmentIds);
+  });
+
+  test("vector WAL record can be built and parsed", () => {
+    const vector = new Float32Array([0.1, 0.2, 0.3, 0.4]);
+    const record: WalRecord = {
+      type: WalRecordType.SET_NODE_VECTOR,
+      txid: 1n,
+      payload: buildSetNodeVectorPayload(100, 5, vector),
+    };
+
+    const bytes = buildWalRecord(record);
+    const parsed = parseWalRecord(bytes, 0);
+
+    expect(parsed).not.toBeNull();
+    expect(parsed!.type).toBe(WalRecordType.SET_NODE_VECTOR);
+    expect(parsed!.txid).toBe(1n);
+
+    const data = parseSetNodeVectorPayload(parsed!.payload);
+    expect(data.nodeId).toBe(100);
+    expect(data.propKeyId).toBe(5);
+    expect(data.vector.length).toBe(4);
+    expect(data.vector[0]).toBeCloseTo(0.1, 5);
+  });
+
+  test("vector records are properly aligned", () => {
+    const vector = new Float32Array(768);
+    for (let i = 0; i < 768; i++) vector[i] = Math.random();
+
+    const record: WalRecord = {
+      type: WalRecordType.SET_NODE_VECTOR,
+      txid: 1n,
+      payload: buildSetNodeVectorPayload(1, 1, vector),
+    };
+
+    const bytes = buildWalRecord(record);
+    expect(bytes.length % 8).toBe(0); // Should be 8-byte aligned
   });
 });

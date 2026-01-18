@@ -6,6 +6,7 @@
 
 import { TxManager } from "./tx-manager.ts";
 import { VersionChainManager } from "./version-chain.ts";
+import { gcLogger } from "../util/logger.ts";
 
 export interface GcStats {
   versionsPruned: bigint;
@@ -74,9 +75,11 @@ export class GarbageCollector {
     try {
       // Calculate GC horizon
       // Versions older than this can be pruned if they have newer successors
-      const now = BigInt(Date.now());
       const minActiveTs = this.txManager.minActiveTs;
-      const retentionTs = now - BigInt(this.retentionMs);
+      
+      // Get the commit timestamp that corresponds to the retention period
+      // This properly converts wall-clock retention to commit timestamp space
+      const retentionTs = this.txManager.getRetentionHorizonTs(this.retentionMs);
       
       // GC horizon is the minimum of:
       // 1. Oldest active transaction snapshot (can't prune versions needed by active reads)
@@ -94,6 +97,9 @@ export class GarbageCollector {
       // This ensures activeTxs doesn't grow unboundedly in concurrent workloads
       this.cleanupOldTransactions(horizonTs);
 
+      // Clean up old wall clock mappings to prevent unbounded growth
+      this.txManager.pruneWallClockMappings(horizonTs);
+
       // Update stats
       this.stats.versionsPruned += BigInt(pruned);
       this.stats.chainsTruncated += BigInt(truncated);
@@ -101,7 +107,7 @@ export class GarbageCollector {
       this.stats.lastGcTime = BigInt(Date.now());
     } catch (error) {
       // Log error but don't crash
-      console.error("GC error:", error);
+      gcLogger.error("GC cycle failed", { error: String(error) });
     }
   }
 
