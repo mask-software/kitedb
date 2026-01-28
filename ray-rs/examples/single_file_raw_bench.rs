@@ -10,6 +10,8 @@
 //!   --wal-size BYTES          WAL size in bytes (default: 67108864)
 //!   --checkpoint-threshold P  Auto-checkpoint threshold (default: 0.8)
 //!   --no-auto-checkpoint      Disable auto-checkpoint
+//!   --vector-dims N            Vector dimensions (default: 128)
+//!   --vector-count N           Number of vectors to set (default: 1000)
 //!   --keep-db                 Keep the database file after benchmark
 
 use rand::{rngs::StdRng, Rng, SeedableRng};
@@ -27,6 +29,8 @@ struct BenchConfig {
   wal_size: usize,
   checkpoint_threshold: f64,
   auto_checkpoint: bool,
+  vector_dims: usize,
+  vector_count: usize,
   keep_db: bool,
   skip_checkpoint: bool,
   reopen_readonly: bool,
@@ -41,6 +45,8 @@ impl Default for BenchConfig {
       wal_size: 64 * 1024 * 1024,
       checkpoint_threshold: 0.8,
       auto_checkpoint: true,
+      vector_dims: 128,
+      vector_count: 1000,
       keep_db: false,
       skip_checkpoint: false,
       reopen_readonly: false,
@@ -87,6 +93,18 @@ fn parse_args() -> BenchConfig {
       }
       "--no-auto-checkpoint" => {
         config.auto_checkpoint = false;
+      }
+      "--vector-dims" => {
+        if let Some(value) = args.get(i + 1) {
+          config.vector_dims = value.parse().unwrap_or(config.vector_dims);
+          i += 1;
+        }
+      }
+      "--vector-count" => {
+        if let Some(value) = args.get(i + 1) {
+          config.vector_count = value.parse().unwrap_or(config.vector_count);
+          i += 1;
+        }
       }
       "--skip-checkpoint" => {
         config.skip_checkpoint = true;
@@ -189,6 +207,14 @@ fn print_latency_table(name: &str, stats: LatencyStats) {
     format_latency(stats.max),
     ops_per_sec
   );
+}
+
+fn build_random_vector(rng: &mut StdRng, dimensions: usize) -> Vec<f32> {
+  let mut values = Vec::with_capacity(dimensions);
+  for _ in 0..dimensions {
+    values.push(rng.gen());
+  }
+  values
 }
 
 struct GraphData {
@@ -321,6 +347,81 @@ fn benchmark_edge_exists(
   print_latency_table("Random edge exists", stats);
 }
 
+fn benchmark_vectors(
+  db: &raydb_core::core::single_file::SingleFileDB,
+  graph: &GraphData,
+  config: &BenchConfig,
+) -> Option<(u32, Vec<u64>)> {
+  if config.vector_count == 0 || config.vector_dims == 0 {
+    println!("\n--- Vector Operations ---");
+    println!("  Skipped (vector_count/vector_dims == 0)");
+    return None;
+  }
+
+  println!("\n--- Vector Operations ---");
+  let vector_count = config.vector_count.min(graph.node_ids.len());
+  let vector_nodes = graph.node_ids[..vector_count].to_vec();
+
+  db.begin(false).unwrap();
+  let prop_key_id = db.define_propkey("embedding").unwrap();
+  db.commit().unwrap();
+
+  let mut rng = StdRng::from_entropy();
+  let vectors: Vec<Vec<f32>> = (0..vector_count)
+    .map(|_| build_random_vector(&mut rng, config.vector_dims))
+    .collect();
+
+  let batch_size = 100usize;
+  let mut samples = Vec::new();
+
+  let mut i = 0;
+  while i < vector_nodes.len() {
+    let end = (i + batch_size).min(vector_nodes.len());
+    let start = Instant::now();
+    db.begin(false).unwrap();
+    for j in i..end {
+      db.set_node_vector(vector_nodes[j], prop_key_id, &vectors[j])
+        .unwrap();
+    }
+    db.commit().unwrap();
+    samples.push(start.elapsed().as_nanos());
+    i = end;
+  }
+
+  let stats = compute_stats(&mut samples);
+  print_latency_table(&format!("Set vectors (batch {batch_size})"), stats);
+
+  Some((prop_key_id, vector_nodes))
+}
+
+fn benchmark_vector_reads(
+  db: &raydb_core::core::single_file::SingleFileDB,
+  vector_nodes: &[u64],
+  prop_key_id: u32,
+  iterations: usize,
+) {
+  let mut rng = StdRng::from_entropy();
+  let mut samples = Vec::with_capacity(iterations);
+  for _ in 0..iterations {
+    let node = vector_nodes[rng.gen_range(0..vector_nodes.len())];
+    let start = Instant::now();
+    let _ = db.get_node_vector(node, prop_key_id);
+    samples.push(start.elapsed().as_nanos());
+  }
+  let stats = compute_stats(&mut samples);
+  print_latency_table("get_node_vector() random", stats);
+
+  let mut samples = Vec::with_capacity(iterations);
+  for _ in 0..iterations {
+    let node = vector_nodes[rng.gen_range(0..vector_nodes.len())];
+    let start = Instant::now();
+    let _ = db.has_node_vector(node, prop_key_id);
+    samples.push(start.elapsed().as_nanos());
+  }
+  let stats = compute_stats(&mut samples);
+  print_latency_table("has_node_vector() random", stats);
+}
+
 fn benchmark_writes(db: &raydb_core::core::single_file::SingleFileDB, iterations: usize) {
   println!("\n--- Batch Writes (100 nodes) ---");
   let batch_size = 100usize;
@@ -354,6 +455,8 @@ fn main() {
   println!("WAL size: {} bytes", format_number(config.wal_size));
   println!("Auto-checkpoint: {}", config.auto_checkpoint);
   println!("Checkpoint threshold: {}", config.checkpoint_threshold);
+  println!("Vector dims: {}", format_number(config.vector_dims));
+  println!("Vector count: {}", format_number(config.vector_count));
   println!("Skip checkpoint: {}", config.skip_checkpoint);
   println!("Reopen read-only: {}", config.reopen_readonly);
   println!("{}", "=".repeat(120));
@@ -369,12 +472,15 @@ fn main() {
 
   let mut db = open_single_file(&db_path, options).expect("failed to open single-file db");
 
-  println!("\n[1/5] Building graph...");
+  println!("\n[1/6] Building graph...");
   let start_build = Instant::now();
   let graph = build_graph(&db, &config);
   println!("  Built in {}ms", start_build.elapsed().as_millis());
 
-  println!("\n[2/5] Checkpointing...");
+  println!("\n[2/6] Vector setup...");
+  let vector_setup = benchmark_vectors(&db, &graph, &config);
+
+  println!("\n[3/6] Checkpointing...");
   if config.skip_checkpoint {
     println!("  Skipped checkpoint");
   } else {
@@ -392,14 +498,20 @@ fn main() {
     println!("  Re-opened database in read-only mode");
   }
 
-  println!("\n[3/5] Key lookup benchmarks...");
+  println!("\n[4/6] Key lookup benchmarks...");
   benchmark_key_lookups(&db, &graph, config.iterations);
 
-  println!("\n[4/5] Traversal and edge benchmarks...");
+  println!("\n[5/6] Traversal and edge benchmarks...");
   benchmark_traversals(&db, &graph, config.iterations);
   benchmark_edge_exists(&db, &graph, config.iterations);
 
-  println!("\n[5/5] Write benchmarks...");
+  if let Some((prop_key_id, vector_nodes)) = vector_setup {
+    if !vector_nodes.is_empty() {
+      benchmark_vector_reads(&db, &vector_nodes, prop_key_id, config.iterations);
+    }
+  }
+
+  println!("\n[6/6] Write benchmarks...");
   if config.reopen_readonly {
     println!("  Skipped write benchmarks (read-only)");
   } else {

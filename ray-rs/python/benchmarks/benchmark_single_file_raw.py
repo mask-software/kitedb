@@ -22,6 +22,8 @@ Options:
   --checkpoint-threshold P  Auto-checkpoint threshold (default: 0.8)
   --no-auto-checkpoint      Disable auto-checkpoint
   --cache-enabled           Enable cache
+  --vector-dims N            Vector dimensions (default: 128)
+  --vector-count N           Number of vectors to set (default: 1000)
   --skip-compact            Skip optimize/compaction step
   --reopen-readonly         Re-open database in read-only mode after compaction
 """
@@ -58,6 +60,8 @@ class BenchConfig:
   checkpoint_threshold: float = 0.8
   auto_checkpoint: bool = True
   cache_enabled: bool = False
+  vector_dims: int = 128
+  vector_count: int = 1000
   skip_compact: bool = False
   reopen_readonly: bool = False
 
@@ -74,6 +78,8 @@ def parse_args() -> BenchConfig:
   parser.add_argument("--checkpoint-threshold", type=float, default=0.8)
   parser.add_argument("--no-auto-checkpoint", action="store_true")
   parser.add_argument("--cache-enabled", action="store_true")
+  parser.add_argument("--vector-dims", type=int, default=128)
+  parser.add_argument("--vector-count", type=int, default=1000)
   parser.add_argument("--skip-compact", action="store_true")
   parser.add_argument("--reopen-readonly", action="store_true")
 
@@ -99,6 +105,8 @@ def parse_args() -> BenchConfig:
     checkpoint_threshold=args.checkpoint_threshold,
     auto_checkpoint=not args.no_auto_checkpoint,
     cache_enabled=args.cache_enabled,
+    vector_dims=args.vector_dims,
+    vector_count=args.vector_count,
     skip_compact=args.skip_compact,
     reopen_readonly=args.reopen_readonly,
   )
@@ -186,13 +194,17 @@ class GraphData:
   etype_calls: int
 
 
+def build_random_vector(dimensions: int) -> List[float]:
+  return [random.random() for _ in range(dimensions)]
+
+
 def build_graph(db: Database, config: BenchConfig) -> GraphData:
   node_ids: List[int] = []
   node_keys: List[str] = []
   batch_size = 5000
 
   logger.log("  Creating nodes...")
-  etype_calls = None
+  etype_calls = 0
   for batch in range(0, config.nodes, batch_size):
     db.begin()
     if batch == 0:
@@ -268,6 +280,56 @@ def benchmark_edge_exists(db: Database, graph: GraphData, iterations: int):
   print_latency_table("Random edge exists", tracker.get_stats())
 
 
+def benchmark_vectors(db: Database, graph: GraphData, config: BenchConfig) -> Optional[tuple[int, List[int]]]:
+  if config.vector_count <= 0 or config.vector_dims <= 0:
+    logger.log("\n--- Vector Operations ---")
+    logger.log("  Skipped (vector_count/vector_dims <= 0)")
+    return None
+
+  logger.log("\n--- Vector Operations ---")
+  vector_count = min(config.vector_count, len(graph.node_ids))
+  vector_nodes = graph.node_ids[:vector_count]
+
+  db.begin()
+  prop_key_id = db.get_or_create_propkey("embedding")
+  db.commit()
+
+  vectors = [build_random_vector(config.vector_dims) for _ in range(vector_count)]
+
+  batch_size = 100
+  tracker = LatencyTracker()
+
+  for i in range(0, vector_count, batch_size):
+    end = min(i + batch_size, vector_count)
+    start = time.perf_counter_ns()
+    db.begin()
+    for j in range(i, end):
+      db.set_node_vector(vector_nodes[j], prop_key_id, vectors[j])
+    db.commit()
+    tracker.record(time.perf_counter_ns() - start)
+
+  print_latency_table(f"Set vectors (batch {batch_size})", tracker.get_stats())
+  return prop_key_id, vector_nodes
+
+
+def benchmark_vector_reads(db: Database, vector_nodes: List[int], prop_key_id: int, iterations: int):
+  tracker = LatencyTracker()
+  for _ in range(iterations):
+    node_id = random.choice(vector_nodes)
+    start = time.perf_counter_ns()
+    db.get_node_vector(node_id, prop_key_id)
+    tracker.record(time.perf_counter_ns() - start)
+  print_latency_table("get_node_vector() random", tracker.get_stats())
+
+  tracker = LatencyTracker()
+  for _ in range(iterations):
+    node_id = random.choice(vector_nodes)
+    start = time.perf_counter_ns()
+    db.has_node_vector(node_id, prop_key_id)
+    tracker.record(time.perf_counter_ns() - start)
+  print_latency_table("has_node_vector() random", tracker.get_stats())
+
+
 def benchmark_writes(db: Database, iterations: int):
   logger.log("\n--- Batch Writes (100 nodes) ---")
   batch_size = 100
@@ -298,6 +360,8 @@ def run_benchmarks(config: BenchConfig):
   logger.log(f"Auto-checkpoint: {config.auto_checkpoint}")
   logger.log(f"Checkpoint threshold: {config.checkpoint_threshold}")
   logger.log(f"Cache enabled: {config.cache_enabled}")
+  logger.log(f"Vector dims: {format_number(config.vector_dims)}")
+  logger.log(f"Vector count: {format_number(config.vector_count)}")
   logger.log(f"Skip compact: {config.skip_compact}")
   logger.log(f"Reopen read-only: {config.reopen_readonly}")
   logger.log("=" * 120)
@@ -307,7 +371,7 @@ def run_benchmarks(config: BenchConfig):
 
   db: Optional[Database] = None
   try:
-    logger.log("\n[1/5] Building graph...")
+    logger.log("\n[1/6] Building graph...")
     options = OpenOptions(
       wal_size=config.wal_size,
       auto_checkpoint=config.auto_checkpoint,
@@ -319,7 +383,10 @@ def run_benchmarks(config: BenchConfig):
     graph = build_graph(db, config)
     logger.log(f"  Built in {(time.perf_counter() - start_build) * 1000:.0f}ms")
 
-    logger.log("\n[2/5] Compacting...")
+    logger.log("\n[2/6] Vector setup...")
+    vector_setup = benchmark_vectors(db, graph, config)
+
+    logger.log("\n[3/6] Compacting...")
     if config.skip_compact:
       logger.log("  Skipped compaction")
     else:
@@ -332,14 +399,19 @@ def run_benchmarks(config: BenchConfig):
       db = Database(db_path, OpenOptions(read_only=True, create_if_missing=False, cache_enabled=config.cache_enabled))
       logger.log("  Re-opened database in read-only mode")
 
-    logger.log("\n[3/5] Key lookup benchmarks...")
+    logger.log("\n[4/6] Key lookup benchmarks...")
     benchmark_key_lookups(db, graph, config.iterations)
 
-    logger.log("\n[4/5] Traversal and edge benchmarks...")
+    logger.log("\n[5/6] Traversal and edge benchmarks...")
     benchmark_traversals(db, graph, config.iterations)
     benchmark_edge_exists(db, graph, config.iterations)
 
-    logger.log("\n[5/5] Write benchmarks...")
+    if vector_setup is not None:
+      prop_key_id, vector_nodes = vector_setup
+      if vector_nodes:
+        benchmark_vector_reads(db, vector_nodes, prop_key_id, config.iterations)
+
+    logger.log("\n[6/6] Write benchmarks...")
     if db.read_only:
       logger.log("  Skipped write benchmarks (read-only)")
     else:

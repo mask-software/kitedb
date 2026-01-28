@@ -17,6 +17,8 @@
  *   --wal-size BYTES       WAL size in bytes (default: 67108864)
  *   --checkpoint-threshold P  Auto-checkpoint threshold (default: 0.8)
  *   --no-auto-checkpoint   Disable auto-checkpoint
+ *   --vector-dims N         Vector dimensions (default: 128)
+ *   --vector-count N        Number of vectors to set (default: 1000)
  */
 
 import { mkdir, rm, writeFile } from "node:fs/promises";
@@ -32,11 +34,15 @@ import {
   commit,
   createNode,
   defineEtype,
+  definePropkey,
   edgeExists,
+  getNodeVector,
   getNeighborsOut,
   getNodeByKey,
+  hasNodeVector,
   openGraphDB,
   optimizeSingleFile,
+  setNodeVector,
 } from "../src/index.ts";
 
 // =============================================================================
@@ -55,6 +61,8 @@ interface BenchConfig {
   skipCompact: boolean;
   reopenReadOnly: boolean;
   cacheEnabled: boolean;
+  vectorDims: number;
+  vectorCount: number;
 }
 
 function parseArgs(): BenchConfig {
@@ -80,6 +88,8 @@ function parseArgs(): BenchConfig {
     skipCompact: false,
     reopenReadOnly: false,
     cacheEnabled: false,
+    vectorDims: 128,
+    vectorCount: 1000,
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -110,6 +120,12 @@ function parseArgs(): BenchConfig {
         break;
       case "--no-auto-checkpoint":
         config.autoCheckpoint = false;
+        break;
+      case "--vector-dims":
+        config.vectorDims = Number.parseInt(args[++i] || "128", 10);
+        break;
+      case "--vector-count":
+        config.vectorCount = Number.parseInt(args[++i] || "1000", 10);
         break;
       case "--cache-enabled":
         config.cacheEnabled = true;
@@ -227,6 +243,14 @@ interface GraphData {
   };
 }
 
+function buildRandomVector(dimensions: number): Float32Array {
+  const values = new Float32Array(dimensions);
+  for (let i = 0; i < dimensions; i++) {
+    values[i] = Math.random();
+  }
+  return values;
+}
+
 async function buildGraph(db: GraphDB, config: BenchConfig): Promise<GraphData> {
   const nodeIds: NodeID[] = [];
   const nodeKeys: string[] = [];
@@ -328,6 +352,71 @@ function benchmarkEdgeExists(db: GraphDB, graph: GraphData, iterations: number):
   printLatencyTable("Random edge exists", tracker.getStats());
 }
 
+async function benchmarkVectors(
+  db: GraphDB,
+  graph: GraphData,
+  config: BenchConfig,
+): Promise<{ propKeyId: number; vectorNodes: NodeID[] } | null> {
+  if (config.vectorCount <= 0 || config.vectorDims <= 0) {
+    logger.log("\n--- Vector Operations ---");
+    logger.log("  Skipped (vectorCount/vectorDims <= 0)");
+    return null;
+  }
+
+  logger.log("\n--- Vector Operations ---");
+  const vectorCount = Math.min(config.vectorCount, graph.nodeIds.length);
+  const vectorNodes = graph.nodeIds.slice(0, vectorCount);
+
+  const setupTx = beginTx(db);
+  const propKeyId = definePropkey(setupTx, "embedding");
+  await commit(setupTx);
+
+  const vectors = vectorNodes.map(() => buildRandomVector(config.vectorDims));
+
+  const batchSize = 100;
+  const tracker = new LatencyTracker();
+
+  for (let i = 0; i < vectorNodes.length; i += batchSize) {
+    const tx = beginTx(db);
+    const end = Math.min(i + batchSize, vectorNodes.length);
+    const start = Bun.nanoseconds();
+    for (let j = i; j < end; j++) {
+      setNodeVector(tx, vectorNodes[j]!, propKeyId, vectors[j]!);
+    }
+    await commit(tx);
+    tracker.record(Bun.nanoseconds() - start);
+  }
+
+  printLatencyTable(`Set vectors (batch ${batchSize})`, tracker.getStats());
+
+  return { propKeyId, vectorNodes };
+}
+
+function benchmarkVectorReads(
+  db: GraphDB,
+  vectorNodes: NodeID[],
+  propKeyId: number,
+  iterations: number,
+): void {
+  const getTracker = new LatencyTracker();
+  for (let i = 0; i < iterations; i++) {
+    const node = vectorNodes[Math.floor(Math.random() * vectorNodes.length)]!;
+    const start = Bun.nanoseconds();
+    getNodeVector(db, node, propKeyId);
+    getTracker.record(Bun.nanoseconds() - start);
+  }
+  printLatencyTable("getNodeVector() random", getTracker.getStats());
+
+  const hasTracker = new LatencyTracker();
+  for (let i = 0; i < iterations; i++) {
+    const node = vectorNodes[Math.floor(Math.random() * vectorNodes.length)]!;
+    const start = Bun.nanoseconds();
+    hasNodeVector(db, node, propKeyId);
+    hasTracker.record(Bun.nanoseconds() - start);
+  }
+  printLatencyTable("hasNodeVector() random", hasTracker.getStats());
+}
+
 async function benchmarkWrites(db: GraphDB, iterations: number): Promise<void> {
   logger.log("\n--- Batch Writes (100 nodes) ---");
 
@@ -369,12 +458,14 @@ async function runBenchmarks(config: BenchConfig): Promise<void> {
   logger.log(`Skip compact: ${config.skipCompact}`);
   logger.log(`Reopen read-only: ${config.reopenReadOnly}`);
   logger.log(`Cache enabled: ${config.cacheEnabled}`);
+  logger.log(`Vector dims: ${formatNumber(config.vectorDims)}`);
+  logger.log(`Vector count: ${formatNumber(config.vectorCount)}`);
   logger.log("=".repeat(120));
 
   const testPath = join(tmpdir(), `ray-bench-raw-${Date.now()}.raydb`);
 
   try {
-    logger.log("\n[1/5] Building graph...");
+    logger.log("\n[1/6] Building graph...");
     let db = await openGraphDB(testPath, {
       autoCheckpoint: config.autoCheckpoint,
       checkpointThreshold: config.checkpointThreshold,
@@ -387,7 +478,10 @@ async function runBenchmarks(config: BenchConfig): Promise<void> {
     const graph = await buildGraph(db, config);
     logger.log(`  Built in ${(performance.now() - startBuild).toFixed(0)}ms`);
 
-    logger.log("\n[2/5] Compacting...");
+    logger.log("\n[2/6] Vector setup...");
+    const vectorSetup = await benchmarkVectors(db, graph, config);
+
+    logger.log("\n[3/6] Compacting...");
     if (config.skipCompact) {
       logger.log("  Skipped compaction");
     } else {
@@ -408,14 +502,18 @@ async function runBenchmarks(config: BenchConfig): Promise<void> {
       logger.log("  Re-opened database in read-only mode");
     }
 
-    logger.log("\n[3/5] Key lookup benchmarks...");
+    logger.log("\n[4/6] Key lookup benchmarks...");
     benchmarkKeyLookups(db, graph, config.iterations);
 
-    logger.log("\n[4/5] Traversal and edge benchmarks...");
+    logger.log("\n[5/6] Traversal and edge benchmarks...");
     benchmarkTraversals(db, graph, config.iterations);
     benchmarkEdgeExists(db, graph, config.iterations);
 
-    logger.log("\n[5/5] Write benchmarks...");
+    if (vectorSetup && vectorSetup.vectorNodes.length > 0) {
+      benchmarkVectorReads(db, vectorSetup.vectorNodes, vectorSetup.propKeyId, config.iterations);
+    }
+
+    logger.log("\n[6/6] Write benchmarks...");
     if (db.readOnly) {
       logger.log("  Skipped write benchmarks (read-only)");
     } else {
