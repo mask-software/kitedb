@@ -3,14 +3,14 @@ import {
   Outlet,
   Scripts,
   createRootRouteWithContext,
-} from '@tanstack/solid-router'
-import { TanStackRouterDevtools } from '@tanstack/solid-router-devtools'
-import { HydrationScript } from 'solid-js/web'
-import { Suspense } from 'solid-js'
+} from "@tanstack/solid-router";
+import { TanStackRouterDevtools } from "@tanstack/solid-router-devtools";
+import { HydrationScript } from "solid-js/web";
+import { Suspense } from "solid-js";
 
-// Import styles directly - Vite will handle injection
-import '../styles.css'
-import NotFound from '../components/NotFound'
+// Import styles as URL to ensure explicit stylesheet link
+import stylesHref from "../styles.css?url";
+import NotFound from "../components/NotFound";
 
 function RootErrorComponent({ error }: { error: Error }) {
   return (
@@ -29,50 +29,62 @@ function RootErrorComponent({ error }: { error: Error }) {
         </a>
       </div>
     </div>
-  )
+  );
 }
 
 export const Route = createRootRouteWithContext()({
   head: () => ({
     meta: [
-      { charSet: 'utf-8' },
-      { name: 'viewport', content: 'width=device-width, initial-scale=1' },
-      { name: 'description', content: 'RayDB - High-performance embedded graph database with vector search for Bun/TypeScript' },
-      { name: 'theme-color', content: '#00d4ff' },
+      { charSet: "utf-8" },
+      { name: "viewport", content: "width=device-width, initial-scale=1" },
+      {
+        name: "description",
+        content:
+          "RayDB - High-performance embedded graph database with vector search for Bun/TypeScript",
+      },
+      { name: "theme-color", content: "#00d4ff" },
     ],
     links: [
-      { rel: 'icon', type: 'image/svg+xml', href: '/favicon.svg' },
-      { rel: 'preconnect', href: 'https://fonts.googleapis.com' },
-      { rel: 'preconnect', href: 'https://fonts.gstatic.com', crossorigin: 'anonymous' },
+      { rel: "icon", type: "image/svg+xml", href: "/favicon.svg" },
+      { rel: "preconnect", href: "https://fonts.googleapis.com" },
+      {
+        rel: "preconnect",
+        href: "https://fonts.gstatic.com",
+        crossorigin: "anonymous",
+      },
+      { rel: "stylesheet", href: stylesHref },
     ],
   }),
   errorComponent: RootErrorComponent,
   notFoundComponent: NotFound,
   shellComponent: RootComponent,
-})
+});
 
 function RootComponent() {
   return (
     <html lang="en" class="dark">
       <head>
+        <link rel="stylesheet" href={stylesHref} />
         <HydrationScript />
       </head>
       <body class="min-h-screen bg-[#030712] text-white antialiased">
         <HeadContent />
-        <Suspense fallback={
-          <div class="min-h-screen flex items-center justify-center bg-[#030712]">
-            <div class="flex items-center gap-3">
-              <div class="w-2 h-2 bg-[#00d4ff] rounded-full animate-pulse" />
-              <div class="w-2 h-2 bg-[#00d4ff] rounded-full animate-pulse [animation-delay:200ms]" />
-              <div class="w-2 h-2 bg-[#00d4ff] rounded-full animate-pulse [animation-delay:400ms]" />
+        <Suspense
+          fallback={
+            <div class="min-h-screen flex items-center justify-center bg-[#030712]">
+              <div class="flex items-center gap-3">
+                <div class="w-2 h-2 bg-[#00d4ff] rounded-full animate-pulse" />
+                <div class="w-2 h-2 bg-[#00d4ff] rounded-full animate-pulse [animation-delay:200ms]" />
+                <div class="w-2 h-2 bg-[#00d4ff] rounded-full animate-pulse [animation-delay:400ms]" />
+              </div>
             </div>
-          </div>
-        }>
+          }
+        >
           <Outlet />
         </Suspense>
         <TanStackRouterDevtools position="bottom-right" />
         <Scripts />
       </body>
     </html>
-  )
+  );
 }
