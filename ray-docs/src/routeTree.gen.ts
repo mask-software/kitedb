@@ -12,6 +12,7 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as DocsRouteImport } from './routes/docs'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as DocsIndexRouteImport } from './routes/docs/index'
+import { Route as DocsSplatRouteImport } from './routes/docs/$'
 import { Route as DocsGettingStartedInstallationRouteImport } from './routes/docs/getting-started/installation'
 
 const DocsRoute = DocsRouteImport.update({
@@ -29,6 +30,11 @@ const DocsIndexRoute = DocsIndexRouteImport.update({
   path: '/',
   getParentRoute: () => DocsRoute,
 } as any)
+const DocsSplatRoute = DocsSplatRouteImport.update({
+  id: '/$',
+  path: '/$',
+  getParentRoute: () => DocsRoute,
+} as any)
 const DocsGettingStartedInstallationRoute =
   DocsGettingStartedInstallationRouteImport.update({
     id: '/getting-started/installation',
@@ -39,11 +45,13 @@ const DocsGettingStartedInstallationRoute =
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/docs': typeof DocsRouteWithChildren
+  '/docs/$': typeof DocsSplatRoute
   '/docs/': typeof DocsIndexRoute
   '/docs/getting-started/installation': typeof DocsGettingStartedInstallationRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/docs/$': typeof DocsSplatRoute
   '/docs': typeof DocsIndexRoute
   '/docs/getting-started/installation': typeof DocsGettingStartedInstallationRoute
 }
@@ -51,18 +59,25 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/docs': typeof DocsRouteWithChildren
+  '/docs/$': typeof DocsSplatRoute
   '/docs/': typeof DocsIndexRoute
   '/docs/getting-started/installation': typeof DocsGettingStartedInstallationRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/docs' | '/docs/' | '/docs/getting-started/installation'
+  fullPaths:
+    | '/'
+    | '/docs'
+    | '/docs/$'
+    | '/docs/'
+    | '/docs/getting-started/installation'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/docs' | '/docs/getting-started/installation'
+  to: '/' | '/docs/$' | '/docs' | '/docs/getting-started/installation'
   id:
     | '__root__'
     | '/'
     | '/docs'
+    | '/docs/$'
     | '/docs/'
     | '/docs/getting-started/installation'
   fileRoutesById: FileRoutesById
@@ -95,6 +110,13 @@ declare module '@tanstack/solid-router' {
       preLoaderRoute: typeof DocsIndexRouteImport
       parentRoute: typeof DocsRoute
     }
+    '/docs/$': {
+      id: '/docs/$'
+      path: '/$'
+      fullPath: '/docs/$'
+      preLoaderRoute: typeof DocsSplatRouteImport
+      parentRoute: typeof DocsRoute
+    }
     '/docs/getting-started/installation': {
       id: '/docs/getting-started/installation'
       path: '/getting-started/installation'
@@ -106,11 +128,13 @@ declare module '@tanstack/solid-router' {
 }
 
 interface DocsRouteChildren {
+  DocsSplatRoute: typeof DocsSplatRoute
   DocsIndexRoute: typeof DocsIndexRoute
   DocsGettingStartedInstallationRoute: typeof DocsGettingStartedInstallationRoute
 }
 
 const DocsRouteChildren: DocsRouteChildren = {
+  DocsSplatRoute: DocsSplatRoute,
   DocsIndexRoute: DocsIndexRoute,
   DocsGettingStartedInstallationRoute: DocsGettingStartedInstallationRoute,
 }

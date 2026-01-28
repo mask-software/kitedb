@@ -2,19 +2,21 @@
 //!
 //! Provides Python access to the single-file database format.
 
-use pyo3::prelude::*;
 use pyo3::exceptions::PyRuntimeError;
-use std::sync::Mutex;
+use pyo3::prelude::*;
 use std::collections::HashSet;
+use std::sync::Mutex;
 
+use super::traversal::{PyPathEdge, PyPathResult, PyTraversalResult};
+use crate::api::pathfinding::{bfs, dijkstra, PathConfig};
+use crate::api::traversal::{
+  TraversalBuilder as RustTraversalBuilder, TraversalDirection, TraverseOptions,
+};
 use crate::core::single_file::{
   close_single_file, open_single_file, SingleFileDB as RustSingleFileDB,
   SingleFileOpenOptions as RustOpenOptions, SyncMode as RustSyncMode,
 };
-use crate::types::{ETypeId, NodeId, PropKeyId, PropValue, Edge};
-use crate::api::traversal::{TraversalBuilder as RustTraversalBuilder, TraversalDirection, TraverseOptions};
-use crate::api::pathfinding::{bfs, dijkstra, PathConfig};
-use super::traversal::{PyTraversalResult, PyPathResult, PyPathEdge};
+use crate::types::{ETypeId, Edge, NodeId, PropKeyId, PropValue};
 
 // ============================================================================
 // Open Options
@@ -23,7 +25,7 @@ use super::traversal::{PyTraversalResult, PyPathResult, PyPathEdge};
 /// Synchronization mode for WAL writes
 ///
 /// Controls the durability vs performance trade-off for commits.
-/// - "full": Fsync on every commit (safest, ~3ms per commit)
+/// - "full": Fsync on every commit (durable to OS, slowest)
 /// - "normal": Fsync only on checkpoint (~1000x faster, safe from app crash)
 /// - "off": No fsync (fastest, data may be lost on any crash)
 #[pyclass(name = "SyncMode")]
@@ -34,23 +36,29 @@ pub struct PySyncMode {
 
 #[pymethods]
 impl PySyncMode {
-  /// Full durability: fsync on every commit (~3ms)
+  /// Full durability: fsync on every commit
   #[staticmethod]
   fn full() -> Self {
-    Self { mode: RustSyncMode::Full }
+    Self {
+      mode: RustSyncMode::Full,
+    }
   }
 
   /// Normal: fsync on checkpoint only (~1000x faster)
   /// Safe from application crashes, but not OS crashes.
   #[staticmethod]
   fn normal() -> Self {
-    Self { mode: RustSyncMode::Normal }
+    Self {
+      mode: RustSyncMode::Normal,
+    }
   }
 
   /// No fsync (fastest, for testing only)
   #[staticmethod]
   fn off() -> Self {
-    Self { mode: RustSyncMode::Off }
+    Self {
+      mode: RustSyncMode::Off,
+    }
   }
 
   fn __repr__(&self) -> String {
@@ -413,7 +421,10 @@ impl PyPropValue {
       "bool" => format!("PropValue({})", self.bool_value.unwrap_or(false)),
       "int" => format!("PropValue({})", self.int_value.unwrap_or(0)),
       "float" => format!("PropValue({})", self.float_value.unwrap_or(0.0)),
-      "string" => format!("PropValue(\"{}\")", self.string_value.clone().unwrap_or_default()),
+      "string" => format!(
+        "PropValue(\"{}\")",
+        self.string_value.clone().unwrap_or_default()
+      ),
       _ => "PropValue(unknown)".to_string(),
     }
   }
@@ -481,7 +492,10 @@ pub struct PyFullEdge {
 #[pymethods]
 impl PyFullEdge {
   fn __repr__(&self) -> String {
-    format!("FullEdge(src={}, etype={}, dst={})", self.src, self.etype, self.dst)
+    format!(
+      "FullEdge(src={}, etype={}, dst={})",
+      self.src, self.etype, self.dst
+    )
   }
 }
 
@@ -532,7 +546,10 @@ impl PyDatabase {
 
   /// Close the database
   fn close(&self) -> PyResult<()> {
-    let mut guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mut guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     if let Some(db) = guard.take() {
       close_single_file(db)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to close database: {e}")))?;
@@ -543,14 +560,20 @@ impl PyDatabase {
   /// Check if database is open
   #[getter]
   fn is_open(&self) -> PyResult<bool> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     Ok(guard.is_some())
   }
 
   /// Get database path
   #[getter]
   fn path(&self) -> PyResult<String> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -560,7 +583,10 @@ impl PyDatabase {
   /// Check if database is read-only
   #[getter]
   fn read_only(&self) -> PyResult<bool> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -574,7 +600,10 @@ impl PyDatabase {
   /// Begin a transaction
   #[pyo3(signature = (read_only=None))]
   fn begin(&self, read_only: Option<bool>) -> PyResult<i64> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -586,7 +615,10 @@ impl PyDatabase {
 
   /// Commit the current transaction
   fn commit(&self) -> PyResult<()> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -596,7 +628,10 @@ impl PyDatabase {
 
   /// Rollback the current transaction
   fn rollback(&self) -> PyResult<()> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -606,7 +641,10 @@ impl PyDatabase {
 
   /// Check if there's an active transaction
   fn has_transaction(&self) -> PyResult<bool> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -620,7 +658,10 @@ impl PyDatabase {
   /// Create a new node
   #[pyo3(signature = (key=None))]
   fn create_node(&self, key: Option<String>) -> PyResult<i64> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -640,33 +681,39 @@ impl PyDatabase {
   ///
   /// Returns:
   ///   List of created node IDs
-  fn batch_create_nodes(&self, nodes: Vec<(String, Vec<(u32, PyPropValue)>)>) -> PyResult<Vec<i64>> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+  fn batch_create_nodes(
+    &self,
+    nodes: Vec<(String, Vec<(u32, PyPropValue)>)>,
+  ) -> PyResult<Vec<i64>> {
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
-    
+
     let mut node_ids = Vec::with_capacity(nodes.len());
-    
+
     db.begin(false)
       .map_err(|e| PyRuntimeError::new_err(format!("Failed to begin transaction: {e}")))?;
-    
+
     let result: Result<(), pyo3::PyErr> = (|| {
       for (key, props) in nodes {
         let node_id = db
           .create_node(Some(&key))
           .map_err(|e| PyRuntimeError::new_err(format!("Failed to create node: {e}")))?;
-        
+
         for (prop_key_id, value) in props {
           db.set_node_prop(node_id, prop_key_id as PropKeyId, value.into())
             .map_err(|e| PyRuntimeError::new_err(format!("Failed to set property: {e}")))?;
         }
-        
+
         node_ids.push(node_id as i64);
       }
       Ok(())
     })();
-    
+
     match result {
       Ok(()) => {
         db.commit()
@@ -682,7 +729,10 @@ impl PyDatabase {
 
   /// Delete a node
   fn delete_node(&self, node_id: i64) -> PyResult<()> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -692,7 +742,10 @@ impl PyDatabase {
 
   /// Check if a node exists
   fn node_exists(&self, node_id: i64) -> PyResult<bool> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -701,7 +754,10 @@ impl PyDatabase {
 
   /// Get node by key
   fn get_node_by_key(&self, key: String) -> PyResult<Option<i64>> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -710,7 +766,10 @@ impl PyDatabase {
 
   /// Get the key for a node
   fn get_node_key(&self, node_id: i64) -> PyResult<Option<String>> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -719,7 +778,10 @@ impl PyDatabase {
 
   /// List all node IDs
   fn list_nodes(&self) -> PyResult<Vec<i64>> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -730,12 +792,16 @@ impl PyDatabase {
   ///
   /// This is optimized for filtering by node type (e.g., "user:" prefix).
   fn list_nodes_with_prefix(&self, prefix: String) -> PyResult<Vec<i64>> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
-    
-    let results: Vec<i64> = db.list_nodes()
+
+    let results: Vec<i64> = db
+      .list_nodes()
       .into_iter()
       .filter(|&id| {
         if let Some(key) = db.get_node_key(id) {
@@ -753,12 +819,16 @@ impl PyDatabase {
   ///
   /// This is optimized for counting by node type (e.g., "user:" prefix).
   fn count_nodes_with_prefix(&self, prefix: String) -> PyResult<i64> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
-    
-    let count = db.list_nodes()
+
+    let count = db
+      .list_nodes()
       .into_iter()
       .filter(|&id| {
         if let Some(key) = db.get_node_key(id) {
@@ -773,7 +843,10 @@ impl PyDatabase {
 
   /// Count all nodes
   fn count_nodes(&self) -> PyResult<i64> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -786,7 +859,10 @@ impl PyDatabase {
 
   /// Add an edge
   fn add_edge(&self, src: i64, etype: u32, dst: i64) -> PyResult<()> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -796,7 +872,10 @@ impl PyDatabase {
 
   /// Add an edge by type name
   fn add_edge_by_name(&self, src: i64, etype_name: String, dst: i64) -> PyResult<()> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -806,7 +885,10 @@ impl PyDatabase {
 
   /// Delete an edge
   fn delete_edge(&self, src: i64, etype: u32, dst: i64) -> PyResult<()> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -816,7 +898,10 @@ impl PyDatabase {
 
   /// Check if an edge exists
   fn edge_exists(&self, src: i64, etype: u32, dst: i64) -> PyResult<bool> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -825,7 +910,10 @@ impl PyDatabase {
 
   /// Get outgoing edges for a node
   fn get_out_edges(&self, node_id: i64) -> PyResult<Vec<PyEdge>> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -842,7 +930,10 @@ impl PyDatabase {
 
   /// Get incoming edges for a node
   fn get_in_edges(&self, node_id: i64) -> PyResult<Vec<PyEdge>> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -859,7 +950,10 @@ impl PyDatabase {
 
   /// Get out-degree for a node
   fn get_out_degree(&self, node_id: i64) -> PyResult<i64> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -868,7 +962,10 @@ impl PyDatabase {
 
   /// Get in-degree for a node
   fn get_in_degree(&self, node_id: i64) -> PyResult<i64> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -877,7 +974,10 @@ impl PyDatabase {
 
   /// Count all edges
   fn count_edges(&self) -> PyResult<i64> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -887,7 +987,10 @@ impl PyDatabase {
   /// List all edges in the database
   #[pyo3(signature = (etype=None))]
   fn list_edges(&self, etype: Option<u32>) -> PyResult<Vec<PyFullEdge>> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -905,7 +1008,10 @@ impl PyDatabase {
 
   /// List edges by type name
   fn list_edges_by_name(&self, etype_name: String) -> PyResult<Vec<PyFullEdge>> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -926,7 +1032,10 @@ impl PyDatabase {
 
   /// Count edges by type
   fn count_edges_by_type(&self, etype: u32) -> PyResult<i64> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -935,7 +1044,10 @@ impl PyDatabase {
 
   /// Count edges by type name
   fn count_edges_by_name(&self, etype_name: String) -> PyResult<i64> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -951,7 +1063,10 @@ impl PyDatabase {
 
   /// Set a node property
   fn set_node_prop(&self, node_id: i64, key_id: u32, value: PyPropValue) -> PyResult<()> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -960,8 +1075,16 @@ impl PyDatabase {
   }
 
   /// Set a node property by key name
-  fn set_node_prop_by_name(&self, node_id: i64, key_name: String, value: PyPropValue) -> PyResult<()> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+  fn set_node_prop_by_name(
+    &self,
+    node_id: i64,
+    key_name: String,
+    value: PyPropValue,
+  ) -> PyResult<()> {
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -971,7 +1094,10 @@ impl PyDatabase {
 
   /// Delete a node property
   fn delete_node_prop(&self, node_id: i64, key_id: u32) -> PyResult<()> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -981,7 +1107,10 @@ impl PyDatabase {
 
   /// Get a specific node property
   fn get_node_prop(&self, node_id: i64, key_id: u32) -> PyResult<Option<PyPropValue>> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -997,7 +1126,10 @@ impl PyDatabase {
 
   /// Get a string property directly (faster than get_node_prop)
   fn get_node_prop_string(&self, node_id: i64, key_id: u32) -> PyResult<Option<String>> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1006,13 +1138,16 @@ impl PyDatabase {
         .and_then(|v| match v {
           PropValue::String(s) => Some(s),
           _ => None,
-        })
+        }),
     )
   }
 
   /// Get an integer property directly (faster than get_node_prop)
   fn get_node_prop_int(&self, node_id: i64, key_id: u32) -> PyResult<Option<i64>> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1021,13 +1156,16 @@ impl PyDatabase {
         .and_then(|v| match v {
           PropValue::I64(i) => Some(i),
           _ => None,
-        })
+        }),
     )
   }
 
   /// Get a float property directly (faster than get_node_prop)
   fn get_node_prop_float(&self, node_id: i64, key_id: u32) -> PyResult<Option<f64>> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1036,13 +1174,16 @@ impl PyDatabase {
         .and_then(|v| match v {
           PropValue::F64(f) => Some(f),
           _ => None,
-        })
+        }),
     )
   }
 
   /// Get a bool property directly (faster than get_node_prop)
   fn get_node_prop_bool(&self, node_id: i64, key_id: u32) -> PyResult<Option<bool>> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1051,53 +1192,84 @@ impl PyDatabase {
         .and_then(|v| match v {
           PropValue::Bool(b) => Some(b),
           _ => None,
-        })
+        }),
     )
   }
 
   /// Set a string property directly (faster than set_node_prop)
   fn set_node_prop_string(&self, node_id: i64, key_id: u32, value: String) -> PyResult<()> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
-    db.set_node_prop(node_id as NodeId, key_id as PropKeyId, PropValue::String(value))
-      .map_err(|e| PyRuntimeError::new_err(format!("Failed to set property: {e}")))
+    db.set_node_prop(
+      node_id as NodeId,
+      key_id as PropKeyId,
+      PropValue::String(value),
+    )
+    .map_err(|e| PyRuntimeError::new_err(format!("Failed to set property: {e}")))
   }
 
   /// Set an integer property directly (faster than set_node_prop)
   fn set_node_prop_int(&self, node_id: i64, key_id: u32, value: i64) -> PyResult<()> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
-    db.set_node_prop(node_id as NodeId, key_id as PropKeyId, PropValue::I64(value))
-      .map_err(|e| PyRuntimeError::new_err(format!("Failed to set property: {e}")))
+    db.set_node_prop(
+      node_id as NodeId,
+      key_id as PropKeyId,
+      PropValue::I64(value),
+    )
+    .map_err(|e| PyRuntimeError::new_err(format!("Failed to set property: {e}")))
   }
 
   /// Set a float property directly (faster than set_node_prop)
   fn set_node_prop_float(&self, node_id: i64, key_id: u32, value: f64) -> PyResult<()> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
-    db.set_node_prop(node_id as NodeId, key_id as PropKeyId, PropValue::F64(value))
-      .map_err(|e| PyRuntimeError::new_err(format!("Failed to set property: {e}")))
+    db.set_node_prop(
+      node_id as NodeId,
+      key_id as PropKeyId,
+      PropValue::F64(value),
+    )
+    .map_err(|e| PyRuntimeError::new_err(format!("Failed to set property: {e}")))
   }
 
   /// Set a bool property directly (faster than set_node_prop)
   fn set_node_prop_bool(&self, node_id: i64, key_id: u32, value: bool) -> PyResult<()> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
-    db.set_node_prop(node_id as NodeId, key_id as PropKeyId, PropValue::Bool(value))
-      .map_err(|e| PyRuntimeError::new_err(format!("Failed to set property: {e}")))
+    db.set_node_prop(
+      node_id as NodeId,
+      key_id as PropKeyId,
+      PropValue::Bool(value),
+    )
+    .map_err(|e| PyRuntimeError::new_err(format!("Failed to set property: {e}")))
   }
 
   /// Get all properties for a node
   fn get_node_props(&self, node_id: i64) -> PyResult<Option<Vec<PyNodeProp>>> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1117,8 +1289,18 @@ impl PyDatabase {
   // ========================================================================
 
   /// Set an edge property
-  fn set_edge_prop(&self, src: i64, etype: u32, dst: i64, key_id: u32, value: PyPropValue) -> PyResult<()> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+  fn set_edge_prop(
+    &self,
+    src: i64,
+    etype: u32,
+    dst: i64,
+    key_id: u32,
+    value: PyPropValue,
+  ) -> PyResult<()> {
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1133,8 +1315,18 @@ impl PyDatabase {
   }
 
   /// Set an edge property by key name
-  fn set_edge_prop_by_name(&self, src: i64, etype: u32, dst: i64, key_name: String, value: PyPropValue) -> PyResult<()> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+  fn set_edge_prop_by_name(
+    &self,
+    src: i64,
+    etype: u32,
+    dst: i64,
+    key_name: String,
+    value: PyPropValue,
+  ) -> PyResult<()> {
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1150,7 +1342,10 @@ impl PyDatabase {
 
   /// Delete an edge property
   fn delete_edge_prop(&self, src: i64, etype: u32, dst: i64, key_id: u32) -> PyResult<()> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1164,8 +1359,17 @@ impl PyDatabase {
   }
 
   /// Get a specific edge property
-  fn get_edge_prop(&self, src: i64, etype: u32, dst: i64, key_id: u32) -> PyResult<Option<PyPropValue>> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+  fn get_edge_prop(
+    &self,
+    src: i64,
+    etype: u32,
+    dst: i64,
+    key_id: u32,
+  ) -> PyResult<Option<PyPropValue>> {
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1182,7 +1386,10 @@ impl PyDatabase {
 
   /// Get all properties for an edge
   fn get_edge_props(&self, src: i64, etype: u32, dst: i64) -> PyResult<Option<Vec<PyNodeProp>>> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1206,7 +1413,10 @@ impl PyDatabase {
 
   /// Set a vector embedding for a node
   fn set_node_vector(&self, node_id: i64, prop_key_id: u32, vector: Vec<f64>) -> PyResult<()> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1217,7 +1427,10 @@ impl PyDatabase {
 
   /// Get a vector embedding for a node
   fn get_node_vector(&self, node_id: i64, prop_key_id: u32) -> PyResult<Option<Vec<f64>>> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1229,7 +1442,10 @@ impl PyDatabase {
 
   /// Delete a vector embedding for a node
   fn delete_node_vector(&self, node_id: i64, prop_key_id: u32) -> PyResult<()> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1239,7 +1455,10 @@ impl PyDatabase {
 
   /// Check if a node has a vector embedding
   fn has_node_vector(&self, node_id: i64, prop_key_id: u32) -> PyResult<bool> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1252,7 +1471,10 @@ impl PyDatabase {
 
   /// Get or create a label ID
   fn get_or_create_label(&self, name: String) -> PyResult<u32> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1261,7 +1483,10 @@ impl PyDatabase {
 
   /// Get label ID by name
   fn get_label_id(&self, name: String) -> PyResult<Option<u32>> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1270,7 +1495,10 @@ impl PyDatabase {
 
   /// Get label name by ID
   fn get_label_name(&self, id: u32) -> PyResult<Option<String>> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1279,7 +1507,10 @@ impl PyDatabase {
 
   /// Get or create an edge type ID
   fn get_or_create_etype(&self, name: String) -> PyResult<u32> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1288,7 +1519,10 @@ impl PyDatabase {
 
   /// Get edge type ID by name
   fn get_etype_id(&self, name: String) -> PyResult<Option<u32>> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1297,7 +1531,10 @@ impl PyDatabase {
 
   /// Get edge type name by ID
   fn get_etype_name(&self, id: u32) -> PyResult<Option<String>> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1306,7 +1543,10 @@ impl PyDatabase {
 
   /// Get or create a property key ID
   fn get_or_create_propkey(&self, name: String) -> PyResult<u32> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1315,7 +1555,10 @@ impl PyDatabase {
 
   /// Get property key ID by name
   fn get_propkey_id(&self, name: String) -> PyResult<Option<u32>> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1324,7 +1567,10 @@ impl PyDatabase {
 
   /// Get property key name by ID
   fn get_propkey_name(&self, id: u32) -> PyResult<Option<String>> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1337,7 +1583,10 @@ impl PyDatabase {
 
   /// Define a new label (requires transaction)
   fn define_label(&self, name: String) -> PyResult<u32> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1347,7 +1596,10 @@ impl PyDatabase {
 
   /// Add a label to a node
   fn add_node_label(&self, node_id: i64, label_id: u32) -> PyResult<()> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1357,7 +1609,10 @@ impl PyDatabase {
 
   /// Add a label to a node by name
   fn add_node_label_by_name(&self, node_id: i64, label_name: String) -> PyResult<()> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1367,7 +1622,10 @@ impl PyDatabase {
 
   /// Remove a label from a node
   fn remove_node_label(&self, node_id: i64, label_id: u32) -> PyResult<()> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1377,7 +1635,10 @@ impl PyDatabase {
 
   /// Check if a node has a label
   fn node_has_label(&self, node_id: i64, label_id: u32) -> PyResult<bool> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1386,7 +1647,10 @@ impl PyDatabase {
 
   /// Get all labels for a node
   fn get_node_labels(&self, node_id: i64) -> PyResult<Vec<u32>> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1399,7 +1663,10 @@ impl PyDatabase {
 
   /// Perform a checkpoint (compact WAL into snapshot)
   fn checkpoint(&self) -> PyResult<()> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1409,7 +1676,10 @@ impl PyDatabase {
 
   /// Perform a background (non-blocking) checkpoint
   fn background_checkpoint(&self) -> PyResult<()> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1420,7 +1690,10 @@ impl PyDatabase {
   /// Check if checkpoint is recommended
   #[pyo3(signature = (threshold=None))]
   fn should_checkpoint(&self, threshold: Option<f64>) -> PyResult<bool> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1429,7 +1702,10 @@ impl PyDatabase {
 
   /// Optimize (compact) the database
   fn optimize(&self) -> PyResult<()> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1439,7 +1715,10 @@ impl PyDatabase {
 
   /// Get database statistics
   fn stats(&self) -> PyResult<PyDbStats> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1464,7 +1743,10 @@ impl PyDatabase {
 
   /// Check if caching is enabled
   fn cache_is_enabled(&self) -> PyResult<bool> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1473,7 +1755,10 @@ impl PyDatabase {
 
   /// Invalidate all caches for a node
   fn cache_invalidate_node(&self, node_id: i64) -> PyResult<()> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1483,7 +1768,10 @@ impl PyDatabase {
 
   /// Invalidate caches for a specific edge
   fn cache_invalidate_edge(&self, src: i64, etype: u32, dst: i64) -> PyResult<()> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1493,7 +1781,10 @@ impl PyDatabase {
 
   /// Invalidate a cached key lookup
   fn cache_invalidate_key(&self, key: String) -> PyResult<()> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1503,7 +1794,10 @@ impl PyDatabase {
 
   /// Clear all caches
   fn cache_clear(&self) -> PyResult<()> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1513,7 +1807,10 @@ impl PyDatabase {
 
   /// Clear only the query cache
   fn cache_clear_query(&self) -> PyResult<()> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1523,7 +1820,10 @@ impl PyDatabase {
 
   /// Clear only the key cache
   fn cache_clear_key(&self) -> PyResult<()> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1533,7 +1833,10 @@ impl PyDatabase {
 
   /// Clear only the property cache
   fn cache_clear_property(&self) -> PyResult<()> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1543,7 +1846,10 @@ impl PyDatabase {
 
   /// Clear only the traversal cache
   fn cache_clear_traversal(&self) -> PyResult<()> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1553,7 +1859,10 @@ impl PyDatabase {
 
   /// Get cache statistics
   fn cache_stats(&self) -> PyResult<Option<PyCacheStats>> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1572,7 +1881,10 @@ impl PyDatabase {
 
   /// Reset cache statistics
   fn cache_reset_stats(&self) -> PyResult<()> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let db = guard
       .as_ref()
       .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
@@ -1594,9 +1906,14 @@ impl PyDatabase {
   ///   List of neighboring node IDs
   #[pyo3(signature = (node_id, etype=None))]
   fn traverse_out(&self, node_id: i64, etype: Option<u32>) -> PyResult<Vec<i64>> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let db = guard.as_ref().ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
-    
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let db = guard
+      .as_ref()
+      .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
+
     let edges = db.get_out_edges(node_id as NodeId);
     let results: Vec<i64> = edges
       .into_iter()
@@ -1617,10 +1934,19 @@ impl PyDatabase {
   /// Returns:
   ///   List of (node_id, key) tuples
   #[pyo3(signature = (node_id, etype=None))]
-  fn traverse_out_with_keys(&self, node_id: i64, etype: Option<u32>) -> PyResult<Vec<(i64, Option<String>)>> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let db = guard.as_ref().ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
-    
+  fn traverse_out_with_keys(
+    &self,
+    node_id: i64,
+    etype: Option<u32>,
+  ) -> PyResult<Vec<(i64, Option<String>)>> {
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let db = guard
+      .as_ref()
+      .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
+
     let edges = db.get_out_edges(node_id as NodeId);
     let results: Vec<(i64, Option<String>)> = edges
       .into_iter()
@@ -1645,12 +1971,18 @@ impl PyDatabase {
   ///   Number of outgoing edges
   #[pyo3(signature = (node_id, etype=None))]
   fn traverse_out_count(&self, node_id: i64, etype: Option<u32>) -> PyResult<i64> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let db = guard.as_ref().ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
-    
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let db = guard
+      .as_ref()
+      .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
+
     if let Some(et) = etype {
       // Count only specific edge type
-      let count = db.get_out_edges(node_id as NodeId)
+      let count = db
+        .get_out_edges(node_id as NodeId)
         .into_iter()
         .filter(|(e, _)| *e == et)
         .count();
@@ -1671,9 +2003,14 @@ impl PyDatabase {
   ///   List of source node IDs
   #[pyo3(signature = (node_id, etype=None))]
   fn traverse_in(&self, node_id: i64, etype: Option<u32>) -> PyResult<Vec<i64>> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let db = guard.as_ref().ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
-    
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let db = guard
+      .as_ref()
+      .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
+
     let edges = db.get_in_edges(node_id as NodeId);
     let results: Vec<i64> = edges
       .into_iter()
@@ -1694,10 +2031,19 @@ impl PyDatabase {
   /// Returns:
   ///   List of (node_id, key) tuples
   #[pyo3(signature = (node_id, etype=None))]
-  fn traverse_in_with_keys(&self, node_id: i64, etype: Option<u32>) -> PyResult<Vec<(i64, Option<String>)>> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let db = guard.as_ref().ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
-    
+  fn traverse_in_with_keys(
+    &self,
+    node_id: i64,
+    etype: Option<u32>,
+  ) -> PyResult<Vec<(i64, Option<String>)>> {
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let db = guard
+      .as_ref()
+      .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
+
     let edges = db.get_in_edges(node_id as NodeId);
     let results: Vec<(i64, Option<String>)> = edges
       .into_iter()
@@ -1722,12 +2068,18 @@ impl PyDatabase {
   ///   Number of incoming edges
   #[pyo3(signature = (node_id, etype=None))]
   fn traverse_in_count(&self, node_id: i64, etype: Option<u32>) -> PyResult<i64> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let db = guard.as_ref().ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
-    
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let db = guard
+      .as_ref()
+      .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
+
     if let Some(et) = etype {
       // Count only specific edge type
-      let count = db.get_in_edges(node_id as NodeId)
+      let count = db
+        .get_in_edges(node_id as NodeId)
         .into_iter()
         .filter(|(e, _)| *e == et)
         .count();
@@ -1750,39 +2102,49 @@ impl PyDatabase {
   /// Returns:
   ///   List of (node_id, key) tuples for final results
   #[pyo3(signature = (start_ids, steps))]
-  fn traverse_multi(&self, start_ids: Vec<i64>, steps: Vec<(String, Option<u32>)>) -> PyResult<Vec<(i64, Option<String>)>> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let db = guard.as_ref().ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
-    
+  fn traverse_multi(
+    &self,
+    start_ids: Vec<i64>,
+    steps: Vec<(String, Option<u32>)>,
+  ) -> PyResult<Vec<(i64, Option<String>)>> {
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let db = guard
+      .as_ref()
+      .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
+
     let mut current_ids: Vec<NodeId> = start_ids.iter().map(|&id| id as NodeId).collect();
-    
+
     for (direction, etype) in steps {
       let mut next_ids: Vec<NodeId> = Vec::new();
       let mut visited: HashSet<NodeId> = HashSet::new();
-      
+
       for node_id in &current_ids {
         let neighbors: Vec<NodeId> = match direction.as_str() {
-          "out" => {
-            db.get_out_edges(*node_id)
-              .into_iter()
-              .filter(|(e, _)| etype.is_none() || etype == Some(*e))
-              .map(|(_, dst)| dst)
-              .collect()
-          }
-          "in" => {
-            db.get_in_edges(*node_id)
-              .into_iter()
-              .filter(|(e, _)| etype.is_none() || etype == Some(*e))
-              .map(|(_, src)| src)
-              .collect()
-          }
-          _ => {  // "both"
-            let mut out: Vec<NodeId> = db.get_out_edges(*node_id)
+          "out" => db
+            .get_out_edges(*node_id)
+            .into_iter()
+            .filter(|(e, _)| etype.is_none() || etype == Some(*e))
+            .map(|(_, dst)| dst)
+            .collect(),
+          "in" => db
+            .get_in_edges(*node_id)
+            .into_iter()
+            .filter(|(e, _)| etype.is_none() || etype == Some(*e))
+            .map(|(_, src)| src)
+            .collect(),
+          _ => {
+            // "both"
+            let mut out: Vec<NodeId> = db
+              .get_out_edges(*node_id)
               .into_iter()
               .filter(|(e, _)| etype.is_none() || etype == Some(*e))
               .map(|(_, dst)| dst)
               .collect();
-            let in_edges: Vec<NodeId> = db.get_in_edges(*node_id)
+            let in_edges: Vec<NodeId> = db
+              .get_in_edges(*node_id)
               .into_iter()
               .filter(|(e, _)| etype.is_none() || etype == Some(*e))
               .map(|(_, src)| src)
@@ -1791,7 +2153,7 @@ impl PyDatabase {
             out
           }
         };
-        
+
         for neighbor_id in neighbors {
           if !visited.contains(&neighbor_id) {
             visited.insert(neighbor_id);
@@ -1799,10 +2161,10 @@ impl PyDatabase {
           }
         }
       }
-      
+
       current_ids = next_ids;
     }
-    
+
     // Get keys for final results
     let results: Vec<(i64, Option<String>)> = current_ids
       .into_iter()
@@ -1811,7 +2173,7 @@ impl PyDatabase {
         (id as i64, key)
       })
       .collect();
-    
+
     Ok(results)
   }
 
@@ -1819,39 +2181,49 @@ impl PyDatabase {
   ///
   /// This is the fastest option when you only need the count.
   #[pyo3(signature = (start_ids, steps))]
-  fn traverse_multi_count(&self, start_ids: Vec<i64>, steps: Vec<(String, Option<u32>)>) -> PyResult<i64> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let db = guard.as_ref().ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
-    
+  fn traverse_multi_count(
+    &self,
+    start_ids: Vec<i64>,
+    steps: Vec<(String, Option<u32>)>,
+  ) -> PyResult<i64> {
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let db = guard
+      .as_ref()
+      .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
+
     let mut current_ids: Vec<NodeId> = start_ids.iter().map(|&id| id as NodeId).collect();
-    
+
     for (direction, etype) in steps {
       let mut next_ids: Vec<NodeId> = Vec::new();
       let mut visited: HashSet<NodeId> = HashSet::new();
-      
+
       for node_id in &current_ids {
         let neighbors: Vec<NodeId> = match direction.as_str() {
-          "out" => {
-            db.get_out_edges(*node_id)
-              .into_iter()
-              .filter(|(e, _)| etype.is_none() || etype == Some(*e))
-              .map(|(_, dst)| dst)
-              .collect()
-          }
-          "in" => {
-            db.get_in_edges(*node_id)
-              .into_iter()
-              .filter(|(e, _)| etype.is_none() || etype == Some(*e))
-              .map(|(_, src)| src)
-              .collect()
-          }
-          _ => {  // "both"
-            let mut out: Vec<NodeId> = db.get_out_edges(*node_id)
+          "out" => db
+            .get_out_edges(*node_id)
+            .into_iter()
+            .filter(|(e, _)| etype.is_none() || etype == Some(*e))
+            .map(|(_, dst)| dst)
+            .collect(),
+          "in" => db
+            .get_in_edges(*node_id)
+            .into_iter()
+            .filter(|(e, _)| etype.is_none() || etype == Some(*e))
+            .map(|(_, src)| src)
+            .collect(),
+          _ => {
+            // "both"
+            let mut out: Vec<NodeId> = db
+              .get_out_edges(*node_id)
               .into_iter()
               .filter(|(e, _)| etype.is_none() || etype == Some(*e))
               .map(|(_, dst)| dst)
               .collect();
-            let in_edges: Vec<NodeId> = db.get_in_edges(*node_id)
+            let in_edges: Vec<NodeId> = db
+              .get_in_edges(*node_id)
               .into_iter()
               .filter(|(e, _)| etype.is_none() || etype == Some(*e))
               .map(|(_, src)| src)
@@ -1860,7 +2232,7 @@ impl PyDatabase {
             out
           }
         };
-        
+
         for neighbor_id in neighbors {
           if !visited.contains(&neighbor_id) {
             visited.insert(neighbor_id);
@@ -1868,10 +2240,10 @@ impl PyDatabase {
           }
         }
       }
-      
+
       current_ids = next_ids;
     }
-    
+
     Ok(current_ids.len() as i64)
   }
 
@@ -1899,15 +2271,20 @@ impl PyDatabase {
     direction: Option<String>,
     unique: Option<bool>,
   ) -> PyResult<Vec<PyTraversalResult>> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let db = guard.as_ref().ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
-    
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let db = guard
+      .as_ref()
+      .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
+
     let dir = match direction.as_deref() {
       Some("in") => TraversalDirection::In,
       Some("both") => TraversalDirection::Both,
       _ => TraversalDirection::Out,
     };
-    
+
     let opts = TraverseOptions {
       direction: dir,
       min_depth: min_depth.unwrap_or(1) as usize,
@@ -1916,11 +2293,11 @@ impl PyDatabase {
       where_edge: None,
       where_node: None,
     };
-    
+
     let get_neighbors = |nid: NodeId, d: TraversalDirection, et: Option<ETypeId>| -> Vec<Edge> {
       get_neighbors_from_db(db, nid, d, et)
     };
-    
+
     let results: Vec<PyTraversalResult> = RustTraversalBuilder::new(vec![node_id as NodeId])
       .traverse(etype, opts)
       .execute(get_neighbors)
@@ -1938,7 +2315,7 @@ impl PyDatabase {
         }
       })
       .collect();
-    
+
     Ok(results)
   }
 
@@ -1968,23 +2345,28 @@ impl PyDatabase {
     max_depth: Option<u32>,
     direction: Option<String>,
   ) -> PyResult<PyPathResult> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let db = guard.as_ref().ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
-    
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let db = guard
+      .as_ref()
+      .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
+
     let dir = match direction.as_deref() {
       Some("in") => TraversalDirection::In,
       Some("both") => TraversalDirection::Both,
       _ => TraversalDirection::Out,
     };
-    
+
     let mut targets = HashSet::new();
     targets.insert(target as NodeId);
-    
+
     let mut allowed_etypes = HashSet::new();
     if let Some(e) = etype {
       allowed_etypes.insert(e);
     }
-    
+
     let config = PathConfig {
       source: source as NodeId,
       targets,
@@ -1992,11 +2374,11 @@ impl PyDatabase {
       direction: dir,
       max_depth: max_depth.unwrap_or(100) as usize,
     };
-    
+
     let get_neighbors = |nid: NodeId, d: TraversalDirection, et: Option<ETypeId>| -> Vec<Edge> {
       get_neighbors_from_db(db, nid, d, et)
     };
-    
+
     let result = bfs(config, get_neighbors);
     Ok(result.into())
   }
@@ -2026,23 +2408,28 @@ impl PyDatabase {
     max_depth: Option<u32>,
     direction: Option<String>,
   ) -> PyResult<PyPathResult> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let db = guard.as_ref().ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
-    
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let db = guard
+      .as_ref()
+      .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
+
     let dir = match direction.as_deref() {
       Some("in") => TraversalDirection::In,
       Some("both") => TraversalDirection::Both,
       _ => TraversalDirection::Out,
     };
-    
+
     let mut targets = HashSet::new();
     targets.insert(target as NodeId);
-    
+
     let mut allowed_etypes = HashSet::new();
     if let Some(e) = etype {
       allowed_etypes.insert(e);
     }
-    
+
     let config = PathConfig {
       source: source as NodeId,
       targets,
@@ -2050,15 +2437,15 @@ impl PyDatabase {
       direction: dir,
       max_depth: max_depth.unwrap_or(100) as usize,
     };
-    
+
     let get_neighbors = |nid: NodeId, d: TraversalDirection, et: Option<ETypeId>| -> Vec<Edge> {
       get_neighbors_from_db(db, nid, d, et)
     };
-    
+
     let get_weight = |_src: NodeId, _etype: ETypeId, _dst: NodeId| -> f64 {
-      1.0  // Default weight
+      1.0 // Default weight
     };
-    
+
     let result = dijkstra(config, get_neighbors, get_weight);
     Ok(result.into())
   }
@@ -2074,7 +2461,13 @@ impl PyDatabase {
   /// Returns:
   ///   True if path exists
   #[pyo3(signature = (source, target, etype=None, max_depth=None))]
-  fn has_path(&self, source: i64, target: i64, etype: Option<u32>, max_depth: Option<u32>) -> PyResult<bool> {
+  fn has_path(
+    &self,
+    source: i64,
+    target: i64,
+    etype: Option<u32>,
+    max_depth: Option<u32>,
+  ) -> PyResult<bool> {
     let result = self.find_path_bfs(source, target, etype, max_depth, None)?;
     Ok(result.found)
   }
@@ -2090,7 +2483,14 @@ impl PyDatabase {
   ///   List of reachable node IDs
   #[pyo3(signature = (source, max_depth, etype=None))]
   fn reachable_nodes(&self, source: i64, max_depth: u32, etype: Option<u32>) -> PyResult<Vec<i64>> {
-    let results = self.traverse(source, max_depth, etype, Some(1), Some("out".to_string()), Some(true))?;
+    let results = self.traverse(
+      source,
+      max_depth,
+      etype,
+      Some(1),
+      Some("out".to_string()),
+      Some(true),
+    )?;
     Ok(results.into_iter().map(|r| r.node_id).collect())
   }
 
@@ -2114,9 +2514,16 @@ impl PyDatabase {
   }
 
   fn __repr__(&self) -> PyResult<String> {
-    let guard = self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     if let Some(db) = guard.as_ref() {
-      Ok(format!("Database(path=\"{}\", read_only={})", db.path.display(), db.read_only))
+      Ok(format!(
+        "Database(path=\"{}\", read_only={})",
+        db.path.display(),
+        db.read_only
+      ))
     } else {
       Ok("Database(closed)".to_string())
     }
@@ -2150,20 +2557,38 @@ fn get_neighbors_from_db(
     TraversalDirection::Out => {
       for (e, dst) in db.get_out_edges(node_id) {
         if etype.is_none() || etype == Some(e) {
-          edges.push(Edge { src: node_id, etype: e, dst });
+          edges.push(Edge {
+            src: node_id,
+            etype: e,
+            dst,
+          });
         }
       }
     }
     TraversalDirection::In => {
       for (e, src) in db.get_in_edges(node_id) {
         if etype.is_none() || etype == Some(e) {
-          edges.push(Edge { src, etype: e, dst: node_id });
+          edges.push(Edge {
+            src,
+            etype: e,
+            dst: node_id,
+          });
         }
       }
     }
     TraversalDirection::Both => {
-      edges.extend(get_neighbors_from_db(db, node_id, TraversalDirection::Out, etype));
-      edges.extend(get_neighbors_from_db(db, node_id, TraversalDirection::In, etype));
+      edges.extend(get_neighbors_from_db(
+        db,
+        node_id,
+        TraversalDirection::Out,
+        etype,
+      ));
+      edges.extend(get_neighbors_from_db(
+        db,
+        node_id,
+        TraversalDirection::In,
+        etype,
+      ));
     }
   }
   edges

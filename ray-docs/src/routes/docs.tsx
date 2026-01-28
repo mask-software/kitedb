@@ -99,8 +99,8 @@ function DocsLayout() {
                       <For each={section.items}>
                         {(item) => (
                           <li>
-                            <Link
-                              to={`/docs/${item.slug}`}
+                            <a
+                              href={`/docs/${item.slug}`}
                               onClick={() => setSidebarOpen(false)}
                               class={`block px-3 py-2 text-sm rounded-lg transition-all duration-150 ${
                                 isActive(item.slug)
@@ -110,7 +110,7 @@ function DocsLayout() {
                               aria-current={isActive(item.slug) ? 'page' : undefined}
                             >
                               {item.title}
-                            </Link>
+                            </a>
                           </li>
                         )}
                       </For>

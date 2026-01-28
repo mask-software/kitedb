@@ -92,8 +92,8 @@ export const Sidebar: Component<SidebarProps> = (props) => {
                       <For each={section.items}>
                         {(item) => (
                           <li>
-                            <Link
-                              to={`/docs/${item.slug}`}
+                            <a
+                              href={`/docs/${item.slug}`}
                               onClick={props.onClose}
                               class={`block px-3 py-2 text-sm rounded-lg transition-all ${
                                 isActive(item.slug)
@@ -103,7 +103,7 @@ export const Sidebar: Component<SidebarProps> = (props) => {
                               aria-current={isActive(item.slug) ? 'page' : undefined}
                             >
                               {item.title}
-                            </Link>
+                            </a>
                           </li>
                         )}
                       </For>

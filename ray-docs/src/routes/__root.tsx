@@ -8,7 +8,8 @@ import { TanStackRouterDevtools } from '@tanstack/solid-router-devtools'
 import { HydrationScript } from 'solid-js/web'
 import { Suspense } from 'solid-js'
 
-import styleCss from '../styles.css?url'
+// Import styles directly - Vite will handle injection
+import '../styles.css'
 import NotFound from '../components/NotFound'
 
 function RootErrorComponent({ error }: { error: Error }) {
@@ -40,7 +41,6 @@ export const Route = createRootRouteWithContext()({
       { name: 'theme-color', content: '#00d4ff' },
     ],
     links: [
-      { rel: 'stylesheet', href: styleCss },
       { rel: 'icon', type: 'image/svg+xml', href: '/favicon.svg' },
       { rel: 'preconnect', href: 'https://fonts.googleapis.com' },
       { rel: 'preconnect', href: 'https://fonts.gstatic.com', crossorigin: 'anonymous' },

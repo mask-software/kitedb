@@ -1,4 +1,4 @@
-import { createFileRoute, Link } from '@tanstack/solid-router'
+import { createFileRoute } from '@tanstack/solid-router'
 import { For } from 'solid-js'
 import {
   Rocket,
@@ -35,8 +35,8 @@ function DocsIndex() {
           Get Started
         </h2>
         <div class="grid sm:grid-cols-2 gap-4">
-          <Link
-            to="/docs/getting-started/installation"
+          <a
+            href="/docs/getting-started/installation"
             class="group flex items-start gap-4 p-6 rounded-2xl bg-gradient-to-br from-cyan-500/5 via-transparent to-violet-500/5 border border-cyan-500/20 hover:border-cyan-500/40 hover:shadow-lg hover:shadow-cyan-500/5 transition-all duration-200"
           >
             <div class="flex-shrink-0 w-12 h-12 flex items-center justify-center rounded-xl bg-gradient-to-br from-cyan-500 to-cyan-600 text-white shadow-lg shadow-cyan-500/30">
@@ -51,10 +51,10 @@ function DocsIndex() {
               </p>
             </div>
             <ArrowRight size={20} class="flex-shrink-0 text-slate-400 group-hover:text-cyan-500 group-hover:translate-x-1 transition-all duration-150 mt-1" aria-hidden="true" />
-          </Link>
+          </a>
 
-          <Link
-            to="/docs/getting-started/quick-start"
+          <a
+            href="/docs/getting-started/quick-start"
             class="group flex items-start gap-4 p-6 rounded-2xl bg-gradient-to-br from-violet-500/5 via-transparent to-cyan-500/5 border border-violet-500/20 hover:border-violet-500/40 hover:shadow-lg hover:shadow-violet-500/5 transition-all duration-200"
           >
             <div class="flex-shrink-0 w-12 h-12 flex items-center justify-center rounded-xl bg-gradient-to-br from-violet-500 to-violet-600 text-white shadow-lg shadow-violet-500/30">
@@ -69,7 +69,7 @@ function DocsIndex() {
               </p>
             </div>
             <ArrowRight size={20} class="flex-shrink-0 text-slate-400 group-hover:text-violet-500 group-hover:translate-x-1 transition-all duration-150 mt-1" aria-hidden="true" />
-          </Link>
+          </a>
         </div>
       </section>
 

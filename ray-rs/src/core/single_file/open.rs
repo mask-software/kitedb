@@ -31,8 +31,8 @@ use super::{CheckpointStatus, SingleFileDB};
 /// Similar to SQLite's PRAGMA synchronous setting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SyncMode {
-  /// Fsync on every commit (safest, slowest ~3ms per commit)
-  /// Data is guaranteed to be on disk after commit returns.
+  /// Fsync on every commit (durable to OS, slowest)
+  /// On macOS this uses fsync for parity with Node/Bun.
   #[default]
   Full,
 

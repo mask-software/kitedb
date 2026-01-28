@@ -183,8 +183,7 @@ impl FilePager {
     }
 
     // Calculate current page count
-    let current_page_count =
-      self.file_size.div_ceil(self.page_size as u64) as u32;
+    let current_page_count = self.file_size.div_ceil(self.page_size as u64) as u32;
     let mut start_page = current_page_count;
 
     // Check if we need to skip the lock byte range
@@ -222,7 +221,19 @@ impl FilePager {
 
   /// Sync file to disk
   pub fn sync(&self) -> Result<()> {
-    self.file.sync_all()?;
+    #[cfg(target_os = "macos")]
+    {
+      use std::os::unix::io::AsRawFd;
+      let result = unsafe { libc::fsync(self.file.as_raw_fd()) };
+      if result != 0 {
+        return Err(std::io::Error::last_os_error().into());
+      }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+      self.file.sync_all()?;
+    }
     Ok(())
   }
 

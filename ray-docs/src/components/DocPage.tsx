@@ -1,6 +1,6 @@
 import type { Component, JSX } from 'solid-js'
 import { Show } from 'solid-js'
-import { Link } from '@tanstack/solid-router'
+
 import { ArrowLeft, ArrowRight, Pencil } from 'lucide-solid'
 import { findDocBySlug, getNextDoc, getPrevDoc } from '~/lib/docs'
 
@@ -50,8 +50,8 @@ export const DocPage: Component<DocPageProps> = (props) => {
       <nav class="mt-8 flex items-stretch gap-4" aria-label="Documentation pages">
         <Show when={prevDoc()}>
           {(prev) => (
-            <Link
-              to={`/docs/${prev().slug}`}
+            <a
+              href={`/docs/${prev().slug}`}
               class="group flex-1 flex flex-col items-start p-4 rounded-xl border border-slate-200 dark:border-slate-800 hover:border-cyan-500/50 hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-all duration-150"
             >
               <span class="flex items-center gap-1 text-xs font-medium text-slate-500 mb-1">
@@ -61,7 +61,7 @@ export const DocPage: Component<DocPageProps> = (props) => {
               <span class="font-medium text-slate-900 dark:text-white group-hover:text-cyan-600 dark:group-hover:text-cyan-400 transition-colors duration-150">
                 {prev().title}
               </span>
-            </Link>
+            </a>
           )}
         </Show>
         
@@ -71,8 +71,8 @@ export const DocPage: Component<DocPageProps> = (props) => {
 
         <Show when={nextDoc()}>
           {(next) => (
-            <Link
-              to={`/docs/${next().slug}`}
+            <a
+              href={`/docs/${next().slug}`}
               class="group flex-1 flex flex-col items-end p-4 rounded-xl border border-slate-200 dark:border-slate-800 hover:border-cyan-500/50 hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-all duration-150"
             >
               <span class="flex items-center gap-1 text-xs font-medium text-slate-500 mb-1">
@@ -82,7 +82,7 @@ export const DocPage: Component<DocPageProps> = (props) => {
               <span class="font-medium text-slate-900 dark:text-white group-hover:text-cyan-600 dark:group-hover:text-cyan-400 transition-colors duration-150">
                 {next().title}
               </span>
-            </Link>
+            </a>
           )}
         </Show>
       </nav>

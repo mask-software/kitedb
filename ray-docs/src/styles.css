@@ -7,24 +7,21 @@
 
 @custom-variant dark (&:is(.dark *));
 
-:root {
-  /* Neon Blue Theme */
-  --neon-50: #eef9ff;
-  --neon-100: #d8f1ff;
-  --neon-200: #b9e7ff;
-  --neon-300: #89d9ff;
-  --neon-400: #52c4ff;
-  --neon-500: #2aa7ff;
-  --neon-600: #0d8bf5;
-  --neon-700: #0a73e1;
-  --neon-800: #0f5cb6;
-  --neon-900: #134e8f;
+/* Theme tokens - these create Tailwind utility classes */
+@theme {
+  /* Custom neon colors */
+  --color-neon-400: #52c4ff;
+  --color-neon-500: #2aa7ff;
+  --color-neon-600: #0d8bf5;
+  --color-electric: #00d4ff;
   
-  /* Electric accent */
-  --electric: #00d4ff;
-  --electric-glow: rgba(0, 212, 255, 0.5);
+  --radius-lg: 0.75rem;
+  --radius-md: 0.5rem;
+  --radius-sm: 0.25rem;
+}
 
-  /* Semantic colors - light mode */
+/* Light mode (default) */
+:root {
   --background: #ffffff;
   --foreground: #0a1628;
   --card: #ffffff;
@@ -33,12 +30,11 @@
   --muted-foreground: #64748b;
   --border: #e2e8f0;
   --ring: #0d8bf5;
-  
   --radius: 0.75rem;
-  
   color-scheme: light;
 }
 
+/* Dark mode */
 .dark {
   --background: #030712;
   --foreground: #f8fafc;
@@ -48,28 +44,36 @@
   --muted-foreground: #94a3b8;
   --border: #1e3a5f;
   --ring: #00d4ff;
-  
   color-scheme: dark;
 }
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --color-card: var(--card);
-  --color-card-foreground: var(--card-foreground);
-  --color-muted: var(--muted);
-  --color-muted-foreground: var(--muted-foreground);
-  --color-border: var(--border);
-  --color-ring: var(--ring);
-  --radius-lg: var(--radius);
-  --radius-md: calc(var(--radius) - 2px);
-  --radius-sm: calc(var(--radius) - 4px);
-  
-  /* Custom neon colors */
-  --color-neon-400: #52c4ff;
-  --color-neon-500: #2aa7ff;
-  --color-neon-600: #0d8bf5;
-  --color-electric: #00d4ff;
+/* Semantic background colors using CSS variables */
+.bg-background {
+  background-color: var(--background);
+}
+
+.text-foreground {
+  color: var(--foreground);
+}
+
+.bg-card {
+  background-color: var(--card);
+}
+
+.text-card-foreground {
+  color: var(--card-foreground);
+}
+
+.bg-muted {
+  background-color: var(--muted);
+}
+
+.text-muted-foreground {
+  color: var(--muted-foreground);
+}
+
+.border-border {
+  border-color: var(--border);
 }
 
 /* Base styles */
@@ -81,7 +85,9 @@ html {
 }
 
 body {
-  @apply m-0 bg-background text-foreground;
+  @apply m-0;
+  background-color: var(--background);
+  color: var(--foreground);
   font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
   touch-action: manipulation;
@@ -94,8 +100,9 @@ code, pre, kbd {
 
 /* Focus styles */
 :focus-visible {
-  @apply outline-none ring-2 ring-offset-2 ring-offset-background;
-  --tw-ring-color: var(--electric);
+  @apply outline-none ring-2 ring-offset-2;
+  --tw-ring-offset-color: var(--background);
+  --tw-ring-color: var(--ring);
 }
 
 :focus:not(:focus-visible) {
@@ -522,6 +529,6 @@ code, pre, kbd {
 
 @layer base {
   * {
-    @apply border-border;
+    border-color: var(--border);
   }
 }

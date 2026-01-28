@@ -18,13 +18,13 @@ use crate::types::{ETypeId, NodeId, PropKeyId, PropValue};
 /// Synchronization mode for WAL writes
 ///
 /// Controls the durability vs performance trade-off for commits.
-/// - Full: Fsync on every commit (safest, ~3ms per commit)
+/// - Full: Fsync on every commit (durable to OS, slowest)
 /// - Normal: Fsync only on checkpoint (~1000x faster, safe from app crash)
 /// - Off: No fsync (fastest, data may be lost on any crash)
 #[napi(string_enum)]
 #[derive(Debug)]
 pub enum JsSyncMode {
-  /// Fsync on every commit (safest, slowest)
+  /// Fsync on every commit (durable to OS, slowest)
   Full,
   /// Fsync on checkpoint only (balanced)
   Normal,
