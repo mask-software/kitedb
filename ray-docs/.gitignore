@@ -11,3 +11,6 @@ dist-ssr
 .vscode
 bun.lock
 pnpm-lock.yaml
+
+# Build artifacts from dev server
+public/assets

@@ -13,7 +13,11 @@ export default defineConfig({
   plugins: [
     lucidePreprocess(),
     devtools(),
-    nitro(),
+    nitro({
+      // Vercel will auto-detect or use vercel preset
+      // For local dev, defaults to node-server
+      preset: process.env.VERCEL ? 'vercel' : undefined,
+    }),
     // this is the plugin that enables path aliases
     viteTsConfigPaths({
       projects: ['./tsconfig.json'],
