@@ -13,11 +13,12 @@ const styles = {
     alignItems: "center",
     gap: "16px",
     padding: "8px 24px",
-    background: COLORS.bg,
+    background: "linear-gradient(90deg, rgba(7, 12, 20, 0.98), rgba(10, 16, 26, 0.92))",
     borderTop: `1px solid ${COLORS.border}`,
     fontSize: "12px",
     color: COLORS.textMuted,
     flexShrink: 0,
+    backdropFilter: "blur(12px)",
   },
   item: {
     display: "flex",
@@ -41,6 +42,7 @@ const styles = {
     background: COLORS.surfaceAlt,
     borderRadius: "4px",
     fontSize: "11px",
+    fontVariantNumeric: "tabular-nums",
   },
   badgeAccent: {
     background: COLORS.accentBg,
@@ -89,7 +91,7 @@ export function StatusBar({
   error,
 }: StatusBarProps) {
   return (
-    <div style={styles.statusBar}>
+    <div className="ray-statusbar" style={styles.statusBar}>
       <div style={styles.item}>
         <div
           style={{
@@ -117,7 +119,7 @@ export function StatusBar({
 
       {loading && (
         <div style={styles.item}>
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke={COLORS.accent} strokeWidth="2">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke={COLORS.accent} strokeWidth="2" aria-hidden="true">
             <circle cx="12" cy="12" r="10" strokeOpacity="0.3" />
             <path d="M12 2a10 10 0 0 1 10 10" strokeLinecap="round">
               <animateTransform
@@ -130,13 +132,13 @@ export function StatusBar({
               />
             </path>
           </svg>
-          <span style={{ color: COLORS.accent }}>Loading...</span>
+          <span style={{ color: COLORS.accent }}>Loading…</span>
         </div>
       )}
 
       {error && (
         <div style={styles.error}>
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
             <circle cx="12" cy="12" r="10" />
             <line x1="12" y1="8" x2="12" y2="12" />
             <line x1="12" y1="16" x2="12.01" y2="16" />
@@ -147,7 +149,7 @@ export function StatusBar({
 
       {truncated && !error && (
         <div style={styles.warning}>
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
             <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
             <line x1="12" y1="9" x2="12" y2="13" />
             <line x1="12" y1="17" x2="12.01" y2="17" />
@@ -158,7 +160,9 @@ export function StatusBar({
 
       <div style={styles.item}>
         <span style={{ color: COLORS.textSubtle }}>Zoom:</span>
-        <span style={{ color: COLORS.textMain, fontWeight: 500 }}>{Math.round(zoom * 100)}%</span>
+        <span style={{ color: COLORS.textMain, fontWeight: 500, fontVariantNumeric: "tabular-nums" }}>
+          {Math.round(zoom * 100)}%
+        </span>
       </div>
     </div>
   );

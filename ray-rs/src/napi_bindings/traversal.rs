@@ -176,6 +176,10 @@ pub struct JsPathConfig {
   pub targets: Option<Vec<i64>>,
   /// Allowed edge types (empty = all)
   pub allowed_edge_types: Option<Vec<u32>>,
+  /// Edge weight property key ID (optional)
+  pub weight_key_id: Option<u32>,
+  /// Edge weight property key name (optional)
+  pub weight_key_name: Option<String>,
   /// Traversal direction
   pub direction: Option<JsTraversalDirection>,
   /// Maximum search depth
@@ -254,16 +258,8 @@ impl JsGraphAccessor {
     let src = src as NodeId;
     let dst = dst as NodeId;
 
-    self
-      .out_edges
-      .entry(src)
-      .or_default()
-      .push((etype, dst));
-    self
-      .in_edges
-      .entry(dst)
-      .or_default()
-      .push((etype, src));
+    self.out_edges.entry(src).or_default().push((etype, dst));
+    self.in_edges.entry(dst).or_default().push((etype, src));
 
     if let Some(w) = weight {
       self.weights.insert((src, etype, dst), w);
@@ -571,6 +567,8 @@ impl JsGraphAccessor {
       target: Some(target),
       targets: None,
       allowed_edge_types: edge_type.map(|e| vec![e]),
+      weight_key_id: None,
+      weight_key_name: None,
       direction: Some(JsTraversalDirection::Out),
       max_depth,
     };
@@ -605,12 +603,7 @@ impl JsGraphAccessor {
   /// @param edgeType - Optional edge type filter
   /// @returns Array of reachable node IDs
   #[napi]
-  pub fn reachable_nodes(
-    &self,
-    source: i64,
-    max_depth: u32,
-    edge_type: Option<u32>,
-  ) -> Vec<i64> {
+  pub fn reachable_nodes(&self, source: i64, max_depth: u32, edge_type: Option<u32>) -> Vec<i64> {
     let opts = JsTraverseOptions {
       direction: Some(JsTraversalDirection::Out),
       min_depth: Some(1),
@@ -677,6 +670,8 @@ pub fn path_config(source: i64, target: i64) -> JsPathConfig {
     target: Some(target),
     targets: None,
     allowed_edge_types: None,
+    weight_key_id: None,
+    weight_key_name: None,
     direction: None,
     max_depth: None,
   }

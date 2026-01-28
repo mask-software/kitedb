@@ -5,11 +5,19 @@
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
+use super::traversal::{
+  JsPathConfig, JsPathResult, JsTraversalDirection, JsTraversalResult, JsTraversalStep,
+  JsTraverseOptions,
+};
+use crate::api::pathfinding::{bfs, dijkstra, yen_k_shortest, PathConfig};
+use crate::api::traversal::{
+  TraversalBuilder as RustTraversalBuilder, TraversalDirection, TraverseOptions,
+};
 use crate::core::single_file::{
   close_single_file, open_single_file, SingleFileDB as RustSingleFileDB,
   SingleFileOpenOptions as RustOpenOptions, SyncMode as RustSyncMode,
 };
-use crate::types::{ETypeId, NodeId, PropKeyId, PropValue};
+use crate::types::{ETypeId, Edge, NodeId, PropKeyId, PropValue};
 
 // ============================================================================
 // Sync Mode
@@ -891,6 +899,314 @@ impl Database {
   }
 
   // ========================================================================
+  // Graph Traversal (DB-backed)
+  // ========================================================================
+
+  /// Execute a single-hop traversal from start nodes
+  ///
+  /// @param startNodes - Array of starting node IDs
+  /// @param direction - Traversal direction
+  /// @param edgeType - Optional edge type filter
+  /// @returns Array of traversal results
+  #[napi]
+  pub fn traverse_single(
+    &self,
+    start_nodes: Vec<i64>,
+    direction: JsTraversalDirection,
+    edge_type: Option<u32>,
+  ) -> Result<Vec<JsTraversalResult>> {
+    let db = self.get_db()?;
+    let start: Vec<NodeId> = start_nodes.iter().map(|&id| id as NodeId).collect();
+    let etype = edge_type;
+
+    let builder = match direction {
+      JsTraversalDirection::Out => RustTraversalBuilder::new(start).out(etype),
+      JsTraversalDirection::In => RustTraversalBuilder::new(start).r#in(etype),
+      JsTraversalDirection::Both => RustTraversalBuilder::new(start).both(etype),
+    };
+
+    Ok(
+      builder
+        .execute(|node_id, dir, etype| get_neighbors_from_db(db, node_id, dir, etype))
+        .map(JsTraversalResult::from)
+        .collect(),
+    )
+  }
+
+  /// Execute a multi-hop traversal
+  ///
+  /// @param startNodes - Array of starting node IDs
+  /// @param steps - Array of traversal steps (direction, edgeType)
+  /// @param limit - Maximum number of results
+  /// @returns Array of traversal results
+  #[napi]
+  pub fn traverse(
+    &self,
+    start_nodes: Vec<i64>,
+    steps: Vec<JsTraversalStep>,
+    limit: Option<u32>,
+  ) -> Result<Vec<JsTraversalResult>> {
+    let db = self.get_db()?;
+    let start: Vec<NodeId> = start_nodes.iter().map(|&id| id as NodeId).collect();
+    let mut builder = RustTraversalBuilder::new(start);
+
+    for step in steps {
+      let etype = step.edge_type;
+      builder = match step.direction {
+        JsTraversalDirection::Out => builder.out(etype),
+        JsTraversalDirection::In => builder.r#in(etype),
+        JsTraversalDirection::Both => builder.both(etype),
+      };
+    }
+
+    if let Some(n) = limit {
+      builder = builder.take(n as usize);
+    }
+
+    Ok(
+      builder
+        .execute(|node_id, dir, etype| get_neighbors_from_db(db, node_id, dir, etype))
+        .map(JsTraversalResult::from)
+        .collect(),
+    )
+  }
+
+  /// Execute a variable-depth traversal
+  ///
+  /// @param startNodes - Array of starting node IDs
+  /// @param edgeType - Optional edge type filter
+  /// @param options - Traversal options (maxDepth, minDepth, direction, unique)
+  /// @returns Array of traversal results
+  #[napi]
+  pub fn traverse_depth(
+    &self,
+    start_nodes: Vec<i64>,
+    edge_type: Option<u32>,
+    options: JsTraverseOptions,
+  ) -> Result<Vec<JsTraversalResult>> {
+    let db = self.get_db()?;
+    let start: Vec<NodeId> = start_nodes.iter().map(|&id| id as NodeId).collect();
+    let opts: TraverseOptions = options.into();
+
+    Ok(
+      RustTraversalBuilder::new(start)
+        .traverse(edge_type, opts)
+        .execute(|node_id, dir, etype| get_neighbors_from_db(db, node_id, dir, etype))
+        .map(JsTraversalResult::from)
+        .collect(),
+    )
+  }
+
+  /// Count traversal results without materializing them
+  ///
+  /// @param startNodes - Array of starting node IDs
+  /// @param steps - Array of traversal steps
+  /// @returns Number of results
+  #[napi]
+  pub fn traverse_count(&self, start_nodes: Vec<i64>, steps: Vec<JsTraversalStep>) -> Result<u32> {
+    let db = self.get_db()?;
+    let start: Vec<NodeId> = start_nodes.iter().map(|&id| id as NodeId).collect();
+    let mut builder = RustTraversalBuilder::new(start);
+
+    for step in steps {
+      let etype = step.edge_type;
+      builder = match step.direction {
+        JsTraversalDirection::Out => builder.out(etype),
+        JsTraversalDirection::In => builder.r#in(etype),
+        JsTraversalDirection::Both => builder.both(etype),
+      };
+    }
+
+    Ok(builder.count(|node_id, dir, etype| get_neighbors_from_db(db, node_id, dir, etype)) as u32)
+  }
+
+  /// Get just the node IDs from a traversal
+  ///
+  /// @param startNodes - Array of starting node IDs
+  /// @param steps - Array of traversal steps
+  /// @param limit - Maximum number of results
+  /// @returns Array of node IDs
+  #[napi]
+  pub fn traverse_node_ids(
+    &self,
+    start_nodes: Vec<i64>,
+    steps: Vec<JsTraversalStep>,
+    limit: Option<u32>,
+  ) -> Result<Vec<i64>> {
+    let db = self.get_db()?;
+    let start: Vec<NodeId> = start_nodes.iter().map(|&id| id as NodeId).collect();
+    let mut builder = RustTraversalBuilder::new(start);
+
+    for step in steps {
+      let etype = step.edge_type;
+      builder = match step.direction {
+        JsTraversalDirection::Out => builder.out(etype),
+        JsTraversalDirection::In => builder.r#in(etype),
+        JsTraversalDirection::Both => builder.both(etype),
+      };
+    }
+
+    if let Some(n) = limit {
+      builder = builder.take(n as usize);
+    }
+
+    Ok(
+      builder
+        .collect_node_ids(|node_id, dir, etype| get_neighbors_from_db(db, node_id, dir, etype))
+        .into_iter()
+        .map(|id| id as i64)
+        .collect(),
+    )
+  }
+
+  // ========================================================================
+  // Pathfinding (DB-backed)
+  // ========================================================================
+
+  /// Find shortest path using Dijkstra's algorithm
+  ///
+  /// @param config - Pathfinding configuration
+  /// @returns Path result with nodes, edges, and weight
+  #[napi]
+  pub fn dijkstra(&self, config: JsPathConfig) -> Result<JsPathResult> {
+    let db = self.get_db()?;
+    let weight_key = resolve_weight_key(db, &config)?;
+    let rust_config: PathConfig = config.into();
+
+    Ok(
+      dijkstra(
+        rust_config,
+        |node_id, dir, etype| get_neighbors_from_db(db, node_id, dir, etype),
+        |src, etype, dst| get_edge_weight_from_db(db, src, etype, dst, weight_key),
+      )
+      .into(),
+    )
+  }
+
+  /// Find shortest path using BFS (unweighted)
+  ///
+  /// Faster than Dijkstra for unweighted graphs.
+  ///
+  /// @param config - Pathfinding configuration
+  /// @returns Path result with nodes, edges, and weight
+  #[napi]
+  pub fn bfs(&self, config: JsPathConfig) -> Result<JsPathResult> {
+    let db = self.get_db()?;
+    let rust_config: PathConfig = config.into();
+
+    Ok(
+      bfs(rust_config, |node_id, dir, etype| {
+        get_neighbors_from_db(db, node_id, dir, etype)
+      })
+      .into(),
+    )
+  }
+
+  /// Find k shortest paths using Yen's algorithm
+  ///
+  /// @param config - Pathfinding configuration
+  /// @param k - Maximum number of paths to find
+  /// @returns Array of path results sorted by weight
+  #[napi]
+  pub fn k_shortest(&self, config: JsPathConfig, k: u32) -> Result<Vec<JsPathResult>> {
+    let db = self.get_db()?;
+    let weight_key = resolve_weight_key(db, &config)?;
+    let rust_config: PathConfig = config.into();
+
+    Ok(
+      yen_k_shortest(
+        rust_config,
+        k as usize,
+        |node_id, dir, etype| get_neighbors_from_db(db, node_id, dir, etype),
+        |src, etype, dst| get_edge_weight_from_db(db, src, etype, dst, weight_key),
+      )
+      .into_iter()
+      .map(JsPathResult::from)
+      .collect(),
+    )
+  }
+
+  /// Find shortest path between two nodes (convenience method)
+  ///
+  /// @param source - Source node ID
+  /// @param target - Target node ID
+  /// @param edgeType - Optional edge type filter
+  /// @param maxDepth - Maximum search depth
+  /// @returns Path result
+  #[napi]
+  pub fn shortest_path(
+    &self,
+    source: i64,
+    target: i64,
+    edge_type: Option<u32>,
+    max_depth: Option<u32>,
+  ) -> Result<JsPathResult> {
+    let config = JsPathConfig {
+      source,
+      target: Some(target),
+      targets: None,
+      allowed_edge_types: edge_type.map(|e| vec![e]),
+      weight_key_id: None,
+      weight_key_name: None,
+      direction: Some(JsTraversalDirection::Out),
+      max_depth,
+    };
+
+    self.dijkstra(config)
+  }
+
+  /// Check if a path exists between two nodes
+  ///
+  /// @param source - Source node ID
+  /// @param target - Target node ID
+  /// @param edgeType - Optional edge type filter
+  /// @param maxDepth - Maximum search depth
+  /// @returns true if path exists
+  #[napi]
+  pub fn has_path(
+    &self,
+    source: i64,
+    target: i64,
+    edge_type: Option<u32>,
+    max_depth: Option<u32>,
+  ) -> Result<bool> {
+    Ok(
+      self
+        .shortest_path(source, target, edge_type, max_depth)?
+        .found,
+    )
+  }
+
+  /// Get all nodes reachable from a source within a certain depth
+  ///
+  /// @param source - Source node ID
+  /// @param maxDepth - Maximum depth to traverse
+  /// @param edgeType - Optional edge type filter
+  /// @returns Array of reachable node IDs
+  #[napi]
+  pub fn reachable_nodes(
+    &self,
+    source: i64,
+    max_depth: u32,
+    edge_type: Option<u32>,
+  ) -> Result<Vec<i64>> {
+    let opts = JsTraverseOptions {
+      direction: Some(JsTraversalDirection::Out),
+      min_depth: Some(1),
+      max_depth,
+      unique: Some(true),
+    };
+
+    Ok(
+      self
+        .traverse_depth(vec![source], edge_type, opts)?
+        .into_iter()
+        .map(|r| r.node_id)
+        .collect(),
+    )
+  }
+
+  // ========================================================================
   // Checkpoint / Maintenance
   // ========================================================================
 
@@ -1057,6 +1373,110 @@ impl Database {
       .inner
       .as_ref()
       .ok_or_else(|| Error::from_reason("Database is closed"))
+  }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Get neighbors from database for traversal
+fn get_neighbors_from_db(
+  db: &RustSingleFileDB,
+  node_id: NodeId,
+  direction: TraversalDirection,
+  etype: Option<ETypeId>,
+) -> Vec<Edge> {
+  let mut edges = Vec::new();
+  match direction {
+    TraversalDirection::Out => {
+      for (e, dst) in db.get_out_edges(node_id) {
+        if etype.is_none() || etype == Some(e) {
+          edges.push(Edge {
+            src: node_id,
+            etype: e,
+            dst,
+          });
+        }
+      }
+    }
+    TraversalDirection::In => {
+      for (e, src) in db.get_in_edges(node_id) {
+        if etype.is_none() || etype == Some(e) {
+          edges.push(Edge {
+            src,
+            etype: e,
+            dst: node_id,
+          });
+        }
+      }
+    }
+    TraversalDirection::Both => {
+      edges.extend(get_neighbors_from_db(
+        db,
+        node_id,
+        TraversalDirection::Out,
+        etype,
+      ));
+      edges.extend(get_neighbors_from_db(
+        db,
+        node_id,
+        TraversalDirection::In,
+        etype,
+      ));
+    }
+  }
+  edges
+}
+
+fn resolve_weight_key(db: &RustSingleFileDB, config: &JsPathConfig) -> Result<Option<PropKeyId>> {
+  if let Some(key_id) = config.weight_key_id {
+    return Ok(Some(key_id as PropKeyId));
+  }
+
+  if let Some(ref key_name) = config.weight_key_name {
+    let key_id = db
+      .get_propkey_id(key_name)
+      .ok_or_else(|| Error::from_reason(format!("Unknown property key: {key_name}")))?;
+    return Ok(Some(key_id));
+  }
+
+  Ok(None)
+}
+
+fn prop_value_to_weight(value: Option<PropValue>) -> f64 {
+  let weight = match value {
+    Some(PropValue::Bool(v)) => {
+      if v {
+        1.0
+      } else {
+        0.0
+      }
+    }
+    Some(PropValue::I64(v)) => v as f64,
+    Some(PropValue::F64(v)) => v,
+    Some(PropValue::String(v)) => v.parse::<f64>().unwrap_or(1.0),
+    Some(PropValue::VectorF32(_)) => 1.0,
+    Some(PropValue::Null) | None => 1.0,
+  };
+
+  if weight.is_finite() && weight > 0.0 {
+    weight
+  } else {
+    1.0
+  }
+}
+
+fn get_edge_weight_from_db(
+  db: &RustSingleFileDB,
+  src: NodeId,
+  etype: ETypeId,
+  dst: NodeId,
+  weight_key: Option<PropKeyId>,
+) -> f64 {
+  match weight_key {
+    Some(key_id) => prop_value_to_weight(db.get_edge_prop(src, etype, dst, key_id)),
+    None => 1.0,
   }
 }
 

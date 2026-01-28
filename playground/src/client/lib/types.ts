@@ -118,42 +118,42 @@ export interface AppState {
 
 export const COLORS = {
   // Base colors
-  bg: "#0D1117",
-  surface: "#161B22",
-  surfaceAlt: "#21262D",
-  border: "#21262D",
-  borderSubtle: "#30363D",
+  bg: "#05070D",
+  surface: "#0E1624",
+  surfaceAlt: "#121E2D",
+  border: "#1B2A3C",
+  borderSubtle: "#223348",
   
   // Accent - Ray Cyan
-  accent: "#00E5FF",
-  accentGlow: "rgba(0, 229, 255, 0.4)",
-  accentBg: "#00E5FF15",
-  accentBgHover: "#00E5FF22",
-  accentBorder: "#00E5FF33",
+  accent: "#2AF2FF",
+  accentGlow: "rgba(42, 242, 255, 0.45)",
+  accentBg: "rgba(42, 242, 255, 0.12)",
+  accentBgHover: "rgba(42, 242, 255, 0.2)",
+  accentBorder: "rgba(42, 242, 255, 0.35)",
   
   // Text
-  textMain: "#E6EDF3",
-  textMuted: "#8B949E",
-  textSubtle: "#6E7681",
+  textMain: "#F2F7FF",
+  textMuted: "#9AA8BA",
+  textSubtle: "#72839A",
   
   // Node types
-  file: "#3B82F6",      // blue
-  function: "#00E5FF",  // cyan (accent)
-  class: "#22C55E",     // green
-  module: "#A855F7",    // purple
+  file: "#60A5FA",      // blue
+  function: "#2AF2FF",  // cyan (accent)
+  class: "#34D399",     // green
+  module: "#FBBF24",    // amber
 
   // Highlights
-  selected: "#00E5FF",
-  selectedBg: "#00E5FF08",
-  pathStart: "#22C55E",
-  pathEnd: "#EF4444",
+  selected: "#2AF2FF",
+  selectedBg: "rgba(42, 242, 255, 0.08)",
+  pathStart: "#34D399",
+  pathEnd: "#F87171",
   pathNode: "#4ADE80",
   impact: "#F59E0B",
   hover: "#ffffff",
   
   // Status
-  success: "#22C55E",
-  error: "#EF4444",
+  success: "#34D399",
+  error: "#F87171",
   warning: "#F59E0B",
 } as const;
 

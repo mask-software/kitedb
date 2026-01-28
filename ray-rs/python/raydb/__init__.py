@@ -6,7 +6,7 @@ A Python interface to the RayDB graph database, providing:
 - Node and edge CRUD operations
 - Property storage
 - Vector embeddings with IVF/IVF-PQ indexes
-- Graph traversal and pathfinding (BFS, Dijkstra)
+- Graph traversal and pathfinding (BFS, Dijkstra, A*)
 
 Fluent API (Recommended):
     >>> from raydb import ray, define_node, define_edge, prop, optional
@@ -101,6 +101,10 @@ from raydb.builders import (
 )
 
 from raydb.traversal import (
+    EdgeResult,
+    EdgeTraversalResult,
+    RawEdge,
+    TraverseOptions,
     TraversalBuilder,
     TraversalResult,
     PathFindingBuilder,
@@ -108,6 +112,7 @@ from raydb.traversal import (
 )
 
 from raydb.fluent import (
+    EdgeData,
     Ray,
     ray,
 )
@@ -122,6 +127,7 @@ __all__ = [
     # Entry point
     "ray",
     "Ray",
+    "EdgeData",
     
     # Schema builders
     "define_node",
@@ -145,6 +151,10 @@ __all__ = [
     # Traversal
     "TraversalBuilder",
     "TraversalResult",
+    "EdgeTraversalResult",
+    "EdgeResult",
+    "RawEdge",
+    "TraverseOptions",
     "PathFindingBuilder",
     "PathResult",
     

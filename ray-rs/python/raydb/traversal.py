@@ -80,7 +80,24 @@ class BothStep:
     edge_def: Optional[EdgeDef] = None
 
 
-TraversalStep = Union[OutStep, InStep, BothStep]
+@dataclass
+class TraverseOptions:
+    """Options for variable-depth traversal."""
+    max_depth: int
+    min_depth: int = 1
+    direction: Literal["out", "in", "both"] = "out"
+    unique: bool = True
+
+
+@dataclass
+class TraverseStep:
+    """Variable-depth traversal step."""
+    type: Literal["traverse"] = "traverse"
+    edge_def: Optional[EdgeDef] = None
+    options: TraverseOptions = field(default_factory=lambda: TraverseOptions(max_depth=1))
+
+
+TraversalStep = Union[OutStep, InStep, BothStep, TraverseStep]
 
 
 # ============================================================================
@@ -122,6 +139,34 @@ class PropLoadStrategy:
 
 
 # ============================================================================
+# Edge Results
+# ============================================================================
+
+
+@dataclass
+class EdgeResult:
+    """Edge result with optional properties."""
+    src: int
+    etype: int
+    dst: int
+    props: Dict[str, Any] = field(default_factory=dict)
+
+    def __getattr__(self, name: str) -> Any:
+        props = object.__getattribute__(self, "props")
+        if name in props:
+            return props[name]
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+
+
+@dataclass
+class RawEdge:
+    """Raw edge data without property loading."""
+    src: int
+    etype: int
+    dst: int
+
+
+# ============================================================================
 # Traversal Result
 # ============================================================================
 
@@ -143,6 +188,8 @@ class TraversalResult(Generic[N]):
         start_nodes: List[NodeRef[Any]],
         steps: List[TraversalStep],
         node_filter: Optional[Callable[[NodeRef[Any]], bool]],
+        edge_filter: Optional[Callable[[EdgeResult], bool]],
+        limit: Optional[int],
         resolve_etype_id: Callable[[EdgeDef], int],
         resolve_prop_key_id: Callable[[NodeDef, str], int],
         get_node_def: Callable[[int], Optional[NodeDef]],
@@ -152,6 +199,8 @@ class TraversalResult(Generic[N]):
         self._start_nodes = start_nodes
         self._steps = steps
         self._node_filter = node_filter
+        self._edge_filter = edge_filter
+        self._limit = limit
         self._resolve_etype_id = resolve_etype_id
         self._resolve_prop_key_id = resolve_prop_key_id
         self._get_node_def = get_node_def
@@ -178,6 +227,32 @@ class TraversalResult(Generic[N]):
                 props[prop_name] = from_prop_value(node_prop.value)
         
         return props
+
+    def _load_edge_props(self, edge_def: Optional[EdgeDef], src: int, etype: int, dst: int) -> Dict[str, Any]:
+        """Load edge properties using edge definition mapping."""
+        if edge_def is None or not edge_def.props:
+            return {}
+
+        props: Dict[str, Any] = {}
+        for prop_name in edge_def.props.keys():
+            try:
+                prop_key_id = self._resolve_prop_key_id(edge_def, prop_name)
+            except Exception:
+                continue
+            prop_value = self._db.get_edge_prop(src, etype, dst, prop_key_id)
+            if prop_value is not None:
+                props[prop_name] = from_prop_value(prop_value)
+        return props
+
+    def _build_edge_result(
+        self,
+        edge_def: Optional[EdgeDef],
+        src: int,
+        etype: int,
+        dst: int,
+    ) -> EdgeResult:
+        props = self._load_edge_props(edge_def, src, etype, dst)
+        return EdgeResult(src=src, etype=etype, dst=dst, props=props)
     
     def _create_node_ref(self, node_id: int, load_props: bool = False) -> Optional[NodeRef[Any]]:
         """Create a NodeRef from a node ID."""
@@ -199,6 +274,129 @@ class TraversalResult(Generic[N]):
     def _create_node_ref_fast(self, node_id: int, node_def: NodeDef) -> NodeRef[Any]:
         """Create a minimal NodeRef without loading key or properties."""
         return NodeRef(id=node_id, key="", node_def=node_def, props={})
+
+    def _has_traverse_step(self) -> bool:
+        return any(isinstance(step, TraverseStep) for step in self._steps)
+
+    def _needs_full_execution(self) -> bool:
+        return (
+            self._edge_filter is not None
+            or self._node_filter is not None
+            or self._prop_strategy.needs_any_props()
+            or self._limit is not None
+            or self._has_traverse_step()
+        )
+
+    def _execute_single_hop(
+        self,
+        node: NodeRef[Any],
+        step: Union[OutStep, InStep, BothStep],
+    ) -> Generator[Tuple[NodeRef[Any], EdgeResult], None, None]:
+        """Execute a single-hop step and yield (node, edge) pairs."""
+        directions: List[str]
+        if step.type == "both":
+            directions = ["out", "in"]
+        else:
+            directions = [step.type]
+
+        etype_id: Optional[int] = None
+        if step.edge_def is not None:
+            etype_id = self._resolve_etype_id(step.edge_def)
+
+        for direction in directions:
+            if direction == "out":
+                edges = self._db.get_out_edges(node.id)
+                for edge in edges:
+                    if etype_id is not None and edge.etype != etype_id:
+                        continue
+                    neighbor_id = edge.node_id
+                    neighbor_ref = self._create_node_ref(neighbor_id, load_props=self._prop_strategy.needs_any_props())
+                    if neighbor_ref is None:
+                        continue
+                    edge_result = self._build_edge_result(step.edge_def, node.id, edge.etype, neighbor_id)
+                    yield neighbor_ref, edge_result
+            else:
+                edges = self._db.get_in_edges(node.id)
+                for edge in edges:
+                    if etype_id is not None and edge.etype != etype_id:
+                        continue
+                    neighbor_id = edge.node_id
+                    neighbor_ref = self._create_node_ref(neighbor_id, load_props=self._prop_strategy.needs_any_props())
+                    if neighbor_ref is None:
+                        continue
+                    edge_result = self._build_edge_result(step.edge_def, neighbor_id, edge.etype, node.id)
+                    yield neighbor_ref, edge_result
+
+    def _execute_traverse(
+        self,
+        node: NodeRef[Any],
+        step: TraverseStep,
+    ) -> Generator[Tuple[NodeRef[Any], EdgeResult], None, None]:
+        """Execute variable-depth traversal from a node."""
+        options = step.options
+        etype_id: Optional[int] = None
+        if step.edge_def is not None:
+            etype_id = self._resolve_etype_id(step.edge_def)
+
+        results = self._db.traverse(
+            node.id,
+            options.max_depth,
+            etype_id,
+            options.min_depth,
+            options.direction,
+            options.unique,
+        )
+
+        for result in results:
+            node_ref = self._create_node_ref(result.node_id, load_props=self._prop_strategy.needs_any_props())
+            if node_ref is None:
+                continue
+
+            if result.edge_src is None or result.edge_dst is None or result.edge_type is None:
+                continue
+
+            edge_result = self._build_edge_result(
+                step.edge_def,
+                int(result.edge_src),
+                int(result.edge_type),
+                int(result.edge_dst),
+            )
+            yield node_ref, edge_result
+
+    def _iter_results(self) -> Generator[Tuple[NodeRef[Any], Optional[EdgeResult]], None, None]:
+        """Full execution path that yields (node, edge) results."""
+        current_results: List[Tuple[NodeRef[Any], Optional[EdgeResult]]] = [
+            (node, None) for node in self._start_nodes
+        ]
+
+        for step in self._steps:
+            next_results: List[Tuple[NodeRef[Any], EdgeResult]] = []
+            for node, _ in current_results:
+                if isinstance(step, TraverseStep):
+                    for result in self._execute_traverse(node, step):
+                        next_results.append(result)
+                else:
+                    for result in self._execute_single_hop(node, step):
+                        next_results.append(result)
+            current_results = [(n, e) for n, e in next_results]
+
+        count = 0
+        for node, edge in current_results:
+            if edge is not None and self._edge_filter is not None:
+                if not self._edge_filter(edge):
+                    continue
+            if self._node_filter is not None and not self._node_filter(node):
+                continue
+            if self._limit is not None and count >= self._limit:
+                break
+            yield node, edge
+            count += 1
+
+    def _execute_edges(self) -> Generator[EdgeResult, None, None]:
+        """Execute traversal and yield edge results."""
+        for _, edge in self._iter_results():
+            if edge is not None:
+                yield edge
     
     def _build_steps_for_rust(self) -> List[Tuple[str, Optional[int]]]:
         """Build step tuples for Rust traverse_multi call."""
@@ -214,6 +412,10 @@ class TraversalResult(Generic[N]):
     
     def _execute_fast(self) -> Generator[int, None, None]:
         """Execute traversal and yield only node IDs (fastest path)."""
+        if self._has_traverse_step():
+            for node, _ in self._iter_results():
+                yield node.id
+            return
         if not self._steps:
             for node in self._start_nodes:
                 yield node.id
@@ -254,6 +456,10 @@ class TraversalResult(Generic[N]):
     
     def _execute_fast_with_keys(self) -> Generator[Tuple[int, str], None, None]:
         """Execute traversal and yield (node_id, key) pairs."""
+        if self._has_traverse_step():
+            for node, _ in self._iter_results():
+                yield (node.id, node.key)
+            return
         # No steps - just yield start nodes
         if not self._steps:
             for node in self._start_nodes:
@@ -299,6 +505,8 @@ class TraversalResult(Generic[N]):
     
     def _execute_fast_count(self) -> int:
         """Execute traversal and return just the count."""
+        if self._has_traverse_step():
+            return sum(1 for _ in self._iter_results())
         if not self._steps:
             return len(self._start_nodes)
         
@@ -334,24 +542,16 @@ class TraversalResult(Generic[N]):
     
     def _execute(self) -> Generator[NodeRef[Any], None, None]:
         """Execute the traversal and yield results."""
-        # Fast path: no filter and no properties needed
-        needs_filter = self._node_filter is not None
-        needs_props = self._prop_strategy.needs_any_props()
-        
-        if not needs_filter and not needs_props:
+        if not self._needs_full_execution():
             # Ultra-fast path: use batch operation to get IDs + keys in one call
             for node_id, key in self._execute_fast_with_keys():
                 node_def = self._get_node_def(node_id)
                 if node_def is not None:
                     yield NodeRef(id=node_id, key=key, node_def=node_def, props={})
             return
-        
-        # Standard path: may need to load properties
-        for node_id in self._execute_fast():
-            node_ref = self._create_node_ref(node_id, load_props=needs_props or needs_filter)
-            if node_ref is not None:
-                if self._node_filter is None or self._node_filter(node_ref):
-                    yield node_ref
+
+        for node_ref, _ in self._iter_results():
+            yield node_ref
     
     def __iter__(self) -> Iterator[NodeRef[Any]]:
         """Iterate over the traversal results."""
@@ -364,19 +564,14 @@ class TraversalResult(Generic[N]):
         Returns:
             List of NodeRef objects
         """
-        # Direct path without generator overhead when possible
-        needs_filter = self._node_filter is not None
-        needs_props = self._prop_strategy.needs_any_props()
-        
-        if not needs_filter and not needs_props:
-            # Fast path: build list directly
+        if not self._needs_full_execution():
             results: List[NodeRef[N]] = []
             for node_id, key in self._execute_fast_with_keys():
                 node_def = self._get_node_def(node_id)
                 if node_def is not None:
                     results.append(NodeRef(id=node_id, key=key, node_def=node_def, props={}))  # type: ignore
             return results
-        
+
         return list(self._execute())  # type: ignore
     
     def first(self) -> Optional[NodeRef[N]]:
@@ -399,12 +594,9 @@ class TraversalResult(Generic[N]):
         Returns:
             Number of matching nodes
         """
-        if self._node_filter is None:
-            # Fast count - optimized path that avoids generator overhead
+        if not self._needs_full_execution() and self._node_filter is None:
             return self._execute_fast_count()
-        else:
-            # Need to check filter - must load props
-            return sum(1 for _ in self._execute())
+        return sum(1 for _ in self._execute())
     
     def ids(self) -> List[int]:
         """
@@ -413,7 +605,9 @@ class TraversalResult(Generic[N]):
         Returns:
             List of node IDs
         """
-        return list(self._execute_fast())
+        if not self._needs_full_execution():
+            return list(self._execute_fast())
+        return [node.id for node, _ in self._iter_results()]
     
     def keys(self) -> List[str]:
         """
@@ -422,12 +616,36 @@ class TraversalResult(Generic[N]):
         Returns:
             List of node keys
         """
-        result = []
-        for node_id in self._execute_fast():
-            key = self._db.get_node_key(node_id)
-            if key:
-                result.append(key)
-        return result
+        if not self._needs_full_execution():
+            result: List[str] = []
+            for node_id in self._execute_fast():
+                key = self._db.get_node_key(node_id)
+                if key:
+                    result.append(key)
+            return result
+
+        return [node.key for node, _ in self._iter_results() if node.key]
+
+
+class EdgeTraversalResult:
+    """Traversal result that yields edges."""
+
+    def __init__(self, traversal: TraversalResult[Any]):
+        self._traversal = traversal
+
+    def __iter__(self) -> Iterator[EdgeResult]:
+        return iter(self._traversal._execute_edges())
+
+    def to_list(self) -> List[EdgeResult]:
+        return list(self._traversal._execute_edges())
+
+    def first(self) -> Optional[EdgeResult]:
+        for edge in self._traversal._execute_edges():
+            return edge
+        return None
+
+    def count(self) -> int:
+        return sum(1 for _ in self._traversal._execute_edges())
 
 
 # ============================================================================
@@ -472,6 +690,8 @@ class TraversalBuilder(Generic[N]):
         self._get_node_def = get_node_def
         self._steps: List[TraversalStep] = []
         self._node_filter: Optional[Callable[[NodeRef[Any]], bool]] = None
+        self._edge_filter: Optional[Callable[[EdgeResult], bool]] = None
+        self._limit: Optional[int] = None
         self._prop_strategy: PropLoadStrategy = PropLoadStrategy.none()
     
     def out(self, edge: Optional[EdgeDef] = None) -> TraversalBuilder[N]:
@@ -514,6 +734,17 @@ class TraversalBuilder(Generic[N]):
         """
         self._steps.append(BothStep(edge_def=edge))
         return self
+
+    def traverse(self, edge: EdgeDef, options: TraverseOptions) -> TraversalBuilder[N]:
+        """
+        Variable-depth traversal.
+        
+        Args:
+            edge: Edge definition to traverse
+            options: TraverseOptions (max_depth required)
+        """
+        self._steps.append(TraverseStep(edge_def=edge, options=options))
+        return self
     
     def with_props(self) -> TraversalBuilder[N]:
         """
@@ -552,6 +783,30 @@ class TraversalBuilder(Generic[N]):
         """
         self._prop_strategy = PropLoadStrategy.only(*prop_names)
         return self
+
+    def select(self, props: List[str]) -> TraversalBuilder[N]:
+        """
+        Select specific properties to load.
+
+        This mirrors the TypeScript `select([...])` behavior.
+        """
+        self._prop_strategy = PropLoadStrategy.only(*props)
+        return self
+
+    def where_edge(self, predicate: Callable[[EdgeResult], bool]) -> TraversalBuilder[N]:
+        """
+        Filter results by edge properties.
+
+        Args:
+            predicate: Function that returns True for edges to include
+        """
+        self._edge_filter = predicate
+        return self
+
+    def take(self, limit: int) -> TraversalBuilder[N]:
+        """Limit the number of results."""
+        self._limit = limit
+        return self
     
     def where_node(self, predicate: Callable[[NodeRef[Any]], bool]) -> TraversalBuilder[N]:
         """
@@ -586,6 +841,8 @@ class TraversalBuilder(Generic[N]):
             start_nodes=self._start_nodes,
             steps=self._steps,
             node_filter=self._node_filter,
+            edge_filter=self._edge_filter,
+            limit=self._limit,
             resolve_etype_id=self._resolve_etype_id,
             resolve_prop_key_id=self._resolve_prop_key_id,
             get_node_def=self._get_node_def,
@@ -600,6 +857,52 @@ class TraversalBuilder(Generic[N]):
             TraversalResult that can be iterated or collected
         """
         return self._build_result()
+
+    def edges(self) -> "EdgeTraversalResult":
+        """Return edge results from the traversal."""
+        return EdgeTraversalResult(self._build_result())
+
+    def raw_edges(self) -> Generator[RawEdge, None, None]:
+        """Return raw edge data without property loading."""
+        if any(isinstance(step, TraverseStep) for step in self._steps):
+            raise ValueError("raw_edges() does not support variable-depth traverse()")
+
+        current_ids = [node.id for node in self._start_nodes]
+
+        for step in self._steps:
+            if isinstance(step, TraverseStep):
+                raise ValueError("raw_edges() does not support variable-depth traverse()")
+
+            directions: List[str]
+            if step.type == "both":
+                directions = ["out", "in"]
+            else:
+                directions = [step.type]
+
+            etype_id: Optional[int] = None
+            if step.edge_def is not None:
+                etype_id = self._resolve_etype_id(step.edge_def)
+
+            next_ids: List[int] = []
+
+            for node_id in current_ids:
+                for direction in directions:
+                    if direction == "out":
+                        edges = self._db.get_out_edges(node_id)
+                        for edge in edges:
+                            if etype_id is not None and edge.etype != etype_id:
+                                continue
+                            yield RawEdge(src=node_id, etype=edge.etype, dst=edge.node_id)
+                            next_ids.append(edge.node_id)
+                    else:
+                        edges = self._db.get_in_edges(node_id)
+                        for edge in edges:
+                            if etype_id is not None and edge.etype != etype_id:
+                                continue
+                            yield RawEdge(src=edge.node_id, etype=edge.etype, dst=node_id)
+                            next_ids.append(edge.node_id)
+
+            current_ids = next_ids
     
     def to_list(self) -> List[NodeRef[N]]:
         """
@@ -661,18 +964,23 @@ class PathResult(Generic[N]):
     
     Attributes:
         nodes: List of node references in the path
+        edges: List of edges in the path
         found: Whether a path was found
         total_weight: Total path weight (for weighted paths)
     """
     nodes: List[NodeRef[N]]
     found: bool
     total_weight: float = 0.0
+    edges: List[EdgeResult] = field(default_factory=list)
     
     def __bool__(self) -> bool:
         return self.found
     
     def __len__(self) -> int:
         return len(self.nodes)
+
+
+WeightSpec = Union[str, Callable[[EdgeResult], float]]
 
 
 class PathFindingBuilder(Generic[N]):
@@ -699,15 +1007,23 @@ class PathFindingBuilder(Generic[N]):
         self._resolve_etype_id = resolve_etype_id
         self._resolve_prop_key_id = resolve_prop_key_id
         self._get_node_def = get_node_def
-        self._target: Optional[NodeRef[Any]] = None
+        self._targets: Optional[List[NodeRef[Any]]] = None
         self._edge_type: Optional[EdgeDef] = None
         self._max_depth: Optional[int] = None
         self._direction: str = "out"
         self._load_props: bool = False
+        self._weight_spec: Optional[WeightSpec] = None
     
     def to(self, target: NodeRef[Any]) -> PathFindingBuilder[N]:
         """Set the target node."""
-        self._target = target
+        self._targets = [target]
+        return self
+
+    def to_any(self, targets: List[NodeRef[Any]]) -> PathFindingBuilder[N]:
+        """Set multiple target nodes (find path to any)."""
+        if not targets:
+            raise ValueError("to_any requires at least one target")
+        self._targets = targets
         return self
     
     def via(self, edge: EdgeDef) -> PathFindingBuilder[N]:
@@ -729,6 +1045,11 @@ class PathFindingBuilder(Generic[N]):
         """Load properties for nodes in the path."""
         self._load_props = True
         return self
+
+    def weight(self, spec: WeightSpec) -> PathFindingBuilder[N]:
+        """Set weight specification (property name or function)."""
+        self._weight_spec = spec
+        return self
     
     def _create_node_ref(self, node_id: int) -> Optional[NodeRef[Any]]:
         """Create a NodeRef from a node ID."""
@@ -749,6 +1070,98 @@ class PathFindingBuilder(Generic[N]):
                     props[prop_name] = from_prop_value(prop_value)
         
         return NodeRef(id=node_id, key=key, node_def=node_def, props=props)
+
+    def _get_targets(self) -> List[NodeRef[Any]]:
+        if not self._targets:
+            raise ValueError("Target node required. Use .to(target) or .to_any(targets) first.")
+        return self._targets
+
+    def _max_depth_value(self) -> int:
+        return self._max_depth if self._max_depth is not None else 100
+
+    def _build_edge_result(self, edge_def: Optional[EdgeDef], src: int, etype: int, dst: int) -> EdgeResult:
+        props: Dict[str, Any] = {}
+        if edge_def is not None and edge_def.props:
+            for prop_name in edge_def.props.keys():
+                try:
+                    prop_key_id = self._resolve_prop_key_id(edge_def, prop_name)
+                except Exception:
+                    continue
+                prop_value = self._db.get_edge_prop(src, etype, dst, prop_key_id)
+                if prop_value is not None:
+                    props[prop_name] = from_prop_value(prop_value)
+        return EdgeResult(src=src, etype=etype, dst=dst, props=props)
+
+    def _coerce_weight(self, value: Any) -> float:
+        try:
+            weight = float(value)
+        except Exception:
+            return 1.0
+        if not weight or weight <= 0:
+            return 1.0
+        return weight
+
+    def _edge_weight(self, edge: EdgeResult) -> float:
+        if self._weight_spec is None:
+            return 1.0
+        if isinstance(self._weight_spec, str):
+            prop_name = self._weight_spec
+            if prop_name in edge.props:
+                return self._coerce_weight(edge.props[prop_name])
+            return 1.0
+        return self._coerce_weight(self._weight_spec(edge))
+
+    def _iter_neighbors(self, node_id: int) -> Generator[Tuple[int, EdgeResult], None, None]:
+        directions: List[str]
+        if self._direction == "both":
+            directions = ["out", "in"]
+        else:
+            directions = [self._direction]
+
+        etype_id: Optional[int] = None
+        if self._edge_type is not None:
+            etype_id = self._resolve_etype_id(self._edge_type)
+
+        for direction in directions:
+            if direction == "out":
+                edges = self._db.get_out_edges(node_id)
+                for edge in edges:
+                    if etype_id is not None and edge.etype != etype_id:
+                        continue
+                    neighbor_id = edge.node_id
+                    edge_result = self._build_edge_result(self._edge_type, node_id, edge.etype, neighbor_id)
+                    yield neighbor_id, edge_result
+            else:
+                edges = self._db.get_in_edges(node_id)
+                for edge in edges:
+                    if etype_id is not None and edge.etype != etype_id:
+                        continue
+                    neighbor_id = edge.node_id
+                    edge_result = self._build_edge_result(self._edge_type, neighbor_id, edge.etype, node_id)
+                    yield neighbor_id, edge_result
+
+    def _reconstruct_path(
+        self,
+        parents: Dict[int, Tuple[Optional[int], Optional[EdgeResult]]],
+        target_id: int,
+    ) -> PathResult[N]:
+        path_nodes: List[NodeRef[N]] = []
+        path_edges: List[EdgeResult] = []
+
+        current: Optional[int] = target_id
+        while current is not None:
+            parent, edge = parents.get(current, (None, None))
+            node_ref = self._create_node_ref(current)
+            if node_ref is not None:
+                path_nodes.append(node_ref)  # type: ignore
+            if edge is not None:
+                path_edges.append(edge)
+            current = parent
+
+        path_nodes.reverse()
+        path_edges.reverse()
+
+        return PathResult(nodes=path_nodes, found=True, total_weight=0.0, edges=path_edges)
     
     def find(self) -> PathResult[N]:
         """
@@ -757,36 +1170,7 @@ class PathFindingBuilder(Generic[N]):
         Returns:
             PathResult containing the path if found
         """
-        if self._target is None:
-            raise ValueError("Target node required. Use .to(target) first.")
-        
-        etype_id = None
-        if self._edge_type is not None:
-            etype_id = self._resolve_etype_id(self._edge_type)
-        
-        result = self._db.find_path_bfs(
-            source=self._source.id,
-            target=self._target.id,
-            etype=etype_id,
-            max_depth=self._max_depth,
-            direction=self._direction,
-        )
-        
-        if not result.found:
-            return PathResult(nodes=[], found=False)
-        
-        # Convert path node IDs to NodeRefs
-        nodes: List[NodeRef[N]] = []
-        for node_id in result.path:
-            node_ref = self._create_node_ref(node_id)
-            if node_ref is not None:
-                nodes.append(node_ref)  # type: ignore
-        
-        return PathResult(
-            nodes=nodes,
-            found=True,
-            total_weight=result.total_weight,
-        )
+        return self.bfs()
     
     def find_weighted(self) -> PathResult[N]:
         """
@@ -795,36 +1179,7 @@ class PathFindingBuilder(Generic[N]):
         Returns:
             PathResult containing the path if found
         """
-        if self._target is None:
-            raise ValueError("Target node required. Use .to(target) first.")
-        
-        etype_id = None
-        if self._edge_type is not None:
-            etype_id = self._resolve_etype_id(self._edge_type)
-        
-        result = self._db.find_path_dijkstra(
-            source=self._source.id,
-            target=self._target.id,
-            etype=etype_id,
-            max_depth=self._max_depth,
-            direction=self._direction,
-        )
-        
-        if not result.found:
-            return PathResult(nodes=[], found=False)
-        
-        # Convert path node IDs to NodeRefs
-        nodes: List[NodeRef[N]] = []
-        for node_id in result.path:
-            node_ref = self._create_node_ref(node_id)
-            if node_ref is not None:
-                nodes.append(node_ref)  # type: ignore
-        
-        return PathResult(
-            nodes=nodes,
-            found=True,
-            total_weight=result.total_weight,
-        )
+        return self.dijkstra()
     
     def exists(self) -> bool:
         """
@@ -833,29 +1188,189 @@ class PathFindingBuilder(Generic[N]):
         Returns:
             True if a path exists
         """
-        if self._target is None:
-            raise ValueError("Target node required. Use .to(target) first.")
-        
-        etype_id = None
-        if self._edge_type is not None:
-            etype_id = self._resolve_etype_id(self._edge_type)
-        
-        return self._db.has_path(
-            source=self._source.id,
-            target=self._target.id,
-            etype=etype_id,
-            max_depth=self._max_depth,
-        )
+        return self.bfs().found
+
+    def bfs(self) -> PathResult[N]:
+        """Execute BFS (unweighted shortest path)."""
+        targets = self._get_targets()
+        target_ids = {t.id for t in targets}
+        max_depth = self._max_depth_value()
+
+        if self._source.id in target_ids:
+            node_ref = self._create_node_ref(self._source.id)
+            if node_ref is None:
+                return PathResult(nodes=[], found=False)
+            return PathResult(nodes=[node_ref], found=True, total_weight=0.0)
+
+        from collections import deque
+
+        queue = deque([(self._source.id, 0)])
+        visited = {self._source.id}
+        parents: Dict[int, Tuple[Optional[int], Optional[EdgeResult]]] = {
+            self._source.id: (None, None)
+        }
+
+        while queue:
+            node_id, depth = queue.popleft()
+            if depth >= max_depth:
+                continue
+
+            for neighbor_id, edge in self._iter_neighbors(node_id):
+                if neighbor_id in visited:
+                    continue
+                visited.add(neighbor_id)
+                parents[neighbor_id] = (node_id, edge)
+
+                if neighbor_id in target_ids:
+                    result = self._reconstruct_path(parents, neighbor_id)
+                    result.total_weight = float(len(result.edges))
+                    return result
+
+                queue.append((neighbor_id, depth + 1))
+
+        return PathResult(nodes=[], found=False)
+
+    def dijkstra(self) -> PathResult[N]:
+        """Execute Dijkstra's algorithm."""
+        targets = self._get_targets()
+        target_ids = {t.id for t in targets}
+        max_depth = self._max_depth_value()
+
+        if isinstance(self._weight_spec, str) and self._edge_type is None:
+            raise ValueError("weight by property requires via(edge)")
+
+        if self._source.id in target_ids:
+            node_ref = self._create_node_ref(self._source.id)
+            if node_ref is None:
+                return PathResult(nodes=[], found=False)
+            return PathResult(nodes=[node_ref], found=True, total_weight=0.0)
+
+        import heapq
+
+        dist: Dict[int, float] = {self._source.id: 0.0}
+        depth_map: Dict[int, int] = {self._source.id: 0}
+        parents: Dict[int, Tuple[Optional[int], Optional[EdgeResult]]] = {
+            self._source.id: (None, None)
+        }
+        heap: List[Tuple[float, int, int]] = [(0.0, 0, self._source.id)]
+        visited: Set[int] = set()
+
+        while heap:
+            cost, depth, node_id = heapq.heappop(heap)
+            if node_id in visited:
+                continue
+            visited.add(node_id)
+
+            if node_id in target_ids:
+                result = self._reconstruct_path(parents, node_id)
+                result.total_weight = cost
+                return result
+
+            if depth >= max_depth:
+                continue
+
+            for neighbor_id, edge in self._iter_neighbors(node_id):
+                next_depth = depth + 1
+                if next_depth > max_depth:
+                    continue
+
+                new_cost = cost + self._edge_weight(edge)
+                if new_cost < dist.get(neighbor_id, float("inf")):
+                    dist[neighbor_id] = new_cost
+                    depth_map[neighbor_id] = next_depth
+                    parents[neighbor_id] = (node_id, edge)
+                    heapq.heappush(heap, (new_cost, next_depth, neighbor_id))
+
+        return PathResult(nodes=[], found=False)
+
+    def a_star(self, heuristic: Callable[[NodeRef[N], NodeRef[N]], float]) -> PathResult[N]:
+        """Execute A* algorithm with a heuristic."""
+        targets = self._get_targets()
+        target_ids = {t.id for t in targets}
+        target_ref = targets[0]
+        max_depth = self._max_depth_value()
+
+        if isinstance(self._weight_spec, str) and self._edge_type is None:
+            raise ValueError("weight by property requires via(edge)")
+
+        if self._source.id in target_ids:
+            node_ref = self._create_node_ref(self._source.id)
+            if node_ref is None:
+                return PathResult(nodes=[], found=False)
+            return PathResult(nodes=[node_ref], found=True, total_weight=0.0)
+
+        import heapq
+
+        def safe_heuristic(current: NodeRef[N]) -> float:
+            try:
+                return float(heuristic(current, target_ref))
+            except Exception:
+                return 0.0
+
+        g_score: Dict[int, float] = {self._source.id: 0.0}
+        parents: Dict[int, Tuple[Optional[int], Optional[EdgeResult]]] = {
+            self._source.id: (None, None)
+        }
+        heap: List[Tuple[float, float, int, int]] = []
+
+        source_ref = self._create_node_ref(self._source.id)
+        if source_ref is None:
+            return PathResult(nodes=[], found=False)
+        heapq.heappush(heap, (safe_heuristic(source_ref), 0.0, self._source.id, 0))
+
+        visited: Set[int] = set()
+
+        while heap:
+            f_score, g_score_val, node_id, depth = heapq.heappop(heap)
+            if node_id in visited:
+                continue
+            visited.add(node_id)
+
+            if node_id in target_ids:
+                result = self._reconstruct_path(parents, node_id)
+                result.total_weight = g_score_val
+                return result
+
+            if depth >= max_depth:
+                continue
+
+            for neighbor_id, edge in self._iter_neighbors(node_id):
+                next_depth = depth + 1
+                if next_depth > max_depth:
+                    continue
+
+                tentative_g = g_score_val + self._edge_weight(edge)
+                if tentative_g < g_score.get(neighbor_id, float("inf")):
+                    neighbor_ref = self._create_node_ref(neighbor_id)
+                    if neighbor_ref is None:
+                        continue
+                    g_score[neighbor_id] = tentative_g
+                    parents[neighbor_id] = (node_id, edge)
+                    h = safe_heuristic(neighbor_ref)
+                    heapq.heappush(heap, (tentative_g + h, tentative_g, neighbor_id, next_depth))
+
+        return PathResult(nodes=[], found=False)
+
+    def all_paths(self, max_paths: Optional[int] = None) -> Iterator[PathResult[N]]:
+        """Yield shortest paths (currently returns at most one)."""
+        result = self.dijkstra() if self._weight_spec is not None else self.bfs()
+        if result.found:
+            yield result
 
 
 __all__ = [
     "TraversalBuilder",
     "TraversalResult",
+    "EdgeTraversalResult",
     "PathFindingBuilder",
     "PathResult",
+    "EdgeResult",
+    "RawEdge",
+    "TraverseOptions",
     "PropLoadStrategy",
     "OutStep",
     "InStep",
     "BothStep",
+    "TraverseStep",
     "TraversalStep",
 ]

@@ -24,6 +24,6 @@ export default defineConfig({
     }),
     tailwindcss(),
     tanstackStart(),
-    solidPlugin({ ssr: true }),
+    solidPlugin({ ssr: true, hot: false }),
   ],
 })

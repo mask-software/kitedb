@@ -11,36 +11,36 @@ import type cytoscape from "cytoscape";
 
 export const CYTOSCAPE_COLORS = {
   // Base
-  background: "#0D1117",
-  surface: "#161B22",
-  border: "rgba(0, 229, 255, 0.2)",
+  background: "#05070D",
+  surface: "#0E1624",
+  border: "rgba(42, 242, 255, 0.25)",
 
   // Accent
-  accent: "#00E5FF",
-  accentDim: "rgba(0, 229, 255, 0.5)",
+  accent: "#2AF2FF",
+  accentDim: "rgba(42, 242, 255, 0.5)",
 
   // Text
-  textPrimary: "#E6EDF3",
-  textSecondary: "#8B949E",
+  textPrimary: "#F2F7FF",
+  textSecondary: "#9AA8BA",
 
   // Node types
-  file: "#3B82F6", // blue
-  function: "#00E5FF", // cyan
-  class: "#22C55E", // green
-  module: "#A855F7", // purple
+  file: "#60A5FA", // blue
+  function: "#2AF2FF", // cyan
+  class: "#34D399", // green
+  module: "#FBBF24", // amber
 
   // Highlights
-  selected: "#00E5FF",
-  hovered: "rgba(0, 229, 255, 0.3)",
-  pathHighlight: "#FFD700", // gold
-  pathStart: "#22C55E", // green
-  pathEnd: "#EF4444", // red
+  selected: "#2AF2FF",
+  hovered: "rgba(42, 242, 255, 0.3)",
+  pathHighlight: "#FACC15", // gold
+  pathStart: "#34D399", // green
+  pathEnd: "#F87171", // red
   impactSource: "#F59E0B", // amber
   impactHighlight: "rgba(245, 158, 11, 0.6)", // amber with transparency
 
   // Edges
-  edgeDefault: "rgba(139, 148, 158, 0.6)",
-  edgeHighlight: "#00E5FF",
+  edgeDefault: "rgba(154, 168, 186, 0.55)",
+  edgeHighlight: "#2AF2FF",
 } as const;
 
 // ============================================================================
@@ -60,7 +60,7 @@ export const cytoscapeStylesheet: cytoscape.StylesheetStyle[] = [
       "text-halign": "center",
       "text-margin-y": 8,
       "font-size": 11,
-      "font-family": "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+      "font-family": "Space Grotesk, sans-serif",
       "min-zoomed-font-size": 8,
       width: "mapData(degree, 0, 20, 24, 48)",
       height: "mapData(degree, 0, 20, 24, 48)",

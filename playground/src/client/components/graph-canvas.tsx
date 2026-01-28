@@ -37,12 +37,16 @@ const styles = {
     width: "100%",
     height: "100%",
     position: "relative" as const,
+    overflow: "hidden",
     // Dot grid background pattern
-    background: `
-      radial-gradient(circle at center, ${COLORS.surface} 1px, transparent 1px)
+    backgroundImage: `
+      radial-gradient(circle at 1px 1px, rgba(120, 170, 220, 0.14) 1px, transparent 1px),
+      linear-gradient(120deg, rgba(42, 242, 255, 0.08), transparent 45%),
+      linear-gradient(300deg, rgba(56, 247, 201, 0.08), transparent 50%)
     `,
-    backgroundSize: "32px 32px",
+    backgroundSize: "28px 28px, 100% 100%, 100% 100%",
     backgroundColor: COLORS.bg,
+    backgroundPosition: "0 0, 0 0, 0 0",
   },
   cyContainer: {
     width: "100%",
@@ -58,11 +62,12 @@ const styles = {
     alignItems: "center",
     gap: "8px",
     padding: "8px",
-    background: COLORS.surface,
+    background: "rgba(12, 20, 32, 0.9)",
     border: `1px solid ${COLORS.borderSubtle}`,
     borderRadius: "16px",
     boxShadow: "0 8px 32px rgba(0, 0, 0, 0.4)",
     zIndex: 10,
+    backdropFilter: "blur(12px)",
   },
   floatingButton: {
     padding: "12px",
@@ -71,7 +76,7 @@ const styles = {
     borderRadius: "12px",
     color: COLORS.textMuted,
     cursor: "pointer",
-    transition: "all 0.15s",
+    transition: "background-color 0.2s, color 0.2s, transform 0.2s",
   },
   floatingDivider: {
     width: "1px",
@@ -80,14 +85,14 @@ const styles = {
   },
   resetButton: {
     padding: "8px 16px",
-    background: COLORS.surfaceAlt,
-    border: "none",
+    background: "rgba(18, 30, 45, 0.9)",
+    border: `1px solid ${COLORS.borderSubtle}`,
     borderRadius: "12px",
     color: COLORS.textMain,
     fontSize: "12px",
     fontWeight: 600,
     cursor: "pointer",
-    transition: "all 0.15s",
+    transition: "background-color 0.2s, border-color 0.2s, color 0.2s, transform 0.2s",
   },
 };
 
@@ -139,34 +144,40 @@ export function GraphCanvas({
   if (onZoomOutRef) onZoomOutRef.current = zoomOut;
 
   return (
-    <div style={styles.container}>
+    <div className="ray-canvas" style={styles.container}>
       <div ref={containerRef} style={styles.cyContainer} />
 
       {/* Floating Action Menu */}
       <div style={styles.floatingMenu}>
         <button
+          type="button"
+          className="ray-icon-button"
           style={styles.floatingButton}
           onClick={zoomIn}
           title="Zoom In"
+          aria-label="Zoom in"
         >
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
             <circle cx="11" cy="11" r="8" />
             <line x1="11" y1="8" x2="11" y2="14" />
             <line x1="8" y1="11" x2="14" y2="11" />
           </svg>
         </button>
         <button
+          type="button"
+          className="ray-icon-button"
           style={styles.floatingButton}
           onClick={zoomOut}
           title="Zoom Out"
+          aria-label="Zoom out"
         >
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
             <circle cx="11" cy="11" r="8" />
             <line x1="8" y1="11" x2="14" y2="11" />
           </svg>
         </button>
         <div style={styles.floatingDivider} />
-        <button style={styles.resetButton} onClick={fit}>
+        <button type="button" className="ray-button" style={styles.resetButton} onClick={fit}>
           Fit View
         </button>
       </div>

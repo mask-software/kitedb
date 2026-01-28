@@ -11,11 +11,13 @@ import { COLORS, getNodeColor } from "../lib/types.ts";
 const styles = {
   sidebar: {
     width: "320px",
-    background: COLORS.bg,
+    background: "linear-gradient(180deg, rgba(9, 16, 26, 0.98), rgba(12, 20, 32, 0.92))",
     borderLeft: `1px solid ${COLORS.border}`,
     display: "flex",
     flexDirection: "column" as const,
     overflow: "hidden",
+    position: "relative" as const,
+    backdropFilter: "blur(14px)",
   },
   sidebarHeader: {
     padding: "16px",
@@ -47,13 +49,15 @@ const styles = {
     letterSpacing: "0.1em",
     color: COLORS.textMuted,
     marginBottom: "16px",
+    fontFamily: "'JetBrains Mono', monospace",
   },
   nodeCard: {
     padding: "16px",
-    background: COLORS.surface,
+    background: "rgba(14, 22, 36, 0.9)",
     borderRadius: "12px",
     border: `1px solid ${COLORS.border}`,
     marginBottom: "8px",
+    boxShadow: "0 10px 24px rgba(0, 0, 0, 0.2)",
   },
   nodeCardSelected: {
     border: `1px solid ${COLORS.accent}`,
@@ -75,17 +79,16 @@ const styles = {
     background: COLORS.accentBg,
   },
   nodeType: {
-    fontSize: "10px",
-    fontFamily: "monospace",
-    textTransform: "uppercase" as const,
-    letterSpacing: "0.05em",
-    color: COLORS.textSubtle,
+    width: "12px",
+    height: "12px",
+    borderRadius: "999px",
+    boxShadow: "0 0 10px rgba(42, 242, 255, 0.25)",
   },
   nodeTypeAccent: {
     color: COLORS.accent,
   },
   nodeLabel: {
-    fontSize: "14px",
+    fontSize: "15px",
     fontWeight: 600,
     color: COLORS.textMain,
   },
@@ -94,7 +97,7 @@ const styles = {
     color: COLORS.textMuted,
     wordBreak: "break-all" as const,
     marginTop: "4px",
-    fontFamily: "monospace",
+    fontFamily: "'JetBrains Mono', monospace",
   },
   nodeProp: {
     display: "flex",
@@ -120,12 +123,16 @@ const styles = {
     alignItems: "center",
     gap: "10px",
     padding: "10px 12px",
-    background: COLORS.surface,
+    background: "rgba(14, 22, 36, 0.9)",
     borderRadius: "8px",
     border: `1px solid ${COLORS.border}`,
     cursor: "pointer",
     fontSize: "13px",
-    transition: "all 0.15s",
+    transition: "background-color 0.2s, border-color 0.2s, color 0.2s, box-shadow 0.2s, transform 0.2s",
+    textAlign: "left" as const,
+    width: "100%",
+    color: "inherit",
+    appearance: "none" as const,
   },
   listItemDot: {
     width: "8px",
@@ -143,11 +150,15 @@ const styles = {
     alignItems: "center",
     gap: "10px",
     padding: "8px 12px",
-    background: COLORS.surface,
+    background: "rgba(14, 22, 36, 0.9)",
     borderRadius: "8px",
     border: `1px solid ${COLORS.border}`,
     fontSize: "12px",
     cursor: "pointer",
+    textAlign: "left" as const,
+    width: "100%",
+    color: "inherit",
+    appearance: "none" as const,
   },
   pathArrow: {
     color: COLORS.textSubtle,
@@ -160,6 +171,7 @@ const styles = {
     background: COLORS.accentBg,
     borderRadius: "4px",
     marginLeft: "auto",
+    fontFamily: "'JetBrains Mono', monospace",
   },
   emptyState: {
     padding: "32px 24px",
@@ -177,8 +189,8 @@ const styles = {
     width: "100%",
     padding: "12px",
     marginTop: "16px",
-    background: COLORS.accentBg,
-    border: "none",
+    background: "linear-gradient(120deg, rgba(42, 242, 255, 0.2), rgba(56, 247, 201, 0.2))",
+    border: `1px solid ${COLORS.accentBorder}`,
     borderRadius: "12px",
     color: COLORS.accent,
     fontSize: "12px",
@@ -188,7 +200,7 @@ const styles = {
     alignItems: "center",
     justifyContent: "center",
     gap: "8px",
-    transition: "background 0.15s",
+    transition: "background-color 0.2s, border-color 0.2s, color 0.2s, transform 0.2s",
   },
 };
 
@@ -257,7 +269,7 @@ export function Sidebar({
     : [];
 
   return (
-    <div style={styles.sidebar}>
+    <div className="ray-sidebar" style={styles.sidebar}>
       {/* Node Details */}
       <div style={styles.section}>
         <div style={styles.sectionTitle}>
@@ -299,7 +311,9 @@ export function Sidebar({
           </div>
           <div style={styles.list}>
             {connected.outgoing.map((node) => (
-              <div
+              <button
+                type="button"
+                className="ray-list-item"
                 key={`out-${node.id}`}
                 style={styles.listItem}
                 onClick={() => onNodeClick(node)}
@@ -314,10 +328,12 @@ export function Sidebar({
                 <span style={{ marginLeft: "auto", color: COLORS.textMuted, fontSize: "10px" }}>
                   out
                 </span>
-              </div>
+              </button>
             ))}
             {connected.incoming.map((node) => (
-              <div
+              <button
+                type="button"
+                className="ray-list-item"
                 key={`in-${node.id}`}
                 style={styles.listItem}
                 onClick={() => onNodeClick(node)}
@@ -332,7 +348,7 @@ export function Sidebar({
                 <span style={{ marginLeft: "auto", color: COLORS.textMuted, fontSize: "10px" }}>
                   in
                 </span>
-              </div>
+              </button>
             ))}
             {connected.outgoing.length === 0 && connected.incoming.length === 0 && (
               <div style={styles.emptyState}>No connections</div>
@@ -349,7 +365,9 @@ export function Sidebar({
             <div style={styles.pathList}>
               {pathNodesList.map((node, i) => (
                 <div key={node.id}>
-                  <div
+                  <button
+                    type="button"
+                    className="ray-list-item"
                     style={{
                       ...styles.pathItem,
                       background:
@@ -373,7 +391,7 @@ export function Sidebar({
                       }}
                     />
                     <span>{node.label}</span>
-                  </div>
+                  </button>
                   {i < pathNodesList.length - 1 && (
                     <div style={{ textAlign: "center", padding: "2px" }}>
                       <span style={styles.pathArrow}>↓</span>
@@ -412,7 +430,9 @@ export function Sidebar({
               </div>
               <div style={styles.list}>
                 {impactedNodesList.map((node) => (
-                  <div
+                  <button
+                    type="button"
+                    className="ray-list-item"
                     key={node.id}
                     style={styles.listItem}
                     onClick={() => onNodeClick(node)}
@@ -424,7 +444,7 @@ export function Sidebar({
                       }}
                     />
                     <span>{node.label}</span>
-                  </div>
+                  </button>
                 ))}
               </div>
             </>

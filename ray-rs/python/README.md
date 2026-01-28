@@ -132,51 +132,57 @@ key_id = db.get_or_create_propkey("name")
 ### Graph Traversal
 
 ```python
-from raydb import GraphAccessor, TraversalStep, TraverseOptions
+from raydb import TraverseOptions
 
-# Create accessor and add edges
-graph = GraphAccessor()
-graph.add_edge(1, 1, 2, 1.0)  # src, etype, dst, weight
-graph.add_edges([(1, 1, 2, 1.0), (2, 1, 3, 1.0)])
+# Assumes db, alice, bob, knows from the fluent API example
 
-# Multi-hop traversal
-results = graph.traverse(
-    [1],  # Start nodes
-    [TraversalStep("out", 1), TraversalStep("out")],
-    limit=100
+# Traverse from a node
+friends = db.from_(alice).out(knows).to_list()
+
+# Variable-depth traversal (1..3 hops)
+results = db.from_(alice).traverse(
+    knows,
+    TraverseOptions(max_depth=3, min_depth=1, direction="out", unique=True),
+).to_list()
+
+# Filter by node properties
+young = (
+    db.from_(alice)
+    .out(knows)
+    .where_node(lambda n: n.age is not None and n.age < 35)
+    .to_list()
 )
 
-# Variable-depth traversal
-results = graph.traverse_depth(
-    [1],
-    edge_type=1,
-    options=TraverseOptions(max_depth=3, direction="out")
+# Filter by edge properties
+recent = (
+    db.from_(alice)
+    .out(knows)
+    .where_edge(lambda e: e.props.get("since", 0) >= 2020)
+    .to_list()
 )
+
+# Edge results
+edges = db.from_(alice).out(knows).edges().to_list()
 ```
 
 ### Pathfinding
 
 ```python
-from raydb import PathConfig
-
-# Shortest path
-path = graph.shortest_path(source=1, target=5)
+# Shortest path (BFS)
+path = db.shortest_path(alice).to(bob).bfs()
 if path.found:
-    print(f"Path: {path.path}")
-    print(f"Weight: {path.total_weight}")
+    print([n.key for n in path.nodes])
 
-# BFS (unweighted)
-path = graph.bfs(PathConfig(source=1, target=5))
+# Weighted shortest path (Dijkstra)
+path = db.shortest_path(alice).via(knows).weight("since").to(bob).dijkstra()
 
-# Dijkstra (weighted)
-path = graph.dijkstra(PathConfig(source=1, target=5))
+# A* pathfinding
+path = db.shortest_path(alice).via(knows).to(bob).a_star(
+    lambda n, goal: abs(n.id - goal.id)
+)
 
-# K-shortest paths
-paths = graph.k_shortest(PathConfig(source=1, target=5), k=3)
-
-# Reachability
-nodes = graph.reachable_nodes(source=1, max_depth=3)
-can_reach = graph.has_path(source=1, target=5)
+# Path existence
+exists = db.shortest_path(alice).to(bob).exists()
 ```
 
 ### Vector Search

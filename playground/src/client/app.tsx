@@ -20,10 +20,11 @@ const styles = {
     flexDirection: "column" as const,
     width: "100%",
     height: "100%",
-    background: COLORS.bg,
+    background: "transparent",
     color: COLORS.textMain,
-    fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
+    fontFamily: "'Space Grotesk', 'Trebuchet MS', sans-serif",
     overflow: "hidden",
+    position: "relative" as const,
   },
   main: {
     display: "flex",
@@ -242,7 +243,7 @@ export function App() {
     : new Set<string>();
 
   return (
-    <div style={styles.app}>
+    <div className="ray-app" style={styles.app}>
       <Header
         connected={connected}
         dbPath={dbPath}
@@ -258,7 +259,7 @@ export function App() {
         onCloseDatabase={handleCloseDatabase}
       />
 
-      <div style={styles.main}>
+      <div className="ray-main" style={styles.main}>
         <Toolbar
           toolMode={toolMode}
           onToolModeChange={handleToolModeChange}

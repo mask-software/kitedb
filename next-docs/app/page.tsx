@@ -10,10 +10,8 @@ import {
   Network,
   Rocket,
   Search,
-  Shield,
   Sparkles,
   Terminal,
-  Zap,
 } from "lucide-react";
 import Header from "../components/Header";
 import Logo from "../components/Logo";
@@ -116,84 +114,152 @@ await db.update(Document)
 
   return (
     <div className="min-h-screen bg-[#05070d] speed-page">
-      <a
-        href="#main-content"
-        className="sr-only focus:not-sr-only focus:absolute focus:top-4 focus:left-4 focus:z-50 focus:px-4 focus:py-2 focus:bg-[#00d4ff] focus:text-black focus:rounded-lg focus:font-semibold"
-      >
-        Skip to main content
-      </a>
 
       <Header />
 
       <main id="main-content">
-        <section className="relative pt-24 pb-32 sm:pt-32 sm:pb-40 overflow-hidden" aria-labelledby="hero-heading">
-          <div className="absolute inset-0 -z-10 overflow-hidden" aria-hidden="true">
-            <div className="hero-glow w-[800px] h-[800px] -top-[400px] left-1/2 -translate-x-1/2 animate-glow-pulse" />
-            <div className="hero-glow w-[600px] h-[600px] top-[100px] -left-[200px] animate-glow-pulse animate-delay-200" />
-            <div className="hero-glow w-[500px] h-[500px] top-[200px] -right-[100px] animate-glow-pulse animate-delay-400" />
-            <div className="speed-grid" />
-            <div className="speed-lines" />
-            <div className="speed-sheen" />
-          </div>
+        <section className="relative pb-28 sm:pb-36 overflow-hidden speed-hero" aria-labelledby="hero-heading">
 
           <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-            <div className="text-center">
-              <h1
-                id="hero-heading"
-                className="text-5xl sm:text-6xl md:text-7xl lg:text-8xl font-black tracking-tight text-balance animate-slide-up"
-              >
-                <span className="block text-white">The Graph Database</span>
-                <span className="block mt-2 speed-text neon-glow-subtle">Built for Speed</span>
-              </h1>
-
-              <p className="mt-8 max-w-2xl mx-auto text-lg sm:text-xl text-slate-400 text-pretty leading-relaxed animate-slide-up animate-delay-100">
-                A high-performance embedded graph database with vector search. Rust core with bindings for TypeScript,
-                Python, and more.
-              </p>
-
-              <div className="mt-12 flex flex-col sm:flex-row items-center justify-center gap-4 animate-slide-up animate-delay-200">
-                <Link
-                  href="/docs/getting-started/installation"
-                  className="group inline-flex items-center gap-2 px-8 py-4 text-base font-semibold text-black bg-[#2af2ff] rounded-xl shadow-[0_0_30px_rgba(42,242,255,0.4)] hover:shadow-[0_0_50px_rgba(42,242,255,0.6)] hover:scale-[1.02] active:scale-[0.98] transition-[box-shadow,transform] duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white focus-visible:ring-offset-2 focus-visible:ring-offset-[#05070d] speed-cta"
+            <div className="grid gap-12 lg:grid-cols-[1.1fr,0.9fr] items-center">
+              <div className="text-left">
+                <div className="speed-badge animate-slide-up">Embedded Graph + Vector Engine</div>
+                <h1
+                  id="hero-heading"
+                  className="mt-6 text-5xl sm:text-6xl md:text-7xl font-black tracking-tight text-balance animate-slide-up animate-delay-100"
                 >
-                  Get Started
-                  <ArrowRight size={18} className="group-hover:translate-x-0.5 transition-transform duration-150" aria-hidden="true" />
-                </Link>
-                <a
-                  href="https://github.com/maskdotdev/ray"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="inline-flex items-center gap-2 px-8 py-4 text-base font-semibold text-white bg-white/5 border border-white/10 rounded-xl hover:bg-white/10 hover:border-white/20 active:scale-[0.98] transition-[background-color,border-color,transform] duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#2af2ff] focus-visible:ring-offset-2 focus-visible:ring-offset-[#05070d]"
-                >
-                  <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24" aria-hidden="true">
-                    <path
-                      fillRule="evenodd"
-                      d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z"
-                      clipRule="evenodd"
-                    />
-                  </svg>
-                  View on GitHub
-                </a>
+                  <span className="block text-white">Instant Graph + Vector Search</span>
+                  <span className="block mt-3 speed-text neon-glow-subtle">Nanosecond Latency by Design</span>
+                </h1>
+
+                <p className="mt-8 max-w-xl text-lg sm:text-xl text-slate-400 text-pretty leading-relaxed animate-slide-up animate-delay-200">
+                  RayDB is an embedded graph database with vector search, built in Rust for fast, local, predictable
+                  performance in every app.
+                </p>
+
+                <div className="mt-10 flex flex-wrap items-center gap-4 animate-slide-up animate-delay-300">
+                  <Link
+                    href="/docs/getting-started/installation"
+                    className="group inline-flex items-center gap-2 px-8 py-4 text-base font-semibold text-black bg-[#2af2ff] rounded-xl shadow-[0_0_30px_rgba(42,242,255,0.4)] hover:shadow-[0_0_50px_rgba(42,242,255,0.6)] hover:scale-[1.02] active:scale-[0.98] transition-[box-shadow,transform] duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white focus-visible:ring-offset-2 focus-visible:ring-offset-[#05070d] speed-cta"
+                  >
+                    Get Started
+                    <ArrowRight size={18} className="group-hover:translate-x-0.5 transition-transform duration-150" aria-hidden="true" />
+                  </Link>
+                  <a
+                    href="https://github.com/maskdotdev/ray"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-2 px-8 py-4 text-base font-semibold text-white bg-white/5 border border-white/10 rounded-xl hover:bg-white/10 hover:border-white/20 active:scale-[0.98] transition-[background-color,border-color,transform] duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#2af2ff] focus-visible:ring-offset-2 focus-visible:ring-offset-[#05070d]"
+                  >
+                    <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                      <path
+                        fillRule="evenodd"
+                        d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z"
+                        clipRule="evenodd"
+                      />
+                    </svg>
+                    View on GitHub
+                  </a>
+                </div>
+
+                <div className="mt-6 flex flex-wrap gap-2 animate-slide-up animate-delay-400">
+                  <span className="speed-chip">125ns lookups</span>
+                  <span className="speed-chip">1.1us traversals</span>
+                  <span className="speed-chip">Zero dependencies</span>
+                  <span className="speed-chip">Rust core</span>
+                </div>
+
+                <div className="mt-10 animate-slide-up animate-delay-500">
+                  <InstallCommand command="bun add @ray-db/ray" />
+                </div>
               </div>
 
-              <div className="mt-12 flex justify-center animate-slide-up animate-delay-300">
-                <InstallCommand command="bun add @ray-db/ray" />
+              <div className="relative">
+                <div className="speed-panel p-8 sm:p-10 animate-slide-up animate-delay-200">
+                  <div className="relative z-10 flex items-center justify-between">
+                    <div>
+                      <p className="text-xs font-semibold tracking-[0.35em] text-slate-500 uppercase">Performance Console</p>
+                      <h2 className="mt-3 text-2xl font-semibold text-white text-balance">Nanosecond Graph Paths</h2>
+                    </div>
+                    <span className="speed-signal">Live</span>
+                  </div>
+
+                  <div className="relative z-10 mt-8 grid grid-cols-2 gap-4">
+                    <div className="speed-metric">
+                      <div className="text-2xl font-semibold text-white tabular-nums">125ns</div>
+                      <div className="mt-1 text-xs text-slate-400 uppercase tracking-[0.2em]">Node lookup</div>
+                    </div>
+                    <div className="speed-metric">
+                      <div className="text-2xl font-semibold text-white tabular-nums">1.1us</div>
+                      <div className="mt-1 text-xs text-slate-400 uppercase tracking-[0.2em]">1 hop traverse</div>
+                    </div>
+                    <div className="speed-metric">
+                      <div className="text-2xl font-semibold text-white tabular-nums">0</div>
+                      <div className="mt-1 text-xs text-slate-400 uppercase tracking-[0.2em]">Network hops</div>
+                    </div>
+                    <div className="speed-metric">
+                      <div className="text-2xl font-semibold text-white tabular-nums">118x</div>
+                      <div className="mt-1 text-xs text-slate-400 uppercase tracking-[0.2em]">Memgraph speedup</div>
+                    </div>
+                  </div>
+
+                  <div className="relative z-10 mt-6 speed-meter" aria-hidden="true" />
+
+                  <p className="relative z-10 mt-4 text-xs text-slate-500">
+                    Runs inside your process with memory-mapped storage and zero copy reads.
+                  </p>
+
+                  <div className="relative z-10 mt-6 grid gap-3 text-sm">
+                    <div className="flex items-center justify-between text-slate-400">
+                      <span>Cold start</span>
+                      <span className="text-white tabular-nums">4ms</span>
+                    </div>
+                    <div className="flex items-center justify-between text-slate-400">
+                      <span>Vector recall</span>
+                      <span className="text-white tabular-nums">0.98</span>
+                    </div>
+                    <div className="flex items-center justify-between text-slate-400">
+                      <span>Disk footprint</span>
+                      <span className="text-white tabular-nums">single file</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="hidden lg:block absolute -bottom-8 right-8">
+                  <div className="speed-ghost-card p-5">
+                    <div className="text-xs uppercase tracking-[0.3em] text-slate-500">Edge Ready</div>
+                    <div className="mt-2 text-white font-semibold">Single file. Zero services.</div>
+                    <p className="mt-2 text-sm text-slate-400">Ship a full graph + vector stack with your app.</p>
+                  </div>
+                </div>
               </div>
             </div>
           </div>
         </section>
 
         <section className="py-20 border-y border-[#1a2a42]/60 bg-[#0b1220]/55" aria-labelledby="stats-heading">
-          <h2 id="stats-heading" className="sr-only">
-            Performance Statistics
-          </h2>
-          <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8">
+          <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div className="flex flex-col lg:flex-row lg:items-end lg:justify-between gap-6 mb-12">
+              <div>
+                <h2 id="stats-heading" className="text-3xl sm:text-4xl font-bold text-white text-balance">
+                  Performance Snapshot
+                </h2>
+                <p className="mt-4 text-lg text-slate-400 max-w-xl text-pretty">
+                  The speed profile stays consistent because everything runs local with zero-copy reads.
+                </p>
+              </div>
+              <Link href="/docs/benchmarks" className="inline-flex items-center gap-2 text-[#00d4ff] hover:text-white transition-colors font-medium">
+                View benchmarks
+                <ArrowRight size={16} aria-hidden="true" />
+              </Link>
+            </div>
+
             <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 md:gap-6">
               <div className="lg:-translate-y-4">
-                <StatCard value="~125ns" label="Node Lookup" />
+                <StatCard value="125ns" label="Node Lookup" />
               </div>
               <div className="lg:translate-y-4">
-                <StatCard value="~1.1us" label="1-Hop Traversal" />
+                <StatCard value="1.1us" label="1-Hop Traversal" />
               </div>
               <div className="lg:-translate-y-4">
                 <StatCard value="Zero" label="Dependencies" />
@@ -207,101 +273,74 @@ await db.update(Document)
 
         <section className="py-28" aria-labelledby="features-heading">
           <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-            <div className="text-center mb-16">
-              <h2 id="features-heading" className="text-3xl sm:text-4xl font-bold text-white text-balance">
-                Built for Modern AI Applications
-              </h2>
-              <p className="mt-4 text-lg text-slate-400 max-w-2xl mx-auto text-pretty">
-                A clear, three-step stack: model your data, query it fast, and ship everywhere.
-              </p>
-            </div>
+            <div className="grid lg:grid-cols-[0.95fr,1.05fr] gap-12 items-start">
+              <div>
+                <h2 id="features-heading" className="text-3xl sm:text-4xl font-bold text-white text-balance">
+                  Fast by Design, End to End
+                </h2>
+                <p className="mt-4 text-lg text-slate-400 text-pretty">
+                  Model, traverse, and ship without latency spikes. Every layer is tuned for speed.
+                </p>
 
-            <div className="space-y-12">
-              <article className="grid lg:grid-cols-12 gap-8 lg:gap-12 items-start">
-                <div className="lg:col-span-4">
-                  <div className="flex items-center gap-3 mb-4">
-                    <span className="text-xs font-semibold tracking-[0.3em] text-[#2af2ff] font-mono">01</span>
-                    <div className="w-10 h-10 icon-tile rounded-lg bg-[#2af2ff]/10 text-[#2af2ff]">
-                      <Database className="w-5 h-5" aria-hidden="true" />
+                <div className="mt-10 space-y-6">
+                  <div className="flex items-start gap-4">
+                    <div className="w-11 h-11 rounded-full bg-[#2af2ff]/10 text-[#2af2ff] font-mono text-xs tracking-[0.3em] flex items-center justify-center">
+                      01
                     </div>
-                    <h3 className="text-2xl font-bold text-white">Unified Data Model</h3>
-                  </div>
-                  <p className="text-slate-400 leading-relaxed">
-                    Combine graph relationships and vector similarity in one coherent API - no glue code, no extra
-                    services.
-                  </p>
-                </div>
-                <div className="lg:col-span-8 grid sm:grid-cols-2 gap-4">
-                  <Card
-                    title="Graph + Vector"
-                    description="Traverse relationships and run similarity search in the same query chain."
-                    icon={<Database className="w-5 h-5" aria-hidden="true" />}
-                  />
-                  <Card
-                    title="HNSW Vector Index"
-                    description="Log-time nearest neighbor search with high recall at scale."
-                    icon={<Search className="w-5 h-5" aria-hidden="true" />}
-                  />
-                </div>
-              </article>
-
-              <div className="h-px w-full bg-gradient-to-r from-transparent via-[#1a2a42] to-transparent" />
-
-              <article className="grid lg:grid-cols-12 gap-8 lg:gap-12 items-start">
-                <div className="lg:col-span-4">
-                  <div className="flex items-center gap-3 mb-4">
-                    <span className="text-xs font-semibold tracking-[0.3em] text-[#2af2ff] font-mono">02</span>
-                    <div className="w-10 h-10 icon-tile rounded-lg bg-[#2af2ff]/10 text-[#2af2ff]">
-                      <Zap className="w-5 h-5" aria-hidden="true" />
+                    <div>
+                      <h3 className="text-xl font-semibold text-white">Unified Data Model</h3>
+                      <p className="mt-2 text-slate-400 leading-relaxed">
+                        Graph relationships and vector similarity live in one coherent API.
+                      </p>
                     </div>
-                    <h3 className="text-2xl font-bold text-white">Blazing Performance</h3>
                   </div>
-                  <p className="text-slate-400 leading-relaxed">
-                    Memory-mapped storage + zero-copy reads keep latency ultra-low without external processes.
-                  </p>
-                </div>
-                <div className="lg:col-span-8 grid sm:grid-cols-2 gap-4">
-                  <Card
-                    title="Blazing Fast"
-                    description="~125ns node lookups, ~1.1us traversals. 118x faster than Memgraph."
-                    icon={<Zap className="w-5 h-5" aria-hidden="true" />}
-                  />
-                  <Card
-                    title="Zero Dependencies"
-                    description="Single-file storage that is easy to back up, sync, and deploy."
-                    icon={<Sparkles className="w-5 h-5" aria-hidden="true" />}
-                  />
-                </div>
-              </article>
-
-              <div className="h-px w-full bg-gradient-to-r from-transparent via-[#1a2a42] to-transparent" />
-
-              <article className="grid lg:grid-cols-12 gap-8 lg:gap-12 items-start">
-                <div className="lg:col-span-4">
-                  <div className="flex items-center gap-3 mb-4">
-                    <span className="text-xs font-semibold tracking-[0.3em] text-[#2af2ff] font-mono">03</span>
-                    <div className="w-10 h-10 icon-tile rounded-lg bg-[#2af2ff]/10 text-[#2af2ff]">
-                      <Shield className="w-5 h-5" aria-hidden="true" />
+                  <div className="flex items-start gap-4">
+                    <div className="w-11 h-11 rounded-full bg-[#2af2ff]/10 text-[#2af2ff] font-mono text-xs tracking-[0.3em] flex items-center justify-center">
+                      02
                     </div>
-                    <h3 className="text-2xl font-bold text-white">Developer Experience</h3>
+                    <div>
+                      <h3 className="text-xl font-semibold text-white">Zero Copy Performance</h3>
+                      <p className="mt-2 text-slate-400 leading-relaxed">
+                        Memory-mapped storage keeps reads hot without external processes.
+                      </p>
+                    </div>
                   </div>
-                  <p className="text-slate-400 leading-relaxed">
-                    Rust core with idiomatic bindings, MVCC transactions, and type-safe schemas across languages.
-                  </p>
+                  <div className="flex items-start gap-4">
+                    <div className="w-11 h-11 rounded-full bg-[#2af2ff]/10 text-[#2af2ff] font-mono text-xs tracking-[0.3em] flex items-center justify-center">
+                      03
+                    </div>
+                    <div>
+                      <h3 className="text-xl font-semibold text-white">Developer Friendly</h3>
+                      <p className="mt-2 text-slate-400 leading-relaxed">
+                        Type-safe schemas and bindings for TypeScript, Python, and more.
+                      </p>
+                    </div>
+                  </div>
                 </div>
-                <div className="lg:col-span-8 grid sm:grid-cols-2 gap-4">
-                  <Card
-                    title="Multi-Language"
-                    description="First-class bindings for TypeScript, Python, and more."
-                    icon={<Shield className="w-5 h-5" aria-hidden="true" />}
-                  />
-                  <Card
-                    title="MVCC Transactions"
-                    description="Snapshot isolation with non-blocking readers by default."
-                    icon={<GitBranch className="w-5 h-5" aria-hidden="true" />}
-                  />
-                </div>
-              </article>
+              </div>
+
+              <div className="grid sm:grid-cols-2 gap-4">
+                <Card
+                  title="Graph + Vector"
+                  description="Traverse relationships and run similarity search in the same query chain."
+                  icon={<Database className="w-5 h-5" aria-hidden="true" />}
+                />
+                <Card
+                  title="HNSW Vector Index"
+                  description="Log-time nearest neighbor search with high recall at scale."
+                  icon={<Search className="w-5 h-5" aria-hidden="true" />}
+                />
+                <Card
+                  title="Zero Dependencies"
+                  description="Single-file storage that is easy to back up, sync, and deploy."
+                  icon={<Sparkles className="w-5 h-5" aria-hidden="true" />}
+                />
+                <Card
+                  title="MVCC Transactions"
+                  description="Snapshot isolation with non-blocking readers by default."
+                  icon={<GitBranch className="w-5 h-5" aria-hidden="true" />}
+                />
+              </div>
             </div>
           </div>
         </section>

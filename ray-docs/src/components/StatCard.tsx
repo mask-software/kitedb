@@ -3,16 +3,23 @@ import type { Component, JSX } from 'solid-js'
 interface StatCardProps {
   value: string
   label: string
+  unit?: string
 }
 
 export const StatCard: Component<StatCardProps> = (props) => {
   return (
-    <article class="group text-center p-8 rounded-2xl bg-[#0a1628]/80 border border-[#1e3a5f] hover:border-[#00d4ff]/30 hover:shadow-[0_0_30px_rgba(0,212,255,0.1)] transition-all duration-300">
-      <div class="text-4xl md:text-5xl font-black text-gradient tabular-nums leading-none">
-        {props.value}
-      </div>
-      <div class="mt-3 text-sm font-medium text-slate-400">
-        {props.label}
+    <article class="group console-container p-5 text-center hover:border-[#00d4ff]/40 transition-all duration-200">
+      <div class="console-scanlines opacity-5" aria-hidden="true" />
+      <div class="relative">
+        <div class="terminal-stat-label mb-2 font-mono text-xs uppercase tracking-wider text-slate-500">
+          {props.label.replace(/\s+/g, '_')}
+        </div>
+        <div class="terminal-stat-value text-3xl md:text-4xl font-mono font-bold tabular-nums text-[#00d4ff] flex items-baseline justify-center gap-1">
+          {props.value}
+          {props.unit && (
+            <span class="text-sm text-slate-500">{props.unit}</span>
+          )}
+        </div>
       </div>
     </article>
   )
@@ -24,7 +31,7 @@ interface StatGridProps {
 
 export const StatGrid: Component<StatGridProps> = (props) => {
   return (
-    <div class="grid grid-cols-2 md:grid-cols-4 gap-4 md:gap-6" role="list" aria-label="Performance statistics">
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-3" role="list" aria-label="Performance statistics">
       {props.children}
     </div>
   )

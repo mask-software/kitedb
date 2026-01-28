@@ -1,7 +1,7 @@
 import type { Component, JSX } from 'solid-js'
 import { Show } from 'solid-js'
 
-import { ArrowLeft, ArrowRight, Pencil } from 'lucide-solid'
+import { ArrowLeft, ArrowRight, Pencil, Terminal } from 'lucide-solid'
 import { findDocBySlug, getNextDoc, getPrevDoc } from '~/lib/docs'
 
 interface DocPageProps {
@@ -16,55 +16,77 @@ export const DocPage: Component<DocPageProps> = (props) => {
 
   return (
     <article class="max-w-4xl mx-auto px-6 py-12">
-      {/* Page header */}
+      {/* Page header - console style */}
       <header class="mb-10">
-        <h1 class="text-3xl md:text-4xl font-extrabold text-slate-900 dark:text-white tracking-tight text-balance">
-          {doc()?.title ?? 'Documentation'}
-        </h1>
-        <Show when={doc()?.description}>
-          <p class="mt-4 text-lg text-slate-600 dark:text-slate-400 text-pretty">
-            {doc()?.description}
-          </p>
-        </Show>
+        {/* Breadcrumb path */}
+        <div class="flex items-center gap-2 text-xs font-mono text-slate-500 mb-4">
+          <span class="text-[#00d4ff]">~</span>
+          <span>/docs/</span>
+          <span class="text-[#00d4ff]">{props.slug || 'index'}</span>
+        </div>
+
+        {/* Console container for title */}
+        <div class="console-container p-6 mb-6">
+          <div class="console-scanlines opacity-10" aria-hidden="true" />
+          <div class="relative">
+            <div class="flex items-center gap-3 mb-4">
+              <Terminal size={20} class="text-[#00d4ff]" aria-hidden="true" />
+              <span class="font-mono text-xs text-slate-500 uppercase tracking-wider">
+                DOCUMENTATION
+              </span>
+            </div>
+            <h1 class="text-2xl md:text-3xl font-mono font-bold text-white tracking-tight">
+              {doc()?.title ?? 'Documentation'}
+            </h1>
+            <Show when={doc()?.description}>
+              <p class="mt-3 text-slate-400 font-mono text-sm leading-relaxed">
+                {doc()?.description}
+              </p>
+            </Show>
+          </div>
+        </div>
       </header>
 
       {/* Content */}
-      <div class="prose max-w-none">
+      <div class="prose prose-console max-w-none">
         {props.children}
       </div>
 
       {/* Edit link */}
-      <div class="mt-12 pt-6 border-t border-slate-200 dark:border-slate-800">
+      <div class="mt-12 pt-6 border-t border-[#1a2a42]">
         <a
           href={`https://github.com/maskdotdev/ray/edit/main/docs-site/src/content/docs/${props.slug || 'index'}.md`}
           target="_blank"
           rel="noopener noreferrer"
-          class="inline-flex items-center gap-2 text-sm text-slate-500 hover:text-slate-700 dark:hover:text-slate-300 transition-colors duration-150"
+          class="inline-flex items-center gap-2 text-sm font-mono text-slate-500 hover:text-[#00d4ff] transition-colors duration-150"
         >
           <Pencil size={14} aria-hidden="true" />
-          Edit this page on GitHub
+          ./edit --remote
         </a>
       </div>
 
-      {/* Prev/Next navigation */}
+      {/* Prev/Next navigation - console style */}
       <nav class="mt-8 flex items-stretch gap-4" aria-label="Documentation pages">
         <Show when={prevDoc()}>
           {(prev) => (
             <a
               href={`/docs/${prev().slug}`}
-              class="group flex-1 flex flex-col items-start p-4 rounded-xl border border-slate-200 dark:border-slate-800 hover:border-cyan-500/50 hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-all duration-150"
+              class="group flex-1 console-container p-4 hover:border-[#00d4ff]/50 transition-colors"
             >
-              <span class="flex items-center gap-1 text-xs font-medium text-slate-500 mb-1">
-                <ArrowLeft size={12} class="group-hover:-translate-x-0.5 transition-transform duration-150" aria-hidden="true" />
-                Previous
-              </span>
-              <span class="font-medium text-slate-900 dark:text-white group-hover:text-cyan-600 dark:group-hover:text-cyan-400 transition-colors duration-150">
-                {prev().title}
-              </span>
+              <div class="console-scanlines opacity-5" aria-hidden="true" />
+              <div class="relative">
+                <span class="flex items-center gap-1 text-xs font-mono text-slate-500 mb-2">
+                  <ArrowLeft size={12} class="group-hover:-translate-x-0.5 transition-transform duration-150" aria-hidden="true" />
+                  cd ..
+                </span>
+                <span class="font-mono text-sm text-white group-hover:text-[#00d4ff] transition-colors duration-150">
+                  {prev().title}
+                </span>
+              </div>
             </a>
           )}
         </Show>
-        
+
         <Show when={!prevDoc()}>
           <div class="flex-1" />
         </Show>
@@ -73,15 +95,18 @@ export const DocPage: Component<DocPageProps> = (props) => {
           {(next) => (
             <a
               href={`/docs/${next().slug}`}
-              class="group flex-1 flex flex-col items-end p-4 rounded-xl border border-slate-200 dark:border-slate-800 hover:border-cyan-500/50 hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-all duration-150"
+              class="group flex-1 console-container p-4 hover:border-[#00d4ff]/50 transition-colors text-right"
             >
-              <span class="flex items-center gap-1 text-xs font-medium text-slate-500 mb-1">
-                Next
-                <ArrowRight size={12} class="group-hover:translate-x-0.5 transition-transform duration-150" aria-hidden="true" />
-              </span>
-              <span class="font-medium text-slate-900 dark:text-white group-hover:text-cyan-600 dark:group-hover:text-cyan-400 transition-colors duration-150">
-                {next().title}
-              </span>
+              <div class="console-scanlines opacity-5" aria-hidden="true" />
+              <div class="relative">
+                <span class="flex items-center justify-end gap-1 text-xs font-mono text-slate-500 mb-2">
+                  cd ./next
+                  <ArrowRight size={12} class="group-hover:translate-x-0.5 transition-transform duration-150" aria-hidden="true" />
+                </span>
+                <span class="font-mono text-sm text-white group-hover:text-[#00d4ff] transition-colors duration-150">
+                  {next().title}
+                </span>
+              </div>
             </a>
           )}
         </Show>

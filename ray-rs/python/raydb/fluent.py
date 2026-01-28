@@ -51,6 +51,7 @@ Example:
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import (
     Any,
     Callable,
@@ -79,11 +80,20 @@ from .builders import (
     from_prop_value,
 )
 from .schema import EdgeDef, NodeDef, PropsSchema
-from .traversal import PathFindingBuilder, TraversalBuilder
+from .traversal import PathFindingBuilder, TraversalBuilder, WeightSpec
 
 
 N = TypeVar("N", bound=NodeDef)
 E = TypeVar("E", bound=EdgeDef)
+
+
+@dataclass
+class EdgeData:
+    """Edge data with source/destination refs and properties."""
+    src: NodeRef[Any]
+    dst: NodeRef[Any]
+    edge: Any
+    props: Dict[str, Any]
 
 
 class Ray:
@@ -547,7 +557,11 @@ class Ray:
             get_node_def=self._get_node_def,
         )
     
-    def shortest_path(self, source: NodeRef[Any]) -> PathFindingBuilder[Any]:
+    def shortest_path(
+        self,
+        source: NodeRef[Any],
+        weight: Optional[WeightSpec] = None,
+    ) -> PathFindingBuilder[Any]:
         """
         Start a pathfinding query from a node.
         
@@ -563,13 +577,16 @@ class Ray:
             ...     for node in path.nodes:
             ...         print(node.key)
         """
-        return PathFindingBuilder(
+        builder = PathFindingBuilder(
             db=self._db,
             source=source,
             resolve_etype_id=self._resolve_etype_id,
             resolve_prop_key_id=self._resolve_prop_key_id,
             get_node_def=self._get_node_def,
         )
+        if weight is not None:
+            builder.weight(weight)
+        return builder
     
     # ==========================================================================
     # Listing and Counting
@@ -640,6 +657,41 @@ class Ray:
         
         etype_id = self._resolve_etype_id(edge_def)
         return self._db.count_edges_by_type(etype_id)
+
+    def all_edges(self, edge_def: Optional[EdgeDef] = None) -> Iterator[EdgeData]:
+        """
+        Iterate all edges, optionally filtered by type.
+
+        Yields:
+            EdgeData objects with src/dst refs and edge properties
+        """
+        etype_id: Optional[int] = None
+        if edge_def is not None:
+            etype_id = self._resolve_etype_id(edge_def)
+
+        edges = self._db.list_edges(etype_id)
+        for edge in edges:
+            src_def = self._get_node_def(edge.src)
+            dst_def = self._get_node_def(edge.dst)
+
+            src_key = self._db.get_node_key(edge.src) or f"node:{edge.src}"
+            dst_key = self._db.get_node_key(edge.dst) or f"node:{edge.dst}"
+
+            if src_def is None or dst_def is None:
+                continue
+
+            src_ref = NodeRef(id=edge.src, key=src_key, node_def=src_def, props={})
+            dst_ref = NodeRef(id=edge.dst, key=dst_key, node_def=dst_def, props={})
+
+            props: Dict[str, Any] = {}
+            if edge_def is not None and edge_def.props:
+                for prop_name in edge_def.props.keys():
+                    prop_key_id = self._resolve_prop_key_id(edge_def, prop_name)
+                    prop_value = self._db.get_edge_prop(edge.src, edge.etype, edge.dst, prop_key_id)
+                    if prop_value is not None:
+                        props[prop_name] = from_prop_value(prop_value)
+
+            yield EdgeData(src=src_ref, dst=dst_ref, edge=edge, props=props)
     
     # ==========================================================================
     # Database Operations
@@ -665,6 +717,30 @@ class Ray:
     # ==========================================================================
     # Transaction Batching
     # ==========================================================================
+
+    def batch(self, operations: List[Any]) -> List[Any]:
+        """
+        Execute multiple operations in a single transaction.
+
+        Each item can be a callable or an executor with .execute()/.returning().
+        """
+        self._db.begin()
+        try:
+            results: List[Any] = []
+            for op in operations:
+                if callable(op):
+                    results.append(op())
+                elif hasattr(op, "returning"):
+                    results.append(op.returning())
+                elif hasattr(op, "execute"):
+                    results.append(op.execute())
+                else:
+                    raise ValueError("Unsupported batch operation")
+            self._db.commit()
+            return results
+        except Exception:
+            self._db.rollback()
+            raise
     
     @contextmanager
     def transaction(self) -> Generator[Ray, None, None]:
@@ -760,4 +836,5 @@ def ray(
 __all__ = [
     "Ray",
     "ray",
+    "EdgeData",
 ]

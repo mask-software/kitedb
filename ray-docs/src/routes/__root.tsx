@@ -42,7 +42,7 @@ export const Route = createRootRouteWithContext()({
         content:
           "RayDB - High-performance embedded graph database with vector search for Bun/TypeScript",
       },
-      { name: "theme-color", content: "#00d4ff" },
+      { name: "theme-color", content: "#05070d" },
     ],
     links: [
       { rel: "icon", type: "image/svg+xml", href: "/favicon.svg" },
@@ -67,7 +67,7 @@ function RootComponent() {
         <link rel="stylesheet" href={stylesHref} />
         <HydrationScript />
       </head>
-      <body class="min-h-screen bg-[#030712] text-white antialiased">
+      <body class="min-h-screen bg-[#05070d] text-white antialiased">
         <HeadContent />
         <Suspense
           fallback={

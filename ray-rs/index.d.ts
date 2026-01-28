@@ -127,6 +127,103 @@ export declare class Database {
   nodeHasLabel(nodeId: number, labelId: number): boolean
   /** Get all labels for a node */
   getNodeLabels(nodeId: number): Array<number>
+  /**
+   * Execute a single-hop traversal from start nodes
+   *
+   * @param startNodes - Array of starting node IDs
+   * @param direction - Traversal direction
+   * @param edgeType - Optional edge type filter
+   * @returns Array of traversal results
+   */
+  traverseSingle(startNodes: Array<number>, direction: JsTraversalDirection, edgeType?: number | undefined | null): Array<JsTraversalResult>
+  /**
+   * Execute a multi-hop traversal
+   *
+   * @param startNodes - Array of starting node IDs
+   * @param steps - Array of traversal steps (direction, edgeType)
+   * @param limit - Maximum number of results
+   * @returns Array of traversal results
+   */
+  traverse(startNodes: Array<number>, steps: Array<JsTraversalStep>, limit?: number | undefined | null): Array<JsTraversalResult>
+  /**
+   * Execute a variable-depth traversal
+   *
+   * @param startNodes - Array of starting node IDs
+   * @param edgeType - Optional edge type filter
+   * @param options - Traversal options (maxDepth, minDepth, direction, unique)
+   * @returns Array of traversal results
+   */
+  traverseDepth(startNodes: Array<number>, edgeType: number | undefined | null, options: JsTraverseOptions): Array<JsTraversalResult>
+  /**
+   * Count traversal results without materializing them
+   *
+   * @param startNodes - Array of starting node IDs
+   * @param steps - Array of traversal steps
+   * @returns Number of results
+   */
+  traverseCount(startNodes: Array<number>, steps: Array<JsTraversalStep>): number
+  /**
+   * Get just the node IDs from a traversal
+   *
+   * @param startNodes - Array of starting node IDs
+   * @param steps - Array of traversal steps
+   * @param limit - Maximum number of results
+   * @returns Array of node IDs
+   */
+  traverseNodeIds(startNodes: Array<number>, steps: Array<JsTraversalStep>, limit?: number | undefined | null): Array<number>
+  /**
+   * Find shortest path using Dijkstra's algorithm
+   *
+   * @param config - Pathfinding configuration
+   * @returns Path result with nodes, edges, and weight
+   */
+  dijkstra(config: JsPathConfig): JsPathResult
+  /**
+   * Find shortest path using BFS (unweighted)
+   *
+   * Faster than Dijkstra for unweighted graphs.
+   *
+   * @param config - Pathfinding configuration
+   * @returns Path result with nodes, edges, and weight
+   */
+  bfs(config: JsPathConfig): JsPathResult
+  /**
+   * Find k shortest paths using Yen's algorithm
+   *
+   * @param config - Pathfinding configuration
+   * @param k - Maximum number of paths to find
+   * @returns Array of path results sorted by weight
+   */
+  kShortest(config: JsPathConfig, k: number): Array<JsPathResult>
+  /**
+   * Find shortest path between two nodes (convenience method)
+   *
+   * @param source - Source node ID
+   * @param target - Target node ID
+   * @param edgeType - Optional edge type filter
+   * @param maxDepth - Maximum search depth
+   * @returns Path result
+   */
+  shortestPath(source: number, target: number, edgeType?: number | undefined | null, maxDepth?: number | undefined | null): JsPathResult
+  /**
+   * Check if a path exists between two nodes
+   *
+   * @param source - Source node ID
+   * @param target - Target node ID
+   * @param edgeType - Optional edge type filter
+   * @param maxDepth - Maximum search depth
+   * @returns true if path exists
+   */
+  hasPath(source: number, target: number, edgeType?: number | undefined | null, maxDepth?: number | undefined | null): boolean
+  /**
+   * Get all nodes reachable from a source within a certain depth
+   *
+   * @param source - Source node ID
+   * @param maxDepth - Maximum depth to traverse
+   * @param edgeType - Optional edge type filter
+   * @returns Array of reachable node IDs
+   */
+  reachableNodes(source: number, maxDepth: number, edgeType?: number | undefined | null): Array<number>
   /** Perform a checkpoint (compact WAL into snapshot) */
   checkpoint(): void
   /** Perform a background (non-blocking) checkpoint */
@@ -513,6 +610,10 @@ export interface JsPathConfig {
   targets?: Array<number>
   /** Allowed edge types (empty = all) */
   allowedEdgeTypes?: Array<number>
+  /** Edge weight property key ID (optional) */
+  weightKeyId?: number
+  /** Edge weight property key name (optional) */
+  weightKeyName?: string
   /** Traversal direction */
   direction?: JsTraversalDirection
   /** Maximum search depth */
