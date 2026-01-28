@@ -9,7 +9,7 @@ export default function Header() {
 
   return (
     <>
-      <header class="sticky top-0 z-50 p-4 flex items-center justify-between bg-white/80 dark:bg-slate-900/80 backdrop-blur-xl border-b border-slate-200 dark:border-slate-800">
+      <header class="sticky top-0 z-50 p-4 flex items-center justify-between border-b border-slate-200 dark:border-slate-800 speed-glass speed-nav">
         <div class="flex items-center gap-4">
           <button
             type="button"

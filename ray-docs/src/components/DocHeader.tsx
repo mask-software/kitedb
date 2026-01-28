@@ -10,7 +10,7 @@ interface DocHeaderProps {
 
 export const DocHeader: Component<DocHeaderProps> = (props) => {
   return (
-    <header class="sticky top-0 z-30 flex items-center justify-between h-16 px-4 bg-white/80 dark:bg-slate-900/80 backdrop-blur-lg border-b border-slate-200 dark:border-slate-800">
+    <header class="sticky top-0 z-30 flex items-center justify-between h-16 px-4 border-b border-slate-200 dark:border-slate-800 speed-glass speed-nav">
       <div class="flex items-center gap-4">
         <button
           type="button"
@@ -18,7 +18,7 @@ export const DocHeader: Component<DocHeaderProps> = (props) => {
           onClick={props.onMenuClick}
           aria-label="Open navigation menu"
         >
-          <Menu size={20} />
+          <Menu size={20} aria-hidden="true" />
         </button>
         
         <Link
@@ -39,8 +39,8 @@ export const DocHeader: Component<DocHeaderProps> = (props) => {
           class="flex items-center gap-2 px-3 py-1.5 text-sm text-slate-500 dark:text-slate-400 bg-slate-100 dark:bg-slate-800 rounded-lg hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors"
           aria-label="Search documentation"
         >
-          <Search size={16} />
-          <span class="hidden sm:inline">Search...</span>
+          <Search size={16} aria-hidden="true" />
+          <span class="hidden sm:inline">Search…</span>
           <kbd class="hidden sm:inline-flex items-center gap-0.5 px-1.5 py-0.5 text-xs font-mono bg-slate-200 dark:bg-slate-700 rounded">
             <span class="text-xs">⌘</span>K
           </kbd>
