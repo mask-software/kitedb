@@ -250,11 +250,7 @@ pub fn export_to_object_graph(db: &GraphDB, options: ExportOptions) -> Result<Ex
         }
       }
 
-      nodes.push(ExportedNode {
-        id: node_id as u64,
-        key,
-        props,
-      });
+      nodes.push(ExportedNode { id: node_id, key, props });
     }
   }
 
@@ -269,9 +265,9 @@ pub fn export_to_object_graph(db: &GraphDB, options: ExportOptions) -> Result<Ex
         }
       }
       edges.push(ExportedEdge {
-        src: edge.src as u64,
-        dst: edge.dst as u64,
-        etype: edge.etype as u32,
+        src: edge.src,
+        dst: edge.dst,
+        etype: edge.etype,
         etype_name: Some(get_etype_name_graph(db, edge.etype)),
         props,
       });
@@ -323,11 +319,7 @@ pub fn export_to_object_single(
           props.insert(name, serialize_prop_value(&value));
         }
       }
-      nodes.push(ExportedNode {
-        id: node_id as u64,
-        key,
-        props,
-      });
+      nodes.push(ExportedNode { id: node_id, key, props });
     }
   }
 
@@ -341,9 +333,9 @@ pub fn export_to_object_single(
         }
       }
       edges.push(ExportedEdge {
-        src: edge.src as u64,
-        dst: edge.dst as u64,
-        etype: edge.etype as u32,
+        src: edge.src,
+        dst: edge.dst,
+        etype: edge.etype,
         etype_name: Some(get_etype_name_single(db, edge.etype)),
         props,
       });
@@ -468,19 +460,19 @@ pub fn import_from_object_graph(
   let mut etype_name_to_id: HashMap<String, ETypeId> = HashMap::new();
 
   let mut tx = begin_tx(db)?;
-  for (_id, name) in &data.schema.prop_keys {
+  for name in data.schema.prop_keys.values() {
     let id = db
       .get_propkey_id(name)
       .unwrap_or_else(|| define_propkey(&mut tx, name).unwrap_or(0));
     propkey_name_to_id.insert(name.clone(), id);
   }
-  for (_id, name) in &data.schema.etypes {
+  for name in data.schema.etypes.values() {
     let id = db
       .get_etype_id(name)
       .unwrap_or_else(|| define_etype(&mut tx, name).unwrap_or(0));
     etype_name_to_id.insert(name.clone(), id);
   }
-  for (_id, name) in &data.schema.labels {
+  for name in data.schema.labels.values() {
     let _ = db
       .get_label_id(name)
       .unwrap_or_else(|| define_label(&mut tx, name).unwrap_or(0));
@@ -587,19 +579,19 @@ pub fn import_from_object_single(
   let mut propkey_name_to_id: HashMap<String, PropKeyId> = HashMap::new();
   let mut etype_name_to_id: HashMap<String, ETypeId> = HashMap::new();
 
-  for (_id, name) in &data.schema.prop_keys {
+  for name in data.schema.prop_keys.values() {
     let id = db
       .get_propkey_id(name)
       .unwrap_or_else(|| db.define_propkey(name).unwrap_or(0));
     propkey_name_to_id.insert(name.clone(), id);
   }
-  for (_id, name) in &data.schema.etypes {
+  for name in data.schema.etypes.values() {
     let id = db
       .get_etype_id(name)
       .unwrap_or_else(|| db.define_etype(name).unwrap_or(0));
     etype_name_to_id.insert(name.clone(), id);
   }
-  for (_id, name) in &data.schema.labels {
+  for name in data.schema.labels.values() {
     let _ = db
       .get_label_id(name)
       .unwrap_or_else(|| db.define_label(name).unwrap_or(0));

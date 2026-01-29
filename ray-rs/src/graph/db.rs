@@ -25,6 +25,8 @@ use crate::core::wal::reader::{load_wal_segment_by_id, recover_from_segment};
 use crate::core::wal::record::WalRecord;
 use crate::core::wal::writer::WalWriter;
 use crate::error::{RayError, Result};
+use crate::graph::checkpoint::CheckpointStatus;
+use crate::mvcc::{GcConfig, MvccManager};
 use crate::types::*;
 use crate::util::lock::{FileLock, LockType};
 use crate::vector::store::{create_vector_store, vector_store_delete, vector_store_insert};
@@ -45,6 +47,12 @@ pub struct OpenOptions {
   pub lock_file: bool,
   /// Enable MVCC
   pub mvcc: bool,
+  /// MVCC GC interval in ms
+  pub mvcc_gc_interval_ms: Option<u64>,
+  /// MVCC retention in ms
+  pub mvcc_retention_ms: Option<u64>,
+  /// MVCC max version chain depth
+  pub mvcc_max_chain_depth: Option<usize>,
   /// Cache options
   pub cache: Option<CacheOptions>,
 }
@@ -56,6 +64,9 @@ impl OpenOptions {
       create_if_missing: true,
       lock_file: true,
       mvcc: false,
+      mvcc_gc_interval_ms: None,
+      mvcc_retention_ms: None,
+      mvcc_max_chain_depth: None,
       cache: None,
     }
   }
@@ -74,41 +85,26 @@ impl OpenOptions {
     self.lock_file = value;
     self
   }
-}
 
-// ============================================================================
-// Transaction State
-// ============================================================================
-
-/// State of an active transaction
-#[derive(Debug)]
-pub struct TxState {
-  pub txid: TxId,
-  pub read_only: bool,
-  /// WAL records accumulated in this transaction
-  pub wal_records: Vec<WalRecord>,
-  /// Snapshot timestamp for MVCC reads
-  pub snapshot_ts: u64,
-  /// Pending vector operations (node_id, prop_key_id -> Some(vec)=set, None=delete)
-  pub pending_vectors: HashMap<(NodeId, PropKeyId), Option<Vec<f32>>>,
-}
-
-impl TxState {
-  pub fn new(txid: TxId, read_only: bool, snapshot_ts: u64) -> Self {
-    Self {
-      txid,
-      read_only,
-      wal_records: Vec::new(),
-      snapshot_ts,
-      pending_vectors: HashMap::new(),
-    }
+  pub fn mvcc(mut self, value: bool) -> Self {
+    self.mvcc = value;
+    self
   }
-}
 
-/// Handle for an active transaction
-pub struct TxHandle<'a> {
-  pub db: &'a mut GraphDB,
-  pub tx: TxState,
+  pub fn mvcc_gc_interval_ms(mut self, value: u64) -> Self {
+    self.mvcc_gc_interval_ms = Some(value);
+    self
+  }
+
+  pub fn mvcc_retention_ms(mut self, value: u64) -> Self {
+    self.mvcc_retention_ms = Some(value);
+    self
+  }
+
+  pub fn mvcc_max_chain_depth(mut self, value: usize) -> Self {
+    self.mvcc_max_chain_depth = Some(value);
+    self
+  }
 }
 
 // ============================================================================
@@ -158,6 +154,12 @@ pub struct GraphDB {
 
   /// Current active transaction (only one at a time for now)
   pub current_tx: Mutex<Option<TxState>>,
+
+  /// Current checkpoint state
+  pub checkpoint_status: Mutex<CheckpointStatus>,
+
+  /// MVCC manager (if enabled)
+  pub mvcc: Option<std::sync::Arc<MvccManager>>,
 
   /// File lock handle
   lock_handle: Option<FileLock>,
@@ -319,23 +321,33 @@ impl GraphDB {
     self.propkey_ids.read().get(&id).cloned()
   }
 
+  /// Update label name/id mappings
+  pub fn update_label_mapping(&self, id: LabelId, name: &str) {
+    let mut names = self.label_names.write();
+    let mut ids = self.label_ids.write();
+    names.insert(name.to_string(), id);
+    ids.insert(id, name.to_string());
+  }
+
+  /// Update edge type name/id mappings
+  pub fn update_etype_mapping(&self, id: ETypeId, name: &str) {
+    let mut names = self.etype_names.write();
+    let mut ids = self.etype_ids.write();
+    names.insert(name.to_string(), id);
+    ids.insert(id, name.to_string());
+  }
+
+  /// Update property key name/id mappings
+  pub fn update_propkey_mapping(&self, id: PropKeyId, name: &str) {
+    let mut names = self.propkey_names.write();
+    let mut ids = self.propkey_ids.write();
+    names.insert(name.to_string(), id);
+    ids.insert(id, name.to_string());
+  }
+
   // ========================================================================
   // WAL Operations
   // ========================================================================
-
-  /// Append WAL records to the current transaction
-  pub fn append_wal_record(&self, record: WalRecord) -> Result<()> {
-    let mut tx_guard = self.current_tx.lock();
-    if let Some(ref mut tx) = *tx_guard {
-      if tx.read_only {
-        return Err(RayError::ReadOnly);
-      }
-      tx.wal_records.push(record);
-      Ok(())
-    } else {
-      Err(RayError::NoTransaction)
-    }
-  }
 
   /// Flush WAL records to disk
   pub fn flush_wal(&self, records: &[WalRecord]) -> Result<()> {
@@ -374,6 +386,11 @@ impl GraphDB {
     } else {
       Err(RayError::Internal("WAL not initialized".to_string()))
     }
+  }
+
+  /// Check if MVCC is enabled
+  pub fn mvcc_enabled(&self) -> bool {
+    self.mvcc.is_some()
   }
 
   // ========================================================================
@@ -440,8 +457,12 @@ impl GraphDB {
       .create(true)
       .read(true)
       .write(true)
+      .truncate(true)
       .open(&wal_path)?;
     self.wal_fd = Some(wal_fd);
+
+    // Best-effort snapshot pruning (keep active + previous)
+    let _ = crate::graph::checkpoint::prune_snapshots(self, 2);
 
     Ok(())
   }
@@ -588,6 +609,7 @@ pub fn open_graph_db<P: AsRef<Path>>(path: P, options: OpenOptions) -> Result<Gr
 
   // Replay WAL for recovery
   let mut next_tx_id = INITIAL_TX_ID;
+  let mut next_commit_ts: u64 = 1;
   let mut delta = DeltaState::new();
 
   // Schema maps
@@ -623,6 +645,9 @@ pub fn open_graph_db<P: AsRef<Path>>(path: P, options: OpenOptions) -> Result<Gr
     }
   }
 
+  let mut committed_in_order: Vec<(TxId, Vec<crate::core::wal::record::ParsedWalRecord>)> =
+    Vec::new();
+
   if let Ok(Some(wal_segment)) = load_wal_segment_by_id(path, manifest.active_wal_seg) {
     let recovery = recover_from_segment(&wal_segment);
 
@@ -631,25 +656,47 @@ pub fn open_graph_db<P: AsRef<Path>>(path: P, options: OpenOptions) -> Result<Gr
       next_tx_id = recovery.max_txid + 1;
     }
 
-    // Replay committed transactions to delta
+    // Replay committed transactions in commit order
     use crate::core::wal::record::{
-      extract_committed_transactions, parse_add_edge_payload, parse_add_node_label_payload,
-      parse_create_node_payload, parse_define_etype_payload, parse_define_label_payload,
-      parse_define_propkey_payload, parse_del_node_prop_payload, parse_del_node_vector_payload,
+      parse_add_edge_payload, parse_add_node_label_payload, parse_create_node_payload,
+      parse_define_etype_payload, parse_define_label_payload, parse_define_propkey_payload,
+      parse_del_edge_prop_payload, parse_del_node_prop_payload, parse_del_node_vector_payload,
       parse_delete_edge_payload, parse_delete_node_payload, parse_remove_node_label_payload,
-      parse_set_node_prop_payload, parse_set_node_vector_payload,
+      parse_set_edge_prop_payload, parse_set_node_prop_payload, parse_set_node_vector_payload,
     };
     use crate::types::WalRecordType;
 
-    let committed = extract_committed_transactions(&wal_segment.records);
+    let mut pending: std::collections::HashMap<TxId, Vec<_>> = std::collections::HashMap::new();
 
-    for (_txid, records) in committed {
+    for record in &wal_segment.records {
+      match record.record_type {
+        WalRecordType::Begin => {
+          pending.insert(record.txid, Vec::new());
+        }
+        WalRecordType::Commit => {
+          if let Some(records) = pending.remove(&record.txid) {
+            committed_in_order.push((record.txid, records));
+          }
+        }
+        WalRecordType::Rollback => {
+          pending.remove(&record.txid);
+        }
+        _ => {
+          if let Some(records) = pending.get_mut(&record.txid) {
+            records.push(record.clone());
+          }
+        }
+      }
+    }
+
+    for (_txid, records) in &committed_in_order {
+      next_commit_ts += 1;
+
       for record in records {
         match record.record_type {
           WalRecordType::CreateNode => {
             if let Some(data) = parse_create_node_payload(&record.payload) {
               delta.create_node(data.node_id, data.key.as_deref());
-              // Update next_node_id if needed
               if data.node_id >= next_node_id {
                 next_node_id = data.node_id + 1;
               }
@@ -678,6 +725,16 @@ pub fn open_graph_db<P: AsRef<Path>>(path: P, options: OpenOptions) -> Result<Gr
           WalRecordType::DelNodeProp => {
             if let Some(data) = parse_del_node_prop_payload(&record.payload) {
               delta.delete_node_prop(data.node_id, data.key_id);
+            }
+          }
+          WalRecordType::SetEdgeProp => {
+            if let Some(data) = parse_set_edge_prop_payload(&record.payload) {
+              delta.set_edge_prop(data.src, data.etype, data.dst, data.key_id, data.value);
+            }
+          }
+          WalRecordType::DelEdgeProp => {
+            if let Some(data) = parse_del_edge_prop_payload(&record.payload) {
+              delta.delete_edge_prop(data.src, data.etype, data.dst, data.key_id);
             }
           }
           WalRecordType::DefineLabel => {
@@ -734,11 +791,10 @@ pub fn open_graph_db<P: AsRef<Path>>(path: P, options: OpenOptions) -> Result<Gr
                 .insert((data.node_id, data.prop_key_id), None);
             }
           }
-          _ => {
-            // Other record types (vectors, edge props, etc.) - handled below
-          }
+          _ => {}
         }
       }
+
     }
   }
 
@@ -761,6 +817,127 @@ pub fn open_graph_db<P: AsRef<Path>>(path: P, options: OpenOptions) -> Result<Gr
     }
   }
 
+  // Initialize MVCC if enabled (after WAL replay for correct tx/commit IDs)
+  let mvcc = if options.mvcc {
+    let mut gc_config = GcConfig::default();
+    if let Some(v) = options.mvcc_gc_interval_ms {
+      gc_config.interval_ms = v;
+    }
+    if let Some(v) = options.mvcc_retention_ms {
+      gc_config.retention_ms = v;
+    }
+    if let Some(v) = options.mvcc_max_chain_depth {
+      gc_config.max_chain_depth = v;
+    }
+
+    let mvcc = std::sync::Arc::new(MvccManager::new(next_tx_id, next_commit_ts, gc_config));
+
+    // Rebuild version chains from WAL if MVCC is enabled
+    if !committed_in_order.is_empty() {
+      use crate::core::wal::record::{
+        parse_add_edge_payload, parse_create_node_payload, parse_del_edge_prop_payload,
+        parse_del_node_prop_payload, parse_delete_edge_payload, parse_delete_node_payload,
+        parse_set_edge_prop_payload, parse_set_node_prop_payload,
+      };
+      use crate::types::WalRecordType;
+
+      let mut commit_ts: u64 = 1;
+      for (txid, records) in &committed_in_order {
+        for record in records {
+          match record.record_type {
+            WalRecordType::CreateNode => {
+              if let Some(data) = parse_create_node_payload(&record.payload) {
+                if let Some(node_delta) = delta.created_nodes.get(&data.node_id) {
+                  let mut vc = mvcc.version_chain.lock();
+                  vc.append_node_version(
+                    data.node_id,
+                    NodeVersionData {
+                      node_id: data.node_id,
+                      delta: node_delta.clone(),
+                    },
+                    *txid,
+                    commit_ts,
+                  );
+                }
+              }
+            }
+            WalRecordType::DeleteNode => {
+              if let Some(data) = parse_delete_node_payload(&record.payload) {
+                let mut vc = mvcc.version_chain.lock();
+                vc.delete_node_version(data.node_id, *txid, commit_ts);
+              }
+            }
+            WalRecordType::AddEdge => {
+              if let Some(data) = parse_add_edge_payload(&record.payload) {
+                let mut vc = mvcc.version_chain.lock();
+                vc.append_edge_version(data.src, data.etype, data.dst, true, *txid, commit_ts);
+              }
+            }
+            WalRecordType::DeleteEdge => {
+              if let Some(data) = parse_delete_edge_payload(&record.payload) {
+                let mut vc = mvcc.version_chain.lock();
+                vc.append_edge_version(data.src, data.etype, data.dst, false, *txid, commit_ts);
+              }
+            }
+            WalRecordType::SetNodeProp => {
+              if let Some(data) = parse_set_node_prop_payload(&record.payload) {
+                let mut vc = mvcc.version_chain.lock();
+                vc.append_node_prop_version(
+                  data.node_id,
+                  data.key_id,
+                  Some(data.value),
+                  *txid,
+                  commit_ts,
+                );
+              }
+            }
+            WalRecordType::DelNodeProp => {
+              if let Some(data) = parse_del_node_prop_payload(&record.payload) {
+                let mut vc = mvcc.version_chain.lock();
+                vc.append_node_prop_version(data.node_id, data.key_id, None, *txid, commit_ts);
+              }
+            }
+            WalRecordType::SetEdgeProp => {
+              if let Some(data) = parse_set_edge_prop_payload(&record.payload) {
+                let mut vc = mvcc.version_chain.lock();
+                vc.append_edge_prop_version(
+                  data.src,
+                  data.etype,
+                  data.dst,
+                  data.key_id,
+                  Some(data.value),
+                  *txid,
+                  commit_ts,
+                );
+              }
+            }
+            WalRecordType::DelEdgeProp => {
+              if let Some(data) = parse_del_edge_prop_payload(&record.payload) {
+                let mut vc = mvcc.version_chain.lock();
+                vc.append_edge_prop_version(
+                  data.src,
+                  data.etype,
+                  data.dst,
+                  data.key_id,
+                  None,
+                  *txid,
+                  commit_ts,
+                );
+              }
+            }
+            _ => {}
+          }
+        }
+        commit_ts += 1;
+      }
+    }
+
+    mvcc.start();
+    Some(mvcc)
+  } else {
+    None
+  };
+
   Ok(GraphDB {
     path: path.to_path_buf(),
     read_only: options.read_only,
@@ -777,6 +954,8 @@ pub fn open_graph_db<P: AsRef<Path>>(path: P, options: OpenOptions) -> Result<Gr
     next_propkey_id: AtomicU32::new(next_propkey_id),
     next_tx_id: AtomicU64::new(next_tx_id),
     current_tx: Mutex::new(None),
+    checkpoint_status: Mutex::new(CheckpointStatus::Idle),
+    mvcc,
     lock_handle,
     label_names: RwLock::new(label_names),
     label_ids: RwLock::new(label_ids),
@@ -792,6 +971,10 @@ pub fn close_graph_db(db: GraphDB) -> Result<()> {
   // Sync WAL if open
   if let Some(fd) = db.wal_fd {
     fd.sync_all()?;
+  }
+
+  if let Some(ref mvcc) = db.mvcc {
+    mvcc.stop();
   }
 
   // Lock is released when db.lock_handle is dropped
@@ -879,7 +1062,7 @@ mod tests {
   #[test]
   fn test_wal_replay_on_reopen() {
     use crate::graph::edges::add_edge;
-    use crate::graph::nodes::{create_node, node_exists, NodeOpts};
+    use crate::graph::nodes::{create_node, NodeOpts};
     use crate::graph::tx::{begin_tx, commit};
 
     let temp_dir = tempdir().unwrap();
@@ -981,15 +1164,14 @@ mod tests {
     use crate::graph::tx::{begin_read_tx, begin_tx, commit};
 
     let temp_dir = tempdir().unwrap();
-    let mut node_id = 0;
     let propkey_id = 1;
 
     // First session: create node with property
-    {
+    let node_id = {
       let db = open_graph_db(temp_dir.path(), OpenOptions::new()).unwrap();
 
       let mut tx = begin_tx(&db).unwrap();
-      node_id = create_node(&mut tx, NodeOpts::new()).unwrap();
+      let node_id = create_node(&mut tx, NodeOpts::new()).unwrap();
       set_node_prop(
         &mut tx,
         node_id,
@@ -1000,7 +1182,8 @@ mod tests {
       commit(&mut tx).unwrap();
 
       close_graph_db(db).unwrap();
-    }
+      node_id
+    };
 
     // Second session: verify property was recovered
     {

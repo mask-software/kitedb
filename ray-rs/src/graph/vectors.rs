@@ -2,11 +2,8 @@
 //!
 //! Mirrors the single-file vector API but uses GraphDB WAL + delta.
 
-use crate::core::wal::record::{
-  build_del_node_vector_payload, build_set_node_vector_payload, WalRecord,
-};
 use crate::error::{RayError, Result};
-use crate::types::{NodeId, PropKeyId, WalRecordType};
+use crate::types::{NodeId, PropKeyId};
 use crate::vector::store::{
   create_vector_store, vector_store_get, vector_store_has, vector_store_stats,
 };
@@ -39,19 +36,15 @@ pub fn set_node_vector(
     }
   }
 
-  // Record WAL entry
-  let record = WalRecord::new(
-    WalRecordType::SetNodeVector,
-    handle.tx.txid,
-    build_set_node_vector_payload(node_id, prop_key_id, vector),
-  );
-  handle.add_record(record)?;
-
-  // Track pending vector op for transaction reads
   handle
     .tx
-    .pending_vectors
-    .insert((node_id, prop_key_id), Some(vector.to_vec()));
+    .pending_vector_deletes
+    .remove(&(node_id, prop_key_id));
+
+  handle
+    .tx
+    .pending_vector_sets
+    .insert((node_id, prop_key_id), vector.to_vec());
 
   Ok(())
 }
@@ -66,17 +59,15 @@ pub fn delete_node_vector(
     return Err(RayError::ReadOnly);
   }
 
-  let record = WalRecord::new(
-    WalRecordType::DelNodeVector,
-    handle.tx.txid,
-    build_del_node_vector_payload(node_id, prop_key_id),
-  );
-  handle.add_record(record)?;
+  handle
+    .tx
+    .pending_vector_sets
+    .remove(&(node_id, prop_key_id));
 
   handle
     .tx
-    .pending_vectors
-    .insert((node_id, prop_key_id), None);
+    .pending_vector_deletes
+    .insert((node_id, prop_key_id));
 
   Ok(())
 }

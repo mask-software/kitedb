@@ -2,8 +2,8 @@
 //!
 //! Provides functions for creating, deleting, and querying nodes.
 
-use crate::core::wal::record::*;
-use crate::error::Result;
+use crate::error::{RayError, Result};
+use crate::mvcc::visibility::{get_visible_version, node_exists as mvcc_node_exists};
 use crate::types::*;
 
 use super::tx::TxHandle;
@@ -50,38 +50,47 @@ impl NodeOpts {
 
 /// Create a new node
 pub fn create_node(handle: &mut TxHandle, opts: NodeOpts) -> Result<NodeId> {
-  let node_id = handle.db.alloc_node_id();
-
-  // Build CREATE_NODE WAL record
-  let payload = build_create_node_payload(node_id, opts.key.as_deref());
-  handle.add_record(WalRecord::new(
-    WalRecordType::CreateNode,
-    handle.txid(),
-    payload,
-  ))?;
-
-  // Add label records if any
-  if let Some(labels) = opts.labels {
-    for label_id in labels {
-      let payload = build_add_node_label_payload(node_id, label_id);
-      handle.add_record(WalRecord::new(
-        WalRecordType::AddNodeLabel,
-        handle.txid(),
-        payload,
-      ))?;
-    }
+  if handle.tx.read_only {
+    return Err(RayError::ReadOnly);
   }
 
-  // Add property records if any
-  if let Some(props) = opts.props {
-    for (key_id, value) in props {
-      let payload = build_set_node_prop_payload(node_id, key_id, &value);
-      handle.add_record(WalRecord::new(
-        WalRecordType::SetNodeProp,
-        handle.txid(),
-        payload,
-      ))?;
+  let node_id = handle.db.alloc_node_id();
+
+  let mut node_delta = NodeDelta {
+    key: opts.key.clone(),
+    labels: None,
+    labels_deleted: None,
+    props: None,
+  };
+
+  if let Some(labels) = opts.labels {
+    let mut set = std::collections::HashSet::new();
+    for label_id in labels {
+      set.insert(label_id);
     }
+    node_delta.labels = Some(set);
+  }
+
+  handle
+    .tx
+    .pending_created_nodes
+    .insert(node_id, node_delta);
+
+  if let Some(key) = opts.key {
+    handle.tx.pending_key_updates.insert(key, node_id);
+  }
+
+  if let Some(props) = opts.props {
+    let mut map = std::collections::HashMap::new();
+    for (key_id, value) in props {
+      map.insert(key_id, Some(value));
+    }
+    handle.tx.pending_node_props.insert(node_id, map);
+  }
+
+  if let Some(mvcc) = handle.db.mvcc.as_ref() {
+    let mut tx_mgr = mvcc.tx_manager.lock();
+    tx_mgr.record_write(handle.tx.txid, format!("node:{node_id}"));
   }
 
   Ok(node_id)
@@ -89,41 +98,83 @@ pub fn create_node(handle: &mut TxHandle, opts: NodeOpts) -> Result<NodeId> {
 
 /// Delete a node
 pub fn delete_node(handle: &mut TxHandle, node_id: NodeId) -> Result<bool> {
-  // Check if node exists
+  if handle.tx.read_only {
+    return Err(RayError::ReadOnly);
+  }
+
+  // If created in this transaction, remove it entirely
+  if let Some(node_delta) = handle.tx.pending_created_nodes.remove(&node_id) {
+    if let Some(key) = node_delta.key {
+      handle.tx.pending_key_updates.remove(&key);
+    }
+    handle.tx.pending_node_props.remove(&node_id);
+    handle.tx.pending_out_add.remove(&node_id);
+    handle.tx.pending_out_del.remove(&node_id);
+    handle.tx.pending_in_add.remove(&node_id);
+    handle.tx.pending_in_del.remove(&node_id);
+    handle.tx.pending_node_labels_add.remove(&node_id);
+    handle.tx.pending_node_labels_del.remove(&node_id);
+    handle
+      .tx
+      .pending_vector_sets
+      .retain(|(n, _), _| *n != node_id);
+    handle
+      .tx
+      .pending_vector_deletes
+      .retain(|(n, _)| *n != node_id);
+    return Ok(true);
+  }
+
   if !node_exists_internal(handle.db, node_id) {
     return Ok(false);
   }
 
-  // Build DELETE_NODE WAL record
-  let payload = build_delete_node_payload(node_id);
-  handle.add_record(WalRecord::new(
-    WalRecordType::DeleteNode,
-    handle.txid(),
-    payload,
-  ))?;
+  handle.tx.pending_deleted_nodes.insert(node_id);
+
+  // Cascade delete vectors for this node
+  {
+    let stores = handle.db.vector_stores.read();
+    for (prop_key_id, store) in stores.iter() {
+      if store.node_to_vector.contains_key(&node_id) {
+        handle
+          .tx
+          .pending_vector_deletes
+          .insert((node_id, *prop_key_id));
+      }
+    }
+  }
+
+  if let Some(mvcc) = handle.db.mvcc.as_ref() {
+    let mut tx_mgr = mvcc.tx_manager.lock();
+    tx_mgr.record_write(handle.tx.txid, format!("node:{node_id}"));
+  }
 
   Ok(true)
 }
 
 /// Check if a node exists
 pub fn node_exists(handle: &TxHandle, node_id: NodeId) -> bool {
-  // Check delta first
-  let delta = handle.db.delta.read();
-
-  if delta.is_node_deleted(node_id) {
+  if handle.tx.pending_created_nodes.contains_key(&node_id) {
+    return true;
+  }
+  if handle.tx.pending_deleted_nodes.contains(&node_id) {
     return false;
   }
 
-  if delta.is_node_created(node_id) {
-    return true;
+  if let Some(mvcc) = handle.db.mvcc.as_ref() {
+    let tx_snapshot_ts = handle.tx.snapshot_ts;
+    let txid = handle.tx.txid;
+    {
+      let mut tx_mgr = mvcc.tx_manager.lock();
+      tx_mgr.record_read(txid, format!("node:{node_id}"));
+    }
+    let vc = mvcc.version_chain.lock();
+    if let Some(version) = vc.get_node_version(node_id) {
+      return mvcc_node_exists(Some(version), tx_snapshot_ts, txid);
+    }
   }
 
-  // Check snapshot
-  if let Some(ref snapshot) = handle.db.snapshot {
-    return snapshot.has_node(node_id);
-  }
-
-  false
+  node_exists_db(handle.db, node_id)
 }
 
 /// Internal node existence check (on GraphDB directly)
@@ -139,6 +190,15 @@ fn node_exists_internal(db: &super::db::GraphDB, node_id: NodeId) -> bool {
 
 /// Check if a node exists (direct read, no transaction)
 pub fn node_exists_db(db: &super::db::GraphDB, node_id: NodeId) -> bool {
+  if let Some(mvcc) = db.mvcc.as_ref() {
+    let tx_snapshot_ts = mvcc.tx_manager.lock().get_next_commit_ts();
+    let txid = 0;
+    let vc = mvcc.version_chain.lock();
+    if let Some(version) = vc.get_node_version(node_id) {
+      return mvcc_node_exists(Some(version), tx_snapshot_ts, txid);
+    }
+  }
+
   let delta = db.delta.read();
 
   if delta.is_node_deleted(node_id) {
@@ -189,6 +249,26 @@ pub fn get_node_by_key_db(db: &super::db::GraphDB, key: &str) -> Option<NodeId> 
 
 /// Get a node property (direct read, no transaction)
 pub fn get_node_prop_db(
+  db: &super::db::GraphDB,
+  node_id: NodeId,
+  key_id: PropKeyId,
+) -> Option<PropValue> {
+  if let Some(mvcc) = db.mvcc.as_ref() {
+    let tx_snapshot_ts = mvcc.tx_manager.lock().get_next_commit_ts();
+    let txid = 0;
+    let vc = mvcc.version_chain.lock();
+    if let Some(prop_version) = vc.get_node_prop_version(node_id, key_id) {
+      if let Some(visible) = get_visible_version(&prop_version, tx_snapshot_ts, txid) {
+        return visible.data.clone();
+      }
+    }
+  }
+
+  get_node_prop_committed(db, node_id, key_id)
+}
+
+/// Get a node property from committed state only (snapshot + delta)
+pub fn get_node_prop_committed(
   db: &super::db::GraphDB,
   node_id: NodeId,
   key_id: PropKeyId,
@@ -272,23 +352,66 @@ pub fn get_node_props_db(
 
 /// Add a label to a node
 pub fn add_node_label(handle: &mut TxHandle, node_id: NodeId, label_id: LabelId) -> Result<()> {
-  let payload = build_add_node_label_payload(node_id, label_id);
-  handle.add_record(WalRecord::new(
-    WalRecordType::AddNodeLabel,
-    handle.txid(),
-    payload,
-  ))?;
+  if handle.tx.read_only {
+    return Err(RayError::ReadOnly);
+  }
+
+  if let Some(node_delta) = handle.tx.pending_created_nodes.get_mut(&node_id) {
+    let labels = node_delta.labels.get_or_insert_with(std::collections::HashSet::new);
+    labels.insert(label_id);
+  } else {
+    if let Some(removed) = handle.tx.pending_node_labels_del.get_mut(&node_id) {
+      removed.remove(&label_id);
+      if removed.is_empty() {
+        handle.tx.pending_node_labels_del.remove(&node_id);
+      }
+    }
+    handle
+      .tx
+      .pending_node_labels_add
+      .entry(node_id)
+      .or_default()
+      .insert(label_id);
+  }
+
+  if let Some(mvcc) = handle.db.mvcc.as_ref() {
+    let mut tx_mgr = mvcc.tx_manager.lock();
+    tx_mgr.record_write(handle.tx.txid, format!("node:{node_id}"));
+  }
+
   Ok(())
 }
 
 /// Remove a label from a node
 pub fn remove_node_label(handle: &mut TxHandle, node_id: NodeId, label_id: LabelId) -> Result<()> {
-  let payload = build_remove_node_label_payload(node_id, label_id);
-  handle.add_record(WalRecord::new(
-    WalRecordType::RemoveNodeLabel,
-    handle.txid(),
-    payload,
-  ))?;
+  if handle.tx.read_only {
+    return Err(RayError::ReadOnly);
+  }
+
+  if let Some(node_delta) = handle.tx.pending_created_nodes.get_mut(&node_id) {
+    if let Some(labels) = node_delta.labels.as_mut() {
+      labels.remove(&label_id);
+    }
+  } else {
+    if let Some(added) = handle.tx.pending_node_labels_add.get_mut(&node_id) {
+      added.remove(&label_id);
+      if added.is_empty() {
+        handle.tx.pending_node_labels_add.remove(&node_id);
+      }
+    }
+    handle
+      .tx
+      .pending_node_labels_del
+      .entry(node_id)
+      .or_default()
+      .insert(label_id);
+  }
+
+  if let Some(mvcc) = handle.db.mvcc.as_ref() {
+    let mut tx_mgr = mvcc.tx_manager.lock();
+    tx_mgr.record_write(handle.tx.txid, format!("node:{node_id}"));
+  }
+
   Ok(())
 }
 
@@ -307,6 +430,14 @@ pub fn node_has_label_db(db: &super::db::GraphDB, node_id: NodeId, label_id: Lab
     return true;
   }
 
+  if let Some(ref snapshot) = db.snapshot {
+    if let Some(phys) = snapshot.get_phys_node(node_id) {
+      if let Some(labels) = snapshot.get_node_labels(phys) {
+        return labels.contains(&label_id);
+      }
+    }
+  }
+
   false
 }
 
@@ -318,6 +449,14 @@ pub fn get_node_labels_db(db: &super::db::GraphDB, node_id: NodeId) -> Vec<Label
   }
 
   let mut labels: std::collections::HashSet<LabelId> = std::collections::HashSet::new();
+
+  if let Some(ref snapshot) = db.snapshot {
+    if let Some(phys) = snapshot.get_phys_node(node_id) {
+      if let Some(snapshot_labels) = snapshot.get_node_labels(phys) {
+        labels.extend(snapshot_labels);
+      }
+    }
+  }
 
   if let Some(added) = delta.get_added_labels(node_id) {
     labels.extend(added.iter().copied());
@@ -366,43 +505,84 @@ pub fn set_node_prop(
   key_id: PropKeyId,
   value: PropValue,
 ) -> Result<()> {
-  let payload = build_set_node_prop_payload(node_id, key_id, &value);
-  handle.add_record(WalRecord::new(
-    WalRecordType::SetNodeProp,
-    handle.txid(),
-    payload,
-  ))
+  if handle.tx.read_only {
+    return Err(RayError::ReadOnly);
+  }
+
+  let props = handle
+    .tx
+    .pending_node_props
+    .entry(node_id)
+    .or_default();
+  props.insert(key_id, Some(value));
+
+  if let Some(mvcc) = handle.db.mvcc.as_ref() {
+    let mut tx_mgr = mvcc.tx_manager.lock();
+    tx_mgr.record_write(handle.tx.txid, format!("nodeprop:{node_id}:{key_id}"));
+  }
+
+  Ok(())
 }
 
 /// Delete a node property
 pub fn del_node_prop(handle: &mut TxHandle, node_id: NodeId, key_id: PropKeyId) -> Result<()> {
-  let payload = build_del_node_prop_payload(node_id, key_id);
-  handle.add_record(WalRecord::new(
-    WalRecordType::DelNodeProp,
-    handle.txid(),
-    payload,
-  ))
+  if handle.tx.read_only {
+    return Err(RayError::ReadOnly);
+  }
+
+  let props = handle
+    .tx
+    .pending_node_props
+    .entry(node_id)
+    .or_default();
+  props.insert(key_id, None);
+
+  if let Some(mvcc) = handle.db.mvcc.as_ref() {
+    let mut tx_mgr = mvcc.tx_manager.lock();
+    tx_mgr.record_write(handle.tx.txid, format!("nodeprop:{node_id}:{key_id}"));
+  }
+
+  Ok(())
 }
 
 /// Get a node property
 pub fn get_node_prop(handle: &TxHandle, node_id: NodeId, key_id: PropKeyId) -> Option<PropValue> {
-  // Check delta first
+  if handle.tx.pending_deleted_nodes.contains(&node_id) {
+    return None;
+  }
+
+  if let Some(pending_props) = handle.tx.pending_node_props.get(&node_id) {
+    if let Some(value) = pending_props.get(&key_id) {
+      return value.clone();
+    }
+  }
+
+  if let Some(mvcc) = handle.db.mvcc.as_ref() {
+    let tx_snapshot_ts = handle.tx.snapshot_ts;
+    let txid = handle.tx.txid;
+    {
+      let mut tx_mgr = mvcc.tx_manager.lock();
+      tx_mgr.record_read(txid, format!("nodeprop:{node_id}:{key_id}"));
+    }
+    let vc = mvcc.version_chain.lock();
+    if let Some(prop_version) = vc.get_node_prop_version(node_id, key_id) {
+      if let Some(visible) = get_visible_version(&prop_version, tx_snapshot_ts, txid) {
+        return visible.data.clone();
+      }
+    }
+  }
+
   let delta = handle.db.delta.read();
 
-  // Check if node is deleted
   if delta.is_node_deleted(node_id) {
     return None;
   }
 
-  // Check delta for property (Some(Some(v)) = set, Some(None) = deleted)
   if let Some(value_opt) = delta.get_node_prop(node_id, key_id) {
-    // If explicitly set or deleted in delta, return that
     return value_opt.cloned();
   }
 
-  // Check snapshot
   if let Some(ref snapshot) = handle.db.snapshot {
-    // Get physical node index
     if let Some(phys) = snapshot.get_phys_node(node_id) {
       return snapshot.get_node_prop(phys, key_id);
     }
@@ -413,33 +593,19 @@ pub fn get_node_prop(handle: &TxHandle, node_id: NodeId, key_id: PropKeyId) -> O
 
 /// Get a node by its key
 pub fn get_node_by_key(handle: &TxHandle, key: &str) -> Option<NodeId> {
-  // Check delta first
-  let delta = handle.db.delta.read();
-
-  // Check if key was deleted in delta
-  if delta.key_index_deleted.contains(key) {
+  if let Some(node_id) = handle.tx.pending_key_updates.get(key) {
+    return Some(*node_id);
+  }
+  if handle.tx.pending_key_deletes.contains(key) {
     return None;
   }
 
-  // Check if key exists in delta
-  if let Some(node_id) = delta.get_node_by_key(key) {
-    // Make sure the node isn't deleted
-    if !delta.is_node_deleted(node_id) {
-      return Some(node_id);
-    }
+  if let Some(mvcc) = handle.db.mvcc.as_ref() {
+    let mut tx_mgr = mvcc.tx_manager.lock();
+    tx_mgr.record_read(handle.tx.txid, format!("key:{key}"));
   }
 
-  // Check snapshot
-  if let Some(ref snapshot) = handle.db.snapshot {
-    if let Some(node_id) = snapshot.lookup_by_key(key) {
-      // Make sure node wasn't deleted in delta
-      if !delta.is_node_deleted(node_id) {
-        return Some(node_id);
-      }
-    }
-  }
-
-  None
+  get_node_by_key_db(handle.db, key)
 }
 
 /// Count total nodes in the database
@@ -469,7 +635,25 @@ pub fn count_nodes(handle: &TxHandle) -> u64 {
     }
   }
 
-  snapshot_count + created - deleted_from_snapshot
+  let mut count = snapshot_count + created - deleted_from_snapshot;
+
+  // Apply pending deletions
+  for &node_id in &handle.tx.pending_deleted_nodes {
+    let in_snapshot = handle
+      .db
+      .snapshot
+      .as_ref()
+      .map(|s| s.has_node(node_id))
+      .unwrap_or(false);
+    let in_delta_created = delta.created_nodes.contains_key(&node_id);
+    let deleted_in_delta = delta.deleted_nodes.contains(&node_id);
+    if (in_snapshot || in_delta_created) && !deleted_in_delta {
+      count = count.saturating_sub(1);
+    }
+  }
+
+  // Add pending creations
+  count + handle.tx.pending_created_nodes.len() as u64
 }
 
 // ============================================================================

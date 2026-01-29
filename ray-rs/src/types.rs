@@ -539,6 +539,8 @@ pub struct MvccStats {
   pub versions_pruned: u64,
   pub gc_runs: u64,
   pub last_gc_time: u64,
+  pub committed_writes_size: usize,
+  pub committed_writes_pruned: usize,
 }
 
 /// Database check result
@@ -557,6 +559,9 @@ pub struct CheckResult {
 #[derive(Debug, Default)]
 pub struct TxState {
   pub txid: TxId,
+  pub read_only: bool,
+  /// Snapshot timestamp for MVCC reads
+  pub snapshot_ts: u64,
   pub pending_created_nodes: HashMap<NodeId, NodeDelta>,
   pub pending_deleted_nodes: HashSet<NodeId>,
   pub pending_out_add: HashMap<NodeId, BTreeSet<EdgePatch>>,
@@ -564,6 +569,10 @@ pub struct TxState {
   pub pending_in_add: HashMap<NodeId, BTreeSet<EdgePatch>>,
   pub pending_in_del: HashMap<NodeId, BTreeSet<EdgePatch>>,
   pub pending_node_props: HashMap<NodeId, HashMap<PropKeyId, Option<PropValue>>>,
+  /// Pending node label additions (node_id -> labels)
+  pub pending_node_labels_add: HashMap<NodeId, HashSet<LabelId>>,
+  /// Pending node label removals (node_id -> labels)
+  pub pending_node_labels_del: HashMap<NodeId, HashSet<LabelId>>,
   pub pending_edge_props: HashMap<(NodeId, ETypeId, NodeId), HashMap<PropKeyId, Option<PropValue>>>,
   pub pending_new_labels: HashMap<LabelId, String>,
   pub pending_new_etypes: HashMap<ETypeId, String>,
@@ -573,6 +582,17 @@ pub struct TxState {
   // Vector embeddings pending operations
   pub pending_vector_sets: HashMap<(NodeId, PropKeyId), Vec<f32>>,
   pub pending_vector_deletes: HashSet<(NodeId, PropKeyId)>,
+}
+
+impl TxState {
+  pub fn new(txid: TxId, read_only: bool, snapshot_ts: u64) -> Self {
+    Self {
+      txid,
+      read_only,
+      snapshot_ts,
+      ..Default::default()
+    }
+  }
 }
 
 // ============================================================================

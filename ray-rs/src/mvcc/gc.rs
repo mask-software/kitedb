@@ -154,14 +154,13 @@ impl GarbageCollector {
   ) -> GcResult {
     // Calculate GC horizon
     // Versions older than this can be pruned if they have newer successors
-    let now = current_time_ms();
     let min_active_ts = tx_manager.min_active_ts();
-    let retention_ts = now.saturating_sub(self.config.retention_ms);
+    let retention_horizon_ts = tx_manager.get_retention_horizon_ts(self.config.retention_ms);
 
     // GC horizon is the minimum of:
-    // 1. Oldest active transaction snapshot (can't prune versions needed by active reads)
-    // 2. Retention period (keep versions for at least retention_ms)
-    let horizon_ts = min_active_ts.min(retention_ts);
+    // 1. Oldest active transaction snapshot
+    // 2. Retention horizon converted to commit timestamp
+    let horizon_ts = min_active_ts.min(retention_horizon_ts);
 
     // Prune old versions
     let pruned = version_chain.prune_old_versions(horizon_ts);
@@ -172,13 +171,14 @@ impl GarbageCollector {
 
     // Clean up old committed transactions
     let txs_cleaned = self.cleanup_old_transactions(tx_manager, horizon_ts);
+    tx_manager.prune_wall_clock_mappings(horizon_ts);
 
     // Update stats
     self.stats.versions_pruned += pruned as u64;
     self.stats.chains_truncated += truncated as u64;
     self.stats.txs_cleaned += txs_cleaned as u64;
     self.stats.gc_runs += 1;
-    self.stats.last_gc_time = now;
+    self.stats.last_gc_time = current_time_ms();
 
     GcResult {
       versions_pruned: pruned,
@@ -388,9 +388,11 @@ impl Drop for BackgroundGcHandle {
 /// A handle that can be used to stop the GC thread
 ///
 /// # Example
-/// ```ignore
-/// use std::sync::Arc;
+/// ```rust,no_run
 /// use parking_lot::Mutex;
+/// use std::sync::Arc;
+/// # use raydb_core::mvcc::{GcConfig, TxManager, VersionChainManager};
+/// # use raydb_core::mvcc::gc::start_background_gc;
 ///
 /// let tx_manager = Arc::new(Mutex::new(TxManager::new()));
 /// let version_chain = Arc::new(Mutex::new(VersionChainManager::new()));
@@ -519,7 +521,7 @@ mod tests {
       version_chain.append_node_version(1, data, i, i);
     }
 
-    let result = gc.run_gc(&mut tx_mgr, &mut version_chain);
+    let _result = gc.run_gc(&mut tx_mgr, &mut version_chain);
 
     // Stats should be updated
     assert!(gc.stats.gc_runs > 0);
@@ -541,7 +543,7 @@ mod tests {
     version_chain.append_node_version(1, data, 1, 1);
 
     // GC should respect the active transaction's snapshot
-    let result = gc.run_gc(&mut tx_mgr, &mut version_chain);
+    let _result = gc.run_gc(&mut tx_mgr, &mut version_chain);
 
     // Version at ts=1 should still exist because there's an active tx
     assert!(version_chain.get_node_version(1).is_some());
@@ -563,7 +565,7 @@ mod tests {
       version_chain.append_node_version(1, data, i, u64::MAX - i);
     }
 
-    let result = gc.run_gc(&mut tx_mgr, &mut version_chain);
+    let _result = gc.run_gc(&mut tx_mgr, &mut version_chain);
 
     // Chain should be truncated
     let mut depth = 0;
@@ -590,7 +592,7 @@ mod tests {
     let (_txid, _) = tx_mgr.begin_tx();
 
     // Run GC - committed transactions with old timestamps should be cleaned
-    let result = gc.run_gc(&mut tx_mgr, &mut version_chain);
+    let _result = gc.run_gc(&mut tx_mgr, &mut version_chain);
 
     // Some transactions might be cleaned
     assert!(gc.stats.gc_runs > 0);
@@ -669,7 +671,7 @@ mod tests {
   fn test_force_gc() {
     let (mut tx_mgr, mut version_chain, mut gc) = setup();
 
-    let pruned = gc.force_gc(&mut tx_mgr, &mut version_chain);
+    let _pruned = gc.force_gc(&mut tx_mgr, &mut version_chain);
 
     // Even with no versions, force_gc should run
     assert!(gc.stats.gc_runs > 0);

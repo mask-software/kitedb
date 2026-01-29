@@ -7,7 +7,8 @@ use crate::core::wal::record::*;
 use crate::error::{RayError, Result};
 use crate::types::*;
 
-use super::db::{GraphDB, TxState};
+use super::db::GraphDB;
+use super::{edges, nodes};
 
 // ============================================================================
 // Transaction Handle
@@ -48,15 +49,6 @@ impl<'a> TxHandle<'a> {
     self.tx.snapshot_ts
   }
 
-  /// Add a WAL record to this transaction
-  pub fn add_record(&mut self, record: WalRecord) -> Result<()> {
-    if self.tx.read_only {
-      return Err(RayError::ReadOnly);
-    }
-    self.tx.wal_records.push(record);
-    Ok(())
-  }
-
   /// Check if the transaction is still active
   pub fn is_active(&self) -> bool {
     !self.finished
@@ -73,22 +65,26 @@ pub fn begin_tx(db: &GraphDB) -> Result<TxHandle> {
     return Err(RayError::ReadOnly);
   }
 
-  // Check for existing transaction (single-writer model for now)
-  {
+  if !db.mvcc_enabled() {
     let current = db.current_tx.lock();
     if current.is_some() {
       return Err(RayError::TransactionInProgress);
     }
   }
 
-  // Allocate transaction ID
-  let txid = db.alloc_tx_id();
-  let snapshot_ts = 0; // TODO: Get from MVCC manager if enabled
+  let (txid, snapshot_ts) = if let Some(mvcc) = db.mvcc.as_ref() {
+    let (txid, snapshot_ts) = {
+      let mut tx_mgr = mvcc.tx_manager.lock();
+      tx_mgr.begin_tx()
+    };
+    (txid, snapshot_ts)
+  } else {
+    (db.alloc_tx_id(), 0)
+  };
 
   let tx = TxState::new(txid, false, snapshot_ts);
 
-  // Set as current transaction
-  {
+  if !db.mvcc_enabled() {
     let mut current = db.current_tx.lock();
     *current = Some(TxState::new(txid, false, snapshot_ts));
   }
@@ -98,8 +94,15 @@ pub fn begin_tx(db: &GraphDB) -> Result<TxHandle> {
 
 /// Begin a read-only transaction
 pub fn begin_read_tx(db: &GraphDB) -> Result<TxHandle> {
-  let txid = db.alloc_tx_id();
-  let snapshot_ts = 0; // TODO: Get from MVCC manager
+  let (txid, snapshot_ts) = if let Some(mvcc) = db.mvcc.as_ref() {
+    let (txid, snapshot_ts) = {
+      let mut tx_mgr = mvcc.tx_manager.lock();
+      tx_mgr.begin_tx()
+    };
+    (txid, snapshot_ts)
+  } else {
+    (db.alloc_tx_id(), 0)
+  };
 
   let tx = TxState::new(txid, true, snapshot_ts);
   Ok(TxHandle::new(db, tx))
@@ -112,37 +115,399 @@ pub fn commit(handle: &mut TxHandle) -> Result<()> {
   }
 
   if handle.tx.read_only {
-    // Read-only transactions just need to clean up
+    if let Some(mvcc) = handle.db.mvcc.as_ref() {
+      let mut tx_mgr = mvcc.tx_manager.lock();
+      tx_mgr.abort_tx(handle.tx.txid);
+    }
     handle.finished = true;
     return Ok(());
   }
 
-  // Build BEGIN record
-  let begin_record = WalRecord::new(WalRecordType::Begin, handle.tx.txid, build_begin_payload());
+  // MVCC: conflict detection + commit timestamp
+  if let Some(mvcc) = handle.db.mvcc.as_ref() {
+    let mut tx_mgr = mvcc.tx_manager.lock();
+    if let Err(err) = mvcc.conflict_detector.validate_commit(&tx_mgr, handle.tx.txid) {
+      return Err(RayError::Conflict {
+        txid: err.txid,
+        keys: err.conflicting_keys,
+      });
+    }
 
-  // Build COMMIT record
-  let commit_record = WalRecord::new(
+    let commit_ts = tx_mgr
+      .commit_tx(handle.tx.txid)
+      .map_err(|e| RayError::Internal(e.to_string()))?;
+
+    let has_active_readers = tx_mgr.get_active_count() > 0;
+    drop(tx_mgr);
+
+    if has_active_readers {
+      let mut vc = mvcc.version_chain.lock();
+
+      // Node creations
+      for (node_id, node_delta) in &handle.tx.pending_created_nodes {
+        vc.append_node_version(
+          *node_id,
+          NodeVersionData {
+            node_id: *node_id,
+            delta: node_delta.clone(),
+          },
+          handle.tx.txid,
+          commit_ts,
+        );
+      }
+
+      // Node deletions
+      for node_id in &handle.tx.pending_deleted_nodes {
+        vc.delete_node_version(*node_id, handle.tx.txid, commit_ts);
+      }
+
+      // Edge additions
+      for (src, patches) in &handle.tx.pending_out_add {
+        for patch in patches {
+          vc.append_edge_version(*src, patch.etype, patch.other, true, handle.tx.txid, commit_ts);
+        }
+      }
+
+      // Edge deletions
+      for (src, patches) in &handle.tx.pending_out_del {
+        for patch in patches {
+          vc.append_edge_version(*src, patch.etype, patch.other, false, handle.tx.txid, commit_ts);
+        }
+      }
+
+      // Node property changes
+      for (node_id, props) in &handle.tx.pending_node_props {
+        let is_new = handle.tx.pending_created_nodes.contains_key(node_id);
+        for (key_id, value) in props {
+          if !is_new && vc.get_node_prop_version(*node_id, *key_id).is_none() {
+            if let Some(old_value) =
+              nodes::get_node_prop_committed(handle.db, *node_id, *key_id)
+            {
+              vc.append_node_prop_version(*node_id, *key_id, Some(old_value), 0, 0);
+            }
+          }
+          vc.append_node_prop_version(
+            *node_id,
+            *key_id,
+            value.clone(),
+            handle.tx.txid,
+            commit_ts,
+          );
+        }
+      }
+
+      // Edge property changes
+      for ((src, etype, dst), props) in &handle.tx.pending_edge_props {
+        for (key_id, value) in props {
+          if vc
+            .get_edge_prop_version(*src, *etype, *dst, *key_id)
+            .is_none()
+          {
+            if let Some(old_value) =
+              edges::get_edge_prop_committed(handle.db, *src, *etype, *dst, *key_id)
+            {
+              vc.append_edge_prop_version(
+                *src,
+                *etype,
+                *dst,
+                *key_id,
+                Some(old_value),
+                0,
+                0,
+              );
+            }
+          }
+          vc.append_edge_prop_version(
+            *src,
+            *etype,
+            *dst,
+            *key_id,
+            value.clone(),
+            handle.tx.txid,
+            commit_ts,
+          );
+        }
+      }
+    }
+  }
+
+  // Build WAL records
+  let mut records: Vec<WalRecord> = Vec::new();
+  records.push(WalRecord::new(
+    WalRecordType::Begin,
+    handle.tx.txid,
+    build_begin_payload(),
+  ));
+
+  // Definitions first
+  for (label_id, name) in &handle.tx.pending_new_labels {
+    records.push(WalRecord::new(
+      WalRecordType::DefineLabel,
+      handle.tx.txid,
+      build_define_label_payload(*label_id, name),
+    ));
+  }
+  for (etype_id, name) in &handle.tx.pending_new_etypes {
+    records.push(WalRecord::new(
+      WalRecordType::DefineEtype,
+      handle.tx.txid,
+      build_define_etype_payload(*etype_id, name),
+    ));
+  }
+  for (propkey_id, name) in &handle.tx.pending_new_propkeys {
+    records.push(WalRecord::new(
+      WalRecordType::DefinePropkey,
+      handle.tx.txid,
+      build_define_propkey_payload(*propkey_id, name),
+    ));
+  }
+
+  // Node creations
+  for (node_id, node_delta) in &handle.tx.pending_created_nodes {
+    records.push(WalRecord::new(
+      WalRecordType::CreateNode,
+      handle.tx.txid,
+      build_create_node_payload(*node_id, node_delta.key.as_deref()),
+    ));
+
+    if let Some(labels) = &node_delta.labels {
+      for label_id in labels {
+        records.push(WalRecord::new(
+          WalRecordType::AddNodeLabel,
+          handle.tx.txid,
+          build_add_node_label_payload(*node_id, *label_id),
+        ));
+      }
+    }
+
+    if let Some(props) = handle.tx.pending_node_props.get(node_id) {
+      for (key_id, value) in props {
+        if let Some(value) = value {
+          records.push(WalRecord::new(
+            WalRecordType::SetNodeProp,
+            handle.tx.txid,
+            build_set_node_prop_payload(*node_id, *key_id, value),
+          ));
+        }
+      }
+    }
+  }
+
+  // Node deletions
+  for node_id in &handle.tx.pending_deleted_nodes {
+    records.push(WalRecord::new(
+      WalRecordType::DeleteNode,
+      handle.tx.txid,
+      build_delete_node_payload(*node_id),
+    ));
+  }
+
+  // Edge additions
+  for (src, patches) in &handle.tx.pending_out_add {
+    for patch in patches {
+      records.push(WalRecord::new(
+        WalRecordType::AddEdge,
+        handle.tx.txid,
+        build_add_edge_payload(*src, patch.etype, patch.other),
+      ));
+    }
+  }
+
+  // Edge deletions
+  for (src, patches) in &handle.tx.pending_out_del {
+    for patch in patches {
+      records.push(WalRecord::new(
+        WalRecordType::DeleteEdge,
+        handle.tx.txid,
+        build_delete_edge_payload(*src, patch.etype, patch.other),
+      ));
+    }
+  }
+
+  // Node property changes for existing nodes
+  for (node_id, props) in &handle.tx.pending_node_props {
+    if !handle.tx.pending_created_nodes.contains_key(node_id) {
+      for (key_id, value) in props {
+        if let Some(value) = value {
+          records.push(WalRecord::new(
+            WalRecordType::SetNodeProp,
+            handle.tx.txid,
+            build_set_node_prop_payload(*node_id, *key_id, value),
+          ));
+        } else {
+          records.push(WalRecord::new(
+            WalRecordType::DelNodeProp,
+            handle.tx.txid,
+            build_del_node_prop_payload(*node_id, *key_id),
+          ));
+        }
+      }
+    }
+  }
+
+  // Node label changes
+  for (node_id, labels) in &handle.tx.pending_node_labels_add {
+    for label_id in labels {
+      records.push(WalRecord::new(
+        WalRecordType::AddNodeLabel,
+        handle.tx.txid,
+        build_add_node_label_payload(*node_id, *label_id),
+      ));
+    }
+  }
+  for (node_id, labels) in &handle.tx.pending_node_labels_del {
+    for label_id in labels {
+      records.push(WalRecord::new(
+        WalRecordType::RemoveNodeLabel,
+        handle.tx.txid,
+        build_remove_node_label_payload(*node_id, *label_id),
+      ));
+    }
+  }
+
+  // Edge property changes
+  for ((src, etype, dst), props) in &handle.tx.pending_edge_props {
+    for (key_id, value) in props {
+      if let Some(value) = value {
+        records.push(WalRecord::new(
+          WalRecordType::SetEdgeProp,
+          handle.tx.txid,
+          build_set_edge_prop_payload(*src, *etype, *dst, *key_id, value),
+        ));
+      } else {
+        records.push(WalRecord::new(
+          WalRecordType::DelEdgeProp,
+          handle.tx.txid,
+          build_del_edge_prop_payload(*src, *etype, *dst, *key_id),
+        ));
+      }
+    }
+  }
+
+  // Vector embeddings - set operations
+  for ((node_id, prop_key_id), vector) in &handle.tx.pending_vector_sets {
+    records.push(WalRecord::new(
+      WalRecordType::SetNodeVector,
+      handle.tx.txid,
+      build_set_node_vector_payload(*node_id, *prop_key_id, vector),
+    ));
+  }
+
+  // Vector embeddings - delete operations
+  for (node_id, prop_key_id) in &handle.tx.pending_vector_deletes {
+    records.push(WalRecord::new(
+      WalRecordType::DelNodeVector,
+      handle.tx.txid,
+      build_del_node_vector_payload(*node_id, *prop_key_id),
+    ));
+  }
+
+  records.push(WalRecord::new(
     WalRecordType::Commit,
     handle.tx.txid,
     build_commit_payload(),
-  );
+  ));
 
-  // Collect all WAL records
-  let mut all_records = Vec::with_capacity(handle.tx.wal_records.len() + 2);
-  all_records.push(begin_record);
-  all_records.append(&mut handle.tx.wal_records);
-  all_records.push(commit_record);
+  handle.db.flush_wal(&records)?;
 
-  // Flush to WAL
-  handle.db.flush_wal(&all_records)?;
-
-  // Apply changes to delta
-  // This happens by processing the WAL records we just wrote
-  apply_records_to_delta(handle.db, &all_records)?;
-  handle.db.apply_pending_vectors();
-
-  // Clear current transaction
   {
+    let mut delta = handle.db.delta.write();
+
+    for (label_id, name) in &handle.tx.pending_new_labels {
+      delta.define_label(*label_id, name);
+    }
+    for (etype_id, name) in &handle.tx.pending_new_etypes {
+      delta.define_etype(*etype_id, name);
+    }
+    for (propkey_id, name) in &handle.tx.pending_new_propkeys {
+      delta.define_propkey(*propkey_id, name);
+    }
+
+    for (node_id, node_delta) in &handle.tx.pending_created_nodes {
+      delta.create_node(*node_id, node_delta.key.as_deref());
+      if let Some(labels) = &node_delta.labels {
+        for label_id in labels {
+          delta.add_node_label(*node_id, *label_id);
+        }
+      }
+    }
+
+    for node_id in &handle.tx.pending_deleted_nodes {
+      delta.delete_node(*node_id);
+    }
+
+    for (src, patches) in &handle.tx.pending_out_add {
+      for patch in patches {
+        delta.add_edge(*src, patch.etype, patch.other);
+      }
+    }
+    for (src, patches) in &handle.tx.pending_out_del {
+      for patch in patches {
+        delta.delete_edge(*src, patch.etype, patch.other);
+      }
+    }
+
+    for (node_id, props) in &handle.tx.pending_node_props {
+      for (key_id, value) in props {
+        if let Some(value) = value {
+          delta.set_node_prop(*node_id, *key_id, value.clone());
+        } else {
+          delta.delete_node_prop(*node_id, *key_id);
+        }
+      }
+    }
+
+    for (node_id, labels) in &handle.tx.pending_node_labels_add {
+      for label_id in labels {
+        delta.add_node_label(*node_id, *label_id);
+      }
+    }
+    for (node_id, labels) in &handle.tx.pending_node_labels_del {
+      for label_id in labels {
+        delta.remove_node_label(*node_id, *label_id);
+      }
+    }
+
+    for ((src, etype, dst), props) in &handle.tx.pending_edge_props {
+      for (key_id, value) in props {
+        if let Some(value) = value {
+          delta.set_edge_prop(*src, *etype, *dst, *key_id, value.clone());
+        } else {
+          delta.delete_edge_prop(*src, *etype, *dst, *key_id);
+        }
+      }
+    }
+  }
+
+  for (label_id, name) in &handle.tx.pending_new_labels {
+    handle.db.update_label_mapping(*label_id, name);
+  }
+  for (etype_id, name) in &handle.tx.pending_new_etypes {
+    handle.db.update_etype_mapping(*etype_id, name);
+  }
+  for (propkey_id, name) in &handle.tx.pending_new_propkeys {
+    handle.db.update_propkey_mapping(*propkey_id, name);
+  }
+
+  {
+    let mut stores = handle.db.vector_stores.write();
+
+    for ((node_id, prop_key_id), vector) in &handle.tx.pending_vector_sets {
+      let store = stores.entry(*prop_key_id).or_insert_with(|| {
+        let config = crate::vector::types::VectorStoreConfig::new(vector.len());
+        crate::vector::store::create_vector_store(config)
+      });
+      let _ = crate::vector::store::vector_store_insert(store, *node_id, vector);
+    }
+
+    for (node_id, prop_key_id) in &handle.tx.pending_vector_deletes {
+      if let Some(store) = stores.get_mut(prop_key_id) {
+        crate::vector::store::vector_store_delete(store, *node_id);
+      }
+    }
+  }
+
+  if !handle.db.mvcc_enabled() {
     let mut current = handle.db.current_tx.lock();
     *current = None;
   }
@@ -157,113 +522,17 @@ pub fn rollback(handle: &mut TxHandle) -> Result<()> {
     return Err(RayError::NoTransaction);
   }
 
-  // Clear WAL records - nothing was written yet
-  handle.tx.wal_records.clear();
+  if let Some(mvcc) = handle.db.mvcc.as_ref() {
+    let mut tx_mgr = mvcc.tx_manager.lock();
+    tx_mgr.abort_tx(handle.tx.txid);
+  }
 
-  // Clear current transaction
-  if !handle.tx.read_only {
+  if !handle.db.mvcc_enabled() && !handle.tx.read_only {
     let mut current = handle.db.current_tx.lock();
     *current = None;
   }
 
   handle.finished = true;
-  Ok(())
-}
-
-/// Apply WAL records to the delta state
-fn apply_records_to_delta(db: &GraphDB, records: &[WalRecord]) -> Result<()> {
-  let mut delta = db.delta.write();
-
-  for record in records {
-    match record.record_type {
-      WalRecordType::Begin | WalRecordType::Commit | WalRecordType::Rollback => {
-        // Control records don't affect delta
-      }
-      WalRecordType::CreateNode => {
-        if let Some(data) = parse_create_node_payload(&record.payload) {
-          delta.create_node(data.node_id, data.key.as_deref());
-        }
-      }
-      WalRecordType::DeleteNode => {
-        if let Some(data) = parse_delete_node_payload(&record.payload) {
-          delta.delete_node(data.node_id);
-        }
-      }
-      WalRecordType::AddEdge => {
-        if let Some(data) = parse_add_edge_payload(&record.payload) {
-          delta.add_edge(data.src, data.etype, data.dst);
-        }
-      }
-      WalRecordType::DeleteEdge => {
-        if let Some(data) = parse_delete_edge_payload(&record.payload) {
-          delta.delete_edge(data.src, data.etype, data.dst);
-        }
-      }
-      WalRecordType::SetNodeProp => {
-        if let Some(data) = parse_set_node_prop_payload(&record.payload) {
-          delta.set_node_prop(data.node_id, data.key_id, data.value);
-        }
-      }
-      WalRecordType::DelNodeProp => {
-        if let Some(data) = parse_del_node_prop_payload(&record.payload) {
-          delta.delete_node_prop(data.node_id, data.key_id);
-        }
-      }
-      WalRecordType::DefineLabel => {
-        if let Some(data) = parse_define_label_payload(&record.payload) {
-          delta.define_label(data.label_id, &data.name);
-        }
-      }
-      WalRecordType::AddNodeLabel => {
-        if let Some(data) = parse_add_node_label_payload(&record.payload) {
-          delta.add_node_label(data.node_id, data.label_id);
-        }
-      }
-      WalRecordType::RemoveNodeLabel => {
-        if let Some(data) = parse_remove_node_label_payload(&record.payload) {
-          delta.remove_node_label(data.node_id, data.label_id);
-        }
-      }
-      WalRecordType::DefineEtype => {
-        if let Some(data) = parse_define_etype_payload(&record.payload) {
-          delta.define_etype(data.label_id, &data.name);
-        }
-      }
-      WalRecordType::DefinePropkey => {
-        if let Some(data) = parse_define_propkey_payload(&record.payload) {
-          delta.define_propkey(data.label_id, &data.name);
-        }
-      }
-      WalRecordType::SetEdgeProp => {
-        if let Some(data) = parse_set_edge_prop_payload(&record.payload) {
-          delta.set_edge_prop(data.src, data.etype, data.dst, data.key_id, data.value);
-        }
-      }
-      WalRecordType::DelEdgeProp => {
-        if let Some(data) = parse_del_edge_prop_payload(&record.payload) {
-          delta.delete_edge_prop(data.src, data.etype, data.dst, data.key_id);
-        }
-      }
-      WalRecordType::SetNodeVector => {
-        if let Some(data) = parse_set_node_vector_payload(&record.payload) {
-          delta
-            .pending_vectors
-            .insert((data.node_id, data.prop_key_id), Some(data.vector));
-        }
-      }
-      WalRecordType::DelNodeVector => {
-        if let Some(data) = parse_del_node_vector_payload(&record.payload) {
-          delta
-            .pending_vectors
-            .insert((data.node_id, data.prop_key_id), None);
-        }
-      }
-      _ => {
-        // Other record types (vectors, etc.) - skip for now
-      }
-    }
-  }
-
   Ok(())
 }
 

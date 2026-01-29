@@ -13,6 +13,7 @@
 
 pub mod conflict;
 pub mod gc;
+pub mod manager;
 pub mod tx_manager;
 pub mod version_chain;
 pub mod visibility;
@@ -20,7 +21,8 @@ pub mod visibility;
 // Re-export main types for convenience
 pub use conflict::{ConflictDetector, ConflictError, ConflictInfo, ConflictType};
 pub use gc::{GarbageCollector, GcConfig, GcResult, GcStats, SharedGcState};
-pub use tx_manager::{TxManager, TxManagerError};
+pub use manager::MvccManager;
+pub use tx_manager::{CommittedWritesStats, TxManager, TxManagerError};
 pub use version_chain::{
   PooledVersion, SoaPropertyVersions, VersionChainCounts, VersionChainManager,
 };

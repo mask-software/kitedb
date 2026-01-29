@@ -6,7 +6,12 @@
 //! - Improving read performance (fewer delta lookups)
 //! - Controlling memory usage
 
-use crate::error::Result;
+use std::collections::HashSet;
+use std::fs;
+use std::sync::Arc;
+
+use crate::constants::{parse_snapshot_gen, SNAPSHOTS_DIR, TRASH_DIR};
+use crate::error::{RayError, Result};
 
 use super::db::GraphDB;
 
@@ -57,9 +62,11 @@ pub fn should_checkpoint(db: &GraphDB) -> bool {
 }
 
 /// Check if a checkpoint is currently running
-pub fn is_checkpoint_running(_db: &GraphDB) -> bool {
-  // TODO: Track checkpoint state in GraphDB
-  false
+pub fn is_checkpoint_running(db: &GraphDB) -> bool {
+  matches!(
+    *db.checkpoint_status.lock(),
+    CheckpointStatus::Running | CheckpointStatus::Completing
+  )
 }
 
 /// Trigger a blocking checkpoint
@@ -68,13 +75,26 @@ pub fn is_checkpoint_running(_db: &GraphDB) -> bool {
 /// 2. Write the snapshot to disk
 /// 3. Clear the delta state
 /// 4. Reset the WAL
-pub fn checkpoint(db: &mut GraphDB) -> Result<CheckpointStats> {
+fn checkpoint_impl(db: &mut GraphDB, manage_status: bool) -> Result<CheckpointStats> {
   use std::time::Instant;
 
   let start = Instant::now();
 
+  if manage_status {
+    let mut status = db.checkpoint_status.lock();
+    if !matches!(*status, CheckpointStatus::Idle) {
+      return Err(RayError::Internal("Checkpoint already running".to_string()));
+    }
+    *status = CheckpointStatus::Running;
+  }
+
   // Use the GraphDB::optimize() method which handles all the checkpoint logic
-  db.optimize()?;
+  if let Err(err) = db.optimize() {
+    *db.checkpoint_status.lock() = CheckpointStatus::Idle;
+    return Err(err);
+  }
+
+  *db.checkpoint_status.lock() = CheckpointStatus::Completing;
 
   let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -89,6 +109,8 @@ pub fn checkpoint(db: &mut GraphDB) -> Result<CheckpointStats> {
     (0, 0, 0)
   };
 
+  *db.checkpoint_status.lock() = CheckpointStatus::Idle;
+
   Ok(CheckpointStats {
     num_nodes,
     num_edges,
@@ -97,12 +119,52 @@ pub fn checkpoint(db: &mut GraphDB) -> Result<CheckpointStats> {
   })
 }
 
+/// Trigger a blocking checkpoint
+/// This will:
+/// 1. Build a new snapshot from current state
+/// 2. Write the snapshot to disk
+/// 3. Clear the delta state
+/// 4. Reset the WAL
+pub fn checkpoint(db: &mut GraphDB) -> Result<CheckpointStats> {
+  checkpoint_impl(db, true)
+}
+
 /// Trigger a background (non-blocking) checkpoint
 /// For single-file format, this switches writes to the secondary WAL region
 /// while the checkpoint runs
-pub fn trigger_background_checkpoint(_db: &mut GraphDB) -> Result<()> {
-  // TODO: Implement background checkpointing
-  // This requires dual-buffer WAL support
+pub fn trigger_background_checkpoint(db: &mut GraphDB) -> Result<()> {
+  if is_checkpoint_running(db) {
+    return Ok(());
+  }
+
+  checkpoint(db).map(|_| ())
+}
+
+/// Trigger a background checkpoint using a shared, lock-protected GraphDB.
+///
+/// This is the safe async entrypoint for multi-file databases when the caller
+/// holds the DB behind `Arc<Mutex<_>>`.
+pub fn trigger_background_checkpoint_async(
+  db: Arc<parking_lot::Mutex<GraphDB>>,
+) -> Result<()> {
+  let db_guard = db.lock();
+  {
+    let mut status = db_guard.checkpoint_status.lock();
+    if !matches!(*status, CheckpointStatus::Idle) {
+      return Ok(());
+    }
+    *status = CheckpointStatus::Running;
+  }
+  drop(db_guard);
+
+  std::thread::spawn(move || {
+    let mut db = db.lock();
+    let result = checkpoint_impl(&mut db, false);
+    if result.is_err() {
+      *db.checkpoint_status.lock() = CheckpointStatus::Idle;
+    }
+  });
+
   Ok(())
 }
 
@@ -133,10 +195,70 @@ pub fn create_snapshot(db: &mut GraphDB) -> Result<u64> {
 }
 
 /// Delete old snapshots (keeping only the N most recent)
-pub fn prune_snapshots(_db: &GraphDB, _keep_count: usize) -> Result<usize> {
-  // TODO: Implement snapshot pruning
-  // Returns number of snapshots deleted
-  Ok(0)
+pub fn prune_snapshots(db: &GraphDB, keep_count: usize) -> Result<usize> {
+  let manifest = match db.manifest.as_ref() {
+    Some(m) => m,
+    None => return Ok(0),
+  };
+
+  let snapshots_dir = db.path.join(SNAPSHOTS_DIR);
+  if !snapshots_dir.exists() {
+    return Ok(0);
+  }
+
+  let entries = match fs::read_dir(&snapshots_dir) {
+    Ok(e) => e,
+    Err(_) => return Ok(0),
+  };
+
+  let mut snapshots: Vec<(u64, std::path::PathBuf, std::ffi::OsString)> = Vec::new();
+  for entry in entries.flatten() {
+    let filename = entry.file_name();
+    let filename_str = filename.to_string_lossy();
+    if let Some(gen) = parse_snapshot_gen(&filename_str) {
+      snapshots.push((gen, entry.path(), filename));
+    }
+  }
+
+  if snapshots.is_empty() {
+    return Ok(0);
+  }
+
+  snapshots.sort_by(|a, b| b.0.cmp(&a.0));
+
+  let mut keep: HashSet<u64> = snapshots
+    .iter()
+    .take(keep_count)
+    .map(|(gen, _, _)| *gen)
+    .collect();
+
+  if manifest.active_snapshot_gen != 0 {
+    keep.insert(manifest.active_snapshot_gen);
+  }
+  if manifest.prev_snapshot_gen != 0 {
+    keep.insert(manifest.prev_snapshot_gen);
+  }
+
+  let mut deleted = 0usize;
+
+  for (gen, path, filename) in snapshots {
+    if keep.contains(&gen) {
+      continue;
+    }
+
+    if fs::remove_file(&path).is_ok() {
+      deleted += 1;
+      continue;
+    }
+
+    let trash_dir = db.path.join(TRASH_DIR);
+    let _ = fs::create_dir_all(&trash_dir);
+    if fs::rename(&path, trash_dir.join(&filename)).is_ok() {
+      deleted += 1;
+    }
+  }
+
+  Ok(deleted)
 }
 
 // ============================================================================

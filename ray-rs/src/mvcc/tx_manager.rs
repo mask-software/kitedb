@@ -5,8 +5,14 @@
 //! Ported from src/mvcc/tx-manager.ts
 
 use std::collections::{HashMap, HashSet};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::types::{MvccTransaction, MvccTxStatus, Timestamp, TxId};
+
+/// Maximum number of committed write entries before pruning
+const MAX_COMMITTED_WRITES: usize = 100_000;
+/// Prune down to this many entries when over the limit
+const PRUNE_THRESHOLD_ENTRIES: usize = 50_000;
 
 // ============================================================================
 // Transaction Manager
@@ -30,8 +36,12 @@ pub struct TxManager {
   next_commit_ts: Timestamp,
   /// Inverted index: key -> max commitTs for conflict detection
   committed_writes: HashMap<String, Timestamp>,
+  /// Map commit timestamp -> wall clock time (ms since epoch)
+  commit_ts_to_wall_clock: HashMap<Timestamp, u64>,
   /// O(1) tracking of active transaction count
   active_count: usize,
+  /// Total committed write entries pruned (for stats)
+  total_pruned: usize,
 }
 
 impl TxManager {
@@ -47,7 +57,9 @@ impl TxManager {
       next_tx_id: initial_tx_id,
       next_commit_ts: initial_commit_ts,
       committed_writes: HashMap::new(),
+      commit_ts_to_wall_clock: HashMap::new(),
       active_count: 0,
+      total_pruned: 0,
     }
   }
 
@@ -143,6 +155,11 @@ impl TxManager {
     tx.commit_ts = Some(commit_ts);
     tx.status = MvccTxStatus::Committed;
 
+    // Track wall clock time for retention mapping
+    self
+      .commit_ts_to_wall_clock
+      .insert(commit_ts, current_time_ms());
+
     // Index writes for fast conflict detection
     // Store only the max commitTs per key (simpler and faster than array)
     let write_set: Vec<String> = tx.write_set.iter().cloned().collect();
@@ -151,6 +168,10 @@ impl TxManager {
       if existing.is_none() || commit_ts > existing.unwrap() {
         self.committed_writes.insert(key, commit_ts);
       }
+    }
+
+    if self.committed_writes.len() > MAX_COMMITTED_WRITES {
+      self.prune_committed_writes();
     }
 
     // Eager cleanup: if no other active transactions, clean up immediately
@@ -251,7 +272,9 @@ impl TxManager {
   pub fn clear(&mut self) {
     self.active_txs.clear();
     self.committed_writes.clear();
+    self.commit_ts_to_wall_clock.clear();
     self.active_count = 0;
+    self.total_pruned = 0;
   }
 
   /// Get the next transaction ID (useful for recovery)
@@ -268,12 +291,96 @@ impl TxManager {
   pub fn set_next_commit_ts(&mut self, commit_ts: Timestamp) {
     self.next_commit_ts = commit_ts;
   }
+
+  /// Get the oldest commit timestamp that is newer than the retention period
+  pub fn get_retention_horizon_ts(&self, retention_ms: u64) -> Timestamp {
+    let cutoff_time = current_time_ms().saturating_sub(retention_ms);
+    let mut oldest_within_retention = self.next_commit_ts;
+
+    for (commit_ts, wall_clock) in &self.commit_ts_to_wall_clock {
+      if *wall_clock >= cutoff_time && *commit_ts < oldest_within_retention {
+        oldest_within_retention = *commit_ts;
+      }
+    }
+
+    oldest_within_retention
+  }
+
+  /// Prune old wall clock mappings older than the given horizon
+  pub fn prune_wall_clock_mappings(&mut self, horizon_ts: Timestamp) {
+    let to_remove: Vec<Timestamp> = self
+      .commit_ts_to_wall_clock
+      .keys()
+      .copied()
+      .filter(|ts| *ts < horizon_ts)
+      .collect();
+    for ts in to_remove {
+      self.commit_ts_to_wall_clock.remove(&ts);
+    }
+  }
+
+  /// Get statistics about committed writes
+  pub fn get_committed_writes_stats(&self) -> CommittedWritesStats {
+    CommittedWritesStats {
+      size: self.committed_writes.len(),
+      pruned: self.total_pruned,
+    }
+  }
+
+  fn prune_committed_writes(&mut self) {
+    let min_ts = self.min_active_ts();
+    let mut entries: Vec<(String, Timestamp)> = self
+      .committed_writes
+      .iter()
+      .map(|(k, &v)| (k.clone(), v))
+      .collect();
+
+    entries.sort_by_key(|(_, ts)| *ts);
+
+    let target_size = MAX_COMMITTED_WRITES.saturating_sub(PRUNE_THRESHOLD_ENTRIES);
+    let mut current_size = self.committed_writes.len();
+    let mut pruned = 0;
+
+    for (key, commit_ts) in entries {
+      if current_size <= target_size {
+        break;
+      }
+
+      if commit_ts < min_ts {
+        if self.committed_writes.remove(&key).is_some() {
+          current_size = current_size.saturating_sub(1);
+          pruned += 1;
+        }
+      } else {
+        break;
+      }
+    }
+
+    self.total_pruned += pruned;
+  }
+}
+
+fn current_time_ms() -> u64 {
+  SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .map(|d| d.as_millis() as u64)
+    .unwrap_or(0)
 }
 
 impl Default for TxManager {
   fn default() -> Self {
     Self::new()
   }
+}
+
+// ============================================================================
+// Committed Write Stats
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommittedWritesStats {
+  pub size: usize,
+  pub pruned: usize,
 }
 
 // ============================================================================

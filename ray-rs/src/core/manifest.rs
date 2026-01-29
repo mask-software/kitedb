@@ -121,8 +121,8 @@ pub fn parse_manifest(buffer: &[u8]) -> Result<ManifestV1> {
 
   // Reserved u64[5]
   let mut reserved2 = [0u64; 5];
-  for i in 0..5 {
-    reserved2[i] = read_u64(buffer, offset);
+  for slot in reserved2.iter_mut() {
+    *slot = read_u64(buffer, offset);
     offset += 8;
   }
 

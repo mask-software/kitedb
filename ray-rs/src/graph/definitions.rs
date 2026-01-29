@@ -3,7 +3,6 @@
 //! Provides functions for defining and looking up schema elements like
 //! labels (node types), edge types, and property keys.
 
-use crate::core::wal::record::*;
 use crate::error::Result;
 use crate::types::*;
 
@@ -17,17 +16,21 @@ use super::tx::TxHandle;
 /// Define a new label (node type)
 /// Returns an existing ID if the label was already defined
 pub fn define_label(handle: &mut TxHandle, name: &str) -> Result<LabelId> {
-  // Use GraphDB's get_or_create which handles deduplication
-  let label_id = handle.db.get_or_create_label(name);
+  if let Some(existing) = handle.db.get_label_id(name) {
+    return Ok(existing);
+  }
 
-  // Add WAL record for the definition
-  let payload = build_define_label_payload(label_id, name);
-  handle.add_record(WalRecord::new(
-    WalRecordType::DefineLabel,
-    handle.txid(),
-    payload,
-  ))?;
+  for (existing_id, existing_name) in &handle.tx.pending_new_labels {
+    if existing_name == name {
+      return Ok(*existing_id);
+    }
+  }
 
+  let label_id = handle.db.alloc_label_id();
+  handle
+    .tx
+    .pending_new_labels
+    .insert(label_id, name.to_string());
   Ok(label_id)
 }
 
@@ -48,15 +51,21 @@ pub fn get_label_name(db: &GraphDB, id: LabelId) -> Option<String> {
 /// Define a new edge type
 /// Returns an existing ID if the edge type was already defined
 pub fn define_etype(handle: &mut TxHandle, name: &str) -> Result<ETypeId> {
-  let etype_id = handle.db.get_or_create_etype(name);
+  if let Some(existing) = handle.db.get_etype_id(name) {
+    return Ok(existing);
+  }
 
-  let payload = build_define_etype_payload(etype_id, name);
-  handle.add_record(WalRecord::new(
-    WalRecordType::DefineEtype,
-    handle.txid(),
-    payload,
-  ))?;
+  for (existing_id, existing_name) in &handle.tx.pending_new_etypes {
+    if existing_name == name {
+      return Ok(*existing_id);
+    }
+  }
 
+  let etype_id = handle.db.alloc_etype_id();
+  handle
+    .tx
+    .pending_new_etypes
+    .insert(etype_id, name.to_string());
   Ok(etype_id)
 }
 
@@ -77,15 +86,21 @@ pub fn get_etype_name(db: &GraphDB, id: ETypeId) -> Option<String> {
 /// Define a new property key
 /// Returns an existing ID if the property key was already defined
 pub fn define_propkey(handle: &mut TxHandle, name: &str) -> Result<PropKeyId> {
-  let propkey_id = handle.db.get_or_create_propkey(name);
+  if let Some(existing) = handle.db.get_propkey_id(name) {
+    return Ok(existing);
+  }
 
-  let payload = build_define_propkey_payload(propkey_id, name);
-  handle.add_record(WalRecord::new(
-    WalRecordType::DefinePropkey,
-    handle.txid(),
-    payload,
-  ))?;
+  for (existing_id, existing_name) in &handle.tx.pending_new_propkeys {
+    if existing_name == name {
+      return Ok(*existing_id);
+    }
+  }
 
+  let propkey_id = handle.db.alloc_propkey_id();
+  handle
+    .tx
+    .pending_new_propkeys
+    .insert(propkey_id, name.to_string());
   Ok(propkey_id)
 }
 

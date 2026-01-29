@@ -2,8 +2,8 @@
 //!
 //! Provides functions for adding, deleting, and querying edges.
 
-use crate::core::wal::record::*;
-use crate::error::Result;
+use crate::error::{RayError, Result};
+use crate::mvcc::visibility::{edge_exists as mvcc_edge_exists, get_visible_version};
 use crate::types::*;
 
 use super::tx::TxHandle;
@@ -14,13 +14,46 @@ use super::tx::TxHandle;
 
 /// Add an edge between two nodes
 pub fn add_edge(handle: &mut TxHandle, src: NodeId, etype: ETypeId, dst: NodeId) -> Result<()> {
-  // Build ADD_EDGE WAL record
-  let payload = build_add_edge_payload(src, etype, dst);
-  handle.add_record(WalRecord::new(
-    WalRecordType::AddEdge,
-    handle.txid(),
-    payload,
-  ))
+  if handle.tx.read_only {
+    return Err(RayError::ReadOnly);
+  }
+
+  let patch = EdgePatch { etype, other: dst };
+
+  if let Some(del_set) = handle.tx.pending_out_del.get_mut(&src) {
+    if del_set.remove(&patch) {
+      if del_set.is_empty() {
+        handle.tx.pending_out_del.remove(&src);
+      }
+      if let Some(in_del) = handle.tx.pending_in_del.get_mut(&dst) {
+        in_del.remove(&EdgePatch { etype, other: src });
+        if in_del.is_empty() {
+          handle.tx.pending_in_del.remove(&dst);
+        }
+      }
+      return Ok(());
+    }
+  }
+
+  handle
+    .tx
+    .pending_out_add
+    .entry(src)
+    .or_default()
+    .insert(patch);
+  handle
+    .tx
+    .pending_in_add
+    .entry(dst)
+    .or_default()
+    .insert(EdgePatch { etype, other: src });
+
+  if let Some(mvcc) = handle.db.mvcc.as_ref() {
+    let mut tx_mgr = mvcc.tx_manager.lock();
+    tx_mgr.record_write(handle.tx.txid, format!("edge:{src}:{etype}:{dst}"));
+  }
+
+  Ok(())
 }
 
 /// Delete an edge between two nodes
@@ -30,24 +63,77 @@ pub fn delete_edge(
   etype: ETypeId,
   dst: NodeId,
 ) -> Result<bool> {
-  // Check if edge exists
+  if handle.tx.read_only {
+    return Err(RayError::ReadOnly);
+  }
+
   if !edge_exists_internal(handle.db, src, etype, dst) {
     return Ok(false);
   }
 
-  // Build DELETE_EDGE WAL record
-  let payload = build_delete_edge_payload(src, etype, dst);
-  handle.add_record(WalRecord::new(
-    WalRecordType::DeleteEdge,
-    handle.txid(),
-    payload,
-  ))?;
+  let patch = EdgePatch { etype, other: dst };
+  if let Some(add_set) = handle.tx.pending_out_add.get_mut(&src) {
+    if add_set.remove(&patch) {
+      if add_set.is_empty() {
+        handle.tx.pending_out_add.remove(&src);
+      }
+      if let Some(in_add) = handle.tx.pending_in_add.get_mut(&dst) {
+        in_add.remove(&EdgePatch { etype, other: src });
+        if in_add.is_empty() {
+          handle.tx.pending_in_add.remove(&dst);
+        }
+      }
+      return Ok(true);
+    }
+  }
+  handle
+    .tx
+    .pending_out_del
+    .entry(src)
+    .or_default()
+    .insert(patch);
+  handle
+    .tx
+    .pending_in_del
+    .entry(dst)
+    .or_default()
+    .insert(EdgePatch { etype, other: src });
+
+  if let Some(mvcc) = handle.db.mvcc.as_ref() {
+    let mut tx_mgr = mvcc.tx_manager.lock();
+    tx_mgr.record_write(handle.tx.txid, format!("edge:{src}:{etype}:{dst}"));
+  }
 
   Ok(true)
 }
 
 /// Check if an edge exists
 pub fn edge_exists(handle: &TxHandle, src: NodeId, etype: ETypeId, dst: NodeId) -> bool {
+  // Check pending transaction changes first
+  if let Some(add_set) = handle.tx.pending_out_add.get(&src) {
+    if add_set.contains(&EdgePatch { etype, other: dst }) {
+      return true;
+    }
+  }
+  if let Some(del_set) = handle.tx.pending_out_del.get(&src) {
+    if del_set.contains(&EdgePatch { etype, other: dst }) {
+      return false;
+    }
+  }
+
+  if let Some(mvcc) = handle.db.mvcc.as_ref() {
+    let tx_snapshot_ts = handle.tx.snapshot_ts;
+    let txid = handle.tx.txid;
+    {
+      let mut tx_mgr = mvcc.tx_manager.lock();
+      tx_mgr.record_read(txid, format!("edge:{src}:{etype}:{dst}"));
+    }
+    let vc = mvcc.version_chain.lock();
+    if let Some(version) = vc.get_edge_version(src, etype, dst) {
+      return mvcc_edge_exists(Some(version), tx_snapshot_ts, txid);
+    }
+  }
+
   edge_exists_internal(handle.db, src, etype, dst)
 }
 
@@ -64,6 +150,16 @@ fn edge_exists_internal(db: &super::db::GraphDB, src: NodeId, etype: ETypeId, ds
 
 /// Check if an edge exists (direct read, no transaction)
 pub fn edge_exists_db(db: &super::db::GraphDB, src: NodeId, etype: ETypeId, dst: NodeId) -> bool {
+  if let Some(mvcc) = db.mvcc.as_ref() {
+    // Fast-path: no active transactions and no versions
+    let tx_snapshot_ts = mvcc.tx_manager.lock().get_next_commit_ts();
+    let txid = 0;
+    let vc = mvcc.version_chain.lock();
+    if let Some(version) = vc.get_edge_version(src, etype, dst) {
+      return mvcc_edge_exists(Some(version), tx_snapshot_ts, txid);
+    }
+  }
+
   let delta = db.delta.read();
 
   // Check if deleted in delta
@@ -194,6 +290,28 @@ pub fn get_edge_prop_db(
   dst: NodeId,
   key_id: PropKeyId,
 ) -> Option<PropValue> {
+  if let Some(mvcc) = db.mvcc.as_ref() {
+    let tx_snapshot_ts = mvcc.tx_manager.lock().get_next_commit_ts();
+    let txid = 0;
+    let vc = mvcc.version_chain.lock();
+    if let Some(prop_version) = vc.get_edge_prop_version(src, etype, dst, key_id) {
+      if let Some(visible) = get_visible_version(&prop_version, tx_snapshot_ts, txid) {
+        return visible.data.clone();
+      }
+    }
+  }
+
+  get_edge_prop_committed(db, src, etype, dst, key_id)
+}
+
+/// Get an edge property from committed state only (snapshot + delta)
+pub fn get_edge_prop_committed(
+  db: &super::db::GraphDB,
+  src: NodeId,
+  etype: ETypeId,
+  dst: NodeId,
+  key_id: PropKeyId,
+) -> Option<PropValue> {
   let delta = db.delta.read();
 
   if delta.is_edge_deleted(src, etype, dst) {
@@ -285,51 +403,33 @@ pub fn get_edge_props_db(
 
 /// Get outgoing neighbors for a node
 pub fn get_neighbors_out(handle: &TxHandle, src: NodeId, etype: Option<ETypeId>) -> Vec<NodeId> {
-  let delta = handle.db.delta.read();
-  let mut neighbors = Vec::new();
+  let mut neighbors = get_neighbors_out_db(handle.db, src, etype);
 
-  // Build set of deleted edges for filtering
-  let deleted_set = delta.out_del.get(&src);
+  if let Some(del_set) = handle.tx.pending_out_del.get(&src) {
+    neighbors.retain(|dst| {
+      if let Some(filter_etype) = etype {
+        !del_set.contains(&EdgePatch {
+          etype: filter_etype,
+          other: *dst,
+        })
+      } else {
+        !del_set.iter().any(|patch| patch.other == *dst)
+      }
+    });
+  }
 
-  // Get from snapshot first
-  if let Some(ref snapshot) = handle.db.snapshot {
-    if let Some(src_phys) = snapshot.get_phys_node(src) {
-      for (dst_phys, edge_etype) in snapshot.iter_out_edges(src_phys) {
-        // Filter by edge type if specified
-        if etype.is_some() && etype != Some(edge_etype) {
-          continue;
-        }
-
-        // Get the logical node ID for the destination
-        if let Some(dst_id) = snapshot.get_node_id(dst_phys) {
-          // Check if this edge was deleted in delta
-          let is_deleted = deleted_set
-            .map(|set| {
-              set.contains(&crate::types::EdgePatch {
-                etype: edge_etype,
-                other: dst_id,
-              })
-            })
-            .unwrap_or(false);
-
-          if !is_deleted {
-            neighbors.push(dst_id);
-          }
-        }
+  if let Some(add_set) = handle.tx.pending_out_add.get(&src) {
+    for patch in add_set {
+      if (etype.is_none() || etype == Some(patch.etype)) && !neighbors.contains(&patch.other) {
+        neighbors.push(patch.other);
       }
     }
   }
 
-  // Get from delta additions
-  if let Some(add_set) = delta.out_add.get(&src) {
-    for patch in add_set {
-      if etype.is_none() || etype == Some(patch.etype) {
-        // Only add if not already in neighbors (from snapshot)
-        if !neighbors.contains(&patch.other) {
-          neighbors.push(patch.other);
-        }
-      }
-    }
+  if let Some(mvcc) = handle.db.mvcc.as_ref() {
+    let mut tx_mgr = mvcc.tx_manager.lock();
+    let etype_key = etype.map(|e| e.to_string()).unwrap_or_else(|| "*".to_string());
+    tx_mgr.record_read(handle.tx.txid, format!("neighbors_out:{src}:{etype_key}"));
   }
 
   neighbors
@@ -337,51 +437,33 @@ pub fn get_neighbors_out(handle: &TxHandle, src: NodeId, etype: Option<ETypeId>)
 
 /// Get incoming neighbors for a node
 pub fn get_neighbors_in(handle: &TxHandle, dst: NodeId, etype: Option<ETypeId>) -> Vec<NodeId> {
-  let delta = handle.db.delta.read();
-  let mut neighbors = Vec::new();
+  let mut neighbors = get_neighbors_in_db(handle.db, dst, etype);
 
-  // Build set of deleted edges for filtering
-  let deleted_set = delta.in_del.get(&dst);
+  if let Some(del_set) = handle.tx.pending_in_del.get(&dst) {
+    neighbors.retain(|src_id| {
+      if let Some(filter_etype) = etype {
+        !del_set.contains(&EdgePatch {
+          etype: filter_etype,
+          other: *src_id,
+        })
+      } else {
+        !del_set.iter().any(|patch| patch.other == *src_id)
+      }
+    });
+  }
 
-  // Get from snapshot first
-  if let Some(ref snapshot) = handle.db.snapshot {
-    if let Some(dst_phys) = snapshot.get_phys_node(dst) {
-      for (src_phys, edge_etype, _out_idx) in snapshot.iter_in_edges(dst_phys) {
-        // Filter by edge type if specified
-        if etype.is_some() && etype != Some(edge_etype) {
-          continue;
-        }
-
-        // Get the logical node ID for the source
-        if let Some(src_id) = snapshot.get_node_id(src_phys) {
-          // Check if this edge was deleted in delta
-          let is_deleted = deleted_set
-            .map(|set| {
-              set.contains(&crate::types::EdgePatch {
-                etype: edge_etype,
-                other: src_id,
-              })
-            })
-            .unwrap_or(false);
-
-          if !is_deleted {
-            neighbors.push(src_id);
-          }
-        }
+  if let Some(add_set) = handle.tx.pending_in_add.get(&dst) {
+    for patch in add_set {
+      if (etype.is_none() || etype == Some(patch.etype)) && !neighbors.contains(&patch.other) {
+        neighbors.push(patch.other);
       }
     }
   }
 
-  // Get from delta additions
-  if let Some(add_set) = delta.in_add.get(&dst) {
-    for patch in add_set {
-      if etype.is_none() || etype == Some(patch.etype) {
-        // Only add if not already in neighbors (from snapshot)
-        if !neighbors.contains(&patch.other) {
-          neighbors.push(patch.other);
-        }
-      }
-    }
+  if let Some(mvcc) = handle.db.mvcc.as_ref() {
+    let mut tx_mgr = mvcc.tx_manager.lock();
+    let etype_key = etype.map(|e| e.to_string()).unwrap_or_else(|| "*".to_string());
+    tx_mgr.record_read(handle.tx.txid, format!("neighbors_in:{dst}:{etype_key}"));
   }
 
   neighbors
@@ -400,12 +482,23 @@ pub fn set_edge_prop(
   key_id: PropKeyId,
   value: PropValue,
 ) -> Result<()> {
-  let payload = build_set_edge_prop_payload(src, etype, dst, key_id, &value);
-  handle.add_record(WalRecord::new(
-    WalRecordType::SetEdgeProp,
-    handle.txid(),
-    payload,
-  ))
+  if handle.tx.read_only {
+    return Err(RayError::ReadOnly);
+  }
+
+  let props = handle
+    .tx
+    .pending_edge_props
+    .entry((src, etype, dst))
+    .or_default();
+  props.insert(key_id, Some(value));
+
+  if let Some(mvcc) = handle.db.mvcc.as_ref() {
+    let mut tx_mgr = mvcc.tx_manager.lock();
+    tx_mgr.record_write(handle.tx.txid, format!("edgeprop:{src}:{etype}:{dst}:{key_id}"));
+  }
+
+  Ok(())
 }
 
 /// Delete a property from an edge
@@ -416,12 +509,23 @@ pub fn del_edge_prop(
   dst: NodeId,
   key_id: PropKeyId,
 ) -> Result<()> {
-  let payload = build_del_edge_prop_payload(src, etype, dst, key_id);
-  handle.add_record(WalRecord::new(
-    WalRecordType::DelEdgeProp,
-    handle.txid(),
-    payload,
-  ))
+  if handle.tx.read_only {
+    return Err(RayError::ReadOnly);
+  }
+
+  let props = handle
+    .tx
+    .pending_edge_props
+    .entry((src, etype, dst))
+    .or_default();
+  props.insert(key_id, None);
+
+  if let Some(mvcc) = handle.db.mvcc.as_ref() {
+    let mut tx_mgr = mvcc.tx_manager.lock();
+    tx_mgr.record_write(handle.tx.txid, format!("edgeprop:{src}:{etype}:{dst}:{key_id}"));
+  }
+
+  Ok(())
 }
 
 /// Get a property from an edge
@@ -432,25 +536,41 @@ pub fn get_edge_prop(
   dst: NodeId,
   key_id: PropKeyId,
 ) -> Option<PropValue> {
-  let delta = handle.db.delta.read();
-
-  // Check if edge is deleted in delta
-  if delta.is_edge_deleted(src, etype, dst) {
-    return None;
-  }
-
-  // Check delta first (for modifications)
-  if let Some(delta_props) = delta.edge_props.get(&(src, etype, dst)) {
-    if let Some(value) = delta_props.get(&key_id) {
-      // Some(None) means explicitly deleted
+  if let Some(pending) = handle.tx.pending_edge_props.get(&(src, etype, dst)) {
+    if let Some(value) = pending.get(&key_id) {
       return value.clone();
     }
   }
 
-  // Check if edge was added in delta (might not have props in snapshot)
+  if let Some(mvcc) = handle.db.mvcc.as_ref() {
+    let tx_snapshot_ts = handle.tx.snapshot_ts;
+    let txid = handle.tx.txid;
+    {
+      let mut tx_mgr = mvcc.tx_manager.lock();
+      tx_mgr.record_read(txid, format!("edgeprop:{src}:{etype}:{dst}:{key_id}"));
+    }
+    let vc = mvcc.version_chain.lock();
+    if let Some(prop_version) = vc.get_edge_prop_version(src, etype, dst, key_id) {
+      if let Some(visible) = get_visible_version(&prop_version, tx_snapshot_ts, txid) {
+        return visible.data.clone();
+      }
+    }
+  }
+
+  let delta = handle.db.delta.read();
+
+  if delta.is_edge_deleted(src, etype, dst) {
+    return None;
+  }
+
+  if let Some(delta_props) = delta.edge_props.get(&(src, etype, dst)) {
+    if let Some(value) = delta_props.get(&key_id) {
+      return value.clone();
+    }
+  }
+
   let edge_added_in_delta = delta.is_edge_added(src, etype, dst);
 
-  // Fall back to snapshot
   if let Some(ref snapshot) = handle.db.snapshot {
     if let Some(src_phys) = snapshot.get_phys_node(src) {
       if let Some(dst_phys) = snapshot.get_phys_node(dst) {
@@ -461,7 +581,6 @@ pub fn get_edge_prop(
             }
           }
         } else if !edge_added_in_delta {
-          // Edge doesn't exist in snapshot and wasn't added in delta
           return None;
         }
       }
@@ -482,13 +601,24 @@ pub fn get_edge_props(
 
   let delta = handle.db.delta.read();
 
-  // Check if edge is deleted in delta
   if delta.is_edge_deleted(src, etype, dst) {
     return None;
   }
 
+  if let Some(del_set) = handle.tx.pending_out_del.get(&src) {
+    if del_set.contains(&EdgePatch { etype, other: dst }) {
+      return None;
+    }
+  }
+
   let mut props = HashMap::new();
   let edge_added_in_delta = delta.is_edge_added(src, etype, dst);
+  let edge_added_in_tx = handle
+    .tx
+    .pending_out_add
+    .get(&src)
+    .map(|set| set.contains(&EdgePatch { etype, other: dst }))
+    .unwrap_or(false);
   let mut edge_exists_in_snapshot = false;
 
   // Check snapshot for edge existence and get base properties
@@ -506,7 +636,7 @@ pub fn get_edge_props(
   }
 
   // Edge must exist either in delta or snapshot
-  if !edge_added_in_delta && !edge_exists_in_snapshot {
+  if !edge_added_in_delta && !edge_exists_in_snapshot && !edge_added_in_tx {
     return None;
   }
 
@@ -519,6 +649,20 @@ pub fn get_edge_props(
         }
         None => {
           props.remove(&key_id);
+        }
+      }
+    }
+  }
+
+  // Apply pending transaction modifications
+  if let Some(pending_props) = handle.tx.pending_edge_props.get(&(src, etype, dst)) {
+    for (key_id, value) in pending_props {
+      match value {
+        Some(v) => {
+          props.insert(*key_id, v.clone());
+        }
+        None => {
+          props.remove(key_id);
         }
       }
     }
@@ -577,11 +721,38 @@ pub fn count_edges_out(handle: &TxHandle, src: NodeId, etype: Option<ETypeId>) -
     0
   };
 
-  // Note: deleted count represents edges deleted from snapshot
-  // So formula is: snapshot - deleted + added
-  // However, added edges might overlap with snapshot edges that were deleted
-  // For simplicity, we're assuming no overlaps
-  snapshot_count.saturating_sub(deleted) + added
+  let mut count = snapshot_count.saturating_sub(deleted) + added;
+
+  let pending_added = handle
+    .tx
+    .pending_out_add
+    .get(&src)
+    .map(|set| {
+      if let Some(et) = etype {
+        set.iter().filter(|p| p.etype == et).count()
+      } else {
+        set.len()
+      }
+    })
+    .unwrap_or(0);
+
+  let pending_deleted = handle
+    .tx
+    .pending_out_del
+    .get(&src)
+    .map(|set| {
+      if let Some(et) = etype {
+        set.iter().filter(|p| p.etype == et).count()
+      } else {
+        set.len()
+      }
+    })
+    .unwrap_or(0);
+
+  count = count.saturating_add(pending_added);
+  count = count.saturating_sub(pending_deleted);
+
+  count
 }
 
 // ============================================================================

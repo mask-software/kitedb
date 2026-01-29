@@ -457,11 +457,11 @@ impl VersionChainManager {
       self
         .soa_node_props
         .get_head(key)
-        .map(|pooled| self.pooled_to_versioned(&self.soa_node_props, pooled))
+        .map(|pooled| Self::pooled_to_versioned(&self.soa_node_props, pooled))
     } else {
       self.legacy_node_props.get(&key).map(|b| {
         // Clone the versioned record for API compatibility
-        self.clone_versioned_record(b.as_ref())
+        Self::clone_versioned_record(b.as_ref())
       })
     }
   }
@@ -471,6 +471,7 @@ impl VersionChainManager {
   // ========================================================================
 
   /// Append a new version to an edge property's version chain
+  #[allow(clippy::too_many_arguments)]
   pub fn append_edge_prop_version(
     &mut self,
     src: NodeId,
@@ -512,12 +513,12 @@ impl VersionChainManager {
       self
         .soa_edge_props
         .get_head(key)
-        .map(|pooled| self.pooled_to_versioned(&self.soa_edge_props, pooled))
+        .map(|pooled| Self::pooled_to_versioned(&self.soa_edge_props, pooled))
     } else {
       self
         .legacy_edge_props
         .get(&key)
-        .map(|b| self.clone_versioned_record(b.as_ref()))
+        .map(|b| Self::clone_versioned_record(b.as_ref()))
     }
   }
 
@@ -527,14 +528,13 @@ impl VersionChainManager {
 
   /// Convert a pooled version to a VersionedRecord (for API compatibility)
   fn pooled_to_versioned(
-    &self,
     store: &SoaPropertyVersions<Option<PropValue>>,
     pooled: PooledVersion<&Option<PropValue>>,
   ) -> VersionedRecord<Option<PropValue>> {
     let prev = if pooled.prev_idx != NULL_IDX {
       store
         .get_at(pooled.prev_idx)
-        .map(|prev_pooled| Box::new(self.pooled_to_versioned(store, prev_pooled)))
+        .map(|prev_pooled| Box::new(Self::pooled_to_versioned(store, prev_pooled)))
     } else {
       None
     };
@@ -549,10 +549,7 @@ impl VersionChainManager {
   }
 
   /// Clone a versioned record (for API compatibility)
-  fn clone_versioned_record(
-    &self,
-    record: &VersionedRecord<Option<PropValue>>,
-  ) -> VersionedRecord<Option<PropValue>> {
+  fn clone_versioned_record(record: &VersionedRecord<Option<PropValue>>) -> VersionedRecord<Option<PropValue>> {
     VersionedRecord {
       data: record.data.clone(),
       txid: record.txid,
@@ -560,7 +557,7 @@ impl VersionChainManager {
       prev: record
         .prev
         .as_ref()
-        .map(|p| Box::new(self.clone_versioned_record(p))),
+        .map(|p| Box::new(Self::clone_versioned_record(p))),
       deleted: record.deleted,
     }
   }

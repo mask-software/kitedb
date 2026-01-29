@@ -328,7 +328,7 @@ pub fn count_edges(db: &GraphDB, etype_filter: Option<ETypeId>) -> u64 {
     .unwrap_or(0);
 
   // Subtract deleted edges
-  for (_src, del_set) in &delta.out_del {
+  for del_set in delta.out_del.values() {
     for patch in del_set {
       if etype_filter.is_none() || etype_filter == Some(patch.etype) {
         count = count.saturating_sub(1);
@@ -337,7 +337,7 @@ pub fn count_edges(db: &GraphDB, etype_filter: Option<ETypeId>) -> u64 {
   }
 
   // Add created edges
-  for (_src, add_set) in &delta.out_add {
+  for add_set in delta.out_add.values() {
     for patch in add_set {
       if etype_filter.is_none() || etype_filter == Some(patch.etype) {
         count += 1;

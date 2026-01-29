@@ -211,6 +211,12 @@ pub trait EdgeLike {
   fn is_added(&self) -> bool;
 }
 
+impl EdgeLike for crate::types::EdgeVersionData {
+  fn is_added(&self) -> bool {
+    self.added
+  }
+}
+
 // ============================================================================
 // Tests
 // ============================================================================

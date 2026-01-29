@@ -344,7 +344,7 @@ impl Ray {
     let full_key = node_def.key(key_suffix);
 
     // Begin transaction
-    let mut handle = begin_tx(&mut self.db)?;
+    let mut handle = begin_tx(&self.db)?;
 
     // Create the node with key
     let node_opts = NodeOpts {
@@ -375,7 +375,13 @@ impl Ray {
   /// to get the created node reference.
   ///
   /// # Example
-  /// ```ignore
+  /// ```rust,no_run
+  /// # use raydb_core::api::ray::Ray;
+  /// # use raydb_core::types::PropValue;
+  /// # use std::collections::HashMap;
+  /// # fn main() -> raydb_core::error::Result<()> {
+  /// # let mut ray: Ray = unimplemented!();
+  /// # let props: HashMap<String, PropValue> = HashMap::new();
   /// // Insert and get the node reference
   /// let user = ray.insert("User")?
   ///     .values("alice", props)?
@@ -385,6 +391,8 @@ impl Ray {
   /// ray.insert("User")?
   ///     .values("bob", HashMap::new())?
   ///     .execute()?;
+  /// # Ok(())
+  /// # }
   /// ```
   pub fn insert(&mut self, node_type: &str) -> Result<RayInsertBuilder<'_>> {
     let key_prefix = self
@@ -456,7 +464,7 @@ impl Ray {
 
   /// Delete a node
   pub fn delete_node(&mut self, node_id: NodeId) -> Result<bool> {
-    let mut handle = begin_tx(&mut self.db)?;
+    let mut handle = begin_tx(&self.db)?;
     let deleted = delete_node(&mut handle, node_id)?;
     commit(&mut handle)?;
     Ok(deleted)
@@ -473,7 +481,7 @@ impl Ray {
   pub fn set_prop(&mut self, node_id: NodeId, prop_name: &str, value: PropValue) -> Result<()> {
     let prop_key_id = self.db.get_or_create_propkey(prop_name);
 
-    let mut handle = begin_tx(&mut self.db)?;
+    let mut handle = begin_tx(&self.db)?;
     set_node_prop(&mut handle, node_id, prop_key_id, value)?;
     commit(&mut handle)?;
     Ok(())
@@ -482,12 +490,18 @@ impl Ray {
   /// Update a node by reference using fluent builder API
   ///
   /// # Example
-  /// ```ignore
+  /// ```rust,no_run
+  /// # use raydb_core::api::ray::Ray;
+  /// # use raydb_core::types::PropValue;
+  /// # fn main() -> raydb_core::error::Result<()> {
+  /// # let mut ray: Ray = unimplemented!();
   /// let alice = ray.get("User", "alice")?.unwrap();
   /// ray.update(&alice)?
   ///     .set("name", PropValue::String("Alice Updated".into()))
   ///     .set("age", PropValue::I64(31))
   ///     .execute()?;
+  /// # Ok(())
+  /// # }
   /// ```
   pub fn update(&mut self, node_ref: &NodeRef) -> Result<RayUpdateNodeBuilder<'_>> {
     // Verify node exists
@@ -509,10 +523,17 @@ impl Ray {
   /// Update a node by ID using fluent builder API
   ///
   /// # Example
-  /// ```ignore
+  /// ```rust,no_run
+  /// # use raydb_core::api::ray::Ray;
+  /// # use raydb_core::types::{NodeId, PropValue};
+  /// # fn main() -> raydb_core::error::Result<()> {
+  /// # let mut ray: Ray = unimplemented!();
+  /// # let node_id: NodeId = 1;
   /// ray.update_by_id(node_id)?
   ///     .set("name", PropValue::String("Updated".into()))
   ///     .execute()?;
+  /// # Ok(())
+  /// # }
   /// ```
   pub fn update_by_id(&mut self, node_id: NodeId) -> Result<RayUpdateNodeBuilder<'_>> {
     // Verify node exists
@@ -534,10 +555,16 @@ impl Ray {
   /// Update a node by key using fluent builder API
   ///
   /// # Example
-  /// ```ignore
+  /// ```rust,no_run
+  /// # use raydb_core::api::ray::Ray;
+  /// # use raydb_core::types::PropValue;
+  /// # fn main() -> raydb_core::error::Result<()> {
+  /// # let mut ray: Ray = unimplemented!();
   /// ray.update_by_key("User", "alice")?
   ///     .set("name", PropValue::String("Alice Updated".into()))
   ///     .execute()?;
+  /// # Ok(())
+  /// # }
   /// ```
   pub fn update_by_key(
     &mut self,
@@ -586,11 +613,20 @@ impl Ray {
   /// Create an edge between two nodes with properties
   ///
   /// # Example
-  /// ```ignore
+  /// ```rust,no_run
+  /// # use raydb_core::api::ray::{NodeRef, Ray};
+  /// # use raydb_core::types::PropValue;
+  /// # use std::collections::HashMap;
+  /// # fn main() -> raydb_core::error::Result<()> {
+  /// # let mut ray: Ray = unimplemented!();
+  /// # let alice: NodeRef = unimplemented!();
+  /// # let bob: NodeRef = unimplemented!();
   /// let mut props = HashMap::new();
   /// props.insert("weight".to_string(), PropValue::F64(0.5));
   /// props.insert("since".to_string(), PropValue::String("2024".into()));
   /// ray.link_with_props(alice.id, "FOLLOWS", bob.id, props)?;
+  /// # Ok(())
+  /// # }
   /// ```
   pub fn link_with_props(
     &mut self,
@@ -638,7 +674,7 @@ impl Ray {
       .etype_id
       .ok_or_else(|| RayError::InvalidSchema("Edge type not initialized".to_string()))?;
 
-    let mut handle = begin_tx(&mut self.db)?;
+    let mut handle = begin_tx(&self.db)?;
     let deleted = delete_edge(&mut handle, src, etype_id, dst)?;
     commit(&mut handle)?;
     Ok(deleted)
@@ -822,11 +858,19 @@ impl Ray {
   /// in a single transaction.
   ///
   /// # Example
-  /// ```ignore
-  /// ray.update_edge(alice_id, "FOLLOWS", bob_id)
+  /// ```rust,no_run
+  /// # use raydb_core::api::ray::Ray;
+  /// # use raydb_core::types::{NodeId, PropValue};
+  /// # fn main() -> raydb_core::error::Result<()> {
+  /// # let mut ray: Ray = unimplemented!();
+  /// # let alice_id: NodeId = 1;
+  /// # let bob_id: NodeId = 2;
+  /// ray.update_edge(alice_id, "FOLLOWS", bob_id)?
   ///    .set("weight", PropValue::Float(0.9))
   ///    .set("since", PropValue::String("2024".to_string()))
   ///    .execute()?;
+  /// # Ok(())
+  /// # }
   /// ```
   pub fn update_edge(
     &mut self,
@@ -916,10 +960,15 @@ impl Ray {
   /// Filters nodes by matching their key prefix.
   ///
   /// # Example
-  /// ```ignore
+  /// ```rust,no_run
+  /// # use raydb_core::api::ray::Ray;
+  /// # fn main() -> raydb_core::error::Result<()> {
+  /// # let ray: Ray = unimplemented!();
   /// for node_ref in ray.all("User")? {
   ///     println!("User: {:?}", node_ref.id);
   /// }
+  /// # Ok(())
+  /// # }
   /// ```
   pub fn all(&self, node_type: &str) -> Result<impl Iterator<Item = NodeRef> + '_> {
     let node_def = self
@@ -951,10 +1000,15 @@ impl Ray {
   /// Returns an iterator that yields edge information.
   ///
   /// # Example
-  /// ```ignore
+  /// ```rust,no_run
+  /// # use raydb_core::api::ray::Ray;
+  /// # fn main() -> raydb_core::error::Result<()> {
+  /// # let ray: Ray = unimplemented!();
   /// for edge in ray.all_edges(Some("FOLLOWS"))? {
   ///     println!("{} -> {}", edge.src, edge.dst);
   /// }
+  /// # Ok(())
+  /// # }
   /// ```
   pub fn all_edges(&self, edge_type: Option<&str>) -> Result<impl Iterator<Item = FullEdge> + '_> {
     let etype_id = match edge_type {
@@ -978,11 +1032,16 @@ impl Ray {
   /// for traversals or edge operations.
   ///
   /// # Example
-  /// ```ignore
+  /// ```rust,no_run
+  /// # use raydb_core::api::ray::Ray;
+  /// # fn main() -> raydb_core::error::Result<()> {
+  /// # let ray: Ray = unimplemented!();
   /// let user_ref = ray.get_ref("User", "alice")?;
   /// if let Some(node) = user_ref {
   ///     // Can now use node.id for edges, traversals, etc.
   /// }
+  /// # Ok(())
+  /// # }
   /// ```
   /// Get a lightweight node reference by key (direct read, no transaction overhead)
   ///
@@ -990,12 +1049,17 @@ impl Ray {
   /// Use this when you only need the node ID for traversals or edge operations.
   ///
   /// # Example
-  /// ```ignore
+  /// ```rust,no_run
+  /// # use raydb_core::api::ray::Ray;
+  /// # fn main() -> raydb_core::error::Result<()> {
+  /// # let ray: Ray = unimplemented!();
   /// // Fast: only gets reference (~85ns)
   /// if let Some(node) = ray.get_ref("User", "alice")? {
   ///     // Can now use node.id for edges, traversals, etc.
-  ///     let friends = ray.from(node.id).out("FOLLOWS").collect();
+  ///     let friends = ray.from(node.id).out(Some("FOLLOWS"))?.to_vec();
   /// }
+  /// # Ok(())
+  /// # }
   /// ```
   pub fn get_ref(&self, node_type: &str, key_suffix: &str) -> Result<Option<NodeRef>> {
     let node_def = self
@@ -1054,11 +1118,18 @@ impl Ray {
   ///
   /// # Example
   ///
-  /// ```rust,ignore
-  /// let friends = ray.from(alice.id)
-  ///     .out(Some("FOLLOWS"))
-  ///     .out(Some("FOLLOWS"))
+  /// ```rust,no_run
+  /// # use raydb_core::api::ray::{NodeRef, Ray};
+  /// # fn main() -> raydb_core::error::Result<()> {
+  /// # let ray: Ray = unimplemented!();
+  /// # let alice: NodeRef = unimplemented!();
+  /// let friends = ray
+  ///     .from(alice.id)
+  ///     .out(Some("FOLLOWS"))?
+  ///     .out(Some("FOLLOWS"))?
   ///     .to_vec();
+  /// # Ok(())
+  /// # }
   /// ```
   pub fn from(&self, node_id: NodeId) -> RayTraversalBuilder<'_> {
     RayTraversalBuilder::new(self, vec![node_id])
@@ -1080,9 +1151,15 @@ impl Ray {
   ///
   /// # Example
   ///
-  /// ```rust,ignore
-  /// let path = ray.shortest_path(alice.id, bob.id)
-  ///     .via("FOLLOWS")
+  /// ```rust,no_run
+  /// # use raydb_core::api::ray::{NodeRef, Ray};
+  /// # fn main() -> raydb_core::error::Result<()> {
+  /// # let ray: Ray = unimplemented!();
+  /// # let alice: NodeRef = unimplemented!();
+  /// # let bob: NodeRef = unimplemented!();
+  /// let path = ray
+  ///     .shortest_path(alice.id, bob.id)
+  ///     .via("FOLLOWS")?
   ///     .max_depth(5)
   ///     .find();
   ///
@@ -1090,6 +1167,8 @@ impl Ray {
   ///     println!("Path: {:?}", path.path);
   ///     println!("Total weight: {}", path.total_weight);
   /// }
+  /// # Ok(())
+  /// # }
   /// ```
   pub fn shortest_path(&self, source: NodeId, target: NodeId) -> RayPathBuilder<'_> {
     RayPathBuilder::new(self, source, target)
@@ -1123,9 +1202,15 @@ impl Ray {
   ///
   /// # Example
   ///
-  /// ```rust,ignore
-  /// let reachable = ray.reachable_from(alice.id, 3, Some("FOLLOWS"));
+  /// ```rust,no_run
+  /// # use raydb_core::api::ray::{NodeRef, Ray};
+  /// # fn main() -> raydb_core::error::Result<()> {
+  /// # let ray: Ray = unimplemented!();
+  /// # let alice: NodeRef = unimplemented!();
+  /// let reachable = ray.reachable_from(alice.id, 3, Some("FOLLOWS"))?;
   /// println!("Alice can reach {} nodes in 3 hops", reachable.len());
+  /// # Ok(())
+  /// # }
   /// ```
   pub fn reachable_from(
     &self,
@@ -1353,6 +1438,22 @@ impl Ray {
       .map(|m| m.active_wal_seg)
       .unwrap_or(0);
 
+    let mvcc_stats = self.db.mvcc.as_ref().map(|mvcc| {
+      let tx_mgr = mvcc.tx_manager.lock();
+      let gc = mvcc.gc.lock();
+      let gc_stats = gc.get_stats();
+      let committed_stats = tx_mgr.get_committed_writes_stats();
+      MvccStats {
+        active_transactions: tx_mgr.get_active_count(),
+        min_active_ts: tx_mgr.min_active_ts(),
+        versions_pruned: gc_stats.versions_pruned,
+        gc_runs: gc_stats.gc_runs,
+        last_gc_time: gc_stats.last_gc_time,
+        committed_writes_size: committed_stats.size,
+        committed_writes_pruned: committed_stats.pruned,
+      }
+    });
+
     // Recommend compaction if delta has significant changes
     let total_changes =
       delta_nodes_created + delta_nodes_deleted + delta_edges_added + delta_edges_deleted;
@@ -1368,9 +1469,9 @@ impl Ray {
       delta_edges_added,
       delta_edges_deleted,
       wal_segment,
-      wal_bytes: 0, // Would need to track WAL size
+      wal_bytes: self.db.wal_bytes(),
       recommend_compact,
-      mvcc_stats: None,
+      mvcc_stats,
     }
   }
 
@@ -1382,7 +1483,10 @@ impl Ray {
   /// - Current statistics
   ///
   /// # Example
-  /// ```ignore
+  /// ```rust,no_run
+  /// # use raydb_core::api::ray::Ray;
+  /// # fn main() {
+  /// # let ray: Ray = unimplemented!();
   /// println!("{}", ray.describe());
   /// // Output:
   /// // RayDB at /path/to/db (multi-file format)
@@ -1392,6 +1496,7 @@ impl Ray {
   /// // Statistics:
   /// //   Nodes: 1,234 (snapshot: 1,200, delta: +34)
   /// //   Edges: 5,678 (snapshot: 5,600, delta: +78)
+  /// # }
   /// ```
   pub fn describe(&self) -> String {
     let stats = self.stats();
@@ -1454,102 +1559,40 @@ impl Ray {
   /// error/warning messages otherwise.
   ///
   /// # Example
-  /// ```ignore
+  /// ```rust,no_run
+  /// # use raydb_core::api::ray::Ray;
+  /// # fn main() -> raydb_core::error::Result<()> {
+  /// # let ray: Ray = unimplemented!();
   /// let result = ray.check()?;
   /// if !result.valid {
   ///     for error in &result.errors {
   ///         eprintln!("Error: {}", error);
   ///     }
   /// }
+  /// # Ok(())
+  /// # }
   /// ```
   pub fn check(&self) -> Result<CheckResult> {
-    use crate::graph::edges::edge_exists;
-    use crate::graph::nodes::node_exists;
-
-    let mut errors = Vec::new();
-    let mut warnings = Vec::new();
-
-    let mut handle = begin_tx(&self.db)?;
-
-    // Get all nodes
-    let all_nodes = list_nodes(&self.db);
-    let node_count = all_nodes.len();
-
-    if node_count == 0 {
-      warnings.push("No nodes in database".to_string());
-      commit(&mut handle)?;
-      return Ok(CheckResult {
+    let mut result = if let Some(ref snapshot) = self.db.snapshot {
+      crate::check::check_snapshot(snapshot)
+    } else {
+      CheckResult {
         valid: true,
-        errors,
-        warnings,
-      });
-    }
-
-    // Check 1: Verify all edges reference existing nodes
-    let all_edges = list_edges(&self.db, ListEdgesOptions::default());
-    let edge_count = all_edges.len();
-
-    for edge in &all_edges {
-      // Check source node exists
-      if !node_exists(&handle, edge.src) {
-        errors.push(format!(
-          "Edge references non-existent source node: {} -[{}]-> {}",
-          edge.src, edge.etype, edge.dst
-        ));
+        errors: Vec::new(),
+        warnings: vec!["No snapshot to check".to_string()],
       }
+    };
 
-      // Check destination node exists
-      if !node_exists(&handle, edge.dst) {
-        errors.push(format!(
-          "Edge references non-existent destination node: {} -[{}]-> {}",
-          edge.src, edge.etype, edge.dst
-        ));
-      }
-    }
-
-    // Check 2: Verify edge reciprocity (outgoing edges have corresponding incoming edges)
-    // This is implicit in the current storage model, but we verify the edge_exists function
-    // returns consistent results
-    for edge in &all_edges {
-      let exists = edge_exists(&handle, edge.src, edge.etype, edge.dst);
-      if !exists {
-        errors.push(format!(
-          "Edge inconsistency: edge {} -[{}]-> {} listed but not found via edge_exists",
-          edge.src, edge.etype, edge.dst
-        ));
-      }
-    }
-
-    // Check 3: Count consistency
-    let counted_nodes = count_nodes(&self.db);
-    let counted_edges = count_edges(&self.db, None);
-
-    if counted_nodes as usize != node_count {
-      warnings.push(format!(
-        "Node count mismatch: list_nodes returned {node_count} but count_nodes returned {counted_nodes}"
-      ));
-    }
-
-    if counted_edges as usize != edge_count {
-      warnings.push(format!(
-        "Edge count mismatch: list_edges returned {edge_count} but count_edges returned {counted_edges}"
-      ));
-    }
-
-    // Check 4: Schema consistency - verify all registered edge types have valid IDs
+    // Schema consistency - verify all registered edge types have valid IDs
     for (edge_name, edge_def) in &self.edges {
       if edge_def.etype_id.is_none() {
-        warnings.push(format!("Edge type '{edge_name}' has no assigned etype_id"));
+        result
+          .warnings
+          .push(format!("Edge type '{edge_name}' has no assigned etype_id"));
       }
     }
 
-    commit(&mut handle)?;
-
-    Ok(CheckResult {
-      valid: errors.is_empty(),
-      errors,
-      warnings,
-    })
+    Ok(result)
   }
 
   // ========================================================================
@@ -1637,11 +1680,18 @@ impl<'a> RayTraversalBuilder<'a> {
   /// from nodes that have many properties.
   ///
   /// # Example
-  /// ```ignore
+  /// ```rust,no_run
+  /// # use raydb_core::api::ray::Ray;
+  /// # use raydb_core::types::NodeId;
+  /// # fn main() -> raydb_core::error::Result<()> {
+  /// # let ray: Ray = unimplemented!();
+  /// # let user_id: NodeId = 1;
   /// let friends = ray.from(user_id)
   ///     .out(Some("FOLLOWS"))?
   ///     .select(&["name", "avatar"]) // Only load name and avatar
   ///     .to_vec();
+  /// # Ok(())
+  /// # }
   /// ```
   pub fn select(mut self, props: &[&str]) -> Self {
     self.builder = self.builder.select_props(props);
@@ -1690,7 +1740,12 @@ impl<'a> RayTraversalBuilder<'a> {
   /// Each result contains the source, destination, and edge type of edges encountered.
   ///
   /// # Example
-  /// ```ignore
+  /// ```rust,no_run
+  /// # use raydb_core::api::ray::Ray;
+  /// # use raydb_core::types::NodeId;
+  /// # fn main() -> raydb_core::error::Result<()> {
+  /// # let ray: Ray = unimplemented!();
+  /// # let user_id: NodeId = 1;
   /// let edges: Vec<_> = ray.from(user_id)
   ///     .out(Some("FOLLOWS"))?
   ///     .edges()
@@ -1699,6 +1754,8 @@ impl<'a> RayTraversalBuilder<'a> {
   /// for edge in edges {
   ///     println!("{} -[{}]-> {}", edge.src, edge.etype, edge.dst);
   /// }
+  /// # Ok(())
+  /// # }
   /// ```
   pub fn edges(self) -> impl Iterator<Item = Edge> + 'a {
     let ray = self.ray;
@@ -1944,9 +2001,11 @@ impl Ray {
   /// the entire batch is rolled back.
   ///
   /// # Example
-  /// ```ignore
-  /// use raydb::api::ray::{Ray, BatchOp};
-  ///
+  /// ```rust,no_run
+  /// # use raydb_core::api::ray::{BatchOp, Ray, RayOptions};
+  /// # use std::collections::HashMap;
+  /// # fn main() -> raydb_core::error::Result<()> {
+  /// # let options = RayOptions::default();
   /// let mut ray = Ray::open("db", options)?;
   ///
   /// let results = ray.batch(vec![
@@ -1961,6 +2020,8 @@ impl Ray {
   ///     props: HashMap::new(),
   ///   },
   /// ])?;
+  /// # Ok(())
+  /// # }
   /// ```
   pub fn batch(&mut self, ops: Vec<BatchOp>) -> Result<Vec<BatchResult>> {
     let mut handle = begin_tx(&self.db)?;
@@ -2227,13 +2288,20 @@ impl Ray {
   /// the closure returns Ok, or rolled back if an error is returned.
   ///
   /// # Example
-  /// ```ignore
+  /// ```rust,no_run
+  /// # use raydb_core::api::ray::Ray;
+  /// # use raydb_core::types::PropValue;
+  /// # use std::collections::HashMap;
+  /// # fn main() -> raydb_core::error::Result<()> {
+  /// # let mut ray: Ray = unimplemented!();
   /// let result = ray.transaction(|ctx| {
   ///   let alice = ctx.create_node("User", "alice", HashMap::new())?;
   ///   let bob = ctx.create_node("User", "bob", HashMap::new())?;
   ///   ctx.link(alice.id, "FOLLOWS", bob.id)?;
   ///   Ok((alice, bob))
   /// })?;
+  /// # Ok(())
+  /// # }
   /// ```
   pub fn transaction<T, F>(&mut self, f: F) -> Result<T>
   where
@@ -2363,7 +2431,12 @@ impl TxBuilder {
 /// in a single transaction.
 ///
 /// # Example
-/// ```ignore
+/// ```rust,no_run
+/// # use raydb_core::api::ray::{NodeRef, Ray};
+/// # use raydb_core::types::PropValue;
+/// # fn main() -> raydb_core::error::Result<()> {
+/// # let mut ray: Ray = unimplemented!();
+/// # let alice: NodeRef = unimplemented!();
 /// // Update by node reference
 /// ray.update(&alice)?
 ///     .set("name", PropValue::String("Alice Updated".into()))
@@ -2375,6 +2448,8 @@ impl TxBuilder {
 /// ray.update_by_key("User", "alice")?
 ///     .set("name", PropValue::String("New Name".into()))
 ///     .execute()?;
+/// # Ok(())
+/// # }
 /// ```
 pub struct RayUpdateNodeBuilder<'a> {
   ray: &'a mut Ray,
@@ -2451,7 +2526,15 @@ impl<'a> RayUpdateNodeBuilder<'a> {
 /// nodes with the `.values().returning()` or `.values().execute()` pattern.
 ///
 /// # Example
-/// ```ignore
+/// ```rust,no_run
+/// # use raydb_core::api::ray::Ray;
+/// # use raydb_core::types::PropValue;
+/// # use std::collections::HashMap;
+/// # fn main() -> raydb_core::error::Result<()> {
+/// # let mut ray: Ray = unimplemented!();
+/// # let props: HashMap<String, PropValue> = HashMap::new();
+/// # let alice_props: HashMap<String, PropValue> = HashMap::new();
+/// # let bob_props: HashMap<String, PropValue> = HashMap::new();
 /// // Insert and get the node reference back
 /// let user = ray.insert("User")?
 ///     .values("alice", props)?
@@ -2464,6 +2547,8 @@ impl<'a> RayUpdateNodeBuilder<'a> {
 ///         ("bob", bob_props),
 ///     ])?
 ///     .returning()?;
+/// # Ok(())
+/// # }
 /// ```
 pub struct RayInsertBuilder<'a> {
   ray: &'a mut Ray,
@@ -2604,12 +2689,20 @@ impl<'a> InsertExecutorMultiple<'a> {
 /// multiple property set/unset operations before executing in a single transaction.
 ///
 /// # Example
-/// ```ignore
+/// ```rust,no_run
+/// # use raydb_core::api::ray::Ray;
+/// # use raydb_core::types::{NodeId, PropValue};
+/// # fn main() -> raydb_core::error::Result<()> {
+/// # let mut ray: Ray = unimplemented!();
+/// # let alice_id: NodeId = 1;
+/// # let bob_id: NodeId = 2;
 /// ray.update_edge(alice_id, "FOLLOWS", bob_id)?
 ///    .set("weight", PropValue::Float(0.9))
 ///    .set("since", PropValue::String("2024".to_string()))
 ///    .unset("deprecated_field")
 ///    .execute()?;
+/// # Ok(())
+/// # }
 /// ```
 pub struct RayUpdateEdgeBuilder<'a> {
   ray: &'a mut Ray,
@@ -3783,7 +3876,7 @@ mod tests {
       .ok();
 
     // Edge doesn't exist, so getting props should return None
-    let props = ray.get_edge_props(alice.id, "FOLLOWS", bob.id).unwrap();
+    let _props = ray.get_edge_props(alice.id, "FOLLOWS", bob.id).unwrap();
     // The edge was implicitly created when we set the prop, so it exists now
     // Let's test with a truly nonexistent edge
     let charlie = ray.create_node("User", "charlie", HashMap::new()).unwrap();
@@ -4049,8 +4142,11 @@ mod tests {
     let result = ray.check().unwrap();
     assert!(result.valid);
     assert!(result.errors.is_empty());
-    // Should have a warning about empty database
-    assert!(result.warnings.iter().any(|w| w.contains("No nodes")));
+    // Should have a warning about missing snapshot
+    assert!(result
+      .warnings
+      .iter()
+      .any(|w| w.contains("No snapshot")));
 
     ray.close().unwrap();
   }
