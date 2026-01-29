@@ -44,6 +44,7 @@ Repository = "https://github.com/raydb/raydb"
 
 [tool.maturin]
 features = ["python"]
+no-default-features = true
 python-source = "python"
 module-name = "raydb._raydb"
 strip = true

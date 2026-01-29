@@ -134,6 +134,22 @@ class TestDatabase:
                 stats = db.stats()
                 assert stats.delta_nodes_created == 2
 
+    def test_check(self):
+        """Test database integrity check."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "test.raydb")
+            with Database(path) as db:
+                db.begin()
+                alice = db.create_node("user:alice")
+                bob = db.create_node("user:bob")
+                knows = db.get_or_create_etype("knows")
+                db.add_edge(alice, knows, bob)
+                db.commit()
+
+                result = db.check()
+                assert result.valid
+                assert result.errors == []
+
     def test_labels(self):
         """Test node labels."""
         with tempfile.TemporaryDirectory() as tmpdir:

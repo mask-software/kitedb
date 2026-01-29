@@ -317,7 +317,6 @@ where
 }
 
 /// Generate a cache key by hashing with xxHash64
-#[cfg(feature = "xxhash")]
 pub fn generate_key_hash(data: &[u8]) -> String {
   use xxhash_rust::xxh64::xxh64;
   xxh64(data, 0).to_string()

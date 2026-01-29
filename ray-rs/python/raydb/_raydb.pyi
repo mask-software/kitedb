@@ -52,6 +52,12 @@ class DbStats:
     wal_bytes: int
     recommend_compact: bool
 
+class CheckResult:
+    """Database integrity check result."""
+    valid: bool
+    errors: List[str]
+    warnings: List[str]
+
 class CacheStats:
     """Cache statistics."""
     property_cache_hits: int
@@ -219,6 +225,7 @@ class Database:
     def should_checkpoint(self, threshold: Optional[float] = None) -> bool: ...
     def optimize(self) -> None: ...
     def stats(self) -> DbStats: ...
+    def check(self) -> CheckResult: ...
     
     # Cache operations
     def cache_is_enabled(self) -> bool: ...

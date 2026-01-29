@@ -16,7 +16,7 @@ use crate::core::single_file::{
   close_single_file, open_single_file, SingleFileDB as RustSingleFileDB,
   SingleFileOpenOptions as RustOpenOptions, SyncMode as RustSyncMode,
 };
-use crate::types::{ETypeId, Edge, NodeId, PropKeyId, PropValue};
+use crate::types::{CheckResult, ETypeId, Edge, NodeId, PropKeyId, PropValue};
 
 // ============================================================================
 // Open Options
@@ -272,6 +272,40 @@ impl PyDbStats {
       self.wal_bytes,
       self.recommend_compact
     )
+  }
+}
+
+/// Database integrity check result
+#[pyclass(name = "CheckResult")]
+#[derive(Debug, Clone)]
+pub struct PyCheckResult {
+  #[pyo3(get)]
+  pub valid: bool,
+  #[pyo3(get)]
+  pub errors: Vec<String>,
+  #[pyo3(get)]
+  pub warnings: Vec<String>,
+}
+
+#[pymethods]
+impl PyCheckResult {
+  fn __repr__(&self) -> String {
+    format!(
+      "CheckResult(valid={}, errors={}, warnings={})",
+      self.valid,
+      self.errors.len(),
+      self.warnings.len()
+    )
+  }
+}
+
+impl From<CheckResult> for PyCheckResult {
+  fn from(result: CheckResult) -> Self {
+    PyCheckResult {
+      valid: result.valid,
+      errors: result.errors,
+      warnings: result.warnings,
+    }
   }
 }
 
@@ -1735,6 +1769,18 @@ impl PyDatabase {
       wal_bytes: s.wal_bytes as i64,
       recommend_compact: s.recommend_compact,
     })
+  }
+
+  /// Check database integrity
+  fn check(&self) -> PyResult<PyCheckResult> {
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let db = guard
+      .as_ref()
+      .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))?;
+    Ok(PyCheckResult::from(db.check()))
   }
 
   // ========================================================================

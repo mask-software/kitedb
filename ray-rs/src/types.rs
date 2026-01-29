@@ -368,7 +368,7 @@ pub struct NodeDelta {
 }
 
 /// Delta state - all uncommitted changes
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct DeltaState {
   // Node state
   pub created_nodes: HashMap<NodeId, NodeDelta>,

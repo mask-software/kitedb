@@ -4,7 +4,6 @@
 
 use crate::constants::LOCK_FILENAME;
 use crate::error::{RayError, Result};
-use fs2::FileExt;
 use std::fs::{File, OpenOptions};
 use std::path::Path;
 
@@ -60,8 +59,7 @@ impl LockHandle {
       .open(path.as_ref())
       .map_err(|e| RayError::LockFailed(format!("Failed to open lock file: {e}")))?;
 
-    file
-      .lock_exclusive()
+    fs2::FileExt::lock_exclusive(&file)
       .map_err(|e| RayError::LockFailed(format!("Failed to acquire exclusive lock: {e}")))?;
 
     Ok(Self {
@@ -80,8 +78,7 @@ impl LockHandle {
       .open(path.as_ref())
       .map_err(|e| RayError::LockFailed(format!("Failed to open lock file: {e}")))?;
 
-    file
-      .lock_shared()
+    fs2::FileExt::lock_shared(&file)
       .map_err(|e| RayError::LockFailed(format!("Failed to acquire shared lock: {e}")))?;
 
     Ok(Self {
@@ -100,7 +97,7 @@ impl LockHandle {
       .open(path.as_ref())
       .map_err(|e| RayError::LockFailed(format!("Failed to open lock file: {e}")))?;
 
-    match file.try_lock_exclusive() {
+    match fs2::FileExt::try_lock_exclusive(&file) {
       Ok(()) => Ok(Some(Self {
         file,
         exclusive: true,
@@ -122,7 +119,7 @@ impl LockHandle {
       .open(path.as_ref())
       .map_err(|e| RayError::LockFailed(format!("Failed to open lock file: {e}")))?;
 
-    match file.try_lock_shared() {
+    match fs2::FileExt::try_lock_shared(&file) {
       Ok(()) => Ok(Some(Self {
         file,
         exclusive: false,
@@ -141,9 +138,7 @@ impl LockHandle {
 
   /// Release the lock (also happens on drop)
   pub fn release(self) -> Result<()> {
-    self
-      .file
-      .unlock()
+    fs2::FileExt::unlock(&self.file)
       .map_err(|e| RayError::LockFailed(format!("Failed to release lock: {e}")))
   }
 }
@@ -151,7 +146,7 @@ impl LockHandle {
 impl Drop for LockHandle {
   fn drop(&mut self) {
     // Best effort unlock on drop
-    let _ = self.file.unlock();
+    let _ = fs2::FileExt::unlock(&self.file);
   }
 }
 

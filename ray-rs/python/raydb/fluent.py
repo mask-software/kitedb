@@ -700,6 +700,16 @@ class Ray:
     def stats(self) -> Any:
         """Get database statistics."""
         return self._db.stats()
+
+    def check(self) -> Any:
+        """Check database integrity."""
+        result = self._db.check()
+        for edge_name, edge_def in self._edges.items():
+            if getattr(edge_def, "_etype_id", None) is None:
+                result.warnings.append(
+                    f"Edge type '{edge_name}' has no assigned etype_id"
+                )
+        return result
     
     def optimize(self) -> None:
         """Optimize the database."""

@@ -71,10 +71,6 @@ libc = "0.2"
 [build-dependencies]
 napi-build = { version = "2", optional = true }
 
-# For conditional build
-[target.'cfg(feature = "python")'.dependencies]
-pyo3-build-config = { version = "0.22", optional = true }
-
 [dev-dependencies]
 tempfile = "3.20"
 criterion = "0.5"

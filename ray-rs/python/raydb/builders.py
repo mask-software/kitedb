@@ -283,14 +283,19 @@ class InsertBuilder(Generic[N]):
         self._node_def = node_def
         self._resolve_prop_key_id = resolve_prop_key_id
     
-    def values(self, data: Optional[Dict[str, Any]] = None, **kwargs: Any) -> InsertExecutor[N]:
+    def values(
+        self,
+        data: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None,
+        **kwargs: Any,
+    ) -> InsertExecutor[N]:
         """
         Set the values to insert.
         
-        Can be called with a dict or with keyword arguments.
+        Can be called with a dict, a list of dicts, or with keyword arguments.
         
         Args:
-            data: Dictionary of property values (including 'key')
+            data: Dictionary of property values (including 'key'),
+                or a list of dictionaries
             **kwargs: Alternative way to pass property values
         
         Returns:
@@ -302,14 +307,30 @@ class InsertBuilder(Generic[N]):
             >>> 
             >>> # Using kwargs
             >>> db.insert(user).values(key="alice", name="Alice")
+            >>> 
+            >>> # Using list
+            >>> db.insert(user).values([
+            ...     {"key": "alice", "name": "Alice"},
+            ...     {"key": "bob", "name": "Bob"},
+            ... ])
         """
         # Avoid unnecessary dict copy
         if data is None:
             data = kwargs
+        elif isinstance(data, list):
+            if kwargs:
+                raise ValueError("Cannot combine list data with keyword arguments")
+            return InsertExecutor(
+                db=self._db,
+                node_def=self._node_def,
+                data=data,
+                resolve_prop_key_id=self._resolve_prop_key_id,
+                use_batch=True,
+            )
         elif kwargs:
             data = {**data, **kwargs}
         # else: use data as-is
-        
+
         return InsertExecutor(
             db=self._db,
             node_def=self._node_def,

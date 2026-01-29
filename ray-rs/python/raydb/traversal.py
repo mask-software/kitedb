@@ -3,18 +3,15 @@ Traversal Builder for RayDB
 
 Provides a fluent API for graph traversals with lazy property loading.
 
-By default, traversals are fast and don't load properties. Use `.load_props()`
-or `.with_props()` to opt-in to property loading when needed.
+By default, traversals load all properties. Use `.select([...])` or
+`.load_props(...)` to load a subset for performance.
 
 Example:
-    >>> # Fast traversal - no properties loaded (just IDs and keys)
-    >>> friend_ids = db.from_(alice).out(knows).to_list()
-    >>> 
-    >>> # Opt-in to load properties when you need them
-    >>> friends_with_props = db.from_(alice).out(knows).with_props().to_list()
+    >>> # Default traversal - properties loaded
+    >>> friends = db.from_(alice).out(knows).to_list()
     >>> 
     >>> # Load specific properties only
-    >>> friends = db.from_(alice).out(knows).load_props("name", "age").to_list()
+    >>> friends = db.from_(alice).out(knows).select(["name", "age"]).to_list()
     >>> 
     >>> # Filter requires properties - auto-loads them
     >>> young_friends = (
@@ -87,6 +84,8 @@ class TraverseOptions:
     min_depth: int = 1
     direction: Literal["out", "in", "both"] = "out"
     unique: bool = True
+    where_edge: Optional[Callable[["EdgeResult"], bool]] = None
+    where_node: Optional[Callable[[NodeRef[Any]], bool]] = None
 
 
 @dataclass
@@ -155,7 +154,30 @@ class EdgeResult:
         props = object.__getattribute__(self, "props")
         if name in props:
             return props[name]
+        if name == "$src":
+            return self.src
+        if name == "$dst":
+            return self.dst
+        if name == "$etype":
+            return self.etype
         raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+
+    def __getitem__(self, key: str) -> Any:
+        if key == "$src":
+            return self.src
+        if key == "$dst":
+            return self.dst
+        if key == "$etype":
+            return self.etype
+        props = object.__getattribute__(self, "props")
+        if key in props:
+            return props[key]
+        raise KeyError(key)
+
+    def to_dict(self) -> Dict[str, Any]:
+        data = {"$src": self.src, "$dst": self.dst, "$etype": self.etype}
+        data.update(self.props)
+        return data
 
 
 @dataclass
@@ -177,9 +199,8 @@ class TraversalResult(Generic[N]):
     This is a lazy iterator - it doesn't execute until you call
     to_list(), first(), or iterate over it.
     
-    By default, no properties are loaded for performance. Use:
-    - `.with_props()` to load all properties
-    - `.load_props("name", "age")` to load specific properties
+    By default, all properties are loaded. Use `.select([...])` or
+    `.load_props("name", "age")` to load specific properties.
     """
     
     def __init__(
@@ -206,11 +227,18 @@ class TraversalResult(Generic[N]):
         self._get_node_def = get_node_def
         self._prop_strategy = prop_strategy
     
-    def _load_node_props(self, node_id: int, node_def: NodeDef) -> Dict[str, Any]:
+    def _load_node_props(
+        self,
+        node_id: int,
+        node_def: NodeDef,
+        prop_strategy: Optional[PropLoadStrategy] = None,
+    ) -> Dict[str, Any]:
         """Load properties for a node based on strategy using single FFI call."""
         props: Dict[str, Any] = {}
-        
-        if not self._prop_strategy.needs_any_props():
+
+        strategy = prop_strategy or self._prop_strategy
+
+        if not strategy.needs_any_props():
             return props
         
         # Use get_node_props() for single FFI call instead of per-property calls
@@ -223,7 +251,7 @@ class TraversalResult(Generic[N]):
         
         for node_prop in all_props:
             prop_name = key_id_to_name.get(node_prop.key_id)
-            if prop_name is not None and self._prop_strategy.should_load(prop_name):
+            if prop_name is not None and strategy.should_load(prop_name):
                 props[prop_name] = from_prop_value(node_prop.value)
         
         return props
@@ -254,7 +282,12 @@ class TraversalResult(Generic[N]):
         props = self._load_edge_props(edge_def, src, etype, dst)
         return EdgeResult(src=src, etype=etype, dst=dst, props=props)
     
-    def _create_node_ref(self, node_id: int, load_props: bool = False) -> Optional[NodeRef[Any]]:
+    def _create_node_ref(
+        self,
+        node_id: int,
+        load_props: bool = False,
+        prop_strategy: Optional[PropLoadStrategy] = None,
+    ) -> Optional[NodeRef[Any]]:
         """Create a NodeRef from a node ID."""
         node_def = self._get_node_def(node_id)
         if node_def is None:
@@ -265,7 +298,7 @@ class TraversalResult(Generic[N]):
             key = f"node:{node_id}"
         
         if load_props:
-            props = self._load_node_props(node_id, node_def)
+            props = self._load_node_props(node_id, node_def, prop_strategy=prop_strategy)
         else:
             props = {}
         
@@ -283,6 +316,14 @@ class TraversalResult(Generic[N]):
             self._edge_filter is not None
             or self._node_filter is not None
             or self._prop_strategy.needs_any_props()
+            or self._limit is not None
+            or self._has_traverse_step()
+        )
+
+    def _needs_full_execution_for_scalar(self) -> bool:
+        return (
+            self._edge_filter is not None
+            or self._node_filter is not None
             or self._limit is not None
             or self._has_traverse_step()
         )
@@ -327,6 +368,100 @@ class TraversalResult(Generic[N]):
                     edge_result = self._build_edge_result(step.edge_def, neighbor_id, edge.etype, node.id)
                     yield neighbor_ref, edge_result
 
+    def _iter_traverse_edges(
+        self,
+        node_id: int,
+        direction: Literal["out", "in", "both"],
+        edge_def: Optional[EdgeDef],
+        etype_id: Optional[int],
+    ) -> Generator[Tuple[int, EdgeResult], None, None]:
+        """Yield (neighbor_id, edge_result) for a traversal step."""
+        directions: List[str]
+        if direction == "both":
+            directions = ["out", "in"]
+        else:
+            directions = [direction]
+
+        for dir_ in directions:
+            if dir_ == "out":
+                edges = self._db.get_out_edges(node_id)
+                for edge in edges:
+                    if etype_id is not None and edge.etype != etype_id:
+                        continue
+                    neighbor_id = edge.node_id
+                    edge_result = self._build_edge_result(edge_def, node_id, edge.etype, neighbor_id)
+                    yield neighbor_id, edge_result
+            else:
+                edges = self._db.get_in_edges(node_id)
+                for edge in edges:
+                    if etype_id is not None and edge.etype != etype_id:
+                        continue
+                    neighbor_id = edge.node_id
+                    edge_result = self._build_edge_result(edge_def, neighbor_id, edge.etype, node_id)
+                    yield neighbor_id, edge_result
+
+    def _execute_traverse_filtered(
+        self,
+        node: NodeRef[Any],
+        step: TraverseStep,
+        etype_id: Optional[int],
+    ) -> Generator[Tuple[NodeRef[Any], EdgeResult], None, None]:
+        """Execute variable-depth traversal with filters applied during traversal."""
+        from collections import deque
+
+        options = step.options
+        node_filter = options.where_node
+        edge_filter = options.where_edge
+
+        prop_strategy = self._prop_strategy
+        if node_filter is not None:
+            prop_strategy = PropLoadStrategy.all()
+
+        load_props = prop_strategy.needs_any_props()
+
+        visited: Set[int] = set()
+        if options.unique:
+            visited.add(node.id)
+
+        queue = deque([(node, 0)])
+
+        while queue:
+            current, depth = queue.popleft()
+            if depth >= options.max_depth:
+                continue
+
+            for neighbor_id, edge_result in self._iter_traverse_edges(
+                current.id,
+                options.direction,
+                step.edge_def,
+                etype_id,
+            ):
+                if options.unique and neighbor_id in visited:
+                    continue
+
+                neighbor_ref = self._create_node_ref(
+                    neighbor_id,
+                    load_props=load_props,
+                    prop_strategy=prop_strategy,
+                )
+                if neighbor_ref is None:
+                    continue
+
+                if edge_filter is not None and not edge_filter(edge_result):
+                    continue
+                if node_filter is not None and not node_filter(neighbor_ref):
+                    continue
+
+                if options.unique:
+                    visited.add(neighbor_id)
+
+                next_depth = depth + 1
+                if next_depth >= options.min_depth:
+                    yield neighbor_ref, edge_result
+
+                if next_depth < options.max_depth:
+                    queue.append((neighbor_ref, next_depth))
+
     def _execute_traverse(
         self,
         node: NodeRef[Any],
@@ -338,6 +473,10 @@ class TraversalResult(Generic[N]):
         if step.edge_def is not None:
             etype_id = self._resolve_etype_id(step.edge_def)
 
+        if options.where_node is not None or options.where_edge is not None:
+            yield from self._execute_traverse_filtered(node, step, etype_id)
+            return
+
         results = self._db.traverse(
             node.id,
             options.max_depth,
@@ -348,7 +487,10 @@ class TraversalResult(Generic[N]):
         )
 
         for result in results:
-            node_ref = self._create_node_ref(result.node_id, load_props=self._prop_strategy.needs_any_props())
+            node_ref = self._create_node_ref(
+                result.node_id,
+                load_props=self._prop_strategy.needs_any_props(),
+            )
             if node_ref is None:
                 continue
 
@@ -594,7 +736,7 @@ class TraversalResult(Generic[N]):
         Returns:
             Number of matching nodes
         """
-        if not self._needs_full_execution() and self._node_filter is None:
+        if not self._needs_full_execution_for_scalar() and self._node_filter is None:
             return self._execute_fast_count()
         return sum(1 for _ in self._execute())
     
@@ -605,7 +747,7 @@ class TraversalResult(Generic[N]):
         Returns:
             List of node IDs
         """
-        if not self._needs_full_execution():
+        if not self._needs_full_execution_for_scalar():
             return list(self._execute_fast())
         return [node.id for node, _ in self._iter_results()]
     
@@ -616,7 +758,7 @@ class TraversalResult(Generic[N]):
         Returns:
             List of node keys
         """
-        if not self._needs_full_execution():
+        if not self._needs_full_execution_for_scalar():
             result: List[str] = []
             for node_id in self._execute_fast():
                 key = self._db.get_node_key(node_id)
@@ -656,17 +798,12 @@ class TraversalBuilder(Generic[N]):
     """
     Builder for graph traversals.
     
-    By default, traversals are fast and don't load properties.
-    Use `.with_props()` or `.load_props()` to opt-in to loading.
-    
+    By default, traversals load all properties. Use `.select([...])` or
+    `.load_props(...)` to load a subset.
+
     Example:
-        >>> # Fast: no properties loaded
-        >>> friend_ids = db.from_(alice).out(knows).ids()
-        >>> friend_keys = db.from_(alice).out(knows).keys()
+        >>> # Default traversal
         >>> friend_refs = db.from_(alice).out(knows).to_list()
-        >>> 
-        >>> # Load all properties
-        >>> friends = db.from_(alice).out(knows).with_props().to_list()
         >>> 
         >>> # Load specific properties only
         >>> friends = db.from_(alice).out(knows).load_props("name").to_list()
@@ -692,7 +829,7 @@ class TraversalBuilder(Generic[N]):
         self._node_filter: Optional[Callable[[NodeRef[Any]], bool]] = None
         self._edge_filter: Optional[Callable[[EdgeResult], bool]] = None
         self._limit: Optional[int] = None
-        self._prop_strategy: PropLoadStrategy = PropLoadStrategy.none()
+        self._prop_strategy: PropLoadStrategy = PropLoadStrategy.all()
     
     def out(self, edge: Optional[EdgeDef] = None) -> TraversalBuilder[N]:
         """
@@ -750,7 +887,7 @@ class TraversalBuilder(Generic[N]):
         """
         Load all properties for traversed nodes.
         
-        This is slower but gives you access to all node properties.
+        This is the default behavior; use load_props/select to limit properties.
         
         Returns:
             Self for chaining
@@ -972,6 +1109,14 @@ class PathResult(Generic[N]):
     found: bool
     total_weight: float = 0.0
     edges: List[EdgeResult] = field(default_factory=list)
+
+    @property
+    def path(self) -> List[NodeRef[N]]:
+        return self.nodes
+
+    @property
+    def totalWeight(self) -> float:
+        return self.total_weight
     
     def __bool__(self) -> bool:
         return self.found
@@ -1011,7 +1156,7 @@ class PathFindingBuilder(Generic[N]):
         self._edge_type: Optional[EdgeDef] = None
         self._max_depth: Optional[int] = None
         self._direction: str = "out"
-        self._load_props: bool = False
+        self._load_props: bool = True
         self._weight_spec: Optional[WeightSpec] = None
     
     def to(self, target: NodeRef[Any]) -> PathFindingBuilder[N]:
@@ -1042,7 +1187,7 @@ class PathFindingBuilder(Generic[N]):
         return self
     
     def with_props(self) -> PathFindingBuilder[N]:
-        """Load properties for nodes in the path."""
+        """Load properties for nodes in the path (default behavior)."""
         self._load_props = True
         return self
 
@@ -1074,6 +1219,8 @@ class PathFindingBuilder(Generic[N]):
     def _get_targets(self) -> List[NodeRef[Any]]:
         if not self._targets:
             raise ValueError("Target node required. Use .to(target) or .to_any(targets) first.")
+        if self._edge_type is None:
+            raise ValueError("Must specify at least one edge type with via()")
         return self._targets
 
     def _max_depth_value(self) -> int:

@@ -29,6 +29,7 @@ pub fn raydb(m: &Bound<'_, PyModule>) -> PyResult<()> {
   m.add_class::<database::PyOpenOptions>()?;
   m.add_class::<database::PySyncMode>()?;
   m.add_class::<database::PyDbStats>()?;
+  m.add_class::<database::PyCheckResult>()?;
   m.add_class::<database::PyCacheStats>()?;
   m.add_class::<database::PyPropValue>()?;
   m.add_class::<database::PyEdge>()?;

@@ -37,7 +37,18 @@ impl SingleFileDB {
       wal.write_record(&record, &mut pager)?;
     }
 
-    *current_tx = Some(SingleFileTxState::new(txid, read_only, snapshot_ts));
+    let delta_snapshot = if read_only {
+      None
+    } else {
+      Some(self.delta.read().clone())
+    };
+
+    *current_tx = Some(SingleFileTxState::new(
+      txid,
+      read_only,
+      snapshot_ts,
+      delta_snapshot,
+    ));
     Ok(txid)
   }
 
@@ -127,7 +138,9 @@ impl SingleFileDB {
     // Discard pending writes (rollback doesn't need to be durable)
     wal.discard_pending();
 
-    // TODO: Discard delta changes for this transaction
+    if let Some(delta_snapshot) = tx.delta_snapshot {
+      *self.delta.write() = delta_snapshot;
+    }
 
     Ok(())
   }

@@ -54,6 +54,7 @@ from raydb._raydb import (
     Database,
     OpenOptions,
     DbStats,
+    CheckResult,
     CacheStats,
     PropValue,
     Edge,
@@ -117,6 +118,14 @@ from raydb.fluent import (
     ray,
 )
 
+from raydb.vector_index import (
+    VectorIndex,
+    VectorIndexOptions,
+    SimilarOptions,
+    VectorSearchHit,
+    create_vector_index,
+)
+
 __version__ = version()
 
 __all__ = [
@@ -128,6 +137,11 @@ __all__ = [
     "ray",
     "Ray",
     "EdgeData",
+    "VectorIndex",
+    "VectorIndexOptions",
+    "SimilarOptions",
+    "VectorSearchHit",
+    "create_vector_index",
     
     # Schema builders
     "define_node",
@@ -166,6 +180,7 @@ __all__ = [
     "Database",
     "OpenOptions",
     "DbStats",
+    "CheckResult",
     "CacheStats",
     "PropValue",
     "Edge",

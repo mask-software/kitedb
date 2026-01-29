@@ -20,6 +20,7 @@ use crate::types::*;
 use crate::vector::types::VectorManifest;
 
 // Submodules
+mod check;
 mod checkpoint;
 mod iter;
 mod open;
@@ -32,9 +33,7 @@ mod write;
 
 // Re-export everything for backward compatibility
 pub use iter::*;
-pub use open::{
-  close_single_file, open_single_file, SingleFileOpenOptions, SyncMode,
-};
+pub use open::{close_single_file, open_single_file, SingleFileOpenOptions, SyncMode};
 
 // Also re-export recovery items that are used externally
 pub use recovery::replay_wal_record;
@@ -52,14 +51,21 @@ pub struct SingleFileTxState {
   pub txid: TxId,
   pub read_only: bool,
   pub snapshot_ts: u64,
+  pub delta_snapshot: Option<DeltaState>,
 }
 
 impl SingleFileTxState {
-  pub fn new(txid: TxId, read_only: bool, snapshot_ts: u64) -> Self {
+  pub fn new(
+    txid: TxId,
+    read_only: bool,
+    snapshot_ts: u64,
+    delta_snapshot: Option<DeltaState>,
+  ) -> Self {
     Self {
       txid,
       read_only,
       snapshot_ts,
+      delta_snapshot,
     }
   }
 }
