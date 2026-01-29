@@ -206,22 +206,22 @@ fn kmeans_plus_plus_init(
     let prev_centroid = &centroids[prev_cent_offset..prev_cent_offset + dimensions];
 
     let mut total_dist = 0.0;
-    for i in 0..n {
+    for (i, min_dist) in min_dists.iter_mut().enumerate().take(n) {
       let vec_offset = i * dimensions;
       let vec = &vectors[vec_offset..vec_offset + dimensions];
       let dist = distance_fn(vec, prev_centroid);
       // Use abs(dist)^2 for k-means++ (handles negative distances like dot product)
       let abs_dist = dist.abs();
-      min_dists[i] = min_dists[i].min(abs_dist * abs_dist);
-      total_dist += min_dists[i];
+      *min_dist = (*min_dist).min(abs_dist * abs_dist);
+      total_dist += *min_dist;
     }
 
     // Weighted random selection
     let mut r = rng.gen::<f32>() * total_dist;
     let mut selected_idx = 0;
 
-    for i in 0..n {
-      r -= min_dists[i];
+    for (i, dist) in min_dists.iter().enumerate().take(n) {
+      r -= *dist;
       if r <= 0.0 {
         selected_idx = i;
         break;
@@ -249,7 +249,7 @@ fn assign_to_centroids(
 ) -> f32 {
   let mut inertia = 0.0;
 
-  for i in 0..n {
+  for (i, assignment) in assignments.iter_mut().enumerate().take(n) {
     let vec_offset = i * dimensions;
     let vec = &vectors[vec_offset..vec_offset + dimensions];
 
@@ -267,7 +267,7 @@ fn assign_to_centroids(
       }
     }
 
-    assignments[i] = best_cluster as u32;
+    *assignment = best_cluster as u32;
     inertia += best_dist;
   }
 
@@ -287,8 +287,8 @@ fn update_centroids(
   let mut cluster_sums = vec![0.0f32; k * dimensions];
   let mut cluster_counts = vec![0u32; k];
 
-  for i in 0..n {
-    let cluster = assignments[i] as usize;
+  for (i, &cluster_id) in assignments.iter().enumerate().take(n) {
+    let cluster = cluster_id as usize;
     let vec_offset = i * dimensions;
     let sum_offset = cluster * dimensions;
 
@@ -299,8 +299,7 @@ fn update_centroids(
   }
 
   // Update centroids
-  for c in 0..k {
-    let count = cluster_counts[c];
+  for (c, &count) in cluster_counts.iter().enumerate().take(k) {
     if count == 0 {
       // Keep existing centroid (shouldn't happen with k-means++)
       continue;
@@ -529,8 +528,7 @@ fn update_centroids_parallel(
     );
 
   // Update centroids (sequential, small work)
-  for c in 0..k {
-    let count = cluster_counts[c];
+  for (c, &count) in cluster_counts.iter().enumerate() {
     if count == 0 {
       continue;
     }
@@ -596,8 +594,8 @@ fn kmeans_plus_plus_init_parallel(
     let mut r = rng.gen::<f32>() * total_dist;
     let mut selected_idx = 0;
 
-    for i in 0..n {
-      r -= min_dists[i];
+    for (i, dist) in min_dists.iter().enumerate().take(n) {
+      r -= *dist;
       if r <= 0.0 {
         selected_idx = i;
         break;

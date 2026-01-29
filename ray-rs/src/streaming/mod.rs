@@ -157,7 +157,7 @@ pub fn get_nodes_page_graph(db: &GraphDB, options: PaginationOptions) -> Page<No
     }
 
     items.push(node_id);
-    if items.len() >= limit + 1 {
+    if items.len() > limit {
       break;
     }
   }
@@ -220,7 +220,7 @@ pub fn get_edges_page_graph(db: &GraphDB, options: PaginationOptions) -> Page<Ed
       etype: edge.etype,
       dst: edge.dst,
     });
-    if items.len() >= limit + 1 {
+    if items.len() > limit {
       break;
     }
   }
@@ -275,7 +275,7 @@ pub fn get_nodes_page_single(db: &SingleFileDB, options: PaginationOptions) -> P
       continue;
     }
     items.push(node_id);
-    if items.len() >= limit + 1 {
+    if items.len() > limit {
       break;
     }
   }
@@ -337,7 +337,7 @@ pub fn get_edges_page_single(db: &SingleFileDB, options: PaginationOptions) -> P
       etype: edge.etype,
       dst: edge.dst,
     });
-    if items.len() >= limit + 1 {
+    if items.len() > limit {
       break;
     }
   }

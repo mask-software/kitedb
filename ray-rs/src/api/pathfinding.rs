@@ -124,7 +124,21 @@ impl PathConfig {
 /// PathResult with the shortest path, or not_found() if no path exists
 ///
 /// # Example
-/// ```ignore
+/// ```rust,no_run
+/// # use raydb_core::api::pathfinding::{dijkstra, PathConfig};
+/// # use raydb_core::api::traversal::TraversalDirection;
+/// # use raydb_core::types::{Edge, ETypeId, NodeId};
+/// # fn get_neighbors(
+/// #   _: NodeId,
+/// #   _: TraversalDirection,
+/// #   _: Option<ETypeId>,
+/// # ) -> Vec<Edge> {
+/// #   Vec::new()
+/// # }
+/// # fn main() {
+/// # let source_id: NodeId = 1;
+/// # let target_id: NodeId = 2;
+/// # let follows_etype: ETypeId = 1;
 /// let config = PathConfig::new(source_id, target_id)
 ///     .via(follows_etype)
 ///     .max_depth(10);
@@ -138,6 +152,7 @@ impl PathConfig {
 /// if result.found {
 ///     println!("Path length: {}", result.path.len());
 /// }
+/// # }
 /// ```
 pub fn dijkstra<F, W>(config: PathConfig, get_neighbors: F, get_weight: W) -> PathResult
 where
@@ -635,7 +650,20 @@ where
 /// Vector of up to k shortest paths, sorted by total weight
 ///
 /// # Example
-/// ```ignore
+/// ```rust,no_run
+/// # use raydb_core::api::pathfinding::{yen_k_shortest, PathConfig};
+/// # use raydb_core::api::traversal::TraversalDirection;
+/// # use raydb_core::types::{Edge, ETypeId, NodeId};
+/// # fn get_neighbors(
+/// #   _: NodeId,
+/// #   _: TraversalDirection,
+/// #   _: Option<ETypeId>,
+/// # ) -> Vec<Edge> {
+/// #   Vec::new()
+/// # }
+/// # fn main() {
+/// # let source_id: NodeId = 1;
+/// # let target_id: NodeId = 2;
 /// let config = PathConfig::new(source_id, target_id).max_depth(10);
 ///
 /// let paths = yen_k_shortest(
@@ -648,6 +676,7 @@ where
 /// for (i, path) in paths.iter().enumerate() {
 ///     println!("Path {}: {:?} (weight: {})", i + 1, path.path, path.total_weight);
 /// }
+/// # }
 /// ```
 pub fn yen_k_shortest<F, W>(
   config: PathConfig,

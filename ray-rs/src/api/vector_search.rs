@@ -184,10 +184,13 @@ impl SimilarOptions {
   /// the node in results, or `false` to exclude it.
   ///
   /// # Example
-  /// ```ignore
+  /// ```rust,no_run
+  /// # use raydb_core::api::vector_search::SimilarOptions;
+  /// # fn main() {
   /// // Only include nodes with ID > 100
   /// let options = SimilarOptions::new(10)
   ///     .with_filter(|node_id| node_id > 100);
+  /// # }
   /// ```
   pub fn with_filter<F>(mut self, filter: F) -> Self
   where
@@ -233,7 +236,13 @@ pub struct VectorIndexStats {
 /// VectorIndex - manages vector embeddings for a set of nodes
 ///
 /// # Example
-/// ```ignore
+/// ```rust,no_run
+/// # use raydb_core::api::vector_search::{SimilarOptions, VectorIndex, VectorIndexOptions};
+/// # use raydb_core::types::NodeId;
+/// # fn main() {
+/// # let node_id: NodeId = 1;
+/// # let embedding = vec![0.0_f32; 768];
+/// # let query_vector = vec![0.0_f32; 768];
 /// // Create a vector index for 768-dimensional embeddings
 /// let mut embeddings = VectorIndex::new(VectorIndexOptions::new(768));
 ///
@@ -245,6 +254,7 @@ pub struct VectorIndexStats {
 /// for hit in similar {
 ///     println!("{}: {}", hit.node_id, hit.similarity);
 /// }
+/// # }
 /// ```
 pub struct VectorIndex {
   /// The underlying vector store manifest
@@ -673,8 +683,9 @@ fn is_valid_vector(vector: &[f32]) -> bool {
 /// Create a new vector index
 ///
 /// # Example
-/// ```ignore
-/// use raydb_core::api::vector_search::{create_vector_index, VectorIndexOptions};
+/// ```rust,no_run
+/// use raydb_core::api::vector_search::{create_vector_index, DistanceMetric, VectorIndexOptions};
+/// # fn main() {
 ///
 /// // Create index for 768-dimensional embeddings (e.g., from OpenAI)
 /// let index = create_vector_index(VectorIndexOptions::new(768));
@@ -686,6 +697,7 @@ fn is_valid_vector(vector: &[f32]) -> bool {
 ///         .with_training_threshold(500)
 ///         .with_n_probe(20)
 /// );
+/// # }
 /// ```
 pub fn create_vector_index(options: VectorIndexOptions) -> VectorIndex {
   VectorIndex::new(options)
@@ -788,7 +800,7 @@ mod tests {
     let mut index = VectorIndex::new(VectorIndexOptions::new(4));
 
     let vector = vec![1.0, f32::NAN, 0.0, 0.0];
-    let result = index.set(1, &vector);
+    let _result = index.set(1, &vector);
 
     // Note: validation happens at search time, not insert time in current impl
     // For this test, we verify the search validation

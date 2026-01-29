@@ -226,7 +226,20 @@ impl std::fmt::Debug for TraversalStep {
 /// Builder for constructing traversal queries
 ///
 /// # Example
-/// ```ignore
+/// ```rust,no_run
+/// # use raydb_core::api::traversal::{TraversalBuilder, TraversalDirection};
+/// # use raydb_core::types::{Edge, ETypeId, NodeId};
+/// # fn get_neighbors_fn(
+/// #   _: NodeId,
+/// #   _: TraversalDirection,
+/// #   _: Option<ETypeId>,
+/// # ) -> Vec<Edge> {
+/// #   Vec::new()
+/// # }
+/// # fn main() {
+/// # let start_node_id: NodeId = 1;
+/// # let follows_etype: ETypeId = 1;
+/// # let knows_etype: ETypeId = 2;
 /// let builder = TraversalBuilder::new(vec![start_node_id])
 ///     .out(Some(follows_etype))
 ///     .out(Some(knows_etype))
@@ -236,6 +249,7 @@ impl std::fmt::Debug for TraversalStep {
 /// for result in builder.execute(&get_neighbors_fn) {
 ///     println!("Found node: {}", result.node_id);
 /// }
+/// # }
 /// ```
 #[derive(Clone)]
 pub struct TraversalBuilder {
@@ -345,10 +359,15 @@ impl TraversalBuilder {
   /// the predicate returns `true` will be included in results.
   ///
   /// # Example
-  /// ```ignore
+  /// ```rust,no_run
+  /// # use raydb_core::api::traversal::TraversalBuilder;
+  /// # use raydb_core::types::ETypeId;
+  /// # fn main() {
+  /// # let knows_etype: ETypeId = 1;
   /// let builder = TraversalBuilder::from_node(1)
   ///     .out(Some(knows_etype))
   ///     .where_edge(|edge| edge.etype == 1);
+  /// # }
   /// ```
   pub fn where_edge<F>(mut self, predicate: F) -> Self
   where
@@ -364,10 +383,15 @@ impl TraversalBuilder {
   /// the predicate returns `true` will be included in results.
   ///
   /// # Example
-  /// ```ignore
+  /// ```rust,no_run
+  /// # use raydb_core::api::traversal::TraversalBuilder;
+  /// # use raydb_core::types::ETypeId;
+  /// # fn main() {
+  /// # let knows_etype: ETypeId = 1;
   /// let builder = TraversalBuilder::from_node(1)
   ///     .out(Some(knows_etype))
   ///     .where_node(|node| node.id > 5);
+  /// # }
   /// ```
   pub fn where_node<F>(mut self, predicate: F) -> Self
   where
@@ -384,12 +408,17 @@ impl TraversalBuilder {
   /// from nodes that have many properties.
   ///
   /// # Example
-  /// ```ignore
+  /// ```rust,no_run
+  /// # use raydb_core::api::traversal::TraversalBuilder;
+  /// # use raydb_core::types::ETypeId;
+  /// # fn main() {
+  /// # let knows_etype: ETypeId = 1;
   /// let builder = TraversalBuilder::from_node(1)
   ///     .out(Some(knows_etype))
   ///     .select(vec!["name".to_string(), "age".to_string()]);
   ///
   /// // Only "name" and "age" properties will be loaded
+  /// # }
   /// ```
   pub fn select(mut self, props: Vec<String>) -> Self {
     self.selected_props = Some(props);
@@ -985,7 +1014,14 @@ where
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust,no_run
+/// # use raydb_core::api::traversal::{TraversalBuilder, TraversalDirection};
+/// # use raydb_core::types::{Edge, ETypeId, NodeId};
+/// # fn main() {
+/// # let knows_etype: ETypeId = 1;
+/// # let get_neighbors = |_: NodeId, _: TraversalDirection, _: Option<ETypeId>| -> Vec<Edge> {
+/// #   Vec::new()
+/// # };
 /// let results = TraversalBuilder::from_node(1)
 ///     .out(Some(knows_etype))
 ///     .results(get_neighbors);
@@ -998,6 +1034,7 @@ where
 ///
 /// // Collect all edges
 /// let edges = results.edges().collect::<Vec<_>>();
+/// # }
 /// ```
 pub struct TraversalResults<I> {
   iter: I,
@@ -1122,7 +1159,14 @@ impl TraversalBuilder {
   ///
   /// # Example
   ///
-  /// ```rust,ignore
+  /// ```rust,no_run
+  /// # use raydb_core::api::traversal::{TraversalBuilder, TraversalDirection};
+  /// # use raydb_core::types::{Edge, ETypeId, NodeId};
+  /// # fn main() {
+  /// # let knows_etype: ETypeId = 1;
+  /// # let get_neighbors = |_: NodeId, _: TraversalDirection, _: Option<ETypeId>| -> Vec<Edge> {
+  /// #   Vec::new()
+  /// # };
   /// let results = TraversalBuilder::from_node(1)
   ///     .out(Some(knows_etype))
   ///     .results(&get_neighbors);
@@ -1132,6 +1176,7 @@ impl TraversalBuilder {
   ///
   /// // Or collect all nodes
   /// let all_nodes = results.to_vec();
+  /// # }
   /// ```
   pub fn results<F>(self, get_neighbors: F) -> TraversalResults<TraversalIterator<F>>
   where

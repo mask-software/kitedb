@@ -13,17 +13,17 @@ use std::collections::BinaryHeap;
 #[derive(Debug, Clone, PartialEq)]
 pub struct MinHeapItem<T>(pub T);
 
-impl<T: PartialOrd> PartialOrd for MinHeapItem<T> {
-  fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-    other.0.partial_cmp(&self.0) // Reversed for min-heap
-  }
-}
-
 impl<T: PartialEq> Eq for MinHeapItem<T> {}
 
 impl<T: PartialOrd + PartialEq> Ord for MinHeapItem<T> {
   fn cmp(&self, other: &Self) -> Ordering {
-    self.partial_cmp(other).unwrap_or(Ordering::Equal)
+    other.0.partial_cmp(&self.0).unwrap_or(Ordering::Equal)
+  }
+}
+
+impl<T: PartialOrd + PartialEq> PartialOrd for MinHeapItem<T> {
+  fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+    Some(self.cmp(other))
   }
 }
 
@@ -106,16 +106,18 @@ impl<K> PartialEq for IndexedItem<K> {
 
 impl<K> Eq for IndexedItem<K> {}
 
-impl<K> PartialOrd for IndexedItem<K> {
-  fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-    // Reversed for min-heap behavior
-    other.priority.partial_cmp(&self.priority)
+impl<K> Ord for IndexedItem<K> {
+  fn cmp(&self, other: &Self) -> Ordering {
+    other
+      .priority
+      .partial_cmp(&self.priority)
+      .unwrap_or(Ordering::Equal)
   }
 }
 
-impl<K> Ord for IndexedItem<K> {
-  fn cmp(&self, other: &Self) -> Ordering {
-    self.partial_cmp(other).unwrap_or(Ordering::Equal)
+impl<K> PartialOrd for IndexedItem<K> {
+  fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+    Some(self.cmp(other))
   }
 }
 
@@ -231,15 +233,15 @@ impl<T> PartialEq for ScoredItem<T> {
 
 impl<T> Eq for ScoredItem<T> {}
 
-impl<T> PartialOrd for ScoredItem<T> {
-  fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-    self.score.partial_cmp(&other.score)
+impl<T> Ord for ScoredItem<T> {
+  fn cmp(&self, other: &Self) -> Ordering {
+    self.score.partial_cmp(&other.score).unwrap_or(Ordering::Equal)
   }
 }
 
-impl<T> Ord for ScoredItem<T> {
-  fn cmp(&self, other: &Self) -> Ordering {
-    self.partial_cmp(other).unwrap_or(Ordering::Equal)
+impl<T> PartialOrd for ScoredItem<T> {
+  fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+    Some(self.cmp(other))
   }
 }
 

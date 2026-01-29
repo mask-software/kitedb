@@ -163,6 +163,7 @@ impl IvfPqIndex {
   }
 
   /// Create from serialized data (for deserialization)
+  #[allow(clippy::too_many_arguments)]
   pub fn from_serialized(
     config: IvfPqConfig,
     ivf_centroids: Vec<f32>,
@@ -266,8 +267,8 @@ impl IvfPqIndex {
     let pq_training_data = if self.config.use_residuals {
       // Compute residuals: vector - assigned_centroid
       let mut residuals = vec![0.0f32; n * self.dimensions];
-      for i in 0..n {
-        let cluster = assignments[i] as usize;
+      for (i, &cluster_id) in assignments.iter().enumerate().take(n) {
+        let cluster = cluster_id as usize;
         let vec_offset = i * self.dimensions;
         let cent_offset = cluster * self.dimensions;
 
@@ -424,7 +425,7 @@ impl IvfPqIndex {
 
     let mut codes = vec![0u8; num_subspaces];
 
-    for m in 0..num_subspaces {
+    for (m, code) in codes.iter_mut().enumerate().take(num_subspaces) {
       let sub_offset = m * self.subspace_dims;
       let subvec = &vector[sub_offset..sub_offset + self.subspace_dims];
 
@@ -447,7 +448,7 @@ impl IvfPqIndex {
         }
       }
 
-      codes[m] = best_centroid as u8;
+      *code = best_centroid as u8;
     }
 
     codes
@@ -598,7 +599,7 @@ impl IvfPqIndex {
     }
 
     // Convert to results
-    let results = heap.to_sorted_vec();
+    let results = heap.into_sorted_vec();
 
     results
       .into_iter()
@@ -1019,7 +1020,7 @@ impl MaxHeap {
     }
   }
 
-  fn to_sorted_vec(mut self) -> Vec<(u64, f32)> {
+  fn into_sorted_vec(mut self) -> Vec<(u64, f32)> {
     let mut result = Vec::with_capacity(self.items.len());
     while let Some(item) = self.pop() {
       result.push(item);
@@ -1057,7 +1058,7 @@ fn train_pq_subspace(
 
   for _ in 0..max_iterations {
     // Assign vectors to nearest centroids
-    for i in 0..num_vectors {
+    for (i, assignment) in assignments.iter_mut().enumerate().take(num_vectors) {
       let vec_offset = i * subspace_dims;
       let mut best_centroid = 0;
       let mut best_dist = f32::INFINITY;
@@ -1074,15 +1075,15 @@ fn train_pq_subspace(
           best_centroid = c;
         }
       }
-      assignments[i] = best_centroid as u16;
+      *assignment = best_centroid as u16;
     }
 
     // Update centroids
     cluster_sums.fill(0.0);
     cluster_counts.fill(0);
 
-    for i in 0..num_vectors {
-      let cluster = assignments[i] as usize;
+    for (i, &cluster_id) in assignments.iter().enumerate().take(num_vectors) {
+      let cluster = cluster_id as usize;
       let vec_offset = i * subspace_dims;
       let sum_offset = cluster * subspace_dims;
 
@@ -1092,8 +1093,7 @@ fn train_pq_subspace(
       cluster_counts[cluster] += 1;
     }
 
-    for c in 0..num_centroids {
-      let count = cluster_counts[c];
+    for (c, &count) in cluster_counts.iter().enumerate() {
       if count == 0 {
         continue;
       }
@@ -1130,22 +1130,22 @@ fn initialize_pq_centroids_kmeans_pp(
     let prev_cent_offset = (c - 1) * dims;
     let mut total_dist = 0.0;
 
-    for i in 0..num_vectors {
+    for (i, min_dist) in min_dists.iter_mut().enumerate().take(num_vectors) {
       let vec_offset = i * dims;
       let mut dist = 0.0;
       for d in 0..dims {
         let diff = vectors[vec_offset + d] - centroids[prev_cent_offset + d];
         dist += diff * diff;
       }
-      min_dists[i] = min_dists[i].min(dist);
-      total_dist += min_dists[i];
+      *min_dist = (*min_dist).min(dist);
+      total_dist += *min_dist;
     }
 
     // Weighted random selection
     let mut r = rng.gen::<f32>() * total_dist;
     let mut selected_idx = 0;
-    for i in 0..num_vectors {
-      r -= min_dists[i];
+    for (i, dist) in min_dists.iter().enumerate().take(num_vectors) {
+      r -= *dist;
       if r <= 0.0 {
         selected_idx = i;
         break;
@@ -1931,7 +1931,7 @@ mod tests {
     assert_eq!(id, 3);
     assert_eq!(dist, 0.8);
 
-    let sorted = heap.to_sorted_vec();
+    let sorted = heap.into_sorted_vec();
     assert_eq!(sorted.len(), 4);
     // Should be sorted by distance ascending
     assert!(sorted[0].1 <= sorted[1].1);

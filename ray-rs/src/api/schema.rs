@@ -9,8 +9,8 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
-//! use raydb::api::schema::{prop, define_node, define_edge};
+//! ```rust,no_run
+//! use raydb_core::api::schema::{define_edge, define_node, prop};
 //!
 //! let user = define_node("user")
 //!     .key(|id: &str| format!("user:{}", id))
@@ -152,8 +152,8 @@ impl PropDef {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// use raydb::api::schema::prop;
+/// ```rust,no_run
+/// use raydb_core::api::schema::prop;
 ///
 /// let name = prop::string("name");           // required string
 /// let age = prop::int("age").optional();     // optional int
@@ -217,7 +217,8 @@ pub type KeyFn = Arc<dyn Fn(&str) -> String + Send + Sync>;
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust,no_run
+/// # use raydb_core::api::schema::key_fn;
 /// let key_fn = key_fn(|id| format!("user:{}", id));
 /// ```
 pub fn key_fn<F>(f: F) -> KeyFn
@@ -315,7 +316,8 @@ impl NodeSchema {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust,no_run
+/// # use raydb_core::api::schema::{define_node, prop};
 /// let user = define_node("user")
 ///     .key(|id| format!("user:{}", id))
 ///     .prop(prop::string("name"))
@@ -345,7 +347,8 @@ impl NodeSchemaBuilder {
   ///
   /// # Example
   ///
-  /// ```rust,ignore
+  /// ```rust,no_run
+  /// # use raydb_core::api::schema::define_node;
   /// define_node("user")
   ///     .key(|id| format!("user:{}", id))
   /// ```
@@ -372,7 +375,8 @@ impl NodeSchemaBuilder {
   ///
   /// # Example
   ///
-  /// ```rust,ignore
+  /// ```rust,no_run
+  /// # use raydb_core::api::schema::{define_node, prop};
   /// define_node("user")
   ///     .prop(prop::string("name"))
   ///     .prop(prop::int("age").optional())
@@ -409,8 +413,8 @@ impl NodeSchemaBuilder {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// use raydb::api::schema::{define_node, prop};
+/// ```rust,no_run
+/// use raydb_core::api::schema::{define_node, prop};
 ///
 /// // Full definition with key function
 /// let user = define_node("user")
@@ -493,7 +497,8 @@ impl EdgeSchema {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust,no_run
+/// # use raydb_core::api::schema::{define_edge, prop};
 /// let knows = define_edge("knows")
 ///     .prop(prop::int("since"))
 ///     .prop(prop::float("weight").optional())
@@ -519,7 +524,8 @@ impl EdgeSchemaBuilder {
   ///
   /// # Example
   ///
-  /// ```rust,ignore
+  /// ```rust,no_run
+  /// # use raydb_core::api::schema::{define_edge, prop};
   /// define_edge("knows")
   ///     .prop(prop::int("since"))
   ///     .prop(prop::float("weight").optional())
@@ -546,8 +552,8 @@ impl EdgeSchemaBuilder {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// use raydb::api::schema::{define_edge, prop};
+/// ```rust,no_run
+/// use raydb_core::api::schema::{define_edge, prop};
 ///
 /// // Edge with properties
 /// let knows = define_edge("knows")
@@ -689,9 +695,9 @@ impl DatabaseSchema {
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// use raydb::schema;
-/// use raydb::api::schema::{define_node, define_edge, prop};
+/// ```rust,no_run
+/// use raydb_core::schema;
+/// use raydb_core::api::schema::{define_edge, define_node, prop};
 ///
 /// let schema = schema! {
 ///     nodes: [

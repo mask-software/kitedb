@@ -179,11 +179,15 @@ impl PqIndex {
 
     let mut codes = vec![0u8; self.config.num_subspaces];
 
-    for m in 0..self.config.num_subspaces {
+    for (m, code) in codes
+      .iter_mut()
+      .enumerate()
+      .take(self.config.num_subspaces)
+    {
       let sub_offset = m * self.subspace_dims;
       let subvec = &vector[sub_offset..sub_offset + self.subspace_dims];
 
-      codes[m] = find_nearest_centroid(
+      *code = find_nearest_centroid(
         &self.centroids[m],
         subvec,
         self.subspace_dims,
@@ -385,7 +389,7 @@ fn train_subspace(
 
   for _ in 0..max_iterations {
     // Assign vectors to nearest centroids
-    for i in 0..num_vectors {
+    for (i, assignment) in assignments.iter_mut().enumerate().take(num_vectors) {
       let vec_offset = i * subspace_dims;
       let mut best_centroid = 0;
       let mut best_dist = f32::INFINITY;
@@ -402,15 +406,15 @@ fn train_subspace(
           best_centroid = c;
         }
       }
-      assignments[i] = best_centroid as u16;
+      *assignment = best_centroid as u16;
     }
 
     // Update centroids
     cluster_sums.fill(0.0);
     cluster_counts.fill(0);
 
-    for i in 0..num_vectors {
-      let cluster = assignments[i] as usize;
+    for (i, &cluster_id) in assignments.iter().enumerate().take(num_vectors) {
+      let cluster = cluster_id as usize;
       let vec_offset = i * subspace_dims;
       let sum_offset = cluster * subspace_dims;
 
@@ -420,8 +424,7 @@ fn train_subspace(
       cluster_counts[cluster] += 1;
     }
 
-    for c in 0..num_centroids {
-      let count = cluster_counts[c];
+    for (c, &count) in cluster_counts.iter().enumerate() {
       if count == 0 {
         continue;
       }
@@ -458,22 +461,22 @@ fn initialize_centroids_kmeans_pp(
     let prev_cent_offset = (c - 1) * dims;
     let mut total_dist = 0.0;
 
-    for i in 0..num_vectors {
+    for (i, min_dist) in min_dists.iter_mut().enumerate() {
       let vec_offset = i * dims;
       let mut dist = 0.0;
       for d in 0..dims {
         let diff = vectors[vec_offset + d] - centroids[prev_cent_offset + d];
         dist += diff * diff;
       }
-      min_dists[i] = min_dists[i].min(dist);
-      total_dist += min_dists[i];
+      *min_dist = (*min_dist).min(dist);
+      total_dist += *min_dist;
     }
 
     // Weighted random selection
     let mut r = rng.gen::<f32>() * total_dist;
     let mut selected_idx = 0;
-    for i in 0..num_vectors {
-      r -= min_dists[i];
+    for (i, dist) in min_dists.iter().enumerate() {
+      r -= *dist;
       if r <= 0.0 {
         selected_idx = i;
         break;

@@ -307,7 +307,7 @@ impl IvfIndex {
     }
 
     // Convert to results
-    let results = heap.to_sorted_vec();
+    let results = heap.into_sorted_vec();
 
     results
       .into_iter()
@@ -676,7 +676,7 @@ impl MaxHeap {
     }
   }
 
-  fn to_sorted_vec(mut self) -> Vec<(u64, f32)> {
+  fn into_sorted_vec(mut self) -> Vec<(u64, f32)> {
     let mut result = Vec::with_capacity(self.items.len());
     while let Some(item) = self.pop() {
       result.push(item);
@@ -726,7 +726,6 @@ impl std::error::Error for IvfError {}
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::vector::store::create_vector_store;
   use crate::vector::types::{MultiQueryAggregation, VectorManifest, VectorStoreConfig};
 
   fn create_test_index(dimensions: usize, n_clusters: usize) -> IvfIndex {
@@ -887,7 +886,7 @@ mod tests {
     assert_eq!(id, 3);
     assert_eq!(dist, 0.8);
 
-    let sorted = heap.to_sorted_vec();
+    let sorted = heap.into_sorted_vec();
     assert_eq!(sorted.len(), 4);
     // Should be sorted by distance ascending
     assert!(sorted[0].1 <= sorted[1].1);
