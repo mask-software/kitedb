@@ -803,6 +803,8 @@ mod tests {
       target: Some(3),
       targets: None,
       allowed_edge_types: None,
+      weight_key_id: None,
+      weight_key_name: None,
       direction: None,
       max_depth: None,
     });
@@ -821,6 +823,8 @@ mod tests {
       target: Some(3),
       targets: None,
       allowed_edge_types: None,
+      weight_key_id: None,
+      weight_key_name: None,
       direction: None,
       max_depth: None,
     });
@@ -882,6 +886,8 @@ mod tests {
         target: Some(4),
         targets: None,
         allowed_edge_types: None,
+        weight_key_id: None,
+        weight_key_name: None,
         direction: None,
         max_depth: None,
       },

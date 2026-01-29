@@ -30,6 +30,9 @@ pub mod util;
 // Storage layer modules (Phase 2)
 pub mod core;
 
+// Snapshot integrity checks
+pub mod check;
+
 // Graph database modules (Phase 3)
 pub mod graph;
 
@@ -38,6 +41,10 @@ pub mod mvcc;
 
 // Vector embeddings modules (Phase 5)
 pub mod vector;
+
+// Backup and metrics modules
+pub mod backup;
+pub mod metrics;
 
 // Cache modules
 pub mod cache;
@@ -61,6 +68,7 @@ pub mod pyo3_bindings;
 
 // Re-export commonly used items
 pub use error::{RayError, Result};
+pub use check::{check_snapshot, quick_check};
 
 // Re-export schema builders for convenience
 pub use api::schema::{

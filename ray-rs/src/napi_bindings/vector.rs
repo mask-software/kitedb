@@ -752,7 +752,7 @@ pub struct VectorIndexOptions {
 }
 
 impl VectorIndexOptions {
-  fn to_rust(self) -> Result<RustVectorIndexOptions> {
+  fn into_rust(self) -> Result<RustVectorIndexOptions> {
     if self.dimensions <= 0 {
       return Err(Error::from_reason("dimensions must be positive"));
     }
@@ -827,7 +827,7 @@ pub struct SimilarOptions {
 }
 
 impl SimilarOptions {
-  fn to_rust(self) -> Result<RustSimilarOptions> {
+  fn into_rust(self) -> Result<RustSimilarOptions> {
     if self.k <= 0 {
       return Err(Error::from_reason("k must be positive"));
     }
@@ -903,7 +903,7 @@ impl VectorIndex {
   /// Create a new vector index
   #[napi(constructor)]
   pub fn new(options: VectorIndexOptions) -> Result<Self> {
-    let options = options.to_rust()?;
+    let options = options.into_rust()?;
     Ok(VectorIndex {
       inner: RwLock::new(RustVectorIndex::new(options)),
     })
@@ -974,7 +974,7 @@ impl VectorIndex {
       .write()
       .map_err(|e| Error::from_reason(e.to_string()))?;
     let query_f32: Vec<f32> = query.iter().map(|&v| v as f32).collect();
-    let options = options.to_rust()?;
+    let options = options.into_rust()?;
     let hits = index
       .search(&query_f32, options)
       .map_err(map_vector_index_error)?;

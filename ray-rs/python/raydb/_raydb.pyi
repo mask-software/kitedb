@@ -74,8 +74,20 @@ class DbStats:
     delta_nodes_deleted: int
     delta_edges_added: int
     delta_edges_deleted: int
+    wal_segment: int
     wal_bytes: int
     recommend_compact: bool
+    mvcc_stats: Optional[MvccStats]
+
+class MvccStats:
+    """MVCC stats."""
+    active_transactions: int
+    min_active_ts: int
+    versions_pruned: int
+    gc_runs: int
+    last_gc_time: int
+    committed_writes_size: int
+    committed_writes_pruned: int
 
 class CheckResult:
     """Database integrity check result."""
@@ -205,6 +217,8 @@ class MvccMetrics:
     versions_pruned: int
     gc_runs: int
     min_active_timestamp: int
+    committed_writes_size: int
+    committed_writes_pruned: int
 
 class MemoryMetrics:
     """Memory metrics."""

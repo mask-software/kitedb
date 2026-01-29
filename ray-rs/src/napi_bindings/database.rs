@@ -5,9 +5,7 @@
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use parking_lot::Mutex;
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::PathBuf;
 
 use super::traversal::{
   JsPathConfig, JsPathResult, JsTraversalDirection, JsTraversalResult, JsTraversalStep,
@@ -17,16 +15,16 @@ use crate::api::pathfinding::{bfs, dijkstra, yen_k_shortest, PathConfig};
 use crate::api::traversal::{
   TraversalBuilder as RustTraversalBuilder, TraversalDirection, TraverseOptions,
 };
-use crate::cache::manager::CacheManagerStats;
-use crate::constants::{EXT_RAYDB, MANIFEST_FILENAME, SNAPSHOTS_DIR, WAL_DIR};
+use crate::backup as core_backup;
 use crate::core::single_file::{
   close_single_file, is_single_file_path, open_single_file, SingleFileDB as RustSingleFileDB,
   SingleFileOpenOptions as RustOpenOptions, SyncMode as RustSyncMode,
+  SingleFileOptimizeOptions as RustSingleFileOptimizeOptions, VacuumOptions as RustVacuumOptions,
 };
 use crate::export as ray_export;
 use crate::graph::db::{
   close_graph_db, open_graph_db as open_multi_file, GraphDB as RustGraphDB,
-  OpenOptions as GraphOpenOptions, TxState as GraphTxState,
+  OpenOptions as GraphOpenOptions,
 };
 use crate::graph::definitions::define_label as graph_define_label;
 use crate::graph::edges::{
@@ -54,10 +52,13 @@ use crate::graph::vectors::{
   delete_node_vector as graph_delete_node_vector, get_node_vector_db as graph_get_node_vector_db,
   has_node_vector_db as graph_has_node_vector_db, set_node_vector as graph_set_node_vector,
 };
+use crate::metrics as core_metrics;
 use crate::streaming;
 use crate::types::{
-  CheckResult as RustCheckResult, DeltaState, ETypeId, Edge, NodeId, PropKeyId, PropValue,
+  CheckResult as RustCheckResult, ETypeId, Edge, NodeId, PropKeyId, PropValue,
+  TxState as GraphTxState,
 };
+use crate::util::compression::{CompressionOptions as CoreCompressionOptions, CompressionType};
 use serde_json;
 
 // ============================================================================
@@ -202,6 +203,102 @@ impl From<OpenOptions> for RustOpenOptions {
   }
 }
 
+// ============================================================================
+// Single-File Maintenance Options
+// ============================================================================
+
+/// Options for vacuuming a single-file database
+#[napi(object)]
+#[derive(Debug, Default)]
+pub struct VacuumOptions {
+  /// Shrink WAL region if empty
+  pub shrink_wal: Option<bool>,
+  /// Minimum WAL size to keep (bytes)
+  pub min_wal_size: Option<i64>,
+}
+
+impl From<VacuumOptions> for RustVacuumOptions {
+  fn from(opts: VacuumOptions) -> Self {
+    let min_wal_size = opts
+      .min_wal_size
+      .and_then(|v| if v >= 0 { Some(v as u64) } else { None });
+    Self {
+      shrink_wal: opts.shrink_wal.unwrap_or(true),
+      min_wal_size,
+    }
+  }
+}
+
+/// Compression type for snapshot building
+#[napi(string_enum)]
+#[derive(Debug)]
+pub enum JsCompressionType {
+  None,
+  Zstd,
+  Gzip,
+  Deflate,
+}
+
+impl From<JsCompressionType> for CompressionType {
+  fn from(value: JsCompressionType) -> Self {
+    match value {
+      JsCompressionType::None => CompressionType::None,
+      JsCompressionType::Zstd => CompressionType::Zstd,
+      JsCompressionType::Gzip => CompressionType::Gzip,
+      JsCompressionType::Deflate => CompressionType::Deflate,
+    }
+  }
+}
+
+/// Compression options
+#[napi(object)]
+#[derive(Debug, Default)]
+pub struct CompressionOptions {
+  /// Enable compression (default false)
+  pub enabled: Option<bool>,
+  /// Compression algorithm
+  pub r#type: Option<JsCompressionType>,
+  /// Minimum section size to compress
+  pub min_size: Option<u32>,
+  /// Compression level
+  pub level: Option<i32>,
+}
+
+impl From<CompressionOptions> for CoreCompressionOptions {
+  fn from(opts: CompressionOptions) -> Self {
+    let mut out = CoreCompressionOptions::default();
+    if let Some(enabled) = opts.enabled {
+      out.enabled = enabled;
+    }
+    if let Some(t) = opts.r#type {
+      out.compression_type = t.into();
+    }
+    if let Some(min_size) = opts.min_size {
+      out.min_size = min_size as usize;
+    }
+    if let Some(level) = opts.level {
+      out.level = level;
+    }
+    out
+  }
+}
+
+/// Options for optimizing a single-file database
+#[napi(object)]
+#[derive(Debug, Default)]
+pub struct SingleFileOptimizeOptions {
+  /// Compression options for the new snapshot
+  pub compression: Option<CompressionOptions>,
+}
+
+impl From<SingleFileOptimizeOptions> for RustSingleFileOptimizeOptions {
+  fn from(opts: SingleFileOptimizeOptions) -> Self {
+    RustSingleFileOptimizeOptions {
+      compression: opts.compression.map(Into::into),
+    }
+  }
+}
+
 impl OpenOptions {
   fn to_graph_options(&self) -> GraphOpenOptions {
     let mut opts = GraphOpenOptions::new();
@@ -217,6 +314,15 @@ impl OpenOptions {
     }
     if let Some(v) = self.mvcc {
       opts.mvcc = v;
+    }
+    if let Some(v) = self.mvcc_gc_interval_ms {
+      opts.mvcc_gc_interval_ms = Some(v as u64);
+    }
+    if let Some(v) = self.mvcc_retention_ms {
+      opts.mvcc_retention_ms = Some(v as u64);
+    }
+    if let Some(v) = self.mvcc_max_chain_depth {
+      opts.mvcc_max_chain_depth = Some(v as usize);
     }
 
     opts
@@ -238,8 +344,10 @@ pub struct DbStats {
   pub delta_nodes_deleted: i64,
   pub delta_edges_added: i64,
   pub delta_edges_deleted: i64,
+  pub wal_segment: i64,
   pub wal_bytes: i64,
   pub recommend_compact: bool,
+  pub mvcc_stats: Option<MvccStats>,
 }
 
 /// Options for export
@@ -252,7 +360,7 @@ pub struct ExportOptions {
 }
 
 impl ExportOptions {
-  fn to_rust(self) -> ray_export::ExportOptions {
+  fn into_rust(self) -> ray_export::ExportOptions {
     let mut opts = ray_export::ExportOptions::default();
     if let Some(v) = self.include_nodes {
       opts.include_nodes = v;
@@ -278,7 +386,7 @@ pub struct ImportOptions {
 }
 
 impl ImportOptions {
-  fn to_rust(self) -> ray_export::ImportOptions {
+  fn into_rust(self) -> ray_export::ImportOptions {
     let mut opts = ray_export::ImportOptions::default();
     if let Some(v) = self.skip_existing {
       opts.skip_existing = v;
@@ -320,7 +428,7 @@ pub struct StreamOptions {
 }
 
 impl StreamOptions {
-  fn to_rust(self) -> Result<crate::streaming::StreamOptions> {
+  fn into_rust(self) -> Result<crate::streaming::StreamOptions> {
     let batch_size = self.batch_size.unwrap_or(0);
     if batch_size < 0 {
       return Err(Error::from_reason("batchSize must be non-negative"));
@@ -342,7 +450,7 @@ pub struct PaginationOptions {
 }
 
 impl PaginationOptions {
-  fn to_rust(self) -> Result<crate::streaming::PaginationOptions> {
+  fn into_rust(self) -> Result<crate::streaming::PaginationOptions> {
     let limit = self.limit.unwrap_or(0);
     if limit < 0 {
       return Err(Error::from_reason("limit must be non-negative"));
@@ -465,6 +573,20 @@ pub struct MvccMetrics {
   pub versions_pruned: i64,
   pub gc_runs: i64,
   pub min_active_timestamp: i64,
+  pub committed_writes_size: i64,
+  pub committed_writes_pruned: i64,
+}
+
+/// MVCC stats (from stats())
+#[napi(object)]
+pub struct MvccStats {
+  pub active_transactions: i64,
+  pub min_active_ts: i64,
+  pub versions_pruned: i64,
+  pub gc_runs: i64,
+  pub last_gc_time: i64,
+  pub committed_writes_size: i64,
+  pub committed_writes_pruned: i64,
 }
 
 /// Memory metrics
@@ -503,6 +625,107 @@ pub struct HealthCheckEntry {
 pub struct HealthCheckResult {
   pub healthy: bool,
   pub checks: Vec<HealthCheckEntry>,
+}
+
+impl From<core_metrics::CacheLayerMetrics> for CacheLayerMetrics {
+  fn from(metrics: core_metrics::CacheLayerMetrics) -> Self {
+    CacheLayerMetrics {
+      hits: metrics.hits,
+      misses: metrics.misses,
+      hit_rate: metrics.hit_rate,
+      size: metrics.size,
+      max_size: metrics.max_size,
+      utilization_percent: metrics.utilization_percent,
+    }
+  }
+}
+
+impl From<core_metrics::CacheMetrics> for CacheMetrics {
+  fn from(metrics: core_metrics::CacheMetrics) -> Self {
+    CacheMetrics {
+      enabled: metrics.enabled,
+      property_cache: metrics.property_cache.into(),
+      traversal_cache: metrics.traversal_cache.into(),
+      query_cache: metrics.query_cache.into(),
+    }
+  }
+}
+
+impl From<core_metrics::DataMetrics> for DataMetrics {
+  fn from(metrics: core_metrics::DataMetrics) -> Self {
+    DataMetrics {
+      node_count: metrics.node_count,
+      edge_count: metrics.edge_count,
+      delta_nodes_created: metrics.delta_nodes_created,
+      delta_nodes_deleted: metrics.delta_nodes_deleted,
+      delta_edges_added: metrics.delta_edges_added,
+      delta_edges_deleted: metrics.delta_edges_deleted,
+      snapshot_generation: metrics.snapshot_generation,
+      max_node_id: metrics.max_node_id,
+      schema_labels: metrics.schema_labels,
+      schema_etypes: metrics.schema_etypes,
+      schema_prop_keys: metrics.schema_prop_keys,
+    }
+  }
+}
+
+impl From<core_metrics::MvccMetrics> for MvccMetrics {
+  fn from(metrics: core_metrics::MvccMetrics) -> Self {
+    MvccMetrics {
+      enabled: metrics.enabled,
+      active_transactions: metrics.active_transactions,
+      versions_pruned: metrics.versions_pruned,
+      gc_runs: metrics.gc_runs,
+      min_active_timestamp: metrics.min_active_timestamp,
+      committed_writes_size: metrics.committed_writes_size,
+      committed_writes_pruned: metrics.committed_writes_pruned,
+    }
+  }
+}
+
+impl From<core_metrics::MemoryMetrics> for MemoryMetrics {
+  fn from(metrics: core_metrics::MemoryMetrics) -> Self {
+    MemoryMetrics {
+      delta_estimate_bytes: metrics.delta_estimate_bytes,
+      cache_estimate_bytes: metrics.cache_estimate_bytes,
+      snapshot_bytes: metrics.snapshot_bytes,
+      total_estimate_bytes: metrics.total_estimate_bytes,
+    }
+  }
+}
+
+impl From<core_metrics::DatabaseMetrics> for DatabaseMetrics {
+  fn from(metrics: core_metrics::DatabaseMetrics) -> Self {
+    DatabaseMetrics {
+      path: metrics.path,
+      is_single_file: metrics.is_single_file,
+      read_only: metrics.read_only,
+      data: metrics.data.into(),
+      cache: metrics.cache.into(),
+      mvcc: metrics.mvcc.map(Into::into),
+      memory: metrics.memory.into(),
+      collected_at: metrics.collected_at_ms,
+    }
+  }
+}
+
+impl From<core_metrics::HealthCheckEntry> for HealthCheckEntry {
+  fn from(entry: core_metrics::HealthCheckEntry) -> Self {
+    HealthCheckEntry {
+      name: entry.name,
+      passed: entry.passed,
+      message: entry.message,
+    }
+  }
+}
+
+impl From<core_metrics::HealthCheckResult> for HealthCheckResult {
+  fn from(result: core_metrics::HealthCheckResult) -> Self {
+    HealthCheckResult {
+      healthy: result.healthy,
+      checks: result.checks.into_iter().map(Into::into).collect(),
+    }
+  }
 }
 
 // ============================================================================
@@ -638,6 +861,7 @@ pub struct JsNodeProp {
 // Database NAPI Wrapper (single-file + multi-file)
 // ============================================================================
 
+#[allow(clippy::large_enum_variant)]
 enum DatabaseInner {
   SingleFile(RustSingleFileDB),
   Graph(RustGraphDB),
@@ -658,16 +882,14 @@ impl Database {
     let options = options.unwrap_or_default();
     let path_buf = PathBuf::from(&path);
 
-    if path_buf.exists() {
-      if path_buf.is_dir() {
-        let graph_opts = options.to_graph_options();
-        let db = open_multi_file(&path_buf, graph_opts)
-          .map_err(|e| Error::from_reason(format!("Failed to open database: {e}")))?;
-        return Ok(Database {
-          inner: Some(DatabaseInner::Graph(db)),
-          graph_tx: Mutex::new(None),
-        });
-      }
+    if path_buf.exists() && path_buf.is_dir() {
+      let graph_opts = options.to_graph_options();
+      let db = open_multi_file(&path_buf, graph_opts)
+        .map_err(|e| Error::from_reason(format!("Failed to open database: {e}")))?;
+      return Ok(Database {
+        inner: Some(DatabaseInner::Graph(db)),
+        graph_tx: Mutex::new(None),
+      });
     }
 
     let mut db_path = path_buf;
@@ -1192,7 +1414,7 @@ impl Database {
   /// Stream nodes in batches
   #[napi]
   pub fn stream_nodes(&self, options: Option<StreamOptions>) -> Result<Vec<Vec<i64>>> {
-    let options = options.unwrap_or_default().to_rust()?;
+    let options = options.unwrap_or_default().into_rust()?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(
         streaming::stream_nodes_single(db, options)
@@ -1216,7 +1438,7 @@ impl Database {
     &self,
     options: Option<StreamOptions>,
   ) -> Result<Vec<Vec<NodeWithProps>>> {
-    let options = options.unwrap_or_default().to_rust()?;
+    let options = options.unwrap_or_default().into_rust()?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
         let batches = streaming::stream_nodes_single(db, options);
@@ -1286,7 +1508,7 @@ impl Database {
   /// Stream edges in batches
   #[napi]
   pub fn stream_edges(&self, options: Option<StreamOptions>) -> Result<Vec<Vec<JsFullEdge>>> {
-    let options = options.unwrap_or_default().to_rust()?;
+    let options = options.unwrap_or_default().into_rust()?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(
         streaming::stream_edges_single(db, options)
@@ -1328,7 +1550,7 @@ impl Database {
     &self,
     options: Option<StreamOptions>,
   ) -> Result<Vec<Vec<EdgeWithProps>>> {
-    let options = options.unwrap_or_default().to_rust()?;
+    let options = options.unwrap_or_default().into_rust()?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
         let batches = streaming::stream_edges_single(db, options);
@@ -1398,7 +1620,7 @@ impl Database {
   /// Get a page of node IDs
   #[napi]
   pub fn get_nodes_page(&self, options: Option<PaginationOptions>) -> Result<NodePage> {
-    let options = options.unwrap_or_default().to_rust()?;
+    let options = options.unwrap_or_default().into_rust()?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
         let page = streaming::get_nodes_page_single(db, options);
@@ -1425,7 +1647,7 @@ impl Database {
   /// Get a page of edges
   #[napi]
   pub fn get_edges_page(&self, options: Option<PaginationOptions>) -> Result<EdgePage> {
-    let options = options.unwrap_or_default().to_rust()?;
+    let options = options.unwrap_or_default().into_rust()?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
         let page = streaming::get_edges_page_single(db, options);
@@ -1779,13 +2001,13 @@ impl Database {
       Some(DatabaseInner::Graph(db)) => {
         let pending = {
           let guard = self.graph_tx.lock();
-          guard
-            .as_ref()
-            .and_then(|tx| {
-              tx.pending_vectors
-                .get(&(node_id as NodeId, prop_key_id as PropKeyId))
-            })
-            .cloned()
+          guard.as_ref().and_then(|tx| {
+            let key = (node_id as NodeId, prop_key_id as PropKeyId);
+            if tx.pending_vector_deletes.contains(&key) {
+              return Some(None);
+            }
+            tx.pending_vector_sets.get(&key).cloned().map(Some)
+          })
         };
 
         if let Some(pending_vec) = pending {
@@ -1827,17 +2049,17 @@ impl Database {
       Some(DatabaseInner::Graph(db)) => {
         let pending = {
           let guard = self.graph_tx.lock();
-          guard
-            .as_ref()
-            .and_then(|tx| {
-              tx.pending_vectors
-                .get(&(node_id as NodeId, prop_key_id as PropKeyId))
-            })
-            .cloned()
+          guard.as_ref().and_then(|tx| {
+            let key = (node_id as NodeId, prop_key_id as PropKeyId);
+            if tx.pending_vector_deletes.contains(&key) {
+              return Some(false);
+            }
+            tx.pending_vector_sets.get(&key).map(|_| true)
+          })
         };
 
-        if let Some(pending_vec) = pending {
-          return Ok(pending_vec.is_some());
+        if let Some(pending_has) = pending {
+          return Ok(pending_has);
         }
 
         Ok(graph_has_node_vector_db(
@@ -2540,20 +2762,56 @@ impl Database {
 
   /// Optimize (compact) the database
   ///
-  /// This is an alias for `checkpoint()` to match the TypeScript API.
-  /// For single-file databases, optimization means merging the WAL into
-  /// the snapshot, which reduces file size and improves read performance.
+  /// For single-file databases, this compacts the WAL into a new snapshot
+  /// (equivalent to optimizeSingleFile in the TypeScript API).
   #[napi]
   pub fn optimize(&mut self) -> Result<()> {
     match self.inner.as_mut() {
       Some(DatabaseInner::SingleFile(db)) => db
-        .checkpoint()
+        .optimize_single_file(None)
         .map_err(|e| Error::from_reason(format!("Failed to optimize: {e}"))),
       Some(DatabaseInner::Graph(db)) => db
         .optimize()
         .map_err(|e| Error::from_reason(format!("Failed to optimize: {e}"))),
       None => Err(Error::from_reason("Database is closed")),
     }
+  }
+
+  /// Optimize (compact) a single-file database with options
+  #[napi(js_name = "optimizeSingleFile")]
+  pub fn optimize_single_file(
+    &mut self,
+    options: Option<SingleFileOptimizeOptions>,
+  ) -> Result<()> {
+    match self.inner.as_mut() {
+      Some(DatabaseInner::SingleFile(db)) => db
+        .optimize_single_file(options.map(Into::into))
+        .map_err(|e| Error::from_reason(format!("Failed to optimize single-file: {e}"))),
+      Some(DatabaseInner::Graph(_)) => Err(Error::from_reason(
+        "optimizeSingleFile() only supports single-file databases",
+      )),
+      None => Err(Error::from_reason("Database is closed")),
+    }
+  }
+
+  /// Vacuum a single-file database to reclaim free space
+  #[napi]
+  pub fn vacuum(&mut self, options: Option<VacuumOptions>) -> Result<()> {
+    match self.inner.as_mut() {
+      Some(DatabaseInner::SingleFile(db)) => db
+        .vacuum_single_file(options.map(Into::into))
+        .map_err(|e| Error::from_reason(format!("Failed to vacuum: {e}"))),
+      Some(DatabaseInner::Graph(_)) => Err(Error::from_reason(
+        "vacuum() only supports single-file databases",
+      )),
+      None => Err(Error::from_reason("Database is closed")),
+    }
+  }
+
+  /// Vacuum a single-file database to reclaim free space
+  #[napi(js_name = "vacuumSingleFile")]
+  pub fn vacuum_single_file(&mut self, options: Option<VacuumOptions>) -> Result<()> {
+    self.vacuum(options)
   }
 
   /// Get database statistics
@@ -2571,8 +2829,18 @@ impl Database {
           delta_nodes_deleted: s.delta_nodes_deleted as i64,
           delta_edges_added: s.delta_edges_added as i64,
           delta_edges_deleted: s.delta_edges_deleted as i64,
+          wal_segment: s.wal_segment as i64,
           wal_bytes: s.wal_bytes as i64,
           recommend_compact: s.recommend_compact,
+          mvcc_stats: s.mvcc_stats.map(|stats| MvccStats {
+            active_transactions: stats.active_transactions as i64,
+            min_active_ts: stats.min_active_ts as i64,
+            versions_pruned: stats.versions_pruned as i64,
+            gc_runs: stats.gc_runs as i64,
+            last_gc_time: stats.last_gc_time as i64,
+            committed_writes_size: stats.committed_writes_size as i64,
+            committed_writes_pruned: stats.committed_writes_pruned as i64,
+          }),
         })
       }
       Some(DatabaseInner::Graph(db)) => Ok(graph_stats(db)),
@@ -2603,7 +2871,7 @@ impl Database {
       include_schema: None,
       pretty: None,
     });
-    let opts = opts.to_rust();
+    let opts = opts.into_rust();
 
     let data = match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => ray_export::export_to_object_single(db, opts)
@@ -2629,7 +2897,7 @@ impl Database {
       include_schema: None,
       pretty: None,
     });
-    let rust_opts = opts.to_rust();
+    let rust_opts = opts.into_rust();
 
     let data = match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
@@ -2662,7 +2930,7 @@ impl Database {
       include_schema: None,
       pretty: None,
     });
-    let rust_opts = opts.to_rust();
+    let rust_opts = opts.into_rust();
 
     let data = match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => ray_export::export_to_object_single(db, rust_opts)
@@ -2691,7 +2959,7 @@ impl Database {
       skip_existing: None,
       batch_size: None,
     });
-    let rust_opts = opts.to_rust();
+    let rust_opts = opts.into_rust();
     let parsed: ray_export::ExportedDatabase =
       serde_json::from_value(data).map_err(|e| Error::from_reason(e.to_string()))?;
 
@@ -2725,7 +2993,7 @@ impl Database {
       skip_existing: None,
       batch_size: None,
     });
-    let rust_opts = opts.to_rust();
+    let rust_opts = opts.into_rust();
     let parsed =
       ray_export::import_from_json(path).map_err(|e| Error::from_reason(e.to_string()))?;
 
@@ -3141,6 +3409,28 @@ fn graph_stats(db: &RustGraphDB) -> DbStats {
       (0, 0, 0, 0)
     };
 
+  let wal_segment = db
+    .manifest
+    .as_ref()
+    .map(|m| m.active_wal_seg)
+    .unwrap_or(0);
+
+  let mvcc_stats = db.mvcc.as_ref().map(|mvcc| {
+    let tx_mgr = mvcc.tx_manager.lock();
+    let gc = mvcc.gc.lock();
+    let gc_stats = gc.get_stats();
+    let committed_stats = tx_mgr.get_committed_writes_stats();
+    MvccStats {
+      active_transactions: tx_mgr.get_active_count() as i64,
+      min_active_ts: tx_mgr.min_active_ts() as i64,
+      versions_pruned: gc_stats.versions_pruned as i64,
+      gc_runs: gc_stats.gc_runs as i64,
+      last_gc_time: gc_stats.last_gc_time as i64,
+      committed_writes_size: committed_stats.size as i64,
+      committed_writes_pruned: committed_stats.pruned as i64,
+    }
+  });
+
   let total_changes =
     delta_nodes_created + delta_nodes_deleted + delta_edges_added + delta_edges_deleted;
   let recommend_compact = total_changes > 10_000;
@@ -3154,75 +3444,22 @@ fn graph_stats(db: &RustGraphDB) -> DbStats {
     delta_nodes_deleted: delta_nodes_deleted as i64,
     delta_edges_added: delta_edges_added as i64,
     delta_edges_deleted: delta_edges_deleted as i64,
+    wal_segment: wal_segment as i64,
     wal_bytes: db.wal_bytes() as i64,
     recommend_compact,
+    mvcc_stats,
   }
 }
 
 fn graph_check(db: &RustGraphDB) -> RustCheckResult {
-  let mut errors = Vec::new();
-  let mut warnings = Vec::new();
-
-  let all_nodes = graph_list_nodes(db);
-  let node_count = all_nodes.len();
-
-  if node_count == 0 {
-    warnings.push("No nodes in database".to_string());
-    return RustCheckResult {
-      valid: true,
-      errors,
-      warnings,
-    };
-  }
-
-  let all_edges = graph_list_edges(db, ListEdgesOptions::default());
-  let edge_count = all_edges.len();
-
-  for edge in &all_edges {
-    if !node_exists_db(db, edge.src) {
-      errors.push(format!(
-        "Edge references non-existent source node: {} -[{}]-> {}",
-        edge.src, edge.etype, edge.dst
-      ));
-    }
-
-    if !node_exists_db(db, edge.dst) {
-      errors.push(format!(
-        "Edge references non-existent destination node: {} -[{}]-> {}",
-        edge.src, edge.etype, edge.dst
-      ));
-    }
-  }
-
-  for edge in &all_edges {
-    let exists = edge_exists_db(db, edge.src, edge.etype, edge.dst);
-    if !exists {
-      errors.push(format!(
-        "Edge inconsistency: edge {} -[{}]-> {} listed but not found via edge_exists",
-        edge.src, edge.etype, edge.dst
-      ));
-    }
-  }
-
-  let counted_nodes = graph_count_nodes(db);
-  let counted_edges = graph_count_edges(db, None);
-
-  if counted_nodes as usize != node_count {
-    warnings.push(format!(
-      "Node count mismatch: list_nodes returned {node_count} but count_nodes returned {counted_nodes}"
-    ));
-  }
-
-  if counted_edges as usize != edge_count {
-    warnings.push(format!(
-      "Edge count mismatch: list_edges returned {edge_count} but count_edges returned {counted_edges}"
-    ));
+  if let Some(ref snapshot) = db.snapshot {
+    return crate::check::check_snapshot(snapshot);
   }
 
   RustCheckResult {
-    valid: errors.is_empty(),
-    errors,
-    warnings,
+    valid: true,
+    errors: Vec::new(),
+    warnings: vec!["No snapshot to check".to_string()],
   }
 }
 
@@ -3243,8 +3480,8 @@ pub fn open_database(path: String, options: Option<OpenOptions>) -> Result<Datab
 #[napi]
 pub fn collect_metrics(db: &Database) -> Result<DatabaseMetrics> {
   match db.inner.as_ref() {
-    Some(DatabaseInner::SingleFile(db)) => Ok(collect_metrics_single_file(db)),
-    Some(DatabaseInner::Graph(db)) => Ok(collect_metrics_graph(db)),
+    Some(DatabaseInner::SingleFile(db)) => Ok(core_metrics::collect_metrics_single_file(db).into()),
+    Some(DatabaseInner::Graph(db)) => Ok(core_metrics::collect_metrics_graph(db).into()),
     None => Err(Error::from_reason("Database is closed")),
   }
 }
@@ -3252,308 +3489,10 @@ pub fn collect_metrics(db: &Database) -> Result<DatabaseMetrics> {
 #[napi]
 pub fn health_check(db: &Database) -> Result<HealthCheckResult> {
   match db.inner.as_ref() {
-    Some(DatabaseInner::SingleFile(db)) => Ok(health_check_single_file(db)),
-    Some(DatabaseInner::Graph(db)) => Ok(health_check_graph(db)),
+    Some(DatabaseInner::SingleFile(db)) => Ok(core_metrics::health_check_single_file(db).into()),
+    Some(DatabaseInner::Graph(db)) => Ok(core_metrics::health_check_graph(db).into()),
     None => Err(Error::from_reason("Database is closed")),
   }
-}
-
-fn calc_hit_rate(hits: u64, misses: u64) -> f64 {
-  let total = hits + misses;
-  if total > 0 {
-    hits as f64 / total as f64
-  } else {
-    0.0
-  }
-}
-
-fn build_cache_layer_metrics(
-  hits: u64,
-  misses: u64,
-  size: usize,
-  max_size: usize,
-) -> CacheLayerMetrics {
-  CacheLayerMetrics {
-    hits: hits as i64,
-    misses: misses as i64,
-    hit_rate: calc_hit_rate(hits, misses),
-    size: size as i64,
-    max_size: max_size as i64,
-    utilization_percent: if max_size > 0 {
-      (size as f64 / max_size as f64) * 100.0
-    } else {
-      0.0
-    },
-  }
-}
-
-fn empty_cache_layer_metrics() -> CacheLayerMetrics {
-  CacheLayerMetrics {
-    hits: 0,
-    misses: 0,
-    hit_rate: 0.0,
-    size: 0,
-    max_size: 0,
-    utilization_percent: 0.0,
-  }
-}
-
-fn build_cache_metrics(stats: Option<&CacheManagerStats>) -> CacheMetrics {
-  match stats {
-    Some(stats) => CacheMetrics {
-      enabled: true,
-      property_cache: build_cache_layer_metrics(
-        stats.property_cache_hits,
-        stats.property_cache_misses,
-        stats.property_cache_size,
-        stats.property_cache_max_size,
-      ),
-      traversal_cache: build_cache_layer_metrics(
-        stats.traversal_cache_hits,
-        stats.traversal_cache_misses,
-        stats.traversal_cache_size,
-        stats.traversal_cache_max_size,
-      ),
-      query_cache: build_cache_layer_metrics(
-        stats.query_cache_hits,
-        stats.query_cache_misses,
-        stats.query_cache_size,
-        stats.query_cache_max_size,
-      ),
-    },
-    None => CacheMetrics {
-      enabled: false,
-      property_cache: empty_cache_layer_metrics(),
-      traversal_cache: empty_cache_layer_metrics(),
-      query_cache: empty_cache_layer_metrics(),
-    },
-  }
-}
-
-fn estimate_delta_memory(delta: &DeltaState) -> i64 {
-  let mut bytes = 0i64;
-
-  bytes += delta.created_nodes.len() as i64 * 100;
-  bytes += delta.deleted_nodes.len() as i64 * 8;
-  bytes += delta.modified_nodes.len() as i64 * 100;
-
-  for patches in delta.out_add.values() {
-    bytes += patches.len() as i64 * 24;
-  }
-  for patches in delta.out_del.values() {
-    bytes += patches.len() as i64 * 24;
-  }
-  for patches in delta.in_add.values() {
-    bytes += patches.len() as i64 * 24;
-  }
-  for patches in delta.in_del.values() {
-    bytes += patches.len() as i64 * 24;
-  }
-
-  bytes += delta.edge_props.len() as i64 * 50;
-  bytes += delta.key_index.len() as i64 * 40;
-
-  bytes
-}
-
-fn estimate_cache_memory(stats: Option<&CacheManagerStats>) -> i64 {
-  match stats {
-    Some(stats) => {
-      (stats.property_cache_size as i64 * 100)
-        + (stats.traversal_cache_size as i64 * 200)
-        + (stats.query_cache_size as i64 * 500)
-    }
-    None => 0,
-  }
-}
-
-fn delta_health_size(delta: &DeltaState) -> usize {
-  delta.created_nodes.len()
-    + delta.deleted_nodes.len()
-    + delta.modified_nodes.len()
-    + delta.out_add.len()
-    + delta.in_add.len()
-}
-
-fn collect_metrics_single_file(db: &RustSingleFileDB) -> DatabaseMetrics {
-  let stats = db.stats();
-  let delta = db.delta.read();
-  let cache_stats = db.cache.read().as_ref().map(|cache| cache.stats());
-
-  let node_count = stats.snapshot_nodes as i64 + stats.delta_nodes_created as i64
-    - stats.delta_nodes_deleted as i64;
-  let edge_count =
-    stats.snapshot_edges as i64 + stats.delta_edges_added as i64 - stats.delta_edges_deleted as i64;
-
-  let data = DataMetrics {
-    node_count,
-    edge_count,
-    delta_nodes_created: stats.delta_nodes_created as i64,
-    delta_nodes_deleted: stats.delta_nodes_deleted as i64,
-    delta_edges_added: stats.delta_edges_added as i64,
-    delta_edges_deleted: stats.delta_edges_deleted as i64,
-    snapshot_generation: stats.snapshot_gen as i64,
-    max_node_id: stats.snapshot_max_node_id as i64,
-    schema_labels: delta.new_labels.len() as i64,
-    schema_etypes: delta.new_etypes.len() as i64,
-    schema_prop_keys: delta.new_propkeys.len() as i64,
-  };
-
-  let cache = build_cache_metrics(cache_stats.as_ref());
-  let delta_bytes = estimate_delta_memory(&delta);
-  let cache_bytes = estimate_cache_memory(cache_stats.as_ref());
-  let snapshot_bytes = (stats.snapshot_nodes as i64 * 50) + (stats.snapshot_edges as i64 * 20);
-
-  DatabaseMetrics {
-    path: db.path.to_string_lossy().to_string(),
-    is_single_file: true,
-    read_only: db.read_only,
-    data,
-    cache,
-    mvcc: None,
-    memory: MemoryMetrics {
-      delta_estimate_bytes: delta_bytes,
-      cache_estimate_bytes: cache_bytes,
-      snapshot_bytes,
-      total_estimate_bytes: delta_bytes + cache_bytes + snapshot_bytes,
-    },
-    collected_at: system_time_to_millis(SystemTime::now()),
-  }
-}
-
-fn collect_metrics_graph(db: &RustGraphDB) -> DatabaseMetrics {
-  let stats = graph_stats(db);
-  let delta = db.delta.read();
-
-  let node_count = stats.snapshot_nodes + stats.delta_nodes_created - stats.delta_nodes_deleted;
-  let edge_count = stats.snapshot_edges + stats.delta_edges_added - stats.delta_edges_deleted;
-
-  let data = DataMetrics {
-    node_count,
-    edge_count,
-    delta_nodes_created: stats.delta_nodes_created,
-    delta_nodes_deleted: stats.delta_nodes_deleted,
-    delta_edges_added: stats.delta_edges_added,
-    delta_edges_deleted: stats.delta_edges_deleted,
-    snapshot_generation: stats.snapshot_gen,
-    max_node_id: stats.snapshot_max_node_id,
-    schema_labels: delta.new_labels.len() as i64,
-    schema_etypes: delta.new_etypes.len() as i64,
-    schema_prop_keys: delta.new_propkeys.len() as i64,
-  };
-
-  let cache = build_cache_metrics(None);
-  let delta_bytes = estimate_delta_memory(&delta);
-  let snapshot_bytes = (stats.snapshot_nodes * 50) + (stats.snapshot_edges * 20);
-
-  DatabaseMetrics {
-    path: db.path.to_string_lossy().to_string(),
-    is_single_file: false,
-    read_only: db.read_only,
-    data,
-    cache,
-    mvcc: None,
-    memory: MemoryMetrics {
-      delta_estimate_bytes: delta_bytes,
-      cache_estimate_bytes: 0,
-      snapshot_bytes,
-      total_estimate_bytes: delta_bytes + snapshot_bytes,
-    },
-    collected_at: system_time_to_millis(SystemTime::now()),
-  }
-}
-
-fn health_check_single_file(db: &RustSingleFileDB) -> HealthCheckResult {
-  let mut checks = Vec::new();
-
-  checks.push(HealthCheckEntry {
-    name: "database_open".to_string(),
-    passed: true,
-    message: "Database handle is valid".to_string(),
-  });
-
-  let delta = db.delta.read();
-  let delta_size = delta_health_size(&delta);
-  let delta_ok = delta_size < 100000;
-  checks.push(HealthCheckEntry {
-    name: "delta_size".to_string(),
-    passed: delta_ok,
-    message: if delta_ok {
-      format!("Delta size is reasonable ({delta_size} entries)")
-    } else {
-      format!("Delta is large ({delta_size} entries) - consider checkpointing")
-    },
-  });
-
-  let cache_stats = db.cache.read().as_ref().map(|cache| cache.stats());
-  if let Some(stats) = cache_stats {
-    let total_hits = stats.property_cache_hits + stats.traversal_cache_hits;
-    let total_misses = stats.property_cache_misses + stats.traversal_cache_misses;
-    let total = total_hits + total_misses;
-    let hit_rate = if total > 0 {
-      total_hits as f64 / total as f64
-    } else {
-      1.0
-    };
-    let cache_ok = hit_rate > 0.5 || total < 100;
-    checks.push(HealthCheckEntry {
-      name: "cache_efficiency".to_string(),
-      passed: cache_ok,
-      message: if cache_ok {
-        format!("Cache hit rate: {:.1}%", hit_rate * 100.0)
-      } else {
-        format!(
-          "Low cache hit rate: {:.1}% - consider adjusting cache size",
-          hit_rate * 100.0
-        )
-      },
-    });
-  }
-
-  if db.read_only {
-    checks.push(HealthCheckEntry {
-      name: "write_access".to_string(),
-      passed: true,
-      message: "Database is read-only".to_string(),
-    });
-  }
-
-  let healthy = checks.iter().all(|check| check.passed);
-  HealthCheckResult { healthy, checks }
-}
-
-fn health_check_graph(db: &RustGraphDB) -> HealthCheckResult {
-  let mut checks = Vec::new();
-
-  checks.push(HealthCheckEntry {
-    name: "database_open".to_string(),
-    passed: true,
-    message: "Database handle is valid".to_string(),
-  });
-
-  let delta = db.delta.read();
-  let delta_size = delta_health_size(&delta);
-  let delta_ok = delta_size < 100000;
-  checks.push(HealthCheckEntry {
-    name: "delta_size".to_string(),
-    passed: delta_ok,
-    message: if delta_ok {
-      format!("Delta size is reasonable ({delta_size} entries)")
-    } else {
-      format!("Delta is large ({delta_size} entries) - consider checkpointing")
-    },
-  });
-
-  if db.read_only {
-    checks.push(HealthCheckEntry {
-      name: "write_access".to_string(),
-      passed: true,
-      message: "Database is read-only".to_string(),
-    });
-  }
-
-  let healthy = checks.iter().all(|check| check.passed);
-  HealthCheckResult { healthy, checks }
 }
 
 // ============================================================================
@@ -3562,7 +3501,7 @@ fn health_check_graph(db: &RustGraphDB) -> HealthCheckResult {
 
 /// Options for creating a backup
 #[napi(object)]
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct BackupOptions {
   /// Force a checkpoint before backup (single-file only)
   pub checkpoint: Option<bool>,
@@ -3572,7 +3511,7 @@ pub struct BackupOptions {
 
 /// Options for restoring a backup
 #[napi(object)]
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct RestoreOptions {
   /// Overwrite existing database if it exists
   pub overwrite: Option<bool>,
@@ -3580,7 +3519,7 @@ pub struct RestoreOptions {
 
 /// Options for offline backup
 #[napi(object)]
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct OfflineBackupOptions {
   /// Overwrite existing backup if it exists
   pub overwrite: Option<bool>,
@@ -3599,81 +3538,39 @@ pub struct BackupResult {
   pub r#type: String,
 }
 
-fn system_time_to_millis(time: SystemTime) -> i64 {
-  match time.duration_since(UNIX_EPOCH) {
-    Ok(duration) => duration.as_millis() as i64,
-    Err(_) => 0,
-  }
-}
-
-fn ensure_parent_dir(path: &Path) -> Result<()> {
-  if let Some(parent) = path.parent() {
-    if !parent.as_os_str().is_empty() {
-      fs::create_dir_all(parent).map_err(|e| Error::from_reason(e.to_string()))?;
+impl From<BackupOptions> for core_backup::BackupOptions {
+  fn from(options: BackupOptions) -> Self {
+    Self {
+      checkpoint: options.checkpoint.unwrap_or(true),
+      overwrite: options.overwrite.unwrap_or(false),
     }
   }
-  Ok(())
 }
 
-fn remove_existing(path: &Path) -> Result<()> {
-  if path.is_dir() {
-    fs::remove_dir_all(path).map_err(|e| Error::from_reason(e.to_string()))?;
-  } else {
-    fs::remove_file(path).map_err(|e| Error::from_reason(e.to_string()))?;
-  }
-  Ok(())
-}
-
-fn copy_file_with_size(src: &Path, dst: &Path) -> Result<u64> {
-  fs::copy(src, dst).map_err(|e| Error::from_reason(e.to_string()))?;
-  let size = fs::metadata(src)
-    .map_err(|e| Error::from_reason(e.to_string()))?
-    .len();
-  Ok(size)
-}
-
-fn dir_size(path: &Path) -> Result<u64> {
-  let mut total = 0u64;
-  for entry in fs::read_dir(path).map_err(|e| Error::from_reason(e.to_string()))? {
-    let entry = entry.map_err(|e| Error::from_reason(e.to_string()))?;
-    let entry_path = entry.path();
-    let metadata = entry
-      .metadata()
-      .map_err(|e| Error::from_reason(e.to_string()))?;
-    if metadata.is_dir() {
-      total += dir_size(&entry_path)?;
-    } else {
-      total += metadata.len();
+impl From<RestoreOptions> for core_backup::RestoreOptions {
+  fn from(options: RestoreOptions) -> Self {
+    Self {
+      overwrite: options.overwrite.unwrap_or(false),
     }
   }
-  Ok(total)
 }
 
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<u64> {
-  fs::create_dir_all(dst).map_err(|e| Error::from_reason(e.to_string()))?;
-  let mut total = 0u64;
-  for entry in fs::read_dir(src).map_err(|e| Error::from_reason(e.to_string()))? {
-    let entry = entry.map_err(|e| Error::from_reason(e.to_string()))?;
-    let src_path = entry.path();
-    let dst_path = dst.join(entry.file_name());
-    let metadata = entry
-      .metadata()
-      .map_err(|e| Error::from_reason(e.to_string()))?;
-    if metadata.is_dir() {
-      total += copy_dir_recursive(&src_path, &dst_path)?;
-    } else {
-      total += copy_file_with_size(&src_path, &dst_path)?;
+impl From<OfflineBackupOptions> for core_backup::OfflineBackupOptions {
+  fn from(options: OfflineBackupOptions) -> Self {
+    Self {
+      overwrite: options.overwrite.unwrap_or(false),
     }
   }
-  Ok(total)
 }
 
-fn backup_result(path: &Path, size: u64, kind: &str, timestamp: SystemTime) -> BackupResult {
-  BackupResult {
-    path: path.to_string_lossy().to_string(),
-    size: size as i64,
-    timestamp: system_time_to_millis(timestamp),
-    r#type: kind.to_string(),
+impl From<core_backup::BackupResult> for BackupResult {
+  fn from(result: core_backup::BackupResult) -> Self {
+    BackupResult {
+      path: result.path,
+      size: result.size as i64,
+      timestamp: result.timestamp_ms as i64,
+      r#type: result.kind,
+    }
   }
 }
 
@@ -3685,100 +3582,21 @@ pub fn create_backup(
   options: Option<BackupOptions>,
 ) -> Result<BackupResult> {
   let options = options.unwrap_or_default();
-  let do_checkpoint = options.checkpoint.unwrap_or(true);
-  let overwrite = options.overwrite.unwrap_or(false);
-  let mut backup_path = PathBuf::from(backup_path);
-
-  if backup_path.exists() && !overwrite {
-    return Err(Error::from_reason(
-      "Backup already exists at path (use overwrite: true)".to_string(),
-    ));
-  }
+  let core_options: core_backup::BackupOptions = options.clone().into();
+  let backup_path = PathBuf::from(backup_path);
 
   match db.inner.as_ref() {
-    Some(DatabaseInner::SingleFile(db)) => {
-      if !backup_path.to_string_lossy().ends_with(EXT_RAYDB) {
-        backup_path = PathBuf::from(format!("{}{}", backup_path.to_string_lossy(), EXT_RAYDB));
-      }
-
-      if do_checkpoint && !db.read_only {
-        db.checkpoint()
-          .map_err(|e| Error::from_reason(format!("Failed to checkpoint: {e}")))?;
-      }
-
-      ensure_parent_dir(&backup_path)?;
-
-      if overwrite && backup_path.exists() {
-        remove_existing(&backup_path)?;
-      }
-
-      copy_file_with_size(&db.path, &backup_path)?;
-      let size = fs::metadata(&backup_path)
-        .map_err(|e| Error::from_reason(e.to_string()))?
-        .len();
-
-      Ok(backup_result(
-        &backup_path,
-        size,
-        "single-file",
-        SystemTime::now(),
-      ))
-    }
+    Some(DatabaseInner::SingleFile(db)) => core_backup::create_backup_single_file(
+      db,
+      &backup_path,
+      core_options,
+    )
+    .map(BackupResult::from)
+    .map_err(|e| Error::from_reason(format!("Failed to create backup: {e}"))),
     Some(DatabaseInner::Graph(db)) => {
-      if overwrite && backup_path.exists() {
-        remove_existing(&backup_path)?;
-      }
-
-      fs::create_dir_all(&backup_path).map_err(|e| Error::from_reason(e.to_string()))?;
-      fs::create_dir_all(backup_path.join(SNAPSHOTS_DIR))
-        .map_err(|e| Error::from_reason(e.to_string()))?;
-      fs::create_dir_all(backup_path.join(WAL_DIR))
-        .map_err(|e| Error::from_reason(e.to_string()))?;
-
-      let mut total_size = 0u64;
-      let manifest_src = db.path.join(MANIFEST_FILENAME);
-      if manifest_src.exists() {
-        total_size += copy_file_with_size(&manifest_src, &backup_path.join(MANIFEST_FILENAME))?;
-      }
-
-      let snapshots_dir = db.path.join(SNAPSHOTS_DIR);
-      if snapshots_dir.exists() {
-        for entry in fs::read_dir(&snapshots_dir).map_err(|e| Error::from_reason(e.to_string()))? {
-          let entry = entry.map_err(|e| Error::from_reason(e.to_string()))?;
-          let src = entry.path();
-          if entry
-            .file_type()
-            .map_err(|e| Error::from_reason(e.to_string()))?
-            .is_file()
-          {
-            let dst = backup_path.join(SNAPSHOTS_DIR).join(entry.file_name());
-            total_size += copy_file_with_size(&src, &dst)?;
-          }
-        }
-      }
-
-      let wal_dir = db.path.join(WAL_DIR);
-      if wal_dir.exists() {
-        for entry in fs::read_dir(&wal_dir).map_err(|e| Error::from_reason(e.to_string()))? {
-          let entry = entry.map_err(|e| Error::from_reason(e.to_string()))?;
-          let src = entry.path();
-          if entry
-            .file_type()
-            .map_err(|e| Error::from_reason(e.to_string()))?
-            .is_file()
-          {
-            let dst = backup_path.join(WAL_DIR).join(entry.file_name());
-            total_size += copy_file_with_size(&src, &dst)?;
-          }
-        }
-      }
-
-      Ok(backup_result(
-        &backup_path,
-        total_size,
-        "multi-file",
-        SystemTime::now(),
-      ))
+      core_backup::create_backup_graph(db, &backup_path, core_options)
+        .map(BackupResult::from)
+        .map_err(|e| Error::from_reason(format!("Failed to create backup: {e}")))
     }
     None => Err(Error::from_reason("Database is closed")),
   }
@@ -3792,116 +3610,19 @@ pub fn restore_backup(
   options: Option<RestoreOptions>,
 ) -> Result<String> {
   let options = options.unwrap_or_default();
-  let overwrite = options.overwrite.unwrap_or(false);
-  let backup_path = PathBuf::from(backup_path);
-  let mut restore_path = PathBuf::from(restore_path);
+  let core_options: core_backup::RestoreOptions = options.into();
 
-  if !backup_path.exists() {
-    return Err(Error::from_reason("Backup not found at path".to_string()));
-  }
-
-  if restore_path.exists() && !overwrite {
-    return Err(Error::from_reason(
-      "Database already exists at restore path (use overwrite: true)".to_string(),
-    ));
-  }
-
-  let metadata = fs::metadata(&backup_path).map_err(|e| Error::from_reason(e.to_string()))?;
-  if metadata.is_file() {
-    if !restore_path.to_string_lossy().ends_with(EXT_RAYDB) {
-      restore_path = PathBuf::from(format!("{}{}", restore_path.to_string_lossy(), EXT_RAYDB));
-    }
-
-    ensure_parent_dir(&restore_path)?;
-
-    if overwrite && restore_path.exists() {
-      remove_existing(&restore_path)?;
-    }
-
-    copy_file_with_size(&backup_path, &restore_path)?;
-    Ok(restore_path.to_string_lossy().to_string())
-  } else if metadata.is_dir() {
-    if overwrite && restore_path.exists() {
-      remove_existing(&restore_path)?;
-    }
-
-    fs::create_dir_all(&restore_path).map_err(|e| Error::from_reason(e.to_string()))?;
-    fs::create_dir_all(restore_path.join(SNAPSHOTS_DIR))
-      .map_err(|e| Error::from_reason(e.to_string()))?;
-    fs::create_dir_all(restore_path.join(WAL_DIR))
-      .map_err(|e| Error::from_reason(e.to_string()))?;
-
-    let manifest_src = backup_path.join(MANIFEST_FILENAME);
-    if manifest_src.exists() {
-      copy_file_with_size(&manifest_src, &restore_path.join(MANIFEST_FILENAME))?;
-    }
-
-    let snapshots_dir = backup_path.join(SNAPSHOTS_DIR);
-    if snapshots_dir.exists() {
-      for entry in fs::read_dir(&snapshots_dir).map_err(|e| Error::from_reason(e.to_string()))? {
-        let entry = entry.map_err(|e| Error::from_reason(e.to_string()))?;
-        let src = entry.path();
-        if entry
-          .file_type()
-          .map_err(|e| Error::from_reason(e.to_string()))?
-          .is_file()
-        {
-          let dst = restore_path.join(SNAPSHOTS_DIR).join(entry.file_name());
-          copy_file_with_size(&src, &dst)?;
-        }
-      }
-    }
-
-    let wal_dir = backup_path.join(WAL_DIR);
-    if wal_dir.exists() {
-      for entry in fs::read_dir(&wal_dir).map_err(|e| Error::from_reason(e.to_string()))? {
-        let entry = entry.map_err(|e| Error::from_reason(e.to_string()))?;
-        let src = entry.path();
-        if entry
-          .file_type()
-          .map_err(|e| Error::from_reason(e.to_string()))?
-          .is_file()
-        {
-          let dst = restore_path.join(WAL_DIR).join(entry.file_name());
-          copy_file_with_size(&src, &dst)?;
-        }
-      }
-    }
-
-    Ok(restore_path.to_string_lossy().to_string())
-  } else {
-    Err(Error::from_reason(
-      "Backup path is not a file or directory".to_string(),
-    ))
-  }
+  core_backup::restore_backup(backup_path, restore_path, core_options)
+    .map(|p| p.to_string_lossy().to_string())
+    .map_err(|e| Error::from_reason(format!("Failed to restore backup: {e}")))
 }
 
 /// Inspect a backup without restoring it
 #[napi]
 pub fn get_backup_info(backup_path: String) -> Result<BackupResult> {
-  let backup_path = PathBuf::from(backup_path);
-  if !backup_path.exists() {
-    return Err(Error::from_reason("Backup not found at path".to_string()));
-  }
-
-  let metadata = fs::metadata(&backup_path).map_err(|e| Error::from_reason(e.to_string()))?;
-  let timestamp = metadata.modified().unwrap_or_else(|_| SystemTime::now());
-
-  if metadata.is_file() {
-    Ok(backup_result(
-      &backup_path,
-      metadata.len(),
-      "single-file",
-      timestamp,
-    ))
-  } else if metadata.is_dir() {
-    let size = dir_size(&backup_path)?;
-    Ok(backup_result(&backup_path, size, "multi-file", timestamp))
-  } else {
-    Err(Error::from_reason(
-      "Backup path is not a file or directory".to_string(),
-    ))
-  }
+  core_backup::get_backup_info(backup_path)
+    .map(BackupResult::from)
+    .map_err(|e| Error::from_reason(format!("Failed to inspect backup: {e}")))
 }
 
 /// Create a backup from a database path without opening it
@@ -3912,50 +3633,9 @@ pub fn create_offline_backup(
   options: Option<OfflineBackupOptions>,
 ) -> Result<BackupResult> {
   let options = options.unwrap_or_default();
-  let overwrite = options.overwrite.unwrap_or(false);
-  let db_path = PathBuf::from(db_path);
-  let backup_path = PathBuf::from(backup_path);
+  let core_options: core_backup::OfflineBackupOptions = options.into();
 
-  if !db_path.exists() {
-    return Err(Error::from_reason("Database not found at path".to_string()));
-  }
-
-  if backup_path.exists() && !overwrite {
-    return Err(Error::from_reason(
-      "Backup already exists at path (use overwrite: true)".to_string(),
-    ));
-  }
-
-  let metadata = fs::metadata(&db_path).map_err(|e| Error::from_reason(e.to_string()))?;
-  if metadata.is_file() {
-    ensure_parent_dir(&backup_path)?;
-    if overwrite && backup_path.exists() {
-      remove_existing(&backup_path)?;
-    }
-    copy_file_with_size(&db_path, &backup_path)?;
-    let size = fs::metadata(&backup_path)
-      .map_err(|e| Error::from_reason(e.to_string()))?
-      .len();
-    Ok(backup_result(
-      &backup_path,
-      size,
-      "single-file",
-      SystemTime::now(),
-    ))
-  } else if metadata.is_dir() {
-    if overwrite && backup_path.exists() {
-      remove_existing(&backup_path)?;
-    }
-    let size = copy_dir_recursive(&db_path, &backup_path)?;
-    Ok(backup_result(
-      &backup_path,
-      size,
-      "multi-file",
-      SystemTime::now(),
-    ))
-  } else {
-    Err(Error::from_reason(
-      "Database path is not a file or directory".to_string(),
-    ))
-  }
+  core_backup::create_offline_backup(db_path, backup_path, core_options)
+    .map(BackupResult::from)
+    .map_err(|e| Error::from_reason(format!("Failed to create offline backup: {e}")))
 }
