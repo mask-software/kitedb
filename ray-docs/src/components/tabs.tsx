@@ -1,6 +1,8 @@
 import type { Component } from 'solid-js'
 import { createSignal, createUniqueId, For, Show } from 'solid-js'
+import { ChevronDown, Check, Copy } from 'lucide-solid'
 import CodeBlock from './code-block'
+import { LANGUAGES, selectedLanguage, setSelectedLanguage } from '~/lib/language-store'
 
 interface TabItem {
   label: string
@@ -15,6 +17,7 @@ interface TabsProps {
 
 export const Tabs: Component<TabsProps> = (props) => {
   const [activeIndex, setActiveIndex] = createSignal(props.defaultIndex ?? 0)
+  const [langDropdownOpen, setLangDropdownOpen] = createSignal(false)
   const baseId = createUniqueId()
 
   const handleKeyDown = (e: KeyboardEvent, index: number) => {
@@ -40,67 +43,102 @@ export const Tabs: Component<TabsProps> = (props) => {
   }
 
   return (
-    <div class="console-container overflow-hidden">
-      <div class="console-scanlines opacity-5" aria-hidden="true" />
-
-      {/* Tab headers - console style */}
-      <div
-        class="relative flex bg-[#0a1628] border-b border-[#1a2a42]"
-        role="tablist"
-        aria-label="Code examples"
-      >
-        {/* Terminal dots */}
-        <div class="flex items-center gap-1.5 px-4" aria-hidden="true">
-          <div class="w-2.5 h-2.5 rounded-full bg-[#ff5f57]" />
-          <div class="w-2.5 h-2.5 rounded-full bg-[#febc2e]" />
-          <div class="w-2.5 h-2.5 rounded-full bg-[#28c840]" />
+    <div>
+      {/* Standalone tabs above the code window */}
+      <div class="flex items-center justify-between mb-3">
+        {/* Tab buttons */}
+        <div
+          class="inline-flex items-center gap-1 p-1 rounded-lg bg-[#0a1628] border border-[#1a2a42]"
+          role="tablist"
+          aria-label="Code examples"
+        >
+          <For each={props.items}>
+            {(item, index) => (
+              <button
+                type="button"
+                role="tab"
+                id={`${baseId}-tab-${index()}`}
+                aria-selected={activeIndex() === index()}
+                aria-controls={`${baseId}-tabpanel-${index()}`}
+                tabIndex={activeIndex() === index() ? 0 : -1}
+                class={`px-3 py-1.5 text-xs font-mono rounded-md transition-all duration-150 ${
+                  activeIndex() === index()
+                    ? 'text-[#00d4ff] bg-[#00d4ff]/10 shadow-[0_0_10px_rgba(0,212,255,0.2)]'
+                    : 'text-slate-500 hover:text-white hover:bg-[#1a2a42]/50'
+                }`}
+                onClick={() => setActiveIndex(index())}
+                onKeyDown={(e) => handleKeyDown(e, index())}
+              >
+                {item.label.toLowerCase().replace(/\s+/g, '_')}
+              </button>
+            )}
+          </For>
         </div>
 
-        <For each={props.items}>
-          {(item, index) => (
-            <button
-              type="button"
-              role="tab"
-              id={`${baseId}-tab-${index()}`}
-              aria-selected={activeIndex() === index()}
-              aria-controls={`${baseId}-tabpanel-${index()}`}
-              tabIndex={activeIndex() === index() ? 0 : -1}
-              class={`px-4 py-2.5 text-xs font-mono transition-colors duration-150 relative ${activeIndex() === index()
-                  ? 'text-[#00d4ff] bg-[#030712]'
-                  : 'text-slate-500 hover:text-white hover:bg-[#1a2a42]/40'
-                }`}
-              onClick={() => setActiveIndex(index())}
-              onKeyDown={(e) => handleKeyDown(e, index())}
+        {/* Language dropdown */}
+        <div class="relative">
+          <button
+            type="button"
+            class="flex items-center gap-1.5 px-3 py-1.5 text-xs font-mono rounded-lg text-slate-400 hover:text-[#00d4ff] bg-[#0a1628] border border-[#1a2a42] hover:border-[#00d4ff]/30 transition-colors duration-150"
+            onClick={() => setLangDropdownOpen(!langDropdownOpen())}
+            aria-expanded={langDropdownOpen()}
+            aria-haspopup="listbox"
+          >
+            {selectedLanguage().label}
+            <ChevronDown size={12} class={`transition-transform duration-150 ${langDropdownOpen() ? 'rotate-180' : ''}`} />
+          </button>
+          
+          <Show when={langDropdownOpen()}>
+            <div 
+              class="absolute right-0 top-full mt-1 z-50 min-w-[120px] py-1 rounded-lg bg-[#0a1628] border border-[#1a2a42] shadow-xl shadow-black/50"
+              role="listbox"
             >
-              {item.label.toLowerCase().replace(/\s+/g, '_')}
-              <Show when={activeIndex() === index()}>
-                <div
-                  class="absolute bottom-0 left-0 right-0 h-0.5 bg-[#00d4ff] shadow-[0_0_10px_rgba(0,212,255,0.5)]"
-                  aria-hidden="true"
-                />
-              </Show>
-            </button>
-          )}
-        </For>
+              <For each={LANGUAGES}>
+                {(lang) => (
+                  <button
+                    type="button"
+                    role="option"
+                    aria-selected={selectedLanguage().id === lang.id}
+                    class={`w-full flex items-center gap-2 px-3 py-2 text-xs font-mono transition-colors ${
+                      selectedLanguage().id === lang.id 
+                        ? 'text-[#00d4ff] bg-[#00d4ff]/10' 
+                        : 'text-slate-400 hover:text-white hover:bg-[#1a2a42]/50'
+                    }`}
+                    onClick={() => {
+                      setSelectedLanguage(lang)
+                      setLangDropdownOpen(false)
+                    }}
+                  >
+                    <Show when={selectedLanguage().id === lang.id}>
+                      <Check size={12} class="text-[#00d4ff]" />
+                    </Show>
+                    <Show when={selectedLanguage().id !== lang.id}>
+                      <div class="w-3" />
+                    </Show>
+                    {lang.label}
+                  </button>
+                )}
+              </For>
+            </div>
+          </Show>
+        </div>
       </div>
 
-      {/* Tab content */}
-      <div class="relative">
-        <For each={props.items}>
-          {(item, index) => (
-            <div
-              role="tabpanel"
-              id={`${baseId}-tabpanel-${index()}`}
-              aria-labelledby={`${baseId}-tab-${index()}`}
-              aria-hidden={activeIndex() !== index()}
-              style={{ display: activeIndex() === index() ? 'block' : 'none' }}
-              tabIndex={0}
-            >
-              <CodeBlock code={item.code} language={item.language} />
-            </div>
-          )}
-        </For>
-      </div>
+      {/* Code window */}
+      <For each={props.items}>
+        {(item, index) => (
+          <div
+            role="tabpanel"
+            id={`${baseId}-tabpanel-${index()}`}
+            aria-labelledby={`${baseId}-tab-${index()}`}
+            aria-hidden={activeIndex() !== index()}
+            style={{ display: activeIndex() === index() ? 'block' : 'none' }}
+            tabIndex={0}
+          >
+            <CodeBlock code={item.code} language={item.language} />
+          </div>
+        )}
+      </For>
     </div>
   )
 }

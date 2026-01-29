@@ -1,5 +1,5 @@
 import type { Component } from "solid-js";
-import { createSignal, createResource, Suspense, Show } from "solid-js";
+import { createSignal, createResource, Suspense, Show, For, createMemo } from "solid-js";
 import { Check, Copy, Terminal } from "lucide-solid";
 import { highlightCode } from "~/lib/highlighter";
 
@@ -8,6 +8,8 @@ interface CodeBlockProps {
 	language?: string;
 	filename?: string;
 	class?: string;
+	showLineNumbers?: boolean;
+	showHeader?: boolean;
 }
 
 export const CodeBlock: Component<CodeBlockProps> = (props) => {
@@ -23,6 +25,11 @@ export const CodeBlock: Component<CodeBlockProps> = (props) => {
 			}
 		}
 	);
+
+	// Calculate line numbers
+	const lineCount = createMemo(() => props.code.split('\n').length);
+	const showLines = () => props.showLineNumbers ?? true; // Default to true
+	const showHeader = () => props.showHeader ?? true; // Default to true
 
 	const copyToClipboard = async () => {
 		try {
@@ -41,7 +48,7 @@ export const CodeBlock: Component<CodeBlockProps> = (props) => {
 			<div class="console-scanlines opacity-5" aria-hidden="true" />
 
 			{/* Console-style header */}
-			<Show when={props.filename || props.language}>
+			<Show when={showHeader() && (props.filename || props.language)}>
 				<div class="relative flex items-center justify-between px-4 py-2.5 bg-[#0a1628] border-b border-[#1a2a42]">
 					<div class="flex items-center gap-3">
 						{/* Terminal dots */}
@@ -80,35 +87,56 @@ export const CodeBlock: Component<CodeBlockProps> = (props) => {
 
 			{/* Code content with Shiki highlighting */}
 			<div class="relative overflow-x-auto scrollbar-thin">
-				<Suspense
-					fallback={
-						<pre class="p-4 text-sm leading-relaxed border-0">
-							<code class="font-mono text-slate-300 whitespace-pre">
-								{props.code}
-							</code>
-						</pre>
-					}
-				>
-					<Show
-						when={highlightedHtml()}
-						fallback={
-							<pre class="p-4 text-sm leading-relaxed border-0">
-								<code class="font-mono text-slate-300 whitespace-pre">
-									{props.code}
-								</code>
-							</pre>
-						}
-					>
-						<div
-							class="shiki-wrapper [&_pre]:p-4 [&_pre]:text-sm [&_pre]:leading-relaxed [&_pre]:bg-transparent! [&_pre]:border-0 [&_code]:font-mono"
-							innerHTML={highlightedHtml() ?? undefined}
-						/>
+				<div class="flex">
+					{/* Line numbers column */}
+					<Show when={showLines()}>
+						<div 
+							class="flex-shrink-0 select-none py-4 pl-4 pr-3 text-right border-r border-[#1a2a42]/50"
+							aria-hidden="true"
+						>
+							<For each={Array.from({ length: lineCount() }, (_, i) => i + 1)}>
+								{(lineNum) => (
+									<div class="text-sm leading-relaxed font-mono text-slate-600">
+										{lineNum}
+									</div>
+								)}
+							</For>
+						</div>
 					</Show>
-				</Suspense>
+					
+					{/* Code content */}
+					<div class="flex-1 min-w-0">
+						<Suspense
+							fallback={
+								<pre class={`text-sm leading-relaxed border-0 ${showLines() ? 'py-4 pr-4 pl-3' : 'p-4'}`}>
+									<code class="font-mono text-slate-300 whitespace-pre">
+										{props.code}
+									</code>
+								</pre>
+							}
+						>
+							<Show
+								when={highlightedHtml()}
+								fallback={
+									<pre class={`text-sm leading-relaxed border-0 ${showLines() ? 'py-4 pr-4 pl-3' : 'p-4'}`}>
+										<code class="font-mono text-slate-300 whitespace-pre">
+											{props.code}
+										</code>
+									</pre>
+								}
+							>
+								<div
+									class={`shiki-wrapper [&_pre]:text-sm [&_pre]:leading-relaxed [&_pre]:bg-transparent! [&_pre]:border-0 [&_code]:font-mono ${showLines() ? '[&_pre]:py-4 [&_pre]:pr-4 [&_pre]:pl-3' : '[&_pre]:p-4'}`}
+									innerHTML={highlightedHtml() ?? undefined}
+								/>
+							</Show>
+						</Suspense>
+					</div>
+				</div>
 			</div>
 
 			{/* Copy button overlay for blocks without header */}
-			<Show when={!props.filename && !props.language}>
+			<Show when={showHeader() && !props.filename && !props.language}>
 				<button
 					type="button"
 					onClick={copyToClipboard}
