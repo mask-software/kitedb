@@ -1,11 +1,32 @@
 //! Python bindings for RayDB using PyO3
 //!
 //! Exposes SingleFileDB and related types to Python.
+//!
+//! ## Module Structure
+//!
+//! - `database` - Core Database class and main operations
+//! - `types` - Basic types (PropValue, Edge, FullEdge, NodeProp, etc.)
+//! - `options` - Configuration options (OpenOptions, BackupOptions, etc.)
+//! - `stats` - Statistics and metrics types
+//! - `ops` - Operation implementations organized by domain
+//! - `helpers` - Internal helper functions
+//! - `traversal` - Traversal result types
+//! - `vector` - Vector index types
 
 #[cfg(feature = "python")]
 pub mod database;
 #[cfg(feature = "python")]
+pub mod helpers;
+#[cfg(feature = "python")]
+pub mod ops;
+#[cfg(feature = "python")]
+pub mod options;
+#[cfg(feature = "python")]
+pub mod stats;
+#[cfg(feature = "python")]
 pub mod traversal;
+#[cfg(feature = "python")]
+pub mod types;
 #[cfg(feature = "python")]
 pub mod vector;
 
@@ -24,39 +45,51 @@ use pyo3::prelude::*;
 #[pymodule]
 #[pyo3(name = "_raydb")]
 pub fn raydb(m: &Bound<'_, PyModule>) -> PyResult<()> {
-  // Database classes
+  // Database class
   m.add_class::<database::PyDatabase>()?;
-  m.add_class::<database::PyOpenOptions>()?;
-  m.add_class::<database::PySyncMode>()?;
-  m.add_class::<database::PyDbStats>()?;
-  m.add_class::<database::PyCheckResult>()?;
-  m.add_class::<database::PyCacheStats>()?;
-  m.add_class::<database::PyExportOptions>()?;
-  m.add_class::<database::PyImportOptions>()?;
-  m.add_class::<database::PyExportResult>()?;
-  m.add_class::<database::PyImportResult>()?;
-  m.add_class::<database::PyStreamOptions>()?;
-  m.add_class::<database::PyPaginationOptions>()?;
-  m.add_class::<database::PyNodeWithProps>()?;
-  m.add_class::<database::PyEdgeWithProps>()?;
-  m.add_class::<database::PyNodePage>()?;
-  m.add_class::<database::PyEdgePage>()?;
-  m.add_class::<database::PyCacheLayerMetrics>()?;
-  m.add_class::<database::PyCacheMetrics>()?;
-  m.add_class::<database::PyDataMetrics>()?;
-  m.add_class::<database::PyMvccMetrics>()?;
-  m.add_class::<database::PyMemoryMetrics>()?;
-  m.add_class::<database::PyDatabaseMetrics>()?;
-  m.add_class::<database::PyHealthCheckEntry>()?;
-  m.add_class::<database::PyHealthCheckResult>()?;
-  m.add_class::<database::PyBackupOptions>()?;
-  m.add_class::<database::PyRestoreOptions>()?;
-  m.add_class::<database::PyOfflineBackupOptions>()?;
-  m.add_class::<database::PyBackupResult>()?;
-  m.add_class::<database::PyPropValue>()?;
-  m.add_class::<database::PyEdge>()?;
-  m.add_class::<database::PyFullEdge>()?;
-  m.add_class::<database::PyNodeProp>()?;
+
+  // Options classes
+  m.add_class::<options::OpenOptions>()?;
+  m.add_class::<options::SyncMode>()?;
+  m.add_class::<options::CompressionOptions>()?;
+  m.add_class::<options::SingleFileOptimizeOptions>()?;
+  m.add_class::<options::VacuumOptions>()?;
+  m.add_class::<options::ExportOptions>()?;
+  m.add_class::<options::ImportOptions>()?;
+  m.add_class::<options::StreamOptions>()?;
+  m.add_class::<options::PaginationOptions>()?;
+  m.add_class::<options::BackupOptions>()?;
+  m.add_class::<options::RestoreOptions>()?;
+  m.add_class::<options::OfflineBackupOptions>()?;
+
+  // Stats classes
+  m.add_class::<stats::DbStats>()?;
+  m.add_class::<stats::CheckResult>()?;
+  m.add_class::<stats::CacheStats>()?;
+  m.add_class::<stats::CacheLayerMetrics>()?;
+  m.add_class::<stats::CacheMetrics>()?;
+  m.add_class::<stats::DataMetrics>()?;
+  m.add_class::<stats::MvccMetrics>()?;
+  m.add_class::<stats::MvccStats>()?;
+  m.add_class::<stats::MemoryMetrics>()?;
+  m.add_class::<stats::DatabaseMetrics>()?;
+  m.add_class::<stats::HealthCheckEntry>()?;
+  m.add_class::<stats::HealthCheckResult>()?;
+
+  // Types classes
+  m.add_class::<types::PropValue>()?;
+  m.add_class::<types::Edge>()?;
+  m.add_class::<types::FullEdge>()?;
+  m.add_class::<types::NodeProp>()?;
+  m.add_class::<types::NodeWithProps>()?;
+  m.add_class::<types::EdgeWithProps>()?;
+  m.add_class::<types::NodePage>()?;
+  m.add_class::<types::EdgePage>()?;
+
+  // Result types from options (ExportResult, ImportResult, BackupResult)
+  m.add_class::<options::ExportResult>()?;
+  m.add_class::<options::ImportResult>()?;
+  m.add_class::<options::BackupResult>()?;
 
   // Traversal result classes
   m.add_class::<traversal::PyTraversalResult>()?;
