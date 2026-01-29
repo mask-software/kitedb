@@ -30,7 +30,7 @@ export type PhysNode = number;
 export type StringID = number;
 
 // ============================================================================
-// Manifest (manifest.gdm)
+// Manifest (manifest.gdm) - legacy multi-file format
 // ============================================================================
 
 export interface ManifestV1 {
@@ -299,6 +299,11 @@ export interface OpenOptions {
    * Install fs-ext with: `bun add fs-ext`
    */
   requireLocking?: boolean;
+  /**
+   * Allow opening legacy multi-file (directory) databases.
+   * Default: false. When false, directory paths will be rejected.
+   */
+  legacyMultiFile?: boolean;
   cache?: CacheOptions;
   mvcc?: boolean; // Enable MVCC mode (default: false for backward compatibility)
   mvccGcInterval?: number; // GC interval in ms (default: 5000)

@@ -512,9 +512,26 @@ const path = await db
 
 ## File Formats
 
-Database files are stored in a directory:
+RayDB primarily uses the single-file `.raydb` format. The directory-based
+format is legacy and deprecated for new deployments.
+
+### Single-File Format (`.raydb`)
 
 ```
+mydb.raydb
+  Header (page 0)
+  WAL Area (circular buffer)
+  Snapshot Area (CSR)
+```
+
+### Multi-File Format (Directory) - Deprecated (Legacy)
+
+Database files stored in a directory:
+
+```
+
+To open an existing legacy directory, pass `{ legacyMultiFile: true }` to
+`openGraphDB`.
 db/
   manifest.gdm              # Metadata (JSON)
   lock.gdl                  # Optional file lock

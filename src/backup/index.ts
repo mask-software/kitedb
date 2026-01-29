@@ -2,6 +2,7 @@
  * Backup and Restore functionality for RayDB
  * 
  * Supports both single-file (.raydb) and multi-file (directory) databases.
+ * Note: Multi-file is legacy and deprecated for new deployments.
  * Backups are atomic and consistent - they capture a point-in-time snapshot.
  */
 
@@ -49,7 +50,7 @@ export interface BackupResult {
  * Create a backup of a database
  * 
  * For single-file databases: Creates a copy of the .raydb file
- * For multi-file databases: Creates a copy of the entire directory
+ * For multi-file databases: Creates a copy of the entire directory (legacy)
  * 
  * @param db - Open database handle (will be checkpointed if needed)
  * @param backupPath - Path where backup should be created

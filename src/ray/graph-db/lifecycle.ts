@@ -104,8 +104,8 @@ function validateDbPath(path: string): void {
  * Open a graph database
  * Automatically detects format based on path:
  * - If path ends with .raydb or is an existing .raydb file: single-file format
- * - If path is an existing directory with manifest.gdm: multi-file format
- * - If path is an existing directory (without manifest): use multi-file format (backward compat)
+ * - If path is an existing directory with manifest.gdm and legacyMultiFile is true: multi-file (legacy)
+ * - If path is an existing directory (without manifest) and legacyMultiFile is true: multi-file (legacy, backward compat)
  * - Otherwise: new database uses single-file format by default
  */
 export async function openGraphDB(
@@ -115,7 +115,12 @@ export async function openGraphDB(
   // Validate path for security before any filesystem operations
   validateDbPath(path);
 
-  const { readOnly = false, createIfMissing = true, lockFile = true } = options;
+  const {
+    readOnly = false,
+    createIfMissing = true,
+    lockFile = true,
+    legacyMultiFile = false,
+  } = options;
 
   // Check if path is an existing directory (multi-file format)
   // This includes directories with manifest.gdm and empty directories
@@ -125,6 +130,17 @@ export async function openGraphDB(
     try {
       const stat = fs.statSync(path);
       if (stat.isDirectory()) {
+        if (!legacyMultiFile) {
+          throw new Error(
+            "Multi-file (directory) format is deprecated. " +
+              "Use the single-file .raydb format, or pass { legacyMultiFile: true } " +
+              "to open existing legacy directories."
+          );
+        }
+        console.warn(
+          "[ray-db] Multi-file (directory) format is deprecated. " +
+            "Use the single-file .raydb format for new deployments."
+        );
         // Existing directory - use multi-file format
         return openMultiFileDB(path, options);
       }
@@ -152,6 +168,7 @@ export async function openGraphDB(
 
 /**
  * Open a multi-file graph database (directory format)
+ * @deprecated Multi-file format is legacy. Prefer the single-file .raydb format.
  * @internal
  */
 async function openMultiFileDB(
@@ -516,4 +533,3 @@ export async function closeGraphDB(db: GraphDB): Promise<void> {
     }
   }
 }
-

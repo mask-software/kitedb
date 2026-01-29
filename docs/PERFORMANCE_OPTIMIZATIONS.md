@@ -6,6 +6,8 @@ This document outlines identified performance optimization opportunities for the
 
 After benchmarking the single-file format against the multi-file format, we identified and fixed the primary performance issue: the pager was using `readSync()` to copy snapshot data into memory instead of `Bun.mmap()` for zero-copy access.
 
+The multi-file (directory) format is now considered legacy; these optimizations focus on the single-file `.raydb` path.
+
 With that fix applied, the single-file format now achieves:
 - **41% smaller storage** (2.82 MB vs 4.79 MB for 5K nodes, 25K edges)
 - **Comparable read performance** (some operations faster, some slightly slower)

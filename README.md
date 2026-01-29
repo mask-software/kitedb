@@ -101,6 +101,7 @@ const db = await openGraphDB(path, {
   readOnly?: boolean,        // Open in read-only mode
   createIfMissing?: boolean, // Create if doesn't exist (default: true)
   lockFile?: boolean,        // Use file locking (default: true)
+  legacyMultiFile?: boolean, // Allow legacy directory format (default: false)
   mvcc?: boolean,            // Enable MVCC for concurrent transactions
   cache?: boolean,           // Enable caching (default: false)
 });
@@ -491,7 +492,8 @@ bun run bench/benchmark-api-vs-raw.ts --nodes 10000 --edges 50000 --iterations 1
 
 ## File Formats
 
-Ray supports two storage formats:
+Ray supports two storage formats. The directory-based format is legacy and will be
+deprecated in favor of the single-file format.
 
 ### Single-File Format (`.raydb`) - Recommended
 
@@ -533,9 +535,15 @@ The single-file format contains:
 - **WAL Area**: Circular buffer for write-ahead log records
 - **Snapshot Area**: CSR snapshot data (mmap-friendly)
 
-### Multi-File Format (directory)
+### Multi-File Format (directory) - Deprecated (Legacy)
 
-The original directory-based format:
+The original directory-based format (legacy). New deployments should use
+the single-file `.raydb` format. A separate WAL file may be retained for
+single-file performance in the future, but the directory format is no longer
+recommended.
+
+To open an existing legacy directory, pass `{ legacyMultiFile: true }` to
+`openGraphDB`.
 
 ```
 db/

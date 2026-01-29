@@ -205,7 +205,10 @@ Edges within each node are **sorted by (etype, dst/src)** for binary search duri
 
 ## Storage Formats
 
-### Multi-File Format (Directory)
+### Multi-File Format (Directory) - Deprecated (Legacy)
+
+The directory-based layout is legacy and deprecated for new deployments. The
+single-file `.raydb` format is the default and recommended path forward.
 
 ```
 database/
