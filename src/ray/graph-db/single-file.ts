@@ -28,6 +28,7 @@ import {
 import type { DbHeaderV1, GraphDB, OpenOptions, DeltaState } from "../../types.js";
 import { createPager, FilePager, isValidPageSize, openPager, pagesToStore } from "../../core/pager.js";
 import { createWalBuffer, WalBuffer } from "../../core/wal-buffer.js";
+import { parseSnapshot } from "../../core/snapshot-reader.js";
 import { isCheckpointRunning, getCheckpointPromise } from "./checkpoint.js";
 import { extractCommittedTransactions, type ParsedWalRecord } from "../../core/wal.js";
 import { WalRecordType } from "../../types.js";
@@ -266,11 +267,27 @@ export async function openSingleFileDB(
 
   // mmap snapshot area if present
   let snapshotMmap: Uint8Array | null = null;
+  let snapshotCache: unknown = null;
   if (header.snapshotPageCount > 0n) {
     snapshotMmap = pager.mmapRange(
       Number(header.snapshotStartPage),
       Number(header.snapshotPageCount)
     );
+
+    // Validate snapshot CRC on open to catch corruption early
+    try {
+      const parsed = parseSnapshot(snapshotMmap);
+      if (cacheSnapshot !== false) {
+        snapshotCache = parsed;
+      }
+    } catch (error) {
+      // Clean up resources on validation failure
+      if (lockFd) {
+        await releaseFileLock(lockFd);
+      }
+      pager.close();
+      throw error;
+    }
   }
 
   return {
@@ -288,7 +305,7 @@ export async function openSingleFileDB(
     _header: header,
     _pager: pager,
     _snapshotMmap: snapshotMmap,
-    _snapshotCache: null,
+    _snapshotCache: snapshotCache,
     _walWritePos: Number(header.walHead),
     
     // Shared fields

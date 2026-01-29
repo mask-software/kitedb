@@ -127,25 +127,27 @@ export async function openGraphDB(
   // for backward compatibility with existing code that creates empty tmp dirs
   const fs = await import("node:fs");
   if (existsSync(path)) {
+    let stat: { isDirectory(): boolean } | null = null;
     try {
-      const stat = fs.statSync(path);
-      if (stat.isDirectory()) {
-        if (!legacyMultiFile) {
-          throw new Error(
-            "Multi-file (directory) format is deprecated. " +
-              "Use the single-file .raydb format, or pass { legacyMultiFile: true } " +
-              "to open existing legacy directories."
-          );
-        }
-        console.warn(
-          "[ray-db] Multi-file (directory) format is deprecated. " +
-            "Use the single-file .raydb format for new deployments."
-        );
-        // Existing directory - use multi-file format
-        return openMultiFileDB(path, options);
-      }
+      stat = fs.statSync(path);
     } catch {
       // Ignore stat errors, continue with single-file detection
+      stat = null;
+    }
+    if (stat?.isDirectory()) {
+      if (!legacyMultiFile) {
+        throw new Error(
+          "Multi-file (directory) format is deprecated. " +
+            "Use the single-file .raydb format, or pass { legacyMultiFile: true } " +
+            "to open existing legacy directories."
+        );
+      }
+      console.warn(
+        "[ray-db] Multi-file (directory) format is deprecated. " +
+          "Use the single-file .raydb format for new deployments."
+      );
+      // Existing directory - use multi-file format
+      return openMultiFileDB(path, options);
     }
   }
   
