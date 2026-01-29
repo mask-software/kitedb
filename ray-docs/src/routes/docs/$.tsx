@@ -56,91 +56,230 @@ function DocPageContent(props: { slug: string }) {
     return (
       <DocPage slug={slug}>
         <p>
-          Performance benchmarks comparing RayDB to other graph databases.
+          Performance benchmarks for RayDB bindings (NAPI, Python, Rust) using the
+          single-file raw benchmark suite.
         </p>
 
         <h2 id="test-environment">Test Environment</h2>
         <ul>
-          <li>MacBook Pro M3 Max, 64GB RAM</li>
-          <li>Bun 1.1.0</li>
+          <li>macOS (Apple Silicon)</li>
+          <li>Bun 1.3.5</li>
+          <li>Python 3.12.8</li>
+          <li>Rust 1.88.0</li>
           <li>RayDB 0.1.0</li>
         </ul>
 
-        <h2 id="insertion">Node Insertion</h2>
-        <p>Inserting 1M nodes:</p>
+        <h2 id="methodology">Methodology</h2>
+        <ul>
+          <li>Benchmark suite: single-file raw bindings (TypeScript, Python, Rust)</li>
+          <li>Read: p50 latency for getNodeByKey / get_node_by_key</li>
+          <li>Write: p50 latency for batch write of 100 nodes</li>
+          <li>Mixed: full benchmark wall time (build + vector setup + compaction + reads + writes)</li>
+          <li>Memory: peak RSS from /usr/bin/time -l</li>
+          <li>Sizes: 10k/50k, 100k/500k, 250k/1.25M (nodes/edges)</li>
+          <li>WAL: default 64MB for small/medium; 512MB for large to avoid WAL exhaustion</li>
+        </ul>
+
+        <h2 id="typescript">TypeScript</h2>
         <table>
           <thead>
             <tr>
-              <th>Database</th>
+              <th>Benchmark</th>
+              <th>Nodes/Edges</th>
               <th>Time</th>
-              <th>Throughput</th>
+              <th>Memory</th>
             </tr>
           </thead>
           <tbody>
             <tr>
-              <td>RayDB</td>
-              <td>1.2s</td>
-              <td>833k ops/sec</td>
+              <td>Read</td>
+              <td>10k/50k</td>
+              <td>167ns</td>
+              <td>109.8MB</td>
             </tr>
             <tr>
-              <td>Neo4j</td>
-              <td>8.4s</td>
-              <td>119k ops/sec</td>
+              <td>Read</td>
+              <td>100k/500k</td>
+              <td>459ns</td>
+              <td>419.2MB</td>
             </tr>
             <tr>
-              <td>ArangoDB</td>
-              <td>5.1s</td>
-              <td>196k ops/sec</td>
+              <td>Read</td>
+              <td>250k/1.25M</td>
+              <td>542ns</td>
+              <td>1027.4MB</td>
+            </tr>
+            <tr>
+              <td>Write</td>
+              <td>10k/50k</td>
+              <td>214.75us</td>
+              <td>109.8MB</td>
+            </tr>
+            <tr>
+              <td>Write</td>
+              <td>100k/500k</td>
+              <td>280.04us</td>
+              <td>419.2MB</td>
+            </tr>
+            <tr>
+              <td>Write</td>
+              <td>250k/1.25M</td>
+              <td>444.92us</td>
+              <td>1027.4MB</td>
+            </tr>
+            <tr>
+              <td>Mixed</td>
+              <td>10k/50k</td>
+              <td>0.30s</td>
+              <td>109.8MB</td>
+            </tr>
+            <tr>
+              <td>Mixed</td>
+              <td>100k/500k</td>
+              <td>3.43s</td>
+              <td>419.2MB</td>
+            </tr>
+            <tr>
+              <td>Mixed</td>
+              <td>250k/1.25M</td>
+              <td>19.47s</td>
+              <td>1027.4MB</td>
             </tr>
           </tbody>
         </table>
 
-        <h2 id="traversal">Graph Traversal</h2>
-        <p>3-hop traversal on 1M node graph:</p>
+        <h2 id="python">Python</h2>
         <table>
           <thead>
             <tr>
-              <th>Database</th>
+              <th>Benchmark</th>
+              <th>Nodes/Edges</th>
               <th>Time</th>
+              <th>Memory</th>
             </tr>
           </thead>
           <tbody>
             <tr>
-              <td>RayDB</td>
-              <td>12ms</td>
+              <td>Read</td>
+              <td>10k/50k</td>
+              <td>250ns</td>
+              <td>63.4MB</td>
             </tr>
             <tr>
-              <td>Neo4j</td>
-              <td>45ms</td>
+              <td>Read</td>
+              <td>100k/500k</td>
+              <td>375ns</td>
+              <td>372.2MB</td>
             </tr>
             <tr>
-              <td>ArangoDB</td>
-              <td>38ms</td>
+              <td>Read</td>
+              <td>250k/1.25M</td>
+              <td>458ns</td>
+              <td>910.7MB</td>
+            </tr>
+            <tr>
+              <td>Write</td>
+              <td>10k/50k</td>
+              <td>306.29us</td>
+              <td>63.4MB</td>
+            </tr>
+            <tr>
+              <td>Write</td>
+              <td>100k/500k</td>
+              <td>281.96us</td>
+              <td>372.2MB</td>
+            </tr>
+            <tr>
+              <td>Write</td>
+              <td>250k/1.25M</td>
+              <td>427.58us</td>
+              <td>910.7MB</td>
+            </tr>
+            <tr>
+              <td>Mixed</td>
+              <td>10k/50k</td>
+              <td>0.50s</td>
+              <td>63.4MB</td>
+            </tr>
+            <tr>
+              <td>Mixed</td>
+              <td>100k/500k</td>
+              <td>4.30s</td>
+              <td>372.2MB</td>
+            </tr>
+            <tr>
+              <td>Mixed</td>
+              <td>250k/1.25M</td>
+              <td>21.91s</td>
+              <td>910.7MB</td>
             </tr>
           </tbody>
         </table>
 
-        <h2 id="vector-search">Vector Search</h2>
-        <p>Top-10 similarity on 100k vectors (1536 dims):</p>
+        <h2 id="rust">Rust</h2>
         <table>
           <thead>
             <tr>
-              <th>Database</th>
+              <th>Benchmark</th>
+              <th>Nodes/Edges</th>
               <th>Time</th>
+              <th>Memory</th>
             </tr>
           </thead>
           <tbody>
             <tr>
-              <td>RayDB (HNSW)</td>
-              <td>0.8ms</td>
+              <td>Read</td>
+              <td>10k/50k</td>
+              <td>83ns</td>
+              <td>38.0MB</td>
             </tr>
             <tr>
-              <td>pgvector</td>
-              <td>2.1ms</td>
+              <td>Read</td>
+              <td>100k/500k</td>
+              <td>291ns</td>
+              <td>339.7MB</td>
             </tr>
             <tr>
-              <td>Pinecone</td>
-              <td>1.5ms</td>
+              <td>Read</td>
+              <td>250k/1.25M</td>
+              <td>417ns</td>
+              <td>899.1MB</td>
+            </tr>
+            <tr>
+              <td>Write</td>
+              <td>10k/50k</td>
+              <td>160.21us</td>
+              <td>38.0MB</td>
+            </tr>
+            <tr>
+              <td>Write</td>
+              <td>100k/500k</td>
+              <td>240.25us</td>
+              <td>339.7MB</td>
+            </tr>
+            <tr>
+              <td>Write</td>
+              <td>250k/1.25M</td>
+              <td>378.83us</td>
+              <td>899.1MB</td>
+            </tr>
+            <tr>
+              <td>Mixed</td>
+              <td>10k/50k</td>
+              <td>0.12s</td>
+              <td>38.0MB</td>
+            </tr>
+            <tr>
+              <td>Mixed</td>
+              <td>100k/500k</td>
+              <td>3.03s</td>
+              <td>339.7MB</td>
+            </tr>
+            <tr>
+              <td>Mixed</td>
+              <td>250k/1.25M</td>
+              <td>17.97s</td>
+              <td>899.1MB</td>
             </tr>
           </tbody>
         </table>
