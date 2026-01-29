@@ -250,7 +250,9 @@ pub struct VectorIndexStats {
 /// embeddings.set(node_id, &embedding);
 ///
 /// // Find similar nodes
-/// let similar = embeddings.search(&query_vector, SimilarOptions::new(10));
+/// let similar = embeddings
+///     .search(&query_vector, SimilarOptions::new(10))
+///     .unwrap();
 /// for hit in similar {
 ///     println!("{}: {}", hit.node_id, hit.similarity);
 /// }
@@ -684,7 +686,8 @@ fn is_valid_vector(vector: &[f32]) -> bool {
 ///
 /// # Example
 /// ```rust,no_run
-/// use raydb_core::api::vector_search::{create_vector_index, DistanceMetric, VectorIndexOptions};
+/// use raydb_core::api::vector_search::{create_vector_index, VectorIndexOptions};
+/// use raydb_core::vector::types::DistanceMetric;
 /// # fn main() {
 ///
 /// // Create index for 768-dimensional embeddings (e.g., from OpenAI)

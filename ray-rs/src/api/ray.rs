@@ -866,7 +866,7 @@ impl Ray {
   /// # let alice_id: NodeId = 1;
   /// # let bob_id: NodeId = 2;
   /// ray.update_edge(alice_id, "FOLLOWS", bob_id)?
-  ///    .set("weight", PropValue::Float(0.9))
+  ///    .set("weight", PropValue::F64(0.9))
   ///    .set("since", PropValue::String("2024".to_string()))
   ///    .execute()?;
   /// # Ok(())
@@ -2697,7 +2697,7 @@ impl<'a> InsertExecutorMultiple<'a> {
 /// # let alice_id: NodeId = 1;
 /// # let bob_id: NodeId = 2;
 /// ray.update_edge(alice_id, "FOLLOWS", bob_id)?
-///    .set("weight", PropValue::Float(0.9))
+///    .set("weight", PropValue::F64(0.9))
 ///    .set("since", PropValue::String("2024".to_string()))
 ///    .unset("deprecated_field")
 ///    .execute()?;

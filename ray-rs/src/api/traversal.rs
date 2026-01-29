@@ -1022,18 +1022,25 @@ where
 /// # let get_neighbors = |_: NodeId, _: TraversalDirection, _: Option<ETypeId>| -> Vec<Edge> {
 /// #   Vec::new()
 /// # };
-/// let results = TraversalBuilder::from_node(1)
-///     .out(Some(knows_etype))
-///     .results(get_neighbors);
-///
 /// // Get first node
-/// let first = results.first();
+/// let first = TraversalBuilder::from_node(1)
+///     .out(Some(knows_etype))
+///     .results(&get_neighbors)
+///     .first();
 ///
 /// // Collect all node IDs
-/// let node_ids = results.nodes().collect::<Vec<_>>();
+/// let node_ids = TraversalBuilder::from_node(1)
+///     .out(Some(knows_etype))
+///     .results(&get_neighbors)
+///     .nodes()
+///     .collect::<Vec<_>>();
 ///
 /// // Collect all edges
-/// let edges = results.edges().collect::<Vec<_>>();
+/// let edges = TraversalBuilder::from_node(1)
+///     .out(Some(knows_etype))
+///     .results(&get_neighbors)
+///     .edges()
+///     .collect::<Vec<_>>();
 /// # }
 /// ```
 pub struct TraversalResults<I> {
@@ -1167,15 +1174,17 @@ impl TraversalBuilder {
   /// # let get_neighbors = |_: NodeId, _: TraversalDirection, _: Option<ETypeId>| -> Vec<Edge> {
   /// #   Vec::new()
   /// # };
-  /// let results = TraversalBuilder::from_node(1)
-  ///     .out(Some(knows_etype))
-  ///     .results(&get_neighbors);
-  ///
-  /// // Get first node ID
-  /// let first = results.first_node();
-  ///
-  /// // Or collect all nodes
-  /// let all_nodes = results.to_vec();
+/// // Get first node ID
+/// let first = TraversalBuilder::from_node(1)
+///     .out(Some(knows_etype))
+///     .results(&get_neighbors)
+///     .first_node();
+///
+/// // Or collect all nodes
+/// let all_nodes = TraversalBuilder::from_node(1)
+///     .out(Some(knows_etype))
+///     .results(&get_neighbors)
+///     .to_vec();
   /// # }
   /// ```
   pub fn results<F>(self, get_neighbors: F) -> TraversalResults<TraversalIterator<F>>

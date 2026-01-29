@@ -347,11 +347,12 @@ impl NodeSchemaBuilder {
   ///
   /// # Example
   ///
-  /// ```rust,no_run
-  /// # use raydb_core::api::schema::define_node;
-  /// define_node("user")
-  ///     .key(|id| format!("user:{}", id))
-  /// ```
+/// ```rust,no_run
+/// # use raydb_core::api::schema::define_node;
+/// define_node("user")
+///     .key(|id| format!("user:{}", id))
+///     ;
+/// ```
   pub fn key<F>(mut self, f: F) -> Self
   where
     F: Fn(&str) -> String + Send + Sync + 'static,
@@ -375,12 +376,13 @@ impl NodeSchemaBuilder {
   ///
   /// # Example
   ///
-  /// ```rust,no_run
-  /// # use raydb_core::api::schema::{define_node, prop};
-  /// define_node("user")
-  ///     .prop(prop::string("name"))
-  ///     .prop(prop::int("age").optional())
-  /// ```
+/// ```rust,no_run
+/// # use raydb_core::api::schema::{define_node, prop};
+/// define_node("user")
+///     .prop(prop::string("name"))
+///     .prop(prop::int("age").optional())
+///     ;
+/// ```
   pub fn prop(mut self, prop_def: PropDef) -> Self {
     self.props.insert(prop_def.name.clone(), prop_def);
     self
@@ -524,12 +526,13 @@ impl EdgeSchemaBuilder {
   ///
   /// # Example
   ///
-  /// ```rust,no_run
-  /// # use raydb_core::api::schema::{define_edge, prop};
-  /// define_edge("knows")
-  ///     .prop(prop::int("since"))
-  ///     .prop(prop::float("weight").optional())
-  /// ```
+/// ```rust,no_run
+/// # use raydb_core::api::schema::{define_edge, prop};
+/// define_edge("knows")
+///     .prop(prop::int("since"))
+///     .prop(prop::float("weight").optional())
+///     ;
+/// ```
   pub fn prop(mut self, prop_def: PropDef) -> Self {
     self.props.insert(prop_def.name.clone(), prop_def);
     self
