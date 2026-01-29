@@ -73,23 +73,37 @@ impl SingleFileDB {
       wal.write_record(&record, &mut pager)?;
 
       // Flush WAL to disk based on sync mode
-      match self.sync_mode {
-        SyncMode::Full => {
-          // Full durability: flush + fsync on every commit (~3ms)
-          wal.flush(&mut pager)?;
+      let should_flush = matches!(self.sync_mode, SyncMode::Full | SyncMode::Normal);
+      if should_flush {
+        wal.flush(&mut pager)?;
+      }
+
+      // Update header with current WAL state and commit metadata
+      let mut header = self.header.write();
+      header.wal_head = wal.head();
+      header.wal_tail = wal.tail();
+      header.wal_primary_head = wal.primary_head();
+      header.wal_secondary_head = wal.secondary_head();
+      header.active_wal_region = wal.active_region();
+      header.max_node_id = self
+        .next_node_id
+        .load(std::sync::atomic::Ordering::SeqCst)
+        .saturating_sub(1);
+      header.next_tx_id = self.next_tx_id.load(std::sync::atomic::Ordering::SeqCst);
+      header.last_commit_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+      header.change_counter += 1;
+
+      // Persist header based on sync mode
+      if self.sync_mode != SyncMode::Off {
+        let header_bytes = header.serialize_to_page();
+        pager.write_page(0, &header_bytes)?;
+
+        if self.sync_mode == SyncMode::Full {
+          // Full durability: fsync after WAL + header updates
           pager.sync()?;
-        }
-        SyncMode::Normal => {
-          // Normal: flush to OS cache but no fsync (~1-10us)
-          // Data is in kernel buffer cache, safe from app crash
-          // Will be synced on checkpoint or close
-          wal.flush(&mut pager)?;
-          // No pager.sync() - let OS handle write-back
-        }
-        SyncMode::Off => {
-          // Off: don't even flush immediately, just buffer in memory
-          // Most dangerous but fastest for bulk operations
-          // Data only written when buffer is full or on checkpoint
         }
       }
     }

@@ -12,8 +12,18 @@ use crate::core::snapshot::writer::{
 };
 use crate::error::{RayError, Result};
 use crate::types::*;
+use crate::vector::store::vector_store_get;
 
+use super::vector::vector_stores_from_snapshot;
 use super::{CheckpointStatus, SingleFileDB};
+
+type GraphData = (
+  Vec<NodeData>,
+  Vec<EdgeData>,
+  HashMap<LabelId, String>,
+  HashMap<ETypeId, String>,
+  HashMap<PropKeyId, String>,
+);
 
 impl SingleFileDB {
   // ========================================================================
@@ -78,7 +88,6 @@ impl SingleFileDB {
       let mut pager = self.pager.lock();
       let mut wal_buffer = self.wal_buffer.lock();
       let mut header = self.header.write();
-
       // Update header fields
       header.active_snapshot_gen = new_gen;
       header.snapshot_start_page = new_snapshot_start_page;
@@ -117,6 +126,7 @@ impl SingleFileDB {
     if header.snapshot_page_count == 0 {
       // No snapshot to load
       *self.snapshot.write() = None;
+      self.vector_stores.write().clear();
       return Ok(());
     }
 
@@ -137,6 +147,12 @@ impl SingleFileDB {
 
     // Update the snapshot
     *self.snapshot.write() = Some(new_snapshot);
+
+    // Rebuild vector stores from the new snapshot
+    if let Some(ref snapshot) = *self.snapshot.read() {
+      let stores = vector_stores_from_snapshot(snapshot)?;
+      *self.vector_stores.write() = stores;
+    }
 
     Ok(())
   }
@@ -285,6 +301,8 @@ impl SingleFileDB {
       let mut pager = self.pager.lock();
       let mut wal_buffer = self.wal_buffer.lock();
       let mut header = self.header.write();
+      let old_snapshot_start_page = header.snapshot_start_page;
+      let old_snapshot_page_count = header.snapshot_page_count;
 
       // Merge secondary WAL records into primary
       wal_buffer.merge_secondary_into_primary(&mut pager)?;
@@ -311,6 +329,11 @@ impl SingleFileDB {
       let header_bytes = header.serialize_to_page();
       pager.write_page(0, &header_bytes)?;
       pager.sync()?;
+
+      // Mark old snapshot pages as free (for future vacuum)
+      if old_snapshot_page_count > 0 && old_snapshot_start_page != new_snapshot_start_page {
+        pager.free_pages(old_snapshot_start_page as u32, old_snapshot_page_count as u32);
+      }
     }
 
     // Clear delta
@@ -384,15 +407,7 @@ impl SingleFileDB {
   }
 
   /// Collect all graph data from snapshot + delta
-  pub(crate) fn collect_graph_data(
-    &self,
-  ) -> (
-    Vec<NodeData>,
-    Vec<EdgeData>,
-    HashMap<LabelId, String>,
-    HashMap<ETypeId, String>,
-    HashMap<PropKeyId, String>,
-  ) {
+  pub(crate) fn collect_graph_data(&self) -> GraphData {
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
     let mut labels = HashMap::new();
@@ -454,8 +469,27 @@ impl SingleFileDB {
           }
         }
 
-        // Collect node labels (simplified - labels handled differently in real impl)
-        let node_labels = Vec::new();
+        // Collect node labels (snapshot + delta)
+        let mut node_labels: std::collections::HashSet<LabelId> =
+          std::collections::HashSet::new();
+
+        if let Some(snapshot_labels) = snapshot.get_node_labels(phys as u32) {
+          node_labels.extend(snapshot_labels.into_iter());
+        }
+
+        if let Some(node_delta) = delta.get_node_delta(node_id) {
+          if let Some(ref labels) = node_delta.labels {
+            node_labels.extend(labels.iter().copied());
+          }
+          if let Some(ref deleted) = node_delta.labels_deleted {
+            for label_id in deleted {
+              node_labels.remove(label_id);
+            }
+          }
+        }
+
+        let mut node_labels: Vec<LabelId> = node_labels.into_iter().collect();
+        node_labels.sort_unstable();
 
         nodes.push(NodeData {
           node_id,
@@ -527,10 +561,17 @@ impl SingleFileDB {
         }
       }
 
+      let mut node_labels: Vec<LabelId> = node_delta
+        .labels
+        .as_ref()
+        .map(|l| l.iter().copied().collect())
+        .unwrap_or_default();
+      node_labels.sort_unstable();
+
       nodes.push(NodeData {
         node_id,
         key: node_delta.key.clone(),
-        labels: Vec::new(),
+        labels: node_labels,
         props,
       });
     }
@@ -565,6 +606,33 @@ impl SingleFileDB {
           dst: patch.other,
           props: edge_props,
         });
+      }
+    }
+
+    // Merge vector embeddings into node props for snapshot persistence
+    if !self.vector_stores.read().is_empty() {
+      let mut node_index: HashMap<NodeId, usize> = HashMap::new();
+      for (idx, node) in nodes.iter().enumerate() {
+        node_index.insert(node.node_id, idx);
+      }
+
+      let stores = self.vector_stores.read();
+      for (&prop_key_id, store) in stores.iter() {
+        for &node_id in store.node_to_vector.keys() {
+          if delta.is_node_deleted(node_id) {
+            continue;
+          }
+
+          let Some(&idx) = node_index.get(&node_id) else {
+            continue;
+          };
+
+          if let Some(vec) = vector_store_get(store, node_id) {
+            nodes[idx]
+              .props
+              .insert(prop_key_id, PropValue::VectorF32(vec.to_vec()));
+          }
+        }
       }
     }
 

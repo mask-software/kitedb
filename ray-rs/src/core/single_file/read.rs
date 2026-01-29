@@ -426,9 +426,14 @@ impl SingleFileDB {
       return true;
     }
 
-    // TODO: Check snapshot for label
-    // Note: The snapshot format would need to store node labels
-    // For now, we only track labels in delta
+    // Check snapshot for label (if present)
+    if let Some(ref snapshot) = *self.snapshot.read() {
+      if let Some(phys) = snapshot.get_phys_node(node_id) {
+        if let Some(labels) = snapshot.get_node_labels(phys) {
+          return labels.contains(&label_id);
+        }
+      }
+    }
 
     false
   }
@@ -444,8 +449,14 @@ impl SingleFileDB {
 
     let mut labels = std::collections::HashSet::new();
 
-    // TODO: Get labels from snapshot first
-    // Note: The snapshot format would need to store node labels
+    // Load labels from snapshot first (if present)
+    if let Some(ref snapshot) = *self.snapshot.read() {
+      if let Some(phys) = snapshot.get_phys_node(node_id) {
+        if let Some(snapshot_labels) = snapshot.get_node_labels(phys) {
+          labels.extend(snapshot_labels);
+        }
+      }
+    }
 
     // Add labels from delta
     if let Some(added) = delta.get_added_labels(node_id) {

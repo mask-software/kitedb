@@ -22,6 +22,7 @@ use crate::vector::types::VectorManifest;
 // Submodules
 mod check;
 mod checkpoint;
+mod compactor;
 mod iter;
 mod open;
 mod read;
@@ -31,9 +32,13 @@ mod transaction;
 mod vector;
 mod write;
 
+#[cfg(test)]
+mod stress;
+
 // Re-export everything for backward compatibility
 pub use iter::*;
 pub use open::{close_single_file, open_single_file, SingleFileOpenOptions, SyncMode};
+pub use compactor::{SingleFileOptimizeOptions, VacuumOptions};
 
 // Also re-export recovery items that are used externally
 pub use recovery::replay_wal_record;

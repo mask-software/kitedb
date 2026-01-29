@@ -113,6 +113,15 @@ impl WalBuffer {
       secondary_head = secondary_region_start;
     }
 
+    // If we were writing to secondary and the header update was interrupted,
+    // wal_head may be ahead of wal_secondary_head. Use wal_head as fallback.
+    if active_region == 1
+      && secondary_head <= secondary_region_start
+      && header.wal_head >= secondary_region_start
+    {
+      secondary_head = header.wal_head;
+    }
+
     Self {
       base_offset,
       capacity,
@@ -284,6 +293,33 @@ impl WalBuffer {
     // Re-write secondary records to primary region
     for record in secondary_records {
       // Rebuild the record and write it
+      let wal_record = WalRecord::new(record.record_type, record.txid, record.payload.clone());
+      let record_bytes = wal_record.build();
+      self.write_record_bytes_to_primary(&record_bytes, pager)?;
+    }
+
+    Ok(())
+  }
+
+  /// Recover an incomplete background checkpoint by merging primary + secondary
+  /// WAL records into a fresh primary region. This preserves all committed
+  /// records when a crash occurs mid-checkpoint.
+  pub fn recover_incomplete_checkpoint(&mut self, pager: &mut FilePager) -> Result<()> {
+    let primary_records = self.scan_region(0, pager)?;
+    let secondary_records = self.scan_region(1, pager)?;
+
+    // Reset both regions to a clean primary state
+    self.primary_head = 0;
+    self.secondary_head = self.secondary_region_start;
+    self.tail = 0;
+    self.active_region = 0;
+    self.head = 0;
+    self.wrapped = false;
+
+    for record in primary_records
+      .into_iter()
+      .chain(secondary_records.into_iter())
+    {
       let wal_record = WalRecord::new(record.record_type, record.txid, record.payload.clone());
       let record_bytes = wal_record.build();
       self.write_record_bytes_to_primary(&record_bytes, pager)?;

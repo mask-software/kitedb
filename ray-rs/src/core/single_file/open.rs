@@ -19,6 +19,7 @@ use crate::vector::store::{create_vector_store, vector_store_delete, vector_stor
 use crate::vector::types::VectorStoreConfig;
 
 use super::recovery::{get_committed_transactions, replay_wal_record, scan_wal_records};
+use super::vector::vector_stores_from_snapshot;
 use super::{CheckpointStatus, SingleFileDB};
 
 // ============================================================================
@@ -192,7 +193,7 @@ pub fn open_single_file<P: AsRef<Path>>(
   }
 
   // Open or create pager
-  let (mut pager, header, is_new) = if file_exists {
+  let (mut pager, mut header, is_new) = if file_exists {
     // Open existing database
     let mut pager = open_pager(path, options.page_size)?;
 
@@ -225,7 +226,25 @@ pub fn open_single_file<P: AsRef<Path>>(
   };
 
   // Initialize WAL buffer
-  let wal_buffer = WalBuffer::from_header(&header);
+  let mut wal_buffer = WalBuffer::from_header(&header);
+
+  // Recover from incomplete background checkpoint if needed
+  if header.checkpoint_in_progress != 0 {
+    wal_buffer.recover_incomplete_checkpoint(&mut pager)?;
+    wal_buffer.flush(&mut pager)?;
+
+    header.active_wal_region = 0;
+    header.checkpoint_in_progress = 0;
+    header.wal_head = wal_buffer.head();
+    header.wal_tail = wal_buffer.tail();
+    header.wal_primary_head = wal_buffer.primary_head();
+    header.wal_secondary_head = wal_buffer.secondary_head();
+    header.change_counter += 1;
+
+    let header_bytes = header.serialize_to_page();
+    pager.write_page(0, &header_bytes)?;
+    pager.sync()?;
+  }
 
   // Initialize ID allocators from header
   let mut next_node_id = INITIAL_NODE_ID;
@@ -328,8 +347,14 @@ pub fn open_single_file<P: AsRef<Path>>(
     }
   }
 
+  // Load vector stores from snapshot (if present)
+  let mut vector_stores = if let Some(ref snapshot) = snapshot {
+    vector_stores_from_snapshot(snapshot)?
+  } else {
+    HashMap::new()
+  };
+
   // Apply pending vector operations from WAL replay
-  let mut vector_stores = HashMap::new();
   for ((node_id, prop_key_id), operation) in delta.pending_vectors.drain() {
     match operation {
       Some(vector) => {
@@ -380,6 +405,165 @@ pub fn open_single_file<P: AsRef<Path>>(
     cache: RwLock::new(cache),
     sync_mode: options.sync_mode,
   })
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::core::single_file::close_single_file;
+  use tempfile::tempdir;
+
+  #[test]
+  fn test_recover_incomplete_background_checkpoint() {
+    let temp_dir = tempdir().unwrap();
+    let db_path = temp_dir.path().join("checkpoint-recover.raydb");
+
+    let db = open_single_file(&db_path, SingleFileOpenOptions::new()).unwrap();
+
+    // Write a primary WAL record
+    db.begin(false).unwrap();
+    let _n1 = db.create_node(Some("n1")).unwrap();
+    db.commit().unwrap();
+
+    // Simulate beginning a background checkpoint (switch to secondary + header flag)
+    {
+      let mut pager = db.pager.lock();
+      let mut wal = db.wal_buffer.lock();
+      let mut header = db.header.write();
+
+      wal.switch_to_secondary();
+      header.active_wal_region = 1;
+      header.checkpoint_in_progress = 1;
+      header.wal_primary_head = wal.primary_head();
+      header.wal_secondary_head = wal.secondary_head();
+      header.wal_head = wal.head();
+      header.wal_tail = wal.tail();
+      header.change_counter += 1;
+
+      let header_bytes = header.serialize_to_page();
+      pager.write_page(0, &header_bytes).unwrap();
+      pager.sync().unwrap();
+    }
+
+    // Write to secondary WAL region
+    db.begin(false).unwrap();
+    let _n2 = db.create_node(Some("n2")).unwrap();
+    db.commit().unwrap();
+
+    close_single_file(db).unwrap();
+
+    // Reopen and ensure both records are recovered
+    let db = open_single_file(&db_path, SingleFileOpenOptions::new()).unwrap();
+    assert!(db.get_node_by_key("n1").is_some());
+    assert!(db.get_node_by_key("n2").is_some());
+    close_single_file(db).unwrap();
+  }
+
+  #[test]
+  fn test_recover_checkpoint_with_partial_header_update() {
+    let temp_dir = tempdir().unwrap();
+    let db_path = temp_dir.path().join("checkpoint-recover-partial-header.raydb");
+
+    let db = open_single_file(&db_path, SingleFileOpenOptions::new()).unwrap();
+
+    // Write a primary WAL record
+    db.begin(false).unwrap();
+    let _n1 = db.create_node(Some("n1")).unwrap();
+    db.commit().unwrap();
+
+    // Simulate beginning a background checkpoint (switch to secondary + header flag)
+    {
+      let mut pager = db.pager.lock();
+      let mut wal = db.wal_buffer.lock();
+      let mut header = db.header.write();
+
+      wal.switch_to_secondary();
+      header.active_wal_region = 1;
+      header.checkpoint_in_progress = 1;
+      header.wal_primary_head = wal.primary_head();
+      header.wal_secondary_head = wal.secondary_head();
+      header.wal_head = wal.head();
+      header.wal_tail = wal.tail();
+      header.change_counter += 1;
+
+      let header_bytes = header.serialize_to_page();
+      pager.write_page(0, &header_bytes).unwrap();
+      pager.sync().unwrap();
+    }
+
+    // Write to secondary WAL region
+    db.begin(false).unwrap();
+    let _n2 = db.create_node(Some("n2")).unwrap();
+    db.commit().unwrap();
+
+    // Simulate an interrupted header update: wal_head advanced, secondary head missing
+    {
+      let mut pager = db.pager.lock();
+      let wal = db.wal_buffer.lock();
+      let mut header = db.header.write();
+
+      header.active_wal_region = 1;
+      header.checkpoint_in_progress = 1;
+      header.wal_primary_head = wal.primary_head();
+      header.wal_head = wal.head();
+      header.wal_tail = wal.tail();
+      header.wal_secondary_head = wal.primary_region_size();
+      header.change_counter += 1;
+
+      let header_bytes = header.serialize_to_page();
+      pager.write_page(0, &header_bytes).unwrap();
+      pager.sync().unwrap();
+    }
+
+    // Simulate crash by dropping without close
+    drop(db);
+
+    // Reopen and ensure both records are recovered
+    let db = open_single_file(&db_path, SingleFileOpenOptions::new()).unwrap();
+    assert!(db.get_node_by_key("n1").is_some());
+    assert!(db.get_node_by_key("n2").is_some());
+    close_single_file(db).unwrap();
+  }
+
+  #[test]
+  fn test_recover_checkpoint_with_missing_primary_head() {
+    let temp_dir = tempdir().unwrap();
+    let db_path = temp_dir
+      .path()
+      .join("checkpoint-recover-missing-primary-head.raydb");
+
+    let db = open_single_file(&db_path, SingleFileOpenOptions::new()).unwrap();
+
+    // Write a primary WAL record
+    db.begin(false).unwrap();
+    let _n1 = db.create_node(Some("n1")).unwrap();
+    db.commit().unwrap();
+
+    // Simulate a crash where checkpoint flag is set but wal_primary_head is missing
+    {
+      let mut pager = db.pager.lock();
+      let wal = db.wal_buffer.lock();
+      let mut header = db.header.write();
+
+      header.active_wal_region = 1;
+      header.checkpoint_in_progress = 1;
+      header.wal_primary_head = 0;
+      header.wal_secondary_head = wal.secondary_head();
+      header.wal_head = wal.head();
+      header.wal_tail = wal.tail();
+      header.change_counter += 1;
+
+      let header_bytes = header.serialize_to_page();
+      pager.write_page(0, &header_bytes).unwrap();
+      pager.sync().unwrap();
+    }
+
+    drop(db);
+
+    let db = open_single_file(&db_path, SingleFileOpenOptions::new()).unwrap();
+    assert!(db.get_node_by_key("n1").is_some());
+    close_single_file(db).unwrap();
+  }
 }
 
 /// Close a single-file database

@@ -50,8 +50,8 @@ pub fn parse_wal_header(buffer: &[u8]) -> Result<WalHeaderV1> {
   let created_unix_ns = read_u64(buffer, 24);
 
   let mut reserved2 = [0u64; 8];
-  for i in 0..8 {
-    reserved2[i] = read_u64(buffer, 32 + i * 8);
+  for (i, slot) in reserved2.iter_mut().enumerate() {
+    *slot = read_u64(buffer, 32 + i * 8);
   }
 
   Ok(WalHeaderV1 {

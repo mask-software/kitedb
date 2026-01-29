@@ -20,7 +20,7 @@ pub const MAGIC_WAL: u32 = 0x31574447;
 // ============================================================================
 
 pub const VERSION_MANIFEST: u32 = 1;
-pub const VERSION_SNAPSHOT: u32 = 1;
+pub const VERSION_SNAPSHOT: u32 = 3;
 pub const VERSION_WAL: u32 = 1;
 
 // ============================================================================
@@ -28,7 +28,7 @@ pub const VERSION_WAL: u32 = 1;
 // ============================================================================
 
 pub const MIN_READER_MANIFEST: u32 = 1;
-pub const MIN_READER_SNAPSHOT: u32 = 1;
+pub const MIN_READER_SNAPSHOT: u32 = 3;
 pub const MIN_READER_WAL: u32 = 1;
 
 // ============================================================================

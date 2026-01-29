@@ -72,6 +72,8 @@ bitflags::bitflags! {
         const HAS_PROPERTIES = 1 << 1;
         const HAS_KEY_BUCKETS = 1 << 2;
         const HAS_EDGE_BLOOM = 1 << 3; // future
+        const HAS_NODE_LABELS = 1 << 4;
+        const HAS_VECTORS = 1 << 5;
     }
 }
 
@@ -129,10 +131,16 @@ pub enum SectionId {
   EdgePropOffsets = 20,
   EdgePropKeys = 21,
   EdgePropVals = 22,
+  NodeLabelOffsets = 23,
+  NodeLabelIds = 24,
+  VectorOffsets = 25,
+  VectorData = 26,
 }
 
 impl SectionId {
-  pub const COUNT: usize = 23;
+  pub const COUNT_V1: usize = 23;
+  pub const COUNT_V2: usize = 25;
+  pub const COUNT: usize = 27;
 
   pub fn from_u32(v: u32) -> Option<Self> {
     match v {
@@ -159,6 +167,10 @@ impl SectionId {
       20 => Some(Self::EdgePropOffsets),
       21 => Some(Self::EdgePropKeys),
       22 => Some(Self::EdgePropVals),
+      23 => Some(Self::NodeLabelOffsets),
+      24 => Some(Self::NodeLabelIds),
+      25 => Some(Self::VectorOffsets),
+      26 => Some(Self::VectorData),
       _ => None,
     }
   }

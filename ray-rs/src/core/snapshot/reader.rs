@@ -16,6 +16,16 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
+fn section_count_for_version(version: u32) -> usize {
+  if version >= 3 {
+    SectionId::COUNT
+  } else if version >= 2 {
+    SectionId::COUNT_V2
+  } else {
+    SectionId::COUNT_V1
+  }
+}
+
 // ============================================================================
 // Snapshot Data Structure
 // ============================================================================
@@ -111,11 +121,21 @@ impl SnapshotData {
       num_strings,
     };
 
+    let section_count = section_count_for_version(version);
+    let section_table_size = section_count * SECTION_ENTRY_SIZE;
+
+    if buffer.len() < SNAPSHOT_HEADER_SIZE + section_table_size {
+      return Err(RayError::InvalidSnapshot(format!(
+        "Snapshot too small for section table: {} bytes",
+        buffer.len()
+      )));
+    }
+
     // Parse section table
-    let mut sections = Vec::with_capacity(SectionId::COUNT);
+    let mut sections = Vec::with_capacity(section_count);
     let mut offset = SNAPSHOT_HEADER_SIZE;
 
-    for _ in 0..SectionId::COUNT {
+    for _ in 0..section_count {
       let section_offset = read_u64(buffer, offset);
       let section_length = read_u64(buffer, offset + 8);
       let compression = read_u32(buffer, offset + 16);
@@ -131,7 +151,7 @@ impl SnapshotData {
     }
 
     // Calculate actual snapshot size from section table
-    let mut max_section_end = SNAPSHOT_HEADER_SIZE + SectionId::COUNT * SECTION_ENTRY_SIZE;
+    let mut max_section_end = SNAPSHOT_HEADER_SIZE + section_table_size;
     for section in &sections {
       if section.length > 0 {
         let section_end = section.offset as usize + section.length as usize;
@@ -231,11 +251,21 @@ impl SnapshotData {
       num_strings,
     };
 
+    let section_count = section_count_for_version(version);
+    let section_table_size = section_count * SECTION_ENTRY_SIZE;
+
+    if buffer.len() < SNAPSHOT_HEADER_SIZE + section_table_size {
+      return Err(RayError::InvalidSnapshot(format!(
+        "Snapshot too small for section table: {} bytes",
+        buffer.len()
+      )));
+    }
+
     // Parse section table
-    let mut sections = Vec::with_capacity(SectionId::COUNT);
+    let mut sections = Vec::with_capacity(section_count);
     let mut table_offset = SNAPSHOT_HEADER_SIZE;
 
-    for _ in 0..SectionId::COUNT {
+    for _ in 0..section_count {
       let section_offset = read_u64(buffer, table_offset);
       let section_length = read_u64(buffer, table_offset + 8);
       let compression = read_u32(buffer, table_offset + 16);
@@ -254,7 +284,7 @@ impl SnapshotData {
     // Verify footer CRC (optional)
     if !options.skip_crc_validation {
       // Calculate actual snapshot size from section table
-      let mut max_section_end = SNAPSHOT_HEADER_SIZE + SectionId::COUNT * SECTION_ENTRY_SIZE;
+      let mut max_section_end = SNAPSHOT_HEADER_SIZE + section_table_size;
       for section in &sections {
         if section.length > 0 {
           // Section offsets are now absolute (includes base offset)
@@ -289,7 +319,7 @@ impl SnapshotData {
 
   /// Get raw section bytes (possibly compressed)
   fn raw_section_bytes(&self, id: SectionId) -> Option<&[u8]> {
-    let section = &self.sections[id as usize];
+    let section = self.sections.get(id as usize)?;
     if section.length == 0 {
       return None;
     }
@@ -300,7 +330,7 @@ impl SnapshotData {
 
   /// Get decompressed section bytes
   pub fn section_bytes(&self, id: SectionId) -> Option<Vec<u8>> {
-    let section = &self.sections[id as usize];
+    let section = self.sections.get(id as usize)?;
     if section.length == 0 {
       return None;
     }
@@ -339,7 +369,7 @@ impl SnapshotData {
   /// Get section bytes as a slice (for uncompressed or already-cached sections)
   /// Returns None if section doesn't exist or is compressed and not cached
   pub fn section_slice(&self, id: SectionId) -> Option<&[u8]> {
-    let section = &self.sections[id as usize];
+    let section = self.sections.get(id as usize)?;
     if section.length == 0 {
       return None;
     }
@@ -655,6 +685,38 @@ impl SnapshotData {
   }
 
   // ========================================================================
+  // Label access
+  // ========================================================================
+
+  /// Get all labels for a node
+  pub fn get_node_labels(&self, phys: PhysNode) -> Option<Vec<LabelId>> {
+    if !self.header.flags.contains(SnapshotFlags::HAS_NODE_LABELS) {
+      return None;
+    }
+
+    let offsets = self.section_slice(SectionId::NodeLabelOffsets)?;
+    let labels = self.section_slice(SectionId::NodeLabelIds)?;
+
+    let idx = phys as usize;
+    if idx * 4 + 8 > offsets.len() {
+      return None;
+    }
+
+    let start = read_u32_at(offsets, idx) as usize;
+    let end = read_u32_at(offsets, idx + 1) as usize;
+
+    let mut out = Vec::with_capacity(end.saturating_sub(start));
+    for i in start..end {
+      if i * 4 + 4 > labels.len() {
+        break;
+      }
+      out.push(read_u32_at(labels, i) as LabelId);
+    }
+
+    Some(out)
+  }
+
+  // ========================================================================
   // Property access
   // ========================================================================
 
@@ -771,8 +833,35 @@ impl SnapshotData {
         Some(PropValue::String(s))
       }
       PropValueTag::VectorF32 => {
-        // Vectors are stored differently in props
-        None
+        if !self.header.flags.contains(SnapshotFlags::HAS_VECTORS) {
+          return None;
+        }
+
+        let offsets = self.section_slice(SectionId::VectorOffsets)?;
+        let data = self.section_slice(SectionId::VectorData)?;
+
+        let idx = payload as usize;
+        if (idx + 1) * 8 > offsets.len() {
+          return None;
+        }
+
+        let start = read_u64_at(offsets, idx) as usize;
+        let end = read_u64_at(offsets, idx + 1) as usize;
+        if start > end || end > data.len() {
+          return None;
+        }
+        let bytes = &data[start..end];
+        if bytes.len() % 4 != 0 {
+          return None;
+        }
+
+        let mut vec = Vec::with_capacity(bytes.len() / 4);
+        for chunk in bytes.chunks_exact(4) {
+          let val = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+          vec.push(val);
+        }
+
+        Some(PropValue::VectorF32(vec))
       }
     }
   }

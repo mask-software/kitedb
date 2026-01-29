@@ -126,7 +126,6 @@ fn parse_args() -> BenchConfig {
 #[derive(Debug, Clone, Copy)]
 struct LatencyStats {
   count: usize,
-  min: u128,
   max: u128,
   sum: u128,
   p50: u128,
@@ -138,7 +137,6 @@ fn compute_stats(samples: &mut Vec<u128>) -> LatencyStats {
   if samples.is_empty() {
     return LatencyStats {
       count: 0,
-      min: 0,
       max: 0,
       sum: 0,
       p50: 0,
@@ -149,7 +147,6 @@ fn compute_stats(samples: &mut Vec<u128>) -> LatencyStats {
 
   samples.sort_unstable();
   let count = samples.len();
-  let min = samples[0];
   let max = samples[count - 1];
   let sum: u128 = samples.iter().copied().sum();
 
@@ -159,7 +156,6 @@ fn compute_stats(samples: &mut Vec<u128>) -> LatencyStats {
 
   LatencyStats {
     count,
-    min,
     max,
     sum,
     p50,

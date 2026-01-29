@@ -310,7 +310,38 @@ fn build_key_index(nodes: &[NodeData], node_key_strings: &[StringId]) -> KeyInde
 // Property encoding
 // ============================================================================
 
-fn encode_prop_value(value: &PropValue, string_table: &StringTable) -> (u8, u64) {
+struct VectorTable {
+  offsets: Vec<u64>,
+  data: Vec<u8>,
+}
+
+impl VectorTable {
+  fn new() -> Self {
+    Self {
+      offsets: vec![0],
+      data: Vec::new(),
+    }
+  }
+
+  fn push(&mut self, vec: &[f32]) -> u64 {
+    for v in vec {
+      self.data.extend_from_slice(&v.to_le_bytes());
+    }
+    let offset = self.data.len() as u64;
+    self.offsets.push(offset);
+    (self.offsets.len() - 2) as u64
+  }
+
+  fn is_empty(&self) -> bool {
+    self.offsets.len() <= 1
+  }
+}
+
+fn encode_prop_value(
+  value: &PropValue,
+  string_table: &StringTable,
+  vectors: &mut VectorTable,
+) -> (u8, u64) {
   match value {
     PropValue::Null => (PropValueTag::Null as u8, 0),
     PropValue::Bool(b) => (PropValueTag::Bool as u8, if *b { 1 } else { 0 }),
@@ -320,10 +351,7 @@ fn encode_prop_value(value: &PropValue, string_table: &StringTable) -> (u8, u64)
       let string_id = string_table.string_to_id.get(s).copied().unwrap_or(0);
       (PropValueTag::String as u8, string_id as u64)
     }
-    PropValue::VectorF32(_) => {
-      // Vectors are stored differently - not supported in snapshot props currently
-      (PropValueTag::Null as u8, 0)
-    }
+    PropValue::VectorF32(vec) => (PropValueTag::VectorF32 as u8, vectors.push(vec)),
   }
 }
 
@@ -427,16 +455,20 @@ pub fn build_snapshot(db_path: &Path, input: SnapshotBuildInput) -> Result<Strin
   // Build key index with buckets
   let key_index = build_key_index(&nodes, &node_key_strings);
 
-  // Intern string property values before building property arrays
+  // Intern string property values before building property arrays (deterministic order)
   for node in &nodes {
-    for value in node.props.values() {
+    let mut sorted_props: Vec<_> = node.props.iter().collect();
+    sorted_props.sort_by_key(|(k, _)| *k);
+    for (_, value) in sorted_props {
       if let PropValue::String(s) = value {
         string_table.intern(s);
       }
     }
   }
   for edge in &edges {
-    for value in edge.props.values() {
+    let mut sorted_props: Vec<_> = edge.props.iter().collect();
+    sorted_props.sort_by_key(|(k, _)| *k);
+    for (_, value) in sorted_props {
       if let PropValue::String(s) = value {
         string_table.intern(s);
       }
@@ -446,6 +478,18 @@ pub fn build_snapshot(db_path: &Path, input: SnapshotBuildInput) -> Result<Strin
   // Check if we have properties
   let has_properties =
     nodes.iter().any(|n| !n.props.is_empty()) || edges.iter().any(|e| !e.props.is_empty());
+
+  // Build node label offsets/ids (always included for v2)
+  let mut node_label_offsets: Vec<u32> = Vec::with_capacity(nodes.len() + 1);
+  let mut node_label_ids: Vec<u32> = Vec::new();
+  node_label_offsets.push(0);
+  for node in &nodes {
+    let mut labels = node.labels.clone();
+    labels.sort_unstable();
+    labels.dedup();
+    node_label_ids.extend(labels.iter().copied());
+    node_label_offsets.push(node_label_ids.len() as u32);
+  }
 
   // Get compression options
   let compression_opts = compression.unwrap_or_default();
@@ -616,6 +660,24 @@ pub fn build_snapshot(db_path: &Path, input: SnapshotBuildInput) -> Result<Strin
     add_section(SectionId::NodeKeyString, data);
   }
 
+  // node_label_offsets: u32[num_nodes + 1]
+  {
+    let mut data = vec![0u8; node_label_offsets.len() * 4];
+    for (i, &offset) in node_label_offsets.iter().enumerate() {
+      write_u32(&mut data, i * 4, offset);
+    }
+    add_section(SectionId::NodeLabelOffsets, data);
+  }
+
+  // node_label_ids: u32[total_labels]
+  {
+    let mut data = vec![0u8; node_label_ids.len() * 4];
+    for (i, &label_id) in node_label_ids.iter().enumerate() {
+      write_u32(&mut data, i * 4, label_id);
+    }
+    add_section(SectionId::NodeLabelIds, data);
+  }
+
   // key_entries
   {
     let mut data = vec![0u8; key_index.entries.len() * KEY_INDEX_ENTRY_SIZE];
@@ -639,6 +701,7 @@ pub fn build_snapshot(db_path: &Path, input: SnapshotBuildInput) -> Result<Strin
   }
 
   // Node property sections
+  let mut vector_table = VectorTable::new();
   {
     let mut node_prop_offsets = vec![0u32; num_nodes + 1];
     let mut node_prop_keys: Vec<u32> = Vec::new();
@@ -653,7 +716,7 @@ pub fn build_snapshot(db_path: &Path, input: SnapshotBuildInput) -> Result<Strin
 
       for (&key_id, value) in sorted_props {
         node_prop_keys.push(key_id);
-        node_prop_vals.push(encode_prop_value(value, &string_table));
+        node_prop_vals.push(encode_prop_value(value, &string_table, &mut vector_table));
       }
     }
     node_prop_offsets[num_nodes] = node_prop_keys.len() as u32;
@@ -720,7 +783,7 @@ pub fn build_snapshot(db_path: &Path, input: SnapshotBuildInput) -> Result<Strin
 
           for (&key_id, value) in sorted_props {
             edge_prop_keys.push(key_id);
-            edge_prop_vals.push(encode_prop_value(value, &string_table));
+            edge_prop_vals.push(encode_prop_value(value, &string_table, &mut vector_table));
           }
         }
         edge_idx += 1;
@@ -750,6 +813,18 @@ pub fn build_snapshot(db_path: &Path, input: SnapshotBuildInput) -> Result<Strin
       write_u64(&mut vals_data, offset + 8, *payload);
     }
     add_section(SectionId::EdgePropVals, vals_data);
+  }
+
+  let has_vectors = !vector_table.is_empty();
+
+  // Vector sections (shared for node/edge vector props)
+  if has_vectors {
+    let mut offsets_data = vec![0u8; vector_table.offsets.len() * 8];
+    for (i, &offset) in vector_table.offsets.iter().enumerate() {
+      write_u64(&mut offsets_data, i * 8, offset);
+    }
+    add_section(SectionId::VectorOffsets, offsets_data);
+    add_section(SectionId::VectorData, vector_table.data);
   }
 
   // Calculate total size with alignment
@@ -787,12 +862,15 @@ pub fn build_snapshot(db_path: &Path, input: SnapshotBuildInput) -> Result<Strin
   offset += 4;
 
   // Flags
-  let mut flags = SnapshotFlags::HAS_IN_EDGES;
+  let mut flags = SnapshotFlags::HAS_IN_EDGES | SnapshotFlags::HAS_NODE_LABELS;
   if has_properties {
     flags |= SnapshotFlags::HAS_PROPERTIES;
   }
   if key_index.buckets.len() > 1 {
     flags |= SnapshotFlags::HAS_KEY_BUCKETS;
+  }
+  if has_vectors {
+    flags |= SnapshotFlags::HAS_VECTORS;
   }
   write_u32(&mut buffer, offset, flags.bits());
   offset += 4;
@@ -954,16 +1032,20 @@ pub fn build_snapshot_to_memory(input: SnapshotBuildInput) -> Result<Vec<u8>> {
   // Build key index
   let key_index = build_key_index(&nodes, &node_key_strings);
 
-  // Intern string property values
+  // Intern string property values (deterministic order)
   for node in &nodes {
-    for value in node.props.values() {
+    let mut sorted_props: Vec<_> = node.props.iter().collect();
+    sorted_props.sort_by_key(|(k, _)| *k);
+    for (_, value) in sorted_props {
       if let PropValue::String(s) = value {
         string_table.intern(s);
       }
     }
   }
   for edge in &edges {
-    for value in edge.props.values() {
+    let mut sorted_props: Vec<_> = edge.props.iter().collect();
+    sorted_props.sort_by_key(|(k, _)| *k);
+    for (_, value) in sorted_props {
       if let PropValue::String(s) = value {
         string_table.intern(s);
       }
@@ -972,6 +1054,18 @@ pub fn build_snapshot_to_memory(input: SnapshotBuildInput) -> Result<Vec<u8>> {
 
   let has_properties =
     nodes.iter().any(|n| !n.props.is_empty()) || edges.iter().any(|e| !e.props.is_empty());
+
+  // Build node label offsets/ids (always included for v2)
+  let mut node_label_offsets: Vec<u32> = Vec::with_capacity(nodes.len() + 1);
+  let mut node_label_ids: Vec<u32> = Vec::new();
+  node_label_offsets.push(0);
+  for node in &nodes {
+    let mut labels = node.labels.clone();
+    labels.sort_unstable();
+    labels.dedup();
+    node_label_ids.extend(labels.iter().copied());
+    node_label_offsets.push(node_label_ids.len() as u32);
+  }
 
   let compression_opts = compression.unwrap_or_default();
   let mut section_data: Vec<SectionData> = Vec::new();
@@ -1137,6 +1231,24 @@ pub fn build_snapshot_to_memory(input: SnapshotBuildInput) -> Result<Vec<u8>> {
     add_section(SectionId::NodeKeyString, data);
   }
 
+  // node_label_offsets
+  {
+    let mut data = vec![0u8; node_label_offsets.len() * 4];
+    for (i, &offset) in node_label_offsets.iter().enumerate() {
+      write_u32(&mut data, i * 4, offset);
+    }
+    add_section(SectionId::NodeLabelOffsets, data);
+  }
+
+  // node_label_ids
+  {
+    let mut data = vec![0u8; node_label_ids.len() * 4];
+    for (i, &label_id) in node_label_ids.iter().enumerate() {
+      write_u32(&mut data, i * 4, label_id);
+    }
+    add_section(SectionId::NodeLabelIds, data);
+  }
+
   // key_entries
   {
     let mut data = vec![0u8; key_index.entries.len() * KEY_INDEX_ENTRY_SIZE];
@@ -1160,6 +1272,7 @@ pub fn build_snapshot_to_memory(input: SnapshotBuildInput) -> Result<Vec<u8>> {
   }
 
   // Node properties
+  let mut vector_table = VectorTable::new();
   {
     let mut node_prop_offsets = vec![0u32; num_nodes + 1];
     let mut node_prop_keys: Vec<u32> = Vec::new();
@@ -1171,7 +1284,7 @@ pub fn build_snapshot_to_memory(input: SnapshotBuildInput) -> Result<Vec<u8>> {
       sorted_props.sort_by_key(|(k, _)| *k);
       for (&key_id, value) in sorted_props {
         node_prop_keys.push(key_id);
-        node_prop_vals.push(encode_prop_value(value, &string_table));
+        node_prop_vals.push(encode_prop_value(value, &string_table, &mut vector_table));
       }
     }
     node_prop_offsets[num_nodes] = node_prop_keys.len() as u32;
@@ -1231,7 +1344,7 @@ pub fn build_snapshot_to_memory(input: SnapshotBuildInput) -> Result<Vec<u8>> {
           sorted_props.sort_by_key(|(k, _)| *k);
           for (&key_id, value) in sorted_props {
             edge_prop_keys.push(key_id);
-            edge_prop_vals.push(encode_prop_value(value, &string_table));
+            edge_prop_vals.push(encode_prop_value(value, &string_table, &mut vector_table));
           }
         }
         edge_idx += 1;
@@ -1258,6 +1371,18 @@ pub fn build_snapshot_to_memory(input: SnapshotBuildInput) -> Result<Vec<u8>> {
       write_u64(&mut vals_data, offset + 8, *payload);
     }
     add_section(SectionId::EdgePropVals, vals_data);
+  }
+
+  let has_vectors = !vector_table.is_empty();
+
+  // Vector sections (shared for node/edge vector props)
+  if has_vectors {
+    let mut offsets_data = vec![0u8; vector_table.offsets.len() * 8];
+    for (i, &offset) in vector_table.offsets.iter().enumerate() {
+      write_u64(&mut offsets_data, i * 8, offset);
+    }
+    add_section(SectionId::VectorOffsets, offsets_data);
+    add_section(SectionId::VectorData, vector_table.data);
   }
 
   // Calculate total size and offsets
@@ -1292,12 +1417,15 @@ pub fn build_snapshot_to_memory(input: SnapshotBuildInput) -> Result<Vec<u8>> {
   write_u32(&mut buffer, offset, MIN_READER_SNAPSHOT);
   offset += 4;
 
-  let mut flags = SnapshotFlags::HAS_IN_EDGES;
+  let mut flags = SnapshotFlags::HAS_IN_EDGES | SnapshotFlags::HAS_NODE_LABELS;
   if has_properties {
     flags |= SnapshotFlags::HAS_PROPERTIES;
   }
   if key_index.buckets.len() > 1 {
     flags |= SnapshotFlags::HAS_KEY_BUCKETS;
+  }
+  if has_vectors {
+    flags |= SnapshotFlags::HAS_VECTORS;
   }
   write_u32(&mut buffer, offset, flags.bits());
   offset += 4;
@@ -1371,7 +1499,7 @@ mod tests {
   use tempfile::tempdir;
 
   fn create_test_input() -> SnapshotBuildInput {
-    let mut nodes = vec![
+    let nodes = vec![
       NodeData {
         node_id: 1,
         key: Some("user:alice".to_string()),
@@ -1380,6 +1508,7 @@ mod tests {
           let mut props = HashMap::new();
           props.insert(1, PropValue::String("Alice".to_string()));
           props.insert(2, PropValue::I64(30));
+          props.insert(4, PropValue::VectorF32(vec![0.1, 0.2, 0.3]));
           props
         },
       },
@@ -1439,6 +1568,7 @@ mod tests {
     propkeys.insert(1, "name".to_string());
     propkeys.insert(2, "age".to_string());
     propkeys.insert(3, "weight".to_string());
+    propkeys.insert(4, "embedding".to_string());
 
     SnapshotBuildInput {
       generation: 1,
@@ -1609,7 +1739,7 @@ mod tests {
     assert_eq!(snapshot.header.max_node_id, 3);
     assert_eq!(snapshot.header.num_labels, 2);
     assert_eq!(snapshot.header.num_etypes, 2);
-    assert_eq!(snapshot.header.num_propkeys, 3);
+    assert_eq!(snapshot.header.num_propkeys, 4);
 
     // Verify node existence
     assert!(snapshot.has_node(1));
@@ -1675,6 +1805,13 @@ mod tests {
       assert_eq!(name, "Alice");
     } else {
       panic!("Expected string property");
+    }
+
+    // Verify vector property values
+    if let Some(PropValue::VectorF32(vec)) = snapshot.get_node_prop(phys0, 4) {
+      assert_eq!(vec, vec![0.1, 0.2, 0.3]);
+    } else {
+      panic!("Expected vector property");
     }
 
     // Verify edge properties

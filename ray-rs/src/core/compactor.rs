@@ -168,7 +168,12 @@ pub fn collect_graph_data(
       }
 
       // Apply delta modifications
-      let mut node_labels: Vec<LabelId> = Vec::new();
+      let mut node_labels: std::collections::HashSet<LabelId> =
+        std::collections::HashSet::new();
+
+      if let Some(snapshot_labels) = snap.get_node_labels(phys as PhysNode) {
+        node_labels.extend(snapshot_labels.into_iter());
+      }
 
       if let Some(node_delta) = delta.modified_nodes.get(&node_id) {
         // Apply property changes
@@ -181,11 +186,19 @@ pub fn collect_graph_data(
             }
           }
         }
-        // Collect labels
+        // Apply label changes
         if let Some(delta_labels) = &node_delta.labels {
-          node_labels.extend(delta_labels.iter().cloned());
+          node_labels.extend(delta_labels.iter().copied());
+        }
+        if let Some(deleted) = &node_delta.labels_deleted {
+          for label_id in deleted {
+            node_labels.remove(label_id);
+          }
         }
       }
+
+      let mut node_labels: Vec<LabelId> = node_labels.into_iter().collect();
+      node_labels.sort_unstable();
 
       nodes.push(NodeData {
         node_id,
@@ -269,11 +282,12 @@ pub fn collect_graph_data(
       }
     }
 
-    let node_labels = node_delta
+    let mut node_labels: Vec<LabelId> = node_delta
       .labels
       .as_ref()
-      .map(|l| l.iter().cloned().collect())
+      .map(|l| l.iter().copied().collect())
       .unwrap_or_default();
+    node_labels.sort_unstable();
 
     nodes.push(NodeData {
       node_id: *node_id,
@@ -342,7 +356,7 @@ fn gc_snapshots(db_path: &Path, active_gen: u64, prev_gen: u64) -> Result<()> {
     let filename = entry.file_name();
     let filename_str = filename.to_string_lossy();
 
-    // Parse generation from filename (format: "snapshot_NNNNNNNNNN.ray")
+    // Parse generation from filename (format: "snap_{:016}.gds")
     if let Some(gen) = parse_snapshot_gen(&filename_str) {
       // Keep active and prev
       if gen == active_gen || gen == prev_gen {
@@ -361,17 +375,6 @@ fn gc_snapshots(db_path: &Path, active_gen: u64, prev_gen: u64) -> Result<()> {
   }
 
   Ok(())
-}
-
-/// Parse snapshot generation from filename
-fn parse_snapshot_gen(filename: &str) -> Option<u64> {
-  // Format: "snapshot_NNNNNNNNNN.ray"
-  if !filename.starts_with("snapshot_") || !filename.ends_with(".ray") {
-    return None;
-  }
-
-  let num_part = &filename[9..filename.len() - 4];
-  num_part.parse().ok()
 }
 
 /// Clean up trash directory
@@ -401,17 +404,6 @@ pub fn clean_trash(db_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
   use super::*;
-
-  #[test]
-  fn test_parse_snapshot_gen() {
-    assert_eq!(parse_snapshot_gen("snapshot_0000000001.ray"), Some(1));
-    assert_eq!(
-      parse_snapshot_gen("snapshot_1234567890.ray"),
-      Some(1234567890)
-    );
-    assert_eq!(parse_snapshot_gen("invalid.ray"), None);
-    assert_eq!(parse_snapshot_gen("snapshot_abc.ray"), None);
-  }
 
   #[test]
   fn test_collect_graph_data_empty() {

@@ -219,6 +219,15 @@ impl FilePager {
     self.free_pages.len()
   }
 
+  /// Truncate file to the given number of pages
+  pub fn truncate_pages(&mut self, page_count: u32) -> Result<()> {
+    let new_size = page_count as u64 * self.page_size as u64;
+    self.file.set_len(new_size)?;
+    self.file_size = new_size;
+    self.invalidate_mmap_cache();
+    Ok(())
+  }
+
   /// Sync file to disk
   pub fn sync(&self) -> Result<()> {
     #[cfg(target_os = "macos")]
@@ -372,7 +381,6 @@ pub fn pages_to_store(byte_count: usize, page_size: usize) -> u32 {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use std::io::Write;
   use tempfile::NamedTempFile;
 
   #[test]
