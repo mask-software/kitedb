@@ -8,6 +8,7 @@ pub mod crc;
 pub mod hash;
 pub mod heap;
 pub mod lock;
+pub mod mmap;
 
 // Re-export commonly used items
 pub use binary::{align_up, padding_for, BufferBuilder};

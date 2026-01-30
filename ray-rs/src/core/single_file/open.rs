@@ -12,6 +12,7 @@ use crate::cache::manager::CacheManager;
 use crate::constants::*;
 use crate::core::pager::{create_pager, is_valid_page_size, open_pager, pages_to_store};
 use crate::core::snapshot::reader::SnapshotData;
+use crate::util::mmap::map_file;
 use crate::core::wal::buffer::WalBuffer;
 use crate::error::{RayError, Result};
 use crate::types::*;
@@ -274,10 +275,9 @@ pub fn open_single_file<P: AsRef<Path>>(
     let snapshot_offset = (header.snapshot_start_page * header.page_size as u64) as usize;
 
     match SnapshotData::parse_at_offset(
-      std::sync::Arc::new(unsafe {
-        // Safety: We're creating an owned Mmap from the file
-        // This is safe because the pager keeps the file open
-        memmap2::Mmap::map(pager.file())?
+      std::sync::Arc::new({
+        // Safety handled inside map_file (native mmap) or in-memory read (wasm).
+        map_file(pager.file())?
       }),
       snapshot_offset,
       &crate::core::snapshot::reader::ParseSnapshotOptions::default(),

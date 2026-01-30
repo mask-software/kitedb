@@ -9,7 +9,7 @@ use crate::util::binary::*;
 use crate::util::compression::{decompress_with_size, CompressionType};
 use crate::util::crc::crc32c;
 use crate::util::hash::xxhash64_string;
-use memmap2::Mmap;
+use crate::util::mmap::{map_file, Mmap};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::fs::File;
@@ -53,14 +53,14 @@ impl SnapshotData {
   /// Load and mmap a snapshot file
   pub fn load(path: impl AsRef<Path>) -> Result<Self> {
     let file = File::open(path.as_ref())?;
-    let mmap = unsafe { Mmap::map(&file)? };
+    let mmap = map_file(&file)?;
     Self::parse(Arc::new(mmap), &ParseSnapshotOptions::default())
   }
 
   /// Load with options
   pub fn load_with_options(path: impl AsRef<Path>, options: &ParseSnapshotOptions) -> Result<Self> {
     let file = File::open(path.as_ref())?;
-    let mmap = unsafe { Mmap::map(&file)? };
+    let mmap = map_file(&file)?;
     Self::parse(Arc::new(mmap), options)
   }
 

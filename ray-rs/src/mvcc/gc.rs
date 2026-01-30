@@ -315,11 +315,13 @@ impl Default for SharedGcState {
 // Background GC Runner
 // ============================================================================
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::thread::{self, JoinHandle};
 
 /// Handle to a running background GC thread
 ///
 /// When dropped, the GC thread is stopped and joined.
+#[cfg(not(target_arch = "wasm32"))]
 pub struct BackgroundGcHandle {
   /// Shared state for communicating with the GC thread
   state: Arc<SharedGcState>,
@@ -327,6 +329,7 @@ pub struct BackgroundGcHandle {
   thread: Option<JoinHandle<()>>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl BackgroundGcHandle {
   /// Stop the background GC thread
   ///
@@ -363,6 +366,7 @@ impl BackgroundGcHandle {
   }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Drop for BackgroundGcHandle {
   fn drop(&mut self) {
     // Signal stop and wait for thread to finish
@@ -370,6 +374,34 @@ impl Drop for BackgroundGcHandle {
     if let Some(handle) = self.thread.take() {
       let _ = handle.join();
     }
+  }
+}
+
+#[cfg(target_arch = "wasm32")]
+pub struct BackgroundGcHandle {
+  state: Arc<SharedGcState>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl BackgroundGcHandle {
+  pub fn stop(self) {
+    self.state.stop();
+  }
+
+  pub fn is_running(&self) -> bool {
+    false
+  }
+
+  pub fn gc_runs(&self) -> u64 {
+    self.state.gc_runs.load(Ordering::Relaxed)
+  }
+
+  pub fn versions_pruned(&self) -> u64 {
+    self.state.versions_pruned.load(Ordering::Relaxed)
+  }
+
+  pub fn state(&self) -> &Arc<SharedGcState> {
+    &self.state
   }
 }
 
@@ -406,6 +438,7 @@ impl Drop for BackgroundGcHandle {
 /// // Later, stop the GC
 /// handle.stop();
 /// ```
+#[cfg(not(target_arch = "wasm32"))]
 pub fn start_background_gc(
   tx_manager: Arc<parking_lot::Mutex<TxManager>>,
   version_chain: Arc<parking_lot::Mutex<VersionChainManager>>,
@@ -439,6 +472,17 @@ pub fn start_background_gc(
   BackgroundGcHandle {
     state,
     thread: Some(thread),
+  }
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn start_background_gc(
+  _tx_manager: Arc<parking_lot::Mutex<TxManager>>,
+  _version_chain: Arc<parking_lot::Mutex<VersionChainManager>>,
+  _config: GcConfig,
+) -> BackgroundGcHandle {
+  BackgroundGcHandle {
+    state: Arc::new(SharedGcState::new()),
   }
 }
 

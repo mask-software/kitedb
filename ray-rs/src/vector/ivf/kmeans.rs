@@ -7,6 +7,7 @@
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+#[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 
 #[cfg(test)]
@@ -442,6 +443,7 @@ pub fn kmeans_parallel(
 
 /// Parallel assign vectors to nearest centroids
 /// Returns total inertia (sum of squared distances)
+#[cfg(not(target_arch = "wasm32"))]
 fn assign_to_centroids_parallel(
   vectors: &[f32],
   n: usize,
@@ -486,7 +488,44 @@ fn assign_to_centroids_parallel(
   inertia
 }
 
+#[cfg(target_arch = "wasm32")]
+fn assign_to_centroids_parallel(
+  vectors: &[f32],
+  n: usize,
+  dimensions: usize,
+  centroids: &[f32],
+  k: usize,
+  assignments: &mut [u32],
+  distance_fn: fn(&[f32], &[f32]) -> f32,
+) -> f32 {
+  let mut inertia = 0.0f32;
+  for i in 0..n {
+    let vec_offset = i * dimensions;
+    let vec = &vectors[vec_offset..vec_offset + dimensions];
+
+    let mut best_cluster = 0u32;
+    let mut best_dist = f32::INFINITY;
+
+    for c in 0..k {
+      let cent_offset = c * dimensions;
+      let centroid = &centroids[cent_offset..cent_offset + dimensions];
+      let dist = distance_fn(vec, centroid);
+
+      if dist < best_dist {
+        best_dist = dist;
+        best_cluster = c as u32;
+      }
+    }
+
+    assignments[i] = best_cluster;
+    inertia += best_dist;
+  }
+
+  inertia
+}
+
 /// Parallel update centroids based on current assignments
+#[cfg(not(target_arch = "wasm32"))]
 fn update_centroids_parallel(
   vectors: &[f32],
   n: usize,
@@ -540,11 +579,47 @@ fn update_centroids_parallel(
   }
 }
 
+#[cfg(target_arch = "wasm32")]
+fn update_centroids_parallel(
+  vectors: &[f32],
+  n: usize,
+  dimensions: usize,
+  assignments: &[u32],
+  k: usize,
+  centroids: &mut [f32],
+) {
+  let mut cluster_sums = vec![0.0f32; k * dimensions];
+  let mut cluster_counts = vec![0u32; k];
+
+  for i in 0..n {
+    let cluster = assignments[i] as usize;
+    let vec_offset = i * dimensions;
+    let sum_offset = cluster * dimensions;
+
+    for d in 0..dimensions {
+      cluster_sums[sum_offset + d] += vectors[vec_offset + d];
+    }
+    cluster_counts[cluster] += 1;
+  }
+
+  for (c, &count) in cluster_counts.iter().enumerate() {
+    if count == 0 {
+      continue;
+    }
+
+    let offset = c * dimensions;
+    for d in 0..dimensions {
+      centroids[offset + d] = cluster_sums[offset + d] / count as f32;
+    }
+  }
+}
+
 /// Parallel k-means++ initialization
 ///
 /// Note: This is partially parallel - the distance updates are parallel,
 /// but the weighted selection is sequential (inherently serial).
 #[allow(dead_code)]
+#[cfg(not(target_arch = "wasm32"))]
 fn kmeans_plus_plus_init_parallel(
   vectors: &[f32],
   n: usize,
@@ -591,6 +666,67 @@ fn kmeans_plus_plus_init_parallel(
     }
 
     // Weighted random selection (sequential)
+    let mut r = rng.gen::<f32>() * total_dist;
+    let mut selected_idx = 0;
+
+    for (i, dist) in min_dists.iter().enumerate().take(n) {
+      r -= *dist;
+      if r <= 0.0 {
+        selected_idx = i;
+        break;
+      }
+    }
+
+    let selected_offset = selected_idx * dimensions;
+    centroids.extend_from_slice(&vectors[selected_offset..selected_offset + dimensions]);
+  }
+
+  centroids
+}
+
+#[allow(dead_code)]
+#[cfg(target_arch = "wasm32")]
+fn kmeans_plus_plus_init_parallel(
+  vectors: &[f32],
+  n: usize,
+  dimensions: usize,
+  k: usize,
+  distance_fn: fn(&[f32], &[f32]) -> f32,
+  seed: Option<u64>,
+) -> Vec<f32> {
+  let mut rng: StdRng = match seed {
+    Some(s) => StdRng::seed_from_u64(s),
+    None => StdRng::from_entropy(),
+  };
+
+  let mut centroids = Vec::with_capacity(k * dimensions);
+
+  let first_idx = rng.gen_range(0..n);
+  let first_offset = first_idx * dimensions;
+  centroids.extend_from_slice(&vectors[first_offset..first_offset + dimensions]);
+
+  let mut min_dists = vec![f32::INFINITY; n];
+
+  for c in 1..k {
+    let prev_cent_offset = (c - 1) * dimensions;
+    let prev_centroid = &centroids[prev_cent_offset..prev_cent_offset + dimensions];
+
+    for i in 0..n {
+      let vec_offset = i * dimensions;
+      let vec = &vectors[vec_offset..vec_offset + dimensions];
+      let dist = distance_fn(vec, prev_centroid);
+      let abs_dist = dist.abs();
+      let candidate = abs_dist * abs_dist;
+      if candidate < min_dists[i] {
+        min_dists[i] = candidate;
+      }
+    }
+
+    let mut total_dist = 0.0f32;
+    for dist in min_dists.iter().take(n) {
+      total_dist += *dist;
+    }
+
     let mut r = rng.gen::<f32>() * total_dist;
     let mut selected_idx = 0;
 

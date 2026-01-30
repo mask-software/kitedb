@@ -4,7 +4,9 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
 use std::thread;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -19,7 +21,10 @@ pub struct MvccManager {
   pub conflict_detector: ConflictDetector,
   pub gc: Arc<Mutex<GarbageCollector>>,
   gc_stop: Arc<AtomicBool>,
+  #[cfg(not(target_arch = "wasm32"))]
   gc_handle: Mutex<Option<thread::JoinHandle<()>>>,
+  #[cfg(target_arch = "wasm32")]
+  gc_handle: Mutex<()>,
 }
 
 impl MvccManager {
@@ -34,11 +39,15 @@ impl MvccManager {
       conflict_detector: ConflictDetector::new(),
       gc: Arc::new(Mutex::new(GarbageCollector::with_config(gc_config))),
       gc_stop: Arc::new(AtomicBool::new(false)),
+      #[cfg(not(target_arch = "wasm32"))]
       gc_handle: Mutex::new(None),
+      #[cfg(target_arch = "wasm32")]
+      gc_handle: Mutex::new(()),
     }
   }
 
   /// Initialize MVCC (starts background GC)
+  #[cfg(not(target_arch = "wasm32"))]
   pub fn start(&self) {
     let mut handle_guard = self.gc_handle.lock();
     if handle_guard.is_some() {
@@ -81,11 +90,23 @@ impl MvccManager {
     *handle_guard = Some(handle);
   }
 
+  #[cfg(target_arch = "wasm32")]
+  pub fn start(&self) {
+    // No background threads on wasm; run one GC cycle and return.
+    let mut tx_mgr = self.tx_manager.lock();
+    let mut vc = self.version_chain.lock();
+    let mut gc = self.gc.lock();
+    let _ = gc.run_gc(&mut tx_mgr, &mut vc);
+  }
+
   /// Shutdown MVCC (stop background GC)
   pub fn stop(&self) {
     self.gc_stop.store(true, Ordering::SeqCst);
-    if let Some(handle) = self.gc_handle.lock().take() {
-      let _ = handle.join();
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+      if let Some(handle) = self.gc_handle.lock().take() {
+        let _ = handle.join();
+      }
     }
   }
 }

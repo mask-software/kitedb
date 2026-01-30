@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 
+#[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 
 use crate::types::NodeId;
@@ -318,32 +319,62 @@ impl IvfPqIndex {
     let subspace_dims = self.subspace_dims;
     let dimensions = self.dimensions;
 
-    // Train each subspace independently in parallel
-    let trained_centroids: Vec<Vec<f32>> = (0..num_subspaces)
-      .into_par_iter()
-      .map(|m| {
-        // Extract subvectors for this subspace
-        let mut subvectors = Vec::with_capacity(num_vectors * subspace_dims);
-        let sub_offset = m * subspace_dims;
+    // Train each subspace independently (parallel on native, sequential on wasm)
+    let trained_centroids: Vec<Vec<f32>> = {
+      #[cfg(not(target_arch = "wasm32"))]
+      {
+        (0..num_subspaces)
+          .into_par_iter()
+          .map(|m| {
+            // Extract subvectors for this subspace
+            let mut subvectors = Vec::with_capacity(num_vectors * subspace_dims);
+            let sub_offset = m * subspace_dims;
 
-        for i in 0..num_vectors {
-          let vec_offset = i * dimensions + sub_offset;
-          subvectors.extend_from_slice(&vectors[vec_offset..vec_offset + subspace_dims]);
-        }
+            for i in 0..num_vectors {
+              let vec_offset = i * dimensions + sub_offset;
+              subvectors.extend_from_slice(&vectors[vec_offset..vec_offset + subspace_dims]);
+            }
 
-        // Run k-means on subvectors
-        let mut centroids = vec![0.0f32; num_centroids * subspace_dims];
-        train_pq_subspace(
-          &mut centroids,
-          &subvectors,
-          num_vectors,
-          subspace_dims,
-          num_centroids,
-          max_iterations,
-        );
-        centroids
-      })
-      .collect();
+            // Run k-means on subvectors
+            let mut centroids = vec![0.0f32; num_centroids * subspace_dims];
+            train_pq_subspace(
+              &mut centroids,
+              &subvectors,
+              num_vectors,
+              subspace_dims,
+              num_centroids,
+              max_iterations,
+            );
+            centroids
+          })
+          .collect()
+      }
+      #[cfg(target_arch = "wasm32")]
+      {
+        (0..num_subspaces)
+          .map(|m| {
+            let mut subvectors = Vec::with_capacity(num_vectors * subspace_dims);
+            let sub_offset = m * subspace_dims;
+
+            for i in 0..num_vectors {
+              let vec_offset = i * dimensions + sub_offset;
+              subvectors.extend_from_slice(&vectors[vec_offset..vec_offset + subspace_dims]);
+            }
+
+            let mut centroids = vec![0.0f32; num_centroids * subspace_dims];
+            train_pq_subspace(
+              &mut centroids,
+              &subvectors,
+              num_vectors,
+              subspace_dims,
+              num_centroids,
+              max_iterations,
+            );
+            centroids
+          })
+          .collect()
+      }
+    };
 
     // Copy results back
     for (m, centroids) in trained_centroids.into_iter().enumerate() {

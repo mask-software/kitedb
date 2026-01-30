@@ -7,6 +7,7 @@ use std::sync::atomic::Ordering;
 
 use crate::core::pager::{pages_to_store, FilePager};
 use crate::core::snapshot::reader::SnapshotData;
+use crate::util::mmap::map_file;
 use crate::core::snapshot::writer::{
   build_snapshot_to_memory, EdgeData, NodeData, SnapshotBuildInput,
 };
@@ -136,10 +137,9 @@ impl SingleFileDB {
     // Re-mmap the file and parse snapshot
     let pager = self.pager.lock();
     let new_snapshot = SnapshotData::parse_at_offset(
-      std::sync::Arc::new(unsafe {
-        // Safety: We're creating an owned Mmap from the file
-        // This is safe because the pager keeps the file open
-        memmap2::Mmap::map(pager.file())?
+      std::sync::Arc::new({
+        // Safety handled inside map_file (native mmap) or in-memory read (wasm).
+        map_file(pager.file())?
       }),
       snapshot_offset,
       &crate::core::snapshot::reader::ParseSnapshotOptions::default(),

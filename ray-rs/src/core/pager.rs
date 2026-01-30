@@ -8,7 +8,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use memmap2::Mmap;
+use crate::util::mmap::{map_file, Mmap};
 
 use crate::constants::{
   LOCK_BYTE_OFFSET, LOCK_BYTE_RANGE, MAX_PAGE_SIZE, MIN_PAGE_SIZE, OS_PAGE_SIZE,
@@ -140,7 +140,7 @@ impl FilePager {
     if self.mmap.is_none() {
       // Safety: The file should not be modified while mmap is active
       // In practice, we invalidate the mmap on writes
-      let mmap = unsafe { Mmap::map(&self.file)? };
+      let mmap = map_file(&self.file)?;
       self.mmap = Some(mmap);
     }
     Ok(self.mmap.as_ref().unwrap())

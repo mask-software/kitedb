@@ -21,6 +21,7 @@ use parking_lot::{Mutex, RwLock};
 use crate::constants::*;
 use crate::core::manifest::{create_empty_manifest, read_manifest, write_manifest};
 use crate::core::snapshot::reader::SnapshotData;
+use crate::util::mmap::map_file;
 use crate::core::wal::reader::{load_wal_segment_by_id, recover_from_segment};
 use crate::core::wal::record::WalRecord;
 use crate::core::wal::writer::WalWriter;
@@ -409,7 +410,6 @@ impl GraphDB {
   pub fn optimize(&mut self) -> Result<()> {
     use crate::core::compactor::{optimize, OptimizeOptions};
     use crate::core::snapshot::reader::{ParseSnapshotOptions, SnapshotData};
-    use memmap2::Mmap;
     use std::sync::Arc;
 
     if self.read_only {
@@ -441,7 +441,7 @@ impl GraphDB {
 
     // Reload snapshot from new file
     let file = File::open(&snapshot_path)?;
-    let mmap = Arc::new(unsafe { Mmap::map(&file)? });
+    let mmap = Arc::new(map_file(&file)?);
     let snapshot_data = SnapshotData::parse(mmap, &ParseSnapshotOptions::default())?;
     self.snapshot = Some(snapshot_data);
 
