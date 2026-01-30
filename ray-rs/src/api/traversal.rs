@@ -227,8 +227,8 @@ impl std::fmt::Debug for TraversalStep {
 ///
 /// # Example
 /// ```rust,no_run
-/// # use raydb_core::api::traversal::{TraversalBuilder, TraversalDirection};
-/// # use raydb_core::types::{Edge, ETypeId, NodeId};
+/// # use raydb::api::traversal::{TraversalBuilder, TraversalDirection};
+/// # use raydb::types::{Edge, ETypeId, NodeId};
 /// # fn get_neighbors_fn(
 /// #   _: NodeId,
 /// #   _: TraversalDirection,
@@ -360,8 +360,8 @@ impl TraversalBuilder {
   ///
   /// # Example
   /// ```rust,no_run
-  /// # use raydb_core::api::traversal::TraversalBuilder;
-  /// # use raydb_core::types::ETypeId;
+  /// # use raydb::api::traversal::TraversalBuilder;
+  /// # use raydb::types::ETypeId;
   /// # fn main() {
   /// # let knows_etype: ETypeId = 1;
   /// let builder = TraversalBuilder::from_node(1)
@@ -384,8 +384,8 @@ impl TraversalBuilder {
   ///
   /// # Example
   /// ```rust,no_run
-  /// # use raydb_core::api::traversal::TraversalBuilder;
-  /// # use raydb_core::types::ETypeId;
+  /// # use raydb::api::traversal::TraversalBuilder;
+  /// # use raydb::types::ETypeId;
   /// # fn main() {
   /// # let knows_etype: ETypeId = 1;
   /// let builder = TraversalBuilder::from_node(1)
@@ -409,8 +409,8 @@ impl TraversalBuilder {
   ///
   /// # Example
   /// ```rust,no_run
-  /// # use raydb_core::api::traversal::TraversalBuilder;
-  /// # use raydb_core::types::ETypeId;
+  /// # use raydb::api::traversal::TraversalBuilder;
+  /// # use raydb::types::ETypeId;
   /// # fn main() {
   /// # let knows_etype: ETypeId = 1;
   /// let builder = TraversalBuilder::from_node(1)
@@ -1015,8 +1015,8 @@ where
 /// # Example
 ///
 /// ```rust,no_run
-/// # use raydb_core::api::traversal::{TraversalBuilder, TraversalDirection};
-/// # use raydb_core::types::{Edge, ETypeId, NodeId};
+/// # use raydb::api::traversal::{TraversalBuilder, TraversalDirection};
+/// # use raydb::types::{Edge, ETypeId, NodeId};
 /// # fn main() {
 /// # let knows_etype: ETypeId = 1;
 /// # let get_neighbors = |_: NodeId, _: TraversalDirection, _: Option<ETypeId>| -> Vec<Edge> {
@@ -1167,24 +1167,24 @@ impl TraversalBuilder {
   /// # Example
   ///
   /// ```rust,no_run
-  /// # use raydb_core::api::traversal::{TraversalBuilder, TraversalDirection};
-  /// # use raydb_core::types::{Edge, ETypeId, NodeId};
+  /// # use raydb::api::traversal::{TraversalBuilder, TraversalDirection};
+  /// # use raydb::types::{Edge, ETypeId, NodeId};
   /// # fn main() {
   /// # let knows_etype: ETypeId = 1;
   /// # let get_neighbors = |_: NodeId, _: TraversalDirection, _: Option<ETypeId>| -> Vec<Edge> {
   /// #   Vec::new()
   /// # };
-/// // Get first node ID
-/// let first = TraversalBuilder::from_node(1)
-///     .out(Some(knows_etype))
-///     .results(&get_neighbors)
-///     .first_node();
-///
-/// // Or collect all nodes
-/// let all_nodes = TraversalBuilder::from_node(1)
-///     .out(Some(knows_etype))
-///     .results(&get_neighbors)
-///     .to_vec();
+  /// // Get first node ID
+  /// let first = TraversalBuilder::from_node(1)
+  ///     .out(Some(knows_etype))
+  ///     .results(&get_neighbors)
+  ///     .first_node();
+  ///
+  /// // Or collect all nodes
+  /// let all_nodes = TraversalBuilder::from_node(1)
+  ///     .out(Some(knows_etype))
+  ///     .results(&get_neighbors)
+  ///     .to_vec();
   /// # }
   /// ```
   pub fn results<F>(self, get_neighbors: F) -> TraversalResults<TraversalIterator<F>>

@@ -125,9 +125,9 @@ impl PathConfig {
 ///
 /// # Example
 /// ```rust,no_run
-/// # use raydb_core::api::pathfinding::{dijkstra, PathConfig};
-/// # use raydb_core::api::traversal::TraversalDirection;
-/// # use raydb_core::types::{Edge, ETypeId, NodeId};
+/// # use raydb::api::pathfinding::{dijkstra, PathConfig};
+/// # use raydb::api::traversal::TraversalDirection;
+/// # use raydb::types::{Edge, ETypeId, NodeId};
 /// # fn get_neighbors(
 /// #   _: NodeId,
 /// #   _: TraversalDirection,
@@ -651,9 +651,9 @@ where
 ///
 /// # Example
 /// ```rust,no_run
-/// # use raydb_core::api::pathfinding::{yen_k_shortest, PathConfig};
-/// # use raydb_core::api::traversal::TraversalDirection;
-/// # use raydb_core::types::{Edge, ETypeId, NodeId};
+/// # use raydb::api::pathfinding::{yen_k_shortest, PathConfig};
+/// # use raydb::api::traversal::TraversalDirection;
+/// # use raydb::types::{Edge, ETypeId, NodeId};
 /// # fn get_neighbors(
 /// #   _: NodeId,
 /// #   _: TraversalDirection,

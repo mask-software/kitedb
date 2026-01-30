@@ -109,8 +109,8 @@ impl CacheManagerStats {
 ///
 /// # Example
 /// ```
-/// use raydb_core::cache::manager::CacheManager;
-/// use raydb_core::types::{CacheOptions, PropValue};
+/// use raydb::cache::manager::CacheManager;
+/// use raydb::types::{CacheOptions, PropValue};
 ///
 /// let mut cache = CacheManager::new(CacheOptions {
 ///     enabled: true,

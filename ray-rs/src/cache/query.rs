@@ -59,8 +59,8 @@ impl QueryCacheStats {
 ///
 /// # Example
 /// ```
-/// use raydb_core::cache::query::QueryCache;
-/// use raydb_core::types::QueryCacheConfig;
+/// use raydb::cache::query::QueryCache;
+/// use raydb::types::QueryCacheConfig;
 ///
 /// let config = QueryCacheConfig {
 ///     max_entries: 100,

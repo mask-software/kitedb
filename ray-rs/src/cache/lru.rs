@@ -47,7 +47,7 @@ impl<K, V> LruNode<K, V> {
 ///
 /// # Example
 /// ```
-/// use raydb_core::cache::lru::LruCache;
+/// use raydb::cache::lru::LruCache;
 ///
 /// let mut cache = LruCache::new(3);
 /// cache.set("a", 1);

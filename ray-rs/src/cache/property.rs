@@ -66,8 +66,8 @@ impl PropertyCacheStats {
 ///
 /// # Example
 /// ```
-/// use raydb_core::cache::property::PropertyCache;
-/// use raydb_core::types::{PropertyCacheConfig, PropValue};
+/// use raydb::cache::property::PropertyCache;
+/// use raydb::types::{PropertyCacheConfig, PropValue};
 ///
 /// let config = PropertyCacheConfig {
 ///     max_node_props: 1000,

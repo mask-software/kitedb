@@ -86,8 +86,8 @@ impl TraversalCacheStats {
 ///
 /// # Example
 /// ```
-/// use raydb_core::cache::traversal::{TraversalCache, TraversalDirection};
-/// use raydb_core::types::{TraversalCacheConfig, Edge};
+/// use raydb::cache::traversal::{TraversalCache, TraversalDirection};
+/// use raydb::types::{TraversalCacheConfig, Edge};
 ///
 /// let config = TraversalCacheConfig {
 ///     max_entries: 100,
