@@ -38,6 +38,23 @@ cd ray
 bun install
 ```
 
+## Browser (WASM) prototype
+
+RayDB can run in the browser via the WASI build of the core (`@ray-db/core`).
+This uses an in-memory filesystem by default (ephemeral per page load).
+
+Build the WASM bundle locally:
+
+```bash
+cd ray-rs
+npm run build:wasm
+```
+
+Then import `@ray-db/core` in your browser bundler (it uses the `browser` entry),
+or import `@ray-db/core-wasm32-wasi` directly. Persistence in the browser
+requires wiring WASI to a persistent FS (e.g. OPFS/IndexedDB).
+See `ray-rs/examples/browser` for a minimal demo.
+
 ## Quick Start
 
 ```typescript

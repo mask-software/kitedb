@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>RayDB WASM Demo</title>
+    <style>
+      body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; margin: 24px; }
+      #log { background: #111; color: #eaeaea; padding: 12px; border-radius: 8px; min-height: 120px; }
+      button { padding: 8px 12px; font-size: 14px; }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <h1>RayDB WASM Demo</h1>
+      <p>This runs the WASI build in the browser with an in-memory filesystem.</p>
+      <button id="run">Run demo</button>
+      <pre id="log"></pre>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
