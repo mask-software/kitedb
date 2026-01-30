@@ -53,7 +53,7 @@ npm run build:wasm
 Then import `@ray-db/core` in your browser bundler (it uses the `browser` entry),
 or import `@ray-db/core-wasm32-wasi` directly. Persistence in the browser
 requires wiring WASI to a persistent FS (e.g. OPFS/IndexedDB).
-See `ray-rs/examples/browser` for a minimal demo.
+See `ray-rs/examples/browser` for a minimal demo (OPFS first, IndexedDB fallback).
 
 ## Quick Start
 

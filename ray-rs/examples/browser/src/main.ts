@@ -1,98 +1,268 @@
-const runButton = document.querySelector('#run') as HTMLButtonElement | null
+type NodeView = { id: number; key: string }
+
+type EdgeView = {
+  src: number
+  etype: number
+  dst: number
+  etypeName: string
+}
+
 const logEl = document.querySelector('#log') as HTMLPreElement | null
+const statusEl = document.querySelector('#status') as HTMLSpanElement | null
+const addNodeBtn = document.querySelector('#add-node') as HTMLButtonElement | null
+const addEdgeBtn = document.querySelector('#add-edge') as HTMLButtonElement | null
+const graphEl = document.querySelector('#graph') as SVGSVGElement | null
+const selectedNodeEl = document.querySelector('#selected-node') as HTMLDivElement | null
+const connectionsOutEl = document.querySelector('#connections-out') as HTMLUListElement | null
+const connectionsInEl = document.querySelector('#connections-in') as HTMLUListElement | null
 
 const log = (message: string) => {
   if (!logEl) return
   logEl.textContent += message + '\n'
+  logEl.scrollTop = logEl.scrollHeight
 }
 
 const DB_PATH = '/demo.raydb'
-const DB_IDB_KEY = 'raydb-demo'
+const EDGE_TYPE = 'connects'
 
-const openDb = (): Promise<IDBDatabase> =>
-  new Promise((resolve, reject) => {
-    const request = indexedDB.open('raydb-wasm-demo', 1)
-    request.onupgradeneeded = () => {
-      const db = request.result
-      if (!db.objectStoreNames.contains('files')) {
-        db.createObjectStore('files')
-      }
-    }
-    request.onsuccess = () => resolve(request.result)
-    request.onerror = () => reject(request.error)
-  })
-
-const loadPersistedFile = async (): Promise<Uint8Array | ArrayBuffer | null> => {
-  if (!('indexedDB' in window)) return null
-  const db = await openDb()
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction('files', 'readonly')
-    const store = tx.objectStore('files')
-    const request = store.get(DB_IDB_KEY)
-    request.onsuccess = () => resolve(request.result ?? null)
-    request.onerror = () => reject(request.error)
-  })
+const state = {
+  ray: null as any,
+  db: null as any,
+  nodes: [] as NodeView[],
+  edges: [] as EdgeView[],
+  positions: new Map<number, { x: number; y: number }>(),
+  selectedNodeId: null as number | null,
+  nextSeed: 1,
 }
 
-const savePersistedFile = async (data: Uint8Array): Promise<void> => {
-  if (!('indexedDB' in window)) return
-  const db = await openDb()
-  await new Promise<void>((resolve, reject) => {
-    const tx = db.transaction('files', 'readwrite')
-    const store = tx.objectStore('files')
-    store.put(data, DB_IDB_KEY)
-    tx.oncomplete = () => resolve()
-    tx.onerror = () => reject(tx.error)
-  })
+const setStatus = (text: string) => {
+  if (statusEl) statusEl.textContent = `WASM: ${text}`
 }
 
-const runDemo = async () => {
-  if (logEl) logEl.textContent = ''
-  log('Loading WASM...')
+const getNodeKey = (id: number) => {
+  const node = state.nodes.find((n) => n.id === id)
+  return node ? node.key : `node-${id}`
+}
 
-  const ray = await import('../../core.wasi-browser.js')
-  const { Database, pathConfig, JsTraversalDirection, __fs } = ray
+const refreshState = () => {
+  if (!state.db) return
+  const db = state.db
+  const nodes = db.listNodes() as number[]
+  const edges = db.listEdges() as Array<{ src: number; etype: number; dst: number }>
+  const nodeViews = nodes.map((id) => ({ id, key: db.getNodeKey(id) ?? `node-${id}` }))
 
-  const persisted = await loadPersistedFile()
-  if (persisted) {
-    log('Restoring persisted DB from IndexedDB...')
-    const bytes = persisted instanceof Uint8Array ? persisted : new Uint8Array(persisted)
-    __fs.writeFileSync(DB_PATH, bytes)
+  const etypeId = db.getEtypeId(EDGE_TYPE)
+  const etypeName = etypeId !== null ? db.getEtypeName(etypeId) ?? EDGE_TYPE : EDGE_TYPE
+
+  state.nodes = nodeViews
+  state.edges = edges.map((edge) => ({
+    ...edge,
+    etypeName,
+  }))
+}
+
+const renderGraph = () => {
+  if (!graphEl) return
+  if (state.nodes.length === 0) {
+    graphEl.innerHTML = '<text x="400" y="260" text-anchor="middle" fill="#64748b">No nodes yet</text>'
+    return
   }
 
-  const db = Database.open(DB_PATH)
-  db.begin()
+  const width = 800
+  const height = 520
+  const radius = Math.min(width, height) / 2 - 80
+  const centerX = width / 2
+  const centerY = height / 2
+  const positions = new Map<number, { x: number; y: number }>()
 
-  const alice = db.createNode('user:alice')
-  const bob = db.createNode('user:bob')
-  const carol = db.createNode('user:carol')
+  state.nodes.forEach((node, index) => {
+    const angle = (index / state.nodes.length) * Math.PI * 2 - Math.PI / 2
+    const x = centerX + radius * Math.cos(angle)
+    const y = centerY + radius * Math.sin(angle)
+    positions.set(node.id, { x, y })
+  })
 
-  const knows = db.getOrCreateEtype('knows')
-  db.addEdge(alice, knows, bob)
-  db.addEdge(bob, knows, carol)
-  db.commit()
+  state.positions = positions
 
-  const config = pathConfig(alice, carol)
-  config.allowedEdgeTypes = [knows]
-  const dijkstra = db.dijkstra(config)
+  const activeEdges = new Set<string>()
+  if (state.selectedNodeId !== null) {
+    state.edges.forEach((edge) => {
+      if (edge.src === state.selectedNodeId || edge.dst === state.selectedNodeId) {
+        activeEdges.add(`${edge.src}:${edge.dst}`)
+      }
+    })
+  }
 
-  log(`Dijkstra found: ${dijkstra.found}`)
-  log(`Path: ${dijkstra.path.join(' -> ')}`)
+  const edgeMarkup = state.edges
+    .map((edge) => {
+      const srcPos = positions.get(edge.src)
+      const dstPos = positions.get(edge.dst)
+      if (!srcPos || !dstPos) return ''
+      const active = activeEdges.has(`${edge.src}:${edge.dst}`) ? 'active' : ''
+      return `<line class="edge-line ${active}" x1="${srcPos.x}" y1="${srcPos.y}" x2="${dstPos.x}" y2="${dstPos.y}" marker-end="url(#arrow)" />`
+    })
+    .join('')
 
-  const reachable = db.reachableNodes(alice, 2, knows)
-  log(`Reachable within 2 hops: ${reachable.join(', ')}`)
+  const neighborIds = new Set<number>()
+  if (state.selectedNodeId !== null) {
+    state.edges.forEach((edge) => {
+      if (edge.src === state.selectedNodeId) neighborIds.add(edge.dst)
+      if (edge.dst === state.selectedNodeId) neighborIds.add(edge.src)
+    })
+  }
 
-  const singleHop = db.traverseSingle([alice], JsTraversalDirection.Out, knows)
-  log(`Single-hop count: ${singleHop.length}`)
+  const nodeMarkup = state.nodes
+    .map((node) => {
+      const pos = positions.get(node.id)
+      if (!pos) return ''
+      const isSelected = node.id === state.selectedNodeId
+      const isNeighbor = neighborIds.has(node.id)
+      const classes = [
+        'node-circle',
+        isSelected ? 'selected' : '',
+        !isSelected && isNeighbor ? 'neighbor' : '',
+      ]
+        .filter(Boolean)
+        .join(' ')
+      return `
+      <g data-node-id="${node.id}">
+        <circle class="${classes}" cx="${pos.x}" cy="${pos.y}" r="22"></circle>
+        <text class="node-label" x="${pos.x}" y="${pos.y + 4}" text-anchor="middle">${node.key}</text>
+      </g>
+      `
+    })
+    .join('')
 
-  db.close()
-
-  const bytes = __fs.readFileSync(DB_PATH) as Uint8Array
-  await savePersistedFile(bytes)
-  log('Persisted DB to IndexedDB')
-  log('Done.')
+  graphEl.innerHTML = `
+    <defs>
+      <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="rgba(15, 23, 42, 0.6)"></path>
+      </marker>
+    </defs>
+    ${edgeMarkup}
+    ${nodeMarkup}
+  `
 }
 
-runButton?.addEventListener('click', () => {
-  void runDemo().catch((err) => log(err?.stack ?? String(err)))
+const renderConnections = () => {
+  if (!connectionsOutEl || !connectionsInEl || !selectedNodeEl) return
+  if (state.selectedNodeId === null) {
+    selectedNodeEl.textContent = 'None'
+    connectionsOutEl.innerHTML = ''
+    connectionsInEl.innerHTML = ''
+    return
+  }
+
+  const selectedKey = getNodeKey(state.selectedNodeId)
+  selectedNodeEl.textContent = `${selectedKey} (#${state.selectedNodeId})`
+
+  const out = state.edges.filter((edge) => edge.src === state.selectedNodeId)
+  const inc = state.edges.filter((edge) => edge.dst === state.selectedNodeId)
+
+  connectionsOutEl.innerHTML = out.length
+    ? out.map((edge) => `<li>${getNodeKey(edge.dst)} (#${edge.dst})</li>`).join('')
+    : '<li>None</li>'
+
+  connectionsInEl.innerHTML = inc.length
+    ? inc.map((edge) => `<li>${getNodeKey(edge.src)} (#${edge.src})</li>`).join('')
+    : '<li>None</li>'
+}
+
+const updateView = () => {
+  refreshState()
+  renderGraph()
+  renderConnections()
+}
+
+const addRandomNode = () => {
+  if (!state.db) return
+  const stamp = Date.now().toString(36)
+  const key = `node-${state.nextSeed}-${stamp}`
+  state.nextSeed += 1
+  const db = state.db
+  db.begin()
+  try {
+    db.createNode(key)
+    db.commit()
+    log(`Added node ${key}.`)
+  } catch (err) {
+    db.rollback()
+    throw err
+  }
+  updateView()
+}
+
+const addRandomEdge = () => {
+  if (!state.db) return
+  if (state.nodes.length < 2) {
+    log('Add at least two nodes first.')
+    return
+  }
+
+  const db = state.db
+  const etype = db.getOrCreateEtype(EDGE_TYPE)
+
+  const pickNodeId = () => state.nodes[Math.floor(Math.random() * state.nodes.length)].id
+
+  let src = state.selectedNodeId ?? pickNodeId()
+  let dst = pickNodeId()
+  let attempts = 0
+  while (dst === src && attempts < 5) {
+    dst = pickNodeId()
+    attempts += 1
+  }
+
+  db.begin()
+  try {
+    db.addEdge(src, etype, dst)
+    db.commit()
+    log(`Added edge ${getNodeKey(src)} -> ${getNodeKey(dst)}.`)
+  } catch (err) {
+    db.rollback()
+    throw err
+  }
+  updateView()
+}
+
+const bindEvents = () => {
+  addNodeBtn?.addEventListener('click', () => addRandomNode())
+  addEdgeBtn?.addEventListener('click', () => addRandomEdge())
+
+  graphEl?.addEventListener('click', (event) => {
+    const target = event.target as HTMLElement | null
+    const group = target?.closest('g[data-node-id]') as SVGGElement | null
+    if (!group) return
+    const id = Number(group.dataset.nodeId)
+    if (Number.isNaN(id)) return
+    state.selectedNodeId = id
+    renderGraph()
+    renderConnections()
+  })
+}
+
+const init = async () => {
+  setStatus('loading')
+  log('Loading WASM...')
+
+  const ray = (await import('../../../core.wasi-browser.js')) as any
+  state.ray = ray
+  state.db = ray.Database.open(DB_PATH)
+  state.db.begin()
+  try {
+    state.db.getOrCreateEtype(EDGE_TYPE)
+    state.db.commit()
+  } catch (err) {
+    state.db.rollback()
+    throw err
+  }
+
+  setStatus('ready')
+  log('Database ready.')
+  updateView()
+}
+
+bindEvents()
+void init().catch((err) => {
+  log(err?.stack ?? String(err))
+  setStatus('error')
 })
