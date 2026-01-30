@@ -28,8 +28,14 @@
       "x86_64-pc-windows-msvc",
       "x86_64-apple-darwin",
       "x86_64-unknown-linux-gnu",
-      "aarch64-apple-darwin"
-    ]
+      "aarch64-apple-darwin",
+      "wasm32-wasip1-threads"
+    ],
+    "wasm": {
+      "browser": {
+        "fs": true
+      }
+    }
   },
   "engines": {
     "node": ">= 12.22.0 < 13 || >= 14.17.0 < 15 || >= 15.12.0 < 16 || >= 16.0.0"
@@ -43,6 +49,8 @@
     "bench": "node --import @oxc-node/core/register benchmark/bench.ts",
     "build": "napi build --platform --release",
     "build:debug": "napi build --platform",
+    "build:wasm": "napi build --target wasm32-wasip1-threads --release && node scripts/rename-wasm.mjs",
+    "build:wasm:debug": "napi build --target wasm32-wasip1-threads && node scripts/rename-wasm.mjs",
     "format": "run-p format:prettier format:rs format:toml",
     "format:prettier": "prettier . -w",
     "format:toml": "taplo format",
@@ -50,9 +58,13 @@
     "lint": "oxlint .",
     "prepublishOnly": "napi prepublish -t npm",
     "test": "ava",
+    "test:wasm": "node scripts/wasm-smoke.mjs",
     "preversion": "napi build --platform && git add .",
     "version": "napi version",
     "prepare": "husky"
+  },
+  "dependencies": {
+    "@napi-rs/wasm-runtime": "^1.1.1"
   },
   "devDependencies": {
     "@emnapi/core": "^1.5.0",
