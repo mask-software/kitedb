@@ -61,10 +61,10 @@
   "scripts": {
     "artifacts": "napi artifacts",
     "bench": "node --import @oxc-node/core/register benchmark/bench.ts",
-    "build": "napi build --platform --release && yarn build:ts",
+    "build": "napi build --platform --release && bun run build:ts",
     "build:native": "napi build --platform --release",
     "build:ts": "tsc -p ts/tsconfig.json",
-    "build:debug": "napi build --platform && yarn build:ts",
+    "build:debug": "napi build --platform && bun run build:ts",
     "build:wasm": "napi build --target wasm32-wasip1-threads --release && node scripts/rename-wasm.mjs",
     "build:wasm:debug": "napi build --target wasm32-wasip1-threads && node scripts/rename-wasm.mjs",
     "format": "run-p format:prettier format:rs format:toml",
@@ -75,7 +75,7 @@
     "prepublishOnly": "napi prepublish -t npm",
     "test": "ava",
     "test:wasm": "node scripts/wasm-smoke.mjs",
-    "preversion": "napi build --platform && yarn build:ts && git add .",
+    "preversion": "napi build --platform && bun run build:ts && git add .",
     "version": "napi version",
     "prepare": "husky"
   },
@@ -132,7 +132,7 @@
     "singleQuote": true,
     "arrowParens": "always"
   },
-  "packageManager": "yarn@4.12.0",
+  "packageManager": "bun@1.2.4",
   "optionalDependencies": {
     "@ray-db/core-darwin-arm64": "0.1.7",
     "@ray-db/core-darwin-x64": "0.1.7",
