@@ -2,7 +2,6 @@ import { Link } from '@tanstack/solid-router'
 import { createSignal } from 'solid-js'
 import { Menu, X } from 'lucide-solid'
 import Logo from './logo'
-import ThemeToggle from './theme-toggle'
 
 export default function Header() {
   const [isOpen, setIsOpen] = createSignal(false)
@@ -29,7 +28,6 @@ export default function Header() {
         </div>
 
         <div class="flex items-center gap-2">
-          <ThemeToggle />
           <a
             href="https://github.com/maskdotdev/ray"
             target="_blank"

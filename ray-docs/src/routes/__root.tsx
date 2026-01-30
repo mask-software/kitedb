@@ -6,7 +6,8 @@ import {
 } from "@tanstack/solid-router";
 import { TanStackRouterDevtools } from "@tanstack/solid-router-devtools";
 import { HydrationScript } from "solid-js/web";
-import { Suspense } from "solid-js";
+import { Suspense, onMount } from "solid-js";
+import { initLanguageFromStorage } from "~/lib/language-store";
 
 // Import styles as URL to ensure explicit stylesheet link
 import stylesHref from "../styles.css?url";
@@ -62,6 +63,11 @@ export const Route = createRootRouteWithContext()({
 });
 
 function RootComponent() {
+  // Initialize language preference from localStorage after hydration
+  onMount(() => {
+    initLanguageFromStorage()
+  })
+
   return (
     <html lang="en" class="dark">
       <head>
