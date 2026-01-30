@@ -1,7 +1,7 @@
 import { createFileRoute, useLocation } from '@tanstack/solid-router'
 import { Show } from 'solid-js'
 import DocPage from '~/components/doc-page'
-import CodeBlock from '~/components/code-block'
+import { MultiLangCode } from '~/components/multi-lang-code'
 import { findDocBySlug } from '~/lib/docs'
 
 export const Route = createFileRoute('/docs/getting-started/$')({
@@ -61,98 +61,166 @@ function DocPageContent(props: { slug: string }) {
 
         <h2 id="create-schema">1. Define Your Schema</h2>
         <p>
-          RayDB uses a type-safe schema to define nodes and edges. Let's create a simple 
+          RayDB uses a schema to define nodes and edges. Let's create a simple 
           social network with users and follow relationships.
         </p>
-        <CodeBlock
-          code={`import { ray, defineNode, defineEdge, prop } from '@ray-db/ray';
+        <MultiLangCode
+          typescript={`import { ray } from '@ray-db/core';
 
-// Define a user node
-const user = defineNode('user', {
-  key: (id: string) => \`user:\${id}\`,
-  props: {
-    name: prop.string('name'),
-    email: prop.string('email'),
-    createdAt: prop.date('created_at'),
-  },
-});
-
-// Define a follow relationship
-const follows = defineEdge('follows', {
-  from: user,
-  to: user,
-  props: {
-    followedAt: prop.date('followed_at'),
-  },
+// Define schema inline when opening the database
+const db = ray('./social.raydb', {
+  nodes: [
+    {
+      name: 'user',
+      props: {
+        name: { type: 'string' },
+        email: { type: 'string' },
+      },
+    },
+  ],
+  edges: [
+    {
+      name: 'follows',
+      props: {
+        followedAt: { type: 'int' },  // Unix timestamp
+      },
+    },
+  ],
 });`}
-          language="typescript"
-          filename="schema.ts"
+          rust={`use raydb::ray;
+
+// Define schema when opening the database
+let db = ray("./social.raydb", RayOptions {
+    nodes: vec![
+        NodeSpec::new("user")
+            .prop("name", PropType::String)
+            .prop("email", PropType::String),
+    ],
+    edges: vec![
+        EdgeSpec::new("follows")
+            .prop("followedAt", PropType::Int),
+    ],
+    ..Default::default()
+})?;`}
+          python={`from raydb import ray, define_node, define_edge, prop
+
+# Define schema
+user = define_node("user",
+    key=lambda id: f"user:{id}",
+    props={
+        "name": prop.string("name"),
+        "email": prop.string("email"),
+    }
+)
+
+follows = define_edge("follows", {
+    "followedAt": prop.int("followedAt"),
+})
+
+# Open database with schema
+db = ray("./social.raydb", nodes=[user], edges=[follows])`}
+          filename={{ ts: 'social.ts', rs: 'main.rs', py: 'social.py' }}
         />
 
-        <h2 id="initialize">2. Initialize the Database</h2>
-        <CodeBlock
-          code={`const db = await ray('./my-app.raydb', {
-  nodes: [user],
-  edges: [follows],
-});
+        <h2 id="add-data">2. Add Some Data</h2>
+        <MultiLangCode
+          typescript={`// Create users
+const alice = db.insert('user')
+  .values('alice', { name: 'Alice Chen', email: 'alice@example.com' })
+  .returning();
 
-console.log('Database initialized!');`}
-          language="typescript"
-        />
-
-        <h2 id="add-data">3. Add Some Data</h2>
-        <CodeBlock
-          code={`// Create users
-const alice = await db.node(user).create({
-  id: 'alice',
-  name: 'Alice Chen',
-  email: 'alice@example.com',
-  createdAt: new Date(),
-});
-
-const bob = await db.node(user).create({
-  id: 'bob',
-  name: 'Bob Smith',
-  email: 'bob@example.com',
-  createdAt: new Date(),
-});
+const bob = db.insert('user')
+  .values('bob', { name: 'Bob Smith', email: 'bob@example.com' })
+  .returning();
 
 // Create a follow relationship
-await db.edge(follows).create({
-  from: alice,
-  to: bob,
-  followedAt: new Date(),
-});`}
-          language="typescript"
+db.link(alice.id, 'follows', bob.id, { followedAt: Date.now() });`}
+          rust={`// Create users
+let alice = db.insert("user")
+    .values("alice", json!({
+        "name": "Alice Chen",
+        "email": "alice@example.com"
+    }))
+    .returning()?;
+
+let bob = db.insert("user")
+    .values("bob", json!({
+        "name": "Bob Smith",
+        "email": "bob@example.com"
+    }))
+    .returning()?;
+
+// Create a follow relationship
+db.link(alice.id, "follows", bob.id, Some(json!({
+    "followedAt": std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs()
+})))?;`}
+          python={`# Create users
+alice = (db.insert(user)
+    .values(key="alice", name="Alice Chen", email="alice@example.com")
+    .returning())
+
+bob = (db.insert(user)
+    .values(key="bob", name="Bob Smith", email="bob@example.com")
+    .returning())
+
+# Create a follow relationship
+import time
+db.link(alice, follows, bob, followedAt=int(time.time()))`}
         />
 
-        <h2 id="query">4. Query the Graph</h2>
-        <CodeBlock
-          code={`// Find all users Alice follows
-const following = await db
-  .node(user)
-  .traverse(follows)
-  .where({ from: alice })
-  .all();
+        <h2 id="query">3. Query the Graph</h2>
+        <MultiLangCode
+          typescript={`// Find all users Alice follows
+const following = db
+  .from(alice.id)
+  .out('follows')
+  .nodes();
 
-console.log('Alice follows:', following.map(u => u.name));
+console.log('Alice follows:', following.length, 'users');
 
-// Find who follows Bob
-const followers = await db
-  .node(user)
-  .traverse(follows)
-  .where({ to: bob })
-  .all();
+// Check if Alice follows Bob
+const followsBob = db.hasEdge(alice.id, 'follows', bob.id);
+console.log('Alice follows Bob:', followsBob);`}
+          rust={`// Find all users Alice follows
+let following = db
+    .from(alice.id)
+    .out(Some("follows"))
+    .nodes()?;
 
-console.log('Bob has followers:', followers.length);`}
-          language="typescript"
+println!("Alice follows: {} users", following.len());
+
+// Check if Alice follows Bob
+let follows_bob = db.has_edge(alice.id, "follows", bob.id)?;
+println!("Alice follows Bob: {}", follows_bob);`}
+          python={`# Find all users Alice follows
+following = (db
+    .from_(alice)
+    .out(follows)
+    .nodes()
+    .to_list())
+
+print(f"Alice follows: {len(following)} users")
+
+# Check if Alice follows Bob
+follows_bob = db.has_edge(alice.id, "follows", bob.id)
+print(f"Alice follows Bob: {follows_bob}")`}
         />
 
-        <h2 id="cleanup">5. Close the Database</h2>
-        <CodeBlock
-          code={`// Always close when done
-await db.close();`}
-          language="typescript"
+        <h2 id="cleanup">4. Close the Database</h2>
+        <MultiLangCode
+          typescript={`// Always close when done
+db.close();`}
+          rust={`// Close when done (or use Drop)
+db.close();`}
+          python={`# Close when done (or use context manager)
+db.close()
+
+# Better: use context manager
+with ray("./social.raydb", nodes=[user], edges=[follows]) as db:
+    # ... operations ...
+    pass  # Auto-closes on exit`}
         />
 
         <h2 id="next-steps">Next Steps</h2>

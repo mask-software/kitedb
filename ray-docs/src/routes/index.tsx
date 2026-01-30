@@ -1,5 +1,5 @@
 import { createFileRoute, Link } from "@tanstack/solid-router";
-import { For, createSignal, onMount, onCleanup } from "solid-js";
+import { createSignal, onMount, onCleanup } from "solid-js";
 import {
 	Zap,
 	Database,
@@ -20,9 +20,10 @@ import {
 	Layers,
 } from "lucide-solid";
 import Logo from "~/components/logo";
-import ThemeToggle from "~/components/theme-toggle";
-import CodeBlock from "~/components/code-block";
-import { Tabs } from "~/components/tabs";
+import { InstallTabs } from "~/components/install-tabs";
+import { LanguageSwitcher } from "~/components/language-switcher";
+import { MultiLangCode } from "~/components/multi-lang-code";
+import { MultiLangTabs } from "~/components/multi-lang-tabs";
 import { searchDialog } from "~/components/search-dialog";
 
 export const Route = createFileRoute("/")({
@@ -99,83 +100,225 @@ function HomePage() {
 		if (typingInterval) clearInterval(typingInterval);
 	});
 
-	const schemaCode = `import { ray, defineNode, defineEdge, prop } from '@ray-db/ray';
-
-// Define nodes with typed properties
-const Document = defineNode('document', {
-  key: (id: string) => \`doc:\${id}\`,
-  props: {
-    title: prop.string('title'),
-    content: prop.string('content'),
-    embedding: prop.vector('embedding', 1536),
-  },
-});
-
-const Topic = defineNode('topic', {
-  key: (name: string) => \`topic:\${name}\`,
-  props: { name: prop.string('name') },
-});
-
-// Define typed edges
-const discusses = defineEdge('discusses', {
-  relevance: prop.float('relevance'),
-});
+	// Schema code examples for each language
+	const schemaCode = {
+		typescript: `import { ray } from '@ray-db/core';
 
 // Open database with schema
-const db = await ray('./knowledge.raydb', {
-  nodes: [Document, Topic],
-  edges: [discusses],
-});`;
+const db = ray('./knowledge.raydb', {
+  nodes: [
+    {
+      name: 'document',
+      props: {
+        title: { type: 'string' },
+        content: { type: 'string' },
+        embedding: { type: 'vector' },
+      },
+    },
+    {
+      name: 'topic',
+      props: { name: { type: 'string' } },
+    },
+  ],
+  edges: [
+    {
+      name: 'discusses',
+      props: { relevance: { type: 'float' } },
+    },
+  ],
+});`,
+		rust: `use raydb::ray;
 
-	const traversalCode = `// Find all topics discussed by Alice's documents
-const topics = await db
-  .from(alice)
+// Open database with schema
+let db = ray("./knowledge.raydb", RayOptions {
+    nodes: vec![
+        NodeSpec::new("document")
+            .prop("title", PropType::String)
+            .prop("content", PropType::String)
+            .prop("embedding", PropType::Vector),
+        NodeSpec::new("topic")
+            .prop("name", PropType::String),
+    ],
+    edges: vec![
+        EdgeSpec::new("discusses")
+            .prop("relevance", PropType::Float),
+    ],
+    ..Default::default()
+})?;`,
+		python: `from raydb import ray, define_node, define_edge, prop
+
+# Define schema
+document = define_node("document",
+    key=lambda id: f"doc:{id}",
+    props={
+        "title": prop.string("title"),
+        "content": prop.string("content"),
+        "embedding": prop.vector("embedding", 1536),
+    }
+)
+
+topic = define_node("topic",
+    key=lambda name: f"topic:{name}",
+    props={"name": prop.string("name")}
+)
+
+discusses = define_edge("discusses", {"relevance": prop.float("relevance")})
+
+# Open database
+db = ray("./knowledge.raydb", nodes=[document, topic], edges=[discusses])`,
+	};
+
+	const traversalCode = {
+		typescript: `// Find all topics discussed by Alice's documents
+const topics = db
+  .from(alice.id)
   .out('wrote')           // Alice -> Document
   .out('discusses')       // Document -> Topic
-  .unique()
-  .toArray();
+  .nodes();
 
-// Multi-hop with filtering
-const results = await db
-  .from(startNode)
-  .out('knows', { where: { since: { gt: 2020n } } })
+// Multi-hop traversal
+const results = db
+  .from(startNode.id)
+  .out('knows')
   .out('worksAt')
-  .filter(company => company.props.employees > 100)
-  .limit(10)
-  .toArray();`;
+  .take(10)
+  .nodes();`,
+		rust: `// Find all topics discussed by Alice's documents
+let topics = db
+    .from(alice.id)
+    .out(Some("wrote"))      // Alice -> Document
+    .out(Some("discusses"))  // Document -> Topic
+    .nodes()?;
 
-	const vectorCode = `// Find similar documents
-const similar = await db.similar(Document, queryEmbedding, {
+// Multi-hop traversal
+let results = db
+    .from(start_node.id)
+    .out(Some("knows"))
+    .out(Some("worksAt"))
+    .take(10)
+    .nodes()?;`,
+		python: `# Find all topics discussed by Alice's documents
+topics = (db
+    .from_(alice)
+    .out(wrote)           # Alice -> Document
+    .out(discusses)       # Document -> Topic
+    .nodes()
+    .to_list())
+
+# Multi-hop traversal
+results = (db
+    .from_(start_node)
+    .out(knows)
+    .out(works_at)
+    .take(10)
+    .nodes()
+    .to_list())`,
+	};
+
+	const vectorCode = {
+		typescript: `// Create vector index
+const index = createVectorIndex({
+  dimensions: 1536,
+  metric: 'Cosine',
+});
+
+// Add vectors for nodes
+index.set(doc.id, embedding);
+
+// Find similar documents
+const similar = index.search(queryEmbedding, {
   k: 10,
   threshold: 0.8,
 });
 
-// Combine with graph context
-const contextual = await Promise.all(
-  similar.map(async (doc) => ({
-    document: doc,
-    topics: await db.from(doc).out('discusses').toArray(),
-    related: await db.from(doc).out('relatedTo').limit(5).toArray(),
-  }))
-);`;
+// Results include nodeId, distance, similarity
+similar.forEach(hit => {
+  console.log(\`Node \${hit.nodeId}: \${hit.similarity}\`);
+});`,
+		rust: `// Create vector index
+let mut index = VectorIndex::new(VectorIndexOptions {
+    dimensions: 1536,
+    metric: DistanceMetric::Cosine,
+    ..Default::default()
+})?;
 
-	const crudCode = `// Insert with returning
-const doc = await db.insert(Document)
-  .values({
-    key: 'doc-1',
+// Add vectors for nodes
+index.set(doc.id, &embedding)?;
+
+// Find similar documents
+let similar = index.search(&query_embedding, SimilarOptions {
+    k: 10,
+    threshold: Some(0.8),
+    ..Default::default()
+})?;
+
+// Results include node_id, distance, similarity
+for hit in similar {
+    println!("Node {}: {}", hit.node_id, hit.similarity);
+}`,
+		python: `# Create vector index
+index = create_vector_index(
+    dimensions=1536,
+    metric="Cosine",
+)
+
+# Add vectors for nodes
+index.set(doc.id, embedding)
+
+# Find similar documents
+similar = index.search(query_embedding, k=10, threshold=0.8)
+
+# Results include node_id, distance, similarity
+for hit in similar:
+    print(f"Node {hit.node_id}: {hit.similarity}")`,
+	};
+
+	const crudCode = {
+		typescript: `// Insert with returning
+const doc = db.insert('document')
+  .values('doc-1', {
     title: 'Getting Started',
     content: 'Welcome to RayDB...',
-    embedding: await embed('Welcome to RayDB...'),
   })
   .returning();
 
 // Create relationships
-await db.link(doc, discusses, topic, { relevance: 0.95 });
+db.link(doc.id, 'discusses', topic.id, { relevance: 0.95 });
 
 // Update properties
-await db.update(Document)
-  .set({ title: 'Updated Title' })
-  .where({ key: 'doc-1' });`;
+db.updateById(doc.id)
+  .set('title', 'Updated Title')
+  .execute();`,
+		rust: `// Insert with returning
+let doc = db.insert("document")
+    .values("doc-1", json!({
+        "title": "Getting Started",
+        "content": "Welcome to RayDB...",
+    }))
+    .returning()?;
+
+// Create relationships
+db.link(doc.id, "discusses", topic.id, Some(json!({
+    "relevance": 0.95
+})))?;
+
+// Update properties
+db.update_by_id(doc.id)
+    .set("title", "Updated Title")
+    .execute()?;`,
+		python: `# Insert with returning
+doc = (db.insert(document)
+    .values(key="doc-1", title="Getting Started", content="Welcome to RayDB...")
+    .returning())
+
+# Create relationships
+db.link(doc, discusses, topic, relevance=0.95)
+
+# Update properties
+(db.update_by_id(doc.id)
+    .set("title", "Updated Title")
+    .execute())`,
+	};
 
 	return (
 		<div class="min-h-screen bg-[#030712] circuit-pattern">
@@ -252,7 +395,7 @@ await db.update(Document)
 									<span class="text-xs">⌘</span>K
 								</kbd>
 							</button>
-							<ThemeToggle />
+							<LanguageSwitcher />
 							<a
 								href="https://github.com/maskdotdev/ray"
 								target="_blank"
@@ -346,24 +489,7 @@ await db.update(Document)
 								</div>
 
 								{/* Command line install */}
-								<div class="bg-[#0a1628] rounded-lg p-4 border border-[#1a2a42]">
-									<div class="flex items-center gap-3 flex-wrap">
-										<span class="text-[#00d4ff]">$</span>
-										<span class="text-[#febc2e]">bun</span>
-										<span class="text-white">add</span>
-										<span class="text-[#28c840]">@ray-db/ray</span>
-										<button
-											type="button"
-											class="ml-auto px-3 py-1 text-xs rounded bg-[#1a2a42] text-slate-400 hover:text-[#00d4ff] hover:bg-[#1a2a42]/80 transition-colors"
-											aria-label="Copy install command"
-											onClick={() =>
-												navigator.clipboard.writeText("bun add @ray-db/ray")
-											}
-										>
-											copy
-										</button>
-									</div>
-								</div>
+								<InstallTabs />
 
 								{/* CTA buttons */}
 								<div class="flex flex-col sm:flex-row items-center justify-center gap-4 pt-4">
@@ -603,10 +729,11 @@ await db.update(Document)
 								</ul>
 							</div>
 							<div class="lg:col-span-7">
-								<CodeBlock
-									code={schemaCode}
-									language="typescript"
-									filename="schema.ts"
+								<MultiLangCode
+									typescript={schemaCode.typescript}
+									rust={schemaCode.rust}
+									python={schemaCode.python}
+									filename={{ ts: "schema.ts", rs: "schema.rs", py: "schema.py" }}
 								/>
 							</div>
 						</div>
@@ -638,19 +765,17 @@ await db.update(Document)
 								</div>
 							</div>
 							<div class="lg:col-span-7 order-1 lg:order-2">
-								<Tabs
+								<MultiLangTabs
 									items={[
 										{
 											label: "Traversal",
 											code: traversalCode,
-											language: "typescript",
 										},
 										{
 											label: "Vector Search",
 											code: vectorCode,
-											language: "typescript",
 										},
-										{ label: "CRUD", code: crudCode, language: "typescript" },
+										{ label: "CRUD", code: crudCode },
 									]}
 								/>
 							</div>

@@ -1,6 +1,7 @@
 import { createFileRoute } from '@tanstack/solid-router'
 import DocPage from '~/components/doc-page'
-import CodeBlock from '~/components/code-block'
+import { MultiLangCode } from '~/components/multi-lang-code'
+import { InstallTabs } from '~/components/install-tabs'
 
 export const Route = createFileRoute('/docs/getting-started/installation')({
   component: InstallationPage,
@@ -10,29 +11,12 @@ function InstallationPage() {
   return (
     <DocPage slug="getting-started/installation">
       <p>
-        RayDB is available for JavaScript/TypeScript, Rust, and Python.
+        RayDB is available for JavaScript/TypeScript (via NAPI), Rust, and Python.
+        Choose your preferred language below.
       </p>
 
-      <h2 id="javascript">JavaScript / TypeScript</h2>
-      <CodeBlock
-        code={`bun add @ray-db/ray
-npm install @ray-db/ray
-pnpm add @ray-db/ray
-yarn add @ray-db/ray`}
-        language="bash"
-        inline
-      />
-
-      <h2 id="rust">Rust</h2>
-      <CodeBlock code="cargo add raydb" language="bash" inline />
-
-      <h2 id="python">Python</h2>
-      <CodeBlock
-        code={`pip install raydb
-uv add raydb`}
-        language="bash"
-        inline
-      />
+      <h2 id="install">Install</h2>
+      <InstallTabs />
 
       <h2 id="requirements">Requirements</h2>
       <ul>
@@ -42,33 +26,61 @@ uv add raydb`}
       </ul>
 
       <h2 id="verify">Verify Installation</h2>
-      <p>Create a simple test file:</p>
-      <CodeBlock
-        code={`import { ray, defineNode, prop } from '@ray-db/ray';
+      <p>Create a simple test file to verify the installation works:</p>
+      <MultiLangCode
+        typescript={`import { ray } from '@ray-db/core';
 
-const user = defineNode('user', {
-  key: (id: string) => \`user:\${id}\`,
-  props: {
-    name: prop.string('name'),
-  },
-});
-
-const db = await ray('./test.raydb', {
-  nodes: [user],
+// Open database with a simple schema
+const db = ray('./test.raydb', {
+  nodes: [
+    {
+      name: 'user',
+      props: { name: { type: 'string' } },
+    },
+  ],
   edges: [],
 });
 
 console.log('RayDB is working!');
-await db.close();`}
-        language="typescript"
-        filename="test.ts"
+db.close();`}
+        rust={`use raydb::ray;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Open database with a simple schema
+    let db = ray("./test.raydb", RayOptions {
+        nodes: vec![
+            NodeSpec::new("user")
+                .prop("name", PropType::String),
+        ],
+        edges: vec![],
+        ..Default::default()
+    })?;
+
+    println!("RayDB is working!");
+    db.close();
+    Ok(())
+}`}
+        python={`from raydb import ray, define_node, prop
+
+# Define a simple schema
+user = define_node("user",
+    key=lambda id: f"user:{id}",
+    props={"name": prop.string("name")}
+)
+
+# Open database
+with ray("./test.raydb", nodes=[user], edges=[]) as db:
+    print("RayDB is working!")`}
+        filename={{ ts: 'test.ts', rs: 'main.rs', py: 'test.py' }}
       />
 
       <p>Run it:</p>
-      <CodeBlock
-        code={`bun run test.ts
+      <MultiLangCode
+        typescript={`bun run test.ts
+# or
 npx tsx test.ts`}
-        language="bash"
+        rust={`cargo run`}
+        python={`python test.py`}
         inline
       />
 

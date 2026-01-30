@@ -3,7 +3,7 @@ import { createFileRoute, Outlet, Link, useLocation } from '@tanstack/solid-rout
 import { createSignal, For, Show } from 'solid-js'
 import { ChevronDown, ChevronRight, Menu, X, Search, Terminal, Zap } from 'lucide-solid'
 import Logo from '~/components/logo'
-import ThemeToggle from '~/components/theme-toggle'
+import { LanguageSwitcher } from '~/components/language-switcher'
 import { docsStructure } from '~/lib/docs'
 import { cn } from '~/lib/utils'
 import { searchDialog } from '~/components/search-dialog'
@@ -200,7 +200,8 @@ function DocsLayout() {
           </div>
 
           <div class="flex items-center gap-2">
-            <ThemeToggle />
+            <LanguageSwitcher />
+
             <a
               href="https://github.com/maskdotdev/ray"
               target="_blank"
