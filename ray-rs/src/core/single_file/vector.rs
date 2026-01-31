@@ -3,7 +3,9 @@
 //! Handles vector embedding storage and retrieval for nodes.
 
 use crate::core::snapshot::reader::SnapshotData;
-use crate::core::wal::record::{build_del_node_vector_payload, build_set_node_vector_payload, WalRecord};
+use crate::core::wal::record::{
+  build_del_node_vector_payload, build_set_node_vector_payload, WalRecord,
+};
 use crate::error::{RayError, Result};
 use crate::types::*;
 use crate::vector::store::{

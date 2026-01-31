@@ -43,7 +43,11 @@ fn test_single_file_stress_checkpoint_reopen() {
       for _ in 0..25 {
         let key = format!("n{next_id}");
         let node_id = db.create_node(Some(&key)).unwrap();
-        let _ = db.set_node_prop_by_name(node_id, "name", crate::types::PropValue::String(key.clone()));
+        let _ = db.set_node_prop_by_name(
+          node_id,
+          "name",
+          crate::types::PropValue::String(key.clone()),
+        );
         expected_keys.insert(key);
         next_id += 1;
       }
@@ -52,7 +56,8 @@ fn test_single_file_stress_checkpoint_reopen() {
       for i in 0..10 {
         let src_key = format!("n{}", next_id.saturating_sub(1 + i));
         let dst_key = format!("n{}", next_id.saturating_sub(1 + ((i + 1) % 10)));
-        if let (Some(src), Some(dst)) = (db.get_node_by_key(&src_key), db.get_node_by_key(&dst_key)) {
+        if let (Some(src), Some(dst)) = (db.get_node_by_key(&src_key), db.get_node_by_key(&dst_key))
+        {
           let _ = db.add_edge_by_name(src, "FOLLOWS", dst);
         }
       }
@@ -92,7 +97,11 @@ fn test_single_file_soak_long_run() {
       for _ in 0..50 {
         let key = format!("n{next_id}");
         let node_id = db.create_node(Some(&key)).unwrap();
-        let _ = db.set_node_prop_by_name(node_id, "name", crate::types::PropValue::String(key.clone()));
+        let _ = db.set_node_prop_by_name(
+          node_id,
+          "name",
+          crate::types::PropValue::String(key.clone()),
+        );
         expected_keys.insert(key);
         next_id += 1;
       }

@@ -7,12 +7,12 @@ use std::sync::atomic::Ordering;
 
 use crate::core::pager::{pages_to_store, FilePager};
 use crate::core::snapshot::reader::SnapshotData;
-use crate::util::mmap::map_file;
 use crate::core::snapshot::writer::{
   build_snapshot_to_memory, EdgeData, NodeData, SnapshotBuildInput,
 };
 use crate::error::{RayError, Result};
 use crate::types::*;
+use crate::util::mmap::map_file;
 use crate::vector::store::vector_store_get;
 
 use super::vector::vector_stores_from_snapshot;
@@ -332,7 +332,10 @@ impl SingleFileDB {
 
       // Mark old snapshot pages as free (for future vacuum)
       if old_snapshot_page_count > 0 && old_snapshot_start_page != new_snapshot_start_page {
-        pager.free_pages(old_snapshot_start_page as u32, old_snapshot_page_count as u32);
+        pager.free_pages(
+          old_snapshot_start_page as u32,
+          old_snapshot_page_count as u32,
+        );
       }
     }
 
@@ -470,8 +473,7 @@ impl SingleFileDB {
         }
 
         // Collect node labels (snapshot + delta)
-        let mut node_labels: std::collections::HashSet<LabelId> =
-          std::collections::HashSet::new();
+        let mut node_labels: std::collections::HashSet<LabelId> = std::collections::HashSet::new();
 
         if let Some(snapshot_labels) = snapshot.get_node_labels(phys as u32) {
           node_labels.extend(snapshot_labels.into_iter());

@@ -118,7 +118,9 @@ pub fn check_snapshot(snapshot: &SnapshotData) -> CheckResult {
       for i in 0..num_edges {
         let dst = read_u32_at(out_dst, i);
         if dst as usize >= num_nodes {
-          errors.push(format!("out_dst[{i}] = {dst} out of range [0, {num_nodes})"));
+          errors.push(format!(
+            "out_dst[{i}] = {dst} out of range [0, {num_nodes})"
+          ));
         }
       }
     }
@@ -158,9 +160,7 @@ pub fn check_snapshot(snapshot: &SnapshotData) -> CheckResult {
 
       let node_id_idx = node_id as usize;
       if node_id_idx * 4 + 4 > nodeid_to_phys.len() {
-        errors.push(format!(
-          "nodeid_to_phys out of range for nodeId {node_id}"
-        ));
+        errors.push(format!("nodeid_to_phys out of range for nodeId {node_id}"));
         continue;
       }
       let back_phys = read_i32_at(nodeid_to_phys, node_id_idx);
@@ -357,10 +357,7 @@ pub fn check_snapshot(snapshot: &SnapshotData) -> CheckResult {
   };
 
   let num_key_entries = key_entries.len() / KEY_INDEX_ENTRY_SIZE;
-  let has_key_buckets = key_buckets
-    .as_ref()
-    .map(|b| b.len() > 4)
-    .unwrap_or(false);
+  let has_key_buckets = key_buckets.as_ref().map(|b| b.len() > 4).unwrap_or(false);
   let num_buckets = if has_key_buckets {
     key_buckets
       .as_ref()
@@ -405,9 +402,7 @@ pub fn check_snapshot(snapshot: &SnapshotData) -> CheckResult {
       let curr_string_id = read_u32(key_entries.as_ref(), curr_offset + 8);
 
       if prev_string_id > curr_string_id {
-        errors.push(format!(
-          "Key index not sorted by stringId at index {i}"
-        ));
+        errors.push(format!("Key index not sorted by stringId at index {i}"));
         break;
       }
 

@@ -145,9 +145,7 @@ pub fn trigger_background_checkpoint(db: &mut GraphDB) -> Result<()> {
 /// This is the safe async entrypoint for multi-file databases when the caller
 /// holds the DB behind `Arc<Mutex<_>>`.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn trigger_background_checkpoint_async(
-  db: Arc<parking_lot::Mutex<GraphDB>>,
-) -> Result<()> {
+pub fn trigger_background_checkpoint_async(db: Arc<parking_lot::Mutex<GraphDB>>) -> Result<()> {
   let db_guard = db.lock();
   {
     let mut status = db_guard.checkpoint_status.lock();
@@ -170,9 +168,7 @@ pub fn trigger_background_checkpoint_async(
 }
 
 #[cfg(target_arch = "wasm32")]
-pub fn trigger_background_checkpoint_async(
-  db: Arc<parking_lot::Mutex<GraphDB>>,
-) -> Result<()> {
+pub fn trigger_background_checkpoint_async(db: Arc<parking_lot::Mutex<GraphDB>>) -> Result<()> {
   let mut db = db.lock();
   checkpoint_impl(&mut db, false).map(|_| ())
 }

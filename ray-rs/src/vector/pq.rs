@@ -179,11 +179,7 @@ impl PqIndex {
 
     let mut codes = vec![0u8; self.config.num_subspaces];
 
-    for (m, code) in codes
-      .iter_mut()
-      .enumerate()
-      .take(self.config.num_subspaces)
-    {
+    for (m, code) in codes.iter_mut().enumerate().take(self.config.num_subspaces) {
       let sub_offset = m * self.subspace_dims;
       let subvec = &vector[sub_offset..sub_offset + self.subspace_dims];
 

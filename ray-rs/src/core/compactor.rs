@@ -168,8 +168,7 @@ pub fn collect_graph_data(
       }
 
       // Apply delta modifications
-      let mut node_labels: std::collections::HashSet<LabelId> =
-        std::collections::HashSet::new();
+      let mut node_labels: std::collections::HashSet<LabelId> = std::collections::HashSet::new();
 
       if let Some(snapshot_labels) = snap.get_node_labels(phys as PhysNode) {
         node_labels.extend(snapshot_labels.into_iter());

@@ -250,7 +250,11 @@ pub fn export_to_object_graph(db: &GraphDB, options: ExportOptions) -> Result<Ex
         }
       }
 
-      nodes.push(ExportedNode { id: node_id, key, props });
+      nodes.push(ExportedNode {
+        id: node_id,
+        key,
+        props,
+      });
     }
   }
 
@@ -319,7 +323,11 @@ pub fn export_to_object_single(
           props.insert(name, serialize_prop_value(&value));
         }
       }
-      nodes.push(ExportedNode { id: node_id, key, props });
+      nodes.push(ExportedNode {
+        id: node_id,
+        key,
+        props,
+      });
     }
   }
 

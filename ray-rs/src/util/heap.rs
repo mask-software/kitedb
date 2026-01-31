@@ -235,7 +235,10 @@ impl<T> Eq for ScoredItem<T> {}
 
 impl<T> Ord for ScoredItem<T> {
   fn cmp(&self, other: &Self) -> Ordering {
-    self.score.partial_cmp(&other.score).unwrap_or(Ordering::Equal)
+    self
+      .score
+      .partial_cmp(&other.score)
+      .unwrap_or(Ordering::Equal)
   }
 }
 

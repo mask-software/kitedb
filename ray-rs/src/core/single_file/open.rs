@@ -12,10 +12,10 @@ use crate::cache::manager::CacheManager;
 use crate::constants::*;
 use crate::core::pager::{create_pager, is_valid_page_size, open_pager, pages_to_store};
 use crate::core::snapshot::reader::SnapshotData;
-use crate::util::mmap::map_file;
 use crate::core::wal::buffer::WalBuffer;
 use crate::error::{RayError, Result};
 use crate::types::*;
+use crate::util::mmap::map_file;
 use crate::vector::store::{create_vector_store, vector_store_delete, vector_store_insert};
 use crate::vector::types::VectorStoreConfig;
 
@@ -463,7 +463,9 @@ mod tests {
   #[test]
   fn test_recover_checkpoint_with_partial_header_update() {
     let temp_dir = tempdir().unwrap();
-    let db_path = temp_dir.path().join("checkpoint-recover-partial-header.raydb");
+    let db_path = temp_dir
+      .path()
+      .join("checkpoint-recover-partial-header.raydb");
 
     let db = open_single_file(&db_path, SingleFileOpenOptions::new()).unwrap();
 

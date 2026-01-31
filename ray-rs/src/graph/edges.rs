@@ -428,7 +428,9 @@ pub fn get_neighbors_out(handle: &TxHandle, src: NodeId, etype: Option<ETypeId>)
 
   if let Some(mvcc) = handle.db.mvcc.as_ref() {
     let mut tx_mgr = mvcc.tx_manager.lock();
-    let etype_key = etype.map(|e| e.to_string()).unwrap_or_else(|| "*".to_string());
+    let etype_key = etype
+      .map(|e| e.to_string())
+      .unwrap_or_else(|| "*".to_string());
     tx_mgr.record_read(handle.tx.txid, format!("neighbors_out:{src}:{etype_key}"));
   }
 
@@ -462,7 +464,9 @@ pub fn get_neighbors_in(handle: &TxHandle, dst: NodeId, etype: Option<ETypeId>) 
 
   if let Some(mvcc) = handle.db.mvcc.as_ref() {
     let mut tx_mgr = mvcc.tx_manager.lock();
-    let etype_key = etype.map(|e| e.to_string()).unwrap_or_else(|| "*".to_string());
+    let etype_key = etype
+      .map(|e| e.to_string())
+      .unwrap_or_else(|| "*".to_string());
     tx_mgr.record_read(handle.tx.txid, format!("neighbors_in:{dst}:{etype_key}"));
   }
 
@@ -495,7 +499,10 @@ pub fn set_edge_prop(
 
   if let Some(mvcc) = handle.db.mvcc.as_ref() {
     let mut tx_mgr = mvcc.tx_manager.lock();
-    tx_mgr.record_write(handle.tx.txid, format!("edgeprop:{src}:{etype}:{dst}:{key_id}"));
+    tx_mgr.record_write(
+      handle.tx.txid,
+      format!("edgeprop:{src}:{etype}:{dst}:{key_id}"),
+    );
   }
 
   Ok(())
@@ -522,7 +529,10 @@ pub fn del_edge_prop(
 
   if let Some(mvcc) = handle.db.mvcc.as_ref() {
     let mut tx_mgr = mvcc.tx_manager.lock();
-    tx_mgr.record_write(handle.tx.txid, format!("edgeprop:{src}:{etype}:{dst}:{key_id}"));
+    tx_mgr.record_write(
+      handle.tx.txid,
+      format!("edgeprop:{src}:{etype}:{dst}:{key_id}"),
+    );
   }
 
   Ok(())

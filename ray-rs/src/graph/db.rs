@@ -21,7 +21,6 @@ use parking_lot::{Mutex, RwLock};
 use crate::constants::*;
 use crate::core::manifest::{create_empty_manifest, read_manifest, write_manifest};
 use crate::core::snapshot::reader::SnapshotData;
-use crate::util::mmap::map_file;
 use crate::core::wal::reader::{load_wal_segment_by_id, recover_from_segment};
 use crate::core::wal::record::WalRecord;
 use crate::core::wal::writer::WalWriter;
@@ -30,6 +29,7 @@ use crate::graph::checkpoint::CheckpointStatus;
 use crate::mvcc::{GcConfig, MvccManager};
 use crate::types::*;
 use crate::util::lock::{FileLock, LockType};
+use crate::util::mmap::map_file;
 use crate::vector::store::{create_vector_store, vector_store_delete, vector_store_insert};
 use crate::vector::types::{VectorManifest, VectorStoreConfig};
 
@@ -794,7 +794,6 @@ pub fn open_graph_db<P: AsRef<Path>>(path: P, options: OpenOptions) -> Result<Gr
           _ => {}
         }
       }
-
     }
   }
 

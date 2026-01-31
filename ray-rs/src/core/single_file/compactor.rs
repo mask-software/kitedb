@@ -114,7 +114,10 @@ impl SingleFileDB {
       pager.sync()?;
 
       if old_snapshot_page_count > 0 && old_snapshot_start_page != new_snapshot_start_page {
-        pager.free_pages(old_snapshot_start_page as u32, old_snapshot_page_count as u32);
+        pager.free_pages(
+          old_snapshot_start_page as u32,
+          old_snapshot_page_count as u32,
+        );
       }
     }
 
@@ -145,8 +148,8 @@ impl SingleFileDB {
       MIN_WAL_PAGES
     };
 
-    let wal_is_empty = header.wal_head == header.wal_tail
-      || (header.wal_head == 0 && header.wal_tail == 0);
+    let wal_is_empty =
+      header.wal_head == header.wal_tail || (header.wal_head == 0 && header.wal_tail == 0);
     let can_shrink_wal =
       options.shrink_wal && wal_is_empty && header.wal_page_count > min_wal_pages;
 
@@ -170,8 +173,10 @@ impl SingleFileDB {
       if current_snapshot_start != new_snapshot_start {
         let snapshot_bytes = {
           let mut pager = self.pager.lock();
-          let slice =
-            pager.mmap_range(current_snapshot_start as u32, header.snapshot_page_count as u32)?;
+          let slice = pager.mmap_range(
+            current_snapshot_start as u32,
+            header.snapshot_page_count as u32,
+          )?;
           slice.to_vec()
         };
 

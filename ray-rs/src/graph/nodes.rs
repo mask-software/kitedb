@@ -71,10 +71,7 @@ pub fn create_node(handle: &mut TxHandle, opts: NodeOpts) -> Result<NodeId> {
     node_delta.labels = Some(set);
   }
 
-  handle
-    .tx
-    .pending_created_nodes
-    .insert(node_id, node_delta);
+  handle.tx.pending_created_nodes.insert(node_id, node_delta);
 
   if let Some(key) = opts.key {
     handle.tx.pending_key_updates.insert(key, node_id);
@@ -357,7 +354,9 @@ pub fn add_node_label(handle: &mut TxHandle, node_id: NodeId, label_id: LabelId)
   }
 
   if let Some(node_delta) = handle.tx.pending_created_nodes.get_mut(&node_id) {
-    let labels = node_delta.labels.get_or_insert_with(std::collections::HashSet::new);
+    let labels = node_delta
+      .labels
+      .get_or_insert_with(std::collections::HashSet::new);
     labels.insert(label_id);
   } else {
     if let Some(removed) = handle.tx.pending_node_labels_del.get_mut(&node_id) {
@@ -509,11 +508,7 @@ pub fn set_node_prop(
     return Err(RayError::ReadOnly);
   }
 
-  let props = handle
-    .tx
-    .pending_node_props
-    .entry(node_id)
-    .or_default();
+  let props = handle.tx.pending_node_props.entry(node_id).or_default();
   props.insert(key_id, Some(value));
 
   if let Some(mvcc) = handle.db.mvcc.as_ref() {
@@ -530,11 +525,7 @@ pub fn del_node_prop(handle: &mut TxHandle, node_id: NodeId, key_id: PropKeyId) 
     return Err(RayError::ReadOnly);
   }
 
-  let props = handle
-    .tx
-    .pending_node_props
-    .entry(node_id)
-    .or_default();
+  let props = handle.tx.pending_node_props.entry(node_id).or_default();
   props.insert(key_id, None);
 
   if let Some(mvcc) = handle.db.mvcc.as_ref() {

@@ -549,7 +549,9 @@ impl VersionChainManager {
   }
 
   /// Clone a versioned record (for API compatibility)
-  fn clone_versioned_record(record: &VersionedRecord<Option<PropValue>>) -> VersionedRecord<Option<PropValue>> {
+  fn clone_versioned_record(
+    record: &VersionedRecord<Option<PropValue>>,
+  ) -> VersionedRecord<Option<PropValue>> {
     VersionedRecord {
       data: record.data.clone(),
       txid: record.txid,
