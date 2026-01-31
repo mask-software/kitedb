@@ -1,6 +1,6 @@
 {
   "name": "kitedb",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "KiteDB - High-performance embedded graph database with vector search",
   "author": "mask <mask@mask.dev>",
   "homepage": "https://github.com/maskdotdev/kite",
@@ -137,9 +137,9 @@
   },
   "packageManager": "bun@1.2.4",
   "optionalDependencies": {
-    "kitedb-win32-x64-msvc": "0.2.3",
-    "kitedb-darwin-x64": "0.2.3",
-    "kitedb-linux-x64-gnu": "0.2.3",
-    "kitedb-darwin-arm64": "0.2.3"
+    "kitedb-win32-x64-msvc": "0.2.4",
+    "kitedb-darwin-x64": "0.2.4",
+    "kitedb-linux-x64-gnu": "0.2.4",
+    "kitedb-darwin-arm64": "0.2.4"
   }
 }

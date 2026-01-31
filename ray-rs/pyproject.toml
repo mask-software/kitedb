@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "kitedb"
-version = "0.2.3"
+version = "0.2.4"
 description = "High-performance embedded graph database with vector search"
 readme = "python/README.md"
 license = { text = "MIT" }
