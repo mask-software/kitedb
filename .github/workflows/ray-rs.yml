@@ -113,14 +113,14 @@ jobs:
         run: |
           echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" >> ~/.npmrc
           npm config set provenance true
-          if git log -1 --pretty=%B | grep "^[0-9]\+\.[0-9]\+\.[0-9]\+$";
-          then
+          COMMIT_MSG=$(git log -1 --pretty=%B)
+          # Match: ts: X.Y.Z or all: X.Y.Z
+          if echo "$COMMIT_MSG" | grep -E "^(ts|all): [0-9]+\.[0-9]+\.[0-9]+$"; then
             npm publish --access public
-          elif git log -1 --pretty=%B | grep "^[0-9]\+\.[0-9]\+\.[0-9]\+";
-          then
+          elif echo "$COMMIT_MSG" | grep -E "^(ts|all): [0-9]+\.[0-9]+\.[0-9]+"; then
             npm publish --tag next --access public
           else
-            echo "Not a release, skipping publish"
+            echo "Not a ts/all release, skipping npm publish"
           fi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -144,12 +144,17 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: |
+            3.9
+            3.10
+            3.11
+            3.12
+            3.13
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.platform.target }}
-          args: --release --out dist --find-interpreter
+          args: --release --out dist -i python3.9 -i python3.10 -i python3.11 -i python3.12 -i python3.13
           manylinux: auto
           working-directory: ray-rs
       - name: Upload wheels
@@ -173,12 +178,17 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: |
+            3.9
+            3.10
+            3.11
+            3.12
+            3.13
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist --find-interpreter
+          args: --release --out dist -i python3.9 -i python3.10 -i python3.11 -i python3.12 -i python3.13
           working-directory: ray-rs
       - name: Upload wheels
         uses: actions/upload-artifact@v4
@@ -193,12 +203,17 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: |
+            3.9
+            3.10
+            3.11
+            3.12
+            3.13
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
           target: x64
-          args: --release --out dist --find-interpreter
+          args: --release --out dist -i python3.9 -i python3.10 -i python3.11 -i python3.12 -i python3.13
           working-directory: ray-rs
       - name: Upload wheels
         uses: actions/upload-artifact@v4
@@ -247,12 +262,13 @@ jobs:
       - name: Publish to PyPI
         working-directory: ray-rs
         run: |
-          if git log -1 --pretty=%B | grep "^[0-9]\+\.[0-9]\+\.[0-9]\+";
-          then
+          COMMIT_MSG=$(git log -1 --pretty=%B)
+          # Match: py: X.Y.Z or all: X.Y.Z
+          if echo "$COMMIT_MSG" | grep -E "^(py|all): [0-9]+\.[0-9]+\.[0-9]+"; then
             pip install maturin
             maturin upload --non-interactive --skip-existing dist/*
           else
-            echo "Not a release, skipping PyPI publish"
+            echo "Not a py/all release, skipping PyPI publish"
           fi
         env:
           MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
@@ -287,11 +303,12 @@ jobs:
         working-directory: ray-rs
       - name: Publish to crates.io
         run: |
-          if git log -1 --pretty=%B | grep "^[0-9]\+\.[0-9]\+\.[0-9]\+";
-          then
+          COMMIT_MSG=$(git log -1 --pretty=%B)
+          # Match: core: X.Y.Z or all: X.Y.Z
+          if echo "$COMMIT_MSG" | grep -E "^(core|all): [0-9]+\.[0-9]+\.[0-9]+"; then
             cargo publish --no-default-features
           else
-            echo "Not a release, skipping crates.io publish"
+            echo "Not a core/all release, skipping crates.io publish"
           fi
         working-directory: ray-rs
         env:
