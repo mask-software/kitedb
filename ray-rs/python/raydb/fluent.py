@@ -4,10 +4,10 @@ Ray Database - Fluent API
 High-level, type-safe API for RayDB matching the TypeScript fluent style.
 
 Example:
-    >>> from raydb import ray, define_node, define_edge, prop, optional
+    >>> from raydb import ray, node, edge, prop, optional
     >>> 
     >>> # Define schema
-    >>> user = define_node("user",
+    >>> user = node("user",
     ...     key=lambda id: f"user:{id}",
     ...     props={
     ...         "name": prop.string("name"),
@@ -16,7 +16,7 @@ Example:
     ...     }
     ... )
     >>> 
-    >>> knows = define_edge("knows", {
+    >>> knows = edge("knows", {
     ...     "since": prop.int("since"),
     ... })
     >>> 
@@ -819,9 +819,9 @@ def ray(
         Ray database instance
     
     Example:
-        >>> from raydb import ray, define_node, define_edge, prop, optional
+        >>> from raydb import ray, node, edge, prop, optional
         >>> 
-        >>> user = define_node("user",
+        >>> user = node("user",
         ...     key=lambda id: f"user:{id}",
         ...     props={
         ...         "name": prop.string("name"),
@@ -830,7 +830,7 @@ def ray(
         ...     }
         ... )
         >>> 
-        >>> knows = define_edge("knows", {
+        >>> knows = edge("knows", {
         ...     "since": prop.int("since"),
         ... })
         >>> 

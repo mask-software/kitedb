@@ -1,13 +1,12 @@
 """
 Schema Definition API for RayDB
 
-Provides type-safe schema builders for defining graph nodes and edges,
-matching the TypeScript fluent API style.
+Provides type-safe schema builders for defining graph nodes and edges.
 
 Example:
-    >>> from raydb import define_node, define_edge, prop, optional
+    >>> from raydb import node, edge, prop, optional
     >>> 
-    >>> user = define_node("user",
+    >>> user = node("user",
     ...     key=lambda id: f"user:{id}",
     ...     props={
     ...         "name": prop.string("name"),
@@ -16,7 +15,7 @@ Example:
     ...     }
     ... )
     >>> 
-    >>> knows = define_edge("knows", {
+    >>> knows = edge("knows", {
     ...     "since": prop.int("since"),
     ... })
 """
@@ -149,7 +148,7 @@ class NodeDef(Generic[KeyArg]):
     """
     A defined node type with metadata.
     
-    Created by `define_node()` and used throughout the API.
+    Created by `node()` and used throughout the API.
     
     Attributes:
         name: The node type name (must be unique per schema)
@@ -171,7 +170,7 @@ class NodeDef(Generic[KeyArg]):
         return False
 
 
-def define_node(
+def node(
     name: str,
     *,
     key: Callable[[KeyArg], str],
@@ -193,7 +192,7 @@ def define_node(
         A NodeDef that can be used with the database API
     
     Example:
-        >>> user = define_node("user",
+        >>> user = node("user",
         ...     key=lambda id: f"user:{id}",
         ...     props={
         ...         "name": prop.string("name"),
@@ -205,6 +204,10 @@ def define_node(
     return NodeDef(name=name, key_fn=key, props=props)
 
 
+# Backwards compatibility alias
+define_node = node
+
+
 # ============================================================================
 # Edge Definition
 # ============================================================================
@@ -214,7 +217,7 @@ class EdgeDef:
     """
     A defined edge type with metadata.
     
-    Created by `define_edge()` and used throughout the API.
+    Created by `edge()` and used throughout the API.
     
     Attributes:
         name: The edge type name (must be unique per schema)
@@ -237,12 +240,12 @@ class EdgeDef:
 
 
 @overload
-def define_edge(name: str) -> EdgeDef: ...
+def edge(name: str) -> EdgeDef: ...
 
 @overload
-def define_edge(name: str, props: PropsSchema) -> EdgeDef: ...
+def edge(name: str, props: PropsSchema) -> EdgeDef: ...
 
-def define_edge(name: str, props: Optional[PropsSchema] = None) -> EdgeDef:
+def edge(name: str, props: Optional[PropsSchema] = None) -> EdgeDef:
     """
     Define an edge type with optional properties.
     
@@ -258,15 +261,19 @@ def define_edge(name: str, props: Optional[PropsSchema] = None) -> EdgeDef:
     
     Example:
         >>> # Edge with properties
-        >>> knows = define_edge("knows", {
+        >>> knows = edge("knows", {
         ...     "since": prop.int("since"),
         ...     "weight": optional(prop.float("weight")),
         ... })
         >>> 
         >>> # Edge without properties
-        >>> follows = define_edge("follows")
+        >>> follows = edge("follows")
     """
     return EdgeDef(name=name, props=props or {})
+
+
+# Backwards compatibility alias
+define_edge = edge
 
 
 # ============================================================================
@@ -308,10 +315,12 @@ __all__ = [
     "optional",
     # Node definitions  
     "NodeDef",
-    "define_node",
+    "node",
+    "define_node",  # backwards compat
     # Edge definitions
     "EdgeDef", 
-    "define_edge",
+    "edge",
+    "define_edge",  # backwards compat
     # Type helpers
     "PropsSchema",
     "NodeRef",

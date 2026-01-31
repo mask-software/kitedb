@@ -10,21 +10,21 @@
 //! # Example
 //!
 //! ```rust,no_run
-//! use raydb::api::schema::{define_edge, define_node, prop};
+//! use raydb::api::schema::{node, edge, prop};
 //!
-//! let user = define_node("user")
+//! let user = node("user")
 //!     .key(|id: &str| format!("user:{}", id))
 //!     .prop(prop::string("name"))
 //!     .prop(prop::int("age").optional())
 //!     .build();
 //!
-//! let knows = define_edge("knows")
+//! let knows = edge("knows")
 //!     .prop(prop::int("since"))
 //!     .prop(prop::float("weight").optional())
 //!     .build();
 //!
 //! // Edge without properties
-//! let follows = define_edge("follows").build();
+//! let follows = edge("follows").build();
 //! ```
 //!
 //! Ported from src/api/schema.ts
@@ -234,7 +234,7 @@ where
 
 /// A defined node type with metadata.
 ///
-/// Created by `define_node()` and used throughout the API.
+/// Created by `node()` and used throughout the API.
 /// Contains the node type name, key generator function, and property schema.
 #[derive(Clone)]
 pub struct NodeSchema {
@@ -317,8 +317,8 @@ impl NodeSchema {
 /// # Example
 ///
 /// ```rust,no_run
-/// # use raydb::api::schema::{define_node, prop};
-/// let user = define_node("user")
+/// # use raydb::api::schema::{node, prop};
+/// let user = node("user")
 ///     .key(|id| format!("user:{}", id))
 ///     .prop(prop::string("name"))
 ///     .prop(prop::int("age").optional())
@@ -348,8 +348,8 @@ impl NodeSchemaBuilder {
   /// # Example
   ///
   /// ```rust,no_run
-  /// # use raydb::api::schema::define_node;
-  /// define_node("user")
+  /// # use raydb::api::schema::node;
+  /// node("user")
   ///     .key(|id| format!("user:{}", id))
   ///     ;
   /// ```
@@ -377,8 +377,8 @@ impl NodeSchemaBuilder {
   /// # Example
   ///
   /// ```rust,no_run
-  /// # use raydb::api::schema::{define_node, prop};
-  /// define_node("user")
+  /// # use raydb::api::schema::{node, prop};
+  /// node("user")
   ///     .prop(prop::string("name"))
   ///     .prop(prop::int("age").optional())
   ///     ;
@@ -416,10 +416,10 @@ impl NodeSchemaBuilder {
 /// # Examples
 ///
 /// ```rust,no_run
-/// use raydb::api::schema::{define_node, prop};
+/// use raydb::api::schema::{node, prop};
 ///
 /// // Full definition with key function
-/// let user = define_node("user")
+/// let user = node("user")
 ///     .key(|id| format!("user:{}", id))
 ///     .prop(prop::string("name"))
 ///     .prop(prop::string("email"))
@@ -427,13 +427,19 @@ impl NodeSchemaBuilder {
 ///     .build();
 ///
 /// // Simple definition with default key function
-/// let post = define_node("post")
+/// let post = node("post")
 ///     .prop(prop::string("title"))
 ///     .prop(prop::string("content").optional())
 ///     .build();
 /// ```
-pub fn define_node(name: &str) -> NodeSchemaBuilder {
+pub fn node(name: &str) -> NodeSchemaBuilder {
   NodeSchemaBuilder::new(name)
+}
+
+/// Define a node type (deprecated alias for `node()`)
+#[deprecated(since = "0.2.0", note = "Use `node()` instead")]
+pub fn define_node(name: &str) -> NodeSchemaBuilder {
+  node(name)
 }
 
 // ============================================================================
@@ -442,7 +448,7 @@ pub fn define_node(name: &str) -> NodeSchemaBuilder {
 
 /// A defined edge type with metadata.
 ///
-/// Created by `define_edge()` and used throughout the API.
+/// Created by `edge()` and used throughout the API.
 /// Contains the edge type name and optional property schema.
 #[derive(Debug, Clone)]
 pub struct EdgeSchema {
@@ -500,14 +506,14 @@ impl EdgeSchema {
 /// # Example
 ///
 /// ```rust,no_run
-/// # use raydb::api::schema::{define_edge, prop};
-/// let knows = define_edge("knows")
+/// # use raydb::api::schema::{edge, prop};
+/// let knows = edge("knows")
 ///     .prop(prop::int("since"))
 ///     .prop(prop::float("weight").optional())
 ///     .build();
 ///
 /// // Edge without properties
-/// let follows = define_edge("follows").build();
+/// let follows = edge("follows").build();
 /// ```
 pub struct EdgeSchemaBuilder {
   name: String,
@@ -527,8 +533,8 @@ impl EdgeSchemaBuilder {
   /// # Example
   ///
   /// ```rust,no_run
-  /// # use raydb::api::schema::{define_edge, prop};
-  /// define_edge("knows")
+  /// # use raydb::api::schema::{edge, prop};
+  /// edge("knows")
   ///     .prop(prop::int("since"))
   ///     .prop(prop::float("weight").optional())
   ///     ;
@@ -556,19 +562,25 @@ impl EdgeSchemaBuilder {
 /// # Examples
 ///
 /// ```rust,no_run
-/// use raydb::api::schema::{define_edge, prop};
+/// use raydb::api::schema::{edge, prop};
 ///
 /// // Edge with properties
-/// let knows = define_edge("knows")
+/// let knows = edge("knows")
 ///     .prop(prop::int("since"))
 ///     .prop(prop::float("weight").optional())
 ///     .build();
 ///
 /// // Edge without properties
-/// let follows = define_edge("follows").build();
+/// let follows = edge("follows").build();
 /// ```
-pub fn define_edge(name: &str) -> EdgeSchemaBuilder {
+pub fn edge(name: &str) -> EdgeSchemaBuilder {
   EdgeSchemaBuilder::new(name)
+}
+
+/// Define an edge type (deprecated alias for `edge()`)
+#[deprecated(since = "0.2.0", note = "Use `edge()` instead")]
+pub fn define_edge(name: &str) -> EdgeSchemaBuilder {
+  edge(name)
 }
 
 // ============================================================================
@@ -700,20 +712,20 @@ impl DatabaseSchema {
 ///
 /// ```rust,no_run
 /// use raydb::schema;
-/// use raydb::api::schema::{define_edge, define_node, prop};
+/// use raydb::api::schema::{node, edge, prop};
 ///
 /// let schema = schema! {
 ///     nodes: [
-///         define_node("user")
+///         node("user")
 ///             .prop(prop::string("name"))
 ///             .build(),
-///         define_node("post")
+///         node("post")
 ///             .prop(prop::string("title"))
 ///             .build(),
 ///     ],
 ///     edges: [
-///         define_edge("follows").build(),
-///         define_edge("authored").build(),
+///         edge("follows").build(),
+///         edge("authored").build(),
 ///     ]
 /// };
 /// ```
@@ -773,8 +785,8 @@ mod tests {
   }
 
   #[test]
-  fn test_define_node() {
-    let user = define_node("user")
+  fn test_node() {
+    let user = node("user")
       .key(|id| format!("user:{}", id))
       .prop(prop::string("name"))
       .prop(prop::int("age").optional())
@@ -791,16 +803,16 @@ mod tests {
   }
 
   #[test]
-  fn test_define_node_default_key() {
-    let post = define_node("post").prop(prop::string("title")).build();
+  fn test_node_default_key() {
+    let post = node("post").prop(prop::string("title")).build();
 
     assert_eq!(post.name, "post");
     assert_eq!(post.key("123"), "post:123");
   }
 
   #[test]
-  fn test_define_edge() {
-    let knows = define_edge("knows")
+  fn test_edge() {
+    let knows = edge("knows")
       .prop(prop::int("since"))
       .prop(prop::float("weight").optional())
       .build();
@@ -811,8 +823,8 @@ mod tests {
   }
 
   #[test]
-  fn test_define_edge_no_props() {
-    let follows = define_edge("follows").build();
+  fn test_edge_no_props() {
+    let follows = edge("follows").build();
 
     assert_eq!(follows.name, "follows");
     assert!(follows.props.is_empty());
@@ -821,7 +833,7 @@ mod tests {
 
   #[test]
   fn test_node_schema_validation() {
-    let user = define_node("user")
+    let user = node("user")
       .prop(prop::string("name"))
       .prop(prop::int("age").optional())
       .build();
@@ -853,18 +865,18 @@ mod tests {
 
   #[test]
   fn test_database_schema() {
-    let user = define_node("user")
+    let user = node("user")
       .key(|id| format!("user:{}", id))
       .prop(prop::string("name"))
       .build();
 
-    let post = define_node("post")
+    let post = node("post")
       .key(|id| format!("post:{}", id))
       .prop(prop::string("title"))
       .build();
 
-    let follows = define_edge("follows").build();
-    let authored = define_edge("authored").build();
+    let follows = edge("follows").build();
+    let authored = edge("authored").build();
 
     let schema = DatabaseSchema::new()
       .node(user)
@@ -887,16 +899,16 @@ mod tests {
   fn test_schema_macro() {
     let schema = schema! {
         nodes: [
-            define_node("user")
+            node("user")
                 .prop(prop::string("name"))
                 .build(),
-            define_node("post")
+            node("post")
                 .prop(prop::string("title"))
                 .build(),
         ],
         edges: [
-            define_edge("follows").build(),
-            define_edge("authored").build(),
+            edge("follows").build(),
+            edge("authored").build(),
         ]
     };
 
@@ -906,7 +918,7 @@ mod tests {
 
   #[test]
   fn test_required_props() {
-    let user = define_node("user")
+    let user = node("user")
       .prop(prop::string("name"))
       .prop(prop::string("email"))
       .prop(prop::int("age").optional())
@@ -930,7 +942,7 @@ mod tests {
 
   #[test]
   fn test_vector_prop() {
-    let doc = define_node("document")
+    let doc = node("document")
       .prop(prop::string("title"))
       .prop(prop::vector("embedding"))
       .build();
@@ -949,7 +961,7 @@ mod tests {
 
   #[test]
   fn test_edge_validation() {
-    let knows = define_edge("knows")
+    let knows = edge("knows")
       .prop(prop::int("since"))
       .prop(prop::float("weight").optional())
       .build();
@@ -977,7 +989,7 @@ mod tests {
     assert!(status.default.is_some());
 
     // Schema with default should not require the prop
-    let user = define_node("user")
+    let user = node("user")
       .prop(prop::string("name"))
       .prop(prop::string("status").default(PropValue::String("active".to_string())))
       .build();
