@@ -1,9 +1,9 @@
 {
-  "name": "kitedb",
+  "name": "@kitedb/core",
   "version": "0.2.4",
   "description": "KiteDB - High-performance embedded graph database with vector search",
   "author": "mask <mask@mask.dev>",
-  "homepage": "https://github.com/maskdotdev/kite",
+  "homepage": "https://ray-kwaf.vercel.app/",
   "main": "dist/index.js",
   "module": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -20,10 +20,10 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/maskdotdev/kite"
+    "url": "git+https://github.com/mask-software/kitedb.git"
   },
   "bugs": {
-    "url": "https://github.com/maskdotdev/kite/issues"
+    "url": "https://github.com/mask-software/kitedb/issues"
   },
   "license": "MIT",
   "browser": "browser.js",
@@ -33,8 +33,7 @@
     "embedded-database",
     "database",
     "graph",
-    "rust",
-    "napi-rs"
+    "rust"
   ],
   "files": [
     "index.d.ts",
@@ -137,9 +136,9 @@
   },
   "packageManager": "bun@1.2.4",
   "optionalDependencies": {
-    "kitedb-win32-x64-msvc": "0.2.4",
-    "kitedb-darwin-x64": "0.2.4",
-    "kitedb-linux-x64-gnu": "0.2.4",
-    "kitedb-darwin-arm64": "0.2.4"
+    "@kitedb/core-win32-x64-msvc": "0.2.4",
+    "@kitedb/core-darwin-x64": "0.2.4",
+    "@kitedb/core-linux-x64-gnu": "0.2.4",
+    "@kitedb/core-darwin-arm64": "0.2.4"
   }
 }

@@ -7,8 +7,8 @@ description = "High-performance embedded graph database"
 license = "MIT"
 readme = "CRATE_README.md"
 documentation = "https://docs.rs/kitedb"
-homepage = "https://github.com/maskdotdev/kitedb"
-repository = "https://github.com/maskdotdev/kitedb"
+homepage = "https://github.com/mask-software/kitedb"
+repository = "https://github.com/mask-software/kitedb"
 
 [lib]
 crate-type = ["cdylib", "rlib"]

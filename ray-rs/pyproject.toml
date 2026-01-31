@@ -38,9 +38,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/maskdotdev/kite"
-Documentation = "https://github.com/maskdotdev/kite#readme"
-Repository = "https://github.com/maskdotdev/kite"
+Homepage = "https://github.com/mask-software/kitedb"
+Documentation = "https://github.com/mask-software/kitedb#readme"
+Repository = "https://github.com/mask-software/kitedb"
 
 [tool.maturin]
 features = ["python"]
