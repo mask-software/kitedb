@@ -16,9 +16,9 @@
 //!   --no-output        Disable file output
 
 use rand::{rngs::StdRng, Rng, SeedableRng};
-use raydb::api::vector_search::{SimilarOptions, VectorIndex, VectorIndexOptions};
-use raydb::types::NodeId;
-use raydb::vector::DistanceMetric;
+use kitedb::api::vector_search::{SimilarOptions, VectorIndex, VectorIndexOptions};
+use kitedb::types::NodeId;
+use kitedb::vector::DistanceMetric;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};

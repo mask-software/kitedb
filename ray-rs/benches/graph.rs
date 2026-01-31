@@ -6,9 +6,9 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use std::collections::HashMap;
 use tempfile::tempdir;
 
-extern crate raydb;
-use raydb::api::ray::{BatchOp, EdgeDef, NodeDef, PropDef, Ray, RayOptions};
-use raydb::types::PropValue;
+extern crate kitedb;
+use kitedb::api::ray::{BatchOp, EdgeDef, NodeDef, PropDef, Ray, RayOptions};
+use kitedb::types::PropValue;
 
 fn create_test_schema() -> RayOptions {
   let user = NodeDef::new("User", "user:")

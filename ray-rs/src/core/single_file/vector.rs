@@ -243,7 +243,7 @@ mod tests {
   #[test]
   fn test_vector_persistence_across_checkpoint() {
     let temp_dir = tempdir().unwrap();
-    let db_path = temp_dir.path().join("vectors.raydb");
+    let db_path = temp_dir.path().join("vectors.kitedb");
 
     // Create DB and insert a vector
     let db = open_single_file(&db_path, SingleFileOpenOptions::new()).unwrap();

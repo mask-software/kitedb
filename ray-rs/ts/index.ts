@@ -1,9 +1,9 @@
 /**
- * RayDB - A fast, lightweight, embedded graph database for Node.js
+ * KiteDB - A fast, lightweight, embedded graph database for Node.js
  *
  * @example
  * ```typescript
- * import { ray, defineNode, defineEdge, prop, optional } from '@ray-db/core'
+ * import { ray, defineNode, defineEdge, prop, optional } from 'kitedb-core'
  *
  * // Define schema
  * const User = defineNode('user', {
@@ -19,7 +19,7 @@
  * })
  *
  * // Open database
- * const db = await ray('./my.raydb', {
+ * const db = await ray('./my.kitedb', {
  *   nodes: [User],
  *   edges: [knows],
  * })

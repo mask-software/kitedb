@@ -75,7 +75,7 @@ function DocsLayout() {
               <div class="flex items-center gap-2 px-2 py-1 rounded bg-[#0a1628] border border-[#1a2a42] group-hover:border-[#00d4ff]/50 transition-colors">
                 <span class="text-[#00d4ff] font-mono text-xs">❯</span>
                 <Logo size={18} />
-                <span class="font-mono font-bold text-white text-sm">raydb</span>
+                <span class="font-mono font-bold text-white text-sm">kitedb</span>
               </div>
             </Link>
             <button

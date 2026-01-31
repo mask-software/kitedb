@@ -75,8 +75,8 @@ function requireNative() {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ray-db/core-android-arm64')
-        const bindingPackageVersion = require('@ray-db/core-android-arm64/package.json').version
+        const binding = require('kitedb-android-arm64')
+        const bindingPackageVersion = require('kitedb-android-arm64/package.json').version
         if (bindingPackageVersion !== '0.2.2' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.2.2 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -91,8 +91,8 @@ function requireNative() {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ray-db/core-android-arm-eabi')
-        const bindingPackageVersion = require('@ray-db/core-android-arm-eabi/package.json').version
+        const binding = require('kitedb-android-arm-eabi')
+        const bindingPackageVersion = require('kitedb-android-arm-eabi/package.json').version
         if (bindingPackageVersion !== '0.2.2' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.2.2 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -112,8 +112,8 @@ function requireNative() {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ray-db/core-win32-x64-gnu')
-        const bindingPackageVersion = require('@ray-db/core-win32-x64-gnu/package.json').version
+        const binding = require('kitedb-win32-x64-gnu')
+        const bindingPackageVersion = require('kitedb-win32-x64-gnu/package.json').version
         if (bindingPackageVersion !== '0.2.2' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.2.2 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -128,8 +128,8 @@ function requireNative() {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ray-db/core-win32-x64-msvc')
-        const bindingPackageVersion = require('@ray-db/core-win32-x64-msvc/package.json').version
+        const binding = require('kitedb-win32-x64-msvc')
+        const bindingPackageVersion = require('kitedb-win32-x64-msvc/package.json').version
         if (bindingPackageVersion !== '0.2.2' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.2.2 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -145,8 +145,8 @@ function requireNative() {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ray-db/core-win32-ia32-msvc')
-        const bindingPackageVersion = require('@ray-db/core-win32-ia32-msvc/package.json').version
+        const binding = require('kitedb-win32-ia32-msvc')
+        const bindingPackageVersion = require('kitedb-win32-ia32-msvc/package.json').version
         if (bindingPackageVersion !== '0.2.2' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.2.2 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -161,8 +161,8 @@ function requireNative() {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ray-db/core-win32-arm64-msvc')
-        const bindingPackageVersion = require('@ray-db/core-win32-arm64-msvc/package.json').version
+        const binding = require('kitedb-win32-arm64-msvc')
+        const bindingPackageVersion = require('kitedb-win32-arm64-msvc/package.json').version
         if (bindingPackageVersion !== '0.2.2' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.2.2 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -180,8 +180,8 @@ function requireNative() {
       loadErrors.push(e)
     }
     try {
-      const binding = require('@ray-db/core-darwin-universal')
-      const bindingPackageVersion = require('@ray-db/core-darwin-universal/package.json').version
+      const binding = require('kitedb-darwin-universal')
+      const bindingPackageVersion = require('kitedb-darwin-universal/package.json').version
       if (bindingPackageVersion !== '0.2.2' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
         throw new Error(`Native binding package version mismatch, expected 0.2.2 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
       }
@@ -196,8 +196,8 @@ function requireNative() {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ray-db/core-darwin-x64')
-        const bindingPackageVersion = require('@ray-db/core-darwin-x64/package.json').version
+        const binding = require('kitedb-darwin-x64')
+        const bindingPackageVersion = require('kitedb-darwin-x64/package.json').version
         if (bindingPackageVersion !== '0.2.2' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.2.2 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -212,8 +212,8 @@ function requireNative() {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ray-db/core-darwin-arm64')
-        const bindingPackageVersion = require('@ray-db/core-darwin-arm64/package.json').version
+        const binding = require('kitedb-darwin-arm64')
+        const bindingPackageVersion = require('kitedb-darwin-arm64/package.json').version
         if (bindingPackageVersion !== '0.2.2' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.2.2 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -232,8 +232,8 @@ function requireNative() {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ray-db/core-freebsd-x64')
-        const bindingPackageVersion = require('@ray-db/core-freebsd-x64/package.json').version
+        const binding = require('kitedb-freebsd-x64')
+        const bindingPackageVersion = require('kitedb-freebsd-x64/package.json').version
         if (bindingPackageVersion !== '0.2.2' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.2.2 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -248,8 +248,8 @@ function requireNative() {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ray-db/core-freebsd-arm64')
-        const bindingPackageVersion = require('@ray-db/core-freebsd-arm64/package.json').version
+        const binding = require('kitedb-freebsd-arm64')
+        const bindingPackageVersion = require('kitedb-freebsd-arm64/package.json').version
         if (bindingPackageVersion !== '0.2.2' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.2.2 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -269,8 +269,8 @@ function requireNative() {
           loadErrors.push(e)
         }
         try {
-          const binding = require('@ray-db/core-linux-x64-musl')
-          const bindingPackageVersion = require('@ray-db/core-linux-x64-musl/package.json').version
+          const binding = require('kitedb-linux-x64-musl')
+          const bindingPackageVersion = require('kitedb-linux-x64-musl/package.json').version
           if (bindingPackageVersion !== '0.2.2' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 0.2.2 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
@@ -285,8 +285,8 @@ function requireNative() {
           loadErrors.push(e)
         }
         try {
-          const binding = require('@ray-db/core-linux-x64-gnu')
-          const bindingPackageVersion = require('@ray-db/core-linux-x64-gnu/package.json').version
+          const binding = require('kitedb-linux-x64-gnu')
+          const bindingPackageVersion = require('kitedb-linux-x64-gnu/package.json').version
           if (bindingPackageVersion !== '0.2.2' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 0.2.2 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
@@ -303,8 +303,8 @@ function requireNative() {
           loadErrors.push(e)
         }
         try {
-          const binding = require('@ray-db/core-linux-arm64-musl')
-          const bindingPackageVersion = require('@ray-db/core-linux-arm64-musl/package.json').version
+          const binding = require('kitedb-linux-arm64-musl')
+          const bindingPackageVersion = require('kitedb-linux-arm64-musl/package.json').version
           if (bindingPackageVersion !== '0.2.2' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 0.2.2 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
@@ -319,8 +319,8 @@ function requireNative() {
           loadErrors.push(e)
         }
         try {
-          const binding = require('@ray-db/core-linux-arm64-gnu')
-          const bindingPackageVersion = require('@ray-db/core-linux-arm64-gnu/package.json').version
+          const binding = require('kitedb-linux-arm64-gnu')
+          const bindingPackageVersion = require('kitedb-linux-arm64-gnu/package.json').version
           if (bindingPackageVersion !== '0.2.2' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 0.2.2 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
@@ -337,8 +337,8 @@ function requireNative() {
           loadErrors.push(e)
         }
         try {
-          const binding = require('@ray-db/core-linux-arm-musleabihf')
-          const bindingPackageVersion = require('@ray-db/core-linux-arm-musleabihf/package.json').version
+          const binding = require('kitedb-linux-arm-musleabihf')
+          const bindingPackageVersion = require('kitedb-linux-arm-musleabihf/package.json').version
           if (bindingPackageVersion !== '0.2.2' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 0.2.2 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
@@ -353,8 +353,8 @@ function requireNative() {
           loadErrors.push(e)
         }
         try {
-          const binding = require('@ray-db/core-linux-arm-gnueabihf')
-          const bindingPackageVersion = require('@ray-db/core-linux-arm-gnueabihf/package.json').version
+          const binding = require('kitedb-linux-arm-gnueabihf')
+          const bindingPackageVersion = require('kitedb-linux-arm-gnueabihf/package.json').version
           if (bindingPackageVersion !== '0.2.2' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 0.2.2 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
@@ -371,8 +371,8 @@ function requireNative() {
           loadErrors.push(e)
         }
         try {
-          const binding = require('@ray-db/core-linux-loong64-musl')
-          const bindingPackageVersion = require('@ray-db/core-linux-loong64-musl/package.json').version
+          const binding = require('kitedb-linux-loong64-musl')
+          const bindingPackageVersion = require('kitedb-linux-loong64-musl/package.json').version
           if (bindingPackageVersion !== '0.2.2' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 0.2.2 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
@@ -387,8 +387,8 @@ function requireNative() {
           loadErrors.push(e)
         }
         try {
-          const binding = require('@ray-db/core-linux-loong64-gnu')
-          const bindingPackageVersion = require('@ray-db/core-linux-loong64-gnu/package.json').version
+          const binding = require('kitedb-linux-loong64-gnu')
+          const bindingPackageVersion = require('kitedb-linux-loong64-gnu/package.json').version
           if (bindingPackageVersion !== '0.2.2' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 0.2.2 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
@@ -405,8 +405,8 @@ function requireNative() {
           loadErrors.push(e)
         }
         try {
-          const binding = require('@ray-db/core-linux-riscv64-musl')
-          const bindingPackageVersion = require('@ray-db/core-linux-riscv64-musl/package.json').version
+          const binding = require('kitedb-linux-riscv64-musl')
+          const bindingPackageVersion = require('kitedb-linux-riscv64-musl/package.json').version
           if (bindingPackageVersion !== '0.2.2' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 0.2.2 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
@@ -421,8 +421,8 @@ function requireNative() {
           loadErrors.push(e)
         }
         try {
-          const binding = require('@ray-db/core-linux-riscv64-gnu')
-          const bindingPackageVersion = require('@ray-db/core-linux-riscv64-gnu/package.json').version
+          const binding = require('kitedb-linux-riscv64-gnu')
+          const bindingPackageVersion = require('kitedb-linux-riscv64-gnu/package.json').version
           if (bindingPackageVersion !== '0.2.2' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 0.2.2 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
@@ -438,8 +438,8 @@ function requireNative() {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ray-db/core-linux-ppc64-gnu')
-        const bindingPackageVersion = require('@ray-db/core-linux-ppc64-gnu/package.json').version
+        const binding = require('kitedb-linux-ppc64-gnu')
+        const bindingPackageVersion = require('kitedb-linux-ppc64-gnu/package.json').version
         if (bindingPackageVersion !== '0.2.2' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.2.2 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -454,8 +454,8 @@ function requireNative() {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ray-db/core-linux-s390x-gnu')
-        const bindingPackageVersion = require('@ray-db/core-linux-s390x-gnu/package.json').version
+        const binding = require('kitedb-linux-s390x-gnu')
+        const bindingPackageVersion = require('kitedb-linux-s390x-gnu/package.json').version
         if (bindingPackageVersion !== '0.2.2' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.2.2 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -474,8 +474,8 @@ function requireNative() {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ray-db/core-openharmony-arm64')
-        const bindingPackageVersion = require('@ray-db/core-openharmony-arm64/package.json').version
+        const binding = require('kitedb-openharmony-arm64')
+        const bindingPackageVersion = require('kitedb-openharmony-arm64/package.json').version
         if (bindingPackageVersion !== '0.2.2' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.2.2 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -490,8 +490,8 @@ function requireNative() {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ray-db/core-openharmony-x64')
-        const bindingPackageVersion = require('@ray-db/core-openharmony-x64/package.json').version
+        const binding = require('kitedb-openharmony-x64')
+        const bindingPackageVersion = require('kitedb-openharmony-x64/package.json').version
         if (bindingPackageVersion !== '0.2.2' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.2.2 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -506,8 +506,8 @@ function requireNative() {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ray-db/core-openharmony-arm')
-        const bindingPackageVersion = require('@ray-db/core-openharmony-arm/package.json').version
+        const binding = require('kitedb-openharmony-arm')
+        const bindingPackageVersion = require('kitedb-openharmony-arm/package.json').version
         if (bindingPackageVersion !== '0.2.2' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.2.2 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -538,7 +538,7 @@ if (!nativeBinding || process.env.NAPI_RS_FORCE_WASI) {
   }
   if (!nativeBinding || process.env.NAPI_RS_FORCE_WASI) {
     try {
-      wasiBinding = require('@ray-db/core-wasm32-wasi')
+      wasiBinding = require('kitedb-wasm32-wasi')
       nativeBinding = wasiBinding
     } catch (err) {
       if (process.env.NAPI_RS_FORCE_WASI) {

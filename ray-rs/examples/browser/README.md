@@ -1,4 +1,4 @@
-# RayDB Browser Demo
+# KiteDB Browser Demo
 
 This demo runs the WASI build in the browser using Vite.
 
@@ -29,5 +29,5 @@ Open the URL Vite prints (usually http://localhost:5173) and click "Run demo".
 ## Notes
 
 - The demo uses the WASI memfs in the browser.
-- After each run, it saves the `.raydb` file to OPFS when available, falling back to IndexedDB.
+- After each run, it saves the `.kitedb` file to OPFS when available, falling back to IndexedDB.
 - Cross-origin isolation headers are enabled in `vite.config.ts` to allow SharedArrayBuffer.

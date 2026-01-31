@@ -1,10 +1,10 @@
 """
 Ray Database - Fluent API
 
-High-level, type-safe API for RayDB matching the TypeScript fluent style.
+High-level, type-safe API for KiteDB matching the TypeScript fluent style.
 
 Example:
-    >>> from raydb import ray, node, edge, prop, optional
+    >>> from kitedb import ray, node, edge, prop, optional
     >>> 
     >>> # Define schema
     >>> user = node("user",
@@ -66,7 +66,7 @@ from typing import (
     overload,
 )
 
-from raydb._raydb import Database, OpenOptions
+from kitedb._kitedb import Database, OpenOptions
 
 from .builders import (
     DeleteBuilder,
@@ -819,7 +819,7 @@ def ray(
         Ray database instance
     
     Example:
-        >>> from raydb import ray, node, edge, prop, optional
+        >>> from kitedb import ray, node, edge, prop, optional
         >>> 
         >>> user = node("user",
         ...     key=lambda id: f"user:{id}",

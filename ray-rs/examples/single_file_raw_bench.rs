@@ -1,4 +1,4 @@
-//! Single-file raw benchmark for RayDB core (Rust)
+//! Single-file raw benchmark for KiteDB core (Rust)
 //!
 //! Usage:
 //!   cargo run --release --example single_file_raw_bench --no-default-features -- [options]
@@ -19,7 +19,7 @@ use std::env;
 use std::time::Instant;
 use tempfile::tempdir;
 
-use raydb::core::single_file::{close_single_file, open_single_file, SingleFileOpenOptions};
+use kitedb::core::single_file::{close_single_file, open_single_file, SingleFileOpenOptions};
 
 #[derive(Debug, Clone)]
 struct BenchConfig {
@@ -219,7 +219,7 @@ struct GraphData {
   etype_calls: u32,
 }
 
-fn build_graph(db: &raydb::core::single_file::SingleFileDB, config: &BenchConfig) -> GraphData {
+fn build_graph(db: &kitedb::core::single_file::SingleFileDB, config: &BenchConfig) -> GraphData {
   let mut node_ids = Vec::with_capacity(config.nodes);
   let mut node_keys = Vec::with_capacity(config.nodes);
   let batch_size = 5_000usize;
@@ -279,7 +279,7 @@ fn build_graph(db: &raydb::core::single_file::SingleFileDB, config: &BenchConfig
 }
 
 fn benchmark_key_lookups(
-  db: &raydb::core::single_file::SingleFileDB,
+  db: &kitedb::core::single_file::SingleFileDB,
   graph: &GraphData,
   iterations: usize,
 ) {
@@ -299,7 +299,7 @@ fn benchmark_key_lookups(
 }
 
 fn benchmark_traversals(
-  db: &raydb::core::single_file::SingleFileDB,
+  db: &kitedb::core::single_file::SingleFileDB,
   graph: &GraphData,
   iterations: usize,
 ) {
@@ -320,7 +320,7 @@ fn benchmark_traversals(
 }
 
 fn benchmark_edge_exists(
-  db: &raydb::core::single_file::SingleFileDB,
+  db: &kitedb::core::single_file::SingleFileDB,
   graph: &GraphData,
   iterations: usize,
 ) {
@@ -341,7 +341,7 @@ fn benchmark_edge_exists(
 }
 
 fn benchmark_vectors(
-  db: &raydb::core::single_file::SingleFileDB,
+  db: &kitedb::core::single_file::SingleFileDB,
   graph: &GraphData,
   config: &BenchConfig,
 ) -> Option<(u32, Vec<u64>)> {
@@ -388,7 +388,7 @@ fn benchmark_vectors(
 }
 
 fn benchmark_vector_reads(
-  db: &raydb::core::single_file::SingleFileDB,
+  db: &kitedb::core::single_file::SingleFileDB,
   vector_nodes: &[u64],
   prop_key_id: u32,
   iterations: usize,
@@ -415,7 +415,7 @@ fn benchmark_vector_reads(
   print_latency_table("has_node_vector() random", stats);
 }
 
-fn benchmark_writes(db: &raydb::core::single_file::SingleFileDB, iterations: usize) {
+fn benchmark_writes(db: &kitedb::core::single_file::SingleFileDB, iterations: usize) {
   println!("\n--- Batch Writes (100 nodes) ---");
   let batch_size = 100usize;
   let batches = (iterations / batch_size).min(50);
@@ -455,7 +455,7 @@ fn main() {
   println!("{}", "=".repeat(120));
 
   let temp = tempdir().expect("failed to create temp dir");
-  let db_path = temp.path().join("ray-bench-raw.raydb");
+  let db_path = temp.path().join("ray-bench-raw.kitedb");
 
   let options = SingleFileOpenOptions::new()
     .wal_size(config.wal_size)

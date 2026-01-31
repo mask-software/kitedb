@@ -1,6 +1,6 @@
-# RayDB
+# KiteDB
 
-RayDB is a high-performance embedded graph database with built-in vector search.
+KiteDB is a high-performance embedded graph database with built-in vector search.
 This crate provides the Rust core and the high-level Ray API.
 
 ## Features
@@ -16,22 +16,22 @@ This crate provides the Rust core and the high-level Ray API.
 
 ```toml
 [dependencies]
-raydb = "0.1"
+kitedb = "0.1"
 ```
 
 ## Quick start (Ray API)
 
 ```rust
-use raydb::api::ray::{EdgeDef, NodeDef, PropDef, Ray, RayOptions};
-use raydb::types::PropValue;
+use kitedb::api::ray::{EdgeDef, NodeDef, PropDef, Ray, RayOptions};
+use kitedb::types::PropValue;
 use std::collections::HashMap;
 
-fn main() -> raydb::error::Result<()> {
+fn main() -> kitedb::error::Result<()> {
   let user = NodeDef::new("User", "user:")
     .prop(PropDef::string("name").required());
   let knows = EdgeDef::new("KNOWS");
 
-  let mut ray = Ray::open("my_graph.raydb", RayOptions::new().node(user).edge(knows))?;
+  let mut ray = Ray::open("my_graph.kitedb", RayOptions::new().node(user).edge(knows))?;
 
   let mut alice_props = HashMap::new();
   alice_props.insert("name".to_string(), PropValue::String("Alice".into()));
@@ -49,20 +49,20 @@ fn main() -> raydb::error::Result<()> {
 
 ## Lower-level API
 
-If you want direct access to graph primitives, use `raydb::graph::db::open_graph_db`
-and the modules under `raydb::graph`, `raydb::vector`, and `raydb::core`.
+If you want direct access to graph primitives, use `kitedb::graph::db::open_graph_db`
+and the modules under `kitedb::graph`, `kitedb::vector`, and `kitedb::core`.
 
 ## Concurrent Access
 
-RayDB supports concurrent reads when wrapped in a `RwLock`. Multiple threads can read simultaneously:
+KiteDB supports concurrent reads when wrapped in a `RwLock`. Multiple threads can read simultaneously:
 
 ```rust
 use std::sync::Arc;
 use parking_lot::RwLock;
-use raydb::api::ray::{Ray, RayOptions, NodeDef};
+use kitedb::api::ray::{Ray, RayOptions, NodeDef};
 
 // Wrap Ray in RwLock for concurrent access
-let ray = Ray::open("graph.raydb", RayOptions::new().node(NodeDef::new("User", "user:")))?;
+let ray = Ray::open("graph.kitedb", RayOptions::new().node(NodeDef::new("User", "user:")))?;
 let db = Arc::new(RwLock::new(ray));
 
 // Multiple threads can read concurrently

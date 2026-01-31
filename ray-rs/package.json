@@ -1,9 +1,9 @@
 {
-  "name": "@ray-db/core",
+  "name": "kitedb",
   "version": "0.2.2",
-  "description": "RayDB - High-performance embedded graph database with vector search",
+  "description": "KiteDB - High-performance embedded graph database with vector search",
   "author": "mask <mask@mask.dev>",
-  "homepage": "https://github.com/maskdotdev/ray",
+  "homepage": "https://github.com/maskdotdev/kite",
   "main": "dist/index.js",
   "module": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -20,15 +20,15 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/maskdotdev/ray"
+    "url": "https://github.com/maskdotdev/kite"
   },
   "bugs": {
-    "url": "https://github.com/maskdotdev/ray/issues"
+    "url": "https://github.com/maskdotdev/kite/issues"
   },
   "license": "MIT",
   "browser": "browser.js",
   "keywords": [
-    "raydb",
+    "kitedb",
     "graph-database",
     "embedded-database",
     "database",
@@ -137,9 +137,9 @@
   },
   "packageManager": "bun@1.2.4",
   "optionalDependencies": {
-    "@ray-db/core-darwin-arm64": "0.2.1",
-    "@ray-db/core-darwin-x64": "0.2.1",
-    "@ray-db/core-linux-x64-gnu": "0.2.1",
-    "@ray-db/core-win32-x64-msvc": "0.2.1"
+    "kitedb-darwin-arm64": "0.2.1",
+    "kitedb-darwin-x64": "0.2.1",
+    "kitedb-linux-x64-gnu": "0.2.1",
+    "kitedb-win32-x64-msvc": "0.2.1"
   }
 }

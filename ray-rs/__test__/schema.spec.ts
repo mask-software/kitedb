@@ -6,8 +6,8 @@ import path from 'node:path'
 import { ray, raySync, node, edge, prop, optional } from '../dist/index.js'
 
 const makeDbPath = () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'raydb-schema-'))
-  return path.join(dir, 'test.raydb')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kitedb-schema-'))
+  return path.join(dir, 'test.kitedb')
 }
 
 // =============================================================================

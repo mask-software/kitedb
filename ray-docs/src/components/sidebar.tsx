@@ -55,7 +55,7 @@ export const Sidebar: Component<SidebarProps> = (props) => {
             >
               <Logo size={28} />
               <span class="bg-gradient-to-r from-cyan-500 to-violet-500 bg-clip-text text-transparent">
-                RayDB
+                KiteDB
               </span>
             </Link>
             <button

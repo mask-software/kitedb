@@ -1,5 +1,5 @@
 """
-Traversal Builder for RayDB
+Traversal Builder for KiteDB
 
 Provides a fluent API for graph traversals with lazy property loading.
 
@@ -46,7 +46,7 @@ from .builders import NodeRef, from_prop_value
 from .schema import EdgeDef, NodeDef
 
 if TYPE_CHECKING:
-    from raydb._raydb import Database
+    from kitedb._kitedb import Database
 
 
 N = TypeVar("N", bound=NodeDef)

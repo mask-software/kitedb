@@ -57,13 +57,13 @@ function DocPageContent(props: { slug: string }) {
     return (
       <DocPage slug="">
         <p>
-          Welcome to RayDB, a high-performance embedded graph database with
+          Welcome to KiteDB, a high-performance embedded graph database with
           built-in vector search, designed for Bun and TypeScript.
         </p>
 
-        <h2 id="what-is-raydb">What is RayDB?</h2>
+        <h2 id="what-is-kitedb">What is KiteDB?</h2>
         <p>
-          RayDB is an embedded graph database that combines the power of graph
+          KiteDB is an embedded graph database that combines the power of graph
           relationships with semantic vector search. It's designed for modern
           TypeScript applications that need:
         </p>
@@ -114,7 +114,7 @@ function DocPageContent(props: { slug: string }) {
 
         <h2 id="quick-example">Quick Example</h2>
         <CodeBlock
-          code={`import { ray, defineNode, defineEdge, prop } from '@ray-db/ray';
+          code={`import { ray, defineNode, defineEdge, prop } from 'kitedb';
 
 const user = defineNode('user', {
   key: (id: string) => \`user:\${id}\`,
@@ -129,7 +129,7 @@ const follows = defineEdge('follows', {
   to: user,
 });
 
-const db = await ray('./social.raydb', {
+const db = await ray('./social.kitedb', {
   nodes: [user],
   edges: [follows],
 });
@@ -152,7 +152,7 @@ const similar = await db.node(user)
         <ul>
           <li>
             <a href="/docs/getting-started/installation">Installation</a> – Get
-            RayDB set up
+            KiteDB set up
           </li>
           <li>
             <a href="/docs/getting-started/quick-start">Quick Start</a> – Build

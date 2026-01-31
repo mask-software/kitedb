@@ -55,7 +55,7 @@ function DocPageContent(props: { slug: string }) {
     return (
       <DocPage slug={slug}>
         <p>
-          Performance benchmarks for RayDB across graph operations, vector
+          Performance benchmarks for KiteDB across graph operations, vector
           search, and multi-language bindings.
         </p>
 
@@ -88,7 +88,7 @@ function DocPageContent(props: { slug: string }) {
           <li>Bun 1.3.5</li>
           <li>Python 3.12.8</li>
           <li>Rust 1.88.0</li>
-          <li>RayDB 0.1.0</li>
+          <li>KiteDB 0.1.0</li>
         </ul>
 
         <h2 id="highlights">Performance Highlights</h2>
@@ -98,7 +98,7 @@ function DocPageContent(props: { slug: string }) {
           <thead>
             <tr>
               <th>Category</th>
-              <th>RayDB vs Memgraph</th>
+              <th>KiteDB vs Memgraph</th>
             </tr>
           </thead>
           <tbody>
@@ -207,7 +207,7 @@ function DocPageContent(props: { slug: string }) {
               <td>
                 <code>bun run bench/benchmark.ts</code>
               </td>
-              <td>Main benchmark (RayDB only)</td>
+              <td>Main benchmark (KiteDB only)</td>
             </tr>
             <tr>
               <td>
@@ -238,13 +238,13 @@ function DocPageContent(props: { slug: string }) {
     return (
       <DocPage slug={slug}>
         <p>
-          Performance benchmarks comparing RayDB's graph operations against other graph databases.
+          Performance benchmarks comparing KiteDB's graph operations against other graph databases.
         </p>
 
         <h2 id="test-configuration">Test Configuration</h2>
         <ul>
           <li><strong>Memgraph</strong>: Docker container with 2GB memory limit</li>
-          <li><strong>RayDB</strong>: Embedded, in-process</li>
+          <li><strong>KiteDB</strong>: Embedded, in-process</li>
           <li><strong>Graph structure</strong>: Power-law distribution with 1% hub nodes</li>
           <li><strong>Edge types</strong>: CALLS (40%), REFERENCES (35%), IMPORTS (15%), EXTENDS (10%)</li>
           <li><strong>Warmup</strong>: 1000 iterations before measurement</li>
@@ -257,7 +257,7 @@ function DocPageContent(props: { slug: string }) {
           <thead>
             <tr>
               <th>Operation</th>
-              <th>RayDB p50</th>
+              <th>KiteDB p50</th>
               <th>Memgraph p50</th>
               <th>Speedup</th>
             </tr>
@@ -274,7 +274,7 @@ function DocPageContent(props: { slug: string }) {
           <thead>
             <tr>
               <th>Operation</th>
-              <th>RayDB p50</th>
+              <th>KiteDB p50</th>
               <th>Memgraph p50</th>
               <th>Speedup</th>
             </tr>
@@ -291,7 +291,7 @@ function DocPageContent(props: { slug: string }) {
           <thead>
             <tr>
               <th>Operation</th>
-              <th>RayDB p50</th>
+              <th>KiteDB p50</th>
               <th>Memgraph p50</th>
               <th>Speedup</th>
             </tr>
@@ -307,7 +307,7 @@ function DocPageContent(props: { slug: string }) {
           <thead>
             <tr>
               <th>Operation</th>
-              <th>RayDB p50</th>
+              <th>KiteDB p50</th>
               <th>Memgraph p50</th>
               <th>Speedup</th>
             </tr>
@@ -326,7 +326,7 @@ function DocPageContent(props: { slug: string }) {
           <thead>
             <tr>
               <th>Operation</th>
-              <th>RayDB p50</th>
+              <th>KiteDB p50</th>
               <th>Memgraph p50</th>
               <th>Speedup</th>
             </tr>
@@ -343,7 +343,7 @@ function DocPageContent(props: { slug: string }) {
           <thead>
             <tr>
               <th>Operation</th>
-              <th>RayDB p50</th>
+              <th>KiteDB p50</th>
               <th>Memgraph p50</th>
               <th>Speedup</th>
             </tr>
@@ -360,7 +360,7 @@ function DocPageContent(props: { slug: string }) {
           <thead>
             <tr>
               <th>Operation</th>
-              <th>RayDB p50</th>
+              <th>KiteDB p50</th>
               <th>Memgraph p50</th>
               <th>Speedup</th>
             </tr>
@@ -376,7 +376,7 @@ function DocPageContent(props: { slug: string }) {
           <thead>
             <tr>
               <th>Operation</th>
-              <th>RayDB p50</th>
+              <th>KiteDB p50</th>
               <th>Memgraph p50</th>
               <th>Speedup</th>
             </tr>
@@ -407,14 +407,14 @@ function DocPageContent(props: { slug: string }) {
           </tbody>
         </table>
 
-        <h2 id="why-faster">Why RayDB is Faster</h2>
+        <h2 id="why-faster">Why KiteDB is Faster</h2>
 
         <h3 id="architecture">Architecture Differences</h3>
         <table>
           <thead>
             <tr>
               <th>Aspect</th>
-              <th>RayDB</th>
+              <th>KiteDB</th>
               <th>Memgraph</th>
             </tr>
           </thead>
@@ -431,7 +431,7 @@ function DocPageContent(props: { slug: string }) {
           <thead>
             <tr>
               <th>Operation</th>
-              <th>RayDB</th>
+              <th>KiteDB</th>
               <th>Memgraph</th>
             </tr>
           </thead>
@@ -466,7 +466,7 @@ function DocPageContent(props: { slug: string }) {
     return (
       <DocPage slug={slug}>
         <p>
-          Performance benchmarks for RayDB's vector embedding operations, including distance 
+          Performance benchmarks for KiteDB's vector embedding operations, including distance 
           calculations, indexing algorithms, and search performance.
         </p>
 
@@ -682,7 +682,7 @@ function DocPageContent(props: { slug: string }) {
     return (
       <DocPage slug={slug}>
         <p>
-          Cross-language benchmarks for RayDB bindings (TypeScript/NAPI, Python, Rust).
+          Cross-language benchmarks for KiteDB bindings (TypeScript/NAPI, Python, Rust).
           Graph results come from the single-file raw benchmark; vector results use the
           VectorIndex benchmark.
         </p>

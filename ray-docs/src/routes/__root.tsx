@@ -42,7 +42,7 @@ export const Route = createRootRouteWithContext()({
       {
         name: "description",
         content:
-          "RayDB - High-performance embedded graph database with vector search for Bun/TypeScript",
+          "KiteDB - High-performance embedded graph database with vector search for Bun/TypeScript",
       },
       { name: "theme-color", content: "#05070d" },
     ],

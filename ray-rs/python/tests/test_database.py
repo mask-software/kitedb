@@ -1,10 +1,10 @@
-"""Tests for RayDB Python bindings."""
+"""Tests for KiteDB Python bindings."""
 
 import os
 import tempfile
 import pytest
 
-from raydb import (
+from kitedb import (
     Database,
     OpenOptions,
     PropValue,

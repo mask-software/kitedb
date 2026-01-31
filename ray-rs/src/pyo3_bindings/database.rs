@@ -1,4 +1,4 @@
-//! Python bindings for RayDB Database
+//! Python bindings for KiteDB Database
 //!
 //! Provides Python access to both single-file and multi-file database formats.
 //! This module contains the main Database class and standalone functions.
@@ -174,7 +174,7 @@ impl PyDatabase {
     let db_path = if is_single_file_path(&path_buf) {
       path_buf
     } else {
-      PathBuf::from(format!("{path}.raydb"))
+      PathBuf::from(format!("{path}.kitedb"))
     };
 
     let opts: RustOpenOptions = options.into();

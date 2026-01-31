@@ -1,4 +1,4 @@
-//! Single-file database format (.raydb)
+//! Single-file database format (.kitedb)
 //!
 //! Provides open/close/read/write operations for single-file databases.
 //! Layout: [Header (1 page)] [WAL (N pages)] [Snapshot (M pages)]
@@ -316,11 +316,11 @@ pub fn is_single_file_path<P: AsRef<Path>>(path: P) -> bool {
   path
     .as_ref()
     .extension()
-    .map(|ext| ext == "raydb")
+    .map(|ext| ext == "kitedb")
     .unwrap_or(false)
 }
 
 /// Get the single-file extension
 pub fn single_file_extension() -> &'static str {
-  EXT_RAYDB
+  EXT_KITEDB
 }

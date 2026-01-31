@@ -1,7 +1,7 @@
 """
-RayDB - High-performance embedded graph database with vector search
+KiteDB - High-performance embedded graph database with vector search
 
-A Python interface to the RayDB graph database, providing:
+A Python interface to the KiteDB graph database, providing:
 - ACID transactions
 - Node and edge CRUD operations
 - Property storage
@@ -9,7 +9,7 @@ A Python interface to the RayDB graph database, providing:
 - Graph traversal and pathfinding (BFS, Dijkstra, A*)
 
 Fluent API (Recommended):
-    >>> from raydb import ray, node, edge, prop, optional
+    >>> from kitedb import ray, node, edge, prop, optional
     >>> 
     >>> # Define schema
     >>> user = node("user",
@@ -39,9 +39,9 @@ Fluent API (Recommended):
     ...     print([f.key for f in friends])  # ['user:bob']
 
 Low-level API (for advanced use):
-    >>> from raydb import Database, PropValue
+    >>> from kitedb import Database, PropValue
     >>> 
-    >>> with Database("my_graph.raydb") as db:
+    >>> with Database("my_graph.kitedb") as db:
     ...     db.begin()
     ...     alice = db.create_node("user:alice")
     ...     name_key = db.get_or_create_propkey("name")
@@ -49,7 +49,7 @@ Low-level API (for advanced use):
     ...     db.commit()
 """
 
-from raydb._raydb import (
+from kitedb._kitedb import (
     # Core classes
     Database,
     OpenOptions,
@@ -111,7 +111,7 @@ from raydb._raydb import (
 )
 
 # Fluent API imports
-from raydb.schema import (
+from kitedb.schema import (
     prop,
     PropDef,
     PropBuilder,
@@ -125,14 +125,14 @@ from raydb.schema import (
     PropsSchema,
 )
 
-from raydb.builders import (
+from kitedb.builders import (
     NodeRef,
     InsertBuilder,
     UpdateBuilder,
     DeleteBuilder,
 )
 
-from raydb.traversal import (
+from kitedb.traversal import (
     EdgeResult,
     EdgeTraversalResult,
     RawEdge,
@@ -143,13 +143,13 @@ from raydb.traversal import (
     PathResult,
 )
 
-from raydb.fluent import (
+from kitedb.fluent import (
     EdgeData,
     Ray,
     ray,
 )
 
-from raydb.vector_index import (
+from kitedb.vector_index import (
     VectorIndex,
     VectorIndexOptions,
     SimilarOptions,

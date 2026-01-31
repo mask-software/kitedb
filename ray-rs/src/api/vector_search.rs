@@ -185,7 +185,7 @@ impl SimilarOptions {
   ///
   /// # Example
   /// ```rust,no_run
-  /// # use raydb::api::vector_search::SimilarOptions;
+  /// # use kitedb::api::vector_search::SimilarOptions;
   /// # fn main() {
   /// // Only include nodes with ID > 100
   /// let options = SimilarOptions::new(10)
@@ -237,8 +237,8 @@ pub struct VectorIndexStats {
 ///
 /// # Example
 /// ```rust,no_run
-/// # use raydb::api::vector_search::{SimilarOptions, VectorIndex, VectorIndexOptions};
-/// # use raydb::types::NodeId;
+/// # use kitedb::api::vector_search::{SimilarOptions, VectorIndex, VectorIndexOptions};
+/// # use kitedb::types::NodeId;
 /// # fn main() {
 /// # let node_id: NodeId = 1;
 /// # let embedding = vec![0.0_f32; 768];
@@ -686,8 +686,8 @@ fn is_valid_vector(vector: &[f32]) -> bool {
 ///
 /// # Example
 /// ```rust,no_run
-/// use raydb::api::vector_search::{create_vector_index, VectorIndexOptions};
-/// use raydb::vector::types::DistanceMetric;
+/// use kitedb::api::vector_search::{create_vector_index, VectorIndexOptions};
+/// use kitedb::vector::types::DistanceMetric;
 /// # fn main() {
 ///
 /// // Create index for 768-dimensional embeddings (e.g., from OpenAI)

@@ -1,4 +1,4 @@
-//! Core type definitions for RayDB
+//! Core type definitions for KiteDB
 //!
 //! Based on spec v1.1 (Mode B) - ported from src/types.ts
 
@@ -650,7 +650,7 @@ pub struct EdgeVersionData {
 /// Database header for single-file format (4KB)
 #[derive(Debug, Clone)]
 pub struct DbHeaderV1 {
-  pub magic: [u8; 16], // "RayDB format 1\0"
+  pub magic: [u8; 16], // "KiteDB format 1\0"
   pub page_size: u32,
   pub version: u32,
   pub min_reader_version: u32,

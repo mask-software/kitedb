@@ -1,4 +1,4 @@
-//! Ray - High-level API for RayDB
+//! Ray - High-level API for KiteDB
 //!
 //! The Ray struct provides a clean, ergonomic API for graph operations.
 //! It wraps the lower-level GraphDB with schema definitions and type-safe operations.
@@ -376,10 +376,10 @@ impl Ray {
   ///
   /// # Example
   /// ```rust,no_run
-  /// # use raydb::api::ray::Ray;
-  /// # use raydb::types::PropValue;
+  /// # use kitedb::api::ray::Ray;
+  /// # use kitedb::types::PropValue;
   /// # use std::collections::HashMap;
-  /// # fn main() -> raydb::error::Result<()> {
+  /// # fn main() -> kitedb::error::Result<()> {
   /// # let mut ray: Ray = unimplemented!();
   /// # let props: HashMap<String, PropValue> = HashMap::new();
   /// // Insert and get the node reference
@@ -491,9 +491,9 @@ impl Ray {
   ///
   /// # Example
   /// ```rust,no_run
-  /// # use raydb::api::ray::Ray;
-  /// # use raydb::types::PropValue;
-  /// # fn main() -> raydb::error::Result<()> {
+  /// # use kitedb::api::ray::Ray;
+  /// # use kitedb::types::PropValue;
+  /// # fn main() -> kitedb::error::Result<()> {
   /// # let mut ray: Ray = unimplemented!();
   /// let alice = ray.get("User", "alice")?.unwrap();
   /// ray.update(&alice)?
@@ -524,9 +524,9 @@ impl Ray {
   ///
   /// # Example
   /// ```rust,no_run
-  /// # use raydb::api::ray::Ray;
-  /// # use raydb::types::{NodeId, PropValue};
-  /// # fn main() -> raydb::error::Result<()> {
+  /// # use kitedb::api::ray::Ray;
+  /// # use kitedb::types::{NodeId, PropValue};
+  /// # fn main() -> kitedb::error::Result<()> {
   /// # let mut ray: Ray = unimplemented!();
   /// # let node_id: NodeId = 1;
   /// ray.update_by_id(node_id)?
@@ -556,9 +556,9 @@ impl Ray {
   ///
   /// # Example
   /// ```rust,no_run
-  /// # use raydb::api::ray::Ray;
-  /// # use raydb::types::PropValue;
-  /// # fn main() -> raydb::error::Result<()> {
+  /// # use kitedb::api::ray::Ray;
+  /// # use kitedb::types::PropValue;
+  /// # fn main() -> kitedb::error::Result<()> {
   /// # let mut ray: Ray = unimplemented!();
   /// ray.update_by_key("User", "alice")?
   ///     .set("name", PropValue::String("Alice Updated".into()))
@@ -614,10 +614,10 @@ impl Ray {
   ///
   /// # Example
   /// ```rust,no_run
-  /// # use raydb::api::ray::{NodeRef, Ray};
-  /// # use raydb::types::PropValue;
+  /// # use kitedb::api::ray::{NodeRef, Ray};
+  /// # use kitedb::types::PropValue;
   /// # use std::collections::HashMap;
-  /// # fn main() -> raydb::error::Result<()> {
+  /// # fn main() -> kitedb::error::Result<()> {
   /// # let mut ray: Ray = unimplemented!();
   /// # let alice: NodeRef = unimplemented!();
   /// # let bob: NodeRef = unimplemented!();
@@ -859,9 +859,9 @@ impl Ray {
   ///
   /// # Example
   /// ```rust,no_run
-  /// # use raydb::api::ray::Ray;
-  /// # use raydb::types::{NodeId, PropValue};
-  /// # fn main() -> raydb::error::Result<()> {
+  /// # use kitedb::api::ray::Ray;
+  /// # use kitedb::types::{NodeId, PropValue};
+  /// # fn main() -> kitedb::error::Result<()> {
   /// # let mut ray: Ray = unimplemented!();
   /// # let alice_id: NodeId = 1;
   /// # let bob_id: NodeId = 2;
@@ -961,8 +961,8 @@ impl Ray {
   ///
   /// # Example
   /// ```rust,no_run
-  /// # use raydb::api::ray::Ray;
-  /// # fn main() -> raydb::error::Result<()> {
+  /// # use kitedb::api::ray::Ray;
+  /// # fn main() -> kitedb::error::Result<()> {
   /// # let ray: Ray = unimplemented!();
   /// for node_ref in ray.all("User")? {
   ///     println!("User: {:?}", node_ref.id);
@@ -1001,8 +1001,8 @@ impl Ray {
   ///
   /// # Example
   /// ```rust,no_run
-  /// # use raydb::api::ray::Ray;
-  /// # fn main() -> raydb::error::Result<()> {
+  /// # use kitedb::api::ray::Ray;
+  /// # fn main() -> kitedb::error::Result<()> {
   /// # let ray: Ray = unimplemented!();
   /// for edge in ray.all_edges(Some("FOLLOWS"))? {
   ///     println!("{} -> {}", edge.src, edge.dst);
@@ -1033,8 +1033,8 @@ impl Ray {
   ///
   /// # Example
   /// ```rust,no_run
-  /// # use raydb::api::ray::Ray;
-  /// # fn main() -> raydb::error::Result<()> {
+  /// # use kitedb::api::ray::Ray;
+  /// # fn main() -> kitedb::error::Result<()> {
   /// # let ray: Ray = unimplemented!();
   /// let user_ref = ray.get_ref("User", "alice")?;
   /// if let Some(node) = user_ref {
@@ -1050,8 +1050,8 @@ impl Ray {
   ///
   /// # Example
   /// ```rust,no_run
-  /// # use raydb::api::ray::Ray;
-  /// # fn main() -> raydb::error::Result<()> {
+  /// # use kitedb::api::ray::Ray;
+  /// # fn main() -> kitedb::error::Result<()> {
   /// # let ray: Ray = unimplemented!();
   /// // Fast: only gets reference (~85ns)
   /// if let Some(node) = ray.get_ref("User", "alice")? {
@@ -1119,8 +1119,8 @@ impl Ray {
   /// # Example
   ///
   /// ```rust,no_run
-  /// # use raydb::api::ray::{NodeRef, Ray};
-  /// # fn main() -> raydb::error::Result<()> {
+  /// # use kitedb::api::ray::{NodeRef, Ray};
+  /// # fn main() -> kitedb::error::Result<()> {
   /// # let ray: Ray = unimplemented!();
   /// # let alice: NodeRef = unimplemented!();
   /// let friends = ray
@@ -1152,8 +1152,8 @@ impl Ray {
   /// # Example
   ///
   /// ```rust,no_run
-  /// # use raydb::api::ray::{NodeRef, Ray};
-  /// # fn main() -> raydb::error::Result<()> {
+  /// # use kitedb::api::ray::{NodeRef, Ray};
+  /// # fn main() -> kitedb::error::Result<()> {
   /// # let ray: Ray = unimplemented!();
   /// # let alice: NodeRef = unimplemented!();
   /// # let bob: NodeRef = unimplemented!();
@@ -1203,8 +1203,8 @@ impl Ray {
   /// # Example
   ///
   /// ```rust,no_run
-  /// # use raydb::api::ray::{NodeRef, Ray};
-  /// # fn main() -> raydb::error::Result<()> {
+  /// # use kitedb::api::ray::{NodeRef, Ray};
+  /// # fn main() -> kitedb::error::Result<()> {
   /// # let ray: Ray = unimplemented!();
   /// # let alice: NodeRef = unimplemented!();
   /// let reachable = ray.reachable_from(alice.id, 3, Some("FOLLOWS"))?;
@@ -1484,12 +1484,12 @@ impl Ray {
   ///
   /// # Example
   /// ```rust,no_run
-  /// # use raydb::api::ray::Ray;
+  /// # use kitedb::api::ray::Ray;
   /// # fn main() {
   /// # let ray: Ray = unimplemented!();
   /// println!("{}", ray.describe());
   /// // Output:
-  /// // RayDB at /path/to/db (multi-file format)
+  /// // KiteDB at /path/to/db (multi-file format)
   /// // Schema:
   /// //   Node types: User, Post, Comment
   /// //   Edge types: FOLLOWS, LIKES, WROTE
@@ -1514,7 +1514,7 @@ impl Ray {
     let delta_edges = stats.delta_edges_added as i64 - stats.delta_edges_deleted as i64;
 
     format!(
-      "RayDB at {} ({} format)\n\
+      "KiteDB at {} ({} format)\n\
        Schema:\n  \
          Node types: {}\n  \
          Edge types: {}\n\
@@ -1560,8 +1560,8 @@ impl Ray {
   ///
   /// # Example
   /// ```rust,no_run
-  /// # use raydb::api::ray::Ray;
-  /// # fn main() -> raydb::error::Result<()> {
+  /// # use kitedb::api::ray::Ray;
+  /// # fn main() -> kitedb::error::Result<()> {
   /// # let ray: Ray = unimplemented!();
   /// let result = ray.check()?;
   /// if !result.valid {
@@ -1681,9 +1681,9 @@ impl<'a> RayTraversalBuilder<'a> {
   ///
   /// # Example
   /// ```rust,no_run
-  /// # use raydb::api::ray::Ray;
-  /// # use raydb::types::NodeId;
-  /// # fn main() -> raydb::error::Result<()> {
+  /// # use kitedb::api::ray::Ray;
+  /// # use kitedb::types::NodeId;
+  /// # fn main() -> kitedb::error::Result<()> {
   /// # let ray: Ray = unimplemented!();
   /// # let user_id: NodeId = 1;
   /// let friends = ray.from(user_id)
@@ -1741,9 +1741,9 @@ impl<'a> RayTraversalBuilder<'a> {
   ///
   /// # Example
   /// ```rust,no_run
-  /// # use raydb::api::ray::Ray;
-  /// # use raydb::types::NodeId;
-  /// # fn main() -> raydb::error::Result<()> {
+  /// # use kitedb::api::ray::Ray;
+  /// # use kitedb::types::NodeId;
+  /// # fn main() -> kitedb::error::Result<()> {
   /// # let ray: Ray = unimplemented!();
   /// # let user_id: NodeId = 1;
   /// let edges: Vec<_> = ray.from(user_id)
@@ -2002,9 +2002,9 @@ impl Ray {
   ///
   /// # Example
   /// ```rust,no_run
-  /// # use raydb::api::ray::{BatchOp, Ray, RayOptions};
+  /// # use kitedb::api::ray::{BatchOp, Ray, RayOptions};
   /// # use std::collections::HashMap;
-  /// # fn main() -> raydb::error::Result<()> {
+  /// # fn main() -> kitedb::error::Result<()> {
   /// # let options = RayOptions::default();
   /// let mut ray = Ray::open("db", options)?;
   ///
@@ -2289,10 +2289,10 @@ impl Ray {
   ///
   /// # Example
   /// ```rust,no_run
-  /// # use raydb::api::ray::Ray;
-  /// # use raydb::types::PropValue;
+  /// # use kitedb::api::ray::Ray;
+  /// # use kitedb::types::PropValue;
   /// # use std::collections::HashMap;
-  /// # fn main() -> raydb::error::Result<()> {
+  /// # fn main() -> kitedb::error::Result<()> {
   /// # let mut ray: Ray = unimplemented!();
   /// let result = ray.transaction(|ctx| {
   ///   let alice = ctx.create_node("User", "alice", HashMap::new())?;
@@ -2432,9 +2432,9 @@ impl TxBuilder {
 ///
 /// # Example
 /// ```rust,no_run
-/// # use raydb::api::ray::{NodeRef, Ray};
-/// # use raydb::types::PropValue;
-/// # fn main() -> raydb::error::Result<()> {
+/// # use kitedb::api::ray::{NodeRef, Ray};
+/// # use kitedb::types::PropValue;
+/// # fn main() -> kitedb::error::Result<()> {
 /// # let mut ray: Ray = unimplemented!();
 /// # let alice: NodeRef = unimplemented!();
 /// // Update by node reference
@@ -2527,10 +2527,10 @@ impl<'a> RayUpdateNodeBuilder<'a> {
 ///
 /// # Example
 /// ```rust,no_run
-/// # use raydb::api::ray::Ray;
-/// # use raydb::types::PropValue;
+/// # use kitedb::api::ray::Ray;
+/// # use kitedb::types::PropValue;
 /// # use std::collections::HashMap;
-/// # fn main() -> raydb::error::Result<()> {
+/// # fn main() -> kitedb::error::Result<()> {
 /// # let mut ray: Ray = unimplemented!();
 /// # let props: HashMap<String, PropValue> = HashMap::new();
 /// # let alice_props: HashMap<String, PropValue> = HashMap::new();
@@ -2690,9 +2690,9 @@ impl<'a> InsertExecutorMultiple<'a> {
 ///
 /// # Example
 /// ```rust,no_run
-/// # use raydb::api::ray::Ray;
-/// # use raydb::types::{NodeId, PropValue};
-/// # fn main() -> raydb::error::Result<()> {
+/// # use kitedb::api::ray::Ray;
+/// # use kitedb::types::{NodeId, PropValue};
+/// # fn main() -> kitedb::error::Result<()> {
 /// # let mut ray: Ray = unimplemented!();
 /// # let alice_id: NodeId = 1;
 /// # let bob_id: NodeId = 2;
@@ -4426,7 +4426,7 @@ mod tests {
     let desc = ray.describe();
 
     // Should contain path
-    assert!(desc.contains("RayDB at"));
+    assert!(desc.contains("KiteDB at"));
     // Should mention format
     assert!(desc.contains("format"));
     // Should list node types

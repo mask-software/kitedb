@@ -5,8 +5,8 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 
 // Import from the crate being built
-extern crate raydb;
-use raydb::vector::{
+extern crate kitedb;
+use kitedb::vector::{
   batch_cosine_distance, batch_squared_euclidean, dot_product, l2_norm, normalize,
   squared_euclidean,
 };

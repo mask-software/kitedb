@@ -1,12 +1,12 @@
 //! Multi-Version Concurrency Control (MVCC)
 //!
-//! This module implements MVCC for RayDB, enabling snapshot isolation for
+//! This module implements MVCC for KiteDB, enabling snapshot isolation for
 //! concurrent transactions. MVCC allows multiple transactions to read data
 //! concurrently without blocking each other, while maintaining consistency.
 //!
 //! # Concurrency Model
 //!
-//! RayDB supports two levels of concurrency:
+//! KiteDB supports two levels of concurrency:
 //!
 //! ## 1. RwLock-based Concurrent Reads
 //!
@@ -28,7 +28,7 @@
 //!                     └──────┬──────┘
 //!                            │
 //!                     ┌──────▼──────┐
-//!                     │   RayDB     │
+//!                     │   KiteDB    │
 //!                     └─────────────┘
 //! ```
 //!

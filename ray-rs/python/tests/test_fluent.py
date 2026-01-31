@@ -1,7 +1,7 @@
 import os
 import tempfile
 
-from raydb import (
+from kitedb import (
     TraverseOptions,
     define_edge,
     define_node,

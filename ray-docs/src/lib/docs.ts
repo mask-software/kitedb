@@ -25,7 +25,7 @@ export const docsStructure: DocSection[] = [
       },
       {
         title: "Installation",
-        description: "How to install RayDB in your project",
+        description: "How to install KiteDB in your project",
         slug: "getting-started/installation",
       },
       {

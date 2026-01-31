@@ -14,19 +14,19 @@ const INSTALL_COMMANDS: InstallCommand[] = [
   {
     id: 'typescript',
     label: 'TypeScript',
-    command: 'bun add @ray-db/core',
-    secondary: 'npm install @ray-db/core',
+    command: 'bun add kitedb',
+    secondary: 'npm install kitedb',
   },
   {
     id: 'rust',
     label: 'Rust',
-    command: 'cargo add raydb',
+    command: 'cargo add kitedb',
   },
   {
     id: 'python',
     label: 'Python',
-    command: 'pip install raydb',
-    secondary: 'uv add raydb',
+    command: 'pip install kitedb',
+    secondary: 'uv add kitedb',
   },
 ]
 

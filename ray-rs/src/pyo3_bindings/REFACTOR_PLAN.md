@@ -160,13 +160,13 @@ impl Database {
 ```python
 # tests/test_bindings.py
 def test_database_open_close():
-    db = Database("test.raydb")
+    db = Database("test.kitedb")
     assert db.is_open
     db.close()
     assert not db.is_open
 
 def test_node_crud():
-    with Database("test.raydb") as db:
+    with Database("test.kitedb") as db:
         db.begin()
         node_id = db.create_node("test:1")
         assert db.node_exists(node_id)

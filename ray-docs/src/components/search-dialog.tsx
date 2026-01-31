@@ -107,7 +107,7 @@ export const SearchDialog: Component<SearchDialogProps> = (props) => {
               <div class="w-2.5 h-2.5 rounded-full bg-[#febc2e]" />
               <div class="w-2.5 h-2.5 rounded-full bg-[#28c840]" />
             </div>
-            <span class="text-xs font-mono text-slate-500">search — raydb docs</span>
+            <span class="text-xs font-mono text-slate-500">search — kitedb docs</span>
           </div>
 
           {/* Search input - console style */}

@@ -42,7 +42,7 @@ from typing import List, Optional
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 try:
-  from raydb import Database, OpenOptions
+  from kitedb import Database, OpenOptions
 except ImportError:
   print("Error: raydb module not found. Build the Python bindings first:")
   print("  cd ray-rs && maturin develop --features python")

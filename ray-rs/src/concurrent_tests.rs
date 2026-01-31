@@ -1,6 +1,6 @@
-//! Comprehensive concurrent access tests for RayDB
+//! Comprehensive concurrent access tests for KiteDB
 //!
-//! This module validates RayDB's concurrent access guarantees:
+//! This module validates KiteDB's concurrent access guarantees:
 //!
 //! # Test Categories
 //!
@@ -839,7 +839,7 @@ mod tests {
     // Note: SingleFileDB is not designed for concurrent access from multiple threads.
     // The internal LruCache is not Sync. This test verifies sequential performance.
     let temp_dir = tempdir().unwrap();
-    let db_path = temp_dir.path().join("test.raydb");
+    let db_path = temp_dir.path().join("test.kitedb");
 
     // Setup: Create database with data
     {

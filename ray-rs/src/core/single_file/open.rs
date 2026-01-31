@@ -417,7 +417,7 @@ mod tests {
   #[test]
   fn test_recover_incomplete_background_checkpoint() {
     let temp_dir = tempdir().unwrap();
-    let db_path = temp_dir.path().join("checkpoint-recover.raydb");
+    let db_path = temp_dir.path().join("checkpoint-recover.kitedb");
 
     let db = open_single_file(&db_path, SingleFileOpenOptions::new()).unwrap();
 
@@ -465,7 +465,7 @@ mod tests {
     let temp_dir = tempdir().unwrap();
     let db_path = temp_dir
       .path()
-      .join("checkpoint-recover-partial-header.raydb");
+      .join("checkpoint-recover-partial-header.kitedb");
 
     let db = open_single_file(&db_path, SingleFileOpenOptions::new()).unwrap();
 
@@ -533,7 +533,7 @@ mod tests {
     let temp_dir = tempdir().unwrap();
     let db_path = temp_dir
       .path()
-      .join("checkpoint-recover-missing-primary-head.raydb");
+      .join("checkpoint-recover-missing-primary-head.kitedb");
 
     let db = open_single_file(&db_path, SingleFileOpenOptions::new()).unwrap();
 

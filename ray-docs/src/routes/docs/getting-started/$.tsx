@@ -56,19 +56,19 @@ function DocPageContent(props: { slug: string }) {
       <DocPage slug={slug}>
         <p>
           Let's build a simple social graph database with users and their connections. 
-          By the end of this guide, you'll understand the core concepts of RayDB.
+          By the end of this guide, you'll understand the core concepts of KiteDB.
         </p>
 
         <h2 id="create-schema">1. Define Your Schema</h2>
         <p>
-          RayDB uses a schema to define nodes and edges. Let's create a simple 
+          KiteDB uses a schema to define nodes and edges. Let's create a simple 
           social network with users and follow relationships.
         </p>
         <MultiLangCode
-          typescript={`import { ray } from '@ray-db/core';
+          typescript={`import { ray } from 'kitedb';
 
 // Define schema inline when opening the database
-const db = ray('./social.raydb', {
+const db = ray('./social.kitedb', {
   nodes: [
     {
       name: 'user',
@@ -87,10 +87,10 @@ const db = ray('./social.raydb', {
     },
   ],
 });`}
-          rust={`use raydb::ray;
+          rust={`use kitedb::ray;
 
 // Define schema when opening the database
-let db = ray("./social.raydb", RayOptions {
+let db = ray("./social.kitedb", RayOptions {
     nodes: vec![
         NodeSpec::new("user")
             .prop("name", PropType::String)
@@ -102,7 +102,7 @@ let db = ray("./social.raydb", RayOptions {
     ],
     ..Default::default()
 })?;`}
-          python={`from raydb import ray, define_node, define_edge, prop
+          python={`from kitedb import ray, define_node, define_edge, prop
 
 # Define schema
 user = define_node("user",
@@ -118,7 +118,7 @@ follows = define_edge("follows", {
 })
 
 # Open database with schema
-db = ray("./social.raydb", nodes=[user], edges=[follows])`}
+db = ray("./social.kitedb", nodes=[user], edges=[follows])`}
           filename={{ ts: 'social.ts', rs: 'main.rs', py: 'social.py' }}
         />
 
@@ -218,14 +218,14 @@ db.close();`}
 db.close()
 
 # Better: use context manager
-with ray("./social.raydb", nodes=[user], edges=[follows]) as db:
+with ray("./social.kitedb", nodes=[user], edges=[follows]) as db:
     # ... operations ...
     pass  # Auto-closes on exit`}
         />
 
         <h2 id="next-steps">Next Steps</h2>
         <p>
-          Congratulations! You've built your first graph database with RayDB. 
+          Congratulations! You've built your first graph database with KiteDB. 
           Continue learning with these guides:
         </p>
         <ul>

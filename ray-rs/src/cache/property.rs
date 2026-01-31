@@ -66,8 +66,8 @@ impl PropertyCacheStats {
 ///
 /// # Example
 /// ```
-/// use raydb::cache::property::PropertyCache;
-/// use raydb::types::{PropertyCacheConfig, PropValue};
+/// use kitedb::cache::property::PropertyCache;
+/// use kitedb::types::{PropertyCacheConfig, PropValue};
 ///
 /// let config = PropertyCacheConfig {
 ///     max_node_props: 1000,

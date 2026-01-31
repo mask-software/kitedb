@@ -1,4 +1,4 @@
-//! Magic numbers and constants for RayDB
+//! Magic numbers and constants for KiteDB
 //!
 //! Ported from src/constants.ts
 
@@ -63,10 +63,10 @@ pub const TRASH_DIR: &str = "trash";
 // Single-file format constants
 // ============================================================================
 
-/// Magic bytes for single-file format: "RayDB format 1\0" (16 bytes)
-pub const MAGIC_RAYDB: [u8; 16] = [
-  0x52, 0x61, 0x79, 0x44, 0x42, 0x20, 0x66, 0x6f, // "RayDB fo"
-  0x72, 0x6d, 0x61, 0x74, 0x20, 0x31, 0x00, 0x00, // "rmat 1\0\0"
+/// Magic bytes for single-file format: "KiteDB format 1\0" (16 bytes)
+pub const MAGIC_KITEDB: [u8; 16] = [
+  0x4b, 0x69, 0x74, 0x65, 0x44, 0x42, 0x20, 0x66, // "KiteDB f"
+  0x6f, 0x72, 0x6d, 0x61, 0x74, 0x20, 0x31, 0x00, // "ormat 1\0"
 ];
 
 /// Single-file format version
@@ -74,7 +74,7 @@ pub const VERSION_SINGLE_FILE: u32 = 1;
 pub const MIN_READER_SINGLE_FILE: u32 = 1;
 
 /// Single-file extension
-pub const EXT_RAYDB: &str = ".raydb";
+pub const EXT_KITEDB: &str = ".kitedb";
 
 /// Default page size (4KB - matches OS page size and SSD blocks)
 pub const DEFAULT_PAGE_SIZE: usize = 4096;

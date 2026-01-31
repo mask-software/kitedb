@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-RayDB Python Bindings Benchmark
+KiteDB Python Bindings Benchmark
 
 Benchmarks for the Python bindings (PyO3 pyo3_bindings).
 Tests the SingleFileDB exposed via the Database class.
@@ -32,7 +32,7 @@ from typing import Dict, List, Optional, Set, Tuple
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 try:
-    from raydb import Database, PropValue
+    from kitedb import Database, PropValue
 except ImportError:
     print("Error: raydb module not found. Make sure to build the Python bindings first:")
     print("  cd ray-rs && maturin develop --features python")
@@ -53,7 +53,7 @@ class BenchConfig:
 
 
 def parse_args() -> BenchConfig:
-    parser = argparse.ArgumentParser(description="RayDB Python Bindings Benchmark")
+    parser = argparse.ArgumentParser(description="KiteDB Python Bindings Benchmark")
     parser.add_argument("--nodes", type=int, default=10000, help="Number of nodes")
     parser.add_argument("--edges", type=int, default=50000, help="Number of edges")
     parser.add_argument("--iterations", type=int, default=10000, help="Iterations for latency benchmarks")
@@ -777,7 +777,7 @@ def run_benchmarks(config: BenchConfig):
     
     now = datetime.now()
     logger.log("=" * 120)
-    logger.log("RayDB Python Bindings Benchmark")
+    logger.log("KiteDB Python Bindings Benchmark")
     logger.log("=" * 120)
     logger.log(f"Date: {now.isoformat()}")
     logger.log(f"Nodes: {format_number(config.nodes)}")

@@ -1,10 +1,10 @@
-//! RayDB - High-performance embedded graph database
+//! KiteDB - High-performance embedded graph database
 //!
-//! A Rust implementation of RayDB with NAPI bindings for Node.js/Bun.
+//! A Rust implementation of KiteDB with NAPI bindings for Node.js/Bun.
 //!
 //! # Architecture
 //!
-//! RayDB uses a **Snapshot + Delta + WAL** architecture:
+//! KiteDB uses a **Snapshot + Delta + WAL** architecture:
 //!
 //! - **Snapshot**: Memory-mapped CSR format for fast reads
 //! - **Delta**: In-memory overlay for pending changes
@@ -97,7 +97,7 @@ pub fn plus_100(input: u32) -> u32 {
   input + 100
 }
 
-/// Get RayDB version
+/// Get KiteDB version
 #[cfg(feature = "napi")]
 #[napi]
 pub fn version() -> String {
@@ -120,6 +120,6 @@ pub use napi_bindings::{
 // ============================================================================
 
 #[cfg(feature = "python")]
-pub use pyo3_bindings::raydb;
+pub use pyo3_bindings::kitedb;
 
 // Note: Full NAPI exports will be added as we implement each module

@@ -1,1 +1,1 @@
-export * from '@ray-db/core-wasm32-wasi'
+export * from 'kitedb-wasm32-wasi'

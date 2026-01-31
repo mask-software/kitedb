@@ -1,17 +1,17 @@
-# @ray-db/core
+# kitedb
 
-RayDB native bindings for Node.js (and WASI/browser builds), powered by Rust + N-API.
+KiteDB native bindings for Node.js (and WASI/browser builds), powered by Rust + N-API.
 
 Docs: https://ray-kwaf.vercel.app/docs
 
 ## Install
 
 ```bash
-npm install @ray-db/core
+npm install kitedb
 # or
-pnpm add @ray-db/core
+pnpm add kitedb
 # or
-yarn add @ray-db/core
+yarn add kitedb
 ```
 
 This package ships prebuilt binaries for major platforms. If a prebuild isn't available for your target, you'll need a Rust toolchain to build from source.
@@ -21,7 +21,7 @@ This package ships prebuilt binaries for major platforms. If a prebuild isn't av
 The fluent API provides a high-level, type-safe interface for schema-driven workflows:
 
 ```ts
-import { ray, node, edge, prop, optional } from '@ray-db/core'
+import { ray, node, edge, prop, optional } from 'kitedb'
 
 // Define your schema
 const User = node('user', {
@@ -38,7 +38,7 @@ const Knows = edge('knows', {
 })
 
 // Open database (async)
-const db = await ray('./social.raydb', {
+const db = await ray('./social.kitedb', {
   nodes: [User],
   edges: [Knows],
 })
@@ -64,9 +64,9 @@ db.close()
 For direct control, use the low-level `Database` class:
 
 ```ts
-import { Database, JsTraversalDirection, PropType, pathConfig, traversalStep } from '@ray-db/core'
+import { Database, JsTraversalDirection, PropType, pathConfig, traversalStep } from 'kitedb'
 
-const db = Database.open('example.raydb', { createIfMissing: true })
+const db = Database.open('example.kitedb', { createIfMissing: true })
 
 // Transactions are explicit for write operations
 db.begin()
@@ -107,7 +107,7 @@ db.close()
 ## Backups and health checks
 
 ```ts
-import { createBackup, restoreBackup, healthCheck } from '@ray-db/core'
+import { createBackup, restoreBackup, healthCheck } from 'kitedb'
 
 const backup = createBackup(db, 'backups/graph')
 const restoredPath = restoreBackup(backup.path, 'restored/graph')
@@ -119,7 +119,7 @@ console.log(health.healthy)
 ## Vector search
 
 ```ts
-import { createVectorIndex } from '@ray-db/core'
+import { createVectorIndex } from 'kitedb'
 
 const index = createVectorIndex({ dimensions: 3 })
 index.set(1, [0.1, 0.2, 0.3])
@@ -132,15 +132,15 @@ console.log(hits)
 
 ## Browser/WASI builds
 
-This package exposes a WASI-compatible build via the `browser` export for bundlers, backed by `@ray-db/core-wasm32-wasi`. If you need to import it directly:
+This package exposes a WASI-compatible build via the `browser` export for bundlers, backed by `kitedb-wasm32-wasi`. If you need to import it directly:
 
 ```ts
-import { Database } from '@ray-db/core-wasm32-wasi'
+import { Database } from 'kitedb-wasm32-wasi'
 ```
 
 ## Concurrent Access
 
-RayDB supports concurrent read operations. Multiple async calls can read from the database simultaneously without blocking each other:
+KiteDB supports concurrent read operations. Multiple async calls can read from the database simultaneously without blocking each other:
 
 ```ts
 // These execute concurrently - reads don't block each other

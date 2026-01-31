@@ -8,8 +8,8 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from raydb._raydb import IvfConfig, IvfIndex, SearchOptions, brute_force_search
-from raydb.builders import NodeRef
+from kitedb._kitedb import IvfConfig, IvfIndex, SearchOptions, brute_force_search
+from kitedb.builders import NodeRef
 
 
 _METRIC_MAP = {

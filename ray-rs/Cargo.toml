@@ -1,8 +1,8 @@
 [package]
-name = "raydb"
+name = "kitedb"
 version = "0.2.2"
 edition = "2021"
-authors = ["RayDB Contributors"]
+authors = ["KiteDB Contributors"]
 description = "High-performance embedded graph database"
 license = "MIT"
 readme = "CRATE_README.md"

@@ -227,8 +227,8 @@ impl std::fmt::Debug for TraversalStep {
 ///
 /// # Example
 /// ```rust,no_run
-/// # use raydb::api::traversal::{TraversalBuilder, TraversalDirection};
-/// # use raydb::types::{Edge, ETypeId, NodeId};
+/// # use kitedb::api::traversal::{TraversalBuilder, TraversalDirection};
+/// # use kitedb::types::{Edge, ETypeId, NodeId};
 /// # fn get_neighbors_fn(
 /// #   _: NodeId,
 /// #   _: TraversalDirection,
@@ -360,8 +360,8 @@ impl TraversalBuilder {
   ///
   /// # Example
   /// ```rust,no_run
-  /// # use raydb::api::traversal::TraversalBuilder;
-  /// # use raydb::types::ETypeId;
+  /// # use kitedb::api::traversal::TraversalBuilder;
+  /// # use kitedb::types::ETypeId;
   /// # fn main() {
   /// # let knows_etype: ETypeId = 1;
   /// let builder = TraversalBuilder::from_node(1)
@@ -384,8 +384,8 @@ impl TraversalBuilder {
   ///
   /// # Example
   /// ```rust,no_run
-  /// # use raydb::api::traversal::TraversalBuilder;
-  /// # use raydb::types::ETypeId;
+  /// # use kitedb::api::traversal::TraversalBuilder;
+  /// # use kitedb::types::ETypeId;
   /// # fn main() {
   /// # let knows_etype: ETypeId = 1;
   /// let builder = TraversalBuilder::from_node(1)
@@ -409,8 +409,8 @@ impl TraversalBuilder {
   ///
   /// # Example
   /// ```rust,no_run
-  /// # use raydb::api::traversal::TraversalBuilder;
-  /// # use raydb::types::ETypeId;
+  /// # use kitedb::api::traversal::TraversalBuilder;
+  /// # use kitedb::types::ETypeId;
   /// # fn main() {
   /// # let knows_etype: ETypeId = 1;
   /// let builder = TraversalBuilder::from_node(1)
@@ -1015,8 +1015,8 @@ where
 /// # Example
 ///
 /// ```rust,no_run
-/// # use raydb::api::traversal::{TraversalBuilder, TraversalDirection};
-/// # use raydb::types::{Edge, ETypeId, NodeId};
+/// # use kitedb::api::traversal::{TraversalBuilder, TraversalDirection};
+/// # use kitedb::types::{Edge, ETypeId, NodeId};
 /// # fn main() {
 /// # let knows_etype: ETypeId = 1;
 /// # let get_neighbors = |_: NodeId, _: TraversalDirection, _: Option<ETypeId>| -> Vec<Edge> {
@@ -1167,8 +1167,8 @@ impl TraversalBuilder {
   /// # Example
   ///
   /// ```rust,no_run
-  /// # use raydb::api::traversal::{TraversalBuilder, TraversalDirection};
-  /// # use raydb::types::{Edge, ETypeId, NodeId};
+  /// # use kitedb::api::traversal::{TraversalBuilder, TraversalDirection};
+  /// # use kitedb::types::{Edge, ETypeId, NodeId};
   /// # fn main() {
   /// # let knows_etype: ETypeId = 1;
   /// # let get_neighbors = |_: NodeId, _: TraversalDirection, _: Option<ETypeId>| -> Vec<Edge> {

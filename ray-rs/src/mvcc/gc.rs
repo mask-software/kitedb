@@ -423,8 +423,8 @@ impl BackgroundGcHandle {
 /// ```rust,no_run
 /// use parking_lot::Mutex;
 /// use std::sync::Arc;
-/// # use raydb::mvcc::{GcConfig, TxManager, VersionChainManager};
-/// # use raydb::mvcc::gc::start_background_gc;
+/// # use kitedb::mvcc::{GcConfig, TxManager, VersionChainManager};
+/// # use kitedb::mvcc::gc::start_background_gc;
 ///
 /// let tx_manager = Arc::new(Mutex::new(TxManager::new()));
 /// let version_chain = Arc::new(Mutex::new(VersionChainManager::new()));

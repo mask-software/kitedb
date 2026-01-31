@@ -29,7 +29,7 @@ fn open_soak_db(path: &std::path::Path) -> SingleFileDB {
 #[test]
 fn test_single_file_stress_checkpoint_reopen() {
   let temp_dir = tempfile::tempdir().unwrap();
-  let db_path = temp_dir.path().join("stress-single-file.raydb");
+  let db_path = temp_dir.path().join("stress-single-file.kitedb");
 
   let mut expected_keys: HashSet<String> = HashSet::new();
   let mut next_id = 0u64;
@@ -84,7 +84,7 @@ fn test_single_file_stress_checkpoint_reopen() {
 #[ignore]
 fn test_single_file_soak_long_run() {
   let temp_dir = tempfile::tempdir().unwrap();
-  let db_path = temp_dir.path().join("soak-single-file.raydb");
+  let db_path = temp_dir.path().join("soak-single-file.kitedb");
 
   let mut expected_keys: HashSet<String> = HashSet::new();
   let mut next_id = 0u64;

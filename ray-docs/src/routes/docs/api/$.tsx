@@ -62,7 +62,7 @@ function DocPageContent(props: { slug: string }) {
         <h2 id="ray-function">ray()</h2>
         <p>Initialize the database connection.</p>
         <CodeBlock
-          code={`import { ray } from '@ray-db/ray';
+          code={`import { ray } from 'kitedb';
 
 const db = await ray(path, options);`}
           language="typescript"
@@ -113,9 +113,9 @@ const db = await ray(path, options);`}
 
         <h2 id="storage-access">Storage Access</h2>
         <CodeBlock
-          code={`import { ray } from '@ray-db/ray';
+          code={`import { ray } from 'kitedb';
 
-const db = await ray('./data.raydb', { nodes, edges });
+const db = await ray('./data.kitedb', { nodes, edges });
 
 // Access the underlying storage
 const storage = db.storage;
@@ -157,12 +157,12 @@ for await (const { key, value } of storage.iterator({
     return (
       <DocPage slug={slug}>
         <p>
-          Complete reference for RayDB's vector search capabilities.
+          Complete reference for KiteDB's vector search capabilities.
         </p>
 
         <h2 id="vector-property">Defining Vector Properties</h2>
         <CodeBlock
-          code={`import { prop } from '@ray-db/ray';
+          code={`import { prop } from 'kitedb';
 
 // Define with dimensions
 embedding: prop.vector('embedding', 1536)

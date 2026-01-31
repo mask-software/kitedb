@@ -27,7 +27,7 @@ export const DocHeader: Component<DocHeaderProps> = (props) => {
         >
           <Logo size={24} />
           <span class="bg-gradient-to-r from-cyan-500 to-violet-500 bg-clip-text text-transparent">
-            RayDB
+            KiteDB
           </span>
         </Link>
       </div>

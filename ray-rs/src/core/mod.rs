@@ -1,4 +1,4 @@
-//! Core storage layer for RayDB
+//! Core storage layer for KiteDB
 
 pub mod compactor;
 pub mod delta;

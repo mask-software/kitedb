@@ -9,7 +9,7 @@ export const LANGUAGES = [
 
 export type Language = (typeof LANGUAGES)[number]
 
-const STORAGE_KEY = 'raydb-preferred-language'
+const STORAGE_KEY = 'kitedb-preferred-language'
 
 // Always start with default to match SSR output
 // This ensures hydration doesn't mismatch

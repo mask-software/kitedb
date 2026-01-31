@@ -1,6 +1,6 @@
-# RayDB for Python
+# KiteDB for Python
 
-RayDB is a high-performance embedded graph database with built-in vector search.
+KiteDB is a high-performance embedded graph database with built-in vector search.
 This package provides the Python bindings to the Rust core.
 
 ## Features
@@ -17,7 +17,7 @@ This package provides the Python bindings to the Rust core.
 ### From PyPI
 
 ```bash
-pip install raydb
+pip install kitedb
 ```
 
 ### From source
@@ -32,7 +32,7 @@ maturin develop --features python
 
 # Or build a wheel
 maturin build --features python --release
-pip install target/wheels/raydb-*.whl
+pip install target/wheels/kitedb-*.whl
 ```
 
 ## Quick start (fluent API)
@@ -40,7 +40,7 @@ pip install target/wheels/raydb-*.whl
 The fluent API provides a high-level, type-safe interface:
 
 ```python
-from raydb import ray, node, edge, prop, optional
+from kitedb import ray, node, edge, prop, optional
 
 # Define your schema
 User = node("user",
@@ -57,7 +57,7 @@ Knows = edge("knows", {
 })
 
 # Open database
-with ray("./social.raydb", nodes=[User], edges=[Knows]) as db:
+with ray("./social.kitedb", nodes=[User], edges=[Knows]) as db:
     # Insert nodes
     alice = db.insert(User).values(key="alice", name="Alice", email="alice@example.com").returning()
     bob = db.insert(User).values(key="bob", name="Bob", email="bob@example.com").returning()
@@ -77,9 +77,9 @@ with ray("./social.raydb", nodes=[User], edges=[Knows]) as db:
 For direct control, use the low-level `Database` class:
 
 ```python
-from raydb import Database, PropValue
+from kitedb import Database, PropValue
 
-with Database("my_graph.raydb") as db:
+with Database("my_graph.kitedb") as db:
     db.begin()
 
     alice = db.create_node("user:alice")
@@ -101,7 +101,7 @@ with Database("my_graph.raydb") as db:
 ## Fluent traversal
 
 ```python
-from raydb import TraverseOptions
+from kitedb import TraverseOptions
 
 friends = db.from_(alice).out(knows).to_list()
 
@@ -113,7 +113,7 @@ results = db.from_(alice).traverse(
 
 ## Concurrent Access
 
-RayDB supports concurrent read operations from multiple threads. Read operations don't block each other:
+KiteDB supports concurrent read operations from multiple threads. Read operations don't block each other:
 
 ```python
 import threading
@@ -150,7 +150,7 @@ Note: Python's GIL is released during Rust operations, allowing true parallelism
 ## Vector search
 
 ```python
-from raydb import IvfIndex, IvfConfig, SearchOptions
+from kitedb import IvfIndex, IvfConfig, SearchOptions
 
 index = IvfIndex(dimensions=128, config=IvfConfig(n_clusters=100))
 

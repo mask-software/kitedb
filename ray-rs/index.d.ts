@@ -1408,5 +1408,5 @@ export interface VectorSearchHit {
   similarity: number
 }
 
-/** Get RayDB version */
+/** Get KiteDB version */
 export declare function version(): string

@@ -1,11 +1,11 @@
 /**
- * Schema Definition API for RayDB
+ * Schema Definition API for KiteDB
  *
  * Provides type-safe schema builders for defining graph nodes and edges.
  *
  * @example
  * ```typescript
- * import { node, edge, prop, optional } from '@ray-db/core'
+ * import { node, edge, prop, optional } from 'kitedb-core'
  *
  * const User = node('user', {
  *   key: (id: string) => `user:${id}`,

@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::constants::{EXT_RAYDB, MANIFEST_FILENAME, SNAPSHOTS_DIR, WAL_DIR};
+use crate::constants::{EXT_KITEDB, MANIFEST_FILENAME, SNAPSHOTS_DIR, WAL_DIR};
 use crate::core::single_file::SingleFileDB;
 use crate::error::{RayError, Result};
 use crate::graph::db::GraphDB;
@@ -65,8 +65,8 @@ pub fn create_backup_single_file(
     ));
   }
 
-  if !backup_path.to_string_lossy().ends_with(EXT_RAYDB) {
-    backup_path = PathBuf::from(format!("{}{}", backup_path.to_string_lossy(), EXT_RAYDB));
+  if !backup_path.to_string_lossy().ends_with(EXT_KITEDB) {
+    backup_path = PathBuf::from(format!("{}{}", backup_path.to_string_lossy(), EXT_KITEDB));
   }
 
   if options.checkpoint && !db.read_only {
@@ -170,8 +170,8 @@ pub fn restore_backup(
 
   let metadata = fs::metadata(&backup_path)?;
   if metadata.is_file() {
-    if !restore_path.to_string_lossy().ends_with(EXT_RAYDB) {
-      restore_path = PathBuf::from(format!("{}{}", restore_path.to_string_lossy(), EXT_RAYDB));
+    if !restore_path.to_string_lossy().ends_with(EXT_KITEDB) {
+      restore_path = PathBuf::from(format!("{}{}", restore_path.to_string_lossy(), EXT_KITEDB));
     }
 
     ensure_parent_dir(&restore_path)?;

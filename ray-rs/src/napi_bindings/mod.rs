@@ -1,4 +1,4 @@
-//! NAPI bindings for RayDB
+//! NAPI bindings for KiteDB
 //!
 //! Exposes SingleFileDB and related types to Node.js/Bun.
 

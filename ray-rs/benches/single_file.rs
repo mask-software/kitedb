@@ -7,14 +7,14 @@ use criterion::{
 };
 use tempfile::tempdir;
 
-extern crate raydb;
+extern crate kitedb;
 
-use raydb::core::single_file::{
+use kitedb::core::single_file::{
   close_single_file, open_single_file, SingleFileOpenOptions, SyncMode,
 };
-use raydb::types::PropValue;
+use kitedb::types::PropValue;
 
-fn open_bench_db(path: &std::path::Path) -> raydb::core::single_file::SingleFileDB {
+fn open_bench_db(path: &std::path::Path) -> kitedb::core::single_file::SingleFileDB {
   open_single_file(
     path,
     SingleFileOpenOptions::new().sync_mode(SyncMode::Normal),

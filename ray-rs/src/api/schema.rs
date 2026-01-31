@@ -10,7 +10,7 @@
 //! # Example
 //!
 //! ```rust,no_run
-//! use raydb::api::schema::{node, edge, prop};
+//! use kitedb::api::schema::{node, edge, prop};
 //!
 //! let user = node("user")
 //!     .key(|id: &str| format!("user:{}", id))
@@ -153,7 +153,7 @@ impl PropDef {
 /// # Examples
 ///
 /// ```rust,no_run
-/// use raydb::api::schema::prop;
+/// use kitedb::api::schema::prop;
 ///
 /// let name = prop::string("name");           // required string
 /// let age = prop::int("age").optional();     // optional int
@@ -218,7 +218,7 @@ pub type KeyFn = Arc<dyn Fn(&str) -> String + Send + Sync>;
 /// # Example
 ///
 /// ```rust,no_run
-/// # use raydb::api::schema::key_fn;
+/// # use kitedb::api::schema::key_fn;
 /// let key_fn = key_fn(|id| format!("user:{}", id));
 /// ```
 pub fn key_fn<F>(f: F) -> KeyFn
@@ -317,7 +317,7 @@ impl NodeSchema {
 /// # Example
 ///
 /// ```rust,no_run
-/// # use raydb::api::schema::{node, prop};
+/// # use kitedb::api::schema::{node, prop};
 /// let user = node("user")
 ///     .key(|id| format!("user:{}", id))
 ///     .prop(prop::string("name"))
@@ -348,7 +348,7 @@ impl NodeSchemaBuilder {
   /// # Example
   ///
   /// ```rust,no_run
-  /// # use raydb::api::schema::node;
+  /// # use kitedb::api::schema::node;
   /// node("user")
   ///     .key(|id| format!("user:{}", id))
   ///     ;
@@ -377,7 +377,7 @@ impl NodeSchemaBuilder {
   /// # Example
   ///
   /// ```rust,no_run
-  /// # use raydb::api::schema::{node, prop};
+  /// # use kitedb::api::schema::{node, prop};
   /// node("user")
   ///     .prop(prop::string("name"))
   ///     .prop(prop::int("age").optional())
@@ -416,7 +416,7 @@ impl NodeSchemaBuilder {
 /// # Examples
 ///
 /// ```rust,no_run
-/// use raydb::api::schema::{node, prop};
+/// use kitedb::api::schema::{node, prop};
 ///
 /// // Full definition with key function
 /// let user = node("user")
@@ -506,7 +506,7 @@ impl EdgeSchema {
 /// # Example
 ///
 /// ```rust,no_run
-/// # use raydb::api::schema::{edge, prop};
+/// # use kitedb::api::schema::{edge, prop};
 /// let knows = edge("knows")
 ///     .prop(prop::int("since"))
 ///     .prop(prop::float("weight").optional())
@@ -533,7 +533,7 @@ impl EdgeSchemaBuilder {
   /// # Example
   ///
   /// ```rust,no_run
-  /// # use raydb::api::schema::{edge, prop};
+  /// # use kitedb::api::schema::{edge, prop};
   /// edge("knows")
   ///     .prop(prop::int("since"))
   ///     .prop(prop::float("weight").optional())
@@ -562,7 +562,7 @@ impl EdgeSchemaBuilder {
 /// # Examples
 ///
 /// ```rust,no_run
-/// use raydb::api::schema::{edge, prop};
+/// use kitedb::api::schema::{edge, prop};
 ///
 /// // Edge with properties
 /// let knows = edge("knows")
@@ -711,8 +711,8 @@ impl DatabaseSchema {
 /// # Example
 ///
 /// ```rust,no_run
-/// use raydb::schema;
-/// use raydb::api::schema::{node, edge, prop};
+/// use kitedb::schema;
+/// use kitedb::api::schema::{node, edge, prop};
 ///
 /// let schema = schema! {
 ///     nodes: [

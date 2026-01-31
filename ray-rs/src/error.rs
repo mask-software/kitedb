@@ -1,13 +1,13 @@
-//! Error types for RayDB
+//! Error types for KiteDB
 //!
 //! Uses thiserror for ergonomic error handling
 
 use crate::types::{NodeId, TxId};
 use thiserror::Error;
 
-/// Main error type for RayDB operations
+/// Main error type for KiteDB operations
 #[derive(Error, Debug)]
-pub enum RayError {
+pub enum KiteError {
   /// I/O error from file operations
   #[error("IO error: {0}")]
   Io(#[from] std::io::Error),
@@ -113,20 +113,23 @@ pub enum RayError {
   InvalidSchema(String),
 }
 
-/// Result type alias for RayDB operations
-pub type Result<T> = std::result::Result<T, RayError>;
+/// Result type alias for KiteDB operations
+pub type Result<T> = std::result::Result<T, KiteError>;
+
+/// Backwards compatibility alias
+pub type RayError = KiteError;
 
 /// Conflict error - specialized error for MVCC conflicts
 /// Allows extracting conflict details
-impl RayError {
+impl KiteError {
   /// Create a conflict error
   pub fn conflict(txid: TxId, keys: Vec<String>) -> Self {
-    RayError::Conflict { txid, keys }
+    KiteError::Conflict { txid, keys }
   }
 
   /// Check if this is a conflict error
   pub fn is_conflict(&self) -> bool {
-    matches!(self, RayError::Conflict { .. })
+    matches!(self, KiteError::Conflict { .. })
   }
 
   /// Get conflict keys if this is a conflict error

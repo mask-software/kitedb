@@ -1,5 +1,5 @@
 """
-Query Builders for RayDB
+Query Builders for KiteDB
 
 Fluent builders for insert, update, delete, and edge operations.
 These provide a type-safe, chainable API for database operations.
@@ -38,7 +38,7 @@ from typing import (
 from .schema import EdgeDef, NodeDef, PropDef
 
 if TYPE_CHECKING:
-    from raydb._raydb import Database, PropValue
+    from kitedb._kitedb import Database, PropValue
 
 
 # ============================================================================
@@ -157,7 +157,7 @@ class InsertExecutor(Generic[N]):
     
     def returning(self) -> Union[NodeRef[N], List[NodeRef[N]]]:
         """Execute insert and return the created node(s)."""
-        from raydb._raydb import PropValue
+        from kitedb._kitedb import PropValue
         
         # For batch inserts with many items, use Rust batch API
         if self._use_batch and len(self._data) > 1:
@@ -210,7 +210,7 @@ class InsertExecutor(Generic[N]):
     
     def _returning_batch(self) -> Union[NodeRef[N], List[NodeRef[N]]]:
         """Execute batch insert using Rust batch API."""
-        from raydb._raydb import PropValue
+        from kitedb._kitedb import PropValue
         
         # Prepare batch data: list of (key, [(prop_key_id, PropValue)])
         batch_nodes = []
@@ -407,7 +407,7 @@ class UpdateExecutor(Generic[N]):
     
     def execute(self) -> None:
         """Execute the update."""
-        from raydb._raydb import PropValue
+        from kitedb._kitedb import PropValue
         
         if self._where_id is None and self._where_key is None:
             raise ValueError("Update requires a where condition (id or key)")
@@ -465,7 +465,7 @@ class UpdateByRefExecutor:
     
     def execute(self) -> None:
         """Execute the update."""
-        from raydb._raydb import PropValue
+        from kitedb._kitedb import PropValue
         
         # Check if we're already in a transaction
         in_tx = self._db.has_transaction()
@@ -705,7 +705,7 @@ def create_link(
         resolve_etype_id: Function to resolve edge type ID
         resolve_prop_key_id: Function to resolve property key ID
     """
-    from raydb._raydb import PropValue
+    from kitedb._kitedb import PropValue
     
     etype_id = resolve_etype_id(edge_def)
     
@@ -797,7 +797,7 @@ class UpdateEdgeExecutor:
     
     def execute(self) -> None:
         """Execute the edge property update."""
-        from raydb._raydb import PropValue
+        from kitedb._kitedb import PropValue
         
         etype_id = self._resolve_etype_id(self._edge_def)
         

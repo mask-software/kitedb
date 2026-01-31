@@ -55,12 +55,12 @@ function DocPageContent(props: { slug: string }) {
     return (
       <DocPage slug={slug}>
         <p>
-          Learn about RayDB's internal architecture and design decisions.
+          Learn about KiteDB's internal architecture and design decisions.
         </p>
 
         <h2 id="overview">Overview</h2>
         <p>
-          RayDB is built on a layered architecture optimized for graph workloads:
+          KiteDB is built on a layered architecture optimized for graph workloads:
         </p>
         <ul>
           <li><strong>Query Layer</strong> – Fluent API and query planning</li>
@@ -98,7 +98,7 @@ r:{type}:{to}:{from}`}
     return (
       <DocPage slug={slug}>
         <p>
-          RayDB uses a Compressed Sparse Row (CSR) inspired format for 
+          KiteDB uses a Compressed Sparse Row (CSR) inspired format for 
           efficient edge storage and traversal.
         </p>
 
@@ -145,7 +145,7 @@ storage.iterator({
     return (
       <DocPage slug={slug}>
         <p>
-          Tips and techniques for getting the best performance from RayDB.
+          Tips and techniques for getting the best performance from KiteDB.
         </p>
 
         <h2 id="batch-operations">Batch Operations</h2>

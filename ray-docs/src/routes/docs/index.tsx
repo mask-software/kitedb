@@ -93,7 +93,7 @@ function DocsIndex() {
               <div class="w-2.5 h-2.5 rounded-full bg-[#febc2e]" />
               <div class="w-2.5 h-2.5 rounded-full bg-[#28c840]" />
             </div>
-            <span class="font-mono text-xs text-slate-500 ml-2">docs — raydb</span>
+            <span class="font-mono text-xs text-slate-500 ml-2">docs — kitedb</span>
           </div>
 
           <div class="flex items-center gap-3 mb-4">
@@ -103,13 +103,13 @@ function DocsIndex() {
             </h1>
           </div>
           <p class="text-slate-400 font-mono text-sm leading-relaxed max-w-2xl">
-            <span class="text-[#00d4ff]">$</span> Learn how to build high-performance graph databases with vector search using RayDB.
+            <span class="text-[#00d4ff]">$</span> Learn how to build high-performance graph databases with vector search using KiteDB.
           </p>
 
           {/* Quick command hint */}
           <div class="mt-6 flex items-center gap-4 text-xs font-mono">
             <span class="text-slate-500">Try:</span>
-            <code class="px-2 py-1 rounded bg-[#1a2a42] text-[#28c840]">bun add @ray-db/ray</code>
+            <code class="px-2 py-1 rounded bg-[#1a2a42] text-[#28c840]">bun add kitedb</code>
           </div>
         </div>
       </div>
@@ -139,7 +139,7 @@ function DocsIndex() {
                   ./install
                 </h3>
                 <p class="mt-1.5 text-sm text-slate-500">
-                  Set up RayDB in your project in under 2&nbsp;minutes.
+                  Set up KiteDB in your project in under 2&nbsp;minutes.
                 </p>
               </div>
               <ArrowRight size={18} class="flex-shrink-0 text-slate-600 group-hover:text-[#00d4ff] group-hover:translate-x-1 transition-all duration-150 mt-1" aria-hidden="true" />

@@ -1,10 +1,10 @@
 """
-Schema Definition API for RayDB
+Schema Definition API for KiteDB
 
 Provides type-safe schema builders for defining graph nodes and edges.
 
 Example:
-    >>> from raydb import node, edge, prop, optional
+    >>> from kitedb import node, edge, prop, optional
     >>> 
     >>> user = node("user",
     ...     key=lambda id: f"user:{id}",

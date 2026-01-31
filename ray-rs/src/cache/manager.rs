@@ -109,8 +109,8 @@ impl CacheManagerStats {
 ///
 /// # Example
 /// ```
-/// use raydb::cache::manager::CacheManager;
-/// use raydb::types::{CacheOptions, PropValue};
+/// use kitedb::cache::manager::CacheManager;
+/// use kitedb::types::{CacheOptions, PropValue};
 ///
 /// let mut cache = CacheManager::new(CacheOptions {
 ///     enabled: true,

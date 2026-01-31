@@ -1,4 +1,4 @@
-//! Python bindings for RayDB using PyO3
+//! Python bindings for KiteDB using PyO3
 //!
 //! Exposes SingleFileDB and related types to Python.
 //!
@@ -45,11 +45,11 @@ pub use vector::*;
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
 
-/// RayDB Python module
+/// KiteDB Python module
 #[cfg(feature = "python")]
 #[pymodule]
-#[pyo3(name = "_raydb")]
-pub fn raydb(m: &Bound<'_, PyModule>) -> PyResult<()> {
+#[pyo3(name = "_kitedb")]
+pub fn kitedb(m: &Bound<'_, PyModule>) -> PyResult<()> {
   // Database class
   m.add_class::<database::PyDatabase>()?;
 
@@ -124,7 +124,7 @@ pub fn raydb(m: &Bound<'_, PyModule>) -> PyResult<()> {
   Ok(())
 }
 
-/// Get RayDB version
+/// Get KiteDB version
 #[cfg(feature = "python")]
 #[pyfunction]
 pub fn version() -> String {

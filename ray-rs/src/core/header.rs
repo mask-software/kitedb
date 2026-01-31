@@ -19,9 +19,9 @@ impl DbHeaderV1 {
     }
 
     // Verify magic
-    if data[0..16] != MAGIC_RAYDB {
+    if data[0..16] != MAGIC_KITEDB {
       return Err(RayError::InvalidMagic {
-        expected: u32::from_le_bytes(MAGIC_RAYDB[0..4].try_into().unwrap()),
+        expected: u32::from_le_bytes(MAGIC_KITEDB[0..4].try_into().unwrap()),
         got: read_u32(data, 0),
       });
     }
@@ -119,7 +119,7 @@ impl DbHeaderV1 {
   /// Create a new header with default values
   pub fn new(page_size: u32, wal_pages: u64) -> Self {
     let mut magic = [0u8; 16];
-    magic.copy_from_slice(&MAGIC_RAYDB);
+    magic.copy_from_slice(&MAGIC_KITEDB);
 
     Self {
       magic,

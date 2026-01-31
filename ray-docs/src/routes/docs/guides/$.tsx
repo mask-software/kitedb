@@ -55,7 +55,7 @@ function DocPageContent(props: { slug: string }) {
     return (
       <DocPage slug={slug}>
         <p>
-          RayDB schemas define the structure of your graph data. 
+          KiteDB schemas define the structure of your graph data. 
           This guide covers how to define nodes, edges, and properties.
         </p>
 
@@ -65,9 +65,9 @@ function DocPageContent(props: { slug: string }) {
           and can have typed properties.
         </p>
         <MultiLangCode
-          typescript={`import { ray } from '@ray-db/core';
+          typescript={`import { ray } from 'kitedb';
 
-const db = ray('./blog.raydb', {
+const db = ray('./blog.kitedb', {
   nodes: [
     {
       name: 'article',
@@ -82,9 +82,9 @@ const db = ray('./blog.raydb', {
   ],
   edges: [],
 });`}
-          rust={`use raydb::ray;
+          rust={`use kitedb::ray;
 
-let db = ray("./blog.raydb", RayOptions {
+let db = ray("./blog.kitedb", RayOptions {
     nodes: vec![
         NodeSpec::new("article")
             .prop("title", PropType::String)
@@ -96,7 +96,7 @@ let db = ray("./blog.raydb", RayOptions {
     edges: vec![],
     ..Default::default()
 })?;`}
-          python={`from raydb import ray, define_node, prop
+          python={`from kitedb import ray, define_node, prop
 
 article = define_node("article",
     key=lambda id: f"article:{id}",
@@ -109,12 +109,12 @@ article = define_node("article",
     }
 )
 
-db = ray("./blog.raydb", nodes=[article], edges=[])`}
+db = ray("./blog.kitedb", nodes=[article], edges=[])`}
           filename={{ ts: 'schema.ts', rs: 'schema.rs', py: 'schema.py' }}
         />
 
         <h2 id="property-types">Property Types</h2>
-        <p>RayDB supports the following property types:</p>
+        <p>KiteDB supports the following property types:</p>
         <ul>
           <li><code>string</code> – Text strings</li>
           <li><code>int</code> – 64-bit integers</li>
@@ -128,7 +128,7 @@ db = ray("./blog.raydb", nodes=[article], edges=[])`}
           Edges connect nodes and can have their own properties.
         </p>
         <MultiLangCode
-          typescript={`const db = ray('./blog.raydb', {
+          typescript={`const db = ray('./blog.kitedb', {
   nodes: [
     { name: 'user', props: { name: { type: 'string' } } },
     { name: 'article', props: { title: { type: 'string' } } },
@@ -148,7 +148,7 @@ db = ray("./blog.raydb", nodes=[article], edges=[])`}
     },
   ],
 });`}
-          rust={`let db = ray("./blog.raydb", RayOptions {
+          rust={`let db = ray("./blog.kitedb", RayOptions {
     nodes: vec![
         NodeSpec::new("user").prop("name", PropType::String),
         NodeSpec::new("article").prop("title", PropType::String),
@@ -161,7 +161,7 @@ db = ray("./blog.raydb", nodes=[article], edges=[])`}
     ],
     ..Default::default()
 })?;`}
-          python={`from raydb import ray, define_node, define_edge, prop
+          python={`from kitedb import ray, define_node, define_edge, prop
 
 user = define_node("user",
     key=lambda id: f"user:{id}",
@@ -176,7 +176,7 @@ article = define_node("article",
 authored = define_edge("authored", {"role": prop.string("role")})
 likes = define_edge("likes", {"likedAt": prop.int("likedAt")})
 
-db = ray("./blog.raydb", nodes=[user, article], edges=[authored, likes])`}
+db = ray("./blog.kitedb", nodes=[user, article], edges=[authored, likes])`}
         />
 
         <h2 id="next-steps">Next Steps</h2>
@@ -192,7 +192,7 @@ db = ray("./blog.raydb", nodes=[user, article], edges=[authored, likes])`}
     return (
       <DocPage slug={slug}>
         <p>
-          Learn how to create, read, update, and delete data in RayDB.
+          Learn how to create, read, update, and delete data in KiteDB.
         </p>
 
         <h2 id="create">Creating Nodes</h2>
@@ -359,7 +359,7 @@ db.delete_by_key(user, "alice")`}
     return (
       <DocPage slug={slug}>
         <p>
-          RayDB provides powerful graph traversal capabilities to navigate 
+          KiteDB provides powerful graph traversal capabilities to navigate 
           relationships between nodes.
         </p>
 
@@ -525,20 +525,20 @@ top_connections = (db
     return (
       <DocPage slug={slug}>
         <p>
-          RayDB includes built-in vector search for semantic similarity queries. 
+          KiteDB includes built-in vector search for semantic similarity queries. 
           Store embeddings and find similar nodes using IVF indexing.
         </p>
 
         <h2 id="creating-index">Creating a Vector Index</h2>
         <MultiLangCode
-          typescript={`import { createVectorIndex } from '@ray-db/core';
+          typescript={`import { createVectorIndex } from 'kitedb';
 
 // Create an index for 1536-dimensional vectors (OpenAI embeddings)
 const index = createVectorIndex({
   dimensions: 1536,
   metric: 'Cosine',  // or 'Euclidean', 'DotProduct'
 });`}
-          rust={`use raydb::{VectorIndex, VectorIndexOptions, DistanceMetric};
+          rust={`use kitedb::{VectorIndex, VectorIndexOptions, DistanceMetric};
 
 // Create an index for 1536-dimensional vectors
 let mut index = VectorIndex::new(VectorIndexOptions {
@@ -546,7 +546,7 @@ let mut index = VectorIndex::new(VectorIndexOptions {
     metric: DistanceMetric::Cosine,
     ..Default::default()
 })?;`}
-          python={`from raydb import create_vector_index
+          python={`from kitedb import create_vector_index
 
 # Create an index for 1536-dimensional vectors
 index = create_vector_index(
@@ -681,15 +681,15 @@ print(f"Total vectors: {stats.total_vectors}")`}
     return (
       <DocPage slug={slug}>
         <p>
-          RayDB supports transactions for atomic operations. The low-level 
+          KiteDB supports transactions for atomic operations. The low-level 
           API provides explicit transaction control.
         </p>
 
         <h2 id="basic-transactions">Basic Transactions</h2>
         <MultiLangCode
-          typescript={`import { Database } from '@ray-db/core';
+          typescript={`import { Database } from 'kitedb';
 
-const db = Database.open('./my.raydb');
+const db = Database.open('./my.kitedb');
 
 // Begin a read-write transaction
 db.begin();
@@ -707,9 +707,9 @@ try {
   db.rollback();
   throw e;
 }`}
-          rust={`use raydb::Database;
+          rust={`use kitedb::Database;
 
-let db = Database::open("./my.raydb", None)?;
+let db = Database::open("./my.kitedb", None)?;
 
 // Begin a read-write transaction
 db.begin(false)?;
@@ -723,9 +723,9 @@ db.commit()?;
 
 // Or rollback on error
 // db.rollback()?;`}
-          python={`from raydb import Database
+          python={`from kitedb import Database
 
-db = Database("./my.raydb")
+db = Database("./my.kitedb")
 
 # Begin a read-write transaction
 db.begin()
@@ -806,13 +806,13 @@ if db.has_transaction():
     return (
       <DocPage slug={slug}>
         <p>
-          RayDB supports concurrent access from multiple threads, enabling
+          KiteDB supports concurrent access from multiple threads, enabling
           parallel reads for improved throughput in multi-threaded applications.
         </p>
 
         <h2 id="concurrency-model">Concurrency Model</h2>
         <p>
-          RayDB uses a <strong>readers-writer lock</strong> pattern:
+          KiteDB uses a <strong>readers-writer lock</strong> pattern:
         </p>
         <ul>
           <li>
@@ -843,7 +843,7 @@ const results = await Promise.all([
           rust={`use std::sync::{Arc, RwLock};
 use std::thread;
 
-let db = Arc::new(RwLock::new(Ray::open("./data.raydb")?));
+let db = Arc::new(RwLock::new(Ray::open("./data.kitedb")?));
 
 let handles: Vec<_> = (0..4).map(|i| {
     let db = Arc::clone(&db);
@@ -860,7 +860,7 @@ let results: Vec<_> = handles.into_iter()
     .collect();`}
           python={`import threading
 
-db = ray("./data.raydb", nodes=[user])
+db = ray("./data.kitedb", nodes=[user])
 results = {}
 
 def read_user(user_id: str):
@@ -946,7 +946,7 @@ print(results)`}
 
         <h2 id="mvcc">MVCC and Snapshot Isolation</h2>
         <p>
-          RayDB uses Multi-Version Concurrency Control (MVCC) to provide
+          KiteDB uses Multi-Version Concurrency Control (MVCC) to provide
           snapshot isolation:
         </p>
         <ul>

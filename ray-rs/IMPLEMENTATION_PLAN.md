@@ -1,6 +1,6 @@
-# RayDB Rust Implementation Plan
+# KiteDB Rust Implementation Plan
 
-A comprehensive plan to port RayDB (TypeScript/Bun embedded graph database) to Rust, maintaining feature parity while leveraging Rust's strengths.
+A comprehensive plan to port KiteDB (TypeScript/Bun embedded graph database) to Rust, maintaining feature parity while leveraging Rust's strengths.
 
 ## Table of Contents
 
@@ -21,7 +21,7 @@ A comprehensive plan to port RayDB (TypeScript/Bun embedded graph database) to R
 
 ## Architecture Overview
 
-RayDB uses a **Snapshot + Delta + WAL** architecture:
+KiteDB uses a **Snapshot + Delta + WAL** architecture:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -158,7 +158,7 @@ ray-rs/
 ### 1.1 Types (`src/types.rs`)
 
 ```rust
-//! Core type definitions for RayDB
+//! Core type definitions for KiteDB
 
 /// Monotonic node ID, never reused (safe integer up to 2^53-1)
 pub type NodeId = u64;
@@ -233,7 +233,7 @@ pub const MAGIC_MANIFEST: u32 = 0x4D424447; // "GDBM"
 pub const MAGIC_SNAPSHOT: u32 = 0x31534447; // "GDS1"
 pub const MAGIC_WAL: u32 = 0x31574447;      // "GDW1"
 
-// Single-file magic: "RayDB format 1\0"
+// Single-file magic: "KiteDB format 1\0"
 pub const MAGIC_RAYDB: [u8; 16] = [
     0x52, 0x61, 0x79, 0x44, 0x42, 0x20, 0x66, 0x6f,
     0x72, 0x6d, 0x61, 0x74, 0x20, 0x31, 0x00, 0x00,
@@ -269,7 +269,7 @@ pub const INITIAL_TX_ID: TxId = 1;
 ### 1.3 Error Types (`src/error.rs`)
 
 ```rust
-//! Error types for RayDB
+//! Error types for KiteDB
 
 use thiserror::Error;
 
@@ -1066,7 +1066,7 @@ impl GraphDB {
     pub fn open(path: impl AsRef<Path>, options: OpenOptions) -> Result<Self> {
         let path = path.as_ref();
         let is_single_file = path.extension()
-            .map(|e| e == "raydb")
+            .map(|e| e == "kitedb")
             .unwrap_or(false);
 
         if is_single_file {
@@ -2394,8 +2394,8 @@ The Rust implementation should be **binary-compatible** with the TypeScript vers
    - Same record framing (8-byte aligned)
    - Same CRC32C coverage
 
-3. **Single-file format (.raydb)**
-   - Same magic: "RayDB format 1\0"
+3. **Single-file format (.kitedb)**
+   - Same magic: "KiteDB format 1\0"
    - Same header layout
    - Same page-based structure
 
@@ -2490,12 +2490,12 @@ All multi-byte integers are stored **little-endian** (same as TypeScript DataVie
 
 ### 8.1 Overview
 
-Once RayDB is fully ported to Rust, we expose it to other languages via native bindings:
+Once KiteDB is fully ported to Rust, we expose it to other languages via native bindings:
 
 | Language | Binding Technology | Package Name |
 |----------|-------------------|--------------|
-| TypeScript/JavaScript | [NAPI-RS](https://napi.rs/) | `@raydb/core` |
-| Python | [PyO3](https://pyo3.rs/) + [Maturin](https://www.maturin.rs/) | `raydb` |
+| TypeScript/JavaScript | [NAPI-RS](https://napi.rs/) | `@kitedb/core` |
+| Python | [PyO3](https://pyo3.rs/) + [Maturin](https://www.maturin.rs/) | `kitedb` |
 
 ### 8.2 Project Structure
 
@@ -2503,9 +2503,9 @@ Once RayDB is fully ported to Rust, we expose it to other languages via native b
 ray-rs/
 ├── Cargo.toml              # Workspace root
 ├── crates/
-│   ├── raydb-core/         # Core Rust library (existing)
+│   ├── kitedb-core/         # Core Rust library (existing)
 │   │   └── Cargo.toml
-│   ├── raydb-napi/         # Node.js/Bun bindings
+│   ├── kitedb-napi/         # Node.js/Bun bindings
 │   │   ├── Cargo.toml
 │   │   ├── src/
 │   │   │   ├── lib.rs
@@ -2517,7 +2517,7 @@ ray-rs/
 │   │   │   └── types.rs    # Type conversions
 │   │   ├── index.d.ts      # TypeScript declarations
 │   │   └── package.json
-│   └── raydb-python/       # Python bindings
+│   └── kitedb-python/       # Python bindings
 │       ├── Cargo.toml
 │       ├── src/
 │       │   ├── lib.rs
@@ -2528,7 +2528,7 @@ ray-rs/
 │       │   ├── vector.rs
 │       │   └── types.rs
 │       ├── python/
-│       │   └── raydb/
+│       │   └── kitedb/
 │       │       ├── __init__.py
 │       │       └── py.typed  # PEP 561 marker
 │       └── pyproject.toml
@@ -2536,11 +2536,11 @@ ray-rs/
 
 ### 8.3 TypeScript/JavaScript Bindings (NAPI-RS)
 
-#### Dependencies (`raydb-napi/Cargo.toml`)
+#### Dependencies (`kitedb-napi/Cargo.toml`)
 
 ```toml
 [package]
-name = "raydb-napi"
+name = "kitedb-napi"
 version = "0.1.0"
 edition = "2021"
 
@@ -2548,7 +2548,7 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-raydb-core = { path = "../raydb-core" }
+kitedb-core = { path = "../kitedb-core" }
 napi = { version = "2", features = ["async", "serde-json"] }
 napi-derive = "2"
 serde = { version = "1.0", features = ["derive"] }
@@ -2558,14 +2558,14 @@ serde_json = "1.0"
 napi-build = "2"
 ```
 
-#### Core Bindings (`raydb-napi/src/lib.rs`)
+#### Core Bindings (`kitedb-napi/src/lib.rs`)
 
 ```rust
 #![deny(clippy::all)]
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
-use raydb_core::{GraphDB, OpenOptions as CoreOptions};
+use kitedb_core::{GraphDB, OpenOptions as CoreOptions};
 use std::sync::Arc;
 use parking_lot::RwLock;
 
@@ -2583,12 +2583,12 @@ pub use query::*;
 pub use vector::*;
 ```
 
-#### Database Handle (`raydb-napi/src/db.rs`)
+#### Database Handle (`kitedb-napi/src/db.rs`)
 
 ```rust
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
-use raydb_core::{GraphDB, OpenOptions as CoreOptions};
+use kitedb_core::{GraphDB, OpenOptions as CoreOptions};
 use std::sync::Arc;
 use parking_lot::RwLock;
 
@@ -2604,14 +2604,14 @@ pub struct OpenOptions {
     pub checkpoint_threshold: Option<f64>,
 }
 
-/// RayDB database handle
+/// KiteDB database handle
 #[napi]
-pub struct RayDB {
+pub struct KiteDB {
     inner: Arc<RwLock<GraphDB>>,
 }
 
 #[napi]
-impl RayDB {
+impl KiteDB {
     /// Open or create a database
     #[napi(factory)]
     pub fn open(path: String, options: Option<OpenOptions>) -> Result<Self> {
@@ -2645,15 +2645,15 @@ impl RayDB {
     #[napi]
     pub fn create_node(&self, key: Option<String>, props: Option<serde_json::Value>) -> Result<i64> {
         let mut db = self.inner.write();
-        let mut tx = raydb_core::begin_tx(&db);
+        let mut tx = kitedb_core::begin_tx(&db);
         
-        let node_id = raydb_core::create_node(&mut tx, raydb_core::NodeOpts {
+        let node_id = kitedb_core::create_node(&mut tx, kitedb_core::NodeOpts {
             key,
             props: props.map(|p| types::json_to_props(&db, p)).transpose()?,
             ..Default::default()
         });
         
-        raydb_core::commit(tx)
+        kitedb_core::commit(tx)
             .map_err(|e| Error::from_reason(e.to_string()))?;
         
         Ok(node_id as i64)
@@ -2663,19 +2663,19 @@ impl RayDB {
     #[napi]
     pub fn get_node_by_key(&self, key: String) -> Option<i64> {
         let db = self.inner.read();
-        raydb_core::get_node_by_key(&db, &key).map(|id| id as i64)
+        kitedb_core::get_node_by_key(&db, &key).map(|id| id as i64)
     }
 
     /// Add an edge
     #[napi]
     pub fn add_edge(&self, src: i64, edge_type: String, dst: i64) -> Result<()> {
         let mut db = self.inner.write();
-        let mut tx = raydb_core::begin_tx(&db);
+        let mut tx = kitedb_core::begin_tx(&db);
         
-        let etype = raydb_core::get_or_create_etype(&mut tx, &edge_type);
-        raydb_core::add_edge(&mut tx, src as u64, etype, dst as u64);
+        let etype = kitedb_core::get_or_create_etype(&mut tx, &edge_type);
+        kitedb_core::add_edge(&mut tx, src as u64, etype, dst as u64);
         
-        raydb_core::commit(tx)
+        kitedb_core::commit(tx)
             .map_err(|e| Error::from_reason(e.to_string()))
     }
 
@@ -2683,21 +2683,21 @@ impl RayDB {
     #[napi]
     pub fn get_neighbors(&self, node_id: i64, direction: String, edge_type: Option<String>) -> Result<Vec<i64>> {
         let db = self.inner.read();
-        let etype = edge_type.map(|et| raydb_core::get_etype_id(&db, &et)).flatten();
+        let etype = edge_type.map(|et| kitedb_core::get_etype_id(&db, &et)).flatten();
         
         let neighbors: Vec<i64> = match direction.as_str() {
-            "out" => raydb_core::get_neighbors_out(&db, node_id as u64, etype)
+            "out" => kitedb_core::get_neighbors_out(&db, node_id as u64, etype)
                 .map(|e| e.dst as i64)
                 .collect(),
-            "in" => raydb_core::get_neighbors_in(&db, node_id as u64, etype)
+            "in" => kitedb_core::get_neighbors_in(&db, node_id as u64, etype)
                 .map(|e| e.src as i64)
                 .collect(),
             "both" => {
-                let mut result: Vec<i64> = raydb_core::get_neighbors_out(&db, node_id as u64, etype)
+                let mut result: Vec<i64> = kitedb_core::get_neighbors_out(&db, node_id as u64, etype)
                     .map(|e| e.dst as i64)
                     .collect();
                 result.extend(
-                    raydb_core::get_neighbors_in(&db, node_id as u64, etype)
+                    kitedb_core::get_neighbors_in(&db, node_id as u64, etype)
                         .map(|e| e.src as i64)
                 );
                 result
@@ -2719,7 +2719,7 @@ impl RayDB {
         let db = self.inner.read();
         let query_f32: Vec<f32> = query.into_iter().map(|v| v as f32).collect();
         
-        let results = raydb_core::vector_search(&db, &query_f32, k as usize, options.map(Into::into))
+        let results = kitedb_core::vector_search(&db, &query_f32, k as usize, options.map(Into::into))
             .map_err(|e| Error::from_reason(e.to_string()))?;
         
         Ok(results.into_iter().map(Into::into).collect())
@@ -2740,7 +2740,7 @@ pub struct VectorSearchResult {
 }
 ```
 
-#### TypeScript Declarations (`raydb-napi/index.d.ts`)
+#### TypeScript Declarations (`kitedb-napi/index.d.ts`)
 
 ```typescript
 export interface OpenOptions {
@@ -2764,8 +2764,8 @@ export interface VectorSearchResult {
   similarity: number;
 }
 
-export class RayDB {
-  static open(path: string, options?: OpenOptions): RayDB;
+export class KiteDB {
+  static open(path: string, options?: OpenOptions): KiteDB;
   close(): void;
   createNode(key?: string, props?: Record<string, unknown>): number;
   getNodeByKey(key: string): number | null;
@@ -2777,20 +2777,20 @@ export class RayDB {
 
 ### 8.4 Python Bindings (PyO3)
 
-#### Dependencies (`raydb-python/Cargo.toml`)
+#### Dependencies (`kitedb-python/Cargo.toml`)
 
 ```toml
 [package]
-name = "raydb-python"
+name = "kitedb-python"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "raydb"
+name = "kitedb"
 crate-type = ["cdylib"]
 
 [dependencies]
-raydb-core = { path = "../raydb-core" }
+kitedb-core = { path = "../kitedb-core" }
 pyo3 = { version = "0.20", features = ["extension-module"] }
 numpy = "0.20"  # For efficient array handling
 
@@ -2798,12 +2798,12 @@ numpy = "0.20"  # For efficient array handling
 pyo3-build-config = "0.20"
 ```
 
-#### Core Bindings (`raydb-python/src/lib.rs`)
+#### Core Bindings (`kitedb-python/src/lib.rs`)
 
 ```rust
 use pyo3::prelude::*;
 use pyo3::exceptions::PyValueError;
-use raydb_core::{GraphDB, OpenOptions as CoreOptions};
+use kitedb_core::{GraphDB, OpenOptions as CoreOptions};
 use std::sync::Arc;
 use parking_lot::RwLock;
 use numpy::{PyArray1, PyReadonlyArray1};
@@ -2815,22 +2815,22 @@ mod query;
 mod vector;
 mod types;
 
-/// RayDB Python module
+/// KiteDB Python module
 #[pymodule]
-fn raydb(_py: Python, m: &PyModule) -> PyResult<()> {
-    m.add_class::<RayDB>()?;
+fn kitedb(_py: Python, m: &PyModule) -> PyResult<()> {
+    m.add_class::<KiteDB>()?;
     m.add_class::<OpenOptions>()?;
     m.add_class::<VectorSearchResult>()?;
     Ok(())
 }
 ```
 
-#### Database Handle (`raydb-python/src/db.rs`)
+#### Database Handle (`kitedb-python/src/db.rs`)
 
 ```rust
 use pyo3::prelude::*;
 use pyo3::exceptions::PyValueError;
-use raydb_core::{GraphDB, OpenOptions as CoreOptions};
+use kitedb_core::{GraphDB, OpenOptions as CoreOptions};
 use std::sync::Arc;
 use parking_lot::RwLock;
 use numpy::{PyArray1, PyReadonlyArray1};
@@ -2871,14 +2871,14 @@ impl OpenOptions {
     }
 }
 
-/// RayDB database handle
+/// KiteDB database handle
 #[pyclass]
-pub struct RayDB {
+pub struct KiteDB {
     inner: Arc<RwLock<GraphDB>>,
 }
 
 #[pymethods]
-impl RayDB {
+impl KiteDB {
     /// Open or create a database
     #[new]
     #[pyo3(signature = (path, options=None))]
@@ -2911,15 +2911,15 @@ impl RayDB {
     #[pyo3(signature = (key=None, props=None))]
     fn create_node(&self, key: Option<String>, props: Option<&PyDict>) -> PyResult<i64> {
         let mut db = self.inner.write();
-        let mut tx = raydb_core::begin_tx(&db);
+        let mut tx = kitedb_core::begin_tx(&db);
         
-        let node_id = raydb_core::create_node(&mut tx, raydb_core::NodeOpts {
+        let node_id = kitedb_core::create_node(&mut tx, kitedb_core::NodeOpts {
             key,
             props: props.map(|p| types::dict_to_props(&db, p)).transpose()?,
             ..Default::default()
         });
         
-        raydb_core::commit(tx)
+        kitedb_core::commit(tx)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         
         Ok(node_id as i64)
@@ -2928,18 +2928,18 @@ impl RayDB {
     /// Get node by key
     fn get_node_by_key(&self, key: &str) -> Option<i64> {
         let db = self.inner.read();
-        raydb_core::get_node_by_key(&db, key).map(|id| id as i64)
+        kitedb_core::get_node_by_key(&db, key).map(|id| id as i64)
     }
 
     /// Add an edge
     fn add_edge(&self, src: i64, edge_type: &str, dst: i64) -> PyResult<()> {
         let mut db = self.inner.write();
-        let mut tx = raydb_core::begin_tx(&db);
+        let mut tx = kitedb_core::begin_tx(&db);
         
-        let etype = raydb_core::get_or_create_etype(&mut tx, edge_type);
-        raydb_core::add_edge(&mut tx, src as u64, etype, dst as u64);
+        let etype = kitedb_core::get_or_create_etype(&mut tx, edge_type);
+        kitedb_core::add_edge(&mut tx, src as u64, etype, dst as u64);
         
-        raydb_core::commit(tx)
+        kitedb_core::commit(tx)
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
 
@@ -2947,21 +2947,21 @@ impl RayDB {
     #[pyo3(signature = (node_id, direction, edge_type=None))]
     fn get_neighbors(&self, node_id: i64, direction: &str, edge_type: Option<&str>) -> PyResult<Vec<i64>> {
         let db = self.inner.read();
-        let etype = edge_type.map(|et| raydb_core::get_etype_id(&db, et)).flatten();
+        let etype = edge_type.map(|et| kitedb_core::get_etype_id(&db, et)).flatten();
         
         let neighbors: Vec<i64> = match direction {
-            "out" => raydb_core::get_neighbors_out(&db, node_id as u64, etype)
+            "out" => kitedb_core::get_neighbors_out(&db, node_id as u64, etype)
                 .map(|e| e.dst as i64)
                 .collect(),
-            "in" => raydb_core::get_neighbors_in(&db, node_id as u64, etype)
+            "in" => kitedb_core::get_neighbors_in(&db, node_id as u64, etype)
                 .map(|e| e.src as i64)
                 .collect(),
             "both" => {
-                let mut result: Vec<i64> = raydb_core::get_neighbors_out(&db, node_id as u64, etype)
+                let mut result: Vec<i64> = kitedb_core::get_neighbors_out(&db, node_id as u64, etype)
                     .map(|e| e.dst as i64)
                     .collect();
                 result.extend(
-                    raydb_core::get_neighbors_in(&db, node_id as u64, etype)
+                    kitedb_core::get_neighbors_in(&db, node_id as u64, etype)
                         .map(|e| e.src as i64)
                 );
                 result
@@ -2984,7 +2984,7 @@ impl RayDB {
         let db = self.inner.read();
         let query_slice = query.as_slice()?;
         
-        let results = raydb_core::vector_search(&db, query_slice, k, n_probe.map(|np| raydb_core::VectorSearchOpts { n_probe: np, ..Default::default() }))
+        let results = kitedb_core::vector_search(&db, query_slice, k, n_probe.map(|np| kitedb_core::VectorSearchOpts { n_probe: np, ..Default::default() }))
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         
         Ok(results.into_iter().map(Into::into).collect())
@@ -3012,7 +3012,7 @@ pub struct VectorSearchResult {
 }
 ```
 
-#### Python Type Stubs (`raydb-python/python/raydb/__init__.pyi`)
+#### Python Type Stubs (`kitedb-python/python/kitedb/__init__.pyi`)
 
 ```python
 from typing import Optional, Dict, Any, List, Literal
@@ -3035,7 +3035,7 @@ class VectorSearchResult:
     distance: float
     similarity: float
 
-class RayDB:
+class KiteDB:
     def __init__(self, path: str, options: Optional[OpenOptions] = None) -> None: ...
     def close(self) -> None: ...
     def create_node(self, key: Optional[str] = None, props: Optional[Dict[str, Any]] = None) -> int: ...
@@ -3054,7 +3054,7 @@ class RayDB:
         n_probe: Optional[int] = None,
     ) -> List[VectorSearchResult]: ...
     
-    def __enter__(self) -> "RayDB": ...
+    def __enter__(self) -> "KiteDB": ...
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> bool: ...
 ```
 
@@ -3067,7 +3067,7 @@ class RayDB:
 npm install -g @napi-rs/cli
 
 # Build for current platform
-cd crates/raydb-napi
+cd crates/kitedb-napi
 napi build --release
 
 # Build for all platforms (CI)
@@ -3088,7 +3088,7 @@ napi build --release --platform
 pip install maturin
 
 # Build wheel for current platform
-cd crates/raydb-python
+cd crates/kitedb-python
 maturin build --release
 
 # Build and install locally

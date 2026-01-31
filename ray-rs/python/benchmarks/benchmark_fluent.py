@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-RayDB Python Fluent API Benchmark
+KiteDB Python Fluent API Benchmark
 
 Compares the new fluent API against the low-level API for common operations.
 This helps measure the overhead of the Python wrapper layer.
@@ -32,9 +32,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 try:
     # Low-level API
-    from raydb import Database, PropValue
+    from kitedb import Database, PropValue
     # Fluent API
-    from raydb import ray, define_node, define_edge, prop, optional
+    from kitedb import ray, define_node, define_edge, prop, optional
 except ImportError as e:
     print(f"Error: raydb module not found ({e}). Make sure to build the Python bindings first:")
     print("  cd ray-rs && maturin develop --features python")
@@ -72,7 +72,7 @@ class BenchConfig:
 
 
 def parse_args() -> BenchConfig:
-    parser = argparse.ArgumentParser(description="RayDB Python Fluent API Benchmark")
+    parser = argparse.ArgumentParser(description="KiteDB Python Fluent API Benchmark")
     parser.add_argument("--nodes", type=int, default=1000, help="Number of nodes")
     parser.add_argument("--edges", type=int, default=5000, help="Number of edges")
     parser.add_argument("--iterations", type=int, default=1000, help="Iterations for latency benchmarks")
@@ -322,7 +322,7 @@ def benchmark_fluent_traversal_load_props(db, user_refs: List, iterations: int) 
 def run_benchmarks(config: BenchConfig):
     now = datetime.now()
     print("=" * 100)
-    print("RayDB Python Fluent API vs Low-Level Benchmark")
+    print("KiteDB Python Fluent API vs Low-Level Benchmark")
     print("=" * 100)
     print(f"Date: {now.isoformat()}")
     print(f"Nodes: {format_number(config.nodes)}")

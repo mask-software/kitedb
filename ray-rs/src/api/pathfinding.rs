@@ -125,9 +125,9 @@ impl PathConfig {
 ///
 /// # Example
 /// ```rust,no_run
-/// # use raydb::api::pathfinding::{dijkstra, PathConfig};
-/// # use raydb::api::traversal::TraversalDirection;
-/// # use raydb::types::{Edge, ETypeId, NodeId};
+/// # use kitedb::api::pathfinding::{dijkstra, PathConfig};
+/// # use kitedb::api::traversal::TraversalDirection;
+/// # use kitedb::types::{Edge, ETypeId, NodeId};
 /// # fn get_neighbors(
 /// #   _: NodeId,
 /// #   _: TraversalDirection,
@@ -651,9 +651,9 @@ where
 ///
 /// # Example
 /// ```rust,no_run
-/// # use raydb::api::pathfinding::{yen_k_shortest, PathConfig};
-/// # use raydb::api::traversal::TraversalDirection;
-/// # use raydb::types::{Edge, ETypeId, NodeId};
+/// # use kitedb::api::pathfinding::{yen_k_shortest, PathConfig};
+/// # use kitedb::api::traversal::TraversalDirection;
+/// # use kitedb::types::{Edge, ETypeId, NodeId};
 /// # fn get_neighbors(
 /// #   _: NodeId,
 /// #   _: TraversalDirection,

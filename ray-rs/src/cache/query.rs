@@ -59,8 +59,8 @@ impl QueryCacheStats {
 ///
 /// # Example
 /// ```
-/// use raydb::cache::query::QueryCache;
-/// use raydb::types::QueryCacheConfig;
+/// use kitedb::cache::query::QueryCache;
+/// use kitedb::types::QueryCacheConfig;
 ///
 /// let config = QueryCacheConfig {
 ///     max_entries: 100,

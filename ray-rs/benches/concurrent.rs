@@ -15,11 +15,11 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use tempfile::tempdir;
 
-extern crate raydb;
-use raydb::api::ray::{EdgeDef, NodeDef, PropDef, Ray, RayOptions};
-use raydb::core::single_file::{open_single_file, SingleFileOpenOptions};
-use raydb::mvcc::TxManager;
-use raydb::types::PropValue;
+extern crate kitedb;
+use kitedb::api::ray::{EdgeDef, NodeDef, PropDef, Ray, RayOptions};
+use kitedb::core::single_file::{open_single_file, SingleFileOpenOptions};
+use kitedb::mvcc::TxManager;
+use kitedb::types::PropValue;
 
 // ============================================================================
 // Setup Helpers
@@ -451,7 +451,7 @@ fn bench_single_file_sequential_reads(c: &mut Criterion) {
   group.sample_size(20);
 
   let temp_dir = tempdir().unwrap();
-  let db_path = temp_dir.path().join("bench.raydb");
+  let db_path = temp_dir.path().join("bench.kitedb");
 
   // Setup database
   {
@@ -464,7 +464,7 @@ fn bench_single_file_sequential_reads(c: &mut Criterion) {
         .unwrap();
     }
     db.commit().unwrap();
-    raydb::core::single_file::close_single_file(db).unwrap();
+    kitedb::core::single_file::close_single_file(db).unwrap();
   }
 
   let db = open_single_file(&db_path, SingleFileOpenOptions::new()).unwrap();

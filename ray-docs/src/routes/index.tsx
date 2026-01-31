@@ -102,10 +102,10 @@ function HomePage() {
 
 	// Schema code examples for each language
 	const schemaCode = {
-		typescript: `import { ray } from '@ray-db/core';
+		typescript: `import { ray } from 'kitedb';
 
 // Open database with schema
-const db = ray('./knowledge.raydb', {
+const db = ray('./knowledge.kitedb', {
   nodes: [
     {
       name: 'document',
@@ -127,10 +127,10 @@ const db = ray('./knowledge.raydb', {
     },
   ],
 });`,
-		rust: `use raydb::ray;
+		rust: `use kitedb::ray;
 
 // Open database with schema
-let db = ray("./knowledge.raydb", RayOptions {
+let db = ray("./knowledge.kitedb", RayOptions {
     nodes: vec![
         NodeSpec::new("document")
             .prop("title", PropType::String)
@@ -145,7 +145,7 @@ let db = ray("./knowledge.raydb", RayOptions {
     ],
     ..Default::default()
 })?;`,
-		python: `from raydb import ray, define_node, define_edge, prop
+		python: `from kitedb import ray, define_node, define_edge, prop
 
 # Define schema
 document = define_node("document",
@@ -165,7 +165,7 @@ topic = define_node("topic",
 discusses = define_edge("discusses", {"relevance": prop.float("relevance")})
 
 # Open database
-db = ray("./knowledge.raydb", nodes=[document, topic], edges=[discusses])`,
+db = ray("./knowledge.kitedb", nodes=[document, topic], edges=[discusses])`,
 	};
 
 	const traversalCode = {
@@ -278,7 +278,7 @@ for hit in similar:
 const doc = db.insert('document')
   .values('doc-1', {
     title: 'Getting Started',
-    content: 'Welcome to RayDB...',
+    content: 'Welcome to KiteDB...',
   })
   .returning();
 
@@ -293,7 +293,7 @@ db.updateById(doc.id)
 let doc = db.insert("document")
     .values("doc-1", json!({
         "title": "Getting Started",
-        "content": "Welcome to RayDB...",
+        "content": "Welcome to KiteDB...",
     }))
     .returning()?;
 
@@ -308,7 +308,7 @@ db.update_by_id(doc.id)
     .execute()?;`,
 		python: `# Insert with returning
 doc = (db.insert(document)
-    .values(key="doc-1", title="Getting Started", content="Welcome to RayDB...")
+    .values(key="doc-1", title="Getting Started", content="Welcome to KiteDB...")
     .returning())
 
 # Create relationships
@@ -350,12 +350,12 @@ db.link(doc, discusses, topic, relevance=0.95)
 						<Link
 							to="/"
 							class="flex items-center gap-3 group"
-							aria-label="RayDB Home"
+							aria-label="KiteDB Home"
 						>
 							<div class="flex items-center gap-2 px-3 py-1.5 rounded-md bg-[#0a1628] border border-[#1a2a42] group-hover:border-[#00d4ff]/50 transition-colors">
 								<span class="text-[#00d4ff] font-mono text-sm">❯</span>
 								<Logo size={20} />
-								<span class="font-mono font-bold text-white">raydb</span>
+								<span class="font-mono font-bold text-white">kitedb</span>
 								<span class="console-cursor h-3 w-1.5" aria-hidden="true" />
 							</div>
 						</Link>
@@ -401,7 +401,7 @@ db.link(doc, discusses, topic, relevance=0.95)
 								target="_blank"
 								rel="noopener noreferrer"
 								class="flex items-center gap-2 px-3 py-1.5 rounded-md text-slate-400 hover:text-white bg-[#0a1628] border border-[#1a2a42] hover:border-[#00d4ff]/50 transition-colors duration-150 font-mono text-sm"
-								aria-label="View RayDB on GitHub"
+								aria-label="View KiteDB on GitHub"
 							>
 								<svg
 									class="w-4 h-4"
@@ -442,7 +442,7 @@ db.link(doc, discusses, topic, relevance=0.95)
 									<div class="console-dot console-dot--yellow" />
 									<div class="console-dot console-dot--green" />
 								</div>
-								<div class="console-title">raydb — bash — 120×40</div>
+								<div class="console-title">kitedb — bash — 120×40</div>
 								<div class="w-12" /> {/* Spacer for symmetry */}
 							</div>
 
@@ -477,7 +477,7 @@ db.link(doc, discusses, topic, relevance=0.95)
 								{/* Typing effect tagline */}
 								<div class="text-center py-4">
 									<h1 id="hero-heading" class="sr-only">
-										RayDB - The Graph Database Built for Speed
+										KiteDB - The Graph Database Built for Speed
 									</h1>
 									<p class="text-lg sm:text-xl text-slate-300">
 										<span class="text-[#00d4ff]">❯</span> {typedText()}
@@ -1026,7 +1026,7 @@ db.link(doc, discusses, topic, relevance=0.95)
 						<div class="flex items-center gap-3">
 							<span class="text-[#00d4ff]">❯</span>
 							<Logo size={20} />
-							<span class="text-slate-400">raydb</span>
+							<span class="text-slate-400">kitedb</span>
 							<span class="text-slate-600">v0.1.0</span>
 						</div>
 
@@ -1040,7 +1040,7 @@ db.link(doc, discusses, topic, relevance=0.95)
 							target="_blank"
 							rel="noopener noreferrer"
 							class="text-slate-500 hover:text-[#00d4ff] transition-colors"
-							aria-label="RayDB on GitHub"
+							aria-label="KiteDB on GitHub"
 						>
 							<svg
 								class="w-5 h-5"

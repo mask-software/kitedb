@@ -1,4 +1,4 @@
-//! Utility modules for RayDB
+//! Utility modules for KiteDB
 //!
 //! Contains binary encoding, hashing, compression, and other helpers.
 

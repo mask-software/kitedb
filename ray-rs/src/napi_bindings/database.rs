@@ -895,7 +895,7 @@ impl Database {
 
     let mut db_path = path_buf;
     if !is_single_file_path(&db_path) {
-      db_path = PathBuf::from(format!("{path}.raydb"));
+      db_path = PathBuf::from(format!("{path}.kitedb"));
     }
 
     let opts: RustOpenOptions = options.into();

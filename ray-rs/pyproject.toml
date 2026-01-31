@@ -3,7 +3,7 @@ requires = ["maturin>=1.4,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "raydb"
+name = "kitedb"
 version = "0.2.2"
 description = "High-performance embedded graph database with vector search"
 readme = "python/README.md"
@@ -26,7 +26,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 authors = [
-    { name = "RayDB Contributors" }
+    { name = "KiteDB Contributors" }
 ]
 
 [project.optional-dependencies]
@@ -38,15 +38,15 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/raydb/raydb"
-Documentation = "https://github.com/raydb/raydb#readme"
-Repository = "https://github.com/raydb/raydb"
+Homepage = "https://github.com/maskdotdev/kite"
+Documentation = "https://github.com/maskdotdev/kite#readme"
+Repository = "https://github.com/maskdotdev/kite"
 
 [tool.maturin]
 features = ["python"]
 no-default-features = true
 python-source = "python"
-module-name = "raydb._raydb"
+module-name = "kitedb._kitedb"
 strip = true
 
 [tool.pytest.ini_options]

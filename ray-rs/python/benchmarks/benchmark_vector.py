@@ -34,7 +34,7 @@ from typing import List, Optional
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 try:
-  from raydb import (
+  from kitedb import (
       VectorIndexOptions,
       SimilarOptions,
       create_vector_index,

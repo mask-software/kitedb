@@ -20,8 +20,8 @@ import {
 } from '../index'
 
 const makeDbPath = () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'raydb-'))
-  return path.join(dir, 'test.raydb')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kitedb-'))
+  return path.join(dir, 'test.kitedb')
 }
 
 test('sync function from native code', (t) => {
@@ -149,8 +149,8 @@ test('weighted dijkstra uses edge property', (t) => {
 })
 
 test('backup/restore APIs', (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'raydb-'))
-  const dbPath = path.join(dir, 'source.raydb')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kitedb-'))
+  const dbPath = path.join(dir, 'source.kitedb')
   const db = Database.open(dbPath)
   db.begin()
 
@@ -159,7 +159,7 @@ test('backup/restore APIs', (t) => {
 
   const backupBase = path.join(dir, 'backup')
   const backup = createBackup(db, backupBase)
-  t.true(backup.path.endsWith('.raydb'))
+  t.true(backup.path.endsWith('.kitedb'))
 
   const info = getBackupInfo(backup.path)
   t.is(info.path, backup.path)
