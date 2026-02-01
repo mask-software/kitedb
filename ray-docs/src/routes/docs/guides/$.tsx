@@ -685,6 +685,79 @@ print(f"Total vectors: {stats.total_vectors}")`}
           API provides explicit transaction control.
         </p>
 
+        <h2 id="high-level">High-Level Transactions (Kite)</h2>
+        <p>
+          The high-level <code>Kite</code> API supports explicit transactions for batching
+          multiple operations into a single commit. When the callback completes, the
+          transaction commits; on error it rolls back.
+        </p>
+        <MultiLangCode
+          typescript={`import { kite } from '@kitedb/core';
+
+const db = await kite('./my.kitedb', { nodes: [User], edges: [follows] });
+
+await db.transaction(async (ctx) => {
+  const alice = ctx.insert('user').values('alice', { name: 'Alice' }).returning();
+  const bob = ctx.insert('user').values('bob', { name: 'Bob' }).returning();
+  ctx.link(alice.id, 'follows', bob.id, { since: 2024 });
+});`}
+          rust={`use kitedb::api::kite::Kite;
+use std::collections::HashMap;
+
+let mut db = Kite::open("./my.kitedb", options)?;
+
+db.transaction(|ctx| {
+    let alice = ctx.create_node("user", "alice", HashMap::new())?;
+    let bob = ctx.create_node("user", "bob", HashMap::new())?;
+    ctx.link(alice.id, "follows", bob.id)?;
+    Ok(())
+})?;`}
+          python={`from kitedb import kite
+
+db = kite("./my.kitedb", nodes=[user], edges=[follows])
+
+with db.transaction():
+    alice = db.insert(user).values(key="alice", name="Alice").returning()
+    bob = db.insert(user).values(key="bob", name="Bob").returning()
+    db.link(alice, follows, bob, since=2024)`}
+        />
+
+        <h2 id="batch">Batch Operations</h2>
+        <p>
+          Batch operations run in a single transaction. This is ideal for fast
+          ingestion (e.g., indexing a codebase) and guarantees atomicity.
+        </p>
+        <MultiLangCode
+          typescript={`// Batch with builder/executor operations (sync)
+db.batch([
+  db.insert('user').values('alice', { name: 'Alice' }),
+  db.insert('user').values('bob', { name: 'Bob' }),
+  () => db.link(aliceId, 'follows', bobId, { since: 2024 }),
+]);`}
+          rust={`use kitedb::api::kite::BatchOp;
+
+db.batch(vec![
+    BatchOp::CreateNode { node_type: "user".into(), key_suffix: "alice".into(), props: HashMap::new() },
+    BatchOp::CreateNode { node_type: "user".into(), key_suffix: "bob".into(), props: HashMap::new() },
+])?;`}
+          python={`db.batch([
+    db.insert(user).values(key="alice", name="Alice"),
+    db.insert(user).values(key="bob", name="Bob"),
+])`}
+        />
+
+        <h2 id="limitations">Current Limitations</h2>
+        <ul>
+          <li>
+            Traversal and path queries read the committed view. If you need to
+            traverse newly written edges, commit first.
+          </li>
+          <li>
+            JavaScript <code>batch()</code> is synchronous; avoid async work inside
+            a batch (do async work first, then batch the writes).
+          </li>
+        </ul>
+
         <h2 id="basic-transactions">Basic Transactions</h2>
         <MultiLangCode
           typescript={`import { Database } from '@kitedb/core';
@@ -779,7 +852,7 @@ if (db.hasTransaction()) {
 }
 
 // The Kite high-level API auto-manages transactions
-// Each operation is atomic by default`}
+// and also supports explicit db.transaction()/db.batch()`}
           rust={`// Check if there's an active transaction
 if db.has_transaction() {
     println!("Transaction is active");
