@@ -11,6 +11,7 @@ on:
       - main
     paths:
       - "ray-rs/**"
+      - ".github/workflows/ray-rs.yml"
   workflow_dispatch:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
