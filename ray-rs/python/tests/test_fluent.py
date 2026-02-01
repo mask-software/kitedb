@@ -11,6 +11,7 @@ from kitedb import (
     VectorIndexOptions,
     SimilarOptions,
 )
+from kitedb.builders import from_prop_value
 
 
 def _build_schema():
@@ -49,6 +50,48 @@ def test_upsert_inserts_and_updates():
 
             deleted = db.upsert(user).values(key="alice", name=None).returning()
             assert deleted.name is None
+
+
+def test_upsert_by_id_and_edge():
+    user, knows = _build_schema()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "fluent.kitedb")
+        with kite(path, nodes=[user], edges=[knows]) as db:
+            db.upsert_by_id(user, 42).set(name="Alice", age=30).execute()
+
+            name_key = db._resolve_prop_key_id(user, "name")
+            age_key = db._resolve_prop_key_id(user, "age")
+
+            name = db._db.get_node_prop(42, name_key)
+            age = db._db.get_node_prop(42, age_key)
+            assert name is not None
+            assert age is not None
+            assert from_prop_value(name) == "Alice"
+            assert from_prop_value(age) == 30
+
+            db.upsert_by_id(user, 42).set(name=None, age=31).execute()
+
+            name = db._db.get_node_prop(42, name_key)
+            age = db._db.get_node_prop(42, age_key)
+            assert name is None
+            assert age is not None
+            assert from_prop_value(age) == 31
+
+            alice = db.insert(user).values(key="alice", name="Alice", age=30).returning()
+            bob = db.insert(user).values(key="bob", name="Bob", age=25).returning()
+
+            db.upsert_edge(alice, knows, bob).set(since=2020).execute()
+
+            etype_id = db._resolve_etype_id(knows)
+            since_key = db._resolve_prop_key_id(knows, "since")
+            since = db._db.get_edge_prop(alice.id, etype_id, bob.id, since_key)
+            assert since is not None
+            assert from_prop_value(since) == 2020
+
+            db.upsert_edge(alice, knows, bob).set(since=None).execute()
+            since = db._db.get_edge_prop(alice.id, etype_id, bob.id, since_key)
+            assert since is None
 
 
 def test_traversal_select_edges():

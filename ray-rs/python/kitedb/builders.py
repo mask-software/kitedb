@@ -31,6 +31,7 @@ from typing import (
     List,
     Optional,
     Protocol,
+    Tuple,
     TypeVar,
     Union,
 )
@@ -734,6 +735,104 @@ class UpdateByRefBuilder:
 
 
 # ============================================================================
+# Upsert By ID Builder
+# ============================================================================
+
+class UpsertByIdExecutor:
+    """Executor for upserting a node by ID."""
+
+    def __init__(
+        self,
+        db: Database,
+        node_def: NodeDef[Any],
+        node_id: int,
+        data: Dict[str, Any],
+        resolve_prop_key_id: Callable[[NodeDef, str], int],
+    ):
+        self._db = db
+        self._node_def = node_def
+        self._node_id = node_id
+        self._data = data
+        self._resolve_prop_key_id = resolve_prop_key_id
+
+    def execute(self) -> None:
+        """Execute the upsert."""
+        from kitedb._kitedb import PropValue
+
+        prop_updates: List[Tuple[int, Optional[PropValue]]] = []
+        for prop_name, value in self._data.items():
+            prop_def = self._node_def.props.get(prop_name)
+            if prop_def is None:
+                continue
+
+            prop_key_id = self._resolve_prop_key_id(self._node_def, prop_name)
+
+            if value is None:
+                prop_updates.append((prop_key_id, None))
+            else:
+                prop_value = to_prop_value(prop_def, value, PropValue)
+                prop_updates.append((prop_key_id, prop_value))
+
+        # Check if we're already in a transaction
+        in_tx = self._db.has_transaction()
+        if not in_tx:
+            self._db.begin()
+        try:
+            self._db.upsert_node_by_id(self._node_id, prop_updates)
+            if not in_tx:
+                self._db.commit()
+        except Exception:
+            if not in_tx:
+                self._db.rollback()
+            raise
+
+
+class UpsertByIdBuilder(Generic[N]):
+    """
+    Builder for upserting a node by ID.
+
+    Example:
+        >>> db.upsert_by_id(user, 42).set(name="Alice").execute()
+    """
+
+    def __init__(
+        self,
+        db: Database,
+        node_def: N,
+        node_id: int,
+        resolve_prop_key_id: Callable[[NodeDef, str], int],
+    ):
+        self._db = db
+        self._node_def = node_def
+        self._node_id = node_id
+        self._resolve_prop_key_id = resolve_prop_key_id
+
+    def set(self, data: Optional[Dict[str, Any]] = None, **kwargs: Any) -> UpsertByIdExecutor:
+        """
+        Set the properties to upsert.
+
+        Args:
+            data: Dictionary of property values
+            **kwargs: Alternative way to pass property values
+
+        Returns:
+            UpsertByIdExecutor for executing
+        """
+        if data is None:
+            data = kwargs
+        elif kwargs:
+            data = {**data, **kwargs}
+
+        return UpsertByIdExecutor(
+            db=self._db,
+            node_def=self._node_def,
+            node_id=self._node_id,
+            data=data,
+            resolve_prop_key_id=self._resolve_prop_key_id,
+        )
+
+
+# ============================================================================
 # Delete Builder
 # ============================================================================
 
@@ -1034,6 +1133,121 @@ class UpdateEdgeBuilder(Generic[E]):
         )
 
 
+# ============================================================================
+# Upsert Edge Builder
+# ============================================================================
+
+class UpsertEdgeExecutor:
+    """Executor for edge upsert operations."""
+
+    def __init__(
+        self,
+        db: Database,
+        src: NodeRef[Any],
+        edge_def: EdgeDef,
+        dst: NodeRef[Any],
+        data: Dict[str, Any],
+        resolve_etype_id: Callable[[EdgeDef], int],
+        resolve_prop_key_id: Callable[[EdgeDef, str], int],
+    ):
+        self._db = db
+        self._src = src
+        self._edge_def = edge_def
+        self._dst = dst
+        self._data = data
+        self._resolve_etype_id = resolve_etype_id
+        self._resolve_prop_key_id = resolve_prop_key_id
+
+    def execute(self) -> None:
+        """Execute the edge upsert."""
+        from kitedb._kitedb import PropValue
+
+        etype_id = self._resolve_etype_id(self._edge_def)
+
+        # Check if we're already in a transaction
+        in_tx = self._db.has_transaction()
+        if not in_tx:
+            self._db.begin()
+        try:
+            if not self._db.edge_exists(self._src.id, etype_id, self._dst.id):
+                self._db.add_edge(self._src.id, etype_id, self._dst.id)
+
+            for prop_name, value in self._data.items():
+                prop_def = self._edge_def.props.get(prop_name)
+                if prop_def is None:
+                    continue
+
+                prop_key_id = self._resolve_prop_key_id(self._edge_def, prop_name)
+
+                if value is None:
+                    self._db.delete_edge_prop(
+                        self._src.id, etype_id, self._dst.id, prop_key_id
+                    )
+                else:
+                    prop_value = to_prop_value(prop_def, value, PropValue)
+                    self._db.set_edge_prop(
+                        self._src.id, etype_id, self._dst.id, prop_key_id, prop_value
+                    )
+
+            if not in_tx:
+                self._db.commit()
+        except Exception:
+            if not in_tx:
+                self._db.rollback()
+            raise
+
+
+class UpsertEdgeBuilder(Generic[E]):
+    """
+    Builder for edge upsert operations.
+
+    Example:
+        >>> db.upsert_edge(alice, knows, bob).set(weight=0.9).execute()
+    """
+
+    def __init__(
+        self,
+        db: Database,
+        src: NodeRef[Any],
+        edge_def: E,
+        dst: NodeRef[Any],
+        resolve_etype_id: Callable[[EdgeDef], int],
+        resolve_prop_key_id: Callable[[EdgeDef, str], int],
+    ):
+        self._db = db
+        self._src = src
+        self._edge_def = edge_def
+        self._dst = dst
+        self._resolve_etype_id = resolve_etype_id
+        self._resolve_prop_key_id = resolve_prop_key_id
+
+    def set(self, data: Optional[Dict[str, Any]] = None, **kwargs: Any) -> UpsertEdgeExecutor:
+        """
+        Set the edge properties to upsert.
+
+        Args:
+            data: Dictionary of property values
+            **kwargs: Alternative way to pass property values
+
+        Returns:
+            UpsertEdgeExecutor for executing
+        """
+        if data is None:
+            data = kwargs
+        else:
+            data = {**data, **kwargs}
+
+        return UpsertEdgeExecutor(
+            db=self._db,
+            src=self._src,
+            edge_def=self._edge_def,
+            dst=self._dst,
+            data=data,
+            resolve_etype_id=self._resolve_etype_id,
+            resolve_prop_key_id=self._resolve_prop_key_id,
+        )
+
+
 __all__ = [
     "NodeRef",
     "InsertBuilder",
@@ -1042,10 +1256,14 @@ __all__ = [
     "UpdateExecutor",
     "UpdateByRefBuilder",
     "UpdateByRefExecutor",
+    "UpsertByIdBuilder",
+    "UpsertByIdExecutor",
     "DeleteBuilder",
     "DeleteExecutor",
     "UpdateEdgeBuilder",
     "UpdateEdgeExecutor",
+    "UpsertEdgeBuilder",
+    "UpsertEdgeExecutor",
     "create_link",
     "delete_link",
     "to_prop_value",

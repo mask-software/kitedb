@@ -44,7 +44,7 @@ use crate::graph::nodes::{
   del_node_prop as graph_del_node_prop, delete_node as graph_delete_node, get_node_by_key_db,
   get_node_labels_db, get_node_prop_db, get_node_props_db, node_exists_db, node_has_label_db,
   remove_node_label as graph_remove_node_label, set_node_prop as graph_set_node_prop,
-  upsert_node_with_props, NodeOpts,
+  upsert_node_by_id_with_props, upsert_node_with_props, NodeOpts,
 };
 use crate::graph::tx::{
   begin_read_tx as graph_begin_read_tx, begin_tx as graph_begin_tx, commit as graph_commit,
@@ -1108,6 +1108,53 @@ impl Database {
           .collect();
 
         let (node_id, _) = upsert_node_with_props(handle, &key, updates)
+          .map_err(|e| Error::from_reason(format!("Failed to upsert node: {e}")))?;
+        Ok(node_id as i64)
+      }),
+      None => Err(Error::from_reason("Database is closed")),
+    }
+  }
+
+  /// Upsert a node by ID (create if missing, update props)
+  #[napi]
+  pub fn upsert_node_by_id(&self, node_id: i64, props: Vec<JsNodeProp>) -> Result<i64> {
+    match self.inner.as_ref() {
+      Some(DatabaseInner::SingleFile(db)) => {
+        let node_id_u = node_id as NodeId;
+        if !db.node_exists(node_id_u) {
+          db.create_node_with_id(node_id_u, None)
+            .map_err(|e| Error::from_reason(format!("Failed to create node: {e}")))?;
+        }
+
+        for prop in props {
+          let key_id = prop.key_id as PropKeyId;
+          if matches!(prop.value.prop_type, PropType::Null) {
+            db
+              .delete_node_prop(node_id_u, key_id)
+              .map_err(|e| Error::from_reason(format!("Failed to delete property: {e}")))?;
+          } else {
+            db
+              .set_node_prop(node_id_u, key_id, prop.value.into())
+              .map_err(|e| Error::from_reason(format!("Failed to set property: {e}")))?;
+          }
+        }
+
+        Ok(node_id)
+      }
+      Some(DatabaseInner::Graph(_)) => self.with_graph_tx(|handle| {
+        let updates: Vec<(PropKeyId, Option<PropValue>)> = props
+          .into_iter()
+          .map(|prop| {
+            let value_opt = match prop.value.prop_type {
+              PropType::Null => None,
+              _ => Some(prop.value.into()),
+            };
+            (prop.key_id as PropKeyId, value_opt)
+          })
+          .collect();
+
+        let opts = NodeOpts::new();
+        let (node_id, _) = upsert_node_by_id_with_props(handle, node_id as NodeId, opts, updates)
           .map_err(|e| Error::from_reason(format!("Failed to upsert node: {e}")))?;
         Ok(node_id as i64)
       }),

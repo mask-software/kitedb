@@ -160,6 +160,24 @@ impl SingleFileDB {
     self.next_node_id.fetch_add(1, Ordering::SeqCst)
   }
 
+  /// Ensure the next node ID is greater than the provided value
+  pub fn reserve_node_id(&self, node_id: NodeId) {
+    let desired = node_id.saturating_add(1);
+    loop {
+      let current = self.next_node_id.load(Ordering::SeqCst);
+      if current >= desired {
+        break;
+      }
+      if self
+        .next_node_id
+        .compare_exchange(current, desired, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+      {
+        break;
+      }
+    }
+  }
+
   /// Allocate a new label ID
   pub fn alloc_label_id(&self) -> LabelId {
     self.next_label_id.fetch_add(1, Ordering::SeqCst)

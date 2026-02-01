@@ -108,6 +108,47 @@ test('db-backed upsertNode', (t) => {
   db.close()
 })
 
+test('db-backed upsertNodeById', (t) => {
+  const db = Database.open(makeDbPath())
+
+  db.begin()
+  const nameKey = db.getOrCreatePropkey('name')
+  const ageKey = db.getOrCreatePropkey('age')
+  const nodeId = 42
+  const createdId = db.upsertNodeById(nodeId, [
+    {
+      keyId: nameKey,
+      value: { propType: PropType.String, stringValue: 'Alice' },
+    },
+  ])
+  db.commit()
+
+  t.is(createdId, nodeId)
+  t.true(db.nodeExists(nodeId))
+
+  db.begin()
+  const updatedId = db.upsertNodeById(nodeId, [
+    {
+      keyId: ageKey,
+      value: { propType: PropType.Int, intValue: 31 },
+    },
+    {
+      keyId: nameKey,
+      value: { propType: PropType.Null },
+    },
+  ])
+  db.commit()
+
+  t.is(updatedId, nodeId)
+
+  const props = db.getNodeProps(nodeId) ?? []
+  const propsByKey = new Map(props.map((p) => [p.keyId, p.value]))
+  t.is(propsByKey.get(ageKey)?.intValue, 31)
+  t.true(!propsByKey.has(nameKey))
+
+  db.close()
+})
+
 test('db-backed pathfinding APIs', (t) => {
   const db = Database.open(makeDbPath())
   db.begin()

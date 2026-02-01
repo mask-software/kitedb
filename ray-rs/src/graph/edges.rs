@@ -107,6 +107,40 @@ pub fn delete_edge(
   Ok(true)
 }
 
+/// Upsert an edge (create if missing, otherwise update props)
+///
+/// Returns a flag indicating whether the edge was created.
+pub fn upsert_edge_with_props<I>(
+  handle: &mut TxHandle,
+  src: NodeId,
+  etype: ETypeId,
+  dst: NodeId,
+  props: I,
+) -> Result<bool>
+where
+  I: IntoIterator<Item = (PropKeyId, Option<PropValue>)>,
+{
+  if handle.tx.read_only {
+    return Err(KiteError::ReadOnly);
+  }
+
+  let created = if edge_exists(handle, src, etype, dst) {
+    false
+  } else {
+    add_edge(handle, src, etype, dst)?;
+    true
+  };
+
+  for (key_id, value_opt) in props {
+    match value_opt {
+      Some(value) => set_edge_prop(handle, src, etype, dst, key_id, value)?,
+      None => del_edge_prop(handle, src, etype, dst, key_id)?,
+    }
+  }
+
+  Ok(created)
+}
+
 /// Check if an edge exists
 pub fn edge_exists(handle: &TxHandle, src: NodeId, etype: ETypeId, dst: NodeId) -> bool {
   // Check pending transaction changes first

@@ -73,6 +73,8 @@ export {
   KiteUpsertBuilder,
   KiteUpsertExecutorSingle,
   KiteUpsertExecutorMany,
+  KiteUpsertByIdBuilder,
+  KiteUpsertEdgeBuilder,
 } from '../index'
 
 // Re-export enums with clean names

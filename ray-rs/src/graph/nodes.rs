@@ -97,6 +97,66 @@ pub fn create_node(handle: &mut TxHandle, opts: NodeOpts) -> Result<NodeId> {
   Ok(node_id)
 }
 
+/// Create a new node with a specific ID
+pub fn create_node_with_id(
+  handle: &mut TxHandle,
+  node_id: NodeId,
+  opts: NodeOpts,
+) -> Result<NodeId> {
+  if handle.tx.read_only {
+    return Err(KiteError::ReadOnly);
+  }
+
+  if node_exists_internal(handle.db, node_id) || handle.tx.pending_created_nodes.contains_key(&node_id)
+  {
+    return Err(KiteError::Internal(format!(
+      "Node ID already exists: {node_id}"
+    )));
+  }
+
+  handle.db.reserve_node_id(node_id);
+
+  let key_for_mvcc = opts.key.clone();
+  let mut node_delta = NodeDelta {
+    key: key_for_mvcc.clone(),
+    labels: None,
+    labels_deleted: None,
+    props: None,
+  };
+
+  if let Some(labels) = opts.labels {
+    let mut set = std::collections::HashSet::new();
+    for label_id in labels {
+      set.insert(label_id);
+    }
+    node_delta.labels = Some(set);
+  }
+
+  handle.tx.pending_created_nodes.insert(node_id, node_delta);
+
+  if let Some(key) = opts.key {
+    handle.tx.pending_key_updates.insert(key, node_id);
+  }
+
+  if let Some(props) = opts.props {
+    let mut map = std::collections::HashMap::new();
+    for (key_id, value) in props {
+      map.insert(key_id, Some(value));
+    }
+    handle.tx.pending_node_props.insert(node_id, map);
+  }
+
+  if let Some(mvcc) = handle.db.mvcc.as_ref() {
+    let mut tx_mgr = mvcc.tx_manager.lock();
+    tx_mgr.record_write(handle.tx.txid, format!("node:{node_id}"));
+    if let Some(key) = &key_for_mvcc {
+      tx_mgr.record_write(handle.tx.txid, format!("key:{key}"));
+    }
+  }
+
+  Ok(node_id)
+}
+
 /// Upsert a node by key (create if missing, otherwise update props)
 ///
 /// Returns the node ID and a flag indicating whether it was created.
@@ -118,6 +178,39 @@ where
       let node_id = create_node(handle, NodeOpts::new().with_key(key))?;
       (node_id, true)
     }
+  };
+
+  for (key_id, value_opt) in props {
+    match value_opt {
+      Some(value) => set_node_prop(handle, node_id, key_id, value)?,
+      None => del_node_prop(handle, node_id, key_id)?,
+    }
+  }
+
+  Ok((node_id, created))
+}
+
+/// Upsert a node by ID (create if missing, otherwise update props)
+///
+/// Returns the node ID and a flag indicating whether it was created.
+pub fn upsert_node_by_id_with_props<I>(
+  handle: &mut TxHandle,
+  node_id: NodeId,
+  opts: NodeOpts,
+  props: I,
+) -> Result<(NodeId, bool)>
+where
+  I: IntoIterator<Item = (PropKeyId, Option<PropValue>)>,
+{
+  if handle.tx.read_only {
+    return Err(KiteError::ReadOnly);
+  }
+
+  let created = if node_exists(handle, node_id) {
+    false
+  } else {
+    create_node_with_id(handle, node_id, opts)?;
+    true
   };
 
   for (key_id, value_opt) in props {

@@ -10,7 +10,7 @@ use crate::core::wal::record::{
   build_delete_node_payload, build_remove_node_label_payload, build_set_edge_prop_payload,
   build_set_node_prop_payload, WalRecord,
 };
-use crate::error::Result;
+use crate::error::{KiteError, Result};
 use crate::types::*;
 
 use super::SingleFileDB;
@@ -24,6 +24,32 @@ impl SingleFileDB {
   pub fn create_node(&self, key: Option<&str>) -> Result<NodeId> {
     let txid = self.require_write_tx()?;
     let node_id = self.alloc_node_id();
+
+    // Write WAL record
+    let record = WalRecord::new(
+      WalRecordType::CreateNode,
+      txid,
+      build_create_node_payload(node_id, key),
+    );
+    self.write_wal(record)?;
+
+    // Update delta
+    self.delta.write().create_node(node_id, key);
+
+    Ok(node_id)
+  }
+
+  /// Create a node with a specific ID
+  pub fn create_node_with_id(&self, node_id: NodeId, key: Option<&str>) -> Result<NodeId> {
+    let txid = self.require_write_tx()?;
+
+    if self.node_exists(node_id) {
+      return Err(KiteError::Internal(format!(
+        "Node ID already exists: {node_id}"
+      )));
+    }
+
+    self.reserve_node_id(node_id);
 
     // Write WAL record
     let record = WalRecord::new(

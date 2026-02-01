@@ -15,12 +15,15 @@ use crate::api::kite::{
 use crate::api::traversal::{TraversalBuilder, TraversalDirection, TraverseOptions};
 use crate::graph::edges::{
   del_edge_prop as graph_del_edge_prop, edge_exists_db, get_edge_props_db, set_edge_prop,
+  upsert_edge_with_props,
 };
 use crate::graph::iterators::{
   list_edges as graph_list_edges, list_nodes as graph_list_nodes, ListEdgesOptions,
 };
 use crate::graph::key_index::get_node_key as graph_get_node_key;
-use crate::graph::nodes::{get_node_by_key_db, get_node_props_db};
+use crate::graph::nodes::{
+  get_node_by_key_db, get_node_props_db, upsert_node_by_id_with_props, NodeOpts,
+};
 use crate::graph::tx::{begin_tx, commit, rollback};
 use crate::types::{ETypeId, Edge, EdgePatch, NodeId, PropValue};
 
@@ -937,6 +940,17 @@ impl Kite {
     })
   }
 
+  /// Create an upsert builder by node ID
+  #[napi]
+  pub fn upsert_by_id(&self, node_type: String, node_id: i64) -> Result<KiteUpsertByIdBuilder> {
+    Ok(KiteUpsertByIdBuilder {
+      ray: self.inner.clone(),
+      node_type,
+      node_id: node_id as NodeId,
+      updates: HashMap::new(),
+    })
+  }
+
   /// Create an update builder by key
   #[napi]
   pub fn update_by_key(
@@ -1111,6 +1125,27 @@ impl Kite {
     })?;
 
     Ok(KiteUpdateEdgeBuilder {
+      ray: self.inner.clone(),
+      src: src as NodeId,
+      etype_id,
+      dst: dst as NodeId,
+      updates: HashMap::new(),
+    })
+  }
+
+  /// Upsert edge properties with a builder
+  #[napi]
+  pub fn upsert_edge(&self, src: i64, edge_type: String, dst: i64) -> Result<KiteUpsertEdgeBuilder> {
+    let etype_id = self.with_kite(|ray| {
+      let edge_def = ray
+        .edge_def(&edge_type)
+        .ok_or_else(|| Error::from_reason(format!("Unknown edge type: {edge_type}")))?;
+      edge_def
+        .etype_id
+        .ok_or_else(|| Error::from_reason("Edge type not initialized"))
+    })?;
+
+    Ok(KiteUpsertEdgeBuilder {
       ray: self.inner.clone(),
       src: src as NodeId,
       etype_id,
@@ -1993,6 +2028,87 @@ impl KiteUpdateBuilder {
 }
 
 // =============================================================================
+// Upsert By ID Builder
+// =============================================================================
+
+#[napi]
+pub struct KiteUpsertByIdBuilder {
+  ray: Arc<RwLock<Option<RustKite>>>,
+  node_type: String,
+  node_id: NodeId,
+  updates: HashMap<String, Option<PropValue>>,
+}
+
+#[napi]
+impl KiteUpsertByIdBuilder {
+  /// Set a node property
+  #[napi]
+  pub fn set(&mut self, env: Env, prop_name: String, value: Unknown) -> Result<()> {
+    let prop_value = js_value_to_prop_value(&env, value)?;
+    self.updates.insert(prop_name, Some(prop_value));
+    Ok(())
+  }
+
+  /// Remove a node property
+  #[napi]
+  pub fn unset(&mut self, prop_name: String) -> Result<()> {
+    self.updates.insert(prop_name, None);
+    Ok(())
+  }
+
+  /// Set multiple properties at once
+  #[napi]
+  pub fn set_all(&mut self, env: Env, props: Object) -> Result<()> {
+    let props_map = js_props_to_map(&env, Some(props))?;
+    for (prop_name, value) in props_map {
+      self.updates.insert(prop_name, Some(value));
+    }
+    Ok(())
+  }
+
+  /// Execute the upsert
+  #[napi]
+  pub fn execute(&self) -> Result<()> {
+    let mut guard = self.ray.write();
+    let ray = guard
+      .as_mut()
+      .ok_or_else(|| Error::from_reason("Kite is closed"))?;
+
+    let node_def = ray
+      .node_def(&self.node_type)
+      .ok_or_else(|| Error::from_reason(format!("Unknown node type: {}", self.node_type)))?
+      .clone();
+
+    let mut handle =
+      begin_tx(ray.raw()).map_err(|e| Error::from_reason(format!("Failed to begin tx: {e}")))?;
+
+    let mut updates = Vec::with_capacity(self.updates.len());
+    for (prop_name, value_opt) in &self.updates {
+      let prop_key_id = if let Some(&id) = node_def.prop_key_ids.get(prop_name) {
+        id
+      } else {
+        ray.raw().get_or_create_propkey(prop_name)
+      };
+      updates.push((prop_key_id, value_opt.clone()));
+    }
+
+    let opts = NodeOpts {
+      key: None,
+      labels: node_def.label_id.map(|id| vec![id]),
+      props: None,
+    };
+
+    if let Err(e) = upsert_node_by_id_with_props(&mut handle, self.node_id, opts, updates) {
+      let _ = rollback(&mut handle);
+      return Err(Error::from_reason(format!("Failed to upsert node: {e}")));
+    }
+
+    commit(&mut handle).map_err(|e| Error::from_reason(format!("Failed to commit: {e}")))?;
+    Ok(())
+  }
+}
+
+// =============================================================================
 // Update Edge Builder
 // =============================================================================
 
@@ -2075,6 +2191,75 @@ impl KiteUpdateEdgeBuilder {
           "Failed to update edge prop: {e}"
         )));
       }
+    }
+
+    commit(&mut handle).map_err(|e| Error::from_reason(format!("Failed to commit: {e}")))?;
+    Ok(())
+  }
+}
+
+// =============================================================================
+// Upsert Edge Builder
+// =============================================================================
+
+#[napi]
+pub struct KiteUpsertEdgeBuilder {
+  ray: Arc<RwLock<Option<RustKite>>>,
+  src: NodeId,
+  etype_id: ETypeId,
+  dst: NodeId,
+  updates: HashMap<String, Option<PropValue>>,
+}
+
+#[napi]
+impl KiteUpsertEdgeBuilder {
+  /// Set an edge property
+  #[napi]
+  pub fn set(&mut self, env: Env, prop_name: String, value: Unknown) -> Result<()> {
+    let prop_value = js_value_to_prop_value(&env, value)?;
+    self.updates.insert(prop_name, Some(prop_value));
+    Ok(())
+  }
+
+  /// Remove an edge property
+  #[napi]
+  pub fn unset(&mut self, prop_name: String) -> Result<()> {
+    self.updates.insert(prop_name, None);
+    Ok(())
+  }
+
+  /// Set multiple edge properties at once
+  #[napi]
+  pub fn set_all(&mut self, env: Env, props: Object) -> Result<()> {
+    let props_map = js_props_to_map(&env, Some(props))?;
+    for (prop_name, value) in props_map {
+      self.updates.insert(prop_name, Some(value));
+    }
+    Ok(())
+  }
+
+  /// Execute the upsert
+  #[napi]
+  pub fn execute(&self) -> Result<()> {
+    let mut guard = self.ray.write();
+    let ray = guard
+      .as_mut()
+      .ok_or_else(|| Error::from_reason("Kite is closed"))?;
+
+    let mut handle =
+      begin_tx(ray.raw()).map_err(|e| Error::from_reason(format!("Failed to begin tx: {e}")))?;
+
+    let mut updates = Vec::with_capacity(self.updates.len());
+    for (prop_name, value_opt) in &self.updates {
+      let prop_key_id = ray.raw().get_or_create_propkey(prop_name);
+      updates.push((prop_key_id, value_opt.clone()));
+    }
+
+    if let Err(e) =
+      upsert_edge_with_props(&mut handle, self.src, self.etype_id, self.dst, updates)
+    {
+      let _ = rollback(&mut handle);
+      return Err(Error::from_reason(format!("Failed to upsert edge: {e}")));
     }
 
     commit(&mut handle).map_err(|e| Error::from_reason(format!("Failed to commit: {e}")))?;

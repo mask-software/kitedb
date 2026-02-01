@@ -151,6 +151,82 @@ test('upsert inserts and updates', async (t) => {
   db.close()
 })
 
+test('upsertById inserts and updates', async (t) => {
+  const User = node('user', {
+    key: (id: string) => `user:${id}`,
+    props: {
+      name: prop.string('name'),
+      age: prop.int('age'),
+    },
+  })
+
+  const db = await kite(makeDbPath(), {
+    nodes: [User],
+    edges: [],
+  })
+
+  const insert = db.upsertById('user', 42)
+  insert.set('name', 'Alice')
+  insert.set('age', 30)
+  insert.execute()
+
+  const created = db.getById(42) as any
+  t.is(created?.name, 'Alice')
+  t.is(created?.age, 30)
+
+  const update = db.upsertById('user', 42)
+  update.set('age', 31)
+  update.unset('name')
+  update.execute()
+
+  const updated = db.getById(42) as any
+  t.is(updated?.age, 31)
+  t.is(updated?.name, undefined)
+
+  db.close()
+})
+
+test('upsertEdge creates and updates edge props', async (t) => {
+  const User = node('user', {
+    key: (id: string) => `user:${id}`,
+    props: {
+      name: prop.string('name'),
+    },
+  })
+
+  const follows = edge('follows', {
+    since: prop.int('since'),
+    weight: optional(prop.float('weight')),
+  })
+
+  const db = await kite(makeDbPath(), {
+    nodes: [User],
+    edges: [follows],
+  })
+
+  const alice = db.insert('user').values('alice', { name: 'Alice' }).returning() as any
+  const bob = db.insert('user').values('bob', { name: 'Bob' }).returning() as any
+
+  const createEdge = db.upsertEdge(alice.id, 'follows', bob.id)
+  createEdge.set('since', 2020)
+  createEdge.execute()
+
+  const since = db.getEdgeProp(alice.id, 'follows', bob.id, 'since')
+  t.is(since?.floatValue, 2020)
+
+  const updateEdge = db.upsertEdge(alice.id, 'follows', bob.id)
+  updateEdge.set('weight', 0.75)
+  updateEdge.unset('since')
+  updateEdge.execute()
+
+  const updatedSince = db.getEdgeProp(alice.id, 'follows', bob.id, 'since')
+  t.is(updatedSince, null)
+  const weight = db.getEdgeProp(alice.id, 'follows', bob.id, 'weight')
+  t.is(weight?.floatValue, 0.75)
+
+  db.close()
+})
+
 test('kiteSync() opens database synchronously', (t) => {
   const User = node('user', {
     key: (id: string) => `user:${id}`,

@@ -48,7 +48,7 @@
 mod tests {
   use std::collections::HashMap;
   use std::sync::atomic::{AtomicU64, Ordering};
-  use std::sync::{Arc, Barrier};
+  use std::sync::{mpsc, Arc, Barrier};
   use std::thread;
   use std::time::{Duration, Instant};
   use tempfile::tempdir;
@@ -617,6 +617,47 @@ mod tests {
       successes.load(Ordering::Relaxed) + conflicts.load(Ordering::Relaxed),
       num_threads as u64,
       "All upserts should either commit or conflict"
+    );
+  }
+
+  #[test]
+  fn test_non_mvcc_single_writer_enforced() {
+    let temp_dir = tempdir().unwrap();
+    let db = open_graph_db(temp_dir.path(), OpenOptions::new().mvcc(false)).unwrap();
+    let db = Arc::new(db);
+
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+
+    let writer_db = Arc::clone(&db);
+    let writer = thread::spawn(move || {
+      let mut tx = begin_tx(&writer_db).expect("begin write tx");
+      started_tx.send(()).unwrap();
+      release_rx.recv().unwrap();
+      rollback(&mut tx).unwrap();
+    });
+
+    let contender_db = Arc::clone(&db);
+    let contender = thread::spawn(move || {
+      started_rx.recv().unwrap();
+      let res = begin_tx(&contender_db);
+      let outcome = match res {
+        Ok(mut tx) => {
+          let _ = rollback(&mut tx);
+          Ok(())
+        }
+        Err(err) => Err(err),
+      };
+      release_tx.send(()).unwrap();
+      outcome
+    });
+
+    let contender_res = contender.join().unwrap();
+    writer.join().unwrap();
+
+    assert!(
+      matches!(contender_res, Err(KiteError::TransactionInProgress)),
+      "Non-MVCC databases should allow only one writer at a time"
     );
   }
 

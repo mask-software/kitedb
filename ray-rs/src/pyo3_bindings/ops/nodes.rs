@@ -9,7 +9,7 @@ use crate::graph::iterators::{count_nodes as graph_count_nodes, list_nodes as gr
 use crate::graph::key_index::get_node_key as graph_get_node_key;
 use crate::graph::nodes::{
   create_node as graph_create_node, delete_node as graph_delete_node, get_node_by_key_db,
-  node_exists_db, upsert_node_with_props, NodeOpts,
+  node_exists_db, upsert_node_by_id_with_props, upsert_node_with_props, NodeOpts,
 };
 use crate::graph::tx::TxHandle as GraphTxHandle;
 use crate::types::{NodeId, PropKeyId, PropValue};
@@ -130,6 +130,44 @@ pub fn upsert_node_graph(
   props: &[(PropKeyId, Option<PropValue>)],
 ) -> PyResult<i64> {
   let (node_id, _) = upsert_node_with_props(handle, key, props.iter().cloned())
+    .map_err(|e| PyRuntimeError::new_err(format!("Failed to upsert node: {e}")))?;
+  Ok(node_id as i64)
+}
+
+/// Upsert node by ID on single-file database
+pub fn upsert_node_by_id_single(
+  db: &RustSingleFileDB,
+  node_id: NodeId,
+  props: &[(PropKeyId, Option<PropValue>)],
+) -> PyResult<i64> {
+  if !db.node_exists(node_id) {
+    db
+      .create_node_with_id(node_id, None)
+      .map_err(|e| PyRuntimeError::new_err(format!("Failed to create node: {e}")))?;
+  }
+
+  for (prop_key_id, value_opt) in props {
+    match value_opt {
+      Some(value) => db
+        .set_node_prop(node_id, *prop_key_id, value.clone())
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to set prop: {e}")))?,
+      None => db
+        .delete_node_prop(node_id, *prop_key_id)
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to delete prop: {e}")))?,
+    }
+  }
+
+  Ok(node_id as i64)
+}
+
+/// Upsert node by ID on graph database (requires transaction handle)
+pub fn upsert_node_by_id_graph(
+  handle: &mut GraphTxHandle,
+  node_id: NodeId,
+  props: &[(PropKeyId, Option<PropValue>)],
+) -> PyResult<i64> {
+  let opts = NodeOpts::new();
+  let (node_id, _) = upsert_node_by_id_with_props(handle, node_id, opts, props.iter().cloned())
     .map_err(|e| PyRuntimeError::new_err(format!("Failed to upsert node: {e}")))?;
   Ok(node_id as i64)
 }

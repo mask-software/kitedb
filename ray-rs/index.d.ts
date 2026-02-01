@@ -24,6 +24,8 @@ export declare class Database {
   createNode(key?: string | undefined | null): number
   /** Upsert a node by key (create if missing, update props) */
   upsertNode(key: string, props: Array<JsNodeProp>): number
+  /** Upsert a node by ID (create if missing, update props) */
+  upsertNodeById(nodeId: number, props: Array<JsNodeProp>): number
   /** Delete a node */
   deleteNode(nodeId: number): void
   /** Check if a node exists */
@@ -570,6 +572,8 @@ export declare class Kite {
   upsert(nodeType: string): KiteUpsertBuilder
   /** Create an update builder by node ID */
   updateById(nodeId: number): KiteUpdateBuilder
+  /** Create an upsert builder by node ID */
+  upsertById(nodeType: string, nodeId: number): KiteUpsertByIdBuilder
   /** Create an update builder by key */
   updateByKey(nodeType: string, key: unknown): KiteUpdateBuilder
   /** Link two nodes */
@@ -588,6 +592,8 @@ export declare class Kite {
   delEdgeProp(src: number, edgeType: string, dst: number, propName: string): void
   /** Update edge properties with a builder */
   updateEdge(src: number, edgeType: string, dst: number): KiteUpdateEdgeBuilder
+  /** Upsert edge properties with a builder */
+  upsertEdge(src: number, edgeType: string, dst: number): KiteUpsertEdgeBuilder
   /** List all nodes of a type (returns array of node objects) */
   all(nodeType: string): Array<object>
   /** Count nodes (optionally by type) */
@@ -694,6 +700,28 @@ export declare class KiteUpsertBuilder {
   values(key: unknown, props?: object | undefined | null): KiteUpsertExecutorSingle
   /** Specify values for multiple upserts */
   valuesMany(entries: Array<unknown>): KiteUpsertExecutorMany
+}
+
+export declare class KiteUpsertByIdBuilder {
+  /** Set a node property */
+  set(propName: string, value: unknown): void
+  /** Remove a node property */
+  unset(propName: string): void
+  /** Set multiple properties at once */
+  setAll(props: object): void
+  /** Execute the upsert */
+  execute(): void
+}
+
+export declare class KiteUpsertEdgeBuilder {
+  /** Set an edge property */
+  set(propName: string, value: unknown): void
+  /** Remove an edge property */
+  unset(propName: string): void
+  /** Set multiple edge properties at once */
+  setAll(props: object): void
+  /** Execute the upsert */
+  execute(): void
 }
 
 export declare class KiteUpsertExecutorMany {

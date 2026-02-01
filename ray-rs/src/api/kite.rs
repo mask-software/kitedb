@@ -25,6 +25,7 @@ use crate::graph::edges::{
   get_neighbors_in_db,
   get_neighbors_out_db,
   set_edge_prop,
+  upsert_edge_with_props,
 };
 use crate::graph::iterators::{
   count_edges, count_nodes, list_edges, list_nodes, FullEdge, ListEdgesOptions,
@@ -32,7 +33,8 @@ use crate::graph::iterators::{
 use crate::graph::key_index::get_node_key;
 use crate::graph::nodes::{
   create_node, del_node_prop, delete_node, get_node_by_key, get_node_by_key_db, get_node_prop,
-  get_node_prop_db, node_exists, node_exists_db, set_node_prop, upsert_node_with_props, NodeOpts,
+  get_node_prop_db, node_exists, node_exists_db, set_node_prop, upsert_node_by_id_with_props,
+  upsert_node_with_props, NodeOpts,
 };
 use crate::graph::tx::{begin_tx, commit, rollback, TxHandle};
 use crate::types::*;
@@ -576,6 +578,28 @@ impl Kite {
     })
   }
 
+  /// Upsert a node by ID using fluent builder API
+  ///
+  /// Creates the node if missing, otherwise updates properties.
+  pub fn upsert_by_id(
+    &mut self,
+    node_type: &str,
+    node_id: NodeId,
+  ) -> Result<KiteUpsertByIdBuilder<'_>> {
+    let node_def = self
+      .nodes
+      .get(node_type)
+      .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown node type: {node_type}")))?
+      .clone();
+
+    Ok(KiteUpsertByIdBuilder {
+      ray: self,
+      node_id,
+      node_def,
+      updates: HashMap::new(),
+    })
+  }
+
   /// Update a node by key using fluent builder API
   ///
   /// # Example
@@ -912,6 +936,32 @@ impl Kite {
       .ok_or_else(|| KiteError::InvalidSchema("Edge type not initialized".to_string()))?;
 
     Ok(KiteUpdateEdgeBuilder {
+      ray: self,
+      src,
+      etype_id,
+      dst,
+      updates: HashMap::new(),
+    })
+  }
+
+  /// Upsert edge properties using fluent builder API
+  ///
+  /// Creates the edge if missing, otherwise updates properties.
+  pub fn upsert_edge(
+    &mut self,
+    src: NodeId,
+    edge_type: &str,
+    dst: NodeId,
+  ) -> Result<KiteUpsertEdgeBuilder<'_>> {
+    let edge_def = self
+      .edges
+      .get(edge_type)
+      .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown edge type: {edge_type}")))?;
+    let etype_id = edge_def
+      .etype_id
+      .ok_or_else(|| KiteError::InvalidSchema(format!("Edge type not initialized: {edge_type}")))?;
+
+    Ok(KiteUpsertEdgeBuilder {
       ray: self,
       src,
       etype_id,
@@ -2541,6 +2591,69 @@ impl<'a> KiteUpdateNodeBuilder<'a> {
 }
 
 // ============================================================================
+// Upsert By ID Builder
+// ============================================================================
+
+/// Fluent builder for upserting a node by ID
+///
+/// Created via `kite.upsert_by_id(node_type, node_id)` and allows chaining
+/// property set/unset operations before executing in a single transaction.
+pub struct KiteUpsertByIdBuilder<'a> {
+  ray: &'a mut Kite,
+  node_id: NodeId,
+  node_def: NodeDef,
+  updates: HashMap<String, Option<PropValue>>,
+}
+
+impl<'a> KiteUpsertByIdBuilder<'a> {
+  /// Set a node property value
+  pub fn set(mut self, prop_name: &str, value: PropValue) -> Self {
+    self.updates.insert(prop_name.to_string(), Some(value));
+    self
+  }
+
+  /// Remove a node property
+  pub fn unset(mut self, prop_name: &str) -> Self {
+    self.updates.insert(prop_name.to_string(), None);
+    self
+  }
+
+  /// Set multiple properties at once from a HashMap
+  pub fn set_all(mut self, props: HashMap<String, PropValue>) -> Self {
+    for (k, v) in props {
+      self.updates.insert(k, Some(v));
+    }
+    self
+  }
+
+  /// Execute the upsert, creating the node if missing
+  pub fn execute(self) -> Result<()> {
+    let mut handle = begin_tx(&self.ray.db)?;
+
+    let mut updates = Vec::with_capacity(self.updates.len());
+    for (prop_name, value_opt) in self.updates {
+      let prop_key_id = if let Some(&id) = self.node_def.prop_key_ids.get(&prop_name) {
+        id
+      } else {
+        self.ray.db.get_or_create_propkey(&prop_name)
+      };
+      updates.push((prop_key_id, value_opt));
+    }
+
+    let opts = NodeOpts {
+      key: None,
+      labels: self.node_def.label_id.map(|id| vec![id]),
+      props: None,
+    };
+
+    upsert_node_by_id_with_props(&mut handle, self.node_id, opts, updates)?;
+
+    commit(&mut handle)?;
+    Ok(())
+  }
+}
+
+// ============================================================================
 // Insert Builder
 // ============================================================================
 
@@ -2932,6 +3045,60 @@ impl<'a> KiteUpdateEdgeBuilder<'a> {
         }
       }
     }
+
+    commit(&mut handle)?;
+    Ok(())
+  }
+}
+
+// ============================================================================
+// Upsert Edge Builder
+// ============================================================================
+
+/// Fluent builder for upserting edge properties
+///
+/// Created via `kite.upsert_edge(src, edge_type, dst)` and allows chaining
+/// property set/unset operations before executing in a single transaction.
+pub struct KiteUpsertEdgeBuilder<'a> {
+  ray: &'a mut Kite,
+  src: NodeId,
+  etype_id: ETypeId,
+  dst: NodeId,
+  updates: HashMap<String, Option<PropValue>>,
+}
+
+impl<'a> KiteUpsertEdgeBuilder<'a> {
+  /// Set an edge property value
+  pub fn set(mut self, prop_name: &str, value: PropValue) -> Self {
+    self.updates.insert(prop_name.to_string(), Some(value));
+    self
+  }
+
+  /// Remove an edge property
+  pub fn unset(mut self, prop_name: &str) -> Self {
+    self.updates.insert(prop_name.to_string(), None);
+    self
+  }
+
+  /// Set multiple properties at once from a HashMap
+  pub fn set_all(mut self, props: HashMap<String, PropValue>) -> Self {
+    for (k, v) in props {
+      self.updates.insert(k, Some(v));
+    }
+    self
+  }
+
+  /// Execute the upsert, creating the edge if missing
+  pub fn execute(self) -> Result<()> {
+    let mut handle = begin_tx(&self.ray.db)?;
+
+    let mut updates = Vec::with_capacity(self.updates.len());
+    for (prop_name, value_opt) in self.updates {
+      let prop_key_id = self.ray.db.get_or_create_propkey(&prop_name);
+      updates.push((prop_key_id, value_opt));
+    }
+
+    upsert_edge_with_props(&mut handle, self.src, self.etype_id, self.dst, updates)?;
 
     commit(&mut handle)?;
     Ok(())
@@ -4162,6 +4329,44 @@ mod tests {
   }
 
   #[test]
+  fn test_upsert_edge_builder() {
+    let temp_dir = tempdir().unwrap();
+    let options = create_test_schema();
+
+    let mut ray = Kite::open(temp_dir.path(), options).unwrap();
+
+    let alice = ray.create_node("User", "alice", HashMap::new()).unwrap();
+    let bob = ray.create_node("User", "bob", HashMap::new()).unwrap();
+
+    ray
+      .upsert_edge(alice.id, "FOLLOWS", bob.id)
+      .unwrap()
+      .set("since", PropValue::I64(2020))
+      .execute()
+      .unwrap();
+
+    let since = ray.get_edge_prop(alice.id, "FOLLOWS", bob.id, "since").unwrap();
+    assert_eq!(since, Some(PropValue::I64(2020)));
+
+    ray
+      .upsert_edge(alice.id, "FOLLOWS", bob.id)
+      .unwrap()
+      .set("weight", PropValue::F64(0.5))
+      .unset("since")
+      .execute()
+      .unwrap();
+
+    let since = ray.get_edge_prop(alice.id, "FOLLOWS", bob.id, "since").unwrap();
+    assert_eq!(since, None);
+    let weight = ray
+      .get_edge_prop(alice.id, "FOLLOWS", bob.id, "weight")
+      .unwrap();
+    assert_eq!(weight, Some(PropValue::F64(0.5)));
+
+    ray.close().unwrap();
+  }
+
+  #[test]
   fn test_insert_builder_returning() {
     let temp_dir = tempdir().unwrap();
     let options = create_test_schema();
@@ -4456,6 +4661,46 @@ mod tests {
     // Verify updates
     let name = ray.get_prop(charlie.id, "name");
     assert_eq!(name, Some(PropValue::String("Charlie Updated".into())));
+
+    ray.close().unwrap();
+  }
+
+  #[test]
+  fn test_upsert_node_by_id_builder() {
+    let temp_dir = tempdir().unwrap();
+    let options = create_test_schema();
+
+    let mut ray = Kite::open(temp_dir.path(), options).unwrap();
+
+    // Create by ID
+    ray
+      .upsert_by_id("User", 42)
+      .unwrap()
+      .set("name", PropValue::String("Alice".into()))
+      .set("age", PropValue::I64(30))
+      .execute()
+      .unwrap();
+
+    assert!(ray.exists(42));
+
+    let name = ray.get_prop(42, "name");
+    assert_eq!(name, Some(PropValue::String("Alice".into())));
+    let age = ray.get_prop(42, "age");
+    assert_eq!(age, Some(PropValue::I64(30)));
+
+    // Update same ID
+    ray
+      .upsert_by_id("User", 42)
+      .unwrap()
+      .set("age", PropValue::I64(31))
+      .unset("name")
+      .execute()
+      .unwrap();
+
+    let name = ray.get_prop(42, "name");
+    assert_eq!(name, None);
+    let age = ray.get_prop(42, "age");
+    assert_eq!(age, Some(PropValue::I64(31)));
 
     ray.close().unwrap();
   }

@@ -129,8 +129,10 @@ from kitedb.builders import (
     NodeRef,
     InsertBuilder,
     UpsertBuilder,
+    UpsertByIdBuilder,
     UpdateBuilder,
     DeleteBuilder,
+    UpsertEdgeBuilder,
 )
 
 from kitedb.traversal import (
@@ -194,8 +196,10 @@ __all__ = [
     # Builders
     "InsertBuilder",
     "UpsertBuilder",
+    "UpsertByIdBuilder",
     "UpdateBuilder",
     "DeleteBuilder",
+    "UpsertEdgeBuilder",
     
     # Traversal
     "TraversalBuilder",

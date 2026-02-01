@@ -72,10 +72,12 @@ from .builders import (
     DeleteBuilder,
     InsertBuilder,
     UpsertBuilder,
+    UpsertByIdBuilder,
     NodeRef,
     UpdateBuilder,
     UpdateByRefBuilder,
     UpdateEdgeBuilder,
+    UpsertEdgeBuilder,
     create_link,
     delete_link,
     from_prop_value,
@@ -302,6 +304,27 @@ class Kite:
         return UpsertBuilder(
             db=self._db,
             node_def=node,
+            resolve_prop_key_id=self._resolve_prop_key_id,
+        )
+
+    def upsert_by_id(self, node: NodeDef[Any], node_id: int) -> UpsertByIdBuilder[NodeDef[Any]]:
+        """
+        Upsert a node by ID (create if missing, otherwise update).
+
+        Args:
+            node: Node definition
+            node_id: Internal node ID
+
+        Returns:
+            UpsertByIdBuilder for chaining
+
+        Example:
+            >>> db.upsert_by_id(user, 42).set(name="Alice").execute()
+        """
+        return UpsertByIdBuilder(
+            db=self._db,
+            node_def=node,
+            node_id=node_id,
             resolve_prop_key_id=self._resolve_prop_key_id,
         )
     
@@ -538,6 +561,35 @@ class Kite:
             >>> db.update_edge(alice, knows, bob).set(weight=0.9).execute()
         """
         return UpdateEdgeBuilder(
+            db=self._db,
+            src=src,
+            edge_def=edge,
+            dst=dst,
+            resolve_etype_id=self._resolve_etype_id,
+            resolve_prop_key_id=self._resolve_prop_key_id,
+        )
+
+    def upsert_edge(
+        self,
+        src: NodeRef[Any],
+        edge: EdgeDef,
+        dst: NodeRef[Any],
+    ) -> UpsertEdgeBuilder[EdgeDef]:
+        """
+        Upsert edge properties (create edge if missing).
+
+        Args:
+            src: Source node reference
+            edge: Edge definition
+            dst: Destination node reference
+
+        Returns:
+            UpsertEdgeBuilder for chaining
+
+        Example:
+            >>> db.upsert_edge(alice, knows, bob).set(weight=0.9).execute()
+        """
+        return UpsertEdgeBuilder(
             db=self._db,
             src=src,
             edge_def=edge,
