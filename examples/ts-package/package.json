@@ -1,0 +1,19 @@
+{
+  "name": "kitedb-ts-example",
+  "private": true,
+  "version": "0.0.0",
+  "description": "TypeScript example using the published @kitedb/core package",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@kitedb/core": "0.2.7"
+  },
+  "devDependencies": {
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.2"
+  }
+}

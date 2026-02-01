@@ -7,7 +7,7 @@
     },
     "ray-rs": {
       "name": "@kitedb/core",
-      "version": "0.2.6",
+      "version": "0.2.7",
       "dependencies": {
         "@napi-rs/wasm-runtime": "^1.1.1",
       },
@@ -30,10 +30,10 @@
         "typescript": "^5.9.2",
       },
       "optionalDependencies": {
-        "@kitedb/core-darwin-arm64": "0.2.6",
-        "@kitedb/core-darwin-x64": "0.2.6",
-        "@kitedb/core-linux-x64-gnu": "0.2.6",
-        "@kitedb/core-win32-x64-msvc": "0.2.6",
+        "@kitedb/core-darwin-arm64": "0.2.7",
+        "@kitedb/core-darwin-x64": "0.2.7",
+        "@kitedb/core-linux-x64-gnu": "0.2.7",
+        "@kitedb/core-win32-x64-msvc": "0.2.7",
       },
     },
   },
@@ -82,13 +82,13 @@
 
     "@kitedb/core": ["@kitedb/core@workspace:ray-rs"],
 
-    "@kitedb/core-darwin-arm64": ["@kitedb/core-darwin-arm64@0.2.6", "", { "os": "darwin", "cpu": "arm64" }, "sha512-kLxPjRPFut6CIBduQkhvBI+MmJ8Qtz9EdxBKcEUEIe8dVNhv310a16iUxa6Fx/2/a/gZ7VPqwqTQ2wXCOW/bTQ=="],
+    "@kitedb/core-darwin-arm64": ["@kitedb/core-darwin-arm64@0.2.7", "", { "os": "darwin", "cpu": "arm64" }, "sha512-kLxPjRPFut6CIBduQkhvBI+MmJ8Qtz9EdxBKcEUEIe8dVNhv310a16iUxa6Fx/2/a/gZ7VPqwqTQ2wXCOW/bTQ=="],
 
-    "@kitedb/core-darwin-x64": ["@kitedb/core-darwin-x64@0.2.6", "", { "os": "darwin", "cpu": "x64" }, "sha512-9+sxU9jECHIsCoDU2v6FwF6MPIIUANLWC3+21cKRMCDVzUehSdOIBQImUtnaReJUuEpCheBz+symttmKJoNi4A=="],
+    "@kitedb/core-darwin-x64": ["@kitedb/core-darwin-x64@0.2.7", "", { "os": "darwin", "cpu": "x64" }, "sha512-9+sxU9jECHIsCoDU2v6FwF6MPIIUANLWC3+21cKRMCDVzUehSdOIBQImUtnaReJUuEpCheBz+symttmKJoNi4A=="],
 
-    "@kitedb/core-linux-x64-gnu": ["@kitedb/core-linux-x64-gnu@0.2.6", "", { "os": "linux", "cpu": "x64" }, "sha512-dBKublHE6v8jDzZKyl3bttUaah8B8tGNC6ySUyN04P1bcwy2ii4DzwpbpNwSROC/VaMK6ml5ZV9qdqPOObaG9Q=="],
+    "@kitedb/core-linux-x64-gnu": ["@kitedb/core-linux-x64-gnu@0.2.7", "", { "os": "linux", "cpu": "x64" }, "sha512-dBKublHE6v8jDzZKyl3bttUaah8B8tGNC6ySUyN04P1bcwy2ii4DzwpbpNwSROC/VaMK6ml5ZV9qdqPOObaG9Q=="],
 
-    "@kitedb/core-win32-x64-msvc": ["@kitedb/core-win32-x64-msvc@0.2.6", "", { "os": "win32", "cpu": "x64" }, "sha512-u2MOjzX0al1o6roMq+yRPigDALFzrJv+6InEgwrIwrvM9GtrKtvJqo5moqPuVW8ME00MKHiXz6G9Cs1DG9hjEg=="],
+    "@kitedb/core-win32-x64-msvc": ["@kitedb/core-win32-x64-msvc@0.2.7", "", { "os": "win32", "cpu": "x64" }, "sha512-u2MOjzX0al1o6roMq+yRPigDALFzrJv+6InEgwrIwrvM9GtrKtvJqo5moqPuVW8ME00MKHiXz6G9Cs1DG9hjEg=="],
 
     "@mapbox/node-pre-gyp": ["@mapbox/node-pre-gyp@2.0.3", "", { "dependencies": { "consola": "^3.2.3", "detect-libc": "^2.0.0", "https-proxy-agent": "^7.0.5", "node-fetch": "^2.6.7", "nopt": "^8.0.0", "semver": "^7.5.3", "tar": "^7.4.0" }, "bin": { "node-pre-gyp": "bin/node-pre-gyp" } }, "sha512-uwPAhccfFJlsfCxMYTwOdVfOz3xqyj8xYL3zJj8f0pb30tLohnnFPhLuqp4/qoEz8sNxe4SESZedcBojRefIzg=="],
 
