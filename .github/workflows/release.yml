@@ -60,7 +60,7 @@ jobs:
 
       - name: Verify package version matches tag
         run: |
-          PACKAGE_VERSION=$(node -p "require('./package.json').version")
+          PACKAGE_VERSION=$(node -p "require('./ray-rs/package.json').version")
           TAG_VERSION=${GITHUB_REF#refs/tags/v}
           if [ "$PACKAGE_VERSION" != "$TAG_VERSION" ]; then
             echo "Package version ($PACKAGE_VERSION) does not match tag version ($TAG_VERSION)"
@@ -69,5 +69,7 @@ jobs:
 
       - name: Publish to NPM
         run: npm publish --provenance --access public
+        working-directory: ray-rs
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_WORKSPACES: "false"
