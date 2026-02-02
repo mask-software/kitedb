@@ -10,7 +10,7 @@ This crate provides the Rust core and the high-level Kite API.
 - Labels, edge types, and schema helpers
 - Fluent traversal and pathfinding (BFS, Dijkstra, Yen)
 - Vector embeddings with IVF and IVF-PQ indexes
-- Single-file and multi-file storage formats
+- Single-file storage format
 
 ## Install
 

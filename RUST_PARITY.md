@@ -19,7 +19,7 @@ Rust now matches the TypeScript core across storage formats, transactions (MVCC)
 | MVCC | 100% | Integrated into DB ops with wall-clock retention + GC |
 | Graph ops (nodes/edges/props) | 100% | MVCC visibility + WAL replay + delta parity |
 | Snapshot checker | 100% | Full CSR invariants + key index + string table validation |
-| Backup/restore | 100% | Single-file + multi-file + offline backup |
+| Backup/restore | 100% | Single-file + offline backup |
 | Metrics/health | 100% | Cache, data, memory, MVCC, health checks |
 | Stats (`stats()`) | 100% | WAL bytes/segment + MVCC stats parity |
 | Streaming/pagination | 100% | Batch streaming + pagination helpers |

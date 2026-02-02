@@ -1,7 +1,6 @@
 //! Schema operations for Python bindings
 
 use crate::core::single_file::SingleFileDB as RustSingleFileDB;
-use crate::graph::db::GraphDB as RustGraphDB;
 
 /// Trait for schema operations
 pub trait SchemaOps {
@@ -62,45 +61,5 @@ pub fn get_propkey_id_single(db: &RustSingleFileDB, name: &str) -> Option<u32> {
 }
 
 pub fn get_propkey_name_single(db: &RustSingleFileDB, id: u32) -> Option<String> {
-  db.get_propkey_name(id)
-}
-
-// ============================================================================
-// Graph database operations
-// ============================================================================
-
-pub fn get_or_create_label_graph(db: &RustGraphDB, name: &str) -> u32 {
-  db.get_or_create_label(name)
-}
-
-pub fn get_label_id_graph(db: &RustGraphDB, name: &str) -> Option<u32> {
-  db.get_label_id(name)
-}
-
-pub fn get_label_name_graph(db: &RustGraphDB, id: u32) -> Option<String> {
-  db.get_label_name(id)
-}
-
-pub fn get_or_create_etype_graph(db: &RustGraphDB, name: &str) -> u32 {
-  db.get_or_create_etype(name)
-}
-
-pub fn get_etype_id_graph(db: &RustGraphDB, name: &str) -> Option<u32> {
-  db.get_etype_id(name)
-}
-
-pub fn get_etype_name_graph(db: &RustGraphDB, id: u32) -> Option<String> {
-  db.get_etype_name(id)
-}
-
-pub fn get_or_create_propkey_graph(db: &RustGraphDB, name: &str) -> u32 {
-  db.get_or_create_propkey(name)
-}
-
-pub fn get_propkey_id_graph(db: &RustGraphDB, name: &str) -> Option<u32> {
-  db.get_propkey_id(name)
-}
-
-pub fn get_propkey_name_graph(db: &RustGraphDB, id: u32) -> Option<String> {
   db.get_propkey_name(id)
 }

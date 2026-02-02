@@ -526,8 +526,7 @@ const path = await db
 
 ## File Formats
 
-RayDB primarily uses the single-file `.kitedb` format. The directory-based
-format is legacy and deprecated for new deployments.
+RayDB uses the single-file `.kitedb` format.
 
 ### Single-File Format (`.kitedb`)
 
@@ -536,25 +535,6 @@ mydb.kitedb
   Header (page 0)
   WAL Area (linear buffer; checkpoint to reclaim space)
   Snapshot Area (CSR)
-```
-
-### Multi-File Format (Directory) - Deprecated (Legacy)
-
-Database files stored in a directory:
-
-```
-
-To open an existing legacy directory, pass `{ legacyMultiFile: true }` to
-`openGraphDB`.
-db/
-  manifest.gdm              # Metadata (JSON)
-  lock.gdl                  # Optional file lock
-  snapshots/
-    snap_0000000000000001.gds
-    snap_0000000000000002.gds
-  wal/
-    wal_0000000000000001.gdw
-    wal_0000000000000002.gdw
 ```
 
 ### Snapshot Format (`.gds`)

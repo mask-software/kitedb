@@ -4,16 +4,6 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
 use crate::core::single_file::SingleFileDB as RustSingleFileDB;
-use crate::graph::db::GraphDB as RustGraphDB;
-use crate::graph::edges::{
-  del_edge_prop as graph_del_edge_prop, get_edge_prop_db, get_edge_props_db,
-  set_edge_prop as graph_set_edge_prop,
-};
-use crate::graph::nodes::{
-  del_node_prop as graph_del_node_prop, get_node_prop_db, get_node_props_db,
-  set_node_prop as graph_set_node_prop,
-};
-use crate::graph::tx::TxHandle as GraphTxHandle;
 use crate::types::{ETypeId, NodeId, PropKeyId, PropValue as CorePropValue};
 
 use crate::pyo3_bindings::types::{NodeProp, PropValue};
@@ -188,115 +178,6 @@ pub fn get_edge_props_single(
 }
 
 // ============================================================================
-// Graph database node property operations
-// ============================================================================
-
-/// Set node property on graph database (requires transaction handle)
-pub fn set_node_prop_graph(
-  handle: &mut GraphTxHandle,
-  node_id: NodeId,
-  key_id: PropKeyId,
-  value: CorePropValue,
-) -> PyResult<()> {
-  graph_set_node_prop(handle, node_id, key_id, value)
-    .map_err(|e| PyRuntimeError::new_err(format!("Failed to set property: {e}")))?;
-  Ok(())
-}
-
-/// Get node property on graph database
-pub fn get_node_prop_graph(
-  db: &RustGraphDB,
-  node_id: NodeId,
-  key_id: PropKeyId,
-) -> Option<PropValue> {
-  get_node_prop_db(db, node_id, key_id).map(|v| v.into())
-}
-
-/// Delete node property on graph database (requires transaction handle)
-pub fn delete_node_prop_graph(
-  handle: &mut GraphTxHandle,
-  node_id: NodeId,
-  key_id: PropKeyId,
-) -> PyResult<()> {
-  graph_del_node_prop(handle, node_id, key_id)
-    .map_err(|e| PyRuntimeError::new_err(format!("Failed to delete property: {e}")))?;
-  Ok(())
-}
-
-/// Get all node properties on graph database
-pub fn get_node_props_graph(db: &RustGraphDB, node_id: NodeId) -> Option<Vec<NodeProp>> {
-  get_node_props_db(db, node_id).map(|props| {
-    props
-      .into_iter()
-      .map(|(k, v)| NodeProp {
-        key_id: k,
-        value: v.into(),
-      })
-      .collect()
-  })
-}
-
-// ============================================================================
-// Graph database edge property operations
-// ============================================================================
-
-/// Set edge property on graph database (requires transaction handle)
-pub fn set_edge_prop_graph(
-  handle: &mut GraphTxHandle,
-  src: NodeId,
-  etype: ETypeId,
-  dst: NodeId,
-  key_id: PropKeyId,
-  value: CorePropValue,
-) -> PyResult<()> {
-  graph_set_edge_prop(handle, src, etype, dst, key_id, value)
-    .map_err(|e| PyRuntimeError::new_err(format!("Failed to set edge property: {e}")))?;
-  Ok(())
-}
-
-/// Get edge property on graph database
-pub fn get_edge_prop_graph(
-  db: &RustGraphDB,
-  src: NodeId,
-  etype: ETypeId,
-  dst: NodeId,
-  key_id: PropKeyId,
-) -> Option<PropValue> {
-  get_edge_prop_db(db, src, etype, dst, key_id).map(|v| v.into())
-}
-
-/// Delete edge property on graph database (requires transaction handle)
-pub fn delete_edge_prop_graph(
-  handle: &mut GraphTxHandle,
-  src: NodeId,
-  etype: ETypeId,
-  dst: NodeId,
-  key_id: PropKeyId,
-) -> PyResult<()> {
-  graph_del_edge_prop(handle, src, etype, dst, key_id)
-    .map_err(|e| PyRuntimeError::new_err(format!("Failed to delete edge property: {e}")))?;
-  Ok(())
-}
-
-/// Get all edge properties on graph database
-pub fn get_edge_props_graph(
-  db: &RustGraphDB,
-  src: NodeId,
-  etype: ETypeId,
-  dst: NodeId,
-) -> Option<Vec<NodeProp>> {
-  get_edge_props_db(db, src, etype, dst).map(|props| {
-    props
-      .into_iter()
-      .map(|(k, v)| NodeProp {
-        key_id: k,
-        value: v.into(),
-      })
-      .collect()
-  })
-}
-
-// ============================================================================
 // Direct type property operations (bypass PropValue wrapper for performance)
 // ============================================================================
 
@@ -343,54 +224,6 @@ pub fn get_node_prop_bool_single(
   key_id: PropKeyId,
 ) -> Option<bool> {
   db.get_node_prop(node_id, key_id).and_then(|v| match v {
-    CorePropValue::Bool(b) => Some(b),
-    _ => None,
-  })
-}
-
-/// Get string property directly from graph
-pub fn get_node_prop_string_graph(
-  db: &RustGraphDB,
-  node_id: NodeId,
-  key_id: PropKeyId,
-) -> Option<String> {
-  get_node_prop_db(db, node_id, key_id).and_then(|v| match v {
-    CorePropValue::String(s) => Some(s),
-    _ => None,
-  })
-}
-
-/// Get int property directly from graph
-pub fn get_node_prop_int_graph(
-  db: &RustGraphDB,
-  node_id: NodeId,
-  key_id: PropKeyId,
-) -> Option<i64> {
-  get_node_prop_db(db, node_id, key_id).and_then(|v| match v {
-    CorePropValue::I64(i) => Some(i),
-    _ => None,
-  })
-}
-
-/// Get float property directly from graph
-pub fn get_node_prop_float_graph(
-  db: &RustGraphDB,
-  node_id: NodeId,
-  key_id: PropKeyId,
-) -> Option<f64> {
-  get_node_prop_db(db, node_id, key_id).and_then(|v| match v {
-    CorePropValue::F64(f) => Some(f),
-    _ => None,
-  })
-}
-
-/// Get bool property directly from graph
-pub fn get_node_prop_bool_graph(
-  db: &RustGraphDB,
-  node_id: NodeId,
-  key_id: PropKeyId,
-) -> Option<bool> {
-  get_node_prop_db(db, node_id, key_id).and_then(|v| match v {
     CorePropValue::Bool(b) => Some(b),
     _ => None,
   })

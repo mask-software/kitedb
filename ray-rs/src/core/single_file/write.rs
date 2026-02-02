@@ -36,6 +36,14 @@ impl SingleFileDB {
     // Update delta
     self.delta.write().create_node(node_id, key);
 
+    if let Some(mvcc) = self.mvcc.as_ref() {
+      let mut tx_mgr = mvcc.tx_manager.lock();
+      tx_mgr.record_write(txid, format!("node:{node_id}"));
+      if let Some(key) = key {
+        tx_mgr.record_write(txid, format!("key:{key}"));
+      }
+    }
+
     Ok(node_id)
   }
 
@@ -62,6 +70,14 @@ impl SingleFileDB {
     // Update delta
     self.delta.write().create_node(node_id, key);
 
+    if let Some(mvcc) = self.mvcc.as_ref() {
+      let mut tx_mgr = mvcc.tx_manager.lock();
+      tx_mgr.record_write(txid, format!("node:{node_id}"));
+      if let Some(key) = key {
+        tx_mgr.record_write(txid, format!("key:{key}"));
+      }
+    }
+
     Ok(node_id)
   }
 
@@ -79,6 +95,11 @@ impl SingleFileDB {
 
     // Update delta
     self.delta.write().delete_node(node_id);
+
+    if let Some(mvcc) = self.mvcc.as_ref() {
+      let mut tx_mgr = mvcc.tx_manager.lock();
+      tx_mgr.record_write(txid, format!("node:{node_id}"));
+    }
 
     // Invalidate cache
     self.cache_invalidate_node(node_id);
@@ -104,6 +125,11 @@ impl SingleFileDB {
 
     // Update delta
     self.delta.write().add_edge(src, etype, dst);
+
+    if let Some(mvcc) = self.mvcc.as_ref() {
+      let mut tx_mgr = mvcc.tx_manager.lock();
+      tx_mgr.record_write(txid, format!("edge:{src}:{etype}:{dst}"));
+    }
 
     // Invalidate cache (traversal cache for both src and dst)
     self.cache_invalidate_edge(src, etype, dst);
@@ -131,6 +157,11 @@ impl SingleFileDB {
 
     // Update delta
     self.delta.write().delete_edge(src, etype, dst);
+
+    if let Some(mvcc) = self.mvcc.as_ref() {
+      let mut tx_mgr = mvcc.tx_manager.lock();
+      tx_mgr.record_write(txid, format!("edge:{src}:{etype}:{dst}"));
+    }
 
     // Invalidate cache
     self.cache_invalidate_edge(src, etype, dst);
@@ -187,6 +218,11 @@ impl SingleFileDB {
     // Update delta
     self.delta.write().set_node_prop(node_id, key_id, value);
 
+    if let Some(mvcc) = self.mvcc.as_ref() {
+      let mut tx_mgr = mvcc.tx_manager.lock();
+      tx_mgr.record_write(txid, format!("nodeprop:{node_id}:{key_id}"));
+    }
+
     // Invalidate cache
     self.cache_invalidate_node(node_id);
 
@@ -218,6 +254,11 @@ impl SingleFileDB {
 
     // Update delta
     self.delta.write().delete_node_prop(node_id, key_id);
+
+    if let Some(mvcc) = self.mvcc.as_ref() {
+      let mut tx_mgr = mvcc.tx_manager.lock();
+      tx_mgr.record_write(txid, format!("nodeprop:{node_id}:{key_id}"));
+    }
 
     // Invalidate cache
     self.cache_invalidate_node(node_id);
@@ -253,6 +294,11 @@ impl SingleFileDB {
       .delta
       .write()
       .set_edge_prop(src, etype, dst, key_id, value);
+
+    if let Some(mvcc) = self.mvcc.as_ref() {
+      let mut tx_mgr = mvcc.tx_manager.lock();
+      tx_mgr.record_write(txid, format!("edgeprop:{src}:{etype}:{dst}:{key_id}"));
+    }
 
     // Invalidate cache
     self.cache_invalidate_edge(src, etype, dst);
@@ -294,6 +340,11 @@ impl SingleFileDB {
     // Update delta
     self.delta.write().delete_edge_prop(src, etype, dst, key_id);
 
+    if let Some(mvcc) = self.mvcc.as_ref() {
+      let mut tx_mgr = mvcc.tx_manager.lock();
+      tx_mgr.record_write(txid, format!("edgeprop:{src}:{etype}:{dst}:{key_id}"));
+    }
+
     // Invalidate cache
     self.cache_invalidate_edge(src, etype, dst);
 
@@ -318,6 +369,11 @@ impl SingleFileDB {
 
     // Update delta
     self.delta.write().add_node_label(node_id, label_id);
+
+    if let Some(mvcc) = self.mvcc.as_ref() {
+      let mut tx_mgr = mvcc.tx_manager.lock();
+      tx_mgr.record_write(txid, format!("node:{node_id}"));
+    }
 
     // Invalidate cache (label changes affect node)
     self.cache_invalidate_node(node_id);
@@ -345,6 +401,11 @@ impl SingleFileDB {
 
     // Update delta
     self.delta.write().remove_node_label(node_id, label_id);
+
+    if let Some(mvcc) = self.mvcc.as_ref() {
+      let mut tx_mgr = mvcc.tx_manager.lock();
+      tx_mgr.record_write(txid, format!("node:{node_id}"));
+    }
 
     // Invalidate cache (label changes affect node)
     self.cache_invalidate_node(node_id);

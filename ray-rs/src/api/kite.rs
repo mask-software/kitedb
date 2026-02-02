@@ -1,7 +1,7 @@
 //! Kite - High-level API for KiteDB
 //!
 //! The Kite struct provides a clean, ergonomic API for graph operations.
-//! It wraps the lower-level GraphDB with schema definitions and type-safe operations.
+//! It wraps the lower-level SingleFileDB with schema definitions and type-safe operations.
 //!
 //! Provides:
 //! - Node and edge CRUD operations
@@ -11,36 +11,359 @@
 //!
 //! Ported from src/api/kite.ts
 
+use crate::core::single_file::{
+  close_single_file, is_single_file_path, open_single_file, single_file_extension, FullEdge,
+  SingleFileDB, SingleFileOpenOptions,
+};
 use crate::error::{KiteError, Result};
-use crate::graph::db::{close_graph_db, open_graph_db, GraphDB, OpenOptions};
-use crate::graph::edges::{
-  add_edge,
-  del_edge_prop,
-  delete_edge,
-  edge_exists,
-  // Direct read functions (no transaction)
-  edge_exists_db,
-  get_edge_prop_db,
-  get_edge_props_db,
-  get_neighbors_in_db,
-  get_neighbors_out_db,
-  set_edge_prop,
-  upsert_edge_with_props,
-};
-use crate::graph::iterators::{
-  count_edges, count_nodes, list_edges, list_nodes, FullEdge, ListEdgesOptions,
-};
-use crate::graph::key_index::get_node_key;
-use crate::graph::nodes::{
-  create_node, del_node_prop, delete_node, get_node_by_key, get_node_by_key_db, get_node_prop,
-  get_node_prop_db, node_exists, node_exists_db, set_node_prop, upsert_node_by_id_with_props,
-  upsert_node_with_props, NodeOpts,
-};
-use crate::graph::tx::{begin_tx, commit, rollback, TxHandle};
 use crate::types::*;
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+// ============================================================================
+// Single-file transaction wrappers
+// ============================================================================
+
+#[derive(Debug, Clone, Default)]
+struct NodeOpts {
+  key: Option<String>,
+  labels: Option<Vec<LabelId>>,
+  props: Option<Vec<(PropKeyId, PropValue)>>,
+}
+
+impl NodeOpts {
+  fn new() -> Self {
+    Self::default()
+  }
+
+  fn with_key(mut self, key: impl Into<String>) -> Self {
+    self.key = Some(key.into());
+    self
+  }
+
+  #[allow(dead_code)]
+  fn with_label(mut self, label: LabelId) -> Self {
+    self.labels.get_or_insert_with(Vec::new).push(label);
+    self
+  }
+
+  #[allow(dead_code)]
+  fn with_prop(mut self, key: PropKeyId, value: PropValue) -> Self {
+    self.props
+      .get_or_insert_with(Vec::new)
+      .push((key, value));
+    self
+  }
+}
+
+struct TxHandle<'a> {
+  db: &'a SingleFileDB,
+  finished: bool,
+  owns_tx: bool,
+}
+
+impl<'a> TxHandle<'a> {
+  fn new(db: &'a SingleFileDB, owns_tx: bool) -> Self {
+    Self {
+      db,
+      finished: false,
+      owns_tx,
+    }
+  }
+}
+
+impl<'a> Drop for TxHandle<'a> {
+  fn drop(&mut self) {
+    if !self.finished {
+      if self.owns_tx {
+        let _ = self.db.rollback();
+      }
+      self.finished = true;
+    }
+  }
+}
+
+fn begin_tx(db: &SingleFileDB) -> Result<TxHandle<'_>> {
+  if db.has_transaction() {
+    db.require_write_tx()?;
+    return Ok(TxHandle::new(db, false));
+  }
+
+  db.begin(false)?;
+  Ok(TxHandle::new(db, true))
+}
+
+fn commit(handle: &mut TxHandle) -> Result<()> {
+  if handle.owns_tx {
+    handle.db.commit()?;
+  }
+  handle.finished = true;
+  Ok(())
+}
+
+fn rollback(handle: &mut TxHandle) -> Result<()> {
+  if handle.owns_tx {
+    handle.db.rollback()?;
+  }
+  handle.finished = true;
+  Ok(())
+}
+
+#[derive(Debug, Clone, Default)]
+struct ListEdgesOptions {
+  pub etype: Option<ETypeId>,
+}
+
+fn create_node(handle: &mut TxHandle, opts: NodeOpts) -> Result<NodeId> {
+  let node_id = handle.db.create_node(opts.key.as_deref())?;
+  if let Some(labels) = opts.labels {
+    for label_id in labels {
+      handle.db.add_node_label(node_id, label_id)?;
+    }
+  }
+  if let Some(props) = opts.props {
+    for (key_id, value) in props {
+      handle.db.set_node_prop(node_id, key_id, value)?;
+    }
+  }
+  Ok(node_id)
+}
+
+fn create_node_with_id(handle: &mut TxHandle, node_id: NodeId, opts: NodeOpts) -> Result<NodeId> {
+  let node_id = handle
+    .db
+    .create_node_with_id(node_id, opts.key.as_deref())?;
+  if let Some(labels) = opts.labels {
+    for label_id in labels {
+      handle.db.add_node_label(node_id, label_id)?;
+    }
+  }
+  if let Some(props) = opts.props {
+    for (key_id, value) in props {
+      handle.db.set_node_prop(node_id, key_id, value)?;
+    }
+  }
+  Ok(node_id)
+}
+
+fn delete_node(handle: &mut TxHandle, node_id: NodeId) -> Result<bool> {
+  if !handle.db.node_exists(node_id) {
+    return Ok(false);
+  }
+  handle.db.delete_node(node_id)?;
+  Ok(true)
+}
+
+fn node_exists(handle: &TxHandle, node_id: NodeId) -> bool {
+  handle.db.node_exists(node_id)
+}
+
+fn node_exists_db(db: &SingleFileDB, node_id: NodeId) -> bool {
+  db.node_exists(node_id)
+}
+
+fn get_node_by_key(handle: &TxHandle, key: &str) -> Option<NodeId> {
+  handle.db.get_node_by_key(key)
+}
+
+fn get_node_by_key_db(db: &SingleFileDB, key: &str) -> Option<NodeId> {
+  db.get_node_by_key(key)
+}
+
+fn get_node_prop(handle: &TxHandle, node_id: NodeId, key_id: PropKeyId) -> Option<PropValue> {
+  handle.db.get_node_prop(node_id, key_id)
+}
+
+fn get_node_prop_db(db: &SingleFileDB, node_id: NodeId, key_id: PropKeyId) -> Option<PropValue> {
+  db.get_node_prop(node_id, key_id)
+}
+
+fn set_node_prop(
+  handle: &mut TxHandle,
+  node_id: NodeId,
+  key_id: PropKeyId,
+  value: PropValue,
+) -> Result<()> {
+  handle.db.set_node_prop(node_id, key_id, value)
+}
+
+fn del_node_prop(handle: &mut TxHandle, node_id: NodeId, key_id: PropKeyId) -> Result<()> {
+  handle.db.delete_node_prop(node_id, key_id)
+}
+
+fn upsert_node_with_props<I>(
+  handle: &mut TxHandle,
+  key: &str,
+  props: I,
+) -> Result<(NodeId, bool)>
+where
+  I: IntoIterator<Item = (PropKeyId, Option<PropValue>)>,
+{
+  let (node_id, created) = match handle.db.get_node_by_key(key) {
+    Some(existing) => (existing, false),
+    None => (create_node(handle, NodeOpts::new().with_key(key))?, true),
+  };
+
+  for (key_id, value_opt) in props {
+    match value_opt {
+      Some(value) => set_node_prop(handle, node_id, key_id, value)?,
+      None => del_node_prop(handle, node_id, key_id)?,
+    }
+  }
+
+  Ok((node_id, created))
+}
+
+fn upsert_node_by_id_with_props<I>(
+  handle: &mut TxHandle,
+  node_id: NodeId,
+  opts: NodeOpts,
+  props: I,
+) -> Result<(NodeId, bool)>
+where
+  I: IntoIterator<Item = (PropKeyId, Option<PropValue>)>,
+{
+  let created = if handle.db.node_exists(node_id) {
+    false
+  } else {
+    create_node_with_id(handle, node_id, opts)?;
+    true
+  };
+
+  for (key_id, value_opt) in props {
+    match value_opt {
+      Some(value) => set_node_prop(handle, node_id, key_id, value)?,
+      None => del_node_prop(handle, node_id, key_id)?,
+    }
+  }
+
+  Ok((node_id, created))
+}
+
+fn add_edge(handle: &mut TxHandle, src: NodeId, etype: ETypeId, dst: NodeId) -> Result<()> {
+  handle.db.add_edge(src, etype, dst)
+}
+
+fn delete_edge(handle: &mut TxHandle, src: NodeId, etype: ETypeId, dst: NodeId) -> Result<bool> {
+  if !handle.db.edge_exists(src, etype, dst) {
+    return Ok(false);
+  }
+  handle.db.delete_edge(src, etype, dst)?;
+  Ok(true)
+}
+
+fn edge_exists(handle: &TxHandle, src: NodeId, etype: ETypeId, dst: NodeId) -> bool {
+  handle.db.edge_exists(src, etype, dst)
+}
+
+fn edge_exists_db(db: &SingleFileDB, src: NodeId, etype: ETypeId, dst: NodeId) -> bool {
+  db.edge_exists(src, etype, dst)
+}
+
+fn get_neighbors_out_db(
+  db: &SingleFileDB,
+  node_id: NodeId,
+  etype: Option<ETypeId>,
+) -> Vec<NodeId> {
+  match etype {
+    Some(filter) => db.get_out_neighbors(node_id, filter),
+    None => db
+      .get_out_edges(node_id)
+      .into_iter()
+      .map(|(_, dst)| dst)
+      .collect(),
+  }
+}
+
+fn get_neighbors_in_db(
+  db: &SingleFileDB,
+  node_id: NodeId,
+  etype: Option<ETypeId>,
+) -> Vec<NodeId> {
+  match etype {
+    Some(filter) => db.get_in_neighbors(node_id, filter),
+    None => db
+      .get_in_edges(node_id)
+      .into_iter()
+      .map(|(_, src)| src)
+      .collect(),
+  }
+}
+
+fn get_edge_prop_db(
+  db: &SingleFileDB,
+  src: NodeId,
+  etype: ETypeId,
+  dst: NodeId,
+  key_id: PropKeyId,
+) -> Option<PropValue> {
+  db.get_edge_prop(src, etype, dst, key_id)
+}
+
+fn get_edge_props_db(
+  db: &SingleFileDB,
+  src: NodeId,
+  etype: ETypeId,
+  dst: NodeId,
+) -> Option<HashMap<PropKeyId, PropValue>> {
+  db.get_edge_props(src, etype, dst)
+}
+
+fn set_edge_prop(
+  handle: &mut TxHandle,
+  src: NodeId,
+  etype: ETypeId,
+  dst: NodeId,
+  key_id: PropKeyId,
+  value: PropValue,
+) -> Result<()> {
+  handle.db.set_edge_prop(src, etype, dst, key_id, value)
+}
+
+fn del_edge_prop(
+  handle: &mut TxHandle,
+  src: NodeId,
+  etype: ETypeId,
+  dst: NodeId,
+  key_id: PropKeyId,
+) -> Result<()> {
+  handle.db.delete_edge_prop(src, etype, dst, key_id)
+}
+
+fn upsert_edge_with_props<I>(
+  handle: &mut TxHandle,
+  src: NodeId,
+  etype: ETypeId,
+  dst: NodeId,
+  props: I,
+) -> Result<bool>
+where
+  I: IntoIterator<Item = (PropKeyId, Option<PropValue>)>,
+{
+  handle
+    .db
+    .upsert_edge_with_props(src, etype, dst, props)
+}
+
+fn list_nodes(db: &SingleFileDB) -> Vec<NodeId> {
+  db.list_nodes()
+}
+
+fn list_edges(db: &SingleFileDB, options: ListEdgesOptions) -> Vec<FullEdge> {
+  db.list_edges(options.etype)
+}
+
+fn count_nodes(db: &SingleFileDB) -> u64 {
+  db.count_nodes() as u64
+}
+
+fn count_edges(db: &SingleFileDB, etype_filter: Option<ETypeId>) -> u64 {
+  match etype_filter {
+    Some(etype) => db.count_edges_by_type(etype) as u64,
+    None => db.count_edges() as u64,
+  }
+}
 
 // ============================================================================
 // Schema Definitions
@@ -223,8 +546,14 @@ pub struct KiteOptions {
   pub read_only: bool,
   /// Create database if it doesn't exist
   pub create_if_missing: bool,
-  /// Acquire file lock
-  pub lock_file: bool,
+  /// Enable MVCC (snapshot isolation + conflict detection)
+  pub mvcc: bool,
+  /// MVCC GC interval in ms
+  pub mvcc_gc_interval_ms: Option<u64>,
+  /// MVCC retention in ms
+  pub mvcc_retention_ms: Option<u64>,
+  /// MVCC max version chain depth
+  pub mvcc_max_chain_depth: Option<usize>,
 }
 
 impl KiteOptions {
@@ -234,7 +563,10 @@ impl KiteOptions {
       edges: Vec::new(),
       read_only: false,
       create_if_missing: true,
-      lock_file: true,
+      mvcc: false,
+      mvcc_gc_interval_ms: None,
+      mvcc_retention_ms: None,
+      mvcc_max_chain_depth: None,
     }
   }
 
@@ -252,6 +584,26 @@ impl KiteOptions {
     self.read_only = value;
     self
   }
+
+  pub fn mvcc(mut self, value: bool) -> Self {
+    self.mvcc = value;
+    self
+  }
+
+  pub fn mvcc_gc_interval_ms(mut self, value: u64) -> Self {
+    self.mvcc_gc_interval_ms = Some(value);
+    self
+  }
+
+  pub fn mvcc_retention_ms(mut self, value: u64) -> Self {
+    self.mvcc_retention_ms = Some(value);
+    self
+  }
+
+  pub fn mvcc_max_chain_depth(mut self, value: usize) -> Self {
+    self.mvcc_max_chain_depth = Some(value);
+    self
+  }
 }
 
 /// Convenience helper to open a KiteDB instance.
@@ -266,7 +618,7 @@ pub fn kite<P: AsRef<Path>>(path: P, options: KiteOptions) -> Result<Kite> {
 /// High-level graph database API
 pub struct Kite {
   /// Underlying database
-  db: GraphDB,
+  db: SingleFileDB,
   /// Node type definitions by name
   nodes: HashMap<String, NodeDef>,
   /// Edge type definitions by name
@@ -278,14 +630,44 @@ pub struct Kite {
 impl Kite {
   /// Open or create a Kite database
   pub fn open<P: AsRef<Path>>(path: P, options: KiteOptions) -> Result<Self> {
-    let db_options = OpenOptions {
-      read_only: options.read_only,
-      create_if_missing: options.create_if_missing,
-      lock_file: options.lock_file,
-      ..Default::default()
-    };
+    let path = path.as_ref();
+    if path.exists() && path.is_dir() {
+      return Err(KiteError::InvalidPath(
+        "Directory-format databases are no longer supported; use a .kitedb file path"
+          .to_string(),
+      ));
+    }
 
-    let db = open_graph_db(path, db_options)?;
+    let mut db_path = PathBuf::from(path);
+    if db_path.extension().is_some() {
+      if !is_single_file_path(&db_path) {
+        let ext = db_path
+          .extension()
+          .map(|value| value.to_string_lossy())
+          .unwrap_or_else(|| "".into());
+        return Err(KiteError::InvalidPath(format!(
+          "Invalid database extension '.{ext}'. Single-file databases must use {} (or pass a path without an extension).",
+          single_file_extension()
+        )));
+      }
+    } else {
+      db_path = PathBuf::from(format!("{}{}", path.display(), single_file_extension()));
+    }
+
+    let mut db_options = SingleFileOpenOptions::new()
+      .read_only(options.read_only)
+      .create_if_missing(options.create_if_missing)
+      .mvcc(options.mvcc);
+    if let Some(v) = options.mvcc_gc_interval_ms {
+      db_options = db_options.mvcc_gc_interval_ms(v);
+    }
+    if let Some(v) = options.mvcc_retention_ms {
+      db_options = db_options.mvcc_retention_ms(v);
+    }
+    if let Some(v) = options.mvcc_max_chain_depth {
+      db_options = db_options.mvcc_max_chain_depth(v);
+    }
+    let db = open_single_file(&db_path, db_options)?;
 
     // Initialize schema in a transaction
     let mut nodes: HashMap<String, NodeDef> = HashMap::new();
@@ -460,8 +842,7 @@ impl Kite {
 
     if exists {
       // Look up the node's key from snapshot/delta
-      let delta = self.db.delta.read();
-      let key = get_node_key(self.db.snapshot.as_ref(), &delta, node_id);
+      let key = self.db.get_node_key(node_id);
 
       // Try to determine node type from key prefix
       let node_type = if let Some(ref k) = key {
@@ -531,9 +912,12 @@ impl Kite {
   /// ```
   pub fn update(&mut self, node_ref: &NodeRef) -> Result<KiteUpdateNodeBuilder<'_>> {
     // Verify node exists
-    let mut handle = begin_tx(&self.db)?;
-    let exists = node_exists(&handle, node_ref.id);
-    commit(&mut handle)?;
+    let exists = {
+      let mut handle = begin_tx(&self.db)?;
+      let exists = node_exists(&handle, node_ref.id);
+      commit(&mut handle)?;
+      exists
+    };
 
     if !exists {
       return Err(KiteError::NodeNotFound(node_ref.id));
@@ -563,9 +947,12 @@ impl Kite {
   /// ```
   pub fn update_by_id(&mut self, node_id: NodeId) -> Result<KiteUpdateNodeBuilder<'_>> {
     // Verify node exists
-    let mut handle = begin_tx(&self.db)?;
-    let exists = node_exists(&handle, node_id);
-    commit(&mut handle)?;
+    let exists = {
+      let mut handle = begin_tx(&self.db)?;
+      let exists = node_exists(&handle, node_id);
+      commit(&mut handle)?;
+      exists
+    };
 
     if !exists {
       return Err(KiteError::NodeNotFound(node_id));
@@ -625,10 +1012,13 @@ impl Kite {
       .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown node type: {node_type}")))?
       .key(key_suffix);
 
-    let mut handle = begin_tx(&self.db)?;
-    let node_id =
-      get_node_by_key(&handle, &full_key).ok_or_else(|| KiteError::KeyNotFound(full_key.clone()))?;
-    commit(&mut handle)?;
+    let node_id = {
+      let mut handle = begin_tx(&self.db)?;
+      let node_id = get_node_by_key(&handle, &full_key)
+        .ok_or_else(|| KiteError::KeyNotFound(full_key.clone()))?;
+      commit(&mut handle)?;
+      node_id
+    };
 
     Ok(KiteUpdateNodeBuilder {
       ray: self,
@@ -1154,8 +1544,7 @@ impl Kite {
 
   /// Helper to get node key from database
   fn get_node_key_internal(&self, node_id: NodeId) -> Option<String> {
-    let delta = self.db.delta.read();
-    get_node_key(self.db.snapshot.as_ref(), &delta, node_id)
+    self.db.get_node_key(node_id)
   }
 
   // ========================================================================
@@ -1326,123 +1715,33 @@ impl Kite {
     use super::traversal::TraversalDirection;
 
     let mut edges = Vec::new();
-    let delta = self.db.delta.read();
 
     match direction {
       TraversalDirection::Out => {
-        // Build set of deleted edges for filtering
-        let deleted_set = delta.out_del.get(&node_id);
-
-        // Get from snapshot first
-        if let Some(ref snapshot) = self.db.snapshot {
-          if let Some(src_phys) = snapshot.get_phys_node(node_id) {
-            for (dst_phys, edge_etype) in snapshot.iter_out_edges(src_phys) {
-              // Filter by edge type if specified
-              if etype.is_some() && etype != Some(edge_etype) {
-                continue;
-              }
-
-              // Get the logical node ID for the destination
-              if let Some(dst_id) = snapshot.get_node_id(dst_phys) {
-                // Check if this edge was deleted in delta
-                let is_deleted = deleted_set
-                  .map(|set| {
-                    set.contains(&EdgePatch {
-                      etype: edge_etype,
-                      other: dst_id,
-                    })
-                  })
-                  .unwrap_or(false);
-
-                if !is_deleted {
-                  edges.push(Edge {
-                    src: node_id,
-                    etype: edge_etype,
-                    dst: dst_id,
-                  });
-                }
-              }
-            }
+        for (edge_etype, dst) in self.db.get_out_edges(node_id) {
+          if etype.is_some() && etype != Some(edge_etype) {
+            continue;
           }
-        }
-
-        // Get from delta additions
-        if let Some(add_set) = delta.out_add.get(&node_id) {
-          for patch in add_set {
-            if etype.is_none() || etype == Some(patch.etype) {
-              // Only add if not already in edges (from snapshot)
-              if !edges
-                .iter()
-                .any(|e| e.dst == patch.other && e.etype == patch.etype)
-              {
-                edges.push(Edge {
-                  src: node_id,
-                  etype: patch.etype,
-                  dst: patch.other,
-                });
-              }
-            }
-          }
+          edges.push(Edge {
+            src: node_id,
+            etype: edge_etype,
+            dst,
+          });
         }
       }
       TraversalDirection::In => {
-        // Build set of deleted edges for filtering
-        let deleted_set = delta.in_del.get(&node_id);
-
-        // Get from snapshot first
-        if let Some(ref snapshot) = self.db.snapshot {
-          if let Some(dst_phys) = snapshot.get_phys_node(node_id) {
-            for (src_phys, edge_etype, _out_index) in snapshot.iter_in_edges(dst_phys) {
-              // Filter by edge type if specified
-              if etype.is_some() && etype != Some(edge_etype) {
-                continue;
-              }
-
-              // Get the logical node ID for the source
-              if let Some(src_id) = snapshot.get_node_id(src_phys) {
-                // Check if this edge was deleted in delta
-                let is_deleted = deleted_set
-                  .map(|set| {
-                    set.contains(&EdgePatch {
-                      etype: edge_etype,
-                      other: src_id,
-                    })
-                  })
-                  .unwrap_or(false);
-
-                if !is_deleted {
-                  edges.push(Edge {
-                    src: src_id,
-                    etype: edge_etype,
-                    dst: node_id,
-                  });
-                }
-              }
-            }
+        for (edge_etype, src) in self.db.get_in_edges(node_id) {
+          if etype.is_some() && etype != Some(edge_etype) {
+            continue;
           }
-        }
-
-        // Get from delta additions
-        if let Some(add_set) = delta.in_add.get(&node_id) {
-          for patch in add_set {
-            if etype.is_none() || etype == Some(patch.etype) {
-              // Only add if not already in edges (from snapshot)
-              if !edges
-                .iter()
-                .any(|e| e.src == patch.other && e.etype == patch.etype)
-              {
-                edges.push(Edge {
-                  src: patch.other,
-                  etype: patch.etype,
-                  dst: node_id,
-                });
-              }
-            }
-          }
+          edges.push(Edge {
+            src,
+            etype: edge_etype,
+            dst: node_id,
+          });
         }
       }
       TraversalDirection::Both => {
-        drop(delta); // Release lock before recursive calls
         edges.extend(self.get_neighbors(node_id, TraversalDirection::Out, etype));
         edges.extend(self.get_neighbors(node_id, TraversalDirection::In, etype));
       }
@@ -1460,93 +1759,15 @@ impl Kite {
   /// This merges the write-ahead log (WAL) into the snapshot, reducing
   /// file size and improving read performance. This is equivalent to
   /// "VACUUM" in SQLite.
-  ///
-  /// Optimize the database by compacting snapshot + delta into a new snapshot
-  ///
-  /// This operation:
-  /// 1. Collects all live nodes and edges from snapshot + delta
-  /// 2. Builds a new snapshot with the merged data  
-  /// 3. Updates manifest to point to new snapshot
-  /// 4. Clears WAL and delta
-  /// 5. Garbage collects old snapshots (keeps last 2)
-  ///
   /// Call this periodically to reclaim space from deleted nodes/edges
   /// and improve read performance.
   pub fn optimize(&mut self) -> Result<()> {
-    self.db.optimize()
+    self.db.optimize_single_file(None)
   }
 
   /// Get database statistics
   pub fn stats(&self) -> DbStats {
-    use crate::graph::iterators::{count_edges, count_nodes};
-
-    let node_count = count_nodes(&self.db);
-    let edge_count = count_edges(&self.db, None);
-
-    // Get delta statistics
-    let delta = self.db.delta.read();
-    let delta_nodes_created = delta.created_nodes.len();
-    let delta_nodes_deleted = delta.deleted_nodes.len();
-    let delta_edges_added = delta.total_edges_added();
-    let delta_edges_deleted = delta.total_edges_deleted();
-    drop(delta);
-
-    // Get snapshot statistics
-    let (snapshot_gen, snapshot_nodes, snapshot_edges, snapshot_max_node_id) =
-      if let Some(ref snapshot) = self.db.snapshot {
-        (
-          snapshot.header.generation,
-          snapshot.header.num_nodes,
-          snapshot.header.num_edges,
-          snapshot.header.max_node_id,
-        )
-      } else {
-        (0, 0, 0, 0)
-      };
-
-    // Get WAL segment from manifest
-    let wal_segment = self
-      .db
-      .manifest
-      .as_ref()
-      .map(|m| m.active_wal_seg)
-      .unwrap_or(0);
-
-    let mvcc_stats = self.db.mvcc.as_ref().map(|mvcc| {
-      let tx_mgr = mvcc.tx_manager.lock();
-      let gc = mvcc.gc.lock();
-      let gc_stats = gc.get_stats();
-      let committed_stats = tx_mgr.get_committed_writes_stats();
-      MvccStats {
-        active_transactions: tx_mgr.get_active_count(),
-        min_active_ts: tx_mgr.min_active_ts(),
-        versions_pruned: gc_stats.versions_pruned,
-        gc_runs: gc_stats.gc_runs,
-        last_gc_time: gc_stats.last_gc_time,
-        committed_writes_size: committed_stats.size,
-        committed_writes_pruned: committed_stats.pruned,
-      }
-    });
-
-    // Recommend compaction if delta has significant changes
-    let total_changes =
-      delta_nodes_created + delta_nodes_deleted + delta_edges_added + delta_edges_deleted;
-    let recommend_compact = total_changes > 10_000;
-
-    DbStats {
-      snapshot_gen,
-      snapshot_nodes: snapshot_nodes.max(node_count), // Use higher of snapshot or total
-      snapshot_edges: snapshot_edges.max(edge_count),
-      snapshot_max_node_id,
-      delta_nodes_created,
-      delta_nodes_deleted,
-      delta_edges_added,
-      delta_edges_deleted,
-      wal_segment,
-      wal_bytes: self.db.wal_bytes(),
-      recommend_compact,
-      mvcc_stats,
-    }
+    self.db.stats()
   }
 
   /// Get a human-readable description of the database
@@ -1563,7 +1784,7 @@ impl Kite {
   /// # let kite: Kite = unimplemented!();
   /// println!("{}", kite.describe());
   /// // Output:
-  /// // KiteDB at /path/to/db (multi-file format)
+  /// // KiteDB at /path/to/db.kitedb (single-file format)
   /// // Schema:
   /// //   Node types: User, Post, Comment
   /// //   Edge types: FOLLOWS, LIKES, WROTE
@@ -1575,11 +1796,7 @@ impl Kite {
   pub fn describe(&self) -> String {
     let stats = self.stats();
     let path = self.db.path.display();
-    let format = if self.db.is_single_file {
-      "single-file"
-    } else {
-      "multi-file"
-    };
+    let format = "single-file";
 
     let node_types: Vec<&str> = self.nodes.keys().map(|s| s.as_str()).collect();
     let edge_types: Vec<&str> = self.edges.keys().map(|s| s.as_str()).collect();
@@ -1647,15 +1864,7 @@ impl Kite {
   /// # }
   /// ```
   pub fn check(&self) -> Result<CheckResult> {
-    let mut result = if let Some(ref snapshot) = self.db.snapshot {
-      crate::check::check_snapshot(snapshot)
-    } else {
-      CheckResult {
-        valid: true,
-        errors: Vec::new(),
-        warnings: vec!["No snapshot to check".to_string()],
-      }
-    };
+    let mut result = self.db.check();
 
     // Schema consistency - verify all registered edge types have valid IDs
     for (edge_name, edge_def) in &self.edges {
@@ -1673,19 +1882,19 @@ impl Kite {
   // Database Access
   // ========================================================================
 
-  /// Get a reference to the underlying GraphDB
-  pub fn raw(&self) -> &GraphDB {
+  /// Get a reference to the underlying SingleFileDB
+  pub fn raw(&self) -> &SingleFileDB {
     &self.db
   }
 
-  /// Get a mutable reference to the underlying GraphDB
-  pub fn raw_mut(&mut self) -> &mut GraphDB {
+  /// Get a mutable reference to the underlying SingleFileDB
+  pub fn raw_mut(&mut self) -> &mut SingleFileDB {
     &mut self.db
   }
 
   /// Close the database
   pub fn close(self) -> Result<()> {
-    close_graph_db(self.db)
+    close_single_file(self.db)
   }
 }
 

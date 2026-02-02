@@ -258,7 +258,21 @@ impl SingleFileDB {
       wal_segment: 0, // Not applicable for single-file
       wal_bytes: self.wal_stats().used,
       recommend_compact: self.should_checkpoint(0.8),
-      mvcc_stats: None,
+      mvcc_stats: self.mvcc.as_ref().map(|mvcc| {
+        let tx_mgr = mvcc.tx_manager.lock();
+        let gc = mvcc.gc.lock();
+        let gc_stats = gc.get_stats();
+        let committed = tx_mgr.get_committed_writes_stats();
+        MvccStats {
+          active_transactions: tx_mgr.get_active_count(),
+          min_active_ts: tx_mgr.min_active_ts(),
+          versions_pruned: gc_stats.versions_pruned,
+          gc_runs: gc_stats.gc_runs,
+          last_gc_time: gc_stats.last_gc_time,
+          committed_writes_size: committed.size,
+          committed_writes_pruned: committed.pruned,
+        }
+      }),
     }
   }
 

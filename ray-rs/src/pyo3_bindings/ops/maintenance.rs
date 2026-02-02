@@ -7,8 +7,6 @@ use crate::core::single_file::{
   SingleFileDB as RustSingleFileDB, SingleFileOptimizeOptions as RustSingleFileOptimizeOptions,
   VacuumOptions as RustVacuumOptions,
 };
-use crate::graph::db::GraphDB as RustGraphDB;
-use crate::types::CheckResult as RustCheckResult;
 
 use crate::pyo3_bindings::stats::{CheckResult, DbStats, MvccStats};
 
@@ -49,7 +47,7 @@ pub fn should_checkpoint_single(db: &RustSingleFileDB, threshold: f64) -> bool {
 }
 
 pub fn optimize_single(
-  db: &mut RustSingleFileDB,
+  db: &RustSingleFileDB,
   options: Option<RustSingleFileOptimizeOptions>,
 ) -> PyResult<()> {
   db.optimize_single_file(options)
@@ -57,7 +55,7 @@ pub fn optimize_single(
 }
 
 pub fn vacuum_single(
-  db: &mut RustSingleFileDB,
+  db: &RustSingleFileDB,
   options: Option<RustVacuumOptions>,
 ) -> PyResult<()> {
   db.vacuum_single_file(options)
@@ -92,25 +90,4 @@ pub fn stats_single(db: &RustSingleFileDB) -> DbStats {
 
 pub fn check_single(db: &RustSingleFileDB) -> CheckResult {
   db.check().into()
-}
-
-// ============================================================================
-// Graph database operations
-// ============================================================================
-
-pub fn optimize_graph(db: &mut RustGraphDB) -> PyResult<()> {
-  db.optimize()
-    .map_err(|e| PyRuntimeError::new_err(format!("Failed to optimize: {e}")))
-}
-
-pub fn check_graph(db: &RustGraphDB) -> RustCheckResult {
-  if let Some(ref snapshot) = db.snapshot {
-    return crate::check::check_snapshot(snapshot);
-  }
-
-  RustCheckResult {
-    valid: true,
-    errors: Vec::new(),
-    warnings: vec!["No snapshot to check".to_string()],
-  }
 }

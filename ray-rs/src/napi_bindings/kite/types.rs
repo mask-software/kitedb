@@ -70,6 +70,12 @@ pub struct JsKiteOptions {
   pub read_only: Option<bool>,
   /// Create database if it doesn't exist
   pub create_if_missing: Option<bool>,
-  /// Use file locking
-  pub lock_file: Option<bool>,
+  /// Enable MVCC (snapshot isolation + conflict detection)
+  pub mvcc: Option<bool>,
+  /// MVCC GC interval in ms
+  pub mvcc_gc_interval_ms: Option<i64>,
+  /// MVCC retention in ms
+  pub mvcc_retention_ms: Option<i64>,
+  /// MVCC max version chain depth
+  pub mvcc_max_chain_depth: Option<i64>,
 }

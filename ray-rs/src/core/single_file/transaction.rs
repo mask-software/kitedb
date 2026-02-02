@@ -23,11 +23,18 @@ impl SingleFileDB {
       return Err(KiteError::TransactionInProgress);
     }
 
-    let txid = self.alloc_tx_id();
-    let snapshot_ts = std::time::SystemTime::now()
-      .duration_since(std::time::UNIX_EPOCH)
-      .map(|d| d.as_nanos() as u64)
-      .unwrap_or(0);
+    let (txid, snapshot_ts) = if let Some(mvcc) = self.mvcc.as_ref() {
+      let (txid, snapshot_ts) = {
+        let mut tx_mgr = mvcc.tx_manager.lock();
+        tx_mgr.begin_tx()
+      };
+      self
+        .next_tx_id
+        .store(txid.saturating_add(1), std::sync::atomic::Ordering::SeqCst);
+      (txid, snapshot_ts)
+    } else {
+      (self.alloc_tx_id(), 0)
+    };
 
     // Write BEGIN record to WAL (for write transactions)
     if !read_only {
@@ -62,7 +69,234 @@ impl SingleFileDB {
 
     if tx.read_only {
       // Read-only transactions don't need WAL
+      if let Some(mvcc) = self.mvcc.as_ref() {
+        let mut tx_mgr = mvcc.tx_manager.lock();
+        tx_mgr.abort_tx(tx.txid);
+      }
       return Ok(());
+    }
+
+    let mut commit_ts_for_mvcc = None;
+    if let Some(mvcc) = self.mvcc.as_ref() {
+      let mut tx_mgr = mvcc.tx_manager.lock();
+      if let Err(err) = mvcc.conflict_detector.validate_commit(&tx_mgr, tx.txid) {
+        tx_mgr.abort_tx(tx.txid);
+        if let Some(delta_snapshot) = tx.delta_snapshot {
+          *self.delta.write() = delta_snapshot;
+        }
+        return Err(KiteError::Conflict {
+          txid: err.txid,
+          keys: err.conflicting_keys,
+        });
+      }
+
+      let commit_ts = tx_mgr
+        .commit_tx(tx.txid)
+        .map_err(|e| KiteError::Internal(e.to_string()))?;
+      commit_ts_for_mvcc = Some((commit_ts, tx_mgr.get_active_count() > 0));
+    }
+
+    if let (Some((commit_ts, has_active_readers)), Some(delta_snapshot)) =
+      (commit_ts_for_mvcc, tx.delta_snapshot.as_ref())
+    {
+      if has_active_readers {
+        let current_delta = self.delta.read();
+        let snapshot = self.snapshot.read();
+        let mvcc = self.mvcc.as_ref().unwrap();
+        let mut vc = mvcc.version_chain.lock();
+
+        let txid = tx.txid;
+
+        for (&node_id, node_delta) in &current_delta.created_nodes {
+          if !delta_snapshot.created_nodes.contains_key(&node_id) {
+            vc.append_node_version(
+              node_id,
+              NodeVersionData {
+                node_id,
+                delta: node_delta.clone(),
+              },
+              txid,
+              commit_ts,
+            );
+          }
+        }
+
+        for node_id in delta_snapshot.created_nodes.keys() {
+          if !current_delta.created_nodes.contains_key(node_id) {
+            vc.delete_node_version(*node_id, txid, commit_ts);
+          }
+        }
+
+        for node_id in current_delta
+          .deleted_nodes
+          .difference(&delta_snapshot.deleted_nodes)
+        {
+          vc.delete_node_version(*node_id, txid, commit_ts);
+        }
+
+        let mut added_edges: Vec<(NodeId, ETypeId, NodeId)> = Vec::new();
+        let mut deleted_edges: Vec<(NodeId, ETypeId, NodeId)> = Vec::new();
+
+        for (&src, patches) in &current_delta.out_add {
+          let before = delta_snapshot.out_add.get(&src);
+          for patch in patches {
+            if before.map(|set| set.contains(patch)).unwrap_or(false) {
+              continue;
+            }
+            added_edges.push((src, patch.etype, patch.other));
+          }
+        }
+
+        for (&src, patches) in &current_delta.out_del {
+          let before = delta_snapshot.out_del.get(&src);
+          for patch in patches {
+            if before.map(|set| set.contains(patch)).unwrap_or(false) {
+              continue;
+            }
+            deleted_edges.push((src, patch.etype, patch.other));
+          }
+        }
+
+        for (&src, patches) in &delta_snapshot.out_add {
+          let after = current_delta.out_add.get(&src);
+          for patch in patches {
+            if after.map(|set| set.contains(patch)).unwrap_or(false) {
+              continue;
+            }
+            deleted_edges.push((src, patch.etype, patch.other));
+          }
+        }
+
+        for (&src, patches) in &delta_snapshot.out_del {
+          let after = current_delta.out_del.get(&src);
+          for patch in patches {
+            if after.map(|set| set.contains(patch)).unwrap_or(false) {
+              continue;
+            }
+            added_edges.push((src, patch.etype, patch.other));
+          }
+        }
+
+        for (src, etype, dst) in added_edges {
+          vc.append_edge_version(src, etype, dst, true, txid, commit_ts);
+        }
+        for (src, etype, dst) in deleted_edges {
+          vc.append_edge_version(src, etype, dst, false, txid, commit_ts);
+        }
+
+        let old_node_prop = |node_id: NodeId, key_id: PropKeyId| -> Option<PropValue> {
+          let delta = delta_snapshot;
+          if delta.is_node_deleted(node_id) {
+            return None;
+          }
+          if let Some(value_opt) = delta.get_node_prop(node_id, key_id) {
+            return value_opt.cloned();
+          }
+          if let Some(ref snap) = *snapshot {
+            if let Some(phys) = snap.get_phys_node(node_id) {
+              return snap.get_node_prop(phys, key_id);
+            }
+          }
+          None
+        };
+
+        let old_edge_prop = |src: NodeId, etype: ETypeId, dst: NodeId, key_id: PropKeyId| {
+          let delta = delta_snapshot;
+          if delta.is_node_deleted(src) || delta.is_node_deleted(dst) {
+            return None;
+          }
+          if delta.is_edge_deleted(src, etype, dst) {
+            return None;
+          }
+          if let Some(value_opt) = delta.get_edge_prop(src, etype, dst, key_id) {
+            return value_opt.cloned();
+          }
+          if let Some(ref snap) = *snapshot {
+            if let (Some(src_phys), Some(dst_phys)) =
+              (snap.get_phys_node(src), snap.get_phys_node(dst))
+            {
+              if let Some(edge_idx) = snap.find_edge_index(src_phys, etype, dst_phys) {
+                if let Some(snapshot_props) = snap.get_edge_props(edge_idx) {
+                  return snapshot_props.get(&key_id).cloned();
+                }
+              }
+            }
+          }
+          None
+        };
+
+        for (node_id, node_delta) in current_delta
+          .created_nodes
+          .iter()
+          .chain(current_delta.modified_nodes.iter())
+        {
+          if current_delta.deleted_nodes.contains(node_id) {
+            continue;
+          }
+          let before_props = delta_snapshot
+            .created_nodes
+            .get(node_id)
+            .or_else(|| delta_snapshot.modified_nodes.get(node_id))
+            .and_then(|d| d.props.as_ref());
+          let after_props = node_delta.props.as_ref();
+
+          if let Some(after_map) = after_props {
+            for (key_id, after_value) in after_map {
+              let before_value = before_props.and_then(|m| m.get(key_id));
+              if before_value == Some(after_value) {
+                continue;
+              }
+              let is_new_node = !delta_snapshot.created_nodes.contains_key(node_id)
+                && current_delta.created_nodes.contains_key(node_id);
+              if !is_new_node && vc.get_node_prop_version(*node_id, *key_id).is_none() {
+                let old_value = old_node_prop(*node_id, *key_id);
+                vc.append_node_prop_version(*node_id, *key_id, old_value, 0, 0);
+              }
+              vc.append_node_prop_version(
+                *node_id,
+                *key_id,
+                after_value.clone(),
+                txid,
+                commit_ts,
+              );
+            }
+          }
+        }
+
+        for (edge_key, after_props) in &current_delta.edge_props {
+          let before_props = delta_snapshot.edge_props.get(edge_key);
+          for (key_id, after_value) in after_props {
+            let before_value = before_props.and_then(|m| m.get(key_id));
+            if before_value == Some(after_value) {
+              continue;
+            }
+            let (src, etype, dst) = *edge_key;
+            if vc
+              .get_edge_prop_version(src, etype, dst, *key_id)
+              .is_none()
+            {
+              vc.append_edge_prop_version(
+                src,
+                etype,
+                dst,
+                *key_id,
+                old_edge_prop(src, etype, dst, *key_id),
+                0,
+                0,
+              );
+            }
+            vc.append_edge_prop_version(
+              src,
+              etype,
+              dst,
+              *key_id,
+              after_value.clone(),
+              txid,
+              commit_ts,
+            );
+          }
+        }
+      }
     }
 
     // Write COMMIT record to WAL
@@ -90,10 +324,14 @@ impl SingleFileDB {
         .load(std::sync::atomic::Ordering::SeqCst)
         .saturating_sub(1);
       header.next_tx_id = self.next_tx_id.load(std::sync::atomic::Ordering::SeqCst);
-      header.last_commit_ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+      header.last_commit_ts = if let Some((commit_ts, _)) = commit_ts_for_mvcc {
+        commit_ts
+      } else {
+        std::time::SystemTime::now()
+          .duration_since(std::time::UNIX_EPOCH)
+          .map(|d| d.as_millis() as u64)
+          .unwrap_or(0)
+      };
       header.change_counter += 1;
 
       // Persist header based on sync mode
@@ -140,7 +378,16 @@ impl SingleFileDB {
 
     if tx.read_only {
       // Read-only transactions don't need WAL
+      if let Some(mvcc) = self.mvcc.as_ref() {
+        let mut tx_mgr = mvcc.tx_manager.lock();
+        tx_mgr.abort_tx(tx.txid);
+      }
       return Ok(());
+    }
+
+    if let Some(mvcc) = self.mvcc.as_ref() {
+      let mut tx_mgr = mvcc.tx_manager.lock();
+      tx_mgr.abort_tx(tx.txid);
     }
 
     // Write ROLLBACK record to WAL

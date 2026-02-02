@@ -1,7 +1,7 @@
 # KiteDB Turso-Style Scale Plan (Single-File, No Vectors)
 
 **Scope**
-- Single-file storage only (multi-file will be dropped)
+- Single-file storage only
 - Vectors ignored for now
 - Local-first performance preserved (default path unchanged)
 - Production readiness as a requirement

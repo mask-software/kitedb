@@ -4,7 +4,6 @@
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
-use parking_lot::Mutex;
 use std::path::PathBuf;
 
 use super::traversal::{
@@ -24,42 +23,10 @@ use crate::core::single_file::{
   VacuumOptions as RustVacuumOptions,
 };
 use crate::export as ray_export;
-use crate::graph::db::{
-  close_graph_db, open_graph_db as open_multi_file, GraphDB as RustGraphDB,
-  OpenOptions as GraphOpenOptions,
-};
-use crate::graph::definitions::define_label as graph_define_label;
-use crate::graph::edges::{
-  add_edge as graph_add_edge, del_edge_prop as graph_del_edge_prop,
-  delete_edge as graph_delete_edge, edge_exists_db, get_edge_prop_db, get_edge_props_db,
-  set_edge_prop as graph_set_edge_prop, upsert_edge_with_props,
-};
-use crate::graph::iterators::{
-  count_edges as graph_count_edges, count_nodes as graph_count_nodes,
-  list_edges as graph_list_edges, list_in_edges, list_nodes as graph_list_nodes, list_out_edges,
-  ListEdgesOptions,
-};
-use crate::graph::key_index::get_node_key as graph_get_node_key;
-use crate::graph::nodes::{
-  add_node_label as graph_add_node_label, create_node as graph_create_node,
-  del_node_prop as graph_del_node_prop, delete_node as graph_delete_node, get_node_by_key_db,
-  get_node_labels_db, get_node_prop_db, get_node_props_db, node_exists_db, node_has_label_db,
-  remove_node_label as graph_remove_node_label, set_node_prop as graph_set_node_prop,
-  upsert_node_by_id_with_props, upsert_node_with_props, NodeOpts,
-};
-use crate::graph::tx::{
-  begin_read_tx as graph_begin_read_tx, begin_tx as graph_begin_tx, commit as graph_commit,
-  rollback as graph_rollback, TxHandle as GraphTxHandle,
-};
-use crate::graph::vectors::{
-  delete_node_vector as graph_delete_node_vector, get_node_vector_db as graph_get_node_vector_db,
-  has_node_vector_db as graph_has_node_vector_db, set_node_vector as graph_set_node_vector,
-};
 use crate::metrics as core_metrics;
 use crate::streaming;
 use crate::types::{
   CheckResult as RustCheckResult, ETypeId, Edge, NodeId, PropKeyId, PropValue,
-  TxState as GraphTxState,
 };
 use crate::util::compression::{CompressionOptions as CoreCompressionOptions, CompressionType};
 use serde_json;
@@ -126,18 +93,14 @@ pub struct OpenOptions {
   pub read_only: Option<bool>,
   /// Create database if it doesn't exist
   pub create_if_missing: Option<bool>,
-  /// Acquire file lock (multi-file only)
-  pub lock_file: Option<bool>,
-  /// Require locking support (multi-file only)
-  pub require_locking: Option<bool>,
-  /// Enable MVCC (multi-file only)
+  /// Enable MVCC (snapshot isolation + conflict detection)
   pub mvcc: Option<bool>,
-  /// MVCC GC interval in ms (multi-file only)
+  /// MVCC GC interval in ms
   pub mvcc_gc_interval_ms: Option<i64>,
-  /// MVCC retention in ms (multi-file only)
+  /// MVCC retention in ms
   pub mvcc_retention_ms: Option<i64>,
-  /// MVCC max version chain depth (multi-file only)
-  pub mvcc_max_chain_depth: Option<u32>,
+  /// MVCC max version chain depth
+  pub mvcc_max_chain_depth: Option<i64>,
   /// Page size in bytes (default 4096)
   pub page_size: Option<u32>,
   /// WAL size in bytes (default 1MB)
@@ -178,6 +141,18 @@ impl From<OpenOptions> for RustOpenOptions {
     }
     if let Some(v) = opts.create_if_missing {
       rust_opts = rust_opts.create_if_missing(v);
+    }
+    if let Some(v) = opts.mvcc {
+      rust_opts = rust_opts.mvcc(v);
+    }
+    if let Some(v) = opts.mvcc_gc_interval_ms {
+      rust_opts = rust_opts.mvcc_gc_interval_ms(v as u64);
+    }
+    if let Some(v) = opts.mvcc_retention_ms {
+      rust_opts = rust_opts.mvcc_retention_ms(v as u64);
+    }
+    if let Some(v) = opts.mvcc_max_chain_depth {
+      rust_opts = rust_opts.mvcc_max_chain_depth(v as usize);
     }
     if let Some(v) = opts.page_size {
       rust_opts = rust_opts.page_size(v as usize);
@@ -333,36 +308,6 @@ impl From<SingleFileOptimizeOptions> for RustSingleFileOptimizeOptions {
   }
 }
 
-impl OpenOptions {
-  fn to_graph_options(&self) -> GraphOpenOptions {
-    let mut opts = GraphOpenOptions::new();
-
-    if let Some(v) = self.read_only {
-      opts.read_only = v;
-    }
-    if let Some(v) = self.create_if_missing {
-      opts.create_if_missing = v;
-    }
-    if let Some(v) = self.lock_file {
-      opts.lock_file = v;
-    }
-    if let Some(v) = self.mvcc {
-      opts.mvcc = v;
-    }
-    if let Some(v) = self.mvcc_gc_interval_ms {
-      opts.mvcc_gc_interval_ms = Some(v as u64);
-    }
-    if let Some(v) = self.mvcc_retention_ms {
-      opts.mvcc_retention_ms = Some(v as u64);
-    }
-    if let Some(v) = self.mvcc_max_chain_depth {
-      opts.mvcc_max_chain_depth = Some(v as usize);
-    }
-
-    opts
-  }
-}
-
 // ============================================================================
 // Database Statistics
 // ============================================================================
@@ -382,6 +327,18 @@ pub struct DbStats {
   pub wal_bytes: i64,
   pub recommend_compact: bool,
   pub mvcc_stats: Option<MvccStats>,
+}
+
+/// MVCC stats (from stats())
+#[napi(object)]
+pub struct MvccStats {
+  pub active_transactions: i64,
+  pub min_active_ts: i64,
+  pub versions_pruned: i64,
+  pub gc_runs: i64,
+  pub last_gc_time: i64,
+  pub committed_writes_size: i64,
+  pub committed_writes_pruned: i64,
 }
 
 /// Options for export
@@ -607,18 +564,6 @@ pub struct MvccMetrics {
   pub versions_pruned: i64,
   pub gc_runs: i64,
   pub min_active_timestamp: i64,
-  pub committed_writes_size: i64,
-  pub committed_writes_pruned: i64,
-}
-
-/// MVCC stats (from stats())
-#[napi(object)]
-pub struct MvccStats {
-  pub active_transactions: i64,
-  pub min_active_ts: i64,
-  pub versions_pruned: i64,
-  pub gc_runs: i64,
-  pub last_gc_time: i64,
   pub committed_writes_size: i64,
   pub committed_writes_pruned: i64,
 }
@@ -892,20 +837,18 @@ pub struct JsNodeProp {
 }
 
 // ============================================================================
-// Database NAPI Wrapper (single-file + multi-file)
+// Database NAPI Wrapper (single-file)
 // ============================================================================
 
 #[allow(clippy::large_enum_variant)]
 enum DatabaseInner {
   SingleFile(RustSingleFileDB),
-  Graph(RustGraphDB),
 }
 
-/// Graph database handle (single-file or multi-file)
+/// Database handle for single-file storage
 #[napi]
 pub struct Database {
   inner: Option<DatabaseInner>,
-  graph_tx: Mutex<Option<GraphTxState>>, // Only used for multi-file GraphDB
 }
 
 #[napi]
@@ -917,13 +860,9 @@ impl Database {
     let path_buf = PathBuf::from(&path);
 
     if path_buf.exists() && path_buf.is_dir() {
-      let graph_opts = options.to_graph_options();
-      let db = open_multi_file(&path_buf, graph_opts)
-        .map_err(|e| Error::from_reason(format!("Failed to open database: {e}")))?;
-      return Ok(Database {
-        inner: Some(DatabaseInner::Graph(db)),
-        graph_tx: Mutex::new(None),
-      });
+      return Err(Error::from_reason(
+        "Multi-file databases are no longer supported. Provide a single-file path.",
+      ));
     }
 
     let mut db_path = path_buf;
@@ -947,7 +886,6 @@ impl Database {
       .map_err(|e| Error::from_reason(format!("Failed to open database: {e}")))?;
     Ok(Database {
       inner: Some(DatabaseInner::SingleFile(db)),
-      graph_tx: Mutex::new(None),
     })
   }
 
@@ -960,13 +898,8 @@ impl Database {
           close_single_file(db)
             .map_err(|e| Error::from_reason(format!("Failed to close database: {e}")))?;
         }
-        DatabaseInner::Graph(db) => {
-          close_graph_db(db)
-            .map_err(|e| Error::from_reason(format!("Failed to close database: {e}")))?;
-        }
       }
     }
-    self.graph_tx.lock().take();
     Ok(())
   }
 
@@ -981,7 +914,6 @@ impl Database {
   pub fn path(&self) -> Result<String> {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(db.path.to_string_lossy().to_string()),
-      Some(DatabaseInner::Graph(db)) => Ok(db.path.to_string_lossy().to_string()),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -991,7 +923,6 @@ impl Database {
   pub fn read_only(&self) -> Result<bool> {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(db.read_only),
-      Some(DatabaseInner::Graph(db)) => Ok(db.read_only),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1011,23 +942,6 @@ impl Database {
           .map_err(|e| Error::from_reason(format!("Failed to begin transaction: {e}")))?;
         Ok(txid as i64)
       }
-      Some(DatabaseInner::Graph(db)) => {
-        let mut guard = self.graph_tx.lock();
-        if guard.is_some() {
-          return Err(Error::from_reason("Transaction already active"));
-        }
-
-        let handle = if read_only {
-          graph_begin_read_tx(db)
-            .map_err(|e| Error::from_reason(format!("Failed to begin transaction: {e}")))?
-        } else {
-          graph_begin_tx(db)
-            .map_err(|e| Error::from_reason(format!("Failed to begin transaction: {e}")))?
-        };
-        let txid = handle.tx.txid as i64;
-        *guard = Some(handle.tx);
-        Ok(txid)
-      }
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1039,16 +953,6 @@ impl Database {
       Some(DatabaseInner::SingleFile(db)) => db
         .commit()
         .map_err(|e| Error::from_reason(format!("Failed to commit: {e}"))),
-      Some(DatabaseInner::Graph(db)) => {
-        let mut guard = self.graph_tx.lock();
-        let tx_state = guard
-          .take()
-          .ok_or_else(|| Error::from_reason("No active transaction"))?;
-        let mut handle = GraphTxHandle::new(db, tx_state);
-        graph_commit(&mut handle)
-          .map_err(|e| Error::from_reason(format!("Failed to commit: {e}")))?;
-        Ok(())
-      }
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1060,16 +964,6 @@ impl Database {
       Some(DatabaseInner::SingleFile(db)) => db
         .rollback()
         .map_err(|e| Error::from_reason(format!("Failed to rollback: {e}"))),
-      Some(DatabaseInner::Graph(db)) => {
-        let mut guard = self.graph_tx.lock();
-        let tx_state = guard
-          .take()
-          .ok_or_else(|| Error::from_reason("No active transaction"))?;
-        let mut handle = GraphTxHandle::new(db, tx_state);
-        graph_rollback(&mut handle)
-          .map_err(|e| Error::from_reason(format!("Failed to rollback: {e}")))?;
-        Ok(())
-      }
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1079,7 +973,6 @@ impl Database {
   pub fn has_transaction(&self) -> Result<bool> {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(db.has_transaction()),
-      Some(DatabaseInner::Graph(_)) => Ok(self.graph_tx.lock().is_some()),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1098,15 +991,6 @@ impl Database {
           .map_err(|e| Error::from_reason(format!("Failed to create node: {e}")))?;
         Ok(node_id as i64)
       }
-      Some(DatabaseInner::Graph(_)) => self.with_graph_tx(|handle| {
-        let mut opts = NodeOpts::new();
-        if let Some(key) = key {
-          opts = opts.with_key(key);
-        }
-        let node_id = graph_create_node(handle, opts)
-          .map_err(|e| Error::from_reason(format!("Failed to create node: {e}")))?;
-        Ok(node_id as i64)
-      }),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1136,22 +1020,6 @@ impl Database {
 
         Ok(node_id as i64)
       }
-      Some(DatabaseInner::Graph(_)) => self.with_graph_tx(|handle| {
-        let updates: Vec<(PropKeyId, Option<PropValue>)> = props
-          .into_iter()
-          .map(|prop| {
-            let value_opt = match prop.value.prop_type {
-              PropType::Null => None,
-              _ => Some(prop.value.into()),
-            };
-            (prop.key_id as PropKeyId, value_opt)
-          })
-          .collect();
-
-        let (node_id, _) = upsert_node_with_props(handle, &key, updates)
-          .map_err(|e| Error::from_reason(format!("Failed to upsert node: {e}")))?;
-        Ok(node_id as i64)
-      }),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1180,24 +1048,6 @@ impl Database {
 
         Ok(node_id)
       }
-      Some(DatabaseInner::Graph(_)) => self.with_graph_tx(|handle| {
-        let updates: Vec<(PropKeyId, Option<PropValue>)> = props
-          .into_iter()
-          .map(|prop| {
-            let value_opt = match prop.value.prop_type {
-              PropType::Null => None,
-              _ => Some(prop.value.into()),
-            };
-            (prop.key_id as PropKeyId, value_opt)
-          })
-          .collect();
-
-        let opts = NodeOpts::new();
-        let (node_id, _) =
-          upsert_node_by_id_with_props(handle, node_id as NodeId, opts, updates)
-            .map_err(|e| Error::from_reason(format!("Failed to upsert node: {e}")))?;
-        Ok(node_id as i64)
-      }),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1209,11 +1059,6 @@ impl Database {
       Some(DatabaseInner::SingleFile(db)) => db
         .delete_node(node_id as NodeId)
         .map_err(|e| Error::from_reason(format!("Failed to delete node: {e}"))),
-      Some(DatabaseInner::Graph(_)) => self.with_graph_tx(|handle| {
-        graph_delete_node(handle, node_id as NodeId)
-          .map_err(|e| Error::from_reason(format!("Failed to delete node: {e}")))?;
-        Ok(())
-      }),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1223,7 +1068,6 @@ impl Database {
   pub fn node_exists(&self, node_id: i64) -> Result<bool> {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(db.node_exists(node_id as NodeId)),
-      Some(DatabaseInner::Graph(db)) => Ok(node_exists_db(db, node_id as NodeId)),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1233,7 +1077,6 @@ impl Database {
   pub fn get_node_by_key(&self, key: String) -> Result<Option<i64>> {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(db.get_node_by_key(&key).map(|id| id as i64)),
-      Some(DatabaseInner::Graph(db)) => Ok(get_node_by_key_db(db, &key).map(|id| id as i64)),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1243,14 +1086,6 @@ impl Database {
   pub fn get_node_key(&self, node_id: i64) -> Result<Option<String>> {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(db.get_node_key(node_id as NodeId)),
-      Some(DatabaseInner::Graph(db)) => {
-        let delta = db.delta.read();
-        Ok(graph_get_node_key(
-          db.snapshot.as_ref(),
-          &delta,
-          node_id as NodeId,
-        ))
-      }
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1262,12 +1097,6 @@ impl Database {
       Some(DatabaseInner::SingleFile(db)) => {
         Ok(db.list_nodes().into_iter().map(|id| id as i64).collect())
       }
-      Some(DatabaseInner::Graph(db)) => Ok(
-        graph_list_nodes(db)
-          .into_iter()
-          .map(|id| id as i64)
-          .collect(),
-      ),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1277,7 +1106,6 @@ impl Database {
   pub fn count_nodes(&self) -> Result<i64> {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(db.count_nodes() as i64),
-      Some(DatabaseInner::Graph(db)) => Ok(graph_count_nodes(db) as i64),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1293,11 +1121,6 @@ impl Database {
       Some(DatabaseInner::SingleFile(db)) => db
         .add_edge(src as NodeId, etype as ETypeId, dst as NodeId)
         .map_err(|e| Error::from_reason(format!("Failed to add edge: {e}"))),
-      Some(DatabaseInner::Graph(_)) => self.with_graph_tx(|handle| {
-        graph_add_edge(handle, src as NodeId, etype as ETypeId, dst as NodeId)
-          .map_err(|e| Error::from_reason(format!("Failed to add edge: {e}")))?;
-        Ok(())
-      }),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1309,16 +1132,6 @@ impl Database {
       Some(DatabaseInner::SingleFile(db)) => db
         .add_edge_by_name(src as NodeId, &etype_name, dst as NodeId)
         .map_err(|e| Error::from_reason(format!("Failed to add edge: {e}"))),
-      Some(DatabaseInner::Graph(db)) => {
-        let etype = db
-          .get_etype_id(&etype_name)
-          .ok_or_else(|| Error::from_reason(format!("Unknown edge type: {etype_name}")))?;
-        self.with_graph_tx(|handle| {
-          graph_add_edge(handle, src as NodeId, etype, dst as NodeId)
-            .map_err(|e| Error::from_reason(format!("Failed to add edge: {e}")))?;
-          Ok(())
-        })
-      }
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1350,28 +1163,6 @@ impl Database {
         db.upsert_edge_with_props(src as NodeId, etype as ETypeId, dst as NodeId, updates)
           .map_err(|e| Error::from_reason(format!("Failed to upsert edge: {e}")))
       }
-      Some(DatabaseInner::Graph(_)) => self.with_graph_tx(|handle| {
-        let updates: Vec<(PropKeyId, Option<PropValue>)> = props
-          .into_iter()
-          .map(|prop| {
-            let value_opt = match prop.value.prop_type {
-              PropType::Null => None,
-              _ => Some(prop.value.into()),
-            };
-            (prop.key_id as PropKeyId, value_opt)
-          })
-          .collect();
-
-        let created = upsert_edge_with_props(
-          handle,
-          src as NodeId,
-          etype as ETypeId,
-          dst as NodeId,
-          updates,
-        )
-        .map_err(|e| Error::from_reason(format!("Failed to upsert edge: {e}")))?;
-        Ok(created)
-      }),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1383,11 +1174,6 @@ impl Database {
       Some(DatabaseInner::SingleFile(db)) => db
         .delete_edge(src as NodeId, etype as ETypeId, dst as NodeId)
         .map_err(|e| Error::from_reason(format!("Failed to delete edge: {e}"))),
-      Some(DatabaseInner::Graph(_)) => self.with_graph_tx(|handle| {
-        graph_delete_edge(handle, src as NodeId, etype as ETypeId, dst as NodeId)
-          .map_err(|e| Error::from_reason(format!("Failed to delete edge: {e}")))?;
-        Ok(())
-      }),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1399,12 +1185,6 @@ impl Database {
       Some(DatabaseInner::SingleFile(db)) => {
         Ok(db.edge_exists(src as NodeId, etype as ETypeId, dst as NodeId))
       }
-      Some(DatabaseInner::Graph(db)) => Ok(edge_exists_db(
-        db,
-        src as NodeId,
-        etype as ETypeId,
-        dst as NodeId,
-      )),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1419,15 +1199,6 @@ impl Database {
           .map(|(etype, dst)| JsEdge {
             etype,
             node_id: dst as i64,
-          })
-          .collect(),
-      ),
-      Some(DatabaseInner::Graph(db)) => Ok(
-        list_out_edges(db, node_id as NodeId)
-          .into_iter()
-          .map(|edge| JsEdge {
-            etype: edge.etype,
-            node_id: edge.dst as i64,
           })
           .collect(),
       ),
@@ -1448,15 +1219,6 @@ impl Database {
           })
           .collect(),
       ),
-      Some(DatabaseInner::Graph(db)) => Ok(
-        list_in_edges(db, node_id as NodeId)
-          .into_iter()
-          .map(|edge| JsEdge {
-            etype: edge.etype,
-            node_id: edge.dst as i64,
-          })
-          .collect(),
-      ),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1466,7 +1228,6 @@ impl Database {
   pub fn get_out_degree(&self, node_id: i64) -> Result<i64> {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(db.get_out_degree(node_id as NodeId) as i64),
-      Some(DatabaseInner::Graph(db)) => Ok(list_out_edges(db, node_id as NodeId).len() as i64),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1476,7 +1237,6 @@ impl Database {
   pub fn get_in_degree(&self, node_id: i64) -> Result<i64> {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(db.get_in_degree(node_id as NodeId) as i64),
-      Some(DatabaseInner::Graph(db)) => Ok(list_in_edges(db, node_id as NodeId).len() as i64),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1486,7 +1246,6 @@ impl Database {
   pub fn count_edges(&self) -> Result<i64> {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(db.count_edges() as i64),
-      Some(DatabaseInner::Graph(db)) => Ok(graph_count_edges(db, None) as i64),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1508,19 +1267,6 @@ impl Database {
           })
           .collect(),
       ),
-      Some(DatabaseInner::Graph(db)) => {
-        let options = ListEdgesOptions { etype };
-        Ok(
-          graph_list_edges(db, options)
-            .into_iter()
-            .map(|e| JsFullEdge {
-              src: e.src as i64,
-              etype: e.etype,
-              dst: e.dst as i64,
-            })
-            .collect(),
-        )
-      }
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1546,22 +1292,6 @@ impl Database {
             .collect(),
         )
       }
-      Some(DatabaseInner::Graph(db)) => {
-        let etype = db
-          .get_etype_id(&etype_name)
-          .ok_or_else(|| Error::from_reason(format!("Unknown edge type: {etype_name}")))?;
-        let options = ListEdgesOptions { etype: Some(etype) };
-        Ok(
-          graph_list_edges(db, options)
-            .into_iter()
-            .map(|e| JsFullEdge {
-              src: e.src as i64,
-              etype: e.etype,
-              dst: e.dst as i64,
-            })
-            .collect(),
-        )
-      }
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1571,7 +1301,6 @@ impl Database {
   pub fn count_edges_by_type(&self, etype: u32) -> Result<i64> {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(db.count_edges_by_type(etype) as i64),
-      Some(DatabaseInner::Graph(db)) => Ok(graph_count_edges(db, Some(etype)) as i64),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1585,12 +1314,6 @@ impl Database {
           .get_etype_id(&etype_name)
           .ok_or_else(|| Error::from_reason(format!("Unknown edge type: {etype_name}")))?;
         Ok(db.count_edges_by_type(etype) as i64)
-      }
-      Some(DatabaseInner::Graph(db)) => {
-        let etype = db
-          .get_etype_id(&etype_name)
-          .ok_or_else(|| Error::from_reason(format!("Unknown edge type: {etype_name}")))?;
-        Ok(graph_count_edges(db, Some(etype)) as i64)
       }
       None => Err(Error::from_reason("Database is closed")),
     }
@@ -1607,12 +1330,6 @@ impl Database {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(
         streaming::stream_nodes_single(db, options)
-          .into_iter()
-          .map(|batch| batch.into_iter().map(|id| id as i64).collect())
-          .collect(),
-      ),
-      Some(DatabaseInner::Graph(db)) => Ok(
-        streaming::stream_nodes_graph(db, options)
           .into_iter()
           .map(|batch| batch.into_iter().map(|id| id as i64).collect())
           .collect(),
@@ -1658,38 +1375,6 @@ impl Database {
             .collect(),
         )
       }
-      Some(DatabaseInner::Graph(db)) => {
-        let batches = streaming::stream_nodes_graph(db, options);
-        Ok(
-          batches
-            .into_iter()
-            .map(|batch| {
-              batch
-                .into_iter()
-                .map(|node_id| {
-                  let key = {
-                    let delta = db.delta.read();
-                    graph_get_node_key(db.snapshot.as_ref(), &delta, node_id)
-                  };
-                  let props = get_node_props_db(db, node_id).unwrap_or_default();
-                  let props = props
-                    .into_iter()
-                    .map(|(k, v)| JsNodeProp {
-                      key_id: k,
-                      value: v.into(),
-                    })
-                    .collect();
-                  NodeWithProps {
-                    id: node_id as i64,
-                    key,
-                    props,
-                  }
-                })
-                .collect()
-            })
-            .collect(),
-        )
-      }
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1701,21 +1386,6 @@ impl Database {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(
         streaming::stream_edges_single(db, options)
-          .into_iter()
-          .map(|batch| {
-            batch
-              .into_iter()
-              .map(|edge| JsFullEdge {
-                src: edge.src as i64,
-                etype: edge.etype,
-                dst: edge.dst as i64,
-              })
-              .collect()
-          })
-          .collect(),
-      ),
-      Some(DatabaseInner::Graph(db)) => Ok(
-        streaming::stream_edges_graph(db, options)
           .into_iter()
           .map(|batch| {
             batch
@@ -1772,36 +1442,6 @@ impl Database {
             .collect(),
         )
       }
-      Some(DatabaseInner::Graph(db)) => {
-        let batches = streaming::stream_edges_graph(db, options);
-        Ok(
-          batches
-            .into_iter()
-            .map(|batch| {
-              batch
-                .into_iter()
-                .map(|edge| {
-                  let props =
-                    get_edge_props_db(db, edge.src, edge.etype, edge.dst).unwrap_or_default();
-                  let props = props
-                    .into_iter()
-                    .map(|(k, v)| JsNodeProp {
-                      key_id: k,
-                      value: v.into(),
-                    })
-                    .collect();
-                  EdgeWithProps {
-                    src: edge.src as i64,
-                    etype: edge.etype,
-                    dst: edge.dst as i64,
-                    props,
-                  }
-                })
-                .collect()
-            })
-            .collect(),
-        )
-      }
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1818,15 +1458,6 @@ impl Database {
           next_cursor: page.next_cursor,
           has_more: page.has_more,
           total: Some(db.count_nodes() as i64),
-        })
-      }
-      Some(DatabaseInner::Graph(db)) => {
-        let page = streaming::get_nodes_page_graph(db, options);
-        Ok(NodePage {
-          items: page.items.into_iter().map(|id| id as i64).collect(),
-          next_cursor: page.next_cursor,
-          has_more: page.has_more,
-          total: Some(graph_count_nodes(db) as i64),
         })
       }
       None => Err(Error::from_reason("Database is closed")),
@@ -1855,23 +1486,6 @@ impl Database {
           total: Some(db.count_edges() as i64),
         })
       }
-      Some(DatabaseInner::Graph(db)) => {
-        let page = streaming::get_edges_page_graph(db, options);
-        Ok(EdgePage {
-          items: page
-            .items
-            .into_iter()
-            .map(|edge| JsFullEdge {
-              src: edge.src as i64,
-              etype: edge.etype,
-              dst: edge.dst as i64,
-            })
-            .collect(),
-          next_cursor: page.next_cursor,
-          has_more: page.has_more,
-          total: Some(graph_count_edges(db, None) as i64),
-        })
-      }
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1887,11 +1501,6 @@ impl Database {
       Some(DatabaseInner::SingleFile(db)) => db
         .set_node_prop(node_id as NodeId, key_id as PropKeyId, value.into())
         .map_err(|e| Error::from_reason(format!("Failed to set property: {e}"))),
-      Some(DatabaseInner::Graph(_)) => self.with_graph_tx(|handle| {
-        graph_set_node_prop(handle, node_id as NodeId, key_id as PropKeyId, value.into())
-          .map_err(|e| Error::from_reason(format!("Failed to set property: {e}")))?;
-        Ok(())
-      }),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1908,16 +1517,6 @@ impl Database {
       Some(DatabaseInner::SingleFile(db)) => db
         .set_node_prop_by_name(node_id as NodeId, &key_name, value.into())
         .map_err(|e| Error::from_reason(format!("Failed to set property: {e}"))),
-      Some(DatabaseInner::Graph(db)) => {
-        let key_id = db
-          .get_propkey_id(&key_name)
-          .ok_or_else(|| Error::from_reason(format!("Unknown property key: {key_name}")))?;
-        self.with_graph_tx(|handle| {
-          graph_set_node_prop(handle, node_id as NodeId, key_id, value.into())
-            .map_err(|e| Error::from_reason(format!("Failed to set property: {e}")))?;
-          Ok(())
-        })
-      }
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1929,11 +1528,6 @@ impl Database {
       Some(DatabaseInner::SingleFile(db)) => db
         .delete_node_prop(node_id as NodeId, key_id as PropKeyId)
         .map_err(|e| Error::from_reason(format!("Failed to delete property: {e}"))),
-      Some(DatabaseInner::Graph(_)) => self.with_graph_tx(|handle| {
-        graph_del_node_prop(handle, node_id as NodeId, key_id as PropKeyId)
-          .map_err(|e| Error::from_reason(format!("Failed to delete property: {e}")))?;
-        Ok(())
-      }),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1946,9 +1540,6 @@ impl Database {
         db.get_node_prop(node_id as NodeId, key_id as PropKeyId)
           .map(|v| v.into()),
       ),
-      Some(DatabaseInner::Graph(db)) => {
-        Ok(get_node_prop_db(db, node_id as NodeId, key_id as PropKeyId).map(|v| v.into()))
-      }
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1968,15 +1559,6 @@ impl Database {
             .collect()
         }))
       }
-      Some(DatabaseInner::Graph(db)) => Ok(get_node_props_db(db, node_id as NodeId).map(|props| {
-        props
-          .into_iter()
-          .map(|(k, v)| JsNodeProp {
-            key_id: k,
-            value: v.into(),
-          })
-          .collect()
-      })),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -2005,18 +1587,6 @@ impl Database {
           value.into(),
         )
         .map_err(|e| Error::from_reason(format!("Failed to set edge property: {e}"))),
-      Some(DatabaseInner::Graph(_)) => self.with_graph_tx(|handle| {
-        graph_set_edge_prop(
-          handle,
-          src as NodeId,
-          etype as ETypeId,
-          dst as NodeId,
-          key_id as PropKeyId,
-          value.into(),
-        )
-        .map_err(|e| Error::from_reason(format!("Failed to set edge property: {e}")))?;
-        Ok(())
-      }),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -2041,23 +1611,6 @@ impl Database {
           value.into(),
         )
         .map_err(|e| Error::from_reason(format!("Failed to set edge property: {e}"))),
-      Some(DatabaseInner::Graph(db)) => {
-        let key_id = db
-          .get_propkey_id(&key_name)
-          .ok_or_else(|| Error::from_reason(format!("Unknown property key: {key_name}")))?;
-        self.with_graph_tx(|handle| {
-          graph_set_edge_prop(
-            handle,
-            src as NodeId,
-            etype as ETypeId,
-            dst as NodeId,
-            key_id,
-            value.into(),
-          )
-          .map_err(|e| Error::from_reason(format!("Failed to set edge property: {e}")))?;
-          Ok(())
-        })
-      }
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -2074,17 +1627,6 @@ impl Database {
           key_id as PropKeyId,
         )
         .map_err(|e| Error::from_reason(format!("Failed to delete edge property: {e}"))),
-      Some(DatabaseInner::Graph(_)) => self.with_graph_tx(|handle| {
-        graph_del_edge_prop(
-          handle,
-          src as NodeId,
-          etype as ETypeId,
-          dst as NodeId,
-          key_id as PropKeyId,
-        )
-        .map_err(|e| Error::from_reason(format!("Failed to delete edge property: {e}")))?;
-        Ok(())
-      }),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -2101,16 +1643,6 @@ impl Database {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(
         db.get_edge_prop(
-          src as NodeId,
-          etype as ETypeId,
-          dst as NodeId,
-          key_id as PropKeyId,
-        )
-        .map(|v| v.into()),
-      ),
-      Some(DatabaseInner::Graph(db)) => Ok(
-        get_edge_prop_db(
-          db,
           src as NodeId,
           etype as ETypeId,
           dst as NodeId,
@@ -2138,17 +1670,6 @@ impl Database {
               .collect()
           }),
       ),
-      Some(DatabaseInner::Graph(db)) => Ok(
-        get_edge_props_db(db, src as NodeId, etype as ETypeId, dst as NodeId).map(|props| {
-          props
-            .into_iter()
-            .map(|(k, v)| JsNodeProp {
-              key_id: k,
-              value: v.into(),
-            })
-            .collect()
-        }),
-      ),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -2165,16 +1686,6 @@ impl Database {
       Some(DatabaseInner::SingleFile(db)) => db
         .set_node_vector(node_id as NodeId, prop_key_id as PropKeyId, &vector_f32)
         .map_err(|e| Error::from_reason(format!("Failed to set vector: {e}"))),
-      Some(DatabaseInner::Graph(_)) => self.with_graph_tx(|handle| {
-        graph_set_node_vector(
-          handle,
-          node_id as NodeId,
-          prop_key_id as PropKeyId,
-          &vector_f32,
-        )
-        .map_err(|e| Error::from_reason(format!("Failed to set vector: {e}")))?;
-        Ok(())
-      }),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -2187,27 +1698,6 @@ impl Database {
         db.get_node_vector(node_id as NodeId, prop_key_id as PropKeyId)
           .map(|v| v.iter().map(|&f| f as f64).collect()),
       ),
-      Some(DatabaseInner::Graph(db)) => {
-        let pending = {
-          let guard = self.graph_tx.lock();
-          guard.as_ref().and_then(|tx| {
-            let key = (node_id as NodeId, prop_key_id as PropKeyId);
-            if tx.pending_vector_deletes.contains(&key) {
-              return Some(None);
-            }
-            tx.pending_vector_sets.get(&key).cloned().map(Some)
-          })
-        };
-
-        if let Some(pending_vec) = pending {
-          return Ok(pending_vec.map(|v| v.iter().map(|&f| f as f64).collect()));
-        }
-
-        Ok(
-          graph_get_node_vector_db(db, node_id as NodeId, prop_key_id as PropKeyId)
-            .map(|v| v.iter().map(|&f| f as f64).collect()),
-        )
-      }
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -2219,11 +1709,6 @@ impl Database {
       Some(DatabaseInner::SingleFile(db)) => db
         .delete_node_vector(node_id as NodeId, prop_key_id as PropKeyId)
         .map_err(|e| Error::from_reason(format!("Failed to delete vector: {e}"))),
-      Some(DatabaseInner::Graph(_)) => self.with_graph_tx(|handle| {
-        graph_delete_node_vector(handle, node_id as NodeId, prop_key_id as PropKeyId)
-          .map_err(|e| Error::from_reason(format!("Failed to delete vector: {e}")))?;
-        Ok(())
-      }),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -2234,28 +1719,6 @@ impl Database {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
         Ok(db.has_node_vector(node_id as NodeId, prop_key_id as PropKeyId))
-      }
-      Some(DatabaseInner::Graph(db)) => {
-        let pending = {
-          let guard = self.graph_tx.lock();
-          guard.as_ref().and_then(|tx| {
-            let key = (node_id as NodeId, prop_key_id as PropKeyId);
-            if tx.pending_vector_deletes.contains(&key) {
-              return Some(false);
-            }
-            tx.pending_vector_sets.get(&key).map(|_| true)
-          })
-        };
-
-        if let Some(pending_has) = pending {
-          return Ok(pending_has);
-        }
-
-        Ok(graph_has_node_vector_db(
-          db,
-          node_id as NodeId,
-          prop_key_id as PropKeyId,
-        ))
       }
       None => Err(Error::from_reason("Database is closed")),
     }
@@ -2270,7 +1733,6 @@ impl Database {
   pub fn get_or_create_label(&self, name: String) -> Result<u32> {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(db.get_or_create_label(&name)),
-      Some(DatabaseInner::Graph(db)) => Ok(db.get_or_create_label(&name)),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -2280,7 +1742,6 @@ impl Database {
   pub fn get_label_id(&self, name: String) -> Result<Option<u32>> {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(db.get_label_id(&name)),
-      Some(DatabaseInner::Graph(db)) => Ok(db.get_label_id(&name)),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -2290,7 +1751,6 @@ impl Database {
   pub fn get_label_name(&self, id: u32) -> Result<Option<String>> {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(db.get_label_name(id)),
-      Some(DatabaseInner::Graph(db)) => Ok(db.get_label_name(id)),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -2300,7 +1760,6 @@ impl Database {
   pub fn get_or_create_etype(&self, name: String) -> Result<u32> {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(db.get_or_create_etype(&name)),
-      Some(DatabaseInner::Graph(db)) => Ok(db.get_or_create_etype(&name)),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -2310,7 +1769,6 @@ impl Database {
   pub fn get_etype_id(&self, name: String) -> Result<Option<u32>> {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(db.get_etype_id(&name)),
-      Some(DatabaseInner::Graph(db)) => Ok(db.get_etype_id(&name)),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -2320,7 +1778,6 @@ impl Database {
   pub fn get_etype_name(&self, id: u32) -> Result<Option<String>> {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(db.get_etype_name(id)),
-      Some(DatabaseInner::Graph(db)) => Ok(db.get_etype_name(id)),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -2330,7 +1787,6 @@ impl Database {
   pub fn get_or_create_propkey(&self, name: String) -> Result<u32> {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(db.get_or_create_propkey(&name)),
-      Some(DatabaseInner::Graph(db)) => Ok(db.get_or_create_propkey(&name)),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -2340,7 +1796,6 @@ impl Database {
   pub fn get_propkey_id(&self, name: String) -> Result<Option<u32>> {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(db.get_propkey_id(&name)),
-      Some(DatabaseInner::Graph(db)) => Ok(db.get_propkey_id(&name)),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -2350,7 +1805,6 @@ impl Database {
   pub fn get_propkey_name(&self, id: u32) -> Result<Option<String>> {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(db.get_propkey_name(id)),
-      Some(DatabaseInner::Graph(db)) => Ok(db.get_propkey_name(id)),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -2366,11 +1820,6 @@ impl Database {
       Some(DatabaseInner::SingleFile(db)) => db
         .define_label(&name)
         .map_err(|e| Error::from_reason(format!("Failed to define label: {e}"))),
-      Some(DatabaseInner::Graph(_)) => self.with_graph_tx(|handle| {
-        let label_id = graph_define_label(handle, &name)
-          .map_err(|e| Error::from_reason(format!("Failed to define label: {e}")))?;
-        Ok(label_id)
-      }),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -2382,11 +1831,6 @@ impl Database {
       Some(DatabaseInner::SingleFile(db)) => db
         .add_node_label(node_id as NodeId, label_id)
         .map_err(|e| Error::from_reason(format!("Failed to add label: {e}"))),
-      Some(DatabaseInner::Graph(_)) => self.with_graph_tx(|handle| {
-        graph_add_node_label(handle, node_id as NodeId, label_id)
-          .map_err(|e| Error::from_reason(format!("Failed to add label: {e}")))?;
-        Ok(())
-      }),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -2398,16 +1842,6 @@ impl Database {
       Some(DatabaseInner::SingleFile(db)) => db
         .add_node_label_by_name(node_id as NodeId, &label_name)
         .map_err(|e| Error::from_reason(format!("Failed to add label: {e}"))),
-      Some(DatabaseInner::Graph(db)) => {
-        let label_id = db
-          .get_label_id(&label_name)
-          .ok_or_else(|| Error::from_reason(format!("Unknown label: {label_name}")))?;
-        self.with_graph_tx(|handle| {
-          graph_add_node_label(handle, node_id as NodeId, label_id)
-            .map_err(|e| Error::from_reason(format!("Failed to add label: {e}")))?;
-          Ok(())
-        })
-      }
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -2419,11 +1853,6 @@ impl Database {
       Some(DatabaseInner::SingleFile(db)) => db
         .remove_node_label(node_id as NodeId, label_id)
         .map_err(|e| Error::from_reason(format!("Failed to remove label: {e}"))),
-      Some(DatabaseInner::Graph(_)) => self.with_graph_tx(|handle| {
-        graph_remove_node_label(handle, node_id as NodeId, label_id)
-          .map_err(|e| Error::from_reason(format!("Failed to remove label: {e}")))?;
-        Ok(())
-      }),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -2433,7 +1862,6 @@ impl Database {
   pub fn node_has_label(&self, node_id: i64, label_id: u32) -> Result<bool> {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(db.node_has_label(node_id as NodeId, label_id)),
-      Some(DatabaseInner::Graph(db)) => Ok(node_has_label_db(db, node_id as NodeId, label_id)),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -2443,13 +1871,12 @@ impl Database {
   pub fn get_node_labels(&self, node_id: i64) -> Result<Vec<u32>> {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(db.get_node_labels(node_id as NodeId)),
-      Some(DatabaseInner::Graph(db)) => Ok(get_node_labels_db(db, node_id as NodeId)),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
 
   // ========================================================================
-  // Graph Traversal (DB-backed)
+  // Traversal (DB-backed)
   // ========================================================================
 
   /// Execute a single-hop traversal from start nodes
@@ -2479,20 +1906,6 @@ impl Database {
         Ok(
           builder
             .execute(|node_id, dir, etype| get_neighbors_from_single_file(db, node_id, dir, etype))
-            .map(JsTraversalResult::from)
-            .collect(),
-        )
-      }
-      Some(DatabaseInner::Graph(db)) => {
-        let builder = match direction {
-          JsTraversalDirection::Out => RustTraversalBuilder::new(start).out(etype),
-          JsTraversalDirection::In => RustTraversalBuilder::new(start).r#in(etype),
-          JsTraversalDirection::Both => RustTraversalBuilder::new(start).both(etype),
-        };
-
-        Ok(
-          builder
-            .execute(|node_id, dir, etype| get_neighbors_from_graph_db(db, node_id, dir, etype))
             .map(JsTraversalResult::from)
             .collect(),
         )
@@ -2539,29 +1952,6 @@ impl Database {
             .collect(),
         )
       }
-      Some(DatabaseInner::Graph(db)) => {
-        let mut builder = RustTraversalBuilder::new(start);
-
-        for step in steps {
-          let etype = step.edge_type;
-          builder = match step.direction {
-            JsTraversalDirection::Out => builder.out(etype),
-            JsTraversalDirection::In => builder.r#in(etype),
-            JsTraversalDirection::Both => builder.both(etype),
-          };
-        }
-
-        if let Some(n) = limit {
-          builder = builder.take(n as usize);
-        }
-
-        Ok(
-          builder
-            .execute(|node_id, dir, etype| get_neighbors_from_graph_db(db, node_id, dir, etype))
-            .map(JsTraversalResult::from)
-            .collect(),
-        )
-      }
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -2587,13 +1977,6 @@ impl Database {
         RustTraversalBuilder::new(start)
           .traverse(edge_type, opts)
           .execute(|node_id, dir, etype| get_neighbors_from_single_file(db, node_id, dir, etype))
-          .map(JsTraversalResult::from)
-          .collect(),
-      ),
-      Some(DatabaseInner::Graph(db)) => Ok(
-        RustTraversalBuilder::new(start)
-          .traverse(edge_type, opts)
-          .execute(|node_id, dir, etype| get_neighbors_from_graph_db(db, node_id, dir, etype))
           .map(JsTraversalResult::from)
           .collect(),
       ),
@@ -2625,23 +2008,6 @@ impl Database {
         Ok(
           builder
             .count(|node_id, dir, etype| get_neighbors_from_single_file(db, node_id, dir, etype))
-            as u32,
-        )
-      }
-      Some(DatabaseInner::Graph(db)) => {
-        let mut builder = RustTraversalBuilder::new(start);
-
-        for step in steps {
-          let etype = step.edge_type;
-          builder = match step.direction {
-            JsTraversalDirection::Out => builder.out(etype),
-            JsTraversalDirection::In => builder.r#in(etype),
-            JsTraversalDirection::Both => builder.both(etype),
-          };
-        }
-
-        Ok(
-          builder.count(|node_id, dir, etype| get_neighbors_from_graph_db(db, node_id, dir, etype))
             as u32,
         )
       }
@@ -2690,32 +2056,6 @@ impl Database {
             .collect(),
         )
       }
-      Some(DatabaseInner::Graph(db)) => {
-        let mut builder = RustTraversalBuilder::new(start);
-
-        for step in steps {
-          let etype = step.edge_type;
-          builder = match step.direction {
-            JsTraversalDirection::Out => builder.out(etype),
-            JsTraversalDirection::In => builder.r#in(etype),
-            JsTraversalDirection::Both => builder.both(etype),
-          };
-        }
-
-        if let Some(n) = limit {
-          builder = builder.take(n as usize);
-        }
-
-        Ok(
-          builder
-            .collect_node_ids(|node_id, dir, etype| {
-              get_neighbors_from_graph_db(db, node_id, dir, etype)
-            })
-            .into_iter()
-            .map(|id| id as i64)
-            .collect(),
-        )
-      }
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -2743,18 +2083,6 @@ impl Database {
           .into(),
         )
       }
-      Some(DatabaseInner::Graph(db)) => {
-        let weight_key = resolve_weight_key_graph(db, &config)?;
-        let rust_config: PathConfig = config.into();
-        Ok(
-          dijkstra(
-            rust_config,
-            |node_id, dir, etype| get_neighbors_from_graph_db(db, node_id, dir, etype),
-            |src, etype, dst| get_edge_weight_from_graph_db(db, src, etype, dst, weight_key),
-          )
-          .into(),
-        )
-      }
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -2772,12 +2100,6 @@ impl Database {
       Some(DatabaseInner::SingleFile(db)) => Ok(
         bfs(rust_config, |node_id, dir, etype| {
           get_neighbors_from_single_file(db, node_id, dir, etype)
-        })
-        .into(),
-      ),
-      Some(DatabaseInner::Graph(db)) => Ok(
-        bfs(rust_config, |node_id, dir, etype| {
-          get_neighbors_from_graph_db(db, node_id, dir, etype)
         })
         .into(),
       ),
@@ -2802,21 +2124,6 @@ impl Database {
             k as usize,
             |node_id, dir, etype| get_neighbors_from_single_file(db, node_id, dir, etype),
             |src, etype, dst| get_edge_weight_from_single_file(db, src, etype, dst, weight_key),
-          )
-          .into_iter()
-          .map(JsPathResult::from)
-          .collect(),
-        )
-      }
-      Some(DatabaseInner::Graph(db)) => {
-        let weight_key = resolve_weight_key_graph(db, &config)?;
-        let rust_config: PathConfig = config.into();
-        Ok(
-          yen_k_shortest(
-            rust_config,
-            k as usize,
-            |node_id, dir, etype| get_neighbors_from_graph_db(db, node_id, dir, etype),
-            |src, etype, dst| get_edge_weight_from_graph_db(db, src, etype, dst, weight_key),
           )
           .into_iter()
           .map(JsPathResult::from)
@@ -2918,9 +2225,6 @@ impl Database {
       Some(DatabaseInner::SingleFile(db)) => db
         .checkpoint()
         .map_err(|e| Error::from_reason(format!("Failed to checkpoint: {e}"))),
-      Some(DatabaseInner::Graph(_)) => Err(Error::from_reason(
-        "checkpoint() only supports single-file databases",
-      )),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -2932,9 +2236,6 @@ impl Database {
       Some(DatabaseInner::SingleFile(db)) => db
         .background_checkpoint()
         .map_err(|e| Error::from_reason(format!("Failed to background checkpoint: {e}"))),
-      Some(DatabaseInner::Graph(_)) => Err(Error::from_reason(
-        "backgroundCheckpoint() only supports single-file databases",
-      )),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -2944,7 +2245,6 @@ impl Database {
   pub fn should_checkpoint(&self, threshold: Option<f64>) -> Result<bool> {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(db.should_checkpoint(threshold.unwrap_or(0.8))),
-      Some(DatabaseInner::Graph(_)) => Ok(false),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -2959,9 +2259,6 @@ impl Database {
       Some(DatabaseInner::SingleFile(db)) => db
         .optimize_single_file(None)
         .map_err(|e| Error::from_reason(format!("Failed to optimize: {e}"))),
-      Some(DatabaseInner::Graph(db)) => db
-        .optimize()
-        .map_err(|e| Error::from_reason(format!("Failed to optimize: {e}"))),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -2973,9 +2270,6 @@ impl Database {
       Some(DatabaseInner::SingleFile(db)) => db
         .optimize_single_file(options.map(Into::into))
         .map_err(|e| Error::from_reason(format!("Failed to optimize single-file: {e}"))),
-      Some(DatabaseInner::Graph(_)) => Err(Error::from_reason(
-        "optimizeSingleFile() only supports single-file databases",
-      )),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -2987,9 +2281,6 @@ impl Database {
       Some(DatabaseInner::SingleFile(db)) => db
         .vacuum_single_file(options.map(Into::into))
         .map_err(|e| Error::from_reason(format!("Failed to vacuum: {e}"))),
-      Some(DatabaseInner::Graph(_)) => Err(Error::from_reason(
-        "vacuum() only supports single-file databases",
-      )),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -3029,7 +2320,6 @@ impl Database {
           }),
         })
       }
-      Some(DatabaseInner::Graph(db)) => Ok(graph_stats(db)),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -3039,7 +2329,6 @@ impl Database {
   pub fn check(&self) -> Result<CheckResult> {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(CheckResult::from(db.check())),
-      Some(DatabaseInner::Graph(db)) => Ok(CheckResult::from(graph_check(db))),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -3061,8 +2350,6 @@ impl Database {
 
     let data = match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => ray_export::export_to_object_single(db, opts)
-        .map_err(|e| Error::from_reason(e.to_string()))?,
-      Some(DatabaseInner::Graph(db)) => ray_export::export_to_object_graph(db, opts)
         .map_err(|e| Error::from_reason(e.to_string()))?,
       None => return Err(Error::from_reason("Database is closed")),
     };
@@ -3090,8 +2377,6 @@ impl Database {
         ray_export::export_to_object_single(db, rust_opts.clone())
           .map_err(|e| Error::from_reason(e.to_string()))?
       }
-      Some(DatabaseInner::Graph(db)) => ray_export::export_to_object_graph(db, rust_opts.clone())
-        .map_err(|e| Error::from_reason(e.to_string()))?,
       None => return Err(Error::from_reason("Database is closed")),
     };
 
@@ -3120,8 +2405,6 @@ impl Database {
 
     let data = match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => ray_export::export_to_object_single(db, rust_opts)
-        .map_err(|e| Error::from_reason(e.to_string()))?,
-      Some(DatabaseInner::Graph(db)) => ray_export::export_to_object_graph(db, rust_opts)
         .map_err(|e| Error::from_reason(e.to_string()))?,
       None => return Err(Error::from_reason("Database is closed")),
     };
@@ -3154,10 +2437,6 @@ impl Database {
         ray_export::import_from_object_single(db, &parsed, rust_opts)
           .map_err(|e| Error::from_reason(e.to_string()))?
       }
-      Some(DatabaseInner::Graph(db)) => {
-        ray_export::import_from_object_graph(db, &parsed, rust_opts)
-          .map_err(|e| Error::from_reason(e.to_string()))?
-      }
       None => return Err(Error::from_reason("Database is closed")),
     };
 
@@ -3188,10 +2467,6 @@ impl Database {
         ray_export::import_from_object_single(db, &parsed, rust_opts)
           .map_err(|e| Error::from_reason(e.to_string()))?
       }
-      Some(DatabaseInner::Graph(db)) => {
-        ray_export::import_from_object_graph(db, &parsed, rust_opts)
-          .map_err(|e| Error::from_reason(e.to_string()))?
-      }
       None => return Err(Error::from_reason("Database is closed")),
     };
 
@@ -3211,7 +2486,6 @@ impl Database {
   pub fn cache_is_enabled(&self) -> Result<bool> {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(db.cache_is_enabled()),
-      Some(DatabaseInner::Graph(_)) => Ok(false),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -3224,7 +2498,6 @@ impl Database {
         db.cache_invalidate_node(node_id as NodeId);
         Ok(())
       }
-      Some(DatabaseInner::Graph(_)) => Ok(()),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -3237,7 +2510,6 @@ impl Database {
         db.cache_invalidate_edge(src as NodeId, etype as ETypeId, dst as NodeId);
         Ok(())
       }
-      Some(DatabaseInner::Graph(_)) => Ok(()),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -3250,7 +2522,6 @@ impl Database {
         db.cache_invalidate_key(&key);
         Ok(())
       }
-      Some(DatabaseInner::Graph(_)) => Ok(()),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -3263,7 +2534,6 @@ impl Database {
         db.cache_clear();
         Ok(())
       }
-      Some(DatabaseInner::Graph(_)) => Ok(()),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -3276,7 +2546,6 @@ impl Database {
         db.cache_clear_query();
         Ok(())
       }
-      Some(DatabaseInner::Graph(_)) => Ok(()),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -3289,7 +2558,6 @@ impl Database {
         db.cache_clear_key();
         Ok(())
       }
-      Some(DatabaseInner::Graph(_)) => Ok(()),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -3302,7 +2570,6 @@ impl Database {
         db.cache_clear_property();
         Ok(())
       }
-      Some(DatabaseInner::Graph(_)) => Ok(()),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -3315,7 +2582,6 @@ impl Database {
         db.cache_clear_traversal();
         Ok(())
       }
-      Some(DatabaseInner::Graph(_)) => Ok(()),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -3335,7 +2601,6 @@ impl Database {
         query_cache_misses: s.query_cache_misses as i64,
         query_cache_size: s.query_cache_size as i64,
       })),
-      Some(DatabaseInner::Graph(_)) => Ok(None),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -3348,7 +2613,6 @@ impl Database {
         db.cache_reset_stats();
         Ok(())
       }
-      Some(DatabaseInner::Graph(_)) => Ok(()),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -3360,32 +2624,8 @@ impl Database {
   fn get_db(&self) -> Result<&RustSingleFileDB> {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(db),
-      Some(DatabaseInner::Graph(_)) => Err(Error::from_reason("Database is multi-file")),
       None => Err(Error::from_reason("Database is closed")),
     }
-  }
-
-  fn get_graph_db(&self) -> Result<&RustGraphDB> {
-    match self.inner.as_ref() {
-      Some(DatabaseInner::Graph(db)) => Ok(db),
-      Some(DatabaseInner::SingleFile(_)) => Err(Error::from_reason("Database is single-file")),
-      None => Err(Error::from_reason("Database is closed")),
-    }
-  }
-
-  fn with_graph_tx<F, R>(&self, f: F) -> Result<R>
-  where
-    F: FnOnce(&mut GraphTxHandle) -> Result<R>,
-  {
-    let db = self.get_graph_db()?;
-    let mut guard = self.graph_tx.lock();
-    let tx_state = guard
-      .take()
-      .ok_or_else(|| Error::from_reason("No active transaction"))?;
-    let mut handle = GraphTxHandle::new(db, tx_state);
-    let result = f(&mut handle);
-    *guard = Some(handle.tx);
-    result
   }
 }
 
@@ -3442,73 +2682,10 @@ fn get_neighbors_from_single_file(
   edges
 }
 
-fn get_neighbors_from_graph_db(
-  db: &RustGraphDB,
-  node_id: NodeId,
-  direction: TraversalDirection,
-  etype: Option<ETypeId>,
-) -> Vec<Edge> {
-  let mut edges = Vec::new();
-  match direction {
-    TraversalDirection::Out => {
-      for edge in list_out_edges(db, node_id) {
-        if etype.is_none() || etype == Some(edge.etype) {
-          edges.push(Edge {
-            src: node_id,
-            etype: edge.etype,
-            dst: edge.dst,
-          });
-        }
-      }
-    }
-    TraversalDirection::In => {
-      for edge in list_in_edges(db, node_id) {
-        if etype.is_none() || etype == Some(edge.etype) {
-          edges.push(Edge {
-            src: edge.dst,
-            etype: edge.etype,
-            dst: node_id,
-          });
-        }
-      }
-    }
-    TraversalDirection::Both => {
-      edges.extend(get_neighbors_from_graph_db(
-        db,
-        node_id,
-        TraversalDirection::Out,
-        etype,
-      ));
-      edges.extend(get_neighbors_from_graph_db(
-        db,
-        node_id,
-        TraversalDirection::In,
-        etype,
-      ));
-    }
-  }
-  edges
-}
-
 fn resolve_weight_key_single_file(
   db: &RustSingleFileDB,
   config: &JsPathConfig,
 ) -> Result<Option<PropKeyId>> {
-  if let Some(key_id) = config.weight_key_id {
-    return Ok(Some(key_id as PropKeyId));
-  }
-
-  if let Some(ref key_name) = config.weight_key_name {
-    let key_id = db
-      .get_propkey_id(key_name)
-      .ok_or_else(|| Error::from_reason(format!("Unknown property key: {key_name}")))?;
-    return Ok(Some(key_id));
-  }
-
-  Ok(None)
-}
-
-fn resolve_weight_key_graph(db: &RustGraphDB, config: &JsPathConfig) -> Result<Option<PropKeyId>> {
   if let Some(key_id) = config.weight_key_id {
     return Ok(Some(key_id as PropKeyId));
   }
@@ -3559,92 +2736,6 @@ fn get_edge_weight_from_single_file(
   }
 }
 
-fn get_edge_weight_from_graph_db(
-  db: &RustGraphDB,
-  src: NodeId,
-  etype: ETypeId,
-  dst: NodeId,
-  weight_key: Option<PropKeyId>,
-) -> f64 {
-  match weight_key {
-    Some(key_id) => prop_value_to_weight(get_edge_prop_db(db, src, etype, dst, key_id)),
-    None => 1.0,
-  }
-}
-
-fn graph_stats(db: &RustGraphDB) -> DbStats {
-  let node_count = graph_count_nodes(db);
-  let edge_count = graph_count_edges(db, None);
-
-  let delta = db.delta.read();
-  let delta_nodes_created = delta.created_nodes.len();
-  let delta_nodes_deleted = delta.deleted_nodes.len();
-  let delta_edges_added = delta.total_edges_added();
-  let delta_edges_deleted = delta.total_edges_deleted();
-  drop(delta);
-
-  let (snapshot_gen, snapshot_nodes, snapshot_edges, snapshot_max_node_id) =
-    if let Some(ref snapshot) = db.snapshot {
-      (
-        snapshot.header.generation,
-        snapshot.header.num_nodes,
-        snapshot.header.num_edges,
-        snapshot.header.max_node_id,
-      )
-    } else {
-      (0, 0, 0, 0)
-    };
-
-  let wal_segment = db.manifest.as_ref().map(|m| m.active_wal_seg).unwrap_or(0);
-
-  let mvcc_stats = db.mvcc.as_ref().map(|mvcc| {
-    let tx_mgr = mvcc.tx_manager.lock();
-    let gc = mvcc.gc.lock();
-    let gc_stats = gc.get_stats();
-    let committed_stats = tx_mgr.get_committed_writes_stats();
-    MvccStats {
-      active_transactions: tx_mgr.get_active_count() as i64,
-      min_active_ts: tx_mgr.min_active_ts() as i64,
-      versions_pruned: gc_stats.versions_pruned as i64,
-      gc_runs: gc_stats.gc_runs as i64,
-      last_gc_time: gc_stats.last_gc_time as i64,
-      committed_writes_size: committed_stats.size as i64,
-      committed_writes_pruned: committed_stats.pruned as i64,
-    }
-  });
-
-  let total_changes =
-    delta_nodes_created + delta_nodes_deleted + delta_edges_added + delta_edges_deleted;
-  let recommend_compact = total_changes > 10_000;
-
-  DbStats {
-    snapshot_gen: snapshot_gen as i64,
-    snapshot_nodes: snapshot_nodes.max(node_count) as i64,
-    snapshot_edges: snapshot_edges.max(edge_count) as i64,
-    snapshot_max_node_id: snapshot_max_node_id as i64,
-    delta_nodes_created: delta_nodes_created as i64,
-    delta_nodes_deleted: delta_nodes_deleted as i64,
-    delta_edges_added: delta_edges_added as i64,
-    delta_edges_deleted: delta_edges_deleted as i64,
-    wal_segment: wal_segment as i64,
-    wal_bytes: db.wal_bytes() as i64,
-    recommend_compact,
-    mvcc_stats,
-  }
-}
-
-fn graph_check(db: &RustGraphDB) -> RustCheckResult {
-  if let Some(ref snapshot) = db.snapshot {
-    return crate::check::check_snapshot(snapshot);
-  }
-
-  RustCheckResult {
-    valid: true,
-    errors: Vec::new(),
-    warnings: vec!["No snapshot to check".to_string()],
-  }
-}
-
 // ============================================================================
 // Convenience Functions
 // ============================================================================
@@ -3663,7 +2754,6 @@ pub fn open_database(path: String, options: Option<OpenOptions>) -> Result<Datab
 pub fn collect_metrics(db: &Database) -> Result<DatabaseMetrics> {
   match db.inner.as_ref() {
     Some(DatabaseInner::SingleFile(db)) => Ok(core_metrics::collect_metrics_single_file(db).into()),
-    Some(DatabaseInner::Graph(db)) => Ok(core_metrics::collect_metrics_graph(db).into()),
     None => Err(Error::from_reason("Database is closed")),
   }
 }
@@ -3672,7 +2762,6 @@ pub fn collect_metrics(db: &Database) -> Result<DatabaseMetrics> {
 pub fn health_check(db: &Database) -> Result<HealthCheckResult> {
   match db.inner.as_ref() {
     Some(DatabaseInner::SingleFile(db)) => Ok(core_metrics::health_check_single_file(db).into()),
-    Some(DatabaseInner::Graph(db)) => Ok(core_metrics::health_check_graph(db).into()),
     None => Err(Error::from_reason("Database is closed")),
   }
 }
@@ -3716,7 +2805,7 @@ pub struct BackupResult {
   pub size: i64,
   /// Timestamp in milliseconds since epoch
   pub timestamp: i64,
-  /// Backup type ("single-file" or "multi-file")
+  /// Backup type ("single-file")
   pub r#type: String,
 }
 
@@ -3770,11 +2859,6 @@ pub fn create_backup(
   match db.inner.as_ref() {
     Some(DatabaseInner::SingleFile(db)) => {
       core_backup::create_backup_single_file(db, &backup_path, core_options)
-        .map(BackupResult::from)
-        .map_err(|e| Error::from_reason(format!("Failed to create backup: {e}")))
-    }
-    Some(DatabaseInner::Graph(db)) => {
-      core_backup::create_backup_graph(db, &backup_path, core_options)
         .map(BackupResult::from)
         .map_err(|e| Error::from_reason(format!("Failed to create backup: {e}")))
     }

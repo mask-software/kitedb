@@ -36,7 +36,7 @@ pub enum KiteError {
   #[error("Duplicate key: {0}")]
   DuplicateKey(String),
 
-  /// Transaction conflict (write-write conflict in MVCC)
+  /// Transaction conflict (write-write conflict)
   #[error("Transaction {txid} conflict on keys: {keys:?}")]
   Conflict { txid: TxId, keys: Vec<String> },
 
@@ -116,7 +116,7 @@ pub enum KiteError {
 /// Result type alias for KiteDB operations
 pub type Result<T> = std::result::Result<T, KiteError>;
 
-/// Conflict error - specialized error for MVCC conflicts
+/// Conflict error - specialized error for transaction conflicts
 /// Allows extracting conflict details
 impl KiteError {
   /// Create a conflict error

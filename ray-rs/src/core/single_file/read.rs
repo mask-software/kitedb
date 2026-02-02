@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 
+use crate::mvcc::visibility::get_visible_version;
 use crate::types::*;
 
 use super::SingleFileDB;
@@ -74,6 +75,24 @@ impl SingleFileDB {
   ///
   /// Returns None if the node doesn't exist, is deleted, or doesn't have the property.
   pub fn get_node_prop(&self, node_id: NodeId, key_id: PropKeyId) -> Option<PropValue> {
+    if let Some(mvcc) = self.mvcc.as_ref() {
+      let (txid, tx_snapshot_ts) = if let Some(tx) = self.current_tx.lock().as_ref() {
+        (tx.txid, tx.snapshot_ts)
+      } else {
+        (0, mvcc.tx_manager.lock().get_next_commit_ts())
+      };
+      if txid != 0 {
+        let mut tx_mgr = mvcc.tx_manager.lock();
+        tx_mgr.record_read(txid, format!("nodeprop:{node_id}:{key_id}"));
+      }
+      let vc = mvcc.version_chain.lock();
+      if let Some(prop_version) = vc.get_node_prop_version(node_id, key_id) {
+        if let Some(visible) = get_visible_version(&prop_version, tx_snapshot_ts, txid) {
+          return visible.data.clone();
+        }
+      }
+    }
+
     let delta = self.delta.read();
 
     // Check if node is deleted
@@ -188,6 +207,24 @@ impl SingleFileDB {
     dst: NodeId,
     key_id: PropKeyId,
   ) -> Option<PropValue> {
+    if let Some(mvcc) = self.mvcc.as_ref() {
+      let (txid, tx_snapshot_ts) = if let Some(tx) = self.current_tx.lock().as_ref() {
+        (tx.txid, tx.snapshot_ts)
+      } else {
+        (0, mvcc.tx_manager.lock().get_next_commit_ts())
+      };
+      if txid != 0 {
+        let mut tx_mgr = mvcc.tx_manager.lock();
+        tx_mgr.record_read(txid, format!("edgeprop:{src}:{etype}:{dst}:{key_id}"));
+      }
+      let vc = mvcc.version_chain.lock();
+      if let Some(prop_version) = vc.get_edge_prop_version(src, etype, dst, key_id) {
+        if let Some(visible) = get_visible_version(&prop_version, tx_snapshot_ts, txid) {
+          return visible.data.clone();
+        }
+      }
+    }
+
     let delta = self.delta.read();
 
     // Check if either node is deleted
@@ -373,24 +410,38 @@ impl SingleFileDB {
   ///
   /// Returns destination node IDs for edges of the given type.
   pub fn get_out_neighbors(&self, node_id: NodeId, etype: ETypeId) -> Vec<NodeId> {
-    self
+    let neighbors: Vec<NodeId> = self
       .get_out_edges(node_id)
       .into_iter()
       .filter(|(e, _)| *e == etype)
       .map(|(_, dst)| dst)
-      .collect()
+      .collect();
+    if let Some(mvcc) = self.mvcc.as_ref() {
+      if let Some(tx) = self.current_tx.lock().as_ref() {
+        let mut tx_mgr = mvcc.tx_manager.lock();
+        tx_mgr.record_read(tx.txid, format!("neighbors_out:{node_id}:{etype}"));
+      }
+    }
+    neighbors
   }
 
   /// Get neighbors via incoming edges of a specific type
   ///
   /// Returns source node IDs for edges of the given type.
   pub fn get_in_neighbors(&self, node_id: NodeId, etype: ETypeId) -> Vec<NodeId> {
-    self
+    let neighbors: Vec<NodeId> = self
       .get_in_edges(node_id)
       .into_iter()
       .filter(|(e, _)| *e == etype)
       .map(|(_, src)| src)
-      .collect()
+      .collect();
+    if let Some(mvcc) = self.mvcc.as_ref() {
+      if let Some(tx) = self.current_tx.lock().as_ref() {
+        let mut tx_mgr = mvcc.tx_manager.lock();
+        tx_mgr.record_read(tx.txid, format!("neighbors_in:{node_id}:{etype}"));
+      }
+    }
+    neighbors
   }
 
   /// Check if there are any outgoing edges of a specific type
@@ -484,6 +535,13 @@ impl SingleFileDB {
   /// Returns the NodeId if found, None otherwise.
   /// Checks delta key index first, then falls back to snapshot.
   pub fn get_node_by_key(&self, key: &str) -> Option<NodeId> {
+    if let Some(mvcc) = self.mvcc.as_ref() {
+      if let Some(tx) = self.current_tx.lock().as_ref() {
+        let mut tx_mgr = mvcc.tx_manager.lock();
+        tx_mgr.record_read(tx.txid, format!("key:{key}"));
+      }
+    }
+
     let delta = self.delta.read();
 
     // Check delta key index first

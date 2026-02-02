@@ -124,13 +124,29 @@ pub fn collect_metrics_single_file(db: &SingleFileDB) -> DatabaseMetrics {
   let cache_bytes = estimate_cache_memory(cache_stats.as_ref());
   let snapshot_bytes = (stats.snapshot_nodes as i64 * 50) + (stats.snapshot_edges as i64 * 20);
 
+  let mvcc = db.mvcc.as_ref().map(|mvcc| {
+    let tx_mgr = mvcc.tx_manager.lock();
+    let gc = mvcc.gc.lock();
+    let gc_stats = gc.get_stats();
+    let committed_stats = tx_mgr.get_committed_writes_stats();
+    MvccMetrics {
+      enabled: true,
+      active_transactions: tx_mgr.get_active_count() as i64,
+      versions_pruned: gc_stats.versions_pruned as i64,
+      gc_runs: gc_stats.gc_runs as i64,
+      min_active_timestamp: tx_mgr.min_active_ts() as i64,
+      committed_writes_size: committed_stats.size as i64,
+      committed_writes_pruned: committed_stats.pruned as i64,
+    }
+  });
+
   DatabaseMetrics {
     path: db.path.to_string_lossy().to_string(),
     is_single_file: true,
     read_only: db.read_only,
     data,
     cache,
-    mvcc: None,
+    mvcc,
     memory: MemoryMetrics {
       delta_estimate_bytes: delta_bytes,
       cache_estimate_bytes: cache_bytes,

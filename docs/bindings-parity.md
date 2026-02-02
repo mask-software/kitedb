@@ -15,10 +15,8 @@ Legend
 
 | Feature area | TypeScript | Python | NAPI | Notes |
 | --- | --- | --- | --- | --- |
-| DB open/close (auto-detect .kitedb + legacy dir) | Full | Missing | Full | Python only opens single-file via `Database` |
 | Single-file DB open/close | Full | Full | Full | `Database`/`open_database`/`openDatabase` |
 | Single-file open options | Full | Full | Full | Page size, WAL size, cache, sync mode |
-| MVCC option | Full | Missing | Full | Single-file core does not expose extra MVCC knobs |
 | Locking utility | Full | Missing | Missing | TS-only helper (`isProperLockingAvailable`) |
 | Backup/restore | Full | Missing | Full | `createBackup`, `restoreBackup`, `createOfflineBackup` |
 | Export/import | Full | Missing | Full | JSON export/import + JSONL export (TS has no JSONL import either) |
@@ -44,7 +42,6 @@ Legend
 ## Language-Specific Gaps
 
 Python gaps (bindings + fluent layer)
-- Missing legacy multi-file DB open/close (dir format) and auto-detect open (not planned)
 - Missing `check()` integrity API
 - Missing high-level `VectorIndex` API
 - No export/import, backup/restore, streaming/pagination, metrics/health
@@ -59,7 +56,6 @@ NAPI gaps
 ## Implementation backlog (draft)
 
 Python
-- [ ] (Legacy) Multi-file DB open/close (match `openGraphDB`) and auto-detect (not planned)
 - [ ] Expose `check()` integrity verification
 - [ ] Add high-level `VectorIndex` API (Python equivalent of TS `VectorIndex`)
 - [ ] Expose export/import and backup/restore
@@ -68,7 +64,6 @@ Python
 
 NAPI
 - [x] Add high-level fluent API surface (Kite + schema + builders) (partial)
-- [x] Add multi-file DB open/close with auto-detect
 - [x] Expose `check()` integrity verification
 - [x] Add high-level `VectorIndex` API
 - [x] Expose export/import (JSON + JSONL export only)

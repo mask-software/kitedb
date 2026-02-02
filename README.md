@@ -115,9 +115,6 @@ await closeGraphDB(db);
 const db = await openGraphDB(path, {
   readOnly?: boolean,        // Open in read-only mode
   createIfMissing?: boolean, // Create if doesn't exist (default: true)
-  lockFile?: boolean,        // Use file locking (default: true)
-  legacyMultiFile?: boolean, // Allow legacy directory format (default: false)
-  mvcc?: boolean,            // Enable MVCC for concurrent transactions
   cache?: boolean,           // Enable caching (default: false)
 });
 
@@ -137,9 +134,7 @@ await commit(tx);
 // Or rollback
 rollback(tx);
 
-// With MVCC enabled, concurrent transactions are supported:
-const tx1 = beginTx(db);  // Transaction 1
-const tx2 = beginTx(db);  // Transaction 2 (concurrent)
+// Single-file transactions are serialized (one active transaction at a time).
 ```
 
 ### Node Operations
@@ -496,12 +491,9 @@ bun run bench/benchmark-api-vs-raw.ts
 bun run bench/benchmark-api-vs-raw.ts --nodes 10000 --edges 50000 --iterations 10000
 ```
 
-## File Formats
+## File Format
 
-Kite supports two storage formats. The directory-based format is legacy and will be
-deprecated in favor of the single-file format.
-
-### Single-File Format (`.kitedb`) - Recommended
+Kite uses a single-file format (`.kitedb`) for simpler deployment and backup.
 
 A SQLite-style single-file database for simpler deployment and backup:
 
@@ -517,10 +509,8 @@ import {
 const db = await openSingleFileDB('./my-graph.kitedb', {
   readOnly?: boolean,        // Open in read-only mode
   createIfMissing?: boolean, // Create if doesn't exist (default: true)
-  lockFile?: boolean,        // Use file locking (default: true)
   pageSize?: number,         // Page size (default: 4096, must be power of 2)
   walSize?: number,          // WAL buffer size in bytes (default: 64MB)
-  mvcc?: boolean,            // Enable MVCC
   cache?: CacheOptions,      // Enable caching
 });
 
@@ -536,32 +526,10 @@ await vacuumSingleFile(db);
 await closeSingleFileDB(db);
 ```
 
-The single-file format contains:
+The `.kitedb` format contains:
 - **Header (page 0)**: Magic, version, page size, snapshot/WAL locations
 - **WAL Area**: Linear buffer for write-ahead log records (checkpoint to reclaim space)
 - **Snapshot Area**: CSR snapshot data (mmap-friendly)
-
-### Multi-File Format (directory) - Deprecated (Legacy)
-
-The original directory-based format (legacy). New deployments should use
-the single-file `.kitedb` format. A separate WAL file may be retained for
-single-file performance in the future, but the directory format is no longer
-recommended.
-
-To open an existing legacy directory, pass `{ legacyMultiFile: true }` to
-`openGraphDB`.
-
-```
-db/
-  manifest.gdm           # Current snapshot and WAL info
-  lock.gdl               # Optional file lock
-  snapshots/
-    snap_0000000000000001.gds
-    snap_0000000000000002.gds
-  wal/
-    wal_0000000000000001.gdw
-    wal_0000000000000002.gdw
-```
 
 ### Snapshot Format (`.gds`)
 
