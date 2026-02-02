@@ -208,7 +208,7 @@ Edges within each node are **sorted by (etype, dst/src)** for binary search duri
 ### Multi-File Format (Directory) - Deprecated (Legacy)
 
 The directory-based layout is legacy and deprecated for new deployments. The
-single-file `.raydb` format is the default and recommended path forward.
+single-file `.kitedb` format is the default and recommended path forward.
 
 ```
 database/
@@ -221,7 +221,7 @@ database/
 └── trash/                 # Old snapshots pending cleanup
 ```
 
-### Single-File Format (.raydb) - Default
+### Single-File Format (.kitedb) - Default
 
 ```
 ┌────────────────────────────────────────┐

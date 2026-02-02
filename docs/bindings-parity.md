@@ -15,7 +15,7 @@ Legend
 
 | Feature area | TypeScript | Python | NAPI | Notes |
 | --- | --- | --- | --- | --- |
-| DB open/close (auto-detect .raydb + legacy dir) | Full | Missing | Full | Python only opens single-file via `Database` |
+| DB open/close (auto-detect .kitedb + legacy dir) | Full | Missing | Full | Python only opens single-file via `Database` |
 | Single-file DB open/close | Full | Full | Full | `Database`/`open_database`/`openDatabase` |
 | Single-file open options | Full | Full | Full | Page size, WAL size, cache, sync mode |
 | MVCC option | Full | Missing | Full | Single-file core does not expose extra MVCC knobs |

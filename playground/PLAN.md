@@ -49,7 +49,7 @@ playground/
 ### Phase 1: Backend Foundation
 
 1. **`src/api/db.ts`** - Database manager singleton
-   - `openDatabase(path: string)` - Opens a `.raydb` file
+   - `openDatabase(path: string)` - Opens a `.kitedb` file
    - `openFromBuffer(buffer: Uint8Array)` - Opens from uploaded file
    - `createDemo()` - Creates demo database
    - `close()` - Closes current database

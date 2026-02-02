@@ -14,7 +14,7 @@ Rust now matches the TypeScript core across storage formats, transactions (MVCC)
 
 | Area | Parity | Notes |
 |------|--------|-------|
-| Single-file format (.raydb) | 100% | Full open/read/write + background checkpointing + compactor/vacuum |
+| Single-file format (.kitedb) | 100% | Full open/read/write + background checkpointing + compactor/vacuum |
 | Multi-file format | 100% | Snapshot + WAL + manifest parity |
 | MVCC | 100% | Integrated into DB ops with wall-clock retention + GC |
 | Graph ops (nodes/edges/props) | 100% | MVCC visibility + WAL replay + delta parity |

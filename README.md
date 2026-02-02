@@ -501,7 +501,7 @@ bun run bench/benchmark-api-vs-raw.ts --nodes 10000 --edges 50000 --iterations 1
 Kite supports two storage formats. The directory-based format is legacy and will be
 deprecated in favor of the single-file format.
 
-### Single-File Format (`.raydb`) - Recommended
+### Single-File Format (`.kitedb`) - Recommended
 
 A SQLite-style single-file database for simpler deployment and backup:
 
@@ -514,7 +514,7 @@ import {
 } from '@kitedb/core';
 
 // Open or create a single-file database
-const db = await openSingleFileDB('./my-graph.raydb', {
+const db = await openSingleFileDB('./my-graph.kitedb', {
   readOnly?: boolean,        // Open in read-only mode
   createIfMissing?: boolean, // Create if doesn't exist (default: true)
   lockFile?: boolean,        // Use file locking (default: true)
@@ -544,7 +544,7 @@ The single-file format contains:
 ### Multi-File Format (directory) - Deprecated (Legacy)
 
 The original directory-based format (legacy). New deployments should use
-the single-file `.raydb` format. A separate WAL file may be retained for
+the single-file `.kitedb` format. A separate WAL file may be retained for
 single-file performance in the future, but the directory format is no longer
 recommended.
 

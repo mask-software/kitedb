@@ -526,13 +526,13 @@ const path = await db
 
 ## File Formats
 
-RayDB primarily uses the single-file `.raydb` format. The directory-based
+RayDB primarily uses the single-file `.kitedb` format. The directory-based
 format is legacy and deprecated for new deployments.
 
-### Single-File Format (`.raydb`)
+### Single-File Format (`.kitedb`)
 
 ```
-mydb.raydb
+mydb.kitedb
   Header (page 0)
   WAL Area (linear buffer; checkpoint to reclaim space)
   Snapshot Area (CSR)
