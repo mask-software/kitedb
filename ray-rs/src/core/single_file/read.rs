@@ -140,7 +140,13 @@ impl SingleFileDB {
       if txid != 0 {
         let mut tx_mgr = mvcc.tx_manager.lock();
         for key_id in props.keys() {
-          tx_mgr.record_read(txid, format!("nodeprop:{node_id}:{key_id}"));
+          tx_mgr.record_read(
+            txid,
+            TxKey::NodeProp {
+              node_id,
+              key_id: *key_id,
+            },
+          );
         }
       }
     }
@@ -180,7 +186,7 @@ impl SingleFileDB {
       };
       if txid != 0 {
         let mut tx_mgr = mvcc.tx_manager.lock();
-        tx_mgr.record_read(txid, format!("nodeprop:{node_id}:{key_id}"));
+        tx_mgr.record_read(txid, TxKey::NodeProp { node_id, key_id });
       }
       let vc = mvcc.version_chain.lock();
       if let Some(version) = vc.get_node_version(node_id) {
@@ -381,7 +387,15 @@ impl SingleFileDB {
       if txid != 0 {
         let mut tx_mgr = mvcc.tx_manager.lock();
         for key_id in props.keys() {
-          tx_mgr.record_read(txid, format!("edgeprop:{src}:{etype}:{dst}:{key_id}"));
+          tx_mgr.record_read(
+            txid,
+            TxKey::EdgeProp {
+              src,
+              etype,
+              dst,
+              key_id: *key_id,
+            },
+          );
         }
       }
     }
@@ -427,7 +441,15 @@ impl SingleFileDB {
       };
       if txid != 0 {
         let mut tx_mgr = mvcc.tx_manager.lock();
-        tx_mgr.record_read(txid, format!("edgeprop:{src}:{etype}:{dst}:{key_id}"));
+        tx_mgr.record_read(
+          txid,
+          TxKey::EdgeProp {
+            src,
+            etype,
+            dst,
+            key_id,
+          },
+        );
       }
       let vc = mvcc.version_chain.lock();
       if let Some(version) = vc.get_node_version(src) {
@@ -654,7 +676,13 @@ impl SingleFileDB {
     if let Some(mvcc) = self.mvcc.as_ref() {
       if txid != 0 {
         let mut tx_mgr = mvcc.tx_manager.lock();
-        tx_mgr.record_read(txid, format!("neighbors_out:{node_id}:*"));
+        tx_mgr.record_read(
+          txid,
+          TxKey::NeighborsOut {
+            node_id,
+            etype: None,
+          },
+        );
       }
     }
 
@@ -786,7 +814,13 @@ impl SingleFileDB {
     if let Some(mvcc) = self.mvcc.as_ref() {
       if txid != 0 {
         let mut tx_mgr = mvcc.tx_manager.lock();
-        tx_mgr.record_read(txid, format!("neighbors_in:{node_id}:*"));
+        tx_mgr.record_read(
+          txid,
+          TxKey::NeighborsIn {
+            node_id,
+            etype: None,
+          },
+        );
       }
     }
 
@@ -818,7 +852,13 @@ impl SingleFileDB {
       if let Some(handle) = tx_handle.as_ref() {
         let tx = handle.lock();
         let mut tx_mgr = mvcc.tx_manager.lock();
-        tx_mgr.record_read(tx.txid, format!("neighbors_out:{node_id}:{etype}"));
+        tx_mgr.record_read(
+          tx.txid,
+          TxKey::NeighborsOut {
+            node_id,
+            etype: Some(etype),
+          },
+        );
       }
     }
     neighbors
@@ -839,7 +879,13 @@ impl SingleFileDB {
       if let Some(handle) = tx_handle.as_ref() {
         let tx = handle.lock();
         let mut tx_mgr = mvcc.tx_manager.lock();
-        tx_mgr.record_read(tx.txid, format!("neighbors_in:{node_id}:{etype}"));
+        tx_mgr.record_read(
+          tx.txid,
+          TxKey::NeighborsIn {
+            node_id,
+            etype: Some(etype),
+          },
+        );
       }
     }
     neighbors
@@ -897,8 +943,8 @@ impl SingleFileDB {
       if let Some(mvcc) = self.mvcc.as_ref() {
         if txid != 0 {
           let mut tx_mgr = mvcc.tx_manager.lock();
-          tx_mgr.record_read(txid, format!("nodelabels:{node_id}"));
-          tx_mgr.record_read(txid, format!("nodelabel:{node_id}:{label_id}"));
+          tx_mgr.record_read(txid, TxKey::NodeLabels(node_id));
+          tx_mgr.record_read(txid, TxKey::NodeLabel { node_id, label_id });
         }
       }
       return false;
@@ -910,8 +956,8 @@ impl SingleFileDB {
           if let Some(mvcc) = self.mvcc.as_ref() {
             if txid != 0 {
               let mut tx_mgr = mvcc.tx_manager.lock();
-              tx_mgr.record_read(txid, format!("nodelabels:{node_id}"));
-              tx_mgr.record_read(txid, format!("nodelabel:{node_id}:{label_id}"));
+              tx_mgr.record_read(txid, TxKey::NodeLabels(node_id));
+              tx_mgr.record_read(txid, TxKey::NodeLabel { node_id, label_id });
             }
           }
           return visible.data.unwrap_or(false);
@@ -926,8 +972,8 @@ impl SingleFileDB {
       if let Some(mvcc) = self.mvcc.as_ref() {
         if txid != 0 {
           let mut tx_mgr = mvcc.tx_manager.lock();
-          tx_mgr.record_read(txid, format!("nodelabels:{node_id}"));
-          tx_mgr.record_read(txid, format!("nodelabel:{node_id}:{label_id}"));
+          tx_mgr.record_read(txid, TxKey::NodeLabels(node_id));
+          tx_mgr.record_read(txid, TxKey::NodeLabel { node_id, label_id });
         }
       }
       return false;
@@ -938,8 +984,8 @@ impl SingleFileDB {
       if let Some(mvcc) = self.mvcc.as_ref() {
         if txid != 0 {
           let mut tx_mgr = mvcc.tx_manager.lock();
-          tx_mgr.record_read(txid, format!("nodelabels:{node_id}"));
-          tx_mgr.record_read(txid, format!("nodelabel:{node_id}:{label_id}"));
+          tx_mgr.record_read(txid, TxKey::NodeLabels(node_id));
+          tx_mgr.record_read(txid, TxKey::NodeLabel { node_id, label_id });
         }
       }
       return false;
@@ -950,8 +996,8 @@ impl SingleFileDB {
       if let Some(mvcc) = self.mvcc.as_ref() {
         if txid != 0 {
           let mut tx_mgr = mvcc.tx_manager.lock();
-          tx_mgr.record_read(txid, format!("nodelabels:{node_id}"));
-          tx_mgr.record_read(txid, format!("nodelabel:{node_id}:{label_id}"));
+          tx_mgr.record_read(txid, TxKey::NodeLabels(node_id));
+          tx_mgr.record_read(txid, TxKey::NodeLabel { node_id, label_id });
         }
       }
       return true;
@@ -965,8 +1011,8 @@ impl SingleFileDB {
           if let Some(mvcc) = self.mvcc.as_ref() {
             if txid != 0 {
               let mut tx_mgr = mvcc.tx_manager.lock();
-              tx_mgr.record_read(txid, format!("nodelabels:{node_id}"));
-              tx_mgr.record_read(txid, format!("nodelabel:{node_id}:{label_id}"));
+              tx_mgr.record_read(txid, TxKey::NodeLabels(node_id));
+              tx_mgr.record_read(txid, TxKey::NodeLabel { node_id, label_id });
             }
           }
           return has_label;
@@ -977,8 +1023,8 @@ impl SingleFileDB {
     if let Some(mvcc) = self.mvcc.as_ref() {
       if txid != 0 {
         let mut tx_mgr = mvcc.tx_manager.lock();
-        tx_mgr.record_read(txid, format!("nodelabels:{node_id}"));
-        tx_mgr.record_read(txid, format!("nodelabel:{node_id}:{label_id}"));
+        tx_mgr.record_read(txid, TxKey::NodeLabels(node_id));
+        tx_mgr.record_read(txid, TxKey::NodeLabel { node_id, label_id });
       }
     }
     false
@@ -1080,9 +1126,15 @@ impl SingleFileDB {
     if let Some(mvcc) = self.mvcc.as_ref() {
       if txid != 0 {
         let mut tx_mgr = mvcc.tx_manager.lock();
-        tx_mgr.record_read(txid, format!("nodelabels:{node_id}"));
+        tx_mgr.record_read(txid, TxKey::NodeLabels(node_id));
         for label_id in &result {
-          tx_mgr.record_read(txid, format!("nodelabel:{node_id}:{label_id}"));
+          tx_mgr.record_read(
+            txid,
+            TxKey::NodeLabel {
+              node_id,
+              label_id: *label_id,
+            },
+          );
         }
       }
     }
@@ -1117,7 +1169,7 @@ impl SingleFileDB {
       if let Some(handle) = tx_handle.as_ref() {
         let tx = handle.lock();
         let mut tx_mgr = mvcc.tx_manager.lock();
-        tx_mgr.record_read(tx.txid, format!("key:{key}"));
+        tx_mgr.record_read(tx.txid, TxKey::Key(key.into()));
       }
     }
 

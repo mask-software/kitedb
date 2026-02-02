@@ -230,7 +230,7 @@ impl SingleFileDB {
       };
       if txid != 0 {
         let mut tx_mgr = mvcc.tx_manager.lock();
-        tx_mgr.record_read(txid, format!("node:{node_id}"));
+        tx_mgr.record_read(txid, TxKey::Node(node_id));
       }
       let vc = mvcc.version_chain.lock();
       if let Some(version) = vc.get_node_version(node_id) {
@@ -281,7 +281,7 @@ impl SingleFileDB {
       };
       if txid != 0 {
         let mut tx_mgr = mvcc.tx_manager.lock();
-        tx_mgr.record_read(txid, format!("edge:{src}:{etype}:{dst}"));
+        tx_mgr.record_read(txid, TxKey::Edge { src, etype, dst });
       }
       let vc = mvcc.version_chain.lock();
       if let Some(version) = vc.get_edge_version(src, etype, dst) {

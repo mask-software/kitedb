@@ -50,7 +50,7 @@ pub fn add_edge(handle: &mut TxHandle, src: NodeId, etype: ETypeId, dst: NodeId)
 
   if let Some(mvcc) = handle.db.mvcc.as_ref() {
     let mut tx_mgr = mvcc.tx_manager.lock();
-    tx_mgr.record_write(handle.tx.txid, format!("edge:{src}:{etype}:{dst}"));
+    tx_mgr.record_write(handle.tx.txid, TxKey::Edge { src, etype, dst });
   }
 
   Ok(())
@@ -101,7 +101,7 @@ pub fn delete_edge(
 
   if let Some(mvcc) = handle.db.mvcc.as_ref() {
     let mut tx_mgr = mvcc.tx_manager.lock();
-    tx_mgr.record_write(handle.tx.txid, format!("edge:{src}:{etype}:{dst}"));
+    tx_mgr.record_write(handle.tx.txid, TxKey::Edge { src, etype, dst });
   }
 
   Ok(true)
@@ -160,7 +160,7 @@ pub fn edge_exists(handle: &TxHandle, src: NodeId, etype: ETypeId, dst: NodeId) 
     let txid = handle.tx.txid;
     {
       let mut tx_mgr = mvcc.tx_manager.lock();
-      tx_mgr.record_read(txid, format!("edge:{src}:{etype}:{dst}"));
+      tx_mgr.record_read(txid, TxKey::Edge { src, etype, dst });
     }
     let vc = mvcc.version_chain.lock();
     if let Some(version) = vc.get_edge_version(src, etype, dst) {
@@ -462,10 +462,13 @@ pub fn get_neighbors_out(handle: &TxHandle, src: NodeId, etype: Option<ETypeId>)
 
   if let Some(mvcc) = handle.db.mvcc.as_ref() {
     let mut tx_mgr = mvcc.tx_manager.lock();
-    let etype_key = etype
-      .map(|e| e.to_string())
-      .unwrap_or_else(|| "*".to_string());
-    tx_mgr.record_read(handle.tx.txid, format!("neighbors_out:{src}:{etype_key}"));
+    tx_mgr.record_read(
+      handle.tx.txid,
+      TxKey::NeighborsOut {
+        node_id: src,
+        etype,
+      },
+    );
   }
 
   neighbors
@@ -498,10 +501,13 @@ pub fn get_neighbors_in(handle: &TxHandle, dst: NodeId, etype: Option<ETypeId>) 
 
   if let Some(mvcc) = handle.db.mvcc.as_ref() {
     let mut tx_mgr = mvcc.tx_manager.lock();
-    let etype_key = etype
-      .map(|e| e.to_string())
-      .unwrap_or_else(|| "*".to_string());
-    tx_mgr.record_read(handle.tx.txid, format!("neighbors_in:{dst}:{etype_key}"));
+    tx_mgr.record_read(
+      handle.tx.txid,
+      TxKey::NeighborsIn {
+        node_id: dst,
+        etype,
+      },
+    );
   }
 
   neighbors
@@ -535,7 +541,12 @@ pub fn set_edge_prop(
     let mut tx_mgr = mvcc.tx_manager.lock();
     tx_mgr.record_write(
       handle.tx.txid,
-      format!("edgeprop:{src}:{etype}:{dst}:{key_id}"),
+      TxKey::EdgeProp {
+        src,
+        etype,
+        dst,
+        key_id,
+      },
     );
   }
 
@@ -565,7 +576,12 @@ pub fn del_edge_prop(
     let mut tx_mgr = mvcc.tx_manager.lock();
     tx_mgr.record_write(
       handle.tx.txid,
-      format!("edgeprop:{src}:{etype}:{dst}:{key_id}"),
+      TxKey::EdgeProp {
+        src,
+        etype,
+        dst,
+        key_id,
+      },
     );
   }
 
@@ -591,7 +607,15 @@ pub fn get_edge_prop(
     let txid = handle.tx.txid;
     {
       let mut tx_mgr = mvcc.tx_manager.lock();
-      tx_mgr.record_read(txid, format!("edgeprop:{src}:{etype}:{dst}:{key_id}"));
+      tx_mgr.record_read(
+        txid,
+        TxKey::EdgeProp {
+          src,
+          etype,
+          dst,
+          key_id,
+        },
+      );
     }
     let vc = mvcc.version_chain.lock();
     if let Some(prop_version) = vc.get_edge_prop_version(src, etype, dst, key_id) {

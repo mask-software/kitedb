@@ -198,8 +198,7 @@ impl SingleFileDB {
     let delta = self.delta.read();
     let snapshot = self.snapshot.read();
     let mut edges = Vec::new();
-    let mut read_srcs =
-      (self.mvcc.is_some() && txid != 0).then(|| HashSet::<NodeId>::new());
+    let mut read_srcs = (self.mvcc.is_some() && txid != 0).then(|| HashSet::<NodeId>::new());
 
     // From snapshot
     if let Some(ref snap) = *snapshot {
@@ -357,11 +356,23 @@ impl SingleFileDB {
       let mut tx_mgr = mvcc.tx_manager.lock();
       if let Some(filter_etype) = etype_filter {
         for src in srcs {
-          tx_mgr.record_read(txid, format!("neighbors_out:{src}:{filter_etype}"));
+          tx_mgr.record_read(
+            txid,
+            TxKey::NeighborsOut {
+              node_id: src,
+              etype: Some(filter_etype),
+            },
+          );
         }
       } else {
         for src in srcs {
-          tx_mgr.record_read(txid, format!("neighbors_out:{src}:*"));
+          tx_mgr.record_read(
+            txid,
+            TxKey::NeighborsOut {
+              node_id: src,
+              etype: None,
+            },
+          );
         }
       }
     }

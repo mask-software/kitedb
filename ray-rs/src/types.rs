@@ -6,6 +6,7 @@
 use napi_derive::napi;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fmt;
 
 // ============================================================================
 // Public (stable) IDs - never reused in v1
@@ -617,6 +618,68 @@ impl TxState {
 // MVCC Types
 // ============================================================================
 
+/// MVCC conflict key
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TxKey {
+  Node(NodeId),
+  Edge {
+    src: NodeId,
+    etype: ETypeId,
+    dst: NodeId,
+  },
+  NodeProp {
+    node_id: NodeId,
+    key_id: PropKeyId,
+  },
+  EdgeProp {
+    src: NodeId,
+    etype: ETypeId,
+    dst: NodeId,
+    key_id: PropKeyId,
+  },
+  Key(std::sync::Arc<str>),
+  NeighborsOut {
+    node_id: NodeId,
+    etype: Option<ETypeId>,
+  },
+  NeighborsIn {
+    node_id: NodeId,
+    etype: Option<ETypeId>,
+  },
+  NodeLabels(NodeId),
+  NodeLabel {
+    node_id: NodeId,
+    label_id: LabelId,
+  },
+}
+
+impl fmt::Display for TxKey {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      TxKey::Node(node_id) => write!(f, "node:{node_id}"),
+      TxKey::Edge { src, etype, dst } => write!(f, "edge:{src}:{etype}:{dst}"),
+      TxKey::NodeProp { node_id, key_id } => write!(f, "nodeprop:{node_id}:{key_id}"),
+      TxKey::EdgeProp {
+        src,
+        etype,
+        dst,
+        key_id,
+      } => write!(f, "edgeprop:{src}:{etype}:{dst}:{key_id}"),
+      TxKey::Key(key) => write!(f, "key:{key}"),
+      TxKey::NeighborsOut { node_id, etype } => match etype {
+        Some(etype) => write!(f, "neighbors_out:{node_id}:{etype}"),
+        None => write!(f, "neighbors_out:{node_id}:*"),
+      },
+      TxKey::NeighborsIn { node_id, etype } => match etype {
+        Some(etype) => write!(f, "neighbors_in:{node_id}:{etype}"),
+        None => write!(f, "neighbors_in:{node_id}:*"),
+      },
+      TxKey::NodeLabels(node_id) => write!(f, "nodelabels:{node_id}"),
+      TxKey::NodeLabel { node_id, label_id } => write!(f, "nodelabel:{node_id}:{label_id}"),
+    }
+  }
+}
+
 /// MVCC transaction metadata
 #[derive(Debug, Clone)]
 pub struct MvccTransaction {
@@ -624,8 +687,8 @@ pub struct MvccTransaction {
   pub start_ts: Timestamp,
   pub commit_ts: Option<Timestamp>,
   pub status: MvccTxStatus,
-  pub read_set: HashSet<String>,
-  pub write_set: HashSet<String>,
+  pub read_set: HashSet<TxKey>,
+  pub write_set: HashSet<TxKey>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

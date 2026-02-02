@@ -41,9 +41,9 @@ impl SingleFileDB {
 
     if let Some(mvcc) = self.mvcc.as_ref() {
       let mut tx_mgr = mvcc.tx_manager.lock();
-      tx_mgr.record_write(txid, format!("node:{node_id}"));
+      tx_mgr.record_write(txid, TxKey::Node(node_id));
       if let Some(key) = key {
-        tx_mgr.record_write(txid, format!("key:{key}"));
+        tx_mgr.record_write(txid, TxKey::Key(key.into()));
       }
     }
 
@@ -78,9 +78,9 @@ impl SingleFileDB {
 
     if let Some(mvcc) = self.mvcc.as_ref() {
       let mut tx_mgr = mvcc.tx_manager.lock();
-      tx_mgr.record_write(txid, format!("node:{node_id}"));
+      tx_mgr.record_write(txid, TxKey::Node(node_id));
       if let Some(key) = key {
-        tx_mgr.record_write(txid, format!("key:{key}"));
+        tx_mgr.record_write(txid, TxKey::Key(key.into()));
       }
     }
 
@@ -124,12 +124,24 @@ impl SingleFileDB {
 
     if let Some(mvcc) = self.mvcc.as_ref() {
       let mut tx_mgr = mvcc.tx_manager.lock();
-      tx_mgr.record_write(txid, format!("node:{node_id}"));
-      tx_mgr.record_write(txid, format!("neighbors_out:{node_id}:*"));
-      tx_mgr.record_write(txid, format!("neighbors_in:{node_id}:*"));
-      tx_mgr.record_write(txid, format!("nodelabels:{node_id}"));
+      tx_mgr.record_write(txid, TxKey::Node(node_id));
+      tx_mgr.record_write(
+        txid,
+        TxKey::NeighborsOut {
+          node_id,
+          etype: None,
+        },
+      );
+      tx_mgr.record_write(
+        txid,
+        TxKey::NeighborsIn {
+          node_id,
+          etype: None,
+        },
+      );
+      tx_mgr.record_write(txid, TxKey::NodeLabels(node_id));
       if let Some(key) = key_to_record.as_ref() {
-        tx_mgr.record_write(txid, format!("key:{key}"));
+        tx_mgr.record_write(txid, TxKey::Key(key.as_str().into()));
       }
     }
 
@@ -163,11 +175,35 @@ impl SingleFileDB {
 
     if let Some(mvcc) = self.mvcc.as_ref() {
       let mut tx_mgr = mvcc.tx_manager.lock();
-      tx_mgr.record_write(txid, format!("edge:{src}:{etype}:{dst}"));
-      tx_mgr.record_write(txid, format!("neighbors_out:{src}:*"));
-      tx_mgr.record_write(txid, format!("neighbors_in:{dst}:*"));
-      tx_mgr.record_write(txid, format!("neighbors_out:{src}:{etype}"));
-      tx_mgr.record_write(txid, format!("neighbors_in:{dst}:{etype}"));
+      tx_mgr.record_write(txid, TxKey::Edge { src, etype, dst });
+      tx_mgr.record_write(
+        txid,
+        TxKey::NeighborsOut {
+          node_id: src,
+          etype: None,
+        },
+      );
+      tx_mgr.record_write(
+        txid,
+        TxKey::NeighborsIn {
+          node_id: dst,
+          etype: None,
+        },
+      );
+      tx_mgr.record_write(
+        txid,
+        TxKey::NeighborsOut {
+          node_id: src,
+          etype: Some(etype),
+        },
+      );
+      tx_mgr.record_write(
+        txid,
+        TxKey::NeighborsIn {
+          node_id: dst,
+          etype: Some(etype),
+        },
+      );
     }
 
     // Invalidate cache (traversal cache for both src and dst)
@@ -202,11 +238,35 @@ impl SingleFileDB {
 
     if let Some(mvcc) = self.mvcc.as_ref() {
       let mut tx_mgr = mvcc.tx_manager.lock();
-      tx_mgr.record_write(txid, format!("edge:{src}:{etype}:{dst}"));
-      tx_mgr.record_write(txid, format!("neighbors_out:{src}:*"));
-      tx_mgr.record_write(txid, format!("neighbors_in:{dst}:*"));
-      tx_mgr.record_write(txid, format!("neighbors_out:{src}:{etype}"));
-      tx_mgr.record_write(txid, format!("neighbors_in:{dst}:{etype}"));
+      tx_mgr.record_write(txid, TxKey::Edge { src, etype, dst });
+      tx_mgr.record_write(
+        txid,
+        TxKey::NeighborsOut {
+          node_id: src,
+          etype: None,
+        },
+      );
+      tx_mgr.record_write(
+        txid,
+        TxKey::NeighborsIn {
+          node_id: dst,
+          etype: None,
+        },
+      );
+      tx_mgr.record_write(
+        txid,
+        TxKey::NeighborsOut {
+          node_id: src,
+          etype: Some(etype),
+        },
+      );
+      tx_mgr.record_write(
+        txid,
+        TxKey::NeighborsIn {
+          node_id: dst,
+          etype: Some(etype),
+        },
+      );
     }
 
     // Invalidate cache
@@ -269,7 +329,7 @@ impl SingleFileDB {
 
     if let Some(mvcc) = self.mvcc.as_ref() {
       let mut tx_mgr = mvcc.tx_manager.lock();
-      tx_mgr.record_write(txid, format!("nodeprop:{node_id}:{key_id}"));
+      tx_mgr.record_write(txid, TxKey::NodeProp { node_id, key_id });
     }
 
     // Invalidate cache
@@ -309,7 +369,7 @@ impl SingleFileDB {
 
     if let Some(mvcc) = self.mvcc.as_ref() {
       let mut tx_mgr = mvcc.tx_manager.lock();
-      tx_mgr.record_write(txid, format!("nodeprop:{node_id}:{key_id}"));
+      tx_mgr.record_write(txid, TxKey::NodeProp { node_id, key_id });
     }
 
     // Invalidate cache
@@ -344,14 +404,20 @@ impl SingleFileDB {
     // Update pending delta
     {
       let mut tx = tx_handle.lock();
-      tx
-        .pending
-        .set_edge_prop(src, etype, dst, key_id, value);
+      tx.pending.set_edge_prop(src, etype, dst, key_id, value);
     }
 
     if let Some(mvcc) = self.mvcc.as_ref() {
       let mut tx_mgr = mvcc.tx_manager.lock();
-      tx_mgr.record_write(txid, format!("edgeprop:{src}:{etype}:{dst}:{key_id}"));
+      tx_mgr.record_write(
+        txid,
+        TxKey::EdgeProp {
+          src,
+          etype,
+          dst,
+          key_id,
+        },
+      );
     }
 
     // Invalidate cache
@@ -399,7 +465,15 @@ impl SingleFileDB {
 
     if let Some(mvcc) = self.mvcc.as_ref() {
       let mut tx_mgr = mvcc.tx_manager.lock();
-      tx_mgr.record_write(txid, format!("edgeprop:{src}:{etype}:{dst}:{key_id}"));
+      tx_mgr.record_write(
+        txid,
+        TxKey::EdgeProp {
+          src,
+          etype,
+          dst,
+          key_id,
+        },
+      );
     }
 
     // Invalidate cache
@@ -432,9 +506,9 @@ impl SingleFileDB {
 
     if let Some(mvcc) = self.mvcc.as_ref() {
       let mut tx_mgr = mvcc.tx_manager.lock();
-      tx_mgr.record_write(txid, format!("node:{node_id}"));
-      tx_mgr.record_write(txid, format!("nodelabels:{node_id}"));
-      tx_mgr.record_write(txid, format!("nodelabel:{node_id}:{label_id}"));
+      tx_mgr.record_write(txid, TxKey::Node(node_id));
+      tx_mgr.record_write(txid, TxKey::NodeLabels(node_id));
+      tx_mgr.record_write(txid, TxKey::NodeLabel { node_id, label_id });
     }
 
     // Invalidate cache (label changes affect node)
@@ -469,9 +543,9 @@ impl SingleFileDB {
 
     if let Some(mvcc) = self.mvcc.as_ref() {
       let mut tx_mgr = mvcc.tx_manager.lock();
-      tx_mgr.record_write(txid, format!("node:{node_id}"));
-      tx_mgr.record_write(txid, format!("nodelabels:{node_id}"));
-      tx_mgr.record_write(txid, format!("nodelabel:{node_id}:{label_id}"));
+      tx_mgr.record_write(txid, TxKey::Node(node_id));
+      tx_mgr.record_write(txid, TxKey::NodeLabels(node_id));
+      tx_mgr.record_write(txid, TxKey::NodeLabel { node_id, label_id });
     }
 
     // Invalidate cache (label changes affect node)

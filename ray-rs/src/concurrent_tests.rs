@@ -54,7 +54,7 @@ mod tests {
   use std::time::{Duration, Instant};
   use tempfile::tempdir;
 
-  use crate::api::kite::{EdgeDef, NodeDef, PropDef, Kite, KiteOptions};
+  use crate::api::kite::{EdgeDef, Kite, KiteOptions, NodeDef, PropDef};
   use crate::core::single_file::{open_single_file, SingleFileOpenOptions};
   use crate::error::KiteError;
   use crate::graph::db::{open_graph_db, OpenOptions};
@@ -64,11 +64,15 @@ mod tests {
   use crate::graph::nodes::{create_node, upsert_node_with_props, NodeOpts};
   use crate::graph::tx::{begin_tx, commit, rollback};
   use crate::mvcc::{ConflictDetector, TxManager};
-  use crate::types::{PropKeyId, PropValue};
+  use crate::types::{PropKeyId, PropValue, TxKey};
 
   // ============================================================================
   // Test Helpers
   // ============================================================================
+
+  fn key(name: &str) -> TxKey {
+    TxKey::Key(std::sync::Arc::from(name))
+  }
 
   fn create_test_schema() -> KiteOptions {
     let user = NodeDef::new("User", "user:")
@@ -762,8 +766,8 @@ mod tests {
     let (txid2, _) = tx_mgr.begin_tx();
 
     // They write to different keys
-    tx_mgr.record_write(txid1, "key_a".to_string());
-    tx_mgr.record_write(txid2, "key_b".to_string());
+    tx_mgr.record_write(txid1, key("key_a"));
+    tx_mgr.record_write(txid2, key("key_b"));
 
     // Both should commit without conflict
     assert!(
@@ -789,8 +793,8 @@ mod tests {
     let (txid2, _) = tx_mgr.begin_tx();
 
     // Both write to same key
-    tx_mgr.record_write(txid1, "shared_key".to_string());
-    tx_mgr.record_write(txid2, "shared_key".to_string());
+    tx_mgr.record_write(txid1, key("shared_key"));
+    tx_mgr.record_write(txid2, key("shared_key"));
 
     // First commits
     assert!(detector.validate_commit(&tx_mgr, txid1).is_ok());
@@ -813,8 +817,8 @@ mod tests {
     let (txid2, _) = tx_mgr.begin_tx();
 
     // Tx1 writes, Tx2 reads the same key
-    tx_mgr.record_write(txid1, "key".to_string());
-    tx_mgr.record_read(txid2, "key".to_string());
+    tx_mgr.record_write(txid1, key("key"));
+    tx_mgr.record_read(txid2, key("key"));
 
     // Tx1 commits first
     tx_mgr.commit_tx(txid1).unwrap();
@@ -834,7 +838,7 @@ mod tests {
 
     // First, establish some data
     let (setup_tx, _) = tx_mgr.begin_tx();
-    tx_mgr.record_write(setup_tx, "data".to_string());
+    tx_mgr.record_write(setup_tx, key("data"));
     tx_mgr.commit_tx(setup_tx).unwrap();
 
     // Start many concurrent read transactions
@@ -842,7 +846,7 @@ mod tests {
     let reader_txids: Vec<_> = (0..num_readers)
       .map(|_| {
         let (txid, _) = tx_mgr.begin_tx();
-        tx_mgr.record_read(txid, "data".to_string());
+        tx_mgr.record_read(txid, key("data"));
         txid
       })
       .collect();
@@ -865,7 +869,7 @@ mod tests {
 
     for i in 0..5 {
       let (txid, _) = tx_mgr.begin_tx();
-      tx_mgr.record_write(txid, "key".to_string());
+      tx_mgr.record_write(txid, key("key"));
 
       assert!(
         detector.validate_commit(&tx_mgr, txid).is_ok(),
@@ -883,20 +887,20 @@ mod tests {
     let (txid1, _) = tx_mgr.begin_tx();
     let (txid2, _) = tx_mgr.begin_tx();
 
-    tx_mgr.record_write(txid1, "conflict_key".to_string());
-    tx_mgr.record_write(txid2, "conflict_key".to_string());
-    tx_mgr.record_write(txid2, "ok_key".to_string());
+    tx_mgr.record_write(txid1, key("conflict_key"));
+    tx_mgr.record_write(txid2, key("conflict_key"));
+    tx_mgr.record_write(txid2, key("ok_key"));
 
     tx_mgr.commit_tx(txid1).unwrap();
 
     let conflicts = detector.check_conflicts(&tx_mgr, txid2);
     assert!(!conflicts.is_empty(), "Should detect conflicts");
     assert!(
-      conflicts.contains(&"conflict_key".to_string()),
+      conflicts.contains(&key("conflict_key").to_string()),
       "Should identify conflicting key"
     );
     assert!(
-      !conflicts.contains(&"ok_key".to_string()),
+      !conflicts.contains(&key("ok_key").to_string()),
       "Non-conflicting key should not be reported"
     );
   }

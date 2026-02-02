@@ -88,9 +88,9 @@ pub fn create_node(handle: &mut TxHandle, opts: NodeOpts) -> Result<NodeId> {
 
   if let Some(mvcc) = handle.db.mvcc.as_ref() {
     let mut tx_mgr = mvcc.tx_manager.lock();
-    tx_mgr.record_write(handle.tx.txid, format!("node:{node_id}"));
+    tx_mgr.record_write(handle.tx.txid, TxKey::Node(node_id));
     if let Some(key) = &key_for_mvcc {
-      tx_mgr.record_write(handle.tx.txid, format!("key:{key}"));
+      tx_mgr.record_write(handle.tx.txid, TxKey::Key(key.as_str().into()));
     }
   }
 
@@ -149,9 +149,9 @@ pub fn create_node_with_id(
 
   if let Some(mvcc) = handle.db.mvcc.as_ref() {
     let mut tx_mgr = mvcc.tx_manager.lock();
-    tx_mgr.record_write(handle.tx.txid, format!("node:{node_id}"));
+    tx_mgr.record_write(handle.tx.txid, TxKey::Node(node_id));
     if let Some(key) = &key_for_mvcc {
-      tx_mgr.record_write(handle.tx.txid, format!("key:{key}"));
+      tx_mgr.record_write(handle.tx.txid, TxKey::Key(key.as_str().into()));
     }
   }
 
@@ -274,7 +274,7 @@ pub fn delete_node(handle: &mut TxHandle, node_id: NodeId) -> Result<bool> {
 
   if let Some(mvcc) = handle.db.mvcc.as_ref() {
     let mut tx_mgr = mvcc.tx_manager.lock();
-    tx_mgr.record_write(handle.tx.txid, format!("node:{node_id}"));
+    tx_mgr.record_write(handle.tx.txid, TxKey::Node(node_id));
   }
 
   Ok(true)
@@ -294,7 +294,7 @@ pub fn node_exists(handle: &TxHandle, node_id: NodeId) -> bool {
     let txid = handle.tx.txid;
     {
       let mut tx_mgr = mvcc.tx_manager.lock();
-      tx_mgr.record_read(txid, format!("node:{node_id}"));
+      tx_mgr.record_read(txid, TxKey::Node(node_id));
     }
     let vc = mvcc.version_chain.lock();
     if let Some(version) = vc.get_node_version(node_id) {
@@ -506,7 +506,7 @@ pub fn add_node_label(handle: &mut TxHandle, node_id: NodeId, label_id: LabelId)
 
   if let Some(mvcc) = handle.db.mvcc.as_ref() {
     let mut tx_mgr = mvcc.tx_manager.lock();
-    tx_mgr.record_write(handle.tx.txid, format!("node:{node_id}"));
+    tx_mgr.record_write(handle.tx.txid, TxKey::Node(node_id));
   }
 
   Ok(())
@@ -539,7 +539,7 @@ pub fn remove_node_label(handle: &mut TxHandle, node_id: NodeId, label_id: Label
 
   if let Some(mvcc) = handle.db.mvcc.as_ref() {
     let mut tx_mgr = mvcc.tx_manager.lock();
-    tx_mgr.record_write(handle.tx.txid, format!("node:{node_id}"));
+    tx_mgr.record_write(handle.tx.txid, TxKey::Node(node_id));
   }
 
   Ok(())
@@ -644,7 +644,7 @@ pub fn set_node_prop(
 
   if let Some(mvcc) = handle.db.mvcc.as_ref() {
     let mut tx_mgr = mvcc.tx_manager.lock();
-    tx_mgr.record_write(handle.tx.txid, format!("nodeprop:{node_id}:{key_id}"));
+    tx_mgr.record_write(handle.tx.txid, TxKey::NodeProp { node_id, key_id });
   }
 
   Ok(())
@@ -661,7 +661,7 @@ pub fn del_node_prop(handle: &mut TxHandle, node_id: NodeId, key_id: PropKeyId) 
 
   if let Some(mvcc) = handle.db.mvcc.as_ref() {
     let mut tx_mgr = mvcc.tx_manager.lock();
-    tx_mgr.record_write(handle.tx.txid, format!("nodeprop:{node_id}:{key_id}"));
+    tx_mgr.record_write(handle.tx.txid, TxKey::NodeProp { node_id, key_id });
   }
 
   Ok(())
@@ -684,7 +684,7 @@ pub fn get_node_prop(handle: &TxHandle, node_id: NodeId, key_id: PropKeyId) -> O
     let txid = handle.tx.txid;
     {
       let mut tx_mgr = mvcc.tx_manager.lock();
-      tx_mgr.record_read(txid, format!("nodeprop:{node_id}:{key_id}"));
+      tx_mgr.record_read(txid, TxKey::NodeProp { node_id, key_id });
     }
     let vc = mvcc.version_chain.lock();
     if let Some(prop_version) = vc.get_node_prop_version(node_id, key_id) {
@@ -724,7 +724,7 @@ pub fn get_node_by_key(handle: &TxHandle, key: &str) -> Option<NodeId> {
 
   if let Some(mvcc) = handle.db.mvcc.as_ref() {
     let mut tx_mgr = mvcc.tx_manager.lock();
-    tx_mgr.record_read(handle.tx.txid, format!("key:{key}"));
+    tx_mgr.record_read(handle.tx.txid, TxKey::Key(key.into()));
   }
 
   get_node_by_key_db(handle.db, key)
