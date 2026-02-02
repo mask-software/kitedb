@@ -35,7 +35,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::api::kite::{BatchOp, EdgeDef, Kite as RustKite, KiteOptions, NodeDef};
-use crate::api::traversal::TraversalBuilder;
 use crate::types::NodeId;
 
 use super::database::{CheckResult, DbStats, MvccStats};
@@ -910,7 +909,10 @@ impl Kite {
   pub fn from(&self, node_id: i64) -> Result<KiteTraversal> {
     Ok(KiteTraversal {
       ray: self.inner.clone(),
-      builder: TraversalBuilder::new(vec![node_id as NodeId]),
+      start_nodes: vec![node_id as NodeId],
+      steps: kite_traversal::StepChain::default(),
+      limit: None,
+      selected_props: None,
       where_edge: None,
       where_node: None,
     })
@@ -921,7 +923,10 @@ impl Kite {
   pub fn from_nodes(&self, node_ids: Vec<i64>) -> Result<KiteTraversal> {
     Ok(KiteTraversal {
       ray: self.inner.clone(),
-      builder: TraversalBuilder::new(node_ids.into_iter().map(|id| id as NodeId).collect()),
+      start_nodes: node_ids.into_iter().map(|id| id as NodeId).collect(),
+      steps: kite_traversal::StepChain::default(),
+      limit: None,
+      selected_props: None,
       where_edge: None,
       where_node: None,
     })

@@ -302,6 +302,10 @@ impl TraversalBuilder {
     Self::new(vec![node_id])
   }
 
+  pub(crate) fn push_step(&mut self, step: TraversalStep) {
+    self.steps.push(step);
+  }
+
   /// Add an outgoing edge traversal step
   pub fn out(mut self, etype: Option<ETypeId>) -> Self {
     self.steps.push(TraversalStep::SingleHop {
