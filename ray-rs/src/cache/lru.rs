@@ -155,6 +155,7 @@ impl<K: Hash + Eq + Clone, V> LruCache<K, V> {
   pub fn set(&mut self, key: K, value: V) {
     if let Some(&node_ptr) = self.map.get(&key) {
       // Update existing value and move to front
+      // SAFETY: node_ptr is valid and owned by this cache.
       unsafe {
         (*node_ptr.as_ptr()).value = value;
       }
@@ -183,6 +184,7 @@ impl<K: Hash + Eq + Clone, V> LruCache<K, V> {
   pub fn insert(&mut self, key: K, value: V) -> Option<V> {
     if let Some(&node_ptr) = self.map.get(&key) {
       // Update existing value and move to front
+      // SAFETY: node_ptr is valid and owned by this cache.
       let old_value = unsafe {
         let node = &mut *node_ptr.as_ptr();
         std::mem::replace(&mut node.value, value)
@@ -266,6 +268,7 @@ impl<K: Hash + Eq + Clone, V> LruCache<K, V> {
     // Free all nodes
     let mut current = self.head;
     while let Some(node_ptr) = current {
+      // SAFETY: nodes in the list are valid until freed here.
       unsafe {
         current = (*node_ptr.as_ptr()).next;
         let _ = Box::from_raw(node_ptr.as_ptr());
@@ -309,6 +312,7 @@ impl<K: Hash + Eq + Clone, V> LruCache<K, V> {
 
   /// Push a node to the front of the list
   fn push_front(&mut self, node_ptr: NonNull<LruNode<K, V>>) {
+    // SAFETY: node_ptr is valid and not currently in the list.
     unsafe {
       let node = node_ptr.as_ptr();
       (*node).prev = None;
@@ -341,6 +345,7 @@ impl<K: Hash + Eq + Clone, V> LruCache<K, V> {
 
   /// Remove a node from the linked list (but don't free it)
   fn remove_node(&mut self, node_ptr: NonNull<LruNode<K, V>>) {
+    // SAFETY: node_ptr is valid and currently linked in this list.
     unsafe {
       let node = node_ptr.as_ptr();
       let prev = (*node).prev;
@@ -368,6 +373,7 @@ impl<K: Hash + Eq + Clone, V> LruCache<K, V> {
   /// Evict the least recently used item (tail of the list)
   fn evict(&mut self) {
     if let Some(tail_ptr) = self.tail {
+      // SAFETY: tail_ptr is valid and owned by this cache.
       unsafe {
         let key = (*tail_ptr.as_ptr()).key.clone();
         self.remove_node(tail_ptr);
@@ -402,10 +408,13 @@ impl<'a, K: Hash + Eq + Clone, V> Iterator for LruIter<'a, K, V> {
   type Item = (&'a K, &'a V);
 
   fn next(&mut self) -> Option<Self::Item> {
-    self.current.map(|node_ptr| unsafe {
-      let node = node_ptr.as_ptr();
-      self.current = (*node).next;
-      (&(*node).key, &(*node).value)
+    self.current.map(|node_ptr| {
+      // SAFETY: iterator holds &LruCache, preventing mutation during iteration.
+      unsafe {
+        let node = node_ptr.as_ptr();
+        self.current = (*node).next;
+        (&(*node).key, &(*node).value)
+      }
     })
   }
 }

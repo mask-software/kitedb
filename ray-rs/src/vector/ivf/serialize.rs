@@ -135,6 +135,25 @@ fn ensure_bytes(
   Ok(())
 }
 
+fn read_u32_at(buffer: &[u8], offset: usize, context: &str) -> Result<u32, SerializeError> {
+  ensure_bytes(buffer.len(), offset, 4, context)?;
+  let mut bytes = [0u8; 4];
+  bytes.copy_from_slice(&buffer[offset..offset + 4]);
+  Ok(u32::from_le_bytes(bytes))
+}
+
+fn read_u64_at(buffer: &[u8], offset: usize, context: &str) -> Result<u64, SerializeError> {
+  ensure_bytes(buffer.len(), offset, 8, context)?;
+  let mut bytes = [0u8; 8];
+  bytes.copy_from_slice(&buffer[offset..offset + 8]);
+  Ok(u64::from_le_bytes(bytes))
+}
+
+fn read_f32_at(buffer: &[u8], offset: usize, context: &str) -> Result<f32, SerializeError> {
+  let bits = read_u32_at(buffer, offset, context)?;
+  Ok(f32::from_bits(bits))
+}
+
 // ============================================================================
 // IVF Index Serialization
 // ============================================================================
@@ -218,7 +237,7 @@ pub fn deserialize_ivf(buffer: &[u8]) -> Result<IvfIndex, SerializeError> {
   let mut offset = 0;
 
   // Header
-  let magic = u32::from_le_bytes(buffer[offset..offset + 4].try_into().unwrap());
+  let magic = read_u32_at(buffer, offset, "IVF magic")?;
   offset += 4;
   if magic != IVF_MAGIC {
     return Err(SerializeError::InvalidMagic {
@@ -227,11 +246,11 @@ pub fn deserialize_ivf(buffer: &[u8]) -> Result<IvfIndex, SerializeError> {
     });
   }
 
-  let n_clusters = u32::from_le_bytes(buffer[offset..offset + 4].try_into().unwrap()) as usize;
+  let n_clusters = read_u32_at(buffer, offset, "IVF n_clusters")? as usize;
   offset += 4;
-  let dimensions = u32::from_le_bytes(buffer[offset..offset + 4].try_into().unwrap()) as usize;
+  let dimensions = read_u32_at(buffer, offset, "IVF dimensions")? as usize;
   offset += 4;
-  let n_probe = u32::from_le_bytes(buffer[offset..offset + 4].try_into().unwrap()) as usize;
+  let n_probe = read_u32_at(buffer, offset, "IVF n_probe")? as usize;
   offset += 4;
   let trained = buffer[offset] == 1;
   offset += 1;
@@ -248,7 +267,7 @@ pub fn deserialize_ivf(buffer: &[u8]) -> Result<IvfIndex, SerializeError> {
 
   // Centroid count + Centroids
   ensure_bytes(buf_len, offset, 4, "IVF centroid count")?;
-  let centroid_count = u32::from_le_bytes(buffer[offset..offset + 4].try_into().unwrap()) as usize;
+  let centroid_count = read_u32_at(buffer, offset, "IVF centroid count")? as usize;
   offset += 4;
 
   let centroids_size = centroid_count * 4;
@@ -256,23 +275,23 @@ pub fn deserialize_ivf(buffer: &[u8]) -> Result<IvfIndex, SerializeError> {
 
   let mut centroids = Vec::with_capacity(centroid_count);
   for _ in 0..centroid_count {
-    let val = f32::from_le_bytes(buffer[offset..offset + 4].try_into().unwrap());
+    let val = read_f32_at(buffer, offset, "IVF centroid")?;
     centroids.push(val);
     offset += 4;
   }
 
   // Inverted lists
   ensure_bytes(buf_len, offset, 4, "IVF inverted list count")?;
-  let num_lists = u32::from_le_bytes(buffer[offset..offset + 4].try_into().unwrap()) as usize;
+  let num_lists = read_u32_at(buffer, offset, "IVF inverted list count")? as usize;
   offset += 4;
 
   let mut inverted_lists: HashMap<usize, Vec<u64>> = HashMap::new();
 
   for i in 0..num_lists {
     ensure_bytes(buf_len, offset, 8, &format!("IVF inverted list {i} header"))?;
-    let cluster = u32::from_le_bytes(buffer[offset..offset + 4].try_into().unwrap()) as usize;
+    let cluster = read_u32_at(buffer, offset, "IVF inverted list cluster")? as usize;
     offset += 4;
-    let list_length = u32::from_le_bytes(buffer[offset..offset + 4].try_into().unwrap()) as usize;
+    let list_length = read_u32_at(buffer, offset, "IVF inverted list length")? as usize;
     offset += 4;
 
     ensure_bytes(
@@ -283,7 +302,7 @@ pub fn deserialize_ivf(buffer: &[u8]) -> Result<IvfIndex, SerializeError> {
     )?;
     let mut list = Vec::with_capacity(list_length);
     for _ in 0..list_length {
-      let vector_id = u64::from_le_bytes(buffer[offset..offset + 8].try_into().unwrap());
+      let vector_id = read_u64_at(buffer, offset, "IVF vector id")?;
       list.push(vector_id);
       offset += 8;
     }
@@ -418,7 +437,7 @@ pub fn deserialize_manifest(buffer: &[u8]) -> Result<VectorManifest, SerializeEr
   let mut offset = 0;
 
   // Header
-  let magic = u32::from_le_bytes(buffer[offset..offset + 4].try_into().unwrap());
+  let magic = read_u32_at(buffer, offset, "manifest magic")?;
   offset += 4;
   if magic != MANIFEST_MAGIC {
     return Err(SerializeError::InvalidMagic {
@@ -427,29 +446,26 @@ pub fn deserialize_manifest(buffer: &[u8]) -> Result<VectorManifest, SerializeEr
     });
   }
 
-  let dimensions = u32::from_le_bytes(buffer[offset..offset + 4].try_into().unwrap()) as usize;
+  let dimensions = read_u32_at(buffer, offset, "manifest dimensions")? as usize;
   offset += 4;
-  let metric =
-    u8_to_metric(u32::from_le_bytes(buffer[offset..offset + 4].try_into().unwrap()) as u8)?;
+  let metric = u8_to_metric(read_u32_at(buffer, offset, "manifest metric")? as u8)?;
   offset += 4;
-  let row_group_size = u32::from_le_bytes(buffer[offset..offset + 4].try_into().unwrap()) as usize;
+  let row_group_size = read_u32_at(buffer, offset, "manifest row_group_size")? as usize;
   offset += 4;
-  let fragment_target_size =
-    u32::from_le_bytes(buffer[offset..offset + 4].try_into().unwrap()) as usize;
+  let fragment_target_size = read_u32_at(buffer, offset, "manifest fragment_target_size")? as usize;
   offset += 4;
   let normalize_on_insert = buffer[offset] == 1;
   offset += 1;
   offset += 3; // padding
-  let num_fragments = u32::from_le_bytes(buffer[offset..offset + 4].try_into().unwrap()) as usize;
+  let num_fragments = read_u32_at(buffer, offset, "manifest num_fragments")? as usize;
   offset += 4;
-  let active_fragment_id =
-    u32::from_le_bytes(buffer[offset..offset + 4].try_into().unwrap()) as usize;
+  let active_fragment_id = read_u32_at(buffer, offset, "manifest active_fragment_id")? as usize;
   offset += 4;
-  let total_vectors = u32::from_le_bytes(buffer[offset..offset + 4].try_into().unwrap()) as usize;
+  let total_vectors = read_u32_at(buffer, offset, "manifest total_vectors")? as usize;
   offset += 4;
-  let total_deleted = u32::from_le_bytes(buffer[offset..offset + 4].try_into().unwrap()) as usize;
+  let total_deleted = read_u32_at(buffer, offset, "manifest total_deleted")? as usize;
   offset += 4;
-  let next_vector_id = u64::from_le_bytes(buffer[offset..offset + 8].try_into().unwrap());
+  let next_vector_id = read_u64_at(buffer, offset, "manifest next_vector_id")?;
   offset += 8;
   offset += 20; // reserved
 
@@ -472,7 +488,7 @@ pub fn deserialize_manifest(buffer: &[u8]) -> Result<VectorManifest, SerializeEr
       &format!("fragment {f} header"),
     )?;
 
-    let id = u32::from_le_bytes(buffer[offset..offset + 4].try_into().unwrap()) as usize;
+    let id = read_u32_at(buffer, offset, "fragment id")? as usize;
     offset += 4;
     let state = if buffer[offset] == 0 {
       FragmentState::Active
@@ -481,16 +497,14 @@ pub fn deserialize_manifest(buffer: &[u8]) -> Result<VectorManifest, SerializeEr
     };
     offset += 1;
     offset += 3; // padding
-    let num_row_groups =
-      u32::from_le_bytes(buffer[offset..offset + 4].try_into().unwrap()) as usize;
+    let num_row_groups = read_u32_at(buffer, offset, "fragment num_row_groups")? as usize;
     offset += 4;
-    let frag_total_vectors =
-      u32::from_le_bytes(buffer[offset..offset + 4].try_into().unwrap()) as usize;
+    let frag_total_vectors = read_u32_at(buffer, offset, "fragment total_vectors")? as usize;
     offset += 4;
-    let deleted_count = u32::from_le_bytes(buffer[offset..offset + 4].try_into().unwrap()) as usize;
+    let deleted_count = read_u32_at(buffer, offset, "fragment deleted_count")? as usize;
     offset += 4;
     let deletion_bitmap_length =
-      u32::from_le_bytes(buffer[offset..offset + 4].try_into().unwrap()) as usize;
+      read_u32_at(buffer, offset, "fragment deletion_bitmap_length")? as usize;
     offset += 4;
     offset += 8; // reserved
 
@@ -505,11 +519,11 @@ pub fn deserialize_manifest(buffer: &[u8]) -> Result<VectorManifest, SerializeEr
         &format!("fragment {f} row group {r} header"),
       )?;
 
-      let rg_id = u32::from_le_bytes(buffer[offset..offset + 4].try_into().unwrap()) as usize;
+      let rg_id = read_u32_at(buffer, offset, "row group id")? as usize;
       offset += 4;
-      let count = u32::from_le_bytes(buffer[offset..offset + 4].try_into().unwrap()) as usize;
+      let count = read_u32_at(buffer, offset, "row group count")? as usize;
       offset += 4;
-      let data_length = u32::from_le_bytes(buffer[offset..offset + 4].try_into().unwrap()) as usize;
+      let data_length = read_u32_at(buffer, offset, "row group data_length")? as usize;
       offset += 4;
       offset += 4; // reserved
 
@@ -522,7 +536,7 @@ pub fn deserialize_manifest(buffer: &[u8]) -> Result<VectorManifest, SerializeEr
       )?;
       let mut data = Vec::with_capacity(data_length / 4);
       for _ in 0..(data_length / 4) {
-        let val = f32::from_le_bytes(buffer[offset..offset + 4].try_into().unwrap());
+        let val = read_f32_at(buffer, offset, "row group data")?;
         data.push(val);
         offset += 4;
       }
@@ -543,7 +557,7 @@ pub fn deserialize_manifest(buffer: &[u8]) -> Result<VectorManifest, SerializeEr
     )?;
     let mut deletion_bitmap = Vec::with_capacity(deletion_bitmap_length / 4);
     for _ in 0..(deletion_bitmap_length / 4) {
-      let word = u32::from_le_bytes(buffer[offset..offset + 4].try_into().unwrap());
+      let word = read_u32_at(buffer, offset, "fragment deletion bitmap")?;
       deletion_bitmap.push(word);
       offset += 4;
     }
@@ -560,8 +574,7 @@ pub fn deserialize_manifest(buffer: &[u8]) -> Result<VectorManifest, SerializeEr
 
   // Node ID to Vector ID mapping
   ensure_bytes(buf_len, offset, 4, "node-to-vector mapping count")?;
-  let node_to_vector_count =
-    u32::from_le_bytes(buffer[offset..offset + 4].try_into().unwrap()) as usize;
+  let node_to_vector_count = read_u32_at(buffer, offset, "node-to-vector count")? as usize;
   offset += 4;
 
   ensure_bytes(
@@ -574,9 +587,9 @@ pub fn deserialize_manifest(buffer: &[u8]) -> Result<VectorManifest, SerializeEr
   let mut vector_to_node: HashMap<u64, u64> = HashMap::with_capacity(node_to_vector_count);
 
   for _ in 0..node_to_vector_count {
-    let node_id = u64::from_le_bytes(buffer[offset..offset + 8].try_into().unwrap());
+    let node_id = read_u64_at(buffer, offset, "node-to-vector node_id")?;
     offset += 8;
-    let vector_id = u64::from_le_bytes(buffer[offset..offset + 8].try_into().unwrap());
+    let vector_id = read_u64_at(buffer, offset, "node-to-vector vector_id")?;
     offset += 8;
     node_to_vector.insert(node_id, vector_id);
     vector_to_node.insert(vector_id, node_id);
@@ -584,8 +597,7 @@ pub fn deserialize_manifest(buffer: &[u8]) -> Result<VectorManifest, SerializeEr
 
   // Vector ID to Location mapping
   ensure_bytes(buf_len, offset, 4, "vector-to-location mapping count")?;
-  let vector_to_location_count =
-    u32::from_le_bytes(buffer[offset..offset + 4].try_into().unwrap()) as usize;
+  let vector_to_location_count = read_u32_at(buffer, offset, "vector-to-location count")? as usize;
   offset += 4;
 
   ensure_bytes(
@@ -598,11 +610,11 @@ pub fn deserialize_manifest(buffer: &[u8]) -> Result<VectorManifest, SerializeEr
     HashMap::with_capacity(vector_to_location_count);
 
   for _ in 0..vector_to_location_count {
-    let vector_id = u64::from_le_bytes(buffer[offset..offset + 8].try_into().unwrap());
+    let vector_id = read_u64_at(buffer, offset, "vector-to-location vector_id")?;
     offset += 8;
-    let fragment_id = u32::from_le_bytes(buffer[offset..offset + 4].try_into().unwrap()) as usize;
+    let fragment_id = read_u32_at(buffer, offset, "vector-to-location fragment_id")? as usize;
     offset += 4;
-    let local_index = u32::from_le_bytes(buffer[offset..offset + 4].try_into().unwrap()) as usize;
+    let local_index = read_u32_at(buffer, offset, "vector-to-location local_index")? as usize;
     offset += 4;
     vector_locations.insert(
       vector_id,

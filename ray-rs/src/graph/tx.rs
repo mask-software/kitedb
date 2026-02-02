@@ -152,7 +152,7 @@ pub fn commit(handle: &mut TxHandle) -> Result<()> {
           *node_id,
           NodeVersionData {
             node_id: *node_id,
-            delta: node_delta.clone(),
+            delta: node_delta.for_version(),
           },
           handle.tx.txid,
           commit_ts,

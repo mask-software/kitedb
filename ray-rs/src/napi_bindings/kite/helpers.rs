@@ -194,6 +194,7 @@ pub(crate) fn call_filter(
   arg: Object,
 ) -> Result<bool> {
   let func_value = func_ref.get_value(env)?;
+  // SAFETY: func_ref is expected to reference a JS function.
   let func: Function<Unknown, Unknown> = unsafe { func_value.cast()? };
   let result: Unknown = func.call(arg.into_unknown(env)?)?;
   result.coerce_to_bool()
@@ -252,10 +253,7 @@ pub(crate) fn node_type_from_key(
 // =============================================================================
 
 /// Execute a batch of operations
-pub(crate) fn execute_batch_ops(
-  ray: &mut RustKite,
-  ops: Vec<BatchOp>,
-) -> Result<Vec<BatchResult>> {
+pub(crate) fn execute_batch_ops(ray: &mut RustKite, ops: Vec<BatchOp>) -> Result<Vec<BatchResult>> {
   ray
     .batch(ops)
     .map_err(|e| Error::from_reason(e.to_string()))

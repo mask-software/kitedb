@@ -233,6 +233,7 @@ impl FilePager {
     #[cfg(target_os = "macos")]
     {
       use std::os::unix::io::AsRawFd;
+      // SAFETY: file descriptor is valid for the pager file.
       let result = unsafe { libc::fsync(self.file.as_raw_fd()) };
       if result != 0 {
         return Err(std::io::Error::last_os_error().into());

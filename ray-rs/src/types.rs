@@ -379,6 +379,20 @@ pub struct NodeDelta {
   pub props: Option<HashMap<PropKeyId, Option<PropValue>>>, // None value = deleted
 }
 
+impl NodeDelta {
+  /// Create a minimal clone suitable for MVCC version chains.
+  ///
+  /// Property and label versions are tracked separately, so we only keep the key.
+  pub fn for_version(&self) -> NodeDelta {
+    NodeDelta {
+      key: self.key.clone(),
+      labels: None,
+      labels_deleted: None,
+      props: None,
+    }
+  }
+}
+
 /// Delta state - all uncommitted changes
 #[derive(Debug, Default, Clone)]
 pub struct DeltaState {

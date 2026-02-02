@@ -99,33 +99,18 @@ pub struct KiteInsertExecutorSingle {
 impl KiteInsertExecutorSingle {
   /// Execute the insert without returning
   #[napi]
-  pub fn execute(&self) -> Result<()> {
-    insert_single(
-      &self.ray,
-      &self.node_type,
-      &self.key_suffix,
-      &self.props,
-    )
-    .map(|_| ())
+  pub fn execute(&mut self) -> Result<()> {
+    let props = std::mem::take(&mut self.props);
+    insert_single_execute(&self.ray, &self.node_type, &self.key_suffix, props)
   }
 
   /// Execute the insert and return the node
   #[napi]
-  pub fn returning(&self, env: Env) -> Result<Object> {
-    let node_ref = insert_single(
-      &self.ray,
-      &self.node_type,
-      &self.key_suffix,
-      &self.props,
-    )?;
-    let props = node_ref.1.unwrap_or_default();
-    node_to_js(
-      &env,
-      node_ref.0.id,
-      node_ref.0.key,
-      &node_ref.0.node_type,
-      props,
-    )
+  pub fn returning(&mut self, env: Env) -> Result<Object> {
+    let props = std::mem::take(&mut self.props);
+    let (node_ref, props) =
+      insert_single_returning(&self.ray, &self.node_type, &self.key_suffix, props)?;
+    node_to_js(&env, node_ref.id, node_ref.key, &node_ref.node_type, props)
   }
 }
 
@@ -141,25 +126,17 @@ pub struct KiteInsertExecutorMany {
 impl KiteInsertExecutorMany {
   /// Execute the inserts without returning
   #[napi]
-  pub fn execute(&self) -> Result<()> {
-    let _ = insert_many(
-      &self.ray,
-      &self.node_type,
-      &self.entries,
-      false,
-    )?;
+  pub fn execute(&mut self) -> Result<()> {
+    let entries = std::mem::take(&mut self.entries);
+    let _ = insert_many(&self.ray, &self.node_type, entries, false)?;
     Ok(())
   }
 
   /// Execute the inserts and return nodes
   #[napi]
-  pub fn returning(&self, env: Env) -> Result<Vec<Object>> {
-    let results = insert_many(
-      &self.ray,
-      &self.node_type,
-      &self.entries,
-      true,
-    )?;
+  pub fn returning(&mut self, env: Env) -> Result<Vec<Object>> {
+    let entries = std::mem::take(&mut self.entries);
+    let results = insert_many(&self.ray, &self.node_type, entries, true)?;
     let mut out = Vec::with_capacity(results.len());
     for (node_ref, props) in results.into_iter() {
       let props =
@@ -176,32 +153,53 @@ impl KiteInsertExecutorMany {
   }
 }
 
-fn insert_single(
+fn insert_single_execute(
   ray: &Arc<RwLock<Option<RustKite>>>,
   node_type: &str,
   key_suffix: &str,
-  props: &HashMap<String, PropValue>,
-) -> Result<(NodeRef, Option<HashMap<String, PropValue>>)> {
+  props: HashMap<String, PropValue>,
+) -> Result<()> {
   let mut guard = ray.write();
   let ray = guard
     .as_mut()
     .ok_or_else(|| Error::from_reason("Kite is closed"))?;
 
+  ray
+    .insert(node_type)
+    .map_err(|e| Error::from_reason(e.to_string()))?
+    .values(key_suffix, props)
+    .map_err(|e| Error::from_reason(e.to_string()))?
+    .execute()
+    .map_err(|e| Error::from_reason(e.to_string()))
+}
+
+fn insert_single_returning(
+  ray: &Arc<RwLock<Option<RustKite>>>,
+  node_type: &str,
+  key_suffix: &str,
+  props: HashMap<String, PropValue>,
+) -> Result<(NodeRef, HashMap<String, PropValue>)> {
+  let mut guard = ray.write();
+  let ray = guard
+    .as_mut()
+    .ok_or_else(|| Error::from_reason("Kite is closed"))?;
+
+  let props_for_return = props.clone();
   let node_ref = ray
     .insert(node_type)
     .map_err(|e| Error::from_reason(e.to_string()))?
-    .values(key_suffix, props.clone())
+    .values(key_suffix, props)
     .map_err(|e| Error::from_reason(e.to_string()))?
     .returning()
     .map_err(|e| Error::from_reason(e.to_string()))?;
 
-  Ok((node_ref, Some(props.clone())))
+  Ok((node_ref, props_for_return))
 }
 
 fn insert_many(
   ray: &Arc<RwLock<Option<RustKite>>>,
   node_type: &str,
-  entries: &[(String, HashMap<String, PropValue>)],
+  entries: Vec<(String, HashMap<String, PropValue>)>,
   load_props: bool,
 ) -> Result<Vec<(NodeRef, Option<HashMap<String, PropValue>>)>> {
   if entries.is_empty() {
@@ -214,29 +212,23 @@ fn insert_many(
     .ok_or_else(|| Error::from_reason("Kite is closed"))?;
 
   if !load_props {
-    let items: Vec<(&str, HashMap<String, PropValue>)> = entries
-      .iter()
-      .map(|(key_suffix, props)| (key_suffix.as_str(), props.clone()))
-      .collect();
     ray
       .insert(node_type)
       .map_err(|e| Error::from_reason(e.to_string()))?
-      .values_many(items)
+      .values_many_owned(entries)
       .map_err(|e| Error::from_reason(e.to_string()))?
       .execute()
       .map_err(|e| Error::from_reason(e.to_string()))?;
     return Ok(Vec::new());
   }
 
-  let items: Vec<(&str, HashMap<String, PropValue>)> = entries
-    .iter()
-    .map(|(key_suffix, props)| (key_suffix.as_str(), props.clone()))
-    .collect();
+  let props_for_return: Vec<HashMap<String, PropValue>> =
+    entries.iter().map(|(_, props)| props.clone()).collect();
 
   let node_refs = ray
     .insert(node_type)
     .map_err(|e| Error::from_reason(e.to_string()))?
-    .values_many(items)
+    .values_many_owned(entries)
     .map_err(|e| Error::from_reason(e.to_string()))?
     .returning()
     .map_err(|e| Error::from_reason(e.to_string()))?;
@@ -244,8 +236,8 @@ fn insert_many(
   Ok(
     node_refs
       .into_iter()
-      .zip(entries.iter())
-      .map(|(node_ref, (_, props))| (node_ref, Some(props.clone())))
+      .zip(props_for_return.into_iter())
+      .map(|(node_ref, props)| (node_ref, Some(props)))
       .collect(),
   )
 }
@@ -332,33 +324,18 @@ pub struct KiteUpsertExecutorSingle {
 impl KiteUpsertExecutorSingle {
   /// Execute the upsert without returning
   #[napi]
-  pub fn execute(&self) -> Result<()> {
-    upsert_single(
-      &self.ray,
-      &self.node_type,
-      &self.key_suffix,
-      &self.props,
-    )
-    .map(|_| ())
+  pub fn execute(&mut self) -> Result<()> {
+    let props = std::mem::take(&mut self.props);
+    upsert_single_execute(&self.ray, &self.node_type, &self.key_suffix, props)
   }
 
   /// Execute the upsert and return the node
   #[napi]
-  pub fn returning(&self, env: Env) -> Result<Object> {
-    let (node_ref, props) = upsert_single(
-      &self.ray,
-      &self.node_type,
-      &self.key_suffix,
-      &self.props,
-    )?;
-    let props = props.unwrap_or_default();
-    node_to_js(
-      &env,
-      node_ref.id,
-      node_ref.key,
-      &node_ref.node_type,
-      props,
-    )
+  pub fn returning(&mut self, env: Env) -> Result<Object> {
+    let props = std::mem::take(&mut self.props);
+    let (node_ref, props) =
+      upsert_single_returning(&self.ray, &self.node_type, &self.key_suffix, props)?;
+    node_to_js(&env, node_ref.id, node_ref.key, &node_ref.node_type, props)
   }
 }
 
@@ -374,25 +351,17 @@ pub struct KiteUpsertExecutorMany {
 impl KiteUpsertExecutorMany {
   /// Execute the upserts without returning
   #[napi]
-  pub fn execute(&self) -> Result<()> {
-    let _ = upsert_many(
-      &self.ray,
-      &self.node_type,
-      &self.entries,
-      false,
-    )?;
+  pub fn execute(&mut self) -> Result<()> {
+    let entries = std::mem::take(&mut self.entries);
+    let _ = upsert_many(&self.ray, &self.node_type, entries, false)?;
     Ok(())
   }
 
   /// Execute the upserts and return nodes
   #[napi]
-  pub fn returning(&self, env: Env) -> Result<Vec<Object>> {
-    let results = upsert_many(
-      &self.ray,
-      &self.node_type,
-      &self.entries,
-      true,
-    )?;
+  pub fn returning(&mut self, env: Env) -> Result<Vec<Object>> {
+    let entries = std::mem::take(&mut self.entries);
+    let results = upsert_many(&self.ray, &self.node_type, entries, true)?;
     let mut out = Vec::with_capacity(results.len());
     for (node_ref, props) in results.into_iter() {
       let props =
@@ -409,32 +378,53 @@ impl KiteUpsertExecutorMany {
   }
 }
 
-fn upsert_single(
+fn upsert_single_execute(
   ray: &Arc<RwLock<Option<RustKite>>>,
   node_type: &str,
   key_suffix: &str,
-  props: &HashMap<String, PropValue>,
-) -> Result<(NodeRef, Option<HashMap<String, PropValue>>)> {
+  props: HashMap<String, PropValue>,
+) -> Result<()> {
   let mut guard = ray.write();
   let ray = guard
     .as_mut()
     .ok_or_else(|| Error::from_reason("Kite is closed"))?;
 
+  ray
+    .upsert(node_type)
+    .map_err(|e| Error::from_reason(e.to_string()))?
+    .values(key_suffix, props)
+    .map_err(|e| Error::from_reason(e.to_string()))?
+    .execute()
+    .map_err(|e| Error::from_reason(e.to_string()))
+}
+
+fn upsert_single_returning(
+  ray: &Arc<RwLock<Option<RustKite>>>,
+  node_type: &str,
+  key_suffix: &str,
+  props: HashMap<String, PropValue>,
+) -> Result<(NodeRef, HashMap<String, PropValue>)> {
+  let mut guard = ray.write();
+  let ray = guard
+    .as_mut()
+    .ok_or_else(|| Error::from_reason("Kite is closed"))?;
+
+  let props_for_return = props.clone();
   let node_ref = ray
     .upsert(node_type)
     .map_err(|e| Error::from_reason(e.to_string()))?
-    .values(key_suffix, props.clone())
+    .values(key_suffix, props)
     .map_err(|e| Error::from_reason(e.to_string()))?
     .returning()
     .map_err(|e| Error::from_reason(e.to_string()))?;
 
-  Ok((node_ref, Some(props.clone())))
+  Ok((node_ref, props_for_return))
 }
 
 fn upsert_many(
   ray: &Arc<RwLock<Option<RustKite>>>,
   node_type: &str,
-  entries: &[(String, HashMap<String, PropValue>)],
+  entries: Vec<(String, HashMap<String, PropValue>)>,
   load_props: bool,
 ) -> Result<Vec<(NodeRef, Option<HashMap<String, PropValue>>)>> {
   if entries.is_empty() {
@@ -447,29 +437,23 @@ fn upsert_many(
     .ok_or_else(|| Error::from_reason("Kite is closed"))?;
 
   if !load_props {
-    let items: Vec<(&str, HashMap<String, PropValue>)> = entries
-      .iter()
-      .map(|(key_suffix, props)| (key_suffix.as_str(), props.clone()))
-      .collect();
     ray
       .upsert(node_type)
       .map_err(|e| Error::from_reason(e.to_string()))?
-      .values_many(items)
+      .values_many_owned(entries)
       .map_err(|e| Error::from_reason(e.to_string()))?
       .execute()
       .map_err(|e| Error::from_reason(e.to_string()))?;
     return Ok(Vec::new());
   }
 
-  let items: Vec<(&str, HashMap<String, PropValue>)> = entries
-    .iter()
-    .map(|(key_suffix, props)| (key_suffix.as_str(), props.clone()))
-    .collect();
+  let props_for_return: Vec<HashMap<String, PropValue>> =
+    entries.iter().map(|(_, props)| props.clone()).collect();
 
   let node_refs = ray
     .upsert(node_type)
     .map_err(|e| Error::from_reason(e.to_string()))?
-    .values_many(items)
+    .values_many_owned(entries)
     .map_err(|e| Error::from_reason(e.to_string()))?
     .returning()
     .map_err(|e| Error::from_reason(e.to_string()))?;
@@ -477,8 +461,8 @@ fn upsert_many(
   Ok(
     node_refs
       .into_iter()
-      .zip(entries.iter())
-      .map(|(node_ref, (_, props))| (node_ref, Some(props.clone())))
+      .zip(props_for_return.into_iter())
+      .map(|(node_ref, props)| (node_ref, Some(props)))
       .collect(),
   )
 }
@@ -496,10 +480,7 @@ pub struct KiteUpdateBuilder {
 }
 
 impl KiteUpdateBuilder {
-  pub(crate) fn new(
-    ray: Arc<RwLock<Option<RustKite>>>,
-    node_id: NodeId,
-  ) -> Self {
+  pub(crate) fn new(ray: Arc<RwLock<Option<RustKite>>>, node_id: NodeId) -> Self {
     Self {
       ray,
       node_id,

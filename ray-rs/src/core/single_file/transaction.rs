@@ -85,13 +85,17 @@ impl SingleFileDB {
       current_tx.remove(&tid).ok_or(KiteError::NoTransaction)?
     };
 
-    let tx = { tx_handle.lock().clone() };
+    let (txid, read_only, pending) = {
+      let mut tx = tx_handle.lock();
+      let pending = std::mem::take(&mut tx.pending);
+      (tx.txid, tx.read_only, pending)
+    };
 
-    if tx.read_only {
+    if read_only {
       // Read-only transactions don't need WAL
       if let Some(mvcc) = self.mvcc.as_ref() {
         let mut tx_mgr = mvcc.tx_manager.lock();
-        tx_mgr.abort_tx(tx.txid);
+        tx_mgr.abort_tx(txid);
       }
       return Ok(());
     }
@@ -99,8 +103,8 @@ impl SingleFileDB {
     let mut commit_ts_for_mvcc = None;
     if let Some(mvcc) = self.mvcc.as_ref() {
       let mut tx_mgr = mvcc.tx_manager.lock();
-      if let Err(err) = mvcc.conflict_detector.validate_commit(&tx_mgr, tx.txid) {
-        tx_mgr.abort_tx(tx.txid);
+      if let Err(err) = mvcc.conflict_detector.validate_commit(&tx_mgr, txid) {
+        tx_mgr.abort_tx(txid);
         return Err(KiteError::Conflict {
           txid: err.txid,
           keys: err.conflicting_keys,
@@ -108,18 +112,16 @@ impl SingleFileDB {
       }
 
       let commit_ts = tx_mgr
-        .commit_tx(tx.txid)
+        .commit_tx(txid)
         .map_err(|e| KiteError::Internal(e.to_string()))?;
       commit_ts_for_mvcc = Some((commit_ts, tx_mgr.get_active_count() > 0));
     }
-
-    let pending = tx.pending;
 
     // Serialize commit to preserve WAL ordering without holding the delta lock during I/O.
     let _commit_guard = self.commit_lock.lock();
 
     // Write COMMIT record to WAL
-    let record = WalRecord::new(WalRecordType::Commit, tx.txid, build_commit_payload());
+    let record = WalRecord::new(WalRecordType::Commit, txid, build_commit_payload());
     {
       let mut pager = self.pager.lock();
       let mut wal = self.wal_buffer.lock();
@@ -173,14 +175,12 @@ impl SingleFileDB {
       if has_active_readers {
         let snapshot = self.snapshot.read();
         let mut vc = mvcc.version_chain.lock();
-        let txid = tx.txid;
-
         for (&node_id, node_delta) in &pending.created_nodes {
           vc.append_node_version(
             node_id,
             NodeVersionData {
               node_id,
-              delta: node_delta.clone(),
+              delta: node_delta.for_version(),
             },
             txid,
             commit_ts,
@@ -290,13 +290,7 @@ impl SingleFileDB {
               if vc.get_node_prop_version(*node_id, *key_id).is_none() {
                 vc.append_node_prop_version(*node_id, *key_id, before_value.clone(), 0, 0);
               }
-              vc.append_node_prop_version(
-                *node_id,
-                *key_id,
-                after_value.clone(),
-                txid,
-                commit_ts,
-              );
+              vc.append_node_prop_version(*node_id, *key_id, after_value.clone(), txid, commit_ts);
             }
           }
 
@@ -346,10 +340,7 @@ impl SingleFileDB {
             if before_value == *after_value {
               continue;
             }
-            if vc
-              .get_edge_prop_version(src, etype, dst, *key_id)
-              .is_none()
-            {
+            if vc.get_edge_prop_version(src, etype, dst, *key_id).is_none() {
               vc.append_edge_prop_version(src, etype, dst, *key_id, before_value.clone(), 0, 0);
             }
             vc.append_edge_prop_version(
@@ -366,11 +357,11 @@ impl SingleFileDB {
       }
     }
 
-    merge_pending_delta(&mut delta, &pending);
-    drop(delta);
-
     // Apply pending vector operations
     self.apply_pending_vectors(&pending.pending_vectors);
+
+    merge_pending_delta(&mut delta, pending);
+    drop(delta);
 
     // Check if auto-checkpoint should be triggered
     // Note: We release all locks above first to avoid deadlock during checkpoint
@@ -401,24 +392,27 @@ impl SingleFileDB {
       let mut current_tx = self.current_tx.lock();
       current_tx.remove(&tid).ok_or(KiteError::NoTransaction)?
     };
-    let tx = { tx_handle.lock().clone() };
+    let (txid, read_only) = {
+      let tx = tx_handle.lock();
+      (tx.txid, tx.read_only)
+    };
 
-    if tx.read_only {
+    if read_only {
       // Read-only transactions don't need WAL
       if let Some(mvcc) = self.mvcc.as_ref() {
         let mut tx_mgr = mvcc.tx_manager.lock();
-        tx_mgr.abort_tx(tx.txid);
+        tx_mgr.abort_tx(txid);
       }
       return Ok(());
     }
 
     if let Some(mvcc) = self.mvcc.as_ref() {
       let mut tx_mgr = mvcc.tx_manager.lock();
-      tx_mgr.abort_tx(tx.txid);
+      tx_mgr.abort_tx(txid);
     }
 
     // Write ROLLBACK record to WAL
-    let record = WalRecord::new(WalRecordType::Rollback, tx.txid, build_rollback_payload());
+    let record = WalRecord::new(WalRecordType::Rollback, txid, build_rollback_payload());
     let mut pager = self.pager.lock();
     let mut wal = self.wal_buffer.lock();
     wal.write_record(&record, &mut pager)?;
@@ -437,9 +431,7 @@ impl SingleFileDB {
 
   /// Get the current transaction ID (if any)
   pub fn current_txid(&self) -> Option<TxId> {
-    self.current_tx_handle()
-      .as_ref()
-      .map(|tx| tx.lock().txid)
+    self.current_tx_handle().as_ref().map(|tx| tx.lock().txid)
   }
 
   /// Write a WAL record (internal helper)
@@ -457,91 +449,82 @@ impl SingleFileDB {
   }
 }
 
-fn merge_pending_delta(target: &mut DeltaState, pending: &DeltaState) {
-  for (&label_id, name) in &pending.new_labels {
-    target.define_label(label_id, name);
-  }
-  for (&etype_id, name) in &pending.new_etypes {
-    target.define_etype(etype_id, name);
-  }
-  for (&propkey_id, name) in &pending.new_propkeys {
-    target.define_propkey(propkey_id, name);
-  }
+fn merge_pending_delta(target: &mut DeltaState, mut pending: DeltaState) {
+  target.new_labels.extend(pending.new_labels.drain());
+  target.new_etypes.extend(pending.new_etypes.drain());
+  target.new_propkeys.extend(pending.new_propkeys.drain());
 
-  for (&node_id, node_delta) in &pending.created_nodes {
+  for (node_id, mut node_delta) in pending.created_nodes.drain() {
     target.create_node(node_id, node_delta.key.as_deref());
 
-    if let Some(labels) = node_delta.labels.as_ref() {
-      for &label_id in labels {
+    if let Some(labels) = node_delta.labels.take() {
+      for label_id in labels {
         target.add_node_label(node_id, label_id);
       }
     }
-    if let Some(labels_deleted) = node_delta.labels_deleted.as_ref() {
-      for &label_id in labels_deleted {
+    if let Some(labels_deleted) = node_delta.labels_deleted.take() {
+      for label_id in labels_deleted {
         target.remove_node_label(node_id, label_id);
       }
     }
-    if let Some(props) = node_delta.props.as_ref() {
-      for (&key_id, value) in props {
+    if let Some(props) = node_delta.props.take() {
+      for (key_id, value) in props {
         match value {
-          Some(value) => target.set_node_prop(node_id, key_id, value.clone()),
+          Some(value) => target.set_node_prop(node_id, key_id, value),
           None => target.delete_node_prop(node_id, key_id),
         }
       }
     }
   }
 
-  for &node_id in &pending.deleted_nodes {
+  for node_id in pending.deleted_nodes.drain() {
     target.delete_node(node_id);
   }
 
-  for (&node_id, node_delta) in &pending.modified_nodes {
-    if let Some(labels) = node_delta.labels.as_ref() {
-      for &label_id in labels {
+  for (node_id, mut node_delta) in pending.modified_nodes.drain() {
+    if let Some(labels) = node_delta.labels.take() {
+      for label_id in labels {
         target.add_node_label(node_id, label_id);
       }
     }
-    if let Some(labels_deleted) = node_delta.labels_deleted.as_ref() {
-      for &label_id in labels_deleted {
+    if let Some(labels_deleted) = node_delta.labels_deleted.take() {
+      for label_id in labels_deleted {
         target.remove_node_label(node_id, label_id);
       }
     }
-    if let Some(props) = node_delta.props.as_ref() {
-      for (&key_id, value) in props {
+    if let Some(props) = node_delta.props.take() {
+      for (key_id, value) in props {
         match value {
-          Some(value) => target.set_node_prop(node_id, key_id, value.clone()),
+          Some(value) => target.set_node_prop(node_id, key_id, value),
           None => target.delete_node_prop(node_id, key_id),
         }
       }
     }
   }
 
-  for (&src, patches) in &pending.out_add {
+  for (src, patches) in pending.out_add.drain() {
     for patch in patches {
       target.add_edge(src, patch.etype, patch.other);
     }
   }
 
-  for (&src, patches) in &pending.out_del {
+  for (src, patches) in pending.out_del.drain() {
     for patch in patches {
       target.delete_edge(src, patch.etype, patch.other);
     }
   }
 
-  for ((src, etype, dst), props) in &pending.edge_props {
-    for (&key_id, value) in props {
+  for ((src, etype, dst), props) in pending.edge_props.drain() {
+    for (key_id, value) in props {
       match value {
-        Some(value) => target.set_edge_prop(*src, *etype, *dst, key_id, value.clone()),
-        None => target.delete_edge_prop(*src, *etype, *dst, key_id),
+        Some(value) => target.set_edge_prop(src, etype, dst, key_id, value),
+        None => target.delete_edge_prop(src, etype, dst, key_id),
       }
     }
   }
 
-  for (key, node_id) in &pending.key_index {
-    target.key_index.insert(key.clone(), *node_id);
-  }
-
-  for key in &pending.key_index_deleted {
-    target.key_index_deleted.insert(key.clone());
-  }
+  target.key_index.extend(pending.key_index.drain());
+  target
+    .key_index_deleted
+    .extend(pending.key_index_deleted.drain());
 }

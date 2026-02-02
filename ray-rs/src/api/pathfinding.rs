@@ -192,7 +192,9 @@ where
       return reconstruct_path(&distances, current_id, source_id);
     }
 
-    let current_state = distances.get(&current_id).unwrap().clone();
+    let Some(current_state) = distances.get(&current_id).cloned() else {
+      continue;
+    };
     if current_state.depth >= config.max_depth {
       continue;
     }
@@ -295,11 +297,9 @@ where
   let source_id = config.source;
 
   // We need at least one target for heuristic
-  let primary_target = *config
-    .targets
-    .iter()
-    .next()
-    .expect("A* requires at least one target");
+  let Some(primary_target) = config.targets.iter().next().copied() else {
+    return PathResult::not_found();
+  };
 
   // State map: nodeId -> (g_score, f_score, depth, parent, edge)
   #[derive(Clone)]
@@ -356,7 +356,9 @@ where
       return reconstruct_path(&path_states, current_id, source_id);
     }
 
-    let current_state = states.get(&current_id).unwrap().clone();
+    let Some(current_state) = states.get(&current_id).cloned() else {
+      continue;
+    };
     if current_state.depth >= config.max_depth {
       continue;
     }

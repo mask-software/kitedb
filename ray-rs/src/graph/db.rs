@@ -390,6 +390,7 @@ impl GraphDB {
       // For production use cases requiring full durability, use sync_all() instead.
       #[cfg(target_os = "macos")]
       {
+        // SAFETY: fd_clone is a valid file descriptor for the WAL file.
         let ret = unsafe { libc::fsync(fd_clone.as_raw_fd()) };
         if ret != 0 {
           return Err(std::io::Error::last_os_error().into());
@@ -870,7 +871,7 @@ pub fn open_graph_db<P: AsRef<Path>>(path: P, options: OpenOptions) -> Result<Gr
                     data.node_id,
                     NodeVersionData {
                       node_id: data.node_id,
-                      delta: node_delta.clone(),
+                      delta: node_delta.for_version(),
                     },
                     *txid,
                     commit_ts,

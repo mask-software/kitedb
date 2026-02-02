@@ -111,6 +111,10 @@ pub enum KiteError {
   /// Invalid schema definition
   #[error("Invalid schema: {0}")]
   InvalidSchema(String),
+
+  /// Invalid query or builder usage
+  #[error("Invalid query: {0}")]
+  InvalidQuery(String),
 }
 
 /// Result type alias for KiteDB operations

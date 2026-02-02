@@ -500,7 +500,7 @@ pub fn open_single_file<P: AsRef<Path>>(
                     data.node_id,
                     NodeVersionData {
                       node_id: data.node_id,
-                      delta: node_delta.clone(),
+                      delta: node_delta.for_version(),
                     },
                     *txid,
                     commit_ts,

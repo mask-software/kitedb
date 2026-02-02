@@ -53,8 +53,7 @@ impl SingleFileDB {
     // Queue in pending delta for commit
     {
       let mut tx = tx_handle.lock();
-      tx
-        .pending
+      tx.pending
         .pending_vectors
         .insert((node_id, prop_key_id), Some(vector.to_vec()));
     }
@@ -79,8 +78,7 @@ impl SingleFileDB {
     // Queue delete in pending delta
     {
       let mut tx = tx_handle.lock();
-      tx
-        .pending
+      tx.pending
         .pending_vectors
         .insert((node_id, prop_key_id), None); // None means delete
     }
@@ -187,10 +185,9 @@ impl SingleFileDB {
     &self,
     pending_vectors: &HashMap<(NodeId, PropKeyId), Option<Vec<f32>>>,
   ) {
-    let pending: Vec<_> = pending_vectors.iter().map(|(k, v)| (*k, v.clone())).collect();
     let mut stores = self.vector_stores.write();
 
-    for ((node_id, prop_key_id), operation) in pending {
+    for (&(node_id, prop_key_id), operation) in pending_vectors {
       match operation {
         Some(vector) => {
           // Set operation - get or create store
@@ -200,7 +197,7 @@ impl SingleFileDB {
           });
 
           // Insert (this handles replacement of existing vectors)
-          let _ = vector_store_insert(store, node_id, &vector);
+          let _ = vector_store_insert(store, node_id, vector);
         }
         None => {
           // Delete operation

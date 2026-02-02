@@ -165,7 +165,11 @@ impl TxManager {
     let write_set: Vec<String> = tx.write_set.iter().cloned().collect();
     for key in write_set {
       let existing = self.committed_writes.get(&key).copied();
-      if existing.is_none() || commit_ts > existing.unwrap() {
+      let should_update = match existing {
+        None => true,
+        Some(existing_ts) => commit_ts > existing_ts,
+      };
+      if should_update {
         self.committed_writes.insert(key, commit_ts);
       }
     }
@@ -329,17 +333,14 @@ impl TxManager {
 
   fn prune_committed_writes(&mut self) {
     let min_ts = self.min_active_ts();
-    let mut entries: Vec<(String, Timestamp)> = self
-      .committed_writes
-      .iter()
-      .map(|(k, &v)| (k.clone(), v))
-      .collect();
+    let mut entries: Vec<(&String, Timestamp)> =
+      self.committed_writes.iter().map(|(k, &v)| (k, v)).collect();
 
     entries.sort_by_key(|(_, ts)| *ts);
 
     let target_size = MAX_COMMITTED_WRITES.saturating_sub(PRUNE_THRESHOLD_ENTRIES);
     let mut current_size = self.committed_writes.len();
-    let mut pruned = 0;
+    let mut to_remove: Vec<String> = Vec::new();
 
     for (key, commit_ts) in entries {
       if current_size <= target_size {
@@ -347,12 +348,17 @@ impl TxManager {
       }
 
       if commit_ts < min_ts {
-        if self.committed_writes.remove(&key).is_some() {
-          current_size = current_size.saturating_sub(1);
-          pruned += 1;
-        }
+        to_remove.push(key.clone());
+        current_size = current_size.saturating_sub(1);
       } else {
         break;
+      }
+    }
+
+    let mut pruned = 0;
+    for key in to_remove {
+      if self.committed_writes.remove(&key).is_some() {
+        pruned += 1;
       }
     }
 

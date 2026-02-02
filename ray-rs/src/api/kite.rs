@@ -50,9 +50,7 @@ impl NodeOpts {
 
   #[allow(dead_code)]
   fn with_prop(mut self, key: PropKeyId, value: PropValue) -> Self {
-    self.props
-      .get_or_insert_with(Vec::new)
-      .push((key, value));
+    self.props.get_or_insert_with(Vec::new).push((key, value));
     self
   }
 }
@@ -192,11 +190,7 @@ fn del_node_prop(handle: &mut TxHandle, node_id: NodeId, key_id: PropKeyId) -> R
   handle.db.delete_node_prop(node_id, key_id)
 }
 
-fn upsert_node_with_props<I>(
-  handle: &mut TxHandle,
-  key: &str,
-  props: I,
-) -> Result<(NodeId, bool)>
+fn upsert_node_with_props<I>(handle: &mut TxHandle, key: &str, props: I) -> Result<(NodeId, bool)>
 where
   I: IntoIterator<Item = (PropKeyId, Option<PropValue>)>,
 {
@@ -261,11 +255,7 @@ fn edge_exists_db(db: &SingleFileDB, src: NodeId, etype: ETypeId, dst: NodeId) -
   db.edge_exists(src, etype, dst)
 }
 
-fn get_neighbors_out_db(
-  db: &SingleFileDB,
-  node_id: NodeId,
-  etype: Option<ETypeId>,
-) -> Vec<NodeId> {
+fn get_neighbors_out_db(db: &SingleFileDB, node_id: NodeId, etype: Option<ETypeId>) -> Vec<NodeId> {
   match etype {
     Some(filter) => db.get_out_neighbors(node_id, filter),
     None => db
@@ -276,11 +266,7 @@ fn get_neighbors_out_db(
   }
 }
 
-fn get_neighbors_in_db(
-  db: &SingleFileDB,
-  node_id: NodeId,
-  etype: Option<ETypeId>,
-) -> Vec<NodeId> {
+fn get_neighbors_in_db(db: &SingleFileDB, node_id: NodeId, etype: Option<ETypeId>) -> Vec<NodeId> {
   match etype {
     Some(filter) => db.get_in_neighbors(node_id, filter),
     None => db
@@ -341,9 +327,7 @@ fn upsert_edge_with_props<I>(
 where
   I: IntoIterator<Item = (PropKeyId, Option<PropValue>)>,
 {
-  handle
-    .db
-    .upsert_edge_with_props(src, etype, dst, props)
+  handle.db.upsert_edge_with_props(src, etype, dst, props)
 }
 
 fn list_nodes(db: &SingleFileDB) -> Vec<NodeId> {
@@ -633,8 +617,7 @@ impl Kite {
     let path = path.as_ref();
     if path.exists() && path.is_dir() {
       return Err(KiteError::InvalidPath(
-        "Directory-format databases are no longer supported; use a .kitedb file path"
-          .to_string(),
+        "Directory-format databases are no longer supported; use a .kitedb file path".to_string(),
       ));
     }
 
@@ -2943,6 +2926,26 @@ impl<'a> KiteInsertBuilder<'a> {
       entries,
     })
   }
+
+  /// Specify values for multiple nodes with owned key suffixes
+  pub fn values_many_owned(
+    self,
+    items: Vec<(String, HashMap<String, PropValue>)>,
+  ) -> Result<InsertExecutorMultiple<'a>> {
+    let entries: Vec<(String, HashMap<String, PropValue>)> = items
+      .into_iter()
+      .map(|(key_suffix, props)| {
+        let full_key = format!("{}{}", self.key_prefix, key_suffix);
+        (full_key, props)
+      })
+      .collect();
+
+    Ok(InsertExecutorMultiple {
+      ray: self.ray,
+      node_type: self.node_type,
+      entries,
+    })
+  }
 }
 
 /// Executor for single node insert
@@ -3060,6 +3063,26 @@ impl<'a> KiteUpsertBuilder<'a> {
   pub fn values_many(
     self,
     items: Vec<(&str, HashMap<String, PropValue>)>,
+  ) -> Result<UpsertExecutorMultiple<'a>> {
+    let entries: Vec<(String, HashMap<String, PropValue>)> = items
+      .into_iter()
+      .map(|(key_suffix, props)| {
+        let full_key = format!("{}{}", self.key_prefix, key_suffix);
+        (full_key, props)
+      })
+      .collect();
+
+    Ok(UpsertExecutorMultiple {
+      ray: self.ray,
+      node_type: self.node_type,
+      entries,
+    })
+  }
+
+  /// Specify values for multiple upserts with owned key suffixes
+  pub fn values_many_owned(
+    self,
+    items: Vec<(String, HashMap<String, PropValue>)>,
   ) -> Result<UpsertExecutorMultiple<'a>> {
     let entries: Vec<(String, HashMap<String, PropValue>)> = items
       .into_iter()
@@ -4558,7 +4581,9 @@ mod tests {
       .execute()
       .unwrap();
 
-    let since = ray.get_edge_prop(alice.id, "FOLLOWS", bob.id, "since").unwrap();
+    let since = ray
+      .get_edge_prop(alice.id, "FOLLOWS", bob.id, "since")
+      .unwrap();
     assert_eq!(since, Some(PropValue::I64(2020)));
 
     ray
@@ -4569,7 +4594,9 @@ mod tests {
       .execute()
       .unwrap();
 
-    let since = ray.get_edge_prop(alice.id, "FOLLOWS", bob.id, "since").unwrap();
+    let since = ray
+      .get_edge_prop(alice.id, "FOLLOWS", bob.id, "since")
+      .unwrap();
     assert_eq!(since, None);
     let weight = ray
       .get_edge_prop(alice.id, "FOLLOWS", bob.id, "weight")
