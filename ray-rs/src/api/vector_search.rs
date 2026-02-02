@@ -12,7 +12,7 @@ use crate::types::NodeId;
 use crate::vector::{
   create_vector_store, vector_store_clear, vector_store_delete, vector_store_get,
   vector_store_insert, vector_store_stats, DistanceMetric, IvfConfig, IvfIndex, SearchOptions,
-  VectorManifest, VectorSearchResult, VectorStoreConfig,
+  IvfError, VectorManifest, VectorSearchResult, VectorStoreConfig,
 };
 
 // ============================================================================
@@ -337,7 +337,11 @@ impl VectorIndex {
     if let Some(ref mut index) = self.index {
       if index.trained {
         if let Some(stored_vector) = vector_store_get(&self.manifest, node_id) {
-          let _ = index.insert(vector_id as u64, stored_vector);
+          if let Err(err) = index.insert(vector_id as u64, stored_vector) {
+            self.index = None;
+            self.needs_training = true;
+            return Err(ivf_error_to_index_error(err));
+          }
         }
       } else {
         self.needs_training = true;
@@ -452,7 +456,11 @@ impl VectorIndex {
     for (i, &vector_id) in vector_ids.iter().enumerate() {
       let offset = i * dimensions;
       let vector = &training_data[offset..offset + dimensions];
-      let _ = index.insert(vector_id, vector);
+      if let Err(err) = index.insert(vector_id, vector) {
+        self.index = None;
+        self.needs_training = true;
+        return Err(ivf_error_to_index_error(err));
+      }
     }
 
     self.index = Some(index);
@@ -676,6 +684,15 @@ impl std::error::Error for VectorIndexError {}
 /// Validate a vector (no NaN or Inf values)
 fn is_valid_vector(vector: &[f32]) -> bool {
   vector.iter().all(|&v| v.is_finite())
+}
+
+fn ivf_error_to_index_error(err: IvfError) -> VectorIndexError {
+  match err {
+    IvfError::DimensionMismatch { expected, got } => {
+      VectorIndexError::DimensionMismatch { expected, got }
+    }
+    other => VectorIndexError::TrainingError(other.to_string()),
+  }
 }
 
 // ============================================================================
