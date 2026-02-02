@@ -272,8 +272,14 @@ impl WalBuffer {
 
     // Re-write secondary records to primary region
     for record in secondary_records {
+      let ParsedWalRecord {
+        record_type,
+        txid,
+        payload,
+        ..
+      } = record;
       // Rebuild the record and write it
-      let wal_record = WalRecord::new(record.record_type, record.txid, record.payload.clone());
+      let wal_record = WalRecord::new(record_type, txid, payload);
       let record_bytes = wal_record.build();
       self.write_record_bytes_to_primary(&record_bytes, pager)?;
     }
@@ -299,7 +305,13 @@ impl WalBuffer {
       .into_iter()
       .chain(secondary_records.into_iter())
     {
-      let wal_record = WalRecord::new(record.record_type, record.txid, record.payload.clone());
+      let ParsedWalRecord {
+        record_type,
+        txid,
+        payload,
+        ..
+      } = record;
+      let wal_record = WalRecord::new(record_type, txid, payload);
       let record_bytes = wal_record.build();
       self.write_record_bytes_to_primary(&record_bytes, pager)?;
     }
