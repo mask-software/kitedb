@@ -49,6 +49,16 @@ struct PathState {
   edge: Option<(NodeId, ETypeId, NodeId)>, // Edge used to reach this node
 }
 
+/// Internal state for A* search
+#[derive(Clone)]
+struct AStarState {
+  g_score: f64,
+  f_score: f64,
+  depth: usize,
+  parent: Option<NodeId>,
+  edge: Option<(NodeId, ETypeId, NodeId)>,
+}
+
 /// Configuration for pathfinding
 #[derive(Debug, Clone)]
 pub struct PathConfig {
@@ -297,37 +307,21 @@ where
   let source_id = config.source;
 
   // We need at least one target for heuristic
-  let Some(primary_target) = config.targets.iter().next().copied() else {
+  let Some(primary_target) = first_target(&config) else {
     return PathResult::not_found();
   };
-
-  // State map: nodeId -> (g_score, f_score, depth, parent, edge)
-  #[derive(Clone)]
-  struct AStarState {
-    g_score: f64,
-    f_score: f64,
-    depth: usize,
-    parent: Option<NodeId>,
-    edge: Option<(NodeId, ETypeId, NodeId)>,
-  }
 
   let mut states: HashMap<NodeId, AStarState> = HashMap::new();
   let mut visited: HashSet<NodeId> = HashSet::new();
   let mut queue = IndexedMinHeap::new();
 
-  // Initialize source
-  let h = heuristic(source_id, primary_target);
-  states.insert(
+  init_astar_state(
     source_id,
-    AStarState {
-      g_score: 0.0,
-      f_score: h,
-      depth: 0,
-      parent: None,
-      edge: None,
-    },
+    primary_target,
+    &heuristic,
+    &mut states,
+    &mut queue,
   );
-  queue.insert(source_id, h);
 
   while let Some(current_id) = queue.extract_min() {
     if visited.contains(&current_id) {
@@ -337,22 +331,7 @@ where
 
     // Check if we reached a target
     if config.targets.contains(&current_id) {
-      // Convert AStarState to PathState for reconstruction
-      let path_states: HashMap<NodeId, PathState> = states
-        .iter()
-        .map(|(&id, state)| {
-          (
-            id,
-            PathState {
-              node_id: id,
-              cost: state.g_score,
-              depth: state.depth,
-              parent: state.parent,
-              edge: state.edge,
-            },
-          )
-        })
-        .collect();
+      let path_states = build_astar_path_states(&states);
       return reconstruct_path(&path_states, current_id, source_id);
     }
 
@@ -363,13 +342,7 @@ where
       continue;
     }
 
-    // Get neighbors
-    let directions = match config.direction {
-      TraversalDirection::Both => vec![TraversalDirection::Out, TraversalDirection::In],
-      dir => vec![dir],
-    };
-
-    for dir in directions {
+    for dir in traversal_directions(config.direction) {
       let neighbors = get_neighbors(current_id, dir, None);
 
       for edge in neighbors {
@@ -378,17 +351,7 @@ where
           continue;
         }
 
-        let neighbor_id = match dir {
-          TraversalDirection::Out => edge.dst,
-          TraversalDirection::In => edge.src,
-          TraversalDirection::Both => {
-            if edge.src == current_id {
-              edge.dst
-            } else {
-              edge.src
-            }
-          }
-        };
+        let neighbor_id = neighbor_id_for_edge(current_id, dir, &edge);
 
         if visited.contains(&neighbor_id) {
           continue;
@@ -428,6 +391,68 @@ where
   }
 
   PathResult::not_found()
+}
+
+fn init_astar_state<H>(
+  source_id: NodeId,
+  primary_target: NodeId,
+  heuristic: &H,
+  states: &mut HashMap<NodeId, AStarState>,
+  queue: &mut IndexedMinHeap<NodeId>,
+) where
+  H: Fn(NodeId, NodeId) -> f64,
+{
+  let h = heuristic(source_id, primary_target);
+  states.insert(
+    source_id,
+    AStarState {
+      g_score: 0.0,
+      f_score: h,
+      depth: 0,
+      parent: None,
+      edge: None,
+    },
+  );
+  queue.insert(source_id, h);
+}
+
+fn build_astar_path_states(states: &HashMap<NodeId, AStarState>) -> HashMap<NodeId, PathState> {
+  states
+    .iter()
+    .map(|(&id, state)| {
+      (
+        id,
+        PathState {
+          node_id: id,
+          cost: state.g_score,
+          depth: state.depth,
+          parent: state.parent,
+          edge: state.edge,
+        },
+      )
+    })
+    .collect()
+}
+
+fn traversal_directions(direction: TraversalDirection) -> Vec<TraversalDirection> {
+  match direction {
+    TraversalDirection::Both => vec![TraversalDirection::Out, TraversalDirection::In],
+    dir => vec![dir],
+  }
+}
+
+fn neighbor_id_for_edge(current_id: NodeId, dir: TraversalDirection, edge: &Edge) -> NodeId {
+  match dir {
+    TraversalDirection::Out => edge.dst,
+    TraversalDirection::In => edge.src,
+    TraversalDirection::Both => {
+      if edge.src == current_id {
+        edge.dst
+      } else {
+        edge.src
+      }
+    }
+  }
 }
 
 /// Reconstruct path from parent pointers
@@ -695,12 +720,10 @@ where
   }
 
   // We need exactly one target for Yen's algorithm
-  let target = match config.targets.iter().next() {
-    Some(&t) => t,
+  let target = match first_target(&config) {
+    Some(target) => target,
     None => return Vec::new(),
   };
-
-  let _source = config.source;
 
   // Result: the k shortest paths
   let mut result_paths: Vec<PathResult> = Vec::with_capacity(k);
@@ -734,43 +757,16 @@ where
       let spur_node = prev_path_nodes[spur_idx];
 
       // Root path: path from source to spur node
-      let root_path: Vec<NodeId> = prev_path_nodes[..=spur_idx].to_vec();
-      let root_edges: Vec<(NodeId, ETypeId, NodeId)> = if spur_idx > 0 {
-        prev_path.edges[..spur_idx].to_vec()
-      } else {
-        Vec::new()
-      };
-
-      // Calculate root path weight
-      let root_weight: f64 = root_edges
-        .iter()
-        .map(|(s, e, d)| get_weight(*s, *e, *d))
-        .sum();
+      let (root_path, root_edges) = root_segments(prev_path, spur_idx);
+      let root_weight = root_weight(&root_edges, &get_weight);
 
       // Collect edges to exclude (edges used by paths that share this root)
-      let mut excluded_edges: HashSet<(NodeId, ETypeId, NodeId)> = HashSet::new();
-
-      for existing_path in &result_paths {
-        // Check if this path shares the same root
-        if existing_path.path.len() > spur_idx && existing_path.path[..=spur_idx] == root_path[..] {
-          // Exclude the edge that leaves the spur node in this path
-          if let Some(&edge) = existing_path.edges.get(spur_idx) {
-            excluded_edges.insert(edge);
-          }
-        }
-      }
-
-      // Also exclude edges from candidate paths
-      for candidate in &candidates {
-        if candidate.path.len() > spur_idx && candidate.path[..=spur_idx] == root_path[..] {
-          if let Some(&edge) = candidate.edges.get(spur_idx) {
-            excluded_edges.insert(edge);
-          }
-        }
-      }
+      let mut excluded_edges = HashSet::new();
+      extend_excluded_edges(&mut excluded_edges, &result_paths, &root_path, spur_idx);
+      extend_excluded_edges(&mut excluded_edges, &candidates, &root_path, spur_idx);
 
       // Nodes in root path (except spur node) should be avoided
-      let root_nodes: HashSet<NodeId> = root_path[..spur_idx].iter().copied().collect();
+      let root_nodes = root_nodes(&root_path, spur_idx);
 
       // Create a modified get_neighbors that excludes forbidden edges and nodes
       let filtered_neighbors = |node: NodeId, dir: TraversalDirection, etype: Option<ETypeId>| {
@@ -793,42 +789,15 @@ where
       };
 
       // Find spur path from spur_node to target
-      let spur_config = PathConfig {
-        source: spur_node,
-        targets: {
-          let mut s = HashSet::new();
-          s.insert(target);
-          s
-        },
-        allowed_etypes: config.allowed_etypes.clone(),
-        direction: config.direction,
-        max_depth: config.max_depth.saturating_sub(spur_idx),
-      };
+      let spur_config = build_spur_config(&config, spur_node, target, spur_idx);
 
       let spur_path = dijkstra(spur_config, filtered_neighbors, &get_weight);
 
       if spur_path.found {
-        // Combine root path + spur path (excluding duplicate spur node)
-        let mut combined_path = root_path.clone();
-        combined_path.extend(spur_path.path.into_iter().skip(1));
-
-        let mut combined_edges = root_edges.clone();
-        combined_edges.extend(spur_path.edges);
-
-        let combined_weight = root_weight + spur_path.total_weight;
-
-        let candidate = PathResult {
-          path: combined_path,
-          edges: combined_edges,
-          total_weight: combined_weight,
-          found: true,
-        };
-
-        // Only add if we haven't seen this exact path before
-        let is_duplicate = result_paths.iter().any(|p| p.path == candidate.path)
-          || candidates.iter().any(|p| p.path == candidate.path);
-
-        if !is_duplicate {
+        let candidate = combine_paths(root_path, root_edges, root_weight, spur_path);
+        if !is_duplicate_path(&candidate, &result_paths)
+          && !is_duplicate_path(&candidate, &candidates)
+        {
           candidates.push(candidate);
         }
       }
@@ -837,14 +806,9 @@ where
     // If we have candidates, add the shortest one to results
     if !candidates.is_empty() {
       // Find the candidate with minimum weight
-      candidates.sort_by(|a, b| {
-        a.total_weight
-          .partial_cmp(&b.total_weight)
-          .unwrap_or(std::cmp::Ordering::Equal)
-      });
-
-      let best = candidates.remove(0);
-      result_paths.push(best);
+      if let Some(best) = pop_best_candidate(&mut candidates) {
+        result_paths.push(best);
+      }
     } else {
       // No more candidates, we've found all possible paths
       break;
@@ -852,6 +816,104 @@ where
   }
 
   result_paths
+}
+
+fn first_target(config: &PathConfig) -> Option<NodeId> {
+  config.targets.iter().next().copied()
+}
+
+fn root_segments(
+  prev_path: &PathResult,
+  spur_idx: usize,
+) -> (Vec<NodeId>, Vec<(NodeId, ETypeId, NodeId)>) {
+  let root_path: Vec<NodeId> = prev_path.path[..=spur_idx].to_vec();
+  let root_edges: Vec<(NodeId, ETypeId, NodeId)> = if spur_idx > 0 {
+    prev_path.edges[..spur_idx].to_vec()
+  } else {
+    Vec::new()
+  };
+  (root_path, root_edges)
+}
+
+fn root_weight<W>(root_edges: &[(NodeId, ETypeId, NodeId)], get_weight: &W) -> f64
+where
+  W: Fn(NodeId, ETypeId, NodeId) -> f64,
+{
+  root_edges
+    .iter()
+    .map(|(s, e, d)| get_weight(*s, *e, *d))
+    .sum()
+}
+
+fn extend_excluded_edges(
+  excluded_edges: &mut HashSet<(NodeId, ETypeId, NodeId)>,
+  paths: &[PathResult],
+  root_path: &[NodeId],
+  spur_idx: usize,
+) {
+  for path in paths {
+    if path.path.len() > spur_idx && path.path[..=spur_idx] == root_path[..] {
+      if let Some(&edge) = path.edges.get(spur_idx) {
+        excluded_edges.insert(edge);
+      }
+    }
+  }
+}
+
+fn root_nodes(root_path: &[NodeId], spur_idx: usize) -> HashSet<NodeId> {
+  root_path[..spur_idx].iter().copied().collect()
+}
+
+fn build_spur_config(
+  config: &PathConfig,
+  spur_node: NodeId,
+  target: NodeId,
+  spur_idx: usize,
+) -> PathConfig {
+  let mut targets = HashSet::new();
+  targets.insert(target);
+
+  PathConfig {
+    source: spur_node,
+    targets,
+    allowed_etypes: config.allowed_etypes.clone(),
+    direction: config.direction,
+    max_depth: config.max_depth.saturating_sub(spur_idx),
+  }
+}
+
+fn combine_paths(
+  mut root_path: Vec<NodeId>,
+  mut root_edges: Vec<(NodeId, ETypeId, NodeId)>,
+  root_weight: f64,
+  spur_path: PathResult,
+) -> PathResult {
+  root_path.extend(spur_path.path.into_iter().skip(1));
+  root_edges.extend(spur_path.edges);
+
+  PathResult {
+    path: root_path,
+    edges: root_edges,
+    total_weight: root_weight + spur_path.total_weight,
+    found: true,
+  }
+}
+
+fn is_duplicate_path(candidate: &PathResult, paths: &[PathResult]) -> bool {
+  paths.iter().any(|p| p.path == candidate.path)
+}
+
+fn pop_best_candidate(candidates: &mut Vec<PathResult>) -> Option<PathResult> {
+  candidates.sort_by(|a, b| {
+    a.total_weight
+      .partial_cmp(&b.total_weight)
+      .unwrap_or(std::cmp::Ordering::Equal)
+  });
+  if candidates.is_empty() {
+    None
+  } else {
+    Some(candidates.remove(0))
+  }
 }
 
 // ============================================================================
