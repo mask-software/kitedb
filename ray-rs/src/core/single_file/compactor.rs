@@ -139,8 +139,8 @@ impl SingleFileDB {
 
     let options = options.unwrap_or_default();
 
-    let header = self.header.read().clone();
-    let page_size = header.page_size as u64;
+    let mut new_header = self.header.read().clone();
+    let page_size = new_header.page_size as u64;
 
     let min_wal_pages = if let Some(min_wal_size) = options.min_wal_size {
       min_wal_size.div_ceil(page_size)
@@ -148,26 +148,24 @@ impl SingleFileDB {
       MIN_WAL_PAGES
     };
 
-    let wal_is_empty =
-      header.wal_head == header.wal_tail || (header.wal_head == 0 && header.wal_tail == 0);
+    let wal_is_empty = new_header.wal_head == new_header.wal_tail
+      || (new_header.wal_head == 0 && new_header.wal_tail == 0);
     let can_shrink_wal =
-      options.shrink_wal && wal_is_empty && header.wal_page_count > min_wal_pages;
+      options.shrink_wal && wal_is_empty && new_header.wal_page_count > min_wal_pages;
 
-    if header.snapshot_page_count == 0 && !can_shrink_wal {
+    if new_header.snapshot_page_count == 0 && !can_shrink_wal {
       return Ok(());
     }
 
     let new_wal_page_count = if can_shrink_wal {
       min_wal_pages
     } else {
-      header.wal_page_count
+      new_header.wal_page_count
     };
-    let new_wal_end_page = header.wal_start_page + new_wal_page_count;
+    let new_wal_end_page = new_header.wal_start_page + new_wal_page_count;
 
-    let mut new_header = header.clone();
-
-    if header.snapshot_page_count > 0 {
-      let current_snapshot_start = header.snapshot_start_page;
+    if new_header.snapshot_page_count > 0 {
+      let current_snapshot_start = new_header.snapshot_start_page;
       let new_snapshot_start = new_wal_end_page;
 
       if current_snapshot_start != new_snapshot_start {
@@ -175,7 +173,7 @@ impl SingleFileDB {
           let mut pager = self.pager.lock();
           let slice = pager.mmap_range(
             current_snapshot_start as u32,
-            header.snapshot_page_count as u32,
+            new_header.snapshot_page_count as u32,
           )?;
           slice.to_vec()
         };
@@ -185,7 +183,7 @@ impl SingleFileDB {
           &mut pager,
           new_snapshot_start as u32,
           &snapshot_bytes,
-          header.page_size as usize,
+          new_header.page_size as usize,
         )?;
       }
 
@@ -211,14 +209,16 @@ impl SingleFileDB {
       pager.truncate_pages(new_header.db_size_pages as u32)?;
     }
 
+    let new_wal_buffer = WalBuffer::from_header(&new_header);
+
     {
       let mut header_guard = self.header.write();
-      *header_guard = new_header.clone();
+      *header_guard = new_header;
     }
 
     {
       let mut wal_buffer = self.wal_buffer.lock();
-      *wal_buffer = WalBuffer::from_header(&new_header);
+      *wal_buffer = new_wal_buffer;
     }
 
     self.reload_snapshot()?;

@@ -483,7 +483,11 @@ fn reconstruct_path(
   }
 
   // Check if we actually reached the source
-  if path_states.is_empty() || path_states.last().unwrap().node_id != source_id {
+  let reached_source = match path_states.last() {
+    Some(last) => last.node_id == source_id,
+    None => false,
+  };
+  if !reached_source {
     return PathResult::not_found();
   }
 
@@ -755,7 +759,6 @@ where
     // For each node in the previous path (except the last), use it as a spur node
     let max_spur_idx = prev_path_nodes.len().saturating_sub(1);
     for (spur_idx, &spur_node) in prev_path_nodes.iter().enumerate().take(max_spur_idx) {
-
       // Root path: path from source to spur node
       let (root_path, root_edges) = root_segments(prev_path, spur_idx);
       let root_weight = root_weight(&root_edges, &get_weight);

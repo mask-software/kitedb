@@ -242,7 +242,7 @@ pub(crate) fn get_node_props(ray: &RustKite, node_id: NodeId) -> HashMap<String,
 
 /// Infer node type from key prefix
 pub(crate) fn node_type_from_key(
-  node_specs: &HashMap<String, KeySpec>,
+  node_specs: &HashMap<String, Arc<KeySpec>>,
   key: &str,
 ) -> Option<String> {
   node_specs

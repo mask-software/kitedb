@@ -78,7 +78,7 @@ use conversion::{js_value_to_prop_value, key_suffix_from_js};
 #[napi]
 pub struct Kite {
   inner: Arc<RwLock<Option<RustKite>>>,
-  node_specs: Arc<HashMap<String, KeySpec>>,
+  node_specs: Arc<HashMap<String, Arc<KeySpec>>>,
 }
 
 impl Kite {
@@ -102,7 +102,7 @@ impl Kite {
     f(ray)
   }
 
-  fn key_spec(&self, node_type: &str) -> Result<&KeySpec> {
+  fn key_spec(&self, node_type: &str) -> Result<&Arc<KeySpec>> {
     self
       .node_specs
       .get(node_type)
@@ -116,7 +116,7 @@ impl Kite {
   #[allow(clippy::arc_with_non_send_sync)]
   #[napi(factory)]
   pub fn open(path: String, options: JsKiteOptions) -> Result<Self> {
-    let mut node_specs: HashMap<String, KeySpec> = HashMap::new();
+    let mut node_specs: HashMap<String, Arc<KeySpec>> = HashMap::new();
     let mut kite_opts = KiteOptions::new();
     kite_opts.read_only = options.read_only.unwrap_or(false);
     kite_opts.create_if_missing = options.create_if_missing.unwrap_or(true);
@@ -126,7 +126,7 @@ impl Kite {
     kite_opts.mvcc_max_chain_depth = options.mvcc_max_chain_depth.map(|v| v as usize);
 
     for node in options.nodes {
-      let key_spec = parse_key_spec(&node.name, node.key)?;
+      let key_spec = Arc::new(parse_key_spec(&node.name, node.key)?);
       let prefix = key_spec.prefix().to_string();
 
       let mut node_def = NodeDef::new(&node.name, &prefix);
@@ -136,7 +136,7 @@ impl Kite {
         }
       }
 
-      node_specs.insert(node.name.clone(), key_spec);
+      node_specs.insert(node.name.clone(), Arc::clone(&key_spec));
       kite_opts.nodes.push(node_def);
     }
 
@@ -186,8 +186,10 @@ impl Kite {
     key: Unknown,
     props: Option<Vec<String>>,
   ) -> Result<Option<Object>> {
-    let spec = self.key_spec(&node_type)?.clone();
-    let key_suffix = key_suffix_from_js(&env, &spec, key)?;
+    let key_suffix = {
+      let spec = self.key_spec(&node_type)?;
+      key_suffix_from_js(&env, spec.as_ref(), key)?
+    };
     let selected_props = props.map(|props| props.into_iter().collect::<HashSet<String>>());
     self.with_kite(move |ray| {
       let node_ref = ray
@@ -232,8 +234,10 @@ impl Kite {
   /// Get a lightweight node reference by key (no properties)
   #[napi]
   pub fn get_ref(&self, env: Env, node_type: String, key: Unknown) -> Result<Option<Object>> {
-    let spec = self.key_spec(&node_type)?.clone();
-    let key_suffix = key_suffix_from_js(&env, &spec, key)?;
+    let key_suffix = {
+      let spec = self.key_spec(&node_type)?;
+      key_suffix_from_js(&env, spec.as_ref(), key)?
+    };
     self.with_kite(move |ray| {
       let node_ref = ray
         .get_ref(&node_type, &key_suffix)
@@ -258,8 +262,10 @@ impl Kite {
   /// Get a node ID by key (no properties)
   #[napi]
   pub fn get_id(&self, env: Env, node_type: String, key: Unknown) -> Result<Option<i64>> {
-    let spec = self.key_spec(&node_type)?.clone();
-    let key_suffix = key_suffix_from_js(&env, &spec, key)?;
+    let key_suffix = {
+      let spec = self.key_spec(&node_type)?;
+      key_suffix_from_js(&env, spec.as_ref(), key)?
+    };
     self.with_kite(move |ray| {
       Ok(
         ray
@@ -341,8 +347,10 @@ impl Kite {
   /// Delete a node by key
   #[napi]
   pub fn delete_by_key(&self, env: Env, node_type: String, key: Unknown) -> Result<bool> {
-    let spec = self.key_spec(&node_type)?.clone();
-    let key_suffix = key_suffix_from_js(&env, &spec, key)?;
+    let key_suffix = {
+      let spec = self.key_spec(&node_type)?;
+      key_suffix_from_js(&env, spec.as_ref(), key)?
+    };
     self.with_kite_mut(|ray| {
       let full_key = ray
         .node_def(&node_type)
@@ -364,7 +372,7 @@ impl Kite {
   /// Create an insert builder
   #[napi]
   pub fn insert(&self, node_type: String) -> Result<KiteInsertBuilder> {
-    let spec = self.key_spec(&node_type)?.clone();
+    let spec = Arc::clone(self.key_spec(&node_type)?);
     let prefix = spec.prefix().to_string();
     Ok(KiteInsertBuilder::new(
       self.inner.clone(),
@@ -377,7 +385,7 @@ impl Kite {
   /// Create an upsert builder
   #[napi]
   pub fn upsert(&self, node_type: String) -> Result<KiteUpsertBuilder> {
-    let spec = self.key_spec(&node_type)?.clone();
+    let spec = Arc::clone(self.key_spec(&node_type)?);
     let prefix = spec.prefix().to_string();
     Ok(KiteUpsertBuilder::new(
       self.inner.clone(),
@@ -390,7 +398,10 @@ impl Kite {
   /// Create an update builder by node ID
   #[napi]
   pub fn update_by_id(&self, node_id: i64) -> Result<KiteUpdateBuilder> {
-    Ok(KiteUpdateBuilder::new(self.inner.clone(), node_id as NodeId))
+    Ok(KiteUpdateBuilder::new(
+      self.inner.clone(),
+      node_id as NodeId,
+    ))
   }
 
   /// Create an upsert builder by node ID
@@ -411,8 +422,10 @@ impl Kite {
     node_type: String,
     key: Unknown,
   ) -> Result<KiteUpdateBuilder> {
-    let spec = self.key_spec(&node_type)?.clone();
-    let key_suffix = key_suffix_from_js(&env, &spec, key)?;
+    let key_suffix = {
+      let spec = self.key_spec(&node_type)?;
+      key_suffix_from_js(&env, spec.as_ref(), key)?
+    };
     self.with_kite(|ray| {
       let node_ref = ray
         .get(&node_type, &key_suffix)
@@ -821,8 +834,10 @@ impl Kite {
           let node_type: String = op.get_named_property("nodeType")?;
           let key: Unknown = op.get_named_property("key")?;
           let props: Option<Object> = op.get_named_property("props")?;
-          let spec = self.key_spec(&node_type)?.clone();
-          let key_suffix = key_suffix_from_js(&env, &spec, key)?;
+          let key_suffix = {
+            let spec = self.key_spec(&node_type)?;
+            key_suffix_from_js(&env, spec.as_ref(), key)?
+          };
           let props_map = js_props_to_map(&env, props)?;
           rust_ops.push(BatchOp::CreateNode {
             node_type,
@@ -948,7 +963,7 @@ pub struct OpenKiteTask {
   path: String,
   options: JsKiteOptions,
   // Store result here to avoid public type in trait
-  result: Option<(RustKite, HashMap<String, KeySpec>)>,
+  result: Option<(RustKite, HashMap<String, Arc<KeySpec>>)>,
 }
 
 impl napi::Task for OpenKiteTask {
@@ -956,7 +971,7 @@ impl napi::Task for OpenKiteTask {
   type JsValue = Kite;
 
   fn compute(&mut self) -> Result<Self::Output> {
-    let mut node_specs: HashMap<String, KeySpec> = HashMap::new();
+    let mut node_specs: HashMap<String, Arc<KeySpec>> = HashMap::new();
     let mut kite_opts = KiteOptions::new();
     kite_opts.read_only = self.options.read_only.unwrap_or(false);
     kite_opts.create_if_missing = self.options.create_if_missing.unwrap_or(true);
@@ -966,7 +981,7 @@ impl napi::Task for OpenKiteTask {
     kite_opts.mvcc_max_chain_depth = self.options.mvcc_max_chain_depth.map(|v| v as usize);
 
     for node in &self.options.nodes {
-      let key_spec = parse_key_spec(&node.name, node.key.clone())?;
+      let key_spec = Arc::new(parse_key_spec(&node.name, node.key.clone())?);
       let prefix = key_spec.prefix().to_string();
 
       let mut node_def = NodeDef::new(&node.name, &prefix);
@@ -976,7 +991,7 @@ impl napi::Task for OpenKiteTask {
         }
       }
 
-      node_specs.insert(node.name.clone(), key_spec);
+      node_specs.insert(node.name.clone(), Arc::clone(&key_spec));
       kite_opts.nodes.push(node_def);
     }
 
