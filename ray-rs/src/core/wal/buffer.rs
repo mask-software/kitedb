@@ -25,13 +25,10 @@ use crate::util::binary::*;
 
 use super::record::{parse_wal_record, ParsedWalRecord, WalRecord};
 
-/// Skip marker magic value (recLen=0 followed by this)
-const SKIP_MARKER_MAGIC: u32 = 0xFFFFFFFF;
-
 /// WAL region split ratio: primary gets 75%, secondary gets 25%
 const PRIMARY_REGION_RATIO: f64 = 0.75;
 
-/// Circular WAL buffer for single-file database format
+/// WAL buffer for single-file database format
 pub struct WalBuffer {
   /// Base offset in file (start of WAL area)
   base_offset: u64,
@@ -41,8 +38,6 @@ pub struct WalBuffer {
   head: u64,
   /// Current tail position (oldest valid record, relative to base)
   tail: u64,
-  /// Whether buffer has wrapped around (legacy WALs only)
-  wrapped: bool,
   /// Page size for batching
   page_size: usize,
   /// Pending page writes (page_offset -> page_data)
@@ -76,7 +71,6 @@ impl WalBuffer {
       capacity,
       head: 0,
       tail: 0,
-      wrapped: false,
       page_size,
       pending_writes: HashMap::new(),
       primary_region_size,
@@ -127,7 +121,6 @@ impl WalBuffer {
       capacity,
       head: header.wal_head,
       tail: header.wal_tail,
-      wrapped: header.wal_head < header.wal_tail,
       page_size: header.page_size as usize,
       pending_writes: HashMap::new(),
       primary_region_size,
@@ -186,7 +179,7 @@ impl WalBuffer {
 
   /// Check if buffer is empty
   pub fn is_empty(&self) -> bool {
-    self.head == self.tail && !self.wrapped
+    self.head == self.tail
   }
 
   /// Get used space (for active region in dual-region mode)
@@ -226,16 +219,6 @@ impl WalBuffer {
   pub fn can_fit(&self, size: usize) -> bool {
     let aligned_size = align_up(size, WAL_RECORD_ALIGNMENT) as u64;
     aligned_size <= self.free()
-  }
-
-  /// Check if writing would exceed the primary region (wrap disabled)
-  pub fn would_wrap(&self, size: usize) -> bool {
-    if self.active_region == 1 {
-      // Secondary region doesn't wrap
-      return false;
-    }
-    let aligned_size = align_up(size, WAL_RECORD_ALIGNMENT) as u64;
-    self.primary_head + aligned_size > self.primary_region_size
   }
 
   // ========================================================================
@@ -286,7 +269,6 @@ impl WalBuffer {
     self.tail = 0;
     self.active_region = 0;
     self.head = 0;
-    self.wrapped = false;
 
     // Re-write secondary records to primary region
     for record in secondary_records {
@@ -312,7 +294,6 @@ impl WalBuffer {
     self.tail = 0;
     self.active_region = 0;
     self.head = 0;
-    self.wrapped = false;
 
     for record in primary_records
       .into_iter()
@@ -331,14 +312,10 @@ impl WalBuffer {
   pub fn scan_region(&mut self, region: u8, pager: &mut FilePager) -> Result<Vec<ParsedWalRecord>> {
     let mut records = Vec::new();
 
-    let (mut pos, end_pos, region_start) = if region == 0 {
-      (self.tail, self.primary_head, 0u64)
+    let (mut pos, end_pos) = if region == 0 {
+      (self.tail, self.primary_head)
     } else {
-      (
-        self.secondary_region_start,
-        self.secondary_head,
-        self.secondary_region_start,
-      )
+      (self.secondary_region_start, self.secondary_head)
     };
 
     while pos < end_pos {
@@ -347,15 +324,7 @@ impl WalBuffer {
 
       let rec_len = read_u32(&header_bytes, 0) as usize;
 
-      // Check for skip marker
       if rec_len == 0 {
-        let marker = read_u32(&header_bytes, 4);
-        if marker == SKIP_MARKER_MAGIC {
-          // Skip to start of region
-          pos = region_start;
-          continue;
-        }
-        // Invalid record
         break;
       }
 
@@ -609,16 +578,12 @@ impl WalBuffer {
   /// Advance tail after checkpoint
   pub fn advance_tail(&mut self, new_tail: u64) {
     self.tail = new_tail;
-    if self.tail >= self.head {
-      self.wrapped = false;
-    }
   }
 
   /// Reset the buffer (after checkpoint)
   pub fn reset(&mut self) {
     self.head = 0;
     self.tail = 0;
-    self.wrapped = false;
     self.pending_writes.clear();
     // Also reset dual-region state
     self.primary_head = 0;
@@ -639,36 +604,22 @@ impl WalBuffer {
       return Ok(records);
     }
 
+    if self.head < self.tail {
+      return Err(KiteError::InvalidWal(
+        "WAL head cannot be behind tail in linear mode".to_string(),
+      ));
+    }
+
     let mut pos = self.tail;
 
-    loop {
-      // Check if we've reached head
-      if !self.wrapped && pos >= self.head {
-        break;
-      }
-      if self.wrapped && pos >= self.capacity {
-        pos = 0;
-        continue;
-      }
-      if self.wrapped && pos >= self.head && pos < self.tail {
-        break;
-      }
-
+    while pos < self.head {
       // Read the record header
       let file_offset = self.file_offset(pos);
       let header_bytes = self.read_at_offset(file_offset, 8, pager)?;
 
       let rec_len = read_u32(&header_bytes, 0) as usize;
 
-      // Check for skip marker
       if rec_len == 0 {
-        let marker = read_u32(&header_bytes, 4);
-        if marker == SKIP_MARKER_MAGIC {
-          // Skip to start
-          pos = 0;
-          continue;
-        }
-        // Invalid record
         break;
       }
 
@@ -700,7 +651,6 @@ impl WalBuffer {
       free: self.free(),
       head: self.head,
       tail: self.tail,
-      wrapped: self.wrapped,
       pending_pages: self.pending_writes.len(),
       primary_head: self.primary_head,
       secondary_head: self.secondary_head,
@@ -734,7 +684,6 @@ pub struct WalBufferStats {
   pub free: u64,
   pub head: u64,
   pub tail: u64,
-  pub wrapped: bool,
   pub pending_pages: usize,
   pub primary_head: u64,
   pub secondary_head: u64,
@@ -871,7 +820,6 @@ mod tests {
     let stats = buffer.stats();
     assert_eq!(stats.capacity, 1024);
     assert!(stats.used > 0);
-    assert!(!stats.wrapped);
   }
 
   #[test]

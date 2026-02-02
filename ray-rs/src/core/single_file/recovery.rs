@@ -18,7 +18,7 @@ use crate::core::wal::record::{
 use crate::error::Result;
 use crate::types::*;
 
-/// Scan WAL records from the WAL area (linear; legacy wrap supported)
+/// Scan WAL records from the WAL area (linear)
 pub(crate) fn scan_wal_records(
   pager: &mut FilePager,
   header: &DbHeaderV1,
@@ -30,7 +30,17 @@ pub(crate) fn scan_wal_records(
 
   let mut pos = header.wal_tail;
   let head = header.wal_head;
-  let wrapped = head < header.wal_tail;
+
+  if head < pos {
+    return Err(crate::error::KiteError::InvalidWal(
+      "WAL head cannot be behind tail in linear mode".to_string(),
+    ));
+  }
+  if head > wal_size {
+    return Err(crate::error::KiteError::InvalidWal(
+      "WAL head exceeds WAL size".to_string(),
+    ));
+  }
 
   // If tail == head, WAL is empty
   if pos == head {
@@ -41,16 +51,10 @@ pub(crate) fn scan_wal_records(
   // This is simpler than page-by-page reading for now
   let wal_data = read_wal_area(pager, header)?;
 
-  while pos != head {
-    let actual_pos = if wrapped { pos % wal_size } else { pos };
+  while pos < head {
+    let actual_pos = pos;
 
-    // Check for skip marker (legacy wrap-around)
     if actual_pos + 8 > wal_size {
-      if wrapped {
-        // Not enough space for header, wrap to start
-        pos = 0;
-        continue;
-      }
       break;
     }
 
@@ -66,35 +70,14 @@ pub(crate) fn scan_wal_records(
       wal_data[offset + 3],
     ]) as usize;
 
-    // Skip marker check
     if rec_len == 0 {
-      if offset + 8 <= wal_data.len() {
-        let marker = u32::from_le_bytes([
-          wal_data[offset + 4],
-          wal_data[offset + 5],
-          wal_data[offset + 6],
-          wal_data[offset + 7],
-        ]);
-        if marker == 0xFFFFFFFF {
-          if wrapped {
-            // Skip to start (legacy wrap)
-            pos = 0;
-            continue;
-          }
-          break;
-        }
-      }
       break; // Invalid record
     }
 
     // Parse the record
     if let Some(record) = parse_wal_record(&wal_data, offset) {
       let aligned_size = crate::util::binary::align_up(rec_len, WAL_RECORD_ALIGNMENT);
-      pos = if wrapped {
-        (actual_pos + aligned_size as u64) % wal_size
-      } else {
-        actual_pos + aligned_size as u64
-      };
+      pos = actual_pos + aligned_size as u64;
       records.push(record);
     } else {
       break; // Invalid record
