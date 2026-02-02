@@ -283,12 +283,12 @@ impl SingleFileDB {
 
           if let Some(after_map) = node_delta.props.as_ref() {
             for (key_id, after_value) in after_map {
-              let before_value = old_node_prop(*node_id, *key_id);
+              let mut before_value = old_node_prop(*node_id, *key_id);
               if before_value == *after_value {
                 continue;
               }
               if vc.get_node_prop_version(*node_id, *key_id).is_none() {
-                vc.append_node_prop_version(*node_id, *key_id, before_value.clone(), 0, 0);
+                vc.append_node_prop_version(*node_id, *key_id, before_value.take(), 0, 0);
               }
               vc.append_node_prop_version(*node_id, *key_id, after_value.clone(), txid, commit_ts);
             }
@@ -336,12 +336,12 @@ impl SingleFileDB {
         for (edge_key, after_props) in &pending.edge_props {
           for (key_id, after_value) in after_props {
             let (src, etype, dst) = *edge_key;
-            let before_value = old_edge_prop(src, etype, dst, *key_id);
+            let mut before_value = old_edge_prop(src, etype, dst, *key_id);
             if before_value == *after_value {
               continue;
             }
             if vc.get_edge_prop_version(src, etype, dst, *key_id).is_none() {
-              vc.append_edge_prop_version(src, etype, dst, *key_id, before_value.clone(), 0, 0);
+              vc.append_edge_prop_version(src, etype, dst, *key_id, before_value.take(), 0, 0);
             }
             vc.append_edge_prop_version(
               src,
