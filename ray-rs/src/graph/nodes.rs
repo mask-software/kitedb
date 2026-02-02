@@ -81,7 +81,7 @@ pub fn create_node(handle: &mut TxHandle, opts: NodeOpts) -> Result<NodeId> {
   if let Some(props) = opts.props {
     let mut map = std::collections::HashMap::new();
     for (key_id, value) in props {
-      map.insert(key_id, Some(value));
+      map.insert(key_id, Some(std::sync::Arc::new(value)));
     }
     handle.tx.pending_node_props.insert(node_id, map);
   }
@@ -107,7 +107,8 @@ pub fn create_node_with_id(
     return Err(KiteError::ReadOnly);
   }
 
-  if node_exists_internal(handle.db, node_id) || handle.tx.pending_created_nodes.contains_key(&node_id)
+  if node_exists_internal(handle.db, node_id)
+    || handle.tx.pending_created_nodes.contains_key(&node_id)
   {
     return Err(KiteError::Internal(format!(
       "Node ID already exists: {node_id}"
@@ -141,7 +142,7 @@ pub fn create_node_with_id(
   if let Some(props) = opts.props {
     let mut map = std::collections::HashMap::new();
     for (key_id, value) in props {
-      map.insert(key_id, Some(value));
+      map.insert(key_id, Some(std::sync::Arc::new(value)));
     }
     handle.tx.pending_node_props.insert(node_id, map);
   }
@@ -386,7 +387,7 @@ pub fn get_node_prop_db(
     let vc = mvcc.version_chain.lock();
     if let Some(prop_version) = vc.get_node_prop_version(node_id, key_id) {
       if let Some(visible) = get_visible_version(&prop_version, tx_snapshot_ts, txid) {
-        return visible.data.clone();
+        return visible.data.as_deref().cloned();
       }
     }
   }
@@ -460,7 +461,7 @@ pub fn get_node_props_db(
       for (&key_id, value) in delta_props {
         match value {
           Some(v) => {
-            props.insert(key_id, v.clone());
+            props.insert(key_id, v.as_ref().clone());
           }
           None => {
             props.remove(&key_id);
@@ -639,7 +640,7 @@ pub fn set_node_prop(
   }
 
   let props = handle.tx.pending_node_props.entry(node_id).or_default();
-  props.insert(key_id, Some(value));
+  props.insert(key_id, Some(std::sync::Arc::new(value)));
 
   if let Some(mvcc) = handle.db.mvcc.as_ref() {
     let mut tx_mgr = mvcc.tx_manager.lock();
@@ -674,7 +675,7 @@ pub fn get_node_prop(handle: &TxHandle, node_id: NodeId, key_id: PropKeyId) -> O
 
   if let Some(pending_props) = handle.tx.pending_node_props.get(&node_id) {
     if let Some(value) = pending_props.get(&key_id) {
-      return value.clone();
+      return value.as_deref().cloned();
     }
   }
 
@@ -688,7 +689,7 @@ pub fn get_node_prop(handle: &TxHandle, node_id: NodeId, key_id: PropKeyId) -> O
     let vc = mvcc.version_chain.lock();
     if let Some(prop_version) = vc.get_node_prop_version(node_id, key_id) {
       if let Some(visible) = get_visible_version(&prop_version, tx_snapshot_ts, txid) {
-        return visible.data.clone();
+        return visible.data.as_deref().cloned();
       }
     }
   }
@@ -857,7 +858,10 @@ mod tests {
     let (node_id_2, created_2) = upsert_node_with_props(
       &mut tx,
       "user:alice",
-      vec![(name_key, Some(PropValue::String("Alice Updated".to_string())))],
+      vec![(
+        name_key,
+        Some(PropValue::String("Alice Updated".to_string())),
+      )],
     )
     .unwrap();
     commit(&mut tx).unwrap();

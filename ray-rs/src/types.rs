@@ -331,6 +331,9 @@ pub enum PropValue {
   VectorF32(Vec<f32>),
 }
 
+/// Shared property value for internal storage
+pub type PropValueRef = std::sync::Arc<PropValue>;
+
 impl PropValue {
   pub fn tag(&self) -> PropValueTag {
     match self {
@@ -376,7 +379,7 @@ pub struct NodeDelta {
   pub key: Option<String>,
   pub labels: Option<HashSet<LabelId>>,
   pub labels_deleted: Option<HashSet<LabelId>>,
-  pub props: Option<HashMap<PropKeyId, Option<PropValue>>>, // None value = deleted
+  pub props: Option<HashMap<PropKeyId, Option<PropValueRef>>>, // None value = deleted
 }
 
 impl NodeDelta {
@@ -408,7 +411,7 @@ pub struct DeltaState {
   pub in_del: HashMap<NodeId, BTreeSet<EdgePatch>>,
 
   // Edge properties (keyed by (src, etype, dst))
-  pub edge_props: HashMap<(NodeId, ETypeId, NodeId), HashMap<PropKeyId, Option<PropValue>>>,
+  pub edge_props: HashMap<(NodeId, ETypeId, NodeId), HashMap<PropKeyId, Option<PropValueRef>>>,
 
   // New definitions
   pub new_labels: HashMap<LabelId, String>,
@@ -582,12 +585,13 @@ pub struct TxState {
   pub pending_out_del: HashMap<NodeId, BTreeSet<EdgePatch>>,
   pub pending_in_add: HashMap<NodeId, BTreeSet<EdgePatch>>,
   pub pending_in_del: HashMap<NodeId, BTreeSet<EdgePatch>>,
-  pub pending_node_props: HashMap<NodeId, HashMap<PropKeyId, Option<PropValue>>>,
+  pub pending_node_props: HashMap<NodeId, HashMap<PropKeyId, Option<PropValueRef>>>,
   /// Pending node label additions (node_id -> labels)
   pub pending_node_labels_add: HashMap<NodeId, HashSet<LabelId>>,
   /// Pending node label removals (node_id -> labels)
   pub pending_node_labels_del: HashMap<NodeId, HashSet<LabelId>>,
-  pub pending_edge_props: HashMap<(NodeId, ETypeId, NodeId), HashMap<PropKeyId, Option<PropValue>>>,
+  pub pending_edge_props:
+    HashMap<(NodeId, ETypeId, NodeId), HashMap<PropKeyId, Option<PropValueRef>>>,
   pub pending_new_labels: HashMap<LabelId, String>,
   pub pending_new_etypes: HashMap<ETypeId, String>,
   pub pending_new_propkeys: HashMap<PropKeyId, String>,

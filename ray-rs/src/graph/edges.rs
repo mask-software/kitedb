@@ -330,7 +330,7 @@ pub fn get_edge_prop_db(
     let vc = mvcc.version_chain.lock();
     if let Some(prop_version) = vc.get_edge_prop_version(src, etype, dst, key_id) {
       if let Some(visible) = get_visible_version(&prop_version, tx_snapshot_ts, txid) {
-        return visible.data.clone();
+        return visible.data.as_deref().cloned();
       }
     }
   }
@@ -355,7 +355,7 @@ pub fn get_edge_prop_committed(
   // Check delta first
   if let Some(delta_props) = delta.edge_props.get(&(src, etype, dst)) {
     if let Some(value) = delta_props.get(&key_id) {
-      return value.clone();
+      return value.as_deref().cloned();
     }
   }
 
@@ -423,7 +423,7 @@ pub fn get_edge_props_db(
     for (&key_id, value) in delta_props {
       match value {
         Some(v) => {
-          props.insert(key_id, v.clone());
+          props.insert(key_id, v.as_ref().clone());
         }
         None => {
           props.remove(&key_id);
@@ -529,7 +529,7 @@ pub fn set_edge_prop(
     .pending_edge_props
     .entry((src, etype, dst))
     .or_default();
-  props.insert(key_id, Some(value));
+  props.insert(key_id, Some(std::sync::Arc::new(value)));
 
   if let Some(mvcc) = handle.db.mvcc.as_ref() {
     let mut tx_mgr = mvcc.tx_manager.lock();
@@ -582,7 +582,7 @@ pub fn get_edge_prop(
 ) -> Option<PropValue> {
   if let Some(pending) = handle.tx.pending_edge_props.get(&(src, etype, dst)) {
     if let Some(value) = pending.get(&key_id) {
-      return value.clone();
+      return value.as_deref().cloned();
     }
   }
 
@@ -596,7 +596,7 @@ pub fn get_edge_prop(
     let vc = mvcc.version_chain.lock();
     if let Some(prop_version) = vc.get_edge_prop_version(src, etype, dst, key_id) {
       if let Some(visible) = get_visible_version(&prop_version, tx_snapshot_ts, txid) {
-        return visible.data.clone();
+        return visible.data.as_deref().cloned();
       }
     }
   }
@@ -609,7 +609,7 @@ pub fn get_edge_prop(
 
   if let Some(delta_props) = delta.edge_props.get(&(src, etype, dst)) {
     if let Some(value) = delta_props.get(&key_id) {
-      return value.clone();
+      return value.as_deref().cloned();
     }
   }
 
@@ -689,7 +689,7 @@ pub fn get_edge_props(
     for (&key_id, value) in delta_props {
       match value {
         Some(v) => {
-          props.insert(key_id, v.clone());
+          props.insert(key_id, v.as_ref().clone());
         }
         None => {
           props.remove(&key_id);
@@ -703,7 +703,7 @@ pub fn get_edge_props(
     for (key_id, value) in pending_props {
       match value {
         Some(v) => {
-          props.insert(*key_id, v.clone());
+          props.insert(*key_id, v.as_ref().clone());
         }
         None => {
           props.remove(key_id);

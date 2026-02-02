@@ -198,7 +198,13 @@ pub fn commit(handle: &mut TxHandle) -> Result<()> {
         for (key_id, value) in props {
           if !is_new && vc.get_node_prop_version(*node_id, *key_id).is_none() {
             if let Some(old_value) = nodes::get_node_prop_committed(handle.db, *node_id, *key_id) {
-              vc.append_node_prop_version(*node_id, *key_id, Some(old_value), 0, 0);
+              vc.append_node_prop_version(
+                *node_id,
+                *key_id,
+                Some(std::sync::Arc::new(old_value)),
+                0,
+                0,
+              );
             }
           }
           vc.append_node_prop_version(*node_id, *key_id, value.clone(), handle.tx.txid, commit_ts);
@@ -215,7 +221,15 @@ pub fn commit(handle: &mut TxHandle) -> Result<()> {
             if let Some(old_value) =
               edges::get_edge_prop_committed(handle.db, *src, *etype, *dst, *key_id)
             {
-              vc.append_edge_prop_version(*src, *etype, *dst, *key_id, Some(old_value), 0, 0);
+              vc.append_edge_prop_version(
+                *src,
+                *etype,
+                *dst,
+                *key_id,
+                Some(std::sync::Arc::new(old_value)),
+                0,
+                0,
+              );
             }
           }
           vc.append_edge_prop_version(
@@ -287,7 +301,7 @@ pub fn commit(handle: &mut TxHandle) -> Result<()> {
           records.push(WalRecord::new(
             WalRecordType::SetNodeProp,
             handle.tx.txid,
-            build_set_node_prop_payload(*node_id, *key_id, value),
+            build_set_node_prop_payload(*node_id, *key_id, value.as_ref()),
           ));
         }
       }
@@ -333,7 +347,7 @@ pub fn commit(handle: &mut TxHandle) -> Result<()> {
           records.push(WalRecord::new(
             WalRecordType::SetNodeProp,
             handle.tx.txid,
-            build_set_node_prop_payload(*node_id, *key_id, value),
+            build_set_node_prop_payload(*node_id, *key_id, value.as_ref()),
           ));
         } else {
           records.push(WalRecord::new(
@@ -373,7 +387,7 @@ pub fn commit(handle: &mut TxHandle) -> Result<()> {
         records.push(WalRecord::new(
           WalRecordType::SetEdgeProp,
           handle.tx.txid,
-          build_set_edge_prop_payload(*src, *etype, *dst, *key_id, value),
+          build_set_edge_prop_payload(*src, *etype, *dst, *key_id, value.as_ref()),
         ));
       } else {
         records.push(WalRecord::new(
@@ -451,7 +465,7 @@ pub fn commit(handle: &mut TxHandle) -> Result<()> {
     for (node_id, props) in &handle.tx.pending_node_props {
       for (key_id, value) in props {
         if let Some(value) = value {
-          delta.set_node_prop(*node_id, *key_id, value.clone());
+          delta.set_node_prop_ref(*node_id, *key_id, value.clone());
         } else {
           delta.delete_node_prop(*node_id, *key_id);
         }
@@ -472,7 +486,7 @@ pub fn commit(handle: &mut TxHandle) -> Result<()> {
     for ((src, etype, dst), props) in &handle.tx.pending_edge_props {
       for (key_id, value) in props {
         if let Some(value) = value {
-          delta.set_edge_prop(*src, *etype, *dst, *key_id, value.clone());
+          delta.set_edge_prop_ref(*src, *etype, *dst, *key_id, value.clone());
         } else {
           delta.delete_edge_prop(*src, *etype, *dst, *key_id);
         }

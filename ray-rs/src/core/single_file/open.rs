@@ -532,7 +532,7 @@ pub fn open_single_file<P: AsRef<Path>>(
                 vc.append_node_prop_version(
                   data.node_id,
                   data.key_id,
-                  Some(data.value),
+                  Some(std::sync::Arc::new(data.value)),
                   *txid,
                   commit_ts,
                 );
@@ -552,7 +552,7 @@ pub fn open_single_file<P: AsRef<Path>>(
                   data.etype,
                   data.dst,
                   data.key_id,
-                  Some(data.value),
+                  Some(std::sync::Arc::new(data.value)),
                   *txid,
                   commit_ts,
                 );

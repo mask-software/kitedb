@@ -221,6 +221,11 @@ impl DeltaState {
 
   /// Set a node property
   pub fn set_node_prop(&mut self, node_id: NodeId, key_id: PropKeyId, value: PropValue) {
+    self.set_node_prop_ref(node_id, key_id, std::sync::Arc::new(value));
+  }
+
+  /// Set a node property using a shared value
+  pub fn set_node_prop_ref(&mut self, node_id: NodeId, key_id: PropKeyId, value: PropValueRef) {
     // Get or create the node delta
     let node_delta = if self.created_nodes.contains_key(&node_id) {
       self.created_nodes.get_mut(&node_id).unwrap()
@@ -280,7 +285,7 @@ impl DeltaState {
       .or_else(|| self.modified_nodes.get(&node_id))?;
 
     let props = node_delta.props.as_ref()?;
-    props.get(&key_id).map(|v| v.as_ref())
+    props.get(&key_id).map(|v| v.as_deref())
   }
 
   // ========================================================================
@@ -422,6 +427,18 @@ impl DeltaState {
     key_id: PropKeyId,
     value: PropValue,
   ) {
+    self.set_edge_prop_ref(src, etype, dst, key_id, std::sync::Arc::new(value));
+  }
+
+  /// Set an edge property using a shared value
+  pub fn set_edge_prop_ref(
+    &mut self,
+    src: NodeId,
+    etype: ETypeId,
+    dst: NodeId,
+    key_id: PropKeyId,
+    value: PropValueRef,
+  ) {
     let edge_key = (src, etype, dst);
     let props = self.edge_props.entry(edge_key).or_default();
     props.insert(key_id, Some(value));
@@ -448,7 +465,7 @@ impl DeltaState {
       .edge_props
       .get(&edge_key)
       .and_then(|props| props.get(&key_id))
-      .map(|v| v.as_ref())
+      .map(|v| v.as_deref())
   }
 
   /// Get all edge property modifications in delta
@@ -457,7 +474,7 @@ impl DeltaState {
     src: NodeId,
     etype: ETypeId,
     dst: NodeId,
-  ) -> Option<&HashMap<PropKeyId, Option<PropValue>>> {
+  ) -> Option<&HashMap<PropKeyId, Option<PropValueRef>>> {
     self.edge_props.get(&(src, etype, dst))
   }
 

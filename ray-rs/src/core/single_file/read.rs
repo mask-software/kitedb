@@ -61,7 +61,7 @@ impl SingleFileDB {
         for (&key_id, value) in delta_props {
           match value {
             Some(v) => {
-              props.insert(key_id, v.clone());
+              props.insert(key_id, v.as_ref().clone());
             }
             None => {
               props.remove(&key_id);
@@ -82,7 +82,7 @@ impl SingleFileDB {
           if let Some(visible) = get_visible_version(&prop_version, tx_snapshot_ts, txid) {
             match &visible.data {
               Some(v) => {
-                props.insert(key_id, v.clone());
+                props.insert(key_id, v.as_ref().clone());
               }
               None => {
                 props.remove(&key_id);
@@ -100,7 +100,7 @@ impl SingleFileDB {
           for (&key_id, value) in delta_props {
             match value {
               Some(v) => {
-                props.insert(key_id, v.clone());
+                props.insert(key_id, v.as_ref().clone());
               }
               None => {
                 props.remove(&key_id);
@@ -161,7 +161,7 @@ impl SingleFileDB {
       if let Some(node_delta) = tx.pending.get_node_delta(node_id) {
         if let Some(ref delta_props) = node_delta.props {
           if let Some(value) = delta_props.get(&key_id) {
-            return value.clone();
+            return value.as_deref().cloned();
           }
         }
       }
@@ -188,7 +188,7 @@ impl SingleFileDB {
       }
       if let Some(prop_version) = vc.get_node_prop_version(node_id, key_id) {
         if let Some(visible) = get_visible_version(&prop_version, tx_snapshot_ts, txid) {
-          return visible.data.clone();
+          return visible.data.as_deref().cloned();
         }
       }
     }
@@ -208,7 +208,7 @@ impl SingleFileDB {
       if let Some(ref delta_props) = node_delta.props {
         if let Some(value) = delta_props.get(&key_id) {
           // None means explicitly deleted
-          return value.clone();
+          return value.as_deref().cloned();
         }
       }
     }
@@ -311,7 +311,7 @@ impl SingleFileDB {
           if let Some(visible) = get_visible_version(&prop_version, tx_snapshot_ts, txid) {
             match &visible.data {
               Some(v) => {
-                props.insert(key_id, v.clone());
+                props.insert(key_id, v.as_ref().clone());
               }
               None => {
                 props.remove(&key_id);
@@ -352,7 +352,7 @@ impl SingleFileDB {
       for (&key_id, value) in delta_props {
         match value {
           Some(v) => {
-            props.insert(key_id, v.clone());
+            props.insert(key_id, v.as_ref().clone());
           }
           None => {
             props.remove(&key_id);
@@ -367,7 +367,7 @@ impl SingleFileDB {
         for (&key_id, value) in delta_props {
           match value {
             Some(v) => {
-              props.insert(key_id, v.clone());
+              props.insert(key_id, v.as_ref().clone());
             }
             None => {
               props.remove(&key_id);
@@ -410,7 +410,7 @@ impl SingleFileDB {
       }
       if let Some(delta_props) = tx.pending.get_edge_props_delta(src, etype, dst) {
         if let Some(value) = delta_props.get(&key_id) {
-          return value.clone();
+          return value.as_deref().cloned();
         }
       }
     }
@@ -441,7 +441,7 @@ impl SingleFileDB {
       }
       if let Some(prop_version) = vc.get_edge_prop_version(src, etype, dst, key_id) {
         if let Some(visible) = get_visible_version(&prop_version, tx_snapshot_ts, txid) {
-          return visible.data.clone();
+          return visible.data.as_deref().cloned();
         }
       }
     }
@@ -502,7 +502,7 @@ impl SingleFileDB {
     if let Some(delta_props) = delta.get_edge_props_delta(src, etype, dst) {
       if let Some(value) = delta_props.get(&key_id) {
         // Some(None) means explicitly deleted
-        return value.clone();
+        return value.as_deref().cloned();
       }
     }
 
@@ -624,8 +624,7 @@ impl SingleFileDB {
           .and_then(|vc| vc.get_edge_version(node_id, edge_patch.etype, edge_patch.other))
           .map(|version| mvcc_edge_exists(Some(version), tx_snapshot_ts, txid));
         if edge_visible == Some(false)
-          || pending
-            .is_some_and(|p| p.is_edge_deleted(node_id, edge_patch.etype, edge_patch.other))
+          || pending.is_some_and(|p| p.is_edge_deleted(node_id, edge_patch.etype, edge_patch.other))
         {
           continue;
         }
@@ -757,8 +756,7 @@ impl SingleFileDB {
           .and_then(|vc| vc.get_edge_version(edge_patch.other, edge_patch.etype, node_id))
           .map(|version| mvcc_edge_exists(Some(version), tx_snapshot_ts, txid));
         if edge_visible == Some(false)
-          || pending
-            .is_some_and(|p| p.is_edge_deleted(edge_patch.other, edge_patch.etype, node_id))
+          || pending.is_some_and(|p| p.is_edge_deleted(edge_patch.other, edge_patch.etype, node_id))
         {
           continue;
         }
@@ -1255,7 +1253,9 @@ impl SingleFileDB {
 
 #[cfg(test)]
 mod tests {
-  use crate::core::single_file::open::{close_single_file, open_single_file, SingleFileOpenOptions};
+  use crate::core::single_file::open::{
+    close_single_file, open_single_file, SingleFileOpenOptions,
+  };
   use crate::error::KiteError;
   use std::sync::{mpsc, Arc};
   use std::thread;
@@ -1361,7 +1361,9 @@ mod tests {
       let result = db_reader.commit();
       match result {
         Err(KiteError::Conflict { keys, .. }) => {
-          assert!(keys.iter().any(|key| key == &format!("neighbors_out:{src}:*")));
+          assert!(keys
+            .iter()
+            .any(|key| key == &format!("neighbors_out:{src}:*")));
         }
         other => panic!("expected conflict, got {other:?}"),
       }

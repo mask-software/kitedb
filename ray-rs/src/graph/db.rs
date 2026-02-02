@@ -903,7 +903,7 @@ pub fn open_graph_db<P: AsRef<Path>>(path: P, options: OpenOptions) -> Result<Gr
                 vc.append_node_prop_version(
                   data.node_id,
                   data.key_id,
-                  Some(data.value),
+                  Some(std::sync::Arc::new(data.value)),
                   *txid,
                   commit_ts,
                 );
@@ -923,7 +923,7 @@ pub fn open_graph_db<P: AsRef<Path>>(path: P, options: OpenOptions) -> Result<Gr
                   data.etype,
                   data.dst,
                   data.key_id,
-                  Some(data.value),
+                  Some(std::sync::Arc::new(data.value)),
                   *txid,
                   commit_ts,
                 );

@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use crate::mvcc::visibility::VersionedRecord;
 use crate::types::{
-  ETypeId, EdgeVersionData, LabelId, NodeDelta, NodeId, NodeVersionData, PropKeyId, PropValue,
+  ETypeId, EdgeVersionData, LabelId, NodeDelta, NodeId, NodeVersionData, PropKeyId, PropValueRef,
   Timestamp, TxId,
 };
 
@@ -273,17 +273,17 @@ pub struct VersionChainManager {
   /// Edge version chains: packed(src, etype, dst) -> head version
   edge_versions: HashMap<u64, Box<VersionedRecord<EdgeVersionData>>>,
   /// SOA-backed storage for node property versions
-  soa_node_props: SoaPropertyVersions<Option<PropValue>>,
+  soa_node_props: SoaPropertyVersions<Option<PropValueRef>>,
   /// SOA-backed storage for edge property versions
-  soa_edge_props: SoaPropertyVersions<Option<PropValue>>,
+  soa_edge_props: SoaPropertyVersions<Option<PropValueRef>>,
   /// SOA-backed storage for node label versions
   soa_node_labels: SoaPropertyVersions<Option<bool>>,
   /// Whether SOA storage is enabled (for benchmarking/compatibility)
   use_soa: bool,
   /// Legacy node property versions (when SOA is disabled)
-  legacy_node_props: HashMap<u64, Box<VersionedRecord<Option<PropValue>>>>,
+  legacy_node_props: HashMap<u64, Box<VersionedRecord<Option<PropValueRef>>>>,
   /// Legacy edge property versions (when SOA is disabled)
-  legacy_edge_props: HashMap<u64, Box<VersionedRecord<Option<PropValue>>>>,
+  legacy_edge_props: HashMap<u64, Box<VersionedRecord<Option<PropValueRef>>>>,
   /// Legacy node label versions (when SOA is disabled)
   legacy_node_labels: HashMap<u64, Box<VersionedRecord<Option<bool>>>>,
 }
@@ -440,7 +440,7 @@ impl VersionChainManager {
     &mut self,
     node_id: NodeId,
     prop_key_id: PropKeyId,
-    value: Option<PropValue>,
+    value: Option<PropValueRef>,
     txid: TxId,
     commit_ts: Timestamp,
   ) {
@@ -467,7 +467,7 @@ impl VersionChainManager {
     &self,
     node_id: NodeId,
     prop_key_id: PropKeyId,
-  ) -> Option<VersionedRecord<Option<PropValue>>> {
+  ) -> Option<VersionedRecord<Option<PropValueRef>>> {
     let key = Self::node_prop_key(node_id, prop_key_id);
 
     if self.use_soa {
@@ -495,7 +495,7 @@ impl VersionChainManager {
     etype: ETypeId,
     dst: NodeId,
     prop_key_id: PropKeyId,
-    value: Option<PropValue>,
+    value: Option<PropValueRef>,
     txid: TxId,
     commit_ts: Timestamp,
   ) {
@@ -523,7 +523,7 @@ impl VersionChainManager {
     etype: ETypeId,
     dst: NodeId,
     prop_key_id: PropKeyId,
-  ) -> Option<VersionedRecord<Option<PropValue>>> {
+  ) -> Option<VersionedRecord<Option<PropValueRef>>> {
     let key = Self::edge_prop_key(src, etype, dst, prop_key_id);
 
     if self.use_soa {
@@ -636,12 +636,7 @@ impl VersionChainManager {
     keys
   }
 
-  pub fn edge_prop_keys(
-    &self,
-    src: NodeId,
-    etype: ETypeId,
-    dst: NodeId,
-  ) -> Vec<PropKeyId> {
+  pub fn edge_prop_keys(&self, src: NodeId, etype: ETypeId, dst: NodeId) -> Vec<PropKeyId> {
     let src_mask = src & 0xFFFFF;
     let dst_mask = dst & 0xFFFFF;
     let etype_mask = etype as u64 & 0xFFF;
@@ -1009,6 +1004,7 @@ pub struct VersionChainCounts {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::types::PropValue;
 
   #[test]
   fn test_soa_property_versions_new() {
@@ -1140,11 +1136,11 @@ mod tests {
     let mut mgr = VersionChainManager::new();
     assert!(mgr.is_soa_enabled());
 
-    mgr.append_node_prop_version(1, 1, Some(PropValue::I64(42)), 1, 10);
+    mgr.append_node_prop_version(1, 1, Some(std::sync::Arc::new(PropValue::I64(42))), 1, 10);
 
     let version = mgr.get_node_prop_version(1, 1);
     assert!(version.is_some());
-    assert_eq!(version.unwrap().data, Some(PropValue::I64(42)));
+    assert_eq!(version.unwrap().data.as_deref(), Some(&PropValue::I64(42)));
   }
 
   #[test]
@@ -1152,22 +1148,33 @@ mod tests {
     let mut mgr = VersionChainManager::with_soa(false);
     assert!(!mgr.is_soa_enabled());
 
-    mgr.append_node_prop_version(1, 1, Some(PropValue::I64(42)), 1, 10);
+    mgr.append_node_prop_version(1, 1, Some(std::sync::Arc::new(PropValue::I64(42))), 1, 10);
 
     let version = mgr.get_node_prop_version(1, 1);
     assert!(version.is_some());
-    assert_eq!(version.unwrap().data, Some(PropValue::I64(42)));
+    assert_eq!(version.unwrap().data.as_deref(), Some(&PropValue::I64(42)));
   }
 
   #[test]
   fn test_edge_prop_version() {
     let mut mgr = VersionChainManager::new();
 
-    mgr.append_edge_prop_version(1, 1, 2, 1, Some(PropValue::F64(3.14)), 1, 10);
+    mgr.append_edge_prop_version(
+      1,
+      1,
+      2,
+      1,
+      Some(std::sync::Arc::new(PropValue::F64(3.14))),
+      1,
+      10,
+    );
 
     let version = mgr.get_edge_prop_version(1, 1, 2, 1);
     assert!(version.is_some());
-    assert_eq!(version.unwrap().data, Some(PropValue::F64(3.14)));
+    assert_eq!(
+      version.unwrap().data.as_deref(),
+      Some(&PropValue::F64(3.14))
+    );
   }
 
   #[test]
@@ -1195,7 +1202,7 @@ mod tests {
       10,
     );
     mgr.append_edge_version(1, 1, 2, true, 1, 10);
-    mgr.append_node_prop_version(1, 1, Some(PropValue::I64(42)), 1, 10);
+    mgr.append_node_prop_version(1, 1, Some(std::sync::Arc::new(PropValue::I64(42))), 1, 10);
 
     mgr.clear();
 
@@ -1244,7 +1251,13 @@ mod tests {
 
     // Add some versions
     for i in 0..100 {
-      mgr.append_node_prop_version(i, 1, Some(PropValue::I64(i as i64)), 1, 10);
+      mgr.append_node_prop_version(
+        i,
+        1,
+        Some(std::sync::Arc::new(PropValue::I64(i as i64))),
+        1,
+        10,
+      );
     }
 
     let (node_mem, _edge_mem) = mgr.get_soa_memory_usage();

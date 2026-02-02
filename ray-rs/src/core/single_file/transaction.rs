@@ -284,11 +284,12 @@ impl SingleFileDB {
           if let Some(after_map) = node_delta.props.as_ref() {
             for (key_id, after_value) in after_map {
               let mut before_value = old_node_prop(*node_id, *key_id);
-              if before_value == *after_value {
+              if before_value.as_ref() == after_value.as_deref() {
                 continue;
               }
               if vc.get_node_prop_version(*node_id, *key_id).is_none() {
-                vc.append_node_prop_version(*node_id, *key_id, before_value.take(), 0, 0);
+                let before_shared = before_value.take().map(std::sync::Arc::new);
+                vc.append_node_prop_version(*node_id, *key_id, before_shared, 0, 0);
               }
               vc.append_node_prop_version(*node_id, *key_id, after_value.clone(), txid, commit_ts);
             }
@@ -337,11 +338,12 @@ impl SingleFileDB {
           for (key_id, after_value) in after_props {
             let (src, etype, dst) = *edge_key;
             let mut before_value = old_edge_prop(src, etype, dst, *key_id);
-            if before_value == *after_value {
+            if before_value.as_ref() == after_value.as_deref() {
               continue;
             }
             if vc.get_edge_prop_version(src, etype, dst, *key_id).is_none() {
-              vc.append_edge_prop_version(src, etype, dst, *key_id, before_value.take(), 0, 0);
+              let before_shared = before_value.take().map(std::sync::Arc::new);
+              vc.append_edge_prop_version(src, etype, dst, *key_id, before_shared, 0, 0);
             }
             vc.append_edge_prop_version(
               src,
@@ -470,7 +472,7 @@ fn merge_pending_delta(target: &mut DeltaState, mut pending: DeltaState) {
     if let Some(props) = node_delta.props.take() {
       for (key_id, value) in props {
         match value {
-          Some(value) => target.set_node_prop(node_id, key_id, value),
+          Some(value) => target.set_node_prop_ref(node_id, key_id, value),
           None => target.delete_node_prop(node_id, key_id),
         }
       }
@@ -495,7 +497,7 @@ fn merge_pending_delta(target: &mut DeltaState, mut pending: DeltaState) {
     if let Some(props) = node_delta.props.take() {
       for (key_id, value) in props {
         match value {
-          Some(value) => target.set_node_prop(node_id, key_id, value),
+          Some(value) => target.set_node_prop_ref(node_id, key_id, value),
           None => target.delete_node_prop(node_id, key_id),
         }
       }
@@ -517,7 +519,7 @@ fn merge_pending_delta(target: &mut DeltaState, mut pending: DeltaState) {
   for ((src, etype, dst), props) in pending.edge_props.drain() {
     for (key_id, value) in props {
       match value {
-        Some(value) => target.set_edge_prop(src, etype, dst, key_id, value),
+        Some(value) => target.set_edge_prop_ref(src, etype, dst, key_id, value),
         None => target.delete_edge_prop(src, etype, dst, key_id),
       }
     }
