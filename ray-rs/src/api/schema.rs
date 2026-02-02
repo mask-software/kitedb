@@ -332,11 +332,13 @@ pub struct NodeSchemaBuilder {
 }
 
 impl NodeSchemaBuilder {
-  fn new(name: &str) -> Self {
+  fn new(name: impl Into<String>) -> Self {
+    let name = name.into();
+    let key_prefix = format!("{name}:");
     Self {
-      name: name.to_string(),
+      name,
       key_fn: None,
-      key_prefix: format!("{name}:"),
+      key_prefix,
       props: HashMap::new(),
     }
   }
@@ -367,8 +369,8 @@ impl NodeSchemaBuilder {
   }
 
   /// Set a custom key prefix (overrides auto-detection)
-  pub fn key_prefix(mut self, prefix: &str) -> Self {
-    self.key_prefix = prefix.to_string();
+  pub fn key_prefix(mut self, prefix: impl Into<String>) -> Self {
+    self.key_prefix = prefix.into();
     self
   }
 
@@ -432,13 +434,13 @@ impl NodeSchemaBuilder {
 ///     .prop(prop::string("content").optional())
 ///     .build();
 /// ```
-pub fn node(name: &str) -> NodeSchemaBuilder {
+pub fn node(name: impl Into<String>) -> NodeSchemaBuilder {
   NodeSchemaBuilder::new(name)
 }
 
 /// Define a node type (deprecated alias for `node()`)
 #[deprecated(since = "0.2.0", note = "Use `node()` instead")]
-pub fn define_node(name: &str) -> NodeSchemaBuilder {
+pub fn define_node(name: impl Into<String>) -> NodeSchemaBuilder {
   node(name)
 }
 
@@ -521,9 +523,9 @@ pub struct EdgeSchemaBuilder {
 }
 
 impl EdgeSchemaBuilder {
-  fn new(name: &str) -> Self {
+  fn new(name: impl Into<String>) -> Self {
     Self {
-      name: name.to_string(),
+      name: name.into(),
       props: HashMap::new(),
     }
   }
@@ -573,13 +575,13 @@ impl EdgeSchemaBuilder {
 /// // Edge without properties
 /// let follows = edge("follows").build();
 /// ```
-pub fn edge(name: &str) -> EdgeSchemaBuilder {
+pub fn edge(name: impl Into<String>) -> EdgeSchemaBuilder {
   EdgeSchemaBuilder::new(name)
 }
 
 /// Define an edge type (deprecated alias for `edge()`)
 #[deprecated(since = "0.2.0", note = "Use `edge()` instead")]
-pub fn define_edge(name: &str) -> EdgeSchemaBuilder {
+pub fn define_edge(name: impl Into<String>) -> EdgeSchemaBuilder {
   edge(name)
 }
 
