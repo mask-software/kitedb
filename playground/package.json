@@ -1,6 +1,6 @@
 {
   "name": "@ray-db/playground",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Interactive web playground for RayDB graph database",
   "type": "module",
   "scripts": {

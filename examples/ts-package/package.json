@@ -1,7 +1,7 @@
 {
   "name": "kitedb-ts-example",
   "private": true,
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "TypeScript example using the published @kitedb/core package",
   "scripts": {
     "dev": "tsx src/index.ts",
