@@ -545,6 +545,10 @@ pub struct KiteOptions {
   pub mvcc_retention_ms: Option<u64>,
   /// MVCC max version chain depth
   pub mvcc_max_chain_depth: Option<usize>,
+  /// WAL size in bytes (default: 1MB)
+  pub wal_size: Option<usize>,
+  /// WAL usage threshold (0.0-1.0) to trigger auto-checkpoint
+  pub checkpoint_threshold: Option<f64>,
 }
 
 impl KiteOptions {
@@ -561,6 +565,8 @@ impl KiteOptions {
       mvcc_gc_interval_ms: None,
       mvcc_retention_ms: None,
       mvcc_max_chain_depth: None,
+      wal_size: None,
+      checkpoint_threshold: None,
     }
   }
 
@@ -625,6 +631,24 @@ impl KiteOptions {
 
   pub fn mvcc_max_chain_depth(mut self, value: usize) -> Self {
     self.mvcc_max_chain_depth = Some(value);
+    self
+  }
+
+  /// Set WAL size in bytes
+  pub fn wal_size(mut self, value: usize) -> Self {
+    self.wal_size = Some(value);
+    self
+  }
+
+  /// Set WAL size in megabytes
+  pub fn wal_size_mb(mut self, value: usize) -> Self {
+    self.wal_size = Some(value.saturating_mul(1024 * 1024));
+    self
+  }
+
+  /// Set checkpoint threshold (0.0-1.0)
+  pub fn checkpoint_threshold(mut self, value: f64) -> Self {
+    self.checkpoint_threshold = Some(value.clamp(0.0, 1.0));
     self
   }
 }
@@ -697,6 +721,12 @@ impl Kite {
     }
     if let Some(v) = options.mvcc_max_chain_depth {
       db_options = db_options.mvcc_max_chain_depth(v);
+    }
+    if let Some(v) = options.wal_size {
+      db_options = db_options.wal_size(v);
+    }
+    if let Some(v) = options.checkpoint_threshold {
+      db_options = db_options.checkpoint_threshold(v);
     }
     let db = open_single_file(&db_path, db_options)?;
 
@@ -1139,16 +1169,16 @@ impl Kite {
     let mut handle = begin_tx(&self.db)?;
     add_edge(&mut handle, src, etype_id, dst)?;
 
-    // Set edge properties
+    let mut prop_pairs = Vec::with_capacity(props.len());
     for (prop_name, value) in props {
       let prop_key_id = if let Some(&id) = edge_def.prop_key_ids.get(&prop_name) {
         id
       } else {
-        // Create prop key if not in schema
         handle.db.get_or_create_propkey(&prop_name)
       };
-      set_edge_prop(&mut handle, src, etype_id, dst, prop_key_id, value)?;
+      prop_pairs.push((prop_key_id, value));
     }
+    handle.db.set_edge_props(src, etype_id, dst, prop_pairs)?;
 
     commit(&mut handle)?;
     Ok(())
@@ -1311,6 +1341,43 @@ impl Kite {
 
     let mut handle = begin_tx(&self.db)?;
     set_edge_prop(&mut handle, src, etype_id, dst, prop_key_id, value)?;
+    commit(&mut handle)?;
+    Ok(())
+  }
+
+  /// Set multiple edge properties
+  pub fn set_edge_props(
+    &mut self,
+    src: NodeId,
+    edge_type: &str,
+    dst: NodeId,
+    props: HashMap<String, PropValue>,
+  ) -> Result<()> {
+    if props.is_empty() {
+      return Ok(());
+    }
+
+    let edge_def = self
+      .edges
+      .get(edge_type)
+      .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown edge type: {edge_type}").into()))?;
+
+    let etype_id = edge_def
+      .etype_id
+      .ok_or_else(|| KiteError::InvalidSchema("Edge type not initialized".into()))?;
+
+    let mut prop_pairs = Vec::with_capacity(props.len());
+    for (prop_name, value) in props {
+      let prop_key_id = if let Some(&id) = edge_def.prop_key_ids.get(&prop_name) {
+        id
+      } else {
+        self.db.get_or_create_propkey(&prop_name)
+      };
+      prop_pairs.push((prop_key_id, value));
+    }
+
+    let mut handle = begin_tx(&self.db)?;
+    handle.db.set_edge_props(src, etype_id, dst, prop_pairs)?;
     commit(&mut handle)?;
     Ok(())
   }
@@ -2321,6 +2388,13 @@ pub enum BatchOp {
     prop_name: String,
     value: PropValue,
   },
+  /// Set multiple edge properties
+  SetEdgeProps {
+    src: NodeId,
+    edge_type: String,
+    dst: NodeId,
+    props: HashMap<String, PropValue>,
+  },
   /// Delete a node property
   DelProp { node_id: NodeId, prop_name: String },
 }
@@ -2477,6 +2551,34 @@ impl Kite {
           };
 
           set_edge_prop(&mut handle, src, etype_id, dst, prop_key_id, value)?;
+          BatchResult::PropSet
+        }
+
+        BatchOp::SetEdgeProps {
+          src,
+          edge_type,
+          dst,
+          props,
+        } => {
+          let edge_def = self.edges.get(&edge_type).ok_or_else(|| {
+            KiteError::InvalidSchema(format!("Unknown edge type: {edge_type}").into())
+          })?;
+
+          let etype_id = edge_def
+            .etype_id
+            .ok_or_else(|| KiteError::InvalidSchema("Edge type not initialized".into()))?;
+
+          let mut prop_pairs = Vec::with_capacity(props.len());
+          for (prop_name, value) in props {
+            let prop_key_id = if let Some(&id) = edge_def.prop_key_ids.get(&prop_name) {
+              id
+            } else {
+              handle.db.get_or_create_propkey(&prop_name)
+            };
+            prop_pairs.push((prop_key_id, value));
+          }
+
+          handle.db.set_edge_props(src, etype_id, dst, prop_pairs)?;
           BatchResult::PropSet
         }
 
@@ -2784,6 +2886,23 @@ impl TxBuilder {
       dst,
       prop_name: prop_name.into(),
       value,
+    });
+    self
+  }
+
+  /// Add a set edge properties operation
+  pub fn set_edge_props(
+    mut self,
+    src: NodeId,
+    edge_type: impl Into<String>,
+    dst: NodeId,
+    props: HashMap<String, PropValue>,
+  ) -> Self {
+    self.ops.push(BatchOp::SetEdgeProps {
+      src,
+      edge_type: edge_type.into(),
+      dst,
+      props,
     });
     self
   }
@@ -4149,6 +4268,43 @@ mod tests {
   }
 
   #[test]
+  fn test_batch_set_edge_props() {
+    let temp_dir = tempdir().unwrap();
+    let options = create_test_schema();
+
+    let mut ray = Kite::open(temp_db_path(&temp_dir), options).unwrap();
+
+    let alice = ray.create_node("User", "alice", HashMap::new()).unwrap();
+    let bob = ray.create_node("User", "bob", HashMap::new()).unwrap();
+    ray.link(alice.id, "FOLLOWS", bob.id).unwrap();
+
+    let mut props = HashMap::new();
+    props.insert("weight".to_string(), PropValue::F64(0.33));
+    props.insert("since".to_string(), PropValue::String("2023".into()));
+
+    ray
+      .batch(vec![BatchOp::SetEdgeProps {
+        src: alice.id,
+        edge_type: "FOLLOWS".into(),
+        dst: bob.id,
+        props,
+      }])
+      .unwrap();
+
+    let weight = ray
+      .get_edge_prop(alice.id, "FOLLOWS", bob.id, "weight")
+      .unwrap();
+    assert_eq!(weight, Some(PropValue::F64(0.33)));
+
+    let since = ray
+      .get_edge_prop(alice.id, "FOLLOWS", bob.id, "since")
+      .unwrap();
+    assert_eq!(since, Some(PropValue::String("2023".into())));
+
+    ray.close().unwrap();
+  }
+
+  #[test]
   fn test_batch_mixed_operations() {
     let temp_dir = tempdir().unwrap();
     let options = create_test_schema();
@@ -4525,6 +4681,36 @@ mod tests {
       .get_edge_prop(alice.id, "FOLLOWS", bob.id, "weight")
       .unwrap();
     assert_eq!(new_weight, Some(PropValue::F64(0.9)));
+
+    ray.close().unwrap();
+  }
+
+  #[test]
+  fn test_set_edge_props() {
+    let temp_dir = tempdir().unwrap();
+    let options = create_test_schema();
+
+    let mut ray = Kite::open(temp_db_path(&temp_dir), options).unwrap();
+
+    let alice = ray.create_node("User", "alice", HashMap::new()).unwrap();
+    let bob = ray.create_node("User", "bob", HashMap::new()).unwrap();
+
+    ray.link(alice.id, "FOLLOWS", bob.id).unwrap();
+
+    let mut props = HashMap::new();
+    props.insert("weight".to_string(), PropValue::F64(0.6));
+    props.insert("since".to_string(), PropValue::String("2024".into()));
+    ray.set_edge_props(alice.id, "FOLLOWS", bob.id, props).unwrap();
+
+    let weight = ray
+      .get_edge_prop(alice.id, "FOLLOWS", bob.id, "weight")
+      .unwrap();
+    assert_eq!(weight, Some(PropValue::F64(0.6)));
+
+    let since = ray
+      .get_edge_prop(alice.id, "FOLLOWS", bob.id, "since")
+      .unwrap();
+    assert_eq!(since, Some(PropValue::String("2024".into())));
 
     ray.close().unwrap();
   }

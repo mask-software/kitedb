@@ -8,7 +8,7 @@ use crate::core::wal::record::{
   build_define_etype_payload, build_define_label_payload, build_define_propkey_payload,
   build_del_edge_prop_payload, build_del_node_prop_payload, build_delete_edge_payload,
   build_delete_node_payload, build_remove_node_label_payload, build_set_edge_prop_payload,
-  build_set_node_prop_payload, WalRecord,
+  build_set_edge_props_payload, build_set_node_prop_payload, WalRecord,
 };
 use crate::error::{KiteError, Result};
 use crate::types::*;
@@ -421,6 +421,54 @@ impl SingleFileDB {
     }
 
     // Invalidate cache
+    self.cache_invalidate_edge(src, etype, dst);
+
+    Ok(())
+  }
+
+  /// Set multiple edge properties in a single WAL record
+  pub fn set_edge_props(
+    &self,
+    src: NodeId,
+    etype: ETypeId,
+    dst: NodeId,
+    props: Vec<(PropKeyId, PropValue)>,
+  ) -> Result<()> {
+    if props.is_empty() {
+      return Ok(());
+    }
+
+    let (txid, tx_handle) = self.require_write_tx_handle()?;
+
+    let record = WalRecord::new(
+      WalRecordType::SetEdgeProps,
+      txid,
+      build_set_edge_props_payload(src, etype, dst, &props),
+    );
+    self.write_wal(record)?;
+
+    if let Some(mvcc) = self.mvcc.as_ref() {
+      let mut tx_mgr = mvcc.tx_manager.lock();
+      for (key_id, _) in props.iter() {
+        tx_mgr.record_write(
+          txid,
+          TxKey::EdgeProp {
+            src,
+            etype,
+            dst,
+            key_id: *key_id,
+          },
+        );
+      }
+    }
+
+    {
+      let mut tx = tx_handle.lock();
+      for (key_id, value) in props.into_iter() {
+        tx.pending.set_edge_prop(src, etype, dst, key_id, value);
+      }
+    }
+
     self.cache_invalidate_edge(src, etype, dst);
 
     Ok(())

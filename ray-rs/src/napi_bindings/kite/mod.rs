@@ -126,6 +126,14 @@ impl Kite {
     if let Some(mode) = options.sync_mode {
       kite_opts.sync_mode = mode.into();
     }
+    if let Some(wal_size_mb) = options.wal_size_mb {
+      if wal_size_mb > 0 {
+        kite_opts.wal_size = Some((wal_size_mb as usize).saturating_mul(1024 * 1024));
+      }
+    }
+    if let Some(threshold) = options.checkpoint_threshold {
+      kite_opts.checkpoint_threshold = Some(threshold.clamp(0.0, 1.0));
+    }
 
     for node in options.nodes {
       let key_spec = Arc::new(parse_key_spec(&node.name, node.key)?);
@@ -560,6 +568,24 @@ impl Kite {
     })
   }
 
+  /// Set multiple edge properties
+  #[napi]
+  pub fn set_edge_props(
+    &self,
+    env: Env,
+    src: i64,
+    edge_type: String,
+    dst: i64,
+    props: Option<Object>,
+  ) -> Result<()> {
+    let props_map = js_props_to_map(&env, props)?;
+    self.with_kite_mut(|ray| {
+      ray
+        .set_edge_props(src as NodeId, &edge_type, dst as NodeId, props_map)
+        .map_err(|e| Error::from_reason(e.to_string()))
+    })
+  }
+
   /// Delete an edge property
   #[napi]
   pub fn del_edge_prop(
@@ -910,6 +936,19 @@ impl Kite {
             value: prop_value,
           });
         }
+        "setEdgeProps" => {
+          let src: i64 = op.get_named_property("src")?;
+          let dst: i64 = op.get_named_property("dst")?;
+          let edge_type: String = op.get_named_property("edgeType")?;
+          let props: Option<Object> = op.get_named_property("props")?;
+          let props_map = js_props_to_map(&env, props)?;
+          rust_ops.push(BatchOp::SetEdgeProps {
+            src: src as NodeId,
+            edge_type,
+            dst: dst as NodeId,
+            props: props_map,
+          });
+        }
         "delProp" => {
           let node_id: i64 = op.get_named_property("nodeId")?;
           let prop_name: String = op.get_named_property("propName")?;
@@ -1013,6 +1052,17 @@ impl napi::Task for OpenKiteTask {
     kite_opts.mvcc_gc_interval_ms = self.options.mvcc_gc_interval_ms.map(|v| v as u64);
     kite_opts.mvcc_retention_ms = self.options.mvcc_retention_ms.map(|v| v as u64);
     kite_opts.mvcc_max_chain_depth = self.options.mvcc_max_chain_depth.map(|v| v as usize);
+    if let Some(mode) = self.options.sync_mode.take() {
+      kite_opts.sync_mode = mode.into();
+    }
+    if let Some(wal_size_mb) = self.options.wal_size_mb {
+      if wal_size_mb > 0 {
+        kite_opts.wal_size = Some((wal_size_mb as usize).saturating_mul(1024 * 1024));
+      }
+    }
+    if let Some(threshold) = self.options.checkpoint_threshold {
+      kite_opts.checkpoint_threshold = Some(threshold.clamp(0.0, 1.0));
+    }
 
     for node in &self.options.nodes {
       let key_spec = Arc::new(parse_key_spec(&node.name, node.key.clone())?);

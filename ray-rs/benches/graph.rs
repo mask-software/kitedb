@@ -56,7 +56,7 @@ fn create_code_graph_schema() -> KiteOptions {
     .prop(PropDef::float("weight"));
   let imports = EdgeDef::new("IMPORTS").prop(PropDef::int("line"));
 
-  KiteOptions::new()
+  let mut options = KiteOptions::new()
     .node(file)
     .node(chunk)
     .node(symbol)
@@ -64,7 +64,20 @@ fn create_code_graph_schema() -> KiteOptions {
     .edge(references)
     .edge(calls)
     .edge(imports)
-    .sync_mode(SyncMode::Normal)
+    .sync_mode(SyncMode::Normal);
+
+  if let Ok(wal_mb) = env::var("KITE_BENCH_WAL_MB") {
+    if let Ok(mb) = wal_mb.parse::<usize>() {
+      options = options.wal_size_mb(mb);
+    }
+  }
+  if let Ok(threshold) = env::var("KITE_BENCH_CHECKPOINT_THRESHOLD") {
+    if let Ok(value) = threshold.parse::<f64>() {
+      options = options.checkpoint_threshold(value);
+    }
+  }
+
+  options
 }
 
 struct CodeGraphFixture {
@@ -162,14 +175,18 @@ fn apply_code_graph_edges(ray: &mut Kite, fixture: &CodeGraphFixture) {
 
   for (src, dst, line, role) in fixture.references.iter() {
     let _ = ray.link(*src, "REFERENCES", *dst);
-    let _ = ray.set_edge_prop(*src, "REFERENCES", *dst, "line", PropValue::I64(*line));
-    let _ = ray.set_edge_prop(*src, "REFERENCES", *dst, "role", PropValue::I64(*role));
+    let mut props = HashMap::with_capacity(2);
+    props.insert("line".to_string(), PropValue::I64(*line));
+    props.insert("role".to_string(), PropValue::I64(*role));
+    let _ = ray.set_edge_props(*src, "REFERENCES", *dst, props);
   }
 
   for (src, dst, line, weight) in fixture.calls.iter() {
     let _ = ray.link(*src, "CALLS", *dst);
-    let _ = ray.set_edge_prop(*src, "CALLS", *dst, "line", PropValue::I64(*line));
-    let _ = ray.set_edge_prop(*src, "CALLS", *dst, "weight", PropValue::F64(*weight));
+    let mut props = HashMap::with_capacity(2);
+    props.insert("line".to_string(), PropValue::I64(*line));
+    props.insert("weight".to_string(), PropValue::F64(*weight));
+    let _ = ray.set_edge_props(*src, "CALLS", *dst, props);
   }
 
   for (src, dst, line) in fixture.imports.iter() {
@@ -198,12 +215,13 @@ fn apply_code_graph_edges_batched(ray: &mut Kite, fixture: &CodeGraphFixture, ba
       edge_type: "CONTAINS".into(),
       dst: *dst,
     });
-    ops.push(BatchOp::SetEdgeProp {
+    let mut props = HashMap::with_capacity(1);
+    props.insert("order".to_string(), PropValue::I64(*order));
+    ops.push(BatchOp::SetEdgeProps {
       src: *src,
       edge_type: "CONTAINS".into(),
       dst: *dst,
-      prop_name: "order".into(),
-      value: PropValue::I64(*order),
+      props,
     });
     if ops.len() >= batch_size {
       flush(ray, &mut ops);
@@ -216,19 +234,14 @@ fn apply_code_graph_edges_batched(ray: &mut Kite, fixture: &CodeGraphFixture, ba
       edge_type: "REFERENCES".into(),
       dst: *dst,
     });
-    ops.push(BatchOp::SetEdgeProp {
+    let mut props = HashMap::with_capacity(2);
+    props.insert("line".to_string(), PropValue::I64(*line));
+    props.insert("role".to_string(), PropValue::I64(*role));
+    ops.push(BatchOp::SetEdgeProps {
       src: *src,
       edge_type: "REFERENCES".into(),
       dst: *dst,
-      prop_name: "line".into(),
-      value: PropValue::I64(*line),
-    });
-    ops.push(BatchOp::SetEdgeProp {
-      src: *src,
-      edge_type: "REFERENCES".into(),
-      dst: *dst,
-      prop_name: "role".into(),
-      value: PropValue::I64(*role),
+      props,
     });
     if ops.len() >= batch_size {
       flush(ray, &mut ops);
@@ -241,19 +254,14 @@ fn apply_code_graph_edges_batched(ray: &mut Kite, fixture: &CodeGraphFixture, ba
       edge_type: "CALLS".into(),
       dst: *dst,
     });
-    ops.push(BatchOp::SetEdgeProp {
+    let mut props = HashMap::with_capacity(2);
+    props.insert("line".to_string(), PropValue::I64(*line));
+    props.insert("weight".to_string(), PropValue::F64(*weight));
+    ops.push(BatchOp::SetEdgeProps {
       src: *src,
       edge_type: "CALLS".into(),
       dst: *dst,
-      prop_name: "line".into(),
-      value: PropValue::I64(*line),
-    });
-    ops.push(BatchOp::SetEdgeProp {
-      src: *src,
-      edge_type: "CALLS".into(),
-      dst: *dst,
-      prop_name: "weight".into(),
-      value: PropValue::F64(*weight),
+      props,
     });
     if ops.len() >= batch_size {
       flush(ray, &mut ops);
@@ -266,12 +274,13 @@ fn apply_code_graph_edges_batched(ray: &mut Kite, fixture: &CodeGraphFixture, ba
       edge_type: "IMPORTS".into(),
       dst: *dst,
     });
-    ops.push(BatchOp::SetEdgeProp {
+    let mut props = HashMap::with_capacity(1);
+    props.insert("line".to_string(), PropValue::I64(*line));
+    ops.push(BatchOp::SetEdgeProps {
       src: *src,
       edge_type: "IMPORTS".into(),
       dst: *dst,
-      prop_name: "line".into(),
-      value: PropValue::I64(*line),
+      props,
     });
     if ops.len() >= batch_size {
       flush(ray, &mut ops);

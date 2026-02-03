@@ -204,6 +204,7 @@ pub enum WalRecordType {
   DelNodeProp = 52,
   SetEdgeProp = 53,
   DelEdgeProp = 54,
+  SetEdgeProps = 55,
   // Vector embeddings operations
   SetNodeVector = 60,
   DelNodeVector = 61,
@@ -231,6 +232,7 @@ impl WalRecordType {
       52 => Some(Self::DelNodeProp),
       53 => Some(Self::SetEdgeProp),
       54 => Some(Self::DelEdgeProp),
+      55 => Some(Self::SetEdgeProps),
       60 => Some(Self::SetNodeVector),
       61 => Some(Self::DelNodeVector),
       62 => Some(Self::BatchVectors),

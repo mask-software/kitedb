@@ -560,6 +560,7 @@ export class Kite extends NativeKite {
       'unlink',
       'setProp',
       'setEdgeProp',
+      'setEdgeProps',
       'delProp',
     ])
     const isNativeBatch = operations.every((op) => {
@@ -722,6 +723,15 @@ export class Kite extends NativeKite {
     return super.setEdgeProp(nodeId(src), edgeName(edgeType), nodeId(dst), propName, value)
   }
 
+  setEdgeProps(
+    src: NodeIdLike,
+    edgeType: EdgeLike,
+    dst: NodeIdLike,
+    props: Record<string, unknown>,
+  ): void {
+    return super.setEdgeProps(nodeId(src), edgeName(edgeType), nodeId(dst), props)
+  }
+
   delEdgeProp(src: NodeIdLike, edgeType: EdgeLike, dst: NodeIdLike, propName: string): void {
     return super.delEdgeProp(nodeId(src), edgeName(edgeType), nodeId(dst), propName)
   }
@@ -818,6 +828,12 @@ export interface Kite {
     dst: NodeIdLike,
     propName: string,
     value: unknown,
+  ): void
+  setEdgeProps(
+    src: NodeIdLike,
+    edgeType: EdgeLike,
+    dst: NodeIdLike,
+    props: Record<string, unknown>,
   ): void
   delEdgeProp(src: NodeIdLike, edgeType: EdgeLike, dst: NodeIdLike, propName: string): void
   updateEdge(src: NodeIdLike, edgeType: EdgeLike, dst: NodeIdLike): KiteUpdateEdgeBuilder
@@ -1034,6 +1050,10 @@ export interface KiteOptions {
   syncMode?: SyncMode
   /** Acquire file lock (default: true) */
   lockFile?: boolean
+  /** WAL size in megabytes (default: 1MB) */
+  walSizeMb?: number
+  /** WAL usage threshold (0.0-1.0) to trigger auto-checkpoint */
+  checkpointThreshold?: number
 }
 
 // =============================================================================
@@ -1089,6 +1109,8 @@ function optionsToNative(options: KiteOptions): JsKiteOptions {
     createIfMissing: options.createIfMissing,
     syncMode: options.syncMode,
     lockFile: options.lockFile,
+    walSizeMb: options.walSizeMb,
+    checkpointThreshold: options.checkpointThreshold,
   }
 }
 

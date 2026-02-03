@@ -80,4 +80,8 @@ pub struct JsKiteOptions {
   pub mvcc_max_chain_depth: Option<i64>,
   /// Sync mode: "Full", "Normal", or "Off" (default: "Full")
   pub sync_mode: Option<JsSyncMode>,
+  /// WAL size in megabytes (default: 1MB)
+  pub wal_size_mb: Option<i64>,
+  /// WAL usage threshold (0.0-1.0) to trigger auto-checkpoint
+  pub checkpoint_threshold: Option<f64>,
 }

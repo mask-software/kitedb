@@ -358,6 +358,34 @@ pub fn build_set_edge_prop_payload(
   buffer
 }
 
+/// Build SET_EDGE_PROPS payload (multiple props on one edge)
+pub fn build_set_edge_props_payload(
+  src: NodeId,
+  etype: ETypeId,
+  dst: NodeId,
+  props: &[(PropKeyId, PropValue)],
+) -> Vec<u8> {
+  let mut total_len = 8 + 4 + 8 + 4; // src + etype + dst + count
+  for (_, value) in props.iter() {
+    total_len += 4 + prop_value_serialized_len(value);
+  }
+
+  let mut buffer = vec![0u8; total_len];
+  write_u64(&mut buffer, 0, src);
+  write_u32(&mut buffer, 8, etype);
+  write_u64(&mut buffer, 12, dst);
+  write_u32(&mut buffer, 20, props.len() as u32);
+
+  let mut offset = 24;
+  for (key_id, value) in props.iter() {
+    write_u32(&mut buffer, offset, *key_id);
+    offset += 4;
+    write_prop_value(value, &mut buffer[offset..]);
+    offset += prop_value_serialized_len(value);
+  }
+  buffer
+}
+
 /// Build DEL_EDGE_PROP payload
 pub fn build_del_edge_prop_payload(
   src: NodeId,
@@ -724,6 +752,47 @@ pub fn parse_set_edge_prop_payload(payload: &[u8]) -> Option<SetEdgePropData> {
   })
 }
 
+/// Parsed SET_EDGE_PROPS data
+#[derive(Debug, Clone)]
+pub struct SetEdgePropsData {
+  pub src: NodeId,
+  pub etype: ETypeId,
+  pub dst: NodeId,
+  pub props: Vec<(PropKeyId, PropValue)>,
+}
+
+/// Parse SET_EDGE_PROPS payload
+/// Format: src (8) + etype (4) + dst (8) + count (4) + repeated (key_id (4) + value)
+pub fn parse_set_edge_props_payload(payload: &[u8]) -> Option<SetEdgePropsData> {
+  if payload.len() < 24 {
+    return None;
+  }
+  let src = read_u64(payload, 0);
+  let etype = read_u32(payload, 8);
+  let dst = read_u64(payload, 12);
+  let count = read_u32(payload, 20) as usize;
+
+  let mut props = Vec::with_capacity(count);
+  let mut offset = 24;
+  for _ in 0..count {
+    if offset + 4 > payload.len() {
+      return None;
+    }
+    let key_id = read_u32(payload, offset);
+    offset += 4;
+    let (value, consumed) = parse_prop_value(payload, offset)?;
+    offset += consumed;
+    props.push((key_id, value));
+  }
+
+  Some(SetEdgePropsData {
+    src,
+    etype,
+    dst,
+    props,
+  })
+}
+
 /// Parsed DEL_EDGE_PROP data
 #[derive(Debug, Clone)]
 pub struct DelEdgePropData {
@@ -782,6 +851,25 @@ mod tests {
     assert_eq!(data.src, 1);
     assert_eq!(data.etype, 100);
     assert_eq!(data.dst, 2);
+  }
+
+  #[test]
+  fn test_set_edge_props_payload() {
+    let props = vec![
+      (10, PropValue::I64(42)),
+      (11, PropValue::String("ok".into())),
+    ];
+    let payload = build_set_edge_props_payload(1, 2, 3, &props);
+    let data = parse_set_edge_props_payload(&payload).unwrap();
+
+    assert_eq!(data.src, 1);
+    assert_eq!(data.etype, 2);
+    assert_eq!(data.dst, 3);
+    assert_eq!(data.props.len(), 2);
+    assert_eq!(data.props[0].0, 10);
+    assert_eq!(data.props[0].1, PropValue::I64(42));
+    assert_eq!(data.props[1].0, 11);
+    assert_eq!(data.props[1].1, PropValue::String("ok".into()));
   }
 
   #[test]

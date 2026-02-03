@@ -79,7 +79,7 @@ pub struct SingleFileOpenOptions {
   pub page_size: usize,
   /// WAL size in bytes (default 1MB)
   pub wal_size: usize,
-  /// Enable auto-checkpoint when WAL usage exceeds threshold
+  /// Enable auto-checkpoint when WAL usage exceeds threshold (default true)
   pub auto_checkpoint: bool,
   /// WAL usage threshold (0.0-1.0) to trigger auto-checkpoint (default 0.8)
   pub checkpoint_threshold: f64,
@@ -110,7 +110,7 @@ impl Default for SingleFileOpenOptions {
       mvcc_max_chain_depth: None,
       page_size: DEFAULT_PAGE_SIZE,
       wal_size: WAL_DEFAULT_SIZE,
-      auto_checkpoint: false,
+      auto_checkpoint: true,
       checkpoint_threshold: 0.8,
       background_checkpoint: true,
       cache: None,
@@ -288,6 +288,14 @@ pub fn open_single_file<P: AsRef<Path>>(
     // Read and validate header
     let header_data = pager.read_page(0)?;
     let header = DbHeaderV1::parse(&header_data)?;
+
+    let expected_wal_pages = pages_to_store(options.wal_size, header.page_size as usize) as u64;
+    if header.wal_page_count != expected_wal_pages {
+      return Err(KiteError::InvalidSnapshot(format!(
+        "WAL size mismatch: header has {} pages, options require {} pages",
+        header.wal_page_count, expected_wal_pages
+      )));
+    }
 
     (pager, header, false)
   } else {
@@ -503,7 +511,7 @@ pub fn open_single_file<P: AsRef<Path>>(
         parse_add_edge_payload, parse_add_node_label_payload, parse_create_node_payload,
         parse_del_edge_prop_payload, parse_del_node_prop_payload, parse_delete_edge_payload,
         parse_delete_node_payload, parse_remove_node_label_payload, parse_set_edge_prop_payload,
-        parse_set_node_prop_payload,
+        parse_set_edge_props_payload, parse_set_node_prop_payload,
       };
 
       let mut commit_ts: u64 = 1;
@@ -574,6 +582,22 @@ pub fn open_single_file<P: AsRef<Path>>(
                   *txid,
                   commit_ts,
                 );
+              }
+            }
+            WalRecordType::SetEdgeProps => {
+              if let Some(data) = parse_set_edge_props_payload(&record.payload) {
+                let mut vc = mvcc.version_chain.lock();
+                for (key_id, value) in data.props {
+                  vc.append_edge_prop_version(
+                    data.src,
+                    data.etype,
+                    data.dst,
+                    key_id,
+                    Some(std::sync::Arc::new(value)),
+                    *txid,
+                    commit_ts,
+                  );
+                }
               }
             }
             WalRecordType::DelEdgeProp => {
@@ -795,6 +819,26 @@ mod tests {
     assert!(db.get_node_by_key("n1").is_some());
     assert!(db.get_node_by_key("n2").is_some());
     close_single_file(db).unwrap();
+  }
+
+  #[test]
+  fn test_open_rejects_wal_size_mismatch() {
+    let temp_dir = tempdir().unwrap();
+    let db_path = temp_dir.path().join("wal-size-mismatch.kitedb");
+
+    let db = open_single_file(
+      &db_path,
+      SingleFileOpenOptions::new().wal_size(64 * 1024),
+    )
+    .unwrap();
+    close_single_file(db).unwrap();
+
+    let reopen = open_single_file(
+      &db_path,
+      SingleFileOpenOptions::new().wal_size(64 * 1024 * 1024),
+    );
+
+    assert!(reopen.is_err(), "expected wal size mismatch to error");
   }
 
   #[test]

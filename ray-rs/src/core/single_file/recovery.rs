@@ -12,8 +12,8 @@ use crate::core::wal::record::{
   parse_create_node_payload, parse_define_etype_payload, parse_define_label_payload,
   parse_define_propkey_payload, parse_del_edge_prop_payload, parse_del_node_prop_payload,
   parse_del_node_vector_payload, parse_delete_edge_payload, parse_delete_node_payload,
-  parse_remove_node_label_payload, parse_set_edge_prop_payload, parse_set_node_prop_payload,
-  parse_set_node_vector_payload, ParsedWalRecord,
+  parse_remove_node_label_payload, parse_set_edge_prop_payload, parse_set_edge_props_payload,
+  parse_set_node_prop_payload, parse_set_node_vector_payload, ParsedWalRecord,
 };
 use crate::error::Result;
 use crate::types::*;
@@ -211,6 +211,13 @@ pub fn replay_wal_record(
     WalRecordType::SetEdgeProp => {
       if let Some(data) = parse_set_edge_prop_payload(&record.payload) {
         delta.set_edge_prop(data.src, data.etype, data.dst, data.key_id, data.value);
+      }
+    }
+    WalRecordType::SetEdgeProps => {
+      if let Some(data) = parse_set_edge_props_payload(&record.payload) {
+        for (key_id, value) in data.props {
+          delta.set_edge_prop(data.src, data.etype, data.dst, key_id, value);
+        }
       }
     }
     WalRecordType::DelEdgeProp => {
