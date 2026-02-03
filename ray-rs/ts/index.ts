@@ -92,6 +92,7 @@ import type {
   JsTraverseOptions,
   JsPathResult,
   JsFullEdge,
+  Database,
   KiteInsertExecutorSingle,
   KiteInsertExecutorMany,
   KiteUpsertExecutorSingle,
@@ -552,7 +553,15 @@ export class Kite extends NativeKite {
       return []
     }
 
-    const nativeOps = new Set(['createNode', 'deleteNode', 'link', 'unlink', 'setProp', 'delProp'])
+    const nativeOps = new Set([
+      'createNode',
+      'deleteNode',
+      'link',
+      'unlink',
+      'setProp',
+      'setEdgeProp',
+      'delProp',
+    ])
     const isNativeBatch = operations.every((op) => {
       if (!op || typeof op !== 'object') {
         return false
@@ -584,7 +593,7 @@ export class Kite extends NativeKite {
           throw new Error('Unsupported batch operation')
         }
 
-        if (value && typeof (value as Promise<unknown>).then === 'function') {
+        if (value && typeof (value as { then?: unknown }).then === 'function') {
           if (!inTransaction) {
             this.rollback()
           }
@@ -836,6 +845,69 @@ export interface KiteTraversal {
   edges(): ArrayWithToArray<JsFullEdge>
   toArray(): ArrayWithToArray<NodeObject>
   count(): number
+}
+
+// =============================================================================
+// Bulk Helpers (non-atomic)
+// =============================================================================
+
+export interface BulkWriteOptions {
+  /** Max operations per transaction (default: 1000) */
+  chunkSize?: number
+  /** Call checkpoint when recommended between chunks (default: false) */
+  checkpoint?: boolean
+  /** Threshold for shouldCheckpoint (default: 0.8) */
+  checkpointThreshold?: number
+}
+
+export function bulkWrite<T>(
+  db: Database,
+  operations: Array<(db: Database) => T>,
+  options?: BulkWriteOptions,
+): Array<T> {
+  if (operations.length === 0) {
+    return []
+  }
+
+  if (db.hasTransaction()) {
+    throw new Error('bulkWrite cannot run inside an active transaction')
+  }
+
+  const chunkSize = options?.chunkSize ?? 1000
+  if (chunkSize <= 0) {
+    throw new Error('chunkSize must be greater than 0')
+  }
+
+  const checkpointThreshold = options?.checkpointThreshold ?? 0.8
+  const shouldCheckpoint = options?.checkpoint ?? false
+
+  const results: Array<T> = []
+  let index = 0
+
+  while (index < operations.length) {
+    db.begin()
+    try {
+      const end = Math.min(index + chunkSize, operations.length)
+      for (; index < end; index += 1) {
+        const op = operations[index]
+        const value = op(db)
+        if (value && typeof (value as { then?: unknown }).then === 'function') {
+          throw new Error('bulkWrite operations must be synchronous')
+        }
+        results.push(value)
+      }
+      db.commit()
+    } catch (err) {
+      db.rollback()
+      throw err
+    }
+
+    if (shouldCheckpoint && db.shouldCheckpoint(checkpointThreshold)) {
+      db.checkpoint()
+    }
+  }
+
+  return results
 }
 
 // Re-export other classes with clean names

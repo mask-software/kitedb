@@ -895,6 +895,21 @@ impl Kite {
             value: prop_value,
           });
         }
+        "setEdgeProp" => {
+          let src: i64 = op.get_named_property("src")?;
+          let dst: i64 = op.get_named_property("dst")?;
+          let edge_type: String = op.get_named_property("edgeType")?;
+          let prop_name: String = op.get_named_property("propName")?;
+          let value: Unknown = op.get_named_property("value")?;
+          let prop_value = js_value_to_prop_value(&env, value)?;
+          rust_ops.push(BatchOp::SetEdgeProp {
+            src: src as NodeId,
+            edge_type,
+            dst: dst as NodeId,
+            prop_name,
+            value: prop_value,
+          });
+        }
         "delProp" => {
           let node_id: i64 = op.get_named_property("nodeId")?;
           let prop_name: String = op.get_named_property("propName")?;
