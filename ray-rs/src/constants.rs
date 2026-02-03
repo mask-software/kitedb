@@ -8,28 +8,20 @@ use crate::types::NodeId;
 // Magic bytes (little-endian u32)
 // ============================================================================
 
-/// Manifest magic: "GDBM"
-pub const MAGIC_MANIFEST: u32 = 0x4D424447;
 /// Snapshot magic: "GDS1"
 pub const MAGIC_SNAPSHOT: u32 = 0x31534447;
-/// WAL magic: "GDW1"
-pub const MAGIC_WAL: u32 = 0x31574447;
 
 // ============================================================================
 // Current versions
 // ============================================================================
 
-pub const VERSION_MANIFEST: u32 = 1;
 pub const VERSION_SNAPSHOT: u32 = 3;
-pub const VERSION_WAL: u32 = 1;
 
 // ============================================================================
 // Minimum reader versions
 // ============================================================================
 
-pub const MIN_READER_MANIFEST: u32 = 1;
 pub const MIN_READER_SNAPSHOT: u32 = 3;
-pub const MIN_READER_WAL: u32 = 1;
 
 // ============================================================================
 // Alignment requirements
@@ -39,25 +31,6 @@ pub const MIN_READER_WAL: u32 = 1;
 pub const SECTION_ALIGNMENT: usize = 64;
 /// 8-byte alignment for WAL records
 pub const WAL_RECORD_ALIGNMENT: usize = 8;
-
-// ============================================================================
-// File extensions
-// ============================================================================
-
-pub const EXT_MANIFEST: &str = ".gdm";
-pub const EXT_SNAPSHOT: &str = ".gds";
-pub const EXT_WAL: &str = ".gdw";
-pub const EXT_LOCK: &str = ".gdl";
-
-// ============================================================================
-// File name patterns
-// ============================================================================
-
-pub const MANIFEST_FILENAME: &str = "manifest.gdm";
-pub const LOCK_FILENAME: &str = "lock.gdl";
-pub const SNAPSHOTS_DIR: &str = "snapshots";
-pub const WAL_DIR: &str = "wal";
-pub const TRASH_DIR: &str = "trash";
 
 // ============================================================================
 // Single-file format constants
@@ -154,86 +127,3 @@ pub const INITIAL_TX_ID: u64 = 1;
 // ============================================================================
 
 pub const INITIAL_SNAPSHOT_GEN: u64 = 0;
-pub const INITIAL_WAL_SEG: u64 = 1;
-
-// ============================================================================
-// Filename formatting utilities
-// ============================================================================
-
-/// Format snapshot filename from generation
-#[inline]
-pub fn snapshot_filename(gen: u64) -> String {
-  format!("snap_{gen:016}{EXT_SNAPSHOT}")
-}
-
-/// Format WAL filename from segment ID
-#[inline]
-pub fn wal_filename(seg: u64) -> String {
-  format!("wal_{seg:016}{EXT_WAL}")
-}
-
-/// Parse generation from snapshot filename
-pub fn parse_snapshot_gen(filename: &str) -> Option<u64> {
-  let prefix = "snap_";
-  let suffix = EXT_SNAPSHOT;
-
-  if !filename.starts_with(prefix) || !filename.ends_with(suffix) {
-    return None;
-  }
-
-  let num_str = &filename[prefix.len()..filename.len() - suffix.len()];
-  if num_str.len() != 16 {
-    return None;
-  }
-
-  num_str.parse().ok()
-}
-
-/// Parse segment ID from WAL filename
-pub fn parse_wal_seg(filename: &str) -> Option<u64> {
-  let prefix = "wal_";
-  let suffix = EXT_WAL;
-
-  if !filename.starts_with(prefix) || !filename.ends_with(suffix) {
-    return None;
-  }
-
-  let num_str = &filename[prefix.len()..filename.len() - suffix.len()];
-  if num_str.len() != 16 {
-    return None;
-  }
-
-  num_str.parse().ok()
-}
-
-#[cfg(test)]
-mod tests {
-  use super::*;
-
-  #[test]
-  fn test_snapshot_filename() {
-    assert_eq!(snapshot_filename(1), "snap_0000000000000001.gds");
-    assert_eq!(snapshot_filename(12345), "snap_0000000000012345.gds");
-  }
-
-  #[test]
-  fn test_wal_filename() {
-    assert_eq!(wal_filename(1), "wal_0000000000000001.gdw");
-    assert_eq!(wal_filename(99999), "wal_0000000000099999.gdw");
-  }
-
-  #[test]
-  fn test_parse_snapshot_gen() {
-    assert_eq!(parse_snapshot_gen("snap_0000000000000001.gds"), Some(1));
-    assert_eq!(parse_snapshot_gen("snap_0000000000012345.gds"), Some(12345));
-    assert_eq!(parse_snapshot_gen("invalid.gds"), None);
-    assert_eq!(parse_snapshot_gen("snap_123.gds"), None);
-  }
-
-  #[test]
-  fn test_parse_wal_seg() {
-    assert_eq!(parse_wal_seg("wal_0000000000000001.gdw"), Some(1));
-    assert_eq!(parse_wal_seg("wal_0000000000099999.gdw"), Some(99999));
-    assert_eq!(parse_wal_seg("invalid.gdw"), None);
-  }
-}

@@ -10,6 +10,7 @@ use super::property::PropertyCache;
 use super::query::QueryCache;
 use super::traversal::{CachedNeighbors, TraversalCache, TraversalDirection};
 use crate::types::{CacheOptions, CacheStats, ETypeId, Edge, NodeId, PropKeyId, PropValue};
+use std::sync::Arc;
 
 #[cfg(test)]
 use crate::types::{PropertyCacheConfig, QueryCacheConfig, TraversalCacheConfig};
@@ -136,7 +137,7 @@ pub struct CacheManager {
   query_cache: QueryCache,
 
   /// Key lookup cache: string key -> NodeId (or None for negative cache)
-  key_cache: LruCache<String, Option<NodeId>>,
+  key_cache: LruCache<Arc<str>, Option<NodeId>>,
 
   /// Key cache statistics (tracked separately since LruCache doesn't track)
   key_cache_hits: u64,
@@ -145,6 +146,11 @@ pub struct CacheManager {
   /// Whether caching is enabled
   enabled: bool,
 }
+
+// SAFETY: CacheManager is only accessed behind external synchronization (DB lock).
+// All fields are Send/Sync when used behind that lock, so sharing across threads is safe.
+unsafe impl Send for CacheManager {}
+unsafe impl Sync for CacheManager {}
 
 impl CacheManager {
   /// Create a new cache manager with the given options
@@ -350,11 +356,11 @@ impl CacheManager {
   /// Set a node ID in cache by key
   ///
   /// Pass `None` to cache a "not found" result (negative cache).
-  pub fn set_node_by_key(&mut self, key: String, node_id: Option<NodeId>) {
+  pub fn set_node_by_key(&mut self, key: impl Into<Arc<str>>, node_id: Option<NodeId>) {
     if !self.enabled {
       return;
     }
-    self.key_cache.set(key, node_id);
+    self.key_cache.set(key.into(), node_id);
   }
 
   /// Invalidate a cached key lookup
@@ -564,7 +570,7 @@ mod tests {
     let result: Option<&i32> = cache.get_query("key");
     assert!(result.is_none());
 
-    cache.set_node_by_key("alice".to_string(), Some(1));
+    cache.set_node_by_key("alice", Some(1));
     assert_eq!(cache.get_node_by_key("alice"), None);
   }
 
@@ -624,11 +630,11 @@ mod tests {
     let mut cache = make_enabled_cache();
 
     // Cache a key -> node mapping
-    cache.set_node_by_key("alice".to_string(), Some(1));
+    cache.set_node_by_key("alice", Some(1));
     assert_eq!(cache.get_node_by_key("alice"), Some(&Some(1)));
 
     // Cache a negative result (key not found)
-    cache.set_node_by_key("nonexistent".to_string(), None);
+    cache.set_node_by_key("nonexistent", None);
     assert_eq!(cache.get_node_by_key("nonexistent"), Some(&None));
 
     // Cache miss
@@ -717,8 +723,8 @@ mod tests {
   fn test_invalidate_key() {
     let mut cache = make_enabled_cache();
 
-    cache.set_node_by_key("alice".to_string(), Some(1));
-    cache.set_node_by_key("bob".to_string(), Some(2));
+    cache.set_node_by_key("alice", Some(1));
+    cache.set_node_by_key("bob", Some(2));
 
     cache.invalidate_key("alice");
 
@@ -734,7 +740,7 @@ mod tests {
     cache.set_edge_prop(1, 1, 2, 10, Some(PropValue::I64(100)));
     cache.set_traversal(1, Some(1), TraversalDirection::Out, vec![]);
     cache.set_query("q1".to_string(), 42i32);
-    cache.set_node_by_key("alice".to_string(), Some(1));
+    cache.set_node_by_key("alice", Some(1));
 
     cache.clear();
 
@@ -755,7 +761,7 @@ mod tests {
     cache.set_node_prop(1, 10, Some(PropValue::I64(42)));
     cache.set_traversal(1, Some(1), TraversalDirection::Out, vec![]);
     cache.set_query("q1".to_string(), 42i32);
-    cache.set_node_by_key("alice".to_string(), Some(1));
+    cache.set_node_by_key("alice", Some(1));
 
     // Clear only property cache
     cache.clear_property_cache();
@@ -800,7 +806,7 @@ mod tests {
     let _: Option<&i32> = cache.get_query("q1"); // Hit
     let _: Option<&i32> = cache.get_query("q2"); // Miss
 
-    cache.set_node_by_key("alice".to_string(), Some(1));
+    cache.set_node_by_key("alice", Some(1));
     cache.get_node_by_key("alice"); // Hit
     cache.get_node_by_key("bob"); // Miss
 

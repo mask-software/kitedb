@@ -272,8 +272,14 @@ impl WalBuffer {
 
     // Re-write secondary records to primary region
     for record in secondary_records {
+      let ParsedWalRecord {
+        record_type,
+        txid,
+        payload,
+        ..
+      } = record;
       // Rebuild the record and write it
-      let wal_record = WalRecord::new(record.record_type, record.txid, record.payload.clone());
+      let wal_record = WalRecord::new(record_type, txid, payload);
       let record_bytes = wal_record.build();
       self.write_record_bytes_to_primary(&record_bytes, pager)?;
     }
@@ -299,7 +305,13 @@ impl WalBuffer {
       .into_iter()
       .chain(secondary_records.into_iter())
     {
-      let wal_record = WalRecord::new(record.record_type, record.txid, record.payload.clone());
+      let ParsedWalRecord {
+        record_type,
+        txid,
+        payload,
+        ..
+      } = record;
+      let wal_record = WalRecord::new(record_type, txid, payload);
       let record_bytes = wal_record.build();
       self.write_record_bytes_to_primary(&record_bytes, pager)?;
     }
@@ -467,14 +479,14 @@ impl WalBuffer {
       let page_file_offset = page_idx * page_size;
 
       // Get or create the page buffer
-      let page_buffer = if let Some(buffer) = self.pending_writes.get_mut(&page_file_offset) {
-        buffer
-      } else {
-        // First write to this page - load existing content
-        let page_num = (page_file_offset / page_size) as u32;
-        let existing = pager.read_page(page_num)?;
-        self.pending_writes.insert(page_file_offset, existing);
-        self.pending_writes.get_mut(&page_file_offset).unwrap()
+      let page_buffer = match self.pending_writes.entry(page_file_offset) {
+        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+        std::collections::hash_map::Entry::Vacant(entry) => {
+          // First write to this page - load existing content
+          let page_num = (page_file_offset / page_size) as u32;
+          let existing = pager.read_page(page_num)?;
+          entry.insert(existing)
+        }
       };
 
       let page_start = page_file_offset;

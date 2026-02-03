@@ -15,7 +15,7 @@
 //! - Zero-copy reads via mmap
 //! - ACID transactions with optional MVCC
 //! - Vector embeddings with IVF index
-//! - Single-file and multi-file formats
+//! - Single-file format
 //! - Compression support (zstd, gzip, deflate)
 
 #![deny(clippy::all)]
@@ -33,8 +33,6 @@ pub mod core;
 // Snapshot integrity checks
 pub mod check;
 
-// Graph database modules (Phase 3)
-pub mod graph;
 
 // MVCC modules (Phase 4)
 pub mod mvcc;

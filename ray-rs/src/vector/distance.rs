@@ -44,6 +44,7 @@ pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
   #[cfg(target_arch = "x86_64")]
   {
     if has_avx() {
+      // SAFETY: guarded by runtime AVX detection.
       return unsafe { dot_product_avx(a, b) };
     }
   }
@@ -92,6 +93,7 @@ fn dot_product_unrolled(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx")]
 unsafe fn dot_product_avx(a: &[f32], b: &[f32]) -> f32 {
+  // SAFETY: caller guarantees AVX support via has_avx().
   let len = a.len();
   let chunks = len / 8;
   let remainder = len % 8;
@@ -136,6 +138,7 @@ pub fn squared_euclidean(a: &[f32], b: &[f32]) -> f32 {
   #[cfg(target_arch = "x86_64")]
   {
     if has_avx() {
+      // SAFETY: guarded by runtime AVX detection.
       return unsafe { squared_euclidean_avx(a, b) };
     }
   }
@@ -194,6 +197,7 @@ fn squared_euclidean_unrolled(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx")]
 unsafe fn squared_euclidean_avx(a: &[f32], b: &[f32]) -> f32 {
+  // SAFETY: caller guarantees AVX support via has_avx().
   let len = a.len();
   let chunks = len / 8;
   let remainder = len % 8;
@@ -254,6 +258,7 @@ pub fn l2_norm(v: &[f32]) -> f32 {
   #[cfg(target_arch = "x86_64")]
   {
     if has_avx() {
+      // SAFETY: guarded by runtime AVX detection.
       return unsafe { l2_norm_avx(v) };
     }
   }
@@ -301,6 +306,7 @@ fn l2_norm_unrolled(v: &[f32]) -> f32 {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx")]
 unsafe fn l2_norm_avx(v: &[f32]) -> f32 {
+  // SAFETY: caller guarantees AVX support via has_avx().
   let len = v.len();
   let chunks = len / 8;
   let remainder = len % 8;
@@ -343,6 +349,7 @@ pub fn normalize_in_place(v: &mut [f32]) {
     #[cfg(target_arch = "x86_64")]
     {
       if has_avx() {
+        // SAFETY: guarded by runtime AVX detection.
         unsafe {
           normalize_in_place_avx(v, inv_norm);
         }
@@ -378,6 +385,7 @@ pub fn normalize_in_place(v: &mut [f32]) {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx")]
 unsafe fn normalize_in_place_avx(v: &mut [f32], inv_norm: f32) {
+  // SAFETY: caller guarantees AVX support via has_avx().
   let len = v.len();
   let chunks = len / 8;
   let remainder = len % 8;
@@ -527,9 +535,7 @@ mod tests {
 
     assert!(
       (result - expected).abs() < 1e-3,
-      "result: {}, expected: {}",
-      result,
-      expected
+      "result: {result}, expected: {expected}"
     );
   }
 
@@ -558,9 +564,7 @@ mod tests {
 
     assert!(
       (result - expected).abs() < 1e-3,
-      "result: {}, expected: {}",
-      result,
-      expected
+      "result: {result}, expected: {expected}"
     );
   }
 
@@ -579,9 +583,7 @@ mod tests {
 
     assert!(
       (result - expected).abs() < 1e-3,
-      "result: {}, expected: {}",
-      result,
-      expected
+      "result: {result}, expected: {expected}"
     );
   }
 

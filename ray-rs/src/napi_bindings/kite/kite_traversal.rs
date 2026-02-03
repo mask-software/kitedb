@@ -10,8 +10,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::api::kite::Kite as RustKite;
-use crate::api::traversal::{TraversalBuilder, TraversalDirection, TraverseOptions};
-use crate::types::{ETypeId, Edge};
+use crate::api::traversal::{TraversalBuilder, TraversalDirection, TraversalStep, TraverseOptions};
+use crate::types::{ETypeId, Edge, NodeId};
 
 use super::helpers::{
   call_filter, edge_filter_arg, edge_filter_data, get_neighbors, node_filter_arg, node_filter_data,
@@ -27,19 +27,73 @@ use crate::napi_bindings::traversal::{JsTraversalDirection, JsTraverseOptions};
 #[napi]
 pub struct KiteTraversal {
   pub(crate) ray: Arc<RwLock<Option<RustKite>>>,
-  pub(crate) builder: TraversalBuilder,
+  pub(crate) start_nodes: Vec<NodeId>,
+  pub(crate) steps: StepChain,
+  pub(crate) limit: Option<usize>,
+  pub(crate) selected_props: Option<Vec<String>>,
   pub(crate) where_edge: Option<Arc<UnknownRef<false>>>,
   pub(crate) where_node: Option<Arc<UnknownRef<false>>>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct StepChain {
+  head: Option<Arc<StepNode>>,
+  len: usize,
+}
+
+struct StepNode {
+  step: TraversalStep,
+  prev: Option<Arc<StepNode>>,
+}
+
+impl StepChain {
+  fn push(&self, step: TraversalStep) -> Self {
+    Self {
+      head: Some(Arc::new(StepNode {
+        step,
+        prev: self.head.clone(),
+      })),
+      len: self.len + 1,
+    }
+  }
+
+  fn to_vec(&self) -> Vec<TraversalStep> {
+    let mut steps = Vec::with_capacity(self.len);
+    let mut current = self.head.as_ref().map(Arc::clone);
+    while let Some(node) = current {
+      steps.push(node.step.clone());
+      current = node.prev.as_ref().map(Arc::clone);
+    }
+    steps.reverse();
+    steps
+  }
 }
 
 impl KiteTraversal {
   fn fork(&self) -> KiteTraversal {
     KiteTraversal {
       ray: self.ray.clone(),
-      builder: self.builder.clone(),
+      start_nodes: self.start_nodes.clone(),
+      steps: self.steps.clone(),
+      limit: self.limit,
+      selected_props: self.selected_props.clone(),
       where_edge: self.where_edge.clone(),
       where_node: self.where_node.clone(),
     }
+  }
+
+  fn build_builder(&self) -> TraversalBuilder {
+    let mut builder = TraversalBuilder::new(self.start_nodes.clone());
+    for step in self.steps.to_vec() {
+      builder.push_step(step);
+    }
+    if let Some(limit) = self.limit {
+      builder = builder.take(limit);
+    }
+    if let Some(ref props) = self.selected_props {
+      builder = builder.select(props.clone());
+    }
+    builder
   }
 }
 
@@ -71,7 +125,12 @@ impl KiteTraversal {
   pub fn out(&self, edge_type: Option<String>) -> Result<KiteTraversal> {
     let mut next = self.fork();
     let etype = next.resolve_etype(edge_type)?;
-    next.builder = next.builder.clone().out(etype);
+    next.steps = next.steps.push(TraversalStep::SingleHop {
+      direction: TraversalDirection::Out,
+      etype,
+      edge_filter: None,
+      node_filter: None,
+    });
     Ok(next)
   }
 
@@ -79,7 +138,12 @@ impl KiteTraversal {
   pub fn in_(&self, edge_type: Option<String>) -> Result<KiteTraversal> {
     let mut next = self.fork();
     let etype = next.resolve_etype(edge_type)?;
-    next.builder = next.builder.clone().r#in(etype);
+    next.steps = next.steps.push(TraversalStep::SingleHop {
+      direction: TraversalDirection::In,
+      etype,
+      edge_filter: None,
+      node_filter: None,
+    });
     Ok(next)
   }
 
@@ -87,7 +151,12 @@ impl KiteTraversal {
   pub fn both(&self, edge_type: Option<String>) -> Result<KiteTraversal> {
     let mut next = self.fork();
     let etype = next.resolve_etype(edge_type)?;
-    next.builder = next.builder.clone().both(etype);
+    next.steps = next.steps.push(TraversalStep::SingleHop {
+      direction: TraversalDirection::Both,
+      etype,
+      edge_filter: None,
+      node_filter: None,
+    });
     Ok(next)
   }
 
@@ -114,29 +183,28 @@ impl KiteTraversal {
       where_edge: None,
       where_node: None,
     };
-    next.builder = next.builder.clone().traverse(etype, opts);
+    next.steps = next.steps.push(TraversalStep::Traverse { etype, options: opts });
     Ok(next)
   }
 
   #[napi]
   pub fn take(&self, limit: i64) -> Result<KiteTraversal> {
     let mut next = self.fork();
-    next.builder = next.builder.clone().take(limit as usize);
+    next.limit = Some(limit as usize);
     Ok(next)
   }
 
   #[napi]
   pub fn select(&self, props: Vec<String>) -> Result<KiteTraversal> {
     let mut next = self.fork();
-    let refs: Vec<&str> = props.iter().map(|p| p.as_str()).collect();
-    next.builder = next.builder.clone().select_props(&refs);
+    next.selected_props = Some(props);
     Ok(next)
   }
 
   #[napi]
   pub fn nodes(&self, env: Env) -> Result<Vec<i64>> {
-    let selected_props = self
-      .builder
+    let builder = self.build_builder();
+    let selected_props = builder
       .selected_properties()
       .map(|props| props.iter().cloned().collect::<HashSet<String>>());
 
@@ -147,9 +215,7 @@ impl KiteTraversal {
         .as_ref()
         .ok_or_else(|| Error::from_reason("Kite is closed"))?;
 
-      let results: Vec<_> = self
-        .builder
-        .clone()
+      let results: Vec<_> = builder
         .execute(|node_id, dir, etype| get_neighbors(ray.raw(), node_id, dir, etype))
         .collect();
 
@@ -198,8 +264,8 @@ impl KiteTraversal {
 
   #[napi(js_name = "nodesWithProps")]
   pub fn nodes_with_props(&self, env: Env) -> Result<Vec<Object>> {
-    let selected_props = self
-      .builder
+    let builder = self.build_builder();
+    let selected_props = builder
       .selected_properties()
       .map(|props| props.iter().cloned().collect::<HashSet<String>>());
 
@@ -210,9 +276,7 @@ impl KiteTraversal {
         .as_ref()
         .ok_or_else(|| Error::from_reason("Kite is closed"))?;
 
-      let results: Vec<_> = self
-        .builder
-        .clone()
+      let results: Vec<_> = builder
         .execute(|node_id, dir, etype| get_neighbors(ray.raw(), node_id, dir, etype))
         .collect();
 
@@ -268,8 +332,8 @@ impl KiteTraversal {
 
   #[napi]
   pub fn edges(&self, env: Env) -> Result<Vec<JsFullEdge>> {
-    let selected_props = self
-      .builder
+    let builder = self.build_builder();
+    let selected_props = builder
       .selected_properties()
       .map(|props| props.iter().cloned().collect::<HashSet<String>>());
 
@@ -280,9 +344,7 @@ impl KiteTraversal {
         .as_ref()
         .ok_or_else(|| Error::from_reason("Kite is closed"))?;
 
-      let results: Vec<_> = self
-        .builder
-        .clone()
+      let results: Vec<_> = builder
         .execute(|node_id, dir, etype| get_neighbors(ray.raw(), node_id, dir, etype))
         .collect();
 
@@ -337,8 +399,8 @@ impl KiteTraversal {
 
   #[napi]
   pub fn count(&self, env: Env) -> Result<i64> {
-    let selected_props = self
-      .builder
+    let builder = self.build_builder();
+    let selected_props = builder
       .selected_properties()
       .map(|props| props.iter().cloned().collect::<HashSet<String>>());
 
@@ -349,9 +411,7 @@ impl KiteTraversal {
         .as_ref()
         .ok_or_else(|| Error::from_reason("Kite is closed"))?;
 
-      let results: Vec<_> = self
-        .builder
-        .clone()
+      let results: Vec<_> = builder
         .execute(|node_id, dir, etype| get_neighbors(ray.raw(), node_id, dir, etype))
         .collect();
 

@@ -1,5 +1,7 @@
 # Kite API - Quick Start Guide
 
+> Note: The directory-based GraphDB (multi-file) engine has been removed. KiteDB is single-file (`.kitedb`) only; GraphDB references below are historical.
+
 Get up and running with Kite in 5 minutes.
 
 ## Installation

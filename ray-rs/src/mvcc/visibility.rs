@@ -92,6 +92,11 @@ impl<T> VersionedRecord<T> {
 /// 2. OR it was created by the transaction itself (own writes)
 /// 3. AND it's not deleted (unless checking for deletion)
 pub fn is_visible<T>(version: &VersionedRecord<T>, snapshot_ts: Timestamp, txid: TxId) -> bool {
+  // Baseline versions (txid=0, commit_ts=0) are visible to all snapshots.
+  if version.txid == 0 && version.commit_ts == 0 {
+    return true;
+  }
+
   // Own writes are always visible (even if uncommitted)
   if version.txid == txid {
     return true;

@@ -6,6 +6,7 @@
 use napi_derive::napi;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fmt;
 
 // ============================================================================
 // Public (stable) IDs - never reused in v1
@@ -38,27 +39,6 @@ pub type PhysNode = u32;
 
 /// String ID in string table. u32, 0 = none
 pub type StringId = u32;
-
-// ============================================================================
-// Manifest (manifest.gdm)
-// ============================================================================
-
-/// Manifest header structure
-#[derive(Debug, Clone)]
-pub struct ManifestV1 {
-  pub magic: u32,              // "GDBM" = 0x4D424447
-  pub version: u32,            // = 1
-  pub min_reader_version: u32, // = 1
-  pub reserved: u32,
-  pub active_snapshot_gen: u64,
-  pub prev_snapshot_gen: u64, // 0 if none
-  pub active_wal_seg: u64,
-  pub reserved2: [u64; 5],
-  pub crc32c: u32,
-}
-
-/// Manifest size in bytes
-pub const MANIFEST_SIZE: usize = 4 + 4 + 4 + 4 + 8 + 8 + 8 + 8 * 5 + 4; // 76 bytes
 
 // ============================================================================
 // Snapshot Header (snapshot.gds)
@@ -201,22 +181,8 @@ pub struct KeyIndexEntry {
 pub const KEY_INDEX_ENTRY_SIZE: usize = 8 + 4 + 4 + 8; // 24 bytes
 
 // ============================================================================
-// WAL Header and Records
+// WAL Records
 // ============================================================================
-
-/// WAL header structure
-#[derive(Debug, Clone)]
-pub struct WalHeaderV1 {
-  pub magic: u32,              // "GDW1" = 0x31574447
-  pub version: u32,            // = 1
-  pub min_reader_version: u32, // = 1
-  pub reserved: u32,
-  pub segment_id: u64,
-  pub created_unix_ns: u64,
-  pub reserved2: [u64; 8],
-}
-
-pub const WAL_HEADER_SIZE: usize = 4 + 4 + 4 + 4 + 8 + 8 + 8 * 8; // 96 bytes
 
 /// WAL record types
 #[repr(u8)]
@@ -331,6 +297,12 @@ pub enum PropValue {
   VectorF32(Vec<f32>),
 }
 
+/// Shared property value for internal storage
+pub type PropValueRef = std::sync::Arc<PropValue>;
+
+/// Shared vector storage for pending operations
+pub type VectorRef = std::sync::Arc<[f32]>;
+
 impl PropValue {
   pub fn tag(&self) -> PropValueTag {
     match self {
@@ -376,7 +348,21 @@ pub struct NodeDelta {
   pub key: Option<String>,
   pub labels: Option<HashSet<LabelId>>,
   pub labels_deleted: Option<HashSet<LabelId>>,
-  pub props: Option<HashMap<PropKeyId, Option<PropValue>>>, // None value = deleted
+  pub props: Option<HashMap<PropKeyId, Option<PropValueRef>>>, // None value = deleted
+}
+
+impl NodeDelta {
+  /// Create a minimal clone suitable for MVCC version chains.
+  ///
+  /// Property and label versions are tracked separately, so we only keep the key.
+  pub fn for_version(&self) -> NodeDelta {
+    NodeDelta {
+      key: self.key.clone(),
+      labels: None,
+      labels_deleted: None,
+      props: None,
+    }
+  }
 }
 
 /// Delta state - all uncommitted changes
@@ -394,7 +380,7 @@ pub struct DeltaState {
   pub in_del: HashMap<NodeId, BTreeSet<EdgePatch>>,
 
   // Edge properties (keyed by (src, etype, dst))
-  pub edge_props: HashMap<(NodeId, ETypeId, NodeId), HashMap<PropKeyId, Option<PropValue>>>,
+  pub edge_props: HashMap<(NodeId, ETypeId, NodeId), HashMap<PropKeyId, Option<PropValueRef>>>,
 
   // New definitions
   pub new_labels: HashMap<LabelId, String>,
@@ -411,7 +397,7 @@ pub struct DeltaState {
 
   // Pending vector operations (keyed by (node_id, prop_key_id))
   // Some(vec) = set, None = delete
-  pub pending_vectors: HashMap<(NodeId, PropKeyId), Option<Vec<f32>>>,
+  pub pending_vectors: HashMap<(NodeId, PropKeyId), Option<VectorRef>>,
 }
 
 // ============================================================================
@@ -568,12 +554,13 @@ pub struct TxState {
   pub pending_out_del: HashMap<NodeId, BTreeSet<EdgePatch>>,
   pub pending_in_add: HashMap<NodeId, BTreeSet<EdgePatch>>,
   pub pending_in_del: HashMap<NodeId, BTreeSet<EdgePatch>>,
-  pub pending_node_props: HashMap<NodeId, HashMap<PropKeyId, Option<PropValue>>>,
+  pub pending_node_props: HashMap<NodeId, HashMap<PropKeyId, Option<PropValueRef>>>,
   /// Pending node label additions (node_id -> labels)
   pub pending_node_labels_add: HashMap<NodeId, HashSet<LabelId>>,
   /// Pending node label removals (node_id -> labels)
   pub pending_node_labels_del: HashMap<NodeId, HashSet<LabelId>>,
-  pub pending_edge_props: HashMap<(NodeId, ETypeId, NodeId), HashMap<PropKeyId, Option<PropValue>>>,
+  pub pending_edge_props:
+    HashMap<(NodeId, ETypeId, NodeId), HashMap<PropKeyId, Option<PropValueRef>>>,
   pub pending_new_labels: HashMap<LabelId, String>,
   pub pending_new_etypes: HashMap<ETypeId, String>,
   pub pending_new_propkeys: HashMap<PropKeyId, String>,
@@ -599,6 +586,68 @@ impl TxState {
 // MVCC Types
 // ============================================================================
 
+/// MVCC conflict key
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TxKey {
+  Node(NodeId),
+  Edge {
+    src: NodeId,
+    etype: ETypeId,
+    dst: NodeId,
+  },
+  NodeProp {
+    node_id: NodeId,
+    key_id: PropKeyId,
+  },
+  EdgeProp {
+    src: NodeId,
+    etype: ETypeId,
+    dst: NodeId,
+    key_id: PropKeyId,
+  },
+  Key(std::sync::Arc<str>),
+  NeighborsOut {
+    node_id: NodeId,
+    etype: Option<ETypeId>,
+  },
+  NeighborsIn {
+    node_id: NodeId,
+    etype: Option<ETypeId>,
+  },
+  NodeLabels(NodeId),
+  NodeLabel {
+    node_id: NodeId,
+    label_id: LabelId,
+  },
+}
+
+impl fmt::Display for TxKey {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      TxKey::Node(node_id) => write!(f, "node:{node_id}"),
+      TxKey::Edge { src, etype, dst } => write!(f, "edge:{src}:{etype}:{dst}"),
+      TxKey::NodeProp { node_id, key_id } => write!(f, "nodeprop:{node_id}:{key_id}"),
+      TxKey::EdgeProp {
+        src,
+        etype,
+        dst,
+        key_id,
+      } => write!(f, "edgeprop:{src}:{etype}:{dst}:{key_id}"),
+      TxKey::Key(key) => write!(f, "key:{key}"),
+      TxKey::NeighborsOut { node_id, etype } => match etype {
+        Some(etype) => write!(f, "neighbors_out:{node_id}:{etype}"),
+        None => write!(f, "neighbors_out:{node_id}:*"),
+      },
+      TxKey::NeighborsIn { node_id, etype } => match etype {
+        Some(etype) => write!(f, "neighbors_in:{node_id}:{etype}"),
+        None => write!(f, "neighbors_in:{node_id}:*"),
+      },
+      TxKey::NodeLabels(node_id) => write!(f, "nodelabels:{node_id}"),
+      TxKey::NodeLabel { node_id, label_id } => write!(f, "nodelabel:{node_id}:{label_id}"),
+    }
+  }
+}
+
 /// MVCC transaction metadata
 #[derive(Debug, Clone)]
 pub struct MvccTransaction {
@@ -606,8 +655,8 @@ pub struct MvccTransaction {
   pub start_ts: Timestamp,
   pub commit_ts: Option<Timestamp>,
   pub status: MvccTxStatus,
-  pub read_set: HashSet<String>,
-  pub write_set: HashSet<String>,
+  pub read_set: HashSet<TxKey>,
+  pub write_set: HashSet<TxKey>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

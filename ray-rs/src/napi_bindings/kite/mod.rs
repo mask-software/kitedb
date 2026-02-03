@@ -24,36 +24,18 @@ pub use types::{JsEdgeSpec, JsKeySpec, JsKiteOptions, JsNodeSpec, JsPropSpec};
 // Internal imports
 use conversion::js_props_to_map;
 use helpers::{
-  batch_result_to_js, execute_batch_ops, get_edge_props_tx, get_node_key_tx, get_node_props,
-  get_node_props_selected, get_node_props_tx, get_node_props_tx_selected, list_edges_with_tx,
-  node_to_js, node_type_from_key, with_tx_handle, with_tx_handle_mut,
+  batch_result_to_js, execute_batch_ops, get_node_props, get_node_props_selected, node_to_js,
 };
 use key_spec::{parse_key_spec, prop_spec_to_def, KeySpec};
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::api::kite::{BatchOp, EdgeDef, Kite as RustKite, KiteOptions, NodeDef};
-use crate::api::traversal::TraversalBuilder;
-use crate::graph::edges::{
-  add_edge as graph_add_edge, del_edge_prop as graph_del_edge_prop,
-  delete_edge as graph_delete_edge, edge_exists as graph_edge_exists, edge_exists_db,
-  get_edge_prop as graph_get_edge_prop, set_edge_prop, upsert_edge_with_props,
-};
-use crate::graph::iterators::{
-  list_edges as graph_list_edges, list_nodes as graph_list_nodes, ListEdgesOptions,
-};
-use crate::graph::key_index::get_node_key as graph_get_node_key;
-use crate::graph::nodes::{
-  delete_node as graph_delete_node, get_node_by_key as graph_get_node_by_key, get_node_by_key_db,
-  get_node_prop as graph_get_node_prop, node_exists as graph_node_exists,
-  set_node_prop as graph_set_node_prop,
-};
-use crate::graph::tx::{begin_read_tx, begin_tx, commit, rollback, TxHandle};
-use crate::types::{NodeId, PropValue, TxState};
+use crate::types::NodeId;
 
 use super::database::{CheckResult, DbStats, MvccStats};
 use super::database::{JsFullEdge, JsPropValue};
@@ -95,8 +77,7 @@ use conversion::{js_value_to_prop_value, key_suffix_from_js};
 #[napi]
 pub struct Kite {
   inner: Arc<RwLock<Option<RustKite>>>,
-  node_specs: Arc<HashMap<String, KeySpec>>,
-  tx_state: Arc<Mutex<Option<TxState>>>,
+  node_specs: Arc<HashMap<String, Arc<KeySpec>>>,
 }
 
 impl Kite {
@@ -120,7 +101,7 @@ impl Kite {
     f(ray)
   }
 
-  fn key_spec(&self, node_type: &str) -> Result<&KeySpec> {
+  fn key_spec(&self, node_type: &str) -> Result<&Arc<KeySpec>> {
     self
       .node_specs
       .get(node_type)
@@ -131,16 +112,23 @@ impl Kite {
 #[napi]
 impl Kite {
   /// Open a Kite database
+  #[allow(clippy::arc_with_non_send_sync)]
   #[napi(factory)]
   pub fn open(path: String, options: JsKiteOptions) -> Result<Self> {
-    let mut node_specs: HashMap<String, KeySpec> = HashMap::new();
-    let mut ray_opts = KiteOptions::new();
-    ray_opts.read_only = options.read_only.unwrap_or(false);
-    ray_opts.create_if_missing = options.create_if_missing.unwrap_or(true);
-    ray_opts.lock_file = options.lock_file.unwrap_or(true);
+    let mut node_specs: HashMap<String, Arc<KeySpec>> = HashMap::new();
+    let mut kite_opts = KiteOptions::new();
+    kite_opts.read_only = options.read_only.unwrap_or(false);
+    kite_opts.create_if_missing = options.create_if_missing.unwrap_or(true);
+    kite_opts.mvcc = options.mvcc.unwrap_or(false);
+    kite_opts.mvcc_gc_interval_ms = options.mvcc_gc_interval_ms.map(|v| v as u64);
+    kite_opts.mvcc_retention_ms = options.mvcc_retention_ms.map(|v| v as u64);
+    kite_opts.mvcc_max_chain_depth = options.mvcc_max_chain_depth.map(|v| v as usize);
+    if let Some(mode) = options.sync_mode {
+      kite_opts.sync_mode = mode.into();
+    }
 
     for node in options.nodes {
-      let key_spec = parse_key_spec(&node.name, node.key)?;
+      let key_spec = Arc::new(parse_key_spec(&node.name, node.key)?);
       let prefix = key_spec.prefix().to_string();
 
       let mut node_def = NodeDef::new(&node.name, &prefix);
@@ -150,8 +138,8 @@ impl Kite {
         }
       }
 
-      node_specs.insert(node.name.clone(), key_spec);
-      ray_opts.nodes.push(node_def);
+      node_specs.insert(node.name.clone(), Arc::clone(&key_spec));
+      kite_opts.nodes.push(node_def);
     }
 
     for edge in options.edges {
@@ -161,15 +149,14 @@ impl Kite {
           edge_def = edge_def.prop(prop_spec_to_def(prop_name, prop_spec)?);
         }
       }
-      ray_opts.edges.push(edge_def);
+      kite_opts.edges.push(edge_def);
     }
 
-    let ray = RustKite::open(path, ray_opts).map_err(|e| Error::from_reason(e.to_string()))?;
+    let ray = RustKite::open(path, kite_opts).map_err(|e| Error::from_reason(e.to_string()))?;
 
     Ok(Kite {
       inner: Arc::new(RwLock::new(Some(ray))),
       node_specs: Arc::new(node_specs),
-      tx_state: Arc::new(Mutex::new(None)),
     })
   }
 
@@ -178,10 +165,10 @@ impl Kite {
   pub fn close(&self) -> Result<()> {
     let mut guard = self.inner.write();
     if let Some(ray) = guard.as_ref() {
-      let mut tx_guard = self.tx_state.lock();
-      if let Some(tx_state) = tx_guard.take() {
-        let mut handle = TxHandle::new(ray.raw(), tx_state);
-        rollback(&mut handle)
+      if ray.raw().has_transaction() {
+        ray
+          .raw()
+          .rollback()
           .map_err(|e| Error::from_reason(format!("Failed to rollback: {e}")))?;
       }
     }
@@ -201,24 +188,11 @@ impl Kite {
     key: Unknown,
     props: Option<Vec<String>>,
   ) -> Result<Option<Object>> {
-    let spec = self.key_spec(&node_type)?.clone();
-    let key_suffix = key_suffix_from_js(&env, &spec, key)?;
-    let full_key = format!("{}{}", spec.prefix(), key_suffix);
+    let key_suffix = {
+      let spec = self.key_spec(&node_type)?;
+      key_suffix_from_js(&env, spec.as_ref(), key)?
+    };
     let selected_props = props.map(|props| props.into_iter().collect::<HashSet<String>>());
-    if self.tx_state.lock().is_some() {
-      return with_tx_handle(&self.inner, &self.tx_state, |_ray, handle| {
-        let node_id = graph_get_node_by_key(handle, &full_key);
-        match node_id {
-          Some(node_id) => {
-            let props = get_node_props_tx_selected(handle, node_id, selected_props.as_ref());
-            let obj = node_to_js(&env, node_id, Some(full_key), &node_type, props)?;
-            Ok(Some(obj))
-          }
-          None => Ok(None),
-        }
-      });
-    }
-
     self.with_kite(move |ray| {
       let node_ref = ray
         .get(&node_type, &key_suffix)
@@ -244,24 +218,6 @@ impl Kite {
     props: Option<Vec<String>>,
   ) -> Result<Option<Object>> {
     let selected_props = props.map(|props| props.into_iter().collect::<HashSet<String>>());
-    if self.tx_state.lock().is_some() {
-      let node_specs = self.node_specs.clone();
-      return with_tx_handle(&self.inner, &self.tx_state, |_ray, handle| {
-        let node_id = node_id as NodeId;
-        if !graph_node_exists(handle, node_id) {
-          return Ok(None);
-        }
-        let key = get_node_key_tx(handle, node_id);
-        let node_type = key
-          .as_ref()
-          .and_then(|k| node_type_from_key(&node_specs, k))
-          .unwrap_or_else(|| "unknown".to_string());
-        let props = get_node_props_tx_selected(handle, node_id, selected_props.as_ref());
-        let obj = node_to_js(&env, node_id, key, &node_type, props)?;
-        Ok(Some(obj))
-      });
-    }
-
     self.with_kite(move |ray| {
       let node_ref = ray
         .get_by_id(node_id as NodeId)
@@ -280,22 +236,10 @@ impl Kite {
   /// Get a lightweight node reference by key (no properties)
   #[napi]
   pub fn get_ref(&self, env: Env, node_type: String, key: Unknown) -> Result<Option<Object>> {
-    let spec = self.key_spec(&node_type)?.clone();
-    let key_suffix = key_suffix_from_js(&env, &spec, key)?;
-    let full_key = format!("{}{}", spec.prefix(), key_suffix);
-    if self.tx_state.lock().is_some() {
-      return with_tx_handle(&self.inner, &self.tx_state, |_ray, handle| {
-        let node_id = graph_get_node_by_key(handle, &full_key);
-        match node_id {
-          Some(node_id) => {
-            let obj = node_to_js(&env, node_id, Some(full_key), &node_type, HashMap::new())?;
-            Ok(Some(obj))
-          }
-          None => Ok(None),
-        }
-      });
-    }
-
+    let key_suffix = {
+      let spec = self.key_spec(&node_type)?;
+      key_suffix_from_js(&env, spec.as_ref(), key)?
+    };
     self.with_kite(move |ray| {
       let node_ref = ray
         .get_ref(&node_type, &key_suffix)
@@ -320,16 +264,18 @@ impl Kite {
   /// Get a node ID by key (no properties)
   #[napi]
   pub fn get_id(&self, env: Env, node_type: String, key: Unknown) -> Result<Option<i64>> {
-    let spec = self.key_spec(&node_type)?.clone();
-    let key_suffix = key_suffix_from_js(&env, &spec, key)?;
-    let full_key = format!("{}{}", spec.prefix(), key_suffix);
-    if self.tx_state.lock().is_some() {
-      return with_tx_handle(&self.inner, &self.tx_state, |_ray, handle| {
-        Ok(graph_get_node_by_key(handle, &full_key).map(|id| id as i64))
-      });
-    }
-
-    self.with_kite(move |ray| Ok(get_node_by_key_db(ray.raw(), &full_key).map(|id| id as i64)))
+    let key_suffix = {
+      let spec = self.key_spec(&node_type)?;
+      key_suffix_from_js(&env, spec.as_ref(), key)?
+    };
+    self.with_kite(move |ray| {
+      Ok(
+        ray
+          .get(&node_type, &key_suffix)
+          .map_err(|e| Error::from_reason(e.to_string()))?
+          .map(|node| node.id as i64),
+      )
+    })
   }
 
   /// Get multiple nodes by ID (returns node objects with props)
@@ -345,27 +291,6 @@ impl Kite {
     }
 
     let selected_props = props.map(|props| props.into_iter().collect::<HashSet<String>>());
-    if self.tx_state.lock().is_some() {
-      let node_specs = self.node_specs.clone();
-      return with_tx_handle(&self.inner, &self.tx_state, |_ray, handle| {
-        let mut out = Vec::with_capacity(node_ids.len());
-        for node_id in &node_ids {
-          let node_id = *node_id as NodeId;
-          if !graph_node_exists(handle, node_id) {
-            continue;
-          }
-          let key = get_node_key_tx(handle, node_id);
-          let node_type = key
-            .as_ref()
-            .and_then(|k| node_type_from_key(&node_specs, k))
-            .unwrap_or_else(|| "unknown".to_string());
-          let props = get_node_props_tx_selected(handle, node_id, selected_props.as_ref());
-          out.push(node_to_js(&env, node_id, key, &node_type, props)?);
-        }
-        Ok(out)
-      });
-    }
-
     self.with_kite(move |ray| {
       let mut out = Vec::with_capacity(node_ids.len());
       for node_id in node_ids {
@@ -390,14 +315,7 @@ impl Kite {
   /// Get a node property value
   #[napi]
   pub fn get_prop(&self, node_id: i64, prop_name: String) -> Result<Option<JsPropValue>> {
-    let value = if self.tx_state.lock().is_some() {
-      with_tx_handle(&self.inner, &self.tx_state, |ray, handle| {
-        let prop_key_id = ray.raw().get_propkey_id(&prop_name);
-        Ok(prop_key_id.and_then(|id| graph_get_node_prop(handle, node_id as NodeId, id)))
-      })?
-    } else {
-      self.with_kite(|ray| Ok(ray.get_prop(node_id as NodeId, &prop_name)))?
-    };
+    let value = self.with_kite(|ray| Ok(ray.get_prop(node_id as NodeId, &prop_name)))?;
     Ok(value.map(JsPropValue::from))
   }
 
@@ -405,14 +323,6 @@ impl Kite {
   #[napi]
   pub fn set_prop(&self, env: Env, node_id: i64, prop_name: String, value: Unknown) -> Result<()> {
     let prop_value = js_value_to_prop_value(&env, value)?;
-    if self.tx_state.lock().is_some() {
-      return with_tx_handle_mut(&self.inner, &self.tx_state, |ray, handle| {
-        let prop_key_id = ray.raw().get_or_create_propkey(&prop_name);
-        graph_set_node_prop(handle, node_id as NodeId, prop_key_id, prop_value)
-          .map_err(|e| Error::from_reason(e.to_string()))
-      });
-    }
-
     self.with_kite_mut(|ray| {
       ray
         .set_prop(node_id as NodeId, &prop_name, prop_value)
@@ -420,25 +330,26 @@ impl Kite {
     })
   }
 
+  /// Set multiple node property values
+  #[napi]
+  pub fn set_props(&self, env: Env, node_id: i64, props: Object) -> Result<()> {
+    let props_map = js_props_to_map(&env, Some(props))?;
+    self.with_kite_mut(|ray| {
+      ray
+        .set_props(node_id as NodeId, props_map)
+        .map_err(|e| Error::from_reason(e.to_string()))
+    })
+  }
+
   /// Check if a node exists
   #[napi]
   pub fn exists(&self, node_id: i64) -> Result<bool> {
-    if self.tx_state.lock().is_some() {
-      return with_tx_handle(&self.inner, &self.tx_state, |_ray, handle| {
-        Ok(graph_node_exists(handle, node_id as NodeId))
-      });
-    }
     self.with_kite(|ray| Ok(ray.exists(node_id as NodeId)))
   }
 
   /// Delete a node by ID
   #[napi]
   pub fn delete_by_id(&self, node_id: i64) -> Result<bool> {
-    if self.tx_state.lock().is_some() {
-      return with_tx_handle_mut(&self.inner, &self.tx_state, |_ray, handle| {
-        graph_delete_node(handle, node_id as NodeId).map_err(|e| Error::from_reason(e.to_string()))
-      });
-    }
     self.with_kite_mut(|ray| {
       ray
         .delete_node(node_id as NodeId)
@@ -449,25 +360,16 @@ impl Kite {
   /// Delete a node by key
   #[napi]
   pub fn delete_by_key(&self, env: Env, node_type: String, key: Unknown) -> Result<bool> {
-    let spec = self.key_spec(&node_type)?.clone();
-    let key_suffix = key_suffix_from_js(&env, &spec, key)?;
-    let full_key = format!("{}{}", spec.prefix(), key_suffix);
-    if self.tx_state.lock().is_some() {
-      return with_tx_handle_mut(&self.inner, &self.tx_state, |_ray, handle| {
-        let node_id = graph_get_node_by_key(handle, &full_key);
-        match node_id {
-          Some(id) => graph_delete_node(handle, id).map_err(|e| Error::from_reason(e.to_string())),
-          None => Ok(false),
-        }
-      });
-    }
-
+    let key_suffix = {
+      let spec = self.key_spec(&node_type)?;
+      key_suffix_from_js(&env, spec.as_ref(), key)?
+    };
     self.with_kite_mut(|ray| {
       let full_key = ray
         .node_def(&node_type)
         .ok_or_else(|| Error::from_reason(format!("Unknown node type: {node_type}")))?
         .key(&key_suffix);
-      let node_id = get_node_by_key_db(ray.raw(), &full_key);
+      let node_id = ray.raw().get_node_by_key(&full_key);
       match node_id {
         Some(id) => {
           let res = ray
@@ -483,11 +385,10 @@ impl Kite {
   /// Create an insert builder
   #[napi]
   pub fn insert(&self, node_type: String) -> Result<KiteInsertBuilder> {
-    let spec = self.key_spec(&node_type)?.clone();
+    let spec = Arc::clone(self.key_spec(&node_type)?);
     let prefix = spec.prefix().to_string();
     Ok(KiteInsertBuilder::new(
       self.inner.clone(),
-      self.tx_state.clone(),
       node_type,
       prefix,
       spec,
@@ -497,11 +398,10 @@ impl Kite {
   /// Create an upsert builder
   #[napi]
   pub fn upsert(&self, node_type: String) -> Result<KiteUpsertBuilder> {
-    let spec = self.key_spec(&node_type)?.clone();
+    let spec = Arc::clone(self.key_spec(&node_type)?);
     let prefix = spec.prefix().to_string();
     Ok(KiteUpsertBuilder::new(
       self.inner.clone(),
-      self.tx_state.clone(),
       node_type,
       prefix,
       spec,
@@ -513,7 +413,6 @@ impl Kite {
   pub fn update_by_id(&self, node_id: i64) -> Result<KiteUpdateBuilder> {
     Ok(KiteUpdateBuilder::new(
       self.inner.clone(),
-      self.tx_state.clone(),
       node_id as NodeId,
     ))
   }
@@ -523,7 +422,6 @@ impl Kite {
   pub fn upsert_by_id(&self, node_type: String, node_id: i64) -> Result<KiteUpsertByIdBuilder> {
     Ok(KiteUpsertByIdBuilder::new(
       self.inner.clone(),
-      self.tx_state.clone(),
       node_type,
       node_id as NodeId,
     ))
@@ -537,31 +435,19 @@ impl Kite {
     node_type: String,
     key: Unknown,
   ) -> Result<KiteUpdateBuilder> {
-    let spec = self.key_spec(&node_type)?.clone();
-    let key_suffix = key_suffix_from_js(&env, &spec, key)?;
-    let full_key = format!("{}{}", spec.prefix(), key_suffix);
-    let node_id = if self.tx_state.lock().is_some() {
-      with_tx_handle(&self.inner, &self.tx_state, |_ray, handle| {
-        Ok(graph_get_node_by_key(handle, &full_key))
-      })?
-    } else {
-      self.with_kite(|ray| {
-        let full_key = ray
-          .node_def(&node_type)
-          .ok_or_else(|| Error::from_reason(format!("Unknown node type: {node_type}")))?
-          .key(&key_suffix);
-        Ok(get_node_by_key_db(ray.raw(), &full_key))
-      })?
+    let key_suffix = {
+      let spec = self.key_spec(&node_type)?;
+      key_suffix_from_js(&env, spec.as_ref(), key)?
     };
-
-    match node_id {
-      Some(node_id) => Ok(KiteUpdateBuilder::new(
-        self.inner.clone(),
-        self.tx_state.clone(),
-        node_id,
-      )),
-      None => Err(Error::from_reason("Key not found")),
-    }
+    self.with_kite(|ray| {
+      let node_ref = ray
+        .get(&node_type, &key_suffix)
+        .map_err(|e| Error::from_reason(e.to_string()))?;
+      match node_ref {
+        Some(node_ref) => Ok(KiteUpdateBuilder::new(self.inner.clone(), node_ref.id)),
+        None => Err(Error::from_reason("Key not found")),
+      }
+    })
   }
 
   /// Link two nodes
@@ -575,35 +461,6 @@ impl Kite {
     props: Option<Object>,
   ) -> Result<()> {
     let props_map = js_props_to_map(&env, props)?;
-    if self.tx_state.lock().is_some() {
-      return with_tx_handle_mut(&self.inner, &self.tx_state, |ray, handle| {
-        let edge_def = ray
-          .edge_def(&edge_type)
-          .ok_or_else(|| Error::from_reason(format!("Unknown edge type: {edge_type}")))?;
-        let etype_id = edge_def
-          .etype_id
-          .ok_or_else(|| Error::from_reason("Edge type not initialized"))?;
-
-        if props_map.is_empty() {
-          graph_add_edge(handle, src as NodeId, etype_id, dst as NodeId)
-            .map_err(|e| Error::from_reason(e.to_string()))
-        } else {
-          let mut updates = Vec::with_capacity(props_map.len());
-          for (prop_name, value) in &props_map {
-            let prop_key_id = ray.raw().get_or_create_propkey(prop_name);
-            let value_opt = match value {
-              PropValue::Null => None,
-              other => Some(other.clone()),
-            };
-            updates.push((prop_key_id, value_opt));
-          }
-          upsert_edge_with_props(handle, src as NodeId, etype_id, dst as NodeId, updates)
-            .map(|_| ())
-            .map_err(|e| Error::from_reason(e.to_string()))
-        }
-      });
-    }
-
     self.with_kite_mut(|ray| {
       if props_map.is_empty() {
         ray
@@ -620,19 +477,6 @@ impl Kite {
   /// Unlink two nodes
   #[napi]
   pub fn unlink(&self, src: i64, edge_type: String, dst: i64) -> Result<bool> {
-    if self.tx_state.lock().is_some() {
-      return with_tx_handle_mut(&self.inner, &self.tx_state, |ray, handle| {
-        let edge_def = ray
-          .edge_def(&edge_type)
-          .ok_or_else(|| Error::from_reason(format!("Unknown edge type: {edge_type}")))?;
-        let etype_id = edge_def
-          .etype_id
-          .ok_or_else(|| Error::from_reason("Edge type not initialized"))?;
-        graph_delete_edge(handle, src as NodeId, etype_id, dst as NodeId)
-          .map_err(|e| Error::from_reason(e.to_string()))
-      });
-    }
-
     self.with_kite_mut(|ray| {
       ray
         .unlink(src as NodeId, &edge_type, dst as NodeId)
@@ -643,36 +487,10 @@ impl Kite {
   /// Check if an edge exists
   #[napi]
   pub fn has_edge(&self, src: i64, edge_type: String, dst: i64) -> Result<bool> {
-    if self.tx_state.lock().is_some() {
-      return with_tx_handle(&self.inner, &self.tx_state, |ray, handle| {
-        let edge_def = ray
-          .edge_def(&edge_type)
-          .ok_or_else(|| Error::from_reason(format!("Unknown edge type: {edge_type}")))?;
-        let etype_id = edge_def
-          .etype_id
-          .ok_or_else(|| Error::from_reason("Edge type not initialized"))?;
-        Ok(graph_edge_exists(
-          handle,
-          src as NodeId,
-          etype_id,
-          dst as NodeId,
-        ))
-      });
-    }
-
     self.with_kite(move |ray| {
-      let edge_def = ray
-        .edge_def(&edge_type)
-        .ok_or_else(|| Error::from_reason(format!("Unknown edge type: {edge_type}")))?;
-      let etype_id = edge_def
-        .etype_id
-        .ok_or_else(|| Error::from_reason("Edge type not initialized"))?;
-      Ok(edge_exists_db(
-        ray.raw(),
-        src as NodeId,
-        etype_id,
-        dst as NodeId,
-      ))
+      ray
+        .has_edge(src as NodeId, &edge_type, dst as NodeId)
+        .map_err(|e| Error::from_reason(e.to_string()))
     })
   }
 
@@ -685,27 +503,11 @@ impl Kite {
     dst: i64,
     prop_name: String,
   ) -> Result<Option<JsPropValue>> {
-    let value = if self.tx_state.lock().is_some() {
-      with_tx_handle(&self.inner, &self.tx_state, |ray, handle| {
-        let edge_def = ray
-          .edge_def(&edge_type)
-          .ok_or_else(|| Error::from_reason(format!("Unknown edge type: {edge_type}")))?;
-        let etype_id = edge_def
-          .etype_id
-          .ok_or_else(|| Error::from_reason("Edge type not initialized"))?;
-        let prop_key_id = ray.raw().get_propkey_id(&prop_name);
-        Ok(
-          prop_key_id
-            .and_then(|id| graph_get_edge_prop(handle, src as NodeId, etype_id, dst as NodeId, id)),
-        )
-      })?
-    } else {
-      self.with_kite(|ray| {
-        ray
-          .get_edge_prop(src as NodeId, &edge_type, dst as NodeId, &prop_name)
-          .map_err(|e| Error::from_reason(e.to_string()))
-      })?
-    };
+    let value = self.with_kite(|ray| {
+      ray
+        .get_edge_prop(src as NodeId, &edge_type, dst as NodeId, &prop_name)
+        .map_err(|e| Error::from_reason(e.to_string()))
+    })?;
     Ok(value.map(JsPropValue::from))
   }
 
@@ -717,29 +519,13 @@ impl Kite {
     edge_type: String,
     dst: i64,
   ) -> Result<HashMap<String, JsPropValue>> {
-    let props = if self.tx_state.lock().is_some() {
-      with_tx_handle(&self.inner, &self.tx_state, |ray, handle| {
-        let edge_def = ray
-          .edge_def(&edge_type)
-          .ok_or_else(|| Error::from_reason(format!("Unknown edge type: {edge_type}")))?;
-        let etype_id = edge_def
-          .etype_id
-          .ok_or_else(|| Error::from_reason("Edge type not initialized"))?;
-        Ok(get_edge_props_tx(
-          handle,
-          src as NodeId,
-          etype_id,
-          dst as NodeId,
-        ))
-      })?
-    } else {
-      let props_opt = self.with_kite(|ray| {
+    let props = self
+      .with_kite(|ray| {
         ray
           .get_edge_props(src as NodeId, &edge_type, dst as NodeId)
           .map_err(|e| Error::from_reason(e.to_string()))
-      })?;
-      props_opt.unwrap_or_default()
-    };
+      })?
+      .unwrap_or_default();
 
     Ok(
       props
@@ -761,26 +547,6 @@ impl Kite {
     value: Unknown,
   ) -> Result<()> {
     let prop_value = js_value_to_prop_value(&env, value)?;
-    if self.tx_state.lock().is_some() {
-      return with_tx_handle_mut(&self.inner, &self.tx_state, |ray, handle| {
-        let edge_def = ray
-          .edge_def(&edge_type)
-          .ok_or_else(|| Error::from_reason(format!("Unknown edge type: {edge_type}")))?;
-        let etype_id = edge_def
-          .etype_id
-          .ok_or_else(|| Error::from_reason("Edge type not initialized"))?;
-        let prop_key_id = ray.raw().get_or_create_propkey(&prop_name);
-        set_edge_prop(
-          handle,
-          src as NodeId,
-          etype_id,
-          dst as NodeId,
-          prop_key_id,
-          prop_value,
-        )
-        .map_err(|e| Error::from_reason(e.to_string()))
-      });
-    }
     self.with_kite_mut(|ray| {
       ray
         .set_edge_prop(
@@ -803,22 +569,6 @@ impl Kite {
     dst: i64,
     prop_name: String,
   ) -> Result<()> {
-    if self.tx_state.lock().is_some() {
-      return with_tx_handle_mut(&self.inner, &self.tx_state, |ray, handle| {
-        let edge_def = ray
-          .edge_def(&edge_type)
-          .ok_or_else(|| Error::from_reason(format!("Unknown edge type: {edge_type}")))?;
-        let etype_id = edge_def
-          .etype_id
-          .ok_or_else(|| Error::from_reason("Edge type not initialized"))?;
-        if let Some(prop_key_id) = ray.raw().get_propkey_id(&prop_name) {
-          graph_del_edge_prop(handle, src as NodeId, etype_id, dst as NodeId, prop_key_id)
-            .map_err(|e| Error::from_reason(e.to_string()))?;
-        }
-        Ok(())
-      });
-    }
-
     self.with_kite_mut(|ray| {
       ray
         .del_edge_prop(src as NodeId, &edge_type, dst as NodeId, &prop_name)
@@ -834,20 +584,17 @@ impl Kite {
     edge_type: String,
     dst: i64,
   ) -> Result<KiteUpdateEdgeBuilder> {
-    let etype_id = self.with_kite(|ray| {
-      let edge_def = ray
+    self.with_kite(|ray| {
+      ray
         .edge_def(&edge_type)
         .ok_or_else(|| Error::from_reason(format!("Unknown edge type: {edge_type}")))?;
-      edge_def
-        .etype_id
-        .ok_or_else(|| Error::from_reason("Edge type not initialized"))
+      Ok(())
     })?;
 
     Ok(KiteUpdateEdgeBuilder::new(
       self.inner.clone(),
-      self.tx_state.clone(),
       src as NodeId,
-      etype_id,
+      edge_type,
       dst as NodeId,
     ))
   }
@@ -860,20 +607,17 @@ impl Kite {
     edge_type: String,
     dst: i64,
   ) -> Result<KiteUpsertEdgeBuilder> {
-    let etype_id = self.with_kite(|ray| {
-      let edge_def = ray
+    self.with_kite(|ray| {
+      ray
         .edge_def(&edge_type)
         .ok_or_else(|| Error::from_reason(format!("Unknown edge type: {edge_type}")))?;
-      edge_def
-        .etype_id
-        .ok_or_else(|| Error::from_reason("Edge type not initialized"))
+      Ok(())
     })?;
 
     Ok(KiteUpsertEdgeBuilder::new(
       self.inner.clone(),
-      self.tx_state.clone(),
       src as NodeId,
-      etype_id,
+      edge_type,
       dst as NodeId,
     ))
   }
@@ -881,75 +625,20 @@ impl Kite {
   /// List all nodes of a type (returns array of node objects)
   #[napi]
   pub fn all(&self, env: Env, node_type: String) -> Result<Vec<Object>> {
-    if self.tx_state.lock().is_some() {
-      return with_tx_handle(&self.inner, &self.tx_state, |ray, handle| {
-        let node_def = ray
-          .node_def(&node_type)
-          .ok_or_else(|| Error::from_reason(format!("Unknown node type: {node_type}")))?;
-        let prefix = node_def.key_prefix.clone();
-        let mut out = Vec::new();
-        let mut seen = HashSet::new();
-
-        for node_id in graph_list_nodes(handle.db) {
-          if handle.tx.pending_deleted_nodes.contains(&node_id) {
-            continue;
-          }
-          let key = get_node_key_tx(handle, node_id);
-          let key = match key {
-            Some(key) => key,
-            None => continue,
-          };
-          if !key.starts_with(&prefix) {
-            continue;
-          }
-          let props = get_node_props_tx(ray, handle, node_id);
-          out.push(node_to_js(&env, node_id, Some(key), &node_type, props)?);
-          seen.insert(node_id);
-        }
-
-        for (&node_id, delta) in &handle.tx.pending_created_nodes {
-          if seen.contains(&node_id) {
-            continue;
-          }
-          if handle.tx.pending_deleted_nodes.contains(&node_id) {
-            continue;
-          }
-          let key = match &delta.key {
-            Some(key) => key,
-            None => continue,
-          };
-          if !key.starts_with(&prefix) {
-            continue;
-          }
-          let props = get_node_props_tx(ray, handle, node_id);
-          out.push(node_to_js(
-            &env,
-            node_id,
-            Some(key.clone()),
-            &node_type,
-            props,
-          )?);
-        }
-
-        Ok(out)
-      });
-    }
-
     self.with_kite(|ray| {
-      let node_def = ray
-        .node_def(&node_type)
-        .ok_or_else(|| Error::from_reason(format!("Unknown node type: {node_type}")))?;
-      let prefix = node_def.key_prefix.clone();
+      let nodes = ray
+        .all(&node_type)
+        .map_err(|e| Error::from_reason(e.to_string()))?;
       let mut out = Vec::new();
-      for node_id in graph_list_nodes(ray.raw()) {
-        let delta = ray.raw().delta.read();
-        if let Some(key) = graph_get_node_key(ray.raw().snapshot.as_ref(), &delta, node_id) {
-          if !key.starts_with(&prefix) {
-            continue;
-          }
-          let props = get_node_props(ray, node_id);
-          out.push(node_to_js(&env, node_id, Some(key), &node_type, props)?);
-        }
+      for node_ref in nodes {
+        let props = get_node_props(ray, node_ref.id);
+        out.push(node_to_js(
+          &env,
+          node_ref.id,
+          node_ref.key,
+          &node_ref.node_type,
+          props,
+        )?);
       }
       Ok(out)
     })
@@ -958,57 +647,6 @@ impl Kite {
   /// Count nodes (optionally by type)
   #[napi]
   pub fn count_nodes(&self, node_type: Option<String>) -> Result<i64> {
-    if self.tx_state.lock().is_some() {
-      let node_type_clone = node_type.clone();
-      return with_tx_handle(
-        &self.inner,
-        &self.tx_state,
-        |ray, handle| match node_type_clone {
-          Some(node_type) => {
-            let node_def = ray
-              .node_def(&node_type)
-              .ok_or_else(|| Error::from_reason(format!("Unknown node type: {node_type}")))?;
-            let prefix = node_def.key_prefix.clone();
-            let mut count = 0i64;
-            let mut seen = HashSet::new();
-
-            for node_id in graph_list_nodes(handle.db) {
-              if handle.tx.pending_deleted_nodes.contains(&node_id) {
-                continue;
-              }
-              let key = match get_node_key_tx(handle, node_id) {
-                Some(key) => key,
-                None => continue,
-              };
-              if !key.starts_with(&prefix) {
-                continue;
-              }
-              count += 1;
-              seen.insert(node_id);
-            }
-
-            for (&node_id, delta) in &handle.tx.pending_created_nodes {
-              if seen.contains(&node_id) {
-                continue;
-              }
-              if handle.tx.pending_deleted_nodes.contains(&node_id) {
-                continue;
-              }
-              let key = match &delta.key {
-                Some(key) => key,
-                None => continue,
-              };
-              if key.starts_with(&prefix) {
-                count += 1;
-              }
-            }
-
-            Ok(count)
-          }
-          None => Ok(crate::graph::nodes::count_nodes(handle) as i64),
-        },
-      );
-    }
     self.with_kite(|ray| match node_type {
       Some(node_type) => ray
         .count_nodes_by_type(&node_type)
@@ -1021,25 +659,6 @@ impl Kite {
   /// Count edges (optionally by type)
   #[napi]
   pub fn count_edges(&self, edge_type: Option<String>) -> Result<i64> {
-    if self.tx_state.lock().is_some() {
-      let edge_type_clone = edge_type.clone();
-      return with_tx_handle(&self.inner, &self.tx_state, |ray, handle| {
-        let etype_filter = if let Some(edge_type) = edge_type_clone {
-          let edge_def = ray
-            .edge_def(&edge_type)
-            .ok_or_else(|| Error::from_reason(format!("Unknown edge type: {edge_type}")))?;
-          Some(
-            edge_def
-              .etype_id
-              .ok_or_else(|| Error::from_reason("Edge type not initialized"))?,
-          )
-        } else {
-          None
-        };
-        Ok(list_edges_with_tx(handle, etype_filter).len() as i64)
-      });
-    }
-
     self.with_kite(|ray| match edge_type {
       Some(edge_type) => ray
         .count_edges_by_type(&edge_type)
@@ -1052,55 +671,12 @@ impl Kite {
   /// List all edges (optionally by type)
   #[napi]
   pub fn all_edges(&self, edge_type: Option<String>) -> Result<Vec<JsFullEdge>> {
-    if self.tx_state.lock().is_some() {
-      let edge_type_clone = edge_type.clone();
-      return with_tx_handle(&self.inner, &self.tx_state, |ray, handle| {
-        let etype_filter = if let Some(ref edge_type) = edge_type_clone {
-          let edge_def = ray
-            .edge_def(edge_type)
-            .ok_or_else(|| Error::from_reason(format!("Unknown edge type: {edge_type}")))?;
-          Some(
-            edge_def
-              .etype_id
-              .ok_or_else(|| Error::from_reason("Edge type not initialized"))?,
-          )
-        } else {
-          None
-        };
-
-        let edges = list_edges_with_tx(handle, etype_filter);
-        Ok(
-          edges
-            .into_iter()
-            .map(|edge| JsFullEdge {
-              src: edge.src as i64,
-              etype: edge.etype,
-              dst: edge.dst as i64,
-            })
-            .collect(),
-        )
-      });
-    }
-
     self.with_kite(|ray| {
-      let options = if let Some(ref edge_type) = edge_type {
-        let edge_def = ray
-          .edge_def(edge_type)
-          .ok_or_else(|| Error::from_reason(format!("Unknown edge type: {edge_type}")))?;
-        let etype_id = edge_def
-          .etype_id
-          .ok_or_else(|| Error::from_reason("Edge type not initialized"))?;
-        ListEdgesOptions {
-          etype: Some(etype_id),
-        }
-      } else {
-        ListEdgesOptions::default()
-      };
-
-      let edges = graph_list_edges(ray.raw(), options);
+      let edges = ray
+        .all_edges(edge_type.as_deref())
+        .map_err(|e| Error::from_reason(e.to_string()))?;
       Ok(
         edges
-          .into_iter()
           .map(|edge| JsFullEdge {
             src: edge.src as i64,
             etype: edge.etype,
@@ -1214,67 +790,44 @@ impl Kite {
   #[napi]
   pub fn begin(&self, read_only: Option<bool>) -> Result<i64> {
     let read_only = read_only.unwrap_or(false);
-    let mut tx_guard = self.tx_state.lock();
-    if tx_guard.is_some() {
-      return Err(Error::from_reason("Transaction already active"));
-    }
-
     let guard = self.inner.read();
     let ray = guard
       .as_ref()
       .ok_or_else(|| Error::from_reason("Kite is closed"))?;
 
-    let handle = if read_only {
-      begin_read_tx(ray.raw())
-        .map_err(|e| Error::from_reason(format!("Failed to begin transaction: {e}")))?
-    } else {
-      begin_tx(ray.raw())
-        .map_err(|e| Error::from_reason(format!("Failed to begin transaction: {e}")))?
-    };
-
-    let txid = handle.tx.txid as i64;
-    *tx_guard = Some(handle.tx);
-    Ok(txid)
+    ray
+      .raw()
+      .begin(read_only)
+      .map(|txid| txid as i64)
+      .map_err(|e| Error::from_reason(format!("Failed to begin transaction: {e}")))
   }
 
   /// Commit the current transaction
   #[napi]
   pub fn commit(&self) -> Result<()> {
-    let mut tx_guard = self.tx_state.lock();
-    let tx_state = tx_guard
-      .take()
-      .ok_or_else(|| Error::from_reason("No active transaction"))?;
-
-    let guard = self.inner.write();
-    let ray = guard
-      .as_ref()
-      .ok_or_else(|| Error::from_reason("Kite is closed"))?;
-    let mut handle = TxHandle::new(ray.raw(), tx_state);
-    commit(&mut handle).map_err(|e| Error::from_reason(format!("Failed to commit: {e}")))?;
-    Ok(())
+    self.with_kite_mut(|ray| {
+      ray
+        .raw()
+        .commit()
+        .map_err(|e| Error::from_reason(format!("Failed to commit: {e}")))
+    })
   }
 
   /// Rollback the current transaction
   #[napi]
   pub fn rollback(&self) -> Result<()> {
-    let mut tx_guard = self.tx_state.lock();
-    let tx_state = tx_guard
-      .take()
-      .ok_or_else(|| Error::from_reason("No active transaction"))?;
-
-    let guard = self.inner.write();
-    let ray = guard
-      .as_ref()
-      .ok_or_else(|| Error::from_reason("Kite is closed"))?;
-    let mut handle = TxHandle::new(ray.raw(), tx_state);
-    rollback(&mut handle).map_err(|e| Error::from_reason(format!("Failed to rollback: {e}")))?;
-    Ok(())
+    self.with_kite_mut(|ray| {
+      ray
+        .raw()
+        .rollback()
+        .map_err(|e| Error::from_reason(format!("Failed to rollback: {e}")))
+    })
   }
 
   /// Check if there's an active transaction
   #[napi]
   pub fn has_transaction(&self) -> Result<bool> {
-    Ok(self.tx_state.lock().is_some())
+    self.with_kite(|ray| Ok(ray.raw().has_transaction()))
   }
 
   /// Execute a batch of operations atomically
@@ -1294,8 +847,10 @@ impl Kite {
           let node_type: String = op.get_named_property("nodeType")?;
           let key: Unknown = op.get_named_property("key")?;
           let props: Option<Object> = op.get_named_property("props")?;
-          let spec = self.key_spec(&node_type)?.clone();
-          let key_suffix = key_suffix_from_js(&env, &spec, key)?;
+          let key_suffix = {
+            let spec = self.key_spec(&node_type)?;
+            key_suffix_from_js(&env, spec.as_ref(), key)?
+          };
           let props_map = js_props_to_map(&env, props)?;
           rust_ops.push(BatchOp::CreateNode {
             node_type,
@@ -1354,17 +909,7 @@ impl Kite {
       }
     }
 
-    let results = if self.tx_state.lock().is_some() {
-      with_tx_handle_mut(&self.inner, &self.tx_state, |ray, handle| {
-        execute_batch_ops(ray, handle, rust_ops)
-      })?
-    } else {
-      self.with_kite_mut(|ray| {
-        ray
-          .batch(rust_ops)
-          .map_err(|e| Error::from_reason(e.to_string()))
-      })?
-    };
+    let results = self.with_kite_mut(|ray| execute_batch_ops(ray, rust_ops))?;
 
     let mut out = Vec::with_capacity(results.len());
     for result in results {
@@ -1378,7 +923,10 @@ impl Kite {
   pub fn from(&self, node_id: i64) -> Result<KiteTraversal> {
     Ok(KiteTraversal {
       ray: self.inner.clone(),
-      builder: TraversalBuilder::new(vec![node_id as NodeId]),
+      start_nodes: vec![node_id as NodeId],
+      steps: kite_traversal::StepChain::default(),
+      limit: None,
+      selected_props: None,
       where_edge: None,
       where_node: None,
     })
@@ -1389,7 +937,10 @@ impl Kite {
   pub fn from_nodes(&self, node_ids: Vec<i64>) -> Result<KiteTraversal> {
     Ok(KiteTraversal {
       ray: self.inner.clone(),
-      builder: TraversalBuilder::new(node_ids.into_iter().map(|id| id as NodeId).collect()),
+      start_nodes: node_ids.into_iter().map(|id| id as NodeId).collect(),
+      steps: kite_traversal::StepChain::default(),
+      limit: None,
+      selected_props: None,
       where_edge: None,
       where_node: None,
     })
@@ -1431,7 +982,7 @@ pub struct OpenKiteTask {
   path: String,
   options: JsKiteOptions,
   // Store result here to avoid public type in trait
-  result: Option<(RustKite, HashMap<String, KeySpec>)>,
+  result: Option<(RustKite, HashMap<String, Arc<KeySpec>>)>,
 }
 
 impl napi::Task for OpenKiteTask {
@@ -1439,14 +990,17 @@ impl napi::Task for OpenKiteTask {
   type JsValue = Kite;
 
   fn compute(&mut self) -> Result<Self::Output> {
-    let mut node_specs: HashMap<String, KeySpec> = HashMap::new();
-    let mut ray_opts = KiteOptions::new();
-    ray_opts.read_only = self.options.read_only.unwrap_or(false);
-    ray_opts.create_if_missing = self.options.create_if_missing.unwrap_or(true);
-    ray_opts.lock_file = self.options.lock_file.unwrap_or(true);
+    let mut node_specs: HashMap<String, Arc<KeySpec>> = HashMap::new();
+    let mut kite_opts = KiteOptions::new();
+    kite_opts.read_only = self.options.read_only.unwrap_or(false);
+    kite_opts.create_if_missing = self.options.create_if_missing.unwrap_or(true);
+    kite_opts.mvcc = self.options.mvcc.unwrap_or(false);
+    kite_opts.mvcc_gc_interval_ms = self.options.mvcc_gc_interval_ms.map(|v| v as u64);
+    kite_opts.mvcc_retention_ms = self.options.mvcc_retention_ms.map(|v| v as u64);
+    kite_opts.mvcc_max_chain_depth = self.options.mvcc_max_chain_depth.map(|v| v as usize);
 
     for node in &self.options.nodes {
-      let key_spec = parse_key_spec(&node.name, node.key.clone())?;
+      let key_spec = Arc::new(parse_key_spec(&node.name, node.key.clone())?);
       let prefix = key_spec.prefix().to_string();
 
       let mut node_def = NodeDef::new(&node.name, &prefix);
@@ -1456,8 +1010,8 @@ impl napi::Task for OpenKiteTask {
         }
       }
 
-      node_specs.insert(node.name.clone(), key_spec);
-      ray_opts.nodes.push(node_def);
+      node_specs.insert(node.name.clone(), Arc::clone(&key_spec));
+      kite_opts.nodes.push(node_def);
     }
 
     for edge in &self.options.edges {
@@ -1467,15 +1021,16 @@ impl napi::Task for OpenKiteTask {
           edge_def = edge_def.prop(prop_spec_to_def(prop_name, prop_spec)?);
         }
       }
-      ray_opts.edges.push(edge_def);
+      kite_opts.edges.push(edge_def);
     }
 
     let ray =
-      RustKite::open(&self.path, ray_opts).map_err(|e| Error::from_reason(e.to_string()))?;
+      RustKite::open(&self.path, kite_opts).map_err(|e| Error::from_reason(e.to_string()))?;
     self.result = Some((ray, node_specs));
     Ok(())
   }
 
+  #[allow(clippy::arc_with_non_send_sync)]
   fn resolve(&mut self, _env: Env, _output: Self::Output) -> Result<Self::JsValue> {
     let (ray, node_specs) = self
       .result
@@ -1484,7 +1039,6 @@ impl napi::Task for OpenKiteTask {
     Ok(Kite {
       inner: Arc::new(RwLock::new(Some(ray))),
       node_specs: Arc::new(node_specs),
-      tx_state: Arc::new(Mutex::new(None)),
     })
   }
 }

@@ -31,7 +31,26 @@ pub struct SnapshotData {
   /// Section table
   sections: Vec<SectionEntry>,
   /// Cache for decompressed sections
-  decompressed_cache: RwLock<HashMap<SectionId, Vec<u8>>>,
+  decompressed_cache: RwLock<HashMap<SectionId, Arc<[u8]>>>,
+}
+
+/// Borrowed or shared section bytes.
+#[derive(Clone)]
+pub enum SectionBytes<'a> {
+  Borrowed(&'a [u8]),
+  Shared(Arc<[u8]>),
+}
+
+impl SectionBytes<'_> {
+}
+
+impl AsRef<[u8]> for SectionBytes<'_> {
+  fn as_ref(&self) -> &[u8] {
+    match self {
+      SectionBytes::Borrowed(bytes) => bytes,
+      SectionBytes::Shared(bytes) => bytes.as_ref(),
+    }
+  }
 }
 
 /// Options for parsing a snapshot
@@ -263,7 +282,7 @@ impl SnapshotData {
     {
       let cache = self.decompressed_cache.read();
       if let Some(cached) = cache.get(&id) {
-        return Some(cached.clone());
+        return Some(cached.as_ref().to_vec());
       }
     }
 
@@ -278,16 +297,17 @@ impl SnapshotData {
     }
 
     // Decompress
-    let decompressed =
-      decompress_with_size(raw_bytes, compression, section.uncompressed_size as usize).ok()?;
+    let decompressed = Arc::<[u8]>::from(
+      decompress_with_size(raw_bytes, compression, section.uncompressed_size as usize).ok()?,
+    );
 
     // Cache the result
     {
       let mut cache = self.decompressed_cache.write();
-      cache.insert(id, decompressed.clone());
+      cache.insert(id, Arc::clone(&decompressed));
     }
 
-    Some(decompressed)
+    Some(decompressed.as_ref().to_vec())
   }
 
   /// Get section bytes as a slice (for uncompressed or already-cached sections)
@@ -308,10 +328,52 @@ impl SnapshotData {
 
   /// Get section data as a slice, decompressing if needed.
   pub fn section_data(&self, id: SectionId) -> Option<Cow<'_, [u8]>> {
-    self
-      .section_slice(id)
-      .map(Cow::Borrowed)
-      .or_else(|| self.section_bytes(id).map(Cow::Owned))
+    let data = self.section_data_shared(id)?;
+    match data {
+      SectionBytes::Borrowed(bytes) => Some(Cow::Borrowed(bytes)),
+      SectionBytes::Shared(bytes) => Some(Cow::Owned(bytes.as_ref().to_vec())),
+    }
+  }
+
+  /// Get section data as a borrowed slice or shared buffer.
+  pub fn section_data_shared(&self, id: SectionId) -> Option<SectionBytes<'_>> {
+    if let Some(slice) = self.section_slice(id) {
+      return Some(SectionBytes::Borrowed(slice));
+    }
+
+    let section = self.sections.get(id as usize)?;
+    if section.length == 0 {
+      return None;
+    }
+
+    // Check cache first
+    {
+      let cache = self.decompressed_cache.read();
+      if let Some(cached) = cache.get(&id) {
+        return Some(SectionBytes::Shared(Arc::clone(cached)));
+      }
+    }
+
+    let raw_bytes = self.raw_section_bytes(id)?;
+    let compression =
+      CompressionType::from_u32(section.compression).unwrap_or(CompressionType::None);
+
+    if compression == CompressionType::None {
+      return Some(SectionBytes::Borrowed(raw_bytes));
+    }
+
+    // Decompress
+    let decompressed = Arc::<[u8]>::from(
+      decompress_with_size(raw_bytes, compression, section.uncompressed_size as usize).ok()?,
+    );
+
+    // Cache the result
+    {
+      let mut cache = self.decompressed_cache.write();
+      cache.insert(id, Arc::clone(&decompressed));
+    }
+
+    Some(SectionBytes::Shared(decompressed))
   }
 
   // ========================================================================
@@ -321,7 +383,7 @@ impl SnapshotData {
   /// Get NodeID for a physical node index
   #[inline]
   pub fn get_node_id(&self, phys: PhysNode) -> Option<NodeId> {
-    let section = self.section_data(SectionId::PhysToNodeId)?;
+    let section = self.section_data_shared(SectionId::PhysToNodeId)?;
     let section = section.as_ref();
     if (phys as usize) * 8 + 8 > section.len() {
       return None;
@@ -332,7 +394,7 @@ impl SnapshotData {
   /// Get physical node index for a NodeID, or None if not present
   #[inline]
   pub fn get_phys_node(&self, node_id: NodeId) -> Option<PhysNode> {
-    let section = self.section_data(SectionId::NodeIdToPhys)?;
+    let section = self.section_data_shared(SectionId::NodeIdToPhys)?;
     let section = section.as_ref();
     let idx = node_id as usize;
     if idx * 4 + 4 > section.len() {
@@ -380,8 +442,8 @@ impl SnapshotData {
       return Some(String::new());
     }
 
-    let offsets = self.section_data(SectionId::StringOffsets)?;
-    let bytes = self.section_data(SectionId::StringBytes)?;
+    let offsets = self.section_data_shared(SectionId::StringOffsets)?;
+    let bytes = self.section_data_shared(SectionId::StringBytes)?;
     let offsets = offsets.as_ref();
     let bytes = bytes.as_ref();
 
@@ -406,7 +468,7 @@ impl SnapshotData {
 
   /// Get out-edge offset range for a physical node
   fn out_edge_range(&self, phys: PhysNode) -> Option<(usize, usize)> {
-    let offsets = self.section_data(SectionId::OutOffsets)?;
+    let offsets = self.section_data_shared(SectionId::OutOffsets)?;
     let offsets = offsets.as_ref();
     let idx = phys as usize;
     if idx * 4 + 8 > offsets.len() {
@@ -430,11 +492,11 @@ impl SnapshotData {
       None => return false,
     };
 
-    let out_etype = match self.section_data(SectionId::OutEtype) {
+    let out_etype = match self.section_data_shared(SectionId::OutEtype) {
       Some(s) => s,
       None => return false,
     };
-    let out_dst = match self.section_data(SectionId::OutDst) {
+    let out_dst = match self.section_data_shared(SectionId::OutDst) {
       Some(s) => s,
       None => return false,
     };
@@ -474,8 +536,8 @@ impl SnapshotData {
     dst_phys: PhysNode,
   ) -> Option<usize> {
     let (start, end) = self.out_edge_range(src_phys)?;
-    let out_etype = self.section_data(SectionId::OutEtype)?;
-    let out_dst = self.section_data(SectionId::OutDst)?;
+    let out_etype = self.section_data_shared(SectionId::OutEtype)?;
+    let out_dst = self.section_data_shared(SectionId::OutDst)?;
     let out_etype = out_etype.as_ref();
     let out_dst = out_dst.as_ref();
 
@@ -516,7 +578,7 @@ impl SnapshotData {
     if !self.header.flags.contains(SnapshotFlags::HAS_IN_EDGES) {
       return None;
     }
-    let offsets = self.section_data(SectionId::InOffsets)?;
+    let offsets = self.section_data_shared(SectionId::InOffsets)?;
     let offsets = offsets.as_ref();
     let idx = phys as usize;
     if idx * 4 + 8 > offsets.len() {
@@ -546,14 +608,14 @@ impl SnapshotData {
   pub fn lookup_by_key(&self, key: &str) -> Option<NodeId> {
     let hash64 = xxhash64_string(key);
 
-    let key_entries = self.section_data(SectionId::KeyEntries)?;
+    let key_entries = self.section_data_shared(SectionId::KeyEntries)?;
     let key_entries = key_entries.as_ref();
     let num_entries = key_entries.len() / KEY_INDEX_ENTRY_SIZE;
     if num_entries == 0 {
       return None;
     }
 
-    let (lo, hi) = if let Some(buckets) = self.section_data(SectionId::KeyBuckets) {
+    let (lo, hi) = if let Some(buckets) = self.section_data_shared(SectionId::KeyBuckets) {
       let buckets = buckets.as_ref();
       if buckets.len() > 4 {
         let num_buckets = buckets.len() / 4 - 1;
@@ -616,7 +678,7 @@ impl SnapshotData {
 
   /// Get the key for a node, if any
   pub fn get_node_key(&self, phys: PhysNode) -> Option<String> {
-    let node_key_string = self.section_data(SectionId::NodeKeyString)?;
+    let node_key_string = self.section_data_shared(SectionId::NodeKeyString)?;
     let node_key_string = node_key_string.as_ref();
     let idx = phys as usize;
     if idx * 4 + 4 > node_key_string.len() {
@@ -639,8 +701,8 @@ impl SnapshotData {
       return None;
     }
 
-    let offsets = self.section_data(SectionId::NodeLabelOffsets)?;
-    let labels = self.section_data(SectionId::NodeLabelIds)?;
+    let offsets = self.section_data_shared(SectionId::NodeLabelOffsets)?;
+    let labels = self.section_data_shared(SectionId::NodeLabelIds)?;
     let offsets = offsets.as_ref();
     let labels = labels.as_ref();
 
@@ -673,9 +735,9 @@ impl SnapshotData {
       return None;
     }
 
-    let offsets = self.section_data(SectionId::NodePropOffsets)?;
-    let keys = self.section_data(SectionId::NodePropKeys)?;
-    let vals = self.section_data(SectionId::NodePropVals)?;
+    let offsets = self.section_data_shared(SectionId::NodePropOffsets)?;
+    let keys = self.section_data_shared(SectionId::NodePropKeys)?;
+    let vals = self.section_data_shared(SectionId::NodePropVals)?;
     let offsets = offsets.as_ref();
     let keys = keys.as_ref();
     let vals = vals.as_ref();
@@ -708,9 +770,9 @@ impl SnapshotData {
       return None;
     }
 
-    let offsets = self.section_data(SectionId::NodePropOffsets)?;
-    let keys = self.section_data(SectionId::NodePropKeys)?;
-    let vals = self.section_data(SectionId::NodePropVals)?;
+    let offsets = self.section_data_shared(SectionId::NodePropOffsets)?;
+    let keys = self.section_data_shared(SectionId::NodePropKeys)?;
+    let vals = self.section_data_shared(SectionId::NodePropVals)?;
     let offsets = offsets.as_ref();
     let keys = keys.as_ref();
     let vals = vals.as_ref();
@@ -742,9 +804,9 @@ impl SnapshotData {
       return None;
     }
 
-    let offsets = self.section_data(SectionId::EdgePropOffsets)?;
-    let keys = self.section_data(SectionId::EdgePropKeys)?;
-    let vals = self.section_data(SectionId::EdgePropVals)?;
+    let offsets = self.section_data_shared(SectionId::EdgePropOffsets)?;
+    let keys = self.section_data_shared(SectionId::EdgePropKeys)?;
+    let vals = self.section_data_shared(SectionId::EdgePropVals)?;
     let offsets = offsets.as_ref();
     let keys = keys.as_ref();
     let vals = vals.as_ref();
@@ -793,8 +855,8 @@ impl SnapshotData {
           return None;
         }
 
-        let offsets = self.section_data(SectionId::VectorOffsets)?;
-        let data = self.section_data(SectionId::VectorData)?;
+        let offsets = self.section_data_shared(SectionId::VectorOffsets)?;
+        let data = self.section_data_shared(SectionId::VectorData)?;
         let offsets = offsets.as_ref();
         let data = data.as_ref();
 
@@ -832,8 +894,8 @@ impl SnapshotData {
 /// Iterator over out-edges
 pub struct OutEdgeIter<'a> {
   snapshot: &'a SnapshotData,
-  out_etype: Option<Cow<'a, [u8]>>,
-  out_dst: Option<Cow<'a, [u8]>>,
+  out_etype: Option<SectionBytes<'a>>,
+  out_dst: Option<SectionBytes<'a>>,
   current: usize,
   end: usize,
 }
@@ -843,8 +905,8 @@ impl<'a> OutEdgeIter<'a> {
     let (current, end) = snapshot.out_edge_range(phys).unwrap_or((0, 0));
     Self {
       snapshot,
-      out_etype: snapshot.section_data(SectionId::OutEtype),
-      out_dst: snapshot.section_data(SectionId::OutDst),
+      out_etype: snapshot.section_data_shared(SectionId::OutEtype),
+      out_dst: snapshot.section_data_shared(SectionId::OutDst),
       current,
       end,
     }
@@ -886,9 +948,9 @@ impl<'a> ExactSizeIterator for OutEdgeIter<'a> {}
 /// Iterator over in-edges
 pub struct InEdgeIter<'a> {
   snapshot: &'a SnapshotData,
-  in_etype: Option<Cow<'a, [u8]>>,
-  in_src: Option<Cow<'a, [u8]>>,
-  in_out_index: Option<Cow<'a, [u8]>>,
+  in_etype: Option<SectionBytes<'a>>,
+  in_src: Option<SectionBytes<'a>>,
+  in_out_index: Option<SectionBytes<'a>>,
   current: usize,
   end: usize,
 }
@@ -898,9 +960,9 @@ impl<'a> InEdgeIter<'a> {
     let (current, end) = snapshot.in_edge_range(phys).unwrap_or((0, 0));
     Self {
       snapshot,
-      in_etype: snapshot.section_data(SectionId::InEtype),
-      in_src: snapshot.section_data(SectionId::InSrc),
-      in_out_index: snapshot.section_data(SectionId::InOutIndex),
+      in_etype: snapshot.section_data_shared(SectionId::InEtype),
+      in_src: snapshot.section_data_shared(SectionId::InSrc),
+      in_out_index: snapshot.section_data_shared(SectionId::InOutIndex),
       current,
       end,
     }
@@ -965,7 +1027,7 @@ pub struct OutEdgeInfo {
 impl SnapshotData {
   /// Get label name by LabelID
   pub fn get_label_name(&self, label_id: LabelId) -> Option<&str> {
-    let label_string_ids = self.section_data(SectionId::LabelStringIds)?;
+    let label_string_ids = self.section_data_shared(SectionId::LabelStringIds)?;
     let label_string_ids = label_string_ids.as_ref();
     let idx = label_id as usize;
     if idx * 4 + 4 > label_string_ids.len() {
@@ -986,7 +1048,7 @@ impl SnapshotData {
 
   /// Get etype name by ETypeID
   pub fn get_etype_name(&self, etype_id: ETypeId) -> Option<&str> {
-    let etype_string_ids = self.section_data(SectionId::EtypeStringIds)?;
+    let etype_string_ids = self.section_data_shared(SectionId::EtypeStringIds)?;
     let etype_string_ids = etype_string_ids.as_ref();
     let idx = etype_id as usize;
     if idx * 4 + 4 > etype_string_ids.len() {
@@ -1003,7 +1065,7 @@ impl SnapshotData {
 
   /// Get propkey name by PropKeyID
   pub fn get_propkey_name(&self, propkey_id: PropKeyId) -> Option<&str> {
-    let propkey_string_ids = self.section_data(SectionId::PropkeyStringIds)?;
+    let propkey_string_ids = self.section_data_shared(SectionId::PropkeyStringIds)?;
     let propkey_string_ids = propkey_string_ids.as_ref();
     let idx = propkey_id as usize;
     if idx * 4 + 4 > propkey_string_ids.len() {

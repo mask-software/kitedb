@@ -29,99 +29,18 @@ pub fn vector_store_insert(
   node_id: NodeId,
   vector: &[f32],
 ) -> Result<u64, VectorStoreError> {
-  // Check dimensions
-  let dimensions = manifest.config.dimensions;
-  let row_group_size = manifest.config.row_group_size;
-  let normalize_on_insert = manifest.config.normalize_on_insert;
+  validate_insert(manifest, vector)?;
+  delete_existing_vector(manifest, node_id);
 
-  if vector.len() != dimensions {
-    return Err(VectorStoreError::DimensionMismatch {
-      expected: dimensions,
-      got: vector.len(),
-    });
-  }
+  let vec_data = prepare_insert_vector(manifest, vector);
 
-  // Validate vector
-  validate_vector(vector)?;
-
-  // Check if node already has a vector - delete old one first
-  if let Some(existing_vector_id) = manifest.node_to_vector.get(&node_id).copied() {
-    vector_store_delete_by_vector_id(manifest, existing_vector_id);
-  }
-
-  // Prepare vector (possibly normalize)
-  let mut vec_data = vector.to_vec();
-  if normalize_on_insert {
-    normalize_in_place(&mut vec_data);
-  }
-
-  // Get or create active fragment
   ensure_active_fragment(manifest);
+  let fragment_idx = active_fragment_index(manifest)?;
 
-  let fragment_id = manifest.active_fragment_id;
+  let (fragment_id, local_index) = append_to_fragment(manifest, fragment_idx, &vec_data);
+  let vector_id = register_vector(manifest, node_id, fragment_id, local_index);
 
-  // Get fragment index
-  let fragment_idx = manifest
-    .fragments
-    .iter()
-    .position(|f| f.id == fragment_id)
-    .unwrap();
-
-  // Check if we need a new row group
-  let row_group_idx = {
-    let fragment = &mut manifest.fragments[fragment_idx];
-    if fragment.row_groups.is_empty() || fragment.row_groups.last().unwrap().is_full(row_group_size)
-    {
-      let rg_id = fragment.row_groups.len();
-      fragment
-        .row_groups
-        .push(RowGroup::new(rg_id, row_group_size, dimensions));
-      rg_id
-    } else {
-      fragment.row_groups.len() - 1
-    }
-  };
-
-  // Append to row group
-  let fragment = &mut manifest.fragments[fragment_idx];
-  let local_row_idx = fragment.row_groups[row_group_idx].append(&vec_data);
-  let local_index = row_group_idx * row_group_size + local_row_idx;
-
-  // Extend deletion bitmap if needed
-  let word_idx = local_index / 32;
-  while fragment.deletion_bitmap.len() <= word_idx {
-    fragment.deletion_bitmap.push(0);
-  }
-
-  fragment.total_vectors += 1;
-
-  // Assign global vector ID
-  let vector_id = manifest.next_vector_id;
-  manifest.next_vector_id += 1;
-
-  // Update mappings
-  manifest.node_to_vector.insert(node_id, vector_id);
-  manifest.vector_to_node.insert(vector_id, node_id);
-  manifest.vector_locations.insert(
-    vector_id,
-    VectorLocation {
-      fragment_id,
-      local_index,
-    },
-  );
-
-  manifest.total_vectors += 1;
-
-  // Check if fragment should be sealed
-  let fragment_target_size = manifest.config.fragment_target_size;
-  let fragment = &mut manifest.fragments[fragment_idx];
-  if fragment.total_vectors >= fragment_target_size {
-    fragment.seal();
-    // Create new active fragment
-    let new_id = manifest.fragments.len();
-    manifest.fragments.push(Fragment::new(new_id));
-    manifest.active_fragment_id = new_id;
-  }
+  maybe_seal_fragment(manifest, fragment_idx);
 
   Ok(vector_id)
 }
@@ -412,6 +331,128 @@ fn ensure_active_fragment(manifest: &mut VectorManifest) {
   }
 }
 
+fn validate_insert(manifest: &VectorManifest, vector: &[f32]) -> Result<(), VectorStoreError> {
+  let dimensions = manifest.config.dimensions;
+  if vector.len() != dimensions {
+    return Err(VectorStoreError::DimensionMismatch {
+      expected: dimensions,
+      got: vector.len(),
+    });
+  }
+
+  validate_vector(vector)
+}
+
+fn delete_existing_vector(manifest: &mut VectorManifest, node_id: NodeId) {
+  if let Some(existing_vector_id) = manifest.node_to_vector.get(&node_id).copied() {
+    vector_store_delete_by_vector_id(manifest, existing_vector_id);
+  }
+}
+
+fn prepare_insert_vector(manifest: &VectorManifest, vector: &[f32]) -> Vec<f32> {
+  let mut vec_data = vector.to_vec();
+  if manifest.config.normalize_on_insert {
+    normalize_in_place(&mut vec_data);
+  }
+  vec_data
+}
+
+fn active_fragment_index(manifest: &VectorManifest) -> Result<usize, VectorStoreError> {
+  let fragment_id = manifest.active_fragment_id;
+  manifest
+    .fragments
+    .iter()
+    .position(|f| f.id == fragment_id)
+    .ok_or_else(|| {
+      VectorStoreError::Invariant(format!(
+        "active fragment id {fragment_id} missing from manifest"
+      ))
+    })
+}
+
+fn append_to_fragment(
+  manifest: &mut VectorManifest,
+  fragment_idx: usize,
+  vec_data: &[f32],
+) -> (usize, usize) {
+  let row_group_size = manifest.config.row_group_size;
+  let dimensions = manifest.config.dimensions;
+  let fragment_id = manifest.fragments[fragment_idx].id;
+
+  let row_group_idx = ensure_row_group(
+    &mut manifest.fragments[fragment_idx],
+    row_group_size,
+    dimensions,
+  );
+
+  let fragment = &mut manifest.fragments[fragment_idx];
+  let local_row_idx = fragment.row_groups[row_group_idx].append(vec_data);
+  let local_index = row_group_idx * row_group_size + local_row_idx;
+
+  extend_deletion_bitmap(fragment, local_index);
+  fragment.total_vectors += 1;
+
+  (fragment_id, local_index)
+}
+
+fn ensure_row_group(fragment: &mut Fragment, row_group_size: usize, dimensions: usize) -> usize {
+  if fragment
+    .row_groups
+    .last()
+    .map(|rg| rg.is_full(row_group_size))
+    .unwrap_or(true)
+  {
+    let rg_id = fragment.row_groups.len();
+    fragment
+      .row_groups
+      .push(RowGroup::new(rg_id, row_group_size, dimensions));
+    rg_id
+  } else {
+    fragment.row_groups.len() - 1
+  }
+}
+
+fn extend_deletion_bitmap(fragment: &mut Fragment, local_index: usize) {
+  let word_idx = local_index / 32;
+  while fragment.deletion_bitmap.len() <= word_idx {
+    fragment.deletion_bitmap.push(0);
+  }
+}
+
+fn register_vector(
+  manifest: &mut VectorManifest,
+  node_id: NodeId,
+  fragment_id: usize,
+  local_index: usize,
+) -> u64 {
+  let vector_id = manifest.next_vector_id;
+  manifest.next_vector_id += 1;
+
+  manifest.node_to_vector.insert(node_id, vector_id);
+  manifest.vector_to_node.insert(vector_id, node_id);
+  manifest.vector_locations.insert(
+    vector_id,
+    VectorLocation {
+      fragment_id,
+      local_index,
+    },
+  );
+  manifest.total_vectors += 1;
+
+  vector_id
+}
+
+fn maybe_seal_fragment(manifest: &mut VectorManifest, fragment_idx: usize) {
+  let fragment_target_size = manifest.config.fragment_target_size;
+  let fragment = &mut manifest.fragments[fragment_idx];
+  if fragment.total_vectors >= fragment_target_size {
+    fragment.seal();
+    let new_id = manifest.fragments.len();
+    manifest.fragments.push(Fragment::new(new_id));
+    manifest.active_fragment_id = new_id;
+  }
+}
+
 /// Validate vector for NaN, Infinity, and zero vectors
 fn validate_vector(vector: &[f32]) -> Result<(), VectorStoreError> {
   let mut all_zero = true;
@@ -454,6 +495,8 @@ pub enum VectorStoreError {
   InvalidVector(String),
   /// Vector not found
   NotFound(u64),
+  /// Internal invariant violation
+  Invariant(String),
 }
 
 impl std::fmt::Display for VectorStoreError {
@@ -467,6 +510,7 @@ impl std::fmt::Display for VectorStoreError {
       }
       VectorStoreError::InvalidVector(msg) => write!(f, "Invalid vector: {msg}"),
       VectorStoreError::NotFound(id) => write!(f, "Vector not found: {id}"),
+      VectorStoreError::Invariant(msg) => write!(f, "Invariant violation: {msg}"),
     }
   }
 }
@@ -753,5 +797,8 @@ mod tests {
 
     let err3 = VectorStoreError::NotFound(42);
     assert!(err3.to_string().contains("42"));
+
+    let err4 = VectorStoreError::Invariant("broken".into());
+    assert!(err4.to_string().contains("broken"));
   }
 }

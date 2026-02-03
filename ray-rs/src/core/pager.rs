@@ -137,13 +137,24 @@ impl FilePager {
   /// Memory-map the entire file (for snapshot access)
   /// Returns a view into mmap'd memory
   pub fn mmap_file(&mut self) -> Result<&Mmap> {
+    if let Some(mmap) = self.mmap.as_ref() {
+      let file_len = self.file.metadata()?.len() as usize;
+      if file_len != mmap.len() {
+        // Drop stale mapping and remap with the current file size.
+        self.mmap = None;
+      }
+    }
+
     if self.mmap.is_none() {
-      // Safety: The file should not be modified while mmap is active
-      // In practice, we invalidate the mmap on writes
+      // SAFETY: The file must not be mutated while this mapping is live.
+      // We invalidate the mmap cache on any write path.
       let mmap = map_file(&self.file)?;
       self.mmap = Some(mmap);
     }
-    Ok(self.mmap.as_ref().unwrap())
+    self
+      .mmap
+      .as_ref()
+      .ok_or_else(|| KiteError::Internal("mmap not initialized after mapping".to_string()))
   }
 
   /// Get a slice of the mmap'd file for a page range
@@ -233,6 +244,7 @@ impl FilePager {
     #[cfg(target_os = "macos")]
     {
       use std::os::unix::io::AsRawFd;
+      // SAFETY: file descriptor is valid for the pager file.
       let result = unsafe { libc::fsync(self.file.as_raw_fd()) };
       if result != 0 {
         return Err(std::io::Error::last_os_error().into());

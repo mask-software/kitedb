@@ -14,6 +14,10 @@ use kitedb::core::single_file::{
 };
 use kitedb::types::PropValue;
 
+fn temp_db_path(temp_dir: &tempfile::TempDir) -> std::path::PathBuf {
+  temp_dir.path().join("bench.kitedb")
+}
+
 fn open_bench_db(path: &std::path::Path) -> kitedb::core::single_file::SingleFileDB {
   open_single_file(
     path,
@@ -35,7 +39,7 @@ fn bench_single_file_insert(c: &mut Criterion) {
         bencher.iter_with_setup(
           || {
             let temp_dir = tempdir().unwrap();
-            let db = open_bench_db(temp_dir.path());
+            let db = open_bench_db(&temp_db_path(&temp_dir));
             (temp_dir, db)
           },
           |(_temp_dir, db)| {
@@ -58,7 +62,7 @@ fn bench_single_file_insert(c: &mut Criterion) {
 
 fn bench_single_file_checkpoint(c: &mut Criterion) {
   let mut group = c.benchmark_group("single_file_checkpoint");
-  group.sample_size(5);
+  group.sample_size(10);
 
   for count in [1_000usize, 5_000usize].iter() {
     group.throughput(Throughput::Elements(*count as u64));
@@ -69,7 +73,7 @@ fn bench_single_file_checkpoint(c: &mut Criterion) {
         bencher.iter_batched(
           || {
             let temp_dir = tempdir().unwrap();
-            let db = open_bench_db(temp_dir.path());
+            let db = open_bench_db(&temp_db_path(&temp_dir));
             db.begin(false).unwrap();
             for i in 0..count {
               let key = format!("n{i}");
@@ -79,7 +83,8 @@ fn bench_single_file_checkpoint(c: &mut Criterion) {
             (temp_dir, db)
           },
           |(_temp_dir, db)| {
-            black_box(db.checkpoint().unwrap());
+            db.checkpoint().unwrap();
+            black_box(());
             close_single_file(db).unwrap();
           },
           BatchSize::SmallInput,

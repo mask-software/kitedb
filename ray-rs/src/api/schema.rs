@@ -106,8 +106,9 @@ pub struct PropDef {
 impl PropDef {
   /// Create a new property definition
   fn new(name: &str, schema_type: SchemaType) -> Self {
+    let name = name.to_string();
     Self {
-      name: name.to_string(),
+      name,
       schema_type,
       optional: false,
       default: None,
@@ -332,11 +333,13 @@ pub struct NodeSchemaBuilder {
 }
 
 impl NodeSchemaBuilder {
-  fn new(name: &str) -> Self {
+  fn new(name: impl Into<String>) -> Self {
+    let name = name.into();
+    let key_prefix = format!("{name}:");
     Self {
-      name: name.to_string(),
+      name,
       key_fn: None,
-      key_prefix: format!("{name}:"),
+      key_prefix,
       props: HashMap::new(),
     }
   }
@@ -367,8 +370,8 @@ impl NodeSchemaBuilder {
   }
 
   /// Set a custom key prefix (overrides auto-detection)
-  pub fn key_prefix(mut self, prefix: &str) -> Self {
-    self.key_prefix = prefix.to_string();
+  pub fn key_prefix(mut self, prefix: impl Into<String>) -> Self {
+    self.key_prefix = prefix.into();
     self
   }
 
@@ -432,13 +435,13 @@ impl NodeSchemaBuilder {
 ///     .prop(prop::string("content").optional())
 ///     .build();
 /// ```
-pub fn node(name: &str) -> NodeSchemaBuilder {
+pub fn node(name: impl Into<String>) -> NodeSchemaBuilder {
   NodeSchemaBuilder::new(name)
 }
 
 /// Define a node type (deprecated alias for `node()`)
 #[deprecated(since = "0.2.0", note = "Use `node()` instead")]
-pub fn define_node(name: &str) -> NodeSchemaBuilder {
+pub fn define_node(name: impl Into<String>) -> NodeSchemaBuilder {
   node(name)
 }
 
@@ -521,9 +524,9 @@ pub struct EdgeSchemaBuilder {
 }
 
 impl EdgeSchemaBuilder {
-  fn new(name: &str) -> Self {
+  fn new(name: impl Into<String>) -> Self {
     Self {
-      name: name.to_string(),
+      name: name.into(),
       props: HashMap::new(),
     }
   }
@@ -573,13 +576,13 @@ impl EdgeSchemaBuilder {
 /// // Edge without properties
 /// let follows = edge("follows").build();
 /// ```
-pub fn edge(name: &str) -> EdgeSchemaBuilder {
+pub fn edge(name: impl Into<String>) -> EdgeSchemaBuilder {
   EdgeSchemaBuilder::new(name)
 }
 
 /// Define an edge type (deprecated alias for `edge()`)
 #[deprecated(since = "0.2.0", note = "Use `edge()` instead")]
-pub fn define_edge(name: &str) -> EdgeSchemaBuilder {
+pub fn define_edge(name: impl Into<String>) -> EdgeSchemaBuilder {
   edge(name)
 }
 
@@ -774,20 +777,20 @@ mod tests {
   #[test]
   fn test_prop_validation() {
     let name_prop = prop::string("name");
-    assert!(name_prop.validate(&PropValue::String("Alice".to_string())));
+    assert!(name_prop.validate(&PropValue::String("Alice".into())));
     assert!(!name_prop.validate(&PropValue::I64(42)));
     assert!(!name_prop.validate(&PropValue::Null));
 
     let age_prop = prop::int("age").optional();
     assert!(age_prop.validate(&PropValue::I64(30)));
     assert!(age_prop.validate(&PropValue::Null)); // Optional allows null
-    assert!(!age_prop.validate(&PropValue::String("thirty".to_string())));
+    assert!(!age_prop.validate(&PropValue::String("thirty".into())));
   }
 
   #[test]
   fn test_node() {
     let user = node("user")
-      .key(|id| format!("user:{}", id))
+      .key(|id| format!("user:{id}"))
       .prop(prop::string("name"))
       .prop(prop::int("age").optional())
       .build();
@@ -840,11 +843,11 @@ mod tests {
 
     // Valid: all required props present
     let mut props = HashMap::new();
-    props.insert("name".to_string(), PropValue::String("Alice".to_string()));
+    props.insert("name".into(), PropValue::String("Alice".into()));
     assert!(user.validate(&props).is_ok());
 
     // Valid: with optional prop
-    props.insert("age".to_string(), PropValue::I64(30));
+    props.insert("age".into(), PropValue::I64(30));
     assert!(user.validate(&props).is_ok());
 
     // Invalid: missing required
@@ -856,7 +859,7 @@ mod tests {
 
     // Invalid: wrong type
     let mut wrong_type = HashMap::new();
-    wrong_type.insert("name".to_string(), PropValue::I64(42));
+    wrong_type.insert("name".into(), PropValue::I64(42));
     assert!(matches!(
       user.validate(&wrong_type),
       Err(ValidationError::TypeMismatch { .. })
@@ -866,12 +869,12 @@ mod tests {
   #[test]
   fn test_database_schema() {
     let user = node("user")
-      .key(|id| format!("user:{}", id))
+      .key(|id| format!("user:{id}"))
       .prop(prop::string("name"))
       .build();
 
     let post = node("post")
-      .key(|id| format!("post:{}", id))
+      .key(|id| format!("post:{id}"))
       .prop(prop::string("title"))
       .build();
 
@@ -956,7 +959,7 @@ mod tests {
     // Validate vector property
     let embedding_prop = prop::vector("embedding");
     assert!(embedding_prop.validate(&PropValue::VectorF32(vec![0.1, 0.2, 0.3])));
-    assert!(!embedding_prop.validate(&PropValue::String("not a vector".to_string())));
+    assert!(!embedding_prop.validate(&PropValue::String("not a vector".into())));
   }
 
   #[test]
@@ -968,11 +971,11 @@ mod tests {
 
     // Valid: required prop present
     let mut props = HashMap::new();
-    props.insert("since".to_string(), PropValue::I64(2020));
+    props.insert("since".into(), PropValue::I64(2020));
     assert!(knows.validate(&props).is_ok());
 
     // Valid: with optional
-    props.insert("weight".to_string(), PropValue::F64(0.95));
+    props.insert("weight".into(), PropValue::F64(0.95));
     assert!(knows.validate(&props).is_ok());
 
     // Invalid: missing required
@@ -985,18 +988,18 @@ mod tests {
 
   #[test]
   fn test_prop_with_default() {
-    let status = prop::string("status").default(PropValue::String("active".to_string()));
+    let status = prop::string("status").default(PropValue::String("active".into()));
     assert!(status.default.is_some());
 
     // Schema with default should not require the prop
     let user = node("user")
       .prop(prop::string("name"))
-      .prop(prop::string("status").default(PropValue::String("active".to_string())))
+      .prop(prop::string("status").default(PropValue::String("active".into())))
       .build();
 
     // Valid without status (has default)
     let mut props = HashMap::new();
-    props.insert("name".to_string(), PropValue::String("Alice".to_string()));
+    props.insert("name".into(), PropValue::String("Alice".into()));
     assert!(user.validate(&props).is_ok());
   }
 }

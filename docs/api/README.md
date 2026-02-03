@@ -1,5 +1,7 @@
 # Kite High-Level API
 
+> Note: The directory-based GraphDB (multi-file) engine has been removed. KiteDB is single-file (`.kitedb`) only; GraphDB references below are historical.
+
 The `api` module provides a **Drizzle-style, type-safe API** for Kite, a high-performance embedded graph database. It wraps the lower-level database primitives with a fluent, ergonomic interface featuring full TypeScript type inference.
 
 ## Overview

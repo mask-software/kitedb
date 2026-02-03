@@ -1,17 +1,19 @@
 # RayDB Single-File Performance Optimizations
 
+> Note: The directory-based GraphDB (multi-file) engine has been removed. KiteDB is single-file (`.kitedb`) only; any GraphDB references below are historical.
+
 This document outlines identified performance optimization opportunities for the single-file format, prioritized by impact and implementation effort.
 
 ## Background
 
-After benchmarking the single-file format against the multi-file format, we identified and fixed the primary performance issue: the pager was using `readSync()` to copy snapshot data into memory instead of `Bun.mmap()` for zero-copy access.
+After benchmarking and profiling the single-file format, we identified and fixed the primary performance issue: the pager was using `readSync()` to copy snapshot data into memory instead of `Bun.mmap()` for zero-copy access.
 
-The multi-file (directory) format is now considered legacy; these optimizations focus on the single-file `.kitedb` path.
+The `.kitedb` single-file format is the only supported storage path.
 
 With that fix applied, the single-file format now achieves:
-- **41% smaller storage** (2.82 MB vs 4.79 MB for 5K nodes, 25K edges)
+- **~2.82 MB storage** for 5K nodes, 25K edges
 - **Comparable read performance** (some operations faster, some slightly slower)
-- **3x faster small batch writes** (108K vs 35K nodes/sec for 10-node batches)
+- **~108K nodes/sec** for 10-node batches
 
 The remaining optimizations below can further improve performance.
 

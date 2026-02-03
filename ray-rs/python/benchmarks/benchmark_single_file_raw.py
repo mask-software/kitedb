@@ -2,7 +2,7 @@
 """
 Single-file Raw Benchmark (Python)
 
-Benchmarks low-level GraphDB operations via the Python bindings.
+Benchmarks low-level Database operations via the Python bindings.
 Intended for apples-to-apples comparison with bench/benchmark-single-file-raw.ts.
 
 Prerequisites:

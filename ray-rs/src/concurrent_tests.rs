@@ -49,26 +49,23 @@
 mod tests {
   use std::collections::HashMap;
   use std::sync::atomic::{AtomicU64, Ordering};
-  use std::sync::{mpsc, Arc, Barrier};
+  use std::sync::{Arc, Barrier};
   use std::thread;
   use std::time::{Duration, Instant};
   use tempfile::tempdir;
 
-  use crate::api::kite::{EdgeDef, NodeDef, PropDef, Kite, KiteOptions};
+  use crate::api::kite::{EdgeDef, Kite, KiteOptions, NodeDef, PropDef};
   use crate::core::single_file::{open_single_file, SingleFileOpenOptions};
-  use crate::error::KiteError;
-  use crate::graph::db::{open_graph_db, OpenOptions};
-  use crate::graph::iterators::list_nodes as graph_list_nodes;
-  use crate::graph::iterators::{list_edges as graph_list_edges, ListEdgesOptions};
-  use crate::graph::key_index::get_node_key as graph_get_node_key;
-  use crate::graph::nodes::{create_node, upsert_node_with_props, NodeOpts};
-  use crate::graph::tx::{begin_tx, commit, rollback};
   use crate::mvcc::{ConflictDetector, TxManager};
-  use crate::types::{PropKeyId, PropValue};
+  use crate::types::{PropValue, TxKey};
 
   // ============================================================================
   // Test Helpers
   // ============================================================================
+
+  fn key(name: &str) -> TxKey {
+    TxKey::Key(std::sync::Arc::from(name))
+  }
 
   fn create_test_schema() -> KiteOptions {
     let user = NodeDef::new("User", "user:")
@@ -88,9 +85,13 @@ mod tests {
       .edge(likes)
   }
 
+  fn temp_db_path(temp_dir: &tempfile::TempDir) -> std::path::PathBuf {
+    temp_dir.path().join("test-db")
+  }
+
   fn setup_test_db(node_count: usize, edge_count: usize) -> (tempfile::TempDir, Kite) {
     let temp_dir = tempdir().unwrap();
-    let mut ray = Kite::open(temp_dir.path(), create_test_schema()).unwrap();
+    let mut ray = Kite::open(temp_db_path(&temp_dir), create_test_schema()).unwrap();
 
     // Create nodes
     let mut node_ids = Vec::with_capacity(node_count);
@@ -534,218 +535,13 @@ mod tests {
     // Reads should not be blocked for more than 100ms (generous threshold)
     assert!(
       *max_read_time < Duration::from_millis(100),
-      "Max read time {:?} exceeded threshold - possible writer starvation",
-      max_read_time
+      "Max read time {max_read_time:?} exceeded threshold - possible writer starvation"
     );
   }
 
   // ============================================================================
   // MVCC Transaction Isolation Tests
   // ============================================================================
-
-  #[test]
-  fn test_concurrent_upsert_same_key_unique() {
-    let temp_dir = tempdir().unwrap();
-    let db = open_graph_db(temp_dir.path(), OpenOptions::new().mvcc(true)).unwrap();
-    let db = Arc::new(db);
-
-    let num_threads = 8;
-    let begin_barrier = Arc::new(Barrier::new(num_threads));
-    let commit_barrier = Arc::new(Barrier::new(num_threads));
-    let successes = Arc::new(AtomicU64::new(0));
-    let conflicts = Arc::new(AtomicU64::new(0));
-
-    let handles: Vec<_> = (0..num_threads)
-      .map(|_| {
-        let db = Arc::clone(&db);
-        let begin_barrier = Arc::clone(&begin_barrier);
-        let commit_barrier = Arc::clone(&commit_barrier);
-        let successes = Arc::clone(&successes);
-        let conflicts = Arc::clone(&conflicts);
-
-        thread::spawn(move || {
-          begin_barrier.wait();
-          let mut tx = begin_tx(&db).unwrap();
-          commit_barrier.wait();
-          let updates: Vec<(PropKeyId, Option<PropValue>)> = Vec::new();
-
-          match upsert_node_with_props(&mut tx, "user:unique", updates) {
-            Ok(_) => match commit(&mut tx) {
-              Ok(_) => {
-                successes.fetch_add(1, Ordering::Relaxed);
-              }
-              Err(err) => {
-                let _ = rollback(&mut tx);
-                match err {
-                  KiteError::Conflict { .. } => {
-                    conflicts.fetch_add(1, Ordering::Relaxed);
-                  }
-                  other => panic!("Unexpected commit error: {other}"),
-                }
-              }
-            },
-            Err(err) => {
-              let _ = rollback(&mut tx);
-              panic!("Upsert failed: {err}");
-            }
-          }
-        })
-      })
-      .collect();
-
-    for handle in handles {
-      handle.join().unwrap();
-    }
-
-    assert_eq!(
-      successes.load(Ordering::Relaxed),
-      1,
-      "Only one upsert should commit successfully"
-    );
-
-    let delta = db.delta.read();
-    let snapshot = db.snapshot.as_ref();
-    let mut count = 0;
-    for node_id in graph_list_nodes(&db) {
-      if let Some(key) = graph_get_node_key(snapshot, &delta, node_id) {
-        if key == "user:unique" {
-          count += 1;
-        }
-      }
-    }
-
-    assert_eq!(count, 1, "Only one node should exist with the key");
-    assert_eq!(
-      successes.load(Ordering::Relaxed) + conflicts.load(Ordering::Relaxed),
-      num_threads as u64,
-      "All upserts should either commit or conflict"
-    );
-  }
-
-  #[test]
-  fn test_mvcc_concurrent_upsert_same_edge_unique() {
-    let temp_dir = tempdir().unwrap();
-    let db = open_graph_db(temp_dir.path(), OpenOptions::new().mvcc(true)).unwrap();
-    let db = Arc::new(db);
-
-    let etype = db.get_or_create_etype("FOLLOWS");
-
-    let (src, dst) = {
-      let mut tx = begin_tx(&db).unwrap();
-      let src = create_node(&mut tx, NodeOpts::new()).unwrap();
-      let dst = create_node(&mut tx, NodeOpts::new()).unwrap();
-      commit(&mut tx).unwrap();
-      (src, dst)
-    };
-
-    let num_threads = 8;
-    let begin_barrier = Arc::new(Barrier::new(num_threads));
-    let commit_barrier = Arc::new(Barrier::new(num_threads));
-    let successes = Arc::new(AtomicU64::new(0));
-    let conflicts = Arc::new(AtomicU64::new(0));
-
-    let handles: Vec<_> = (0..num_threads)
-      .map(|_| {
-        let db = Arc::clone(&db);
-        let begin_barrier = Arc::clone(&begin_barrier);
-        let commit_barrier = Arc::clone(&commit_barrier);
-        let successes = Arc::clone(&successes);
-        let conflicts = Arc::clone(&conflicts);
-
-        thread::spawn(move || {
-          begin_barrier.wait();
-          let mut tx = begin_tx(&db).unwrap();
-          commit_barrier.wait();
-          let updates: Vec<(PropKeyId, Option<PropValue>)> = Vec::new();
-
-          match crate::graph::edges::upsert_edge_with_props(&mut tx, src, etype, dst, updates) {
-            Ok(_) => match commit(&mut tx) {
-              Ok(_) => {
-                successes.fetch_add(1, Ordering::Relaxed);
-              }
-              Err(err) => {
-                let _ = rollback(&mut tx);
-                match err {
-                  KiteError::Conflict { .. } => {
-                    conflicts.fetch_add(1, Ordering::Relaxed);
-                  }
-                  other => panic!("Unexpected commit error: {other}"),
-                }
-              }
-            },
-            Err(err) => {
-              let _ = rollback(&mut tx);
-              panic!("Upsert failed: {err}");
-            }
-          }
-        })
-      })
-      .collect();
-
-    for handle in handles {
-      handle.join().unwrap();
-    }
-
-    assert_eq!(
-      successes.load(Ordering::Relaxed),
-      1,
-      "Only one edge upsert should commit successfully"
-    );
-
-    let edges = graph_list_edges(&db, ListEdgesOptions { etype: Some(etype) });
-    let count = edges
-      .into_iter()
-      .filter(|edge| edge.src == src && edge.dst == dst)
-      .count();
-    assert_eq!(count, 1, "Only one edge should exist between nodes");
-
-    assert_eq!(
-      successes.load(Ordering::Relaxed) + conflicts.load(Ordering::Relaxed),
-      num_threads as u64,
-      "All upserts should either commit or conflict"
-    );
-  }
-
-  #[test]
-  fn test_non_mvcc_single_writer_enforced() {
-    let temp_dir = tempdir().unwrap();
-    let db = open_graph_db(temp_dir.path(), OpenOptions::new().mvcc(false)).unwrap();
-    let db = Arc::new(db);
-
-    let (started_tx, started_rx) = mpsc::channel();
-    let (release_tx, release_rx) = mpsc::channel();
-
-    let writer_db = Arc::clone(&db);
-    let writer = thread::spawn(move || {
-      let mut tx = begin_tx(&writer_db).expect("begin write tx");
-      started_tx.send(()).unwrap();
-      release_rx.recv().unwrap();
-      rollback(&mut tx).unwrap();
-    });
-
-    let contender_db = Arc::clone(&db);
-    let contender = thread::spawn(move || {
-      started_rx.recv().unwrap();
-      let res = begin_tx(&contender_db);
-      let outcome = match res {
-        Ok(mut tx) => {
-          let _ = rollback(&mut tx);
-          Ok(())
-        }
-        Err(err) => Err(err),
-      };
-      release_tx.send(()).unwrap();
-      outcome
-    });
-
-    let contender_res = contender.join().unwrap();
-    writer.join().unwrap();
-
-    assert!(
-      matches!(contender_res, Err(KiteError::TransactionInProgress)),
-      "Non-MVCC databases should allow only one writer at a time"
-    );
-  }
 
   #[test]
   fn test_mvcc_concurrent_transactions_no_conflict() {
@@ -758,8 +554,8 @@ mod tests {
     let (txid2, _) = tx_mgr.begin_tx();
 
     // They write to different keys
-    tx_mgr.record_write(txid1, "key_a".to_string());
-    tx_mgr.record_write(txid2, "key_b".to_string());
+    tx_mgr.record_write(txid1, key("key_a"));
+    tx_mgr.record_write(txid2, key("key_b"));
 
     // Both should commit without conflict
     assert!(
@@ -785,8 +581,8 @@ mod tests {
     let (txid2, _) = tx_mgr.begin_tx();
 
     // Both write to same key
-    tx_mgr.record_write(txid1, "shared_key".to_string());
-    tx_mgr.record_write(txid2, "shared_key".to_string());
+    tx_mgr.record_write(txid1, key("shared_key"));
+    tx_mgr.record_write(txid2, key("shared_key"));
 
     // First commits
     assert!(detector.validate_commit(&tx_mgr, txid1).is_ok());
@@ -809,8 +605,8 @@ mod tests {
     let (txid2, _) = tx_mgr.begin_tx();
 
     // Tx1 writes, Tx2 reads the same key
-    tx_mgr.record_write(txid1, "key".to_string());
-    tx_mgr.record_read(txid2, "key".to_string());
+    tx_mgr.record_write(txid1, key("key"));
+    tx_mgr.record_read(txid2, key("key"));
 
     // Tx1 commits first
     tx_mgr.commit_tx(txid1).unwrap();
@@ -830,7 +626,7 @@ mod tests {
 
     // First, establish some data
     let (setup_tx, _) = tx_mgr.begin_tx();
-    tx_mgr.record_write(setup_tx, "data".to_string());
+    tx_mgr.record_write(setup_tx, key("data"));
     tx_mgr.commit_tx(setup_tx).unwrap();
 
     // Start many concurrent read transactions
@@ -838,7 +634,7 @@ mod tests {
     let reader_txids: Vec<_> = (0..num_readers)
       .map(|_| {
         let (txid, _) = tx_mgr.begin_tx();
-        tx_mgr.record_read(txid, "data".to_string());
+        tx_mgr.record_read(txid, key("data"));
         txid
       })
       .collect();
@@ -861,7 +657,7 @@ mod tests {
 
     for i in 0..5 {
       let (txid, _) = tx_mgr.begin_tx();
-      tx_mgr.record_write(txid, "key".to_string());
+      tx_mgr.record_write(txid, key("key"));
 
       assert!(
         detector.validate_commit(&tx_mgr, txid).is_ok(),
@@ -879,20 +675,20 @@ mod tests {
     let (txid1, _) = tx_mgr.begin_tx();
     let (txid2, _) = tx_mgr.begin_tx();
 
-    tx_mgr.record_write(txid1, "conflict_key".to_string());
-    tx_mgr.record_write(txid2, "conflict_key".to_string());
-    tx_mgr.record_write(txid2, "ok_key".to_string());
+    tx_mgr.record_write(txid1, key("conflict_key"));
+    tx_mgr.record_write(txid2, key("conflict_key"));
+    tx_mgr.record_write(txid2, key("ok_key"));
 
     tx_mgr.commit_tx(txid1).unwrap();
 
     let conflicts = detector.check_conflicts(&tx_mgr, txid2);
     assert!(!conflicts.is_empty(), "Should detect conflicts");
     assert!(
-      conflicts.contains(&"conflict_key".to_string()),
+      conflicts.contains(&key("conflict_key").to_string()),
       "Should identify conflicting key"
     );
     assert!(
-      !conflicts.contains(&"ok_key".to_string()),
+      !conflicts.contains(&key("ok_key").to_string()),
       "Non-conflicting key should not be reported"
     );
   }
@@ -940,8 +736,7 @@ mod tests {
     let ops_per_sec = total as f64 / elapsed.as_secs_f64();
 
     println!(
-      "High concurrency test: {} ops in {:?} ({:.0} ops/sec)",
-      total, elapsed, ops_per_sec
+      "High concurrency test: {total} ops in {elapsed:?} ({ops_per_sec:.0} ops/sec)"
     );
 
     assert_eq!(
@@ -1037,8 +832,7 @@ mod tests {
     );
 
     println!(
-      "Mixed workload: {} reads, {} writes completed",
-      total_reads, total_writes
+      "Mixed workload: {total_reads} reads, {total_writes} writes completed"
     );
   }
 
@@ -1138,10 +932,9 @@ mod tests {
         throughput / baseline_throughput
       };
 
-      println!(
-        "{:7} | {:>19.0} | {:>6.2}x",
-        num_threads, throughput, speedup
-      );
+    println!(
+        "{num_threads:7} | {throughput:>19.0} | {speedup:>6.2}x"
+    );
     }
   }
 }

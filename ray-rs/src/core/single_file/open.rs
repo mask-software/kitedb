@@ -14,6 +14,7 @@ use crate::core::pager::{create_pager, is_valid_page_size, open_pager, pages_to_
 use crate::core::snapshot::reader::SnapshotData;
 use crate::core::wal::buffer::WalBuffer;
 use crate::error::{KiteError, Result};
+use crate::mvcc::{GcConfig, MvccManager};
 use crate::types::*;
 use crate::util::compression::CompressionOptions;
 use crate::util::mmap::map_file;
@@ -66,6 +67,14 @@ pub struct SingleFileOpenOptions {
   pub read_only: bool,
   /// Create database if it doesn't exist
   pub create_if_missing: bool,
+  /// Enable MVCC (snapshot isolation + conflict detection)
+  pub mvcc: bool,
+  /// MVCC GC interval in ms
+  pub mvcc_gc_interval_ms: Option<u64>,
+  /// MVCC retention in ms
+  pub mvcc_retention_ms: Option<u64>,
+  /// MVCC max version chain depth
+  pub mvcc_max_chain_depth: Option<usize>,
   /// Page size (default 4KB, must be power of 2 between 4KB and 64KB)
   pub page_size: usize,
   /// WAL size in bytes (default 1MB)
@@ -91,6 +100,10 @@ impl Default for SingleFileOpenOptions {
     Self {
       read_only: false,
       create_if_missing: true,
+      mvcc: false,
+      mvcc_gc_interval_ms: None,
+      mvcc_retention_ms: None,
+      mvcc_max_chain_depth: None,
       page_size: DEFAULT_PAGE_SIZE,
       wal_size: WAL_DEFAULT_SIZE,
       auto_checkpoint: false,
@@ -119,6 +132,26 @@ impl SingleFileOpenOptions {
 
   pub fn create_if_missing(mut self, value: bool) -> Self {
     self.create_if_missing = value;
+    self
+  }
+
+  pub fn mvcc(mut self, value: bool) -> Self {
+    self.mvcc = value;
+    self
+  }
+
+  pub fn mvcc_gc_interval_ms(mut self, value: u64) -> Self {
+    self.mvcc_gc_interval_ms = Some(value);
+    self
+  }
+
+  pub fn mvcc_retention_ms(mut self, value: u64) -> Self {
+    self.mvcc_retention_ms = Some(value);
+    self
+  }
+
+  pub fn mvcc_max_chain_depth(mut self, value: usize) -> Self {
+    self.mvcc_max_chain_depth = Some(value);
     self
   }
 
@@ -296,6 +329,9 @@ pub fn open_single_file<P: AsRef<Path>>(
 
   // Initialize delta
   let mut delta = DeltaState::new();
+  let mut next_commit_ts: u64 = 1;
+  let mut committed_in_order: Vec<(TxId, Vec<&crate::core::wal::record::ParsedWalRecord>)> =
+    Vec::new();
 
   // Schema maps
   let mut label_names: HashMap<String, LabelId> = HashMap::new();
@@ -367,31 +403,36 @@ pub fn open_single_file<P: AsRef<Path>>(
   };
 
   // Replay WAL for recovery (if not a new database)
+  let mut _wal_records_storage: Option<Vec<crate::core::wal::record::ParsedWalRecord>>;
   if !is_new && header.wal_head > 0 {
-    // Read WAL records from the WAL area
-    let wal_records = scan_wal_records(&mut pager, &header)?;
-    let committed = get_committed_transactions(&wal_records);
+    _wal_records_storage = Some(scan_wal_records(&mut pager, &header)?);
+    if let Some(ref wal_records) = _wal_records_storage {
+      committed_in_order = get_committed_transactions(wal_records);
 
-    // Replay committed transactions
-    for (_txid, records) in committed {
-      for record in records {
-        replay_wal_record(
-          record,
-          snapshot.as_ref(),
-          &mut delta,
-          &mut next_node_id,
-          &mut next_label_id,
-          &mut next_etype_id,
-          &mut next_propkey_id,
-          &mut label_names,
-          &mut label_ids,
-          &mut etype_names,
-          &mut etype_ids,
-          &mut propkey_names,
-          &mut propkey_ids,
-        );
+      // Replay committed transactions
+      for (_txid, records) in &committed_in_order {
+        for record in records {
+          replay_wal_record(
+            record,
+            snapshot.as_ref(),
+            &mut delta,
+            &mut next_node_id,
+            &mut next_label_id,
+            &mut next_etype_id,
+            &mut next_propkey_id,
+            &mut label_names,
+            &mut label_ids,
+            &mut etype_names,
+            &mut etype_ids,
+            &mut propkey_names,
+            &mut propkey_ids,
+          );
+        }
+        next_commit_ts += 1;
       }
     }
+  } else {
+    _wal_records_storage = None;
   }
 
   // Load vector stores from snapshot (if present)
@@ -410,7 +451,7 @@ pub fn open_single_file<P: AsRef<Path>>(
           let config = VectorStoreConfig::new(vector.len());
           create_vector_store(config)
         });
-        let _ = vector_store_insert(store, node_id, &vector);
+        let _ = vector_store_insert(store, node_id, vector.as_ref());
       }
       None => {
         // Delete operation
@@ -423,6 +464,144 @@ pub fn open_single_file<P: AsRef<Path>>(
 
   // Initialize cache if enabled
   let cache = options.cache.map(CacheManager::new);
+
+  // Initialize MVCC if enabled (after WAL replay)
+  let mvcc = if options.mvcc {
+    let mut gc_config = GcConfig::default();
+    if let Some(v) = options.mvcc_gc_interval_ms {
+      gc_config.interval_ms = v;
+    }
+    if let Some(v) = options.mvcc_retention_ms {
+      gc_config.retention_ms = v;
+    }
+    if let Some(v) = options.mvcc_max_chain_depth {
+      gc_config.max_chain_depth = v;
+    }
+
+    let mvcc = std::sync::Arc::new(MvccManager::new(next_tx_id, next_commit_ts, gc_config));
+
+    if !committed_in_order.is_empty() {
+      use crate::core::wal::record::{
+        parse_add_edge_payload, parse_add_node_label_payload, parse_create_node_payload,
+        parse_del_edge_prop_payload, parse_del_node_prop_payload, parse_delete_edge_payload,
+        parse_delete_node_payload, parse_remove_node_label_payload, parse_set_edge_prop_payload,
+        parse_set_node_prop_payload,
+      };
+
+      let mut commit_ts: u64 = 1;
+      for (txid, records) in &committed_in_order {
+        for record in records {
+          match record.record_type {
+            WalRecordType::CreateNode => {
+              if let Some(data) = parse_create_node_payload(&record.payload) {
+                if let Some(node_delta) = delta.created_nodes.get(&data.node_id) {
+                  let mut vc = mvcc.version_chain.lock();
+                  vc.append_node_version(
+                    data.node_id,
+                    NodeVersionData {
+                      node_id: data.node_id,
+                      delta: node_delta.for_version(),
+                    },
+                    *txid,
+                    commit_ts,
+                  );
+                }
+              }
+            }
+            WalRecordType::DeleteNode => {
+              if let Some(data) = parse_delete_node_payload(&record.payload) {
+                let mut vc = mvcc.version_chain.lock();
+                vc.delete_node_version(data.node_id, *txid, commit_ts);
+              }
+            }
+            WalRecordType::AddEdge => {
+              if let Some(data) = parse_add_edge_payload(&record.payload) {
+                let mut vc = mvcc.version_chain.lock();
+                vc.append_edge_version(data.src, data.etype, data.dst, true, *txid, commit_ts);
+              }
+            }
+            WalRecordType::DeleteEdge => {
+              if let Some(data) = parse_delete_edge_payload(&record.payload) {
+                let mut vc = mvcc.version_chain.lock();
+                vc.append_edge_version(data.src, data.etype, data.dst, false, *txid, commit_ts);
+              }
+            }
+            WalRecordType::SetNodeProp => {
+              if let Some(data) = parse_set_node_prop_payload(&record.payload) {
+                let mut vc = mvcc.version_chain.lock();
+                vc.append_node_prop_version(
+                  data.node_id,
+                  data.key_id,
+                  Some(std::sync::Arc::new(data.value)),
+                  *txid,
+                  commit_ts,
+                );
+              }
+            }
+            WalRecordType::DelNodeProp => {
+              if let Some(data) = parse_del_node_prop_payload(&record.payload) {
+                let mut vc = mvcc.version_chain.lock();
+                vc.append_node_prop_version(data.node_id, data.key_id, None, *txid, commit_ts);
+              }
+            }
+            WalRecordType::SetEdgeProp => {
+              if let Some(data) = parse_set_edge_prop_payload(&record.payload) {
+                let mut vc = mvcc.version_chain.lock();
+                vc.append_edge_prop_version(
+                  data.src,
+                  data.etype,
+                  data.dst,
+                  data.key_id,
+                  Some(std::sync::Arc::new(data.value)),
+                  *txid,
+                  commit_ts,
+                );
+              }
+            }
+            WalRecordType::DelEdgeProp => {
+              if let Some(data) = parse_del_edge_prop_payload(&record.payload) {
+                let mut vc = mvcc.version_chain.lock();
+                vc.append_edge_prop_version(
+                  data.src,
+                  data.etype,
+                  data.dst,
+                  data.key_id,
+                  None,
+                  *txid,
+                  commit_ts,
+                );
+              }
+            }
+            WalRecordType::AddNodeLabel => {
+              if let Some(data) = parse_add_node_label_payload(&record.payload) {
+                let mut vc = mvcc.version_chain.lock();
+                vc.append_node_label_version(
+                  data.node_id,
+                  data.label_id,
+                  Some(true),
+                  *txid,
+                  commit_ts,
+                );
+              }
+            }
+            WalRecordType::RemoveNodeLabel => {
+              if let Some(data) = parse_remove_node_label_payload(&record.payload) {
+                let mut vc = mvcc.version_chain.lock();
+                vc.append_node_label_version(data.node_id, data.label_id, None, *txid, commit_ts);
+              }
+            }
+            _ => {}
+          }
+        }
+        commit_ts += 1;
+      }
+    }
+
+    mvcc.start();
+    Some(mvcc)
+  } else {
+    None
+  };
 
   Ok(SingleFileDB {
     path: path.to_path_buf(),
@@ -437,7 +616,9 @@ pub fn open_single_file<P: AsRef<Path>>(
     next_etype_id: AtomicU32::new(next_etype_id),
     next_propkey_id: AtomicU32::new(next_propkey_id),
     next_tx_id: AtomicU64::new(next_tx_id),
-    current_tx: Mutex::new(None),
+    current_tx: Mutex::new(HashMap::new()),
+    commit_lock: Mutex::new(()),
+    mvcc,
     label_names: RwLock::new(label_names),
     label_ids: RwLock::new(label_ids),
     etype_names: RwLock::new(etype_names),
@@ -453,6 +634,37 @@ pub fn open_single_file<P: AsRef<Path>>(
     checkpoint_compression: options.checkpoint_compression.clone(),
     sync_mode: options.sync_mode,
   })
+}
+
+/// Close a single-file database
+pub fn close_single_file(db: SingleFileDB) -> Result<()> {
+  if let Some(ref mvcc) = db.mvcc {
+    mvcc.stop();
+  }
+
+  // Flush WAL and sync to disk
+  let mut pager = db.pager.lock();
+  let mut wal_buffer = db.wal_buffer.lock();
+
+  // Flush any pending WAL writes
+  wal_buffer.flush(&mut pager)?;
+
+  // Update header with current WAL state
+  {
+    let mut header = db.header.write();
+    header.wal_head = wal_buffer.head();
+    header.wal_tail = wal_buffer.tail();
+    header.max_node_id = db.next_node_id.load(Ordering::SeqCst).saturating_sub(1);
+    header.next_tx_id = db.next_tx_id.load(Ordering::SeqCst);
+
+    // Write header
+    let header_bytes = header.serialize_to_page();
+    pager.write_page(0, &header_bytes)?;
+  }
+
+  // Final sync
+  pager.sync()?;
+  Ok(())
 }
 
 #[cfg(test)]
@@ -753,29 +965,3 @@ mod tests {
   }
 }
 
-/// Close a single-file database
-pub fn close_single_file(db: SingleFileDB) -> Result<()> {
-  // Flush WAL and sync to disk
-  let mut pager = db.pager.lock();
-  let mut wal_buffer = db.wal_buffer.lock();
-
-  // Flush any pending WAL writes
-  wal_buffer.flush(&mut pager)?;
-
-  // Update header with current WAL state
-  {
-    let mut header = db.header.write();
-    header.wal_head = wal_buffer.head();
-    header.wal_tail = wal_buffer.tail();
-    header.max_node_id = db.next_node_id.load(Ordering::SeqCst).saturating_sub(1);
-    header.next_tx_id = db.next_tx_id.load(Ordering::SeqCst);
-
-    // Write header
-    let header_bytes = header.serialize_to_page();
-    pager.write_page(0, &header_bytes)?;
-  }
-
-  // Final sync
-  pager.sync()?;
-  Ok(())
-}

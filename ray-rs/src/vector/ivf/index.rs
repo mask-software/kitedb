@@ -14,7 +14,8 @@ use std::collections::HashMap;
 use crate::types::NodeId;
 use crate::vector::distance::normalize;
 use crate::vector::types::{
-  DistanceMetric, IvfConfig, MultiQueryAggregation, VectorManifest, VectorSearchResult,
+  DistanceMetric, Fragment, IvfConfig, MultiQueryAggregation, VectorLocation, VectorManifest,
+  VectorSearchResult,
 };
 
 use super::kmeans::{kmeans_parallel, KMeansConfig};
@@ -220,11 +221,7 @@ impl IvfIndex {
     let n_probe = options.n_probe.unwrap_or(self.config.n_probe);
 
     // Prepare query vector
-    let query_vec = if self.config.metric == DistanceMetric::Cosine {
-      normalize(query)
-    } else {
-      query.to_vec()
-    };
+    let query_vec = self.prepare_query(query);
 
     // Find top n_probe nearest centroids
     let probe_clusters = self.find_nearest_centroids(&query_vec, n_probe);
@@ -233,77 +230,23 @@ impl IvfIndex {
     let distance_fn = self.config.metric.distance_fn();
 
     // Build fragment lookup map for O(1) access (avoid .find() in hot loop)
-    let fragment_map: HashMap<usize, &_> = manifest.fragments.iter().map(|f| (f.id, f)).collect();
+    let fragment_map = build_fragment_map(manifest);
 
     // Use max-heap to track top-k candidates
     let mut heap = MaxHeap::new();
 
+    let params = SearchClusterParams {
+      manifest,
+      query_vec: &query_vec,
+      options: &options,
+      fragment_map: &fragment_map,
+      distance_fn,
+      k,
+    };
+
     // Search within selected clusters
     for cluster in probe_clusters {
-      let vector_ids = match self.inverted_lists.get(&cluster) {
-        Some(list) if !list.is_empty() => list,
-        _ => continue,
-      };
-
-      for &vector_id in vector_ids {
-        // Get vector location
-        let location = match manifest.vector_locations.get(&vector_id) {
-          Some(loc) => loc,
-          None => continue,
-        };
-
-        // Get fragment with O(1) lookup
-        let fragment = match fragment_map.get(&location.fragment_id) {
-          Some(f) => *f,
-          None => continue,
-        };
-
-        // Check deletion bitmap
-        if fragment.is_deleted(location.local_index) {
-          continue;
-        }
-
-        // Apply filter if provided
-        if let Some(ref filter) = options.filter {
-          if let Some(&node_id) = manifest.vector_to_node.get(&vector_id) {
-            if !filter(node_id) {
-              continue;
-            }
-          }
-        }
-
-        // Get vector data
-        let row_group_idx = location.local_index / manifest.config.row_group_size;
-        let local_row_idx = location.local_index % manifest.config.row_group_size;
-        let row_group = match fragment.row_groups.get(row_group_idx) {
-          Some(rg) if local_row_idx < rg.count => rg,
-          _ => continue,
-        };
-
-        let offset = local_row_idx * manifest.config.dimensions;
-        let vec = &row_group.data[offset..offset + manifest.config.dimensions];
-
-        // Compute distance
-        let dist = distance_fn(&query_vec, vec);
-
-        // Apply threshold filter
-        if let Some(threshold) = options.threshold {
-          let similarity = self.config.metric.distance_to_similarity(dist);
-          if similarity < threshold {
-            continue;
-          }
-        }
-
-        // Add to heap
-        if heap.len() < k {
-          heap.push(vector_id, dist);
-        } else if let Some(&(_, max_dist)) = heap.peek() {
-          if dist < max_dist {
-            heap.pop();
-            heap.push(vector_id, dist);
-          }
-        }
-      }
+      self.search_cluster(cluster, &params, &mut heap);
     }
 
     // Convert to results
@@ -325,6 +268,59 @@ impl IvfIndex {
         }
       })
       .collect()
+  }
+
+  fn prepare_query(&self, query: &[f32]) -> Vec<f32> {
+    if self.config.metric == DistanceMetric::Cosine {
+      normalize(query)
+    } else {
+      query.to_vec()
+    }
+  }
+
+  fn search_cluster(
+    &self,
+    cluster: usize,
+    params: &SearchClusterParams<'_>,
+    heap: &mut MaxHeap,
+  ) {
+    let vector_ids = match self.inverted_lists.get(&cluster) {
+      Some(list) if !list.is_empty() => list,
+      _ => return,
+    };
+
+    for &vector_id in vector_ids {
+      let location = match params.manifest.vector_locations.get(&vector_id) {
+        Some(loc) => loc,
+        None => continue,
+      };
+
+      let fragment = match params.fragment_map.get(&location.fragment_id) {
+        Some(f) => *f,
+        None => continue,
+      };
+
+      if fragment.is_deleted(location.local_index) {
+        continue;
+      }
+
+      if !passes_filter(params.options, params.manifest, vector_id) {
+        continue;
+      }
+
+      let vec = match vector_slice(params.manifest, fragment, location) {
+        Some(vec) => vec,
+        None => continue,
+      };
+
+      let dist = (params.distance_fn)(params.query_vec, vec);
+
+      if !passes_threshold(self.config.metric, params.options, dist) {
+        continue;
+      }
+
+      update_heap(heap, vector_id, dist, params.k);
+    }
   }
 
   /// Search with multiple query vectors
@@ -558,6 +554,65 @@ impl IvfIndex {
 
     centroid_dists.into_iter().take(n).map(|(c, _)| c).collect()
   }
+}
+
+fn build_fragment_map(manifest: &VectorManifest) -> HashMap<usize, &Fragment> {
+  manifest.fragments.iter().map(|f| (f.id, f)).collect()
+}
+
+fn passes_filter(options: &SearchOptions, manifest: &VectorManifest, vector_id: u64) -> bool {
+  if let Some(ref filter) = options.filter {
+    if let Some(&node_id) = manifest.vector_to_node.get(&vector_id) {
+      return filter(node_id);
+    }
+  }
+  true
+}
+
+fn passes_threshold(metric: DistanceMetric, options: &SearchOptions, dist: f32) -> bool {
+  if let Some(threshold) = options.threshold {
+    let similarity = metric.distance_to_similarity(dist);
+    if similarity < threshold {
+      return false;
+    }
+  }
+  true
+}
+
+fn vector_slice<'a>(
+  manifest: &'a VectorManifest,
+  fragment: &'a Fragment,
+  location: &VectorLocation,
+) -> Option<&'a [f32]> {
+  let row_group_idx = location.local_index / manifest.config.row_group_size;
+  let local_row_idx = location.local_index % manifest.config.row_group_size;
+  let row_group = match fragment.row_groups.get(row_group_idx) {
+    Some(rg) if local_row_idx < rg.count => rg,
+    _ => return None,
+  };
+
+  let offset = local_row_idx * manifest.config.dimensions;
+  Some(&row_group.data[offset..offset + manifest.config.dimensions])
+}
+
+fn update_heap(heap: &mut MaxHeap, vector_id: u64, dist: f32, k: usize) {
+  if heap.len() < k {
+    heap.push(vector_id, dist);
+  } else if let Some(&(_, max_dist)) = heap.peek() {
+    if dist < max_dist {
+      heap.pop();
+      heap.push(vector_id, dist);
+    }
+  }
+}
+
+struct SearchClusterParams<'a> {
+  manifest: &'a VectorManifest,
+  query_vec: &'a [f32],
+  options: &'a SearchOptions,
+  fragment_map: &'a HashMap<usize, &'a Fragment>,
+  distance_fn: fn(&[f32], &[f32]) -> f32,
+  k: usize,
 }
 
 // ============================================================================

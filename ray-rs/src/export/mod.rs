@@ -1,6 +1,6 @@
 //! Export and Import utilities
 //!
-//! JSON and JSONL export/import for GraphDB and SingleFileDB.
+//! JSON and JSONL export/import for SingleFileDB.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -10,15 +10,6 @@ use std::path::Path;
 
 use crate::core::single_file::SingleFileDB;
 use crate::error::{KiteError, Result};
-use crate::graph::db::GraphDB;
-use crate::graph::definitions::{define_etype, define_label, define_propkey};
-use crate::graph::edges::{add_edge, get_edge_props_db};
-use crate::graph::iterators::{
-  list_edges as graph_list_edges, list_nodes as graph_list_nodes, ListEdgesOptions,
-};
-use crate::graph::key_index::get_node_key;
-use crate::graph::nodes::{create_node, get_node_by_key_db, get_node_props_db, NodeOpts};
-use crate::graph::tx::{begin_tx, commit, rollback};
 use crate::types::{ETypeId, NodeId, PropKeyId, PropValue};
 
 // =============================================================================
@@ -204,16 +195,6 @@ fn build_schema_from_delta(delta: &crate::types::DeltaState) -> ExportedSchema {
   schema
 }
 
-fn get_prop_key_name_graph(db: &GraphDB, key_id: PropKeyId) -> String {
-  db.get_propkey_name(key_id)
-    .unwrap_or_else(|| format!("prop_{key_id}"))
-}
-
-fn get_etype_name_graph(db: &GraphDB, etype_id: ETypeId) -> String {
-  db.get_etype_name(etype_id)
-    .unwrap_or_else(|| format!("etype_{etype_id}"))
-}
-
 fn get_prop_key_name_single(db: &SingleFileDB, key_id: PropKeyId) -> String {
   db.get_propkey_name(key_id)
     .unwrap_or_else(|| format!("prop_{key_id}"))
@@ -222,81 +203,6 @@ fn get_prop_key_name_single(db: &SingleFileDB, key_id: PropKeyId) -> String {
 fn get_etype_name_single(db: &SingleFileDB, etype_id: ETypeId) -> String {
   db.get_etype_name(etype_id)
     .unwrap_or_else(|| format!("etype_{etype_id}"))
-}
-
-// =============================================================================
-// Export (GraphDB)
-// =============================================================================
-
-pub fn export_to_object_graph(db: &GraphDB, options: ExportOptions) -> Result<ExportedDatabase> {
-  let delta = db.delta.read();
-  let schema = if options.include_schema {
-    build_schema_from_delta(&delta)
-  } else {
-    ExportedSchema::default()
-  };
-
-  let mut nodes = Vec::new();
-  let mut edges = Vec::new();
-
-  if options.include_nodes {
-    for node_id in graph_list_nodes(db) {
-      let key = get_node_key(db.snapshot.as_ref(), &delta, node_id);
-      let mut props = HashMap::new();
-      if let Some(props_by_id) = get_node_props_db(db, node_id) {
-        for (key_id, value) in props_by_id {
-          let name = get_prop_key_name_graph(db, key_id);
-          props.insert(name, serialize_prop_value(&value));
-        }
-      }
-
-      nodes.push(ExportedNode {
-        id: node_id,
-        key,
-        props,
-      });
-    }
-  }
-
-  if options.include_edges {
-    let options = ListEdgesOptions::default();
-    for edge in graph_list_edges(db, options) {
-      let mut props = HashMap::new();
-      if let Some(props_by_id) = get_edge_props_db(db, edge.src, edge.etype, edge.dst) {
-        for (key_id, value) in props_by_id {
-          let name = get_prop_key_name_graph(db, key_id);
-          props.insert(name, serialize_prop_value(&value));
-        }
-      }
-      edges.push(ExportedEdge {
-        src: edge.src,
-        dst: edge.dst,
-        etype: edge.etype,
-        etype_name: Some(get_etype_name_graph(db, edge.etype)),
-        props,
-      });
-    }
-  }
-
-  let exported_at = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-    Ok(duration) => duration.as_secs().to_string(),
-    Err(_) => "0".to_string(),
-  };
-
-  let node_count = nodes.len();
-  let edge_count = edges.len();
-
-  Ok(ExportedDatabase {
-    version: 1,
-    exported_at,
-    schema,
-    nodes,
-    edges,
-    stats: ExportStats {
-      node_count,
-      edge_count,
-    },
-  })
 }
 
 pub fn export_to_object_single(
@@ -452,130 +358,6 @@ pub fn export_to_jsonl<P: AsRef<Path>>(data: &ExportedDatabase, path: P) -> Resu
   Ok(ExportResult {
     node_count: data.stats.node_count,
     edge_count: data.stats.edge_count,
-  })
-}
-
-// =============================================================================
-// Import (GraphDB)
-// =============================================================================
-
-pub fn import_from_object_graph(
-  db: &GraphDB,
-  data: &ExportedDatabase,
-  options: ImportOptions,
-) -> Result<ImportResult> {
-  let mut propkey_name_to_id: HashMap<String, PropKeyId> = HashMap::new();
-  let mut etype_name_to_id: HashMap<String, ETypeId> = HashMap::new();
-
-  let mut tx = begin_tx(db)?;
-  for name in data.schema.prop_keys.values() {
-    let id = db
-      .get_propkey_id(name)
-      .unwrap_or_else(|| define_propkey(&mut tx, name).unwrap_or(0));
-    propkey_name_to_id.insert(name.clone(), id);
-  }
-  for name in data.schema.etypes.values() {
-    let id = db
-      .get_etype_id(name)
-      .unwrap_or_else(|| define_etype(&mut tx, name).unwrap_or(0));
-    etype_name_to_id.insert(name.clone(), id);
-  }
-  for name in data.schema.labels.values() {
-    let _ = db
-      .get_label_id(name)
-      .unwrap_or_else(|| define_label(&mut tx, name).unwrap_or(0));
-  }
-  commit(&mut tx)?;
-
-  let mut old_to_new: HashMap<NodeId, NodeId> = HashMap::new();
-  let mut node_count = 0usize;
-  let mut skipped = 0usize;
-  let mut batch_count = 0usize;
-
-  let mut tx = begin_tx(db)?;
-  for node in &data.nodes {
-    if options.skip_existing {
-      if let Some(ref key) = node.key {
-        if let Some(existing) = get_node_by_key_db(db, key) {
-          old_to_new.insert(node.id as NodeId, existing);
-          skipped += 1;
-          continue;
-        }
-      }
-    }
-
-    let mut node_opts = NodeOpts::new();
-    if let Some(ref key) = node.key {
-      node_opts = node_opts.with_key(key);
-    }
-    let node_id = match create_node(&mut tx, node_opts) {
-      Ok(id) => id,
-      Err(e) => {
-        rollback(&mut tx)?;
-        return Err(e);
-      }
-    };
-
-    for (prop_name, exported_value) in &node.props {
-      if let Some(&key_id) = propkey_name_to_id.get(prop_name) {
-        let value = deserialize_prop_value(exported_value);
-        crate::graph::nodes::set_node_prop(&mut tx, node_id, key_id, value)?;
-      }
-    }
-
-    old_to_new.insert(node.id as NodeId, node_id);
-    node_count += 1;
-    batch_count += 1;
-
-    if batch_count >= options.batch_size {
-      commit(&mut tx)?;
-      tx = begin_tx(db)?;
-      batch_count = 0;
-    }
-  }
-
-  if batch_count > 0 {
-    commit(&mut tx)?;
-  }
-
-  let mut edge_count = 0usize;
-  let mut batch_count = 0usize;
-  let mut tx = begin_tx(db)?;
-  for edge in &data.edges {
-    let src = match old_to_new.get(&(edge.src as NodeId)) {
-      Some(id) => *id,
-      None => continue,
-    };
-    let dst = match old_to_new.get(&(edge.dst as NodeId)) {
-      Some(id) => *id,
-      None => continue,
-    };
-
-    let etype_id = edge
-      .etype_name
-      .as_ref()
-      .and_then(|name| etype_name_to_id.get(name).copied())
-      .unwrap_or(edge.etype as ETypeId);
-
-    add_edge(&mut tx, src, etype_id, dst)?;
-    edge_count += 1;
-    batch_count += 1;
-
-    if batch_count >= options.batch_size {
-      commit(&mut tx)?;
-      tx = begin_tx(db)?;
-      batch_count = 0;
-    }
-  }
-
-  if batch_count > 0 {
-    commit(&mut tx)?;
-  }
-
-  Ok(ImportResult {
-    node_count,
-    edge_count,
-    skipped,
   })
 }
 

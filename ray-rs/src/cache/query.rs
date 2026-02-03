@@ -73,8 +73,7 @@ impl QueryCacheStats {
 ///
 /// // Retrieve the result
 /// let result: Option<&Vec<u64>> = cache.get("query1");
-/// assert!(result.is_some());
-/// assert_eq!(result.unwrap(), &vec![1u64, 2, 3]);
+/// assert!(matches!(result, Some(values) if values.as_slice() == [1u64, 2, 3]));
 /// ```
 pub struct QueryCache {
   /// The LRU cache for query results
@@ -525,13 +524,13 @@ mod tests {
     let mut cache = make_cache();
 
     cache.set("int".to_string(), 42i64);
-    cache.set("float".to_string(), 3.14f64);
+    cache.set("float".to_string(), std::f64::consts::PI);
     cache.set("string".to_string(), "hello".to_string());
     cache.set("vec".to_string(), vec![1u32, 2, 3]);
     cache.set("tuple".to_string(), (1i32, "a".to_string()));
 
     assert_eq!(cache.get::<i64>("int"), Some(&42));
-    assert_eq!(cache.get::<f64>("float"), Some(&3.14));
+    assert_eq!(cache.get::<f64>("float"), Some(&std::f64::consts::PI));
     assert_eq!(cache.get::<String>("string"), Some(&"hello".to_string()));
     assert_eq!(cache.get::<Vec<u32>>("vec"), Some(&vec![1, 2, 3]));
     assert_eq!(

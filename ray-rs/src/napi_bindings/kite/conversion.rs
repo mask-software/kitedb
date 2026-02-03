@@ -66,6 +66,7 @@ pub(crate) fn js_value_to_prop_value(_env: &Env, value: Unknown) -> Result<PropV
       value.coerce_to_string()?.into_utf8()?.as_str()?.to_string(),
     )),
     ValueType::BigInt => {
+      // SAFETY: value type checked as BigInt above.
       let big: BigInt = unsafe { value.cast()? };
       let (v, _lossless) = big.get_i64();
       Ok(PropValue::I64(v))
@@ -73,6 +74,7 @@ pub(crate) fn js_value_to_prop_value(_env: &Env, value: Unknown) -> Result<PropV
     ValueType::Object => {
       let obj = value.coerce_to_object()?;
       if obj.is_array()? {
+        // SAFETY: value is an array; NAPI will validate element types on cast.
         let values: Vec<f64> = unsafe { value.cast()? };
         let values = values.into_iter().map(|v| v as f32).collect();
         return Ok(PropValue::VectorF32(values));
@@ -131,6 +133,7 @@ pub(crate) fn js_value_to_string(_env: &Env, value: Unknown, field: &str) -> Res
     ValueType::Number => Ok(value.coerce_to_number()?.get_double()?.to_string()),
     ValueType::Boolean => Ok(value.coerce_to_bool()?.to_string()),
     ValueType::BigInt => {
+      // SAFETY: value type checked as BigInt above.
       let big: BigInt = unsafe { value.cast()? };
       let (v, _lossless) = big.get_i64();
       Ok(v.to_string())

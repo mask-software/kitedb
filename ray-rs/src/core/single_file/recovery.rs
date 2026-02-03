@@ -222,7 +222,7 @@ pub fn replay_wal_record(
       if let Some(data) = parse_set_node_vector_payload(&record.payload) {
         delta
           .pending_vectors
-          .insert((data.node_id, data.prop_key_id), Some(data.vector));
+          .insert((data.node_id, data.prop_key_id), Some(VectorRef::from(data.vector)));
       }
     }
     WalRecordType::DelNodeVector => {

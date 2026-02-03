@@ -4,16 +4,6 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
 use crate::core::single_file::SingleFileDB as RustSingleFileDB;
-use crate::graph::db::GraphDB as RustGraphDB;
-use crate::graph::edges::{
-  add_edge as graph_add_edge, delete_edge as graph_delete_edge, edge_exists_db,
-  upsert_edge_with_props as graph_upsert_edge_with_props,
-};
-use crate::graph::iterators::{
-  count_edges as graph_count_edges, list_edges as graph_list_edges, list_in_edges, list_out_edges,
-  ListEdgesOptions,
-};
-use crate::graph::tx::TxHandle as GraphTxHandle;
 use crate::types::{ETypeId, NodeId, PropKeyId, PropValue};
 
 use crate::pyo3_bindings::types::{Edge, FullEdge};
@@ -141,101 +131,6 @@ pub fn count_edges_by_type_single(db: &RustSingleFileDB, etype: ETypeId) -> i64 
 /// List edges on single-file database
 pub fn list_edges_single(db: &RustSingleFileDB, etype: Option<ETypeId>) -> Vec<FullEdge> {
   db.list_edges(etype)
-    .into_iter()
-    .map(|e| FullEdge {
-      src: e.src as i64,
-      etype: e.etype,
-      dst: e.dst as i64,
-    })
-    .collect()
-}
-
-// ============================================================================
-// Graph database operations
-// ============================================================================
-
-/// Add edge on graph database (requires transaction handle)
-pub fn add_edge_graph(
-  handle: &mut GraphTxHandle,
-  src: NodeId,
-  etype: ETypeId,
-  dst: NodeId,
-) -> PyResult<()> {
-  graph_add_edge(handle, src, etype, dst)
-    .map_err(|e| PyRuntimeError::new_err(format!("Failed to add edge: {e}")))?;
-  Ok(())
-}
-
-/// Delete edge on graph database (requires transaction handle)
-pub fn delete_edge_graph(
-  handle: &mut GraphTxHandle,
-  src: NodeId,
-  etype: ETypeId,
-  dst: NodeId,
-) -> PyResult<()> {
-  graph_delete_edge(handle, src, etype, dst)
-    .map_err(|e| PyRuntimeError::new_err(format!("Failed to delete edge: {e}")))?;
-  Ok(())
-}
-
-/// Upsert edge on graph database (requires transaction handle)
-pub fn upsert_edge_graph(
-  handle: &mut GraphTxHandle,
-  src: NodeId,
-  etype: ETypeId,
-  dst: NodeId,
-  props: &[(PropKeyId, Option<PropValue>)],
-) -> PyResult<bool> {
-  graph_upsert_edge_with_props(handle, src, etype, dst, props.iter().cloned())
-    .map_err(|e| PyRuntimeError::new_err(format!("Failed to upsert edge: {e}")))
-}
-
-/// Check edge exists on graph database
-pub fn edge_exists_graph(db: &RustGraphDB, src: NodeId, etype: ETypeId, dst: NodeId) -> bool {
-  edge_exists_db(db, src, etype, dst)
-}
-
-/// Get out edges on graph database
-pub fn get_out_edges_graph(db: &RustGraphDB, node_id: NodeId) -> Vec<Edge> {
-  list_out_edges(db, node_id)
-    .into_iter()
-    .map(|edge| Edge {
-      etype: edge.etype,
-      node_id: edge.dst as i64,
-    })
-    .collect()
-}
-
-/// Get in edges on graph database
-pub fn get_in_edges_graph(db: &RustGraphDB, node_id: NodeId) -> Vec<Edge> {
-  list_in_edges(db, node_id)
-    .into_iter()
-    .map(|edge| Edge {
-      etype: edge.etype,
-      node_id: edge.dst as i64,
-    })
-    .collect()
-}
-
-/// Get out degree on graph database
-pub fn get_out_degree_graph(db: &RustGraphDB, node_id: NodeId) -> i64 {
-  list_out_edges(db, node_id).len() as i64
-}
-
-/// Get in degree on graph database
-pub fn get_in_degree_graph(db: &RustGraphDB, node_id: NodeId) -> i64 {
-  list_in_edges(db, node_id).len() as i64
-}
-
-/// Count edges on graph database
-pub fn count_edges_graph(db: &RustGraphDB, etype: Option<ETypeId>) -> i64 {
-  graph_count_edges(db, etype) as i64
-}
-
-/// List edges on graph database
-pub fn list_edges_graph(db: &RustGraphDB, etype: Option<ETypeId>) -> Vec<FullEdge> {
-  let options = ListEdgesOptions { etype };
-  graph_list_edges(db, options)
     .into_iter()
     .map(|e| FullEdge {
       src: e.src as i64,

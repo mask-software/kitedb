@@ -143,7 +143,7 @@ pub fn parse_wal_record(buffer: &[u8], offset: usize) -> Option<ParsedWalRecord>
 /// Scan WAL buffer and return all valid records
 pub fn scan_wal(buffer: &[u8]) -> Vec<ParsedWalRecord> {
   let mut records = Vec::new();
-  let mut offset = WAL_HEADER_SIZE;
+  let mut offset = 0;
 
   while offset < buffer.len() {
     match parse_wal_record(buffer, offset) {
@@ -268,41 +268,54 @@ pub fn build_define_propkey_payload(propkey_id: PropKeyId, name: &str) -> Vec<u8
 }
 
 /// Serialize a property value
-fn serialize_prop_value(value: &PropValue) -> Vec<u8> {
+fn prop_value_serialized_len(value: &PropValue) -> usize {
   match value {
-    PropValue::Null => vec![0],
-    PropValue::Bool(v) => vec![1, if *v { 1 } else { 0 }],
+    PropValue::Null => 1,
+    PropValue::Bool(_) => 2,
+    PropValue::I64(_) | PropValue::F64(_) => 9,
+    PropValue::String(s) => 1 + 4 + s.as_bytes().len(),
+    PropValue::VectorF32(v) => 1 + 4 + v.len() * 4,
+  }
+}
+
+fn write_prop_value(value: &PropValue, buffer: &mut [u8]) {
+  match value {
+    PropValue::Null => {
+      buffer[0] = 0;
+    }
+    PropValue::Bool(v) => {
+      buffer[0] = 1;
+      buffer[1] = if *v { 1 } else { 0 };
+    }
     PropValue::I64(v) => {
-      let mut buf = vec![0u8; 9];
-      buf[0] = 2;
-      write_i64(&mut buf, 1, *v);
-      buf
+      buffer[0] = 2;
+      write_i64(buffer, 1, *v);
     }
     PropValue::F64(v) => {
-      let mut buf = vec![0u8; 9];
-      buf[0] = 3;
-      write_f64(&mut buf, 1, *v);
-      buf
+      buffer[0] = 3;
+      write_f64(buffer, 1, *v);
     }
     PropValue::String(s) => {
       let str_bytes = s.as_bytes();
-      let mut buf = vec![0u8; 1 + 4 + str_bytes.len()];
-      buf[0] = 4;
-      write_u32(&mut buf, 1, str_bytes.len() as u32);
-      buf[5..5 + str_bytes.len()].copy_from_slice(str_bytes);
-      buf
+      buffer[0] = 4;
+      write_u32(buffer, 1, str_bytes.len() as u32);
+      buffer[5..5 + str_bytes.len()].copy_from_slice(str_bytes);
     }
     PropValue::VectorF32(v) => {
-      let mut buf = vec![0u8; 1 + 4 + v.len() * 4];
-      buf[0] = 5;
-      write_u32(&mut buf, 1, v.len() as u32);
+      buffer[0] = 5;
+      write_u32(buffer, 1, v.len() as u32);
       for (i, val) in v.iter().enumerate() {
         let bytes = val.to_le_bytes();
-        buf[5 + i * 4..5 + i * 4 + 4].copy_from_slice(&bytes);
+        buffer[5 + i * 4..5 + i * 4 + 4].copy_from_slice(&bytes);
       }
-      buf
     }
   }
+}
+
+fn serialize_prop_value(value: &PropValue) -> Vec<u8> {
+  let mut buf = vec![0u8; prop_value_serialized_len(value)];
+  write_prop_value(value, &mut buf);
+  buf
 }
 
 /// Build SET_NODE_PROP payload
@@ -311,11 +324,11 @@ pub fn build_set_node_prop_payload(
   key_id: PropKeyId,
   value: &PropValue,
 ) -> Vec<u8> {
-  let value_bytes = serialize_prop_value(value);
-  let mut buffer = vec![0u8; 8 + 4 + value_bytes.len()];
+  let value_len = prop_value_serialized_len(value);
+  let mut buffer = vec![0u8; 8 + 4 + value_len];
   write_u64(&mut buffer, 0, node_id);
   write_u32(&mut buffer, 8, key_id);
-  buffer[12..].copy_from_slice(&value_bytes);
+  write_prop_value(value, &mut buffer[12..]);
   buffer
 }
 
@@ -335,13 +348,13 @@ pub fn build_set_edge_prop_payload(
   key_id: PropKeyId,
   value: &PropValue,
 ) -> Vec<u8> {
-  let value_bytes = serialize_prop_value(value);
-  let mut buffer = vec![0u8; 8 + 4 + 8 + 4 + value_bytes.len()];
+  let value_len = prop_value_serialized_len(value);
+  let mut buffer = vec![0u8; 8 + 4 + 8 + 4 + value_len];
   write_u64(&mut buffer, 0, src);
   write_u32(&mut buffer, 8, etype);
   write_u64(&mut buffer, 12, dst);
   write_u32(&mut buffer, 20, key_id);
-  buffer[24..].copy_from_slice(&value_bytes);
+  write_prop_value(value, &mut buffer[24..]);
   buffer
 }
 

@@ -235,9 +235,9 @@ mod tests {
 
   #[test]
   fn test_prop_value_float() {
-    let pv = PropValue::float_val(3.14);
+    let pv = PropValue::float_val(std::f64::consts::PI);
     assert_eq!(pv.prop_type, "float");
-    assert_eq!(pv.float_value, Some(3.14));
+    assert_eq!(pv.float_value, Some(std::f64::consts::PI));
   }
 
   #[test]

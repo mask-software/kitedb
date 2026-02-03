@@ -10,7 +10,7 @@ This crate provides the Rust core and the high-level Kite API.
 - Labels, edge types, and schema helpers
 - Fluent traversal and pathfinding (BFS, Dijkstra, Yen)
 - Vector embeddings with IVF and IVF-PQ indexes
-- Single-file and multi-file storage formats
+- Single-file storage format
 
 ## Install
 
@@ -49,8 +49,8 @@ fn main() -> kitedb::error::Result<()> {
 
 ## Lower-level API
 
-If you want direct access to graph primitives, use `kitedb::graph::db::open_graph_db`
-and the modules under `kitedb::graph`, `kitedb::vector`, and `kitedb::core`.
+For direct access to storage primitives, use `kitedb::core::single_file` and the
+modules under `kitedb::vector` and `kitedb::core`.
 
 ## Concurrent Access
 

@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::thread::ThreadId;
 
 use parking_lot::{Mutex, RwLock};
 
@@ -16,6 +17,8 @@ use crate::constants::*;
 use crate::core::pager::FilePager;
 use crate::core::snapshot::reader::SnapshotData;
 use crate::core::wal::buffer::WalBuffer;
+use crate::mvcc::visibility::{edge_exists as mvcc_edge_exists, node_exists as mvcc_node_exists};
+use crate::mvcc::MvccManager;
 use crate::types::*;
 use crate::util::compression::CompressionOptions;
 use crate::vector::types::VectorManifest;
@@ -52,34 +55,29 @@ pub use recovery::replay_wal_record;
 
 /// Transaction state for SingleFileDB
 ///
-/// This is simpler than the main TxState in types.rs, as SingleFileDB
-/// handles operations differently.
-#[derive(Debug)]
+/// This is scoped to SingleFileDB and only tracks what single-file
+/// transactions need.
+#[derive(Debug, Clone)]
 pub struct SingleFileTxState {
   pub txid: TxId,
   pub read_only: bool,
   pub snapshot_ts: u64,
-  pub delta_snapshot: Option<DeltaState>,
+  pub pending: DeltaState,
 }
 
 impl SingleFileTxState {
-  pub fn new(
-    txid: TxId,
-    read_only: bool,
-    snapshot_ts: u64,
-    delta_snapshot: Option<DeltaState>,
-  ) -> Self {
+  pub fn new(txid: TxId, read_only: bool, snapshot_ts: u64) -> Self {
     Self {
       txid,
       read_only,
       snapshot_ts,
-      delta_snapshot,
+      pending: DeltaState::new(),
     }
   }
 }
 
 // ============================================================================
-// Single-File GraphDB
+// Single-File Database
 // ============================================================================
 
 /// Single-file database handle
@@ -107,7 +105,13 @@ pub struct SingleFileDB {
   pub(crate) next_tx_id: AtomicU64,
 
   /// Current active transaction
-  pub current_tx: Mutex<Option<SingleFileTxState>>,
+  pub current_tx: Mutex<HashMap<ThreadId, std::sync::Arc<Mutex<SingleFileTxState>>>>,
+
+  /// Serialize commit operations to preserve WAL/delta ordering
+  pub(crate) commit_lock: Mutex<()>,
+
+  /// MVCC manager (if enabled)
+  pub mvcc: Option<std::sync::Arc<MvccManager>>,
 
   /// Label name -> ID mapping
   pub(crate) label_names: RwLock<HashMap<String, LabelId>>,
@@ -206,6 +210,34 @@ impl SingleFileDB {
 
   /// Check if a node exists
   pub fn node_exists(&self, node_id: NodeId) -> bool {
+    let tx_handle = self.current_tx_handle();
+    if let Some(handle) = tx_handle.as_ref() {
+      let tx = handle.lock();
+      if tx.pending.is_node_deleted(node_id) {
+        return false;
+      }
+      if tx.pending.is_node_created(node_id) {
+        return true;
+      }
+    }
+
+    if let Some(mvcc) = self.mvcc.as_ref() {
+      let (txid, tx_snapshot_ts) = if let Some(handle) = tx_handle.as_ref() {
+        let tx = handle.lock();
+        (tx.txid, tx.snapshot_ts)
+      } else {
+        (0, mvcc.tx_manager.lock().get_next_commit_ts())
+      };
+      if txid != 0 {
+        let mut tx_mgr = mvcc.tx_manager.lock();
+        tx_mgr.record_read(txid, TxKey::Node(node_id));
+      }
+      let vc = mvcc.version_chain.lock();
+      if let Some(version) = vc.get_node_version(node_id) {
+        return mvcc_node_exists(Some(version), tx_snapshot_ts, txid);
+      }
+    }
+
     let delta = self.delta.read();
 
     if delta.is_node_deleted(node_id) {
@@ -226,6 +258,37 @@ impl SingleFileDB {
 
   /// Check if an edge exists
   pub fn edge_exists(&self, src: NodeId, etype: ETypeId, dst: NodeId) -> bool {
+    let tx_handle = self.current_tx_handle();
+    if let Some(handle) = tx_handle.as_ref() {
+      let tx = handle.lock();
+      if tx.pending.is_node_deleted(src) || tx.pending.is_node_deleted(dst) {
+        return false;
+      }
+      if tx.pending.is_edge_deleted(src, etype, dst) {
+        return false;
+      }
+      if tx.pending.is_edge_added(src, etype, dst) {
+        return true;
+      }
+    }
+
+    if let Some(mvcc) = self.mvcc.as_ref() {
+      let (txid, tx_snapshot_ts) = if let Some(handle) = tx_handle.as_ref() {
+        let tx = handle.lock();
+        (tx.txid, tx.snapshot_ts)
+      } else {
+        (0, mvcc.tx_manager.lock().get_next_commit_ts())
+      };
+      if txid != 0 {
+        let mut tx_mgr = mvcc.tx_manager.lock();
+        tx_mgr.record_read(txid, TxKey::Edge { src, etype, dst });
+      }
+      let vc = mvcc.version_chain.lock();
+      if let Some(version) = vc.get_edge_version(src, etype, dst) {
+        return mvcc_edge_exists(Some(version), tx_snapshot_ts, txid);
+      }
+    }
+
     let delta = self.delta.read();
 
     if delta.is_edge_deleted(src, etype, dst) {
@@ -246,6 +309,11 @@ impl SingleFileDB {
     }
 
     false
+  }
+
+  /// Check if MVCC is enabled
+  pub fn mvcc_enabled(&self) -> bool {
+    self.mvcc.is_some()
   }
 
   // ==========================================================================

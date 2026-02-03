@@ -6,35 +6,20 @@
  */
 
 import { join } from "node:path";
-import {
-	PropValueTag,
-	addEdge,
-	beginTx,
-	closeGraphDB,
-	commit,
-	createNode,
-	defineEtype,
-	defineLabel,
-	definePropkey,
-	openGraphDB,
-	optimizeSingleFile,
-	setNodeProp,
-	stats,
-	vacuumSingleFile,
-} from "../src/index.ts";
-import type { PropValue } from "../src/types.ts";
+import { Database, PropType } from "@kitedb/core";
+import type { JsPropValue } from "@kitedb/core";
 
 // Helper functions to create PropValue objects
-function str(value: string): PropValue {
-	return { tag: PropValueTag.STRING, value };
+function str(value: string): JsPropValue {
+	return { propType: PropType.String, stringValue: value };
 }
 
-function int(value: bigint): PropValue {
-	return { tag: PropValueTag.I64, value };
+function int(value: bigint): JsPropValue {
+	return { propType: PropType.Int, intValue: Number(value) };
 }
 
-function bool(value: boolean): PropValue {
-	return { tag: PropValueTag.BOOL, value };
+function bool(value: boolean): JsPropValue {
+	return { propType: PropType.Bool, boolValue: value };
 }
 
 // ============================================================================
@@ -46,40 +31,40 @@ async function generateAuthDb() {
 
 	console.log(`Creating auth database at: ${dbPath}`);
 
-	const db = await openGraphDB(dbPath);
+	const db = Database.open(dbPath);
 
 	// Start transaction
-	const tx = beginTx(db);
+	db.begin();
 
 	// Define labels
-	const userLabel = defineLabel(tx, "user");
-	const roleLabel = defineLabel(tx, "role");
-	const permLabel = defineLabel(tx, "permission");
-	const sessionLabel = defineLabel(tx, "session");
-	const auditLabel = defineLabel(tx, "audit");
+	const userLabel = db.defineLabel("user");
+	const roleLabel = db.defineLabel("role");
+	const permLabel = db.defineLabel("permission");
+	const sessionLabel = db.defineLabel("session");
+	const auditLabel = db.defineLabel("audit");
 
 	// Define edge types
-	const hasRoleEtype = defineEtype(tx, "has_role");
-	const grantsEtype = defineEtype(tx, "grants");
-	const hasSessionEtype = defineEtype(tx, "has_session");
-	const performedEtype = defineEtype(tx, "performed");
-	const inheritsEtype = defineEtype(tx, "inherits");
+	const hasRoleEtype = db.defineEtype("has_role");
+	const grantsEtype = db.defineEtype("grants");
+	const hasSessionEtype = db.defineEtype("has_session");
+	const performedEtype = db.defineEtype("performed");
+	const inheritsEtype = db.defineEtype("inherits");
 
 	// Define property keys
-	const nameProp = definePropkey(tx, "name");
-	const emailProp = definePropkey(tx, "email");
-	const usernameProp = definePropkey(tx, "username");
-	const createdAtProp = definePropkey(tx, "createdAt");
-	const isActiveProp = definePropkey(tx, "isActive");
-	const descriptionProp = definePropkey(tx, "description");
-	const priorityProp = definePropkey(tx, "priority");
-	const resourceProp = definePropkey(tx, "resource");
-	const actionProp = definePropkey(tx, "action");
-	const tokenProp = definePropkey(tx, "token");
-	const expiresAtProp = definePropkey(tx, "expiresAt");
-	const ipAddressProp = definePropkey(tx, "ipAddress");
-	const timestampProp = definePropkey(tx, "timestamp");
-	const detailsProp = definePropkey(tx, "details");
+	const nameProp = db.definePropkey("name");
+	const emailProp = db.definePropkey("email");
+	const usernameProp = db.definePropkey("username");
+	const createdAtProp = db.definePropkey("createdAt");
+	const isActiveProp = db.definePropkey("isActive");
+	const descriptionProp = db.definePropkey("description");
+	const priorityProp = db.definePropkey("priority");
+	const resourceProp = db.definePropkey("resource");
+	const actionProp = db.definePropkey("action");
+	const tokenProp = db.definePropkey("token");
+	const expiresAtProp = db.definePropkey("expiresAt");
+	const ipAddressProp = db.definePropkey("ipAddress");
+	const timestampProp = db.definePropkey("timestamp");
+	const detailsProp = db.definePropkey("details");
 
 	// Create permissions
 	const permissions = [
@@ -124,10 +109,11 @@ async function generateAuthDb() {
 
 	const permIds = new Map<string, number>();
 	for (const perm of permissions) {
-		const nodeId = createNode(tx, { labels: [permLabel], key: perm.key });
-		setNodeProp(tx, nodeId, nameProp, str(perm.name));
-		setNodeProp(tx, nodeId, resourceProp, str(perm.resource));
-		setNodeProp(tx, nodeId, actionProp, str(perm.action));
+		const nodeId = db.createNode(perm.key);
+		db.addNodeLabel(nodeId, permLabel);
+		db.setNodeProp(nodeId, nameProp, str(perm.name));
+		db.setNodeProp(nodeId, resourceProp, str(perm.resource));
+		db.setNodeProp(nodeId, actionProp, str(perm.action));
 		permIds.set(perm.name, nodeId);
 		console.log(`  Created permission: ${perm.name}`);
 	}
@@ -162,10 +148,11 @@ async function generateAuthDb() {
 
 	const roleIds = new Map<string, number>();
 	for (const role of roles) {
-		const nodeId = createNode(tx, { labels: [roleLabel], key: role.key });
-		setNodeProp(tx, nodeId, nameProp, str(role.name));
-		setNodeProp(tx, nodeId, descriptionProp, str(role.description));
-		setNodeProp(tx, nodeId, priorityProp, int(role.priority));
+		const nodeId = db.createNode(role.key);
+		db.addNodeLabel(nodeId, roleLabel);
+		db.setNodeProp(nodeId, nameProp, str(role.name));
+		db.setNodeProp(nodeId, descriptionProp, str(role.description));
+		db.setNodeProp(nodeId, priorityProp, int(role.priority));
 		roleIds.set(role.name, nodeId);
 		console.log(`  Created role: ${role.name}`);
 	}
@@ -181,7 +168,7 @@ async function generateAuthDb() {
 		const roleId = roleIds.get(roleName)!;
 		for (const permName of perms) {
 			const permId = permIds.get(permName)!;
-			addEdge(tx, roleId, grantsEtype, permId);
+			db.addEdge(roleId, grantsEtype, permId);
 		}
 	}
 
@@ -189,8 +176,8 @@ async function generateAuthDb() {
 	const modId = roleIds.get("moderator")!;
 	const userId = roleIds.get("user")!;
 	const guestId = roleIds.get("guest")!;
-	addEdge(tx, modId, inheritsEtype, userId);
-	addEdge(tx, userId, inheritsEtype, guestId);
+	db.addEdge(modId, inheritsEtype, userId);
+	db.addEdge(userId, inheritsEtype, guestId);
 
 	// Create users
 	const now = Date.now();
@@ -234,11 +221,12 @@ async function generateAuthDb() {
 
 	const userIds = new Map<string, number>();
 	for (const user of users) {
-		const nodeId = createNode(tx, { labels: [userLabel], key: user.key });
-		setNodeProp(tx, nodeId, usernameProp, str(user.username));
-		setNodeProp(tx, nodeId, emailProp, str(user.email));
-		setNodeProp(tx, nodeId, createdAtProp, int(user.createdAt));
-		setNodeProp(tx, nodeId, isActiveProp, bool(user.isActive));
+		const nodeId = db.createNode(user.key);
+		db.addNodeLabel(nodeId, userLabel);
+		db.setNodeProp(nodeId, usernameProp, str(user.username));
+		db.setNodeProp(nodeId, emailProp, str(user.email));
+		db.setNodeProp(nodeId, createdAtProp, int(user.createdAt));
+		db.setNodeProp(nodeId, isActiveProp, bool(user.isActive));
 		userIds.set(user.username, nodeId);
 		console.log(`  Created user: ${user.username}`);
 	}
@@ -255,7 +243,7 @@ async function generateAuthDb() {
 	for (const [userName, roleName] of userRoles) {
 		const uId = userIds.get(userName)!;
 		const rId = roleIds.get(roleName)!;
-		addEdge(tx, uId, hasRoleEtype, rId);
+		db.addEdge(uId, hasRoleEtype, rId);
 	}
 
 	// Create some sessions for active users
@@ -282,10 +270,11 @@ async function generateAuthDb() {
 
 	const sessionIds = new Map<string, number>();
 	for (const session of sessions) {
-		const nodeId = createNode(tx, { labels: [sessionLabel], key: session.key });
-		setNodeProp(tx, nodeId, tokenProp, str(session.token));
-		setNodeProp(tx, nodeId, expiresAtProp, int(session.expiresAt));
-		setNodeProp(tx, nodeId, ipAddressProp, str(session.ipAddress));
+		const nodeId = db.createNode(session.key);
+		db.addNodeLabel(nodeId, sessionLabel);
+		db.setNodeProp(nodeId, tokenProp, str(session.token));
+		db.setNodeProp(nodeId, expiresAtProp, int(session.expiresAt));
+		db.setNodeProp(nodeId, ipAddressProp, str(session.ipAddress));
 		sessionIds.set(session.key, nodeId);
 		console.log(`  Created session: ${session.key}`);
 	}
@@ -300,7 +289,7 @@ async function generateAuthDb() {
 	for (const [userName, sessionKey] of userSessions) {
 		const uId = userIds.get(userName)!;
 		const sId = sessionIds.get(sessionKey)!;
-		addEdge(tx, uId, hasSessionEtype, sId);
+		db.addEdge(uId, hasSessionEtype, sId);
 	}
 
 	// Create audit logs
@@ -339,10 +328,11 @@ async function generateAuthDb() {
 
 	const auditIds = new Map<string, number>();
 	for (const audit of auditLogs) {
-		const nodeId = createNode(tx, { labels: [auditLabel], key: audit.key });
-		setNodeProp(tx, nodeId, actionProp, str(audit.action));
-		setNodeProp(tx, nodeId, timestampProp, int(audit.timestamp));
-		setNodeProp(tx, nodeId, detailsProp, str(audit.details));
+		const nodeId = db.createNode(audit.key);
+		db.addNodeLabel(nodeId, auditLabel);
+		db.setNodeProp(nodeId, actionProp, str(audit.action));
+		db.setNodeProp(nodeId, timestampProp, int(audit.timestamp));
+		db.setNodeProp(nodeId, detailsProp, str(audit.details));
 		auditIds.set(audit.key, nodeId);
 		console.log(`  Created audit log: ${audit.action}`);
 	}
@@ -359,14 +349,14 @@ async function generateAuthDb() {
 	for (const [userName, auditKey] of performedBy) {
 		const uId = userIds.get(userName)!;
 		const aId = auditIds.get(auditKey)!;
-		addEdge(tx, uId, performedEtype, aId);
+		db.addEdge(uId, performedEtype, aId);
 	}
 
 	// Commit transaction
-	await commit(tx);
+	db.commit();
 
 	// Get stats before optimization
-	const dbStats = stats(db);
+	const dbStats = db.stats();
 	console.log("\nDatabase stats:");
 	console.log(
 		`  Nodes: ${Number(dbStats.snapshotNodes) + dbStats.deltaNodesCreated}`,
@@ -377,10 +367,10 @@ async function generateAuthDb() {
 
 	// Optimize (compact delta into snapshot) and vacuum (shrink file)
 	console.log("\nOptimizing and vacuuming database...");
-	await optimizeSingleFile(db);
-	await vacuumSingleFile(db);
+	db.optimizeSingleFile();
+	db.vacuumSingleFile();
 
-	await closeGraphDB(db);
+	db.close();
 
 	console.log(`\nDatabase saved to: ${dbPath}`);
 	console.log("You can now upload this file to the playground!");

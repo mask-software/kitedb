@@ -45,7 +45,7 @@ impl SingleFileDB {
     }
 
     // Don't checkpoint with active transaction
-    if self.has_transaction() {
+    if self.has_any_transaction() {
       return Err(KiteError::TransactionInProgress);
     }
 
@@ -366,8 +366,12 @@ impl SingleFileDB {
 
           // Try to write header
           let header_bytes = header.serialize_to_page();
-          let _ = pager.write_page(0, &header_bytes);
-          let _ = pager.sync();
+          if let Err(err) = pager.write_page(0, &header_bytes) {
+            eprintln!("Warning: Failed to write checkpoint header during recovery: {err}");
+          }
+          if let Err(err) = pager.sync() {
+            eprintln!("Warning: Failed to sync checkpoint header during recovery: {err}");
+          }
         }
       }
     }
@@ -462,7 +466,7 @@ impl SingleFileDB {
             for (&key_id, value) in delta_props {
               match value {
                 Some(v) => {
-                  props.insert(key_id, v.clone());
+                  props.insert(key_id, v.as_ref().clone());
                 }
                 None => {
                   props.remove(&key_id);
@@ -533,7 +537,7 @@ impl SingleFileDB {
             for (&key_id, value) in delta_edge_props {
               match value {
                 Some(v) => {
-                  edge_props.insert(key_id, v.clone());
+                  edge_props.insert(key_id, v.as_ref().clone());
                 }
                 None => {
                   edge_props.remove(&key_id);
@@ -558,7 +562,7 @@ impl SingleFileDB {
       if let Some(ref delta_props) = node_delta.props {
         for (&key_id, value) in delta_props {
           if let Some(v) = value {
-            props.insert(key_id, v.clone());
+            props.insert(key_id, v.as_ref().clone());
           }
         }
       }
@@ -597,7 +601,7 @@ impl SingleFileDB {
         if let Some(delta_edge_props) = delta.edge_props.get(&edge_key) {
           for (&key_id, value) in delta_edge_props {
             if let Some(v) = value {
-              edge_props.insert(key_id, v.clone());
+              edge_props.insert(key_id, v.as_ref().clone());
             }
           }
         }

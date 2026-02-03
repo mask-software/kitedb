@@ -6,10 +6,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::constants::{EXT_KITEDB, MANIFEST_FILENAME, SNAPSHOTS_DIR, WAL_DIR};
+use crate::constants::EXT_KITEDB;
 use crate::core::single_file::SingleFileDB;
 use crate::error::{KiteError, Result};
-use crate::graph::db::GraphDB;
 
 /// Backup options
 #[derive(Debug, Clone)]
@@ -90,66 +89,6 @@ pub fn create_backup_single_file(
   ))
 }
 
-pub fn create_backup_graph(
-  db: &GraphDB,
-  backup_path: impl AsRef<Path>,
-  options: BackupOptions,
-) -> Result<BackupResult> {
-  let backup_path = PathBuf::from(backup_path.as_ref());
-
-  if backup_path.exists() && !options.overwrite {
-    return Err(KiteError::Internal(
-      "Backup already exists at path (use overwrite: true)".to_string(),
-    ));
-  }
-
-  if options.overwrite && backup_path.exists() {
-    remove_existing(&backup_path)?;
-  }
-
-  fs::create_dir_all(&backup_path)?;
-  fs::create_dir_all(backup_path.join(SNAPSHOTS_DIR))?;
-  fs::create_dir_all(backup_path.join(WAL_DIR))?;
-
-  let mut total_size = 0u64;
-
-  let manifest_src = db.path.join(MANIFEST_FILENAME);
-  if manifest_src.exists() {
-    total_size += copy_file_with_size(&manifest_src, &backup_path.join(MANIFEST_FILENAME))?;
-  }
-
-  let snapshots_dir = db.path.join(SNAPSHOTS_DIR);
-  if snapshots_dir.exists() {
-    for entry in fs::read_dir(&snapshots_dir)? {
-      let entry = entry?;
-      let src = entry.path();
-      let dst = backup_path.join(SNAPSHOTS_DIR).join(entry.file_name());
-      if src.is_file() {
-        total_size += copy_file_with_size(&src, &dst)?;
-      }
-    }
-  }
-
-  let wal_dir = db.path.join(WAL_DIR);
-  if wal_dir.exists() {
-    for entry in fs::read_dir(&wal_dir)? {
-      let entry = entry?;
-      let src = entry.path();
-      let dst = backup_path.join(WAL_DIR).join(entry.file_name());
-      if src.is_file() {
-        total_size += copy_file_with_size(&src, &dst)?;
-      }
-    }
-  }
-
-  Ok(backup_result(
-    &backup_path,
-    total_size,
-    "multi-file",
-    SystemTime::now(),
-  ))
-}
-
 pub fn restore_backup(
   backup_path: impl AsRef<Path>,
   restore_path: impl AsRef<Path>,
@@ -169,30 +108,24 @@ pub fn restore_backup(
   }
 
   let metadata = fs::metadata(&backup_path)?;
-  if metadata.is_file() {
-    if !restore_path.to_string_lossy().ends_with(EXT_KITEDB) {
-      restore_path = PathBuf::from(format!("{}{}", restore_path.to_string_lossy(), EXT_KITEDB));
-    }
-
-    ensure_parent_dir(&restore_path)?;
-
-    if options.overwrite && restore_path.exists() {
-      remove_existing(&restore_path)?;
-    }
-
-    copy_file_with_size(&backup_path, &restore_path)?;
-    Ok(restore_path)
-  } else if metadata.is_dir() {
-    if options.overwrite && restore_path.exists() {
-      remove_existing(&restore_path)?;
-    }
-    let _size = copy_dir_recursive(&backup_path, &restore_path)?;
-    Ok(restore_path)
-  } else {
-    Err(KiteError::Internal(
-      "Backup path is not a file or directory".to_string(),
-    ))
+  if !metadata.is_file() {
+    return Err(KiteError::Internal(
+      "Backup path must be a single-file .kitedb backup".to_string(),
+    ));
   }
+
+  if !restore_path.to_string_lossy().ends_with(EXT_KITEDB) {
+    restore_path = PathBuf::from(format!("{}{}", restore_path.to_string_lossy(), EXT_KITEDB));
+  }
+
+  ensure_parent_dir(&restore_path)?;
+
+  if options.overwrite && restore_path.exists() {
+    remove_existing(&restore_path)?;
+  }
+
+  copy_file_with_size(&backup_path, &restore_path)?;
+  Ok(restore_path)
 }
 
 pub fn get_backup_info(backup_path: impl AsRef<Path>) -> Result<BackupResult> {
@@ -211,12 +144,9 @@ pub fn get_backup_info(backup_path: impl AsRef<Path>) -> Result<BackupResult> {
       "single-file",
       timestamp,
     ))
-  } else if metadata.is_dir() {
-    let size = dir_size(&backup_path)?;
-    Ok(backup_result(&backup_path, size, "multi-file", timestamp))
   } else {
     Err(KiteError::Internal(
-      "Backup path is not a file or directory".to_string(),
+      "Backup path must be a single-file .kitedb backup".to_string(),
     ))
   }
 }
@@ -240,35 +170,24 @@ pub fn create_offline_backup(
   }
 
   let metadata = fs::metadata(&db_path)?;
-  if metadata.is_file() {
-    ensure_parent_dir(&backup_path)?;
-    if options.overwrite && backup_path.exists() {
-      remove_existing(&backup_path)?;
-    }
-    copy_file_with_size(&db_path, &backup_path)?;
-    let size = fs::metadata(&backup_path)?.len();
-    Ok(backup_result(
-      &backup_path,
-      size,
-      "single-file",
-      SystemTime::now(),
-    ))
-  } else if metadata.is_dir() {
-    if options.overwrite && backup_path.exists() {
-      remove_existing(&backup_path)?;
-    }
-    let size = copy_dir_recursive(&db_path, &backup_path)?;
-    Ok(backup_result(
-      &backup_path,
-      size,
-      "multi-file",
-      SystemTime::now(),
-    ))
-  } else {
-    Err(KiteError::Internal(
-      "Database path is not a file or directory".to_string(),
-    ))
+  if !metadata.is_file() {
+    return Err(KiteError::Internal(
+      "Database path must be a single-file .kitedb database".to_string(),
+    ));
   }
+
+  ensure_parent_dir(&backup_path)?;
+  if options.overwrite && backup_path.exists() {
+    remove_existing(&backup_path)?;
+  }
+  copy_file_with_size(&db_path, &backup_path)?;
+  let size = fs::metadata(&backup_path)?.len();
+  Ok(backup_result(
+    &backup_path,
+    size,
+    "single-file",
+    SystemTime::now(),
+  ))
 }
 
 fn backup_result(path: &Path, size: u64, kind: &str, timestamp: SystemTime) -> BackupResult {
@@ -308,35 +227,4 @@ fn remove_existing(path: &Path) -> Result<()> {
 fn copy_file_with_size(src: &Path, dst: &Path) -> Result<u64> {
   fs::copy(src, dst)?;
   Ok(fs::metadata(dst)?.len())
-}
-
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<u64> {
-  fs::create_dir_all(dst)?;
-  let mut total = 0u64;
-  for entry in fs::read_dir(src)? {
-    let entry = entry?;
-    let src_path = entry.path();
-    let dst_path = dst.join(entry.file_name());
-    let metadata = entry.metadata()?;
-    if metadata.is_dir() {
-      total += copy_dir_recursive(&src_path, &dst_path)?;
-    } else {
-      total += copy_file_with_size(&src_path, &dst_path)?;
-    }
-  }
-  Ok(total)
-}
-
-fn dir_size(path: &Path) -> Result<u64> {
-  let mut total = 0u64;
-  for entry in fs::read_dir(path)? {
-    let entry = entry?;
-    let metadata = entry.metadata()?;
-    if metadata.is_dir() {
-      total += dir_size(&entry.path())?;
-    } else {
-      total += metadata.len();
-    }
-  }
-  Ok(total)
 }

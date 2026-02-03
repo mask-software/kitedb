@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::types::{MvccTransaction, MvccTxStatus, Timestamp, TxId};
+use crate::types::{MvccTransaction, MvccTxStatus, Timestamp, TxId, TxKey};
 
 /// Maximum number of committed write entries before pruning
 const MAX_COMMITTED_WRITES: usize = 100_000;
@@ -35,7 +35,7 @@ pub struct TxManager {
   /// Next commit timestamp to assign
   next_commit_ts: Timestamp,
   /// Inverted index: key -> max commitTs for conflict detection
-  committed_writes: HashMap<String, Timestamp>,
+  committed_writes: HashMap<TxKey, Timestamp>,
   /// Map commit timestamp -> wall clock time (ms since epoch)
   commit_ts_to_wall_clock: HashMap<Timestamp, u64>,
   /// O(1) tracking of active transaction count
@@ -120,7 +120,7 @@ impl TxManager {
   }
 
   /// Record a read operation
-  pub fn record_read(&mut self, txid: TxId, key: String) {
+  pub fn record_read(&mut self, txid: TxId, key: TxKey) {
     if let Some(tx) = self.active_txs.get_mut(&txid) {
       if tx.status == MvccTxStatus::Active {
         tx.read_set.insert(key);
@@ -129,7 +129,7 @@ impl TxManager {
   }
 
   /// Record a write operation
-  pub fn record_write(&mut self, txid: TxId, key: String) {
+  pub fn record_write(&mut self, txid: TxId, key: TxKey) {
     if let Some(tx) = self.active_txs.get_mut(&txid) {
       if tx.status == MvccTxStatus::Active {
         tx.write_set.insert(key);
@@ -162,10 +162,14 @@ impl TxManager {
 
     // Index writes for fast conflict detection
     // Store only the max commitTs per key (simpler and faster than array)
-    let write_set: Vec<String> = tx.write_set.iter().cloned().collect();
+    let write_set: Vec<TxKey> = tx.write_set.iter().cloned().collect();
     for key in write_set {
       let existing = self.committed_writes.get(&key).copied();
-      if existing.is_none() || commit_ts > existing.unwrap() {
+      let should_update = match existing {
+        None => true,
+        Some(existing_ts) => commit_ts > existing_ts,
+      };
+      if should_update {
         self.committed_writes.insert(key, commit_ts);
       }
     }
@@ -248,7 +252,7 @@ impl TxManager {
 
   /// Get committed writes for a key (for conflict detection)
   /// Returns the max commitTs for the key if >= minCommitTs, otherwise None
-  pub fn get_committed_write_ts(&self, key: &str, min_commit_ts: Timestamp) -> Option<Timestamp> {
+  pub fn get_committed_write_ts(&self, key: &TxKey, min_commit_ts: Timestamp) -> Option<Timestamp> {
     self.committed_writes.get(key).and_then(|&max_ts| {
       if max_ts >= min_commit_ts {
         Some(max_ts)
@@ -260,7 +264,7 @@ impl TxManager {
 
   /// Check if there's a conflicting write for a key (fast path for conflict detection)
   /// Returns true if any transaction wrote this key with commitTs >= minCommitTs
-  pub fn has_conflicting_write(&self, key: &str, min_commit_ts: Timestamp) -> bool {
+  pub fn has_conflicting_write(&self, key: &TxKey, min_commit_ts: Timestamp) -> bool {
     self
       .committed_writes
       .get(key)
@@ -329,17 +333,14 @@ impl TxManager {
 
   fn prune_committed_writes(&mut self) {
     let min_ts = self.min_active_ts();
-    let mut entries: Vec<(String, Timestamp)> = self
-      .committed_writes
-      .iter()
-      .map(|(k, &v)| (k.clone(), v))
-      .collect();
+    let mut entries: Vec<(&TxKey, Timestamp)> =
+      self.committed_writes.iter().map(|(k, &v)| (k, v)).collect();
 
     entries.sort_by_key(|(_, ts)| *ts);
 
     let target_size = MAX_COMMITTED_WRITES.saturating_sub(PRUNE_THRESHOLD_ENTRIES);
     let mut current_size = self.committed_writes.len();
-    let mut pruned = 0;
+    let mut to_remove: Vec<TxKey> = Vec::new();
 
     for (key, commit_ts) in entries {
       if current_size <= target_size {
@@ -347,12 +348,17 @@ impl TxManager {
       }
 
       if commit_ts < min_ts {
-        if self.committed_writes.remove(&key).is_some() {
-          current_size = current_size.saturating_sub(1);
-          pruned += 1;
-        }
+        to_remove.push(key.clone());
+        current_size = current_size.saturating_sub(1);
       } else {
         break;
+      }
+    }
+
+    let mut pruned = 0;
+    for key in to_remove {
+      if self.committed_writes.remove(&key).is_some() {
+        pruned += 1;
       }
     }
 
@@ -417,6 +423,10 @@ impl std::error::Error for TxManagerError {}
 mod tests {
   use super::*;
 
+  fn key(name: &str) -> TxKey {
+    TxKey::Key(std::sync::Arc::from(name))
+  }
+
   #[test]
   fn test_new() {
     let tx_mgr = TxManager::new();
@@ -473,12 +483,12 @@ mod tests {
     let mut tx_mgr = TxManager::new();
     let (txid, _) = tx_mgr.begin_tx();
 
-    tx_mgr.record_read(txid, "key1".to_string());
-    tx_mgr.record_write(txid, "key2".to_string());
+    tx_mgr.record_read(txid, key("key1"));
+    tx_mgr.record_write(txid, key("key2"));
 
     let tx = tx_mgr.get_tx(txid).unwrap();
-    assert!(tx.read_set.contains("key1"));
-    assert!(tx.write_set.contains("key2"));
+    assert!(tx.read_set.contains(&key("key1")));
+    assert!(tx.write_set.contains(&key("key2")));
   }
 
   #[test]
@@ -486,14 +496,14 @@ mod tests {
     let mut tx_mgr = TxManager::new();
     let (txid, _) = tx_mgr.begin_tx();
 
-    tx_mgr.record_write(txid, "key1".to_string());
+    tx_mgr.record_write(txid, key("key1"));
 
     let commit_ts = tx_mgr.commit_tx(txid).unwrap();
     assert_eq!(commit_ts, 1);
     assert_eq!(tx_mgr.get_active_count(), 0);
 
     // Check committed writes tracking
-    assert!(tx_mgr.has_conflicting_write("key1", 1));
+    assert!(tx_mgr.has_conflicting_write(&key("key1"), 1));
   }
 
   #[test]
@@ -583,41 +593,41 @@ mod tests {
     let mut tx_mgr = TxManager::new();
 
     // No writes yet
-    assert!(!tx_mgr.has_conflicting_write("key1", 0));
+    assert!(!tx_mgr.has_conflicting_write(&key("key1"), 0));
 
     let (txid, _) = tx_mgr.begin_tx();
-    tx_mgr.record_write(txid, "key1".to_string());
+    tx_mgr.record_write(txid, key("key1"));
     tx_mgr.commit_tx(txid).unwrap();
 
     // After commit at ts=1
-    assert!(tx_mgr.has_conflicting_write("key1", 1));
-    assert!(tx_mgr.has_conflicting_write("key1", 0));
-    assert!(!tx_mgr.has_conflicting_write("key1", 2)); // min_commit_ts > actual
-    assert!(!tx_mgr.has_conflicting_write("key2", 0)); // Different key
+    assert!(tx_mgr.has_conflicting_write(&key("key1"), 1));
+    assert!(tx_mgr.has_conflicting_write(&key("key1"), 0));
+    assert!(!tx_mgr.has_conflicting_write(&key("key1"), 2)); // min_commit_ts > actual
+    assert!(!tx_mgr.has_conflicting_write(&key("key2"), 0)); // Different key
   }
 
   #[test]
   fn test_get_committed_write_ts() {
     let mut tx_mgr = TxManager::new();
     let (txid, _) = tx_mgr.begin_tx();
-    tx_mgr.record_write(txid, "key1".to_string());
+    tx_mgr.record_write(txid, key("key1"));
     tx_mgr.commit_tx(txid).unwrap();
 
-    assert_eq!(tx_mgr.get_committed_write_ts("key1", 0), Some(1));
-    assert_eq!(tx_mgr.get_committed_write_ts("key1", 1), Some(1));
-    assert_eq!(tx_mgr.get_committed_write_ts("key1", 2), None);
-    assert_eq!(tx_mgr.get_committed_write_ts("key2", 0), None);
+    assert_eq!(tx_mgr.get_committed_write_ts(&key("key1"), 0), Some(1));
+    assert_eq!(tx_mgr.get_committed_write_ts(&key("key1"), 1), Some(1));
+    assert_eq!(tx_mgr.get_committed_write_ts(&key("key1"), 2), None);
+    assert_eq!(tx_mgr.get_committed_write_ts(&key("key2"), 0), None);
   }
 
   #[test]
   fn test_clear() {
     let mut tx_mgr = TxManager::new();
     let (txid, _) = tx_mgr.begin_tx();
-    tx_mgr.record_write(txid, "key1".to_string());
+    tx_mgr.record_write(txid, key("key1"));
 
     tx_mgr.clear();
     assert_eq!(tx_mgr.get_active_count(), 0);
-    assert!(!tx_mgr.has_conflicting_write("key1", 0));
+    assert!(!tx_mgr.has_conflicting_write(&key("key1"), 0));
   }
 
   #[test]
@@ -627,7 +637,7 @@ mod tests {
 
     for i in 0..10 {
       let (txid, _) = tx_mgr.begin_tx();
-      tx_mgr.record_write(txid, format!("key{}", i));
+      tx_mgr.record_write(txid, TxKey::Key(format!("key{i}").into()));
       tx_mgr.commit_tx(txid).unwrap();
     }
 
@@ -650,9 +660,9 @@ mod tests {
     assert_eq!(start_ts2, start_ts3);
 
     // Record some writes
-    tx_mgr.record_write(txid1, "a".to_string());
-    tx_mgr.record_write(txid2, "b".to_string());
-    tx_mgr.record_write(txid3, "a".to_string()); // Same key as tx1
+    tx_mgr.record_write(txid1, key("a"));
+    tx_mgr.record_write(txid2, key("b"));
+    tx_mgr.record_write(txid3, key("a")); // Same key as tx1
 
     // Commit tx1
     let commit_ts1 = tx_mgr.commit_tx(txid1).unwrap();
@@ -660,7 +670,7 @@ mod tests {
     assert_eq!(tx_mgr.get_active_count(), 2);
 
     // tx3 now has conflict with tx1 on key "a"
-    assert!(tx_mgr.has_conflicting_write("a", start_ts3));
+    assert!(tx_mgr.has_conflicting_write(&key("a"), start_ts3));
 
     // Commit tx2 (no conflict)
     let commit_ts2 = tx_mgr.commit_tx(txid2).unwrap();

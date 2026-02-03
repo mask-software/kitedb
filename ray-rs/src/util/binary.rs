@@ -415,7 +415,7 @@ mod tests {
 
   #[test]
   fn test_f64_bits() {
-    let value = 3.14159265359;
+    let value = std::f64::consts::PI;
     let bits = f64_to_u64_bits(value);
     let recovered = u64_bits_to_f64(bits);
     assert_eq!(value, recovered);

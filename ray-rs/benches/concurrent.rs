@@ -16,10 +16,10 @@ use std::thread;
 use tempfile::tempdir;
 
 extern crate kitedb;
-use kitedb::api::kite::{EdgeDef, NodeDef, PropDef, Kite, KiteOptions};
-use kitedb::core::single_file::{open_single_file, SingleFileOpenOptions};
+use kitedb::api::kite::{EdgeDef, Kite, KiteOptions, NodeDef, PropDef};
+use kitedb::core::single_file::{open_single_file, SingleFileOpenOptions, SyncMode};
 use kitedb::mvcc::TxManager;
-use kitedb::types::PropValue;
+use kitedb::types::{PropValue, TxKey};
 
 // ============================================================================
 // Setup Helpers
@@ -33,12 +33,19 @@ fn create_test_schema() -> KiteOptions {
 
   let follows = EdgeDef::new("FOLLOWS");
 
-  KiteOptions::new().node(user).edge(follows)
+  KiteOptions::new()
+    .node(user)
+    .edge(follows)
+    .sync_mode(SyncMode::Normal)
+}
+
+fn temp_db_path(temp_dir: &tempfile::TempDir) -> std::path::PathBuf {
+  temp_dir.path().join("bench")
 }
 
 fn setup_ray_db(node_count: usize, edge_count: usize) -> (tempfile::TempDir, Kite) {
   let temp_dir = tempdir().unwrap();
-  let mut ray = Kite::open(temp_dir.path(), create_test_schema()).unwrap();
+  let mut ray = Kite::open(temp_db_path(&temp_dir), create_test_schema()).unwrap();
 
   let mut node_ids = Vec::with_capacity(node_count);
   for i in 0..node_count {
@@ -48,6 +55,11 @@ fn setup_ray_db(node_count: usize, edge_count: usize) -> (tempfile::TempDir, Kit
     props.insert("score".to_string(), PropValue::F64(i as f64 * 0.1));
     let node = ray.create_node("User", &format!("user{i}"), props).unwrap();
     node_ids.push(node.id);
+
+    // Optimize periodically to avoid WAL overflow
+    if (i + 1) % 1000 == 0 {
+      ray.optimize().unwrap();
+    }
   }
 
   let edges_to_create = std::cmp::min(edge_count, node_count.saturating_sub(1));
@@ -57,8 +69,13 @@ fn setup_ray_db(node_count: usize, edge_count: usize) -> (tempfile::TempDir, Kit
     if src != dst {
       let _ = ray.link(src, "FOLLOWS", dst);
     }
+    // Optimize periodically to avoid WAL overflow
+    if (i + 1) % 1000 == 0 {
+      ray.optimize().unwrap();
+    }
   }
 
+  ray.optimize().unwrap();
   (temp_dir, ray)
 }
 
@@ -81,7 +98,7 @@ fn bench_concurrent_reads(c: &mut Criterion) {
       group.throughput(Throughput::Elements((*num_threads * ops_per_thread) as u64));
 
       group.bench_with_input(
-        BenchmarkId::new(format!("nodes_{}", node_count), num_threads),
+        BenchmarkId::new(format!("nodes_{node_count}"), num_threads),
         num_threads,
         |bencher, &num_threads| {
           bencher.iter(|| {
@@ -99,7 +116,7 @@ fn bench_concurrent_reads(c: &mut Criterion) {
                   for i in 0..ops_per_thread {
                     let idx = (thread_id * 100 + i) % node_count;
                     let ray_guard = ray.read();
-                    black_box(ray_guard.get("User", &format!("user{idx}")));
+                    let _ = black_box(ray_guard.get("User", &format!("user{idx}")));
                   }
                 })
               })
@@ -151,7 +168,7 @@ fn bench_read_scaling(c: &mut Criterion) {
                 for i in 0..ops_per_thread {
                   let idx = (thread_id * 123 + i * 7) % 2000; // Spread reads
                   let ray_guard = ray.read();
-                  black_box(ray_guard.get("User", &format!("user{idx}")));
+                  let _ = black_box(ray_guard.get("User", &format!("user{idx}")));
                 }
               })
             })
@@ -291,7 +308,7 @@ fn bench_traversal_scaling(c: &mut Criterion) {
                 for i in 0..traversals_per_thread {
                   let start = start_ids[(thread_id + i) % start_ids.len()];
                   let ray_guard = ray.read();
-                  black_box(ray_guard.neighbors_out(start, Some("FOLLOWS")));
+                  let _ = black_box(ray_guard.neighbors_out(start, Some("FOLLOWS")));
                 }
               })
             })
@@ -326,7 +343,7 @@ fn bench_reader_writer_contention(c: &mut Criterion) {
     group.throughput(Throughput::Elements(total_ops as u64));
 
     group.bench_with_input(
-      BenchmarkId::new(format!("r{}_w{}", num_readers, num_writers), ""),
+      BenchmarkId::new(format!("r{num_readers}_w{num_writers}"), ""),
       &(*num_readers, *num_writers),
       |bencher, &(num_readers, num_writers)| {
         let write_counter = Arc::new(AtomicU64::new(0));
@@ -348,7 +365,7 @@ fn bench_reader_writer_contention(c: &mut Criterion) {
               for i in 0..ops_per_thread {
                 let idx = (thread_id * 50 + i) % 500;
                 let ray_guard = ray.read();
-                black_box(ray_guard.get("User", &format!("user{idx}")));
+                let _ = black_box(ray_guard.get("User", &format!("user{idx}")));
               }
             }));
           }
@@ -369,7 +386,7 @@ fn bench_reader_writer_contention(c: &mut Criterion) {
                   "name".to_string(),
                   PropValue::String(format!("BenchUser{writer_id}_{i}")),
                 );
-                black_box(ray_guard.create_node("User", &format!("bench{counter}"), props));
+                let _ = black_box(ray_guard.create_node("User", &format!("bench{counter}"), props));
               }
             }));
           }
@@ -396,9 +413,9 @@ fn bench_mvcc_transaction_overhead(c: &mut Criterion) {
   // Benchmark transaction begin/commit cycle
   group.bench_function("begin_commit_cycle", |bencher| {
     bencher.iter_with_setup(TxManager::new, |mut tx_mgr| {
-      for _ in 0..100 {
+      for i in 0..100 {
         let (txid, _) = tx_mgr.begin_tx();
-        tx_mgr.record_read(txid, "key".to_string());
+        tx_mgr.record_read(txid, TxKey::Node(i as u64));
         black_box(tx_mgr.commit_tx(txid).unwrap());
       }
     });
@@ -409,7 +426,7 @@ fn bench_mvcc_transaction_overhead(c: &mut Criterion) {
     bencher.iter_with_setup(TxManager::new, |mut tx_mgr| {
       for i in 0..100 {
         let (txid, _) = tx_mgr.begin_tx();
-        tx_mgr.record_write(txid, format!("key{i}"));
+        tx_mgr.record_write(txid, TxKey::Node(i as u64));
         black_box(tx_mgr.commit_tx(txid).unwrap());
       }
     });
@@ -420,7 +437,7 @@ fn bench_mvcc_transaction_overhead(c: &mut Criterion) {
     bencher.iter_with_setup(TxManager::new, |mut tx_mgr| {
       let (txid, _) = tx_mgr.begin_tx();
       for i in 0..1000 {
-        tx_mgr.record_read(txid, format!("key{i}"));
+        tx_mgr.record_read(txid, TxKey::Node(i as u64));
       }
       black_box(tx_mgr.commit_tx(txid).unwrap());
     });
@@ -431,7 +448,7 @@ fn bench_mvcc_transaction_overhead(c: &mut Criterion) {
     bencher.iter_with_setup(TxManager::new, |mut tx_mgr| {
       let (txid, _) = tx_mgr.begin_tx();
       for i in 0..1000 {
-        tx_mgr.record_write(txid, format!("key{i}"));
+        tx_mgr.record_write(txid, TxKey::Node(i as u64));
       }
       black_box(tx_mgr.commit_tx(txid).unwrap());
     });
@@ -455,7 +472,11 @@ fn bench_single_file_sequential_reads(c: &mut Criterion) {
 
   // Setup database
   {
-    let db = open_single_file(&db_path, SingleFileOpenOptions::new()).unwrap();
+    let db = open_single_file(
+      &db_path,
+      SingleFileOpenOptions::new().sync_mode(SyncMode::Normal),
+    )
+    .unwrap();
     db.begin(false).unwrap();
     for i in 0..1000 {
       let key = format!("node{i}");
@@ -467,7 +488,11 @@ fn bench_single_file_sequential_reads(c: &mut Criterion) {
     kitedb::core::single_file::close_single_file(db).unwrap();
   }
 
-  let db = open_single_file(&db_path, SingleFileOpenOptions::new()).unwrap();
+  let db = open_single_file(
+    &db_path,
+    SingleFileOpenOptions::new().sync_mode(SyncMode::Normal),
+  )
+  .unwrap();
 
   group.throughput(Throughput::Elements(1000));
 
@@ -537,7 +562,8 @@ fn bench_edge_check_scaling(c: &mut Criterion) {
                   let src_idx = (thread_id * 20 + i) % (node_ids.len() - 1);
                   let dst_idx = src_idx + 1;
                   let ray_guard = ray.read();
-                  black_box(ray_guard.has_edge(node_ids[src_idx], "FOLLOWS", node_ids[dst_idx]));
+                  let _ =
+                    black_box(ray_guard.has_edge(node_ids[src_idx], "FOLLOWS", node_ids[dst_idx]));
                 }
               })
             })

@@ -1,5 +1,7 @@
 # RayDB Architecture Overview
 
+> Note: The directory-based GraphDB (multi-file) engine has been removed. KiteDB is single-file (`.kitedb`) only; GraphDB references below are historical.
+
 RayDB is a high-performance embedded graph database written in TypeScript for the Bun runtime.
 
 ## Table of Contents

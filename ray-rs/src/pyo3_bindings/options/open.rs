@@ -5,7 +5,6 @@ use crate::core::single_file::{
   SingleFileOpenOptions as RustOpenOptions, SnapshotParseMode as RustSnapshotParseMode,
   SyncMode as RustSyncMode,
 };
-use crate::graph::db::OpenOptions as GraphOpenOptions;
 use crate::types::{CacheOptions, PropertyCacheConfig, QueryCacheConfig, TraversalCacheConfig};
 use pyo3::prelude::*;
 
@@ -103,24 +102,18 @@ pub struct OpenOptions {
   /// Create database if it doesn't exist
   #[pyo3(get, set)]
   pub create_if_missing: Option<bool>,
-  /// Acquire file lock (multi-file only)
-  #[pyo3(get, set)]
-  pub lock_file: Option<bool>,
-  /// Require locking support (multi-file only)
-  #[pyo3(get, set)]
-  pub require_locking: Option<bool>,
-  /// Enable MVCC (multi-file only)
+  /// Enable MVCC (snapshot isolation + conflict detection)
   #[pyo3(get, set)]
   pub mvcc: Option<bool>,
-  /// MVCC GC interval in ms (multi-file only)
+  /// MVCC GC interval in ms
   #[pyo3(get, set)]
   pub mvcc_gc_interval_ms: Option<i64>,
-  /// MVCC retention in ms (multi-file only)
+  /// MVCC retention in ms
   #[pyo3(get, set)]
   pub mvcc_retention_ms: Option<i64>,
-  /// MVCC max version chain depth (multi-file only)
+  /// MVCC max version chain depth
   #[pyo3(get, set)]
-  pub mvcc_max_chain_depth: Option<u32>,
+  pub mvcc_max_chain_depth: Option<i64>,
   /// Page size in bytes (default 4096)
   #[pyo3(get, set)]
   pub page_size: Option<u32>,
@@ -173,8 +166,6 @@ impl OpenOptions {
   #[pyo3(signature = (
         read_only=None,
         create_if_missing=None,
-        lock_file=None,
-        require_locking=None,
         mvcc=None,
         mvcc_gc_interval_ms=None,
         mvcc_retention_ms=None,
@@ -199,12 +190,10 @@ impl OpenOptions {
   fn new(
     read_only: Option<bool>,
     create_if_missing: Option<bool>,
-    lock_file: Option<bool>,
-    require_locking: Option<bool>,
     mvcc: Option<bool>,
     mvcc_gc_interval_ms: Option<i64>,
     mvcc_retention_ms: Option<i64>,
-    mvcc_max_chain_depth: Option<u32>,
+    mvcc_max_chain_depth: Option<i64>,
     page_size: Option<u32>,
     wal_size: Option<u32>,
     auto_checkpoint: Option<bool>,
@@ -224,8 +213,6 @@ impl OpenOptions {
     Self {
       read_only,
       create_if_missing,
-      lock_file,
-      require_locking,
       mvcc,
       mvcc_gc_interval_ms,
       mvcc_retention_ms,
@@ -273,6 +260,18 @@ impl OpenOptions {
     }
     if let Some(v) = self.create_if_missing {
       rust_opts = rust_opts.create_if_missing(v);
+    }
+    if let Some(v) = self.mvcc {
+      rust_opts = rust_opts.mvcc(v);
+    }
+    if let Some(v) = self.mvcc_gc_interval_ms {
+      rust_opts = rust_opts.mvcc_gc_interval_ms(v as u64);
+    }
+    if let Some(v) = self.mvcc_retention_ms {
+      rust_opts = rust_opts.mvcc_retention_ms(v as u64);
+    }
+    if let Some(v) = self.mvcc_max_chain_depth {
+      rust_opts = rust_opts.mvcc_max_chain_depth(v as usize);
     }
     if let Some(v) = self.page_size {
       rust_opts = rust_opts.page_size(v as usize);
@@ -327,37 +326,6 @@ impl OpenOptions {
     }
 
     Ok(rust_opts)
-  }
-}
-
-impl OpenOptions {
-  /// Convert to GraphOpenOptions for multi-file databases
-  pub fn to_graph_options(&self) -> GraphOpenOptions {
-    let mut opts = GraphOpenOptions::new();
-
-    if let Some(v) = self.read_only {
-      opts.read_only = v;
-    }
-    if let Some(v) = self.create_if_missing {
-      opts.create_if_missing = v;
-    }
-    if let Some(v) = self.lock_file {
-      opts.lock_file = v;
-    }
-    if let Some(v) = self.mvcc {
-      opts.mvcc = v;
-    }
-    if let Some(v) = self.mvcc_gc_interval_ms {
-      opts.mvcc_gc_interval_ms = Some(v as u64);
-    }
-    if let Some(v) = self.mvcc_retention_ms {
-      opts.mvcc_retention_ms = Some(v as u64);
-    }
-    if let Some(v) = self.mvcc_max_chain_depth {
-      opts.mvcc_max_chain_depth = Some(v as usize);
-    }
-
-    opts
   }
 }
 

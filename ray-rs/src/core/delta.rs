@@ -221,9 +221,14 @@ impl DeltaState {
 
   /// Set a node property
   pub fn set_node_prop(&mut self, node_id: NodeId, key_id: PropKeyId, value: PropValue) {
+    self.set_node_prop_ref(node_id, key_id, std::sync::Arc::new(value));
+  }
+
+  /// Set a node property using a shared value
+  pub fn set_node_prop_ref(&mut self, node_id: NodeId, key_id: PropKeyId, value: PropValueRef) {
     // Get or create the node delta
-    let node_delta = if self.created_nodes.contains_key(&node_id) {
-      self.created_nodes.get_mut(&node_id).unwrap()
+    let node_delta = if let Some(node_delta) = self.created_nodes.get_mut(&node_id) {
+      node_delta
     } else {
       self
         .modified_nodes
@@ -236,22 +241,16 @@ impl DeltaState {
         })
     };
 
-    // Initialize props map if needed
-    if node_delta.props.is_none() {
-      node_delta.props = Some(std::collections::HashMap::new());
-    }
-
-    node_delta
+    let props = node_delta
       .props
-      .as_mut()
-      .unwrap()
-      .insert(key_id, Some(value));
+      .get_or_insert_with(std::collections::HashMap::new);
+    props.insert(key_id, Some(value));
   }
 
   /// Delete a node property
   pub fn delete_node_prop(&mut self, node_id: NodeId, key_id: PropKeyId) {
-    let node_delta = if self.created_nodes.contains_key(&node_id) {
-      self.created_nodes.get_mut(&node_id).unwrap()
+    let node_delta = if let Some(node_delta) = self.created_nodes.get_mut(&node_id) {
+      node_delta
     } else {
       self
         .modified_nodes
@@ -264,12 +263,11 @@ impl DeltaState {
         })
     };
 
-    if node_delta.props.is_none() {
-      node_delta.props = Some(std::collections::HashMap::new());
-    }
-
+    let props = node_delta
+      .props
+      .get_or_insert_with(std::collections::HashMap::new);
     // None value means deleted
-    node_delta.props.as_mut().unwrap().insert(key_id, None);
+    props.insert(key_id, None);
   }
 
   /// Get a node property from delta
@@ -280,7 +278,7 @@ impl DeltaState {
       .or_else(|| self.modified_nodes.get(&node_id))?;
 
     let props = node_delta.props.as_ref()?;
-    props.get(&key_id).map(|v| v.as_ref())
+    props.get(&key_id).map(|v| v.as_deref())
   }
 
   // ========================================================================
@@ -289,10 +287,8 @@ impl DeltaState {
 
   /// Add a label to a node
   pub fn add_node_label(&mut self, node_id: NodeId, label_id: LabelId) {
-    let is_created = self.created_nodes.contains_key(&node_id);
-
-    let node_delta = if is_created {
-      self.created_nodes.get_mut(&node_id).unwrap()
+    let node_delta = if let Some(node_delta) = self.created_nodes.get_mut(&node_id) {
+      node_delta
     } else {
       self
         .modified_nodes
@@ -311,18 +307,18 @@ impl DeltaState {
     }
 
     // Add to labels set
-    if node_delta.labels.is_none() {
-      node_delta.labels = Some(std::collections::HashSet::new());
-    }
-    node_delta.labels.as_mut().unwrap().insert(label_id);
+    let labels = node_delta
+      .labels
+      .get_or_insert_with(std::collections::HashSet::new);
+    labels.insert(label_id);
   }
 
   /// Remove a label from a node
   pub fn remove_node_label(&mut self, node_id: NodeId, label_id: LabelId) {
     let is_created = self.created_nodes.contains_key(&node_id);
 
-    let node_delta = if is_created {
-      self.created_nodes.get_mut(&node_id).unwrap()
+    let node_delta = if let Some(node_delta) = self.created_nodes.get_mut(&node_id) {
+      node_delta
     } else {
       self
         .modified_nodes
@@ -342,10 +338,10 @@ impl DeltaState {
 
     // If not a new node, mark as deleted
     if !is_created {
-      if node_delta.labels_deleted.is_none() {
-        node_delta.labels_deleted = Some(std::collections::HashSet::new());
-      }
-      node_delta.labels_deleted.as_mut().unwrap().insert(label_id);
+      let deleted = node_delta
+        .labels_deleted
+        .get_or_insert_with(std::collections::HashSet::new);
+      deleted.insert(label_id);
     }
   }
 
@@ -422,6 +418,18 @@ impl DeltaState {
     key_id: PropKeyId,
     value: PropValue,
   ) {
+    self.set_edge_prop_ref(src, etype, dst, key_id, std::sync::Arc::new(value));
+  }
+
+  /// Set an edge property using a shared value
+  pub fn set_edge_prop_ref(
+    &mut self,
+    src: NodeId,
+    etype: ETypeId,
+    dst: NodeId,
+    key_id: PropKeyId,
+    value: PropValueRef,
+  ) {
     let edge_key = (src, etype, dst);
     let props = self.edge_props.entry(edge_key).or_default();
     props.insert(key_id, Some(value));
@@ -448,7 +456,7 @@ impl DeltaState {
       .edge_props
       .get(&edge_key)
       .and_then(|props| props.get(&key_id))
-      .map(|v| v.as_ref())
+      .map(|v| v.as_deref())
   }
 
   /// Get all edge property modifications in delta
@@ -457,7 +465,7 @@ impl DeltaState {
     src: NodeId,
     etype: ETypeId,
     dst: NodeId,
-  ) -> Option<&HashMap<PropKeyId, Option<PropValue>>> {
+  ) -> Option<&HashMap<PropKeyId, Option<PropValueRef>>> {
     self.edge_props.get(&(src, etype, dst))
   }
 

@@ -88,6 +88,7 @@ import type {
   JsEdgeSpec,
   JsPropSpec,
   JsPropValue,
+  JsSyncMode,
   JsTraverseOptions,
   JsPathResult,
   JsFullEdge,
@@ -123,6 +124,7 @@ type ArrayWithToArray<T, U = T> = T[] & { toArray(): U[] }
 type NodeObject = NodeRef & Record<string, unknown>
 type NodeIdLike = number | { id: number }
 type NodePropsSelection = Array<string>
+type SyncMode = JsSyncMode
 type InsertExecutorSingle<N extends NodeSpec> = Omit<KiteInsertExecutorSingle, 'returning'> & {
   returning(): InferNode<N>
 }
@@ -626,6 +628,18 @@ export class Kite extends NativeKite {
     return super.getByIds(ids, props)
   }
 
+  getProp(node: NodeIdLike, propName: string): JsPropValue | null {
+    return super.getProp(nodeId(node), propName)
+  }
+
+  setProp(node: NodeIdLike, propName: string, value: unknown): void {
+    return super.setProp(nodeId(node), propName, value)
+  }
+
+  setProps(node: NodeIdLike, props: Record<string, unknown>): void {
+    return super.setProps(nodeId(node), props)
+  }
+
   deleteByKey(nodeType: NodeLike, key: unknown): boolean {
     return super.deleteByKey(nodeName(nodeType), key)
   }
@@ -944,6 +958,8 @@ export interface KiteOptions {
   readOnly?: boolean
   /** Create database if it doesn't exist (default: true) */
   createIfMissing?: boolean
+  /** Sync mode for durability (default: "Full") */
+  syncMode?: SyncMode
   /** Acquire file lock (default: true) */
   lockFile?: boolean
 }
@@ -999,6 +1015,7 @@ function optionsToNative(options: KiteOptions): JsKiteOptions {
     edges: options.edges.map(edgeSpecToNative),
     readOnly: options.readOnly,
     createIfMissing: options.createIfMissing,
+    syncMode: options.syncMode,
     lockFile: options.lockFile,
   }
 }

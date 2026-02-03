@@ -1,6 +1,6 @@
 //! Python bindings for KiteDB Database
 //!
-//! Provides Python access to both single-file and multi-file database formats.
+//! Provides Python access to the single-file database format.
 //! This module contains the main Database class and standalone functions.
 
 use pyo3::exceptions::PyRuntimeError;
@@ -11,14 +11,12 @@ use std::sync::RwLock;
 use crate::backup as core_backup;
 use crate::core::single_file::{
   close_single_file, is_single_file_path, open_single_file, SingleFileDB as RustSingleFileDB,
-  SingleFileOpenOptions as RustOpenOptions, VacuumOptions as RustVacuumOptions,
+  VacuumOptions as RustVacuumOptions,
 };
-use crate::graph::db::{close_graph_db, open_graph_db as open_multi_file, GraphDB as RustGraphDB};
 use crate::metrics as core_metrics;
-use crate::types::{ETypeId, NodeId, PropKeyId, TxState as GraphTxState};
+use crate::types::{ETypeId, NodeId, PropKeyId};
 
 // Import from modular structure
-use super::helpers::{graph_check, graph_stats};
 use super::ops::{
   cache, edges, export_import, graph_traversal, labels, maintenance, nodes, properties, schema,
   streaming as streaming_ops, transaction, vectors,
@@ -40,14 +38,13 @@ use super::types::{
 
 pub(crate) enum DatabaseInner {
   SingleFile(Box<RustSingleFileDB>),
-  Graph(Box<RustGraphDB>),
 }
 
 // ============================================================================
 // Dispatch Macros - Eliminate boilerplate for method dispatch
 // ============================================================================
 
-/// Dispatch to single-file or graph implementation (immutable, returns PyResult)
+/// Dispatch to single-file implementation (immutable, returns PyResult)
 /// Uses read lock for concurrent read access
 macro_rules! dispatch {
   ($self:expr, |$sf:ident| $sf_expr:expr, |$gf:ident| $gf_expr:expr) => {{
@@ -57,7 +54,6 @@ macro_rules! dispatch {
       .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     match guard.as_ref() {
       Some(DatabaseInner::SingleFile($sf)) => $sf_expr,
-      Some(DatabaseInner::Graph($gf)) => $gf_expr,
       None => Err(PyRuntimeError::new_err("Database is closed")),
     }
   }};
@@ -73,13 +69,12 @@ macro_rules! dispatch_ok {
       .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     match guard.as_ref() {
       Some(DatabaseInner::SingleFile($sf)) => Ok($sf_expr),
-      Some(DatabaseInner::Graph($gf)) => Ok($gf_expr),
       None => Err(PyRuntimeError::new_err("Database is closed")),
     }
   }};
 }
 
-/// Dispatch to mutable single-file or graph implementation
+/// Dispatch to mutable single-file implementation
 /// Uses write lock for exclusive access
 macro_rules! dispatch_mut {
   ($self:expr, |$sf:ident| $sf_expr:expr, |$gf:ident| $gf_expr:expr) => {{
@@ -89,14 +84,12 @@ macro_rules! dispatch_mut {
       .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     match guard.as_mut() {
       Some(DatabaseInner::SingleFile($sf)) => $sf_expr,
-      Some(DatabaseInner::Graph($gf)) => $gf_expr,
       None => Err(PyRuntimeError::new_err("Database is closed")),
     }
   }};
 }
 
-/// Dispatch with graph transaction (for write operations on graph db)
-/// Uses read lock since transaction state is managed separately
+/// Dispatch for write operations
 macro_rules! dispatch_tx {
   ($self:expr, |$sf:ident| $sf_expr:expr, |$handle:ident| $gf_expr:expr) => {{
     let guard = $self
@@ -105,9 +98,6 @@ macro_rules! dispatch_tx {
       .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     match guard.as_ref() {
       Some(DatabaseInner::SingleFile($sf)) => $sf_expr,
-      Some(DatabaseInner::Graph(db)) => {
-        transaction::with_graph_tx(db, &$self.graph_tx, |$handle| $gf_expr)
-      }
       None => Err(PyRuntimeError::new_err("Database is closed")),
     }
   }};
@@ -117,7 +107,7 @@ macro_rules! dispatch_tx {
 // Database Python Wrapper
 // ============================================================================
 
-/// Graph database handle (single-file or multi-file).
+/// Single-file database handle.
 ///
 /// # Thread Safety and Concurrent Access
 ///
@@ -146,7 +136,6 @@ macro_rules! dispatch_tx {
 #[pyclass(name = "Database")]
 pub struct PyDatabase {
   pub(crate) inner: RwLock<Option<DatabaseInner>>,
-  pub(crate) graph_tx: std::sync::Mutex<Option<GraphTxState>>,
 }
 
 #[pymethods]
@@ -162,19 +151,19 @@ impl PyDatabase {
     let path_buf = PathBuf::from(&path);
 
     if path_buf.exists() && path_buf.is_dir() {
-      let graph_opts = options.to_graph_options();
-      let db = open_multi_file(&path_buf, graph_opts)
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to open database: {e}")))?;
-      return Ok(PyDatabase {
-        inner: RwLock::new(Some(DatabaseInner::Graph(Box::new(db)))),
-        graph_tx: std::sync::Mutex::new(None),
-      });
+      return Err(PyRuntimeError::new_err(
+        "Single-file databases require a file path, not a directory",
+      ));
     }
 
     let db_path = if is_single_file_path(&path_buf) {
       path_buf
-    } else {
+    } else if path_buf.extension().is_none() {
       PathBuf::from(format!("{path}.kitedb"))
+    } else {
+      return Err(PyRuntimeError::new_err(
+        "Single-file databases must use the .kitedb extension",
+      ));
     };
 
     let opts = options
@@ -184,7 +173,6 @@ impl PyDatabase {
       .map_err(|e| PyRuntimeError::new_err(format!("Failed to open database: {e}")))?;
     Ok(PyDatabase {
       inner: RwLock::new(Some(DatabaseInner::SingleFile(Box::new(db)))),
-      graph_tx: std::sync::Mutex::new(None),
     })
   }
 
@@ -197,11 +185,8 @@ impl PyDatabase {
       match db {
         DatabaseInner::SingleFile(db) => close_single_file(*db)
           .map_err(|e| PyRuntimeError::new_err(format!("Failed to close: {e}")))?,
-        DatabaseInner::Graph(db) => close_graph_db(*db)
-          .map_err(|e| PyRuntimeError::new_err(format!("Failed to close: {e}")))?,
       }
     }
-    let _ = self.graph_tx.lock().map(|mut tx| tx.take());
     Ok(())
   }
 
@@ -251,31 +236,25 @@ impl PyDatabase {
   #[pyo3(signature = (read_only=None))]
   fn begin(&self, read_only: Option<bool>) -> PyResult<i64> {
     let read_only = read_only.unwrap_or(false);
-    dispatch!(
-      self,
-      |db| transaction::begin_single_file(db, read_only),
-      |db| transaction::begin_graph(db, &self.graph_tx, read_only)
-    )
+    dispatch!(self, |db| transaction::begin_single_file(db, read_only), |_db| {
+      unreachable!("multi-file database support removed")
+    })
   }
 
   fn commit(&self) -> PyResult<()> {
-    dispatch!(self, |db| transaction::commit_single_file(db), |db| {
-      transaction::commit_graph(db, &self.graph_tx)
+    dispatch!(self, |db| transaction::commit_single_file(db), |_db| {
+      unreachable!("multi-file database support removed")
     })
   }
 
   fn rollback(&self) -> PyResult<()> {
-    dispatch!(self, |db| transaction::rollback_single_file(db), |db| {
-      transaction::rollback_graph(db, &self.graph_tx)
+    dispatch!(self, |db| transaction::rollback_single_file(db), |_db| {
+      unreachable!("multi-file database support removed")
     })
   }
 
   fn has_transaction(&self) -> PyResult<bool> {
-    dispatch_ok!(self, |db| db.has_transaction(), |_db| self
-      .graph_tx
-      .lock()
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-      .is_some())
+    dispatch_ok!(self, |db| db.has_transaction(), |_db| false)
   }
 
   // ==========================================================================
@@ -287,7 +266,7 @@ impl PyDatabase {
     dispatch_tx!(
       self,
       |db| nodes::create_node_single(db, key.as_deref()),
-      |h| nodes::create_node_graph(h, key.clone())
+      |h| nodes::create_node_single(h, key.clone())
     )
   }
 
@@ -295,7 +274,7 @@ impl PyDatabase {
     dispatch_tx!(
       self,
       |db| nodes::delete_node_single(db, node_id as NodeId),
-      |h| nodes::delete_node_graph(h, node_id as NodeId)
+      |h| nodes::delete_node_single(h, node_id as NodeId)
     )
   }
 
@@ -303,13 +282,13 @@ impl PyDatabase {
     dispatch_ok!(
       self,
       |db| nodes::node_exists_single(db, node_id as NodeId),
-      |db| nodes::node_exists_graph(db, node_id as NodeId)
+      |db| nodes::node_exists_single(db, node_id as NodeId)
     )
   }
 
   fn get_node_by_key(&self, key: &str) -> PyResult<Option<i64>> {
     dispatch_ok!(self, |db| nodes::get_node_by_key_single(db, key), |db| {
-      nodes::get_node_by_key_graph(db, key)
+      nodes::get_node_by_key_single(db, key)
     })
   }
 
@@ -317,19 +296,19 @@ impl PyDatabase {
     dispatch_ok!(
       self,
       |db| nodes::get_node_key_single(db, node_id as NodeId),
-      |db| nodes::get_node_key_graph(db, node_id as NodeId)
+      |db| nodes::get_node_key_single(db, node_id as NodeId)
     )
   }
 
   fn list_nodes(&self) -> PyResult<Vec<i64>> {
     dispatch_ok!(self, |db| nodes::list_nodes_single(db), |db| {
-      nodes::list_nodes_graph(db)
+      nodes::list_nodes_single(db)
     })
   }
 
   fn count_nodes(&self) -> PyResult<i64> {
     dispatch_ok!(self, |db| nodes::count_nodes_single(db), |db| {
-      nodes::count_nodes_graph(db)
+      nodes::count_nodes_single(db)
     })
   }
 
@@ -337,7 +316,7 @@ impl PyDatabase {
     dispatch_ok!(
       self,
       |db| nodes::list_nodes_with_prefix_single(db, prefix),
-      |db| nodes::list_nodes_with_prefix_graph(db, prefix)
+      |db| nodes::list_nodes_with_prefix_single(db, prefix)
     )
   }
 
@@ -345,7 +324,7 @@ impl PyDatabase {
     dispatch_ok!(
       self,
       |db| nodes::count_nodes_with_prefix_single(db, prefix),
-      |db| nodes::count_nodes_with_prefix_graph(db, prefix)
+      |db| nodes::count_nodes_with_prefix_single(db, prefix)
     )
   }
 
@@ -387,17 +366,6 @@ impl PyDatabase {
           }
         }
       }
-      Some(DatabaseInner::Graph(db)) => transaction::with_graph_tx(db, &self.graph_tx, |h| {
-        let mut ids = Vec::with_capacity(input_nodes.len());
-        for (key, props) in &input_nodes {
-          let id = nodes::create_node_graph(h, Some(key.clone()))?;
-          for (k, v) in props {
-            properties::set_node_prop_graph(h, id as NodeId, *k as PropKeyId, v.clone().into())?;
-          }
-          ids.push(id);
-        }
-        Ok(ids)
-      }),
       None => Err(PyRuntimeError::new_err("Database is closed")),
     }
   }
@@ -411,7 +379,7 @@ impl PyDatabase {
     dispatch_tx!(
       self,
       |db| nodes::upsert_node_single(db, &key, &core_props),
-      |h| nodes::upsert_node_graph(h, &key, &core_props)
+      |h| nodes::upsert_node_single(h, &key, &core_props)
     )
   }
 
@@ -424,7 +392,7 @@ impl PyDatabase {
     dispatch_tx!(
       self,
       |db| nodes::upsert_node_by_id_single(db, node_id as NodeId, &core_props),
-      |h| nodes::upsert_node_by_id_graph(h, node_id as NodeId, &core_props)
+      |h| nodes::upsert_node_by_id_single(h, node_id as NodeId, &core_props)
     )
   }
 
@@ -436,7 +404,7 @@ impl PyDatabase {
     dispatch_tx!(
       self,
       |db| edges::add_edge_single(db, src as NodeId, etype as ETypeId, dst as NodeId),
-      |h| edges::add_edge_graph(h, src as NodeId, etype as ETypeId, dst as NodeId)
+      |h| edges::add_edge_single(h, src as NodeId, etype as ETypeId, dst as NodeId)
     )
   }
 
@@ -449,12 +417,6 @@ impl PyDatabase {
       Some(DatabaseInner::SingleFile(db)) => {
         edges::add_edge_by_name_single(db, src as NodeId, etype_name, dst as NodeId)
       }
-      Some(DatabaseInner::Graph(db)) => {
-        let etype = db.get_or_create_etype(etype_name);
-        transaction::with_graph_tx(db, &self.graph_tx, |h| {
-          edges::add_edge_graph(h, src as NodeId, etype as ETypeId, dst as NodeId)
-        })
-      }
       None => Err(PyRuntimeError::new_err("Database is closed")),
     }
   }
@@ -463,7 +425,7 @@ impl PyDatabase {
     dispatch_tx!(
       self,
       |db| edges::delete_edge_single(db, src as NodeId, etype as ETypeId, dst as NodeId),
-      |h| edges::delete_edge_graph(h, src as NodeId, etype as ETypeId, dst as NodeId)
+      |h| edges::delete_edge_single(h, src as NodeId, etype as ETypeId, dst as NodeId)
     )
   }
 
@@ -488,7 +450,7 @@ impl PyDatabase {
         dst as NodeId,
         &core_props
       ),
-      |h| edges::upsert_edge_graph(
+      |h| edges::upsert_edge_single(
         h,
         src as NodeId,
         etype as ETypeId,
@@ -502,7 +464,7 @@ impl PyDatabase {
     dispatch_ok!(
       self,
       |db| edges::edge_exists_single(db, src as NodeId, etype as ETypeId, dst as NodeId),
-      |db| edges::edge_exists_graph(db, src as NodeId, etype as ETypeId, dst as NodeId)
+      |db| edges::edge_exists_single(db, src as NodeId, etype as ETypeId, dst as NodeId)
     )
   }
 
@@ -510,7 +472,7 @@ impl PyDatabase {
     dispatch_ok!(
       self,
       |db| edges::get_out_edges_single(db, node_id as NodeId),
-      |db| edges::get_out_edges_graph(db, node_id as NodeId)
+      |db| edges::get_out_edges_single(db, node_id as NodeId)
     )
   }
 
@@ -518,7 +480,7 @@ impl PyDatabase {
     dispatch_ok!(
       self,
       |db| edges::get_in_edges_single(db, node_id as NodeId),
-      |db| edges::get_in_edges_graph(db, node_id as NodeId)
+      |db| edges::get_in_edges_single(db, node_id as NodeId)
     )
   }
 
@@ -526,7 +488,7 @@ impl PyDatabase {
     dispatch_ok!(
       self,
       |db| edges::get_out_degree_single(db, node_id as NodeId),
-      |db| edges::get_out_degree_graph(db, node_id as NodeId)
+      |db| edges::get_out_degree_single(db, node_id as NodeId)
     )
   }
 
@@ -534,13 +496,13 @@ impl PyDatabase {
     dispatch_ok!(
       self,
       |db| edges::get_in_degree_single(db, node_id as NodeId),
-      |db| edges::get_in_degree_graph(db, node_id as NodeId)
+      |db| edges::get_in_degree_single(db, node_id as NodeId)
     )
   }
 
   fn count_edges(&self) -> PyResult<i64> {
     dispatch_ok!(self, |db| edges::count_edges_single(db), |db| {
-      edges::count_edges_graph(db, None)
+      edges::count_edges_single(db, None)
     })
   }
 
@@ -548,7 +510,7 @@ impl PyDatabase {
     dispatch_ok!(
       self,
       |db| edges::count_edges_by_type_single(db, etype as ETypeId),
-      |db| edges::count_edges_graph(db, Some(etype as ETypeId))
+      |db| edges::count_edges_single(db, Some(etype as ETypeId))
     )
   }
 
@@ -557,7 +519,7 @@ impl PyDatabase {
     dispatch_ok!(
       self,
       |db| edges::list_edges_single(db, etype.map(|e| e as ETypeId)),
-      |db| edges::list_edges_graph(db, etype.map(|e| e as ETypeId))
+      |db| edges::list_edges_single(db, etype.map(|e| e as ETypeId))
     )
   }
 
@@ -574,7 +536,7 @@ impl PyDatabase {
         key_id as PropKeyId,
         value.into()
       ),
-      |h| properties::set_node_prop_graph(
+      |h| properties::set_node_prop_single(
         h,
         node_id as NodeId,
         key_id as PropKeyId,
@@ -592,17 +554,6 @@ impl PyDatabase {
       Some(DatabaseInner::SingleFile(db)) => {
         properties::set_node_prop_by_name_single(db, node_id as NodeId, key_name, value.into())
       }
-      Some(DatabaseInner::Graph(db)) => {
-        let key_id = db.get_or_create_propkey(key_name);
-        transaction::with_graph_tx(db, &self.graph_tx, |h| {
-          properties::set_node_prop_graph(
-            h,
-            node_id as NodeId,
-            key_id as PropKeyId,
-            value.clone().into(),
-          )
-        })
-      }
       None => Err(PyRuntimeError::new_err("Database is closed")),
     }
   }
@@ -611,7 +562,7 @@ impl PyDatabase {
     dispatch_ok!(
       self,
       |db| properties::get_node_prop_single(db, node_id as NodeId, key_id as PropKeyId),
-      |db| properties::get_node_prop_graph(db, node_id as NodeId, key_id as PropKeyId)
+      |db| properties::get_node_prop_single(db, node_id as NodeId, key_id as PropKeyId)
     )
   }
 
@@ -619,7 +570,7 @@ impl PyDatabase {
     dispatch_tx!(
       self,
       |db| properties::delete_node_prop_single(db, node_id as NodeId, key_id as PropKeyId),
-      |h| properties::delete_node_prop_graph(h, node_id as NodeId, key_id as PropKeyId)
+      |h| properties::delete_node_prop_single(h, node_id as NodeId, key_id as PropKeyId)
     )
   }
 
@@ -627,7 +578,7 @@ impl PyDatabase {
     dispatch_ok!(
       self,
       |db| properties::get_node_props_single(db, node_id as NodeId),
-      |db| properties::get_node_props_graph(db, node_id as NodeId)
+      |db| properties::get_node_props_single(db, node_id as NodeId)
     )
   }
 
@@ -649,7 +600,7 @@ impl PyDatabase {
         key_id as PropKeyId,
         value.into()
       ),
-      |h| properties::set_edge_prop_graph(
+      |h| properties::set_edge_prop_single(
         h,
         src as NodeId,
         etype as ETypeId,
@@ -681,19 +632,6 @@ impl PyDatabase {
         key_name,
         value.into(),
       ),
-      Some(DatabaseInner::Graph(db)) => {
-        let key_id = db.get_or_create_propkey(key_name);
-        transaction::with_graph_tx(db, &self.graph_tx, |h| {
-          properties::set_edge_prop_graph(
-            h,
-            src as NodeId,
-            etype as ETypeId,
-            dst as NodeId,
-            key_id as PropKeyId,
-            value.clone().into(),
-          )
-        })
-      }
       None => Err(PyRuntimeError::new_err("Database is closed")),
     }
   }
@@ -714,7 +652,7 @@ impl PyDatabase {
         dst as NodeId,
         key_id as PropKeyId
       ),
-      |db| properties::get_edge_prop_graph(
+      |db| properties::get_edge_prop_single(
         db,
         src as NodeId,
         etype as ETypeId,
@@ -734,7 +672,7 @@ impl PyDatabase {
         dst as NodeId,
         key_id as PropKeyId
       ),
-      |h| properties::delete_edge_prop_graph(
+      |h| properties::delete_edge_prop_single(
         h,
         src as NodeId,
         etype as ETypeId,
@@ -748,7 +686,7 @@ impl PyDatabase {
     dispatch_ok!(
       self,
       |db| properties::get_edge_props_single(db, src as NodeId, etype as ETypeId, dst as NodeId),
-      |db| properties::get_edge_props_graph(db, src as NodeId, etype as ETypeId, dst as NodeId)
+      |db| properties::get_edge_props_single(db, src as NodeId, etype as ETypeId, dst as NodeId)
     )
   }
 
@@ -757,7 +695,7 @@ impl PyDatabase {
     dispatch_ok!(
       self,
       |db| properties::get_node_prop_string_single(db, node_id as NodeId, key_id as PropKeyId),
-      |db| properties::get_node_prop_string_graph(db, node_id as NodeId, key_id as PropKeyId)
+      |db| properties::get_node_prop_string_single(db, node_id as NodeId, key_id as PropKeyId)
     )
   }
 
@@ -765,7 +703,7 @@ impl PyDatabase {
     dispatch_ok!(
       self,
       |db| properties::get_node_prop_int_single(db, node_id as NodeId, key_id as PropKeyId),
-      |db| properties::get_node_prop_int_graph(db, node_id as NodeId, key_id as PropKeyId)
+      |db| properties::get_node_prop_int_single(db, node_id as NodeId, key_id as PropKeyId)
     )
   }
 
@@ -773,7 +711,7 @@ impl PyDatabase {
     dispatch_ok!(
       self,
       |db| properties::get_node_prop_float_single(db, node_id as NodeId, key_id as PropKeyId),
-      |db| properties::get_node_prop_float_graph(db, node_id as NodeId, key_id as PropKeyId)
+      |db| properties::get_node_prop_float_single(db, node_id as NodeId, key_id as PropKeyId)
     )
   }
 
@@ -781,7 +719,7 @@ impl PyDatabase {
     dispatch_ok!(
       self,
       |db| properties::get_node_prop_bool_single(db, node_id as NodeId, key_id as PropKeyId),
-      |db| properties::get_node_prop_bool_graph(db, node_id as NodeId, key_id as PropKeyId)
+      |db| properties::get_node_prop_bool_single(db, node_id as NodeId, key_id as PropKeyId)
     )
   }
 
@@ -793,19 +731,19 @@ impl PyDatabase {
     dispatch_ok!(
       self,
       |db| schema::get_or_create_label_single(db, name),
-      |db| schema::get_or_create_label_graph(db, name)
+      |db| schema::get_or_create_label_single(db, name)
     )
   }
 
   fn get_label_id(&self, name: &str) -> PyResult<Option<u32>> {
     dispatch_ok!(self, |db| schema::get_label_id_single(db, name), |db| {
-      schema::get_label_id_graph(db, name)
+      schema::get_label_id_single(db, name)
     })
   }
 
   fn get_label_name(&self, id: u32) -> PyResult<Option<String>> {
     dispatch_ok!(self, |db| schema::get_label_name_single(db, id), |db| {
-      schema::get_label_name_graph(db, id)
+      schema::get_label_name_single(db, id)
     })
   }
 
@@ -813,19 +751,19 @@ impl PyDatabase {
     dispatch_ok!(
       self,
       |db| schema::get_or_create_etype_single(db, name),
-      |db| schema::get_or_create_etype_graph(db, name)
+      |db| schema::get_or_create_etype_single(db, name)
     )
   }
 
   fn get_etype_id(&self, name: &str) -> PyResult<Option<u32>> {
     dispatch_ok!(self, |db| schema::get_etype_id_single(db, name), |db| {
-      schema::get_etype_id_graph(db, name)
+      schema::get_etype_id_single(db, name)
     })
   }
 
   fn get_etype_name(&self, id: u32) -> PyResult<Option<String>> {
     dispatch_ok!(self, |db| schema::get_etype_name_single(db, id), |db| {
-      schema::get_etype_name_graph(db, id)
+      schema::get_etype_name_single(db, id)
     })
   }
 
@@ -833,19 +771,19 @@ impl PyDatabase {
     dispatch_ok!(
       self,
       |db| schema::get_or_create_propkey_single(db, name),
-      |db| schema::get_or_create_propkey_graph(db, name)
+      |db| schema::get_or_create_propkey_single(db, name)
     )
   }
 
   fn get_propkey_id(&self, name: &str) -> PyResult<Option<u32>> {
     dispatch_ok!(self, |db| schema::get_propkey_id_single(db, name), |db| {
-      schema::get_propkey_id_graph(db, name)
+      schema::get_propkey_id_single(db, name)
     })
   }
 
   fn get_propkey_name(&self, id: u32) -> PyResult<Option<String>> {
     dispatch_ok!(self, |db| schema::get_propkey_name_single(db, id), |db| {
-      schema::get_propkey_name_graph(db, id)
+      schema::get_propkey_name_single(db, id)
     })
   }
 
@@ -855,7 +793,7 @@ impl PyDatabase {
 
   fn define_label(&self, name: &str) -> PyResult<u32> {
     dispatch_tx!(self, |db| labels::define_label_single(db, name), |h| {
-      labels::define_label_graph(h, name)
+      labels::define_label_single(h, name)
     })
   }
 
@@ -863,7 +801,7 @@ impl PyDatabase {
     dispatch_tx!(
       self,
       |db| labels::add_node_label_single(db, node_id as NodeId, label_id),
-      |h| labels::add_node_label_graph(h, node_id as NodeId, label_id)
+      |h| labels::add_node_label_single(h, node_id as NodeId, label_id)
     )
   }
 
@@ -876,12 +814,6 @@ impl PyDatabase {
       Some(DatabaseInner::SingleFile(db)) => {
         labels::add_node_label_by_name_single(db, node_id as NodeId, label_name)
       }
-      Some(DatabaseInner::Graph(db)) => {
-        let label_id = db.get_or_create_label(label_name);
-        transaction::with_graph_tx(db, &self.graph_tx, |h| {
-          labels::add_node_label_graph(h, node_id as NodeId, label_id)
-        })
-      }
       None => Err(PyRuntimeError::new_err("Database is closed")),
     }
   }
@@ -890,7 +822,7 @@ impl PyDatabase {
     dispatch_tx!(
       self,
       |db| labels::remove_node_label_single(db, node_id as NodeId, label_id),
-      |h| labels::remove_node_label_graph(h, node_id as NodeId, label_id)
+      |h| labels::remove_node_label_single(h, node_id as NodeId, label_id)
     )
   }
 
@@ -898,7 +830,7 @@ impl PyDatabase {
     dispatch_ok!(
       self,
       |db| labels::node_has_label_single(db, node_id as NodeId, label_id),
-      |db| labels::node_has_label_graph(db, node_id as NodeId, label_id)
+      |db| labels::node_has_label_single(db, node_id as NodeId, label_id)
     )
   }
 
@@ -906,7 +838,7 @@ impl PyDatabase {
     dispatch_ok!(
       self,
       |db| labels::get_node_labels_single(db, node_id as NodeId),
-      |db| labels::get_node_labels_graph(db, node_id as NodeId)
+      |db| labels::get_node_labels_single(db, node_id as NodeId)
     )
   }
 
@@ -919,7 +851,7 @@ impl PyDatabase {
     dispatch_tx!(
       self,
       |db| vectors::set_node_vector_single(db, node_id as NodeId, prop_key_id as PropKeyId, &v),
-      |h| vectors::set_node_vector_graph(h, node_id as NodeId, prop_key_id as PropKeyId, &v)
+      |h| vectors::set_node_vector_single(h, node_id as NodeId, prop_key_id as PropKeyId, &v)
     )
   }
 
@@ -927,7 +859,7 @@ impl PyDatabase {
     dispatch_ok!(
       self,
       |db| vectors::get_node_vector_single(db, node_id as NodeId, prop_key_id as PropKeyId),
-      |db| vectors::get_node_vector_graph(db, node_id as NodeId, prop_key_id as PropKeyId)
+      |db| vectors::get_node_vector_single(db, node_id as NodeId, prop_key_id as PropKeyId)
     )
   }
 
@@ -935,7 +867,7 @@ impl PyDatabase {
     dispatch_tx!(
       self,
       |db| vectors::delete_node_vector_single(db, node_id as NodeId, prop_key_id as PropKeyId),
-      |h| vectors::delete_node_vector_graph(h, node_id as NodeId, prop_key_id as PropKeyId)
+      |h| vectors::delete_node_vector_single(h, node_id as NodeId, prop_key_id as PropKeyId)
     )
   }
 
@@ -943,7 +875,7 @@ impl PyDatabase {
     dispatch_ok!(
       self,
       |db| vectors::has_node_vector_single(db, node_id as NodeId, prop_key_id as PropKeyId),
-      |db| vectors::has_node_vector_graph(db, node_id as NodeId, prop_key_id as PropKeyId)
+      |db| vectors::has_node_vector_single(db, node_id as NodeId, prop_key_id as PropKeyId)
     )
   }
 
@@ -956,7 +888,7 @@ impl PyDatabase {
     dispatch_ok!(
       self,
       |db| graph_traversal::traverse_out_single(db, node_id as NodeId, etype),
-      |db| graph_traversal::traverse_out_graph(db, node_id as NodeId, etype)
+      |db| graph_traversal::traverse_out_single(db, node_id as NodeId, etype)
     )
   }
 
@@ -969,7 +901,7 @@ impl PyDatabase {
     dispatch_ok!(
       self,
       |db| graph_traversal::traverse_out_with_keys_single(db, node_id as NodeId, etype),
-      |db| graph_traversal::traverse_out_with_keys_graph(db, node_id as NodeId, etype)
+      |db| graph_traversal::traverse_out_with_keys_single(db, node_id as NodeId, etype)
     )
   }
 
@@ -978,7 +910,7 @@ impl PyDatabase {
     dispatch_ok!(
       self,
       |db| graph_traversal::traverse_out_count_single(db, node_id as NodeId, etype),
-      |db| graph_traversal::traverse_out_count_graph(db, node_id as NodeId, etype)
+      |db| graph_traversal::traverse_out_count_single(db, node_id as NodeId, etype)
     )
   }
 
@@ -987,7 +919,7 @@ impl PyDatabase {
     dispatch_ok!(
       self,
       |db| graph_traversal::traverse_in_single(db, node_id as NodeId, etype),
-      |db| graph_traversal::traverse_in_graph(db, node_id as NodeId, etype)
+      |db| graph_traversal::traverse_in_single(db, node_id as NodeId, etype)
     )
   }
 
@@ -1000,7 +932,7 @@ impl PyDatabase {
     dispatch_ok!(
       self,
       |db| graph_traversal::traverse_in_with_keys_single(db, node_id as NodeId, etype),
-      |db| graph_traversal::traverse_in_with_keys_graph(db, node_id as NodeId, etype)
+      |db| graph_traversal::traverse_in_with_keys_single(db, node_id as NodeId, etype)
     )
   }
 
@@ -1009,7 +941,7 @@ impl PyDatabase {
     dispatch_ok!(
       self,
       |db| graph_traversal::traverse_in_count_single(db, node_id as NodeId, etype),
-      |db| graph_traversal::traverse_in_count_graph(db, node_id as NodeId, etype)
+      |db| graph_traversal::traverse_in_count_single(db, node_id as NodeId, etype)
     )
   }
 
@@ -1021,7 +953,7 @@ impl PyDatabase {
     dispatch_ok!(
       self,
       |db| graph_traversal::traverse_multi_single(db, start_ids.clone(), steps.clone()),
-      |db| graph_traversal::traverse_multi_graph(db, start_ids.clone(), steps.clone())
+      |db| graph_traversal::traverse_multi_single(db, start_ids.clone(), steps.clone())
     )
   }
 
@@ -1033,7 +965,7 @@ impl PyDatabase {
     dispatch_ok!(
       self,
       |db| graph_traversal::traverse_multi_count_single(db, start_ids.clone(), steps.clone()),
-      |db| graph_traversal::traverse_multi_count_graph(db, start_ids.clone(), steps.clone())
+      |db| graph_traversal::traverse_multi_count_single(db, start_ids.clone(), steps.clone())
     )
   }
 
@@ -1058,7 +990,7 @@ impl PyDatabase {
         direction.clone(),
         unique
       ),
-      |db| graph_traversal::traverse_graph(
+      |db| graph_traversal::traverse_single(
         db,
         node_id as NodeId,
         max_depth,
@@ -1089,7 +1021,7 @@ impl PyDatabase {
         max_depth,
         direction.clone()
       ),
-      |db| graph_traversal::find_path_bfs_graph(
+      |db| graph_traversal::find_path_bfs_single(
         db,
         source as NodeId,
         target as NodeId,
@@ -1119,7 +1051,7 @@ impl PyDatabase {
         max_depth,
         direction.clone()
       ),
-      |db| graph_traversal::find_path_dijkstra_graph(
+      |db| graph_traversal::find_path_dijkstra_single(
         db,
         source as NodeId,
         target as NodeId,
@@ -1149,7 +1081,7 @@ impl PyDatabase {
         max_depth,
         direction.clone()
       ),
-      |db| graph_traversal::find_path_bfs_graph(
+      |db| graph_traversal::find_path_bfs_single(
         db,
         source as NodeId,
         target as NodeId,
@@ -1177,7 +1109,7 @@ impl PyDatabase {
         direction.clone(),
         unique
       ),
-      |db| graph_traversal::traverse_graph(
+      |db| graph_traversal::traverse_single(
         db,
         source as NodeId,
         max_depth,
@@ -1226,7 +1158,7 @@ impl PyDatabase {
         };
         maintenance::optimize_single(db, opts)
       },
-      |db| maintenance::optimize_graph(db)
+      |db| maintenance::optimize_single(db)
     )
   }
 
@@ -1246,16 +1178,15 @@ impl PyDatabase {
   }
 
   fn stats(&self) -> PyResult<DbStats> {
-    dispatch_ok!(self, |db| maintenance::stats_single(db), |db| graph_stats(
-      db
-    ))
+    dispatch_ok!(self, |db| maintenance::stats_single(db), |_db| {
+      unreachable!("multi-file database support removed")
+    })
   }
 
   fn check(&self) -> PyResult<CheckResult> {
-    dispatch_ok!(self, |db| maintenance::check_single(db), |db| graph_check(
-      db
-    )
-    .into())
+    dispatch_ok!(self, |db| maintenance::check_single(db), |_db| {
+      unreachable!("multi-file database support removed")
+    })
   }
 
   // ==========================================================================
@@ -1373,7 +1304,7 @@ impl PyDatabase {
     dispatch_ok!(
       self,
       |db| streaming_ops::stream_nodes_single(db, opts.clone()),
-      |db| streaming_ops::stream_nodes_graph(db, opts.clone())
+      |db| streaming_ops::stream_nodes_single(db, opts.clone())
     )
   }
 
@@ -1389,7 +1320,7 @@ impl PyDatabase {
     dispatch_ok!(
       self,
       |db| streaming_ops::stream_nodes_with_props_single(db, opts.clone()),
-      |db| streaming_ops::stream_nodes_with_props_graph(db, opts.clone())
+      |db| streaming_ops::stream_nodes_with_props_single(db, opts.clone())
     )
   }
 
@@ -1402,7 +1333,7 @@ impl PyDatabase {
     dispatch_ok!(
       self,
       |db| streaming_ops::stream_edges_single(db, opts.clone()),
-      |db| streaming_ops::stream_edges_graph(db, opts.clone())
+      |db| streaming_ops::stream_edges_single(db, opts.clone())
     )
   }
 
@@ -1418,7 +1349,7 @@ impl PyDatabase {
     dispatch_ok!(
       self,
       |db| streaming_ops::stream_edges_with_props_single(db, opts.clone()),
-      |db| streaming_ops::stream_edges_with_props_graph(db, opts.clone())
+      |db| streaming_ops::stream_edges_with_props_single(db, opts.clone())
     )
   }
 
@@ -1431,7 +1362,7 @@ impl PyDatabase {
     dispatch_ok!(
       self,
       |db| streaming_ops::get_nodes_page_single(db, opts.clone()),
-      |db| streaming_ops::get_nodes_page_graph(db, opts.clone())
+      |db| streaming_ops::get_nodes_page_single(db, opts.clone())
     )
   }
 
@@ -1444,7 +1375,7 @@ impl PyDatabase {
     dispatch_ok!(
       self,
       |db| streaming_ops::get_edges_page_single(db, opts.clone()),
-      |db| streaming_ops::get_edges_page_graph(db, opts.clone())
+      |db| streaming_ops::get_edges_page_single(db, opts.clone())
     )
   }
 
@@ -1458,7 +1389,7 @@ impl PyDatabase {
     dispatch!(
       self,
       |db| export_import::export_to_json_single(db, path.clone(), opts.clone()),
-      |db| export_import::export_to_json_graph(db, path.clone(), opts.clone())
+      |db| export_import::export_to_json_single(db, path.clone(), opts.clone())
     )
   }
 
@@ -1472,7 +1403,7 @@ impl PyDatabase {
     dispatch!(
       self,
       |db| export_import::export_to_jsonl_single(db, path.clone(), opts.clone()),
-      |db| export_import::export_to_jsonl_graph(db, path.clone(), opts.clone())
+      |db| export_import::export_to_jsonl_single(db, path.clone(), opts.clone())
     )
   }
 
@@ -1486,7 +1417,7 @@ impl PyDatabase {
     dispatch!(
       self,
       |db| export_import::import_from_json_single(db, path.clone(), opts.clone()),
-      |db| export_import::import_from_json_graph(db, path.clone(), opts.clone())
+      |db| export_import::import_from_json_single(db, path.clone(), opts.clone())
     )
   }
 }
@@ -1511,9 +1442,6 @@ pub fn collect_metrics(db: &PyDatabase) -> PyResult<DatabaseMetrics> {
     Some(DatabaseInner::SingleFile(d)) => Ok(DatabaseMetrics::from(
       core_metrics::collect_metrics_single_file(d),
     )),
-    Some(DatabaseInner::Graph(d)) => Ok(DatabaseMetrics::from(
-      core_metrics::collect_metrics_graph(d),
-    )),
     None => Err(PyRuntimeError::new_err("Database is closed")),
   }
 }
@@ -1528,9 +1456,6 @@ pub fn health_check(db: &PyDatabase) -> PyResult<HealthCheckResult> {
     Some(DatabaseInner::SingleFile(d)) => Ok(HealthCheckResult::from(
       core_metrics::health_check_single_file(d),
     )),
-    Some(DatabaseInner::Graph(d)) => {
-      Ok(HealthCheckResult::from(core_metrics::health_check_graph(d)))
-    }
     None => Err(PyRuntimeError::new_err("Database is closed")),
   }
 }
@@ -1550,9 +1475,6 @@ pub fn create_backup(
     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
   match guard.as_ref() {
     Some(DatabaseInner::SingleFile(d)) => core_backup::create_backup_single_file(d, &path, opts)
-      .map(BackupResult::from)
-      .map_err(|e| PyRuntimeError::new_err(e.to_string())),
-    Some(DatabaseInner::Graph(d)) => core_backup::create_backup_graph(d, &path, opts)
       .map(BackupResult::from)
       .map_err(|e| PyRuntimeError::new_err(e.to_string())),
     None => Err(PyRuntimeError::new_err("Database is closed")),

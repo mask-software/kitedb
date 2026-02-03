@@ -39,6 +39,9 @@ bench/results/
 
 # Local tooling / build artifacts
 .cursor/
+.agents/
+.codex/
+.opencode/
 ray-docs/.vercel/
 
 # Python artifacts

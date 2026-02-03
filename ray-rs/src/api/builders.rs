@@ -4,6 +4,7 @@
 //!
 //! Ported from src/api/builders.ts
 
+use crate::error::{KiteError, Result};
 use crate::types::{ETypeId, NodeId, PropKeyId, PropValue};
 use std::collections::HashMap;
 
@@ -159,11 +160,11 @@ where
   }
 
   /// Execute the update
-  pub fn execute(self) -> R {
-    let node_id = self
-      .node_id
-      .expect("Update requires a node ID (use where_id())");
-    (self.executor)(node_id, self.updates)
+  pub fn execute(self) -> Result<R> {
+    let node_id = self.node_id.ok_or_else(|| {
+      KiteError::InvalidQuery("Update requires a node ID (use where_id())".into())
+    })?;
+    Ok((self.executor)(node_id, self.updates))
   }
 }
 
@@ -201,11 +202,11 @@ where
   }
 
   /// Execute the delete
-  pub fn execute(self) -> R {
-    let node_id = self
-      .node_id
-      .expect("Delete requires a node ID (use where_id())");
-    (self.executor)(node_id)
+  pub fn execute(self) -> Result<R> {
+    let node_id = self.node_id.ok_or_else(|| {
+      KiteError::InvalidQuery("Delete requires a node ID (use where_id())".into())
+    })?;
+    Ok((self.executor)(node_id))
   }
 }
 
@@ -258,9 +259,11 @@ where
   }
 
   /// Execute the link
-  pub fn execute(self) -> R {
-    let dst = self.dst.expect("Link requires a destination (use to())");
-    (self.executor)(self.src, self.etype, dst, self.props)
+  pub fn execute(self) -> Result<R> {
+    let dst = self
+      .dst
+      .ok_or_else(|| KiteError::InvalidQuery("Link requires a destination (use to())".into()))?;
+    Ok((self.executor)(self.src, self.etype, dst, self.props))
   }
 }
 
@@ -304,11 +307,11 @@ where
   }
 
   /// Execute the unlink
-  pub fn execute(self) -> R {
-    let dst = self
-      .dst
-      .expect("Unlink requires a destination (use from_node())");
-    (self.executor)(self.src, self.etype, dst)
+  pub fn execute(self) -> Result<R> {
+    let dst = self.dst.ok_or_else(|| {
+      KiteError::InvalidQuery("Unlink requires a destination (use from_node())".into())
+    })?;
+    Ok((self.executor)(self.src, self.etype, dst))
   }
 }
 
@@ -557,7 +560,8 @@ mod tests {
       .where_id(42)
       .set(1, PropValue::String("Updated".to_string()))
       .unset(2)
-      .execute();
+      .execute()
+      .unwrap();
 
     let (node_id, updates) = captured.unwrap();
     assert_eq!(node_id, 42);
@@ -575,7 +579,10 @@ mod tests {
       true
     };
 
-    let result = DeleteBuilder::new(&mut executor).where_id(42).execute();
+    let result = DeleteBuilder::new(&mut executor)
+      .where_id(42)
+      .execute()
+      .unwrap();
 
     assert!(result);
     assert_eq!(deleted_id, Some(42));
@@ -592,7 +599,8 @@ mod tests {
     LinkBuilder::new(1, 10, &mut executor)
       .to(2)
       .with_prop(100, PropValue::F64(1.5))
-      .execute();
+      .execute()
+      .unwrap();
 
     let (src, etype, dst, props) = captured.unwrap();
     assert_eq!(src, 1);
@@ -612,7 +620,8 @@ mod tests {
 
     let result = UnlinkBuilder::new(1, 10, &mut executor)
       .from_node(2)
-      .execute();
+      .execute()
+      .unwrap();
 
     assert!(result);
     let (src, etype, dst) = captured.unwrap();

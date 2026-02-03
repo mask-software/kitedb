@@ -20,8 +20,14 @@ impl DbHeaderV1 {
 
     // Verify magic
     if data[0..16] != MAGIC_KITEDB {
+      let expected = u32::from_le_bytes([
+        MAGIC_KITEDB[0],
+        MAGIC_KITEDB[1],
+        MAGIC_KITEDB[2],
+        MAGIC_KITEDB[3],
+      ]);
       return Err(KiteError::InvalidMagic {
-        expected: u32::from_le_bytes(MAGIC_KITEDB[0..4].try_into().unwrap()),
+        expected,
         got: read_u32(data, 0),
       });
     }

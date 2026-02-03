@@ -1,5 +1,7 @@
 # KiteDB Rust Implementation Plan
 
+> Note: The directory-based GraphDB (multi-file) engine has been removed. KiteDB is single-file (`.kitedb`) only; GraphDB/multi-file references below are historical.
+
 A comprehensive plan to port KiteDB (TypeScript/Bun embedded graph database) to Rust, maintaining feature parity while leveraging Rust's strengths.
 
 ## Table of Contents

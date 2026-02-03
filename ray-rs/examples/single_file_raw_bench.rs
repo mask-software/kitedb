@@ -133,7 +133,7 @@ struct LatencyStats {
   p99: u128,
 }
 
-fn compute_stats(samples: &mut Vec<u128>) -> LatencyStats {
+fn compute_stats(samples: &mut [u128]) -> LatencyStats {
   if samples.is_empty() {
     return LatencyStats {
       count: 0,
@@ -177,13 +177,11 @@ fn format_latency(ns: u128) -> String {
 fn format_number(n: usize) -> String {
   let s = n.to_string();
   let mut out = String::new();
-  let mut count = 0;
-  for ch in s.chars().rev() {
+  for (count, ch) in s.chars().rev().enumerate() {
     if count > 0 && count % 3 == 0 {
       out.push(',');
     }
     out.push(ch);
-    count += 1;
   }
   out.chars().rev().collect()
 }

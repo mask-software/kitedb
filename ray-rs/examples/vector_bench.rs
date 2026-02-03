@@ -107,7 +107,7 @@ fn parse_args() -> BenchConfig {
     let default_path = Path::new("..")
       .join("bench")
       .join("results")
-      .join(format!("benchmark-vector-rust-{}.txt", timestamp));
+      .join(format!("benchmark-vector-rust-{timestamp}.txt"));
     config.output_file = Some(default_path);
   }
 
@@ -132,7 +132,7 @@ impl Logger {
   }
 
   fn log(&mut self, message: &str) {
-    println!("{}", message);
+    println!("{message}");
     self.buffer.push(message.to_string());
   }
 
@@ -190,7 +190,7 @@ fn latency_stats(samples: &[u128]) -> LatencyStats {
 
 fn format_latency(ns: u128) -> String {
   if ns < 1_000 {
-    format!("{}ns", ns)
+    format!("{ns}ns")
   } else if ns < 1_000_000 {
     format!("{:.2}us", ns as f64 / 1_000.0)
   } else {
@@ -334,7 +334,7 @@ fn main() {
   logger.log(&format!("    Metric: {:?}", stats.metric));
   logger.log(&format!("    Index trained: {}", stats.index_trained));
   if let Some(clusters) = stats.index_clusters {
-    logger.log(&format!("    Index clusters: {}", clusters));
+    logger.log(&format!("    Index clusters: {clusters}"));
   }
 
   logger.log(&format!("\n{}", "=".repeat(120)));

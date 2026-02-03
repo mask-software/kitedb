@@ -5,7 +5,8 @@
 //! Ported from src/mvcc/conflict-detector.ts
 
 use crate::mvcc::tx_manager::TxManager;
-use crate::types::{MvccTxStatus, TxId};
+use crate::types::{MvccTxStatus, TxId, TxKey};
+use std::collections::HashSet;
 
 // ============================================================================
 // Conflict Error
@@ -90,26 +91,23 @@ impl ConflictDetector {
     }
 
     let tx_snapshot_ts = tx.start_ts;
-    let mut conflicts = Vec::new();
+    let mut conflicts: HashSet<String> = HashSet::new();
 
     // Check read-write conflicts
     for read_key in &tx.read_set {
       if tx_manager.has_conflicting_write(read_key, tx_snapshot_ts) {
-        conflicts.push(read_key.clone());
+        conflicts.insert(read_key.to_string());
       }
     }
 
     // Check write-write conflicts
     for write_key in &tx.write_set {
       if tx_manager.has_conflicting_write(write_key, tx_snapshot_ts) {
-        // Avoid duplicates (key might be in both read and write set)
-        if !conflicts.contains(write_key) {
-          conflicts.push(write_key.clone());
-        }
+        conflicts.insert(write_key.to_string());
       }
     }
 
-    conflicts
+    conflicts.into_iter().collect()
   }
 
   /// Check if a transaction has any conflicts (fast path, no allocations)
@@ -153,7 +151,7 @@ impl ConflictDetector {
   }
 
   /// Check for a specific key conflict
-  pub fn check_key_conflict(&self, tx_manager: &TxManager, txid: TxId, key: &str) -> bool {
+  pub fn check_key_conflict(&self, tx_manager: &TxManager, txid: TxId, key: &TxKey) -> bool {
     let tx = match tx_manager.get_tx(txid) {
       Some(tx) => tx,
       None => return false,
@@ -216,7 +214,7 @@ impl ConflictDetector {
     for read_key in &tx.read_set {
       if let Some(write_ts) = tx_manager.get_committed_write_ts(read_key, tx_snapshot_ts) {
         conflicts.push(ConflictInfo {
-          key: read_key.clone(),
+          key: read_key.to_string(),
           conflict_type: ConflictType::ReadWrite,
           conflicting_write_ts: write_ts,
         });
@@ -231,7 +229,7 @@ impl ConflictDetector {
       }
       if let Some(write_ts) = tx_manager.get_committed_write_ts(write_key, tx_snapshot_ts) {
         conflicts.push(ConflictInfo {
-          key: write_key.clone(),
+          key: write_key.to_string(),
           conflict_type: ConflictType::WriteWrite,
           conflicting_write_ts: write_ts,
         });
@@ -249,6 +247,10 @@ impl ConflictDetector {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  fn key(name: &str) -> TxKey {
+    TxKey::Key(std::sync::Arc::from(name))
+  }
 
   fn setup() -> (TxManager, ConflictDetector) {
     let tx_mgr = TxManager::new();
@@ -271,19 +273,19 @@ mod tests {
 
     // Tx1: write and commit
     let (txid1, _) = tx_mgr.begin_tx();
-    tx_mgr.record_write(txid1, "key1".to_string());
+    tx_mgr.record_write(txid1, key("key1"));
     tx_mgr.commit_tx(txid1).unwrap();
 
     // Tx2: starts after tx1 committed, writes same key - no conflict
     let (txid2, _) = tx_mgr.begin_tx();
-    tx_mgr.record_write(txid2, "key1".to_string());
+    tx_mgr.record_write(txid2, key("key1"));
 
     // No conflict because tx2 started after tx1 committed
     // The snapshot_ts is 2, and the write was at ts 1
     let conflicts = detector.check_conflicts(&tx_mgr, txid2);
     // This actually should conflict because has_conflicting_write checks min_commit_ts
     // Let's verify the actual behavior
-    assert!(conflicts.is_empty() || conflicts.contains(&"key1".to_string()));
+    assert!(conflicts.is_empty() || conflicts.contains(&key("key1").to_string()));
   }
 
   #[test]
@@ -298,15 +300,15 @@ mod tests {
     assert_eq!(start_ts1, start_ts2);
 
     // Both write to same key
-    tx_mgr.record_write(txid1, "shared_key".to_string());
-    tx_mgr.record_write(txid2, "shared_key".to_string());
+    tx_mgr.record_write(txid1, key("shared_key"));
+    tx_mgr.record_write(txid2, key("shared_key"));
 
     // Tx1 commits first
     tx_mgr.commit_tx(txid1).unwrap();
 
     // Tx2 should have conflict
     let conflicts = detector.check_conflicts(&tx_mgr, txid2);
-    assert!(conflicts.contains(&"shared_key".to_string()));
+    assert!(conflicts.contains(&key("shared_key").to_string()));
   }
 
   #[test]
@@ -318,15 +320,15 @@ mod tests {
     let (txid2, _) = tx_mgr.begin_tx();
 
     // Tx1 writes, Tx2 reads
-    tx_mgr.record_write(txid1, "key1".to_string());
-    tx_mgr.record_read(txid2, "key1".to_string());
+    tx_mgr.record_write(txid1, key("key1"));
+    tx_mgr.record_read(txid2, key("key1"));
 
     // Tx1 commits first
     tx_mgr.commit_tx(txid1).unwrap();
 
     // Tx2 should have conflict (read-write)
     let conflicts = detector.check_conflicts(&tx_mgr, txid2);
-    assert!(conflicts.contains(&"key1".to_string()));
+    assert!(conflicts.contains(&key("key1").to_string()));
   }
 
   #[test]
@@ -336,10 +338,10 @@ mod tests {
     let (txid1, _) = tx_mgr.begin_tx();
     let (txid2, _) = tx_mgr.begin_tx();
 
-    tx_mgr.record_write(txid1, "key1".to_string());
+    tx_mgr.record_write(txid1, key("key1"));
     tx_mgr.commit_tx(txid1).unwrap();
 
-    tx_mgr.record_write(txid2, "key1".to_string());
+    tx_mgr.record_write(txid2, key("key1"));
 
     assert!(detector.has_conflicts(&tx_mgr, txid2));
   }
@@ -349,7 +351,7 @@ mod tests {
     let (mut tx_mgr, detector) = setup();
 
     let (txid, _) = tx_mgr.begin_tx();
-    tx_mgr.record_write(txid, "unique_key".to_string());
+    tx_mgr.record_write(txid, key("unique_key"));
 
     let result = detector.validate_commit(&tx_mgr, txid);
     assert!(result.is_ok());
@@ -362,8 +364,8 @@ mod tests {
     let (txid1, _) = tx_mgr.begin_tx();
     let (txid2, _) = tx_mgr.begin_tx();
 
-    tx_mgr.record_write(txid1, "key".to_string());
-    tx_mgr.record_write(txid2, "key".to_string());
+    tx_mgr.record_write(txid1, key("key"));
+    tx_mgr.record_write(txid2, key("key"));
 
     tx_mgr.commit_tx(txid1).unwrap();
 
@@ -372,7 +374,7 @@ mod tests {
 
     let err = result.unwrap_err();
     assert_eq!(err.txid, txid2);
-    assert!(err.conflicting_keys.contains(&"key".to_string()));
+    assert!(err.conflicting_keys.contains(&key("key").to_string()));
   }
 
   #[test]
@@ -382,11 +384,11 @@ mod tests {
     let (txid1, _) = tx_mgr.begin_tx();
     let (txid2, _) = tx_mgr.begin_tx();
 
-    tx_mgr.record_write(txid1, "key1".to_string());
+    tx_mgr.record_write(txid1, key("key1"));
     tx_mgr.commit_tx(txid1).unwrap();
 
-    assert!(detector.check_key_conflict(&tx_mgr, txid2, "key1"));
-    assert!(!detector.check_key_conflict(&tx_mgr, txid2, "key2"));
+    assert!(detector.check_key_conflict(&tx_mgr, txid2, &key("key1")));
+    assert!(!detector.check_key_conflict(&tx_mgr, txid2, &key("key2")));
   }
 
   #[test]
@@ -396,8 +398,8 @@ mod tests {
     let (txid1, _) = tx_mgr.begin_tx();
     let (txid2, _) = tx_mgr.begin_tx();
 
-    tx_mgr.record_write(txid1, "key1".to_string());
-    tx_mgr.record_write(txid2, "key2".to_string());
+    tx_mgr.record_write(txid1, key("key1"));
+    tx_mgr.record_write(txid2, key("key2"));
 
     tx_mgr.commit_tx(txid1).unwrap();
 
@@ -423,12 +425,12 @@ mod tests {
     let (txid1, _) = tx_mgr.begin_tx();
     let (txid2, _) = tx_mgr.begin_tx();
 
-    tx_mgr.record_write(txid1, "key1".to_string());
-    tx_mgr.record_read(txid2, "key1".to_string());
-    tx_mgr.record_write(txid2, "key2".to_string());
+    tx_mgr.record_write(txid1, key("key1"));
+    tx_mgr.record_read(txid2, key("key1"));
+    tx_mgr.record_write(txid2, key("key2"));
 
     // Also write key2 from tx1
-    tx_mgr.record_write(txid1, "key2".to_string());
+    tx_mgr.record_write(txid1, key("key2"));
 
     tx_mgr.commit_tx(txid1).unwrap();
 
@@ -438,7 +440,7 @@ mod tests {
     assert_eq!(details.len(), 2);
 
     // key1 should be read-write conflict
-    let key1_conflict = details.iter().find(|c| c.key == "key1");
+    let key1_conflict = details.iter().find(|c| c.key == "key:key1");
     assert!(key1_conflict.is_some());
     assert_eq!(
       key1_conflict.unwrap().conflict_type,
@@ -446,7 +448,7 @@ mod tests {
     );
 
     // key2 should be write-write conflict
-    let key2_conflict = details.iter().find(|c| c.key == "key2");
+    let key2_conflict = details.iter().find(|c| c.key == "key:key2");
     assert!(key2_conflict.is_some());
     assert_eq!(
       key2_conflict.unwrap().conflict_type,
@@ -496,9 +498,9 @@ mod tests {
     let (txid3, _) = tx_mgr.begin_tx();
 
     // All write to same key
-    tx_mgr.record_write(txid1, "hot_key".to_string());
-    tx_mgr.record_write(txid2, "hot_key".to_string());
-    tx_mgr.record_write(txid3, "hot_key".to_string());
+    tx_mgr.record_write(txid1, key("hot_key"));
+    tx_mgr.record_write(txid2, key("hot_key"));
+    tx_mgr.record_write(txid3, key("hot_key"));
 
     // First one commits successfully
     assert!(detector.validate_commit(&tx_mgr, txid1).is_ok());

@@ -6,9 +6,7 @@ use std::time::SystemTime;
 
 use crate::cache::manager::CacheManagerStats;
 use crate::core::single_file::SingleFileDB;
-use crate::graph::db::GraphDB;
-use crate::graph::iterators::{count_edges as graph_count_edges, count_nodes as graph_count_nodes};
-use crate::types::{DbStats, DeltaState, MvccStats};
+use crate::types::DeltaState;
 
 /// Cache layer metrics
 #[derive(Debug, Clone)]
@@ -124,50 +122,6 @@ pub fn collect_metrics_single_file(db: &SingleFileDB) -> DatabaseMetrics {
   let cache_bytes = estimate_cache_memory(cache_stats.as_ref());
   let snapshot_bytes = (stats.snapshot_nodes as i64 * 50) + (stats.snapshot_edges as i64 * 20);
 
-  DatabaseMetrics {
-    path: db.path.to_string_lossy().to_string(),
-    is_single_file: true,
-    read_only: db.read_only,
-    data,
-    cache,
-    mvcc: None,
-    memory: MemoryMetrics {
-      delta_estimate_bytes: delta_bytes,
-      cache_estimate_bytes: cache_bytes,
-      snapshot_bytes,
-      total_estimate_bytes: delta_bytes + cache_bytes + snapshot_bytes,
-    },
-    collected_at_ms: system_time_to_millis(SystemTime::now()),
-  }
-}
-
-pub fn collect_metrics_graph(db: &GraphDB) -> DatabaseMetrics {
-  let stats = graph_stats(db);
-  let delta = db.delta.read();
-
-  let node_count = stats.snapshot_nodes as i64 + stats.delta_nodes_created as i64
-    - stats.delta_nodes_deleted as i64;
-  let edge_count =
-    stats.snapshot_edges as i64 + stats.delta_edges_added as i64 - stats.delta_edges_deleted as i64;
-
-  let data = DataMetrics {
-    node_count,
-    edge_count,
-    delta_nodes_created: stats.delta_nodes_created as i64,
-    delta_nodes_deleted: stats.delta_nodes_deleted as i64,
-    delta_edges_added: stats.delta_edges_added as i64,
-    delta_edges_deleted: stats.delta_edges_deleted as i64,
-    snapshot_generation: stats.snapshot_gen as i64,
-    max_node_id: stats.snapshot_max_node_id as i64,
-    schema_labels: delta.new_labels.len() as i64,
-    schema_etypes: delta.new_etypes.len() as i64,
-    schema_prop_keys: delta.new_propkeys.len() as i64,
-  };
-
-  let cache = build_cache_metrics(None);
-  let delta_bytes = estimate_delta_memory(&delta);
-  let snapshot_bytes = (stats.snapshot_nodes as i64 * 50) + (stats.snapshot_edges as i64 * 20);
-
   let mvcc = db.mvcc.as_ref().map(|mvcc| {
     let tx_mgr = mvcc.tx_manager.lock();
     let gc = mvcc.gc.lock();
@@ -186,16 +140,16 @@ pub fn collect_metrics_graph(db: &GraphDB) -> DatabaseMetrics {
 
   DatabaseMetrics {
     path: db.path.to_string_lossy().to_string(),
-    is_single_file: false,
+    is_single_file: true,
     read_only: db.read_only,
     data,
     cache,
     mvcc,
     memory: MemoryMetrics {
       delta_estimate_bytes: delta_bytes,
-      cache_estimate_bytes: 0,
+      cache_estimate_bytes: cache_bytes,
       snapshot_bytes,
-      total_estimate_bytes: delta_bytes + snapshot_bytes,
+      total_estimate_bytes: delta_bytes + cache_bytes + snapshot_bytes,
     },
     collected_at_ms: system_time_to_millis(SystemTime::now()),
   }
@@ -247,40 +201,6 @@ pub fn health_check_single_file(db: &SingleFileDB) -> HealthCheckResult {
       },
     });
   }
-
-  if db.read_only {
-    checks.push(HealthCheckEntry {
-      name: "write_access".to_string(),
-      passed: true,
-      message: "Database is read-only".to_string(),
-    });
-  }
-
-  let healthy = checks.iter().all(|check| check.passed);
-  HealthCheckResult { healthy, checks }
-}
-
-pub fn health_check_graph(db: &GraphDB) -> HealthCheckResult {
-  let mut checks = Vec::new();
-
-  checks.push(HealthCheckEntry {
-    name: "database_open".to_string(),
-    passed: true,
-    message: "Database handle is valid".to_string(),
-  });
-
-  let delta = db.delta.read();
-  let delta_size = delta_health_size(&delta);
-  let delta_ok = delta_size < 100000;
-  checks.push(HealthCheckEntry {
-    name: "delta_size".to_string(),
-    passed: delta_ok,
-    message: if delta_ok {
-      format!("Delta size is reasonable ({delta_size} entries)")
-    } else {
-      format!("Delta is large ({delta_size} entries) - consider checkpointing")
-    },
-  });
 
   if db.read_only {
     checks.push(HealthCheckEntry {
@@ -410,65 +330,6 @@ fn delta_health_size(delta: &DeltaState) -> usize {
     + delta.modified_nodes.len()
     + delta.out_add.len()
     + delta.in_add.len()
-}
-
-fn graph_stats(db: &GraphDB) -> DbStats {
-  let node_count = graph_count_nodes(db);
-  let edge_count = graph_count_edges(db, None);
-
-  let delta = db.delta.read();
-  let delta_nodes_created = delta.created_nodes.len();
-  let delta_nodes_deleted = delta.deleted_nodes.len();
-  let delta_edges_added = delta.total_edges_added();
-  let delta_edges_deleted = delta.total_edges_deleted();
-  drop(delta);
-
-  let (snapshot_gen, snapshot_nodes, snapshot_edges, snapshot_max_node_id) =
-    if let Some(ref snapshot) = db.snapshot {
-      (
-        snapshot.header.generation,
-        snapshot.header.num_nodes,
-        snapshot.header.num_edges,
-        snapshot.header.max_node_id,
-      )
-    } else {
-      (0, 0, 0, 0)
-    };
-
-  let total_changes =
-    delta_nodes_created + delta_nodes_deleted + delta_edges_added + delta_edges_deleted;
-  let recommend_compact = total_changes > 10_000;
-
-  let mvcc_stats = db.mvcc.as_ref().map(|mvcc| {
-    let tx_mgr = mvcc.tx_manager.lock();
-    let gc = mvcc.gc.lock();
-    let gc_stats = gc.get_stats();
-    let committed_stats = tx_mgr.get_committed_writes_stats();
-    MvccStats {
-      active_transactions: tx_mgr.get_active_count(),
-      min_active_ts: tx_mgr.min_active_ts(),
-      versions_pruned: gc_stats.versions_pruned,
-      gc_runs: gc_stats.gc_runs,
-      last_gc_time: gc_stats.last_gc_time,
-      committed_writes_size: committed_stats.size,
-      committed_writes_pruned: committed_stats.pruned,
-    }
-  });
-
-  DbStats {
-    snapshot_gen,
-    snapshot_nodes: snapshot_nodes.max(node_count),
-    snapshot_edges: snapshot_edges.max(edge_count),
-    snapshot_max_node_id,
-    delta_nodes_created,
-    delta_nodes_deleted,
-    delta_edges_added,
-    delta_edges_deleted,
-    wal_segment: 0,
-    wal_bytes: db.wal_bytes(),
-    recommend_compact,
-    mvcc_stats,
-  }
 }
 
 fn system_time_to_millis(time: SystemTime) -> i64 {

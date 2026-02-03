@@ -969,7 +969,7 @@ mod tests {
 
     // Inertia should be similar (within 10% typically)
     let ratio = result_par.inertia / result_seq.inertia;
-    assert!(ratio > 0.5 && ratio < 2.0, "Inertia ratio: {}", ratio);
+    assert!(ratio > 0.5 && ratio < 2.0, "Inertia ratio: {ratio}");
   }
 
   #[test]
@@ -1004,8 +1004,7 @@ mod tests {
     for count in &cluster_counts {
       assert!(
         *count > vectors_per_cluster / 2,
-        "Cluster has too few vectors: {}",
-        count
+        "Cluster has too few vectors: {count}"
       );
     }
   }

@@ -412,10 +412,10 @@ mod tests {
   #[test]
   fn test_edge_prop_cache_hit() {
     let mut cache = make_cache();
-    cache.set_edge_prop(1, 1, 2, 10, Some(PropValue::F64(3.14)));
+    cache.set_edge_prop(1, 1, 2, 10, Some(PropValue::F64(std::f64::consts::PI)));
 
     let result = cache.get_edge_prop(1, 1, 2, 10);
-    assert_eq!(result, Some(&Some(PropValue::F64(3.14))));
+    assert_eq!(result, Some(&Some(PropValue::F64(std::f64::consts::PI))));
     assert_eq!(cache.stats().hits, 1);
   }
 
@@ -573,7 +573,7 @@ mod tests {
     cache.set_node_prop(1, 1, Some(PropValue::Null));
     cache.set_node_prop(1, 2, Some(PropValue::Bool(true)));
     cache.set_node_prop(1, 3, Some(PropValue::I64(-123)));
-    cache.set_node_prop(1, 4, Some(PropValue::F64(3.14159)));
+    cache.set_node_prop(1, 4, Some(PropValue::F64(std::f64::consts::PI)));
     cache.set_node_prop(1, 5, Some(PropValue::String("hello world".to_string())));
     cache.set_node_prop(1, 6, Some(PropValue::VectorF32(vec![1.0, 2.0, 3.0])));
 
@@ -585,7 +585,7 @@ mod tests {
     assert_eq!(cache.get_node_prop(1, 3), Some(&Some(PropValue::I64(-123))));
     assert_eq!(
       cache.get_node_prop(1, 4),
-      Some(&Some(PropValue::F64(3.14159)))
+      Some(&Some(PropValue::F64(std::f64::consts::PI)))
     );
     assert_eq!(
       cache.get_node_prop(1, 5),
