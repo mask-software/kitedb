@@ -2313,6 +2313,14 @@ pub enum BatchOp {
     prop_name: String,
     value: PropValue,
   },
+  /// Set an edge property
+  SetEdgeProp {
+    src: NodeId,
+    edge_type: String,
+    dst: NodeId,
+    prop_name: String,
+    value: PropValue,
+  },
   /// Delete a node property
   DelProp { node_id: NodeId, prop_name: String },
 }
@@ -2444,6 +2452,31 @@ impl Kite {
           // Use handle.db to access schema methods while handle is active
           let prop_key_id = handle.db.get_or_create_propkey(&prop_name);
           set_node_prop(&mut handle, node_id, prop_key_id, value)?;
+          BatchResult::PropSet
+        }
+
+        BatchOp::SetEdgeProp {
+          src,
+          edge_type,
+          dst,
+          prop_name,
+          value,
+        } => {
+          let edge_def = self.edges.get(&edge_type).ok_or_else(|| {
+            KiteError::InvalidSchema(format!("Unknown edge type: {edge_type}").into())
+          })?;
+
+          let etype_id = edge_def
+            .etype_id
+            .ok_or_else(|| KiteError::InvalidSchema("Edge type not initialized".into()))?;
+
+          let prop_key_id = if let Some(&id) = edge_def.prop_key_ids.get(&prop_name) {
+            id
+          } else {
+            handle.db.get_or_create_propkey(&prop_name)
+          };
+
+          set_edge_prop(&mut handle, src, etype_id, dst, prop_key_id, value)?;
           BatchResult::PropSet
         }
 
@@ -2730,6 +2763,25 @@ impl TxBuilder {
   ) -> Self {
     self.ops.push(BatchOp::SetProp {
       node_id,
+      prop_name: prop_name.into(),
+      value,
+    });
+    self
+  }
+
+  /// Add a set edge property operation
+  pub fn set_edge_prop(
+    mut self,
+    src: NodeId,
+    edge_type: impl Into<String>,
+    dst: NodeId,
+    prop_name: impl Into<String>,
+    value: PropValue,
+  ) -> Self {
+    self.ops.push(BatchOp::SetEdgeProp {
+      src,
+      edge_type: edge_type.into(),
+      dst,
       prop_name: prop_name.into(),
       value,
     });
@@ -4048,6 +4100,50 @@ mod tests {
       Some(PropValue::String("Alice".into()))
     );
     assert_eq!(ray.get_prop(user.id, "age"), Some(PropValue::I64(30)));
+
+    ray.close().unwrap();
+  }
+
+  #[test]
+  fn test_batch_set_edge_properties() {
+    let temp_dir = tempdir().unwrap();
+    let options = create_test_schema();
+
+    let mut ray = Kite::open(temp_db_path(&temp_dir), options).unwrap();
+
+    let alice = ray.create_node("User", "alice", HashMap::new()).unwrap();
+    let bob = ray.create_node("User", "bob", HashMap::new()).unwrap();
+    ray.link(alice.id, "FOLLOWS", bob.id).unwrap();
+
+    ray
+      .batch(vec![
+        BatchOp::SetEdgeProp {
+          src: alice.id,
+          edge_type: "FOLLOWS".into(),
+          dst: bob.id,
+          prop_name: "weight".into(),
+          value: PropValue::F64(0.75),
+        },
+        BatchOp::SetEdgeProp {
+          src: alice.id,
+          edge_type: "FOLLOWS".into(),
+          dst: bob.id,
+          prop_name: "since".into(),
+          value: PropValue::String("2024".into()),
+        },
+      ])
+      .unwrap();
+
+    assert_eq!(
+      ray.get_edge_prop(alice.id, "FOLLOWS", bob.id, "weight")
+        .unwrap(),
+      Some(PropValue::F64(0.75))
+    );
+    assert_eq!(
+      ray.get_edge_prop(alice.id, "FOLLOWS", bob.id, "since")
+        .unwrap(),
+      Some(PropValue::String("2024".into()))
+    );
 
     ray.close().unwrap();
   }

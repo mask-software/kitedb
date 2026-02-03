@@ -397,6 +397,18 @@ pub fn build_snapshot_to_memory(input: SnapshotBuildInput) -> Result<Vec<u8>> {
     }
   }
 
+  // Validate edges reference existing nodes to avoid panics during CSR build.
+  for edge in &edges {
+    let src_missing = !node_id_to_phys.contains_key(&edge.src);
+    let dst_missing = !node_id_to_phys.contains_key(&edge.dst);
+    if src_missing || dst_missing {
+      return Err(KiteError::InvalidSnapshot(format!(
+        "Edge references missing node(s): src={}, dst={}",
+        edge.src, edge.dst
+      )));
+    }
+  }
+
   // Build string table
   let mut string_table = StringTable::new();
 
@@ -1057,6 +1069,29 @@ mod tests {
     let num_edges = read_u64(&buffer, 40);
     assert_eq!(num_nodes, 0);
     assert_eq!(num_edges, 0);
+  }
+
+  #[test]
+  fn test_build_snapshot_missing_nodes_returns_error() {
+    let mut etypes = HashMap::new();
+    etypes.insert(1, "REL".to_string());
+
+    let input = SnapshotBuildInput {
+      generation: 1,
+      nodes: vec![],
+      edges: vec![EdgeData {
+        src: 1,
+        etype: 1,
+        dst: 2,
+        props: HashMap::new(),
+      }],
+      labels: HashMap::new(),
+      etypes,
+      propkeys: HashMap::new(),
+      compression: None,
+    };
+
+    assert!(build_snapshot_to_memory(input).is_err());
   }
 
   #[test]
