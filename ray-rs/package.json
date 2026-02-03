@@ -60,6 +60,7 @@
   "scripts": {
     "artifacts": "napi artifacts",
     "bench": "node --import @oxc-node/core/register benchmark/bench.ts",
+    "bench:scip": "node --import @oxc-node/core/register benchmark/scip-stress.ts",
     "build": "napi build --platform --release && bun run build:ts",
     "build:native": "napi build --platform --release",
     "build:ts": "tsc -p ts/tsconfig.json",
@@ -84,6 +85,7 @@
   "devDependencies": {
     "@emnapi/core": "^1.5.0",
     "@emnapi/runtime": "^1.5.0",
+    "@bufbuild/protobuf": "^2.11.0",
     "@napi-rs/cli": "^3.2.0",
     "@oxc-node/core": "^0.0.35",
     "@oxc-node/core-darwin-arm64": "0.0.35",
