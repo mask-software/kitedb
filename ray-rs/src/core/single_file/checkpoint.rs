@@ -647,7 +647,7 @@ impl SingleFileDB {
 
   /// Check if checkpoint is recommended based on WAL usage
   pub fn should_checkpoint(&self, threshold: f64) -> bool {
-    let stats = self.wal_stats();
-    stats.used as f64 / stats.capacity as f64 >= threshold
+    let usage = self.wal_buffer.lock().usage_ratio();
+    usage >= threshold
   }
 }

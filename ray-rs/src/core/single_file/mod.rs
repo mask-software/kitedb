@@ -40,7 +40,7 @@ mod write;
 mod stress;
 
 // Re-export everything for backward compatibility
-pub use compactor::{SingleFileOptimizeOptions, VacuumOptions};
+pub use compactor::{ResizeWalOptions, SingleFileOptimizeOptions, VacuumOptions};
 pub use iter::*;
 pub use open::{
   close_single_file, open_single_file, SingleFileOpenOptions, SnapshotParseMode, SyncMode,

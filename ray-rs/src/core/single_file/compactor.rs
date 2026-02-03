@@ -26,6 +26,24 @@ pub struct VacuumOptions {
   pub min_wal_size: Option<u64>,
 }
 
+/// Options for resizing WAL region
+#[derive(Debug, Clone)]
+pub struct ResizeWalOptions {
+  /// Allow shrinking WAL size (default false)
+  pub allow_shrink: bool,
+  /// Perform a checkpoint before resizing (default true)
+  pub checkpoint: bool,
+}
+
+impl Default for ResizeWalOptions {
+  fn default() -> Self {
+    Self {
+      allow_shrink: false,
+      checkpoint: true,
+    }
+  }
+}
+
 impl Default for VacuumOptions {
   fn default() -> Self {
     Self {
@@ -222,6 +240,160 @@ impl SingleFileDB {
     }
 
     self.reload_snapshot()?;
+
+    Ok(())
+  }
+
+  /// Resize the WAL region (single-file only).
+  ///
+  /// This operation is offline (no active transactions). By default it
+  /// checkpoints to clear WAL before resizing.
+  pub fn resize_wal(&self, wal_size_bytes: usize, options: Option<ResizeWalOptions>) -> Result<()> {
+    if self.read_only {
+      return Err(KiteError::ReadOnly);
+    }
+
+    if self.has_any_transaction() {
+      return Err(KiteError::TransactionInProgress);
+    }
+
+    if self.is_checkpoint_running() {
+      while self.is_checkpoint_running() {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+      }
+    }
+
+    let options = options.unwrap_or_default();
+
+    if wal_size_bytes == 0 {
+      return Err(KiteError::Internal("WAL size must be > 0".to_string()));
+    }
+
+    if options.checkpoint {
+      self.checkpoint()?;
+    }
+
+    let header = self.header.read().clone();
+    let wal_is_empty =
+      header.wal_head == header.wal_tail || (header.wal_head == 0 && header.wal_tail == 0);
+    if !wal_is_empty {
+      return Err(KiteError::Internal(
+        "WAL must be empty before resize (run checkpoint)".to_string(),
+      ));
+    }
+
+    let new_wal_page_count =
+      pages_to_store(wal_size_bytes, header.page_size as usize) as u64;
+
+    if new_wal_page_count < MIN_WAL_PAGES {
+      return Err(KiteError::Internal(format!(
+        "WAL size too small: minimum is {} pages",
+        MIN_WAL_PAGES
+      )));
+    }
+
+    if new_wal_page_count < header.wal_page_count && !options.allow_shrink {
+      return Err(KiteError::Internal(
+        "WAL shrink requires allow_shrink=true".to_string(),
+      ));
+    }
+
+    if new_wal_page_count == header.wal_page_count {
+      return Ok(());
+    }
+
+    let mut new_header = header.clone();
+    let new_wal_end_page = new_header.wal_start_page + new_wal_page_count;
+
+    if new_header.snapshot_page_count > 0 {
+      let current_snapshot_start = new_header.snapshot_start_page;
+      if current_snapshot_start != new_wal_end_page {
+        let snapshot_bytes = {
+          let mut pager = self.pager.lock();
+          let slice = pager.mmap_range(
+            current_snapshot_start as u32,
+            new_header.snapshot_page_count as u32,
+          )?;
+          slice.to_vec()
+        };
+
+        let mut pager = self.pager.lock();
+        self.write_snapshot_pages(
+          &mut pager,
+          new_wal_end_page as u32,
+          &snapshot_bytes,
+          new_header.page_size as usize,
+        )?;
+      }
+
+      new_header.snapshot_start_page = new_wal_end_page;
+    }
+
+    new_header.wal_page_count = new_wal_page_count;
+    new_header.wal_head = 0;
+    new_header.wal_tail = 0;
+    new_header.wal_primary_head = 0;
+    new_header.wal_secondary_head = 0;
+    new_header.active_wal_region = 0;
+    new_header.checkpoint_in_progress = 0;
+
+    new_header.db_size_pages = if new_header.snapshot_page_count > 0 {
+      new_header.snapshot_start_page + new_header.snapshot_page_count
+    } else {
+      new_header.wal_start_page + new_header.wal_page_count
+    };
+    new_header.change_counter += 1;
+
+    {
+      let mut pager = self.pager.lock();
+      let header_bytes = new_header.serialize_to_page();
+      pager.write_page(0, &header_bytes)?;
+      pager.sync()?;
+      if new_header.db_size_pages < header.db_size_pages {
+        pager.truncate_pages(new_header.db_size_pages as u32)?;
+      }
+    }
+
+    let new_wal_buffer = WalBuffer::from_header(&new_header);
+
+    {
+      let mut header_guard = self.header.write();
+      *header_guard = new_header;
+    }
+
+    {
+      let mut wal_buffer = self.wal_buffer.lock();
+      *wal_buffer = new_wal_buffer;
+    }
+
+    self.reload_snapshot()?;
+
+    Ok(())
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::core::single_file::{close_single_file, open_single_file, SingleFileOpenOptions};
+  use tempfile::tempdir;
+
+  #[test]
+  fn test_resize_wal_grow_reopen() -> Result<()> {
+    let temp_dir = tempdir()?;
+    let db_path = temp_dir.path().join("resize-wal.kitedb");
+
+    let db = open_single_file(&db_path, SingleFileOpenOptions::new().wal_size(64 * 1024))?;
+    db.begin(false)?;
+    db.create_node(Some("a"))?;
+    db.commit()?;
+
+    db.resize_wal(1024 * 1024, None)?;
+    close_single_file(db)?;
+
+    let reopened = open_single_file(&db_path, SingleFileOpenOptions::new().wal_size(1024 * 1024))?;
+    assert!(reopened.get_node_by_key("a").is_some());
+    close_single_file(reopened)?;
 
     Ok(())
   }

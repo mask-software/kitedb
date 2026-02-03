@@ -82,6 +82,54 @@ fn test_single_file_stress_checkpoint_reopen() -> Result<()> {
 }
 
 #[test]
+fn test_single_file_resize_wal_stress() -> Result<()> {
+  let temp_dir = tempfile::tempdir()?;
+  let db_path = temp_dir.path().join("stress-resize-wal.kitedb");
+
+  let db = open_single_file(
+    &db_path,
+    SingleFileOpenOptions::new()
+      .sync_mode(SyncMode::Normal)
+      .wal_size(64 * 1024)
+      .auto_checkpoint(true)
+      .checkpoint_threshold(0.7)
+      .background_checkpoint(false),
+  )?;
+
+  for i in 0..200 {
+    db.begin(false)?;
+    db.create_node(Some(&format!("pre-{i}")))?;
+    db.commit()?;
+  }
+
+  db.resize_wal(8 * 1024 * 1024, None)?;
+  close_single_file(db)?;
+
+  let db = open_single_file(
+    &db_path,
+    SingleFileOpenOptions::new()
+      .sync_mode(SyncMode::Normal)
+      .wal_size(8 * 1024 * 1024)
+      .auto_checkpoint(true)
+      .checkpoint_threshold(0.7)
+      .background_checkpoint(false),
+  )?;
+
+  for i in 0..400 {
+    db.begin(false)?;
+    db.create_node(Some(&format!("post-{i}")))?;
+    db.commit()?;
+  }
+
+  assert!(db.get_node_by_key("pre-0").is_some());
+  assert!(db.get_node_by_key("post-0").is_some());
+
+  close_single_file(db)?;
+
+  Ok(())
+}
+
+#[test]
 #[ignore]
 fn test_single_file_soak_long_run() -> Result<()> {
   let temp_dir = tempfile::tempdir()?;
