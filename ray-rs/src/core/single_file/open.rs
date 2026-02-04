@@ -77,11 +77,11 @@ pub struct SingleFileOpenOptions {
   pub mvcc_max_chain_depth: Option<usize>,
   /// Page size (default 4KB, must be power of 2 between 4KB and 64KB)
   pub page_size: usize,
-  /// WAL size in bytes (default 1MB)
+  /// WAL size in bytes (default 4MB)
   pub wal_size: usize,
   /// Enable auto-checkpoint when WAL usage exceeds threshold (default true)
   pub auto_checkpoint: bool,
-  /// WAL usage threshold (0.0-1.0) to trigger auto-checkpoint (default 0.8)
+  /// WAL usage threshold (0.0-1.0) to trigger auto-checkpoint (default 0.5)
   pub checkpoint_threshold: f64,
   /// Use background (non-blocking) checkpoint instead of blocking (default true)
   pub background_checkpoint: bool,
@@ -111,7 +111,7 @@ impl Default for SingleFileOpenOptions {
       page_size: DEFAULT_PAGE_SIZE,
       wal_size: WAL_DEFAULT_SIZE,
       auto_checkpoint: true,
-      checkpoint_threshold: 0.8,
+      checkpoint_threshold: 0.5,
       background_checkpoint: true,
       cache: None,
       checkpoint_compression: Some(CompressionOptions {

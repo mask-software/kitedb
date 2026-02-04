@@ -68,7 +68,7 @@ pub const DB_HEADER_SIZE: usize = 4096;
 pub const DB_HEADER_RESERVED_SIZE: usize = 14;
 
 /// Default WAL buffer size (1MB - grows dynamically as needed)
-pub const WAL_DEFAULT_SIZE: usize = 1024 * 1024;
+pub const WAL_DEFAULT_SIZE: usize = 4 * 1024 * 1024;
 
 /// Minimum WAL to snapshot ratio (10%)
 pub const WAL_MIN_SNAPSHOT_RATIO: f64 = 0.1;

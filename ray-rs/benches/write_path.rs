@@ -312,7 +312,7 @@ fn bench_write_batch_tx(c: &mut Criterion) {
 
 fn bench_write_batch_tx_wal_sweep(c: &mut Criterion) {
   let mut group = c.benchmark_group("write_batch_tx_wal_sweep");
-  group.sample_size(5);
+  group.sample_size(10);
 
   let total_ops = 5_000usize;
   let batch_size = 100usize;
