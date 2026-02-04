@@ -391,6 +391,44 @@ export function PerformancePage() {
 				throughput under concurrency, but can slow single-threaded benchmarks.
 			</p>
 
+			<h4 class="mt-6">Decision Table</h4>
+			<table>
+				<thead>
+					<tr>
+						<th>Workload</th>
+						<th>sync_mode</th>
+						<th>group_commit</th>
+						<th>Why</th>
+					</tr>
+				</thead>
+				<tbody>
+					<tr>
+						<td>Production, high durability</td>
+						<td>Full</td>
+						<td>Off</td>
+						<td>fsync per commit</td>
+					</tr>
+					<tr>
+						<td>Single-writer ingest</td>
+						<td>Normal</td>
+						<td>Off</td>
+						<td>Lowest latency per commit</td>
+					</tr>
+					<tr>
+						<td>Multi-writer throughput</td>
+						<td>Normal</td>
+						<td>On (1-2ms)</td>
+						<td>Coalesces commits</td>
+					</tr>
+					<tr>
+						<td>Testing/throwaway data</td>
+						<td>Off</td>
+						<td>Off</td>
+						<td>Max speed, weakest durability</td>
+					</tr>
+				</tbody>
+			</table>
+
 			<h2 id="best-practices">Best Practices</h2>
 
 			<h3>Batch Writes</h3>
