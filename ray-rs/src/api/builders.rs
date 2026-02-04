@@ -16,26 +16,46 @@ use std::collections::HashMap;
 #[derive(Debug, Clone)]
 pub struct NodeRef {
   /// Node ID
-  pub id: NodeId,
+  id: NodeId,
   /// Node key (may be empty)
-  pub key: String,
+  key: String,
   /// Node properties (cached)
-  pub props: HashMap<String, PropValue>,
+  props: HashMap<String, PropValue>,
 }
 
 impl NodeRef {
   /// Create a new node reference
-  pub fn new(id: NodeId, key: String) -> Self {
+  pub fn new(id: NodeId, key: impl Into<String>) -> Self {
     Self {
       id,
-      key,
+      key: key.into(),
       props: HashMap::new(),
     }
   }
 
   /// Create a node reference with properties
-  pub fn with_props(id: NodeId, key: String, props: HashMap<String, PropValue>) -> Self {
-    Self { id, key, props }
+  pub fn with_props(id: NodeId, key: impl Into<String>, props: HashMap<String, PropValue>) -> Self {
+    Self {
+      id,
+      key: key.into(),
+      props,
+    }
+  }
+
+  pub fn id(&self) -> NodeId {
+    self.id
+  }
+
+  pub fn key(&self) -> &str {
+    &self.key
+  }
+
+  pub fn props(&self) -> &HashMap<String, PropValue> {
+    &self.props
+  }
+
+  pub fn into_parts(self) -> (NodeId, String, HashMap<String, PropValue>) {
+    (self.id, self.key, self.props)
   }
 
   /// Get a property value
@@ -497,9 +517,9 @@ mod tests {
   #[test]
   fn test_node_ref() {
     let node = NodeRef::new(1, "alice".to_string());
-    assert_eq!(node.id, 1);
-    assert_eq!(node.key, "alice");
-    assert!(node.props.is_empty());
+    assert_eq!(node.id(), 1);
+    assert_eq!(node.key(), "alice");
+    assert!(node.props().is_empty());
   }
 
   #[test]

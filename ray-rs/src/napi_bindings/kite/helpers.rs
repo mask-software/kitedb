@@ -40,13 +40,8 @@ pub(crate) fn batch_result_to_js(env: &Env, result: BatchResult) -> Result<Objec
   match result {
     BatchResult::NodeCreated(node_ref) => {
       obj.set_named_property("type", "nodeCreated")?;
-      let node_obj = node_to_js(
-        env,
-        node_ref.id,
-        node_ref.key,
-        &node_ref.node_type,
-        HashMap::new(),
-      )?;
+      let (node_id, node_key, node_type) = node_ref.into_parts();
+      let node_obj = node_to_js(env, node_id, node_key, &node_type, HashMap::new())?;
       obj.set_named_property("node", node_obj)?;
     }
     BatchResult::NodeDeleted(deleted) => {
@@ -127,10 +122,10 @@ pub(crate) fn node_filter_data(
 ) -> NodeFilterData {
   let node_ref = ray.get_by_id(node_id).ok().flatten();
   let (key, node_type) = match node_ref {
-    Some(node_ref) => (
-      node_ref.key.unwrap_or_default(),
-      node_ref.node_type.to_string(),
-    ),
+    Some(node_ref) => {
+      let (_id, key, node_type) = node_ref.into_parts();
+      (key.unwrap_or_default(), node_type.to_string())
+    }
     None => ("".to_string(), "unknown".to_string()),
   };
 

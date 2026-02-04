@@ -499,11 +499,11 @@ impl EdgeDef {
 #[derive(Debug, Clone)]
 pub struct NodeRef {
   /// Node ID
-  pub id: NodeId,
+  id: NodeId,
   /// Full key (if available)
-  pub key: Option<String>,
+  key: Option<String>,
   /// Node type name
-  pub node_type: Arc<str>,
+  node_type: Arc<str>,
 }
 
 impl NodeRef {
@@ -513,6 +513,22 @@ impl NodeRef {
       key,
       node_type: node_type.into(),
     }
+  }
+
+  pub fn id(&self) -> NodeId {
+    self.id
+  }
+
+  pub fn key(&self) -> Option<&str> {
+    self.key.as_deref()
+  }
+
+  pub fn node_type(&self) -> &str {
+    &self.node_type
+  }
+
+  pub fn into_parts(self) -> (NodeId, Option<String>, Arc<str>) {
+    (self.id, self.key, self.node_type)
   }
 }
 
@@ -956,16 +972,26 @@ impl Kite {
   }
 
   /// Set multiple node properties in a single transaction
-  pub fn set_props(&mut self, node_id: NodeId, props: HashMap<String, PropValue>) -> Result<()> {
-    if props.is_empty() {
+  pub fn set_props<I, K>(&mut self, node_id: NodeId, props: I) -> Result<()>
+  where
+    I: IntoIterator<Item = (K, PropValue)>,
+    K: AsRef<str>,
+  {
+    let mut iter = props.into_iter();
+    let Some((first_name, first_value)) = iter.next() else {
       return Ok(());
-    }
+    };
 
     let mut handle = begin_tx(&self.db)?;
-    for (prop_name, value) in props {
-      let prop_key_id = self.db.get_or_create_propkey(&prop_name);
+
+    let first_key_id = self.db.get_or_create_propkey(first_name.as_ref());
+    set_node_prop(&mut handle, node_id, first_key_id, first_value)?;
+
+    for (prop_name, value) in iter {
+      let prop_key_id = self.db.get_or_create_propkey(prop_name.as_ref());
       set_node_prop(&mut handle, node_id, prop_key_id, value)?;
     }
+
     commit(&mut handle)?;
     Ok(())
   }
@@ -993,18 +1019,18 @@ impl Kite {
     // Verify node exists
     let exists = {
       let mut handle = begin_tx(&self.db)?;
-      let exists = node_exists(&handle, node_ref.id);
+      let exists = node_exists(&handle, node_ref.id());
       commit(&mut handle)?;
       exists
     };
 
     if !exists {
-      return Err(KiteError::NodeNotFound(node_ref.id));
+      return Err(KiteError::NodeNotFound(node_ref.id()));
     }
 
     Ok(KiteUpdateNodeBuilder {
       ray: self,
-      node_id: node_ref.id,
+      node_id: node_ref.id(),
       updates: HashMap::new(),
     })
   }
@@ -1554,7 +1580,7 @@ impl Kite {
   /// # fn main() -> kitedb::error::Result<()> {
   /// # let kite: Kite = unimplemented!();
   /// for node_ref in kite.all("User")? {
-  ///     println!("User: {:?}", node_ref.id);
+  ///     println!("User: {:?}", node_ref.id());
   /// }
   /// # Ok(())
   /// # }
@@ -3847,8 +3873,8 @@ mod tests {
     let node_ref = ray.get_ref("User", "alice").unwrap();
     assert!(node_ref.is_some());
     let node_ref = node_ref.unwrap();
-    assert_eq!(node_ref.id, user.id);
-    assert_eq!(node_ref.key, Some("user:alice".to_string()));
+    assert_eq!(node_ref.id(), user.id);
+    assert_eq!(node_ref.key(), Some("user:alice"));
 
     // Non-existent user
     let not_found = ray.get_ref("User", "bob").unwrap();
@@ -4242,11 +4268,11 @@ mod tests {
 
     // Extract node IDs from results
     let alice_id = match &results[0] {
-      BatchResult::NodeCreated(node_ref) => node_ref.id,
+      BatchResult::NodeCreated(node_ref) => node_ref.id(),
       _ => panic!("Expected NodeCreated"),
     };
     let bob_id = match &results[1] {
-      BatchResult::NodeCreated(node_ref) => node_ref.id,
+      BatchResult::NodeCreated(node_ref) => node_ref.id(),
       _ => panic!("Expected NodeCreated"),
     };
 
@@ -4689,11 +4715,11 @@ mod tests {
 
     // Extract IDs and create edges
     let alice_id = match &results[0] {
-      BatchResult::NodeCreated(node_ref) => node_ref.id,
+      BatchResult::NodeCreated(node_ref) => node_ref.id(),
       _ => panic!("Expected NodeCreated"),
     };
     let bob_id = match &results[1] {
-      BatchResult::NodeCreated(node_ref) => node_ref.id,
+      BatchResult::NodeCreated(node_ref) => node_ref.id(),
       _ => panic!("Expected NodeCreated"),
     };
 

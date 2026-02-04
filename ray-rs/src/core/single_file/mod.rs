@@ -87,19 +87,19 @@ impl SingleFileTxState {
 /// Single-file database handle
 pub struct SingleFileDB {
   /// Database file path
-  pub path: PathBuf,
+  pub(crate) path: PathBuf,
   /// Read-only mode
-  pub read_only: bool,
+  pub(crate) read_only: bool,
   /// Page-based I/O
-  pub pager: Mutex<FilePager>,
+  pub(crate) pager: Mutex<FilePager>,
   /// Database header
-  pub header: RwLock<DbHeaderV1>,
+  pub(crate) header: RwLock<DbHeaderV1>,
   /// WAL buffer manager
-  pub wal_buffer: Mutex<WalBuffer>,
+  pub(crate) wal_buffer: Mutex<WalBuffer>,
   /// Memory-mapped snapshot data (if exists)
-  pub snapshot: RwLock<Option<SnapshotData>>,
+  pub(crate) snapshot: RwLock<Option<SnapshotData>>,
   /// Delta state (uncommitted changes)
-  pub delta: RwLock<DeltaState>,
+  pub(crate) delta: RwLock<DeltaState>,
 
   // ID allocators
   pub(crate) next_node_id: AtomicU64,
@@ -109,7 +109,7 @@ pub struct SingleFileDB {
   pub(crate) next_tx_id: AtomicU64,
 
   /// Current active transaction
-  pub current_tx: Mutex<HashMap<ThreadId, std::sync::Arc<Mutex<SingleFileTxState>>>>,
+  pub(crate) current_tx: Mutex<HashMap<ThreadId, std::sync::Arc<Mutex<SingleFileTxState>>>>,
   /// Active write transactions (excludes read-only)
   pub(crate) active_writers: AtomicUsize,
 
@@ -121,7 +121,7 @@ pub struct SingleFileDB {
   pub(crate) group_commit_cv: Condvar,
 
   /// MVCC manager (if enabled)
-  pub mvcc: Option<std::sync::Arc<MvccManager>>,
+  pub(crate) mvcc: Option<std::sync::Arc<MvccManager>>,
 
   /// Label name -> ID mapping
   pub(crate) label_names: RwLock<HashMap<String, LabelId>>,
@@ -150,7 +150,7 @@ pub struct SingleFileDB {
   pub(crate) vector_stores: RwLock<HashMap<PropKeyId, VectorManifest>>,
 
   /// Cache manager for property, traversal, query, and key caches
-  pub cache: RwLock<Option<CacheManager>>,
+  pub(crate) cache: RwLock<Option<CacheManager>>,
 
   /// Compression options for checkpoint snapshots
   pub(crate) checkpoint_compression: Option<CompressionOptions>,
@@ -194,6 +194,16 @@ pub(crate) struct GroupCommitState {
 // ============================================================================
 
 impl SingleFileDB {
+  /// Database file path
+  pub fn path(&self) -> &Path {
+    &self.path
+  }
+
+  /// Read-only mode
+  pub fn is_read_only(&self) -> bool {
+    self.read_only
+  }
+
   /// Allocate a new node ID
   pub fn alloc_node_id(&self) -> NodeId {
     self.next_node_id.fetch_add(1, Ordering::SeqCst)

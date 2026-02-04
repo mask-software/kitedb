@@ -110,7 +110,8 @@ impl KiteInsertExecutorSingle {
     let props = std::mem::take(&mut self.props);
     let (node_ref, props) =
       insert_single_returning(&self.ray, &self.node_type, &self.key_suffix, props)?;
-    node_to_js(&env, node_ref.id, node_ref.key, &node_ref.node_type, props)
+    let (node_id, node_key, node_type) = node_ref.into_parts();
+    node_to_js(&env, node_id, node_key, &node_type, props)
   }
 }
 
@@ -141,13 +142,8 @@ impl KiteInsertExecutorMany {
     for (node_ref, props) in results.into_iter() {
       let props =
         props.ok_or_else(|| Error::from_reason("Insert returning=true did not yield props"))?;
-      out.push(node_to_js(
-        &env,
-        node_ref.id,
-        node_ref.key,
-        &node_ref.node_type,
-        props,
-      )?);
+      let (node_id, node_key, node_type) = node_ref.into_parts();
+      out.push(node_to_js(&env, node_id, node_key, &node_type, props)?);
     }
     Ok(out)
   }
@@ -335,7 +331,8 @@ impl KiteUpsertExecutorSingle {
     let props = std::mem::take(&mut self.props);
     let (node_ref, props) =
       upsert_single_returning(&self.ray, &self.node_type, &self.key_suffix, props)?;
-    node_to_js(&env, node_ref.id, node_ref.key, &node_ref.node_type, props)
+    let (node_id, node_key, node_type) = node_ref.into_parts();
+    node_to_js(&env, node_id, node_key, &node_type, props)
   }
 }
 
@@ -366,13 +363,8 @@ impl KiteUpsertExecutorMany {
     for (node_ref, props) in results.into_iter() {
       let props =
         props.ok_or_else(|| Error::from_reason("Upsert returning=true did not yield props"))?;
-      out.push(node_to_js(
-        &env,
-        node_ref.id,
-        node_ref.key,
-        &node_ref.node_type,
-        props,
-      )?);
+      let (node_id, node_key, node_type) = node_ref.into_parts();
+      out.push(node_to_js(&env, node_id, node_key, &node_type, props)?);
     }
     Ok(out)
   }
@@ -417,7 +409,7 @@ fn upsert_single_returning(
     .returning()
     .map_err(|e| Error::from_reason(e.to_string()))?;
 
-  let props_for_return = get_node_props(ray, node_ref.id);
+  let props_for_return = get_node_props(ray, node_ref.id());
   Ok((node_ref, props_for_return))
 }
 
@@ -459,7 +451,7 @@ fn upsert_many(
     node_refs
       .into_iter()
       .map(|node_ref| {
-        let props = get_node_props(ray, node_ref.id);
+        let props = get_node_props(ray, node_ref.id());
         (node_ref, Some(props))
       })
       .collect(),
