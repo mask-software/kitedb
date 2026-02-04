@@ -104,14 +104,14 @@ fn build_code_graph_fixture(
     let file = ray
       .create_node("File", &format!("file{i}"), HashMap::new())
       .unwrap();
-    file_ids.push(file.id);
+    file_ids.push(file.id());
 
     let mut chunks = Vec::with_capacity(chunks_per_file);
     for c in 0..chunks_per_file {
       let chunk = ray
         .create_node("Chunk", &format!("file{i}:chunk{c}"), HashMap::new())
         .unwrap();
-      chunks.push(chunk.id);
+      chunks.push(chunk.id());
     }
     chunk_ids.push(chunks);
 
@@ -120,7 +120,7 @@ fn build_code_graph_fixture(
       let symbol = ray
         .create_node("Symbol", &format!("file{i}:sym{s}"), HashMap::new())
         .unwrap();
-      symbols.push(symbol.id);
+      symbols.push(symbol.id());
     }
     symbol_ids.push(symbols);
   }
@@ -384,7 +384,7 @@ fn bench_node_exists(c: &mut Criterion) {
     let node = ray
       .create_node("User", &format!("user{i}"), HashMap::new())
       .unwrap();
-    node_ids.push(node.id);
+    node_ids.push(node.id());
   }
 
   group.bench_function("exists_true", |bencher| {
@@ -433,7 +433,7 @@ fn bench_link(c: &mut Criterion) {
               let node = ray
                 .create_node("User", &format!("user{i}"), HashMap::new())
                 .unwrap();
-              node_ids.push(node.id);
+              node_ids.push(node.id());
             }
 
             (temp_dir, ray, node_ids)
@@ -468,7 +468,7 @@ fn bench_has_edge(c: &mut Criterion) {
     let node = ray
       .create_node("User", &format!("user{i}"), HashMap::new())
       .unwrap();
-    node_ids.push(node.id);
+    node_ids.push(node.id());
   }
 
   // Create edges in a chain
@@ -527,7 +527,7 @@ fn bench_set_edge_prop(c: &mut Criterion) {
               let node = ray
                 .create_node("User", &format!("user{i}"), HashMap::new())
                 .unwrap();
-              node_ids.push(node.id);
+              node_ids.push(node.id());
             }
 
             let mut edges = Vec::with_capacity(edge_count);
@@ -569,7 +569,7 @@ fn bench_get_edge_prop(c: &mut Criterion) {
     let node = ray
       .create_node("User", &format!("user{i}"), HashMap::new())
       .unwrap();
-    node_ids.push(node.id);
+    node_ids.push(node.id());
   }
 
   let mut edges = Vec::with_capacity(edge_count);
@@ -777,7 +777,7 @@ fn bench_neighbors_out(c: &mut Criterion) {
     let node = ray
       .create_node("User", &format!("user{i}"), HashMap::new())
       .unwrap();
-    node_ids.push(node.id);
+    node_ids.push(node.id());
   }
 
   // Create edges: each node follows the next 10 nodes
@@ -897,7 +897,7 @@ fn bench_multi_hop_traversal(c: &mut Criterion) {
     let node = ray
       .create_node("User", &format!("user{i}"), HashMap::new())
       .unwrap();
-    node_ids.push(node.id);
+    node_ids.push(node.id());
   }
 
   // Linear chain
@@ -964,7 +964,7 @@ fn bench_get_prop(c: &mut Criterion) {
     props.insert("name".to_string(), PropValue::String(format!("User{i}")));
     props.insert("age".to_string(), PropValue::I64(i as i64));
     let node = ray.create_node("User", &format!("user{i}"), props).unwrap();
-    node_ids.push(node.id);
+    node_ids.push(node.id());
   }
 
   group.bench_function("get_existing_prop", |bencher| {
@@ -998,7 +998,7 @@ fn bench_set_prop(c: &mut Criterion) {
         let temp_dir = tempdir().unwrap();
         let mut ray = Kite::open(temp_db_path(&temp_dir), create_test_schema()).unwrap();
         let node = ray.create_node("User", "testuser", HashMap::new()).unwrap();
-        (temp_dir, ray, node.id)
+        (temp_dir, ray, node.id())
       },
       |(_temp_dir, mut ray, node_id)| {
         for i in 0..100 {
@@ -1020,7 +1020,7 @@ fn bench_set_prop_tx(c: &mut Criterion) {
         let temp_dir = tempdir().unwrap();
         let mut ray = Kite::open(temp_db_path(&temp_dir), create_test_schema()).unwrap();
         let node = ray.create_node("User", "testuser", HashMap::new()).unwrap();
-        (temp_dir, ray, node.id)
+        (temp_dir, ray, node.id())
       },
       |(_temp_dir, mut ray, node_id)| {
         let _ = black_box(ray.transaction(|ctx| {
@@ -1053,7 +1053,7 @@ fn bench_shortest_path(c: &mut Criterion) {
     let node = ray
       .create_node("User", &format!("user{i}"), HashMap::new())
       .unwrap();
-    node_ids.push(node.id);
+    node_ids.push(node.id());
   }
 
   // Connect grid horizontally and vertically
@@ -1110,7 +1110,7 @@ fn bench_count(c: &mut Criterion) {
     let node = ray
       .create_node("User", &format!("user{i}"), HashMap::new())
       .unwrap();
-    node_ids.push(node.id);
+    node_ids.push(node.id());
   }
 
   for i in 0..995 {

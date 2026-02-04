@@ -286,8 +286,7 @@ impl SingleFileDB {
 
     if new_wal_page_count < MIN_WAL_PAGES {
       return Err(KiteError::Internal(format!(
-        "WAL size too small: minimum is {} pages",
-        MIN_WAL_PAGES
+        "WAL size too small: minimum is {MIN_WAL_PAGES} pages"
       )));
     }
 

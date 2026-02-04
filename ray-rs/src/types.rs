@@ -313,6 +313,12 @@ pub type PropValueRef = std::sync::Arc<PropValue>;
 /// Shared vector storage for pending operations
 pub type VectorRef = std::sync::Arc<[f32]>;
 
+/// Edge property entry (key/value)
+pub type EdgeProp = (PropKeyId, PropValue);
+
+/// Edge with properties in batch operations
+pub type EdgeWithProps = (NodeId, ETypeId, NodeId, Vec<EdgeProp>);
+
 impl PropValue {
   pub fn tag(&self) -> PropValueTag {
     match self {

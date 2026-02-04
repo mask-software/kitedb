@@ -444,10 +444,7 @@ impl SingleFileDB {
   }
 
   /// Add multiple edges with properties in a single WAL record
-  pub fn add_edges_with_props_batch(
-    &self,
-    edges: Vec<(NodeId, ETypeId, NodeId, Vec<(PropKeyId, PropValue)>)>,
-  ) -> Result<()> {
+  pub fn add_edges_with_props_batch(&self, edges: Vec<EdgeWithProps>) -> Result<()> {
     if edges.is_empty() {
       return Ok(());
     }

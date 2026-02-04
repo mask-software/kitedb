@@ -101,7 +101,7 @@ mod tests {
       props.insert("age".to_string(), PropValue::I64(20 + (i % 50) as i64));
       props.insert("score".to_string(), PropValue::F64(i as f64 * 0.1));
       let node = ray.create_node("User", &format!("user{i}"), props).unwrap();
-      node_ids.push(node.id);
+      node_ids.push(node.id());
     }
 
     // Create edges (chain + random)
@@ -221,7 +221,7 @@ mod tests {
             .get("User", &format!("user{i}"))
             .ok()
             .flatten()
-            .map(|n| n.id)
+            .map(|n| n.id())
         })
         .collect()
     };
@@ -280,7 +280,7 @@ mod tests {
             .get("User", &format!("user{i}"))
             .ok()
             .flatten()
-            .map(|n| n.id)
+            .map(|n| n.id())
         })
         .collect()
     };
@@ -338,7 +338,7 @@ mod tests {
             .get("User", &format!("user{i}"))
             .ok()
             .flatten()
-            .map(|n| n.id)
+            .map(|n| n.id())
         })
         .collect()
     };

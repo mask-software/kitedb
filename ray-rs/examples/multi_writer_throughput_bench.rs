@@ -285,10 +285,10 @@ fn main() {
   let tx_total = (config.threads * config.tx_per_thread) as u64;
 
   println!("\n--- Throughput ---");
-  println!("Elapsed: {:.3}s", elapsed);
-  println!("Transactions: {}", tx_total);
-  println!("Nodes written: {}", nodes_written);
-  println!("Edges written: {}", edges_written);
+  println!("Elapsed: {elapsed:.3}s");
+  println!("Transactions: {tx_total}");
+  println!("Nodes written: {nodes_written}");
+  println!("Edges written: {edges_written}");
   println!("Tx rate: {}", format_rate(tx_total, elapsed));
   println!("Node rate: {}", format_rate(nodes_written, elapsed));
   println!("Edge rate: {}", format_rate(edges_written, elapsed));

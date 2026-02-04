@@ -72,7 +72,7 @@ fn setup_ray_db(
     props.insert("age".to_string(), PropValue::I64(20 + (i % 50) as i64));
     props.insert("score".to_string(), PropValue::F64(i as f64 * 0.1));
     let node = ray.create_node("User", &format!("user{i}"), props).unwrap();
-    node_ids.push(node.id);
+    node_ids.push(node.id());
 
     // Optimize periodically to avoid WAL overflow
     if (i + 1) % 1000 == 0 {
@@ -271,7 +271,7 @@ fn bench_property_read_scaling(c: &mut Criterion) {
           .get("User", &format!("user{i}"))
           .ok()
           .flatten()
-          .map(|n| n.id)
+          .map(|n| n.id())
       })
       .collect()
   };
@@ -340,7 +340,7 @@ fn bench_traversal_scaling(c: &mut Criterion) {
           .get("User", &format!("user{i}"))
           .ok()
           .flatten()
-          .map(|n| n.id)
+          .map(|n| n.id())
       })
       .collect()
   };
@@ -802,7 +802,7 @@ fn bench_edge_check_scaling(c: &mut Criterion) {
           .get("User", &format!("user{i}"))
           .ok()
           .flatten()
-          .map(|n| n.id)
+          .map(|n| n.id())
       })
       .collect()
   };

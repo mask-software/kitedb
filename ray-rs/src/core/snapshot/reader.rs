@@ -268,9 +268,8 @@ impl SnapshotData {
   }
 
   fn init_string_cache(num_strings: u64) -> Result<Vec<OnceLock<Arc<str>>>> {
-    let base_len = usize::try_from(num_strings).map_err(|_| {
-      KiteError::InvalidSnapshot("Snapshot string table too large".to_string())
-    })?;
+    let base_len = usize::try_from(num_strings)
+      .map_err(|_| KiteError::InvalidSnapshot("Snapshot string table too large".to_string()))?;
     let len = base_len
       .checked_add(1)
       .ok_or_else(|| KiteError::InvalidSnapshot("Snapshot string table too large".to_string()))?;

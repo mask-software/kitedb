@@ -14,7 +14,7 @@ use crate::core::single_file::{
   VacuumOptions as RustVacuumOptions,
 };
 use crate::metrics as core_metrics;
-use crate::types::{ETypeId, NodeId, PropKeyId};
+use crate::types::{ETypeId, EdgeWithProps as CoreEdgeWithProps, NodeId, PropKeyId};
 
 // Import from modular structure
 use super::ops::{
@@ -31,6 +31,8 @@ use super::traversal::{PyPathEdge, PyPathResult, PyTraversalResult};
 use super::types::{
   Edge, EdgePage, EdgeWithProps, FullEdge, NodePage, NodeProp, NodeWithProps, PropValue,
 };
+
+type EdgePropsInput = (i64, u32, i64, Vec<(u32, PropValue)>);
 
 // ============================================================================
 // Database Inner Enum
@@ -245,11 +247,9 @@ impl PyDatabase {
 
   /// Begin a bulk-load transaction (fast path, MVCC disabled)
   fn begin_bulk(&self) -> PyResult<i64> {
-    dispatch!(
-      self,
-      |db| transaction::begin_bulk_single_file(db),
-      |_db| { unreachable!("multi-file database support removed") }
-    )
+    dispatch!(self, |db| transaction::begin_bulk_single_file(db), |_db| {
+      unreachable!("multi-file database support removed")
+    })
   }
 
   fn commit(&self) -> PyResult<()> {
@@ -427,32 +427,23 @@ impl PyDatabase {
   }
 
   /// Add multiple edges with props in a single WAL record (fast path)
-  fn add_edges_with_props_batch(
-    &self,
-    edges: Vec<(i64, u32, i64, Vec<(u32, PropValue)>)>,
-  ) -> PyResult<()> {
+  fn add_edges_with_props_batch(&self, edges: Vec<EdgePropsInput>) -> PyResult<()> {
     let guard = self
       .inner
       .read()
       .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     match guard.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
-        let core_edges: Vec<(NodeId, ETypeId, NodeId, Vec<(PropKeyId, crate::types::PropValue)>)> =
-          edges
-            .into_iter()
-            .map(|(src, etype, dst, props)| {
-              let core_props = props
-                .into_iter()
-                .map(|(key_id, value)| (key_id as PropKeyId, value.into()))
-                .collect();
-              (
-                src as NodeId,
-                etype as ETypeId,
-                dst as NodeId,
-                core_props,
-              )
-            })
-            .collect();
+        let core_edges: Vec<CoreEdgeWithProps> = edges
+          .into_iter()
+          .map(|(src, etype, dst, props)| {
+            let core_props = props
+              .into_iter()
+              .map(|(key_id, value)| (key_id as PropKeyId, value.into()))
+              .collect();
+            (src as NodeId, etype as ETypeId, dst as NodeId, core_props)
+          })
+          .collect();
         db.add_edges_with_props_batch(core_edges)
           .map_err(|e| PyRuntimeError::new_err(format!("Failed to add edges: {e}")))
       }

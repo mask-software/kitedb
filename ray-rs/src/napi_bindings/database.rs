@@ -26,7 +26,10 @@ use crate::core::single_file::{
 use crate::export as ray_export;
 use crate::metrics as core_metrics;
 use crate::streaming;
-use crate::types::{CheckResult as RustCheckResult, ETypeId, Edge, NodeId, PropKeyId, PropValue};
+use crate::types::{
+  CheckResult as RustCheckResult, ETypeId, Edge, EdgeWithProps as CoreEdgeWithProps, NodeId,
+  PropKeyId, PropValue,
+};
 use crate::util::compression::{CompressionOptions as CoreCompressionOptions, CompressionType};
 use serde_json;
 
@@ -1200,7 +1203,13 @@ impl Database {
       Some(DatabaseInner::SingleFile(db)) => {
         let core_edges: Vec<(NodeId, ETypeId, NodeId)> = edges
           .into_iter()
-          .map(|edge| (edge.src as NodeId, edge.etype as ETypeId, edge.dst as NodeId))
+          .map(|edge| {
+            (
+              edge.src as NodeId,
+              edge.etype as ETypeId,
+              edge.dst as NodeId,
+            )
+          })
           .collect();
         db.add_edges_batch(&core_edges)
           .map_err(|e| Error::from_reason(format!("Failed to add edges: {e}")))
@@ -1214,7 +1223,7 @@ impl Database {
   pub fn add_edges_with_props_batch(&self, edges: Vec<JsEdgeWithPropsInput>) -> Result<()> {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
-        let core_edges: Vec<(NodeId, ETypeId, NodeId, Vec<(PropKeyId, PropValue)>)> = edges
+        let core_edges: Vec<CoreEdgeWithProps> = edges
           .into_iter()
           .map(|edge| {
             let props = edge

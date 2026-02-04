@@ -231,7 +231,7 @@ pub fn build_create_node_payload(node_id: NodeId, key: Option<&str>) -> Vec<u8> 
 pub fn build_create_nodes_batch_payload(entries: &[(NodeId, Option<&str>)]) -> Vec<u8> {
   let mut total_len = 4;
   for (_, key) in entries.iter() {
-    let key_len = key.map(|k| k.as_bytes().len()).unwrap_or(0);
+    let key_len = key.map(|k| k.len()).unwrap_or(0);
     total_len += 8 + 4 + key_len;
   }
 
@@ -320,9 +320,7 @@ pub fn build_add_edge_props_payload(
 
 /// Build ADD_EDGES_PROPS_BATCH payload
 /// Format: count (4) + repeated (src (8) + etype (4) + dst (8) + prop_count (4) + props...)
-pub fn build_add_edges_props_batch_payload(
-  edges: &[(NodeId, ETypeId, NodeId, Vec<(PropKeyId, PropValue)>)],
-) -> Vec<u8> {
+pub fn build_add_edges_props_batch_payload(edges: &[EdgeWithProps]) -> Vec<u8> {
   let mut total_len = 4;
   for (_, _, _, props) in edges.iter() {
     total_len += 8 + 4 + 8 + 4;
@@ -386,7 +384,7 @@ fn prop_value_serialized_len(value: &PropValue) -> usize {
     PropValue::Null => 1,
     PropValue::Bool(_) => 2,
     PropValue::I64(_) | PropValue::F64(_) => 9,
-    PropValue::String(s) => 1 + 4 + s.as_bytes().len(),
+    PropValue::String(s) => 1 + 4 + s.len(),
     PropValue::VectorF32(v) => 1 + 4 + v.len() * 4,
   }
 }

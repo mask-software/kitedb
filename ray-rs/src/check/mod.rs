@@ -101,18 +101,16 @@ pub fn check_snapshot(snapshot: &SnapshotData) -> CheckResult {
     &mut warnings,
   );
 
-  check_edge_reciprocity(
-    out_offsets.as_deref(),
-    out_etype.as_deref(),
-    out_dst.as_deref(),
-    in_offsets.as_deref(),
-    in_src.as_deref(),
-    in_etype.as_deref(),
-    in_out_index.as_deref(),
-    num_nodes,
-    num_edges,
-    &mut errors,
-  );
+  let reciprocity_sections = EdgeReciprocitySections {
+    out_offsets: out_offsets.as_deref(),
+    out_etype: out_etype.as_deref(),
+    out_dst: out_dst.as_deref(),
+    in_offsets: in_offsets.as_deref(),
+    in_src: in_src.as_deref(),
+    in_etype: in_etype.as_deref(),
+    in_out_index: in_out_index.as_deref(),
+  };
+  check_edge_reciprocity(&reciprocity_sections, num_nodes, num_edges, &mut errors);
 
   let key_entries = match key_entries {
     Some(entries) => entries,
@@ -125,11 +123,7 @@ pub fn check_snapshot(snapshot: &SnapshotData) -> CheckResult {
     }
   };
 
-  check_key_index_ordering(
-    key_entries.as_ref(),
-    key_buckets.as_deref(),
-    &mut errors,
-  );
+  check_key_index_ordering(key_entries.as_ref(), key_buckets.as_deref(), &mut errors);
 
   let num_strings = match usize::try_from(snapshot.header.num_strings) {
     Ok(v) => v,
@@ -206,7 +200,9 @@ fn check_edge_references(
   num_nodes: usize,
   errors: &mut Vec<String>,
 ) {
-  let Some(data) = data else { return; };
+  let Some(data) = data else {
+    return;
+  };
 
   if data.len() < num_edges * 4 {
     errors.push(format!("{name} section is too small"));
@@ -294,7 +290,8 @@ fn check_out_edge_sorting(
   errors: &mut Vec<String>,
   warnings: &mut Vec<String>,
 ) {
-  let (Some(out_offsets), Some(out_etype), Some(out_dst)) = (out_offsets, out_etype, out_dst) else {
+  let (Some(out_offsets), Some(out_etype), Some(out_dst)) = (out_offsets, out_etype, out_dst)
+  else {
     return;
   };
 
@@ -340,15 +337,19 @@ fn check_out_edge_sorting(
   }
 }
 
+struct EdgeReciprocitySections<'a> {
+  out_offsets: Option<&'a [u8]>,
+  out_etype: Option<&'a [u8]>,
+  out_dst: Option<&'a [u8]>,
+  in_offsets: Option<&'a [u8]>,
+  in_src: Option<&'a [u8]>,
+  in_etype: Option<&'a [u8]>,
+  in_out_index: Option<&'a [u8]>,
+}
+
 #[inline]
 fn check_edge_reciprocity(
-  out_offsets: Option<&[u8]>,
-  out_etype: Option<&[u8]>,
-  out_dst: Option<&[u8]>,
-  in_offsets: Option<&[u8]>,
-  in_src: Option<&[u8]>,
-  in_etype: Option<&[u8]>,
-  in_out_index: Option<&[u8]>,
+  sections: &EdgeReciprocitySections<'_>,
   num_nodes: usize,
   num_edges: usize,
   errors: &mut Vec<String>,
@@ -362,14 +363,15 @@ fn check_edge_reciprocity(
     Some(in_etype),
     Some(in_out_index),
   ) = (
-    out_offsets,
-    out_etype,
-    out_dst,
-    in_offsets,
-    in_src,
-    in_etype,
-    in_out_index,
-  ) else {
+    sections.out_offsets,
+    sections.out_etype,
+    sections.out_dst,
+    sections.in_offsets,
+    sections.in_src,
+    sections.in_etype,
+    sections.in_out_index,
+  )
+  else {
     return;
   };
 
