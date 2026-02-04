@@ -14,6 +14,8 @@ export declare class Database {
   get readOnly(): boolean
   /** Begin a transaction */
   begin(readOnly?: boolean | undefined | null): number
+  /** Begin a bulk-load transaction (fast path, MVCC disabled) */
+  beginBulk(): number
   /** Commit the current transaction */
   commit(): void
   /** Rollback the current transaction */
@@ -22,6 +24,8 @@ export declare class Database {
   hasTransaction(): boolean
   /** Create a new node */
   createNode(key?: string | undefined | null): number
+  /** Create multiple nodes in a single WAL record (fast path) */
+  createNodesBatch(keys: Array<string | null | undefined>): Array<number>
   /** Upsert a node by key (create if missing, update props) */
   upsertNode(key: string, props: Array<JsNodeProp>): number
   /** Upsert a node by ID (create if missing, update props) */
@@ -40,6 +44,10 @@ export declare class Database {
   countNodes(): number
   /** Add an edge */
   addEdge(src: number, etype: number, dst: number): void
+  /** Add multiple edges in a single WAL record (fast path) */
+  addEdgesBatch(edges: Array<JsFullEdge>): void
+  /** Add multiple edges with props in a single WAL record (fast path) */
+  addEdgesWithPropsBatch(edges: Array<JsEdgeWithPropsInput>): void
   /** Add an edge by type name */
   addEdgeByName(src: number, etypeName: string, dst: number): void
   /**
@@ -634,6 +642,8 @@ export declare class Kite {
   check(): CheckResult
   /** Begin a transaction */
   begin(readOnly?: boolean | undefined | null): number
+  /** Begin a bulk-load transaction (fast path, MVCC disabled) */
+  beginBulk(): number
   /** Commit the current transaction */
   commit(): void
   /** Rollback the current transaction */
@@ -1054,6 +1064,13 @@ export interface JsFullEdge {
   src: number
   etype: number
   dst: number
+}
+
+export interface JsEdgeWithPropsInput {
+  src: number
+  etype: number
+  dst: number
+  props: Array<JsNodeProp>
 }
 
 /** Configuration for IVF index */

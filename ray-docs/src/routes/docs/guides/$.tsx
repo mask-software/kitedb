@@ -750,6 +750,62 @@ db.batch(vec![
 ])`}
         />
 
+        <h2 id="bulk-load">Bulk Load (Max Throughput)</h2>
+        <p>
+          Bulk-load disables MVCC to minimize per-write overhead. Use for one-shot
+          ingest or ETL jobs; avoid concurrent readers/writers while it runs.
+        </p>
+        <MultiLangCode
+          typescript={`import { Database } from '@kitedb/core';
+
+const db = Database.open('./my.kitedb');
+db.beginBulk();
+const nodeIds = db.createNodesBatch(keys); // keys: Array<string | null>
+db.addEdgesBatch(edges); // edges: { src, etype, dst }[]
+db.addEdgesWithPropsBatch(edgesWithProps);
+db.commit();`}
+          rust={`use kitedb::Database;
+
+let db = Database::open("./my.kitedb", None)?;
+db.begin_bulk()?;
+let node_ids = db.create_nodes_batch(&keys)?;
+db.add_edges_batch(&edges)?;
+db.add_edges_with_props_batch(edges_with_props)?;
+db.commit()?;`}
+          python={`from kitedb import Database
+
+db = Database("./my.kitedb")
+db.begin_bulk()
+node_ids = db.create_nodes_batch(keys)  # keys: List[Optional[str]]
+db.add_edges_batch(edges)               # edges: List[Tuple[int, int, int]]
+db.add_edges_with_props_batch(edges_with_props)
+db.commit()`}
+        />
+
+        <h2 id="write-path">Choose Your Write Path</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Goal</th>
+              <th>Recommended API</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Max throughput, single writer</td>
+              <td><code>begin_bulk()</code> + batch APIs</td>
+            </tr>
+            <tr>
+              <td>Atomic ingest w/ MVCC</td>
+              <td><code>batch()</code> / <code>transaction()</code></td>
+            </tr>
+            <tr>
+              <td>Multi-writer throughput</td>
+              <td><code>sync_mode=Normal</code> + group commit + chunked batches</td>
+            </tr>
+          </tbody>
+        </table>
+
         <h2 id="limitations">Current Limitations</h2>
         <ul>
           <li>
@@ -874,6 +930,132 @@ if db.has_transaction():
         <ul>
           <li><a href="/docs/api/high-level">API Reference</a> – Full transaction API</li>
           <li><a href="/docs/internals/architecture">Architecture</a> – How transactions work</li>
+        </ul>
+      </DocPage>
+    )
+  }
+
+  if (slug === 'guides/performance') {
+    return (
+      <DocPage slug={slug}>
+        <p>
+          Use this checklist to pick the fastest write path and the right durability
+          preset for your workload. The goal is simple: fewer WAL syncs, fewer
+          per-op allocations, and bigger batches.
+        </p>
+
+        <h2 id="decision">Decision Matrix</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Goal</th>
+              <th>Best Path</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Max ingest throughput, single writer</td>
+              <td><code>begin_bulk()</code> + batch APIs</td>
+            </tr>
+            <tr>
+              <td>Atomic ingest with MVCC</td>
+              <td><code>transaction()</code> / <code>batch()</code></td>
+            </tr>
+            <tr>
+              <td>Multi-writer throughput</td>
+              <td><code>sync_mode=Normal</code> + group commit (1-2ms)</td>
+            </tr>
+            <tr>
+              <td>Strong durability per commit</td>
+              <td><code>sync_mode=Full</code></td>
+            </tr>
+            <tr>
+              <td>Throwaway or test data</td>
+              <td><code>sync_mode=Off</code></td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h2 id="bulk">Bulk Ingest (Fastest Path)</h2>
+        <p>
+          Bulk-load disables MVCC to minimize overhead. Use it for one-shot ingest
+          or ETL jobs. Avoid concurrent readers/writers while it runs.
+        </p>
+        <MultiLangCode
+          typescript={`import { Database } from '@kitedb/core';
+
+const db = Database.open('./my.kitedb');
+db.beginBulk();
+const nodeIds = db.createNodesBatch(keys);
+db.addEdgesBatch(edges);
+db.addEdgesWithPropsBatch(edgesWithProps);
+db.commit();`}
+          rust={`use kitedb::Database;
+
+let db = Database::open("./my.kitedb", None)?;
+db.begin_bulk()?;
+let node_ids = db.create_nodes_batch(&keys)?;
+db.add_edges_batch(&edges)?;
+db.add_edges_with_props_batch(edges_with_props)?;
+db.commit()?;`}
+          python={`from kitedb import Database
+
+db = Database("./my.kitedb")
+db.begin_bulk()
+node_ids = db.create_nodes_batch(keys)
+db.add_edges_batch(edges)
+db.add_edges_with_props_batch(edges_with_props)
+db.commit()`}
+        />
+
+        <h2 id="presets">Config Presets</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Preset</th>
+              <th>Settings</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Single-writer ingest</td>
+              <td>
+                <code>sync_mode=Normal</code>, <code>group_commit=false</code>,
+                WAL ≥ 256MB, <code>auto_checkpoint=false</code>
+              </td>
+            </tr>
+            <tr>
+              <td>Multi-writer throughput</td>
+              <td>
+                <code>sync_mode=Normal</code>, <code>group_commit=true</code>
+                (1-2ms window), chunked batches
+              </td>
+            </tr>
+            <tr>
+              <td>Max durability</td>
+              <td><code>sync_mode=Full</code>, smaller batches</td>
+            </tr>
+            <tr>
+              <td>Max speed (test)</td>
+              <td><code>sync_mode=Off</code></td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h2 id="checklist">Checklist</h2>
+        <ul>
+          <li>Use batch APIs: <code>create_nodes_batch</code>, <code>add_edges_batch</code>, <code>add_edges_with_props_batch</code></li>
+          <li>Prefer <code>begin_bulk()</code> for ingest; commit in chunks</li>
+          <li>Increase WAL size for large ingest (256MB+)</li>
+          <li>Disable auto-checkpoint during ingest; checkpoint once at the end</li>
+          <li>Use low-level API for hot paths in JS/TS</li>
+          <li>Avoid per-edge property sets when you can batch props with the edge</li>
+        </ul>
+
+        <h2 id="verify">Verify With Benchmarks</h2>
+        <ul>
+          <li><a href="/docs/benchmarks/graph">Graph Benchmarks</a> – Baselines and numbers</li>
+          <li><a href="/docs/internals/performance">Performance</a> – Deeper tuning notes</li>
         </ul>
       </DocPage>
     )

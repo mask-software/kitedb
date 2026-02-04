@@ -573,7 +573,10 @@ impl IvfPqIndex {
       match shared_dist_table.as_deref() {
         Some(table) => Some(table),
         None => {
-          debug_assert!(false, "shared distance table missing for non-residual search");
+          debug_assert!(
+            false,
+            "shared distance table missing for non-residual search"
+          );
           return Vec::new();
         }
       }
@@ -640,7 +643,10 @@ impl IvfPqIndex {
       } else if let Some(table) = shared_table {
         search_vectors(table, vector_ids);
       } else {
-        debug_assert!(false, "shared distance table missing for non-residual search");
+        debug_assert!(
+          false,
+          "shared distance table missing for non-residual search"
+        );
         return Vec::new();
       }
     }

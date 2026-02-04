@@ -160,7 +160,9 @@ pub fn create_offline_backup(
   let backup_path = PathBuf::from(backup_path.as_ref());
 
   if !db_path.exists() {
-    return Err(KiteError::Internal("Database not found at path".to_string()));
+    return Err(KiteError::Internal(
+      "Database not found at path".to_string(),
+    ));
   }
 
   if backup_path.exists() && !options.overwrite {

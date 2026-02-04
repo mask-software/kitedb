@@ -1167,9 +1167,7 @@ mod tests {
       1,
       2,
       1,
-      Some(std::sync::Arc::new(PropValue::F64(
-        std::f64::consts::PI,
-      ))),
+      Some(std::sync::Arc::new(PropValue::F64(std::f64::consts::PI))),
       1,
       10,
     );

@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use parking_lot::{Mutex, RwLock};
 
@@ -508,10 +508,12 @@ pub fn open_single_file<P: AsRef<Path>>(
 
     if !committed_in_order.is_empty() {
       use crate::core::wal::record::{
-        parse_add_edge_payload, parse_add_edge_props_payload, parse_add_node_label_payload,
-        parse_create_node_payload, parse_del_edge_prop_payload, parse_del_node_prop_payload,
-        parse_delete_edge_payload, parse_delete_node_payload, parse_remove_node_label_payload,
-        parse_set_edge_prop_payload, parse_set_edge_props_payload, parse_set_node_prop_payload,
+        parse_add_edge_payload, parse_add_edge_props_payload, parse_add_edges_batch_payload,
+        parse_add_edges_props_batch_payload, parse_add_node_label_payload,
+        parse_create_node_payload, parse_create_nodes_batch_payload, parse_del_edge_prop_payload,
+        parse_del_node_prop_payload, parse_delete_edge_payload, parse_delete_node_payload,
+        parse_remove_node_label_payload, parse_set_edge_prop_payload, parse_set_edge_props_payload,
+        parse_set_node_prop_payload,
       };
 
       let mut commit_ts: u64 = 1;
@@ -534,6 +536,24 @@ pub fn open_single_file<P: AsRef<Path>>(
                 }
               }
             }
+            WalRecordType::CreateNodesBatch => {
+              if let Some(nodes) = parse_create_nodes_batch_payload(&record.payload) {
+                for data in nodes {
+                  if let Some(node_delta) = delta.created_nodes.get(&data.node_id) {
+                    let mut vc = mvcc.version_chain.lock();
+                    vc.append_node_version(
+                      data.node_id,
+                      NodeVersionData {
+                        node_id: data.node_id,
+                        delta: node_delta.for_version(),
+                      },
+                      *txid,
+                      commit_ts,
+                    );
+                  }
+                }
+              }
+            }
             WalRecordType::DeleteNode => {
               if let Some(data) = parse_delete_node_payload(&record.payload) {
                 let mut vc = mvcc.version_chain.lock();
@@ -544,6 +564,14 @@ pub fn open_single_file<P: AsRef<Path>>(
               if let Some(data) = parse_add_edge_payload(&record.payload) {
                 let mut vc = mvcc.version_chain.lock();
                 vc.append_edge_version(data.src, data.etype, data.dst, true, *txid, commit_ts);
+              }
+            }
+            WalRecordType::AddEdgesBatch => {
+              if let Some(edges) = parse_add_edges_batch_payload(&record.payload) {
+                let mut vc = mvcc.version_chain.lock();
+                for data in edges {
+                  vc.append_edge_version(data.src, data.etype, data.dst, true, *txid, commit_ts);
+                }
               }
             }
             WalRecordType::AddEdgeProps => {
@@ -560,6 +588,25 @@ pub fn open_single_file<P: AsRef<Path>>(
                     *txid,
                     commit_ts,
                   );
+                }
+              }
+            }
+            WalRecordType::AddEdgesPropsBatch => {
+              if let Some(edges) = parse_add_edges_props_batch_payload(&record.payload) {
+                let mut vc = mvcc.version_chain.lock();
+                for data in edges {
+                  vc.append_edge_version(data.src, data.etype, data.dst, true, *txid, commit_ts);
+                  for (key_id, value) in data.props {
+                    vc.append_edge_prop_version(
+                      data.src,
+                      data.etype,
+                      data.dst,
+                      key_id,
+                      Some(std::sync::Arc::new(value)),
+                      *txid,
+                      commit_ts,
+                    );
+                  }
                 }
               }
             }
@@ -676,6 +723,7 @@ pub fn open_single_file<P: AsRef<Path>>(
     next_propkey_id: AtomicU32::new(next_propkey_id),
     next_tx_id: AtomicU64::new(next_tx_id),
     current_tx: Mutex::new(HashMap::new()),
+    active_writers: AtomicUsize::new(0),
     commit_lock: Mutex::new(()),
     group_commit_state: Mutex::new(super::GroupCommitState::default()),
     group_commit_cv: parking_lot::Condvar::new(),
@@ -855,8 +903,7 @@ mod tests {
     db.begin(false).unwrap();
     let node_id = db.create_node(Some("n1")).unwrap();
     let key_id = db.get_or_create_propkey("value");
-    db
-      .set_node_prop(node_id, key_id, crate::types::PropValue::I64(42))
+    db.set_node_prop(node_id, key_id, crate::types::PropValue::I64(42))
       .unwrap();
     db.commit().unwrap();
 
@@ -873,9 +920,7 @@ mod tests {
     )
     .unwrap();
 
-    let value = reopened
-      .get_node_prop(node_id, key_id)
-      .expect("prop value");
+    let value = reopened.get_node_prop(node_id, key_id).expect("prop value");
     assert_eq!(value, crate::types::PropValue::I64(42));
 
     close_single_file(reopened).unwrap();
@@ -886,11 +931,7 @@ mod tests {
     let temp_dir = tempdir().unwrap();
     let db_path = temp_dir.path().join("wal-size-mismatch.kitedb");
 
-    let db = open_single_file(
-      &db_path,
-      SingleFileOpenOptions::new().wal_size(64 * 1024),
-    )
-    .unwrap();
+    let db = open_single_file(&db_path, SingleFileOpenOptions::new().wal_size(64 * 1024)).unwrap();
     close_single_file(db).unwrap();
 
     let reopen = open_single_file(

@@ -961,9 +961,20 @@ export function bulkWrite<T>(
 
   const results: Array<T> = []
   let index = 0
+  const beginBulk = typeof (db as unknown as { beginBulk?: () => number }).beginBulk === 'function'
+    ? () => (db as unknown as { beginBulk: () => number }).beginBulk()
+    : null
 
   while (index < operations.length) {
-    db.begin()
+    if (beginBulk) {
+      try {
+        beginBulk()
+      } catch {
+        db.begin()
+      }
+    } else {
+      db.begin()
+    }
     try {
       const end = Math.min(index + chunkSize, operations.length)
       for (; index < end; index += 1) {

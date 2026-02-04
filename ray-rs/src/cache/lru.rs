@@ -113,7 +113,8 @@ impl<K: Hash + Eq + Clone, V> LruCache<K, V> {
     // Move to front (most recently used)
     self.move_to_front(node_ptr);
 
-    // SAFETY: node_ptr is valid because it's in our map
+    // SAFETY: node_ptr came from our map; nodes are leaked on insert and freed
+    // only after removal from map+list, so the pointer stays valid here.
     unsafe { Some(&(*node_ptr.as_ptr()).value) }
   }
 
@@ -131,7 +132,8 @@ impl<K: Hash + Eq + Clone, V> LruCache<K, V> {
     // Move to front (most recently used)
     self.move_to_front(node_ptr);
 
-    // SAFETY: node_ptr is valid because it's in our map
+    // SAFETY: node_ptr came from our map; nodes are leaked on insert and freed
+    // only after removal from map+list, so the pointer stays valid here.
     unsafe { Some(&mut (*node_ptr.as_ptr()).value) }
   }
 
@@ -143,7 +145,8 @@ impl<K: Hash + Eq + Clone, V> LruCache<K, V> {
     Q: Hash + Eq + ?Sized,
   {
     let node_ptr = self.map.get(key)?;
-    // SAFETY: node_ptr is valid because it's in our map
+    // SAFETY: node_ptr came from our map; nodes are leaked on insert and freed
+    // only after removal from map+list, so the pointer stays valid here.
     unsafe { Some(&(*node_ptr.as_ptr()).value) }
   }
 

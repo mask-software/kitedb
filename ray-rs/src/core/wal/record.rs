@@ -226,6 +226,34 @@ pub fn build_create_node_payload(node_id: NodeId, key: Option<&str>) -> Vec<u8> 
   buffer
 }
 
+/// Build CREATE_NODES_BATCH payload
+/// Format: count (4) + repeated (node_id (8) + key_len (4) + key_bytes)
+pub fn build_create_nodes_batch_payload(entries: &[(NodeId, Option<&str>)]) -> Vec<u8> {
+  let mut total_len = 4;
+  for (_, key) in entries.iter() {
+    let key_len = key.map(|k| k.as_bytes().len()).unwrap_or(0);
+    total_len += 8 + 4 + key_len;
+  }
+
+  let mut buffer = vec![0u8; total_len];
+  write_u32(&mut buffer, 0, entries.len() as u32);
+
+  let mut offset = 4;
+  for (node_id, key) in entries.iter() {
+    write_u64(&mut buffer, offset, *node_id);
+    offset += 8;
+    let key_bytes = key.map(|k| k.as_bytes()).unwrap_or(&[]);
+    write_u32(&mut buffer, offset, key_bytes.len() as u32);
+    offset += 4;
+    if !key_bytes.is_empty() {
+      buffer[offset..offset + key_bytes.len()].copy_from_slice(key_bytes);
+      offset += key_bytes.len();
+    }
+  }
+
+  buffer
+}
+
 /// Build DELETE_NODE payload
 pub fn build_delete_node_payload(node_id: NodeId) -> Vec<u8> {
   let mut buffer = vec![0u8; 8];
@@ -239,6 +267,26 @@ pub fn build_add_edge_payload(src: NodeId, etype: ETypeId, dst: NodeId) -> Vec<u
   write_u64(&mut buffer, 0, src);
   write_u32(&mut buffer, 8, etype);
   write_u64(&mut buffer, 12, dst);
+  buffer
+}
+
+/// Build ADD_EDGES_BATCH payload
+/// Format: count (4) + repeated (src (8) + etype (4) + dst (8))
+pub fn build_add_edges_batch_payload(edges: &[(NodeId, ETypeId, NodeId)]) -> Vec<u8> {
+  let total_len = 4 + edges.len() * (8 + 4 + 8);
+  let mut buffer = vec![0u8; total_len];
+  write_u32(&mut buffer, 0, edges.len() as u32);
+
+  let mut offset = 4;
+  for (src, etype, dst) in edges.iter() {
+    write_u64(&mut buffer, offset, *src);
+    offset += 8;
+    write_u32(&mut buffer, offset, *etype);
+    offset += 4;
+    write_u64(&mut buffer, offset, *dst);
+    offset += 8;
+  }
+
   buffer
 }
 
@@ -267,6 +315,44 @@ pub fn build_add_edge_props_payload(
     write_prop_value(value, &mut buffer[offset..]);
     offset += prop_value_serialized_len(value);
   }
+  buffer
+}
+
+/// Build ADD_EDGES_PROPS_BATCH payload
+/// Format: count (4) + repeated (src (8) + etype (4) + dst (8) + prop_count (4) + props...)
+pub fn build_add_edges_props_batch_payload(
+  edges: &[(NodeId, ETypeId, NodeId, Vec<(PropKeyId, PropValue)>)],
+) -> Vec<u8> {
+  let mut total_len = 4;
+  for (_, _, _, props) in edges.iter() {
+    total_len += 8 + 4 + 8 + 4;
+    for (_, value) in props.iter() {
+      total_len += 4 + prop_value_serialized_len(value);
+    }
+  }
+
+  let mut buffer = vec![0u8; total_len];
+  write_u32(&mut buffer, 0, edges.len() as u32);
+
+  let mut offset = 4;
+  for (src, etype, dst, props) in edges.iter() {
+    write_u64(&mut buffer, offset, *src);
+    offset += 8;
+    write_u32(&mut buffer, offset, *etype);
+    offset += 4;
+    write_u64(&mut buffer, offset, *dst);
+    offset += 8;
+    write_u32(&mut buffer, offset, props.len() as u32);
+    offset += 4;
+
+    for (key_id, value) in props.iter() {
+      write_u32(&mut buffer, offset, *key_id);
+      offset += 4;
+      write_prop_value(value, &mut buffer[offset..]);
+      offset += prop_value_serialized_len(value);
+    }
+  }
+
   buffer
 }
 /// Build DELETE_EDGE payload
@@ -493,6 +579,39 @@ pub fn parse_create_node_payload(payload: &[u8]) -> Option<CreateNodeData> {
   Some(CreateNodeData { node_id, key })
 }
 
+/// Parse CREATE_NODES_BATCH payload
+pub fn parse_create_nodes_batch_payload(payload: &[u8]) -> Option<Vec<CreateNodeData>> {
+  if payload.len() < 4 {
+    return None;
+  }
+  let count = read_u32(payload, 0) as usize;
+  let mut nodes = Vec::with_capacity(count);
+  let mut offset = 4;
+
+  for _ in 0..count {
+    if offset + 12 > payload.len() {
+      return None;
+    }
+    let node_id = read_u64(payload, offset);
+    offset += 8;
+    let key_len = read_u32(payload, offset) as usize;
+    offset += 4;
+    if offset + key_len > payload.len() {
+      return None;
+    }
+    let key = if key_len > 0 {
+      let key_bytes = payload[offset..offset + key_len].to_vec();
+      offset += key_len;
+      String::from_utf8(key_bytes).ok()
+    } else {
+      None
+    };
+    nodes.push(CreateNodeData { node_id, key });
+  }
+
+  Some(nodes)
+}
+
 /// Parsed DELETE_NODE data
 #[derive(Debug, Clone)]
 pub struct DeleteNodeData {
@@ -527,6 +646,29 @@ pub fn parse_add_edge_payload(payload: &[u8]) -> Option<AddEdgeData> {
     etype: read_u32(payload, 8),
     dst: read_u64(payload, 12),
   })
+}
+
+/// Parse ADD_EDGES_BATCH payload
+pub fn parse_add_edges_batch_payload(payload: &[u8]) -> Option<Vec<AddEdgeData>> {
+  if payload.len() < 4 {
+    return None;
+  }
+  let count = read_u32(payload, 0) as usize;
+  let mut edges = Vec::with_capacity(count);
+  let mut offset = 4;
+  for _ in 0..count {
+    if offset + 20 > payload.len() {
+      return None;
+    }
+    let src = read_u64(payload, offset);
+    offset += 8;
+    let etype = read_u32(payload, offset);
+    offset += 4;
+    let dst = read_u64(payload, offset);
+    offset += 8;
+    edges.push(AddEdgeData { src, etype, dst });
+  }
+  Some(edges)
 }
 
 /// Parsed ADD_EDGE_PROPS data
@@ -568,6 +710,51 @@ pub fn parse_add_edge_props_payload(payload: &[u8]) -> Option<AddEdgePropsData> 
     dst,
     props,
   })
+}
+
+/// Parse ADD_EDGES_PROPS_BATCH payload
+pub fn parse_add_edges_props_batch_payload(payload: &[u8]) -> Option<Vec<AddEdgePropsData>> {
+  if payload.len() < 4 {
+    return None;
+  }
+  let count = read_u32(payload, 0) as usize;
+  let mut edges = Vec::with_capacity(count);
+  let mut offset = 4;
+
+  for _ in 0..count {
+    if offset + 24 > payload.len() {
+      return None;
+    }
+    let src = read_u64(payload, offset);
+    offset += 8;
+    let etype = read_u32(payload, offset);
+    offset += 4;
+    let dst = read_u64(payload, offset);
+    offset += 8;
+    let prop_count = read_u32(payload, offset) as usize;
+    offset += 4;
+
+    let mut props = Vec::with_capacity(prop_count);
+    for _ in 0..prop_count {
+      if offset + 4 > payload.len() {
+        return None;
+      }
+      let key_id = read_u32(payload, offset);
+      offset += 4;
+      let (value, consumed) = parse_prop_value(payload, offset)?;
+      offset += consumed;
+      props.push((key_id, value));
+    }
+
+    edges.push(AddEdgePropsData {
+      src,
+      etype,
+      dst,
+      props,
+    });
+  }
+
+  Some(edges)
 }
 
 /// Parse DELETE_EDGE payload (same format as ADD_EDGE)
@@ -922,11 +1109,72 @@ mod tests {
   }
 
   #[test]
-  fn test_add_edge_props_payload() {
-    let props = vec![
-      (10, PropValue::I64(7)),
-      (11, PropValue::String("v".into())),
+  fn test_create_nodes_batch_payload() {
+    let entries = vec![(1, Some("a")), (2, None), (3, Some("ccc"))];
+    let payload = build_create_nodes_batch_payload(&entries);
+    let data = parse_create_nodes_batch_payload(&payload).unwrap();
+
+    assert_eq!(data.len(), 3);
+    assert_eq!(data[0].node_id, 1);
+    assert_eq!(data[0].key, Some("a".to_string()));
+    assert_eq!(data[1].node_id, 2);
+    assert_eq!(data[1].key, None);
+    assert_eq!(data[2].node_id, 3);
+    assert_eq!(data[2].key, Some("ccc".to_string()));
+  }
+
+  #[test]
+  fn test_add_edges_batch_payload() {
+    let edges = vec![(1, 10, 2), (2, 11, 3)];
+    let payload = build_add_edges_batch_payload(&edges);
+    let data = parse_add_edges_batch_payload(&payload).unwrap();
+
+    assert_eq!(data.len(), 2);
+    assert_eq!(data[0].src, 1);
+    assert_eq!(data[0].etype, 10);
+    assert_eq!(data[0].dst, 2);
+    assert_eq!(data[1].src, 2);
+    assert_eq!(data[1].etype, 11);
+    assert_eq!(data[1].dst, 3);
+  }
+
+  #[test]
+  fn test_add_edges_props_batch_payload() {
+    let edges = vec![
+      (1, 2, 3, vec![(10, PropValue::I64(7))]),
+      (
+        4,
+        5,
+        6,
+        vec![
+          (11, PropValue::String("v".into())),
+          (12, PropValue::Bool(true)),
+        ],
+      ),
     ];
+    let payload = build_add_edges_props_batch_payload(&edges);
+    let data = parse_add_edges_props_batch_payload(&payload).unwrap();
+
+    assert_eq!(data.len(), 2);
+    assert_eq!(data[0].src, 1);
+    assert_eq!(data[0].etype, 2);
+    assert_eq!(data[0].dst, 3);
+    assert_eq!(data[0].props.len(), 1);
+    assert_eq!(data[0].props[0].0, 10);
+    assert_eq!(data[0].props[0].1, PropValue::I64(7));
+    assert_eq!(data[1].src, 4);
+    assert_eq!(data[1].etype, 5);
+    assert_eq!(data[1].dst, 6);
+    assert_eq!(data[1].props.len(), 2);
+    assert_eq!(data[1].props[0].0, 11);
+    assert_eq!(data[1].props[0].1, PropValue::String("v".into()));
+    assert_eq!(data[1].props[1].0, 12);
+    assert_eq!(data[1].props[1].1, PropValue::Bool(true));
+  }
+
+  #[test]
+  fn test_add_edge_props_payload() {
+    let props = vec![(10, PropValue::I64(7)), (11, PropValue::String("v".into()))];
     let payload = build_add_edge_props_payload(1, 2, 3, &props);
     let data = parse_add_edge_props_payload(&payload).unwrap();
 

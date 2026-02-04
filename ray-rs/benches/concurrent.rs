@@ -13,9 +13,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
-use tempfile::tempdir;
 #[cfg(feature = "bench-profile")]
 use std::time::Instant;
+use tempfile::tempdir;
 
 // Perf profiling (optional):
 //   cargo bench --bench concurrent --features bench-profile
@@ -53,7 +53,11 @@ fn temp_db_path(temp_dir: &tempfile::TempDir) -> std::path::PathBuf {
   temp_dir.path().join("bench")
 }
 
-fn setup_ray_db(node_count: usize, edge_count: usize, group_commit: bool) -> (tempfile::TempDir, Kite) {
+fn setup_ray_db(
+  node_count: usize,
+  edge_count: usize,
+  group_commit: bool,
+) -> (tempfile::TempDir, Kite) {
   let temp_dir = tempdir().unwrap();
   let mut ray = Kite::open(
     temp_db_path(&temp_dir),
@@ -652,12 +656,7 @@ fn bench_reader_writer_contention_variant(
 }
 
 fn bench_reader_writer_contention(c: &mut Criterion) {
-  bench_reader_writer_contention_variant(
-    c,
-    "reader_writer_contention",
-    LockMode::PerOp,
-    false,
-  );
+  bench_reader_writer_contention_variant(c, "reader_writer_contention", LockMode::PerOp, false);
 }
 
 fn bench_reader_writer_contention_batched(c: &mut Criterion) {

@@ -64,6 +64,20 @@ cargo run --release --example vector_bench --no-default-features -- \
   --vectors 10000 --dimensions 768 --iterations 1000 --k 10 --n-probe 10
 ```
 
+### SQLite baseline (single-file raw)
+
+```bash
+cd docs/benchmarks
+python3 sqlite_single_file_raw_bench.py \
+  --nodes 10000 --edges 50000 --iterations 10000 --sync-mode normal
+```
+
+Notes (SQLite):
+- WAL mode, `synchronous=normal`
+- `temp_store=MEMORY`, `locking_mode=EXCLUSIVE`, `cache_size=256MB`
+- WAL autocheckpoint disabled; `journal_size_limit` set to match WAL size
+- Edge props stored in a separate table; edges use `INSERT OR IGNORE` and props use `INSERT OR REPLACE`
+
 ## Latest Results (2026-02-04)
 
 Sync-mode sweep logs (nodes-only + edges-heavy datasets):
@@ -77,6 +91,37 @@ docs/benchmarks/results/2026-02-04-bench-fluent-vs-lowlevel-{nodes,edges}-{norma
 Notes:
 - Group commit only affects `SyncMode::Normal`; in `Full`/`Off` it is ignored.
 - These runs disable auto-checkpoint (`--no-auto-checkpoint`) and use a 256MB WAL to expose raw commit costs.
+
+### Edge Write Microbench (Rust, edges-heavy, sync=Normal, GC off)
+
+Batch write p50/p95 (100 ops per batch):
+
+| Operation | p50 | p95 |
+|-----------|-----|-----|
+| 100 nodes | 34.08us | 56.54us |
+| 100 edges | 40.25us | 65.58us |
+| 100 edges + props | 172.33us | 253.12us |
+
+Raw log:
+
+```
+docs/benchmarks/results/2026-02-04-single-file-raw-rust-edges-normal-nogc.txt
+```
+
+### SQLite Baseline (single-file raw)
+
+Batch write (100 nodes), sync=normal:
+
+| Metric | Value |
+|--------|-------|
+| p50 | 120.67us |
+| p95 | 2.98ms |
+
+Raw logs:
+
+```
+docs/benchmarks/results/2026-02-04-sqlite-single-file-raw-{nodes,edges}-{normal,full,off}.txt
+```
 
 Large dataset sweep logs (100k nodes / 500k edges):
 

@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::thread::ThreadId;
 
 use parking_lot::{Condvar, Mutex, RwLock};
@@ -63,15 +63,19 @@ pub struct SingleFileTxState {
   pub read_only: bool,
   pub snapshot_ts: u64,
   pub pending: DeltaState,
+  pub bulk_load: bool,
+  pub pending_wal: Vec<u8>,
 }
 
 impl SingleFileTxState {
-  pub fn new(txid: TxId, read_only: bool, snapshot_ts: u64) -> Self {
+  pub fn new(txid: TxId, read_only: bool, snapshot_ts: u64, bulk_load: bool) -> Self {
     Self {
       txid,
       read_only,
       snapshot_ts,
       pending: DeltaState::new(),
+      bulk_load,
+      pending_wal: Vec::new(),
     }
   }
 }
@@ -106,6 +110,8 @@ pub struct SingleFileDB {
 
   /// Current active transaction
   pub current_tx: Mutex<HashMap<ThreadId, std::sync::Arc<Mutex<SingleFileTxState>>>>,
+  /// Active write transactions (excludes read-only)
+  pub(crate) active_writers: AtomicUsize,
 
   /// Serialize commit operations to preserve WAL/delta ordering
   pub(crate) commit_lock: Mutex<()>,

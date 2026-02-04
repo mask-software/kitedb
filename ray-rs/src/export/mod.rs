@@ -288,7 +288,8 @@ pub fn export_to_json<P: AsRef<Path>>(
     serde_json::to_writer_pretty(&mut writer, data)
       .map_err(|e| KiteError::Serialization(e.to_string()))?;
   } else {
-    serde_json::to_writer(&mut writer, data).map_err(|e| KiteError::Serialization(e.to_string()))?;
+    serde_json::to_writer(&mut writer, data)
+      .map_err(|e| KiteError::Serialization(e.to_string()))?;
   }
   writer.flush().map_err(KiteError::Io)?;
   Ok(ExportResult {

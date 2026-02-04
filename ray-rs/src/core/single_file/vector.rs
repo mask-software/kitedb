@@ -49,14 +49,15 @@ impl SingleFileDB {
       txid,
       build_set_node_vector_payload(node_id, prop_key_id, vector),
     );
-    self.write_wal(record)?;
+    self.write_wal_tx(&tx_handle, record)?;
 
     // Queue in pending delta for commit
     {
       let mut tx = tx_handle.lock();
-      tx.pending
-        .pending_vectors
-        .insert((node_id, prop_key_id), Some(VectorRef::from(vector.to_vec())));
+      tx.pending.pending_vectors.insert(
+        (node_id, prop_key_id),
+        Some(VectorRef::from(vector.to_vec())),
+      );
     }
 
     Ok(())
@@ -74,7 +75,7 @@ impl SingleFileDB {
       txid,
       build_del_node_vector_payload(node_id, prop_key_id),
     );
-    self.write_wal(record)?;
+    self.write_wal_tx(&tx_handle, record)?;
 
     // Queue delete in pending delta
     {

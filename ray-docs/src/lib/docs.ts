@@ -64,6 +64,11 @@ export const docsStructure: DocSection[] = [
 				slug: "guides/transactions",
 			},
 			{
+				title: "Performance Checklist",
+				description: "Choose the fastest write path and config presets",
+				slug: "guides/performance",
+			},
+			{
 				title: "Concurrency",
 				description: "Multi-threaded access and parallel reads",
 				slug: "guides/concurrency",

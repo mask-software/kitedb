@@ -98,6 +98,10 @@ harness = false
 name = "concurrent"
 harness = false
 
+[[bench]]
+name = "write_path"
+harness = false
+
 [features]
 default = ["napi"]
 napi = ["dep:napi", "dep:napi-derive", "dep:napi-build"]

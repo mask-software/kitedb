@@ -8,10 +8,9 @@ use crate::core::wal::record::{
 use crate::error::{KiteError, Result};
 use crate::types::*;
 use parking_lot::Mutex;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
-#[cfg(feature = "bench-profile")]
-use std::sync::atomic::Ordering;
 #[cfg(feature = "bench-profile")]
 use std::time::Instant;
 
@@ -19,28 +18,17 @@ use super::open::SyncMode;
 use super::{SingleFileDB, SingleFileTxState};
 
 impl SingleFileDB {
-  pub(crate) fn current_tx_handle(&self) -> Option<Arc<Mutex<SingleFileTxState>>> {
-    let tid = std::thread::current().id();
-    let current_tx = self.current_tx.lock();
-    current_tx.get(&tid).cloned()
-  }
-
-  pub(crate) fn require_write_tx_handle(&self) -> Result<(TxId, Arc<Mutex<SingleFileTxState>>)> {
-    let handle = self.current_tx_handle().ok_or(KiteError::NoTransaction)?;
-    let txid = {
-      let tx = handle.lock();
-      if tx.read_only {
-        return Err(KiteError::ReadOnly);
-      }
-      tx.txid
-    };
-    Ok((txid, handle))
-  }
-
-  /// Begin a new transaction
-  pub fn begin(&self, read_only: bool) -> Result<TxId> {
+  fn begin_with_mode(&self, read_only: bool, bulk_load: bool) -> Result<TxId> {
     if self.read_only && !read_only {
       return Err(KiteError::ReadOnly);
+    }
+    if bulk_load && read_only {
+      return Err(KiteError::ReadOnly);
+    }
+    if bulk_load && self.mvcc.is_some() {
+      return Err(KiteError::Internal(
+        "bulk load requires MVCC disabled".to_string(),
+      ));
     }
 
     let tid = std::thread::current().id();
@@ -65,7 +53,7 @@ impl SingleFileDB {
     };
 
     // Write BEGIN record to WAL (for write transactions)
-    if !read_only {
+    if !read_only && !bulk_load {
       let record = WalRecord::new(WalRecordType::Begin, txid, build_begin_payload());
       let mut pager = self.pager.lock();
       let mut wal = self.wal_buffer.lock();
@@ -76,10 +64,42 @@ impl SingleFileDB {
       txid,
       read_only,
       snapshot_ts,
+      bulk_load,
     )));
 
     self.current_tx.lock().insert(tid, tx_state);
+    if !read_only {
+      self.active_writers.fetch_add(1, Ordering::SeqCst);
+    }
     Ok(txid)
+  }
+
+  pub(crate) fn current_tx_handle(&self) -> Option<Arc<Mutex<SingleFileTxState>>> {
+    let tid = std::thread::current().id();
+    let current_tx = self.current_tx.lock();
+    current_tx.get(&tid).cloned()
+  }
+
+  pub(crate) fn require_write_tx_handle(&self) -> Result<(TxId, Arc<Mutex<SingleFileTxState>>)> {
+    let handle = self.current_tx_handle().ok_or(KiteError::NoTransaction)?;
+    let txid = {
+      let tx = handle.lock();
+      if tx.read_only {
+        return Err(KiteError::ReadOnly);
+      }
+      tx.txid
+    };
+    Ok((txid, handle))
+  }
+
+  /// Begin a new transaction
+  pub fn begin(&self, read_only: bool) -> Result<TxId> {
+    self.begin_with_mode(read_only, false)
+  }
+
+  /// Begin a bulk-load transaction (fast path, MVCC disabled)
+  pub fn begin_bulk(&self) -> Result<TxId> {
+    self.begin_with_mode(false, true)
   }
 
   /// Commit the current transaction
@@ -90,10 +110,11 @@ impl SingleFileDB {
       current_tx.remove(&tid).ok_or(KiteError::NoTransaction)?
     };
 
-    let (txid, read_only, pending) = {
+    let (txid, read_only, bulk_load, pending, pending_wal) = {
       let mut tx = tx_handle.lock();
       let pending = std::mem::take(&mut tx.pending);
-      (tx.txid, tx.read_only, pending)
+      let pending_wal = std::mem::take(&mut tx.pending_wal);
+      (tx.txid, tx.read_only, tx.bulk_load, pending, pending_wal)
     };
 
     if read_only {
@@ -104,6 +125,8 @@ impl SingleFileDB {
       }
       return Ok(());
     }
+    let prev_writers = self.active_writers.fetch_sub(1, Ordering::SeqCst);
+    debug_assert!(prev_writers > 0, "active_writers underflow in commit");
 
     let mut commit_ts_for_mvcc = None;
     if let Some(mvcc) = self.mvcc.as_ref() {
@@ -131,15 +154,26 @@ impl SingleFileDB {
       let commit_lock_start = Instant::now();
       let _commit_guard = self.commit_lock.lock();
       #[cfg(feature = "bench-profile")]
-      self
-        .commit_lock_wait_ns
-        .fetch_add(commit_lock_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+      self.commit_lock_wait_ns.fetch_add(
+        commit_lock_start.elapsed().as_nanos() as u64,
+        Ordering::Relaxed,
+      );
 
-      // Write COMMIT record to WAL
-      let record = WalRecord::new(WalRecordType::Commit, txid, build_commit_payload());
       let mut pager = self.pager.lock();
       let mut wal = self.wal_buffer.lock();
-      wal.write_record(&record, &mut pager)?;
+      if bulk_load {
+        let begin_record = WalRecord::new(WalRecordType::Begin, txid, build_begin_payload());
+        wal.write_record(&begin_record, &mut pager)?;
+        if !pending_wal.is_empty() {
+          wal.write_record_bytes_batch(&pending_wal, &mut pager)?;
+        }
+        let commit_record = WalRecord::new(WalRecordType::Commit, txid, build_commit_payload());
+        wal.write_record(&commit_record, &mut pager)?;
+      } else {
+        // Write COMMIT record to WAL
+        let record = WalRecord::new(WalRecordType::Commit, txid, build_commit_payload());
+        wal.write_record(&record, &mut pager)?;
+      }
 
       // Flush WAL to disk based on sync mode
       let should_flush = matches!(self.sync_mode, SyncMode::Full | SyncMode::Normal);
@@ -399,6 +433,9 @@ impl SingleFileDB {
     self.apply_pending_vectors(&pending.pending_vectors);
 
     merge_pending_delta(&mut delta, pending);
+    if bulk_load {
+      self.cache_clear();
+    }
     drop(delta);
 
     // Check if auto-checkpoint should be triggered
@@ -430,9 +467,9 @@ impl SingleFileDB {
       let mut current_tx = self.current_tx.lock();
       current_tx.remove(&tid).ok_or(KiteError::NoTransaction)?
     };
-    let (txid, read_only) = {
+    let (txid, read_only, bulk_load) = {
       let tx = tx_handle.lock();
-      (tx.txid, tx.read_only)
+      (tx.txid, tx.read_only, tx.bulk_load)
     };
 
     if read_only {
@@ -443,17 +480,21 @@ impl SingleFileDB {
       }
       return Ok(());
     }
+    let prev_writers = self.active_writers.fetch_sub(1, Ordering::SeqCst);
+    debug_assert!(prev_writers > 0, "active_writers underflow in rollback");
 
     if let Some(mvcc) = self.mvcc.as_ref() {
       let mut tx_mgr = mvcc.tx_manager.lock();
       tx_mgr.abort_tx(txid);
     }
 
-    // Write ROLLBACK record to WAL
-    let record = WalRecord::new(WalRecordType::Rollback, txid, build_rollback_payload());
-    let mut pager = self.pager.lock();
-    let mut wal = self.wal_buffer.lock();
-    wal.write_record(&record, &mut pager)?;
+    if !bulk_load {
+      // Write ROLLBACK record to WAL
+      let record = WalRecord::new(WalRecordType::Rollback, txid, build_rollback_payload());
+      let mut pager = self.pager.lock();
+      let mut wal = self.wal_buffer.lock();
+      wal.write_record(&record, &mut pager)?;
+    }
 
     Ok(())
   }
@@ -480,6 +521,22 @@ impl SingleFileDB {
     Ok(())
   }
 
+  pub(crate) fn write_wal_tx(
+    &self,
+    tx_handle: &Arc<Mutex<SingleFileTxState>>,
+    record: WalRecord,
+  ) -> Result<()> {
+    let mut tx = tx_handle.lock();
+    if tx.bulk_load {
+      let record_bytes = record.build();
+      tx.pending_wal.extend_from_slice(&record_bytes);
+      Ok(())
+    } else {
+      drop(tx);
+      self.write_wal(record)
+    }
+  }
+
   fn wait_for_group_commit(&self, seq: u64) -> Result<()> {
     let window_ms = self.group_commit_window_ms;
 
@@ -501,7 +558,7 @@ impl SingleFileDB {
       state.flushing = true;
     }
 
-    if window_ms > 0 {
+    if window_ms > 0 && self.active_writers.load(Ordering::SeqCst) > 0 {
       std::thread::sleep(Duration::from_millis(window_ms));
     }
 
@@ -509,9 +566,10 @@ impl SingleFileDB {
     let commit_lock_start = Instant::now();
     let _commit_guard = self.commit_lock.lock();
     #[cfg(feature = "bench-profile")]
-    self
-      .commit_lock_wait_ns
-      .fetch_add(commit_lock_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    self.commit_lock_wait_ns.fetch_add(
+      commit_lock_start.elapsed().as_nanos() as u64,
+      Ordering::Relaxed,
+    );
 
     #[cfg(feature = "bench-profile")]
     let flush_start = Instant::now();

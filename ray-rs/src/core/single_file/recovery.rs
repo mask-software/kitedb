@@ -8,12 +8,13 @@ use crate::constants::*;
 use crate::core::pager::FilePager;
 use crate::core::snapshot::reader::SnapshotData;
 use crate::core::wal::record::{
-  extract_committed_transactions, parse_add_edge_payload, parse_add_node_label_payload,
-  parse_create_node_payload, parse_define_etype_payload, parse_define_label_payload,
-  parse_define_propkey_payload, parse_del_edge_prop_payload, parse_del_node_prop_payload,
-  parse_del_node_vector_payload, parse_delete_edge_payload, parse_delete_node_payload,
-  parse_remove_node_label_payload, parse_set_edge_prop_payload, parse_set_edge_props_payload,
-  parse_set_node_prop_payload, parse_set_node_vector_payload, parse_add_edge_props_payload,
+  extract_committed_transactions, parse_add_edge_payload, parse_add_edge_props_payload,
+  parse_add_edges_batch_payload, parse_add_edges_props_batch_payload, parse_add_node_label_payload,
+  parse_create_node_payload, parse_create_nodes_batch_payload, parse_define_etype_payload,
+  parse_define_label_payload, parse_define_propkey_payload, parse_del_edge_prop_payload,
+  parse_del_node_prop_payload, parse_del_node_vector_payload, parse_delete_edge_payload,
+  parse_delete_node_payload, parse_remove_node_label_payload, parse_set_edge_prop_payload,
+  parse_set_edge_props_payload, parse_set_node_prop_payload, parse_set_node_vector_payload,
   ParsedWalRecord,
 };
 use crate::error::Result;
@@ -144,6 +145,22 @@ pub fn replay_wal_record(
         }
       }
     }
+    WalRecordType::CreateNodesBatch => {
+      if let Some(nodes) = parse_create_nodes_batch_payload(&record.payload) {
+        for data in nodes {
+          if let Some(snap) = snapshot {
+            if snap.get_phys_node(data.node_id).is_none() {
+              delta.create_node(data.node_id, data.key.as_deref());
+            }
+          } else {
+            delta.create_node(data.node_id, data.key.as_deref());
+          }
+          if data.node_id >= *next_node_id {
+            *next_node_id = data.node_id + 1;
+          }
+        }
+      }
+    }
     WalRecordType::DeleteNode => {
       if let Some(data) = parse_delete_node_payload(&record.payload) {
         delta.delete_node(data.node_id);
@@ -154,11 +171,28 @@ pub fn replay_wal_record(
         delta.add_edge(data.src, data.etype, data.dst);
       }
     }
+    WalRecordType::AddEdgesBatch => {
+      if let Some(edges) = parse_add_edges_batch_payload(&record.payload) {
+        for data in edges {
+          delta.add_edge(data.src, data.etype, data.dst);
+        }
+      }
+    }
     WalRecordType::AddEdgeProps => {
       if let Some(data) = parse_add_edge_props_payload(&record.payload) {
         delta.add_edge(data.src, data.etype, data.dst);
         for (key_id, value) in data.props {
           delta.set_edge_prop(data.src, data.etype, data.dst, key_id, value);
+        }
+      }
+    }
+    WalRecordType::AddEdgesPropsBatch => {
+      if let Some(edges) = parse_add_edges_props_batch_payload(&record.payload) {
+        for data in edges {
+          delta.add_edge(data.src, data.etype, data.dst);
+          for (key_id, value) in data.props {
+            delta.set_edge_prop(data.src, data.etype, data.dst, key_id, value);
+          }
         }
       }
     }
@@ -236,9 +270,10 @@ pub fn replay_wal_record(
     }
     WalRecordType::SetNodeVector => {
       if let Some(data) = parse_set_node_vector_payload(&record.payload) {
-        delta
-          .pending_vectors
-          .insert((data.node_id, data.prop_key_id), Some(VectorRef::from(data.vector)));
+        delta.pending_vectors.insert(
+          (data.node_id, data.prop_key_id),
+          Some(VectorRef::from(data.vector)),
+        );
       }
     }
     WalRecordType::DelNodeVector => {

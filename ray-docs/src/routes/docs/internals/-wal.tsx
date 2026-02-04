@@ -533,6 +533,9 @@ export function WALPage() {
 					<code>group_commit_window_ms = 2</code>
 				</li>
 				<li>
+					<code>begin_bulk()</code> + batch APIs for ingest (MVCC disabled)
+				</li>
+				<li>
 					Optional: increase <code>wal_size</code> (e.g., 64MB) for heavy ingest to
 					reduce checkpoints
 				</li>
@@ -560,8 +563,9 @@ export function WALPage() {
 				The WAL has a fixed size once the file is created. For large ingests,
 				use <code>resizeWal</code> (offline) to grow it, or rebuild into a new
 				file. To prevent single transactions from overfilling the active WAL
-				region, split work into smaller commits (see <code>bulkWrite</code>) and
-				consider disabling background checkpoints during ingest.
+				region, split work into smaller commits (see <code>bulkWrite</code> or
+				chunked <code>begin_bulk()</code> sessions) and consider disabling
+				background checkpoints during ingest.
 			</p>
 
 			<h2 id="next">Next Steps</h2>

@@ -10,6 +10,9 @@ pub trait TransactionOps {
   /// Begin a new transaction
   fn begin_impl(&self, read_only: bool) -> PyResult<i64>;
 
+  /// Begin a bulk-load transaction
+  fn begin_bulk_impl(&self) -> PyResult<i64>;
+
   /// Commit the current transaction
   fn commit_impl(&self) -> PyResult<()>;
 
@@ -25,6 +28,14 @@ pub fn begin_single_file(db: &RustSingleFileDB, read_only: bool) -> PyResult<i64
   let txid = db
     .begin(read_only)
     .map_err(|e| PyRuntimeError::new_err(format!("Failed to begin transaction: {e}")))?;
+  Ok(txid as i64)
+}
+
+/// Begin bulk-load transaction on single-file database
+pub fn begin_bulk_single_file(db: &RustSingleFileDB) -> PyResult<i64> {
+  let txid = db
+    .begin_bulk()
+    .map_err(|e| PyRuntimeError::new_err(format!("Failed to begin bulk transaction: {e}")))?;
   Ok(txid as i64)
 }
 

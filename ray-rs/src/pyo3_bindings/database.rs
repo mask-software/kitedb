@@ -236,9 +236,20 @@ impl PyDatabase {
   #[pyo3(signature = (read_only=None))]
   fn begin(&self, read_only: Option<bool>) -> PyResult<i64> {
     let read_only = read_only.unwrap_or(false);
-    dispatch!(self, |db| transaction::begin_single_file(db, read_only), |_db| {
-      unreachable!("multi-file database support removed")
-    })
+    dispatch!(
+      self,
+      |db| transaction::begin_single_file(db, read_only),
+      |_db| { unreachable!("multi-file database support removed") }
+    )
+  }
+
+  /// Begin a bulk-load transaction (fast path, MVCC disabled)
+  fn begin_bulk(&self) -> PyResult<i64> {
+    dispatch!(
+      self,
+      |db| transaction::begin_bulk_single_file(db),
+      |_db| { unreachable!("multi-file database support removed") }
+    )
   }
 
   fn commit(&self) -> PyResult<()> {
@@ -339,18 +350,26 @@ impl PyDatabase {
     match guard.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
         let mut ids = Vec::with_capacity(input_nodes.len());
-        db.begin(false)
-          .map_err(|e| PyRuntimeError::new_err(format!("Failed to begin: {e}")))?;
+        let mut keys = Vec::with_capacity(input_nodes.len());
+        let mut props_list = Vec::with_capacity(input_nodes.len());
+        for (key, props) in input_nodes {
+          keys.push(key);
+          props_list.push(props);
+        }
+
+        db.begin_bulk()
+          .map_err(|e| PyRuntimeError::new_err(format!("Failed to begin bulk: {e}")))?;
         let result: Result<(), PyErr> = (|| {
-          for (key, props) in input_nodes {
-            let id = db
-              .create_node(Some(&key))
-              .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            for (k, v) in props {
-              db.set_node_prop(id, k as PropKeyId, v.into())
+          let key_refs: Vec<Option<&str>> = keys.iter().map(|k| Some(k.as_str())).collect();
+          let node_ids = db
+            .create_nodes_batch(&key_refs)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+          for (node_id, props) in node_ids.iter().copied().zip(props_list.iter()) {
+            for (k, v) in props.iter() {
+              db.set_node_prop(node_id, *k as PropKeyId, v.clone().into())
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             }
-            ids.push(id as i64);
+            ids.push(node_id as i64);
           }
           Ok(())
         })();
@@ -365,6 +384,77 @@ impl PyDatabase {
             Err(e)
           }
         }
+      }
+      None => Err(PyRuntimeError::new_err("Database is closed")),
+    }
+  }
+
+  /// Create multiple nodes in a single WAL record (fast path)
+  fn create_nodes_batch(&self, keys: Vec<Option<String>>) -> PyResult<Vec<i64>> {
+    let guard = self
+      .inner
+      .read()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    match guard.as_ref() {
+      Some(DatabaseInner::SingleFile(db)) => {
+        let key_refs: Vec<Option<&str>> = keys.iter().map(|k| k.as_deref()).collect();
+        let node_ids = db
+          .create_nodes_batch(&key_refs)
+          .map_err(|e| PyRuntimeError::new_err(format!("Failed to create nodes: {e}")))?;
+        Ok(node_ids.into_iter().map(|id| id as i64).collect())
+      }
+      None => Err(PyRuntimeError::new_err("Database is closed")),
+    }
+  }
+
+  /// Add multiple edges in a single WAL record (fast path)
+  fn add_edges_batch(&self, edges: Vec<(i64, u32, i64)>) -> PyResult<()> {
+    let guard = self
+      .inner
+      .read()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    match guard.as_ref() {
+      Some(DatabaseInner::SingleFile(db)) => {
+        let core_edges: Vec<(NodeId, ETypeId, NodeId)> = edges
+          .into_iter()
+          .map(|(src, etype, dst)| (src as NodeId, etype as ETypeId, dst as NodeId))
+          .collect();
+        db.add_edges_batch(&core_edges)
+          .map_err(|e| PyRuntimeError::new_err(format!("Failed to add edges: {e}")))
+      }
+      None => Err(PyRuntimeError::new_err("Database is closed")),
+    }
+  }
+
+  /// Add multiple edges with props in a single WAL record (fast path)
+  fn add_edges_with_props_batch(
+    &self,
+    edges: Vec<(i64, u32, i64, Vec<(u32, PropValue)>)>,
+  ) -> PyResult<()> {
+    let guard = self
+      .inner
+      .read()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    match guard.as_ref() {
+      Some(DatabaseInner::SingleFile(db)) => {
+        let core_edges: Vec<(NodeId, ETypeId, NodeId, Vec<(PropKeyId, crate::types::PropValue)>)> =
+          edges
+            .into_iter()
+            .map(|(src, etype, dst, props)| {
+              let core_props = props
+                .into_iter()
+                .map(|(key_id, value)| (key_id as PropKeyId, value.into()))
+                .collect();
+              (
+                src as NodeId,
+                etype as ETypeId,
+                dst as NodeId,
+                core_props,
+              )
+            })
+            .collect();
+        db.add_edges_with_props_batch(core_edges)
+          .map_err(|e| PyRuntimeError::new_err(format!("Failed to add edges: {e}")))
       }
       None => Err(PyRuntimeError::new_err("Database is closed")),
     }

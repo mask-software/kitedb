@@ -828,6 +828,21 @@ impl Kite {
       .map_err(|e| Error::from_reason(format!("Failed to begin transaction: {e}")))
   }
 
+  /// Begin a bulk-load transaction (fast path, MVCC disabled)
+  #[napi]
+  pub fn begin_bulk(&self) -> Result<i64> {
+    let guard = self.inner.read();
+    let ray = guard
+      .as_ref()
+      .ok_or_else(|| Error::from_reason("Kite is closed"))?;
+
+    ray
+      .raw()
+      .begin_bulk()
+      .map(|txid| txid as i64)
+      .map_err(|e| Error::from_reason(format!("Failed to begin bulk transaction: {e}")))
+  }
+
   /// Commit the current transaction
   #[napi]
   pub fn commit(&self) -> Result<()> {

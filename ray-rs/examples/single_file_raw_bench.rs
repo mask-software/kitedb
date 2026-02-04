@@ -276,6 +276,7 @@ struct GraphData {
   node_ids: Vec<u64>,
   node_keys: Vec<String>,
   edge_types: Vec<u32>,
+  edge_prop_keys: Vec<u32>,
 }
 
 fn build_graph(db: &kitedb::core::single_file::SingleFileDB, config: &BenchConfig) -> GraphData {
@@ -288,7 +289,7 @@ fn build_graph(db: &kitedb::core::single_file::SingleFileDB, config: &BenchConfi
   let mut edge_prop_keys: Vec<u32> = Vec::new();
   for batch_start in (0..config.nodes).step_by(batch_size) {
     let end = (batch_start + batch_size).min(config.nodes);
-    db.begin(false).unwrap();
+    db.begin_bulk().unwrap();
 
     if batch_start == 0 {
       for idx in 0..config.edge_types {
@@ -301,12 +302,15 @@ fn build_graph(db: &kitedb::core::single_file::SingleFileDB, config: &BenchConfi
       }
     }
 
+    let mut keys = Vec::with_capacity(end - batch_start);
     for i in batch_start..end {
       let key = format!("pkg.module{}.Class{}", i / 100, i % 100);
-      let node_id = db.create_node(Some(&key)).unwrap();
-      node_ids.push(node_id);
-      node_keys.push(key);
+      keys.push(key);
     }
+    let key_refs: Vec<Option<&str>> = keys.iter().map(|k| Some(k.as_str())).collect();
+    let batch_ids = db.create_nodes_batch(&key_refs).unwrap();
+    node_ids.extend(batch_ids);
+    node_keys.extend(keys);
 
     db.commit().unwrap();
     print!("\r  Created {} / {} nodes", end, config.nodes);
@@ -321,7 +325,15 @@ fn build_graph(db: &kitedb::core::single_file::SingleFileDB, config: &BenchConfi
 
   while edges_created < config.edges && attempts < max_attempts {
     let batch_target = (edges_created + batch_size).min(config.edges);
-    db.begin(false).unwrap();
+    db.begin_bulk().unwrap();
+
+    let mut edges = Vec::new();
+    let mut edges_with_props = Vec::new();
+    if edge_prop_keys.is_empty() {
+      edges.reserve(batch_target.saturating_sub(edges_created));
+    } else {
+      edges_with_props.reserve(batch_target.saturating_sub(edges_created));
+    }
 
     while edges_created < batch_target && attempts < max_attempts {
       attempts += 1;
@@ -329,16 +341,24 @@ fn build_graph(db: &kitedb::core::single_file::SingleFileDB, config: &BenchConfi
       let dst = node_ids[rng.gen_range(0..node_ids.len())];
       if src != dst {
         let etype = edge_types[rng.gen_range(0..edge_types.len())];
-        db.add_edge(src, etype, dst).unwrap();
-        if !edge_prop_keys.is_empty() {
+        if edge_prop_keys.is_empty() {
+          edges.push((src, etype, dst));
+        } else {
+          let mut props = Vec::with_capacity(edge_prop_keys.len());
           for (idx, key_id) in edge_prop_keys.iter().enumerate() {
             let value = PropValue::I64(edges_created.saturating_add(idx) as i64);
-            db.set_edge_prop(src, etype, dst, *key_id, value)
-              .unwrap();
+            props.push((*key_id, value));
           }
+          edges_with_props.push((src, etype, dst, props));
         }
         edges_created += 1;
       }
+    }
+
+    if edge_prop_keys.is_empty() {
+      db.add_edges_batch(&edges).unwrap();
+    } else {
+      db.add_edges_with_props_batch(edges_with_props).unwrap();
     }
 
     db.commit().unwrap();
@@ -350,6 +370,7 @@ fn build_graph(db: &kitedb::core::single_file::SingleFileDB, config: &BenchConfi
     node_ids,
     node_keys,
     edge_types,
+    edge_prop_keys,
   }
 }
 
@@ -491,7 +512,30 @@ fn benchmark_vector_reads(
   print_latency_table("has_node_vector() random", stats);
 }
 
-fn benchmark_writes(db: &kitedb::core::single_file::SingleFileDB, iterations: usize) {
+fn create_bench_nodes(
+  db: &kitedb::core::single_file::SingleFileDB,
+  label: &str,
+  count: usize,
+) -> Vec<u64> {
+  if count == 0 {
+    return Vec::new();
+  }
+  db.begin_bulk().unwrap();
+  let mut keys = Vec::with_capacity(count);
+  for idx in 0..count {
+    keys.push(format!("{label}:{idx}"));
+  }
+  let key_refs: Vec<Option<&str>> = keys.iter().map(|k| Some(k.as_str())).collect();
+  let node_ids = db.create_nodes_batch(&key_refs).unwrap();
+  db.commit().unwrap();
+  node_ids
+}
+
+fn benchmark_writes(
+  db: &kitedb::core::single_file::SingleFileDB,
+  graph: &GraphData,
+  iterations: usize,
+) {
   println!("\n--- Batch Writes (100 nodes) ---");
   let batch_size = 100usize;
   let batches = (iterations / batch_size).min(50);
@@ -499,17 +543,86 @@ fn benchmark_writes(db: &kitedb::core::single_file::SingleFileDB, iterations: us
 
   for b in 0..batches {
     let start = Instant::now();
-    db.begin(false).unwrap();
+    db.begin_bulk().unwrap();
+    let mut keys = Vec::with_capacity(batch_size);
     for i in 0..batch_size {
-      let key = format!("bench:raw:{b}:{i}");
-      let _ = db.create_node(Some(&key)).unwrap();
+      keys.push(format!("bench:raw:{b}:{i}"));
     }
+    let key_refs: Vec<Option<&str>> = keys.iter().map(|k| Some(k.as_str())).collect();
+    let _ = db.create_nodes_batch(&key_refs).unwrap();
     db.commit().unwrap();
     samples.push(start.elapsed().as_nanos());
   }
 
   let stats = compute_stats(&mut samples);
   print_latency_table("Batch of 100 nodes", stats);
+
+  if batches == 0 {
+    return;
+  }
+
+  let edge_batch_size = 100usize;
+  let edge_batches = (iterations / edge_batch_size).min(50);
+  if edge_batches == 0 {
+    return;
+  }
+
+  let edge_etype = graph.edge_types.first().copied().unwrap_or_else(|| {
+    db.begin_bulk().unwrap();
+    let etype = db.define_etype("BENCH_EDGE").unwrap();
+    db.commit().unwrap();
+    etype
+  });
+
+  println!("\n--- Batch Writes (100 edges) ---");
+  let total_edges = edge_batches * edge_batch_size;
+  let edge_nodes = create_bench_nodes(db, "bench:edge", total_edges * 2);
+  let mut edge_samples = Vec::with_capacity(edge_batches);
+  for b in 0..edge_batches {
+    let start = Instant::now();
+    db.begin_bulk().unwrap();
+    let base = b * edge_batch_size * 2;
+    let mut edges = Vec::with_capacity(edge_batch_size);
+    for i in 0..edge_batch_size {
+      let src = edge_nodes[base + i * 2];
+      let dst = edge_nodes[base + i * 2 + 1];
+      edges.push((src, edge_etype, dst));
+    }
+    db.add_edges_batch(&edges).unwrap();
+    db.commit().unwrap();
+    edge_samples.push(start.elapsed().as_nanos());
+  }
+  let edge_stats = compute_stats(&mut edge_samples);
+  print_latency_table("Batch of 100 edges", edge_stats);
+
+  if graph.edge_prop_keys.is_empty() {
+    return;
+  }
+
+  println!("\n--- Batch Writes (100 edges + props) ---");
+  let edge_prop_nodes = create_bench_nodes(db, "bench:edge-props", total_edges * 2);
+  let mut edge_prop_samples = Vec::with_capacity(edge_batches);
+  for b in 0..edge_batches {
+    let start = Instant::now();
+    db.begin_bulk().unwrap();
+    let base = b * edge_batch_size * 2;
+    let mut edges = Vec::with_capacity(edge_batch_size);
+    for i in 0..edge_batch_size {
+      let src = edge_prop_nodes[base + i * 2];
+      let dst = edge_prop_nodes[base + i * 2 + 1];
+      let mut props = Vec::with_capacity(graph.edge_prop_keys.len());
+      for (idx, key_id) in graph.edge_prop_keys.iter().enumerate() {
+        let value = PropValue::I64((b * edge_batch_size + i + idx) as i64);
+        props.push((*key_id, value));
+      }
+      edges.push((src, edge_etype, dst, props));
+    }
+    db.add_edges_with_props_batch(edges).unwrap();
+    db.commit().unwrap();
+    edge_prop_samples.push(start.elapsed().as_nanos());
+  }
+  let edge_prop_stats = compute_stats(&mut edge_prop_samples);
+  print_latency_table("Batch of 100 edges + props", edge_prop_stats);
 }
 
 fn main() {
@@ -597,7 +710,7 @@ fn main() {
   if config.reopen_readonly {
     println!("  Skipped write benchmarks (read-only)");
   } else {
-    benchmark_writes(&db, config.iterations);
+    benchmark_writes(&db, &graph, config.iterations);
   }
 
   close_single_file(db).expect("failed to close db");

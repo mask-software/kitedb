@@ -956,11 +956,7 @@ impl Kite {
   }
 
   /// Set multiple node properties in a single transaction
-  pub fn set_props(
-    &mut self,
-    node_id: NodeId,
-    props: HashMap<String, PropValue>,
-  ) -> Result<()> {
+  pub fn set_props(&mut self, node_id: NodeId, props: HashMap<String, PropValue>) -> Result<()> {
     if props.is_empty() {
       return Ok(());
     }
@@ -2442,9 +2438,9 @@ fn resolve_edge_cache_entry<'a>(
     return Ok(edge_cache.get_mut(edge_type).unwrap());
   }
 
-  let edge_def = edges.get(edge_type).ok_or_else(|| {
-    KiteError::InvalidSchema(format!("Unknown edge type: {edge_type}").into())
-  })?;
+  let edge_def = edges
+    .get(edge_type)
+    .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown edge type: {edge_type}").into()))?;
 
   let etype_id = edge_def
     .etype_id
@@ -2564,7 +2560,9 @@ impl Kite {
               };
               prop_pairs.push((prop_key_id, value));
             }
-            handle.db.add_edge_with_props(src, etype_id, dst, prop_pairs)?;
+            handle
+              .db
+              .add_edge_with_props(src, etype_id, dst, prop_pairs)?;
           }
 
           BatchResult::EdgeCreated
@@ -4370,12 +4368,14 @@ mod tests {
       .unwrap();
 
     assert_eq!(
-      ray.get_edge_prop(alice.id, "FOLLOWS", bob.id, "weight")
+      ray
+        .get_edge_prop(alice.id, "FOLLOWS", bob.id, "weight")
         .unwrap(),
       Some(PropValue::F64(0.75))
     );
     assert_eq!(
-      ray.get_edge_prop(alice.id, "FOLLOWS", bob.id, "since")
+      ray
+        .get_edge_prop(alice.id, "FOLLOWS", bob.id, "since")
         .unwrap(),
       Some(PropValue::String("2024".into()))
     );
@@ -4816,7 +4816,9 @@ mod tests {
     let mut props = HashMap::new();
     props.insert("weight".to_string(), PropValue::F64(0.6));
     props.insert("since".to_string(), PropValue::String("2024".into()));
-    ray.set_edge_props(alice.id, "FOLLOWS", bob.id, props).unwrap();
+    ray
+      .set_edge_props(alice.id, "FOLLOWS", bob.id, props)
+      .unwrap();
 
     let weight = ray
       .get_edge_prop(alice.id, "FOLLOWS", bob.id, "weight")

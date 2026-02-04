@@ -735,9 +735,7 @@ mod tests {
     let total = total_ops.load(Ordering::Relaxed);
     let ops_per_sec = total as f64 / elapsed.as_secs_f64();
 
-    println!(
-      "High concurrency test: {total} ops in {elapsed:?} ({ops_per_sec:.0} ops/sec)"
-    );
+    println!("High concurrency test: {total} ops in {elapsed:?} ({ops_per_sec:.0} ops/sec)");
 
     assert_eq!(
       total,
@@ -831,9 +829,7 @@ mod tests {
       "All writes should complete"
     );
 
-    println!(
-      "Mixed workload: {total_reads} reads, {total_writes} writes completed"
-    );
+    println!("Mixed workload: {total_reads} reads, {total_writes} writes completed");
   }
 
   // ============================================================================
@@ -932,9 +928,7 @@ mod tests {
         throughput / baseline_throughput
       };
 
-    println!(
-        "{num_threads:7} | {throughput:>19.0} | {speedup:>6.2}x"
-    );
+      println!("{num_threads:7} | {throughput:>19.0} | {speedup:>6.2}x");
     }
   }
 }

@@ -26,9 +26,7 @@ use crate::core::single_file::{
 use crate::export as ray_export;
 use crate::metrics as core_metrics;
 use crate::streaming;
-use crate::types::{
-  CheckResult as RustCheckResult, ETypeId, Edge, NodeId, PropKeyId, PropValue,
-};
+use crate::types::{CheckResult as RustCheckResult, ETypeId, Edge, NodeId, PropKeyId, PropValue};
 use crate::util::compression::{CompressionOptions as CoreCompressionOptions, CompressionType};
 use serde_json;
 
@@ -857,6 +855,15 @@ pub struct JsFullEdge {
   pub dst: i64,
 }
 
+/// Edge input with properties for batch operations
+#[napi(object)]
+pub struct JsEdgeWithPropsInput {
+  pub src: i64,
+  pub etype: u32,
+  pub dst: i64,
+  pub props: Vec<JsNodeProp>,
+}
+
 // ============================================================================
 // Node Property Result
 // ============================================================================
@@ -978,6 +985,20 @@ impl Database {
     }
   }
 
+  /// Begin a bulk-load transaction (fast path, MVCC disabled)
+  #[napi]
+  pub fn begin_bulk(&self) -> Result<i64> {
+    match self.inner.as_ref() {
+      Some(DatabaseInner::SingleFile(db)) => {
+        let txid = db
+          .begin_bulk()
+          .map_err(|e| Error::from_reason(format!("Failed to begin bulk transaction: {e}")))?;
+        Ok(txid as i64)
+      }
+      None => Err(Error::from_reason("Database is closed")),
+    }
+  }
+
   /// Commit the current transaction
   #[napi]
   pub fn commit(&self) -> Result<()> {
@@ -1022,6 +1043,21 @@ impl Database {
           .create_node(key.as_deref())
           .map_err(|e| Error::from_reason(format!("Failed to create node: {e}")))?;
         Ok(node_id as i64)
+      }
+      None => Err(Error::from_reason("Database is closed")),
+    }
+  }
+
+  /// Create multiple nodes in a single WAL record (fast path)
+  #[napi]
+  pub fn create_nodes_batch(&self, keys: Vec<Option<String>>) -> Result<Vec<i64>> {
+    match self.inner.as_ref() {
+      Some(DatabaseInner::SingleFile(db)) => {
+        let key_refs: Vec<Option<&str>> = keys.iter().map(|k| k.as_deref()).collect();
+        let node_ids = db
+          .create_nodes_batch(&key_refs)
+          .map_err(|e| Error::from_reason(format!("Failed to create nodes: {e}")))?;
+        Ok(node_ids.into_iter().map(|id| id as i64).collect())
       }
       None => Err(Error::from_reason("Database is closed")),
     }
@@ -1153,6 +1189,50 @@ impl Database {
       Some(DatabaseInner::SingleFile(db)) => db
         .add_edge(src as NodeId, etype as ETypeId, dst as NodeId)
         .map_err(|e| Error::from_reason(format!("Failed to add edge: {e}"))),
+      None => Err(Error::from_reason("Database is closed")),
+    }
+  }
+
+  /// Add multiple edges in a single WAL record (fast path)
+  #[napi]
+  pub fn add_edges_batch(&self, edges: Vec<JsFullEdge>) -> Result<()> {
+    match self.inner.as_ref() {
+      Some(DatabaseInner::SingleFile(db)) => {
+        let core_edges: Vec<(NodeId, ETypeId, NodeId)> = edges
+          .into_iter()
+          .map(|edge| (edge.src as NodeId, edge.etype as ETypeId, edge.dst as NodeId))
+          .collect();
+        db.add_edges_batch(&core_edges)
+          .map_err(|e| Error::from_reason(format!("Failed to add edges: {e}")))
+      }
+      None => Err(Error::from_reason("Database is closed")),
+    }
+  }
+
+  /// Add multiple edges with props in a single WAL record (fast path)
+  #[napi]
+  pub fn add_edges_with_props_batch(&self, edges: Vec<JsEdgeWithPropsInput>) -> Result<()> {
+    match self.inner.as_ref() {
+      Some(DatabaseInner::SingleFile(db)) => {
+        let core_edges: Vec<(NodeId, ETypeId, NodeId, Vec<(PropKeyId, PropValue)>)> = edges
+          .into_iter()
+          .map(|edge| {
+            let props = edge
+              .props
+              .into_iter()
+              .map(|prop| (prop.key_id as PropKeyId, prop.value.into()))
+              .collect();
+            (
+              edge.src as NodeId,
+              edge.etype as ETypeId,
+              edge.dst as NodeId,
+              props,
+            )
+          })
+          .collect();
+        db.add_edges_with_props_batch(core_edges)
+          .map_err(|e| Error::from_reason(format!("Failed to add edges: {e}")))
+      }
       None => Err(Error::from_reason("Database is closed")),
     }
   }

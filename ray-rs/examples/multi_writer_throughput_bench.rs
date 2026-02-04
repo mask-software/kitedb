@@ -23,7 +23,9 @@ use std::sync::Arc;
 use std::time::Instant;
 use tempfile::tempdir;
 
-use kitedb::core::single_file::{close_single_file, open_single_file, SingleFileOpenOptions, SyncMode};
+use kitedb::core::single_file::{
+  close_single_file, open_single_file, SingleFileOpenOptions, SyncMode,
+};
 use kitedb::types::PropValue;
 
 #[derive(Debug, Clone)]
@@ -218,33 +220,49 @@ fn main() {
       let mut total_edges = 0u64;
       for _ in 0..config.tx_per_thread {
         db.begin(false).unwrap();
-        let mut batch_nodes = Vec::with_capacity(config.batch_size);
+        let mut keys = Vec::with_capacity(config.batch_size);
         for _ in 0..config.batch_size {
           let idx = node_counter.fetch_add(1, Ordering::Relaxed);
           let key = format!("t{tid}-n{idx}");
-          let node_id = db.create_node(Some(&key)).unwrap();
-          batch_nodes.push(node_id);
-          total_nodes += 1;
+          keys.push(key);
         }
+        let key_refs: Vec<Option<&str>> = keys.iter().map(|k| Some(k.as_str())).collect();
+        let batch_nodes = db.create_nodes_batch(&key_refs).unwrap();
+        total_nodes += batch_nodes.len() as u64;
 
         if !etypes.is_empty() && !batch_nodes.is_empty() && config.edges_per_node > 0 {
           let etype = etypes[tid % etypes.len()];
           let last = batch_nodes.len();
+          let mut edges = Vec::new();
+          let mut edges_with_props = Vec::new();
+          if edge_prop_keys.is_empty() {
+            edges.reserve(last * config.edges_per_node);
+          } else {
+            edges_with_props.reserve(last * config.edges_per_node);
+          }
           for (i, &src) in batch_nodes.iter().enumerate() {
             for e in 0..config.edges_per_node {
               let dst = batch_nodes[(i + 1 + e) % last];
               if src == dst {
                 continue;
               }
-              db.add_edge(src, etype, dst).unwrap();
-              if !edge_prop_keys.is_empty() {
+              if edge_prop_keys.is_empty() {
+                edges.push((src, etype, dst));
+              } else {
+                let mut props = Vec::with_capacity(edge_prop_keys.len());
                 for (idx, key_id) in edge_prop_keys.iter().enumerate() {
                   let value = PropValue::I64((idx as i64) + 1);
-                  db.set_edge_prop(src, etype, dst, *key_id, value).unwrap();
+                  props.push((*key_id, value));
                 }
+                edges_with_props.push((src, etype, dst, props));
               }
               total_edges += 1;
             }
+          }
+          if edge_prop_keys.is_empty() {
+            db.add_edges_batch(&edges).unwrap();
+          } else {
+            db.add_edges_with_props_batch(edges_with_props).unwrap();
           }
         }
 

@@ -282,8 +282,7 @@ impl SingleFileDB {
       ));
     }
 
-    let new_wal_page_count =
-      pages_to_store(wal_size_bytes, header.page_size as usize) as u64;
+    let new_wal_page_count = pages_to_store(wal_size_bytes, header.page_size as usize) as u64;
 
     if new_wal_page_count < MIN_WAL_PAGES {
       return Err(KiteError::Internal(format!(

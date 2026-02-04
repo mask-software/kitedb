@@ -1,0 +1,23 @@
+========================================================================================================================
+SQLite Benchmark (single-file raw)
+========================================================================================================================
+Nodes: 10000
+Edges: 0
+Edge types: 3
+Edge props: 0
+Iterations: 10000
+WAL size: 268435456 bytes
+Sync mode: normal
+========================================================================================================================
+
+[1/2] Building graph...
+  Creating nodes...
+  Created 5000 / 10000 nodes  Created 10000 / 10000 nodes
+  Creating edges...
+
+  Built in 10ms
+
+[2/2] Write benchmarks...
+
+--- Batch Writes (100 nodes) ---
+Batch of 100 nodes                       p50= 113.08us p95=   3.70ms p99=   4.36ms max=   4.36ms (2226 ops/sec)

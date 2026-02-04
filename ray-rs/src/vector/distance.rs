@@ -70,6 +70,7 @@ fn dot_product_unrolled(a: &[f32], b: &[f32]) -> f32 {
 
   for i in 0..chunks {
     let base = i * 8;
+    debug_assert!(base + 7 < len);
     sum0 += a[base] * b[base];
     sum1 += a[base + 1] * b[base + 1];
     sum2 += a[base + 2] * b[base + 2];
@@ -82,6 +83,7 @@ fn dot_product_unrolled(a: &[f32], b: &[f32]) -> f32 {
 
   // Handle remainder
   let base = chunks * 8;
+  debug_assert!(base + remainder <= len);
   for i in 0..remainder {
     sum0 += a[base + i] * b[base + i];
   }
@@ -93,7 +95,7 @@ fn dot_product_unrolled(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx")]
 unsafe fn dot_product_avx(a: &[f32], b: &[f32]) -> f32 {
-  // SAFETY: caller guarantees AVX support via has_avx().
+  // SAFETY: caller guarantees AVX support via has_avx() and equal lengths.
   let len = a.len();
   let chunks = len / 8;
   let remainder = len % 8;
@@ -164,6 +166,7 @@ fn squared_euclidean_unrolled(a: &[f32], b: &[f32]) -> f32 {
 
   for i in 0..chunks {
     let base = i * 8;
+    debug_assert!(base + 7 < len);
     let d0 = a[base] - b[base];
     let d1 = a[base + 1] - b[base + 1];
     let d2 = a[base + 2] - b[base + 2];
@@ -185,6 +188,7 @@ fn squared_euclidean_unrolled(a: &[f32], b: &[f32]) -> f32 {
 
   // Handle remainder
   let base = chunks * 8;
+  debug_assert!(base + remainder <= len);
   for i in 0..remainder {
     let d = a[base + i] - b[base + i];
     sum0 += d * d;
@@ -197,7 +201,7 @@ fn squared_euclidean_unrolled(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx")]
 unsafe fn squared_euclidean_avx(a: &[f32], b: &[f32]) -> f32 {
-  // SAFETY: caller guarantees AVX support via has_avx().
+  // SAFETY: caller guarantees AVX support via has_avx() and equal lengths.
   let len = a.len();
   let chunks = len / 8;
   let remainder = len % 8;
@@ -284,6 +288,7 @@ fn l2_norm_unrolled(v: &[f32]) -> f32 {
 
   for i in 0..chunks {
     let base = i * 8;
+    debug_assert!(base + 7 < len);
     sum0 += v[base] * v[base];
     sum1 += v[base + 1] * v[base + 1];
     sum2 += v[base + 2] * v[base + 2];
@@ -295,6 +300,7 @@ fn l2_norm_unrolled(v: &[f32]) -> f32 {
   }
 
   let base = chunks * 8;
+  debug_assert!(base + remainder <= len);
   for i in 0..remainder {
     sum0 += v[base + i] * v[base + i];
   }
@@ -364,6 +370,7 @@ pub fn normalize_in_place(v: &mut [f32]) {
 
     for i in 0..chunks {
       let base = i * 8;
+      debug_assert!(base + 7 < len);
       v[base] *= inv_norm;
       v[base + 1] *= inv_norm;
       v[base + 2] *= inv_norm;
@@ -375,6 +382,7 @@ pub fn normalize_in_place(v: &mut [f32]) {
     }
 
     let base = chunks * 8;
+    debug_assert!(base + remainder <= len);
     for i in 0..remainder {
       v[base + i] *= inv_norm;
     }

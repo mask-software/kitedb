@@ -427,6 +427,52 @@ impl WalBuffer {
     self.write_record_bytes(&record_bytes, pager)
   }
 
+  /// Write prebuilt record bytes in a single batch
+  /// The buffer must contain a sequence of padded records (alignment-sized).
+  pub fn write_record_bytes_batch(
+    &mut self,
+    record_bytes: &[u8],
+    pager: &mut FilePager,
+  ) -> Result<u64> {
+    if record_bytes.is_empty() {
+      return Ok(self.head);
+    }
+
+    if record_bytes.len() % WAL_RECORD_ALIGNMENT != 0 {
+      return Err(KiteError::Internal(
+        "WAL batch bytes must be alignment-sized".to_string(),
+      ));
+    }
+
+    if !self.can_fit(record_bytes.len()) {
+      return Err(KiteError::WalBufferFull);
+    }
+
+    if self.active_region == 0 {
+      if self.primary_head + record_bytes.len() as u64 > self.primary_region_size {
+        return Err(KiteError::WalBufferFull);
+      }
+
+      let file_offset = self.file_offset(self.primary_head);
+      self.buffer_write(file_offset, record_bytes, pager)?;
+      self.primary_head += record_bytes.len() as u64;
+      self.head = self.primary_head;
+    } else {
+      if self.secondary_head + record_bytes.len() as u64
+        > self.secondary_region_start + self.secondary_region_size
+      {
+        return Err(KiteError::WalBufferFull);
+      }
+
+      let file_offset = self.file_offset(self.secondary_head);
+      self.buffer_write(file_offset, record_bytes, pager)?;
+      self.secondary_head += record_bytes.len() as u64;
+      self.head = self.secondary_head;
+    }
+
+    Ok(self.head)
+  }
+
   /// Write raw record bytes to the active region
   fn write_record_bytes(&mut self, record_bytes: &[u8], pager: &mut FilePager) -> Result<u64> {
     let record_size = record_bytes.len();

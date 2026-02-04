@@ -97,6 +97,24 @@ with Database("my_graph.kitedb") as db:
     print("edges:", db.count_edges())
 ```
 
+## Bulk ingest (max throughput)
+
+Use bulk-load transactions + batch APIs to maximize write throughput.
+Bulk-load disables MVCC, so avoid concurrent readers/writers while it runs.
+
+```python
+from kitedb import Database
+
+db = Database("my_graph.kitedb")
+db.begin_bulk()
+
+node_ids = db.create_nodes_batch(keys)  # keys: List[Optional[str]]
+db.add_edges_batch(edges)               # edges: List[Tuple[int, int, int]]
+db.add_edges_with_props_batch(edges_with_props)
+
+db.commit()
+```
+
 ## Fluent traversal
 
 ```python

@@ -11,8 +11,8 @@ use crate::cache::lru::LruCache;
 use crate::types::NodeId;
 use crate::vector::{
   create_vector_store, vector_store_clear, vector_store_delete, vector_store_get,
-  vector_store_insert, vector_store_stats, DistanceMetric, IvfConfig, IvfIndex, SearchOptions,
-  IvfError, VectorManifest, VectorSearchResult, VectorStoreConfig,
+  vector_store_insert, vector_store_stats, DistanceMetric, IvfConfig, IvfError, IvfIndex,
+  SearchOptions, VectorManifest, VectorSearchResult, VectorStoreConfig,
 };
 
 // ============================================================================

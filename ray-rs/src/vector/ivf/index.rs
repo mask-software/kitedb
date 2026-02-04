@@ -278,12 +278,7 @@ impl IvfIndex {
     }
   }
 
-  fn search_cluster(
-    &self,
-    cluster: usize,
-    params: &SearchClusterParams<'_>,
-    heap: &mut MaxHeap,
-  ) {
+  fn search_cluster(&self, cluster: usize, params: &SearchClusterParams<'_>, heap: &mut MaxHeap) {
     let vector_ids = match self.inverted_lists.get(&cluster) {
       Some(list) if !list.is_empty() => list,
       _ => return,

@@ -15,10 +15,10 @@
 //!   --output FILE      Output file path (default: auto-generated)
 //!   --no-output        Disable file output
 
-use rand::{rngs::StdRng, Rng, SeedableRng};
 use kitedb::api::vector_search::{SimilarOptions, VectorIndex, VectorIndexOptions};
 use kitedb::types::NodeId;
 use kitedb::vector::DistanceMetric;
+use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};

@@ -183,7 +183,10 @@ impl KiteTraversal {
       where_edge: None,
       where_node: None,
     };
-    next.steps = next.steps.push(TraversalStep::Traverse { etype, options: opts });
+    next.steps = next.steps.push(TraversalStep::Traverse {
+      etype,
+      options: opts,
+    });
     Ok(next)
   }
 

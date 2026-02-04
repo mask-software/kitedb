@@ -1177,6 +1177,4 @@ mod tests {
     // Check in-edge offsets - node 0 has 1 in-edge, node 1 has 1, node 2 has 1
     assert_eq!(in_csr.offsets, vec![0, 1, 2, 3]);
   }
-
-
 }

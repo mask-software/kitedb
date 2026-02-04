@@ -349,9 +349,7 @@ fn bench_get_node_by_key_micro(c: &mut Criterion) {
   let mut keys = Vec::with_capacity(1000);
   for i in 0..1000 {
     let key = format!("user{i}");
-    ray
-      .create_node("User", &key, HashMap::new())
-      .unwrap();
+    ray.create_node("User", &key, HashMap::new()).unwrap();
     keys.push(key);
   }
 
@@ -608,17 +606,30 @@ fn bench_edge_prop_codegraph_write(c: &mut Criterion) {
       || {
         let temp_dir = tempdir().unwrap();
         let mut ray = Kite::open(temp_db_path(&temp_dir), create_code_graph_schema()).unwrap();
-        let file_count = env::var("KITE_BENCH_FILES").ok().and_then(|v| v.parse().ok()).unwrap_or(100);
-        let chunks_per_file =
-          env::var("KITE_BENCH_CHUNKS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
-        let symbols_per_file =
-          env::var("KITE_BENCH_SYMBOLS").ok().and_then(|v| v.parse().ok()).unwrap_or(120);
-        let refs_per_chunk =
-          env::var("KITE_BENCH_REFS").ok().and_then(|v| v.parse().ok()).unwrap_or(15);
-        let calls_per_chunk =
-          env::var("KITE_BENCH_CALLS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
-        let imports_per_file =
-          env::var("KITE_BENCH_IMPORTS").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+        let file_count = env::var("KITE_BENCH_FILES")
+          .ok()
+          .and_then(|v| v.parse().ok())
+          .unwrap_or(100);
+        let chunks_per_file = env::var("KITE_BENCH_CHUNKS")
+          .ok()
+          .and_then(|v| v.parse().ok())
+          .unwrap_or(20);
+        let symbols_per_file = env::var("KITE_BENCH_SYMBOLS")
+          .ok()
+          .and_then(|v| v.parse().ok())
+          .unwrap_or(120);
+        let refs_per_chunk = env::var("KITE_BENCH_REFS")
+          .ok()
+          .and_then(|v| v.parse().ok())
+          .unwrap_or(15);
+        let calls_per_chunk = env::var("KITE_BENCH_CALLS")
+          .ok()
+          .and_then(|v| v.parse().ok())
+          .unwrap_or(5);
+        let imports_per_file = env::var("KITE_BENCH_IMPORTS")
+          .ok()
+          .and_then(|v| v.parse().ok())
+          .unwrap_or(4);
         let fixture = build_code_graph_fixture(
           &mut ray,
           file_count,
@@ -653,17 +664,30 @@ fn bench_edge_prop_codegraph_write_batched(c: &mut Criterion) {
       || {
         let temp_dir = tempdir().unwrap();
         let mut ray = Kite::open(temp_db_path(&temp_dir), create_code_graph_schema()).unwrap();
-        let file_count = env::var("KITE_BENCH_FILES").ok().and_then(|v| v.parse().ok()).unwrap_or(100);
-        let chunks_per_file =
-          env::var("KITE_BENCH_CHUNKS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
-        let symbols_per_file =
-          env::var("KITE_BENCH_SYMBOLS").ok().and_then(|v| v.parse().ok()).unwrap_or(120);
-        let refs_per_chunk =
-          env::var("KITE_BENCH_REFS").ok().and_then(|v| v.parse().ok()).unwrap_or(15);
-        let calls_per_chunk =
-          env::var("KITE_BENCH_CALLS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
-        let imports_per_file =
-          env::var("KITE_BENCH_IMPORTS").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+        let file_count = env::var("KITE_BENCH_FILES")
+          .ok()
+          .and_then(|v| v.parse().ok())
+          .unwrap_or(100);
+        let chunks_per_file = env::var("KITE_BENCH_CHUNKS")
+          .ok()
+          .and_then(|v| v.parse().ok())
+          .unwrap_or(20);
+        let symbols_per_file = env::var("KITE_BENCH_SYMBOLS")
+          .ok()
+          .and_then(|v| v.parse().ok())
+          .unwrap_or(120);
+        let refs_per_chunk = env::var("KITE_BENCH_REFS")
+          .ok()
+          .and_then(|v| v.parse().ok())
+          .unwrap_or(15);
+        let calls_per_chunk = env::var("KITE_BENCH_CALLS")
+          .ok()
+          .and_then(|v| v.parse().ok())
+          .unwrap_or(5);
+        let imports_per_file = env::var("KITE_BENCH_IMPORTS")
+          .ok()
+          .and_then(|v| v.parse().ok())
+          .unwrap_or(4);
         let fixture = build_code_graph_fixture(
           &mut ray,
           file_count,
@@ -689,14 +713,30 @@ fn bench_edge_prop_codegraph_read(c: &mut Criterion) {
 
   let temp_dir = tempdir().unwrap();
   let mut ray = Kite::open(temp_db_path(&temp_dir), create_code_graph_schema()).unwrap();
-  let file_count = env::var("KITE_BENCH_FILES").ok().and_then(|v| v.parse().ok()).unwrap_or(100);
-  let chunks_per_file = env::var("KITE_BENCH_CHUNKS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
-  let symbols_per_file =
-    env::var("KITE_BENCH_SYMBOLS").ok().and_then(|v| v.parse().ok()).unwrap_or(120);
-  let refs_per_chunk = env::var("KITE_BENCH_REFS").ok().and_then(|v| v.parse().ok()).unwrap_or(15);
-  let calls_per_chunk = env::var("KITE_BENCH_CALLS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
-  let imports_per_file =
-    env::var("KITE_BENCH_IMPORTS").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+  let file_count = env::var("KITE_BENCH_FILES")
+    .ok()
+    .and_then(|v| v.parse().ok())
+    .unwrap_or(100);
+  let chunks_per_file = env::var("KITE_BENCH_CHUNKS")
+    .ok()
+    .and_then(|v| v.parse().ok())
+    .unwrap_or(20);
+  let symbols_per_file = env::var("KITE_BENCH_SYMBOLS")
+    .ok()
+    .and_then(|v| v.parse().ok())
+    .unwrap_or(120);
+  let refs_per_chunk = env::var("KITE_BENCH_REFS")
+    .ok()
+    .and_then(|v| v.parse().ok())
+    .unwrap_or(15);
+  let calls_per_chunk = env::var("KITE_BENCH_CALLS")
+    .ok()
+    .and_then(|v| v.parse().ok())
+    .unwrap_or(5);
+  let imports_per_file = env::var("KITE_BENCH_IMPORTS")
+    .ok()
+    .and_then(|v| v.parse().ok())
+    .unwrap_or(4);
   let fixture = build_code_graph_fixture(
     &mut ray,
     file_count,
@@ -764,14 +804,30 @@ fn bench_edge_prop_codegraph_props_only(c: &mut Criterion) {
   let mut group = c.benchmark_group("edge_prop_codegraph_props_only");
   group.sample_size(10);
 
-  let file_count = env::var("KITE_BENCH_FILES").ok().and_then(|v| v.parse().ok()).unwrap_or(100);
-  let chunks_per_file = env::var("KITE_BENCH_CHUNKS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
-  let symbols_per_file =
-    env::var("KITE_BENCH_SYMBOLS").ok().and_then(|v| v.parse().ok()).unwrap_or(120);
-  let refs_per_chunk = env::var("KITE_BENCH_REFS").ok().and_then(|v| v.parse().ok()).unwrap_or(15);
-  let calls_per_chunk = env::var("KITE_BENCH_CALLS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
-  let imports_per_file =
-    env::var("KITE_BENCH_IMPORTS").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+  let file_count = env::var("KITE_BENCH_FILES")
+    .ok()
+    .and_then(|v| v.parse().ok())
+    .unwrap_or(100);
+  let chunks_per_file = env::var("KITE_BENCH_CHUNKS")
+    .ok()
+    .and_then(|v| v.parse().ok())
+    .unwrap_or(20);
+  let symbols_per_file = env::var("KITE_BENCH_SYMBOLS")
+    .ok()
+    .and_then(|v| v.parse().ok())
+    .unwrap_or(120);
+  let refs_per_chunk = env::var("KITE_BENCH_REFS")
+    .ok()
+    .and_then(|v| v.parse().ok())
+    .unwrap_or(15);
+  let calls_per_chunk = env::var("KITE_BENCH_CALLS")
+    .ok()
+    .and_then(|v| v.parse().ok())
+    .unwrap_or(5);
+  let imports_per_file = env::var("KITE_BENCH_IMPORTS")
+    .ok()
+    .and_then(|v| v.parse().ok())
+    .unwrap_or(4);
 
   group.bench_function("set_props", |bencher| {
     bencher.iter_with_setup(

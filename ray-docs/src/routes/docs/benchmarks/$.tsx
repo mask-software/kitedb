@@ -240,7 +240,7 @@ function DocPageContent(props: { slug: string }) {
     return (
       <DocPage slug={slug}>
         <p>
-          Measured graph performance for the single-file engine. Latest run: February 3, 2026.
+          Measured graph performance for the single-file engine. Latest run: February 4, 2026.
           Raw logs live in <code>docs/benchmarks/results/</code>.
         </p>
 
@@ -264,13 +264,15 @@ function DocPageContent(props: { slug: string }) {
             </tr>
           </thead>
           <tbody>
-            <tr><td>Key lookup (random existing)</td><td>125ns</td><td>167ns</td></tr>
-            <tr><td>1-hop traversal (out)</td><td>208ns</td><td>334ns</td></tr>
+            <tr><td>Key lookup (random existing)</td><td>125ns</td><td>291ns</td></tr>
+            <tr><td>1-hop traversal (out)</td><td>208ns</td><td>292ns</td></tr>
             <tr><td>Edge exists (random)</td><td>83ns</td><td>125ns</td></tr>
-            <tr><td>Batch write (100 nodes)</td><td>45.62us</td><td>58.75us</td></tr>
-            <tr><td>get_node_vector()</td><td>84ns</td><td>209ns</td></tr>
+            <tr><td>Batch write (100 nodes)</td><td>34.08us</td><td>56.54us</td></tr>
+            <tr><td>Batch write (100 edges)</td><td>40.25us</td><td>65.58us</td></tr>
+            <tr><td>Batch write (100 edges + props)</td><td>172.33us</td><td>253.12us</td></tr>
+            <tr><td>get_node_vector()</td><td>125ns</td><td>209ns</td></tr>
             <tr><td>has_node_vector()</td><td>42ns</td><td>84ns</td></tr>
-            <tr><td>Set vectors (batch 100)</td><td>147.25us</td><td>214.21us</td></tr>
+            <tr><td>Set vectors (batch 100)</td><td>94.33us</td><td>195.38us</td></tr>
           </tbody>
         </table>
 
@@ -285,13 +287,37 @@ function DocPageContent(props: { slug: string }) {
             </tr>
           </thead>
           <tbody>
-            <tr><td>Key lookup (random existing)</td><td>208ns</td><td>375ns</td></tr>
-            <tr><td>1-hop traversal (out)</td><td>375ns</td><td>583ns</td></tr>
-            <tr><td>Edge exists (random)</td><td>125ns</td><td>167ns</td></tr>
-            <tr><td>Batch write (100 nodes)</td><td>253.08us</td><td>5.78ms</td></tr>
-            <tr><td>get_node_vector()</td><td>1.21us</td><td>1.54us</td></tr>
-            <tr><td>has_node_vector()</td><td>166ns</td><td>167ns</td></tr>
-            <tr><td>Set vectors (batch 100)</td><td>3.61ms</td><td>6.23ms</td></tr>
+            <tr><td>Key lookup (random existing)</td><td>208ns</td><td>334ns</td></tr>
+            <tr><td>1-hop traversal (out)</td><td>458ns</td><td>708ns</td></tr>
+            <tr><td>Edge exists (random)</td><td>167ns</td><td>209ns</td></tr>
+            <tr><td>Batch write (100 nodes)</td><td>49.71us</td><td>57.96us</td></tr>
+            <tr><td>Batch write (100 edges)</td><td>53.96us</td><td>64.21us</td></tr>
+            <tr><td>Batch write (100 edges + props)</td><td>436.58us</td><td>647.46us</td></tr>
+            <tr><td>get_node_vector()</td><td>1.25us</td><td>2.04us</td></tr>
+            <tr><td>has_node_vector()</td><td>167ns</td><td>208ns</td></tr>
+            <tr><td>Set vectors (batch 100)</td><td>241.83us</td><td>658.42us</td></tr>
+          </tbody>
+        </table>
+
+        <h2 id="sqlite">SQLite Baseline (single-file raw)</h2>
+        <p>
+          Apples-to-apples config: WAL mode, <code>synchronous=normal</code>,
+          <code>temp_store=MEMORY</code>, <code>locking_mode=EXCLUSIVE</code>,
+          <code>cache_size=256MB</code>, WAL autocheckpoint disabled. Edge props are
+          stored in a separate table; edges use <code>INSERT OR IGNORE</code> and
+          props use <code>INSERT OR REPLACE</code>. Script:{" "}
+          <code>docs/benchmarks/sqlite_single_file_raw_bench.py</code>.
+        </p>
+        <table>
+          <thead>
+            <tr>
+              <th>Operation</th>
+              <th>p50</th>
+              <th>p95</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td>Batch write (100 nodes)</td><td>120.67us</td><td>2.98ms</td></tr>
           </tbody>
         </table>
 
@@ -375,7 +401,7 @@ function DocPageContent(props: { slug: string }) {
     return (
       <DocPage slug={slug}>
         <p>
-          Cross-language benchmarks for KiteDB bindings. Latest run: February 3, 2026.
+          Cross-language benchmarks for KiteDB bindings. Latest run: February 4, 2026.
           Raw logs live in <code>docs/benchmarks/results/</code>.
         </p>
 
@@ -390,9 +416,11 @@ function DocPageContent(props: { slug: string }) {
           </thead>
           <tbody>
             <tr><td>Key lookup (random existing)</td><td>125ns</td><td>208ns</td></tr>
-            <tr><td>1-hop traversal (out)</td><td>208ns</td><td>375ns</td></tr>
-            <tr><td>Edge exists (random)</td><td>83ns</td><td>125ns</td></tr>
-            <tr><td>Batch write (100 nodes)</td><td>45.62us</td><td>253.08us</td></tr>
+            <tr><td>1-hop traversal (out)</td><td>208ns</td><td>458ns</td></tr>
+            <tr><td>Edge exists (random)</td><td>83ns</td><td>167ns</td></tr>
+            <tr><td>Batch write (100 nodes)</td><td>34.08us</td><td>49.71us</td></tr>
+            <tr><td>Batch write (100 edges)</td><td>40.25us</td><td>53.96us</td></tr>
+            <tr><td>Batch write (100 edges + props)</td><td>172.33us</td><td>436.58us</td></tr>
           </tbody>
         </table>
 

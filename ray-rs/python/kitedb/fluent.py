@@ -827,6 +827,41 @@ class Kite:
         except Exception:
             self._db.rollback()
             raise
+
+    def bulk(self, operations: List[Any]) -> List[Any]:
+        """
+        Execute multiple operations in a bulk-load transaction (max throughput).
+
+        Note: bulk-load disables MVCC. Use for one-shot ingest/ETL jobs.
+        """
+        if self._db.has_transaction():
+            raise ValueError("bulk() cannot run inside an active transaction")
+
+        begin_bulk = getattr(self._db, "begin_bulk", None)
+        if begin_bulk is None:
+            return self.batch(operations)
+
+        try:
+            begin_bulk()
+        except Exception:
+            self._db.begin()
+
+        try:
+            results: List[Any] = []
+            for op in operations:
+                if callable(op):
+                    results.append(op())
+                elif hasattr(op, "returning"):
+                    results.append(op.returning())
+                elif hasattr(op, "execute"):
+                    results.append(op.execute())
+                else:
+                    raise ValueError("Unsupported batch operation")
+            self._db.commit()
+            return results
+        except Exception:
+            self._db.rollback()
+            raise
     
     @contextmanager
     def transaction(self) -> Generator[Kite, None, None]:

@@ -33,7 +33,6 @@ pub mod core;
 // Snapshot integrity checks
 pub mod check;
 
-
 // MVCC modules (Phase 4)
 pub mod mvcc;
 
@@ -112,7 +111,7 @@ pub use types::PropValueTag;
 #[cfg(feature = "napi")]
 pub use napi_bindings::{
   open_database, Database, DbStats, EdgePage, EdgeWithProps, JsEdge, JsFullEdge, JsNodeProp,
-  JsPropValue, NodePage, NodeWithProps, OpenOptions, PaginationOptions, PropType, Kite,
+  JsPropValue, Kite, NodePage, NodeWithProps, OpenOptions, PaginationOptions, PropType,
   StreamOptions,
 };
 

@@ -54,10 +54,7 @@ pub fn optimize_single(
     .map_err(|e| PyRuntimeError::new_err(format!("Failed to optimize: {e}")))
 }
 
-pub fn vacuum_single(
-  db: &RustSingleFileDB,
-  options: Option<RustVacuumOptions>,
-) -> PyResult<()> {
+pub fn vacuum_single(db: &RustSingleFileDB, options: Option<RustVacuumOptions>) -> PyResult<()> {
   db.vacuum_single_file(options)
     .map_err(|e| PyRuntimeError::new_err(format!("Failed to vacuum: {e}")))
 }

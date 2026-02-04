@@ -18,9 +18,9 @@ pub use database::{
 };
 
 pub use kite::{
-  kite, kite_sync, JsEdgeSpec, JsKeySpec, JsNodeSpec, JsPathEdge, JsPathResult, JsPropSpec,
-  JsKiteOptions, Kite, KiteInsertBuilder, KiteInsertExecutorMany, KiteInsertExecutorSingle,
-  KitePath, KiteTraversal, KiteUpdateBuilder, KiteUpdateEdgeBuilder, KiteUpsertBuilder,
+  kite, kite_sync, JsEdgeSpec, JsKeySpec, JsKiteOptions, JsNodeSpec, JsPathEdge, JsPathResult,
+  JsPropSpec, Kite, KiteInsertBuilder, KiteInsertExecutorMany, KiteInsertExecutorSingle, KitePath,
+  KiteTraversal, KiteUpdateBuilder, KiteUpdateEdgeBuilder, KiteUpsertBuilder,
   KiteUpsertByIdBuilder, KiteUpsertEdgeBuilder, KiteUpsertExecutorMany, KiteUpsertExecutorSingle,
 };
 

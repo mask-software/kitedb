@@ -320,7 +320,8 @@ export function PerformancePage() {
 
 			<p>
 				Latest snapshot (single-file raw, Rust core, 10k nodes / 50k edges,
-				edge types=3, edge props=10, group commit enabled, February 3, 2026):
+				edge types=3, edge props=10, sync_mode=Normal, group_commit=false,
+				February 4, 2026):
 			</p>
 
 			<h3>Node Ops</h3>
@@ -338,7 +339,7 @@ export function PerformancePage() {
 					</tr>
 					<tr>
 						<td>Batch write (100 nodes)</td>
-						<td>3.09ms</td>
+						<td>34.08us</td>
 					</tr>
 				</tbody>
 			</table>
@@ -359,6 +360,14 @@ export function PerformancePage() {
 					<tr>
 						<td>Edge exists (random)</td>
 						<td>83ns</td>
+					</tr>
+					<tr>
+						<td>Batch write (100 edges)</td>
+						<td>40.25us</td>
+					</tr>
+					<tr>
+						<td>Batch write (100 edges + props)</td>
+						<td>172.33us</td>
 					</tr>
 				</tbody>
 			</table>
@@ -429,21 +438,62 @@ export function PerformancePage() {
 				</tbody>
 			</table>
 
+			<h2 id="playbook">Performance Playbook</h2>
+			<ul class="space-y-2 text-sm text-slate-400">
+				<li>
+					<b class="text-slate-200">Fastest ingest (single writer):</b>{" "}
+					<code>begin_bulk()</code> + <code>create_nodes_batch()</code> +{" "}
+					<code>add_edges_batch()</code> / <code>add_edges_with_props_batch()</code>,{" "}
+					<code>sync_mode=Normal</code>, <code>group_commit=false</code>, WAL ≥ 256MB,
+					auto-checkpoint off during ingest, then checkpoint.
+				</li>
+				<li>
+					<b class="text-slate-200">Multi-writer throughput:</b>{" "}
+					<code>sync_mode=Normal</code> + <code>group_commit=true</code> (1-2ms window),
+					batched ops per transaction.
+				</li>
+				<li>
+					<b class="text-slate-200">Read-heavy, mixed workload:</b>{" "}
+					Keep batches small, checkpoint when WAL ≥ 80%, avoid deep traversals.
+				</li>
+				<li>
+					<b class="text-slate-200">Max speed, lowest durability:</b>{" "}
+					<code>sync_mode=Off</code> for testing only.
+				</li>
+			</ul>
+			<p class="text-sm text-slate-500 mt-3">
+				Bulk-load mode requires MVCC disabled. Use it for one-shot ingest or ETL jobs.
+			</p>
+
+			<h3 class="mt-6">Bulk Ingest Example (Low-Level)</h3>
+			<CodeBlock
+				code={`// Fast ingest: low-level API
+db.begin_bulk();
+const nodeIds = db.create_nodes_batch(keys); // keys: string[]
+db.add_edges_batch(edges); // edges: { src, etype, dst }[]
+db.add_edges_with_props_batch(edgesWithProps);
+db.commit();
+
+// Optional: checkpoint after ingest
+db.checkpoint();`}
+				language="typescript"
+			/>
+
 			<h2 id="best-practices">Best Practices</h2>
 
 			<h3>Batch Writes</h3>
 			<CodeBlock
-				code={`// Slow: Individual inserts (1 WAL sync per operation)
-for (const user of users) {
-  await db.insert(userSchema).values(user);
+				code={`// Slow: Individual inserts (1 WAL sync per op)
+for (const key of keys) {
+  db.create_node(key);
 }
-// 1000 users × 1ms sync = 1000ms
 
-// Fast: Batch insert (1 WAL sync for all)
-await db.insert(userSchema).values(users);
-// 1000 users × 1μs + 1ms sync = ~2ms
+// Fast: Batch + bulk-load transaction
+db.begin_bulk();
+db.create_nodes_batch(keys);
+db.commit();
 
-Speedup: 500x for bulk operations`}
+// 1000 nodes × 1μs + 1 WAL sync = ~2ms`}
 				language="typescript"
 			/>
 

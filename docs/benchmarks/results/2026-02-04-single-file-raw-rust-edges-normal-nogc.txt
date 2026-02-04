@@ -13,7 +13,7 @@ Auto-checkpoint: false
 Checkpoint threshold: 0.8
 Vector dims: 128
 Vector count: 1,000
-Skip checkpoint: true
+Skip checkpoint: false
 Reopen read-only: false
 ========================================================================================================================
 
@@ -22,32 +22,38 @@ Reopen read-only: false
   Created 5000 / 10000 nodes  Created 10000 / 10000 nodes
   Creating edges...
   Created 5000 / 50000 edges  Created 10000 / 50000 edges  Created 15000 / 50000 edges  Created 20000 / 50000 edges  Created 25000 / 50000 edges  Created 30000 / 50000 edges  Created 35000 / 50000 edges  Created 40000 / 50000 edges  Created 45000 / 50000 edges  Created 50000 / 50000 edges
-  Built in 207ms
+  Built in 127ms
 
 [2/6] Vector setup...
 
 --- Vector Operations ---
-Set vectors (batch 100)                       p50=  248.75us p95=    2.91ms p99=    2.91ms max=    2.91ms (2179 ops/sec)
+Set vectors (batch 100)                       p50=   94.33us p95=  195.38us p99=  195.38us max=  195.38us (9566 ops/sec)
 
 [3/6] Checkpointing...
-  Skipped checkpoint
+  Checkpointed in 121ms
 
 [4/6] Key lookup benchmarks...
 
 --- Key Lookups (get_node_by_key) ---
-Random existing keys                          p50=      84ns p95=     333ns p99=     500ns max=    3.71us (7913127 ops/sec)
+Random existing keys                          p50=     125ns p95=     291ns p99=     500ns max=  412.54us (5434605 ops/sec)
 
 [5/6] Traversal and edge benchmarks...
 
 --- 1-Hop Traversals (out) ---
-Random nodes                                  p50=     167ns p95=     458ns p99=     833ns max=   29.08us (4889402 ops/sec)
+Random nodes                                  p50=     208ns p95=     292ns p99=     417ns max=  506.75us (3911791 ops/sec)
 
 --- Edge Exists ---
-Random edge exists                            p50=      83ns p95=     250ns p99=     375ns max=   47.04us (9608308 ops/sec)
-get_node_vector() random                      p50=     125ns p95=     417ns p99=     583ns max=   30.88us (5162881 ops/sec)
-has_node_vector() random                      p50=      42ns p95=      84ns p99=     209ns max=    6.75us (15504044 ops/sec)
+Random edge exists                            p50=      83ns p95=     125ns p99=     333ns max=   41.04us (8912839 ops/sec)
+get_node_vector() random                      p50=     125ns p95=     209ns p99=     334ns max=    6.17us (8137034 ops/sec)
+has_node_vector() random                      p50=      42ns p95=      84ns p99=      84ns max=   10.50us (17233535 ops/sec)
 
 [6/6] Write benchmarks...
 
 --- Batch Writes (100 nodes) ---
-Batch of 100 nodes                            p50=   51.08us p95=  256.42us p99=  815.00us max=  815.00us (12294 ops/sec)
+Batch of 100 nodes                            p50=   34.08us p95=   56.54us p99=  132.00us max=  132.00us (25831 ops/sec)
+
+--- Batch Writes (100 edges) ---
+Batch of 100 edges                            p50=   40.25us p95=   65.58us p99=   89.21us max=   89.21us (22933 ops/sec)
+
+--- Batch Writes (100 edges + props) ---
+Batch of 100 edges + props                    p50=  172.33us p95=  253.12us p99=  420.67us max=  420.67us (5459 ops/sec)

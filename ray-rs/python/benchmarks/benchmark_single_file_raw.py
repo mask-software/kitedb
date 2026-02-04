@@ -228,7 +228,7 @@ def build_graph(db: Database, config: BenchConfig) -> GraphData:
   edge_types: List[int] = []
   edge_prop_keys: List[int] = []
   for batch in range(0, config.nodes, batch_size):
-    db.begin()
+    db.begin_bulk()
     if batch == 0:
       for idx in range(config.edge_types):
         edge_types.append(db.get_or_create_etype(f"CALLS_{idx}"))
@@ -236,11 +236,12 @@ def build_graph(db: Database, config: BenchConfig) -> GraphData:
         edge_prop_keys.append(db.get_or_create_propkey(f"edge_prop_{idx}"))
 
     end = min(batch + batch_size, config.nodes)
+    keys = []
     for i in range(batch, end):
-      key = f"pkg.module{i // 100}.Class{i % 100}"
-      node_id = db.create_node(key)
-      node_ids.append(node_id)
-      node_keys.append(key)
+      keys.append(f"pkg.module{i // 100}.Class{i % 100}")
+    batch_ids = db.create_nodes_batch(keys)
+    node_ids.extend(batch_ids)
+    node_keys.extend(keys)
 
     db.commit()
     print(f"\r  Created {end} / {config.nodes} nodes", end="", flush=True)
@@ -252,8 +253,10 @@ def build_graph(db: Database, config: BenchConfig) -> GraphData:
   max_attempts = config.edges * 3
 
   while edges_created < config.edges and attempts < max_attempts:
-    db.begin()
+    db.begin_bulk()
     batch_target = min(edges_created + batch_size, config.edges)
+    edges_batch = []
+    edges_with_props_batch = []
 
     while edges_created < batch_target and attempts < max_attempts:
       attempts += 1
@@ -261,17 +264,19 @@ def build_graph(db: Database, config: BenchConfig) -> GraphData:
       dst = random.choice(node_ids)
       if src != dst:
         etype = random.choice(edge_types)
-        db.add_edge(src, etype, dst)
         if edge_prop_keys:
+          props = []
           for offset, key_id in enumerate(edge_prop_keys):
-            db.set_edge_prop(
-              src,
-              etype,
-              dst,
-              key_id,
-              PropValue.int(edges_created + offset),
-            )
+            props.append((key_id, PropValue.int(edges_created + offset)))
+          edges_with_props_batch.append((src, etype, dst, props))
+        else:
+          edges_batch.append((src, etype, dst))
         edges_created += 1
+
+    if edge_prop_keys:
+      db.add_edges_with_props_batch(edges_with_props_batch)
+    else:
+      db.add_edges_batch(edges_batch)
 
     db.commit()
     print(f"\r  Created {edges_created} / {config.edges} edges", end="", flush=True)
@@ -371,19 +376,80 @@ def benchmark_vector_reads(db: Database, vector_nodes: List[int], prop_key_id: i
   print_latency_table("has_node_vector() random", tracker.get_stats())
 
 
-def benchmark_writes(db: Database, iterations: int):
+def create_bench_nodes(db: Database, label: str, count: int) -> List[int]:
+  if count <= 0:
+    return []
+  db.begin_bulk()
+  keys = [f"{label}:{idx}" for idx in range(count)]
+  node_ids = db.create_nodes_batch(keys)
+  db.commit()
+  return node_ids
+
+
+def benchmark_writes(db: Database, graph: GraphData, iterations: int):
   logger.log("\n--- Batch Writes (100 nodes) ---")
   batch_size = 100
   batches = min(iterations // batch_size, 50)
   tracker = LatencyTracker()
   for b in range(batches):
     start = time.perf_counter_ns()
-    db.begin()
-    for i in range(batch_size):
-      db.create_node(f"bench:raw:{b}:{i}")
+    db.begin_bulk()
+    keys = [f"bench:raw:{b}:{i}" for i in range(batch_size)]
+    db.create_nodes_batch(keys)
     db.commit()
     tracker.record(time.perf_counter_ns() - start)
   print_latency_table("Batch of 100 nodes", tracker.get_stats())
+
+  if batches == 0:
+    return
+
+  edge_batch_size = 100
+  edge_batches = min(iterations // edge_batch_size, 50)
+  if edge_batches == 0:
+    return
+
+  edge_etype = graph.edge_types[0] if graph.edge_types else db.get_or_create_etype("BENCH_EDGE")
+
+  logger.log("\n--- Batch Writes (100 edges) ---")
+  total_edges = edge_batches * edge_batch_size
+  edge_nodes = create_bench_nodes(db, "bench:edge", total_edges * 2)
+  tracker = LatencyTracker()
+  for b in range(edge_batches):
+    start = time.perf_counter_ns()
+    db.begin_bulk()
+    base = b * edge_batch_size * 2
+    edges = []
+    for i in range(edge_batch_size):
+      src = edge_nodes[base + i * 2]
+      dst = edge_nodes[base + i * 2 + 1]
+      edges.append((src, edge_etype, dst))
+    db.add_edges_batch(edges)
+    db.commit()
+    tracker.record(time.perf_counter_ns() - start)
+  print_latency_table("Batch of 100 edges", tracker.get_stats())
+
+  if not graph.edge_prop_keys:
+    return
+
+  logger.log("\n--- Batch Writes (100 edges + props) ---")
+  edge_prop_nodes = create_bench_nodes(db, "bench:edge-props", total_edges * 2)
+  tracker = LatencyTracker()
+  for b in range(edge_batches):
+    start = time.perf_counter_ns()
+    db.begin_bulk()
+    base = b * edge_batch_size * 2
+    edges = []
+    for i in range(edge_batch_size):
+      src = edge_prop_nodes[base + i * 2]
+      dst = edge_prop_nodes[base + i * 2 + 1]
+      props = []
+      for idx, key_id in enumerate(graph.edge_prop_keys):
+        props.append((key_id, PropValue.int(b * edge_batch_size + i + idx)))
+      edges.append((src, edge_etype, dst, props))
+    db.add_edges_with_props_batch(edges)
+    db.commit()
+    tracker.record(time.perf_counter_ns() - start)
+  print_latency_table("Batch of 100 edges + props", tracker.get_stats())
 
 
 def run_benchmarks(config: BenchConfig):
@@ -469,7 +535,7 @@ def run_benchmarks(config: BenchConfig):
     if db.read_only:
       logger.log("  Skipped write benchmarks (read-only)")
     else:
-      benchmark_writes(db, config.iterations)
+      benchmark_writes(db, graph, config.iterations)
 
   finally:
     if db is not None and db.is_open:
