@@ -58,7 +58,7 @@ pub fn traverse_out_single(
   node_id: NodeId,
   etype: Option<ETypeId>,
 ) -> Vec<i64> {
-  db.get_out_edges(node_id)
+  db.out_edges(node_id)
     .into_iter()
     .filter(|(e, _)| etype.is_none() || etype == Some(*e))
     .map(|(_, dst)| dst as i64)
@@ -70,11 +70,11 @@ pub fn traverse_out_with_keys_single(
   node_id: NodeId,
   etype: Option<ETypeId>,
 ) -> Vec<(i64, Option<String>)> {
-  db.get_out_edges(node_id)
+  db.out_edges(node_id)
     .into_iter()
     .filter(|(e, _)| etype.is_none() || etype == Some(*e))
     .map(|(_, dst)| {
-      let key = db.get_node_key(dst);
+      let key = db.node_key(dst);
       (dst as i64, key)
     })
     .collect()
@@ -86,12 +86,12 @@ pub fn traverse_out_count_single(
   etype: Option<ETypeId>,
 ) -> i64 {
   if let Some(et) = etype {
-    db.get_out_edges(node_id)
+    db.out_edges(node_id)
       .into_iter()
       .filter(|(e, _)| *e == et)
       .count() as i64
   } else {
-    db.get_out_degree(node_id) as i64
+    db.out_degree(node_id) as i64
   }
 }
 
@@ -100,7 +100,7 @@ pub fn traverse_in_single(
   node_id: NodeId,
   etype: Option<ETypeId>,
 ) -> Vec<i64> {
-  db.get_in_edges(node_id)
+  db.in_edges(node_id)
     .into_iter()
     .filter(|(e, _)| etype.is_none() || etype == Some(*e))
     .map(|(_, src)| src as i64)
@@ -112,11 +112,11 @@ pub fn traverse_in_with_keys_single(
   node_id: NodeId,
   etype: Option<ETypeId>,
 ) -> Vec<(i64, Option<String>)> {
-  db.get_in_edges(node_id)
+  db.in_edges(node_id)
     .into_iter()
     .filter(|(e, _)| etype.is_none() || etype == Some(*e))
     .map(|(_, src)| {
-      let key = db.get_node_key(src);
+      let key = db.node_key(src);
       (src as i64, key)
     })
     .collect()
@@ -128,12 +128,12 @@ pub fn traverse_in_count_single(
   etype: Option<ETypeId>,
 ) -> i64 {
   if let Some(et) = etype {
-    db.get_in_edges(node_id)
+    db.in_edges(node_id)
       .into_iter()
       .filter(|(e, _)| *e == et)
       .count() as i64
   } else {
-    db.get_in_degree(node_id) as i64
+    db.in_degree(node_id) as i64
   }
 }
 
@@ -151,26 +151,26 @@ pub fn traverse_multi_single(
     for node_id in &current_ids {
       let neighbors: Vec<NodeId> = match direction.as_str() {
         "out" => db
-          .get_out_edges(*node_id)
+          .out_edges(*node_id)
           .into_iter()
           .filter(|(e, _)| etype.is_none() || etype == Some(*e))
           .map(|(_, dst)| dst)
           .collect(),
         "in" => db
-          .get_in_edges(*node_id)
+          .in_edges(*node_id)
           .into_iter()
           .filter(|(e, _)| etype.is_none() || etype == Some(*e))
           .map(|(_, src)| src)
           .collect(),
         _ => {
           let mut out: Vec<NodeId> = db
-            .get_out_edges(*node_id)
+            .out_edges(*node_id)
             .into_iter()
             .filter(|(e, _)| etype.is_none() || etype == Some(*e))
             .map(|(_, dst)| dst)
             .collect();
           let in_edges: Vec<NodeId> = db
-            .get_in_edges(*node_id)
+            .in_edges(*node_id)
             .into_iter()
             .filter(|(e, _)| etype.is_none() || etype == Some(*e))
             .map(|(_, src)| src)
@@ -194,7 +194,7 @@ pub fn traverse_multi_single(
   current_ids
     .into_iter()
     .map(|id| {
-      let key = db.get_node_key(id);
+      let key = db.node_key(id);
       (id as i64, key)
     })
     .collect()
@@ -214,26 +214,26 @@ pub fn traverse_multi_count_single(
     for node_id in &current_ids {
       let neighbors: Vec<NodeId> = match direction.as_str() {
         "out" => db
-          .get_out_edges(*node_id)
+          .out_edges(*node_id)
           .into_iter()
           .filter(|(e, _)| etype.is_none() || etype == Some(*e))
           .map(|(_, dst)| dst)
           .collect(),
         "in" => db
-          .get_in_edges(*node_id)
+          .in_edges(*node_id)
           .into_iter()
           .filter(|(e, _)| etype.is_none() || etype == Some(*e))
           .map(|(_, src)| src)
           .collect(),
         _ => {
           let mut out: Vec<NodeId> = db
-            .get_out_edges(*node_id)
+            .out_edges(*node_id)
             .into_iter()
             .filter(|(e, _)| etype.is_none() || etype == Some(*e))
             .map(|(_, dst)| dst)
             .collect();
           let in_edges: Vec<NodeId> = db
-            .get_in_edges(*node_id)
+            .in_edges(*node_id)
             .into_iter()
             .filter(|(e, _)| etype.is_none() || etype == Some(*e))
             .map(|(_, src)| src)

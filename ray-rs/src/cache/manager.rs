@@ -120,11 +120,11 @@ impl CacheManagerStats {
 ///
 /// // Property cache operations
 /// cache.set_node_prop(1, 10, Some(PropValue::I64(42)));
-/// assert_eq!(cache.get_node_prop(1, 10), Some(&Some(PropValue::I64(42))));
+/// assert_eq!(cache.node_prop(1, 10), Some(&Some(PropValue::I64(42))));
 ///
 /// // Invalidation
 /// cache.invalidate_node(1);
-/// assert_eq!(cache.get_node_prop(1, 10), None);
+/// assert_eq!(cache.node_prop(1, 10), None);
 /// ```
 pub struct CacheManager {
   /// Property cache for node/edge properties
@@ -209,7 +209,7 @@ impl CacheManager {
   // ========================================================================
 
   /// Get a node property from cache
-  pub fn get_node_prop(
+  pub fn node_prop(
     &mut self,
     node_id: NodeId,
     prop_key_id: PropKeyId,
@@ -217,7 +217,7 @@ impl CacheManager {
     if !self.enabled {
       return None;
     }
-    self.property_cache.get_node_prop(node_id, prop_key_id)
+    self.property_cache.node_prop(node_id, prop_key_id)
   }
 
   /// Set a node property in cache
@@ -236,7 +236,7 @@ impl CacheManager {
   }
 
   /// Get an edge property from cache
-  pub fn get_edge_prop(
+  pub fn edge_prop(
     &mut self,
     src: NodeId,
     etype: ETypeId,
@@ -246,9 +246,7 @@ impl CacheManager {
     if !self.enabled {
       return None;
     }
-    self
-      .property_cache
-      .get_edge_prop(src, etype, dst, prop_key_id)
+    self.property_cache.edge_prop(src, etype, dst, prop_key_id)
   }
 
   /// Set an edge property in cache
@@ -273,7 +271,7 @@ impl CacheManager {
   // ========================================================================
 
   /// Get cached neighbors for a node
-  pub fn get_traversal(
+  pub fn traversal(
     &mut self,
     node_id: NodeId,
     etype: Option<ETypeId>,
@@ -306,7 +304,7 @@ impl CacheManager {
   // ========================================================================
 
   /// Get a cached query result
-  pub fn get_query<T: 'static>(&mut self, query_key: &str) -> Option<&T> {
+  pub fn query<T: 'static>(&mut self, query_key: &str) -> Option<&T> {
     if !self.enabled {
       return None;
     }
@@ -340,7 +338,7 @@ impl CacheManager {
   /// - `Some(&Some(node_id))` - Key found, maps to node_id
   /// - `Some(&None)` - Key was looked up but not found (negative cache)
   /// - `None` - Not in cache
-  pub fn get_node_by_key(&mut self, key: &str) -> Option<&Option<NodeId>> {
+  pub fn node_by_key(&mut self, key: &str) -> Option<&Option<NodeId>> {
     if !self.enabled {
       return None;
     }
@@ -456,7 +454,7 @@ impl CacheManager {
   // ========================================================================
 
   /// Get detailed statistics for all caches
-  pub fn stats(&self) -> CacheManagerStats {
+  pub fn manager_stats(&self) -> CacheManagerStats {
     let prop_stats = self.property_cache.stats();
     let trav_stats = self.traversal_cache.stats();
     let query_stats = self.query_cache.stats();
@@ -485,8 +483,8 @@ impl CacheManager {
   }
 
   /// Get simple cache statistics (for CacheStats type)
-  pub fn get_stats(&self) -> CacheStats {
-    self.stats().to_cache_stats()
+  pub fn stats(&self) -> CacheStats {
+    self.manager_stats().to_cache_stats()
   }
 
   /// Reset all statistics counters
@@ -556,22 +554,22 @@ mod tests {
 
     // All operations should be no-ops
     cache.set_node_prop(1, 10, Some(PropValue::I64(42)));
-    assert_eq!(cache.get_node_prop(1, 10), None);
+    assert_eq!(cache.node_prop(1, 10), None);
 
     cache.set_edge_prop(1, 1, 2, 10, Some(PropValue::I64(100)));
-    assert_eq!(cache.get_edge_prop(1, 1, 2, 10), None);
+    assert_eq!(cache.edge_prop(1, 1, 2, 10), None);
 
     cache.set_traversal(1, Some(1), TraversalDirection::Out, vec![]);
     assert!(cache
-      .get_traversal(1, Some(1), TraversalDirection::Out)
+      .traversal(1, Some(1), TraversalDirection::Out)
       .is_none());
 
     cache.set_query("key".to_string(), 42i32);
-    let result: Option<&i32> = cache.get_query("key");
+    let result: Option<&i32> = cache.query("key");
     assert!(result.is_none());
 
     cache.set_node_by_key("alice", Some(1));
-    assert_eq!(cache.get_node_by_key("alice"), None);
+    assert_eq!(cache.node_by_key("alice"), None);
   }
 
   #[test]
@@ -580,12 +578,12 @@ mod tests {
 
     // Node properties
     cache.set_node_prop(1, 10, Some(PropValue::I64(42)));
-    assert_eq!(cache.get_node_prop(1, 10), Some(&Some(PropValue::I64(42))));
+    assert_eq!(cache.node_prop(1, 10), Some(&Some(PropValue::I64(42))));
 
     // Edge properties
     cache.set_edge_prop(1, 1, 2, 10, Some(PropValue::String("weight".to_string())));
     assert_eq!(
-      cache.get_edge_prop(1, 1, 2, 10),
+      cache.edge_prop(1, 1, 2, 10),
       Some(&Some(PropValue::String("weight".to_string())))
     );
   }
@@ -609,7 +607,7 @@ mod tests {
 
     cache.set_traversal(1, Some(1), TraversalDirection::Out, neighbors.clone());
 
-    let result = cache.get_traversal(1, Some(1), TraversalDirection::Out);
+    let result = cache.traversal(1, Some(1), TraversalDirection::Out);
     assert!(result.is_some());
     assert_eq!(result.unwrap().neighbors.len(), 2);
   }
@@ -620,7 +618,7 @@ mod tests {
 
     cache.set_query("query1".to_string(), vec![1u64, 2, 3]);
 
-    let result: Option<&Vec<u64>> = cache.get_query("query1");
+    let result: Option<&Vec<u64>> = cache.query("query1");
     assert!(result.is_some());
     assert_eq!(result.unwrap(), &vec![1, 2, 3]);
   }
@@ -631,14 +629,14 @@ mod tests {
 
     // Cache a key -> node mapping
     cache.set_node_by_key("alice", Some(1));
-    assert_eq!(cache.get_node_by_key("alice"), Some(&Some(1)));
+    assert_eq!(cache.node_by_key("alice"), Some(&Some(1)));
 
     // Cache a negative result (key not found)
     cache.set_node_by_key("nonexistent", None);
-    assert_eq!(cache.get_node_by_key("nonexistent"), Some(&None));
+    assert_eq!(cache.node_by_key("nonexistent"), Some(&None));
 
     // Cache miss
-    assert_eq!(cache.get_node_by_key("unknown"), None);
+    assert_eq!(cache.node_by_key("unknown"), None);
   }
 
   #[test]
@@ -666,14 +664,14 @@ mod tests {
     cache.invalidate_node(1);
 
     // Node 1 caches should be gone
-    assert_eq!(cache.get_node_prop(1, 10), None);
-    assert_eq!(cache.get_node_prop(1, 20), None);
+    assert_eq!(cache.node_prop(1, 10), None);
+    assert_eq!(cache.node_prop(1, 20), None);
     assert!(cache
-      .get_traversal(1, Some(1), TraversalDirection::Out)
+      .traversal(1, Some(1), TraversalDirection::Out)
       .is_none());
 
     // Node 2 cache should remain
-    assert_eq!(cache.get_node_prop(2, 10), Some(&Some(PropValue::I64(100))));
+    assert_eq!(cache.node_prop(2, 10), Some(&Some(PropValue::I64(100))));
   }
 
   #[test]
@@ -710,11 +708,11 @@ mod tests {
     cache.invalidate_edge(1, 1, 2);
 
     // Edge (1,1,2) caches should be gone
-    assert_eq!(cache.get_edge_prop(1, 1, 2, 10), None);
+    assert_eq!(cache.edge_prop(1, 1, 2, 10), None);
 
     // Edge (1,2,3) cache should remain
     assert_eq!(
-      cache.get_edge_prop(1, 2, 3, 10),
+      cache.edge_prop(1, 2, 3, 10),
       Some(&Some(PropValue::I64(100)))
     );
   }
@@ -728,8 +726,8 @@ mod tests {
 
     cache.invalidate_key("alice");
 
-    assert_eq!(cache.get_node_by_key("alice"), None);
-    assert_eq!(cache.get_node_by_key("bob"), Some(&Some(2)));
+    assert_eq!(cache.node_by_key("alice"), None);
+    assert_eq!(cache.node_by_key("bob"), Some(&Some(2)));
   }
 
   #[test]
@@ -744,14 +742,14 @@ mod tests {
 
     cache.clear();
 
-    assert_eq!(cache.get_node_prop(1, 10), None);
-    assert_eq!(cache.get_edge_prop(1, 1, 2, 10), None);
+    assert_eq!(cache.node_prop(1, 10), None);
+    assert_eq!(cache.edge_prop(1, 1, 2, 10), None);
     assert!(cache
-      .get_traversal(1, Some(1), TraversalDirection::Out)
+      .traversal(1, Some(1), TraversalDirection::Out)
       .is_none());
-    let q: Option<&i32> = cache.get_query("q1");
+    let q: Option<&i32> = cache.query("q1");
     assert!(q.is_none());
-    assert_eq!(cache.get_node_by_key("alice"), None);
+    assert_eq!(cache.node_by_key("alice"), None);
   }
 
   #[test]
@@ -765,28 +763,28 @@ mod tests {
 
     // Clear only property cache
     cache.clear_property_cache();
-    assert_eq!(cache.get_node_prop(1, 10), None);
+    assert_eq!(cache.node_prop(1, 10), None);
     assert!(cache
-      .get_traversal(1, Some(1), TraversalDirection::Out)
+      .traversal(1, Some(1), TraversalDirection::Out)
       .is_some());
 
     // Clear only traversal cache
     cache.clear_traversal_cache();
     assert!(cache
-      .get_traversal(1, Some(1), TraversalDirection::Out)
+      .traversal(1, Some(1), TraversalDirection::Out)
       .is_none());
-    let q: Option<&i32> = cache.get_query("q1");
+    let q: Option<&i32> = cache.query("q1");
     assert!(q.is_some());
 
     // Clear only query cache
     cache.clear_query_cache();
-    let q: Option<&i32> = cache.get_query("q1");
+    let q: Option<&i32> = cache.query("q1");
     assert!(q.is_none());
-    assert_eq!(cache.get_node_by_key("alice"), Some(&Some(1)));
+    assert_eq!(cache.node_by_key("alice"), Some(&Some(1)));
 
     // Clear only key cache
     cache.clear_key_cache();
-    assert_eq!(cache.get_node_by_key("alice"), None);
+    assert_eq!(cache.node_by_key("alice"), None);
   }
 
   #[test]
@@ -795,22 +793,22 @@ mod tests {
 
     // Generate some cache activity
     cache.set_node_prop(1, 10, Some(PropValue::I64(42)));
-    cache.get_node_prop(1, 10); // Hit
-    cache.get_node_prop(999, 10); // Miss
+    cache.node_prop(1, 10); // Hit
+    cache.node_prop(999, 10); // Miss
 
     cache.set_traversal(1, Some(1), TraversalDirection::Out, vec![]);
-    cache.get_traversal(1, Some(1), TraversalDirection::Out); // Hit
-    cache.get_traversal(999, Some(1), TraversalDirection::Out); // Miss
+    cache.traversal(1, Some(1), TraversalDirection::Out); // Hit
+    cache.traversal(999, Some(1), TraversalDirection::Out); // Miss
 
     cache.set_query("q1".to_string(), 42i32);
-    let _: Option<&i32> = cache.get_query("q1"); // Hit
-    let _: Option<&i32> = cache.get_query("q2"); // Miss
+    let _: Option<&i32> = cache.query("q1"); // Hit
+    let _: Option<&i32> = cache.query("q2"); // Miss
 
     cache.set_node_by_key("alice", Some(1));
-    cache.get_node_by_key("alice"); // Hit
-    cache.get_node_by_key("bob"); // Miss
+    cache.node_by_key("alice"); // Hit
+    cache.node_by_key("bob"); // Miss
 
-    let stats = cache.stats();
+    let stats = cache.manager_stats();
 
     assert_eq!(stats.property_cache_hits, 1);
     assert_eq!(stats.property_cache_misses, 1);
@@ -831,17 +829,17 @@ mod tests {
     let mut cache = make_enabled_cache();
 
     cache.set_node_prop(1, 10, Some(PropValue::I64(42)));
-    cache.get_node_prop(1, 10);
-    cache.get_node_by_key("alice");
+    cache.node_prop(1, 10);
+    cache.node_by_key("alice");
 
-    assert!(cache.stats().total_hits() > 0 || cache.stats().total_misses() > 0);
+    assert!(cache.manager_stats().total_hits() > 0 || cache.manager_stats().total_misses() > 0);
 
     cache.reset_stats();
 
-    assert_eq!(cache.stats().property_cache_hits, 0);
-    assert_eq!(cache.stats().property_cache_misses, 0);
-    assert_eq!(cache.stats().key_cache_hits, 0);
-    assert_eq!(cache.stats().key_cache_misses, 0);
+    assert_eq!(cache.manager_stats().property_cache_hits, 0);
+    assert_eq!(cache.manager_stats().property_cache_misses, 0);
+    assert_eq!(cache.manager_stats().key_cache_hits, 0);
+    assert_eq!(cache.manager_stats().key_cache_misses, 0);
   }
 
   #[test]
@@ -865,6 +863,6 @@ mod tests {
     );
 
     assert!(cache.is_enabled());
-    assert_eq!(cache.stats().key_cache_max_size, 500);
+    assert_eq!(cache.manager_stats().key_cache_max_size, 500);
   }
 }

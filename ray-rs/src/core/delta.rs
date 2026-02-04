@@ -208,7 +208,7 @@ impl DeltaState {
   }
 
   /// Get node delta (for created or modified nodes)
-  pub fn get_node_delta(&self, node_id: NodeId) -> Option<&NodeDelta> {
+  pub fn node_delta(&self, node_id: NodeId) -> Option<&NodeDelta> {
     self
       .created_nodes
       .get(&node_id)
@@ -271,7 +271,7 @@ impl DeltaState {
   }
 
   /// Get a node property from delta
-  pub fn get_node_prop(&self, node_id: NodeId, key_id: PropKeyId) -> Option<Option<&PropValue>> {
+  pub fn node_prop(&self, node_id: NodeId, key_id: PropKeyId) -> Option<Option<&PropValue>> {
     let node_delta = self
       .created_nodes
       .get(&node_id)
@@ -370,7 +370,7 @@ impl DeltaState {
   }
 
   /// Get labels added in delta for a node
-  pub fn get_added_labels(&self, node_id: NodeId) -> Option<&std::collections::HashSet<LabelId>> {
+  pub fn added_labels(&self, node_id: NodeId) -> Option<&std::collections::HashSet<LabelId>> {
     self
       .created_nodes
       .get(&node_id)
@@ -379,7 +379,7 @@ impl DeltaState {
   }
 
   /// Get labels removed in delta for a node
-  pub fn get_removed_labels(&self, node_id: NodeId) -> Option<&std::collections::HashSet<LabelId>> {
+  pub fn removed_labels(&self, node_id: NodeId) -> Option<&std::collections::HashSet<LabelId>> {
     self
       .modified_nodes
       .get(&node_id)
@@ -444,7 +444,7 @@ impl DeltaState {
 
   /// Get an edge property from delta
   /// Returns Some(Some(value)) if set, Some(None) if deleted, None if not in delta
-  pub fn get_edge_prop(
+  pub fn edge_prop(
     &self,
     src: NodeId,
     etype: ETypeId,
@@ -460,7 +460,7 @@ impl DeltaState {
   }
 
   /// Get all edge property modifications in delta
-  pub fn get_edge_props_delta(
+  pub fn edge_props_delta(
     &self,
     src: NodeId,
     etype: ETypeId,
@@ -474,7 +474,7 @@ impl DeltaState {
   // ========================================================================
 
   /// Lookup node by key in delta
-  pub fn get_node_by_key(&self, key: &str) -> Option<NodeId> {
+  pub fn node_by_key(&self, key: &str) -> Option<NodeId> {
     // Check if key was deleted
     if self.key_index_deleted.contains(key) {
       return None;

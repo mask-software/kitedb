@@ -390,7 +390,7 @@ mod tests {
     close_single_file(db)?;
 
     let reopened = open_single_file(&db_path, SingleFileOpenOptions::new().wal_size(1024 * 1024))?;
-    assert!(reopened.get_node_by_key("a").is_some());
+    assert!(reopened.node_by_key("a").is_some());
     close_single_file(reopened)?;
 
     Ok(())

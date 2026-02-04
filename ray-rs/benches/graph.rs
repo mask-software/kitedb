@@ -588,7 +588,7 @@ fn bench_get_edge_prop(c: &mut Criterion) {
     let mut i = 0usize;
     bencher.iter(|| {
       let (src, dst) = edges[i % edges.len()];
-      let _ = black_box(ray.get_edge_prop(src, "FOLLOWS", dst, "weight"));
+      let _ = black_box(ray.edge_prop(src, "FOLLOWS", dst, "weight"));
       i += 1;
     });
   });
@@ -753,7 +753,7 @@ fn bench_edge_prop_codegraph_read(c: &mut Criterion) {
     let mut i = 0usize;
     bencher.iter(|| {
       let (src, dst, _line, _role) = reference_edges[i % reference_edges.len()];
-      let _ = black_box(ray.get_edge_prop(src, "REFERENCES", dst, "line"));
+      let _ = black_box(ray.edge_prop(src, "REFERENCES", dst, "line"));
       i += 1;
     });
   });
@@ -971,7 +971,7 @@ fn bench_get_prop(c: &mut Criterion) {
     let mut i = 0;
     bencher.iter(|| {
       let id = node_ids[i % node_ids.len()];
-      let _ = black_box(ray.get_prop(id, "name"));
+      let _ = black_box(ray.prop(id, "name"));
       i += 1;
     });
   });
@@ -980,7 +980,7 @@ fn bench_get_prop(c: &mut Criterion) {
     let mut i = 0;
     bencher.iter(|| {
       let id = node_ids[i % node_ids.len()];
-      let _ = black_box(ray.get_prop(id, "nonexistent"));
+      let _ = black_box(ray.prop(id, "nonexistent"));
       i += 1;
     });
   });

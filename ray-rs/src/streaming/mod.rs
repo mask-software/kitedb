@@ -76,7 +76,7 @@ pub fn stream_edges_single(db: &SingleFileDB, options: StreamOptions) -> Vec<Vec
 // Pagination (SingleFileDB)
 // =============================================================================
 
-pub fn get_nodes_page_single(db: &SingleFileDB, options: PaginationOptions) -> Page<NodeId> {
+pub fn nodes_page_single(db: &SingleFileDB, options: PaginationOptions) -> Page<NodeId> {
   let limit = if options.limit == 0 {
     100
   } else {
@@ -125,7 +125,7 @@ pub fn get_nodes_page_single(db: &SingleFileDB, options: PaginationOptions) -> P
   }
 }
 
-pub fn get_edges_page_single(db: &SingleFileDB, options: PaginationOptions) -> Page<Edge> {
+pub fn edges_page_single(db: &SingleFileDB, options: PaginationOptions) -> Page<Edge> {
   let limit = if options.limit == 0 {
     100
   } else {

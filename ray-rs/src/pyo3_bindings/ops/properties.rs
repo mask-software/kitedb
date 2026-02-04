@@ -80,7 +80,7 @@ pub fn get_node_prop_single(
   node_id: NodeId,
   key_id: PropKeyId,
 ) -> Option<PropValue> {
-  db.get_node_prop(node_id, key_id).map(|v| v.into())
+  db.node_prop(node_id, key_id).map(|v| v.into())
 }
 
 /// Delete node property on single-file database
@@ -95,7 +95,7 @@ pub fn delete_node_prop_single(
 
 /// Get all node properties on single-file database
 pub fn get_node_props_single(db: &RustSingleFileDB, node_id: NodeId) -> Option<Vec<NodeProp>> {
-  db.get_node_props(node_id).map(|props| {
+  db.node_props(node_id).map(|props| {
     props
       .into_iter()
       .map(|(k, v)| NodeProp {
@@ -144,7 +144,7 @@ pub fn get_edge_prop_single(
   dst: NodeId,
   key_id: PropKeyId,
 ) -> Option<PropValue> {
-  db.get_edge_prop(src, etype, dst, key_id).map(|v| v.into())
+  db.edge_prop(src, etype, dst, key_id).map(|v| v.into())
 }
 
 /// Delete edge property on single-file database
@@ -166,7 +166,7 @@ pub fn get_edge_props_single(
   etype: ETypeId,
   dst: NodeId,
 ) -> Option<Vec<NodeProp>> {
-  db.get_edge_props(src, etype, dst).map(|props| {
+  db.edge_props(src, etype, dst).map(|props| {
     props
       .into_iter()
       .map(|(k, v)| NodeProp {
@@ -187,7 +187,7 @@ pub fn get_node_prop_string_single(
   node_id: NodeId,
   key_id: PropKeyId,
 ) -> Option<String> {
-  db.get_node_prop(node_id, key_id).and_then(|v| match v {
+  db.node_prop(node_id, key_id).and_then(|v| match v {
     CorePropValue::String(s) => Some(s),
     _ => None,
   })
@@ -199,7 +199,7 @@ pub fn get_node_prop_int_single(
   node_id: NodeId,
   key_id: PropKeyId,
 ) -> Option<i64> {
-  db.get_node_prop(node_id, key_id).and_then(|v| match v {
+  db.node_prop(node_id, key_id).and_then(|v| match v {
     CorePropValue::I64(i) => Some(i),
     _ => None,
   })
@@ -211,7 +211,7 @@ pub fn get_node_prop_float_single(
   node_id: NodeId,
   key_id: PropKeyId,
 ) -> Option<f64> {
-  db.get_node_prop(node_id, key_id).and_then(|v| match v {
+  db.node_prop(node_id, key_id).and_then(|v| match v {
     CorePropValue::F64(f) => Some(f),
     _ => None,
   })
@@ -223,7 +223,7 @@ pub fn get_node_prop_bool_single(
   node_id: NodeId,
   key_id: PropKeyId,
 ) -> Option<bool> {
-  db.get_node_prop(node_id, key_id).and_then(|v| match v {
+  db.node_prop(node_id, key_id).and_then(|v| match v {
     CorePropValue::Bool(b) => Some(b),
     _ => None,
   })

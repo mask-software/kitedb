@@ -229,7 +229,7 @@ impl Kite {
     let selected_props = props.map(|props| props.into_iter().collect::<HashSet<String>>());
     self.with_kite(move |ray| {
       let node_ref = ray
-        .get_by_id(node_id as NodeId)
+        .node_by_id(node_id as NodeId)
         .map_err(|e| Error::from_reason(e.to_string()))?;
       match node_ref {
         Some(node_ref) => {
@@ -252,7 +252,7 @@ impl Kite {
     };
     self.with_kite(move |ray| {
       let node_ref = ray
-        .get_ref(&node_type, &key_suffix)
+        .node_ref(&node_type, &key_suffix)
         .map_err(|e| Error::from_reason(e.to_string()))?;
 
       match node_ref {
@@ -300,7 +300,7 @@ impl Kite {
       let mut out = Vec::with_capacity(node_ids.len());
       for node_id in node_ids {
         let node_ref = ray
-          .get_by_id(node_id as NodeId)
+          .node_by_id(node_id as NodeId)
           .map_err(|e| Error::from_reason(e.to_string()))?;
         if let Some(node_ref) = node_ref {
           let (node_id, node_key, node_type) = node_ref.into_parts();
@@ -315,7 +315,7 @@ impl Kite {
   /// Get a node property value
   #[napi]
   pub fn get_prop(&self, node_id: i64, prop_name: String) -> Result<Option<JsPropValue>> {
-    let value = self.with_kite(|ray| Ok(ray.get_prop(node_id as NodeId, &prop_name)))?;
+    let value = self.with_kite(|ray| Ok(ray.prop(node_id as NodeId, &prop_name)))?;
     Ok(value.map(JsPropValue::from))
   }
 
@@ -369,7 +369,7 @@ impl Kite {
         .node_def(&node_type)
         .ok_or_else(|| Error::from_reason(format!("Unknown node type: {node_type}")))?
         .key(&key_suffix);
-      let node_id = ray.raw().get_node_by_key(&full_key);
+      let node_id = ray.raw().node_by_key(&full_key);
       match node_id {
         Some(id) => {
           let res = ray
@@ -505,7 +505,7 @@ impl Kite {
   ) -> Result<Option<JsPropValue>> {
     let value = self.with_kite(|ray| {
       ray
-        .get_edge_prop(src as NodeId, &edge_type, dst as NodeId, &prop_name)
+        .edge_prop(src as NodeId, &edge_type, dst as NodeId, &prop_name)
         .map_err(|e| Error::from_reason(e.to_string()))
     })?;
     Ok(value.map(JsPropValue::from))
@@ -522,7 +522,7 @@ impl Kite {
     let props = self
       .with_kite(|ray| {
         ray
-          .get_edge_props(src as NodeId, &edge_type, dst as NodeId)
+          .edge_props(src as NodeId, &edge_type, dst as NodeId)
           .map_err(|e| Error::from_reason(e.to_string()))
       })?
       .unwrap_or_default();

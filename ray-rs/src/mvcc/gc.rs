@@ -155,7 +155,7 @@ impl GarbageCollector {
     // Calculate GC horizon
     // Versions older than this can be pruned if they have newer successors
     let min_active_ts = tx_manager.min_active_ts();
-    let retention_horizon_ts = tx_manager.get_retention_horizon_ts(self.config.retention_ms);
+    let retention_horizon_ts = tx_manager.retention_horizon_ts(self.config.retention_ms);
 
     // GC horizon is the minimum of:
     // 1. Oldest active transaction snapshot
@@ -192,7 +192,7 @@ impl GarbageCollector {
   /// These transactions are no longer needed for visibility calculations
   fn cleanup_old_transactions(&self, tx_manager: &mut TxManager, horizon_ts: Timestamp) -> usize {
     let txs_to_remove: Vec<_> = tx_manager
-      .get_all_txs()
+      .all_txs()
       .filter(|(_, tx)| {
         tx.status == MvccTxStatus::Committed
           && tx.commit_ts.is_some_and(|commit_ts| commit_ts < horizon_ts)
@@ -230,7 +230,7 @@ impl GarbageCollector {
   }
 
   /// Get GC statistics
-  pub fn get_stats(&self) -> GcStats {
+  pub fn stats(&self) -> GcStats {
     self.stats.clone()
   }
 
@@ -589,7 +589,7 @@ mod tests {
     let _result = gc.run_gc(&mut tx_mgr, &mut version_chain);
 
     // Version at ts=1 should still exist because there's an active tx
-    assert!(version_chain.get_node_version(1).is_some());
+    assert!(version_chain.node_version(1).is_some());
   }
 
   #[test]
@@ -612,7 +612,7 @@ mod tests {
 
     // Chain should be truncated
     let mut depth = 0;
-    let mut current = version_chain.get_node_version(1);
+    let mut current = version_chain.node_version(1);
     while let Some(v) = current {
       depth += 1;
       current = v.prev.as_deref();
@@ -649,7 +649,7 @@ mod tests {
     gc.run_gc(&mut tx_mgr, &mut version_chain);
     gc.run_gc(&mut tx_mgr, &mut version_chain);
 
-    let stats = gc.get_stats();
+    let stats = gc.stats();
     assert_eq!(stats.gc_runs, 3);
   }
 
@@ -660,7 +660,7 @@ mod tests {
     gc.run_gc(&mut tx_mgr, &mut version_chain);
     gc.reset_stats();
 
-    let stats = gc.get_stats();
+    let stats = gc.stats();
     assert_eq!(stats.gc_runs, 0);
     assert_eq!(stats.versions_pruned, 0);
   }

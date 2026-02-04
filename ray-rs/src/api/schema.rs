@@ -270,7 +270,7 @@ impl NodeSchema {
   }
 
   /// Get a property definition by name
-  pub fn get_prop(&self, name: &str) -> Option<&PropDef> {
+  pub fn prop(&self, name: &str) -> Option<&PropDef> {
     self.props.get(name)
   }
 
@@ -467,7 +467,7 @@ pub struct EdgeSchema {
 
 impl EdgeSchema {
   /// Get a property definition by name
-  pub fn get_prop(&self, name: &str) -> Option<&PropDef> {
+  pub fn prop(&self, name: &str) -> Option<&PropDef> {
     self.props.get(name)
   }
 
@@ -675,12 +675,12 @@ impl DatabaseSchema {
   }
 
   /// Get a node schema by name
-  pub fn get_node(&self, name: &str) -> Option<&NodeSchema> {
+  pub fn node_schema(&self, name: &str) -> Option<&NodeSchema> {
     self.nodes.get(name)
   }
 
   /// Get an edge schema by name
-  pub fn get_edge(&self, name: &str) -> Option<&EdgeSchema> {
+  pub fn edge_schema(&self, name: &str) -> Option<&EdgeSchema> {
     self.edges.get(name)
   }
 
@@ -799,10 +799,10 @@ mod tests {
     assert_eq!(user.key_prefix, "user:");
     assert_eq!(user.key("alice"), "user:alice");
     assert_eq!(user.props.len(), 2);
-    assert!(user.get_prop("name").is_some());
-    assert!(user.get_prop("age").is_some());
-    assert!(!user.get_prop("name").unwrap().optional);
-    assert!(user.get_prop("age").unwrap().optional);
+    assert!(user.prop("name").is_some());
+    assert!(user.prop("age").is_some());
+    assert!(!user.prop("name").unwrap().optional);
+    assert!(user.prop("age").unwrap().optional);
   }
 
   #[test]
@@ -889,8 +889,8 @@ mod tests {
 
     assert_eq!(schema.node_types().len(), 2);
     assert_eq!(schema.edge_types().len(), 2);
-    assert!(schema.get_node("user").is_some());
-    assert!(schema.get_edge("follows").is_some());
+    assert!(schema.node_schema("user").is_some());
+    assert!(schema.edge_schema("follows").is_some());
 
     // Test key prefix lookup
     assert_eq!(schema.node_type_from_key("user:alice"), Some("user"));
@@ -950,9 +950,9 @@ mod tests {
       .prop(prop::vector("embedding"))
       .build();
 
-    assert!(doc.get_prop("embedding").is_some());
+    assert!(doc.prop("embedding").is_some());
     assert_eq!(
-      doc.get_prop("embedding").unwrap().schema_type,
+      doc.prop("embedding").unwrap().schema_type,
       SchemaType::Vector
     );
 

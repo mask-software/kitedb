@@ -128,7 +128,7 @@ pub fn restore_backup(
   Ok(restore_path)
 }
 
-pub fn get_backup_info(backup_path: impl AsRef<Path>) -> Result<BackupResult> {
+pub fn backup_info(backup_path: impl AsRef<Path>) -> Result<BackupResult> {
   let backup_path = PathBuf::from(backup_path.as_ref());
   if !backup_path.exists() {
     return Err(KiteError::Internal("Backup not found at path".to_string()));

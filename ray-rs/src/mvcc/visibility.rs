@@ -115,7 +115,7 @@ pub fn is_visible<T>(version: &VersionedRecord<T>, snapshot_ts: Timestamp, txid:
 ///
 /// Walks the chain to find the newest version visible to the transaction.
 /// Returns None if no version is visible.
-pub fn get_visible_version<T>(
+pub fn visible_version<T>(
   head: &VersionedRecord<T>,
   snapshot_ts: Timestamp,
   txid: TxId,
@@ -142,7 +142,7 @@ pub fn get_visible_version<T>(
 }
 
 /// Get a mutable reference to the visible version from a version chain
-pub fn get_visible_version_mut<T>(
+pub fn visible_version_mut<T>(
   head: &mut VersionedRecord<T>,
   snapshot_ts: Timestamp,
   txid: TxId,
@@ -183,7 +183,7 @@ pub fn node_exists<T>(
     return false;
   };
 
-  let visible = get_visible_version(head, snapshot_ts, txid);
+  let visible = visible_version(head, snapshot_ts, txid);
   match visible {
     Some(v) => !v.deleted,
     None => false,
@@ -204,7 +204,7 @@ pub fn edge_exists<T: EdgeLike>(
     return false;
   };
 
-  let visible = get_visible_version(head, snapshot_ts, txid);
+  let visible = visible_version(head, snapshot_ts, txid);
   match visible {
     Some(v) => v.data.is_added(),
     None => false,
@@ -259,11 +259,11 @@ mod tests {
   fn test_get_visible_version_single() {
     let version = VersionedRecord::new(42, 1, 10);
 
-    let visible = get_visible_version(&version, 20, 2);
+    let visible = visible_version(&version, 20, 2);
     assert!(visible.is_some());
     assert_eq!(visible.unwrap().data, 42);
 
-    let not_visible = get_visible_version(&version, 5, 2);
+    let not_visible = visible_version(&version, 5, 2);
     assert!(not_visible.is_none());
   }
 
@@ -275,19 +275,19 @@ mod tests {
     let v3 = VersionedRecord::with_prev(3, 3, 30, Box::new(v2));
 
     // Snapshot at 35 sees v3
-    let visible = get_visible_version(&v3, 35, 100);
+    let visible = visible_version(&v3, 35, 100);
     assert_eq!(visible.unwrap().data, 3);
 
     // Snapshot at 25 sees v2
-    let visible = get_visible_version(&v3, 25, 100);
+    let visible = visible_version(&v3, 25, 100);
     assert_eq!(visible.unwrap().data, 2);
 
     // Snapshot at 15 sees v1
-    let visible = get_visible_version(&v3, 15, 100);
+    let visible = visible_version(&v3, 15, 100);
     assert_eq!(visible.unwrap().data, 1);
 
     // Snapshot at 5 sees nothing
-    let visible = get_visible_version(&v3, 5, 100);
+    let visible = visible_version(&v3, 5, 100);
     assert!(visible.is_none());
   }
 

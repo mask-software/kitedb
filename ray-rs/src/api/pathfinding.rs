@@ -127,7 +127,7 @@ impl PathConfig {
 ///
 /// # Arguments
 /// * `config` - Pathfinding configuration
-/// * `get_neighbors` - Function to get neighbors for a node
+/// * `neighbors` - Function to get neighbors for a node
 /// * `get_weight` - Function to get edge weight (default: 1.0 for all edges)
 ///
 /// # Returns
@@ -138,7 +138,7 @@ impl PathConfig {
 /// # use kitedb::api::pathfinding::{dijkstra, PathConfig};
 /// # use kitedb::api::traversal::TraversalDirection;
 /// # use kitedb::types::{Edge, ETypeId, NodeId};
-/// # fn get_neighbors(
+/// # fn neighbors(
 /// #   _: NodeId,
 /// #   _: TraversalDirection,
 /// #   _: Option<ETypeId>,
@@ -155,7 +155,7 @@ impl PathConfig {
 ///
 /// let result = dijkstra(
 ///     config,
-///     |node, dir, etype| get_neighbors(node, dir, etype),
+///     |node, dir, etype| neighbors(node, dir, etype),
 ///     |src, etype, dst| 1.0,  // Unweighted
 /// );
 ///
@@ -164,7 +164,7 @@ impl PathConfig {
 /// }
 /// # }
 /// ```
-pub fn dijkstra<F, W>(config: PathConfig, get_neighbors: F, get_weight: W) -> PathResult
+pub fn dijkstra<F, W>(config: PathConfig, neighbors: F, get_weight: W) -> PathResult
 where
   F: Fn(NodeId, TraversalDirection, Option<ETypeId>) -> Vec<Edge>,
   W: Fn(NodeId, ETypeId, NodeId) -> f64,
@@ -225,7 +225,7 @@ where
         None
       };
 
-      let neighbors = get_neighbors(current_id, dir, etype_filter);
+      let neighbors = neighbors(current_id, dir, etype_filter);
 
       for edge in neighbors {
         // Filter by allowed etypes
@@ -287,18 +287,13 @@ where
 ///
 /// # Arguments
 /// * `config` - Pathfinding configuration
-/// * `get_neighbors` - Function to get neighbors for a node
+/// * `neighbors` - Function to get neighbors for a node
 /// * `get_weight` - Function to get edge weight
 /// * `heuristic` - Function estimating distance from node to target
 ///
 /// # Returns
 /// PathResult with the shortest path, or not_found() if no path exists
-pub fn a_star<F, W, H>(
-  config: PathConfig,
-  get_neighbors: F,
-  get_weight: W,
-  heuristic: H,
-) -> PathResult
+pub fn a_star<F, W, H>(config: PathConfig, neighbors: F, get_weight: W, heuristic: H) -> PathResult
 where
   F: Fn(NodeId, TraversalDirection, Option<ETypeId>) -> Vec<Edge>,
   W: Fn(NodeId, ETypeId, NodeId) -> f64,
@@ -343,7 +338,7 @@ where
     }
 
     for dir in traversal_directions(config.direction) {
-      let neighbors = get_neighbors(current_id, dir, None);
+      let neighbors = neighbors(current_id, dir, None);
 
       for edge in neighbors {
         // Filter by allowed etypes
@@ -527,7 +522,7 @@ pub struct PathFindingBuilder<F, W> {
   allowed_etypes: HashSet<ETypeId>,
   direction: TraversalDirection,
   max_depth: usize,
-  get_neighbors: F,
+  neighbors: F,
   get_weight: W,
 }
 
@@ -537,14 +532,14 @@ where
   W: Fn(NodeId, ETypeId, NodeId) -> f64,
 {
   /// Create a new pathfinding builder
-  pub fn new(source: NodeId, get_neighbors: F, get_weight: W) -> Self {
+  pub fn new(source: NodeId, neighbors: F, get_weight: W) -> Self {
     Self {
       source,
       targets: HashSet::new(),
       allowed_etypes: HashSet::new(),
       direction: TraversalDirection::Out,
       max_depth: 100,
-      get_neighbors,
+      neighbors,
       get_weight,
     }
   }
@@ -594,7 +589,7 @@ where
       max_depth: self.max_depth,
     };
 
-    dijkstra(config, self.get_neighbors, self.get_weight)
+    dijkstra(config, self.neighbors, self.get_weight)
   }
 
   /// Execute A* algorithm with heuristic
@@ -614,7 +609,7 @@ where
       max_depth: self.max_depth,
     };
 
-    a_star(config, self.get_neighbors, self.get_weight, heuristic)
+    a_star(config, self.neighbors, self.get_weight, heuristic)
   }
 
   /// Find k shortest paths using Yen's algorithm
@@ -633,7 +628,7 @@ where
       max_depth: self.max_depth,
     };
 
-    yen_k_shortest(config, k, self.get_neighbors, self.get_weight)
+    yen_k_shortest(config, k, self.neighbors, self.get_weight)
   }
 
   /// Find all paths (alias for k_shortest with a large k)
@@ -652,11 +647,11 @@ where
 /// Find shortest path using BFS (unweighted)
 ///
 /// This is faster than Dijkstra for unweighted graphs.
-pub fn bfs<F>(config: PathConfig, get_neighbors: F) -> PathResult
+pub fn bfs<F>(config: PathConfig, neighbors: F) -> PathResult
 where
   F: Fn(NodeId, TraversalDirection, Option<ETypeId>) -> Vec<Edge>,
 {
-  dijkstra(config, get_neighbors, |_, _, _| 1.0)
+  dijkstra(config, neighbors, |_, _, _| 1.0)
 }
 
 // ============================================================================
@@ -674,7 +669,7 @@ where
 /// # Arguments
 /// * `config` - Pathfinding configuration (source, target, etc.)
 /// * `k` - Maximum number of paths to find
-/// * `get_neighbors` - Function to get neighbors for a node
+/// * `neighbors` - Function to get neighbors for a node
 /// * `get_weight` - Function to get edge weight
 ///
 /// # Returns
@@ -685,7 +680,7 @@ where
 /// # use kitedb::api::pathfinding::{yen_k_shortest, PathConfig};
 /// # use kitedb::api::traversal::TraversalDirection;
 /// # use kitedb::types::{Edge, ETypeId, NodeId};
-/// # fn get_neighbors(
+/// # fn neighbors(
 /// #   _: NodeId,
 /// #   _: TraversalDirection,
 /// #   _: Option<ETypeId>,
@@ -700,7 +695,7 @@ where
 /// let paths = yen_k_shortest(
 ///     config,
 ///     3,  // Find up to 3 shortest paths
-///     |node, dir, etype| get_neighbors(node, dir, etype),
+///     |node, dir, etype| neighbors(node, dir, etype),
 ///     |src, etype, dst| 1.0,  // Unweighted
 /// );
 ///
@@ -712,7 +707,7 @@ where
 pub fn yen_k_shortest<F, W>(
   config: PathConfig,
   k: usize,
-  get_neighbors: F,
+  neighbors: F,
   get_weight: W,
 ) -> Vec<PathResult>
 where
@@ -733,7 +728,7 @@ where
   let mut result_paths: Vec<PathResult> = Vec::with_capacity(k);
 
   // Find the first shortest path using Dijkstra
-  let first_path = dijkstra(config.clone(), &get_neighbors, &get_weight);
+  let first_path = dijkstra(config.clone(), &neighbors, &get_weight);
   if !first_path.found {
     return Vec::new();
   }
@@ -771,9 +766,9 @@ where
       // Nodes in root path (except spur node) should be avoided
       let root_nodes = root_nodes(&root_path, spur_idx);
 
-      // Create a modified get_neighbors that excludes forbidden edges and nodes
+      // Create a modified neighbors that excludes forbidden edges and nodes
       let filtered_neighbors = |node: NodeId, dir: TraversalDirection, etype: Option<ETypeId>| {
-        get_neighbors(node, dir, etype)
+        neighbors(node, dir, etype)
           .into_iter()
           .filter(|edge| {
             // Don't use excluded edges from spur node
@@ -1027,10 +1022,10 @@ mod tests {
 
   #[test]
   fn test_dijkstra_direct_path() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
     let config = PathConfig::new(1, 2).via(1);
 
-    let result = dijkstra(config, get_neighbors, |_, _, _| 1.0);
+    let result = dijkstra(config, neighbors, |_, _, _| 1.0);
 
     assert!(result.found);
     assert_eq!(result.path, vec![1, 2]);
@@ -1039,10 +1034,10 @@ mod tests {
 
   #[test]
   fn test_dijkstra_two_hop() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
     let config = PathConfig::new(1, 3).via(1);
 
-    let result = dijkstra(config, get_neighbors, |_, _, _| 1.0);
+    let result = dijkstra(config, neighbors, |_, _, _| 1.0);
 
     assert!(result.found);
     assert_eq!(result.path, vec![1, 2, 3]);
@@ -1051,12 +1046,12 @@ mod tests {
 
   #[test]
   fn test_dijkstra_weighted() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
     let config = PathConfig::new(1, 5).via(1);
 
     // Unweighted: 1->4->5 or 1->2->5 both have 2 hops
     // Weighted: 1->2->5 = 1+1=2, 1->4->5 = 2+1=3
-    let result = dijkstra(config, get_neighbors, weight_fn);
+    let result = dijkstra(config, neighbors, weight_fn);
 
     assert!(result.found);
     // Should prefer 1->2->5 (weight 2) over 1->4->5 (weight 3)
@@ -1066,10 +1061,10 @@ mod tests {
 
   #[test]
   fn test_dijkstra_no_path() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
     let config = PathConfig::new(3, 1).via(1); // Can't go backwards
 
-    let result = dijkstra(config, get_neighbors, |_, _, _| 1.0);
+    let result = dijkstra(config, neighbors, |_, _, _| 1.0);
 
     assert!(!result.found);
     assert!(result.path.is_empty());
@@ -1077,20 +1072,20 @@ mod tests {
 
   #[test]
   fn test_dijkstra_max_depth() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
     let config = PathConfig::new(1, 3).via(1).max_depth(1);
 
-    let result = dijkstra(config, get_neighbors, |_, _, _| 1.0);
+    let result = dijkstra(config, neighbors, |_, _, _| 1.0);
 
     assert!(!result.found); // 3 is 2 hops away
   }
 
   #[test]
   fn test_dijkstra_multiple_targets() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
     let config = PathConfig::with_targets(1, vec![3, 4]).via(1);
 
-    let result = dijkstra(config, get_neighbors, |_, _, _| 1.0);
+    let result = dijkstra(config, neighbors, |_, _, _| 1.0);
 
     assert!(result.found);
     // Should find 4 first (1 hop) not 3 (2 hops)
@@ -1099,11 +1094,11 @@ mod tests {
 
   #[test]
   fn test_a_star() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
     let config = PathConfig::new(1, 5).via(1);
 
     // Simple heuristic: always returns 0 (degenerates to Dijkstra)
-    let result = a_star(config, get_neighbors, weight_fn, |_, _| 0.0);
+    let result = a_star(config, neighbors, weight_fn, |_, _| 0.0);
 
     assert!(result.found);
     assert_eq!(result.path, vec![1, 2, 5]);
@@ -1111,10 +1106,10 @@ mod tests {
 
   #[test]
   fn test_bfs() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
     let config = PathConfig::new(1, 5).via(1);
 
-    let result = bfs(config, get_neighbors);
+    let result = bfs(config, neighbors);
 
     assert!(result.found);
     // BFS finds shortest path by hops (either 1->2->5 or 1->4->5, both 2 hops)
@@ -1125,9 +1120,9 @@ mod tests {
 
   #[test]
   fn test_builder() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
 
-    let result = PathFindingBuilder::new(1, get_neighbors, |_, _, _| 1.0)
+    let result = PathFindingBuilder::new(1, neighbors, |_, _, _| 1.0)
       .to(3)
       .via(1)
       .max_depth(10)
@@ -1139,9 +1134,9 @@ mod tests {
 
   #[test]
   fn test_builder_no_target() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
 
-    let result = PathFindingBuilder::new(1, get_neighbors, |_, _, _| 1.0)
+    let result = PathFindingBuilder::new(1, neighbors, |_, _, _| 1.0)
       .via(1)
       .dijkstra();
 
@@ -1150,10 +1145,10 @@ mod tests {
 
   #[test]
   fn test_same_source_target() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
     let config = PathConfig::new(1, 1).via(1);
 
-    let result = dijkstra(config, get_neighbors, |_, _, _| 1.0);
+    let result = dijkstra(config, neighbors, |_, _, _| 1.0);
 
     assert!(result.found);
     assert_eq!(result.path, vec![1]);
@@ -1166,10 +1161,10 @@ mod tests {
 
   #[test]
   fn test_yen_single_path() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
     let config = PathConfig::new(1, 3).via(1);
 
-    let paths = yen_k_shortest(config, 1, get_neighbors, |_, _, _| 1.0);
+    let paths = yen_k_shortest(config, 1, neighbors, |_, _, _| 1.0);
 
     assert_eq!(paths.len(), 1);
     assert!(paths[0].found);
@@ -1180,10 +1175,10 @@ mod tests {
   fn test_yen_two_paths_to_node_5() {
     // Graph has two paths to node 5:
     // 1->2->5 (weight 2) and 1->4->5 (weight 3)
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
     let config = PathConfig::new(1, 5).via(1);
 
-    let paths = yen_k_shortest(config, 3, get_neighbors, weight_fn);
+    let paths = yen_k_shortest(config, 3, neighbors, weight_fn);
 
     assert!(paths.len() >= 2);
 
@@ -1198,10 +1193,10 @@ mod tests {
 
   #[test]
   fn test_yen_paths_sorted_by_weight() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
     let config = PathConfig::new(1, 5).via(1);
 
-    let paths = yen_k_shortest(config, 10, get_neighbors, weight_fn);
+    let paths = yen_k_shortest(config, 10, neighbors, weight_fn);
 
     // Verify paths are sorted by weight
     for i in 1..paths.len() {
@@ -1214,30 +1209,30 @@ mod tests {
 
   #[test]
   fn test_yen_no_path() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
     let config = PathConfig::new(3, 1).via(1); // Can't go backwards
 
-    let paths = yen_k_shortest(config, 3, get_neighbors, |_, _, _| 1.0);
+    let paths = yen_k_shortest(config, 3, neighbors, |_, _, _| 1.0);
 
     assert!(paths.is_empty());
   }
 
   #[test]
   fn test_yen_k_zero() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
     let config = PathConfig::new(1, 5).via(1);
 
-    let paths = yen_k_shortest(config, 0, get_neighbors, |_, _, _| 1.0);
+    let paths = yen_k_shortest(config, 0, neighbors, |_, _, _| 1.0);
 
     assert!(paths.is_empty());
   }
 
   #[test]
   fn test_yen_no_duplicate_paths() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
     let config = PathConfig::new(1, 5).via(1);
 
-    let paths = yen_k_shortest(config, 10, get_neighbors, |_, _, _| 1.0);
+    let paths = yen_k_shortest(config, 10, neighbors, |_, _, _| 1.0);
 
     // Check no duplicate paths
     for i in 0..paths.len() {
@@ -1252,9 +1247,9 @@ mod tests {
 
   #[test]
   fn test_yen_builder() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
 
-    let paths = PathFindingBuilder::new(1, get_neighbors, weight_fn)
+    let paths = PathFindingBuilder::new(1, neighbors, weight_fn)
       .to(5)
       .via(1)
       .k_shortest(3);
@@ -1266,9 +1261,9 @@ mod tests {
 
   #[test]
   fn test_yen_all_paths() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
 
-    let paths = PathFindingBuilder::new(1, get_neighbors, |_, _, _| 1.0)
+    let paths = PathFindingBuilder::new(1, neighbors, |_, _, _| 1.0)
       .to(5)
       .via(1)
       .all_paths();

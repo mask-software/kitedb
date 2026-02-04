@@ -55,8 +55,7 @@ fn test_single_file_stress_checkpoint_reopen() -> Result<()> {
       for i in 0..10 {
         let src_key = format!("n{}", next_id.saturating_sub(1 + i));
         let dst_key = format!("n{}", next_id.saturating_sub(1 + ((i + 1) % 10)));
-        if let (Some(src), Some(dst)) = (db.get_node_by_key(&src_key), db.get_node_by_key(&dst_key))
-        {
+        if let (Some(src), Some(dst)) = (db.node_by_key(&src_key), db.node_by_key(&dst_key)) {
           let _ = db.add_edge_by_name(src, "FOLLOWS", dst);
         }
       }
@@ -73,7 +72,7 @@ fn test_single_file_stress_checkpoint_reopen() -> Result<()> {
     // Reopen and validate a few invariants
     let db = open_stress_db(&db_path)?;
     for key in expected_keys.iter().take(20) {
-      assert!(db.get_node_by_key(key).is_some());
+      assert!(db.node_by_key(key).is_some());
     }
     close_single_file(db)?;
   }
@@ -121,8 +120,8 @@ fn test_single_file_resize_wal_stress() -> Result<()> {
     db.commit()?;
   }
 
-  assert!(db.get_node_by_key("pre-0").is_some());
-  assert!(db.get_node_by_key("post-0").is_some());
+  assert!(db.node_by_key("pre-0").is_some());
+  assert!(db.node_by_key("post-0").is_some());
 
   close_single_file(db)?;
 

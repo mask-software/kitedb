@@ -37,7 +37,7 @@ pub fn get_node_vector_single(
   node_id: NodeId,
   prop_key_id: PropKeyId,
 ) -> Option<Vec<f64>> {
-  db.get_node_vector(node_id, prop_key_id)
+  db.node_vector(node_id, prop_key_id)
     .map(|v| v.iter().map(|&f| f as f64).collect())
 }
 

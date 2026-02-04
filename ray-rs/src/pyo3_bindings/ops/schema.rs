@@ -29,37 +29,37 @@ pub trait SchemaOps {
 // ============================================================================
 
 pub fn get_or_create_label_single(db: &RustSingleFileDB, name: &str) -> u32 {
-  db.get_or_create_label(name)
+  db.label_id_or_create(name)
 }
 
 pub fn get_label_id_single(db: &RustSingleFileDB, name: &str) -> Option<u32> {
-  db.get_label_id(name)
+  db.label_id(name)
 }
 
 pub fn get_label_name_single(db: &RustSingleFileDB, id: u32) -> Option<String> {
-  db.get_label_name(id)
+  db.label_name(id)
 }
 
 pub fn get_or_create_etype_single(db: &RustSingleFileDB, name: &str) -> u32 {
-  db.get_or_create_etype(name)
+  db.etype_id_or_create(name)
 }
 
 pub fn get_etype_id_single(db: &RustSingleFileDB, name: &str) -> Option<u32> {
-  db.get_etype_id(name)
+  db.etype_id(name)
 }
 
-pub fn get_etype_name_single(db: &RustSingleFileDB, id: u32) -> Option<String> {
-  db.get_etype_name(id)
+pub fn etype_name_single(db: &RustSingleFileDB, id: u32) -> Option<String> {
+  db.etype_name(id)
 }
 
 pub fn get_or_create_propkey_single(db: &RustSingleFileDB, name: &str) -> u32 {
-  db.get_or_create_propkey(name)
+  db.propkey_id_or_create(name)
 }
 
 pub fn get_propkey_id_single(db: &RustSingleFileDB, name: &str) -> Option<u32> {
-  db.get_propkey_id(name)
+  db.propkey_id(name)
 }
 
 pub fn get_propkey_name_single(db: &RustSingleFileDB, id: u32) -> Option<String> {
-  db.get_propkey_name(id)
+  db.propkey_name(id)
 }

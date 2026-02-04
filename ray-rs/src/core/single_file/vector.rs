@@ -91,7 +91,7 @@ impl SingleFileDB {
   /// Get a vector embedding for a node
   ///
   /// Checks pending operations first, then falls back to committed storage.
-  pub fn get_node_vector(&self, node_id: NodeId, prop_key_id: PropKeyId) -> Option<VectorRef> {
+  pub fn node_vector(&self, node_id: NodeId, prop_key_id: PropKeyId) -> Option<VectorRef> {
     let tx_handle = self.current_tx_handle();
     if let Some(handle) = tx_handle.as_ref() {
       let tx = handle.lock();
@@ -159,11 +159,7 @@ impl SingleFileDB {
   /// Get or create a vector store for a property key
   ///
   /// Creates a new store with the given dimensions if it doesn't exist.
-  pub fn get_or_create_vector_store(
-    &self,
-    prop_key_id: PropKeyId,
-    dimensions: usize,
-  ) -> Result<()> {
+  pub fn vector_store_or_create(&self, prop_key_id: PropKeyId, dimensions: usize) -> Result<()> {
     let mut stores = self.vector_stores.write();
     if stores.contains_key(&prop_key_id) {
       let store = stores.get(&prop_key_id).ok_or_else(|| {
@@ -225,12 +221,12 @@ pub(crate) fn vector_stores_from_snapshot(
 
   let num_nodes = snapshot.header.num_nodes as usize;
   for phys in 0..num_nodes {
-    let node_id = match snapshot.get_node_id(phys as u32) {
+    let node_id = match snapshot.node_id(phys as u32) {
       Some(id) => id,
       None => continue,
     };
 
-    let Some(props) = snapshot.get_node_props(phys as u32) else {
+    let Some(props) = snapshot.node_props(phys as u32) else {
       continue;
     };
 
@@ -287,7 +283,7 @@ mod tests {
 
     // Reopen and verify vector is restored from snapshot
     let db = open_single_file(&db_path, SingleFileOpenOptions::new()).unwrap();
-    let vec = db.get_node_vector(node_id, prop_key_id).unwrap();
+    let vec = db.node_vector(node_id, prop_key_id).unwrap();
     let expected = normalize(&[0.1, 0.2, 0.3]);
     assert_eq!(vec.len(), expected.len());
     for (got, exp) in vec.iter().zip(expected.iter()) {

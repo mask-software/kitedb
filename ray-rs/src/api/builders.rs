@@ -59,7 +59,7 @@ impl NodeRef {
   }
 
   /// Get a property value
-  pub fn get_prop(&self, name: &str) -> Option<&PropValue> {
+  pub fn prop(&self, name: &str) -> Option<&PropValue> {
     self.props.get(name)
   }
 }
@@ -531,11 +531,11 @@ mod tests {
     let node = NodeRef::with_props(1, "alice".to_string(), props);
 
     assert_eq!(
-      node.get_prop("name"),
+      node.prop("name"),
       Some(&PropValue::String("Alice".to_string()))
     );
-    assert_eq!(node.get_prop("age"), Some(&PropValue::I64(30)));
-    assert_eq!(node.get_prop("unknown"), None);
+    assert_eq!(node.prop("age"), Some(&PropValue::I64(30)));
+    assert_eq!(node.prop("unknown"), None);
   }
 
   #[test]

@@ -273,14 +273,14 @@ impl SingleFileDB {
         let tx = handle.lock();
         (tx.txid, tx.snapshot_ts)
       } else {
-        (0, mvcc.tx_manager.lock().get_next_commit_ts())
+        (0, mvcc.tx_manager.lock().next_commit_ts())
       };
       if txid != 0 {
         let mut tx_mgr = mvcc.tx_manager.lock();
         tx_mgr.record_read(txid, TxKey::Node(node_id));
       }
       let vc = mvcc.version_chain.lock();
-      if let Some(version) = vc.get_node_version(node_id) {
+      if let Some(version) = vc.node_version(node_id) {
         return mvcc_node_exists(Some(version), tx_snapshot_ts, txid);
       }
     }
@@ -324,14 +324,14 @@ impl SingleFileDB {
         let tx = handle.lock();
         (tx.txid, tx.snapshot_ts)
       } else {
-        (0, mvcc.tx_manager.lock().get_next_commit_ts())
+        (0, mvcc.tx_manager.lock().next_commit_ts())
       };
       if txid != 0 {
         let mut tx_mgr = mvcc.tx_manager.lock();
         tx_mgr.record_read(txid, TxKey::Edge { src, etype, dst });
       }
       let vc = mvcc.version_chain.lock();
-      if let Some(version) = vc.get_edge_version(src, etype, dst) {
+      if let Some(version) = vc.edge_version(src, etype, dst) {
         return mvcc_edge_exists(Some(version), tx_snapshot_ts, txid);
       }
     }
@@ -348,9 +348,7 @@ impl SingleFileDB {
 
     // Check snapshot
     if let Some(ref snapshot) = *self.snapshot.read() {
-      if let (Some(src_phys), Some(dst_phys)) =
-        (snapshot.get_phys_node(src), snapshot.get_phys_node(dst))
-      {
+      if let (Some(src_phys), Some(dst_phys)) = (snapshot.phys_node(src), snapshot.phys_node(dst)) {
         return snapshot.has_edge(src_phys, etype, dst_phys);
       }
     }
@@ -435,7 +433,7 @@ impl SingleFileDB {
 
   /// Get cache statistics
   pub fn cache_stats(&self) -> Option<CacheStats> {
-    self.cache.read().as_ref().map(|c| c.get_stats())
+    self.cache.read().as_ref().map(|c| c.stats())
   }
 
   /// Reset cache statistics

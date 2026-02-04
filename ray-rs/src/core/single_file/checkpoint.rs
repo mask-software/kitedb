@@ -439,7 +439,7 @@ impl SingleFileDB {
       let num_nodes = snapshot.header.num_nodes as usize;
 
       for phys in 0..num_nodes {
-        let node_id = match snapshot.get_node_id(phys as u32) {
+        let node_id = match snapshot.node_id(phys as u32) {
           Some(id) => id,
           None => continue,
         };
@@ -450,18 +450,18 @@ impl SingleFileDB {
         }
 
         // Get key
-        let key = snapshot.get_node_key(phys as u32);
+        let key = snapshot.node_key(phys as u32);
 
         // Get properties from snapshot
         let mut props = HashMap::new();
-        if let Some(snapshot_props) = snapshot.get_node_props(phys as u32) {
+        if let Some(snapshot_props) = snapshot.node_props(phys as u32) {
           for (key_id, value) in snapshot_props {
             props.insert(key_id, value);
           }
         }
 
         // Apply delta modifications
-        if let Some(node_delta) = delta.get_node_delta(node_id) {
+        if let Some(node_delta) = delta.node_delta(node_id) {
           if let Some(ref delta_props) = node_delta.props {
             for (&key_id, value) in delta_props {
               match value {
@@ -479,11 +479,11 @@ impl SingleFileDB {
         // Collect node labels (snapshot + delta)
         let mut node_labels: std::collections::HashSet<LabelId> = std::collections::HashSet::new();
 
-        if let Some(snapshot_labels) = snapshot.get_node_labels(phys as u32) {
+        if let Some(snapshot_labels) = snapshot.node_labels(phys as u32) {
           node_labels.extend(snapshot_labels.into_iter());
         }
 
-        if let Some(node_delta) = delta.get_node_delta(node_id) {
+        if let Some(node_delta) = delta.node_delta(node_id) {
           if let Some(ref labels) = node_delta.labels {
             node_labels.extend(labels.iter().copied());
           }
@@ -505,8 +505,8 @@ impl SingleFileDB {
         });
 
         // Collect edges from this node
-        for edge_info in snapshot.get_out_edges(phys as u32) {
-          let dst_node_id = match snapshot.get_node_id(edge_info.dst) {
+        for edge_info in snapshot.out_edges(phys as u32) {
+          let dst_node_id = match snapshot.node_id(edge_info.dst) {
             Some(id) => id,
             None => continue,
           };
@@ -526,7 +526,7 @@ impl SingleFileDB {
           if let Some(edge_idx) =
             snapshot.find_edge_index(phys as u32, edge_info.etype, edge_info.dst)
           {
-            if let Some(snapshot_edge_props) = snapshot.get_edge_props(edge_idx) {
+            if let Some(snapshot_edge_props) = snapshot.edge_props(edge_idx) {
               edge_props = snapshot_edge_props;
             }
           }

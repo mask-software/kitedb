@@ -96,7 +96,7 @@ pub struct HealthCheckResult {
 pub fn collect_metrics_single_file(db: &SingleFileDB) -> DatabaseMetrics {
   let stats = db.stats();
   let delta = db.delta.read();
-  let cache_stats = db.cache.read().as_ref().map(|cache| cache.stats());
+  let cache_stats = db.cache.read().as_ref().map(|cache| cache.manager_stats());
 
   let node_count = stats.snapshot_nodes as i64 + stats.delta_nodes_created as i64
     - stats.delta_nodes_deleted as i64;
@@ -125,11 +125,11 @@ pub fn collect_metrics_single_file(db: &SingleFileDB) -> DatabaseMetrics {
   let mvcc = db.mvcc.as_ref().map(|mvcc| {
     let tx_mgr = mvcc.tx_manager.lock();
     let gc = mvcc.gc.lock();
-    let gc_stats = gc.get_stats();
-    let committed_stats = tx_mgr.get_committed_writes_stats();
+    let gc_stats = gc.stats();
+    let committed_stats = tx_mgr.committed_writes_stats();
     MvccMetrics {
       enabled: true,
-      active_transactions: tx_mgr.get_active_count() as i64,
+      active_transactions: tx_mgr.active_count() as i64,
       versions_pruned: gc_stats.versions_pruned as i64,
       gc_runs: gc_stats.gc_runs as i64,
       min_active_timestamp: tx_mgr.min_active_ts() as i64,
@@ -177,7 +177,7 @@ pub fn health_check_single_file(db: &SingleFileDB) -> HealthCheckResult {
     },
   });
 
-  let cache_stats = db.cache.read().as_ref().map(|cache| cache.stats());
+  let cache_stats = db.cache.read().as_ref().map(|cache| cache.manager_stats());
   if let Some(stats) = cache_stats {
     let total_hits = stats.property_cache_hits + stats.traversal_cache_hits;
     let total_misses = stats.property_cache_misses + stats.traversal_cache_misses;

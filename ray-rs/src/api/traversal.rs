@@ -229,7 +229,7 @@ impl std::fmt::Debug for TraversalStep {
 /// ```rust,no_run
 /// # use kitedb::api::traversal::{TraversalBuilder, TraversalDirection};
 /// # use kitedb::types::{Edge, ETypeId, NodeId};
-/// # fn get_neighbors_fn(
+/// # fn neighbors_fn(
 /// #   _: NodeId,
 /// #   _: TraversalDirection,
 /// #   _: Option<ETypeId>,
@@ -246,7 +246,7 @@ impl std::fmt::Debug for TraversalStep {
 ///     .where_edge(|e| e.etype == 1)
 ///     .take(10);
 ///
-/// for result in builder.execute(&get_neighbors_fn) {
+/// for result in builder.execute(&neighbors_fn) {
 ///     println!("Found node: {}", result.node_id);
 /// }
 /// # }
@@ -482,34 +482,34 @@ impl TraversalBuilder {
 
   /// Execute the traversal and return an iterator of results
   ///
-  /// The `get_neighbors` function should return neighbors for a given node and direction.
-  pub fn execute<F>(self, get_neighbors: F) -> TraversalIterator<F>
+  /// The `neighbors` function should return neighbors for a given node and direction.
+  pub fn execute<F>(self, neighbors: F) -> TraversalIterator<F>
   where
     F: Fn(NodeId, TraversalDirection, Option<ETypeId>) -> Vec<Edge>,
   {
-    TraversalIterator::new(self, get_neighbors)
+    TraversalIterator::new(self, neighbors)
   }
 
   /// Execute the traversal and collect all node IDs
-  pub fn collect_node_ids<F>(self, get_neighbors: F) -> Vec<NodeId>
+  pub fn collect_node_ids<F>(self, neighbors: F) -> Vec<NodeId>
   where
     F: Fn(NodeId, TraversalDirection, Option<ETypeId>) -> Vec<Edge>,
   {
-    self.execute(get_neighbors).map(|r| r.node_id).collect()
+    self.execute(neighbors).map(|r| r.node_id).collect()
   }
 
   /// Execute the traversal and count results (optimized path)
-  pub fn count<F>(self, get_neighbors: F) -> usize
+  pub fn count<F>(self, neighbors: F) -> usize
   where
     F: Fn(NodeId, TraversalDirection, Option<ETypeId>) -> Vec<Edge>,
   {
     // For simple traversals without variable-depth, use fast counting
     if self.can_use_fast_count() {
-      return self.count_fast(&get_neighbors);
+      return self.count_fast(&neighbors);
     }
 
     // Fall back to full iteration
-    self.execute(get_neighbors).count()
+    self.execute(neighbors).count()
   }
 
   /// Check if we can use the fast count path
@@ -529,7 +529,7 @@ impl TraversalBuilder {
   }
 
   /// Fast count for simple traversals
-  fn count_fast<F>(&self, get_neighbors: &F) -> usize
+  fn count_fast<F>(&self, neighbors: &F) -> usize
   where
     F: Fn(NodeId, TraversalDirection, Option<ETypeId>) -> Vec<Edge>,
   {
@@ -546,7 +546,7 @@ impl TraversalBuilder {
       let mut next_nodes = HashSet::new();
 
       for node_id in current_nodes {
-        let edges = get_neighbors(node_id, *direction, *etype);
+        let edges = neighbors(node_id, *direction, *etype);
         for edge in edges {
           let neighbor = match direction {
             TraversalDirection::Out => edge.dst,
@@ -575,11 +575,11 @@ impl TraversalBuilder {
   }
 
   /// Get raw edges without property loading (fastest traversal mode)
-  pub fn raw_edges<F>(self, get_neighbors: F) -> RawEdgeIterator<F>
+  pub fn raw_edges<F>(self, neighbors: F) -> RawEdgeIterator<F>
   where
     F: Fn(NodeId, TraversalDirection, Option<ETypeId>) -> Vec<Edge>,
   {
-    RawEdgeIterator::new(self, get_neighbors)
+    RawEdgeIterator::new(self, neighbors)
   }
 }
 
@@ -589,8 +589,8 @@ impl TraversalBuilder {
 
 /// Iterator for traversal results
 pub struct TraversalIterator<F> {
-  /// The get_neighbors function
-  get_neighbors: F,
+  /// The neighbors function
+  neighbors: F,
   /// Current step index
   step_index: usize,
   /// Steps to execute
@@ -617,7 +617,7 @@ impl<F> TraversalIterator<F>
 where
   F: Fn(NodeId, TraversalDirection, Option<ETypeId>) -> Vec<Edge>,
 {
-  fn new(builder: TraversalBuilder, get_neighbors: F) -> Self {
+  fn new(builder: TraversalBuilder, neighbors: F) -> Self {
     let mut frontier = VecDeque::new();
     let mut visited = HashSet::new();
 
@@ -634,7 +634,7 @@ where
     }
 
     Self {
-      get_neighbors,
+      neighbors,
       step_index: 0,
       steps: builder.steps,
       current_frontier: frontier,
@@ -685,7 +685,7 @@ where
     let mut next_frontier = VecDeque::new();
 
     for result in self.current_frontier.drain(..) {
-      let edges = (self.get_neighbors)(result.node_id, direction, etype);
+      let edges = (self.neighbors)(result.node_id, direction, etype);
 
       for edge in edges {
         let neighbor_id = match direction {
@@ -773,7 +773,7 @@ where
       };
 
       for dir in directions {
-        let edges = (self.get_neighbors)(current_id, dir, etype);
+        let edges = (self.neighbors)(current_id, dir, etype);
 
         for edge in edges {
           let neighbor_id = match dir {
@@ -919,7 +919,7 @@ where
 
 /// Iterator for raw edges (fastest traversal mode, no property loading)
 pub struct RawEdgeIterator<F> {
-  get_neighbors: F,
+  neighbors: F,
   steps: Vec<TraversalStep>,
   step_index: usize,
   current_nodes: VecDeque<NodeId>,
@@ -930,7 +930,7 @@ impl<F> RawEdgeIterator<F>
 where
   F: Fn(NodeId, TraversalDirection, Option<ETypeId>) -> Vec<Edge>,
 {
-  fn new(builder: TraversalBuilder, get_neighbors: F) -> Self {
+  fn new(builder: TraversalBuilder, neighbors: F) -> Self {
     // Check that there are no variable-depth steps
     for step in &builder.steps {
       if matches!(step, TraversalStep::Traverse { .. }) {
@@ -941,7 +941,7 @@ where
     let current_nodes = builder.start_nodes.into_iter().collect();
 
     Self {
-      get_neighbors,
+      neighbors,
       steps: builder.steps,
       step_index: 0,
       current_nodes,
@@ -973,7 +973,7 @@ where
             unreachable!()
           };
 
-          let edges = (self.get_neighbors)(node_id, *direction, *etype);
+          let edges = (self.neighbors)(node_id, *direction, *etype);
           for edge in edges {
             self.pending_edges.push_back(RawEdge::from(edge));
           }
@@ -1023,26 +1023,26 @@ where
 /// # use kitedb::types::{Edge, ETypeId, NodeId};
 /// # fn main() {
 /// # let knows_etype: ETypeId = 1;
-/// # let get_neighbors = |_: NodeId, _: TraversalDirection, _: Option<ETypeId>| -> Vec<Edge> {
+/// # let neighbors = |_: NodeId, _: TraversalDirection, _: Option<ETypeId>| -> Vec<Edge> {
 /// #   Vec::new()
 /// # };
 /// // Get first node
 /// let first = TraversalBuilder::from_node(1)
 ///     .out(Some(knows_etype))
-///     .results(&get_neighbors)
+///     .results(&neighbors)
 ///     .first();
 ///
 /// // Collect all node IDs
 /// let node_ids = TraversalBuilder::from_node(1)
 ///     .out(Some(knows_etype))
-///     .results(&get_neighbors)
+///     .results(&neighbors)
 ///     .nodes()
 ///     .collect::<Vec<_>>();
 ///
 /// // Collect all edges
 /// let edges = TraversalBuilder::from_node(1)
 ///     .out(Some(knows_etype))
-///     .results(&get_neighbors)
+///     .results(&neighbors)
 ///     .edges()
 ///     .collect::<Vec<_>>();
 /// # }
@@ -1175,57 +1175,57 @@ impl TraversalBuilder {
   /// # use kitedb::types::{Edge, ETypeId, NodeId};
   /// # fn main() {
   /// # let knows_etype: ETypeId = 1;
-  /// # let get_neighbors = |_: NodeId, _: TraversalDirection, _: Option<ETypeId>| -> Vec<Edge> {
+  /// # let neighbors = |_: NodeId, _: TraversalDirection, _: Option<ETypeId>| -> Vec<Edge> {
   /// #   Vec::new()
   /// # };
   /// // Get first node ID
   /// let first = TraversalBuilder::from_node(1)
   ///     .out(Some(knows_etype))
-  ///     .results(&get_neighbors)
+  ///     .results(&neighbors)
   ///     .first_node();
   ///
   /// // Or collect all nodes
   /// let all_nodes = TraversalBuilder::from_node(1)
   ///     .out(Some(knows_etype))
-  ///     .results(&get_neighbors)
+  ///     .results(&neighbors)
   ///     .to_vec();
   /// # }
   /// ```
-  pub fn results<F>(self, get_neighbors: F) -> TraversalResults<TraversalIterator<F>>
+  pub fn results<F>(self, neighbors: F) -> TraversalResults<TraversalIterator<F>>
   where
     F: Fn(NodeId, TraversalDirection, Option<ETypeId>) -> Vec<Edge>,
   {
-    TraversalResults::new(self.execute(get_neighbors))
+    TraversalResults::new(self.execute(neighbors))
   }
 
   /// Execute and get the first result
   ///
   /// Convenience method equivalent to `.results(f).first()`.
-  pub fn first<F>(self, get_neighbors: F) -> Option<TraversalResult>
+  pub fn first<F>(self, neighbors: F) -> Option<TraversalResult>
   where
     F: Fn(NodeId, TraversalDirection, Option<ETypeId>) -> Vec<Edge>,
   {
-    self.execute(get_neighbors).next()
+    self.execute(neighbors).next()
   }
 
   /// Execute and get the first node ID
   ///
   /// Convenience method equivalent to `.results(f).first_node()`.
-  pub fn first_node<F>(self, get_neighbors: F) -> Option<NodeId>
+  pub fn first_node<F>(self, neighbors: F) -> Option<NodeId>
   where
     F: Fn(NodeId, TraversalDirection, Option<ETypeId>) -> Vec<Edge>,
   {
-    self.execute(get_neighbors).next().map(|r| r.node_id)
+    self.execute(neighbors).next().map(|r| r.node_id)
   }
 
   /// Execute and collect all node IDs into a Vec
   ///
   /// Convenience method equivalent to `.results(f).to_vec()`.
-  pub fn to_vec<F>(self, get_neighbors: F) -> Vec<NodeId>
+  pub fn to_vec<F>(self, neighbors: F) -> Vec<NodeId>
   where
     F: Fn(NodeId, TraversalDirection, Option<ETypeId>) -> Vec<Edge>,
   {
-    self.collect_node_ids(get_neighbors)
+    self.collect_node_ids(neighbors)
   }
 }
 
@@ -1272,7 +1272,7 @@ impl NodeResult {
   }
 
   /// Get a string property
-  pub fn get_string(&self, name: &str) -> Option<&str> {
+  pub fn string(&self, name: &str) -> Option<&str> {
     match self.props.get(name) {
       Some(PropValue::String(s)) => Some(s),
       _ => None,
@@ -1280,7 +1280,7 @@ impl NodeResult {
   }
 
   /// Get an integer property
-  pub fn get_int(&self, name: &str) -> Option<i64> {
+  pub fn int(&self, name: &str) -> Option<i64> {
     match self.props.get(name) {
       Some(PropValue::I64(v)) => Some(*v),
       _ => None,
@@ -1288,7 +1288,7 @@ impl NodeResult {
   }
 
   /// Get a float property
-  pub fn get_float(&self, name: &str) -> Option<f64> {
+  pub fn float(&self, name: &str) -> Option<f64> {
     match self.props.get(name) {
       Some(PropValue::F64(v)) => Some(*v),
       _ => None,
@@ -1296,7 +1296,7 @@ impl NodeResult {
   }
 
   /// Get a boolean property
-  pub fn get_bool(&self, name: &str) -> Option<bool> {
+  pub fn bool(&self, name: &str) -> Option<bool> {
     match self.props.get(name) {
       Some(PropValue::Bool(v)) => Some(*v),
       _ => None,
@@ -1486,11 +1486,11 @@ mod tests {
 
   #[test]
   fn test_single_hop_out() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
 
     let results: Vec<_> = TraversalBuilder::from_node(1)
       .out(Some(1)) // knows
-      .execute(&get_neighbors)
+      .execute(&neighbors)
       .collect();
 
     assert_eq!(results.len(), 1);
@@ -1499,11 +1499,11 @@ mod tests {
 
   #[test]
   fn test_single_hop_all_etypes() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
 
     let results: Vec<_> = TraversalBuilder::from_node(1)
       .out(None) // all edge types
-      .execute(&get_neighbors)
+      .execute(&neighbors)
       .collect();
 
     assert_eq!(results.len(), 2);
@@ -1514,12 +1514,12 @@ mod tests {
 
   #[test]
   fn test_two_hops() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
 
     let results: Vec<_> = TraversalBuilder::from_node(1)
       .out(Some(1)) // 1 -> 2
       .out(Some(1)) // 2 -> 3
-      .execute(&get_neighbors)
+      .execute(&neighbors)
       .collect();
 
     assert_eq!(results.len(), 1);
@@ -1528,11 +1528,11 @@ mod tests {
 
   #[test]
   fn test_incoming() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
 
     let results: Vec<_> = TraversalBuilder::from_node(3)
       .r#in(Some(1)) // 3 <- 2
-      .execute(&get_neighbors)
+      .execute(&neighbors)
       .collect();
 
     assert_eq!(results.len(), 1);
@@ -1541,12 +1541,12 @@ mod tests {
 
   #[test]
   fn test_take_limit() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
 
     let results: Vec<_> = TraversalBuilder::from_node(1)
       .out(None)
       .take(1)
-      .execute(&get_neighbors)
+      .execute(&neighbors)
       .collect();
 
     assert_eq!(results.len(), 1);
@@ -1554,34 +1554,32 @@ mod tests {
 
   #[test]
   fn test_count() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
 
-    let count = TraversalBuilder::from_node(1)
-      .out(None)
-      .count(&get_neighbors);
+    let count = TraversalBuilder::from_node(1).out(None).count(&neighbors);
 
     assert_eq!(count, 2);
   }
 
   #[test]
   fn test_count_with_limit() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
 
     let count = TraversalBuilder::from_node(1)
       .out(None)
       .take(1)
-      .count(&get_neighbors);
+      .count(&neighbors);
 
     assert_eq!(count, 1);
   }
 
   #[test]
   fn test_traverse_variable_depth() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
 
     let results: Vec<_> = TraversalBuilder::from_node(1)
       .traverse(Some(1), TraverseOptions::new(TraversalDirection::Out, 2))
-      .execute(&get_neighbors)
+      .execute(&neighbors)
       .collect();
 
     // Should find: 2 (depth 1), 3 (depth 2)
@@ -1593,13 +1591,13 @@ mod tests {
 
   #[test]
   fn test_traverse_min_depth() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
 
     let options = TraverseOptions::new(TraversalDirection::Out, 2).with_min_depth(2);
 
     let results: Vec<_> = TraversalBuilder::from_node(1)
       .traverse(Some(1), options)
-      .execute(&get_neighbors)
+      .execute(&neighbors)
       .collect();
 
     // Should only find: 3 (depth 2, skipping depth 1)
@@ -1609,11 +1607,11 @@ mod tests {
 
   #[test]
   fn test_multiple_start_nodes() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
 
     let results: Vec<_> = TraversalBuilder::new(vec![1, 2])
       .out(Some(1))
-      .execute(&get_neighbors)
+      .execute(&neighbors)
       .collect();
 
     // From 1: finds 2
@@ -1634,12 +1632,12 @@ mod tests {
 
   #[test]
   fn test_unique_false() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
 
     let results: Vec<_> = TraversalBuilder::new(vec![1, 2])
       .unique(false)
       .out(Some(1))
-      .execute(&get_neighbors)
+      .execute(&neighbors)
       .collect();
 
     // Without uniqueness, we get all results:
@@ -1650,23 +1648,23 @@ mod tests {
 
   #[test]
   fn test_collect_node_ids() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
 
     let node_ids = TraversalBuilder::from_node(1)
       .out(Some(1))
       .out(Some(1))
-      .collect_node_ids(&get_neighbors);
+      .collect_node_ids(&neighbors);
 
     assert_eq!(node_ids, vec![3]);
   }
 
   #[test]
   fn test_empty_result() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
 
     let results: Vec<_> = TraversalBuilder::from_node(999)
       .out(None)
-      .execute(&get_neighbors)
+      .execute(&neighbors)
       .collect();
 
     assert!(results.is_empty());
@@ -1674,15 +1672,13 @@ mod tests {
 
   #[test]
   fn test_no_steps() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
 
     // With no steps, should just yield start nodes
     // But wait, the implementation doesn't yield start nodes unless there are steps
     // Actually looking at the iterator, if step_index >= steps.len() and frontier not empty,
     // it yields from frontier. So start nodes should be yielded.
-    let results: Vec<_> = TraversalBuilder::from_node(1)
-      .execute(&get_neighbors)
-      .collect();
+    let results: Vec<_> = TraversalBuilder::from_node(1).execute(&neighbors).collect();
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].node_id, 1);
@@ -1694,13 +1690,13 @@ mod tests {
 
   #[test]
   fn test_where_edge_filter_by_etype() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
 
     // Filter to only include edges with etype == 1 (knows)
     let results: Vec<_> = TraversalBuilder::from_node(1)
       .out(None) // all edge types
       .where_edge(|edge| edge.etype == 1)
-      .execute(&get_neighbors)
+      .execute(&neighbors)
       .collect();
 
     // Should only find node 2 (via knows edge), not node 4 (via follows edge)
@@ -1710,13 +1706,13 @@ mod tests {
 
   #[test]
   fn test_where_edge_filter_by_dst() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
 
     // Filter to only include edges where dst > 3
     let results: Vec<_> = TraversalBuilder::from_node(1)
       .out(None)
       .where_edge(|edge| edge.dst > 3)
-      .execute(&get_neighbors)
+      .execute(&neighbors)
       .collect();
 
     // Should only find node 4 (dst=4)
@@ -1726,13 +1722,13 @@ mod tests {
 
   #[test]
   fn test_where_node_filter() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
 
     // Filter to only include nodes with id > 3
     let results: Vec<_> = TraversalBuilder::from_node(1)
       .out(None)
       .where_node(|node| node.id > 3)
-      .execute(&get_neighbors)
+      .execute(&neighbors)
       .collect();
 
     // Should only find node 4
@@ -1742,13 +1738,13 @@ mod tests {
 
   #[test]
   fn test_where_node_filter_excludes_all() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
 
     // Filter that excludes all nodes
     let results: Vec<_> = TraversalBuilder::from_node(1)
       .out(None)
       .where_node(|node| node.id > 100)
-      .execute(&get_neighbors)
+      .execute(&neighbors)
       .collect();
 
     assert!(results.is_empty());
@@ -1756,14 +1752,14 @@ mod tests {
 
   #[test]
   fn test_combined_edge_and_node_filters() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
 
     // Combine edge and node filters
     let results: Vec<_> = TraversalBuilder::from_node(1)
       .out(None)
       .where_edge(|edge| edge.etype == 2) // follows only
       .where_node(|node| node.id >= 4)
-      .execute(&get_neighbors)
+      .execute(&neighbors)
       .collect();
 
     // Should find node 4 (follows edge with dst >= 4)
@@ -1773,7 +1769,7 @@ mod tests {
 
   #[test]
   fn test_filter_with_limit() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
 
     // From node 2, we can reach nodes 3 and 5 (knows->3, follows->5)
     // Filter to etype 1 only, but also with limit
@@ -1781,7 +1777,7 @@ mod tests {
       .out(None)
       .where_edge(|edge| edge.etype == 1)
       .take(10)
-      .execute(&get_neighbors)
+      .execute(&neighbors)
       .collect();
 
     assert_eq!(results.len(), 1);
@@ -1815,7 +1811,7 @@ mod tests {
 
   #[test]
   fn test_count_falls_back_to_iteration_with_filters() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
 
     // With filters, count should use iteration (slow path)
     let builder = TraversalBuilder::from_node(1)
@@ -1826,13 +1822,13 @@ mod tests {
     assert!(!builder.can_use_fast_count());
 
     // But count still works
-    let count = builder.count(&get_neighbors);
+    let count = builder.count(&neighbors);
     assert_eq!(count, 1);
   }
 
   #[test]
   fn test_traverse_with_edge_filter() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
 
     // Variable-depth traversal with edge filter in options
     let options =
@@ -1840,7 +1836,7 @@ mod tests {
 
     let results: Vec<_> = TraversalBuilder::from_node(1)
       .traverse(Some(1), options)
-      .execute(&get_neighbors)
+      .execute(&neighbors)
       .collect();
 
     // Should find: 2 (depth 1), 3 (depth 2) - all via knows edges
@@ -1852,7 +1848,7 @@ mod tests {
 
   #[test]
   fn test_traverse_with_node_filter() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
 
     // Variable-depth traversal with node filter in options
     // Filter only yields nodes with id >= 2 (which is all reachable nodes)
@@ -1861,7 +1857,7 @@ mod tests {
 
     let results: Vec<_> = TraversalBuilder::from_node(1)
       .traverse(Some(1), options)
-      .execute(&get_neighbors)
+      .execute(&neighbors)
       .collect();
 
     // Should find: 2 (depth 1), 3 (depth 2)
@@ -1873,7 +1869,7 @@ mod tests {
 
   #[test]
   fn test_traverse_with_node_filter_excludes_intermediate() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
 
     // Filter for id >= 3 - this will filter out node 2, so we can't reach node 3
     // because the traversal stops at filtered nodes
@@ -1882,7 +1878,7 @@ mod tests {
 
     let results: Vec<_> = TraversalBuilder::from_node(1)
       .traverse(Some(1), options)
-      .execute(&get_neighbors)
+      .execute(&neighbors)
       .collect();
 
     // Node 2 is filtered out, so we can't traverse through it to reach node 3
@@ -1892,7 +1888,7 @@ mod tests {
 
   #[test]
   fn test_traverse_options_with_combined_filters() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
 
     // Variable-depth traversal with both filters
     let options = TraverseOptions::new(TraversalDirection::Out, 3)
@@ -1901,7 +1897,7 @@ mod tests {
 
     let results: Vec<_> = TraversalBuilder::from_node(1)
       .traverse(None, options)
-      .execute(&get_neighbors)
+      .execute(&neighbors)
       .collect();
 
     // Should find nodes 2 and 3 via knows edges (etype=1)
@@ -1932,11 +1928,11 @@ mod tests {
 
   #[test]
   fn test_results_to_vec() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
 
     let nodes = TraversalBuilder::from_node(1)
       .out(Some(1))
-      .results(&get_neighbors)
+      .results(&neighbors)
       .to_vec();
 
     assert_eq!(nodes, vec![2]);
@@ -1944,11 +1940,11 @@ mod tests {
 
   #[test]
   fn test_results_first() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
 
     let first = TraversalBuilder::from_node(1)
       .out(Some(1))
-      .results(&get_neighbors)
+      .results(&neighbors)
       .first();
 
     assert!(first.is_some());
@@ -1957,11 +1953,11 @@ mod tests {
 
   #[test]
   fn test_results_first_node() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
 
     let first = TraversalBuilder::from_node(1)
       .out(Some(1))
-      .results(&get_neighbors)
+      .results(&neighbors)
       .first_node();
 
     assert_eq!(first, Some(2));
@@ -1969,11 +1965,11 @@ mod tests {
 
   #[test]
   fn test_results_first_empty() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
 
     let first = TraversalBuilder::from_node(999)
       .out(None)
-      .results(&get_neighbors)
+      .results(&neighbors)
       .first();
 
     assert!(first.is_none());
@@ -1981,11 +1977,11 @@ mod tests {
 
   #[test]
   fn test_results_count() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
 
     let count = TraversalBuilder::from_node(1)
       .out(None)
-      .results(&get_neighbors)
+      .results(&neighbors)
       .count();
 
     assert_eq!(count, 2);
@@ -1993,11 +1989,11 @@ mod tests {
 
   #[test]
   fn test_results_nodes_iterator() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
 
     let nodes: Vec<_> = TraversalBuilder::from_node(1)
       .out(None)
-      .results(&get_neighbors)
+      .results(&neighbors)
       .nodes()
       .collect();
 
@@ -2008,11 +2004,11 @@ mod tests {
 
   #[test]
   fn test_results_edges_iterator() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
 
     let edges: Vec<_> = TraversalBuilder::from_node(1)
       .out(None)
-      .results(&get_neighbors)
+      .results(&neighbors)
       .edges()
       .collect();
 
@@ -2025,11 +2021,11 @@ mod tests {
 
   #[test]
   fn test_results_full_iterator() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
 
     let results: Vec<_> = TraversalBuilder::from_node(1)
       .out(Some(1))
-      .results(&get_neighbors)
+      .results(&neighbors)
       .full()
       .collect();
 
@@ -2041,11 +2037,11 @@ mod tests {
 
   #[test]
   fn test_builder_first_method() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
 
     let first = TraversalBuilder::from_node(1)
       .out(Some(1))
-      .first(&get_neighbors);
+      .first(&neighbors);
 
     assert!(first.is_some());
     assert_eq!(first.unwrap().node_id, 2);
@@ -2053,22 +2049,20 @@ mod tests {
 
   #[test]
   fn test_builder_first_node_method() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
 
     let first = TraversalBuilder::from_node(1)
       .out(Some(1))
-      .first_node(&get_neighbors);
+      .first_node(&neighbors);
 
     assert_eq!(first, Some(2));
   }
 
   #[test]
   fn test_builder_to_vec_method() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
 
-    let nodes = TraversalBuilder::from_node(1)
-      .out(None)
-      .to_vec(&get_neighbors);
+    let nodes = TraversalBuilder::from_node(1).out(None).to_vec(&neighbors);
 
     assert_eq!(nodes.len(), 2);
     assert!(nodes.contains(&2));
@@ -2089,11 +2083,11 @@ mod tests {
 
     assert_eq!(result.id, 1);
     assert_eq!(result.key, Some("user:alice".to_string()));
-    assert_eq!(result.get_string("name"), Some("Alice"));
-    assert_eq!(result.get_int("age"), Some(30));
-    assert_eq!(result.get_float("score"), Some(95.5));
-    assert_eq!(result.get_bool("active"), Some(true));
-    assert_eq!(result.get_string("missing"), None);
+    assert_eq!(result.string("name"), Some("Alice"));
+    assert_eq!(result.int("age"), Some(30));
+    assert_eq!(result.float("score"), Some(95.5));
+    assert_eq!(result.bool("active"), Some(true));
+    assert_eq!(result.string("missing"), None);
   }
 
   #[test]
@@ -2117,13 +2111,13 @@ mod tests {
 
   #[test]
   fn test_two_hop_results() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
 
     // 1 -> 2 -> 3
     let results: Vec<_> = TraversalBuilder::from_node(1)
       .out(Some(1))
       .out(Some(1))
-      .results(&get_neighbors)
+      .results(&neighbors)
       .full()
       .collect();
 
@@ -2211,13 +2205,13 @@ mod tests {
 
   #[test]
   fn test_select_does_not_affect_execution() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
 
     // Select should not affect traversal execution, only property loading
     let results: Vec<_> = TraversalBuilder::from_node(1)
       .out(Some(1))
       .select_props(&["name", "age"])
-      .execute(&get_neighbors)
+      .execute(&neighbors)
       .collect();
 
     assert_eq!(results.len(), 1);
@@ -2226,14 +2220,14 @@ mod tests {
 
   #[test]
   fn test_select_with_take() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
 
     // Select combined with take should work
     let results: Vec<_> = TraversalBuilder::from_node(1)
       .out(None)
       .select_props(&["name"])
       .take(1)
-      .execute(&get_neighbors)
+      .execute(&neighbors)
       .collect();
 
     assert_eq!(results.len(), 1);
@@ -2241,14 +2235,14 @@ mod tests {
 
   #[test]
   fn test_select_with_filters() {
-    let get_neighbors = mock_graph();
+    let neighbors = mock_graph();
 
     // Select combined with filters
     let results: Vec<_> = TraversalBuilder::from_node(1)
       .out(None)
       .select_props(&["name"])
       .where_edge(|e| e.etype == 1)
-      .execute(&get_neighbors)
+      .execute(&neighbors)
       .collect();
 
     assert_eq!(results.len(), 1);

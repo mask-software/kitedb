@@ -105,7 +105,7 @@ pub(crate) fn read_wal_area(pager: &mut FilePager, header: &DbHeaderV1) -> Resul
 }
 
 /// Extract committed transactions from WAL records
-pub(crate) fn get_committed_transactions(
+pub(crate) fn committed_transactions(
   wal_records: &[ParsedWalRecord],
 ) -> Vec<(TxId, Vec<&ParsedWalRecord>)> {
   extract_committed_transactions(wal_records)
@@ -134,7 +134,7 @@ pub fn replay_wal_record(
     WalRecordType::CreateNode => {
       if let Some(data) = parse_create_node_payload(&record.payload) {
         if let Some(snap) = snapshot {
-          if snap.get_phys_node(data.node_id).is_none() {
+          if snap.phys_node(data.node_id).is_none() {
             delta.create_node(data.node_id, data.key.as_deref());
           }
         } else {
@@ -149,7 +149,7 @@ pub fn replay_wal_record(
       if let Some(nodes) = parse_create_nodes_batch_payload(&record.payload) {
         for data in nodes {
           if let Some(snap) = snapshot {
-            if snap.get_phys_node(data.node_id).is_none() {
+            if snap.phys_node(data.node_id).is_none() {
               delta.create_node(data.node_id, data.key.as_deref());
             }
           } else {

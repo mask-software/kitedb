@@ -195,13 +195,13 @@ fn build_schema_from_delta(delta: &crate::types::DeltaState) -> ExportedSchema {
   schema
 }
 
-fn get_prop_key_name_single(db: &SingleFileDB, key_id: PropKeyId) -> String {
-  db.get_propkey_name(key_id)
+fn prop_key_name_single(db: &SingleFileDB, key_id: PropKeyId) -> String {
+  db.propkey_name(key_id)
     .unwrap_or_else(|| format!("prop_{key_id}"))
 }
 
-fn get_etype_name_single(db: &SingleFileDB, etype_id: ETypeId) -> String {
-  db.get_etype_name(etype_id)
+fn etype_name_single(db: &SingleFileDB, etype_id: ETypeId) -> String {
+  db.etype_name(etype_id)
     .unwrap_or_else(|| format!("etype_{etype_id}"))
 }
 
@@ -221,11 +221,11 @@ pub fn export_to_object_single(
 
   if options.include_nodes {
     for node_id in db.list_nodes() {
-      let key = db.get_node_key(node_id);
+      let key = db.node_key(node_id);
       let mut props = HashMap::new();
-      if let Some(props_by_id) = db.get_node_props(node_id) {
+      if let Some(props_by_id) = db.node_props(node_id) {
         for (key_id, value) in props_by_id {
-          let name = get_prop_key_name_single(db, key_id);
+          let name = prop_key_name_single(db, key_id);
           props.insert(name, serialize_prop_value(&value));
         }
       }
@@ -240,9 +240,9 @@ pub fn export_to_object_single(
   if options.include_edges {
     for edge in db.list_edges(None) {
       let mut props = HashMap::new();
-      if let Some(props_by_id) = db.get_edge_props(edge.src, edge.etype, edge.dst) {
+      if let Some(props_by_id) = db.edge_props(edge.src, edge.etype, edge.dst) {
         for (key_id, value) in props_by_id {
-          let name = get_prop_key_name_single(db, key_id);
+          let name = prop_key_name_single(db, key_id);
           props.insert(name, serialize_prop_value(&value));
         }
       }
@@ -250,7 +250,7 @@ pub fn export_to_object_single(
         src: edge.src,
         dst: edge.dst,
         etype: edge.etype,
-        etype_name: Some(get_etype_name_single(db, edge.etype)),
+        etype_name: Some(etype_name_single(db, edge.etype)),
         props,
       });
     }
@@ -372,19 +372,19 @@ pub fn import_from_object_single(
 
   for name in data.schema.prop_keys.values() {
     let id = db
-      .get_propkey_id(name)
+      .propkey_id(name)
       .unwrap_or_else(|| db.define_propkey(name).unwrap_or(0));
     propkey_name_to_id.insert(name.clone(), id);
   }
   for name in data.schema.etypes.values() {
     let id = db
-      .get_etype_id(name)
+      .etype_id(name)
       .unwrap_or_else(|| db.define_etype(name).unwrap_or(0));
     etype_name_to_id.insert(name.clone(), id);
   }
   for name in data.schema.labels.values() {
     let _ = db
-      .get_label_id(name)
+      .label_id(name)
       .unwrap_or_else(|| db.define_label(name).unwrap_or(0));
   }
 
@@ -397,7 +397,7 @@ pub fn import_from_object_single(
   for node in &data.nodes {
     if options.skip_existing {
       if let Some(ref key) = node.key {
-        if let Some(existing) = db.get_node_by_key(key) {
+        if let Some(existing) = db.node_by_key(key) {
           old_to_new.insert(node.id as NodeId, existing);
           skipped += 1;
           continue;

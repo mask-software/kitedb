@@ -717,10 +717,7 @@ impl WalBuffer {
   }
 
   /// Get records for recovery (from both regions if checkpoint was in progress)
-  pub fn get_records_for_recovery(
-    &mut self,
-    pager: &mut FilePager,
-  ) -> Result<Vec<ParsedWalRecord>> {
+  pub fn records_for_recovery(&mut self, pager: &mut FilePager) -> Result<Vec<ParsedWalRecord>> {
     // Scan primary region first
     let mut records = self.scan_region(0, pager)?;
 

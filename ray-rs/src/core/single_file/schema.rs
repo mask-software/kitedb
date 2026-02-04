@@ -8,7 +8,7 @@ use super::SingleFileDB;
 
 impl SingleFileDB {
   /// Get or create a label ID by name
-  pub fn get_or_create_label(&self, name: &str) -> LabelId {
+  pub fn label_id_or_create(&self, name: &str) -> LabelId {
     {
       let names = self.label_names.read();
       if let Some(&id) = names.get(name) {
@@ -30,17 +30,17 @@ impl SingleFileDB {
   }
 
   /// Get label ID by name
-  pub fn get_label_id(&self, name: &str) -> Option<LabelId> {
+  pub fn label_id(&self, name: &str) -> Option<LabelId> {
     self.label_names.read().get(name).copied()
   }
 
   /// Get label name by ID
-  pub fn get_label_name(&self, id: LabelId) -> Option<String> {
+  pub fn label_name(&self, id: LabelId) -> Option<String> {
     self.label_ids.read().get(&id).cloned()
   }
 
   /// Get or create an edge type ID by name
-  pub fn get_or_create_etype(&self, name: &str) -> ETypeId {
+  pub fn etype_id_or_create(&self, name: &str) -> ETypeId {
     {
       let names = self.etype_names.read();
       if let Some(&id) = names.get(name) {
@@ -62,17 +62,17 @@ impl SingleFileDB {
   }
 
   /// Get edge type ID by name
-  pub fn get_etype_id(&self, name: &str) -> Option<ETypeId> {
+  pub fn etype_id(&self, name: &str) -> Option<ETypeId> {
     self.etype_names.read().get(name).copied()
   }
 
   /// Get edge type name by ID
-  pub fn get_etype_name(&self, id: ETypeId) -> Option<String> {
+  pub fn etype_name(&self, id: ETypeId) -> Option<String> {
     self.etype_ids.read().get(&id).cloned()
   }
 
   /// Get or create a property key ID by name
-  pub fn get_or_create_propkey(&self, name: &str) -> PropKeyId {
+  pub fn propkey_id_or_create(&self, name: &str) -> PropKeyId {
     {
       let names = self.propkey_names.read();
       if let Some(&id) = names.get(name) {
@@ -94,12 +94,12 @@ impl SingleFileDB {
   }
 
   /// Get property key ID by name
-  pub fn get_propkey_id(&self, name: &str) -> Option<PropKeyId> {
+  pub fn propkey_id(&self, name: &str) -> Option<PropKeyId> {
     self.propkey_names.read().get(name).copied()
   }
 
   /// Get property key name by ID
-  pub fn get_propkey_name(&self, id: PropKeyId) -> Option<String> {
+  pub fn propkey_name(&self, id: PropKeyId) -> Option<String> {
     self.propkey_ids.read().get(&id).cloned()
   }
 }

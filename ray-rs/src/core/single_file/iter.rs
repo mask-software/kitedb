@@ -46,7 +46,7 @@ impl NodeIterator {
         txid = tx.txid;
         tx_snapshot_ts = tx.snapshot_ts;
       } else {
-        tx_snapshot_ts = mvcc.tx_manager.lock().get_next_commit_ts();
+        tx_snapshot_ts = mvcc.tx_manager.lock().next_commit_ts();
       }
       Some(mvcc.version_chain.lock())
     } else {
@@ -59,11 +59,11 @@ impl NodeIterator {
     if let Some(ref snap) = *snapshot {
       let num_nodes = snap.header.num_nodes as u32;
       for phys in 0..num_nodes {
-        if let Some(node_id) = snap.get_node_id(phys) {
+        if let Some(node_id) = snap.node_id(phys) {
           // Skip if deleted in delta
           let node_visible = vc_guard
             .as_ref()
-            .and_then(|vc| vc.get_node_version(node_id))
+            .and_then(|vc| vc.node_version(node_id))
             .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
           if pending.is_some_and(|p| p.is_node_deleted(node_id)) {
             continue;
@@ -86,7 +86,7 @@ impl NodeIterator {
       }
       let node_visible = vc_guard
         .as_ref()
-        .and_then(|vc| vc.get_node_version(node_id))
+        .and_then(|vc| vc.node_version(node_id))
         .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
       if node_visible == Some(false) {
         continue;
@@ -189,7 +189,7 @@ impl SingleFileDB {
         txid = tx.txid;
         tx_snapshot_ts = tx.snapshot_ts;
       } else {
-        tx_snapshot_ts = mvcc.tx_manager.lock().get_next_commit_ts();
+        tx_snapshot_ts = mvcc.tx_manager.lock().next_commit_ts();
       }
       Some(mvcc.version_chain.lock())
     } else {
@@ -204,11 +204,11 @@ impl SingleFileDB {
     if let Some(ref snap) = *snapshot {
       let num_nodes = snap.header.num_nodes as u32;
       for phys in 0..num_nodes {
-        if let Some(src) = snap.get_node_id(phys) {
+        if let Some(src) = snap.node_id(phys) {
           // Skip deleted nodes
           let src_visible = vc_guard
             .as_ref()
-            .and_then(|vc| vc.get_node_version(src))
+            .and_then(|vc| vc.node_version(src))
             .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
           if src_visible == Some(false)
             || pending.is_some_and(|p| p.is_node_deleted(src))
@@ -228,11 +228,11 @@ impl SingleFileDB {
               }
             }
 
-            if let Some(dst) = snap.get_node_id(dst_phys) {
+            if let Some(dst) = snap.node_id(dst_phys) {
               // Skip deleted edges
               let dst_visible = vc_guard
                 .as_ref()
-                .and_then(|vc| vc.get_node_version(dst))
+                .and_then(|vc| vc.node_version(dst))
                 .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
               if dst_visible == Some(false)
                 || pending.is_some_and(|p| p.is_node_deleted(dst))
@@ -242,7 +242,7 @@ impl SingleFileDB {
               }
               let edge_visible = vc_guard
                 .as_ref()
-                .and_then(|vc| vc.get_edge_version(src, etype, dst))
+                .and_then(|vc| vc.edge_version(src, etype, dst))
                 .map(|version| mvcc_edge_exists(Some(version), tx_snapshot_ts, txid));
               if edge_visible == Some(false)
                 || pending.is_some_and(|p| p.is_edge_deleted(src, etype, dst))
@@ -270,7 +270,7 @@ impl SingleFileDB {
 
         let src_visible = vc_guard
           .as_ref()
-          .and_then(|vc| vc.get_node_version(src))
+          .and_then(|vc| vc.node_version(src))
           .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
         if src_visible == Some(false)
           || pending.is_some_and(|p| p.is_node_deleted(src))
@@ -283,7 +283,7 @@ impl SingleFileDB {
         }
         let dst_visible = vc_guard
           .as_ref()
-          .and_then(|vc| vc.get_node_version(patch.other))
+          .and_then(|vc| vc.node_version(patch.other))
           .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
         if dst_visible == Some(false)
           || pending.is_some_and(|p| p.is_node_deleted(patch.other))
@@ -293,7 +293,7 @@ impl SingleFileDB {
         }
         let edge_visible = vc_guard
           .as_ref()
-          .and_then(|vc| vc.get_edge_version(src, patch.etype, patch.other))
+          .and_then(|vc| vc.edge_version(src, patch.etype, patch.other))
           .map(|version| mvcc_edge_exists(Some(version), tx_snapshot_ts, txid));
         if edge_visible == Some(false) {
           continue;
@@ -321,7 +321,7 @@ impl SingleFileDB {
 
           let src_visible = vc_guard
             .as_ref()
-            .and_then(|vc| vc.get_node_version(src))
+            .and_then(|vc| vc.node_version(src))
             .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
           if src_visible == Some(false)
             || pending_delta.is_node_deleted(src)
@@ -334,7 +334,7 @@ impl SingleFileDB {
           }
           let dst_visible = vc_guard
             .as_ref()
-            .and_then(|vc| vc.get_node_version(patch.other))
+            .and_then(|vc| vc.node_version(patch.other))
             .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
           if dst_visible == Some(false)
             || pending_delta.is_node_deleted(patch.other)
@@ -411,10 +411,10 @@ impl SingleFileDB {
       mvcc_stats: self.mvcc.as_ref().map(|mvcc| {
         let tx_mgr = mvcc.tx_manager.lock();
         let gc = mvcc.gc.lock();
-        let gc_stats = gc.get_stats();
-        let committed = tx_mgr.get_committed_writes_stats();
+        let gc_stats = gc.stats();
+        let committed = tx_mgr.committed_writes_stats();
         MvccStats {
-          active_transactions: tx_mgr.get_active_count(),
+          active_transactions: tx_mgr.active_count(),
           min_active_ts: tx_mgr.min_active_ts(),
           versions_pruned: gc_stats.versions_pruned,
           gc_runs: gc_stats.gc_runs,

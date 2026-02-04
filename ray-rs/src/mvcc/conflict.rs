@@ -76,7 +76,7 @@ impl ConflictDetector {
   ///
   /// Returns array of conflicting keys if conflicts found, empty array otherwise
   pub fn check_conflicts(&self, tx_manager: &TxManager, txid: TxId) -> Vec<String> {
-    let tx = match tx_manager.get_tx(txid) {
+    let tx = match tx_manager.tx(txid) {
       Some(tx) => tx,
       None => return Vec::new(),
     };
@@ -112,7 +112,7 @@ impl ConflictDetector {
 
   /// Check if a transaction has any conflicts (fast path, no allocations)
   pub fn has_conflicts(&self, tx_manager: &TxManager, txid: TxId) -> bool {
-    let tx = match tx_manager.get_tx(txid) {
+    let tx = match tx_manager.tx(txid) {
       Some(tx) => tx,
       None => return false,
     };
@@ -152,7 +152,7 @@ impl ConflictDetector {
 
   /// Check for a specific key conflict
   pub fn check_key_conflict(&self, tx_manager: &TxManager, txid: TxId, key: &TxKey) -> bool {
-    let tx = match tx_manager.get_tx(txid) {
+    let tx = match tx_manager.tx(txid) {
       Some(tx) => tx,
       None => return false,
     };
@@ -197,8 +197,8 @@ pub struct ConflictInfo {
 
 impl ConflictDetector {
   /// Get detailed conflict information
-  pub fn get_conflict_details(&self, tx_manager: &TxManager, txid: TxId) -> Vec<ConflictInfo> {
-    let tx = match tx_manager.get_tx(txid) {
+  pub fn conflict_details(&self, tx_manager: &TxManager, txid: TxId) -> Vec<ConflictInfo> {
+    let tx = match tx_manager.tx(txid) {
       Some(tx) => tx,
       None => return Vec::new(),
     };
@@ -212,7 +212,7 @@ impl ConflictDetector {
 
     // Check read-write conflicts
     for read_key in &tx.read_set {
-      if let Some(write_ts) = tx_manager.get_committed_write_ts(read_key, tx_snapshot_ts) {
+      if let Some(write_ts) = tx_manager.committed_write_ts(read_key, tx_snapshot_ts) {
         conflicts.push(ConflictInfo {
           key: read_key.to_string(),
           conflict_type: ConflictType::ReadWrite,
@@ -227,7 +227,7 @@ impl ConflictDetector {
       if tx.read_set.contains(write_key) {
         continue;
       }
-      if let Some(write_ts) = tx_manager.get_committed_write_ts(write_key, tx_snapshot_ts) {
+      if let Some(write_ts) = tx_manager.committed_write_ts(write_key, tx_snapshot_ts) {
         conflicts.push(ConflictInfo {
           key: write_key.to_string(),
           conflict_type: ConflictType::WriteWrite,
@@ -434,7 +434,7 @@ mod tests {
 
     tx_mgr.commit_tx(txid1).unwrap();
 
-    let details = detector.get_conflict_details(&tx_mgr, txid2);
+    let details = detector.conflict_details(&tx_mgr, txid2);
 
     // Should have two conflicts
     assert_eq!(details.len(), 2);

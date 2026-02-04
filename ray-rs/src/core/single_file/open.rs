@@ -247,36 +247,41 @@ impl SingleFileOpenOptions {
   }
 }
 
-fn load_snapshot_and_schema(
-  header: &DbHeaderV1,
-  pager: &mut FilePager,
-  options: &SingleFileOpenOptions,
-  label_names: &mut HashMap<String, LabelId>,
-  label_ids: &mut HashMap<LabelId, String>,
-  etype_names: &mut HashMap<String, ETypeId>,
-  etype_ids: &mut HashMap<ETypeId, String>,
-  propkey_names: &mut HashMap<String, PropKeyId>,
-  propkey_ids: &mut HashMap<PropKeyId, String>,
-  next_node_id: &mut NodeId,
-  next_label_id: &mut LabelId,
-  next_etype_id: &mut ETypeId,
-  next_propkey_id: &mut PropKeyId,
-) -> Result<Option<SnapshotData>> {
-  if header.snapshot_page_count == 0 {
+struct SnapshotLoadState<'a> {
+  header: &'a DbHeaderV1,
+  pager: &'a mut FilePager,
+  options: &'a SingleFileOpenOptions,
+  label_names: &'a mut HashMap<String, LabelId>,
+  label_ids: &'a mut HashMap<LabelId, String>,
+  etype_names: &'a mut HashMap<String, ETypeId>,
+  etype_ids: &'a mut HashMap<ETypeId, String>,
+  propkey_names: &'a mut HashMap<String, PropKeyId>,
+  propkey_ids: &'a mut HashMap<PropKeyId, String>,
+  next_node_id: &'a mut NodeId,
+  next_label_id: &'a mut LabelId,
+  next_etype_id: &'a mut ETypeId,
+  next_propkey_id: &'a mut PropKeyId,
+}
+
+fn load_snapshot_and_schema(state: &mut SnapshotLoadState<'_>) -> Result<Option<SnapshotData>> {
+  if state.header.snapshot_page_count == 0 {
     return Ok(None);
   }
 
-  let snapshot_offset = (header.snapshot_start_page * header.page_size as u64) as usize;
+  let snapshot_offset = (state.header.snapshot_start_page * state.header.page_size as u64) as usize;
 
   let mut parse_options = crate::core::snapshot::reader::ParseSnapshotOptions::default();
-  if matches!(options.snapshot_parse_mode, SnapshotParseMode::Salvage) {
+  if matches!(
+    state.options.snapshot_parse_mode,
+    SnapshotParseMode::Salvage
+  ) {
     parse_options.skip_crc_validation = true;
   }
 
   let parse_result = SnapshotData::parse_at_offset(
     std::sync::Arc::new({
       // Safety handled inside map_file (native mmap) or in-memory read (wasm).
-      map_file(pager.file())?
+      map_file(state.pager.file())?
     }),
     snapshot_offset,
     &parse_options,
@@ -287,32 +292,32 @@ fn load_snapshot_and_schema(
       // Load schema from snapshot
       for i in 1..=snap.header.num_labels as u32 {
         if let Some(name) = snap.label_name(i) {
-          label_names.insert(name.to_string(), i);
-          label_ids.insert(i, name.to_string());
+          state.label_names.insert(name.to_string(), i);
+          state.label_ids.insert(i, name.to_string());
         }
       }
       for i in 1..=snap.header.num_etypes as u32 {
         if let Some(name) = snap.etype_name(i) {
-          etype_names.insert(name.to_string(), i);
-          etype_ids.insert(i, name.to_string());
+          state.etype_names.insert(name.to_string(), i);
+          state.etype_ids.insert(i, name.to_string());
         }
       }
       for i in 1..=snap.header.num_propkeys as u32 {
         if let Some(name) = snap.propkey_name(i) {
-          propkey_names.insert(name.to_string(), i);
-          propkey_ids.insert(i, name.to_string());
+          state.propkey_names.insert(name.to_string(), i);
+          state.propkey_ids.insert(i, name.to_string());
         }
       }
 
       // Update ID allocators from snapshot
-      *next_node_id = snap.header.max_node_id + 1;
-      *next_label_id = snap.header.num_labels as u32 + 1;
-      *next_etype_id = snap.header.num_etypes as u32 + 1;
-      *next_propkey_id = snap.header.num_propkeys as u32 + 1;
+      *state.next_node_id = snap.header.max_node_id + 1;
+      *state.next_label_id = snap.header.num_labels as u32 + 1;
+      *state.next_etype_id = snap.header.num_etypes as u32 + 1;
+      *state.next_propkey_id = snap.header.num_propkeys as u32 + 1;
 
       Ok(Some(snap))
     }
-    Err(e) => match options.snapshot_parse_mode {
+    Err(e) => match state.options.snapshot_parse_mode {
       SnapshotParseMode::Strict => Err(e),
       SnapshotParseMode::Salvage => {
         eprintln!("Warning: Failed to parse snapshot: {e}");
@@ -667,28 +672,29 @@ pub fn open_single_file<P: AsRef<Path>>(
   let mut propkey_ids: HashMap<PropKeyId, String> = HashMap::new();
 
   // Load snapshot if exists
-  let snapshot = load_snapshot_and_schema(
-    &header,
-    &mut pager,
-    &options,
-    &mut label_names,
-    &mut label_ids,
-    &mut etype_names,
-    &mut etype_ids,
-    &mut propkey_names,
-    &mut propkey_ids,
-    &mut next_node_id,
-    &mut next_label_id,
-    &mut next_etype_id,
-    &mut next_propkey_id,
-  )?;
+  let mut snapshot_state = SnapshotLoadState {
+    header: &header,
+    pager: &mut pager,
+    options: &options,
+    label_names: &mut label_names,
+    label_ids: &mut label_ids,
+    etype_names: &mut etype_names,
+    etype_ids: &mut etype_ids,
+    propkey_names: &mut propkey_names,
+    propkey_ids: &mut propkey_ids,
+    next_node_id: &mut next_node_id,
+    next_label_id: &mut next_label_id,
+    next_etype_id: &mut next_etype_id,
+    next_propkey_id: &mut next_propkey_id,
+  };
+  let snapshot = load_snapshot_and_schema(&mut snapshot_state)?;
 
   // Replay WAL for recovery (if not a new database)
   let mut _wal_records_storage: Option<Vec<crate::core::wal::record::ParsedWalRecord>>;
   if !is_new && header.wal_head > 0 {
     _wal_records_storage = Some(scan_wal_records(&mut pager, &header)?);
     if let Some(ref wal_records) = _wal_records_storage {
-      committed_in_order = get_committed_transactions(wal_records);
+      committed_in_order = committed_transactions(wal_records);
 
       // Replay committed transactions
       for (_txid, records) in &committed_in_order {
@@ -744,7 +750,7 @@ pub fn open_single_file<P: AsRef<Path>>(
   }
 
   // Initialize cache if enabled
-  let cache = options.cache.map(CacheManager::new);
+  let cache = options.cache.clone().map(CacheManager::new);
 
   // Initialize MVCC if enabled (after WAL replay)
   let mvcc = init_mvcc_from_wal(

@@ -162,20 +162,20 @@ fn node_exists_db(db: &SingleFileDB, node_id: NodeId) -> bool {
   db.node_exists(node_id)
 }
 
-fn get_node_by_key(handle: &TxHandle, key: &str) -> Option<NodeId> {
-  handle.db.get_node_by_key(key)
+fn node_by_key(handle: &TxHandle, key: &str) -> Option<NodeId> {
+  handle.db.node_by_key(key)
 }
 
-fn get_node_by_key_db(db: &SingleFileDB, key: &str) -> Option<NodeId> {
-  db.get_node_by_key(key)
+fn node_by_key_db(db: &SingleFileDB, key: &str) -> Option<NodeId> {
+  db.node_by_key(key)
 }
 
-fn get_node_prop(handle: &TxHandle, node_id: NodeId, key_id: PropKeyId) -> Option<PropValue> {
-  handle.db.get_node_prop(node_id, key_id)
+fn node_prop(handle: &TxHandle, node_id: NodeId, key_id: PropKeyId) -> Option<PropValue> {
+  handle.db.node_prop(node_id, key_id)
 }
 
-fn get_node_prop_db(db: &SingleFileDB, node_id: NodeId, key_id: PropKeyId) -> Option<PropValue> {
-  db.get_node_prop(node_id, key_id)
+fn node_prop_db(db: &SingleFileDB, node_id: NodeId, key_id: PropKeyId) -> Option<PropValue> {
+  db.node_prop(node_id, key_id)
 }
 
 fn set_node_prop(
@@ -195,7 +195,7 @@ fn upsert_node_with_props<I>(handle: &mut TxHandle, key: &str, props: I) -> Resu
 where
   I: IntoIterator<Item = (PropKeyId, Option<PropValue>)>,
 {
-  let (node_id, created) = match handle.db.get_node_by_key(key) {
+  let (node_id, created) = match handle.db.node_by_key(key) {
     Some(existing) => (existing, false),
     None => (create_node(handle, NodeOpts::new().with_key(key))?, true),
   };
@@ -256,45 +256,45 @@ fn edge_exists_db(db: &SingleFileDB, src: NodeId, etype: ETypeId, dst: NodeId) -
   db.edge_exists(src, etype, dst)
 }
 
-fn get_neighbors_out_db(db: &SingleFileDB, node_id: NodeId, etype: Option<ETypeId>) -> Vec<NodeId> {
+fn neighbors_out_db(db: &SingleFileDB, node_id: NodeId, etype: Option<ETypeId>) -> Vec<NodeId> {
   match etype {
-    Some(filter) => db.get_out_neighbors(node_id, filter),
+    Some(filter) => db.out_neighbors(node_id, filter),
     None => db
-      .get_out_edges(node_id)
+      .out_edges(node_id)
       .into_iter()
       .map(|(_, dst)| dst)
       .collect(),
   }
 }
 
-fn get_neighbors_in_db(db: &SingleFileDB, node_id: NodeId, etype: Option<ETypeId>) -> Vec<NodeId> {
+fn neighbors_in_db(db: &SingleFileDB, node_id: NodeId, etype: Option<ETypeId>) -> Vec<NodeId> {
   match etype {
-    Some(filter) => db.get_in_neighbors(node_id, filter),
+    Some(filter) => db.in_neighbors(node_id, filter),
     None => db
-      .get_in_edges(node_id)
+      .in_edges(node_id)
       .into_iter()
       .map(|(_, src)| src)
       .collect(),
   }
 }
 
-fn get_edge_prop_db(
+fn edge_prop_db(
   db: &SingleFileDB,
   src: NodeId,
   etype: ETypeId,
   dst: NodeId,
   key_id: PropKeyId,
 ) -> Option<PropValue> {
-  db.get_edge_prop(src, etype, dst, key_id)
+  db.edge_prop(src, etype, dst, key_id)
 }
 
-fn get_edge_props_db(
+fn edge_props_db(
   db: &SingleFileDB,
   src: NodeId,
   etype: ETypeId,
   dst: NodeId,
 ) -> Option<HashMap<PropKeyId, PropValue>> {
-  db.get_edge_props(src, etype, dst)
+  db.edge_props(src, etype, dst)
 }
 
 fn set_edge_prop(
@@ -754,12 +754,12 @@ impl Kite {
     // Process node definitions
     for mut node_def in options.nodes {
       // Define label
-      let label_id = db.get_or_create_label(&node_def.name);
+      let label_id = db.label_id_or_create(&node_def.name);
       node_def.label_id = Some(label_id);
 
       // Define property keys
       for prop_name in node_def.props.keys() {
-        let prop_key_id = db.get_or_create_propkey(prop_name);
+        let prop_key_id = db.propkey_id_or_create(prop_name);
         node_def.prop_key_ids.insert(prop_name.clone(), prop_key_id);
       }
 
@@ -770,12 +770,12 @@ impl Kite {
     // Process edge definitions
     for mut edge_def in options.edges {
       // Define edge type
-      let etype_id = db.get_or_create_etype(&edge_def.name);
+      let etype_id = db.etype_id_or_create(&edge_def.name);
       edge_def.etype_id = Some(etype_id);
 
       // Define property keys
       for prop_name in edge_def.props.keys() {
-        let prop_key_id = db.get_or_create_propkey(prop_name);
+        let prop_key_id = db.propkey_id_or_create(prop_name);
         edge_def.prop_key_ids.insert(prop_name.clone(), prop_key_id);
       }
 
@@ -904,7 +904,7 @@ impl Kite {
     let full_key = node_def.key(key_suffix);
 
     // Direct read without transaction
-    let node_id = get_node_by_key_db(&self.db, &full_key);
+    let node_id = node_by_key_db(&self.db, &full_key);
 
     match node_id {
       Some(id) => Ok(Some(NodeRef::new(id, Some(full_key), node_type))),
@@ -913,13 +913,13 @@ impl Kite {
   }
 
   /// Get a node by ID (direct read, no transaction overhead)
-  pub fn get_by_id(&self, node_id: NodeId) -> Result<Option<NodeRef>> {
+  pub fn node_by_id(&self, node_id: NodeId) -> Result<Option<NodeRef>> {
     // Direct read without transaction
     let exists = node_exists_db(&self.db, node_id);
 
     if exists {
       // Look up the node's key from snapshot/delta
-      let key = self.db.get_node_key(node_id);
+      let key = self.db.node_key(node_id);
 
       // Try to determine node type from key prefix
       let node_type = if let Some(ref k) = key {
@@ -955,15 +955,15 @@ impl Kite {
   }
 
   /// Get a node property (direct read, no transaction overhead)
-  pub fn get_prop(&self, node_id: NodeId, prop_name: &str) -> Option<PropValue> {
-    let prop_key_id = self.db.get_propkey_id(prop_name)?;
+  pub fn prop(&self, node_id: NodeId, prop_name: &str) -> Option<PropValue> {
+    let prop_key_id = self.db.propkey_id(prop_name)?;
     // Direct read without transaction
-    get_node_prop_db(&self.db, node_id, prop_key_id)
+    node_prop_db(&self.db, node_id, prop_key_id)
   }
 
   /// Set a node property
   pub fn set_prop(&mut self, node_id: NodeId, prop_name: &str, value: PropValue) -> Result<()> {
-    let prop_key_id = self.db.get_or_create_propkey(prop_name);
+    let prop_key_id = self.db.propkey_id_or_create(prop_name);
 
     let mut handle = begin_tx(&self.db)?;
     set_node_prop(&mut handle, node_id, prop_key_id, value)?;
@@ -984,11 +984,11 @@ impl Kite {
 
     let mut handle = begin_tx(&self.db)?;
 
-    let first_key_id = self.db.get_or_create_propkey(first_name.as_ref());
+    let first_key_id = self.db.propkey_id_or_create(first_name.as_ref());
     set_node_prop(&mut handle, node_id, first_key_id, first_value)?;
 
     for (prop_name, value) in iter {
-      let prop_key_id = self.db.get_or_create_propkey(prop_name.as_ref());
+      let prop_key_id = self.db.propkey_id_or_create(prop_name.as_ref());
       set_node_prop(&mut handle, node_id, prop_key_id, value)?;
     }
 
@@ -1119,8 +1119,8 @@ impl Kite {
 
     let node_id = {
       let mut handle = begin_tx(&self.db)?;
-      let node_id = get_node_by_key(&handle, &full_key)
-        .ok_or_else(|| KiteError::KeyNotFound(full_key.clone()))?;
+      let node_id =
+        node_by_key(&handle, &full_key).ok_or_else(|| KiteError::KeyNotFound(full_key.clone()))?;
       commit(&mut handle)?;
       node_id
     };
@@ -1197,7 +1197,7 @@ impl Kite {
         let prop_key_id = if let Some(&id) = edge_def.prop_key_ids.get(&prop_name) {
           id
         } else {
-          handle.db.get_or_create_propkey(&prop_name)
+          handle.db.propkey_id_or_create(&prop_name)
         };
         prop_pairs.push((prop_key_id, value));
       }
@@ -1256,7 +1256,7 @@ impl Kite {
     };
 
     // Direct read without transaction
-    Ok(get_neighbors_out_db(&self.db, node_id, etype_id))
+    Ok(neighbors_out_db(&self.db, node_id, etype_id))
   }
 
   /// Get incoming neighbors of a node (direct read, no transaction overhead)
@@ -1273,7 +1273,7 @@ impl Kite {
     };
 
     // Direct read without transaction
-    let neighbors = get_neighbors_in_db(&self.db, node_id, etype_id);
+    let neighbors = neighbors_in_db(&self.db, node_id, etype_id);
     Ok(neighbors)
   }
 
@@ -1284,7 +1284,7 @@ impl Kite {
   /// Get an edge property (direct read, no transaction overhead)
   ///
   /// Returns None if the edge doesn't exist or the property is not set.
-  pub fn get_edge_prop(
+  pub fn edge_prop(
     &self,
     src: NodeId,
     edge_type: &str,
@@ -1300,19 +1300,19 @@ impl Kite {
       .etype_id
       .ok_or_else(|| KiteError::InvalidSchema("Edge type not initialized".into()))?;
 
-    let prop_key_id = match self.db.get_propkey_id(prop_name) {
+    let prop_key_id = match self.db.propkey_id(prop_name) {
       Some(id) => id,
       None => return Ok(None), // Unknown property = not set
     };
 
     // Direct read without transaction
-    Ok(get_edge_prop_db(&self.db, src, etype_id, dst, prop_key_id))
+    Ok(edge_prop_db(&self.db, src, etype_id, dst, prop_key_id))
   }
 
   /// Get all properties for an edge (direct read, no transaction overhead)
   ///
   /// Returns None if the edge doesn't exist.
-  pub fn get_edge_props(
+  pub fn edge_props(
     &self,
     src: NodeId,
     edge_type: &str,
@@ -1328,14 +1328,14 @@ impl Kite {
       .ok_or_else(|| KiteError::InvalidSchema("Edge type not initialized".into()))?;
 
     // Direct read without transaction
-    let props = get_edge_props_db(&self.db, src, etype_id, dst);
+    let props = edge_props_db(&self.db, src, etype_id, dst);
 
     // Convert PropKeyId -> String in the result
     match props {
       Some(props_by_id) => {
         let mut result = HashMap::new();
         for (key_id, value) in props_by_id {
-          if let Some(name) = self.db.get_propkey_name(key_id) {
+          if let Some(name) = self.db.propkey_name(key_id) {
             result.insert(name, value);
           }
         }
@@ -1363,7 +1363,7 @@ impl Kite {
       .etype_id
       .ok_or_else(|| KiteError::InvalidSchema("Edge type not initialized".into()))?;
 
-    let prop_key_id = self.db.get_or_create_propkey(prop_name);
+    let prop_key_id = self.db.propkey_id_or_create(prop_name);
 
     let mut handle = begin_tx(&self.db)?;
     set_edge_prop(&mut handle, src, etype_id, dst, prop_key_id, value)?;
@@ -1397,7 +1397,7 @@ impl Kite {
       let prop_key_id = if let Some(&id) = edge_def.prop_key_ids.get(&prop_name) {
         id
       } else {
-        self.db.get_or_create_propkey(&prop_name)
+        self.db.propkey_id_or_create(&prop_name)
       };
       prop_pairs.push((prop_key_id, value));
     }
@@ -1427,7 +1427,7 @@ impl Kite {
 
     let prop_key_id = self
       .db
-      .get_propkey_id(prop_name)
+      .propkey_id(prop_name)
       .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown property: {prop_name}").into()))?;
 
     let mut handle = begin_tx(&self.db)?;
@@ -1530,7 +1530,7 @@ impl Kite {
     let mut count = 0u64;
 
     for node_id in list_nodes(&self.db) {
-      if let Some(key) = self.get_node_key_internal(node_id) {
+      if let Some(key) = self.node_key_internal(node_id) {
         if key.starts_with(prefix) {
           count += 1;
         }
@@ -1596,7 +1596,7 @@ impl Kite {
     let node_type_arc: Arc<str> = node_type.to_string().into();
 
     Ok(list_nodes(&self.db).into_iter().filter_map(move |node_id| {
-      let key = self.get_node_key_internal(node_id)?;
+      let key = self.node_key_internal(node_id)?;
       if key.starts_with(&prefix) {
         Some(NodeRef::new(node_id, Some(key), Arc::clone(&node_type_arc)))
       } else {
@@ -1651,7 +1651,7 @@ impl Kite {
   /// # use kitedb::api::kite::Kite;
   /// # fn main() -> kitedb::error::Result<()> {
   /// # let kite: Kite = unimplemented!();
-  /// let user_ref = kite.get_ref("User", "alice")?;
+  /// let user_ref = kite.node_ref("User", "alice")?;
   /// if let Some(node) = user_ref {
   ///     // Can now use node.id for edges, traversals, etc.
   /// }
@@ -1669,14 +1669,14 @@ impl Kite {
   /// # fn main() -> kitedb::error::Result<()> {
   /// # let kite: Kite = unimplemented!();
   /// // Fast: only gets reference (~85ns)
-  /// if let Some(node) = kite.get_ref("User", "alice")? {
+  /// if let Some(node) = kite.node_ref("User", "alice")? {
   ///     // Can now use node.id for edges, traversals, etc.
   ///     let friends = kite.from(node.id).out(Some("FOLLOWS"))?.to_vec();
   /// }
   /// # Ok(())
   /// # }
   /// ```
-  pub fn get_ref(&self, node_type: &str, key_suffix: &str) -> Result<Option<NodeRef>> {
+  pub fn node_ref(&self, node_type: &str, key_suffix: &str) -> Result<Option<NodeRef>> {
     let node_def = self
       .nodes
       .get(node_type)
@@ -1685,7 +1685,7 @@ impl Kite {
     let full_key = node_def.key(key_suffix);
 
     // Direct read without transaction
-    let node_id = get_node_by_key_db(&self.db, &full_key);
+    let node_id = node_by_key_db(&self.db, &full_key);
 
     match node_id {
       Some(id) => Ok(Some(NodeRef::new(id, Some(full_key), node_type))),
@@ -1694,8 +1694,8 @@ impl Kite {
   }
 
   /// Helper to get node key from database
-  fn get_node_key_internal(&self, node_id: NodeId) -> Option<String> {
-    self.db.get_node_key(node_id)
+  fn node_key_internal(&self, node_id: NodeId) -> Option<String> {
+    self.db.node_key(node_id)
   }
 
   // ========================================================================
@@ -1849,15 +1849,13 @@ impl Kite {
 
     let results = TraversalBuilder::from_node(source)
       .traverse(etype, options)
-      .collect_node_ids(|node_id, dir, etype_filter| {
-        self.get_neighbors(node_id, dir, etype_filter)
-      });
+      .collect_node_ids(|node_id, dir, etype_filter| self.neighbors(node_id, dir, etype_filter));
 
     Ok(results)
   }
 
   // Internal helper to get neighbors for traversal/pathfinding (read-only, no transaction)
-  fn get_neighbors(
+  fn neighbors(
     &self,
     node_id: NodeId,
     direction: super::traversal::TraversalDirection,
@@ -1869,7 +1867,7 @@ impl Kite {
 
     match direction {
       TraversalDirection::Out => {
-        for (edge_etype, dst) in self.db.get_out_edges(node_id) {
+        for (edge_etype, dst) in self.db.out_edges(node_id) {
           if etype.is_some() && etype != Some(edge_etype) {
             continue;
           }
@@ -1881,7 +1879,7 @@ impl Kite {
         }
       }
       TraversalDirection::In => {
-        for (edge_etype, src) in self.db.get_in_edges(node_id) {
+        for (edge_etype, src) in self.db.in_edges(node_id) {
           if etype.is_some() && etype != Some(edge_etype) {
             continue;
           }
@@ -1893,8 +1891,8 @@ impl Kite {
         }
       }
       TraversalDirection::Both => {
-        edges.extend(self.get_neighbors(node_id, TraversalDirection::Out, etype));
-        edges.extend(self.get_neighbors(node_id, TraversalDirection::In, etype));
+        edges.extend(self.neighbors(node_id, TraversalDirection::Out, etype));
+        edges.extend(self.neighbors(node_id, TraversalDirection::In, etype));
       }
     }
 
@@ -2136,28 +2134,28 @@ impl<'a> KiteTraversalBuilder<'a> {
   pub fn to_vec(self) -> Vec<NodeId> {
     self
       .builder
-      .collect_node_ids(|node_id, dir, etype| self.ray.get_neighbors(node_id, dir, etype))
+      .collect_node_ids(|node_id, dir, etype| self.ray.neighbors(node_id, dir, etype))
   }
 
   /// Execute and get first result
   pub fn first(self) -> Option<TraversalResult> {
     self
       .builder
-      .first(|node_id, dir, etype| self.ray.get_neighbors(node_id, dir, etype))
+      .first(|node_id, dir, etype| self.ray.neighbors(node_id, dir, etype))
   }
 
   /// Execute and get first node ID
   pub fn first_node(self) -> Option<NodeId> {
     self
       .builder
-      .first_node(|node_id, dir, etype| self.ray.get_neighbors(node_id, dir, etype))
+      .first_node(|node_id, dir, etype| self.ray.neighbors(node_id, dir, etype))
   }
 
   /// Execute and count results
   pub fn count(self) -> usize {
     self
       .builder
-      .count(|node_id, dir, etype| self.ray.get_neighbors(node_id, dir, etype))
+      .count(|node_id, dir, etype| self.ray.neighbors(node_id, dir, etype))
   }
 
   /// Execute and return iterator over traversal results
@@ -2165,7 +2163,7 @@ impl<'a> KiteTraversalBuilder<'a> {
     let ray = self.ray;
     self
       .builder
-      .execute(move |node_id, dir, etype| ray.get_neighbors(node_id, dir, etype))
+      .execute(move |node_id, dir, etype| ray.neighbors(node_id, dir, etype))
   }
 
   /// Execute and return iterator over edges only
@@ -2195,7 +2193,7 @@ impl<'a> KiteTraversalBuilder<'a> {
     let ray = self.ray;
     self
       .builder
-      .execute(move |node_id, dir, etype| ray.get_neighbors(node_id, dir, etype))
+      .execute(move |node_id, dir, etype| ray.neighbors(node_id, dir, etype))
       .filter_map(|result| {
         result.edge.map(|e| Edge {
           src: e.src,
@@ -2212,7 +2210,7 @@ impl<'a> KiteTraversalBuilder<'a> {
     let ray = self.ray;
     self
       .builder
-      .execute(move |node_id, dir, etype| ray.get_neighbors(node_id, dir, etype))
+      .execute(move |node_id, dir, etype| ray.neighbors(node_id, dir, etype))
       .filter_map(move |result| {
         result.edge.map(|e| FullEdge {
           src: e.src,
@@ -2331,7 +2329,7 @@ impl<'a> KitePathBuilder<'a> {
     let weights = self.weights;
     dijkstra(
       config,
-      |node_id, dir, etype| self.ray.get_neighbors(node_id, dir, etype),
+      |node_id, dir, etype| self.ray.neighbors(node_id, dir, etype),
       move |src, etype, dst| weights.get(&(src, etype, dst)).copied().unwrap_or(1.0),
     )
   }
@@ -2349,7 +2347,7 @@ impl<'a> KitePathBuilder<'a> {
     };
 
     bfs(config, |node_id, dir, etype| {
-      self.ray.get_neighbors(node_id, dir, etype)
+      self.ray.neighbors(node_id, dir, etype)
     })
   }
 
@@ -2367,7 +2365,7 @@ impl<'a> KitePathBuilder<'a> {
     yen_k_shortest(
       config,
       k,
-      |node_id, dir, etype| self.ray.get_neighbors(node_id, dir, etype),
+      |node_id, dir, etype| self.ray.neighbors(node_id, dir, etype),
       move |src, etype, dst| weights.get(&(src, etype, dst)).copied().unwrap_or(1.0),
     )
   }
@@ -2580,7 +2578,7 @@ impl Kite {
               let prop_key_id = if let Some(&id) = entry.prop_key_ids.get(&prop_name) {
                 id
               } else {
-                let key_id = handle.db.get_or_create_propkey(&prop_name);
+                let key_id = handle.db.propkey_id_or_create(&prop_name);
                 entry.prop_key_ids.insert(prop_name.clone(), key_id);
                 key_id
               };
@@ -2617,7 +2615,7 @@ impl Kite {
           value,
         } => {
           // Use handle.db to access schema methods while handle is active
-          let prop_key_id = handle.db.get_or_create_propkey(&prop_name);
+          let prop_key_id = handle.db.propkey_id_or_create(&prop_name);
           set_node_prop(&mut handle, node_id, prop_key_id, value)?;
           BatchResult::PropSet
         }
@@ -2635,7 +2633,7 @@ impl Kite {
           let prop_key_id = if let Some(&id) = entry.prop_key_ids.get(&prop_name) {
             id
           } else {
-            let key_id = handle.db.get_or_create_propkey(&prop_name);
+            let key_id = handle.db.propkey_id_or_create(&prop_name);
             entry.prop_key_ids.insert(prop_name.clone(), key_id);
             key_id
           };
@@ -2658,7 +2656,7 @@ impl Kite {
             let prop_key_id = if let Some(&id) = entry.prop_key_ids.get(&prop_name) {
               id
             } else {
-              let key_id = handle.db.get_or_create_propkey(&prop_name);
+              let key_id = handle.db.propkey_id_or_create(&prop_name);
               entry.prop_key_ids.insert(prop_name.clone(), key_id);
               key_id
             };
@@ -2670,7 +2668,7 @@ impl Kite {
         }
 
         BatchOp::DelProp { node_id, prop_name } => {
-          let prop_key_id = handle.db.get_propkey_id(&prop_name).ok_or_else(|| {
+          let prop_key_id = handle.db.propkey_id(&prop_name).ok_or_else(|| {
             KiteError::InvalidSchema(format!("Unknown property: {prop_name}").into())
           })?;
           del_node_prop(&mut handle, node_id, prop_key_id)?;
@@ -2775,7 +2773,7 @@ impl<'a> TxContext<'a> {
 
   /// Set a node property
   pub fn set_prop(&mut self, node_id: NodeId, prop_name: &str, value: PropValue) -> Result<()> {
-    let prop_key_id = self.handle.db.get_or_create_propkey(prop_name);
+    let prop_key_id = self.handle.db.propkey_id_or_create(prop_name);
     set_node_prop(&mut self.handle, node_id, prop_key_id, value)?;
     Ok(())
   }
@@ -2785,7 +2783,7 @@ impl<'a> TxContext<'a> {
     let prop_key_id = self
       .handle
       .db
-      .get_propkey_id(prop_name)
+      .propkey_id(prop_name)
       .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown property: {prop_name}").into()))?;
     del_node_prop(&mut self.handle, node_id, prop_key_id)?;
     Ok(())
@@ -2811,14 +2809,14 @@ impl<'a> TxContext<'a> {
   }
 
   /// Get a node property
-  pub fn get_prop(&self, node_id: NodeId, prop_name: &str) -> Result<Option<PropValue>> {
+  pub fn prop(&self, node_id: NodeId, prop_name: &str) -> Result<Option<PropValue>> {
     let prop_key_id = self
       .handle
       .db
-      .get_propkey_id(prop_name)
+      .propkey_id(prop_name)
       .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown property: {prop_name}").into()))?;
 
-    Ok(get_node_prop(&self.handle, node_id, prop_key_id))
+    Ok(node_prop(&self.handle, node_id, prop_key_id))
   }
 
   /// Get a node by key
@@ -2829,7 +2827,7 @@ impl<'a> TxContext<'a> {
       .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown node type: {node_type}").into()))?;
 
     let full_key = node_def.key(key_suffix);
-    let node_id = get_node_by_key(&self.handle, &full_key);
+    let node_id = node_by_key(&self.handle, &full_key);
 
     match node_id {
       Some(id) => Ok(Some(NodeRef::new(id, Some(full_key), node_type))),
@@ -3104,7 +3102,7 @@ impl<'a> KiteUpdateNodeBuilder<'a> {
     let mut handle = begin_tx(&self.ray.db)?;
 
     for (prop_name, value_opt) in self.updates {
-      let prop_key_id = self.ray.db.get_or_create_propkey(&prop_name);
+      let prop_key_id = self.ray.db.propkey_id_or_create(&prop_name);
 
       match value_opt {
         Some(value) => {
@@ -3172,7 +3170,7 @@ impl<'a> KiteUpsertByIdBuilder<'a> {
       let prop_key_id = if let Some(&id) = self.node_def.prop_key_ids.get(&prop_name) {
         id
       } else {
-        self.ray.db.get_or_create_propkey(&prop_name)
+        self.ray.db.propkey_id_or_create(&prop_name)
       };
       updates.push((prop_key_id, value_opt));
     }
@@ -3313,7 +3311,7 @@ impl<'a> InsertExecutorSingle<'a> {
 
     // Set properties
     for (prop_name, value) in self.props {
-      let prop_key_id = self.ray.db.get_or_create_propkey(&prop_name);
+      let prop_key_id = self.ray.db.propkey_id_or_create(&prop_name);
       set_node_prop(&mut handle, node_id, prop_key_id, value)?;
     }
 
@@ -3356,7 +3354,7 @@ impl<'a> InsertExecutorMultiple<'a> {
 
       // Set properties
       for (prop_name, value) in props {
-        let prop_key_id = self.ray.db.get_or_create_propkey(&prop_name);
+        let prop_key_id = self.ray.db.propkey_id_or_create(&prop_name);
         set_node_prop(&mut handle, node_id, prop_key_id, value)?;
       }
 
@@ -3467,7 +3465,7 @@ impl<'a> UpsertExecutorSingle<'a> {
 
     let mut updates = Vec::with_capacity(self.props.len());
     for (prop_name, value) in self.props {
-      let prop_key_id = self.ray.db.get_or_create_propkey(&prop_name);
+      let prop_key_id = self.ray.db.propkey_id_or_create(&prop_name);
       let value_opt = match value {
         PropValue::Null => None,
         other => Some(other),
@@ -3510,7 +3508,7 @@ impl<'a> UpsertExecutorMultiple<'a> {
     for (full_key, props) in self.entries {
       let mut updates = Vec::with_capacity(props.len());
       for (prop_name, value) in props {
-        let prop_key_id = self.ray.db.get_or_create_propkey(&prop_name);
+        let prop_key_id = self.ray.db.propkey_id_or_create(&prop_name);
         let value_opt = match value {
           PropValue::Null => None,
           other => Some(other),
@@ -3607,7 +3605,7 @@ impl<'a> KiteUpdateEdgeBuilder<'a> {
     let mut handle = begin_tx(&self.ray.db)?;
 
     for (prop_name, value_opt) in self.updates {
-      let prop_key_id = self.ray.db.get_or_create_propkey(&prop_name);
+      let prop_key_id = self.ray.db.propkey_id_or_create(&prop_name);
 
       match value_opt {
         Some(value) => {
@@ -3622,7 +3620,7 @@ impl<'a> KiteUpdateEdgeBuilder<'a> {
         }
         None => {
           // Only delete if prop_key exists
-          if let Some(existing_key_id) = self.ray.db.get_propkey_id(&prop_name) {
+          if let Some(existing_key_id) = self.ray.db.propkey_id(&prop_name) {
             del_edge_prop(
               &mut handle,
               self.src,
@@ -3683,7 +3681,7 @@ impl<'a> KiteUpsertEdgeBuilder<'a> {
 
     let mut updates = Vec::with_capacity(self.updates.len());
     for (prop_name, value_opt) in self.updates {
-      let prop_key_id = self.ray.db.get_or_create_propkey(&prop_name);
+      let prop_key_id = self.ray.db.propkey_id_or_create(&prop_name);
       updates.push((prop_key_id, value_opt));
     }
 
@@ -3814,12 +3812,12 @@ mod tests {
     let user = ray.create_node("User", "alice", props).unwrap();
 
     // Get property
-    let name = ray.get_prop(user.id, "name");
+    let name = ray.prop(user.id, "name");
     assert_eq!(name, Some(PropValue::String("Alice".to_string())));
 
     // Set property
     ray.set_prop(user.id, "age", PropValue::I64(25)).unwrap();
-    let age = ray.get_prop(user.id, "age");
+    let age = ray.prop(user.id, "age");
     assert_eq!(age, Some(PropValue::I64(25)));
 
     ray.close().unwrap();
@@ -3870,14 +3868,14 @@ mod tests {
     let user = ray.create_node("User", "alice", HashMap::new()).unwrap();
 
     // Get lightweight reference
-    let node_ref = ray.get_ref("User", "alice").unwrap();
+    let node_ref = ray.node_ref("User", "alice").unwrap();
     assert!(node_ref.is_some());
     let node_ref = node_ref.unwrap();
     assert_eq!(node_ref.id(), user.id);
     assert_eq!(node_ref.key(), Some("user:alice"));
 
     // Non-existent user
-    let not_found = ray.get_ref("User", "bob").unwrap();
+    let not_found = ray.node_ref("User", "bob").unwrap();
     assert!(not_found.is_none());
 
     ray.close().unwrap();
@@ -4315,13 +4313,11 @@ mod tests {
       .unwrap();
 
     let weight = ray
-      .get_edge_prop(alice.id, "FOLLOWS", bob.id, "weight")
+      .edge_prop(alice.id, "FOLLOWS", bob.id, "weight")
       .unwrap();
     assert_eq!(weight, Some(PropValue::F64(0.9)));
 
-    let since = ray
-      .get_edge_prop(alice.id, "FOLLOWS", bob.id, "since")
-      .unwrap();
+    let since = ray.edge_prop(alice.id, "FOLLOWS", bob.id, "since").unwrap();
     assert_eq!(since, Some(PropValue::String("2025".into())));
 
     ray.close().unwrap();
@@ -4355,10 +4351,10 @@ mod tests {
 
     // Verify properties
     assert_eq!(
-      ray.get_prop(user.id, "name"),
+      ray.prop(user.id, "name"),
       Some(PropValue::String("Alice".into()))
     );
-    assert_eq!(ray.get_prop(user.id, "age"), Some(PropValue::I64(30)));
+    assert_eq!(ray.prop(user.id, "age"), Some(PropValue::I64(30)));
 
     ray.close().unwrap();
   }
@@ -4395,14 +4391,12 @@ mod tests {
 
     assert_eq!(
       ray
-        .get_edge_prop(alice.id, "FOLLOWS", bob.id, "weight")
+        .edge_prop(alice.id, "FOLLOWS", bob.id, "weight")
         .unwrap(),
       Some(PropValue::F64(0.75))
     );
     assert_eq!(
-      ray
-        .get_edge_prop(alice.id, "FOLLOWS", bob.id, "since")
-        .unwrap(),
+      ray.edge_prop(alice.id, "FOLLOWS", bob.id, "since").unwrap(),
       Some(PropValue::String("2024".into()))
     );
 
@@ -4434,13 +4428,11 @@ mod tests {
       .unwrap();
 
     let weight = ray
-      .get_edge_prop(alice.id, "FOLLOWS", bob.id, "weight")
+      .edge_prop(alice.id, "FOLLOWS", bob.id, "weight")
       .unwrap();
     assert_eq!(weight, Some(PropValue::F64(0.33)));
 
-    let since = ray
-      .get_edge_prop(alice.id, "FOLLOWS", bob.id, "since")
-      .unwrap();
+    let since = ray.edge_prop(alice.id, "FOLLOWS", bob.id, "since").unwrap();
     assert_eq!(since, Some(PropValue::String("2023".into())));
 
     ray.close().unwrap();
@@ -4484,7 +4476,7 @@ mod tests {
 
     // Verify results
     assert_eq!(
-      ray.get_prop(alice.id, "name"),
+      ray.prop(alice.id, "name"),
       Some(PropValue::String("Alice".into()))
     );
     assert!(ray.get("User", "charlie").unwrap().is_some());
@@ -4581,10 +4573,10 @@ mod tests {
 
     // Verify properties
     assert_eq!(
-      ray.get_prop(alice.id, "name"),
+      ray.prop(alice.id, "name"),
       Some(PropValue::String("Alice".into()))
     );
-    assert_eq!(ray.get_prop(alice.id, "age"), Some(PropValue::I64(30)));
+    assert_eq!(ray.prop(alice.id, "age"), Some(PropValue::I64(30)));
 
     ray.close().unwrap();
   }
@@ -4634,7 +4626,7 @@ mod tests {
         let existing = ctx.get("User", "alice")?;
         assert!(existing.is_some());
 
-        let name = ctx.get_prop(alice.id, "name")?;
+        let name = ctx.prop(alice.id, "name")?;
         assert!(ctx.exists(alice.id));
 
         // Create new node
@@ -4732,7 +4724,7 @@ mod tests {
 
     assert!(ray.has_edge(alice_id, "FOLLOWS", bob_id).unwrap());
     assert_eq!(
-      ray.get_prop(alice_id, "name"),
+      ray.prop(alice_id, "name"),
       Some(PropValue::String("Alice".into()))
     );
 
@@ -4779,13 +4771,11 @@ mod tests {
 
     // Verify edge properties
     let weight = ray
-      .get_edge_prop(alice.id, "FOLLOWS", bob.id, "weight")
+      .edge_prop(alice.id, "FOLLOWS", bob.id, "weight")
       .unwrap();
     assert_eq!(weight, Some(PropValue::F64(0.8)));
 
-    let since = ray
-      .get_edge_prop(alice.id, "FOLLOWS", bob.id, "since")
-      .unwrap();
+    let since = ray.edge_prop(alice.id, "FOLLOWS", bob.id, "since").unwrap();
     assert_eq!(since, Some(PropValue::String("2024".into())));
 
     ray.close().unwrap();
@@ -4811,7 +4801,7 @@ mod tests {
 
     // Get edge property
     let weight = ray
-      .get_edge_prop(alice.id, "FOLLOWS", bob.id, "weight")
+      .edge_prop(alice.id, "FOLLOWS", bob.id, "weight")
       .unwrap();
     assert_eq!(weight, Some(PropValue::F64(0.5)));
 
@@ -4820,7 +4810,7 @@ mod tests {
       .set_edge_prop(alice.id, "FOLLOWS", bob.id, "weight", PropValue::F64(0.9))
       .unwrap();
     let new_weight = ray
-      .get_edge_prop(alice.id, "FOLLOWS", bob.id, "weight")
+      .edge_prop(alice.id, "FOLLOWS", bob.id, "weight")
       .unwrap();
     assert_eq!(new_weight, Some(PropValue::F64(0.9)));
 
@@ -4847,13 +4837,11 @@ mod tests {
       .unwrap();
 
     let weight = ray
-      .get_edge_prop(alice.id, "FOLLOWS", bob.id, "weight")
+      .edge_prop(alice.id, "FOLLOWS", bob.id, "weight")
       .unwrap();
     assert_eq!(weight, Some(PropValue::F64(0.6)));
 
-    let since = ray
-      .get_edge_prop(alice.id, "FOLLOWS", bob.id, "since")
-      .unwrap();
+    let since = ray.edge_prop(alice.id, "FOLLOWS", bob.id, "since").unwrap();
     assert_eq!(since, Some(PropValue::String("2024".into())));
 
     ray.close().unwrap();
@@ -4878,7 +4866,7 @@ mod tests {
       .unwrap();
 
     // Get all properties
-    let all_props = ray.get_edge_props(alice.id, "FOLLOWS", bob.id).unwrap();
+    let all_props = ray.edge_props(alice.id, "FOLLOWS", bob.id).unwrap();
     assert!(all_props.is_some());
 
     let all_props = all_props.unwrap();
@@ -4909,7 +4897,7 @@ mod tests {
 
     // Verify property exists
     let weight = ray
-      .get_edge_prop(alice.id, "FOLLOWS", bob.id, "weight")
+      .edge_prop(alice.id, "FOLLOWS", bob.id, "weight")
       .unwrap();
     assert_eq!(weight, Some(PropValue::F64(0.5)));
 
@@ -4920,7 +4908,7 @@ mod tests {
 
     // Verify property is gone
     let weight = ray
-      .get_edge_prop(alice.id, "FOLLOWS", bob.id, "weight")
+      .edge_prop(alice.id, "FOLLOWS", bob.id, "weight")
       .unwrap();
     assert_eq!(weight, None);
 
@@ -4944,11 +4932,11 @@ mod tests {
       .ok();
 
     // Edge doesn't exist, so getting props should return None
-    let _props = ray.get_edge_props(alice.id, "FOLLOWS", bob.id).unwrap();
+    let _props = ray.edge_props(alice.id, "FOLLOWS", bob.id).unwrap();
     // The edge was implicitly created when we set the prop, so it exists now
     // Let's test with a truly nonexistent edge
     let charlie = ray.create_node("User", "charlie", HashMap::new()).unwrap();
-    let props2 = ray.get_edge_props(alice.id, "FOLLOWS", charlie.id).unwrap();
+    let props2 = ray.edge_props(alice.id, "FOLLOWS", charlie.id).unwrap();
     assert!(props2.is_none());
 
     ray.close().unwrap();
@@ -4978,13 +4966,11 @@ mod tests {
 
     // Verify properties were set
     let weight = ray
-      .get_edge_prop(alice.id, "FOLLOWS", bob.id, "weight")
+      .edge_prop(alice.id, "FOLLOWS", bob.id, "weight")
       .unwrap();
     assert_eq!(weight, Some(PropValue::F64(0.9)));
 
-    let since = ray
-      .get_edge_prop(alice.id, "FOLLOWS", bob.id, "since")
-      .unwrap();
+    let since = ray.edge_prop(alice.id, "FOLLOWS", bob.id, "since").unwrap();
     assert_eq!(since, Some(PropValue::String("2024".into())));
 
     // Update with unset
@@ -4998,13 +4984,11 @@ mod tests {
 
     // Verify update and unset
     let weight = ray
-      .get_edge_prop(alice.id, "FOLLOWS", bob.id, "weight")
+      .edge_prop(alice.id, "FOLLOWS", bob.id, "weight")
       .unwrap();
     assert_eq!(weight, Some(PropValue::F64(0.5)));
 
-    let since = ray
-      .get_edge_prop(alice.id, "FOLLOWS", bob.id, "since")
-      .unwrap();
+    let since = ray.edge_prop(alice.id, "FOLLOWS", bob.id, "since").unwrap();
     assert_eq!(since, None);
 
     ray.close().unwrap();
@@ -5037,7 +5021,7 @@ mod tests {
 
     // Verify
     let all_props = ray
-      .get_edge_props(alice.id, "FOLLOWS", bob.id)
+      .edge_props(alice.id, "FOLLOWS", bob.id)
       .unwrap()
       .unwrap();
     assert_eq!(all_props.get("weight"), Some(&PropValue::F64(0.8)));
@@ -5089,9 +5073,7 @@ mod tests {
       .execute()
       .unwrap();
 
-    let since = ray
-      .get_edge_prop(alice.id, "FOLLOWS", bob.id, "since")
-      .unwrap();
+    let since = ray.edge_prop(alice.id, "FOLLOWS", bob.id, "since").unwrap();
     assert_eq!(since, Some(PropValue::I64(2020)));
 
     ray
@@ -5102,12 +5084,10 @@ mod tests {
       .execute()
       .unwrap();
 
-    let since = ray
-      .get_edge_prop(alice.id, "FOLLOWS", bob.id, "since")
-      .unwrap();
+    let since = ray.edge_prop(alice.id, "FOLLOWS", bob.id, "since").unwrap();
     assert_eq!(since, None);
     let weight = ray
-      .get_edge_prop(alice.id, "FOLLOWS", bob.id, "weight")
+      .edge_prop(alice.id, "FOLLOWS", bob.id, "weight")
       .unwrap();
     assert_eq!(weight, Some(PropValue::F64(0.5)));
 
@@ -5140,10 +5120,10 @@ mod tests {
     assert_eq!(alice.node_type.as_ref(), "User");
 
     // Verify properties were set
-    let name = ray.get_prop(alice.id, "name");
+    let name = ray.prop(alice.id, "name");
     assert_eq!(name, Some(PropValue::String("Alice".into())));
 
-    let age = ray.get_prop(alice.id, "age");
+    let age = ray.prop(alice.id, "age");
     assert_eq!(age, Some(PropValue::I64(30)));
 
     ray.close().unwrap();
@@ -5173,7 +5153,7 @@ mod tests {
     assert!(bob.is_some());
 
     let bob = bob.unwrap();
-    let name = ray.get_prop(bob.id, "name");
+    let name = ray.prop(bob.id, "name");
     assert_eq!(name, Some(PropValue::String("Bob".into())));
 
     ray.close().unwrap();
@@ -5348,10 +5328,10 @@ mod tests {
       .unwrap();
 
     // Verify updates
-    let name = ray.get_prop(alice.id, "name");
+    let name = ray.prop(alice.id, "name");
     assert_eq!(name, Some(PropValue::String("Alice Updated".into())));
 
-    let age = ray.get_prop(alice.id, "age");
+    let age = ray.prop(alice.id, "age");
     assert_eq!(age, Some(PropValue::I64(31)));
 
     ray.close().unwrap();
@@ -5380,10 +5360,10 @@ mod tests {
 
     // Verify updates
     let bob = ray.get("User", "bob").unwrap().unwrap();
-    let name = ray.get_prop(bob.id, "name");
+    let name = ray.prop(bob.id, "name");
     assert_eq!(name, Some(PropValue::String("Bob Updated".into())));
 
-    let age = ray.get_prop(bob.id, "age");
+    let age = ray.prop(bob.id, "age");
     assert_eq!(age, Some(PropValue::I64(25)));
 
     ray.close().unwrap();
@@ -5410,7 +5390,7 @@ mod tests {
       .unwrap();
 
     // Verify updates
-    let name = ray.get_prop(charlie.id, "name");
+    let name = ray.prop(charlie.id, "name");
     assert_eq!(name, Some(PropValue::String("Charlie Updated".into())));
 
     ray.close().unwrap();
@@ -5434,9 +5414,9 @@ mod tests {
 
     assert!(ray.exists(42));
 
-    let name = ray.get_prop(42, "name");
+    let name = ray.prop(42, "name");
     assert_eq!(name, Some(PropValue::String("Alice".into())));
-    let age = ray.get_prop(42, "age");
+    let age = ray.prop(42, "age");
     assert_eq!(age, Some(PropValue::I64(30)));
 
     // Update same ID
@@ -5448,9 +5428,9 @@ mod tests {
       .execute()
       .unwrap();
 
-    let name = ray.get_prop(42, "name");
+    let name = ray.prop(42, "name");
     assert_eq!(name, None);
-    let age = ray.get_prop(42, "age");
+    let age = ray.prop(42, "age");
     assert_eq!(age, Some(PropValue::I64(31)));
 
     ray.close().unwrap();
@@ -5470,7 +5450,7 @@ mod tests {
     let dave = ray.create_node("User", "dave", props).unwrap();
 
     // Verify properties exist
-    assert!(ray.get_prop(dave.id, "age").is_some());
+    assert!(ray.prop(dave.id, "age").is_some());
 
     // Update with unset
     ray
@@ -5482,10 +5462,10 @@ mod tests {
       .unwrap();
 
     // Verify name updated and age removed
-    let name = ray.get_prop(dave.id, "name");
+    let name = ray.prop(dave.id, "name");
     assert_eq!(name, Some(PropValue::String("Dave Updated".into())));
 
-    let age = ray.get_prop(dave.id, "age");
+    let age = ray.prop(dave.id, "age");
     assert_eq!(age, None);
 
     ray.close().unwrap();
@@ -5514,10 +5494,10 @@ mod tests {
       .unwrap();
 
     // Verify all properties set
-    let name = ray.get_prop(eve.id, "name");
+    let name = ray.prop(eve.id, "name");
     assert_eq!(name, Some(PropValue::String("Eve".into())));
 
-    let age = ray.get_prop(eve.id, "age");
+    let age = ray.prop(eve.id, "age");
     assert_eq!(age, Some(PropValue::I64(28)));
 
     ray.close().unwrap();
@@ -5557,7 +5537,7 @@ mod tests {
     ray.update(&frank).unwrap().execute().unwrap();
 
     // Verify nothing changed
-    let name = ray.get_prop(frank.id, "name");
+    let name = ray.prop(frank.id, "name");
     assert_eq!(name, Some(PropValue::String("Frank".into())));
 
     ray.close().unwrap();

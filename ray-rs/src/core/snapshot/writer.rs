@@ -374,15 +374,13 @@ struct SnapshotBuildState {
   node_key_strings: Vec<StringId>,
   out_csr: CSRData,
   in_csr: CSRData,
-  key_index: KeyIndex,
+  key_index: KeyIndexData,
   node_label_offsets: Vec<u32>,
   node_label_ids: Vec<u32>,
   has_properties: bool,
 }
 
-fn build_node_id_maps(
-  nodes: &[NodeData],
-) -> (Vec<NodeId>, HashMap<NodeId, PhysNode>, NodeId) {
+fn build_node_id_maps(nodes: &[NodeData]) -> (Vec<NodeId>, HashMap<NodeId, PhysNode>, NodeId) {
   let phys_to_node_id: Vec<NodeId> = nodes.iter().map(|n| n.node_id).collect();
   let mut node_id_to_phys: HashMap<NodeId, PhysNode> = HashMap::new();
   let mut max_node_id: NodeId = 0;
@@ -414,9 +412,13 @@ fn validate_edge_nodes(
   Ok(())
 }
 
-fn intern_name_table<F>(count: usize, mut lookup: F, string_table: &mut StringTable) -> Vec<StringId>
+fn intern_name_table<'a, F>(
+  count: usize,
+  mut lookup: F,
+  string_table: &mut StringTable,
+) -> Vec<StringId>
 where
-  F: FnMut(usize) -> Option<&str>,
+  F: FnMut(usize) -> Option<&'a str>,
 {
   let mut ids: Vec<StringId> = vec![0];
   for i in 1..=count {
@@ -489,15 +491,21 @@ fn prepare_snapshot_state(
   validate_edge_nodes(edges, &node_id_to_phys)?;
 
   let mut string_table = StringTable::new();
-  let label_string_ids = intern_name_table(labels.len(), |i| {
-    labels.get(&(i as LabelId)).map(|s| s.as_str())
-  }, &mut string_table);
-  let etype_string_ids = intern_name_table(etypes.len(), |i| {
-    etypes.get(&(i as ETypeId)).map(|s| s.as_str())
-  }, &mut string_table);
-  let propkey_string_ids = intern_name_table(propkeys.len(), |i| {
-    propkeys.get(&(i as PropKeyId)).map(|s| s.as_str())
-  }, &mut string_table);
+  let label_string_ids = intern_name_table(
+    labels.len(),
+    |i| labels.get(&(i as LabelId)).map(|s| s.as_str()),
+    &mut string_table,
+  );
+  let etype_string_ids = intern_name_table(
+    etypes.len(),
+    |i| etypes.get(&(i as ETypeId)).map(|s| s.as_str()),
+    &mut string_table,
+  );
+  let propkey_string_ids = intern_name_table(
+    propkeys.len(),
+    |i| propkeys.get(&(i as PropKeyId)).map(|s| s.as_str()),
+    &mut string_table,
+  );
 
   let node_key_strings = build_node_key_strings(nodes, &mut string_table);
 
@@ -656,9 +664,18 @@ fn add_string_id_sections(
   propkey_string_ids: &[StringId],
   node_key_strings: &[StringId],
 ) {
-  add_section(SectionId::LabelStringIds, encode_u32_slice(label_string_ids));
-  add_section(SectionId::EtypeStringIds, encode_u32_slice(etype_string_ids));
-  add_section(SectionId::PropkeyStringIds, encode_u32_slice(propkey_string_ids));
+  add_section(
+    SectionId::LabelStringIds,
+    encode_u32_slice(label_string_ids),
+  );
+  add_section(
+    SectionId::EtypeStringIds,
+    encode_u32_slice(etype_string_ids),
+  );
+  add_section(
+    SectionId::PropkeyStringIds,
+    encode_u32_slice(propkey_string_ids),
+  );
   add_section(SectionId::NodeKeyString, encode_u32_slice(node_key_strings));
 }
 
@@ -667,13 +684,16 @@ fn add_node_label_sections(
   node_label_offsets: &[u32],
   node_label_ids: &[u32],
 ) {
-  add_section(SectionId::NodeLabelOffsets, encode_u32_slice(node_label_offsets));
+  add_section(
+    SectionId::NodeLabelOffsets,
+    encode_u32_slice(node_label_offsets),
+  );
   add_section(SectionId::NodeLabelIds, encode_u32_slice(node_label_ids));
 }
 
 fn add_key_index_sections(
   add_section: &mut impl FnMut(SectionId, Vec<u8>),
-  key_index: &KeyIndex,
+  key_index: &KeyIndexData,
 ) {
   let mut data = vec![0u8; key_index.entries.len() * KEY_INDEX_ENTRY_SIZE];
   for (i, entry) in key_index.entries.iter().enumerate() {
@@ -710,7 +730,10 @@ fn add_node_prop_sections(
   }
   node_prop_offsets[num_nodes] = node_prop_keys.len() as u32;
 
-  add_section(SectionId::NodePropOffsets, encode_u32_slice(&node_prop_offsets));
+  add_section(
+    SectionId::NodePropOffsets,
+    encode_u32_slice(&node_prop_offsets),
+  );
   add_section(SectionId::NodePropKeys, encode_u32_slice(&node_prop_keys));
 
   let mut vals_data = vec![0u8; node_prop_vals.len() * PROP_VALUE_DISK_SIZE];
@@ -722,56 +745,68 @@ fn add_node_prop_sections(
   add_section(SectionId::NodePropVals, vals_data);
 }
 
-fn add_edge_prop_sections(
-  add_section: &mut impl FnMut(SectionId, Vec<u8>),
-  edges: &[EdgeData],
-  node_id_to_phys: &HashMap<NodeId, PhysNode>,
-  out_csr: &CSRData,
-  string_table: &StringTable,
-  vector_table: &mut VectorTable,
+struct EdgePropSectionArgs<'a> {
+  edges: &'a [EdgeData],
+  node_id_to_phys: &'a HashMap<NodeId, PhysNode>,
+  out_csr: &'a CSRData,
+  string_table: &'a StringTable,
+  vector_table: &'a mut VectorTable,
   num_nodes: usize,
   num_edges: usize,
+}
+
+fn add_edge_prop_sections(
+  add_section: &mut impl FnMut(SectionId, Vec<u8>),
+  args: EdgePropSectionArgs<'_>,
 ) {
   let mut edge_prop_map: HashMap<(PhysNode, ETypeId, PhysNode), &HashMap<PropKeyId, PropValue>> =
     HashMap::new();
-  for edge in edges {
+  for edge in args.edges {
     if !edge.props.is_empty() {
-      if let (Some(&src_phys), Some(&dst_phys)) =
-        (node_id_to_phys.get(&edge.src), node_id_to_phys.get(&edge.dst))
-      {
+      if let (Some(&src_phys), Some(&dst_phys)) = (
+        args.node_id_to_phys.get(&edge.src),
+        args.node_id_to_phys.get(&edge.dst),
+      ) {
         edge_prop_map.insert((src_phys, edge.etype, dst_phys), &edge.props);
       }
     }
   }
 
-  let mut edge_prop_offsets = vec![0u32; num_edges + 1];
+  let mut edge_prop_offsets = vec![0u32; args.num_edges + 1];
   let mut edge_prop_keys: Vec<u32> = Vec::new();
   let mut edge_prop_vals: Vec<(u8, u64)> = Vec::new();
 
   let mut edge_idx = 0usize;
-  for src_phys in 0..num_nodes {
-    let start = out_csr.offsets[src_phys] as usize;
-    let end = out_csr.offsets[src_phys + 1] as usize;
+  for src_phys in 0..args.num_nodes {
+    let start = args.out_csr.offsets[src_phys] as usize;
+    let end = args.out_csr.offsets[src_phys + 1] as usize;
 
     for i in start..end {
       edge_prop_offsets[edge_idx] = edge_prop_keys.len() as u32;
-      let dst_phys = out_csr.dst[i];
-      let etype = out_csr.etype[i];
+      let dst_phys = args.out_csr.dst[i];
+      let etype = args.out_csr.etype[i];
 
       if let Some(props) = edge_prop_map.get(&(src_phys as PhysNode, etype, dst_phys)) {
         let mut sorted_props: Vec<_> = props.iter().collect();
         sorted_props.sort_by_key(|(k, _)| *k);
         for (&key_id, value) in sorted_props {
           edge_prop_keys.push(key_id);
-          edge_prop_vals.push(encode_prop_value(value, string_table, vector_table));
+          edge_prop_vals.push(encode_prop_value(
+            value,
+            args.string_table,
+            args.vector_table,
+          ));
         }
       }
       edge_idx += 1;
     }
   }
-  edge_prop_offsets[num_edges] = edge_prop_keys.len() as u32;
+  edge_prop_offsets[args.num_edges] = edge_prop_keys.len() as u32;
 
-  add_section(SectionId::EdgePropOffsets, encode_u32_slice(&edge_prop_offsets));
+  add_section(
+    SectionId::EdgePropOffsets,
+    encode_u32_slice(&edge_prop_offsets),
+  );
   add_section(SectionId::EdgePropKeys, encode_u32_slice(&edge_prop_keys));
 
   let mut vals_data = vec![0u8; edge_prop_vals.len() * PROP_VALUE_DISK_SIZE];
@@ -858,7 +893,11 @@ pub fn build_snapshot_to_memory(input: SnapshotBuildInput) -> Result<Vec<u8>> {
     &state.propkey_string_ids,
     &state.node_key_strings,
   );
-  add_node_label_sections(&mut add_section, &state.node_label_offsets, &state.node_label_ids);
+  add_node_label_sections(
+    &mut add_section,
+    &state.node_label_offsets,
+    &state.node_label_ids,
+  );
   add_key_index_sections(&mut add_section, &state.key_index);
 
   // Node/edge properties (including vectors)
@@ -871,13 +910,15 @@ pub fn build_snapshot_to_memory(input: SnapshotBuildInput) -> Result<Vec<u8>> {
   );
   add_edge_prop_sections(
     &mut add_section,
-    &edges,
-    &state.node_id_to_phys,
-    &state.out_csr,
-    &state.string_table,
-    &mut vector_table,
-    num_nodes,
-    num_edges,
+    EdgePropSectionArgs {
+      edges: &edges,
+      node_id_to_phys: &state.node_id_to_phys,
+      out_csr: &state.out_csr,
+      string_table: &state.string_table,
+      vector_table: &mut vector_table,
+      num_nodes,
+      num_edges,
+    },
   );
 
   let has_vectors = add_vector_sections(&mut add_section, vector_table);

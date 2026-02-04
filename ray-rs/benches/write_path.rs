@@ -29,7 +29,11 @@ enum LockMode {
   Batched,
 }
 
-fn create_write_schema(group_commit: bool) -> KiteOptions {
+fn create_write_schema(
+  group_commit: bool,
+  wal_mb: Option<usize>,
+  checkpoint_threshold: Option<f64>,
+) -> KiteOptions {
   let user = NodeDef::new("User", "user:").prop(PropDef::string("name"));
 
   let mut options = KiteOptions::new()
@@ -38,15 +42,22 @@ fn create_write_schema(group_commit: bool) -> KiteOptions {
     .group_commit_enabled(group_commit)
     .group_commit_window_ms(2);
 
-  if let Ok(wal_mb) = env::var("KITE_BENCH_WAL_MB") {
-    if let Ok(mb) = wal_mb.parse::<usize>() {
-      options = options.wal_size_mb(mb);
-    }
+  let wal_mb = wal_mb.or_else(|| {
+    env::var("KITE_BENCH_WAL_MB")
+      .ok()
+      .and_then(|value| value.parse::<usize>().ok())
+  });
+  let checkpoint_threshold = checkpoint_threshold.or_else(|| {
+    env::var("KITE_BENCH_CHECKPOINT_THRESHOLD")
+      .ok()
+      .and_then(|value| value.parse::<f64>().ok())
+  });
+
+  if let Some(mb) = wal_mb {
+    options = options.wal_size_mb(mb);
   }
-  if let Ok(threshold) = env::var("KITE_BENCH_CHECKPOINT_THRESHOLD") {
-    if let Ok(value) = threshold.parse::<f64>() {
-      options = options.checkpoint_threshold(value);
-    }
+  if let Some(value) = checkpoint_threshold {
+    options = options.checkpoint_threshold(value);
   }
 
   options
@@ -139,8 +150,11 @@ fn bench_write_concurrent_variant(
         bencher.iter_batched(
           || {
             let temp_dir = tempdir().unwrap();
-            let kite =
-              Kite::open(temp_db_path(&temp_dir), create_write_schema(group_commit)).unwrap();
+            let kite = Kite::open(
+              temp_db_path(&temp_dir),
+              create_write_schema(group_commit, None, None),
+            )
+            .unwrap();
             let kite = Arc::new(parking_lot::RwLock::new(kite));
             (temp_dir, kite)
           },
@@ -220,8 +234,11 @@ fn bench_write_single(c: &mut Criterion) {
           bencher.iter_batched(
             || {
               let temp_dir = tempdir().unwrap();
-              let kite =
-                Kite::open(temp_db_path(&temp_dir), create_write_schema(group_commit)).unwrap();
+              let kite = Kite::open(
+                temp_db_path(&temp_dir),
+                create_write_schema(group_commit, None, None),
+              )
+              .unwrap();
               (temp_dir, kite)
             },
             |(_temp_dir, mut kite)| {
@@ -260,8 +277,11 @@ fn bench_write_batch_tx(c: &mut Criterion) {
             bencher.iter_batched(
               || {
                 let temp_dir = tempdir().unwrap();
-                let kite =
-                  Kite::open(temp_db_path(&temp_dir), create_write_schema(group_commit)).unwrap();
+                let kite = Kite::open(
+                  temp_db_path(&temp_dir),
+                  create_write_schema(group_commit, None, None),
+                )
+                .unwrap();
                 (temp_dir, kite)
               },
               |(_temp_dir, mut kite)| {
@@ -290,6 +310,60 @@ fn bench_write_batch_tx(c: &mut Criterion) {
   group.finish();
 }
 
+fn bench_write_batch_tx_wal_sweep(c: &mut Criterion) {
+  let mut group = c.benchmark_group("write_batch_tx_wal_sweep");
+  group.sample_size(5);
+
+  let total_ops = 5_000usize;
+  let batch_size = 100usize;
+  let wal_sizes = [4usize, 16, 64, 256];
+  let thresholds = [0.5_f64, 0.8_f64, 0.95_f64];
+
+  for &wal_mb in wal_sizes.iter() {
+    for &threshold in thresholds.iter() {
+      let bench_id = format!("wal{wal_mb}_thr{threshold:.2}");
+      group.throughput(Throughput::Elements(total_ops as u64));
+      group.bench_with_input(
+        BenchmarkId::new(bench_id, total_ops),
+        &total_ops,
+        move |bencher, &total_ops| {
+          bencher.iter_batched(
+            || {
+              let temp_dir = tempdir().unwrap();
+              let kite = Kite::open(
+                temp_db_path(&temp_dir),
+                create_write_schema(false, Some(wal_mb), Some(threshold)),
+              )
+              .unwrap();
+              (temp_dir, kite)
+            },
+            |(_temp_dir, mut kite)| {
+              let mut start = 0usize;
+              while start < total_ops {
+                let count = (total_ops - start).min(batch_size);
+                create_users_batched_with_retry(&mut kite, start, count).unwrap();
+                start += count;
+              }
+              #[cfg(feature = "bench-profile")]
+              maybe_log_profile(
+                &kite,
+                &format!(
+                  "wal_sweep total={total_ops} batch_size={batch_size} wal_mb={wal_mb} thr={threshold}"
+                ),
+              );
+              kite.close().unwrap();
+              black_box(());
+            },
+            BatchSize::SmallInput,
+          );
+        },
+      );
+    }
+  }
+
+  group.finish();
+}
+
 fn bench_write_concurrent_per_op(c: &mut Criterion) {
   bench_write_concurrent_variant(c, "write_concurrent_per_op", LockMode::PerOp, false);
   bench_write_concurrent_variant(c, "write_concurrent_per_op_gc", LockMode::PerOp, true);
@@ -304,6 +378,7 @@ criterion_group!(
   benches,
   bench_write_single,
   bench_write_batch_tx,
+  bench_write_batch_tx_wal_sweep,
   bench_write_concurrent_per_op,
   bench_write_concurrent_batched
 );

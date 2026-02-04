@@ -190,7 +190,7 @@ impl<K: Clone + Hash + Eq> IndexedMinHeap<K> {
   }
 
   /// Get the priority of a key
-  pub fn get_priority(&self, key: &K) -> Option<f64> {
+  pub fn priority(&self, key: &K) -> Option<f64> {
     self.priorities.get(key).copied()
   }
 }

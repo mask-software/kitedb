@@ -70,6 +70,6 @@ pub use version_chain::{
   PooledVersion, SoaPropertyVersions, VersionChainCounts, VersionChainManager,
 };
 pub use visibility::{
-  edge_exists, get_visible_version, get_visible_version_mut, is_visible, node_exists, EdgeLike,
+  edge_exists, is_visible, node_exists, visible_version, visible_version_mut, EdgeLike,
   VersionedRecord,
 };

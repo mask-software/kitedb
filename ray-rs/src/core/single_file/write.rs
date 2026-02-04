@@ -160,8 +160,8 @@ impl SingleFileDB {
       if let Some(node_delta) = delta.created_nodes.get(&node_id) {
         key_to_record = node_delta.key.clone();
       } else if let Some(ref snap) = *self.snapshot.read() {
-        if let Some(phys) = snap.get_phys_node(node_id) {
-          key_to_record = snap.get_node_key(phys);
+        if let Some(phys) = snap.phys_node(node_id) {
+          key_to_record = snap.node_key(phys);
         }
       }
     }
@@ -540,7 +540,7 @@ impl SingleFileDB {
 
   /// Add an edge by type name
   pub fn add_edge_by_name(&self, src: NodeId, etype_name: &str, dst: NodeId) -> Result<()> {
-    let etype = self.get_or_create_etype(etype_name);
+    let etype = self.etype_id_or_create(etype_name);
     self.add_edge(src, etype, dst)
   }
 
@@ -683,7 +683,7 @@ impl SingleFileDB {
     key_name: &str,
     value: PropValue,
   ) -> Result<()> {
-    let key_id = self.get_or_create_propkey(key_name);
+    let key_id = self.propkey_id_or_create(key_name);
     self.set_node_prop(node_id, key_id, value)
   }
 
@@ -840,7 +840,7 @@ impl SingleFileDB {
     key_name: &str,
     value: PropValue,
   ) -> Result<()> {
-    let key_id = self.get_or_create_propkey(key_name);
+    let key_id = self.propkey_id_or_create(key_name);
     self.set_edge_prop(src, etype, dst, key_id, value)
   }
 
@@ -936,7 +936,7 @@ impl SingleFileDB {
 
   /// Add a label to a node by name
   pub fn add_node_label_by_name(&self, node_id: NodeId, label_name: &str) -> Result<()> {
-    let label_id = self.get_or_create_label(label_name);
+    let label_id = self.label_id_or_create(label_name);
     self.add_node_label(node_id, label_id)
   }
 
@@ -979,7 +979,7 @@ impl SingleFileDB {
 
   /// Remove a label from a node by name
   pub fn remove_node_label_by_name(&self, node_id: NodeId, label_name: &str) -> Result<()> {
-    if let Some(label_id) = self.get_label_id(label_name) {
+    if let Some(label_id) = self.label_id(label_name) {
       self.remove_node_label(node_id, label_id)
     } else {
       Ok(()) // Label doesn't exist, nothing to remove
@@ -995,7 +995,7 @@ impl SingleFileDB {
     let (txid, tx_handle) = self.require_write_tx_handle()?;
 
     // Check if already exists
-    if let Some(id) = self.get_label_id(name) {
+    if let Some(id) = self.label_id(name) {
       return Ok(id);
     }
 
@@ -1028,7 +1028,7 @@ impl SingleFileDB {
     let (txid, tx_handle) = self.require_write_tx_handle()?;
 
     // Check if already exists
-    if let Some(id) = self.get_etype_id(name) {
+    if let Some(id) = self.etype_id(name) {
       return Ok(id);
     }
 
@@ -1061,7 +1061,7 @@ impl SingleFileDB {
     let (txid, tx_handle) = self.require_write_tx_handle()?;
 
     // Check if already exists
-    if let Some(id) = self.get_propkey_id(name) {
+    if let Some(id) = self.propkey_id(name) {
       return Ok(id);
     }
 

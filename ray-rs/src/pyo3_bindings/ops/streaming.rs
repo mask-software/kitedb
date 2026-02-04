@@ -101,11 +101,8 @@ pub fn stream_edges_with_props_single(
     .collect()
 }
 
-pub fn get_nodes_page_single(
-  db: &RustSingleFileDB,
-  options: streaming::PaginationOptions,
-) -> NodePage {
-  let page = streaming::get_nodes_page_single(db, options);
+pub fn nodes_page_single(db: &RustSingleFileDB, options: streaming::PaginationOptions) -> NodePage {
+  let page = streaming::nodes_page_single(db, options);
   NodePage {
     items: page.items.into_iter().map(|id| id as i64).collect(),
     next_cursor: page.next_cursor,
@@ -114,11 +111,8 @@ pub fn get_nodes_page_single(
   }
 }
 
-pub fn get_edges_page_single(
-  db: &RustSingleFileDB,
-  options: streaming::PaginationOptions,
-) -> EdgePage {
-  let page = streaming::get_edges_page_single(db, options);
+pub fn edges_page_single(db: &RustSingleFileDB, options: streaming::PaginationOptions) -> EdgePage {
+  let page = streaming::edges_page_single(db, options);
   EdgePage {
     items: page
       .items

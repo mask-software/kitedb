@@ -333,7 +333,7 @@ pub fn run_compaction_if_needed(
 }
 
 /// Get compaction statistics
-pub fn get_compaction_stats(manifest: &VectorManifest) -> CompactionStats {
+pub fn compaction_stats(manifest: &VectorManifest) -> CompactionStats {
   let mut fragments_needing_compaction = 0;
   let mut potential_space_reclaim = 0;
   let mut total_deleted_vectors = 0;
@@ -451,7 +451,7 @@ mod tests {
   #[test]
   fn test_compaction_stats() {
     let manifest = create_test_manifest(4);
-    let stats = get_compaction_stats(&manifest);
+    let stats = compaction_stats(&manifest);
 
     assert_eq!(stats.fragments_needing_compaction, 0);
     assert_eq!(stats.total_deleted_vectors, 0);

@@ -79,13 +79,13 @@ impl<T: Clone> SoaPropertyVersions<T> {
   }
 
   /// Get the head version for a key
-  pub fn get_head(&self, key: u64) -> Option<PooledVersion<&T>> {
+  pub fn head(&self, key: u64) -> Option<PooledVersion<&T>> {
     let idx = *self.heads.get(&key)?;
-    self.get_at(idx)
+    self.at(idx)
   }
 
   /// Get version at a specific index
-  pub fn get_at(&self, idx: u32) -> Option<PooledVersion<&T>> {
+  pub fn at(&self, idx: u32) -> Option<PooledVersion<&T>> {
     if idx == NULL_IDX || idx as usize >= self.data.len() {
       return None;
     }
@@ -215,7 +215,7 @@ impl<T: Clone> SoaPropertyVersions<T> {
   }
 
   /// Get memory usage estimate in bytes
-  pub fn get_memory_usage(&self) -> usize {
+  pub fn memory_usage(&self) -> usize {
     let data_size = std::mem::size_of::<T>() * self.data.capacity();
     let meta_size = (std::mem::size_of::<TxId>()
       + std::mem::size_of::<Timestamp>()
@@ -385,7 +385,7 @@ impl VersionChainManager {
   }
 
   /// Get the latest version for a node
-  pub fn get_node_version(&self, node_id: NodeId) -> Option<&VersionedRecord<NodeVersionData>> {
+  pub fn node_version(&self, node_id: NodeId) -> Option<&VersionedRecord<NodeVersionData>> {
     self.node_versions.get(&node_id).map(|b| b.as_ref())
   }
 
@@ -421,7 +421,7 @@ impl VersionChainManager {
   }
 
   /// Get the latest version for an edge
-  pub fn get_edge_version(
+  pub fn edge_version(
     &self,
     src: NodeId,
     etype: ETypeId,
@@ -463,7 +463,7 @@ impl VersionChainManager {
 
   /// Get the latest version for a node property
   /// Returns a VersionedRecord for API compatibility
-  pub fn get_node_prop_version(
+  pub fn node_prop_version(
     &self,
     node_id: NodeId,
     prop_key_id: PropKeyId,
@@ -473,7 +473,7 @@ impl VersionChainManager {
     if self.use_soa {
       self
         .soa_node_props
-        .get_head(key)
+        .head(key)
         .map(|pooled| Self::pooled_to_versioned(&self.soa_node_props, pooled))
     } else {
       self.legacy_node_props.get(&key).map(|b| {
@@ -517,7 +517,7 @@ impl VersionChainManager {
   }
 
   /// Get the latest version for an edge property
-  pub fn get_edge_prop_version(
+  pub fn edge_prop_version(
     &self,
     src: NodeId,
     etype: ETypeId,
@@ -529,7 +529,7 @@ impl VersionChainManager {
     if self.use_soa {
       self
         .soa_edge_props
-        .get_head(key)
+        .head(key)
         .map(|pooled| Self::pooled_to_versioned(&self.soa_edge_props, pooled))
     } else {
       self
@@ -570,7 +570,7 @@ impl VersionChainManager {
   }
 
   /// Get the latest version for a node label
-  pub fn get_node_label_version(
+  pub fn node_label_version(
     &self,
     node_id: NodeId,
     label_id: LabelId,
@@ -580,7 +580,7 @@ impl VersionChainManager {
     if self.use_soa {
       self
         .soa_node_labels
-        .get_head(key)
+        .head(key)
         .map(|pooled| Self::pooled_to_versioned(&self.soa_node_labels, pooled))
     } else {
       self.legacy_node_labels.get(&key).map(|b| {
@@ -678,7 +678,7 @@ impl VersionChainManager {
   ) -> VersionedRecord<Option<T>> {
     let prev = if pooled.prev_idx != NULL_IDX {
       store
-        .get_at(pooled.prev_idx)
+        .at(pooled.prev_idx)
         .map(|prev_pooled| Box::new(Self::pooled_to_versioned(store, prev_pooled)))
     } else {
       None
@@ -941,10 +941,10 @@ impl VersionChainManager {
   }
 
   /// Get memory usage estimate for SOA stores
-  pub fn get_soa_memory_usage(&self) -> (usize, usize) {
+  pub fn soa_memory_usage(&self) -> (usize, usize) {
     (
-      self.soa_node_props.get_memory_usage(),
-      self.soa_edge_props.get_memory_usage(),
+      self.soa_node_props.memory_usage(),
+      self.soa_edge_props.memory_usage(),
     )
   }
 
@@ -961,7 +961,7 @@ impl VersionChainManager {
   }
 
   /// Get counts for statistics
-  pub fn get_counts(&self) -> VersionChainCounts {
+  pub fn counts(&self) -> VersionChainCounts {
     VersionChainCounts {
       node_versions: self.node_versions.len(),
       edge_versions: self.edge_versions.len(),
@@ -1022,7 +1022,7 @@ mod tests {
 
     store.append(1, 42, 1, 10);
 
-    let head = store.get_head(1);
+    let head = store.head(1);
     assert!(head.is_some());
     let v = head.unwrap();
     assert_eq!(*v.data, 42);
@@ -1039,13 +1039,13 @@ mod tests {
     store.append(1, 20, 2, 20);
     store.append(1, 30, 3, 30);
 
-    let head = store.get_head(1).unwrap();
+    let head = store.head(1).unwrap();
     assert_eq!(*head.data, 30);
     assert_eq!(head.commit_ts, 30);
     assert_ne!(head.prev_idx, NULL_IDX);
 
     // Follow chain
-    let prev = store.get_at(head.prev_idx).unwrap();
+    let prev = store.at(head.prev_idx).unwrap();
     assert_eq!(*prev.data, 20);
   }
 
@@ -1053,7 +1053,7 @@ mod tests {
   fn test_version_chain_manager_new() {
     let mgr = VersionChainManager::new();
     assert!(mgr.is_soa_enabled());
-    let counts = mgr.get_counts();
+    let counts = mgr.counts();
     assert_eq!(counts.node_versions, 0);
     assert_eq!(counts.edge_versions, 0);
   }
@@ -1068,7 +1068,7 @@ mod tests {
     };
     mgr.append_node_version(1, data, 1, 10);
 
-    let version = mgr.get_node_version(1);
+    let version = mgr.node_version(1);
     assert!(version.is_some());
     assert_eq!(version.unwrap().data.node_id, 1);
   }
@@ -1086,7 +1086,7 @@ mod tests {
       mgr.append_node_version(1, data, i, i * 10);
     }
 
-    let version = mgr.get_node_version(1).unwrap();
+    let version = mgr.node_version(1).unwrap();
     assert_eq!(version.commit_ts, 30);
     assert!(version.prev.is_some());
     assert_eq!(version.prev.as_ref().unwrap().commit_ts, 20);
@@ -1103,7 +1103,7 @@ mod tests {
     mgr.append_node_version(1, data, 1, 10);
     mgr.delete_node_version(1, 2, 20);
 
-    let version = mgr.get_node_version(1).unwrap();
+    let version = mgr.node_version(1).unwrap();
     assert!(version.deleted);
     assert_eq!(version.commit_ts, 20);
   }
@@ -1114,7 +1114,7 @@ mod tests {
 
     mgr.append_edge_version(1, 1, 2, true, 1, 10);
 
-    let version = mgr.get_edge_version(1, 1, 2);
+    let version = mgr.edge_version(1, 1, 2);
     assert!(version.is_some());
     let v = version.unwrap();
     assert_eq!(v.data.src, 1);
@@ -1130,7 +1130,7 @@ mod tests {
     mgr.append_edge_version(1, 1, 2, true, 1, 10);
     mgr.append_edge_version(1, 1, 2, false, 2, 20);
 
-    let version = mgr.get_edge_version(1, 1, 2).unwrap();
+    let version = mgr.edge_version(1, 1, 2).unwrap();
     assert!(!version.data.added);
   }
 
@@ -1141,7 +1141,7 @@ mod tests {
 
     mgr.append_node_prop_version(1, 1, Some(std::sync::Arc::new(PropValue::I64(42))), 1, 10);
 
-    let version = mgr.get_node_prop_version(1, 1);
+    let version = mgr.node_prop_version(1, 1);
     assert!(version.is_some());
     assert_eq!(version.unwrap().data.as_deref(), Some(&PropValue::I64(42)));
   }
@@ -1153,7 +1153,7 @@ mod tests {
 
     mgr.append_node_prop_version(1, 1, Some(std::sync::Arc::new(PropValue::I64(42))), 1, 10);
 
-    let version = mgr.get_node_prop_version(1, 1);
+    let version = mgr.node_prop_version(1, 1);
     assert!(version.is_some());
     assert_eq!(version.unwrap().data.as_deref(), Some(&PropValue::I64(42)));
   }
@@ -1172,7 +1172,7 @@ mod tests {
       10,
     );
 
-    let version = mgr.get_edge_prop_version(1, 1, 2, 1);
+    let version = mgr.edge_prop_version(1, 1, 2, 1);
     assert!(version.is_some());
     assert_eq!(
       version.unwrap().data.as_deref(),
@@ -1209,7 +1209,7 @@ mod tests {
 
     mgr.clear();
 
-    let counts = mgr.get_counts();
+    let counts = mgr.counts();
     assert_eq!(counts.node_versions, 0);
     assert_eq!(counts.edge_versions, 0);
     assert_eq!(counts.node_prop_versions, 0);
@@ -1263,7 +1263,7 @@ mod tests {
       );
     }
 
-    let (node_mem, _edge_mem) = mgr.get_soa_memory_usage();
+    let (node_mem, _edge_mem) = mgr.soa_memory_usage();
     assert!(node_mem > 0);
   }
 
@@ -1286,7 +1286,7 @@ mod tests {
 
     // Verify chain is now limited
     let mut depth = 0;
-    let mut current = mgr.get_node_version(1);
+    let mut current = mgr.node_version(1);
     while let Some(v) = current {
       depth += 1;
       current = v.prev.as_deref();

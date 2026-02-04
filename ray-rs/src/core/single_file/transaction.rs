@@ -154,12 +154,12 @@ impl SingleFileDB {
       if delta.is_node_deleted(node_id) {
         return None;
       }
-      if let Some(value_opt) = delta.get_node_prop(node_id, key_id) {
+      if let Some(value_opt) = delta.node_prop(node_id, key_id) {
         return value_opt.cloned();
       }
       if let Some(ref snap) = *snapshot {
-        if let Some(phys) = snap.get_phys_node(node_id) {
-          return snap.get_node_prop(phys, key_id);
+        if let Some(phys) = snap.phys_node(node_id) {
+          return snap.node_prop(phys, key_id);
         }
       }
       None
@@ -172,15 +172,13 @@ impl SingleFileDB {
       if delta.is_edge_deleted(src, etype, dst) {
         return None;
       }
-      if let Some(value_opt) = delta.get_edge_prop(src, etype, dst, key_id) {
+      if let Some(value_opt) = delta.edge_prop(src, etype, dst, key_id) {
         return value_opt.cloned();
       }
       if let Some(ref snap) = *snapshot {
-        if let (Some(src_phys), Some(dst_phys)) =
-          (snap.get_phys_node(src), snap.get_phys_node(dst))
-        {
+        if let (Some(src_phys), Some(dst_phys)) = (snap.phys_node(src), snap.phys_node(dst)) {
           if let Some(edge_idx) = snap.find_edge_index(src_phys, etype, dst_phys) {
-            if let Some(snapshot_props) = snap.get_edge_props(edge_idx) {
+            if let Some(snapshot_props) = snap.edge_props(edge_idx) {
               return snapshot_props.get(&key_id).cloned();
             }
           }
@@ -193,7 +191,7 @@ impl SingleFileDB {
       if delta.is_node_deleted(node_id) {
         return false;
       }
-      if let Some(node_delta) = delta.get_node_delta(node_id) {
+      if let Some(node_delta) = delta.node_delta(node_id) {
         if node_delta
           .labels_deleted
           .as_ref()
@@ -210,8 +208,8 @@ impl SingleFileDB {
         }
       }
       if let Some(ref snap) = *snapshot {
-        if let Some(phys) = snap.get_phys_node(node_id) {
-          if let Some(labels) = snap.get_node_labels(phys) {
+        if let Some(phys) = snap.phys_node(node_id) {
+          if let Some(labels) = snap.node_labels(phys) {
             return labels.contains(&label_id);
           }
         }
@@ -234,7 +232,7 @@ impl SingleFileDB {
           if before_value.as_ref() == after_value.as_deref() {
             continue;
           }
-          if vc.get_node_prop_version(*node_id, *key_id).is_none() {
+          if vc.node_prop_version(*node_id, *key_id).is_none() {
             let before_shared = before_value.take().map(std::sync::Arc::new);
             vc.append_node_prop_version(*node_id, *key_id, before_shared, 0, 0);
           }
@@ -248,7 +246,7 @@ impl SingleFileDB {
           if before_value {
             continue;
           }
-          if vc.get_node_label_version(*node_id, *label_id).is_none() {
+          if vc.node_label_version(*node_id, *label_id).is_none() {
             vc.append_node_label_version(
               *node_id,
               *label_id,
@@ -267,7 +265,7 @@ impl SingleFileDB {
           if !before_value {
             continue;
           }
-          if vc.get_node_label_version(*node_id, *label_id).is_none() {
+          if vc.node_label_version(*node_id, *label_id).is_none() {
             vc.append_node_label_version(
               *node_id,
               *label_id,
@@ -288,7 +286,7 @@ impl SingleFileDB {
         if before_value.as_ref() == after_value.as_deref() {
           continue;
         }
-        if vc.get_edge_prop_version(src, etype, dst, *key_id).is_none() {
+        if vc.edge_prop_version(src, etype, dst, *key_id).is_none() {
           let before_shared = before_value.take().map(std::sync::Arc::new);
           vc.append_edge_prop_version(src, etype, dst, *key_id, before_shared, 0, 0);
         }
@@ -345,7 +343,7 @@ impl SingleFileDB {
       let commit_ts = tx_mgr
         .commit_tx(txid)
         .map_err(|e| KiteError::Internal(e.to_string()))?;
-      commit_ts_for_mvcc = Some((commit_ts, tx_mgr.get_active_count() > 0));
+      commit_ts_for_mvcc = Some((commit_ts, tx_mgr.active_count() > 0));
     }
 
     let group_commit_active = self.group_commit_enabled && self.sync_mode == SyncMode::Normal;

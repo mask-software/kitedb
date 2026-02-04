@@ -1071,7 +1071,7 @@ impl Database {
   pub fn upsert_node(&self, key: String, props: Vec<JsNodeProp>) -> Result<i64> {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
-        let node_id = match db.get_node_by_key(&key) {
+        let node_id = match db.node_by_key(&key) {
           Some(id) => id,
           None => db
             .create_node(Some(&key))
@@ -1147,7 +1147,7 @@ impl Database {
   #[napi]
   pub fn get_node_by_key(&self, key: String) -> Result<Option<i64>> {
     match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => Ok(db.get_node_by_key(&key).map(|id| id as i64)),
+      Some(DatabaseInner::SingleFile(db)) => Ok(db.node_by_key(&key).map(|id| id as i64)),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1156,7 +1156,7 @@ impl Database {
   #[napi]
   pub fn get_node_key(&self, node_id: i64) -> Result<Option<String>> {
     match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => Ok(db.get_node_key(node_id as NodeId)),
+      Some(DatabaseInner::SingleFile(db)) => Ok(db.node_key(node_id as NodeId)),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1315,7 +1315,7 @@ impl Database {
   pub fn get_out_edges(&self, node_id: i64) -> Result<Vec<JsEdge>> {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(
-        db.get_out_edges(node_id as NodeId)
+        db.out_edges(node_id as NodeId)
           .into_iter()
           .map(|(etype, dst)| JsEdge {
             etype,
@@ -1332,7 +1332,7 @@ impl Database {
   pub fn get_in_edges(&self, node_id: i64) -> Result<Vec<JsEdge>> {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(
-        db.get_in_edges(node_id as NodeId)
+        db.in_edges(node_id as NodeId)
           .into_iter()
           .map(|(etype, src)| JsEdge {
             etype,
@@ -1348,7 +1348,7 @@ impl Database {
   #[napi]
   pub fn get_out_degree(&self, node_id: i64) -> Result<i64> {
     match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => Ok(db.get_out_degree(node_id as NodeId) as i64),
+      Some(DatabaseInner::SingleFile(db)) => Ok(db.out_degree(node_id as NodeId) as i64),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1357,7 +1357,7 @@ impl Database {
   #[napi]
   pub fn get_in_degree(&self, node_id: i64) -> Result<i64> {
     match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => Ok(db.get_in_degree(node_id as NodeId) as i64),
+      Some(DatabaseInner::SingleFile(db)) => Ok(db.in_degree(node_id as NodeId) as i64),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1400,7 +1400,7 @@ impl Database {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
         let etype = db
-          .get_etype_id(&etype_name)
+          .etype_id(&etype_name)
           .ok_or_else(|| Error::from_reason(format!("Unknown edge type: {etype_name}")))?;
         Ok(
           db.list_edges(Some(etype))
@@ -1432,7 +1432,7 @@ impl Database {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
         let etype = db
-          .get_etype_id(&etype_name)
+          .etype_id(&etype_name)
           .ok_or_else(|| Error::from_reason(format!("Unknown edge type: {etype_name}")))?;
         Ok(db.count_edges_by_type(etype) as i64)
       }
@@ -1476,8 +1476,8 @@ impl Database {
               batch
                 .into_iter()
                 .map(|node_id| {
-                  let key = db.get_node_key(node_id as NodeId);
-                  let props = db.get_node_props(node_id as NodeId).unwrap_or_default();
+                  let key = db.node_key(node_id as NodeId);
+                  let props = db.node_props(node_id as NodeId).unwrap_or_default();
                   let props = props
                     .into_iter()
                     .map(|(k, v)| JsNodeProp {
@@ -1542,7 +1542,7 @@ impl Database {
                 .into_iter()
                 .map(|edge| {
                   let props = db
-                    .get_edge_props(edge.src, edge.etype, edge.dst)
+                    .edge_props(edge.src, edge.etype, edge.dst)
                     .unwrap_or_default();
                   let props = props
                     .into_iter()
@@ -1573,7 +1573,7 @@ impl Database {
     let options = options.unwrap_or_default().into_rust()?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
-        let page = streaming::get_nodes_page_single(db, options);
+        let page = streaming::nodes_page_single(db, options);
         Ok(NodePage {
           items: page.items.into_iter().map(|id| id as i64).collect(),
           next_cursor: page.next_cursor,
@@ -1591,7 +1591,7 @@ impl Database {
     let options = options.unwrap_or_default().into_rust()?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
-        let page = streaming::get_edges_page_single(db, options);
+        let page = streaming::edges_page_single(db, options);
         Ok(EdgePage {
           items: page
             .items
@@ -1658,7 +1658,7 @@ impl Database {
   pub fn get_node_prop(&self, node_id: i64, key_id: u32) -> Result<Option<JsPropValue>> {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(
-        db.get_node_prop(node_id as NodeId, key_id as PropKeyId)
+        db.node_prop(node_id as NodeId, key_id as PropKeyId)
           .map(|v| v.into()),
       ),
       None => Err(Error::from_reason("Database is closed")),
@@ -1669,17 +1669,15 @@ impl Database {
   #[napi]
   pub fn get_node_props(&self, node_id: i64) -> Result<Option<Vec<JsNodeProp>>> {
     match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => {
-        Ok(db.get_node_props(node_id as NodeId).map(|props| {
-          props
-            .into_iter()
-            .map(|(k, v)| JsNodeProp {
-              key_id: k,
-              value: v.into(),
-            })
-            .collect()
-        }))
-      }
+      Some(DatabaseInner::SingleFile(db)) => Ok(db.node_props(node_id as NodeId).map(|props| {
+        props
+          .into_iter()
+          .map(|(k, v)| JsNodeProp {
+            key_id: k,
+            value: v.into(),
+          })
+          .collect()
+      })),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1763,7 +1761,7 @@ impl Database {
   ) -> Result<Option<JsPropValue>> {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(
-        db.get_edge_prop(
+        db.edge_prop(
           src as NodeId,
           etype as ETypeId,
           dst as NodeId,
@@ -1780,7 +1778,7 @@ impl Database {
   pub fn get_edge_props(&self, src: i64, etype: u32, dst: i64) -> Result<Option<Vec<JsNodeProp>>> {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(
-        db.get_edge_props(src as NodeId, etype as ETypeId, dst as NodeId)
+        db.edge_props(src as NodeId, etype as ETypeId, dst as NodeId)
           .map(|props| {
             props
               .into_iter()
@@ -1816,7 +1814,7 @@ impl Database {
   pub fn get_node_vector(&self, node_id: i64, prop_key_id: u32) -> Result<Option<Vec<f64>>> {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(
-        db.get_node_vector(node_id as NodeId, prop_key_id as PropKeyId)
+        db.node_vector(node_id as NodeId, prop_key_id as PropKeyId)
           .map(|v| v.iter().map(|&f| f as f64).collect()),
       ),
       None => Err(Error::from_reason("Database is closed")),
@@ -1853,7 +1851,7 @@ impl Database {
   #[napi]
   pub fn get_or_create_label(&self, name: String) -> Result<u32> {
     match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => Ok(db.get_or_create_label(&name)),
+      Some(DatabaseInner::SingleFile(db)) => Ok(db.label_id_or_create(&name)),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1862,7 +1860,7 @@ impl Database {
   #[napi]
   pub fn get_label_id(&self, name: String) -> Result<Option<u32>> {
     match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => Ok(db.get_label_id(&name)),
+      Some(DatabaseInner::SingleFile(db)) => Ok(db.label_id(&name)),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1871,7 +1869,7 @@ impl Database {
   #[napi]
   pub fn get_label_name(&self, id: u32) -> Result<Option<String>> {
     match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => Ok(db.get_label_name(id)),
+      Some(DatabaseInner::SingleFile(db)) => Ok(db.label_name(id)),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1880,7 +1878,7 @@ impl Database {
   #[napi]
   pub fn get_or_create_etype(&self, name: String) -> Result<u32> {
     match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => Ok(db.get_or_create_etype(&name)),
+      Some(DatabaseInner::SingleFile(db)) => Ok(db.etype_id_or_create(&name)),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1889,7 +1887,7 @@ impl Database {
   #[napi]
   pub fn get_etype_id(&self, name: String) -> Result<Option<u32>> {
     match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => Ok(db.get_etype_id(&name)),
+      Some(DatabaseInner::SingleFile(db)) => Ok(db.etype_id(&name)),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1898,7 +1896,7 @@ impl Database {
   #[napi]
   pub fn get_etype_name(&self, id: u32) -> Result<Option<String>> {
     match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => Ok(db.get_etype_name(id)),
+      Some(DatabaseInner::SingleFile(db)) => Ok(db.etype_name(id)),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1907,7 +1905,7 @@ impl Database {
   #[napi]
   pub fn get_or_create_propkey(&self, name: String) -> Result<u32> {
     match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => Ok(db.get_or_create_propkey(&name)),
+      Some(DatabaseInner::SingleFile(db)) => Ok(db.propkey_id_or_create(&name)),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1916,7 +1914,7 @@ impl Database {
   #[napi]
   pub fn get_propkey_id(&self, name: String) -> Result<Option<u32>> {
     match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => Ok(db.get_propkey_id(&name)),
+      Some(DatabaseInner::SingleFile(db)) => Ok(db.propkey_id(&name)),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1925,7 +1923,7 @@ impl Database {
   #[napi]
   pub fn get_propkey_name(&self, id: u32) -> Result<Option<String>> {
     match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => Ok(db.get_propkey_name(id)),
+      Some(DatabaseInner::SingleFile(db)) => Ok(db.propkey_name(id)),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1991,7 +1989,7 @@ impl Database {
   #[napi]
   pub fn get_node_labels(&self, node_id: i64) -> Result<Vec<u32>> {
     match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => Ok(db.get_node_labels(node_id as NodeId)),
+      Some(DatabaseInner::SingleFile(db)) => Ok(db.node_labels(node_id as NodeId)),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -2779,7 +2777,7 @@ fn get_neighbors_from_single_file(
   let mut edges = Vec::new();
   match direction {
     TraversalDirection::Out => {
-      for (e, dst) in db.get_out_edges(node_id) {
+      for (e, dst) in db.out_edges(node_id) {
         if etype.is_none() || etype == Some(e) {
           edges.push(Edge {
             src: node_id,
@@ -2790,7 +2788,7 @@ fn get_neighbors_from_single_file(
       }
     }
     TraversalDirection::In => {
-      for (e, src) in db.get_in_edges(node_id) {
+      for (e, src) in db.in_edges(node_id) {
         if etype.is_none() || etype == Some(e) {
           edges.push(Edge {
             src,
@@ -2828,7 +2826,7 @@ fn resolve_weight_key_single_file(
 
   if let Some(ref key_name) = config.weight_key_name {
     let key_id = db
-      .get_propkey_id(key_name)
+      .propkey_id(key_name)
       .ok_or_else(|| Error::from_reason(format!("Unknown property key: {key_name}")))?;
     return Ok(Some(key_id));
   }
@@ -2867,7 +2865,7 @@ fn get_edge_weight_from_single_file(
   weight_key: Option<PropKeyId>,
 ) -> f64 {
   match weight_key {
-    Some(key_id) => prop_value_to_weight(db.get_edge_prop(src, etype, dst, key_id)),
+    Some(key_id) => prop_value_to_weight(db.edge_prop(src, etype, dst, key_id)),
     None => 1.0,
   }
 }
@@ -3019,8 +3017,8 @@ pub fn restore_backup(
 
 /// Inspect a backup without restoring it
 #[napi]
-pub fn get_backup_info(backup_path: String) -> Result<BackupResult> {
-  core_backup::get_backup_info(backup_path)
+pub fn backup_info(backup_path: String) -> Result<BackupResult> {
+  core_backup::backup_info(backup_path)
     .map(BackupResult::from)
     .map_err(|e| Error::from_reason(format!("Failed to inspect backup: {e}")))
 }

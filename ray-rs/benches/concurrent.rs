@@ -303,7 +303,7 @@ fn bench_property_read_scaling(c: &mut Criterion) {
                 for i in 0..ops_per_thread {
                   let node_id = node_ids[(thread_id * 50 + i) % node_ids.len()];
                   let ray_guard = ray.read();
-                  black_box(ray_guard.get_prop(node_id, "name"));
+                  black_box(ray_guard.prop(node_id, "name"));
                 }
               })
             })
@@ -774,7 +774,7 @@ fn bench_single_file_sequential_reads(c: &mut Criterion) {
   group.bench_function("key_lookup_1000", |bencher| {
     bencher.iter(|| {
       for i in 0..1000 {
-        black_box(db.get_node_by_key(&format!("node{i}")));
+        black_box(db.node_by_key(&format!("node{i}")));
       }
     });
   });

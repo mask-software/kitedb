@@ -117,7 +117,7 @@ pub fn kitedb(m: &Bound<'_, PyModule>) -> PyResult<()> {
   m.add_function(wrap_pyfunction!(database::health_check, m)?)?;
   m.add_function(wrap_pyfunction!(database::create_backup, m)?)?;
   m.add_function(wrap_pyfunction!(database::restore_backup, m)?)?;
-  m.add_function(wrap_pyfunction!(database::get_backup_info, m)?)?;
+  m.add_function(wrap_pyfunction!(database::backup_info, m)?)?;
   m.add_function(wrap_pyfunction!(database::create_offline_backup, m)?)?;
   m.add_function(wrap_pyfunction!(version, m)?)?;
   m.add_function(wrap_pyfunction!(vector::brute_force_search, m)?)?;

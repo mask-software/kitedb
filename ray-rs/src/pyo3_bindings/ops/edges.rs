@@ -88,7 +88,7 @@ pub fn edge_exists_single(db: &RustSingleFileDB, src: NodeId, etype: ETypeId, ds
 
 /// Get out edges on single-file database
 pub fn get_out_edges_single(db: &RustSingleFileDB, node_id: NodeId) -> Vec<Edge> {
-  db.get_out_edges(node_id)
+  db.out_edges(node_id)
     .into_iter()
     .map(|(etype, dst)| Edge {
       etype,
@@ -99,7 +99,7 @@ pub fn get_out_edges_single(db: &RustSingleFileDB, node_id: NodeId) -> Vec<Edge>
 
 /// Get in edges on single-file database
 pub fn get_in_edges_single(db: &RustSingleFileDB, node_id: NodeId) -> Vec<Edge> {
-  db.get_in_edges(node_id)
+  db.in_edges(node_id)
     .into_iter()
     .map(|(etype, src)| Edge {
       etype,
@@ -110,12 +110,12 @@ pub fn get_in_edges_single(db: &RustSingleFileDB, node_id: NodeId) -> Vec<Edge> 
 
 /// Get out degree on single-file database
 pub fn get_out_degree_single(db: &RustSingleFileDB, node_id: NodeId) -> i64 {
-  db.get_out_degree(node_id) as i64
+  db.out_degree(node_id) as i64
 }
 
 /// Get in degree on single-file database
 pub fn get_in_degree_single(db: &RustSingleFileDB, node_id: NodeId) -> i64 {
-  db.get_in_degree(node_id) as i64
+  db.in_degree(node_id) as i64
 }
 
 /// Count edges on single-file database

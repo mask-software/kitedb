@@ -126,7 +126,7 @@ macro_rules! dispatch_tx {
 /// from concurrent.futures import ThreadPoolExecutor
 ///
 /// def read_node(key):
-///     return db.get_node_by_key(key)
+///     return db.node_by_key(key)
 ///
 /// # These execute concurrently
 /// with ThreadPoolExecutor(max_workers=4) as executor:
@@ -843,8 +843,8 @@ impl PyDatabase {
   }
 
   fn get_etype_name(&self, id: u32) -> PyResult<Option<String>> {
-    dispatch_ok!(self, |db| schema::get_etype_name_single(db, id), |db| {
-      schema::get_etype_name_single(db, id)
+    dispatch_ok!(self, |db| schema::etype_name_single(db, id), |db| {
+      schema::etype_name_single(db, id)
     })
   }
 
@@ -1442,8 +1442,8 @@ impl PyDatabase {
     };
     dispatch_ok!(
       self,
-      |db| streaming_ops::get_nodes_page_single(db, opts.clone()),
-      |db| streaming_ops::get_nodes_page_single(db, opts.clone())
+      |db| streaming_ops::nodes_page_single(db, opts.clone()),
+      |db| streaming_ops::nodes_page_single(db, opts.clone())
     )
   }
 
@@ -1455,8 +1455,8 @@ impl PyDatabase {
     };
     dispatch_ok!(
       self,
-      |db| streaming_ops::get_edges_page_single(db, opts.clone()),
-      |db| streaming_ops::get_edges_page_single(db, opts.clone())
+      |db| streaming_ops::edges_page_single(db, opts.clone()),
+      |db| streaming_ops::edges_page_single(db, opts.clone())
     )
   }
 
@@ -1576,8 +1576,8 @@ pub fn restore_backup(
 }
 
 #[pyfunction]
-pub fn get_backup_info(backup_path: String) -> PyResult<BackupResult> {
-  core_backup::get_backup_info(backup_path)
+pub fn backup_info(backup_path: String) -> PyResult<BackupResult> {
+  core_backup::backup_info(backup_path)
     .map(BackupResult::from)
     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }

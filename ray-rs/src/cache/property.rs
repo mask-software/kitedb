@@ -77,14 +77,14 @@ impl PropertyCacheStats {
 ///
 /// // Cache a node property
 /// cache.set_node_prop(1, 10, Some(PropValue::I64(42)));
-/// assert_eq!(cache.get_node_prop(1, 10), Some(&Some(PropValue::I64(42))));
+/// assert_eq!(cache.node_prop(1, 10), Some(&Some(PropValue::I64(42))));
 ///
 /// // Cache miss returns None (undefined in TS)
-/// assert_eq!(cache.get_node_prop(999, 10), None);
+/// assert_eq!(cache.node_prop(999, 10), None);
 ///
 /// // Invalidate all props for a node
 /// cache.invalidate_node(1);
-/// assert_eq!(cache.get_node_prop(1, 10), None);
+/// assert_eq!(cache.node_prop(1, 10), None);
 /// ```
 pub struct PropertyCache {
   /// Node property cache: (NodeId, PropKeyId) -> PropValue or None (deleted)
@@ -127,7 +127,7 @@ impl PropertyCache {
   /// - `Some(&Some(value))` - Property exists with value
   /// - `Some(&None)` - Property was explicitly deleted/null
   /// - `None` - Not in cache (cache miss)
-  pub fn get_node_prop(
+  pub fn node_prop(
     &mut self,
     node_id: NodeId,
     prop_key_id: PropKeyId,
@@ -191,7 +191,7 @@ impl PropertyCache {
   /// - `Some(&Some(value))` - Property exists with value
   /// - `Some(&None)` - Property was explicitly deleted/null
   /// - `None` - Not in cache (cache miss)
-  pub fn get_edge_prop(
+  pub fn edge_prop(
     &mut self,
     src: NodeId,
     etype: ETypeId,
@@ -337,7 +337,7 @@ mod tests {
   #[test]
   fn test_node_prop_cache_miss() {
     let mut cache = make_cache();
-    assert_eq!(cache.get_node_prop(1, 10), None);
+    assert_eq!(cache.node_prop(1, 10), None);
     assert_eq!(cache.stats().misses, 1);
   }
 
@@ -346,7 +346,7 @@ mod tests {
     let mut cache = make_cache();
     cache.set_node_prop(1, 10, Some(PropValue::I64(42)));
 
-    let result = cache.get_node_prop(1, 10);
+    let result = cache.node_prop(1, 10);
     assert_eq!(result, Some(&Some(PropValue::I64(42))));
     assert_eq!(cache.stats().hits, 1);
     assert_eq!(cache.stats().misses, 0);
@@ -358,7 +358,7 @@ mod tests {
     // Cache a "property does not exist" result
     cache.set_node_prop(1, 10, None);
 
-    let result = cache.get_node_prop(1, 10);
+    let result = cache.node_prop(1, 10);
     assert_eq!(result, Some(&None));
     assert_eq!(cache.stats().hits, 1);
   }
@@ -369,7 +369,7 @@ mod tests {
     cache.set_node_prop(1, 10, Some(PropValue::I64(42)));
     cache.set_node_prop(1, 10, Some(PropValue::I64(100)));
 
-    let result = cache.get_node_prop(1, 10);
+    let result = cache.node_prop(1, 10);
     assert_eq!(result, Some(&Some(PropValue::I64(100))));
     assert_eq!(cache.node_cache_size(), 1);
   }
@@ -392,12 +392,12 @@ mod tests {
     cache.invalidate_node(1);
 
     // Node 1 props should be gone
-    assert_eq!(cache.get_node_prop(1, 10), None);
-    assert_eq!(cache.get_node_prop(1, 20), None);
-    assert_eq!(cache.get_node_prop(1, 30), None);
+    assert_eq!(cache.node_prop(1, 10), None);
+    assert_eq!(cache.node_prop(1, 20), None);
+    assert_eq!(cache.node_prop(1, 30), None);
 
     // Node 2 prop should still exist
-    assert_eq!(cache.get_node_prop(2, 10), Some(&Some(PropValue::I64(100))));
+    assert_eq!(cache.node_prop(2, 10), Some(&Some(PropValue::I64(100))));
 
     assert_eq!(cache.node_cache_size(), 1);
   }
@@ -405,7 +405,7 @@ mod tests {
   #[test]
   fn test_edge_prop_cache_miss() {
     let mut cache = make_cache();
-    assert_eq!(cache.get_edge_prop(1, 1, 2, 10), None);
+    assert_eq!(cache.edge_prop(1, 1, 2, 10), None);
     assert_eq!(cache.stats().misses, 1);
   }
 
@@ -414,7 +414,7 @@ mod tests {
     let mut cache = make_cache();
     cache.set_edge_prop(1, 1, 2, 10, Some(PropValue::F64(std::f64::consts::PI)));
 
-    let result = cache.get_edge_prop(1, 1, 2, 10);
+    let result = cache.edge_prop(1, 1, 2, 10);
     assert_eq!(result, Some(&Some(PropValue::F64(std::f64::consts::PI))));
     assert_eq!(cache.stats().hits, 1);
   }
@@ -424,7 +424,7 @@ mod tests {
     let mut cache = make_cache();
     cache.set_edge_prop(1, 1, 2, 10, None);
 
-    let result = cache.get_edge_prop(1, 1, 2, 10);
+    let result = cache.edge_prop(1, 1, 2, 10);
     assert_eq!(result, Some(&None));
   }
 
@@ -445,12 +445,12 @@ mod tests {
     cache.invalidate_edge(1, 1, 2);
 
     // Edge (1,1,2) props should be gone
-    assert_eq!(cache.get_edge_prop(1, 1, 2, 10), None);
-    assert_eq!(cache.get_edge_prop(1, 1, 2, 20), None);
+    assert_eq!(cache.edge_prop(1, 1, 2, 10), None);
+    assert_eq!(cache.edge_prop(1, 1, 2, 20), None);
 
     // Edge (1,2,3) prop should still exist
     assert_eq!(
-      cache.get_edge_prop(1, 2, 3, 10),
+      cache.edge_prop(1, 2, 3, 10),
       Some(&Some(PropValue::I64(100)))
     );
 
@@ -465,8 +465,8 @@ mod tests {
     cache.set_edge_prop(1, 1, 2, 10, Some(PropValue::I64(100)));
 
     // Generate some hits/misses
-    cache.get_node_prop(1, 10);
-    cache.get_node_prop(999, 10);
+    cache.node_prop(1, 10);
+    cache.node_prop(999, 10);
 
     cache.clear();
 
@@ -511,7 +511,7 @@ mod tests {
     cache.set_node_prop(3, 10, Some(PropValue::I64(3)));
 
     // Get node 1 (SHOULD make it most recently used)
-    cache.get_node_prop(1, 10);
+    cache.node_prop(1, 10);
 
     // Add node 4 - should evict node 2 (oldest after node 1 was accessed)
     cache.set_node_prop(4, 10, Some(PropValue::I64(4)));
@@ -530,12 +530,12 @@ mod tests {
     cache.set_edge_prop(1, 1, 2, 10, Some(PropValue::I64(100)));
 
     // 2 hits
-    cache.get_node_prop(1, 10);
-    cache.get_edge_prop(1, 1, 2, 10);
+    cache.node_prop(1, 10);
+    cache.edge_prop(1, 1, 2, 10);
 
     // 2 misses
-    cache.get_node_prop(999, 10);
-    cache.get_edge_prop(999, 1, 2, 10);
+    cache.node_prop(999, 10);
+    cache.edge_prop(999, 1, 2, 10);
 
     let stats = cache.stats();
     assert_eq!(stats.hits, 2);
@@ -551,8 +551,8 @@ mod tests {
     let mut cache = make_cache();
 
     cache.set_node_prop(1, 10, Some(PropValue::I64(42)));
-    cache.get_node_prop(1, 10);
-    cache.get_node_prop(999, 10);
+    cache.node_prop(1, 10);
+    cache.node_prop(999, 10);
 
     assert_eq!(cache.stats().hits, 1);
     assert_eq!(cache.stats().misses, 1);
@@ -577,22 +577,19 @@ mod tests {
     cache.set_node_prop(1, 5, Some(PropValue::String("hello world".to_string())));
     cache.set_node_prop(1, 6, Some(PropValue::VectorF32(vec![1.0, 2.0, 3.0])));
 
-    assert_eq!(cache.get_node_prop(1, 1), Some(&Some(PropValue::Null)));
+    assert_eq!(cache.node_prop(1, 1), Some(&Some(PropValue::Null)));
+    assert_eq!(cache.node_prop(1, 2), Some(&Some(PropValue::Bool(true))));
+    assert_eq!(cache.node_prop(1, 3), Some(&Some(PropValue::I64(-123))));
     assert_eq!(
-      cache.get_node_prop(1, 2),
-      Some(&Some(PropValue::Bool(true)))
-    );
-    assert_eq!(cache.get_node_prop(1, 3), Some(&Some(PropValue::I64(-123))));
-    assert_eq!(
-      cache.get_node_prop(1, 4),
+      cache.node_prop(1, 4),
       Some(&Some(PropValue::F64(std::f64::consts::PI)))
     );
     assert_eq!(
-      cache.get_node_prop(1, 5),
+      cache.node_prop(1, 5),
       Some(&Some(PropValue::String("hello world".to_string())))
     );
     assert_eq!(
-      cache.get_node_prop(1, 6),
+      cache.node_prop(1, 6),
       Some(&Some(PropValue::VectorF32(vec![1.0, 2.0, 3.0])))
     );
   }
@@ -605,7 +602,7 @@ mod tests {
     // Should not panic or affect other entries
     cache.invalidate_node(999);
 
-    assert_eq!(cache.get_node_prop(1, 10), Some(&Some(PropValue::I64(42))));
+    assert_eq!(cache.node_prop(1, 10), Some(&Some(PropValue::I64(42))));
   }
 
   #[test]
@@ -617,7 +614,7 @@ mod tests {
     cache.invalidate_edge(999, 1, 2);
 
     assert_eq!(
-      cache.get_edge_prop(1, 1, 2, 10),
+      cache.edge_prop(1, 1, 2, 10),
       Some(&Some(PropValue::I64(42)))
     );
   }

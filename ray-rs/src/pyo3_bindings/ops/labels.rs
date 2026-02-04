@@ -61,5 +61,5 @@ pub fn node_has_label_single(db: &RustSingleFileDB, node_id: NodeId, label_id: u
 }
 
 pub fn get_node_labels_single(db: &RustSingleFileDB, node_id: NodeId) -> Vec<u32> {
-  db.get_node_labels(node_id)
+  db.node_labels(node_id)
 }

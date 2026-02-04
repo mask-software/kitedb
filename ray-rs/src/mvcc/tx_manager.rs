@@ -101,12 +101,12 @@ impl TxManager {
   }
 
   /// Get transaction by ID
-  pub fn get_tx(&self, txid: TxId) -> Option<&MvccTransaction> {
+  pub fn tx(&self, txid: TxId) -> Option<&MvccTransaction> {
     self.active_txs.get(&txid)
   }
 
   /// Get mutable transaction by ID
-  pub fn get_tx_mut(&mut self, txid: TxId) -> Option<&mut MvccTransaction> {
+  pub fn tx_mut(&mut self, txid: TxId) -> Option<&mut MvccTransaction> {
     self.active_txs.get_mut(&txid)
   }
 
@@ -218,7 +218,7 @@ impl TxManager {
   }
 
   /// Get all active transaction IDs
-  pub fn get_active_tx_ids(&self) -> Vec<TxId> {
+  pub fn active_tx_ids(&self) -> Vec<TxId> {
     self
       .active_txs
       .values()
@@ -228,7 +228,7 @@ impl TxManager {
   }
 
   /// Get transaction count (O(1) using tracked counter)
-  pub fn get_active_count(&self) -> usize {
+  pub fn active_count(&self) -> usize {
     self.active_count
   }
 
@@ -241,18 +241,18 @@ impl TxManager {
   }
 
   /// Get the next commit timestamp (for snapshot reads outside transactions)
-  pub fn get_next_commit_ts(&self) -> Timestamp {
+  pub fn next_commit_ts(&self) -> Timestamp {
     self.next_commit_ts
   }
 
   /// Get all transactions (for debugging/recovery)
-  pub fn get_all_txs(&self) -> impl Iterator<Item = (&TxId, &MvccTransaction)> {
+  pub fn all_txs(&self) -> impl Iterator<Item = (&TxId, &MvccTransaction)> {
     self.active_txs.iter()
   }
 
   /// Get committed writes for a key (for conflict detection)
   /// Returns the max commitTs for the key if >= minCommitTs, otherwise None
-  pub fn get_committed_write_ts(&self, key: &TxKey, min_commit_ts: Timestamp) -> Option<Timestamp> {
+  pub fn committed_write_ts(&self, key: &TxKey, min_commit_ts: Timestamp) -> Option<Timestamp> {
     self.committed_writes.get(key).and_then(|&max_ts| {
       if max_ts >= min_commit_ts {
         Some(max_ts)
@@ -282,7 +282,7 @@ impl TxManager {
   }
 
   /// Get the next transaction ID (useful for recovery)
-  pub fn get_next_tx_id(&self) -> TxId {
+  pub fn next_tx_id(&self) -> TxId {
     self.next_tx_id
   }
 
@@ -297,7 +297,7 @@ impl TxManager {
   }
 
   /// Get the oldest commit timestamp that is newer than the retention period
-  pub fn get_retention_horizon_ts(&self, retention_ms: u64) -> Timestamp {
+  pub fn retention_horizon_ts(&self, retention_ms: u64) -> Timestamp {
     let cutoff_time = current_time_ms().saturating_sub(retention_ms);
     let mut oldest_within_retention = self.next_commit_ts;
 
@@ -324,7 +324,7 @@ impl TxManager {
   }
 
   /// Get statistics about committed writes
-  pub fn get_committed_writes_stats(&self) -> CommittedWritesStats {
+  pub fn committed_writes_stats(&self) -> CommittedWritesStats {
     CommittedWritesStats {
       size: self.committed_writes.len(),
       pruned: self.total_pruned,
@@ -430,16 +430,16 @@ mod tests {
   #[test]
   fn test_new() {
     let tx_mgr = TxManager::new();
-    assert_eq!(tx_mgr.get_active_count(), 0);
-    assert_eq!(tx_mgr.get_next_tx_id(), 1);
-    assert_eq!(tx_mgr.get_next_commit_ts(), 1);
+    assert_eq!(tx_mgr.active_count(), 0);
+    assert_eq!(tx_mgr.next_tx_id(), 1);
+    assert_eq!(tx_mgr.next_commit_ts(), 1);
   }
 
   #[test]
   fn test_with_initial() {
     let tx_mgr = TxManager::with_initial(100, 200);
-    assert_eq!(tx_mgr.get_next_tx_id(), 100);
-    assert_eq!(tx_mgr.get_next_commit_ts(), 200);
+    assert_eq!(tx_mgr.next_tx_id(), 100);
+    assert_eq!(tx_mgr.next_commit_ts(), 200);
   }
 
   #[test]
@@ -449,12 +449,12 @@ mod tests {
     let (txid1, start_ts1) = tx_mgr.begin_tx();
     assert_eq!(txid1, 1);
     assert_eq!(start_ts1, 1);
-    assert_eq!(tx_mgr.get_active_count(), 1);
+    assert_eq!(tx_mgr.active_count(), 1);
 
     let (txid2, start_ts2) = tx_mgr.begin_tx();
     assert_eq!(txid2, 2);
     assert_eq!(start_ts2, 1); // Same snapshot
-    assert_eq!(tx_mgr.get_active_count(), 2);
+    assert_eq!(tx_mgr.active_count(), 2);
   }
 
   #[test]
@@ -462,11 +462,11 @@ mod tests {
     let mut tx_mgr = TxManager::new();
     let (txid, _) = tx_mgr.begin_tx();
 
-    let tx = tx_mgr.get_tx(txid);
+    let tx = tx_mgr.tx(txid);
     assert!(tx.is_some());
     assert_eq!(tx.unwrap().txid, txid);
 
-    assert!(tx_mgr.get_tx(999).is_none());
+    assert!(tx_mgr.tx(999).is_none());
   }
 
   #[test]
@@ -486,7 +486,7 @@ mod tests {
     tx_mgr.record_read(txid, key("key1"));
     tx_mgr.record_write(txid, key("key2"));
 
-    let tx = tx_mgr.get_tx(txid).unwrap();
+    let tx = tx_mgr.tx(txid).unwrap();
     assert!(tx.read_set.contains(&key("key1")));
     assert!(tx.write_set.contains(&key("key2")));
   }
@@ -500,7 +500,7 @@ mod tests {
 
     let commit_ts = tx_mgr.commit_tx(txid).unwrap();
     assert_eq!(commit_ts, 1);
-    assert_eq!(tx_mgr.get_active_count(), 0);
+    assert_eq!(tx_mgr.active_count(), 0);
 
     // Check committed writes tracking
     assert!(tx_mgr.has_conflicting_write(&key("key1"), 1));
@@ -532,11 +532,11 @@ mod tests {
   fn test_abort_tx() {
     let mut tx_mgr = TxManager::new();
     let (txid, _) = tx_mgr.begin_tx();
-    assert_eq!(tx_mgr.get_active_count(), 1);
+    assert_eq!(tx_mgr.active_count(), 1);
 
     tx_mgr.abort_tx(txid);
-    assert_eq!(tx_mgr.get_active_count(), 0);
-    assert!(tx_mgr.get_tx(txid).is_none()); // Removed immediately
+    assert_eq!(tx_mgr.active_count(), 0);
+    assert!(tx_mgr.tx(txid).is_none()); // Removed immediately
   }
 
   #[test]
@@ -565,13 +565,13 @@ mod tests {
     let (txid1, _) = tx_mgr.begin_tx();
     let (txid2, _) = tx_mgr.begin_tx();
 
-    let active_ids = tx_mgr.get_active_tx_ids();
+    let active_ids = tx_mgr.active_tx_ids();
     assert_eq!(active_ids.len(), 2);
     assert!(active_ids.contains(&txid1));
     assert!(active_ids.contains(&txid2));
 
     tx_mgr.commit_tx(txid1).unwrap();
-    let active_ids = tx_mgr.get_active_tx_ids();
+    let active_ids = tx_mgr.active_tx_ids();
     assert_eq!(active_ids.len(), 1);
     assert!(active_ids.contains(&txid2));
   }
@@ -613,10 +613,10 @@ mod tests {
     tx_mgr.record_write(txid, key("key1"));
     tx_mgr.commit_tx(txid).unwrap();
 
-    assert_eq!(tx_mgr.get_committed_write_ts(&key("key1"), 0), Some(1));
-    assert_eq!(tx_mgr.get_committed_write_ts(&key("key1"), 1), Some(1));
-    assert_eq!(tx_mgr.get_committed_write_ts(&key("key1"), 2), None);
-    assert_eq!(tx_mgr.get_committed_write_ts(&key("key2"), 0), None);
+    assert_eq!(tx_mgr.committed_write_ts(&key("key1"), 0), Some(1));
+    assert_eq!(tx_mgr.committed_write_ts(&key("key1"), 1), Some(1));
+    assert_eq!(tx_mgr.committed_write_ts(&key("key1"), 2), None);
+    assert_eq!(tx_mgr.committed_write_ts(&key("key2"), 0), None);
   }
 
   #[test]
@@ -626,7 +626,7 @@ mod tests {
     tx_mgr.record_write(txid, key("key1"));
 
     tx_mgr.clear();
-    assert_eq!(tx_mgr.get_active_count(), 0);
+    assert_eq!(tx_mgr.active_count(), 0);
     assert!(!tx_mgr.has_conflicting_write(&key("key1"), 0));
   }
 
@@ -642,8 +642,8 @@ mod tests {
     }
 
     // After serial commits, no transactions should remain in active_txs
-    assert_eq!(tx_mgr.get_active_count(), 0);
-    assert_eq!(tx_mgr.get_active_tx_ids().len(), 0);
+    assert_eq!(tx_mgr.active_count(), 0);
+    assert_eq!(tx_mgr.active_tx_ids().len(), 0);
   }
 
   #[test]
@@ -667,7 +667,7 @@ mod tests {
     // Commit tx1
     let commit_ts1 = tx_mgr.commit_tx(txid1).unwrap();
     assert_eq!(commit_ts1, 1);
-    assert_eq!(tx_mgr.get_active_count(), 2);
+    assert_eq!(tx_mgr.active_count(), 2);
 
     // tx3 now has conflict with tx1 on key "a"
     assert!(tx_mgr.has_conflicting_write(&key("a"), start_ts3));
@@ -675,11 +675,11 @@ mod tests {
     // Commit tx2 (no conflict)
     let commit_ts2 = tx_mgr.commit_tx(txid2).unwrap();
     assert_eq!(commit_ts2, 2);
-    assert_eq!(tx_mgr.get_active_count(), 1);
+    assert_eq!(tx_mgr.active_count(), 1);
 
     // Abort tx3
     tx_mgr.abort_tx(txid3);
-    assert_eq!(tx_mgr.get_active_count(), 0);
+    assert_eq!(tx_mgr.active_count(), 0);
   }
 
   #[test]
@@ -693,14 +693,14 @@ mod tests {
     tx_mgr.commit_tx(txid1).unwrap();
 
     // tx1 should still be in active_txs because there's another active tx
-    assert!(tx_mgr.get_tx(txid1).is_some());
+    assert!(tx_mgr.tx(txid1).is_some());
 
     // Remove it manually (like GC would do)
     tx_mgr.remove_tx(txid1);
-    assert!(tx_mgr.get_tx(txid1).is_none());
+    assert!(tx_mgr.tx(txid1).is_none());
 
     // tx2 should still be there
-    assert!(tx_mgr.get_tx(txid2).is_some());
+    assert!(tx_mgr.tx(txid2).is_some());
   }
 
   #[test]

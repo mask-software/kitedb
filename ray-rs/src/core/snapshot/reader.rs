@@ -398,7 +398,7 @@ impl SnapshotData {
 
   /// Get NodeID for a physical node index
   #[inline]
-  pub fn get_node_id(&self, phys: PhysNode) -> Option<NodeId> {
+  pub fn node_id(&self, phys: PhysNode) -> Option<NodeId> {
     let section = self.section_data_shared(SectionId::PhysToNodeId)?;
     let section = section.as_ref();
     if (phys as usize) * 8 + 8 > section.len() {
@@ -409,7 +409,7 @@ impl SnapshotData {
 
   /// Get physical node index for a NodeID, or None if not present
   #[inline]
-  pub fn get_phys_node(&self, node_id: NodeId) -> Option<PhysNode> {
+  pub fn phys_node(&self, node_id: NodeId) -> Option<PhysNode> {
     let section = self.section_data_shared(SectionId::NodeIdToPhys)?;
     let section = section.as_ref();
     let idx = node_id as usize;
@@ -427,7 +427,7 @@ impl SnapshotData {
   /// Check if a NodeID exists in the snapshot
   #[inline]
   pub fn has_node(&self, node_id: NodeId) -> bool {
-    self.get_phys_node(node_id).is_some()
+    self.phys_node(node_id).is_some()
   }
 
   /// Get the number of nodes in the snapshot
@@ -453,7 +453,7 @@ impl SnapshotData {
   // ========================================================================
 
   /// Get string by StringID
-  pub fn get_string(&self, string_id: StringId) -> Option<String> {
+  pub fn string(&self, string_id: StringId) -> Option<String> {
     if string_id == 0 {
       return Some(String::new());
     }
@@ -478,7 +478,7 @@ impl SnapshotData {
     String::from_utf8(bytes[start..end].to_vec()).ok()
   }
 
-  fn get_string_cached(&self, string_id: StringId) -> Option<&str> {
+  fn string_cached(&self, string_id: StringId) -> Option<&str> {
     if string_id == 0 {
       return Some("");
     }
@@ -489,7 +489,7 @@ impl SnapshotData {
       return Some(value.as_ref());
     }
 
-    let value = self.get_string(string_id)?;
+    let value = self.string(string_id)?;
     let arc: Arc<str> = Arc::from(value);
     let _ = cell.set(arc);
     cell.get().map(|value| value.as_ref())
@@ -513,7 +513,7 @@ impl SnapshotData {
   }
 
   /// Get out-degree for a physical node
-  pub fn get_out_degree(&self, phys: PhysNode) -> Option<usize> {
+  pub fn out_degree(&self, phys: PhysNode) -> Option<usize> {
     let (start, end) = self.out_edge_range(phys)?;
     Some(end - start)
   }
@@ -623,7 +623,7 @@ impl SnapshotData {
   }
 
   /// Get in-degree for a physical node
-  pub fn get_in_degree(&self, phys: PhysNode) -> Option<usize> {
+  pub fn in_degree(&self, phys: PhysNode) -> Option<usize> {
     let (start, end) = self.in_edge_range(phys)?;
     Some(end - start)
   }
@@ -676,7 +676,7 @@ impl SnapshotData {
       let node_id = read_u64(key_entries, offset + 16);
 
       // Compare actual key
-      if let Some(entry_key) = self.get_string(string_id) {
+      if let Some(entry_key) = self.string(string_id) {
         if entry_key == key {
           return Some(node_id);
         }
@@ -710,7 +710,7 @@ impl SnapshotData {
   }
 
   /// Get the key for a node, if any
-  pub fn get_node_key(&self, phys: PhysNode) -> Option<String> {
+  pub fn node_key(&self, phys: PhysNode) -> Option<String> {
     let node_key_string = self.section_data_shared(SectionId::NodeKeyString)?;
     let node_key_string = node_key_string.as_ref();
     let idx = phys as usize;
@@ -721,7 +721,7 @@ impl SnapshotData {
     if string_id == 0 {
       return None;
     }
-    self.get_string(string_id)
+    self.string(string_id)
   }
 
   // ========================================================================
@@ -729,7 +729,7 @@ impl SnapshotData {
   // ========================================================================
 
   /// Get all labels for a node
-  pub fn get_node_labels(&self, phys: PhysNode) -> Option<Vec<LabelId>> {
+  pub fn node_labels(&self, phys: PhysNode) -> Option<Vec<LabelId>> {
     if !self.header.flags.contains(SnapshotFlags::HAS_NODE_LABELS) {
       return None;
     }
@@ -763,7 +763,7 @@ impl SnapshotData {
   // ========================================================================
 
   /// Get all properties for a node
-  pub fn get_node_props(&self, phys: PhysNode) -> Option<HashMap<PropKeyId, PropValue>> {
+  pub fn node_props(&self, phys: PhysNode) -> Option<HashMap<PropKeyId, PropValue>> {
     if !self.header.flags.contains(SnapshotFlags::HAS_PROPERTIES) {
       return None;
     }
@@ -798,7 +798,7 @@ impl SnapshotData {
   }
 
   /// Get a specific property for a node
-  pub fn get_node_prop(&self, phys: PhysNode, prop_key_id: PropKeyId) -> Option<PropValue> {
+  pub fn node_prop(&self, phys: PhysNode, prop_key_id: PropKeyId) -> Option<PropValue> {
     if !self.header.flags.contains(SnapshotFlags::HAS_PROPERTIES) {
       return None;
     }
@@ -832,7 +832,7 @@ impl SnapshotData {
   }
 
   /// Get all properties for an edge by edge index
-  pub fn get_edge_props(&self, edge_idx: usize) -> Option<HashMap<PropKeyId, PropValue>> {
+  pub fn edge_props(&self, edge_idx: usize) -> Option<HashMap<PropKeyId, PropValue>> {
     if !self.header.flags.contains(SnapshotFlags::HAS_PROPERTIES) {
       return None;
     }
@@ -880,7 +880,7 @@ impl SnapshotData {
       PropValueTag::I64 => Some(PropValue::I64(payload as i64)),
       PropValueTag::F64 => Some(PropValue::F64(f64::from_bits(payload))),
       PropValueTag::String => {
-        let s = self.get_string(payload as u32)?;
+        let s = self.string(payload as u32)?;
         Some(PropValue::String(s))
       }
       PropValueTag::VectorF32 => {
@@ -1059,7 +1059,7 @@ pub struct OutEdgeInfo {
 
 impl SnapshotData {
   /// Get label name by LabelID
-  pub fn get_label_name(&self, label_id: LabelId) -> Option<&str> {
+  pub fn label_name(&self, label_id: LabelId) -> Option<&str> {
     let label_string_ids = self.section_data_shared(SectionId::LabelStringIds)?;
     let label_string_ids = label_string_ids.as_ref();
     let idx = label_id as usize;
@@ -1070,11 +1070,11 @@ impl SnapshotData {
     if string_id == 0 {
       return None;
     }
-    self.get_string_cached(string_id)
+    self.string_cached(string_id)
   }
 
   /// Get etype name by ETypeID
-  pub fn get_etype_name(&self, etype_id: ETypeId) -> Option<&str> {
+  pub fn etype_name(&self, etype_id: ETypeId) -> Option<&str> {
     let etype_string_ids = self.section_data_shared(SectionId::EtypeStringIds)?;
     let etype_string_ids = etype_string_ids.as_ref();
     let idx = etype_id as usize;
@@ -1085,11 +1085,11 @@ impl SnapshotData {
     if string_id == 0 {
       return None;
     }
-    self.get_string_cached(string_id)
+    self.string_cached(string_id)
   }
 
   /// Get propkey name by PropKeyID
-  pub fn get_propkey_name(&self, propkey_id: PropKeyId) -> Option<&str> {
+  pub fn propkey_name(&self, propkey_id: PropKeyId) -> Option<&str> {
     let propkey_string_ids = self.section_data_shared(SectionId::PropkeyStringIds)?;
     let propkey_string_ids = propkey_string_ids.as_ref();
     let idx = propkey_id as usize;
@@ -1100,11 +1100,11 @@ impl SnapshotData {
     if string_id == 0 {
       return None;
     }
-    self.get_string_cached(string_id)
+    self.string_cached(string_id)
   }
 
   /// Get out-edges as a Vec for compaction purposes
-  pub fn get_out_edges(&self, phys: PhysNode) -> Vec<OutEdgeInfo> {
+  pub fn out_edges(&self, phys: PhysNode) -> Vec<OutEdgeInfo> {
     let mut edges = Vec::new();
     for (dst, etype) in self.iter_out_edges(phys) {
       edges.push(OutEdgeInfo { dst, etype });

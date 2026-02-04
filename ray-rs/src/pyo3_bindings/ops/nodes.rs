@@ -55,12 +55,12 @@ pub fn node_exists_single(db: &RustSingleFileDB, node_id: NodeId) -> bool {
 
 /// Get node by key on single-file database
 pub fn get_node_by_key_single(db: &RustSingleFileDB, key: &str) -> Option<i64> {
-  db.get_node_by_key(key).map(|id| id as i64)
+  db.node_by_key(key).map(|id| id as i64)
 }
 
 /// Get node key on single-file database
 pub fn get_node_key_single(db: &RustSingleFileDB, node_id: NodeId) -> Option<String> {
-  db.get_node_key(node_id)
+  db.node_key(node_id)
 }
 
 /// List nodes on single-file database
@@ -79,7 +79,7 @@ pub fn upsert_node_single(
   key: &str,
   props: &[(PropKeyId, Option<PropValue>)],
 ) -> PyResult<i64> {
-  let node_id = match db.get_node_by_key(key) {
+  let node_id = match db.node_by_key(key) {
     Some(id) => id,
     None => db
       .create_node(Some(key))
@@ -130,7 +130,7 @@ pub fn list_nodes_with_prefix_single(db: &RustSingleFileDB, prefix: &str) -> Vec
   db.list_nodes()
     .into_iter()
     .filter(|&id| {
-      if let Some(key) = db.get_node_key(id) {
+      if let Some(key) = db.node_key(id) {
         key.starts_with(prefix)
       } else {
         false
@@ -145,7 +145,7 @@ pub fn count_nodes_with_prefix_single(db: &RustSingleFileDB, prefix: &str) -> i6
   db.list_nodes()
     .into_iter()
     .filter(|&id| {
-      if let Some(key) = db.get_node_key(id) {
+      if let Some(key) = db.node_key(id) {
         key.starts_with(prefix)
       } else {
         false

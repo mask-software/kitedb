@@ -379,14 +379,14 @@ fn benchmark_key_lookups(
   graph: &GraphData,
   iterations: usize,
 ) {
-  println!("\n--- Key Lookups (get_node_by_key) ---");
+  println!("\n--- Key Lookups (node_by_key) ---");
   let mut rng = StdRng::from_entropy();
   let mut samples = Vec::with_capacity(iterations);
 
   for _ in 0..iterations {
     let key = &graph.node_keys[rng.gen_range(0..graph.node_keys.len())];
     let start = Instant::now();
-    let _ = db.get_node_by_key(key);
+    let _ = db.node_by_key(key);
     samples.push(start.elapsed().as_nanos());
   }
 
@@ -406,7 +406,7 @@ fn benchmark_traversals(
   for _ in 0..iterations {
     let node = graph.node_ids[rng.gen_range(0..graph.node_ids.len())];
     let start = Instant::now();
-    let edges = db.get_out_edges(node);
+    let edges = db.out_edges(node);
     let _count = edges.len();
     samples.push(start.elapsed().as_nanos());
   }
@@ -495,11 +495,11 @@ fn benchmark_vector_reads(
   for _ in 0..iterations {
     let node = vector_nodes[rng.gen_range(0..vector_nodes.len())];
     let start = Instant::now();
-    let _ = db.get_node_vector(node, prop_key_id);
+    let _ = db.node_vector(node, prop_key_id);
     samples.push(start.elapsed().as_nanos());
   }
   let stats = compute_stats(&mut samples);
-  print_latency_table("get_node_vector() random", stats);
+  print_latency_table("node_vector() random", stats);
 
   let mut samples = Vec::with_capacity(iterations);
   for _ in 0..iterations {

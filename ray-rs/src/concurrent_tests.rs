@@ -241,10 +241,10 @@ mod tests {
           for i in 0..reads_per_thread {
             let node_id = node_ids[i % node_ids.len()];
             let ray_guard = ray.read();
-            if ray_guard.get_prop(node_id, "name").is_some() {
+            if ray_guard.prop(node_id, "name").is_some() {
               success_count += 1;
             }
-            if ray_guard.get_prop(node_id, "age").is_some() {
+            if ray_guard.prop(node_id, "age").is_some() {
               success_count += 1;
             }
           }
@@ -864,7 +864,7 @@ mod tests {
     let mut success_count = 0;
     for i in 0..reads {
       let key = format!("node{}", i % 100);
-      if db.get_node_by_key(&key).is_some() {
+      if db.node_by_key(&key).is_some() {
         success_count += 1;
       }
     }

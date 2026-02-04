@@ -14,7 +14,7 @@ pub fn get_neighbors_from_single_file(
   let mut edges = Vec::new();
   match direction {
     TraversalDirection::Out => {
-      for (e, dst) in db.get_out_edges(node_id) {
+      for (e, dst) in db.out_edges(node_id) {
         if etype.is_none() || etype == Some(e) {
           edges.push(Edge {
             src: node_id,
@@ -25,7 +25,7 @@ pub fn get_neighbors_from_single_file(
       }
     }
     TraversalDirection::In => {
-      for (e, src) in db.get_in_edges(node_id) {
+      for (e, src) in db.in_edges(node_id) {
         if etype.is_none() || etype == Some(e) {
           edges.push(Edge {
             src,
