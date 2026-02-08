@@ -260,3 +260,67 @@ fn wait_for_token_times_out_then_succeeds_after_catch_up() {
   close_single_file(replica).expect("close replica");
   close_single_file(primary).expect("close primary");
 }
+
+#[test]
+fn vector_property_mutations_replicate_and_delete() {
+  let dir = tempfile::tempdir().expect("tempdir");
+  let primary_path = dir.path().join("primary-vector-repl.kitedb");
+  let replica_path = dir.path().join("replica-vector-repl.kitedb");
+
+  let primary = open_primary(&primary_path).expect("open primary");
+  primary.begin(false).expect("begin base");
+  let node = primary
+    .create_node(Some("vec-node"))
+    .expect("create vec node");
+  let embedding_key = primary.define_propkey("embedding").expect("define propkey");
+  primary
+    .set_node_vector(node, embedding_key, &[0.1, 0.2, 0.3])
+    .expect("set vector");
+  let token_set = primary
+    .commit_with_token()
+    .expect("commit set")
+    .expect("token set");
+
+  let replica = open_replica(&replica_path, &primary_path).expect("open replica");
+  replica
+    .replica_bootstrap_from_snapshot()
+    .expect("bootstrap snapshot");
+  let status = replica.replica_replication_status().expect("status");
+  assert_eq!(status.applied_log_index, token_set.log_index);
+  let primary_vector = primary
+    .node_vector(node, embedding_key)
+    .expect("primary vector after commit");
+  let replica_vector = replica
+    .node_vector(node, embedding_key)
+    .expect("replica vector after bootstrap");
+  assert_eq!(replica_vector.len(), primary_vector.len());
+  for (replica_value, primary_value) in replica_vector.iter().zip(primary_vector.iter()) {
+    assert!(
+      (replica_value - primary_value).abs() <= 1e-6,
+      "vector mismatch: replica={replica_value}, primary={primary_value}"
+    );
+  }
+
+  primary.begin(false).expect("begin delete");
+  primary
+    .delete_node_vector(node, embedding_key)
+    .expect("delete vector");
+  let token_delete = primary
+    .commit_with_token()
+    .expect("commit delete")
+    .expect("token delete");
+
+  let pulled = replica.replica_catch_up_once(8).expect("catch up delete");
+  assert_eq!(pulled, 1);
+  let status = replica
+    .replica_replication_status()
+    .expect("status after delete");
+  assert_eq!(status.applied_log_index, token_delete.log_index);
+  assert!(
+    replica.node_vector(node, embedding_key).is_none(),
+    "vector delete should replicate"
+  );
+
+  close_single_file(replica).expect("close replica");
+  close_single_file(primary).expect("close primary");
+}

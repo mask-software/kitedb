@@ -403,7 +403,7 @@ fn sync_graph_state(replica: &SingleFileDB, source: &SingleFileDB) -> Result<()>
   let source_nodes = source.list_nodes();
   let source_node_set: HashSet<_> = source_nodes.iter().copied().collect();
 
-  for node_id in source_nodes {
+  for &node_id in &source_nodes {
     let source_key = source.node_key(node_id);
     if replica.node_exists(node_id) {
       if replica.node_key(node_id) != source_key {
@@ -421,13 +421,64 @@ fn sync_graph_state(replica: &SingleFileDB, source: &SingleFileDB) -> Result<()>
     }
   }
 
+  for &node_id in &source_nodes {
+    let source_props = source.node_props(node_id).unwrap_or_default();
+    let replica_props = replica.node_props(node_id).unwrap_or_default();
+    for (&key_id, value) in &source_props {
+      if replica_props.get(&key_id) != Some(value) {
+        replica.set_node_prop(node_id, key_id, value.clone())?;
+      }
+    }
+    for &key_id in replica_props.keys() {
+      if !source_props.contains_key(&key_id) {
+        replica.delete_node_prop(node_id, key_id)?;
+      }
+    }
+
+    let source_labels: HashSet<_> = source.node_labels(node_id).into_iter().collect();
+    let replica_labels: HashSet<_> = replica.node_labels(node_id).into_iter().collect();
+    for &label_id in &source_labels {
+      if !replica_labels.contains(&label_id) {
+        replica.add_node_label(node_id, label_id)?;
+      }
+    }
+    for &label_id in &replica_labels {
+      if !source_labels.contains(&label_id) {
+        replica.remove_node_label(node_id, label_id)?;
+      }
+    }
+  }
+
+  let mut vector_prop_keys: HashSet<_> = source.vector_stores.read().keys().copied().collect();
+  vector_prop_keys.extend(replica.vector_stores.read().keys().copied());
+  for &node_id in &source_nodes {
+    for &prop_key_id in &vector_prop_keys {
+      let source_vector = source.node_vector(node_id, prop_key_id);
+      let replica_vector = replica.node_vector(node_id, prop_key_id);
+      match (source_vector, replica_vector) {
+        (Some(source_value), Some(replica_value)) => {
+          if source_value.as_ref() != replica_value.as_ref() {
+            replica.set_node_vector(node_id, prop_key_id, source_value.as_ref())?;
+          }
+        }
+        (Some(source_value), None) => {
+          replica.set_node_vector(node_id, prop_key_id, source_value.as_ref())?;
+        }
+        (None, Some(_)) => {
+          replica.delete_node_vector(node_id, prop_key_id)?;
+        }
+        (None, None) => {}
+      }
+    }
+  }
+
   let source_edges = source.list_edges(None);
   let source_edge_set: HashSet<_> = source_edges
     .iter()
     .map(|edge| (edge.src, edge.etype, edge.dst))
     .collect();
 
-  for edge in source_edges {
+  for edge in &source_edges {
     if !replica.edge_exists(edge.src, edge.etype, edge.dst) {
       replica.add_edge(edge.src, edge.etype, edge.dst)?;
     }
@@ -436,6 +487,26 @@ fn sync_graph_state(replica: &SingleFileDB, source: &SingleFileDB) -> Result<()>
   for edge in replica.list_edges(None) {
     if !source_edge_set.contains(&(edge.src, edge.etype, edge.dst)) {
       replica.delete_edge(edge.src, edge.etype, edge.dst)?;
+    }
+  }
+
+  for edge in source_edges {
+    let source_props = source
+      .edge_props(edge.src, edge.etype, edge.dst)
+      .unwrap_or_default();
+    let replica_props = replica
+      .edge_props(edge.src, edge.etype, edge.dst)
+      .unwrap_or_default();
+
+    for (&key_id, value) in &source_props {
+      if replica_props.get(&key_id) != Some(value) {
+        replica.set_edge_prop(edge.src, edge.etype, edge.dst, key_id, value.clone())?;
+      }
+    }
+    for &key_id in replica_props.keys() {
+      if !source_props.contains_key(&key_id) {
+        replica.delete_edge_prop(edge.src, edge.etype, edge.dst, key_id)?;
+      }
     }
   }
 
@@ -701,9 +772,45 @@ fn apply_wal_record_idempotent(db: &SingleFileDB, record: &ParsedWalRecord) -> R
       Ok(())
     }
     WalRecordType::BatchVectors | WalRecordType::SealFragment | WalRecordType::CompactFragments => {
-      Err(KiteError::InvalidReplication(
-        "vector batch/maintenance WAL replay is not yet supported in replica apply".to_string(),
-      ))
+      // Vector batch and maintenance records are derived/index-management artifacts.
+      // Replica correctness is defined by logical graph + property mutations, including
+      // SetNodeVector/DelNodeVector records, so these can be skipped safely.
+      Ok(())
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::apply_wal_record_idempotent;
+  use crate::core::single_file::{close_single_file, open_single_file, SingleFileOpenOptions};
+  use crate::core::wal::record::ParsedWalRecord;
+  use crate::types::WalRecordType;
+
+  #[test]
+  fn replica_apply_ignores_vector_maintenance_records() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("replica-apply-vector-maintenance.kitedb");
+    let db = open_single_file(&db_path, SingleFileOpenOptions::new()).expect("open db");
+
+    for record_type in [
+      WalRecordType::BatchVectors,
+      WalRecordType::SealFragment,
+      WalRecordType::CompactFragments,
+    ] {
+      let record = ParsedWalRecord {
+        record_type,
+        flags: 0,
+        txid: 1,
+        payload: Vec::new(),
+        record_end: 0,
+      };
+      apply_wal_record_idempotent(&db, &record)
+        .expect("derived vector maintenance should be ignored");
+    }
+
+    assert_eq!(db.count_nodes(), 0);
+    assert_eq!(db.count_edges(), 0);
+    close_single_file(db).expect("close db");
   }
 }

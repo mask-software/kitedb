@@ -369,7 +369,7 @@ Phase exit criteria:
 
 - Commit overhead budget is fixed for V1 gate: `P95_MAX_RATIO=1.03` (replication-on p95 / baseline p95).
 - Host-runtime parity helpers for runtimes/frameworks beyond Node/Python (Node helper available via `createNodeTlsMtlsMatcher`; Python helper available via `create_asgi_tls_mtls_matcher`).
-- Whether any vector side data must be promoted to authoritative replicated state in a later phase.
+- Future choice of ANN/vector index algorithm and compaction strategy remains open; authoritative replication scope remains logical vector property mutations (`SetNodeVector` / `DelNodeVector`).
 
 ## 20) Phase D Summary (February 8, 2026)
 
@@ -405,6 +405,7 @@ Implemented:
 - Replication benchmark gate script (`ray-rs/scripts/replication-bench-gate.sh`) + benchmark doc wiring.
 - Replica catch-up throughput gate (`ray-rs/scripts/replication-catchup-gate.sh`) and combined perf gate (`ray-rs/scripts/replication-perf-gate.sh`).
 - Main-branch CI perf-gate enforcement in `ray-rs` workflow (`.github/workflows/ray-rs.yml`) with benchmark log artifact upload.
+- Vector replication authority decision: canonical vector property mutations replicate (`SetNodeVector`/`DelNodeVector`); derived vector maintenance WAL records are non-authoritative and skipped during replica apply.
 - HTTP transport/admin rollout in playground runtime:
   - `GET /api/replication/status`
   - `GET /api/replication/metrics` (Prometheus text export)
