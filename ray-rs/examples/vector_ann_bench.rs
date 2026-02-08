@@ -4,7 +4,7 @@
 //!   cargo run --release --example vector_ann_bench --no-default-features -- [options]
 //!
 //! Options:
-//!   --algorithm ivf|ivf_pq             Algorithm to benchmark (default: ivf)
+//!   --algorithm ivf|ivf_pq             Algorithm to benchmark (default: ivf_pq)
 //!   --vectors N                        Number of vectors (default: 20000)
 //!   --dimensions D                     Vector dimensions (default: 384)
 //!   --queries N                        Query count (default: 200)
@@ -69,7 +69,7 @@ struct BenchConfig {
 impl Default for BenchConfig {
   fn default() -> Self {
     Self {
-      algorithm: Algorithm::Ivf,
+      algorithm: Algorithm::IvfPq,
       vectors: 20_000,
       dimensions: 384,
       queries: 200,
@@ -78,7 +78,7 @@ impl Default for BenchConfig {
       n_probe: 10,
       pq_subspaces: 48,
       pq_centroids: 256,
-      residuals: true,
+      residuals: false,
       seed: 42,
     }
   }

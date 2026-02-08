@@ -12,7 +12,8 @@ use crate::types::NodeId;
 use crate::vector::{
   create_vector_store, vector_store_clear, vector_store_delete, vector_store_insert,
   vector_store_node_vector, vector_store_stats, DistanceMetric, IvfConfig, IvfError, IvfIndex,
-  SearchOptions, VectorManifest, VectorSearchResult, VectorStoreConfig,
+  IvfPqConfig, IvfPqError, IvfPqIndex, IvfPqSearchOptions, SearchOptions, VectorManifest,
+  VectorSearchResult, VectorStoreConfig,
 };
 
 // ============================================================================
@@ -23,6 +24,15 @@ const DEFAULT_CACHE_MAX_SIZE: usize = 10_000;
 const DEFAULT_TRAINING_THRESHOLD: usize = 1000;
 const MIN_CLUSTERS: usize = 16;
 const MAX_CLUSTERS: usize = 1024;
+const DEFAULT_PQ_SUBSPACES: usize = 48;
+const DEFAULT_PQ_CENTROIDS: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AnnAlgorithm {
+  Ivf,
+  #[default]
+  IvfPq,
+}
 
 // ============================================================================
 // Types
@@ -49,6 +59,14 @@ pub struct VectorIndexOptions {
   pub training_threshold: usize,
   /// Maximum node refs to cache for search results (default: 10_000)
   pub cache_max_size: usize,
+  /// ANN backend algorithm (default: IVF-PQ)
+  pub ann_algorithm: AnnAlgorithm,
+  /// PQ subspaces for IVF-PQ (default: 48)
+  pub pq_subspaces: usize,
+  /// PQ centroids per subspace for IVF-PQ (default: 256)
+  pub pq_centroids: usize,
+  /// Use residual encoding for IVF-PQ (default: false)
+  pub pq_residuals: bool,
 }
 
 impl Default for VectorIndexOptions {
@@ -63,6 +81,10 @@ impl Default for VectorIndexOptions {
       n_probe: 10,
       training_threshold: DEFAULT_TRAINING_THRESHOLD,
       cache_max_size: DEFAULT_CACHE_MAX_SIZE,
+      ann_algorithm: AnnAlgorithm::default(),
+      pq_subspaces: DEFAULT_PQ_SUBSPACES,
+      pq_centroids: DEFAULT_PQ_CENTROIDS,
+      pq_residuals: false,
     }
   }
 }
@@ -127,6 +149,30 @@ impl VectorIndexOptions {
   /// Set the cache max size
   pub fn with_cache_max_size(mut self, size: usize) -> Self {
     self.cache_max_size = size;
+    self
+  }
+
+  /// Set ANN backend algorithm.
+  pub fn with_ann_algorithm(mut self, algorithm: AnnAlgorithm) -> Self {
+    self.ann_algorithm = algorithm;
+    self
+  }
+
+  /// Set PQ subspaces for IVF-PQ backend.
+  pub fn with_pq_subspaces(mut self, subspaces: usize) -> Self {
+    self.pq_subspaces = subspaces.max(1);
+    self
+  }
+
+  /// Set PQ centroids per subspace for IVF-PQ backend.
+  pub fn with_pq_centroids(mut self, centroids: usize) -> Self {
+    self.pq_centroids = centroids.max(2);
+    self
+  }
+
+  /// Set residual encoding mode for IVF-PQ backend.
+  pub fn with_pq_residuals(mut self, residuals: bool) -> Self {
+    self.pq_residuals = residuals;
     self
   }
 }
@@ -258,11 +304,32 @@ pub struct VectorIndexStats {
 /// # Ok(())
 /// # }
 /// ```
+enum BuiltIndex {
+  Ivf(IvfIndex),
+  IvfPq(IvfPqIndex),
+}
+
+impl BuiltIndex {
+  fn trained(&self) -> bool {
+    match self {
+      BuiltIndex::Ivf(index) => index.trained,
+      BuiltIndex::IvfPq(index) => index.trained,
+    }
+  }
+
+  fn n_clusters(&self) -> usize {
+    match self {
+      BuiltIndex::Ivf(index) => index.config.n_clusters,
+      BuiltIndex::IvfPq(index) => index.config.ivf.n_clusters,
+    }
+  }
+}
+
 pub struct VectorIndex {
   /// The underlying vector store manifest
   manifest: VectorManifest,
-  /// IVF index for approximate search (None if not trained)
-  index: Option<IvfIndex>,
+  /// ANN index for approximate search (None if not trained)
+  index: Option<BuiltIndex>,
   /// Cache of node IDs for quick lookup
   node_cache: LruCache<NodeId, ()>,
   /// Node ID to vector ID mapping for cache lookups
@@ -317,9 +384,16 @@ impl VectorIndex {
     // Check if we need to delete from index first
     if let Some(&existing_vector_id) = self.manifest.node_to_vector.get(&node_id) {
       if let Some(ref mut index) = self.index {
-        if index.trained {
+        if index.trained() {
           if let Some(existing_vector) = vector_store_node_vector(&self.manifest, node_id) {
-            index.delete(existing_vector_id, existing_vector);
+            match index {
+              BuiltIndex::Ivf(ivf_index) => {
+                ivf_index.delete(existing_vector_id, existing_vector);
+              }
+              BuiltIndex::IvfPq(ivf_pq_index) => {
+                ivf_pq_index.delete(existing_vector_id, existing_vector);
+              }
+            }
           }
         }
       }
@@ -335,12 +409,20 @@ impl VectorIndex {
 
     // Add to index if trained, otherwise mark for training
     if let Some(ref mut index) = self.index {
-      if index.trained {
+      if index.trained() {
         if let Some(stored_vector) = vector_store_node_vector(&self.manifest, node_id) {
-          if let Err(err) = index.insert(vector_id as u64, stored_vector) {
+          let insert_result = match index {
+            BuiltIndex::Ivf(ivf_index) => ivf_index
+              .insert(vector_id as u64, stored_vector)
+              .map_err(ivf_error_to_index_error),
+            BuiltIndex::IvfPq(ivf_pq_index) => ivf_pq_index
+              .insert(vector_id as u64, stored_vector)
+              .map_err(ivf_pq_error_to_index_error),
+          };
+          if let Err(err) = insert_result {
             self.index = None;
             self.needs_training = true;
-            return Err(ivf_error_to_index_error(err));
+            return Err(err);
           }
         }
       } else {
@@ -369,10 +451,17 @@ impl VectorIndex {
 
     // Remove from index if trained
     if let Some(ref mut index) = self.index {
-      if index.trained {
+      if index.trained() {
         if let Some(&vector_id) = self.manifest.node_to_vector.get(&node_id) {
           if let Some(vector) = vector_store_node_vector(&self.manifest, node_id) {
-            index.delete(vector_id, vector);
+            match index {
+              BuiltIndex::Ivf(ivf_index) => {
+                ivf_index.delete(vector_id, vector);
+              }
+              BuiltIndex::IvfPq(ivf_pq_index) => {
+                ivf_pq_index.delete(vector_id, vector);
+              }
+            }
           }
         }
       }
@@ -392,10 +481,10 @@ impl VectorIndex {
     self.manifest.node_to_vector.contains_key(&node_id)
   }
 
-  /// Build/rebuild the IVF index for faster search
+  /// Build/rebuild the configured ANN index for faster search
   ///
   /// Call this after bulk loading vectors, or periodically as vectors are updated.
-  /// Uses k-means clustering for approximate nearest neighbor search.
+  /// Uses IVF or IVF-PQ based on configured ANN backend.
   ///
   /// Note: Modifications (set/delete) are blocked while building is in progress.
   pub fn build_index(&mut self) -> Result<(), VectorIndexError> {
@@ -438,32 +527,63 @@ impl VectorIndex {
       }
     }
 
-    // Create and train the index
-    let ivf_config = IvfConfig::new(n_clusters)
-      .with_n_probe(self.options.n_probe)
-      .with_metric(self.options.metric);
-    let mut index = IvfIndex::new(dimensions, ivf_config);
+    // Create and train the configured ANN index.
+    self.index = Some(match self.options.ann_algorithm {
+      AnnAlgorithm::Ivf => {
+        let ivf_config = IvfConfig::new(n_clusters)
+          .with_n_probe(self.options.n_probe)
+          .with_metric(self.options.metric);
+        let mut index = IvfIndex::new(dimensions, ivf_config);
 
-    index
-      .add_training_vectors(&training_data, vector_ids.len())
-      .map_err(|e| VectorIndexError::TrainingError(e.to_string()))?;
+        index
+          .add_training_vectors(&training_data, vector_ids.len())
+          .map_err(|e| VectorIndexError::TrainingError(e.to_string()))?;
 
-    index
-      .train()
-      .map_err(|e| VectorIndexError::TrainingError(e.to_string()))?;
+        index
+          .train()
+          .map_err(|e| VectorIndexError::TrainingError(e.to_string()))?;
 
-    // Insert all vectors into the trained index
-    for (i, &vector_id) in vector_ids.iter().enumerate() {
-      let offset = i * dimensions;
-      let vector = &training_data[offset..offset + dimensions];
-      if let Err(err) = index.insert(vector_id, vector) {
-        self.index = None;
-        self.needs_training = true;
-        return Err(ivf_error_to_index_error(err));
+        for (i, &vector_id) in vector_ids.iter().enumerate() {
+          let offset = i * dimensions;
+          let vector = &training_data[offset..offset + dimensions];
+          if let Err(err) = index.insert(vector_id, vector) {
+            self.index = None;
+            self.needs_training = true;
+            return Err(ivf_error_to_index_error(err));
+          }
+        }
+        BuiltIndex::Ivf(index)
       }
-    }
+      AnnAlgorithm::IvfPq => {
+        let pq_subspaces = resolve_pq_subspaces(self.options.pq_subspaces, dimensions);
+        let pq_centroids = self.options.pq_centroids.max(2).min(live_vectors.max(2));
+        let ivf_pq_config = IvfPqConfig::new()
+          .with_n_clusters(n_clusters)
+          .with_n_probe(self.options.n_probe)
+          .with_metric(self.options.metric)
+          .with_num_subspaces(pq_subspaces)
+          .with_num_centroids(pq_centroids)
+          .with_residuals(self.options.pq_residuals);
+        let mut index =
+          IvfPqIndex::new(dimensions, ivf_pq_config).map_err(ivf_pq_error_to_index_error)?;
 
-    self.index = Some(index);
+        index
+          .add_training_vectors(&training_data, vector_ids.len())
+          .map_err(ivf_pq_error_to_index_error)?;
+        index.train().map_err(ivf_pq_error_to_index_error)?;
+
+        for (i, &vector_id) in vector_ids.iter().enumerate() {
+          let offset = i * dimensions;
+          let vector = &training_data[offset..offset + dimensions];
+          if let Err(err) = index.insert(vector_id, vector) {
+            self.index = None;
+            self.needs_training = true;
+            return Err(ivf_pq_error_to_index_error(err));
+          }
+        }
+        BuiltIndex::IvfPq(index)
+      }
+    });
     self.needs_training = false;
 
     Ok(())
@@ -472,7 +592,7 @@ impl VectorIndex {
   /// Search for similar vectors
   ///
   /// Returns the k most similar nodes to the query vector.
-  /// Uses IVF index if available, otherwise falls back to brute force.
+  /// Uses configured ANN index if available, otherwise falls back to brute force.
   pub fn search(
     &mut self,
     query: &[f32],
@@ -507,19 +627,33 @@ impl VectorIndex {
     let n_probe = n_probe.unwrap_or(self.options.n_probe);
 
     let results: Vec<VectorSearchResult> = if let Some(ref index) = self.index {
-      if index.trained {
-        // Use IVF index for approximate search (push down threshold/filter)
-        let filter_box = filter.as_ref().map(|f| {
-          let f = Arc::clone(f);
-          Box::new(move |node_id: NodeId| f(node_id)) as Box<dyn Fn(NodeId) -> bool>
-        });
-
-        let search_opts = SearchOptions {
-          n_probe: Some(n_probe),
-          filter: filter_box,
-          threshold,
-        };
-        index.search(&self.manifest, query, k, Some(search_opts))
+      if index.trained() {
+        match index {
+          BuiltIndex::Ivf(ivf_index) => {
+            let filter_box = filter.as_ref().map(|f| {
+              let f = Arc::clone(f);
+              Box::new(move |node_id: NodeId| f(node_id)) as Box<dyn Fn(NodeId) -> bool>
+            });
+            let search_opts = SearchOptions {
+              n_probe: Some(n_probe),
+              filter: filter_box,
+              threshold,
+            };
+            ivf_index.search(&self.manifest, query, k, Some(search_opts))
+          }
+          BuiltIndex::IvfPq(ivf_pq_index) => {
+            let filter_box = filter.as_ref().map(|f| {
+              let f = Arc::clone(f);
+              Box::new(move |node_id: NodeId| f(node_id)) as Box<dyn Fn(NodeId) -> bool>
+            });
+            let search_opts = IvfPqSearchOptions {
+              n_probe: Some(n_probe),
+              filter: filter_box,
+              threshold,
+            };
+            ivf_pq_index.search(&self.manifest, query, k, Some(search_opts))
+          }
+        }
       } else {
         self.brute_force_search_filtered(query, k, threshold, filter.as_ref())
       }
@@ -658,8 +792,12 @@ impl VectorIndex {
       live_vectors: store_stats.live_vectors,
       dimensions: self.options.dimensions,
       metric: self.options.metric,
-      index_trained: self.index.as_ref().map(|i| i.trained).unwrap_or(false),
-      index_clusters: self.index.as_ref().map(|i| i.config.n_clusters),
+      index_trained: self
+        .index
+        .as_ref()
+        .map(BuiltIndex::trained)
+        .unwrap_or(false),
+      index_clusters: self.index.as_ref().map(BuiltIndex::n_clusters),
     }
   }
 
@@ -752,6 +890,25 @@ fn ivf_error_to_index_error(err: IvfError) -> VectorIndexError {
   }
 }
 
+fn ivf_pq_error_to_index_error(err: IvfPqError) -> VectorIndexError {
+  match err {
+    IvfPqError::DimensionMismatch { expected, got } => {
+      VectorIndexError::DimensionMismatch { expected, got }
+    }
+    other => VectorIndexError::TrainingError(other.to_string()),
+  }
+}
+
+fn resolve_pq_subspaces(requested: usize, dimensions: usize) -> usize {
+  let capped = requested.max(1).min(dimensions.max(1));
+  for candidate in (1..=capped).rev() {
+    if dimensions % candidate == 0 {
+      return candidate;
+    }
+  }
+  1
+}
+
 // ============================================================================
 // Factory Function
 // ============================================================================
@@ -795,6 +952,10 @@ mod tests {
     assert_eq!(opts.metric, DistanceMetric::Cosine);
     assert!(opts.normalize);
     assert_eq!(opts.training_threshold, DEFAULT_TRAINING_THRESHOLD);
+    assert_eq!(opts.ann_algorithm, AnnAlgorithm::IvfPq);
+    assert_eq!(opts.pq_subspaces, DEFAULT_PQ_SUBSPACES);
+    assert_eq!(opts.pq_centroids, DEFAULT_PQ_CENTROIDS);
+    assert!(!opts.pq_residuals);
   }
 
   #[test]
@@ -803,13 +964,21 @@ mod tests {
       .with_metric(DistanceMetric::Euclidean)
       .with_normalize(false)
       .with_n_probe(20)
-      .with_training_threshold(500);
+      .with_training_threshold(500)
+      .with_ann_algorithm(AnnAlgorithm::Ivf)
+      .with_pq_subspaces(32)
+      .with_pq_centroids(128)
+      .with_pq_residuals(true);
 
     assert_eq!(opts.dimensions, 512);
     assert_eq!(opts.metric, DistanceMetric::Euclidean);
     assert!(!opts.normalize);
     assert_eq!(opts.n_probe, 20);
     assert_eq!(opts.training_threshold, 500);
+    assert_eq!(opts.ann_algorithm, AnnAlgorithm::Ivf);
+    assert_eq!(opts.pq_subspaces, 32);
+    assert_eq!(opts.pq_centroids, 128);
+    assert!(opts.pq_residuals);
   }
 
   #[test]

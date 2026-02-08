@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT_DIR="${OUT_DIR:-$ROOT_DIR/../docs/benchmarks/results}"
 
-ALGORITHM="${ALGORITHM:-ivf}"
+ALGORITHM="${ALGORITHM:-ivf_pq}"
 RESIDUALS="${RESIDUALS:-false}"
 VECTORS="${VECTORS:-20000}"
 DIMENSIONS="${DIMENSIONS:-384}"
@@ -17,8 +17,8 @@ PQ_CENTROIDS="${PQ_CENTROIDS:-256}"
 SEED="${SEED:-42}"
 ATTEMPTS="${ATTEMPTS:-3}"
 
-MIN_RECALL_AT_K="${MIN_RECALL_AT_K:-0.25}"
-MAX_P95_MS="${MAX_P95_MS:-6.0}"
+MIN_RECALL_AT_K="${MIN_RECALL_AT_K:-0.16}"
+MAX_P95_MS="${MAX_P95_MS:-8.0}"
 
 if [[ "$ATTEMPTS" -lt 1 ]]; then
   echo "ATTEMPTS must be >= 1"

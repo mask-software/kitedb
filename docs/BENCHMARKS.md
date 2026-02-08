@@ -115,7 +115,8 @@ Single run:
 ```bash
 cd ray-rs
 cargo run --release --example vector_ann_bench --no-default-features -- \
-  --algorithm ivf --vectors 20000 --dimensions 384 --queries 200 --k 10 --n-probe 8
+  --algorithm ivf_pq --vectors 20000 --dimensions 384 --queries 200 --k 10 --n-probe 16 \
+  --pq-subspaces 48 --pq-centroids 256 --residuals false
 ```
 
 Matrix sweep:
@@ -136,7 +137,8 @@ Latest matrix snapshot (2026-02-08, 20k vectors, 384 dims, 200 queries, k=10):
   - `n_probe=8`: `0.4508ms` vs IVF `0.7660ms`
   - `n_probe=16`: `1.3993ms` vs IVF `4.0272ms`
 - IVF-PQ build time was much higher than IVF in this baseline.
-- Current recommendation: keep IVF as default ANN path for quality-first behavior; revisit IVF-PQ default candidacy after PQ tuning (subspaces/centroids/probe) and workload-specific recall targets.
+- Current recommendation: use latency-first IVF-PQ as default ANN path with
+  `residuals=false`, `pq_subspaces=48`, `pq_centroids=256`; monitor recall floor via ANN gate.
 
 PQ tuning sweep:
 
@@ -173,11 +175,12 @@ cd ray-rs
 ```
 
 Defaults:
-- `ALGORITHM=ivf`, `N_PROBE=16`, `ATTEMPTS=3`
-- `MIN_RECALL_AT_K=0.25`
-- `MAX_P95_MS=6.0`
+- `ALGORITHM=ivf_pq`, `RESIDUALS=false`, `PQ_SUBSPACES=48`, `PQ_CENTROIDS=256`
+- `N_PROBE=16`, `ATTEMPTS=3`
+- `MIN_RECALL_AT_K=0.16`
+- `MAX_P95_MS=8.0`
 
-Latest gate snapshot (2026-02-08): median recall@k `0.2835`, median p95 `1.1716ms` (pass).
+Latest gate snapshot (2026-02-08): see `docs/benchmarks/results/2026-02-08-vector-ann-gate.attempt*.txt` (pass).
 
 CI:
 - Main-branch workflow (`.github/workflows/ray-rs.yml`) runs `./scripts/vector-ann-gate.sh`

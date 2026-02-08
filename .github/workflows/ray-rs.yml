@@ -123,12 +123,15 @@ jobs:
         run: ./scripts/vector-ann-gate.sh
         env:
           STAMP: ci-${{ github.run_id }}-${{ github.run_attempt }}
-          # CI defaults tuned from baseline matrix; quality-first IVF gate.
+          # CI defaults tuned from baseline matrix; latency-first IVF-PQ gate.
           ATTEMPTS: "3"
-          ALGORITHM: "ivf"
+          ALGORITHM: "ivf_pq"
+          RESIDUALS: "false"
+          PQ_SUBSPACES: "48"
+          PQ_CENTROIDS: "256"
           N_PROBE: "16"
-          MIN_RECALL_AT_K: "0.25"
-          MAX_P95_MS: "6.0"
+          MIN_RECALL_AT_K: "0.16"
+          MAX_P95_MS: "8.0"
       - name: Upload ANN gate logs
         if: always()
         uses: actions/upload-artifact@v4

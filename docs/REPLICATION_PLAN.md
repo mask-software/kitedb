@@ -368,7 +368,7 @@ Phase exit criteria:
 ## 19) Open Questions
 
 - Commit overhead budget is fixed for V1 gate: `P95_MAX_RATIO=1.03` (replication-on p95 / baseline p95).
-- Future choice of ANN/vector index algorithm remains open; authoritative replication scope remains logical vector property mutations (`SetNodeVector` / `DelNodeVector`). Current compaction defaults (`min_deletion_ratio=0.30`, `max_fragments_per_compaction=4`, `min_vectors_to_compact=10000`) are retained after the 2026-02-08 matrix run (`ray-rs/scripts/vector-compaction-matrix.sh`); ANN baseline matrix (`ray-rs/scripts/vector-ann-matrix.sh`) and PQ sweep (`ray-rs/scripts/vector-ann-pq-tuning.sh`) still favor IVF recall over IVF-PQ at equal probe counts.
+- ANN default decision is now fixed to latency-first IVF-PQ (`residuals=false`, `pq_subspaces=48`, `pq_centroids=256`) based on 2026-02-08 matrix/sweep data (`ray-rs/scripts/vector-ann-matrix.sh`, `ray-rs/scripts/vector-ann-pq-tuning.sh`); authoritative replication scope remains logical vector property mutations (`SetNodeVector` / `DelNodeVector`).
 
 ## 20) Phase D Summary (February 8, 2026)
 
@@ -411,6 +411,7 @@ Implemented:
 - Vector compaction matrix script + baseline snapshot (`ray-rs/scripts/vector-compaction-matrix.sh`, `docs/benchmarks/results/2026-02-08-vector-compaction-*.{txt,csv}`) with recommendation to keep current compaction defaults.
 - ANN algorithm benchmark harness + matrix script (`ray-rs/examples/vector_ann_bench.rs`, `ray-rs/scripts/vector-ann-matrix.sh`) with baseline artifact snapshot (`docs/benchmarks/results/2026-02-08-vector-ann-matrix.{txt,csv}`).
 - ANN PQ tuning sweep + ANN recall/p95 gate scripts (`ray-rs/scripts/vector-ann-pq-tuning.sh`, `ray-rs/scripts/vector-ann-gate.sh`) with artifact snapshots (`docs/benchmarks/results/2026-02-08-vector-ann-pq-tuning.{txt,csv}`, `docs/benchmarks/results/2026-02-08-vector-ann-gate.attempt*.txt`).
+- Latency-first ANN default selection: IVF-PQ (`residuals=false`, `pq_subspaces=48`, `pq_centroids=256`) with CI quality floor via `vector-ann-gate.sh`.
 - Non-blocking ANN PQ trend tracking in CI (`ann-pq-tracking` job in `.github/workflows/ray-rs.yml`, weekly schedule + manual dispatch with `ann_pq_profile=fast|full`, artifact `ann-pq-tracking-logs`, run-scoped `ci-<run_id>-<run_attempt>` stamp).
 - HTTP transport/admin rollout in playground runtime:
   - `GET /api/replication/status`
