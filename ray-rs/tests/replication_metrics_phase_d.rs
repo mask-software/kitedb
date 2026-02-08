@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Mutex;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use kitedb::core::single_file::{close_single_file, open_single_file, SingleFileOpenOptions};
 use kitedb::metrics::{
@@ -775,6 +775,99 @@ fn otlp_push_payload_circuit_breaker_opens_after_failure() {
     !third.to_string().contains("circuit breaker open"),
     "breaker should have closed, got: {third}"
   );
+}
+
+#[test]
+fn otlp_push_payload_uses_persisted_shared_circuit_breaker_state() {
+  let dir = tempfile::tempdir().expect("tempdir");
+  let state_path = dir.path().join("otlp-breaker-state.json");
+  let now_ms = SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .unwrap_or_default()
+    .as_millis() as u64;
+  let state_json = serde_json::json!({
+    "shared-breaker": {
+      "consecutive_failures": 0,
+      "open_until_ms": now_ms + 5_000
+    }
+  });
+  std::fs::write(
+    &state_path,
+    serde_json::to_vec(&state_json).expect("serialize state"),
+  )
+  .expect("write state");
+
+  let options = OtlpHttpPushOptions {
+    timeout_ms: 100,
+    retry_max_attempts: 1,
+    circuit_breaker_failure_threshold: 1,
+    circuit_breaker_open_ms: 500,
+    circuit_breaker_state_path: Some(state_path.to_string_lossy().to_string()),
+    circuit_breaker_scope_key: Some("shared-breaker".to_string()),
+    ..OtlpHttpPushOptions::default()
+  };
+
+  let error = push_replication_metrics_otel_json_payload_with_options(
+    "{}",
+    "http://127.0.0.1:9/v1/metrics",
+    &options,
+  )
+  .expect_err("persisted open breaker should block request");
+  assert!(
+    error.to_string().contains("circuit breaker open"),
+    "unexpected error: {error}"
+  );
+}
+
+#[test]
+fn otlp_push_payload_adaptive_retry_uses_failure_history() {
+  let dir = tempfile::tempdir().expect("tempdir");
+  let state_path = dir.path().join("otlp-adaptive-state.json");
+  let state_json = serde_json::json!({
+    "adaptive-breaker": {
+      "consecutive_failures": 4,
+      "open_until_ms": 0
+    }
+  });
+  std::fs::write(
+    &state_path,
+    serde_json::to_vec(&state_json).expect("serialize adaptive state"),
+  )
+  .expect("write adaptive state");
+
+  let payload = "{\"resourceMetrics\":[]}";
+  let (endpoint, captured_rx, handle) = spawn_http_sequence_capture_server(vec![500, 200], "ok");
+  let options = OtlpHttpPushOptions {
+    timeout_ms: 2_000,
+    retry_max_attempts: 2,
+    retry_backoff_ms: 80,
+    retry_backoff_max_ms: 2_000,
+    adaptive_retry: true,
+    retry_jitter_ratio: 0.0,
+    circuit_breaker_failure_threshold: 2,
+    circuit_breaker_open_ms: 2_000,
+    circuit_breaker_state_path: Some(state_path.to_string_lossy().to_string()),
+    circuit_breaker_scope_key: Some("adaptive-breaker".to_string()),
+    ..OtlpHttpPushOptions::default()
+  };
+
+  let start = Instant::now();
+  let result =
+    push_replication_metrics_otel_json_payload_with_options(payload, &endpoint, &options)
+      .expect("adaptive retry second attempt should succeed");
+  let elapsed = start.elapsed();
+  assert_eq!(result.status_code, 200);
+  assert!(
+    elapsed >= Duration::from_millis(250),
+    "adaptive retry backoff too small: {:?}",
+    elapsed
+  );
+
+  let captures = captured_rx
+    .recv_timeout(Duration::from_secs(2))
+    .expect("captured adaptive requests");
+  assert_eq!(captures.len(), 2);
+  handle.join().expect("adaptive sequence thread");
 }
 
 #[test]

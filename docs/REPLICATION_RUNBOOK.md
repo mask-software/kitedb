@@ -39,17 +39,20 @@ Metrics surface:
     - advanced TLS/mTLS: `push_replication_metrics_otel_json_*_with_options(...)` with
       `https_only`, `ca_cert_pem_path`, `client_cert_pem_path`, `client_key_pem_path`,
       `retry_max_attempts`, `retry_backoff_ms`, `retry_backoff_max_ms`, `retry_jitter_ratio`,
-      `circuit_breaker_failure_threshold`, `circuit_breaker_open_ms`, `compression_gzip`.
+      `adaptive_retry`, `circuit_breaker_failure_threshold`, `circuit_breaker_open_ms`,
+      `circuit_breaker_state_path`, `circuit_breaker_scope_key`, `compression_gzip`.
   - Rust core (protobuf): `push_replication_metrics_otel_protobuf_single_file(db, endpoint, timeout_ms, bearer_token)`
     - advanced TLS/mTLS: `push_replication_metrics_otel_protobuf_*_with_options(...)` with
       `https_only`, `ca_cert_pem_path`, `client_cert_pem_path`, `client_key_pem_path`,
       `retry_max_attempts`, `retry_backoff_ms`, `retry_backoff_max_ms`, `retry_jitter_ratio`,
-      `circuit_breaker_failure_threshold`, `circuit_breaker_open_ms`, `compression_gzip`.
+      `adaptive_retry`, `circuit_breaker_failure_threshold`, `circuit_breaker_open_ms`,
+      `circuit_breaker_state_path`, `circuit_breaker_scope_key`, `compression_gzip`.
   - Rust core (gRPC): `push_replication_metrics_otel_grpc_single_file(db, endpoint, timeout_ms, bearer_token)`
     - advanced TLS/mTLS: `push_replication_metrics_otel_grpc_*_with_options(...)` with
       `https_only`, `ca_cert_pem_path`, `client_cert_pem_path`, `client_key_pem_path`,
       `retry_max_attempts`, `retry_backoff_ms`, `retry_backoff_max_ms`, `retry_jitter_ratio`,
-      `circuit_breaker_failure_threshold`, `circuit_breaker_open_ms`, `compression_gzip`.
+      `adaptive_retry`, `circuit_breaker_failure_threshold`, `circuit_breaker_open_ms`,
+      `circuit_breaker_state_path`, `circuit_breaker_scope_key`, `compression_gzip`.
   - Node NAPI: `pushReplicationMetricsOtelJson(db, endpoint, timeoutMs, bearerToken?)`
     - advanced TLS/mTLS: `pushReplicationMetricsOtelJsonWithOptions(db, endpoint, options)`.
   - Node NAPI (protobuf): `pushReplicationMetricsOtelProtobuf(db, endpoint, timeoutMs, bearerToken?)`
@@ -60,17 +63,20 @@ Metrics surface:
     - advanced TLS/mTLS kwargs:
       `https_only`, `ca_cert_pem_path`, `client_cert_pem_path`, `client_key_pem_path`,
       `retry_max_attempts`, `retry_backoff_ms`, `retry_backoff_max_ms`, `retry_jitter_ratio`,
-      `circuit_breaker_failure_threshold`, `circuit_breaker_open_ms`, `compression_gzip`.
+      `adaptive_retry`, `circuit_breaker_failure_threshold`, `circuit_breaker_open_ms`,
+      `circuit_breaker_state_path`, `circuit_breaker_scope_key`, `compression_gzip`.
   - Python PyO3 (protobuf): `push_replication_metrics_otel_protobuf(db, endpoint, timeout_ms=5000, bearer_token=None)`
     - advanced TLS/mTLS kwargs:
       `https_only`, `ca_cert_pem_path`, `client_cert_pem_path`, `client_key_pem_path`,
       `retry_max_attempts`, `retry_backoff_ms`, `retry_backoff_max_ms`, `retry_jitter_ratio`,
-      `circuit_breaker_failure_threshold`, `circuit_breaker_open_ms`, `compression_gzip`.
+      `adaptive_retry`, `circuit_breaker_failure_threshold`, `circuit_breaker_open_ms`,
+      `circuit_breaker_state_path`, `circuit_breaker_scope_key`, `compression_gzip`.
   - Python PyO3 (gRPC): `push_replication_metrics_otel_grpc(db, endpoint, timeout_ms=5000, bearer_token=None)`
     - advanced TLS/mTLS kwargs:
       `https_only`, `ca_cert_pem_path`, `client_cert_pem_path`, `client_key_pem_path`,
       `retry_max_attempts`, `retry_backoff_ms`, `retry_backoff_max_ms`, `retry_jitter_ratio`,
-      `circuit_breaker_failure_threshold`, `circuit_breaker_open_ms`, `compression_gzip`.
+      `adaptive_retry`, `circuit_breaker_failure_threshold`, `circuit_breaker_open_ms`,
+      `circuit_breaker_state_path`, `circuit_breaker_scope_key`, `compression_gzip`.
 - Host-runtime replication transport JSON export helpers are available via:
   - Node NAPI: `collectReplicationSnapshotTransportJson(db, includeData?)`,
     `collectReplicationLogTransportJson(db, cursor?, maxFrames?, maxBytes?, includePayload?)`
@@ -219,5 +225,5 @@ Playground curl examples:
 
 - Retention policy supports entry-window + time-window floors, but not richer SLA-aware policies.
 - Bundled HTTP admin endpoints still ship in playground runtime; host runtime now exposes transport JSON helpers for embedding custom HTTP surfaces.
-- OTLP retry policy is per-process with bounded attempt/backoff/jitter and endpoint-local circuit-breakers; no shared/durable breaker state yet.
+- OTLP retry policy is bounded attempt/backoff/jitter with optional adaptive multiplier. Circuit-breaker state is process-local by default; optional file-backed sharing is available via `circuit_breaker_state_path` + `circuit_breaker_scope_key`.
 - `SyncMode::Normal` and `SyncMode::Off` optimize commit latency by batching sidecar frame writes in-memory and refreshing manifest fencing periodically (not every commit). For strict per-commit sidecar visibility/fencing, use `SyncMode::Full`.

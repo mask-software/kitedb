@@ -28,6 +28,7 @@ use opentelemetry_proto::tonic::resource::v1::Resource as OtelResource;
 use parking_lot::Mutex;
 use prost::Message;
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tonic::codec::CompressionEncoding as TonicCompressionEncoding;
 use tonic::metadata::MetadataValue;
@@ -190,8 +191,11 @@ pub struct OtlpHttpPushOptions {
   pub retry_backoff_ms: u64,
   pub retry_backoff_max_ms: u64,
   pub retry_jitter_ratio: f64,
+  pub adaptive_retry: bool,
   pub circuit_breaker_failure_threshold: u32,
   pub circuit_breaker_open_ms: u64,
+  pub circuit_breaker_state_path: Option<String>,
+  pub circuit_breaker_scope_key: Option<String>,
   pub compression_gzip: bool,
   pub tls: OtlpHttpTlsOptions,
 }
@@ -205,8 +209,11 @@ impl Default for OtlpHttpPushOptions {
       retry_backoff_ms: 100,
       retry_backoff_max_ms: 2_000,
       retry_jitter_ratio: 0.0,
+      adaptive_retry: false,
       circuit_breaker_failure_threshold: 0,
       circuit_breaker_open_ms: 0,
+      circuit_breaker_state_path: None,
+      circuit_breaker_scope_key: None,
       compression_gzip: false,
       tls: OtlpHttpTlsOptions::default(),
     }
@@ -558,7 +565,10 @@ fn push_replication_metrics_otel_grpc_request_with_options(
             "OTLP collector gRPC transport error: {error}"
           )));
           if attempt < options.retry_max_attempts {
-            tokio::time::sleep(retry_backoff_with_jitter_duration(options, attempt)).await;
+            tokio::time::sleep(retry_backoff_with_jitter_duration(
+              endpoint, options, attempt,
+            ))
+            .await;
             continue;
           }
           record_circuit_breaker_failure(endpoint, options);
@@ -601,7 +611,10 @@ fn push_replication_metrics_otel_grpc_request_with_options(
         }
         Err(status) => {
           if attempt < options.retry_max_attempts && should_retry_grpc_status(status.code()) {
-            tokio::time::sleep(retry_backoff_with_jitter_duration(options, attempt)).await;
+            tokio::time::sleep(retry_backoff_with_jitter_duration(
+              endpoint, options, attempt,
+            ))
+            .await;
             continue;
           }
           record_circuit_breaker_failure(endpoint, options);
@@ -669,7 +682,9 @@ fn push_replication_metrics_otel_http_payload_with_options(
       Err(ureq::Error::Status(status_code, response)) => {
         let body = response.into_string().unwrap_or_default();
         if attempt < options.retry_max_attempts && should_retry_http_status(status_code) {
-          thread::sleep(retry_backoff_with_jitter_duration(options, attempt));
+          thread::sleep(retry_backoff_with_jitter_duration(
+            endpoint, options, attempt,
+          ));
           continue;
         }
         record_circuit_breaker_failure(endpoint, options);
@@ -679,7 +694,9 @@ fn push_replication_metrics_otel_http_payload_with_options(
       }
       Err(ureq::Error::Transport(error)) => {
         if attempt < options.retry_max_attempts {
-          thread::sleep(retry_backoff_with_jitter_duration(options, attempt));
+          thread::sleep(retry_backoff_with_jitter_duration(
+            endpoint, options, attempt,
+          ));
           continue;
         }
         record_circuit_breaker_failure(endpoint, options);
@@ -715,6 +732,20 @@ fn validate_otel_push_options(options: &OtlpHttpPushOptions) -> Result<()> {
         .into(),
     ));
   }
+  if let Some(path) = options.circuit_breaker_state_path.as_deref() {
+    if path.trim().is_empty() {
+      return Err(KiteError::InvalidQuery(
+        "circuit_breaker_state_path must not be empty when provided".into(),
+      ));
+    }
+  }
+  if let Some(scope_key) = options.circuit_breaker_scope_key.as_deref() {
+    if scope_key.trim().is_empty() {
+      return Err(KiteError::InvalidQuery(
+        "circuit_breaker_scope_key must not be empty when provided".into(),
+      ));
+    }
+  }
   Ok(())
 }
 
@@ -744,24 +775,35 @@ fn retry_backoff_duration(options: &OtlpHttpPushOptions, attempt: u32) -> Durati
   Duration::from_millis(backoff)
 }
 
-fn retry_backoff_with_jitter_duration(options: &OtlpHttpPushOptions, attempt: u32) -> Duration {
+fn retry_backoff_with_jitter_duration(
+  endpoint: &str,
+  options: &OtlpHttpPushOptions,
+  attempt: u32,
+) -> Duration {
+  let multiplier = adaptive_retry_multiplier(endpoint, options);
   let base = retry_backoff_duration(options, attempt);
-  if options.retry_jitter_ratio <= 0.0 {
-    return base;
+  let mut base_ms = base.as_millis() as u64;
+  if multiplier > 1 {
+    base_ms = base_ms.saturating_mul(multiplier);
+    if options.retry_backoff_max_ms > 0 {
+      base_ms = base_ms.min(options.retry_backoff_max_ms);
+    }
   }
-  let base_ms = base.as_millis() as u64;
+  if options.retry_jitter_ratio <= 0.0 {
+    return Duration::from_millis(base_ms);
+  }
   if base_ms == 0 {
-    return base;
+    return Duration::from_millis(base_ms);
   }
   let jitter_max = ((base_ms as f64) * options.retry_jitter_ratio) as u64;
   if jitter_max == 0 {
-    return base;
+    return Duration::from_millis(base_ms);
   }
   let jitter = rand::thread_rng().gen_range(0..=jitter_max);
   Duration::from_millis(base_ms.saturating_add(jitter))
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct OtlpCircuitBreakerState {
   consecutive_failures: u32,
   open_until_ms: u64,
@@ -781,14 +823,81 @@ fn circuit_breaker_now_ms() -> u64 {
     .as_millis() as u64
 }
 
+fn circuit_breaker_key(endpoint: &str, options: &OtlpHttpPushOptions) -> String {
+  options
+    .circuit_breaker_scope_key
+    .as_deref()
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+    .unwrap_or(endpoint)
+    .to_string()
+}
+
+fn circuit_breaker_state_path(options: &OtlpHttpPushOptions) -> Option<&str> {
+  options
+    .circuit_breaker_state_path
+    .as_deref()
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+}
+
+fn load_persisted_breakers(path: &str) -> HashMap<String, OtlpCircuitBreakerState> {
+  let raw = match fs::read(path) {
+    Ok(bytes) => bytes,
+    Err(_) => return HashMap::new(),
+  };
+  serde_json::from_slice::<HashMap<String, OtlpCircuitBreakerState>>(&raw).unwrap_or_default()
+}
+
+fn persist_breakers(path: &str, states: &HashMap<String, OtlpCircuitBreakerState>) {
+  let Ok(serialized) = serde_json::to_vec(states) else {
+    return;
+  };
+  let _ = fs::write(path, serialized);
+}
+
+fn merge_persisted_breaker_state(
+  key: &str,
+  options: &OtlpHttpPushOptions,
+  states: &mut HashMap<String, OtlpCircuitBreakerState>,
+) {
+  let Some(path) = circuit_breaker_state_path(options) else {
+    return;
+  };
+  let persisted = load_persisted_breakers(path);
+  let Some(persisted_state) = persisted.get(key).cloned() else {
+    return;
+  };
+  let entry = states.entry(key.to_string()).or_default();
+  entry.consecutive_failures = entry
+    .consecutive_failures
+    .max(persisted_state.consecutive_failures);
+  entry.open_until_ms = entry.open_until_ms.max(persisted_state.open_until_ms);
+}
+
+fn adaptive_retry_multiplier(endpoint: &str, options: &OtlpHttpPushOptions) -> u64 {
+  if !options.adaptive_retry {
+    return 1;
+  }
+  let key = circuit_breaker_key(endpoint, options);
+  let mut states = otlp_circuit_breakers().lock();
+  merge_persisted_breaker_state(&key, options, &mut states);
+  let failures = states
+    .get(&key)
+    .map(|state| state.consecutive_failures)
+    .unwrap_or(0);
+  1 + u64::from(failures.min(8))
+}
+
 fn check_circuit_breaker_open(endpoint: &str, options: &OtlpHttpPushOptions) -> Result<()> {
   if options.circuit_breaker_failure_threshold == 0 {
     return Ok(());
   }
+  let key = circuit_breaker_key(endpoint, options);
   let now = circuit_breaker_now_ms();
-  let breakers = otlp_circuit_breakers();
-  let states = breakers.lock();
-  if let Some(state) = states.get(endpoint) {
+  let mut states = otlp_circuit_breakers().lock();
+  merge_persisted_breaker_state(&key, options, &mut states);
+  if let Some(state) = states.get(&key) {
     if state.open_until_ms > now {
       return Err(KiteError::Internal(format!(
         "OTLP circuit breaker open for endpoint {endpoint} until {}",
@@ -803,20 +912,36 @@ fn record_circuit_breaker_success(endpoint: &str, options: &OtlpHttpPushOptions)
   if options.circuit_breaker_failure_threshold == 0 {
     return;
   }
-  otlp_circuit_breakers().lock().remove(endpoint);
+  let key = circuit_breaker_key(endpoint, options);
+  let snapshot = {
+    let mut states = otlp_circuit_breakers().lock();
+    states.remove(&key);
+    states.clone()
+  };
+  if let Some(path) = circuit_breaker_state_path(options) {
+    persist_breakers(path, &snapshot);
+  }
 }
 
 fn record_circuit_breaker_failure(endpoint: &str, options: &OtlpHttpPushOptions) {
   if options.circuit_breaker_failure_threshold == 0 || options.circuit_breaker_open_ms == 0 {
     return;
   }
+  let key = circuit_breaker_key(endpoint, options);
   let now = circuit_breaker_now_ms();
-  let mut states = otlp_circuit_breakers().lock();
-  let state = states.entry(endpoint.to_string()).or_default();
-  state.consecutive_failures = state.consecutive_failures.saturating_add(1);
-  if state.consecutive_failures >= options.circuit_breaker_failure_threshold {
-    state.open_until_ms = now.saturating_add(options.circuit_breaker_open_ms);
-    state.consecutive_failures = 0;
+  let snapshot = {
+    let mut states = otlp_circuit_breakers().lock();
+    merge_persisted_breaker_state(&key, options, &mut states);
+    let state = states.entry(key).or_default();
+    state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+    if state.consecutive_failures >= options.circuit_breaker_failure_threshold {
+      state.open_until_ms = now.saturating_add(options.circuit_breaker_open_ms);
+      state.consecutive_failures = 0;
+    }
+    states.clone()
+  };
+  if let Some(path) = circuit_breaker_state_path(options) {
+    persist_breakers(path, &snapshot);
   }
 }
 

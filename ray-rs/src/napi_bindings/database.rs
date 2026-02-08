@@ -854,8 +854,11 @@ pub struct PushReplicationMetricsOtelOptions {
   pub retry_backoff_ms: Option<i64>,
   pub retry_backoff_max_ms: Option<i64>,
   pub retry_jitter_ratio: Option<f64>,
+  pub adaptive_retry: Option<bool>,
   pub circuit_breaker_failure_threshold: Option<i64>,
   pub circuit_breaker_open_ms: Option<i64>,
+  pub circuit_breaker_state_path: Option<String>,
+  pub circuit_breaker_scope_key: Option<String>,
   pub compression_gzip: Option<bool>,
   pub https_only: Option<bool>,
   pub ca_cert_pem_path: Option<String>,
@@ -3490,6 +3493,20 @@ fn build_core_otel_push_options(
       "circuitBreakerOpenMs must be positive when circuitBreakerFailureThreshold is set",
     ));
   }
+  if let Some(path) = options.circuit_breaker_state_path.as_deref() {
+    if path.trim().is_empty() {
+      return Err(Error::from_reason(
+        "circuitBreakerStatePath must not be empty when provided",
+      ));
+    }
+  }
+  if let Some(scope_key) = options.circuit_breaker_scope_key.as_deref() {
+    if scope_key.trim().is_empty() {
+      return Err(Error::from_reason(
+        "circuitBreakerScopeKey must not be empty when provided",
+      ));
+    }
+  }
 
   Ok(core_metrics::OtlpHttpPushOptions {
     timeout_ms: timeout_ms as u64,
@@ -3498,8 +3515,11 @@ fn build_core_otel_push_options(
     retry_backoff_ms: retry_backoff_ms as u64,
     retry_backoff_max_ms: retry_backoff_max_ms as u64,
     retry_jitter_ratio,
+    adaptive_retry: options.adaptive_retry.unwrap_or(false),
     circuit_breaker_failure_threshold: circuit_breaker_failure_threshold as u32,
     circuit_breaker_open_ms: circuit_breaker_open_ms as u64,
+    circuit_breaker_state_path: options.circuit_breaker_state_path,
+    circuit_breaker_scope_key: options.circuit_breaker_scope_key,
     compression_gzip: options.compression_gzip.unwrap_or(false),
     tls: core_metrics::OtlpHttpTlsOptions {
       https_only: options.https_only.unwrap_or(false),

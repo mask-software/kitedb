@@ -888,8 +888,11 @@ export interface PushReplicationMetricsOtelOptions {
   retryBackoffMs?: number
   retryBackoffMaxMs?: number
   retryJitterRatio?: number
+  adaptiveRetry?: boolean
   circuitBreakerFailureThreshold?: number
   circuitBreakerOpenMs?: number
+  circuitBreakerStatePath?: string
+  circuitBreakerScopeKey?: string
   compressionGzip?: boolean
   httpsOnly?: boolean
   caCertPemPath?: string
