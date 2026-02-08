@@ -834,6 +834,148 @@ fn spawn_state_store_patch_batch_server(expected_key: String) -> (String, thread
   (endpoint, handle)
 }
 
+fn spawn_state_store_patch_merge_server(
+  expected_steps: Vec<(String, String)>,
+) -> (String, thread::JoinHandle<()>) {
+  let listener = TcpListener::bind("127.0.0.1:0").expect("bind state store patch merge");
+  let address = listener
+    .local_addr()
+    .expect("state store patch merge local addr");
+  let endpoint = format!("http://{address}/breaker-state");
+  let handle = thread::spawn(move || {
+    for (expected_key, expected_patch_mode) in expected_steps {
+      for expected_method in ["GET", "GET", "PATCH"] {
+        let (mut stream, _) = listener.accept().expect("accept state store patch merge");
+        stream
+          .set_read_timeout(Some(Duration::from_secs(2)))
+          .expect("set state store patch merge read timeout");
+
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 1024];
+        let mut header_end: Option<usize> = None;
+        let mut content_length = 0usize;
+        loop {
+          match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => {
+              buffer.extend_from_slice(&chunk[..read]);
+              if header_end.is_none() {
+                if let Some(position) = find_subsequence(&buffer, b"\r\n\r\n") {
+                  let end = position + 4;
+                  header_end = Some(end);
+                  let headers_text = String::from_utf8_lossy(&buffer[..end]);
+                  for line in headers_text.lines().skip(1) {
+                    let Some((name, value)) = line.split_once(':') else {
+                      continue;
+                    };
+                    if name.eq_ignore_ascii_case("content-length") {
+                      content_length = value.trim().parse::<usize>().unwrap_or(0);
+                    }
+                  }
+                }
+              }
+              if let Some(end) = header_end {
+                if buffer.len() >= end + content_length {
+                  break;
+                }
+              }
+            }
+            Err(error) => panic!("read state store patch merge request failed: {error}"),
+          }
+        }
+
+        let end = header_end.expect("state store patch merge header terminator");
+        let request_text = String::from_utf8_lossy(&buffer[..end]);
+        let request_line = request_text.lines().next().unwrap_or_default();
+        assert!(
+          request_line.starts_with(&format!("{expected_method} /breaker-state HTTP/1.1")),
+          "unexpected state store patch merge request line: {request_line}"
+        );
+
+        let mut headers = HashMap::new();
+        for line in request_text.lines().skip(1) {
+          let Some((name, value)) = line.split_once(':') else {
+            continue;
+          };
+          headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+        }
+
+        assert_eq!(
+          headers.get("x-kitedb-breaker-key").map(String::as_str),
+          Some(expected_key.as_str()),
+          "patch merge key header mismatch"
+        );
+        if expected_method == "PATCH" {
+          assert_eq!(
+            headers.get("x-kitedb-breaker-mode").map(String::as_str),
+            Some(expected_patch_mode.as_str()),
+            "patch merge mode header mismatch"
+          );
+          let body_end = (end + content_length).min(buffer.len());
+          let payload: serde_json::Value =
+            serde_json::from_slice(&buffer[end..body_end]).expect("parse patch merge payload");
+          if expected_patch_mode == "patch-merge-v1" {
+            assert_eq!(
+              payload["scope_key"].as_str(),
+              Some(expected_key.as_str()),
+              "patch merge scope key mismatch"
+            );
+            assert!(
+              payload["total_keys"].as_u64().unwrap_or_default() >= 3,
+              "patch merge total_keys should include all tracked keys"
+            );
+            assert_eq!(
+              payload["truncated"].as_bool(),
+              Some(true),
+              "patch merge payload should mark truncation"
+            );
+            let updates = payload["updates"].as_array().expect("updates array");
+            assert!(!updates.is_empty(), "updates must not be empty");
+            assert!(
+              updates.len() <= 2,
+              "updates should respect merge max keys, got {}",
+              updates.len()
+            );
+            assert_eq!(
+              updates[0]["key"].as_str(),
+              Some(expected_key.as_str()),
+              "primary key must be first update"
+            );
+          } else {
+            assert_eq!(
+              payload["key"].as_str(),
+              Some(expected_key.as_str()),
+              "patch key mismatch"
+            );
+            assert!(payload["state"].is_object(), "missing patch state object");
+          }
+        } else {
+          assert_eq!(
+            headers.get("x-kitedb-breaker-mode").map(String::as_str),
+            Some("patch-v1"),
+            "patch merge GET mode header mismatch"
+          );
+        }
+
+        let etag = if expected_method == "PATCH" {
+          "pm2"
+        } else {
+          "pm1"
+        };
+        let body = "{}";
+        let response = format!(
+          "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nETag: {etag}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+          body.len()
+        );
+        stream
+          .write_all(response.as_bytes())
+          .expect("write state store patch merge response");
+      }
+    }
+  });
+  (endpoint, handle)
+}
+
 fn spawn_grpc_capture_server(
   fail_first_attempts: usize,
 ) -> (
@@ -1428,6 +1570,46 @@ fn otlp_push_payload_rejects_state_patch_retry_max_attempts_zero() {
 }
 
 #[test]
+fn otlp_push_payload_rejects_state_patch_merge_without_patch() {
+  let options = OtlpHttpPushOptions {
+    timeout_ms: 2_000,
+    circuit_breaker_state_url: Some("http://127.0.0.1:4318/state".to_string()),
+    circuit_breaker_state_patch_merge: true,
+    ..OtlpHttpPushOptions::default()
+  };
+  let error = push_replication_metrics_otel_json_payload_with_options(
+    "{}",
+    "http://127.0.0.1:4318/v1/metrics",
+    &options,
+  )
+  .expect_err("state patch merge without patch mode must fail");
+  assert!(error
+    .to_string()
+    .contains("circuit_breaker_state_patch_merge requires circuit_breaker_state_patch"));
+}
+
+#[test]
+fn otlp_push_payload_rejects_state_patch_merge_max_keys_zero() {
+  let options = OtlpHttpPushOptions {
+    timeout_ms: 2_000,
+    circuit_breaker_state_url: Some("http://127.0.0.1:4318/state".to_string()),
+    circuit_breaker_state_patch: true,
+    circuit_breaker_state_patch_merge: true,
+    circuit_breaker_state_patch_merge_max_keys: 0,
+    ..OtlpHttpPushOptions::default()
+  };
+  let error = push_replication_metrics_otel_json_payload_with_options(
+    "{}",
+    "http://127.0.0.1:4318/v1/metrics",
+    &options,
+  )
+  .expect_err("state patch merge max keys zero must fail");
+  assert!(error
+    .to_string()
+    .contains("circuit_breaker_state_patch_merge_max_keys"));
+}
+
+#[test]
 fn otlp_push_payload_rejects_state_lease_without_url() {
   let options = OtlpHttpPushOptions {
     timeout_ms: 2_000,
@@ -1771,6 +1953,60 @@ fn otlp_push_payload_shared_state_url_patch_batch_protocol_uses_multi_key_update
   );
 
   state_handle.join().expect("state store patch batch thread");
+}
+
+#[test]
+fn otlp_push_payload_shared_state_url_patch_merge_protocol_compacts_high_cardinality_keys() {
+  let key_a = "shared-patch-merge-breaker-a";
+  let key_b = "shared-patch-merge-breaker-b";
+  let key_c = "shared-patch-merge-breaker-c";
+  let (state_url, state_handle) = spawn_state_store_patch_merge_server(vec![
+    (key_a.to_string(), "patch-v1".to_string()),
+    (key_b.to_string(), "patch-v1".to_string()),
+    (key_c.to_string(), "patch-merge-v1".to_string()),
+  ]);
+
+  let base_options = OtlpHttpPushOptions {
+    timeout_ms: 200,
+    retry_max_attempts: 1,
+    circuit_breaker_failure_threshold: 1,
+    circuit_breaker_open_ms: 2_000,
+    circuit_breaker_state_url: Some(state_url),
+    circuit_breaker_state_patch: true,
+    circuit_breaker_state_patch_merge_max_keys: 2,
+    ..OtlpHttpPushOptions::default()
+  };
+
+  for scope_key in [key_a, key_b] {
+    let mut options = base_options.clone();
+    options.circuit_breaker_scope_key = Some(scope_key.to_string());
+    let first = push_replication_metrics_otel_json_payload_with_options(
+      "{}",
+      "http://127.0.0.1:9/v1/metrics",
+      &options,
+    )
+    .expect_err("preload call should fail transport and persist key-scoped patch");
+    assert!(
+      first.to_string().contains("transport"),
+      "unexpected preload error: {first}"
+    );
+  }
+
+  let mut merge_options = base_options.clone();
+  merge_options.circuit_breaker_scope_key = Some(key_c.to_string());
+  merge_options.circuit_breaker_state_patch_merge = true;
+  let merged = push_replication_metrics_otel_json_payload_with_options(
+    "{}",
+    "http://127.0.0.1:9/v1/metrics",
+    &merge_options,
+  )
+  .expect_err("merge call should fail transport and persist compacted merge patch");
+  assert!(
+    merged.to_string().contains("transport"),
+    "unexpected merge error: {merged}"
+  );
+
+  state_handle.join().expect("state store patch merge thread");
 }
 
 #[test]

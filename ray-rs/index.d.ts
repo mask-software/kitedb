@@ -899,6 +899,8 @@ export interface PushReplicationMetricsOtelOptions {
   circuitBreakerStatePatch?: boolean
   circuitBreakerStatePatchBatch?: boolean
   circuitBreakerStatePatchBatchMaxKeys?: number
+  circuitBreakerStatePatchMerge?: boolean
+  circuitBreakerStatePatchMergeMaxKeys?: number
   circuitBreakerStatePatchRetryMaxAttempts?: number
   circuitBreakerStateCas?: boolean
   circuitBreakerStateLeaseId?: string

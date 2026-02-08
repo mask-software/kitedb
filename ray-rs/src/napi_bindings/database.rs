@@ -865,6 +865,8 @@ pub struct PushReplicationMetricsOtelOptions {
   pub circuit_breaker_state_patch: Option<bool>,
   pub circuit_breaker_state_patch_batch: Option<bool>,
   pub circuit_breaker_state_patch_batch_max_keys: Option<i64>,
+  pub circuit_breaker_state_patch_merge: Option<bool>,
+  pub circuit_breaker_state_patch_merge_max_keys: Option<i64>,
   pub circuit_breaker_state_patch_retry_max_attempts: Option<i64>,
   pub circuit_breaker_state_cas: Option<bool>,
   pub circuit_breaker_state_lease_id: Option<String>,
@@ -3581,12 +3583,27 @@ fn build_core_otel_push_options(
       "circuitBreakerStatePatchBatch requires circuitBreakerStatePatch",
     ));
   }
+  if options.circuit_breaker_state_patch_merge.unwrap_or(false)
+    && !options.circuit_breaker_state_patch.unwrap_or(false)
+  {
+    return Err(Error::from_reason(
+      "circuitBreakerStatePatchMerge requires circuitBreakerStatePatch",
+    ));
+  }
   let circuit_breaker_state_patch_batch_max_keys = options
     .circuit_breaker_state_patch_batch_max_keys
     .unwrap_or(8);
   if circuit_breaker_state_patch_batch_max_keys <= 0 {
     return Err(Error::from_reason(
       "circuitBreakerStatePatchBatchMaxKeys must be positive",
+    ));
+  }
+  let circuit_breaker_state_patch_merge_max_keys = options
+    .circuit_breaker_state_patch_merge_max_keys
+    .unwrap_or(32);
+  if circuit_breaker_state_patch_merge_max_keys <= 0 {
+    return Err(Error::from_reason(
+      "circuitBreakerStatePatchMergeMaxKeys must be positive",
     ));
   }
   let circuit_breaker_state_patch_retry_max_attempts = options
@@ -3642,6 +3659,8 @@ fn build_core_otel_push_options(
     circuit_breaker_state_patch: options.circuit_breaker_state_patch.unwrap_or(false),
     circuit_breaker_state_patch_batch: options.circuit_breaker_state_patch_batch.unwrap_or(false),
     circuit_breaker_state_patch_batch_max_keys: circuit_breaker_state_patch_batch_max_keys as u32,
+    circuit_breaker_state_patch_merge: options.circuit_breaker_state_patch_merge.unwrap_or(false),
+    circuit_breaker_state_patch_merge_max_keys: circuit_breaker_state_patch_merge_max_keys as u32,
     circuit_breaker_state_patch_retry_max_attempts: circuit_breaker_state_patch_retry_max_attempts
       as u32,
     circuit_breaker_state_cas: options.circuit_breaker_state_cas.unwrap_or(false),

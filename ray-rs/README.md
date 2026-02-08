@@ -279,6 +279,8 @@ const secureExport = pushReplicationMetricsOtelJsonWithOptions(
     circuitBreakerStatePatch: true,
     circuitBreakerStatePatchBatch: true,
     circuitBreakerStatePatchBatchMaxKeys: 4,
+    circuitBreakerStatePatchMerge: true,
+    circuitBreakerStatePatchMergeMaxKeys: 16,
     circuitBreakerStatePatchRetryMaxAttempts: 2,
     circuitBreakerStateCas: true,
     circuitBreakerStateLeaseId: 'otlp-writer-a',
