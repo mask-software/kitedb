@@ -299,6 +299,46 @@ fn spawn_http_sequence_capture_server(
   (endpoint, rx, handle)
 }
 
+fn spawn_state_store_get_server(state_body: String) -> (String, thread::JoinHandle<()>) {
+  let listener = TcpListener::bind("127.0.0.1:0").expect("bind state store");
+  let address = listener.local_addr().expect("state store local addr");
+  let endpoint = format!("http://{address}/breaker-state");
+  let handle = thread::spawn(move || {
+    let (mut stream, _) = listener.accept().expect("accept state store");
+    stream
+      .set_read_timeout(Some(Duration::from_secs(2)))
+      .expect("set state store read timeout");
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 512];
+    loop {
+      match stream.read(&mut chunk) {
+        Ok(0) => break,
+        Ok(read) => {
+          buffer.extend_from_slice(&chunk[..read]);
+          if find_subsequence(&buffer, b"\r\n\r\n").is_some() {
+            break;
+          }
+        }
+        Err(error) => panic!("read state store request failed: {error}"),
+      }
+    }
+    let request_text = String::from_utf8_lossy(&buffer);
+    assert!(
+      request_text.starts_with("GET /breaker-state HTTP/1.1"),
+      "unexpected state store request: {request_text}"
+    );
+    let response = format!(
+      "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+      state_body.len(),
+      state_body
+    );
+    stream
+      .write_all(response.as_bytes())
+      .expect("write state store response");
+  });
+  (endpoint, handle)
+}
+
 fn spawn_grpc_capture_server(
   fail_first_attempts: usize,
 ) -> (
@@ -779,6 +819,25 @@ fn otlp_push_payload_rejects_zero_half_open_probes_when_breaker_enabled() {
 }
 
 #[test]
+fn otlp_push_payload_rejects_conflicting_breaker_state_backends() {
+  let options = OtlpHttpPushOptions {
+    timeout_ms: 2_000,
+    circuit_breaker_state_path: Some("/tmp/otlp-breaker-state.json".to_string()),
+    circuit_breaker_state_url: Some("http://127.0.0.1:4318/state".to_string()),
+    ..OtlpHttpPushOptions::default()
+  };
+  let error = push_replication_metrics_otel_json_payload_with_options(
+    "{}",
+    "http://127.0.0.1:4318/v1/metrics",
+    &options,
+  )
+  .expect_err("conflicting state backend options must fail");
+  assert!(error
+    .to_string()
+    .contains("circuit_breaker_state_path and circuit_breaker_state_url"));
+}
+
+#[test]
 fn otlp_push_payload_circuit_breaker_opens_after_failure() {
   let probe = TcpListener::bind("127.0.0.1:0").expect("bind probe");
   let port = probe.local_addr().expect("probe addr").port();
@@ -908,6 +967,44 @@ fn otlp_push_payload_uses_persisted_shared_circuit_breaker_state() {
     error.to_string().contains("circuit breaker open"),
     "unexpected error: {error}"
   );
+}
+
+#[test]
+fn otlp_push_payload_uses_shared_circuit_breaker_state_url() {
+  let now_ms = SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .unwrap_or_default()
+    .as_millis() as u64;
+  let state_json = serde_json::json!({
+    "shared-breaker-url": {
+      "consecutive_failures": 0,
+      "open_until_ms": now_ms + 5_000
+    }
+  })
+  .to_string();
+  let (state_url, state_handle) = spawn_state_store_get_server(state_json);
+
+  let options = OtlpHttpPushOptions {
+    timeout_ms: 200,
+    retry_max_attempts: 1,
+    circuit_breaker_failure_threshold: 1,
+    circuit_breaker_open_ms: 500,
+    circuit_breaker_state_url: Some(state_url),
+    circuit_breaker_scope_key: Some("shared-breaker-url".to_string()),
+    ..OtlpHttpPushOptions::default()
+  };
+
+  let error = push_replication_metrics_otel_json_payload_with_options(
+    "{}",
+    "http://127.0.0.1:9/v1/metrics",
+    &options,
+  )
+  .expect_err("remote shared open breaker should block request");
+  assert!(
+    error.to_string().contains("circuit breaker open"),
+    "unexpected error: {error}"
+  );
+  state_handle.join().expect("state store thread");
 }
 
 #[test]

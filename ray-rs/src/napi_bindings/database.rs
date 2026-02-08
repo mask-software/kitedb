@@ -861,6 +861,7 @@ pub struct PushReplicationMetricsOtelOptions {
   pub circuit_breaker_open_ms: Option<i64>,
   pub circuit_breaker_half_open_probes: Option<i64>,
   pub circuit_breaker_state_path: Option<String>,
+  pub circuit_breaker_state_url: Option<String>,
   pub circuit_breaker_scope_key: Option<String>,
   pub compression_gzip: Option<bool>,
   pub https_only: Option<bool>,
@@ -3537,6 +3538,29 @@ fn build_core_otel_push_options(
       ));
     }
   }
+  if let Some(url) = options.circuit_breaker_state_url.as_deref() {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+      return Err(Error::from_reason(
+        "circuitBreakerStateUrl must not be empty when provided",
+      ));
+    }
+    if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+      return Err(Error::from_reason(
+        "circuitBreakerStateUrl must use http:// or https://",
+      ));
+    }
+    if options.https_only.unwrap_or(false) && trimmed.starts_with("http://") {
+      return Err(Error::from_reason(
+        "circuitBreakerStateUrl must use https when httpsOnly is enabled",
+      ));
+    }
+  }
+  if options.circuit_breaker_state_path.is_some() && options.circuit_breaker_state_url.is_some() {
+    return Err(Error::from_reason(
+      "circuitBreakerStatePath and circuitBreakerStateUrl are mutually exclusive",
+    ));
+  }
   if let Some(scope_key) = options.circuit_breaker_scope_key.as_deref() {
     if scope_key.trim().is_empty() {
       return Err(Error::from_reason(
@@ -3559,6 +3583,7 @@ fn build_core_otel_push_options(
     circuit_breaker_open_ms: circuit_breaker_open_ms as u64,
     circuit_breaker_half_open_probes: circuit_breaker_half_open_probes as u32,
     circuit_breaker_state_path: options.circuit_breaker_state_path,
+    circuit_breaker_state_url: options.circuit_breaker_state_url,
     circuit_breaker_scope_key: options.circuit_breaker_scope_key,
     compression_gzip: options.compression_gzip.unwrap_or(false),
     tls: core_metrics::OtlpHttpTlsOptions {

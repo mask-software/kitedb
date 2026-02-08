@@ -205,6 +205,7 @@ pub struct OtlpHttpPushOptions {
   pub circuit_breaker_open_ms: u64,
   pub circuit_breaker_half_open_probes: u32,
   pub circuit_breaker_state_path: Option<String>,
+  pub circuit_breaker_state_url: Option<String>,
   pub circuit_breaker_scope_key: Option<String>,
   pub compression_gzip: bool,
   pub tls: OtlpHttpTlsOptions,
@@ -226,6 +227,7 @@ impl Default for OtlpHttpPushOptions {
       circuit_breaker_open_ms: 0,
       circuit_breaker_half_open_probes: 1,
       circuit_breaker_state_path: None,
+      circuit_breaker_state_url: None,
       circuit_breaker_scope_key: None,
       compression_gzip: false,
       tls: OtlpHttpTlsOptions::default(),
@@ -764,6 +766,29 @@ fn validate_otel_push_options(options: &OtlpHttpPushOptions) -> Result<()> {
       ));
     }
   }
+  if let Some(url) = options.circuit_breaker_state_url.as_deref() {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+      return Err(KiteError::InvalidQuery(
+        "circuit_breaker_state_url must not be empty when provided".into(),
+      ));
+    }
+    if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+      return Err(KiteError::InvalidQuery(
+        "circuit_breaker_state_url must use http:// or https://".into(),
+      ));
+    }
+    if options.tls.https_only && !endpoint_uses_https(trimmed) {
+      return Err(KiteError::InvalidQuery(
+        "circuit_breaker_state_url must use https when https_only is enabled".into(),
+      ));
+    }
+  }
+  if options.circuit_breaker_state_path.is_some() && options.circuit_breaker_state_url.is_some() {
+    return Err(KiteError::InvalidQuery(
+      "circuit_breaker_state_path and circuit_breaker_state_url are mutually exclusive".into(),
+    ));
+  }
   if let Some(scope_key) = options.circuit_breaker_scope_key.as_deref() {
     if scope_key.trim().is_empty() {
       return Err(KiteError::InvalidQuery(
@@ -870,7 +895,15 @@ fn circuit_breaker_state_path(options: &OtlpHttpPushOptions) -> Option<&str> {
     .filter(|value| !value.is_empty())
 }
 
-fn load_persisted_breakers(path: &str) -> HashMap<String, OtlpCircuitBreakerState> {
+fn circuit_breaker_state_url(options: &OtlpHttpPushOptions) -> Option<&str> {
+  options
+    .circuit_breaker_state_url
+    .as_deref()
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+}
+
+fn load_persisted_breakers_from_path(path: &str) -> HashMap<String, OtlpCircuitBreakerState> {
   let raw = match fs::read(path) {
     Ok(bytes) => bytes,
     Err(_) => return HashMap::new(),
@@ -878,23 +911,81 @@ fn load_persisted_breakers(path: &str) -> HashMap<String, OtlpCircuitBreakerStat
   serde_json::from_slice::<HashMap<String, OtlpCircuitBreakerState>>(&raw).unwrap_or_default()
 }
 
-fn persist_breakers(path: &str, states: &HashMap<String, OtlpCircuitBreakerState>) {
+fn load_persisted_breakers_from_url(
+  url: &str,
+  options: &OtlpHttpPushOptions,
+) -> HashMap<String, OtlpCircuitBreakerState> {
+  let timeout = Duration::from_millis(options.timeout_ms.max(1));
+  let agent = match build_otel_http_agent(url, options, timeout) {
+    Ok(agent) => agent,
+    Err(_) => return HashMap::new(),
+  };
+  let response = match agent.get(url).timeout(timeout).call() {
+    Ok(response) => response,
+    Err(_) => return HashMap::new(),
+  };
+  let body = response.into_string().unwrap_or_default();
+  serde_json::from_str::<HashMap<String, OtlpCircuitBreakerState>>(&body).unwrap_or_default()
+}
+
+fn load_persisted_breaker_state(
+  key: &str,
+  options: &OtlpHttpPushOptions,
+) -> Option<OtlpCircuitBreakerState> {
+  if let Some(path) = circuit_breaker_state_path(options) {
+    return load_persisted_breakers_from_path(path).get(key).cloned();
+  }
+  if let Some(url) = circuit_breaker_state_url(options) {
+    return load_persisted_breakers_from_url(url, options)
+      .get(key)
+      .cloned();
+  }
+  None
+}
+
+fn persist_breakers_to_path(path: &str, states: &HashMap<String, OtlpCircuitBreakerState>) {
   let Ok(serialized) = serde_json::to_vec(states) else {
     return;
   };
   let _ = fs::write(path, serialized);
 }
 
-fn merge_persisted_breaker_state(
-  key: &str,
+fn persist_breakers_to_url(
+  url: &str,
   options: &OtlpHttpPushOptions,
-  states: &mut HashMap<String, OtlpCircuitBreakerState>,
+  states: &HashMap<String, OtlpCircuitBreakerState>,
 ) {
-  let Some(path) = circuit_breaker_state_path(options) else {
+  let Ok(serialized) = serde_json::to_vec(states) else {
     return;
   };
-  let persisted = load_persisted_breakers(path);
-  let Some(persisted_state) = persisted.get(key).cloned() else {
+  let timeout = Duration::from_millis(options.timeout_ms.max(1));
+  let Ok(agent) = build_otel_http_agent(url, options, timeout) else {
+    return;
+  };
+  let _ = agent
+    .put(url)
+    .set("content-type", "application/json")
+    .timeout(timeout)
+    .send_bytes(&serialized);
+}
+
+fn persist_breakers(
+  options: &OtlpHttpPushOptions,
+  states: &HashMap<String, OtlpCircuitBreakerState>,
+) {
+  if let Some(path) = circuit_breaker_state_path(options) {
+    persist_breakers_to_path(path, states);
+  } else if let Some(url) = circuit_breaker_state_url(options) {
+    persist_breakers_to_url(url, options, states);
+  }
+}
+
+fn merge_persisted_breaker_state(
+  key: &str,
+  persisted_state: Option<OtlpCircuitBreakerState>,
+  states: &mut HashMap<String, OtlpCircuitBreakerState>,
+) {
+  let Some(persisted_state) = persisted_state else {
     return;
   };
   let entry = states.entry(key.to_string()).or_default();
@@ -916,8 +1007,9 @@ fn adaptive_retry_multiplier(endpoint: &str, options: &OtlpHttpPushOptions) -> u
     return 1;
   }
   let key = circuit_breaker_key(endpoint, options);
+  let persisted_state = load_persisted_breaker_state(&key, options);
   let mut states = otlp_circuit_breakers().lock();
-  merge_persisted_breaker_state(&key, options, &mut states);
+  merge_persisted_breaker_state(&key, persisted_state, &mut states);
   let multiplier = states
     .get(&key)
     .map(|state| match options.adaptive_retry_mode {
@@ -937,9 +1029,10 @@ fn check_circuit_breaker_open(endpoint: &str, options: &OtlpHttpPushOptions) -> 
   }
   let key = circuit_breaker_key(endpoint, options);
   let now = circuit_breaker_now_ms();
+  let persisted_state = load_persisted_breaker_state(&key, options);
   let snapshot = {
     let mut states = otlp_circuit_breakers().lock();
-    merge_persisted_breaker_state(&key, options, &mut states);
+    merge_persisted_breaker_state(&key, persisted_state, &mut states);
     let Some(state) = states.get_mut(&key) else {
       return Ok(());
     };
@@ -977,8 +1070,8 @@ fn check_circuit_breaker_open(endpoint: &str, options: &OtlpHttpPushOptions) -> 
       None
     }
   };
-  if let (Some(path), Some(snapshot)) = (circuit_breaker_state_path(options), snapshot) {
-    persist_breakers(path, &snapshot);
+  if let Some(snapshot) = snapshot {
+    persist_breakers(options, &snapshot);
   }
   Ok(())
 }
@@ -988,9 +1081,10 @@ fn record_circuit_breaker_success(endpoint: &str, options: &OtlpHttpPushOptions)
     return;
   }
   let key = circuit_breaker_key(endpoint, options);
+  let persisted_state = load_persisted_breaker_state(&key, options);
   let snapshot = {
     let mut states = otlp_circuit_breakers().lock();
-    merge_persisted_breaker_state(&key, options, &mut states);
+    merge_persisted_breaker_state(&key, persisted_state, &mut states);
     let state = states.entry(key.clone()).or_default();
     let alpha = options.adaptive_retry_ewma_alpha.clamp(0.0, 1.0);
     state.ewma_error_score = ((1.0 - alpha) * state.ewma_error_score).clamp(0.0, 1.0);
@@ -1015,9 +1109,7 @@ fn record_circuit_breaker_success(endpoint: &str, options: &OtlpHttpPushOptions)
     }
     states.clone()
   };
-  if let Some(path) = circuit_breaker_state_path(options) {
-    persist_breakers(path, &snapshot);
-  }
+  persist_breakers(options, &snapshot);
 }
 
 fn record_circuit_breaker_failure(endpoint: &str, options: &OtlpHttpPushOptions) {
@@ -1028,9 +1120,10 @@ fn record_circuit_breaker_failure(endpoint: &str, options: &OtlpHttpPushOptions)
   }
   let key = circuit_breaker_key(endpoint, options);
   let now = circuit_breaker_now_ms();
+  let persisted_state = load_persisted_breaker_state(&key, options);
   let snapshot = {
     let mut states = otlp_circuit_breakers().lock();
-    merge_persisted_breaker_state(&key, options, &mut states);
+    merge_persisted_breaker_state(&key, persisted_state, &mut states);
     let state = states.entry(key).or_default();
     let alpha = options.adaptive_retry_ewma_alpha.clamp(0.0, 1.0);
     state.ewma_error_score = ((1.0 - alpha) * state.ewma_error_score + alpha).clamp(0.0, 1.0);
@@ -1053,9 +1146,7 @@ fn record_circuit_breaker_failure(endpoint: &str, options: &OtlpHttpPushOptions)
     }
     states.clone()
   };
-  if let Some(path) = circuit_breaker_state_path(options) {
-    persist_breakers(path, &snapshot);
-  }
+  persist_breakers(options, &snapshot);
 }
 
 fn encode_http_request_payload(payload: &[u8], compression_gzip: bool) -> Result<Vec<u8>> {
