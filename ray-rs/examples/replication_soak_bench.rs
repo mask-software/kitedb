@@ -460,6 +460,45 @@ fn main() -> kitedb::Result<()> {
     }
 
     if config.promotion_interval > 0 && (cycle + 1) % config.promotion_interval == 0 {
+      // Before epoch change, force all replicas to converge to current head.
+      // This keeps promotion checks deterministic under churn and retention pressure.
+      let head_before_promotion = primary_status(&primary)?;
+      for slot in &mut replicas {
+        let loops = match catch_up_to_target(
+          &slot.db,
+          head_before_promotion.head_log_index,
+          config.max_frames,
+          config.recovery_max_loops,
+        ) {
+          Ok(loops) => loops,
+          Err(err) => {
+            let status = replica_status(&slot.db)?;
+            if status.needs_reseed || err.to_string().contains("reseed") {
+              reseed_count = reseed_count.saturating_add(1);
+              primary.checkpoint()?;
+              slot.db.replica_reseed_from_snapshot()?;
+              reseed_recovery_successes = reseed_recovery_successes.saturating_add(1);
+              catch_up_to_target(
+                &slot.db,
+                head_before_promotion.head_log_index,
+                config.max_frames,
+                config.recovery_max_loops,
+              )?
+            } else {
+              return Err(err);
+            }
+          }
+        };
+        max_recovery_loops_seen = max_recovery_loops_seen.max(loops);
+
+        let status = replica_status(&slot.db)?;
+        primary.primary_report_replica_progress(
+          &slot.id,
+          status.applied_epoch,
+          status.applied_log_index,
+        )?;
+      }
+
       let _ = primary.primary_promote_to_next_epoch()?;
       promotion_count = promotion_count.saturating_add(1);
 

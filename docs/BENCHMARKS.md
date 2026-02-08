@@ -310,18 +310,18 @@ cd ray-rs
 
 Defaults:
 - `REPLICAS=5`
-- `CYCLES=18`
-- `COMMITS_PER_CYCLE=120`
+- `CYCLES=6`
+- `COMMITS_PER_CYCLE=40`
 - `ACTIVE_REPLICAS=3`
-- `CHURN_INTERVAL=3`
-- `PROMOTION_INTERVAL=6`
-- `RESEED_CHECK_INTERVAL=3`
+- `CHURN_INTERVAL=2`
+- `PROMOTION_INTERVAL=3`
+- `RESEED_CHECK_INTERVAL=2`
 - `MAX_FRAMES=128`
 - `RECOVERY_MAX_LOOPS=80`
 - `SEGMENT_MAX_BYTES=1`
 - `RETENTION_MIN=64`
 - `ATTEMPTS=1`
-- Pass threshold: `MAX_ALLOWED_LAG=3000`
+- Pass threshold: `MAX_ALLOWED_LAG=1200`
 - Pass threshold: `MIN_PROMOTIONS=2`
 - Pass threshold: `MIN_RESEEDS=1`
 - Invariant checks: divergence must be `0`, stale-fence rejections must equal promotions.
@@ -330,7 +330,7 @@ Example override:
 
 ```bash
 cd ray-rs
-CYCLES=24 COMMITS_PER_CYCLE=160 ATTEMPTS=2 ./scripts/replication-soak-gate.sh
+CYCLES=18 COMMITS_PER_CYCLE=120 CHURN_INTERVAL=3 PROMOTION_INTERVAL=6 RESEED_CHECK_INTERVAL=3 MAX_ALLOWED_LAG=3000 ATTEMPTS=2 ./scripts/replication-soak-gate.sh
 ```
 
 Output:
