@@ -53,6 +53,41 @@ jobs:
           if echo "$COMMIT_MSG" | grep -E "^(all|js|ts|py|rs|core): [0-9]+\.[0-9]+\.[0-9]+"; then
             echo "any=true" >> "$GITHUB_OUTPUT"
           fi
+
+  replication-perf-gate:
+    name: Replication Perf Gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ray-rs/target/
+          key: replication-perf-gate-${{ hashFiles('ray-rs/Cargo.lock') }}
+      - name: Run replication perf gate
+        run: ./scripts/replication-perf-gate.sh
+        env:
+          # CI-tuned defaults to reduce runtime while keeping meaningful signal.
+          ITERATIONS: "10000"
+          SEED_COMMITS: "1000"
+          BACKLOG_COMMITS: "3000"
+          ATTEMPTS: "3"
+          P95_MAX_RATIO: "1.03"
+          MIN_CATCHUP_FPS: "2500"
+          MIN_THROUGHPUT_RATIO: "0.10"
+      - name: Upload replication benchmark logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: replication-perf-gate-logs
+          path: docs/benchmarks/results/*replication-*gate*.txt
+          if-no-files-found: ignore
   # ===========================================
   # Node.js Builds (napi-rs)
   # ===========================================

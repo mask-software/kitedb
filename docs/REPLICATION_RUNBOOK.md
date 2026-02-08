@@ -200,6 +200,7 @@ Perf gate:
 - Commit overhead gate: require median p95 ratio (replication-on / baseline) within `P95_MAX_RATIO` (default `1.03`, `ATTEMPTS=7`).
 - Catch-up gate: require replica throughput floors (`MIN_CATCHUP_FPS`, `MIN_THROUGHPUT_RATIO`).
 - Catch-up gate retries benchmark noise by default (`ATTEMPTS=3`); increase on busy dev machines.
+- CI on `main` (`.github/workflows/ray-rs.yml`) enforces replication perf gate and uploads benchmark logs as `replication-perf-gate-logs`.
 
 ## 8. HTTP Admin Endpoints (Playground Runtime)
 

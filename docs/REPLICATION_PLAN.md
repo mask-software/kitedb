@@ -404,6 +404,7 @@ Implemented:
 - Operator runbook for promotion/reseed/retention tuning (`docs/REPLICATION_RUNBOOK.md`).
 - Replication benchmark gate script (`ray-rs/scripts/replication-bench-gate.sh`) + benchmark doc wiring.
 - Replica catch-up throughput gate (`ray-rs/scripts/replication-catchup-gate.sh`) and combined perf gate (`ray-rs/scripts/replication-perf-gate.sh`).
+- Main-branch CI perf-gate enforcement in `ray-rs` workflow (`.github/workflows/ray-rs.yml`) with benchmark log artifact upload.
 - HTTP transport/admin rollout in playground runtime:
   - `GET /api/replication/status`
   - `GET /api/replication/metrics` (Prometheus text export)
