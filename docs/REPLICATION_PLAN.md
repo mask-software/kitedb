@@ -395,4 +395,4 @@ Known limits:
 - Host-runtime OTLP export currently targets HTTP OTLP-JSON payloads only (no protobuf/gRPC exporter path).
 
 Carry-over to next phase:
-- Standardized host-runtime HTTP adapter package/templates on top of transport JSON helpers.
+- Polyglot host-runtime HTTP adapter templates (Python + generic middleware examples) on top of transport JSON helpers.
