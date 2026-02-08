@@ -207,6 +207,9 @@ pub struct OtlpHttpPushOptions {
   pub circuit_breaker_state_path: Option<String>,
   pub circuit_breaker_state_url: Option<String>,
   pub circuit_breaker_state_patch: bool,
+  pub circuit_breaker_state_patch_batch: bool,
+  pub circuit_breaker_state_patch_batch_max_keys: u32,
+  pub circuit_breaker_state_patch_retry_max_attempts: u32,
   pub circuit_breaker_state_cas: bool,
   pub circuit_breaker_state_lease_id: Option<String>,
   pub circuit_breaker_scope_key: Option<String>,
@@ -232,6 +235,9 @@ impl Default for OtlpHttpPushOptions {
       circuit_breaker_state_path: None,
       circuit_breaker_state_url: None,
       circuit_breaker_state_patch: false,
+      circuit_breaker_state_patch_batch: false,
+      circuit_breaker_state_patch_batch_max_keys: 8,
+      circuit_breaker_state_patch_retry_max_attempts: 1,
       circuit_breaker_state_cas: false,
       circuit_breaker_state_lease_id: None,
       circuit_breaker_scope_key: None,
@@ -800,6 +806,21 @@ fn validate_otel_push_options(options: &OtlpHttpPushOptions) -> Result<()> {
       "circuit_breaker_state_patch requires circuit_breaker_state_url".into(),
     ));
   }
+  if options.circuit_breaker_state_patch_batch && !options.circuit_breaker_state_patch {
+    return Err(KiteError::InvalidQuery(
+      "circuit_breaker_state_patch_batch requires circuit_breaker_state_patch".into(),
+    ));
+  }
+  if options.circuit_breaker_state_patch_batch_max_keys == 0 {
+    return Err(KiteError::InvalidQuery(
+      "circuit_breaker_state_patch_batch_max_keys must be > 0".into(),
+    ));
+  }
+  if options.circuit_breaker_state_patch_retry_max_attempts == 0 {
+    return Err(KiteError::InvalidQuery(
+      "circuit_breaker_state_patch_retry_max_attempts must be > 0".into(),
+    ));
+  }
   if options.circuit_breaker_state_cas && options.circuit_breaker_state_url.is_none() {
     return Err(KiteError::InvalidQuery(
       "circuit_breaker_state_cas requires circuit_breaker_state_url".into(),
@@ -937,11 +958,10 @@ fn circuit_breaker_state_url(options: &OtlpHttpPushOptions) -> Option<&str> {
     .filter(|value| !value.is_empty())
 }
 
-fn circuit_breaker_state_url_etag_key(url: &str, key: Option<&str>, patch_mode: bool) -> String {
-  if patch_mode {
-    format!("{url}::{}", key.unwrap_or_default())
-  } else {
-    url.to_string()
+fn circuit_breaker_state_url_etag_key(url: &str, scope: &str, key: Option<&str>) -> String {
+  match key {
+    Some(value) => format!("{url}::{scope}::{value}"),
+    None => format!("{url}::{scope}"),
   }
 }
 
@@ -973,7 +993,7 @@ fn load_persisted_breakers_from_url(
   if options.circuit_breaker_state_cas {
     if let Some(etag) = response.header("etag") {
       otlp_circuit_breaker_state_url_etags().lock().insert(
-        circuit_breaker_state_url_etag_key(url, None, false),
+        circuit_breaker_state_url_etag_key(url, "doc", None),
         etag.to_string(),
       );
     }
@@ -1008,7 +1028,7 @@ fn load_persisted_breaker_from_url_patch(
   if options.circuit_breaker_state_cas {
     if let Some(etag) = response.header("etag") {
       otlp_circuit_breaker_state_url_etags().lock().insert(
-        circuit_breaker_state_url_etag_key(url, Some(key), true),
+        circuit_breaker_state_url_etag_key(url, "patch", Some(key)),
         etag.to_string(),
       );
     }
@@ -1069,7 +1089,7 @@ fn persist_breakers_to_url(
   if options.circuit_breaker_state_cas {
     if let Some(etag) = otlp_circuit_breaker_state_url_etags()
       .lock()
-      .get(&circuit_breaker_state_url_etag_key(url, None, false))
+      .get(&circuit_breaker_state_url_etag_key(url, "doc", None))
       .cloned()
     {
       request = request.set("if-match", &etag);
@@ -1085,7 +1105,7 @@ fn persist_breakers_to_url(
       if options.circuit_breaker_state_cas {
         if let Some(etag) = response.header("etag") {
           otlp_circuit_breaker_state_url_etags().lock().insert(
-            circuit_breaker_state_url_etag_key(url, None, false),
+            circuit_breaker_state_url_etag_key(url, "doc", None),
             etag.to_string(),
           );
         }
@@ -1095,7 +1115,7 @@ fn persist_breakers_to_url(
       if options.circuit_breaker_state_cas && (status == 409 || status == 412) {
         if let Some(etag) = response.header("etag") {
           otlp_circuit_breaker_state_url_etags().lock().insert(
-            circuit_breaker_state_url_etag_key(url, None, false),
+            circuit_breaker_state_url_etag_key(url, "doc", None),
             etag.to_string(),
           );
         }
@@ -1118,52 +1138,151 @@ fn persist_breaker_to_url_patch(
   let Ok(serialized) = serde_json::to_vec(&payload) else {
     return;
   };
-  let timeout = Duration::from_millis(options.timeout_ms.max(1));
-  let Ok(agent) = build_otel_http_agent(url, options, timeout) else {
+  let attempts = options
+    .circuit_breaker_state_patch_retry_max_attempts
+    .max(1);
+  for attempt in 1..=attempts {
+    let timeout = Duration::from_millis(options.timeout_ms.max(1));
+    let Ok(agent) = build_otel_http_agent(url, options, timeout) else {
+      return;
+    };
+    let mut request = agent
+      .request("PATCH", url)
+      .set("content-type", "application/json")
+      .set("x-kitedb-breaker-mode", "patch-v1")
+      .set("x-kitedb-breaker-key", key)
+      .timeout(timeout);
+    if options.circuit_breaker_state_cas {
+      if let Some(etag) = otlp_circuit_breaker_state_url_etags()
+        .lock()
+        .get(&circuit_breaker_state_url_etag_key(url, "patch", Some(key)))
+        .cloned()
+      {
+        request = request.set("if-match", &etag);
+      } else {
+        request = request.set("if-match", "*");
+      }
+    }
+    if let Some(lease_id) = options.circuit_breaker_state_lease_id.as_deref() {
+      request = request.set("x-kitedb-breaker-lease", lease_id);
+    }
+    match request.send_bytes(&serialized) {
+      Ok(response) => {
+        if options.circuit_breaker_state_cas {
+          if let Some(etag) = response.header("etag") {
+            otlp_circuit_breaker_state_url_etags().lock().insert(
+              circuit_breaker_state_url_etag_key(url, "patch", Some(key)),
+              etag.to_string(),
+            );
+          }
+        }
+        return;
+      }
+      Err(ureq::Error::Status(status, response)) => {
+        if options.circuit_breaker_state_cas && (status == 409 || status == 412) {
+          if let Some(etag) = response.header("etag") {
+            otlp_circuit_breaker_state_url_etags().lock().insert(
+              circuit_breaker_state_url_etag_key(url, "patch", Some(key)),
+              etag.to_string(),
+            );
+          }
+          if attempt < attempts {
+            continue;
+          }
+        }
+        return;
+      }
+      Err(_) => return,
+    }
+  }
+}
+
+fn persist_breakers_to_url_patch_batch(
+  url: &str,
+  primary_key: &str,
+  states: &HashMap<String, OtlpCircuitBreakerState>,
+  options: &OtlpHttpPushOptions,
+) {
+  let mut updates = Vec::new();
+  let max_keys =
+    usize::try_from(options.circuit_breaker_state_patch_batch_max_keys).unwrap_or(usize::MAX);
+  if let Some(state) = states.get(primary_key) {
+    updates.push(json!({ "key": primary_key, "state": state }));
+  } else {
+    updates.push(json!({ "key": primary_key, "state": Value::Null }));
+  }
+  if max_keys > 1 {
+    for (key, state) in states {
+      if key == primary_key {
+        continue;
+      }
+      updates.push(json!({ "key": key, "state": state }));
+      if updates.len() >= max_keys {
+        break;
+      }
+    }
+  }
+  let payload = json!({ "updates": updates });
+  let Ok(serialized) = serde_json::to_vec(&payload) else {
     return;
   };
-  let mut request = agent
-    .request("PATCH", url)
-    .set("content-type", "application/json")
-    .set("x-kitedb-breaker-mode", "patch-v1")
-    .set("x-kitedb-breaker-key", key)
-    .timeout(timeout);
-  if options.circuit_breaker_state_cas {
-    if let Some(etag) = otlp_circuit_breaker_state_url_etags()
-      .lock()
-      .get(&circuit_breaker_state_url_etag_key(url, Some(key), true))
-      .cloned()
-    {
-      request = request.set("if-match", &etag);
-    } else {
-      request = request.set("if-match", "*");
-    }
-  }
-  if let Some(lease_id) = options.circuit_breaker_state_lease_id.as_deref() {
-    request = request.set("x-kitedb-breaker-lease", lease_id);
-  }
-  match request.send_bytes(&serialized) {
-    Ok(response) => {
-      if options.circuit_breaker_state_cas {
-        if let Some(etag) = response.header("etag") {
-          otlp_circuit_breaker_state_url_etags().lock().insert(
-            circuit_breaker_state_url_etag_key(url, Some(key), true),
-            etag.to_string(),
-          );
-        }
+
+  let attempts = options
+    .circuit_breaker_state_patch_retry_max_attempts
+    .max(1);
+  for attempt in 1..=attempts {
+    let timeout = Duration::from_millis(options.timeout_ms.max(1));
+    let Ok(agent) = build_otel_http_agent(url, options, timeout) else {
+      return;
+    };
+    let mut request = agent
+      .request("PATCH", url)
+      .set("content-type", "application/json")
+      .set("x-kitedb-breaker-mode", "patch-batch-v1")
+      .set("x-kitedb-breaker-key", primary_key)
+      .timeout(timeout);
+    if options.circuit_breaker_state_cas {
+      if let Some(etag) = otlp_circuit_breaker_state_url_etags()
+        .lock()
+        .get(&circuit_breaker_state_url_etag_key(url, "batch", None))
+        .cloned()
+      {
+        request = request.set("if-match", &etag);
+      } else {
+        request = request.set("if-match", "*");
       }
     }
-    Err(ureq::Error::Status(status, response)) => {
-      if options.circuit_breaker_state_cas && (status == 409 || status == 412) {
-        if let Some(etag) = response.header("etag") {
-          otlp_circuit_breaker_state_url_etags().lock().insert(
-            circuit_breaker_state_url_etag_key(url, Some(key), true),
-            etag.to_string(),
-          );
-        }
-      }
+    if let Some(lease_id) = options.circuit_breaker_state_lease_id.as_deref() {
+      request = request.set("x-kitedb-breaker-lease", lease_id);
     }
-    Err(_) => {}
+    match request.send_bytes(&serialized) {
+      Ok(response) => {
+        if options.circuit_breaker_state_cas {
+          if let Some(etag) = response.header("etag") {
+            otlp_circuit_breaker_state_url_etags().lock().insert(
+              circuit_breaker_state_url_etag_key(url, "batch", None),
+              etag.to_string(),
+            );
+          }
+        }
+        return;
+      }
+      Err(ureq::Error::Status(status, response)) => {
+        if options.circuit_breaker_state_cas && (status == 409 || status == 412) {
+          if let Some(etag) = response.header("etag") {
+            otlp_circuit_breaker_state_url_etags().lock().insert(
+              circuit_breaker_state_url_etag_key(url, "batch", None),
+              etag.to_string(),
+            );
+          }
+          if attempt < attempts {
+            continue;
+          }
+        }
+        return;
+      }
+      Err(_) => return,
+    }
   }
 }
 
@@ -1176,7 +1295,11 @@ fn persist_breakers(
     persist_breakers_to_path(path, states);
   } else if let Some(url) = circuit_breaker_state_url(options) {
     if options.circuit_breaker_state_patch {
-      persist_breaker_to_url_patch(url, key, states.get(key), options);
+      if options.circuit_breaker_state_patch_batch {
+        persist_breakers_to_url_patch_batch(url, key, states, options);
+      } else {
+        persist_breaker_to_url_patch(url, key, states.get(key), options);
+      }
     } else {
       persist_breakers_to_url(url, options, states);
     }

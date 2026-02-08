@@ -40,19 +40,19 @@ Metrics surface:
       `https_only`, `ca_cert_pem_path`, `client_cert_pem_path`, `client_key_pem_path`,
       `retry_max_attempts`, `retry_backoff_ms`, `retry_backoff_max_ms`, `retry_jitter_ratio`,
       `adaptive_retry`, `adaptive_retry_mode`, `adaptive_retry_ewma_alpha`, `circuit_breaker_failure_threshold`, `circuit_breaker_open_ms`, `circuit_breaker_half_open_probes`,
-      `circuit_breaker_state_path`, `circuit_breaker_state_url`, `circuit_breaker_state_patch`, `circuit_breaker_state_cas`, `circuit_breaker_state_lease_id`, `circuit_breaker_scope_key`, `compression_gzip`.
+      `circuit_breaker_state_path`, `circuit_breaker_state_url`, `circuit_breaker_state_patch`, `circuit_breaker_state_patch_batch`, `circuit_breaker_state_patch_batch_max_keys`, `circuit_breaker_state_patch_retry_max_attempts`, `circuit_breaker_state_cas`, `circuit_breaker_state_lease_id`, `circuit_breaker_scope_key`, `compression_gzip`.
   - Rust core (protobuf): `push_replication_metrics_otel_protobuf_single_file(db, endpoint, timeout_ms, bearer_token)`
     - advanced TLS/mTLS: `push_replication_metrics_otel_protobuf_*_with_options(...)` with
       `https_only`, `ca_cert_pem_path`, `client_cert_pem_path`, `client_key_pem_path`,
       `retry_max_attempts`, `retry_backoff_ms`, `retry_backoff_max_ms`, `retry_jitter_ratio`,
       `adaptive_retry`, `adaptive_retry_mode`, `adaptive_retry_ewma_alpha`, `circuit_breaker_failure_threshold`, `circuit_breaker_open_ms`, `circuit_breaker_half_open_probes`,
-      `circuit_breaker_state_path`, `circuit_breaker_state_url`, `circuit_breaker_state_patch`, `circuit_breaker_state_cas`, `circuit_breaker_state_lease_id`, `circuit_breaker_scope_key`, `compression_gzip`.
+      `circuit_breaker_state_path`, `circuit_breaker_state_url`, `circuit_breaker_state_patch`, `circuit_breaker_state_patch_batch`, `circuit_breaker_state_patch_batch_max_keys`, `circuit_breaker_state_patch_retry_max_attempts`, `circuit_breaker_state_cas`, `circuit_breaker_state_lease_id`, `circuit_breaker_scope_key`, `compression_gzip`.
   - Rust core (gRPC): `push_replication_metrics_otel_grpc_single_file(db, endpoint, timeout_ms, bearer_token)`
     - advanced TLS/mTLS: `push_replication_metrics_otel_grpc_*_with_options(...)` with
       `https_only`, `ca_cert_pem_path`, `client_cert_pem_path`, `client_key_pem_path`,
       `retry_max_attempts`, `retry_backoff_ms`, `retry_backoff_max_ms`, `retry_jitter_ratio`,
       `adaptive_retry`, `adaptive_retry_mode`, `adaptive_retry_ewma_alpha`, `circuit_breaker_failure_threshold`, `circuit_breaker_open_ms`, `circuit_breaker_half_open_probes`,
-      `circuit_breaker_state_path`, `circuit_breaker_state_url`, `circuit_breaker_state_patch`, `circuit_breaker_state_cas`, `circuit_breaker_state_lease_id`, `circuit_breaker_scope_key`, `compression_gzip`.
+      `circuit_breaker_state_path`, `circuit_breaker_state_url`, `circuit_breaker_state_patch`, `circuit_breaker_state_patch_batch`, `circuit_breaker_state_patch_batch_max_keys`, `circuit_breaker_state_patch_retry_max_attempts`, `circuit_breaker_state_cas`, `circuit_breaker_state_lease_id`, `circuit_breaker_scope_key`, `compression_gzip`.
   - Node NAPI: `pushReplicationMetricsOtelJson(db, endpoint, timeoutMs, bearerToken?)`
     - advanced TLS/mTLS: `pushReplicationMetricsOtelJsonWithOptions(db, endpoint, options)`.
   - Node NAPI (protobuf): `pushReplicationMetricsOtelProtobuf(db, endpoint, timeoutMs, bearerToken?)`
@@ -64,21 +64,21 @@ Metrics surface:
       `https_only`, `ca_cert_pem_path`, `client_cert_pem_path`, `client_key_pem_path`,
       `retry_max_attempts`, `retry_backoff_ms`, `retry_backoff_max_ms`, `retry_jitter_ratio`,
       `adaptive_retry`, `adaptive_retry_mode`, `adaptive_retry_ewma_alpha`, `circuit_breaker_failure_threshold`, `circuit_breaker_open_ms`, `circuit_breaker_half_open_probes`,
-      `circuit_breaker_state_path`, `circuit_breaker_state_url`, `circuit_breaker_state_patch`, `circuit_breaker_state_cas`, `circuit_breaker_state_lease_id`, `circuit_breaker_scope_key`, `compression_gzip`.
+      `circuit_breaker_state_path`, `circuit_breaker_state_url`, `circuit_breaker_state_patch`, `circuit_breaker_state_patch_batch`, `circuit_breaker_state_patch_batch_max_keys`, `circuit_breaker_state_patch_retry_max_attempts`, `circuit_breaker_state_cas`, `circuit_breaker_state_lease_id`, `circuit_breaker_scope_key`, `compression_gzip`.
   - Python PyO3 (protobuf): `push_replication_metrics_otel_protobuf(db, endpoint, timeout_ms=5000, bearer_token=None)`
     - advanced TLS/mTLS kwargs:
       `https_only`, `ca_cert_pem_path`, `client_cert_pem_path`, `client_key_pem_path`,
       `retry_max_attempts`, `retry_backoff_ms`, `retry_backoff_max_ms`, `retry_jitter_ratio`,
       `adaptive_retry`, `adaptive_retry_mode`, `adaptive_retry_ewma_alpha`, `circuit_breaker_failure_threshold`, `circuit_breaker_open_ms`, `circuit_breaker_half_open_probes`,
-      `circuit_breaker_state_path`, `circuit_breaker_state_url`, `circuit_breaker_state_patch`, `circuit_breaker_state_cas`, `circuit_breaker_state_lease_id`, `circuit_breaker_scope_key`, `compression_gzip`.
+      `circuit_breaker_state_path`, `circuit_breaker_state_url`, `circuit_breaker_state_patch`, `circuit_breaker_state_patch_batch`, `circuit_breaker_state_patch_batch_max_keys`, `circuit_breaker_state_patch_retry_max_attempts`, `circuit_breaker_state_cas`, `circuit_breaker_state_lease_id`, `circuit_breaker_scope_key`, `compression_gzip`.
   - Python PyO3 (gRPC): `push_replication_metrics_otel_grpc(db, endpoint, timeout_ms=5000, bearer_token=None)`
     - advanced TLS/mTLS kwargs:
       `https_only`, `ca_cert_pem_path`, `client_cert_pem_path`, `client_key_pem_path`,
       `retry_max_attempts`, `retry_backoff_ms`, `retry_backoff_max_ms`, `retry_jitter_ratio`,
       `adaptive_retry`, `adaptive_retry_mode`, `adaptive_retry_ewma_alpha`, `circuit_breaker_failure_threshold`, `circuit_breaker_open_ms`, `circuit_breaker_half_open_probes`,
-      `circuit_breaker_state_path`, `circuit_breaker_state_url`, `circuit_breaker_state_patch`, `circuit_breaker_state_cas`, `circuit_breaker_state_lease_id`, `circuit_breaker_scope_key`, `compression_gzip`.
+      `circuit_breaker_state_path`, `circuit_breaker_state_url`, `circuit_breaker_state_patch`, `circuit_breaker_state_patch_batch`, `circuit_breaker_state_patch_batch_max_keys`, `circuit_breaker_state_patch_retry_max_attempts`, `circuit_breaker_state_cas`, `circuit_breaker_state_lease_id`, `circuit_breaker_scope_key`, `compression_gzip`.
   - Note: `circuit_breaker_state_path` and `circuit_breaker_state_url` are mutually exclusive.
-  - Note: `circuit_breaker_state_patch`, `circuit_breaker_state_cas`, and `circuit_breaker_state_lease_id` require `circuit_breaker_state_url`.
+  - Note: `circuit_breaker_state_patch`, `circuit_breaker_state_patch_batch`, `circuit_breaker_state_patch_batch_max_keys`, `circuit_breaker_state_patch_retry_max_attempts`, `circuit_breaker_state_cas`, and `circuit_breaker_state_lease_id` require `circuit_breaker_state_url`.
 - Host-runtime replication transport JSON export helpers are available via:
   - Node NAPI: `collectReplicationSnapshotTransportJson(db, includeData?)`,
     `collectReplicationLogTransportJson(db, cursor?, maxFrames?, maxBytes?, includePayload?)`
@@ -227,5 +227,5 @@ Playground curl examples:
 
 - Retention policy supports entry-window + time-window floors, but not richer SLA-aware policies.
 - Bundled HTTP admin endpoints still ship in playground runtime; host runtime now exposes transport JSON helpers for embedding custom HTTP surfaces.
-- OTLP retry policy is bounded attempt/backoff/jitter with optional adaptive multiplier (`linear` or `ewma`) and circuit-breaker half-open probes. Circuit-breaker state is process-local by default; optional file-backed sharing (`circuit_breaker_state_path`) or shared HTTP store (`circuit_breaker_state_url`) is available with `circuit_breaker_scope_key`; URL backend can enable key-scoped patch mode (`circuit_breaker_state_patch`), CAS (`circuit_breaker_state_cas`), and lease header propagation (`circuit_breaker_state_lease_id`).
+- OTLP retry policy is bounded attempt/backoff/jitter with optional adaptive multiplier (`linear` or `ewma`) and circuit-breaker half-open probes. Circuit-breaker state is process-local by default; optional file-backed sharing (`circuit_breaker_state_path`) or shared HTTP store (`circuit_breaker_state_url`) is available with `circuit_breaker_scope_key`; URL backend can enable key-scoped patch mode (`circuit_breaker_state_patch`), batched patch mode (`circuit_breaker_state_patch_batch` with `circuit_breaker_state_patch_batch_max_keys`), bounded patch retries (`circuit_breaker_state_patch_retry_max_attempts`), CAS (`circuit_breaker_state_cas`), and lease header propagation (`circuit_breaker_state_lease_id`).
 - `SyncMode::Normal` and `SyncMode::Off` optimize commit latency by batching sidecar frame writes in-memory and refreshing manifest fencing periodically (not every commit). For strict per-commit sidecar visibility/fencing, use `SyncMode::Full`.

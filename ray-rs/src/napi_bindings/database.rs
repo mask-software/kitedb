@@ -863,6 +863,9 @@ pub struct PushReplicationMetricsOtelOptions {
   pub circuit_breaker_state_path: Option<String>,
   pub circuit_breaker_state_url: Option<String>,
   pub circuit_breaker_state_patch: Option<bool>,
+  pub circuit_breaker_state_patch_batch: Option<bool>,
+  pub circuit_breaker_state_patch_batch_max_keys: Option<i64>,
+  pub circuit_breaker_state_patch_retry_max_attempts: Option<i64>,
   pub circuit_breaker_state_cas: Option<bool>,
   pub circuit_breaker_state_lease_id: Option<String>,
   pub circuit_breaker_scope_key: Option<String>,
@@ -3571,6 +3574,29 @@ fn build_core_otel_push_options(
       "circuitBreakerStatePatch requires circuitBreakerStateUrl",
     ));
   }
+  if options.circuit_breaker_state_patch_batch.unwrap_or(false)
+    && !options.circuit_breaker_state_patch.unwrap_or(false)
+  {
+    return Err(Error::from_reason(
+      "circuitBreakerStatePatchBatch requires circuitBreakerStatePatch",
+    ));
+  }
+  let circuit_breaker_state_patch_batch_max_keys = options
+    .circuit_breaker_state_patch_batch_max_keys
+    .unwrap_or(8);
+  if circuit_breaker_state_patch_batch_max_keys <= 0 {
+    return Err(Error::from_reason(
+      "circuitBreakerStatePatchBatchMaxKeys must be positive",
+    ));
+  }
+  let circuit_breaker_state_patch_retry_max_attempts = options
+    .circuit_breaker_state_patch_retry_max_attempts
+    .unwrap_or(1);
+  if circuit_breaker_state_patch_retry_max_attempts <= 0 {
+    return Err(Error::from_reason(
+      "circuitBreakerStatePatchRetryMaxAttempts must be positive",
+    ));
+  }
   if options.circuit_breaker_state_cas.unwrap_or(false)
     && options.circuit_breaker_state_url.is_none()
   {
@@ -3614,6 +3640,10 @@ fn build_core_otel_push_options(
     circuit_breaker_state_path: options.circuit_breaker_state_path,
     circuit_breaker_state_url: options.circuit_breaker_state_url,
     circuit_breaker_state_patch: options.circuit_breaker_state_patch.unwrap_or(false),
+    circuit_breaker_state_patch_batch: options.circuit_breaker_state_patch_batch.unwrap_or(false),
+    circuit_breaker_state_patch_batch_max_keys: circuit_breaker_state_patch_batch_max_keys as u32,
+    circuit_breaker_state_patch_retry_max_attempts: circuit_breaker_state_patch_retry_max_attempts
+      as u32,
     circuit_breaker_state_cas: options.circuit_breaker_state_cas.unwrap_or(false),
     circuit_breaker_state_lease_id: options.circuit_breaker_state_lease_id,
     circuit_breaker_scope_key: options.circuit_breaker_scope_key,

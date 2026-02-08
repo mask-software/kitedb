@@ -613,6 +613,227 @@ fn spawn_state_store_patch_server(expected_key: String) -> (String, thread::Join
   (endpoint, handle)
 }
 
+fn spawn_state_store_patch_retry_server(expected_key: String) -> (String, thread::JoinHandle<()>) {
+  let listener = TcpListener::bind("127.0.0.1:0").expect("bind state store patch retry");
+  let address = listener
+    .local_addr()
+    .expect("state store patch retry local addr");
+  let endpoint = format!("http://{address}/breaker-state");
+  let handle = thread::spawn(move || {
+    let mut patch_attempts = 0usize;
+    for expected_method in ["GET", "GET", "PATCH", "PATCH"] {
+      let (mut stream, _) = listener.accept().expect("accept state store patch retry");
+      stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set state store patch retry read timeout");
+
+      let mut buffer = Vec::new();
+      let mut chunk = [0u8; 1024];
+      let mut header_end: Option<usize> = None;
+      let mut content_length = 0usize;
+      loop {
+        match stream.read(&mut chunk) {
+          Ok(0) => break,
+          Ok(read) => {
+            buffer.extend_from_slice(&chunk[..read]);
+            if header_end.is_none() {
+              if let Some(position) = find_subsequence(&buffer, b"\r\n\r\n") {
+                let end = position + 4;
+                header_end = Some(end);
+                let headers_text = String::from_utf8_lossy(&buffer[..end]);
+                for line in headers_text.lines().skip(1) {
+                  let Some((name, value)) = line.split_once(':') else {
+                    continue;
+                  };
+                  if name.eq_ignore_ascii_case("content-length") {
+                    content_length = value.trim().parse::<usize>().unwrap_or(0);
+                  }
+                }
+              }
+            }
+            if let Some(end) = header_end {
+              if buffer.len() >= end + content_length {
+                break;
+              }
+            }
+          }
+          Err(error) => panic!("read state store patch retry request failed: {error}"),
+        }
+      }
+
+      let end = header_end.expect("state store patch retry header terminator");
+      let request_text = String::from_utf8_lossy(&buffer[..end]);
+      let request_line = request_text.lines().next().unwrap_or_default();
+      assert!(
+        request_line.starts_with(&format!("{expected_method} /breaker-state HTTP/1.1")),
+        "unexpected state store patch retry request line: {request_line}"
+      );
+
+      let mut headers = HashMap::new();
+      for line in request_text.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+          continue;
+        };
+        headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+      }
+
+      if expected_method == "PATCH" {
+        assert_eq!(
+          headers.get("x-kitedb-breaker-mode").map(String::as_str),
+          Some("patch-v1"),
+          "patch mode header mismatch"
+        );
+        assert_eq!(
+          headers.get("x-kitedb-breaker-key").map(String::as_str),
+          Some(expected_key.as_str()),
+          "patch key header mismatch"
+        );
+        let if_match = headers
+          .get("if-match")
+          .map(String::as_str)
+          .unwrap_or_default();
+        patch_attempts = patch_attempts.saturating_add(1);
+        if patch_attempts == 1 {
+          assert_eq!(
+            if_match, "pr1",
+            "first patch if-match header should use GET ETag"
+          );
+          let response = "HTTP/1.1 412 Precondition Failed\r\nETag: pr2\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+          stream
+            .write_all(response.as_bytes())
+            .expect("write patch retry precondition response");
+          continue;
+        }
+        if patch_attempts == 2 {
+          assert_eq!(if_match, "pr2", "retry if-match header mismatch");
+        }
+      }
+
+      let (status_line, etag, body) = if expected_method == "GET" {
+        ("HTTP/1.1 200 OK", "pr1", "{}")
+      } else {
+        ("HTTP/1.1 200 OK", "pr3", "")
+      };
+      let response = format!(
+        "{status_line}\r\nContent-Type: application/json\r\nETag: {etag}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+      );
+      stream
+        .write_all(response.as_bytes())
+        .expect("write state store patch retry response");
+    }
+  });
+  (endpoint, handle)
+}
+
+fn spawn_state_store_patch_batch_server(expected_key: String) -> (String, thread::JoinHandle<()>) {
+  let listener = TcpListener::bind("127.0.0.1:0").expect("bind state store patch batch");
+  let address = listener
+    .local_addr()
+    .expect("state store patch batch local addr");
+  let endpoint = format!("http://{address}/breaker-state");
+  let handle = thread::spawn(move || {
+    for expected_method in ["GET", "GET", "PATCH"] {
+      let (mut stream, _) = listener.accept().expect("accept state store patch batch");
+      stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set state store patch batch read timeout");
+
+      let mut buffer = Vec::new();
+      let mut chunk = [0u8; 1024];
+      let mut header_end: Option<usize> = None;
+      let mut content_length = 0usize;
+      loop {
+        match stream.read(&mut chunk) {
+          Ok(0) => break,
+          Ok(read) => {
+            buffer.extend_from_slice(&chunk[..read]);
+            if header_end.is_none() {
+              if let Some(position) = find_subsequence(&buffer, b"\r\n\r\n") {
+                let end = position + 4;
+                header_end = Some(end);
+                let headers_text = String::from_utf8_lossy(&buffer[..end]);
+                for line in headers_text.lines().skip(1) {
+                  let Some((name, value)) = line.split_once(':') else {
+                    continue;
+                  };
+                  if name.eq_ignore_ascii_case("content-length") {
+                    content_length = value.trim().parse::<usize>().unwrap_or(0);
+                  }
+                }
+              }
+            }
+            if let Some(end) = header_end {
+              if buffer.len() >= end + content_length {
+                break;
+              }
+            }
+          }
+          Err(error) => panic!("read state store patch batch request failed: {error}"),
+        }
+      }
+
+      let end = header_end.expect("state store patch batch header terminator");
+      let request_text = String::from_utf8_lossy(&buffer[..end]);
+      let request_line = request_text.lines().next().unwrap_or_default();
+      assert!(
+        request_line.starts_with(&format!("{expected_method} /breaker-state HTTP/1.1")),
+        "unexpected state store patch batch request line: {request_line}"
+      );
+
+      let mut headers = HashMap::new();
+      for line in request_text.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+          continue;
+        };
+        headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+      }
+
+      if expected_method == "PATCH" {
+        assert_eq!(
+          headers.get("x-kitedb-breaker-mode").map(String::as_str),
+          Some("patch-batch-v1"),
+          "patch batch mode header mismatch"
+        );
+        assert_eq!(
+          headers.get("x-kitedb-breaker-key").map(String::as_str),
+          Some(expected_key.as_str()),
+          "patch batch key header mismatch"
+        );
+        let body_end = (end + content_length).min(buffer.len());
+        let payload: serde_json::Value =
+          serde_json::from_slice(&buffer[end..body_end]).expect("parse patch batch payload");
+        let updates = payload["updates"].as_array().expect("updates array");
+        assert!(!updates.is_empty(), "updates must not be empty");
+        assert!(
+          updates.len() <= 2,
+          "updates should respect batch max keys, got {}",
+          updates.len()
+        );
+        assert_eq!(
+          updates[0]["key"].as_str(),
+          Some(expected_key.as_str()),
+          "primary key must be first update"
+        );
+      }
+
+      let (status_line, etag, body) = if expected_method == "PATCH" {
+        ("HTTP/1.1 200 OK", "pb2", "")
+      } else {
+        ("HTTP/1.1 200 OK", "pb1", "{}")
+      };
+      let response = format!(
+        "{status_line}\r\nContent-Type: application/json\r\nETag: {etag}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+      );
+      stream
+        .write_all(response.as_bytes())
+        .expect("write state store patch batch response");
+    }
+  });
+  (endpoint, handle)
+}
+
 fn spawn_grpc_capture_server(
   fail_first_attempts: usize,
 ) -> (
@@ -1148,6 +1369,65 @@ fn otlp_push_payload_rejects_state_patch_without_url() {
 }
 
 #[test]
+fn otlp_push_payload_rejects_state_patch_batch_without_patch() {
+  let options = OtlpHttpPushOptions {
+    timeout_ms: 2_000,
+    circuit_breaker_state_url: Some("http://127.0.0.1:4318/state".to_string()),
+    circuit_breaker_state_patch_batch: true,
+    ..OtlpHttpPushOptions::default()
+  };
+  let error = push_replication_metrics_otel_json_payload_with_options(
+    "{}",
+    "http://127.0.0.1:4318/v1/metrics",
+    &options,
+  )
+  .expect_err("state patch batch without patch mode must fail");
+  assert!(error
+    .to_string()
+    .contains("circuit_breaker_state_patch_batch requires circuit_breaker_state_patch"));
+}
+
+#[test]
+fn otlp_push_payload_rejects_state_patch_batch_max_keys_zero() {
+  let options = OtlpHttpPushOptions {
+    timeout_ms: 2_000,
+    circuit_breaker_state_url: Some("http://127.0.0.1:4318/state".to_string()),
+    circuit_breaker_state_patch: true,
+    circuit_breaker_state_patch_batch_max_keys: 0,
+    ..OtlpHttpPushOptions::default()
+  };
+  let error = push_replication_metrics_otel_json_payload_with_options(
+    "{}",
+    "http://127.0.0.1:4318/v1/metrics",
+    &options,
+  )
+  .expect_err("state patch batch max keys zero must fail");
+  assert!(error
+    .to_string()
+    .contains("circuit_breaker_state_patch_batch_max_keys"));
+}
+
+#[test]
+fn otlp_push_payload_rejects_state_patch_retry_max_attempts_zero() {
+  let options = OtlpHttpPushOptions {
+    timeout_ms: 2_000,
+    circuit_breaker_state_url: Some("http://127.0.0.1:4318/state".to_string()),
+    circuit_breaker_state_patch: true,
+    circuit_breaker_state_patch_retry_max_attempts: 0,
+    ..OtlpHttpPushOptions::default()
+  };
+  let error = push_replication_metrics_otel_json_payload_with_options(
+    "{}",
+    "http://127.0.0.1:4318/v1/metrics",
+    &options,
+  )
+  .expect_err("state patch retry max attempts zero must fail");
+  assert!(error
+    .to_string()
+    .contains("circuit_breaker_state_patch_retry_max_attempts"));
+}
+
+#[test]
 fn otlp_push_payload_rejects_state_lease_without_url() {
   let options = OtlpHttpPushOptions {
     timeout_ms: 2_000,
@@ -1429,6 +1709,68 @@ fn otlp_push_payload_shared_state_url_patch_protocol_uses_key_scoped_updates() {
   );
 
   state_handle.join().expect("state store patch thread");
+}
+
+#[test]
+fn otlp_push_payload_shared_state_url_patch_protocol_retries_on_precondition_failure() {
+  let scope_key = "shared-patch-retry-breaker";
+  let (state_url, state_handle) = spawn_state_store_patch_retry_server(scope_key.to_string());
+  let options = OtlpHttpPushOptions {
+    timeout_ms: 200,
+    retry_max_attempts: 1,
+    circuit_breaker_failure_threshold: 1,
+    circuit_breaker_open_ms: 2_000,
+    circuit_breaker_state_url: Some(state_url),
+    circuit_breaker_state_patch: true,
+    circuit_breaker_state_cas: true,
+    circuit_breaker_state_patch_retry_max_attempts: 2,
+    circuit_breaker_scope_key: Some(scope_key.to_string()),
+    ..OtlpHttpPushOptions::default()
+  };
+
+  let first = push_replication_metrics_otel_json_payload_with_options(
+    "{}",
+    "http://127.0.0.1:9/v1/metrics",
+    &options,
+  )
+  .expect_err("first call should fail transport and persist key-scoped patch with retry");
+  assert!(
+    first.to_string().contains("transport"),
+    "unexpected first error: {first}"
+  );
+
+  state_handle.join().expect("state store patch retry thread");
+}
+
+#[test]
+fn otlp_push_payload_shared_state_url_patch_batch_protocol_uses_multi_key_updates() {
+  let scope_key = "shared-patch-batch-breaker";
+  let (state_url, state_handle) = spawn_state_store_patch_batch_server(scope_key.to_string());
+  let options = OtlpHttpPushOptions {
+    timeout_ms: 200,
+    retry_max_attempts: 1,
+    circuit_breaker_failure_threshold: 1,
+    circuit_breaker_open_ms: 2_000,
+    circuit_breaker_state_url: Some(state_url),
+    circuit_breaker_state_patch: true,
+    circuit_breaker_state_patch_batch: true,
+    circuit_breaker_state_patch_batch_max_keys: 2,
+    circuit_breaker_scope_key: Some(scope_key.to_string()),
+    ..OtlpHttpPushOptions::default()
+  };
+
+  let first = push_replication_metrics_otel_json_payload_with_options(
+    "{}",
+    "http://127.0.0.1:9/v1/metrics",
+    &options,
+  )
+  .expect_err("first call should fail transport and persist patch batch update");
+  assert!(
+    first.to_string().contains("transport"),
+    "unexpected first error: {first}"
+  );
+
+  state_handle.join().expect("state store patch batch thread");
 }
 
 #[test]

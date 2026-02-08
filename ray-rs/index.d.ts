@@ -897,6 +897,9 @@ export interface PushReplicationMetricsOtelOptions {
   circuitBreakerStatePath?: string
   circuitBreakerStateUrl?: string
   circuitBreakerStatePatch?: boolean
+  circuitBreakerStatePatchBatch?: boolean
+  circuitBreakerStatePatchBatchMaxKeys?: number
+  circuitBreakerStatePatchRetryMaxAttempts?: number
   circuitBreakerStateCas?: boolean
   circuitBreakerStateLeaseId?: string
   circuitBreakerScopeKey?: string

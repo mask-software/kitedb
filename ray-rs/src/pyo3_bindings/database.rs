@@ -1892,6 +1892,9 @@ fn build_otel_push_options_py(
   circuit_breaker_state_path: Option<String>,
   circuit_breaker_state_url: Option<String>,
   circuit_breaker_state_patch: bool,
+  circuit_breaker_state_patch_batch: bool,
+  circuit_breaker_state_patch_batch_max_keys: i64,
+  circuit_breaker_state_patch_retry_max_attempts: i64,
   circuit_breaker_state_cas: bool,
   circuit_breaker_state_lease_id: Option<String>,
   circuit_breaker_scope_key: Option<String>,
@@ -2010,6 +2013,21 @@ fn build_otel_push_options_py(
       "circuit_breaker_state_patch requires circuit_breaker_state_url",
     ));
   }
+  if circuit_breaker_state_patch_batch && !circuit_breaker_state_patch {
+    return Err(PyRuntimeError::new_err(
+      "circuit_breaker_state_patch_batch requires circuit_breaker_state_patch",
+    ));
+  }
+  if circuit_breaker_state_patch_batch_max_keys <= 0 {
+    return Err(PyRuntimeError::new_err(
+      "circuit_breaker_state_patch_batch_max_keys must be > 0",
+    ));
+  }
+  if circuit_breaker_state_patch_retry_max_attempts <= 0 {
+    return Err(PyRuntimeError::new_err(
+      "circuit_breaker_state_patch_retry_max_attempts must be > 0",
+    ));
+  }
   if circuit_breaker_state_cas && circuit_breaker_state_url.is_none() {
     return Err(PyRuntimeError::new_err(
       "circuit_breaker_state_cas requires circuit_breaker_state_url",
@@ -2051,6 +2069,10 @@ fn build_otel_push_options_py(
     circuit_breaker_state_path,
     circuit_breaker_state_url,
     circuit_breaker_state_patch,
+    circuit_breaker_state_patch_batch,
+    circuit_breaker_state_patch_batch_max_keys: circuit_breaker_state_patch_batch_max_keys as u32,
+    circuit_breaker_state_patch_retry_max_attempts: circuit_breaker_state_patch_retry_max_attempts
+      as u32,
     circuit_breaker_state_cas,
     circuit_breaker_state_lease_id,
     circuit_breaker_scope_key,
@@ -2083,6 +2105,9 @@ fn build_otel_push_options_py(
   circuit_breaker_state_path=None,
   circuit_breaker_state_url=None,
   circuit_breaker_state_patch=false,
+  circuit_breaker_state_patch_batch=false,
+  circuit_breaker_state_patch_batch_max_keys=8,
+  circuit_breaker_state_patch_retry_max_attempts=1,
   circuit_breaker_state_cas=false,
   circuit_breaker_state_lease_id=None,
   circuit_breaker_scope_key=None,
@@ -2110,6 +2135,9 @@ pub fn push_replication_metrics_otel_json(
   circuit_breaker_state_path: Option<String>,
   circuit_breaker_state_url: Option<String>,
   circuit_breaker_state_patch: bool,
+  circuit_breaker_state_patch_batch: bool,
+  circuit_breaker_state_patch_batch_max_keys: i64,
+  circuit_breaker_state_patch_retry_max_attempts: i64,
   circuit_breaker_state_cas: bool,
   circuit_breaker_state_lease_id: Option<String>,
   circuit_breaker_scope_key: Option<String>,
@@ -2135,6 +2163,9 @@ pub fn push_replication_metrics_otel_json(
     circuit_breaker_state_path,
     circuit_breaker_state_url,
     circuit_breaker_state_patch,
+    circuit_breaker_state_patch_batch,
+    circuit_breaker_state_patch_batch_max_keys,
+    circuit_breaker_state_patch_retry_max_attempts,
     circuit_breaker_state_cas,
     circuit_breaker_state_lease_id,
     circuit_breaker_scope_key,
@@ -2180,6 +2211,9 @@ pub fn push_replication_metrics_otel_json(
   circuit_breaker_state_path=None,
   circuit_breaker_state_url=None,
   circuit_breaker_state_patch=false,
+  circuit_breaker_state_patch_batch=false,
+  circuit_breaker_state_patch_batch_max_keys=8,
+  circuit_breaker_state_patch_retry_max_attempts=1,
   circuit_breaker_state_cas=false,
   circuit_breaker_state_lease_id=None,
   circuit_breaker_scope_key=None,
@@ -2207,6 +2241,9 @@ pub fn push_replication_metrics_otel_protobuf(
   circuit_breaker_state_path: Option<String>,
   circuit_breaker_state_url: Option<String>,
   circuit_breaker_state_patch: bool,
+  circuit_breaker_state_patch_batch: bool,
+  circuit_breaker_state_patch_batch_max_keys: i64,
+  circuit_breaker_state_patch_retry_max_attempts: i64,
   circuit_breaker_state_cas: bool,
   circuit_breaker_state_lease_id: Option<String>,
   circuit_breaker_scope_key: Option<String>,
@@ -2232,6 +2269,9 @@ pub fn push_replication_metrics_otel_protobuf(
     circuit_breaker_state_path,
     circuit_breaker_state_url,
     circuit_breaker_state_patch,
+    circuit_breaker_state_patch_batch,
+    circuit_breaker_state_patch_batch_max_keys,
+    circuit_breaker_state_patch_retry_max_attempts,
     circuit_breaker_state_cas,
     circuit_breaker_state_lease_id,
     circuit_breaker_scope_key,
@@ -2277,6 +2317,9 @@ pub fn push_replication_metrics_otel_protobuf(
   circuit_breaker_state_path=None,
   circuit_breaker_state_url=None,
   circuit_breaker_state_patch=false,
+  circuit_breaker_state_patch_batch=false,
+  circuit_breaker_state_patch_batch_max_keys=8,
+  circuit_breaker_state_patch_retry_max_attempts=1,
   circuit_breaker_state_cas=false,
   circuit_breaker_state_lease_id=None,
   circuit_breaker_scope_key=None,
@@ -2304,6 +2347,9 @@ pub fn push_replication_metrics_otel_grpc(
   circuit_breaker_state_path: Option<String>,
   circuit_breaker_state_url: Option<String>,
   circuit_breaker_state_patch: bool,
+  circuit_breaker_state_patch_batch: bool,
+  circuit_breaker_state_patch_batch_max_keys: i64,
+  circuit_breaker_state_patch_retry_max_attempts: i64,
   circuit_breaker_state_cas: bool,
   circuit_breaker_state_lease_id: Option<String>,
   circuit_breaker_scope_key: Option<String>,
@@ -2329,6 +2375,9 @@ pub fn push_replication_metrics_otel_grpc(
     circuit_breaker_state_path,
     circuit_breaker_state_url,
     circuit_breaker_state_patch,
+    circuit_breaker_state_patch_batch,
+    circuit_breaker_state_patch_batch_max_keys,
+    circuit_breaker_state_patch_retry_max_attempts,
     circuit_breaker_state_cas,
     circuit_breaker_state_lease_id,
     circuit_breaker_scope_key,
