@@ -339,6 +339,85 @@ fn spawn_state_store_get_server(state_body: String) -> (String, thread::JoinHand
   (endpoint, handle)
 }
 
+fn spawn_state_store_roundtrip_server() -> (String, thread::JoinHandle<()>) {
+  let listener = TcpListener::bind("127.0.0.1:0").expect("bind state store roundtrip");
+  let address = listener
+    .local_addr()
+    .expect("state store roundtrip local addr");
+  let endpoint = format!("http://{address}/breaker-state");
+  let handle = thread::spawn(move || {
+    let mut stored_state = "{}".to_string();
+    for expected_method in ["GET", "GET", "PUT", "GET"] {
+      let (mut stream, _) = listener.accept().expect("accept state store roundtrip");
+      stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set state store roundtrip read timeout");
+
+      let mut buffer = Vec::new();
+      let mut chunk = [0u8; 1024];
+      let mut header_end: Option<usize> = None;
+      let mut content_length = 0usize;
+      loop {
+        match stream.read(&mut chunk) {
+          Ok(0) => break,
+          Ok(read) => {
+            buffer.extend_from_slice(&chunk[..read]);
+            if header_end.is_none() {
+              if let Some(position) = find_subsequence(&buffer, b"\r\n\r\n") {
+                let end = position + 4;
+                header_end = Some(end);
+                let headers_text = String::from_utf8_lossy(&buffer[..end]);
+                for line in headers_text.lines().skip(1) {
+                  let Some((name, value)) = line.split_once(':') else {
+                    continue;
+                  };
+                  if name.eq_ignore_ascii_case("content-length") {
+                    content_length = value.trim().parse::<usize>().unwrap_or(0);
+                  }
+                }
+              }
+            }
+            if let Some(end) = header_end {
+              if buffer.len() >= end + content_length {
+                break;
+              }
+            }
+          }
+          Err(error) => panic!("read state store roundtrip request failed: {error}"),
+        }
+      }
+
+      let end = header_end.expect("state store roundtrip header terminator");
+      let request_text = String::from_utf8_lossy(&buffer[..end]);
+      let request_line = request_text.lines().next().unwrap_or_default();
+      assert!(
+        request_line.starts_with(&format!("{expected_method} /breaker-state HTTP/1.1")),
+        "unexpected state store roundtrip request line: {request_line}"
+      );
+
+      if expected_method == "PUT" {
+        let body_end = (end + content_length).min(buffer.len());
+        stored_state = String::from_utf8_lossy(&buffer[end..body_end]).to_string();
+      }
+
+      let response_body = if expected_method == "GET" {
+        stored_state.clone()
+      } else {
+        String::new()
+      };
+      let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        response_body.len(),
+        response_body
+      );
+      stream
+        .write_all(response.as_bytes())
+        .expect("write state store roundtrip response");
+    }
+  });
+  (endpoint, handle)
+}
+
 fn spawn_grpc_capture_server(
   fail_first_attempts: usize,
 ) -> (
@@ -1005,6 +1084,44 @@ fn otlp_push_payload_uses_shared_circuit_breaker_state_url() {
     "unexpected error: {error}"
   );
   state_handle.join().expect("state store thread");
+}
+
+#[test]
+fn otlp_push_payload_shared_state_url_roundtrips_failure_open_state() {
+  let (state_url, state_handle) = spawn_state_store_roundtrip_server();
+  let options = OtlpHttpPushOptions {
+    timeout_ms: 200,
+    retry_max_attempts: 1,
+    circuit_breaker_failure_threshold: 1,
+    circuit_breaker_open_ms: 2_000,
+    circuit_breaker_state_url: Some(state_url),
+    circuit_breaker_scope_key: Some("shared-roundtrip-breaker".to_string()),
+    ..OtlpHttpPushOptions::default()
+  };
+
+  let first = push_replication_metrics_otel_json_payload_with_options(
+    "{}",
+    "http://127.0.0.1:9/v1/metrics",
+    &options,
+  )
+  .expect_err("first call should fail transport and persist open state");
+  assert!(
+    first.to_string().contains("transport"),
+    "unexpected first error: {first}"
+  );
+
+  let second = push_replication_metrics_otel_json_payload_with_options(
+    "{}",
+    "http://127.0.0.1:9/v1/metrics",
+    &options,
+  )
+  .expect_err("second call should be blocked by state loaded from shared url");
+  assert!(
+    second.to_string().contains("circuit breaker open"),
+    "unexpected second error: {second}"
+  );
+
+  state_handle.join().expect("state store roundtrip thread");
 }
 
 #[test]
