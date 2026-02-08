@@ -160,6 +160,7 @@ CI tracking:
   (weekly schedule + manual dispatch) running `./scripts/vector-ann-pq-tuning.sh`.
 - Results are uploaded as artifact `ann-pq-tracking-logs`.
 - Tracking logs are run-scoped with stamp `ci-<run_id>-<run_attempt>`.
+- Scheduled runs skip release/publish gating jobs; schedule path is tracking-only.
 - Manual dispatch input `ann_pq_profile`:
   - `fast` (default): lightweight trend sweep.
   - `full`: deeper sweep (`RESIDUALS_SET=false true`) for investigation.

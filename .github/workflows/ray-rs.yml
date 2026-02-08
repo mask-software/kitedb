@@ -33,6 +33,7 @@ defaults:
 jobs:
   meta:
     name: Release Gate
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     outputs:
       all: ${{ steps.flags.outputs.all }}
