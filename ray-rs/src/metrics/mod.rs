@@ -183,6 +183,13 @@ pub struct OtlpHttpTlsOptions {
 }
 
 /// OTLP HTTP push options for collector export.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OtlpAdaptiveRetryMode {
+  #[default]
+  Linear,
+  Ewma,
+}
+
 #[derive(Debug, Clone)]
 pub struct OtlpHttpPushOptions {
   pub timeout_ms: u64,
@@ -191,9 +198,12 @@ pub struct OtlpHttpPushOptions {
   pub retry_backoff_ms: u64,
   pub retry_backoff_max_ms: u64,
   pub retry_jitter_ratio: f64,
+  pub adaptive_retry_mode: OtlpAdaptiveRetryMode,
+  pub adaptive_retry_ewma_alpha: f64,
   pub adaptive_retry: bool,
   pub circuit_breaker_failure_threshold: u32,
   pub circuit_breaker_open_ms: u64,
+  pub circuit_breaker_half_open_probes: u32,
   pub circuit_breaker_state_path: Option<String>,
   pub circuit_breaker_scope_key: Option<String>,
   pub compression_gzip: bool,
@@ -209,9 +219,12 @@ impl Default for OtlpHttpPushOptions {
       retry_backoff_ms: 100,
       retry_backoff_max_ms: 2_000,
       retry_jitter_ratio: 0.0,
+      adaptive_retry_mode: OtlpAdaptiveRetryMode::Linear,
+      adaptive_retry_ewma_alpha: 0.3,
       adaptive_retry: false,
       circuit_breaker_failure_threshold: 0,
       circuit_breaker_open_ms: 0,
+      circuit_breaker_half_open_probes: 1,
       circuit_breaker_state_path: None,
       circuit_breaker_scope_key: None,
       compression_gzip: false,
@@ -726,9 +739,21 @@ fn validate_otel_push_options(options: &OtlpHttpPushOptions) -> Result<()> {
       "retry_jitter_ratio must be within [0.0, 1.0]".into(),
     ));
   }
+  if !(0.0..=1.0).contains(&options.adaptive_retry_ewma_alpha) {
+    return Err(KiteError::InvalidQuery(
+      "adaptive_retry_ewma_alpha must be within [0.0, 1.0]".into(),
+    ));
+  }
   if options.circuit_breaker_failure_threshold > 0 && options.circuit_breaker_open_ms == 0 {
     return Err(KiteError::InvalidQuery(
       "circuit_breaker_open_ms must be > 0 when circuit_breaker_failure_threshold is enabled"
+        .into(),
+    ));
+  }
+  if options.circuit_breaker_failure_threshold > 0 && options.circuit_breaker_half_open_probes == 0
+  {
+    return Err(KiteError::InvalidQuery(
+      "circuit_breaker_half_open_probes must be > 0 when circuit_breaker_failure_threshold is enabled"
         .into(),
     ));
   }
@@ -804,9 +829,13 @@ fn retry_backoff_with_jitter_duration(
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 struct OtlpCircuitBreakerState {
   consecutive_failures: u32,
   open_until_ms: u64,
+  half_open_remaining_probes: u32,
+  half_open_in_flight: bool,
+  ewma_error_score: f64,
 }
 
 static OTLP_CIRCUIT_BREAKERS: OnceLock<Mutex<HashMap<String, OtlpCircuitBreakerState>>> =
@@ -873,6 +902,13 @@ fn merge_persisted_breaker_state(
     .consecutive_failures
     .max(persisted_state.consecutive_failures);
   entry.open_until_ms = entry.open_until_ms.max(persisted_state.open_until_ms);
+  entry.half_open_remaining_probes = entry
+    .half_open_remaining_probes
+    .max(persisted_state.half_open_remaining_probes);
+  entry.ewma_error_score = entry
+    .ewma_error_score
+    .max(persisted_state.ewma_error_score)
+    .clamp(0.0, 1.0);
 }
 
 fn adaptive_retry_multiplier(endpoint: &str, options: &OtlpHttpPushOptions) -> u64 {
@@ -882,11 +918,17 @@ fn adaptive_retry_multiplier(endpoint: &str, options: &OtlpHttpPushOptions) -> u
   let key = circuit_breaker_key(endpoint, options);
   let mut states = otlp_circuit_breakers().lock();
   merge_persisted_breaker_state(&key, options, &mut states);
-  let failures = states
+  let multiplier = states
     .get(&key)
-    .map(|state| state.consecutive_failures)
-    .unwrap_or(0);
-  1 + u64::from(failures.min(8))
+    .map(|state| match options.adaptive_retry_mode {
+      OtlpAdaptiveRetryMode::Linear => 1 + u64::from(state.consecutive_failures.min(8)),
+      OtlpAdaptiveRetryMode::Ewma => {
+        let score = state.ewma_error_score.clamp(0.0, 1.0);
+        1 + ((score * 8.0).round() as u64)
+      }
+    })
+    .unwrap_or(1);
+  multiplier.max(1)
 }
 
 fn check_circuit_breaker_open(endpoint: &str, options: &OtlpHttpPushOptions) -> Result<()> {
@@ -895,27 +937,82 @@ fn check_circuit_breaker_open(endpoint: &str, options: &OtlpHttpPushOptions) -> 
   }
   let key = circuit_breaker_key(endpoint, options);
   let now = circuit_breaker_now_ms();
-  let mut states = otlp_circuit_breakers().lock();
-  merge_persisted_breaker_state(&key, options, &mut states);
-  if let Some(state) = states.get(&key) {
+  let snapshot = {
+    let mut states = otlp_circuit_breakers().lock();
+    merge_persisted_breaker_state(&key, options, &mut states);
+    let Some(state) = states.get_mut(&key) else {
+      return Ok(());
+    };
     if state.open_until_ms > now {
       return Err(KiteError::Internal(format!(
         "OTLP circuit breaker open for endpoint {endpoint} until {}",
         state.open_until_ms
       )));
     }
+
+    let mut changed = false;
+    if state.open_until_ms > 0 {
+      state.open_until_ms = 0;
+      if state.half_open_remaining_probes == 0 && !state.half_open_in_flight {
+        state.half_open_remaining_probes = options.circuit_breaker_half_open_probes.max(1);
+      }
+      changed = true;
+    }
+
+    if state.half_open_in_flight {
+      return Err(KiteError::Internal(format!(
+        "OTLP circuit breaker half-open probe already in flight for endpoint {endpoint}"
+      )));
+    }
+
+    if state.half_open_remaining_probes > 0 {
+      state.half_open_remaining_probes = state.half_open_remaining_probes.saturating_sub(1);
+      state.half_open_in_flight = true;
+      changed = true;
+    }
+
+    if changed {
+      Some(states.clone())
+    } else {
+      None
+    }
+  };
+  if let (Some(path), Some(snapshot)) = (circuit_breaker_state_path(options), snapshot) {
+    persist_breakers(path, &snapshot);
   }
   Ok(())
 }
 
 fn record_circuit_breaker_success(endpoint: &str, options: &OtlpHttpPushOptions) {
-  if options.circuit_breaker_failure_threshold == 0 {
+  if options.circuit_breaker_failure_threshold == 0 && !options.adaptive_retry {
     return;
   }
   let key = circuit_breaker_key(endpoint, options);
   let snapshot = {
     let mut states = otlp_circuit_breakers().lock();
-    states.remove(&key);
+    merge_persisted_breaker_state(&key, options, &mut states);
+    let state = states.entry(key.clone()).or_default();
+    let alpha = options.adaptive_retry_ewma_alpha.clamp(0.0, 1.0);
+    state.ewma_error_score = ((1.0 - alpha) * state.ewma_error_score).clamp(0.0, 1.0);
+    state.consecutive_failures = 0;
+    state.open_until_ms = 0;
+    state.half_open_in_flight = false;
+    if !options.adaptive_retry
+      && state.consecutive_failures == 0
+      && state.open_until_ms == 0
+      && state.half_open_remaining_probes == 0
+      && !state.half_open_in_flight
+    {
+      states.remove(&key);
+    } else if options.adaptive_retry
+      && state.consecutive_failures == 0
+      && state.open_until_ms == 0
+      && state.half_open_remaining_probes == 0
+      && !state.half_open_in_flight
+      && state.ewma_error_score <= f64::EPSILON
+    {
+      states.remove(&key);
+    }
     states.clone()
   };
   if let Some(path) = circuit_breaker_state_path(options) {
@@ -924,7 +1021,9 @@ fn record_circuit_breaker_success(endpoint: &str, options: &OtlpHttpPushOptions)
 }
 
 fn record_circuit_breaker_failure(endpoint: &str, options: &OtlpHttpPushOptions) {
-  if options.circuit_breaker_failure_threshold == 0 || options.circuit_breaker_open_ms == 0 {
+  if (options.circuit_breaker_failure_threshold == 0 || options.circuit_breaker_open_ms == 0)
+    && !options.adaptive_retry
+  {
     return;
   }
   let key = circuit_breaker_key(endpoint, options);
@@ -933,10 +1032,24 @@ fn record_circuit_breaker_failure(endpoint: &str, options: &OtlpHttpPushOptions)
     let mut states = otlp_circuit_breakers().lock();
     merge_persisted_breaker_state(&key, options, &mut states);
     let state = states.entry(key).or_default();
-    state.consecutive_failures = state.consecutive_failures.saturating_add(1);
-    if state.consecutive_failures >= options.circuit_breaker_failure_threshold {
-      state.open_until_ms = now.saturating_add(options.circuit_breaker_open_ms);
-      state.consecutive_failures = 0;
+    let alpha = options.adaptive_retry_ewma_alpha.clamp(0.0, 1.0);
+    state.ewma_error_score = ((1.0 - alpha) * state.ewma_error_score + alpha).clamp(0.0, 1.0);
+    if options.circuit_breaker_failure_threshold > 0 && options.circuit_breaker_open_ms > 0 {
+      let probe_budget = options.circuit_breaker_half_open_probes.max(1);
+      if state.half_open_in_flight || state.half_open_remaining_probes > 0 {
+        state.open_until_ms = now.saturating_add(options.circuit_breaker_open_ms);
+        state.consecutive_failures = 0;
+        state.half_open_remaining_probes = probe_budget;
+        state.half_open_in_flight = false;
+      } else {
+        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        if state.consecutive_failures >= options.circuit_breaker_failure_threshold {
+          state.open_until_ms = now.saturating_add(options.circuit_breaker_open_ms);
+          state.consecutive_failures = 0;
+          state.half_open_remaining_probes = probe_budget;
+          state.half_open_in_flight = false;
+        }
+      }
     }
     states.clone()
   };

@@ -16,7 +16,7 @@ use kitedb::metrics::{
   push_replication_metrics_otel_json_payload,
   push_replication_metrics_otel_json_payload_with_options,
   push_replication_metrics_otel_protobuf_payload, render_replication_metrics_prometheus,
-  OtlpHttpPushOptions, OtlpHttpTlsOptions,
+  OtlpAdaptiveRetryMode, OtlpHttpPushOptions, OtlpHttpTlsOptions,
 };
 use kitedb::replication::types::ReplicationRole;
 use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::{
@@ -741,6 +741,44 @@ fn otlp_push_payload_rejects_invalid_retry_jitter_ratio() {
 }
 
 #[test]
+fn otlp_push_payload_rejects_invalid_adaptive_retry_ewma_alpha() {
+  let options = OtlpHttpPushOptions {
+    timeout_ms: 2_000,
+    adaptive_retry: true,
+    adaptive_retry_mode: OtlpAdaptiveRetryMode::Ewma,
+    adaptive_retry_ewma_alpha: 1.5,
+    ..OtlpHttpPushOptions::default()
+  };
+  let error = push_replication_metrics_otel_json_payload_with_options(
+    "{}",
+    "http://127.0.0.1:4318/v1/metrics",
+    &options,
+  )
+  .expect_err("invalid adaptive ewma alpha must fail");
+  assert!(error.to_string().contains("adaptive_retry_ewma_alpha"));
+}
+
+#[test]
+fn otlp_push_payload_rejects_zero_half_open_probes_when_breaker_enabled() {
+  let options = OtlpHttpPushOptions {
+    timeout_ms: 2_000,
+    circuit_breaker_failure_threshold: 1,
+    circuit_breaker_open_ms: 1_000,
+    circuit_breaker_half_open_probes: 0,
+    ..OtlpHttpPushOptions::default()
+  };
+  let error = push_replication_metrics_otel_json_payload_with_options(
+    "{}",
+    "http://127.0.0.1:4318/v1/metrics",
+    &options,
+  )
+  .expect_err("zero half-open probes must fail");
+  assert!(error
+    .to_string()
+    .contains("circuit_breaker_half_open_probes"));
+}
+
+#[test]
 fn otlp_push_payload_circuit_breaker_opens_after_failure() {
   let probe = TcpListener::bind("127.0.0.1:0").expect("bind probe");
   let port = probe.local_addr().expect("probe addr").port();
@@ -775,6 +813,59 @@ fn otlp_push_payload_circuit_breaker_opens_after_failure() {
     !third.to_string().contains("circuit breaker open"),
     "breaker should have closed, got: {third}"
   );
+}
+
+#[test]
+fn otlp_push_payload_half_open_probes_gate_recovery() {
+  let payload = "{\"resourceMetrics\":[]}";
+  let (endpoint, captured_rx, handle) =
+    spawn_http_sequence_capture_server(vec![500, 200, 200, 500], "ok");
+  let options = OtlpHttpPushOptions {
+    timeout_ms: 2_000,
+    retry_max_attempts: 1,
+    retry_backoff_ms: 1,
+    retry_backoff_max_ms: 1,
+    circuit_breaker_failure_threshold: 1,
+    circuit_breaker_open_ms: 50,
+    circuit_breaker_half_open_probes: 2,
+    ..OtlpHttpPushOptions::default()
+  };
+
+  let first = push_replication_metrics_otel_json_payload_with_options(payload, &endpoint, &options)
+    .expect_err("first call should open breaker");
+  assert!(first.to_string().contains("status 500"));
+
+  let second =
+    push_replication_metrics_otel_json_payload_with_options(payload, &endpoint, &options)
+      .expect_err("breaker should block while open");
+  assert!(second.to_string().contains("circuit breaker open"));
+
+  thread::sleep(Duration::from_millis(70));
+  let third = push_replication_metrics_otel_json_payload_with_options(payload, &endpoint, &options)
+    .expect("first half-open probe should pass");
+  assert_eq!(third.status_code, 200);
+
+  let fourth =
+    push_replication_metrics_otel_json_payload_with_options(payload, &endpoint, &options)
+      .expect("second half-open probe should pass");
+  assert_eq!(fourth.status_code, 200);
+
+  let fifth = push_replication_metrics_otel_json_payload_with_options(payload, &endpoint, &options)
+    .expect_err("fifth call should hit configured server failure");
+  assert!(
+    !fifth.to_string().contains("circuit breaker open"),
+    "expected call to be attempted after successful probes, got: {fifth}"
+  );
+
+  let captures = captured_rx
+    .recv_timeout(Duration::from_secs(2))
+    .expect("captured half-open requests");
+  assert_eq!(
+    captures.len(),
+    4,
+    "blocked open-window call should not hit endpoint"
+  );
+  handle.join().expect("half-open sequence server thread");
 }
 
 #[test]
@@ -868,6 +959,60 @@ fn otlp_push_payload_adaptive_retry_uses_failure_history() {
     .expect("captured adaptive requests");
   assert_eq!(captures.len(), 2);
   handle.join().expect("adaptive sequence thread");
+}
+
+#[test]
+fn otlp_push_payload_adaptive_retry_ewma_mode_uses_error_score() {
+  let dir = tempfile::tempdir().expect("tempdir");
+  let state_path = dir.path().join("otlp-adaptive-ewma-state.json");
+  let state_json = serde_json::json!({
+    "adaptive-ewma-breaker": {
+      "consecutive_failures": 0,
+      "open_until_ms": 0,
+      "ewma_error_score": 0.75
+    }
+  });
+  std::fs::write(
+    &state_path,
+    serde_json::to_vec(&state_json).expect("serialize adaptive ewma state"),
+  )
+  .expect("write adaptive ewma state");
+
+  let payload = "{\"resourceMetrics\":[]}";
+  let (endpoint, captured_rx, handle) = spawn_http_sequence_capture_server(vec![500, 200], "ok");
+  let options = OtlpHttpPushOptions {
+    timeout_ms: 2_000,
+    retry_max_attempts: 2,
+    retry_backoff_ms: 80,
+    retry_backoff_max_ms: 2_000,
+    retry_jitter_ratio: 0.0,
+    adaptive_retry: true,
+    adaptive_retry_mode: OtlpAdaptiveRetryMode::Ewma,
+    adaptive_retry_ewma_alpha: 0.5,
+    circuit_breaker_failure_threshold: 2,
+    circuit_breaker_open_ms: 2_000,
+    circuit_breaker_state_path: Some(state_path.to_string_lossy().to_string()),
+    circuit_breaker_scope_key: Some("adaptive-ewma-breaker".to_string()),
+    ..OtlpHttpPushOptions::default()
+  };
+
+  let start = Instant::now();
+  let result =
+    push_replication_metrics_otel_json_payload_with_options(payload, &endpoint, &options)
+      .expect("adaptive ewma retry second attempt should succeed");
+  let elapsed = start.elapsed();
+  assert_eq!(result.status_code, 200);
+  assert!(
+    elapsed >= Duration::from_millis(450),
+    "adaptive ewma retry backoff too small: {:?}",
+    elapsed
+  );
+
+  let captures = captured_rx
+    .recv_timeout(Duration::from_secs(2))
+    .expect("captured adaptive ewma requests");
+  assert_eq!(captures.len(), 2);
+  handle.join().expect("adaptive ewma sequence thread");
 }
 
 #[test]

@@ -855,8 +855,11 @@ pub struct PushReplicationMetricsOtelOptions {
   pub retry_backoff_max_ms: Option<i64>,
   pub retry_jitter_ratio: Option<f64>,
   pub adaptive_retry: Option<bool>,
+  pub adaptive_retry_mode: Option<String>,
+  pub adaptive_retry_ewma_alpha: Option<f64>,
   pub circuit_breaker_failure_threshold: Option<i64>,
   pub circuit_breaker_open_ms: Option<i64>,
+  pub circuit_breaker_half_open_probes: Option<i64>,
   pub circuit_breaker_state_path: Option<String>,
   pub circuit_breaker_scope_key: Option<String>,
   pub compression_gzip: Option<bool>,
@@ -3476,6 +3479,29 @@ fn build_core_otel_push_options(
       "retryJitterRatio must be within [0.0, 1.0]",
     ));
   }
+  let adaptive_retry_mode = match options
+    .adaptive_retry_mode
+    .as_deref()
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+  {
+    None => core_metrics::OtlpAdaptiveRetryMode::Linear,
+    Some(value) if value.eq_ignore_ascii_case("linear") => {
+      core_metrics::OtlpAdaptiveRetryMode::Linear
+    }
+    Some(value) if value.eq_ignore_ascii_case("ewma") => core_metrics::OtlpAdaptiveRetryMode::Ewma,
+    Some(_) => {
+      return Err(Error::from_reason(
+        "adaptiveRetryMode must be one of: linear, ewma",
+      ));
+    }
+  };
+  let adaptive_retry_ewma_alpha = options.adaptive_retry_ewma_alpha.unwrap_or(0.3);
+  if !(0.0..=1.0).contains(&adaptive_retry_ewma_alpha) {
+    return Err(Error::from_reason(
+      "adaptiveRetryEwmaAlpha must be within [0.0, 1.0]",
+    ));
+  }
   let circuit_breaker_failure_threshold = options.circuit_breaker_failure_threshold.unwrap_or(0);
   if circuit_breaker_failure_threshold < 0 {
     return Err(Error::from_reason(
@@ -3491,6 +3517,17 @@ fn build_core_otel_push_options(
   if circuit_breaker_failure_threshold > 0 && circuit_breaker_open_ms == 0 {
     return Err(Error::from_reason(
       "circuitBreakerOpenMs must be positive when circuitBreakerFailureThreshold is set",
+    ));
+  }
+  let circuit_breaker_half_open_probes = options.circuit_breaker_half_open_probes.unwrap_or(1);
+  if circuit_breaker_half_open_probes < 0 {
+    return Err(Error::from_reason(
+      "circuitBreakerHalfOpenProbes must be non-negative",
+    ));
+  }
+  if circuit_breaker_failure_threshold > 0 && circuit_breaker_half_open_probes == 0 {
+    return Err(Error::from_reason(
+      "circuitBreakerHalfOpenProbes must be positive when circuitBreakerFailureThreshold is set",
     ));
   }
   if let Some(path) = options.circuit_breaker_state_path.as_deref() {
@@ -3515,9 +3552,12 @@ fn build_core_otel_push_options(
     retry_backoff_ms: retry_backoff_ms as u64,
     retry_backoff_max_ms: retry_backoff_max_ms as u64,
     retry_jitter_ratio,
+    adaptive_retry_mode,
+    adaptive_retry_ewma_alpha,
     adaptive_retry: options.adaptive_retry.unwrap_or(false),
     circuit_breaker_failure_threshold: circuit_breaker_failure_threshold as u32,
     circuit_breaker_open_ms: circuit_breaker_open_ms as u64,
+    circuit_breaker_half_open_probes: circuit_breaker_half_open_probes as u32,
     circuit_breaker_state_path: options.circuit_breaker_state_path,
     circuit_breaker_scope_key: options.circuit_breaker_scope_key,
     compression_gzip: options.compression_gzip.unwrap_or(false),

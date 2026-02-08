@@ -1884,8 +1884,11 @@ fn build_otel_push_options_py(
   retry_backoff_max_ms: i64,
   retry_jitter_ratio: f64,
   adaptive_retry: bool,
+  adaptive_retry_mode: Option<String>,
+  adaptive_retry_ewma_alpha: f64,
   circuit_breaker_failure_threshold: i64,
   circuit_breaker_open_ms: i64,
+  circuit_breaker_half_open_probes: i64,
   circuit_breaker_state_path: Option<String>,
   circuit_breaker_scope_key: Option<String>,
   compression_gzip: bool,
@@ -1922,6 +1925,27 @@ fn build_otel_push_options_py(
       "retry_jitter_ratio must be within [0.0, 1.0]",
     ));
   }
+  let adaptive_retry_mode = match adaptive_retry_mode
+    .as_deref()
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+  {
+    None => core_metrics::OtlpAdaptiveRetryMode::Linear,
+    Some(value) if value.eq_ignore_ascii_case("linear") => {
+      core_metrics::OtlpAdaptiveRetryMode::Linear
+    }
+    Some(value) if value.eq_ignore_ascii_case("ewma") => core_metrics::OtlpAdaptiveRetryMode::Ewma,
+    Some(_) => {
+      return Err(PyRuntimeError::new_err(
+        "adaptive_retry_mode must be one of: linear, ewma",
+      ));
+    }
+  };
+  if !(0.0..=1.0).contains(&adaptive_retry_ewma_alpha) {
+    return Err(PyRuntimeError::new_err(
+      "adaptive_retry_ewma_alpha must be within [0.0, 1.0]",
+    ));
+  }
   if circuit_breaker_failure_threshold < 0 {
     return Err(PyRuntimeError::new_err(
       "circuit_breaker_failure_threshold must be non-negative",
@@ -1935,6 +1959,16 @@ fn build_otel_push_options_py(
   if circuit_breaker_failure_threshold > 0 && circuit_breaker_open_ms == 0 {
     return Err(PyRuntimeError::new_err(
       "circuit_breaker_open_ms must be > 0 when circuit_breaker_failure_threshold is enabled",
+    ));
+  }
+  if circuit_breaker_half_open_probes < 0 {
+    return Err(PyRuntimeError::new_err(
+      "circuit_breaker_half_open_probes must be non-negative",
+    ));
+  }
+  if circuit_breaker_failure_threshold > 0 && circuit_breaker_half_open_probes == 0 {
+    return Err(PyRuntimeError::new_err(
+      "circuit_breaker_half_open_probes must be > 0 when circuit_breaker_failure_threshold is enabled",
     ));
   }
   if let Some(path) = circuit_breaker_state_path.as_deref() {
@@ -1959,9 +1993,12 @@ fn build_otel_push_options_py(
     retry_backoff_ms: retry_backoff_ms as u64,
     retry_backoff_max_ms: retry_backoff_max_ms as u64,
     retry_jitter_ratio,
+    adaptive_retry_mode,
+    adaptive_retry_ewma_alpha,
     adaptive_retry,
     circuit_breaker_failure_threshold: circuit_breaker_failure_threshold as u32,
     circuit_breaker_open_ms: circuit_breaker_open_ms as u64,
+    circuit_breaker_half_open_probes: circuit_breaker_half_open_probes as u32,
     circuit_breaker_state_path,
     circuit_breaker_scope_key,
     compression_gzip,
@@ -1985,8 +2022,11 @@ fn build_otel_push_options_py(
   retry_backoff_max_ms=2000,
   retry_jitter_ratio=0.0,
   adaptive_retry=false,
+  adaptive_retry_mode=None,
+  adaptive_retry_ewma_alpha=0.3,
   circuit_breaker_failure_threshold=0,
   circuit_breaker_open_ms=0,
+  circuit_breaker_half_open_probes=1,
   circuit_breaker_state_path=None,
   circuit_breaker_scope_key=None,
   compression_gzip=false,
@@ -2005,8 +2045,11 @@ pub fn push_replication_metrics_otel_json(
   retry_backoff_max_ms: i64,
   retry_jitter_ratio: f64,
   adaptive_retry: bool,
+  adaptive_retry_mode: Option<String>,
+  adaptive_retry_ewma_alpha: f64,
   circuit_breaker_failure_threshold: i64,
   circuit_breaker_open_ms: i64,
+  circuit_breaker_half_open_probes: i64,
   circuit_breaker_state_path: Option<String>,
   circuit_breaker_scope_key: Option<String>,
   compression_gzip: bool,
@@ -2023,8 +2066,11 @@ pub fn push_replication_metrics_otel_json(
     retry_backoff_max_ms,
     retry_jitter_ratio,
     adaptive_retry,
+    adaptive_retry_mode,
+    adaptive_retry_ewma_alpha,
     circuit_breaker_failure_threshold,
     circuit_breaker_open_ms,
+    circuit_breaker_half_open_probes,
     circuit_breaker_state_path,
     circuit_breaker_scope_key,
     compression_gzip,
@@ -2061,8 +2107,11 @@ pub fn push_replication_metrics_otel_json(
   retry_backoff_max_ms=2000,
   retry_jitter_ratio=0.0,
   adaptive_retry=false,
+  adaptive_retry_mode=None,
+  adaptive_retry_ewma_alpha=0.3,
   circuit_breaker_failure_threshold=0,
   circuit_breaker_open_ms=0,
+  circuit_breaker_half_open_probes=1,
   circuit_breaker_state_path=None,
   circuit_breaker_scope_key=None,
   compression_gzip=false,
@@ -2081,8 +2130,11 @@ pub fn push_replication_metrics_otel_protobuf(
   retry_backoff_max_ms: i64,
   retry_jitter_ratio: f64,
   adaptive_retry: bool,
+  adaptive_retry_mode: Option<String>,
+  adaptive_retry_ewma_alpha: f64,
   circuit_breaker_failure_threshold: i64,
   circuit_breaker_open_ms: i64,
+  circuit_breaker_half_open_probes: i64,
   circuit_breaker_state_path: Option<String>,
   circuit_breaker_scope_key: Option<String>,
   compression_gzip: bool,
@@ -2099,8 +2151,11 @@ pub fn push_replication_metrics_otel_protobuf(
     retry_backoff_max_ms,
     retry_jitter_ratio,
     adaptive_retry,
+    adaptive_retry_mode,
+    adaptive_retry_ewma_alpha,
     circuit_breaker_failure_threshold,
     circuit_breaker_open_ms,
+    circuit_breaker_half_open_probes,
     circuit_breaker_state_path,
     circuit_breaker_scope_key,
     compression_gzip,
@@ -2137,8 +2192,11 @@ pub fn push_replication_metrics_otel_protobuf(
   retry_backoff_max_ms=2000,
   retry_jitter_ratio=0.0,
   adaptive_retry=false,
+  adaptive_retry_mode=None,
+  adaptive_retry_ewma_alpha=0.3,
   circuit_breaker_failure_threshold=0,
   circuit_breaker_open_ms=0,
+  circuit_breaker_half_open_probes=1,
   circuit_breaker_state_path=None,
   circuit_breaker_scope_key=None,
   compression_gzip=false,
@@ -2157,8 +2215,11 @@ pub fn push_replication_metrics_otel_grpc(
   retry_backoff_max_ms: i64,
   retry_jitter_ratio: f64,
   adaptive_retry: bool,
+  adaptive_retry_mode: Option<String>,
+  adaptive_retry_ewma_alpha: f64,
   circuit_breaker_failure_threshold: i64,
   circuit_breaker_open_ms: i64,
+  circuit_breaker_half_open_probes: i64,
   circuit_breaker_state_path: Option<String>,
   circuit_breaker_scope_key: Option<String>,
   compression_gzip: bool,
@@ -2175,8 +2236,11 @@ pub fn push_replication_metrics_otel_grpc(
     retry_backoff_max_ms,
     retry_jitter_ratio,
     adaptive_retry,
+    adaptive_retry_mode,
+    adaptive_retry_ewma_alpha,
     circuit_breaker_failure_threshold,
     circuit_breaker_open_ms,
+    circuit_breaker_half_open_probes,
     circuit_breaker_state_path,
     circuit_breaker_scope_key,
     compression_gzip,

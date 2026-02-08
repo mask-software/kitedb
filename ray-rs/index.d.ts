@@ -889,8 +889,11 @@ export interface PushReplicationMetricsOtelOptions {
   retryBackoffMaxMs?: number
   retryJitterRatio?: number
   adaptiveRetry?: boolean
+  adaptiveRetryMode?: 'linear' | 'ewma'
+  adaptiveRetryEwmaAlpha?: number
   circuitBreakerFailureThreshold?: number
   circuitBreakerOpenMs?: number
+  circuitBreakerHalfOpenProbes?: number
   circuitBreakerStatePath?: string
   circuitBreakerScopeKey?: string
   compressionGzip?: boolean
