@@ -15,13 +15,13 @@ pub const MAGIC_SNAPSHOT: u32 = 0x31534447;
 // Current versions
 // ============================================================================
 
-pub const VERSION_SNAPSHOT: u32 = 3;
+pub const VERSION_SNAPSHOT: u32 = 4;
 
 // ============================================================================
 // Minimum reader versions
 // ============================================================================
 
-pub const MIN_READER_SNAPSHOT: u32 = 3;
+pub const MIN_READER_SNAPSHOT: u32 = 4;
 
 // ============================================================================
 // Alignment requirements

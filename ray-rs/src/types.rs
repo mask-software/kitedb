@@ -54,6 +54,7 @@ bitflags::bitflags! {
         const HAS_EDGE_BLOOM = 1 << 3; // future
         const HAS_NODE_LABELS = 1 << 4;
         const HAS_VECTORS = 1 << 5;
+        const HAS_VECTOR_STORES = 1 << 6;
     }
 }
 
@@ -115,12 +116,15 @@ pub enum SectionId {
   NodeLabelIds = 24,
   VectorOffsets = 25,
   VectorData = 26,
+  VectorStoreIndex = 27,
+  VectorStoreData = 28,
 }
 
 impl SectionId {
   pub const COUNT_V1: usize = 23;
   pub const COUNT_V2: usize = 25;
-  pub const COUNT: usize = 27;
+  pub const COUNT_V3: usize = 27;
+  pub const COUNT: usize = 29;
 
   pub fn from_u32(v: u32) -> Option<Self> {
     match v {
@@ -151,6 +155,8 @@ impl SectionId {
       24 => Some(Self::NodeLabelIds),
       25 => Some(Self::VectorOffsets),
       26 => Some(Self::VectorData),
+      27 => Some(Self::VectorStoreIndex),
+      28 => Some(Self::VectorStoreData),
       _ => None,
     }
   }

@@ -10,6 +10,8 @@ use crate::util::binary::*;
 use crate::util::compression::{maybe_compress, CompressionOptions, CompressionType};
 use crate::util::crc::crc32c;
 use crate::util::hash::xxhash64_string;
+use crate::vector::ivf::serialize::serialize_manifest;
+use crate::vector::types::VectorManifest;
 use std::collections::HashMap;
 
 // ============================================================================
@@ -43,6 +45,7 @@ pub struct SnapshotBuildInput {
   pub labels: HashMap<LabelId, String>,
   pub etypes: HashMap<ETypeId, String>,
   pub propkeys: HashMap<PropKeyId, String>,
+  pub vector_stores: Option<HashMap<PropKeyId, VectorManifest>>,
   pub compression: Option<CompressionOptions>,
 }
 
@@ -835,6 +838,42 @@ fn add_vector_sections(
   true
 }
 
+fn add_vector_store_sections(
+  add_section: &mut impl FnMut(SectionId, Vec<u8>),
+  vector_stores: Option<&HashMap<PropKeyId, VectorManifest>>,
+) -> bool {
+  let Some(vector_stores) = vector_stores else {
+    return false;
+  };
+  if vector_stores.is_empty() {
+    return false;
+  }
+
+  let mut ordered: Vec<(PropKeyId, &VectorManifest)> =
+    vector_stores.iter().map(|(&k, v)| (k, v)).collect();
+  ordered.sort_by_key(|(prop_key_id, _)| *prop_key_id);
+
+  let mut index_data = vec![0u8; 4 + ordered.len() * 20];
+  write_u32(&mut index_data, 0, ordered.len() as u32);
+  let mut blob_data = Vec::new();
+
+  for (i, (prop_key_id, manifest)) in ordered.iter().enumerate() {
+    let encoded = serialize_manifest(manifest);
+    let offset = blob_data.len() as u64;
+    let length = encoded.len() as u64;
+    blob_data.extend_from_slice(&encoded);
+
+    let entry_offset = 4 + i * 20;
+    write_u32(&mut index_data, entry_offset, *prop_key_id);
+    write_u64(&mut index_data, entry_offset + 4, offset);
+    write_u64(&mut index_data, entry_offset + 12, length);
+  }
+
+  add_section(SectionId::VectorStoreIndex, index_data);
+  add_section(SectionId::VectorStoreData, blob_data);
+  true
+}
+
 // ============================================================================
 // Main snapshot building
 // ============================================================================
@@ -851,6 +890,7 @@ pub fn build_snapshot_to_memory(input: SnapshotBuildInput) -> Result<Vec<u8>> {
     labels,
     etypes,
     propkeys,
+    vector_stores,
     compression,
   } = input;
 
@@ -922,6 +962,7 @@ pub fn build_snapshot_to_memory(input: SnapshotBuildInput) -> Result<Vec<u8>> {
   );
 
   let has_vectors = add_vector_sections(&mut add_section, vector_table);
+  let has_vector_stores = add_vector_store_sections(&mut add_section, vector_stores.as_ref());
 
   // Calculate total size and offsets
   let header_size = SNAPSHOT_HEADER_SIZE;
@@ -964,6 +1005,9 @@ pub fn build_snapshot_to_memory(input: SnapshotBuildInput) -> Result<Vec<u8>> {
   }
   if has_vectors {
     flags |= SnapshotFlags::HAS_VECTORS;
+  }
+  if has_vector_stores {
+    flags |= SnapshotFlags::HAS_VECTOR_STORES;
   }
   write_u32(&mut buffer, offset, flags.bits());
   offset += 4;
@@ -1117,6 +1161,7 @@ mod tests {
       labels,
       etypes,
       propkeys,
+      vector_stores: None,
       compression: None,
     }
   }
@@ -1192,6 +1237,7 @@ mod tests {
       labels: HashMap::new(),
       etypes: HashMap::new(),
       propkeys: HashMap::new(),
+      vector_stores: None,
       compression: None,
     };
 
@@ -1224,6 +1270,7 @@ mod tests {
       labels: HashMap::new(),
       etypes,
       propkeys: HashMap::new(),
+      vector_stores: None,
       compression: None,
     };
 

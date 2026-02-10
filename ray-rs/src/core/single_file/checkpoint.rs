@@ -14,6 +14,7 @@ use crate::error::{KiteError, Result};
 use crate::types::*;
 use crate::util::mmap::map_file;
 use crate::vector::store::vector_store_node_vector;
+use crate::vector::types::VectorManifest;
 
 use super::vector::vector_stores_from_snapshot;
 use super::{CheckpointStatus, SingleFileDB};
@@ -24,6 +25,7 @@ type GraphData = (
   HashMap<LabelId, String>,
   HashMap<ETypeId, String>,
   HashMap<PropKeyId, String>,
+  HashMap<PropKeyId, VectorManifest>,
 );
 
 impl SingleFileDB {
@@ -50,7 +52,7 @@ impl SingleFileDB {
     }
 
     // Collect all graph data
-    let (nodes, edges, labels, etypes, propkeys) = self.collect_graph_data();
+    let (nodes, edges, labels, etypes, propkeys, vector_stores) = self.collect_graph_data();
 
     // Get current header state
     let header = self.header.read().clone();
@@ -64,6 +66,7 @@ impl SingleFileDB {
       labels,
       etypes,
       propkeys,
+      vector_stores: Some(vector_stores),
       compression: self.checkpoint_compression.clone(),
     })?;
 
@@ -252,7 +255,7 @@ impl SingleFileDB {
   /// Returns (new_gen, new_snapshot_start_page, new_snapshot_page_count)
   fn build_and_write_snapshot(&self) -> Result<(u64, u64, u64)> {
     // Collect all graph data (reads from snapshot + delta)
-    let (nodes, edges, labels, etypes, propkeys) = self.collect_graph_data();
+    let (nodes, edges, labels, etypes, propkeys, vector_stores) = self.collect_graph_data();
 
     // Get current header state
     let header = self.header.read().clone();
@@ -266,6 +269,7 @@ impl SingleFileDB {
       labels,
       etypes,
       propkeys,
+      vector_stores: Some(vector_stores),
       compression: self.checkpoint_compression.clone(),
     })?;
 
@@ -615,14 +619,29 @@ impl SingleFileDB {
       }
     }
 
-    // Merge vector embeddings into node props for snapshot persistence
-    if !self.vector_stores.read().is_empty() {
+    // Merge vector embeddings into node props for snapshot persistence.
+    // Also persist a cloned copy of vector stores as dedicated snapshot sections.
+    let vector_stores_for_snapshot: HashMap<PropKeyId, VectorManifest>;
+    {
+      let stores = self.vector_stores.read();
+      vector_stores_for_snapshot = stores.clone();
+
+      if stores.is_empty() {
+        return (
+          nodes,
+          edges,
+          labels,
+          etypes,
+          propkeys,
+          vector_stores_for_snapshot,
+        );
+      }
+
       let mut node_index: HashMap<NodeId, usize> = HashMap::new();
       for (idx, node) in nodes.iter().enumerate() {
         node_index.insert(node.node_id, idx);
       }
 
-      let stores = self.vector_stores.read();
       for (&prop_key_id, store) in stores.iter() {
         for &node_id in store.node_to_vector.keys() {
           if delta.is_node_deleted(node_id) {
@@ -642,7 +661,14 @@ impl SingleFileDB {
       }
     }
 
-    (nodes, edges, labels, etypes, propkeys)
+    (
+      nodes,
+      edges,
+      labels,
+      etypes,
+      propkeys,
+      vector_stores_for_snapshot,
+    )
   }
 
   /// Check if checkpoint is recommended based on WAL usage

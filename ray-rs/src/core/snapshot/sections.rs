@@ -17,8 +17,10 @@ pub struct ParsedSections {
 
 /// Resolve section table size for a snapshot version.
 pub fn section_count_for_version(version: u32) -> usize {
-  if version >= 3 {
+  if version >= 4 {
     SectionId::COUNT
+  } else if version >= 3 {
+    SectionId::COUNT_V3
   } else if version >= 2 {
     SectionId::COUNT_V2
   } else {
@@ -169,6 +171,7 @@ mod tests {
       labels: HashMap::new(),
       etypes: HashMap::new(),
       propkeys: HashMap::new(),
+      vector_stores: None,
       compression: None,
     })
     .expect("snapshot build")

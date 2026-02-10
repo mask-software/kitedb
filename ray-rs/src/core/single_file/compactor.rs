@@ -76,7 +76,7 @@ impl SingleFileDB {
       }
     }
 
-    let (nodes, edges, labels, etypes, propkeys) = self.collect_graph_data();
+    let (nodes, edges, labels, etypes, propkeys, vector_stores) = self.collect_graph_data();
 
     let header = self.header.read().clone();
     let old_snapshot_start_page = header.snapshot_start_page;
@@ -91,6 +91,7 @@ impl SingleFileDB {
       labels,
       etypes,
       propkeys,
+      vector_stores: Some(vector_stores),
       compression,
     })?;
 

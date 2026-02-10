@@ -8,6 +8,8 @@ use crate::core::wal::record::{
 };
 use crate::error::{KiteError, Result};
 use crate::types::*;
+use crate::util::binary::{read_u32, read_u64};
+use crate::vector::ivf::serialize::deserialize_manifest;
 use crate::vector::store::{
   create_vector_store, validate_vector, vector_store_delete, vector_store_has, vector_store_insert,
   vector_store_node_vector,
@@ -244,7 +246,18 @@ impl SingleFileDB {
 pub(crate) fn vector_stores_from_snapshot(
   snapshot: &SnapshotData,
 ) -> Result<HashMap<PropKeyId, VectorManifest>> {
-  let mut stores: HashMap<PropKeyId, VectorManifest> = HashMap::new();
+  if snapshot
+    .header
+    .flags
+    .contains(SnapshotFlags::HAS_VECTOR_STORES)
+  {
+    return vector_stores_from_sections(snapshot);
+  }
+
+  let mut stores = vector_stores_from_sections(snapshot)?;
+  if !stores.is_empty() {
+    return Ok(stores);
+  }
 
   if !snapshot.header.flags.contains(SnapshotFlags::HAS_VECTORS) {
     return Ok(stores);
@@ -288,11 +301,85 @@ pub(crate) fn vector_stores_from_snapshot(
   Ok(stores)
 }
 
+fn vector_stores_from_sections(
+  snapshot: &SnapshotData,
+) -> Result<HashMap<PropKeyId, VectorManifest>> {
+  let mut stores: HashMap<PropKeyId, VectorManifest> = HashMap::new();
+  let Some(index_bytes) = snapshot.section_bytes(SectionId::VectorStoreIndex) else {
+    return Ok(stores);
+  };
+  let Some(blob_bytes) = snapshot.section_bytes(SectionId::VectorStoreData) else {
+    return Err(KiteError::InvalidSnapshot(
+      "Vector store index present but vector store blob section is missing".to_string(),
+    ));
+  };
+
+  if index_bytes.len() < 4 {
+    return Err(KiteError::InvalidSnapshot(
+      "Vector store index section too small".to_string(),
+    ));
+  }
+
+  let count = read_u32(&index_bytes, 0) as usize;
+  let expected_len = 4usize
+    .checked_add(count.saturating_mul(20))
+    .ok_or_else(|| KiteError::InvalidSnapshot("Vector store index size overflow".to_string()))?;
+  if index_bytes.len() < expected_len {
+    return Err(KiteError::InvalidSnapshot(format!(
+      "Vector store index truncated: expected at least {expected_len} bytes, found {}",
+      index_bytes.len()
+    )));
+  }
+
+  for i in 0..count {
+    let entry_offset = 4 + i * 20;
+    let prop_key_id = read_u32(&index_bytes, entry_offset);
+    let payload_offset = read_u64(&index_bytes, entry_offset + 4) as usize;
+    let payload_len = read_u64(&index_bytes, entry_offset + 12) as usize;
+    let payload_end = payload_offset.checked_add(payload_len).ok_or_else(|| {
+      KiteError::InvalidSnapshot(format!(
+        "Vector store entry {i} overflow: offset={payload_offset}, len={payload_len}"
+      ))
+    })?;
+    if payload_end > blob_bytes.len() {
+      return Err(KiteError::InvalidSnapshot(format!(
+        "Vector store entry {i} out of bounds: {}..{} exceeds blob size {}",
+        payload_offset,
+        payload_end,
+        blob_bytes.len()
+      )));
+    }
+
+    let manifest =
+      deserialize_manifest(&blob_bytes[payload_offset..payload_end]).map_err(|err| {
+        KiteError::InvalidSnapshot(format!(
+          "Failed to deserialize vector store for prop key {prop_key_id}: {err}"
+        ))
+      })?;
+
+    if stores.insert(prop_key_id, manifest).is_some() {
+      return Err(KiteError::InvalidSnapshot(format!(
+        "Duplicate vector store entry for prop key {prop_key_id}"
+      )));
+    }
+  }
+
+  Ok(stores)
+}
+
 #[cfg(test)]
 mod tests {
+  use super::vector_stores_from_snapshot;
   use crate::core::single_file::{close_single_file, open_single_file, SingleFileOpenOptions};
+  use crate::core::snapshot::reader::SnapshotData;
+  use crate::core::snapshot::writer::{build_snapshot_to_memory, NodeData, SnapshotBuildInput};
+  use crate::types::{PropValue, SnapshotFlags};
   use crate::vector::distance::normalize;
-  use tempfile::tempdir;
+  use crate::vector::store::{create_vector_store, vector_store_has, vector_store_insert};
+  use crate::vector::types::VectorStoreConfig;
+  use std::collections::HashMap;
+  use std::io::Write;
+  use tempfile::{tempdir, NamedTempFile};
 
   #[test]
   fn test_set_node_vector_rejects_invalid_vectors() {
@@ -376,5 +463,57 @@ mod tests {
       assert!((got - exp).abs() < 1e-6);
     }
     close_single_file(db).expect("expected value");
+  }
+
+  #[test]
+  fn test_vector_store_sections_round_trip() {
+    let mut manifest = create_vector_store(VectorStoreConfig::new(3));
+    vector_store_insert(&mut manifest, 42, &[0.1, 0.2, 0.3]).expect("expected value");
+
+    let mut stores = HashMap::new();
+    stores.insert(7, manifest);
+
+    let mut propkeys = HashMap::new();
+    propkeys.insert(7, "embedding".to_string());
+
+    let buffer = build_snapshot_to_memory(SnapshotBuildInput {
+      generation: 1,
+      nodes: vec![NodeData {
+        node_id: 42,
+        key: None,
+        labels: vec![],
+        props: HashMap::new(),
+      }],
+      edges: Vec::new(),
+      labels: HashMap::new(),
+      etypes: HashMap::new(),
+      propkeys,
+      vector_stores: Some(stores),
+      compression: None,
+    })
+    .expect("expected value");
+
+    let mut tmp = NamedTempFile::new().expect("expected value");
+    tmp.write_all(&buffer).expect("expected value");
+    tmp.flush().expect("expected value");
+
+    let snapshot = SnapshotData::load(tmp.path()).expect("expected value");
+    assert!(snapshot
+      .header
+      .flags
+      .contains(SnapshotFlags::HAS_VECTOR_STORES));
+    assert!(!snapshot.header.flags.contains(SnapshotFlags::HAS_VECTORS));
+
+    let loaded = vector_stores_from_snapshot(&snapshot).expect("expected value");
+    let loaded_manifest = loaded.get(&7).expect("expected value");
+    assert!(vector_store_has(loaded_manifest, 42));
+
+    // Verify the legacy property path remains empty when vectors are only
+    // materialized via persisted vector-store sections.
+    let phys = snapshot.phys_node(42).expect("expected value");
+    assert!(!matches!(
+      snapshot.node_prop(phys, 7),
+      Some(PropValue::VectorF32(_))
+    ));
   }
 }
