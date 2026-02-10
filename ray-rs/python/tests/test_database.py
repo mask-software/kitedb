@@ -14,6 +14,22 @@ from kitedb import (
 class TestDatabase:
     """Test database operations."""
 
+    def test_open_static_keeps_connection(self):
+        """Test Database.open() returns a reusable connection."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "test.kitedb")
+            db = Database.open(path)
+            assert db.is_open
+
+            db.begin()
+            node_id = db.create_node("user:alice")
+            db.commit()
+
+            assert db.get_node_by_key("user:alice") == node_id
+
+            db.close()
+            assert not db.is_open
+
     def test_create_and_close(self):
         """Test database creation and closing."""
         with tempfile.TemporaryDirectory() as tmpdir:

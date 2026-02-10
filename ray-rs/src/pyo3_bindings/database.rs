@@ -12,7 +12,8 @@ use std::sync::RwLock;
 
 use crate::backup as core_backup;
 use crate::core::single_file::{
-  close_single_file, is_single_file_path, open_single_file, SingleFileDB as RustSingleFileDB,
+  close_single_file, close_single_file_with_options, is_single_file_path, open_single_file,
+  SingleFileCloseOptions as RustSingleFileCloseOptions, SingleFileDB as RustSingleFileDB,
   VacuumOptions as RustVacuumOptions,
 };
 use crate::metrics as core_metrics;
@@ -181,6 +182,12 @@ impl PyDatabase {
     })
   }
 
+  #[staticmethod]
+  #[pyo3(signature = (path, options=None))]
+  fn open(path: String, options: Option<OpenOptions>) -> PyResult<Self> {
+    Self::new(path, options)
+  }
+
   fn close(&self) -> PyResult<()> {
     let mut guard = self
       .inner
@@ -190,6 +197,24 @@ impl PyDatabase {
       match db {
         DatabaseInner::SingleFile(db) => close_single_file(*db)
           .map_err(|e| PyRuntimeError::new_err(format!("Failed to close: {e}")))?,
+      }
+    }
+    Ok(())
+  }
+
+  #[pyo3(signature = (threshold))]
+  fn close_with_checkpoint_if_wal_over(&self, threshold: f64) -> PyResult<()> {
+    let mut guard = self
+      .inner
+      .write()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    if let Some(db) = guard.take() {
+      match db {
+        DatabaseInner::SingleFile(db) => close_single_file_with_options(
+          *db,
+          RustSingleFileCloseOptions::new().checkpoint_if_wal_usage_at_least(threshold),
+        )
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to close: {e}")))?,
       }
     }
     Ok(())
