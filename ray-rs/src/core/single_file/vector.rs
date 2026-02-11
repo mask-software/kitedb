@@ -10,6 +10,7 @@ use crate::error::{KiteError, Result};
 use crate::types::*;
 use crate::util::binary::{read_u32, read_u64};
 use crate::vector::ivf::serialize::deserialize_manifest;
+use crate::util::binary::{read_u32_at, read_u64, read_u64_at};
 use crate::vector::store::{
   create_vector_store, validate_vector, vector_store_delete, vector_store_has, vector_store_insert,
   vector_store_node_vector,
@@ -352,38 +353,84 @@ pub(crate) fn vector_store_state_from_snapshot(
     return Ok((stores, HashMap::new()));
   }
 
+  let Some(node_prop_offsets) = snapshot.section_data_shared(SectionId::NodePropOffsets) else {
+    return Ok(stores);
+  };
+  let Some(node_prop_keys) = snapshot.section_data_shared(SectionId::NodePropKeys) else {
+    return Ok(stores);
+  };
+  let Some(node_prop_vals) = snapshot.section_data_shared(SectionId::NodePropVals) else {
+    return Ok(stores);
+  };
+  let Some(vector_offsets) = snapshot.section_data_shared(SectionId::VectorOffsets) else {
+    return Ok(stores);
+  };
+  let Some(vector_data) = snapshot.section_data_shared(SectionId::VectorData) else {
+    return Ok(stores);
+  };
+
+  let node_prop_offsets = node_prop_offsets.as_ref();
+  let node_prop_keys = node_prop_keys.as_ref();
+  let node_prop_vals = node_prop_vals.as_ref();
+  let vector_offsets = vector_offsets.as_ref();
+  let vector_data = vector_data.as_ref();
+
   let num_nodes = snapshot.header.num_nodes as usize;
   for phys in 0..num_nodes {
+    if phys * 4 + 8 > node_prop_offsets.len() {
+      break;
+    }
+
     let node_id = match snapshot.node_id(phys as u32) {
       Some(id) => id,
       None => continue,
     };
 
-    let Some(props) = snapshot.node_props(phys as u32) else {
-      continue;
-    };
+    let start = read_u32_at(node_prop_offsets, phys) as usize;
+    let end = read_u32_at(node_prop_offsets, phys + 1) as usize;
+    if end < start {
+      return Err(KiteError::InvalidSnapshot(format!(
+        "Node property range invalid for phys={phys}: start={start}, end={end}"
+      )));
+    }
 
-    for (key_id, value) in props {
-      if let PropValue::VectorF32(vec) = value {
-        let store = stores.entry(key_id).or_insert_with(|| {
-          let config = VectorStoreConfig::new(vec.len());
-          create_vector_store(config)
-        });
-
-        if store.config.dimensions != vec.len() {
-          return Err(KiteError::InvalidSnapshot(format!(
-            "Vector dimension mismatch for prop key {key_id}: expected {}, got {}",
-            store.config.dimensions,
-            vec.len()
-          )));
-        }
-
-        vector_store_insert(store, node_id, &vec).map_err(|e| {
-          KiteError::InvalidSnapshot(format!(
-            "Failed to insert vector for node {node_id} (prop {key_id}): {e}"
-          ))
-        })?;
+    for i in start..end {
+      let key_offset = i * 4;
+      let val_offset = i * PROP_VALUE_DISK_SIZE;
+      if key_offset + 4 > node_prop_keys.len()
+        || val_offset + PROP_VALUE_DISK_SIZE > node_prop_vals.len()
+      {
+        return Err(KiteError::InvalidSnapshot(format!(
+          "Node property entry out of bounds for phys={phys}, entry={i}"
+        )));
       }
+
+      if PropValueTag::from_u8(node_prop_vals[val_offset]) != Some(PropValueTag::VectorF32) {
+        continue;
+      }
+
+      let key_id = read_u32_at(node_prop_keys, i);
+      let vector_idx = read_u64(node_prop_vals, val_offset + 8) as usize;
+      let vec = decode_vector_payload(vector_offsets, vector_data, vector_idx)?;
+
+      let store = stores.entry(key_id).or_insert_with(|| {
+        let config = VectorStoreConfig::new(vec.len());
+        create_vector_store(config)
+      });
+
+      if store.config.dimensions != vec.len() {
+        return Err(KiteError::InvalidSnapshot(format!(
+          "Vector dimension mismatch for prop key {key_id}: expected {}, got {}",
+          store.config.dimensions,
+          vec.len()
+        )));
+      }
+
+      vector_store_insert(store, node_id, &vec).map_err(|e| {
+        KiteError::InvalidSnapshot(format!(
+          "Failed to insert vector for node {node_id} (prop {key_id}): {e}"
+        ))
+      })?;
     }
   }
 
@@ -537,6 +584,39 @@ fn deserialize_vector_store_entry(
       "Failed to deserialize vector store for prop key {prop_key_id}: {err}"
     ))
   })
+fn decode_vector_payload(
+  vector_offsets: &[u8],
+  vector_data: &[u8],
+  idx: usize,
+) -> Result<Vec<f32>> {
+  if (idx + 1) * 8 > vector_offsets.len() {
+    return Err(KiteError::InvalidSnapshot(format!(
+      "Vector index out of range: {idx}"
+    )));
+  }
+
+  let start = read_u64_at(vector_offsets, idx) as usize;
+  let end = read_u64_at(vector_offsets, idx + 1) as usize;
+  if start > end || end > vector_data.len() {
+    return Err(KiteError::InvalidSnapshot(format!(
+      "Vector range invalid for idx={idx}: start={start}, end={end}, data_len={}",
+      vector_data.len()
+    )));
+  }
+
+  let bytes = &vector_data[start..end];
+  if bytes.len() % 4 != 0 {
+    return Err(KiteError::InvalidSnapshot(format!(
+      "Vector byte length is not multiple of 4 for idx={idx}: {}",
+      bytes.len()
+    )));
+  }
+
+  let mut vec = Vec::with_capacity(bytes.len() / 4);
+  for chunk in bytes.chunks_exact(4) {
+    vec.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+  }
+  Ok(vec)
 }
 
 #[cfg(test)]
