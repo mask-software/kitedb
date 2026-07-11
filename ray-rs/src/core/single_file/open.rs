@@ -13,7 +13,12 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::cache::manager::CacheManager;
 use crate::constants::*;
-use crate::core::pager::{create_pager, is_valid_page_size, open_pager, pages_to_store, FilePager};
+use crate::core::header::{
+  other_header_slot, read_header_slots, write_header_slot, HEADER_SLOT_A, HEADER_SLOT_B,
+};
+use crate::core::pager::{
+  create_pager_with_locking, is_valid_page_size, open_pager_with_locking, pages_to_store, FilePager,
+};
 use crate::core::snapshot::reader::SnapshotData;
 use crate::core::wal::buffer::WalBuffer;
 use crate::error::{KiteError, Result};
@@ -23,13 +28,13 @@ use crate::replication::replica::ReplicaReplication;
 use crate::replication::types::ReplicationRole;
 use crate::types::*;
 use crate::util::compression::CompressionOptions;
-use crate::util::mmap::map_file;
+use crate::util::mmap::{map_file_range, Mmap};
 use crate::vector::store::{create_vector_store, vector_store_delete, vector_store_insert};
 use crate::vector::types::VectorStoreConfig;
 
 use super::recovery::{committed_transactions, replay_wal_record, scan_wal_records};
 use super::vector::{materialize_vector_store_from_lazy_entries, vector_store_state_from_snapshot};
-use super::{CheckpointStatus, SingleFileDB};
+use super::{CheckpointStatus, SchemaReservations, SingleFileDB};
 
 // ============================================================================
 // Open Options
@@ -113,12 +118,18 @@ pub struct SingleFileOpenOptions {
   pub replication_source_sidecar_path: Option<PathBuf>,
   /// Fault injection for tests: fail append once `n` successful appends reached
   pub replication_fail_after_append_for_testing: Option<u64>,
+  /// Test-only abrupt stop after local commit durability and before sidecar append.
+  #[doc(hidden)]
+  pub replication_crash_after_local_commit_for_testing: bool,
   /// Rotate replication segments when active segment reaches/exceeds this size
   pub replication_segment_max_bytes: Option<u64>,
   /// Retain at least this many entries when pruning old segments
   pub replication_retention_min_entries: Option<u64>,
   /// Retain segments newer than this many milliseconds (primary role only)
   pub replication_retention_min_ms: Option<u64>,
+  /// Skip all main-file locking solely to simulate independent nodes on shared storage in tests.
+  #[doc(hidden)]
+  pub danger_bypass_file_lock_for_multi_node_simulation: bool,
 }
 
 impl Default for SingleFileOpenOptions {
@@ -149,9 +160,11 @@ impl Default for SingleFileOpenOptions {
       replication_source_db_path: None,
       replication_source_sidecar_path: None,
       replication_fail_after_append_for_testing: None,
+      replication_crash_after_local_commit_for_testing: false,
       replication_segment_max_bytes: None,
       replication_retention_min_entries: None,
       replication_retention_min_ms: None,
+      danger_bypass_file_lock_for_multi_node_simulation: false,
     }
   }
 }
@@ -168,6 +181,14 @@ impl SingleFileOpenOptions {
 
   pub fn create_if_missing(mut self, value: bool) -> Self {
     self.create_if_missing = value;
+    self
+  }
+
+  /// Skip all main-file locking solely to simulate independent nodes on shared storage in tests.
+  /// Never use this for normal database access.
+  #[doc(hidden)]
+  pub fn danger_bypass_file_lock_for_multi_node_simulation(mut self, value: bool) -> Self {
+    self.danger_bypass_file_lock_for_multi_node_simulation = value;
     self
   }
 
@@ -306,6 +327,13 @@ impl SingleFileOpenOptions {
     self
   }
 
+  /// Test-only fault injection at the local-durable/sidecar boundary.
+  #[doc(hidden)]
+  pub fn replication_crash_after_local_commit_for_testing(mut self, value: bool) -> Self {
+    self.replication_crash_after_local_commit_for_testing = value;
+    self
+  }
+
   /// Set replication segment rotation threshold in bytes (primary role only)
   pub fn replication_segment_max_bytes(mut self, value: u64) -> Self {
     self.replication_segment_max_bytes = Some(value);
@@ -365,6 +393,21 @@ struct SnapshotLoadState<'a> {
   crc_chunk_size: Option<usize>,
   #[cfg(feature = "bench-profile")]
   snapshot_profile: Option<&'a mut SnapshotOpenProfile>,
+}
+
+pub(crate) fn map_snapshot_range(pager: &FilePager, header: &DbHeaderV1) -> Result<Arc<Mmap>> {
+  let offset = header
+    .snapshot_start_page
+    .checked_mul(header.page_size as u64)
+    .ok_or_else(|| KiteError::InvalidSnapshot("snapshot offset overflow".to_string()))?;
+  let length = header
+    .snapshot_page_count
+    .checked_mul(header.page_size as u64)
+    .ok_or_else(|| KiteError::InvalidSnapshot("snapshot length overflow".to_string()))?;
+  let length = usize::try_from(length)
+    .map_err(|_| KiteError::InvalidSnapshot("snapshot is too large to map".to_string()))?;
+
+  Ok(Arc::new(map_file_range(pager.file(), offset, length)?))
 }
 
 #[cfg(feature = "bench-profile")]
@@ -452,8 +495,6 @@ fn load_snapshot_and_schema(state: &mut SnapshotLoadState<'_>) -> Result<Option<
     return Ok(None);
   }
 
-  let snapshot_offset = (state.header.snapshot_start_page * state.header.page_size as u64) as usize;
-
   let mut parse_options = crate::core::snapshot::reader::ParseSnapshotOptions::default();
   if matches!(
     state.options.snapshot_parse_mode,
@@ -465,13 +506,10 @@ fn load_snapshot_and_schema(state: &mut SnapshotLoadState<'_>) -> Result<Option<
 
   #[cfg(feature = "bench-profile")]
   {
-    let mmap = std::sync::Arc::new({
-      // Safety handled inside map_file (native mmap) or in-memory read (wasm).
-      map_file(state.pager.file())?
-    });
+    let mmap = map_snapshot_range(state.pager, state.header)?;
 
     let parse_started = Instant::now();
-    let _ = SnapshotData::parse_at_offset(mmap.clone(), snapshot_offset, &parse_options);
+    let _ = SnapshotData::parse(mmap.clone(), &parse_options);
     let parse_total_ns = elapsed_ns(parse_started);
     state.profile.snapshot_parse_ns = state
       .profile
@@ -483,7 +521,7 @@ fn load_snapshot_and_schema(state: &mut SnapshotLoadState<'_>) -> Result<Option<
       let mut decode_options = parse_options.clone();
       decode_options.skip_crc_validation = true;
       let decode_started = Instant::now();
-      if SnapshotData::parse_at_offset(mmap, snapshot_offset, &decode_options).is_ok() {
+      if SnapshotData::parse(mmap, &decode_options).is_ok() {
         let decode_ns = elapsed_ns(decode_started);
         state.profile.snapshot_decode_ns =
           state.profile.snapshot_decode_ns.saturating_add(decode_ns);
@@ -517,12 +555,8 @@ fn load_snapshot_and_schema(state: &mut SnapshotLoadState<'_>) -> Result<Option<
 
   #[cfg(feature = "bench-profile")]
   let parse_start = Instant::now();
-  let parse_result = SnapshotData::parse_at_offset(
-    Arc::new({
-      // Safety handled inside map_file (native mmap) or in-memory read (wasm).
-      map_file(state.pager.file())?
-    }),
-    snapshot_offset,
+  let parse_result = SnapshotData::parse(
+    map_snapshot_range(state.pager, state.header)?,
     &parse_options,
   );
   #[cfg(feature = "bench-profile")]
@@ -827,7 +861,26 @@ pub fn open_single_file<P: AsRef<Path>>(
   path: P,
   options: SingleFileOpenOptions,
 ) -> Result<SingleFileDB> {
-  let path = path.as_ref();
+  let lock_file = !options.danger_bypass_file_lock_for_multi_node_simulation;
+  open_single_file_internal(path.as_ref(), options, lock_file)
+}
+
+pub(crate) fn open_replication_source(path: &Path) -> Result<SingleFileDB> {
+  open_single_file_internal(
+    path,
+    SingleFileOpenOptions::new()
+      .read_only(true)
+      .create_if_missing(false)
+      .replication_role(ReplicationRole::Disabled),
+    false,
+  )
+}
+
+fn open_single_file_internal(
+  path: &Path,
+  options: SingleFileOpenOptions,
+  lock_file: bool,
+) -> Result<SingleFileDB> {
   #[cfg(feature = "bench-profile")]
   let open_started = Instant::now();
   #[cfg(feature = "bench-profile")]
@@ -858,13 +911,22 @@ pub fn open_single_file<P: AsRef<Path>>(
   }
 
   // Open or create pager
-  let (mut pager, mut header, is_new) = if file_exists {
+  let (mut pager, mut header, is_new, mut header_slot) = if file_exists {
     // Open existing database
-    let mut pager = open_pager(path, options.page_size)?;
+    let mut pager = open_pager_with_locking(path, options.page_size, options.read_only, lock_file)?;
 
-    // Read and validate header
-    let header_data = pager.read_page(0)?;
-    let header = DbHeaderV1::parse(&header_data)?;
+    // Read both independently checksummed header pages and select the newest
+    // valid generation. A torn newest slot falls back to the other slot.
+    let (header, header_slot) = read_header_slots(&mut pager)?;
+
+    // Files created before the dual-page format have WAL at page one. Migrate
+    // through a separately checkpointed file; an in-place shift would destroy
+    // the old header's fallback before the new slot is durable.
+    if header.wal_start_page < HEADER_SLOT_B as u64 + 1 && !options.read_only {
+      drop(pager);
+      migrate_legacy_single_header(path, &options, lock_file)?;
+      return open_single_file_internal(path, options, lock_file);
+    }
 
     let expected_wal_pages = pages_to_store(options.wal_size, header.page_size as usize) as u64;
     if header.wal_page_count != expected_wal_pages {
@@ -874,10 +936,10 @@ pub fn open_single_file<P: AsRef<Path>>(
       )));
     }
 
-    (pager, header, false)
+    (pager, header, false, header_slot)
   } else {
     // Create new database
-    let mut pager = create_pager(path, options.page_size)?;
+    let mut pager = create_pager_with_locking(path, options.page_size, lock_file)?;
 
     // Calculate WAL page count
     let wal_page_count = pages_to_store(options.wal_size, options.page_size) as u64;
@@ -885,9 +947,11 @@ pub fn open_single_file<P: AsRef<Path>>(
     // Create initial header
     let header = DbHeaderV1::new(options.page_size as u32, wal_page_count);
 
-    // Write header
+    // Write both initial header slots before allocating the WAL. This makes a
+    // brand-new file recoverable even if the first open is interrupted.
     let header_bytes = header.serialize_to_page();
     pager.write_page(0, &header_bytes)?;
+    pager.write_page(1, &header_bytes)?;
 
     // Allocate WAL pages
     pager.allocate_pages(wal_page_count as u32)?;
@@ -895,7 +959,7 @@ pub fn open_single_file<P: AsRef<Path>>(
     // Sync to disk
     pager.sync()?;
 
-    (pager, header, true)
+    (pager, header, true, HEADER_SLOT_A)
   };
 
   // Initialize WAL buffer
@@ -903,6 +967,12 @@ pub fn open_single_file<P: AsRef<Path>>(
 
   // Recover from incomplete background checkpoint if needed
   if header.checkpoint_in_progress != 0 {
+    if options.read_only {
+      return Err(KiteError::InvalidSnapshot(
+        "read-only open cannot recover an incomplete checkpoint; reopen writable to repair it"
+          .to_string(),
+      ));
+    }
     wal_buffer.recover_incomplete_checkpoint(&mut pager)?;
     wal_buffer.flush(&mut pager)?;
 
@@ -913,10 +983,10 @@ pub fn open_single_file<P: AsRef<Path>>(
     header.wal_primary_head = wal_buffer.primary_head();
     header.wal_secondary_head = wal_buffer.secondary_head();
     header.change_counter += 1;
-
-    let header_bytes = header.serialize_to_page();
-    pager.write_page(0, &header_bytes)?;
+    let next_header_slot = other_header_slot(header_slot);
+    write_header_slot(&mut pager, &header, next_header_slot)?;
     pager.sync()?;
+    header_slot = next_header_slot;
   }
 
   // Initialize ID allocators from header
@@ -1099,10 +1169,14 @@ pub fn open_single_file<P: AsRef<Path>>(
     &delta,
   );
 
+  if options.read_only && options.replication_role != ReplicationRole::Disabled {
+    return Err(KiteError::ReadOnly);
+  }
+
   let (primary_replication, replica_replication) = match options.replication_role {
     ReplicationRole::Disabled => (None, None),
     ReplicationRole::Primary => (
-      Some(PrimaryReplication::open(
+      Some(PrimaryReplication::open_with_recovery(
         path,
         options.replication_sidecar_path.clone(),
         options.replication_segment_max_bytes,
@@ -1110,6 +1184,8 @@ pub fn open_single_file<P: AsRef<Path>>(
         options.replication_retention_min_ms,
         options.sync_mode,
         options.replication_fail_after_append_for_testing,
+        committed_in_order.last().map(|(txid, _)| *txid),
+        options.replication_crash_after_local_commit_for_testing,
       )?),
       None,
     ),
@@ -1154,6 +1230,7 @@ pub fn open_single_file<P: AsRef<Path>>(
     read_only: options.read_only,
     pager: Mutex::new(pager),
     header: RwLock::new(header),
+    header_slot: AtomicU32::new(header_slot),
     wal_buffer: Mutex::new(wal_buffer),
     snapshot: RwLock::new(snapshot),
     delta: RwLock::new(delta),
@@ -1164,6 +1241,10 @@ pub fn open_single_file<P: AsRef<Path>>(
     next_tx_id: AtomicU64::new(next_tx_id),
     current_tx: Mutex::new(HashMap::new()),
     active_writers: AtomicUsize::new(0),
+    active_transactions: AtomicUsize::new(0),
+    checkpoint_gate: RwLock::new(()),
+    checkpoint_wait: Mutex::new(()),
+    checkpoint_cv: parking_lot::Condvar::new(),
     commit_lock: Mutex::new(()),
     group_commit_state: Mutex::new(super::GroupCommitState::default()),
     group_commit_cv: parking_lot::Condvar::new(),
@@ -1174,6 +1255,7 @@ pub fn open_single_file<P: AsRef<Path>>(
     etype_ids: RwLock::new(etype_ids),
     propkey_names: RwLock::new(propkey_names),
     propkey_ids: RwLock::new(propkey_ids),
+    schema_reservations: Mutex::new(SchemaReservations::default()),
     auto_checkpoint: options.auto_checkpoint,
     checkpoint_threshold: options.checkpoint_threshold,
     background_checkpoint: options.background_checkpoint,
@@ -1192,6 +1274,142 @@ pub fn open_single_file<P: AsRef<Path>>(
     #[cfg(feature = "bench-profile")]
     wal_flush_ns: AtomicU64::new(0),
   })
+}
+
+fn legacy_migration_temp_path(path: &Path) -> Result<PathBuf> {
+  let file_name = path.file_name().ok_or_else(|| {
+    KiteError::InvalidPath(format!(
+      "database path has no file name: {}",
+      path.display()
+    ))
+  })?;
+  Ok(path.with_file_name(format!("{}.migrate-tmp", file_name.to_string_lossy())))
+}
+
+fn migrate_legacy_single_header(
+  path: &Path,
+  options: &SingleFileOpenOptions,
+  lock_file: bool,
+) -> Result<()> {
+  let temp_path = legacy_migration_temp_path(path)?;
+  if temp_path.exists() {
+    std::fs::remove_file(&temp_path)?;
+  }
+
+  // Internal migration opens must not inspect, create, or advance replication
+  // sidecars. Replication cursors address sidecar segment/log positions, not
+  // main-file WAL offsets; the sidecar is unchanged and the recovered logical
+  // state is identical, so primary and replica cursors remain valid without a
+  // forced reseed. They are reopened only after the replacement is installed.
+  let mut recovery_options = options.clone();
+  recovery_options.read_only = true;
+  recovery_options.create_if_missing = false;
+  recovery_options.replication_role = ReplicationRole::Disabled;
+  recovery_options.replication_sidecar_path = None;
+  recovery_options.replication_source_db_path = None;
+  recovery_options.replication_source_sidecar_path = None;
+  let recovered = open_single_file_internal(path, recovery_options, lock_file)?;
+  let legacy_header = recovered.header.read().clone();
+
+  let mut temp_options = options.clone();
+  temp_options.read_only = false;
+  temp_options.create_if_missing = true;
+  temp_options.replication_role = ReplicationRole::Disabled;
+  temp_options.replication_sidecar_path = None;
+  temp_options.replication_source_db_path = None;
+  temp_options.replication_source_sidecar_path = None;
+
+  let temp = match open_single_file_internal(&temp_path, temp_options, lock_file) {
+    Ok(db) => db,
+    Err(error) => {
+      let _ = std::fs::remove_file(&temp_path);
+      return Err(error);
+    }
+  };
+
+  // Move the state produced by the normal read-only snapshot/WAL recovery
+  // path into the new database, then let the normal checkpoint API serialize
+  // it. No record-level migration implementation is duplicated here.
+  *temp.snapshot.write() = recovered.snapshot.write().take();
+  *temp.delta.write() = std::mem::replace(&mut *recovered.delta.write(), DeltaState::new());
+  *temp.label_names.write() = std::mem::take(&mut *recovered.label_names.write());
+  *temp.label_ids.write() = std::mem::take(&mut *recovered.label_ids.write());
+  *temp.etype_names.write() = std::mem::take(&mut *recovered.etype_names.write());
+  *temp.etype_ids.write() = std::mem::take(&mut *recovered.etype_ids.write());
+  *temp.propkey_names.write() = std::mem::take(&mut *recovered.propkey_names.write());
+  *temp.propkey_ids.write() = std::mem::take(&mut *recovered.propkey_ids.write());
+  *temp.vector_stores.write() = std::mem::take(&mut *recovered.vector_stores.write());
+  *temp.vector_store_lazy_entries.write() =
+    std::mem::take(&mut *recovered.vector_store_lazy_entries.write());
+  temp.next_node_id.store(
+    recovered.next_node_id.load(Ordering::SeqCst),
+    Ordering::SeqCst,
+  );
+  temp.next_label_id.store(
+    recovered.next_label_id.load(Ordering::SeqCst),
+    Ordering::SeqCst,
+  );
+  temp.next_etype_id.store(
+    recovered.next_etype_id.load(Ordering::SeqCst),
+    Ordering::SeqCst,
+  );
+  temp.next_propkey_id.store(
+    recovered.next_propkey_id.load(Ordering::SeqCst),
+    Ordering::SeqCst,
+  );
+  temp.next_tx_id.store(
+    recovered.next_tx_id.load(Ordering::SeqCst),
+    Ordering::SeqCst,
+  );
+
+  {
+    let mut header = temp.header.write();
+    // Exact semantic-field audit. Layout fields (db/snapshot/WAL locations and
+    // heads) intentionally belong to the fresh dual-header file. Generation
+    // and change counters advance once when checkpoint installs the snapshot.
+    header.magic = legacy_header.magic;
+    header.page_size = legacy_header.page_size;
+    header.version = legacy_header.version;
+    header.min_reader_version = legacy_header.min_reader_version;
+    header.flags = legacy_header.flags;
+    header.change_counter = legacy_header.change_counter;
+    header.active_snapshot_gen = legacy_header.active_snapshot_gen;
+    header.prev_snapshot_gen = legacy_header.prev_snapshot_gen;
+    header.max_node_id = recovered
+      .next_node_id
+      .load(Ordering::SeqCst)
+      .saturating_sub(1);
+    header.next_tx_id = recovered.next_tx_id.load(Ordering::SeqCst);
+    header.last_commit_ts = legacy_header.last_commit_ts;
+    header.schema_cookie = legacy_header.schema_cookie;
+    // db_size_pages, snapshot_start_page/count, wal_start_page/count,
+    // wal_head/tail, wal_primary/secondary_head, active_wal_region, and
+    // checkpoint_in_progress are fresh-layout state and remain initialized.
+  }
+
+  let migration_result = (|| {
+    temp.checkpoint()?;
+    drop(recovered);
+    drop(temp);
+
+    // Crash argument: before rename, the original inode is untouched and a
+    // partial/complete temp is removed on the next migration attempt. The temp
+    // file and its directory entry are synced before rename. After atomic
+    // rename, the visible file already contains two valid headers, an empty
+    // WAL, and a complete snapshot; the second directory sync persists the
+    // replacement name.
+    std::fs::File::open(&temp_path)?.sync_all()?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::File::open(parent)?.sync_all()?;
+    std::fs::rename(&temp_path, path)?;
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
+  })();
+
+  if migration_result.is_err() {
+    let _ = std::fs::remove_file(&temp_path);
+  }
+  migration_result
 }
 
 /// Close a single-file database using custom close options.
@@ -1216,6 +1434,10 @@ pub fn close_single_file_with_options(
     mvcc.stop();
   }
 
+  if db.read_only {
+    return Ok(());
+  }
+
   // Flush WAL and sync to disk
   let mut pager = db.pager.lock();
   let mut wal_buffer = db.wal_buffer.lock();
@@ -1231,9 +1453,9 @@ pub fn close_single_file_with_options(
     header.max_node_id = db.next_node_id.load(Ordering::SeqCst).saturating_sub(1);
     header.next_tx_id = db.next_tx_id.load(Ordering::SeqCst);
 
-    // Write header
-    let header_bytes = header.serialize_to_page();
-    pager.write_page(0, &header_bytes)?;
+    // Install the updated header in the inactive slot. The final sync below
+    // makes the WAL and header durable together.
+    db.persist_header(&mut pager, &mut header, false)?;
   }
 
   // Final sync
@@ -1249,13 +1471,103 @@ pub fn close_single_file(db: SingleFileDB) -> Result<()> {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::core::header::HEADER_SLOT_COUNT;
   use crate::core::single_file::recovery::read_wal_area;
   use crate::core::single_file::{
     close_single_file, close_single_file_with_options, SingleFileCloseOptions,
   };
   use crate::core::wal::record::parse_wal_record;
   use crate::util::binary::{align_up, read_u32};
+  use std::io::Write;
   use tempfile::tempdir;
+
+  fn legacy_migration_temp_path(path: &Path) -> PathBuf {
+    let file_name = path
+      .file_name()
+      .expect("database file name")
+      .to_string_lossy();
+    path.with_file_name(format!("{file_name}.migrate-tmp"))
+  }
+
+  fn build_legacy_single_header_fixture(
+    path: &Path,
+  ) -> (
+    SingleFileOpenOptions,
+    NodeId,
+    LabelId,
+    PropKeyId,
+    DbHeaderV1,
+  ) {
+    let source_path = path.with_extension("source.kitedb");
+    let options = SingleFileOpenOptions::new()
+      .wal_size(64 * 1024)
+      .auto_checkpoint(false);
+    let source = open_single_file(&source_path, options.clone()).expect("source database");
+
+    source.begin(false).expect("begin fixture transaction");
+    let label_id = source.define_label("LegacyLabel").expect("dynamic label");
+    let propkey_id = source
+      .define_propkey("legacy_value")
+      .expect("dynamic property");
+    let node_id = source
+      .create_node(Some("legacy-node"))
+      .expect("legacy node");
+    source
+      .add_node_label(node_id, label_id)
+      .expect("legacy label assignment");
+    source
+      .set_node_prop(node_id, propkey_id, PropValue::I64(42))
+      .expect("legacy property");
+    source.commit().expect("commit fixture transaction");
+    source.checkpoint().expect("checkpoint fixture source");
+
+    // Keep a committed update only in the legacy WAL so migration exercises
+    // the normal snapshot + WAL recovery path rather than snapshot copying.
+    source.begin(false).expect("begin WAL-only transaction");
+    source
+      .set_node_prop(node_id, propkey_id, PropValue::I64(84))
+      .expect("WAL-only property update");
+    source.commit().expect("commit WAL-only transaction");
+
+    let current_header = source.header.read().clone();
+    let (wal_bytes, snapshot_bytes) = {
+      let mut pager = source.pager.lock();
+      let mut wal = Vec::new();
+      for page in 0..current_header.wal_page_count as u32 {
+        wal.extend_from_slice(
+          &pager
+            .read_page(current_header.wal_start_page as u32 + page)
+            .expect("WAL page"),
+        );
+      }
+      let mut snapshot = Vec::new();
+      for page in 0..current_header.snapshot_page_count as u32 {
+        snapshot.extend_from_slice(
+          &pager
+            .read_page(current_header.snapshot_start_page as u32 + page)
+            .expect("snapshot page"),
+        );
+      }
+      (wal, snapshot)
+    };
+
+    let mut legacy_header = current_header;
+    legacy_header.wal_start_page = 1;
+    legacy_header.snapshot_start_page = 1 + legacy_header.wal_page_count;
+    legacy_header.db_size_pages =
+      legacy_header.snapshot_start_page + legacy_header.snapshot_page_count;
+
+    let mut fixture = std::fs::File::create(path).expect("legacy fixture file");
+    fixture
+      .write_all(&legacy_header.serialize_to_page())
+      .expect("legacy header");
+    fixture.write_all(&wal_bytes).expect("legacy WAL");
+    fixture.write_all(&snapshot_bytes).expect("legacy snapshot");
+    fixture.sync_all().expect("legacy fixture sync");
+    drop(source);
+
+    (options, node_id, label_id, propkey_id, legacy_header)
+  }
 
   fn corrupt_last_wal_record(db: &SingleFileDB) {
     let mut pager = db.pager.lock();
@@ -1370,7 +1682,7 @@ mod tests {
 
     db.begin(false).expect("expected value");
     let node_id = db.create_node(Some("n1")).expect("expected value");
-    let key_id = db.propkey_id_or_create("value");
+    let key_id = db.define_propkey("value").expect("expected value");
     db.set_node_prop(node_id, key_id, crate::types::PropValue::I64(42))
       .expect("expected value");
     db.commit().expect("expected value");
@@ -1409,6 +1721,56 @@ mod tests {
     );
 
     assert!(reopen.is_err(), "expected wal size mismatch to error");
+  }
+
+  #[test]
+  fn writable_open_migrates_legacy_single_header_database() {
+    let temp_dir = tempdir().expect("temp dir");
+    let db_path = temp_dir.path().join("legacy.kitedb");
+    let (options, node_id, label_id, propkey_id, legacy_header) =
+      build_legacy_single_header_fixture(&db_path);
+
+    let migrated = open_single_file(&db_path, options.clone()).expect("automatic migration");
+    assert_eq!(migrated.node_by_key("legacy-node"), Some(node_id));
+    assert_eq!(
+      migrated.node_prop(node_id, propkey_id),
+      Some(PropValue::I64(84))
+    );
+    assert!(migrated.node_labels(node_id).contains(&label_id));
+    assert_eq!(migrated.label_id("LegacyLabel"), Some(label_id));
+    assert_eq!(migrated.propkey_id("legacy_value"), Some(propkey_id));
+    assert!(migrated.header.read().wal_start_page >= HEADER_SLOT_COUNT);
+    assert_eq!(
+      migrated.header.read().max_node_id,
+      legacy_header.max_node_id
+    );
+    assert!(migrated.header.read().next_tx_id >= legacy_header.next_tx_id);
+
+    migrated.begin(false).expect("post-migration transaction");
+    migrated
+      .create_node(Some("after-migration"))
+      .expect("post-migration node");
+    migrated.commit().expect("post-migration commit");
+    close_single_file(migrated).expect("close migrated database");
+
+    let reopened = open_single_file(&db_path, options).expect("reopen migrated database");
+    assert!(reopened.node_by_key("legacy-node").is_some());
+    assert!(reopened.node_by_key("after-migration").is_some());
+    close_single_file(reopened).expect("close reopened database");
+  }
+
+  #[test]
+  fn stale_migration_temp_is_cleaned_before_legacy_retry() {
+    let temp_dir = tempdir().expect("temp dir");
+    let db_path = temp_dir.path().join("legacy-stale-temp.kitedb");
+    let (options, node_id, _, _, _) = build_legacy_single_header_fixture(&db_path);
+    let migration_temp = legacy_migration_temp_path(&db_path);
+    std::fs::write(&migration_temp, b"incomplete migration").expect("stale migration temp");
+
+    let migrated = open_single_file(&db_path, options).expect("migration retry");
+    assert_eq!(migrated.node_by_key("legacy-node"), Some(node_id));
+    assert!(!migration_temp.exists());
+    close_single_file(migrated).expect("close migrated database");
   }
 
   #[test]
@@ -1577,6 +1939,43 @@ mod tests {
     let db = open_single_file(&db_path, SingleFileOpenOptions::new()).expect("expected value");
     assert!(db.node_by_key("n1").is_none());
     close_single_file(db).expect("expected value");
+  }
+
+  #[test]
+  fn test_recovery_replays_commits_in_wal_order() {
+    let temp_dir = tempdir().expect("expected value");
+    let db_path = temp_dir.path().join("wal-commit-order.kitedb");
+    let options = SingleFileOpenOptions::new().auto_checkpoint(false);
+
+    let db = open_single_file(&db_path, options.clone()).expect("expected value");
+
+    db.begin(false).expect("expected value");
+    let node_id = db.create_node(None).expect("expected value");
+    let key_id = db.define_propkey("value").expect("expected value");
+    db.set_node_prop(node_id, key_id, crate::types::PropValue::I64(0))
+      .expect("expected value");
+    db.commit().expect("expected value");
+
+    for value in 1..=64 {
+      db.begin(false).expect("expected value");
+      db.set_node_prop(node_id, key_id, crate::types::PropValue::I64(value))
+        .expect("expected value");
+      db.commit().expect("expected value");
+    }
+
+    // Simulate a crash: committed WAL is durable, but no checkpoint is run.
+    drop(db);
+
+    // Reopen repeatedly so a HashMap iteration that happens to be ordered once
+    // cannot make this regression pass by luck.
+    for _ in 0..8 {
+      let reopened = open_single_file(&db_path, options.clone()).expect("expected value");
+      assert_eq!(
+        reopened.node_prop(node_id, key_id),
+        Some(crate::types::PropValue::I64(64))
+      );
+      drop(reopened);
+    }
   }
 
   #[test]

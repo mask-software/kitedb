@@ -12,6 +12,7 @@ use crate::api::traversal::TraversalDirection;
 use crate::types::{ETypeId, NodeId};
 
 use super::helpers::neighbors;
+use crate::napi_bindings::validation;
 
 // =============================================================================
 // Path Builder
@@ -60,7 +61,7 @@ impl KitePath {
 
   #[napi]
   pub fn max_depth(&mut self, depth: i64) -> Result<()> {
-    self.max_depth = depth as usize;
+    self.max_depth = validation::non_negative_usize("maxDepth", depth, validation::MAX_DEPTH)?;
     Ok(())
   }
 
@@ -123,6 +124,7 @@ impl KitePath {
 
   #[napi]
   pub fn find_k_shortest(&self, k: i64) -> Result<Vec<JsPathResult>> {
+    let k = validation::non_negative_usize("k", k, validation::MAX_COUNT)?;
     let guard = self.ray.read();
     let ray = guard
       .as_ref()
@@ -136,7 +138,7 @@ impl KitePath {
     };
     let results = yen_k_shortest(
       config,
-      k as usize,
+      k,
       |node_id, dir, etype| neighbors(ray.raw(), node_id, dir, etype),
       |_src, _etype, _dst| 1.0,
     );

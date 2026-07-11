@@ -186,7 +186,7 @@ test('upsertById inserts and updates', async (t) => {
   insert.set('age', 30)
   insert.execute()
 
-  const created = db.getById(42) as any
+  const created = db.get_by_id(42) as any
   t.is(created?.name, 'Alice')
   t.is(created?.age, 30)
 
@@ -195,7 +195,7 @@ test('upsertById inserts and updates', async (t) => {
   update.unset('name')
   update.execute()
 
-  const updated = db.getById(42) as any
+  const updated = db.get_by_id(42) as any
   t.is(updated?.age, 31)
   t.is(updated?.name, undefined)
 
@@ -227,7 +227,7 @@ test('upsertEdge creates and updates edge props', async (t) => {
   createEdge.set('since', 2020)
   createEdge.execute()
 
-  const since = db.getEdgeProp(alice.id, 'follows', bob.id, 'since')
+  const since = db.get_edge_prop(alice.id, 'follows', bob.id, 'since')
   t.is(since?.floatValue, 2020)
 
   const updateEdge = db.upsertEdge(alice.id, 'follows', bob.id)
@@ -235,9 +235,9 @@ test('upsertEdge creates and updates edge props', async (t) => {
   updateEdge.unset('since')
   updateEdge.execute()
 
-  const updatedSince = db.getEdgeProp(alice.id, 'follows', bob.id, 'since')
+  const updatedSince = db.get_edge_prop(alice.id, 'follows', bob.id, 'since')
   t.is(updatedSince, null)
-  const weight = db.getEdgeProp(alice.id, 'follows', bob.id, 'weight')
+  const weight = db.get_edge_prop(alice.id, 'follows', bob.id, 'weight')
   t.is(weight?.floatValue, 0.75)
 
   db.close()
@@ -385,7 +385,7 @@ test('full schema-based workflow', async (t) => {
   t.true(db.hasEdge(doc.id, 'discusses', topic.id))
 
   // Get edge prop
-  const relevance = db.getEdgeProp(doc.id, 'discusses', topic.id, 'relevance')
+  const relevance = db.get_edge_prop(doc.id, 'discusses', topic.id, 'relevance')
   t.truthy(relevance)
   t.is(relevance?.floatValue, 0.95)
 

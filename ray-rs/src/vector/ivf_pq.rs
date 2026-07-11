@@ -16,13 +16,13 @@
 //! Ported from src/vector/ivf-pq.ts
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 
 use crate::types::NodeId;
-use crate::vector::distance::normalize;
+use crate::vector::distance::{normalize, normalize_in_place};
 use crate::vector::ivf::{kmeans_parallel, KMeansConfig};
 use crate::vector::types::{
   DistanceMetric, IvfConfig, MultiQueryAggregation, PqConfig, VectorManifest, VectorSearchResult,
@@ -113,8 +113,6 @@ pub struct IvfPqIndex {
   pub pq_codes: HashMap<u64, Vec<u8>>,
   /// PQ centroids for each subspace: M arrays of K * subspace_dims floats
   pub pq_centroids: Vec<Vec<f32>>,
-  /// Pre-computed centroid-to-centroid distances (optional)
-  pub centroid_distances: Option<Vec<f32>>,
   /// Number of dimensions
   pub dimensions: usize,
   /// Dimensions per PQ subspace
@@ -130,18 +128,16 @@ pub struct IvfPqIndex {
 impl IvfPqIndex {
   /// Create a new IVF-PQ index
   pub fn new(dimensions: usize, config: IvfPqConfig) -> Result<Self, IvfPqError> {
-    if dimensions % config.pq.num_subspaces != 0 {
-      return Err(IvfPqError::DimensionNotDivisible {
-        dimensions,
-        num_subspaces: config.pq.num_subspaces,
-      });
-    }
-
-    let subspace_dims = dimensions / config.pq.num_subspaces;
+    let subspace_dims = validate_ivf_pq_config(dimensions, &config)?;
+    let pq_centroid_len = config
+      .pq
+      .num_centroids
+      .checked_mul(subspace_dims)
+      .ok_or_else(|| IvfPqError::SizeOverflow("IVF-PQ centroid allocation".into()))?;
 
     // Initialize empty PQ centroids for each subspace
     let pq_centroids: Vec<Vec<f32>> = (0..config.pq.num_subspaces)
-      .map(|_| vec![0.0; config.pq.num_centroids * subspace_dims])
+      .map(|_| vec![0.0; pq_centroid_len])
       .collect();
 
     Ok(Self {
@@ -150,7 +146,6 @@ impl IvfPqIndex {
       inverted_lists: HashMap::new(),
       pq_codes: HashMap::new(),
       pq_centroids,
-      centroid_distances: None,
       dimensions,
       subspace_dims,
       trained: false,
@@ -172,18 +167,20 @@ impl IvfPqIndex {
     inverted_lists: HashMap<usize, Vec<u64>>,
     pq_codes: HashMap<u64, Vec<u8>>,
     pq_centroids: Vec<Vec<f32>>,
-    centroid_distances: Option<Vec<f32>>,
+    _centroid_distances: Option<Vec<f32>>,
     dimensions: usize,
     trained: bool,
   ) -> Result<Self, IvfPqError> {
-    if dimensions % config.pq.num_subspaces != 0 {
-      return Err(IvfPqError::DimensionNotDivisible {
-        dimensions,
-        num_subspaces: config.pq.num_subspaces,
-      });
-    }
-
-    let subspace_dims = dimensions / config.pq.num_subspaces;
+    let subspace_dims = validate_ivf_pq_config(dimensions, &config)?;
+    validate_ivf_pq_parts(&SerializedIvfPqParts {
+      config: &config,
+      ivf_centroids: &ivf_centroids,
+      inverted_lists: &inverted_lists,
+      pq_codes: &pq_codes,
+      pq_centroids: &pq_centroids,
+      dimensions,
+      trained,
+    })?;
 
     Ok(Self {
       config,
@@ -191,7 +188,6 @@ impl IvfPqIndex {
       inverted_lists,
       pq_codes,
       pq_centroids,
-      centroid_distances,
       dimensions,
       subspace_dims,
       trained,
@@ -206,7 +202,9 @@ impl IvfPqIndex {
       return Err(IvfPqError::AlreadyTrained);
     }
 
-    let expected_len = count * self.dimensions;
+    let expected_len = count
+      .checked_mul(self.dimensions)
+      .ok_or_else(|| IvfPqError::SizeOverflow("IVF-PQ training input".into()))?;
     if vectors.len() < expected_len {
       return Err(IvfPqError::DimensionMismatch {
         expected: expected_len,
@@ -216,7 +214,10 @@ impl IvfPqIndex {
 
     let training_buf = self.training_vectors.get_or_insert_with(Vec::new);
     training_buf.extend_from_slice(&vectors[..expected_len]);
-    self.training_count += count;
+    self.training_count = self
+      .training_count
+      .checked_add(count)
+      .ok_or_else(|| IvfPqError::SizeOverflow("IVF-PQ training count".into()))?;
 
     Ok(())
   }
@@ -227,9 +228,13 @@ impl IvfPqIndex {
       return Ok(());
     }
 
-    let training_vectors = self
+    // Validate before touching the pending buffer.  Keep a working copy so any
+    // later training failure leaves the original buffer available for retry.
+    validate_ivf_pq_config(self.dimensions, &self.config)?;
+
+    let pending_training_vectors = self
       .training_vectors
-      .take()
+      .as_ref()
       .ok_or(IvfPqError::NoTrainingVectors)?;
 
     let n = self.training_count;
@@ -244,6 +249,13 @@ impl IvfPqIndex {
         n,
         k: self.config.pq.num_centroids,
       });
+    }
+
+    let mut training_vectors = pending_training_vectors.clone();
+    if self.config.ivf.metric == DistanceMetric::Cosine {
+      for vector in training_vectors.chunks_exact_mut(self.dimensions) {
+        normalize_in_place(vector);
+      }
     }
 
     let distance_fn = self.config.ivf.metric.distance_fn();
@@ -263,13 +275,41 @@ impl IvfPqIndex {
     .map_err(|e| IvfPqError::TrainingFailed(e.to_string()))?;
 
     self.ivf_centroids = kmeans_result.centroids;
-    let assignments = kmeans_result.assignments;
+    if self.config.ivf.metric == DistanceMetric::Cosine {
+      // k-means updates centroids with arithmetic means.  Normalize those
+      // means before using them for insert/search/delete, which all compare
+      // against normalized cosine vectors.
+      for centroid in self.ivf_centroids.chunks_exact_mut(self.dimensions) {
+        normalize_in_place(centroid);
+      }
+    }
+
+    // Recompute assignments against the final centroids.  This is important
+    // for cosine because the centroids are normalized after k-means updates.
+    let mut assignments = Vec::with_capacity(n);
+    for vector in training_vectors.chunks_exact(self.dimensions) {
+      let mut best_cluster = 0;
+      let mut best_dist = f32::INFINITY;
+      for cluster in 0..n_clusters {
+        let cent_offset = cluster * self.dimensions;
+        let centroid = &self.ivf_centroids[cent_offset..cent_offset + self.dimensions];
+        let dist = distance_fn(vector, centroid);
+        if dist < best_dist {
+          best_dist = dist;
+          best_cluster = cluster;
+        }
+      }
+      assignments.push(best_cluster as u32);
+    }
 
     // Step 2: Compute residuals and train PQ
     // Train PQ on residuals or raw vectors (avoid cloning full training set)
     if self.config.use_residuals {
       // Compute residuals: vector - assigned_centroid
-      let mut residuals = vec![0.0f32; n * self.dimensions];
+      let residual_len = n
+        .checked_mul(self.dimensions)
+        .ok_or_else(|| IvfPqError::SizeOverflow("IVF-PQ residual allocation".into()))?;
+      let mut residuals = vec![0.0f32; residual_len];
       for (i, &cluster_id) in assignments.iter().enumerate().take(n) {
         let cluster = cluster_id as usize;
         let vec_offset = i * self.dimensions;
@@ -285,19 +325,6 @@ impl IvfPqIndex {
     } else {
       self.train_pq(&training_vectors, n)?;
     }
-
-    // Step 3: Pre-compute centroid distances for faster search
-    let mut centroid_distances = vec![0.0f32; n_clusters * n_clusters];
-    for i in 0..n_clusters {
-      let ci = &self.ivf_centroids[i * self.dimensions..(i + 1) * self.dimensions];
-      for j in i..n_clusters {
-        let cj = &self.ivf_centroids[j * self.dimensions..(j + 1) * self.dimensions];
-        let dist = distance_fn(ci, cj);
-        centroid_distances[i * n_clusters + j] = dist;
-        centroid_distances[j * n_clusters + i] = dist;
-      }
-    }
-    self.centroid_distances = Some(centroid_distances);
 
     // Initialize inverted lists
     for c in 0..n_clusters {
@@ -318,6 +345,9 @@ impl IvfPqIndex {
     let max_iterations = self.config.pq.max_iterations;
     let subspace_dims = self.subspace_dims;
     let dimensions = self.dimensions;
+    let subvector_capacity = num_vectors
+      .checked_mul(subspace_dims)
+      .ok_or_else(|| IvfPqError::SizeOverflow("IVF-PQ subvector allocation".into()))?;
 
     // Train each subspace independently (parallel on native, sequential on wasm)
     let trained_centroids: Vec<Vec<f32>> = {
@@ -327,7 +357,7 @@ impl IvfPqIndex {
           .into_par_iter()
           .map(|m| {
             // Extract subvectors for this subspace
-            let mut subvectors = Vec::with_capacity(num_vectors * subspace_dims);
+            let mut subvectors = Vec::with_capacity(subvector_capacity);
             let sub_offset = m * subspace_dims;
 
             for i in 0..num_vectors {
@@ -353,7 +383,7 @@ impl IvfPqIndex {
       {
         (0..num_subspaces)
           .map(|m| {
-            let mut subvectors = Vec::with_capacity(num_vectors * subspace_dims);
+            let mut subvectors = Vec::with_capacity(subvector_capacity);
             let sub_offset = m * subspace_dims;
 
             for i in 0..num_vectors {
@@ -542,11 +572,25 @@ impl IvfPqIndex {
     k: usize,
     options: Option<IvfPqSearchOptions>,
   ) -> Vec<VectorSearchResult> {
-    if !self.trained {
+    let options = options.unwrap_or_default();
+    self.search_with_options(manifest, query, k, &options, true)
+  }
+
+  /// Search with borrowed options so multi-query search can reuse a filter
+  /// without moving it. `apply_threshold` is disabled by multi-query search
+  /// until the per-query distances have been aggregated.
+  fn search_with_options(
+    &self,
+    manifest: &VectorManifest,
+    query: &[f32],
+    k: usize,
+    options: &IvfPqSearchOptions,
+    apply_threshold: bool,
+  ) -> Vec<VectorSearchResult> {
+    if !self.trained || k == 0 {
       return Vec::new();
     }
 
-    let options = options.unwrap_or_default();
     let n_probe = options.n_probe.unwrap_or(self.config.ivf.n_probe);
 
     // Normalize query for cosine metric
@@ -565,14 +609,14 @@ impl IvfPqIndex {
 
     // For non-residual mode, build the distance table ONCE
     let shared_dist_table = if !self.config.use_residuals {
-      Some(self.build_distance_table(query_slice))
+      Some(self.build_distance_table(query_slice, None))
     } else {
       None
     };
     let shared_table = if self.config.use_residuals {
       None
     } else {
-      match shared_dist_table.as_deref() {
+      match shared_dist_table.as_ref() {
         Some(table) => Some(table),
         None => {
           debug_assert!(
@@ -584,15 +628,19 @@ impl IvfPqIndex {
       }
     };
 
-    let mut search_vectors = |dist_table: &[f32], vector_ids: &Vec<u64>| {
+    let mut search_vectors = |dist_table: &AdcTable, vector_ids: &[u64]| {
       // Search vectors in this cluster using PQ ADC
       for &vector_id in vector_ids {
-        // Apply filter early if provided
+        // A missing mapping is not a valid result. Do this check before the
+        // filter so an unmappable vector can never bypass it.
+        let node_id = match manifest.vector_to_node.get(&vector_id) {
+          Some(&node_id) => node_id,
+          None => continue,
+        };
+
         if let Some(ref filter) = options.filter {
-          if let Some(&node_id) = manifest.vector_to_node.get(&vector_id) {
-            if !filter(node_id) {
-              continue;
-            }
+          if !filter(node_id) {
+            continue;
           }
         }
 
@@ -606,10 +654,12 @@ impl IvfPqIndex {
         let dist = self.distance_adc(dist_table, codes);
 
         // Apply threshold filter
-        if let Some(threshold) = options.threshold {
-          let similarity = self.config.ivf.metric.distance_to_similarity(dist);
-          if similarity < threshold {
-            continue;
+        if apply_threshold {
+          if let Some(threshold) = options.threshold {
+            let similarity = self.config.ivf.metric.distance_to_similarity(dist);
+            if similarity < threshold {
+              continue;
+            }
           }
         }
 
@@ -632,104 +682,157 @@ impl IvfPqIndex {
         _ => continue,
       };
 
-      if self.config.use_residuals {
-        // Query residual = query - centroid (requires per-cluster table)
-        let cent_offset = cluster * self.dimensions;
-        let query_residual: Vec<f32> = query_slice
-          .iter()
-          .zip(&self.ivf_centroids[cent_offset..cent_offset + self.dimensions])
-          .map(|(q, c)| q - c)
-          .collect();
-        let dist_table = self.build_distance_table(&query_residual);
-        search_vectors(&dist_table, vector_ids);
-      } else if let Some(table) = shared_table {
-        search_vectors(table, vector_ids);
+      let dist_table = if self.config.use_residuals {
+        self.build_distance_table(query_slice, Some(cluster))
       } else {
-        debug_assert!(
-          false,
-          "shared distance table missing for non-residual search"
-        );
-        return Vec::new();
-      }
+        match shared_table {
+          Some(table) => table.clone(),
+          None => {
+            debug_assert!(
+              false,
+              "shared distance table missing for non-residual search"
+            );
+            return Vec::new();
+          }
+        }
+      };
+      search_vectors(&dist_table, vector_ids);
     }
 
-    // Convert to results
-    let results = heap.into_sorted_vec();
-
-    results
+    // Convert to results. The mapping was checked while collecting, so a
+    // result cannot silently turn into node 0 here.
+    heap
+      .into_sorted_vec()
       .into_iter()
-      .map(|(vector_id, distance)| {
-        let node_id = manifest
-          .vector_to_node
-          .get(&vector_id)
-          .copied()
-          .unwrap_or(0);
-        VectorSearchResult {
+      .filter_map(|(vector_id, distance)| {
+        let node_id = manifest.vector_to_node.get(&vector_id).copied()?;
+        Some(VectorSearchResult {
           vector_id,
           node_id,
           distance,
           similarity: self.config.ivf.metric.distance_to_similarity(distance),
-        }
+        })
       })
       .collect()
   }
 
-  /// Build distance table for a query vector
-  fn build_distance_table(&self, query: &[f32]) -> Vec<f32> {
+  /// Build a metric-aware ADC table.
+  ///
+  /// The table is evaluated in the same native distance space as
+  /// `DistanceMetric::distance_fn`: Euclidean returns L2 (not squared L2),
+  /// dot product returns negative inner product, and cosine returns
+  /// `1 - normalized_inner_product`.
+  fn build_distance_table(&self, query: &[f32], cluster: Option<usize>) -> AdcTable {
     let num_subspaces = self.config.pq.num_subspaces;
     let num_centroids = self.config.pq.num_centroids;
-
-    let mut table = vec![0.0; num_subspaces * num_centroids];
+    let mut values = vec![0.0; num_subspaces * num_centroids];
+    let mut norm_sq = if self.config.ivf.metric == DistanceMetric::Cosine {
+      Some(vec![0.0; num_subspaces * num_centroids])
+    } else {
+      None
+    };
 
     for m in 0..num_subspaces {
       let sub_offset = m * self.subspace_dims;
       let table_offset = m * num_centroids;
       let query_sub = &query[sub_offset..sub_offset + self.subspace_dims];
+      let centroid_sub = cluster.map(|cluster| {
+        let offset = cluster * self.dimensions + sub_offset;
+        &self.ivf_centroids[offset..offset + self.subspace_dims]
+      });
 
       for c in 0..num_centroids {
-        let cent_offset = c * self.subspace_dims;
-        let centroid = &self.pq_centroids[m][cent_offset..cent_offset + self.subspace_dims];
+        let pq_offset = c * self.subspace_dims;
+        let pq_centroid = &self.pq_centroids[m][pq_offset..pq_offset + self.subspace_dims];
+        let table_index = table_offset + c;
 
-        let mut dist = 0.0;
-        for d in 0..self.subspace_dims {
-          let diff = query_sub[d] - centroid[d];
-          dist += diff * diff;
+        match self.config.ivf.metric {
+          DistanceMetric::Euclidean => {
+            let mut squared_distance = 0.0;
+            for d in 0..self.subspace_dims {
+              let reconstructed = pq_centroid[d] + centroid_sub.map_or(0.0, |centroid| centroid[d]);
+              let diff = query_sub[d] - reconstructed;
+              squared_distance += diff * diff;
+            }
+            values[table_index] = squared_distance;
+          }
+          DistanceMetric::DotProduct => {
+            let mut inner_product = 0.0;
+            for d in 0..self.subspace_dims {
+              let reconstructed = pq_centroid[d] + centroid_sub.map_or(0.0, |centroid| centroid[d]);
+              inner_product += query_sub[d] * reconstructed;
+            }
+            // The exact path uses -dot_product as its sortable distance.
+            values[table_index] = -inner_product;
+          }
+          DistanceMetric::Cosine => {
+            let mut inner_product = 0.0;
+            let mut reconstructed_norm_sq = 0.0;
+            for d in 0..self.subspace_dims {
+              let reconstructed = pq_centroid[d] + centroid_sub.map_or(0.0, |centroid| centroid[d]);
+              inner_product += query_sub[d] * reconstructed;
+              reconstructed_norm_sq += reconstructed * reconstructed;
+            }
+            values[table_index] = inner_product;
+            norm_sq.as_mut().expect("cosine norm table")[table_index] = reconstructed_norm_sq;
+          }
         }
-
-        table[table_offset + c] = dist;
       }
     }
 
-    table
+    AdcTable { values, norm_sq }
   }
 
-  /// Compute approximate distance using ADC
-  fn distance_adc(&self, table: &[f32], codes: &[u8]) -> f32 {
+  /// Compute a native metric distance using ADC.
+  fn distance_adc(&self, table: &AdcTable, codes: &[u8]) -> f32 {
     let num_subspaces = self.config.pq.num_subspaces;
     let num_centroids = self.config.pq.num_centroids;
+    let mut value = 0.0;
+    let mut reconstructed_norm_sq = 0.0;
 
-    let mut dist = 0.0;
-
-    // Unroll for performance (8x like TypeScript version)
+    // Unroll for performance (8x like the TypeScript version).
     let remainder = num_subspaces % 8;
     let main_len = num_subspaces - remainder;
 
     for m in (0..main_len).step_by(8) {
-      dist += table[m * num_centroids + codes[m] as usize]
-        + table[(m + 1) * num_centroids + codes[m + 1] as usize]
-        + table[(m + 2) * num_centroids + codes[m + 2] as usize]
-        + table[(m + 3) * num_centroids + codes[m + 3] as usize]
-        + table[(m + 4) * num_centroids + codes[m + 4] as usize]
-        + table[(m + 5) * num_centroids + codes[m + 5] as usize]
-        + table[(m + 6) * num_centroids + codes[m + 6] as usize]
-        + table[(m + 7) * num_centroids + codes[m + 7] as usize];
+      let indices = [
+        m * num_centroids + codes[m] as usize,
+        (m + 1) * num_centroids + codes[m + 1] as usize,
+        (m + 2) * num_centroids + codes[m + 2] as usize,
+        (m + 3) * num_centroids + codes[m + 3] as usize,
+        (m + 4) * num_centroids + codes[m + 4] as usize,
+        (m + 5) * num_centroids + codes[m + 5] as usize,
+        (m + 6) * num_centroids + codes[m + 6] as usize,
+        (m + 7) * num_centroids + codes[m + 7] as usize,
+      ];
+      for &index in &indices {
+        value += table.values[index];
+        if let Some(norm_sq) = &table.norm_sq {
+          reconstructed_norm_sq += norm_sq[index];
+        }
+      }
     }
 
-    for m in main_len..num_subspaces {
-      dist += table[m * num_centroids + codes[m] as usize];
+    for (m, code) in codes.iter().enumerate().skip(main_len).take(num_subspaces) {
+      let index = m * num_centroids + *code as usize;
+      value += table.values[index];
+      if let Some(norm_sq) = &table.norm_sq {
+        reconstructed_norm_sq += norm_sq[index];
+      }
     }
 
-    dist
+    match self.config.ivf.metric {
+      DistanceMetric::Euclidean => value.max(0.0).sqrt(),
+      DistanceMetric::DotProduct => value,
+      DistanceMetric::Cosine => {
+        let similarity = if reconstructed_norm_sq > 1e-20 {
+          value / reconstructed_norm_sq.sqrt()
+        } else {
+          0.0
+        };
+        1.0 - similarity
+      }
+    }
   }
 
   /// Find the top n nearest centroids
@@ -789,69 +892,78 @@ impl IvfPqIndex {
     if !self.trained || queries.is_empty() {
       return Vec::new();
     }
+    if k == 0 {
+      return Vec::new();
+    }
 
     let options = options.unwrap_or_default();
 
-    // Run individual searches with higher k to ensure we have enough candidates
-    let expanded_k = k * 2;
-    let all_results: Vec<Vec<VectorSearchResult>> = queries
-      .iter()
-      .map(|query| self.search(manifest, query, expanded_k, None))
-      .collect();
-
-    // Aggregate by node_id
-    let mut aggregated: std::collections::HashMap<NodeId, (Vec<f32>, u64)> =
-      std::collections::HashMap::new();
-
-    for results in &all_results {
-      for result in results {
-        let entry = aggregated
-          .entry(result.node_id)
-          .or_insert_with(|| (Vec::new(), result.vector_id));
-        entry.0.push(result.distance);
-      }
+    // Filter while collecting candidates.  Over-fetch grows geometrically up
+    // to the number of indexed codes, so a filtered search can recover k
+    // survivors without an unbounded scan/retry loop.  `n_probe` is passed
+    // through on every pass; it is never replaced by the config default.
+    let max_candidates = self.pq_codes.len();
+    if max_candidates == 0 {
+      return Vec::new();
     }
+    let mut expanded_k = k.saturating_mul(2).max(k).min(max_candidates);
 
-    // Apply filter if provided
-    let aggregated: std::collections::HashMap<NodeId, (Vec<f32>, u64)> =
-      if let Some(ref filter) = options.filter {
-        aggregated
-          .into_iter()
-          .filter(|(node_id, _)| filter(*node_id))
-          .collect()
-      } else {
-        aggregated
-      };
+    loop {
+      let all_results: Vec<Vec<VectorSearchResult>> = queries
+        .iter()
+        .map(|query| self.search_with_options(manifest, query, expanded_k, &options, false))
+        .collect();
 
-    // Compute aggregated scores and build results
-    let mut scored: Vec<VectorSearchResult> = aggregated
-      .into_iter()
-      .map(|(node_id, (distances, vector_id))| {
-        let distance = aggregation.aggregate(&distances);
-        let similarity = self.config.ivf.metric.distance_to_similarity(distance);
-        VectorSearchResult {
-          vector_id,
-          node_id,
-          distance,
-          similarity,
+      let mut aggregated: std::collections::HashMap<NodeId, (Vec<f32>, u64)> =
+        std::collections::HashMap::new();
+      for results in &all_results {
+        for result in results {
+          let entry = aggregated
+            .entry(result.node_id)
+            .or_insert_with(|| (Vec::new(), result.vector_id));
+          entry.0.push(result.distance);
         }
-      })
-      .collect();
+      }
 
-    // Apply threshold filter
-    if let Some(threshold) = options.threshold {
-      scored.retain(|r| r.similarity >= threshold);
+      let exhausted = expanded_k >= max_candidates
+        || all_results.iter().all(|results| results.len() < expanded_k);
+      let mut scored: Vec<VectorSearchResult> = aggregated
+        .into_iter()
+        .map(|(node_id, (distances, vector_id))| {
+          let distance = aggregation.aggregate(&distances);
+          let similarity = self.config.ivf.metric.distance_to_similarity(distance);
+          VectorSearchResult {
+            vector_id,
+            node_id,
+            distance,
+            similarity,
+          }
+        })
+        .collect();
+
+      if let Some(threshold) = options.threshold {
+        scored.retain(|r| r.similarity >= threshold);
+      }
+
+      // Stop as soon as enough filtered and threshold-qualified nodes are
+      // available, or when every query exhausted its selected-cluster
+      // candidates.
+      if scored.len() >= k || exhausted {
+        scored.sort_by(|a, b| {
+          a.distance
+            .partial_cmp(&b.distance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        scored.truncate(k);
+        return scored;
+      }
+
+      let next_k = expanded_k.saturating_mul(2).min(max_candidates);
+      if next_k == expanded_k {
+        return Vec::new();
+      }
+      expanded_k = next_k;
     }
-
-    // Sort by distance and return top k
-    scored.sort_by(|a, b| {
-      a.distance
-        .partial_cmp(&b.distance)
-        .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    scored.truncate(k);
-
-    scored
   }
 
   /// Build index from all vectors in the store
@@ -955,7 +1067,6 @@ impl IvfPqIndex {
     self.ivf_centroids.clear();
     self.inverted_lists.clear();
     self.pq_codes.clear();
-    self.centroid_distances = None;
     self.trained = false;
     self.training_vectors = Some(Vec::new());
     self.training_count = 0;
@@ -970,6 +1081,18 @@ impl IvfPqIndex {
 // ============================================================================
 // Search Options
 // ============================================================================
+
+/// Metric-aware ADC lookup tables.
+///
+/// `values` stores squared component distances for Euclidean, negative
+/// component inner products for DotProduct, and component inner products for
+/// Cosine.  Cosine additionally stores the reconstructed component norms so
+/// the final ADC score is a normalized inner product.
+#[derive(Debug, Clone)]
+struct AdcTable {
+  values: Vec<f32>,
+  norm_sq: Option<Vec<f32>>,
+}
 
 /// Options for IVF-PQ search
 #[derive(Default)]
@@ -1248,6 +1371,9 @@ pub enum IvfPqError {
     k: usize,
   },
   TrainingFailed(String),
+  InvalidConfiguration(String),
+  InvalidStructure(String),
+  SizeOverflow(String),
 }
 
 impl std::fmt::Display for IvfPqError {
@@ -1270,11 +1396,182 @@ impl std::fmt::Display for IvfPqError {
         write!(f, "Not enough training vectors: {n} < {k} required")
       }
       IvfPqError::TrainingFailed(msg) => write!(f, "Training failed: {msg}"),
+      IvfPqError::InvalidConfiguration(msg) => {
+        write!(f, "Invalid IVF-PQ configuration: {msg}")
+      }
+      IvfPqError::InvalidStructure(msg) => write!(f, "Invalid IVF-PQ structure: {msg}"),
+      IvfPqError::SizeOverflow(context) => write!(f, "IVF-PQ size overflow: {context}"),
     }
   }
 }
 
 impl std::error::Error for IvfPqError {}
+
+fn validate_ivf_pq_config(dimensions: usize, config: &IvfPqConfig) -> Result<usize, IvfPqError> {
+  if dimensions == 0 {
+    return Err(IvfPqError::InvalidConfiguration(
+      "dimensions must be nonzero".into(),
+    ));
+  }
+  if config.ivf.n_clusters == 0 {
+    return Err(IvfPqError::InvalidConfiguration(
+      "n_clusters must be nonzero".into(),
+    ));
+  }
+  if config.ivf.n_probe == 0 {
+    return Err(IvfPqError::InvalidConfiguration(
+      "n_probe must be nonzero".into(),
+    ));
+  }
+  if config.pq.num_subspaces == 0 {
+    return Err(IvfPqError::InvalidConfiguration(
+      "num_subspaces must be nonzero".into(),
+    ));
+  }
+  if !(1..=MAX_PQ_CENTROIDS).contains(&config.pq.num_centroids) {
+    return Err(IvfPqError::InvalidConfiguration(format!(
+      "num_centroids must be in 1..={} (got {})",
+      MAX_PQ_CENTROIDS, config.pq.num_centroids
+    )));
+  }
+  if config.pq.max_iterations == 0 {
+    return Err(IvfPqError::InvalidConfiguration(
+      "max_iterations must be nonzero".into(),
+    ));
+  }
+  if dimensions % config.pq.num_subspaces != 0 {
+    return Err(IvfPqError::DimensionNotDivisible {
+      dimensions,
+      num_subspaces: config.pq.num_subspaces,
+    });
+  }
+
+  let subspace_dims = dimensions / config.pq.num_subspaces;
+  config
+    .pq
+    .num_centroids
+    .checked_mul(subspace_dims)
+    .ok_or_else(|| IvfPqError::SizeOverflow("IVF-PQ centroid allocation".into()))?;
+  Ok(subspace_dims)
+}
+
+struct SerializedIvfPqParts<'a> {
+  config: &'a IvfPqConfig,
+  ivf_centroids: &'a [f32],
+  inverted_lists: &'a HashMap<usize, Vec<u64>>,
+  pq_codes: &'a HashMap<u64, Vec<u8>>,
+  pq_centroids: &'a [Vec<f32>],
+  dimensions: usize,
+  trained: bool,
+}
+
+fn validate_ivf_pq_parts(parts: &SerializedIvfPqParts<'_>) -> Result<(), IvfPqError> {
+  let config = parts.config;
+  let ivf_centroids = parts.ivf_centroids;
+  let inverted_lists = parts.inverted_lists;
+  let pq_codes = parts.pq_codes;
+  let pq_centroids = parts.pq_centroids;
+  let dimensions = parts.dimensions;
+  let trained = parts.trained;
+  let subspace_dims = validate_ivf_pq_config(dimensions, config)?;
+  let expected_ivf_centroids = if trained {
+    config
+      .ivf
+      .n_clusters
+      .checked_mul(dimensions)
+      .ok_or_else(|| IvfPqError::SizeOverflow("IVF centroid shape".into()))?
+  } else {
+    0
+  };
+  if ivf_centroids.len() != expected_ivf_centroids {
+    return Err(IvfPqError::InvalidStructure(format!(
+      "IVF centroid count {} does not match expected {}",
+      ivf_centroids.len(),
+      expected_ivf_centroids
+    )));
+  }
+
+  if inverted_lists.len() > config.ivf.n_clusters {
+    return Err(IvfPqError::InvalidStructure(format!(
+      "inverted list count {} exceeds n_clusters {}",
+      inverted_lists.len(),
+      config.ivf.n_clusters
+    )));
+  }
+  let mut list_ids = HashSet::new();
+  for (&cluster, list) in inverted_lists {
+    if cluster >= config.ivf.n_clusters {
+      return Err(IvfPqError::InvalidStructure(format!(
+        "inverted list cluster {} is outside n_clusters {}",
+        cluster, config.ivf.n_clusters
+      )));
+    }
+    for &vector_id in list {
+      if !list_ids.insert(vector_id) {
+        return Err(IvfPqError::InvalidStructure(format!(
+          "duplicate vector id {vector_id} in inverted lists"
+        )));
+      }
+    }
+  }
+
+  if pq_centroids.len() != config.pq.num_subspaces {
+    return Err(IvfPqError::InvalidStructure(format!(
+      "PQ subspace count {} does not match configured {}",
+      pq_centroids.len(),
+      config.pq.num_subspaces
+    )));
+  }
+  let expected_pq_centroids = config
+    .pq
+    .num_centroids
+    .checked_mul(subspace_dims)
+    .ok_or_else(|| IvfPqError::SizeOverflow("PQ centroid shape".into()))?;
+  for (subspace, centroids) in pq_centroids.iter().enumerate() {
+    if centroids.len() != expected_pq_centroids {
+      return Err(IvfPqError::InvalidStructure(format!(
+        "PQ subspace {} centroid count {} does not match expected {}",
+        subspace,
+        centroids.len(),
+        expected_pq_centroids
+      )));
+    }
+  }
+
+  for (&vector_id, codes) in pq_codes {
+    if codes.len() != config.pq.num_subspaces {
+      return Err(IvfPqError::InvalidStructure(format!(
+        "PQ code for vector {} has length {}, expected {}",
+        vector_id,
+        codes.len(),
+        config.pq.num_subspaces
+      )));
+    }
+    if codes
+      .iter()
+      .any(|&code| usize::from(code) >= config.pq.num_centroids)
+    {
+      return Err(IvfPqError::InvalidStructure(format!(
+        "PQ code for vector {} contains a centroid outside codebook size {}",
+        vector_id, config.pq.num_centroids
+      )));
+    }
+  }
+
+  if list_ids.len() != pq_codes.len() || list_ids.iter().any(|id| !pq_codes.contains_key(id)) {
+    return Err(IvfPqError::InvalidStructure(
+      "inverted-list IDs and PQ-code IDs do not match".into(),
+    ));
+  }
+
+  if !trained && (!inverted_lists.is_empty() || !pq_codes.is_empty()) {
+    return Err(IvfPqError::InvalidStructure(
+      "untrained index contains vectors".into(),
+    ));
+  }
+
+  Ok(())
+}
 
 // ============================================================================
 // Serialization
@@ -1284,6 +1581,12 @@ impl std::error::Error for IvfPqError {}
 const IVFPQ_MAGIC: u32 = 0x49565051;
 /// Header size for IVF-PQ index
 const IVFPQ_HEADER_SIZE: usize = 48;
+/// PQ codes are serialized as uint8 centroid indexes.
+const MAX_PQ_CENTROIDS: usize = u8::MAX as usize + 1;
+/// Header flag used by the current writer to omit the obsolete centroid
+/// distance payload. A zero flag identifies the legacy format, whose trailing
+/// centroid distances are still read and discarded.
+const IVFPQ_FORMAT_FLAG_NO_CENTROID_DISTANCES: u8 = 1;
 
 /// Serialization error
 #[derive(Debug, Clone)]
@@ -1299,6 +1602,8 @@ pub enum SerializeError {
   },
   /// Invalid metric value
   InvalidMetric(u32),
+  /// Structurally inconsistent input
+  InvalidStructure(String),
 }
 
 impl std::fmt::Display for SerializeError {
@@ -1327,6 +1632,7 @@ impl std::fmt::Display for SerializeError {
           "Invalid metric value: {n}. Expected 0 (cosine), 1 (euclidean), or 2 (dot)"
         )
       }
+      SerializeError::InvalidStructure(msg) => write!(f, "Invalid IVF-PQ structure: {msg}"),
     }
   }
 }
@@ -1359,7 +1665,10 @@ fn ensure_bytes(
   needed: usize,
   context: &str,
 ) -> Result<(), SerializeError> {
-  if offset + needed > buf_len {
+  let end = offset
+    .checked_add(needed)
+    .ok_or_else(|| SerializeError::InvalidStructure(format!("{context} size overflow")))?;
+  if end > buf_len {
     return Err(SerializeError::BufferUnderflow {
       context: context.to_string(),
       offset,
@@ -1370,8 +1679,23 @@ fn ensure_bytes(
   Ok(())
 }
 
+fn ensure_count_bytes(
+  buf_len: usize,
+  offset: usize,
+  count: usize,
+  minimum_size: usize,
+  context: &str,
+) -> Result<(), SerializeError> {
+  let needed = count
+    .checked_mul(minimum_size)
+    .ok_or_else(|| SerializeError::InvalidStructure(format!("{context} count size overflow")))?;
+  ensure_bytes(buf_len, offset, needed, context)
+}
+
 fn read_u8(buffer: &[u8], offset: &mut usize, context: &str) -> Result<u8, SerializeError> {
-  let end = offset.saturating_add(1);
+  let end = offset
+    .checked_add(1)
+    .ok_or_else(|| SerializeError::InvalidStructure(format!("{context} offset overflow")))?;
   let slice = buffer
     .get(*offset..end)
     .ok_or_else(|| SerializeError::BufferUnderflow {
@@ -1385,7 +1709,9 @@ fn read_u8(buffer: &[u8], offset: &mut usize, context: &str) -> Result<u8, Seria
 }
 
 fn read_u32_le(buffer: &[u8], offset: &mut usize, context: &str) -> Result<u32, SerializeError> {
-  let end = offset.saturating_add(4);
+  let end = offset
+    .checked_add(4)
+    .ok_or_else(|| SerializeError::InvalidStructure(format!("{context} offset overflow")))?;
   let slice = buffer
     .get(*offset..end)
     .ok_or_else(|| SerializeError::BufferUnderflow {
@@ -1401,7 +1727,9 @@ fn read_u32_le(buffer: &[u8], offset: &mut usize, context: &str) -> Result<u32, 
 }
 
 fn read_u64_le(buffer: &[u8], offset: &mut usize, context: &str) -> Result<u64, SerializeError> {
-  let end = offset.saturating_add(8);
+  let end = offset
+    .checked_add(8)
+    .ok_or_else(|| SerializeError::InvalidStructure(format!("{context} offset overflow")))?;
   let slice = buffer
     .get(*offset..end)
     .ok_or_else(|| SerializeError::BufferUnderflow {
@@ -1417,7 +1745,9 @@ fn read_u64_le(buffer: &[u8], offset: &mut usize, context: &str) -> Result<u64, 
 }
 
 fn read_f32_le(buffer: &[u8], offset: &mut usize, context: &str) -> Result<f32, SerializeError> {
-  let end = offset.saturating_add(4);
+  let end = offset
+    .checked_add(4)
+    .ok_or_else(|| SerializeError::InvalidStructure(format!("{context} offset overflow")))?;
   let slice = buffer
     .get(*offset..end)
     .ok_or_else(|| SerializeError::BufferUnderflow {
@@ -1459,12 +1789,6 @@ pub fn ivf_pq_serialized_size(index: &IvfPqIndex) -> usize {
     size += 8 + 4 + codes.len(); // vector_id (u64) + code_len (u32) + codes
   }
 
-  // Centroid distances (optional)
-  size += 1; // has_centroid_distances flag
-  if let Some(ref dists) = index.centroid_distances {
-    size += 4 + dists.len() * 4; // count + distances
-  }
-
   size
 }
 
@@ -1482,7 +1806,9 @@ pub fn ivf_pq_serialized_size(index: &IvfPqIndex) -> usize {
 ///   - metric (1): 0=cosine, 1=euclidean, 2=dot
 ///   - trained (1)
 ///   - use_residuals (1)
-///   - reserved (17)
+///   - format flags (1): bit 0 means the obsolete centroid-distance payload
+///     is omitted; zero means the legacy payload follows the PQ codes
+///   - reserved (16)
 /// - ivf_centroid_count (4)
 /// - IVF centroids (ivf_centroid_count * 4 bytes)
 /// - num_inverted_lists (4)
@@ -1499,10 +1825,9 @@ pub fn ivf_pq_serialized_size(index: &IvfPqIndex) -> usize {
 ///   - vector_id (8)
 ///   - code_len (4)
 ///   - codes (code_len bytes)
-/// - has_centroid_distances (1)
-/// - If has_centroid_distances:
-///   - distance_count (4)
-///   - distances (distance_count * 4)
+///
+/// Legacy files may additionally contain a centroid-distance payload after the
+/// PQ codes. It is read for compatibility and discarded.
 pub fn serialize_ivf_pq(index: &IvfPqIndex) -> Vec<u8> {
   let size = ivf_pq_serialized_size(index);
   let mut buffer = Vec::with_capacity(size);
@@ -1518,7 +1843,8 @@ pub fn serialize_ivf_pq(index: &IvfPqIndex) -> Vec<u8> {
   buffer.push(metric_to_u8(index.config.ivf.metric));
   buffer.push(if index.trained { 1 } else { 0 });
   buffer.push(if index.config.use_residuals { 1 } else { 0 });
-  buffer.extend_from_slice(&[0u8; 17]); // reserved
+  buffer.push(IVFPQ_FORMAT_FLAG_NO_CENTROID_DISTANCES);
+  buffer.extend_from_slice(&[0u8; 16]); // reserved
 
   // IVF centroids
   buffer.extend_from_slice(&(index.ivf_centroids.len() as u32).to_le_bytes());
@@ -1553,17 +1879,6 @@ pub fn serialize_ivf_pq(index: &IvfPqIndex) -> Vec<u8> {
     buffer.extend_from_slice(codes);
   }
 
-  // Centroid distances
-  if let Some(ref dists) = index.centroid_distances {
-    buffer.push(1);
-    buffer.extend_from_slice(&(dists.len() as u32).to_le_bytes());
-    for &val in dists {
-      buffer.extend_from_slice(&val.to_le_bytes());
-    }
-  } else {
-    buffer.push(0);
-  }
-
   buffer
 }
 
@@ -1590,10 +1905,32 @@ pub fn deserialize_ivf_pq(buffer: &[u8]) -> Result<IvfPqIndex, SerializeError> {
   let num_centroids = read_u32_le(buffer, &mut offset, "IVF-PQ num_centroids")? as usize;
   let max_iterations = read_u32_le(buffer, &mut offset, "IVF-PQ max_iterations")? as usize;
   let metric = u8_to_metric(read_u8(buffer, &mut offset, "IVF-PQ metric")?)?;
-  let trained = read_u8(buffer, &mut offset, "IVF-PQ trained")? == 1;
-  let use_residuals = read_u8(buffer, &mut offset, "IVF-PQ use_residuals")? == 1;
-  ensure_bytes(buf_len, offset, 17, "IVF-PQ header reserved")?;
-  offset += 17; // reserved
+  let trained = match read_u8(buffer, &mut offset, "IVF-PQ trained")? {
+    0 => false,
+    1 => true,
+    value => {
+      return Err(SerializeError::InvalidStructure(format!(
+        "IVF-PQ trained flag {value} is invalid"
+      )));
+    }
+  };
+  let use_residuals = match read_u8(buffer, &mut offset, "IVF-PQ use_residuals")? {
+    0 => false,
+    1 => true,
+    value => {
+      return Err(SerializeError::InvalidStructure(format!(
+        "IVF-PQ use_residuals flag {value} is invalid"
+      )));
+    }
+  };
+  let format_flags = read_u8(buffer, &mut offset, "IVF-PQ format flags")?;
+  if format_flags & !IVFPQ_FORMAT_FLAG_NO_CENTROID_DISTANCES != 0 {
+    return Err(SerializeError::InvalidStructure(format!(
+      "IVF-PQ format flags {format_flags:#04x} contain unknown bits"
+    )));
+  }
+  ensure_bytes(buf_len, offset, 16, "IVF-PQ header reserved")?;
+  offset += 16; // reserved
 
   let config = IvfPqConfig {
     ivf: IvfConfig {
@@ -1608,16 +1945,30 @@ pub fn deserialize_ivf_pq(buffer: &[u8]) -> Result<IvfPqIndex, SerializeError> {
     },
     use_residuals,
   };
+  validate_ivf_pq_config(dimensions, &config)
+    .map_err(|error| SerializeError::InvalidStructure(error.to_string()))?;
 
   // IVF centroids
   let ivf_centroid_count = read_u32_le(buffer, &mut offset, "IVF-PQ centroid count")? as usize;
-
-  ensure_bytes(
+  ensure_count_bytes(
     buf_len,
     offset,
-    ivf_centroid_count * 4,
+    ivf_centroid_count,
+    4,
     "IVF-PQ IVF centroids",
   )?;
+  let expected_ivf_centroid_count = if trained {
+    n_clusters
+      .checked_mul(dimensions)
+      .ok_or_else(|| SerializeError::InvalidStructure("IVF centroid shape overflow".into()))?
+  } else {
+    0
+  };
+  if ivf_centroid_count != expected_ivf_centroid_count {
+    return Err(SerializeError::InvalidStructure(format!(
+      "IVF centroid count {ivf_centroid_count} does not match expected {expected_ivf_centroid_count}"
+    )));
+  }
   let mut ivf_centroids = Vec::with_capacity(ivf_centroid_count);
   for _ in 0..ivf_centroid_count {
     let val = read_f32_le(buffer, &mut offset, "IVF-PQ IVF centroid")?;
@@ -1626,35 +1977,58 @@ pub fn deserialize_ivf_pq(buffer: &[u8]) -> Result<IvfPqIndex, SerializeError> {
 
   // Inverted lists
   let num_lists = read_u32_le(buffer, &mut offset, "IVF-PQ inverted list count")? as usize;
+  if num_lists > n_clusters {
+    return Err(SerializeError::InvalidStructure(format!(
+      "inverted list count {num_lists} exceeds n_clusters {n_clusters}"
+    )));
+  }
+  ensure_count_bytes(
+    buf_len,
+    offset,
+    num_lists,
+    8,
+    "IVF-PQ inverted list headers",
+  )?;
 
-  let mut inverted_lists: HashMap<usize, Vec<u64>> = HashMap::new();
+  let mut inverted_lists: HashMap<usize, Vec<u64>> = HashMap::with_capacity(num_lists);
+  let mut list_ids = HashSet::new();
   for i in 0..num_lists {
-    ensure_bytes(
-      buf_len,
-      offset,
-      8,
-      &format!("IVF-PQ inverted list {i} header"),
-    )?;
     let cluster = read_u32_le(
       buffer,
       &mut offset,
       &format!("IVF-PQ inverted list {i} cluster"),
     )? as usize;
+    if cluster >= n_clusters {
+      return Err(SerializeError::InvalidStructure(format!(
+        "IVF-PQ inverted list {i} cluster {cluster} is outside n_clusters {n_clusters}"
+      )));
+    }
+    if inverted_lists.contains_key(&cluster) {
+      return Err(SerializeError::InvalidStructure(format!(
+        "duplicate IVF-PQ inverted list cluster {cluster}"
+      )));
+    }
     let list_length = read_u32_le(
       buffer,
       &mut offset,
       &format!("IVF-PQ inverted list {i} length"),
     )? as usize;
 
-    ensure_bytes(
+    ensure_count_bytes(
       buf_len,
       offset,
-      list_length * 8,
+      list_length,
+      8,
       &format!("IVF-PQ inverted list {i} data"),
     )?;
     let mut list = Vec::with_capacity(list_length);
     for _ in 0..list_length {
       let vector_id = read_u64_le(buffer, &mut offset, "IVF-PQ inverted list vector_id")?;
+      if !list_ids.insert(vector_id) {
+        return Err(SerializeError::InvalidStructure(format!(
+          "duplicate IVF-PQ vector id {vector_id} in inverted lists"
+        )));
+      }
       list.push(vector_id);
     }
     inverted_lists.insert(cluster, list);
@@ -1662,27 +2036,42 @@ pub fn deserialize_ivf_pq(buffer: &[u8]) -> Result<IvfPqIndex, SerializeError> {
 
   // PQ centroids
   let num_pq_subspaces = read_u32_le(buffer, &mut offset, "IVF-PQ PQ subspace count")? as usize;
+  ensure_count_bytes(
+    buf_len,
+    offset,
+    num_pq_subspaces,
+    4,
+    "IVF-PQ PQ subspace headers",
+  )?;
+  if num_pq_subspaces != num_subspaces {
+    return Err(SerializeError::InvalidStructure(format!(
+      "PQ subspace count {num_pq_subspaces} does not match configured {num_subspaces}"
+    )));
+  }
 
   let mut pq_centroids = Vec::with_capacity(num_pq_subspaces);
   for i in 0..num_pq_subspaces {
-    ensure_bytes(
-      buf_len,
-      offset,
-      4,
-      &format!("IVF-PQ PQ subspace {i} centroid count"),
-    )?;
     let centroid_count = read_u32_le(
       buffer,
       &mut offset,
       &format!("IVF-PQ PQ subspace {i} centroid count"),
     )? as usize;
 
-    ensure_bytes(
+    ensure_count_bytes(
       buf_len,
       offset,
-      centroid_count * 4,
+      centroid_count,
+      4,
       &format!("IVF-PQ PQ subspace {i} centroids"),
     )?;
+    let expected_centroid_count = num_centroids
+      .checked_mul(dimensions / num_subspaces)
+      .ok_or_else(|| SerializeError::InvalidStructure("PQ centroid shape overflow".into()))?;
+    if centroid_count != expected_centroid_count {
+      return Err(SerializeError::InvalidStructure(format!(
+        "PQ subspace {i} centroid count {centroid_count} does not match expected {expected_centroid_count}"
+      )));
+    }
     let mut centroids = Vec::with_capacity(centroid_count);
     for _ in 0..centroid_count {
       let val = read_f32_le(buffer, &mut offset, "IVF-PQ PQ centroid")?;
@@ -1693,10 +2082,10 @@ pub fn deserialize_ivf_pq(buffer: &[u8]) -> Result<IvfPqIndex, SerializeError> {
 
   // PQ codes
   let num_pq_codes = read_u32_le(buffer, &mut offset, "IVF-PQ PQ codes count")? as usize;
+  ensure_count_bytes(buf_len, offset, num_pq_codes, 12, "IVF-PQ PQ code headers")?;
 
-  let mut pq_codes: HashMap<u64, Vec<u8>> = HashMap::new();
+  let mut pq_codes: HashMap<u64, Vec<u8>> = HashMap::with_capacity(num_pq_codes);
   for i in 0..num_pq_codes {
-    ensure_bytes(buf_len, offset, 12, &format!("IVF-PQ PQ code {i} header"))?;
     let vector_id = read_u64_le(
       buffer,
       &mut offset,
@@ -1704,6 +2093,12 @@ pub fn deserialize_ivf_pq(buffer: &[u8]) -> Result<IvfPqIndex, SerializeError> {
     )?;
     let code_len =
       read_u32_le(buffer, &mut offset, &format!("IVF-PQ PQ code {i} length"))? as usize;
+
+    if code_len != num_subspaces {
+      return Err(SerializeError::InvalidStructure(format!(
+        "PQ code {i} length {code_len} does not match num_subspaces {num_subspaces}"
+      )));
+    }
 
     ensure_bytes(
       buf_len,
@@ -1713,31 +2108,65 @@ pub fn deserialize_ivf_pq(buffer: &[u8]) -> Result<IvfPqIndex, SerializeError> {
     )?;
     let codes = buffer[offset..offset + code_len].to_vec();
     offset += code_len;
-    pq_codes.insert(vector_id, codes);
+    if codes.iter().any(|&code| usize::from(code) >= num_centroids) {
+      return Err(SerializeError::InvalidStructure(format!(
+        "PQ code {i} contains a centroid outside codebook size {num_centroids}"
+      )));
+    }
+    if pq_codes.insert(vector_id, codes).is_some() {
+      return Err(SerializeError::InvalidStructure(format!(
+        "duplicate IVF-PQ code vector id {vector_id}"
+      )));
+    }
   }
 
-  // Centroid distances
-  let has_centroid_distances = read_u8(buffer, &mut offset, "IVF-PQ centroid distances flag")? == 1;
+  // Legacy writers appended centroid distances. Read and discard them when
+  // the format flag is absent; current files omit this unused payload.
+  let centroid_distances = if format_flags & IVFPQ_FORMAT_FLAG_NO_CENTROID_DISTANCES == 0 {
+    let has_centroid_distances =
+      match read_u8(buffer, &mut offset, "IVF-PQ centroid distances flag")? {
+        0 => false,
+        1 => true,
+        value => {
+          return Err(SerializeError::InvalidStructure(format!(
+            "centroid distances flag {value} is invalid"
+          )));
+        }
+      };
 
-  let centroid_distances = if has_centroid_distances {
-    let distance_count =
-      read_u32_le(buffer, &mut offset, "IVF-PQ centroid distances count")? as usize;
-
-    ensure_bytes(
-      buf_len,
-      offset,
-      distance_count * 4,
-      "IVF-PQ centroid distances",
-    )?;
-    let mut dists = Vec::with_capacity(distance_count);
-    for _ in 0..distance_count {
-      let val = read_f32_le(buffer, &mut offset, "IVF-PQ centroid distance")?;
-      dists.push(val);
+    if has_centroid_distances {
+      let distance_count =
+        read_u32_le(buffer, &mut offset, "IVF-PQ centroid distances count")? as usize;
+      ensure_count_bytes(
+        buf_len,
+        offset,
+        distance_count,
+        4,
+        "IVF-PQ centroid distances",
+      )?;
+      let expected_distance_count = n_clusters.checked_mul(n_clusters).ok_or_else(|| {
+        SerializeError::InvalidStructure("centroid distance shape overflow".into())
+      })?;
+      if distance_count != expected_distance_count {
+        return Err(SerializeError::InvalidStructure(format!(
+          "centroid distance count {distance_count} does not match expected {expected_distance_count}"
+        )));
+      }
+      for _ in 0..distance_count {
+        let _ = read_f32_le(buffer, &mut offset, "IVF-PQ centroid distance")?;
+      }
     }
-    Some(dists)
+    Some(Vec::new())
   } else {
     None
   };
+
+  if offset != buf_len {
+    return Err(SerializeError::InvalidStructure(format!(
+      "IVF-PQ payload has {} trailing bytes",
+      buf_len - offset
+    )));
+  }
 
   IvfPqIndex::from_serialized(
     config,
@@ -1749,12 +2178,7 @@ pub fn deserialize_ivf_pq(buffer: &[u8]) -> Result<IvfPqIndex, SerializeError> {
     dimensions,
     trained,
   )
-  .map_err(|e| SerializeError::BufferUnderflow {
-    context: format!("IVF-PQ index construction: {e}"),
-    offset: 0,
-    needed: 0,
-    available: 0,
-  })
+  .map_err(|e| SerializeError::InvalidStructure(format!("IVF-PQ index construction: {e}")))
 }
 
 /// Write IVF-PQ index to a writer
@@ -1788,6 +2212,7 @@ pub fn read_ivf_pq<R: std::io::Read>(reader: &mut R) -> Result<IvfPqIndex, Seria
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::vector::types::VectorStoreConfig;
 
   fn test_config() -> IvfPqConfig {
     IvfPqConfig {
@@ -1803,6 +2228,334 @@ mod tests {
       },
       use_residuals: true,
     }
+  }
+
+  fn manual_metric_fixture(
+    metric: DistanceMetric,
+  ) -> (IvfPqIndex, VectorManifest, Vec<Vec<f32>>, Vec<f32>) {
+    let config = IvfPqConfig {
+      ivf: IvfConfig {
+        n_clusters: 1,
+        n_probe: 1,
+        metric,
+      },
+      pq: PqConfig {
+        num_subspaces: 4,
+        num_centroids: 5,
+        max_iterations: 1,
+      },
+      use_residuals: false,
+    };
+    let mut index = IvfPqIndex::new(4, config).expect("fixture config");
+    index.ivf_centroids = vec![0.0; 4];
+    index.pq_centroids = vec![
+      vec![1.0, 0.8, 0.6, 0.0, -1.0],
+      vec![0.0, 0.6, 0.8, 1.0, 0.0],
+      vec![0.0, 0.0, 0.0, 0.0, 1.0],
+      vec![0.0; 5],
+    ];
+
+    let vectors = vec![
+      vec![1.0, 0.0, 0.0, 0.0],
+      vec![0.8, 0.6, 0.0, 0.0],
+      vec![0.6, 0.8, 0.0, 0.0],
+      vec![-1.0, 0.0, 0.0, 0.0],
+      vec![0.0, 0.0, 1.0, 0.0],
+    ];
+    let codes = [
+      [0, 0, 0, 0],
+      [1, 1, 0, 0],
+      [2, 2, 0, 0],
+      [4, 0, 0, 0],
+      [3, 0, 1, 0],
+    ];
+    index.inverted_lists.insert(0, (1..=5).collect());
+    for (offset, code) in codes.into_iter().enumerate() {
+      index.pq_codes.insert((offset + 1) as u64, code.to_vec());
+    }
+    index.trained = true;
+
+    let mut manifest = VectorManifest::new(VectorStoreConfig::new(4).with_metric(metric));
+    for vector_id in 1..=5 {
+      manifest.vector_to_node.insert(vector_id, vector_id);
+      manifest.node_to_vector.insert(vector_id, vector_id);
+    }
+
+    (index, manifest, vectors, vec![1.0, 0.0, 0.0, 0.0])
+  }
+
+  fn exact_fixture_distances(
+    metric: DistanceMetric,
+    vectors: &[Vec<f32>],
+    query: &[f32],
+  ) -> Vec<(u64, f32)> {
+    let query_normalized = if metric == DistanceMetric::Cosine {
+      normalize(query)
+    } else {
+      query.to_vec()
+    };
+    let distance_fn = metric.distance_fn();
+    let mut distances: Vec<(u64, f32)> = vectors
+      .iter()
+      .enumerate()
+      .map(|(offset, vector)| {
+        let vector_normalized = if metric == DistanceMetric::Cosine {
+          normalize(vector)
+        } else {
+          vector.clone()
+        };
+        (
+          (offset + 1) as u64,
+          distance_fn(&query_normalized, &vector_normalized),
+        )
+      })
+      .collect();
+    distances.sort_by(|a, b| a.1.total_cmp(&b.1));
+    distances
+  }
+
+  #[test]
+  fn test_ivf_pq_adc_matches_exact_metric_space() {
+    for metric in [
+      DistanceMetric::Euclidean,
+      DistanceMetric::Cosine,
+      DistanceMetric::DotProduct,
+    ] {
+      let (index, manifest, vectors, query) = manual_metric_fixture(metric);
+      let exact = exact_fixture_distances(metric, &vectors, &query);
+      let expected_ids: HashSet<u64> = exact.iter().take(3).map(|(id, _)| *id).collect();
+      let results = index.search(&manifest, &query, 3, None);
+      let actual_ids: HashSet<u64> = results.iter().map(|result| result.vector_id).collect();
+
+      assert_eq!(
+        expected_ids.intersection(&actual_ids).count(),
+        3,
+        "{metric:?}"
+      );
+      for result in &results {
+        let (_, expected_distance) = exact
+          .iter()
+          .find(|(id, _)| *id == result.vector_id)
+          .expect("exact result");
+        assert!(
+          (result.distance - expected_distance).abs() < 1e-5,
+          "{metric:?}: ADC distance {} != exact {}",
+          result.distance,
+          expected_distance
+        );
+        assert!(
+          (result.similarity - metric.distance_to_similarity(result.distance)).abs() < 1e-5,
+          "{metric:?}: similarity is not derived from native distance"
+        );
+      }
+
+      for pair in results.windows(2) {
+        assert!(pair[0].distance <= pair[1].distance + 1e-5, "{metric:?}");
+        assert!(
+          pair[0].similarity + 1e-5 >= pair[1].similarity,
+          "{metric:?}"
+        );
+      }
+
+      match metric {
+        DistanceMetric::Euclidean => {
+          assert!(results.iter().all(|result| result.distance >= 0.0));
+          assert!(results.iter().all(|result| result.similarity <= 1.0));
+        }
+        DistanceMetric::Cosine => {
+          assert!(results.iter().all(|result| result.distance >= -1e-5));
+          assert!(results
+            .iter()
+            .all(|result| result.similarity >= -1.0 - 1e-5));
+          assert!(results.iter().all(|result| result.similarity <= 1.0 + 1e-5));
+        }
+        DistanceMetric::DotProduct => {
+          assert!(results[0].distance < 0.0);
+          assert!(results[0].similarity > 0.0);
+          assert!(results
+            .iter()
+            .all(|result| { (result.distance + result.similarity).abs() < 1e-5 }));
+        }
+      }
+    }
+  }
+
+  #[test]
+  fn test_ivf_pq_cosine_training_uses_normalized_vectors() {
+    let config = IvfPqConfig {
+      ivf: IvfConfig {
+        n_clusters: 1,
+        n_probe: 1,
+        metric: DistanceMetric::Cosine,
+      },
+      pq: PqConfig {
+        num_subspaces: 1,
+        num_centroids: 2,
+        max_iterations: 5,
+      },
+      use_residuals: false,
+    };
+    let mut index = IvfPqIndex::new(2, config).expect("fixture config");
+    index
+      .add_training_vectors(&[10.0, 0.0, 0.0, 1.0], 2)
+      .expect("training vectors");
+    index.train().expect("cosine training");
+
+    let centroid = &index.ivf_centroids;
+    let centroid_norm = (centroid.iter().map(|value| value * value).sum::<f32>()).sqrt();
+    assert!((centroid_norm - 1.0).abs() < 1e-5);
+    assert!(index
+      .pq_centroids
+      .iter()
+      .flatten()
+      .all(|value| value.abs() <= 1.0 + 1e-5));
+  }
+
+  fn manual_multi_query_fixture() -> (IvfPqIndex, VectorManifest) {
+    let config = IvfPqConfig {
+      ivf: IvfConfig {
+        n_clusters: 2,
+        n_probe: 1,
+        metric: DistanceMetric::Euclidean,
+      },
+      pq: PqConfig {
+        num_subspaces: 1,
+        num_centroids: 2,
+        max_iterations: 1,
+      },
+      use_residuals: false,
+    };
+    let mut index = IvfPqIndex::new(2, config).expect("fixture config");
+    index.ivf_centroids = vec![0.0, 0.0, 100.0, 0.0];
+    index.pq_centroids = vec![vec![0.0, 0.0, 10.0, 0.0]];
+    index.inverted_lists.insert(0, vec![1, 2]);
+    index.inverted_lists.insert(1, vec![3, 4]);
+    index.pq_codes.insert(1, vec![0]);
+    index.pq_codes.insert(2, vec![0]);
+    index.pq_codes.insert(3, vec![1]);
+    index.pq_codes.insert(4, vec![1]);
+    index.trained = true;
+
+    let mut manifest = VectorManifest::new(VectorStoreConfig::new(2));
+    for vector_id in 1..=4 {
+      manifest.vector_to_node.insert(vector_id, vector_id);
+      manifest.node_to_vector.insert(vector_id, vector_id);
+    }
+    (index, manifest)
+  }
+
+  #[test]
+  fn test_ivf_pq_search_multi_honors_probe_and_filters_during_collection() {
+    let (index, manifest) = manual_multi_query_fixture();
+    let query = [0.0, 0.0];
+    let filtered = index.search_multi(
+      &manifest,
+      &[&query],
+      2,
+      MultiQueryAggregation::Min,
+      Some(IvfPqSearchOptions {
+        n_probe: Some(2),
+        filter: Some(Box::new(|node_id| node_id >= 3)),
+        threshold: None,
+      }),
+    );
+    assert_eq!(filtered.len(), 2);
+    assert!(filtered.iter().all(|result| result.node_id >= 3));
+
+    let not_probed = index.search_multi(
+      &manifest,
+      &[&query],
+      2,
+      MultiQueryAggregation::Min,
+      Some(IvfPqSearchOptions {
+        n_probe: None,
+        filter: Some(Box::new(|node_id| node_id >= 3)),
+        threshold: None,
+      }),
+    );
+    assert!(not_probed.is_empty());
+  }
+
+  #[test]
+  fn test_ivf_pq_failed_train_preserves_training_buffer() {
+    let config = IvfPqConfig {
+      ivf: IvfConfig {
+        n_clusters: 2,
+        n_probe: 1,
+        metric: DistanceMetric::Euclidean,
+      },
+      pq: PqConfig {
+        num_subspaces: 2,
+        num_centroids: 2,
+        max_iterations: 3,
+      },
+      use_residuals: false,
+    };
+    let mut index = IvfPqIndex::new(2, config).expect("fixture config");
+    index
+      .add_training_vectors(&[1.0, 0.0], 1)
+      .expect("first vector");
+
+    assert!(matches!(
+      index.train(),
+      Err(IvfPqError::NotEnoughTrainingVectors { .. })
+    ));
+    assert_eq!(index.training_count, 1);
+    assert_eq!(index.training_vectors.as_ref().expect("buffer").len(), 2);
+
+    index
+      .add_training_vectors(&[0.0, 1.0], 1)
+      .expect("second vector");
+    index.train().expect("retry training");
+    assert!(index.trained);
+  }
+
+  #[test]
+  fn test_ivf_pq_num_centroids_must_fit_uint8_codes() {
+    for invalid in [0, 257] {
+      let mut config = test_config();
+      config.pq.num_centroids = invalid;
+      let error = IvfPqIndex::new(16, config).expect_err("invalid centroid count");
+      assert!(error.to_string().contains("1..=256"));
+      assert!(error.to_string().contains(&invalid.to_string()));
+    }
+  }
+
+  #[test]
+  fn test_ivf_pq_missing_mapping_never_becomes_node_zero() {
+    let config = IvfPqConfig {
+      ivf: IvfConfig {
+        n_clusters: 1,
+        n_probe: 1,
+        metric: DistanceMetric::Euclidean,
+      },
+      pq: PqConfig {
+        num_subspaces: 1,
+        num_centroids: 1,
+        max_iterations: 1,
+      },
+      use_residuals: false,
+    };
+    let mut index = IvfPqIndex::new(2, config).expect("fixture config");
+    index.ivf_centroids = vec![0.0, 0.0];
+    index.pq_centroids = vec![vec![0.0, 0.0]];
+    index.inverted_lists.insert(0, vec![99]);
+    index.pq_codes.insert(99, vec![0]);
+    index.trained = true;
+
+    let manifest = VectorManifest::new(VectorStoreConfig::new(2));
+    let results = index.search(
+      &manifest,
+      &[0.0, 0.0],
+      1,
+      Some(IvfPqSearchOptions {
+        n_probe: None,
+        filter: Some(Box::new(|node_id| node_id == 0)),
+        threshold: None,
+      }),
+    );
+    assert!(results.is_empty());
+    assert!(results.iter().all(|result| result.node_id != 0));
   }
 
   #[test]
@@ -1853,7 +2606,6 @@ mod tests {
 
     assert!(index.trained);
     assert_eq!(index.ivf_centroids.len(), 4 * 16); // n_clusters * dimensions
-    assert!(index.centroid_distances.is_some());
   }
 
   #[test]
@@ -2136,12 +2888,49 @@ mod tests {
     );
     assert!(deserialized.trained);
     assert_eq!(deserialized.pq_codes.len(), 10);
-    assert!(deserialized.centroid_distances.is_some());
+    assert_eq!(serialized[31], IVFPQ_FORMAT_FLAG_NO_CENTROID_DISTANCES);
 
     // Check stats match
     let orig_stats = index.stats();
     let deser_stats = deserialized.stats();
     assert_eq!(orig_stats.total_vectors, deser_stats.total_vectors);
+  }
+
+  #[test]
+  fn test_ivf_pq_reads_legacy_centroid_distance_payload() {
+    let config = IvfPqConfig {
+      ivf: IvfConfig {
+        n_clusters: 1,
+        n_probe: 1,
+        metric: DistanceMetric::Euclidean,
+      },
+      pq: PqConfig {
+        num_subspaces: 1,
+        num_centroids: 1,
+        max_iterations: 1,
+      },
+      use_residuals: false,
+    };
+    let mut index = IvfPqIndex::new(2, config).expect("fixture config");
+    index.ivf_centroids = vec![0.0, 0.0];
+    index.inverted_lists.insert(0, vec![7]);
+    index.pq_codes.insert(7, vec![0]);
+    index.trained = true;
+
+    let current = serialize_ivf_pq(&index);
+    assert_eq!(current[31], IVFPQ_FORMAT_FLAG_NO_CENTROID_DISTANCES);
+
+    // Convert the current payload to the format written before the flag was
+    // introduced: clear the flag and append the obsolete legacy payload.
+    let mut legacy = current;
+    legacy[31] = 0;
+    legacy.push(1); // has_centroid_distances
+    legacy.extend_from_slice(&1u32.to_le_bytes());
+    legacy.extend_from_slice(&0.0f32.to_le_bytes());
+
+    let restored = deserialize_ivf_pq(&legacy).expect("legacy payload");
+    assert!(restored.trained);
+    assert_eq!(restored.pq_codes.len(), 1);
   }
 
   #[test]
@@ -2161,6 +2950,153 @@ mod tests {
       result,
       Err(SerializeError::BufferUnderflow { .. })
     ));
+  }
+
+  #[test]
+  #[allow(clippy::type_complexity)]
+  fn test_ivf_pq_corruption_matrix_returns_errors_without_panicking() {
+    let index = IvfPqIndex::new(16, test_config()).expect("index");
+    let valid = serialize_ivf_pq(&index);
+    let mutations: [(&str, Box<dyn Fn(&mut Vec<u8>)>); 4] = [
+      (
+        "zero PQ subspaces in header",
+        Box::new(|bytes| bytes[16..20].copy_from_slice(&0u32.to_le_bytes())),
+      ),
+      (
+        "too many PQ centroids for uint8 codes",
+        Box::new(|bytes| bytes[20..24].copy_from_slice(&257u32.to_le_bytes())),
+      ),
+      (
+        "zero IVF clusters",
+        Box::new(|bytes| bytes[8..12].copy_from_slice(&0u32.to_le_bytes())),
+      ),
+      (
+        "PQ subspace count mismatch",
+        Box::new(|bytes| bytes[56..60].copy_from_slice(&3u32.to_le_bytes())),
+      ),
+    ];
+
+    for (name, mutate) in mutations {
+      let mut corrupted = valid.clone();
+      mutate(&mut corrupted);
+      let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        deserialize_ivf_pq(&corrupted)
+      }));
+      assert!(result.is_ok(), "{name} panicked");
+      assert!(result.expect("panic checked").is_err(), "{name} accepted");
+    }
+
+    for (name, field_offset) in [
+      ("IVF centroid count", 48usize),
+      ("inverted list count", 52usize),
+      ("PQ subspace count", 56usize),
+      ("PQ centroid count", 60usize),
+    ] {
+      let mut corrupted = valid.clone();
+      corrupted[field_offset..field_offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+      let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        deserialize_ivf_pq(&corrupted)
+      }));
+      assert!(result.is_ok(), "{name} u32::MAX panicked");
+      assert!(
+        result.expect("panic checked").is_err(),
+        "{name} u32::MAX accepted"
+      );
+    }
+
+    for length in 0..valid.len() {
+      let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        deserialize_ivf_pq(&valid[..length])
+      }));
+      assert!(result.is_ok(), "truncation at {length} panicked");
+      assert!(
+        result.expect("panic checked").is_err(),
+        "truncation at {length} accepted"
+      );
+    }
+
+    let mut trailing = valid.clone();
+    trailing.push(0);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      deserialize_ivf_pq(&trailing)
+    }));
+    assert!(result.is_ok(), "trailing bytes panicked");
+    assert!(
+      result.expect("panic checked").is_err(),
+      "trailing bytes accepted"
+    );
+
+    let mut populated_config = test_config();
+    populated_config.ivf.n_clusters = 2;
+    populated_config.ivf.n_probe = 1;
+    populated_config.pq.num_subspaces = 2;
+    populated_config.pq.num_centroids = 2;
+    let mut populated = IvfPqIndex::new(4, populated_config).expect("index");
+    populated.ivf_centroids = vec![1.0; 8];
+    populated.inverted_lists.insert(0, vec![10]);
+    populated.inverted_lists.insert(1, vec![20]);
+    populated.pq_codes.insert(10, vec![0, 1]);
+    populated.pq_codes.insert(20, vec![1, 0]);
+    populated.trained = true;
+    let valid = serialize_ivf_pq(&populated);
+    let lists_offset = IVFPQ_HEADER_SIZE + 4 + populated.ivf_centroids.len() * 4 + 4;
+
+    let mut duplicate_cluster = valid.clone();
+    let first_cluster = u32::from_le_bytes(
+      valid[lists_offset..lists_offset + 4]
+        .try_into()
+        .expect("cluster"),
+    );
+    duplicate_cluster[lists_offset + 16..lists_offset + 20]
+      .copy_from_slice(&first_cluster.to_le_bytes());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      deserialize_ivf_pq(&duplicate_cluster)
+    }));
+    assert!(result.is_ok(), "duplicate cluster panicked");
+    assert!(
+      result.expect("panic checked").is_err(),
+      "duplicate cluster accepted"
+    );
+
+    let mut duplicate_id = valid.clone();
+    let first_id = u64::from_le_bytes(
+      valid[lists_offset + 8..lists_offset + 16]
+        .try_into()
+        .expect("id"),
+    );
+    duplicate_id[lists_offset + 24..lists_offset + 32].copy_from_slice(&first_id.to_le_bytes());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      deserialize_ivf_pq(&duplicate_id)
+    }));
+    assert!(result.is_ok(), "duplicate vector ID panicked");
+    assert!(
+      result.expect("panic checked").is_err(),
+      "duplicate vector ID accepted"
+    );
+
+    let mut code_length_mismatch = valid.clone();
+    let pq_codes_offset = lists_offset + 2 * 16 + 4 + 2 * (4 + 4 * 4);
+    code_length_mismatch[pq_codes_offset + 4 + 8..pq_codes_offset + 4 + 12]
+      .copy_from_slice(&0u32.to_le_bytes());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      deserialize_ivf_pq(&code_length_mismatch)
+    }));
+    assert!(result.is_ok(), "code length mismatch panicked");
+    assert!(
+      result.expect("panic checked").is_err(),
+      "code length mismatch accepted"
+    );
+
+    let mut list_code_mismatch = valid.clone();
+    list_code_mismatch[lists_offset + 8..lists_offset + 16].copy_from_slice(&99u64.to_le_bytes());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      deserialize_ivf_pq(&list_code_mismatch)
+    }));
+    assert!(result.is_ok(), "list/code mismatch panicked");
+    assert!(
+      result.expect("panic checked").is_err(),
+      "list/code mismatch accepted"
+    );
   }
 
   #[test]

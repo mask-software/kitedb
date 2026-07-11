@@ -33,6 +33,8 @@ pub mod traversal;
 #[cfg(feature = "python")]
 pub mod types;
 #[cfg(feature = "python")]
+pub(crate) mod validation;
+#[cfg(feature = "python")]
 pub mod vector;
 
 #[cfg(feature = "python")]

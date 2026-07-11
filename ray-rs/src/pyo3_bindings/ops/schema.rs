@@ -1,23 +1,26 @@
 //! Schema operations for Python bindings
 
+use pyo3::exceptions::PyRuntimeError;
+use pyo3::prelude::*;
+
 use crate::core::single_file::SingleFileDB as RustSingleFileDB;
 
 /// Trait for schema operations
 pub trait SchemaOps {
   /// Get or create a label ID
-  fn ensure_label_impl(&self, name: &str) -> u32;
+  fn ensure_label_impl(&self, name: &str) -> PyResult<u32>;
   /// Get label ID by name
   fn label_id_impl(&self, name: &str) -> Option<u32>;
   /// Get label name by ID
   fn label_name_impl(&self, id: u32) -> Option<String>;
   /// Get or create an edge type ID
-  fn ensure_etype_impl(&self, name: &str) -> u32;
+  fn ensure_etype_impl(&self, name: &str) -> PyResult<u32>;
   /// Get edge type ID by name
   fn etype_id_impl(&self, name: &str) -> Option<u32>;
   /// Get edge type name by ID
   fn etype_name_impl(&self, id: u32) -> Option<String>;
   /// Get or create a property key ID
-  fn ensure_propkey_impl(&self, name: &str) -> u32;
+  fn ensure_propkey_impl(&self, name: &str) -> PyResult<u32>;
   /// Get property key ID by name
   fn propkey_id_impl(&self, name: &str) -> Option<u32>;
   /// Get property key name by ID
@@ -28,8 +31,9 @@ pub trait SchemaOps {
 // Single-file database operations
 // ============================================================================
 
-pub fn ensure_label_single(db: &RustSingleFileDB, name: &str) -> u32 {
-  db.label_id_or_create(name)
+pub fn ensure_label_single(db: &RustSingleFileDB, name: &str) -> PyResult<u32> {
+  db.ensure_label(name)
+    .map_err(|e| PyRuntimeError::new_err(format!("Failed to ensure label: {e}")))
 }
 
 pub fn label_id_single(db: &RustSingleFileDB, name: &str) -> Option<u32> {
@@ -40,8 +44,9 @@ pub fn label_name_single(db: &RustSingleFileDB, id: u32) -> Option<String> {
   db.label_name(id)
 }
 
-pub fn ensure_etype_single(db: &RustSingleFileDB, name: &str) -> u32 {
-  db.etype_id_or_create(name)
+pub fn ensure_etype_single(db: &RustSingleFileDB, name: &str) -> PyResult<u32> {
+  db.ensure_etype(name)
+    .map_err(|e| PyRuntimeError::new_err(format!("Failed to ensure edge type: {e}")))
 }
 
 pub fn etype_id_single(db: &RustSingleFileDB, name: &str) -> Option<u32> {
@@ -52,8 +57,9 @@ pub fn etype_name_single(db: &RustSingleFileDB, id: u32) -> Option<String> {
   db.etype_name(id)
 }
 
-pub fn ensure_propkey_single(db: &RustSingleFileDB, name: &str) -> u32 {
-  db.propkey_id_or_create(name)
+pub fn ensure_propkey_single(db: &RustSingleFileDB, name: &str) -> PyResult<u32> {
+  db.ensure_propkey(name)
+    .map_err(|e| PyRuntimeError::new_err(format!("Failed to ensure property key: {e}")))
 }
 
 pub fn propkey_id_single(db: &RustSingleFileDB, name: &str) -> Option<u32> {

@@ -1,11 +1,12 @@
 //! Single-file database format (.kitedb)
 //!
 //! Provides open/close/read/write operations for single-file databases.
-//! Layout: [Header (1 page)] [WAL (N pages)] [Snapshot (M pages)]
+//! Layout: [Header A] [Header B] [WAL (N pages)] [append-only snapshots]
 //!
 //! Ported from src/ray/graph-db/single-file.ts
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::thread::ThreadId;
@@ -15,9 +16,11 @@ use parking_lot::{Condvar, Mutex, RwLock};
 use self::vector::VectorStoreLazyEntry;
 use crate::cache::manager::CacheManager;
 use crate::constants::*;
+use crate::core::header::{other_header_slot, write_header_slot};
 use crate::core::pager::FilePager;
 use crate::core::snapshot::reader::SnapshotData;
 use crate::core::wal::buffer::WalBuffer;
+use crate::error::Result;
 use crate::mvcc::visibility::{edge_exists as mvcc_edge_exists, node_exists as mvcc_node_exists};
 use crate::mvcc::MvccManager;
 use crate::types::*;
@@ -57,6 +60,88 @@ pub use recovery::replay_wal_record;
 // Transaction State (for single-file DB)
 // ============================================================================
 
+/// Schema entries staged by one thread-affine transaction.
+///
+/// The forward and reverse maps stay in transaction state until commit. A
+/// transaction can therefore use a freshly allocated ID immediately while
+/// other transactions continue to see only committed schema.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SchemaStaging {
+  pub(crate) label_names: HashMap<String, LabelId>,
+  pub(crate) label_ids: HashMap<LabelId, String>,
+  pub(crate) etype_names: HashMap<String, ETypeId>,
+  pub(crate) etype_ids: HashMap<ETypeId, String>,
+  pub(crate) propkey_names: HashMap<String, PropKeyId>,
+  pub(crate) propkey_ids: HashMap<PropKeyId, String>,
+}
+
+impl SchemaStaging {
+  pub(crate) fn label_id(&self, name: &str) -> Option<LabelId> {
+    self.label_names.get(name).copied()
+  }
+
+  pub(crate) fn label_name(&self, id: LabelId) -> Option<String> {
+    self.label_ids.get(&id).cloned()
+  }
+
+  pub(crate) fn etype_id(&self, name: &str) -> Option<ETypeId> {
+    self.etype_names.get(name).copied()
+  }
+
+  pub(crate) fn etype_name(&self, id: ETypeId) -> Option<String> {
+    self.etype_ids.get(&id).cloned()
+  }
+
+  pub(crate) fn propkey_id(&self, name: &str) -> Option<PropKeyId> {
+    self.propkey_names.get(name).copied()
+  }
+
+  pub(crate) fn propkey_name(&self, id: PropKeyId) -> Option<String> {
+    self.propkey_ids.get(&id).cloned()
+  }
+
+  pub(crate) fn define_label(&mut self, id: LabelId, name: &str) {
+    self.label_names.insert(name.to_string(), id);
+    self.label_ids.insert(id, name.to_string());
+  }
+
+  pub(crate) fn define_etype(&mut self, id: ETypeId, name: &str) {
+    self.etype_names.insert(name.to_string(), id);
+    self.etype_ids.insert(id, name.to_string());
+  }
+
+  pub(crate) fn define_propkey(&mut self, id: PropKeyId, name: &str) {
+    self.propkey_names.insert(name.to_string(), id);
+    self.propkey_ids.insert(id, name.to_string());
+  }
+}
+
+#[derive(Debug)]
+struct SchemaReservation<Id> {
+  id: Id,
+  owners: HashSet<TxId>,
+}
+
+impl<Id> SchemaReservation<Id> {
+  fn new(id: Id, txid: TxId) -> Self {
+    let mut owners = HashSet::new();
+    owners.insert(txid);
+    Self { id, owners }
+  }
+}
+
+/// In-process schema-name claims. A claim is made before a define WAL record
+/// is emitted, so concurrent transactions defining one name share one ID.
+/// The claim is memory-only: commit publishes the mapping and removes it;
+/// rollback removes only that transaction's ownership. A process crash drops
+/// all claims, and only committed WAL records recreate schema on reopen.
+#[derive(Debug, Default)]
+pub(crate) struct SchemaReservations {
+  labels: HashMap<String, SchemaReservation<LabelId>>,
+  etypes: HashMap<String, SchemaReservation<ETypeId>>,
+  propkeys: HashMap<String, SchemaReservation<PropKeyId>>,
+}
+
 /// Transaction state for SingleFileDB
 ///
 /// This is scoped to SingleFileDB and only tracks what single-file
@@ -67,6 +152,7 @@ pub struct SingleFileTxState {
   pub read_only: bool,
   pub snapshot_ts: u64,
   pub pending: DeltaState,
+  pub(crate) schema: SchemaStaging,
   pub bulk_load: bool,
   pub pending_wal: Vec<u8>,
 }
@@ -78,6 +164,7 @@ impl SingleFileTxState {
       read_only,
       snapshot_ts,
       pending: DeltaState::new(),
+      schema: SchemaStaging::default(),
       bulk_load,
       pending_wal: Vec::new(),
     }
@@ -98,6 +185,8 @@ pub struct SingleFileDB {
   pub(crate) pager: Mutex<FilePager>,
   /// Database header
   pub(crate) header: RwLock<DbHeaderV1>,
+  /// Physical header slot containing the newest installed header.
+  pub(crate) header_slot: AtomicU32,
   /// WAL buffer manager
   pub(crate) wal_buffer: Mutex<WalBuffer>,
   /// Memory-mapped snapshot data (if exists)
@@ -116,6 +205,14 @@ pub struct SingleFileDB {
   pub(crate) current_tx: Mutex<HashMap<ThreadId, std::sync::Arc<Mutex<SingleFileTxState>>>>,
   /// Active write transactions (excludes read-only)
   pub(crate) active_writers: AtomicUsize,
+  /// All transactions that have begun and have not finished commit/rollback.
+  pub(crate) active_transactions: AtomicUsize,
+
+  /// Read permits cover transaction creation; the blocking checkpoint takes
+  /// the write side for its complete snapshot/header critical section.
+  pub(crate) checkpoint_gate: RwLock<()>,
+  pub(crate) checkpoint_wait: Mutex<()>,
+  pub(crate) checkpoint_cv: Condvar,
 
   /// Serialize commit operations to preserve WAL/delta ordering
   pub(crate) commit_lock: Mutex<()>,
@@ -139,6 +236,8 @@ pub struct SingleFileDB {
   pub(crate) propkey_names: RwLock<HashMap<String, PropKeyId>>,
   /// ID -> property key name mapping
   pub(crate) propkey_ids: RwLock<HashMap<PropKeyId, String>>,
+  /// Pending name claims; never persisted in a snapshot or WAL.
+  pub(crate) schema_reservations: Mutex<SchemaReservations>,
 
   /// Enable auto-checkpoint when WAL usage exceeds threshold
   pub(crate) auto_checkpoint: bool,
@@ -205,6 +304,44 @@ pub(crate) struct GroupCommitState {
 // ============================================================================
 
 impl SingleFileDB {
+  /// Install a header in the inactive slot, then optionally make that slot
+  /// durable. The old slot remains untouched until this method succeeds.
+  pub(crate) fn persist_header(
+    &self,
+    pager: &mut FilePager,
+    header: &mut DbHeaderV1,
+    sync: bool,
+  ) -> Result<()> {
+    let current_slot = self.header_slot.load(Ordering::Acquire);
+    let next_slot = other_header_slot(current_slot);
+    header.change_counter = header
+      .change_counter
+      .checked_add(1)
+      .ok_or_else(|| crate::error::KiteError::Internal("header generation overflow".to_string()))?;
+
+    write_header_slot(pager, header, next_slot)?;
+    if sync {
+      pager.sync()?;
+    }
+    self.header_slot.store(next_slot, Ordering::Release);
+    Ok(())
+  }
+
+  pub(crate) fn wait_for_no_active_transactions(&self) {
+    let mut wait = self.checkpoint_wait.lock();
+    while self.active_transactions.load(Ordering::Acquire) != 0 {
+      self.checkpoint_cv.wait(&mut wait);
+    }
+  }
+
+  pub(crate) fn transaction_finished(&self) {
+    let previous = self.active_transactions.fetch_sub(1, Ordering::AcqRel);
+    debug_assert!(previous > 0, "active transaction count underflow");
+    if previous == 1 {
+      self.checkpoint_cv.notify_all();
+    }
+  }
+
   /// Database file path
   pub fn path(&self) -> &Path {
     &self.path
@@ -234,6 +371,146 @@ impl SingleFileDB {
         .is_ok()
       {
         break;
+      }
+    }
+  }
+
+  /// Claim a label name for a transaction, sharing an existing in-flight ID.
+  pub(crate) fn claim_label_reservation(&self, name: &str, txid: TxId) -> LabelId {
+    let mut reservations = self.schema_reservations.lock();
+    if let Some(id) = self.label_names.read().get(name).copied() {
+      reservations.labels.remove(name);
+      return id;
+    }
+    if let Some(reservation) = reservations.labels.get_mut(name) {
+      reservation.owners.insert(txid);
+      return reservation.id;
+    }
+
+    let id = self.alloc_unclaimed_label_id();
+    reservations
+      .labels
+      .insert(name.to_string(), SchemaReservation::new(id, txid));
+    id
+  }
+
+  /// Claim an edge type name for a transaction, sharing an existing in-flight ID.
+  pub(crate) fn claim_etype_reservation(&self, name: &str, txid: TxId) -> ETypeId {
+    let mut reservations = self.schema_reservations.lock();
+    if let Some(id) = self.etype_names.read().get(name).copied() {
+      reservations.etypes.remove(name);
+      return id;
+    }
+    if let Some(reservation) = reservations.etypes.get_mut(name) {
+      reservation.owners.insert(txid);
+      return reservation.id;
+    }
+
+    let id = self.alloc_unclaimed_etype_id();
+    reservations
+      .etypes
+      .insert(name.to_string(), SchemaReservation::new(id, txid));
+    id
+  }
+
+  /// Claim a property key name for a transaction, sharing an existing in-flight ID.
+  pub(crate) fn claim_propkey_reservation(&self, name: &str, txid: TxId) -> PropKeyId {
+    let mut reservations = self.schema_reservations.lock();
+    if let Some(id) = self.propkey_names.read().get(name).copied() {
+      reservations.propkeys.remove(name);
+      return id;
+    }
+    if let Some(reservation) = reservations.propkeys.get_mut(name) {
+      reservation.owners.insert(txid);
+      return reservation.id;
+    }
+
+    let id = self.alloc_unclaimed_propkey_id();
+    reservations
+      .propkeys
+      .insert(name.to_string(), SchemaReservation::new(id, txid));
+    id
+  }
+
+  pub(crate) fn release_label_reservation(&self, name: &str, txid: TxId) {
+    release_schema_reservation(&mut self.schema_reservations.lock().labels, name, txid);
+  }
+
+  pub(crate) fn release_etype_reservation(&self, name: &str, txid: TxId) {
+    release_schema_reservation(&mut self.schema_reservations.lock().etypes, name, txid);
+  }
+
+  pub(crate) fn release_propkey_reservation(&self, name: &str, txid: TxId) {
+    release_schema_reservation(&mut self.schema_reservations.lock().propkeys, name, txid);
+  }
+
+  /// Release every claim owned by a transaction that did not commit.
+  pub(crate) fn release_schema_reservations(&self, txid: TxId) {
+    let mut reservations = self.schema_reservations.lock();
+    release_schema_reservation_owner(&mut reservations.labels, txid);
+    release_schema_reservation_owner(&mut reservations.etypes, txid);
+    release_schema_reservation_owner(&mut reservations.propkeys, txid);
+  }
+
+  /// Publish staged schema after the transaction's durable commit and data
+  /// delta merge. The caller holds `commit_lock`, which gives schema and data
+  /// one serialized commit order.
+  pub(crate) fn publish_staged_schema(&self, staged: &SchemaStaging) -> Result<()> {
+    let mut reservations = self.schema_reservations.lock();
+    let mut label_names = self.label_names.write();
+    let mut label_ids = self.label_ids.write();
+    let mut etype_names = self.etype_names.write();
+    let mut etype_ids = self.etype_ids.write();
+    let mut propkey_names = self.propkey_names.write();
+    let mut propkey_ids = self.propkey_ids.write();
+
+    publish_schema_entries(
+      &mut reservations.labels,
+      &mut label_names,
+      &mut label_ids,
+      &staged.label_names,
+      "label",
+    )?;
+    publish_schema_entries(
+      &mut reservations.etypes,
+      &mut etype_names,
+      &mut etype_ids,
+      &staged.etype_names,
+      "edge type",
+    )?;
+    publish_schema_entries(
+      &mut reservations.propkeys,
+      &mut propkey_names,
+      &mut propkey_ids,
+      &staged.propkey_names,
+      "property key",
+    )?;
+    Ok(())
+  }
+
+  fn alloc_unclaimed_label_id(&self) -> LabelId {
+    loop {
+      let id = self.alloc_label_id();
+      if !self.label_ids.read().contains_key(&id) {
+        return id;
+      }
+    }
+  }
+
+  fn alloc_unclaimed_etype_id(&self) -> ETypeId {
+    loop {
+      let id = self.alloc_etype_id();
+      if !self.etype_ids.read().contains_key(&id) {
+        return id;
+      }
+    }
+  }
+
+  fn alloc_unclaimed_propkey_id(&self) -> PropKeyId {
+    loop {
+      let id = self.alloc_propkey_id();
+      if !self.propkey_ids.read().contains_key(&id) {
+        return id;
       }
     }
   }
@@ -453,6 +730,89 @@ impl SingleFileDB {
       cache.reset_stats();
     }
   }
+}
+
+fn release_schema_reservation<Id>(
+  reservations: &mut HashMap<String, SchemaReservation<Id>>,
+  name: &str,
+  txid: TxId,
+) {
+  let remove = reservations
+    .get_mut(name)
+    .map(|reservation| {
+      reservation.owners.remove(&txid);
+      reservation.owners.is_empty()
+    })
+    .unwrap_or(false);
+  if remove {
+    reservations.remove(name);
+  }
+}
+
+fn release_schema_reservation_owner<Id>(
+  reservations: &mut HashMap<String, SchemaReservation<Id>>,
+  txid: TxId,
+) {
+  reservations.retain(|_, reservation| {
+    reservation.owners.remove(&txid);
+    !reservation.owners.is_empty()
+  });
+}
+
+fn publish_schema_entries<Id>(
+  reservations: &mut HashMap<String, SchemaReservation<Id>>,
+  global_names: &mut HashMap<String, Id>,
+  global_ids: &mut HashMap<Id, String>,
+  staged: &HashMap<String, Id>,
+  kind: &str,
+) -> Result<()>
+where
+  Id: Copy + Eq + Hash,
+{
+  // Validate the whole batch before mutating either global map. The normal
+  // path has one allocator-owned ID per name; these checks make a corrupted
+  // reservation or an allocator regression fail closed instead of replacing
+  // an existing mapping.
+  let mut staged_ids = HashMap::with_capacity(staged.len());
+  for (name, &id) in staged {
+    if let Some(reservation) = reservations.get(name) {
+      if reservation.id != id {
+        return Err(crate::error::KiteError::Internal(format!(
+          "{kind} reservation ID changed before commit"
+        )));
+      }
+    }
+    if let Some(existing) = global_names.get(name) {
+      if *existing != id {
+        return Err(crate::error::KiteError::Internal(format!(
+          "{kind} name maps to two IDs during commit"
+        )));
+      }
+    }
+    if let Some(existing) = global_ids.get(&id) {
+      if existing != name {
+        return Err(crate::error::KiteError::Internal(format!(
+          "{kind} ID maps to two names during commit"
+        )));
+      }
+    }
+    if let Some(existing) = staged_ids.insert(id, name) {
+      if existing != name {
+        return Err(crate::error::KiteError::Internal(format!(
+          "{kind} transaction stages one ID for two names"
+        )));
+      }
+    }
+  }
+
+  for (name, &id) in staged {
+    global_names.entry(name.clone()).or_insert(id);
+    global_ids.entry(id).or_insert_with(|| name.clone());
+    // Once the mapping is committed, all transactions that shared this claim
+    // can use the committed entry; no pending reservation must survive it.
+    reservations.remove(name);
+  }
+  Ok(())
 }
 
 // ============================================================================

@@ -73,7 +73,7 @@ pub fn import_from_object_single(
   data: &ray_export::ExportedDatabase,
   options: ImportOptions,
 ) -> PyResult<ImportResult> {
-  let opts = options.to_rust();
+  let opts = options.to_rust()?;
   let result = ray_export::import_from_object_single(db, data, opts)
     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
@@ -89,7 +89,7 @@ pub fn import_from_json_single(
   path: String,
   options: ImportOptions,
 ) -> PyResult<ImportResult> {
-  let opts = options.to_rust();
+  let opts = options.to_rust()?;
   let parsed =
     ray_export::import_from_json(path).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 

@@ -36,6 +36,10 @@ impl ReplicationFrame {
   }
 }
 
+/// Frames matched by a filtered read, the offset scanning stopped at, and the
+/// (epoch, log_index) of the last frame seen (matched or not), if any.
+pub type FilteredFrameRead = (Vec<ReplicationFrame>, u64, Option<(u64, u64)>);
+
 #[derive(Debug)]
 pub struct SegmentLogStore {
   path: PathBuf,
@@ -159,13 +163,12 @@ impl SegmentLogStore {
 
     if payload_len > MAX_FRAME_PAYLOAD_BYTES {
       return Err(KiteError::InvalidReplication(format!(
-        "frame payload too large: {} bytes",
-        payload_len
+        "frame payload too large: {payload_len} bytes"
       )));
     }
 
     let payload_len_u32 = u32::try_from(payload_len).map_err(|_| {
-      KiteError::InvalidReplication(format!("payload length does not fit u32: {}", payload_len))
+      KiteError::InvalidReplication(format!("payload length does not fit u32: {payload_len}"))
     })?;
 
     let flags = if with_crc {
@@ -226,13 +229,12 @@ impl SegmentLogStore {
 
     if payload_len > MAX_FRAME_PAYLOAD_BYTES {
       return Err(KiteError::InvalidReplication(format!(
-        "frame payload too large: {} bytes",
-        payload_len
+        "frame payload too large: {payload_len} bytes"
       )));
     }
 
     let payload_len_u32 = u32::try_from(payload_len).map_err(|_| {
-      KiteError::InvalidReplication(format!("payload length does not fit u32: {}", payload_len))
+      KiteError::InvalidReplication(format!("payload length does not fit u32: {payload_len}"))
     })?;
 
     let flags = if with_crc {
@@ -357,7 +359,7 @@ impl SegmentLogStore {
     start_offset: u64,
     mut include: impl FnMut(&ReplicationFrame) -> bool,
     max_frames: usize,
-  ) -> Result<(Vec<ReplicationFrame>, u64, Option<(u64, u64)>)> {
+  ) -> Result<FilteredFrameRead> {
     let mut file = OpenOptions::new().read(true).open(&self.path)?;
     let file_len = file.metadata()?.len();
     let clamped_start = start_offset.min(file_len);

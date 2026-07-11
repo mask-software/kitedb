@@ -16,6 +16,8 @@
 
 use crate::vector::types::PqConfig;
 
+const MAX_CODEBOOK_SIZE: usize = u8::MAX as usize + 1;
+
 // ============================================================================
 // PQ Index
 // ============================================================================
@@ -42,18 +44,15 @@ pub struct PqIndex {
 impl PqIndex {
   /// Create a new PQ index
   pub fn new(dimensions: usize, config: PqConfig) -> Result<Self, PqError> {
-    if dimensions % config.num_subspaces != 0 {
-      return Err(PqError::DimensionNotDivisible {
-        dimensions,
-        num_subspaces: config.num_subspaces,
-      });
-    }
-
-    let subspace_dims = dimensions / config.num_subspaces;
+    let subspace_dims = validate_pq_config(dimensions, &config)?;
+    let centroid_len = config
+      .num_centroids
+      .checked_mul(subspace_dims)
+      .ok_or_else(|| PqError::SizeOverflow("PQ centroid allocation".into()))?;
 
     // Initialize empty centroids for each subspace
     let centroids: Vec<Vec<f32>> = (0..config.num_subspaces)
-      .map(|_| vec![0.0; config.num_centroids * subspace_dims])
+      .map(|_| vec![0.0; centroid_len])
       .collect();
 
     Ok(Self {
@@ -78,7 +77,13 @@ impl PqIndex {
       return Err(PqError::AlreadyTrained);
     }
 
-    let expected_len = num_vectors * self.dimensions;
+    validate_pq_config(self.dimensions, &self.config)?;
+    let expected_len = num_vectors
+      .checked_mul(self.dimensions)
+      .ok_or_else(|| PqError::SizeOverflow("PQ training input".into()))?;
+    let subvector_capacity = num_vectors
+      .checked_mul(self.subspace_dims)
+      .ok_or_else(|| PqError::SizeOverflow("PQ subvector allocation".into()))?;
     if vectors.len() < expected_len {
       return Err(PqError::DimensionMismatch {
         expected: expected_len,
@@ -96,7 +101,7 @@ impl PqIndex {
     // Train each subspace independently
     for m in 0..self.config.num_subspaces {
       // Extract subvectors for this subspace
-      let mut subvectors = Vec::with_capacity(num_vectors * self.subspace_dims);
+      let mut subvectors = Vec::with_capacity(subvector_capacity);
       let sub_offset = m * self.subspace_dims;
 
       for i in 0..num_vectors {
@@ -112,7 +117,7 @@ impl PqIndex {
         self.subspace_dims,
         self.config.num_centroids,
         self.config.max_iterations,
-      );
+      )?;
     }
 
     self.trained = true;
@@ -125,7 +130,13 @@ impl PqIndex {
       return Err(PqError::NotTrained);
     }
 
-    let expected_len = num_vectors * self.dimensions;
+    validate_pq_config(self.dimensions, &self.config)?;
+    let expected_len = num_vectors
+      .checked_mul(self.dimensions)
+      .ok_or_else(|| PqError::SizeOverflow("PQ encoding input".into()))?;
+    let code_len = num_vectors
+      .checked_mul(self.config.num_subspaces)
+      .ok_or_else(|| PqError::SizeOverflow("PQ code allocation".into()))?;
     if vectors.len() < expected_len {
       return Err(PqError::DimensionMismatch {
         expected: expected_len,
@@ -134,7 +145,7 @@ impl PqIndex {
     }
 
     // Allocate codes array
-    let mut codes = vec![0u8; num_vectors * self.config.num_subspaces];
+    let mut codes = vec![0u8; code_len];
 
     // Encode each vector
     for i in 0..num_vectors {
@@ -170,6 +181,7 @@ impl PqIndex {
       return Err(PqError::NotTrained);
     }
 
+    validate_pq_config(self.dimensions, &self.config)?;
     if vector.len() != self.dimensions {
       return Err(PqError::DimensionMismatch {
         expected: self.dimensions,
@@ -203,6 +215,7 @@ impl PqIndex {
       return Err(PqError::NotTrained);
     }
 
+    validate_pq_config(self.dimensions, &self.config)?;
     if query.len() != self.dimensions {
       return Err(PqError::DimensionMismatch {
         expected: self.dimensions,
@@ -210,7 +223,12 @@ impl PqIndex {
       });
     }
 
-    let mut table = vec![0.0; self.config.num_subspaces * self.config.num_centroids];
+    let table_len = self
+      .config
+      .num_subspaces
+      .checked_mul(self.config.num_centroids)
+      .ok_or_else(|| PqError::SizeOverflow("PQ distance table allocation".into()))?;
+    let mut table = vec![0.0; table_len];
 
     for m in 0..self.config.num_subspaces {
       let sub_offset = m * self.subspace_dims;
@@ -369,7 +387,11 @@ fn train_subspace(
   subspace_dims: usize,
   num_centroids: usize,
   max_iterations: usize,
-) {
+) -> Result<(), PqError> {
+  let cluster_sum_len = num_centroids
+    .checked_mul(subspace_dims)
+    .ok_or_else(|| PqError::SizeOverflow("PQ cluster sum allocation".into()))?;
+
   // Initialize centroids with k-means++
   initialize_centroids_kmeans_pp(
     centroids,
@@ -380,7 +402,7 @@ fn train_subspace(
   );
 
   let mut assignments = vec![0u16; num_vectors];
-  let mut cluster_sums = vec![0.0f32; num_centroids * subspace_dims];
+  let mut cluster_sums = vec![0.0f32; cluster_sum_len];
   let mut cluster_counts = vec![0u32; num_centroids];
 
   for _ in 0..max_iterations {
@@ -431,6 +453,8 @@ fn train_subspace(
       }
     }
   }
+
+  Ok(())
 }
 
 /// K-means++ initialization
@@ -560,6 +584,8 @@ pub enum PqError {
     n: usize,
     k: usize,
   },
+  InvalidConfiguration(String),
+  SizeOverflow(String),
 }
 
 impl std::fmt::Display for PqError {
@@ -580,11 +606,50 @@ impl std::fmt::Display for PqError {
       PqError::NotEnoughTrainingVectors { n, k } => {
         write!(f, "Need at least {k} training vectors, got {n}")
       }
+      PqError::InvalidConfiguration(msg) => write!(f, "Invalid PQ configuration: {msg}"),
+      PqError::SizeOverflow(context) => write!(f, "PQ size overflow: {context}"),
     }
   }
 }
 
 impl std::error::Error for PqError {}
+
+fn validate_pq_config(dimensions: usize, config: &PqConfig) -> Result<usize, PqError> {
+  if dimensions == 0 {
+    return Err(PqError::InvalidConfiguration(
+      "dimensions must be nonzero".into(),
+    ));
+  }
+  if config.num_subspaces == 0 {
+    return Err(PqError::InvalidConfiguration(
+      "num_subspaces must be nonzero".into(),
+    ));
+  }
+  if config.num_centroids == 0 {
+    return Err(PqError::InvalidConfiguration(
+      "num_centroids must be nonzero".into(),
+    ));
+  }
+  if config.num_centroids > MAX_CODEBOOK_SIZE {
+    return Err(PqError::InvalidConfiguration(format!(
+      "num_centroids {} exceeds uint8 code range {}",
+      config.num_centroids, MAX_CODEBOOK_SIZE
+    )));
+  }
+  if config.max_iterations == 0 {
+    return Err(PqError::InvalidConfiguration(
+      "max_iterations must be nonzero".into(),
+    ));
+  }
+  if dimensions % config.num_subspaces != 0 {
+    return Err(PqError::DimensionNotDivisible {
+      dimensions,
+      num_subspaces: config.num_subspaces,
+    });
+  }
+
+  Ok(dimensions / config.num_subspaces)
+}
 
 // ============================================================================
 // Tests
@@ -643,6 +708,29 @@ mod tests {
       result,
       Err(PqError::NotEnoughTrainingVectors { .. })
     ));
+  }
+
+  #[test]
+  fn test_pq_rejects_zero_and_out_of_range_configuration() {
+    let result = PqIndex::new(
+      16,
+      PqConfig {
+        num_subspaces: 0,
+        num_centroids: 8,
+        max_iterations: 10,
+      },
+    );
+    assert!(result.is_err());
+
+    let result = PqIndex::new(
+      16,
+      PqConfig {
+        num_subspaces: 4,
+        num_centroids: 257,
+        max_iterations: 10,
+      },
+    );
+    assert!(result.is_err());
   }
 
   #[test]

@@ -3,7 +3,7 @@
 //! Provides Python access to the single-file database format.
 //! This module contains the main Database class and standalone functions.
 
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use std::path::PathBuf;
@@ -36,6 +36,7 @@ use super::traversal::{PyPathEdge, PyPathResult, PyTraversalResult};
 use super::types::{
   Edge, EdgePage, EdgeWithProps, FullEdge, NodePage, NodeProp, NodeWithProps, PropValue,
 };
+use super::validation;
 
 type EdgePropsInput = (i64, u32, i64, Vec<(u32, PropValue)>);
 
@@ -173,9 +174,7 @@ impl PyDatabase {
       ));
     };
 
-    let opts = options
-      .to_single_file_options()
-      .map_err(|e| PyRuntimeError::new_err(format!("Failed to parse options: {e}")))?;
+    let opts = options.to_single_file_options()?;
     let db = open_single_file(&db_path, opts)
       .map_err(|e| PyRuntimeError::new_err(format!("Failed to open database: {e}")))?;
     Ok(PyDatabase {
@@ -205,6 +204,7 @@ impl PyDatabase {
 
   #[pyo3(signature = (threshold))]
   fn close_with_checkpoint_if_wal_over(&self, threshold: f64) -> PyResult<()> {
+    let threshold = validation::ratio("threshold", threshold)?;
     let mut guard = self
       .inner
       .write()
@@ -311,15 +311,14 @@ impl PyDatabase {
 
   /// Wait until this DB has observed at least the provided commit token.
   fn wait_for_token(&self, token: String, timeout_ms: i64) -> PyResult<bool> {
-    if timeout_ms < 0 {
-      return Err(PyRuntimeError::new_err("timeout_ms must be non-negative"));
-    }
+    let timeout_ms =
+      validation::non_negative_u64("timeout_ms", timeout_ms, validation::MAX_DURATION_MS as u64)?;
     let token = CommitToken::from_str(&token)
       .map_err(|e| PyRuntimeError::new_err(format!("Invalid token: {e}")))?;
     dispatch!(
       self,
       |db| db
-        .wait_for_token(token, timeout_ms as u64)
+        .wait_for_token(token, timeout_ms)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed waiting for token: {e}"))),
       |_db| { unreachable!("multi-file database support removed") }
     )
@@ -350,6 +349,8 @@ impl PyDatabase {
           "last_token",
           status.last_token.map(|token| token.to_string()),
         )?;
+        out.set_item("last_replication_error", status.last_replication_error)?;
+        out.set_item("sidecar_needs_repair", status.sidecar_needs_repair)?;
         out.set_item("append_attempts", status.append_attempts)?;
         out.set_item("append_failures", status.append_failures)?;
         out.set_item("append_successes", status.append_successes)?;
@@ -425,15 +426,13 @@ impl PyDatabase {
     epoch: i64,
     applied_log_index: i64,
   ) -> PyResult<()> {
-    if epoch < 0 || applied_log_index < 0 {
-      return Err(PyRuntimeError::new_err(
-        "epoch and applied_log_index must be non-negative",
-      ));
-    }
+    let epoch = validation::non_negative_u64("epoch", epoch, i64::MAX as u64)?;
+    let applied_log_index =
+      validation::non_negative_u64("applied_log_index", applied_log_index, i64::MAX as u64)?;
     dispatch!(
       self,
       |db| db
-        .primary_report_replica_progress(&replica_id, epoch as u64, applied_log_index as u64)
+        .primary_report_replica_progress(&replica_id, epoch, applied_log_index)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to report replica progress: {e}"))),
       |_db| { unreachable!("multi-file database support removed") }
     )
@@ -477,19 +476,15 @@ impl PyDatabase {
     max_bytes: i64,
     include_payload: bool,
   ) -> PyResult<String> {
-    if max_frames <= 0 {
-      return Err(PyRuntimeError::new_err("max_frames must be positive"));
-    }
-    if max_bytes <= 0 {
-      return Err(PyRuntimeError::new_err("max_bytes must be positive"));
-    }
+    let max_frames = validation::positive_usize("max_frames", max_frames, validation::MAX_COUNT)?;
+    let max_bytes = validation::positive_usize("max_bytes", max_bytes, validation::MAX_BYTES)?;
     dispatch!(
       self,
       |db| db
         .primary_export_log_transport_json(
           cursor.as_deref(),
-          max_frames as usize,
-          max_bytes as usize,
+          max_frames,
+          max_bytes,
           include_payload,
         )
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to export replication log: {e}"))),
@@ -510,13 +505,12 @@ impl PyDatabase {
 
   /// Pull and apply at most max_frames frames on replica.
   fn replica_catch_up_once(&self, max_frames: i64) -> PyResult<i64> {
-    if max_frames < 0 {
-      return Err(PyRuntimeError::new_err("max_frames must be non-negative"));
-    }
+    let max_frames =
+      validation::non_negative_usize("max_frames", max_frames, validation::MAX_COUNT)?;
     dispatch!(
       self,
       |db| db
-        .replica_catch_up_once(max_frames as usize)
+        .replica_catch_up_once(max_frames)
         .map(|count| count as i64)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed replica catch-up: {e}"))),
       |_db| { unreachable!("multi-file database support removed") }
@@ -1084,7 +1078,7 @@ impl PyDatabase {
 
   #[pyo3(name = "get_or_create_label")]
   fn ensure_label(&self, name: &str) -> PyResult<u32> {
-    dispatch_ok!(self, |db| schema::ensure_label_single(db, name), |db| {
+    dispatch!(self, |db| schema::ensure_label_single(db, name), |db| {
       schema::ensure_label_single(db, name)
     })
   }
@@ -1105,7 +1099,7 @@ impl PyDatabase {
 
   #[pyo3(name = "get_or_create_etype")]
   fn ensure_etype(&self, name: &str) -> PyResult<u32> {
-    dispatch_ok!(self, |db| schema::ensure_etype_single(db, name), |db| {
+    dispatch!(self, |db| schema::ensure_etype_single(db, name), |db| {
       schema::ensure_etype_single(db, name)
     })
   }
@@ -1126,7 +1120,7 @@ impl PyDatabase {
 
   #[pyo3(name = "get_or_create_propkey")]
   fn ensure_propkey(&self, name: &str) -> PyResult<u32> {
-    dispatch_ok!(self, |db| schema::ensure_propkey_single(db, name), |db| {
+    dispatch!(self, |db| schema::ensure_propkey_single(db, name), |db| {
       schema::ensure_propkey_single(db, name)
     })
   }
@@ -1245,10 +1239,11 @@ impl PyDatabase {
 
   #[pyo3(signature = (node_id, etype=None))]
   fn traverse_out(&self, node_id: i64, etype: Option<u32>) -> PyResult<Vec<i64>> {
+    let node_id = validation::node_id("node_id", node_id)? as NodeId;
     dispatch_ok!(
       self,
-      |db| graph_traversal::traverse_out_single(db, node_id as NodeId, etype),
-      |db| graph_traversal::traverse_out_single(db, node_id as NodeId, etype)
+      |db| graph_traversal::traverse_out_single(db, node_id, etype),
+      |db| graph_traversal::traverse_out_single(db, node_id, etype)
     )
   }
 
@@ -1258,28 +1253,31 @@ impl PyDatabase {
     node_id: i64,
     etype: Option<u32>,
   ) -> PyResult<Vec<(i64, Option<String>)>> {
+    let node_id = validation::node_id("node_id", node_id)? as NodeId;
     dispatch_ok!(
       self,
-      |db| graph_traversal::traverse_out_with_keys_single(db, node_id as NodeId, etype),
-      |db| graph_traversal::traverse_out_with_keys_single(db, node_id as NodeId, etype)
+      |db| graph_traversal::traverse_out_with_keys_single(db, node_id, etype),
+      |db| graph_traversal::traverse_out_with_keys_single(db, node_id, etype)
     )
   }
 
   #[pyo3(signature = (node_id, etype=None))]
   fn traverse_out_count(&self, node_id: i64, etype: Option<u32>) -> PyResult<i64> {
+    let node_id = validation::node_id("node_id", node_id)? as NodeId;
     dispatch_ok!(
       self,
-      |db| graph_traversal::traverse_out_count_single(db, node_id as NodeId, etype),
-      |db| graph_traversal::traverse_out_count_single(db, node_id as NodeId, etype)
+      |db| graph_traversal::traverse_out_count_single(db, node_id, etype),
+      |db| graph_traversal::traverse_out_count_single(db, node_id, etype)
     )
   }
 
   #[pyo3(signature = (node_id, etype=None))]
   fn traverse_in(&self, node_id: i64, etype: Option<u32>) -> PyResult<Vec<i64>> {
+    let node_id = validation::node_id("node_id", node_id)? as NodeId;
     dispatch_ok!(
       self,
-      |db| graph_traversal::traverse_in_single(db, node_id as NodeId, etype),
-      |db| graph_traversal::traverse_in_single(db, node_id as NodeId, etype)
+      |db| graph_traversal::traverse_in_single(db, node_id, etype),
+      |db| graph_traversal::traverse_in_single(db, node_id, etype)
     )
   }
 
@@ -1289,19 +1287,21 @@ impl PyDatabase {
     node_id: i64,
     etype: Option<u32>,
   ) -> PyResult<Vec<(i64, Option<String>)>> {
+    let node_id = validation::node_id("node_id", node_id)? as NodeId;
     dispatch_ok!(
       self,
-      |db| graph_traversal::traverse_in_with_keys_single(db, node_id as NodeId, etype),
-      |db| graph_traversal::traverse_in_with_keys_single(db, node_id as NodeId, etype)
+      |db| graph_traversal::traverse_in_with_keys_single(db, node_id, etype),
+      |db| graph_traversal::traverse_in_with_keys_single(db, node_id, etype)
     )
   }
 
   #[pyo3(signature = (node_id, etype=None))]
   fn traverse_in_count(&self, node_id: i64, etype: Option<u32>) -> PyResult<i64> {
+    let node_id = validation::node_id("node_id", node_id)? as NodeId;
     dispatch_ok!(
       self,
-      |db| graph_traversal::traverse_in_count_single(db, node_id as NodeId, etype),
-      |db| graph_traversal::traverse_in_count_single(db, node_id as NodeId, etype)
+      |db| graph_traversal::traverse_in_count_single(db, node_id, etype),
+      |db| graph_traversal::traverse_in_count_single(db, node_id, etype)
     )
   }
 
@@ -1310,6 +1310,9 @@ impl PyDatabase {
     start_ids: Vec<i64>,
     steps: Vec<(String, Option<u32>)>,
   ) -> PyResult<Vec<(i64, Option<String>)>> {
+    for &node_id in &start_ids {
+      validation::node_id("start_ids", node_id)?;
+    }
     dispatch_ok!(
       self,
       |db| graph_traversal::traverse_multi_single(db, start_ids.clone(), steps.clone()),
@@ -1322,6 +1325,9 @@ impl PyDatabase {
     start_ids: Vec<i64>,
     steps: Vec<(String, Option<u32>)>,
   ) -> PyResult<i64> {
+    for &node_id in &start_ids {
+      validation::node_id("start_ids", node_id)?;
+    }
     dispatch_ok!(
       self,
       |db| graph_traversal::traverse_multi_count_single(db, start_ids.clone(), steps.clone()),
@@ -1333,17 +1339,27 @@ impl PyDatabase {
   fn traverse(
     &self,
     node_id: i64,
-    max_depth: u32,
+    max_depth: i64,
     etype: Option<u32>,
-    min_depth: Option<u32>,
+    min_depth: Option<i64>,
     direction: Option<String>,
     unique: Option<bool>,
   ) -> PyResult<Vec<PyTraversalResult>> {
+    let node_id = validation::node_id("node_id", node_id)? as NodeId;
+    let max_depth = validation::non_negative_usize("max_depth", max_depth, validation::MAX_DEPTH)?;
+    let min_depth = min_depth
+      .map(|depth| validation::non_negative_usize("min_depth", depth, validation::MAX_DEPTH))
+      .transpose()?;
+    if min_depth.unwrap_or(1) > max_depth {
+      return Err(pyo3::exceptions::PyValueError::new_err(
+        "min_depth must be <= max_depth",
+      ));
+    }
     dispatch_ok!(
       self,
       |db| graph_traversal::traverse_single(
         db,
-        node_id as NodeId,
+        node_id,
         max_depth,
         etype,
         min_depth,
@@ -1352,7 +1368,7 @@ impl PyDatabase {
       ),
       |db| graph_traversal::traverse_single(
         db,
-        node_id as NodeId,
+        node_id,
         max_depth,
         etype,
         min_depth,
@@ -1368,23 +1384,28 @@ impl PyDatabase {
     source: i64,
     target: i64,
     etype: Option<u32>,
-    max_depth: Option<u32>,
+    max_depth: Option<i64>,
     direction: Option<String>,
   ) -> PyResult<PyPathResult> {
+    let source = validation::node_id("source", source)? as NodeId;
+    let target = validation::node_id("target", target)? as NodeId;
+    let max_depth = max_depth
+      .map(|depth| validation::non_negative_usize("max_depth", depth, validation::MAX_DEPTH))
+      .transpose()?;
     dispatch_ok!(
       self,
       |db| graph_traversal::find_path_bfs_single(
         db,
-        source as NodeId,
-        target as NodeId,
+        source,
+        target,
         etype,
         max_depth,
         direction.clone()
       ),
       |db| graph_traversal::find_path_bfs_single(
         db,
-        source as NodeId,
-        target as NodeId,
+        source,
+        target,
         etype,
         max_depth,
         direction.clone()
@@ -1398,23 +1419,28 @@ impl PyDatabase {
     source: i64,
     target: i64,
     etype: Option<u32>,
-    max_depth: Option<u32>,
+    max_depth: Option<i64>,
     direction: Option<String>,
   ) -> PyResult<PyPathResult> {
+    let source = validation::node_id("source", source)? as NodeId;
+    let target = validation::node_id("target", target)? as NodeId;
+    let max_depth = max_depth
+      .map(|depth| validation::non_negative_usize("max_depth", depth, validation::MAX_DEPTH))
+      .transpose()?;
     dispatch_ok!(
       self,
       |db| graph_traversal::find_path_dijkstra_single(
         db,
-        source as NodeId,
-        target as NodeId,
+        source,
+        target,
         etype,
         max_depth,
         direction.clone()
       ),
       |db| graph_traversal::find_path_dijkstra_single(
         db,
-        source as NodeId,
-        target as NodeId,
+        source,
+        target,
         etype,
         max_depth,
         direction.clone()
@@ -1428,23 +1454,28 @@ impl PyDatabase {
     source: i64,
     target: i64,
     etype: Option<u32>,
-    max_depth: Option<u32>,
+    max_depth: Option<i64>,
     direction: Option<String>,
   ) -> PyResult<bool> {
+    let source = validation::node_id("source", source)? as NodeId;
+    let target = validation::node_id("target", target)? as NodeId;
+    let max_depth = max_depth
+      .map(|depth| validation::non_negative_usize("max_depth", depth, validation::MAX_DEPTH))
+      .transpose()?;
     let path = dispatch_ok!(
       self,
       |db| graph_traversal::find_path_bfs_single(
         db,
-        source as NodeId,
-        target as NodeId,
+        source,
+        target,
         etype,
         max_depth,
         direction.clone()
       ),
       |db| graph_traversal::find_path_bfs_single(
         db,
-        source as NodeId,
-        target as NodeId,
+        source,
+        target,
         etype,
         max_depth,
         direction.clone()
@@ -1454,7 +1485,9 @@ impl PyDatabase {
   }
 
   #[pyo3(signature = (source, max_depth, etype=None))]
-  fn reachable_nodes(&self, source: i64, max_depth: u32, etype: Option<u32>) -> PyResult<Vec<i64>> {
+  fn reachable_nodes(&self, source: i64, max_depth: i64, etype: Option<u32>) -> PyResult<Vec<i64>> {
+    let source = validation::node_id("source", source)? as NodeId;
+    let max_depth = validation::non_negative_usize("max_depth", max_depth, validation::MAX_DEPTH)?;
     let min_depth = Some(1);
     let direction = Some("out".to_string());
     let unique = Some(true);
@@ -1462,7 +1495,7 @@ impl PyDatabase {
       self,
       |db| graph_traversal::traverse_single(
         db,
-        source as NodeId,
+        source,
         max_depth,
         etype,
         min_depth,
@@ -1471,7 +1504,7 @@ impl PyDatabase {
       ),
       |db| graph_traversal::traverse_single(
         db,
-        source as NodeId,
+        source,
         max_depth,
         etype,
         min_depth,
@@ -1500,6 +1533,7 @@ impl PyDatabase {
 
   #[pyo3(signature = (threshold=0.5))]
   fn should_checkpoint(&self, threshold: f64) -> PyResult<bool> {
+    let threshold = validation::ratio("threshold", threshold)?;
     dispatch_ok!(
       self,
       |db| maintenance::should_checkpoint_single(db, threshold),
@@ -1523,7 +1557,12 @@ impl PyDatabase {
   }
 
   #[pyo3(signature = (shrink_wal=true, min_wal_size=None))]
-  fn vacuum(&mut self, shrink_wal: bool, min_wal_size: Option<u64>) -> PyResult<()> {
+  fn vacuum(&mut self, shrink_wal: bool, min_wal_size: Option<i64>) -> PyResult<()> {
+    let min_wal_size = min_wal_size
+      .map(|value| {
+        validation::non_negative_u64("min_wal_size", value, validation::MAX_BYTES as u64)
+      })
+      .transpose()?;
     dispatch_mut!(
       self,
       |db| maintenance::vacuum_single(
@@ -1892,12 +1931,8 @@ pub fn collect_replication_log_transport_json(
   max_bytes: i64,
   include_payload: bool,
 ) -> PyResult<String> {
-  if max_frames <= 0 {
-    return Err(PyRuntimeError::new_err("max_frames must be positive"));
-  }
-  if max_bytes <= 0 {
-    return Err(PyRuntimeError::new_err("max_bytes must be positive"));
-  }
+  let max_frames = validation::positive_usize("max_frames", max_frames, validation::MAX_COUNT)?;
+  let max_bytes = validation::positive_usize("max_bytes", max_bytes, validation::MAX_BYTES)?;
 
   let guard = db
     .inner
@@ -1905,12 +1940,7 @@ pub fn collect_replication_log_transport_json(
     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
   match guard.as_ref() {
     Some(DatabaseInner::SingleFile(d)) => d
-      .primary_export_log_transport_json(
-        cursor.as_deref(),
-        max_frames as usize,
-        max_bytes as usize,
-        include_payload,
-      )
+      .primary_export_log_transport_json(cursor.as_deref(), max_frames, max_bytes, include_payload)
       .map_err(|e| PyRuntimeError::new_err(format!("Failed to export replication log: {e}"))),
     None => Err(PyRuntimeError::new_err("Database is closed")),
   }
@@ -1947,34 +1977,29 @@ fn build_otel_push_options_py(
   client_cert_pem_path: Option<String>,
   client_key_pem_path: Option<String>,
 ) -> PyResult<core_metrics::OtlpHttpPushOptions> {
-  if timeout_ms <= 0 {
-    return Err(PyRuntimeError::new_err("timeout_ms must be positive"));
-  }
-  if retry_max_attempts <= 0 {
-    return Err(PyRuntimeError::new_err(
-      "retry_max_attempts must be positive",
-    ));
-  }
-  if retry_backoff_ms < 0 {
-    return Err(PyRuntimeError::new_err(
-      "retry_backoff_ms must be non-negative",
-    ));
-  }
-  if retry_backoff_max_ms < 0 {
-    return Err(PyRuntimeError::new_err(
-      "retry_backoff_max_ms must be non-negative",
-    ));
-  }
+  let timeout_ms =
+    validation::positive_u64("timeout_ms", timeout_ms, validation::MAX_DURATION_MS as u64)?;
+  let retry_max_attempts = validation::positive_u32(
+    "retry_max_attempts",
+    retry_max_attempts,
+    validation::MAX_COUNT,
+  )?;
+  let retry_backoff_ms = validation::non_negative_u64(
+    "retry_backoff_ms",
+    retry_backoff_ms,
+    validation::MAX_DURATION_MS as u64,
+  )?;
+  let retry_backoff_max_ms = validation::non_negative_u64(
+    "retry_backoff_max_ms",
+    retry_backoff_max_ms,
+    validation::MAX_DURATION_MS as u64,
+  )?;
   if retry_backoff_max_ms > 0 && retry_backoff_max_ms < retry_backoff_ms {
-    return Err(PyRuntimeError::new_err(
+    return Err(PyValueError::new_err(
       "retry_backoff_max_ms must be >= retry_backoff_ms when non-zero",
     ));
   }
-  if !(0.0..=1.0).contains(&retry_jitter_ratio) {
-    return Err(PyRuntimeError::new_err(
-      "retry_jitter_ratio must be within [0.0, 1.0]",
-    ));
-  }
+  let retry_jitter_ratio = validation::ratio("retry_jitter_ratio", retry_jitter_ratio)?;
   let adaptive_retry_mode = match adaptive_retry_mode
     .as_deref()
     .map(str::trim)
@@ -1991,33 +2016,30 @@ fn build_otel_push_options_py(
       ));
     }
   };
-  if !(0.0..=1.0).contains(&adaptive_retry_ewma_alpha) {
-    return Err(PyRuntimeError::new_err(
-      "adaptive_retry_ewma_alpha must be within [0.0, 1.0]",
-    ));
-  }
-  if circuit_breaker_failure_threshold < 0 {
-    return Err(PyRuntimeError::new_err(
-      "circuit_breaker_failure_threshold must be non-negative",
-    ));
-  }
-  if circuit_breaker_open_ms < 0 {
-    return Err(PyRuntimeError::new_err(
-      "circuit_breaker_open_ms must be non-negative",
-    ));
-  }
+  let adaptive_retry_ewma_alpha =
+    validation::ratio("adaptive_retry_ewma_alpha", adaptive_retry_ewma_alpha)?;
+  let circuit_breaker_failure_threshold = validation::non_negative_u32(
+    "circuit_breaker_failure_threshold",
+    circuit_breaker_failure_threshold,
+    validation::MAX_COUNT,
+  )?;
+  let circuit_breaker_open_ms = validation::non_negative_u64(
+    "circuit_breaker_open_ms",
+    circuit_breaker_open_ms,
+    validation::MAX_DURATION_MS as u64,
+  )?;
   if circuit_breaker_failure_threshold > 0 && circuit_breaker_open_ms == 0 {
-    return Err(PyRuntimeError::new_err(
+    return Err(PyValueError::new_err(
       "circuit_breaker_open_ms must be > 0 when circuit_breaker_failure_threshold is enabled",
     ));
   }
-  if circuit_breaker_half_open_probes < 0 {
-    return Err(PyRuntimeError::new_err(
-      "circuit_breaker_half_open_probes must be non-negative",
-    ));
-  }
+  let circuit_breaker_half_open_probes = validation::non_negative_u32(
+    "circuit_breaker_half_open_probes",
+    circuit_breaker_half_open_probes,
+    validation::MAX_COUNT,
+  )?;
   if circuit_breaker_failure_threshold > 0 && circuit_breaker_half_open_probes == 0 {
-    return Err(PyRuntimeError::new_err(
+    return Err(PyValueError::new_err(
       "circuit_breaker_half_open_probes must be > 0 when circuit_breaker_failure_threshold is enabled",
     ));
   }
@@ -2066,21 +2088,21 @@ fn build_otel_push_options_py(
       "circuit_breaker_state_patch_merge requires circuit_breaker_state_patch",
     ));
   }
-  if circuit_breaker_state_patch_batch_max_keys <= 0 {
-    return Err(PyRuntimeError::new_err(
-      "circuit_breaker_state_patch_batch_max_keys must be > 0",
-    ));
-  }
-  if circuit_breaker_state_patch_merge_max_keys <= 0 {
-    return Err(PyRuntimeError::new_err(
-      "circuit_breaker_state_patch_merge_max_keys must be > 0",
-    ));
-  }
-  if circuit_breaker_state_patch_retry_max_attempts <= 0 {
-    return Err(PyRuntimeError::new_err(
-      "circuit_breaker_state_patch_retry_max_attempts must be > 0",
-    ));
-  }
+  let circuit_breaker_state_patch_batch_max_keys = validation::positive_u32(
+    "circuit_breaker_state_patch_batch_max_keys",
+    circuit_breaker_state_patch_batch_max_keys,
+    validation::MAX_COUNT,
+  )?;
+  let circuit_breaker_state_patch_merge_max_keys = validation::positive_u32(
+    "circuit_breaker_state_patch_merge_max_keys",
+    circuit_breaker_state_patch_merge_max_keys,
+    validation::MAX_COUNT,
+  )?;
+  let circuit_breaker_state_patch_retry_max_attempts = validation::positive_u32(
+    "circuit_breaker_state_patch_retry_max_attempts",
+    circuit_breaker_state_patch_retry_max_attempts,
+    validation::MAX_COUNT,
+  )?;
   if circuit_breaker_state_cas && circuit_breaker_state_url.is_none() {
     return Err(PyRuntimeError::new_err(
       "circuit_breaker_state_cas requires circuit_breaker_state_url",
@@ -2107,27 +2129,26 @@ fn build_otel_push_options_py(
   }
 
   Ok(core_metrics::OtlpHttpPushOptions {
-    timeout_ms: timeout_ms as u64,
+    timeout_ms,
     bearer_token,
-    retry_max_attempts: retry_max_attempts as u32,
-    retry_backoff_ms: retry_backoff_ms as u64,
-    retry_backoff_max_ms: retry_backoff_max_ms as u64,
+    retry_max_attempts,
+    retry_backoff_ms,
+    retry_backoff_max_ms,
     retry_jitter_ratio,
     adaptive_retry_mode,
     adaptive_retry_ewma_alpha,
     adaptive_retry,
-    circuit_breaker_failure_threshold: circuit_breaker_failure_threshold as u32,
-    circuit_breaker_open_ms: circuit_breaker_open_ms as u64,
-    circuit_breaker_half_open_probes: circuit_breaker_half_open_probes as u32,
+    circuit_breaker_failure_threshold,
+    circuit_breaker_open_ms,
+    circuit_breaker_half_open_probes,
     circuit_breaker_state_path,
     circuit_breaker_state_url,
     circuit_breaker_state_patch,
     circuit_breaker_state_patch_batch,
-    circuit_breaker_state_patch_batch_max_keys: circuit_breaker_state_patch_batch_max_keys as u32,
+    circuit_breaker_state_patch_batch_max_keys,
     circuit_breaker_state_patch_merge,
-    circuit_breaker_state_patch_merge_max_keys: circuit_breaker_state_patch_merge_max_keys as u32,
-    circuit_breaker_state_patch_retry_max_attempts: circuit_breaker_state_patch_retry_max_attempts
-      as u32,
+    circuit_breaker_state_patch_merge_max_keys,
+    circuit_breaker_state_patch_retry_max_attempts,
     circuit_breaker_state_cas,
     circuit_breaker_state_lease_id,
     circuit_breaker_scope_key,
@@ -2174,6 +2195,7 @@ fn build_otel_push_options_py(
   client_cert_pem_path=None,
   client_key_pem_path=None
 ))]
+#[allow(clippy::too_many_arguments)]
 pub fn push_replication_metrics_otel_json(
   db: &PyDatabase,
   endpoint: String,
@@ -2286,6 +2308,7 @@ pub fn push_replication_metrics_otel_json(
   client_cert_pem_path=None,
   client_key_pem_path=None
 ))]
+#[allow(clippy::too_many_arguments)]
 pub fn push_replication_metrics_otel_protobuf(
   db: &PyDatabase,
   endpoint: String,
@@ -2398,6 +2421,7 @@ pub fn push_replication_metrics_otel_protobuf(
   client_cert_pem_path=None,
   client_key_pem_path=None
 ))]
+#[allow(clippy::too_many_arguments)]
 pub fn push_replication_metrics_otel_grpc(
   db: &PyDatabase,
   endpoint: String,

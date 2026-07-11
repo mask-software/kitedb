@@ -74,17 +74,17 @@ pub struct JsKiteOptions {
   pub mvcc: Option<bool>,
   /// MVCC GC interval in ms
   pub mvcc_gc_interval_ms: Option<i64>,
-  /// MVCC retention in ms
+  /// MVCC retention in ms (0 means retain no historical window)
   pub mvcc_retention_ms: Option<i64>,
-  /// MVCC max version chain depth
+  /// MVCC max version chain depth (must be positive)
   pub mvcc_max_chain_depth: Option<i64>,
   /// Sync mode: "Full", "Normal", or "Off" (default: "Full")
   pub sync_mode: Option<JsSyncMode>,
   /// Enable group commit (coalesce WAL flushes across commits)
   pub group_commit_enabled: Option<bool>,
-  /// Group commit window in milliseconds
+  /// Group commit window in milliseconds (0 adds no coalescing delay)
   pub group_commit_window_ms: Option<i64>,
-  /// WAL size in megabytes (default: 1MB)
+  /// WAL size in megabytes (must be positive)
   pub wal_size_mb: Option<i64>,
   /// WAL usage threshold (0.0-1.0) to trigger auto-checkpoint
   pub checkpoint_threshold: Option<f64>,
@@ -100,8 +100,8 @@ pub struct JsKiteOptions {
   pub replication_source_sidecar_path: Option<String>,
   /// Segment rotation threshold in bytes (primary role only)
   pub replication_segment_max_bytes: Option<i64>,
-  /// Minimum retained entries window (primary role only)
+  /// Minimum retained entries window (0 imposes no entry-count floor)
   pub replication_retention_min_entries: Option<i64>,
-  /// Minimum retained segment age in milliseconds (primary role only)
+  /// Minimum retained segment age in milliseconds (0 imposes no age floor)
   pub replication_retention_min_ms: Option<i64>,
 }

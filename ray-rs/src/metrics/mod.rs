@@ -105,6 +105,8 @@ pub struct PrimaryReplicationMetrics {
   pub min_replica_applied_log_index: Option<i64>,
   pub sidecar_path: String,
   pub last_token: Option<String>,
+  pub last_replication_error: Option<String>,
+  pub sidecar_needs_repair: bool,
   pub append_attempts: i64,
   pub append_failures: i64,
   pub append_successes: i64,
@@ -1543,20 +1545,13 @@ fn record_circuit_breaker_success(endpoint: &str, options: &OtlpHttpPushOptions)
     state.consecutive_failures = 0;
     state.open_until_ms = 0;
     state.half_open_in_flight = false;
-    if !options.adaptive_retry
-      && state.consecutive_failures == 0
+    let quiescent = state.consecutive_failures == 0
       && state.open_until_ms == 0
       && state.half_open_remaining_probes == 0
-      && !state.half_open_in_flight
-    {
-      states.remove(&key);
-    } else if options.adaptive_retry
-      && state.consecutive_failures == 0
-      && state.open_until_ms == 0
-      && state.half_open_remaining_probes == 0
-      && !state.half_open_in_flight
-      && state.ewma_error_score <= f64::EPSILON
-    {
+      && !state.half_open_in_flight;
+    // Adaptive retry additionally keeps the entry while an EWMA error score
+    // remains, so its decay continues to influence future retries.
+    if quiescent && (!options.adaptive_retry || state.ewma_error_score <= f64::EPSILON) {
       states.remove(&key);
     }
     states.clone()
@@ -1866,6 +1861,36 @@ pub fn render_replication_metrics_prometheus(metrics: &DatabaseMetrics) -> Strin
 
     push_prometheus_help(
       &mut lines,
+      "kitedb_replication_primary_sidecar_needs_repair",
+      "gauge",
+      "Whether the primary sidecar is fenced and requires repair or resync.",
+    );
+    push_prometheus_sample(
+      &mut lines,
+      "kitedb_replication_primary_sidecar_needs_repair",
+      if primary.sidecar_needs_repair { 1 } else { 0 },
+      &[],
+    );
+
+    push_prometheus_help(
+      &mut lines,
+      "kitedb_replication_primary_last_replication_error_present",
+      "gauge",
+      "Whether the primary currently has a non-empty replication error.",
+    );
+    push_prometheus_sample(
+      &mut lines,
+      "kitedb_replication_primary_last_replication_error_present",
+      if primary.last_replication_error.is_some() {
+        1
+      } else {
+        0
+      },
+      &[],
+    );
+
+    push_prometheus_help(
+      &mut lines,
       "kitedb_replication_primary_append_attempts_total",
       "counter",
       "Total replication append attempts on the primary commit path.",
@@ -2038,6 +2063,26 @@ pub fn render_replication_metrics_otel_json(metrics: &DatabaseMetrics) -> String
       &[],
       &time_unix_nano,
     ));
+    otel_metrics.push(otel_gauge_metric(
+      "kitedb.replication.primary.sidecar_needs_repair",
+      "Whether the primary sidecar is fenced and requires repair or resync.",
+      "1",
+      if primary.sidecar_needs_repair { 1 } else { 0 },
+      &[],
+      &time_unix_nano,
+    ));
+    otel_metrics.push(otel_gauge_metric(
+      "kitedb.replication.primary.last_replication_error_present",
+      "Whether the primary currently has a non-empty replication error.",
+      "1",
+      if primary.last_replication_error.is_some() {
+        1
+      } else {
+        0
+      },
+      &[],
+      &time_unix_nano,
+    ));
 
     otel_metrics.push(otel_sum_metric(
       "kitedb.replication.primary.append_attempts",
@@ -2201,6 +2246,26 @@ pub fn render_replication_metrics_otel_protobuf(metrics: &DatabaseMetrics) -> Ve
       "Maximum reported lag (log frames) across replicas.",
       "1",
       primary.max_replica_lag,
+      &[],
+      time_unix_nano,
+    ));
+    otel_metrics.push(otel_proto_gauge_metric(
+      "kitedb.replication.primary.sidecar_needs_repair",
+      "Whether the primary sidecar is fenced and requires repair or resync.",
+      "1",
+      if primary.sidecar_needs_repair { 1 } else { 0 },
+      &[],
+      time_unix_nano,
+    ));
+    otel_metrics.push(otel_proto_gauge_metric(
+      "kitedb.replication.primary.last_replication_error_present",
+      "Whether the primary currently has a non-empty replication error.",
+      "1",
+      if primary.last_replication_error.is_some() {
+        1
+      } else {
+        0
+      },
       &[],
       time_unix_nano,
     ));
@@ -2408,6 +2473,8 @@ fn build_primary_replication_metrics(
     min_replica_applied_log_index: min_replica_applied_log_index.map(|value| value as i64),
     sidecar_path: status.sidecar_path.to_string_lossy().to_string(),
     last_token: status.last_token.map(|token| token.to_string()),
+    last_replication_error: status.last_replication_error,
+    sidecar_needs_repair: status.sidecar_needs_repair,
     append_attempts: status.append_attempts as i64,
     append_failures: status.append_failures as i64,
     append_successes: status.append_successes as i64,

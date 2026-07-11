@@ -9,6 +9,43 @@ use flate2::write::{DeflateEncoder, GzEncoder};
 use flate2::Compression;
 use std::io::{Read, Write};
 
+/// Absolute decompressed-size ceiling for untrusted snapshot metadata.
+///
+/// On 64-bit targets the snapshot format can describe sections up to 4 GiB,
+/// which keeps legitimate large graph sections readable. On 32-bit and
+/// wasm32 targets the lower ceiling avoids exhausting the address space.
+/// `decompress_with_size` uses the CRC-covered declared size exactly; this
+/// ceiling is enforced while validating the section table. The sizeless
+/// `decompress` API uses it as its fallback bomb limit.
+#[cfg(target_pointer_width = "64")]
+pub(crate) const MAX_DECOMPRESSED_BYTES: usize = 4 * 1024 * 1024 * 1024;
+
+#[cfg(not(target_pointer_width = "64"))]
+pub(crate) const MAX_DECOMPRESSED_BYTES: usize = 256 * 1024 * 1024;
+
+fn read_limited<R: Read>(reader: &mut R, limit: usize) -> Result<Vec<u8>> {
+  let mut output = Vec::new();
+  let mut chunk = [0u8; 8192];
+
+  loop {
+    let read = reader
+      .read(&mut chunk)
+      .map_err(|e| KiteError::Compression(e.to_string()))?;
+    if read == 0 {
+      return Ok(output);
+    }
+    if read > limit.saturating_sub(output.len()) {
+      return Err(KiteError::Compression(format!(
+        "decompressed data exceeds safe limit of {limit} bytes"
+      )));
+    }
+    output
+      .try_reserve(read)
+      .map_err(|e| KiteError::Compression(format!("decompressed data allocation failed: {e}")))?;
+    output.extend_from_slice(&chunk[..read]);
+  }
+}
+
 // ============================================================================
 // Compression Types
 // ============================================================================
@@ -120,53 +157,48 @@ pub fn decompress(data: &[u8], compression_type: CompressionType) -> Result<Vec<
 
     CompressionType::Gzip => {
       let mut decoder = GzDecoder::new(data);
-      let mut out = Vec::new();
-      decoder
-        .read_to_end(&mut out)
-        .map_err(|e| KiteError::Compression(e.to_string()))?;
-      Ok(out)
+      read_limited(&mut decoder, MAX_DECOMPRESSED_BYTES)
     }
 
     CompressionType::Deflate => {
       let mut decoder = DeflateDecoder::new(data);
-      let mut out = Vec::new();
-      decoder
-        .read_to_end(&mut out)
-        .map_err(|e| KiteError::Compression(e.to_string()))?;
-      Ok(out)
+      read_limited(&mut decoder, MAX_DECOMPRESSED_BYTES)
     }
   }
 }
 
-/// Decompress data with known uncompressed size (more efficient allocation)
+/// Decompress data with a declared uncompressed size.
+///
+/// The declared size is a validation hint, never an allocation request.
 pub fn decompress_with_size(
   data: &[u8],
   compression_type: CompressionType,
   uncompressed_size: usize,
 ) -> Result<Vec<u8>> {
-  match compression_type {
+  let output = match compression_type {
     CompressionType::None => Ok(data.to_vec()),
 
     CompressionType::Zstd => zstd_decode_with_size(data, uncompressed_size),
 
     CompressionType::Gzip => {
-      let mut out = Vec::with_capacity(uncompressed_size);
       let mut decoder = GzDecoder::new(data);
-      decoder
-        .read_to_end(&mut out)
-        .map_err(|e| KiteError::Compression(e.to_string()))?;
-      Ok(out)
+      read_limited(&mut decoder, uncompressed_size)
     }
 
     CompressionType::Deflate => {
-      let mut out = Vec::with_capacity(uncompressed_size);
       let mut decoder = DeflateDecoder::new(data);
-      decoder
-        .read_to_end(&mut out)
-        .map_err(|e| KiteError::Compression(e.to_string()))?;
-      Ok(out)
+      read_limited(&mut decoder, uncompressed_size)
     }
+  }?;
+
+  if output.len() != uncompressed_size {
+    return Err(KiteError::Compression(format!(
+      "decompressed data size mismatch: expected {uncompressed_size} bytes, found {}",
+      output.len()
+    )));
   }
+
+  Ok(output)
 }
 
 /// Determine if compression is beneficial for the given data
@@ -207,7 +239,8 @@ fn zstd_encode(_data: &[u8], _level: i32) -> Result<Vec<u8>> {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn zstd_decode(data: &[u8]) -> Result<Vec<u8>> {
-  zstd::decode_all(data).map_err(|e| KiteError::Compression(e.to_string()))
+  let mut decoder = zstd::Decoder::new(data).map_err(|e| KiteError::Compression(e.to_string()))?;
+  read_limited(&mut decoder, MAX_DECOMPRESSED_BYTES)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -219,12 +252,8 @@ fn zstd_decode(_data: &[u8]) -> Result<Vec<u8>> {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn zstd_decode_with_size(data: &[u8], uncompressed_size: usize) -> Result<Vec<u8>> {
-  let mut out = Vec::with_capacity(uncompressed_size);
   let mut decoder = zstd::Decoder::new(data).map_err(|e| KiteError::Compression(e.to_string()))?;
-  decoder
-    .read_to_end(&mut out)
-    .map_err(|e| KiteError::Compression(e.to_string()))?;
-  Ok(out)
+  read_limited(&mut decoder, uncompressed_size)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -323,6 +352,20 @@ mod tests {
     let decompressed =
       decompress_with_size(&compressed, CompressionType::Zstd, data.len()).expect("expected value");
     assert_eq!(decompressed, data);
+  }
+
+  #[test]
+  fn test_decompress_with_size_rejects_size_mismatch() {
+    let data = vec![b'x'; 10_000];
+    let compressed = compress(&data, CompressionType::Zstd, 3).expect("expected value");
+
+    let shorter_declaration =
+      decompress_with_size(&compressed, CompressionType::Zstd, data.len() - 1);
+    assert!(shorter_declaration.is_err());
+
+    let longer_declaration =
+      decompress_with_size(&compressed, CompressionType::Zstd, data.len() + 1);
+    assert!(longer_declaration.is_err());
   }
 
   #[test]

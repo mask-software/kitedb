@@ -15,6 +15,8 @@ Primary status fields:
 - `retained_floor`: lowest retained index after pruning.
 - `replica_lags[]`: per-replica applied position.
 - `append_attempts|append_failures|append_successes`: commit-path replication health.
+- `last_replication_error`: latest primary-side sidecar failure, if any.
+- `sidecar_needs_repair`: the sidecar is fenced and requires repair/resync; local commits still succeed without replication tokens.
 
 Replica status fields:
 
@@ -108,6 +110,7 @@ Metrics surface:
 Alert heuristics:
 
 - `append_failures > 0` growing: primary sidecar durability issue.
+- `sidecar_needs_repair == true`: stop expecting sidecar progress, repair or reseed it before resuming replication; later frames are intentionally not appended over the gap.
 - Replica lag growth over steady traffic: pull/apply bottleneck.
 - `needs_reseed == true`: force reseed, do not keep retrying catch-up.
 

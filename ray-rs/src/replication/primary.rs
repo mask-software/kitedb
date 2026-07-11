@@ -1,20 +1,30 @@
 //! Primary-side replication orchestration.
+//!
+//! The main database commit is authoritative. Once its COMMIT record, WAL,
+//! and header are durable, a replication-sidecar append is best effort: an
+//! append error is recorded as `sidecar_needs_repair` and is never returned as
+//! a failure of the local commit. The sidecar is fenced after that error, so
+//! later commits cannot append over a missing frame. The stale/error state is
+//! persisted in `primary-health.json`; reopen also compares the newest local
+//! WAL commit txid with the newest sidecar frame and writes that marker if a
+//! crash happened before the append attempt recorded the error.
 
-use super::log_store::SegmentLogStore;
+use super::log_store::{ReplicationFrame, SegmentLogStore};
 use super::manifest::{ManifestStore, ReplicationManifest, SegmentMeta, MANIFEST_ENVELOPE_VERSION};
 use super::progress::{
   clear_replica_progress, load_replica_progress, upsert_replica_progress,
   ReplicaProgress as ReplicaProgressEntry,
 };
-use super::transport::build_commit_payload_header;
+use super::transport::{build_commit_payload_header, decode_commit_frame_payload};
 use super::types::{CommitToken, ReplicationRole};
 use crate::core::single_file::SyncMode;
 use crate::error::{KiteError, Result};
 use fs2::FileExt;
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
@@ -26,6 +36,8 @@ const DEFAULT_SEGMENT_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_RETENTION_MIN_ENTRIES: u64 = 1024;
 const DEFAULT_MANIFEST_REFRESH_APPEND_INTERVAL: u64 = 256;
 const DEFAULT_APPEND_WRITE_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+const PRIMARY_HEALTH_FILE_NAME: &str = "primary-health.json";
+const PRIMARY_HEALTH_VERSION: u32 = 1;
 
 type SidecarOpLock = Arc<Mutex<()>>;
 type SidecarPrimaryLock = Arc<PrimarySidecarProcessLock>;
@@ -47,6 +59,8 @@ pub struct PrimaryReplicationStatus {
   pub replica_lags: Vec<ReplicaLagStatus>,
   pub sidecar_path: PathBuf,
   pub last_token: Option<CommitToken>,
+  pub last_replication_error: Option<String>,
+  pub sidecar_needs_repair: bool,
   pub append_attempts: u64,
   pub append_failures: u64,
   pub append_successes: u64,
@@ -83,6 +97,8 @@ struct PrimaryReplicationState {
   log_store: SegmentLogStore,
   active_segment_size_bytes: u64,
   last_token: Option<CommitToken>,
+  last_replication_error: Option<String>,
+  sidecar_needs_repair: bool,
   replica_progress: HashMap<String, ReplicaProgressEntry>,
   write_fenced: bool,
   appends_since_manifest_refresh: u64,
@@ -105,12 +121,80 @@ pub struct PrimaryReplication {
   manifest_refresh_append_interval: u64,
   append_write_buffer_bytes: usize,
   fail_after_append_for_testing: Option<u64>,
+  crash_after_local_commit_for_testing: bool,
+  health_store: PrimarySidecarHealthStore,
   sidecar_op_lock: SidecarOpLock,
   _sidecar_primary_lock: SidecarPrimaryLock,
   epoch_fence: SidecarEpochFence,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct PrimarySidecarHealth {
+  version: u32,
+  last_replication_error: Option<String>,
+  sidecar_needs_repair: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PrimarySidecarHealthStore {
+  path: PathBuf,
+}
+
+impl PrimarySidecarHealthStore {
+  fn new(sidecar_path: &Path) -> Self {
+    Self {
+      path: sidecar_path.join(PRIMARY_HEALTH_FILE_NAME),
+    }
+  }
+
+  fn read(&self) -> Result<Option<PrimarySidecarHealth>> {
+    let bytes = match std::fs::read(&self.path) {
+      Ok(bytes) => bytes,
+      Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+      Err(error) => return Err(error.into()),
+    };
+
+    let health: PrimarySidecarHealth = serde_json::from_slice(&bytes).map_err(|error| {
+      KiteError::Serialization(format!("decode primary replication health: {error}"))
+    })?;
+    if health.version != PRIMARY_HEALTH_VERSION {
+      return Err(KiteError::VersionMismatch {
+        required: health.version,
+        current: PRIMARY_HEALTH_VERSION,
+      });
+    }
+    Ok(Some(health))
+  }
+
+  fn write(&self, health: &PrimarySidecarHealth) -> Result<()> {
+    if let Some(parent) = self.path.parent() {
+      std::fs::create_dir_all(parent)?;
+    }
+
+    let mut persisted = health.clone();
+    persisted.version = PRIMARY_HEALTH_VERSION;
+    let bytes = serde_json::to_vec(&persisted).map_err(|error| {
+      KiteError::Serialization(format!("encode primary replication health: {error}"))
+    })?;
+    let temp_path = self.path.with_extension("json.tmp");
+    let mut temp_file = OpenOptions::new()
+      .create(true)
+      .truncate(true)
+      .write(true)
+      .open(&temp_path)?;
+    temp_file.write_all(&bytes)?;
+    temp_file.sync_all()?;
+    drop(temp_file);
+
+    std::fs::rename(&temp_path, &self.path)?;
+    sync_sidecar_parent(self.path.parent())?;
+    Ok(())
+  }
+}
+
 impl PrimaryReplication {
+  /// Open a primary replication sidecar using the stable runtime options.
   pub fn open(
     db_path: &Path,
     sidecar_path: Option<PathBuf>,
@@ -120,12 +204,39 @@ impl PrimaryReplication {
     sync_mode: SyncMode,
     fail_after_append_for_testing: Option<u64>,
   ) -> Result<Self> {
-    let sidecar_path =
-      sidecar_path.unwrap_or_else(|| default_replication_sidecar_path(db_path.as_ref()));
+    Self::open_with_recovery(
+      db_path,
+      sidecar_path,
+      segment_max_bytes,
+      retention_min_entries,
+      retention_min_ms,
+      sync_mode,
+      fail_after_append_for_testing,
+      None,
+      false,
+    )
+  }
+
+  /// Open a primary and reconcile a local WAL commit boundary during recovery.
+  #[allow(clippy::too_many_arguments)]
+  pub fn open_with_recovery(
+    db_path: &Path,
+    sidecar_path: Option<PathBuf>,
+    segment_max_bytes: Option<u64>,
+    retention_min_entries: Option<u64>,
+    retention_min_ms: Option<u64>,
+    sync_mode: SyncMode,
+    fail_after_append_for_testing: Option<u64>,
+    local_latest_committed_txid: Option<u64>,
+    crash_after_local_commit_for_testing: bool,
+  ) -> Result<Self> {
+    let sidecar_path = sidecar_path.unwrap_or_else(|| default_replication_sidecar_path(db_path));
     std::fs::create_dir_all(&sidecar_path)?;
     let sidecar_primary_lock = acquire_sidecar_primary_lock(&sidecar_path)?;
 
     let manifest_store = ManifestStore::new(sidecar_path.join(MANIFEST_FILE_NAME));
+    let health_store = PrimarySidecarHealthStore::new(&sidecar_path);
+    let persisted_health = health_store.read()?;
 
     let mut manifest = if manifest_store.path().exists() {
       manifest_store.read()?
@@ -148,9 +259,70 @@ impl PrimaryReplication {
     };
 
     ensure_active_segment_metadata(&mut manifest);
-    if reconcile_manifest_head_from_active_segment(&sidecar_path, &mut manifest)? {
-      // Recover append state when manifest head lagged a flushed segment tail.
-      manifest_store.write(&manifest)?;
+    let mut last_replication_error = persisted_health
+      .as_ref()
+      .and_then(|health| health.last_replication_error.clone());
+    let mut sidecar_needs_repair = persisted_health
+      .as_ref()
+      .map(|health| health.sidecar_needs_repair)
+      .unwrap_or(false);
+
+    if !sidecar_needs_repair {
+      match reconcile_manifest_head_from_active_segment(&sidecar_path, &mut manifest) {
+        Ok(true) => {
+          // Recover append state when manifest head lagged a flushed segment tail.
+          if let Err(error) = manifest_store.write(&manifest) {
+            sidecar_needs_repair = true;
+            last_replication_error = Some(format!(
+              "replication sidecar manifest recovery failed: {error}"
+            ));
+          }
+        }
+        Ok(false) => {}
+        Err(error) => {
+          sidecar_needs_repair = true;
+          last_replication_error = Some(format!(
+            "replication sidecar recovery failed; repair/resync required: {error}"
+          ));
+        }
+      }
+    }
+
+    if !sidecar_needs_repair {
+      if let Some(local_txid) = local_latest_committed_txid {
+        match sidecar_last_txid(&sidecar_path, &manifest) {
+          Ok(Some(sidecar_txid)) if sidecar_txid == local_txid => {}
+          Ok(Some(sidecar_txid)) => {
+            sidecar_needs_repair = true;
+            last_replication_error = Some(format!(
+              "local WAL commit txid {local_txid} is newer than sidecar txid {sidecar_txid}; repair/resync required"
+            ));
+          }
+          Ok(None) => {
+            sidecar_needs_repair = true;
+            last_replication_error = Some(format!(
+              "local WAL commit txid {local_txid} has no matching replication sidecar frame; repair/resync required"
+            ));
+          }
+          Err(error) => {
+            sidecar_needs_repair = true;
+            last_replication_error = Some(format!(
+              "replication sidecar frame inspection failed; repair/resync required: {error}"
+            ));
+          }
+        }
+      }
+    }
+
+    if sidecar_needs_repair {
+      persist_health_best_effort(
+        &health_store,
+        &PrimarySidecarHealth {
+          version: PRIMARY_HEALTH_VERSION,
+          last_replication_error: last_replication_error.clone(),
+          sidecar_needs_repair: true,
+        },
+      );
     }
 
     let segment_path = sidecar_path.join(segment_file_name(manifest.active_segment_id));
@@ -177,6 +349,8 @@ impl PrimaryReplication {
         log_store,
         active_segment_size_bytes,
         last_token: None,
+        last_replication_error,
+        sidecar_needs_repair,
         replica_progress,
         write_fenced: false,
         appends_since_manifest_refresh: 0,
@@ -199,6 +373,8 @@ impl PrimaryReplication {
       },
       append_write_buffer_bytes,
       fail_after_append_for_testing,
+      crash_after_local_commit_for_testing,
+      health_store,
       sidecar_op_lock,
       _sidecar_primary_lock: sidecar_primary_lock,
       epoch_fence,
@@ -210,8 +386,41 @@ impl PrimaryReplication {
   }
 
   pub fn append_commit_wal_frame(&self, txid: u64, wal_bytes: Vec<u8>) -> Result<CommitToken> {
-    let header = build_commit_payload_header(txid, wal_bytes.len())?;
+    let header = match build_commit_payload_header(txid, wal_bytes.len()) {
+      Ok(header) => header,
+      Err(error) => {
+        self.mark_append_failure(&error);
+        return Err(error);
+      }
+    };
     self.append_commit_payload_owned_segments(vec![header.to_vec(), wal_bytes])
+  }
+
+  pub fn crash_after_local_commit_for_testing(&self) -> bool {
+    self.crash_after_local_commit_for_testing
+  }
+
+  /// Reject a local commit before its WAL COMMIT record when this instance is
+  /// fenced by a newer primary epoch. A sidecar-repair fence is intentionally
+  /// excluded: local commits remain authoritative while replication is stale.
+  pub fn ensure_local_commit_allowed(&self) -> Result<()> {
+    let _sidecar_guard = self.sidecar_op_lock.lock();
+    let mut state = self.state.lock();
+    self.refresh_health_locked(&mut state)?;
+    if state.sidecar_needs_repair {
+      return Ok(());
+    }
+
+    if self.epoch_fence.load(Ordering::Acquire) > state.manifest.epoch {
+      state.write_fenced = true;
+      return Err(stale_primary_error());
+    }
+
+    let epoch_changed = self.refresh_manifest_locked(&mut state)?;
+    if epoch_changed || state.write_fenced {
+      return Err(stale_primary_error());
+    }
+    Ok(())
   }
 
   fn append_commit_payload_segments(&self, payload_segments: &[&[u8]]) -> Result<CommitToken> {
@@ -220,15 +429,33 @@ impl PrimaryReplication {
     if let Some(limit) = self.fail_after_append_for_testing {
       let successes = self.append_successes.load(Ordering::Relaxed);
       if successes >= limit {
-        self.append_failures.fetch_add(1, Ordering::Relaxed);
-        return Err(KiteError::InvalidReplication(
+        let error = KiteError::InvalidReplication(
           "replication append failure injected for testing".to_string(),
-        ));
+        );
+        self.append_failures.fetch_add(1, Ordering::Relaxed);
+        self.mark_append_failure(&error);
+        return Err(error);
       }
     }
 
+    let result = self.append_commit_payload_segments_inner(payload_segments);
+    if let Err(error) = &result {
+      self.mark_append_failure(error);
+    }
+    result
+  }
+
+  fn append_commit_payload_segments_inner(
+    &self,
+    payload_segments: &[&[u8]],
+  ) -> Result<CommitToken> {
     let _sidecar_guard = self.sidecar_op_lock.lock();
     let mut state = self.state.lock();
+    self.refresh_health_locked(&mut state)?;
+    if state.sidecar_needs_repair {
+      self.append_failures.fetch_add(1, Ordering::Relaxed);
+      return Err(sidecar_repair_error());
+    }
     let fenced_epoch = self.epoch_fence.load(Ordering::Acquire);
     if fenced_epoch > state.manifest.epoch {
       state.write_fenced = true;
@@ -350,15 +577,33 @@ impl PrimaryReplication {
     if let Some(limit) = self.fail_after_append_for_testing {
       let successes = self.append_successes.load(Ordering::Relaxed);
       if successes >= limit {
-        self.append_failures.fetch_add(1, Ordering::Relaxed);
-        return Err(KiteError::InvalidReplication(
+        let error = KiteError::InvalidReplication(
           "replication append failure injected for testing".to_string(),
-        ));
+        );
+        self.append_failures.fetch_add(1, Ordering::Relaxed);
+        self.mark_append_failure(&error);
+        return Err(error);
       }
     }
 
+    let result = self.append_commit_payload_owned_segments_inner(payload_segments);
+    if let Err(error) = &result {
+      self.mark_append_failure(error);
+    }
+    result
+  }
+
+  fn append_commit_payload_owned_segments_inner(
+    &self,
+    payload_segments: Vec<Vec<u8>>,
+  ) -> Result<CommitToken> {
     let _sidecar_guard = self.sidecar_op_lock.lock();
     let mut state = self.state.lock();
+    self.refresh_health_locked(&mut state)?;
+    if state.sidecar_needs_repair {
+      self.append_failures.fetch_add(1, Ordering::Relaxed);
+      return Err(sidecar_repair_error());
+    }
     let fenced_epoch = self.epoch_fence.load(Ordering::Acquire);
     if fenced_epoch > state.manifest.epoch {
       state.write_fenced = true;
@@ -474,6 +719,9 @@ impl PrimaryReplication {
   pub fn promote_to_next_epoch(&self) -> Result<u64> {
     let _sidecar_guard = self.sidecar_op_lock.lock();
     let mut state = self.state.lock();
+    if state.sidecar_needs_repair {
+      return Err(sidecar_repair_error());
+    }
     let epoch_changed = self.refresh_manifest_locked(&mut state)?;
     if epoch_changed || state.write_fenced {
       return Ok(state.manifest.epoch);
@@ -519,6 +767,9 @@ impl PrimaryReplication {
   ) -> Result<()> {
     let _sidecar_guard = self.sidecar_op_lock.lock();
     let mut state = self.state.lock();
+    if state.sidecar_needs_repair {
+      return Err(sidecar_repair_error());
+    }
     let epoch_changed = self.refresh_manifest_locked(&mut state)?;
     if epoch_changed || state.write_fenced {
       return Err(stale_primary_error());
@@ -544,6 +795,9 @@ impl PrimaryReplication {
   pub fn run_retention(&self) -> Result<PrimaryRetentionOutcome> {
     let _sidecar_guard = self.sidecar_op_lock.lock();
     let mut state = self.state.lock();
+    if state.sidecar_needs_repair {
+      return Err(sidecar_repair_error());
+    }
     let epoch_changed = self.refresh_manifest_locked(&mut state)?;
     if epoch_changed || state.write_fenced {
       return Err(stale_primary_error());
@@ -637,10 +891,46 @@ impl PrimaryReplication {
       replica_lags,
       sidecar_path: self.sidecar_path.clone(),
       last_token: state.last_token,
+      last_replication_error: state.last_replication_error.clone(),
+      sidecar_needs_repair: state.sidecar_needs_repair,
       append_attempts: self.append_attempts.load(Ordering::Relaxed),
       append_failures: self.append_failures.load(Ordering::Relaxed),
       append_successes: self.append_successes.load(Ordering::Relaxed),
     }
+  }
+
+  fn mark_append_failure(&self, error: &KiteError) {
+    let _sidecar_guard = self.sidecar_op_lock.lock();
+    let health = {
+      let mut state = self.state.lock();
+      if !state.sidecar_needs_repair || state.last_replication_error.is_none() {
+        state.last_replication_error = Some(error.to_string());
+      }
+      state.sidecar_needs_repair = true;
+      state.write_fenced = true;
+      PrimarySidecarHealth {
+        version: PRIMARY_HEALTH_VERSION,
+        last_replication_error: state.last_replication_error.clone(),
+        sidecar_needs_repair: true,
+      }
+    };
+    persist_health_best_effort(&self.health_store, &health);
+  }
+
+  fn refresh_health_locked(&self, state: &mut PrimaryReplicationState) -> Result<()> {
+    let Some(health) = self.health_store.read()? else {
+      return Ok(());
+    };
+    if !health.sidecar_needs_repair {
+      return Ok(());
+    }
+
+    state.sidecar_needs_repair = true;
+    state.write_fenced = true;
+    if state.last_replication_error.is_none() {
+      state.last_replication_error = health.last_replication_error;
+    }
+    Ok(())
   }
 
   pub fn flush_for_transport_export(&self) -> Result<()> {
@@ -790,6 +1080,40 @@ fn segment_file_name(id: u64) -> String {
   format!("segment-{id:020}.rlog")
 }
 
+fn sidecar_last_txid(sidecar_path: &Path, manifest: &ReplicationManifest) -> Result<Option<u64>> {
+  let Some(frame) = sidecar_last_frame(sidecar_path, manifest)? else {
+    return Ok(None);
+  };
+  if frame.log_index != manifest.head_log_index {
+    return Err(KiteError::InvalidReplication(format!(
+      "replication sidecar manifest head {} does not match last frame {}",
+      manifest.head_log_index, frame.log_index
+    )));
+  }
+  Ok(Some(decode_commit_frame_payload(&frame.payload)?.txid))
+}
+
+fn sidecar_last_frame(
+  sidecar_path: &Path,
+  manifest: &ReplicationManifest,
+) -> Result<Option<ReplicationFrame>> {
+  let Some(segment) = manifest
+    .segments
+    .iter()
+    .filter(|segment| segment.end_log_index > 0)
+    .max_by_key(|segment| (segment.end_log_index, segment.id))
+  else {
+    return Ok(None);
+  };
+
+  let segment_path = sidecar_path.join(segment_file_name(segment.id));
+  if !segment_path.exists() {
+    return Ok(None);
+  }
+  let frames = SegmentLogStore::open(&segment_path)?.read_all()?;
+  Ok(frames.into_iter().last())
+}
+
 fn reconcile_manifest_head_from_active_segment(
   sidecar_path: &Path,
   manifest: &mut ReplicationManifest,
@@ -830,6 +1154,34 @@ fn reconcile_manifest_head_from_active_segment(
 
 fn stale_primary_error() -> KiteError {
   KiteError::InvalidReplication("stale primary is fenced for writes".to_string())
+}
+
+fn sidecar_repair_error() -> KiteError {
+  KiteError::InvalidReplication(
+    "primary replication sidecar needs repair/resync; later appends are fenced".to_string(),
+  )
+}
+
+fn persist_health_best_effort(store: &PrimarySidecarHealthStore, health: &PrimarySidecarHealth) {
+  if let Err(error) = store.write(health) {
+    eprintln!("Warning: failed to persist primary replication sidecar health state: {error}");
+  }
+}
+
+fn sync_sidecar_parent(parent: Option<&Path>) -> Result<()> {
+  #[cfg(unix)]
+  {
+    if let Some(parent) = parent {
+      File::open(parent)?.sync_all()?;
+    }
+  }
+
+  #[cfg(not(unix))]
+  {
+    let _ = parent;
+  }
+
+  Ok(())
 }
 
 fn read_manifest_disk_stamp(path: &Path) -> Result<ManifestDiskStamp> {
@@ -877,6 +1229,7 @@ fn acquire_sidecar_primary_lock(sidecar_path: &Path) -> Result<SidecarPrimaryLoc
   let lock_path = key.join(PRIMARY_LOCK_FILE_NAME);
   let lock_file = OpenOptions::new()
     .create(true)
+    .truncate(false)
     .read(true)
     .write(true)
     .open(&lock_path)?;

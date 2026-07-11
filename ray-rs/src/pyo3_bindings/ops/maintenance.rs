@@ -21,7 +21,7 @@ pub trait MaintenanceOps {
   /// Optimize the database
   fn optimize_impl(&self) -> PyResult<()>;
   /// Vacuum the database
-  fn vacuum_impl(&self, shrink_wal: bool, min_wal_size: Option<u64>) -> PyResult<()>;
+  fn vacuum_impl(&self, shrink_wal: bool, min_wal_size: Option<i64>) -> PyResult<()>;
   /// Get database statistics
   fn stats_impl(&self) -> DbStats;
   /// Check database integrity

@@ -435,6 +435,21 @@ where
   ids
 }
 
+/// Schema IDs are array-indexed in the snapshot, so the header/table bound is
+/// the largest committed ID, not the number of map entries. Rollbacks may
+/// leave holes in the ID space.
+fn schema_id_bound<Id>(ids: &HashMap<Id, String>) -> usize
+where
+  Id: Copy + Ord + Into<u64>,
+{
+  ids
+    .keys()
+    .copied()
+    .max()
+    .map(|id| id.into() as usize)
+    .unwrap_or(0)
+}
+
 fn build_node_key_strings(nodes: &[NodeData], string_table: &mut StringTable) -> Vec<StringId> {
   nodes
     .iter()
@@ -494,18 +509,21 @@ fn prepare_snapshot_state(
   validate_edge_nodes(edges, &node_id_to_phys)?;
 
   let mut string_table = StringTable::new();
+  let label_bound = schema_id_bound(labels);
+  let etype_bound = schema_id_bound(etypes);
+  let propkey_bound = schema_id_bound(propkeys);
   let label_string_ids = intern_name_table(
-    labels.len(),
+    label_bound,
     |i| labels.get(&(i as LabelId)).map(|s| s.as_str()),
     &mut string_table,
   );
   let etype_string_ids = intern_name_table(
-    etypes.len(),
+    etype_bound,
     |i| etypes.get(&(i as ETypeId)).map(|s| s.as_str()),
     &mut string_table,
   );
   let propkey_string_ids = intern_name_table(
-    propkeys.len(),
+    propkey_bound,
     |i| propkeys.get(&(i as PropKeyId)).map(|s| s.as_str()),
     &mut string_table,
   );
@@ -1034,11 +1052,11 @@ pub fn build_snapshot_to_memory(input: SnapshotBuildInput) -> Result<Vec<u8>> {
   offset += 8;
   write_u64(&mut buffer, offset, state.max_node_id);
   offset += 8;
-  write_u64(&mut buffer, offset, labels.len() as u64);
+  write_u64(&mut buffer, offset, schema_id_bound(&labels) as u64);
   offset += 8;
-  write_u64(&mut buffer, offset, etypes.len() as u64);
+  write_u64(&mut buffer, offset, schema_id_bound(&etypes) as u64);
   offset += 8;
-  write_u64(&mut buffer, offset, propkeys.len() as u64);
+  write_u64(&mut buffer, offset, schema_id_bound(&propkeys) as u64);
   offset += 8;
   write_u64(&mut buffer, offset, num_strings as u64);
 

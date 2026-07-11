@@ -83,10 +83,25 @@ pub struct ParsedWalRecord {
   pub record_end: usize, // Offset after this record (including padding)
 }
 
+#[inline]
+fn has_bytes(buffer_len: usize, offset: usize, needed: usize) -> bool {
+  offset
+    .checked_add(needed)
+    .map(|end| end <= buffer_len)
+    .unwrap_or(false)
+}
+
+#[inline]
+fn checked_padded_len(length: usize) -> Option<usize> {
+  length
+    .checked_add(WAL_RECORD_ALIGNMENT - 1)
+    .map(|aligned| aligned & !(WAL_RECORD_ALIGNMENT - 1))
+}
+
 /// Parse a single WAL record from buffer at given offset
 /// Returns None if record is invalid or truncated
 pub fn parse_wal_record(buffer: &[u8], offset: usize) -> Option<ParsedWalRecord> {
-  if offset + 4 > buffer.len() {
+  if !has_bytes(buffer.len(), offset, 4) {
     return None;
   }
 
@@ -97,31 +112,41 @@ pub fn parse_wal_record(buffer: &[u8], offset: usize) -> Option<ParsedWalRecord>
   }
 
   // Check if full record is available
-  let pad_len = padding_for(rec_len, WAL_RECORD_ALIGNMENT);
-  let total_len = rec_len + pad_len;
+  let total_len = checked_padded_len(rec_len)?;
 
-  if offset + total_len > buffer.len() {
+  if !has_bytes(buffer.len(), offset, total_len) {
     return None; // Truncated
   }
 
   // Read header fields
-  let record_type_byte = buffer[offset + 4];
-  let flags = buffer[offset + 5];
-  let txid = read_u64(buffer, offset + 8);
-  let payload_len = read_u32(buffer, offset + 16) as usize;
+  let record_type_offset = offset.checked_add(4)?;
+  let flags_offset = offset.checked_add(5)?;
+  let txid_offset = offset.checked_add(8)?;
+  let payload_len_offset = offset.checked_add(16)?;
+  let record_type_byte = buffer[record_type_offset];
+  let flags = buffer[flags_offset];
+  let txid = read_u64(buffer, txid_offset);
+  let payload_len = read_u32(buffer, payload_len_offset) as usize;
 
   // Validate payload length
-  if WAL_RECORD_HEADER_SIZE + payload_len + 4 != rec_len {
+  let expected_rec_len = WAL_RECORD_HEADER_SIZE
+    .checked_add(payload_len)?
+    .checked_add(4)?;
+  if expected_rec_len != rec_len {
     return None;
   }
 
   // Extract payload
-  let payload_start = offset + WAL_RECORD_HEADER_SIZE;
-  let payload = buffer[payload_start..payload_start + payload_len].to_vec();
+  let payload_start = offset.checked_add(WAL_RECORD_HEADER_SIZE)?;
+  let payload_end = payload_start.checked_add(payload_len)?;
+  if payload_end > buffer.len() {
+    return None;
+  }
+  let payload = buffer[payload_start..payload_end].to_vec();
 
   // Verify CRC
-  let crc_start = offset + 4;
-  let crc_end = offset + WAL_RECORD_HEADER_SIZE + payload_len;
+  let crc_start = record_type_offset;
+  let crc_end = payload_end;
   let stored_crc = read_u32(buffer, crc_end);
   let computed_crc = crc32c(&buffer[crc_start..crc_end]);
 
@@ -136,7 +161,7 @@ pub fn parse_wal_record(buffer: &[u8], offset: usize) -> Option<ParsedWalRecord>
     flags,
     txid,
     payload,
-    record_end: offset + total_len,
+    record_end: offset.checked_add(total_len)?,
   })
 }
 
@@ -158,15 +183,16 @@ pub fn scan_wal(buffer: &[u8]) -> Vec<ParsedWalRecord> {
   records
 }
 
-/// Extract committed transactions from WAL records
-/// Returns records grouped by committed transaction
-pub fn extract_committed_transactions(
+/// Extract committed transactions from WAL records in COMMIT-record order.
+/// Returns records grouped by committed transaction. Recovery replays these
+/// in order, so the ordering must match the WAL's COMMIT serialization.
+pub fn extract_committed_transactions_in_order(
   records: &[ParsedWalRecord],
-) -> std::collections::HashMap<TxId, Vec<&ParsedWalRecord>> {
+) -> Vec<(TxId, Vec<&ParsedWalRecord>)> {
   use std::collections::HashMap;
 
   let mut pending: HashMap<TxId, Vec<&ParsedWalRecord>> = HashMap::new();
-  let mut committed: HashMap<TxId, Vec<&ParsedWalRecord>> = HashMap::new();
+  let mut committed = Vec::new();
 
   for record in records {
     let txid = record.txid;
@@ -177,7 +203,7 @@ pub fn extract_committed_transactions(
       }
       WalRecordType::Commit => {
         if let Some(tx_records) = pending.remove(&txid) {
-          committed.insert(txid, tx_records);
+          committed.push((txid, tx_records));
         }
       }
       WalRecordType::Rollback => {
@@ -569,9 +595,19 @@ pub fn parse_create_node_payload(payload: &[u8]) -> Option<CreateNodeData> {
   }
   let node_id = read_u64(payload, 0);
   let key_len = read_u32(payload, 8) as usize;
-  let key = if key_len > 0 && payload.len() >= 12 + key_len {
-    String::from_utf8(payload[12..12 + key_len].to_vec()).ok()
+  if !has_bytes(payload.len(), 12, key_len) {
+    return None;
+  }
+  let key = if key_len > 0 {
+    let key_end = 12usize.checked_add(key_len)?;
+    if key_end != payload.len() {
+      return None;
+    }
+    Some(String::from_utf8(payload[12..key_end].to_vec()).ok()?)
   } else {
+    if payload.len() != 12 {
+      return None;
+    }
     None
   };
   Some(CreateNodeData { node_id, key })
@@ -583,30 +619,37 @@ pub fn parse_create_nodes_batch_payload(payload: &[u8]) -> Option<Vec<CreateNode
     return None;
   }
   let count = read_u32(payload, 0) as usize;
+  if count > (payload.len() - 4) / 12 {
+    return None;
+  }
   let mut nodes = Vec::with_capacity(count);
   let mut offset = 4;
 
   for _ in 0..count {
-    if offset + 12 > payload.len() {
+    if !has_bytes(payload.len(), offset, 12) {
       return None;
     }
     let node_id = read_u64(payload, offset);
-    offset += 8;
+    offset = offset.checked_add(8)?;
     let key_len = read_u32(payload, offset) as usize;
-    offset += 4;
-    if offset + key_len > payload.len() {
+    offset = offset.checked_add(4)?;
+    if !has_bytes(payload.len(), offset, key_len) {
       return None;
     }
     let key = if key_len > 0 {
-      let key_bytes = payload[offset..offset + key_len].to_vec();
-      offset += key_len;
-      String::from_utf8(key_bytes).ok()
+      let key_end = offset.checked_add(key_len)?;
+      let key_bytes = payload[offset..key_end].to_vec();
+      offset = key_end;
+      Some(String::from_utf8(key_bytes).ok()?)
     } else {
       None
     };
     nodes.push(CreateNodeData { node_id, key });
   }
 
+  if offset != payload.len() {
+    return None;
+  }
   Some(nodes)
 }
 
@@ -652,19 +695,25 @@ pub fn parse_add_edges_batch_payload(payload: &[u8]) -> Option<Vec<AddEdgeData>>
     return None;
   }
   let count = read_u32(payload, 0) as usize;
+  if count > (payload.len() - 4) / 20 {
+    return None;
+  }
   let mut edges = Vec::with_capacity(count);
   let mut offset = 4;
   for _ in 0..count {
-    if offset + 20 > payload.len() {
+    if !has_bytes(payload.len(), offset, 20) {
       return None;
     }
     let src = read_u64(payload, offset);
-    offset += 8;
+    offset = offset.checked_add(8)?;
     let etype = read_u32(payload, offset);
-    offset += 4;
+    offset = offset.checked_add(4)?;
     let dst = read_u64(payload, offset);
-    offset += 8;
+    offset = offset.checked_add(8)?;
     edges.push(AddEdgeData { src, etype, dst });
+  }
+  if offset != payload.len() {
+    return None;
   }
   Some(edges)
 }
@@ -689,19 +738,25 @@ pub fn parse_add_edge_props_payload(payload: &[u8]) -> Option<AddEdgePropsData> 
   let dst = read_u64(payload, 12);
   let count = read_u32(payload, 20) as usize;
 
+  if count > (payload.len() - 24) / 5 {
+    return None;
+  }
   let mut props = Vec::with_capacity(count);
   let mut offset = 24;
   for _ in 0..count {
-    if offset + 4 > payload.len() {
+    if !has_bytes(payload.len(), offset, 4) {
       return None;
     }
     let key_id = read_u32(payload, offset);
-    offset += 4;
+    offset = offset.checked_add(4)?;
     let (value, consumed) = parse_prop_value(payload, offset)?;
-    offset += consumed;
+    offset = offset.checked_add(consumed)?;
     props.push((key_id, value));
   }
 
+  if offset != payload.len() {
+    return None;
+  }
   Some(AddEdgePropsData {
     src,
     etype,
@@ -716,31 +771,37 @@ pub fn parse_add_edges_props_batch_payload(payload: &[u8]) -> Option<Vec<AddEdge
     return None;
   }
   let count = read_u32(payload, 0) as usize;
+  if count > (payload.len() - 4) / 24 {
+    return None;
+  }
   let mut edges = Vec::with_capacity(count);
   let mut offset = 4;
 
   for _ in 0..count {
-    if offset + 24 > payload.len() {
+    if !has_bytes(payload.len(), offset, 24) {
       return None;
     }
     let src = read_u64(payload, offset);
-    offset += 8;
+    offset = offset.checked_add(8)?;
     let etype = read_u32(payload, offset);
-    offset += 4;
+    offset = offset.checked_add(4)?;
     let dst = read_u64(payload, offset);
-    offset += 8;
+    offset = offset.checked_add(8)?;
     let prop_count = read_u32(payload, offset) as usize;
-    offset += 4;
+    offset = offset.checked_add(4)?;
 
+    if prop_count > (payload.len() - offset) / 5 {
+      return None;
+    }
     let mut props = Vec::with_capacity(prop_count);
     for _ in 0..prop_count {
-      if offset + 4 > payload.len() {
+      if !has_bytes(payload.len(), offset, 4) {
         return None;
       }
       let key_id = read_u32(payload, offset);
-      offset += 4;
+      offset = offset.checked_add(4)?;
       let (value, consumed) = parse_prop_value(payload, offset)?;
-      offset += consumed;
+      offset = offset.checked_add(consumed)?;
       props.push((key_id, value));
     }
 
@@ -752,6 +813,9 @@ pub fn parse_add_edges_props_batch_payload(payload: &[u8]) -> Option<Vec<AddEdge
     });
   }
 
+  if offset != payload.len() {
+    return None;
+  }
   Some(edges)
 }
 
@@ -774,10 +838,14 @@ pub fn parse_define_label_payload(payload: &[u8]) -> Option<DefineLabelData> {
   }
   let label_id = read_u32(payload, 0);
   let name_len = read_u32(payload, 4) as usize;
-  if payload.len() < 8 + name_len {
+  if !has_bytes(payload.len(), 8, name_len) {
     return None;
   }
-  let name = String::from_utf8(payload[8..8 + name_len].to_vec()).ok()?;
+  let name_end = 8usize.checked_add(name_len)?;
+  if name_end != payload.len() {
+    return None;
+  }
+  let name = String::from_utf8(payload[8..name_end].to_vec()).ok()?;
   Some(DefineLabelData { label_id, name })
 }
 
@@ -824,53 +892,58 @@ fn parse_prop_value(payload: &[u8], offset: usize) -> Option<(PropValue, usize)>
   match PropValueTag::from_u8(tag)? {
     PropValueTag::Null => Some((PropValue::Null, 1)),
     PropValueTag::Bool => {
-      if offset + 2 > payload.len() {
+      if !has_bytes(payload.len(), offset, 2) {
         return None;
       }
       Some((PropValue::Bool(payload[offset + 1] != 0), 2))
     }
     PropValueTag::I64 => {
-      if offset + 9 > payload.len() {
+      if !has_bytes(payload.len(), offset, 9) {
         return None;
       }
       Some((PropValue::I64(read_i64(payload, offset + 1)), 9))
     }
     PropValueTag::F64 => {
-      if offset + 9 > payload.len() {
+      if !has_bytes(payload.len(), offset, 9) {
         return None;
       }
       Some((PropValue::F64(read_f64(payload, offset + 1)), 9))
     }
     PropValueTag::String => {
-      if offset + 5 > payload.len() {
+      if !has_bytes(payload.len(), offset, 5) {
         return None;
       }
       let str_len = read_u32(payload, offset + 1) as usize;
-      if offset + 5 + str_len > payload.len() {
+      if !has_bytes(payload.len(), offset + 5, str_len) {
         return None;
       }
-      let s = String::from_utf8(payload[offset + 5..offset + 5 + str_len].to_vec()).ok()?;
-      Some((PropValue::String(s), 5 + str_len))
+      let string_start = offset.checked_add(5)?;
+      let string_end = string_start.checked_add(str_len)?;
+      let s = String::from_utf8(payload[string_start..string_end].to_vec()).ok()?;
+      Some((PropValue::String(s), 5usize.checked_add(str_len)?))
     }
     PropValueTag::VectorF32 => {
-      if offset + 5 > payload.len() {
+      if !has_bytes(payload.len(), offset, 5) {
         return None;
       }
       let dimensions = read_u32(payload, offset + 1) as usize;
-      if offset + 5 + dimensions * 4 > payload.len() {
+      let vector_bytes = dimensions.checked_mul(4)?;
+      if !has_bytes(payload.len(), offset + 5, vector_bytes) {
         return None;
       }
+      let vector_start = offset.checked_add(5)?;
       let mut vector = Vec::with_capacity(dimensions);
       for i in 0..dimensions {
-        let bytes = [
-          payload[offset + 5 + i * 4],
-          payload[offset + 5 + i * 4 + 1],
-          payload[offset + 5 + i * 4 + 2],
-          payload[offset + 5 + i * 4 + 3],
-        ];
+        let element_offset = vector_start.checked_add(i.checked_mul(4)?)?;
+        let element_end = element_offset.checked_add(4)?;
+        let bytes = payload.get(element_offset..element_end)?;
+        let bytes = [bytes[0], bytes[1], bytes[2], bytes[3]];
         vector.push(f32::from_le_bytes(bytes));
       }
-      Some((PropValue::VectorF32(vector), 5 + dimensions * 4))
+      Some((
+        PropValue::VectorF32(vector),
+        5usize.checked_add(vector_bytes)?,
+      ))
     }
   }
 }
@@ -890,7 +963,10 @@ pub fn parse_set_node_prop_payload(payload: &[u8]) -> Option<SetNodePropData> {
   }
   let node_id = read_u64(payload, 0);
   let key_id = read_u32(payload, 8);
-  let (value, _) = parse_prop_value(payload, 12)?;
+  let (value, consumed) = parse_prop_value(payload, 12)?;
+  if 12usize.checked_add(consumed)? != payload.len() {
+    return None;
+  }
   Some(SetNodePropData {
     node_id,
     key_id,
@@ -934,19 +1010,22 @@ pub fn parse_set_node_vector_payload(payload: &[u8]) -> Option<SetNodeVectorData
   let prop_key_id = read_u32(payload, 8);
   let dimensions = read_u32(payload, 12) as usize;
 
-  if payload.len() < 16 + dimensions * 4 {
+  let vector_bytes = dimensions.checked_mul(4)?;
+  if !has_bytes(payload.len(), 16, vector_bytes) {
     return None;
   }
 
+  let vector_start: usize = 16;
   let mut vector = Vec::with_capacity(dimensions);
   for i in 0..dimensions {
-    let bytes = [
-      payload[16 + i * 4],
-      payload[16 + i * 4 + 1],
-      payload[16 + i * 4 + 2],
-      payload[16 + i * 4 + 3],
-    ];
+    let element_offset = vector_start.checked_add(i.checked_mul(4)?)?;
+    let element_end = element_offset.checked_add(4)?;
+    let bytes = payload.get(element_offset..element_end)?;
+    let bytes = [bytes[0], bytes[1], bytes[2], bytes[3]];
     vector.push(f32::from_le_bytes(bytes));
+  }
+  if 16usize.checked_add(vector_bytes)? != payload.len() {
+    return None;
   }
 
   Some(SetNodeVectorData {
@@ -995,7 +1074,10 @@ pub fn parse_set_edge_prop_payload(payload: &[u8]) -> Option<SetEdgePropData> {
   let etype = read_u32(payload, 8);
   let dst = read_u64(payload, 12);
   let key_id = read_u32(payload, 20);
-  let (value, _) = parse_prop_value(payload, 24)?;
+  let (value, consumed) = parse_prop_value(payload, 24)?;
+  if 24usize.checked_add(consumed)? != payload.len() {
+    return None;
+  }
   Some(SetEdgePropData {
     src,
     etype,
@@ -1025,19 +1107,25 @@ pub fn parse_set_edge_props_payload(payload: &[u8]) -> Option<SetEdgePropsData> 
   let dst = read_u64(payload, 12);
   let count = read_u32(payload, 20) as usize;
 
+  if count > (payload.len() - 24) / 5 {
+    return None;
+  }
   let mut props = Vec::with_capacity(count);
   let mut offset = 24;
   for _ in 0..count {
-    if offset + 4 > payload.len() {
+    if !has_bytes(payload.len(), offset, 4) {
       return None;
     }
     let key_id = read_u32(payload, offset);
-    offset += 4;
+    offset = offset.checked_add(4)?;
     let (value, consumed) = parse_prop_value(payload, offset)?;
-    offset += consumed;
+    offset = offset.checked_add(consumed)?;
     props.push((key_id, value));
   }
 
+  if offset != payload.len() {
+    return None;
+  }
   Some(SetEdgePropsData {
     src,
     etype,
@@ -1234,5 +1322,75 @@ mod tests {
     assert_eq!(data.prop_key_id, 10);
     assert_eq!(data.dimensions, 4);
     assert_eq!(data.vector, vector);
+  }
+
+  #[test]
+  #[allow(clippy::type_complexity)]
+  fn test_wal_count_corruption_returns_none_without_panicking() {
+    let mut create_nodes = vec![0u8; 4];
+    write_u32(&mut create_nodes, 0, u32::MAX);
+    let mut add_edges = vec![0u8; 4];
+    write_u32(&mut add_edges, 0, u32::MAX);
+    let mut add_edge_props = vec![0u8; 24];
+    write_u32(&mut add_edge_props, 20, u32::MAX);
+    let mut add_edges_props_batch = vec![0u8; 4];
+    write_u32(&mut add_edges_props_batch, 0, u32::MAX);
+    let mut set_edge_props = vec![0u8; 24];
+    write_u32(&mut set_edge_props, 20, u32::MAX);
+    let mut set_node_vector = vec![0u8; 16];
+    write_u32(&mut set_node_vector, 12, u32::MAX);
+    let mut property_vector = vec![PropValueTag::VectorF32 as u8, 0, 0, 0, 0, 0];
+    property_vector[1..5].copy_from_slice(&u32::MAX.to_le_bytes());
+
+    let cases: [(&str, Box<dyn Fn() -> bool>); 7] = [
+      (
+        "create nodes",
+        Box::new(move || parse_create_nodes_batch_payload(&create_nodes).is_none()),
+      ),
+      (
+        "add edges",
+        Box::new(move || parse_add_edges_batch_payload(&add_edges).is_none()),
+      ),
+      (
+        "add edge props",
+        Box::new(move || parse_add_edge_props_payload(&add_edge_props).is_none()),
+      ),
+      (
+        "add edges props batch",
+        Box::new(move || parse_add_edges_props_batch_payload(&add_edges_props_batch).is_none()),
+      ),
+      (
+        "set edge props",
+        Box::new(move || parse_set_edge_props_payload(&set_edge_props).is_none()),
+      ),
+      (
+        "set node vector",
+        Box::new(move || parse_set_node_vector_payload(&set_node_vector).is_none()),
+      ),
+      (
+        "property vector",
+        Box::new(move || parse_prop_value(&property_vector, 0).is_none()),
+      ),
+    ];
+
+    for (name, parse) in cases {
+      let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(parse));
+      assert!(result.is_ok(), "{name} count panicked");
+      assert!(result.expect("panic checked"), "{name} count was accepted");
+    }
+
+    let valid_batch = build_create_nodes_batch_payload(&[(1, Some("a")), (2, Some("b"))]);
+    for count in [0u32, 1, u32::MAX] {
+      let mut corrupted = valid_batch.clone();
+      write_u32(&mut corrupted, 0, count);
+      let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        parse_create_nodes_batch_payload(&corrupted)
+      }));
+      assert!(result.is_ok(), "batch count {count} panicked");
+      assert!(
+        result.expect("panic checked").is_none(),
+        "batch count {count} accepted"
+      );
+    }
   }
 }

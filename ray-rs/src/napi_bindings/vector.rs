@@ -11,6 +11,7 @@ use crate::api::vector_search::{
   VectorIndexError as RustVectorIndexError, VectorIndexOptions as RustVectorIndexOptions,
   VectorIndexStats as RustVectorIndexStats, VectorSearchHit as RustVectorSearchHit,
 };
+use crate::napi_bindings::validation;
 use crate::vector::{
   DistanceMetric as RustDistanceMetric, IvfConfig as RustIvfConfig, IvfIndex as RustIvfIndex,
   IvfPqConfig as RustIvfPqConfig, IvfPqIndex as RustIvfPqIndex, MultiQueryAggregation,
@@ -97,19 +98,22 @@ pub struct JsIvfConfig {
   pub metric: Option<JsDistanceMetric>,
 }
 
-impl From<JsIvfConfig> for RustIvfConfig {
-  fn from(c: JsIvfConfig) -> Self {
+impl JsIvfConfig {
+  fn into_rust(self) -> Result<RustIvfConfig> {
+    let c = self;
     let mut config = RustIvfConfig::default();
     if let Some(n) = c.n_clusters {
-      config.n_clusters = n as usize;
+      config.n_clusters =
+        validation::positive_usize("nClusters", n as i64, validation::MAX_VECTOR_PARAM)?;
     }
     if let Some(n) = c.n_probe {
-      config.n_probe = n as usize;
+      config.n_probe =
+        validation::positive_usize("nProbe", n as i64, validation::MAX_VECTOR_PARAM)?;
     }
     if let Some(m) = c.metric {
       config.metric = m.into();
     }
-    config
+    Ok(config)
   }
 }
 
@@ -129,19 +133,23 @@ pub struct JsPqConfig {
   pub max_iterations: Option<i32>,
 }
 
-impl From<JsPqConfig> for RustPqConfig {
-  fn from(c: JsPqConfig) -> Self {
+impl JsPqConfig {
+  fn into_rust(self) -> Result<RustPqConfig> {
+    let c = self;
     let mut config = RustPqConfig::default();
     if let Some(n) = c.num_subspaces {
-      config.num_subspaces = n as usize;
+      config.num_subspaces =
+        validation::positive_usize("numSubspaces", n as i64, validation::MAX_VECTOR_PARAM)?;
     }
     if let Some(n) = c.num_centroids {
-      config.num_centroids = n as usize;
+      config.num_centroids =
+        validation::positive_usize("numCentroids", n as i64, validation::MAX_VECTOR_PARAM)?;
     }
     if let Some(n) = c.max_iterations {
-      config.max_iterations = n as usize;
+      config.max_iterations =
+        validation::positive_usize("maxIterations", n as i64, validation::MAX_VECTOR_PARAM)?;
     }
-    config
+    Ok(config)
   }
 }
 
@@ -153,10 +161,24 @@ impl From<JsPqConfig> for RustPqConfig {
 #[napi(object)]
 #[derive(Debug, Default)]
 pub struct JsSearchOptions {
-  /// Number of clusters to probe (overrides index default)
+  /// Number of clusters to probe (overrides index default; must be positive)
   pub n_probe: Option<i32>,
   /// Minimum similarity threshold (0-1)
   pub threshold: Option<f64>,
+}
+
+impl JsSearchOptions {
+  fn validated(&self) -> Result<(Option<usize>, Option<f32>)> {
+    let n_probe = self
+      .n_probe
+      .map(|n| validation::positive_usize("nProbe", n as i64, validation::MAX_VECTOR_PARAM))
+      .transpose()?;
+    let threshold = self
+      .threshold
+      .map(|value| validation::ratio("threshold", value).map(|value| value as f32))
+      .transpose()?;
+    Ok((n_probe, threshold))
+  }
 }
 
 // ============================================================================
@@ -225,9 +247,14 @@ impl JsIvfIndex {
   /// Create a new IVF index
   #[napi(constructor)]
   pub fn new(dimensions: i32, config: Option<JsIvfConfig>) -> Result<JsIvfIndex> {
-    let rust_config = config.unwrap_or_default().into();
+    let dimensions = validation::positive_usize(
+      "dimensions",
+      dimensions as i64,
+      validation::MAX_VECTOR_DIMENSIONS,
+    )?;
+    let rust_config = config.unwrap_or_default().into_rust()?;
     Ok(JsIvfIndex {
-      inner: RwLock::new(RustIvfIndex::new(dimensions as usize, rust_config)),
+      inner: RwLock::new(RustIvfIndex::new(dimensions, rust_config)),
     })
   }
 
@@ -256,13 +283,15 @@ impl JsIvfIndex {
   /// Call this before train() with representative vectors from your dataset.
   #[napi]
   pub fn add_training_vectors(&self, vectors: Vec<f64>, num_vectors: i32) -> Result<()> {
+    let num_vectors =
+      validation::non_negative_usize("numVectors", num_vectors as i64, validation::MAX_COUNT)?;
     let mut index = self
       .inner
       .write()
       .map_err(|e| Error::from_reason(e.to_string()))?;
     let vectors_f32: Vec<f32> = vectors.iter().map(|&v| v as f32).collect();
     index
-      .add_training_vectors(&vectors_f32, num_vectors as usize)
+      .add_training_vectors(&vectors_f32, num_vectors)
       .map_err(|e| Error::from_reason(format!("Failed to add training vectors: {e}")))
   }
 
@@ -285,13 +314,14 @@ impl JsIvfIndex {
   /// The index must be trained first.
   #[napi]
   pub fn insert(&self, vector_id: i64, vector: Vec<f64>) -> Result<()> {
+    let vector_id = validation::node_id("vectorId", vector_id)?;
     let mut index = self
       .inner
       .write()
       .map_err(|e| Error::from_reason(e.to_string()))?;
     let vector_f32: Vec<f32> = vector.iter().map(|&v| v as f32).collect();
     index
-      .insert(vector_id as u64, &vector_f32)
+      .insert(vector_id, &vector_f32)
       .map_err(|e| Error::from_reason(format!("Failed to insert vector: {e}")))
   }
 
@@ -300,12 +330,13 @@ impl JsIvfIndex {
   /// Requires the vector data to determine which cluster to remove from.
   #[napi]
   pub fn delete(&self, vector_id: i64, vector: Vec<f64>) -> Result<bool> {
+    let vector_id = validation::node_id("vectorId", vector_id)?;
     let mut index = self
       .inner
       .write()
       .map_err(|e| Error::from_reason(e.to_string()))?;
     let vector_f32: Vec<f32> = vector.iter().map(|&v| v as f32).collect();
-    Ok(index.delete(vector_id as u64, &vector_f32))
+    Ok(index.delete(vector_id, &vector_f32))
   }
 
   /// Clear all data from the index
@@ -341,13 +372,18 @@ impl JsIvfIndex {
 
     let query_f32: Vec<f32> = query.iter().map(|&v| v as f32).collect();
 
-    let rust_options = options.map(|o| RustSearchOptions {
-      n_probe: o.n_probe.map(|n| n as usize),
-      filter: None,
-      threshold: o.threshold.map(|t| t as f32),
-    });
+    let rust_options = options
+      .as_ref()
+      .map(JsSearchOptions::validated)
+      .transpose()?
+      .map(|(n_probe, threshold)| RustSearchOptions {
+        n_probe,
+        filter: None,
+        threshold,
+      });
 
-    let results = index.search(&manifest, &query_f32, k as usize, rust_options);
+    let k = validation::non_negative_usize("k", k as i64, validation::MAX_COUNT)?;
+    let results = index.search(&manifest, &query_f32, k, rust_options);
     Ok(results.into_iter().map(|r| r.into()).collect())
   }
 
@@ -379,19 +415,18 @@ impl JsIvfIndex {
 
     let query_refs: Vec<&[f32]> = queries_f32.iter().map(|q| q.as_slice()).collect();
 
-    let rust_options = options.map(|o| RustSearchOptions {
-      n_probe: o.n_probe.map(|n| n as usize),
-      filter: None,
-      threshold: o.threshold.map(|t| t as f32),
-    });
+    let rust_options = options
+      .as_ref()
+      .map(JsSearchOptions::validated)
+      .transpose()?
+      .map(|(n_probe, threshold)| RustSearchOptions {
+        n_probe,
+        filter: None,
+        threshold,
+      });
 
-    let results = index.search_multi(
-      &manifest,
-      &query_refs,
-      k as usize,
-      aggregation.into(),
-      rust_options,
-    );
+    let k = validation::non_negative_usize("k", k as i64, validation::MAX_COUNT)?;
+    let results = index.search_multi(&manifest, &query_refs, k, aggregation.into(), rust_options);
     Ok(results.into_iter().map(|r| r.into()).collect())
   }
 
@@ -456,13 +491,18 @@ impl JsIvfPqIndex {
     pq_config: Option<JsPqConfig>,
     use_residuals: Option<bool>,
   ) -> Result<JsIvfPqIndex> {
+    let dimensions = validation::positive_usize(
+      "dimensions",
+      dimensions as i64,
+      validation::MAX_VECTOR_DIMENSIONS,
+    )?;
     let config = RustIvfPqConfig {
-      ivf: ivf_config.unwrap_or_default().into(),
-      pq: pq_config.unwrap_or_default().into(),
+      ivf: ivf_config.unwrap_or_default().into_rust()?,
+      pq: pq_config.unwrap_or_default().into_rust()?,
       use_residuals: use_residuals.unwrap_or(true),
     };
 
-    let index = RustIvfPqIndex::new(dimensions as usize, config)
+    let index = RustIvfPqIndex::new(dimensions, config)
       .map_err(|e| Error::from_reason(format!("Failed to create index: {e}")))?;
 
     Ok(JsIvfPqIndex {
@@ -493,13 +533,15 @@ impl JsIvfPqIndex {
   /// Add training vectors
   #[napi]
   pub fn add_training_vectors(&self, vectors: Vec<f64>, num_vectors: i32) -> Result<()> {
+    let num_vectors =
+      validation::non_negative_usize("numVectors", num_vectors as i64, validation::MAX_COUNT)?;
     let mut index = self
       .inner
       .write()
       .map_err(|e| Error::from_reason(e.to_string()))?;
     let vectors_f32: Vec<f32> = vectors.iter().map(|&v| v as f32).collect();
     index
-      .add_training_vectors(&vectors_f32, num_vectors as usize)
+      .add_training_vectors(&vectors_f32, num_vectors)
       .map_err(|e| Error::from_reason(format!("Failed to add training vectors: {e}")))
   }
 
@@ -518,13 +560,14 @@ impl JsIvfPqIndex {
   /// Insert a vector
   #[napi]
   pub fn insert(&self, vector_id: i64, vector: Vec<f64>) -> Result<()> {
+    let vector_id = validation::node_id("vectorId", vector_id)?;
     let mut index = self
       .inner
       .write()
       .map_err(|e| Error::from_reason(e.to_string()))?;
     let vector_f32: Vec<f32> = vector.iter().map(|&v| v as f32).collect();
     index
-      .insert(vector_id as u64, &vector_f32)
+      .insert(vector_id, &vector_f32)
       .map_err(|e| Error::from_reason(format!("Failed to insert vector: {e}")))
   }
 
@@ -533,12 +576,13 @@ impl JsIvfPqIndex {
   /// Requires the vector data to determine which cluster to remove from.
   #[napi]
   pub fn delete(&self, vector_id: i64, vector: Vec<f64>) -> Result<bool> {
+    let vector_id = validation::node_id("vectorId", vector_id)?;
     let mut index = self
       .inner
       .write()
       .map_err(|e| Error::from_reason(e.to_string()))?;
     let vector_f32: Vec<f32> = vector.iter().map(|&v| v as f32).collect();
-    Ok(index.delete(vector_id as u64, &vector_f32))
+    Ok(index.delete(vector_id, &vector_f32))
   }
 
   /// Clear the index
@@ -572,13 +616,20 @@ impl JsIvfPqIndex {
 
     let query_f32: Vec<f32> = query.iter().map(|&v| v as f32).collect();
 
-    let rust_options = options.map(|o| crate::vector::ivf_pq::IvfPqSearchOptions {
-      n_probe: o.n_probe.map(|n| n as usize),
-      filter: None,
-      threshold: o.threshold.map(|t| t as f32),
-    });
+    let rust_options = options
+      .as_ref()
+      .map(JsSearchOptions::validated)
+      .transpose()?
+      .map(
+        |(n_probe, threshold)| crate::vector::ivf_pq::IvfPqSearchOptions {
+          n_probe,
+          filter: None,
+          threshold,
+        },
+      );
 
-    let results = index.search(&manifest, &query_f32, k as usize, rust_options);
+    let k = validation::non_negative_usize("k", k as i64, validation::MAX_COUNT)?;
+    let results = index.search(&manifest, &query_f32, k, rust_options);
     Ok(results.into_iter().map(|r| r.into()).collect())
   }
 
@@ -608,19 +659,20 @@ impl JsIvfPqIndex {
 
     let query_refs: Vec<&[f32]> = queries_f32.iter().map(|q| q.as_slice()).collect();
 
-    let rust_options = options.map(|o| crate::vector::ivf_pq::IvfPqSearchOptions {
-      n_probe: o.n_probe.map(|n| n as usize),
-      filter: None,
-      threshold: o.threshold.map(|t| t as f32),
-    });
+    let rust_options = options
+      .as_ref()
+      .map(JsSearchOptions::validated)
+      .transpose()?
+      .map(
+        |(n_probe, threshold)| crate::vector::ivf_pq::IvfPqSearchOptions {
+          n_probe,
+          filter: None,
+          threshold,
+        },
+      );
 
-    let results = index.search_multi(
-      &manifest,
-      &query_refs,
-      k as usize,
-      aggregation.into(),
-      rust_options,
-    );
+    let k = validation::non_negative_usize("k", k as i64, validation::MAX_COUNT)?;
+    let results = index.search_multi(&manifest, &query_refs, k, aggregation.into(), rust_options);
     Ok(results.into_iter().map(|r| r.into()).collect())
   }
 
@@ -693,6 +745,9 @@ pub fn brute_force_search(
       "vectors and node_ids must have same length",
     ));
   }
+  for &node_id in &node_ids {
+    validation::node_id("nodeIds", node_id)?;
+  }
 
   let metric = metric.unwrap_or(JsDistanceMetric::Cosine);
   let rust_metric: RustDistanceMetric = metric.into();
@@ -712,7 +767,8 @@ pub fn brute_force_search(
 
   // Sort by distance
   results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-  results.truncate(k as usize);
+  let k = validation::non_negative_usize("k", k as i64, validation::MAX_COUNT)?;
+  results.truncate(k);
 
   Ok(
     results
@@ -747,64 +803,85 @@ pub struct VectorIndexOptions {
   pub ivf: Option<JsIvfConfig>,
   /// Minimum training vectors before index training (default: 1000)
   pub training_threshold: Option<i32>,
-  /// Maximum node IDs to cache for search results (default: 10_000)
+  /// Maximum node IDs to cache for search results (0 disables this cache)
   pub cache_max_size: Option<i32>,
 }
 
 impl VectorIndexOptions {
   fn into_rust(self) -> Result<RustVectorIndexOptions> {
-    if self.dimensions <= 0 {
-      return Err(Error::from_reason("dimensions must be positive"));
-    }
-
-    let mut options = RustVectorIndexOptions::new(self.dimensions as usize);
+    let dimensions = validation::positive_usize(
+      "dimensions",
+      self.dimensions as i64,
+      validation::MAX_VECTOR_DIMENSIONS,
+    )?;
+    let mut options = RustVectorIndexOptions::new(dimensions);
 
     if let Some(metric) = self.metric {
       options = options.with_metric(metric.into());
     }
 
     if let Some(row_group_size) = self.row_group_size {
-      if row_group_size <= 0 {
-        return Err(Error::from_reason("rowGroupSize must be positive"));
-      }
-      options = options.with_row_group_size(row_group_size as usize);
+      let row_group_size = validation::positive_usize(
+        "rowGroupSize",
+        row_group_size as i64,
+        validation::MAX_VECTOR_PARAM,
+      )?;
+      options = options.with_row_group_size(row_group_size);
     }
 
     if let Some(fragment_target_size) = self.fragment_target_size {
-      if fragment_target_size <= 0 {
-        return Err(Error::from_reason("fragmentTargetSize must be positive"));
-      }
-      options = options.with_fragment_target_size(fragment_target_size as usize);
+      let fragment_target_size = validation::positive_usize(
+        "fragmentTargetSize",
+        fragment_target_size as i64,
+        validation::MAX_VECTOR_PARAM,
+      )?;
+      options = options.with_fragment_target_size(fragment_target_size);
     }
 
     if let Some(ivf) = self.ivf {
-      if let Some(n_clusters) = ivf.n_clusters {
-        if n_clusters <= 0 {
-          return Err(Error::from_reason("ivf.nClusters must be positive"));
-        }
-        options = options.with_n_clusters(n_clusters as usize);
+      let JsIvfConfig {
+        n_clusters,
+        n_probe,
+        metric,
+      } = ivf;
+      JsIvfConfig {
+        n_clusters,
+        n_probe,
+        metric,
       }
-
-      if let Some(n_probe) = ivf.n_probe {
-        if n_probe <= 0 {
-          return Err(Error::from_reason("ivf.nProbe must be positive"));
-        }
-        options = options.with_n_probe(n_probe as usize);
+      .into_rust()?;
+      if let Some(n_clusters) = n_clusters {
+        options = options.with_n_clusters(validation::positive_usize(
+          "ivf.nClusters",
+          n_clusters as i64,
+          validation::MAX_VECTOR_PARAM,
+        )?);
+      }
+      if let Some(n_probe) = n_probe {
+        options = options.with_n_probe(validation::positive_usize(
+          "ivf.nProbe",
+          n_probe as i64,
+          validation::MAX_VECTOR_PARAM,
+        )?);
       }
     }
 
     if let Some(training_threshold) = self.training_threshold {
-      if training_threshold <= 0 {
-        return Err(Error::from_reason("trainingThreshold must be positive"));
-      }
-      options = options.with_training_threshold(training_threshold as usize);
+      let training_threshold = validation::positive_usize(
+        "trainingThreshold",
+        training_threshold as i64,
+        validation::MAX_COUNT,
+      )?;
+      options = options.with_training_threshold(training_threshold);
     }
 
     if let Some(cache_max_size) = self.cache_max_size {
-      if cache_max_size <= 0 {
-        return Err(Error::from_reason("cacheMaxSize must be positive"));
-      }
-      options = options.with_cache_max_size(cache_max_size as usize);
+      let cache_max_size = validation::non_negative_usize(
+        "cacheMaxSize",
+        cache_max_size as i64,
+        validation::MAX_CACHE_ENTRIES,
+      )?;
+      options = options.with_cache_max_size(cache_max_size);
     }
 
     if let Some(normalize) = self.normalize {
@@ -818,29 +895,25 @@ impl VectorIndexOptions {
 /// Options for similarity search
 #[napi(object)]
 pub struct SimilarOptions {
-  /// Number of results to return
+  /// Number of results to return (0 returns an empty result)
   pub k: i32,
   /// Minimum similarity threshold (0-1 for cosine)
   pub threshold: Option<f64>,
-  /// Number of clusters to probe for IVF (default: 10)
+  /// Number of clusters to probe for IVF (must be positive)
   pub n_probe: Option<i32>,
 }
 
 impl SimilarOptions {
   fn into_rust(self) -> Result<RustSimilarOptions> {
-    if self.k <= 0 {
-      return Err(Error::from_reason("k must be positive"));
-    }
-
-    let mut options = RustSimilarOptions::new(self.k as usize);
+    let k = validation::non_negative_usize("k", self.k as i64, validation::MAX_COUNT)?;
+    let mut options = RustSimilarOptions::new(k);
     if let Some(threshold) = self.threshold {
-      options = options.with_threshold(threshold as f32);
+      options = options.with_threshold(validation::ratio("threshold", threshold)? as f32);
     }
     if let Some(n_probe) = self.n_probe {
-      if n_probe <= 0 {
-        return Err(Error::from_reason("nProbe must be positive"));
-      }
-      options = options.with_n_probe(n_probe as usize);
+      let n_probe =
+        validation::positive_usize("nProbe", n_probe as i64, validation::MAX_VECTOR_PARAM)?;
+      options = options.with_n_probe(n_probe);
     }
     Ok(options)
   }
@@ -912,26 +985,28 @@ impl VectorIndex {
   /// Set/update a vector for a node
   #[napi]
   pub fn set(&self, node_id: i64, vector: Vec<f64>) -> Result<()> {
+    let node_id = validation::node_id("nodeId", node_id)?;
     let mut index = self
       .inner
       .write()
       .map_err(|e| Error::from_reason(e.to_string()))?;
     let vector_f32: Vec<f32> = vector.iter().map(|&v| v as f32).collect();
     index
-      .set(node_id as u64, &vector_f32)
+      .set(node_id, &vector_f32)
       .map_err(map_vector_index_error)
   }
 
   /// Get the vector for a node (if any)
   #[napi]
   pub fn get(&self, node_id: i64) -> Result<Option<Vec<f64>>> {
+    let node_id = validation::node_id("nodeId", node_id)?;
     let index = self
       .inner
       .read()
       .map_err(|e| Error::from_reason(e.to_string()))?;
     Ok(
       index
-        .get(node_id as u64)
+        .get(node_id)
         .map(|v| v.iter().map(|&x| x as f64).collect()),
     )
   }
@@ -939,21 +1014,23 @@ impl VectorIndex {
   /// Delete the vector for a node
   #[napi]
   pub fn delete(&self, node_id: i64) -> Result<bool> {
+    let node_id = validation::node_id("nodeId", node_id)?;
     let mut index = self
       .inner
       .write()
       .map_err(|e| Error::from_reason(e.to_string()))?;
-    index.delete(node_id as u64).map_err(map_vector_index_error)
+    index.delete(node_id).map_err(map_vector_index_error)
   }
 
   /// Check if a node has a vector
   #[napi]
   pub fn has(&self, node_id: i64) -> Result<bool> {
+    let node_id = validation::node_id("nodeId", node_id)?;
     let index = self
       .inner
       .read()
       .map_err(|e| Error::from_reason(e.to_string()))?;
-    Ok(index.has(node_id as u64))
+    Ok(index.has(node_id))
   }
 
   /// Build/rebuild the IVF index for faster search
@@ -1007,4 +1084,106 @@ impl VectorIndex {
 #[napi]
 pub fn create_vector_index(options: VectorIndexOptions) -> Result<VectorIndex> {
   VectorIndex::new(options)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn validates_ivf_pq_and_search_options() {
+    assert!(JsIvfConfig {
+      n_clusters: Some(1),
+      n_probe: Some(1),
+      metric: None,
+    }
+    .into_rust()
+    .is_ok());
+    for value in [0, -1, (validation::MAX_VECTOR_PARAM + 1) as i32] {
+      assert!(JsIvfConfig {
+        n_clusters: Some(value),
+        n_probe: None,
+        metric: None,
+      }
+      .into_rust()
+      .is_err());
+    }
+    assert!(JsPqConfig {
+      num_subspaces: Some(1),
+      num_centroids: Some(1),
+      max_iterations: Some(1),
+    }
+    .into_rust()
+    .is_ok());
+    assert!(JsPqConfig {
+      num_subspaces: Some(0),
+      ..Default::default()
+    }
+    .into_rust()
+    .is_err());
+    assert!(JsSearchOptions {
+      n_probe: Some(1),
+      threshold: Some(0.0),
+    }
+    .validated()
+    .is_ok());
+    assert!(JsSearchOptions {
+      n_probe: Some(0),
+      threshold: None,
+    }
+    .validated()
+    .is_err());
+    assert!(JsSearchOptions {
+      n_probe: None,
+      threshold: Some(2.0),
+    }
+    .validated()
+    .is_err());
+  }
+
+  #[test]
+  fn validates_index_dimensions_counts_and_zero_result_limits() {
+    assert!(JsIvfIndex::new(1, None).is_ok());
+    assert!(JsIvfIndex::new(0, None).is_err());
+    assert!(JsIvfIndex::new(-1, None).is_err());
+    assert!(JsIvfIndex::new((validation::MAX_VECTOR_DIMENSIONS + 1) as i32, None).is_err());
+    assert!(VectorIndexOptions {
+      dimensions: 1,
+      metric: None,
+      row_group_size: Some(1),
+      fragment_target_size: Some(1),
+      normalize: None,
+      ivf: None,
+      training_threshold: Some(1),
+      cache_max_size: Some(0),
+    }
+    .into_rust()
+    .is_ok());
+    assert!(VectorIndexOptions {
+      dimensions: 1,
+      metric: None,
+      row_group_size: Some(0),
+      fragment_target_size: None,
+      normalize: None,
+      ivf: None,
+      training_threshold: None,
+      cache_max_size: None,
+    }
+    .into_rust()
+    .is_err());
+    assert!(SimilarOptions {
+      k: 0,
+      threshold: Some(0.0),
+      n_probe: None,
+    }
+    .into_rust()
+    .is_ok());
+    assert!(SimilarOptions {
+      k: -1,
+      threshold: None,
+      n_probe: None,
+    }
+    .into_rust()
+    .is_err());
+  }
 }

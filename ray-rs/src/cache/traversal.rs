@@ -186,6 +186,9 @@ impl TraversalCache {
     direction: TraversalDirection,
     neighbors: Vec<Edge>,
   ) {
+    if self.cache.max_size() == 0 {
+      return;
+    }
     let key = Self::make_key(node_id, etype, direction);
 
     // Truncate if exceeds max neighbors per entry

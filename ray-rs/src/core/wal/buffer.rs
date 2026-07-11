@@ -162,6 +162,11 @@ impl WalBuffer {
     self.secondary_head
   }
 
+  /// Whether the secondary region contains records from a background cut.
+  pub fn has_secondary_records(&self) -> bool {
+    self.secondary_head > self.secondary_region_start
+  }
+
   /// Get active region (0=primary, 1=secondary)
   pub fn active_region(&self) -> u8 {
     self.active_region
@@ -253,8 +258,13 @@ impl WalBuffer {
 
   /// Merge secondary region records into primary region
   /// Called after checkpoint completes to preserve any writes that occurred during checkpoint
-  pub fn merge_secondary_into_primary(&mut self, pager: &mut FilePager) -> Result<()> {
-    // Read all records from secondary region (if any)
+  pub fn merge_secondary_into_primary_preserving_old(
+    &mut self,
+    pager: &mut FilePager,
+  ) -> Result<()> {
+    // Read all records from secondary region (if any). Keep the old primary
+    // bytes intact until the new checkpoint header is durable; the old header
+    // remains the crash fallback while this append happens.
     let has_secondary_records = self.secondary_head > self.secondary_region_start;
     let secondary_records = if has_secondary_records {
       self.scan_region(1, pager)?
@@ -262,24 +272,55 @@ impl WalBuffer {
       Vec::new()
     };
 
-    // Reset both regions - this must happen even if no secondary records exist,
-    // because checkpoint has incorporated all primary WAL data into the snapshot
+    let record_bytes: Vec<Vec<u8>> = secondary_records
+      .into_iter()
+      .map(|record| WalRecord::new(record.record_type, record.txid, record.payload).build())
+      .collect();
+    let required = record_bytes
+      .iter()
+      .map(|bytes| align_up(bytes.len(), WAL_RECORD_ALIGNMENT) as u64)
+      .sum::<u64>();
+    if self.primary_head.saturating_add(required) > self.primary_region_size {
+      return Err(KiteError::WalBufferFull);
+    }
+
+    let old_primary_head = self.primary_head;
+    // Append secondary records after the old primary head. The new header will
+    // set tail=old_primary_head, so the snapshot covers the retained prefix.
+    for record_bytes in record_bytes {
+      self.write_record_bytes_to_primary(&record_bytes, pager)?;
+    }
+
+    self.tail = old_primary_head;
+    self.secondary_head = self.secondary_region_start;
+    self.active_region = 0;
+    self.head = self.primary_head;
+
+    Ok(())
+  }
+
+  /// Merge secondary records into a fresh primary region.
+  ///
+  /// This is retained for standalone WAL-buffer callers and recovery paths
+  /// that already have a durable checkpoint marker. Checkpoint installation
+  /// uses `merge_secondary_into_primary_preserving_old` so the old header's
+  /// primary bytes remain intact until the new header is synced.
+  pub fn merge_secondary_into_primary(&mut self, pager: &mut FilePager) -> Result<()> {
+    let has_secondary_records = self.secondary_head > self.secondary_region_start;
+    let secondary_records = if has_secondary_records {
+      self.scan_region(1, pager)?
+    } else {
+      Vec::new()
+    };
+
     self.primary_head = 0;
     self.secondary_head = self.secondary_region_start;
     self.tail = 0;
     self.active_region = 0;
     self.head = 0;
 
-    // Re-write secondary records to primary region
     for record in secondary_records {
-      let ParsedWalRecord {
-        record_type,
-        txid,
-        payload,
-        ..
-      } = record;
-      // Rebuild the record and write it
-      let wal_record = WalRecord::new(record_type, txid, payload);
+      let wal_record = WalRecord::new(record.record_type, record.txid, record.payload);
       let record_bytes = wal_record.build();
       self.write_record_bytes_to_primary(&record_bytes, pager)?;
     }

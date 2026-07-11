@@ -5,8 +5,8 @@
 use crate::constants::SECTION_ALIGNMENT;
 use crate::error::{KiteError, Result};
 use crate::types::{SectionEntry, SectionId, SECTION_ENTRY_SIZE, SNAPSHOT_HEADER_SIZE};
-use crate::util::binary::{align_up, read_u32, read_u64};
-use crate::util::compression::CompressionType;
+use crate::util::binary::{read_u32, read_u64};
+use crate::util::compression::{CompressionType, MAX_DECOMPRESSED_BYTES};
 
 /// Parsed section table metadata
 #[derive(Debug, Clone)]
@@ -28,6 +28,20 @@ pub fn section_count_for_version(version: u32) -> usize {
   }
 }
 
+fn validate_declared_uncompressed_size(section_index: usize, size: u32) -> Result<()> {
+  let size = usize::try_from(size).map_err(|_| {
+    KiteError::InvalidSnapshot(format!(
+      "Section {section_index} declared uncompressed size does not fit in usize"
+    ))
+  })?;
+  if size > MAX_DECOMPRESSED_BYTES {
+    return Err(KiteError::InvalidSnapshot(format!(
+      "Section {section_index} declared uncompressed size {size} exceeds limit {MAX_DECOMPRESSED_BYTES}"
+    )));
+  }
+  Ok(())
+}
+
 /// Parse and validate the snapshot section table.
 ///
 /// `buffer` is the snapshot slice starting at the header.
@@ -37,8 +51,14 @@ pub fn parse_section_table(
   section_count: usize,
   base_offset: usize,
 ) -> Result<ParsedSections> {
-  let section_table_size = section_count * SECTION_ENTRY_SIZE;
-  let table_end = SNAPSHOT_HEADER_SIZE + section_table_size;
+  let section_table_size = section_count
+    .checked_mul(SECTION_ENTRY_SIZE)
+    .ok_or_else(|| {
+      KiteError::InvalidSnapshot("Snapshot section table size overflow".to_string())
+    })?;
+  let table_end = SNAPSHOT_HEADER_SIZE
+    .checked_add(section_table_size)
+    .ok_or_else(|| KiteError::InvalidSnapshot("Snapshot section table end overflow".to_string()))?;
 
   if buffer.len() < table_end {
     return Err(KiteError::InvalidSnapshot(format!(
@@ -47,15 +67,22 @@ pub fn parse_section_table(
     )));
   }
 
-  let data_start = align_up(table_end, SECTION_ALIGNMENT);
+  let data_start = table_end
+    .checked_add(SECTION_ALIGNMENT - 1)
+    .map(|value| value & !(SECTION_ALIGNMENT - 1))
+    .ok_or_else(|| KiteError::InvalidSnapshot("Snapshot data start overflow".to_string()))?;
   let mut sections = Vec::with_capacity(section_count);
   let mut ranges: Vec<(usize, usize, usize)> = Vec::new();
   let mut max_section_end = table_end;
 
   let mut offset = SNAPSHOT_HEADER_SIZE;
   for idx in 0..section_count {
-    let section_offset = read_u64(buffer, offset) as usize;
-    let section_length = read_u64(buffer, offset + 8) as usize;
+    let section_offset = usize::try_from(read_u64(buffer, offset)).map_err(|_| {
+      KiteError::InvalidSnapshot(format!("Section {idx} offset does not fit in usize"))
+    })?;
+    let section_length = usize::try_from(read_u64(buffer, offset + 8)).map_err(|_| {
+      KiteError::InvalidSnapshot(format!("Section {idx} length does not fit in usize"))
+    })?;
     let compression = read_u32(buffer, offset + 16);
     let uncompressed_size = read_u32(buffer, offset + 20);
     offset += SECTION_ENTRY_SIZE;
@@ -82,6 +109,8 @@ pub fn parse_section_table(
       )));
     }
 
+    validate_declared_uncompressed_size(idx, uncompressed_size)?;
+
     if section_offset < data_start {
       return Err(KiteError::InvalidSnapshot(format!(
         "Section {idx} offset {section_offset} overlaps header/table"
@@ -101,7 +130,7 @@ pub fn parse_section_table(
     })?;
 
     if compression_type == CompressionType::None {
-      if uncompressed_size != 0 && uncompressed_size != section_length as u32 {
+      if uncompressed_size != 0 && usize::try_from(uncompressed_size).ok() != Some(section_length) {
         return Err(KiteError::InvalidSnapshot(format!(
           "Section {idx} uncompressed_size {uncompressed_size} invalid for uncompressed data"
         )));
@@ -129,8 +158,17 @@ pub fn parse_section_table(
 
     ranges.push((section_offset, section_end, idx));
 
+    let absolute_offset = section_offset.checked_add(base_offset).ok_or_else(|| {
+      KiteError::InvalidSnapshot(format!("Section {idx} absolute offset overflow"))
+    })?;
+    absolute_offset
+      .checked_add(section_length)
+      .ok_or_else(|| KiteError::InvalidSnapshot(format!("Section {idx} absolute end overflow")))?;
+
     sections.push(SectionEntry {
-      offset: (section_offset + base_offset) as u64,
+      offset: u64::try_from(absolute_offset).map_err(|_| {
+        KiteError::InvalidSnapshot(format!("Section {idx} absolute offset overflow"))
+      })?,
       length: section_length as u64,
       compression,
       uncompressed_size,
@@ -160,7 +198,7 @@ pub fn parse_section_table(
 mod tests {
   use super::*;
   use crate::core::snapshot::writer::{build_snapshot_to_memory, SnapshotBuildInput};
-  use crate::util::binary::{read_u32, write_u64};
+  use crate::util::binary::{align_up, read_u32, write_u64};
   use std::collections::HashMap;
 
   fn build_empty_snapshot() -> Vec<u8> {
@@ -212,5 +250,17 @@ mod tests {
     let message = format!("{err:?}");
     assert!(message.contains("aligned"));
     assert!(section.length > 0);
+  }
+
+  #[test]
+  fn test_declared_size_policy_allows_large_64_bit_sections() {
+    let large_size = (256 * 1024 * 1024 + 1) as u32;
+    let result = validate_declared_uncompressed_size(0, large_size);
+
+    if cfg!(target_pointer_width = "64") {
+      assert!(result.is_ok());
+    } else {
+      assert!(result.is_err());
+    }
   }
 }

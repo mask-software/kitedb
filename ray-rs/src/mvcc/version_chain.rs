@@ -6,11 +6,12 @@
 //! Ported from src/mvcc/version-chain.ts
 
 use std::collections::HashMap;
+use std::hash::Hash;
 
 use crate::mvcc::visibility::VersionedRecord;
 use crate::types::{
   ETypeId, EdgeVersionData, LabelId, NodeDelta, NodeId, NodeVersionData, PropKeyId, PropValueRef,
-  Timestamp, TxId,
+  Timestamp, TxId, TxKey,
 };
 
 // ============================================================================
@@ -23,7 +24,7 @@ const NULL_IDX: u32 = u32::MAX;
 /// SOA storage for property versions - stores version metadata in parallel arrays
 /// This reduces memory overhead compared to storing full VersionedRecord structs
 #[derive(Debug)]
-pub struct SoaPropertyVersions<T> {
+pub struct SoaPropertyVersions<T, K = u64> {
   /// Data values
   data: Vec<T>,
   /// Transaction IDs
@@ -35,12 +36,12 @@ pub struct SoaPropertyVersions<T> {
   /// Deleted flags
   deleted: Vec<bool>,
   /// Key -> head index mapping
-  heads: HashMap<u64, u32>,
+  heads: HashMap<K, u32>,
   /// Free list for reusing slots
   free_list: Vec<u32>,
 }
 
-impl<T: Clone> SoaPropertyVersions<T> {
+impl<T: Clone, K: Eq + Hash + Clone> SoaPropertyVersions<T, K> {
   pub fn new() -> Self {
     Self {
       data: Vec::new(),
@@ -54,7 +55,7 @@ impl<T: Clone> SoaPropertyVersions<T> {
   }
 
   /// Append a new version to a key's version chain
-  pub fn append(&mut self, key: u64, value: T, txid: TxId, commit_ts: Timestamp) {
+  pub fn append(&mut self, key: K, value: T, txid: TxId, commit_ts: Timestamp) {
     let prev = self.heads.get(&key).copied().unwrap_or(NULL_IDX);
 
     // Try to reuse a free slot
@@ -79,7 +80,7 @@ impl<T: Clone> SoaPropertyVersions<T> {
   }
 
   /// Get the head version for a key
-  pub fn head(&self, key: u64) -> Option<PooledVersion<&T>> {
+  pub fn head(&self, key: K) -> Option<PooledVersion<&T>> {
     let idx = *self.heads.get(&key)?;
     self.at(idx)
   }
@@ -99,8 +100,8 @@ impl<T: Clone> SoaPropertyVersions<T> {
     })
   }
 
-  pub fn keys(&self) -> impl Iterator<Item = u64> + '_ {
-    self.heads.keys().copied()
+  pub fn keys(&self) -> impl Iterator<Item = K> + '_ {
+    self.heads.keys().cloned()
   }
 
   /// Prune old versions older than the given timestamp
@@ -109,7 +110,7 @@ impl<T: Clone> SoaPropertyVersions<T> {
     let mut pruned = 0;
     let mut keys_to_remove = Vec::new();
 
-    for (&key, &head_idx) in &self.heads {
+    for (key, &head_idx) in &self.heads {
       // Walk the chain to find versions to prune
       let mut current_idx = head_idx;
       let mut keep_idx = NULL_IDX;
@@ -138,7 +139,7 @@ impl<T: Clone> SoaPropertyVersions<T> {
 
       // If the entire chain is old, mark for removal
       if head_idx != NULL_IDX && self.commit_ts[head_idx as usize] < horizon_ts {
-        keys_to_remove.push(key);
+        keys_to_remove.push(key.clone());
         self.free_list.push(head_idx);
         pruned += 1;
       } else if keep_idx != NULL_IDX && prev_keep_idx != NULL_IDX {
@@ -222,7 +223,7 @@ impl<T: Clone> SoaPropertyVersions<T> {
       + std::mem::size_of::<u32>()
       + std::mem::size_of::<bool>())
       * self.data.capacity();
-    let heads_size = std::mem::size_of::<(u64, u32)>() * self.heads.capacity();
+    let heads_size = std::mem::size_of::<(K, u32)>() * self.heads.capacity();
     let free_list_size = std::mem::size_of::<u32>() * self.free_list.capacity();
 
     data_size + meta_size + heads_size + free_list_size
@@ -239,7 +240,7 @@ impl<T: Clone> SoaPropertyVersions<T> {
   }
 }
 
-impl<T: Clone> Default for SoaPropertyVersions<T> {
+impl<T: Clone, K: Eq + Hash + Clone> Default for SoaPropertyVersions<T, K> {
   fn default() -> Self {
     Self::new()
   }
@@ -268,24 +269,24 @@ pub struct PooledVersion<T> {
 /// - Edge property versions (using SOA storage)
 #[derive(Debug)]
 pub struct VersionChainManager {
-  /// Node version chains: nodeId -> head version
-  node_versions: HashMap<NodeId, Box<VersionedRecord<NodeVersionData>>>,
-  /// Edge version chains: packed(src, etype, dst) -> head version
-  edge_versions: HashMap<u64, Box<VersionedRecord<EdgeVersionData>>>,
+  /// Node version chains: TxKey::Node(node_id) -> head version
+  node_versions: HashMap<TxKey, Box<VersionedRecord<NodeVersionData>>>,
+  /// Edge version chains: TxKey::Edge { src, etype, dst } -> head version
+  edge_versions: HashMap<TxKey, Box<VersionedRecord<EdgeVersionData>>>,
   /// SOA-backed storage for node property versions
-  soa_node_props: SoaPropertyVersions<Option<PropValueRef>>,
+  soa_node_props: SoaPropertyVersions<Option<PropValueRef>, TxKey>,
   /// SOA-backed storage for edge property versions
-  soa_edge_props: SoaPropertyVersions<Option<PropValueRef>>,
+  soa_edge_props: SoaPropertyVersions<Option<PropValueRef>, TxKey>,
   /// SOA-backed storage for node label versions
-  soa_node_labels: SoaPropertyVersions<Option<bool>>,
+  soa_node_labels: SoaPropertyVersions<Option<bool>, TxKey>,
   /// Whether SOA storage is enabled (for benchmarking/compatibility)
   use_soa: bool,
   /// Legacy node property versions (when SOA is disabled)
-  legacy_node_props: HashMap<u64, Box<VersionedRecord<Option<PropValueRef>>>>,
+  legacy_node_props: HashMap<TxKey, Box<VersionedRecord<Option<PropValueRef>>>>,
   /// Legacy edge property versions (when SOA is disabled)
-  legacy_edge_props: HashMap<u64, Box<VersionedRecord<Option<PropValueRef>>>>,
+  legacy_edge_props: HashMap<TxKey, Box<VersionedRecord<Option<PropValueRef>>>>,
   /// Legacy node label versions (when SOA is disabled)
-  legacy_node_labels: HashMap<u64, Box<VersionedRecord<Option<bool>>>>,
+  legacy_node_labels: HashMap<TxKey, Box<VersionedRecord<Option<bool>>>>,
 }
 
 impl VersionChainManager {
@@ -313,36 +314,36 @@ impl VersionChainManager {
   // Key computation helpers
   // ========================================================================
 
-  /// Compute numeric composite key for edge lookups
-  /// Uses bit packing: src (20 bits) | etype (20 bits) | dst (20 bits)
-  /// Supports NodeID/ETypeID up to ~1M values each
+  /// Compute a collision-free key for edge lookups.
   #[inline]
-  fn edge_key(src: NodeId, etype: ETypeId, dst: NodeId) -> u64 {
-    ((src & 0xFFFFF) << 40) | ((etype as u64 & 0xFFFFF) << 20) | (dst & 0xFFFFF)
+  fn edge_key(src: NodeId, etype: ETypeId, dst: NodeId) -> TxKey {
+    TxKey::Edge { src, etype, dst }
   }
 
-  /// Compute numeric composite key for node property lookups
-  /// Uses bit packing: nodeId (40 bits) | propKeyId (24 bits)
+  /// Compute a collision-free key for node property lookups.
   #[inline]
-  pub fn node_prop_key(node_id: NodeId, prop_key_id: PropKeyId) -> u64 {
-    (node_id << 24) | (prop_key_id as u64)
+  pub fn node_prop_key(node_id: NodeId, prop_key_id: PropKeyId) -> TxKey {
+    TxKey::NodeProp {
+      node_id,
+      key_id: prop_key_id,
+    }
   }
 
-  /// Compute numeric composite key for node label lookups
-  /// Uses bit packing: nodeId (40 bits) | labelId (24 bits)
+  /// Compute a collision-free key for node label lookups.
   #[inline]
-  pub fn node_label_key(node_id: NodeId, label_id: LabelId) -> u64 {
-    (node_id << 24) | (label_id as u64)
+  pub fn node_label_key(node_id: NodeId, label_id: LabelId) -> TxKey {
+    TxKey::NodeLabel { node_id, label_id }
   }
 
-  /// Compute numeric composite key for edge property lookups
-  /// Uses bit packing: src (20 bits) | etype (12 bits) | dst (20 bits) | propKeyId (12 bits)
+  /// Compute a collision-free key for edge property lookups.
   #[inline]
-  pub fn edge_prop_key(src: NodeId, etype: ETypeId, dst: NodeId, prop_key_id: PropKeyId) -> u64 {
-    ((src & 0xFFFFF) << 44)
-      | ((etype as u64 & 0xFFF) << 32)
-      | ((dst & 0xFFFFF) << 12)
-      | (prop_key_id as u64 & 0xFFF)
+  pub fn edge_prop_key(src: NodeId, etype: ETypeId, dst: NodeId, prop_key_id: PropKeyId) -> TxKey {
+    TxKey::EdgeProp {
+      src,
+      dst,
+      etype,
+      key_id: prop_key_id,
+    }
   }
 
   // ========================================================================
@@ -357,7 +358,8 @@ impl VersionChainManager {
     txid: TxId,
     commit_ts: Timestamp,
   ) {
-    let existing = self.node_versions.remove(&node_id);
+    let key = TxKey::Node(node_id);
+    let existing = self.node_versions.remove(&key);
     let new_version = Box::new(VersionedRecord {
       data,
       txid,
@@ -365,12 +367,13 @@ impl VersionChainManager {
       prev: existing,
       deleted: false,
     });
-    self.node_versions.insert(node_id, new_version);
+    self.node_versions.insert(key, new_version);
   }
 
   /// Mark a node as deleted
   pub fn delete_node_version(&mut self, node_id: NodeId, txid: TxId, commit_ts: Timestamp) {
-    let existing = self.node_versions.remove(&node_id);
+    let key = TxKey::Node(node_id);
+    let existing = self.node_versions.remove(&key);
     let deleted_version = Box::new(VersionedRecord {
       data: NodeVersionData {
         node_id,
@@ -381,12 +384,15 @@ impl VersionChainManager {
       prev: existing,
       deleted: true,
     });
-    self.node_versions.insert(node_id, deleted_version);
+    self.node_versions.insert(key, deleted_version);
   }
 
   /// Get the latest version for a node
   pub fn node_version(&self, node_id: NodeId) -> Option<&VersionedRecord<NodeVersionData>> {
-    self.node_versions.get(&node_id).map(|b| b.as_ref())
+    self
+      .node_versions
+      .get(&TxKey::Node(node_id))
+      .map(|b| b.as_ref())
   }
 
   // ========================================================================
@@ -592,18 +598,29 @@ impl VersionChainManager {
 
   pub fn node_prop_keys(&self, node_id: NodeId) -> Vec<PropKeyId> {
     let mut keys = Vec::new();
-    let node_prefix = node_id;
 
     if self.use_soa {
       for key in self.soa_node_props.keys() {
-        if (key >> 24) == node_prefix {
-          keys.push((key & 0xFFFFFF) as PropKeyId);
+        if let TxKey::NodeProp {
+          node_id: key_node_id,
+          key_id,
+        } = key
+        {
+          if key_node_id == node_id {
+            keys.push(key_id);
+          }
         }
       }
     } else {
-      for &key in self.legacy_node_props.keys() {
-        if (key >> 24) == node_prefix {
-          keys.push((key & 0xFFFFFF) as PropKeyId);
+      for key in self.legacy_node_props.keys() {
+        if let TxKey::NodeProp {
+          node_id: key_node_id,
+          key_id,
+        } = key
+        {
+          if *key_node_id == node_id {
+            keys.push(*key_id);
+          }
         }
       }
     }
@@ -615,18 +632,29 @@ impl VersionChainManager {
 
   pub fn node_label_keys(&self, node_id: NodeId) -> Vec<LabelId> {
     let mut keys = Vec::new();
-    let node_prefix = node_id;
 
     if self.use_soa {
       for key in self.soa_node_labels.keys() {
-        if (key >> 24) == node_prefix {
-          keys.push((key & 0xFFFFFF) as LabelId);
+        if let TxKey::NodeLabel {
+          node_id: key_node_id,
+          label_id,
+        } = key
+        {
+          if key_node_id == node_id {
+            keys.push(label_id);
+          }
         }
       }
     } else {
-      for &key in self.legacy_node_labels.keys() {
-        if (key >> 24) == node_prefix {
-          keys.push((key & 0xFFFFFF) as LabelId);
+      for key in self.legacy_node_labels.keys() {
+        if let TxKey::NodeLabel {
+          node_id: key_node_id,
+          label_id,
+        } = key
+        {
+          if *key_node_id == node_id {
+            keys.push(*label_id);
+          }
         }
       }
     }
@@ -637,27 +665,34 @@ impl VersionChainManager {
   }
 
   pub fn edge_prop_keys(&self, src: NodeId, etype: ETypeId, dst: NodeId) -> Vec<PropKeyId> {
-    let src_mask = src & 0xFFFFF;
-    let dst_mask = dst & 0xFFFFF;
-    let etype_mask = etype as u64 & 0xFFF;
     let mut keys = Vec::new();
-
-    let matches_edge = |key: u64| {
-      ((key >> 44) & 0xFFFFF) == src_mask
-        && ((key >> 32) & 0xFFF) == etype_mask
-        && ((key >> 12) & 0xFFFFF) == dst_mask
-    };
 
     if self.use_soa {
       for key in self.soa_edge_props.keys() {
-        if matches_edge(key) {
-          keys.push((key & 0xFFF) as PropKeyId);
+        if let TxKey::EdgeProp {
+          src: key_src,
+          etype: key_etype,
+          dst: key_dst,
+          key_id,
+        } = key
+        {
+          if key_src == src && key_etype == etype && key_dst == dst {
+            keys.push(key_id);
+          }
         }
       }
     } else {
-      for &key in self.legacy_edge_props.keys() {
-        if matches_edge(key) {
-          keys.push((key & 0xFFF) as PropKeyId);
+      for key in self.legacy_edge_props.keys() {
+        if let TxKey::EdgeProp {
+          src: key_src,
+          etype: key_etype,
+          dst: key_dst,
+          key_id,
+        } = key
+        {
+          if *key_src == src && *key_etype == etype && *key_dst == dst {
+            keys.push(*key_id);
+          }
         }
       }
     }
@@ -672,8 +707,8 @@ impl VersionChainManager {
   // ========================================================================
 
   /// Convert a pooled version to a VersionedRecord (for API compatibility)
-  fn pooled_to_versioned<T: Clone>(
-    store: &SoaPropertyVersions<Option<T>>,
+  fn pooled_to_versioned<T: Clone, K: Eq + Hash + Clone>(
+    store: &SoaPropertyVersions<Option<T>, K>,
     pooled: PooledVersion<&Option<T>>,
   ) -> VersionedRecord<Option<T>> {
     let prev = if pooled.prev_idx != NULL_IDX {
@@ -719,12 +754,12 @@ impl VersionChainManager {
     let mut pruned = 0;
 
     // Prune node versions
-    let node_ids: Vec<_> = self.node_versions.keys().copied().collect();
-    for node_id in node_ids {
-      if let Some(version) = self.node_versions.get_mut(&node_id) {
+    let node_keys: Vec<_> = self.node_versions.keys().cloned().collect();
+    for key in node_keys {
+      if let Some(version) = self.node_versions.get_mut(&key) {
         let result = Self::prune_chain(version, horizon_ts);
         if result == -1 {
-          self.node_versions.remove(&node_id);
+          self.node_versions.remove(&key);
           pruned += 1;
         } else {
           pruned += result as usize;
@@ -733,7 +768,7 @@ impl VersionChainManager {
     }
 
     // Prune edge versions
-    let edge_keys: Vec<_> = self.edge_versions.keys().copied().collect();
+    let edge_keys: Vec<_> = self.edge_versions.keys().cloned().collect();
     for key in edge_keys {
       if let Some(version) = self.edge_versions.get_mut(&key) {
         let result = Self::prune_chain(version, horizon_ts);
@@ -752,7 +787,7 @@ impl VersionChainManager {
       pruned += self.soa_edge_props.prune_old_versions(horizon_ts);
     } else {
       // Legacy path
-      let node_prop_keys: Vec<_> = self.legacy_node_props.keys().copied().collect();
+      let node_prop_keys: Vec<_> = self.legacy_node_props.keys().cloned().collect();
       for key in node_prop_keys {
         if let Some(version) = self.legacy_node_props.get_mut(&key) {
           let result = Self::prune_chain(version, horizon_ts);
@@ -765,7 +800,7 @@ impl VersionChainManager {
         }
       }
 
-      let edge_prop_keys: Vec<_> = self.legacy_edge_props.keys().copied().collect();
+      let edge_prop_keys: Vec<_> = self.legacy_edge_props.keys().cloned().collect();
       for key in edge_prop_keys {
         if let Some(version) = self.legacy_edge_props.get_mut(&key) {
           let result = Self::prune_chain(version, horizon_ts);
@@ -1007,6 +1042,7 @@ pub struct VersionChainCounts {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::mvcc::visibility::visible_version;
   use crate::types::PropValue;
 
   #[test]
@@ -1223,8 +1259,8 @@ mod tests {
   }
 
   #[test]
-  fn test_edge_key_packing() {
-    // Test that edge keys pack correctly
+  fn test_edge_key_identity() {
+    // Test that full component values remain part of the key identity.
     let key1 = VersionChainManager::edge_key(1, 2, 3);
     let key2 = VersionChainManager::edge_key(1, 2, 4);
     let key3 = VersionChainManager::edge_key(2, 2, 3);
@@ -1235,7 +1271,7 @@ mod tests {
   }
 
   #[test]
-  fn test_node_prop_key_packing() {
+  fn test_node_prop_key_identity() {
     let key1 = VersionChainManager::node_prop_key(1, 1);
     let key2 = VersionChainManager::node_prop_key(1, 2);
     let key3 = VersionChainManager::node_prop_key(2, 1);
@@ -1245,13 +1281,76 @@ mod tests {
   }
 
   #[test]
-  fn test_edge_prop_key_packing() {
+  fn test_edge_prop_key_identity() {
     let key1 = VersionChainManager::edge_prop_key(1, 1, 2, 1);
     let key2 = VersionChainManager::edge_prop_key(1, 1, 2, 2);
     let key3 = VersionChainManager::edge_prop_key(1, 1, 3, 1);
 
     assert_ne!(key1, key2);
     assert_ne!(key1, key3);
+  }
+
+  #[test]
+  fn test_edge_versions_do_not_collide_for_source_nodes_2pow20_apart() {
+    let mut mgr = VersionChainManager::new();
+    let far_source = 1 + (1 << 20);
+
+    mgr.append_edge_version(1, 7, 99, true, 1, 10);
+    mgr.append_edge_version(far_source, 7, 99, false, 2, 20);
+
+    let first = mgr
+      .edge_version(1, 7, 99)
+      .expect("first edge version should have its own chain");
+    assert_eq!(first.data.src, 1);
+    assert!(first.data.added);
+    assert_eq!(first.commit_ts, 10);
+
+    let second = mgr
+      .edge_version(far_source, 7, 99)
+      .expect("second edge version should have its own chain");
+    assert_eq!(second.data.src, far_source);
+    assert!(!second.data.added);
+    assert_eq!(second.commit_ts, 20);
+
+    let first_visible = visible_version(first, 15, 3).expect("first edge should be visible");
+    assert_eq!(first_visible.data.src, 1);
+    assert!(visible_version(second, 15, 3).is_none());
+  }
+
+  #[test]
+  fn test_edge_property_versions_do_not_collide_for_property_ids_above_12_bits() {
+    for use_soa in [true, false] {
+      let mut mgr = VersionChainManager::with_soa(use_soa);
+      let value_one = std::sync::Arc::new(PropValue::I64(1));
+      let value_four_thousand_ninety_seven = std::sync::Arc::new(PropValue::I64(4097));
+
+      mgr.append_edge_prop_version(11, 3, 19, 1, Some(value_one.clone()), 1, 10);
+      mgr.append_edge_prop_version(
+        11,
+        3,
+        19,
+        4097,
+        Some(value_four_thousand_ninety_seven.clone()),
+        2,
+        20,
+      );
+
+      let first = mgr
+        .edge_prop_version(11, 3, 19, 1)
+        .expect("first edge property should have its own chain");
+      assert_eq!(first.data.as_deref(), Some(value_one.as_ref()));
+      assert_eq!(first.commit_ts, 10);
+
+      let second = mgr
+        .edge_prop_version(11, 3, 19, 4097)
+        .expect("second edge property should have its own chain");
+      assert_eq!(
+        second.data.as_deref(),
+        Some(value_four_thousand_ninety_seven.as_ref())
+      );
+      assert_eq!(second.commit_ts, 20);
+      assert_eq!(mgr.edge_prop_keys(11, 3, 19), vec![1, 4097]);
+    }
   }
 
   #[test]

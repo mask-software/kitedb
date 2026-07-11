@@ -163,6 +163,9 @@ impl PropertyCache {
     prop_key_id: PropKeyId,
     value: Option<PropValue>,
   ) {
+    if self.node_cache.max_size() == 0 {
+      return;
+    }
     let key = (node_id, prop_key_id);
     self.node_cache.set(key, value);
 
@@ -233,6 +236,9 @@ impl PropertyCache {
     prop_key_id: PropKeyId,
     value: Option<PropValue>,
   ) {
+    if self.edge_cache.max_size() == 0 {
+      return;
+    }
     let key = (src, etype, dst, prop_key_id);
     self.edge_cache.set(key, value);
 

@@ -1,7 +1,13 @@
 //! Lightweight mmap abstraction for native + wasm builds.
 //!
 //! On native targets, this is a thin wrapper over memmap2::Mmap.
-//! On wasm32-wasi, we fall back to reading the full file into memory.
+//! On wasm32-wasi, we fall back to reading the requested bytes into memory.
+//!
+//! A mapping is an immutable view for its entire lifetime. Native callers must
+//! never mutate, truncate, or extend any byte in a mapped range until the
+//! mapping is dropped. Embedded single-file snapshots use `map_file_range` so
+//! only the immutable snapshot pages are mapped; headers and WAL pages remain
+//! ordinary mutable I/O ranges.
 
 use std::fs::File;
 
@@ -12,6 +18,9 @@ use std::sync::Arc;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub type Mmap = memmap2::Mmap;
+
+#[cfg(not(target_arch = "wasm32"))]
+use memmap2::MmapOptions;
 
 #[cfg(target_arch = "wasm32")]
 #[derive(Clone)]
@@ -48,8 +57,8 @@ impl std::ops::Deref for Mmap {
 
 /// Map a file into memory (native uses unsafe mmap, wasm reads to memory).
 ///
-/// # Safety
-/// Callers must ensure the file is not mutated while the mapping is live.
+/// The caller must keep the entire file immutable while the returned mapping
+/// is live. For an embedded database, prefer `map_file_range`.
 pub fn map_file(file: &File) -> std::io::Result<Mmap> {
   #[cfg(not(target_arch = "wasm32"))]
   unsafe {
@@ -65,5 +74,54 @@ pub fn map_file(file: &File) -> std::io::Result<Mmap> {
   #[cfg(target_arch = "wasm32")]
   {
     Mmap::map(file)
+  }
+}
+
+/// Map exactly one immutable byte range of a file.
+///
+/// KiteDB snapshot starts are page-aligned, so the native alignment rule is an
+/// invariant of the file format rather than a caller-controlled unsafe
+/// precondition.
+pub fn map_file_range(file: &File, offset: u64, length: usize) -> std::io::Result<Mmap> {
+  if length == 0 {
+    return Err(std::io::Error::new(
+      std::io::ErrorKind::InvalidInput,
+      "cannot mmap an empty range",
+    ));
+  }
+
+  #[cfg(not(target_arch = "wasm32"))]
+  {
+    let file_len = file.metadata()?.len();
+    let end = offset.checked_add(length as u64).ok_or_else(|| {
+      std::io::Error::new(std::io::ErrorKind::InvalidInput, "mmap range overflow")
+    })?;
+    if end > file_len {
+      return Err(std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        "mmap range exceeds file length",
+      ));
+    }
+    if offset % 4096 != 0 {
+      return Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "mmap offset must be aligned to 4096 bytes",
+      ));
+    }
+
+    // SAFETY: the caller owns the immutable-range invariant documented above;
+    // the offset is page-aligned and the requested range is within the file.
+    unsafe { MmapOptions::new().offset(offset).len(length).map(file) }
+  }
+
+  #[cfg(target_arch = "wasm32")]
+  {
+    let mut handle = file.try_clone()?;
+    handle.seek(SeekFrom::Start(offset))?;
+    let mut buffer = vec![0u8; length];
+    handle.read_exact(&mut buffer)?;
+    Ok(Mmap {
+      data: Arc::new(buffer),
+    })
   }
 }

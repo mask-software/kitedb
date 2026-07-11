@@ -11,11 +11,10 @@ use super::traversal::{
   JsPathConfig, JsPathResult, JsTraversalDirection, JsTraversalResult, JsTraversalStep,
   JsTraverseOptions,
 };
+use super::validation;
 use crate::api::kite::KiteRuntimeProfile as RustKiteRuntimeProfile;
-use crate::api::pathfinding::{bfs, dijkstra, yen_k_shortest, PathConfig};
-use crate::api::traversal::{
-  TraversalBuilder as RustTraversalBuilder, TraversalDirection, TraverseOptions,
-};
+use crate::api::pathfinding::{bfs, dijkstra, yen_k_shortest};
+use crate::api::traversal::{TraversalBuilder as RustTraversalBuilder, TraversalDirection};
 use crate::backup as core_backup;
 use crate::core::single_file::{
   close_single_file, close_single_file_with_options, is_single_file_path, open_single_file,
@@ -72,6 +71,16 @@ impl From<JsSyncMode> for RustSyncMode {
   }
 }
 
+impl From<&JsSyncMode> for RustSyncMode {
+  fn from(mode: &JsSyncMode) -> Self {
+    match mode {
+      JsSyncMode::Full => RustSyncMode::Full,
+      JsSyncMode::Normal => RustSyncMode::Normal,
+      JsSyncMode::Off => RustSyncMode::Off,
+    }
+  }
+}
+
 /// Snapshot parse behavior for single-file databases
 #[napi(string_enum)]
 #[derive(Debug)]
@@ -110,6 +119,16 @@ impl From<JsReplicationRole> for RustReplicationRole {
   }
 }
 
+impl From<&JsReplicationRole> for RustReplicationRole {
+  fn from(role: &JsReplicationRole) -> Self {
+    match role {
+      JsReplicationRole::Disabled => RustReplicationRole::Disabled,
+      JsReplicationRole::Primary => RustReplicationRole::Primary,
+      JsReplicationRole::Replica => RustReplicationRole::Replica,
+    }
+  }
+}
+
 // ============================================================================
 // Open Options
 // ============================================================================
@@ -126,13 +145,13 @@ pub struct OpenOptions {
   pub mvcc: Option<bool>,
   /// MVCC GC interval in ms
   pub mvcc_gc_interval_ms: Option<i64>,
-  /// MVCC retention in ms
+  /// MVCC retention in ms (0 means retain no historical window)
   pub mvcc_retention_ms: Option<i64>,
-  /// MVCC max version chain depth
+  /// MVCC max version chain depth (must be positive)
   pub mvcc_max_chain_depth: Option<i64>,
-  /// Page size in bytes (default 4096)
+  /// Page size in bytes (must be a supported positive power of two)
   pub page_size: Option<u32>,
-  /// WAL size in bytes (default 1MB)
+  /// WAL size in bytes (must be positive and at least 16 pages)
   pub wal_size: Option<u32>,
   /// Enable auto-checkpoint when WAL usage exceeds threshold
   pub auto_checkpoint: Option<bool>,
@@ -144,21 +163,21 @@ pub struct OpenOptions {
   pub checkpoint_compression: Option<CompressionOptions>,
   /// Enable caching
   pub cache_enabled: Option<bool>,
-  /// Max node properties in cache
+  /// Max node properties in cache (0 disables the node-property cache)
   pub cache_max_node_props: Option<i64>,
-  /// Max edge properties in cache
+  /// Max edge properties in cache (0 disables the edge-property cache)
   pub cache_max_edge_props: Option<i64>,
-  /// Max traversal cache entries
+  /// Max traversal cache entries (0 disables the traversal cache)
   pub cache_max_traversal_entries: Option<i64>,
-  /// Max query cache entries
+  /// Max query cache entries (0 disables the query cache)
   pub cache_max_query_entries: Option<i64>,
-  /// Query cache TTL in milliseconds
+  /// Query cache TTL in milliseconds (0 expires entries immediately)
   pub cache_query_ttl_ms: Option<i64>,
   /// Sync mode: "Full", "Normal", or "Off" (default: "Full")
   pub sync_mode: Option<JsSyncMode>,
   /// Enable group commit (coalesce WAL flushes across commits)
   pub group_commit_enabled: Option<bool>,
-  /// Group commit window in milliseconds
+  /// Group commit window in milliseconds (0 adds no coalescing delay)
   pub group_commit_window_ms: Option<i64>,
   /// Snapshot parse mode: "Strict" or "Salvage" (single-file only)
   pub snapshot_parse_mode: Option<JsSnapshotParseMode>,
@@ -172,69 +191,128 @@ pub struct OpenOptions {
   pub replication_source_sidecar_path: Option<String>,
   /// Segment rotation threshold in bytes (primary role only)
   pub replication_segment_max_bytes: Option<i64>,
-  /// Minimum retained entries window (primary role only)
+  /// Minimum retained entries window (0 imposes no entry-count floor)
   pub replication_retention_min_entries: Option<i64>,
-  /// Minimum retained segment age in milliseconds (primary role only)
+  /// Minimum retained segment age in milliseconds (0 imposes no age floor)
   pub replication_retention_min_ms: Option<i64>,
+  /// TEST-ONLY: skip database file locking to simulate multi-node topologies
+  /// (e.g. split-brain fencing tests) in a single process. Honored only when
+  /// the KITEDB_DANGER_ALLOW_MULTI_NODE_SIMULATION environment variable is
+  /// set; rejected otherwise. Never use this outside tests: it removes the
+  /// corruption protection that prevents two writers on one database file.
+  pub danger_bypass_file_lock_for_multi_node_simulation: Option<bool>,
 }
 
-impl From<OpenOptions> for RustOpenOptions {
-  fn from(opts: OpenOptions) -> Self {
+impl OpenOptions {
+  fn into_rust(self) -> Result<RustOpenOptions> {
     use crate::types::{CacheOptions, PropertyCacheConfig, QueryCacheConfig, TraversalCacheConfig};
 
+    let page_size = self
+      .page_size
+      .map(validation::page_size)
+      .transpose()?
+      .unwrap_or(validation::MIN_PAGE_SIZE as usize);
+
     let mut rust_opts = RustOpenOptions::new();
-    if let Some(v) = opts.read_only {
+    if let Some(v) = self.read_only {
       rust_opts = rust_opts.read_only(v);
     }
-    if let Some(v) = opts.create_if_missing {
+    if let Some(v) = self.create_if_missing {
       rust_opts = rust_opts.create_if_missing(v);
     }
-    if let Some(v) = opts.mvcc {
+    if let Some(v) = self.mvcc {
       rust_opts = rust_opts.mvcc(v);
     }
-    if let Some(v) = opts.mvcc_gc_interval_ms {
-      rust_opts = rust_opts.mvcc_gc_interval_ms(v as u64);
+    if let Some(v) = self.mvcc_gc_interval_ms {
+      rust_opts = rust_opts.mvcc_gc_interval_ms(validation::positive_u64(
+        "mvccGcIntervalMs",
+        v,
+        validation::MAX_DURATION_MS as u64,
+      )?);
     }
-    if let Some(v) = opts.mvcc_retention_ms {
-      rust_opts = rust_opts.mvcc_retention_ms(v as u64);
+    if let Some(v) = self.mvcc_retention_ms {
+      rust_opts = rust_opts.mvcc_retention_ms(validation::non_negative_u64(
+        "mvccRetentionMs",
+        v,
+        validation::MAX_DURATION_MS as u64,
+      )?);
     }
-    if let Some(v) = opts.mvcc_max_chain_depth {
-      rust_opts = rust_opts.mvcc_max_chain_depth(v as usize);
+    if let Some(v) = self.mvcc_max_chain_depth {
+      rust_opts = rust_opts.mvcc_max_chain_depth(validation::positive_usize(
+        "mvccMaxChainDepth",
+        v,
+        validation::MAX_DEPTH,
+      )?);
     }
-    if let Some(v) = opts.page_size {
-      rust_opts = rust_opts.page_size(v as usize);
+    if self.page_size.is_some() {
+      rust_opts = rust_opts.page_size(page_size);
     }
-    if let Some(v) = opts.wal_size {
-      rust_opts = rust_opts.wal_size(v as usize);
+    if let Some(v) = self.wal_size {
+      rust_opts = rust_opts.wal_size(validation::wal_size(v, page_size)?);
     }
-    if let Some(v) = opts.auto_checkpoint {
+    if let Some(v) = self.auto_checkpoint {
       rust_opts = rust_opts.auto_checkpoint(v);
     }
-    if let Some(v) = opts.checkpoint_threshold {
-      rust_opts = rust_opts.checkpoint_threshold(v);
+    if let Some(v) = self.checkpoint_threshold {
+      rust_opts = rust_opts.checkpoint_threshold(validation::ratio("checkpointThreshold", v)?);
     }
-    if let Some(v) = opts.background_checkpoint {
+    if let Some(v) = self.background_checkpoint {
       rust_opts = rust_opts.background_checkpoint(v);
     }
-    if let Some(compression) = opts.checkpoint_compression {
-      rust_opts = rust_opts.checkpoint_compression(Some(compression.into()));
+    if let Some(compression) = self.checkpoint_compression {
+      rust_opts = rust_opts.checkpoint_compression(Some(compression.into_rust()?));
     }
 
+    let max_node_props = self
+      .cache_max_node_props
+      .map(|v| {
+        validation::non_negative_usize("cacheMaxNodeProps", v, validation::MAX_CACHE_ENTRIES)
+      })
+      .transpose()?
+      .unwrap_or(10_000);
+    let max_edge_props = self
+      .cache_max_edge_props
+      .map(|v| {
+        validation::non_negative_usize("cacheMaxEdgeProps", v, validation::MAX_CACHE_ENTRIES)
+      })
+      .transpose()?
+      .unwrap_or(10_000);
+    let max_traversal_entries = self
+      .cache_max_traversal_entries
+      .map(|v| {
+        validation::non_negative_usize("cacheMaxTraversalEntries", v, validation::MAX_CACHE_ENTRIES)
+      })
+      .transpose()?
+      .unwrap_or(5_000);
+    let max_query_entries = self
+      .cache_max_query_entries
+      .map(|v| {
+        validation::non_negative_usize("cacheMaxQueryEntries", v, validation::MAX_CACHE_ENTRIES)
+      })
+      .transpose()?
+      .unwrap_or(1_000);
+    let query_ttl_ms = self
+      .cache_query_ttl_ms
+      .map(|v| {
+        validation::non_negative_u64("cacheQueryTtlMs", v, validation::MAX_DURATION_MS as u64)
+      })
+      .transpose()?;
+
     // Cache options
-    if opts.cache_enabled == Some(true) {
+    if self.cache_enabled == Some(true) {
       let property_cache = Some(PropertyCacheConfig {
-        max_node_props: opts.cache_max_node_props.unwrap_or(10000) as usize,
-        max_edge_props: opts.cache_max_edge_props.unwrap_or(10000) as usize,
+        max_node_props,
+        max_edge_props,
       });
 
       let traversal_cache = Some(TraversalCacheConfig {
-        max_entries: opts.cache_max_traversal_entries.unwrap_or(5000) as usize,
+        max_entries: max_traversal_entries,
         max_neighbors_per_entry: 100,
       });
 
       let query_cache = Some(QueryCacheConfig {
-        max_entries: opts.cache_max_query_entries.unwrap_or(1000) as usize,
-        ttl_ms: opts.cache_query_ttl_ms.map(|v| v as u64),
+        max_entries: max_query_entries,
+        ttl_ms: query_ttl_ms,
       });
 
       rust_opts = rust_opts.cache(Some(CacheOptions {
@@ -246,51 +324,258 @@ impl From<OpenOptions> for RustOpenOptions {
     }
 
     // Sync mode
-    if let Some(mode) = opts.sync_mode {
+    if let Some(mode) = self.sync_mode {
       rust_opts = rust_opts.sync_mode(mode.into());
     }
-    if let Some(enabled) = opts.group_commit_enabled {
+    if let Some(enabled) = self.group_commit_enabled {
       rust_opts = rust_opts.group_commit_enabled(enabled);
     }
-    if let Some(window_ms) = opts.group_commit_window_ms {
-      if window_ms >= 0 {
-        rust_opts = rust_opts.group_commit_window_ms(window_ms as u64);
-      }
+    if let Some(window_ms) = self.group_commit_window_ms {
+      rust_opts = rust_opts.group_commit_window_ms(validation::non_negative_u64(
+        "groupCommitWindowMs",
+        window_ms,
+        validation::MAX_DURATION_MS as u64,
+      )?);
     }
 
     // Snapshot parse mode
-    if let Some(mode) = opts.snapshot_parse_mode {
+    if let Some(mode) = self.snapshot_parse_mode {
       rust_opts = rust_opts.snapshot_parse_mode(mode.into());
     }
-    if let Some(role) = opts.replication_role {
+    if let Some(role) = self.replication_role {
       rust_opts = rust_opts.replication_role(role.into());
     }
-    if let Some(path) = opts.replication_sidecar_path {
+    if self.danger_bypass_file_lock_for_multi_node_simulation == Some(true) {
+      if std::env::var_os("KITEDB_DANGER_ALLOW_MULTI_NODE_SIMULATION").is_none() {
+        return Err(Error::new(
+          Status::InvalidArg,
+          "dangerBypassFileLockForMultiNodeSimulation is test-only and requires the \
+           KITEDB_DANGER_ALLOW_MULTI_NODE_SIMULATION environment variable"
+            .to_string(),
+        ));
+      }
+      rust_opts = rust_opts.danger_bypass_file_lock_for_multi_node_simulation(true);
+    }
+    if let Some(path) = self.replication_sidecar_path {
       rust_opts = rust_opts.replication_sidecar_path(path);
     }
-    if let Some(path) = opts.replication_source_db_path {
+    if let Some(path) = self.replication_source_db_path {
       rust_opts = rust_opts.replication_source_db_path(path);
     }
-    if let Some(path) = opts.replication_source_sidecar_path {
+    if let Some(path) = self.replication_source_sidecar_path {
       rust_opts = rust_opts.replication_source_sidecar_path(path);
     }
-    if let Some(value) = opts.replication_segment_max_bytes {
-      if value >= 0 {
-        rust_opts = rust_opts.replication_segment_max_bytes(value as u64);
-      }
+    if let Some(value) = self.replication_segment_max_bytes {
+      rust_opts = rust_opts.replication_segment_max_bytes(validation::positive_u64(
+        "replicationSegmentMaxBytes",
+        value,
+        validation::MAX_BYTES as u64,
+      )?);
     }
-    if let Some(value) = opts.replication_retention_min_entries {
-      if value >= 0 {
-        rust_opts = rust_opts.replication_retention_min_entries(value as u64);
-      }
+    if let Some(value) = self.replication_retention_min_entries {
+      rust_opts = rust_opts.replication_retention_min_entries(validation::non_negative_u64(
+        "replicationRetentionMinEntries",
+        value,
+        validation::MAX_COUNT as u64,
+      )?);
     }
-    if let Some(value) = opts.replication_retention_min_ms {
-      if value >= 0 {
-        rust_opts = rust_opts.replication_retention_min_ms(value as u64);
-      }
+    if let Some(value) = self.replication_retention_min_ms {
+      rust_opts = rust_opts.replication_retention_min_ms(validation::non_negative_u64(
+        "replicationRetentionMinMs",
+        value,
+        validation::MAX_DURATION_MS as u64,
+      )?);
     }
 
-    rust_opts
+    Ok(rust_opts)
+  }
+}
+
+#[cfg(test)]
+mod open_option_validation_tests {
+  use super::*;
+
+  #[test]
+  fn validates_open_numeric_ranges_and_zero_semantics() {
+    assert!(OpenOptions {
+      page_size: Some(8192),
+      wal_size: Some(8192 * 16),
+      mvcc_gc_interval_ms: Some(1),
+      mvcc_retention_ms: Some(0),
+      mvcc_max_chain_depth: Some(1),
+      cache_enabled: Some(true),
+      cache_max_node_props: Some(0),
+      cache_max_edge_props: Some(1),
+      cache_max_traversal_entries: Some(0),
+      cache_max_query_entries: Some(0),
+      cache_query_ttl_ms: Some(0),
+      checkpoint_threshold: Some(0.0),
+      group_commit_window_ms: Some(0),
+      replication_segment_max_bytes: Some(1),
+      replication_retention_min_entries: Some(0),
+      replication_retention_min_ms: Some(0),
+      ..Default::default()
+    }
+    .into_rust()
+    .is_ok());
+
+    for options in [
+      OpenOptions {
+        page_size: Some(0),
+        ..Default::default()
+      },
+      OpenOptions {
+        page_size: Some(1_000_000),
+        ..Default::default()
+      },
+      OpenOptions {
+        wal_size: Some(0),
+        ..Default::default()
+      },
+      OpenOptions {
+        mvcc_gc_interval_ms: Some(0),
+        ..Default::default()
+      },
+      OpenOptions {
+        mvcc_gc_interval_ms: Some(-1),
+        ..Default::default()
+      },
+      OpenOptions {
+        mvcc_retention_ms: Some(-1),
+        ..Default::default()
+      },
+      OpenOptions {
+        mvcc_max_chain_depth: Some(0),
+        ..Default::default()
+      },
+      OpenOptions {
+        cache_max_node_props: Some(-1),
+        ..Default::default()
+      },
+      OpenOptions {
+        cache_max_query_entries: Some(validation::MAX_CACHE_ENTRIES + 1),
+        ..Default::default()
+      },
+      OpenOptions {
+        checkpoint_threshold: Some(2.0),
+        ..Default::default()
+      },
+      OpenOptions {
+        group_commit_window_ms: Some(-1),
+        ..Default::default()
+      },
+      OpenOptions {
+        replication_segment_max_bytes: Some(0),
+        ..Default::default()
+      },
+      OpenOptions {
+        replication_retention_min_ms: Some(validation::MAX_DURATION_MS + 1),
+        ..Default::default()
+      },
+    ] {
+      assert!(options.into_rust().is_err());
+    }
+
+    assert!(OpenOptions {
+      cache_enabled: Some(true),
+      cache_max_node_props: Some(validation::MAX_CACHE_ENTRIES),
+      ..Default::default()
+    }
+    .into_rust()
+    .is_ok());
+  }
+
+  #[test]
+  fn validates_maintenance_and_streaming_options() {
+    assert!(CompressionOptions {
+      r#type: Some(JsCompressionType::Zstd),
+      min_size: Some(1),
+      level: Some(1),
+      ..Default::default()
+    }
+    .into_rust()
+    .is_ok());
+    assert!(CompressionOptions {
+      r#type: Some(JsCompressionType::Zstd),
+      level: Some(0),
+      ..Default::default()
+    }
+    .into_rust()
+    .is_err());
+    assert!(ImportOptions {
+      batch_size: Some(0),
+      skip_existing: None,
+    }
+    .into_rust()
+    .map(|opts| opts.batch_size == 1000)
+    .unwrap_or(false));
+    assert!(ImportOptions {
+      batch_size: Some(-1),
+      skip_existing: None,
+    }
+    .into_rust()
+    .is_err());
+    assert!(StreamOptions {
+      batch_size: Some(0),
+    }
+    .into_rust()
+    .map(|opts| opts.batch_size == 0)
+    .unwrap_or(false));
+    assert!(PaginationOptions {
+      limit: Some(-1),
+      cursor: None,
+    }
+    .into_rust()
+    .is_err());
+  }
+
+  #[test]
+  fn validates_otlp_numeric_options_and_zero_semantics() {
+    assert!(build_core_otel_push_options(PushReplicationMetricsOtelOptions::default()).is_ok());
+
+    let zero = PushReplicationMetricsOtelOptions {
+      retry_backoff_ms: Some(0),
+      retry_backoff_max_ms: Some(0),
+      circuit_breaker_failure_threshold: Some(0),
+      circuit_breaker_open_ms: Some(0),
+      circuit_breaker_half_open_probes: Some(0),
+      ..Default::default()
+    };
+    assert!(build_core_otel_push_options(zero).is_ok());
+
+    let invalid_cases = [
+      PushReplicationMetricsOtelOptions {
+        timeout_ms: Some(0),
+        ..Default::default()
+      },
+      PushReplicationMetricsOtelOptions {
+        retry_max_attempts: Some(0),
+        ..Default::default()
+      },
+      PushReplicationMetricsOtelOptions {
+        retry_backoff_ms: Some(-1),
+        ..Default::default()
+      },
+      PushReplicationMetricsOtelOptions {
+        retry_jitter_ratio: Some(2.0),
+        ..Default::default()
+      },
+      PushReplicationMetricsOtelOptions {
+        circuit_breaker_failure_threshold: Some(-1),
+        ..Default::default()
+      },
+      PushReplicationMetricsOtelOptions {
+        circuit_breaker_state_patch_batch_max_keys: Some(0),
+        ..Default::default()
+      },
+      PushReplicationMetricsOtelOptions {
+        circuit_breaker_state_patch_retry_max_attempts: Some(validation::MAX_COUNT + 1),
+        ..Default::default()
+      },
+    ];
+    for invalid in invalid_cases {
+      assert!(build_core_otel_push_options(invalid).is_err());
+    }
   }
 }
 
@@ -355,6 +640,7 @@ fn open_options_from_kite_profile_options(opts: crate::api::kite::KiteOptions) -
     replication_retention_min_ms: opts
       .replication_retention_min_ms
       .and_then(|v| i64::try_from(v).ok()),
+    danger_bypass_file_lock_for_multi_node_simulation: None,
   }
 }
 
@@ -389,15 +675,16 @@ pub struct VacuumOptions {
   pub min_wal_size: Option<i64>,
 }
 
-impl From<VacuumOptions> for RustVacuumOptions {
-  fn from(opts: VacuumOptions) -> Self {
-    let min_wal_size = opts
+impl VacuumOptions {
+  fn into_rust(self) -> Result<RustVacuumOptions> {
+    let min_wal_size = self
       .min_wal_size
-      .and_then(|v| if v >= 0 { Some(v as u64) } else { None });
-    Self {
-      shrink_wal: opts.shrink_wal.unwrap_or(true),
+      .map(|v| validation::non_negative_u64("minWalSize", v, validation::MAX_BYTES as u64))
+      .transpose()?;
+    Ok(RustVacuumOptions {
+      shrink_wal: self.shrink_wal.unwrap_or(true),
       min_wal_size,
-    }
+    })
   }
 }
 
@@ -455,22 +742,23 @@ pub struct CompressionOptions {
   pub level: Option<i32>,
 }
 
-impl From<CompressionOptions> for CoreCompressionOptions {
-  fn from(opts: CompressionOptions) -> Self {
+impl CompressionOptions {
+  fn into_rust(self) -> Result<CoreCompressionOptions> {
     let mut out = CoreCompressionOptions::default();
-    if let Some(enabled) = opts.enabled {
+    if let Some(enabled) = self.enabled {
       out.enabled = enabled;
     }
-    if let Some(t) = opts.r#type {
+    if let Some(t) = self.r#type {
       out.compression_type = t.into();
     }
-    if let Some(min_size) = opts.min_size {
-      out.min_size = min_size as usize;
+    if let Some(min_size) = self.min_size {
+      out.min_size = validation::compression_min_size(min_size)?;
     }
-    if let Some(level) = opts.level {
-      out.level = level;
+    if let Some(level) = self.level {
+      let zstd = matches!(out.compression_type, CompressionType::Zstd);
+      out.level = validation::compression_level("level", level, zstd)?;
     }
-    out
+    Ok(out)
   }
 }
 
@@ -482,11 +770,14 @@ pub struct SingleFileOptimizeOptions {
   pub compression: Option<CompressionOptions>,
 }
 
-impl From<SingleFileOptimizeOptions> for RustSingleFileOptimizeOptions {
-  fn from(opts: SingleFileOptimizeOptions) -> Self {
-    RustSingleFileOptimizeOptions {
-      compression: opts.compression.map(Into::into),
-    }
+impl SingleFileOptimizeOptions {
+  fn into_rust(self) -> Result<RustSingleFileOptimizeOptions> {
+    Ok(RustSingleFileOptimizeOptions {
+      compression: self
+        .compression
+        .map(CompressionOptions::into_rust)
+        .transpose()?,
+    })
   }
 }
 
@@ -541,6 +832,8 @@ pub struct JsPrimaryReplicationStatus {
   pub replica_lags: Vec<JsReplicaLagStatus>,
   pub sidecar_path: String,
   pub last_token: Option<String>,
+  pub last_replication_error: Option<String>,
+  pub sidecar_needs_repair: bool,
   pub append_attempts: i64,
   pub append_failures: i64,
   pub append_successes: i64,
@@ -585,6 +878,8 @@ impl From<PrimaryReplicationStatus> for JsPrimaryReplicationStatus {
       replica_lags: value.replica_lags.into_iter().map(Into::into).collect(),
       sidecar_path: value.sidecar_path.to_string_lossy().to_string(),
       last_token: value.last_token.map(|token| token.to_string()),
+      last_replication_error: value.last_replication_error,
+      sidecar_needs_repair: value.sidecar_needs_repair,
       append_attempts: value.append_attempts as i64,
       append_failures: value.append_failures as i64,
       append_successes: value.append_successes as i64,
@@ -651,21 +946,23 @@ impl ExportOptions {
 #[napi(object)]
 pub struct ImportOptions {
   pub skip_existing: Option<bool>,
+  /// Batch size; 0 preserves the core default.
   pub batch_size: Option<i64>,
 }
 
 impl ImportOptions {
-  fn into_rust(self) -> ray_export::ImportOptions {
+  fn into_rust(self) -> Result<ray_export::ImportOptions> {
     let mut opts = ray_export::ImportOptions::default();
     if let Some(v) = self.skip_existing {
       opts.skip_existing = v;
     }
     if let Some(v) = self.batch_size {
-      if v > 0 {
-        opts.batch_size = v as usize;
+      let batch_size = validation::non_negative_usize("batchSize", v, validation::MAX_COUNT)?;
+      if batch_size > 0 {
+        opts.batch_size = batch_size;
       }
     }
-    opts
+    Ok(opts)
   }
 }
 
@@ -692,18 +989,15 @@ pub struct ImportResult {
 #[napi(object)]
 #[derive(Debug, Default)]
 pub struct StreamOptions {
-  /// Number of items per batch (default: 1000)
+  /// Number of items per batch; 0 preserves the core default.
   pub batch_size: Option<i64>,
 }
 
 impl StreamOptions {
   fn into_rust(self) -> Result<crate::streaming::StreamOptions> {
     let batch_size = self.batch_size.unwrap_or(0);
-    if batch_size < 0 {
-      return Err(Error::from_reason("batchSize must be non-negative"));
-    }
     Ok(crate::streaming::StreamOptions {
-      batch_size: batch_size as usize,
+      batch_size: validation::non_negative_usize("batchSize", batch_size, validation::MAX_COUNT)?,
     })
   }
 }
@@ -712,7 +1006,7 @@ impl StreamOptions {
 #[napi(object)]
 #[derive(Debug, Default)]
 pub struct PaginationOptions {
-  /// Number of items per page (default: 100)
+  /// Number of items per page; 0 preserves the core default.
   pub limit: Option<i64>,
   /// Cursor from previous page
   pub cursor: Option<String>,
@@ -721,11 +1015,8 @@ pub struct PaginationOptions {
 impl PaginationOptions {
   fn into_rust(self) -> Result<crate::streaming::PaginationOptions> {
     let limit = self.limit.unwrap_or(0);
-    if limit < 0 {
-      return Err(Error::from_reason("limit must be non-negative"));
-    }
     Ok(crate::streaming::PaginationOptions {
-      limit: limit as usize,
+      limit: validation::non_negative_usize("limit", limit, validation::MAX_COUNT)?,
       cursor: self.cursor,
     })
   }
@@ -858,6 +1149,8 @@ pub struct PrimaryReplicationMetrics {
   pub min_replica_applied_log_index: Option<i64>,
   pub sidecar_path: String,
   pub last_token: Option<String>,
+  pub last_replication_error: Option<String>,
+  pub sidecar_needs_repair: bool,
   pub append_attempts: i64,
   pub append_failures: i64,
   pub append_successes: i64,
@@ -1029,6 +1322,8 @@ impl From<core_metrics::PrimaryReplicationMetrics> for PrimaryReplicationMetrics
       min_replica_applied_log_index: metrics.min_replica_applied_log_index,
       sidecar_path: metrics.sidecar_path,
       last_token: metrics.last_token,
+      last_replication_error: metrics.last_replication_error,
+      sidecar_needs_repair: metrics.sidecar_needs_repair,
       append_attempts: metrics.append_attempts,
       append_failures: metrics.append_failures,
       append_successes: metrics.append_successes,
@@ -1296,7 +1591,7 @@ impl Database {
       db_path = PathBuf::from(format!("{path}{}", single_file_extension()));
     }
 
-    let opts: RustOpenOptions = options.into();
+    let opts = options.into_rust()?;
     let db = open_single_file(&db_path, opts)
       .map_err(|e| Error::from_reason(format!("Failed to open database: {e}")))?;
     Ok(Database {
@@ -1321,6 +1616,7 @@ impl Database {
   /// Close the database and run a blocking checkpoint if WAL usage is above threshold.
   #[napi]
   pub fn close_with_checkpoint_if_wal_over(&mut self, threshold: f64) -> Result<()> {
+    let threshold = validation::ratio("threshold", threshold)?;
     if let Some(db) = self.inner.take() {
       match db {
         DatabaseInner::SingleFile(db) => close_single_file_with_options(
@@ -1436,15 +1732,14 @@ impl Database {
   /// Wait until the DB has observed at least the provided commit token.
   #[napi]
   pub fn wait_for_token(&self, token: String, timeout_ms: i64) -> Result<bool> {
-    if timeout_ms < 0 {
-      return Err(Error::from_reason("timeoutMs must be non-negative"));
-    }
+    let timeout_ms =
+      validation::non_negative_u64("timeoutMs", timeout_ms, validation::MAX_DURATION_MS as u64)?;
     let token = CommitToken::from_str(&token)
       .map_err(|e| Error::from_reason(format!("Invalid commit token: {e}")))?;
 
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => db
-        .wait_for_token(token, timeout_ms as u64)
+        .wait_for_token(token, timeout_ms)
         .map_err(|e| Error::from_reason(format!("Failed waiting for token: {e}"))),
       None => Err(Error::from_reason("Database is closed")),
     }
@@ -1492,14 +1787,12 @@ impl Database {
     epoch: i64,
     applied_log_index: i64,
   ) -> Result<()> {
-    if epoch < 0 || applied_log_index < 0 {
-      return Err(Error::from_reason(
-        "epoch and appliedLogIndex must be non-negative",
-      ));
-    }
+    let epoch = validation::non_negative_u64("epoch", epoch, i64::MAX as u64)?;
+    let applied_log_index =
+      validation::non_negative_u64("appliedLogIndex", applied_log_index, i64::MAX as u64)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => db
-        .primary_report_replica_progress(&replica_id, epoch as u64, applied_log_index as u64)
+        .primary_report_replica_progress(&replica_id, epoch, applied_log_index)
         .map_err(|e| Error::from_reason(format!("Failed to report replica progress: {e}"))),
       None => Err(Error::from_reason("Database is closed")),
     }
@@ -1542,19 +1835,15 @@ impl Database {
   ) -> Result<String> {
     let max_frames = max_frames.unwrap_or(128);
     let max_bytes = max_bytes.unwrap_or(1_048_576);
-    if max_frames <= 0 {
-      return Err(Error::from_reason("maxFrames must be positive"));
-    }
-    if max_bytes <= 0 {
-      return Err(Error::from_reason("maxBytes must be positive"));
-    }
+    let max_frames = validation::positive_usize("maxFrames", max_frames, validation::MAX_COUNT)?;
+    let max_bytes = validation::positive_usize("maxBytes", max_bytes, validation::MAX_BYTES)?;
 
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => db
         .primary_export_log_transport_json(
           cursor.as_deref(),
-          max_frames as usize,
-          max_bytes as usize,
+          max_frames,
+          max_bytes,
           include_payload.unwrap_or(true),
         )
         .map_err(|e| Error::from_reason(format!("Failed to export replication log: {e}"))),
@@ -1576,12 +1865,11 @@ impl Database {
   /// Pull and apply up to maxFrames replication frames on replica.
   #[napi]
   pub fn replica_catch_up_once(&self, max_frames: i64) -> Result<i64> {
-    if max_frames < 0 {
-      return Err(Error::from_reason("maxFrames must be non-negative"));
-    }
+    let max_frames =
+      validation::non_negative_usize("maxFrames", max_frames, validation::MAX_COUNT)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => db
-        .replica_catch_up_once(max_frames as usize)
+        .replica_catch_up_once(max_frames)
         .map(|count| count as i64)
         .map_err(|e| Error::from_reason(format!("Failed replica catch-up: {e}"))),
       None => Err(Error::from_reason("Database is closed")),
@@ -2417,7 +2705,9 @@ impl Database {
   #[napi(js_name = "get_or_create_label")]
   pub fn ensure_label(&self, name: String) -> Result<u32> {
     match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => Ok(db.label_id_or_create(&name)),
+      Some(DatabaseInner::SingleFile(db)) => db
+        .ensure_label(&name)
+        .map_err(|e| Error::from_reason(format!("Failed to ensure label: {e}"))),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -2444,7 +2734,9 @@ impl Database {
   #[napi(js_name = "get_or_create_etype")]
   pub fn ensure_etype(&self, name: String) -> Result<u32> {
     match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => Ok(db.etype_id_or_create(&name)),
+      Some(DatabaseInner::SingleFile(db)) => db
+        .ensure_etype(&name)
+        .map_err(|e| Error::from_reason(format!("Failed to ensure edge type: {e}"))),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -2471,7 +2763,9 @@ impl Database {
   #[napi(js_name = "get_or_create_propkey")]
   pub fn ensure_propkey(&self, name: String) -> Result<u32> {
     match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => Ok(db.propkey_id_or_create(&name)),
+      Some(DatabaseInner::SingleFile(db)) => db
+        .ensure_propkey(&name)
+        .map_err(|e| Error::from_reason(format!("Failed to ensure property key: {e}"))),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -2577,7 +2871,10 @@ impl Database {
     direction: JsTraversalDirection,
     edge_type: Option<u32>,
   ) -> Result<Vec<JsTraversalResult>> {
-    let start: Vec<NodeId> = start_nodes.iter().map(|&id| id as NodeId).collect();
+    let start: Vec<NodeId> = start_nodes
+      .into_iter()
+      .map(|id| validation::node_id("startNodes", id).map(|id| id as NodeId))
+      .collect::<Result<Vec<_>>>()?;
     let etype = edge_type;
 
     match self.inner.as_ref() {
@@ -2612,7 +2909,10 @@ impl Database {
     steps: Vec<JsTraversalStep>,
     limit: Option<u32>,
   ) -> Result<Vec<JsTraversalResult>> {
-    let start: Vec<NodeId> = start_nodes.iter().map(|&id| id as NodeId).collect();
+    let start: Vec<NodeId> = start_nodes
+      .into_iter()
+      .map(|id| validation::node_id("startNodes", id).map(|id| id as NodeId))
+      .collect::<Result<Vec<_>>>()?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
         let mut builder = RustTraversalBuilder::new(start);
@@ -2627,7 +2927,8 @@ impl Database {
         }
 
         if let Some(n) = limit {
-          builder = builder.take(n as usize);
+          let n = validation::non_negative_usize("limit", n as i64, validation::MAX_COUNT)?;
+          builder = builder.take(n);
         }
 
         Ok(
@@ -2654,8 +2955,11 @@ impl Database {
     edge_type: Option<u32>,
     options: JsTraverseOptions,
   ) -> Result<Vec<JsTraversalResult>> {
-    let start: Vec<NodeId> = start_nodes.iter().map(|&id| id as NodeId).collect();
-    let opts: TraverseOptions = options.into();
+    let start: Vec<NodeId> = start_nodes
+      .into_iter()
+      .map(|id| validation::node_id("startNodes", id).map(|id| id as NodeId))
+      .collect::<Result<Vec<_>>>()?;
+    let opts = options.to_rust()?;
 
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(
@@ -2676,7 +2980,10 @@ impl Database {
   /// @returns Number of results
   #[napi]
   pub fn traverse_count(&self, start_nodes: Vec<i64>, steps: Vec<JsTraversalStep>) -> Result<u32> {
-    let start: Vec<NodeId> = start_nodes.iter().map(|&id| id as NodeId).collect();
+    let start: Vec<NodeId> = start_nodes
+      .into_iter()
+      .map(|id| validation::node_id("startNodes", id).map(|id| id as NodeId))
+      .collect::<Result<Vec<_>>>()?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
         let mut builder = RustTraversalBuilder::new(start);
@@ -2712,7 +3019,10 @@ impl Database {
     steps: Vec<JsTraversalStep>,
     limit: Option<u32>,
   ) -> Result<Vec<i64>> {
-    let start: Vec<NodeId> = start_nodes.iter().map(|&id| id as NodeId).collect();
+    let start: Vec<NodeId> = start_nodes
+      .into_iter()
+      .map(|id| validation::node_id("startNodes", id).map(|id| id as NodeId))
+      .collect::<Result<Vec<_>>>()?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
         let mut builder = RustTraversalBuilder::new(start);
@@ -2727,7 +3037,8 @@ impl Database {
         }
 
         if let Some(n) = limit {
-          builder = builder.take(n as usize);
+          let n = validation::non_negative_usize("limit", n as i64, validation::MAX_COUNT)?;
+          builder = builder.take(n);
         }
 
         Ok(
@@ -2757,7 +3068,7 @@ impl Database {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
         let weight_key = resolve_weight_key_single_file(db, &config)?;
-        let rust_config: PathConfig = config.into();
+        let rust_config = config.to_rust()?;
         Ok(
           dijkstra(
             rust_config,
@@ -2779,7 +3090,7 @@ impl Database {
   /// @returns Path result with nodes, edges, and weight
   #[napi]
   pub fn bfs(&self, config: JsPathConfig) -> Result<JsPathResult> {
-    let rust_config: PathConfig = config.into();
+    let rust_config = config.to_rust()?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(
         bfs(rust_config, |node_id, dir, etype| {
@@ -2801,11 +3112,12 @@ impl Database {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
         let weight_key = resolve_weight_key_single_file(db, &config)?;
-        let rust_config: PathConfig = config.into();
+        let rust_config = config.to_rust()?;
+        let k = validation::non_negative_usize("k", k as i64, validation::MAX_COUNT)?;
         Ok(
           yen_k_shortest(
             rust_config,
-            k as usize,
+            k,
             |node_id, dir, etype| neighbors_from_single_file(db, node_id, dir, etype),
             |src, etype, dst| edge_weight_from_single_file(db, src, etype, dst, weight_key),
           )
@@ -2927,8 +3239,9 @@ impl Database {
   /// Check if checkpoint is recommended
   #[napi]
   pub fn should_checkpoint(&self, threshold: Option<f64>) -> Result<bool> {
+    let threshold = validation::ratio("threshold", threshold.unwrap_or(0.8))?;
     match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => Ok(db.should_checkpoint(threshold.unwrap_or(0.8))),
+      Some(DatabaseInner::SingleFile(db)) => Ok(db.should_checkpoint(threshold)),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -2950,9 +3263,12 @@ impl Database {
   /// Optimize (compact) a single-file database with options
   #[napi(js_name = "optimizeSingleFile")]
   pub fn optimize_single_file(&mut self, options: Option<SingleFileOptimizeOptions>) -> Result<()> {
+    let options = options
+      .map(SingleFileOptimizeOptions::into_rust)
+      .transpose()?;
     match self.inner.as_mut() {
       Some(DatabaseInner::SingleFile(db)) => db
-        .optimize_single_file(options.map(Into::into))
+        .optimize_single_file(options)
         .map_err(|e| Error::from_reason(format!("Failed to optimize single-file: {e}"))),
       None => Err(Error::from_reason("Database is closed")),
     }
@@ -2961,9 +3277,10 @@ impl Database {
   /// Vacuum a single-file database to reclaim free space
   #[napi]
   pub fn vacuum(&mut self, options: Option<VacuumOptions>) -> Result<()> {
+    let options = options.map(VacuumOptions::into_rust).transpose()?;
     match self.inner.as_mut() {
       Some(DatabaseInner::SingleFile(db)) => db
-        .vacuum_single_file(options.map(Into::into))
+        .vacuum_single_file(options)
         .map_err(|e| Error::from_reason(format!("Failed to vacuum: {e}"))),
       None => Err(Error::from_reason("Database is closed")),
     }
@@ -2978,13 +3295,11 @@ impl Database {
   /// Resize the WAL region (single-file only)
   #[napi(js_name = "resizeWal")]
   pub fn resize_wal(&mut self, size_bytes: i64, options: Option<ResizeWalOptions>) -> Result<()> {
-    if size_bytes <= 0 {
-      return Err(Error::from_reason("sizeBytes must be greater than 0"));
-    }
+    let size_bytes = validation::resize_wal_size("sizeBytes", size_bytes)?;
 
     match self.inner.as_mut() {
       Some(DatabaseInner::SingleFile(db)) => db
-        .resize_wal(size_bytes as usize, options.map(Into::into))
+        .resize_wal(size_bytes, options.map(Into::into))
         .map_err(|e| Error::from_reason(format!("Failed to resize WAL: {e}"))),
       None => Err(Error::from_reason("Database is closed")),
     }
@@ -3127,7 +3442,7 @@ impl Database {
       skip_existing: None,
       batch_size: None,
     });
-    let rust_opts = opts.into_rust();
+    let rust_opts = opts.into_rust()?;
     let parsed: ray_export::ExportedDatabase =
       serde_json::from_value(data).map_err(|e| Error::from_reason(e.to_string()))?;
 
@@ -3157,7 +3472,7 @@ impl Database {
       skip_existing: None,
       batch_size: None,
     });
-    let rust_opts = opts.into_rust();
+    let rust_opts = opts.into_rust()?;
     let parsed =
       ray_export::import_from_json(path).map_err(|e| Error::from_reason(e.to_string()))?;
 
@@ -3528,19 +3843,15 @@ pub fn collect_replication_log_transport_json(
 ) -> Result<String> {
   let max_frames = max_frames.unwrap_or(128);
   let max_bytes = max_bytes.unwrap_or(1_048_576);
-  if max_frames <= 0 {
-    return Err(Error::from_reason("maxFrames must be positive"));
-  }
-  if max_bytes <= 0 {
-    return Err(Error::from_reason("maxBytes must be positive"));
-  }
+  let max_frames = validation::positive_usize("maxFrames", max_frames, validation::MAX_COUNT)?;
+  let max_bytes = validation::positive_usize("maxBytes", max_bytes, validation::MAX_BYTES)?;
 
   match db.inner.as_ref() {
     Some(DatabaseInner::SingleFile(db)) => db
       .primary_export_log_transport_json(
         cursor.as_deref(),
-        max_frames as usize,
-        max_bytes as usize,
+        max_frames,
+        max_bytes,
         include_payload.unwrap_or(true),
       )
       .map_err(|e| Error::from_reason(format!("Failed to export replication log: {e}"))),
@@ -3555,16 +3866,15 @@ pub fn push_replication_metrics_otel_json(
   timeout_ms: i64,
   bearer_token: Option<String>,
 ) -> Result<OtlpHttpExportResult> {
-  if timeout_ms <= 0 {
-    return Err(Error::from_reason("timeoutMs must be positive"));
-  }
+  let timeout_ms =
+    validation::positive_u64("timeoutMs", timeout_ms, validation::MAX_DURATION_MS as u64)?;
 
   match db.inner.as_ref() {
     Some(DatabaseInner::SingleFile(db)) => {
       core_metrics::push_replication_metrics_otel_json_single_file(
         db,
         &endpoint,
-        timeout_ms as u64,
+        timeout_ms,
         bearer_token.as_deref(),
       )
       .map(Into::into)
@@ -3577,33 +3887,35 @@ pub fn push_replication_metrics_otel_json(
 fn build_core_otel_push_options(
   options: PushReplicationMetricsOtelOptions,
 ) -> Result<core_metrics::OtlpHttpPushOptions> {
-  let timeout_ms = options.timeout_ms.unwrap_or(5_000);
-  if timeout_ms <= 0 {
-    return Err(Error::from_reason("timeoutMs must be positive"));
-  }
-  let retry_max_attempts = options.retry_max_attempts.unwrap_or(1);
-  if retry_max_attempts <= 0 {
-    return Err(Error::from_reason("retryMaxAttempts must be positive"));
-  }
-  let retry_backoff_ms = options.retry_backoff_ms.unwrap_or(100);
-  if retry_backoff_ms < 0 {
-    return Err(Error::from_reason("retryBackoffMs must be non-negative"));
-  }
-  let retry_backoff_max_ms = options.retry_backoff_max_ms.unwrap_or(2_000);
-  if retry_backoff_max_ms < 0 {
-    return Err(Error::from_reason("retryBackoffMaxMs must be non-negative"));
-  }
+  let timeout_ms = validation::positive_u64(
+    "timeoutMs",
+    options.timeout_ms.unwrap_or(5_000),
+    validation::MAX_DURATION_MS as u64,
+  )?;
+  let retry_max_attempts = validation::positive_u32(
+    "retryMaxAttempts",
+    options.retry_max_attempts.unwrap_or(1),
+    validation::MAX_COUNT,
+  )?;
+  let retry_backoff_ms = validation::non_negative_u64(
+    "retryBackoffMs",
+    options.retry_backoff_ms.unwrap_or(100),
+    validation::MAX_DURATION_MS as u64,
+  )?;
+  let retry_backoff_max_ms = validation::non_negative_u64(
+    "retryBackoffMaxMs",
+    options.retry_backoff_max_ms.unwrap_or(2_000),
+    validation::MAX_DURATION_MS as u64,
+  )?;
   if retry_backoff_max_ms > 0 && retry_backoff_max_ms < retry_backoff_ms {
-    return Err(Error::from_reason(
+    return Err(validation::invalid_argument(
       "retryBackoffMaxMs must be >= retryBackoffMs when non-zero",
     ));
   }
-  let retry_jitter_ratio = options.retry_jitter_ratio.unwrap_or(0.0);
-  if !(0.0..=1.0).contains(&retry_jitter_ratio) {
-    return Err(Error::from_reason(
-      "retryJitterRatio must be within [0.0, 1.0]",
-    ));
-  }
+  let retry_jitter_ratio = validation::ratio(
+    "retryJitterRatio",
+    options.retry_jitter_ratio.unwrap_or(0.0),
+  )?;
   let adaptive_retry_mode = match options
     .adaptive_retry_mode
     .as_deref()
@@ -3621,37 +3933,32 @@ fn build_core_otel_push_options(
       ));
     }
   };
-  let adaptive_retry_ewma_alpha = options.adaptive_retry_ewma_alpha.unwrap_or(0.3);
-  if !(0.0..=1.0).contains(&adaptive_retry_ewma_alpha) {
-    return Err(Error::from_reason(
-      "adaptiveRetryEwmaAlpha must be within [0.0, 1.0]",
-    ));
-  }
-  let circuit_breaker_failure_threshold = options.circuit_breaker_failure_threshold.unwrap_or(0);
-  if circuit_breaker_failure_threshold < 0 {
-    return Err(Error::from_reason(
-      "circuitBreakerFailureThreshold must be non-negative",
-    ));
-  }
-  let circuit_breaker_open_ms = options.circuit_breaker_open_ms.unwrap_or(0);
-  if circuit_breaker_open_ms < 0 {
-    return Err(Error::from_reason(
-      "circuitBreakerOpenMs must be non-negative",
-    ));
-  }
+  let adaptive_retry_ewma_alpha = validation::ratio(
+    "adaptiveRetryEwmaAlpha",
+    options.adaptive_retry_ewma_alpha.unwrap_or(0.3),
+  )?;
+  let circuit_breaker_failure_threshold = validation::non_negative_u32(
+    "circuitBreakerFailureThreshold",
+    options.circuit_breaker_failure_threshold.unwrap_or(0),
+    validation::MAX_COUNT,
+  )?;
+  let circuit_breaker_open_ms = validation::non_negative_u64(
+    "circuitBreakerOpenMs",
+    options.circuit_breaker_open_ms.unwrap_or(0),
+    validation::MAX_DURATION_MS as u64,
+  )?;
   if circuit_breaker_failure_threshold > 0 && circuit_breaker_open_ms == 0 {
-    return Err(Error::from_reason(
+    return Err(validation::invalid_argument(
       "circuitBreakerOpenMs must be positive when circuitBreakerFailureThreshold is set",
     ));
   }
-  let circuit_breaker_half_open_probes = options.circuit_breaker_half_open_probes.unwrap_or(1);
-  if circuit_breaker_half_open_probes < 0 {
-    return Err(Error::from_reason(
-      "circuitBreakerHalfOpenProbes must be non-negative",
-    ));
-  }
+  let circuit_breaker_half_open_probes = validation::non_negative_u32(
+    "circuitBreakerHalfOpenProbes",
+    options.circuit_breaker_half_open_probes.unwrap_or(1),
+    validation::MAX_COUNT,
+  )?;
   if circuit_breaker_failure_threshold > 0 && circuit_breaker_half_open_probes == 0 {
-    return Err(Error::from_reason(
+    return Err(validation::invalid_argument(
       "circuitBreakerHalfOpenProbes must be positive when circuitBreakerFailureThreshold is set",
     ));
   }
@@ -3706,30 +4013,27 @@ fn build_core_otel_push_options(
       "circuitBreakerStatePatchMerge requires circuitBreakerStatePatch",
     ));
   }
-  let circuit_breaker_state_patch_batch_max_keys = options
-    .circuit_breaker_state_patch_batch_max_keys
-    .unwrap_or(8);
-  if circuit_breaker_state_patch_batch_max_keys <= 0 {
-    return Err(Error::from_reason(
-      "circuitBreakerStatePatchBatchMaxKeys must be positive",
-    ));
-  }
-  let circuit_breaker_state_patch_merge_max_keys = options
-    .circuit_breaker_state_patch_merge_max_keys
-    .unwrap_or(32);
-  if circuit_breaker_state_patch_merge_max_keys <= 0 {
-    return Err(Error::from_reason(
-      "circuitBreakerStatePatchMergeMaxKeys must be positive",
-    ));
-  }
-  let circuit_breaker_state_patch_retry_max_attempts = options
-    .circuit_breaker_state_patch_retry_max_attempts
-    .unwrap_or(1);
-  if circuit_breaker_state_patch_retry_max_attempts <= 0 {
-    return Err(Error::from_reason(
-      "circuitBreakerStatePatchRetryMaxAttempts must be positive",
-    ));
-  }
+  let circuit_breaker_state_patch_batch_max_keys = validation::positive_u32(
+    "circuitBreakerStatePatchBatchMaxKeys",
+    options
+      .circuit_breaker_state_patch_batch_max_keys
+      .unwrap_or(8),
+    validation::MAX_COUNT,
+  )?;
+  let circuit_breaker_state_patch_merge_max_keys = validation::positive_u32(
+    "circuitBreakerStatePatchMergeMaxKeys",
+    options
+      .circuit_breaker_state_patch_merge_max_keys
+      .unwrap_or(32),
+    validation::MAX_COUNT,
+  )?;
+  let circuit_breaker_state_patch_retry_max_attempts = validation::positive_u32(
+    "circuitBreakerStatePatchRetryMaxAttempts",
+    options
+      .circuit_breaker_state_patch_retry_max_attempts
+      .unwrap_or(1),
+    validation::MAX_COUNT,
+  )?;
   if options.circuit_breaker_state_cas.unwrap_or(false)
     && options.circuit_breaker_state_url.is_none()
   {
@@ -3758,27 +4062,26 @@ fn build_core_otel_push_options(
   }
 
   Ok(core_metrics::OtlpHttpPushOptions {
-    timeout_ms: timeout_ms as u64,
+    timeout_ms,
     bearer_token: options.bearer_token,
-    retry_max_attempts: retry_max_attempts as u32,
-    retry_backoff_ms: retry_backoff_ms as u64,
-    retry_backoff_max_ms: retry_backoff_max_ms as u64,
+    retry_max_attempts,
+    retry_backoff_ms,
+    retry_backoff_max_ms,
     retry_jitter_ratio,
     adaptive_retry_mode,
     adaptive_retry_ewma_alpha,
     adaptive_retry: options.adaptive_retry.unwrap_or(false),
-    circuit_breaker_failure_threshold: circuit_breaker_failure_threshold as u32,
-    circuit_breaker_open_ms: circuit_breaker_open_ms as u64,
-    circuit_breaker_half_open_probes: circuit_breaker_half_open_probes as u32,
+    circuit_breaker_failure_threshold,
+    circuit_breaker_open_ms,
+    circuit_breaker_half_open_probes,
     circuit_breaker_state_path: options.circuit_breaker_state_path,
     circuit_breaker_state_url: options.circuit_breaker_state_url,
     circuit_breaker_state_patch: options.circuit_breaker_state_patch.unwrap_or(false),
     circuit_breaker_state_patch_batch: options.circuit_breaker_state_patch_batch.unwrap_or(false),
-    circuit_breaker_state_patch_batch_max_keys: circuit_breaker_state_patch_batch_max_keys as u32,
+    circuit_breaker_state_patch_batch_max_keys,
     circuit_breaker_state_patch_merge: options.circuit_breaker_state_patch_merge.unwrap_or(false),
-    circuit_breaker_state_patch_merge_max_keys: circuit_breaker_state_patch_merge_max_keys as u32,
-    circuit_breaker_state_patch_retry_max_attempts: circuit_breaker_state_patch_retry_max_attempts
-      as u32,
+    circuit_breaker_state_patch_merge_max_keys,
+    circuit_breaker_state_patch_retry_max_attempts,
     circuit_breaker_state_cas: options.circuit_breaker_state_cas.unwrap_or(false),
     circuit_breaker_state_lease_id: options.circuit_breaker_state_lease_id,
     circuit_breaker_scope_key: options.circuit_breaker_scope_key,
@@ -3821,16 +4124,15 @@ pub fn push_replication_metrics_otel_protobuf(
   timeout_ms: i64,
   bearer_token: Option<String>,
 ) -> Result<OtlpHttpExportResult> {
-  if timeout_ms <= 0 {
-    return Err(Error::from_reason("timeoutMs must be positive"));
-  }
+  let timeout_ms =
+    validation::positive_u64("timeoutMs", timeout_ms, validation::MAX_DURATION_MS as u64)?;
 
   match db.inner.as_ref() {
     Some(DatabaseInner::SingleFile(db)) => {
       core_metrics::push_replication_metrics_otel_protobuf_single_file(
         db,
         &endpoint,
-        timeout_ms as u64,
+        timeout_ms,
         bearer_token.as_deref(),
       )
       .map(Into::into)
@@ -3869,16 +4171,15 @@ pub fn push_replication_metrics_otel_grpc(
   timeout_ms: i64,
   bearer_token: Option<String>,
 ) -> Result<OtlpHttpExportResult> {
-  if timeout_ms <= 0 {
-    return Err(Error::from_reason("timeoutMs must be positive"));
-  }
+  let timeout_ms =
+    validation::positive_u64("timeoutMs", timeout_ms, validation::MAX_DURATION_MS as u64)?;
 
   match db.inner.as_ref() {
     Some(DatabaseInner::SingleFile(db)) => {
       core_metrics::push_replication_metrics_otel_grpc_single_file(
         db,
         &endpoint,
-        timeout_ms as u64,
+        timeout_ms,
         bearer_token.as_deref(),
       )
       .map(Into::into)

@@ -1,6 +1,7 @@
 //! Export and import options for Python bindings
 
 use crate::export as ray_export;
+use crate::pyo3_bindings::validation;
 use pyo3::prelude::*;
 
 /// Options for exporting a database
@@ -70,6 +71,7 @@ pub struct ImportOptions {
   #[pyo3(get, set)]
   pub skip_existing: Option<bool>,
   #[pyo3(get, set)]
+  /// Batch size; 0 preserves the core default.
   pub batch_size: Option<i64>,
 }
 
@@ -94,17 +96,18 @@ impl ImportOptions {
 
 impl ImportOptions {
   /// Convert to core import options
-  pub fn to_rust(self) -> ray_export::ImportOptions {
+  pub fn to_rust(self) -> PyResult<ray_export::ImportOptions> {
     let mut opts = ray_export::ImportOptions::default();
     if let Some(v) = self.skip_existing {
       opts.skip_existing = v;
     }
     if let Some(v) = self.batch_size {
-      if v > 0 {
-        opts.batch_size = v as usize;
+      let batch_size = validation::non_negative_usize("batch_size", v, validation::MAX_COUNT)?;
+      if batch_size > 0 {
+        opts.batch_size = batch_size;
       }
     }
-    opts
+    Ok(opts)
   }
 }
 
@@ -198,7 +201,7 @@ mod tests {
   #[test]
   fn test_import_options_default() {
     let opts = ImportOptions::default();
-    let rust = opts.to_rust();
+    let rust = opts.to_rust().expect("expected value");
     assert!(!rust.skip_existing);
   }
 
@@ -208,9 +211,30 @@ mod tests {
       skip_existing: Some(true),
       batch_size: Some(500),
     };
-    let rust = opts.to_rust();
+    let rust = opts.to_rust().expect("expected value");
     assert!(rust.skip_existing);
     assert_eq!(rust.batch_size, 500);
+  }
+
+  #[test]
+  fn test_import_batch_size_validation_and_zero_default() {
+    let zero = ImportOptions {
+      skip_existing: None,
+      batch_size: Some(0),
+    };
+    assert_eq!(zero.to_rust().expect("expected value").batch_size, 1000);
+    assert!(ImportOptions {
+      skip_existing: None,
+      batch_size: Some(-1),
+    }
+    .to_rust()
+    .is_err());
+    assert!(ImportOptions {
+      skip_existing: None,
+      batch_size: Some(validation::MAX_COUNT + 1),
+    }
+    .to_rust()
+    .is_err());
   }
 
   #[test]

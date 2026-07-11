@@ -8,6 +8,7 @@ use crate::core::single_file::{
   SingleFileOpenOptions as RustOpenOptions, SnapshotParseMode as RustSnapshotParseMode,
   SyncMode as RustSyncMode,
 };
+use crate::pyo3_bindings::validation;
 use crate::replication::types::ReplicationRole;
 use crate::types::{CacheOptions, PropertyCacheConfig, QueryCacheConfig, TraversalCacheConfig};
 use pyo3::exceptions::PyValueError;
@@ -114,18 +115,18 @@ pub struct OpenOptions {
   /// MVCC GC interval in ms
   #[pyo3(get, set)]
   pub mvcc_gc_interval_ms: Option<i64>,
-  /// MVCC retention in ms
+  /// MVCC retention in ms (0 means retain no historical window)
   #[pyo3(get, set)]
   pub mvcc_retention_ms: Option<i64>,
-  /// MVCC max version chain depth
+  /// MVCC max version chain depth (must be positive)
   #[pyo3(get, set)]
   pub mvcc_max_chain_depth: Option<i64>,
-  /// Page size in bytes (default 4096)
+  /// Page size in bytes (must be a supported positive power of two)
   #[pyo3(get, set)]
-  pub page_size: Option<u32>,
-  /// WAL size in bytes (default 1MB)
+  pub page_size: Option<i64>,
+  /// WAL size in bytes (must be positive and at least 16 pages)
   #[pyo3(get, set)]
-  pub wal_size: Option<u32>,
+  pub wal_size: Option<i64>,
   /// Enable auto-checkpoint when WAL usage exceeds threshold
   #[pyo3(get, set)]
   pub auto_checkpoint: Option<bool>,
@@ -144,19 +145,19 @@ pub struct OpenOptions {
   /// Enable caching
   #[pyo3(get, set)]
   pub cache_enabled: Option<bool>,
-  /// Max node properties in cache
+  /// Max node properties in cache (0 disables the node-property cache)
   #[pyo3(get, set)]
   pub cache_max_node_props: Option<i64>,
-  /// Max edge properties in cache
+  /// Max edge properties in cache (0 disables the edge-property cache)
   #[pyo3(get, set)]
   pub cache_max_edge_props: Option<i64>,
-  /// Max traversal cache entries
+  /// Max traversal cache entries (0 disables the traversal cache)
   #[pyo3(get, set)]
   pub cache_max_traversal_entries: Option<i64>,
-  /// Max query cache entries
+  /// Max query cache entries (0 disables the query cache)
   #[pyo3(get, set)]
   pub cache_max_query_entries: Option<i64>,
-  /// Query cache TTL in milliseconds
+  /// Query cache TTL in milliseconds (0 expires entries immediately)
   #[pyo3(get, set)]
   pub cache_query_ttl_ms: Option<i64>,
   /// Sync mode: "full", "normal", or "off"
@@ -164,7 +165,7 @@ pub struct OpenOptions {
   /// Enable group commit (coalesce WAL flushes across commits)
   #[pyo3(get, set)]
   pub group_commit_enabled: Option<bool>,
-  /// Group commit window in milliseconds
+  /// Group commit window in milliseconds (0 adds no coalescing delay)
   #[pyo3(get, set)]
   pub group_commit_window_ms: Option<i64>,
   /// Snapshot parse mode: "strict" or "salvage" (single-file only)
@@ -185,10 +186,10 @@ pub struct OpenOptions {
   /// Segment rotation threshold in bytes (primary role only)
   #[pyo3(get, set)]
   pub replication_segment_max_bytes: Option<i64>,
-  /// Minimum retained entries window (primary role only)
+  /// Minimum retained entries window (0 imposes no entry-count floor)
   #[pyo3(get, set)]
   pub replication_retention_min_entries: Option<i64>,
-  /// Minimum retained segment age in milliseconds (primary role only)
+  /// Minimum retained segment age in milliseconds (0 imposes no age floor)
   #[pyo3(get, set)]
   pub replication_retention_min_ms: Option<i64>,
 }
@@ -236,8 +237,8 @@ impl OpenOptions {
     mvcc_gc_interval_ms: Option<i64>,
     mvcc_retention_ms: Option<i64>,
     mvcc_max_chain_depth: Option<i64>,
-    page_size: Option<u32>,
-    wal_size: Option<u32>,
+    page_size: Option<i64>,
+    wal_size: Option<i64>,
     auto_checkpoint: Option<bool>,
     checkpoint_threshold: Option<f64>,
     background_checkpoint: Option<bool>,
@@ -314,6 +315,11 @@ impl TryFrom<OpenOptions> for RustOpenOptions {
 impl OpenOptions {
   /// Convert to single-file open options with validation
   pub fn to_single_file_options(&self) -> PyResult<RustOpenOptions> {
+    let page_size = self
+      .page_size
+      .map(validation::page_size)
+      .transpose()?
+      .unwrap_or(validation::MIN_PAGE_SIZE as usize);
     let mut rust_opts = RustOpenOptions::new();
     if let Some(v) = self.read_only {
       rust_opts = rust_opts.read_only(v);
@@ -325,25 +331,37 @@ impl OpenOptions {
       rust_opts = rust_opts.mvcc(v);
     }
     if let Some(v) = self.mvcc_gc_interval_ms {
-      rust_opts = rust_opts.mvcc_gc_interval_ms(v as u64);
+      rust_opts = rust_opts.mvcc_gc_interval_ms(validation::positive_u64(
+        "mvcc_gc_interval_ms",
+        v,
+        validation::MAX_DURATION_MS as u64,
+      )?);
     }
     if let Some(v) = self.mvcc_retention_ms {
-      rust_opts = rust_opts.mvcc_retention_ms(v as u64);
+      rust_opts = rust_opts.mvcc_retention_ms(validation::non_negative_u64(
+        "mvcc_retention_ms",
+        v,
+        validation::MAX_DURATION_MS as u64,
+      )?);
     }
     if let Some(v) = self.mvcc_max_chain_depth {
-      rust_opts = rust_opts.mvcc_max_chain_depth(v as usize);
+      rust_opts = rust_opts.mvcc_max_chain_depth(validation::positive_usize(
+        "mvcc_max_chain_depth",
+        v,
+        validation::MAX_DEPTH,
+      )?);
     }
-    if let Some(v) = self.page_size {
-      rust_opts = rust_opts.page_size(v as usize);
+    if self.page_size.is_some() {
+      rust_opts = rust_opts.page_size(page_size);
     }
     if let Some(v) = self.wal_size {
-      rust_opts = rust_opts.wal_size(v as usize);
+      rust_opts = rust_opts.wal_size(validation::wal_size(v, page_size)?);
     }
     if let Some(v) = self.auto_checkpoint {
       rust_opts = rust_opts.auto_checkpoint(v);
     }
     if let Some(v) = self.checkpoint_threshold {
-      rust_opts = rust_opts.checkpoint_threshold(v);
+      rust_opts = rust_opts.checkpoint_threshold(validation::ratio("checkpoint_threshold", v)?);
     }
     if let Some(v) = self.background_checkpoint {
       rust_opts = rust_opts.background_checkpoint(v);
@@ -352,21 +370,69 @@ impl OpenOptions {
       rust_opts = rust_opts.checkpoint_compression(Some(compression.to_core()?));
     }
 
-    // Cache options
+    let max_node_props = self
+      .cache_max_node_props
+      .map(|value| {
+        validation::non_negative_usize("cache_max_node_props", value, validation::MAX_CACHE_ENTRIES)
+      })
+      .transpose()?
+      .unwrap_or(10_000);
+    let max_edge_props = self
+      .cache_max_edge_props
+      .map(|value| {
+        validation::non_negative_usize("cache_max_edge_props", value, validation::MAX_CACHE_ENTRIES)
+      })
+      .transpose()?
+      .unwrap_or(10_000);
+    let max_traversal_entries = self
+      .cache_max_traversal_entries
+      .map(|value| {
+        validation::non_negative_usize(
+          "cache_max_traversal_entries",
+          value,
+          validation::MAX_CACHE_ENTRIES,
+        )
+      })
+      .transpose()?
+      .unwrap_or(5_000);
+    let max_query_entries = self
+      .cache_max_query_entries
+      .map(|value| {
+        validation::non_negative_usize(
+          "cache_max_query_entries",
+          value,
+          validation::MAX_CACHE_ENTRIES,
+        )
+      })
+      .transpose()?
+      .unwrap_or(1_000);
+    let query_ttl_ms = self
+      .cache_query_ttl_ms
+      .map(|value| {
+        validation::non_negative_u64(
+          "cache_query_ttl_ms",
+          value,
+          validation::MAX_DURATION_MS as u64,
+        )
+      })
+      .transpose()?;
+
+    // A zero cache capacity disables that cache. A zero TTL keeps the cache
+    // enabled but makes entries immediately stale, matching core semantics.
     if self.cache_enabled == Some(true) {
       let property_cache = Some(PropertyCacheConfig {
-        max_node_props: self.cache_max_node_props.unwrap_or(10000) as usize,
-        max_edge_props: self.cache_max_edge_props.unwrap_or(10000) as usize,
+        max_node_props,
+        max_edge_props,
       });
 
       let traversal_cache = Some(TraversalCacheConfig {
-        max_entries: self.cache_max_traversal_entries.unwrap_or(5000) as usize,
+        max_entries: max_traversal_entries,
         max_neighbors_per_entry: 100,
       });
 
       let query_cache = Some(QueryCacheConfig {
-        max_entries: self.cache_max_query_entries.unwrap_or(1000) as usize,
-        ttl_ms: self.cache_query_ttl_ms.map(|v| v as u64),
+        max_entries: max_query_entries,
+        ttl_ms: query_ttl_ms,
       });
 
       rust_opts = rust_opts.cache(Some(CacheOptions {
@@ -385,9 +451,11 @@ impl OpenOptions {
       rust_opts = rust_opts.group_commit_enabled(enabled);
     }
     if let Some(window_ms) = self.group_commit_window_ms {
-      if window_ms >= 0 {
-        rust_opts = rust_opts.group_commit_window_ms(window_ms as u64);
-      }
+      rust_opts = rust_opts.group_commit_window_ms(validation::non_negative_u64(
+        "group_commit_window_ms",
+        window_ms,
+        validation::MAX_DURATION_MS as u64,
+      )?);
     }
     if let Some(mode) = self.snapshot_parse_mode {
       rust_opts = rust_opts.snapshot_parse_mode(mode.mode);
@@ -408,28 +476,25 @@ impl OpenOptions {
       rust_opts = rust_opts.replication_source_sidecar_path(path);
     }
     if let Some(value) = self.replication_segment_max_bytes {
-      if value < 0 {
-        return Err(PyValueError::new_err(
-          "replication_segment_max_bytes must be non-negative",
-        ));
-      }
-      rust_opts = rust_opts.replication_segment_max_bytes(value as u64);
+      rust_opts = rust_opts.replication_segment_max_bytes(validation::positive_u64(
+        "replication_segment_max_bytes",
+        value,
+        validation::MAX_BYTES as u64,
+      )?);
     }
     if let Some(value) = self.replication_retention_min_entries {
-      if value < 0 {
-        return Err(PyValueError::new_err(
-          "replication_retention_min_entries must be non-negative",
-        ));
-      }
-      rust_opts = rust_opts.replication_retention_min_entries(value as u64);
+      rust_opts = rust_opts.replication_retention_min_entries(validation::non_negative_u64(
+        "replication_retention_min_entries",
+        value,
+        validation::MAX_COUNT as u64,
+      )?);
     }
     if let Some(value) = self.replication_retention_min_ms {
-      if value < 0 {
-        return Err(PyValueError::new_err(
-          "replication_retention_min_ms must be non-negative",
-        ));
-      }
-      rust_opts = rust_opts.replication_retention_min_ms(value as u64);
+      rust_opts = rust_opts.replication_retention_min_ms(validation::non_negative_u64(
+        "replication_retention_min_ms",
+        value,
+        validation::MAX_DURATION_MS as u64,
+      )?);
     }
 
     Ok(rust_opts)
@@ -454,7 +519,7 @@ impl OpenOptions {
         .mvcc_max_chain_depth
         .and_then(|v| i64::try_from(v).ok()),
       page_size: None,
-      wal_size: opts.wal_size.and_then(|v| u32::try_from(v).ok()),
+      wal_size: opts.wal_size.and_then(|v| i64::try_from(v).ok()),
       auto_checkpoint: None,
       checkpoint_threshold: opts.checkpoint_threshold,
       background_checkpoint: None,
@@ -570,5 +635,105 @@ mod tests {
     assert!(!rust_opts.create_if_missing);
     assert!(rust_opts.group_commit_enabled);
     assert_eq!(rust_opts.group_commit_window_ms, 5);
+  }
+
+  #[test]
+  fn test_open_numeric_validation_and_zero_semantics() {
+    let valid = OpenOptions {
+      page_size: Some(8192),
+      wal_size: Some(8192 * 16),
+      mvcc_gc_interval_ms: Some(1),
+      mvcc_retention_ms: Some(0),
+      mvcc_max_chain_depth: Some(1),
+      cache_enabled: Some(true),
+      cache_max_node_props: Some(0),
+      cache_max_edge_props: Some(1),
+      cache_max_traversal_entries: Some(0),
+      cache_max_query_entries: Some(0),
+      cache_query_ttl_ms: Some(0),
+      checkpoint_threshold: Some(0.0),
+      group_commit_window_ms: Some(0),
+      replication_segment_max_bytes: Some(1),
+      replication_retention_min_entries: Some(0),
+      replication_retention_min_ms: Some(0),
+      ..Default::default()
+    };
+    assert!(valid.to_single_file_options().is_ok());
+
+    for options in [
+      OpenOptions {
+        page_size: Some(0),
+        ..Default::default()
+      },
+      OpenOptions {
+        page_size: Some(-1),
+        ..Default::default()
+      },
+      OpenOptions {
+        page_size: Some(1_000_000),
+        ..Default::default()
+      },
+      OpenOptions {
+        wal_size: Some(0),
+        ..Default::default()
+      },
+      OpenOptions {
+        wal_size: Some(-1),
+        ..Default::default()
+      },
+      OpenOptions {
+        wal_size: Some(validation::MAX_BYTES + 1),
+        ..Default::default()
+      },
+      OpenOptions {
+        mvcc_gc_interval_ms: Some(0),
+        ..Default::default()
+      },
+      OpenOptions {
+        mvcc_gc_interval_ms: Some(-1),
+        ..Default::default()
+      },
+      OpenOptions {
+        mvcc_retention_ms: Some(-1),
+        ..Default::default()
+      },
+      OpenOptions {
+        mvcc_max_chain_depth: Some(0),
+        ..Default::default()
+      },
+      OpenOptions {
+        cache_max_node_props: Some(-1),
+        ..Default::default()
+      },
+      OpenOptions {
+        cache_max_query_entries: Some(validation::MAX_CACHE_ENTRIES + 1),
+        ..Default::default()
+      },
+      OpenOptions {
+        checkpoint_threshold: Some(2.0),
+        ..Default::default()
+      },
+      OpenOptions {
+        group_commit_window_ms: Some(-1),
+        ..Default::default()
+      },
+      OpenOptions {
+        replication_segment_max_bytes: Some(0),
+        ..Default::default()
+      },
+      OpenOptions {
+        replication_retention_min_ms: Some(validation::MAX_DURATION_MS + 1),
+        ..Default::default()
+      },
+    ] {
+      assert!(options.to_single_file_options().is_err());
+    }
+    assert!(OpenOptions {
+      cache_enabled: Some(true),
+      cache_max_node_props: Some(validation::MAX_CACHE_ENTRIES),
+      ..Default::default()
+    }
+    .to_single_file_options()
+    .is_ok());
   }
 }

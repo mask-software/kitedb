@@ -5,6 +5,8 @@
 //!
 //! Ported from src/vector/columnar-store.ts
 
+use std::collections::HashSet;
+
 use crate::types::NodeId;
 
 use super::distance::normalize_in_place;
@@ -180,12 +182,9 @@ pub fn vector_store_batch_insert(
 /// Get all vectors as a flat Vec<f32> (for training/serialization)
 /// Only includes non-deleted vectors
 pub fn vector_store_all_vectors(manifest: &VectorManifest) -> (Vec<f32>, Vec<NodeId>, Vec<u64>) {
-  let live_count = manifest.live_count();
-  let dimensions = manifest.config.dimensions;
-
-  let mut data = Vec::with_capacity(live_count * dimensions);
-  let mut node_ids = Vec::with_capacity(live_count);
-  let mut vector_ids = Vec::with_capacity(live_count);
+  let mut data = Vec::new();
+  let mut node_ids = Vec::new();
+  let mut vector_ids = Vec::new();
 
   for (&node_id, &vector_id) in &manifest.node_to_vector {
     if let Some(vec) = vector_store_vector_by_id(manifest, vector_id) {
@@ -306,6 +305,277 @@ pub fn vector_store_clear(manifest: &mut VectorManifest) {
   manifest.node_to_vector.clear();
   manifest.vector_to_node.clear();
   manifest.vector_locations.clear();
+}
+
+/// Validate all invariants required by vector-manifest readers and hot paths.
+///
+/// This is deliberately kept out of individual lookup functions. A manifest
+/// loaded from bytes is validated once, so those functions can retain their
+/// branch-light traversal behavior.
+pub(crate) fn validate_vector_manifest(manifest: &VectorManifest) -> Result<(), VectorStoreError> {
+  let config = &manifest.config;
+  if config.dimensions == 0 {
+    return Err(VectorStoreError::Invariant(
+      "manifest dimensions must be nonzero".into(),
+    ));
+  }
+  if config.row_group_size == 0 {
+    return Err(VectorStoreError::Invariant(
+      "manifest row_group_size must be nonzero".into(),
+    ));
+  }
+  if config.fragment_target_size == 0 {
+    return Err(VectorStoreError::Invariant(
+      "manifest fragment_target_size must be nonzero".into(),
+    ));
+  }
+  if manifest.fragments.is_empty() {
+    return Err(VectorStoreError::Invariant(
+      "manifest must contain at least one fragment".into(),
+    ));
+  }
+
+  let mut fragment_ids = HashSet::with_capacity(manifest.fragments.len());
+  let mut active_count = 0usize;
+  let mut total_vectors = 0usize;
+  let mut total_deleted = 0usize;
+
+  for fragment in &manifest.fragments {
+    if !fragment_ids.insert(fragment.id) {
+      return Err(VectorStoreError::Invariant(format!(
+        "duplicate fragment id {}",
+        fragment.id
+      )));
+    }
+
+    if fragment.state == FragmentState::Active {
+      active_count += 1;
+    }
+
+    let mut row_group_ids = HashSet::with_capacity(fragment.row_groups.len());
+    let mut row_count = 0usize;
+    for row_group in &fragment.row_groups {
+      if !row_group_ids.insert(row_group.id) {
+        return Err(VectorStoreError::Invariant(format!(
+          "fragment {} has duplicate row group id {}",
+          fragment.id, row_group.id
+        )));
+      }
+      if row_group.count > config.row_group_size {
+        return Err(VectorStoreError::Invariant(format!(
+          "fragment {} row group {} count {} exceeds row_group_size {}",
+          fragment.id, row_group.id, row_group.count, config.row_group_size
+        )));
+      }
+
+      let expected_data_len = row_group
+        .count
+        .checked_mul(config.dimensions)
+        .ok_or_else(|| {
+          VectorStoreError::Invariant(format!(
+            "fragment {} row group {} data length overflow",
+            fragment.id, row_group.id
+          ))
+        })?;
+      if row_group.data.len() != expected_data_len {
+        return Err(VectorStoreError::Invariant(format!(
+          "fragment {} row group {} data length {} does not match count {} * dimensions {}",
+          fragment.id,
+          row_group.id,
+          row_group.data.len(),
+          row_group.count,
+          config.dimensions
+        )));
+      }
+      row_count = row_count.checked_add(row_group.count).ok_or_else(|| {
+        VectorStoreError::Invariant(format!("fragment {} row count overflow", fragment.id))
+      })?;
+    }
+
+    if fragment.total_vectors != row_count {
+      return Err(VectorStoreError::Invariant(format!(
+        "fragment {} total_vectors {} does not match row count {}",
+        fragment.id, fragment.total_vectors, row_count
+      )));
+    }
+    if fragment.deleted_count > fragment.total_vectors {
+      return Err(VectorStoreError::Invariant(format!(
+        "fragment {} deleted_count {} exceeds total_vectors {}",
+        fragment.id, fragment.deleted_count, fragment.total_vectors
+      )));
+    }
+
+    let expected_bitmap_words = if fragment.total_vectors == 0 {
+      0
+    } else {
+      (fragment.total_vectors - 1) / 32 + 1
+    };
+    if fragment.deletion_bitmap.len() != expected_bitmap_words {
+      return Err(VectorStoreError::Invariant(format!(
+        "fragment {} deletion bitmap has {} words, expected {}",
+        fragment.id,
+        fragment.deletion_bitmap.len(),
+        expected_bitmap_words
+      )));
+    }
+
+    let mut bitmap_deleted = 0usize;
+    for (word_index, &word) in fragment.deletion_bitmap.iter().enumerate() {
+      if word_index + 1 == expected_bitmap_words {
+        let remaining = fragment.total_vectors % 32;
+        if remaining != 0 && word & (u32::MAX << remaining) != 0 {
+          return Err(VectorStoreError::Invariant(format!(
+            "fragment {} deletion bitmap sets bits beyond total_vectors",
+            fragment.id
+          )));
+        }
+      }
+      bitmap_deleted = bitmap_deleted
+        .checked_add(word.count_ones() as usize)
+        .ok_or_else(|| {
+          VectorStoreError::Invariant(format!(
+            "fragment {} deletion bitmap count overflow",
+            fragment.id
+          ))
+        })?;
+    }
+    if bitmap_deleted != fragment.deleted_count {
+      return Err(VectorStoreError::Invariant(format!(
+        "fragment {} deletion bitmap count {} does not match deleted_count {}",
+        fragment.id, bitmap_deleted, fragment.deleted_count
+      )));
+    }
+
+    total_vectors = total_vectors
+      .checked_add(fragment.total_vectors)
+      .ok_or_else(|| VectorStoreError::Invariant("manifest total_vectors overflow".into()))?;
+    total_deleted = total_deleted
+      .checked_add(fragment.deleted_count)
+      .ok_or_else(|| VectorStoreError::Invariant("manifest total_deleted overflow".into()))?;
+  }
+
+  if active_count != 1 {
+    return Err(VectorStoreError::Invariant(format!(
+      "manifest must contain exactly one active fragment, found {active_count}"
+    )));
+  }
+  let active_fragment = manifest
+    .fragments
+    .iter()
+    .find(|fragment| fragment.id == manifest.active_fragment_id)
+    .ok_or_else(|| {
+      VectorStoreError::Invariant(format!(
+        "active fragment id {} is missing",
+        manifest.active_fragment_id
+      ))
+    })?;
+  if active_fragment.state != FragmentState::Active {
+    return Err(VectorStoreError::Invariant(format!(
+      "active fragment id {} is not active",
+      manifest.active_fragment_id
+    )));
+  }
+
+  if manifest.total_vectors != total_vectors {
+    return Err(VectorStoreError::Invariant(format!(
+      "manifest total_vectors {} does not match fragment total {}",
+      manifest.total_vectors, total_vectors
+    )));
+  }
+  if manifest.total_deleted != total_deleted {
+    return Err(VectorStoreError::Invariant(format!(
+      "manifest total_deleted {} does not match fragment total {}",
+      manifest.total_deleted, total_deleted
+    )));
+  }
+  if manifest.total_deleted > manifest.total_vectors {
+    return Err(VectorStoreError::Invariant(
+      "manifest total_deleted exceeds total_vectors".into(),
+    ));
+  }
+
+  let live_count = manifest.total_vectors - manifest.total_deleted;
+  if manifest.node_to_vector.len() != live_count
+    || manifest.vector_to_node.len() != live_count
+    || manifest.vector_locations.len() != live_count
+  {
+    return Err(VectorStoreError::Invariant(format!(
+      "live mapping counts do not match live vector count {live_count}"
+    )));
+  }
+
+  for (&node_id, &vector_id) in &manifest.node_to_vector {
+    if manifest.vector_to_node.get(&vector_id) != Some(&node_id) {
+      return Err(VectorStoreError::Invariant(format!(
+        "node-to-vector mapping for node {node_id} is not bijective"
+      )));
+    }
+    if vector_id >= manifest.next_vector_id {
+      return Err(VectorStoreError::Invariant(format!(
+        "vector id {vector_id} is not below next_vector_id {}",
+        manifest.next_vector_id
+      )));
+    }
+    let location = manifest.vector_locations.get(&vector_id).ok_or_else(|| {
+      VectorStoreError::Invariant(format!("vector id {vector_id} has no location"))
+    })?;
+    validate_live_location(manifest, vector_id, location)?;
+  }
+
+  for (&vector_id, &node_id) in &manifest.vector_to_node {
+    if manifest.node_to_vector.get(&node_id) != Some(&vector_id) {
+      return Err(VectorStoreError::Invariant(format!(
+        "vector-to-node mapping for vector {vector_id} is not bijective"
+      )));
+    }
+  }
+
+  for (&vector_id, location) in &manifest.vector_locations {
+    if !manifest.vector_to_node.contains_key(&vector_id) {
+      return Err(VectorStoreError::Invariant(format!(
+        "location exists for unmapped vector id {vector_id}"
+      )));
+    }
+    validate_live_location(manifest, vector_id, location)?;
+  }
+
+  Ok(())
+}
+
+fn validate_live_location(
+  manifest: &VectorManifest,
+  vector_id: u64,
+  location: &VectorLocation,
+) -> Result<(), VectorStoreError> {
+  let fragment = manifest
+    .fragments
+    .iter()
+    .find(|fragment| fragment.id == location.fragment_id)
+    .ok_or_else(|| {
+      VectorStoreError::Invariant(format!(
+        "vector id {vector_id} references missing fragment {}",
+        location.fragment_id
+      ))
+    })?;
+  let row_group_index = location.local_index / manifest.config.row_group_size;
+  let local_row_index = location.local_index % manifest.config.row_group_size;
+  let row_group = fragment.row_groups.get(row_group_index).ok_or_else(|| {
+    VectorStoreError::Invariant(format!(
+      "vector id {vector_id} references missing row group {row_group_index}"
+    ))
+  })?;
+  if local_row_index >= row_group.count {
+    return Err(VectorStoreError::Invariant(format!(
+      "vector id {vector_id} local index {} is outside row group",
+      location.local_index
+    )));
+  }
+  if fragment.is_deleted(location.local_index) {
+    return Err(VectorStoreError::Invariant(format!(
+      "vector id {vector_id} references a deleted vector"
+    )));
+  }
+  Ok(())
 }
 
 // ============================================================================

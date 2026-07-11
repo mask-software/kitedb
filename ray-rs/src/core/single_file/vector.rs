@@ -9,8 +9,8 @@ use crate::core::wal::record::{
 use crate::error::{KiteError, Result};
 use crate::types::*;
 use crate::util::binary::{read_u32, read_u64};
-use crate::vector::ivf::serialize::deserialize_manifest;
 use crate::util::binary::{read_u32_at, read_u64_at};
+use crate::vector::ivf::serialize::deserialize_manifest;
 use crate::vector::store::{
   create_vector_store, validate_vector, vector_store_delete, vector_store_has, vector_store_insert,
   vector_store_node_vector,
@@ -531,8 +531,7 @@ fn vector_store_lazy_entries_from_sections(
     })?;
     if payload_end > blob_len {
       return Err(KiteError::InvalidSnapshot(format!(
-        "Vector store entry {i} out of bounds: {}..{} exceeds blob size {}",
-        payload_offset, payload_end, blob_len
+        "Vector store entry {i} out of bounds: {payload_offset}..{payload_end} exceeds blob size {blob_len}"
       )));
     }
 
@@ -623,7 +622,9 @@ fn decode_vector_payload(
 
 #[cfg(test)]
 mod tests {
-  use super::{decode_vector_payload, vector_store_state_from_snapshot, vector_stores_from_snapshot};
+  use super::{
+    decode_vector_payload, vector_store_state_from_snapshot, vector_stores_from_snapshot,
+  };
   use crate::core::single_file::{close_single_file, open_single_file, SingleFileOpenOptions};
   use crate::core::snapshot::reader::SnapshotData;
   use crate::core::snapshot::writer::{build_snapshot_to_memory, NodeData, SnapshotBuildInput};
@@ -882,8 +883,8 @@ mod tests {
         prev_end = prev_end.max(offset + len);
       }
     }
-    let fake_payload_offset = ((prev_end + 63) / 64) * 64;
-    let required_size = (((fake_payload_offset + 1 + 63) / 64) * 64 + 4) as usize;
+    let fake_payload_offset = prev_end.div_ceil(64) * 64;
+    let required_size = ((fake_payload_offset + 1).div_ceil(64) * 64 + 4) as usize;
     if buffer.len() < required_size {
       buffer.resize(required_size, 0);
     }

@@ -3,13 +3,31 @@
 //! Ported from src/core/header.ts
 
 use crate::constants::*;
+use crate::core::pager::FilePager;
 use crate::error::{KiteError, Result};
-use crate::types::DbHeaderV1;
+use crate::types::{DbHeaderV1, DB_HEADER_FIXED_SIZE};
 use crate::util::binary::*;
 use crate::util::crc::crc32c;
 
+/// Two physical header pages. A new header is written to the inactive page,
+/// synced, and selected by generation during the next open.
+pub(crate) const HEADER_SLOT_A: u32 = 0;
+pub(crate) const HEADER_SLOT_B: u32 = 1;
+pub(crate) const HEADER_SLOT_COUNT: u64 = 2;
+
+const HEADER_CRC_OFFSET: usize = DB_HEADER_FIXED_SIZE;
+const HEADER_CRC_END: usize = DB_HEADER_FIXED_SIZE + std::mem::size_of::<u32>();
+
+pub(crate) fn other_header_slot(slot: u32) -> u32 {
+  match slot {
+    HEADER_SLOT_A => HEADER_SLOT_B,
+    HEADER_SLOT_B => HEADER_SLOT_A,
+    _ => panic!("invalid header slot: {slot}"),
+  }
+}
+
 impl DbHeaderV1 {
-  /// Parse header from page buffer
+  /// Parse and verify a complete header page.
   pub fn parse(data: &[u8]) -> Result<Self> {
     if data.len() < DB_HEADER_SIZE {
       return Err(KiteError::InvalidSnapshot(format!(
@@ -17,8 +35,13 @@ impl DbHeaderV1 {
         data.len()
       )));
     }
+    if data.len() < HEADER_CRC_END {
+      return Err(KiteError::InvalidSnapshot(
+        "Header checksum is truncated".to_string(),
+      ));
+    }
 
-    // Verify magic
+    // Verify magic before interpreting any header state.
     if data[0..16] != MAGIC_KITEDB {
       let expected = u32::from_le_bytes([
         MAGIC_KITEDB[0],
@@ -32,9 +55,16 @@ impl DbHeaderV1 {
       });
     }
 
-    // Verify header checksum
-    let header_crc = read_u32(data, 176);
-    let computed_header_crc = crc32c(&data[0..176]);
+    let page_size = read_u32(data, 16) as usize;
+    if page_size < DB_HEADER_SIZE || page_size > data.len() || !page_size.is_power_of_two() {
+      return Err(KiteError::InvalidSnapshot(format!(
+        "Invalid header page size: {page_size}"
+      )));
+    }
+
+    // Verify the fixed-field checksum before accepting any header state.
+    let header_crc = read_u32(data, HEADER_CRC_OFFSET);
+    let computed_header_crc = crc32c(&data[..HEADER_CRC_OFFSET]);
     if header_crc != computed_header_crc {
       return Err(KiteError::CrcMismatch {
         stored: header_crc,
@@ -42,7 +72,17 @@ impl DbHeaderV1 {
       });
     }
 
-    // Parse fields
+    // Verify the page footer as well. It protects the reserved part of the
+    // header page, which is outside the fixed-field checksum.
+    let footer_crc = read_u32(data, page_size - 4);
+    let computed_footer_crc = crc32c(&data[..page_size - 4]);
+    if footer_crc != computed_footer_crc {
+      return Err(KiteError::CrcMismatch {
+        stored: footer_crc,
+        computed: computed_footer_crc,
+      });
+    }
+
     let mut magic = [0u8; 16];
     magic.copy_from_slice(&data[0..16]);
 
@@ -73,7 +113,7 @@ impl DbHeaderV1 {
     })
   }
 
-  /// Serialize header to fixed 4KB buffer (default page size)
+  /// Serialize header to fixed 4KB buffer (default page size).
   pub fn serialize(&self) -> [u8; DB_HEADER_SIZE] {
     let vec = self.serialize_to_page();
     let mut buf = [0u8; DB_HEADER_SIZE];
@@ -82,7 +122,7 @@ impl DbHeaderV1 {
     buf
   }
 
-  /// Serialize header to a Vec matching the page size
+  /// Serialize header to a Vec matching the page size.
   pub fn serialize_to_page(&self) -> Vec<u8> {
     let page_size = self.page_size as usize;
     let mut buf = vec![0u8; page_size];
@@ -111,18 +151,15 @@ impl DbHeaderV1 {
     buf[160] = self.active_wal_region;
     buf[161] = self.checkpoint_in_progress;
 
-    // Compute and write header checksum
-    let header_crc = crc32c(&buf[0..176]);
-    write_u32(&mut buf, 176, header_crc);
+    let header_crc = crc32c(&buf[..HEADER_CRC_OFFSET]);
+    write_u32(&mut buf, HEADER_CRC_OFFSET, header_crc);
 
-    // Compute and write footer checksum (at end of page)
-    let footer_crc = crc32c(&buf[0..page_size - 4]);
+    let footer_crc = crc32c(&buf[..page_size - 4]);
     write_u32(&mut buf, page_size - 4, footer_crc);
-
     buf
   }
 
-  /// Create a new header with default values
+  /// Create a new header with default values.
   pub fn new(page_size: u32, wal_pages: u64) -> Self {
     let mut magic = [0u8; 16];
     magic.copy_from_slice(&MAGIC_KITEDB);
@@ -134,10 +171,10 @@ impl DbHeaderV1 {
       min_reader_version: MIN_READER_SINGLE_FILE,
       flags: 0,
       change_counter: 0,
-      db_size_pages: 1 + wal_pages, // header + WAL
-      snapshot_start_page: 0,       // No snapshot yet
+      db_size_pages: HEADER_SLOT_COUNT + wal_pages,
+      snapshot_start_page: 0,
       snapshot_page_count: 0,
-      wal_start_page: 1,
+      wal_start_page: HEADER_SLOT_COUNT,
       wal_page_count: wal_pages,
       wal_head: 0,
       wal_tail: 0,
@@ -153,4 +190,55 @@ impl DbHeaderV1 {
       checkpoint_in_progress: 0,
     }
   }
+}
+
+/// Read both physical header pages and return the newest valid generation.
+/// A torn or partially written inactive page is ignored.
+pub(crate) fn read_header_slots(pager: &mut FilePager) -> Result<(DbHeaderV1, u32)> {
+  let mut valid = Vec::with_capacity(2);
+  let mut errors = Vec::with_capacity(2);
+
+  for slot in [HEADER_SLOT_A, HEADER_SLOT_B] {
+    match DbHeaderV1::parse(&pager.read_page(slot)?) {
+      Ok(header) if header.page_size as usize == pager.page_size() => {
+        valid.push((header, slot));
+      }
+      Ok(header) => errors.push(format!(
+        "slot {slot} has page size {}, expected {}",
+        header.page_size,
+        pager.page_size()
+      )),
+      Err(error) => errors.push(format!("slot {slot}: {error}")),
+    }
+  }
+
+  valid
+    .into_iter()
+    .max_by_key(|(header, slot)| (header.change_counter, *slot == HEADER_SLOT_A))
+    .ok_or_else(|| {
+      KiteError::InvalidSnapshot(format!(
+        "no valid database header slot; {}",
+        errors.join("; ")
+      ))
+    })
+}
+
+/// Write one complete header page. The caller must sync before treating the
+/// target slot as installed.
+pub(crate) fn write_header_slot(
+  pager: &mut FilePager,
+  header: &DbHeaderV1,
+  slot: u32,
+) -> Result<()> {
+  if slot >= HEADER_SLOT_COUNT as u32 {
+    return Err(KiteError::Internal(format!("invalid header slot: {slot}")));
+  }
+  if header.page_size as usize != pager.page_size() {
+    return Err(KiteError::InvalidSnapshot(format!(
+      "header page size {} does not match pager page size {}",
+      header.page_size,
+      pager.page_size()
+    )));
+  }
+  pager.write_page(slot, &header.serialize_to_page())
 }

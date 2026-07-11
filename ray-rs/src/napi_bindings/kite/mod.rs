@@ -39,6 +39,7 @@ use super::database::{
   CheckResult, DbStats, JsPrimaryReplicationStatus, JsReplicaReplicationStatus, MvccStats,
 };
 use super::database::{JsFullEdge, JsPropValue};
+use super::validation;
 
 use conversion::{js_value_to_prop_value, key_suffix_from_js};
 
@@ -109,6 +110,104 @@ impl Kite {
   }
 }
 
+fn apply_kite_open_options(options: &JsKiteOptions, kite_opts: &mut KiteOptions) -> Result<()> {
+  kite_opts.read_only = options.read_only.unwrap_or(false);
+  kite_opts.create_if_missing = options.create_if_missing.unwrap_or(true);
+  kite_opts.mvcc = options.mvcc.unwrap_or(false);
+
+  if let Some(value) = options.mvcc_gc_interval_ms {
+    kite_opts.mvcc_gc_interval_ms = Some(validation::positive_u64(
+      "mvccGcIntervalMs",
+      value,
+      validation::MAX_DURATION_MS as u64,
+    )?);
+  }
+  if let Some(value) = options.mvcc_retention_ms {
+    kite_opts.mvcc_retention_ms = Some(validation::non_negative_u64(
+      "mvccRetentionMs",
+      value,
+      validation::MAX_DURATION_MS as u64,
+    )?);
+  }
+  if let Some(value) = options.mvcc_max_chain_depth {
+    kite_opts.mvcc_max_chain_depth = Some(validation::positive_usize(
+      "mvccMaxChainDepth",
+      value,
+      validation::MAX_DEPTH,
+    )?);
+  }
+  if let Some(mode) = options.sync_mode.as_ref() {
+    kite_opts.sync_mode = mode.into();
+  }
+  if let Some(enabled) = options.group_commit_enabled {
+    kite_opts.group_commit_enabled = enabled;
+  }
+  if let Some(value) = options.group_commit_window_ms {
+    kite_opts.group_commit_window_ms = validation::non_negative_u64(
+      "groupCommitWindowMs",
+      value,
+      validation::MAX_DURATION_MS as u64,
+    )?;
+  }
+  if let Some(value) = options.wal_size_mb {
+    let megabytes = validation::positive_u64(
+      "walSizeMb",
+      value,
+      (validation::MAX_BYTES as u64) / (1024 * 1024),
+    )?;
+    kite_opts.wal_size = Some(
+      usize::try_from(
+        megabytes
+          .checked_mul(1024 * 1024)
+          .ok_or_else(|| validation::invalid_argument("walSizeMb is too large"))?,
+      )
+      .map_err(|_| validation::invalid_argument("walSizeMb does not fit in a platform usize"))?,
+    );
+  }
+  if let Some(value) = options.checkpoint_threshold {
+    kite_opts.checkpoint_threshold = Some(validation::ratio("checkpointThreshold", value)?);
+  }
+  if let Some(value) = options.close_checkpoint_if_wal_usage_at_least {
+    kite_opts.close_checkpoint_if_wal_usage_at_least = Some(validation::ratio(
+      "closeCheckpointIfWalUsageAtLeast",
+      value,
+    )?);
+  }
+  if let Some(role) = options.replication_role.as_ref() {
+    kite_opts.replication_role = role.into();
+  }
+  kite_opts.replication_sidecar_path = options.replication_sidecar_path.as_ref().map(Into::into);
+  kite_opts.replication_source_db_path =
+    options.replication_source_db_path.as_ref().map(Into::into);
+  kite_opts.replication_source_sidecar_path = options
+    .replication_source_sidecar_path
+    .as_ref()
+    .map(Into::into);
+  if let Some(value) = options.replication_segment_max_bytes {
+    kite_opts.replication_segment_max_bytes = Some(validation::positive_u64(
+      "replicationSegmentMaxBytes",
+      value,
+      validation::MAX_BYTES as u64,
+    )?);
+  }
+  if let Some(value) = options.replication_retention_min_entries {
+    kite_opts.replication_retention_min_entries = Some(validation::non_negative_u64(
+      "replicationRetentionMinEntries",
+      value,
+      validation::MAX_COUNT as u64,
+    )?);
+  }
+  if let Some(value) = options.replication_retention_min_ms {
+    kite_opts.replication_retention_min_ms = Some(validation::non_negative_u64(
+      "replicationRetentionMinMs",
+      value,
+      validation::MAX_DURATION_MS as u64,
+    )?);
+  }
+
+  Ok(())
+}
+
 #[napi]
 impl Kite {
   /// Open a Kite database
@@ -117,61 +216,7 @@ impl Kite {
   pub fn open(path: String, options: JsKiteOptions) -> Result<Self> {
     let mut node_specs: HashMap<String, Arc<KeySpec>> = HashMap::new();
     let mut kite_opts = KiteOptions::new();
-    kite_opts.read_only = options.read_only.unwrap_or(false);
-    kite_opts.create_if_missing = options.create_if_missing.unwrap_or(true);
-    kite_opts.mvcc = options.mvcc.unwrap_or(false);
-    kite_opts.mvcc_gc_interval_ms = options.mvcc_gc_interval_ms.map(|v| v as u64);
-    kite_opts.mvcc_retention_ms = options.mvcc_retention_ms.map(|v| v as u64);
-    kite_opts.mvcc_max_chain_depth = options.mvcc_max_chain_depth.map(|v| v as usize);
-    if let Some(mode) = options.sync_mode {
-      kite_opts.sync_mode = mode.into();
-    }
-    if let Some(enabled) = options.group_commit_enabled {
-      kite_opts.group_commit_enabled = enabled;
-    }
-    if let Some(window_ms) = options.group_commit_window_ms {
-      if window_ms >= 0 {
-        kite_opts.group_commit_window_ms = window_ms as u64;
-      }
-    }
-    if let Some(wal_size_mb) = options.wal_size_mb {
-      if wal_size_mb > 0 {
-        kite_opts.wal_size = Some((wal_size_mb as usize).saturating_mul(1024 * 1024));
-      }
-    }
-    if let Some(threshold) = options.checkpoint_threshold {
-      kite_opts.checkpoint_threshold = Some(threshold.clamp(0.0, 1.0));
-    }
-    if let Some(threshold) = options.close_checkpoint_if_wal_usage_at_least {
-      kite_opts.close_checkpoint_if_wal_usage_at_least = Some(threshold.clamp(0.0, 1.0));
-    }
-    if let Some(role) = options.replication_role {
-      kite_opts.replication_role = role.into();
-    }
-    if let Some(path) = options.replication_sidecar_path {
-      kite_opts.replication_sidecar_path = Some(path.into());
-    }
-    if let Some(path) = options.replication_source_db_path {
-      kite_opts.replication_source_db_path = Some(path.into());
-    }
-    if let Some(path) = options.replication_source_sidecar_path {
-      kite_opts.replication_source_sidecar_path = Some(path.into());
-    }
-    if let Some(value) = options.replication_segment_max_bytes {
-      if value >= 0 {
-        kite_opts.replication_segment_max_bytes = Some(value as u64);
-      }
-    }
-    if let Some(value) = options.replication_retention_min_entries {
-      if value >= 0 {
-        kite_opts.replication_retention_min_entries = Some(value as u64);
-      }
-    }
-    if let Some(value) = options.replication_retention_min_ms {
-      if value >= 0 {
-        kite_opts.replication_retention_min_ms = Some(value as u64);
-      }
-    }
+    apply_kite_open_options(&options, &mut kite_opts)?;
 
     for node in options.nodes {
       let key_spec = Arc::new(parse_key_spec(&node.name, node.key)?);
@@ -756,9 +801,11 @@ impl Kite {
     max_depth: i64,
     edge_type: Option<String>,
   ) -> Result<Vec<i64>> {
+    let source = validation::node_id("source", source)? as NodeId;
+    let max_depth = validation::non_negative_usize("maxDepth", max_depth, validation::MAX_DEPTH)?;
     self.with_kite(|ray| {
       let nodes = ray
-        .reachable_from(source as NodeId, max_depth as usize, edge_type.as_deref())
+        .reachable_from(source, max_depth, edge_type.as_deref())
         .map_err(|e| Error::from_reason(e.to_string()))?;
       Ok(nodes.into_iter().map(|id| id as i64).collect())
     })
@@ -911,13 +958,12 @@ impl Kite {
   /// Pull and apply up to maxFrames replication frames on replica.
   #[napi]
   pub fn replica_catch_up_once(&self, max_frames: i64) -> Result<i64> {
-    if max_frames < 0 {
-      return Err(Error::from_reason("maxFrames must be non-negative"));
-    }
+    let max_frames =
+      validation::non_negative_usize("maxFrames", max_frames, validation::MAX_COUNT)?;
     self.with_kite_mut(|ray| {
       ray
         .raw()
-        .replica_catch_up_once(max_frames as usize)
+        .replica_catch_up_once(max_frames)
         .map(|count| count as i64)
         .map_err(|e| Error::from_reason(format!("Failed replica catch-up: {e}")))
     })
@@ -1160,61 +1206,7 @@ impl napi::Task for OpenKiteTask {
   fn compute(&mut self) -> Result<Self::Output> {
     let mut node_specs: HashMap<String, Arc<KeySpec>> = HashMap::new();
     let mut kite_opts = KiteOptions::new();
-    kite_opts.read_only = self.options.read_only.unwrap_or(false);
-    kite_opts.create_if_missing = self.options.create_if_missing.unwrap_or(true);
-    kite_opts.mvcc = self.options.mvcc.unwrap_or(false);
-    kite_opts.mvcc_gc_interval_ms = self.options.mvcc_gc_interval_ms.map(|v| v as u64);
-    kite_opts.mvcc_retention_ms = self.options.mvcc_retention_ms.map(|v| v as u64);
-    kite_opts.mvcc_max_chain_depth = self.options.mvcc_max_chain_depth.map(|v| v as usize);
-    if let Some(mode) = self.options.sync_mode.take() {
-      kite_opts.sync_mode = mode.into();
-    }
-    if let Some(enabled) = self.options.group_commit_enabled {
-      kite_opts.group_commit_enabled = enabled;
-    }
-    if let Some(window_ms) = self.options.group_commit_window_ms {
-      if window_ms >= 0 {
-        kite_opts.group_commit_window_ms = window_ms as u64;
-      }
-    }
-    if let Some(wal_size_mb) = self.options.wal_size_mb {
-      if wal_size_mb > 0 {
-        kite_opts.wal_size = Some((wal_size_mb as usize).saturating_mul(1024 * 1024));
-      }
-    }
-    if let Some(threshold) = self.options.checkpoint_threshold {
-      kite_opts.checkpoint_threshold = Some(threshold.clamp(0.0, 1.0));
-    }
-    if let Some(threshold) = self.options.close_checkpoint_if_wal_usage_at_least {
-      kite_opts.close_checkpoint_if_wal_usage_at_least = Some(threshold.clamp(0.0, 1.0));
-    }
-    if let Some(role) = self.options.replication_role.take() {
-      kite_opts.replication_role = role.into();
-    }
-    if let Some(path) = self.options.replication_sidecar_path.take() {
-      kite_opts.replication_sidecar_path = Some(path.into());
-    }
-    if let Some(path) = self.options.replication_source_db_path.take() {
-      kite_opts.replication_source_db_path = Some(path.into());
-    }
-    if let Some(path) = self.options.replication_source_sidecar_path.take() {
-      kite_opts.replication_source_sidecar_path = Some(path.into());
-    }
-    if let Some(value) = self.options.replication_segment_max_bytes {
-      if value >= 0 {
-        kite_opts.replication_segment_max_bytes = Some(value as u64);
-      }
-    }
-    if let Some(value) = self.options.replication_retention_min_entries {
-      if value >= 0 {
-        kite_opts.replication_retention_min_entries = Some(value as u64);
-      }
-    }
-    if let Some(value) = self.options.replication_retention_min_ms {
-      if value >= 0 {
-        kite_opts.replication_retention_min_ms = Some(value as u64);
-      }
-    }
+    apply_kite_open_options(&self.options, &mut kite_opts)?;
 
     for node in &self.options.nodes {
       let key_spec = Arc::new(parse_key_spec(&node.name, node.key.clone())?);
@@ -1269,4 +1261,82 @@ pub fn kite(path: String, options: JsKiteOptions) -> AsyncTask<OpenKiteTask> {
     options,
     result: None,
   })
+}
+
+#[cfg(test)]
+mod option_validation_tests {
+  use super::*;
+
+  fn options() -> JsKiteOptions {
+    JsKiteOptions {
+      nodes: Vec::new(),
+      edges: Vec::new(),
+      read_only: None,
+      create_if_missing: None,
+      mvcc: None,
+      mvcc_gc_interval_ms: None,
+      mvcc_retention_ms: None,
+      mvcc_max_chain_depth: None,
+      sync_mode: None,
+      group_commit_enabled: None,
+      group_commit_window_ms: None,
+      wal_size_mb: None,
+      checkpoint_threshold: None,
+      close_checkpoint_if_wal_usage_at_least: None,
+      replication_role: None,
+      replication_sidecar_path: None,
+      replication_source_db_path: None,
+      replication_source_sidecar_path: None,
+      replication_segment_max_bytes: None,
+      replication_retention_min_entries: None,
+      replication_retention_min_ms: None,
+    }
+  }
+
+  #[test]
+  fn validates_high_level_open_options_once_for_sync_and_async_paths() {
+    let mut valid = options();
+    valid.wal_size_mb = Some(1);
+    valid.mvcc_gc_interval_ms = Some(1);
+    valid.mvcc_retention_ms = Some(0);
+    valid.mvcc_max_chain_depth = Some(1);
+    valid.group_commit_window_ms = Some(0);
+    valid.checkpoint_threshold = Some(0.0);
+    valid.close_checkpoint_if_wal_usage_at_least = Some(1.0);
+    valid.replication_segment_max_bytes = Some(1);
+    valid.replication_retention_min_entries = Some(0);
+    valid.replication_retention_min_ms = Some(0);
+    let mut rust = KiteOptions::new();
+    assert!(apply_kite_open_options(&valid, &mut rust).is_ok());
+
+    for invalid in [
+      ("mvcc_gc_interval_ms", 0),
+      ("mvcc_retention_ms", -1),
+      ("mvcc_max_chain_depth", 0),
+      ("group_commit_window_ms", -1),
+      ("wal_size_mb", 0),
+      ("replication_segment_max_bytes", 0),
+    ] {
+      let mut candidate = options();
+      match invalid.0 {
+        "mvcc_gc_interval_ms" => candidate.mvcc_gc_interval_ms = Some(invalid.1),
+        "mvcc_retention_ms" => candidate.mvcc_retention_ms = Some(invalid.1),
+        "mvcc_max_chain_depth" => candidate.mvcc_max_chain_depth = Some(invalid.1),
+        "group_commit_window_ms" => candidate.group_commit_window_ms = Some(invalid.1),
+        "wal_size_mb" => candidate.wal_size_mb = Some(invalid.1),
+        "replication_segment_max_bytes" => {
+          candidate.replication_segment_max_bytes = Some(invalid.1)
+        }
+        _ => unreachable!(),
+      }
+      assert!(apply_kite_open_options(&candidate, &mut KiteOptions::new()).is_err());
+    }
+
+    let mut candidate = options();
+    candidate.checkpoint_threshold = Some(2.0);
+    assert!(apply_kite_open_options(&candidate, &mut KiteOptions::new()).is_err());
+    let mut candidate = options();
+    candidate.wal_size_mb = Some((validation::MAX_BYTES / (1024 * 1024)) + 1);
+    assert!(apply_kite_open_options(&candidate, &mut KiteOptions::new()).is_err());
+  }
 }

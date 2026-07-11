@@ -7,6 +7,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::sync::RwLock;
 
+use crate::pyo3_bindings::validation;
 use crate::vector::{
   DistanceMetric as RustDistanceMetric, IvfConfig as RustIvfConfig, IvfIndex as RustIvfIndex,
   IvfPqConfig as RustIvfPqConfig, IvfPqIndex as RustIvfPqIndex, MultiQueryAggregation,
@@ -129,20 +130,23 @@ impl PyIvfConfig {
   }
 }
 
-impl From<PyIvfConfig> for RustIvfConfig {
-  fn from(c: PyIvfConfig) -> Self {
+impl PyIvfConfig {
+  fn into_rust(self) -> PyResult<RustIvfConfig> {
+    let c = self;
     let mut config = RustIvfConfig::default();
     if let Some(n) = c.n_clusters {
-      config.n_clusters = n as usize;
+      config.n_clusters =
+        validation::positive_usize("n_clusters", n as i64, validation::MAX_VECTOR_PARAM)?;
     }
     if let Some(n) = c.n_probe {
-      config.n_probe = n as usize;
+      config.n_probe =
+        validation::positive_usize("n_probe", n as i64, validation::MAX_VECTOR_PARAM)?;
     }
     if let Some(m) = c.metric {
       let metric: PyDistanceMetricEnum = m.as_str().into();
       config.metric = metric.into();
     }
-    config
+    Ok(config)
   }
 }
 
@@ -189,19 +193,23 @@ impl PyPqConfig {
   }
 }
 
-impl From<PyPqConfig> for RustPqConfig {
-  fn from(c: PyPqConfig) -> Self {
+impl PyPqConfig {
+  fn into_rust(self) -> PyResult<RustPqConfig> {
+    let c = self;
     let mut config = RustPqConfig::default();
     if let Some(n) = c.num_subspaces {
-      config.num_subspaces = n as usize;
+      config.num_subspaces =
+        validation::positive_usize("num_subspaces", n as i64, validation::MAX_VECTOR_PARAM)?;
     }
     if let Some(n) = c.num_centroids {
-      config.num_centroids = n as usize;
+      config.num_centroids =
+        validation::positive_usize("num_centroids", n as i64, validation::MAX_VECTOR_PARAM)?;
     }
     if let Some(n) = c.max_iterations {
-      config.max_iterations = n as usize;
+      config.max_iterations =
+        validation::positive_usize("max_iterations", n as i64, validation::MAX_VECTOR_PARAM)?;
     }
-    config
+    Ok(config)
   }
 }
 
@@ -213,7 +221,7 @@ impl From<PyPqConfig> for RustPqConfig {
 #[pyclass(name = "SearchOptions")]
 #[derive(Debug, Clone)]
 pub struct PySearchOptions {
-  /// Number of clusters to probe (overrides index default)
+  /// Number of clusters to probe (overrides index default; must be positive)
   #[pyo3(get, set)]
   pub n_probe: Option<i32>,
   /// Minimum similarity threshold (0-1)
@@ -234,6 +242,18 @@ impl PySearchOptions {
       "SearchOptions(n_probe={:?}, threshold={:?})",
       self.n_probe, self.threshold
     )
+  }
+
+  fn validated(&self) -> PyResult<(Option<usize>, Option<f32>)> {
+    let n_probe = self
+      .n_probe
+      .map(|n| validation::positive_usize("n_probe", n as i64, validation::MAX_VECTOR_PARAM))
+      .transpose()?;
+    let threshold = self
+      .threshold
+      .map(|value| validation::ratio("threshold", value).map(|value| value as f32))
+      .transpose()?;
+    Ok((n_probe, threshold))
   }
 }
 
@@ -337,9 +357,17 @@ impl PyIvfIndex {
   #[new]
   #[pyo3(signature = (dimensions, config=None))]
   fn new(dimensions: i32, config: Option<PyIvfConfig>) -> PyResult<Self> {
-    let rust_config = config.map(Into::into).unwrap_or_default();
+    let dimensions = validation::positive_usize(
+      "dimensions",
+      dimensions as i64,
+      validation::MAX_VECTOR_DIMENSIONS,
+    )?;
+    let rust_config = config
+      .map(PyIvfConfig::into_rust)
+      .transpose()?
+      .unwrap_or_default();
     Ok(PyIvfIndex {
-      inner: RwLock::new(RustIvfIndex::new(dimensions as usize, rust_config)),
+      inner: RwLock::new(RustIvfIndex::new(dimensions, rust_config)),
     })
   }
 
@@ -365,13 +393,15 @@ impl PyIvfIndex {
 
   /// Add training vectors
   fn add_training_vectors(&self, vectors: Vec<f64>, num_vectors: i32) -> PyResult<()> {
+    let num_vectors =
+      validation::non_negative_usize("num_vectors", num_vectors as i64, validation::MAX_COUNT)?;
     let mut index = self
       .inner
       .write()
       .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let vectors_f32: Vec<f32> = vectors.iter().map(|&v| v as f32).collect();
     index
-      .add_training_vectors(&vectors_f32, num_vectors as usize)
+      .add_training_vectors(&vectors_f32, num_vectors)
       .map_err(|e| PyRuntimeError::new_err(format!("Failed to add training vectors: {e}")))
   }
 
@@ -388,24 +418,26 @@ impl PyIvfIndex {
 
   /// Insert a vector into the index
   fn insert(&self, vector_id: i64, vector: Vec<f64>) -> PyResult<()> {
+    let vector_id = validation::node_id("vector_id", vector_id)?;
     let mut index = self
       .inner
       .write()
       .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let vector_f32: Vec<f32> = vector.iter().map(|&v| v as f32).collect();
     index
-      .insert(vector_id as u64, &vector_f32)
+      .insert(vector_id, &vector_f32)
       .map_err(|e| PyRuntimeError::new_err(format!("Failed to insert vector: {e}")))
   }
 
   /// Delete a vector from the index
   fn delete(&self, vector_id: i64, vector: Vec<f64>) -> PyResult<bool> {
+    let vector_id = validation::node_id("vector_id", vector_id)?;
     let mut index = self
       .inner
       .write()
       .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let vector_f32: Vec<f32> = vector.iter().map(|&v| v as f32).collect();
-    Ok(index.delete(vector_id as u64, &vector_f32))
+    Ok(index.delete(vector_id, &vector_f32))
   }
 
   /// Clear all data from the index
@@ -437,13 +469,18 @@ impl PyIvfIndex {
 
     let query_f32: Vec<f32> = query.iter().map(|&v| v as f32).collect();
 
-    let rust_options = options.map(|o| RustSearchOptions {
-      n_probe: o.n_probe.map(|n| n as usize),
-      filter: None,
-      threshold: o.threshold.map(|t| t as f32),
-    });
+    let rust_options = options
+      .as_ref()
+      .map(PySearchOptions::validated)
+      .transpose()?
+      .map(|(n_probe, threshold)| RustSearchOptions {
+        n_probe,
+        filter: None,
+        threshold,
+      });
 
-    let results = index.search(&manifest, &query_f32, k as usize, rust_options);
+    let k = validation::non_negative_usize("k", k as i64, validation::MAX_COUNT)?;
+    let results = index.search(&manifest, &query_f32, k, rust_options);
     Ok(results.into_iter().map(|r| r.into()).collect())
   }
 
@@ -474,13 +511,18 @@ impl PyIvfIndex {
 
     let agg: PyAggregationEnum = aggregation.as_str().into();
 
-    let rust_options = options.map(|o| RustSearchOptions {
-      n_probe: o.n_probe.map(|n| n as usize),
-      filter: None,
-      threshold: o.threshold.map(|t| t as f32),
-    });
+    let rust_options = options
+      .as_ref()
+      .map(PySearchOptions::validated)
+      .transpose()?
+      .map(|(n_probe, threshold)| RustSearchOptions {
+        n_probe,
+        filter: None,
+        threshold,
+      });
 
-    let results = index.search_multi(&manifest, &query_refs, k as usize, agg.into(), rust_options);
+    let k = validation::non_negative_usize("k", k as i64, validation::MAX_COUNT)?;
+    let results = index.search_multi(&manifest, &query_refs, k, agg.into(), rust_options);
     Ok(results.into_iter().map(|r| r.into()).collect())
   }
 
@@ -555,13 +597,24 @@ impl PyIvfPqIndex {
     pq_config: Option<PyPqConfig>,
     use_residuals: Option<bool>,
   ) -> PyResult<Self> {
+    let dimensions = validation::positive_usize(
+      "dimensions",
+      dimensions as i64,
+      validation::MAX_VECTOR_DIMENSIONS,
+    )?;
     let config = RustIvfPqConfig {
-      ivf: ivf_config.map(Into::into).unwrap_or_default(),
-      pq: pq_config.map(Into::into).unwrap_or_default(),
+      ivf: ivf_config
+        .map(PyIvfConfig::into_rust)
+        .transpose()?
+        .unwrap_or_default(),
+      pq: pq_config
+        .map(PyPqConfig::into_rust)
+        .transpose()?
+        .unwrap_or_default(),
       use_residuals: use_residuals.unwrap_or(true),
     };
 
-    let index = RustIvfPqIndex::new(dimensions as usize, config)
+    let index = RustIvfPqIndex::new(dimensions, config)
       .map_err(|e| PyRuntimeError::new_err(format!("Failed to create index: {e}")))?;
 
     Ok(PyIvfPqIndex {
@@ -591,13 +644,15 @@ impl PyIvfPqIndex {
 
   /// Add training vectors
   fn add_training_vectors(&self, vectors: Vec<f64>, num_vectors: i32) -> PyResult<()> {
+    let num_vectors =
+      validation::non_negative_usize("num_vectors", num_vectors as i64, validation::MAX_COUNT)?;
     let mut index = self
       .inner
       .write()
       .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let vectors_f32: Vec<f32> = vectors.iter().map(|&v| v as f32).collect();
     index
-      .add_training_vectors(&vectors_f32, num_vectors as usize)
+      .add_training_vectors(&vectors_f32, num_vectors)
       .map_err(|e| PyRuntimeError::new_err(format!("Failed to add training vectors: {e}")))
   }
 
@@ -614,24 +669,26 @@ impl PyIvfPqIndex {
 
   /// Insert a vector
   fn insert(&self, vector_id: i64, vector: Vec<f64>) -> PyResult<()> {
+    let vector_id = validation::node_id("vector_id", vector_id)?;
     let mut index = self
       .inner
       .write()
       .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let vector_f32: Vec<f32> = vector.iter().map(|&v| v as f32).collect();
     index
-      .insert(vector_id as u64, &vector_f32)
+      .insert(vector_id, &vector_f32)
       .map_err(|e| PyRuntimeError::new_err(format!("Failed to insert vector: {e}")))
   }
 
   /// Delete a vector
   fn delete(&self, vector_id: i64, vector: Vec<f64>) -> PyResult<bool> {
+    let vector_id = validation::node_id("vector_id", vector_id)?;
     let mut index = self
       .inner
       .write()
       .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let vector_f32: Vec<f32> = vector.iter().map(|&v| v as f32).collect();
-    Ok(index.delete(vector_id as u64, &vector_f32))
+    Ok(index.delete(vector_id, &vector_f32))
   }
 
   /// Clear the index
@@ -663,13 +720,20 @@ impl PyIvfPqIndex {
 
     let query_f32: Vec<f32> = query.iter().map(|&v| v as f32).collect();
 
-    let rust_options = options.map(|o| crate::vector::ivf_pq::IvfPqSearchOptions {
-      n_probe: o.n_probe.map(|n| n as usize),
-      filter: None,
-      threshold: o.threshold.map(|t| t as f32),
-    });
+    let rust_options = options
+      .as_ref()
+      .map(PySearchOptions::validated)
+      .transpose()?
+      .map(
+        |(n_probe, threshold)| crate::vector::ivf_pq::IvfPqSearchOptions {
+          n_probe,
+          filter: None,
+          threshold,
+        },
+      );
 
-    let results = index.search(&manifest, &query_f32, k as usize, rust_options);
+    let k = validation::non_negative_usize("k", k as i64, validation::MAX_COUNT)?;
+    let results = index.search(&manifest, &query_f32, k, rust_options);
     Ok(results.into_iter().map(|r| r.into()).collect())
   }
 
@@ -700,13 +764,20 @@ impl PyIvfPqIndex {
 
     let agg: PyAggregationEnum = aggregation.as_str().into();
 
-    let rust_options = options.map(|o| crate::vector::ivf_pq::IvfPqSearchOptions {
-      n_probe: o.n_probe.map(|n| n as usize),
-      filter: None,
-      threshold: o.threshold.map(|t| t as f32),
-    });
+    let rust_options = options
+      .as_ref()
+      .map(PySearchOptions::validated)
+      .transpose()?
+      .map(
+        |(n_probe, threshold)| crate::vector::ivf_pq::IvfPqSearchOptions {
+          n_probe,
+          filter: None,
+          threshold,
+        },
+      );
 
-    let results = index.search_multi(&manifest, &query_refs, k as usize, agg.into(), rust_options);
+    let k = validation::non_negative_usize("k", k as i64, validation::MAX_COUNT)?;
+    let results = index.search_multi(&manifest, &query_refs, k, agg.into(), rust_options);
     Ok(results.into_iter().map(|r| r.into()).collect())
   }
 
@@ -801,6 +872,9 @@ pub fn brute_force_search(
       "vectors and node_ids must have same length",
     ));
   }
+  for &node_id in &node_ids {
+    validation::node_id("node_ids", node_id)?;
+  }
 
   let metric_enum: PyDistanceMetricEnum = metric.as_deref().unwrap_or("cosine").into();
   let rust_metric: RustDistanceMetric = metric_enum.into();
@@ -820,7 +894,8 @@ pub fn brute_force_search(
 
   // Sort by distance
   results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-  results.truncate(k as usize);
+  let k = validation::non_negative_usize("k", k as i64, validation::MAX_COUNT)?;
+  results.truncate(k);
 
   Ok(
     results
@@ -832,4 +907,75 @@ pub fn brute_force_search(
       })
       .collect(),
   )
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn validates_ivf_pq_and_search_options() {
+    assert!(PyIvfConfig {
+      n_clusters: Some(1),
+      n_probe: Some(1),
+      metric: None,
+    }
+    .into_rust()
+    .is_ok());
+    for value in [0, -1, (validation::MAX_VECTOR_PARAM + 1) as i32] {
+      assert!(PyIvfConfig {
+        n_clusters: Some(value),
+        n_probe: None,
+        metric: None,
+      }
+      .into_rust()
+      .is_err());
+    }
+    assert!(PyPqConfig {
+      num_subspaces: Some(1),
+      num_centroids: Some(1),
+      max_iterations: Some(1),
+    }
+    .into_rust()
+    .is_ok());
+    assert!(PyPqConfig {
+      num_subspaces: Some(0),
+      num_centroids: None,
+      max_iterations: None,
+    }
+    .into_rust()
+    .is_err());
+    assert!(PySearchOptions {
+      n_probe: Some(1),
+      threshold: Some(0.0),
+    }
+    .validated()
+    .is_ok());
+    assert!(PySearchOptions {
+      n_probe: Some(0),
+      threshold: None,
+    }
+    .validated()
+    .is_err());
+    assert!(PySearchOptions {
+      n_probe: None,
+      threshold: Some(2.0),
+    }
+    .validated()
+    .is_err());
+  }
+
+  #[test]
+  fn validates_dimensions_counts_and_zero_result_limits() {
+    assert!(PyIvfIndex::new(1, None).is_ok());
+    assert!(PyIvfIndex::new(0, None).is_err());
+    assert!(PyIvfIndex::new(-1, None).is_err());
+    assert!(PyIvfIndex::new((validation::MAX_VECTOR_DIMENSIONS + 1) as i32, None).is_err());
+    assert!(
+      brute_force_search(vec![vec![1.0]], vec![1], vec![1.0], 0, None)
+        .expect("zero k is a valid empty result")
+        .is_empty()
+    );
+    assert!(brute_force_search(vec![vec![1.0]], vec![-1], vec![1.0], 1, None).is_err());
+  }
 }

@@ -1,13 +1,14 @@
 //! Streaming and pagination options for Python bindings
 
+use crate::pyo3_bindings::validation;
 use crate::streaming;
-use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
 /// Options for streaming node/edge batches
 #[pyclass(name = "StreamOptions")]
 #[derive(Debug, Clone, Default)]
 pub struct StreamOptions {
+  /// Batch size; 0 preserves the core default.
   #[pyo3(get, set)]
   pub batch_size: Option<i64>,
 }
@@ -28,13 +29,12 @@ impl StreamOptions {
 impl StreamOptions {
   /// Convert to core streaming options
   pub fn to_rust(self) -> PyResult<streaming::StreamOptions> {
-    let batch_size = self.batch_size.unwrap_or(0);
-    if batch_size < 0 {
-      return Err(PyRuntimeError::new_err("batch_size must be non-negative"));
-    }
-    Ok(streaming::StreamOptions {
-      batch_size: batch_size as usize,
-    })
+    let batch_size = validation::non_negative_usize(
+      "batch_size",
+      self.batch_size.unwrap_or(0),
+      validation::MAX_COUNT,
+    )?;
+    Ok(streaming::StreamOptions { batch_size })
   }
 }
 
@@ -42,6 +42,7 @@ impl StreamOptions {
 #[pyclass(name = "PaginationOptions")]
 #[derive(Debug, Clone, Default)]
 pub struct PaginationOptions {
+  /// Page limit; 0 preserves the core default.
   #[pyo3(get, set)]
   pub limit: Option<i64>,
   #[pyo3(get, set)]
@@ -67,12 +68,10 @@ impl PaginationOptions {
 impl PaginationOptions {
   /// Convert to core pagination options
   pub fn to_rust(self) -> PyResult<streaming::PaginationOptions> {
-    let limit = self.limit.unwrap_or(0);
-    if limit < 0 {
-      return Err(PyRuntimeError::new_err("limit must be non-negative"));
-    }
+    let limit =
+      validation::non_negative_usize("limit", self.limit.unwrap_or(0), validation::MAX_COUNT)?;
     Ok(streaming::PaginationOptions {
-      limit: limit as usize,
+      limit,
       cursor: self.cursor,
     })
   }
@@ -107,6 +106,14 @@ mod tests {
   }
 
   #[test]
+  fn test_stream_options_rejects_huge_batch_size() {
+    let opts = StreamOptions {
+      batch_size: Some(validation::MAX_COUNT + 1),
+    };
+    assert!(opts.to_rust().is_err());
+  }
+
+  #[test]
   fn test_pagination_options_default() {
     let opts = PaginationOptions::default();
     let rust = opts.to_rust().expect("expected value");
@@ -129,6 +136,15 @@ mod tests {
   fn test_pagination_options_negative_limit() {
     let opts = PaginationOptions {
       limit: Some(-1),
+      cursor: None,
+    };
+    assert!(opts.to_rust().is_err());
+  }
+
+  #[test]
+  fn test_pagination_options_rejects_huge_limit() {
+    let opts = PaginationOptions {
+      limit: Some(validation::MAX_COUNT + 1),
       cursor: None,
     };
     assert!(opts.to_rust().is_err());

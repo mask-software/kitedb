@@ -5,10 +5,11 @@
 //!
 //! Ported from src/vector/ivf-serialize.ts
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 
 use crate::vector::ivf::IvfIndex;
+use crate::vector::store::validate_vector_manifest;
 use crate::vector::types::{
   DistanceMetric, Fragment, FragmentState, IvfConfig, RowGroup, VectorLocation, VectorManifest,
   VectorStoreConfig,
@@ -53,6 +54,8 @@ pub enum SerializeError {
   },
   /// Invalid metric value
   InvalidMetric(u32),
+  /// Structurally inconsistent input
+  InvalidStructure(String),
 }
 
 impl std::fmt::Display for SerializeError {
@@ -82,6 +85,7 @@ impl std::fmt::Display for SerializeError {
           "Invalid metric value: {n}. Expected 0 (cosine), 1 (euclidean), or 2 (dot)"
         )
       }
+      SerializeError::InvalidStructure(msg) => write!(f, "Invalid vector structure: {msg}"),
     }
   }
 }
@@ -117,6 +121,15 @@ fn u8_to_metric(n: u8) -> Result<DistanceMetric, SerializeError> {
   }
 }
 
+fn metric_from_u32(n: u32) -> Result<DistanceMetric, SerializeError> {
+  match n {
+    0 => Ok(DistanceMetric::Cosine),
+    1 => Ok(DistanceMetric::Euclidean),
+    2 => Ok(DistanceMetric::DotProduct),
+    _ => Err(SerializeError::InvalidMetric(n)),
+  }
+}
+
 /// Ensure buffer has enough bytes remaining
 fn ensure_bytes(
   buf_len: usize,
@@ -124,7 +137,10 @@ fn ensure_bytes(
   needed: usize,
   context: &str,
 ) -> Result<(), SerializeError> {
-  if offset + needed > buf_len {
+  let end = offset
+    .checked_add(needed)
+    .ok_or_else(|| SerializeError::InvalidStructure(format!("{context} size overflow")))?;
+  if end > buf_len {
     return Err(SerializeError::BufferUnderflow {
       context: context.to_string(),
       offset,
@@ -133,6 +149,19 @@ fn ensure_bytes(
     });
   }
   Ok(())
+}
+
+fn ensure_count_bytes(
+  buf_len: usize,
+  offset: usize,
+  count: usize,
+  minimum_size: usize,
+  context: &str,
+) -> Result<(), SerializeError> {
+  let needed = count
+    .checked_mul(minimum_size)
+    .ok_or_else(|| SerializeError::InvalidStructure(format!("{context} count size overflow")))?;
+  ensure_bytes(buf_len, offset, needed, context)
 }
 
 fn read_u32_at(buffer: &[u8], offset: usize, context: &str) -> Result<u32, SerializeError> {
@@ -252,12 +281,36 @@ pub fn deserialize_ivf(buffer: &[u8]) -> Result<IvfIndex, SerializeError> {
   offset += 4;
   let n_probe = read_u32_at(buffer, offset, "IVF n_probe")? as usize;
   offset += 4;
-  let trained = buffer[offset] == 1;
+  let trained = match buffer[offset] {
+    0 => false,
+    1 => true,
+    value => {
+      return Err(SerializeError::InvalidStructure(format!(
+        "IVF trained flag {value} is invalid"
+      )));
+    }
+  };
   offset += 1;
   offset += 1; // skip reserved
   let metric = u8_to_metric(buffer[offset])?;
   offset += 1;
   offset += 13; // skip reserved
+
+  if n_clusters == 0 {
+    return Err(SerializeError::InvalidStructure(
+      "IVF n_clusters must be nonzero".into(),
+    ));
+  }
+  if dimensions == 0 {
+    return Err(SerializeError::InvalidStructure(
+      "IVF dimensions must be nonzero".into(),
+    ));
+  }
+  if n_probe == 0 {
+    return Err(SerializeError::InvalidStructure(
+      "IVF n_probe must be nonzero".into(),
+    ));
+  }
 
   let config = IvfConfig {
     n_clusters,
@@ -270,8 +323,19 @@ pub fn deserialize_ivf(buffer: &[u8]) -> Result<IvfIndex, SerializeError> {
   let centroid_count = read_u32_at(buffer, offset, "IVF centroid count")? as usize;
   offset += 4;
 
-  let centroids_size = centroid_count * 4;
-  ensure_bytes(buf_len, offset, centroids_size, "IVF centroids")?;
+  ensure_count_bytes(buf_len, offset, centroid_count, 4, "IVF centroids")?;
+  let expected_centroid_count = if trained {
+    n_clusters
+      .checked_mul(dimensions)
+      .ok_or_else(|| SerializeError::InvalidStructure("IVF centroid shape overflow".into()))?
+  } else {
+    0
+  };
+  if centroid_count != expected_centroid_count {
+    return Err(SerializeError::InvalidStructure(format!(
+      "IVF centroid count {centroid_count} does not match expected {expected_centroid_count}"
+    )));
+  }
 
   let mut centroids = Vec::with_capacity(centroid_count);
   for _ in 0..centroid_count {
@@ -284,30 +348,64 @@ pub fn deserialize_ivf(buffer: &[u8]) -> Result<IvfIndex, SerializeError> {
   ensure_bytes(buf_len, offset, 4, "IVF inverted list count")?;
   let num_lists = read_u32_at(buffer, offset, "IVF inverted list count")? as usize;
   offset += 4;
+  if num_lists > n_clusters {
+    return Err(SerializeError::InvalidStructure(format!(
+      "IVF inverted list count {num_lists} exceeds n_clusters {n_clusters}"
+    )));
+  }
+  if !trained && num_lists != 0 {
+    return Err(SerializeError::InvalidStructure(
+      "untrained IVF contains inverted lists".into(),
+    ));
+  }
+  ensure_count_bytes(buf_len, offset, num_lists, 8, "IVF inverted list headers")?;
 
-  let mut inverted_lists: HashMap<usize, Vec<u64>> = HashMap::new();
+  let mut inverted_lists: HashMap<usize, Vec<u64>> = HashMap::with_capacity(num_lists);
+  let mut vector_ids = HashSet::new();
 
   for i in 0..num_lists {
-    ensure_bytes(buf_len, offset, 8, &format!("IVF inverted list {i} header"))?;
     let cluster = read_u32_at(buffer, offset, "IVF inverted list cluster")? as usize;
     offset += 4;
+    if cluster >= n_clusters {
+      return Err(SerializeError::InvalidStructure(format!(
+        "IVF inverted list {i} cluster {cluster} is outside n_clusters {n_clusters}"
+      )));
+    }
+    if inverted_lists.contains_key(&cluster) {
+      return Err(SerializeError::InvalidStructure(format!(
+        "duplicate IVF inverted list cluster {cluster}"
+      )));
+    }
     let list_length = read_u32_at(buffer, offset, "IVF inverted list length")? as usize;
     offset += 4;
 
-    ensure_bytes(
+    ensure_count_bytes(
       buf_len,
       offset,
-      list_length * 8,
+      list_length,
+      8,
       &format!("IVF inverted list {i} data"),
     )?;
     let mut list = Vec::with_capacity(list_length);
     for _ in 0..list_length {
       let vector_id = read_u64_at(buffer, offset, "IVF vector id")?;
       list.push(vector_id);
+      if !vector_ids.insert(vector_id) {
+        return Err(SerializeError::InvalidStructure(format!(
+          "duplicate IVF vector id {vector_id} in inverted lists"
+        )));
+      }
       offset += 8;
     }
 
     inverted_lists.insert(cluster, list);
+  }
+
+  if offset != buf_len {
+    return Err(SerializeError::InvalidStructure(format!(
+      "IVF payload has {} trailing bytes",
+      buf_len - offset
+    )));
   }
 
   Ok(IvfIndex::from_serialized(
@@ -448,13 +546,21 @@ pub fn deserialize_manifest(buffer: &[u8]) -> Result<VectorManifest, SerializeEr
 
   let dimensions = read_u32_at(buffer, offset, "manifest dimensions")? as usize;
   offset += 4;
-  let metric = u8_to_metric(read_u32_at(buffer, offset, "manifest metric")? as u8)?;
+  let metric = metric_from_u32(read_u32_at(buffer, offset, "manifest metric")?)?;
   offset += 4;
   let row_group_size = read_u32_at(buffer, offset, "manifest row_group_size")? as usize;
   offset += 4;
   let fragment_target_size = read_u32_at(buffer, offset, "manifest fragment_target_size")? as usize;
   offset += 4;
-  let normalize_on_insert = buffer[offset] == 1;
+  let normalize_on_insert = match buffer[offset] {
+    0 => false,
+    1 => true,
+    value => {
+      return Err(SerializeError::InvalidStructure(format!(
+        "manifest normalize_on_insert flag {value} is invalid"
+      )));
+    }
+  };
   offset += 1;
   offset += 3; // padding
   let num_fragments = read_u32_at(buffer, offset, "manifest num_fragments")? as usize;
@@ -469,6 +575,27 @@ pub fn deserialize_manifest(buffer: &[u8]) -> Result<VectorManifest, SerializeEr
   offset += 8;
   offset += 20; // reserved
 
+  if dimensions == 0 {
+    return Err(SerializeError::InvalidStructure(
+      "manifest dimensions must be nonzero".into(),
+    ));
+  }
+  if row_group_size == 0 {
+    return Err(SerializeError::InvalidStructure(
+      "manifest row_group_size must be nonzero".into(),
+    ));
+  }
+  if fragment_target_size == 0 {
+    return Err(SerializeError::InvalidStructure(
+      "manifest fragment_target_size must be nonzero".into(),
+    ));
+  }
+  if num_fragments == 0 {
+    return Err(SerializeError::InvalidStructure(
+      "manifest must contain at least one fragment".into(),
+    ));
+  }
+
   let config = VectorStoreConfig {
     dimensions,
     metric,
@@ -478,6 +605,13 @@ pub fn deserialize_manifest(buffer: &[u8]) -> Result<VectorManifest, SerializeEr
   };
 
   // Fragments
+  ensure_count_bytes(
+    buf_len,
+    offset,
+    num_fragments,
+    FRAGMENT_HEADER_SIZE,
+    "manifest fragment headers",
+  )?;
   let mut fragments: Vec<Fragment> = Vec::with_capacity(num_fragments);
 
   for f in 0..num_fragments {
@@ -490,10 +624,14 @@ pub fn deserialize_manifest(buffer: &[u8]) -> Result<VectorManifest, SerializeEr
 
     let id = read_u32_at(buffer, offset, "fragment id")? as usize;
     offset += 4;
-    let state = if buffer[offset] == 0 {
-      FragmentState::Active
-    } else {
-      FragmentState::Sealed
+    let state = match buffer[offset] {
+      0 => FragmentState::Active,
+      1 => FragmentState::Sealed,
+      value => {
+        return Err(SerializeError::InvalidStructure(format!(
+          "fragment {f} state {value} is invalid"
+        )));
+      }
     };
     offset += 1;
     offset += 3; // padding
@@ -509,6 +647,13 @@ pub fn deserialize_manifest(buffer: &[u8]) -> Result<VectorManifest, SerializeEr
     offset += 8; // reserved
 
     // Row groups
+    ensure_count_bytes(
+      buf_len,
+      offset,
+      num_row_groups,
+      ROW_GROUP_HEADER_SIZE,
+      &format!("fragment {f} row group headers"),
+    )?;
     let mut row_groups: Vec<RowGroup> = Vec::with_capacity(num_row_groups);
 
     for r in 0..num_row_groups {
@@ -526,6 +671,23 @@ pub fn deserialize_manifest(buffer: &[u8]) -> Result<VectorManifest, SerializeEr
       let data_length = read_u32_at(buffer, offset, "row group data_length")? as usize;
       offset += 4;
       offset += 4; // reserved
+
+      if data_length % 4 != 0 {
+        return Err(SerializeError::InvalidStructure(format!(
+          "fragment {f} row group {r} data length {data_length} is not a multiple of 4"
+        )));
+      }
+      let expected_value_count = count.checked_mul(dimensions).ok_or_else(|| {
+        SerializeError::InvalidStructure(format!("fragment {f} row group {r} value count overflow"))
+      })?;
+      let expected_data_length = expected_value_count.checked_mul(4).ok_or_else(|| {
+        SerializeError::InvalidStructure(format!("fragment {f} row group {r} data length overflow"))
+      })?;
+      if data_length != expected_data_length {
+        return Err(SerializeError::InvalidStructure(format!(
+          "fragment {f} row group {r} data length {data_length} does not match count {count} * dimensions {dimensions} * 4"
+        )));
+      }
 
       // Copy row group data
       ensure_bytes(
@@ -549,6 +711,11 @@ pub fn deserialize_manifest(buffer: &[u8]) -> Result<VectorManifest, SerializeEr
     }
 
     // Deletion bitmap
+    if deletion_bitmap_length % 4 != 0 {
+      return Err(SerializeError::InvalidStructure(format!(
+        "fragment {f} deletion bitmap length {deletion_bitmap_length} is not a multiple of 4"
+      )));
+    }
     ensure_bytes(
       buf_len,
       offset,
@@ -577,12 +744,13 @@ pub fn deserialize_manifest(buffer: &[u8]) -> Result<VectorManifest, SerializeEr
   let node_to_vector_count = read_u32_at(buffer, offset, "node-to-vector count")? as usize;
   offset += 4;
 
-  ensure_bytes(
+  ensure_count_bytes(
     buf_len,
     offset,
-    node_to_vector_count * 16,
+    node_to_vector_count,
+    16,
     "node-to-vector mapping data",
-  )?; // 8 + 8 = 16
+  )?;
   let mut node_to_vector: HashMap<u64, u64> = HashMap::with_capacity(node_to_vector_count);
   let mut vector_to_node: HashMap<u64, u64> = HashMap::with_capacity(node_to_vector_count);
 
@@ -591,6 +759,11 @@ pub fn deserialize_manifest(buffer: &[u8]) -> Result<VectorManifest, SerializeEr
     offset += 8;
     let vector_id = read_u64_at(buffer, offset, "node-to-vector vector_id")?;
     offset += 8;
+    if node_to_vector.contains_key(&node_id) || vector_to_node.contains_key(&vector_id) {
+      return Err(SerializeError::InvalidStructure(
+        "duplicate node-to-vector mapping key".into(),
+      ));
+    }
     node_to_vector.insert(node_id, vector_id);
     vector_to_node.insert(vector_id, node_id);
   }
@@ -600,10 +773,11 @@ pub fn deserialize_manifest(buffer: &[u8]) -> Result<VectorManifest, SerializeEr
   let vector_to_location_count = read_u32_at(buffer, offset, "vector-to-location count")? as usize;
   offset += 4;
 
-  ensure_bytes(
+  ensure_count_bytes(
     buf_len,
     offset,
-    vector_to_location_count * 16,
+    vector_to_location_count,
+    16,
     "vector-to-location mapping data",
   )?;
   let mut vector_locations: HashMap<u64, VectorLocation> =
@@ -616,6 +790,11 @@ pub fn deserialize_manifest(buffer: &[u8]) -> Result<VectorManifest, SerializeEr
     offset += 4;
     let local_index = read_u32_at(buffer, offset, "vector-to-location local_index")? as usize;
     offset += 4;
+    if vector_locations.contains_key(&vector_id) {
+      return Err(SerializeError::InvalidStructure(format!(
+        "duplicate vector-to-location mapping for vector id {vector_id}"
+      )));
+    }
     vector_locations.insert(
       vector_id,
       VectorLocation {
@@ -625,7 +804,14 @@ pub fn deserialize_manifest(buffer: &[u8]) -> Result<VectorManifest, SerializeEr
     );
   }
 
-  Ok(VectorManifest {
+  if offset != buf_len {
+    return Err(SerializeError::InvalidStructure(format!(
+      "manifest payload has {} trailing bytes",
+      buf_len - offset
+    )));
+  }
+
+  let manifest = VectorManifest {
     config,
     fragments,
     active_fragment_id,
@@ -635,7 +821,10 @@ pub fn deserialize_manifest(buffer: &[u8]) -> Result<VectorManifest, SerializeEr
     node_to_vector,
     vector_to_node,
     vector_locations,
-  })
+  };
+  validate_vector_manifest(&manifest)
+    .map_err(|error| SerializeError::InvalidStructure(format!("manifest: {error}")))?;
+  Ok(manifest)
 }
 
 // ============================================================================
@@ -800,6 +989,112 @@ mod tests {
   }
 
   #[test]
+  #[allow(clippy::type_complexity)]
+  fn test_ivf_corruption_matrix_returns_errors_without_panicking() {
+    let config = IvfConfig::new(2);
+    let mut index = IvfIndex::new(4, config);
+    index.centroids = vec![1.0; 8];
+    index.inverted_lists.insert(0, vec![1]);
+    index.inverted_lists.insert(1, vec![2]);
+    index.trained = true;
+    let valid = serialize_ivf(&index);
+    let lists_offset = IVF_HEADER_SIZE + 4 + index.centroids.len() * 4 + 4;
+    let mutations: [(&str, Box<dyn Fn(&mut Vec<u8>)>); 3] = [
+      (
+        "zero n_probe",
+        Box::new(|bytes| bytes[12..16].copy_from_slice(&0u32.to_le_bytes())),
+      ),
+      (
+        "zero clusters",
+        Box::new(|bytes| bytes[4..8].copy_from_slice(&0u32.to_le_bytes())),
+      ),
+      (
+        "centroid count mismatch",
+        Box::new(|bytes| bytes[32..36].copy_from_slice(&4u32.to_le_bytes())),
+      ),
+    ];
+
+    for (name, mutate) in mutations {
+      let mut corrupted = valid.clone();
+      mutate(&mut corrupted);
+      let result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| deserialize_ivf(&corrupted)));
+      assert!(result.is_ok(), "{name} panicked");
+      assert!(result.expect("panic checked").is_err(), "{name} accepted");
+    }
+
+    for (name, field_offset) in [
+      ("IVF centroid count", 32usize),
+      ("inverted list count", lists_offset - 4),
+      ("inverted list length", lists_offset + 4),
+    ] {
+      let mut corrupted = valid.clone();
+      corrupted[field_offset..field_offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+      let result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| deserialize_ivf(&corrupted)));
+      assert!(result.is_ok(), "{name} u32::MAX panicked");
+      assert!(
+        result.expect("panic checked").is_err(),
+        "{name} u32::MAX accepted"
+      );
+    }
+
+    let mut duplicate_cluster = valid.clone();
+    let first_cluster = u32::from_le_bytes(
+      valid[lists_offset..lists_offset + 4]
+        .try_into()
+        .expect("cluster"),
+    );
+    duplicate_cluster[lists_offset + 16..lists_offset + 20]
+      .copy_from_slice(&first_cluster.to_le_bytes());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      deserialize_ivf(&duplicate_cluster)
+    }));
+    assert!(result.is_ok(), "duplicate cluster panicked");
+    assert!(
+      result.expect("panic checked").is_err(),
+      "duplicate cluster accepted"
+    );
+
+    let mut duplicate_id = valid.clone();
+    let first_id = u64::from_le_bytes(
+      valid[lists_offset + 8..lists_offset + 16]
+        .try_into()
+        .expect("id"),
+    );
+    duplicate_id[lists_offset + 24..lists_offset + 32].copy_from_slice(&first_id.to_le_bytes());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      deserialize_ivf(&duplicate_id)
+    }));
+    assert!(result.is_ok(), "duplicate vector ID panicked");
+    assert!(
+      result.expect("panic checked").is_err(),
+      "duplicate vector ID accepted"
+    );
+
+    for length in 0..valid.len() {
+      let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        deserialize_ivf(&valid[..length])
+      }));
+      assert!(result.is_ok(), "truncation at {length} panicked");
+      assert!(
+        result.expect("panic checked").is_err(),
+        "truncation at {length} accepted"
+      );
+    }
+
+    let mut trailing = valid.clone();
+    trailing.push(0);
+    let result =
+      std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| deserialize_ivf(&trailing)));
+    assert!(result.is_ok(), "trailing bytes panicked");
+    assert!(
+      result.expect("panic checked").is_err(),
+      "trailing bytes accepted"
+    );
+  }
+
+  #[test]
   fn test_ivf_serialized_size() {
     let config = IvfConfig::new(2);
     let mut index = IvfIndex::new(4, config);
@@ -837,5 +1132,121 @@ mod tests {
     }
 
     assert_eq!(size, serialized.len());
+  }
+
+  #[test]
+  #[allow(clippy::type_complexity)]
+  fn test_manifest_corruption_matrix_returns_errors_without_panicking() {
+    let config = VectorStoreConfig::new(4);
+    let manifest = create_vector_store(config);
+    let valid = serialize_manifest(&manifest);
+    let mutations: [(&str, Box<dyn Fn(&mut Vec<u8>)>); 4] = [
+      (
+        "zero dimensions",
+        Box::new(|bytes| bytes[4..8].copy_from_slice(&0u32.to_le_bytes())),
+      ),
+      (
+        "zero row group size",
+        Box::new(|bytes| bytes[12..16].copy_from_slice(&0u32.to_le_bytes())),
+      ),
+      (
+        "zero fragment target size",
+        Box::new(|bytes| bytes[16..20].copy_from_slice(&0u32.to_le_bytes())),
+      ),
+      (
+        "active fragment missing",
+        Box::new(|bytes| bytes[28..32].copy_from_slice(&1u32.to_le_bytes())),
+      ),
+    ];
+
+    for (name, mutate) in mutations {
+      let mut corrupted = valid.clone();
+      mutate(&mut corrupted);
+      let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        deserialize_manifest(&corrupted)
+      }));
+      assert!(result.is_ok(), "{name} panicked");
+      assert!(result.expect("panic checked").is_err(), "{name} accepted");
+    }
+
+    for (name, field_offset) in [
+      ("fragment count", 24usize),
+      (
+        "node-to-vector count",
+        MANIFEST_HEADER_SIZE + FRAGMENT_HEADER_SIZE,
+      ),
+      (
+        "vector-to-location count",
+        MANIFEST_HEADER_SIZE + FRAGMENT_HEADER_SIZE + 4,
+      ),
+    ] {
+      let mut corrupted = valid.clone();
+      corrupted[field_offset..field_offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+      let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        deserialize_manifest(&corrupted)
+      }));
+      assert!(result.is_ok(), "{name} u32::MAX panicked");
+      assert!(
+        result.expect("panic checked").is_err(),
+        "{name} u32::MAX accepted"
+      );
+    }
+
+    for length in 0..valid.len() {
+      let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        deserialize_manifest(&valid[..length])
+      }));
+      assert!(result.is_ok(), "truncation at {length} panicked");
+      assert!(
+        result.expect("panic checked").is_err(),
+        "truncation at {length} accepted"
+      );
+    }
+
+    let mut trailing = valid.clone();
+    trailing.push(0);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      deserialize_manifest(&trailing)
+    }));
+    assert!(result.is_ok(), "trailing bytes panicked");
+    assert!(
+      result.expect("panic checked").is_err(),
+      "trailing bytes accepted"
+    );
+
+    let config = VectorStoreConfig::new(4)
+      .with_row_group_size(10)
+      .with_fragment_target_size(1);
+    let mut manifest = create_vector_store(config);
+    vector_store_insert(&mut manifest, 1, &[1.0, 2.0, 3.0, 4.0]).expect("first vector");
+    vector_store_insert(&mut manifest, 2, &[2.0, 3.0, 4.0, 5.0]).expect("second vector");
+    let valid = serialize_manifest(&manifest);
+    let first_fragment_offset = MANIFEST_HEADER_SIZE;
+    let first_row_group_offset = first_fragment_offset + FRAGMENT_HEADER_SIZE;
+    let second_fragment_offset = first_row_group_offset + ROW_GROUP_HEADER_SIZE + 16 + 4;
+
+    let mut duplicate_fragment_id = valid.clone();
+    duplicate_fragment_id[second_fragment_offset..second_fragment_offset + 4]
+      .copy_from_slice(&0u32.to_le_bytes());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      deserialize_manifest(&duplicate_fragment_id)
+    }));
+    assert!(result.is_ok(), "duplicate fragment ID panicked");
+    assert!(
+      result.expect("panic checked").is_err(),
+      "duplicate fragment ID accepted"
+    );
+
+    let mut row_count_mismatch = valid.clone();
+    row_count_mismatch[first_row_group_offset + 4..first_row_group_offset + 8]
+      .copy_from_slice(&0u32.to_le_bytes());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      deserialize_manifest(&row_count_mismatch)
+    }));
+    assert!(result.is_ok(), "row count mismatch panicked");
+    assert!(
+      result.expect("panic checked").is_err(),
+      "row count mismatch accepted"
+    );
   }
 }

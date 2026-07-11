@@ -76,13 +76,14 @@ pub struct LruCache<K: Hash + Eq + Clone, V> {
 impl<K: Hash + Eq + Clone, V> LruCache<K, V> {
   /// Create a new LRU cache with specified maximum capacity
   ///
-  /// # Panics
-  /// Panics if max_size is 0
+  /// A capacity of zero is a valid disabled cache. Disabled caches retain no
+  /// entries and never allocate an entry node.
   pub fn new(max_size: usize) -> Self {
-    assert!(max_size > 0, "LRU cache max_size must be greater than 0");
     Self {
       max_size,
-      map: HashMap::with_capacity(max_size),
+      // Avoid turning an untrusted capacity hint into an eager, enormous
+      // allocation. The map still grows normally as entries are inserted.
+      map: HashMap::with_capacity(max_size.min(1024)),
       head: None,
       tail: None,
     }
@@ -90,10 +91,9 @@ impl<K: Hash + Eq + Clone, V> LruCache<K, V> {
 
   /// Create a new LRU cache with specified capacity hint
   pub fn with_capacity(max_size: usize, initial_capacity: usize) -> Self {
-    assert!(max_size > 0, "LRU cache max_size must be greater than 0");
     Self {
       max_size,
-      map: HashMap::with_capacity(initial_capacity.min(max_size)),
+      map: HashMap::with_capacity(initial_capacity.min(max_size).min(1024)),
       head: None,
       tail: None,
     }
@@ -156,6 +156,10 @@ impl<K: Hash + Eq + Clone, V> LruCache<K, V> {
   /// If the key already exists, updates the value and marks as recently used.
   /// If at capacity, evicts the least recently used item.
   pub fn set(&mut self, key: K, value: V) {
+    if self.max_size == 0 {
+      return;
+    }
+
     if let Some(&node_ptr) = self.map.get(&key) {
       // Update existing value and move to front
       // SAFETY: node_ptr is valid and owned by this cache.
@@ -185,6 +189,10 @@ impl<K: Hash + Eq + Clone, V> LruCache<K, V> {
   /// Insert a value, returning the old value if present
   /// O(1) time complexity
   pub fn insert(&mut self, key: K, value: V) -> Option<V> {
+    if self.max_size == 0 {
+      return None;
+    }
+
     if let Some(&node_ptr) = self.map.get(&key) {
       // Update existing value and move to front
       // SAFETY: node_ptr is valid and owned by this cache.
@@ -439,9 +447,21 @@ mod tests {
   }
 
   #[test]
-  #[should_panic(expected = "max_size must be greater than 0")]
-  fn test_zero_capacity_panics() {
-    let _cache: LruCache<String, i32> = LruCache::new(0);
+  fn test_zero_capacity_disables_cache() {
+    let mut cache: LruCache<String, i32> = LruCache::new(0);
+    cache.set("a".to_string(), 1);
+    assert_eq!(cache.insert("b".to_string(), 2), None);
+    assert!(cache.is_empty());
+    assert_eq!(cache.max_size(), 0);
+  }
+
+  #[test]
+  fn test_small_and_large_capacities_are_total() {
+    let one: LruCache<String, i32> = LruCache::new(1);
+    assert_eq!(one.max_size(), 1);
+
+    let large: LruCache<String, i32> = LruCache::new(usize::MAX);
+    assert_eq!(large.max_size(), usize::MAX);
   }
 
   #[test]

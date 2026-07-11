@@ -510,4 +510,49 @@ mod tests {
     assert!(detector.validate_commit(&tx_mgr, txid2).is_err());
     assert!(detector.validate_commit(&tx_mgr, txid3).is_err());
   }
+
+  #[test]
+  fn test_old_packed_collisions_are_not_conflicts_but_same_records_are() {
+    let (mut tx_mgr, detector) = setup();
+    let (txid1, _) = tx_mgr.begin_tx();
+    let (txid2, _) = tx_mgr.begin_tx();
+    let (txid3, _) = tx_mgr.begin_tx();
+
+    let edge_a = TxKey::Edge {
+      src: 1,
+      etype: 7,
+      dst: 99,
+    };
+    let edge_b = TxKey::Edge {
+      src: 1 + (1 << 20),
+      etype: 7,
+      dst: 99,
+    };
+    let edge_prop_a = TxKey::EdgeProp {
+      src: 11,
+      etype: 3,
+      dst: 19,
+      key_id: 1,
+    };
+    let edge_prop_b = TxKey::EdgeProp {
+      src: 11,
+      etype: 3,
+      dst: 19,
+      key_id: 4097,
+    };
+
+    tx_mgr.record_write(txid1, edge_a.clone());
+    tx_mgr.record_write(txid1, edge_prop_a.clone());
+    tx_mgr.record_write(txid2, edge_b);
+    tx_mgr.record_write(txid2, edge_prop_b);
+    tx_mgr.record_write(txid3, edge_a.clone());
+    tx_mgr.record_write(txid3, edge_prop_a.clone());
+
+    tx_mgr.commit_tx(txid1).expect("first writer should commit");
+
+    assert!(detector.check_conflicts(&tx_mgr, txid2).is_empty());
+    let conflicts = detector.check_conflicts(&tx_mgr, txid3);
+    assert!(conflicts.contains(&edge_a.to_string()));
+    assert!(conflicts.contains(&edge_prop_a.to_string()));
+  }
 }

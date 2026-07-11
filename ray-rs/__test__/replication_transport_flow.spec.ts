@@ -42,12 +42,16 @@ test('host-runtime replication transport/admin flow is consistent', (t) => {
     replicationRetentionMinEntries: 1,
     autoCheckpoint: false,
   })
+  // Second live primary on one path simulates multi-machine split-brain so
+  // epoch fencing can be exercised; requires the test-only lock bypass.
+  process.env.KITEDB_DANGER_ALLOW_MULTI_NODE_SIMULATION = '1'
   const stale = Database.open(paths.primaryPath, {
     replicationRole: 'Primary',
     replicationSidecarPath: paths.primarySidecar,
     replicationSegmentMaxBytes: 1,
     replicationRetentionMinEntries: 1,
     autoCheckpoint: false,
+    dangerBypassFileLockForMultiNodeSimulation: true,
   })
   const replica = Database.open(paths.replicaPath, {
     replicationRole: 'Replica',
@@ -125,11 +129,14 @@ test('host-runtime replication transport/admin flow is consistent', (t) => {
   )
   primary.primaryRunRetention()
 
-  const reseedErr = t.throws(() => replica.replicaCatchUpOnce(64))
-  t.truthy(reseedErr)
-  t.regex(String(reseedErr?.message), /reseed/i)
-  t.true(replica.replicaReplicationStatus().needsReseed)
+  // Retention respects the reported replica cursor and lagging replicas
+  // recover automatically (reseeding from snapshot internally when a gap
+  // exists), so catch-up succeeds instead of throwing a reseed error.
+  drainReplica(replica, 64)
+  t.false(replica.replicaReplicationStatus().needsReseed)
+  t.is(replica.countNodes(), primary.countNodes())
 
+  // The explicit reseed admin API remains available and idempotent.
   primary.checkpoint()
   replica.replicaReseedFromSnapshot()
   t.false(replica.replicaReplicationStatus().needsReseed)

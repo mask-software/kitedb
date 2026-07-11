@@ -936,40 +936,75 @@ impl Kite {
     }
     let db = open_single_file(&db_path, db_options)?;
 
-    // Initialize schema in a transaction
+    // Initialize schema, opening a write transaction only for new entries.
     let mut nodes: HashMap<String, NodeDef> = HashMap::new();
     let mut edges: HashMap<String, EdgeDef> = HashMap::new();
     let mut key_prefix_to_node: HashMap<String, String> = HashMap::new();
+    {
+      let mut schema_handle = None;
 
-    // Process node definitions
-    for mut node_def in options.nodes {
-      // Define label
-      let label_id = db.label_id_or_create(&node_def.name);
-      node_def.label_id = Some(label_id);
+      // Process node definitions
+      for mut node_def in options.nodes {
+        // Define label
+        let label_id = if let Some(id) = db.label_id(&node_def.name) {
+          id
+        } else {
+          if schema_handle.is_none() {
+            schema_handle = Some(begin_tx(&db)?);
+          }
+          db.define_label(&node_def.name)?
+        };
+        node_def.label_id = Some(label_id);
 
-      // Define property keys
-      for prop_name in node_def.props.keys() {
-        let prop_key_id = db.propkey_id_or_create(prop_name);
-        node_def.prop_key_ids.insert(prop_name.clone(), prop_key_id);
+        // Define property keys
+        for prop_name in node_def.props.keys() {
+          let prop_key_id = if let Some(id) = db.propkey_id(prop_name) {
+            id
+          } else {
+            if schema_handle.is_none() {
+              schema_handle = Some(begin_tx(&db)?);
+            }
+            db.define_propkey(prop_name)?
+          };
+          node_def.prop_key_ids.insert(prop_name.clone(), prop_key_id);
+        }
+
+        key_prefix_to_node.insert(node_def.key_prefix.clone(), node_def.name.clone());
+        nodes.insert(node_def.name.clone(), node_def);
       }
 
-      key_prefix_to_node.insert(node_def.key_prefix.clone(), node_def.name.clone());
-      nodes.insert(node_def.name.clone(), node_def);
-    }
+      // Process edge definitions
+      for mut edge_def in options.edges {
+        // Define edge type
+        let etype_id = if let Some(id) = db.etype_id(&edge_def.name) {
+          id
+        } else {
+          if schema_handle.is_none() {
+            schema_handle = Some(begin_tx(&db)?);
+          }
+          db.define_etype(&edge_def.name)?
+        };
+        edge_def.etype_id = Some(etype_id);
 
-    // Process edge definitions
-    for mut edge_def in options.edges {
-      // Define edge type
-      let etype_id = db.etype_id_or_create(&edge_def.name);
-      edge_def.etype_id = Some(etype_id);
+        // Define property keys
+        for prop_name in edge_def.props.keys() {
+          let prop_key_id = if let Some(id) = db.propkey_id(prop_name) {
+            id
+          } else {
+            if schema_handle.is_none() {
+              schema_handle = Some(begin_tx(&db)?);
+            }
+            db.define_propkey(prop_name)?
+          };
+          edge_def.prop_key_ids.insert(prop_name.clone(), prop_key_id);
+        }
 
-      // Define property keys
-      for prop_name in edge_def.props.keys() {
-        let prop_key_id = db.propkey_id_or_create(prop_name);
-        edge_def.prop_key_ids.insert(prop_name.clone(), prop_key_id);
+        edges.insert(edge_def.name.clone(), edge_def);
       }
 
-      edges.insert(edge_def.name.clone(), edge_def);
+      if let Some(mut handle) = schema_handle {
+        commit(&mut handle)?;
+      }
     }
 
     Ok(Self {
@@ -1154,9 +1189,8 @@ impl Kite {
 
   /// Set a node property
   pub fn set_prop(&mut self, node_id: NodeId, prop_name: &str, value: PropValue) -> Result<()> {
-    let prop_key_id = self.db.propkey_id_or_create(prop_name);
-
     let mut handle = begin_tx(&self.db)?;
+    let prop_key_id = handle.db.define_propkey(prop_name)?;
     set_node_prop(&mut handle, node_id, prop_key_id, value)?;
     commit(&mut handle)?;
     Ok(())
@@ -1175,11 +1209,11 @@ impl Kite {
 
     let mut handle = begin_tx(&self.db)?;
 
-    let first_key_id = self.db.propkey_id_or_create(first_name.as_ref());
+    let first_key_id = handle.db.define_propkey(first_name.as_ref())?;
     set_node_prop(&mut handle, node_id, first_key_id, first_value)?;
 
     for (prop_name, value) in iter {
-      let prop_key_id = self.db.propkey_id_or_create(prop_name.as_ref());
+      let prop_key_id = handle.db.define_propkey(prop_name.as_ref())?;
       set_node_prop(&mut handle, node_id, prop_key_id, value)?;
     }
 
@@ -1388,7 +1422,7 @@ impl Kite {
         let prop_key_id = if let Some(&id) = edge_def.prop_key_ids.get(&prop_name) {
           id
         } else {
-          handle.db.propkey_id_or_create(&prop_name)
+          handle.db.define_propkey(&prop_name)?
         };
         prop_pairs.push((prop_key_id, value));
       }
@@ -1554,9 +1588,8 @@ impl Kite {
       .etype_id
       .ok_or_else(|| KiteError::InvalidSchema("Edge type not initialized".into()))?;
 
-    let prop_key_id = self.db.propkey_id_or_create(prop_name);
-
     let mut handle = begin_tx(&self.db)?;
+    let prop_key_id = handle.db.define_propkey(prop_name)?;
     set_edge_prop(&mut handle, src, etype_id, dst, prop_key_id, value)?;
     commit(&mut handle)?;
     Ok(())
@@ -1583,17 +1616,17 @@ impl Kite {
       .etype_id
       .ok_or_else(|| KiteError::InvalidSchema("Edge type not initialized".into()))?;
 
+    let mut handle = begin_tx(&self.db)?;
     let mut prop_pairs = Vec::with_capacity(props.len());
     for (prop_name, value) in props {
       let prop_key_id = if let Some(&id) = edge_def.prop_key_ids.get(&prop_name) {
         id
       } else {
-        self.db.propkey_id_or_create(&prop_name)
+        handle.db.define_propkey(&prop_name)?
       };
       prop_pairs.push((prop_key_id, value));
     }
 
-    let mut handle = begin_tx(&self.db)?;
     handle.db.set_edge_props(src, etype_id, dst, prop_pairs)?;
     commit(&mut handle)?;
     Ok(())
@@ -2786,7 +2819,7 @@ impl Kite {
               let prop_key_id = if let Some(&id) = entry.prop_key_ids.get(&prop_name) {
                 id
               } else {
-                let key_id = handle.db.propkey_id_or_create(&prop_name);
+                let key_id = handle.db.define_propkey(&prop_name)?;
                 entry.prop_key_ids.insert(prop_name.clone(), key_id);
                 key_id
               };
@@ -2823,7 +2856,7 @@ impl Kite {
           value,
         } => {
           // Use handle.db to access schema methods while handle is active
-          let prop_key_id = handle.db.propkey_id_or_create(&prop_name);
+          let prop_key_id = handle.db.define_propkey(&prop_name)?;
           set_node_prop(&mut handle, node_id, prop_key_id, value)?;
           BatchResult::PropSet
         }
@@ -2841,7 +2874,7 @@ impl Kite {
           let prop_key_id = if let Some(&id) = entry.prop_key_ids.get(&prop_name) {
             id
           } else {
-            let key_id = handle.db.propkey_id_or_create(&prop_name);
+            let key_id = handle.db.define_propkey(&prop_name)?;
             entry.prop_key_ids.insert(prop_name.clone(), key_id);
             key_id
           };
@@ -2864,7 +2897,7 @@ impl Kite {
             let prop_key_id = if let Some(&id) = entry.prop_key_ids.get(&prop_name) {
               id
             } else {
-              let key_id = handle.db.propkey_id_or_create(&prop_name);
+              let key_id = handle.db.define_propkey(&prop_name)?;
               entry.prop_key_ids.insert(prop_name.clone(), key_id);
               key_id
             };
@@ -2981,7 +3014,7 @@ impl<'a> TxContext<'a> {
 
   /// Set a node property
   pub fn set_prop(&mut self, node_id: NodeId, prop_name: &str, value: PropValue) -> Result<()> {
-    let prop_key_id = self.handle.db.propkey_id_or_create(prop_name);
+    let prop_key_id = self.handle.db.define_propkey(prop_name)?;
     set_node_prop(&mut self.handle, node_id, prop_key_id, value)?;
     Ok(())
   }
@@ -3310,7 +3343,7 @@ impl<'a> KiteUpdateNodeBuilder<'a> {
     let mut handle = begin_tx(&self.ray.db)?;
 
     for (prop_name, value_opt) in self.updates {
-      let prop_key_id = self.ray.db.propkey_id_or_create(&prop_name);
+      let prop_key_id = self.ray.db.define_propkey(&prop_name)?;
 
       match value_opt {
         Some(value) => {
@@ -3378,7 +3411,7 @@ impl<'a> KiteUpsertByIdBuilder<'a> {
       let prop_key_id = if let Some(&id) = self.node_def.prop_key_ids.get(&prop_name) {
         id
       } else {
-        self.ray.db.propkey_id_or_create(&prop_name)
+        self.ray.db.define_propkey(&prop_name)?
       };
       updates.push((prop_key_id, value_opt));
     }
@@ -3519,7 +3552,7 @@ impl<'a> InsertExecutorSingle<'a> {
 
     // Set properties
     for (prop_name, value) in self.props {
-      let prop_key_id = self.ray.db.propkey_id_or_create(&prop_name);
+      let prop_key_id = self.ray.db.define_propkey(&prop_name)?;
       set_node_prop(&mut handle, node_id, prop_key_id, value)?;
     }
 
@@ -3562,7 +3595,7 @@ impl<'a> InsertExecutorMultiple<'a> {
 
       // Set properties
       for (prop_name, value) in props {
-        let prop_key_id = self.ray.db.propkey_id_or_create(&prop_name);
+        let prop_key_id = self.ray.db.define_propkey(&prop_name)?;
         set_node_prop(&mut handle, node_id, prop_key_id, value)?;
       }
 
@@ -3673,7 +3706,7 @@ impl<'a> UpsertExecutorSingle<'a> {
 
     let mut updates = Vec::with_capacity(self.props.len());
     for (prop_name, value) in self.props {
-      let prop_key_id = self.ray.db.propkey_id_or_create(&prop_name);
+      let prop_key_id = self.ray.db.define_propkey(&prop_name)?;
       let value_opt = match value {
         PropValue::Null => None,
         other => Some(other),
@@ -3716,7 +3749,7 @@ impl<'a> UpsertExecutorMultiple<'a> {
     for (full_key, props) in self.entries {
       let mut updates = Vec::with_capacity(props.len());
       for (prop_name, value) in props {
-        let prop_key_id = self.ray.db.propkey_id_or_create(&prop_name);
+        let prop_key_id = self.ray.db.define_propkey(&prop_name)?;
         let value_opt = match value {
           PropValue::Null => None,
           other => Some(other),
@@ -3813,7 +3846,7 @@ impl<'a> KiteUpdateEdgeBuilder<'a> {
     let mut handle = begin_tx(&self.ray.db)?;
 
     for (prop_name, value_opt) in self.updates {
-      let prop_key_id = self.ray.db.propkey_id_or_create(&prop_name);
+      let prop_key_id = self.ray.db.define_propkey(&prop_name)?;
 
       match value_opt {
         Some(value) => {
@@ -3889,7 +3922,7 @@ impl<'a> KiteUpsertEdgeBuilder<'a> {
 
     let mut updates = Vec::with_capacity(self.updates.len());
     for (prop_name, value_opt) in self.updates {
-      let prop_key_id = self.ray.db.propkey_id_or_create(&prop_name);
+      let prop_key_id = self.ray.db.define_propkey(&prop_name)?;
       updates.push((prop_key_id, value_opt));
     }
 

@@ -120,6 +120,7 @@ fn temp_file_path(path: &Path) -> PathBuf {
 fn with_progress_lock<T>(sidecar_path: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
   let lock_file = OpenOptions::new()
     .create(true)
+    .truncate(false)
     .read(true)
     .write(true)
     .open(lock_file_path(sidecar_path))?;

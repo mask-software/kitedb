@@ -20,10 +20,34 @@ export declare class Database {
   beginBulk(): number
   /** Commit the current transaction */
   commit(): void
+  /** Commit the current transaction and return replication token when primary replication is enabled. */
+  commitWithToken(): string | null
   /** Rollback the current transaction */
   rollback(): void
   /** Check if there's an active transaction */
   hasTransaction(): boolean
+  /** Wait until the DB has observed at least the provided commit token. */
+  waitForToken(token: string, timeoutMs: number): boolean
+  /** Primary replication status when role=primary, else null. */
+  primaryReplicationStatus(): JsPrimaryReplicationStatus | null
+  /** Replica replication status when role=replica, else null. */
+  replicaReplicationStatus(): JsReplicaReplicationStatus | null
+  /** Promote this primary to the next replication epoch. */
+  primaryPromoteToNextEpoch(): number
+  /** Report replica applied cursor to primary for retention decisions. */
+  primaryReportReplicaProgress(replicaId: string, epoch: number, appliedLogIndex: number): void
+  /** Execute replication retention on primary. */
+  primaryRunRetention(): JsPrimaryRetentionOutcome
+  /** Export latest primary snapshot metadata and optional bytes as transport JSON. */
+  exportReplicationSnapshotTransportJson(includeData?: boolean | undefined | null): string
+  /** Export primary replication log page (cursor + limits) as transport JSON. */
+  exportReplicationLogTransportJson(cursor?: string | undefined | null, maxFrames?: number | undefined | null, maxBytes?: number | undefined | null, includePayload?: boolean | undefined | null): string
+  /** Bootstrap a replica from the primary snapshot. */
+  replicaBootstrapFromSnapshot(): void
+  /** Pull and apply up to maxFrames replication frames on replica. */
+  replicaCatchUpOnce(maxFrames: number): number
+  /** Force a replica reseed from current primary snapshot. */
+  replicaReseedFromSnapshot(): void
   /** Create a new node */
   createNode(key?: string | undefined | null): number
   /** Create multiple nodes in a single WAL record (fast path) */
@@ -37,9 +61,9 @@ export declare class Database {
   /** Check if a node exists */
   nodeExists(nodeId: number): boolean
   /** Get node by key */
-  getNodeByKey(key: string): number | null
+  get_node_by_key(key: string): number | null
   /** Get the key for a node */
-  getNodeKey(nodeId: number): string | null
+  get_node_key(nodeId: number): string | null
   /** List all node IDs */
   listNodes(): Array<number>
   /** Count all nodes */
@@ -63,13 +87,13 @@ export declare class Database {
   /** Check if an edge exists */
   edgeExists(src: number, etype: number, dst: number): boolean
   /** Get outgoing edges for a node */
-  getOutEdges(nodeId: number): Array<JsEdge>
+  get_out_edges(nodeId: number): Array<JsEdge>
   /** Get incoming edges for a node */
-  getInEdges(nodeId: number): Array<JsEdge>
+  get_in_edges(nodeId: number): Array<JsEdge>
   /** Get out-degree for a node */
-  getOutDegree(nodeId: number): number
+  get_out_degree(nodeId: number): number
   /** Get in-degree for a node */
-  getInDegree(nodeId: number): number
+  get_in_degree(nodeId: number): number
   /** Count all edges */
   countEdges(): number
   /**
@@ -98,9 +122,9 @@ export declare class Database {
   /** Stream edges with properties in batches */
   streamEdgesWithProps(options?: StreamOptions | undefined | null): Array<Array<EdgeWithProps>>
   /** Get a page of node IDs */
-  getNodesPage(options?: PaginationOptions | undefined | null): NodePage
+  get_nodes_page(options?: PaginationOptions | undefined | null): NodePage
   /** Get a page of edges */
-  getEdgesPage(options?: PaginationOptions | undefined | null): EdgePage
+  get_edges_page(options?: PaginationOptions | undefined | null): EdgePage
   /** Set a node property */
   setNodeProp(nodeId: number, keyId: number, value: JsPropValue): void
   /** Set a node property by key name */
@@ -108,9 +132,9 @@ export declare class Database {
   /** Delete a node property */
   deleteNodeProp(nodeId: number, keyId: number): void
   /** Get a specific node property */
-  getNodeProp(nodeId: number, keyId: number): JsPropValue | null
+  get_node_prop(nodeId: number, keyId: number): JsPropValue | null
   /** Get all properties for a node (returns array of {key_id, value} pairs) */
-  getNodeProps(nodeId: number): Array<JsNodeProp> | null
+  get_node_props(nodeId: number): Array<JsNodeProp> | null
   /** Set an edge property */
   setEdgeProp(src: number, etype: number, dst: number, keyId: number, value: JsPropValue): void
   /** Set an edge property by key name */
@@ -118,35 +142,35 @@ export declare class Database {
   /** Delete an edge property */
   deleteEdgeProp(src: number, etype: number, dst: number, keyId: number): void
   /** Get a specific edge property */
-  getEdgeProp(src: number, etype: number, dst: number, keyId: number): JsPropValue | null
+  get_edge_prop(src: number, etype: number, dst: number, keyId: number): JsPropValue | null
   /** Get all properties for an edge (returns array of {key_id, value} pairs) */
-  getEdgeProps(src: number, etype: number, dst: number): Array<JsNodeProp> | null
+  get_edge_props(src: number, etype: number, dst: number): Array<JsNodeProp> | null
   /** Set a vector embedding for a node */
   setNodeVector(nodeId: number, propKeyId: number, vector: Array<number>): void
   /** Get a vector embedding for a node */
-  getNodeVector(nodeId: number, propKeyId: number): Array<number> | null
+  get_node_vector(nodeId: number, propKeyId: number): Array<number> | null
   /** Delete a vector embedding for a node */
   deleteNodeVector(nodeId: number, propKeyId: number): void
   /** Check if a node has a vector embedding */
   hasNodeVector(nodeId: number, propKeyId: number): boolean
   /** Get or create a label ID */
-  getOrCreateLabel(name: string): number
+  get_or_create_label(name: string): number
   /** Get label ID by name */
-  getLabelId(name: string): number | null
+  get_label_id(name: string): number | null
   /** Get label name by ID */
-  getLabelName(id: number): string | null
+  get_label_name(id: number): string | null
   /** Get or create an edge type ID */
-  getOrCreateEtype(name: string): number
+  get_or_create_etype(name: string): number
   /** Get edge type ID by name */
-  getEtypeId(name: string): number | null
+  get_etype_id(name: string): number | null
   /** Get edge type name by ID */
-  getEtypeName(id: number): string | null
+  get_etype_name(id: number): string | null
   /** Get or create a property key ID */
-  getOrCreatePropkey(name: string): number
+  get_or_create_propkey(name: string): number
   /** Get property key ID by name */
-  getPropkeyId(name: string): number | null
+  get_propkey_id(name: string): number | null
   /** Get property key name by ID */
-  getPropkeyName(id: number): string | null
+  get_propkey_name(id: number): string | null
   /** Define a new label (requires transaction) */
   defineLabel(name: string): number
   /** Add a label to a node */
@@ -158,7 +182,7 @@ export declare class Database {
   /** Check if a node has a label */
   nodeHasLabel(nodeId: number, labelId: number): boolean
   /** Get all labels for a node */
-  getNodeLabels(nodeId: number): Array<number>
+  get_node_labels(nodeId: number): Array<number>
   /**
    * Execute a single-hop traversal from start nodes
    *
@@ -571,15 +595,15 @@ export declare class Kite {
   /** Get a node by key (returns node object with props) */
   get(nodeType: string, key: unknown, props?: Array<string> | undefined | null): object | null
   /** Get a node by ID (returns node object with props) */
-  getById(nodeId: number, props?: Array<string> | undefined | null): object | null
+  get_by_id(nodeId: number, props?: Array<string> | undefined | null): object | null
   /** Get a lightweight node reference by key (no properties) */
-  getRef(nodeType: string, key: unknown): object | null
+  get_ref(nodeType: string, key: unknown): object | null
   /** Get a node ID by key (no properties) */
-  getId(nodeType: string, key: unknown): number | null
+  get_id(nodeType: string, key: unknown): number | null
   /** Get multiple nodes by ID (returns node objects with props) */
-  getByIds(nodeIds: Array<number>, props?: Array<string> | undefined | null): Array<object>
+  get_by_ids(nodeIds: Array<number>, props?: Array<string> | undefined | null): Array<object>
   /** Get a node property value */
-  getProp(nodeId: number, propName: string): JsPropValue | null
+  get_prop(nodeId: number, propName: string): JsPropValue | null
   /** Set a node property value */
   setProp(nodeId: number, propName: string, value: unknown): void
   /** Set multiple node property values */
@@ -607,9 +631,9 @@ export declare class Kite {
   /** Check if an edge exists */
   hasEdge(src: number, edgeType: string, dst: number): boolean
   /** Get an edge property value */
-  getEdgeProp(src: number, edgeType: string, dst: number, propName: string): JsPropValue | null
+  get_edge_prop(src: number, edgeType: string, dst: number, propName: string): JsPropValue | null
   /** Get all edge properties */
-  getEdgeProps(src: number, edgeType: string, dst: number): Record<string, JsPropValue>
+  get_edge_props(src: number, edgeType: string, dst: number): Record<string, JsPropValue>
   /** Set an edge property value */
   setEdgeProp(src: number, edgeType: string, dst: number, propName: string, value: unknown): void
   /** Set multiple edge properties */
@@ -652,6 +676,16 @@ export declare class Kite {
   rollback(): void
   /** Check if there's an active transaction */
   hasTransaction(): boolean
+  /** Primary replication status when role=primary, else null. */
+  primaryReplicationStatus(): JsPrimaryReplicationStatus | null
+  /** Replica replication status when role=replica, else null. */
+  replicaReplicationStatus(): JsReplicaReplicationStatus | null
+  /** Pull and apply up to maxFrames replication frames on replica. */
+  replicaCatchUpOnce(maxFrames: number): number
+  /** Force a replica reseed from current primary snapshot. */
+  replicaReseedFromSnapshot(): void
+  /** Promote this primary to the next replication epoch. */
+  primaryPromoteToNextEpoch(): number
   /** Perform a checkpoint (compact WAL into snapshot) */
   checkpoint(): void
   /** Execute a batch of operations atomically */
@@ -876,54 +910,6 @@ export declare function collectReplicationMetricsPrometheus(db: Database): strin
 
 export declare function collectReplicationSnapshotTransportJson(db: Database, includeData?: boolean | undefined | null): string
 
-export interface OtlpHttpExportResult {
-  statusCode: number
-  responseBody: string
-}
-
-export declare function pushReplicationMetricsOtelJson(db: Database, endpoint: string, timeoutMs: number, bearerToken?: string | undefined | null): OtlpHttpExportResult
-
-export interface PushReplicationMetricsOtelOptions {
-  timeoutMs?: number
-  bearerToken?: string
-  retryMaxAttempts?: number
-  retryBackoffMs?: number
-  retryBackoffMaxMs?: number
-  retryJitterRatio?: number
-  adaptiveRetry?: boolean
-  adaptiveRetryMode?: 'linear' | 'ewma'
-  adaptiveRetryEwmaAlpha?: number
-  circuitBreakerFailureThreshold?: number
-  circuitBreakerOpenMs?: number
-  circuitBreakerHalfOpenProbes?: number
-  circuitBreakerStatePath?: string
-  circuitBreakerStateUrl?: string
-  circuitBreakerStatePatch?: boolean
-  circuitBreakerStatePatchBatch?: boolean
-  circuitBreakerStatePatchBatchMaxKeys?: number
-  circuitBreakerStatePatchMerge?: boolean
-  circuitBreakerStatePatchMergeMaxKeys?: number
-  circuitBreakerStatePatchRetryMaxAttempts?: number
-  circuitBreakerStateCas?: boolean
-  circuitBreakerStateLeaseId?: string
-  circuitBreakerScopeKey?: string
-  compressionGzip?: boolean
-  httpsOnly?: boolean
-  caCertPemPath?: string
-  clientCertPemPath?: string
-  clientKeyPemPath?: string
-}
-
-export declare function pushReplicationMetricsOtelJsonWithOptions(db: Database, endpoint: string, options?: PushReplicationMetricsOtelOptions | undefined | null): OtlpHttpExportResult
-
-export declare function pushReplicationMetricsOtelProtobuf(db: Database, endpoint: string, timeoutMs: number, bearerToken?: string | undefined | null): OtlpHttpExportResult
-
-export declare function pushReplicationMetricsOtelProtobufWithOptions(db: Database, endpoint: string, options?: PushReplicationMetricsOtelOptions | undefined | null): OtlpHttpExportResult
-
-export declare function pushReplicationMetricsOtelGrpc(db: Database, endpoint: string, timeoutMs: number, bearerToken?: string | undefined | null): OtlpHttpExportResult
-
-export declare function pushReplicationMetricsOtelGrpcWithOptions(db: Database, endpoint: string, options?: PushReplicationMetricsOtelOptions | undefined | null): OtlpHttpExportResult
-
 /** Compression options */
 export interface CompressionOptions {
   /** Enable compression (default false) */
@@ -953,6 +939,7 @@ export interface DatabaseMetrics {
   data: DataMetrics
   cache: CacheMetrics
   mvcc?: MvccMetrics
+  replication: ReplicationMetrics
   memory: MemoryMetrics
   /** Timestamp in milliseconds since epoch */
   collectedAt: number
@@ -1037,6 +1024,7 @@ export interface HealthCheckResult {
 /** Options for import */
 export interface ImportOptions {
   skipExisting?: boolean
+  /** Batch size; 0 preserves the core default. */
   batchSize?: number
 }
 
@@ -1190,22 +1178,36 @@ export interface JsKiteOptions {
   mvcc?: boolean
   /** MVCC GC interval in ms */
   mvccGcIntervalMs?: number
-  /** MVCC retention in ms */
+  /** MVCC retention in ms (0 means retain no historical window) */
   mvccRetentionMs?: number
-  /** MVCC max version chain depth */
+  /** MVCC max version chain depth (must be positive) */
   mvccMaxChainDepth?: number
   /** Sync mode: "Full", "Normal", or "Off" (default: "Full") */
   syncMode?: JsSyncMode
   /** Enable group commit (coalesce WAL flushes across commits) */
   groupCommitEnabled?: boolean
-  /** Group commit window in milliseconds */
+  /** Group commit window in milliseconds (0 adds no coalescing delay) */
   groupCommitWindowMs?: number
-  /** WAL size in megabytes (default: 1MB) */
+  /** WAL size in megabytes (must be positive) */
   walSizeMb?: number
   /** WAL usage threshold (0.0-1.0) to trigger auto-checkpoint */
   checkpointThreshold?: number
   /** On close, checkpoint if WAL usage is at or above this threshold (default: 0.2) */
   closeCheckpointIfWalUsageAtLeast?: number
+  /** Replication role: "Disabled", "Primary", or "Replica" */
+  replicationRole?: JsReplicationRole
+  /** Replication sidecar path override */
+  replicationSidecarPath?: string
+  /** Source primary db path (replica role only) */
+  replicationSourceDbPath?: string
+  /** Source primary sidecar path (replica role only) */
+  replicationSourceSidecarPath?: string
+  /** Segment rotation threshold in bytes (primary role only) */
+  replicationSegmentMaxBytes?: number
+  /** Minimum retained entries window (0 imposes no entry-count floor) */
+  replicationRetentionMinEntries?: number
+  /** Minimum retained segment age in milliseconds (0 imposes no age floor) */
+  replicationRetentionMinMs?: number
 }
 
 /** Node property key-value pair for JS */
@@ -1286,6 +1288,28 @@ export interface JsPqConfig {
   maxIterations?: number
 }
 
+/** Primary replication runtime status */
+export interface JsPrimaryReplicationStatus {
+  role: string
+  epoch: number
+  headLogIndex: number
+  retainedFloor: number
+  replicaLags: Array<JsReplicaLagStatus>
+  sidecarPath: string
+  lastToken?: string
+  lastReplicationError?: string
+  sidecarNeedsRepair: boolean
+  appendAttempts: number
+  appendFailures: number
+  appendSuccesses: number
+}
+
+/** Retention run outcome */
+export interface JsPrimaryRetentionOutcome {
+  prunedSegments: number
+  retainedFloor: number
+}
+
 /** Property specification for a node or edge type */
 export interface JsPropSpec {
   /** Property type: "string", "int", "float", "bool", "vector", "any" */
@@ -1306,9 +1330,34 @@ export interface JsPropValue {
   vectorValue?: Array<number>
 }
 
+/** Per-replica lag entry on primary status */
+export interface JsReplicaLagStatus {
+  replicaId: string
+  epoch: number
+  appliedLogIndex: number
+}
+
+/** Replica replication runtime status */
+export interface JsReplicaReplicationStatus {
+  role: string
+  sourceDbPath?: string
+  sourceSidecarPath?: string
+  appliedEpoch: number
+  appliedLogIndex: number
+  lastError?: string
+  needsReseed: boolean
+}
+
+/** Replication role for single-file open options */
+export declare const enum JsReplicationRole {
+  Disabled = 'Disabled',
+  Primary = 'Primary',
+  Replica = 'Replica'
+}
+
 /** Options for vector search */
 export interface JsSearchOptions {
-  /** Number of clusters to probe (overrides index default) */
+  /** Number of clusters to probe (overrides index default; must be positive) */
   nProbe?: number
   /** Minimum similarity threshold (0-1) */
   threshold?: number
@@ -1385,9 +1434,9 @@ export interface JsTraversalStep {
 export interface JsTraverseOptions {
   /** Direction of traversal */
   direction?: JsTraversalDirection
-  /** Minimum depth (default: 1) */
+  /** Minimum depth (default: 1; 0 includes the starting node) */
   minDepth?: number
-  /** Maximum depth (required) */
+  /** Maximum depth (0 performs no hops) */
   maxDepth: number
   /** Whether to only visit unique nodes (default: true) */
   unique?: boolean
@@ -1456,23 +1505,6 @@ export interface OfflineBackupOptions {
 /** Open a database file (standalone function) */
 export declare function openDatabase(path: string, options?: OpenOptions | undefined | null): Database
 
-/** Recommended conservative profile (durability-first). */
-export declare function recommendedSafeProfile(): RuntimeProfile
-
-/** Recommended balanced profile (good throughput + durability tradeoff). */
-export declare function recommendedBalancedProfile(): RuntimeProfile
-
-/** Recommended profile for reopen-heavy workloads. */
-export declare function recommendedReopenHeavyProfile(): RuntimeProfile
-
-/** Runtime profile preset for open/close behavior. */
-export interface RuntimeProfile {
-  /** Open-time options for `Database.open(path, options)`. */
-  openOptions: OpenOptions
-  /** Optional close-time checkpoint trigger threshold. */
-  closeCheckpointIfWalUsageAtLeast?: number
-}
-
 /** Options for opening a database */
 export interface OpenOptions {
   /** Open in read-only mode */
@@ -1483,13 +1515,13 @@ export interface OpenOptions {
   mvcc?: boolean
   /** MVCC GC interval in ms */
   mvccGcIntervalMs?: number
-  /** MVCC retention in ms */
+  /** MVCC retention in ms (0 means retain no historical window) */
   mvccRetentionMs?: number
-  /** MVCC max version chain depth */
+  /** MVCC max version chain depth (must be positive) */
   mvccMaxChainDepth?: number
-  /** Page size in bytes (default 4096) */
+  /** Page size in bytes (must be a supported positive power of two) */
   pageSize?: number
-  /** WAL size in bytes (default 1MB) */
+  /** WAL size in bytes (must be positive and at least 16 pages) */
   walSize?: number
   /** Enable auto-checkpoint when WAL usage exceeds threshold */
   autoCheckpoint?: boolean
@@ -1501,29 +1533,57 @@ export interface OpenOptions {
   checkpointCompression?: CompressionOptions
   /** Enable caching */
   cacheEnabled?: boolean
-  /** Max node properties in cache */
+  /** Max node properties in cache (0 disables the node-property cache) */
   cacheMaxNodeProps?: number
-  /** Max edge properties in cache */
+  /** Max edge properties in cache (0 disables the edge-property cache) */
   cacheMaxEdgeProps?: number
-  /** Max traversal cache entries */
+  /** Max traversal cache entries (0 disables the traversal cache) */
   cacheMaxTraversalEntries?: number
-  /** Max query cache entries */
+  /** Max query cache entries (0 disables the query cache) */
   cacheMaxQueryEntries?: number
-  /** Query cache TTL in milliseconds */
+  /** Query cache TTL in milliseconds (0 expires entries immediately) */
   cacheQueryTtlMs?: number
   /** Sync mode: "Full", "Normal", or "Off" (default: "Full") */
   syncMode?: JsSyncMode
   /** Enable group commit (coalesce WAL flushes across commits) */
   groupCommitEnabled?: boolean
-  /** Group commit window in milliseconds */
+  /** Group commit window in milliseconds (0 adds no coalescing delay) */
   groupCommitWindowMs?: number
   /** Snapshot parse mode: "Strict" or "Salvage" (single-file only) */
   snapshotParseMode?: JsSnapshotParseMode
+  /** Replication role: "Disabled", "Primary", or "Replica" */
+  replicationRole?: JsReplicationRole
+  /** Replication sidecar path override */
+  replicationSidecarPath?: string
+  /** Source primary db path (replica role only) */
+  replicationSourceDbPath?: string
+  /** Source primary sidecar path (replica role only) */
+  replicationSourceSidecarPath?: string
+  /** Segment rotation threshold in bytes (primary role only) */
+  replicationSegmentMaxBytes?: number
+  /** Minimum retained entries window (0 imposes no entry-count floor) */
+  replicationRetentionMinEntries?: number
+  /** Minimum retained segment age in milliseconds (0 imposes no age floor) */
+  replicationRetentionMinMs?: number
+  /**
+   * TEST-ONLY: skip database file locking to simulate multi-node topologies
+   * (e.g. split-brain fencing tests) in a single process. Honored only when
+   * the KITEDB_DANGER_ALLOW_MULTI_NODE_SIMULATION environment variable is
+   * set; rejected otherwise. Never use this outside tests: it removes the
+   * corruption protection that prevents two writers on one database file.
+   */
+  dangerBypassFileLockForMultiNodeSimulation?: boolean
+}
+
+/** OTLP HTTP metrics push result. */
+export interface OtlpHttpExportResult {
+  statusCode: number
+  responseBody: string
 }
 
 /** Options for cursor-based pagination */
 export interface PaginationOptions {
-  /** Number of items per page (default: 100) */
+  /** Number of items per page; 0 preserves the core default. */
   limit?: number
   /** Cursor from previous page */
   cursor?: string
@@ -1540,6 +1600,24 @@ export declare function pathConfig(source: number, target: number): JsPathConfig
 
 /** Test function to verify NAPI bindings work */
 export declare function plus100(input: number): number
+
+/** Primary replication metrics */
+export interface PrimaryReplicationMetrics {
+  epoch: number
+  headLogIndex: number
+  retainedFloor: number
+  replicaCount: number
+  staleEpochReplicaCount: number
+  maxReplicaLag: number
+  minReplicaAppliedLogIndex?: number
+  sidecarPath: string
+  lastToken?: string
+  lastReplicationError?: string
+  sidecarNeedsRepair: boolean
+  appendAttempts: number
+  appendFailures: number
+  appendSuccesses: number
+}
 
 /** Property value types */
 export declare const enum PropType {
@@ -1561,6 +1639,75 @@ export declare const enum PropValueTag {
   VectorF32 = 5
 }
 
+export declare function pushReplicationMetricsOtelGrpc(db: Database, endpoint: string, timeoutMs: number, bearerToken?: string | undefined | null): OtlpHttpExportResult
+
+export declare function pushReplicationMetricsOtelGrpcWithOptions(db: Database, endpoint: string, options?: PushReplicationMetricsOtelOptions | undefined | null): OtlpHttpExportResult
+
+export declare function pushReplicationMetricsOtelJson(db: Database, endpoint: string, timeoutMs: number, bearerToken?: string | undefined | null): OtlpHttpExportResult
+
+export declare function pushReplicationMetricsOtelJsonWithOptions(db: Database, endpoint: string, options?: PushReplicationMetricsOtelOptions | undefined | null): OtlpHttpExportResult
+
+/** OTLP collector push options (host runtime). */
+export interface PushReplicationMetricsOtelOptions {
+  timeoutMs?: number
+  bearerToken?: string
+  retryMaxAttempts?: number
+  retryBackoffMs?: number
+  retryBackoffMaxMs?: number
+  retryJitterRatio?: number
+  adaptiveRetry?: boolean
+  adaptiveRetryMode?: string
+  adaptiveRetryEwmaAlpha?: number
+  circuitBreakerFailureThreshold?: number
+  circuitBreakerOpenMs?: number
+  circuitBreakerHalfOpenProbes?: number
+  circuitBreakerStatePath?: string
+  circuitBreakerStateUrl?: string
+  circuitBreakerStatePatch?: boolean
+  circuitBreakerStatePatchBatch?: boolean
+  circuitBreakerStatePatchBatchMaxKeys?: number
+  circuitBreakerStatePatchMerge?: boolean
+  circuitBreakerStatePatchMergeMaxKeys?: number
+  circuitBreakerStatePatchRetryMaxAttempts?: number
+  circuitBreakerStateCas?: boolean
+  circuitBreakerStateLeaseId?: string
+  circuitBreakerScopeKey?: string
+  compressionGzip?: boolean
+  httpsOnly?: boolean
+  caCertPemPath?: string
+  clientCertPemPath?: string
+  clientKeyPemPath?: string
+}
+
+export declare function pushReplicationMetricsOtelProtobuf(db: Database, endpoint: string, timeoutMs: number, bearerToken?: string | undefined | null): OtlpHttpExportResult
+
+export declare function pushReplicationMetricsOtelProtobufWithOptions(db: Database, endpoint: string, options?: PushReplicationMetricsOtelOptions | undefined | null): OtlpHttpExportResult
+
+/** Recommended balanced profile (good throughput + durability tradeoff). */
+export declare function recommendedBalancedProfile(): RuntimeProfile
+
+/** Recommended profile for reopen-heavy workloads. */
+export declare function recommendedReopenHeavyProfile(): RuntimeProfile
+
+/** Recommended conservative profile (durability-first). */
+export declare function recommendedSafeProfile(): RuntimeProfile
+
+/** Replica replication metrics */
+export interface ReplicaReplicationMetrics {
+  appliedEpoch: number
+  appliedLogIndex: number
+  needsReseed: boolean
+  lastError?: string
+}
+
+/** Replication metrics */
+export interface ReplicationMetrics {
+  enabled: boolean
+  role: string
+  primary?: PrimaryReplicationMetrics
+  replica?: ReplicaReplicationMetrics
+}
+
 /** Options for resizing WAL */
 export interface ResizeWalOptions {
   /** Allow shrinking WAL size (default false) */
@@ -1578,13 +1725,21 @@ export interface RestoreOptions {
   overwrite?: boolean
 }
 
+/** Runtime profile preset for open/close behavior. */
+export interface RuntimeProfile {
+  /** Open-time options for `Database.open(path, options)`. */
+  openOptions: OpenOptions
+  /** Optional close-time checkpoint trigger threshold. */
+  closeCheckpointIfWalUsageAtLeast?: number
+}
+
 /** Options for similarity search */
 export interface SimilarOptions {
-  /** Number of results to return */
+  /** Number of results to return (0 returns an empty result) */
   k: number
   /** Minimum similarity threshold (0-1 for cosine) */
   threshold?: number
-  /** Number of clusters to probe for IVF (default: 10) */
+  /** Number of clusters to probe for IVF (must be positive) */
   nProbe?: number
 }
 
@@ -1596,7 +1751,7 @@ export interface SingleFileOptimizeOptions {
 
 /** Options for streaming node/edge batches */
 export interface StreamOptions {
-  /** Number of items per batch (default: 1000) */
+  /** Number of items per batch; 0 preserves the core default. */
   batchSize?: number
 }
 
@@ -1633,7 +1788,7 @@ export interface VectorIndexOptions {
   ivf?: JsIvfConfig
   /** Minimum training vectors before index training (default: 1000) */
   trainingThreshold?: number
-  /** Maximum node IDs to cache for search results (default: 10_000) */
+  /** Maximum node IDs to cache for search results (0 disables this cache) */
   cacheMaxSize?: number
 }
 

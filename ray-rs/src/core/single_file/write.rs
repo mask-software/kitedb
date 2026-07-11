@@ -540,7 +540,7 @@ impl SingleFileDB {
 
   /// Add an edge by type name
   pub fn add_edge_by_name(&self, src: NodeId, etype_name: &str, dst: NodeId) -> Result<()> {
-    let etype = self.etype_id_or_create(etype_name);
+    let etype = self.define_etype(etype_name)?;
     self.add_edge(src, etype, dst)
   }
 
@@ -683,7 +683,7 @@ impl SingleFileDB {
     key_name: &str,
     value: PropValue,
   ) -> Result<()> {
-    let key_id = self.propkey_id_or_create(key_name);
+    let key_id = self.define_propkey(key_name)?;
     self.set_node_prop(node_id, key_id, value)
   }
 
@@ -840,7 +840,7 @@ impl SingleFileDB {
     key_name: &str,
     value: PropValue,
   ) -> Result<()> {
-    let key_id = self.propkey_id_or_create(key_name);
+    let key_id = self.define_propkey(key_name)?;
     self.set_edge_prop(src, etype, dst, key_id, value)
   }
 
@@ -936,7 +936,7 @@ impl SingleFileDB {
 
   /// Add a label to a node by name
   pub fn add_node_label_by_name(&self, node_id: NodeId, label_name: &str) -> Result<()> {
-    let label_id = self.label_id_or_create(label_name);
+    let label_id = self.define_label(label_name)?;
     self.add_node_label(node_id, label_id)
   }
 
@@ -992,14 +992,19 @@ impl SingleFileDB {
 
   /// Define a new label (writes to WAL for durability)
   pub fn define_label(&self, name: &str) -> Result<LabelId> {
-    let (txid, tx_handle) = self.require_write_tx_handle()?;
-
     // Check if already exists
     if let Some(id) = self.label_id(name) {
       return Ok(id);
     }
 
-    let label_id = self.alloc_label_id();
+    let (txid, tx_handle) = self.require_write_tx_handle()?;
+
+    // A concurrent writer may have defined it while this transaction was starting.
+    if let Some(id) = self.label_id(name) {
+      return Ok(id);
+    }
+
+    let label_id = self.claim_label_reservation(name, txid);
 
     // Write WAL record
     let record = WalRecord::new(
@@ -1007,32 +1012,37 @@ impl SingleFileDB {
       txid,
       build_define_label_payload(label_id, name),
     );
-    self.write_wal_tx(&tx_handle, record)?;
-
-    // Update schema maps
-    {
-      let mut names = self.label_names.write();
-      let mut ids = self.label_ids.write();
-      names.insert(name.to_string(), label_id);
-      ids.insert(label_id, name.to_string());
+    if let Err(error) = self.write_wal_tx(&tx_handle, record) {
+      self.release_label_reservation(name, txid);
+      return Err(error);
     }
 
-    // Update delta
-    self.delta.write().define_label(label_id, name);
+    // Stage both the transaction-local lookup and the transaction delta. The
+    // global maps are published by commit after the durable WAL boundary.
+    {
+      let mut tx = tx_handle.lock();
+      tx.schema.define_label(label_id, name);
+      tx.pending.define_label(label_id, name);
+    }
 
     Ok(label_id)
   }
 
   /// Define a new edge type (writes to WAL for durability)
   pub fn define_etype(&self, name: &str) -> Result<ETypeId> {
-    let (txid, tx_handle) = self.require_write_tx_handle()?;
-
     // Check if already exists
     if let Some(id) = self.etype_id(name) {
       return Ok(id);
     }
 
-    let etype_id = self.alloc_etype_id();
+    let (txid, tx_handle) = self.require_write_tx_handle()?;
+
+    // A concurrent writer may have defined it while this transaction was starting.
+    if let Some(id) = self.etype_id(name) {
+      return Ok(id);
+    }
+
+    let etype_id = self.claim_etype_reservation(name, txid);
 
     // Write WAL record
     let record = WalRecord::new(
@@ -1040,32 +1050,37 @@ impl SingleFileDB {
       txid,
       build_define_etype_payload(etype_id, name),
     );
-    self.write_wal_tx(&tx_handle, record)?;
-
-    // Update schema maps
-    {
-      let mut names = self.etype_names.write();
-      let mut ids = self.etype_ids.write();
-      names.insert(name.to_string(), etype_id);
-      ids.insert(etype_id, name.to_string());
+    if let Err(error) = self.write_wal_tx(&tx_handle, record) {
+      self.release_etype_reservation(name, txid);
+      return Err(error);
     }
 
-    // Update delta
-    self.delta.write().define_etype(etype_id, name);
+    // Stage both the transaction-local lookup and the transaction delta. The
+    // global maps are published by commit after the durable WAL boundary.
+    {
+      let mut tx = tx_handle.lock();
+      tx.schema.define_etype(etype_id, name);
+      tx.pending.define_etype(etype_id, name);
+    }
 
     Ok(etype_id)
   }
 
   /// Define a new property key (writes to WAL for durability)
   pub fn define_propkey(&self, name: &str) -> Result<PropKeyId> {
-    let (txid, tx_handle) = self.require_write_tx_handle()?;
-
     // Check if already exists
     if let Some(id) = self.propkey_id(name) {
       return Ok(id);
     }
 
-    let propkey_id = self.alloc_propkey_id();
+    let (txid, tx_handle) = self.require_write_tx_handle()?;
+
+    // A concurrent writer may have defined it while this transaction was starting.
+    if let Some(id) = self.propkey_id(name) {
+      return Ok(id);
+    }
+
+    let propkey_id = self.claim_propkey_reservation(name, txid);
 
     // Write WAL record
     let record = WalRecord::new(
@@ -1073,18 +1088,18 @@ impl SingleFileDB {
       txid,
       build_define_propkey_payload(propkey_id, name),
     );
-    self.write_wal_tx(&tx_handle, record)?;
-
-    // Update schema maps
-    {
-      let mut names = self.propkey_names.write();
-      let mut ids = self.propkey_ids.write();
-      names.insert(name.to_string(), propkey_id);
-      ids.insert(propkey_id, name.to_string());
+    if let Err(error) = self.write_wal_tx(&tx_handle, record) {
+      self.release_propkey_reservation(name, txid);
+      return Err(error);
     }
 
-    // Update delta
-    self.delta.write().define_propkey(propkey_id, name);
+    // Stage both the transaction-local lookup and the transaction delta. The
+    // global maps are published by commit after the durable WAL boundary.
+    {
+      let mut tx = tx_handle.lock();
+      tx.schema.define_propkey(propkey_id, name);
+      tx.pending.define_propkey(propkey_id, name);
+    }
 
     Ok(propkey_id)
   }

@@ -3,8 +3,9 @@
 use crate::core::single_file::{
   SingleFileOptimizeOptions as RustSingleFileOptimizeOptions, VacuumOptions as RustVacuumOptions,
 };
+use crate::pyo3_bindings::validation;
 use crate::util::compression::{CompressionOptions as CoreCompressionOptions, CompressionType};
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 /// Compression options for database optimization
@@ -16,7 +17,7 @@ pub struct CompressionOptions {
   #[pyo3(get, set)]
   pub compression_type: Option<String>,
   #[pyo3(get, set)]
-  pub min_size: Option<u32>,
+  pub min_size: Option<i64>,
   #[pyo3(get, set)]
   pub level: Option<i32>,
 }
@@ -28,7 +29,7 @@ impl CompressionOptions {
   fn new(
     enabled: Option<bool>,
     compression_type: Option<String>,
-    min_size: Option<u32>,
+    min_size: Option<i64>,
     level: Option<i32>,
   ) -> Self {
     Self {
@@ -62,17 +63,18 @@ impl CompressionOptions {
         "gzip" => CompressionType::Gzip,
         "deflate" => CompressionType::Deflate,
         _ => {
-          return Err(PyRuntimeError::new_err(format!(
+          return Err(PyValueError::new_err(format!(
             "Unknown compression_type: {name}"
           )))
         }
       };
     }
     if let Some(min_size) = self.min_size {
-      out.min_size = min_size as usize;
+      out.min_size = validation::compression_min_size(min_size)?;
     }
     if let Some(level) = self.level {
-      out.level = level;
+      let zstd = matches!(out.compression_type, CompressionType::Zstd);
+      out.level = validation::compression_level("level", level, zstd)?;
     }
     Ok(out)
   }
@@ -120,14 +122,14 @@ pub struct VacuumOptions {
   #[pyo3(get, set)]
   pub shrink_wal: Option<bool>,
   #[pyo3(get, set)]
-  pub min_wal_size: Option<u64>,
+  pub min_wal_size: Option<i64>,
 }
 
 #[pymethods]
 impl VacuumOptions {
   #[new]
   #[pyo3(signature = (shrink_wal=None, min_wal_size=None))]
-  fn new(shrink_wal: Option<bool>, min_wal_size: Option<u64>) -> Self {
+  fn new(shrink_wal: Option<bool>, min_wal_size: Option<i64>) -> Self {
     Self {
       shrink_wal,
       min_wal_size,
@@ -144,11 +146,16 @@ impl VacuumOptions {
 
 impl VacuumOptions {
   /// Convert to core vacuum options
-  pub fn to_core(&self) -> RustVacuumOptions {
-    RustVacuumOptions {
+  pub fn to_core(&self) -> PyResult<RustVacuumOptions> {
+    Ok(RustVacuumOptions {
       shrink_wal: self.shrink_wal.unwrap_or(true),
-      min_wal_size: self.min_wal_size,
-    }
+      min_wal_size: self
+        .min_wal_size
+        .map(|value| {
+          validation::non_negative_u64("min_wal_size", value, validation::MAX_BYTES as u64)
+        })
+        .transpose()?,
+    })
   }
 }
 
@@ -187,9 +194,47 @@ mod tests {
   }
 
   #[test]
+  fn test_compression_level_validation() {
+    assert!(CompressionOptions {
+      compression_type: Some("zstd".to_string()),
+      level: Some(0),
+      ..Default::default()
+    }
+    .to_core()
+    .is_err());
+    assert!(CompressionOptions {
+      compression_type: Some("gzip".to_string()),
+      level: Some(10),
+      ..Default::default()
+    }
+    .to_core()
+    .is_err());
+    assert!(CompressionOptions {
+      compression_type: Some("gzip".to_string()),
+      level: Some(0),
+      min_size: Some(1),
+      ..Default::default()
+    }
+    .to_core()
+    .is_ok());
+    assert!(CompressionOptions {
+      min_size: Some(-1),
+      ..Default::default()
+    }
+    .to_core()
+    .is_err());
+    assert!(CompressionOptions {
+      min_size: Some(validation::MAX_COMPRESSION_MIN_SIZE + 1),
+      ..Default::default()
+    }
+    .to_core()
+    .is_err());
+  }
+
+  #[test]
   fn test_vacuum_options_default() {
     let opts = VacuumOptions::default();
-    let core = opts.to_core();
+    let core = opts.to_core().expect("expected value");
     assert!(core.shrink_wal); // defaults to true
   }
 
@@ -199,8 +244,22 @@ mod tests {
       shrink_wal: Some(false),
       min_wal_size: Some(1024 * 1024),
     };
-    let core = opts.to_core();
+    let core = opts.to_core().expect("expected value");
     assert!(!core.shrink_wal);
     assert_eq!(core.min_wal_size, Some(1024 * 1024));
+  }
+
+  #[test]
+  fn test_vacuum_rejects_huge_wal_size() {
+    let opts = VacuumOptions {
+      min_wal_size: Some(validation::MAX_BYTES + 1),
+      ..Default::default()
+    };
+    assert!(opts.to_core().is_err());
+    let opts = VacuumOptions {
+      min_wal_size: Some(-1),
+      ..Default::default()
+    };
+    assert!(opts.to_core().is_err());
   }
 }

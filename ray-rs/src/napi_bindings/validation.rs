@@ -1,0 +1,140 @@
+//! Checked numeric conversions for the N-API boundary.
+
+use napi::bindgen_prelude::{Error, Result};
+use napi::Status;
+
+/// Keep binding-provided cache allocations bounded even on 64-bit hosts.
+pub(crate) const MAX_CACHE_ENTRIES: i64 = 10_000_000;
+/// Upper bound for general result, batch, and traversal counts.
+pub(crate) const MAX_COUNT: i64 = 1_000_000_000;
+/// Upper bound for depth-like options.
+pub(crate) const MAX_DEPTH: i64 = 1_000_000;
+/// Upper bound for durations accepted at the binding boundary (100 years).
+pub(crate) const MAX_DURATION_MS: i64 = 3_153_600_000_000;
+/// Upper bound for byte-sized options that can cause file or buffer growth.
+pub(crate) const MAX_BYTES: i64 = 1_i64 << 40;
+/// Compression metadata is a u32 in the public binding, but keep the value
+/// below the decompression safety ceiling used by the core.
+pub(crate) const MAX_COMPRESSION_MIN_SIZE: i64 = 4 * 1024 * 1024 * 1024;
+/// Page sizes are part of the single-file format contract.
+pub(crate) const MIN_PAGE_SIZE: u32 = 4096;
+pub(crate) const MAX_PAGE_SIZE: u32 = 65536;
+/// The WAL must have enough pages for the format's minimum usable region.
+pub(crate) const MIN_WAL_PAGES: u64 = 16;
+/// Vector parameters are counts, but should not permit accidental huge work.
+pub(crate) const MAX_VECTOR_PARAM: i64 = 1_000_000;
+/// Vector dimensions are also used for direct allocations.
+pub(crate) const MAX_VECTOR_DIMENSIONS: i64 = 1_000_000;
+
+fn invalid(field: &str, expectation: &str) -> Error {
+  invalid_argument(format!("{field} {expectation}"))
+}
+
+pub(crate) fn invalid_argument(message: impl Into<String>) -> Error {
+  Error::new(Status::InvalidArg, message.into())
+}
+
+pub(crate) fn non_negative_usize(field: &str, value: i64, max: i64) -> Result<usize> {
+  if value < 0 {
+    return Err(invalid(field, "must be non-negative"));
+  }
+  if value > max {
+    return Err(invalid(field, &format!("must be <= {max}")));
+  }
+  usize::try_from(value).map_err(|_| invalid(field, "does not fit in a platform usize"))
+}
+
+pub(crate) fn positive_usize(field: &str, value: i64, max: i64) -> Result<usize> {
+  if value <= 0 {
+    return Err(invalid(field, "must be positive"));
+  }
+  non_negative_usize(field, value, max)
+}
+
+pub(crate) fn non_negative_u32(field: &str, value: i64, max: i64) -> Result<u32> {
+  let value = non_negative_usize(field, value, max)?;
+  u32::try_from(value).map_err(|_| invalid(field, "does not fit in a u32"))
+}
+
+pub(crate) fn positive_u32(field: &str, value: i64, max: i64) -> Result<u32> {
+  if value <= 0 {
+    return Err(invalid(field, "must be positive"));
+  }
+  non_negative_u32(field, value, max)
+}
+
+pub(crate) fn non_negative_u64(field: &str, value: i64, max: u64) -> Result<u64> {
+  if value < 0 {
+    return Err(invalid(field, "must be non-negative"));
+  }
+  let value = value as u64;
+  if value > max {
+    return Err(invalid(field, &format!("must be <= {max}")));
+  }
+  Ok(value)
+}
+
+pub(crate) fn positive_u64(field: &str, value: i64, max: u64) -> Result<u64> {
+  if value <= 0 {
+    return Err(invalid(field, "must be positive"));
+  }
+  non_negative_u64(field, value, max)
+}
+
+pub(crate) fn node_id(field: &str, value: i64) -> Result<u64> {
+  non_negative_u64(field, value, i64::MAX as u64)
+}
+
+pub(crate) fn ratio(field: &str, value: f64) -> Result<f64> {
+  if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+    return Err(invalid(field, "must be a finite number in [0.0, 1.0]"));
+  }
+  Ok(value)
+}
+
+pub(crate) fn page_size(value: u32) -> Result<usize> {
+  if !(MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&value) || !value.is_power_of_two() {
+    return Err(invalid(
+      "pageSize",
+      "must be a power of two between 4096 and 65536",
+    ));
+  }
+  usize::try_from(value).map_err(|_| invalid("pageSize", "does not fit in a platform usize"))
+}
+
+pub(crate) fn wal_size(value: u32, page_size: usize) -> Result<usize> {
+  let value = value as u64;
+  let min = MIN_WAL_PAGES * page_size as u64;
+  if value < min {
+    return Err(invalid(
+      "walSize",
+      &format!("must be at least {min} bytes ({MIN_WAL_PAGES} pages)"),
+    ));
+  }
+  if value > MAX_BYTES as u64 {
+    return Err(invalid("walSize", &format!("must be <= {MAX_BYTES} bytes")));
+  }
+  usize::try_from(value).map_err(|_| invalid("walSize", "does not fit in a platform usize"))
+}
+
+pub(crate) fn resize_wal_size(field: &str, value: i64) -> Result<usize> {
+  positive_usize(field, value, MAX_BYTES)
+}
+
+pub(crate) fn compression_min_size(value: u32) -> Result<usize> {
+  if value as i64 > MAX_COMPRESSION_MIN_SIZE {
+    return Err(invalid(
+      "minSize",
+      &format!("must be <= {MAX_COMPRESSION_MIN_SIZE}"),
+    ));
+  }
+  usize::try_from(value).map_err(|_| invalid("minSize", "does not fit in a platform usize"))
+}
+
+pub(crate) fn compression_level(field: &str, value: i32, zstd: bool) -> Result<i32> {
+  let (min, max) = if zstd { (1, 22) } else { (0, 9) };
+  if !(min..=max).contains(&value) {
+    return Err(invalid(field, &format!("must be in [{min}, {max}]")));
+  }
+  Ok(value)
+}

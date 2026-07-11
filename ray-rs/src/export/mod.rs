@@ -369,24 +369,28 @@ pub fn import_from_object_single(
 ) -> Result<ImportResult> {
   let mut propkey_name_to_id: HashMap<String, PropKeyId> = HashMap::new();
   let mut etype_name_to_id: HashMap<String, ETypeId> = HashMap::new();
+  let schema_tx = db.begin_guard(false)?;
 
   for name in data.schema.prop_keys.values() {
-    let id = db
-      .propkey_id(name)
-      .unwrap_or_else(|| db.define_propkey(name).unwrap_or(0));
+    let id = match db.propkey_id(name) {
+      Some(id) => id,
+      None => db.define_propkey(name)?,
+    };
     propkey_name_to_id.insert(name.clone(), id);
   }
   for name in data.schema.etypes.values() {
-    let id = db
-      .etype_id(name)
-      .unwrap_or_else(|| db.define_etype(name).unwrap_or(0));
+    let id = match db.etype_id(name) {
+      Some(id) => id,
+      None => db.define_etype(name)?,
+    };
     etype_name_to_id.insert(name.clone(), id);
   }
   for name in data.schema.labels.values() {
-    let _ = db
-      .label_id(name)
-      .unwrap_or_else(|| db.define_label(name).unwrap_or(0));
+    if db.label_id(name).is_none() {
+      db.define_label(name)?;
+    }
   }
+  schema_tx.commit()?;
 
   let mut old_to_new: HashMap<NodeId, NodeId> = HashMap::new();
   let mut node_count = 0usize;

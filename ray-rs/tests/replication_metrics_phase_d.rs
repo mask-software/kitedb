@@ -2200,8 +2200,7 @@ fn otlp_push_payload_adaptive_retry_uses_failure_history() {
   assert_eq!(result.status_code, 200);
   assert!(
     elapsed >= Duration::from_millis(250),
-    "adaptive retry backoff too small: {:?}",
-    elapsed
+    "adaptive retry backoff too small: {elapsed:?}"
   );
 
   let captures = captured_rx
@@ -2254,8 +2253,7 @@ fn otlp_push_payload_adaptive_retry_ewma_mode_uses_error_score() {
   assert_eq!(result.status_code, 200);
   assert!(
     elapsed >= Duration::from_millis(450),
-    "adaptive ewma retry backoff too small: {:?}",
-    elapsed
+    "adaptive ewma retry backoff too small: {elapsed:?}"
   );
 
   let captures = captured_rx

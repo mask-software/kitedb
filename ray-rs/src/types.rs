@@ -608,7 +608,10 @@ impl TxState {
 // MVCC Types
 // ============================================================================
 
-/// MVCC conflict key
+/// Structural MVCC identity used by version chains and conflict detection.
+///
+/// Keep numeric components as full-width fields. These keys are hashed directly;
+/// they must not be replaced with lossy bit-packed integers.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TxKey {
   Node(NodeId),

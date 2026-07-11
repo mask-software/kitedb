@@ -5,6 +5,7 @@
 pub mod database;
 pub mod kite;
 pub mod traversal;
+mod validation;
 pub mod vector;
 
 pub use database::{

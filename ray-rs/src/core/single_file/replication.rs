@@ -13,7 +13,7 @@ use crate::replication::manifest::ManifestStore;
 use crate::replication::primary::PrimaryRetentionOutcome;
 use crate::replication::replica::ReplicaReplicationStatus;
 use crate::replication::transport::decode_commit_frame_payload;
-use crate::replication::types::{CommitToken, ReplicationCursor, ReplicationRole};
+use crate::replication::types::{CommitToken, ReplicationCursor};
 use crate::types::WalRecordType;
 use crate::util::crc::{crc32c, Crc32cHasher};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -26,7 +26,8 @@ use std::path::Path;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
-use super::{close_single_file, open_single_file, SingleFileDB, SingleFileOpenOptions};
+use super::open::open_replication_source;
+use super::{close_single_file, SingleFileDB};
 
 const REPLICATION_MANIFEST_FILE: &str = "manifest.json";
 const REPLICATION_FRAME_MAGIC: u32 = 0x474F_4C52;
@@ -104,13 +105,19 @@ impl SingleFileDB {
     let mut backoff_ms = REPLICA_BOOTSTRAP_INITIAL_BACKOFF_MS;
     loop {
       attempts = attempts.saturating_add(1);
-      let source = open_single_file(
-        &source_db_path,
-        SingleFileOpenOptions::new()
-          .read_only(true)
-          .create_if_missing(false)
-          .replication_role(ReplicationRole::Disabled),
-      )?;
+      let source = match open_replication_source(&source_db_path) {
+        Ok(source) => source,
+        Err(error)
+          if is_bootstrap_retryable_error(&error) && attempts < REPLICA_BOOTSTRAP_MAX_ATTEMPTS =>
+        {
+          std::thread::sleep(Duration::from_millis(backoff_ms));
+          backoff_ms = backoff_ms
+            .saturating_mul(2)
+            .min(REPLICA_BOOTSTRAP_MAX_BACKOFF_MS);
+          continue;
+        }
+        Err(error) => return Err(error),
+      };
 
       let bootstrap_start = runtime.source_head_position()?;
       let bootstrap_source_fingerprint = source_db_fingerprint(&source_db_path)?;
@@ -169,7 +176,7 @@ impl SingleFileDB {
 
       let close_result = close_single_file(source);
       if let Err(error) = sync_result {
-        if is_bootstrap_quiesce_error(&error) && attempts < REPLICA_BOOTSTRAP_MAX_ATTEMPTS {
+        if is_bootstrap_retryable_error(&error) && attempts < REPLICA_BOOTSTRAP_MAX_ATTEMPTS {
           std::thread::sleep(Duration::from_millis(backoff_ms));
           backoff_ms = backoff_ms
             .saturating_mul(2)
@@ -306,8 +313,7 @@ impl SingleFileDB {
         .mark_applied(applied_epoch, applied_log_index)
         .map_err(|error| {
           KiteError::InvalidReplication(format!(
-            "replica cursor persist failed at {}:{}: {error}",
-            applied_epoch, applied_log_index
+            "replica cursor persist failed at {applied_epoch}:{applied_log_index}: {error}"
           ))
         })?;
     }
@@ -491,6 +497,18 @@ fn is_bootstrap_quiesce_error(error: &KiteError) -> bool {
   }
 }
 
+fn is_bootstrap_retryable_error(error: &KiteError) -> bool {
+  is_bootstrap_quiesce_error(error)
+    || matches!(
+      error,
+      KiteError::CrcMismatch { .. }
+        | KiteError::InvalidMagic { .. }
+        | KiteError::InvalidSnapshot(_)
+        | KiteError::InvalidWal(_)
+        | KiteError::Io(_)
+    )
+}
+
 fn read_snapshot_transport_payload(
   path: &Path,
   include_data: bool,
@@ -521,8 +539,7 @@ fn read_snapshot_transport_payload(
       bytes_read = bytes_read.saturating_add(read as u64);
       if bytes_read > REPLICATION_SNAPSHOT_INLINE_MAX_BYTES {
         return Err(KiteError::InvalidReplication(format!(
-          "snapshot size {} exceeds max inline payload {} bytes",
-          bytes_read, REPLICATION_SNAPSHOT_INLINE_MAX_BYTES
+          "snapshot size {bytes_read} exceeds max inline payload {REPLICATION_SNAPSHOT_INLINE_MAX_BYTES} bytes"
         )));
       }
       hasher.update(payload);
@@ -620,8 +637,7 @@ fn read_frame_header(
         return Ok(None);
       }
       return Err(KiteError::InvalidReplication(format!(
-        "replication frame truncated in segment {} at byte {}",
-        segment_id, frame_offset
+        "replication frame truncated in segment {segment_id} at byte {frame_offset}"
       )));
     }
     filled = filled.saturating_add(read);
@@ -638,8 +654,7 @@ fn parse_frame_header(
   let magic = le_u32(&header_bytes[0..4])?;
   if magic != REPLICATION_FRAME_MAGIC {
     return Err(KiteError::InvalidReplication(format!(
-      "invalid replication frame magic 0x{magic:08X} in segment {} at byte {}",
-      segment_id, frame_offset
+      "invalid replication frame magic 0x{magic:08X} in segment {segment_id} at byte {frame_offset}"
     )));
   }
 
@@ -654,16 +669,14 @@ fn parse_frame_header(
   let flags = le_u16(&header_bytes[6..8])?;
   if flags & !REPLICATION_FRAME_FLAG_CRC32_DISABLED != 0 {
     return Err(KiteError::InvalidReplication(format!(
-      "unsupported replication frame flags 0x{flags:04X} in segment {} at byte {}",
-      segment_id, frame_offset
+      "unsupported replication frame flags 0x{flags:04X} in segment {segment_id} at byte {frame_offset}"
     )));
   }
 
   let payload_len = le_u32(&header_bytes[24..28])? as usize;
   if payload_len > REPLICATION_MAX_FRAME_PAYLOAD_BYTES {
     return Err(KiteError::InvalidReplication(format!(
-      "frame payload exceeds limit: {}",
-      payload_len
+      "frame payload exceeds limit: {payload_len}"
     )));
   }
 
@@ -750,8 +763,7 @@ fn map_frame_payload_read_error(
 ) -> KiteError {
   if error.kind() == std::io::ErrorKind::UnexpectedEof {
     KiteError::InvalidReplication(format!(
-      "replication frame truncated in segment {} at byte {}",
-      segment_id, frame_offset
+      "replication frame truncated in segment {segment_id} at byte {frame_offset}"
     ))
   } else {
     KiteError::Io(error)
@@ -793,7 +805,7 @@ where
     let source_key = source.node_key(node_id);
     if replica.node_exists(node_id) {
       if replica.node_key(node_id) != source_key {
-        let _ = replica.delete_node(node_id)?;
+        replica.delete_node(node_id)?;
         replica.create_node_with_id(node_id, source_key.as_deref())?;
       }
     } else {
@@ -803,7 +815,7 @@ where
 
   for node_id in replica.list_nodes() {
     if !source_node_set.contains(&node_id) {
-      let _ = replica.delete_node(node_id)?;
+      replica.delete_node(node_id)?;
     }
   }
 
@@ -987,7 +999,7 @@ fn apply_wal_record_idempotent(db: &SingleFileDB, record: &ParsedWalRecord) -> R
         KiteError::InvalidReplication("invalid DeleteNode replication payload".to_string())
       })?;
       if db.node_exists(data.node_id) {
-        let _ = db.delete_node(data.node_id)?;
+        db.delete_node(data.node_id)?;
       }
       Ok(())
     }
@@ -1138,7 +1150,7 @@ fn apply_wal_record_idempotent(db: &SingleFileDB, record: &ParsedWalRecord) -> R
       })?;
 
       let current = db.node_vector(data.node_id, data.prop_key_id);
-      if current.as_deref().map(|v| v.as_ref()) != Some(data.vector.as_slice()) {
+      if current.as_deref() != Some(data.vector.as_slice()) {
         db.set_node_vector(data.node_id, data.prop_key_id, &data.vector)?;
       }
       Ok(())

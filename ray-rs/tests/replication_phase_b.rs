@@ -10,6 +10,7 @@ use kitedb::replication::types::ReplicationRole;
 const CRASH_BOUNDARY_CHILD_ENV: &str = "RAYDB_CRASH_BOUNDARY_CHILD";
 const CRASH_BOUNDARY_DB_PATH_ENV: &str = "RAYDB_CRASH_BOUNDARY_DB_PATH";
 const CRASH_BOUNDARY_TOKEN_PATH_ENV: &str = "RAYDB_CRASH_BOUNDARY_TOKEN_PATH";
+const CRASH_BEFORE_SIDECAR_CHILD_ENV: &str = "RAYDB_CRASH_BEFORE_SIDECAR_CHILD";
 
 #[test]
 fn crash_boundary_child_process_helper() {
@@ -38,6 +39,32 @@ fn crash_boundary_child_process_helper() {
     .expect("commit token");
   std::fs::write(&token_path, token.to_string()).expect("persist emitted token");
   std::process::abort();
+}
+
+#[test]
+fn crash_before_sidecar_child_process_helper() {
+  if env::var_os(CRASH_BEFORE_SIDECAR_CHILD_ENV).is_none() {
+    return;
+  }
+
+  let db_path =
+    std::path::PathBuf::from(env::var(CRASH_BOUNDARY_DB_PATH_ENV).expect("child db path env"));
+  let primary = open_single_file(
+    &db_path,
+    SingleFileOpenOptions::new()
+      .auto_checkpoint(false)
+      .replication_role(ReplicationRole::Primary)
+      .replication_crash_after_local_commit_for_testing(true),
+  )
+  .expect("open child primary");
+  primary.begin(false).expect("begin child tx");
+  primary
+    .create_node(Some("crash-before-sidecar"))
+    .expect("create crash-before-sidecar node");
+  let _ = primary
+    .commit_with_token()
+    .expect("local commit reaches crash hook");
+  panic!("crash hook must abort the child process");
 }
 
 #[test]
@@ -94,7 +121,7 @@ fn replication_disabled_mode_has_no_sidecar_activity() {
 }
 
 #[test]
-fn sidecar_append_failure_causes_commit_failure_without_token() {
+fn sidecar_append_failure_does_not_hide_durable_local_commit() {
   let dir = tempfile::tempdir().expect("tempdir");
   let db_path = dir.path().join("phase-b-failure.kitedb");
 
@@ -107,19 +134,100 @@ fn sidecar_append_failure_causes_commit_failure_without_token() {
   .expect("open db");
 
   db.begin(false).expect("begin");
-  db.create_node(Some("boom")).expect("create node");
-  let err = db.commit_with_token().expect_err("commit should fail");
+  let node_id = db.create_node(Some("boom")).expect("create node");
+  db.commit()
+    .expect("local commit must succeed despite sidecar failure");
   assert!(
-    err.to_string().contains("replication append"),
-    "unexpected error: {err}"
+    db.node_by_key("boom").is_some(),
+    "durably committed data must be visible immediately"
   );
+  assert!(db.node_exists(node_id));
 
   let status = db.primary_replication_status().expect("status");
   assert_eq!(status.head_log_index, 0);
   assert_eq!(status.append_failures, 1);
+  assert!(status
+    .last_replication_error
+    .as_deref()
+    .is_some_and(|error| error.contains("injected")));
+  assert!(status.sidecar_needs_repair);
   assert!(db.last_commit_token().is_none());
+  let prometheus = kitedb::metrics::collect_replication_metrics_prometheus_single_file(&db);
+  assert!(prometheus.contains("kitedb_replication_primary_sidecar_needs_repair 1"));
+  assert!(prometheus.contains("kitedb_replication_primary_last_replication_error_present 1"));
 
   close_single_file(db).expect("close db");
+
+  let reopened = open_single_file(
+    &db_path,
+    SingleFileOpenOptions::new()
+      .auto_checkpoint(false)
+      .replication_role(ReplicationRole::Primary),
+  )
+  .expect("reopen db after sidecar failure");
+  assert!(reopened.node_by_key("boom").is_some());
+  let reopened_status = reopened
+    .primary_replication_status()
+    .expect("reopened status");
+  assert!(reopened_status.sidecar_needs_repair);
+  assert!(reopened_status
+    .last_replication_error
+    .as_deref()
+    .is_some_and(|error| error.contains("injected")));
+
+  reopened.begin(false).expect("begin later local commit");
+  reopened
+    .create_node(Some("later-local-commit"))
+    .expect("create later node");
+  assert!(reopened
+    .commit_with_token()
+    .expect("later local commit must succeed")
+    .is_none());
+  assert!(reopened.node_by_key("later-local-commit").is_some());
+  let later_status = reopened.primary_replication_status().expect("later status");
+  assert_eq!(later_status.head_log_index, 0);
+  assert!(later_status.sidecar_needs_repair);
+  close_single_file(reopened).expect("close reopened db");
+}
+
+#[test]
+fn crash_between_local_commit_and_sidecar_append_marks_sidecar_stale_on_reopen() {
+  let dir = tempfile::tempdir().expect("tempdir");
+  let db_path = dir.path().join("phase-b-crash-before-sidecar.kitedb");
+
+  let status = std::process::Command::new(std::env::current_exe().expect("current test binary"))
+    .arg("--test-threads=1")
+    .arg("--exact")
+    .arg("crash_before_sidecar_child_process_helper")
+    .arg("--nocapture")
+    .env(CRASH_BEFORE_SIDECAR_CHILD_ENV, "1")
+    .env(CRASH_BOUNDARY_DB_PATH_ENV, db_path.as_os_str())
+    .status()
+    .expect("spawn crash-before-sidecar child");
+  assert!(
+    !status.success(),
+    "child helper should crash between local commit and sidecar append"
+  );
+
+  let reopened = open_single_file(
+    &db_path,
+    SingleFileOpenOptions::new()
+      .auto_checkpoint(false)
+      .replication_role(ReplicationRole::Primary),
+  )
+  .expect("reopen primary after crash");
+  assert!(reopened.node_by_key("crash-before-sidecar").is_some());
+  let status = reopened
+    .primary_replication_status()
+    .expect("reopened primary status");
+  assert_eq!(status.head_log_index, 0);
+  assert!(status.sidecar_needs_repair);
+  assert!(status
+    .last_replication_error
+    .as_deref()
+    .is_some_and(|error| error.contains("no matching replication sidecar frame")));
+
+  close_single_file(reopened).expect("close reopened primary");
 }
 
 #[test]

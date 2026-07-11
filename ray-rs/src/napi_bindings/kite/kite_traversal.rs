@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::api::kite::Kite as RustKite;
-use crate::api::traversal::{TraversalBuilder, TraversalDirection, TraversalStep, TraverseOptions};
+use crate::api::traversal::{TraversalBuilder, TraversalDirection, TraversalStep};
 use crate::types::{ETypeId, Edge, NodeId};
 
 use super::helpers::{
@@ -18,7 +18,8 @@ use super::helpers::{
   node_to_js, TraversalFilterItem,
 };
 use crate::napi_bindings::database::JsFullEdge;
-use crate::napi_bindings::traversal::{JsTraversalDirection, JsTraverseOptions};
+use crate::napi_bindings::traversal::JsTraverseOptions;
+use crate::napi_bindings::validation;
 
 // =============================================================================
 // Traversal Builder
@@ -168,21 +169,7 @@ impl KiteTraversal {
   ) -> Result<KiteTraversal> {
     let mut next = self.fork();
     let etype = next.resolve_etype(edge_type)?;
-    let opts = TraverseOptions {
-      max_depth: options.max_depth as usize,
-      min_depth: options.min_depth.unwrap_or(1) as usize,
-      direction: options
-        .direction
-        .map(|d| match d {
-          JsTraversalDirection::Out => TraversalDirection::Out,
-          JsTraversalDirection::In => TraversalDirection::In,
-          JsTraversalDirection::Both => TraversalDirection::Both,
-        })
-        .unwrap_or(TraversalDirection::Out),
-      unique: options.unique.unwrap_or(true),
-      where_edge: None,
-      where_node: None,
-    };
+    let opts = options.to_rust()?;
     next.steps = next.steps.push(TraversalStep::Traverse {
       etype,
       options: opts,
@@ -193,7 +180,11 @@ impl KiteTraversal {
   #[napi]
   pub fn take(&self, limit: i64) -> Result<KiteTraversal> {
     let mut next = self.fork();
-    next.limit = Some(limit as usize);
+    next.limit = Some(validation::non_negative_usize(
+      "limit",
+      limit,
+      validation::MAX_COUNT,
+    )?);
     Ok(next)
   }
 

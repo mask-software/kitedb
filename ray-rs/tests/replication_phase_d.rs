@@ -43,6 +43,25 @@ fn open_primary_with_sync(
   )
 }
 
+fn open_primary_multi_node_simulation(
+  path: &std::path::Path,
+  sidecar: &std::path::Path,
+  segment_max_bytes: u64,
+  retention_min_entries: u64,
+  sync_mode: SyncMode,
+) -> kitedb::Result<kitedb::core::single_file::SingleFileDB> {
+  open_single_file(
+    path,
+    SingleFileOpenOptions::new()
+      .sync_mode(sync_mode)
+      .replication_role(ReplicationRole::Primary)
+      .replication_sidecar_path(sidecar)
+      .replication_segment_max_bytes(segment_max_bytes)
+      .replication_retention_min_entries(retention_min_entries)
+      .danger_bypass_file_lock_for_multi_node_simulation(true),
+  )
+}
+
 fn open_replica(
   replica_path: &std::path::Path,
   source_db_path: &std::path::Path,
@@ -91,8 +110,11 @@ fn promotion_increments_epoch_and_fences_stale_primary_writes() {
   let db_path = dir.path().join("phase-d-promote.kitedb");
   let sidecar = dir.path().join("phase-d-promote.sidecar");
 
-  let primary_a = open_primary(&db_path, &sidecar, 256, 4).expect("open primary a");
-  let primary_b = open_primary(&db_path, &sidecar, 256, 4).expect("open primary b");
+  // Simulate independent machines sharing storage where advisory locks are ineffective.
+  let primary_a = open_primary_multi_node_simulation(&db_path, &sidecar, 256, 4, SyncMode::Full)
+    .expect("open primary a");
+  let primary_b = open_primary_multi_node_simulation(&db_path, &sidecar, 256, 4, SyncMode::Full)
+    .expect("open primary b");
 
   primary_a.begin(false).expect("begin a");
   primary_a.create_node(Some("a0")).expect("create a0");
@@ -133,10 +155,11 @@ fn promotion_fences_stale_primary_writes_in_normal_sync_mode() {
   let db_path = dir.path().join("phase-d-promote-normal-sync.kitedb");
   let sidecar = dir.path().join("phase-d-promote-normal-sync.sidecar");
 
-  let primary_a =
-    open_primary_with_sync(&db_path, &sidecar, 256, 4, SyncMode::Normal).expect("open primary a");
-  let primary_b =
-    open_primary_with_sync(&db_path, &sidecar, 256, 4, SyncMode::Normal).expect("open primary b");
+  // Simulate independent machines sharing storage where advisory locks are ineffective.
+  let primary_a = open_primary_multi_node_simulation(&db_path, &sidecar, 256, 4, SyncMode::Normal)
+    .expect("open primary a");
+  let primary_b = open_primary_multi_node_simulation(&db_path, &sidecar, 256, 4, SyncMode::Normal)
+    .expect("open primary b");
 
   primary_a.begin(false).expect("begin a");
   primary_a.create_node(Some("a0")).expect("create a0");
@@ -818,8 +841,15 @@ fn promotion_race_rejects_split_brain_writes() {
   let db_path = dir.path().join("phase-d-race.kitedb");
   let sidecar = dir.path().join("phase-d-race.sidecar");
 
-  let left = Arc::new(open_primary(&db_path, &sidecar, 128, 8).expect("open left"));
-  let right = Arc::new(open_primary(&db_path, &sidecar, 128, 8).expect("open right"));
+  // Simulate independent machines sharing storage where advisory locks are ineffective.
+  let left = Arc::new(
+    open_primary_multi_node_simulation(&db_path, &sidecar, 128, 8, SyncMode::Full)
+      .expect("open left"),
+  );
+  let right = Arc::new(
+    open_primary_multi_node_simulation(&db_path, &sidecar, 128, 8, SyncMode::Full)
+      .expect("open right"),
+  );
 
   let l = Arc::clone(&left);
   let h1 = std::thread::spawn(move || {

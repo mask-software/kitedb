@@ -294,8 +294,7 @@ impl ReplicaReplication {
       format!("replica needs reseed: {detail}")
     } else {
       format!(
-        "replica missing frames after {}:{} ({detail}); transient retry {attempts}/{}",
-        applied_epoch, expected_next_log, TRANSIENT_MISSING_RESEED_ATTEMPTS
+        "replica missing frames after {applied_epoch}:{expected_next_log} ({detail}); transient retry {attempts}/{TRANSIENT_MISSING_RESEED_ATTEMPTS}"
       )
     };
     next_state.last_error = Some(error_message.clone());

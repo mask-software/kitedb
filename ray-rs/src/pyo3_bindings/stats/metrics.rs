@@ -207,6 +207,10 @@ pub struct PrimaryReplicationMetrics {
   #[pyo3(get)]
   pub last_token: Option<String>,
   #[pyo3(get)]
+  pub last_replication_error: Option<String>,
+  #[pyo3(get)]
+  pub sidecar_needs_repair: bool,
+  #[pyo3(get)]
   pub append_attempts: i64,
   #[pyo3(get)]
   pub append_failures: i64,
@@ -236,6 +240,8 @@ impl From<core_metrics::PrimaryReplicationMetrics> for PrimaryReplicationMetrics
       min_replica_applied_log_index: metrics.min_replica_applied_log_index,
       sidecar_path: metrics.sidecar_path,
       last_token: metrics.last_token,
+      last_replication_error: metrics.last_replication_error,
+      sidecar_needs_repair: metrics.sidecar_needs_repair,
       append_attempts: metrics.append_attempts,
       append_failures: metrics.append_failures,
       append_successes: metrics.append_successes,

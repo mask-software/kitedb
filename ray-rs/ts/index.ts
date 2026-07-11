@@ -165,6 +165,37 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
 }
 
+/**
+ * Roll back only an owned transaction that is still active. Native commit
+ * failures can consume the transaction before throwing; a second rollback in
+ * that state must never replace the original error.
+ */
+function rollbackIfActive(
+  db: { hasTransaction(): boolean; rollback(): void },
+  ownsTransaction: boolean,
+): void {
+  if (!ownsTransaction) {
+    return
+  }
+
+  let active = false
+  try {
+    active = db.hasTransaction()
+  } catch {
+    // Preserve the original failure if transaction-state inspection fails.
+    return
+  }
+  if (!active) {
+    return
+  }
+
+  try {
+    db.rollback()
+  } catch {
+    // Rollback is cleanup. Its secondary failure must not mask the original.
+  }
+}
+
 function nodeName(nodeType: NodeLike): string {
   return typeof nodeType === 'string' ? nodeType : nodeType.name
 }
@@ -545,11 +576,16 @@ export class Kite extends NativeKite {
       if (result && typeof (result as Promise<T>).then === 'function') {
         return (result as Promise<T>).then(
           (value) => {
-            this.commit()
+            try {
+              this.commit()
+            } catch (err) {
+              rollbackIfActive(this, true)
+              throw err
+            }
             return value
           },
           (err) => {
-            this.rollback()
+            rollbackIfActive(this, true)
             throw err
           },
         )
@@ -557,7 +593,7 @@ export class Kite extends NativeKite {
       this.commit()
       return result
     } catch (err) {
-      this.rollback()
+      rollbackIfActive(this, true)
       throw err
     }
   }
@@ -614,10 +650,9 @@ export class Kite extends NativeKite {
         }
 
         if (value && typeof (value as { then?: unknown }).then === 'function') {
-          if (!inTransaction) {
-            this.rollback()
-          }
-          throw new Error('Batch operations must be synchronous')
+          const error = new Error('Batch operations must be synchronous')
+          rollbackIfActive(this, !inTransaction)
+          throw error
         }
 
         results.push(value)
@@ -629,9 +664,7 @@ export class Kite extends NativeKite {
 
       return results
     } catch (err) {
-      if (!inTransaction) {
-        this.rollback()
-      }
+      rollbackIfActive(this, !inTransaction)
       throw err
     }
   }
@@ -1001,7 +1034,7 @@ export function bulkWrite<T>(
       }
       db.commit()
     } catch (err) {
-      db.rollback()
+      rollbackIfActive(db, true)
       throw err
     }
 

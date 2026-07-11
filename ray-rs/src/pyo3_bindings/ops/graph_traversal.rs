@@ -23,9 +23,9 @@ pub trait GraphTraversalOps {
   fn traverse_impl(
     &self,
     node_id: i64,
-    max_depth: u32,
+    max_depth: usize,
     etype: Option<u32>,
-    min_depth: Option<u32>,
+    min_depth: Option<usize>,
     direction: Option<String>,
     unique: Option<bool>,
   ) -> PyResult<Vec<TraversalResult>>;
@@ -35,7 +35,7 @@ pub trait GraphTraversalOps {
     source: i64,
     target: i64,
     etype: Option<u32>,
-    max_depth: Option<u32>,
+    max_depth: Option<usize>,
     direction: Option<String>,
   ) -> PyResult<PyPathResult>;
   /// Find shortest path using Dijkstra
@@ -44,7 +44,7 @@ pub trait GraphTraversalOps {
     source: i64,
     target: i64,
     etype: Option<u32>,
-    max_depth: Option<u32>,
+    max_depth: Option<usize>,
     direction: Option<String>,
   ) -> PyResult<PyPathResult>;
 }
@@ -260,9 +260,9 @@ pub fn traverse_multi_count_single(
 pub fn traverse_single(
   db: &RustSingleFileDB,
   node_id: NodeId,
-  max_depth: u32,
+  max_depth: usize,
   etype: Option<u32>,
-  min_depth: Option<u32>,
+  min_depth: Option<usize>,
   direction: Option<String>,
   unique: Option<bool>,
 ) -> Vec<TraversalResult> {
@@ -274,8 +274,8 @@ pub fn traverse_single(
 
   let opts = TraverseOptions {
     direction: dir,
-    min_depth: min_depth.unwrap_or(1) as usize,
-    max_depth: max_depth as usize,
+    min_depth: min_depth.unwrap_or(1),
+    max_depth,
     unique: unique.unwrap_or(true),
     where_edge: None,
     where_node: None,
@@ -309,7 +309,7 @@ pub fn find_path_bfs_single(
   source: NodeId,
   target: NodeId,
   etype: Option<u32>,
-  max_depth: Option<u32>,
+  max_depth: Option<usize>,
   direction: Option<String>,
 ) -> PyPathResult {
   let dir = match direction.as_deref() {
@@ -331,7 +331,7 @@ pub fn find_path_bfs_single(
     targets,
     allowed_etypes,
     direction: dir,
-    max_depth: max_depth.unwrap_or(100) as usize,
+    max_depth: max_depth.unwrap_or(100),
   };
 
   let neighbors = |nid: NodeId, d: TraversalDirection, et: Option<ETypeId>| -> Vec<Edge> {
@@ -346,7 +346,7 @@ pub fn find_path_dijkstra_single(
   source: NodeId,
   target: NodeId,
   etype: Option<u32>,
-  max_depth: Option<u32>,
+  max_depth: Option<usize>,
   direction: Option<String>,
 ) -> PyPathResult {
   let dir = match direction.as_deref() {
@@ -368,7 +368,7 @@ pub fn find_path_dijkstra_single(
     targets,
     allowed_etypes,
     direction: dir,
-    max_depth: max_depth.unwrap_or(100) as usize,
+    max_depth: max_depth.unwrap_or(100),
   };
 
   let neighbors = |nid: NodeId, d: TraversalDirection, et: Option<ETypeId>| -> Vec<Edge> {

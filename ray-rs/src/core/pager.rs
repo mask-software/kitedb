@@ -3,10 +3,11 @@
 //! Provides page-level read/write, mmap support, and area management.
 //! Ported from src/core/pager.ts
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use crate::util::mmap::{map_file, Mmap};
 
@@ -15,12 +16,161 @@ use crate::constants::{
 };
 use crate::error::{KiteError, Result};
 
+static DATABASE_FILE_LOCKS: OnceLock<Mutex<HashMap<PathBuf, InProcessLockState>>> = OnceLock::new();
+const WRITABLE_OPEN_MAX_ATTEMPTS: usize = 4;
+
+#[derive(Clone, Copy)]
+enum FileLockMode {
+  Shared,
+  Exclusive,
+}
+
+#[derive(Default)]
+struct InProcessLockState {
+  readers: usize,
+  writer: bool,
+}
+
+struct DatabaseFileLock {
+  path: PathBuf,
+  mode: FileLockMode,
+}
+
+impl DatabaseFileLock {
+  fn acquire(path: &Path, mode: FileLockMode) -> Result<Self> {
+    let path = normalize_lock_path(path)?;
+    let registry = DATABASE_FILE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut registry = registry
+      .lock()
+      .map_err(|_| KiteError::LockFailed("database file lock registry poisoned".to_string()))?;
+    let state = registry.entry(path.clone()).or_default();
+
+    let conflict = match mode {
+      FileLockMode::Shared => state.writer,
+      FileLockMode::Exclusive => state.writer || state.readers != 0,
+    };
+    if conflict {
+      return Err(KiteError::LockFailed(format!(
+        "database file is already open in this process: {}",
+        path.display()
+      )));
+    }
+
+    match mode {
+      FileLockMode::Shared => state.readers += 1,
+      FileLockMode::Exclusive => state.writer = true,
+    }
+
+    Ok(Self { path, mode })
+  }
+}
+
+impl Drop for DatabaseFileLock {
+  fn drop(&mut self) {
+    let Some(registry) = DATABASE_FILE_LOCKS.get() else {
+      return;
+    };
+    let Ok(mut registry) = registry.lock() else {
+      return;
+    };
+    let Some(state) = registry.get_mut(&self.path) else {
+      return;
+    };
+
+    match self.mode {
+      FileLockMode::Shared => state.readers = state.readers.saturating_sub(1),
+      FileLockMode::Exclusive => state.writer = false,
+    }
+    if state.readers == 0 && !state.writer {
+      registry.remove(&self.path);
+    }
+  }
+}
+
+fn normalize_lock_path(path: &Path) -> Result<PathBuf> {
+  if path.exists() {
+    return Ok(std::fs::canonicalize(path)?);
+  }
+
+  let parent = path
+    .parent()
+    .filter(|parent| !parent.as_os_str().is_empty());
+  let parent = std::fs::canonicalize(parent.unwrap_or_else(|| Path::new(".")))?;
+  let file_name = path.file_name().ok_or_else(|| {
+    KiteError::InvalidPath(format!(
+      "database path has no file name: {}",
+      path.display()
+    ))
+  })?;
+  Ok(parent.join(file_name))
+}
+
+fn try_lock_file(file: &File, path: &Path, mode: FileLockMode) -> Result<()> {
+  #[cfg(not(target_arch = "wasm32"))]
+  {
+    let result = match mode {
+      FileLockMode::Shared => fs2::FileExt::try_lock_shared(file),
+      FileLockMode::Exclusive => fs2::FileExt::try_lock_exclusive(file),
+    };
+    result.map_err(|error| {
+      KiteError::LockFailed(format!(
+        "database file is locked by another process: {} ({error})",
+        path.display()
+      ))
+    })?;
+  }
+
+  #[cfg(target_arch = "wasm32")]
+  let _ = (file, path, mode);
+
+  Ok(())
+}
+
+#[cfg(unix)]
+fn locked_file_matches_path(file: &File, path: &Path) -> Result<bool> {
+  use std::os::unix::fs::MetadataExt;
+
+  let locked = file.metadata()?;
+  let current = std::fs::metadata(path)?;
+  Ok(locked.dev() == current.dev() && locked.ino() == current.ino())
+}
+
+#[cfg(windows)]
+fn locked_file_matches_path(file: &File, path: &Path) -> Result<bool> {
+  use std::os::windows::fs::MetadataExt;
+
+  let locked = file.metadata()?;
+  let current = std::fs::metadata(path)?;
+  Ok(
+    match (
+      locked.volume_serial_number(),
+      locked.file_index(),
+      current.volume_serial_number(),
+      current.file_index(),
+    ) {
+      (Some(locked_volume), Some(locked_index), Some(current_volume), Some(current_index)) => {
+        locked_volume == current_volume && locked_index == current_index
+      }
+      _ => false,
+    },
+  )
+}
+
+#[cfg(not(any(unix, windows)))]
+fn locked_file_matches_path(_file: &File, _path: &Path) -> Result<bool> {
+  // Stable std APIs expose no portable file identity on this platform. Keep
+  // its existing lock behavior rather than introducing unsafe platform code.
+  Ok(true)
+}
+
 /// FilePager implementation for single-file database
 pub struct FilePager {
   file: File,
+  file_lock: Option<DatabaseFileLock>,
   file_path: PathBuf,
   page_size: usize,
   file_size: u64,
+  read_only: bool,
   free_pages: HashSet<u32>,
   /// Cached mmap for the entire file (lazily created)
   mmap: Option<Mmap>,
@@ -29,12 +179,24 @@ pub struct FilePager {
 impl FilePager {
   /// Create a new FilePager from an open file
   pub fn new(file: File, file_path: PathBuf, page_size: usize) -> Result<Self> {
+    Self::new_locked(file, None, file_path, page_size, false)
+  }
+
+  fn new_locked(
+    file: File,
+    file_lock: Option<DatabaseFileLock>,
+    file_path: PathBuf,
+    page_size: usize,
+    read_only: bool,
+  ) -> Result<Self> {
     let file_size = file.metadata()?.len();
     Ok(Self {
       file,
+      file_lock,
       file_path,
       page_size,
       file_size,
+      read_only,
       free_pages: HashSet::new(),
       mmap: None,
     })
@@ -44,9 +206,11 @@ impl FilePager {
   pub fn with_size(file: File, file_path: PathBuf, page_size: usize, file_size: u64) -> Self {
     Self {
       file,
+      file_lock: None,
       file_path,
       page_size,
       file_size,
+      read_only: false,
       free_pages: HashSet::new(),
       mmap: None,
     }
@@ -101,6 +265,9 @@ impl FilePager {
 
   /// Write a single page by page number
   pub fn write_page(&mut self, page_num: u32, data: &[u8]) -> Result<()> {
+    if self.read_only {
+      return Err(KiteError::ReadOnly);
+    }
     if data.len() != self.page_size {
       return Err(KiteError::Internal(format!(
         "Page data must be exactly {} bytes, got {}",
@@ -115,6 +282,7 @@ impl FilePager {
         "Cannot write to lock byte page range (page {page_num})"
       )));
     }
+    self.ensure_no_live_mmap()?;
 
     let offset = page_num as u64 * self.page_size as u64;
 
@@ -128,14 +296,13 @@ impl FilePager {
     self.file.seek(SeekFrom::Start(offset))?;
     self.file.write_all(data)?;
 
-    // Invalidate mmap cache since file contents changed
-    self.invalidate_mmap_cache();
-
     Ok(())
   }
 
-  /// Memory-map the entire file (for snapshot access)
-  /// Returns a view into mmap'd memory
+  /// Memory-map the entire file for read-only pager tests and tooling.
+  ///
+  /// The pager rejects all writes, extension, relocation, and truncation while
+  /// this mapping is cached. Call `release_mmap` before mutating the file.
   pub fn mmap_file(&mut self) -> Result<&Mmap> {
     if let Some(mmap) = self.mmap.as_ref() {
       let file_len = self.file.metadata()?.len() as usize;
@@ -146,8 +313,7 @@ impl FilePager {
     }
 
     if self.mmap.is_none() {
-      // SAFETY: The file must not be mutated while this mapping is live.
-      // We invalidate the mmap cache on any write path.
+      // SAFETY: FilePager rejects every mutation while this mapping is live.
       let mmap = map_file(&self.file)?;
       self.mmap = Some(mmap);
     }
@@ -184,14 +350,23 @@ impl FilePager {
     Ok(&mmap[start_offset..start_offset + length])
   }
 
+  /// Release the cached full-file mapping after all borrowed slices are gone.
+  pub fn release_mmap(&mut self) {
+    self.mmap = None;
+  }
+
   /// Allocate new pages at end of file
   /// Returns the starting page number of the allocated range
   pub fn allocate_pages(&mut self, count: u32) -> Result<u32> {
+    if self.read_only {
+      return Err(KiteError::ReadOnly);
+    }
     if count == 0 {
       return Err(KiteError::Internal(
         "Must allocate at least 1 page".to_string(),
       ));
     }
+    self.ensure_no_live_mmap()?;
 
     // Calculate current page count
     let current_page_count = self.file_size.div_ceil(self.page_size as u64) as u32;
@@ -211,9 +386,6 @@ impl FilePager {
     self.file.set_len(new_size)?;
     self.file_size = new_size;
 
-    // Invalidate mmap cache
-    self.invalidate_mmap_cache();
-
     Ok(start_page)
   }
 
@@ -225,6 +397,43 @@ impl FilePager {
     }
   }
 
+  /// Find a contiguous free range without consuming it.
+  pub(crate) fn find_free_range(&self, count: u32) -> Option<u32> {
+    if count == 0 {
+      return None;
+    }
+    let mut pages: Vec<u32> = self.free_pages.iter().copied().collect();
+    pages.sort_unstable();
+
+    let mut run_start = None;
+    let mut previous = 0u32;
+    let mut run_len = 0u32;
+    for page in pages {
+      if run_start.is_some() && page == previous.saturating_add(1) {
+        run_len += 1;
+      } else {
+        run_start = Some(page);
+        run_len = 1;
+      }
+      if run_len >= count {
+        return run_start;
+      }
+      previous = page;
+    }
+    None
+  }
+
+  /// Consume a range previously returned by `find_free_range`.
+  pub(crate) fn consume_free_range(&mut self, start_page: u32, count: u32) {
+    for page in start_page..start_page.saturating_add(count) {
+      self.free_pages.remove(&page);
+    }
+  }
+
+  pub(crate) fn is_range_free(&self, start_page: u32, end_page: u32) -> bool {
+    (start_page..end_page).all(|page| self.free_pages.contains(&page))
+  }
+
   /// Get count of free pages
   pub fn free_page_count(&self) -> usize {
     self.free_pages.len()
@@ -232,15 +441,22 @@ impl FilePager {
 
   /// Truncate file to the given number of pages
   pub fn truncate_pages(&mut self, page_count: u32) -> Result<()> {
+    if self.read_only {
+      return Err(KiteError::ReadOnly);
+    }
+    self.ensure_no_live_mmap()?;
     let new_size = page_count as u64 * self.page_size as u64;
     self.file.set_len(new_size)?;
     self.file_size = new_size;
-    self.invalidate_mmap_cache();
+    self.free_pages.retain(|page| *page < page_count);
     Ok(())
   }
 
   /// Sync file to disk
   pub fn sync(&self) -> Result<()> {
+    if self.read_only {
+      return Ok(());
+    }
     #[cfg(target_os = "macos")]
     {
       use std::os::unix::io::AsRawFd;
@@ -261,6 +477,10 @@ impl FilePager {
   /// Relocate an area to a new location (for growth/compaction)
   /// This is an expensive operation that copies data page by page
   pub fn relocate_area(&mut self, src_page: u32, page_count: u32, dst_page: u32) -> Result<()> {
+    if self.read_only {
+      return Err(KiteError::ReadOnly);
+    }
+    self.ensure_no_live_mmap()?;
     if src_page == dst_page {
       return Ok(());
     }
@@ -328,15 +548,17 @@ impl FilePager {
     // Mark old pages as free
     self.free_pages(src_page, page_count);
 
-    // Invalidate mmap cache
-    self.invalidate_mmap_cache();
-
     Ok(())
   }
 
-  /// Invalidate mmap cache
-  fn invalidate_mmap_cache(&mut self) {
-    self.mmap = None;
+  fn ensure_no_live_mmap(&self) -> Result<()> {
+    if self.mmap.is_some() {
+      return Err(KiteError::Internal(
+        "cannot mutate file while a pager mmap is live; call release_mmap after readers drop"
+          .to_string(),
+      ));
+    }
+    Ok(())
   }
 
   /// Get a reference to the underlying file
@@ -350,30 +572,140 @@ impl FilePager {
   }
 }
 
+impl Drop for FilePager {
+  fn drop(&mut self) {
+    #[cfg(not(target_arch = "wasm32"))]
+    if self.file_lock.is_some() {
+      let _ = fs2::FileExt::unlock(&self.file);
+    }
+  }
+}
+
 // ============================================================================
 // Factory functions
 // ============================================================================
 
-/// Open a pager for an existing file
-pub fn open_pager<P: AsRef<Path>>(file_path: P, page_size: usize) -> Result<FilePager> {
-  let file = OpenOptions::new().read(true).write(true).open(&file_path)?;
-  FilePager::new(file, file_path.as_ref().to_path_buf(), page_size)
+/// Open a pager for an existing file and hold its process lock for the pager lifetime.
+pub fn open_pager<P: AsRef<Path>>(
+  file_path: P,
+  page_size: usize,
+  read_only: bool,
+) -> Result<FilePager> {
+  open_pager_with_locking(file_path, page_size, read_only, true)
+}
+
+pub(crate) fn open_pager_with_locking<P: AsRef<Path>>(
+  file_path: P,
+  page_size: usize,
+  read_only: bool,
+  lock_file: bool,
+) -> Result<FilePager> {
+  let file_path = file_path.as_ref();
+  let mode = if read_only {
+    FileLockMode::Shared
+  } else {
+    FileLockMode::Exclusive
+  };
+  let attempts = if lock_file && !read_only {
+    WRITABLE_OPEN_MAX_ATTEMPTS
+  } else {
+    1
+  };
+  for attempt in 0..attempts {
+    let file_lock = if lock_file {
+      Some(DatabaseFileLock::acquire(file_path, mode)?)
+    } else {
+      None
+    };
+    let file = OpenOptions::new()
+      .read(true)
+      .write(!read_only)
+      .open(file_path)?;
+    if lock_file {
+      try_lock_file(&file, file_path, mode)?;
+    }
+    // A concurrent legacy migration can rename a replacement over the path
+    // between open and lock. Never trust the now-unlinked, stale descriptor.
+    if lock_file && !read_only && !locked_file_matches_path(&file, file_path)? {
+      drop(file);
+      drop(file_lock);
+      if attempt + 1 == attempts {
+        break;
+      }
+      continue;
+    }
+    return FilePager::new_locked(
+      file,
+      file_lock,
+      file_path.to_path_buf(),
+      page_size,
+      read_only,
+    );
+  }
+  Err(KiteError::LockFailed(format!(
+    "database path changed while acquiring its lock after {attempts} attempts: {}",
+    file_path.display()
+  )))
 }
 
 /// Create a new pager for a new file
 pub fn create_pager<P: AsRef<Path>>(file_path: P, page_size: usize) -> Result<FilePager> {
-  let file = OpenOptions::new()
-    .read(true)
-    .write(true)
-    .create(true)
-    .truncate(true)
-    .open(&file_path)?;
-  Ok(FilePager::with_size(
-    file,
-    file_path.as_ref().to_path_buf(),
-    page_size,
-    0,
-  ))
+  create_pager_with_locking(file_path, page_size, true)
+}
+
+pub(crate) fn create_pager_with_locking<P: AsRef<Path>>(
+  file_path: P,
+  page_size: usize,
+  lock_file: bool,
+) -> Result<FilePager> {
+  let file_path = file_path.as_ref();
+  let attempts = if lock_file {
+    WRITABLE_OPEN_MAX_ATTEMPTS
+  } else {
+    1
+  };
+  for attempt in 0..attempts {
+    let file_lock = if lock_file {
+      Some(DatabaseFileLock::acquire(
+        file_path,
+        FileLockMode::Exclusive,
+      )?)
+    } else {
+      None
+    };
+    let file = OpenOptions::new()
+      .read(true)
+      .write(true)
+      .create(true)
+      .truncate(false)
+      .open(file_path)?;
+    if lock_file {
+      try_lock_file(&file, file_path, FileLockMode::Exclusive)?;
+    }
+    if lock_file && !locked_file_matches_path(&file, file_path)? {
+      drop(file);
+      drop(file_lock);
+      if attempt + 1 == attempts {
+        break;
+      }
+      continue;
+    }
+    file.set_len(0)?;
+    return Ok(FilePager {
+      file,
+      file_lock,
+      file_path: file_path.to_path_buf(),
+      page_size,
+      file_size: 0,
+      read_only: false,
+      free_pages: HashSet::new(),
+      mmap: None,
+    });
+  }
+  Err(KiteError::LockFailed(format!(
+    "database path changed while acquiring its lock after {attempts} attempts: {}",
+    file_path.display()
+  )))
 }
 
 /// Validate that a page size is valid (power of 2, within bounds)
@@ -490,6 +822,26 @@ mod tests {
   }
 
   #[test]
+  fn test_mmap_rejects_mutation_until_released() {
+    let temp_file = NamedTempFile::new().expect("expected value");
+    let mut pager = create_pager(temp_file.path(), 4096).expect("expected value");
+    pager
+      .write_page(0, &vec![0x11; 4096])
+      .expect("expected value");
+    pager.sync().expect("expected value");
+
+    {
+      let mmap = pager.mmap_file().expect("expected value");
+      assert_eq!(mmap[0], 0x11);
+    }
+    assert!(pager.write_page(1, &vec![0x22; 4096]).is_err());
+    pager.release_mmap();
+    pager
+      .write_page(1, &vec![0x22; 4096])
+      .expect("expected value");
+  }
+
+  #[test]
   fn test_write_extends_file() {
     let temp_file = NamedTempFile::new().expect("expected value");
     let mut pager = create_pager(temp_file.path(), 4096).expect("expected value");
@@ -514,5 +866,26 @@ mod tests {
 
     let large_data = vec![0u8; 8192];
     assert!(pager.write_page(0, &large_data).is_err());
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn locked_file_identity_detects_rename_over_path() {
+    let temp_dir = tempfile::tempdir().expect("expected temp directory");
+    let database_path = temp_dir.path().join("database.kite");
+    let replacement_path = temp_dir.path().join("replacement.kite");
+    std::fs::write(&database_path, b"original").expect("expected original file");
+    std::fs::write(&replacement_path, b"replacement").expect("expected replacement file");
+
+    let stale_file = File::open(&database_path).expect("expected stale file descriptor");
+    std::fs::rename(&replacement_path, &database_path).expect("expected atomic replacement");
+
+    assert!(
+      !locked_file_matches_path(&stale_file, &database_path).expect("expected identity check")
+    );
+    let current_file = File::open(&database_path).expect("expected current file descriptor");
+    assert!(
+      locked_file_matches_path(&current_file, &database_path).expect("expected identity check")
+    );
   }
 }

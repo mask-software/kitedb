@@ -61,7 +61,7 @@ test('resizeWal updates WAL size for existing db', (t) => {
   db.close()
 
   const reopened = Database.open(dbPath, { walSize: 1024 * 1024 })
-  t.truthy(reopened.getNodeByKey('a'))
+  t.truthy(reopened.get_node_by_key('a'))
   reopened.close()
 })
 
@@ -78,7 +78,7 @@ test('db-backed traversal APIs', (t) => {
   const b = db.createNode('b')
   const c = db.createNode('c')
 
-  const knows = db.getOrCreateEtype('knows')
+  const knows = db.get_or_create_etype('knows')
   db.addEdge(a, knows, b)
   db.addEdge(b, knows, c)
   db.commit()
@@ -114,8 +114,8 @@ test('db-backed upsertNode', (t) => {
   const db = Database.open(makeDbPath())
 
   db.begin()
-  const nameKey = db.getOrCreatePropkey('name')
-  const ageKey = db.getOrCreatePropkey('age')
+  const nameKey = db.get_or_create_propkey('name')
+  const ageKey = db.get_or_create_propkey('age')
   const nodeId = db.upsertNode('user:alice', [
     {
       keyId: nameKey,
@@ -124,7 +124,7 @@ test('db-backed upsertNode', (t) => {
   ])
   db.commit()
 
-  t.is(db.getNodeByKey('user:alice'), nodeId)
+  t.is(db.get_node_by_key('user:alice'), nodeId)
 
   db.begin()
   const sameId = db.upsertNode('user:alice', [
@@ -141,7 +141,7 @@ test('db-backed upsertNode', (t) => {
 
   t.is(sameId, nodeId)
 
-  const props = db.getNodeProps(nodeId) ?? []
+  const props = db.get_node_props(nodeId) ?? []
   const propsByKey = new Map(props.map((p) => [p.keyId, p.value]))
   t.is(propsByKey.get(ageKey)?.intValue, 30)
   t.true(!propsByKey.has(nameKey))
@@ -153,8 +153,8 @@ test('db-backed upsertNodeById', (t) => {
   const db = Database.open(makeDbPath())
 
   db.begin()
-  const nameKey = db.getOrCreatePropkey('name')
-  const ageKey = db.getOrCreatePropkey('age')
+  const nameKey = db.get_or_create_propkey('name')
+  const ageKey = db.get_or_create_propkey('age')
   const nodeId = 42
   const createdId = db.upsertNodeById(nodeId, [
     {
@@ -182,7 +182,7 @@ test('db-backed upsertNodeById', (t) => {
 
   t.is(updatedId, nodeId)
 
-  const props = db.getNodeProps(nodeId) ?? []
+  const props = db.get_node_props(nodeId) ?? []
   const propsByKey = new Map(props.map((p) => [p.keyId, p.value]))
   t.is(propsByKey.get(ageKey)?.intValue, 31)
   t.true(!propsByKey.has(nameKey))
@@ -196,8 +196,8 @@ test('db-backed upsertEdge', (t) => {
   db.begin()
   const a = db.createNode('a')
   const b = db.createNode('b')
-  const knows = db.getOrCreateEtype('knows')
-  const weightKey = db.getOrCreatePropkey('weight')
+  const knows = db.get_or_create_etype('knows')
+  const weightKey = db.get_or_create_propkey('weight')
   const created = db.upsertEdge(a, knows, b, [
     {
       keyId: weightKey,
@@ -207,7 +207,7 @@ test('db-backed upsertEdge', (t) => {
   db.commit()
 
   t.true(created)
-  const props = db.getEdgeProps(a, knows, b) ?? []
+  const props = db.get_edge_props(a, knows, b) ?? []
   const propsByKey = new Map(props.map((p) => [p.keyId, p.value]))
   t.is(propsByKey.get(weightKey)?.intValue, 10)
 
@@ -221,7 +221,7 @@ test('db-backed upsertEdge', (t) => {
   db.commit()
 
   t.false(updated)
-  const updatedProps = db.getEdgeProps(a, knows, b) ?? []
+  const updatedProps = db.get_edge_props(a, knows, b) ?? []
   const updatedByKey = new Map(updatedProps.map((p) => [p.keyId, p.value]))
   t.true(!updatedByKey.has(weightKey))
 
@@ -236,7 +236,7 @@ test('db-backed pathfinding APIs', (t) => {
   const b = db.createNode('b')
   const c = db.createNode('c')
 
-  const knows = db.getOrCreateEtype('knows')
+  const knows = db.get_or_create_etype('knows')
   db.addEdge(a, knows, b)
   db.addEdge(b, knows, c)
   db.commit()
@@ -267,8 +267,8 @@ test('weighted dijkstra uses edge property', (t) => {
   const b = db.createNode('b')
   const c = db.createNode('c')
 
-  const knows = db.getOrCreateEtype('knows')
-  const weightKey = db.getOrCreatePropkey('weight')
+  const knows = db.get_or_create_etype('knows')
+  const weightKey = db.get_or_create_propkey('weight')
 
   db.addEdge(a, knows, b)
   db.addEdge(a, knows, c)

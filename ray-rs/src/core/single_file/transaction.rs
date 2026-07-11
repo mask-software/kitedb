@@ -1,6 +1,13 @@
 //! Transaction management for SingleFileDB
 //!
 //! Handles begin, commit, and rollback operations.
+//!
+//! Commit ordering is:
+//! `WAL COMMIT -> WAL flush -> durable header -> delta / vector / bookkeeping
+//! merge -> sidecar attempt`. The sidecar attempt is deliberately
+//! non-authoritative after the local durability boundary: an error records
+//! primary replication lag and fences future sidecar appends, while this
+//! commit still completes locally and returns success.
 
 use crate::core::wal::record::{
   build_begin_payload, build_commit_payload, build_rollback_payload, WalRecord,
@@ -20,6 +27,44 @@ use std::time::Instant;
 
 use super::open::SyncMode;
 use super::{SingleFileDB, SingleFileTxState};
+
+struct ActiveTransactionGuard<'db> {
+  db: &'db SingleFileDB,
+}
+
+impl Drop for ActiveTransactionGuard<'_> {
+  fn drop(&mut self) {
+    self.db.transaction_finished();
+  }
+}
+
+struct SchemaReservationGuard<'db> {
+  db: &'db SingleFileDB,
+  txid: TxId,
+  active: bool,
+}
+
+impl<'db> SchemaReservationGuard<'db> {
+  fn new(db: &'db SingleFileDB, txid: TxId) -> Self {
+    Self {
+      db,
+      txid,
+      active: true,
+    }
+  }
+
+  fn disarm(&mut self) {
+    self.active = false;
+  }
+}
+
+impl Drop for SchemaReservationGuard<'_> {
+  fn drop(&mut self) {
+    if self.active {
+      self.db.release_schema_reservations(self.txid);
+    }
+  }
+}
 
 /// RAII transaction guard for SingleFileDB.
 /// Rolls back the transaction on drop unless committed or rolled back.
@@ -82,6 +127,10 @@ impl SingleFileDB {
       ));
     }
 
+    // A blocking checkpoint takes the write side. Holding this read permit
+    // through insertion makes the gate atomic with transaction creation.
+    let _checkpoint_gate = self.checkpoint_gate.read();
+
     let tid = std::thread::current().id();
     {
       let current_tx = self.current_tx.lock();
@@ -119,6 +168,7 @@ impl SingleFileDB {
     )));
 
     self.current_tx.lock().insert(tid, tx_state);
+    self.active_transactions.fetch_add(1, Ordering::Release);
     if !read_only {
       self.active_writers.fetch_add(1, Ordering::SeqCst);
     }
@@ -373,18 +423,32 @@ impl SingleFileDB {
 
   /// Commit the current transaction and return replication commit token if enabled.
   pub fn commit_with_token(&self) -> Result<Option<CommitToken>> {
+    if self.read_only && self.current_tx_handle().is_none() {
+      return Err(KiteError::ReadOnly);
+    }
+
     let tx_handle = {
       let tid = std::thread::current().id();
       let mut current_tx = self.current_tx.lock();
       current_tx.remove(&tid).ok_or(KiteError::NoTransaction)?
     };
 
-    let (txid, read_only, bulk_load, pending, pending_wal) = {
+    let (txid, read_only, bulk_load, pending, pending_wal, staged_schema) = {
       let mut tx = tx_handle.lock();
       let pending = std::mem::take(&mut tx.pending);
+      let staged_schema = std::mem::take(&mut tx.schema);
       let pending_wal = std::mem::take(&mut tx.pending_wal);
-      (tx.txid, tx.read_only, tx.bulk_load, pending, pending_wal)
+      (
+        tx.txid,
+        tx.read_only,
+        tx.bulk_load,
+        pending,
+        pending_wal,
+        staged_schema,
+      )
     };
+    let active_transaction_guard = ActiveTransactionGuard { db: self };
+    let mut schema_reservation_guard = SchemaReservationGuard::new(self, txid);
 
     if read_only {
       // Read-only transactions don't need WAL
@@ -396,6 +460,13 @@ impl SingleFileDB {
     }
     let prev_writers = self.active_writers.fetch_sub(1, Ordering::SeqCst);
     debug_assert!(prev_writers > 0, "active_writers underflow in commit");
+
+    // Fencing must happen before MVCC marks the transaction committed or the
+    // local WAL gets a COMMIT record. A repair fence is deliberately allowed
+    // through; it affects only replication, not local commit authority.
+    if let Some(replication) = self.primary_replication.as_ref() {
+      replication.ensure_local_commit_allowed()?;
+    }
 
     let mut commit_ts_for_mvcc = None;
     if let Some(mvcc) = self.mvcc.as_ref() {
@@ -420,17 +491,19 @@ impl SingleFileDB {
     let mut group_commit_seq = 0u64;
     let mut commit_token = None;
 
-    {
-      // Serialize commit to preserve WAL ordering without holding the delta lock during I/O.
-      #[cfg(feature = "bench-profile")]
-      let commit_lock_start = Instant::now();
-      let _commit_guard = self.commit_lock.lock();
-      #[cfg(feature = "bench-profile")]
-      self.commit_lock_wait_ns.fetch_add(
-        commit_lock_start.elapsed().as_nanos() as u64,
-        Ordering::Relaxed,
-      );
+    // Serialize the WAL and delta portions together. The checkpoint cut uses
+    // the same lock, so a commit is either completely before or completely
+    // after a background snapshot cut.
+    #[cfg(feature = "bench-profile")]
+    let commit_lock_start = Instant::now();
+    let _commit_guard = self.commit_lock.lock();
+    #[cfg(feature = "bench-profile")]
+    self.commit_lock_wait_ns.fetch_add(
+      commit_lock_start.elapsed().as_nanos() as u64,
+      Ordering::Relaxed,
+    );
 
+    {
       let mut pager = self.pager.lock();
       let mut wal = self.wal_buffer.lock();
       if bulk_load {
@@ -479,23 +552,15 @@ impl SingleFileDB {
           .map(|d| d.as_millis() as u64)
           .unwrap_or(0)
       };
-      header.change_counter += 1;
-
       // Persist header based on sync mode
       if self.sync_mode != SyncMode::Off {
-        let header_bytes = header.serialize_to_page();
-        pager.write_page(0, &header_bytes)?;
-
-        if self.sync_mode == SyncMode::Full {
-          #[cfg(feature = "bench-profile")]
-          let sync_start = Instant::now();
-          // Full durability: fsync after WAL + header updates
-          pager.sync()?;
-          #[cfg(feature = "bench-profile")]
-          self
-            .wal_flush_ns
-            .fetch_add(sync_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        }
+        #[cfg(feature = "bench-profile")]
+        let sync_start = Instant::now();
+        self.persist_header(&mut pager, &mut header, self.sync_mode == SyncMode::Full)?;
+        #[cfg(feature = "bench-profile")]
+        self
+          .wal_flush_ns
+          .fetch_add(sync_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
       }
 
       if group_commit_active {
@@ -503,15 +568,18 @@ impl SingleFileDB {
         state.next_seq = state.next_seq.saturating_add(1);
         group_commit_seq = state.next_seq;
       }
-
-      if let Some(replication) = self.primary_replication.as_ref() {
-        commit_token = Some(replication.append_commit_wal_frame(txid, pending_wal)?);
-      }
     }
 
     if group_commit_active {
       self.wait_for_group_commit(group_commit_seq)?;
     }
+
+    // This is the schema visibility point. It occurs immediately after the
+    // durable commit boundary, while commit_lock still serializes writers.
+    // Publishing before any fallible post-commit work prevents a later error
+    // from leaving a committed WAL definition hidden in this process.
+    self.publish_staged_schema(&staged_schema)?;
+    schema_reservation_guard.disarm();
 
     let mut delta = self.delta.write();
 
@@ -525,6 +593,23 @@ impl SingleFileDB {
       self.cache_clear();
     }
     drop(delta);
+
+    if let Some(replication) = self.primary_replication.as_ref() {
+      if replication.crash_after_local_commit_for_testing() {
+        // Test-only abrupt-stop hook for the exact local-durable/sidecar
+        // boundary. The main WAL, header, and in-memory state are complete.
+        std::process::abort();
+      }
+      match replication.append_commit_wal_frame(txid, pending_wal) {
+        Ok(token) => commit_token = Some(token),
+        Err(error) => {
+          eprintln!("Warning: local commit durable but replication sidecar append failed: {error}")
+        }
+      }
+    }
+
+    drop(_commit_guard);
+    drop(active_transaction_guard);
 
     // Check if auto-checkpoint should be triggered
     // Note: We release all locks above first to avoid deadlock during checkpoint
@@ -559,6 +644,8 @@ impl SingleFileDB {
       let tx = tx_handle.lock();
       (tx.txid, tx.read_only, tx.bulk_load)
     };
+    let _active_transaction_guard = ActiveTransactionGuard { db: self };
+    let _schema_reservation_guard = SchemaReservationGuard::new(self, txid);
 
     if read_only {
       // Read-only transactions don't need WAL

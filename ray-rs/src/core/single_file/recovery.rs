@@ -8,7 +8,7 @@ use crate::constants::*;
 use crate::core::pager::FilePager;
 use crate::core::snapshot::reader::SnapshotData;
 use crate::core::wal::record::{
-  extract_committed_transactions, parse_add_edge_payload, parse_add_edge_props_payload,
+  extract_committed_transactions_in_order, parse_add_edge_payload, parse_add_edge_props_payload,
   parse_add_edges_batch_payload, parse_add_edges_props_batch_payload, parse_add_node_label_payload,
   parse_create_node_payload, parse_create_nodes_batch_payload, parse_define_etype_payload,
   parse_define_label_payload, parse_define_propkey_payload, parse_del_edge_prop_payload,
@@ -104,13 +104,11 @@ pub(crate) fn read_wal_area(pager: &mut FilePager, header: &DbHeaderV1) -> Resul
   Ok(wal_data)
 }
 
-/// Extract committed transactions from WAL records
+/// Extract committed transactions from WAL records in COMMIT-record order.
 pub(crate) fn committed_transactions(
   wal_records: &[ParsedWalRecord],
 ) -> Vec<(TxId, Vec<&ParsedWalRecord>)> {
-  extract_committed_transactions(wal_records)
-    .into_iter()
-    .collect()
+  extract_committed_transactions_in_order(wal_records)
 }
 
 /// Replay a single WAL record into delta and update allocators/schema

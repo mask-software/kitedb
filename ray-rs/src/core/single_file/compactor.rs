@@ -56,6 +56,18 @@ impl Default for VacuumOptions {
 /// Minimum WAL pages to keep (64KB at 4KB page size)
 const MIN_WAL_PAGES: u64 = 16;
 
+fn read_snapshot_pages(
+  pager: &mut crate::core::pager::FilePager,
+  start_page: u32,
+  page_count: u32,
+) -> Result<Vec<u8>> {
+  let mut bytes = Vec::with_capacity(page_count as usize * pager.page_size());
+  for page in 0..page_count {
+    bytes.extend_from_slice(&pager.read_page(start_page + page)?);
+  }
+  Ok(bytes)
+}
+
 impl SingleFileDB {
   /// Optimize (compact) a single-file database.
   ///
@@ -65,7 +77,7 @@ impl SingleFileDB {
       return Err(KiteError::ReadOnly);
     }
 
-    if self.has_any_transaction() {
+    if self.current_tx_handle().is_some() {
       return Err(KiteError::TransactionInProgress);
     }
 
@@ -75,6 +87,8 @@ impl SingleFileDB {
         std::thread::sleep(std::time::Duration::from_millis(1));
       }
     }
+    let _checkpoint_gate = self.checkpoint_gate.write();
+    self.wait_for_no_active_transactions();
 
     let (nodes, edges, labels, etypes, propkeys, vector_stores) = self.collect_graph_data()?;
 
@@ -95,8 +109,7 @@ impl SingleFileDB {
       compression,
     })?;
 
-    let wal_end_page = header.wal_start_page + header.wal_page_count;
-    let new_snapshot_start_page = wal_end_page;
+    let new_snapshot_start_page = self.snapshot_append_start_page(&header)?;
     let new_snapshot_page_count =
       pages_to_store(snapshot_buffer.len(), header.page_size as usize) as u64;
 
@@ -115,6 +128,7 @@ impl SingleFileDB {
       let mut wal_buffer = self.wal_buffer.lock();
       let mut header = self.header.write();
 
+      header.prev_snapshot_gen = header.active_snapshot_gen;
       header.active_snapshot_gen = new_gen;
       header.snapshot_start_page = new_snapshot_start_page;
       header.snapshot_page_count = new_snapshot_page_count;
@@ -126,11 +140,10 @@ impl SingleFileDB {
       header.wal_tail = 0;
       wal_buffer.reset();
 
-      header.change_counter += 1;
-
-      let header_bytes = header.serialize_to_page();
-      pager.write_page(0, &header_bytes)?;
-      pager.sync()?;
+      self.persist_header(&mut pager, &mut header, true)?;
+      // Retire the previous snapshot only after both durable slots name the
+      // optimized snapshot; checkpoint reuse may consume these free pages.
+      self.persist_header(&mut pager, &mut header, true)?;
 
       if old_snapshot_page_count > 0 && old_snapshot_start_page != new_snapshot_start_page {
         pager.free_pages(
@@ -152,9 +165,16 @@ impl SingleFileDB {
       return Err(KiteError::ReadOnly);
     }
 
-    if self.has_any_transaction() {
+    if self.current_tx_handle().is_some() {
       return Err(KiteError::TransactionInProgress);
     }
+
+    while self.is_checkpoint_running() {
+      std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+
+    let _checkpoint_gate = self.checkpoint_gate.write();
+    self.wait_for_no_active_transactions();
 
     let options = options.unwrap_or_default();
 
@@ -183,30 +203,57 @@ impl SingleFileDB {
     };
     let new_wal_end_page = new_header.wal_start_page + new_wal_page_count;
 
-    if new_header.snapshot_page_count > 0 {
-      let current_snapshot_start = new_header.snapshot_start_page;
-      let new_snapshot_start = new_wal_end_page;
+    let current_snapshot_start = new_header.snapshot_start_page;
+    let snapshot_page_count = new_header.snapshot_page_count;
+    let snapshot_relocation_needed =
+      snapshot_page_count > 0 && current_snapshot_start != new_wal_end_page;
+    let snapshot_bytes = if snapshot_relocation_needed {
+      let mut pager = self.pager.lock();
+      Some(read_snapshot_pages(
+        &mut pager,
+        current_snapshot_start as u32,
+        snapshot_page_count as u32,
+      )?)
+    } else {
+      None
+    };
 
-      if current_snapshot_start != new_snapshot_start {
-        let snapshot_bytes = {
-          let mut pager = self.pager.lock();
-          let slice = pager.mmap_range(
-            current_snapshot_start as u32,
-            new_header.snapshot_page_count as u32,
-          )?;
-          slice.to_vec()
-        };
-
+    // A compacted location may overlap the currently installed snapshot.
+    // First copy to append-only pages and install that copy durably; only then
+    // may the old mapping and pages be reclaimed or overwritten.
+    if let Some(snapshot_bytes) = snapshot_bytes.as_deref() {
+      let append_start = self.snapshot_append_start_page(&new_header)?;
+      {
         let mut pager = self.pager.lock();
         self.write_snapshot_pages(
           &mut pager,
-          new_snapshot_start as u32,
-          &snapshot_bytes,
+          append_start as u32,
+          snapshot_bytes,
           new_header.page_size as usize,
         )?;
       }
 
-      new_header.snapshot_start_page = new_snapshot_start;
+      new_header.snapshot_start_page = append_start;
+      new_header.db_size_pages = append_start + snapshot_page_count;
+      {
+        let mut pager = self.pager.lock();
+        self.persist_header(&mut pager, &mut new_header, true)?;
+      }
+      *self.header.write() = new_header.clone();
+      *self.snapshot.write() = None;
+
+      {
+        let mut pager = self.pager.lock();
+        self.write_snapshot_pages(
+          &mut pager,
+          new_wal_end_page as u32,
+          snapshot_bytes,
+          new_header.page_size as usize,
+        )?;
+      }
+      new_header.snapshot_start_page = new_wal_end_page;
+    } else if snapshot_page_count > 0 {
+      new_header.snapshot_start_page = new_wal_end_page;
     }
 
     if can_shrink_wal {
@@ -218,13 +265,18 @@ impl SingleFileDB {
     } else {
       new_header.wal_start_page + new_header.wal_page_count
     };
-    new_header.change_counter += 1;
-
-    {
+    if snapshot_bytes.is_none() {
       let mut pager = self.pager.lock();
-      let header_bytes = new_header.serialize_to_page();
-      pager.write_page(0, &header_bytes)?;
-      pager.sync()?;
+      self.persist_header(&mut pager, &mut new_header, true)?;
+      if new_header.snapshot_page_count > 0 {
+        *self.snapshot.write() = None;
+      }
+      pager.truncate_pages(new_header.db_size_pages as u32)?;
+    } else {
+      // The append-only header was already durable. Install the compacted
+      // location before truncating the now-unreachable append-only copy.
+      let mut pager = self.pager.lock();
+      self.persist_header(&mut pager, &mut new_header, true)?;
       pager.truncate_pages(new_header.db_size_pages as u32)?;
     }
 
@@ -254,7 +306,7 @@ impl SingleFileDB {
       return Err(KiteError::ReadOnly);
     }
 
-    if self.has_any_transaction() {
+    if self.current_tx_handle().is_some() {
       return Err(KiteError::TransactionInProgress);
     }
 
@@ -273,6 +325,9 @@ impl SingleFileDB {
     if options.checkpoint {
       self.checkpoint()?;
     }
+
+    let _checkpoint_gate = self.checkpoint_gate.write();
+    self.wait_for_no_active_transactions();
 
     let header = self.header.read().clone();
     let wal_is_empty =
@@ -304,27 +359,54 @@ impl SingleFileDB {
     let mut new_header = header.clone();
     let new_wal_end_page = new_header.wal_start_page + new_wal_page_count;
 
-    if new_header.snapshot_page_count > 0 {
-      let current_snapshot_start = new_header.snapshot_start_page;
-      if current_snapshot_start != new_wal_end_page {
-        let snapshot_bytes = {
-          let mut pager = self.pager.lock();
-          let slice = pager.mmap_range(
-            current_snapshot_start as u32,
-            new_header.snapshot_page_count as u32,
-          )?;
-          slice.to_vec()
-        };
+    let current_snapshot_start = new_header.snapshot_start_page;
+    let snapshot_page_count = new_header.snapshot_page_count;
+    let snapshot_relocation_needed =
+      snapshot_page_count > 0 && current_snapshot_start != new_wal_end_page;
+    let snapshot_bytes = if snapshot_relocation_needed {
+      let mut pager = self.pager.lock();
+      Some(read_snapshot_pages(
+        &mut pager,
+        current_snapshot_start as u32,
+        snapshot_page_count as u32,
+      )?)
+    } else {
+      None
+    };
 
+    // Resizing can move the compacted snapshot into the currently mapped
+    // range. Use an installed append-only copy as the crash-safe bridge.
+    if let Some(snapshot_bytes) = snapshot_bytes.as_deref() {
+      let append_start = self.snapshot_append_start_page(&new_header)?;
+      {
+        let mut pager = self.pager.lock();
+        self.write_snapshot_pages(
+          &mut pager,
+          append_start as u32,
+          snapshot_bytes,
+          new_header.page_size as usize,
+        )?;
+      }
+      new_header.snapshot_start_page = append_start;
+      new_header.db_size_pages = append_start + snapshot_page_count;
+      {
+        let mut pager = self.pager.lock();
+        self.persist_header(&mut pager, &mut new_header, true)?;
+      }
+      *self.header.write() = new_header.clone();
+      *self.snapshot.write() = None;
+
+      {
         let mut pager = self.pager.lock();
         self.write_snapshot_pages(
           &mut pager,
           new_wal_end_page as u32,
-          &snapshot_bytes,
+          snapshot_bytes,
           new_header.page_size as usize,
         )?;
       }
-
+      new_header.snapshot_start_page = new_wal_end_page;
+    } else if snapshot_page_count > 0 {
       new_header.snapshot_start_page = new_wal_end_page;
     }
 
@@ -341,16 +423,19 @@ impl SingleFileDB {
     } else {
       new_header.wal_start_page + new_header.wal_page_count
     };
-    new_header.change_counter += 1;
-
-    {
+    if snapshot_bytes.is_none() {
       let mut pager = self.pager.lock();
-      let header_bytes = new_header.serialize_to_page();
-      pager.write_page(0, &header_bytes)?;
-      pager.sync()?;
+      self.persist_header(&mut pager, &mut new_header, true)?;
+      if new_header.snapshot_page_count > 0 {
+        *self.snapshot.write() = None;
+      }
       if new_header.db_size_pages < header.db_size_pages {
         pager.truncate_pages(new_header.db_size_pages as u32)?;
       }
+    } else {
+      let mut pager = self.pager.lock();
+      self.persist_header(&mut pager, &mut new_header, true)?;
+      pager.truncate_pages(new_header.db_size_pages as u32)?;
     }
 
     let new_wal_buffer = WalBuffer::from_header(&new_header);
@@ -392,6 +477,51 @@ mod tests {
 
     let reopened = open_single_file(&db_path, SingleFileOpenOptions::new().wal_size(1024 * 1024))?;
     assert!(reopened.node_by_key("a").is_some());
+    close_single_file(reopened)?;
+
+    Ok(())
+  }
+
+  #[test]
+  fn test_vacuum_and_resize_relocate_snapshot_safely() -> Result<()> {
+    let temp_dir = tempdir()?;
+    let db_path = temp_dir.path().join("relocate-snapshot.kitedb");
+    let small_wal = 4 * 1024 * 1024;
+    let options = SingleFileOpenOptions::new()
+      .wal_size(small_wal)
+      .auto_checkpoint(false);
+    let db = open_single_file(&db_path, options.clone())?;
+
+    db.begin(false)?;
+    for index in 0..64 {
+      db.create_node(Some(&format!("node-{index}")))?;
+    }
+    db.commit()?;
+    db.checkpoint()?;
+
+    db.vacuum_single_file(None)?;
+    assert!(db.node_by_key("node-63").is_some());
+
+    close_single_file(db)?;
+
+    let db = open_single_file(
+      &db_path,
+      SingleFileOpenOptions::new()
+        .wal_size(MIN_WAL_PAGES as usize * crate::constants::DEFAULT_PAGE_SIZE)
+        .auto_checkpoint(false),
+    )?;
+    db.resize_wal(
+      small_wal,
+      Some(ResizeWalOptions {
+        checkpoint: false,
+        ..Default::default()
+      }),
+    )?;
+    assert!(db.node_by_key("node-0").is_some());
+    close_single_file(db)?;
+
+    let reopened = open_single_file(&db_path, options)?;
+    assert!(reopened.node_by_key("node-63").is_some());
     close_single_file(reopened)?;
 
     Ok(())

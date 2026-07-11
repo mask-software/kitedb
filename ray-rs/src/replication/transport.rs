@@ -18,7 +18,7 @@ pub fn build_commit_payload_header(
   wal_len: usize,
 ) -> Result<[u8; COMMIT_PAYLOAD_HEADER_BYTES]> {
   let wal_len = u32::try_from(wal_len).map_err(|_| {
-    KiteError::InvalidReplication(format!("replication commit payload too large: {}", wal_len))
+    KiteError::InvalidReplication(format!("replication commit payload too large: {wal_len}"))
   })?;
 
   let mut bytes = [0u8; COMMIT_PAYLOAD_HEADER_BYTES];
