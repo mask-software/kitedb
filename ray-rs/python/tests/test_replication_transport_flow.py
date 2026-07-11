@@ -72,6 +72,10 @@ def test_python_replication_transport_admin_flow_roundtrip():
                 auto_checkpoint=False,
             ),
         )
+        # A second live primary on one path simulates multi-machine
+        # split-brain so epoch fencing can be exercised; requires the
+        # test-only lock bypass.
+        os.environ["KITEDB_DANGER_ALLOW_MULTI_NODE_SIMULATION"] = "1"
         stale = Database(
             primary_path,
             OpenOptions(
@@ -80,6 +84,7 @@ def test_python_replication_transport_admin_flow_roundtrip():
                 replication_segment_max_bytes=1,
                 replication_retention_min_entries=1,
                 auto_checkpoint=False,
+                danger_bypass_file_lock_for_multi_node_simulation=True,
             ),
         )
         replica = Database(
@@ -156,10 +161,15 @@ def test_python_replication_transport_admin_flow_roundtrip():
             )
             primary.primary_run_retention()
 
-            with pytest.raises(Exception, match="reseed"):
-                replica.replica_catch_up_once(64)
-            assert replica.replica_replication_status()["needs_reseed"] is True
+            # Retention respects the reported replica cursor and lagging
+            # replicas recover automatically (reseeding from snapshot
+            # internally when a gap exists), so catch-up succeeds instead
+            # of raising a reseed error.
+            _drain_replica(replica, 64)
+            assert replica.replica_replication_status()["needs_reseed"] is False
+            assert replica.count_nodes() == primary.count_nodes()
 
+            # The explicit reseed admin API remains available and idempotent.
             primary.checkpoint()
             replica.replica_reseed_from_snapshot()
             assert replica.replica_replication_status()["needs_reseed"] is False

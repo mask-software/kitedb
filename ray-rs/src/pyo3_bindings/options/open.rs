@@ -192,6 +192,13 @@ pub struct OpenOptions {
   /// Minimum retained segment age in milliseconds (0 imposes no age floor)
   #[pyo3(get, set)]
   pub replication_retention_min_ms: Option<i64>,
+  /// TEST-ONLY: skip database file locking to simulate multi-node topologies
+  /// (e.g. split-brain fencing tests) in a single process. Honored only when
+  /// the KITEDB_DANGER_ALLOW_MULTI_NODE_SIMULATION environment variable is
+  /// set; rejected otherwise. Never use this outside tests: it removes the
+  /// corruption protection that prevents two writers on one database file.
+  #[pyo3(get, set)]
+  pub danger_bypass_file_lock_for_multi_node_simulation: Option<bool>,
 }
 
 #[pymethods]
@@ -227,7 +234,8 @@ impl OpenOptions {
         replication_source_sidecar_path=None,
         replication_segment_max_bytes=None,
         replication_retention_min_entries=None,
-        replication_retention_min_ms=None
+        replication_retention_min_ms=None,
+        danger_bypass_file_lock_for_multi_node_simulation=None
     ))]
   #[allow(clippy::too_many_arguments)]
   fn new(
@@ -261,6 +269,7 @@ impl OpenOptions {
     replication_segment_max_bytes: Option<i64>,
     replication_retention_min_entries: Option<i64>,
     replication_retention_min_ms: Option<i64>,
+    danger_bypass_file_lock_for_multi_node_simulation: Option<bool>,
   ) -> Self {
     Self {
       read_only,
@@ -293,6 +302,7 @@ impl OpenOptions {
       replication_segment_max_bytes,
       replication_retention_min_entries,
       replication_retention_min_ms,
+      danger_bypass_file_lock_for_multi_node_simulation,
     }
   }
 
@@ -466,6 +476,15 @@ impl OpenOptions {
       })?;
       rust_opts = rust_opts.replication_role(role);
     }
+    if self.danger_bypass_file_lock_for_multi_node_simulation == Some(true) {
+      if std::env::var_os("KITEDB_DANGER_ALLOW_MULTI_NODE_SIMULATION").is_none() {
+        return Err(PyValueError::new_err(
+          "danger_bypass_file_lock_for_multi_node_simulation is test-only and requires the \
+           KITEDB_DANGER_ALLOW_MULTI_NODE_SIMULATION environment variable",
+        ));
+      }
+      rust_opts = rust_opts.danger_bypass_file_lock_for_multi_node_simulation(true);
+    }
     if let Some(ref path) = self.replication_sidecar_path {
       rust_opts = rust_opts.replication_sidecar_path(path);
     }
@@ -556,6 +575,7 @@ impl OpenOptions {
       replication_retention_min_ms: opts
         .replication_retention_min_ms
         .and_then(|v| i64::try_from(v).ok()),
+      danger_bypass_file_lock_for_multi_node_simulation: None,
     }
   }
 }

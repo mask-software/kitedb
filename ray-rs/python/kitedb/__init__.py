@@ -118,7 +118,7 @@ from kitedb._kitedb import (
     health_check,
     create_backup,
     restore_backup,
-    get_backup_info,
+    backup_info as get_backup_info,
     create_offline_backup,
     version,
     brute_force_search,
