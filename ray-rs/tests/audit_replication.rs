@@ -875,3 +875,225 @@ fn audit_missing_log_range_escalates_to_needs_reseed() {
   close_single_file(replica).expect("close replica");
   close_single_file(primary).expect("close primary");
 }
+
+// ============================================================================
+// Regression tests for the fixes above
+// ============================================================================
+
+#[test]
+fn bootstrap_from_buffered_primary_pins_cursor_to_published_head() {
+  let dir = tempfile::tempdir().expect("tempdir");
+  let primary_path = dir.path().join("pin-primary.kitedb");
+  let replica_path = dir.path().join("pin-replica.kitedb");
+
+  // Normal mode keeps these frames in memory until the publisher writes them.
+  let primary = open_primary(&primary_path, SyncMode::Normal);
+  let mut head = None;
+  for i in 0..3 {
+    primary.begin(false).expect("begin");
+    primary
+      .create_node(Some(&format!("pin-{i}")))
+      .expect("create node");
+    head = Some(commit(&primary));
+  }
+  let head = head.expect("head token");
+
+  let replica = open_replica(&replica_path, &primary_path);
+  replica
+    .replica_bootstrap_from_snapshot()
+    .expect("bootstrap from snapshot");
+  assert_eq!(
+    replica
+      .replica_replication_status()
+      .expect("status")
+      .applied_log_index,
+    head.log_index,
+    "bootstrap cursor must match the copied state"
+  );
+  assert_eq!(graph_state(&replica), graph_state(&primary));
+
+  close_single_file(replica).expect("close replica");
+  close_single_file(primary).expect("close primary");
+}
+
+#[test]
+fn catch_up_reads_active_segment_past_stale_manifest_end() {
+  use kitedb::replication::manifest::ManifestStore;
+
+  let dir = tempfile::tempdir().expect("tempdir");
+  let primary_path = dir.path().join("stale-manifest-primary.kitedb");
+  let replica_path = dir.path().join("stale-manifest-replica.kitedb");
+  let primary = open_primary(&primary_path, SyncMode::Full);
+  let replica = open_replica(&replica_path, &primary_path);
+  replica
+    .replica_bootstrap_from_snapshot()
+    .expect("bootstrap empty primary");
+
+  for i in 0..3 {
+    primary.begin(false).expect("begin");
+    primary
+      .create_node(Some(&format!("stale-{i}")))
+      .expect("create node");
+    commit(&primary);
+  }
+  assert_eq!(replica.replica_catch_up_once(1).expect("catch up one"), 1);
+  let primary_state = graph_state(&primary);
+  close_single_file(primary).expect("close primary");
+
+  // A buffered primary writes frames into its active segment before it
+  // persists the manifest, so the manifest can trail the segment file.
+  let manifest_store =
+    ManifestStore::new(default_replication_sidecar_path(&primary_path).join("manifest.json"));
+  let mut manifest = manifest_store.read().expect("read manifest");
+  manifest.head_log_index = 1;
+  for segment in &mut manifest.segments {
+    segment.end_log_index = segment.end_log_index.min(1);
+  }
+  manifest_store
+    .write(&manifest)
+    .expect("write stale manifest");
+
+  catch_up_all(&replica).expect("catch up");
+  assert_eq!(
+    replica
+      .replica_replication_status()
+      .expect("status")
+      .applied_log_index,
+    3
+  );
+  assert_eq!(graph_state(&replica), primary_state);
+
+  close_single_file(replica).expect("close replica");
+}
+
+#[test]
+fn diverged_replica_schema_requires_reseed() {
+  let dir = tempfile::tempdir().expect("tempdir");
+  let primary_path = dir.path().join("diverged-primary.kitedb");
+  let replica_path = dir.path().join("diverged-replica.kitedb");
+  let primary = open_primary(&primary_path, SyncMode::Full);
+
+  // The replica file already has its own schema before it starts following.
+  let local = open_single_file(&replica_path, SingleFileOpenOptions::new()).expect("open local");
+  local.begin(false).expect("begin local");
+  local
+    .define_propkey("local_only")
+    .expect("define local key");
+  local.commit().expect("commit local");
+  close_single_file(local).expect("close local");
+
+  let replica = open_replica(&replica_path, &primary_path);
+  primary.begin(false).expect("begin");
+  let email = primary.define_propkey("email").expect("define email");
+  commit(&primary);
+  assert_eq!(
+    replica.propkey_id("local_only"),
+    Some(email),
+    "test setup: ids must collide"
+  );
+
+  let error = catch_up_all(&replica).expect_err("diverged schema must not apply");
+  assert!(
+    error.to_string().contains("reseed"),
+    "divergence must ask for a reseed: {error}"
+  );
+  let status = replica.replica_replication_status().expect("status");
+  assert!(status.needs_reseed, "divergence must set needs_reseed");
+  assert_eq!(replica.propkey_name(email).as_deref(), Some("local_only"));
+
+  close_single_file(replica).expect("close replica");
+  close_single_file(primary).expect("close primary");
+}
+
+#[test]
+fn replay_after_crash_skips_records_for_deleted_node() {
+  let dir = tempfile::tempdir().expect("tempdir");
+  let primary_path = dir.path().join("replay-props-primary.kitedb");
+  let replica_path = dir.path().join("replay-props-replica.kitedb");
+  let primary = open_primary(&primary_path, SyncMode::Full);
+
+  let ids = std::cell::Cell::new((0u64, 0u32, 0u64, 0u32, 0u32));
+  let (replica, head) = replay_later_frames_after_simulated_crash(
+    &primary,
+    &primary_path,
+    &replica_path,
+    |db| {
+      db.begin(false).expect("begin");
+      let links = db.define_etype("LINKS").expect("etype");
+      let tag = db.define_label("Tag").expect("label");
+      let weight = db.define_propkey("weight").expect("propkey");
+      let a = db.create_node(Some("a")).expect("a");
+      let b = db.create_node(Some("b")).expect("b");
+      commit(db);
+      ids.set((a, links, b, tag, weight));
+    },
+    |db| {
+      let (a, links, b, tag, weight) = ids.get();
+      db.begin(false).expect("begin writes");
+      db.set_node_prop(b, weight, PropValue::I64(7))
+        .expect("prop on b");
+      db.add_node_label(b, tag).expect("label on b");
+      db.add_edge(a, links, b).expect("edge a->b");
+      db.set_edge_prop(a, links, b, weight, PropValue::I64(9))
+        .expect("edge prop");
+      commit(db);
+      db.begin(false).expect("begin delete");
+      db.delete_node(b).expect("delete b");
+      commit(db)
+    },
+  );
+
+  let (a, links, b, _, weight) = ids.get();
+  assert!(!replica.node_exists(b));
+  assert_eq!(replica.node_prop(b, weight), None);
+  assert!(replica.node_labels(b).is_empty());
+  assert_eq!(replica.edge_prop(a, links, b, weight), None);
+  assert_eq!(graph_state(&replica), graph_state(&primary));
+  assert_eq!(
+    replica
+      .replica_replication_status()
+      .expect("status")
+      .applied_log_index,
+    head.log_index
+  );
+
+  close_single_file(replica).expect("close replica");
+  close_single_file(primary).expect("close primary");
+}
+
+#[test]
+fn clean_close_of_buffered_primary_publishes_and_keeps_sidecar_healthy() {
+  use kitedb::replication::manifest::ManifestStore;
+
+  let dir = tempfile::tempdir().expect("tempdir");
+  let primary_path = dir.path().join("clean-close-primary.kitedb");
+  let primary = open_primary(&primary_path, SyncMode::Normal);
+  let mut head = None;
+  for i in 0..3 {
+    primary.begin(false).expect("begin");
+    primary
+      .create_node(Some(&format!("close-{i}")))
+      .expect("create node");
+    head = Some(commit(&primary));
+  }
+  let head = head.expect("head token");
+  // The checkpoint empties the WAL, so reopen has no commit to compare.
+  primary.checkpoint().expect("checkpoint");
+  close_single_file(primary).expect("close primary");
+
+  let manifest =
+    ManifestStore::new(default_replication_sidecar_path(&primary_path).join("manifest.json"))
+      .read()
+      .expect("read manifest");
+  assert_eq!(manifest.head_log_index, head.log_index);
+
+  let primary = open_primary(&primary_path, SyncMode::Normal);
+  let status = primary.primary_replication_status().expect("status");
+  assert!(
+    !status.sidecar_needs_repair,
+    "a clean close must not look like lost frames: {:?}",
+    status.last_replication_error
+  );
+  assert_eq!(status.head_log_index, head.log_index);
+  close_single_file(primary).expect("close primary");
+}

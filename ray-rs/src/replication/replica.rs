@@ -4,6 +4,7 @@ use super::log_store::{ReplicationFrame, SegmentLogStore};
 use super::manifest::{ManifestStore, ReplicationManifest};
 use super::primary::default_replication_sidecar_path;
 use super::progress::upsert_replica_progress;
+use super::transport::decode_commit_frame_payload;
 use super::types::ReplicationRole;
 use crate::error::{KiteError, Result};
 use parking_lot::Mutex;
@@ -25,6 +26,16 @@ pub struct ReplicaReplicationStatus {
   pub applied_log_index: u64,
   pub last_error: Option<String>,
   pub needs_reseed: bool,
+}
+
+/// Replication head of the source sidecar as published on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourcePublishedHead {
+  pub epoch: u64,
+  /// Head in the manifest; frames up to it reach the segments first.
+  pub manifest_head: u64,
+  /// Newest frame in the segment files: log index and primary txid.
+  pub newest_frame: Option<(u64, Option<u64>)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -143,6 +154,41 @@ impl ReplicaReplication {
 
     let manifest = ManifestStore::new(source_sidecar_path.join(MANIFEST_FILE_NAME)).read()?;
     Ok((manifest.epoch, manifest.head_log_index))
+  }
+
+  /// Manifest head plus the newest frame in the source segment files. A
+  /// buffered (Normal/Off) primary writes frames before it persists the
+  /// manifest, so the newest frame can be ahead of the manifest head.
+  pub fn source_published_head(&self) -> Result<SourcePublishedHead> {
+    let source_sidecar_path = self.source_sidecar_path.as_ref().ok_or_else(|| {
+      KiteError::InvalidReplication("replica source sidecar path is not configured".to_string())
+    })?;
+
+    let manifest = ManifestStore::new(source_sidecar_path.join(MANIFEST_FILE_NAME)).read()?;
+    let mut segment_ids: Vec<u64> = manifest.segments.iter().map(|segment| segment.id).collect();
+    segment_ids.sort_unstable_by(|left, right| right.cmp(left));
+    for segment_id in segment_ids {
+      let segment_path = source_sidecar_path.join(segment_file_name(segment_id));
+      if !segment_path.exists() {
+        continue;
+      }
+      if let Some(frame) = SegmentLogStore::open(&segment_path)?.read_last_frame()? {
+        let txid = decode_commit_frame_payload(&frame.payload)
+          .ok()
+          .map(|payload| payload.txid);
+        return Ok(SourcePublishedHead {
+          epoch: manifest.epoch,
+          manifest_head: manifest.head_log_index,
+          newest_frame: Some((frame.log_index, txid)),
+        });
+      }
+    }
+
+    Ok(SourcePublishedHead {
+      epoch: manifest.epoch,
+      manifest_head: manifest.head_log_index,
+      newest_frame: None,
+    })
   }
 
   pub fn mark_applied(&self, epoch: u64, log_index: u64) -> Result<()> {
@@ -398,7 +444,10 @@ fn read_frames_after(
 
   let mut frames = Vec::new();
   for segment in segments {
-    if segment.end_log_index > 0 && segment.end_log_index < minimum_log_index {
+    // A buffered primary flushes frames into its active segment before it
+    // persists the manifest, so the active segment's end index can be stale.
+    let sealed = segment.id != manifest.active_segment_id;
+    if sealed && segment.end_log_index > 0 && segment.end_log_index < minimum_log_index {
       continue;
     }
 

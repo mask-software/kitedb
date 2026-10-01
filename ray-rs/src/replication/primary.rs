@@ -8,6 +8,14 @@
 //! persisted in `primary-health.json`; reopen also compares the newest local
 //! WAL commit txid with the newest sidecar frame and writes that marker if a
 //! crash happened before the append attempt recorded the error.
+//!
+//! Normal/Off sync modes buffer frames in memory. A background publisher
+//! writes them to the segment file within one tick and persists the manifest
+//! once appends pause, so an idle primary never hides commits from replicas.
+//! While frames are buffered, `primary-unflushed` exists; finding it on an
+//! open whose WAL a checkpoint already emptied means commits may be missing
+//! from the sidecar with no WAL record left to compare, so the sidecar is
+//! fenced for repair.
 
 use super::log_store::{ReplicationFrame, SegmentLogStore};
 use super::manifest::{ManifestStore, ReplicationManifest, SegmentMeta, MANIFEST_ENVELOPE_VERSION};
@@ -28,6 +36,7 @@ use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
+use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MANIFEST_FILE_NAME: &str = "manifest.json";
@@ -38,6 +47,9 @@ const DEFAULT_MANIFEST_REFRESH_APPEND_INTERVAL: u64 = 256;
 const DEFAULT_APPEND_WRITE_BUFFER_BYTES: usize = 16 * 1024 * 1024;
 const PRIMARY_HEALTH_FILE_NAME: &str = "primary-health.json";
 const PRIMARY_HEALTH_VERSION: u32 = 1;
+const PRIMARY_UNFLUSHED_MARKER_FILE_NAME: &str = "primary-unflushed";
+/// Upper bound for buffered frames to reach the segment file.
+const BUFFERED_FRAME_PUBLISH_INTERVAL: Duration = Duration::from_millis(100);
 
 type SidecarOpLock = Arc<Mutex<()>>;
 type SidecarPrimaryLock = Arc<PrimarySidecarProcessLock>;
@@ -102,10 +114,24 @@ struct PrimaryReplicationState {
   replica_progress: HashMap<String, ReplicaProgressEntry>,
   write_fenced: bool,
   appends_since_manifest_refresh: u64,
+  /// Frames were appended since the publisher's last tick.
+  appended_since_publish: bool,
+  /// The in-memory manifest is ahead of the persisted one.
+  manifest_dirty: bool,
+  /// `primary-unflushed` exists on disk.
+  unflushed_marker: bool,
+}
+
+/// Primary replication runtime. Buffered sync modes run a background
+/// publisher that is stopped, followed by a final publish, on drop.
+#[derive(Debug)]
+pub struct PrimaryReplication {
+  inner: Arc<PrimaryReplicationInner>,
+  publisher: Option<BufferedFramePublisher>,
 }
 
 #[derive(Debug)]
-pub struct PrimaryReplication {
+struct PrimaryReplicationInner {
   sidecar_path: PathBuf,
   manifest_store: ManifestStore,
   state: Mutex<PrimaryReplicationState>,
@@ -123,9 +149,61 @@ pub struct PrimaryReplication {
   fail_after_append_for_testing: Option<u64>,
   crash_after_local_commit_for_testing: bool,
   health_store: PrimarySidecarHealthStore,
+  unflushed_marker_path: PathBuf,
   sidecar_op_lock: SidecarOpLock,
   _sidecar_primary_lock: SidecarPrimaryLock,
   epoch_fence: SidecarEpochFence,
+}
+
+/// Thread that publishes buffered frames every `interval` until dropped.
+#[derive(Debug)]
+struct BufferedFramePublisher {
+  shutdown: Arc<PublisherShutdown>,
+  thread: Option<JoinHandle<()>>,
+}
+
+#[derive(Debug, Default)]
+struct PublisherShutdown {
+  requested: Mutex<bool>,
+  wake: parking_lot::Condvar,
+}
+
+impl BufferedFramePublisher {
+  fn spawn(primary: Weak<PrimaryReplicationInner>, interval: Duration) -> Result<Self> {
+    let shutdown = Arc::new(PublisherShutdown::default());
+    let thread_shutdown = Arc::clone(&shutdown);
+    let thread = std::thread::Builder::new()
+      .name("kitedb-replication-publisher".to_string())
+      .spawn(move || loop {
+        {
+          let mut requested = thread_shutdown.requested.lock();
+          if !*requested {
+            thread_shutdown.wake.wait_for(&mut requested, interval);
+          }
+          if *requested {
+            return;
+          }
+        }
+        match primary.upgrade() {
+          Some(primary) => primary.publish_buffered_frames(),
+          None => return,
+        }
+      })?;
+    Ok(Self {
+      shutdown,
+      thread: Some(thread),
+    })
+  }
+}
+
+impl Drop for BufferedFramePublisher {
+  fn drop(&mut self) {
+    *self.shutdown.requested.lock() = true;
+    self.shutdown.wake.notify_all();
+    if let Some(thread) = self.thread.take() {
+      let _ = thread.join();
+    }
+  }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -230,6 +308,100 @@ impl PrimaryReplication {
     local_latest_committed_txid: Option<u64>,
     crash_after_local_commit_for_testing: bool,
   ) -> Result<Self> {
+    let inner = Arc::new(PrimaryReplicationInner::open_with_recovery(
+      db_path,
+      sidecar_path,
+      segment_max_bytes,
+      retention_min_entries,
+      retention_min_ms,
+      sync_mode,
+      fail_after_append_for_testing,
+      local_latest_committed_txid,
+      crash_after_local_commit_for_testing,
+    )?);
+    let publisher = if inner.durable_append {
+      None
+    } else {
+      Some(BufferedFramePublisher::spawn(
+        Arc::downgrade(&inner),
+        BUFFERED_FRAME_PUBLISH_INTERVAL,
+      )?)
+    };
+    Ok(Self { inner, publisher })
+  }
+
+  pub fn append_commit_frame(&self, payload: Vec<u8>) -> Result<CommitToken> {
+    self.inner.append_commit_frame(payload)
+  }
+
+  pub fn append_commit_wal_frame(&self, txid: u64, wal_bytes: Vec<u8>) -> Result<CommitToken> {
+    self.inner.append_commit_wal_frame(txid, wal_bytes)
+  }
+
+  pub fn crash_after_local_commit_for_testing(&self) -> bool {
+    self.inner.crash_after_local_commit_for_testing()
+  }
+
+  /// Reject a local commit before its WAL COMMIT record when this instance is
+  /// fenced by a newer primary epoch. A sidecar-repair fence is intentionally
+  /// excluded: local commits remain authoritative while replication is stale.
+  pub fn ensure_local_commit_allowed(&self) -> Result<()> {
+    self.inner.ensure_local_commit_allowed()
+  }
+
+  pub fn promote_to_next_epoch(&self) -> Result<u64> {
+    self.inner.promote_to_next_epoch()
+  }
+
+  pub fn report_replica_progress(
+    &self,
+    replica_id: &str,
+    epoch: u64,
+    applied_log_index: u64,
+  ) -> Result<()> {
+    self
+      .inner
+      .report_replica_progress(replica_id, epoch, applied_log_index)
+  }
+
+  pub fn run_retention(&self) -> Result<PrimaryRetentionOutcome> {
+    self.inner.run_retention()
+  }
+
+  pub fn last_token(&self) -> Option<CommitToken> {
+    self.inner.last_token()
+  }
+
+  pub fn status(&self) -> PrimaryReplicationStatus {
+    self.inner.status()
+  }
+
+  pub fn flush_for_transport_export(&self) -> Result<()> {
+    self.inner.flush_for_transport_export()
+  }
+}
+
+impl Drop for PrimaryReplication {
+  fn drop(&mut self) {
+    // Stop the publisher first so the final publish is the last sidecar write.
+    drop(self.publisher.take());
+    self.inner.publish_on_close();
+  }
+}
+
+impl PrimaryReplicationInner {
+  #[allow(clippy::too_many_arguments)]
+  fn open_with_recovery(
+    db_path: &Path,
+    sidecar_path: Option<PathBuf>,
+    segment_max_bytes: Option<u64>,
+    retention_min_entries: Option<u64>,
+    retention_min_ms: Option<u64>,
+    sync_mode: SyncMode,
+    fail_after_append_for_testing: Option<u64>,
+    local_latest_committed_txid: Option<u64>,
+    crash_after_local_commit_for_testing: bool,
+  ) -> Result<Self> {
     let sidecar_path = sidecar_path.unwrap_or_else(|| default_replication_sidecar_path(db_path));
     std::fs::create_dir_all(&sidecar_path)?;
     let sidecar_primary_lock = acquire_sidecar_primary_lock(&sidecar_path)?;
@@ -237,6 +409,8 @@ impl PrimaryReplication {
     let manifest_store = ManifestStore::new(sidecar_path.join(MANIFEST_FILE_NAME));
     let health_store = PrimarySidecarHealthStore::new(&sidecar_path);
     let persisted_health = health_store.read()?;
+    let unflushed_marker_path = sidecar_path.join(PRIMARY_UNFLUSHED_MARKER_FILE_NAME);
+    let stopped_with_buffered_frames = unflushed_marker_path.exists();
 
     let mut manifest = if manifest_store.path().exists() {
       manifest_store.read()?
@@ -311,6 +485,14 @@ impl PrimaryReplication {
             ));
           }
         }
+      } else if stopped_with_buffered_frames {
+        // No WAL commit is left to compare: a checkpoint folded the commits
+        // whose frames were still buffered when the process stopped.
+        sidecar_needs_repair = true;
+        last_replication_error = Some(
+          "primary stopped with replication frames buffered in memory and the WAL holding their commits was checkpointed; repair/resync required"
+            .to_string(),
+        );
       }
     }
 
@@ -323,6 +505,10 @@ impl PrimaryReplication {
           sidecar_needs_repair: true,
         },
       );
+    }
+    if stopped_with_buffered_frames {
+      // The decision above (or the persisted health) now carries the marker.
+      remove_unflushed_marker(&unflushed_marker_path)?;
     }
 
     let segment_path = sidecar_path.join(segment_file_name(manifest.active_segment_id));
@@ -354,6 +540,9 @@ impl PrimaryReplication {
         replica_progress,
         write_fenced: false,
         appends_since_manifest_refresh: 0,
+        appended_since_publish: false,
+        manifest_dirty: false,
+        unflushed_marker: false,
       }),
       append_attempts: AtomicU64::new(0),
       append_failures: AtomicU64::new(0),
@@ -375,6 +564,7 @@ impl PrimaryReplication {
       fail_after_append_for_testing,
       crash_after_local_commit_for_testing,
       health_store,
+      unflushed_marker_path,
       sidecar_op_lock,
       _sidecar_primary_lock: sidecar_primary_lock,
       epoch_fence,
@@ -477,6 +667,11 @@ impl PrimaryReplication {
       }
     }
 
+    if let Err(error) = self.note_frame_buffering_locked(&mut state) {
+      self.append_failures.fetch_add(1, Ordering::Relaxed);
+      return Err(error);
+    }
+
     let epoch = state.manifest.epoch;
     let next_log_index = state.manifest.head_log_index.saturating_add(1);
 
@@ -558,6 +753,8 @@ impl PrimaryReplication {
       state.active_segment_size_bytes = 0;
     }
     state.manifest = next_manifest;
+    state.manifest_dirty = !persist_manifest;
+    state.appended_since_publish = true;
     state.last_token = Some(token);
     state.appends_since_manifest_refresh = state.appends_since_manifest_refresh.saturating_add(1);
     self.append_successes.fetch_add(1, Ordering::Relaxed);
@@ -623,6 +820,11 @@ impl PrimaryReplication {
         self.append_failures.fetch_add(1, Ordering::Relaxed);
         return Err(stale_primary_error());
       }
+    }
+
+    if let Err(error) = self.note_frame_buffering_locked(&mut state) {
+      self.append_failures.fetch_add(1, Ordering::Relaxed);
+      return Err(error);
     }
 
     let epoch = state.manifest.epoch;
@@ -706,6 +908,8 @@ impl PrimaryReplication {
       state.active_segment_size_bytes = 0;
     }
     state.manifest = next_manifest;
+    state.manifest_dirty = !persist_manifest;
+    state.appended_since_publish = true;
     state.last_token = Some(token);
     state.appends_since_manifest_refresh = state.appends_since_manifest_refresh.saturating_add(1);
     self.append_successes.fetch_add(1, Ordering::Relaxed);
@@ -748,6 +952,7 @@ impl PrimaryReplication {
     )?;
     state.active_segment_size_bytes = 0;
     state.manifest = next_manifest;
+    state.manifest_dirty = false;
     state.last_token = None;
     state.replica_progress.clear();
     clear_replica_progress(&self.sidecar_path)?;
@@ -851,6 +1056,7 @@ impl PrimaryReplication {
     self.manifest_store.write(&next_manifest)?;
     state.manifest_disk_stamp = read_manifest_disk_stamp(self.manifest_store.path())?;
     state.manifest = next_manifest;
+    state.manifest_dirty = false;
     state.appends_since_manifest_refresh = 0;
 
     for id in &pruned_ids {
@@ -936,7 +1142,82 @@ impl PrimaryReplication {
   pub fn flush_for_transport_export(&self) -> Result<()> {
     let _sidecar_guard = self.sidecar_op_lock.lock();
     let mut state = self.state.lock();
-    state.log_store.flush()
+    self.publish_locked(&mut state, false)
+  }
+
+  /// Record on disk that frames are about to sit in memory, before the first
+  /// buffered append after a publish. Full sync appends never buffer.
+  fn note_frame_buffering_locked(&self, state: &mut PrimaryReplicationState) -> Result<()> {
+    if self.durable_append || state.unflushed_marker {
+      return Ok(());
+    }
+    OpenOptions::new()
+      .create(true)
+      .truncate(true)
+      .write(true)
+      .open(&self.unflushed_marker_path)?;
+    state.unflushed_marker = true;
+    Ok(())
+  }
+
+  /// Publisher tick: write buffered frames to the segment file, and persist
+  /// the manifest once a full tick passed without appends (a busy primary
+  /// still persists it every `DEFAULT_MANIFEST_REFRESH_APPEND_INTERVAL`).
+  fn publish_buffered_frames(&self) {
+    {
+      let state = self.state.lock();
+      if !state.appended_since_publish && !state.manifest_dirty && !state.unflushed_marker {
+        return;
+      }
+    }
+
+    let result = {
+      let _sidecar_guard = self.sidecar_op_lock.lock();
+      let mut state = self.state.lock();
+      let idle = !std::mem::take(&mut state.appended_since_publish);
+      self.publish_locked(&mut state, idle)
+    };
+    if let Err(error) = result {
+      self.mark_append_failure(&error);
+    }
+  }
+
+  /// Final publish when the primary closes.
+  fn publish_on_close(&self) {
+    let result = {
+      let _sidecar_guard = self.sidecar_op_lock.lock();
+      let mut state = self.state.lock();
+      self.publish_locked(&mut state, true)
+    };
+    if let Err(error) = result {
+      self.mark_append_failure(&error);
+    }
+  }
+
+  fn publish_locked(
+    &self,
+    state: &mut PrimaryReplicationState,
+    persist_manifest: bool,
+  ) -> Result<()> {
+    state.log_store.flush()?;
+
+    if persist_manifest && state.manifest_dirty {
+      // A fenced sidecar keeps its manifest for repair, and a manifest that
+      // another primary instance advanced is never overwritten.
+      if !state.sidecar_needs_repair && !self.refresh_manifest_locked(state)? && !state.write_fenced
+      {
+        self.manifest_store.write(&state.manifest)?;
+        state.manifest_disk_stamp = read_manifest_disk_stamp(self.manifest_store.path())?;
+        state.appends_since_manifest_refresh = 0;
+      }
+      state.manifest_dirty = false;
+    }
+
+    if state.unflushed_marker && !state.log_store.has_buffered_frames() {
+      remove_unflushed_marker(&self.unflushed_marker_path)?;
+      state.unflushed_marker = false;
+    }
+    Ok(())
   }
 
   fn refresh_manifest_locked(&self, state: &mut PrimaryReplicationState) -> Result<bool> {
@@ -1150,6 +1431,23 @@ fn reconcile_manifest_head_from_active_segment(
 
   ensure_active_segment_metadata(manifest);
   Ok(true)
+}
+
+fn remove_unflushed_marker(path: &Path) -> Result<()> {
+  match std::fs::remove_file(path) {
+    Ok(()) => Ok(()),
+    Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+    Err(error) => Err(error.into()),
+  }
+}
+
+/// Whether a primary sidecar is fenced for repair/resync (`primary-health.json`).
+pub fn primary_sidecar_needs_repair(sidecar_path: &Path) -> Result<bool> {
+  Ok(
+    PrimarySidecarHealthStore::new(sidecar_path)
+      .read()?
+      .is_some_and(|health| health.sidecar_needs_repair),
+  )
 }
 
 fn stale_primary_error() -> KiteError {
