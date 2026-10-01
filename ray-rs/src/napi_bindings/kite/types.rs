@@ -85,6 +85,10 @@ pub struct JsKiteOptions {
   /// Group commit window in milliseconds (0 adds no coalescing delay)
   pub group_commit_window_ms: Option<i64>,
   /// WAL size in megabytes (must be positive; default: 4)
+  /// WAL size in megabytes (must be positive), fixed when the file is created.
+  /// Unset: a new file gets a 4MB WAL and an existing file keeps its own.
+  /// Set: a new file gets this size; an existing file with a different WAL
+  /// size fails to open.
   pub wal_size_mb: Option<i64>,
   /// WAL usage threshold (0.0-1.0) to trigger auto-checkpoint
   pub checkpoint_threshold: Option<f64>,

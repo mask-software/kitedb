@@ -787,7 +787,11 @@ pub struct KiteOptions {
   pub mvcc_retention_ms: Option<u64>,
   /// MVCC max version chain depth
   pub mvcc_max_chain_depth: Option<usize>,
-  /// WAL size in bytes (default: 4MB)
+  /// WAL size in bytes, fixed when the file is created.
+  ///
+  /// `None` (default): a new file gets a 4MB WAL and an existing file keeps
+  /// its own. `Some(n)`: a new file gets an `n`-byte WAL; an existing file
+  /// with a different WAL size fails to open.
   pub wal_size: Option<usize>,
   /// WAL usage threshold (0.0-1.0) to trigger auto-checkpoint
   pub checkpoint_threshold: Option<f64>,
@@ -914,13 +918,15 @@ impl KiteOptions {
     self
   }
 
-  /// Set WAL size in bytes
+  /// Require a WAL of `value` bytes: a new file is created with it, and an
+  /// existing file whose WAL size differs fails to open.
   pub fn wal_size(mut self, value: usize) -> Self {
     self.wal_size = Some(value);
     self
   }
 
-  /// Set WAL size in megabytes
+  /// Require a WAL of `value` megabytes: a new file is created with it, and an
+  /// existing file whose WAL size differs fails to open.
   pub fn wal_size_mb(mut self, value: usize) -> Self {
     self.wal_size = Some(value.saturating_mul(1024 * 1024));
     self

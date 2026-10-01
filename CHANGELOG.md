@@ -22,6 +22,7 @@ All notable changes to this project will be documented in this file.
 - Writable opens take an exclusive file lock (shared for read-only), preventing two processes from corrupting the same database. Replica bootstrap reads a live primary without taking its lock.
 - `read_only` opens are now truly read-only: no write permission is requested, recovery that would need to write returns a clear error, and close does not touch the file.
 - IVF-PQ approximate search now computes distances in each metric's native space (L2, cosine with reconstructed-norm correction, dot product), matching the exact search path's ranking and scores. The unused precomputed centroid-distance table is no longer written (a format flag keeps older payloads readable).
+- The WAL size is optional when reopening a database. `SingleFileOpenOptions.wal_size` is now `Option<usize>` (default `None`): an existing file opens with the WAL size recorded in its header, and a new file gets the 4MB default. An explicit size (`.wal_size(n)`, unchanged) still creates new files with that size and rejects existing files whose WAL differs. The Node (`walSize`, `walSizeMb`) and Python (`wal_size`) options follow the same rule when left unset. Rust code that reads or assigns the field directly must now handle an `Option`.
 
 ### Fixed
 - A checkpoint whose header install fails now restores the previous WAL and header state. Previously the WAL was reset in memory first, so later commits could overwrite WAL records the on-disk header still named and lose committed transactions after a crash.
@@ -37,6 +38,8 @@ All notable changes to this project will be documented in this file.
 - Cosine IVF-PQ training normalizes vectors consistently with insert/search; `search_multi` honors `n_probe` and filters during candidate collection; a failed `train()` no longer permanently wedges the index; vectors without a node mapping are skipped instead of surfacing as node id 0.
 - Numeric options passed through the Node and Python bindings are range-validated with clear errors instead of silently wrapping (e.g. a negative cache size becoming a huge capacity, `cacheSize: 0` panicking).
 - The TypeScript `transaction()`/`batch()` helpers preserve the original commit error instead of masking it with `No active transaction` from the cleanup rollback.
+- Replica bootstrap works for primaries whose WAL is not 4MB (a custom size, the balanced or reopen-heavy profile, or a WAL shrunk by vacuum). Previously the replica opened the primary assuming the default size and failed with "WAL size mismatch".
+- Reopening with default options after a default vacuum (which shrinks the WAL) works. Previously it failed with "WAL size mismatch".
 - Fix ray schema ID reuse and add persistence integration tests (`5d73b0c`).
 - Deleting an edge that lives in the snapshot after re-adding it now hides it, instead of leaving it visible forever and double-counting it. WAL replay drops dangling edges written by older versions, which previously made every checkpoint fail.
 - Deleting a node deletes its vector embeddings, and ids of deleted nodes are no longer reused after a checkpoint and reopen.

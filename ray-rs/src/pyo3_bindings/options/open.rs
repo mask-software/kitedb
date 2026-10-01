@@ -124,7 +124,10 @@ pub struct OpenOptions {
   /// Page size in bytes (must be a supported positive power of two)
   #[pyo3(get, set)]
   pub page_size: Option<i64>,
-  /// WAL size in bytes (must be positive and at least 16 pages)
+  /// WAL size in bytes (at least 16 pages), fixed when the file is created.
+  /// None: a new file gets a 4MB WAL and an existing file keeps its own.
+  /// Set: a new file gets this size; an existing file with a different WAL
+  /// size fails to open.
   #[pyo3(get, set)]
   pub wal_size: Option<i64>,
   /// Enable auto-checkpoint when WAL usage exceeds threshold
@@ -755,5 +758,31 @@ mod tests {
     }
     .to_single_file_options()
     .is_ok());
+  }
+
+  #[test]
+  fn test_unset_wal_size_reopens_a_file_with_its_own_wal_size() {
+    use crate::core::single_file::{close_single_file, open_single_file};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("python-wal-size.kitedb");
+    let create = OpenOptions {
+      wal_size: Some(64 * 1024),
+      ..Default::default()
+    }
+    .to_single_file_options()
+    .expect("create options");
+    assert_eq!(create.wal_size, Some(64 * 1024));
+    close_single_file(open_single_file(&path, create).expect("create")).expect("close");
+
+    let reopen = OpenOptions::default()
+      .to_single_file_options()
+      .expect("default options");
+    assert_eq!(
+      reopen.wal_size, None,
+      "an unset wal_size must not become a default"
+    );
+    let db = open_single_file(&path, reopen).expect("reopen without wal_size");
+    close_single_file(db).expect("close reopened");
   }
 }

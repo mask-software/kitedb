@@ -52,6 +52,34 @@ fn replica_bootstrap_from_snapshot_reaches_primary_state() {
 }
 
 #[test]
+fn replica_bootstrap_works_for_primary_with_non_default_wal_size() {
+  let dir = tempfile::tempdir().expect("tempdir");
+  let primary_path = dir.path().join("primary-custom-wal.kitedb");
+  let replica_path = dir.path().join("replica-custom-wal.kitedb");
+
+  let primary = open_single_file(
+    &primary_path,
+    SingleFileOpenOptions::new()
+      .replication_role(ReplicationRole::Primary)
+      .wal_size(64 * 1024),
+  )
+  .expect("open primary");
+  primary.begin(false).expect("begin");
+  primary.create_node(Some("n1")).expect("n1");
+  primary.commit_with_token().expect("commit").expect("token");
+
+  let replica = open_replica(&replica_path, &primary_path).expect("open replica");
+  replica
+    .replica_bootstrap_from_snapshot()
+    .expect("bootstrap from a primary whose WAL is not the default size");
+  assert_eq!(replica.count_nodes(), primary.count_nodes());
+  assert!(replica.node_by_key("n1").is_some());
+
+  close_single_file(replica).expect("close replica");
+  close_single_file(primary).expect("close primary");
+}
+
+#[test]
 fn incremental_catch_up_applies_frames_in_order() {
   let dir = tempfile::tempdir().expect("tempdir");
   let primary_path = dir.path().join("primary-catch-up.kitedb");

@@ -1352,4 +1352,26 @@ mod option_validation_tests {
     candidate.wal_size_mb = Some((validation::MAX_BYTES / (1024 * 1024)) + 1);
     assert!(apply_kite_open_options(&candidate, &mut KiteOptions::new()).is_err());
   }
+
+  #[test]
+  fn unset_wal_size_mb_reopens_a_file_with_its_own_wal_size() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("kite-wal-size.kitedb");
+    let mut create = options();
+    create.wal_size_mb = Some(1);
+    let mut create_opts = KiteOptions::new();
+    apply_kite_open_options(&create, &mut create_opts).expect("create options");
+    RustKite::open(&path, create_opts)
+      .expect("create")
+      .close()
+      .expect("close");
+
+    let mut reopen_opts = KiteOptions::new();
+    apply_kite_open_options(&options(), &mut reopen_opts).expect("default options");
+    assert_eq!(reopen_opts.wal_size, None);
+    RustKite::open(&path, reopen_opts)
+      .expect("reopen without walSizeMb")
+      .close()
+      .expect("close reopened");
+  }
 }

@@ -152,6 +152,10 @@ pub struct OpenOptions {
   /// Page size in bytes (must be a supported positive power of two)
   pub page_size: Option<u32>,
   /// WAL size in bytes (must be positive and at least 16 pages; default: 4MB)
+  /// WAL size in bytes (at least 16 pages), fixed when the file is created.
+  /// Unset: a new file gets a 4MB WAL and an existing file keeps its own.
+  /// Set: a new file gets this size; an existing file with a different WAL
+  /// size fails to open.
   pub wal_size: Option<u32>,
   /// Enable auto-checkpoint when WAL usage exceeds threshold
   pub auto_checkpoint: Option<bool>,
@@ -576,6 +580,28 @@ mod open_option_validation_tests {
     for invalid in invalid_cases {
       assert!(build_core_otel_push_options(invalid).is_err());
     }
+  }
+
+  #[test]
+  fn unset_wal_size_reopens_a_file_with_its_own_wal_size() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("napi-wal-size.kitedb");
+    let create = OpenOptions {
+      wal_size: Some(64 * 1024),
+      ..Default::default()
+    }
+    .into_rust()
+    .expect("create options");
+    assert_eq!(create.wal_size, Some(64 * 1024));
+    close_single_file(open_single_file(&path, create).expect("create")).expect("close");
+
+    let reopen = OpenOptions::default().into_rust().expect("default options");
+    assert_eq!(
+      reopen.wal_size, None,
+      "an unset walSize must not become a default"
+    );
+    let db = open_single_file(&path, reopen).expect("reopen without walSize");
+    close_single_file(db).expect("close reopened");
   }
 }
 

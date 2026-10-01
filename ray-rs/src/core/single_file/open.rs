@@ -90,8 +90,14 @@ pub struct SingleFileOpenOptions {
   pub mvcc_max_chain_depth: Option<usize>,
   /// Page size (default 4KB, must be power of 2 between 4KB and 64KB)
   pub page_size: usize,
-  /// WAL size in bytes (default 4MB)
-  pub wal_size: usize,
+  /// WAL size in bytes. A database's WAL size is fixed when the file is
+  /// created (change it later with `resize_wal`).
+  ///
+  /// `None` (default): a new file gets a `WAL_DEFAULT_SIZE` (4MB) WAL, and an
+  /// existing file is opened with the WAL size recorded in its header.
+  /// `Some(n)`: a new file gets an `n`-byte WAL, and opening an existing file
+  /// whose WAL size differs fails.
+  pub wal_size: Option<usize>,
   /// Enable auto-checkpoint when WAL usage exceeds threshold (default true)
   pub auto_checkpoint: bool,
   /// WAL usage threshold (0.0-1.0) to trigger auto-checkpoint (default 0.5)
@@ -144,7 +150,7 @@ impl Default for SingleFileOpenOptions {
       mvcc_retention_ms: None,
       mvcc_max_chain_depth: None,
       page_size: DEFAULT_PAGE_SIZE,
-      wal_size: WAL_DEFAULT_SIZE,
+      wal_size: None,
       auto_checkpoint: true,
       checkpoint_threshold: 0.5,
       background_checkpoint: true,
@@ -219,8 +225,11 @@ impl SingleFileOpenOptions {
     self
   }
 
+  /// Require a WAL of `value` bytes: a new file is created with it, and an
+  /// existing file whose WAL size differs is rejected. Leave unset to accept
+  /// an existing file's WAL size.
   pub fn wal_size(mut self, value: usize) -> Self {
-    self.wal_size = value;
+    self.wal_size = Some(value);
     self
   }
 
@@ -931,12 +940,16 @@ fn open_single_file_internal(
       return open_single_file_internal(path, options, lock_file);
     }
 
-    let expected_wal_pages = pages_to_store(options.wal_size, header.page_size as usize) as u64;
-    if header.wal_page_count != expected_wal_pages {
-      return Err(KiteError::InvalidSnapshot(format!(
-        "WAL size mismatch: header has {} pages, options require {} pages",
-        header.wal_page_count, expected_wal_pages
-      )));
+    // The WAL size is fixed at creation. Only an explicitly requested size is
+    // checked; otherwise the header's size is used as-is.
+    if let Some(wal_size) = options.wal_size {
+      let expected_wal_pages = pages_to_store(wal_size, header.page_size as usize) as u64;
+      if header.wal_page_count != expected_wal_pages {
+        return Err(KiteError::InvalidSnapshot(format!(
+          "WAL size mismatch: header has {} pages, options require {} pages",
+          header.wal_page_count, expected_wal_pages
+        )));
+      }
     }
 
     (pager, header, false, header_slot)
@@ -945,7 +958,8 @@ fn open_single_file_internal(
     let mut pager = create_pager_with_locking(path, options.page_size, lock_file)?;
 
     // Calculate WAL page count
-    let wal_page_count = pages_to_store(options.wal_size, options.page_size) as u64;
+    let wal_size = options.wal_size.unwrap_or(WAL_DEFAULT_SIZE);
+    let wal_page_count = pages_to_store(wal_size, options.page_size) as u64;
 
     // Create initial header
     let header = DbHeaderV1::new(options.page_size as u32, wal_page_count);
@@ -1332,6 +1346,12 @@ fn migrate_legacy_single_header(
   temp_options.replication_sidecar_path = None;
   temp_options.replication_source_db_path = None;
   temp_options.replication_source_sidecar_path = None;
+  // Keep the legacy file's WAL size unless the caller required one (which the
+  // recovery open above has already checked against the legacy header).
+  if temp_options.wal_size.is_none() {
+    temp_options.wal_size =
+      Some(legacy_header.wal_page_count as usize * legacy_header.page_size as usize);
+  }
 
   let temp = match open_single_file_internal(&temp_path, temp_options, lock_file) {
     Ok(db) => db,
@@ -1720,6 +1740,20 @@ mod tests {
   }
 
   #[test]
+  fn test_replication_source_opens_primaries_with_any_wal_size() {
+    // Replica bootstrap opens the primary with default options; that must not
+    // assume the default WAL size.
+    let temp_dir = tempdir().expect("expected value");
+    let db_path = temp_dir.path().join("replication-source.kitedb");
+    let db = open_single_file(&db_path, SingleFileOpenOptions::new().wal_size(64 * 1024))
+      .expect("expected value");
+    close_single_file(db).expect("expected value");
+
+    let source = open_replication_source(&db_path).expect("open replication source");
+    drop(source);
+  }
+
+  #[test]
   fn test_open_rejects_wal_size_mismatch() {
     let temp_dir = tempdir().expect("expected value");
     let db_path = temp_dir.path().join("wal-size-mismatch.kitedb");
@@ -1769,6 +1803,29 @@ mod tests {
     let reopened = open_single_file(&db_path, options).expect("reopen migrated database");
     assert!(reopened.node_by_key("legacy-node").is_some());
     assert!(reopened.node_by_key("after-migration").is_some());
+    close_single_file(reopened).expect("close reopened database");
+  }
+
+  #[test]
+  fn legacy_migration_without_explicit_wal_size_keeps_the_files_wal_size() {
+    let temp_dir = tempdir().expect("temp dir");
+    let db_path = temp_dir.path().join("legacy-default-options.kitedb");
+    let (_, node_id, _, _, legacy_header) = build_legacy_single_header_fixture(&db_path);
+
+    let options = SingleFileOpenOptions::new().auto_checkpoint(false);
+    let migrated = open_single_file(&db_path, options.clone()).expect("automatic migration");
+    assert_eq!(migrated.node_by_key("legacy-node"), Some(node_id));
+    assert_eq!(
+      migrated.header.read().wal_page_count,
+      legacy_header.wal_page_count
+    );
+    close_single_file(migrated).expect("close migrated database");
+
+    let reopened = open_single_file(&db_path, options).expect("reopen migrated database");
+    assert_eq!(
+      reopened.header.read().wal_page_count,
+      legacy_header.wal_page_count
+    );
     close_single_file(reopened).expect("close reopened database");
   }
 
