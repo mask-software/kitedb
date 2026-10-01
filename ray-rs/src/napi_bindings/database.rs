@@ -1521,17 +1521,17 @@ pub struct JsEdge {
 /// Full edge representation for JS (src, etype, dst)
 #[napi(object)]
 pub struct JsFullEdge {
-  pub src: i64,
+  pub src: f64,
   pub etype: u32,
-  pub dst: i64,
+  pub dst: f64,
 }
 
 /// Edge input with properties for batch operations
 #[napi(object)]
 pub struct JsEdgeWithPropsInput {
-  pub src: i64,
+  pub src: f64,
   pub etype: u32,
-  pub dst: i64,
+  pub dst: f64,
   pub props: Vec<JsNodeProp>,
 }
 
@@ -1951,27 +1951,27 @@ impl Database {
 
   /// Upsert a node by ID (create if missing, update props)
   #[napi]
-  pub fn upsert_node_by_id(&self, node_id: i64, props: Vec<JsNodeProp>) -> Result<i64> {
+  pub fn upsert_node_by_id(&self, node_id: f64, props: Vec<JsNodeProp>) -> Result<i64> {
+    let node_id = validation::node_id("nodeId", node_id)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
-        let node_id_u = node_id as NodeId;
-        if !db.node_exists(node_id_u) {
-          db.create_node_with_id(node_id_u, None)
+        if !db.node_exists(node_id) {
+          db.create_node_with_id(node_id, None)
             .map_err(|e| Error::from_reason(format!("Failed to create node: {e}")))?;
         }
 
         for prop in props {
           let key_id = prop.key_id as PropKeyId;
           if matches!(prop.value.prop_type, PropType::Null) {
-            db.delete_node_prop(node_id_u, key_id)
+            db.delete_node_prop(node_id, key_id)
               .map_err(|e| Error::from_reason(format!("Failed to delete property: {e}")))?;
           } else {
-            db.set_node_prop(node_id_u, key_id, prop.value.into())
+            db.set_node_prop(node_id, key_id, prop.value.into())
               .map_err(|e| Error::from_reason(format!("Failed to set property: {e}")))?;
           }
         }
 
-        Ok(node_id)
+        Ok(node_id as i64)
       }
       None => Err(Error::from_reason("Database is closed")),
     }
@@ -1979,10 +1979,11 @@ impl Database {
 
   /// Delete a node
   #[napi]
-  pub fn delete_node(&self, node_id: i64) -> Result<()> {
+  pub fn delete_node(&self, node_id: f64) -> Result<()> {
+    let node_id = validation::node_id("nodeId", node_id)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => db
-        .delete_node(node_id as NodeId)
+        .delete_node(node_id)
         .map_err(|e| Error::from_reason(format!("Failed to delete node: {e}"))),
       None => Err(Error::from_reason("Database is closed")),
     }
@@ -1990,9 +1991,10 @@ impl Database {
 
   /// Check if a node exists
   #[napi]
-  pub fn node_exists(&self, node_id: i64) -> Result<bool> {
+  pub fn node_exists(&self, node_id: f64) -> Result<bool> {
+    let node_id = validation::node_id("nodeId", node_id)?;
     match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => Ok(db.node_exists(node_id as NodeId)),
+      Some(DatabaseInner::SingleFile(db)) => Ok(db.node_exists(node_id)),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -2008,9 +2010,10 @@ impl Database {
 
   /// Get the key for a node
   #[napi(js_name = "get_node_key")]
-  pub fn node_key(&self, node_id: i64) -> Result<Option<String>> {
+  pub fn node_key(&self, node_id: f64) -> Result<Option<String>> {
+    let node_id = validation::node_id("nodeId", node_id)?;
     match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => Ok(db.node_key(node_id as NodeId)),
+      Some(DatabaseInner::SingleFile(db)) => Ok(db.node_key(node_id)),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -2041,10 +2044,12 @@ impl Database {
 
   /// Add an edge
   #[napi]
-  pub fn add_edge(&self, src: i64, etype: u32, dst: i64) -> Result<()> {
+  pub fn add_edge(&self, src: f64, etype: u32, dst: f64) -> Result<()> {
+    let src = validation::node_id("src", src)?;
+    let dst = validation::node_id("dst", dst)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => db
-        .add_edge(src as NodeId, etype as ETypeId, dst as NodeId)
+        .add_edge(src, etype as ETypeId, dst)
         .map_err(|e| Error::from_reason(format!("Failed to add edge: {e}"))),
       None => Err(Error::from_reason("Database is closed")),
     }
@@ -2055,16 +2060,16 @@ impl Database {
   pub fn add_edges_batch(&self, edges: Vec<JsFullEdge>) -> Result<()> {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
-        let core_edges: Vec<(NodeId, ETypeId, NodeId)> = edges
+        let core_edges = edges
           .into_iter()
           .map(|edge| {
-            (
-              edge.src as NodeId,
+            Ok((
+              validation::node_id("src", edge.src)?,
               edge.etype as ETypeId,
-              edge.dst as NodeId,
-            )
+              validation::node_id("dst", edge.dst)?,
+            ))
           })
-          .collect();
+          .collect::<Result<Vec<(NodeId, ETypeId, NodeId)>>>()?;
         db.add_edges_batch(&core_edges)
           .map_err(|e| Error::from_reason(format!("Failed to add edges: {e}")))
       }
@@ -2077,7 +2082,7 @@ impl Database {
   pub fn add_edges_with_props_batch(&self, edges: Vec<JsEdgeWithPropsInput>) -> Result<()> {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
-        let core_edges: Vec<CoreEdgeWithProps> = edges
+        let core_edges = edges
           .into_iter()
           .map(|edge| {
             let props = edge
@@ -2085,14 +2090,14 @@ impl Database {
               .into_iter()
               .map(|prop| (prop.key_id as PropKeyId, prop.value.into()))
               .collect();
-            (
-              edge.src as NodeId,
+            Ok((
+              validation::node_id("src", edge.src)?,
               edge.etype as ETypeId,
-              edge.dst as NodeId,
+              validation::node_id("dst", edge.dst)?,
               props,
-            )
+            ))
           })
-          .collect();
+          .collect::<Result<Vec<CoreEdgeWithProps>>>()?;
         db.add_edges_with_props_batch(core_edges)
           .map_err(|e| Error::from_reason(format!("Failed to add edges: {e}")))
       }
@@ -2102,10 +2107,12 @@ impl Database {
 
   /// Add an edge by type name
   #[napi]
-  pub fn add_edge_by_name(&self, src: i64, etype_name: String, dst: i64) -> Result<()> {
+  pub fn add_edge_by_name(&self, src: f64, etype_name: String, dst: f64) -> Result<()> {
+    let src = validation::node_id("src", src)?;
+    let dst = validation::node_id("dst", dst)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => db
-        .add_edge_by_name(src as NodeId, &etype_name, dst as NodeId)
+        .add_edge_by_name(src, &etype_name, dst)
         .map_err(|e| Error::from_reason(format!("Failed to add edge: {e}"))),
       None => Err(Error::from_reason("Database is closed")),
     }
@@ -2117,11 +2124,13 @@ impl Database {
   #[napi]
   pub fn upsert_edge(
     &self,
-    src: i64,
+    src: f64,
     etype: u32,
-    dst: i64,
+    dst: f64,
     props: Vec<JsNodeProp>,
   ) -> Result<bool> {
+    let src = validation::node_id("src", src)?;
+    let dst = validation::node_id("dst", dst)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
         let updates: Vec<(PropKeyId, Option<PropValue>)> = props
@@ -2135,7 +2144,7 @@ impl Database {
           })
           .collect();
 
-        db.upsert_edge_with_props(src as NodeId, etype as ETypeId, dst as NodeId, updates)
+        db.upsert_edge_with_props(src, etype as ETypeId, dst, updates)
           .map_err(|e| Error::from_reason(format!("Failed to upsert edge: {e}")))
       }
       None => Err(Error::from_reason("Database is closed")),
@@ -2144,10 +2153,12 @@ impl Database {
 
   /// Delete an edge
   #[napi]
-  pub fn delete_edge(&self, src: i64, etype: u32, dst: i64) -> Result<()> {
+  pub fn delete_edge(&self, src: f64, etype: u32, dst: f64) -> Result<()> {
+    let src = validation::node_id("src", src)?;
+    let dst = validation::node_id("dst", dst)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => db
-        .delete_edge(src as NodeId, etype as ETypeId, dst as NodeId)
+        .delete_edge(src, etype as ETypeId, dst)
         .map_err(|e| Error::from_reason(format!("Failed to delete edge: {e}"))),
       None => Err(Error::from_reason("Database is closed")),
     }
@@ -2155,21 +2166,22 @@ impl Database {
 
   /// Check if an edge exists
   #[napi]
-  pub fn edge_exists(&self, src: i64, etype: u32, dst: i64) -> Result<bool> {
+  pub fn edge_exists(&self, src: f64, etype: u32, dst: f64) -> Result<bool> {
+    let src = validation::node_id("src", src)?;
+    let dst = validation::node_id("dst", dst)?;
     match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => {
-        Ok(db.edge_exists(src as NodeId, etype as ETypeId, dst as NodeId))
-      }
+      Some(DatabaseInner::SingleFile(db)) => Ok(db.edge_exists(src, etype as ETypeId, dst)),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
 
   /// Get outgoing edges for a node
   #[napi(js_name = "get_out_edges")]
-  pub fn out_edges(&self, node_id: i64) -> Result<Vec<JsEdge>> {
+  pub fn out_edges(&self, node_id: f64) -> Result<Vec<JsEdge>> {
+    let node_id = validation::node_id("nodeId", node_id)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(
-        db.out_edges(node_id as NodeId)
+        db.out_edges(node_id)
           .into_iter()
           .map(|(etype, dst)| JsEdge {
             etype,
@@ -2183,10 +2195,11 @@ impl Database {
 
   /// Get incoming edges for a node
   #[napi(js_name = "get_in_edges")]
-  pub fn in_edges(&self, node_id: i64) -> Result<Vec<JsEdge>> {
+  pub fn in_edges(&self, node_id: f64) -> Result<Vec<JsEdge>> {
+    let node_id = validation::node_id("nodeId", node_id)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(
-        db.in_edges(node_id as NodeId)
+        db.in_edges(node_id)
           .into_iter()
           .map(|(etype, src)| JsEdge {
             etype,
@@ -2200,18 +2213,20 @@ impl Database {
 
   /// Get out-degree for a node
   #[napi(js_name = "get_out_degree")]
-  pub fn out_degree(&self, node_id: i64) -> Result<i64> {
+  pub fn out_degree(&self, node_id: f64) -> Result<i64> {
+    let node_id = validation::node_id("nodeId", node_id)?;
     match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => Ok(db.out_degree(node_id as NodeId) as i64),
+      Some(DatabaseInner::SingleFile(db)) => Ok(db.out_degree(node_id) as i64),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
 
   /// Get in-degree for a node
   #[napi(js_name = "get_in_degree")]
-  pub fn in_degree(&self, node_id: i64) -> Result<i64> {
+  pub fn in_degree(&self, node_id: f64) -> Result<i64> {
+    let node_id = validation::node_id("nodeId", node_id)?;
     match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => Ok(db.in_degree(node_id as NodeId) as i64),
+      Some(DatabaseInner::SingleFile(db)) => Ok(db.in_degree(node_id) as i64),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -2236,9 +2251,9 @@ impl Database {
         db.list_edges(etype)
           .into_iter()
           .map(|e| JsFullEdge {
-            src: e.src as i64,
+            src: e.src as f64,
             etype: e.etype,
-            dst: e.dst as i64,
+            dst: e.dst as f64,
           })
           .collect(),
       ),
@@ -2260,9 +2275,9 @@ impl Database {
           db.list_edges(Some(etype))
             .into_iter()
             .map(|e| JsFullEdge {
-              src: e.src as i64,
+              src: e.src as f64,
               etype: e.etype,
-              dst: e.dst as i64,
+              dst: e.dst as f64,
             })
             .collect(),
         )
@@ -2366,9 +2381,9 @@ impl Database {
             batch
               .into_iter()
               .map(|edge| JsFullEdge {
-                src: edge.src as i64,
+                src: edge.src as f64,
                 etype: edge.etype,
-                dst: edge.dst as i64,
+                dst: edge.dst as f64,
               })
               .collect()
           })
@@ -2451,9 +2466,9 @@ impl Database {
             .items
             .into_iter()
             .map(|edge| JsFullEdge {
-              src: edge.src as i64,
+              src: edge.src as f64,
               etype: edge.etype,
-              dst: edge.dst as i64,
+              dst: edge.dst as f64,
             })
             .collect(),
           next_cursor: page.next_cursor,
@@ -2471,10 +2486,11 @@ impl Database {
 
   /// Set a node property
   #[napi]
-  pub fn set_node_prop(&self, node_id: i64, key_id: u32, value: JsPropValue) -> Result<()> {
+  pub fn set_node_prop(&self, node_id: f64, key_id: u32, value: JsPropValue) -> Result<()> {
+    let node_id = validation::node_id("nodeId", node_id)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => db
-        .set_node_prop(node_id as NodeId, key_id as PropKeyId, value.into())
+        .set_node_prop(node_id, key_id as PropKeyId, value.into())
         .map_err(|e| Error::from_reason(format!("Failed to set property: {e}"))),
       None => Err(Error::from_reason("Database is closed")),
     }
@@ -2484,13 +2500,14 @@ impl Database {
   #[napi]
   pub fn set_node_prop_by_name(
     &self,
-    node_id: i64,
+    node_id: f64,
     key_name: String,
     value: JsPropValue,
   ) -> Result<()> {
+    let node_id = validation::node_id("nodeId", node_id)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => db
-        .set_node_prop_by_name(node_id as NodeId, &key_name, value.into())
+        .set_node_prop_by_name(node_id, &key_name, value.into())
         .map_err(|e| Error::from_reason(format!("Failed to set property: {e}"))),
       None => Err(Error::from_reason("Database is closed")),
     }
@@ -2498,10 +2515,11 @@ impl Database {
 
   /// Delete a node property
   #[napi]
-  pub fn delete_node_prop(&self, node_id: i64, key_id: u32) -> Result<()> {
+  pub fn delete_node_prop(&self, node_id: f64, key_id: u32) -> Result<()> {
+    let node_id = validation::node_id("nodeId", node_id)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => db
-        .delete_node_prop(node_id as NodeId, key_id as PropKeyId)
+        .delete_node_prop(node_id, key_id as PropKeyId)
         .map_err(|e| Error::from_reason(format!("Failed to delete property: {e}"))),
       None => Err(Error::from_reason("Database is closed")),
     }
@@ -2509,21 +2527,22 @@ impl Database {
 
   /// Get a specific node property
   #[napi(js_name = "get_node_prop")]
-  pub fn node_prop(&self, node_id: i64, key_id: u32) -> Result<Option<JsPropValue>> {
+  pub fn node_prop(&self, node_id: f64, key_id: u32) -> Result<Option<JsPropValue>> {
+    let node_id = validation::node_id("nodeId", node_id)?;
     match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => Ok(
-        db.node_prop(node_id as NodeId, key_id as PropKeyId)
-          .map(|v| v.into()),
-      ),
+      Some(DatabaseInner::SingleFile(db)) => {
+        Ok(db.node_prop(node_id, key_id as PropKeyId).map(|v| v.into()))
+      }
       None => Err(Error::from_reason("Database is closed")),
     }
   }
 
   /// Get all properties for a node (returns array of {key_id, value} pairs)
   #[napi(js_name = "get_node_props")]
-  pub fn node_props(&self, node_id: i64) -> Result<Option<Vec<JsNodeProp>>> {
+  pub fn node_props(&self, node_id: f64) -> Result<Option<Vec<JsNodeProp>>> {
+    let node_id = validation::node_id("nodeId", node_id)?;
     match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => Ok(db.node_props(node_id as NodeId).map(|props| {
+      Some(DatabaseInner::SingleFile(db)) => Ok(db.node_props(node_id).map(|props| {
         props
           .into_iter()
           .map(|(k, v)| JsNodeProp {
@@ -2544,18 +2563,20 @@ impl Database {
   #[napi]
   pub fn set_edge_prop(
     &self,
-    src: i64,
+    src: f64,
     etype: u32,
-    dst: i64,
+    dst: f64,
     key_id: u32,
     value: JsPropValue,
   ) -> Result<()> {
+    let src = validation::node_id("src", src)?;
+    let dst = validation::node_id("dst", dst)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => db
         .set_edge_prop(
-          src as NodeId,
+          src,
           etype as ETypeId,
-          dst as NodeId,
+          dst,
           key_id as PropKeyId,
           value.into(),
         )
@@ -2568,21 +2589,17 @@ impl Database {
   #[napi]
   pub fn set_edge_prop_by_name(
     &self,
-    src: i64,
+    src: f64,
     etype: u32,
-    dst: i64,
+    dst: f64,
     key_name: String,
     value: JsPropValue,
   ) -> Result<()> {
+    let src = validation::node_id("src", src)?;
+    let dst = validation::node_id("dst", dst)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => db
-        .set_edge_prop_by_name(
-          src as NodeId,
-          etype as ETypeId,
-          dst as NodeId,
-          &key_name,
-          value.into(),
-        )
+        .set_edge_prop_by_name(src, etype as ETypeId, dst, &key_name, value.into())
         .map_err(|e| Error::from_reason(format!("Failed to set edge property: {e}"))),
       None => Err(Error::from_reason("Database is closed")),
     }
@@ -2590,15 +2607,12 @@ impl Database {
 
   /// Delete an edge property
   #[napi]
-  pub fn delete_edge_prop(&self, src: i64, etype: u32, dst: i64, key_id: u32) -> Result<()> {
+  pub fn delete_edge_prop(&self, src: f64, etype: u32, dst: f64, key_id: u32) -> Result<()> {
+    let src = validation::node_id("src", src)?;
+    let dst = validation::node_id("dst", dst)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => db
-        .delete_edge_prop(
-          src as NodeId,
-          etype as ETypeId,
-          dst as NodeId,
-          key_id as PropKeyId,
-        )
+        .delete_edge_prop(src, etype as ETypeId, dst, key_id as PropKeyId)
         .map_err(|e| Error::from_reason(format!("Failed to delete edge property: {e}"))),
       None => Err(Error::from_reason("Database is closed")),
     }
@@ -2608,20 +2622,17 @@ impl Database {
   #[napi(js_name = "get_edge_prop")]
   pub fn edge_prop(
     &self,
-    src: i64,
+    src: f64,
     etype: u32,
-    dst: i64,
+    dst: f64,
     key_id: u32,
   ) -> Result<Option<JsPropValue>> {
+    let src = validation::node_id("src", src)?;
+    let dst = validation::node_id("dst", dst)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(
-        db.edge_prop(
-          src as NodeId,
-          etype as ETypeId,
-          dst as NodeId,
-          key_id as PropKeyId,
-        )
-        .map(|v| v.into()),
+        db.edge_prop(src, etype as ETypeId, dst, key_id as PropKeyId)
+          .map(|v| v.into()),
       ),
       None => Err(Error::from_reason("Database is closed")),
     }
@@ -2629,20 +2640,21 @@ impl Database {
 
   /// Get all properties for an edge (returns array of {key_id, value} pairs)
   #[napi(js_name = "get_edge_props")]
-  pub fn edge_props(&self, src: i64, etype: u32, dst: i64) -> Result<Option<Vec<JsNodeProp>>> {
+  pub fn edge_props(&self, src: f64, etype: u32, dst: f64) -> Result<Option<Vec<JsNodeProp>>> {
+    let src = validation::node_id("src", src)?;
+    let dst = validation::node_id("dst", dst)?;
     match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => Ok(
-        db.edge_props(src as NodeId, etype as ETypeId, dst as NodeId)
-          .map(|props| {
-            props
-              .into_iter()
-              .map(|(k, v)| JsNodeProp {
-                key_id: k,
-                value: v.into(),
-              })
-              .collect()
-          }),
-      ),
+      Some(DatabaseInner::SingleFile(db)) => {
+        Ok(db.edge_props(src, etype as ETypeId, dst).map(|props| {
+          props
+            .into_iter()
+            .map(|(k, v)| JsNodeProp {
+              key_id: k,
+              value: v.into(),
+            })
+            .collect()
+        }))
+      }
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -2653,11 +2665,12 @@ impl Database {
 
   /// Set a vector embedding for a node
   #[napi]
-  pub fn set_node_vector(&self, node_id: i64, prop_key_id: u32, vector: Vec<f64>) -> Result<()> {
+  pub fn set_node_vector(&self, node_id: f64, prop_key_id: u32, vector: Vec<f64>) -> Result<()> {
+    let node_id = validation::node_id("nodeId", node_id)?;
     let vector_f32: Vec<f32> = vector.iter().map(|&v| v as f32).collect();
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => db
-        .set_node_vector(node_id as NodeId, prop_key_id as PropKeyId, &vector_f32)
+        .set_node_vector(node_id, prop_key_id as PropKeyId, &vector_f32)
         .map_err(|e| Error::from_reason(format!("Failed to set vector: {e}"))),
       None => Err(Error::from_reason("Database is closed")),
     }
@@ -2665,10 +2678,11 @@ impl Database {
 
   /// Get a vector embedding for a node
   #[napi(js_name = "get_node_vector")]
-  pub fn node_vector(&self, node_id: i64, prop_key_id: u32) -> Result<Option<Vec<f64>>> {
+  pub fn node_vector(&self, node_id: f64, prop_key_id: u32) -> Result<Option<Vec<f64>>> {
+    let node_id = validation::node_id("nodeId", node_id)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(
-        db.node_vector(node_id as NodeId, prop_key_id as PropKeyId)
+        db.node_vector(node_id, prop_key_id as PropKeyId)
           .map(|v| v.iter().map(|&f| f as f64).collect()),
       ),
       None => Err(Error::from_reason("Database is closed")),
@@ -2677,10 +2691,11 @@ impl Database {
 
   /// Delete a vector embedding for a node
   #[napi]
-  pub fn delete_node_vector(&self, node_id: i64, prop_key_id: u32) -> Result<()> {
+  pub fn delete_node_vector(&self, node_id: f64, prop_key_id: u32) -> Result<()> {
+    let node_id = validation::node_id("nodeId", node_id)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => db
-        .delete_node_vector(node_id as NodeId, prop_key_id as PropKeyId)
+        .delete_node_vector(node_id, prop_key_id as PropKeyId)
         .map_err(|e| Error::from_reason(format!("Failed to delete vector: {e}"))),
       None => Err(Error::from_reason("Database is closed")),
     }
@@ -2688,10 +2703,11 @@ impl Database {
 
   /// Check if a node has a vector embedding
   #[napi]
-  pub fn has_node_vector(&self, node_id: i64, prop_key_id: u32) -> Result<bool> {
+  pub fn has_node_vector(&self, node_id: f64, prop_key_id: u32) -> Result<bool> {
+    let node_id = validation::node_id("nodeId", node_id)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
-        Ok(db.has_node_vector(node_id as NodeId, prop_key_id as PropKeyId))
+        Ok(db.has_node_vector(node_id, prop_key_id as PropKeyId))
       }
       None => Err(Error::from_reason("Database is closed")),
     }
@@ -2805,10 +2821,11 @@ impl Database {
 
   /// Add a label to a node
   #[napi]
-  pub fn add_node_label(&self, node_id: i64, label_id: u32) -> Result<()> {
+  pub fn add_node_label(&self, node_id: f64, label_id: u32) -> Result<()> {
+    let node_id = validation::node_id("nodeId", node_id)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => db
-        .add_node_label(node_id as NodeId, label_id)
+        .add_node_label(node_id, label_id)
         .map_err(|e| Error::from_reason(format!("Failed to add label: {e}"))),
       None => Err(Error::from_reason("Database is closed")),
     }
@@ -2816,10 +2833,11 @@ impl Database {
 
   /// Add a label to a node by name
   #[napi]
-  pub fn add_node_label_by_name(&self, node_id: i64, label_name: String) -> Result<()> {
+  pub fn add_node_label_by_name(&self, node_id: f64, label_name: String) -> Result<()> {
+    let node_id = validation::node_id("nodeId", node_id)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => db
-        .add_node_label_by_name(node_id as NodeId, &label_name)
+        .add_node_label_by_name(node_id, &label_name)
         .map_err(|e| Error::from_reason(format!("Failed to add label: {e}"))),
       None => Err(Error::from_reason("Database is closed")),
     }
@@ -2827,10 +2845,11 @@ impl Database {
 
   /// Remove a label from a node
   #[napi]
-  pub fn remove_node_label(&self, node_id: i64, label_id: u32) -> Result<()> {
+  pub fn remove_node_label(&self, node_id: f64, label_id: u32) -> Result<()> {
+    let node_id = validation::node_id("nodeId", node_id)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => db
-        .remove_node_label(node_id as NodeId, label_id)
+        .remove_node_label(node_id, label_id)
         .map_err(|e| Error::from_reason(format!("Failed to remove label: {e}"))),
       None => Err(Error::from_reason("Database is closed")),
     }
@@ -2838,18 +2857,20 @@ impl Database {
 
   /// Check if a node has a label
   #[napi]
-  pub fn node_has_label(&self, node_id: i64, label_id: u32) -> Result<bool> {
+  pub fn node_has_label(&self, node_id: f64, label_id: u32) -> Result<bool> {
+    let node_id = validation::node_id("nodeId", node_id)?;
     match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => Ok(db.node_has_label(node_id as NodeId, label_id)),
+      Some(DatabaseInner::SingleFile(db)) => Ok(db.node_has_label(node_id, label_id)),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
 
   /// Get all labels for a node
   #[napi(js_name = "get_node_labels")]
-  pub fn node_labels(&self, node_id: i64) -> Result<Vec<u32>> {
+  pub fn node_labels(&self, node_id: f64) -> Result<Vec<u32>> {
+    let node_id = validation::node_id("nodeId", node_id)?;
     match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => Ok(db.node_labels(node_id as NodeId)),
+      Some(DatabaseInner::SingleFile(db)) => Ok(db.node_labels(node_id)),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -2867,14 +2888,11 @@ impl Database {
   #[napi]
   pub fn traverse_single(
     &self,
-    start_nodes: Vec<i64>,
+    start_nodes: Vec<f64>,
     direction: JsTraversalDirection,
     edge_type: Option<u32>,
   ) -> Result<Vec<JsTraversalResult>> {
-    let start: Vec<NodeId> = start_nodes
-      .into_iter()
-      .map(|id| validation::node_id("startNodes", id).map(|id| id as NodeId))
-      .collect::<Result<Vec<_>>>()?;
+    let start = validation::node_ids("startNodes", &start_nodes)?;
     let etype = edge_type;
 
     match self.inner.as_ref() {
@@ -2905,14 +2923,11 @@ impl Database {
   #[napi]
   pub fn traverse(
     &self,
-    start_nodes: Vec<i64>,
+    start_nodes: Vec<f64>,
     steps: Vec<JsTraversalStep>,
     limit: Option<u32>,
   ) -> Result<Vec<JsTraversalResult>> {
-    let start: Vec<NodeId> = start_nodes
-      .into_iter()
-      .map(|id| validation::node_id("startNodes", id).map(|id| id as NodeId))
-      .collect::<Result<Vec<_>>>()?;
+    let start = validation::node_ids("startNodes", &start_nodes)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
         let mut builder = RustTraversalBuilder::new(start);
@@ -2951,14 +2966,11 @@ impl Database {
   #[napi]
   pub fn traverse_depth(
     &self,
-    start_nodes: Vec<i64>,
+    start_nodes: Vec<f64>,
     edge_type: Option<u32>,
     options: JsTraverseOptions,
   ) -> Result<Vec<JsTraversalResult>> {
-    let start: Vec<NodeId> = start_nodes
-      .into_iter()
-      .map(|id| validation::node_id("startNodes", id).map(|id| id as NodeId))
-      .collect::<Result<Vec<_>>>()?;
+    let start = validation::node_ids("startNodes", &start_nodes)?;
     let opts = options.to_rust()?;
 
     match self.inner.as_ref() {
@@ -2979,11 +2991,8 @@ impl Database {
   /// @param steps - Array of traversal steps
   /// @returns Number of results
   #[napi]
-  pub fn traverse_count(&self, start_nodes: Vec<i64>, steps: Vec<JsTraversalStep>) -> Result<u32> {
-    let start: Vec<NodeId> = start_nodes
-      .into_iter()
-      .map(|id| validation::node_id("startNodes", id).map(|id| id as NodeId))
-      .collect::<Result<Vec<_>>>()?;
+  pub fn traverse_count(&self, start_nodes: Vec<f64>, steps: Vec<JsTraversalStep>) -> Result<u32> {
+    let start = validation::node_ids("startNodes", &start_nodes)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
         let mut builder = RustTraversalBuilder::new(start);
@@ -3015,14 +3024,11 @@ impl Database {
   #[napi]
   pub fn traverse_node_ids(
     &self,
-    start_nodes: Vec<i64>,
+    start_nodes: Vec<f64>,
     steps: Vec<JsTraversalStep>,
     limit: Option<u32>,
   ) -> Result<Vec<i64>> {
-    let start: Vec<NodeId> = start_nodes
-      .into_iter()
-      .map(|id| validation::node_id("startNodes", id).map(|id| id as NodeId))
-      .collect::<Result<Vec<_>>>()?;
+    let start = validation::node_ids("startNodes", &start_nodes)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
         let mut builder = RustTraversalBuilder::new(start);
@@ -3140,8 +3146,8 @@ impl Database {
   #[napi]
   pub fn shortest_path(
     &self,
-    source: i64,
-    target: i64,
+    source: f64,
+    target: f64,
     edge_type: Option<u32>,
     max_depth: Option<u32>,
   ) -> Result<JsPathResult> {
@@ -3169,8 +3175,8 @@ impl Database {
   #[napi]
   pub fn has_path(
     &self,
-    source: i64,
-    target: i64,
+    source: f64,
+    target: f64,
     edge_type: Option<u32>,
     max_depth: Option<u32>,
   ) -> Result<bool> {
@@ -3190,7 +3196,7 @@ impl Database {
   #[napi]
   pub fn reachable_nodes(
     &self,
-    source: i64,
+    source: f64,
     max_depth: u32,
     edge_type: Option<u32>,
   ) -> Result<Vec<i64>> {
@@ -3506,10 +3512,11 @@ impl Database {
 
   /// Invalidate all caches for a node
   #[napi]
-  pub fn cache_invalidate_node(&self, node_id: i64) -> Result<()> {
+  pub fn cache_invalidate_node(&self, node_id: f64) -> Result<()> {
+    let node_id = validation::node_id("nodeId", node_id)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
-        db.cache_invalidate_node(node_id as NodeId);
+        db.cache_invalidate_node(node_id);
         Ok(())
       }
       None => Err(Error::from_reason("Database is closed")),
@@ -3518,10 +3525,12 @@ impl Database {
 
   /// Invalidate caches for a specific edge
   #[napi]
-  pub fn cache_invalidate_edge(&self, src: i64, etype: u32, dst: i64) -> Result<()> {
+  pub fn cache_invalidate_edge(&self, src: f64, etype: u32, dst: f64) -> Result<()> {
+    let src = validation::node_id("src", src)?;
+    let dst = validation::node_id("dst", dst)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
-        db.cache_invalidate_edge(src as NodeId, etype as ETypeId, dst as NodeId);
+        db.cache_invalidate_edge(src, etype as ETypeId, dst);
         Ok(())
       }
       None => Err(Error::from_reason("Database is closed")),

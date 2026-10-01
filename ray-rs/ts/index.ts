@@ -68,6 +68,8 @@ export type {
 } from './schema'
 export type { RuntimeProfile } from '../index'
 
+import { AsyncLocalStorage } from 'async_hooks'
+
 // =============================================================================
 // Native Bindings
 // =============================================================================
@@ -80,6 +82,10 @@ import {
   Database as NativeDatabase,
   Kite as NativeKite,
   KiteInsertBuilder as NativeKiteInsertBuilder,
+  KiteInsertExecutorSingle as NativeKiteInsertExecutorSingle,
+  KiteInsertExecutorMany as NativeKiteInsertExecutorMany,
+  KiteUpsertExecutorSingle as NativeKiteUpsertExecutorSingle,
+  KiteUpsertExecutorMany as NativeKiteUpsertExecutorMany,
   KiteUpsertBuilder as NativeKiteUpsertBuilder,
   KiteUpdateBuilder as NativeKiteUpdateBuilder,
   KiteUpdateEdgeBuilder as NativeKiteUpdateEdgeBuilder,
@@ -203,6 +209,55 @@ function rollbackIfActive(
   }
 }
 
+// =============================================================================
+// Async Transaction Ownership
+// =============================================================================
+
+// The engine keeps one open transaction per database per OS thread, and all
+// JS on the main thread shares that thread. While an async `transaction()` is
+// suspended at an `await`, unrelated code runs, and its writes would silently
+// join (and roll back with) the open transaction. Ownership is therefore
+// tracked per async context; see `Kite.transaction()` for the semantics.
+
+/** An async `transaction()` that has not committed or rolled back yet. */
+interface OpenTransaction {
+  /** Resolves (never rejects) once the transaction has committed or rolled back. */
+  readonly settled: Promise<void>
+}
+
+/** The open async transaction of each Kite instance. */
+const openTransactions = new WeakMap<object, OpenTransaction>()
+/** Transactions owned by the current async context (inherited across awaits). */
+const ownedTransactions = new AsyncLocalStorage<ReadonlySet<OpenTransaction>>()
+
+const AsyncFunction = (async () => {}).constructor
+
+function transactionConflict(): Error {
+  return new Error(
+    'Another async transaction() is open on this database. A write or synchronous transaction() from ' +
+      'outside it would join it and roll back with it, so it is rejected. Run it inside that transaction, ' +
+      'or use `await db.transaction(async (tx) => ...)`, which waits for the open transaction to finish.',
+  )
+}
+
+/** Throw if `db` has an open async transaction that the current async context does not own. */
+function assertWriteAllowed(db: object | undefined): void {
+  const open = db && openTransactions.get(db)
+  if (open && !ownedTransactions.getStore()?.has(open)) {
+    throw transactionConflict()
+  }
+}
+
+/** Native builders and executors remember the Kite that created them for the write guard. */
+type KiteBound = { __db?: Kite }
+
+function bindKite<T extends object>(target: T, db: Kite | undefined): T {
+  if (db) {
+    ;(target as KiteBound).__db = db
+  }
+  return target
+}
+
 function nodeName(nodeType: NodeLike): string {
   return typeof nodeType === 'string' ? nodeType : nodeType.name
 }
@@ -246,10 +301,45 @@ function normalizeEntry(entry: InsertEntry): { key: unknown; props?: object | nu
 // Fluent Builder Wrappers
 // =============================================================================
 
+type NativeExecutor = abstract new (...args: any[]) => {
+  execute(): void
+  returning(): unknown
+}
+
+/**
+ * Executors write when `execute()` or `returning()` runs, so that is where the
+ * async-transaction write guard checks the Kite that created them.
+ */
+function guardedExecutor<TBase extends NativeExecutor>(Base: TBase): TBase {
+  abstract class Guarded extends Base {
+    execute(): void {
+      assertWriteAllowed((this as KiteBound).__db)
+      super.execute()
+    }
+
+    returning(): unknown {
+      assertWriteAllowed((this as KiteBound).__db)
+      return super.returning()
+    }
+  }
+  return Guarded
+}
+
+const GuardedInsertExecutorSingle = guardedExecutor(NativeKiteInsertExecutorSingle)
+const GuardedInsertExecutorMany = guardedExecutor(NativeKiteInsertExecutorMany)
+const GuardedUpsertExecutorSingle = guardedExecutor(NativeKiteUpsertExecutorSingle)
+const GuardedUpsertExecutorMany = guardedExecutor(NativeKiteUpsertExecutorMany)
+
+/** Give a native executor the write guard and the Kite of the builder that made it. */
+function guardExecutor<T extends object>(executor: T, guarded: NativeExecutor, builder: object): T {
+  Object.setPrototypeOf(executor, guarded.prototype)
+  return bindKite(executor, (builder as KiteBound).__db)
+}
+
 export class KiteInsertBuilder<N extends NodeSpec = NodeSpec> extends NativeKiteInsertBuilder {
-  static wrap(builder: NativeKiteInsertBuilder): KiteInsertBuilder {
+  static wrap(builder: NativeKiteInsertBuilder, db?: Kite): KiteInsertBuilder {
     Object.setPrototypeOf(builder, KiteInsertBuilder.prototype)
-    return builder as KiteInsertBuilder
+    return bindKite(builder, db) as KiteInsertBuilder
   }
 
   values(key: InferNodeInsert<N>['key'], props?: Omit<InferNodeInsert<N>, 'key'> | null): InsertExecutorSingle<N>
@@ -259,9 +349,11 @@ export class KiteInsertBuilder<N extends NodeSpec = NodeSpec> extends NativeKite
   values(keyOrEntry: unknown, props?: object | null): KiteInsertExecutorSingle {
     if (props === undefined && isRecord(keyOrEntry) && 'key' in keyOrEntry) {
       const normalized = normalizeEntry(keyOrEntry as InsertEntry)
-      return super.values(normalized.key, normalized.props) as InsertExecutorSingle<N>
+      const executor = super.values(normalized.key, normalized.props)
+      return guardExecutor(executor, GuardedInsertExecutorSingle, this) as InsertExecutorSingle<N>
     }
-    return super.values(keyOrEntry, props ?? undefined) as InsertExecutorSingle<N>
+    const executor = super.values(keyOrEntry, props ?? undefined)
+    return guardExecutor(executor, GuardedInsertExecutorSingle, this) as InsertExecutorSingle<N>
   }
 
   valuesMany(entries: Array<InferNodeInsert<N>>): InsertExecutorMany<N>
@@ -274,14 +366,15 @@ export class KiteInsertBuilder<N extends NodeSpec = NodeSpec> extends NativeKite
       }
       return entry
     })
-    return super.valuesMany(normalized) as InsertExecutorMany<N>
+    const executor = super.valuesMany(normalized)
+    return guardExecutor(executor, GuardedInsertExecutorMany, this) as InsertExecutorMany<N>
   }
 }
 
 export class KiteUpsertBuilder<N extends NodeSpec = NodeSpec> extends NativeKiteUpsertBuilder {
-  static wrap(builder: NativeKiteUpsertBuilder): KiteUpsertBuilder {
+  static wrap(builder: NativeKiteUpsertBuilder, db?: Kite): KiteUpsertBuilder {
     Object.setPrototypeOf(builder, KiteUpsertBuilder.prototype)
-    return builder as KiteUpsertBuilder
+    return bindKite(builder, db) as KiteUpsertBuilder
   }
 
   values(key: InferNodeUpsert<N>['key'], props?: Omit<InferNodeUpsert<N>, 'key'> | null): UpsertExecutorSingle<N>
@@ -291,9 +384,11 @@ export class KiteUpsertBuilder<N extends NodeSpec = NodeSpec> extends NativeKite
   values(keyOrEntry: unknown, props?: object | null): KiteUpsertExecutorSingle {
     if (props === undefined && isRecord(keyOrEntry) && 'key' in keyOrEntry) {
       const normalized = normalizeEntry(keyOrEntry as InsertEntry)
-      return super.values(normalized.key, normalized.props) as UpsertExecutorSingle<N>
+      const executor = super.values(normalized.key, normalized.props)
+      return guardExecutor(executor, GuardedUpsertExecutorSingle, this) as UpsertExecutorSingle<N>
     }
-    return super.values(keyOrEntry, props ?? undefined) as UpsertExecutorSingle<N>
+    const executor = super.values(keyOrEntry, props ?? undefined)
+    return guardExecutor(executor, GuardedUpsertExecutorSingle, this) as UpsertExecutorSingle<N>
   }
 
   valuesMany(entries: Array<InferNodeUpsert<N>>): UpsertExecutorMany<N>
@@ -306,7 +401,8 @@ export class KiteUpsertBuilder<N extends NodeSpec = NodeSpec> extends NativeKite
       }
       return entry
     })
-    return super.valuesMany(normalized) as UpsertExecutorMany<N>
+    const executor = super.valuesMany(normalized)
+    return guardExecutor(executor, GuardedUpsertExecutorMany, this) as UpsertExecutorMany<N>
   }
 }
 
@@ -314,6 +410,7 @@ type NativePropBuilder = abstract new (...args: any[]) => {
   set(propName: string, value: unknown): void
   unset(propName: string): void
   setAll(props: object): void
+  execute(): void
 }
 
 interface ChainablePropBuilder {
@@ -328,6 +425,9 @@ interface ChainablePropBuilder {
 /**
  * Native property builders mutate in place and return void. Return the builder
  * so calls chain: `db.update(User, 'alice').set('name', 'Alicia').execute()`.
+ *
+ * `execute()` runs the async-transaction write guard against the Kite that
+ * created the builder (see `Kite.transaction()`).
  *
  * The explicit return type keeps `this` in emitted declarations; an inferred
  * mixin type degrades it to `any`. The chainable signatures come first so they
@@ -351,39 +451,44 @@ function chainablePropBuilder<TBase extends NativePropBuilder>(
       super.setAll(props)
       return this
     }
+
+    execute(): void {
+      assertWriteAllowed((this as KiteBound).__db)
+      super.execute()
+    }
   }
   return Chainable
 }
 
 /** Builder for updating node properties */
 export class KiteUpdateBuilder extends chainablePropBuilder(NativeKiteUpdateBuilder) {
-  static wrap(builder: NativeKiteUpdateBuilder): KiteUpdateBuilder {
+  static wrap(builder: NativeKiteUpdateBuilder, db?: Kite): KiteUpdateBuilder {
     Object.setPrototypeOf(builder, KiteUpdateBuilder.prototype)
-    return builder as KiteUpdateBuilder
+    return bindKite(builder, db) as KiteUpdateBuilder
   }
 }
 
 /** Builder for upserting a node by ID */
 export class KiteUpsertByIdBuilder extends chainablePropBuilder(NativeKiteUpsertByIdBuilder) {
-  static wrap(builder: NativeKiteUpsertByIdBuilder): KiteUpsertByIdBuilder {
+  static wrap(builder: NativeKiteUpsertByIdBuilder, db?: Kite): KiteUpsertByIdBuilder {
     Object.setPrototypeOf(builder, KiteUpsertByIdBuilder.prototype)
-    return builder as KiteUpsertByIdBuilder
+    return bindKite(builder, db) as KiteUpsertByIdBuilder
   }
 }
 
 /** Builder for updating edge properties */
 export class KiteUpdateEdgeBuilder extends chainablePropBuilder(NativeKiteUpdateEdgeBuilder) {
-  static wrap(builder: NativeKiteUpdateEdgeBuilder): KiteUpdateEdgeBuilder {
+  static wrap(builder: NativeKiteUpdateEdgeBuilder, db?: Kite): KiteUpdateEdgeBuilder {
     Object.setPrototypeOf(builder, KiteUpdateEdgeBuilder.prototype)
-    return builder as KiteUpdateEdgeBuilder
+    return bindKite(builder, db) as KiteUpdateEdgeBuilder
   }
 }
 
 /** Builder for upserting edges (create if missing, update properties) */
 export class KiteUpsertEdgeBuilder extends chainablePropBuilder(NativeKiteUpsertEdgeBuilder) {
-  static wrap(builder: NativeKiteUpsertEdgeBuilder): KiteUpsertEdgeBuilder {
+  static wrap(builder: NativeKiteUpsertEdgeBuilder, db?: Kite): KiteUpsertEdgeBuilder {
     Object.setPrototypeOf(builder, KiteUpsertEdgeBuilder.prototype)
-    return builder as KiteUpsertEdgeBuilder
+    return bindKite(builder, db) as KiteUpsertEdgeBuilder
   }
 }
 
@@ -649,27 +754,74 @@ export class Kite extends NativeKite {
     return native as unknown as Kite
   }
 
+  /**
+   * Run `fn` in a transaction: commit when it returns (or its promise resolves),
+   * roll back when it throws (or its promise rejects). A call made while this
+   * context already has a transaction open joins that transaction.
+   *
+   * Async transactions and concurrency: the engine keeps one open transaction
+   * per database per thread, and all async code on the main thread shares that
+   * thread. While an async transaction waits at an `await`, other code runs, so
+   * ownership is tracked per async context (AsyncLocalStorage):
+   *
+   * - Inside `fn`, including code after its awaits and nested `transaction()`
+   *   calls, writes join the open transaction.
+   * - `transaction(async (tx) => ...)` called from outside waits until the open
+   *   transaction has committed or rolled back, then runs in its own
+   *   transaction. Only `async` functions are queued; a plain function that
+   *   returns a promise counts as synchronous.
+   * - A synchronous `transaction()` or a write (insert, upsert, update, link,
+   *   unlink, setProp, delete, batch, begin, commit, rollback, ...) from outside
+   *   throws instead of joining, because it would roll back with the open
+   *   transaction.
+   * - Reads are not isolated: from any context they see the open transaction's
+   *   uncommitted writes.
+   *
+   * The tracking lives in this wrapper; the raw native bindings do not have it.
+   */
   transaction<T>(fn: (ctx: Kite) => T | Promise<T>): T | Promise<T> {
+    const open = openTransactions.get(this)
+    if (open) {
+      if (ownedTransactions.getStore()?.has(open)) {
+        return fn(this)
+      }
+      if (fn instanceof AsyncFunction) {
+        return open.settled.then(() => this.transaction(fn))
+      }
+      throw transactionConflict()
+    }
     if (this.hasTransaction()) {
       return fn(this)
     }
 
+    let settle!: () => void
+    const tx: OpenTransaction = { settled: new Promise<void>((resolve) => (settle = resolve)) }
+    const owned = new Set(ownedTransactions.getStore())
+    owned.add(tx)
+
     this.begin()
     try {
-      const result = fn(this)
+      const result = ownedTransactions.run(owned, () => fn(this))
       if (result && typeof (result as Promise<T>).then === 'function') {
-        return (result as Promise<T>).then(
+        openTransactions.set(this, tx)
+        return Promise.resolve(result).then(
           (value) => {
+            // Release ownership first: commit() is guarded against outside callers.
+            openTransactions.delete(this)
             try {
               this.commit()
             } catch (err) {
               rollbackIfActive(this, true)
               throw err
+            } finally {
+              settle()
             }
             return value
           },
           (err) => {
+            openTransactions.delete(this)
             rollbackIfActive(this, true)
+            settle()
             throw err
           },
         )
@@ -682,6 +834,26 @@ export class Kite extends NativeKite {
     }
   }
 
+  begin(readOnly?: boolean | null): number {
+    assertWriteAllowed(this)
+    return super.begin(readOnly)
+  }
+
+  beginBulk(): number {
+    assertWriteAllowed(this)
+    return super.beginBulk()
+  }
+
+  commit(): void {
+    assertWriteAllowed(this)
+    return super.commit()
+  }
+
+  rollback(): void {
+    assertWriteAllowed(this)
+    return super.rollback()
+  }
+
   checkpoint(): void {
     return super.checkpoint()
   }
@@ -690,6 +862,7 @@ export class Kite extends NativeKite {
     if (operations.length === 0) {
       return []
     }
+    assertWriteAllowed(this)
 
     const nativeOps = new Set([
       'createNode',
@@ -831,14 +1004,22 @@ export class Kite extends NativeKite {
   }
 
   setProp(node: NodeIdLike, propName: string, value: unknown): void {
+    assertWriteAllowed(this)
     return super.setProp(nodeId(node), propName, value)
   }
 
   setProps(node: NodeIdLike, props: Record<string, unknown>): void {
+    assertWriteAllowed(this)
     return super.setProps(nodeId(node), props)
   }
 
+  deleteById(node: NodeIdLike): boolean {
+    assertWriteAllowed(this)
+    return super.deleteById(nodeId(node))
+  }
+
   deleteByKey(nodeType: NodeLike, key: unknown): boolean {
+    assertWriteAllowed(this)
     return super.deleteByKey(nodeName(nodeType), key)
   }
 
@@ -847,15 +1028,15 @@ export class Kite extends NativeKite {
   }
 
   insert(nodeType: NodeLike): KiteInsertBuilder {
-    return KiteInsertBuilder.wrap(super.insert(nodeName(nodeType)))
+    return KiteInsertBuilder.wrap(super.insert(nodeName(nodeType)), this)
   }
 
   upsert(nodeType: NodeLike): KiteUpsertBuilder {
-    return KiteUpsertBuilder.wrap(super.upsert(nodeName(nodeType)))
+    return KiteUpsertBuilder.wrap(super.upsert(nodeName(nodeType)), this)
   }
 
   updateByKey(nodeType: NodeLike, key: unknown): KiteUpdateBuilder {
-    return KiteUpdateBuilder.wrap(super.updateByKey(nodeName(nodeType), key))
+    return KiteUpdateBuilder.wrap(super.updateByKey(nodeName(nodeType), key), this)
   }
 
   update(nodeType: NodeLike, key: unknown): KiteUpdateBuilder {
@@ -863,11 +1044,11 @@ export class Kite extends NativeKite {
   }
 
   updateById(node: NodeIdLike): KiteUpdateBuilder {
-    return KiteUpdateBuilder.wrap(super.updateById(nodeId(node)))
+    return KiteUpdateBuilder.wrap(super.updateById(nodeId(node)), this)
   }
 
   upsertById(nodeType: NodeLike, nodeId: number): KiteUpsertByIdBuilder {
-    return KiteUpsertByIdBuilder.wrap(super.upsertById(nodeName(nodeType), nodeId))
+    return KiteUpsertByIdBuilder.wrap(super.upsertById(nodeName(nodeType), nodeId), this)
   }
 
   link(src: NodeIdLike, edgeType: EdgeLike, dst: NodeIdLike, props?: object | null): void
@@ -881,6 +1062,7 @@ export class Kite extends NativeKite {
     if (!edgeType || dst === undefined) {
       return new KiteLinkBuilder(this, nodeId(src))
     }
+    assertWriteAllowed(this)
     return super.link(
       nodeId(src),
       edgeName(edgeType),
@@ -890,6 +1072,7 @@ export class Kite extends NativeKite {
   }
 
   unlink(src: NodeIdLike, edgeType: EdgeLike, dst: NodeIdLike): boolean {
+    assertWriteAllowed(this)
     return super.unlink(nodeId(src), edgeName(edgeType), nodeId(dst))
   }
 
@@ -912,6 +1095,7 @@ export class Kite extends NativeKite {
     propName: string,
     value: unknown,
   ): void {
+    assertWriteAllowed(this)
     return super.setEdgeProp(nodeId(src), edgeName(edgeType), nodeId(dst), propName, value)
   }
 
@@ -921,19 +1105,23 @@ export class Kite extends NativeKite {
     dst: NodeIdLike,
     props: Record<string, unknown>,
   ): void {
+    assertWriteAllowed(this)
     return super.setEdgeProps(nodeId(src), edgeName(edgeType), nodeId(dst), props)
   }
 
   delEdgeProp(src: NodeIdLike, edgeType: EdgeLike, dst: NodeIdLike, propName: string): void {
+    assertWriteAllowed(this)
     return super.delEdgeProp(nodeId(src), edgeName(edgeType), nodeId(dst), propName)
   }
 
   updateEdge(src: NodeIdLike, edgeType: EdgeLike, dst: NodeIdLike): KiteUpdateEdgeBuilder {
-    return KiteUpdateEdgeBuilder.wrap(super.updateEdge(nodeId(src), edgeName(edgeType), nodeId(dst)))
+    const builder = super.updateEdge(nodeId(src), edgeName(edgeType), nodeId(dst))
+    return KiteUpdateEdgeBuilder.wrap(builder, this)
   }
 
   upsertEdge(src: NodeIdLike, edgeType: EdgeLike, dst: NodeIdLike): KiteUpsertEdgeBuilder {
-    return KiteUpsertEdgeBuilder.wrap(super.upsertEdge(nodeId(src), edgeName(edgeType), nodeId(dst)))
+    const builder = super.upsertEdge(nodeId(src), edgeName(edgeType), nodeId(dst))
+    return KiteUpsertEdgeBuilder.wrap(builder, this)
   }
 
   all(nodeType: NodeLike): Array<object> {

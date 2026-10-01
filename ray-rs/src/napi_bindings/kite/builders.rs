@@ -1,6 +1,10 @@
 //! Builder pattern implementations for Kite operations
 //!
 //! Contains insert, upsert, and update builders for nodes and edges.
+//!
+//! Executors clone their input on every run instead of consuming it:
+//! `batchAdaptive` retries the same executor after a failed write (WAL full),
+//! and the retry must insert the full rows.
 
 #![allow(clippy::type_complexity)]
 
@@ -99,17 +103,24 @@ pub struct KiteInsertExecutorSingle {
 impl KiteInsertExecutorSingle {
   /// Execute the insert without returning
   #[napi]
-  pub fn execute(&mut self) -> Result<()> {
-    let props = std::mem::take(&mut self.props);
-    insert_single_execute(&self.ray, &self.node_type, &self.key_suffix, props)
+  pub fn execute(&self) -> Result<()> {
+    insert_single_execute(
+      &self.ray,
+      &self.node_type,
+      &self.key_suffix,
+      self.props.clone(),
+    )
   }
 
   /// Execute the insert and return the node
   #[napi]
-  pub fn returning(&mut self, env: Env) -> Result<Object<'_>> {
-    let props = std::mem::take(&mut self.props);
-    let (node_ref, props) =
-      insert_single_returning(&self.ray, &self.node_type, &self.key_suffix, props)?;
+  pub fn returning(&self, env: Env) -> Result<Object<'_>> {
+    let (node_ref, props) = insert_single_returning(
+      &self.ray,
+      &self.node_type,
+      &self.key_suffix,
+      self.props.clone(),
+    )?;
     let (node_id, node_key, node_type) = node_ref.into_parts();
     node_to_js(&env, node_id, node_key, &node_type, props)
   }
@@ -127,17 +138,15 @@ pub struct KiteInsertExecutorMany {
 impl KiteInsertExecutorMany {
   /// Execute the inserts without returning
   #[napi]
-  pub fn execute(&mut self) -> Result<()> {
-    let entries = std::mem::take(&mut self.entries);
-    let _ = insert_many(&self.ray, &self.node_type, entries, false)?;
+  pub fn execute(&self) -> Result<()> {
+    let _ = insert_many(&self.ray, &self.node_type, self.entries.clone(), false)?;
     Ok(())
   }
 
   /// Execute the inserts and return nodes
   #[napi]
-  pub fn returning(&mut self, env: Env) -> Result<Vec<Object<'_>>> {
-    let entries = std::mem::take(&mut self.entries);
-    let results = insert_many(&self.ray, &self.node_type, entries, true)?;
+  pub fn returning(&self, env: Env) -> Result<Vec<Object<'_>>> {
+    let results = insert_many(&self.ray, &self.node_type, self.entries.clone(), true)?;
     let mut out = Vec::with_capacity(results.len());
     for (node_ref, props) in results.into_iter() {
       let props =
@@ -320,17 +329,24 @@ pub struct KiteUpsertExecutorSingle {
 impl KiteUpsertExecutorSingle {
   /// Execute the upsert without returning
   #[napi]
-  pub fn execute(&mut self) -> Result<()> {
-    let props = std::mem::take(&mut self.props);
-    upsert_single_execute(&self.ray, &self.node_type, &self.key_suffix, props)
+  pub fn execute(&self) -> Result<()> {
+    upsert_single_execute(
+      &self.ray,
+      &self.node_type,
+      &self.key_suffix,
+      self.props.clone(),
+    )
   }
 
   /// Execute the upsert and return the node
   #[napi]
-  pub fn returning(&mut self, env: Env) -> Result<Object<'_>> {
-    let props = std::mem::take(&mut self.props);
-    let (node_ref, props) =
-      upsert_single_returning(&self.ray, &self.node_type, &self.key_suffix, props)?;
+  pub fn returning(&self, env: Env) -> Result<Object<'_>> {
+    let (node_ref, props) = upsert_single_returning(
+      &self.ray,
+      &self.node_type,
+      &self.key_suffix,
+      self.props.clone(),
+    )?;
     let (node_id, node_key, node_type) = node_ref.into_parts();
     node_to_js(&env, node_id, node_key, &node_type, props)
   }
@@ -348,17 +364,15 @@ pub struct KiteUpsertExecutorMany {
 impl KiteUpsertExecutorMany {
   /// Execute the upserts without returning
   #[napi]
-  pub fn execute(&mut self) -> Result<()> {
-    let entries = std::mem::take(&mut self.entries);
-    let _ = upsert_many(&self.ray, &self.node_type, entries, false)?;
+  pub fn execute(&self) -> Result<()> {
+    let _ = upsert_many(&self.ray, &self.node_type, self.entries.clone(), false)?;
     Ok(())
   }
 
   /// Execute the upserts and return nodes
   #[napi]
-  pub fn returning(&mut self, env: Env) -> Result<Vec<Object<'_>>> {
-    let entries = std::mem::take(&mut self.entries);
-    let results = upsert_many(&self.ray, &self.node_type, entries, true)?;
+  pub fn returning(&self, env: Env) -> Result<Vec<Object<'_>>> {
+    let results = upsert_many(&self.ray, &self.node_type, self.entries.clone(), true)?;
     let mut out = Vec::with_capacity(results.len());
     for (node_ref, props) in results.into_iter() {
       let props =

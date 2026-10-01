@@ -12,6 +12,7 @@ use crate::api::vector_search::{
   VectorIndexStats as RustVectorIndexStats, VectorSearchHit as RustVectorSearchHit,
 };
 use crate::napi_bindings::validation;
+use crate::vector::distance::l2_norm;
 use crate::vector::{
   DistanceMetric as RustDistanceMetric, IvfConfig as RustIvfConfig, IvfIndex as RustIvfIndex,
   IvfPqConfig as RustIvfPqConfig, IvfPqIndex as RustIvfPqIndex, MultiQueryAggregation,
@@ -281,7 +282,7 @@ impl JsIvfIndex {
   /// Add training vectors
   ///
   /// Call this before train() with representative vectors from your dataset.
-  #[napi]
+  #[napi(catch_unwind)]
   pub fn add_training_vectors(&self, vectors: Vec<f64>, num_vectors: i32) -> Result<()> {
     let num_vectors =
       validation::non_negative_usize("numVectors", num_vectors as i64, validation::MAX_COUNT)?;
@@ -298,7 +299,7 @@ impl JsIvfIndex {
   /// Train the index on added training vectors
   ///
   /// This runs k-means clustering to create the inverted file structure.
-  #[napi]
+  #[napi(catch_unwind)]
   pub fn train(&self) -> Result<()> {
     let mut index = self
       .inner
@@ -312,8 +313,8 @@ impl JsIvfIndex {
   /// Insert a vector into the index
   ///
   /// The index must be trained first.
-  #[napi]
-  pub fn insert(&self, vector_id: i64, vector: Vec<f64>) -> Result<()> {
+  #[napi(catch_unwind)]
+  pub fn insert(&self, vector_id: f64, vector: Vec<f64>) -> Result<()> {
     let vector_id = validation::node_id("vectorId", vector_id)?;
     let mut index = self
       .inner
@@ -328,13 +329,14 @@ impl JsIvfIndex {
   /// Delete a vector from the index
   ///
   /// Requires the vector data to determine which cluster to remove from.
-  #[napi]
-  pub fn delete(&self, vector_id: i64, vector: Vec<f64>) -> Result<bool> {
+  #[napi(catch_unwind)]
+  pub fn delete(&self, vector_id: f64, vector: Vec<f64>) -> Result<bool> {
     let vector_id = validation::node_id("vectorId", vector_id)?;
     let mut index = self
       .inner
       .write()
       .map_err(|e| Error::from_reason(e.to_string()))?;
+    validation::vector_len("vector", vector.len(), index.dimensions)?;
     let vector_f32: Vec<f32> = vector.iter().map(|&v| v as f32).collect();
     index
       .delete(vector_id, &vector_f32)
@@ -355,7 +357,7 @@ impl JsIvfIndex {
   /// Search for k nearest neighbors
   ///
   /// Requires a VectorManifest to look up actual vector data.
-  #[napi]
+  #[napi(catch_unwind)]
   pub fn search(
     &self,
     manifest_json: String,
@@ -367,10 +369,12 @@ impl JsIvfIndex {
       .inner
       .read()
       .map_err(|e| Error::from_reason(e.to_string()))?;
+    validation::vector_len("query", query.len(), index.dimensions)?;
 
     // Parse manifest from JSON
     let manifest: VectorManifest = serde_json::from_str(&manifest_json)
       .map_err(|e| Error::from_reason(format!("Failed to parse manifest: {e}")))?;
+    validation::vector_len("manifest", manifest.config.dimensions, index.dimensions)?;
 
     let query_f32: Vec<f32> = query.iter().map(|&v| v as f32).collect();
 
@@ -394,7 +398,7 @@ impl JsIvfIndex {
   /// Search with multiple query vectors
   ///
   /// Aggregates results using the specified method.
-  #[napi]
+  #[napi(catch_unwind)]
   pub fn search_multi(
     &self,
     manifest_json: String,
@@ -407,10 +411,14 @@ impl JsIvfIndex {
       .inner
       .read()
       .map_err(|e| Error::from_reason(e.to_string()))?;
+    for (i, query) in queries.iter().enumerate() {
+      validation::vector_len(format_args!("queries[{i}]"), query.len(), index.dimensions)?;
+    }
 
     // Parse manifest from JSON
     let manifest: VectorManifest = serde_json::from_str(&manifest_json)
       .map_err(|e| Error::from_reason(format!("Failed to parse manifest: {e}")))?;
+    validation::vector_len("manifest", manifest.config.dimensions, index.dimensions)?;
 
     let queries_f32: Vec<Vec<f32>> = queries
       .iter()
@@ -467,7 +475,7 @@ impl JsIvfIndex {
   }
 
   /// Deserialize an index from bytes
-  #[napi(factory)]
+  #[napi(factory, catch_unwind)]
   pub fn deserialize(data: Buffer) -> Result<JsIvfIndex> {
     let index = crate::vector::ivf::serialize::deserialize_ivf(&data)
       .map_err(|e| Error::from_reason(format!("Failed to deserialize: {e}")))?;
@@ -537,7 +545,7 @@ impl JsIvfPqIndex {
   }
 
   /// Add training vectors
-  #[napi]
+  #[napi(catch_unwind)]
   pub fn add_training_vectors(&self, vectors: Vec<f64>, num_vectors: i32) -> Result<()> {
     let num_vectors =
       validation::non_negative_usize("numVectors", num_vectors as i64, validation::MAX_COUNT)?;
@@ -552,7 +560,7 @@ impl JsIvfPqIndex {
   }
 
   /// Train the index
-  #[napi]
+  #[napi(catch_unwind)]
   pub fn train(&self) -> Result<()> {
     let mut index = self
       .inner
@@ -564,8 +572,8 @@ impl JsIvfPqIndex {
   }
 
   /// Insert a vector
-  #[napi]
-  pub fn insert(&self, vector_id: i64, vector: Vec<f64>) -> Result<()> {
+  #[napi(catch_unwind)]
+  pub fn insert(&self, vector_id: f64, vector: Vec<f64>) -> Result<()> {
     let vector_id = validation::node_id("vectorId", vector_id)?;
     let mut index = self
       .inner
@@ -580,13 +588,14 @@ impl JsIvfPqIndex {
   /// Delete a vector
   ///
   /// Requires the vector data to determine which cluster to remove from.
-  #[napi]
-  pub fn delete(&self, vector_id: i64, vector: Vec<f64>) -> Result<bool> {
+  #[napi(catch_unwind)]
+  pub fn delete(&self, vector_id: f64, vector: Vec<f64>) -> Result<bool> {
     let vector_id = validation::node_id("vectorId", vector_id)?;
     let mut index = self
       .inner
       .write()
       .map_err(|e| Error::from_reason(e.to_string()))?;
+    validation::vector_len("vector", vector.len(), index.dimensions)?;
     let vector_f32: Vec<f32> = vector.iter().map(|&v| v as f32).collect();
     index
       .delete(vector_id, &vector_f32)
@@ -605,7 +614,7 @@ impl JsIvfPqIndex {
   }
 
   /// Search for k nearest neighbors using PQ distance approximation
-  #[napi]
+  #[napi(catch_unwind)]
   pub fn search(
     &self,
     manifest_json: String,
@@ -617,6 +626,7 @@ impl JsIvfPqIndex {
       .inner
       .read()
       .map_err(|e| Error::from_reason(e.to_string()))?;
+    validation::vector_len("query", query.len(), index.dimensions)?;
 
     // Parse manifest from JSON
     let manifest: VectorManifest = serde_json::from_str(&manifest_json)
@@ -644,7 +654,7 @@ impl JsIvfPqIndex {
   }
 
   /// Search with multiple query vectors
-  #[napi]
+  #[napi(catch_unwind)]
   pub fn search_multi(
     &self,
     manifest_json: String,
@@ -657,6 +667,9 @@ impl JsIvfPqIndex {
       .inner
       .read()
       .map_err(|e| Error::from_reason(e.to_string()))?;
+    for (i, query) in queries.iter().enumerate() {
+      validation::vector_len(format_args!("queries[{i}]"), query.len(), index.dimensions)?;
+    }
 
     // Parse manifest from JSON
     let manifest: VectorManifest = serde_json::from_str(&manifest_json)
@@ -719,7 +732,7 @@ impl JsIvfPqIndex {
   }
 
   /// Deserialize an index from bytes
-  #[napi(factory)]
+  #[napi(factory, catch_unwind)]
   pub fn deserialize(data: Buffer) -> Result<JsIvfPqIndex> {
     let index = crate::vector::ivf_pq::deserialize_ivf_pq(&data)
       .map_err(|e| Error::from_reason(format!("Failed to deserialize: {e}")))?;
@@ -741,13 +754,31 @@ pub struct JsBruteForceResult {
   pub similarity: f64,
 }
 
+/// Convert a JS vector for brute-force search.
+///
+/// Core cosine distance is `1 - dot` and assumes unit vectors, so cosine
+/// inputs are normalized here; a zero vector has no direction and is rejected.
+fn search_vector(field: impl std::fmt::Display, values: &[f64], cosine: bool) -> Result<Vec<f32>> {
+  let mut vector: Vec<f32> = values.iter().map(|&v| v as f32).collect();
+  if cosine {
+    let norm = l2_norm(&vector);
+    if norm <= 0.0 {
+      return Err(validation::invalid_argument(format!(
+        "{field} is a zero vector; cosine distance needs a non-zero vector"
+      )));
+    }
+    vector.iter_mut().for_each(|v| *v /= norm);
+  }
+  Ok(vector)
+}
+
 /// Perform brute-force search over all vectors
 ///
 /// Useful for small datasets or verifying IVF results.
-#[napi]
+#[napi(catch_unwind)]
 pub fn brute_force_search(
   vectors: Vec<Vec<f64>>,
-  node_ids: Vec<i64>,
+  node_ids: Vec<f64>,
   query: Vec<f64>,
   k: i32,
   metric: Option<JsDistanceMetric>,
@@ -757,25 +788,21 @@ pub fn brute_force_search(
       "vectors and node_ids must have same length",
     ));
   }
-  for &node_id in &node_ids {
-    validation::node_id("nodeIds", node_id)?;
-  }
+  let node_ids = validation::node_ids("nodeIds", &node_ids)?;
 
   let metric = metric.unwrap_or(JsDistanceMetric::Cosine);
   let rust_metric: RustDistanceMetric = metric.into();
   let distance_fn = rust_metric.distance_fn();
+  let cosine = rust_metric == RustDistanceMetric::Cosine;
 
-  let query_f32: Vec<f32> = query.iter().map(|&v| v as f32).collect();
+  let query_f32 = search_vector("query", &query, cosine)?;
 
-  let mut results: Vec<(i64, f32)> = vectors
-    .iter()
-    .zip(node_ids.iter())
-    .map(|(v, &node_id)| {
-      let v_f32: Vec<f32> = v.iter().map(|&x| x as f32).collect();
-      let dist = distance_fn(&query_f32, &v_f32);
-      (node_id, dist)
-    })
-    .collect();
+  let mut results: Vec<(i64, f32)> = Vec::with_capacity(vectors.len());
+  for (i, (v, &node_id)) in vectors.iter().zip(node_ids.iter()).enumerate() {
+    validation::vector_len(format_args!("vectors[{i}]"), v.len(), query.len())?;
+    let v_f32 = search_vector(format_args!("vectors[{i}]"), v, cosine)?;
+    results.push((node_id as i64, distance_fn(&query_f32, &v_f32)));
+  }
 
   // Sort by distance
   results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -995,8 +1022,8 @@ impl VectorIndex {
   }
 
   /// Set/update a vector for a node
-  #[napi]
-  pub fn set(&self, node_id: i64, vector: Vec<f64>) -> Result<()> {
+  #[napi(catch_unwind)]
+  pub fn set(&self, node_id: f64, vector: Vec<f64>) -> Result<()> {
     let node_id = validation::node_id("nodeId", node_id)?;
     let mut index = self
       .inner
@@ -1010,7 +1037,7 @@ impl VectorIndex {
 
   /// Get the vector for a node (if any)
   #[napi]
-  pub fn get(&self, node_id: i64) -> Result<Option<Vec<f64>>> {
+  pub fn get(&self, node_id: f64) -> Result<Option<Vec<f64>>> {
     let node_id = validation::node_id("nodeId", node_id)?;
     let index = self
       .inner
@@ -1025,7 +1052,7 @@ impl VectorIndex {
 
   /// Delete the vector for a node
   #[napi]
-  pub fn delete(&self, node_id: i64) -> Result<bool> {
+  pub fn delete(&self, node_id: f64) -> Result<bool> {
     let node_id = validation::node_id("nodeId", node_id)?;
     let mut index = self
       .inner
@@ -1036,7 +1063,7 @@ impl VectorIndex {
 
   /// Check if a node has a vector
   #[napi]
-  pub fn has(&self, node_id: i64) -> Result<bool> {
+  pub fn has(&self, node_id: f64) -> Result<bool> {
     let node_id = validation::node_id("nodeId", node_id)?;
     let index = self
       .inner
@@ -1046,7 +1073,7 @@ impl VectorIndex {
   }
 
   /// Build/rebuild the IVF index for faster search
-  #[napi]
+  #[napi(catch_unwind)]
   pub fn build_index(&self) -> Result<()> {
     let mut index = self
       .inner
@@ -1056,7 +1083,7 @@ impl VectorIndex {
   }
 
   /// Search for similar vectors
-  #[napi]
+  #[napi(catch_unwind)]
   pub fn search(&self, query: Vec<f64>, options: SimilarOptions) -> Result<Vec<VectorSearchHit>> {
     let mut index = self
       .inner

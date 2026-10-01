@@ -181,11 +181,11 @@ impl From<PathResult> for JsPathResult {
 #[derive(Debug, Clone)]
 pub struct JsPathConfig {
   /// Source node ID
-  pub source: i64,
+  pub source: f64,
   /// Target node ID (for single target)
-  pub target: Option<i64>,
+  pub target: Option<f64>,
   /// Multiple target node IDs (find path to any)
-  pub targets: Option<Vec<i64>>,
+  pub targets: Option<Vec<f64>>,
   /// Allowed edge types (empty = all)
   pub allowed_edge_types: Option<Vec<u32>>,
   /// Edge weight property key ID (optional)
@@ -203,12 +203,12 @@ impl JsPathConfig {
     let mut targets = HashSet::new();
 
     if let Some(target) = self.target {
-      targets.insert(validation::node_id("target", target)? as NodeId);
+      targets.insert(validation::node_id("target", target)?);
     }
 
     if let Some(target_list) = self.targets.as_ref() {
       for t in target_list {
-        targets.insert(validation::node_id("targets", *t)? as NodeId);
+        targets.insert(validation::node_id("targets", *t)?);
       }
     }
 
@@ -226,7 +226,7 @@ impl JsPathConfig {
     )?;
 
     Ok(PathConfig {
-      source: validation::node_id("source", self.source)? as NodeId,
+      source: validation::node_id("source", self.source)?,
       targets,
       allowed_etypes,
       direction: self
@@ -266,11 +266,8 @@ impl JsGraphAccessor {
     Self::default()
   }
 
-  fn start_nodes(start_nodes: Vec<i64>) -> napi::Result<Vec<NodeId>> {
-    start_nodes
-      .into_iter()
-      .map(|id| validation::node_id("startNodes", id).map(|id| id as NodeId))
-      .collect()
+  fn start_nodes(start_nodes: Vec<f64>) -> napi::Result<Vec<NodeId>> {
+    validation::node_ids("startNodes", &start_nodes)
   }
 
   /// Add an edge to the graph
@@ -282,13 +279,13 @@ impl JsGraphAccessor {
   #[napi]
   pub fn add_edge(
     &mut self,
-    src: i64,
+    src: f64,
     etype: u32,
-    dst: i64,
+    dst: f64,
     weight: Option<f64>,
   ) -> napi::Result<()> {
-    let src = validation::node_id("src", src)? as NodeId;
-    let dst = validation::node_id("dst", dst)? as NodeId;
+    let src = validation::node_id("src", src)?;
+    let dst = validation::node_id("dst", dst)?;
 
     self.out_edges.entry(src).or_default().push((etype, dst));
     self.in_edges.entry(dst).or_default().push((etype, src));
@@ -396,7 +393,7 @@ impl JsGraphAccessor {
   #[napi]
   pub fn traverse_single(
     &self,
-    start_nodes: Vec<i64>,
+    start_nodes: Vec<f64>,
     _direction: JsTraversalDirection,
     edge_type: Option<u32>,
   ) -> napi::Result<Vec<JsTraversalResult>> {
@@ -420,7 +417,7 @@ impl JsGraphAccessor {
   #[napi]
   pub fn traverse(
     &self,
-    start_nodes: Vec<i64>,
+    start_nodes: Vec<f64>,
     steps: Vec<JsTraversalStep>,
     limit: Option<u32>,
   ) -> napi::Result<Vec<JsTraversalResult>> {
@@ -458,7 +455,7 @@ impl JsGraphAccessor {
   #[napi]
   pub fn traverse_depth(
     &self,
-    start_nodes: Vec<i64>,
+    start_nodes: Vec<f64>,
     edge_type: Option<u32>,
     options: JsTraverseOptions,
   ) -> napi::Result<Vec<JsTraversalResult>> {
@@ -482,7 +479,7 @@ impl JsGraphAccessor {
   #[napi]
   pub fn traverse_count(
     &self,
-    start_nodes: Vec<i64>,
+    start_nodes: Vec<f64>,
     steps: Vec<JsTraversalStep>,
   ) -> napi::Result<u32> {
     let start = Self::start_nodes(start_nodes)?;
@@ -509,7 +506,7 @@ impl JsGraphAccessor {
   #[napi]
   pub fn traverse_node_ids(
     &self,
-    start_nodes: Vec<i64>,
+    start_nodes: Vec<f64>,
     steps: Vec<JsTraversalStep>,
     limit: Option<u32>,
   ) -> napi::Result<Vec<i64>> {
@@ -612,8 +609,8 @@ impl JsGraphAccessor {
   #[napi]
   pub fn shortest_path(
     &self,
-    source: i64,
-    target: i64,
+    source: f64,
+    target: f64,
     edge_type: Option<u32>,
     max_depth: Option<u32>,
   ) -> napi::Result<JsPathResult> {
@@ -641,8 +638,8 @@ impl JsGraphAccessor {
   #[napi]
   pub fn has_path(
     &self,
-    source: i64,
-    target: i64,
+    source: f64,
+    target: f64,
     edge_type: Option<u32>,
     max_depth: Option<u32>,
   ) -> napi::Result<bool> {
@@ -662,7 +659,7 @@ impl JsGraphAccessor {
   #[napi]
   pub fn reachable_nodes(
     &self,
-    source: i64,
+    source: f64,
     max_depth: u32,
     edge_type: Option<u32>,
   ) -> napi::Result<Vec<i64>> {
@@ -691,9 +688,9 @@ impl JsGraphAccessor {
 #[napi(object)]
 #[derive(Debug, Clone)]
 pub struct JsEdgeInput {
-  pub src: i64,
+  pub src: f64,
   pub etype: u32,
-  pub dst: i64,
+  pub dst: f64,
   pub weight: Option<f64>,
 }
 
@@ -728,7 +725,7 @@ pub fn traversal_step(direction: JsTraversalDirection, edge_type: Option<u32>) -
 /// @param target - Target node ID
 /// @returns Path configuration object
 #[napi]
-pub fn path_config(source: i64, target: i64) -> JsPathConfig {
+pub fn path_config(source: f64, target: f64) -> JsPathConfig {
   JsPathConfig {
     source,
     target: Some(target),
@@ -754,10 +751,10 @@ mod tests {
     // 1 --knows(1)--> 2 --knows(1)--> 3
     // 1 --follows(2)--> 4
     // 2 --follows(2)--> 5
-    graph.add_edge(1, 1, 2, Some(1.0)).expect("valid edge"); // 1 -knows-> 2
-    graph.add_edge(2, 1, 3, Some(1.0)).expect("valid edge"); // 2 -knows-> 3
-    graph.add_edge(1, 2, 4, Some(2.0)).expect("valid edge"); // 1 -follows-> 4
-    graph.add_edge(2, 2, 5, Some(2.0)).expect("valid edge"); // 2 -follows-> 5
+    graph.add_edge(1.0, 1, 2.0, Some(1.0)).expect("valid edge"); // 1 -knows-> 2
+    graph.add_edge(2.0, 1, 3.0, Some(1.0)).expect("valid edge"); // 2 -knows-> 3
+    graph.add_edge(1.0, 2, 4.0, Some(2.0)).expect("valid edge"); // 1 -follows-> 4
+    graph.add_edge(2.0, 2, 5.0, Some(2.0)).expect("valid edge"); // 2 -follows-> 5
     graph
   }
 
@@ -774,7 +771,7 @@ mod tests {
 
     let results = graph
       .traverse(
-        vec![1],
+        vec![1.0],
         vec![JsTraversalStep {
           direction: JsTraversalDirection::Out,
           edge_type: Some(1),
@@ -793,7 +790,7 @@ mod tests {
 
     let results = graph
       .traverse(
-        vec![1],
+        vec![1.0],
         vec![
           JsTraversalStep {
             direction: JsTraversalDirection::Out,
@@ -818,7 +815,7 @@ mod tests {
 
     let results = graph
       .traverse(
-        vec![1],
+        vec![1.0],
         vec![JsTraversalStep {
           direction: JsTraversalDirection::Out,
           edge_type: None,
@@ -838,7 +835,7 @@ mod tests {
     let graph = create_test_graph();
 
     let count = graph.traverse_count(
-      vec![1],
+      vec![1.0],
       vec![JsTraversalStep {
         direction: JsTraversalDirection::Out,
         edge_type: None,
@@ -854,7 +851,7 @@ mod tests {
 
     let ids = graph
       .traverse_node_ids(
-        vec![1],
+        vec![1.0],
         vec![JsTraversalStep {
           direction: JsTraversalDirection::Out,
           edge_type: Some(1),
@@ -872,8 +869,8 @@ mod tests {
 
     let result = graph
       .dijkstra(JsPathConfig {
-        source: 1,
-        target: Some(3),
+        source: 1.0,
+        target: Some(3.0),
         targets: None,
         allowed_edge_types: None,
         weight_key_id: None,
@@ -894,8 +891,8 @@ mod tests {
 
     let result = graph
       .bfs(JsPathConfig {
-        source: 1,
-        target: Some(3),
+        source: 1.0,
+        target: Some(3.0),
         targets: None,
         allowed_edge_types: None,
         weight_key_id: None,
@@ -913,7 +910,9 @@ mod tests {
   fn test_shortest_path_not_found() {
     let graph = create_test_graph();
 
-    let result = graph.shortest_path(1, 999, None, None).expect("valid path");
+    let result = graph
+      .shortest_path(1.0, 999.0, None, None)
+      .expect("valid path");
     assert!(!result.found);
     assert!(result.path.is_empty());
   }
@@ -922,17 +921,19 @@ mod tests {
   fn test_has_path() {
     let graph = create_test_graph();
 
-    assert!(graph.has_path(1, 3, None, None).expect("valid path"));
-    assert!(graph.has_path(1, 5, None, None).expect("valid path"));
-    assert!(!graph.has_path(1, 999, None, None).expect("valid path"));
-    assert!(!graph.has_path(3, 1, None, None).expect("valid path")); // No reverse path
+    assert!(graph.has_path(1.0, 3.0, None, None).expect("valid path"));
+    assert!(graph.has_path(1.0, 5.0, None, None).expect("valid path"));
+    assert!(!graph.has_path(1.0, 999.0, None, None).expect("valid path"));
+    assert!(!graph.has_path(3.0, 1.0, None, None).expect("valid path")); // No reverse path
   }
 
   #[test]
   fn test_reachable_nodes() {
     let graph = create_test_graph();
 
-    let reachable = graph.reachable_nodes(1, 2, None).expect("valid traversal");
+    let reachable = graph
+      .reachable_nodes(1.0, 2, None)
+      .expect("valid traversal");
 
     assert_eq!(reachable.len(), 4); // 2, 3, 4, 5
     let ids: HashSet<i64> = reachable.into_iter().collect();
@@ -951,16 +952,16 @@ mod tests {
     //   1   4
     //    \ /
     //     3
-    graph.add_edge(1, 1, 2, Some(1.0)).expect("valid edge");
-    graph.add_edge(1, 1, 3, Some(2.0)).expect("valid edge");
-    graph.add_edge(2, 1, 4, Some(1.0)).expect("valid edge");
-    graph.add_edge(3, 1, 4, Some(1.0)).expect("valid edge");
+    graph.add_edge(1.0, 1, 2.0, Some(1.0)).expect("valid edge");
+    graph.add_edge(1.0, 1, 3.0, Some(2.0)).expect("valid edge");
+    graph.add_edge(2.0, 1, 4.0, Some(1.0)).expect("valid edge");
+    graph.add_edge(3.0, 1, 4.0, Some(1.0)).expect("valid edge");
 
     let paths = graph
       .k_shortest(
         JsPathConfig {
-          source: 1,
-          target: Some(4),
+          source: 1.0,
+          target: Some(4.0),
           targets: None,
           allowed_edge_types: None,
           weight_key_id: None,
@@ -989,7 +990,7 @@ mod tests {
 
     let results = graph
       .traverse(
-        vec![1],
+        vec![1.0],
         vec![JsTraversalStep {
           direction: JsTraversalDirection::Out,
           edge_type: None,
@@ -1007,7 +1008,7 @@ mod tests {
 
     let results = graph
       .traverse_depth(
-        vec![1],
+        vec![1.0],
         Some(1), // Only "knows" edges
         JsTraverseOptions {
           direction: Some(JsTraversalDirection::Out),
@@ -1027,9 +1028,9 @@ mod tests {
 
   #[test]
   fn test_path_config_helper() {
-    let config = path_config(1, 5);
-    assert_eq!(config.source, 1);
-    assert_eq!(config.target, Some(5));
+    let config = path_config(1.0, 5.0);
+    assert_eq!(config.source, 1.0);
+    assert_eq!(config.target, Some(5.0));
   }
 
   #[test]
@@ -1066,8 +1067,8 @@ mod tests {
     .to_rust()
     .is_err());
     assert!(JsPathConfig {
-      source: -1,
-      target: Some(1),
+      source: -1.0,
+      target: Some(1.0),
       targets: None,
       allowed_edge_types: None,
       weight_key_id: None,
