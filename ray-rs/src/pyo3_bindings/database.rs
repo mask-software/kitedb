@@ -9,6 +9,7 @@ use pyo3::types::{PyDict, PyList};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::RwLock;
+use std::time::{Duration, Instant};
 
 use crate::api::kite::KiteRuntimeProfile as RustKiteRuntimeProfile;
 use crate::backup as core_backup;
@@ -82,21 +83,6 @@ macro_rules! dispatch_ok {
   }};
 }
 
-/// Dispatch to mutable single-file implementation
-/// Uses write lock for exclusive access
-macro_rules! dispatch_mut {
-  ($self:expr, |$sf:ident| $sf_expr:expr, |$gf:ident| $gf_expr:expr) => {{
-    let mut guard = $self
-      .inner
-      .write()
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    match guard.as_mut() {
-      Some(DatabaseInner::SingleFile($sf)) => $sf_expr,
-      None => Err(PyRuntimeError::new_err("Database is closed")),
-    }
-  }};
-}
-
 /// Dispatch for write operations
 macro_rules! dispatch_tx {
   ($self:expr, |$sf:ident| $sf_expr:expr, |$handle:ident| $gf_expr:expr) => {{
@@ -139,11 +125,61 @@ macro_rules! dispatch_tx {
 ///     results = list(executor.map(read_node, ["user:1", "user:2", "user:3"]))
 /// ```
 ///
-/// Note: Python's GIL is released during Rust operations, enabling true
-/// parallelism for database I/O operations.
+/// Long-running operations (open, close, commit, checkpoint, optimize, vacuum,
+/// export/import, backup, replication catch-up and `wait_for_token`) release
+/// the GIL, so other Python threads keep running while they block on I/O.
 #[pyclass(name = "Database")]
 pub struct PyDatabase {
   pub(crate) inner: RwLock<Option<DatabaseInner>>,
+}
+
+/// Poll interval for `wait_for_token`, matching the core wait loop.
+const TOKEN_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+impl PyDatabase {
+  fn with_db<T>(&self, f: impl FnOnce(&RustSingleFileDB) -> PyResult<T>) -> PyResult<T> {
+    let guard = self
+      .inner
+      .read()
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    match guard.as_ref() {
+      Some(DatabaseInner::SingleFile(db)) => f(db),
+      None => Err(PyRuntimeError::new_err("Database is closed")),
+    }
+  }
+
+  /// Runs `f` under the read lock with the GIL released.
+  ///
+  /// The lock is taken inside `allow_threads`, so this thread never holds it
+  /// while waiting for the GIL (which would deadlock against a thread that
+  /// holds the GIL and waits for the lock).
+  fn with_db_nogil<T: Send>(
+    &self,
+    py: Python<'_>,
+    f: impl FnOnce(&RustSingleFileDB) -> PyResult<T> + Send,
+  ) -> PyResult<T> {
+    py.allow_threads(|| self.with_db(f))
+  }
+
+  /// Takes the database out of the handle and closes it with the GIL released.
+  fn close_nogil(
+    &self,
+    py: Python<'_>,
+    close: impl FnOnce(RustSingleFileDB) -> crate::error::Result<()> + Send,
+  ) -> PyResult<()> {
+    py.allow_threads(|| {
+      let mut guard = self
+        .inner
+        .write()
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+      match guard.take() {
+        Some(DatabaseInner::SingleFile(db)) => {
+          close(*db).map_err(|e| PyRuntimeError::new_err(format!("Failed to close: {e}")))
+        }
+        None => Ok(()),
+      }
+    })
+  }
 }
 
 #[pymethods]
@@ -154,7 +190,7 @@ impl PyDatabase {
 
   #[new]
   #[pyo3(signature = (path, options=None))]
-  fn new(path: String, options: Option<OpenOptions>) -> PyResult<Self> {
+  fn new(py: Python<'_>, path: String, options: Option<OpenOptions>) -> PyResult<Self> {
     let options = options.unwrap_or_default();
     let path_buf = PathBuf::from(&path);
 
@@ -175,7 +211,8 @@ impl PyDatabase {
     };
 
     let opts = options.to_single_file_options()?;
-    let db = open_single_file(&db_path, opts)
+    let db = py
+      .allow_threads(|| open_single_file(&db_path, opts))
       .map_err(|e| PyRuntimeError::new_err(format!("Failed to open database: {e}")))?;
     Ok(PyDatabase {
       inner: RwLock::new(Some(DatabaseInner::SingleFile(Box::new(db)))),
@@ -184,41 +221,23 @@ impl PyDatabase {
 
   #[staticmethod]
   #[pyo3(signature = (path, options=None))]
-  fn open(path: String, options: Option<OpenOptions>) -> PyResult<Self> {
-    Self::new(path, options)
+  fn open(py: Python<'_>, path: String, options: Option<OpenOptions>) -> PyResult<Self> {
+    Self::new(py, path, options)
   }
 
-  fn close(&self) -> PyResult<()> {
-    let mut guard = self
-      .inner
-      .write()
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    if let Some(db) = guard.take() {
-      match db {
-        DatabaseInner::SingleFile(db) => close_single_file(*db)
-          .map_err(|e| PyRuntimeError::new_err(format!("Failed to close: {e}")))?,
-      }
-    }
-    Ok(())
+  fn close(&self, py: Python<'_>) -> PyResult<()> {
+    self.close_nogil(py, close_single_file)
   }
 
   #[pyo3(signature = (threshold))]
-  fn close_with_checkpoint_if_wal_over(&self, threshold: f64) -> PyResult<()> {
+  fn close_with_checkpoint_if_wal_over(&self, py: Python<'_>, threshold: f64) -> PyResult<()> {
     let threshold = validation::ratio("threshold", threshold)?;
-    let mut guard = self
-      .inner
-      .write()
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    if let Some(db) = guard.take() {
-      match db {
-        DatabaseInner::SingleFile(db) => close_single_file_with_options(
-          *db,
-          RustSingleFileCloseOptions::new().checkpoint_if_wal_usage_at_least(threshold),
-        )
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to close: {e}")))?,
-      }
-    }
-    Ok(())
+    self.close_nogil(py, |db| {
+      close_single_file_with_options(
+        db,
+        RustSingleFileCloseOptions::new().checkpoint_if_wal_usage_at_least(threshold),
+      )
+    })
   }
 
   fn __enter__(slf: PyRef<'_, Self>) -> PyResult<PyRef<'_, Self>> {
@@ -228,11 +247,12 @@ impl PyDatabase {
   #[pyo3(signature = (_exc_type=None, _exc_value=None, _traceback=None))]
   fn __exit__(
     &self,
+    py: Python<'_>,
     _exc_type: Option<PyObject>,
     _exc_value: Option<PyObject>,
     _traceback: Option<PyObject>,
   ) -> PyResult<bool> {
-    self.close()?;
+    self.close(py)?;
     Ok(false)
   }
 
@@ -265,26 +285,21 @@ impl PyDatabase {
   // ==========================================================================
 
   #[pyo3(signature = (read_only=None))]
-  fn begin(&self, read_only: Option<bool>) -> PyResult<i64> {
+  fn begin(&self, py: Python<'_>, read_only: Option<bool>) -> PyResult<i64> {
     let read_only = read_only.unwrap_or(false);
-    dispatch!(
-      self,
-      |db| transaction::begin_single_file(db, read_only),
-      |_db| { unreachable!("multi-file database support removed") }
-    )
+    // Begin waits on the core checkpoint gate. A checkpoint holding it waits for
+    // other threads' transactions to finish, so blocking here with the GIL held
+    // would starve those threads and deadlock.
+    self.with_db_nogil(py, |db| transaction::begin_single_file(db, read_only))
   }
 
   /// Begin a bulk-load transaction (fast path, MVCC disabled)
-  fn begin_bulk(&self) -> PyResult<i64> {
-    dispatch!(self, |db| transaction::begin_bulk_single_file(db), |_db| {
-      unreachable!("multi-file database support removed")
-    })
+  fn begin_bulk(&self, py: Python<'_>) -> PyResult<i64> {
+    self.with_db_nogil(py, transaction::begin_bulk_single_file)
   }
 
-  fn commit(&self) -> PyResult<()> {
-    dispatch!(self, |db| transaction::commit_single_file(db), |_db| {
-      unreachable!("multi-file database support removed")
-    })
+  fn commit(&self, py: Python<'_>) -> PyResult<()> {
+    self.with_db_nogil(py, transaction::commit_single_file)
   }
 
   fn rollback(&self) -> PyResult<()> {
@@ -298,30 +313,39 @@ impl PyDatabase {
   }
 
   /// Commit and return replication commit token (e.g. "2:41") when available.
-  fn commit_with_token(&self) -> PyResult<Option<String>> {
-    dispatch!(
-      self,
-      |db| db
-        .commit_with_token()
+  fn commit_with_token(&self, py: Python<'_>) -> PyResult<Option<String>> {
+    self.with_db_nogil(py, |db| {
+      db.commit_with_token()
         .map(|token| token.map(|value| value.to_string()))
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to commit: {e}"))),
-      |_db| { unreachable!("multi-file database support removed") }
-    )
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to commit: {e}")))
+    })
   }
 
   /// Wait until this DB has observed at least the provided commit token.
-  fn wait_for_token(&self, token: String, timeout_ms: i64) -> PyResult<bool> {
+  ///
+  /// Polls with the GIL released and holds the read lock only for each check,
+  /// so other threads can catch up, run maintenance or close meanwhile.
+  fn wait_for_token(&self, py: Python<'_>, token: String, timeout_ms: i64) -> PyResult<bool> {
     let timeout_ms =
       validation::non_negative_u64("timeout_ms", timeout_ms, validation::MAX_DURATION_MS as u64)?;
     let token = CommitToken::from_str(&token)
       .map_err(|e| PyRuntimeError::new_err(format!("Invalid token: {e}")))?;
-    dispatch!(
-      self,
-      |db| db
-        .wait_for_token(token, timeout_ms)
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed waiting for token: {e}"))),
-      |_db| { unreachable!("multi-file database support removed") }
-    )
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    py.allow_threads(|| loop {
+      // A zero timeout makes the core call a single non-blocking check.
+      let observed = self.with_db(|db| {
+        db.wait_for_token(token, 0)
+          .map_err(|e| PyRuntimeError::new_err(format!("Failed waiting for token: {e}")))
+      })?;
+      if observed {
+        return Ok(true);
+      }
+      let now = Instant::now();
+      if now >= deadline {
+        return Ok(false);
+      }
+      std::thread::sleep(TOKEN_POLL_INTERVAL.min(deadline - now));
+    })
   }
 
   /// Primary replication status dictionary when role=primary, else None.
@@ -493,39 +517,30 @@ impl PyDatabase {
   }
 
   /// Bootstrap replica state from source snapshot.
-  fn replica_bootstrap_from_snapshot(&self) -> PyResult<()> {
-    dispatch!(
-      self,
-      |db| db
-        .replica_bootstrap_from_snapshot()
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to bootstrap replica: {e}"))),
-      |_db| { unreachable!("multi-file database support removed") }
-    )
+  fn replica_bootstrap_from_snapshot(&self, py: Python<'_>) -> PyResult<()> {
+    self.with_db_nogil(py, |db| {
+      db.replica_bootstrap_from_snapshot()
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to bootstrap replica: {e}")))
+    })
   }
 
   /// Pull and apply at most max_frames frames on replica.
-  fn replica_catch_up_once(&self, max_frames: i64) -> PyResult<i64> {
+  fn replica_catch_up_once(&self, py: Python<'_>, max_frames: i64) -> PyResult<i64> {
     let max_frames =
       validation::non_negative_usize("max_frames", max_frames, validation::MAX_COUNT)?;
-    dispatch!(
-      self,
-      |db| db
-        .replica_catch_up_once(max_frames)
+    self.with_db_nogil(py, |db| {
+      db.replica_catch_up_once(max_frames)
         .map(|count| count as i64)
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed replica catch-up: {e}"))),
-      |_db| { unreachable!("multi-file database support removed") }
-    )
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed replica catch-up: {e}")))
+    })
   }
 
   /// Force a replica reseed from source snapshot.
-  fn replica_reseed_from_snapshot(&self) -> PyResult<()> {
-    dispatch!(
-      self,
-      |db| db
-        .replica_reseed_from_snapshot()
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to reseed replica: {e}"))),
-      |_db| { unreachable!("multi-file database support removed") }
-    )
+  fn replica_reseed_from_snapshot(&self, py: Python<'_>) -> PyResult<()> {
+    self.with_db_nogil(py, |db| {
+      db.replica_reseed_from_snapshot()
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to reseed replica: {e}")))
+    })
   }
 
   // ==========================================================================
@@ -542,19 +557,17 @@ impl PyDatabase {
   }
 
   fn delete_node(&self, node_id: i64) -> PyResult<()> {
-    dispatch_tx!(
-      self,
-      |db| nodes::delete_node_single(db, node_id as NodeId),
-      |h| nodes::delete_node_single(h, node_id as NodeId)
-    )
+    let node_id = validation::node_id("node_id", node_id)?;
+    dispatch_tx!(self, |db| nodes::delete_node_single(db, node_id), |h| {
+      nodes::delete_node_single(h, node_id)
+    })
   }
 
   fn node_exists(&self, node_id: i64) -> PyResult<bool> {
-    dispatch_ok!(
-      self,
-      |db| nodes::node_exists_single(db, node_id as NodeId),
-      |db| nodes::node_exists_single(db, node_id as NodeId)
-    )
+    let node_id = validation::node_id("node_id", node_id)?;
+    dispatch_ok!(self, |db| nodes::node_exists_single(db, node_id), |db| {
+      nodes::node_exists_single(db, node_id)
+    })
   }
 
   #[pyo3(name = "get_node_by_key")]
@@ -566,11 +579,10 @@ impl PyDatabase {
 
   #[pyo3(name = "get_node_key")]
   fn node_key(&self, node_id: i64) -> PyResult<Option<String>> {
-    dispatch_ok!(
-      self,
-      |db| nodes::node_key_single(db, node_id as NodeId),
-      |db| nodes::node_key_single(db, node_id as NodeId)
-    )
+    let node_id = validation::node_id("node_id", node_id)?;
+    dispatch_ok!(self, |db| nodes::node_key_single(db, node_id), |db| {
+      nodes::node_key_single(db, node_id)
+    })
   }
 
   fn list_nodes(&self) -> PyResult<Vec<i64>> {
@@ -603,52 +615,46 @@ impl PyDatabase {
 
   fn batch_create_nodes(
     &self,
+    py: Python<'_>,
     input_nodes: Vec<(String, Vec<(u32, PropValue)>)>,
   ) -> PyResult<Vec<i64>> {
-    let guard = self
-      .inner
-      .read()
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    match guard.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => {
-        let mut ids = Vec::with_capacity(input_nodes.len());
-        let mut keys = Vec::with_capacity(input_nodes.len());
-        let mut props_list = Vec::with_capacity(input_nodes.len());
-        for (key, props) in input_nodes {
-          keys.push(key);
-          props_list.push(props);
-        }
+    self.with_db_nogil(py, |db| {
+      let mut ids = Vec::with_capacity(input_nodes.len());
+      let mut keys = Vec::with_capacity(input_nodes.len());
+      let mut props_list = Vec::with_capacity(input_nodes.len());
+      for (key, props) in input_nodes {
+        keys.push(key);
+        props_list.push(props);
+      }
 
-        db.begin_bulk()
-          .map_err(|e| PyRuntimeError::new_err(format!("Failed to begin bulk: {e}")))?;
-        let result: Result<(), PyErr> = (|| {
-          let key_refs: Vec<Option<&str>> = keys.iter().map(|k| Some(k.as_str())).collect();
-          let node_ids = db
-            .create_nodes_batch(&key_refs)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-          for (node_id, props) in node_ids.iter().copied().zip(props_list.iter()) {
-            for (k, v) in props.iter() {
-              db.set_node_prop(node_id, *k as PropKeyId, v.clone().into())
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            }
-            ids.push(node_id as i64);
-          }
-          Ok(())
-        })();
-        match result {
-          Ok(()) => {
-            db.commit()
+      db.begin_bulk()
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to begin bulk: {e}")))?;
+      let result: Result<(), PyErr> = (|| {
+        let key_refs: Vec<Option<&str>> = keys.iter().map(|k| Some(k.as_str())).collect();
+        let node_ids = db
+          .create_nodes_batch(&key_refs)
+          .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        for (node_id, props) in node_ids.iter().copied().zip(props_list.iter()) {
+          for (k, v) in props.iter() {
+            db.set_node_prop(node_id, *k as PropKeyId, v.clone().into())
               .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            Ok(ids)
           }
-          Err(e) => {
-            let _ = db.rollback();
-            Err(e)
-          }
+          ids.push(node_id as i64);
+        }
+        Ok(())
+      })();
+      match result {
+        Ok(()) => {
+          db.commit()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+          Ok(ids)
+        }
+        Err(e) => {
+          let _ = db.rollback();
+          Err(e)
         }
       }
-      None => Err(PyRuntimeError::new_err("Database is closed")),
-    }
+    })
   }
 
   /// Create multiple nodes in a single WAL record (fast path)
@@ -671,44 +677,53 @@ impl PyDatabase {
 
   /// Add multiple edges in a single WAL record (fast path)
   fn add_edges_batch(&self, edges: Vec<(i64, u32, i64)>) -> PyResult<()> {
+    let core_edges: Vec<(NodeId, ETypeId, NodeId)> = edges
+      .into_iter()
+      .map(|(src, etype, dst)| {
+        Ok((
+          validation::node_id("src", src)?,
+          etype as ETypeId,
+          validation::node_id("dst", dst)?,
+        ))
+      })
+      .collect::<PyResult<_>>()?;
     let guard = self
       .inner
       .read()
       .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     match guard.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => {
-        let core_edges: Vec<(NodeId, ETypeId, NodeId)> = edges
-          .into_iter()
-          .map(|(src, etype, dst)| (src as NodeId, etype as ETypeId, dst as NodeId))
-          .collect();
-        db.add_edges_batch(&core_edges)
-          .map_err(|e| PyRuntimeError::new_err(format!("Failed to add edges: {e}")))
-      }
+      Some(DatabaseInner::SingleFile(db)) => db
+        .add_edges_batch(&core_edges)
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to add edges: {e}"))),
       None => Err(PyRuntimeError::new_err("Database is closed")),
     }
   }
 
   /// Add multiple edges with props in a single WAL record (fast path)
   fn add_edges_with_props_batch(&self, edges: Vec<EdgePropsInput>) -> PyResult<()> {
+    let core_edges: Vec<CoreEdgeWithProps> = edges
+      .into_iter()
+      .map(|(src, etype, dst, props)| {
+        let core_props = props
+          .into_iter()
+          .map(|(key_id, value)| (key_id as PropKeyId, value.into()))
+          .collect();
+        Ok((
+          validation::node_id("src", src)?,
+          etype as ETypeId,
+          validation::node_id("dst", dst)?,
+          core_props,
+        ))
+      })
+      .collect::<PyResult<_>>()?;
     let guard = self
       .inner
       .read()
       .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     match guard.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => {
-        let core_edges: Vec<CoreEdgeWithProps> = edges
-          .into_iter()
-          .map(|(src, etype, dst, props)| {
-            let core_props = props
-              .into_iter()
-              .map(|(key_id, value)| (key_id as PropKeyId, value.into()))
-              .collect();
-            (src as NodeId, etype as ETypeId, dst as NodeId, core_props)
-          })
-          .collect();
-        db.add_edges_with_props_batch(core_edges)
-          .map_err(|e| PyRuntimeError::new_err(format!("Failed to add edges: {e}")))
-      }
+      Some(DatabaseInner::SingleFile(db)) => db
+        .add_edges_with_props_batch(core_edges)
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to add edges: {e}"))),
       None => Err(PyRuntimeError::new_err("Database is closed")),
     }
   }
@@ -727,6 +742,7 @@ impl PyDatabase {
   }
 
   fn upsert_node_by_id(&self, node_id: i64, props: Vec<(u32, Option<PropValue>)>) -> PyResult<i64> {
+    let node_id = validation::node_id("node_id", node_id)?;
     let core_props: Vec<(PropKeyId, Option<crate::types::PropValue>)> = props
       .into_iter()
       .map(|(k, v)| (k as PropKeyId, v.map(|value| value.into())))
@@ -734,8 +750,8 @@ impl PyDatabase {
 
     dispatch_tx!(
       self,
-      |db| nodes::upsert_node_by_id_single(db, node_id as NodeId, &core_props),
-      |h| nodes::upsert_node_by_id_single(h, node_id as NodeId, &core_props)
+      |db| nodes::upsert_node_by_id_single(db, node_id, &core_props),
+      |h| nodes::upsert_node_by_id_single(h, node_id, &core_props)
     )
   }
 
@@ -744,31 +760,37 @@ impl PyDatabase {
   // ==========================================================================
 
   fn add_edge(&self, src: i64, etype: u32, dst: i64) -> PyResult<()> {
+    let src = validation::node_id("src", src)?;
+    let dst = validation::node_id("dst", dst)?;
     dispatch_tx!(
       self,
-      |db| edges::add_edge_single(db, src as NodeId, etype as ETypeId, dst as NodeId),
-      |h| edges::add_edge_single(h, src as NodeId, etype as ETypeId, dst as NodeId)
+      |db| edges::add_edge_single(db, src, etype as ETypeId, dst),
+      |h| edges::add_edge_single(h, src, etype as ETypeId, dst)
     )
   }
 
   fn add_edge_by_name(&self, src: i64, etype_name: &str, dst: i64) -> PyResult<()> {
+    let src = validation::node_id("src", src)?;
+    let dst = validation::node_id("dst", dst)?;
     let guard = self
       .inner
       .read()
       .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     match guard.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
-        edges::add_edge_by_name_single(db, src as NodeId, etype_name, dst as NodeId)
+        edges::add_edge_by_name_single(db, src, etype_name, dst)
       }
       None => Err(PyRuntimeError::new_err("Database is closed")),
     }
   }
 
   fn delete_edge(&self, src: i64, etype: u32, dst: i64) -> PyResult<()> {
+    let src = validation::node_id("src", src)?;
+    let dst = validation::node_id("dst", dst)?;
     dispatch_tx!(
       self,
-      |db| edges::delete_edge_single(db, src as NodeId, etype as ETypeId, dst as NodeId),
-      |h| edges::delete_edge_single(h, src as NodeId, etype as ETypeId, dst as NodeId)
+      |db| edges::delete_edge_single(db, src, etype as ETypeId, dst),
+      |h| edges::delete_edge_single(h, src, etype as ETypeId, dst)
     )
   }
 
@@ -779,6 +801,8 @@ impl PyDatabase {
     dst: i64,
     props: Vec<(u32, Option<PropValue>)>,
   ) -> PyResult<bool> {
+    let src = validation::node_id("src", src)?;
+    let dst = validation::node_id("dst", dst)?;
     let core_props: Vec<(PropKeyId, Option<crate::types::PropValue>)> = props
       .into_iter()
       .map(|(k, v)| (k as PropKeyId, v.map(|value| value.into())))
@@ -786,65 +810,51 @@ impl PyDatabase {
 
     dispatch_tx!(
       self,
-      |db| edges::upsert_edge_single(
-        db,
-        src as NodeId,
-        etype as ETypeId,
-        dst as NodeId,
-        &core_props
-      ),
-      |h| edges::upsert_edge_single(
-        h,
-        src as NodeId,
-        etype as ETypeId,
-        dst as NodeId,
-        &core_props
-      )
+      |db| edges::upsert_edge_single(db, src, etype as ETypeId, dst, &core_props),
+      |h| edges::upsert_edge_single(h, src, etype as ETypeId, dst, &core_props)
     )
   }
 
   fn edge_exists(&self, src: i64, etype: u32, dst: i64) -> PyResult<bool> {
+    let src = validation::node_id("src", src)?;
+    let dst = validation::node_id("dst", dst)?;
     dispatch_ok!(
       self,
-      |db| edges::edge_exists_single(db, src as NodeId, etype as ETypeId, dst as NodeId),
-      |db| edges::edge_exists_single(db, src as NodeId, etype as ETypeId, dst as NodeId)
+      |db| edges::edge_exists_single(db, src, etype as ETypeId, dst),
+      |db| edges::edge_exists_single(db, src, etype as ETypeId, dst)
     )
   }
 
   #[pyo3(name = "get_out_edges")]
   fn out_edges(&self, node_id: i64) -> PyResult<Vec<Edge>> {
-    dispatch_ok!(
-      self,
-      |db| edges::out_edges_single(db, node_id as NodeId),
-      |db| edges::out_edges_single(db, node_id as NodeId)
-    )
+    let node_id = validation::node_id("node_id", node_id)?;
+    dispatch_ok!(self, |db| edges::out_edges_single(db, node_id), |db| {
+      edges::out_edges_single(db, node_id)
+    })
   }
 
   #[pyo3(name = "get_in_edges")]
   fn in_edges(&self, node_id: i64) -> PyResult<Vec<Edge>> {
-    dispatch_ok!(
-      self,
-      |db| edges::in_edges_single(db, node_id as NodeId),
-      |db| edges::in_edges_single(db, node_id as NodeId)
-    )
+    let node_id = validation::node_id("node_id", node_id)?;
+    dispatch_ok!(self, |db| edges::in_edges_single(db, node_id), |db| {
+      edges::in_edges_single(db, node_id)
+    })
   }
 
   #[pyo3(name = "get_out_degree")]
   fn out_degree(&self, node_id: i64) -> PyResult<i64> {
-    dispatch_ok!(
-      self,
-      |db| edges::out_degree_single(db, node_id as NodeId),
-      |db| edges::out_degree_single(db, node_id as NodeId)
-    )
+    let node_id = validation::node_id("node_id", node_id)?;
+    dispatch_ok!(self, |db| edges::out_degree_single(db, node_id), |db| {
+      edges::out_degree_single(db, node_id)
+    })
   }
 
   #[pyo3(name = "get_in_degree")]
   fn in_degree(&self, node_id: i64) -> PyResult<i64> {
-    dispatch_ok!(
-      self,
-      |db| edges::in_degree_single(db, node_id as NodeId),
-      |db| edges::in_degree_single(db, node_id as NodeId)
-    )
+    let node_id = validation::node_id("node_id", node_id)?;
+    dispatch_ok!(self, |db| edges::in_degree_single(db, node_id), |db| {
+      edges::in_degree_single(db, node_id)
+    })
   }
 
   fn count_edges(&self) -> PyResult<i64> {
@@ -875,31 +885,23 @@ impl PyDatabase {
   // ==========================================================================
 
   fn set_node_prop(&self, node_id: i64, key_id: u32, value: PropValue) -> PyResult<()> {
+    let node_id = validation::node_id("node_id", node_id)?;
     dispatch_tx!(
       self,
-      |db| properties::set_node_prop_single(
-        db,
-        node_id as NodeId,
-        key_id as PropKeyId,
-        value.into()
-      ),
-      |h| properties::set_node_prop_single(
-        h,
-        node_id as NodeId,
-        key_id as PropKeyId,
-        value.clone().into()
-      )
+      |db| properties::set_node_prop_single(db, node_id, key_id as PropKeyId, value.into()),
+      |h| properties::set_node_prop_single(h, node_id, key_id as PropKeyId, value.clone().into())
     )
   }
 
   fn set_node_prop_by_name(&self, node_id: i64, key_name: &str, value: PropValue) -> PyResult<()> {
+    let node_id = validation::node_id("node_id", node_id)?;
     let guard = self
       .inner
       .read()
       .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     match guard.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
-        properties::set_node_prop_by_name_single(db, node_id as NodeId, key_name, value.into())
+        properties::set_node_prop_by_name_single(db, node_id, key_name, value.into())
       }
       None => Err(PyRuntimeError::new_err("Database is closed")),
     }
@@ -907,27 +909,30 @@ impl PyDatabase {
 
   #[pyo3(name = "get_node_prop")]
   fn node_prop(&self, node_id: i64, key_id: u32) -> PyResult<Option<PropValue>> {
+    let node_id = validation::node_id("node_id", node_id)?;
     dispatch_ok!(
       self,
-      |db| properties::node_prop_single(db, node_id as NodeId, key_id as PropKeyId),
-      |db| properties::node_prop_single(db, node_id as NodeId, key_id as PropKeyId)
+      |db| properties::node_prop_single(db, node_id, key_id as PropKeyId),
+      |db| properties::node_prop_single(db, node_id, key_id as PropKeyId)
     )
   }
 
   fn delete_node_prop(&self, node_id: i64, key_id: u32) -> PyResult<()> {
+    let node_id = validation::node_id("node_id", node_id)?;
     dispatch_tx!(
       self,
-      |db| properties::delete_node_prop_single(db, node_id as NodeId, key_id as PropKeyId),
-      |h| properties::delete_node_prop_single(h, node_id as NodeId, key_id as PropKeyId)
+      |db| properties::delete_node_prop_single(db, node_id, key_id as PropKeyId),
+      |h| properties::delete_node_prop_single(h, node_id, key_id as PropKeyId)
     )
   }
 
   #[pyo3(name = "get_node_props")]
   fn node_props(&self, node_id: i64) -> PyResult<Option<Vec<NodeProp>>> {
+    let node_id = validation::node_id("node_id", node_id)?;
     dispatch_ok!(
       self,
-      |db| properties::node_props_single(db, node_id as NodeId),
-      |db| properties::node_props_single(db, node_id as NodeId)
+      |db| properties::node_props_single(db, node_id),
+      |db| properties::node_props_single(db, node_id)
     )
   }
 
@@ -939,21 +944,23 @@ impl PyDatabase {
     key_id: u32,
     value: PropValue,
   ) -> PyResult<()> {
+    let src = validation::node_id("src", src)?;
+    let dst = validation::node_id("dst", dst)?;
     dispatch_tx!(
       self,
       |db| properties::set_edge_prop_single(
         db,
-        src as NodeId,
+        src,
         etype as ETypeId,
-        dst as NodeId,
+        dst,
         key_id as PropKeyId,
         value.into()
       ),
       |h| properties::set_edge_prop_single(
         h,
-        src as NodeId,
+        src,
         etype as ETypeId,
-        dst as NodeId,
+        dst,
         key_id as PropKeyId,
         value.clone().into()
       )
@@ -968,6 +975,8 @@ impl PyDatabase {
     key_name: &str,
     value: PropValue,
   ) -> PyResult<()> {
+    let src = validation::node_id("src", src)?;
+    let dst = validation::node_id("dst", dst)?;
     let guard = self
       .inner
       .read()
@@ -975,9 +984,9 @@ impl PyDatabase {
     match guard.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => properties::set_edge_prop_by_name_single(
         db,
-        src as NodeId,
+        src,
         etype as ETypeId,
-        dst as NodeId,
+        dst,
         key_name,
         value.into(),
       ),
@@ -987,88 +996,74 @@ impl PyDatabase {
 
   #[pyo3(name = "get_edge_prop")]
   fn edge_prop(&self, src: i64, etype: u32, dst: i64, key_id: u32) -> PyResult<Option<PropValue>> {
+    let src = validation::node_id("src", src)?;
+    let dst = validation::node_id("dst", dst)?;
     dispatch_ok!(
       self,
-      |db| properties::edge_prop_single(
-        db,
-        src as NodeId,
-        etype as ETypeId,
-        dst as NodeId,
-        key_id as PropKeyId
-      ),
-      |db| properties::edge_prop_single(
-        db,
-        src as NodeId,
-        etype as ETypeId,
-        dst as NodeId,
-        key_id as PropKeyId
-      )
+      |db| properties::edge_prop_single(db, src, etype as ETypeId, dst, key_id as PropKeyId),
+      |db| properties::edge_prop_single(db, src, etype as ETypeId, dst, key_id as PropKeyId)
     )
   }
 
   fn delete_edge_prop(&self, src: i64, etype: u32, dst: i64, key_id: u32) -> PyResult<()> {
+    let src = validation::node_id("src", src)?;
+    let dst = validation::node_id("dst", dst)?;
     dispatch_tx!(
       self,
-      |db| properties::delete_edge_prop_single(
-        db,
-        src as NodeId,
-        etype as ETypeId,
-        dst as NodeId,
-        key_id as PropKeyId
-      ),
-      |h| properties::delete_edge_prop_single(
-        h,
-        src as NodeId,
-        etype as ETypeId,
-        dst as NodeId,
-        key_id as PropKeyId
-      )
+      |db| properties::delete_edge_prop_single(db, src, etype as ETypeId, dst, key_id as PropKeyId),
+      |h| properties::delete_edge_prop_single(h, src, etype as ETypeId, dst, key_id as PropKeyId)
     )
   }
 
   #[pyo3(name = "get_edge_props")]
   fn edge_props(&self, src: i64, etype: u32, dst: i64) -> PyResult<Option<Vec<NodeProp>>> {
+    let src = validation::node_id("src", src)?;
+    let dst = validation::node_id("dst", dst)?;
     dispatch_ok!(
       self,
-      |db| properties::edge_props_single(db, src as NodeId, etype as ETypeId, dst as NodeId),
-      |db| properties::edge_props_single(db, src as NodeId, etype as ETypeId, dst as NodeId)
+      |db| properties::edge_props_single(db, src, etype as ETypeId, dst),
+      |db| properties::edge_props_single(db, src, etype as ETypeId, dst)
     )
   }
 
   // Direct type property getters
   #[pyo3(name = "get_node_prop_string")]
   fn node_prop_string(&self, node_id: i64, key_id: u32) -> PyResult<Option<String>> {
+    let node_id = validation::node_id("node_id", node_id)?;
     dispatch_ok!(
       self,
-      |db| properties::node_prop_string_single(db, node_id as NodeId, key_id as PropKeyId),
-      |db| properties::node_prop_string_single(db, node_id as NodeId, key_id as PropKeyId)
+      |db| properties::node_prop_string_single(db, node_id, key_id as PropKeyId),
+      |db| properties::node_prop_string_single(db, node_id, key_id as PropKeyId)
     )
   }
 
   #[pyo3(name = "get_node_prop_int")]
   fn node_prop_int(&self, node_id: i64, key_id: u32) -> PyResult<Option<i64>> {
+    let node_id = validation::node_id("node_id", node_id)?;
     dispatch_ok!(
       self,
-      |db| properties::node_prop_int_single(db, node_id as NodeId, key_id as PropKeyId),
-      |db| properties::node_prop_int_single(db, node_id as NodeId, key_id as PropKeyId)
+      |db| properties::node_prop_int_single(db, node_id, key_id as PropKeyId),
+      |db| properties::node_prop_int_single(db, node_id, key_id as PropKeyId)
     )
   }
 
   #[pyo3(name = "get_node_prop_float")]
   fn node_prop_float(&self, node_id: i64, key_id: u32) -> PyResult<Option<f64>> {
+    let node_id = validation::node_id("node_id", node_id)?;
     dispatch_ok!(
       self,
-      |db| properties::node_prop_float_single(db, node_id as NodeId, key_id as PropKeyId),
-      |db| properties::node_prop_float_single(db, node_id as NodeId, key_id as PropKeyId)
+      |db| properties::node_prop_float_single(db, node_id, key_id as PropKeyId),
+      |db| properties::node_prop_float_single(db, node_id, key_id as PropKeyId)
     )
   }
 
   #[pyo3(name = "get_node_prop_bool")]
   fn node_prop_bool(&self, node_id: i64, key_id: u32) -> PyResult<Option<bool>> {
+    let node_id = validation::node_id("node_id", node_id)?;
     dispatch_ok!(
       self,
-      |db| properties::node_prop_bool_single(db, node_id as NodeId, key_id as PropKeyId),
-      |db| properties::node_prop_bool_single(db, node_id as NodeId, key_id as PropKeyId)
+      |db| properties::node_prop_bool_single(db, node_id, key_id as PropKeyId),
+      |db| properties::node_prop_bool_single(db, node_id, key_id as PropKeyId)
     )
   }
 
@@ -1150,49 +1145,52 @@ impl PyDatabase {
   }
 
   fn add_node_label(&self, node_id: i64, label_id: u32) -> PyResult<()> {
+    let node_id = validation::node_id("node_id", node_id)?;
     dispatch_tx!(
       self,
-      |db| labels::add_node_label_single(db, node_id as NodeId, label_id),
-      |h| labels::add_node_label_single(h, node_id as NodeId, label_id)
+      |db| labels::add_node_label_single(db, node_id, label_id),
+      |h| labels::add_node_label_single(h, node_id, label_id)
     )
   }
 
   fn add_node_label_by_name(&self, node_id: i64, label_name: &str) -> PyResult<()> {
+    let node_id = validation::node_id("node_id", node_id)?;
     let guard = self
       .inner
       .read()
       .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     match guard.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
-        labels::add_node_label_by_name_single(db, node_id as NodeId, label_name)
+        labels::add_node_label_by_name_single(db, node_id, label_name)
       }
       None => Err(PyRuntimeError::new_err("Database is closed")),
     }
   }
 
   fn remove_node_label(&self, node_id: i64, label_id: u32) -> PyResult<()> {
+    let node_id = validation::node_id("node_id", node_id)?;
     dispatch_tx!(
       self,
-      |db| labels::remove_node_label_single(db, node_id as NodeId, label_id),
-      |h| labels::remove_node_label_single(h, node_id as NodeId, label_id)
+      |db| labels::remove_node_label_single(db, node_id, label_id),
+      |h| labels::remove_node_label_single(h, node_id, label_id)
     )
   }
 
   fn node_has_label(&self, node_id: i64, label_id: u32) -> PyResult<bool> {
+    let node_id = validation::node_id("node_id", node_id)?;
     dispatch_ok!(
       self,
-      |db| labels::node_has_label_single(db, node_id as NodeId, label_id),
-      |db| labels::node_has_label_single(db, node_id as NodeId, label_id)
+      |db| labels::node_has_label_single(db, node_id, label_id),
+      |db| labels::node_has_label_single(db, node_id, label_id)
     )
   }
 
   #[pyo3(name = "get_node_labels")]
   fn node_labels(&self, node_id: i64) -> PyResult<Vec<u32>> {
-    dispatch_ok!(
-      self,
-      |db| labels::node_labels_single(db, node_id as NodeId),
-      |db| labels::node_labels_single(db, node_id as NodeId)
-    )
+    let node_id = validation::node_id("node_id", node_id)?;
+    dispatch_ok!(self, |db| labels::node_labels_single(db, node_id), |db| {
+      labels::node_labels_single(db, node_id)
+    })
   }
 
   // ==========================================================================
@@ -1200,36 +1198,40 @@ impl PyDatabase {
   // ==========================================================================
 
   fn set_node_vector(&self, node_id: i64, prop_key_id: u32, vector: Vec<f64>) -> PyResult<()> {
+    let node_id = validation::node_id("node_id", node_id)?;
     let v: Vec<f32> = vector.iter().map(|&x| x as f32).collect();
     dispatch_tx!(
       self,
-      |db| vectors::set_node_vector_single(db, node_id as NodeId, prop_key_id as PropKeyId, &v),
-      |h| vectors::set_node_vector_single(h, node_id as NodeId, prop_key_id as PropKeyId, &v)
+      |db| vectors::set_node_vector_single(db, node_id, prop_key_id as PropKeyId, &v),
+      |h| vectors::set_node_vector_single(h, node_id, prop_key_id as PropKeyId, &v)
     )
   }
 
   #[pyo3(name = "get_node_vector")]
   fn node_vector(&self, node_id: i64, prop_key_id: u32) -> PyResult<Option<Vec<f64>>> {
+    let node_id = validation::node_id("node_id", node_id)?;
     dispatch_ok!(
       self,
-      |db| vectors::node_vector_single(db, node_id as NodeId, prop_key_id as PropKeyId),
-      |db| vectors::node_vector_single(db, node_id as NodeId, prop_key_id as PropKeyId)
+      |db| vectors::node_vector_single(db, node_id, prop_key_id as PropKeyId),
+      |db| vectors::node_vector_single(db, node_id, prop_key_id as PropKeyId)
     )
   }
 
   fn delete_node_vector(&self, node_id: i64, prop_key_id: u32) -> PyResult<()> {
+    let node_id = validation::node_id("node_id", node_id)?;
     dispatch_tx!(
       self,
-      |db| vectors::delete_node_vector_single(db, node_id as NodeId, prop_key_id as PropKeyId),
-      |h| vectors::delete_node_vector_single(h, node_id as NodeId, prop_key_id as PropKeyId)
+      |db| vectors::delete_node_vector_single(db, node_id, prop_key_id as PropKeyId),
+      |h| vectors::delete_node_vector_single(h, node_id, prop_key_id as PropKeyId)
     )
   }
 
   fn has_node_vector(&self, node_id: i64, prop_key_id: u32) -> PyResult<bool> {
+    let node_id = validation::node_id("node_id", node_id)?;
     dispatch_ok!(
       self,
-      |db| vectors::has_node_vector_single(db, node_id as NodeId, prop_key_id as PropKeyId),
-      |db| vectors::has_node_vector_single(db, node_id as NodeId, prop_key_id as PropKeyId)
+      |db| vectors::has_node_vector_single(db, node_id, prop_key_id as PropKeyId),
+      |db| vectors::has_node_vector_single(db, node_id, prop_key_id as PropKeyId)
     )
   }
 
@@ -1239,7 +1241,7 @@ impl PyDatabase {
 
   #[pyo3(signature = (node_id, etype=None))]
   fn traverse_out(&self, node_id: i64, etype: Option<u32>) -> PyResult<Vec<i64>> {
-    let node_id = validation::node_id("node_id", node_id)? as NodeId;
+    let node_id = validation::node_id("node_id", node_id)?;
     dispatch_ok!(
       self,
       |db| graph_traversal::traverse_out_single(db, node_id, etype),
@@ -1253,7 +1255,7 @@ impl PyDatabase {
     node_id: i64,
     etype: Option<u32>,
   ) -> PyResult<Vec<(i64, Option<String>)>> {
-    let node_id = validation::node_id("node_id", node_id)? as NodeId;
+    let node_id = validation::node_id("node_id", node_id)?;
     dispatch_ok!(
       self,
       |db| graph_traversal::traverse_out_with_keys_single(db, node_id, etype),
@@ -1263,7 +1265,7 @@ impl PyDatabase {
 
   #[pyo3(signature = (node_id, etype=None))]
   fn traverse_out_count(&self, node_id: i64, etype: Option<u32>) -> PyResult<i64> {
-    let node_id = validation::node_id("node_id", node_id)? as NodeId;
+    let node_id = validation::node_id("node_id", node_id)?;
     dispatch_ok!(
       self,
       |db| graph_traversal::traverse_out_count_single(db, node_id, etype),
@@ -1273,7 +1275,7 @@ impl PyDatabase {
 
   #[pyo3(signature = (node_id, etype=None))]
   fn traverse_in(&self, node_id: i64, etype: Option<u32>) -> PyResult<Vec<i64>> {
-    let node_id = validation::node_id("node_id", node_id)? as NodeId;
+    let node_id = validation::node_id("node_id", node_id)?;
     dispatch_ok!(
       self,
       |db| graph_traversal::traverse_in_single(db, node_id, etype),
@@ -1287,7 +1289,7 @@ impl PyDatabase {
     node_id: i64,
     etype: Option<u32>,
   ) -> PyResult<Vec<(i64, Option<String>)>> {
-    let node_id = validation::node_id("node_id", node_id)? as NodeId;
+    let node_id = validation::node_id("node_id", node_id)?;
     dispatch_ok!(
       self,
       |db| graph_traversal::traverse_in_with_keys_single(db, node_id, etype),
@@ -1297,7 +1299,7 @@ impl PyDatabase {
 
   #[pyo3(signature = (node_id, etype=None))]
   fn traverse_in_count(&self, node_id: i64, etype: Option<u32>) -> PyResult<i64> {
-    let node_id = validation::node_id("node_id", node_id)? as NodeId;
+    let node_id = validation::node_id("node_id", node_id)?;
     dispatch_ok!(
       self,
       |db| graph_traversal::traverse_in_count_single(db, node_id, etype),
@@ -1345,7 +1347,7 @@ impl PyDatabase {
     direction: Option<String>,
     unique: Option<bool>,
   ) -> PyResult<Vec<PyTraversalResult>> {
-    let node_id = validation::node_id("node_id", node_id)? as NodeId;
+    let node_id = validation::node_id("node_id", node_id)?;
     let max_depth = validation::non_negative_usize("max_depth", max_depth, validation::MAX_DEPTH)?;
     let min_depth = min_depth
       .map(|depth| validation::non_negative_usize("min_depth", depth, validation::MAX_DEPTH))
@@ -1387,8 +1389,8 @@ impl PyDatabase {
     max_depth: Option<i64>,
     direction: Option<String>,
   ) -> PyResult<PyPathResult> {
-    let source = validation::node_id("source", source)? as NodeId;
-    let target = validation::node_id("target", target)? as NodeId;
+    let source = validation::node_id("source", source)?;
+    let target = validation::node_id("target", target)?;
     let max_depth = max_depth
       .map(|depth| validation::non_negative_usize("max_depth", depth, validation::MAX_DEPTH))
       .transpose()?;
@@ -1422,8 +1424,8 @@ impl PyDatabase {
     max_depth: Option<i64>,
     direction: Option<String>,
   ) -> PyResult<PyPathResult> {
-    let source = validation::node_id("source", source)? as NodeId;
-    let target = validation::node_id("target", target)? as NodeId;
+    let source = validation::node_id("source", source)?;
+    let target = validation::node_id("target", target)?;
     let max_depth = max_depth
       .map(|depth| validation::non_negative_usize("max_depth", depth, validation::MAX_DEPTH))
       .transpose()?;
@@ -1457,8 +1459,8 @@ impl PyDatabase {
     max_depth: Option<i64>,
     direction: Option<String>,
   ) -> PyResult<bool> {
-    let source = validation::node_id("source", source)? as NodeId;
-    let target = validation::node_id("target", target)? as NodeId;
+    let source = validation::node_id("source", source)?;
+    let target = validation::node_id("target", target)?;
     let max_depth = max_depth
       .map(|depth| validation::non_negative_usize("max_depth", depth, validation::MAX_DEPTH))
       .transpose()?;
@@ -1486,7 +1488,7 @@ impl PyDatabase {
 
   #[pyo3(signature = (source, max_depth, etype=None))]
   fn reachable_nodes(&self, source: i64, max_depth: i64, etype: Option<u32>) -> PyResult<Vec<i64>> {
-    let source = validation::node_id("source", source)? as NodeId;
+    let source = validation::node_id("source", source)?;
     let max_depth = validation::non_negative_usize("max_depth", max_depth, validation::MAX_DEPTH)?;
     let min_depth = Some(1);
     let direction = Some("out".to_string());
@@ -1519,16 +1521,12 @@ impl PyDatabase {
   // Maintenance Operations
   // ==========================================================================
 
-  fn checkpoint(&self) -> PyResult<()> {
-    dispatch!(self, |db| maintenance::checkpoint_single(db), |_db| Ok(()))
+  fn checkpoint(&self, py: Python<'_>) -> PyResult<()> {
+    self.with_db_nogil(py, maintenance::checkpoint_single)
   }
 
-  fn background_checkpoint(&self) -> PyResult<()> {
-    dispatch!(
-      self,
-      |db| maintenance::background_checkpoint_single(db),
-      |_db| Ok(())
-    )
+  fn background_checkpoint(&self, py: Python<'_>) -> PyResult<()> {
+    self.with_db_nogil(py, maintenance::background_checkpoint_single)
   }
 
   #[pyo3(signature = (threshold=0.5))]
@@ -1542,38 +1540,26 @@ impl PyDatabase {
   }
 
   #[pyo3(signature = (options=None))]
-  fn optimize(&mut self, options: Option<SingleFileOptimizeOptions>) -> PyResult<()> {
-    dispatch_mut!(
-      self,
-      |db| {
-        let opts = match options {
-          Some(o) => Some(o.to_core()?),
-          None => None,
-        };
-        maintenance::optimize_single(db, opts)
-      },
-      |db| maintenance::optimize_single(db)
-    )
+  fn optimize(&self, py: Python<'_>, options: Option<SingleFileOptimizeOptions>) -> PyResult<()> {
+    let opts = options.map(|o| o.to_core()).transpose()?;
+    // Shared lock on purpose: core serializes maintenance on its checkpoint gate
+    // and waits for open transactions to drain, and those need this lock to
+    // commit. Holding the exclusive lock here would deadlock against them.
+    self.with_db_nogil(py, |db| maintenance::optimize_single(db, opts))
   }
 
   #[pyo3(signature = (shrink_wal=true, min_wal_size=None))]
-  fn vacuum(&mut self, shrink_wal: bool, min_wal_size: Option<i64>) -> PyResult<()> {
+  fn vacuum(&self, py: Python<'_>, shrink_wal: bool, min_wal_size: Option<i64>) -> PyResult<()> {
     let min_wal_size = min_wal_size
       .map(|value| {
         validation::non_negative_u64("min_wal_size", value, validation::MAX_BYTES as u64)
       })
       .transpose()?;
-    dispatch_mut!(
-      self,
-      |db| maintenance::vacuum_single(
-        db,
-        Some(RustVacuumOptions {
-          shrink_wal,
-          min_wal_size
-        })
-      ),
-      |_db| Ok(())
-    )
+    let options = RustVacuumOptions {
+      shrink_wal,
+      min_wal_size,
+    };
+    self.with_db_nogil(py, |db| maintenance::vacuum_single(db, Some(options)))
   }
 
   fn stats(&self) -> PyResult<DbStats> {
@@ -1597,20 +1583,23 @@ impl PyDatabase {
   }
 
   fn cache_invalidate_node(&self, node_id: i64) -> PyResult<()> {
+    let node_id = validation::node_id("node_id", node_id)?;
     dispatch_ok!(
       self,
       |db| {
-        cache::cache_invalidate_node(db, node_id as NodeId);
+        cache::cache_invalidate_node(db, node_id);
       },
       |_db| ()
     )
   }
 
   fn cache_invalidate_edge(&self, src: i64, etype: u32, dst: i64) -> PyResult<()> {
+    let src = validation::node_id("src", src)?;
+    let dst = validation::node_id("dst", dst)?;
     dispatch_ok!(
       self,
       |db| {
-        cache::cache_invalidate_edge(db, src as NodeId, etype as ETypeId, dst as NodeId);
+        cache::cache_invalidate_edge(db, src, etype as ETypeId, dst);
       },
       |_db| ()
     )
@@ -1785,41 +1774,42 @@ impl PyDatabase {
   // ==========================================================================
 
   #[pyo3(signature = (path, options=None))]
-  fn export_to_json(&self, path: String, options: Option<ExportOptions>) -> PyResult<ExportResult> {
+  fn export_to_json(
+    &self,
+    py: Python<'_>,
+    path: String,
+    options: Option<ExportOptions>,
+  ) -> PyResult<ExportResult> {
     let opts = options.unwrap_or_default();
-    dispatch!(
-      self,
-      |db| export_import::export_to_json_single(db, path.clone(), opts.clone()),
-      |db| export_import::export_to_json_single(db, path.clone(), opts.clone())
-    )
+    self.with_db_nogil(py, |db| {
+      export_import::export_to_json_single(db, path, opts)
+    })
   }
 
   #[pyo3(signature = (path, options=None))]
   fn export_to_jsonl(
     &self,
+    py: Python<'_>,
     path: String,
     options: Option<ExportOptions>,
   ) -> PyResult<ExportResult> {
     let opts = options.unwrap_or_default();
-    dispatch!(
-      self,
-      |db| export_import::export_to_jsonl_single(db, path.clone(), opts.clone()),
-      |db| export_import::export_to_jsonl_single(db, path.clone(), opts.clone())
-    )
+    self.with_db_nogil(py, |db| {
+      export_import::export_to_jsonl_single(db, path, opts)
+    })
   }
 
   #[pyo3(signature = (path, options=None))]
   fn import_from_json(
     &self,
+    py: Python<'_>,
     path: String,
     options: Option<ImportOptions>,
   ) -> PyResult<ImportResult> {
     let opts = options.unwrap_or_default();
-    dispatch!(
-      self,
-      |db| export_import::import_from_json_single(db, path.clone(), opts.clone()),
-      |db| export_import::import_from_json_single(db, path.clone(), opts.clone())
-    )
+    self.with_db_nogil(py, |db| {
+      export_import::import_from_json_single(db, path, opts)
+    })
   }
 }
 
@@ -1829,8 +1819,12 @@ impl PyDatabase {
 
 #[pyfunction]
 #[pyo3(signature = (path, options=None))]
-pub fn open_database(path: String, options: Option<OpenOptions>) -> PyResult<PyDatabase> {
-  PyDatabase::new(path, options)
+pub fn open_database(
+  py: Python<'_>,
+  path: String,
+  options: Option<OpenOptions>,
+) -> PyResult<PyDatabase> {
+  PyDatabase::new(py, path, options)
 }
 
 #[pyfunction]
@@ -2197,6 +2191,7 @@ fn build_otel_push_options_py(
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn push_replication_metrics_otel_json(
+  py: Python<'_>,
   db: &PyDatabase,
   endpoint: String,
   timeout_ms: i64,
@@ -2259,20 +2254,13 @@ pub fn push_replication_metrics_otel_json(
     client_key_pem_path,
   )?;
 
-  let guard = db
-    .inner
-    .read()
-    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-  match guard.as_ref() {
-    Some(DatabaseInner::SingleFile(d)) => {
-      let result = core_metrics::push_replication_metrics_otel_json_single_file_with_options(
-        d, &endpoint, &options,
-      )
-      .map_err(|e| PyRuntimeError::new_err(format!("Failed to push replication metrics: {e}")))?;
-      Ok((result.status_code, result.response_body))
-    }
-    None => Err(PyRuntimeError::new_err("Database is closed")),
-  }
+  db.with_db_nogil(py, |d| {
+    let result = core_metrics::push_replication_metrics_otel_json_single_file_with_options(
+      d, &endpoint, &options,
+    )
+    .map_err(|e| PyRuntimeError::new_err(format!("Failed to push replication metrics: {e}")))?;
+    Ok((result.status_code, result.response_body))
+  })
 }
 
 #[pyfunction]
@@ -2310,6 +2298,7 @@ pub fn push_replication_metrics_otel_json(
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn push_replication_metrics_otel_protobuf(
+  py: Python<'_>,
   db: &PyDatabase,
   endpoint: String,
   timeout_ms: i64,
@@ -2372,20 +2361,13 @@ pub fn push_replication_metrics_otel_protobuf(
     client_key_pem_path,
   )?;
 
-  let guard = db
-    .inner
-    .read()
-    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-  match guard.as_ref() {
-    Some(DatabaseInner::SingleFile(d)) => {
-      let result = core_metrics::push_replication_metrics_otel_protobuf_single_file_with_options(
-        d, &endpoint, &options,
-      )
-      .map_err(|e| PyRuntimeError::new_err(format!("Failed to push replication metrics: {e}")))?;
-      Ok((result.status_code, result.response_body))
-    }
-    None => Err(PyRuntimeError::new_err("Database is closed")),
-  }
+  db.with_db_nogil(py, |d| {
+    let result = core_metrics::push_replication_metrics_otel_protobuf_single_file_with_options(
+      d, &endpoint, &options,
+    )
+    .map_err(|e| PyRuntimeError::new_err(format!("Failed to push replication metrics: {e}")))?;
+    Ok((result.status_code, result.response_body))
+  })
 }
 
 #[pyfunction]
@@ -2423,6 +2405,7 @@ pub fn push_replication_metrics_otel_protobuf(
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn push_replication_metrics_otel_grpc(
+  py: Python<'_>,
   db: &PyDatabase,
   endpoint: String,
   timeout_ms: i64,
@@ -2485,20 +2468,13 @@ pub fn push_replication_metrics_otel_grpc(
     client_key_pem_path,
   )?;
 
-  let guard = db
-    .inner
-    .read()
-    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-  match guard.as_ref() {
-    Some(DatabaseInner::SingleFile(d)) => {
-      let result = core_metrics::push_replication_metrics_otel_grpc_single_file_with_options(
-        d, &endpoint, &options,
-      )
-      .map_err(|e| PyRuntimeError::new_err(format!("Failed to push replication metrics: {e}")))?;
-      Ok((result.status_code, result.response_body))
-    }
-    None => Err(PyRuntimeError::new_err("Database is closed")),
-  }
+  db.with_db_nogil(py, |d| {
+    let result = core_metrics::push_replication_metrics_otel_grpc_single_file_with_options(
+      d, &endpoint, &options,
+    )
+    .map_err(|e| PyRuntimeError::new_err(format!("Failed to push replication metrics: {e}")))?;
+    Ok((result.status_code, result.response_body))
+  })
 }
 
 #[pyfunction]
@@ -2518,33 +2494,30 @@ pub fn health_check(db: &PyDatabase) -> PyResult<HealthCheckResult> {
 #[pyfunction]
 #[pyo3(signature = (db, backup_path, options=None))]
 pub fn create_backup(
+  py: Python<'_>,
   db: &PyDatabase,
   backup_path: String,
   options: Option<BackupOptions>,
 ) -> PyResult<BackupResult> {
   let opts: core_backup::BackupOptions = options.unwrap_or_default().into();
   let path = PathBuf::from(backup_path);
-  let guard = db
-    .inner
-    .read()
-    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-  match guard.as_ref() {
-    Some(DatabaseInner::SingleFile(d)) => core_backup::create_backup_single_file(d, &path, opts)
+  db.with_db_nogil(py, |d| {
+    core_backup::create_backup_single_file(d, &path, opts)
       .map(BackupResult::from)
-      .map_err(|e| PyRuntimeError::new_err(e.to_string())),
-    None => Err(PyRuntimeError::new_err("Database is closed")),
-  }
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+  })
 }
 
 #[pyfunction]
 #[pyo3(signature = (backup_path, restore_path, options=None))]
 pub fn restore_backup(
+  py: Python<'_>,
   backup_path: String,
   restore_path: String,
   options: Option<RestoreOptions>,
 ) -> PyResult<String> {
   let opts: core_backup::RestoreOptions = options.unwrap_or_default().into();
-  core_backup::restore_backup(backup_path, restore_path, opts)
+  py.allow_threads(|| core_backup::restore_backup(backup_path, restore_path, opts))
     .map(|p| p.to_string_lossy().to_string())
     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
@@ -2559,12 +2532,13 @@ pub fn backup_info(backup_path: String) -> PyResult<BackupResult> {
 #[pyfunction]
 #[pyo3(signature = (db_path, backup_path, options=None))]
 pub fn create_offline_backup(
+  py: Python<'_>,
   db_path: String,
   backup_path: String,
   options: Option<OfflineBackupOptions>,
 ) -> PyResult<BackupResult> {
   let opts: core_backup::OfflineBackupOptions = options.unwrap_or_default().into();
-  core_backup::create_offline_backup(db_path, backup_path, opts)
+  py.allow_threads(|| core_backup::create_offline_backup(db_path, backup_path, opts))
     .map(BackupResult::from)
     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }

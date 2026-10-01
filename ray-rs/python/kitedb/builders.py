@@ -202,7 +202,7 @@ class InsertExecutor(Generic[N]):
             
             if not in_tx:
                 self._db.commit()
-        except Exception:
+        except BaseException:
             if not in_tx:
                 self._db.rollback()
             raise
@@ -441,7 +441,7 @@ class UpsertExecutor(Generic[N]):
             
             if not in_tx:
                 self._db.commit()
-        except Exception:
+        except BaseException:
             if not in_tx:
                 self._db.rollback()
             raise
@@ -595,7 +595,7 @@ class UpdateExecutor(Generic[N]):
             
             if not in_tx:
                 self._db.commit()
-        except Exception:
+        except BaseException:
             if not in_tx:
                 self._db.rollback()
             raise
@@ -640,7 +640,7 @@ class UpdateByRefExecutor:
             
             if not in_tx:
                 self._db.commit()
-        except Exception:
+        except BaseException:
             if not in_tx:
                 self._db.rollback()
             raise
@@ -781,7 +781,7 @@ class UpsertByIdExecutor:
             self._db.upsert_node_by_id(self._node_id, prop_updates)
             if not in_tx:
                 self._db.commit()
-        except Exception:
+        except BaseException:
             if not in_tx:
                 self._db.rollback()
             raise
@@ -893,7 +893,7 @@ class DeleteExecutor:
             if not in_tx:
                 self._db.commit()
             return True
-        except Exception:
+        except BaseException:
             if not in_tx:
                 self._db.rollback()
             raise
@@ -982,7 +982,7 @@ def create_link(
         
         if not in_tx:
             db.commit()
-    except Exception:
+    except BaseException:
         if not in_tx:
             db.rollback()
         raise
@@ -1015,7 +1015,7 @@ def delete_link(
         db.delete_edge(src.id, etype_id, dst.id)
         if not in_tx:
             db.commit()
-    except Exception:
+    except BaseException:
         if not in_tx:
             db.rollback()
         raise
@@ -1076,7 +1076,7 @@ class UpdateEdgeExecutor:
             
             if not in_tx:
                 self._db.commit()
-        except Exception:
+        except BaseException:
             if not in_tx:
                 self._db.rollback()
             raise
@@ -1191,7 +1191,7 @@ class UpsertEdgeExecutor:
 
             if not in_tx:
                 self._db.commit()
-        except Exception:
+        except BaseException:
             if not in_tx:
                 self._db.rollback()
             raise

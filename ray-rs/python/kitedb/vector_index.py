@@ -10,6 +10,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from kitedb._kitedb import IvfConfig, IvfIndex, SearchOptions, brute_force_search
 from kitedb.builders import NodeRef
+from kitedb.schema import NodeDef
 
 
 _METRIC_MAP = {
@@ -64,6 +65,8 @@ class VectorIndexOptions:
     normalize: Optional[bool] = None
     ivf: Optional[Dict[str, object]] = None
     training_threshold: int = 1000
+    # Max NodeRefs (with their props snapshot) kept for search hits. Evicted
+    # nodes are still returned, as refs carrying only id, key and node_def.
     cache_max_size: int = 10_000
 
 
@@ -96,6 +99,7 @@ class VectorIndex:
         self._ivf_config = options.ivf or {}
         self._training_threshold = options.training_threshold
         self._node_ref_cache = _LRUCache(options.cache_max_size)
+        self._node_meta: Dict[int, Tuple[str, NodeDef]] = {}
 
         self._vectors: Dict[int, List[float]] = {}
         self._node_to_vector: Dict[int, int] = {}
@@ -144,6 +148,7 @@ class VectorIndex:
         self._vector_to_node[vector_id] = node_id
         self._manifest_dirty = True
 
+        self._node_meta[node_id] = (node_ref.key, node_ref.node_def)
         self._node_ref_cache.set(node_id, node_ref)
 
         if self._index is not None and self._index.trained:
@@ -173,6 +178,7 @@ class VectorIndex:
         self._vectors.pop(node_id, None)
         self._node_to_vector.pop(node_id, None)
         self._vector_to_node.pop(vector_id, None)
+        self._node_meta.pop(node_id, None)
         self._node_ref_cache.delete(node_id)
         self._manifest_dirty = True
         return True
@@ -247,7 +253,7 @@ class VectorIndex:
 
         hits: List[VectorSearchHit] = []
         for node_id, distance, similarity in results:
-            node_ref = self._node_ref_cache.get(node_id)
+            node_ref = self._node_ref(node_id)
             if node_ref is None:
                 continue
             hits.append(VectorSearchHit(node=node_ref, distance=distance, similarity=similarity))
@@ -273,6 +279,7 @@ class VectorIndex:
         self._vectors.clear()
         self._node_to_vector.clear()
         self._vector_to_node.clear()
+        self._node_meta.clear()
         self._node_ref_cache.clear()
         self._next_vector_id = 0
         self._index = None
@@ -282,6 +289,20 @@ class VectorIndex:
 
     def buildIndex(self) -> None:  # noqa: N802
         self.build_index()
+
+    def _node_ref(self, node_id: int) -> Optional[NodeRef]:
+        node_ref = self._node_ref_cache.get(node_id)
+        if node_ref is not None:
+            return node_ref
+        meta = self._node_meta.get(node_id)
+        if meta is None:
+            return None
+        # Evicted from the LRU cache: rebuild the ref (without its props snapshot)
+        # rather than dropping a real hit.
+        key, node_def = meta
+        node_ref = NodeRef(id=node_id, key=key, node_def=node_def)
+        self._node_ref_cache.set(node_id, node_ref)
+        return node_ref
 
     def _coerce_vector(self, vector: Sequence[float]) -> List[float]:
         return [float(v) for v in vector]
