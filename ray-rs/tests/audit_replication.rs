@@ -1,4 +1,5 @@
-//! Audit repros for replication findings R1, R3, R4 and R5.
+//! Audit repros for replication findings R1, R3, R4 and R5, plus the replica
+//! missing-log-range escalation to `needs_reseed`.
 //!
 //! Every test here reproduces a finding through the public API and fails until
 //! the finding is fixed. Crash scenarios use a child process that aborts (the
@@ -776,6 +777,99 @@ fn audit_r5_reseed_with_stale_key_holder_keeps_key_lookup() {
     Some(n2),
     "reseed WAL order (create n2, then delete stale n1) loses the key on replay"
   );
+  assert_eq!(graph_state(&replica), graph_state(&primary));
+
+  close_single_file(replica).expect("close replica");
+  close_single_file(primary).expect("close primary");
+}
+
+// ============================================================================
+// Missing log range: transient retries never escalate to needs_reseed
+// ============================================================================
+
+/// Pulls allowed before a permanently missing log range must be flagged. Each
+/// pull already retries internally, so a few pulls exceed the transient budget.
+const MISSING_RANGE_MAX_PULLS: usize = 4;
+
+#[test]
+fn audit_missing_log_range_escalates_to_needs_reseed() {
+  let dir = tempfile::tempdir().expect("tempdir");
+  let primary_path = dir.path().join("gap-primary.kitedb");
+  let replica_path = dir.path().join("gap-replica.kitedb");
+  let primary = open_primary(&primary_path, SyncMode::Full);
+  let replica = open_replica(&replica_path, &primary_path);
+  replica
+    .replica_bootstrap_from_snapshot()
+    .expect("bootstrap empty primary");
+
+  for i in 0..3 {
+    primary.begin(false).expect("begin");
+    primary
+      .create_node(Some(&format!("gap-{i}")))
+      .expect("create node");
+    commit(&primary);
+  }
+
+  // The frames the replica needs next are gone for good.
+  let mut removed = 0usize;
+  let sidecar = default_replication_sidecar_path(&primary_path);
+  for entry in std::fs::read_dir(&sidecar).expect("read primary sidecar") {
+    let path = entry.expect("sidecar entry").path();
+    let is_segment = path
+      .file_name()
+      .and_then(|name| name.to_str())
+      .is_some_and(|name| name.starts_with("segment-") && name.ends_with(".rlog"));
+    if is_segment {
+      std::fs::remove_file(&path).expect("remove segment");
+      removed += 1;
+    }
+  }
+  assert!(removed > 0, "test setup: no segment files found");
+
+  let mut errors = Vec::new();
+  for _ in 0..MISSING_RANGE_MAX_PULLS {
+    let error = replica
+      .replica_catch_up_once(64)
+      .expect_err("catch-up must fail while frames are missing");
+    errors.push(error.to_string());
+    if replica
+      .replica_replication_status()
+      .expect("replica status")
+      .needs_reseed
+    {
+      break;
+    }
+  }
+
+  let status = replica
+    .replica_replication_status()
+    .expect("replica status");
+  assert!(
+    status.needs_reseed,
+    "a permanently missing log range never escalated to needs_reseed after {} pulls: \
+     errors={errors:?}",
+    errors.len()
+  );
+  assert!(
+    errors
+      .last()
+      .is_some_and(|error| error.contains("needs reseed")),
+    "the escalating pull must report `needs reseed`: errors={errors:?}"
+  );
+  assert!(
+    status
+      .last_error
+      .as_deref()
+      .is_some_and(|error| error.contains("needs reseed")),
+    "status must report `needs reseed`: last_error={:?}",
+    status.last_error
+  );
+
+  replica.replica_reseed_from_snapshot().expect("reseed");
+  let status = replica
+    .replica_replication_status()
+    .expect("replica status");
+  assert!(!status.needs_reseed && status.last_error.is_none());
   assert_eq!(graph_state(&replica), graph_state(&primary));
 
   close_single_file(replica).expect("close replica");
