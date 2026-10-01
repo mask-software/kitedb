@@ -181,18 +181,15 @@ fn deserialize_prop_value(value: &ExportedPropValue) -> PropValue {
 // Schema Helpers
 // =============================================================================
 
-fn build_schema_from_delta(delta: &crate::types::DeltaState) -> ExportedSchema {
-  let mut schema = ExportedSchema::default();
-  for (id, name) in &delta.new_labels {
-    schema.labels.insert(*id, name.clone());
+/// Every committed definition, from the snapshot and the WAL alike. The
+/// delta's `new_*` maps miss whatever a checkpoint already moved into the
+/// snapshot.
+fn build_schema(db: &SingleFileDB) -> ExportedSchema {
+  ExportedSchema {
+    labels: db.label_ids.read().clone(),
+    etypes: db.etype_ids.read().clone(),
+    prop_keys: db.propkey_ids.read().clone(),
   }
-  for (id, name) in &delta.new_etypes {
-    schema.etypes.insert(*id, name.clone());
-  }
-  for (id, name) in &delta.new_propkeys {
-    schema.prop_keys.insert(*id, name.clone());
-  }
-  schema
 }
 
 fn prop_key_name_single(db: &SingleFileDB, key_id: PropKeyId) -> String {
@@ -209,9 +206,11 @@ pub fn export_to_object_single(
   db: &SingleFileDB,
   options: ExportOptions,
 ) -> Result<ExportedDatabase> {
-  let delta = db.delta.read();
+  // Read only through the read API, which takes and releases its own guards.
+  // Holding `delta.read()` across those calls would re-lock it, and a commit or
+  // checkpoint queued on `delta.write()` blocks that nested read forever.
   let schema = if options.include_schema {
-    build_schema_from_delta(&delta)
+    build_schema(db)
   } else {
     ExportedSchema::default()
   };
@@ -372,23 +371,13 @@ pub fn import_from_object_single(
   let schema_tx = db.begin_guard(false)?;
 
   for name in data.schema.prop_keys.values() {
-    let id = match db.propkey_id(name) {
-      Some(id) => id,
-      None => db.define_propkey(name)?,
-    };
-    propkey_name_to_id.insert(name.clone(), id);
+    resolve_propkey(db, &mut propkey_name_to_id, name)?;
   }
   for name in data.schema.etypes.values() {
-    let id = match db.etype_id(name) {
-      Some(id) => id,
-      None => db.define_etype(name)?,
-    };
-    etype_name_to_id.insert(name.clone(), id);
+    resolve_etype(db, &mut etype_name_to_id, name)?;
   }
   for name in data.schema.labels.values() {
-    if db.label_id(name).is_none() {
-      db.define_label(name)?;
-    }
+    db.define_label(name)?;
   }
   schema_tx.commit()?;
 
@@ -411,10 +400,9 @@ pub fn import_from_object_single(
 
     let node_id = db.create_node(node.key.as_deref())?;
     for (prop_name, exported_value) in &node.props {
-      if let Some(&key_id) = propkey_name_to_id.get(prop_name) {
-        let value = deserialize_prop_value(exported_value);
-        db.set_node_prop(node_id, key_id, value)?;
-      }
+      // Older exports can carry a partial schema, so names are resolved here.
+      let key_id = resolve_propkey(db, &mut propkey_name_to_id, prop_name)?;
+      db.set_node_prop(node_id, key_id, deserialize_prop_value(exported_value))?;
     }
 
     old_to_new.insert(node.id as NodeId, node_id);
@@ -447,13 +435,22 @@ pub fn import_from_object_single(
       None => continue,
     };
 
-    let etype_id = edge
+    let etype_name = edge
       .etype_name
-      .as_ref()
-      .and_then(|name| etype_name_to_id.get(name).copied())
-      .unwrap_or(edge.etype as ETypeId);
+      .as_deref()
+      .or_else(|| data.schema.etypes.get(&edge.etype).map(String::as_str));
+    let etype_id = match etype_name {
+      Some(name) => resolve_etype(db, &mut etype_name_to_id, name)?,
+      None => edge.etype as ETypeId,
+    };
 
     db.add_edge(src, etype_id, dst)?;
+    let mut props = Vec::with_capacity(edge.props.len());
+    for (prop_name, exported_value) in &edge.props {
+      let key_id = resolve_propkey(db, &mut propkey_name_to_id, prop_name)?;
+      props.push((key_id, deserialize_prop_value(exported_value)));
+    }
+    db.set_edge_props(src, etype_id, dst, props)?;
     edge_count += 1;
     batch_count += 1;
 
@@ -477,10 +474,92 @@ pub fn import_from_object_single(
   })
 }
 
+/// Returns the id for a property key name, defining the key in the open
+/// write transaction when the database does not know it yet.
+fn resolve_propkey(
+  db: &SingleFileDB,
+  known: &mut HashMap<String, PropKeyId>,
+  name: &str,
+) -> Result<PropKeyId> {
+  if let Some(&id) = known.get(name) {
+    return Ok(id);
+  }
+  let id = db.define_propkey(name)?;
+  known.insert(name.to_string(), id);
+  Ok(id)
+}
+
+/// Returns the id for an edge type name, defining the type in the open write
+/// transaction when the database does not know it yet.
+fn resolve_etype(
+  db: &SingleFileDB,
+  known: &mut HashMap<String, ETypeId>,
+  name: &str,
+) -> Result<ETypeId> {
+  if let Some(&id) = known.get(name) {
+    return Ok(id);
+  }
+  let id = db.define_etype(name)?;
+  known.insert(name.to_string(), id);
+  Ok(id)
+}
+
 pub fn import_from_json<P: AsRef<Path>>(path: P) -> Result<ExportedDatabase> {
   let file = File::open(path).map_err(KiteError::Io)?;
   let reader = BufReader::new(file);
   let data: ExportedDatabase =
     serde_json::from_reader(reader).map_err(|e| KiteError::Serialization(e.to_string()))?;
   Ok(data)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::core::single_file::{close_single_file, open_single_file, SingleFileOpenOptions};
+
+  /// Exports written before the schema came from the full name maps carry an
+  /// empty schema once the source had checkpointed. Import resolves names from
+  /// the nodes and edges themselves, and maps a nameless edge type through the
+  /// schema's etypes.
+  #[test]
+  fn imports_export_with_partial_schema() {
+    let json = r#"{
+      "version": 1,
+      "exported_at": "0",
+      "schema": { "labels": {}, "etypes": { "7": "LIKES" }, "prop_keys": {} },
+      "nodes": [
+        { "id": 1, "key": "user:alice", "props": { "name": { "type": "string", "value": "Alice" } } },
+        { "id": 2, "key": "user:bob", "props": { "age": { "type": "int", "value": 41 } } }
+      ],
+      "edges": [
+        { "src": 1, "dst": 2, "etype": 3, "etype_name": "KNOWS",
+          "props": { "since": { "type": "int", "value": 2020 } } },
+        { "src": 2, "dst": 1, "etype": 7, "etype_name": null, "props": {} }
+      ],
+      "stats": { "node_count": 2, "edge_count": 2 }
+    }"#;
+    let data: ExportedDatabase = serde_json::from_str(json).expect("parse export");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db =
+      open_single_file(dir.path().join("db.kitedb"), SingleFileOpenOptions::new()).expect("open");
+    let result = import_from_object_single(&db, &data, ImportOptions::default()).expect("import");
+    assert_eq!((result.node_count, result.edge_count), (2, 2));
+
+    let alice = db.node_by_key("user:alice").expect("alice");
+    let bob = db.node_by_key("user:bob").expect("bob");
+    let prop = |node, name: &str| db.node_prop(node, db.propkey_id(name).expect(name));
+    assert_eq!(prop(alice, "name"), Some(PropValue::String("Alice".into())));
+    assert_eq!(prop(bob, "age"), Some(PropValue::I64(41)));
+
+    let knows = db.etype_id("KNOWS").expect("KNOWS");
+    let since = db.propkey_id("since").expect("since");
+    assert_eq!(
+      db.edge_prop(alice, knows, bob, since),
+      Some(PropValue::I64(2020))
+    );
+    let likes = db.etype_id("LIKES").expect("LIKES");
+    assert!(db.edge_exists(bob, likes, alice));
+    close_single_file(db).expect("close");
+  }
 }
