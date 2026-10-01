@@ -24,6 +24,7 @@ use rayon::prelude::*;
 use crate::types::NodeId;
 use crate::vector::distance::{normalize, normalize_in_place};
 use crate::vector::ivf::{kmeans_parallel, KMeansConfig};
+use crate::vector::store::validate_manifest_layout;
 use crate::vector::types::{
   DistanceMetric, IvfConfig, MultiQueryAggregation, PqConfig, VectorManifest, VectorSearchResult,
 };
@@ -419,22 +420,12 @@ impl IvfPqIndex {
     if !self.trained {
       return Err(IvfPqError::NotTrained);
     }
-
-    if vector.len() != self.dimensions {
-      return Err(IvfPqError::DimensionMismatch {
-        expected: self.dimensions,
-        got: vector.len(),
-      });
-    }
+    self.check_dimensions(vector)?;
 
     let distance_fn = self.config.ivf.metric.distance_fn();
 
     // Prepare vector (normalize for cosine metric)
-    let query_vec: Cow<[f32]> = if self.config.ivf.metric == DistanceMetric::Cosine {
-      Cow::Owned(normalize(vector))
-    } else {
-      Cow::Borrowed(vector)
-    };
+    let query_vec = self.prepare_query(vector);
     let query_slice = query_vec.as_ref();
 
     // Find nearest centroid
@@ -516,19 +507,19 @@ impl IvfPqIndex {
   }
 
   /// Delete a vector from the index
-  pub fn delete(&mut self, vector_id: u64, vector: &[f32]) -> bool {
+  ///
+  /// # Errors
+  /// Returns an error if the vector length does not match the index dimensions.
+  pub fn delete(&mut self, vector_id: u64, vector: &[f32]) -> Result<bool, IvfPqError> {
+    self.check_dimensions(vector)?;
     if !self.trained {
-      return false;
+      return Ok(false);
     }
 
     let distance_fn = self.config.ivf.metric.distance_fn();
 
     // Prepare vector (normalize for cosine metric)
-    let query_vec: Cow<[f32]> = if self.config.ivf.metric == DistanceMetric::Cosine {
-      Cow::Owned(normalize(vector))
-    } else {
-      Cow::Borrowed(vector)
-    };
+    let query_vec = self.prepare_query(vector);
     let query_slice = query_vec.as_ref();
 
     // Find which cluster it's in
@@ -561,74 +552,76 @@ impl IvfPqIndex {
     // Remove PQ codes
     let removed_codes = self.pq_codes.remove(&vector_id).is_some();
 
-    removed_from_list || removed_codes
+    Ok(removed_from_list || removed_codes)
   }
 
   /// Search for k nearest neighbors
+  ///
+  /// # Errors
+  /// Returns an error if the query or the manifest does not match the index
+  /// dimensions, or if the manifest's row groups are malformed.
   pub fn search(
     &self,
     manifest: &VectorManifest,
     query: &[f32],
     k: usize,
     options: Option<IvfPqSearchOptions>,
-  ) -> Vec<VectorSearchResult> {
+  ) -> Result<Vec<VectorSearchResult>, IvfPqError> {
+    self.check_dimensions(query)?;
+    self.check_manifest(manifest)?;
     let options = options.unwrap_or_default();
-    self.search_with_options(manifest, query, k, &options, true)
+    let query = self.prepare_query(query);
+    Ok(
+      self
+        .collect_candidates(manifest, &query, k, &options, true)
+        .into_iter()
+        .map(|(candidate, distance)| self.to_result(candidate, distance))
+        .collect(),
+    )
   }
 
-  /// Search with borrowed options so multi-query search can reuse a filter
-  /// without moving it. `apply_threshold` is disabled by multi-query search
-  /// until the per-query distances have been aggregated.
-  fn search_with_options(
+  /// Top-k candidates for a prepared (cosine-normalized) query, best first.
+  /// Multi-query search disables `apply_threshold` and thresholds the
+  /// aggregated distance instead.
+  fn collect_candidates(
     &self,
     manifest: &VectorManifest,
     query: &[f32],
     k: usize,
     options: &IvfPqSearchOptions,
     apply_threshold: bool,
-  ) -> Vec<VectorSearchResult> {
+  ) -> Vec<(Candidate, f32)> {
     if !self.trained || k == 0 {
       return Vec::new();
     }
 
     let n_probe = options.n_probe.unwrap_or(self.config.ivf.n_probe);
 
-    // Normalize query for cosine metric
-    let query_for_search: Cow<[f32]> = if self.config.ivf.metric == DistanceMetric::Cosine {
-      Cow::Owned(normalize(query))
-    } else {
-      Cow::Borrowed(query)
-    };
-    let query_slice = query_for_search.as_ref();
-
     // Find top n_probe nearest centroids
-    let probe_clusters = self.find_nearest_centroids(query_slice, n_probe);
+    let probe_clusters = self.find_nearest_centroids(query, n_probe);
 
     // Use max-heap to track top-k candidates
     let mut heap = MaxHeap::new();
 
     // For non-residual mode, build the distance table ONCE
-    let shared_dist_table = if !self.config.use_residuals {
-      Some(self.build_distance_table(query_slice, None))
-    } else {
-      None
-    };
-    let shared_table = if self.config.use_residuals {
-      None
-    } else {
-      match shared_dist_table.as_ref() {
-        Some(table) => Some(table),
-        None => {
-          debug_assert!(
-            false,
-            "shared distance table missing for non-residual search"
-          );
-          return Vec::new();
-        }
-      }
-    };
+    let shared_table = (!self.config.use_residuals).then(|| self.build_distance_table(query, None));
 
-    let mut search_vectors = |dist_table: &AdcTable, vector_ids: &[u64]| {
+    // Search within selected clusters
+    for cluster in probe_clusters {
+      let vector_ids = match self.inverted_lists.get(&cluster) {
+        Some(list) if !list.is_empty() => list,
+        _ => continue,
+      };
+
+      let residual_table;
+      let dist_table = match &shared_table {
+        Some(table) => table,
+        None => {
+          residual_table = self.build_distance_table(query, Some(cluster));
+          &residual_table
+        }
+      };
+
       // Search vectors in this cluster using PQ ADC
       for &vector_id in vector_ids {
         // A missing mapping is not a valid result. Do this check before the
@@ -664,56 +657,57 @@ impl IvfPqIndex {
         }
 
         // Add to heap
+        let candidate = Candidate {
+          vector_id,
+          node_id,
+          cluster,
+        };
         if heap.len() < k {
-          heap.push(vector_id, dist);
+          heap.push(candidate, dist);
         } else if let Some(&(_, max_dist)) = heap.peek() {
           if dist < max_dist {
             heap.pop();
-            heap.push(vector_id, dist);
+            heap.push(candidate, dist);
           }
         }
       }
-    };
-
-    // Search within selected clusters
-    for cluster in probe_clusters {
-      let vector_ids = match self.inverted_lists.get(&cluster) {
-        Some(list) if !list.is_empty() => list,
-        _ => continue,
-      };
-
-      let dist_table = if self.config.use_residuals {
-        self.build_distance_table(query_slice, Some(cluster))
-      } else {
-        match shared_table {
-          Some(table) => table.clone(),
-          None => {
-            debug_assert!(
-              false,
-              "shared distance table missing for non-residual search"
-            );
-            return Vec::new();
-          }
-        }
-      };
-      search_vectors(&dist_table, vector_ids);
     }
 
-    // Convert to results. The mapping was checked while collecting, so a
-    // result cannot silently turn into node 0 here.
-    heap
-      .into_sorted_vec()
-      .into_iter()
-      .filter_map(|(vector_id, distance)| {
-        let node_id = manifest.vector_to_node.get(&vector_id).copied()?;
-        Some(VectorSearchResult {
-          vector_id,
-          node_id,
-          distance,
-          similarity: self.config.ivf.metric.distance_to_similarity(distance),
-        })
-      })
-      .collect()
+    heap.into_sorted_vec()
+  }
+
+  fn to_result(&self, candidate: Candidate, distance: f32) -> VectorSearchResult {
+    VectorSearchResult {
+      vector_id: candidate.vector_id,
+      node_id: candidate.node_id,
+      distance,
+      similarity: self.config.ivf.metric.distance_to_similarity(distance),
+    }
+  }
+
+  fn prepare_query<'a>(&self, query: &'a [f32]) -> Cow<'a, [f32]> {
+    if self.config.ivf.metric == DistanceMetric::Cosine {
+      Cow::Owned(normalize(query))
+    } else {
+      Cow::Borrowed(query)
+    }
+  }
+
+  fn check_dimensions(&self, vector: &[f32]) -> Result<(), IvfPqError> {
+    if vector.len() != self.dimensions {
+      return Err(IvfPqError::DimensionMismatch {
+        expected: self.dimensions,
+        got: vector.len(),
+      });
+    }
+    Ok(())
+  }
+
+  /// Search reads only the node mappings, but a manifest of a different
+  /// width cannot belong to this index.
+  fn check_manifest(&self, manifest: &VectorManifest) -> Result<(), IvfPqError> {
+    validate_manifest_layout(manifest, self.dimensions)
+      .map_err(|e| IvfPqError::InvalidManifest(e.to_string()))
   }
 
   /// Build a metric-aware ADC table.
@@ -888,12 +882,13 @@ impl IvfPqIndex {
     k: usize,
     aggregation: MultiQueryAggregation,
     options: Option<IvfPqSearchOptions>,
-  ) -> Vec<VectorSearchResult> {
-    if !self.trained || queries.is_empty() {
-      return Vec::new();
+  ) -> Result<Vec<VectorSearchResult>, IvfPqError> {
+    for query in queries {
+      self.check_dimensions(query)?;
     }
-    if k == 0 {
-      return Vec::new();
+    self.check_manifest(manifest)?;
+    if !self.trained || queries.is_empty() || k == 0 {
+      return Ok(Vec::new());
     }
 
     let options = options.unwrap_or_default();
@@ -904,45 +899,74 @@ impl IvfPqIndex {
     // through on every pass; it is never replaced by the config default.
     let max_candidates = self.pq_codes.len();
     if max_candidates == 0 {
-      return Vec::new();
+      return Ok(Vec::new());
     }
     let mut expanded_k = k.saturating_mul(2).max(k).min(max_candidates);
 
-    loop {
-      let all_results: Vec<Vec<VectorSearchResult>> = queries
+    let prepared: Vec<Cow<[f32]>> = queries
+      .iter()
+      .map(|query| self.prepare_query(query))
+      .collect();
+    // Without residuals the ADC table depends only on the query.
+    let shared_tables: Option<Vec<AdcTable>> = (!self.config.use_residuals).then(|| {
+      prepared
         .iter()
-        .map(|query| self.search_with_options(manifest, query, expanded_k, &options, false))
-        .collect();
+        .map(|query| self.build_distance_table(query, None))
+        .collect()
+    });
+    let mut distances = Vec::with_capacity(prepared.len());
 
-      let mut aggregated: std::collections::HashMap<NodeId, (Vec<f32>, u64)> =
-        std::collections::HashMap::new();
-      for results in &all_results {
-        for result in results {
-          let entry = aggregated
-            .entry(result.node_id)
-            .or_insert_with(|| (Vec::new(), result.vector_id));
-          entry.0.push(result.distance);
+    loop {
+      // Candidates: union of each query's top-expanded_k.
+      let mut seen = HashSet::new();
+      let mut by_cluster: HashMap<usize, Vec<Candidate>> = HashMap::new();
+      let mut all_short = true;
+      for query in &prepared {
+        let found = self.collect_candidates(manifest, query, expanded_k, &options, false);
+        all_short &= found.len() < expanded_k;
+        for (candidate, _) in found {
+          if seen.insert(candidate.vector_id) {
+            by_cluster
+              .entry(candidate.cluster)
+              .or_default()
+              .push(candidate);
+          }
         }
       }
+      let exhausted = expanded_k >= max_candidates || all_short;
 
-      let exhausted = expanded_k >= max_candidates
-        || all_results.iter().all(|results| results.len() < expanded_k);
-      let mut scored: Vec<VectorSearchResult> = aggregated
-        .into_iter()
-        .map(|(node_id, (distances, vector_id))| {
-          let distance = aggregation.aggregate(&distances);
-          let similarity = self.config.ivf.metric.distance_to_similarity(distance);
-          VectorSearchResult {
-            vector_id,
-            node_id,
-            distance,
-            similarity,
+      // Score every candidate against every query. A candidate found by only
+      // one query must not be aggregated over that query's distance alone.
+      // Residual tables depend on the cluster, so build them per cluster.
+      let mut scored: Vec<VectorSearchResult> = Vec::with_capacity(seen.len());
+      for (cluster, candidates) in by_cluster {
+        let residual_tables: Vec<AdcTable>;
+        let tables = match &shared_tables {
+          Some(tables) => tables,
+          None => {
+            residual_tables = prepared
+              .iter()
+              .map(|query| self.build_distance_table(query, Some(cluster)))
+              .collect();
+            &residual_tables
           }
-        })
-        .collect();
-
-      if let Some(threshold) = options.threshold {
-        scored.retain(|r| r.similarity >= threshold);
+        };
+        for candidate in candidates {
+          let codes = match self.pq_codes.get(&candidate.vector_id) {
+            Some(codes) => codes,
+            None => continue,
+          };
+          distances.clear();
+          distances.extend(tables.iter().map(|table| self.distance_adc(table, codes)));
+          let result = self.to_result(candidate, aggregation.aggregate(&distances));
+          if options
+            .threshold
+            .is_some_and(|threshold| result.similarity < threshold)
+          {
+            continue;
+          }
+          scored.push(result);
+        }
       }
 
       // Stop as soon as enough filtered and threshold-qualified nodes are
@@ -955,12 +979,12 @@ impl IvfPqIndex {
             .unwrap_or(std::cmp::Ordering::Equal)
         });
         scored.truncate(k);
-        return scored;
+        return Ok(scored);
       }
 
       let next_k = expanded_k.saturating_mul(2).min(max_candidates);
       if next_k == expanded_k {
-        return Vec::new();
+        return Ok(Vec::new());
       }
       expanded_k = next_k;
     }
@@ -968,6 +992,8 @@ impl IvfPqIndex {
 
   /// Build index from all vectors in the store
   pub fn build_from_store(&mut self, manifest: &VectorManifest) -> Result<(), IvfPqError> {
+    self.check_manifest(manifest)?;
+
     // Collect training vectors
     for fragment in &manifest.fragments {
       for row_group in &fragment.row_groups {
@@ -996,13 +1022,14 @@ impl IvfPqIndex {
 
       let row_group_idx = location.local_index / manifest.config.row_group_size;
       let local_row_idx = location.local_index % manifest.config.row_group_size;
-      let row_group = match fragment.row_groups.get(row_group_idx) {
-        Some(rg) => rg,
+      let vector = match fragment
+        .row_groups
+        .get(row_group_idx)
+        .and_then(|rg| rg.get(local_row_idx, manifest.config.dimensions))
+      {
+        Some(vector) => vector,
         None => continue,
       };
-
-      let offset = local_row_idx * manifest.config.dimensions;
-      let vector = &row_group.data[offset..offset + manifest.config.dimensions];
 
       self.insert(vector_id, vector)?;
     }
@@ -1138,12 +1165,21 @@ pub struct IvfPqStats {
 // Max Heap for Top-K
 // ============================================================================
 
-/// Simple max-heap for top-k selection
-struct MaxHeap {
-  items: Vec<(u64, f32)>, // (vector_id, distance)
+/// A search hit before it becomes a `VectorSearchResult`. Multi-query search
+/// needs the cluster to rebuild residual ADC tables for the other queries.
+#[derive(Debug, Clone, Copy)]
+struct Candidate {
+  vector_id: u64,
+  node_id: NodeId,
+  cluster: usize,
 }
 
-impl MaxHeap {
+/// Simple max-heap for top-k selection
+struct MaxHeap<T> {
+  items: Vec<(T, f32)>, // (item, distance)
+}
+
+impl<T> MaxHeap<T> {
   fn new() -> Self {
     Self { items: Vec::new() }
   }
@@ -1152,12 +1188,12 @@ impl MaxHeap {
     self.items.len()
   }
 
-  fn push(&mut self, id: u64, dist: f32) {
+  fn push(&mut self, id: T, dist: f32) {
     self.items.push((id, dist));
     self.sift_up(self.items.len() - 1);
   }
 
-  fn pop(&mut self) -> Option<(u64, f32)> {
+  fn pop(&mut self) -> Option<(T, f32)> {
     if self.items.is_empty() {
       return None;
     }
@@ -1170,7 +1206,7 @@ impl MaxHeap {
     result
   }
 
-  fn peek(&self) -> Option<&(u64, f32)> {
+  fn peek(&self) -> Option<&(T, f32)> {
     self.items.first()
   }
 
@@ -1209,7 +1245,7 @@ impl MaxHeap {
     }
   }
 
-  fn into_sorted_vec(mut self) -> Vec<(u64, f32)> {
+  fn into_sorted_vec(mut self) -> Vec<(T, f32)> {
     let mut result = Vec::with_capacity(self.items.len());
     while let Some(item) = self.pop() {
       result.push(item);
@@ -1374,6 +1410,7 @@ pub enum IvfPqError {
   InvalidConfiguration(String),
   InvalidStructure(String),
   SizeOverflow(String),
+  InvalidManifest(String),
 }
 
 impl std::fmt::Display for IvfPqError {
@@ -1401,6 +1438,7 @@ impl std::fmt::Display for IvfPqError {
       }
       IvfPqError::InvalidStructure(msg) => write!(f, "Invalid IVF-PQ structure: {msg}"),
       IvfPqError::SizeOverflow(context) => write!(f, "IVF-PQ size overflow: {context}"),
+      IvfPqError::InvalidManifest(msg) => write!(f, "Invalid vector manifest: {msg}"),
     }
   }
 }
@@ -2324,7 +2362,7 @@ mod tests {
       let (index, manifest, vectors, query) = manual_metric_fixture(metric);
       let exact = exact_fixture_distances(metric, &vectors, &query);
       let expected_ids: HashSet<u64> = exact.iter().take(3).map(|(id, _)| *id).collect();
-      let results = index.search(&manifest, &query, 3, None);
+      let results = index.search(&manifest, &query, 3, None).expect("search");
       let actual_ids: HashSet<u64> = results.iter().map(|result| result.vector_id).collect();
 
       assert_eq!(
@@ -2448,32 +2486,116 @@ mod tests {
   fn test_ivf_pq_search_multi_honors_probe_and_filters_during_collection() {
     let (index, manifest) = manual_multi_query_fixture();
     let query = [0.0, 0.0];
-    let filtered = index.search_multi(
-      &manifest,
-      &[&query],
-      2,
-      MultiQueryAggregation::Min,
-      Some(IvfPqSearchOptions {
-        n_probe: Some(2),
-        filter: Some(Box::new(|node_id| node_id >= 3)),
-        threshold: None,
-      }),
-    );
+    let filtered = index
+      .search_multi(
+        &manifest,
+        &[&query],
+        2,
+        MultiQueryAggregation::Min,
+        Some(IvfPqSearchOptions {
+          n_probe: Some(2),
+          filter: Some(Box::new(|node_id| node_id >= 3)),
+          threshold: None,
+        }),
+      )
+      .expect("search_multi");
     assert_eq!(filtered.len(), 2);
     assert!(filtered.iter().all(|result| result.node_id >= 3));
 
-    let not_probed = index.search_multi(
-      &manifest,
-      &[&query],
-      2,
-      MultiQueryAggregation::Min,
-      Some(IvfPqSearchOptions {
-        n_probe: None,
-        filter: Some(Box::new(|node_id| node_id >= 3)),
-        threshold: None,
-      }),
-    );
+    let not_probed = index
+      .search_multi(
+        &manifest,
+        &[&query],
+        2,
+        MultiQueryAggregation::Min,
+        Some(IvfPqSearchOptions {
+          n_probe: None,
+          filter: Some(Box::new(|node_id| node_id >= 3)),
+          threshold: None,
+        }),
+      )
+      .expect("search_multi");
     assert!(not_probed.is_empty());
+  }
+
+  #[test]
+  fn test_ivf_pq_search_multi_scores_residual_candidates_against_their_cluster() {
+    // Residual codebooks that reproduce A = (1, 1) in cluster 0 and
+    // B = (9, 3) in cluster 1 exactly. With n_probe = 1, q1 only sees A and q2
+    // only sees B, so each candidate's distance to the other query must use
+    // its own cluster's residual table.
+    let config = IvfPqConfig {
+      ivf: IvfConfig {
+        n_clusters: 2,
+        n_probe: 1,
+        metric: DistanceMetric::Euclidean,
+      },
+      pq: PqConfig {
+        num_subspaces: 2,
+        num_centroids: 2,
+        max_iterations: 1,
+      },
+      use_residuals: true,
+    };
+    let index = IvfPqIndex::from_serialized(
+      config,
+      vec![0.0, 0.0, 10.0, 0.0],
+      HashMap::from([(0, vec![1]), (1, vec![2])]),
+      HashMap::from([(1, vec![0, 0]), (2, vec![1, 1])]),
+      vec![vec![1.0, -1.0], vec![1.0, 3.0]],
+      None,
+      2,
+      true,
+    )
+    .expect("hand-built residual index");
+    let mut manifest = VectorManifest::new(VectorStoreConfig::new(2));
+    for vector_id in [1, 2] {
+      manifest.vector_to_node.insert(vector_id, vector_id);
+      manifest.node_to_vector.insert(vector_id, vector_id);
+    }
+
+    let q1 = [0.0, 0.0];
+    let q2 = [10.0, 0.0];
+    let a = (2.0f32.sqrt(), 82.0f32.sqrt());
+    let b = (90.0f32.sqrt(), 10.0f32.sqrt());
+    for (aggregation, expected) in [
+      (MultiQueryAggregation::Sum, [(1, a.0 + a.1), (2, b.0 + b.1)]),
+      (MultiQueryAggregation::Max, [(1, a.1), (2, b.0)]),
+    ] {
+      let results = index
+        .search_multi(&manifest, &[&q1, &q2], 2, aggregation, None)
+        .expect("search_multi");
+      let got: Vec<(u64, f32)> = results.iter().map(|r| (r.node_id, r.distance)).collect();
+      assert_eq!(got.len(), 2, "{aggregation:?}: {got:?}");
+      for ((node_id, distance), (expected_id, expected_distance)) in got.iter().zip(expected) {
+        assert_eq!(*node_id, expected_id, "{aggregation:?}: {got:?}");
+        assert!(
+          (distance - expected_distance).abs() < 1e-4,
+          "{aggregation:?}: {got:?}"
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn test_ivf_pq_build_from_store_rejects_mismatched_manifest_before_training() {
+    let mut manifest = VectorManifest::new(VectorStoreConfig::new(8).with_normalize(false));
+    for node_id in 1..=4u64 {
+      let vector: Vec<f32> = (0..8).map(|d| (node_id * 8 + d) as f32).collect();
+      crate::vector::store::vector_store_insert(&mut manifest, node_id, &vector)
+        .expect("store insert");
+    }
+    let config = IvfPqConfig::new()
+      .with_n_clusters(1)
+      .with_num_subspaces(2)
+      .with_num_centroids(2);
+    let mut index = IvfPqIndex::new(4, config).expect("config");
+
+    assert!(matches!(
+      index.build_from_store(&manifest),
+      Err(IvfPqError::InvalidManifest(_))
+    ));
+    assert!(!index.trained);
   }
 
   #[test]
@@ -2544,16 +2666,18 @@ mod tests {
     index.trained = true;
 
     let manifest = VectorManifest::new(VectorStoreConfig::new(2));
-    let results = index.search(
-      &manifest,
-      &[0.0, 0.0],
-      1,
-      Some(IvfPqSearchOptions {
-        n_probe: None,
-        filter: Some(Box::new(|node_id| node_id == 0)),
-        threshold: None,
-      }),
-    );
+    let results = index
+      .search(
+        &manifest,
+        &[0.0, 0.0],
+        1,
+        Some(IvfPqSearchOptions {
+          n_probe: None,
+          filter: Some(Box::new(|node_id| node_id == 0)),
+          threshold: None,
+        }),
+      )
+      .expect("search");
     assert!(results.is_empty());
     assert!(results.iter().all(|result| result.node_id != 0));
   }
@@ -2678,8 +2802,8 @@ mod tests {
     // Insert and delete
     let vector = vec![0.5f32; 16];
     index.insert(0, &vector).expect("expected value");
-    assert!(index.delete(0, &vector));
-    assert!(!index.delete(0, &vector)); // Already deleted
+    assert!(index.delete(0, &vector).expect("delete"));
+    assert!(!index.delete(0, &vector).expect("delete")); // Already deleted
 
     let stats = index.stats();
     assert_eq!(stats.total_vectors, 0);
@@ -3152,7 +3276,9 @@ mod tests {
     let manifest = crate::vector::types::VectorManifest::new(config);
 
     // Empty queries should return empty results
-    let results = index.search_multi(&manifest, &[], 5, MultiQueryAggregation::Min, None);
+    let results = index
+      .search_multi(&manifest, &[], 5, MultiQueryAggregation::Min, None)
+      .expect("search_multi");
     assert!(results.is_empty());
   }
 
@@ -3163,7 +3289,9 @@ mod tests {
     let manifest = crate::vector::types::VectorManifest::new(config);
 
     let query = vec![0.5f32; 16];
-    let results = index.search_multi(&manifest, &[&query], 5, MultiQueryAggregation::Min, None);
+    let results = index
+      .search_multi(&manifest, &[&query], 5, MultiQueryAggregation::Min, None)
+      .expect("search_multi");
     assert!(results.is_empty());
   }
 }

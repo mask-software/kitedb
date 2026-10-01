@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use crate::cache::lru::LruCache;
 use crate::types::NodeId;
+use crate::vector::store::validate_vector;
 use crate::vector::{
   create_vector_store, vector_store_clear, vector_store_delete, vector_store_insert,
   vector_store_node_vector, vector_store_stats, DistanceMetric, IvfConfig, IvfError, IvfIndex,
@@ -49,7 +50,7 @@ pub struct VectorIndexOptions {
   pub row_group_size: usize,
   /// Vectors per fragment before sealing (default: 100_000)
   pub fragment_target_size: usize,
-  /// Whether to auto-normalize vectors (default: true for cosine)
+  /// Whether to auto-normalize vectors (default: true for cosine, false otherwise)
   pub normalize: bool,
   /// Number of IVF clusters (default: auto-computed)
   pub n_clusters: Option<usize>,
@@ -101,12 +102,13 @@ impl VectorIndexOptions {
   }
 
   /// Set the distance metric
+  ///
+  /// Also resets `normalize` to the metric's default (true only for cosine,
+  /// since normalizing changes Euclidean and dot-product distances). Call
+  /// `with_normalize` afterwards to override.
   pub fn with_metric(mut self, metric: DistanceMetric) -> Self {
     self.metric = metric;
-    // Auto-adjust normalize for cosine
-    if metric == DistanceMetric::Cosine {
-      self.normalize = true;
-    }
+    self.normalize = metric == DistanceMetric::Cosine;
     self
   }
 
@@ -323,6 +325,18 @@ impl BuiltIndex {
       BuiltIndex::IvfPq(index) => index.config.ivf.n_clusters,
     }
   }
+
+  /// Remove a vector from the ANN index (a no-op until trained).
+  fn delete(&mut self, vector_id: u64, vector: &[f32]) -> Result<bool, VectorIndexError> {
+    match self {
+      BuiltIndex::Ivf(index) => index
+        .delete(vector_id, vector)
+        .map_err(ivf_error_to_index_error),
+      BuiltIndex::IvfPq(index) => index
+        .delete(vector_id, vector)
+        .map_err(ivf_pq_error_to_index_error),
+    }
+  }
 }
 
 pub struct VectorIndex {
@@ -381,20 +395,15 @@ impl VectorIndex {
       });
     }
 
+    // Reject before touching the ANN index, so a bad vector cannot drop the
+    // node's existing entry.
+    validate_vector(vector).map_err(|e| VectorIndexError::StoreError(e.to_string()))?;
+
     // Check if we need to delete from index first
     if let Some(&existing_vector_id) = self.manifest.node_to_vector.get(&node_id) {
       if let Some(ref mut index) = self.index {
-        if index.trained() {
-          if let Some(existing_vector) = vector_store_node_vector(&self.manifest, node_id) {
-            match index {
-              BuiltIndex::Ivf(ivf_index) => {
-                ivf_index.delete(existing_vector_id, existing_vector);
-              }
-              BuiltIndex::IvfPq(ivf_pq_index) => {
-                ivf_pq_index.delete(existing_vector_id, existing_vector);
-              }
-            }
-          }
+        if let Some(existing_vector) = vector_store_node_vector(&self.manifest, node_id) {
+          index.delete(existing_vector_id, existing_vector)?;
         }
       }
     }
@@ -451,18 +460,9 @@ impl VectorIndex {
 
     // Remove from index if trained
     if let Some(ref mut index) = self.index {
-      if index.trained() {
-        if let Some(&vector_id) = self.manifest.node_to_vector.get(&node_id) {
-          if let Some(vector) = vector_store_node_vector(&self.manifest, node_id) {
-            match index {
-              BuiltIndex::Ivf(ivf_index) => {
-                ivf_index.delete(vector_id, vector);
-              }
-              BuiltIndex::IvfPq(ivf_pq_index) => {
-                ivf_pq_index.delete(vector_id, vector);
-              }
-            }
-          }
+      if let Some(&vector_id) = self.manifest.node_to_vector.get(&node_id) {
+        if let Some(vector) = vector_store_node_vector(&self.manifest, node_id) {
+          index.delete(vector_id, vector)?;
         }
       }
     }
@@ -639,7 +639,9 @@ impl VectorIndex {
               filter: filter_box,
               threshold,
             };
-            ivf_index.search(&self.manifest, query, k, Some(search_opts))
+            ivf_index
+              .search(&self.manifest, query, k, Some(search_opts))
+              .map_err(ivf_error_to_index_error)?
           }
           BuiltIndex::IvfPq(ivf_pq_index) => {
             let filter_box = filter.as_ref().map(|f| {
@@ -651,7 +653,9 @@ impl VectorIndex {
               filter: filter_box,
               threshold,
             };
-            ivf_pq_index.search(&self.manifest, query, k, Some(search_opts))
+            ivf_pq_index
+              .search(&self.manifest, query, k, Some(search_opts))
+              .map_err(ivf_pq_error_to_index_error)?
           }
         }
       } else {
@@ -676,9 +680,10 @@ impl VectorIndex {
 
   /// Brute force search (fallback when index not available)
   fn brute_force_search(&self, query: &[f32], k: usize) -> Vec<VectorSearchResult> {
-    use crate::vector::{cosine_distance, dot_product, euclidean_distance, normalize};
+    use crate::vector::normalize;
 
     let metric = self.options.metric;
+    let distance_fn = self.stored_distance_fn();
 
     // Normalize query for cosine similarity
     let query_normalized: Vec<f32>;
@@ -693,11 +698,7 @@ impl VectorIndex {
 
     for (&node_id, &vector_id) in &self.manifest.node_to_vector {
       if let Some(vector) = vector_store_node_vector(&self.manifest, node_id) {
-        let distance = match metric {
-          DistanceMetric::Cosine => cosine_distance(query_for_search, vector),
-          DistanceMetric::Euclidean => euclidean_distance(query_for_search, vector),
-          DistanceMetric::DotProduct => -dot_product(query_for_search, vector), // Negate for sorting
-        };
+        let distance = distance_fn(query_for_search, vector);
 
         let similarity = metric.distance_to_similarity(distance);
 
@@ -731,9 +732,10 @@ impl VectorIndex {
       return self.brute_force_search(query, k);
     }
 
-    use crate::vector::{cosine_distance, dot_product, euclidean_distance, normalize};
+    use crate::vector::normalize;
 
     let metric = self.options.metric;
+    let distance_fn = self.stored_distance_fn();
 
     let query_normalized: Vec<f32>;
     let query_for_search = if metric == DistanceMetric::Cosine {
@@ -753,11 +755,7 @@ impl VectorIndex {
       }
 
       if let Some(vector) = vector_store_node_vector(&self.manifest, node_id) {
-        let distance = match metric {
-          DistanceMetric::Cosine => cosine_distance(query_for_search, vector),
-          DistanceMetric::Euclidean => euclidean_distance(query_for_search, vector),
-          DistanceMetric::DotProduct => -dot_product(query_for_search, vector), // Negate for sorting
-        };
+        let distance = distance_fn(query_for_search, vector);
 
         let similarity = metric.distance_to_similarity(distance);
         if let Some(threshold) = threshold {
@@ -782,6 +780,15 @@ impl VectorIndex {
     });
     candidates.truncate(k);
     candidates
+  }
+
+  /// Exact distance from a prepared query to a stored vector. Cosine divides
+  /// out the stored norm when the store keeps raw vectors.
+  fn stored_distance_fn(&self) -> fn(&[f32], &[f32]) -> f32 {
+    self
+      .options
+      .metric
+      .stored_distance_fn(self.manifest.config.normalize_on_insert)
   }
 
   /// Get index statistics

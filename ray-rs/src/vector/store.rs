@@ -542,6 +542,46 @@ pub(crate) fn validate_vector_manifest(manifest: &VectorManifest) -> Result<(), 
   Ok(())
 }
 
+/// Cheap shape check for a manifest handed to an ANN index entry point.
+///
+/// O(row groups), so search can run it on every call (unlike
+/// `validate_vector_manifest`, which walks every vector). Together with the
+/// `local_row < count` check at lookup time it keeps every vector slice in
+/// bounds.
+pub(crate) fn validate_manifest_layout(
+  manifest: &VectorManifest,
+  dimensions: usize,
+) -> Result<(), VectorStoreError> {
+  let config = &manifest.config;
+  if config.dimensions != dimensions {
+    return Err(VectorStoreError::DimensionMismatch {
+      expected: dimensions,
+      got: config.dimensions,
+    });
+  }
+  if config.row_group_size == 0 {
+    return Err(VectorStoreError::Invariant(
+      "manifest row_group_size must be nonzero".into(),
+    ));
+  }
+  for fragment in &manifest.fragments {
+    for row_group in &fragment.row_groups {
+      let expected = row_group.count.checked_mul(dimensions);
+      if expected != Some(row_group.data.len()) {
+        return Err(VectorStoreError::Invariant(format!(
+          "fragment {} row group {} data length {} does not match count {} * dimensions {}",
+          fragment.id,
+          row_group.id,
+          row_group.data.len(),
+          row_group.count,
+          dimensions
+        )));
+      }
+    }
+  }
+  Ok(())
+}
+
 fn validate_live_location(
   manifest: &VectorManifest,
   vector_id: u64,
