@@ -1,4 +1,4 @@
-//! Audit repros for replication findings R1, R3 and R4.
+//! Audit repros for replication findings R1, R3, R4 and R5.
 //!
 //! Every test here reproduces a finding through the public API and fails until
 //! the finding is fixed. Crash scenarios use a child process that aborts (the
@@ -728,6 +728,55 @@ fn audit_r4_normal_mode_bootstrap_cursor_matches_copied_state() {
     graph_state(&primary),
     "replica state must equal the primary's after bootstrap + catch-up"
   );
+
+  close_single_file(replica).expect("close replica");
+  close_single_file(primary).expect("close primary");
+}
+
+// ============================================================================
+// R5: reseed creates source nodes before deleting stale ones
+// ============================================================================
+
+#[test]
+fn audit_r5_reseed_with_stale_key_holder_keeps_key_lookup() {
+  let dir = tempfile::tempdir().expect("tempdir");
+  let primary_path = dir.path().join("r5-primary.kitedb");
+  let replica_path = dir.path().join("r5-replica.kitedb");
+  let primary = open_primary(&primary_path, SyncMode::Full);
+  let replica = open_replica(&replica_path, &primary_path);
+  replica
+    .replica_bootstrap_from_snapshot()
+    .expect("bootstrap empty primary");
+
+  primary.begin(false).expect("begin n1");
+  let n1 = primary.create_node(Some("shared")).expect("n1");
+  commit(&primary);
+  catch_up_all(&replica).expect("catch up n1");
+  assert_eq!(replica.node_by_key("shared"), Some(n1), "test setup");
+
+  // The key moves to a new node while the replica is not following; the
+  // replica's n1 is now a stale node holding the primary's key.
+  primary.begin(false).expect("begin delete n1");
+  primary.delete_node(n1).expect("delete n1");
+  commit(&primary);
+  primary.begin(false).expect("begin n2");
+  let n2 = primary.create_node(Some("shared")).expect("n2");
+  commit(&primary);
+
+  replica
+    .replica_reseed_from_snapshot()
+    .expect("reseed over a stale node that holds the same key");
+  assert_eq!(replica.node_by_key("shared"), Some(n2));
+  assert_eq!(graph_state(&replica), graph_state(&primary));
+
+  close_single_file(replica).expect("close replica");
+  let replica = open_replica(&replica_path, &primary_path);
+  assert_eq!(
+    replica.node_by_key("shared"),
+    Some(n2),
+    "reseed WAL order (create n2, then delete stale n1) loses the key on replay"
+  );
+  assert_eq!(graph_state(&replica), graph_state(&primary));
 
   close_single_file(replica).expect("close replica");
   close_single_file(primary).expect("close primary");
