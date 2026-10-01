@@ -3,6 +3,7 @@
 //! Handles all mutation operations: create/delete nodes, add/delete edges,
 //! set/delete properties, and node labels.
 
+use crate::core::snapshot::reader::SnapshotData;
 use crate::core::wal::record::{
   build_add_edge_payload, build_add_edge_props_payload, build_add_edges_batch_payload,
   build_add_edges_props_batch_payload, build_add_node_label_payload, build_create_node_payload,
@@ -14,18 +15,128 @@ use crate::core::wal::record::{
 };
 use crate::error::{KiteError, Result};
 use crate::types::*;
+use parking_lot::Mutex;
+use std::collections::HashSet;
+use std::sync::Arc;
 
-use super::SingleFileDB;
+use super::{SingleFileDB, SingleFileTxState, MAX_NODE_ID};
+
+/// What a write transaction sees: its pending delta over the committed delta
+/// over the snapshot. Write paths validate against it before logging to the
+/// WAL. It records no MVCC reads.
+struct TxView<'a> {
+  pending: &'a DeltaState,
+  delta: &'a DeltaState,
+  snapshot: Option<&'a SnapshotData>,
+}
+
+/// Where a live node lives, as seen by a write transaction.
+enum Endpoint {
+  /// Created by this transaction.
+  Pending,
+  /// Created in the committed delta.
+  Delta,
+  /// In the snapshot, at this physical index.
+  Snapshot(PhysNode),
+}
+
+impl TxView<'_> {
+  /// Resolve an edge endpoint with `node_exists` precedence.
+  fn endpoint(&self, node_id: NodeId) -> Result<Endpoint> {
+    let missing = Err(KiteError::NodeNotFound(node_id));
+    if self.pending.is_node_deleted(node_id) {
+      return missing;
+    }
+    if self.pending.is_node_created(node_id) {
+      return Ok(Endpoint::Pending);
+    }
+    if self.delta.is_node_deleted(node_id) {
+      return missing;
+    }
+    if self.delta.is_node_created(node_id) {
+      return Ok(Endpoint::Delta);
+    }
+    match self.snapshot.and_then(|snap| snap.phys_node(node_id)) {
+      Some(phys) => Ok(Endpoint::Snapshot(phys)),
+      None => missing,
+    }
+  }
+
+  /// Like `edge`, but both endpoints must exist (`NodeNotFound` otherwise).
+  fn edge_to_add(&self, src: NodeId, etype: ETypeId, dst: NodeId) -> Result<(bool, bool)> {
+    let in_base = match (self.endpoint(src)?, self.endpoint(dst)?) {
+      // A node created by this transaction has no committed edges.
+      (Endpoint::Pending, _) | (_, Endpoint::Pending) => false,
+      (Endpoint::Snapshot(src_phys), Endpoint::Snapshot(dst_phys)) => {
+        self.delta.is_edge_added(src, etype, dst)
+          || (!self.delta.is_edge_deleted(src, etype, dst)
+            && self
+              .snapshot
+              .is_some_and(|snap| snap.has_edge(src_phys, etype, dst_phys)))
+      }
+      _ => self.delta.is_edge_added(src, etype, dst),
+    };
+    Ok((in_base, self.pending.edge_visible(src, etype, dst, in_base)))
+  }
+
+  /// Whether the committed state holds the edge (the pending delta's base),
+  /// and whether the transaction sees it.
+  fn edge(&self, src: NodeId, etype: ETypeId, dst: NodeId) -> (bool, bool) {
+    let in_base = self.delta.edge_exists_over(self.snapshot, src, etype, dst);
+    (in_base, self.pending.edge_visible(src, etype, dst, in_base))
+  }
+
+  fn check_key_free(&self, key: &str) -> Result<()> {
+    let owner = self.pending.key_owner_over(None, key).or_else(|| {
+      self
+        .delta
+        .key_owner_over(self.snapshot, key)
+        .filter(|&node_id| !self.pending.is_node_deleted(node_id))
+    });
+    match owner {
+      Some(_) => Err(KiteError::DuplicateKey(key.to_string())),
+      None => Ok(()),
+    }
+  }
+}
 
 impl SingleFileDB {
+  fn with_tx_view<R>(
+    &self,
+    tx_handle: &Arc<Mutex<SingleFileTxState>>,
+    f: impl FnOnce(&TxView<'_>) -> R,
+  ) -> R {
+    let tx = tx_handle.lock();
+    let delta = self.delta.read();
+    let snapshot = self.snapshot.read();
+    f(&TxView {
+      pending: &tx.pending,
+      delta: &delta,
+      snapshot: snapshot.as_ref(),
+    })
+  }
+
+  /// A write that turned out to be a no-op still depends on the edge's state.
+  fn record_edge_read(&self, txid: TxId, src: NodeId, etype: ETypeId, dst: NodeId) {
+    if let Some(mvcc) = self.mvcc.as_ref() {
+      let mut tx_mgr = mvcc.tx_manager.lock();
+      tx_mgr.record_read(txid, TxKey::Edge { src, etype, dst });
+    }
+  }
+
   // ========================================================================
   // Node Operations
   // ========================================================================
 
   /// Create a node
+  ///
+  /// Fails with `DuplicateKey` if a live node already holds `key`.
   pub fn create_node(&self, key: Option<&str>) -> Result<NodeId> {
     let (txid, tx_handle) = self.require_write_tx_handle()?;
-    let node_id = self.alloc_node_id();
+    if let Some(key) = key {
+      self.with_tx_view(&tx_handle, |view| view.check_key_free(key))?;
+    }
+    let node_id = self.alloc_node_id()?;
 
     // Write WAL record
     let record = WalRecord::new(
@@ -56,14 +167,24 @@ impl SingleFileDB {
     Ok(node_id)
   }
 
-  /// Create a node with a specific ID
+  /// Create a node with a specific ID (at most [`MAX_NODE_ID`])
   pub fn create_node_with_id(&self, node_id: NodeId, key: Option<&str>) -> Result<NodeId> {
     let (txid, tx_handle) = self.require_write_tx_handle()?;
+
+    if node_id > MAX_NODE_ID {
+      return Err(KiteError::InvalidQuery(
+        format!("Node ID {node_id} exceeds the maximum node ID {MAX_NODE_ID}").into(),
+      ));
+    }
 
     if self.node_exists(node_id) {
       return Err(KiteError::Internal(format!(
         "Node ID already exists: {node_id}"
       )));
+    }
+
+    if let Some(key) = key {
+      self.with_tx_view(&tx_handle, |view| view.check_key_free(key))?;
     }
 
     self.reserve_node_id(node_id);
@@ -104,9 +225,21 @@ impl SingleFileDB {
     }
 
     let (txid, tx_handle) = self.require_write_tx_handle()?;
+    if keys.iter().any(Option::is_some) {
+      self.with_tx_view(&tx_handle, |view| {
+        let mut batch_keys = HashSet::with_capacity(keys.len());
+        for &key in keys.iter().flatten() {
+          view.check_key_free(key)?;
+          if !batch_keys.insert(key) {
+            return Err(KiteError::DuplicateKey(key.to_string()));
+          }
+        }
+        Ok(())
+      })?;
+    }
     let mut node_ids = Vec::with_capacity(keys.len());
     for _ in keys.iter() {
-      node_ids.push(self.alloc_node_id());
+      node_ids.push(self.alloc_node_id()?);
     }
 
     let entries: Vec<(NodeId, Option<&str>)> =
@@ -166,6 +299,11 @@ impl SingleFileDB {
       }
     }
 
+    // A deleted node keeps no vectors, now or after the next checkpoint.
+    for prop_key_id in self.node_vector_keys(&tx_handle, node_id)? {
+      self.delete_node_vector(node_id, prop_key_id)?;
+    }
+
     // Write WAL record
     let record = WalRecord::new(
       WalRecordType::DeleteNode,
@@ -219,8 +357,17 @@ impl SingleFileDB {
   // ========================================================================
 
   /// Add an edge
+  ///
+  /// Both endpoints must exist (`NodeNotFound` otherwise). Adding an edge
+  /// that already exists is a no-op.
   pub fn add_edge(&self, src: NodeId, etype: ETypeId, dst: NodeId) -> Result<()> {
     let (txid, tx_handle) = self.require_write_tx_handle()?;
+    let (in_base, exists) =
+      self.with_tx_view(&tx_handle, |view| view.edge_to_add(src, etype, dst))?;
+    if exists {
+      self.record_edge_read(txid, src, etype, dst);
+      return Ok(());
+    }
 
     // Write WAL record
     let record = WalRecord::new(
@@ -233,7 +380,7 @@ impl SingleFileDB {
     // Update pending delta
     let bulk_load = {
       let mut tx = tx_handle.lock();
-      tx.pending.add_edge(src, etype, dst);
+      tx.pending.add_edge_over(src, etype, dst, in_base);
       tx.bulk_load
     };
 
@@ -282,12 +429,38 @@ impl SingleFileDB {
   }
 
   /// Add multiple edges in a single WAL record
+  ///
+  /// Fails without adding anything if an endpoint is missing. Edges that
+  /// already exist are skipped.
   pub fn add_edges_batch(&self, edges: &[(NodeId, ETypeId, NodeId)]) -> Result<()> {
     if edges.is_empty() {
       return Ok(());
     }
 
     let (txid, tx_handle) = self.require_write_tx_handle()?;
+    let mut existing = Vec::new();
+    let mut new_edges = Vec::with_capacity(edges.len());
+    let mut new_in_base = Vec::with_capacity(edges.len());
+    self.with_tx_view(&tx_handle, |view| {
+      for &(src, etype, dst) in edges {
+        let (in_base, exists) = view.edge_to_add(src, etype, dst)?;
+        if exists {
+          existing.push((src, etype, dst));
+        } else {
+          new_edges.push((src, etype, dst));
+          new_in_base.push(in_base);
+        }
+      }
+      Ok::<_, KiteError>(())
+    })?;
+    for &(src, etype, dst) in &existing {
+      self.record_edge_read(txid, src, etype, dst);
+    }
+    if new_edges.is_empty() {
+      return Ok(());
+    }
+    let edges = new_edges.as_slice();
+
     let record = WalRecord::new(
       WalRecordType::AddEdgesBatch,
       txid,
@@ -297,8 +470,8 @@ impl SingleFileDB {
 
     let bulk_load = {
       let mut tx = tx_handle.lock();
-      for (src, etype, dst) in edges.iter() {
-        tx.pending.add_edge(*src, *etype, *dst);
+      for (&(src, etype, dst), &in_base) in edges.iter().zip(&new_in_base) {
+        tx.pending.add_edge_over(src, etype, dst, in_base);
       }
       tx.bulk_load
     };
@@ -369,6 +542,7 @@ impl SingleFileDB {
     }
 
     let (txid, tx_handle) = self.require_write_tx_handle()?;
+    let (in_base, _) = self.with_tx_view(&tx_handle, |view| view.edge_to_add(src, etype, dst))?;
 
     let record = WalRecord::new(
       WalRecordType::AddEdgeProps,
@@ -430,7 +604,7 @@ impl SingleFileDB {
 
     {
       let mut tx = tx_handle.lock();
-      tx.pending.add_edge(src, etype, dst);
+      tx.pending.add_edge_over(src, etype, dst, in_base);
       for (key_id, value) in props.into_iter() {
         tx.pending.set_edge_prop(src, etype, dst, key_id, value);
       }
@@ -450,6 +624,12 @@ impl SingleFileDB {
     }
 
     let (txid, tx_handle) = self.require_write_tx_handle()?;
+    let in_base = self.with_tx_view(&tx_handle, |view| {
+      edges
+        .iter()
+        .map(|&(src, etype, dst, _)| Ok(view.edge_to_add(src, etype, dst)?.0))
+        .collect::<Result<Vec<bool>>>()
+    })?;
     let mut edge_meta: Vec<(NodeId, ETypeId, NodeId, Vec<PropKeyId>)> =
       Vec::with_capacity(edges.len());
     for (src, etype, dst, props) in edges.iter() {
@@ -465,8 +645,8 @@ impl SingleFileDB {
 
     let bulk_load = {
       let mut tx = tx_handle.lock();
-      for (src, etype, dst, props) in edges.into_iter() {
-        tx.pending.add_edge(src, etype, dst);
+      for ((src, etype, dst, props), in_base) in edges.into_iter().zip(in_base) {
+        tx.pending.add_edge_over(src, etype, dst, in_base);
         for (key_id, value) in props {
           tx.pending.set_edge_prop(src, etype, dst, key_id, value);
         }
@@ -544,9 +724,14 @@ impl SingleFileDB {
     self.add_edge(src, etype, dst)
   }
 
-  /// Delete an edge
+  /// Delete an edge (a no-op if it does not exist)
   pub fn delete_edge(&self, src: NodeId, etype: ETypeId, dst: NodeId) -> Result<()> {
     let (txid, tx_handle) = self.require_write_tx_handle()?;
+    let (in_base, exists) = self.with_tx_view(&tx_handle, |view| view.edge(src, etype, dst));
+    if !exists {
+      self.record_edge_read(txid, src, etype, dst);
+      return Ok(());
+    }
 
     // Write WAL record
     let record = WalRecord::new(
@@ -559,7 +744,7 @@ impl SingleFileDB {
     // Update pending delta
     let bulk_load = {
       let mut tx = tx_handle.lock();
-      tx.pending.delete_edge(src, etype, dst);
+      tx.pending.delete_edge_over(src, etype, dst, in_base);
       tx.bulk_load
     };
 
@@ -1102,5 +1287,87 @@ impl SingleFileDB {
     }
 
     Ok(propkey_id)
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  // No checkpoints here: checkpoint unit tests arm process-wide phase
+  // barriers that a concurrent checkpoint could consume.
+  use crate::core::single_file::{close_single_file, open_single_file, SingleFileOpenOptions};
+  use crate::error::KiteError;
+  use tempfile::tempdir;
+
+  #[test]
+  fn add_after_deleting_missing_edge_keeps_edge() {
+    let dir = tempdir().expect("tempdir");
+    let db =
+      open_single_file(dir.path().join("db.kitedb"), SingleFileOpenOptions::new()).expect("open");
+    db.begin(false).expect("begin");
+    let a = db.create_node(None).expect("a");
+    let b = db.create_node(None).expect("b");
+    let t = db.define_etype("T").expect("etype");
+    db.commit().expect("commit");
+
+    db.begin(false).expect("begin");
+    db.delete_edge(a, t, b).expect("delete missing edge");
+    db.add_edge(a, t, b).expect("add");
+    assert!(db.edge_exists(a, t, b));
+    db.commit().expect("commit");
+    assert!(db.edge_exists(a, t, b));
+    assert_eq!(db.count_edges(), 1);
+    close_single_file(db).expect("close");
+  }
+
+  #[test]
+  fn bulk_load_batches_validate_and_skip_existing() {
+    let dir = tempdir().expect("tempdir");
+    let db =
+      open_single_file(dir.path().join("db.kitedb"), SingleFileOpenOptions::new()).expect("open");
+    db.begin_bulk().expect("begin bulk");
+    let ids = db
+      .create_nodes_batch(&[Some("a"), Some("b")])
+      .expect("nodes");
+    let (a, b) = (ids[0], ids[1]);
+    let t = db.define_etype("T").expect("etype");
+    assert!(matches!(
+      db.create_nodes_batch(&[Some("c"), Some("a")]),
+      Err(KiteError::DuplicateKey(_))
+    ));
+    assert!(matches!(
+      db.add_edges_batch(&[(a, t, b), (a, t, 999_999)]),
+      Err(KiteError::NodeNotFound(999_999))
+    ));
+    db.add_edges_batch(&[(a, t, b), (a, t, b), (b, t, a)])
+      .expect("edges");
+    db.add_edges_batch(&[(a, t, b)]).expect("re-add");
+    db.commit().expect("commit");
+    assert_eq!(db.count_nodes(), 2);
+    assert_eq!(db.count_edges(), 2);
+    close_single_file(db).expect("close");
+  }
+
+  #[test]
+  fn delete_node_drops_vector_set_in_same_tx() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("db.kitedb");
+    let db = open_single_file(&path, SingleFileOpenOptions::new()).expect("open");
+    db.begin(false).expect("begin");
+    let keep = db.create_node(Some("keep")).expect("keep");
+    let pk = db.define_propkey("embedding").expect("propkey");
+    db.set_node_vector(keep, pk, &[1.0, 0.0]).expect("vector");
+    let gone = db.create_node(Some("gone")).expect("gone");
+    db.set_node_vector(gone, pk, &[0.0, 1.0]).expect("vector");
+    db.delete_node(gone).expect("delete");
+    assert!(db.node_vector(gone, pk).is_none());
+    db.commit().expect("commit");
+
+    assert!(db.node_vector(gone, pk).is_none());
+    assert!(db.has_node_vector(keep, pk));
+    close_single_file(db).expect("close");
+    let db = open_single_file(&path, SingleFileOpenOptions::new()).expect("reopen");
+    assert!(db.node_vector(gone, pk).is_none());
+    assert!(db.has_node_vector(keep, pk));
+    close_single_file(db).expect("close");
   }
 }

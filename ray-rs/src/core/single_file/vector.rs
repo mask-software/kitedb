@@ -16,10 +16,11 @@ use crate::vector::store::{
   vector_store_node_vector,
 };
 use crate::vector::types::{VectorManifest, VectorStoreConfig};
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::SingleFileDB;
+use super::{SingleFileDB, SingleFileTxState};
 
 #[derive(Debug, Clone)]
 pub(crate) struct VectorStoreLazyEntry {
@@ -75,6 +76,45 @@ impl SingleFileDB {
       self.vector_stores.read().keys().copied().collect();
     keys.extend(self.vector_store_lazy_entries.read().keys().copied());
     keys
+  }
+
+  /// Property keys under which `node_id` holds a vector, as the transaction
+  /// sees it: its pending operations, then committed ones, then the stores.
+  pub(crate) fn node_vector_keys(
+    &self,
+    tx_handle: &Arc<Mutex<SingleFileTxState>>,
+    node_id: NodeId,
+  ) -> Result<Vec<PropKeyId>> {
+    let node_ops = |ops: &HashMap<(NodeId, PropKeyId), Option<VectorRef>>| {
+      ops
+        .iter()
+        .filter(|((op_node_id, _), _)| *op_node_id == node_id)
+        .map(|(&(_, prop_key_id), op)| (prop_key_id, op.is_some()))
+        .collect::<HashMap<PropKeyId, bool>>()
+    };
+    let mut ops = node_ops(&self.delta.read().pending_vectors);
+    ops.extend(node_ops(&tx_handle.lock().pending.pending_vectors));
+
+    let mut keys = self.vector_prop_keys();
+    keys.extend(ops.keys().copied());
+    let mut with_vector = Vec::new();
+    for prop_key_id in keys {
+      let has_vector = match ops.get(&prop_key_id) {
+        Some(&is_set) => is_set,
+        None => {
+          self.ensure_vector_store_loaded(prop_key_id)?;
+          self
+            .vector_stores
+            .read()
+            .get(&prop_key_id)
+            .is_some_and(|store| vector_store_has(store, node_id))
+        }
+      };
+      if has_vector {
+        with_vector.push(prop_key_id);
+      }
+    }
+    Ok(with_vector)
   }
 
   /// Set a vector embedding for a node

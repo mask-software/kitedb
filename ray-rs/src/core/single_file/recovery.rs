@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 
 use crate::constants::*;
+use crate::core::delta::snapshot_has_edge;
 use crate::core::pager::FilePager;
 use crate::core::snapshot::reader::SnapshotData;
 use crate::core::wal::record::{
@@ -139,7 +140,7 @@ pub fn replay_wal_record(
           delta.create_node(data.node_id, data.key.as_deref());
         }
         if data.node_id >= *next_node_id {
-          *next_node_id = data.node_id + 1;
+          *next_node_id = data.node_id.saturating_add(1);
         }
       }
     }
@@ -154,7 +155,7 @@ pub fn replay_wal_record(
             delta.create_node(data.node_id, data.key.as_deref());
           }
           if data.node_id >= *next_node_id {
-            *next_node_id = data.node_id + 1;
+            *next_node_id = data.node_id.saturating_add(1);
           }
         }
       }
@@ -166,37 +167,40 @@ pub fn replay_wal_record(
     }
     WalRecordType::AddEdge => {
       if let Some(data) = parse_add_edge_payload(&record.payload) {
-        delta.add_edge(data.src, data.etype, data.dst);
+        replay_add_edge(snapshot, delta, data.src, data.etype, data.dst);
       }
     }
     WalRecordType::AddEdgesBatch => {
       if let Some(edges) = parse_add_edges_batch_payload(&record.payload) {
         for data in edges {
-          delta.add_edge(data.src, data.etype, data.dst);
+          replay_add_edge(snapshot, delta, data.src, data.etype, data.dst);
         }
       }
     }
     WalRecordType::AddEdgeProps => {
       if let Some(data) = parse_add_edge_props_payload(&record.payload) {
-        delta.add_edge(data.src, data.etype, data.dst);
-        for (key_id, value) in data.props {
-          delta.set_edge_prop(data.src, data.etype, data.dst, key_id, value);
-        }
-      }
-    }
-    WalRecordType::AddEdgesPropsBatch => {
-      if let Some(edges) = parse_add_edges_props_batch_payload(&record.payload) {
-        for data in edges {
-          delta.add_edge(data.src, data.etype, data.dst);
+        if replay_add_edge(snapshot, delta, data.src, data.etype, data.dst) {
           for (key_id, value) in data.props {
             delta.set_edge_prop(data.src, data.etype, data.dst, key_id, value);
           }
         }
       }
     }
+    WalRecordType::AddEdgesPropsBatch => {
+      if let Some(edges) = parse_add_edges_props_batch_payload(&record.payload) {
+        for data in edges {
+          if replay_add_edge(snapshot, delta, data.src, data.etype, data.dst) {
+            for (key_id, value) in data.props {
+              delta.set_edge_prop(data.src, data.etype, data.dst, key_id, value);
+            }
+          }
+        }
+      }
+    }
     WalRecordType::DeleteEdge => {
       if let Some(data) = parse_delete_edge_payload(&record.payload) {
-        delta.delete_edge(data.src, data.etype, data.dst);
+        let in_snapshot = snapshot_has_edge(snapshot, data.src, data.etype, data.dst);
+        delta.delete_edge_over(data.src, data.etype, data.dst, in_snapshot);
       }
     }
     WalRecordType::SetNodeProp => {
@@ -284,5 +288,193 @@ pub fn replay_wal_record(
     _ => {
       // Other record types (batch vectors, seal fragment, etc.) - skip for now
     }
+  }
+}
+
+/// Replay an edge add under the write path's rules: both endpoints must exist,
+/// and an edge that is already visible is not added again. Older WALs may hold
+/// either. Returns whether the edge exists afterwards.
+fn replay_add_edge(
+  snapshot: Option<&SnapshotData>,
+  delta: &mut DeltaState,
+  src: NodeId,
+  etype: ETypeId,
+  dst: NodeId,
+) -> bool {
+  if !delta.node_exists_over(snapshot, src) || !delta.node_exists_over(snapshot, dst) {
+    return false;
+  }
+  let in_snapshot = snapshot_has_edge(snapshot, src, etype, dst);
+  delta.add_edge_over(src, etype, dst, in_snapshot);
+  true
+}
+
+/// After replay, turn vector sets for nodes that no longer exist into deletes.
+/// Older WALs logged a node delete without deletes for its vectors.
+pub(crate) fn drop_vectors_of_missing_nodes(
+  delta: &mut DeltaState,
+  snapshot: Option<&SnapshotData>,
+) {
+  let orphaned: Vec<(NodeId, PropKeyId)> = delta
+    .pending_vectors
+    .iter()
+    .filter(|(&(node_id, _), op)| op.is_some() && !delta.node_exists_over(snapshot, node_id))
+    .map(|(&key, _)| key)
+    .collect();
+  for key in orphaned {
+    delta.pending_vectors.insert(key, None);
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  // These tests never checkpoint: checkpoint unit tests arm process-wide
+  // phase barriers that a concurrent checkpoint here could consume.
+  use crate::core::single_file::{
+    close_single_file, open_single_file, SingleFileDB, SingleFileOpenOptions,
+  };
+  use crate::core::wal::record::{
+    build_add_edge_payload, build_create_node_payload, build_delete_edge_payload,
+    build_delete_node_payload, WalRecord,
+  };
+  use crate::types::{NodeId, WalRecordType};
+  use crate::vector::store::vector_store_has;
+  use std::path::Path;
+  use tempfile::tempdir;
+
+  fn open(path: &Path) -> SingleFileDB {
+    open_single_file(path, SingleFileOpenOptions::new().auto_checkpoint(false)).expect("open")
+  }
+
+  /// Commit raw WAL records with no in-memory effect, as older versions
+  /// logged operations the write path now rejects or skips.
+  fn commit_legacy_records(db: &SingleFileDB, records: Vec<(WalRecordType, Vec<u8>)>) {
+    db.begin(false).expect("begin");
+    let (txid, tx_handle) = db.require_write_tx_handle().expect("write tx");
+    for (record_type, payload) in records {
+      db.write_wal_tx(&tx_handle, WalRecord::new(record_type, txid, payload))
+        .expect("write record");
+    }
+    db.commit().expect("commit");
+  }
+
+  #[test]
+  fn replay_drops_edge_to_missing_node() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("dangling.kitedb");
+    let missing: NodeId = 999_999;
+    let db = open(&path);
+    db.begin(false).expect("begin");
+    let a = db.create_node(Some("a")).expect("a");
+    let t = db.define_etype("T").expect("etype");
+    db.commit().expect("commit");
+    commit_legacy_records(
+      &db,
+      vec![(
+        WalRecordType::AddEdge,
+        build_add_edge_payload(a, t, missing),
+      )],
+    );
+    close_single_file(db).expect("close");
+
+    let db = open(&path);
+    assert!(!db.edge_exists(a, t, missing));
+    let delta = db.delta.read();
+    assert!(
+      delta.out_add.is_empty() && delta.in_add.is_empty(),
+      "dangling edge replayed into the delta (would fail the next checkpoint)"
+    );
+    drop(delta);
+    close_single_file(db).expect("close");
+  }
+
+  #[test]
+  fn replay_skips_delete_of_missing_edge() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("stale_delete.kitedb");
+    let db = open(&path);
+    db.begin(false).expect("begin");
+    let a = db.create_node(Some("a")).expect("a");
+    let b = db.create_node(Some("b")).expect("b");
+    let t = db.define_etype("T").expect("etype");
+    db.commit().expect("commit");
+    commit_legacy_records(
+      &db,
+      vec![(
+        WalRecordType::DeleteEdge,
+        build_delete_edge_payload(a, t, b),
+      )],
+    );
+    db.begin(false).expect("begin");
+    db.add_edge(a, t, b).expect("edge");
+    db.commit().expect("commit");
+    close_single_file(db).expect("close");
+
+    let db = open(&path);
+    assert!(
+      db.edge_exists(a, t, b),
+      "stale delete swallowed a later add"
+    );
+    assert_eq!(db.count_edges(), 1);
+    close_single_file(db).expect("close");
+  }
+
+  #[test]
+  fn replay_drops_vector_of_node_deleted_without_vector_delete() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("vector.kitedb");
+    let db = open(&path);
+    db.begin(false).expect("begin");
+    let keep = db.create_node(Some("keep")).expect("keep");
+    let node = db.create_node(Some("v")).expect("node");
+    let pk = db.define_propkey("embedding").expect("propkey");
+    db.set_node_vector(keep, pk, &[0.0, 1.0, 0.0, 0.0])
+      .expect("vector");
+    db.set_node_vector(node, pk, &[1.0, 0.5, 0.25, 0.125])
+      .expect("vector");
+    db.commit().expect("commit");
+    commit_legacy_records(
+      &db,
+      vec![(WalRecordType::DeleteNode, build_delete_node_payload(node))],
+    );
+    close_single_file(db).expect("close");
+
+    let db = open(&path);
+    assert!(!db.node_exists(node));
+    assert!(db.node_vector(node, pk).is_none());
+    assert!(db.has_node_vector(keep, pk));
+    let stores = db.vector_stores.read();
+    let store = stores.get(&pk).expect("store");
+    assert!(
+      !vector_store_has(store, node),
+      "store keeps the vector, so the next checkpoint would persist it"
+    );
+    drop(stores);
+    close_single_file(db).expect("close");
+  }
+
+  #[test]
+  fn replay_of_max_node_id_does_not_wrap_allocator() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("max_id.kitedb");
+    let db = open(&path);
+    db.begin(false).expect("begin");
+    let first = db.create_node(None).expect("first");
+    db.commit().expect("commit");
+    commit_legacy_records(
+      &db,
+      vec![(
+        WalRecordType::CreateNode,
+        build_create_node_payload(u64::MAX, None),
+      )],
+    );
+    close_single_file(db).expect("close");
+
+    let db = open(&path);
+    assert!(db.node_exists(first));
+    db.begin(false).expect("begin");
+    assert!(db.create_node(None).is_err(), "allocator must not wrap");
+    db.rollback().expect("rollback");
+    close_single_file(db).expect("close");
   }
 }
