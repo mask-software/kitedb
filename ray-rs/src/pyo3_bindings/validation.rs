@@ -3,6 +3,8 @@
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
+use crate::types::NodeId;
+
 pub(crate) const MAX_CACHE_ENTRIES: i64 = 10_000_000;
 pub(crate) const MAX_COUNT: i64 = 1_000_000_000;
 pub(crate) const MAX_DEPTH: i64 = 1_000_000;
@@ -67,8 +69,22 @@ pub(crate) fn positive_u64(field: &str, value: i64, max: u64) -> PyResult<u64> {
   non_negative_u64(field, value, max)
 }
 
-pub(crate) fn node_id(field: &str, value: i64) -> PyResult<u64> {
+/// Checks a node (or vector) id from Python. Core ids are u64, so a negative i64 cast with `as`
+/// would wrap to a huge id and corrupt the allocator; every id argument must pass through here.
+pub(crate) fn node_id(field: &str, value: i64) -> PyResult<NodeId> {
   non_negative_u64(field, value, i64::MAX as u64)
+}
+
+/// Checks that a vector has the expected length. Core distance kernels assert on mismatched
+/// lengths, which would surface as a PanicException and poison any lock held by the caller.
+pub(crate) fn vector_len(field: &str, vector: &[f64], dimensions: usize) -> PyResult<()> {
+  if vector.len() != dimensions {
+    return Err(PyValueError::new_err(format!(
+      "{field} must have {dimensions} dimensions, got {}",
+      vector.len()
+    )));
+  }
+  Ok(())
 }
 
 pub(crate) fn ratio(field: &str, value: f64) -> PyResult<f64> {

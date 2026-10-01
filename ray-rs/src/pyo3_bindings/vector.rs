@@ -2,12 +2,13 @@
 //!
 //! Exposes IVF and IVF-PQ indexes to Python.
 
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::sync::RwLock;
 
 use crate::pyo3_bindings::validation;
+use crate::vector::distance::{l2_norm, normalize_in_place};
 use crate::vector::{
   DistanceMetric as RustDistanceMetric, IvfConfig as RustIvfConfig, IvfIndex as RustIvfIndex,
   IvfPqConfig as RustIvfPqConfig, IvfPqIndex as RustIvfPqIndex, MultiQueryAggregation,
@@ -89,6 +90,20 @@ impl From<PyAggregationEnum> for MultiQueryAggregation {
       PyAggregationEnum::Sum => MultiQueryAggregation::Sum,
     }
   }
+}
+
+/// Parses a search manifest and checks it matches the index dimensions, since
+/// core distance kernels assert on mismatched vector lengths.
+fn parse_manifest(manifest_json: &str, dimensions: usize) -> PyResult<VectorManifest> {
+  let manifest: VectorManifest = serde_json::from_str(manifest_json)
+    .map_err(|e| PyRuntimeError::new_err(format!("Failed to parse manifest: {e}")))?;
+  if manifest.config.dimensions != dimensions {
+    return Err(PyValueError::new_err(format!(
+      "manifest has {} dimensions, index has {dimensions}",
+      manifest.config.dimensions
+    )));
+  }
+  Ok(manifest)
 }
 
 // ============================================================================
@@ -406,14 +421,16 @@ impl PyIvfIndex {
   }
 
   /// Train the index on added training vectors
-  fn train(&self) -> PyResult<()> {
-    let mut index = self
-      .inner
-      .write()
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    index
-      .train()
-      .map_err(|e| PyRuntimeError::new_err(format!("Failed to train index: {e}")))
+  fn train(&self, py: Python<'_>) -> PyResult<()> {
+    py.allow_threads(|| {
+      let mut index = self
+        .inner
+        .write()
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+      index
+        .train()
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to train index: {e}")))
+    })
   }
 
   /// Insert a vector into the index
@@ -436,6 +453,7 @@ impl PyIvfIndex {
       .inner
       .write()
       .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    validation::vector_len("vector", &vector, index.dimensions)?;
     let vector_f32: Vec<f32> = vector.iter().map(|&v| v as f32).collect();
     Ok(index.delete(vector_id, &vector_f32))
   }
@@ -464,9 +482,8 @@ impl PyIvfIndex {
       .read()
       .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-    let manifest: VectorManifest = serde_json::from_str(&manifest_json)
-      .map_err(|e| PyRuntimeError::new_err(format!("Failed to parse manifest: {e}")))?;
-
+    let manifest = parse_manifest(&manifest_json, index.dimensions)?;
+    validation::vector_len("query", &query, index.dimensions)?;
     let query_f32: Vec<f32> = query.iter().map(|&v| v as f32).collect();
 
     let rust_options = options
@@ -499,9 +516,10 @@ impl PyIvfIndex {
       .read()
       .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-    let manifest: VectorManifest = serde_json::from_str(&manifest_json)
-      .map_err(|e| PyRuntimeError::new_err(format!("Failed to parse manifest: {e}")))?;
-
+    let manifest = parse_manifest(&manifest_json, index.dimensions)?;
+    for (i, query) in queries.iter().enumerate() {
+      validation::vector_len(&format!("queries[{i}]"), query, index.dimensions)?;
+    }
     let queries_f32: Vec<Vec<f32>> = queries
       .iter()
       .map(|q| q.iter().map(|&v| v as f32).collect())
@@ -657,14 +675,16 @@ impl PyIvfPqIndex {
   }
 
   /// Train the index
-  fn train(&self) -> PyResult<()> {
-    let mut index = self
-      .inner
-      .write()
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    index
-      .train()
-      .map_err(|e| PyRuntimeError::new_err(format!("Failed to train index: {e}")))
+  fn train(&self, py: Python<'_>) -> PyResult<()> {
+    py.allow_threads(|| {
+      let mut index = self
+        .inner
+        .write()
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+      index
+        .train()
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to train index: {e}")))
+    })
   }
 
   /// Insert a vector
@@ -687,6 +707,7 @@ impl PyIvfPqIndex {
       .inner
       .write()
       .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    validation::vector_len("vector", &vector, index.dimensions)?;
     let vector_f32: Vec<f32> = vector.iter().map(|&v| v as f32).collect();
     Ok(index.delete(vector_id, &vector_f32))
   }
@@ -715,9 +736,8 @@ impl PyIvfPqIndex {
       .read()
       .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-    let manifest: VectorManifest = serde_json::from_str(&manifest_json)
-      .map_err(|e| PyRuntimeError::new_err(format!("Failed to parse manifest: {e}")))?;
-
+    let manifest = parse_manifest(&manifest_json, index.dimensions)?;
+    validation::vector_len("query", &query, index.dimensions)?;
     let query_f32: Vec<f32> = query.iter().map(|&v| v as f32).collect();
 
     let rust_options = options
@@ -752,9 +772,10 @@ impl PyIvfPqIndex {
       .read()
       .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-    let manifest: VectorManifest = serde_json::from_str(&manifest_json)
-      .map_err(|e| PyRuntimeError::new_err(format!("Failed to parse manifest: {e}")))?;
-
+    let manifest = parse_manifest(&manifest_json, index.dimensions)?;
+    for (i, query) in queries.iter().enumerate() {
+      validation::vector_len(&format!("queries[{i}]"), query, index.dimensions)?;
+    }
     let queries_f32: Vec<Vec<f32>> = queries
       .iter()
       .map(|q| q.iter().map(|&v| v as f32).collect())
@@ -857,6 +878,24 @@ impl PyBruteForceResult {
   }
 }
 
+/// Below this norm `normalize_in_place` leaves a vector unscaled.
+const MIN_COSINE_NORM: f32 = 1e-10;
+
+/// Converts to f32 and, for cosine, scales to unit length: core cosine distance
+/// is `1 - dot` and assumes unit vectors. Returns None when the norm is zero or
+/// not finite, since such a vector has no direction.
+fn prepare_brute_force_vector(vector: &[f64], cosine: bool) -> Option<Vec<f32>> {
+  let mut v: Vec<f32> = vector.iter().map(|&x| x as f32).collect();
+  if cosine {
+    let norm = l2_norm(&v);
+    if !norm.is_finite() || norm <= MIN_COSINE_NORM {
+      return None;
+    }
+    normalize_in_place(&mut v);
+  }
+  Some(v)
+}
+
 /// Perform brute-force search over all vectors
 #[pyfunction]
 #[pyo3(signature = (vectors, node_ids, query, k, metric=None))]
@@ -875,26 +914,40 @@ pub fn brute_force_search(
   for &node_id in &node_ids {
     validation::node_id("node_ids", node_id)?;
   }
+  if query.is_empty() {
+    return Err(PyValueError::new_err("query must not be empty"));
+  }
+  for (i, vector) in vectors.iter().enumerate() {
+    validation::vector_len(&format!("vectors[{i}]"), vector, query.len())?;
+  }
+  let k = validation::non_negative_usize("k", k as i64, validation::MAX_COUNT)?;
 
   let metric_enum: PyDistanceMetricEnum = metric.as_deref().unwrap_or("cosine").into();
   let rust_metric: RustDistanceMetric = metric_enum.into();
   let distance_fn = rust_metric.distance_fn();
+  let cosine = rust_metric == RustDistanceMetric::Cosine;
+  let zero_norm = |field: String| {
+    PyValueError::new_err(format!(
+      "{field} must be a non-zero, finite vector for cosine distance"
+    ))
+  };
 
-  let query_f32: Vec<f32> = query.iter().map(|&v| v as f32).collect();
+  let query_f32 =
+    prepare_brute_force_vector(&query, cosine).ok_or_else(|| zero_norm("query".to_string()))?;
 
   let mut results: Vec<(i64, f32)> = vectors
     .iter()
     .zip(node_ids.iter())
-    .map(|(v, &node_id)| {
-      let v_f32: Vec<f32> = v.iter().map(|&x| x as f32).collect();
-      let dist = distance_fn(&query_f32, &v_f32);
-      (node_id, dist)
+    .enumerate()
+    .map(|(i, (v, &node_id))| {
+      let v_f32 =
+        prepare_brute_force_vector(v, cosine).ok_or_else(|| zero_norm(format!("vectors[{i}]")))?;
+      Ok((node_id, distance_fn(&query_f32, &v_f32)))
     })
-    .collect();
+    .collect::<PyResult<_>>()?;
 
   // Sort by distance
   results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-  let k = validation::non_negative_usize("k", k as i64, validation::MAX_COUNT)?;
   results.truncate(k);
 
   Ok(
