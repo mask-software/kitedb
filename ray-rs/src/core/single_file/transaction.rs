@@ -534,11 +534,7 @@ impl SingleFileDB {
 
       // Update header with current WAL state and commit metadata
       let mut header = self.header.write();
-      header.wal_head = wal.head();
-      header.wal_tail = wal.tail();
-      header.wal_primary_head = wal.primary_head();
-      header.wal_secondary_head = wal.secondary_head();
-      header.active_wal_region = wal.active_region();
+      wal.store_in_header(&mut header);
       header.max_node_id = self
         .next_node_id
         .load(std::sync::atomic::Ordering::SeqCst)

@@ -965,8 +965,10 @@ fn open_single_file_internal(
   // Initialize WAL buffer
   let mut wal_buffer = WalBuffer::from_header(&header);
 
-  // Recover from incomplete background checkpoint if needed
-  if header.checkpoint_in_progress != 0 {
+  // Finish an interrupted background checkpoint. Each branch leaves the WAL
+  // bytes synced before a header naming them is installed in the other slot,
+  // so the selected header stays the crash fallback.
+  let rebuilt_wal = if header.checkpoint_in_progress != 0 {
     if options.read_only {
       return Err(KiteError::InvalidSnapshot(
         "read-only open cannot recover an incomplete checkpoint; reopen writable to repair it"
@@ -975,13 +977,20 @@ fn open_single_file_internal(
     }
     wal_buffer.recover_incomplete_checkpoint(&mut pager)?;
     wal_buffer.flush(&mut pager)?;
-
-    header.active_wal_region = 0;
+    pager.sync()?;
+    true
+  } else if wal_buffer.is_primary_retired() && !options.read_only {
+    // The new snapshot was installed with the post-cut records still in the
+    // secondary region, and the process stopped before compacting them into
+    // the primary region. Read-only opens replay them in place instead.
+    wal_buffer.compact_secondary_into_primary(&mut pager)?;
+    true
+  } else {
+    false
+  };
+  if rebuilt_wal {
+    wal_buffer.store_in_header(&mut header);
     header.checkpoint_in_progress = 0;
-    header.wal_head = wal_buffer.head();
-    header.wal_tail = wal_buffer.tail();
-    header.wal_primary_head = wal_buffer.primary_head();
-    header.wal_secondary_head = wal_buffer.secondary_head();
     header.change_counter += 1;
     let next_header_slot = other_header_slot(header_slot);
     write_header_slot(&mut pager, &header, next_header_slot)?;
@@ -1448,8 +1457,7 @@ pub fn close_single_file_with_options(
   // Update header with current WAL state
   {
     let mut header = db.header.write();
-    header.wal_head = wal_buffer.head();
-    header.wal_tail = wal_buffer.tail();
+    wal_buffer.store_in_header(&mut header);
     header.max_node_id = db.next_node_id.load(Ordering::SeqCst).saturating_sub(1);
     header.next_tx_id = db.next_tx_id.load(Ordering::SeqCst);
 

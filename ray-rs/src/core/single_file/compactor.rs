@@ -136,9 +136,8 @@ impl SingleFileDB {
       header.max_node_id = self.next_node_id.load(Ordering::SeqCst).saturating_sub(1);
       header.next_tx_id = self.next_tx_id.load(Ordering::SeqCst);
 
-      header.wal_head = 0;
-      header.wal_tail = 0;
       wal_buffer.reset();
+      wal_buffer.store_in_header(&mut header);
 
       self.persist_header(&mut pager, &mut header, true)?;
       // Retire the previous snapshot only after both durable slots name the

@@ -212,6 +212,10 @@ impl WalBuffer {
   }
 
   /// Get usage ratio (0.0 - 1.0) for active region
+  ///
+  /// This measures how much of the linear region is consumed, which is what
+  /// bounds further appends. Checkpoints keep it meaningful by rewinding the
+  /// primary region to offset 0 instead of leaving a retired prefix behind.
   pub fn usage_ratio(&self) -> f64 {
     if self.active_region == 0 {
       self.primary_head as f64 / self.primary_region_size as f64
@@ -256,55 +260,96 @@ impl WalBuffer {
     self.head = self.primary_head;
   }
 
-  /// Merge secondary region records into primary region
-  /// Called after checkpoint completes to preserve any writes that occurred during checkpoint
-  pub fn merge_secondary_into_primary_preserving_old(
-    &mut self,
-    pager: &mut FilePager,
-  ) -> Result<()> {
-    // Read all records from secondary region (if any). Keep the old primary
-    // bytes intact until the new checkpoint header is durable; the old header
-    // remains the crash fallback while this append happens.
-    let has_secondary_records = self.secondary_head > self.secondary_region_start;
-    let secondary_records = if has_secondary_records {
-      self.scan_region(1, pager)?
-    } else {
-      Vec::new()
-    };
-
-    let record_bytes: Vec<Vec<u8>> = secondary_records
-      .into_iter()
-      .map(|record| WalRecord::new(record.record_type, record.txid, record.payload).build())
-      .collect();
-    let required = record_bytes
-      .iter()
-      .map(|bytes| align_up(bytes.len(), WAL_RECORD_ALIGNMENT) as u64)
-      .sum::<u64>();
-    if self.primary_head.saturating_add(required) > self.primary_region_size {
-      return Err(KiteError::WalBufferFull);
-    }
-
-    let old_primary_head = self.primary_head;
-    // Append secondary records after the old primary head. The new header will
-    // set tail=old_primary_head, so the snapshot covers the retained prefix.
-    for record_bytes in record_bytes {
-      self.write_record_bytes_to_primary(&record_bytes, pager)?;
-    }
-
-    self.tail = old_primary_head;
-    self.secondary_head = self.secondary_region_start;
-    self.active_region = 0;
-    self.head = self.primary_head;
-
-    Ok(())
+  /// Retire every primary-region record once a checkpoint snapshot covers them.
+  ///
+  /// Records written to the secondary region after the checkpoint cut stay in
+  /// place and become the whole live WAL: `tail..head` spans exactly the
+  /// secondary records. The primary region is fenced (`tail == primary_head
+  /// == primary_region_size`) so nothing appends to it until
+  /// [`Self::compact_secondary_into_primary`] rewrites the retained records at
+  /// its start. No bytes are written, so the WAL named by the previous header
+  /// stays intact until a header for this state is durable.
+  pub fn retire_primary_region(&mut self) {
+    self.primary_head = self.primary_region_size;
+    self.tail = self.secondary_region_start;
+    self.active_region = 1;
+    self.head = self.secondary_head;
   }
 
-  /// Merge secondary records into a fresh primary region.
+  /// Whether this buffer is in the state produced by
+  /// [`Self::retire_primary_region`]: the WAL lives in the secondary region
+  /// while no checkpoint is cutting it.
+  pub fn is_primary_retired(&self) -> bool {
+    self.active_region == 1 && self.tail == self.secondary_region_start
+  }
+
+  /// Rewrite the secondary region's records at the start of the primary region,
+  /// then make the primary region active again.
   ///
-  /// This is retained for standalone WAL-buffer callers and recovery paths
-  /// that already have a durable checkpoint marker. Checkpoint installation
-  /// uses `merge_secondary_into_primary_preserving_old` so the old header's
-  /// primary bytes remain intact until the new header is synced.
+  /// The rewritten bytes are flushed and synced before this returns. The
+  /// caller must ensure the header a crash would recover from names only the
+  /// secondary records (for example, a header recording
+  /// [`Self::retire_primary_region`] is durable in both slots, or is the newest
+  /// slot and the next header goes to the other one), and must then persist a
+  /// header for the new state. Until then the secondary records remain the
+  /// crash fallback.
+  ///
+  /// Precondition: the primary records are already retired (see
+  /// [`Self::is_primary_retired`]); only the secondary records are kept.
+  ///
+  /// On error the region state is left unchanged, so it still matches the
+  /// durable header that names the secondary records.
+  pub fn compact_secondary_into_primary(&mut self, pager: &mut FilePager) -> Result<()> {
+    // Flush earlier writes first so an error below drops only the pages this
+    // rewrite buffered.
+    self.flush(pager)?;
+    let retained = self.region_state();
+    let result = self
+      .merge_secondary_into_primary(pager)
+      .and_then(|()| self.flush(pager))
+      .and_then(|()| pager.sync());
+    if result.is_err() {
+      self.pending_writes.clear();
+      self.restore_region_state(retained);
+    }
+    result
+  }
+
+  /// Capture the positions and active region, so a transition whose header
+  /// fails to persist can be rolled back to match the durable header.
+  pub fn region_state(&self) -> WalRegionState {
+    WalRegionState {
+      head: self.head,
+      tail: self.tail,
+      primary_head: self.primary_head,
+      secondary_head: self.secondary_head,
+      active_region: self.active_region,
+    }
+  }
+
+  /// Restore positions captured by [`Self::region_state`]. Pending writes are
+  /// not touched.
+  pub fn restore_region_state(&mut self, state: WalRegionState) {
+    self.head = state.head;
+    self.tail = state.tail;
+    self.primary_head = state.primary_head;
+    self.secondary_head = state.secondary_head;
+    self.active_region = state.active_region;
+  }
+
+  /// Record this buffer's positions and active region in `header`.
+  pub fn store_in_header(&self, header: &mut DbHeaderV1) {
+    header.wal_head = self.head;
+    header.wal_tail = self.tail;
+    header.wal_primary_head = self.primary_head;
+    header.wal_secondary_head = self.secondary_head;
+    header.active_wal_region = self.active_region;
+  }
+
+  /// Merge secondary records into a fresh primary region (buffered, not
+  /// flushed). Checkpoint completion uses
+  /// [`Self::compact_secondary_into_primary`], which adds the flush, sync, and
+  /// error rollback that make the rewrite safe to install.
   pub fn merge_secondary_into_primary(&mut self, pager: &mut FilePager) -> Result<()> {
     let has_secondary_records = self.secondary_head > self.secondary_region_start;
     let secondary_records = if has_secondary_records {
@@ -772,6 +817,16 @@ impl WalBuffer {
   }
 }
 
+/// Saved WAL positions; see [`WalBuffer::region_state`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalRegionState {
+  head: u64,
+  tail: u64,
+  primary_head: u64,
+  secondary_head: u64,
+  active_region: u8,
+}
+
 /// WAL buffer statistics
 #[derive(Debug, Clone)]
 pub struct WalBufferStats {
@@ -1018,5 +1073,132 @@ mod tests {
     let records = buffer.scan_records(&mut pager).expect("expected value");
     assert_eq!(records.len(), 1); // Only secondary record preserved
     assert_eq!(records[0].txid, 2);
+  }
+
+  /// Header for the 4-page WAL at page 1 used by these tests.
+  fn test_header() -> DbHeaderV1 {
+    let mut header = DbHeaderV1::new(4096, 4);
+    header.wal_start_page = 1;
+    header
+  }
+
+  fn write_node_record(buffer: &mut WalBuffer, pager: &mut FilePager, txid: u64) {
+    let record = WalRecord::new(
+      WalRecordType::CreateNode,
+      txid,
+      build_create_node_payload(txid, Some(&format!("node-{txid}"))),
+    );
+    buffer.write_record(&record, pager).expect("write record");
+  }
+
+  fn txids(buffer: &mut WalBuffer, pager: &mut FilePager) -> Vec<u64> {
+    let records = buffer.scan_records(pager).expect("scan records");
+    records.iter().map(|record| record.txid).collect()
+  }
+
+  /// Primary txids 1..=pre_cut, then a background cut, then `post_cut`
+  /// records in the secondary region, all flushed.
+  fn buffer_with_cut(pager: &mut FilePager, pre_cut: u64, post_cut: &[u64]) -> WalBuffer {
+    let mut buffer = WalBuffer::new(4096, 4 * 4096, 4096);
+    for txid in 1..=pre_cut {
+      write_node_record(&mut buffer, pager, txid);
+    }
+    buffer.switch_to_secondary();
+    for &txid in post_cut {
+      write_node_record(&mut buffer, pager, txid);
+    }
+    buffer.flush(pager).expect("flush");
+    buffer
+  }
+
+  #[test]
+  fn retire_primary_region_keeps_only_post_cut_records() {
+    let (mut pager, _temp) = create_test_pager();
+    let mut buffer = buffer_with_cut(&mut pager, 3, &[10, 11]);
+    let mut cut_header = test_header();
+    buffer.store_in_header(&mut cut_header);
+    let post_cut_bytes = buffer.secondary_head() - buffer.primary_region_size();
+
+    buffer.retire_primary_region();
+
+    assert!(buffer.is_primary_retired());
+    assert!(!buffer.has_pending_writes(), "retiring writes no WAL bytes");
+    assert_eq!(buffer.used(), post_cut_bytes);
+    assert_eq!(txids(&mut buffer, &mut pager), vec![10, 11]);
+    assert!(buffer
+      .scan_region(0, &mut pager)
+      .expect("scan primary")
+      .is_empty());
+
+    // The persisted form reopens into the same retained state.
+    let mut retained_header = test_header();
+    buffer.store_in_header(&mut retained_header);
+    let mut reopened = WalBuffer::from_header(&retained_header);
+    assert!(reopened.is_primary_retired());
+    assert_eq!(txids(&mut reopened, &mut pager), vec![10, 11]);
+
+    // The cut header's primary records are still intact as a crash fallback.
+    let mut fallback = WalBuffer::from_header(&cut_header);
+    let fallback_records = fallback
+      .records_for_recovery(&mut pager)
+      .expect("fallback records");
+    let fallback_txids: Vec<u64> = fallback_records.iter().map(|r| r.txid).collect();
+    assert_eq!(fallback_txids, vec![1, 2, 3, 10, 11]);
+  }
+
+  #[test]
+  fn compact_secondary_into_primary_rewinds_primary_usage() {
+    let (mut pager, _temp) = create_test_pager();
+    let mut buffer = buffer_with_cut(&mut pager, 40, &[50, 51, 52]);
+    let pre_cut_usage = buffer.primary_head() as f64 / buffer.primary_region_size() as f64;
+    let post_cut_bytes = buffer.secondary_head() - buffer.primary_region_size();
+    buffer.retire_primary_region();
+
+    buffer
+      .compact_secondary_into_primary(&mut pager)
+      .expect("compact");
+
+    assert_eq!(buffer.active_region(), 0);
+    assert_eq!(buffer.tail(), 0);
+    assert_eq!(buffer.primary_head(), post_cut_bytes);
+    assert!(!buffer.has_secondary_records());
+    assert!(
+      !buffer.has_pending_writes(),
+      "compaction flushes its rewrite"
+    );
+    assert!(buffer.usage_ratio() < pre_cut_usage / 4.0);
+    assert_eq!(txids(&mut buffer, &mut pager), vec![50, 51, 52]);
+
+    let mut header = test_header();
+    buffer.store_in_header(&mut header);
+    let mut reopened = WalBuffer::from_header(&header);
+    assert!(!reopened.is_primary_retired());
+    assert_eq!(reopened.usage_ratio(), buffer.usage_ratio());
+    assert_eq!(txids(&mut reopened, &mut pager), vec![50, 51, 52]);
+  }
+
+  #[test]
+  fn failed_compaction_keeps_retained_state() {
+    let (mut pager, temp) = create_test_pager();
+    let mut buffer = buffer_with_cut(&mut pager, 3, &[10, 11]);
+    buffer.retire_primary_region();
+    let retained = buffer.region_state();
+
+    // Writes through a read-only pager fail after the rewrite is buffered.
+    let mut read_only = crate::core::pager::open_pager_with_locking(temp.path(), 4096, true, false)
+      .expect("read-only pager");
+    assert!(buffer
+      .compact_secondary_into_primary(&mut read_only)
+      .is_err());
+
+    assert_eq!(buffer.region_state(), retained);
+    assert!(!buffer.has_pending_writes());
+    assert_eq!(txids(&mut buffer, &mut pager), vec![10, 11]);
+
+    buffer
+      .compact_secondary_into_primary(&mut pager)
+      .expect("retry compaction");
+    assert_eq!(buffer.active_region(), 0);
+    assert_eq!(txids(&mut buffer, &mut pager), vec![10, 11]);
   }
 }

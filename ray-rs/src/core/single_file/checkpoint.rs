@@ -15,6 +15,7 @@ use crate::core::snapshot::reader::SnapshotData;
 use crate::core::snapshot::writer::{
   build_snapshot_to_memory, EdgeData, NodeData, SnapshotBuildInput,
 };
+use crate::core::wal::buffer::WalBuffer;
 use crate::error::{KiteError, Result};
 use crate::types::*;
 use crate::vector::types::VectorManifest;
@@ -40,6 +41,9 @@ enum CheckpointPhase {
   SnapshotDurable,
   HeaderWritten,
   HeaderDurable,
+  /// A background checkpoint's header naming the post-cut records in the
+  /// secondary region is durable; they are not yet compacted into primary.
+  PostCutWalRetained,
 }
 
 #[cfg(test)]
@@ -204,10 +208,11 @@ impl SingleFileDB {
       header.max_node_id = self.next_node_id.load(Ordering::SeqCst).saturating_sub(1);
       header.next_tx_id = self.next_tx_id.load(Ordering::SeqCst);
 
-      // Reset WAL
-      header.wal_head = 0;
-      header.wal_tail = 0;
+      // Reset WAL. Record every region field: a stale primary head or active
+      // region would make the next open append after, or re-merge, records
+      // this snapshot already covers.
       wal_buffer.reset();
+      wal_buffer.store_in_header(&mut header);
 
       // Snapshot pages were synced by write_snapshot_pages. Install the
       // header only after that durable write, using the inactive slot.
@@ -292,8 +297,11 @@ impl SingleFileDB {
   /// 2. Set checkpointInProgress flag (for crash recovery)
   /// 3. Build new snapshot from primary WAL + current snapshot + delta
   /// 4. Write new snapshot to disk
-  /// 5. Merge secondary into primary, update header
-  /// 6. Clear checkpointInProgress flag
+  /// 5. Install a header for the new snapshot that drops every primary
+  ///    record: the WAL is empty, or names only the post-cut records still in
+  ///    the secondary region (this also clears checkpointInProgress)
+  /// 6. If post-cut records exist, rewrite them at the start of the primary
+  ///    region and install a second header naming them there
   pub fn background_checkpoint(&self) -> Result<()> {
     if self.read_only {
       return Err(KiteError::ReadOnly);
@@ -327,25 +335,29 @@ impl SingleFileDB {
       return Err(KiteError::TransactionInProgress);
     }
 
-    let start_result = {
+    let start_result = (|| {
       let _commit_guard = self.commit_lock.lock();
       let mut pager = self.pager.lock();
       let mut wal_buffer = self.wal_buffer.lock();
       let mut header = self.header.write();
+
+      // An earlier completion installed its snapshot but failed to compact
+      // the post-cut records it retained in the secondary region. Finish that
+      // first, so this cut starts from a primary region holding every pre-cut
+      // record and an empty secondary region.
+      if wal_buffer.is_primary_retired() {
+        self.compact_retained_wal(&mut pager, &mut wal_buffer, &mut header)?;
+      }
 
       // Make all pre-cut WAL bytes durable before the checkpoint marker.
       wal_buffer.flush(&mut pager)?;
       pager.sync()?;
 
       wal_buffer.switch_to_secondary();
-      header.active_wal_region = 1;
+      wal_buffer.store_in_header(&mut header);
       header.checkpoint_in_progress = 1;
-      header.wal_head = wal_buffer.head();
-      header.wal_tail = wal_buffer.tail();
-      header.wal_primary_head = wal_buffer.primary_head();
-      header.wal_secondary_head = wal_buffer.secondary_head();
       self.persist_header(&mut pager, &mut header, true)
-    };
+    })();
     drop(checkpoint_gate);
     if let Err(error) = start_result {
       *self.checkpoint_status.lock() = CheckpointStatus::Idle;
@@ -430,8 +442,8 @@ impl SingleFileDB {
     self.wait_for_no_active_transactions();
     let _commit_guard = self.commit_lock.lock();
 
-    // Merge secondary records into primary and update header
     let post_cut_records;
+    let compaction_result;
     {
       let mut pager = self.pager.lock();
       let mut wal_buffer = self.wal_buffer.lock();
@@ -440,18 +452,16 @@ impl SingleFileDB {
       let old_snapshot_page_count = header.snapshot_page_count;
 
       wal_buffer.flush(&mut pager)?;
-      post_cut_records = if wal_buffer.has_secondary_records() {
+      let retain_post_cut = wal_buffer.has_secondary_records();
+      post_cut_records = if retain_post_cut {
         wal_buffer.scan_region(1, &mut pager)?
       } else {
         Vec::new()
       };
 
-      // Update header with new snapshot location. The normal path appends the
-      // secondary records after the old primary prefix so the old header can
-      // still recover if the install is interrupted. If that prefix has no
-      // room, install the new snapshot with the secondary region as the
-      // temporary retained WAL, then compact that region after the first
-      // header is durable.
+      let cut_header = header.clone();
+      let cut_wal = wal_buffer.region_state();
+
       header.prev_snapshot_gen = header.active_snapshot_gen;
       header.active_snapshot_gen = new_gen;
       header.snapshot_start_page = new_snapshot_start_page;
@@ -460,48 +470,40 @@ impl SingleFileDB {
       header.max_node_id = self.next_node_id.load(Ordering::SeqCst).saturating_sub(1);
       header.next_tx_id = self.next_tx_id.load(Ordering::SeqCst);
 
-      // Update WAL state
-      header.wal_head = wal_buffer.head();
-      header.wal_tail = wal_buffer.tail();
-      header.wal_primary_head = wal_buffer.primary_head();
-      header.wal_secondary_head = wal_buffer.secondary_head();
-
-      let compact_after_install =
-        match wal_buffer.merge_secondary_into_primary_preserving_old(&mut pager) {
-          Ok(()) => false,
-          Err(KiteError::WalBufferFull) => true,
-          Err(error) => return Err(error),
-        };
-
-      if compact_after_install {
-        header.wal_head = wal_buffer.secondary_head();
-        header.wal_tail = wal_buffer.primary_region_size();
-        header.wal_primary_head = wal_buffer.primary_head();
-        header.wal_secondary_head = wal_buffer.secondary_head();
-        header.active_wal_region = 1;
-        header.checkpoint_in_progress = 0;
-        self.persist_checkpoint_header(&mut pager, &mut header)?;
-
-        // The first durable header makes the old primary unreachable. It is
-        // now safe to rebuild a compact primary and install it with a second
-        // header flip; a crash between flips recovers the secondary region.
-        wal_buffer.merge_secondary_into_primary(&mut pager)?;
-        wal_buffer.flush(&mut pager)?;
-        pager.sync()?;
+      // The new snapshot covers every primary record, so the installed header
+      // stops counting them: with no post-cut records the WAL is simply
+      // empty; otherwise it names only the post-cut records, still in place
+      // in the secondary region. Neither state writes WAL bytes, so the cut
+      // header's WAL stays intact as the crash fallback until this header is
+      // durable in both slots.
+      if retain_post_cut {
+        wal_buffer.retire_primary_region();
       } else {
-        wal_buffer.flush(&mut pager)?;
-        pager.sync()?;
+        wal_buffer.reset();
+      }
+      wal_buffer.store_in_header(&mut header);
+      header.checkpoint_in_progress = 0;
+      if let Err(error) = self.persist_checkpoint_header(&mut pager, &mut header) {
+        // The cut header may still be the newest durable slot, and it names
+        // the primary region. Restore the cut state (keeping the generation
+        // monotonic) so the caller rebuilds the WAL instead of letting the
+        // next commit overwrite records that header still needs.
+        let change_counter = header.change_counter;
+        *header = cut_header;
+        header.change_counter = change_counter;
+        wal_buffer.restore_region_state(cut_wal);
+        return Err(error);
       }
 
-      header.wal_head = wal_buffer.head();
-      header.wal_tail = wal_buffer.tail();
-      header.wal_primary_head = wal_buffer.primary_head();
-      header.wal_secondary_head = wal_buffer.secondary_head();
-      header.active_wal_region = 0;
-      header.checkpoint_in_progress = 0;
-      // The new snapshot and retained WAL are durable before the inactive
-      // header slot is installed.
-      self.persist_checkpoint_header(&mut pager, &mut header)?;
+      // Both slots now name the retained secondary records, so the primary
+      // region is free to rewrite. A failure leaves the retained state, which
+      // is consistent on disk and finished by the next background checkpoint
+      // or open; the new snapshot is installed either way.
+      compaction_result = if retain_post_cut {
+        self.compact_retained_wal(&mut pager, &mut wal_buffer, &mut header)
+      } else {
+        Ok(())
+      };
 
       // Mark old snapshot pages as free (for future vacuum)
       if old_snapshot_page_count > 0 && old_snapshot_start_page != new_snapshot_start_page {
@@ -517,15 +519,40 @@ impl SingleFileDB {
     self.truncate_orphaned_tail()?;
 
     // Replace, rather than clear, the delta with only transactions written
-    // after the snapshot cut. Those records are retained in the new primary
-    // WAL range and must remain visible both now and after restart.
+    // after the snapshot cut. Those records are retained in the WAL and must
+    // remain visible both now and after restart.
     let post_cut_delta = self.replay_records_into_delta(&post_cut_records)?;
     *self.delta.write() = post_cut_delta;
 
     // Mark as idle
     *self.checkpoint_status.lock() = CheckpointStatus::Idle;
 
-    Ok(())
+    compaction_result
+  }
+
+  /// Move post-cut records retained in the secondary region to the start of
+  /// the primary region, then install a header naming them there.
+  ///
+  /// Callers hold the commit lock with no transaction active, and every valid
+  /// header slot names the retained secondary records rather than the primary
+  /// region, so rewriting primary bytes cannot damage a crash fallback.
+  ///
+  /// If the rewrite fails, the buffer stays in the retained state the durable
+  /// header names. If only the header install fails, the buffer keeps the
+  /// compacted state: its bytes are already synced, the next header write
+  /// records it, and until then the retained header stays a valid fallback
+  /// because the secondary region is not written again before a new
+  /// checkpoint marker is durable.
+  fn compact_retained_wal(
+    &self,
+    pager: &mut FilePager,
+    wal_buffer: &mut WalBuffer,
+    header: &mut DbHeaderV1,
+  ) -> Result<()> {
+    checkpoint_phase(CheckpointPhase::PostCutWalRetained)?;
+    wal_buffer.compact_secondary_into_primary(pager)?;
+    wal_buffer.store_in_header(header);
+    self.persist_checkpoint_header(pager, header)
   }
 
   fn replay_records_into_delta(
@@ -604,12 +631,8 @@ impl SingleFileDB {
       eprintln!("Warning: Failed to rebuild checkpoint WAL during recovery: {error}");
     }
 
-    header.active_wal_region = 0;
+    wal_buffer.store_in_header(&mut header);
     header.checkpoint_in_progress = 0;
-    header.wal_head = wal_buffer.head();
-    header.wal_tail = wal_buffer.tail();
-    header.wal_primary_head = wal_buffer.primary_head();
-    header.wal_secondary_head = wal_buffer.secondary_head();
     if let Err(error) = self.persist_header(&mut pager, &mut header, false) {
       eprintln!("Warning: Failed to write checkpoint header during recovery: {error}");
     }
@@ -1156,6 +1179,329 @@ mod tests {
     drop(db);
     let reopened = open_single_file(&db_path, options).expect("expected value");
     assert!(reopened.node_by_key("after-cut").is_some());
+  }
+
+  /// Run a background checkpoint on another thread (with `fault` armed there)
+  /// and run `post_cut` after its snapshot cut but before it completes.
+  fn background_checkpoint_with_post_cut(
+    db: &Arc<SingleFileDB>,
+    fault: Option<CheckpointPhase>,
+    post_cut: impl FnOnce(&SingleFileDB),
+  ) -> Result<()> {
+    let cut_barrier = Arc::new(Barrier::new(2));
+    set_checkpoint_test_barrier(CheckpointPhase::SnapshotDurable, Arc::clone(&cut_barrier));
+    let checkpoint_db = Arc::clone(db);
+    let checkpoint_thread = std::thread::spawn(move || {
+      set_checkpoint_test_fault(fault);
+      checkpoint_db.background_checkpoint()
+    });
+
+    // The marker is set under the header lock once the cut is installed; the
+    // checkpoint thread then parks on the barrier until `post_cut` is done.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while db.header.read().checkpoint_in_progress == 0 {
+      assert!(std::time::Instant::now() < deadline, "cut never happened");
+      std::thread::yield_now();
+    }
+    post_cut(db);
+    cut_barrier.wait();
+    checkpoint_thread.join().expect("checkpoint thread")
+  }
+
+  fn commit_node(db: &SingleFileDB, key: &str) {
+    db.begin(false).expect("begin");
+    db.create_node(Some(key)).expect("create node");
+    db.commit().expect("commit");
+  }
+
+  #[test]
+  fn background_checkpoint_without_post_cut_commits_empties_wal() {
+    let _serial = checkpoint_test_serial();
+    let temp_dir = tempdir().expect("temp dir");
+    let db_path = temp_dir.path().join("checkpoint-background-empty.kitedb");
+    let options = SingleFileOpenOptions::new()
+      .wal_size(64 * 1024)
+      .auto_checkpoint(false);
+    let db = open_single_file(&db_path, options.clone()).expect("open");
+    for index in 0..50 {
+      commit_node(&db, &format!("pre-{index}"));
+    }
+    assert!(db.wal_buffer.lock().usage_ratio() > 0.0);
+
+    db.background_checkpoint().expect("background checkpoint");
+
+    let stats = db.wal_stats();
+    assert_eq!(
+      (
+        stats.active_region,
+        stats.head,
+        stats.tail,
+        stats.primary_head
+      ),
+      (0, 0, 0, 0)
+    );
+    assert_eq!(db.wal_buffer.lock().usage_ratio(), 0.0);
+    let header = db.header.read().clone();
+    assert_eq!(
+      (
+        header.wal_head,
+        header.wal_tail,
+        header.wal_primary_head,
+        header.active_wal_region,
+        header.checkpoint_in_progress,
+      ),
+      (0, 0, 0, 0, 0)
+    );
+
+    drop(db);
+    let reopened = open_single_file(&db_path, options).expect("reopen");
+    assert_eq!(reopened.wal_stats().primary_head, 0);
+    assert!(reopened.node_by_key("pre-0").is_some());
+    assert!(reopened.node_by_key("pre-49").is_some());
+  }
+
+  #[test]
+  fn background_checkpoint_moves_post_cut_records_to_primary_start() {
+    let _serial = checkpoint_test_serial();
+    let temp_dir = tempdir().expect("temp dir");
+    let db_path = temp_dir.path().join("checkpoint-background-compact.kitedb");
+    let options = SingleFileOpenOptions::new()
+      .wal_size(64 * 1024)
+      .auto_checkpoint(false);
+    let db = Arc::new(open_single_file(&db_path, options.clone()).expect("open"));
+    db.begin(false).expect("begin");
+    let node = db.create_node(Some("counter")).expect("node");
+    let key = db.define_propkey("value").expect("propkey");
+    db.set_node_prop(node, key, PropValue::I64(0))
+      .expect("prop");
+    db.commit().expect("commit");
+    for value in 1..=40 {
+      db.begin(false).expect("begin");
+      db.set_node_prop(node, key, PropValue::I64(value))
+        .expect("prop");
+      db.commit().expect("commit");
+    }
+    let pre_cut_usage = db.wal_buffer.lock().usage_ratio();
+
+    background_checkpoint_with_post_cut(&db, None, |db| {
+      for value in [100, 101] {
+        db.begin(false).expect("begin");
+        db.set_node_prop(node, key, PropValue::I64(value))
+          .expect("prop");
+        db.commit().expect("commit");
+      }
+      commit_node(db, "after-cut");
+    })
+    .expect("background checkpoint");
+
+    // Only the post-cut records remain, rewound to the primary start.
+    let stats = db.wal_stats();
+    assert_eq!((stats.active_region, stats.tail), (0, 0));
+    assert_eq!(stats.head, stats.primary_head);
+    assert!(!db.wal_buffer.lock().has_secondary_records());
+    let usage = db.wal_buffer.lock().usage_ratio();
+    assert!(
+      usage > 0.0 && usage < pre_cut_usage / 4.0,
+      "usage {usage} vs pre-cut {pre_cut_usage}"
+    );
+    let header = db.header.read().clone();
+    assert_eq!(
+      (
+        header.wal_head,
+        header.wal_tail,
+        header.active_wal_region,
+        header.checkpoint_in_progress,
+      ),
+      (stats.head, 0, 0, 0)
+    );
+    let retained = {
+      let mut pager = db.pager.lock();
+      db.wal_buffer
+        .lock()
+        .scan_records(&mut pager)
+        .expect("scan WAL")
+    };
+    assert_eq!(committed_transactions(&retained).len(), 3);
+
+    assert_eq!(db.node_prop(node, key), Some(PropValue::I64(101)));
+    assert!(db.node_by_key("after-cut").is_some());
+
+    drop(db);
+    let reopened = open_single_file(&db_path, options).expect("reopen");
+    assert_eq!(reopened.node_prop(node, key), Some(PropValue::I64(101)));
+    assert!(reopened.node_by_key("after-cut").is_some());
+    assert!(reopened.node_by_key("counter").is_some());
+  }
+
+  #[test]
+  fn crash_before_post_cut_compaction_recovers_on_open() {
+    let _serial = checkpoint_test_serial();
+    let temp_dir = tempdir().expect("temp dir");
+    let db_path = temp_dir
+      .path()
+      .join("checkpoint-background-retained.kitedb");
+    let options = SingleFileOpenOptions::new().auto_checkpoint(false);
+    let db = Arc::new(open_single_file(&db_path, options.clone()).expect("open"));
+    commit_node(&db, "before-cut");
+
+    let result =
+      background_checkpoint_with_post_cut(&db, Some(CheckpointPhase::PostCutWalRetained), |db| {
+        commit_node(db, "after-cut")
+      });
+    assert!(result.is_err());
+
+    // The snapshot is installed, and the post-cut records are retained in
+    // place in the secondary region.
+    let header = db.header.read().clone();
+    assert_eq!(
+      (header.checkpoint_in_progress, header.active_wal_region),
+      (0, 1)
+    );
+    assert_eq!(header.wal_tail, db.wal_buffer.lock().primary_region_size());
+    assert!(db.wal_buffer.lock().is_primary_retired());
+    assert!(db.node_by_key("before-cut").is_some());
+    assert!(db.node_by_key("after-cut").is_some());
+
+    // Crash: nothing else reaches the file.
+    drop(db);
+
+    // A read-only open replays the retained records in place.
+    let bytes_before = std::fs::read(&db_path).expect("read file");
+    let read_only =
+      open_single_file(&db_path, options.clone().read_only(true)).expect("read-only open");
+    assert!(read_only.node_by_key("before-cut").is_some());
+    assert!(read_only.node_by_key("after-cut").is_some());
+    drop(read_only);
+    assert!(std::fs::read(&db_path).expect("read file") == bytes_before);
+
+    let reopened = open_single_file(&db_path, options.clone()).expect("reopen");
+    assert!(reopened.node_by_key("before-cut").is_some());
+    assert!(reopened.node_by_key("after-cut").is_some());
+    let stats = reopened.wal_stats();
+    assert_eq!((stats.active_region, stats.tail), (0, 0));
+    assert!(stats.primary_head > 0);
+    assert_eq!(reopened.header.read().active_wal_region, 0);
+
+    commit_node(&reopened, "after-reopen");
+    crate::core::single_file::close_single_file(reopened).expect("close");
+    let reopened = open_single_file(&db_path, options).expect("reopen again");
+    for key in ["before-cut", "after-cut", "after-reopen"] {
+      assert!(reopened.node_by_key(key).is_some(), "{key} missing");
+    }
+  }
+
+  #[test]
+  fn failed_post_cut_compaction_is_finished_by_next_background_checkpoint() {
+    let _serial = checkpoint_test_serial();
+    let temp_dir = tempdir().expect("temp dir");
+    let db_path = temp_dir.path().join("checkpoint-background-resume.kitedb");
+    let options = SingleFileOpenOptions::new().auto_checkpoint(false);
+    let db = Arc::new(open_single_file(&db_path, options.clone()).expect("open"));
+    commit_node(&db, "before-cut");
+    let result =
+      background_checkpoint_with_post_cut(&db, Some(CheckpointPhase::PostCutWalRetained), |db| {
+        commit_node(db, "after-cut")
+      });
+    assert!(result.is_err());
+
+    // Commits keep landing in the retained secondary region.
+    commit_node(&db, "while-retained");
+    assert!(db.wal_buffer.lock().is_primary_retired());
+
+    db.background_checkpoint()
+      .expect("resumed background checkpoint");
+    let stats = db.wal_stats();
+    assert_eq!(
+      (
+        stats.active_region,
+        stats.head,
+        stats.tail,
+        stats.primary_head
+      ),
+      (0, 0, 0, 0)
+    );
+    for key in ["before-cut", "after-cut", "while-retained"] {
+      assert!(db.node_by_key(key).is_some(), "{key} missing live");
+    }
+
+    drop(db);
+    let reopened = open_single_file(&db_path, options).expect("reopen");
+    for key in ["before-cut", "after-cut", "while-retained"] {
+      assert!(reopened.node_by_key(key).is_some(), "{key} missing");
+    }
+  }
+
+  #[test]
+  fn background_checkpoint_header_faults_preserve_post_cut_commits() {
+    let _serial = checkpoint_test_serial();
+    for (index, phase) in [
+      CheckpointPhase::HeaderWritten,
+      CheckpointPhase::HeaderDurable,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+      let temp_dir = tempdir().expect("temp dir");
+      let db_path = temp_dir
+        .path()
+        .join(format!("checkpoint-background-header-{index}.kitedb"));
+      let options = SingleFileOpenOptions::new().auto_checkpoint(false);
+      let db = Arc::new(open_single_file(&db_path, options.clone()).expect("open"));
+      commit_node(&db, "before-cut");
+
+      let result =
+        background_checkpoint_with_post_cut(&db, Some(phase), |db| commit_node(db, "after-cut"));
+      assert!(result.is_err(), "phase {phase:?} should abort");
+      assert!(!db.is_checkpoint_running());
+      assert!(db.node_by_key("before-cut").is_some());
+      assert!(db.node_by_key("after-cut").is_some());
+
+      // The process keeps working after the failed install.
+      commit_node(&db, "after-failure");
+      drop(db);
+
+      let reopened = open_single_file(&db_path, options).expect("reopen");
+      for key in ["before-cut", "after-cut", "after-failure"] {
+        assert!(
+          reopened.node_by_key(key).is_some(),
+          "{key} missing after {phase:?}"
+        );
+      }
+      reopened
+        .background_checkpoint()
+        .expect("checkpoint after recovery");
+      assert!(reopened.node_by_key("after-cut").is_some());
+    }
+  }
+
+  #[test]
+  fn blocking_checkpoint_persists_reset_wal_regions() {
+    let _serial = checkpoint_test_serial();
+    let temp_dir = tempdir().expect("temp dir");
+    let db_path = temp_dir.path().join("checkpoint-blocking-wal-state.kitedb");
+    let options = SingleFileOpenOptions::new().auto_checkpoint(false);
+    let db = open_single_file(&db_path, options.clone()).expect("open");
+    db.begin(false).expect("begin");
+    let a = db.create_node(Some("a")).expect("node a");
+    let b = db.create_node(Some("b")).expect("node b");
+    let knows = db.define_etype("knows").expect("etype");
+    db.add_edge(a, knows, b).expect("edge");
+    db.commit().expect("commit");
+    db.checkpoint().expect("checkpoint");
+    crate::core::single_file::close_single_file(db).expect("close");
+
+    // The checkpoint emptied the WAL; a reopen must not resume appending
+    // after the records the snapshot already covers.
+    let db = open_single_file(&db_path, options.clone()).expect("reopen");
+    assert_eq!(db.wal_stats().primary_head, 0);
+    db.begin(false).expect("begin");
+    db.create_node(Some("c")).expect("node c");
+    db.commit().expect("commit");
+    crate::core::single_file::close_single_file(db).expect("close");
+
+    let db = open_single_file(&db_path, options).expect("reopen");
+    assert_eq!(db.out_edges(a), vec![(knows, b)]);
+    assert!(db.node_by_key("c").is_some());
   }
 
   #[test]
