@@ -163,6 +163,12 @@ export interface NodeSpec<
   props?: P
 }
 
+/**
+ * Node objects carry their identity as `id`, `key` and `type`, so props must not
+ * use these names: they would shadow the identity of every returned node.
+ */
+const RESERVED_NODE_PROPS: ReadonlyArray<string> = ['id', 'key', 'type']
+
 /** Configuration for node() */
 export interface NodeConfig<
   K extends string = string,
@@ -198,6 +204,7 @@ export interface NodeConfig<
  * @param name - The node type name (must be unique)
  * @param config - Node configuration with key function and properties
  * @returns A NodeSpec that can be passed to kite()
+ * @throws If a prop is named `id`, `key` or `type` (reserved for node identity)
  *
  * @example
  * ```typescript
@@ -225,6 +232,14 @@ export function node<
 >(name: string, config?: NodeConfig<K, P>): NodeSpec<P> {
   if (!config) {
     return { name }
+  }
+
+  for (const propName of Object.keys(config.props ?? {})) {
+    if (RESERVED_NODE_PROPS.includes(propName)) {
+      throw new Error(
+        `node('${name}'): prop name '${propName}' is reserved for node identity (id, key, type); rename the prop`,
+      )
+    }
   }
 
   let keySpec: KeySpec | undefined
