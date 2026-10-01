@@ -1,13 +1,12 @@
 //! Single-file compactor and vacuum operations.
 
-use std::sync::atomic::Ordering;
-
 use crate::core::pager::pages_to_store;
 use crate::core::snapshot::writer::{build_snapshot_to_memory, SnapshotBuildInput};
 use crate::core::wal::buffer::WalBuffer;
 use crate::error::{KiteError, Result};
 use crate::util::compression::CompressionOptions;
 
+use super::checkpoint::WrittenSnapshot;
 use super::SingleFileDB;
 
 /// Options for single-file optimize operation
@@ -81,20 +80,11 @@ impl SingleFileDB {
       return Err(KiteError::TransactionInProgress);
     }
 
-    if self.is_checkpoint_running() {
-      // Wait for background checkpoint to complete (mirrors TS behavior)
-      while self.is_checkpoint_running() {
-        std::thread::sleep(std::time::Duration::from_millis(1));
-      }
-    }
-    let _checkpoint_gate = self.checkpoint_gate.write();
-    self.wait_for_no_active_transactions();
+    let _checkpoint_gate = self.exclusive_checkpoint_gate()?;
 
     let (nodes, edges, labels, etypes, propkeys, vector_stores) = self.collect_graph_data()?;
 
     let header = self.header.read().clone();
-    let old_snapshot_start_page = header.snapshot_start_page;
-    let old_snapshot_page_count = header.snapshot_page_count;
     let new_gen = header.active_snapshot_gen + 1;
     let compression = options.and_then(|o| o.compression);
 
@@ -123,33 +113,24 @@ impl SingleFileDB {
       )?;
     }
 
+    // The snapshot covers every WAL record, so the installed header names an
+    // empty WAL. The previous snapshot is retired only after both durable
+    // slots name the optimized one; checkpoint reuse may consume its pages.
     {
       let mut pager = self.pager.lock();
       let mut wal_buffer = self.wal_buffer.lock();
       let mut header = self.header.write();
-
-      header.prev_snapshot_gen = header.active_snapshot_gen;
-      header.active_snapshot_gen = new_gen;
-      header.snapshot_start_page = new_snapshot_start_page;
-      header.snapshot_page_count = new_snapshot_page_count;
-      header.db_size_pages = new_snapshot_start_page + new_snapshot_page_count;
-      header.max_node_id = self.next_node_id.load(Ordering::SeqCst).saturating_sub(1);
-      header.next_tx_id = self.next_tx_id.load(Ordering::SeqCst);
-
-      wal_buffer.reset();
-      wal_buffer.store_in_header(&mut header);
-
-      self.persist_header(&mut pager, &mut header, true)?;
-      // Retire the previous snapshot only after both durable slots name the
-      // optimized snapshot; checkpoint reuse may consume these free pages.
-      self.persist_header(&mut pager, &mut header, true)?;
-
-      if old_snapshot_page_count > 0 && old_snapshot_start_page != new_snapshot_start_page {
-        pager.free_pages(
-          old_snapshot_start_page as u32,
-          old_snapshot_page_count as u32,
-        );
-      }
+      self.install_snapshot(
+        &mut pager,
+        &mut wal_buffer,
+        &mut header,
+        WrittenSnapshot {
+          generation: new_gen,
+          start_page: new_snapshot_start_page,
+          page_count: new_snapshot_page_count,
+        },
+        WalBuffer::reset,
+      )?;
     }
 
     self.delta.write().clear();
@@ -168,12 +149,7 @@ impl SingleFileDB {
       return Err(KiteError::TransactionInProgress);
     }
 
-    while self.is_checkpoint_running() {
-      std::thread::sleep(std::time::Duration::from_millis(1));
-    }
-
-    let _checkpoint_gate = self.checkpoint_gate.write();
-    self.wait_for_no_active_transactions();
+    let _checkpoint_gate = self.exclusive_checkpoint_gate()?;
 
     let options = options.unwrap_or_default();
 
@@ -309,12 +285,6 @@ impl SingleFileDB {
       return Err(KiteError::TransactionInProgress);
     }
 
-    if self.is_checkpoint_running() {
-      while self.is_checkpoint_running() {
-        std::thread::sleep(std::time::Duration::from_millis(1));
-      }
-    }
-
     let options = options.unwrap_or_default();
 
     if wal_size_bytes == 0 {
@@ -325,8 +295,7 @@ impl SingleFileDB {
       self.checkpoint()?;
     }
 
-    let _checkpoint_gate = self.checkpoint_gate.write();
-    self.wait_for_no_active_transactions();
+    let _checkpoint_gate = self.exclusive_checkpoint_gate()?;
 
     let header = self.header.read().clone();
     let wal_is_empty =

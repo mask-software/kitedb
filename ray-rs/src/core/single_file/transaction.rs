@@ -28,13 +28,19 @@ use std::time::Instant;
 use super::open::SyncMode;
 use super::{SingleFileDB, SingleFileTxState};
 
+/// Marks a transaction finished once commit or rollback is done with it,
+/// including on error paths. A successful commit drops it only after its
+/// COMMIT record is written.
 struct ActiveTransactionGuard<'db> {
   db: &'db SingleFileDB,
+  txid: TxId,
+  /// The transaction wrote a BEGIN record (a non-bulk write transaction).
+  wrote_begin: bool,
 }
 
 impl Drop for ActiveTransactionGuard<'_> {
   fn drop(&mut self) {
-    self.db.transaction_finished();
+    self.db.transaction_finished(self.txid, self.wrote_begin);
   }
 }
 
@@ -127,17 +133,17 @@ impl SingleFileDB {
       ));
     }
 
-    // A blocking checkpoint takes the write side. Holding this read permit
-    // through insertion makes the gate atomic with transaction creation.
-    let _checkpoint_gate = self.checkpoint_gate.read();
-
+    // Only this thread inserts its own entry, so checking before the gate is
+    // race-free. It must come first: a blocking checkpoint holding the gate
+    // may be waiting for this thread's open transaction.
     let tid = std::thread::current().id();
-    {
-      let current_tx = self.current_tx.lock();
-      if current_tx.contains_key(&tid) {
-        return Err(KiteError::TransactionInProgress);
-      }
+    if self.current_tx.lock().contains_key(&tid) {
+      return Err(KiteError::TransactionInProgress);
     }
+
+    // A checkpoint takes the write side. Holding this read permit through
+    // insertion makes the gate atomic with transaction creation.
+    let _checkpoint_gate = self.checkpoint_gate.read();
 
     let (txid, snapshot_ts) = if let Some(mvcc) = self.mvcc.as_ref() {
       let (txid, snapshot_ts) = {
@@ -152,12 +158,14 @@ impl SingleFileDB {
       (self.alloc_tx_id(), 0)
     };
 
-    // Write BEGIN record to WAL (for write transactions)
+    // Write BEGIN record to WAL (for write transactions). Bulk loads write
+    // all their records at commit instead.
     if !read_only && !bulk_load {
       let record = WalRecord::new(WalRecordType::Begin, txid, build_begin_payload());
       let mut pager = self.pager.lock();
       let mut wal = self.wal_buffer.lock();
       wal.write_record(&record, &mut pager)?;
+      self.open_write_txids.lock().insert(txid);
     }
 
     let tx_state = Arc::new(Mutex::new(SingleFileTxState::new(
@@ -447,7 +455,11 @@ impl SingleFileDB {
         staged_schema,
       )
     };
-    let active_transaction_guard = ActiveTransactionGuard { db: self };
+    let active_transaction_guard = ActiveTransactionGuard {
+      db: self,
+      txid,
+      wrote_begin: !read_only && !bulk_load,
+    };
     let mut schema_reservation_guard = SchemaReservationGuard::new(self, txid);
 
     if read_only {
@@ -607,8 +619,9 @@ impl SingleFileDB {
     drop(_commit_guard);
     drop(active_transaction_guard);
 
-    // Check if auto-checkpoint should be triggered
-    // Note: We release all locks above first to avoid deadlock during checkpoint
+    // Check if auto-checkpoint should be triggered. Every lock is released and
+    // this thread's transaction is finished, so the checkpoint may wait for
+    // other threads' open transactions without ever waiting on its own.
     if self.auto_checkpoint && self.should_checkpoint(self.checkpoint_threshold) {
       // Don't trigger if checkpoint is already running
       if !self.is_checkpoint_running() {
@@ -640,7 +653,11 @@ impl SingleFileDB {
       let tx = tx_handle.lock();
       (tx.txid, tx.read_only, tx.bulk_load)
     };
-    let _active_transaction_guard = ActiveTransactionGuard { db: self };
+    let _active_transaction_guard = ActiveTransactionGuard {
+      db: self,
+      txid,
+      wrote_begin: !read_only && !bulk_load,
+    };
     let _schema_reservation_guard = SchemaReservationGuard::new(self, txid);
 
     if read_only {

@@ -5,6 +5,8 @@
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 
+use parking_lot::RwLockWriteGuard;
+
 #[cfg(test)]
 use std::cell::RefCell;
 #[cfg(test)]
@@ -37,6 +39,9 @@ type GraphData = (
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CheckpointPhase {
   GateAcquired,
+  /// A background checkpoint's cut is durable and the gate is open again; its
+  /// snapshot is not built yet.
+  CutReleased,
   SnapshotPageWritten,
   SnapshotDurable,
   HeaderWritten,
@@ -46,34 +51,31 @@ enum CheckpointPhase {
   PostCutWalRetained,
 }
 
+/// A barrier armed for one phase of checkpoints on the database at a path.
 #[cfg(test)]
-type CheckpointTestBarrier = (CheckpointPhase, Arc<Barrier>);
+type CheckpointTestBarrier = (std::path::PathBuf, CheckpointPhase, Arc<Barrier>);
 
 #[cfg(test)]
 thread_local! {
   static CHECKPOINT_TEST_FAULT: RefCell<Option<CheckpointPhase>> = const { RefCell::new(None) };
 }
 #[cfg(test)]
-static CHECKPOINT_TEST_BARRIER: OnceLock<Mutex<Option<CheckpointTestBarrier>>> = OnceLock::new();
+static CHECKPOINT_TEST_BARRIERS: OnceLock<Mutex<Vec<CheckpointTestBarrier>>> = OnceLock::new();
 #[cfg(test)]
 static CHECKPOINT_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
 
-fn checkpoint_phase(phase: CheckpointPhase) -> Result<()> {
+fn checkpoint_phase(db_path: &std::path::Path, phase: CheckpointPhase) -> Result<()> {
   #[cfg(test)]
   {
     let barrier = {
-      let mut configured = CHECKPOINT_TEST_BARRIER
-        .get_or_init(|| Mutex::new(None))
+      let mut configured = CHECKPOINT_TEST_BARRIERS
+        .get_or_init(|| Mutex::new(Vec::new()))
         .lock()
         .expect("checkpoint test barrier lock");
-      if configured
-        .as_ref()
-        .is_some_and(|(barrier_phase, _)| *barrier_phase == phase)
-      {
-        configured.take().map(|(_, barrier)| barrier)
-      } else {
-        None
-      }
+      configured
+        .iter()
+        .position(|(path, barrier_phase, _)| path == db_path && *barrier_phase == phase)
+        .map(|index| configured.remove(index).2)
     };
     let faulted = CHECKPOINT_TEST_FAULT.with(|fault| {
       let mut fault = fault.borrow_mut();
@@ -92,7 +94,7 @@ fn checkpoint_phase(phase: CheckpointPhase) -> Result<()> {
     }
   }
 
-  let _ = phase;
+  let _ = (db_path, phase);
   Ok(())
 }
 
@@ -101,10 +103,17 @@ fn set_checkpoint_test_fault(phase: Option<CheckpointPhase>) {
   CHECKPOINT_TEST_FAULT.with(|fault| *fault.borrow_mut() = phase);
 }
 
+/// Park the next thread that reaches `phase` of a checkpoint on `db` on
+/// `barrier`, replacing any barrier still armed for that phase. Barriers are
+/// per database, so tests running in parallel never take each other's.
 #[cfg(test)]
-fn set_checkpoint_test_barrier(phase: CheckpointPhase, barrier: Arc<Barrier>) {
-  let target = CHECKPOINT_TEST_BARRIER.get_or_init(|| Mutex::new(None));
-  *target.lock().expect("checkpoint test barrier lock") = Some((phase, barrier));
+fn set_checkpoint_test_barrier(db: &SingleFileDB, phase: CheckpointPhase, barrier: Arc<Barrier>) {
+  let mut configured = CHECKPOINT_TEST_BARRIERS
+    .get_or_init(|| Mutex::new(Vec::new()))
+    .lock()
+    .expect("checkpoint test barrier lock");
+  configured.retain(|(path, barrier_phase, _)| path != db.path() || *barrier_phase != phase);
+  configured.push((db.path().to_path_buf(), phase, barrier));
 }
 
 #[cfg(test)]
@@ -113,6 +122,22 @@ fn checkpoint_test_serial() -> std::sync::MutexGuard<'static, ()> {
     .get_or_init(|| Mutex::new(()))
     .lock()
     .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// A snapshot written and synced to pages that no valid header names yet.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WrittenSnapshot {
+  pub(crate) generation: u64,
+  pub(crate) start_page: u64,
+  pub(crate) page_count: u64,
+}
+
+/// Return `header` to `prior` after a failed header write, keeping the newer
+/// change counter so the next write still outranks every slot on disk.
+fn restore_header(header: &mut DbHeaderV1, prior: DbHeaderV1) {
+  let change_counter = header.change_counter;
+  *header = prior;
+  header.change_counter = change_counter;
 }
 
 impl SingleFileDB {
@@ -150,80 +175,27 @@ impl SingleFileDB {
     if self.current_tx_handle().is_some() {
       return Err(KiteError::TransactionInProgress);
     }
-    let _checkpoint_gate = self.checkpoint_gate.write();
-    checkpoint_phase(CheckpointPhase::GateAcquired)?;
-    self.wait_for_no_active_transactions();
+    let _checkpoint_gate = self.exclusive_checkpoint_gate()?;
 
-    // Collect all graph data
-    let (nodes, edges, labels, etypes, propkeys, vector_stores) = self.collect_graph_data()?;
-
-    // Get current header state
+    let graph = self.collect_graph_data()?;
     let header = self.header.read().clone();
-    let old_snapshot_start_page = header.snapshot_start_page;
-    let old_snapshot_page_count = header.snapshot_page_count;
-    let new_gen = header.active_snapshot_gen + 1;
+    let generation = header.active_snapshot_gen + 1;
+    let snapshot_buffer = self.build_snapshot_buffer(generation, graph)?;
+    let snapshot = self.write_new_snapshot(&header, generation, &snapshot_buffer)?;
 
-    // Build new snapshot in memory
-    let snapshot_buffer = build_snapshot_to_memory(SnapshotBuildInput {
-      generation: new_gen,
-      nodes,
-      edges,
-      labels,
-      etypes,
-      propkeys,
-      vector_stores: Some(vector_stores),
-      compression: self.checkpoint_compression.clone(),
-    })?;
-
-    let new_snapshot_page_count =
-      pages_to_store(snapshot_buffer.len(), header.page_size as usize) as u64;
-    // Never reuse the installed snapshot's pages. Orphaned pages from an
-    // interrupted checkpoint are also skipped; vacuum owns reclamation.
-    let new_snapshot_start_page =
-      self.checkpoint_snapshot_start_page(&header, new_snapshot_page_count)?;
-
-    // Write snapshot to file
-    {
-      let mut pager = self.pager.lock();
-      self.write_snapshot_pages(
-        &mut pager,
-        new_snapshot_start_page as u32,
-        &snapshot_buffer,
-        header.page_size as usize,
-      )?;
-    }
-    checkpoint_phase(CheckpointPhase::SnapshotDurable)?;
-
-    // Update header
+    // The snapshot covers every WAL record, so the installed header names an
+    // empty WAL.
     {
       let mut pager = self.pager.lock();
       let mut wal_buffer = self.wal_buffer.lock();
       let mut header = self.header.write();
-      // Update header fields
-      header.prev_snapshot_gen = header.active_snapshot_gen;
-      header.active_snapshot_gen = new_gen;
-      header.snapshot_start_page = new_snapshot_start_page;
-      header.snapshot_page_count = new_snapshot_page_count;
-      header.db_size_pages = new_snapshot_start_page + new_snapshot_page_count;
-      header.max_node_id = self.next_node_id.load(Ordering::SeqCst).saturating_sub(1);
-      header.next_tx_id = self.next_tx_id.load(Ordering::SeqCst);
-
-      // Reset WAL. Record every region field: a stale primary head or active
-      // region would make the next open append after, or re-merge, records
-      // this snapshot already covers.
-      wal_buffer.reset();
-      wal_buffer.store_in_header(&mut header);
-
-      // Snapshot pages were synced by write_snapshot_pages. Install the
-      // header only after that durable write, using the inactive slot.
-      self.persist_checkpoint_header(&mut pager, &mut header)?;
-
-      if old_snapshot_page_count > 0 && old_snapshot_start_page != new_snapshot_start_page {
-        pager.free_pages(
-          old_snapshot_start_page as u32,
-          old_snapshot_page_count as u32,
-        );
-      }
+      self.install_snapshot(
+        &mut pager,
+        &mut wal_buffer,
+        &mut header,
+        snapshot,
+        WalBuffer::reset,
+      )?;
     }
 
     // Clear delta
@@ -234,6 +206,28 @@ impl SingleFileDB {
     self.truncate_orphaned_tail()?;
 
     Ok(())
+  }
+
+  /// Take the checkpoint gate for work that replaces the snapshot or resets
+  /// the WAL: no transaction is open, none can begin, and no background
+  /// checkpoint is between its cut and its install. Running inside that window
+  /// would erase the background checkpoint's post-cut commits: the WAL holding
+  /// them would be reset, and its install would then replace this snapshot
+  /// with its older one.
+  pub(crate) fn exclusive_checkpoint_gate(&self) -> Result<RwLockWriteGuard<'_, ()>> {
+    loop {
+      let checkpoint_gate = self.checkpoint_gate.write();
+      checkpoint_phase(&self.path, CheckpointPhase::GateAcquired)?;
+      self.wait_for_no_active_transactions();
+      // The marker is set by a background cut and cleared by its install
+      // (both under this gate) or by the WAL rebuild after it fails. Either
+      // way the background checkpoint then returns to idle.
+      if self.header.read().checkpoint_in_progress == 0 {
+        return Ok(checkpoint_gate);
+      }
+      drop(checkpoint_gate);
+      self.wait_for_background_checkpoint();
+    }
   }
 
   /// Reload snapshot from disk after checkpoint
@@ -287,15 +281,41 @@ impl SingleFileDB {
     *self.checkpoint_status.lock()
   }
 
+  /// Block until no background checkpoint is running.
+  fn wait_for_background_checkpoint(&self) {
+    let mut wait = self.checkpoint_wait.lock();
+    while self.is_checkpoint_running() {
+      self.checkpoint_cv.wait(&mut wait);
+    }
+  }
+
+  /// End a background checkpoint and wake threads waiting for it. Callers
+  /// leave the in-memory checkpoint marker clear.
+  fn set_checkpoint_idle(&self) {
+    *self.checkpoint_status.lock() = CheckpointStatus::Idle;
+    self.notify_checkpoint_waiters();
+  }
+
   /// Trigger a background checkpoint (non-blocking)
   ///
   /// This switches writes to secondary WAL region immediately and starts
   /// the checkpoint process. Writes can continue while checkpoint is running.
   ///
+  /// It does not wait for open transactions to finish, so it starts however
+  /// many are open (it only queues behind a blocking checkpoint or compaction
+  /// that holds the gate). Each open transaction's records so far are copied
+  /// into the secondary region at the cut and its later records go there too,
+  /// so it may commit during or after the checkpoint. New transactions pause
+  /// only while the cut and the install are written. The caller must not have
+  /// its own open transaction (`TransactionInProgress`): a blocking checkpoint
+  /// holding the gate could be waiting for it.
+  ///
   /// Steps:
-  /// 1. Switch writes to secondary WAL region
-  /// 2. Set checkpointInProgress flag (for crash recovery)
-  /// 3. Build new snapshot from primary WAL + current snapshot + delta
+  /// 1. Switch writes to secondary WAL region, copying there the records of
+  ///    transactions still open
+  /// 2. Set checkpointInProgress flag (for crash recovery) and copy the
+  ///    committed delta
+  /// 3. Build new snapshot from the current snapshot + that copy
   /// 4. Write new snapshot to disk
   /// 5. Install a header for the new snapshot that drops every primary
   ///    record: the WAL is empty, or names only the post-cut records still in
@@ -306,37 +326,66 @@ impl SingleFileDB {
     if self.read_only {
       return Err(KiteError::ReadOnly);
     }
-
-    // Check if already running
-    {
-      let mut status = self.checkpoint_status.lock();
-      match *status {
-        CheckpointStatus::Running => {
-          // Already running, just return
-          return Ok(());
-        }
-        CheckpointStatus::Completing => {
-          // Wait for completion by returning
-          return Ok(());
-        }
-        CheckpointStatus::Idle => {
-          *status = CheckpointStatus::Running;
-        }
-      }
-    }
-
-    // Step 1: establish a clean cut. Existing transactions are not erased;
-    // this path declines to start if one is open, while the short write gate
-    // prevents a new transaction from appearing between the check and switch.
-    let checkpoint_gate = self.checkpoint_gate.write();
-    if self.active_transactions.load(Ordering::Acquire) != 0 {
-      drop(checkpoint_gate);
-      *self.checkpoint_status.lock() = CheckpointStatus::Idle;
+    if self.current_tx_handle().is_some() {
       return Err(KiteError::TransactionInProgress);
     }
 
-    let start_result = (|| {
-      let _commit_guard = self.commit_lock.lock();
+    // Claim the checkpoint before taking the gate, so commits that cross the
+    // threshold meanwhile skip it instead of queueing behind it.
+    {
+      let mut status = self.checkpoint_status.lock();
+      if *status != CheckpointStatus::Idle {
+        // Already running or completing
+        return Ok(());
+      }
+      *status = CheckpointStatus::Running;
+    }
+
+    // Steps 1-2: establish a clean cut. The gate excludes blocking
+    // checkpoints and compaction, and holds off a BEGIN record between the
+    // switch and the set of open transactions being read.
+    let checkpoint_gate = self.checkpoint_gate.write();
+    let cut_result = self.cut_background_checkpoint();
+    drop(checkpoint_gate);
+
+    // Steps 3-6
+    let result = cut_result.and_then(|cut_delta| {
+      checkpoint_phase(&self.path, CheckpointPhase::CutReleased)?;
+      let snapshot = self.build_and_write_snapshot(cut_delta)?;
+      self.complete_background_checkpoint(snapshot)
+    });
+    if result.is_err() {
+      self.abandon_background_checkpoint();
+    }
+    result
+  }
+
+  /// Return to idle after a failed background checkpoint. Once the cut
+  /// marker is set, the WAL is first rebuilt in the primary region from both
+  /// regions, so the marker can be cleared without losing a record.
+  fn abandon_background_checkpoint(&self) {
+    if self.header.read().checkpoint_in_progress != 0 {
+      self.recover_from_checkpoint_error();
+    } else {
+      self.set_checkpoint_idle();
+    }
+  }
+
+  /// Switch new WAL writes to the secondary region and durably mark the
+  /// checkpoint in progress. Returns the committed delta as of the cut.
+  ///
+  /// Callers hold the checkpoint gate. Every transaction that commits after
+  /// the cut has all its records in the secondary region: those still open
+  /// are copied there. The snapshot must be built from exactly the pre-cut
+  /// commits: completion replays every post-cut commit over it, and edge and
+  /// label changes are not idempotent (a delete followed by a re-add would
+  /// cancel out if applied twice).
+  ///
+  /// An error after the marker is set leaves it set, for the caller to
+  /// recover from.
+  fn cut_background_checkpoint(&self) -> Result<DeltaState> {
+    let _commit_guard = self.commit_lock.lock();
+    {
       let mut pager = self.pager.lock();
       let mut wal_buffer = self.wal_buffer.lock();
       let mut header = self.header.write();
@@ -353,93 +402,61 @@ impl SingleFileDB {
       wal_buffer.flush(&mut pager)?;
       pager.sync()?;
 
+      // The commit lock holds off COMMIT records and the gate holds off BEGIN
+      // records, so the open set is exact: a transaction that finishes after
+      // it is read has written its COMMIT or ROLLBACK already, or never will.
+      // Collecting the copies first declines a cut they would not fit, before
+      // anything changes.
+      let open = self.open_write_txids.lock().clone();
+      let carried = wal_buffer.open_transaction_records(&open, &mut pager)?;
+
+      let prior_header = header.clone();
+      let prior_wal = wal_buffer.region_state();
       wal_buffer.switch_to_secondary();
       wal_buffer.store_in_header(&mut header);
       header.checkpoint_in_progress = 1;
-      self.persist_header(&mut pager, &mut header, true)
-    })();
-    drop(checkpoint_gate);
-    if let Err(error) = start_result {
-      *self.checkpoint_status.lock() = CheckpointStatus::Idle;
-      return Err(error);
+      if let Err(error) = self.persist_header(&mut pager, &mut header, true) {
+        // The marker may not be durable, so keep appending where the durable
+        // header expects the next record.
+        restore_header(&mut header, prior_header);
+        wal_buffer.restore_region_state(prior_wal);
+        return Err(error);
+      }
+
+      // The durable marker names an empty secondary region, so the copies
+      // cannot clobber records a crash fallback needs; the header of the next
+      // commit names them.
+      wal_buffer.carry_into_secondary(&carried, &mut pager)?;
     }
 
-    // Step 2-4: Build and write snapshot, get the info
-    let snapshot_info = match self.build_and_write_snapshot() {
-      Ok(info) => info,
-      Err(e) => {
-        // On error, try to recover
-        self.recover_from_checkpoint_error();
-        return Err(e);
-      }
-    };
-
-    // Step 5: Complete the checkpoint
-    if let Err(error) = self.complete_background_checkpoint(snapshot_info) {
-      if self.header.read().checkpoint_in_progress != 0 {
-        self.recover_from_checkpoint_error();
-      } else {
-        *self.checkpoint_status.lock() = CheckpointStatus::Idle;
-      }
-      return Err(error);
-    }
-
-    Ok(())
+    // Commits merge into the delta under the commit lock, so this is exactly
+    // the pre-cut state.
+    Ok(self.delta.read().clone())
   }
 
   /// Build and write the snapshot (called during background checkpoint)
-  /// Returns (new_gen, new_snapshot_start_page, new_snapshot_page_count)
-  fn build_and_write_snapshot(&self) -> Result<(u64, u64, u64)> {
-    // Collect all graph data (reads from snapshot + delta)
-    let (nodes, edges, labels, etypes, propkeys, vector_stores) = self.collect_graph_data()?;
+  fn build_and_write_snapshot(&self, cut_delta: DeltaState) -> Result<WrittenSnapshot> {
+    let graph = self.collect_graph_data_from(&cut_delta)?;
+    drop(cut_delta);
 
-    // Get current header state
+    // Snapshot fields do not change while this checkpoint runs; commits only
+    // move the WAL positions.
     let header = self.header.read().clone();
-    let new_gen = header.active_snapshot_gen + 1;
-
-    // Build new snapshot in memory
-    let snapshot_buffer = build_snapshot_to_memory(SnapshotBuildInput {
-      generation: new_gen,
-      nodes,
-      edges,
-      labels,
-      etypes,
-      propkeys,
-      vector_stores: Some(vector_stores),
-      compression: self.checkpoint_compression.clone(),
-    })?;
-
-    let new_snapshot_page_count =
-      pages_to_store(snapshot_buffer.len(), header.page_size as usize) as u64;
-    let new_snapshot_start_page =
-      self.checkpoint_snapshot_start_page(&header, new_snapshot_page_count)?;
-
-    // Write snapshot to file
-    {
-      let mut pager = self.pager.lock();
-      self.write_snapshot_pages(
-        &mut pager,
-        new_snapshot_start_page as u32,
-        &snapshot_buffer,
-        header.page_size as usize,
-      )?;
-    }
-    checkpoint_phase(CheckpointPhase::SnapshotDurable)?;
-
-    Ok((new_gen, new_snapshot_start_page, new_snapshot_page_count))
+    let generation = header.active_snapshot_gen + 1;
+    let snapshot_buffer = self.build_snapshot_buffer(generation, graph)?;
+    self.write_new_snapshot(&header, generation, &snapshot_buffer)
   }
 
   /// Complete the background checkpoint
-  fn complete_background_checkpoint(&self, snapshot_info: (u64, u64, u64)) -> Result<()> {
-    let (new_gen, new_snapshot_start_page, new_snapshot_page_count) = snapshot_info;
-
+  fn complete_background_checkpoint(&self, snapshot: WrittenSnapshot) -> Result<()> {
     // Mark as completing (brief lock period)
     *self.checkpoint_status.lock() = CheckpointStatus::Completing;
 
-    // Stop new transactions for the install window and let every transaction
-    // that began after the cut finish before its secondary WAL is transferred.
+    // The gate excludes blocking checkpoints and compaction until the delta
+    // is replaced below; the commit lock keeps the retained records and that
+    // delta in step. Open transactions keep their records in the secondary
+    // region, which is retained and compacted, and append after them.
     let _checkpoint_gate = self.checkpoint_gate.write();
-    self.wait_for_no_active_transactions();
     let _commit_guard = self.commit_lock.lock();
 
     let post_cut_records;
@@ -448,8 +465,6 @@ impl SingleFileDB {
       let mut pager = self.pager.lock();
       let mut wal_buffer = self.wal_buffer.lock();
       let mut header = self.header.write();
-      let old_snapshot_start_page = header.snapshot_start_page;
-      let old_snapshot_page_count = header.snapshot_page_count;
 
       wal_buffer.flush(&mut pager)?;
       let retain_post_cut = wal_buffer.has_secondary_records();
@@ -459,41 +474,28 @@ impl SingleFileDB {
         Vec::new()
       };
 
-      let cut_header = header.clone();
-      let cut_wal = wal_buffer.region_state();
-
-      header.prev_snapshot_gen = header.active_snapshot_gen;
-      header.active_snapshot_gen = new_gen;
-      header.snapshot_start_page = new_snapshot_start_page;
-      header.snapshot_page_count = new_snapshot_page_count;
-      header.db_size_pages = new_snapshot_start_page + new_snapshot_page_count;
-      header.max_node_id = self.next_node_id.load(Ordering::SeqCst).saturating_sub(1);
-      header.next_tx_id = self.next_tx_id.load(Ordering::SeqCst);
-
       // The new snapshot covers every primary record, so the installed header
       // stops counting them: with no post-cut records the WAL is simply
       // empty; otherwise it names only the post-cut records, still in place
       // in the secondary region. Neither state writes WAL bytes, so the cut
       // header's WAL stays intact as the crash fallback until this header is
-      // durable in both slots.
-      if retain_post_cut {
-        wal_buffer.retire_primary_region();
-      } else {
-        wal_buffer.reset();
-      }
-      wal_buffer.store_in_header(&mut header);
-      header.checkpoint_in_progress = 0;
-      if let Err(error) = self.persist_checkpoint_header(&mut pager, &mut header) {
-        // The cut header may still be the newest durable slot, and it names
-        // the primary region. Restore the cut state (keeping the generation
-        // monotonic) so the caller rebuilds the WAL instead of letting the
-        // next commit overwrite records that header still needs.
-        let change_counter = header.change_counter;
-        *header = cut_header;
-        header.change_counter = change_counter;
-        wal_buffer.restore_region_state(cut_wal);
-        return Err(error);
-      }
+      // durable in both slots. If the install fails, the cut state is
+      // restored (the cut header may still be the newest durable slot, and it
+      // names the primary region), so the caller rebuilds the WAL instead of
+      // letting the next commit overwrite records that header still needs.
+      self.install_snapshot(
+        &mut pager,
+        &mut wal_buffer,
+        &mut header,
+        snapshot,
+        |wal_buffer| {
+          if retain_post_cut {
+            wal_buffer.retire_primary_region();
+          } else {
+            wal_buffer.reset();
+          }
+        },
+      )?;
 
       // Both slots now name the retained secondary records, so the primary
       // region is free to rewrite. A failure leaves the retained state, which
@@ -504,14 +506,6 @@ impl SingleFileDB {
       } else {
         Ok(())
       };
-
-      // Mark old snapshot pages as free (for future vacuum)
-      if old_snapshot_page_count > 0 && old_snapshot_start_page != new_snapshot_start_page {
-        pager.free_pages(
-          old_snapshot_start_page as u32,
-          old_snapshot_page_count as u32,
-        );
-      }
     }
 
     // Reload the new snapshot
@@ -524,8 +518,7 @@ impl SingleFileDB {
     let post_cut_delta = self.replay_records_into_delta(&post_cut_records)?;
     *self.delta.write() = post_cut_delta;
 
-    // Mark as idle
-    *self.checkpoint_status.lock() = CheckpointStatus::Idle;
+    self.set_checkpoint_idle();
 
     compaction_result
   }
@@ -533,9 +526,11 @@ impl SingleFileDB {
   /// Move post-cut records retained in the secondary region to the start of
   /// the primary region, then install a header naming them there.
   ///
-  /// Callers hold the commit lock with no transaction active, and every valid
-  /// header slot names the retained secondary records rather than the primary
-  /// region, so rewriting primary bytes cannot damage a crash fallback.
+  /// Callers hold the commit lock and the WAL buffer, so no record is written
+  /// meanwhile; open transactions append after the rewritten records. Every
+  /// valid header slot names the retained secondary records rather than the
+  /// primary region, so rewriting primary bytes cannot damage a crash
+  /// fallback.
   ///
   /// If the rewrite fails, the buffer stays in the retained state the durable
   /// header names. If only the header install fails, the buffer keeps the
@@ -549,7 +544,7 @@ impl SingleFileDB {
     wal_buffer: &mut WalBuffer,
     header: &mut DbHeaderV1,
   ) -> Result<()> {
-    checkpoint_phase(CheckpointPhase::PostCutWalRetained)?;
+    checkpoint_phase(&self.path, CheckpointPhase::PostCutWalRetained)?;
     wal_buffer.compact_secondary_into_primary(pager)?;
     wal_buffer.store_in_header(header);
     self.persist_checkpoint_header(pager, header)
@@ -618,30 +613,31 @@ impl SingleFileDB {
   fn recover_from_checkpoint_error(&self) {
     // Rebuild a clean primary WAL before clearing the marker. This preserves
     // both pre-cut and post-cut committed records if the snapshot build fails.
-    let _commit_guard = self.commit_lock.lock();
-    let mut pager = self.pager.lock();
-    let mut wal_buffer = self.wal_buffer.lock();
-    let mut header = self.header.write();
-
-    if let Err(error) = wal_buffer
-      .recover_incomplete_checkpoint(&mut pager)
-      .and_then(|_| wal_buffer.flush(&mut pager))
-      .and_then(|_| pager.sync())
     {
-      eprintln!("Warning: Failed to rebuild checkpoint WAL during recovery: {error}");
+      let _commit_guard = self.commit_lock.lock();
+      let mut pager = self.pager.lock();
+      let mut wal_buffer = self.wal_buffer.lock();
+      let mut header = self.header.write();
+
+      if let Err(error) = wal_buffer
+        .recover_incomplete_checkpoint(&mut pager)
+        .and_then(|_| wal_buffer.flush(&mut pager))
+        .and_then(|_| pager.sync())
+      {
+        eprintln!("Warning: Failed to rebuild checkpoint WAL during recovery: {error}");
+      }
+
+      wal_buffer.store_in_header(&mut header);
+      header.checkpoint_in_progress = 0;
+      if let Err(error) = self.persist_header(&mut pager, &mut header, false) {
+        eprintln!("Warning: Failed to write checkpoint header during recovery: {error}");
+      }
+      if let Err(error) = pager.sync() {
+        eprintln!("Warning: Failed to sync checkpoint header during recovery: {error}");
+      }
     }
 
-    wal_buffer.store_in_header(&mut header);
-    header.checkpoint_in_progress = 0;
-    if let Err(error) = self.persist_header(&mut pager, &mut header, false) {
-      eprintln!("Warning: Failed to write checkpoint header during recovery: {error}");
-    }
-    if let Err(error) = pager.sync() {
-      eprintln!("Warning: Failed to sync checkpoint header during recovery: {error}");
-    }
-
-    // Mark as idle
-    *self.checkpoint_status.lock() = CheckpointStatus::Idle;
+    self.set_checkpoint_idle();
   }
 
   /// Return an append-only page range for a new snapshot. The file may retain
@@ -714,20 +710,141 @@ impl SingleFileDB {
     Ok(())
   }
 
+  /// Install `header` durably in both slots.
+  ///
+  /// If the first slot never becomes durable, the next header write targets
+  /// that slot again: it may hold a torn or unsynced copy of `header`, while
+  /// the other slot holds the last durable header, which must stay the crash
+  /// fallback until a newer header is durable.
   fn persist_checkpoint_header(
     &self,
     pager: &mut FilePager,
     header: &mut DbHeaderV1,
   ) -> Result<()> {
-    self.persist_header(pager, header, false)?;
-    checkpoint_phase(CheckpointPhase::HeaderWritten)?;
-    pager.sync()?;
-    checkpoint_phase(CheckpointPhase::HeaderDurable)?;
+    let durable_slot = self.header_slot.load(Ordering::Acquire);
+    let first_slot = self
+      .persist_header(pager, header, false)
+      .and_then(|()| checkpoint_phase(&self.path, CheckpointPhase::HeaderWritten))
+      .and_then(|()| pager.sync());
+    if let Err(error) = first_slot {
+      self.header_slot.store(durable_slot, Ordering::Release);
+      return Err(error);
+    }
+    checkpoint_phase(&self.path, CheckpointPhase::HeaderDurable)?;
 
     // Rotate the installed header into the other slot before retiring the old
     // snapshot. After this fsync both valid slots name `header`'s snapshot, so
     // no fallback can reach the region placed on the free list.
     self.persist_header(pager, header, true)
+  }
+
+  /// Install `snapshot`, with the WAL state `retire_wal` leaves, in both
+  /// header slots.
+  ///
+  /// Until both slots are durable a crash may still select the previous
+  /// header, so a failure returns the in-memory header and WAL to it: later
+  /// commits append after the WAL records that header names instead of
+  /// overwriting them. The failed install may have left `snapshot` named in a
+  /// slot, so its pages stay out of reuse until a later install is durable in
+  /// both slots; the previous snapshot's pages are not freed.
+  pub(crate) fn install_snapshot(
+    &self,
+    pager: &mut FilePager,
+    wal_buffer: &mut WalBuffer,
+    header: &mut DbHeaderV1,
+    snapshot: WrittenSnapshot,
+    retire_wal: impl FnOnce(&mut WalBuffer),
+  ) -> Result<()> {
+    // `WalBuffer::reset` drops buffered bytes, which a failed install must
+    // keep, so write them out first.
+    wal_buffer.flush(pager)?;
+    let prior_header = header.clone();
+    let prior_wal = wal_buffer.region_state();
+
+    header.prev_snapshot_gen = header.active_snapshot_gen;
+    header.active_snapshot_gen = snapshot.generation;
+    header.snapshot_start_page = snapshot.start_page;
+    header.snapshot_page_count = snapshot.page_count;
+    header.db_size_pages = snapshot.start_page + snapshot.page_count;
+    header.max_node_id = self.next_node_id.load(Ordering::SeqCst).saturating_sub(1);
+    header.next_tx_id = self.next_tx_id.load(Ordering::SeqCst);
+
+    // Record every region field: a stale primary head or active region would
+    // make the next open append after, or re-merge, records this snapshot
+    // already covers.
+    retire_wal(wal_buffer);
+    wal_buffer.store_in_header(header);
+    header.checkpoint_in_progress = 0;
+
+    if let Err(error) = self.persist_checkpoint_header(pager, header) {
+      restore_header(header, prior_header);
+      wal_buffer.restore_region_state(prior_wal);
+      pager.defer_free_pages(snapshot.start_page as u32, snapshot.page_count as u32);
+      return Err(error);
+    }
+
+    // Both slots name `snapshot`, so no fallback can reach the previous
+    // snapshot or one left by an earlier failed install.
+    if prior_header.snapshot_page_count > 0
+      && prior_header.snapshot_start_page != snapshot.start_page
+    {
+      pager.free_pages(
+        prior_header.snapshot_start_page as u32,
+        prior_header.snapshot_page_count as u32,
+      );
+    }
+    pager.release_deferred_free_pages();
+    Ok(())
+  }
+
+  /// Serialize a checkpoint snapshot of `graph`.
+  fn build_snapshot_buffer(&self, generation: u64, graph: GraphData) -> Result<Vec<u8>> {
+    let (nodes, edges, labels, etypes, propkeys, vector_stores) = graph;
+    build_snapshot_to_memory(SnapshotBuildInput {
+      generation,
+      nodes,
+      edges,
+      labels,
+      etypes,
+      propkeys,
+      vector_stores: Some(vector_stores),
+      compression: self.checkpoint_compression.clone(),
+    })
+  }
+
+  /// Write `buffer` to pages no valid header names and sync it.
+  fn write_new_snapshot(
+    &self,
+    header: &DbHeaderV1,
+    generation: u64,
+    buffer: &[u8],
+  ) -> Result<WrittenSnapshot> {
+    let page_size = header.page_size as usize;
+    let page_count = pages_to_store(buffer.len(), page_size) as u64;
+    // Never reuse the installed snapshot's pages. Orphaned pages from an
+    // interrupted checkpoint are also skipped; vacuum owns reclamation.
+    let start_page = self.checkpoint_snapshot_start_page(header, page_count)?;
+
+    let written = {
+      let mut pager = self.pager.lock();
+      self.write_snapshot_pages(&mut pager, start_page as u32, buffer, page_size)
+    };
+    if let Err(error) =
+      written.and_then(|()| checkpoint_phase(&self.path, CheckpointPhase::SnapshotDurable))
+    {
+      // No header names these pages yet, so they are reusable right away.
+      self
+        .pager
+        .lock()
+        .free_pages(start_page as u32, page_count as u32);
+      return Err(error);
+    }
+
+    Ok(WrittenSnapshot {
+      generation,
+      start_page,
+      page_count,
+    })
   }
 
   /// Write snapshot buffer to file pages
@@ -755,7 +872,7 @@ impl SingleFileDB {
       let src_end = std::cmp::min(src_offset + page_size, buffer.len());
       page_data[..src_end - src_offset].copy_from_slice(&buffer[src_offset..src_end]);
       pager.write_page(start_page + i, &page_data)?;
-      checkpoint_phase(CheckpointPhase::SnapshotPageWritten)?;
+      checkpoint_phase(&self.path, CheckpointPhase::SnapshotPageWritten)?;
     }
 
     // Sync to disk
@@ -766,13 +883,17 @@ impl SingleFileDB {
 
   /// Collect all graph data from snapshot + delta
   pub(crate) fn collect_graph_data(&self) -> Result<GraphData> {
+    let delta = self.delta.read();
+    self.collect_graph_data_from(&delta)
+  }
+
+  /// Collect all graph data from snapshot + `delta`
+  fn collect_graph_data_from(&self, delta: &DeltaState) -> Result<GraphData> {
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
     let mut labels = HashMap::new();
     let mut etypes = HashMap::new();
     let mut propkeys = HashMap::new();
-
-    let delta = self.delta.read();
 
     // First, copy schema from our in-memory maps
     for (&id, name) in self.label_ids.read().iter() {
@@ -1000,10 +1121,12 @@ impl SingleFileDB {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::core::header::other_header_slot;
   use crate::core::single_file::{open_single_file, SingleFileOpenOptions};
   use std::fs::OpenOptions as FsOpenOptions;
   use std::io::{Seek, SeekFrom, Write};
   use std::sync::{mpsc, Arc, Barrier};
+  use std::time::Duration;
   use tempfile::tempdir;
 
   fn seeded_db(path: &std::path::Path) -> (SingleFileDB, SingleFileOpenOptions) {
@@ -1127,7 +1250,11 @@ mod tests {
     ready_rx.recv().expect("expected value");
 
     let gate_barrier = Arc::new(Barrier::new(2));
-    set_checkpoint_test_barrier(CheckpointPhase::GateAcquired, Arc::clone(&gate_barrier));
+    set_checkpoint_test_barrier(
+      &db,
+      CheckpointPhase::GateAcquired,
+      Arc::clone(&gate_barrier),
+    );
     let checkpoint_db = Arc::clone(&db);
     let checkpoint_thread = std::thread::spawn(move || checkpoint_db.checkpoint());
     gate_barrier.wait();
@@ -1161,7 +1288,11 @@ mod tests {
     db.commit().expect("expected value");
 
     let cut_barrier = Arc::new(Barrier::new(2));
-    set_checkpoint_test_barrier(CheckpointPhase::SnapshotDurable, Arc::clone(&cut_barrier));
+    set_checkpoint_test_barrier(
+      &db,
+      CheckpointPhase::SnapshotDurable,
+      Arc::clone(&cut_barrier),
+    );
     let checkpoint_db = Arc::clone(&db);
     let checkpoint_thread = std::thread::spawn(move || checkpoint_db.background_checkpoint());
     cut_barrier.wait();
@@ -1189,7 +1320,11 @@ mod tests {
     post_cut: impl FnOnce(&SingleFileDB),
   ) -> Result<()> {
     let cut_barrier = Arc::new(Barrier::new(2));
-    set_checkpoint_test_barrier(CheckpointPhase::SnapshotDurable, Arc::clone(&cut_barrier));
+    set_checkpoint_test_barrier(
+      db,
+      CheckpointPhase::SnapshotDurable,
+      Arc::clone(&cut_barrier),
+    );
     let checkpoint_db = Arc::clone(db);
     let checkpoint_thread = std::thread::spawn(move || {
       set_checkpoint_test_fault(fault);
@@ -1536,5 +1671,692 @@ mod tests {
       final_size < initial_size + growth_budget,
       "checkpoint file grew from {initial_size} to {final_size} with snapshot size {snapshot_size}"
     );
+  }
+
+  /// A blocking checkpoint whose header install fails must leave the WAL the
+  /// old header names untouched. Regression: the WAL was reset in memory before
+  /// the header write, so the next commit overwrote records the on-disk header
+  /// still pointed at.
+  #[test]
+  fn failed_blocking_checkpoint_header_install_keeps_old_wal_intact() {
+    let _serial = checkpoint_test_serial();
+    let temp_dir = tempdir().expect("expected value");
+    let db_path = temp_dir.path().join("failed-header-install.kitedb");
+    // "new-node" exists only in the WAL; "old-*" are in the snapshot.
+    let (db, options) = seeded_db(&db_path);
+
+    let header_bytes = 2 * db.header.read().page_size as usize;
+    let mut original_header_pages = vec![0u8; header_bytes];
+    {
+      use std::io::Read;
+      let mut file = std::fs::File::open(&db_path).expect("open file");
+      file
+        .read_exact(&mut original_header_pages)
+        .expect("read header pages");
+    }
+
+    // The header slot write never becomes durable.
+    set_checkpoint_test_fault(Some(CheckpointPhase::HeaderWritten));
+    assert!(db.checkpoint().is_err());
+
+    // The process keeps running and commits again.
+    db.begin(false).expect("expected value");
+    db.create_node(Some("after-failed-checkpoint"))
+      .expect("expected value");
+    db.commit().expect("expected value");
+    drop(db);
+
+    // Crash model: neither the checkpoint's unsynced header write nor the
+    // commit's header write reached the disk, but the commit's WAL write did.
+    // The pre-checkpoint header is authoritative and must still find its WAL.
+    {
+      let mut file = FsOpenOptions::new()
+        .write(true)
+        .open(&db_path)
+        .expect("open for write");
+      file.seek(SeekFrom::Start(0)).expect("seek");
+      file
+        .write_all(&original_header_pages)
+        .expect("restore header pages");
+      file.sync_all().expect("sync");
+    }
+
+    let reopened = open_single_file(&db_path, options).expect("reopen");
+    assert!(reopened.node_by_key("old-0").is_some());
+    assert!(
+      reopened.node_by_key("new-node").is_some(),
+      "a commit made after a failed checkpoint overwrote WAL records the old header still names"
+    );
+  }
+
+  fn read_header_pages(db_path: &std::path::Path, page_size: u32) -> Vec<u8> {
+    let bytes = std::fs::read(db_path).expect("read database file");
+    bytes[..2 * page_size as usize].to_vec()
+  }
+
+  fn write_header_pages(db_path: &std::path::Path, pages: &[u8]) {
+    let mut file = FsOpenOptions::new()
+      .write(true)
+      .open(db_path)
+      .expect("open for write");
+    file.write_all(pages).expect("restore header pages");
+    file.sync_all().expect("sync");
+  }
+
+  /// Open a copy of the file as it is now: the state a crash would leave.
+  fn open_crash_copy(db_path: &std::path::Path, options: &SingleFileOpenOptions) -> SingleFileDB {
+    let copy_path = db_path.with_extension("crash.kitedb");
+    std::fs::copy(db_path, &copy_path).expect("copy database file");
+    open_single_file(&copy_path, options.clone()).expect("open crash copy")
+  }
+
+  /// The slot a failed install wrote may hold a torn or unsynced header, so
+  /// the next header write must go there instead of over the durable slot.
+  #[test]
+  fn failed_checkpoint_install_keeps_durable_header_slot_as_fallback() {
+    let _serial = checkpoint_test_serial();
+    let temp_dir = tempdir().expect("temp dir");
+    let db_path = temp_dir.path().join("failed-install-slot.kitedb");
+    let (db, _options) = seeded_db(&db_path);
+    let durable_slot = db.header_slot.load(Ordering::Acquire);
+    let page_size = db.header.read().page_size as usize;
+    let slot_bytes = |slot: u32| {
+      let bytes = std::fs::read(&db_path).expect("read database file");
+      let start = slot as usize * page_size;
+      bytes[start..start + page_size].to_vec()
+    };
+    let durable_bytes = slot_bytes(durable_slot);
+
+    set_checkpoint_test_fault(Some(CheckpointPhase::HeaderWritten));
+    assert!(db.checkpoint().is_err());
+    assert_eq!(db.header_slot.load(Ordering::Acquire), durable_slot);
+
+    commit_node(&db, "after-failed-checkpoint");
+    assert_eq!(
+      db.header_slot.load(Ordering::Acquire),
+      other_header_slot(durable_slot)
+    );
+    assert!(
+      slot_bytes(durable_slot) == durable_bytes,
+      "a commit overwrote the last durable header slot"
+    );
+  }
+
+  /// After a failed install, a header slot may still name the unused
+  /// snapshot, so its pages stay out of reuse until the next checkpoint is
+  /// installed in both slots; that checkpoint then reclaims them.
+  #[test]
+  fn checkpoint_after_failed_install_reclaims_unused_snapshot_pages() {
+    let _serial = checkpoint_test_serial();
+    for (index, phase) in [
+      CheckpointPhase::HeaderWritten,
+      CheckpointPhase::HeaderDurable,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+      let temp_dir = tempdir().expect("temp dir");
+      let db_path = temp_dir
+        .path()
+        .join(format!("failed-install-reclaim-{index}.kitedb"));
+      let (db, options) = seeded_db(&db_path);
+      let installed = db.header.read().clone();
+
+      set_checkpoint_test_fault(Some(phase));
+      assert!(db.checkpoint().is_err(), "phase {phase:?} should abort");
+      let header = db.header.read().clone();
+      assert_eq!(
+        (
+          header.active_snapshot_gen,
+          header.snapshot_start_page,
+          header.wal_head
+        ),
+        (
+          installed.active_snapshot_gen,
+          installed.snapshot_start_page,
+          installed.wal_head
+        ),
+        "memory must keep describing the installed snapshot and its WAL"
+      );
+      let unused = db.pager.lock().deferred_free_page_list();
+      assert!(!unused.is_empty());
+
+      // Commits keep appending after the WAL records the old header names.
+      commit_node(&db, "after-failure");
+      let crashed = open_crash_copy(&db_path, &options);
+      for key in ["old-0", "new-node", "after-failure"] {
+        assert!(
+          crashed.node_by_key(key).is_some(),
+          "{key} missing after a crash following {phase:?}"
+        );
+      }
+      drop(crashed);
+
+      db.checkpoint().expect("checkpoint after failed install");
+      let header = db.header.read().clone();
+      let installed_range =
+        header.snapshot_start_page..header.snapshot_start_page + header.snapshot_page_count;
+      assert!(
+        unused
+          .iter()
+          .all(|page| !installed_range.contains(&(*page as u64))),
+        "pages a header slot may name were reused"
+      );
+      {
+        let pager = db.pager.lock();
+        assert!(pager.deferred_free_page_list().is_empty());
+        let file_pages = (pager.file_size() / header.page_size as u64) as u32;
+        assert!(
+          unused
+            .iter()
+            .all(|&page| page >= file_pages || pager.is_range_free(page, page + 1)),
+          "unused snapshot pages leaked"
+        );
+      }
+      for key in ["old-0", "new-node", "after-failure"] {
+        assert!(db.node_by_key(key).is_some(), "{key} missing live");
+      }
+
+      drop(db);
+      let reopened = open_single_file(&db_path, options).expect("reopen");
+      for key in ["old-0", "new-node", "after-failure"] {
+        assert!(
+          reopened.node_by_key(key).is_some(),
+          "{key} missing after {phase:?}"
+        );
+      }
+    }
+  }
+
+  /// Optimize installs its snapshot the same way, so a failed install must
+  /// also leave later commits appending after the old WAL.
+  #[test]
+  fn failed_optimize_header_install_keeps_old_wal_intact() {
+    let _serial = checkpoint_test_serial();
+    let temp_dir = tempdir().expect("temp dir");
+    let db_path = temp_dir.path().join("failed-optimize-install.kitedb");
+    let (db, options) = seeded_db(&db_path);
+    let original_header_pages = read_header_pages(&db_path, db.header.read().page_size);
+
+    set_checkpoint_test_fault(Some(CheckpointPhase::HeaderWritten));
+    assert!(db.optimize_single_file(None).is_err());
+    commit_node(&db, "after-failed-optimize");
+    drop(db);
+
+    // Neither header write reached the disk; the commit's WAL write did.
+    write_header_pages(&db_path, &original_header_pages);
+    let reopened = open_single_file(&db_path, options).expect("reopen");
+    assert!(reopened.node_by_key("old-0").is_some());
+    assert!(reopened.node_by_key("new-node").is_some());
+  }
+
+  /// A background checkpoint starts while another thread's write transaction
+  /// is open, without waiting for it. The transaction commits between the cut
+  /// and the install, and survives a crash at that point, the install, and a
+  /// reopen, applied exactly once.
+  #[test]
+  fn background_checkpoint_carries_transaction_open_at_the_cut() {
+    let _serial = checkpoint_test_serial();
+    let temp_dir = tempdir().expect("temp dir");
+    let db_path = temp_dir.path().join("checkpoint-background-open-tx.kitedb");
+    let options = SingleFileOpenOptions::new().auto_checkpoint(false);
+    let db = Arc::new(open_single_file(&db_path, options.clone()).expect("open"));
+
+    // The edge is in the snapshot and deleted in the delta, so applying the
+    // open transaction's re-add twice would list it twice.
+    db.begin(false).expect("begin");
+    let a = db.create_node(Some("a")).expect("node a");
+    let b = db.create_node(Some("b")).expect("node b");
+    let knows = db.define_etype("knows").expect("etype");
+    db.add_edge(a, knows, b).expect("edge");
+    db.commit().expect("commit");
+    db.checkpoint().expect("checkpoint");
+    db.begin(false).expect("begin");
+    db.delete_edge(a, knows, b).expect("delete edge");
+    db.commit().expect("commit");
+
+    let (opened_tx, opened_rx) = mpsc::channel();
+    let (cut_tx, cut_rx) = mpsc::channel::<()>();
+    let writer_db = Arc::clone(&db);
+    let writer = std::thread::spawn(move || {
+      writer_db.begin(false).expect("begin");
+      writer_db.add_edge(a, knows, b).expect("re-add before cut");
+      writer_db
+        .create_node(Some("open-at-cut"))
+        .expect("create before cut");
+      opened_tx.send(()).expect("signal open");
+      cut_rx.recv().expect("wait for cut");
+      writer_db
+        .create_node(Some("written-after-cut"))
+        .expect("create after cut");
+      writer_db.commit().expect("commit");
+    });
+    opened_rx.recv().expect("writer opened");
+
+    let expected_keys = ["a", "b", "open-at-cut", "written-after-cut"];
+    let crash_options = options.clone();
+    background_checkpoint_with_post_cut(&db, None, move |db| {
+      cut_tx.send(()).expect("release writer");
+      writer.join().expect("writer thread");
+
+      // Crash with the cut marker durable: open merges both WAL regions,
+      // which hold the writer's pre-cut records twice.
+      let crashed = open_crash_copy(db.path(), &crash_options);
+      for key in expected_keys {
+        assert!(
+          crashed.node_by_key(key).is_some(),
+          "{key} missing after crash"
+        );
+      }
+      assert_eq!(crashed.out_edges(a), vec![(knows, b)]);
+    })
+    .expect("background checkpoint");
+
+    assert!(!db.is_checkpoint_running());
+    for key in expected_keys {
+      assert!(db.node_by_key(key).is_some(), "{key} missing live");
+    }
+    assert_eq!(db.out_edges(a), vec![(knows, b)]);
+
+    drop(db);
+    let reopened = open_single_file(&db_path, options).expect("reopen");
+    for key in expected_keys {
+      assert!(reopened.node_by_key(key).is_some(), "{key} missing");
+    }
+    assert_eq!(reopened.out_edges(a), vec![(knows, b)]);
+  }
+
+  /// A transaction open for the whole background checkpoint, including the
+  /// install, keeps working and commits afterwards.
+  #[test]
+  fn transaction_open_across_background_checkpoint_commits_after_install() {
+    let _serial = checkpoint_test_serial();
+    let temp_dir = tempdir().expect("temp dir");
+    let db_path = temp_dir.path().join("checkpoint-background-long-tx.kitedb");
+    let options = SingleFileOpenOptions::new().auto_checkpoint(false);
+    let db = Arc::new(open_single_file(&db_path, options.clone()).expect("open"));
+    commit_node(&db, "before");
+
+    let (opened_tx, opened_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let writer_db = Arc::clone(&db);
+    let writer = std::thread::spawn(move || {
+      writer_db.begin(false).expect("begin");
+      writer_db.create_node(Some("long-1")).expect("create");
+      opened_tx.send(()).expect("signal open");
+      done_rx.recv().expect("wait for checkpoint");
+      writer_db.create_node(Some("long-2")).expect("create");
+      writer_db.commit().expect("commit");
+    });
+    opened_rx.recv().expect("writer opened");
+
+    db.background_checkpoint().expect("background checkpoint");
+    commit_node(&db, "after-install");
+    done_tx.send(()).expect("release writer");
+    writer.join().expect("writer thread");
+
+    for key in ["before", "long-1", "long-2", "after-install"] {
+      assert!(db.node_by_key(key).is_some(), "{key} missing live");
+    }
+    drop(db);
+    let reopened = open_single_file(&db_path, options).expect("reopen");
+    for key in ["before", "long-1", "long-2", "after-install"] {
+      assert!(reopened.node_by_key(key).is_some(), "{key} missing");
+    }
+  }
+
+  /// The background snapshot holds exactly the commits before the cut. Later
+  /// commits are replayed over it at completion; had the snapshot already
+  /// applied the delete, the re-add would cancel the replayed delete instead
+  /// of restoring the edge.
+  #[test]
+  fn background_snapshot_holds_only_pre_cut_commits() {
+    let _serial = checkpoint_test_serial();
+    let temp_dir = tempdir().expect("temp dir");
+    let db_path = temp_dir
+      .path()
+      .join("checkpoint-background-cut-state.kitedb");
+    let options = SingleFileOpenOptions::new().auto_checkpoint(false);
+    let db = Arc::new(open_single_file(&db_path, options.clone()).expect("open"));
+    db.begin(false).expect("begin");
+    let a = db.create_node(Some("a")).expect("node a");
+    let b = db.create_node(Some("b")).expect("node b");
+    let knows = db.define_etype("knows").expect("etype");
+    db.add_edge(a, knows, b).expect("edge");
+    db.commit().expect("commit");
+
+    let released = Arc::new(Barrier::new(2));
+    let written = Arc::new(Barrier::new(2));
+    set_checkpoint_test_barrier(&db, CheckpointPhase::CutReleased, Arc::clone(&released));
+    set_checkpoint_test_barrier(&db, CheckpointPhase::SnapshotDurable, Arc::clone(&written));
+    let checkpoint_db = Arc::clone(&db);
+    let checkpoint_thread = std::thread::spawn(move || checkpoint_db.background_checkpoint());
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while db.header.read().checkpoint_in_progress == 0 {
+      assert!(std::time::Instant::now() < deadline, "cut never happened");
+      std::thread::yield_now();
+    }
+    // After the cut, before the snapshot is collected.
+    db.begin(false).expect("begin");
+    db.delete_edge(a, knows, b).expect("delete edge");
+    db.commit().expect("commit");
+    released.wait();
+    // After the snapshot is written.
+    written.wait();
+    db.begin(false).expect("begin");
+    db.add_edge(a, knows, b).expect("re-add edge");
+    db.commit().expect("commit");
+    checkpoint_thread
+      .join()
+      .expect("checkpoint thread")
+      .expect("background checkpoint");
+
+    assert_eq!(db.out_edges(a), vec![(knows, b)]);
+    drop(db);
+    let reopened = open_single_file(&db_path, options).expect("reopen");
+    assert_eq!(reopened.out_edges(a), vec![(knows, b)]);
+  }
+
+  /// A blocking checkpoint must not run between a background checkpoint's
+  /// cut and its install: it would reset the WAL holding the post-cut
+  /// commits, and the background install would then replace its snapshot.
+  #[test]
+  fn blocking_checkpoint_waits_for_running_background_checkpoint() {
+    let _serial = checkpoint_test_serial();
+    let temp_dir = tempdir().expect("temp dir");
+    let db_path = temp_dir
+      .path()
+      .join("checkpoint-blocking-during-background.kitedb");
+    let options = SingleFileOpenOptions::new().auto_checkpoint(false);
+    let db = Arc::new(open_single_file(&db_path, options.clone()).expect("open"));
+    commit_node(&db, "before-cut");
+
+    let blocking_db = Arc::clone(&db);
+    let mut blocking = None;
+    background_checkpoint_with_post_cut(&db, None, |db| {
+      commit_node(db, "after-cut");
+      let handle = std::thread::spawn(move || blocking_db.checkpoint());
+      std::thread::sleep(Duration::from_millis(100));
+      assert!(
+        !handle.is_finished(),
+        "blocking checkpoint ran inside a background checkpoint"
+      );
+      blocking = Some(handle);
+    })
+    .expect("background checkpoint");
+    blocking
+      .expect("blocking checkpoint thread")
+      .join()
+      .expect("blocking checkpoint thread")
+      .expect("blocking checkpoint");
+
+    for key in ["before-cut", "after-cut"] {
+      assert!(db.node_by_key(key).is_some(), "{key} missing live");
+    }
+    drop(db);
+    let reopened = open_single_file(&db_path, options).expect("reopen");
+    for key in ["before-cut", "after-cut"] {
+      assert!(reopened.node_by_key(key).is_some(), "{key} missing");
+    }
+  }
+
+  /// A blocking checkpoint holding the gate could be waiting for the
+  /// caller's own transaction, so the caller is refused instead.
+  #[test]
+  fn background_checkpoint_refuses_callers_open_transaction() {
+    let _serial = checkpoint_test_serial();
+    let temp_dir = tempdir().expect("temp dir");
+    let db_path = temp_dir.path().join("checkpoint-background-own-tx.kitedb");
+    let db = open_single_file(
+      &db_path,
+      SingleFileOpenOptions::new().auto_checkpoint(false),
+    )
+    .expect("open");
+    db.begin(false).expect("begin");
+    db.create_node(Some("mine")).expect("create");
+    assert!(matches!(
+      db.background_checkpoint(),
+      Err(KiteError::TransactionInProgress)
+    ));
+    assert_eq!(db.checkpoint_status(), CheckpointStatus::Idle);
+    db.commit().expect("commit");
+    db.background_checkpoint().expect("background checkpoint");
+    assert!(db.node_by_key("mine").is_some());
+  }
+
+  /// A thread with an open transaction that calls `begin` again while a
+  /// checkpoint holds the gate (waiting for that very transaction) gets an
+  /// error instead of blocking on the gate forever.
+  #[test]
+  fn begin_inside_open_transaction_fails_while_checkpoint_holds_gate() {
+    let _serial = checkpoint_test_serial();
+    let temp_dir = tempdir().expect("temp dir");
+    let db_path = temp_dir.path().join("checkpoint-nested-begin.kitedb");
+    let db = Arc::new(
+      open_single_file(
+        &db_path,
+        SingleFileOpenOptions::new().auto_checkpoint(false),
+      )
+      .expect("open"),
+    );
+
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let (result_tx, result_rx) = mpsc::channel();
+    let worker_db = Arc::clone(&db);
+    let worker = std::thread::spawn(move || {
+      worker_db.begin(false).expect("begin");
+      worker_db.create_node(Some("worker")).expect("create");
+      ready_tx.send(()).expect("signal ready");
+      go_rx.recv().expect("wait for gate");
+      let nested = worker_db.begin(false);
+      result_tx
+        .send(matches!(nested, Err(KiteError::TransactionInProgress)))
+        .expect("send result");
+      worker_db.commit().expect("commit");
+    });
+    ready_rx.recv().expect("worker ready");
+
+    let gate_barrier = Arc::new(Barrier::new(2));
+    set_checkpoint_test_barrier(
+      &db,
+      CheckpointPhase::GateAcquired,
+      Arc::clone(&gate_barrier),
+    );
+    let checkpoint_db = Arc::clone(&db);
+    let checkpoint_thread = std::thread::spawn(move || checkpoint_db.checkpoint());
+    gate_barrier.wait();
+    go_tx.send(()).expect("release worker");
+
+    let refused = result_rx
+      .recv_timeout(Duration::from_secs(10))
+      .expect("nested begin blocked on the checkpoint gate");
+    assert!(refused, "nested begin must fail with TransactionInProgress");
+    worker.join().expect("worker thread");
+    checkpoint_thread
+      .join()
+      .expect("checkpoint thread")
+      .expect("checkpoint");
+    assert!(db.node_by_key("worker").is_some());
+  }
+
+  /// An auto background checkpoint triggered by one thread's commit starts
+  /// and finishes while another thread holds its transaction open, so it
+  /// neither waits for that thread nor gives up.
+  #[test]
+  fn auto_background_checkpoint_runs_while_another_thread_holds_a_transaction() {
+    let _serial = checkpoint_test_serial();
+    let temp_dir = tempdir().expect("temp dir");
+    let db_path = temp_dir.path().join("checkpoint-auto-open-tx.kitedb");
+    let options = SingleFileOpenOptions::new()
+      .wal_size(64 * 1024)
+      .auto_checkpoint(true)
+      .checkpoint_threshold(0.5)
+      .background_checkpoint(true);
+    let db = Arc::new(open_single_file(&db_path, options.clone()).expect("open"));
+
+    let (opened_tx, opened_rx) = mpsc::channel();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let holder_db = Arc::clone(&db);
+    let holder = std::thread::spawn(move || {
+      holder_db.begin(false).expect("begin");
+      holder_db.create_node(Some("held-open")).expect("create");
+      opened_tx.send(()).expect("signal open");
+      go_rx.recv().expect("wait");
+      holder_db.commit().expect("commit");
+    });
+    opened_rx.recv().expect("holder opened");
+
+    let start_gen = db.header.read().active_snapshot_gen;
+    let (done_tx, done_rx) = mpsc::channel();
+    let committer_db = Arc::clone(&db);
+    let committer = std::thread::spawn(move || {
+      let mut index = 0;
+      while committer_db.header.read().active_snapshot_gen < start_gen + 2 {
+        assert!(index < 5000, "auto checkpoints never ran");
+        commit_node(&committer_db, &format!("c-{index}"));
+        index += 1;
+      }
+      done_tx.send(index).expect("send count");
+    });
+    let commits = done_rx
+      .recv_timeout(Duration::from_secs(60))
+      .expect("committer stalled behind the open transaction");
+    committer.join().expect("committer thread");
+
+    go_tx.send(()).expect("release holder");
+    holder.join().expect("holder thread");
+    assert!(db.node_by_key("held-open").is_some());
+
+    let db = Arc::try_unwrap(db).ok().expect("sole owner");
+    crate::core::single_file::close_single_file(db).expect("close");
+    let reopened = open_single_file(&db_path, options).expect("reopen");
+    assert!(reopened.node_by_key("held-open").is_some());
+    assert!(reopened.node_by_key("c-0").is_some());
+    assert!(reopened
+      .node_by_key(&format!("c-{}", commits - 1))
+      .is_some());
+  }
+
+  /// When an open transaction's records do not fit in the secondary region,
+  /// the background checkpoint declines before its cut, and the transaction
+  /// commits in the primary region as usual.
+  #[test]
+  fn background_checkpoint_declines_when_open_transactions_do_not_fit() {
+    let _serial = checkpoint_test_serial();
+    let temp_dir = tempdir().expect("temp dir");
+    let db_path = temp_dir
+      .path()
+      .join("checkpoint-background-carry-full.kitedb");
+    let options = SingleFileOpenOptions::new()
+      .wal_size(64 * 1024)
+      .auto_checkpoint(false);
+    let db = Arc::new(open_single_file(&db_path, options.clone()).expect("open"));
+    commit_node(&db, "before");
+
+    // About 20 KiB of records: more than the 16 KiB secondary region.
+    let (opened_tx, opened_rx) = mpsc::channel();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let writer_db = Arc::clone(&db);
+    let writer = std::thread::spawn(move || {
+      writer_db.begin(false).expect("begin");
+      for index in 0..10 {
+        let key = format!("big-{index}-{}", "x".repeat(2000));
+        writer_db.create_node(Some(&key)).expect("create");
+      }
+      opened_tx.send(()).expect("signal open");
+      go_rx.recv().expect("wait");
+      writer_db.commit().expect("commit");
+    });
+    opened_rx.recv().expect("writer opened");
+
+    assert!(matches!(
+      db.background_checkpoint(),
+      Err(KiteError::WalBufferFull)
+    ));
+    assert_eq!(db.checkpoint_status(), CheckpointStatus::Idle);
+    assert_eq!(db.header.read().checkpoint_in_progress, 0);
+    assert_eq!(db.wal_stats().active_region, 0);
+
+    go_tx.send(()).expect("release writer");
+    writer.join().expect("writer thread");
+    let big_key = format!("big-9-{}", "x".repeat(2000));
+    assert!(db.node_by_key(&big_key).is_some());
+    commit_node(&db, "after");
+
+    drop(db);
+    let reopened = open_single_file(&db_path, options).expect("reopen");
+    for key in ["before", big_key.as_str(), "after"] {
+      assert!(reopened.node_by_key(key).is_some(), "missing {key:.12}");
+    }
+  }
+
+  /// A background checkpoint that fails after carrying an open transaction
+  /// rebuilds the WAL from both regions, which then hold that transaction's
+  /// first records twice. It still commits exactly once, live and on reopen.
+  #[test]
+  fn failed_background_checkpoint_keeps_carried_transaction_exactly_once() {
+    let _serial = checkpoint_test_serial();
+    let temp_dir = tempdir().expect("temp dir");
+    let db_path = temp_dir
+      .path()
+      .join("checkpoint-background-carry-failure.kitedb");
+    let options = SingleFileOpenOptions::new().auto_checkpoint(false);
+    let db = Arc::new(open_single_file(&db_path, options.clone()).expect("open"));
+
+    // The edge is in the snapshot and deleted in the delta, so applying the
+    // open transaction's re-add twice would list it twice.
+    db.begin(false).expect("begin");
+    let a = db.create_node(Some("a")).expect("node a");
+    let b = db.create_node(Some("b")).expect("node b");
+    let knows = db.define_etype("knows").expect("etype");
+    db.add_edge(a, knows, b).expect("edge");
+    db.commit().expect("commit");
+    db.checkpoint().expect("checkpoint");
+    db.begin(false).expect("begin");
+    db.delete_edge(a, knows, b).expect("delete edge");
+    db.commit().expect("commit");
+
+    let (opened_tx, opened_rx) = mpsc::channel();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let writer_db = Arc::clone(&db);
+    let writer = std::thread::spawn(move || {
+      writer_db.begin(false).expect("begin");
+      writer_db.add_edge(a, knows, b).expect("re-add");
+      writer_db.create_node(Some("carried")).expect("create");
+      opened_tx.send(()).expect("signal open");
+      go_rx.recv().expect("wait");
+      writer_db
+        .create_node(Some("after-failure"))
+        .expect("create after failure");
+      writer_db.commit().expect("commit");
+    });
+    opened_rx.recv().expect("writer opened");
+
+    let checkpoint_db = Arc::clone(&db);
+    let result = std::thread::spawn(move || {
+      set_checkpoint_test_fault(Some(CheckpointPhase::CutReleased));
+      checkpoint_db.background_checkpoint()
+    })
+    .join()
+    .expect("checkpoint thread");
+    assert!(result.is_err());
+    assert_eq!(db.checkpoint_status(), CheckpointStatus::Idle);
+    assert_eq!(db.header.read().checkpoint_in_progress, 0);
+
+    go_tx.send(()).expect("release writer");
+    writer.join().expect("writer thread");
+    for key in ["a", "b", "carried", "after-failure"] {
+      assert!(db.node_by_key(key).is_some(), "{key} missing live");
+    }
+    assert_eq!(db.out_edges(a), vec![(knows, b)]);
+
+    drop(db);
+    let reopened = open_single_file(&db_path, options).expect("reopen");
+    for key in ["a", "b", "carried", "after-failure"] {
+      assert!(reopened.node_by_key(key).is_some(), "{key} missing");
+    }
+    assert_eq!(reopened.out_edges(a), vec![(knows, b)]);
   }
 }

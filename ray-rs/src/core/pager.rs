@@ -172,6 +172,10 @@ pub struct FilePager {
   file_size: u64,
   read_only: bool,
   free_pages: HashSet<u32>,
+  /// Pages of a snapshot whose header install failed. A header slot may still
+  /// name them, so they join `free_pages` only when a later install is
+  /// durable in both slots (see `release_deferred_free_pages`).
+  deferred_free_pages: HashSet<u32>,
   /// Cached mmap for the entire file (lazily created)
   mmap: Option<Mmap>,
 }
@@ -198,6 +202,7 @@ impl FilePager {
       file_size,
       read_only,
       free_pages: HashSet::new(),
+      deferred_free_pages: HashSet::new(),
       mmap: None,
     })
   }
@@ -212,6 +217,7 @@ impl FilePager {
       file_size,
       read_only: false,
       free_pages: HashSet::new(),
+      deferred_free_pages: HashSet::new(),
       mmap: None,
     }
   }
@@ -434,6 +440,27 @@ impl FilePager {
     (start_page..end_page).all(|page| self.free_pages.contains(&page))
   }
 
+  /// Hold pages back from reuse until the next `release_deferred_free_pages`.
+  pub(crate) fn defer_free_pages(&mut self, start_page: u32, count: u32) {
+    self
+      .deferred_free_pages
+      .extend(start_page..start_page.saturating_add(count));
+  }
+
+  /// Make every deferred page free. Call only once no valid header slot can
+  /// name them, i.e. after a newer snapshot is durable in both slots.
+  pub(crate) fn release_deferred_free_pages(&mut self) {
+    self.free_pages.extend(self.deferred_free_pages.drain());
+  }
+
+  /// Pages waiting in `defer_free_pages`, sorted
+  #[cfg(test)]
+  pub(crate) fn deferred_free_page_list(&self) -> Vec<u32> {
+    let mut pages: Vec<u32> = self.deferred_free_pages.iter().copied().collect();
+    pages.sort_unstable();
+    pages
+  }
+
   /// Get count of free pages
   pub fn free_page_count(&self) -> usize {
     self.free_pages.len()
@@ -449,6 +476,7 @@ impl FilePager {
     self.file.set_len(new_size)?;
     self.file_size = new_size;
     self.free_pages.retain(|page| *page < page_count);
+    self.deferred_free_pages.retain(|page| *page < page_count);
     Ok(())
   }
 
@@ -699,6 +727,7 @@ pub(crate) fn create_pager_with_locking<P: AsRef<Path>>(
       file_size: 0,
       read_only: false,
       free_pages: HashSet::new(),
+      deferred_free_pages: HashSet::new(),
       mmap: None,
     });
   }

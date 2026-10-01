@@ -2,7 +2,7 @@
 //!
 //! Handles opening, creating, and closing single-file databases.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -1255,6 +1255,7 @@ fn open_single_file_internal(
     current_tx: Mutex::new(HashMap::new()),
     active_writers: AtomicUsize::new(0),
     active_transactions: AtomicUsize::new(0),
+    open_write_txids: Mutex::new(HashSet::new()),
     checkpoint_gate: RwLock::new(()),
     checkpoint_wait: Mutex::new(()),
     checkpoint_cv: parking_lot::Condvar::new(),

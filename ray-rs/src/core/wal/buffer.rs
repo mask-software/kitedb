@@ -15,7 +15,7 @@
 //! for each ~100 byte record on a 4KB page), we buffer writes in memory and
 //! flush entire pages at once.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::constants::*;
 use crate::core::pager::FilePager;
@@ -244,6 +244,85 @@ impl WalBuffer {
     self.head = self.secondary_head;
   }
 
+  /// The records a background checkpoint cut must copy into the secondary
+  /// region, built and concatenated: those of every transaction in `open`
+  /// that has no COMMIT or ROLLBACK in the primary region, from its last
+  /// BEGIN on, in WAL order.
+  ///
+  /// Copied, each such transaction lies wholly in the secondary region, which
+  /// is all of the WAL the checkpoint keeps, so it stays replayable when it
+  /// commits after the cut. Replay keeps only a transaction's records after
+  /// its last BEGIN, so a recovery that merges both regions applies the
+  /// copies once.
+  ///
+  /// Fails with `WalBufferFull` if they do not fit in the secondary region.
+  pub fn open_transaction_records(
+    &mut self,
+    open: &HashSet<TxId>,
+    pager: &mut FilePager,
+  ) -> Result<Vec<u8>> {
+    let mut carried = Vec::new();
+    if open.is_empty() {
+      return Ok(carried);
+    }
+
+    let records = self.scan_region(0, pager)?;
+    let mut last_begin: HashMap<TxId, usize> = HashMap::new();
+    for (index, record) in records.iter().enumerate() {
+      if !open.contains(&record.txid) {
+        continue;
+      }
+      match record.record_type {
+        WalRecordType::Begin => {
+          last_begin.insert(record.txid, index);
+        }
+        WalRecordType::Commit | WalRecordType::Rollback => {
+          last_begin.remove(&record.txid);
+        }
+        _ => {}
+      }
+    }
+    for (index, record) in records.into_iter().enumerate() {
+      if last_begin
+        .get(&record.txid)
+        .is_some_and(|begin| index >= *begin)
+      {
+        let record = WalRecord::new(record.record_type, record.txid, record.payload);
+        carried.extend_from_slice(&record.build());
+      }
+    }
+
+    if carried.len() as u64 > self.secondary_region_size {
+      return Err(KiteError::WalBufferFull);
+    }
+    Ok(carried)
+  }
+
+  /// Append records from [`Self::open_transaction_records`] to the empty
+  /// secondary region, which a background checkpoint cut has just made
+  /// active. They are buffered, like any write. On error the buffer is left
+  /// as it was.
+  pub fn carry_into_secondary(&mut self, records: &[u8], pager: &mut FilePager) -> Result<()> {
+    if self.active_region != 1 || self.has_secondary_records() {
+      return Err(KiteError::Internal(
+        "open transactions are carried only into an empty active secondary region".to_string(),
+      ));
+    }
+    if records.is_empty() {
+      return Ok(());
+    }
+
+    // Flush earlier writes first so an error below drops only the copies.
+    self.flush(pager)?;
+    let prior = self.region_state();
+    if let Err(error) = self.write_record_bytes_batch(records, pager) {
+      self.pending_writes.clear();
+      self.restore_region_state(prior);
+      return Err(error);
+    }
+    Ok(())
+  }
+
   /// Switch writes back to primary region (called after checkpoint completes)
   /// If reset_primary is true, resets the primary region (checkpoint completed)
   pub fn switch_to_primary(&mut self, reset_primary: bool) {
@@ -408,40 +487,28 @@ impl WalBuffer {
   /// Scan records from a specific region
   /// region: 0 for primary, 1 for secondary
   pub fn scan_region(&mut self, region: u8, pager: &mut FilePager) -> Result<Vec<ParsedWalRecord>> {
-    let mut records = Vec::new();
-
-    let (mut pos, end_pos) = if region == 0 {
+    let (start, end) = if region == 0 {
       (self.tail, self.primary_head)
     } else {
       (self.secondary_region_start, self.secondary_head)
     };
+    if start >= end {
+      return Ok(Vec::new());
+    }
 
-    while pos < end_pos {
-      let file_offset = self.file_offset(pos);
-      let header_bytes = self.read_at_offset(file_offset, 8, pager)?;
-
-      let rec_len = read_u32(&header_bytes, 0) as usize;
-
-      if rec_len == 0 {
-        break;
-      }
-
-      // Calculate total record size with alignment
-      let pad_len = padding_for(rec_len, WAL_RECORD_ALIGNMENT);
-      let total_len = rec_len + pad_len;
-
-      let record_bytes = self.read_at_offset(file_offset, total_len, pager)?;
-
-      // Parse the record
-      match parse_wal_record(&record_bytes, 0) {
+    // Read the region once rather than each record's pages separately.
+    let bytes = self.read_at_offset(self.file_offset(start), (end - start) as usize, pager)?;
+    let mut records = Vec::new();
+    let mut offset = 0;
+    while offset < bytes.len() {
+      match parse_wal_record(&bytes, offset) {
         Some(record) => {
+          offset = record.record_end;
           records.push(record);
-          pos += total_len as u64;
         }
         None => break, // Invalid record
       }
     }
-
     Ok(records)
   }
 
@@ -1200,5 +1267,131 @@ mod tests {
       .expect("retry compaction");
     assert_eq!(buffer.active_region(), 0);
     assert_eq!(txids(&mut buffer, &mut pager), vec![10, 11]);
+  }
+
+  fn write_tx_record(
+    buffer: &mut WalBuffer,
+    pager: &mut FilePager,
+    record_type: WalRecordType,
+    txid: u64,
+    node_id: u64,
+  ) {
+    let payload = match record_type {
+      WalRecordType::CreateNode => build_create_node_payload(node_id, None),
+      _ => Vec::new(),
+    };
+    let record = WalRecord::new(record_type, txid, payload);
+    buffer.write_record(&record, pager).expect("write record");
+  }
+
+  fn record_ids(records: &[ParsedWalRecord]) -> Vec<(WalRecordType, u64, Vec<u8>)> {
+    records
+      .iter()
+      .map(|record| (record.record_type, record.txid, record.payload.clone()))
+      .collect()
+  }
+
+  #[test]
+  fn carry_open_transactions_copies_them_whole_into_secondary() {
+    use WalRecordType::{Begin, Commit, CreateNode, Rollback};
+    let (mut pager, _temp) = create_test_pager();
+    let mut buffer = WalBuffer::new(4096, 4 * 4096, 4096);
+    // Tx 1 commits; tx 2 stays open; tx 3 is unterminated but no longer open
+    // (it failed); tx 4 rolls back; tx 5 has two BEGINs, as in a WAL rebuilt
+    // from both regions after an earlier carry.
+    for (record_type, txid, node_id) in [
+      (Begin, 1, 0),
+      (CreateNode, 1, 10),
+      (Begin, 2, 0),
+      (CreateNode, 2, 20),
+      (Commit, 1, 0),
+      (Begin, 3, 0),
+      (CreateNode, 3, 30),
+      (Begin, 4, 0),
+      (CreateNode, 4, 40),
+      (Rollback, 4, 0),
+      (Begin, 5, 0),
+      (CreateNode, 5, 50),
+      (Begin, 5, 0),
+      (CreateNode, 5, 51),
+      (CreateNode, 2, 21),
+    ] {
+      write_tx_record(&mut buffer, &mut pager, record_type, txid, node_id);
+    }
+    let primary_records = buffer.scan_region(0, &mut pager).expect("scan primary");
+    let primary_head = buffer.primary_head();
+
+    let open = HashSet::from([2, 4, 5]);
+    let carried = buffer
+      .open_transaction_records(&open, &mut pager)
+      .expect("collect open records");
+    buffer.switch_to_secondary();
+    buffer
+      .carry_into_secondary(&carried, &mut pager)
+      .expect("carry");
+    buffer.flush(&mut pager).expect("flush");
+
+    assert_eq!(buffer.primary_head(), primary_head);
+    let expected: Vec<_> = [2usize, 3, 12, 13, 14]
+      .iter()
+      .map(|&index| primary_records[index].clone())
+      .collect();
+    assert_eq!(
+      record_ids(&buffer.scan_region(1, &mut pager).expect("scan secondary")),
+      record_ids(&expected)
+    );
+
+    // The open transactions finish after the cut. Merging both regions, as
+    // crash recovery does, replays each committed transaction's records once.
+    write_tx_record(&mut buffer, &mut pager, CreateNode, 2, 22);
+    write_tx_record(&mut buffer, &mut pager, Commit, 2, 0);
+    write_tx_record(&mut buffer, &mut pager, Commit, 5, 0);
+    buffer.flush(&mut pager).expect("flush");
+    let merged = buffer.records_for_recovery(&mut pager).expect("merge");
+    let committed: Vec<(u64, Vec<u64>)> =
+      crate::core::wal::record::extract_committed_transactions_in_order(&merged)
+        .into_iter()
+        .map(|(txid, records)| {
+          let nodes = records
+            .iter()
+            .map(|record| {
+              crate::core::wal::record::parse_create_node_payload(&record.payload)
+                .expect("create node payload")
+                .node_id
+            })
+            .collect();
+          (txid, nodes)
+        })
+        .collect();
+    assert_eq!(
+      committed,
+      vec![(1, vec![10]), (2, vec![20, 21, 22]), (5, vec![51])]
+    );
+  }
+
+  #[test]
+  fn open_transaction_records_must_fit_in_secondary() {
+    let (mut pager, _temp) = create_test_pager();
+    // The secondary region is a quarter of the WAL: too small for tx 7.
+    let mut buffer = WalBuffer::new(4096, 4 * 4096, 4096);
+    write_tx_record(&mut buffer, &mut pager, WalRecordType::Begin, 7, 0);
+    let key = "k".repeat(1500);
+    for node_id in 0..3 {
+      let record = WalRecord::new(
+        WalRecordType::CreateNode,
+        7,
+        build_create_node_payload(node_id, Some(&key)),
+      );
+      buffer.write_record(&record, &mut pager).expect("write");
+    }
+    buffer.flush(&mut pager).expect("flush");
+    let before = buffer.region_state();
+
+    let result = buffer.open_transaction_records(&HashSet::from([7]), &mut pager);
+
+    assert!(matches!(result, Err(KiteError::WalBufferFull)));
+    assert_eq!(buffer.region_state(), before);
+    assert!(!buffer.has_pending_writes());
+    assert_eq!(txids(&mut buffer, &mut pager), vec![7, 7, 7, 7]);
   }
 }

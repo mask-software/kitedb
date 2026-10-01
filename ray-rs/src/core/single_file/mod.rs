@@ -211,11 +211,20 @@ pub struct SingleFileDB {
   pub(crate) active_writers: AtomicUsize,
   /// All transactions that have begun and have not finished commit/rollback.
   pub(crate) active_transactions: AtomicUsize,
+  /// Write transactions that wrote a BEGIN record and have not finished
+  /// commit/rollback. A background checkpoint cut copies the WAL records of
+  /// those still unterminated into the secondary region.
+  pub(crate) open_write_txids: Mutex<HashSet<TxId>>,
 
   /// Read permits cover transaction creation; the blocking checkpoint takes
-  /// the write side for its complete snapshot/header critical section.
+  /// the write side for its complete snapshot/header critical section, and a
+  /// background checkpoint takes it to establish its cut and to install.
   pub(crate) checkpoint_gate: RwLock<()>,
+  /// Paired with `checkpoint_cv`. Notifiers take it before notifying, so a
+  /// waiter that checked its condition under it cannot miss the wakeup.
   pub(crate) checkpoint_wait: Mutex<()>,
+  /// Signaled when the last open transaction finishes and when a background
+  /// checkpoint returns to idle.
   pub(crate) checkpoint_cv: Condvar,
 
   /// Serialize commit operations to preserve WAL/delta ordering
@@ -338,12 +347,24 @@ impl SingleFileDB {
     }
   }
 
-  pub(crate) fn transaction_finished(&self) {
+  pub(crate) fn transaction_finished(&self, txid: TxId, wrote_begin: bool) {
+    if wrote_begin {
+      self.open_write_txids.lock().remove(&txid);
+    }
     let previous = self.active_transactions.fetch_sub(1, Ordering::AcqRel);
     debug_assert!(previous > 0, "active transaction count underflow");
     if previous == 1 {
-      self.checkpoint_cv.notify_all();
+      self.notify_checkpoint_waiters();
     }
+  }
+
+  /// Wake threads in `wait_for_no_active_transactions` or
+  /// `wait_for_background_checkpoint`. Taking the wait mutex orders this
+  /// notification after a waiter's condition check, so it cannot be lost
+  /// between that check and the waiter parking.
+  pub(crate) fn notify_checkpoint_waiters(&self) {
+    let _wait = self.checkpoint_wait.lock();
+    self.checkpoint_cv.notify_all();
   }
 
   /// Database file path
