@@ -1483,6 +1483,15 @@ fn promotion_announces_schema_and_replica_rebuilds_translation() {
 
 #[test]
 fn reseed_recreates_nodes_whose_keys_were_swapped() {
+  reseed_after_key_swap(false);
+}
+
+#[test]
+fn reseed_recreates_checkpointed_nodes_whose_keys_were_swapped() {
+  reseed_after_key_swap(true);
+}
+
+fn reseed_after_key_swap(checkpoint_replica: bool) {
   let dir = tempfile::tempdir().expect("tempdir");
   let primary_path = dir.path().join("swap-primary.kitedb");
   let replica_path = dir.path().join("swap-replica.kitedb");
@@ -1498,6 +1507,10 @@ fn reseed_recreates_nodes_whose_keys_were_swapped() {
   let n3 = primary.create_node(Some("c")).expect("n3");
   commit(&primary);
   catch_up_all(&replica).expect("catch up");
+  if checkpoint_replica {
+    // The replica's copies of n1..n3 now live in its snapshot.
+    replica.checkpoint().expect("checkpoint replica");
+  }
 
   // While the replica is not following, n1/n2 exchange keys and n3 changes
   // its key; each id is recreated (keys are immutable on a live node).
