@@ -395,8 +395,9 @@ impl FilePager {
     Ok(start_page)
   }
 
-  /// Mark pages as free (for vacuum)
-  /// In v1, this just tracks free pages; actual reclamation happens during vacuum
+  /// Mark pages as free. The next checkpoint may write its snapshot over them,
+  /// so only pages no valid header slot can name belong here: never the
+  /// header, the WAL, or the installed snapshot.
   pub fn free_pages(&mut self, start_page: u32, count: u32) {
     for i in 0..count {
       self.free_pages.insert(start_page + i);
@@ -453,10 +454,31 @@ impl FilePager {
     self.free_pages.extend(self.deferred_free_pages.drain());
   }
 
+  /// Remove pages `start_page..end_page` from the free and deferred lists, so
+  /// they are never reused, and return how many were listed. For pages that
+  /// hold, or are about to hold, data a header names.
+  pub(crate) fn withdraw_free_pages(&mut self, start_page: u32, end_page: u32) -> usize {
+    let range = start_page..end_page;
+    let listed = self.free_pages.len() + self.deferred_free_pages.len();
+    self.free_pages.retain(|page| !range.contains(page));
+    self
+      .deferred_free_pages
+      .retain(|page| !range.contains(page));
+    listed - self.free_pages.len() - self.deferred_free_pages.len()
+  }
+
   /// Pages waiting in `defer_free_pages`, sorted
   #[cfg(test)]
   pub(crate) fn deferred_free_page_list(&self) -> Vec<u32> {
     let mut pages: Vec<u32> = self.deferred_free_pages.iter().copied().collect();
+    pages.sort_unstable();
+    pages
+  }
+
+  /// Free pages, sorted
+  #[cfg(test)]
+  pub(crate) fn free_page_list(&self) -> Vec<u32> {
+    let mut pages: Vec<u32> = self.free_pages.iter().copied().collect();
     pages.sort_unstable();
     pages
   }
@@ -573,8 +595,11 @@ impl FilePager {
     // Sync to ensure data is durable before marking old pages as free
     self.sync()?;
 
-    // Mark old pages as free
-    self.free_pages(src_page, page_count);
+    // Free the old pages, except those the copy now occupies.
+    let copy = dst_page..dst_page + page_count;
+    self
+      .free_pages
+      .extend((src_page..src_page + page_count).filter(|page| !copy.contains(page)));
 
     Ok(())
   }
@@ -833,6 +858,17 @@ mod tests {
     pager.free_pages(2, 3);
 
     assert_eq!(pager.free_page_count(), 3);
+  }
+
+  #[test]
+  fn relocate_area_frees_only_pages_the_copy_left() {
+    let temp_file = NamedTempFile::new().expect("expected value");
+    let mut pager = create_pager(temp_file.path(), 4096).expect("expected value");
+    pager.allocate_pages(10).expect("expected value");
+
+    // Pages 4..8 move down to 2..6, so pages 4 and 5 hold part of the copy.
+    pager.relocate_area(4, 4, 2).expect("expected value");
+    assert_eq!(pager.free_page_list(), vec![6, 7]);
   }
 
   #[test]

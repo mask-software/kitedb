@@ -670,6 +670,23 @@ impl SingleFileDB {
     snapshot_page_count: u64,
   ) -> Result<u64> {
     let mut pager = self.pager.lock();
+    let wal_end_page = header.wal_start_page + header.wal_page_count;
+    let snapshot_end_page = header
+      .snapshot_start_page
+      .saturating_add(header.snapshot_page_count);
+
+    // The header, the WAL, and the installed snapshot are never free. Should
+    // a bookkeeping mistake list any of them, withdraw them instead of
+    // writing this snapshot over pages the installed header names.
+    let live_pages_listed = pager.withdraw_free_pages(0, wal_end_page as u32)
+      + pager.withdraw_free_pages(header.snapshot_start_page as u32, snapshot_end_page as u32);
+    if live_pages_listed > 0 {
+      eprintln!(
+        "Warning: {live_pages_listed} pages of the header, WAL, or installed snapshot were \
+         listed as free; withdrew them from reuse"
+      );
+    }
+
     if let Some(start_page) = pager.find_free_range(snapshot_page_count as u32) {
       pager.consume_free_range(start_page, snapshot_page_count as u32);
       return Ok(start_page as u64);
@@ -677,10 +694,6 @@ impl SingleFileDB {
 
     let page_size = header.page_size as u64;
     let file_pages = pager.file_size().div_ceil(page_size);
-    let wal_end_page = header.wal_start_page + header.wal_page_count;
-    let snapshot_end_page = header
-      .snapshot_start_page
-      .saturating_add(header.snapshot_page_count);
     Ok(
       file_pages
         .max(header.db_size_pages)
@@ -2358,5 +2371,324 @@ mod tests {
       assert!(reopened.node_by_key(key).is_some(), "{key} missing");
     }
     assert_eq!(reopened.out_edges(a), vec![(knows, b)]);
+  }
+
+  /// Vacuum relocates the snapshot onto pages an earlier checkpoint freed;
+  /// those pages must leave the free list. Regression: they stayed free, so the
+  /// next checkpoint wrote its new snapshot over the live one before its header
+  /// install, breaking copy-on-write (a crash mid-write could leave the header
+  /// naming half-overwritten pages).
+  #[test]
+  fn checkpoint_after_vacuum_never_overwrites_the_live_snapshot() {
+    let _serial = checkpoint_test_serial();
+    let temp_dir = tempdir().expect("expected value");
+    let db_path = temp_dir.path().join("vacuum-free-list.kitedb");
+    let options = SingleFileOpenOptions::new()
+      .auto_checkpoint(false)
+      .background_checkpoint(false);
+    let db = open_single_file(&db_path, options.clone()).expect("open");
+
+    // A large first snapshot.
+    db.begin(false).expect("expected value");
+    let mut ids = Vec::new();
+    for index in 0..4000 {
+      ids.push(
+        db.create_node(Some(&format!("bulk-{index}")))
+          .expect("expected value"),
+      );
+    }
+    db.commit().expect("expected value");
+    db.checkpoint().expect("expected value");
+
+    // A small second snapshot; the large region goes on the free list.
+    db.begin(false).expect("expected value");
+    for id in &ids[10..] {
+      db.delete_node(*id).expect("expected value");
+    }
+    db.commit().expect("expected value");
+    db.checkpoint().expect("expected value");
+
+    // Vacuum moves the small snapshot down onto the freed region. Keep the
+    // WAL size so the file reopens with the same options.
+    db.vacuum_single_file(Some(crate::core::single_file::VacuumOptions {
+      shrink_wal: false,
+      min_wal_size: None,
+    }))
+    .expect("vacuum");
+
+    let (live_start, live_count) = {
+      let header = db.header.read();
+      (header.snapshot_start_page, header.snapshot_page_count)
+    };
+
+    db.begin(false).expect("expected value");
+    db.create_node(Some("after-vacuum")).expect("expected value");
+    db.commit().expect("expected value");
+    db.checkpoint().expect("checkpoint after vacuum");
+
+    // Copy-on-write: the new snapshot must not have been written onto the
+    // pages the installed snapshot occupied.
+    let (new_start, new_count) = {
+      let header = db.header.read();
+      (header.snapshot_start_page, header.snapshot_page_count)
+    };
+    let overlaps = new_start < live_start + live_count && live_start < new_start + new_count;
+    assert!(
+      !overlaps,
+      "checkpoint wrote its snapshot (pages {new_start}..{}) over the live snapshot (pages {live_start}..{})",
+      new_start + new_count,
+      live_start + live_count
+    );
+
+    drop(db);
+    let reopened = open_single_file(&db_path, options).expect("reopen");
+    assert!(reopened.node_by_key("bulk-0").is_some());
+    assert!(reopened.node_by_key("bulk-500").is_none());
+    assert!(reopened.node_by_key("after-vacuum").is_some());
+  }
+
+  /// A large snapshot replaced by a small one: the large region is on the free
+  /// list, directly after the WAL, and the small snapshot follows it.
+  fn db_with_freed_snapshot_region(
+    db_path: &std::path::Path,
+  ) -> (SingleFileDB, SingleFileOpenOptions) {
+    let options = SingleFileOpenOptions::new()
+      .auto_checkpoint(false)
+      .background_checkpoint(false);
+    let db = open_single_file(db_path, options.clone()).expect("open");
+
+    db.begin(false).expect("begin");
+    let mut ids = Vec::new();
+    for index in 0..4000 {
+      ids.push(
+        db.create_node(Some(&format!("bulk-{index}")))
+          .expect("create node"),
+      );
+    }
+    db.commit().expect("commit");
+    db.checkpoint().expect("checkpoint large snapshot");
+
+    db.begin(false).expect("begin");
+    for id in &ids[10..] {
+      db.delete_node(*id).expect("delete node");
+    }
+    db.commit().expect("commit");
+    db.checkpoint().expect("checkpoint small snapshot");
+
+    let header = db.header.read().clone();
+    let wal_end = header.wal_start_page + header.wal_page_count;
+    let freed = db.pager.lock().free_page_list();
+    assert!(
+      freed.len() >= 2 && u64::from(freed[0]) == wal_end,
+      "setup: the large snapshot's pages should be free directly after the WAL"
+    );
+    (db, options)
+  }
+
+  /// Every page on the free or deferred list must lie outside the header, the
+  /// WAL, and the installed snapshot: a checkpoint may write its new snapshot
+  /// onto a free page before its header install.
+  fn assert_free_lists_exclude_live_pages(db: &SingleFileDB, context: &str) {
+    let header = db.header.read().clone();
+    let wal_end = header.wal_start_page + header.wal_page_count;
+    let snapshot =
+      header.snapshot_start_page..header.snapshot_start_page + header.snapshot_page_count;
+    let pager = db.pager.lock();
+    for (list, pages) in [
+      ("free", pager.free_page_list()),
+      ("deferred", pager.deferred_free_page_list()),
+    ] {
+      for page in pages.into_iter().map(u64::from) {
+        assert!(
+          page >= wal_end,
+          "{context}: {list} page {page} lies in the header or WAL (pages 0..{wal_end})"
+        );
+        assert!(
+          !snapshot.contains(&page),
+          "{context}: {list} page {page} lies in the installed snapshot (pages {}..{})",
+          snapshot.start,
+          snapshot.end
+        );
+      }
+    }
+  }
+
+  /// Checkpoint, asserting the new snapshot avoided every page the previously
+  /// installed header named.
+  fn checkpoint_avoiding_live_pages(db: &SingleFileDB, context: &str) {
+    let before = db.header.read().clone();
+    let wal_end = before.wal_start_page + before.wal_page_count;
+    let live = before.snapshot_start_page..before.snapshot_start_page + before.snapshot_page_count;
+    db.checkpoint().expect(context);
+
+    let after = db.header.read().clone();
+    let written = after.snapshot_start_page..after.snapshot_start_page + after.snapshot_page_count;
+    assert!(
+      written.start >= wal_end,
+      "{context}: checkpoint wrote its snapshot (pages {}..{}) into the header or WAL (pages 0..{wal_end})",
+      written.start,
+      written.end
+    );
+    assert!(
+      live.is_empty() || written.end <= live.start || live.end <= written.start,
+      "{context}: checkpoint wrote its snapshot (pages {}..{}) over the live snapshot (pages {}..{})",
+      written.start,
+      written.end,
+      live.start,
+      live.end
+    );
+  }
+
+  /// Growing the WAL moves the snapshot onto pages an earlier checkpoint freed
+  /// and extends the WAL over others; none of them may stay free. Regression:
+  /// they stayed on the free list, so the next checkpoint wrote its snapshot
+  /// into the WAL, over records the installed header still named, before its
+  /// header install.
+  #[test]
+  fn checkpoint_after_wal_resize_never_overwrites_the_wal_or_live_snapshot() {
+    let _serial = checkpoint_test_serial();
+    let temp_dir = tempdir().expect("temp dir");
+    let db_path = temp_dir.path().join("resize-free-list.kitedb");
+    let (db, options) = db_with_freed_snapshot_region(&db_path);
+
+    // One more WAL page covers the first freed page; the snapshot moves onto
+    // the second.
+    let header = db.header.read().clone();
+    let wal_size = (header.wal_page_count as usize + 1) * header.page_size as usize;
+    db.resize_wal(
+      wal_size,
+      Some(crate::core::single_file::ResizeWalOptions {
+        allow_shrink: false,
+        checkpoint: false,
+      }),
+    )
+    .expect("resize WAL");
+    assert_free_lists_exclude_live_pages(&db, "after resize");
+
+    commit_node(&db, "after-resize");
+    checkpoint_avoiding_live_pages(&db, "checkpoint after resize");
+    commit_node(&db, "after-checkpoint");
+
+    drop(db);
+    let reopened = open_single_file(&db_path, options.wal_size(wal_size)).expect("reopen");
+    for key in ["bulk-0", "after-resize", "after-checkpoint"] {
+      assert!(reopened.node_by_key(key).is_some(), "{key} missing");
+    }
+    assert!(reopened.node_by_key("bulk-500").is_none());
+  }
+
+  /// A failed install defers its snapshot's pages. Growing the WAL over them
+  /// makes them WAL pages, so they must leave the deferred list rather than
+  /// become free at the next install. Regression: they stayed deferred, the
+  /// next install freed them, and the checkpoint after it wrote its snapshot
+  /// into the WAL.
+  #[test]
+  fn wal_resize_over_deferred_pages_never_frees_wal_pages() {
+    let _serial = checkpoint_test_serial();
+    let temp_dir = tempdir().expect("temp dir");
+    let db_path = temp_dir.path().join("resize-deferred.kitedb");
+    let options = SingleFileOpenOptions::new()
+      .auto_checkpoint(false)
+      .background_checkpoint(false);
+    let db = open_single_file(&db_path, options.clone()).expect("open");
+    commit_node(&db, "before-resize");
+    db.checkpoint().expect("checkpoint");
+
+    // The install fails, deferring the unused snapshot's pages. The WAL stays
+    // empty, as resize requires.
+    set_checkpoint_test_fault(Some(CheckpointPhase::HeaderWritten));
+    assert!(db.checkpoint().is_err());
+    let deferred = db.pager.lock().deferred_free_page_list();
+    let last_deferred = *deferred.last().expect("deferred pages");
+
+    // Grow the WAL over every deferred page.
+    let header = db.header.read().clone();
+    let wal_pages = u64::from(last_deferred) + 1 - header.wal_start_page;
+    let wal_size = wal_pages as usize * header.page_size as usize;
+    db.resize_wal(
+      wal_size,
+      Some(crate::core::single_file::ResizeWalOptions {
+        allow_shrink: false,
+        checkpoint: false,
+      }),
+    )
+    .expect("resize WAL");
+    assert_free_lists_exclude_live_pages(&db, "after resize");
+
+    commit_node(&db, "after-resize");
+    checkpoint_avoiding_live_pages(&db, "first checkpoint after resize");
+    commit_node(&db, "after-first-checkpoint");
+    checkpoint_avoiding_live_pages(&db, "second checkpoint after resize");
+
+    drop(db);
+    let reopened = open_single_file(&db_path, options.wal_size(wal_size)).expect("reopen");
+    for key in ["before-resize", "after-resize", "after-first-checkpoint"] {
+      assert!(reopened.node_by_key(key).is_some(), "{key} missing");
+    }
+  }
+
+  /// Vacuum may move the snapshot onto pages a failed install deferred; like
+  /// freed pages it moves onto, they must leave their list.
+  #[test]
+  fn vacuum_leaves_no_live_pages_on_the_free_or_deferred_lists() {
+    let _serial = checkpoint_test_serial();
+    let temp_dir = tempdir().expect("temp dir");
+    let db_path = temp_dir.path().join("vacuum-deferred.kitedb");
+    let (db, options) = db_with_freed_snapshot_region(&db_path);
+
+    // The failed install took the low end of the freed region, right after
+    // the WAL, where vacuum will put the snapshot.
+    set_checkpoint_test_fault(Some(CheckpointPhase::HeaderWritten));
+    assert!(db.checkpoint().is_err());
+    assert!(!db.pager.lock().deferred_free_page_list().is_empty());
+
+    db.vacuum_single_file(Some(crate::core::single_file::VacuumOptions {
+      shrink_wal: false,
+      min_wal_size: None,
+    }))
+    .expect("vacuum");
+    assert_free_lists_exclude_live_pages(&db, "after vacuum");
+
+    commit_node(&db, "after-vacuum");
+    checkpoint_avoiding_live_pages(&db, "checkpoint after vacuum");
+    assert_free_lists_exclude_live_pages(&db, "after checkpoint");
+
+    drop(db);
+    let reopened = open_single_file(&db_path, options).expect("reopen");
+    for key in ["bulk-0", "after-vacuum"] {
+      assert!(reopened.node_by_key(key).is_some(), "{key} missing");
+    }
+    assert!(reopened.node_by_key("bulk-500").is_none());
+  }
+
+  /// Defense in depth: even if bookkeeping wrongly lists live pages as free, a
+  /// checkpoint must not write its snapshot over the WAL or the installed
+  /// snapshot.
+  #[test]
+  fn checkpoint_never_reuses_live_pages_listed_as_free() {
+    let _serial = checkpoint_test_serial();
+    let temp_dir = tempdir().expect("temp dir");
+    let db_path = temp_dir.path().join("live-pages-listed-free.kitedb");
+    // "new-node" exists only in the WAL.
+    let (db, options) = seeded_db(&db_path);
+
+    let header = db.header.read().clone();
+    {
+      let mut pager = db.pager.lock();
+      pager.free_pages(header.wal_start_page as u32, header.wal_page_count as u32);
+      pager.free_pages(
+        header.snapshot_start_page as u32,
+        header.snapshot_page_count as u32,
+      );
+    }
+    checkpoint_avoiding_live_pages(&db, "checkpoint with live pages listed free");
+    assert_free_lists_exclude_live_pages(&db, "after checkpoint");
+
+    commit_node(&db, "after-checkpoint");
+    drop(db);
+    let reopened = open_single_file(&db_path, options).expect("reopen");
+    for key in ["old-0", "new-node", "after-checkpoint"] {
+      assert!(reopened.node_by_key(key).is_some(), "{key} missing");
+    }
   }
 }

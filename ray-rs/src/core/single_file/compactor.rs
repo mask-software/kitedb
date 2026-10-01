@@ -55,6 +55,16 @@ impl Default for VacuumOptions {
 /// Minimum WAL pages to keep (64KB at 4KB page size)
 const MIN_WAL_PAGES: u64 = 16;
 
+/// Compaction rewrites every page below `end_page`, without gaps, as header,
+/// WAL, and snapshot pages, so withdraw them all from reuse first: left on a
+/// free list, they would take the next checkpoint's snapshot over the live WAL
+/// or snapshot. Withdrawing before the first write also covers a failure
+/// part-way, when a header slot may already name the new layout; leaking pages
+/// until the next vacuum is safe where reusing them is not.
+fn withdraw_compacted_pages(pager: &mut crate::core::pager::FilePager, end_page: u64) {
+  pager.withdraw_free_pages(0, end_page as u32);
+}
+
 fn read_snapshot_pages(
   pager: &mut crate::core::pager::FilePager,
   start_page: u32,
@@ -182,6 +192,10 @@ impl SingleFileDB {
     let snapshot_page_count = new_header.snapshot_page_count;
     let snapshot_relocation_needed =
       snapshot_page_count > 0 && current_snapshot_start != new_wal_end_page;
+    withdraw_compacted_pages(
+      &mut self.pager.lock(),
+      new_wal_end_page + snapshot_page_count,
+    );
     let snapshot_bytes = if snapshot_relocation_needed {
       let mut pager = self.pager.lock();
       Some(read_snapshot_pages(
@@ -331,6 +345,10 @@ impl SingleFileDB {
     let snapshot_page_count = new_header.snapshot_page_count;
     let snapshot_relocation_needed =
       snapshot_page_count > 0 && current_snapshot_start != new_wal_end_page;
+    withdraw_compacted_pages(
+      &mut self.pager.lock(),
+      new_wal_end_page + snapshot_page_count,
+    );
     let snapshot_bytes = if snapshot_relocation_needed {
       let mut pager = self.pager.lock();
       Some(read_snapshot_pages(
