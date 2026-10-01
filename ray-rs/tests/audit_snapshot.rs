@@ -285,11 +285,14 @@ fn s1_node_id_2_pow_40_survives_checkpoint_and_reopen() {
   });
 }
 
+/// The largest ID `create_node_with_id` accepts (MAX_NODE_ID = i64::MAX, so
+/// IDs survive the signed bindings). The raw writer/reader round trip of
+/// u64::MAX - 1 and u64::MAX is covered by the writer unit tests.
 #[test]
-fn s1_node_id_u64_max_minus_one_survives_checkpoint_and_reopen() {
+fn s1_max_legal_node_id_survives_checkpoint_and_reopen() {
   run_in_child(
-    "s1_node_id_u64_max_minus_one_survives_checkpoint_and_reopen",
-    || huge_node_id_round_trip(u64::MAX - 1),
+    "s1_max_legal_node_id_survives_checkpoint_and_reopen",
+    || huge_node_id_round_trip(i64::MAX as u64),
   );
 }
 

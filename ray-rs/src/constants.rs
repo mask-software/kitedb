@@ -15,13 +15,16 @@ pub const MAGIC_SNAPSHOT: u32 = 0x31534447;
 // Current versions
 // ============================================================================
 
-pub const VERSION_SNAPSHOT: u32 = 4;
+/// v5: u64 section sizes, u64 string offsets and the sparse NodeIdToPhys
+/// layout. v4 and older snapshots are still read; the next checkpoint
+/// rewrites them as v5.
+pub const VERSION_SNAPSHOT: u32 = 5;
 
 // ============================================================================
 // Minimum reader versions
 // ============================================================================
 
-pub const MIN_READER_SNAPSHOT: u32 = 4;
+pub const MIN_READER_SNAPSHOT: u32 = 5;
 
 // ============================================================================
 // Alignment requirements
