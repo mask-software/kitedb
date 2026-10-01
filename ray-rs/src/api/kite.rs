@@ -193,21 +193,28 @@ fn del_node_prop(handle: &mut TxHandle, node_id: NodeId, key_id: PropKeyId) -> R
   handle.db.delete_node_prop(node_id, key_id)
 }
 
-fn upsert_node_with_props<I>(handle: &mut TxHandle, key: &str, props: I) -> Result<(NodeId, bool)>
+fn upsert_node_with_props<I>(
+  handle: &mut TxHandle,
+  key: &str,
+  node_def: Option<&NodeDef>,
+  strict: bool,
+  props: I,
+) -> Result<(NodeId, bool)>
 where
-  I: IntoIterator<Item = (PropKeyId, Option<PropValue>)>,
+  I: IntoIterator<Item = (String, Option<PropValue>)>,
 {
-  let (node_id, created) = match handle.db.node_by_key(key) {
+  let existing = handle.db.node_by_key(key);
+  let write = match existing {
+    Some(_) => NodeWrite::Update,
+    None => NodeWrite::Create,
+  };
+  let props = resolve_node_props(handle.db, node_def, strict, write, props)?;
+
+  let (node_id, created) = match existing {
     Some(existing) => (existing, false),
     None => (create_node(handle, NodeOpts::new().with_key(key))?, true),
   };
-
-  for (key_id, value_opt) in props {
-    match value_opt {
-      Some(value) => set_node_prop(handle, node_id, key_id, value)?,
-      None => del_node_prop(handle, node_id, key_id)?,
-    }
-  }
+  apply_node_props(handle, node_id, props)?;
 
   Ok((node_id, created))
 }
@@ -216,24 +223,25 @@ fn upsert_node_by_id_with_props<I>(
   handle: &mut TxHandle,
   node_id: NodeId,
   opts: NodeOpts,
+  node_def: &NodeDef,
+  strict: bool,
   props: I,
 ) -> Result<(NodeId, bool)>
 where
-  I: IntoIterator<Item = (PropKeyId, Option<PropValue>)>,
+  I: IntoIterator<Item = (String, Option<PropValue>)>,
 {
-  let created = if handle.db.node_exists(node_id) {
-    false
+  let created = !handle.db.node_exists(node_id);
+  let write = if created {
+    NodeWrite::Create
   } else {
-    create_node_with_id(handle, node_id, opts)?;
-    true
+    NodeWrite::Update
   };
+  let props = resolve_node_props(handle.db, Some(node_def), strict, write, props)?;
 
-  for (key_id, value_opt) in props {
-    match value_opt {
-      Some(value) => set_node_prop(handle, node_id, key_id, value)?,
-      None => del_node_prop(handle, node_id, key_id)?,
-    }
+  if created {
+    create_node_with_id(handle, node_id, opts)?;
   }
+  apply_node_props(handle, node_id, props)?;
 
   Ok((node_id, created))
 }
@@ -494,6 +502,222 @@ impl EdgeDef {
 }
 
 // ============================================================================
+// Schema Policy
+// ============================================================================
+
+/// Whether a node write creates the node or updates an existing one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeWrite {
+  Create,
+  Update,
+}
+
+/// Resolve the props of a node write into key ids, under the one policy shared by every node
+/// create/update path:
+/// - props outside the schema are kept; their key is defined on demand;
+/// - on create, a declared `default` fills a prop that is absent or `Null`;
+/// - with `strict`, a `required` prop must be present on create, and every value must match its
+///   `prop_type` (int<->float is coerced only when lossless).
+///
+/// `None` values are deletions (`unset`) and pass through unchecked. Only prop keys are written,
+/// so callers resolve before creating the node and a rejected write leaves no node behind.
+fn resolve_node_props<I>(
+  db: &SingleFileDB,
+  node_def: Option<&NodeDef>,
+  strict: bool,
+  write: NodeWrite,
+  props: I,
+) -> Result<Vec<(PropKeyId, Option<PropValue>)>>
+where
+  I: IntoIterator<Item = (String, Option<PropValue>)>,
+{
+  let mut props: Vec<(String, Option<PropValue>)> = props.into_iter().collect();
+
+  if let (NodeWrite::Create, Some(node_def)) = (write, node_def) {
+    for prop_def in node_def.props.values() {
+      // Values are applied in order, so the last entry for a name is the one that counts.
+      let slot = props.iter().rposition(|(name, _)| *name == prop_def.name);
+      let provided =
+        slot.is_some_and(|index| !matches!(props[index].1, None | Some(PropValue::Null)));
+      if provided {
+        continue;
+      }
+      match (&prop_def.default, slot) {
+        (Some(default), Some(index)) => props[index].1 = Some(default.clone()),
+        (Some(default), None) => props.push((prop_def.name.clone(), Some(default.clone()))),
+        (None, _) if strict && prop_def.required => {
+          return Err(KiteError::SchemaViolation(format!(
+            "{}.{} is required",
+            node_def.name, prop_def.name
+          )));
+        }
+        (None, _) => {}
+      }
+    }
+  }
+
+  props
+    .into_iter()
+    .map(|(name, value)| {
+      let declared = node_def.and_then(|def| def.props.get(&name).map(|prop| (def, prop)));
+      let value = match (value, declared) {
+        (Some(value), Some((def, prop))) if strict => {
+          Some(coerce_prop_value(&def.name, prop, value)?)
+        }
+        (value, _) => value,
+      };
+      let key_id = match node_def.and_then(|def| def.prop_key_ids.get(&name)) {
+        Some(&key_id) => key_id,
+        None => db.define_propkey(&name)?,
+      };
+      Ok((key_id, value))
+    })
+    .collect()
+}
+
+/// Check `value` against the declared type of `prop`. `Null` and `PropType::Any` always pass;
+/// int<->float is coerced only when the conversion is exact.
+fn coerce_prop_value(node_type: &str, prop: &PropDef, value: PropValue) -> Result<PropValue> {
+  let coerced = match (prop.prop_type, &value) {
+    (PropType::Any, _)
+    | (_, PropValue::Null)
+    | (PropType::String, PropValue::String(_))
+    | (PropType::Int, PropValue::I64(_))
+    | (PropType::Float, PropValue::F64(_))
+    | (PropType::Bool, PropValue::Bool(_)) => return Ok(value),
+    (PropType::Int, &PropValue::F64(float)) => lossless_i64(float).map(PropValue::I64),
+    (PropType::Float, &PropValue::I64(int)) => lossless_f64(int).map(PropValue::F64),
+    _ => None,
+  };
+  coerced.ok_or_else(|| {
+    let got = match &value {
+      PropValue::I64(int) => format!("I64 {int}"),
+      PropValue::F64(float) => format!("F64 {float}"),
+      other => format!("{:?}", other.tag()),
+    };
+    KiteError::SchemaViolation(format!(
+      "{node_type}.{} expects {:?}, got {got}",
+      prop.name, prop.prop_type
+    ))
+  })
+}
+
+/// `float` as an i64, if it is a whole number in range.
+fn lossless_i64(float: f64) -> Option<i64> {
+  // Exactly 2^63: every whole f64 in [-2^63, 2^63) fits an i64.
+  const LIMIT: f64 = 9_223_372_036_854_775_808.0;
+  (float.fract() == 0.0 && (-LIMIT..LIMIT).contains(&float)).then_some(float as i64)
+}
+
+/// `int` as an f64, if the conversion is exact.
+fn lossless_f64(int: i64) -> Option<f64> {
+  let float = int as f64;
+  (lossless_i64(float) == Some(int)).then_some(float)
+}
+
+/// Schema type of an existing node: by key prefix (longest match wins), else by label.
+fn node_def_of<'a>(
+  nodes: &'a HashMap<String, NodeDef>,
+  db: &SingleFileDB,
+  node_id: NodeId,
+) -> Option<&'a NodeDef> {
+  let by_key = db.node_key(node_id).and_then(|key| {
+    nodes
+      .values()
+      .filter(|def| key.starts_with(&def.key_prefix))
+      .max_by_key(|def| def.key_prefix.len())
+  });
+  by_key.or_else(|| {
+    let labels = db.node_labels(node_id);
+    nodes
+      .values()
+      .find(|def| def.label_id.is_some_and(|label| labels.contains(&label)))
+  })
+}
+
+/// Resolve the props of an update to an existing node. The node must exist inside the tx.
+fn resolve_node_update<I>(
+  handle: &TxHandle,
+  nodes: &HashMap<String, NodeDef>,
+  strict: bool,
+  node_id: NodeId,
+  props: I,
+) -> Result<Vec<(PropKeyId, Option<PropValue>)>>
+where
+  I: IntoIterator<Item = (String, Option<PropValue>)>,
+{
+  if !node_exists(handle, node_id) {
+    return Err(KiteError::NodeNotFound(node_id));
+  }
+  // The node's type only matters for type checks.
+  let node_def = if strict {
+    node_def_of(nodes, handle.db, node_id)
+  } else {
+    None
+  };
+  resolve_node_props(handle.db, node_def, strict, NodeWrite::Update, props)
+}
+
+/// Apply resolved props: `Some` sets a value, `None` deletes it.
+fn apply_node_props(
+  handle: &mut TxHandle,
+  node_id: NodeId,
+  props: Vec<(PropKeyId, Option<PropValue>)>,
+) -> Result<()> {
+  for (key_id, value) in props {
+    match value {
+      Some(value) => set_node_prop(handle, node_id, key_id, value)?,
+      None => del_node_prop(handle, node_id, key_id)?,
+    }
+  }
+  Ok(())
+}
+
+/// Create a keyed, labeled node of `node_def`'s type with `props` (create_node, batch and
+/// transaction paths). Returns the node id and its full key.
+fn create_typed_node(
+  handle: &mut TxHandle,
+  node_def: &NodeDef,
+  strict: bool,
+  key_suffix: &str,
+  props: HashMap<String, PropValue>,
+) -> Result<(NodeId, String)> {
+  let props = resolve_node_props(
+    handle.db,
+    Some(node_def),
+    strict,
+    NodeWrite::Create,
+    props.into_iter().map(|(name, value)| (name, Some(value))),
+  )?;
+  let full_key = node_def.key(key_suffix);
+  let node_opts = NodeOpts {
+    key: Some(full_key.clone()),
+    labels: node_def.label_id.map(|id| vec![id]),
+    props: None,
+  };
+  let node_id = create_node(handle, node_opts)?;
+  apply_node_props(handle, node_id, props)?;
+  Ok((node_id, full_key))
+}
+
+/// Upsert treats a `Null` value as "unset this prop".
+fn null_as_unset(value: PropValue) -> Option<PropValue> {
+  match value {
+    PropValue::Null => None,
+    other => Some(other),
+  }
+}
+
+/// Edge props may only be written on an existing edge, checked inside the tx.
+fn require_edge(handle: &TxHandle, src: NodeId, etype: ETypeId, dst: NodeId) -> Result<()> {
+  if edge_exists(handle, src, etype, dst) {
+    Ok(())
+  } else {
+    Err(KiteError::EdgeNotFound { src, etype, dst })
+  }
+}
+
+// ============================================================================
 // Node Reference
 // ============================================================================
 
@@ -583,6 +807,13 @@ pub struct KiteOptions {
   pub replication_retention_min_entries: Option<u64>,
   /// Minimum retained segment age in milliseconds (primary role only)
   pub replication_retention_min_ms: Option<u64>,
+  /// Enforce node schemas on writes (default: false).
+  ///
+  /// When enabled, creating a node fails if a `required` prop is missing or `Null`, and every
+  /// node create/update fails if a declared prop's value does not match its `prop_type`
+  /// (int<->float is coerced only when lossless). In both modes props outside the schema are
+  /// kept and declared defaults are applied on create.
+  pub strict_schema: bool,
 }
 
 impl KiteOptions {
@@ -609,6 +840,7 @@ impl KiteOptions {
       replication_segment_max_bytes: None,
       replication_retention_min_entries: None,
       replication_retention_min_ms: None,
+      strict_schema: false,
     }
   }
 
@@ -629,6 +861,12 @@ impl KiteOptions {
 
   pub fn sync_mode(mut self, mode: SyncMode) -> Self {
     self.sync_mode = mode;
+    self
+  }
+
+  /// Enforce `required` and `prop_type` on node writes (see the `strict_schema` field).
+  pub fn strict_schema(mut self, value: bool) -> Self {
+    self.strict_schema = value;
     self
   }
 
@@ -861,6 +1099,8 @@ pub struct Kite {
   edges: HashMap<String, EdgeDef>,
   /// Key prefix to node def mapping for fast lookups
   key_prefix_to_node: HashMap<String, String>,
+  /// Enforce `required` and `prop_type` on node writes
+  strict_schema: bool,
 }
 
 impl Kite {
@@ -1013,6 +1253,7 @@ impl Kite {
       nodes,
       edges,
       key_prefix_to_node,
+      strict_schema: options.strict_schema,
     })
   }
 
@@ -1030,30 +1271,11 @@ impl Kite {
     let node_def = self
       .nodes
       .get(node_type)
-      .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown node type: {node_type}").into()))?
-      .clone();
+      .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown node type: {node_type}").into()))?;
 
-    let full_key = node_def.key(key_suffix);
-
-    // Begin transaction
     let mut handle = begin_tx(&self.db)?;
-
-    // Create the node with key
-    let node_opts = NodeOpts {
-      key: Some(full_key.clone()),
-      labels: node_def.label_id.map(|id| vec![id]),
-      props: None,
-    };
-    let node_id = create_node(&mut handle, node_opts)?;
-
-    // Set properties
-    for (prop_name, value) in props {
-      if let Some(&prop_key_id) = node_def.prop_key_ids.get(&prop_name) {
-        set_node_prop(&mut handle, node_id, prop_key_id, value)?;
-      }
-    }
-
-    // Commit
+    let (node_id, full_key) =
+      create_typed_node(&mut handle, node_def, self.strict_schema, key_suffix, props)?;
     commit(&mut handle)?;
 
     Ok(NodeRef::new(node_id, Some(full_key), node_type))
@@ -1187,36 +1409,29 @@ impl Kite {
     node_prop_db(&self.db, node_id, prop_key_id)
   }
 
-  /// Set a node property
+  /// Set a node property. Fails with `NodeNotFound` if the node does not exist.
   pub fn set_prop(&mut self, node_id: NodeId, prop_name: &str, value: PropValue) -> Result<()> {
-    let mut handle = begin_tx(&self.db)?;
-    let prop_key_id = handle.db.define_propkey(prop_name)?;
-    set_node_prop(&mut handle, node_id, prop_key_id, value)?;
-    commit(&mut handle)?;
-    Ok(())
+    self.set_props(node_id, [(prop_name, value)])
   }
 
-  /// Set multiple node properties in a single transaction
+  /// Set multiple node properties in a single transaction. Fails with `NodeNotFound` if the
+  /// node does not exist.
   pub fn set_props<I, K>(&mut self, node_id: NodeId, props: I) -> Result<()>
   where
     I: IntoIterator<Item = (K, PropValue)>,
     K: AsRef<str>,
   {
-    let mut iter = props.into_iter();
-    let Some((first_name, first_value)) = iter.next() else {
+    let props: Vec<(String, Option<PropValue>)> = props
+      .into_iter()
+      .map(|(name, value)| (name.as_ref().to_string(), Some(value)))
+      .collect();
+    if props.is_empty() {
       return Ok(());
-    };
-
-    let mut handle = begin_tx(&self.db)?;
-
-    let first_key_id = handle.db.define_propkey(first_name.as_ref())?;
-    set_node_prop(&mut handle, node_id, first_key_id, first_value)?;
-
-    for (prop_name, value) in iter {
-      let prop_key_id = handle.db.define_propkey(prop_name.as_ref())?;
-      set_node_prop(&mut handle, node_id, prop_key_id, value)?;
     }
 
+    let mut handle = begin_tx(&self.db)?;
+    let props = resolve_node_update(&handle, &self.nodes, self.strict_schema, node_id, props)?;
+    apply_node_props(&mut handle, node_id, props)?;
     commit(&mut handle)?;
     Ok(())
   }
@@ -1570,7 +1785,7 @@ impl Kite {
     }
   }
 
-  /// Set an edge property
+  /// Set an edge property. Fails with `EdgeNotFound` if the edge does not exist.
   pub fn set_edge_prop(
     &mut self,
     src: NodeId,
@@ -1589,13 +1804,14 @@ impl Kite {
       .ok_or_else(|| KiteError::InvalidSchema("Edge type not initialized".into()))?;
 
     let mut handle = begin_tx(&self.db)?;
+    require_edge(&handle, src, etype_id, dst)?;
     let prop_key_id = handle.db.define_propkey(prop_name)?;
     set_edge_prop(&mut handle, src, etype_id, dst, prop_key_id, value)?;
     commit(&mut handle)?;
     Ok(())
   }
 
-  /// Set multiple edge properties
+  /// Set multiple edge properties. Fails with `EdgeNotFound` if the edge does not exist.
   pub fn set_edge_props(
     &mut self,
     src: NodeId,
@@ -1617,6 +1833,7 @@ impl Kite {
       .ok_or_else(|| KiteError::InvalidSchema("Edge type not initialized".into()))?;
 
     let mut handle = begin_tx(&self.db)?;
+    require_edge(&handle, src, etype_id, dst)?;
     let mut prop_pairs = Vec::with_capacity(props.len());
     for (prop_name, value) in props {
       let prop_key_id = if let Some(&id) = edge_def.prop_key_ids.get(&prop_name) {
@@ -2767,21 +2984,13 @@ impl Kite {
             KiteError::InvalidSchema(format!("Unknown node type: {node_type}").into())
           })?;
 
-          let full_key = node_def.key(&key_suffix);
-
-          let node_opts = NodeOpts {
-            key: Some(full_key.clone()),
-            labels: node_def.label_id.map(|id| vec![id]),
-            props: None,
-          };
-          let node_id = create_node(&mut handle, node_opts)?;
-
-          // Set properties
-          for (prop_name, value) in props {
-            if let Some(&prop_key_id) = node_def.prop_key_ids.get(&prop_name) {
-              set_node_prop(&mut handle, node_id, prop_key_id, value)?;
-            }
-          }
+          let (node_id, full_key) = create_typed_node(
+            &mut handle,
+            node_def,
+            self.strict_schema,
+            &key_suffix,
+            props,
+          )?;
 
           BatchResult::NodeCreated(NodeRef::new(node_id, Some(full_key), node_type))
         }
@@ -2855,9 +3064,14 @@ impl Kite {
           prop_name,
           value,
         } => {
-          // Use handle.db to access schema methods while handle is active
-          let prop_key_id = handle.db.define_propkey(&prop_name)?;
-          set_node_prop(&mut handle, node_id, prop_key_id, value)?;
+          let props = resolve_node_update(
+            &handle,
+            &self.nodes,
+            self.strict_schema,
+            node_id,
+            [(prop_name, Some(value))],
+          )?;
+          apply_node_props(&mut handle, node_id, props)?;
           BatchResult::PropSet
         }
 
@@ -2870,6 +3084,7 @@ impl Kite {
         } => {
           let entry = resolve_edge_cache_entry(&mut edge_cache, &self.edges, &edge_type)?;
           let etype_id = entry.etype_id;
+          require_edge(&handle, src, etype_id, dst)?;
 
           let prop_key_id = if let Some(&id) = entry.prop_key_ids.get(&prop_name) {
             id
@@ -2891,6 +3106,7 @@ impl Kite {
         } => {
           let entry = resolve_edge_cache_entry(&mut edge_cache, &self.edges, &edge_type)?;
           let etype_id = entry.etype_id;
+          require_edge(&handle, src, etype_id, dst)?;
 
           let mut prop_pairs = Vec::with_capacity(props.len());
           for (prop_name, value) in props {
@@ -2943,6 +3159,7 @@ pub struct TxContext<'a> {
   handle: TxHandle<'a>,
   nodes: &'a HashMap<String, NodeDef>,
   edges: &'a HashMap<String, EdgeDef>,
+  strict_schema: bool,
 }
 
 impl<'a> TxContext<'a> {
@@ -2956,24 +3173,15 @@ impl<'a> TxContext<'a> {
     let node_def = self
       .nodes
       .get(node_type)
-      .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown node type: {node_type}").into()))?
-      .clone();
+      .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown node type: {node_type}").into()))?;
 
-    let full_key = node_def.key(key_suffix);
-
-    let node_opts = NodeOpts {
-      key: Some(full_key.clone()),
-      labels: node_def.label_id.map(|id| vec![id]),
-      props: None,
-    };
-    let node_id = create_node(&mut self.handle, node_opts)?;
-
-    // Set properties
-    for (prop_name, value) in props {
-      if let Some(&prop_key_id) = node_def.prop_key_ids.get(&prop_name) {
-        set_node_prop(&mut self.handle, node_id, prop_key_id, value)?;
-      }
-    }
+    let (node_id, full_key) = create_typed_node(
+      &mut self.handle,
+      node_def,
+      self.strict_schema,
+      key_suffix,
+      props,
+    )?;
 
     Ok(NodeRef::new(node_id, Some(full_key), node_type))
   }
@@ -3012,11 +3220,16 @@ impl<'a> TxContext<'a> {
     delete_edge(&mut self.handle, src, etype_id, dst)
   }
 
-  /// Set a node property
+  /// Set a node property. Fails with `NodeNotFound` if the node does not exist.
   pub fn set_prop(&mut self, node_id: NodeId, prop_name: &str, value: PropValue) -> Result<()> {
-    let prop_key_id = self.handle.db.define_propkey(prop_name)?;
-    set_node_prop(&mut self.handle, node_id, prop_key_id, value)?;
-    Ok(())
+    let props = resolve_node_update(
+      &self.handle,
+      self.nodes,
+      self.strict_schema,
+      node_id,
+      [(prop_name.to_string(), Some(value))],
+    )?;
+    apply_node_props(&mut self.handle, node_id, props)
   }
 
   /// Delete a node property
@@ -3112,6 +3325,7 @@ impl Kite {
       handle,
       nodes: &self.nodes,
       edges: &self.edges,
+      strict_schema: self.strict_schema,
     };
 
     match f(&mut ctx) {
@@ -3341,21 +3555,14 @@ impl<'a> KiteUpdateNodeBuilder<'a> {
     }
 
     let mut handle = begin_tx(&self.ray.db)?;
-
-    for (prop_name, value_opt) in self.updates {
-      let prop_key_id = self.ray.db.define_propkey(&prop_name)?;
-
-      match value_opt {
-        Some(value) => {
-          set_node_prop(&mut handle, self.node_id, prop_key_id, value)?;
-        }
-        None => {
-          // Only delete if prop exists
-          del_node_prop(&mut handle, self.node_id, prop_key_id)?;
-        }
-      }
-    }
-
+    let props = resolve_node_update(
+      &handle,
+      &self.ray.nodes,
+      self.ray.strict_schema,
+      self.node_id,
+      self.updates,
+    )?;
+    apply_node_props(&mut handle, self.node_id, props)?;
     commit(&mut handle)?;
     Ok(())
   }
@@ -3406,23 +3613,20 @@ impl<'a> KiteUpsertByIdBuilder<'a> {
   pub fn execute(self) -> Result<()> {
     let mut handle = begin_tx(&self.ray.db)?;
 
-    let mut updates = Vec::with_capacity(self.updates.len());
-    for (prop_name, value_opt) in self.updates {
-      let prop_key_id = if let Some(&id) = self.node_def.prop_key_ids.get(&prop_name) {
-        id
-      } else {
-        self.ray.db.define_propkey(&prop_name)?
-      };
-      updates.push((prop_key_id, value_opt));
-    }
-
     let opts = NodeOpts {
       key: None,
       labels: self.node_def.label_id.map(|id| vec![id]),
       props: None,
     };
 
-    upsert_node_by_id_with_props(&mut handle, self.node_id, opts, updates)?;
+    upsert_node_by_id_with_props(
+      &mut handle,
+      self.node_id,
+      opts,
+      &self.node_def,
+      self.ray.strict_schema,
+      self.updates,
+    )?;
 
     commit(&mut handle)?;
     Ok(())
@@ -3543,22 +3747,26 @@ pub struct InsertExecutorSingle<'a> {
 impl<'a> InsertExecutorSingle<'a> {
   /// Execute the insert and return the created node reference
   pub fn returning(self) -> Result<NodeRef> {
-    let node_type: Arc<str> = self.node_type.into();
+    let node_def = self.ray.nodes.get(&self.node_type);
     let mut handle = begin_tx(&self.ray.db)?;
 
-    // Create the node
+    let props = resolve_node_props(
+      handle.db,
+      node_def,
+      self.ray.strict_schema,
+      NodeWrite::Create,
+      self
+        .props
+        .into_iter()
+        .map(|(name, value)| (name, Some(value))),
+    )?;
     let node_opts = NodeOpts::new().with_key(self.full_key.clone());
     let node_id = create_node(&mut handle, node_opts)?;
-
-    // Set properties
-    for (prop_name, value) in self.props {
-      let prop_key_id = self.ray.db.define_propkey(&prop_name)?;
-      set_node_prop(&mut handle, node_id, prop_key_id, value)?;
-    }
+    apply_node_props(&mut handle, node_id, props)?;
 
     commit(&mut handle)?;
 
-    Ok(NodeRef::new(node_id, Some(self.full_key), node_type))
+    Ok(NodeRef::new(node_id, Some(self.full_key), self.node_type))
   }
 
   /// Execute the insert without returning the node reference
@@ -3584,20 +3792,22 @@ impl<'a> InsertExecutorMultiple<'a> {
       return Ok(Vec::new());
     }
 
+    let node_def = self.ray.nodes.get(&self.node_type);
     let mut handle = begin_tx(&self.ray.db)?;
     let mut results = Vec::with_capacity(self.entries.len());
-    let node_type: Arc<str> = self.node_type.into();
+    let node_type: Arc<str> = self.node_type.as_str().into();
 
     for (full_key, props) in self.entries {
-      // Create the node
+      let props = resolve_node_props(
+        handle.db,
+        node_def,
+        self.ray.strict_schema,
+        NodeWrite::Create,
+        props.into_iter().map(|(name, value)| (name, Some(value))),
+      )?;
       let node_opts = NodeOpts::new().with_key(full_key.clone());
       let node_id = create_node(&mut handle, node_opts)?;
-
-      // Set properties
-      for (prop_name, value) in props {
-        let prop_key_id = self.ray.db.define_propkey(&prop_name)?;
-        set_node_prop(&mut handle, node_id, prop_key_id, value)?;
-      }
+      apply_node_props(&mut handle, node_id, props)?;
 
       results.push(NodeRef::new(
         node_id,
@@ -3701,24 +3911,23 @@ pub struct UpsertExecutorSingle<'a> {
 impl<'a> UpsertExecutorSingle<'a> {
   /// Execute the upsert and return the node reference
   pub fn returning(self) -> Result<NodeRef> {
-    let node_type: Arc<str> = self.node_type.into();
+    let node_def = self.ray.nodes.get(&self.node_type);
     let mut handle = begin_tx(&self.ray.db)?;
 
-    let mut updates = Vec::with_capacity(self.props.len());
-    for (prop_name, value) in self.props {
-      let prop_key_id = self.ray.db.define_propkey(&prop_name)?;
-      let value_opt = match value {
-        PropValue::Null => None,
-        other => Some(other),
-      };
-      updates.push((prop_key_id, value_opt));
-    }
-
-    let (node_id, _) = upsert_node_with_props(&mut handle, &self.full_key, updates)?;
+    let (node_id, _) = upsert_node_with_props(
+      &mut handle,
+      &self.full_key,
+      node_def,
+      self.ray.strict_schema,
+      self
+        .props
+        .into_iter()
+        .map(|(name, value)| (name, null_as_unset(value))),
+    )?;
 
     commit(&mut handle)?;
 
-    Ok(NodeRef::new(node_id, Some(self.full_key), node_type))
+    Ok(NodeRef::new(node_id, Some(self.full_key), self.node_type))
   }
 
   /// Execute the upsert without returning the node reference
@@ -3742,22 +3951,21 @@ impl<'a> UpsertExecutorMultiple<'a> {
       return Ok(Vec::new());
     }
 
+    let node_def = self.ray.nodes.get(&self.node_type);
     let mut handle = begin_tx(&self.ray.db)?;
     let mut results = Vec::with_capacity(self.entries.len());
-    let node_type: Arc<str> = self.node_type.into();
+    let node_type: Arc<str> = self.node_type.as_str().into();
 
     for (full_key, props) in self.entries {
-      let mut updates = Vec::with_capacity(props.len());
-      for (prop_name, value) in props {
-        let prop_key_id = self.ray.db.define_propkey(&prop_name)?;
-        let value_opt = match value {
-          PropValue::Null => None,
-          other => Some(other),
-        };
-        updates.push((prop_key_id, value_opt));
-      }
-
-      let (node_id, _) = upsert_node_with_props(&mut handle, &full_key, updates)?;
+      let (node_id, _) = upsert_node_with_props(
+        &mut handle,
+        &full_key,
+        node_def,
+        self.ray.strict_schema,
+        props
+          .into_iter()
+          .map(|(name, value)| (name, null_as_unset(value))),
+      )?;
       results.push(NodeRef::new(
         node_id,
         Some(full_key),
@@ -3837,13 +4045,15 @@ impl<'a> KiteUpdateEdgeBuilder<'a> {
     self
   }
 
-  /// Execute the update, applying all property changes in a single transaction
+  /// Execute the update, applying all property changes in a single transaction.
+  /// Fails with `EdgeNotFound` if the edge does not exist.
   pub fn execute(self) -> Result<()> {
     if self.updates.is_empty() {
       return Ok(());
     }
 
     let mut handle = begin_tx(&self.ray.db)?;
+    require_edge(&handle, self.src, self.etype_id, self.dst)?;
 
     for (prop_name, value_opt) in self.updates {
       let prop_key_id = self.ray.db.define_propkey(&prop_name)?;
@@ -5506,25 +5716,20 @@ mod tests {
       .create_node("User", "bob", HashMap::new())
       .expect("expected value");
 
-    // Try to get prop on nonexistent edge - should fail gracefully
-    // First we need to create the prop key
-    ray
+    // Setting a prop on a missing edge fails and does not create the edge
+    let err = ray
       .set_edge_prop(alice.id, "FOLLOWS", bob.id, "weight", PropValue::F64(0.5))
-      .ok();
+      .expect_err("set_edge_prop on a missing edge");
+    assert!(matches!(err, KiteError::EdgeNotFound { .. }), "{err}");
+    assert!(!ray
+      .has_edge(alice.id, "FOLLOWS", bob.id)
+      .expect("expected value"));
 
     // Edge doesn't exist, so getting props should return None
-    let _props = ray
+    let props = ray
       .edge_props(alice.id, "FOLLOWS", bob.id)
       .expect("expected value");
-    // The edge was implicitly created when we set the prop, so it exists now
-    // Let's test with a truly nonexistent edge
-    let charlie = ray
-      .create_node("User", "charlie", HashMap::new())
-      .expect("expected value");
-    let props2 = ray
-      .edge_props(alice.id, "FOLLOWS", charlie.id)
-      .expect("expected value");
-    assert!(props2.is_none());
+    assert!(props.is_none());
 
     ray.close().expect("expected value");
   }
@@ -6257,5 +6462,160 @@ mod tests {
     assert!(stats.snapshot_edges + stats.delta_edges_added as u64 >= 1);
 
     ray.close().expect("expected value");
+  }
+
+  // ============================================================================
+  // Schema Policy Tests
+  // ============================================================================
+
+  /// `Account` (prefix "account:") and the nested `Admin` (prefix "account:admin:").
+  fn open_policy_kite(temp_dir: &tempfile::TempDir, strict: bool) -> Kite {
+    let account = NodeDef::new("Account", "account:")
+      .prop(PropDef::string("name").required())
+      .prop(PropDef::int("level").default(PropValue::F64(1.0)))
+      .prop(PropDef {
+        name: "meta".to_string(),
+        prop_type: PropType::Any,
+        required: false,
+        default: None,
+      });
+    let admin = NodeDef::new("Admin", "account:admin:").prop(PropDef::bool("root"));
+    let options = KiteOptions::new()
+      .node(account)
+      .node(admin)
+      .strict_schema(strict);
+    Kite::open(temp_db_path(temp_dir), options).expect("expected value")
+  }
+
+  fn named(name: &str) -> HashMap<String, PropValue> {
+    HashMap::from([("name".to_string(), PropValue::String(name.to_string()))])
+  }
+
+  #[test]
+  fn test_default_schema_mode_is_lenient() {
+    let temp_dir = tempdir().expect("expected value");
+    let mut ray = open_policy_kite(&temp_dir, false);
+
+    // `required` and `prop_type` are not enforced; defaults apply as declared.
+    let node = ray
+      .create_node("Account", "anon", HashMap::new())
+      .expect("expected value");
+    assert_eq!(ray.prop(node.id, "name"), None);
+    assert_eq!(ray.prop(node.id, "level"), Some(PropValue::F64(1.0)));
+    ray
+      .set_prop(node.id, "level", PropValue::String("high".into()))
+      .expect("expected value");
+    assert_eq!(
+      ray.prop(node.id, "level"),
+      Some(PropValue::String("high".into()))
+    );
+
+    ray.close().expect("expected value");
+  }
+
+  #[test]
+  fn test_strict_schema_null_is_missing_and_unset_is_allowed() {
+    let temp_dir = tempdir().expect("expected value");
+    let mut ray = open_policy_kite(&temp_dir, true);
+
+    let null_name = HashMap::from([("name".to_string(), PropValue::Null)]);
+    let err = ray
+      .create_node("Account", "null", null_name)
+      .expect_err("Null does not satisfy `required`");
+    assert!(matches!(err, KiteError::SchemaViolation(_)), "{err}");
+    assert!(ray
+      .get("Account", "null")
+      .expect("expected value")
+      .is_none());
+
+    // Defaults go through the type check, so an int default given as F64 is stored as I64.
+    let node = ray
+      .create_node("Account", "alice", named("Alice"))
+      .expect("expected value");
+    assert_eq!(ray.prop(node.id, "level"), Some(PropValue::I64(1)));
+
+    // `required` is a create-time rule: unsetting later is allowed.
+    ray
+      .update_by_id(node.id)
+      .expect("expected value")
+      .unset("name")
+      .execute()
+      .expect("expected value");
+    assert_eq!(ray.prop(node.id, "name"), None);
+
+    ray.close().expect("expected value");
+  }
+
+  #[test]
+  fn test_strict_schema_skips_any_and_non_schema_props() {
+    let temp_dir = tempdir().expect("expected value");
+    let mut ray = open_policy_kite(&temp_dir, true);
+
+    let mut props = named("Bo");
+    props.insert("meta".to_string(), PropValue::I64(7));
+    props.insert("nickname".to_string(), PropValue::Bool(true));
+    let node = ray
+      .create_node("Account", "bo", props)
+      .expect("expected value");
+    ray
+      .set_prop(node.id, "meta", PropValue::String("any".into()))
+      .expect("expected value");
+    assert_eq!(
+      ray.prop(node.id, "meta"),
+      Some(PropValue::String("any".into()))
+    );
+    assert_eq!(ray.prop(node.id, "nickname"), Some(PropValue::Bool(true)));
+
+    ray.close().expect("expected value");
+  }
+
+  #[test]
+  fn test_strict_schema_update_checks_the_nodes_own_type() {
+    let temp_dir = tempdir().expect("expected value");
+    let mut ray = open_policy_kite(&temp_dir, true);
+
+    // "account:admin:root" matches both prefixes; the longer one (Admin) wins.
+    let admin = ray
+      .create_node("Admin", "root", HashMap::new())
+      .expect("expected value");
+    let err = ray
+      .set_prop(admin.id, "root", PropValue::I64(1))
+      .expect_err("Admin.root is a bool");
+    assert!(err.to_string().contains("Admin.root"), "{err}");
+    ray
+      .set_prop(admin.id, "name", PropValue::I64(1))
+      .expect("Admin declares no `name`");
+
+    // Keyless nodes are typed by their label.
+    ray
+      .upsert_by_id("Account", 77)
+      .expect("expected value")
+      .set("name", PropValue::String("Keyless".into()))
+      .execute()
+      .expect("expected value");
+    let err = ray
+      .set_prop(77, "level", PropValue::String("high".into()))
+      .expect_err("Account.level is an int");
+    assert!(err.to_string().contains("Account.level"), "{err}");
+
+    ray.close().expect("expected value");
+  }
+
+  #[test]
+  fn test_lossless_numeric_coercion() {
+    let two_pow_63 = 9_223_372_036_854_775_808.0;
+    assert_eq!(lossless_i64(4.0), Some(4));
+    assert_eq!(lossless_i64(-0.0), Some(0));
+    assert_eq!(lossless_i64(-two_pow_63), Some(i64::MIN));
+    assert_eq!(lossless_i64(two_pow_63), None);
+    assert_eq!(lossless_i64(2.5), None);
+    assert_eq!(lossless_i64(f64::NAN), None);
+    assert_eq!(lossless_i64(f64::INFINITY), None);
+
+    assert_eq!(lossless_f64(3), Some(3.0));
+    assert_eq!(lossless_f64(1 << 53), Some(9_007_199_254_740_992.0));
+    assert_eq!(lossless_f64((1 << 53) + 1), None);
+    assert_eq!(lossless_f64(i64::MIN), Some(-two_pow_63));
+    assert_eq!(lossless_f64(i64::MAX), None);
   }
 }

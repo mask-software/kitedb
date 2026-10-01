@@ -53,6 +53,12 @@ fn person_schema() -> KiteOptions {
     .edge(EdgeDef::new("F"))
 }
 
+/// `required` and `prop_type` are enforced only with the opt-in `strict_schema`; defaults and
+/// non-schema props behave the same in both modes.
+fn strict_person_schema() -> KiteOptions {
+  person_schema().strict_schema(true)
+}
+
 fn user(kite: &mut Kite, key: &str) -> NodeId {
   kite
     .create_node("User", key, HashMap::new())
@@ -292,7 +298,7 @@ fn expect_create_rejected(
   input: Props,
   prop: &str,
 ) {
-  let (_dir, mut kite) = open(person_schema());
+  let (_dir, mut kite) = open(strict_person_schema());
   match create_via(&mut kite, path, key, input) {
     Ok(id) => failures.push(format!(
       "{path:?}: create succeeded (node {id}), expected an error about `{prop}`"
@@ -443,7 +449,7 @@ fn update_via(
 fn audit_j2_prop_type_mismatch_errors_on_update() {
   let mut failures = Vec::new();
   for path in UPDATE_PATHS {
-    let (_dir, mut kite) = open(person_schema());
+    let (_dir, mut kite) = open(strict_person_schema());
     let input = props(&[("name", s("Pat")), ("age", PropValue::I64(30))]);
     let id = kite
       .create_node(PERSON, "pat", input)
@@ -473,7 +479,7 @@ fn audit_j2_prop_type_mismatch_errors_on_update() {
 #[test]
 fn audit_j2_int_float_coercion_only_when_lossless() {
   let mut failures = Vec::new();
-  let (_dir, mut kite) = open(person_schema());
+  let (_dir, mut kite) = open(strict_person_schema());
 
   // Lossless coercions are accepted and stored as the declared type.
   let input = props(&[
