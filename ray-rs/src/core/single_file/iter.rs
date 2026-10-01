@@ -382,9 +382,13 @@ impl SingleFileDB {
 
   /// Get database statistics
   pub fn stats(&self) -> DbStats {
+    // Commit and checkpoints lock wal_buffer and then header.write(): read the
+    // WAL before any other guard, and copy from the header instead of holding it.
+    let wal_bytes = self.wal_stats().used;
+    let recommend_compact = self.should_checkpoint(0.8);
+    let snapshot_gen = self.header.read().active_snapshot_gen;
     let delta = self.delta.read();
     let snapshot = self.snapshot.read();
-    let header = self.header.read();
 
     let (snapshot_nodes, snapshot_edges, snapshot_max_node_id) = if let Some(ref snap) = *snapshot {
       (
@@ -397,7 +401,7 @@ impl SingleFileDB {
     };
 
     DbStats {
-      snapshot_gen: header.active_snapshot_gen,
+      snapshot_gen,
       snapshot_nodes,
       snapshot_edges,
       snapshot_max_node_id,
@@ -406,8 +410,8 @@ impl SingleFileDB {
       delta_edges_added: delta.total_edges_added(),
       delta_edges_deleted: delta.total_edges_deleted(),
       wal_segment: 0, // Not applicable for single-file
-      wal_bytes: self.wal_stats().used,
-      recommend_compact: self.should_checkpoint(0.8),
+      wal_bytes,
+      recommend_compact,
       mvcc_stats: self.mvcc.as_ref().map(|mvcc| {
         let tx_mgr = mvcc.tx_manager.lock();
         let gc = mvcc.gc.lock();
