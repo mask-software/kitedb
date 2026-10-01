@@ -14,10 +14,19 @@ This crate provides the Rust core and the high-level Kite API.
 
 ## Install
 
+```sh
+cargo add kitedb --no-default-features
+```
+
+or in `Cargo.toml`:
+
 ```toml
 [dependencies]
-kitedb = "0.1"
+kitedb = { version = "0.2", default-features = false }
 ```
+
+The default `napi` feature compiles the Node.js (N-API) binding layer used by
+the `@kitedb/core` npm package. Rust programs don't need it.
 
 ## Quick start (Kite API)
 

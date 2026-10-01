@@ -151,7 +151,7 @@ pub struct OpenOptions {
   pub mvcc_max_chain_depth: Option<i64>,
   /// Page size in bytes (must be a supported positive power of two)
   pub page_size: Option<u32>,
-  /// WAL size in bytes (must be positive and at least 16 pages)
+  /// WAL size in bytes (must be positive and at least 16 pages; default: 4MB)
   pub wal_size: Option<u32>,
   /// Enable auto-checkpoint when WAL usage exceeds threshold
   pub auto_checkpoint: Option<bool>,

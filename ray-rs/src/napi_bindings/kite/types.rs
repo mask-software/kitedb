@@ -84,7 +84,7 @@ pub struct JsKiteOptions {
   pub group_commit_enabled: Option<bool>,
   /// Group commit window in milliseconds (0 adds no coalescing delay)
   pub group_commit_window_ms: Option<i64>,
-  /// WAL size in megabytes (must be positive)
+  /// WAL size in megabytes (must be positive; default: 4)
   pub wal_size_mb: Option<i64>,
   /// WAL usage threshold (0.0-1.0) to trigger auto-checkpoint
   pub checkpoint_threshold: Option<f64>,

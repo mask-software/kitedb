@@ -3,7 +3,7 @@
  *
  * @example
  * ```typescript
- * import { kite, defineNode, defineEdge, string, int, optional } from 'kitedb-core'
+ * import { kite, defineNode, defineEdge, string, int, optional } from '@kitedb/core'
  *
  * // Define schema
  * const User = defineNode('user', {
@@ -76,9 +76,15 @@ export type { RuntimeProfile } from '../index'
 import {
   kite as nativeKite,
   kiteSync as nativeKiteSync,
+  openDatabase as nativeOpenDatabase,
+  Database as NativeDatabase,
   Kite as NativeKite,
   KiteInsertBuilder as NativeKiteInsertBuilder,
   KiteUpsertBuilder as NativeKiteUpsertBuilder,
+  KiteUpdateBuilder as NativeKiteUpdateBuilder,
+  KiteUpdateEdgeBuilder as NativeKiteUpdateEdgeBuilder,
+  KiteUpsertByIdBuilder as NativeKiteUpsertByIdBuilder,
+  KiteUpsertEdgeBuilder as NativeKiteUpsertEdgeBuilder,
   KiteTraversal as NativeKiteTraversal,
   KitePath as NativeKitePath,
 } from '../index'
@@ -93,15 +99,16 @@ import type {
   JsTraverseOptions,
   JsPathResult,
   JsFullEdge,
-  Database,
+  JsEdge,
+  JsNodeProp,
+  OpenOptions,
+  PaginationOptions,
+  NodePage,
+  EdgePage,
   KiteInsertExecutorSingle,
   KiteInsertExecutorMany,
   KiteUpsertExecutorSingle,
   KiteUpsertExecutorMany,
-  KiteUpdateBuilder,
-  KiteUpdateEdgeBuilder,
-  KiteUpsertByIdBuilder,
-  KiteUpsertEdgeBuilder,
 } from '../index'
 
 import type {
@@ -300,6 +307,83 @@ export class KiteUpsertBuilder<N extends NodeSpec = NodeSpec> extends NativeKite
       return entry
     })
     return super.valuesMany(normalized) as UpsertExecutorMany<N>
+  }
+}
+
+type NativePropBuilder = abstract new (...args: any[]) => {
+  set(propName: string, value: unknown): void
+  unset(propName: string): void
+  setAll(props: object): void
+}
+
+interface ChainablePropBuilder {
+  /** Set a property */
+  set(propName: string, value: unknown): this
+  /** Remove a property */
+  unset(propName: string): this
+  /** Set multiple properties at once */
+  setAll(props: object): this
+}
+
+/**
+ * Native property builders mutate in place and return void. Return the builder
+ * so calls chain: `db.update(User, 'alice').set('name', 'Alicia').execute()`.
+ *
+ * The explicit return type keeps `this` in emitted declarations; an inferred
+ * mixin type degrades it to `any`. The chainable signatures come first so they
+ * win overload resolution over the native `void` ones.
+ */
+function chainablePropBuilder<TBase extends NativePropBuilder>(
+  Base: TBase,
+): (abstract new (...args: any[]) => ChainablePropBuilder) & TBase {
+  abstract class Chainable extends Base {
+    set(propName: string, value: unknown): this {
+      super.set(propName, value)
+      return this
+    }
+
+    unset(propName: string): this {
+      super.unset(propName)
+      return this
+    }
+
+    setAll(props: object): this {
+      super.setAll(props)
+      return this
+    }
+  }
+  return Chainable
+}
+
+/** Builder for updating node properties */
+export class KiteUpdateBuilder extends chainablePropBuilder(NativeKiteUpdateBuilder) {
+  static wrap(builder: NativeKiteUpdateBuilder): KiteUpdateBuilder {
+    Object.setPrototypeOf(builder, KiteUpdateBuilder.prototype)
+    return builder as KiteUpdateBuilder
+  }
+}
+
+/** Builder for upserting a node by ID */
+export class KiteUpsertByIdBuilder extends chainablePropBuilder(NativeKiteUpsertByIdBuilder) {
+  static wrap(builder: NativeKiteUpsertByIdBuilder): KiteUpsertByIdBuilder {
+    Object.setPrototypeOf(builder, KiteUpsertByIdBuilder.prototype)
+    return builder as KiteUpsertByIdBuilder
+  }
+}
+
+/** Builder for updating edge properties */
+export class KiteUpdateEdgeBuilder extends chainablePropBuilder(NativeKiteUpdateEdgeBuilder) {
+  static wrap(builder: NativeKiteUpdateEdgeBuilder): KiteUpdateEdgeBuilder {
+    Object.setPrototypeOf(builder, KiteUpdateEdgeBuilder.prototype)
+    return builder as KiteUpdateEdgeBuilder
+  }
+}
+
+/** Builder for upserting edges (create if missing, update properties) */
+export class KiteUpsertEdgeBuilder extends chainablePropBuilder(NativeKiteUpsertEdgeBuilder) {
+  static wrap(builder: NativeKiteUpsertEdgeBuilder): KiteUpsertEdgeBuilder {
+    Object.setPrototypeOf(builder, KiteUpsertEdgeBuilder.prototype)
+    return builder as KiteUpsertEdgeBuilder
   }
 }
 
@@ -771,15 +855,19 @@ export class Kite extends NativeKite {
   }
 
   updateByKey(nodeType: NodeLike, key: unknown): KiteUpdateBuilder {
-    return super.updateByKey(nodeName(nodeType), key)
+    return KiteUpdateBuilder.wrap(super.updateByKey(nodeName(nodeType), key))
   }
 
   update(nodeType: NodeLike, key: unknown): KiteUpdateBuilder {
     return this.updateByKey(nodeType, key)
   }
 
+  updateById(node: NodeIdLike): KiteUpdateBuilder {
+    return KiteUpdateBuilder.wrap(super.updateById(nodeId(node)))
+  }
+
   upsertById(nodeType: NodeLike, nodeId: number): KiteUpsertByIdBuilder {
-    return super.upsertById(nodeName(nodeType), nodeId)
+    return KiteUpsertByIdBuilder.wrap(super.upsertById(nodeName(nodeType), nodeId))
   }
 
   link(src: NodeIdLike, edgeType: EdgeLike, dst: NodeIdLike, props?: object | null): void
@@ -841,11 +929,11 @@ export class Kite extends NativeKite {
   }
 
   updateEdge(src: NodeIdLike, edgeType: EdgeLike, dst: NodeIdLike): KiteUpdateEdgeBuilder {
-    return super.updateEdge(nodeId(src), edgeName(edgeType), nodeId(dst))
+    return KiteUpdateEdgeBuilder.wrap(super.updateEdge(nodeId(src), edgeName(edgeType), nodeId(dst)))
   }
 
   upsertEdge(src: NodeIdLike, edgeType: EdgeLike, dst: NodeIdLike): KiteUpsertEdgeBuilder {
-    return super.upsertEdge(nodeId(src), edgeName(edgeType), nodeId(dst))
+    return KiteUpsertEdgeBuilder.wrap(super.upsertEdge(nodeId(src), edgeName(edgeType), nodeId(dst)))
   }
 
   all(nodeType: NodeLike): Array<object> {
@@ -973,6 +1061,149 @@ export interface KiteTraversal {
 }
 
 // =============================================================================
+// Database Wrapper (low-level API)
+// =============================================================================
+
+function toDatabase(native: NativeDatabase): Database {
+  Object.setPrototypeOf(native, Database.prototype)
+  return native as Database
+}
+
+/**
+ * Low-level database handle.
+ *
+ * The native binding exposes its getters in snake_case (`get_node_by_key`).
+ * This wrapper adds camelCase names matching the rest of the API; the
+ * snake_case names keep working.
+ */
+export class Database extends NativeDatabase {
+  /** Open a database file */
+  static open(path: string, options?: OpenOptions | null): Database {
+    return toDatabase(NativeDatabase.open(path, options))
+  }
+
+  /** Get node ID by key */
+  getNodeByKey(key: string): number | null {
+    return super.get_node_by_key(key)
+  }
+
+  /** Get the key for a node */
+  getNodeKey(nodeId: number): string | null {
+    return super.get_node_key(nodeId)
+  }
+
+  /** Get outgoing edges for a node */
+  getOutEdges(nodeId: number): Array<JsEdge> {
+    return super.get_out_edges(nodeId)
+  }
+
+  /** Get incoming edges for a node */
+  getInEdges(nodeId: number): Array<JsEdge> {
+    return super.get_in_edges(nodeId)
+  }
+
+  /** Get out-degree for a node */
+  getOutDegree(nodeId: number): number {
+    return super.get_out_degree(nodeId)
+  }
+
+  /** Get in-degree for a node */
+  getInDegree(nodeId: number): number {
+    return super.get_in_degree(nodeId)
+  }
+
+  /** Get a page of node IDs */
+  getNodesPage(options?: PaginationOptions | null): NodePage {
+    return super.get_nodes_page(options)
+  }
+
+  /** Get a page of edges */
+  getEdgesPage(options?: PaginationOptions | null): EdgePage {
+    return super.get_edges_page(options)
+  }
+
+  /** Get a specific node property */
+  getNodeProp(nodeId: number, keyId: number): JsPropValue | null {
+    return super.get_node_prop(nodeId, keyId)
+  }
+
+  /** Get all properties for a node (array of {keyId, value} pairs) */
+  getNodeProps(nodeId: number): Array<JsNodeProp> | null {
+    return super.get_node_props(nodeId)
+  }
+
+  /** Get a specific edge property */
+  getEdgeProp(src: number, etype: number, dst: number, keyId: number): JsPropValue | null {
+    return super.get_edge_prop(src, etype, dst, keyId)
+  }
+
+  /** Get all properties for an edge (array of {keyId, value} pairs) */
+  getEdgeProps(src: number, etype: number, dst: number): Array<JsNodeProp> | null {
+    return super.get_edge_props(src, etype, dst)
+  }
+
+  /** Get a vector embedding for a node */
+  getNodeVector(nodeId: number, propKeyId: number): Array<number> | null {
+    return super.get_node_vector(nodeId, propKeyId)
+  }
+
+  /** Get or create a label ID */
+  getOrCreateLabel(name: string): number {
+    return super.get_or_create_label(name)
+  }
+
+  /** Get label ID by name */
+  getLabelId(name: string): number | null {
+    return super.get_label_id(name)
+  }
+
+  /** Get label name by ID */
+  getLabelName(id: number): string | null {
+    return super.get_label_name(id)
+  }
+
+  /** Get or create an edge type ID */
+  getOrCreateEtype(name: string): number {
+    return super.get_or_create_etype(name)
+  }
+
+  /** Get edge type ID by name */
+  getEtypeId(name: string): number | null {
+    return super.get_etype_id(name)
+  }
+
+  /** Get edge type name by ID */
+  getEtypeName(id: number): string | null {
+    return super.get_etype_name(id)
+  }
+
+  /** Get or create a property key ID */
+  getOrCreatePropkey(name: string): number {
+    return super.get_or_create_propkey(name)
+  }
+
+  /** Get property key ID by name */
+  getPropkeyId(name: string): number | null {
+    return super.get_propkey_id(name)
+  }
+
+  /** Get property key name by ID */
+  getPropkeyName(id: number): string | null {
+    return super.get_propkey_name(id)
+  }
+
+  /** Get all labels for a node */
+  getNodeLabels(nodeId: number): Array<number> {
+    return super.get_node_labels(nodeId)
+  }
+}
+
+/** Open a database file (standalone function) */
+export function openDatabase(path: string, options?: OpenOptions | null): Database {
+  return toDatabase(nativeOpenDatabase(path, options))
+}
+
+// =============================================================================
 // Bulk Helpers (non-atomic)
 // =============================================================================
 
@@ -985,9 +1216,9 @@ export interface BulkWriteOptions {
   checkpointThreshold?: number
 }
 
-export function bulkWrite<T>(
-  db: Database,
-  operations: Array<(db: Database) => T>,
+export function bulkWrite<T, D extends NativeDatabase = Database>(
+  db: D,
+  operations: Array<(db: D) => T>,
   options?: BulkWriteOptions,
 ): Array<T> {
   if (operations.length === 0) {
@@ -1048,16 +1279,11 @@ export function bulkWrite<T>(
 
 // Re-export other classes with clean names
 export {
-  Database,
   VectorIndex,
   KiteInsertExecutorSingle,
   KiteInsertExecutorMany,
-  KiteUpdateBuilder,
-  KiteUpdateEdgeBuilder,
   KiteUpsertExecutorSingle,
   KiteUpsertExecutorMany,
-  KiteUpsertByIdBuilder,
-  KiteUpsertEdgeBuilder,
 } from '../index'
 
 // Re-export enums with clean names
@@ -1072,7 +1298,6 @@ export {
 
 // Re-export utility functions
 export {
-  openDatabase,
   recommendedSafeProfile,
   recommendedBalancedProfile,
   recommendedReopenHeavyProfile,
@@ -1224,7 +1449,7 @@ export interface KiteOptions {
   groupCommitEnabled?: boolean
   /** Group commit window in milliseconds */
   groupCommitWindowMs?: number
-  /** WAL size in megabytes (default: 1MB) */
+  /** WAL size in megabytes (default: 4) */
   walSizeMb?: number
   /** WAL usage threshold (0.0-1.0) to trigger auto-checkpoint */
   checkpointThreshold?: number

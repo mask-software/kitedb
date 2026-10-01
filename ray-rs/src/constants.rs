@@ -67,7 +67,7 @@ pub const DB_HEADER_SIZE: usize = 4096;
 /// Database header reserved area size - reduced for V2 fields
 pub const DB_HEADER_RESERVED_SIZE: usize = 14;
 
-/// Default WAL buffer size (1MB - grows dynamically as needed)
+/// Default WAL size (4MB). The WAL is fixed-size: it does not grow on its own.
 pub const WAL_DEFAULT_SIZE: usize = 4 * 1024 * 1024;
 
 /// Minimum WAL to snapshot ratio (10%)

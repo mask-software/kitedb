@@ -5,7 +5,7 @@
  *
  * @example
  * ```typescript
- * import { node, edge, string, int, optional } from 'kitedb-core'
+ * import { node, edge, string, int, optional } from '@kitedb/core'
  *
  * const User = node('user', {
  *   key: (id: string) => `user:${id}`,
