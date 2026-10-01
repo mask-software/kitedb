@@ -4,7 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Added
+- `KiteOptions::strict_schema(true)` (Rust) enforces `required` props on create and checks values against their declared `prop_type` on every create/update (int<->float coerced only when lossless), failing with the new `KiteError::SchemaViolation`. Off by default.
+- CI runs Rust tests, clippy, rustfmt, and the Node (ava), Python (pytest) and Bun (playground, tui) suites on every pull request and push to main.
+
 ### Changed
+- **Snapshot format v5**: the node-id map switches to a sparse sorted table when ids are spread out, and section sizes and string offsets are 64-bit. Huge custom node ids (e.g. 3e9, 2^40, `i64::MAX`) no longer make checkpoints and opens allocate gigabytes or leave the database unopenable, and sections beyond 4 GiB round-trip. v4 databases still open and are upgraded at the next checkpoint; older releases cannot open v5 snapshots.
+- Node keys are unique: creating a node (single, by id, or in a batch) with a key held by a live node fails with `DuplicateKey`. Upserts still resolve to the existing node.
+- Adding an edge whose source or destination node does not exist fails with `NodeNotFound`; re-adding an existing edge is a no-op. Setting properties on a missing node or edge fails with `NodeNotFound` / the new `EdgeNotFound`.
+- Explicit node ids above `i64::MAX` are rejected, and the id allocator returns an error instead of wrapping. The Node and Python bindings reject negative, fractional, NaN/Infinity and (Node) above-`Number.MAX_SAFE_INTEGER` ids.
+- `VectorIndex` normalizes stored vectors only for cosine by default; Euclidean and dot-product indexes keep raw vectors. In Rust, `IvfIndex`/`IvfPqIndex` `search`, `search_multi` and `delete` now return `Result`.
+- TS: an async `transaction()` no longer absorbs writes from other async contexts. Outside writes and sync transactions throw; outside async transactions wait their turn. Node props named `id`, `key` or `type` are rejected at schema definition.
+- `create_node`, batch `CreateNode` and `TxContext::create_node` keep properties outside the node schema, consistent with insert/upsert/set_prop, and declared defaults are applied on every create path.
+- Backup blocks commits and checkpoints while it copies, fsyncs the result, and requires no open transaction on the calling thread. Restore writes a temp file and renames it into place, and refuses a target that is open.
 - **On-disk format**: the database file now stores two checksummed header pages (pages 0-1) with the WAL starting at page 2, so a torn header write can no longer make a database unopenable. Existing single-header files are migrated automatically and crash-safely (temp file + atomic rename) on their first writable open; read-only opens of legacy files work without migration. Releases up to v0.2.18 read only the first header page, so do not open a converted file with them.
 - Checkpoints are copy-on-write: the new snapshot is written to a fresh region and fsynced before the header flips, so a crash mid-checkpoint can no longer destroy the only valid snapshot. Retired snapshot regions are reused when the next snapshot fits, keeping file growth bounded; vacuum still performs full compaction.
 - Writable opens take an exclusive file lock (shared for read-only), preventing two processes from corrupting the same database. Replica bootstrap reads a live primary without taking its lock.
@@ -24,3 +36,18 @@ All notable changes to this project will be documented in this file.
 - Numeric options passed through the Node and Python bindings are range-validated with clear errors instead of silently wrapping (e.g. a negative cache size becoming a huge capacity, `cacheSize: 0` panicking).
 - The TypeScript `transaction()`/`batch()` helpers preserve the original commit error instead of masking it with `No active transaction` from the cleanup rollback.
 - Fix ray schema ID reuse and add persistence integration tests (`5d73b0c`).
+- Deleting an edge that lives in the snapshot after re-adding it now hides it, instead of leaving it visible forever and double-counting it. WAL replay drops dangling edges written by older versions, which previously made every checkpoint fail.
+- Deleting a node deletes its vector embeddings, and ids of deleted nodes are no longer reused after a checkpoint and reopen.
+- Lookups by out-of-range node ids (e.g. 2^62+1, `u64::MAX`) miss instead of panicking or returning another node's data, and the snapshot writer fails a checkpoint cleanly, before anything is installed, if a count exceeds a 32-bit field.
+- Deadlocks: export racing a commit or background checkpoint, `stats()`/metrics scrapes racing a commit, MVCC reads racing GC or commits, and `node_by_key` inside an MVCC transaction (Kite `update_by_key`, upserts). MVCC readers follow one documented lock order.
+- MVCC GC prunes label version chains, and chain truncation keeps the version the oldest active reader needs.
+- Export -> import no longer loses node props, edge type names and edge props after a checkpoint; older export files still import. `createBackup`/`restoreBackup` with an extension-less path no longer overwrite an existing `.kitedb` despite `overwrite: false`, and backups taken under load are no longer torn.
+- Replication: replicas receive label, edge-type and property-key names and translate the primary's ids to their own, so a Kite opened on a replica reads the primary's values by name (the mapping persists, is rebuilt on reseed, and is re-announced on promotion). Normal/Off-sync primaries publish buffered frames within ~100 ms and flag `sidecar_needs_repair` after a crash that lost buffered frames. Catch-up replay converges after a crash, reseed handles moved and swapped keys, and a permanently missing log range escalates to `needs_reseed`.
+- Vector search: cosine with `normalize: false` ranks by true cosine; IVF/IVF-PQ return errors instead of crashing on wrong-length vectors or mismatched manifests (Node no longer aborts, Python raises `ValueError`); multi-query `Sum`/`Avg`/`Max` aggregate every candidate's distance to every query; a rejected `VectorIndex.set` no longer drops the node's existing ANN entry; `bruteForceSearch` cosine is correct for non-unit vectors and rejects zero vectors.
+- Traversal `count()` always equals the number of results the traversal yields.
+- Python: long-running calls (open/close, begin/commit, checkpoint, optimize, vacuum, export/import, backup/restore, replication catch-up, `wait_for_token`, index training, OTLP pushes) release the GIL; interrupted transactions are rolled back; `VectorIndex.search` no longer drops hits evicted from its cache; multi-hop traversals no longer return duplicates.
+- Node: retried insert/upsert executors (e.g. `batchAdaptive` after WAL-full) keep their props, and `whereNode`/`whereEdge` callbacks are released when the traversal is collected.
+- Playground graph view, path finding and impact analysis work again on the native engine.
+
+### Security
+- Playground: uploads are stored under a fixed name in a private temp directory, so a crafted filename can no longer write outside it. The server binds `127.0.0.1` by default (`PLAYGROUND_HOST`), allows only listed CORS origins (`PLAYGROUND_ALLOWED_ORIGINS`), opens databases only inside `PLAYGROUND_DATA_DIR`, and disables replication admin endpoints unless `REPLICATION_ADMIN_TOKEN` or mTLS is configured (tokens compared in constant time).
