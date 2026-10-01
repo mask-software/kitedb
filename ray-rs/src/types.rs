@@ -55,6 +55,8 @@ bitflags::bitflags! {
         const HAS_NODE_LABELS = 1 << 4;
         const HAS_VECTORS = 1 << 5;
         const HAS_VECTOR_STORES = 1 << 6;
+        /// NodeIdToPhys uses the sparse (node_id, phys) layout (v5+).
+        const SPARSE_NODE_ID_MAP = 1 << 7;
     }
 }
 
@@ -82,7 +84,7 @@ pub struct SectionEntry {
   pub offset: u64,            // byte offset in file
   pub length: u64,            // size on disk (compressed size if compressed)
   pub compression: u32,       // 0 = none, 1 = zstd, 2 = gzip, 3 = deflate
-  pub uncompressed_size: u32, // original size before compression (0 if uncompressed)
+  pub uncompressed_size: u64, // original size before compression (u32 on disk before v5)
 }
 
 /// Section identifiers
@@ -162,8 +164,12 @@ impl SectionId {
   }
 }
 
-/// Section entry size in bytes
-pub const SECTION_ENTRY_SIZE: usize = 8 + 8 + 4 + 4; // 24 bytes
+/// Section entry size in bytes (v5+): offset u64, length u64, compression u32,
+/// uncompressed_size u64 (unaligned, at +20), reserved u32.
+pub const SECTION_ENTRY_SIZE: usize = 8 + 8 + 4 + 8 + 4; // 32 bytes
+
+/// Section entry size before v5, when uncompressed_size was a u32 at +20.
+pub const SECTION_ENTRY_SIZE_V4: usize = 8 + 8 + 4 + 4; // 24 bytes
 
 /// Header fixed size
 pub const SNAPSHOT_HEADER_SIZE: usize = 4 + 4 + 4 + 4 + 8 + 8 + 8 * 7; // 88 bytes

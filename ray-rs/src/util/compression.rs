@@ -11,9 +11,10 @@ use std::io::{Read, Write};
 
 /// Absolute decompressed-size ceiling for untrusted snapshot metadata.
 ///
-/// On 64-bit targets the snapshot format can describe sections up to 4 GiB,
-/// which keeps legitimate large graph sections readable. On 32-bit and
-/// wasm32 targets the lower ceiling avoids exhausting the address space.
+/// Only compressed sections are inflated into memory, so only they are
+/// capped: 4 GiB on 64-bit targets, and a lower ceiling on 32-bit and wasm32
+/// targets to avoid exhausting the address space. `maybe_compress` leaves
+/// larger data uncompressed, so writers never emit a section readers refuse.
 /// `decompress_with_size` uses the CRC-covered declared size exactly; this
 /// ceiling is enforced while validating the section table. The sizeless
 /// `decompress` API uses it as its fallback bomb limit.
@@ -201,17 +202,19 @@ pub fn decompress_with_size(
   Ok(output)
 }
 
+/// Whether `len` bytes are worth trying to compress. Readers refuse to
+/// inflate more than `MAX_DECOMPRESSED_BYTES`, so larger data stays raw.
+fn should_try_compress(len: usize, options: &CompressionOptions) -> bool {
+  options.enabled && len >= options.min_size && len <= MAX_DECOMPRESSED_BYTES
+}
+
 /// Determine if compression is beneficial for the given data
 ///
 /// Only compresses if:
-/// 1. Data size >= minSize
+/// 1. minSize <= data size <= MAX_DECOMPRESSED_BYTES
 /// 2. Compressed size < original size
 pub fn maybe_compress(data: &[u8], options: &CompressionOptions) -> (Vec<u8>, CompressionType) {
-  if !options.enabled {
-    return (data.to_vec(), CompressionType::None);
-  }
-
-  if data.len() < options.min_size {
+  if !should_try_compress(data.len(), options) {
     return (data.to_vec(), CompressionType::None);
   }
 
@@ -329,6 +332,17 @@ mod tests {
     let (result, compression_type) = maybe_compress(data, &options);
     assert_eq!(compression_type, CompressionType::None);
     assert_eq!(result, data);
+  }
+
+  #[test]
+  fn test_sections_readers_cannot_inflate_stay_uncompressed() {
+    let options = CompressionOptions {
+      enabled: true,
+      ..Default::default()
+    };
+    assert!(should_try_compress(MAX_DECOMPRESSED_BYTES, &options));
+    assert!(!should_try_compress(MAX_DECOMPRESSED_BYTES + 1, &options));
+    assert!(!should_try_compress(usize::MAX, &options));
   }
 
   #[test]

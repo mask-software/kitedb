@@ -4,8 +4,9 @@
 
 use std::borrow::Cow;
 
+use crate::core::snapshot::node_map::{self, NodeIdMapLayout};
 use crate::core::snapshot::reader::SnapshotData;
-use crate::types::{CheckResult, SectionId, KEY_INDEX_ENTRY_SIZE};
+use crate::types::{CheckResult, PhysNode, SectionId, KEY_INDEX_ENTRY_SIZE};
 use crate::util::binary::{read_i32_at, read_u32, read_u32_at, read_u64, read_u64_at};
 
 /// Check all snapshot invariants
@@ -86,6 +87,7 @@ pub fn check_snapshot(snapshot: &SnapshotData) -> CheckResult {
   check_mapping_bijection(
     phys_to_nodeid.as_deref(),
     nodeid_to_phys.as_deref(),
+    snapshot.node_id_map_layout(),
     num_nodes,
     max_node_id,
     &mut errors,
@@ -141,6 +143,7 @@ pub fn check_snapshot(snapshot: &SnapshotData) -> CheckResult {
     string_offsets.as_deref(),
     string_bytes.as_deref(),
     num_strings,
+    snapshot.string_offset_size(),
     &mut errors,
   );
 
@@ -219,10 +222,13 @@ fn check_edge_references(
   }
 }
 
+/// Checks both directions of the NodeID <-> phys mapping, in either
+/// NodeIdToPhys layout.
 #[inline]
 fn check_mapping_bijection(
   phys_to_nodeid: Option<&[u8]>,
   nodeid_to_phys: Option<&[u8]>,
+  layout: NodeIdMapLayout,
   num_nodes: usize,
   max_node_id: u64,
   errors: &mut Vec<String>,
@@ -232,7 +238,7 @@ fn check_mapping_bijection(
     return;
   };
 
-  if phys_to_nodeid.len() < num_nodes * 8 {
+  if phys_to_nodeid.len() / 8 < num_nodes {
     errors.push("phys_to_nodeid section is too small".to_string());
   }
 
@@ -246,36 +252,62 @@ fn check_mapping_bijection(
       continue;
     }
 
-    let node_id_idx = node_id as usize;
-    if node_id_idx * 4 + 4 > nodeid_to_phys.len() {
-      errors.push(format!("nodeid_to_phys out of range for nodeId {node_id}"));
-      continue;
-    }
-    let back_phys = read_i32_at(nodeid_to_phys, node_id_idx);
-    if back_phys != phys as i32 {
-      errors.push(format!(
+    let back_phys = match layout {
+      NodeIdMapLayout::Dense => node_map::dense_lookup(nodeid_to_phys, node_id),
+      NodeIdMapLayout::Sparse => node_map::sparse_lookup(nodeid_to_phys, node_id),
+    };
+    match back_phys {
+      Some(back_phys) if back_phys as usize == phys => {}
+      Some(back_phys) => errors.push(format!(
         "Mapping mismatch: phys {phys} -> nodeId {node_id} -> phys {back_phys}"
-      ));
+      )),
+      None => errors.push(format!("nodeid_to_phys has no entry for nodeId {node_id}")),
     }
   }
 
-  let mapping_size = nodeid_to_phys.len() / 4;
-  for node_id in 0..mapping_size {
-    let phys = read_i32_at(nodeid_to_phys, node_id);
-    if phys == -1 {
-      continue;
-    }
-
-    if phys < 0 || phys as usize >= num_nodes {
+  // Every mapped (nodeId, phys) pair must point back to its nodeId.
+  let check_reverse = |node_id: u64, phys: PhysNode, errors: &mut Vec<String>| {
+    if phys as usize >= phys_limit {
       errors.push(format!("nodeid_to_phys[{node_id}] = {phys} out of range"));
-      continue;
+      return;
     }
-
     let back_node_id = read_u64_at(phys_to_nodeid, phys as usize);
-    if back_node_id != node_id as u64 {
+    if back_node_id != node_id {
       errors.push(format!(
         "Mapping mismatch: nodeId {node_id} -> phys {phys} -> nodeId {back_node_id}"
       ));
+    }
+  };
+
+  match layout {
+    NodeIdMapLayout::Dense => {
+      let mapping_size = nodeid_to_phys.len() / node_map::DENSE_ENTRY_SIZE;
+      for node_id in 0..mapping_size {
+        let phys = read_i32_at(nodeid_to_phys, node_id);
+        if phys == -1 {
+          continue;
+        }
+        match PhysNode::try_from(phys) {
+          Ok(phys) => check_reverse(node_id as u64, phys, errors),
+          Err(_) => errors.push(format!("nodeid_to_phys[{node_id}] = {phys} out of range")),
+        }
+      }
+    }
+    NodeIdMapLayout::Sparse => {
+      if nodeid_to_phys.len() % node_map::SPARSE_ENTRY_SIZE != 0 {
+        errors.push("nodeid_to_phys sparse map has a partial entry".to_string());
+      }
+      let mut previous: Option<u64> = None;
+      for index in 0..node_map::sparse_len(nodeid_to_phys) {
+        let (node_id, phys) = node_map::sparse_entry(nodeid_to_phys, index);
+        if previous.is_some_and(|previous| previous >= node_id) {
+          errors.push(format!(
+            "nodeid_to_phys sparse map not sorted at entry {index}: nodeId {node_id}"
+          ));
+        }
+        previous = Some(node_id);
+        check_reverse(node_id, phys, errors);
+      }
     }
   }
 }
@@ -528,20 +560,25 @@ fn check_string_table_bounds(
   string_offsets: Option<&[u8]>,
   string_bytes: Option<&[u8]>,
   num_strings: usize,
+  offset_size: usize,
   errors: &mut Vec<String>,
 ) {
   let (Some(string_offsets), Some(string_bytes)) = (string_offsets, string_bytes) else {
     return;
   };
 
-  if string_offsets.len() < (num_strings + 1) * 4 {
+  if string_offsets.len() / offset_size <= num_strings {
     errors.push("string_offsets section is too small".to_string());
     return;
   }
 
-  let string_bytes_len = string_bytes.len();
+  let string_bytes_len = string_bytes.len() as u64;
   for i in 0..=num_strings {
-    let offset = read_u32_at(string_offsets, i) as usize;
+    let offset = if offset_size == 8 {
+      read_u64_at(string_offsets, i)
+    } else {
+      u64::from(read_u32_at(string_offsets, i))
+    };
     if offset > string_bytes_len {
       errors.push(format!(
         "string_offsets[{i}] = {offset} > string_bytes length {string_bytes_len}"
