@@ -2211,3 +2211,188 @@ mod tests {
     }
   }
 }
+
+/// Audit S3: every accessor that indexes by a caller-provided ID must return
+/// a miss for out-of-range IDs. Unchecked `idx * N + M` bounds checks wrap for
+/// IDs >= 2^62 (u64 node IDs, usize edge indices) and panic with overflow
+/// checks or alias low entries without them.
+#[cfg(test)]
+mod audit_tests {
+  use super::*;
+  use crate::core::snapshot::writer::{
+    build_snapshot_to_memory, EdgeData, NodeData, SnapshotBuildInput,
+  };
+  use std::fmt::Debug;
+  use std::io::Write;
+  use std::panic::{catch_unwind, AssertUnwindSafe};
+  use tempfile::NamedTempFile;
+
+  const KNOWS: ETypeId = 1;
+  const NAME: PropKeyId = 1;
+  const WEIGHT: PropKeyId = 2;
+
+  /// Nodes 1 and 2 with keys, labels and props; edge 1 -> 2 with a prop.
+  /// NodeIdToPhys is [-1, 0, 1], so IDs 2^62 + 1 and 2^62 + 2 alias nodes 1
+  /// and 2 once `id * 4` wraps.
+  fn small_snapshot() -> (NamedTempFile, SnapshotData) {
+    let node = |node_id: NodeId, key: &str| NodeData {
+      node_id,
+      key: Some(key.to_string()),
+      labels: vec![1],
+      props: HashMap::from([(NAME, PropValue::String(key.to_string()))]),
+    };
+    let buffer = build_snapshot_to_memory(SnapshotBuildInput {
+      generation: 1,
+      nodes: vec![node(1, "alpha"), node(2, "beta")],
+      edges: vec![EdgeData {
+        src: 1,
+        etype: KNOWS,
+        dst: 2,
+        props: HashMap::from([(WEIGHT, PropValue::F64(0.5))]),
+      }],
+      labels: HashMap::from([(1, "Thing".to_string())]),
+      etypes: HashMap::from([(KNOWS, "KNOWS".to_string())]),
+      propkeys: HashMap::from([(NAME, "name".to_string()), (WEIGHT, "weight".to_string())]),
+      vector_stores: None,
+      compression: None,
+    })
+    .expect("build snapshot");
+    let mut file = NamedTempFile::new().expect("temp file");
+    file.write_all(&buffer).expect("write snapshot");
+    file.flush().expect("flush snapshot");
+    let snapshot = SnapshotData::load(file.path()).expect("load snapshot");
+    (file, snapshot)
+  }
+
+  fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+      (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+      message.clone()
+    } else {
+      "non-string panic".to_string()
+    }
+  }
+
+  fn probe<T: PartialEq + Debug>(
+    failures: &mut Vec<String>,
+    what: String,
+    expected: T,
+    f: impl FnOnce() -> T,
+  ) {
+    match catch_unwind(AssertUnwindSafe(f)) {
+      Ok(actual) if actual == expected => {}
+      Ok(actual) => failures.push(format!("{what} = {actual:?}, expected {expected:?}")),
+      Err(payload) => failures.push(format!("{what} panicked: {}", panic_message(&*payload))),
+    }
+  }
+
+  fn assert_no_failures(failures: Vec<String>) {
+    assert!(
+      failures.is_empty(),
+      "out-of-range lookups must miss cleanly:\n{}",
+      failures.join("\n")
+    );
+  }
+
+  #[test]
+  fn s3_phys_node_rejects_node_ids_past_the_mapping() {
+    let (_file, snapshot) = small_snapshot();
+    let mut failures = Vec::new();
+    for id in [
+      3,
+      1 << 32,
+      1 << 62,
+      (1 << 62) + 1,
+      (1 << 62) + 2,
+      (1 << 63) + 1,
+      u64::MAX - 1,
+      u64::MAX,
+    ] {
+      probe(&mut failures, format!("phys_node({id})"), None, || {
+        snapshot.phys_node(id)
+      });
+      probe(&mut failures, format!("has_node({id})"), false, || {
+        snapshot.has_node(id)
+      });
+    }
+    assert_no_failures(failures);
+  }
+
+  /// `edge_props` takes a raw usize. The u32-indexed accessors cannot overflow
+  /// usize on 64-bit targets, but would on wasm32; they are probed here so the
+  /// fix covers them all.
+  #[test]
+  fn s3_index_accessors_reject_indices_past_their_sections() {
+    let (_file, snapshot) = small_snapshot();
+    let mut failures = Vec::new();
+
+    for edge_idx in [1, 1 << 32, 1 << 62, (1 << 62) + 1, usize::MAX] {
+      probe(
+        &mut failures,
+        format!("edge_props({edge_idx})"),
+        None,
+        || snapshot.edge_props(edge_idx),
+      );
+    }
+
+    for phys in [2, u32::MAX] {
+      probe(&mut failures, format!("node_id({phys})"), None, || {
+        snapshot.node_id(phys)
+      });
+      probe(&mut failures, format!("node_key({phys})"), None, || {
+        snapshot.node_key(phys)
+      });
+      probe(&mut failures, format!("node_labels({phys})"), None, || {
+        snapshot.node_labels(phys)
+      });
+      probe(&mut failures, format!("node_props({phys})"), None, || {
+        snapshot.node_props(phys)
+      });
+      probe(&mut failures, format!("node_prop({phys})"), None, || {
+        snapshot.node_prop(phys, NAME)
+      });
+      probe(&mut failures, format!("out_degree({phys})"), None, || {
+        snapshot.out_degree(phys)
+      });
+      probe(&mut failures, format!("in_degree({phys})"), None, || {
+        snapshot.in_degree(phys)
+      });
+      probe(&mut failures, format!("has_edge({phys}, 1)"), false, || {
+        snapshot.has_edge(phys, KNOWS, 1)
+      });
+      probe(&mut failures, format!("has_edge(0, {phys})"), false, || {
+        snapshot.has_edge(0, KNOWS, phys)
+      });
+      probe(
+        &mut failures,
+        format!("find_edge_index({phys}, 1)"),
+        None,
+        || snapshot.find_edge_index(phys, KNOWS, 1),
+      );
+      probe(&mut failures, format!("iter_out_edges({phys})"), 0, || {
+        snapshot.iter_out_edges(phys).count()
+      });
+      probe(&mut failures, format!("iter_in_edges({phys})"), 0, || {
+        snapshot.iter_in_edges(phys).count()
+      });
+    }
+
+    for id in [u32::MAX - 1, u32::MAX] {
+      probe(&mut failures, format!("string({id})"), None, || {
+        snapshot.string(id)
+      });
+      probe(&mut failures, format!("label_name({id})"), None, || {
+        snapshot.label_name(id).map(str::to_string)
+      });
+      probe(&mut failures, format!("etype_name({id})"), None, || {
+        snapshot.etype_name(id).map(str::to_string)
+      });
+      probe(&mut failures, format!("propkey_name({id})"), None, || {
+        snapshot.propkey_name(id).map(str::to_string)
+      });
+    }
+
+    assert_no_failures(failures);
+  }
+}

@@ -1437,3 +1437,149 @@ mod tests {
     assert_eq!(in_csr.offsets, vec![0, 1, 2, 3]);
   }
 }
+
+/// Audit S1/S2: node IDs are user-chosen, so nothing in the snapshot may be
+/// sized by the largest ID, and no ID may make the writer panic.
+#[cfg(test)]
+mod audit_tests {
+  use super::*;
+  use crate::check::check_snapshot;
+  use crate::core::snapshot::reader::SnapshotData;
+  use std::io::Write;
+  use std::panic::{catch_unwind, AssertUnwindSafe};
+  use tempfile::NamedTempFile;
+
+  const KNOWS: ETypeId = 1;
+  const NAME: PropKeyId = 1;
+
+  /// Node 1 and node `high`, linked both ways, with keys and a property.
+  fn two_node_input(high: NodeId) -> SnapshotBuildInput {
+    let node = |node_id: NodeId, key: &str| NodeData {
+      node_id,
+      key: Some(key.to_string()),
+      labels: vec![1],
+      props: HashMap::from([(NAME, PropValue::String(key.to_string()))]),
+    };
+    let edge = |src: NodeId, dst: NodeId| EdgeData {
+      src,
+      etype: KNOWS,
+      dst,
+      props: HashMap::new(),
+    };
+    SnapshotBuildInput {
+      generation: 1,
+      nodes: vec![node(1, "low"), node(high, "high")],
+      edges: vec![edge(1, high), edge(high, 1)],
+      labels: HashMap::from([(1, "Thing".to_string())]),
+      etypes: HashMap::from([(KNOWS, "KNOWS".to_string())]),
+      propkeys: HashMap::from([(NAME, "name".to_string())]),
+      vector_stores: None,
+      compression: None,
+    }
+  }
+
+  fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+      (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+      message.clone()
+    } else {
+      "non-string panic".to_string()
+    }
+  }
+
+  fn build_without_panic(high: NodeId) -> Result<Vec<u8>> {
+    catch_unwind(AssertUnwindSafe(|| {
+      build_snapshot_to_memory(two_node_input(high))
+    }))
+    .unwrap_or_else(|payload| {
+      panic!(
+        "writer panicked for node id {high}: {}",
+        panic_message(&*payload)
+      )
+    })
+  }
+
+  fn assert_two_node_round_trip(buffer: &[u8], high: NodeId) {
+    let mut file = NamedTempFile::new().expect("temp file");
+    file.write_all(buffer).expect("write snapshot");
+    file.flush().expect("flush snapshot");
+    let snapshot = SnapshotData::load(file.path())
+      .unwrap_or_else(|error| panic!("reader rejected snapshot with node id {high}: {error}"));
+
+    let report = check_snapshot(&snapshot);
+    assert!(report.valid, "check_snapshot: {:?}", report.errors);
+    assert_eq!(snapshot.num_nodes(), 2);
+    assert_eq!(snapshot.max_node_id(), high);
+    assert_eq!(snapshot.phys_node(1), Some(0));
+    assert_eq!(snapshot.phys_node(high), Some(1));
+    assert_eq!(snapshot.node_id(1), Some(high));
+    for missing in [0, 2, high - 1] {
+      assert_eq!(snapshot.phys_node(missing), None, "phys_node({missing})");
+    }
+    if let Some(next) = high.checked_add(1) {
+      assert_eq!(snapshot.phys_node(next), None, "phys_node({next})");
+    }
+    assert_eq!(snapshot.lookup_by_key("high"), Some(high));
+    assert_eq!(
+      snapshot.node_prop(1, NAME),
+      Some(PropValue::String("high".to_string()))
+    );
+    assert_eq!(
+      snapshot.iter_out_edges(0).collect::<Vec<_>>(),
+      vec![(1, KNOWS)]
+    );
+    assert_eq!(
+      snapshot.iter_out_edges(1).collect::<Vec<_>>(),
+      vec![(0, KNOWS)]
+    );
+    assert_eq!(snapshot.iter_in_edges(0).count(), 1);
+  }
+
+  /// Scaled-down S1: max id 2^22 already costs a 16 MiB dense section for two
+  /// nodes. IDs >= 2^30 cost >= 4 GiB (S2 truncation), 2^40 costs 4 TiB.
+  #[test]
+  fn s1_snapshot_size_does_not_scale_with_max_node_id() {
+    let high: NodeId = 1 << 22;
+    let buffer = build_without_panic(high).expect("build snapshot");
+    assert!(
+      buffer.len() < 64 * 1024,
+      "snapshot of 2 nodes (max id {high}) is {} bytes",
+      buffer.len()
+    );
+    assert_two_node_round_trip(&buffer, high);
+  }
+
+  /// `(max_node_id + 1) * 4` overflows before anything is allocated.
+  #[test]
+  fn s1_u64_max_minus_one_node_id_round_trips() {
+    let high = u64::MAX - 1;
+    let buffer = build_without_panic(high).expect("build snapshot");
+    assert_two_node_round_trip(&buffer, high);
+  }
+
+  /// `max_node_id + 1` itself overflows. Rejecting the ID cleanly is fine;
+  /// panicking mid-checkpoint is not.
+  #[test]
+  fn s1_u64_max_node_id_does_not_panic_the_writer() {
+    let high = u64::MAX;
+    if let Ok(buffer) = build_without_panic(high) {
+      assert_two_node_round_trip(&buffer, high);
+    }
+  }
+
+  /// S2 (format contract): v4 stores section sizes as u32 and NodeIdToPhys
+  /// densely, so it cannot represent the graphs above. The writer must emit
+  /// the new version, with a min reader version that v4 readers refuse.
+  #[test]
+  fn s2_writer_emits_snapshot_format_newer_than_v4() {
+    let buffer = build_without_panic(2).expect("build snapshot");
+    let version = read_u32(&buffer, 4);
+    let min_reader = read_u32(&buffer, 8);
+    assert!(version > 4, "writer emits snapshot version {version}");
+    assert!(
+      min_reader > 4,
+      "writer emits min_reader_version {min_reader}; v4 readers would accept it"
+    );
+  }
+}
