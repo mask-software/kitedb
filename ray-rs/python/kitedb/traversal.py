@@ -499,23 +499,51 @@ class TraversalResult(Generic[N]):
             )
             yield node_ref, edge_result
 
-    def _iter_results(self) -> Generator[Tuple[NodeRef[Any], Optional[EdgeResult]], None, None]:
-        """Full execution path that yields (node, edge) results."""
+    @staticmethod
+    def _step_dedupes(step: TraversalStep) -> bool:
+        """Whether a step yields each node at most once, like the native fast paths."""
+        return not isinstance(step, TraverseStep) or step.options.unique
+
+    @staticmethod
+    def _unique_by_node(
+        results: List[Tuple[NodeRef[Any], Optional[EdgeResult]]],
+    ) -> List[Tuple[NodeRef[Any], Optional[EdgeResult]]]:
+        seen: Set[int] = set()
+        unique: List[Tuple[NodeRef[Any], Optional[EdgeResult]]] = []
+        for node, edge in results:
+            if node.id not in seen:
+                seen.add(node.id)
+                unique.append((node, edge))
+        return unique
+
+    def _iter_results(
+        self, unique_nodes: bool = True
+    ) -> Generator[Tuple[NodeRef[Any], Optional[EdgeResult]], None, None]:
+        """Full execution path that yields (node, edge) results.
+
+        Every intermediate frontier is deduplicated by node id. With
+        `unique_nodes`, the final results are too (after filtering, so a node
+        reachable through any edge that passes `where_edge` is kept); the edge
+        view passes False to keep every distinct edge into the last frontier.
+        """
         current_results: List[Tuple[NodeRef[Any], Optional[EdgeResult]]] = [
             (node, None) for node in self._start_nodes
         ]
 
-        for step in self._steps:
-            next_results: List[Tuple[NodeRef[Any], EdgeResult]] = []
+        for index, step in enumerate(self._steps):
+            next_results: List[Tuple[NodeRef[Any], Optional[EdgeResult]]] = []
             for node, _ in current_results:
                 if isinstance(step, TraverseStep):
-                    for result in self._execute_traverse(node, step):
-                        next_results.append(result)
+                    next_results.extend(self._execute_traverse(node, step))
                 else:
-                    for result in self._execute_single_hop(node, step):
-                        next_results.append(result)
-            current_results = [(n, e) for n, e in next_results]
+                    next_results.extend(self._execute_single_hop(node, step))
+            is_last = index == len(self._steps) - 1
+            if not is_last and self._step_dedupes(step):
+                next_results = self._unique_by_node(next_results)
+            current_results = next_results
 
+        dedupe_final = unique_nodes and bool(self._steps) and self._step_dedupes(self._steps[-1])
+        emitted: Set[int] = set()
         count = 0
         for node, edge in current_results:
             if edge is not None and self._edge_filter is not None:
@@ -523,6 +551,10 @@ class TraversalResult(Generic[N]):
                     continue
             if self._node_filter is not None and not self._node_filter(node):
                 continue
+            if dedupe_final:
+                if node.id in emitted:
+                    continue
+                emitted.add(node.id)
             if self._limit is not None and count >= self._limit:
                 break
             yield node, edge
@@ -530,7 +562,7 @@ class TraversalResult(Generic[N]):
 
     def _execute_edges(self) -> Generator[EdgeResult, None, None]:
         """Execute traversal and yield edge results."""
-        for _, edge in self._iter_results():
+        for _, edge in self._iter_results(unique_nodes=False):
             if edge is not None:
                 yield edge
     

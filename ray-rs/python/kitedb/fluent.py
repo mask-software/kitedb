@@ -207,7 +207,7 @@ class Kite:
                     edge._prop_key_ids[prop_name] = self._prop_key_ids[key]
             
             self._db.commit()
-        except Exception:
+        except BaseException:
             self._db.rollback()
             raise
     
@@ -837,7 +837,7 @@ class Kite:
                     raise ValueError("Unsupported batch operation")
             self._db.commit()
             return results
-        except Exception:
+        except BaseException:
             self._db.rollback()
             raise
 
@@ -872,7 +872,7 @@ class Kite:
                     raise ValueError("Unsupported batch operation")
             self._db.commit()
             return results
-        except Exception:
+        except BaseException:
             self._db.rollback()
             raise
     
@@ -897,7 +897,7 @@ class Kite:
         try:
             yield self
             self._db.commit()
-        except Exception:
+        except BaseException:
             self._db.rollback()
             raise
     
