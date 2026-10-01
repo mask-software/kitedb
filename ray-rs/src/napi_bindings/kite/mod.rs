@@ -24,7 +24,7 @@ pub use types::{JsEdgeSpec, JsKeySpec, JsKiteOptions, JsNodeSpec, JsPropSpec};
 // Internal imports
 use conversion::js_props_to_map;
 use helpers::{batch_result_to_js, execute_batch_ops, node_props, node_props_selected, node_to_js};
-use key_spec::{parse_key_spec, prop_spec_to_def, KeySpec};
+use key_spec::{node_prop_spec_to_def, parse_key_spec, prop_spec_to_def, KeySpec};
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -33,7 +33,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::api::kite::{BatchOp, EdgeDef, Kite as RustKite, KiteOptions, NodeDef};
-use crate::types::NodeId;
 
 use super::database::{
   CheckResult, DbStats, JsPrimaryReplicationStatus, JsReplicaReplicationStatus, MvccStats,
@@ -225,7 +224,7 @@ impl Kite {
       let mut node_def = NodeDef::new(&node.name, &prefix);
       if let Some(props) = node.props.as_ref() {
         for (prop_name, prop_spec) in props {
-          node_def = node_def.prop(prop_spec_to_def(prop_name, prop_spec)?);
+          node_def = node_def.prop(node_prop_spec_to_def(&node.name, prop_name, prop_spec)?);
         }
       }
 
@@ -306,13 +305,14 @@ impl Kite {
   pub fn by_id(
     &self,
     env: Env,
-    node_id: i64,
+    node_id: f64,
     props: Option<Vec<String>>,
   ) -> Result<Option<Object<'_>>> {
+    let node_id = validation::node_id("nodeId", node_id)?;
     let selected_props = props.map(|props| props.into_iter().collect::<HashSet<String>>());
     self.with_kite(move |ray| {
       let node_ref = ray
-        .node_by_id(node_id as NodeId)
+        .node_by_id(node_id)
         .map_err(|e| Error::from_reason(e.to_string()))?;
       match node_ref {
         Some(node_ref) => {
@@ -371,19 +371,20 @@ impl Kite {
   pub fn by_ids(
     &self,
     env: Env,
-    node_ids: Vec<i64>,
+    node_ids: Vec<f64>,
     props: Option<Vec<String>>,
   ) -> Result<Vec<Object<'_>>> {
     if node_ids.is_empty() {
       return Ok(Vec::new());
     }
+    let node_ids = validation::node_ids("nodeIds", &node_ids)?;
 
     let selected_props = props.map(|props| props.into_iter().collect::<HashSet<String>>());
     self.with_kite(move |ray| {
       let mut out = Vec::with_capacity(node_ids.len());
       for node_id in node_ids {
         let node_ref = ray
-          .node_by_id(node_id as NodeId)
+          .node_by_id(node_id)
           .map_err(|e| Error::from_reason(e.to_string()))?;
         if let Some(node_ref) = node_ref {
           let (node_id, node_key, node_type) = node_ref.into_parts();
@@ -397,45 +398,50 @@ impl Kite {
 
   /// Get a node property value
   #[napi(js_name = "get_prop")]
-  pub fn prop(&self, node_id: i64, prop_name: String) -> Result<Option<JsPropValue>> {
-    let value = self.with_kite(|ray| Ok(ray.prop(node_id as NodeId, &prop_name)))?;
+  pub fn prop(&self, node_id: f64, prop_name: String) -> Result<Option<JsPropValue>> {
+    let node_id = validation::node_id("nodeId", node_id)?;
+    let value = self.with_kite(|ray| Ok(ray.prop(node_id, &prop_name)))?;
     Ok(value.map(JsPropValue::from))
   }
 
   /// Set a node property value
   #[napi]
-  pub fn set_prop(&self, env: Env, node_id: i64, prop_name: String, value: Unknown) -> Result<()> {
+  pub fn set_prop(&self, env: Env, node_id: f64, prop_name: String, value: Unknown) -> Result<()> {
+    let node_id = validation::node_id("nodeId", node_id)?;
     let prop_value = js_value_to_prop_value(&env, value)?;
     self.with_kite_mut(|ray| {
       ray
-        .set_prop(node_id as NodeId, &prop_name, prop_value)
+        .set_prop(node_id, &prop_name, prop_value)
         .map_err(|e| Error::from_reason(e.to_string()))
     })
   }
 
   /// Set multiple node property values
   #[napi]
-  pub fn set_props(&self, env: Env, node_id: i64, props: Object) -> Result<()> {
+  pub fn set_props(&self, env: Env, node_id: f64, props: Object) -> Result<()> {
+    let node_id = validation::node_id("nodeId", node_id)?;
     let props_map = js_props_to_map(&env, Some(props))?;
     self.with_kite_mut(|ray| {
       ray
-        .set_props(node_id as NodeId, props_map)
+        .set_props(node_id, props_map)
         .map_err(|e| Error::from_reason(e.to_string()))
     })
   }
 
   /// Check if a node exists
   #[napi]
-  pub fn exists(&self, node_id: i64) -> Result<bool> {
-    self.with_kite(|ray| Ok(ray.exists(node_id as NodeId)))
+  pub fn exists(&self, node_id: f64) -> Result<bool> {
+    let node_id = validation::node_id("nodeId", node_id)?;
+    self.with_kite(|ray| Ok(ray.exists(node_id)))
   }
 
   /// Delete a node by ID
   #[napi]
-  pub fn delete_by_id(&self, node_id: i64) -> Result<bool> {
+  pub fn delete_by_id(&self, node_id: f64) -> Result<bool> {
+    let node_id = validation::node_id("nodeId", node_id)?;
     self.with_kite_mut(|ray| {
       ray
-        .delete_node(node_id as NodeId)
+        .delete_node(node_id)
         .map_err(|e| Error::from_reason(e.to_string()))
     })
   }
@@ -493,20 +499,19 @@ impl Kite {
 
   /// Create an update builder by node ID
   #[napi]
-  pub fn update_by_id(&self, node_id: i64) -> Result<KiteUpdateBuilder> {
-    Ok(KiteUpdateBuilder::new(
-      self.inner.clone(),
-      node_id as NodeId,
-    ))
+  pub fn update_by_id(&self, node_id: f64) -> Result<KiteUpdateBuilder> {
+    let node_id = validation::node_id("nodeId", node_id)?;
+    Ok(KiteUpdateBuilder::new(self.inner.clone(), node_id))
   }
 
   /// Create an upsert builder by node ID
   #[napi]
-  pub fn upsert_by_id(&self, node_type: String, node_id: i64) -> Result<KiteUpsertByIdBuilder> {
+  pub fn upsert_by_id(&self, node_type: String, node_id: f64) -> Result<KiteUpsertByIdBuilder> {
+    let node_id = validation::node_id("nodeId", node_id)?;
     Ok(KiteUpsertByIdBuilder::new(
       self.inner.clone(),
       node_type,
-      node_id as NodeId,
+      node_id,
     ))
   }
 
@@ -538,20 +543,22 @@ impl Kite {
   pub fn link(
     &self,
     env: Env,
-    src: i64,
+    src: f64,
     edge_type: String,
-    dst: i64,
+    dst: f64,
     props: Option<Object>,
   ) -> Result<()> {
+    let src = validation::node_id("src", src)?;
+    let dst = validation::node_id("dst", dst)?;
     let props_map = js_props_to_map(&env, props)?;
     self.with_kite_mut(|ray| {
       if props_map.is_empty() {
         ray
-          .link(src as NodeId, &edge_type, dst as NodeId)
+          .link(src, &edge_type, dst)
           .map_err(|e| Error::from_reason(e.to_string()))
       } else {
         ray
-          .link_with_props(src as NodeId, &edge_type, dst as NodeId, props_map)
+          .link_with_props(src, &edge_type, dst, props_map)
           .map_err(|e| Error::from_reason(e.to_string()))
       }
     })
@@ -559,20 +566,24 @@ impl Kite {
 
   /// Unlink two nodes
   #[napi]
-  pub fn unlink(&self, src: i64, edge_type: String, dst: i64) -> Result<bool> {
+  pub fn unlink(&self, src: f64, edge_type: String, dst: f64) -> Result<bool> {
+    let src = validation::node_id("src", src)?;
+    let dst = validation::node_id("dst", dst)?;
     self.with_kite_mut(|ray| {
       ray
-        .unlink(src as NodeId, &edge_type, dst as NodeId)
+        .unlink(src, &edge_type, dst)
         .map_err(|e| Error::from_reason(e.to_string()))
     })
   }
 
   /// Check if an edge exists
   #[napi]
-  pub fn has_edge(&self, src: i64, edge_type: String, dst: i64) -> Result<bool> {
+  pub fn has_edge(&self, src: f64, edge_type: String, dst: f64) -> Result<bool> {
+    let src = validation::node_id("src", src)?;
+    let dst = validation::node_id("dst", dst)?;
     self.with_kite(move |ray| {
       ray
-        .has_edge(src as NodeId, &edge_type, dst as NodeId)
+        .has_edge(src, &edge_type, dst)
         .map_err(|e| Error::from_reason(e.to_string()))
     })
   }
@@ -581,14 +592,16 @@ impl Kite {
   #[napi(js_name = "get_edge_prop")]
   pub fn edge_prop(
     &self,
-    src: i64,
+    src: f64,
     edge_type: String,
-    dst: i64,
+    dst: f64,
     prop_name: String,
   ) -> Result<Option<JsPropValue>> {
+    let src = validation::node_id("src", src)?;
+    let dst = validation::node_id("dst", dst)?;
     let value = self.with_kite(|ray| {
       ray
-        .edge_prop(src as NodeId, &edge_type, dst as NodeId, &prop_name)
+        .edge_prop(src, &edge_type, dst, &prop_name)
         .map_err(|e| Error::from_reason(e.to_string()))
     })?;
     Ok(value.map(JsPropValue::from))
@@ -598,14 +611,16 @@ impl Kite {
   #[napi(js_name = "get_edge_props")]
   pub fn edge_props(
     &self,
-    src: i64,
+    src: f64,
     edge_type: String,
-    dst: i64,
+    dst: f64,
   ) -> Result<HashMap<String, JsPropValue>> {
+    let src = validation::node_id("src", src)?;
+    let dst = validation::node_id("dst", dst)?;
     let props = self
       .with_kite(|ray| {
         ray
-          .edge_props(src as NodeId, &edge_type, dst as NodeId)
+          .edge_props(src, &edge_type, dst)
           .map_err(|e| Error::from_reason(e.to_string()))
       })?
       .unwrap_or_default();
@@ -623,22 +638,18 @@ impl Kite {
   pub fn set_edge_prop(
     &self,
     env: Env,
-    src: i64,
+    src: f64,
     edge_type: String,
-    dst: i64,
+    dst: f64,
     prop_name: String,
     value: Unknown,
   ) -> Result<()> {
+    let src = validation::node_id("src", src)?;
+    let dst = validation::node_id("dst", dst)?;
     let prop_value = js_value_to_prop_value(&env, value)?;
     self.with_kite_mut(|ray| {
       ray
-        .set_edge_prop(
-          src as NodeId,
-          &edge_type,
-          dst as NodeId,
-          &prop_name,
-          prop_value,
-        )
+        .set_edge_prop(src, &edge_type, dst, &prop_name, prop_value)
         .map_err(|e| Error::from_reason(e.to_string()))
     })
   }
@@ -648,15 +659,17 @@ impl Kite {
   pub fn set_edge_props(
     &self,
     env: Env,
-    src: i64,
+    src: f64,
     edge_type: String,
-    dst: i64,
+    dst: f64,
     props: Option<Object>,
   ) -> Result<()> {
+    let src = validation::node_id("src", src)?;
+    let dst = validation::node_id("dst", dst)?;
     let props_map = js_props_to_map(&env, props)?;
     self.with_kite_mut(|ray| {
       ray
-        .set_edge_props(src as NodeId, &edge_type, dst as NodeId, props_map)
+        .set_edge_props(src, &edge_type, dst, props_map)
         .map_err(|e| Error::from_reason(e.to_string()))
     })
   }
@@ -665,14 +678,16 @@ impl Kite {
   #[napi]
   pub fn del_edge_prop(
     &self,
-    src: i64,
+    src: f64,
     edge_type: String,
-    dst: i64,
+    dst: f64,
     prop_name: String,
   ) -> Result<()> {
+    let src = validation::node_id("src", src)?;
+    let dst = validation::node_id("dst", dst)?;
     self.with_kite_mut(|ray| {
       ray
-        .del_edge_prop(src as NodeId, &edge_type, dst as NodeId, &prop_name)
+        .del_edge_prop(src, &edge_type, dst, &prop_name)
         .map_err(|e| Error::from_reason(e.to_string()))
     })
   }
@@ -681,10 +696,12 @@ impl Kite {
   #[napi]
   pub fn update_edge(
     &self,
-    src: i64,
+    src: f64,
     edge_type: String,
-    dst: i64,
+    dst: f64,
   ) -> Result<KiteUpdateEdgeBuilder> {
+    let src = validation::node_id("src", src)?;
+    let dst = validation::node_id("dst", dst)?;
     self.with_kite(|ray| {
       ray
         .edge_def(&edge_type)
@@ -694,9 +711,9 @@ impl Kite {
 
     Ok(KiteUpdateEdgeBuilder::new(
       self.inner.clone(),
-      src as NodeId,
+      src,
       edge_type,
-      dst as NodeId,
+      dst,
     ))
   }
 
@@ -704,10 +721,12 @@ impl Kite {
   #[napi]
   pub fn upsert_edge(
     &self,
-    src: i64,
+    src: f64,
     edge_type: String,
-    dst: i64,
+    dst: f64,
   ) -> Result<KiteUpsertEdgeBuilder> {
+    let src = validation::node_id("src", src)?;
+    let dst = validation::node_id("dst", dst)?;
     self.with_kite(|ray| {
       ray
         .edge_def(&edge_type)
@@ -717,9 +736,9 @@ impl Kite {
 
     Ok(KiteUpsertEdgeBuilder::new(
       self.inner.clone(),
-      src as NodeId,
+      src,
       edge_type,
-      dst as NodeId,
+      dst,
     ))
   }
 
@@ -774,9 +793,9 @@ impl Kite {
       Ok(
         edges
           .map(|edge| JsFullEdge {
-            src: edge.src as i64,
+            src: edge.src as f64,
             etype: edge.etype,
-            dst: edge.dst as i64,
+            dst: edge.dst as f64,
           })
           .collect(),
       )
@@ -785,10 +804,12 @@ impl Kite {
 
   /// Check if a path exists between two nodes
   #[napi]
-  pub fn has_path(&self, source: i64, target: i64, edge_type: Option<String>) -> Result<bool> {
+  pub fn has_path(&self, source: f64, target: f64, edge_type: Option<String>) -> Result<bool> {
+    let source = validation::node_id("source", source)?;
+    let target = validation::node_id("target", target)?;
     self.with_kite_mut(|ray| {
       ray
-        .has_path(source as NodeId, target as NodeId, edge_type.as_deref())
+        .has_path(source, target, edge_type.as_deref())
         .map_err(|e| Error::from_reason(e.to_string()))
     })
   }
@@ -797,11 +818,11 @@ impl Kite {
   #[napi]
   pub fn reachable_from(
     &self,
-    source: i64,
+    source: f64,
     max_depth: i64,
     edge_type: Option<String>,
   ) -> Result<Vec<i64>> {
-    let source = validation::node_id("source", source)? as NodeId;
+    let source = validation::node_id("source", source)?;
     let max_depth = validation::non_negative_usize("maxDepth", max_depth, validation::MAX_DEPTH)?;
     self.with_kite(|ray| {
       let nodes = ray
@@ -1032,90 +1053,85 @@ impl Kite {
           });
         }
         "deleteNode" => {
-          let node_id: i64 = op.get_named_property("nodeId")?;
-          rust_ops.push(BatchOp::DeleteNode {
-            node_id: node_id as NodeId,
-          });
+          let node_id = validation::node_id("nodeId", op.get_named_property("nodeId")?)?;
+          rust_ops.push(BatchOp::DeleteNode { node_id });
         }
         "link" => {
-          let src: i64 = op.get_named_property("src")?;
-          let dst: i64 = op.get_named_property("dst")?;
+          let src = validation::node_id("src", op.get_named_property("src")?)?;
+          let dst = validation::node_id("dst", op.get_named_property("dst")?)?;
           let edge_type: String = op.get_named_property("edgeType")?;
           rust_ops.push(BatchOp::Link {
-            src: src as NodeId,
+            src,
             edge_type,
-            dst: dst as NodeId,
+            dst,
           });
         }
         "linkWithProps" => {
-          let src: i64 = op.get_named_property("src")?;
-          let dst: i64 = op.get_named_property("dst")?;
+          let src = validation::node_id("src", op.get_named_property("src")?)?;
+          let dst = validation::node_id("dst", op.get_named_property("dst")?)?;
           let edge_type: String = op.get_named_property("edgeType")?;
           let props: Option<Object> = op.get_named_property("props")?;
           let props_map = js_props_to_map(&env, props)?;
           rust_ops.push(BatchOp::LinkWithProps {
-            src: src as NodeId,
+            src,
             edge_type,
-            dst: dst as NodeId,
+            dst,
             props: props_map,
           });
         }
         "unlink" => {
-          let src: i64 = op.get_named_property("src")?;
-          let dst: i64 = op.get_named_property("dst")?;
+          let src = validation::node_id("src", op.get_named_property("src")?)?;
+          let dst = validation::node_id("dst", op.get_named_property("dst")?)?;
           let edge_type: String = op.get_named_property("edgeType")?;
           rust_ops.push(BatchOp::Unlink {
-            src: src as NodeId,
+            src,
             edge_type,
-            dst: dst as NodeId,
+            dst,
           });
         }
         "setProp" => {
-          let node_id: i64 = op.get_named_property("nodeId")?;
+          let node_id = validation::node_id("nodeId", op.get_named_property("nodeId")?)?;
           let prop_name: String = op.get_named_property("propName")?;
           let value: Unknown = op.get_named_property("value")?;
           let prop_value = js_value_to_prop_value(&env, value)?;
           rust_ops.push(BatchOp::SetProp {
-            node_id: node_id as NodeId,
+            node_id,
             prop_name,
             value: prop_value,
           });
         }
         "setEdgeProp" => {
-          let src: i64 = op.get_named_property("src")?;
-          let dst: i64 = op.get_named_property("dst")?;
+          let src = validation::node_id("src", op.get_named_property("src")?)?;
+          let dst = validation::node_id("dst", op.get_named_property("dst")?)?;
           let edge_type: String = op.get_named_property("edgeType")?;
           let prop_name: String = op.get_named_property("propName")?;
           let value: Unknown = op.get_named_property("value")?;
           let prop_value = js_value_to_prop_value(&env, value)?;
           rust_ops.push(BatchOp::SetEdgeProp {
-            src: src as NodeId,
+            src,
             edge_type,
-            dst: dst as NodeId,
+            dst,
             prop_name,
             value: prop_value,
           });
         }
         "setEdgeProps" => {
-          let src: i64 = op.get_named_property("src")?;
-          let dst: i64 = op.get_named_property("dst")?;
+          let src = validation::node_id("src", op.get_named_property("src")?)?;
+          let dst = validation::node_id("dst", op.get_named_property("dst")?)?;
           let edge_type: String = op.get_named_property("edgeType")?;
           let props: Option<Object> = op.get_named_property("props")?;
           let props_map = js_props_to_map(&env, props)?;
           rust_ops.push(BatchOp::SetEdgeProps {
-            src: src as NodeId,
+            src,
             edge_type,
-            dst: dst as NodeId,
+            dst,
             props: props_map,
           });
         }
         "delProp" => {
-          let node_id: i64 = op.get_named_property("nodeId")?;
+          let node_id = validation::node_id("nodeId", op.get_named_property("nodeId")?)?;
           let prop_name: String = op.get_named_property("propName")?;
-          rust_ops.push(BatchOp::DelProp {
-            node_id: node_id as NodeId,
-            prop_name,
-          });
+          rust_ops.push(BatchOp::DelProp { node_id, prop_name });
         }
         other => {
           return Err(Error::from_reason(format!("Unknown batch op: {other}")));
@@ -1134,10 +1150,11 @@ impl Kite {
 
   /// Begin a traversal from a node ID
   #[napi]
-  pub fn from(&self, node_id: i64) -> Result<KiteTraversal> {
+  pub fn from(&self, node_id: f64) -> Result<KiteTraversal> {
+    let node_id = validation::node_id("nodeId", node_id)?;
     Ok(KiteTraversal {
       ray: self.inner.clone(),
-      start_nodes: vec![node_id as NodeId],
+      start_nodes: vec![node_id],
       steps: kite_traversal::StepChain::default(),
       limit: None,
       selected_props: None,
@@ -1148,10 +1165,10 @@ impl Kite {
 
   /// Begin a traversal from multiple nodes
   #[napi]
-  pub fn from_nodes(&self, node_ids: Vec<i64>) -> Result<KiteTraversal> {
+  pub fn from_nodes(&self, node_ids: Vec<f64>) -> Result<KiteTraversal> {
     Ok(KiteTraversal {
       ray: self.inner.clone(),
-      start_nodes: node_ids.into_iter().map(|id| id as NodeId).collect(),
+      start_nodes: validation::node_ids("nodeIds", &node_ids)?,
       steps: kite_traversal::StepChain::default(),
       limit: None,
       selected_props: None,
@@ -1162,22 +1179,18 @@ impl Kite {
 
   /// Begin a path finding query
   #[napi]
-  pub fn path(&self, source: i64, target: i64) -> Result<KitePath> {
-    Ok(KitePath::new(
-      self.inner.clone(),
-      source as NodeId,
-      vec![target as NodeId],
-    ))
+  pub fn path(&self, source: f64, target: f64) -> Result<KitePath> {
+    let source = validation::node_id("source", source)?;
+    let target = validation::node_id("target", target)?;
+    Ok(KitePath::new(self.inner.clone(), source, vec![target]))
   }
 
   /// Begin a path finding query to multiple targets
   #[napi]
-  pub fn path_to_any(&self, source: i64, targets: Vec<i64>) -> Result<KitePath> {
-    Ok(KitePath::new(
-      self.inner.clone(),
-      source as NodeId,
-      targets.into_iter().map(|id| id as NodeId).collect(),
-    ))
+  pub fn path_to_any(&self, source: f64, targets: Vec<f64>) -> Result<KitePath> {
+    let source = validation::node_id("source", source)?;
+    let targets = validation::node_ids("targets", &targets)?;
+    Ok(KitePath::new(self.inner.clone(), source, targets))
   }
 }
 
@@ -1215,7 +1228,7 @@ impl napi::Task for OpenKiteTask {
       let mut node_def = NodeDef::new(&node.name, &prefix);
       if let Some(props) = node.props.as_ref() {
         for (prop_name, prop_spec) in props {
-          node_def = node_def.prop(prop_spec_to_def(prop_name, prop_spec)?);
+          node_def = node_def.prop(node_prop_spec_to_def(&node.name, prop_name, prop_spec)?);
         }
       }
 

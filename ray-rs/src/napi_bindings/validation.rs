@@ -2,6 +2,9 @@
 
 use napi::bindgen_prelude::{Error, Result};
 use napi::Status;
+use std::fmt::Display;
+
+use crate::types::NodeId;
 
 /// Keep binding-provided cache allocations bounded even on 64-bit hosts.
 pub(crate) const MAX_CACHE_ENTRIES: i64 = 10_000_000;
@@ -25,6 +28,8 @@ pub(crate) const MIN_WAL_PAGES: u64 = 16;
 pub(crate) const MAX_VECTOR_PARAM: i64 = 1_000_000;
 /// Vector dimensions are also used for direct allocations.
 pub(crate) const MAX_VECTOR_DIMENSIONS: i64 = 1_000_000;
+/// Largest integer a JS number represents exactly (`Number.MAX_SAFE_INTEGER`).
+pub(crate) const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 
 fn invalid(field: &str, expectation: &str) -> Error {
   invalid_argument(format!("{field} {expectation}"))
@@ -81,8 +86,43 @@ pub(crate) fn positive_u64(field: &str, value: i64, max: u64) -> Result<u64> {
   non_negative_u64(field, value, max)
 }
 
-pub(crate) fn node_id(field: &str, value: i64) -> Result<u64> {
-  non_negative_u64(field, value, i64::MAX as u64)
+/// Validate a node (or vector) ID passed in as a JS number.
+///
+/// IDs must be taken as `f64`: napi's `i64` conversion turns NaN and Infinity
+/// into 0 and truncates fractions before the binding sees the value.
+pub(crate) fn node_id(field: &str, value: f64) -> Result<NodeId> {
+  if value.is_finite() && value.fract() == 0.0 && (0.0..=MAX_SAFE_INTEGER).contains(&value) {
+    return Ok(value as NodeId);
+  }
+  let shown = if value.is_nan() {
+    "NaN".to_string()
+  } else if value.is_infinite() {
+    if value > 0.0 { "Infinity" } else { "-Infinity" }.to_string()
+  } else {
+    value.to_string()
+  };
+  Err(invalid(
+    field,
+    &format!("must be an integer between 0 and Number.MAX_SAFE_INTEGER, got {shown}"),
+  ))
+}
+
+/// Validate every ID in a list (see [`node_id`]).
+pub(crate) fn node_ids(field: &str, values: &[f64]) -> Result<Vec<NodeId>> {
+  values.iter().map(|&value| node_id(field, value)).collect()
+}
+
+/// Reject a vector whose length differs from the expected dimensions.
+///
+/// Core distance functions assert equal lengths, and a panic across the N-API
+/// boundary aborts the process, so bindings check before calling into core.
+pub(crate) fn vector_len(field: impl Display, len: usize, dimensions: usize) -> Result<()> {
+  if len != dimensions {
+    return Err(invalid_argument(format!(
+      "Dimension mismatch: {field} has {len} dimensions, expected {dimensions}"
+    )));
+  }
+  Ok(())
 }
 
 pub(crate) fn ratio(field: &str, value: f64) -> Result<f64> {
@@ -137,4 +177,37 @@ pub(crate) fn compression_level(field: &str, value: i32, zstd: bool) -> Result<i
     return Err(invalid(field, &format!("must be in [{min}, {max}]")));
   }
   Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn node_id_accepts_only_safe_non_negative_integers() {
+    for valid in [0.0, -0.0, 42.0, MAX_SAFE_INTEGER] {
+      assert_eq!(node_id("nodeId", valid).unwrap(), valid as NodeId);
+    }
+    for invalid in [
+      -1.0,
+      1.5,
+      f64::NAN,
+      f64::INFINITY,
+      f64::NEG_INFINITY,
+      MAX_SAFE_INTEGER + 1.0,
+    ] {
+      let err = node_id("nodeId", invalid).unwrap_err();
+      assert!(err.reason.starts_with("nodeId must be an integer"), "{err}");
+    }
+  }
+
+  #[test]
+  fn vector_len_reports_dimension_mismatch() {
+    assert!(vector_len("query", 3, 3).is_ok());
+    let err = vector_len("query", 2, 3).unwrap_err();
+    assert_eq!(
+      err.reason,
+      "Dimension mismatch: query has 2 dimensions, expected 3"
+    );
+  }
 }

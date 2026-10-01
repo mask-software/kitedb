@@ -90,6 +90,27 @@ pub(crate) fn infer_prefix_from_template(template: &str) -> String {
   }
 }
 
+/// Node objects carry their identity as `id`, `key` and `type`; a prop with one
+/// of these names would shadow it in every node returned to JS.
+const RESERVED_NODE_PROPS: [&str; 3] = ["id", "key", "type"];
+
+/// Convert a node prop spec, rejecting names reserved for node identity
+pub(crate) fn node_prop_spec_to_def(
+  node_name: &str,
+  name: &str,
+  spec: &JsPropSpec,
+) -> Result<PropDef> {
+  if RESERVED_NODE_PROPS.contains(&name) {
+    return Err(Error::new(
+      Status::InvalidArg,
+      format!(
+        "node type \"{node_name}\": prop name \"{name}\" is reserved for node identity (id, key, type)"
+      ),
+    ));
+  }
+  prop_spec_to_def(name, spec)
+}
+
 /// Convert a JsPropSpec to a PropDef for schema configuration
 pub(crate) fn prop_spec_to_def(name: &str, spec: &JsPropSpec) -> Result<PropDef> {
   let mut prop = match spec.r#type.as_str() {

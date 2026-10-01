@@ -4,7 +4,6 @@
 //! transaction handling, and batch operations.
 
 use napi::bindgen_prelude::*;
-use napi::UnknownRef;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -74,14 +73,14 @@ pub(crate) fn node_to_js(
   props: HashMap<String, PropValue>,
 ) -> Result<Object<'static>> {
   let mut obj = Object::new(env)?;
-  obj.set_named_property("id", node_id as i64)?;
-  obj.set_named_property("key", node_key.as_deref().unwrap_or(""))?;
-  obj.set_named_property("type", node_type)?;
-
   for (name, value) in props {
     let js_value = prop_value_to_js(env, value)?;
     obj.set_named_property(&name, js_value)?;
   }
+  // Identity is set last so a schema-less prop named id/key/type cannot shadow it.
+  obj.set_named_property("id", node_id as i64)?;
+  obj.set_named_property("key", node_key.as_deref().unwrap_or(""))?;
+  obj.set_named_property("type", node_type)?;
 
   Ok(Object::from_raw(env.raw(), obj.raw()))
 }
@@ -161,13 +160,14 @@ pub(crate) fn edge_filter_data(ray: &RustKite, edge: &Edge) -> EdgeFilterData {
 /// Create a JS object for node filtering
 pub(crate) fn node_filter_arg(env: &Env, data: &NodeFilterData) -> Result<Object<'static>> {
   let mut obj = Object::new(env)?;
-  obj.set_named_property("id", data.id as i64)?;
-  obj.set_named_property("key", data.key.as_str())?;
-  obj.set_named_property("type", data.node_type.as_str())?;
   for (name, value) in &data.props {
     let js_value = prop_value_to_js(env, value.clone())?;
     obj.set_named_property(name, js_value)?;
   }
+  // Identity last, as in `node_to_js`.
+  obj.set_named_property("id", data.id as i64)?;
+  obj.set_named_property("key", data.key.as_str())?;
+  obj.set_named_property("type", data.node_type.as_str())?;
   Ok(Object::from_raw(env.raw(), obj.raw()))
 }
 
@@ -184,17 +184,25 @@ pub(crate) fn edge_filter_arg(env: &Env, data: &EdgeFilterData) -> Result<Object
   Ok(Object::from_raw(env.raw(), obj.raw()))
 }
 
+/// A whereNode/whereEdge predicate kept alive by a traversal.
+///
+/// `FunctionRef` deletes its napi reference on drop, so the callback becomes
+/// collectable once the last traversal holding it is garbage collected.
+pub(crate) type FilterFn = FunctionRef<Object<'static>, Unknown<'static>>;
+
+/// Hold a JS function as a filter, rejecting any other value.
+pub(crate) fn filter_fn(value: Unknown, method: &str) -> Result<Arc<FilterFn>> {
+  if value.get_type()? != ValueType::Function {
+    return Err(Error::from_reason(format!("{method} requires a function")));
+  }
+  // SAFETY: the value was just checked to be a JS function.
+  let func: Function<Object<'static>, Unknown<'static>> = unsafe { value.cast()? };
+  Ok(Arc::new(func.create_ref()?))
+}
+
 /// Call a JS filter function with an argument
-#[allow(clippy::arc_with_non_send_sync)]
-pub(crate) fn call_filter(
-  env: &Env,
-  func_ref: &Arc<UnknownRef<false>>,
-  arg: Object,
-) -> Result<bool> {
-  let func_value = func_ref.get_value(env)?;
-  // SAFETY: func_ref is expected to reference a JS function.
-  let func: Function<Unknown, Unknown> = unsafe { func_value.cast()? };
-  let result: Unknown = func.call(arg.into_unknown(env)?)?;
+pub(crate) fn call_filter(env: &Env, filter: &FilterFn, arg: Object<'static>) -> Result<bool> {
+  let result = filter.borrow_back(env)?.call(arg)?;
   result.coerce_to_bool()
 }
 

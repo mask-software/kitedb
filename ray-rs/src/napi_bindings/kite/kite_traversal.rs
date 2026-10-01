@@ -3,7 +3,6 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
 use napi::bindgen_prelude::*;
-use napi::UnknownRef;
 use napi_derive::napi;
 use parking_lot::RwLock;
 use std::collections::HashSet;
@@ -14,8 +13,8 @@ use crate::api::traversal::{TraversalBuilder, TraversalDirection, TraversalStep}
 use crate::types::{ETypeId, Edge, NodeId};
 
 use super::helpers::{
-  call_filter, edge_filter_arg, edge_filter_data, neighbors, node_filter_arg, node_filter_data,
-  node_to_js, TraversalFilterItem,
+  call_filter, edge_filter_arg, edge_filter_data, filter_fn, neighbors, node_filter_arg,
+  node_filter_data, node_to_js, FilterFn, TraversalFilterItem,
 };
 use crate::napi_bindings::database::JsFullEdge;
 use crate::napi_bindings::traversal::JsTraverseOptions;
@@ -32,8 +31,8 @@ pub struct KiteTraversal {
   pub(crate) steps: StepChain,
   pub(crate) limit: Option<usize>,
   pub(crate) selected_props: Option<Vec<String>>,
-  pub(crate) where_edge: Option<Arc<UnknownRef<false>>>,
-  pub(crate) where_node: Option<Arc<UnknownRef<false>>>,
+  pub(crate) where_edge: Option<Arc<FilterFn>>,
+  pub(crate) where_node: Option<Arc<FilterFn>>,
 }
 
 #[derive(Clone, Default)]
@@ -101,24 +100,16 @@ impl KiteTraversal {
 #[napi]
 impl KiteTraversal {
   #[napi(js_name = "whereEdge")]
-  pub fn where_edge(&self, env: Env, func: UnknownRef<false>) -> Result<KiteTraversal> {
-    let value = func.get_value(&env)?;
-    if value.get_type()? != ValueType::Function {
-      return Err(Error::from_reason("whereEdge requires a function"));
-    }
+  pub fn where_edge(&self, func: Unknown) -> Result<KiteTraversal> {
     let mut next = self.fork();
-    next.where_edge = Some(Arc::new(func));
+    next.where_edge = Some(filter_fn(func, "whereEdge")?);
     Ok(next)
   }
 
   #[napi(js_name = "whereNode")]
-  pub fn where_node(&self, env: Env, func: UnknownRef<false>) -> Result<KiteTraversal> {
-    let value = func.get_value(&env)?;
-    if value.get_type()? != ValueType::Function {
-      return Err(Error::from_reason("whereNode requires a function"));
-    }
+  pub fn where_node(&self, func: Unknown) -> Result<KiteTraversal> {
     let mut next = self.fork();
-    next.where_node = Some(Arc::new(func));
+    next.where_node = Some(filter_fn(func, "whereNode")?);
     Ok(next)
   }
 
@@ -381,9 +372,9 @@ impl KiteTraversal {
 
       if let Some(edge) = item.edge {
         edges.push(JsFullEdge {
-          src: edge.src as i64,
+          src: edge.src as f64,
           etype: edge.etype,
-          dst: edge.dst as i64,
+          dst: edge.dst as f64,
         });
       }
     }
