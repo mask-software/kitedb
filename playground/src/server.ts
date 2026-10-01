@@ -2,6 +2,22 @@
  * Playground Server
  *
  * Elysia server that serves both the API and static files.
+ *
+ * The API has no user authentication, so the defaults keep it local:
+ *
+ *   PORT                          Listen port (default 3000; 0 picks a free port).
+ *   PLAYGROUND_HOST               Bind address (default 127.0.0.1). Anything else exposes the API to that network.
+ *   PLAYGROUND_ALLOWED_ORIGINS    Comma-separated origins allowed cross-origin (CORS) access, e.g.
+ *                                 "http://localhost:5173". Default: none (same-origin only).
+ *   PLAYGROUND_DATA_DIR           The only directory /api/db/open may read or create databases in
+ *                                 (default: playground/data). Relative paths are resolved against it;
+ *                                 paths outside it are rejected. Uploads and the demo use private temp dirs.
+ *   REPLICATION_ADMIN_TOKEN       Bearer token for the replication admin routes (snapshot, log, pull,
+ *                                 reseed, promote, metrics). Unset: those routes are disabled, unless
+ *                                 REPLICATION_ADMIN_AUTH_MODE selects mTLS or explicitly sets "none".
+ *   REPLICATION_ADMIN_AUTH_MODE   token | mtls | token_or_mtls | token_and_mtls | none (default: token).
+ *   PLAYGROUND_TLS_*, REPLICATION_MTLS_*   TLS / mTLS settings, see resolvePlaygroundTlsConfig() and
+ *                                 resolveReplicationAdminConfig() in api/routes.ts.
  */
 
 import { Elysia } from "elysia";
@@ -11,7 +27,8 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 
 const PORT = process.env.PORT ? parseInt(process.env.PORT) : 3000;
-const DEV = process.env.NODE_ENV !== "production";
+const HOST = process.env.PLAYGROUND_HOST?.trim() || "127.0.0.1";
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1", "localhost"]);
 const DIST_DIR = join(import.meta.dir, "../dist");
 
 // Helper to get content type
@@ -102,10 +119,23 @@ export function resolvePlaygroundTlsConfig(env: NodeJS.ProcessEnv = process.env)
   };
 }
 
+/** Origins from PLAYGROUND_ALLOWED_ORIGINS, read per request. */
+function isAllowedOrigin(request: Request): boolean {
+  const origin = request.headers.get("origin");
+  if (!origin) {
+    return false;
+  }
+  const allowed = (process.env.PLAYGROUND_ALLOWED_ORIGINS ?? "")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+  return allowed.includes(origin);
+}
+
 export const app = new Elysia()
-  // Enable CORS for development
+  // Same-origin only unless PLAYGROUND_ALLOWED_ORIGINS lists the origin
   .use(cors({
-    origin: DEV ? true : false,
+    origin: isAllowedOrigin,
   }))
   
   // Mount API routes first
@@ -140,11 +170,17 @@ if (import.meta.main) {
     const tlsConfig = resolvePlaygroundTlsConfig();
     server = app.listen({
       port: PORT,
-      hostname: "0.0.0.0",
+      hostname: HOST,
       ...(tlsConfig.tls ? { tls: tlsConfig.tls } : {}),
     });
     const actualPort = server.server?.port ?? PORT;
-    console.log(`RayDB Playground running at ${tlsConfig.protocol}://localhost:${actualPort}`);
+    const urlHost = HOST.includes(":") ? `[${HOST}]` : HOST;
+    console.log(`RayDB Playground running at ${tlsConfig.protocol}://${urlHost}:${actualPort}`);
+    if (!LOOPBACK_HOSTS.has(HOST)) {
+      console.warn(
+        `Warning: PLAYGROUND_HOST=${HOST} exposes the unauthenticated playground API beyond this machine.`,
+      );
+    }
     if (tlsConfig.enabled) {
       console.log(
         `TLS enabled (requestCert=${tlsConfig.tls?.requestCert ? "true" : "false"}, rejectUnauthorized=${tlsConfig.tls?.rejectUnauthorized ? "true" : "false"})`,
