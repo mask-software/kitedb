@@ -336,7 +336,9 @@ impl JsIvfIndex {
       .write()
       .map_err(|e| Error::from_reason(e.to_string()))?;
     let vector_f32: Vec<f32> = vector.iter().map(|&v| v as f32).collect();
-    Ok(index.delete(vector_id, &vector_f32))
+    index
+      .delete(vector_id, &vector_f32)
+      .map_err(|e| Error::from_reason(format!("Failed to delete vector: {e}")))
   }
 
   /// Clear all data from the index
@@ -383,7 +385,9 @@ impl JsIvfIndex {
       });
 
     let k = validation::non_negative_usize("k", k as i64, validation::MAX_COUNT)?;
-    let results = index.search(&manifest, &query_f32, k, rust_options);
+    let results = index
+      .search(&manifest, &query_f32, k, rust_options)
+      .map_err(|e| Error::from_reason(e.to_string()))?;
     Ok(results.into_iter().map(|r| r.into()).collect())
   }
 
@@ -426,7 +430,9 @@ impl JsIvfIndex {
       });
 
     let k = validation::non_negative_usize("k", k as i64, validation::MAX_COUNT)?;
-    let results = index.search_multi(&manifest, &query_refs, k, aggregation.into(), rust_options);
+    let results = index
+      .search_multi(&manifest, &query_refs, k, aggregation.into(), rust_options)
+      .map_err(|e| Error::from_reason(e.to_string()))?;
     Ok(results.into_iter().map(|r| r.into()).collect())
   }
 
@@ -582,7 +588,9 @@ impl JsIvfPqIndex {
       .write()
       .map_err(|e| Error::from_reason(e.to_string()))?;
     let vector_f32: Vec<f32> = vector.iter().map(|&v| v as f32).collect();
-    Ok(index.delete(vector_id, &vector_f32))
+    index
+      .delete(vector_id, &vector_f32)
+      .map_err(|e| Error::from_reason(format!("Failed to delete vector: {e}")))
   }
 
   /// Clear the index
@@ -629,7 +637,9 @@ impl JsIvfPqIndex {
       );
 
     let k = validation::non_negative_usize("k", k as i64, validation::MAX_COUNT)?;
-    let results = index.search(&manifest, &query_f32, k, rust_options);
+    let results = index
+      .search(&manifest, &query_f32, k, rust_options)
+      .map_err(|e| Error::from_reason(e.to_string()))?;
     Ok(results.into_iter().map(|r| r.into()).collect())
   }
 
@@ -672,7 +682,9 @@ impl JsIvfPqIndex {
       );
 
     let k = validation::non_negative_usize("k", k as i64, validation::MAX_COUNT)?;
-    let results = index.search_multi(&manifest, &query_refs, k, aggregation.into(), rust_options);
+    let results = index
+      .search_multi(&manifest, &query_refs, k, aggregation.into(), rust_options)
+      .map_err(|e| Error::from_reason(e.to_string()))?;
     Ok(results.into_iter().map(|r| r.into()).collect())
   }
 

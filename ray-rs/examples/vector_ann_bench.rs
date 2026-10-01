@@ -271,16 +271,18 @@ fn run_ivf_bench(
   for query in queries {
     let exact = exact_top_k(manifest, query, config.k, DistanceMetric::Cosine);
     let start = Instant::now();
-    let approx = index.search(
-      manifest,
-      query,
-      config.k,
-      Some(SearchOptions {
-        n_probe: Some(config.n_probe),
-        filter: None,
-        threshold: None,
-      }),
-    );
+    let approx = index
+      .search(
+        manifest,
+        query,
+        config.k,
+        Some(SearchOptions {
+          n_probe: Some(config.n_probe),
+          filter: None,
+          threshold: None,
+        }),
+      )
+      .map_err(|err| err.to_string())?;
     latency_ns.push(start.elapsed().as_nanos());
     recall_sum += recall_at_k(&approx, &exact, config.k);
   }
@@ -329,16 +331,18 @@ fn run_ivf_pq_bench(
   for query in queries {
     let exact = exact_top_k(manifest, query, config.k, DistanceMetric::Cosine);
     let start = Instant::now();
-    let approx = index.search(
-      manifest,
-      query,
-      config.k,
-      Some(IvfPqSearchOptions {
-        n_probe: Some(config.n_probe),
-        filter: None,
-        threshold: None,
-      }),
-    );
+    let approx = index
+      .search(
+        manifest,
+        query,
+        config.k,
+        Some(IvfPqSearchOptions {
+          n_probe: Some(config.n_probe),
+          filter: None,
+          threshold: None,
+        }),
+      )
+      .map_err(|err| err.to_string())?;
     latency_ns.push(start.elapsed().as_nanos());
     recall_sum += recall_at_k(&approx, &exact, config.k);
   }

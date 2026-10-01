@@ -437,7 +437,9 @@ impl PyIvfIndex {
       .write()
       .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let vector_f32: Vec<f32> = vector.iter().map(|&v| v as f32).collect();
-    Ok(index.delete(vector_id, &vector_f32))
+    index
+      .delete(vector_id, &vector_f32)
+      .map_err(|e| PyRuntimeError::new_err(format!("Failed to delete vector: {e}")))
   }
 
   /// Clear all data from the index
@@ -480,7 +482,9 @@ impl PyIvfIndex {
       });
 
     let k = validation::non_negative_usize("k", k as i64, validation::MAX_COUNT)?;
-    let results = index.search(&manifest, &query_f32, k, rust_options);
+    let results = index
+      .search(&manifest, &query_f32, k, rust_options)
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     Ok(results.into_iter().map(|r| r.into()).collect())
   }
 
@@ -522,7 +526,9 @@ impl PyIvfIndex {
       });
 
     let k = validation::non_negative_usize("k", k as i64, validation::MAX_COUNT)?;
-    let results = index.search_multi(&manifest, &query_refs, k, agg.into(), rust_options);
+    let results = index
+      .search_multi(&manifest, &query_refs, k, agg.into(), rust_options)
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     Ok(results.into_iter().map(|r| r.into()).collect())
   }
 
@@ -688,7 +694,9 @@ impl PyIvfPqIndex {
       .write()
       .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let vector_f32: Vec<f32> = vector.iter().map(|&v| v as f32).collect();
-    Ok(index.delete(vector_id, &vector_f32))
+    index
+      .delete(vector_id, &vector_f32)
+      .map_err(|e| PyRuntimeError::new_err(format!("Failed to delete vector: {e}")))
   }
 
   /// Clear the index
@@ -733,7 +741,9 @@ impl PyIvfPqIndex {
       );
 
     let k = validation::non_negative_usize("k", k as i64, validation::MAX_COUNT)?;
-    let results = index.search(&manifest, &query_f32, k, rust_options);
+    let results = index
+      .search(&manifest, &query_f32, k, rust_options)
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     Ok(results.into_iter().map(|r| r.into()).collect())
   }
 
@@ -777,7 +787,9 @@ impl PyIvfPqIndex {
       );
 
     let k = validation::non_negative_usize("k", k as i64, validation::MAX_COUNT)?;
-    let results = index.search_multi(&manifest, &query_refs, k, agg.into(), rust_options);
+    let results = index
+      .search_multi(&manifest, &query_refs, k, agg.into(), rust_options)
+      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     Ok(results.into_iter().map(|r| r.into()).collect())
   }
 

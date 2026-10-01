@@ -256,6 +256,20 @@ pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
   1.0 - cosine_similarity(a, b)
 }
 
+/// Cosine distance between a unit-length `query` and a vector of any length.
+///
+/// For stores that keep raw vectors: dividing by the stored vector's norm
+/// keeps long vectors from looking more similar than they are.
+#[inline]
+pub(crate) fn cosine_distance_unit_query(query: &[f32], vector: &[f32]) -> f32 {
+  let norm = l2_norm(vector);
+  if norm > 0.0 {
+    1.0 - dot_product(query, vector) / norm
+  } else {
+    1.0
+  }
+}
+
 /// L2 norm of a vector
 #[inline]
 pub fn l2_norm(v: &[f32]) -> f32 {

@@ -9,10 +9,11 @@
 //!
 //! Ported from src/vector/ivf-index.ts
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::types::NodeId;
-use crate::vector::distance::normalize;
+use crate::vector::distance::{normalize, normalize_in_place};
+use crate::vector::store::validate_manifest_layout;
 use crate::vector::types::{
   DistanceMetric, Fragment, IvfConfig, MultiQueryAggregation, VectorLocation, VectorManifest,
   VectorSearchResult,
@@ -112,7 +113,7 @@ impl IvfIndex {
       return Ok(());
     }
 
-    let training_vectors = self
+    let mut training_vectors = self
       .training_vectors
       .take()
       .ok_or(IvfError::NoTrainingVectors)?;
@@ -122,6 +123,14 @@ impl IvfIndex {
         n: self.training_count,
         k: self.config.n_clusters,
       });
+    }
+
+    // Cluster directions, not magnitudes: insert/search/delete compare
+    // normalized vectors against these centroids.
+    if self.config.metric == DistanceMetric::Cosine && self.dimensions > 0 {
+      for vector in training_vectors.chunks_exact_mut(self.dimensions) {
+        normalize_in_place(vector);
+      }
     }
 
     // Get distance function
@@ -162,13 +171,7 @@ impl IvfIndex {
     if !self.trained {
       return Err(IvfError::NotTrained);
     }
-
-    if vector.len() != self.dimensions {
-      return Err(IvfError::DimensionMismatch {
-        expected: self.dimensions,
-        got: vector.len(),
-      });
-    }
+    self.check_dimensions(vector)?;
 
     // Find nearest centroid
     let cluster = self.find_nearest_centroid(vector);
@@ -186,9 +189,13 @@ impl IvfIndex {
   /// Delete a vector from the index
   ///
   /// Returns true if deleted, false if not found.
-  pub fn delete(&mut self, vector_id: u64, vector: &[f32]) -> bool {
+  ///
+  /// # Errors
+  /// Returns an error if the vector length does not match the index dimensions.
+  pub fn delete(&mut self, vector_id: u64, vector: &[f32]) -> Result<bool, IvfError> {
+    self.check_dimensions(vector)?;
     if !self.trained {
-      return false;
+      return Ok(false);
     }
 
     // Find which cluster it's in
@@ -198,50 +205,73 @@ impl IvfIndex {
       if let Some(idx) = list.iter().position(|&id| id == vector_id) {
         // Remove from list (swap with last for O(1))
         list.swap_remove(idx);
-        return true;
+        return Ok(true);
       }
     }
 
-    false
+    Ok(false)
   }
 
   /// Search for k nearest neighbors
+  ///
+  /// # Errors
+  /// Returns an error if the query or the manifest does not match the index
+  /// dimensions, or if the manifest's row groups are malformed.
   pub fn search(
     &self,
     manifest: &VectorManifest,
     query: &[f32],
     k: usize,
     options: Option<SearchOptions>,
-  ) -> Vec<VectorSearchResult> {
+  ) -> Result<Vec<VectorSearchResult>, IvfError> {
+    self.check_dimensions(query)?;
+    self.check_manifest(manifest)?;
     if !self.trained {
-      return Vec::new();
+      return Ok(Vec::new());
     }
 
     let options = options.unwrap_or_default();
-    let n_probe = options.n_probe.unwrap_or(self.config.n_probe);
-
-    // Prepare query vector
     let query_vec = self.prepare_query(query);
-
-    // Find top n_probe nearest centroids
-    let probe_clusters = self.find_nearest_centroids(&query_vec, n_probe);
-
-    // Get distance function
-    let distance_fn = self.config.metric.distance_fn();
 
     // Build fragment lookup map for O(1) access (avoid .find() in hot loop)
     let fragment_map = build_fragment_map(manifest);
+
+    let hits = self.search_prepared(manifest, &fragment_map, &query_vec, k, &options, true);
+    Ok(
+      hits
+        .into_iter()
+        .map(|(vector_id, distance)| self.to_result(manifest, vector_id, distance))
+        .collect(),
+    )
+  }
+
+  /// Top-k `(vector_id, distance)` for a prepared query. Multi-query search
+  /// disables `apply_threshold` and thresholds the aggregated distance instead.
+  fn search_prepared(
+    &self,
+    manifest: &VectorManifest,
+    fragment_map: &HashMap<usize, &Fragment>,
+    query_vec: &[f32],
+    k: usize,
+    options: &SearchOptions,
+    apply_threshold: bool,
+  ) -> Vec<(u64, f32)> {
+    let n_probe = options.n_probe.unwrap_or(self.config.n_probe);
+
+    // Find top n_probe nearest centroids
+    let probe_clusters = self.find_nearest_centroids(query_vec, n_probe);
 
     // Use max-heap to track top-k candidates
     let mut heap = MaxHeap::new();
 
     let params = SearchClusterParams {
       manifest,
-      query_vec: &query_vec,
-      options: &options,
-      fragment_map: &fragment_map,
-      distance_fn,
+      query_vec,
+      options,
+      fragment_map,
+      distance_fn: self.stored_distance_fn(manifest),
       k,
+      apply_threshold,
     };
 
     // Search within selected clusters
@@ -249,25 +279,26 @@ impl IvfIndex {
       self.search_cluster(cluster, &params, &mut heap);
     }
 
-    // Convert to results
-    let results = heap.into_sorted_vec();
+    heap.into_sorted_vec()
+  }
 
-    results
-      .into_iter()
-      .map(|(vector_id, distance)| {
-        let node_id = manifest
-          .vector_to_node
-          .get(&vector_id)
-          .copied()
-          .unwrap_or(0);
-        VectorSearchResult {
-          vector_id,
-          node_id,
-          distance,
-          similarity: self.config.metric.distance_to_similarity(distance),
-        }
-      })
-      .collect()
+  fn to_result(
+    &self,
+    manifest: &VectorManifest,
+    vector_id: u64,
+    distance: f32,
+  ) -> VectorSearchResult {
+    let node_id = manifest
+      .vector_to_node
+      .get(&vector_id)
+      .copied()
+      .unwrap_or(0);
+    VectorSearchResult {
+      vector_id,
+      node_id,
+      distance,
+      similarity: self.config.metric.distance_to_similarity(distance),
+    }
   }
 
   fn prepare_query(&self, query: &[f32]) -> Vec<f32> {
@@ -278,6 +309,28 @@ impl IvfIndex {
     }
   }
 
+  fn stored_distance_fn(&self, manifest: &VectorManifest) -> fn(&[f32], &[f32]) -> f32 {
+    self
+      .config
+      .metric
+      .stored_distance_fn(manifest.config.normalize_on_insert)
+  }
+
+  fn check_dimensions(&self, vector: &[f32]) -> Result<(), IvfError> {
+    if vector.len() != self.dimensions {
+      return Err(IvfError::DimensionMismatch {
+        expected: self.dimensions,
+        got: vector.len(),
+      });
+    }
+    Ok(())
+  }
+
+  fn check_manifest(&self, manifest: &VectorManifest) -> Result<(), IvfError> {
+    validate_manifest_layout(manifest, self.dimensions)
+      .map_err(|e| IvfError::InvalidManifest(e.to_string()))
+  }
+
   fn search_cluster(&self, cluster: usize, params: &SearchClusterParams<'_>, heap: &mut MaxHeap) {
     let vector_ids = match self.inverted_lists.get(&cluster) {
       Some(list) if !list.is_empty() => list,
@@ -285,32 +338,18 @@ impl IvfIndex {
     };
 
     for &vector_id in vector_ids {
-      let location = match params.manifest.vector_locations.get(&vector_id) {
-        Some(loc) => loc,
+      let vec = match lookup_vector(params.manifest, params.fragment_map, vector_id) {
+        Some(vec) => vec,
         None => continue,
       };
-
-      let fragment = match params.fragment_map.get(&location.fragment_id) {
-        Some(f) => *f,
-        None => continue,
-      };
-
-      if fragment.is_deleted(location.local_index) {
-        continue;
-      }
 
       if !passes_filter(params.options, params.manifest, vector_id) {
         continue;
       }
 
-      let vec = match vector_slice(params.manifest, fragment, location) {
-        Some(vec) => vec,
-        None => continue,
-      };
-
       let dist = (params.distance_fn)(params.query_vec, vec);
 
-      if !passes_threshold(self.config.metric, params.options, dist) {
+      if params.apply_threshold && !passes_threshold(self.config.metric, params.options, dist) {
         continue;
       }
 
@@ -341,60 +380,67 @@ impl IvfIndex {
     k: usize,
     aggregation: MultiQueryAggregation,
     options: Option<SearchOptions>,
-  ) -> Vec<VectorSearchResult> {
+  ) -> Result<Vec<VectorSearchResult>, IvfError> {
+    for query in queries {
+      self.check_dimensions(query)?;
+    }
+    self.check_manifest(manifest)?;
     if !self.trained || queries.is_empty() {
-      return Vec::new();
+      return Ok(Vec::new());
     }
 
     let options = options.unwrap_or_default();
-
-    // Run individual searches with higher k to ensure we have enough candidates
-    let expanded_k = k * 2;
-    let all_results: Vec<Vec<VectorSearchResult>> = queries
+    let prepared: Vec<Vec<f32>> = queries
       .iter()
-      .map(|query| self.search(manifest, query, expanded_k, None))
+      .map(|query| self.prepare_query(query))
       .collect();
+    let fragment_map = build_fragment_map(manifest);
 
-    // Aggregate by node_id
-    let mut aggregated: HashMap<NodeId, (Vec<f32>, u64)> = HashMap::new();
-
-    for results in &all_results {
-      for result in results {
-        let entry = aggregated
-          .entry(result.node_id)
-          .or_insert_with(|| (Vec::new(), result.vector_id));
-        entry.0.push(result.distance);
+    // Candidates: union of each query's over-fetched top-k (filter and n_probe
+    // apply here; the threshold applies to the aggregated distance).
+    let expanded_k = k.saturating_mul(2);
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+    for query_vec in &prepared {
+      let hits = self.search_prepared(
+        manifest,
+        &fragment_map,
+        query_vec,
+        expanded_k,
+        &options,
+        false,
+      );
+      for (vector_id, _) in hits {
+        if seen.insert(vector_id) {
+          candidates.push(vector_id);
+        }
       }
     }
 
-    // Apply filter if provided
-    let aggregated: HashMap<NodeId, (Vec<f32>, u64)> = if let Some(ref filter) = options.filter {
-      aggregated
-        .into_iter()
-        .filter(|(node_id, _)| filter(*node_id))
-        .collect()
-    } else {
-      aggregated
-    };
-
-    // Compute aggregated scores and build results
-    let mut scored: Vec<VectorSearchResult> = aggregated
-      .into_iter()
-      .map(|(node_id, (distances, vector_id))| {
-        let distance = aggregation.aggregate(&distances);
-        let similarity = self.config.metric.distance_to_similarity(distance);
-        VectorSearchResult {
-          vector_id,
-          node_id,
-          distance,
-          similarity,
-        }
-      })
-      .collect();
-
-    // Apply threshold filter
-    if let Some(threshold) = options.threshold {
-      scored.retain(|r| r.similarity >= threshold);
+    // Score every candidate against every query. A candidate found by only
+    // one query must not be aggregated over that query's distance alone.
+    let distance_fn = self.stored_distance_fn(manifest);
+    let mut distances = Vec::with_capacity(prepared.len());
+    let mut scored = Vec::with_capacity(candidates.len());
+    for vector_id in candidates {
+      let vector = match lookup_vector(manifest, &fragment_map, vector_id) {
+        Some(vector) => vector,
+        None => continue,
+      };
+      distances.clear();
+      distances.extend(
+        prepared
+          .iter()
+          .map(|query_vec| distance_fn(query_vec, vector)),
+      );
+      let result = self.to_result(manifest, vector_id, aggregation.aggregate(&distances));
+      if options
+        .threshold
+        .is_some_and(|threshold| result.similarity < threshold)
+      {
+        continue;
+      }
+      scored.push(result);
     }
 
     // Sort by distance and return top k
@@ -405,11 +451,13 @@ impl IvfIndex {
     });
     scored.truncate(k);
 
-    scored
+    Ok(scored)
   }
 
   /// Build index from all vectors in the store
   pub fn build_from_store(&mut self, manifest: &VectorManifest) -> Result<(), IvfError> {
+    self.check_manifest(manifest)?;
+
     // Collect training vectors
     for fragment in &manifest.fragments {
       for row_group in &fragment.row_groups {
@@ -421,36 +469,13 @@ impl IvfIndex {
     self.train()?;
 
     // Build fragment lookup map for O(1) access
-    let fragment_map: HashMap<usize, &_> = manifest.fragments.iter().map(|f| (f.id, f)).collect();
+    let fragment_map = build_fragment_map(manifest);
 
     // Insert all vectors
-    for (&_node_id, &vector_id) in &manifest.node_to_vector {
-      let location = match manifest.vector_locations.get(&vector_id) {
-        Some(loc) => loc,
-        None => continue,
-      };
-
-      // Get fragment with O(1) lookup
-      let fragment = match fragment_map.get(&location.fragment_id) {
-        Some(f) => *f,
-        None => continue,
-      };
-
-      if fragment.is_deleted(location.local_index) {
-        continue;
+    for &vector_id in manifest.node_to_vector.values() {
+      if let Some(vector) = lookup_vector(manifest, &fragment_map, vector_id) {
+        self.insert(vector_id, vector)?;
       }
-
-      let row_group_idx = location.local_index / manifest.config.row_group_size;
-      let local_row_idx = location.local_index % manifest.config.row_group_size;
-      let row_group = match fragment.row_groups.get(row_group_idx) {
-        Some(rg) => rg,
-        None => continue,
-      };
-
-      let offset = local_row_idx * manifest.config.dimensions;
-      let vector = &row_group.data[offset..offset + manifest.config.dimensions];
-
-      self.insert(vector_id, vector)?;
     }
 
     Ok(())
@@ -574,6 +599,22 @@ fn passes_threshold(metric: DistanceMetric, options: &SearchOptions, dist: f32) 
   true
 }
 
+/// Live vector data for `vector_id`, or None if unmapped or deleted.
+///
+/// The manifest must have passed `validate_manifest_layout`.
+fn lookup_vector<'a>(
+  manifest: &'a VectorManifest,
+  fragment_map: &HashMap<usize, &'a Fragment>,
+  vector_id: u64,
+) -> Option<&'a [f32]> {
+  let location = manifest.vector_locations.get(&vector_id)?;
+  let fragment = *fragment_map.get(&location.fragment_id)?;
+  if fragment.is_deleted(location.local_index) {
+    return None;
+  }
+  vector_slice(manifest, fragment, location)
+}
+
 fn vector_slice<'a>(
   manifest: &'a VectorManifest,
   fragment: &'a Fragment,
@@ -608,6 +649,7 @@ struct SearchClusterParams<'a> {
   fragment_map: &'a HashMap<usize, &'a Fragment>,
   distance_fn: fn(&[f32], &[f32]) -> f32,
   k: usize,
+  apply_threshold: bool,
 }
 
 // ============================================================================
@@ -748,6 +790,7 @@ pub enum IvfError {
   NotEnoughTrainingVectors { n: usize, k: usize },
   DimensionMismatch { expected: usize, got: usize },
   TrainingFailed(String),
+  InvalidManifest(String),
 }
 
 impl std::fmt::Display for IvfError {
@@ -763,6 +806,7 @@ impl std::fmt::Display for IvfError {
         write!(f, "Dimension mismatch: expected {expected}, got {got}")
       }
       IvfError::TrainingFailed(msg) => write!(f, "Training failed: {msg}"),
+      IvfError::InvalidManifest(msg) => write!(f, "Invalid vector manifest: {msg}"),
     }
   }
 }
@@ -886,8 +930,8 @@ mod tests {
     // Insert and delete
     let vector = vec![5.0, 0.0, 0.0, 1.0];
     index.insert(0, &vector).expect("expected value");
-    assert!(index.delete(0, &vector));
-    assert!(!index.delete(0, &vector)); // Already deleted
+    assert!(index.delete(0, &vector).expect("delete"));
+    assert!(!index.delete(0, &vector).expect("delete")); // Already deleted
 
     let stats = index.stats();
     assert_eq!(stats.total_vectors, 0);
@@ -965,6 +1009,23 @@ mod tests {
     assert!(IvfError::NoTrainingVectors.to_string().contains("training"));
   }
 
+  #[test]
+  fn test_ivf_build_from_store_rejects_mismatched_manifest_before_training() {
+    let mut manifest = VectorManifest::new(VectorStoreConfig::new(8).with_normalize(false));
+    for node_id in 1..=4u64 {
+      let vector: Vec<f32> = (0..8).map(|d| (node_id * 8 + d) as f32).collect();
+      crate::vector::store::vector_store_insert(&mut manifest, node_id, &vector)
+        .expect("store insert");
+    }
+    let mut index = create_test_index(4, 1);
+
+    assert!(matches!(
+      index.build_from_store(&manifest),
+      Err(IvfError::InvalidManifest(_))
+    ));
+    assert!(!index.trained);
+  }
+
   // ========================================================================
   // Multi-Query Search Tests
   // ========================================================================
@@ -987,7 +1048,9 @@ mod tests {
     let manifest = VectorManifest::new(VectorStoreConfig::new(4));
 
     // Empty queries should return empty results
-    let results = index.search_multi(&manifest, &[], 5, MultiQueryAggregation::Min, None);
+    let results = index
+      .search_multi(&manifest, &[], 5, MultiQueryAggregation::Min, None)
+      .expect("search_multi");
     assert!(results.is_empty());
   }
 
@@ -997,7 +1060,9 @@ mod tests {
     let manifest = VectorManifest::new(VectorStoreConfig::new(4));
 
     let query = vec![1.0, 0.0, 0.0, 0.0];
-    let results = index.search_multi(&manifest, &[&query], 5, MultiQueryAggregation::Min, None);
+    let results = index
+      .search_multi(&manifest, &[&query], 5, MultiQueryAggregation::Min, None)
+      .expect("search_multi");
     assert!(results.is_empty());
   }
 

@@ -36,6 +36,17 @@ impl DistanceMetric {
     }
   }
 
+  /// Distance from a prepared query (unit length for cosine) to a stored vector.
+  ///
+  /// `distance_fn` assumes cosine operands are unit length. Stores that skip
+  /// normalization on insert need the stored vector's norm divided out.
+  pub(crate) fn stored_distance_fn(&self, stored_normalized: bool) -> fn(&[f32], &[f32]) -> f32 {
+    match self {
+      DistanceMetric::Cosine if !stored_normalized => super::distance::cosine_distance_unit_query,
+      _ => self.distance_fn(),
+    }
+  }
+
   /// Convert distance to similarity score (0-1 range, higher is more similar)
   pub fn distance_to_similarity(&self, distance: f32) -> f32 {
     match self {
