@@ -50,7 +50,9 @@ fn commit_many_small_transactions(background: bool) {
   close_single_file(db).expect("close");
   let reopened = open_single_file(&path, options(background)).expect("reopen");
   assert!(reopened.node_by_key("n:0").is_some());
-  assert!(reopened.node_by_key(&format!("n:{}", COMMITS - 1)).is_some());
+  assert!(reopened
+    .node_by_key(&format!("n:{}", COMMITS - 1))
+    .is_some());
   close_single_file(reopened).expect("close reopened");
 }
 
