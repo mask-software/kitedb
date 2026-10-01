@@ -283,12 +283,12 @@ function WALDualRegionDetailed() {
 						no longer needed for replay
 					</FlowItem>
 					<FlowItem color="emerald">
-						Records from the secondary region are appended to the primary region
-						after the old records, and new writes go to the primary again. The
-						old records stay in place so the previous header remains usable
-						until the new one is durable. If the secondary records don't fit,
-						KiteDB installs the new header first and then rebuilds the primary
-						region from them.
+						The header that installs the new snapshot no longer points at any
+						record written before the checkpoint started, so that space is free
+						again. If nothing committed during the checkpoint, the WAL is empty.
+						Otherwise those commits stay in the secondary region until the new
+						header is durable, then are rewritten at the start of the primary
+						region, and new writes continue after them.
 					</FlowItem>
 					<FlowItem color="emerald">
 						Transactions that committed during the checkpoint stay visible
