@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 process.env.REPLICATION_ADMIN_TOKEN = "test-repl-admin-token";
+const PREVIOUS_DATA_DIR = process.env.PLAYGROUND_DATA_DIR;
 
 const { Elysia } = await import("elysia");
 const { apiRoutes } = await import("./routes.ts");
@@ -143,8 +144,14 @@ async function requestText(
   };
 }
 
-async function openPrimary(): Promise<void> {
+/** Fresh temp dir per test; /api/db/open only accepts paths inside PLAYGROUND_DATA_DIR. */
+async function useTempDataDir(): Promise<void> {
   tempDir = await mkdtemp(join(tmpdir(), "playground-repl-test-"));
+  process.env.PLAYGROUND_DATA_DIR = tempDir;
+}
+
+async function openPrimary(): Promise<void> {
+  await useTempDataDir();
   dbPath = join(tempDir, "primary.kitedb");
 
   const response = await requestJson<{ success: boolean; error?: string }>(
@@ -185,6 +192,11 @@ afterEach(async () => {
   await closeDatabase();
   if (tempDir) {
     await rm(tempDir, { recursive: true, force: true });
+  }
+  if (PREVIOUS_DATA_DIR === undefined) {
+    delete process.env.PLAYGROUND_DATA_DIR;
+  } else {
+    process.env.PLAYGROUND_DATA_DIR = PREVIOUS_DATA_DIR;
   }
 });
 
@@ -320,6 +332,7 @@ describe("replication log endpoints", () => {
     const emptyEpoch = await requestJson<{
       success: boolean;
       frameCount: number;
+      headLogIndex: number;
       cursor: string | null;
       nextCursor: string | null;
     }>(
@@ -331,7 +344,9 @@ describe("replication log endpoints", () => {
     expect(emptyEpoch.status).toBe(200);
     expect(emptyEpoch.body.success).toBe(true);
     expect(emptyEpoch.body.cursor).toBe(":2");
-    expect(emptyEpoch.body.frameCount).toBe(2);
+    // ":2" parses as epoch 0, so every retained epoch-1 frame is after it: the schema
+    // bootstrap frame Kite::open logs on a fresh primary plus the 2 commits.
+    expect(emptyEpoch.body.frameCount).toBe(emptyEpoch.body.headLogIndex);
     expect(emptyEpoch.body.nextCursor).toBeTruthy();
   });
 
@@ -1192,7 +1207,7 @@ describe("replication log endpoints", () => {
 
   test("reseed clears needsReseed after missing-segment failure", async () => {
     await closeDatabase();
-    tempDir = await mkdtemp(join(tmpdir(), "playground-repl-test-"));
+    await useTempDataDir();
     dbPath = join(tempDir, "primary-needs-reseed.kitedb");
     const openPrimaryWithSmallSegments = await requestJson<{ success: boolean }>(
       "POST",
@@ -1272,15 +1287,23 @@ describe("replication log endpoints", () => {
     );
     await rm(segmentPath, { force: true });
 
-    const pullAfterTamper = await requestJson<{ success: boolean; error?: string }>(
-      "POST",
-      "/api/replication/pull",
-      { maxFrames: 64 },
-      AUTH_HEADER,
-    );
-    expect(pullAfterTamper.status).toBe(200);
-    expect(pullAfterTamper.body.success).toBe(false);
-    expect(pullAfterTamper.body.error).toContain("needs reseed");
+    // A missing segment is first retried as transient; each pull spends part of the retry
+    // budget, and the replica escalates to needs-reseed once the budget is exhausted.
+    let pullAfterTamper: JsonResponse<{ success: boolean; error?: string }> | null = null;
+    for (let attempt = 0; attempt < 10; attempt++) {
+      pullAfterTamper = await requestJson<{ success: boolean; error?: string }>(
+        "POST",
+        "/api/replication/pull",
+        { maxFrames: 64 },
+        AUTH_HEADER,
+      );
+      expect(pullAfterTamper.status).toBe(200);
+      expect(pullAfterTamper.body.success).toBe(false);
+      if (pullAfterTamper.body.error?.includes("needs reseed")) {
+        break;
+      }
+    }
+    expect(pullAfterTamper?.body.error).toContain("needs reseed");
 
     const replicaStatusAfter = await requestJson<{
       connected: boolean;
@@ -1321,5 +1344,5 @@ describe("replication log endpoints", () => {
     );
     expect(pullAfterReseed.status).toBe(200);
     expect(pullAfterReseed.body.success).toBe(true);
-  });
+  }, 30_000);
 });

@@ -424,7 +424,7 @@ export function Header({
 
 						<input
 							type="text"
-							placeholder="Enter database path (e.g., /path/to/db.kitedb)…"
+							placeholder="Database path, relative to the playground data dir (e.g., my.kitedb)…"
 							value={openPath}
 							onChange={(e) => setOpenPath(e.target.value)}
 							style={styles.modalInput}
