@@ -1480,3 +1480,53 @@ fn promotion_announces_schema_and_replica_rebuilds_translation() {
   replica.close().expect("close replica");
   primary.close().expect("close primary");
 }
+
+#[test]
+fn reseed_recreates_nodes_whose_keys_were_swapped() {
+  let dir = tempfile::tempdir().expect("tempdir");
+  let primary_path = dir.path().join("swap-primary.kitedb");
+  let replica_path = dir.path().join("swap-replica.kitedb");
+  let primary = open_primary(&primary_path, SyncMode::Full);
+  let replica = open_replica(&replica_path, &primary_path);
+  replica
+    .replica_bootstrap_from_snapshot()
+    .expect("bootstrap empty primary");
+
+  primary.begin(false).expect("begin");
+  let n1 = primary.create_node(Some("a")).expect("n1");
+  let n2 = primary.create_node(Some("b")).expect("n2");
+  let n3 = primary.create_node(Some("c")).expect("n3");
+  commit(&primary);
+  catch_up_all(&replica).expect("catch up");
+
+  // While the replica is not following, n1/n2 exchange keys and n3 changes
+  // its key; each id is recreated (keys are immutable on a live node).
+  primary.begin(false).expect("begin delete");
+  for node in [n1, n2, n3] {
+    primary.delete_node(node).expect("delete");
+  }
+  commit(&primary);
+  primary.begin(false).expect("begin recreate");
+  primary.create_node_with_id(n1, Some("b")).expect("n1 b");
+  primary.create_node_with_id(n2, Some("a")).expect("n2 a");
+  primary.create_node_with_id(n3, Some("d")).expect("n3 d");
+  commit(&primary);
+
+  replica.replica_reseed_from_snapshot().expect("reseed");
+  let expected = [("a", n2), ("b", n1), ("c", 0), ("d", n3)];
+  let check = |db: &SingleFileDB| {
+    for (key, node) in expected {
+      let expected = (node != 0).then_some(node);
+      assert_eq!(db.node_by_key(key), expected, "key {key}");
+    }
+    assert_eq!(graph_state(db), graph_state(&primary));
+  };
+  check(&replica);
+
+  close_single_file(replica).expect("close replica");
+  let replica = open_replica(&replica_path, &primary_path);
+  check(&replica);
+
+  close_single_file(replica).expect("close replica");
+  close_single_file(primary).expect("close primary");
+}
