@@ -157,6 +157,9 @@ impl<T: Clone, K: Eq + Hash + Clone> SoaPropertyVersions<T, K> {
   }
 
   /// Truncate deep chains to limit worst-case traversal time
+  ///
+  /// The newest version with `commit_ts < min_active_ts` is what the oldest active reader
+  /// sees, so a chain is never cut above it, even if that leaves it deeper than `max_depth`.
   pub fn truncate_deep_chains(
     &mut self,
     max_depth: usize,
@@ -165,40 +168,36 @@ impl<T: Clone, K: Eq + Hash + Clone> SoaPropertyVersions<T, K> {
     let mut truncated = 0;
 
     for &head_idx in self.heads.values() {
-      let mut depth = 0;
-      let mut current_idx = head_idx;
-      let mut truncate_at = NULL_IDX;
-
-      while current_idx != NULL_IDX && depth < max_depth {
-        let i = current_idx as usize;
-
-        // Track the last version that's safe to truncate after
-        if let Some(min_ts) = min_active_ts {
-          if self.commit_ts[i] >= min_ts {
-            truncate_at = current_idx;
-          }
-        } else {
-          truncate_at = current_idx;
+      // Walk to the oldest version to keep: at least `max_depth` deep, and deep enough to
+      // include the oldest reader's version.
+      let mut keep_idx = head_idx;
+      let mut depth = 1;
+      let mut oldest_reader_covered = min_active_ts.is_none();
+      loop {
+        let i = keep_idx as usize;
+        if min_active_ts.is_some_and(|min_ts| self.commit_ts[i] < min_ts) {
+          oldest_reader_covered = true;
         }
-
+        let prev = self.prev_idx[i];
+        if prev == NULL_IDX || (depth >= max_depth && oldest_reader_covered) {
+          break;
+        }
+        keep_idx = prev;
         depth += 1;
-        current_idx = self.prev_idx[i];
       }
 
-      // If we exceeded max_depth, truncate
-      if current_idx != NULL_IDX && truncate_at != NULL_IDX {
-        // Free all versions after truncate_at
-        let mut to_free = self.prev_idx[truncate_at as usize];
-        self.prev_idx[truncate_at as usize] = NULL_IDX;
-
-        while to_free != NULL_IDX {
-          let next = self.prev_idx[to_free as usize];
-          self.free_list.push(to_free);
-          to_free = next;
-        }
-
-        truncated += 1;
+      // Free all versions after keep_idx
+      let mut to_free = self.prev_idx[keep_idx as usize];
+      if to_free == NULL_IDX {
+        continue;
       }
+      self.prev_idx[keep_idx as usize] = NULL_IDX;
+      while to_free != NULL_IDX {
+        let next = self.prev_idx[to_free as usize];
+        self.free_list.push(to_free);
+        to_free = next;
+      }
+      truncated += 1;
     }
 
     truncated
@@ -753,67 +752,39 @@ impl VersionChainManager {
   pub fn prune_old_versions(&mut self, horizon_ts: Timestamp) -> usize {
     let mut pruned = 0;
 
-    // Prune node versions
-    let node_keys: Vec<_> = self.node_versions.keys().cloned().collect();
-    for key in node_keys {
-      if let Some(version) = self.node_versions.get_mut(&key) {
-        let result = Self::prune_chain(version, horizon_ts);
-        if result == -1 {
-          self.node_versions.remove(&key);
-          pruned += 1;
-        } else {
-          pruned += result as usize;
-        }
-      }
-    }
+    pruned += Self::prune_chains(&mut self.node_versions, horizon_ts);
+    pruned += Self::prune_chains(&mut self.edge_versions, horizon_ts);
 
-    // Prune edge versions
-    let edge_keys: Vec<_> = self.edge_versions.keys().cloned().collect();
-    for key in edge_keys {
-      if let Some(version) = self.edge_versions.get_mut(&key) {
-        let result = Self::prune_chain(version, horizon_ts);
-        if result == -1 {
-          self.edge_versions.remove(&key);
-          pruned += 1;
-        } else {
-          pruned += result as usize;
-        }
-      }
-    }
-
-    // Prune property versions
+    // Prune property and label versions
     if self.use_soa {
       pruned += self.soa_node_props.prune_old_versions(horizon_ts);
       pruned += self.soa_edge_props.prune_old_versions(horizon_ts);
+      pruned += self.soa_node_labels.prune_old_versions(horizon_ts);
     } else {
-      // Legacy path
-      let node_prop_keys: Vec<_> = self.legacy_node_props.keys().cloned().collect();
-      for key in node_prop_keys {
-        if let Some(version) = self.legacy_node_props.get_mut(&key) {
-          let result = Self::prune_chain(version, horizon_ts);
-          if result == -1 {
-            self.legacy_node_props.remove(&key);
-            pruned += 1;
-          } else {
-            pruned += result as usize;
-          }
-        }
-      }
-
-      let edge_prop_keys: Vec<_> = self.legacy_edge_props.keys().cloned().collect();
-      for key in edge_prop_keys {
-        if let Some(version) = self.legacy_edge_props.get_mut(&key) {
-          let result = Self::prune_chain(version, horizon_ts);
-          if result == -1 {
-            self.legacy_edge_props.remove(&key);
-            pruned += 1;
-          } else {
-            pruned += result as usize;
-          }
-        }
-      }
+      pruned += Self::prune_chains(&mut self.legacy_node_props, horizon_ts);
+      pruned += Self::prune_chains(&mut self.legacy_edge_props, horizon_ts);
+      pruned += Self::prune_chains(&mut self.legacy_node_labels, horizon_ts);
     }
 
+    pruned
+  }
+
+  /// Prune every chain in a map, removing chains that are entirely older than horizon_ts
+  fn prune_chains<T>(
+    chains: &mut HashMap<TxKey, Box<VersionedRecord<T>>>,
+    horizon_ts: Timestamp,
+  ) -> usize {
+    let mut pruned = 0;
+    chains.retain(|_, version| {
+      let result = Self::prune_chain(version, horizon_ts);
+      if result == -1 {
+        pruned += 1;
+        false
+      } else {
+        pruned += result as usize;
+        true
+      }
+    });
     pruned
   }
 
@@ -868,21 +839,10 @@ impl VersionChainManager {
   ) -> usize {
     let mut truncated = 0;
 
-    // Truncate node version chains
-    for version in self.node_versions.values_mut() {
-      if Self::truncate_chain_at_depth(version, max_depth, min_active_ts) {
-        truncated += 1;
-      }
-    }
+    truncated += Self::truncate_chains(&mut self.node_versions, max_depth, min_active_ts);
+    truncated += Self::truncate_chains(&mut self.edge_versions, max_depth, min_active_ts);
 
-    // Truncate edge version chains
-    for version in self.edge_versions.values_mut() {
-      if Self::truncate_chain_at_depth(version, max_depth, min_active_ts) {
-        truncated += 1;
-      }
-    }
-
-    // Truncate property version chains
+    // Truncate property and label version chains
     if self.use_soa {
       truncated += self
         .soa_node_props
@@ -890,19 +850,30 @@ impl VersionChainManager {
       truncated += self
         .soa_edge_props
         .truncate_deep_chains(max_depth, min_active_ts);
+      truncated += self
+        .soa_node_labels
+        .truncate_deep_chains(max_depth, min_active_ts);
     } else {
-      for version in self.legacy_node_props.values_mut() {
-        if Self::truncate_chain_at_depth(version, max_depth, min_active_ts) {
-          truncated += 1;
-        }
-      }
-      for version in self.legacy_edge_props.values_mut() {
-        if Self::truncate_chain_at_depth(version, max_depth, min_active_ts) {
-          truncated += 1;
-        }
-      }
+      truncated += Self::truncate_chains(&mut self.legacy_node_props, max_depth, min_active_ts);
+      truncated += Self::truncate_chains(&mut self.legacy_edge_props, max_depth, min_active_ts);
+      truncated += Self::truncate_chains(&mut self.legacy_node_labels, max_depth, min_active_ts);
     }
 
+    truncated
+  }
+
+  /// Truncate every chain in a map; returns the number of chains truncated
+  fn truncate_chains<T>(
+    chains: &mut HashMap<TxKey, Box<VersionedRecord<T>>>,
+    max_depth: usize,
+    min_active_ts: Option<Timestamp>,
+  ) -> usize {
+    let mut truncated = 0;
+    for version in chains.values_mut() {
+      if Self::truncate_chain_at_depth(version, max_depth, min_active_ts) {
+        truncated += 1;
+      }
+    }
     truncated
   }
 
@@ -1417,5 +1388,283 @@ mod tests {
 
     // Should have pruned some versions
     assert!(pruned > 0);
+  }
+
+  #[test]
+  fn test_soa_truncate_with_active_reader() {
+    let deep_chain = || {
+      let mut mgr = VersionChainManager::new();
+      for i in 1..=20u64 {
+        let value = Some(std::sync::Arc::new(PropValue::I64(i as i64)));
+        mgr.append_node_prop_version(1, 1, value, i, i);
+      }
+      mgr
+    };
+    let visible_at = |mgr: &VersionChainManager, ts: Timestamp| {
+      let head = mgr.node_prop_version(1, 1).expect("prop chain");
+      let visible = visible_version(&head, ts, 999).and_then(|v| v.data.as_deref().cloned());
+      (head.chain_depth(), visible)
+    };
+
+    // The reader's version (ts=18) is within max_depth: the chain is cut at max_depth.
+    let mut mgr = deep_chain();
+    assert_eq!(mgr.truncate_deep_chains(5, Some(19)), 1);
+    assert_eq!(visible_at(&mgr, 19), (5, Some(PropValue::I64(18))));
+
+    // The reader's version (ts=2) is deeper than max_depth: the chain keeps it.
+    let mut mgr = deep_chain();
+    assert_eq!(mgr.truncate_deep_chains(5, Some(3)), 1);
+    assert_eq!(visible_at(&mgr, 3), (19, Some(PropValue::I64(2))));
+  }
+}
+
+#[cfg(test)]
+mod audit_tests {
+  use super::*;
+  use crate::mvcc::visibility::visible_version;
+  use crate::types::PropValue;
+  use std::sync::Arc;
+
+  const NODE: NodeId = 1;
+  const LABEL: LabelId = 7;
+  const PROP: PropKeyId = 3;
+  const READER_TXID: TxId = 999;
+
+  fn label_depth(mgr: &VersionChainManager) -> usize {
+    mgr
+      .node_label_version(NODE, LABEL)
+      .map_or(0, |head| head.chain_depth())
+  }
+
+  fn prop_depth(mgr: &VersionChainManager) -> usize {
+    mgr
+      .node_prop_version(NODE, PROP)
+      .map_or(0, |head| head.chain_depth())
+  }
+
+  fn i64_value(value: i64) -> Option<PropValueRef> {
+    Some(Arc::new(PropValue::I64(value)))
+  }
+
+  // M4: label chains must be pruned like property chains.
+
+  #[test]
+  fn audit_m4_prune_reclaims_label_chain_older_than_horizon() {
+    for use_soa in [true, false] {
+      let mut mgr = VersionChainManager::with_soa(use_soa);
+      mgr.append_node_prop_version(NODE, PROP, None, 0, 0);
+      mgr.append_node_prop_version(NODE, PROP, i64_value(1), 1, 5);
+      mgr.append_node_label_version(NODE, LABEL, None, 0, 0);
+      mgr.append_node_label_version(NODE, LABEL, Some(true), 1, 5);
+      mgr.append_node_label_version(NODE, LABEL, None, 2, 6);
+
+      mgr.prune_old_versions(100);
+
+      assert!(
+        mgr.node_prop_version(NODE, PROP).is_none(),
+        "control: prop chain below the horizon is reclaimed (soa={use_soa})"
+      );
+      assert!(
+        mgr.node_label_version(NODE, LABEL).is_none(),
+        "label chain below the horizon must be reclaimed (soa={use_soa})"
+      );
+      assert_eq!(mgr.counts().node_label_versions, 0, "soa={use_soa}");
+      assert!(mgr.node_label_keys(NODE).is_empty(), "soa={use_soa}");
+    }
+  }
+
+  #[test]
+  fn audit_m4_prune_trims_label_chain_to_newest_below_horizon() {
+    for use_soa in [true, false] {
+      let mut mgr = VersionChainManager::with_soa(use_soa);
+      let history: [(TxId, Timestamp); 5] = [(0, 0), (1, 5), (2, 6), (3, 7), (4, 20)];
+      for (i, &(txid, ts)) in history.iter().enumerate() {
+        let present = i % 2 == 1;
+        mgr.append_node_prop_version(NODE, PROP, i64_value(i as i64), txid, ts);
+        mgr.append_node_label_version(NODE, LABEL, present.then_some(true), txid, ts);
+      }
+
+      // Readers are at ts >= 10: they need the ts=20 head and the ts=7 version.
+      mgr.prune_old_versions(10);
+
+      assert_eq!(prop_depth(&mgr), 2, "control: prop chain (soa={use_soa})");
+      assert_eq!(
+        label_depth(&mgr),
+        2,
+        "label chain must keep only the head and the newest version below the horizon (soa={use_soa})"
+      );
+      let head = mgr
+        .node_label_version(NODE, LABEL)
+        .expect("label head survives");
+      let visible = visible_version(&head, 10, READER_TXID).expect("reader at ts=10 sees ts=7");
+      assert_eq!(visible.data, Some(true), "soa={use_soa}");
+    }
+  }
+
+  #[test]
+  fn audit_m4_truncate_bounds_label_chain_depth() {
+    for use_soa in [true, false] {
+      let mut mgr = VersionChainManager::with_soa(use_soa);
+      for i in 1..=20u64 {
+        mgr.append_node_prop_version(NODE, PROP, i64_value(i as i64), i, i);
+        mgr.append_node_label_version(NODE, LABEL, (i % 2 == 0).then_some(true), i, i);
+      }
+
+      mgr.truncate_deep_chains(5, None);
+
+      assert!(
+        prop_depth(&mgr) <= 5,
+        "control: prop chain truncated (soa={use_soa})"
+      );
+      assert!(
+        label_depth(&mgr) <= 5,
+        "label chain depth {} must be truncated to max_depth 5 (soa={use_soa})",
+        label_depth(&mgr)
+      );
+    }
+  }
+
+  #[test]
+  fn audit_m4_gc_reclaims_label_versions_after_readers_finish() {
+    use crate::core::single_file::{close_single_file, open_single_file, SingleFileOpenOptions};
+    use std::sync::mpsc;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = Arc::new(
+      open_single_file(
+        dir.path().join("m4.kitedb"),
+        SingleFileOpenOptions::new()
+          .mvcc(true)
+          .mvcc_gc_interval_ms(50)
+          .mvcc_retention_ms(0)
+          .auto_checkpoint(false),
+      )
+      .expect("open db"),
+    );
+
+    db.begin(false).expect("begin");
+    let node = db.create_node(Some("n")).expect("create node");
+    let label = db.define_label("Tag").expect("define label");
+    let prop = db.define_propkey("p").expect("define propkey");
+    db.set_node_prop(node, prop, PropValue::I64(0))
+      .expect("set prop");
+    db.commit().expect("commit");
+
+    // An open reader makes the following commits publish versions.
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let reader_db = Arc::clone(&db);
+    let reader = std::thread::spawn(move || {
+      reader_db.begin(true).expect("begin read tx");
+      ready_tx.send(()).expect("ready");
+      let _ = release_rx.recv();
+      reader_db.commit().expect("commit read tx");
+    });
+    ready_rx.recv().expect("reader ready");
+
+    for (i, add) in [true, false, true, false].into_iter().enumerate() {
+      db.begin(false).expect("begin");
+      if add {
+        db.add_node_label(node, label).expect("add label");
+      } else {
+        db.remove_node_label(node, label).expect("remove label");
+      }
+      db.set_node_prop(node, prop, PropValue::I64(i as i64 + 1))
+        .expect("set prop");
+      db.commit().expect("commit");
+    }
+
+    let mvcc = db.mvcc.as_ref().expect("mvcc enabled").clone();
+    {
+      let vc = mvcc.version_chain.lock();
+      assert!(vc.counts().node_prop_versions > 0, "prop versions created");
+      assert!(
+        vc.counts().node_label_versions > 0,
+        "label versions created"
+      );
+    }
+
+    release_tx.send(()).expect("release reader");
+    reader.join().expect("reader thread");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    {
+      let mut tx_mgr = mvcc.tx_manager.lock();
+      let mut vc = mvcc.version_chain.lock();
+      let mut gc = mvcc.gc.lock();
+      let _ = gc.run_gc(&mut tx_mgr, &mut vc);
+    }
+
+    {
+      let vc = mvcc.version_chain.lock();
+      let counts = vc.counts();
+      assert_eq!(
+        counts.node_prop_versions, 0,
+        "control: prop versions reclaimed once no reader needs them"
+      );
+      assert_eq!(
+        counts.node_label_versions, 0,
+        "label versions must be reclaimed once no reader needs them"
+      );
+    }
+
+    drop(mvcc);
+    let db = match Arc::try_unwrap(db) {
+      Ok(db) => db,
+      Err(_) => panic!("db still shared"),
+    };
+    close_single_file(db).expect("close db");
+  }
+
+  // M5: truncation must keep the newest version below min_active_ts.
+
+  #[test]
+  fn audit_m5_truncate_keeps_node_prop_version_of_oldest_reader() {
+    const READER_TS: Timestamp = 5;
+    for use_soa in [true, false] {
+      let mut mgr = VersionChainManager::with_soa(use_soa);
+      for (txid, ts, value) in [(1, 1, 100), (2, 2, 200), (3, 3, 300)] {
+        mgr.append_node_prop_version(NODE, PROP, i64_value(value), txid, ts);
+      }
+      // Twelve commits after the reader's snapshot (more than max_depth 10).
+      for i in 0..12u64 {
+        mgr.append_node_prop_version(NODE, PROP, i64_value(1000 + i as i64), 10 + i, 6 + i);
+      }
+
+      mgr.truncate_deep_chains(10, Some(READER_TS));
+
+      let head = mgr.node_prop_version(NODE, PROP).expect("prop chain");
+      let visible = visible_version(&head, READER_TS, READER_TXID);
+      assert_eq!(
+        visible.and_then(|v| v.data.as_deref().cloned()),
+        Some(PropValue::I64(300)),
+        "reader at ts={READER_TS} must still see the ts=3 value (soa={use_soa})"
+      );
+    }
+  }
+
+  #[test]
+  fn audit_m5_truncate_keeps_edge_prop_version_of_oldest_reader() {
+    const READER_TS: Timestamp = 5;
+    for use_soa in [true, false] {
+      let mut mgr = VersionChainManager::with_soa(use_soa);
+      mgr.append_edge_prop_version(1, 2, 3, PROP, None, 0, 0);
+      mgr.append_edge_prop_version(1, 2, 3, PROP, i64_value(300), 3, 3);
+      for i in 0..12u64 {
+        mgr.append_edge_prop_version(1, 2, 3, PROP, i64_value(1000 + i as i64), 10 + i, 6 + i);
+      }
+
+      mgr.truncate_deep_chains(10, Some(READER_TS));
+
+      let head = mgr
+        .edge_prop_version(1, 2, 3, PROP)
+        .expect("edge prop chain");
+      let visible = visible_version(&head, READER_TS, READER_TXID);
+      assert_eq!(
+        visible.and_then(|v| v.data.as_deref().cloned()),
+        Some(PropValue::I64(300)),
+        "reader at ts={READER_TS} must still see the ts=3 edge value (soa={use_soa})"
+      );
+    }
   }
 }
