@@ -281,6 +281,11 @@ impl SegmentLogStore {
     Ok(FRAME_HEADER_SIZE as u64 + payload_len as u64)
   }
 
+  /// Whether appended frames are still held in memory, unwritten to the file.
+  pub fn has_buffered_frames(&self) -> bool {
+    !self.write_buffer.is_empty() || !self.write_chunks.is_empty()
+  }
+
   pub fn file_len(&self) -> Result<u64> {
     let metadata = self.file.metadata()?;
     Ok(
@@ -331,6 +336,19 @@ impl SegmentLogStore {
     }
 
     Ok(frames)
+  }
+
+  /// Last frame written to the segment file, if any.
+  pub fn read_last_frame(&self) -> Result<Option<ReplicationFrame>> {
+    let file = OpenOptions::new().read(true).open(&self.path)?;
+    let mut reader = BufReader::new(file);
+    let mut last = None;
+
+    while let Some(frame) = read_frame(&mut reader)? {
+      last = Some(frame);
+    }
+
+    Ok(last)
   }
 
   pub fn read_filtered(
