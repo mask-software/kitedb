@@ -24,6 +24,8 @@ All notable changes to this project will be documented in this file.
 - IVF-PQ approximate search now computes distances in each metric's native space (L2, cosine with reconstructed-norm correction, dot product), matching the exact search path's ranking and scores. The unused precomputed centroid-distance table is no longer written (a format flag keeps older payloads readable).
 
 ### Fixed
+- A checkpoint whose header install fails now restores the previous WAL and header state. Previously the WAL was reset in memory first, so later commits could overwrite WAL records the on-disk header still named and lose committed transactions after a crash.
+- Background checkpoints now start while other threads have write transactions open; their records so far are carried into the new WAL region. Previously checkpoints were refused while any transaction was open, so sustained concurrent writers could fill the WAL ("WAL buffer full").
 - Blocking checkpoints and compaction now persist the WAL region heads and active region in the header. Previously a database reopened after a checkpoint could resume appending at a stale WAL offset.
 - WAL recovery replays committed transactions in commit order instead of HashMap iteration order, which could previously produce nondeterministic post-crash state.
 - Dynamically created labels, edge types, and property keys are WAL-logged, so their name-to-id mappings survive reopen without a checkpoint and ids can no longer be reattached to different names.
