@@ -219,6 +219,21 @@ impl std::fmt::Debug for TraversalStep {
   }
 }
 
+/// The node a single-hop step reaches from `node_id` over `edge`.
+fn neighbor_of(edge: &Edge, node_id: NodeId, direction: TraversalDirection) -> NodeId {
+  match direction {
+    TraversalDirection::Out => edge.dst,
+    TraversalDirection::In => edge.src,
+    TraversalDirection::Both => {
+      if edge.src == node_id {
+        edge.dst
+      } else {
+        edge.src
+      }
+    }
+  }
+}
+
 // ============================================================================
 // Traversal Builder
 // ============================================================================
@@ -528,12 +543,25 @@ impl TraversalBuilder {
     true
   }
 
-  /// Fast count for simple traversals
+  /// Fast count for simple traversals.
+  ///
+  /// Counts exactly what `TraversalIterator` yields, without materializing results: with
+  /// `unique`, the start nodes seed `visited` and each node is counted once across all steps;
+  /// without it, every traversed edge yields a result, so the frontier tracks how many times
+  /// each node was reached.
   fn count_fast<F>(&self, neighbors: &F) -> usize
   where
     F: Fn(NodeId, TraversalDirection, Option<ETypeId>) -> Vec<Edge>,
   {
-    let mut current_nodes: HashSet<NodeId> = self.start_nodes.iter().copied().collect();
+    let mut frontier: HashMap<NodeId, usize> = HashMap::new();
+    for &node_id in &self.start_nodes {
+      *frontier.entry(node_id).or_insert(0) += 1;
+    }
+    let mut visited: HashSet<NodeId> = if self.unique_nodes {
+      frontier.keys().copied().collect()
+    } else {
+      HashSet::new()
+    };
 
     for step in &self.steps {
       let TraversalStep::SingleHop {
@@ -543,35 +571,27 @@ impl TraversalBuilder {
         unreachable!()
       };
 
-      let mut next_nodes = HashSet::new();
-
-      for node_id in current_nodes {
-        let edges = neighbors(node_id, *direction, *etype);
-        for edge in edges {
-          let neighbor = match direction {
-            TraversalDirection::Out => edge.dst,
-            TraversalDirection::In => edge.src,
-            TraversalDirection::Both => {
-              if edge.src == node_id {
-                edge.dst
-              } else {
-                edge.src
-              }
+      let mut next: HashMap<NodeId, usize> = HashMap::new();
+      for (&node_id, &times_reached) in &frontier {
+        for edge in neighbors(node_id, *direction, *etype) {
+          let neighbor = neighbor_of(&edge, node_id, *direction);
+          if self.unique_nodes {
+            if visited.insert(neighbor) {
+              next.insert(neighbor, 1);
             }
-          };
-          next_nodes.insert(neighbor);
+          } else {
+            let count = next.entry(neighbor).or_insert(0);
+            *count = count.saturating_add(times_reached);
+          }
         }
       }
-
-      current_nodes = next_nodes;
+      frontier = next;
     }
 
-    // Apply limit if set
-    if let Some(limit) = self.limit {
-      current_nodes.len().min(limit)
-    } else {
-      current_nodes.len()
-    }
+    let total = frontier
+      .values()
+      .fold(0usize, |total, &count| total.saturating_add(count));
+    self.limit.map_or(total, |limit| total.min(limit))
   }
 
   /// Get raw edges without property loading (fastest traversal mode)
@@ -688,17 +708,7 @@ where
       let edges = (self.neighbors)(result.node_id, direction, etype);
 
       for edge in edges {
-        let neighbor_id = match direction {
-          TraversalDirection::Out => edge.dst,
-          TraversalDirection::In => edge.src,
-          TraversalDirection::Both => {
-            if edge.src == result.node_id {
-              edge.dst
-            } else {
-              edge.src
-            }
-          }
-        };
+        let neighbor_id = neighbor_of(&edge, result.node_id, direction);
 
         // Skip if already visited (and uniqueness is enabled)
         if self.unique_nodes && self.visited.contains(&neighbor_id) {
@@ -1824,6 +1834,94 @@ mod tests {
     // But count still works
     let count = builder.count(&neighbors);
     assert_eq!(count, 1);
+  }
+
+  #[test]
+  fn test_fast_count_matches_iteration_for_every_single_hop_config() {
+    // Cycle 1<->2, parallel 1->2 edges of two types, 2->3 and a self-loop on 3.
+    let graph = [
+      Edge {
+        src: 1,
+        etype: 1,
+        dst: 2,
+      },
+      Edge {
+        src: 1,
+        etype: 2,
+        dst: 2,
+      },
+      Edge {
+        src: 2,
+        etype: 1,
+        dst: 1,
+      },
+      Edge {
+        src: 2,
+        etype: 1,
+        dst: 3,
+      },
+      Edge {
+        src: 3,
+        etype: 1,
+        dst: 3,
+      },
+    ];
+    let neighbors = |node_id: NodeId, direction: TraversalDirection, etype: Option<ETypeId>| {
+      graph
+        .iter()
+        .copied()
+        .filter(|edge| etype.map_or(true, |etype| edge.etype == etype))
+        .filter(|edge| match direction {
+          TraversalDirection::Out => edge.src == node_id,
+          TraversalDirection::In => edge.dst == node_id,
+          TraversalDirection::Both => edge.src == node_id || edge.dst == node_id,
+        })
+        .collect::<Vec<_>>()
+    };
+    let directions = [
+      TraversalDirection::Out,
+      TraversalDirection::In,
+      TraversalDirection::Both,
+    ];
+
+    for start in [vec![1], vec![1, 2], vec![2, 2], vec![3, 1, 3]] {
+      for unique in [true, false] {
+        for limit in [None, Some(1), Some(3)] {
+          for etype in [None, Some(1)] {
+            for step_count in 0..=3u32 {
+              // Every direction sequence of this length.
+              for sequence in 0..directions.len().pow(step_count) {
+                let mut builder = TraversalBuilder::new(start.clone()).unique(unique);
+                let mut path = Vec::new();
+                let mut digits = sequence;
+                for _ in 0..step_count {
+                  let direction = directions[digits % directions.len()];
+                  digits /= directions.len();
+                  path.push(direction);
+                  builder = match direction {
+                    TraversalDirection::Out => builder.out(etype),
+                    TraversalDirection::In => builder.r#in(etype),
+                    TraversalDirection::Both => builder.both(etype),
+                  };
+                }
+                if let Some(limit) = limit {
+                  builder = builder.take(limit);
+                }
+
+                assert!(builder.can_use_fast_count());
+                let expected = builder.clone().collect_node_ids(neighbors);
+                assert_eq!(
+                  builder.count(neighbors),
+                  expected.len(),
+                  "start={start:?} unique={unique} limit={limit:?} etype={etype:?} \
+                   steps={path:?}: iterator yields {expected:?}"
+                );
+              }
+            }
+          }
+        }
+      }
+    }
   }
 
   #[test]

@@ -2,7 +2,7 @@
 //!
 //! Uses thiserror for ergonomic error handling
 
-use crate::types::{NodeId, TxId};
+use crate::types::{ETypeId, NodeId, TxId};
 use std::borrow::Cow;
 use thiserror::Error;
 
@@ -28,6 +28,14 @@ pub enum KiteError {
   /// Node not found
   #[error("Node not found: {0}")]
   NodeNotFound(NodeId),
+
+  /// Edge not found
+  #[error("Edge not found: {src} -[{etype}]-> {dst}")]
+  EdgeNotFound {
+    src: NodeId,
+    etype: ETypeId,
+    dst: NodeId,
+  },
 
   /// Key not found in index
   #[error("Key not found: {0}")]
@@ -112,6 +120,10 @@ pub enum KiteError {
   /// Invalid schema definition
   #[error("Invalid schema: {0}")]
   InvalidSchema(Cow<'static, str>),
+
+  /// A property value violates its schema (missing required prop or wrong type)
+  #[error("Schema violation: {0}")]
+  SchemaViolation(String),
 
   /// Invalid query or builder usage
   #[error("Invalid query: {0}")]
