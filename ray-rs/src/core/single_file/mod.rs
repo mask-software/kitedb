@@ -56,6 +56,10 @@ pub use transaction::SingleFileTxGuard;
 // Also re-export recovery items that are used externally
 pub use recovery::replay_wal_record;
 
+/// Largest node ID the database issues or accepts. IDs stay within `i64` so
+/// every binding can represent them.
+pub const MAX_NODE_ID: NodeId = i64::MAX as NodeId;
+
 // ============================================================================
 // Transaction State (for single-file DB)
 // ============================================================================
@@ -352,12 +356,20 @@ impl SingleFileDB {
     self.read_only
   }
 
-  /// Allocate a new node ID
-  pub fn alloc_node_id(&self) -> NodeId {
-    self.next_node_id.fetch_add(1, Ordering::SeqCst)
+  /// Allocate a new node ID. Fails once every ID up to [`MAX_NODE_ID`] is taken.
+  pub fn alloc_node_id(&self) -> Result<NodeId> {
+    self
+      .next_node_id
+      .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |next| {
+        (next <= MAX_NODE_ID).then(|| next + 1)
+      })
+      .map_err(|_| {
+        crate::error::KiteError::Internal(format!("node ID space exhausted (max {MAX_NODE_ID})"))
+      })
   }
 
   /// Ensure the next node ID is greater than the provided value
+  /// (callers keep `node_id <= MAX_NODE_ID`).
   pub fn reserve_node_id(&self, node_id: NodeId) {
     let desired = node_id.saturating_add(1);
     loop {

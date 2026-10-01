@@ -2,13 +2,119 @@
 //!
 //! Ported from src/core/delta.ts
 
+use crate::core::snapshot::reader::SnapshotData;
 use crate::types::*;
 use std::collections::HashMap;
+
+/// Whether `snapshot` holds the edge `src -[etype]-> dst`.
+pub fn snapshot_has_edge(
+  snapshot: Option<&SnapshotData>,
+  src: NodeId,
+  etype: ETypeId,
+  dst: NodeId,
+) -> bool {
+  let Some(snap) = snapshot else {
+    return false;
+  };
+  match (snap.phys_node(src), snap.phys_node(dst)) {
+    (Some(src_phys), Some(dst_phys)) => snap.has_edge(src_phys, etype, dst_phys),
+    _ => false,
+  }
+}
 
 impl DeltaState {
   /// Create empty delta state
   pub fn new() -> Self {
     Self::default()
+  }
+
+  // ========================================================================
+  // Layered Edge Operations
+  // ========================================================================
+  //
+  // A delta overlays a base layer (the snapshot, or for a transaction the
+  // committed state). `in_base` says whether the base holds the edge. These
+  // keep `out_add` disjoint from the base and `out_del` inside it, so a
+  // re-added base edge is never counted twice and deleting a base edge always
+  // hides it.
+
+  /// Whether the edge is visible through this delta.
+  pub fn edge_visible(&self, src: NodeId, etype: ETypeId, dst: NodeId, in_base: bool) -> bool {
+    self.is_edge_added(src, etype, dst) || (in_base && !self.is_edge_deleted(src, etype, dst))
+  }
+
+  /// Add an edge unless it is already visible.
+  pub fn add_edge_over(&mut self, src: NodeId, etype: ETypeId, dst: NodeId, in_base: bool) {
+    if self.edge_visible(src, etype, dst, in_base) {
+      return;
+    }
+    if !in_base {
+      // A tombstone for an edge the base lacks must not swallow the add.
+      self.remove_edge_patch(src, etype, dst, false);
+    }
+    self.add_edge(src, etype, dst);
+  }
+
+  /// Delete an edge if it is visible. A base edge always gets a tombstone,
+  /// even when the delta also held an add patch for it.
+  pub fn delete_edge_over(&mut self, src: NodeId, etype: ETypeId, dst: NodeId, in_base: bool) {
+    if !self.edge_visible(src, etype, dst, in_base) {
+      return;
+    }
+    self.remove_edge_patch(src, etype, dst, true);
+    if in_base {
+      self
+        .out_del
+        .entry(src)
+        .or_default()
+        .insert(EdgePatch { etype, other: dst });
+      self
+        .in_del
+        .entry(dst)
+        .or_default()
+        .insert(EdgePatch { etype, other: src });
+    }
+  }
+
+  /// Remove an add patch (`added`) or a tombstone (`!added`) in both directions.
+  fn remove_edge_patch(&mut self, src: NodeId, etype: ETypeId, dst: NodeId, added: bool) {
+    let (out_map, in_map) = if added {
+      (&mut self.out_add, &mut self.in_add)
+    } else {
+      (&mut self.out_del, &mut self.in_del)
+    };
+    if let Some(set) = out_map.get_mut(&src) {
+      if set.remove(&EdgePatch { etype, other: dst }) && set.is_empty() {
+        out_map.remove(&src);
+      }
+    }
+    if let Some(set) = in_map.get_mut(&dst) {
+      if set.remove(&EdgePatch { etype, other: src }) && set.is_empty() {
+        in_map.remove(&dst);
+      }
+    }
+  }
+
+  /// Whether `node_id` exists through this delta over `snapshot`.
+  pub fn node_exists_over(&self, snapshot: Option<&SnapshotData>, node_id: NodeId) -> bool {
+    if self.is_node_deleted(node_id) {
+      return false;
+    }
+    self.is_node_created(node_id) || snapshot.is_some_and(|snap| snap.has_node(node_id))
+  }
+
+  /// Whether the edge is visible through this delta over `snapshot`.
+  pub fn edge_exists_over(
+    &self,
+    snapshot: Option<&SnapshotData>,
+    src: NodeId,
+    etype: ETypeId,
+    dst: NodeId,
+  ) -> bool {
+    if self.is_edge_added(src, etype, dst) {
+      return true;
+    }
+    !self.is_edge_deleted(src, etype, dst) && snapshot_has_edge(snapshot, src, etype, dst)
   }
 
   /// Add edge with cancellation logic
@@ -481,6 +587,21 @@ impl DeltaState {
     }
     self.key_index.get(key).copied()
   }
+
+  /// Live node holding `key` through this delta over `snapshot`.
+  pub fn key_owner_over(&self, snapshot: Option<&SnapshotData>, key: &str) -> Option<NodeId> {
+    if self.key_index_deleted.contains(key) {
+      return None;
+    }
+    if let Some(&node_id) = self.key_index.get(key) {
+      if !self.is_node_deleted(node_id) {
+        return Some(node_id);
+      }
+    }
+    snapshot
+      .and_then(|snap| snap.lookup_by_key(key))
+      .filter(|&node_id| !self.is_node_deleted(node_id))
+  }
 }
 
 #[cfg(test)]
@@ -525,5 +646,51 @@ mod tests {
     delta.delete_edge(1, 10, 2);
     assert!(!delta.is_edge_added(1, 10, 2));
     assert!(!delta.is_edge_deleted(1, 10, 2)); // Cancellation
+  }
+
+  #[test]
+  fn test_add_over_base_edge_is_noop() {
+    let mut delta = DeltaState::new();
+    delta.add_edge_over(1, 10, 2, true);
+    assert!(!delta.is_edge_added(1, 10, 2));
+    assert_eq!(delta.total_edges_added(), 0);
+    assert!(delta.edge_visible(1, 10, 2, true));
+  }
+
+  #[test]
+  fn test_delete_over_base_edge_always_tombstones() {
+    let mut delta = DeltaState::new();
+    // A stray add patch for a base edge (written by older versions).
+    delta.add_edge(1, 10, 2);
+    delta.delete_edge_over(1, 10, 2, true);
+    assert!(!delta.is_edge_added(1, 10, 2));
+    assert!(delta.is_edge_deleted(1, 10, 2));
+    assert!(!delta.edge_visible(1, 10, 2, true));
+
+    // Re-adding lifts the tombstone without an add patch.
+    delta.add_edge_over(1, 10, 2, true);
+    assert!(!delta.is_edge_deleted(1, 10, 2));
+    assert!(!delta.is_edge_added(1, 10, 2));
+  }
+
+  #[test]
+  fn test_layered_ops_on_edge_missing_from_base() {
+    let mut delta = DeltaState::new();
+    delta.delete_edge_over(1, 10, 2, false);
+    assert!(
+      !delta.is_edge_deleted(1, 10, 2),
+      "no tombstone for a missing edge"
+    );
+
+    // A stray tombstone must not swallow the add.
+    delta.delete_edge(1, 10, 2);
+    delta.add_edge_over(1, 10, 2, false);
+    assert!(delta.is_edge_added(1, 10, 2));
+    assert!(!delta.is_edge_deleted(1, 10, 2));
+
+    delta.delete_edge_over(1, 10, 2, false);
+    assert!(!delta.is_edge_added(1, 10, 2));
+    assert!(!delta.is_edge_deleted(1, 10, 2));
+    assert!(delta.in_add.is_empty() && delta.in_del.is_empty());
   }
 }

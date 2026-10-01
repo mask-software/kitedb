@@ -32,7 +32,9 @@ use crate::util::mmap::{map_file_range, Mmap};
 use crate::vector::store::{create_vector_store, vector_store_delete, vector_store_insert};
 use crate::vector::types::VectorStoreConfig;
 
-use super::recovery::{committed_transactions, replay_wal_record, scan_wal_records};
+use super::recovery::{
+  committed_transactions, drop_vectors_of_missing_nodes, replay_wal_record, scan_wal_records,
+};
 use super::vector::{materialize_vector_store_from_lazy_entries, vector_store_state_from_snapshot};
 use super::{CheckpointStatus, SchemaReservations, SingleFileDB};
 
@@ -603,8 +605,9 @@ fn load_snapshot_and_schema(state: &mut SnapshotLoadState<'_>) -> Result<Option<
         }
       }
 
-      // Update ID allocators from snapshot
-      *state.next_node_id = snap.header.max_node_id + 1;
+      // Update ID allocators from snapshot. Its max_node_id counts live nodes
+      // only; the header's may be higher (deleted IDs) and must not be reused.
+      *state.next_node_id = (*state.next_node_id).max(snap.header.max_node_id.saturating_add(1));
       *state.next_label_id = snap.header.num_labels as u32 + 1;
       *state.next_etype_id = snap.header.num_etypes as u32 + 1;
       *state.next_propkey_id = snap.header.num_propkeys as u32 + 1;
@@ -1006,7 +1009,7 @@ fn open_single_file_internal(
   let next_tx_id = header.next_tx_id;
 
   if header.max_node_id > 0 {
-    next_node_id = header.max_node_id + 1;
+    next_node_id = header.max_node_id.saturating_add(1);
   }
 
   // Initialize delta
@@ -1097,6 +1100,7 @@ fn open_single_file_internal(
         }
         next_commit_ts += 1;
       }
+      drop_vectors_of_missing_nodes(&mut delta, snapshot.as_ref());
       #[cfg(feature = "bench-profile")]
       {
         open_profile.wal_replay_ns = open_profile
