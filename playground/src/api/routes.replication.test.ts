@@ -169,15 +169,20 @@ async function openPrimary(): Promise<void> {
   expect(response.body.success).toBe(true);
 }
 
+// Keys are unique across calls: a test may append to the same database more
+// than once, and inserting an existing key is an error.
+let nextCommitFile = 0;
+
 async function appendCommits(count: number): Promise<void> {
   const db = getDb();
   expect(db).not.toBeNull();
   for (let i = 0; i < count; i++) {
+    const file = `src/file-${nextCommitFile++}.ts`;
     await db!
       .insert(FileNode)
       .values({
-        key: `src/file-${i}.ts`,
-        path: `src/file-${i}.ts`,
+        key: file,
+        path: file,
         language: "typescript",
       })
       .returning();
