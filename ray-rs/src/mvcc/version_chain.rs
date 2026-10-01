@@ -1419,3 +1419,254 @@ mod tests {
     assert!(pruned > 0);
   }
 }
+
+#[cfg(test)]
+mod audit_tests {
+  use super::*;
+  use crate::mvcc::visibility::visible_version;
+  use crate::types::PropValue;
+  use std::sync::Arc;
+
+  const NODE: NodeId = 1;
+  const LABEL: LabelId = 7;
+  const PROP: PropKeyId = 3;
+  const READER_TXID: TxId = 999;
+
+  fn label_depth(mgr: &VersionChainManager) -> usize {
+    mgr
+      .node_label_version(NODE, LABEL)
+      .map_or(0, |head| head.chain_depth())
+  }
+
+  fn prop_depth(mgr: &VersionChainManager) -> usize {
+    mgr
+      .node_prop_version(NODE, PROP)
+      .map_or(0, |head| head.chain_depth())
+  }
+
+  fn i64_value(value: i64) -> Option<PropValueRef> {
+    Some(Arc::new(PropValue::I64(value)))
+  }
+
+  // M4: label chains must be pruned like property chains.
+
+  #[test]
+  fn audit_m4_prune_reclaims_label_chain_older_than_horizon() {
+    for use_soa in [true, false] {
+      let mut mgr = VersionChainManager::with_soa(use_soa);
+      mgr.append_node_prop_version(NODE, PROP, None, 0, 0);
+      mgr.append_node_prop_version(NODE, PROP, i64_value(1), 1, 5);
+      mgr.append_node_label_version(NODE, LABEL, None, 0, 0);
+      mgr.append_node_label_version(NODE, LABEL, Some(true), 1, 5);
+      mgr.append_node_label_version(NODE, LABEL, None, 2, 6);
+
+      mgr.prune_old_versions(100);
+
+      assert!(
+        mgr.node_prop_version(NODE, PROP).is_none(),
+        "control: prop chain below the horizon is reclaimed (soa={use_soa})"
+      );
+      assert!(
+        mgr.node_label_version(NODE, LABEL).is_none(),
+        "label chain below the horizon must be reclaimed (soa={use_soa})"
+      );
+      assert_eq!(mgr.counts().node_label_versions, 0, "soa={use_soa}");
+      assert!(mgr.node_label_keys(NODE).is_empty(), "soa={use_soa}");
+    }
+  }
+
+  #[test]
+  fn audit_m4_prune_trims_label_chain_to_newest_below_horizon() {
+    for use_soa in [true, false] {
+      let mut mgr = VersionChainManager::with_soa(use_soa);
+      let history: [(TxId, Timestamp); 5] = [(0, 0), (1, 5), (2, 6), (3, 7), (4, 20)];
+      for (i, &(txid, ts)) in history.iter().enumerate() {
+        let present = i % 2 == 1;
+        mgr.append_node_prop_version(NODE, PROP, i64_value(i as i64), txid, ts);
+        mgr.append_node_label_version(NODE, LABEL, present.then_some(true), txid, ts);
+      }
+
+      // Readers are at ts >= 10: they need the ts=20 head and the ts=7 version.
+      mgr.prune_old_versions(10);
+
+      assert_eq!(prop_depth(&mgr), 2, "control: prop chain (soa={use_soa})");
+      assert_eq!(
+        label_depth(&mgr),
+        2,
+        "label chain must keep only the head and the newest version below the horizon (soa={use_soa})"
+      );
+      let head = mgr
+        .node_label_version(NODE, LABEL)
+        .expect("label head survives");
+      let visible = visible_version(&head, 10, READER_TXID).expect("reader at ts=10 sees ts=7");
+      assert_eq!(visible.data, Some(true), "soa={use_soa}");
+    }
+  }
+
+  #[test]
+  fn audit_m4_truncate_bounds_label_chain_depth() {
+    for use_soa in [true, false] {
+      let mut mgr = VersionChainManager::with_soa(use_soa);
+      for i in 1..=20u64 {
+        mgr.append_node_prop_version(NODE, PROP, i64_value(i as i64), i, i);
+        mgr.append_node_label_version(NODE, LABEL, (i % 2 == 0).then_some(true), i, i);
+      }
+
+      mgr.truncate_deep_chains(5, None);
+
+      assert!(
+        prop_depth(&mgr) <= 5,
+        "control: prop chain truncated (soa={use_soa})"
+      );
+      assert!(
+        label_depth(&mgr) <= 5,
+        "label chain depth {} must be truncated to max_depth 5 (soa={use_soa})",
+        label_depth(&mgr)
+      );
+    }
+  }
+
+  #[test]
+  fn audit_m4_gc_reclaims_label_versions_after_readers_finish() {
+    use crate::core::single_file::{close_single_file, open_single_file, SingleFileOpenOptions};
+    use std::sync::mpsc;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = Arc::new(
+      open_single_file(
+        dir.path().join("m4.kitedb"),
+        SingleFileOpenOptions::new()
+          .mvcc(true)
+          .mvcc_gc_interval_ms(50)
+          .mvcc_retention_ms(0)
+          .auto_checkpoint(false),
+      )
+      .expect("open db"),
+    );
+
+    db.begin(false).expect("begin");
+    let node = db.create_node(Some("n")).expect("create node");
+    let label = db.define_label("Tag").expect("define label");
+    let prop = db.define_propkey("p").expect("define propkey");
+    db.set_node_prop(node, prop, PropValue::I64(0))
+      .expect("set prop");
+    db.commit().expect("commit");
+
+    // An open reader makes the following commits publish versions.
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let reader_db = Arc::clone(&db);
+    let reader = std::thread::spawn(move || {
+      reader_db.begin(true).expect("begin read tx");
+      ready_tx.send(()).expect("ready");
+      let _ = release_rx.recv();
+      reader_db.commit().expect("commit read tx");
+    });
+    ready_rx.recv().expect("reader ready");
+
+    for (i, add) in [true, false, true, false].into_iter().enumerate() {
+      db.begin(false).expect("begin");
+      if add {
+        db.add_node_label(node, label).expect("add label");
+      } else {
+        db.remove_node_label(node, label).expect("remove label");
+      }
+      db.set_node_prop(node, prop, PropValue::I64(i as i64 + 1))
+        .expect("set prop");
+      db.commit().expect("commit");
+    }
+
+    let mvcc = db.mvcc.as_ref().expect("mvcc enabled").clone();
+    {
+      let vc = mvcc.version_chain.lock();
+      assert!(vc.counts().node_prop_versions > 0, "prop versions created");
+      assert!(
+        vc.counts().node_label_versions > 0,
+        "label versions created"
+      );
+    }
+
+    release_tx.send(()).expect("release reader");
+    reader.join().expect("reader thread");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    {
+      let mut tx_mgr = mvcc.tx_manager.lock();
+      let mut vc = mvcc.version_chain.lock();
+      let mut gc = mvcc.gc.lock();
+      let _ = gc.run_gc(&mut tx_mgr, &mut vc);
+    }
+
+    {
+      let vc = mvcc.version_chain.lock();
+      let counts = vc.counts();
+      assert_eq!(
+        counts.node_prop_versions, 0,
+        "control: prop versions reclaimed once no reader needs them"
+      );
+      assert_eq!(
+        counts.node_label_versions, 0,
+        "label versions must be reclaimed once no reader needs them"
+      );
+    }
+
+    drop(mvcc);
+    let db = match Arc::try_unwrap(db) {
+      Ok(db) => db,
+      Err(_) => panic!("db still shared"),
+    };
+    close_single_file(db).expect("close db");
+  }
+
+  // M5: truncation must keep the newest version below min_active_ts.
+
+  #[test]
+  fn audit_m5_truncate_keeps_node_prop_version_of_oldest_reader() {
+    const READER_TS: Timestamp = 5;
+    for use_soa in [true, false] {
+      let mut mgr = VersionChainManager::with_soa(use_soa);
+      for (txid, ts, value) in [(1, 1, 100), (2, 2, 200), (3, 3, 300)] {
+        mgr.append_node_prop_version(NODE, PROP, i64_value(value), txid, ts);
+      }
+      // Twelve commits after the reader's snapshot (more than max_depth 10).
+      for i in 0..12u64 {
+        mgr.append_node_prop_version(NODE, PROP, i64_value(1000 + i as i64), 10 + i, 6 + i);
+      }
+
+      mgr.truncate_deep_chains(10, Some(READER_TS));
+
+      let head = mgr.node_prop_version(NODE, PROP).expect("prop chain");
+      let visible = visible_version(&head, READER_TS, READER_TXID);
+      assert_eq!(
+        visible.and_then(|v| v.data.as_deref().cloned()),
+        Some(PropValue::I64(300)),
+        "reader at ts={READER_TS} must still see the ts=3 value (soa={use_soa})"
+      );
+    }
+  }
+
+  #[test]
+  fn audit_m5_truncate_keeps_edge_prop_version_of_oldest_reader() {
+    const READER_TS: Timestamp = 5;
+    for use_soa in [true, false] {
+      let mut mgr = VersionChainManager::with_soa(use_soa);
+      mgr.append_edge_prop_version(1, 2, 3, PROP, None, 0, 0);
+      mgr.append_edge_prop_version(1, 2, 3, PROP, i64_value(300), 3, 3);
+      for i in 0..12u64 {
+        mgr.append_edge_prop_version(1, 2, 3, PROP, i64_value(1000 + i as i64), 10 + i, 6 + i);
+      }
+
+      mgr.truncate_deep_chains(10, Some(READER_TS));
+
+      let head = mgr
+        .edge_prop_version(1, 2, 3, PROP)
+        .expect("edge prop chain");
+      let visible = visible_version(&head, READER_TS, READER_TXID);
+      assert_eq!(
+        visible.and_then(|v| v.data.as_deref().cloned()),
+        Some(PropValue::I64(300)),
+        "reader at ts={READER_TS} must still see the ts=3 edge value (soa={use_soa})"
+      );
+    }
+  }
+}
