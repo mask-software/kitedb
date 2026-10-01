@@ -12,10 +12,13 @@ use crate::core::wal::record::{
 use crate::error::{KiteError, Result};
 use crate::replication::manifest::ManifestStore;
 use crate::replication::primary::{primary_sidecar_needs_repair, PrimaryRetentionOutcome};
-use crate::replication::replica::ReplicaReplicationStatus;
+use crate::replication::replica::{
+  ReplicaReplicationStatus, ReplicaSchemaMap,
+  SchemaIdKind::{self, EdgeType, Label, PropertyKey},
+};
 use crate::replication::transport::decode_commit_frame_payload;
 use crate::replication::types::{CommitToken, ReplicationCursor};
-use crate::types::{ETypeId, NodeId, TxId, WalRecordType};
+use crate::types::{ETypeId, NodeId, PropKeyId, PropValue, TxId, WalRecordType};
 use crate::util::crc::{crc32c, Crc32cHasher};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
@@ -50,14 +53,41 @@ const SOURCE_FRAME_UNPUBLISHED_ERROR: &str =
 
 impl SingleFileDB {
   /// Promote this primary instance to the next replication epoch.
+  ///
+  /// The new epoch opens with a frame that re-announces every schema name
+  /// and id. Replicas translate the primary's schema ids by name and trust a
+  /// translation only within the epoch that announced it.
   pub fn primary_promote_to_next_epoch(&self) -> Result<u64> {
-    self
-      .primary_replication
-      .as_ref()
-      .ok_or_else(|| {
-        KiteError::InvalidReplication("database is not opened in primary role".to_string())
-      })?
-      .promote_to_next_epoch()
+    let replication = self.primary_replication.as_ref().ok_or_else(|| {
+      KiteError::InvalidReplication("database is not opened in primary role".to_string())
+    })?;
+    // The announcement commits its own transaction.
+    if self.has_transaction() {
+      return Err(KiteError::TransactionInProgress);
+    }
+
+    let promotion = replication.promote()?;
+    if promotion.promoted {
+      self.announce_schema()?;
+    }
+    Ok(promotion.epoch)
+  }
+
+  fn announce_schema(&self) -> Result<()> {
+    let has_schema = !self.label_ids.read().is_empty()
+      || !self.etype_ids.read().is_empty()
+      || !self.propkey_ids.read().is_empty();
+    if !has_schema {
+      return Ok(());
+    }
+
+    let tx_guard = self.begin_guard(false)?;
+    self.log_committed_schema()?;
+    match tx_guard.commit() {
+      // A racing instance promoted past this one; the winner announces.
+      Err(error) if is_stale_primary_error(&error) => Ok(()),
+      result => result,
+    }
   }
 
   /// Report a replica's applied cursor to drive retention decisions.
@@ -141,7 +171,8 @@ impl SingleFileDB {
             quiesce_fingerprint.1
           )));
         }
-        sync_graph_state(self, &source, || {
+        remove_stale_nodes(self, &source, runtime)?;
+        let schema_map = sync_graph_state(self, &source, bootstrap_position.0, || {
           let bootstrap_end = runtime.source_head_position()?;
           let bootstrap_end_fingerprint = source_db_fingerprint(&source_db_path)?;
           if bootstrap_end != bootstrap_start
@@ -173,9 +204,10 @@ impl SingleFileDB {
           }
           Ok(())
         })?;
-        Ok(bootstrap_position)
+        Ok((bootstrap_position, schema_map))
       })()
-      .and_then(|(epoch, log_index)| {
+      .and_then(|((epoch, log_index), schema_map)| {
+        runtime.store_schema_map(schema_map)?;
         runtime.mark_applied(epoch, log_index)?;
         runtime.clear_error()
       });
@@ -294,6 +326,7 @@ impl SingleFileDB {
     }
 
     let (mut applied_epoch, mut applied_log_index) = runtime.applied_position();
+    let mut schema_map = runtime.schema_map();
     let mut applied = 0usize;
     for frame in frames {
       let already_applied = applied_epoch > frame.epoch
@@ -302,9 +335,14 @@ impl SingleFileDB {
         continue;
       }
 
-      if let Err(error) = apply_replication_frame(self, &frame.payload) {
+      // The frame's defines join the translation only if the frame commits.
+      let mut frame_schema_map = schema_map.clone();
+      frame_schema_map.enter_epoch(frame.epoch);
+      if let Err(error) = apply_replication_frame(self, &frame.payload, &mut frame_schema_map) {
         if applied > 0 {
-          let _ = runtime.mark_applied(applied_epoch, applied_log_index);
+          let _ = runtime
+            .store_schema_map(schema_map)
+            .and_then(|_| runtime.mark_applied(applied_epoch, applied_log_index));
         }
         return Err(KiteError::InvalidReplication(format!(
           "replica apply failed at {}:{}: {error}",
@@ -312,6 +350,7 @@ impl SingleFileDB {
         )));
       }
 
+      schema_map = frame_schema_map;
       applied_epoch = frame.epoch;
       applied_log_index = frame.log_index;
       applied = applied.saturating_add(1);
@@ -319,7 +358,8 @@ impl SingleFileDB {
 
     if applied > 0 {
       runtime
-        .mark_applied(applied_epoch, applied_log_index)
+        .store_schema_map(schema_map)
+        .and_then(|_| runtime.mark_applied(applied_epoch, applied_log_index))
         .map_err(|error| {
           KiteError::InvalidReplication(format!(
             "replica cursor persist failed at {applied_epoch}:{applied_log_index}: {error}"
@@ -487,6 +527,13 @@ impl SingleFileDB {
     serde_json::to_string(&payload)
       .map_err(|error| KiteError::Serialization(format!("encode replication log export: {error}")))
   }
+}
+
+fn is_stale_primary_error(error: &KiteError) -> bool {
+  matches!(
+    error,
+    KiteError::InvalidReplication(message) if message.contains("stale primary")
+  )
 }
 
 fn is_reseed_error(error: &KiteError) -> bool {
@@ -850,22 +897,27 @@ fn source_db_fingerprint(path: &Path) -> Result<(u64, u32)> {
   Ok((bytes, hasher.finalize()))
 }
 
-/// Copy the source's schema names under the source's IDs, so the IDs in the
-/// copied data resolve to the same names on the replica.
-fn sync_schema_names(replica: &SingleFileDB, source: &SingleFileDB) -> Result<()> {
+/// Build the schema translation from names: every source name gets a local
+/// id (its existing one, else the source's id when free here).
+fn sync_schema_names(
+  replica: &SingleFileDB,
+  source: &SingleFileDB,
+  epoch: u64,
+) -> Result<ReplicaSchemaMap> {
   let labels = sorted_schema_entries(&source.label_ids.read());
   let etypes = sorted_schema_entries(&source.etype_ids.read());
   let propkeys = sorted_schema_entries(&source.propkey_ids.read());
+  let mut schema_map = ReplicaSchemaMap::for_epoch(epoch);
   for (id, name) in labels {
-    replica.define_label_with_id(id, &name)?;
+    schema_map.insert(Label, id, replica.ensure_replica_label(&name, id)?);
   }
   for (id, name) in etypes {
-    replica.define_etype_with_id(id, &name)?;
+    schema_map.insert(EdgeType, id, replica.ensure_replica_etype(&name, id)?);
   }
   for (id, name) in propkeys {
-    replica.define_propkey_with_id(id, &name)?;
+    schema_map.insert(PropertyKey, id, replica.ensure_replica_propkey(&name, id)?);
   }
-  Ok(())
+  Ok(schema_map)
 }
 
 fn sorted_schema_entries(ids: &HashMap<u32, String>) -> Vec<(u32, String)> {
@@ -874,43 +926,94 @@ fn sorted_schema_entries(ids: &HashMap<u32, String>) -> Vec<(u32, String)> {
   entries
 }
 
+fn translate_prop_map(
+  db: &SingleFileDB,
+  schema_map: &mut ReplicaSchemaMap,
+  props: HashMap<PropKeyId, PropValue>,
+) -> Result<HashMap<PropKeyId, PropValue>> {
+  props
+    .into_iter()
+    .map(|(key_id, value)| Ok((local_schema_id(db, schema_map, PropertyKey, key_id)?, value)))
+    .collect()
+}
+
+/// Bootstrap phase 1: delete every replica node that is missing from the
+/// source or holds a different key, in its own transaction. All deletes must
+/// precede all creates (keys move between nodes and an id can return with a
+/// new key), and the delta cannot delete and recreate one id inside a single
+/// transaction. Until the bootstrap completes, catch-up refuses to run over
+/// the partially removed state.
+///
+/// Recreating an id whose deleted copy lives in the snapshot leaves the new
+/// node hidden behind the delete tombstone, so such deletes are folded into
+/// a new snapshot before phase 2 recreates the ids.
+fn remove_stale_nodes(
+  replica: &SingleFileDB,
+  source: &SingleFileDB,
+  runtime: &crate::replication::replica::ReplicaReplication,
+) -> Result<()> {
+  let stale: Vec<NodeId> = replica
+    .list_nodes()
+    .into_iter()
+    .filter(|&node_id| {
+      !source.node_exists(node_id) || source.node_key(node_id) != replica.node_key(node_id)
+    })
+    .collect();
+  if stale.is_empty() {
+    return Ok(());
+  }
+  let recreates_snapshot_node = {
+    let snapshot = replica.snapshot.read();
+    stale.iter().any(|&node_id| {
+      source.node_exists(node_id)
+        && snapshot
+          .as_ref()
+          .is_some_and(|snapshot| snapshot.phys_node(node_id).is_some())
+    })
+  };
+
+  runtime.mark_bootstrap_incomplete()?;
+  let tx_guard = replica.begin_guard(false)?;
+  for node_id in stale {
+    replica.delete_node(node_id)?;
+  }
+  tx_guard.commit()?;
+  if recreates_snapshot_node {
+    replica.checkpoint()?;
+  }
+  Ok(())
+}
+
+/// Bootstrap phase 2: create the source's nodes and copy schema, properties,
+/// labels, vectors, and edges, translating the source's schema ids. Returns
+/// the translation for the replica to persist.
 fn sync_graph_state<F>(
   replica: &SingleFileDB,
   source: &SingleFileDB,
+  epoch: u64,
   before_commit: F,
-) -> Result<()>
+) -> Result<ReplicaSchemaMap>
 where
   F: FnOnce() -> Result<()>,
 {
   let tx_guard = replica.begin_guard(false)?;
 
-  sync_schema_names(replica, source)?;
+  let mut schema_map = sync_schema_names(replica, source, epoch)?;
 
+  // Phase 1 removed every node whose key differs, so existing ones match.
   let source_nodes = source.list_nodes();
-  let source_keys: HashMap<NodeId, Option<String>> = source_nodes
-    .iter()
-    .map(|&node_id| (node_id, source.node_key(node_id)))
-    .collect();
-
-  // Delete stale nodes before creating source nodes: a stale node can hold a
-  // key that a source node now owns, and the WAL replays in this order.
-  for node_id in replica.list_nodes() {
-    let matches_source = source_keys
-      .get(&node_id)
-      .is_some_and(|source_key| replica.node_key(node_id) == *source_key);
-    if !matches_source {
-      replica.delete_node(node_id)?;
-    }
-  }
-
   for &node_id in &source_nodes {
     if !replica.node_exists(node_id) {
-      replica.create_node_with_id(node_id, source_keys[&node_id].as_deref())?;
+      replica.create_node_with_id(node_id, source.node_key(node_id).as_deref())?;
     }
   }
 
   for &node_id in &source_nodes {
-    let source_props = source.node_props(node_id).unwrap_or_default();
+    let source_props = translate_prop_map(
+      replica,
+      &mut schema_map,
+      source.node_props(node_id).unwrap_or_default(),
+    )?;
     let replica_props = replica.node_props(node_id).unwrap_or_default();
     for (&key_id, value) in &source_props {
       if replica_props.get(&key_id) != Some(value) {
@@ -923,7 +1026,11 @@ where
       }
     }
 
-    let source_labels: HashSet<_> = source.node_labels(node_id).into_iter().collect();
+    let source_labels = source
+      .node_labels(node_id)
+      .into_iter()
+      .map(|label_id| local_schema_id(replica, &mut schema_map, Label, label_id))
+      .collect::<Result<HashSet<_>>>()?;
     let replica_labels: HashSet<_> = replica.node_labels(node_id).into_iter().collect();
     for &label_id in &source_labels {
       if !replica_labels.contains(&label_id) {
@@ -937,11 +1044,21 @@ where
     }
   }
 
-  let mut vector_prop_keys = source.vector_prop_keys();
-  vector_prop_keys.extend(replica.vector_prop_keys());
+  // Local vector key -> source key; replica-only keys have no source values.
+  let mut vector_prop_keys: HashMap<PropKeyId, Option<PropKeyId>> = replica
+    .vector_prop_keys()
+    .into_iter()
+    .map(|local_key| (local_key, None))
+    .collect();
+  for source_key in source.vector_prop_keys() {
+    vector_prop_keys.insert(
+      local_schema_id(replica, &mut schema_map, PropertyKey, source_key)?,
+      Some(source_key),
+    );
+  }
   for &node_id in &source_nodes {
-    for &prop_key_id in &vector_prop_keys {
-      let source_vector = source.node_vector(node_id, prop_key_id);
+    for (&prop_key_id, &source_key) in &vector_prop_keys {
+      let source_vector = source_key.and_then(|key| source.node_vector(node_id, key));
       let replica_vector = replica.node_vector(node_id, prop_key_id);
       match (source_vector, replica_vector) {
         (Some(source_value), Some(replica_value)) => {
@@ -960,15 +1077,28 @@ where
     }
   }
 
-  let source_edges = source.list_edges(None);
+  // (src, source etype, local etype, dst)
+  let source_edges = source
+    .list_edges(None)
+    .into_iter()
+    .map(|edge| {
+      Ok((
+        edge.src,
+        edge.etype,
+        local_schema_id(replica, &mut schema_map, EdgeType, edge.etype)?,
+        edge.dst,
+      ))
+    })
+    .collect::<Result<Vec<_>>>()?;
   let source_edge_set: HashSet<_> = source_edges
     .iter()
-    .map(|edge| (edge.src, edge.etype, edge.dst))
+    .map(|&(src, _, etype, dst)| (src, etype, dst))
     .collect();
 
-  for edge in &source_edges {
-    if !replica.edge_exists(edge.src, edge.etype, edge.dst) {
-      replica.add_edge(edge.src, edge.etype, edge.dst)?;
+  // A dangling source edge (legacy data) has no live endpoint to attach to.
+  for &(src, _, etype, dst) in &source_edges {
+    if endpoints_exist(replica, src, dst) && !replica.edge_exists(src, etype, dst) {
+      replica.add_edge(src, etype, dst)?;
     }
   }
 
@@ -978,31 +1108,41 @@ where
     }
   }
 
-  for edge in source_edges {
-    let source_props = source
-      .edge_props(edge.src, edge.etype, edge.dst)
-      .unwrap_or_default();
-    let replica_props = replica
-      .edge_props(edge.src, edge.etype, edge.dst)
-      .unwrap_or_default();
+  for (src, source_etype, etype, dst) in source_edges {
+    if !edge_is_live(replica, src, etype, dst) {
+      continue;
+    }
+    let source_props = translate_prop_map(
+      replica,
+      &mut schema_map,
+      source
+        .edge_props(src, source_etype, dst)
+        .unwrap_or_default(),
+    )?;
+    let replica_props = replica.edge_props(src, etype, dst).unwrap_or_default();
 
     for (&key_id, value) in &source_props {
       if replica_props.get(&key_id) != Some(value) {
-        replica.set_edge_prop(edge.src, edge.etype, edge.dst, key_id, value.clone())?;
+        replica.set_edge_prop(src, etype, dst, key_id, value.clone())?;
       }
     }
     for &key_id in replica_props.keys() {
       if !source_props.contains_key(&key_id) {
-        replica.delete_edge_prop(edge.src, edge.etype, edge.dst, key_id)?;
+        replica.delete_edge_prop(src, etype, dst, key_id)?;
       }
     }
   }
 
   before_commit()?;
-  tx_guard.commit()
+  tx_guard.commit()?;
+  Ok(schema_map)
 }
 
-fn apply_replication_frame(db: &SingleFileDB, payload: &[u8]) -> Result<()> {
+fn apply_replication_frame(
+  db: &SingleFileDB,
+  payload: &[u8],
+  schema_map: &mut ReplicaSchemaMap,
+) -> Result<()> {
   let decoded = decode_commit_frame_payload(payload)?;
   let records = parse_wal_records(&decoded.wal_bytes)?;
 
@@ -1012,7 +1152,7 @@ fn apply_replication_frame(db: &SingleFileDB, payload: &[u8]) -> Result<()> {
 
   let tx_guard = db.begin_guard(false)?;
   for record in &records {
-    apply_wal_record_idempotent(db, record)?;
+    apply_wal_record_idempotent(db, record, schema_map)?;
   }
 
   tx_guard.commit()
@@ -1065,9 +1205,16 @@ fn edge_is_live(db: &SingleFileDB, src: NodeId, etype: ETypeId, dst: NodeId) -> 
 /// may have removed the entities they touch. On the primary, keys are unique
 /// and edges, labels, and properties belong to live nodes, so a record that
 /// reaches a missing node or edge comes from such a replay and is skipped
-/// instead of resurrecting it. The replayed suffix then converges on the
-/// primary's state.
-fn apply_wal_record_idempotent(db: &SingleFileDB, record: &ParsedWalRecord) -> Result<()> {
+/// (before any write call) instead of resurrecting it. The replayed suffix
+/// then converges on the primary's state.
+///
+/// Schema ids in the record are the primary's; `schema_map` translates them
+/// to this replica's ids and learns new names from define records.
+fn apply_wal_record_idempotent(
+  db: &SingleFileDB,
+  record: &ParsedWalRecord,
+  schema_map: &mut ReplicaSchemaMap,
+) -> Result<()> {
   match record.record_type {
     WalRecordType::Begin | WalRecordType::Commit | WalRecordType::Rollback => Ok(()),
     WalRecordType::CreateNode => {
@@ -1128,9 +1275,9 @@ fn apply_wal_record_idempotent(db: &SingleFileDB, record: &ParsedWalRecord) -> R
       let data = parse_add_edge_payload(&record.payload).ok_or_else(|| {
         KiteError::InvalidReplication("invalid AddEdge replication payload".to_string())
       })?;
-      if endpoints_exist(db, data.src, data.dst) && !db.edge_exists(data.src, data.etype, data.dst)
-      {
-        db.add_edge(data.src, data.etype, data.dst)?;
+      let etype = local_schema_id(db, schema_map, EdgeType, data.etype)?;
+      if endpoints_exist(db, data.src, data.dst) && !db.edge_exists(data.src, etype, data.dst) {
+        db.add_edge(data.src, etype, data.dst)?;
       }
       Ok(())
     }
@@ -1138,8 +1285,9 @@ fn apply_wal_record_idempotent(db: &SingleFileDB, record: &ParsedWalRecord) -> R
       let data = parse_delete_edge_payload(&record.payload).ok_or_else(|| {
         KiteError::InvalidReplication("invalid DeleteEdge replication payload".to_string())
       })?;
-      if db.edge_exists(data.src, data.etype, data.dst) {
-        db.delete_edge(data.src, data.etype, data.dst)?;
+      let etype = local_schema_id(db, schema_map, EdgeType, data.etype)?;
+      if db.edge_exists(data.src, etype, data.dst) {
+        db.delete_edge(data.src, etype, data.dst)?;
       }
       Ok(())
     }
@@ -1149,10 +1297,9 @@ fn apply_wal_record_idempotent(db: &SingleFileDB, record: &ParsedWalRecord) -> R
       })?;
 
       for edge in batch {
-        if endpoints_exist(db, edge.src, edge.dst)
-          && !db.edge_exists(edge.src, edge.etype, edge.dst)
-        {
-          db.add_edge(edge.src, edge.etype, edge.dst)?;
+        let etype = local_schema_id(db, schema_map, EdgeType, edge.etype)?;
+        if endpoints_exist(db, edge.src, edge.dst) && !db.edge_exists(edge.src, etype, edge.dst) {
+          db.add_edge(edge.src, etype, edge.dst)?;
         }
       }
       Ok(())
@@ -1161,20 +1308,8 @@ fn apply_wal_record_idempotent(db: &SingleFileDB, record: &ParsedWalRecord) -> R
       let data = parse_add_edge_props_payload(&record.payload).ok_or_else(|| {
         KiteError::InvalidReplication("invalid AddEdgeProps replication payload".to_string())
       })?;
-
-      if !endpoints_exist(db, data.src, data.dst) {
-        return Ok(());
-      }
-      if !db.edge_exists(data.src, data.etype, data.dst) {
-        db.add_edge(data.src, data.etype, data.dst)?;
-      }
-
-      for (key_id, value) in data.props {
-        if db.edge_prop(data.src, data.etype, data.dst, key_id) != Some(value.clone()) {
-          db.set_edge_prop(data.src, data.etype, data.dst, key_id, value)?;
-        }
-      }
-      Ok(())
+      let etype = local_schema_id(db, schema_map, EdgeType, data.etype)?;
+      apply_edge_with_props(db, schema_map, data.src, etype, data.dst, data.props)
     }
     WalRecordType::AddEdgesPropsBatch => {
       let batch = parse_add_edges_props_batch_payload(&record.payload).ok_or_else(|| {
@@ -1182,42 +1317,32 @@ fn apply_wal_record_idempotent(db: &SingleFileDB, record: &ParsedWalRecord) -> R
       })?;
 
       for entry in batch {
-        if !endpoints_exist(db, entry.src, entry.dst) {
-          continue;
-        }
-        if !db.edge_exists(entry.src, entry.etype, entry.dst) {
-          db.add_edge(entry.src, entry.etype, entry.dst)?;
-        }
-
-        for (key_id, value) in entry.props {
-          if db.edge_prop(entry.src, entry.etype, entry.dst, key_id) != Some(value.clone()) {
-            db.set_edge_prop(entry.src, entry.etype, entry.dst, key_id, value)?;
-          }
-        }
+        let etype = local_schema_id(db, schema_map, EdgeType, entry.etype)?;
+        apply_edge_with_props(db, schema_map, entry.src, etype, entry.dst, entry.props)?;
       }
-
       Ok(())
     }
     WalRecordType::SetNodeProp => {
       let data = parse_set_node_prop_payload(&record.payload).ok_or_else(|| {
         KiteError::InvalidReplication("invalid SetNodeProp replication payload".to_string())
       })?;
+      let key_id = local_schema_id(db, schema_map, PropertyKey, data.key_id)?;
 
       if db.node_exists(data.node_id)
-        && db.node_prop(data.node_id, data.key_id) != Some(data.value.clone())
+        && db.node_prop(data.node_id, key_id).as_ref() != Some(&data.value)
       {
-        db.set_node_prop(data.node_id, data.key_id, data.value)?;
+        db.set_node_prop(data.node_id, key_id, data.value)?;
       }
-
       Ok(())
     }
     WalRecordType::DelNodeProp => {
       let data = parse_del_node_prop_payload(&record.payload).ok_or_else(|| {
         KiteError::InvalidReplication("invalid DelNodeProp replication payload".to_string())
       })?;
+      let key_id = local_schema_id(db, schema_map, PropertyKey, data.key_id)?;
 
-      if db.node_prop(data.node_id, data.key_id).is_some() {
-        db.delete_node_prop(data.node_id, data.key_id)?;
+      if db.node_prop(data.node_id, key_id).is_some() {
+        db.delete_node_prop(data.node_id, key_id)?;
       }
       Ok(())
     }
@@ -1225,11 +1350,13 @@ fn apply_wal_record_idempotent(db: &SingleFileDB, record: &ParsedWalRecord) -> R
       let data = parse_set_edge_prop_payload(&record.payload).ok_or_else(|| {
         KiteError::InvalidReplication("invalid SetEdgeProp replication payload".to_string())
       })?;
+      let etype = local_schema_id(db, schema_map, EdgeType, data.etype)?;
+      let key_id = local_schema_id(db, schema_map, PropertyKey, data.key_id)?;
 
-      if edge_is_live(db, data.src, data.etype, data.dst)
-        && db.edge_prop(data.src, data.etype, data.dst, data.key_id) != Some(data.value.clone())
+      if edge_is_live(db, data.src, etype, data.dst)
+        && db.edge_prop(data.src, etype, data.dst, key_id).as_ref() != Some(&data.value)
       {
-        db.set_edge_prop(data.src, data.etype, data.dst, data.key_id, data.value)?;
+        db.set_edge_prop(data.src, etype, data.dst, key_id, data.value)?;
       }
       Ok(())
     }
@@ -1237,13 +1364,15 @@ fn apply_wal_record_idempotent(db: &SingleFileDB, record: &ParsedWalRecord) -> R
       let data = parse_set_edge_props_payload(&record.payload).ok_or_else(|| {
         KiteError::InvalidReplication("invalid SetEdgeProps replication payload".to_string())
       })?;
+      let etype = local_schema_id(db, schema_map, EdgeType, data.etype)?;
+      let props = translate_props(db, schema_map, data.props)?;
 
-      if !edge_is_live(db, data.src, data.etype, data.dst) {
+      if !edge_is_live(db, data.src, etype, data.dst) {
         return Ok(());
       }
-      for (key_id, value) in data.props {
-        if db.edge_prop(data.src, data.etype, data.dst, key_id) != Some(value.clone()) {
-          db.set_edge_prop(data.src, data.etype, data.dst, key_id, value)?;
+      for (key_id, value) in props {
+        if db.edge_prop(data.src, etype, data.dst, key_id).as_ref() != Some(&value) {
+          db.set_edge_prop(data.src, etype, data.dst, key_id, value)?;
         }
       }
       Ok(())
@@ -1252,12 +1381,11 @@ fn apply_wal_record_idempotent(db: &SingleFileDB, record: &ParsedWalRecord) -> R
       let data = parse_del_edge_prop_payload(&record.payload).ok_or_else(|| {
         KiteError::InvalidReplication("invalid DelEdgeProp replication payload".to_string())
       })?;
+      let etype = local_schema_id(db, schema_map, EdgeType, data.etype)?;
+      let key_id = local_schema_id(db, schema_map, PropertyKey, data.key_id)?;
 
-      if db
-        .edge_prop(data.src, data.etype, data.dst, data.key_id)
-        .is_some()
-      {
-        db.delete_edge_prop(data.src, data.etype, data.dst, data.key_id)?;
+      if db.edge_prop(data.src, etype, data.dst, key_id).is_some() {
+        db.delete_edge_prop(data.src, etype, data.dst, key_id)?;
       }
       Ok(())
     }
@@ -1265,9 +1393,10 @@ fn apply_wal_record_idempotent(db: &SingleFileDB, record: &ParsedWalRecord) -> R
       let data = parse_add_node_label_payload(&record.payload).ok_or_else(|| {
         KiteError::InvalidReplication("invalid AddNodeLabel replication payload".to_string())
       })?;
+      let label_id = local_schema_id(db, schema_map, Label, data.label_id)?;
 
-      if db.node_exists(data.node_id) && !db.node_has_label(data.node_id, data.label_id) {
-        db.add_node_label(data.node_id, data.label_id)?;
+      if db.node_exists(data.node_id) && !db.node_has_label(data.node_id, label_id) {
+        db.add_node_label(data.node_id, label_id)?;
       }
       Ok(())
     }
@@ -1275,9 +1404,10 @@ fn apply_wal_record_idempotent(db: &SingleFileDB, record: &ParsedWalRecord) -> R
       let data = parse_remove_node_label_payload(&record.payload).ok_or_else(|| {
         KiteError::InvalidReplication("invalid RemoveNodeLabel replication payload".to_string())
       })?;
+      let label_id = local_schema_id(db, schema_map, Label, data.label_id)?;
 
-      if db.node_has_label(data.node_id, data.label_id) {
-        db.remove_node_label(data.node_id, data.label_id)?;
+      if db.node_has_label(data.node_id, label_id) {
+        db.remove_node_label(data.node_id, label_id)?;
       }
       Ok(())
     }
@@ -1285,13 +1415,14 @@ fn apply_wal_record_idempotent(db: &SingleFileDB, record: &ParsedWalRecord) -> R
       let data = parse_set_node_vector_payload(&record.payload).ok_or_else(|| {
         KiteError::InvalidReplication("invalid SetNodeVector replication payload".to_string())
       })?;
+      let prop_key_id = local_schema_id(db, schema_map, PropertyKey, data.prop_key_id)?;
 
       if !db.node_exists(data.node_id) {
         return Ok(());
       }
-      let current = db.node_vector(data.node_id, data.prop_key_id);
+      let current = db.node_vector(data.node_id, prop_key_id);
       if current.as_deref() != Some(data.vector.as_slice()) {
-        db.set_node_vector(data.node_id, data.prop_key_id, &data.vector)?;
+        db.set_node_vector(data.node_id, prop_key_id, &data.vector)?;
       }
       Ok(())
     }
@@ -1299,30 +1430,36 @@ fn apply_wal_record_idempotent(db: &SingleFileDB, record: &ParsedWalRecord) -> R
       let data = parse_del_node_vector_payload(&record.payload).ok_or_else(|| {
         KiteError::InvalidReplication("invalid DelNodeVector replication payload".to_string())
       })?;
+      let prop_key_id = local_schema_id(db, schema_map, PropertyKey, data.prop_key_id)?;
 
-      if db.has_node_vector(data.node_id, data.prop_key_id) {
-        db.delete_node_vector(data.node_id, data.prop_key_id)?;
+      if db.has_node_vector(data.node_id, prop_key_id) {
+        db.delete_node_vector(data.node_id, prop_key_id)?;
       }
       Ok(())
     }
-    // Mutation records address schema by ID, so names must keep the primary's IDs.
     WalRecordType::DefineLabel => {
       let data = parse_define_label_payload(&record.payload).ok_or_else(|| {
         KiteError::InvalidReplication("invalid DefineLabel replication payload".to_string())
       })?;
-      db.define_label_with_id(data.label_id, &data.name)
+      let local_id = db.ensure_replica_label(&data.name, data.label_id)?;
+      schema_map.insert(Label, data.label_id, local_id);
+      Ok(())
     }
     WalRecordType::DefineEtype => {
       let data = parse_define_etype_payload(&record.payload).ok_or_else(|| {
         KiteError::InvalidReplication("invalid DefineEtype replication payload".to_string())
       })?;
-      db.define_etype_with_id(data.label_id, &data.name)
+      let local_id = db.ensure_replica_etype(&data.name, data.label_id)?;
+      schema_map.insert(EdgeType, data.label_id, local_id);
+      Ok(())
     }
     WalRecordType::DefinePropkey => {
       let data = parse_define_propkey_payload(&record.payload).ok_or_else(|| {
         KiteError::InvalidReplication("invalid DefinePropkey replication payload".to_string())
       })?;
-      db.define_propkey_with_id(data.label_id, &data.name)
+      let local_id = db.ensure_replica_propkey(&data.name, data.label_id)?;
+      schema_map.insert(PropertyKey, data.label_id, local_id);
+      Ok(())
     }
     WalRecordType::BatchVectors | WalRecordType::SealFragment | WalRecordType::CompactFragments => {
       // Vector batch and maintenance records are derived/index-management artifacts.
@@ -1333,11 +1470,77 @@ fn apply_wal_record_idempotent(db: &SingleFileDB, record: &ParsedWalRecord) -> R
   }
 }
 
+/// Local id for a primary schema id. Named ids translate through the map. The
+/// raw API also accepts ids that were never named; such an id keeps its
+/// number, but only while no local name claims that number, so data never
+/// lands under a different name. Anything else needs a reseed.
+fn local_schema_id(
+  db: &SingleFileDB,
+  schema_map: &mut ReplicaSchemaMap,
+  kind: SchemaIdKind,
+  primary_id: u32,
+) -> Result<u32> {
+  if let Some(local_id) = schema_map.get(kind, primary_id) {
+    return Ok(local_id);
+  }
+  let locally_named = match kind {
+    Label => db.label_name(primary_id).is_some(),
+    EdgeType => db.etype_name(primary_id).is_some(),
+    PropertyKey => db.propkey_name(primary_id).is_some(),
+  };
+  if locally_named {
+    return Err(KiteError::InvalidReplication(format!(
+      "replica has no translation for primary {} id {primary_id} and that id names another \
+       local {0}; reseed required",
+      kind.noun()
+    )));
+  }
+  schema_map.insert(kind, primary_id, primary_id);
+  Ok(primary_id)
+}
+
+fn translate_props(
+  db: &SingleFileDB,
+  schema_map: &mut ReplicaSchemaMap,
+  props: Vec<(PropKeyId, PropValue)>,
+) -> Result<Vec<(PropKeyId, PropValue)>> {
+  props
+    .into_iter()
+    .map(|(key_id, value)| Ok((local_schema_id(db, schema_map, PropertyKey, key_id)?, value)))
+    .collect()
+}
+
+/// Add an edge (translated etype) with props in primary ids, unless an
+/// endpoint was already deleted by newer state.
+fn apply_edge_with_props(
+  db: &SingleFileDB,
+  schema_map: &mut ReplicaSchemaMap,
+  src: NodeId,
+  etype: ETypeId,
+  dst: NodeId,
+  props: Vec<(PropKeyId, PropValue)>,
+) -> Result<()> {
+  let props = translate_props(db, schema_map, props)?;
+  if !endpoints_exist(db, src, dst) {
+    return Ok(());
+  }
+  if !db.edge_exists(src, etype, dst) {
+    db.add_edge(src, etype, dst)?;
+  }
+  for (key_id, value) in props {
+    if db.edge_prop(src, etype, dst, key_id).as_ref() != Some(&value) {
+      db.set_edge_prop(src, etype, dst, key_id, value)?;
+    }
+  }
+  Ok(())
+}
+
 #[cfg(test)]
 mod tests {
   use super::apply_wal_record_idempotent;
   use crate::core::single_file::{close_single_file, open_single_file, SingleFileOpenOptions};
   use crate::core::wal::record::ParsedWalRecord;
+  use crate::replication::replica::ReplicaSchemaMap;
   use crate::types::WalRecordType;
 
   #[test]
@@ -1358,7 +1561,7 @@ mod tests {
         payload: Vec::new(),
         record_end: 0,
       };
-      apply_wal_record_idempotent(&db, &record)
+      apply_wal_record_idempotent(&db, &record, &mut ReplicaSchemaMap::for_epoch(1))
         .expect("derived vector maintenance should be ignored");
     }
 

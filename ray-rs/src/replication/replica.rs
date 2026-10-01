@@ -8,13 +8,17 @@ use super::transport::decode_commit_frame_payload;
 use super::types::ReplicationRole;
 use crate::error::{KiteError, Result};
 use parking_lot::Mutex;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const MANIFEST_FILE_NAME: &str = "manifest.json";
 const CURSOR_FILE_NAME: &str = "replica-cursor.json";
+const SCHEMA_MAP_FILE_NAME: &str = "replica-schema-map.json";
+const SCHEMA_MAP_VERSION: u32 = 1;
 const TRANSIENT_MISSING_RESEED_ATTEMPTS: u32 = 8;
 
 #[derive(Debug, Clone)]
@@ -38,6 +42,77 @@ pub struct SourcePublishedHead {
   pub newest_frame: Option<(u64, Option<u64>)>,
 }
 
+/// Schema namespace of a translated id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaIdKind {
+  Label,
+  EdgeType,
+  PropertyKey,
+}
+
+impl SchemaIdKind {
+  pub fn noun(self) -> &'static str {
+    match self {
+      SchemaIdKind::Label => "label",
+      SchemaIdKind::EdgeType => "edge type",
+      SchemaIdKind::PropertyKey => "property key",
+    }
+  }
+}
+
+/// Translation from the primary's schema ids to this replica's local ids.
+///
+/// Entries are trusted only within the source epoch they were learned in: a
+/// promoted primary re-announces its whole schema, so a new epoch starts from
+/// an empty translation. Persisted before the cursor that depends on it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReplicaSchemaMap {
+  version: u32,
+  epoch: u64,
+  labels: BTreeMap<u32, u32>,
+  etypes: BTreeMap<u32, u32>,
+  propkeys: BTreeMap<u32, u32>,
+}
+
+impl ReplicaSchemaMap {
+  pub fn for_epoch(epoch: u64) -> Self {
+    Self {
+      version: SCHEMA_MAP_VERSION,
+      epoch,
+      ..Self::default()
+    }
+  }
+
+  /// Enter the epoch of the next frame; a newer epoch drops every entry.
+  pub fn enter_epoch(&mut self, epoch: u64) {
+    if epoch > self.epoch {
+      *self = Self::for_epoch(epoch);
+    }
+  }
+
+  pub fn get(&self, kind: SchemaIdKind, primary_id: u32) -> Option<u32> {
+    self.entries(kind).get(&primary_id).copied()
+  }
+
+  pub fn insert(&mut self, kind: SchemaIdKind, primary_id: u32, local_id: u32) {
+    let entries = match kind {
+      SchemaIdKind::Label => &mut self.labels,
+      SchemaIdKind::EdgeType => &mut self.etypes,
+      SchemaIdKind::PropertyKey => &mut self.propkeys,
+    };
+    entries.insert(primary_id, local_id);
+  }
+
+  fn entries(&self, kind: SchemaIdKind) -> &BTreeMap<u32, u32> {
+    match kind {
+      SchemaIdKind::Label => &self.labels,
+      SchemaIdKind::EdgeType => &self.etypes,
+      SchemaIdKind::PropertyKey => &self.propkeys,
+    }
+  }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 struct ReplicaCursorState {
@@ -48,6 +123,8 @@ struct ReplicaCursorState {
   transient_missing_attempts: u32,
   transient_missing_epoch: u64,
   transient_missing_log_index: u64,
+  /// A bootstrap removed stale nodes but has not installed the source state.
+  bootstrap_incomplete: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -62,10 +139,12 @@ struct SegmentScanHint {
 pub struct ReplicaReplication {
   local_sidecar_path: PathBuf,
   cursor_state_path: PathBuf,
+  schema_map_path: PathBuf,
   replica_id: String,
   source_db_path: Option<PathBuf>,
   source_sidecar_path: Option<PathBuf>,
   state: Mutex<ReplicaCursorState>,
+  schema_map: Mutex<ReplicaSchemaMap>,
   scan_hint: Mutex<Option<SegmentScanHint>>,
 }
 
@@ -84,7 +163,15 @@ impl ReplicaReplication {
       .to_string();
 
     let cursor_state_path = local_sidecar_path.join(CURSOR_FILE_NAME);
-    let state = load_cursor_state(&cursor_state_path)?;
+    let state: ReplicaCursorState = load_json_state(&cursor_state_path, "replica cursor state")?;
+    let schema_map_path = local_sidecar_path.join(SCHEMA_MAP_FILE_NAME);
+    let schema_map: ReplicaSchemaMap = load_json_state(&schema_map_path, "replica schema map")?;
+    if schema_map.version > SCHEMA_MAP_VERSION {
+      return Err(KiteError::VersionMismatch {
+        required: schema_map.version,
+        current: SCHEMA_MAP_VERSION,
+      });
+    }
 
     let source_db_path = source_db_path.ok_or_else(|| {
       KiteError::InvalidReplication("replica source db path is not configured".to_string())
@@ -126,10 +213,12 @@ impl ReplicaReplication {
     Ok(Self {
       local_sidecar_path,
       cursor_state_path,
+      schema_map_path,
       replica_id,
       source_db_path: Some(source_db_path),
       source_sidecar_path,
       state: Mutex::new(state),
+      schema_map: Mutex::new(schema_map),
       scan_hint: Mutex::new(None),
     })
   }
@@ -191,6 +280,23 @@ impl ReplicaReplication {
     })
   }
 
+  pub fn schema_map(&self) -> ReplicaSchemaMap {
+    self.schema_map.lock().clone()
+  }
+
+  /// Durably replace the schema translation. Callers store it before the
+  /// cursor that depends on it, so a crash can only leave the translation
+  /// ahead of the cursor; replaying defines is idempotent.
+  pub fn store_schema_map(&self, schema_map: ReplicaSchemaMap) -> Result<()> {
+    let mut current = self.schema_map.lock();
+    if *current == schema_map {
+      return Ok(());
+    }
+    persist_json_state(&self.schema_map_path, &schema_map, "replica schema map")?;
+    *current = schema_map;
+    Ok(())
+  }
+
   pub fn mark_applied(&self, epoch: u64, log_index: u64) -> Result<()> {
     let mut state = self.state.lock();
 
@@ -208,11 +314,26 @@ impl ReplicaReplication {
     next_state.applied_log_index = log_index;
     next_state.last_error = None;
     next_state.needs_reseed = false;
+    next_state.bootstrap_incomplete = false;
     clear_transient_missing_state(&mut next_state);
     persist_cursor_state(&self.cursor_state_path, &next_state)?;
     *state = next_state;
     drop(state);
     self.report_source_progress(epoch, log_index)
+  }
+
+  /// Record, before a bootstrap commits its first change, that the replica
+  /// state is partial until the bootstrap marks its cursor applied.
+  pub fn mark_bootstrap_incomplete(&self) -> Result<()> {
+    let mut state = self.state.lock();
+    if state.bootstrap_incomplete {
+      return Ok(());
+    }
+    let mut next_state = state.clone();
+    next_state.bootstrap_incomplete = true;
+    persist_cursor_state(&self.cursor_state_path, &next_state)?;
+    *state = next_state;
+    Ok(())
   }
 
   pub fn mark_error(&self, message: impl Into<String>, needs_reseed: bool) -> Result<()> {
@@ -265,6 +386,14 @@ impl ReplicaReplication {
     let source_sidecar_path = self.source_sidecar_path.as_ref().ok_or_else(|| {
       KiteError::InvalidReplication("replica source sidecar path is not configured".to_string())
     })?;
+
+    if self.state.lock().bootstrap_incomplete {
+      let message =
+        "replica needs reseed: a snapshot bootstrap was interrupted after removing stale nodes"
+          .to_string();
+      self.mark_error(message.clone(), true)?;
+      return Err(KiteError::InvalidReplication(message));
+    }
 
     let (applied_epoch, applied_log_index) = self.applied_position();
     let manifest = ManifestStore::new(source_sidecar_path.join(MANIFEST_FILE_NAME)).read()?;
@@ -358,23 +487,25 @@ impl ReplicaReplication {
   }
 }
 
-fn load_cursor_state(path: &Path) -> Result<ReplicaCursorState> {
+fn load_json_state<T: DeserializeOwned + Default>(path: &Path, what: &str) -> Result<T> {
   if !path.exists() {
-    return Ok(ReplicaCursorState::default());
+    return Ok(T::default());
   }
 
   let bytes = std::fs::read(path)?;
-  let state: ReplicaCursorState = serde_json::from_slice(&bytes).map_err(|error| {
-    KiteError::Serialization(format!("decode replica cursor state failed: {error}"))
-  })?;
-  Ok(state)
+  serde_json::from_slice(&bytes)
+    .map_err(|error| KiteError::Serialization(format!("decode {what} failed: {error}")))
 }
 
 fn persist_cursor_state(path: &Path, state: &ReplicaCursorState) -> Result<()> {
+  persist_json_state(path, state, "replica cursor state")
+}
+
+/// Atomic replace: write a temp file, fsync it, rename, fsync the directory.
+fn persist_json_state<T: Serialize>(path: &Path, state: &T, what: &str) -> Result<()> {
   let tmp_path = path.with_extension("json.tmp");
-  let bytes = serde_json::to_vec(state).map_err(|error| {
-    KiteError::Serialization(format!("encode replica cursor state failed: {error}"))
-  })?;
+  let bytes = serde_json::to_vec(state)
+    .map_err(|error| KiteError::Serialization(format!("encode {what} failed: {error}")))?;
 
   let mut file = OpenOptions::new()
     .create(true)
@@ -558,4 +689,33 @@ fn normalize_path_for_compare(path: &Path) -> PathBuf {
 
 fn paths_equivalent(left: &Path, right: &Path) -> bool {
   normalize_path_for_compare(left) == normalize_path_for_compare(right)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::ReplicaSchemaMap;
+
+  #[test]
+  fn schema_map_trusts_entries_only_within_their_epoch() {
+    use super::SchemaIdKind::{Label, PropertyKey};
+
+    let mut map = ReplicaSchemaMap::for_epoch(1);
+    map.insert(PropertyKey, 1, 7);
+    map.insert(Label, 2, 3);
+
+    map.enter_epoch(1);
+    assert_eq!(map.get(PropertyKey, 1), Some(7), "same epoch keeps entries");
+
+    map.enter_epoch(2);
+    assert_eq!(map.get(PropertyKey, 1), None, "a newer epoch drops entries");
+    assert_eq!(map.get(Label, 2), None);
+
+    map.insert(PropertyKey, 1, 9);
+    map.enter_epoch(1);
+    assert_eq!(
+      map.get(PropertyKey, 1),
+      Some(9),
+      "replaying an older frame keeps entries"
+    );
+  }
 }
