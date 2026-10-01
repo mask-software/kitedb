@@ -2691,4 +2691,97 @@ mod tests {
       assert!(reopened.node_by_key(key).is_some(), "{key} missing");
     }
   }
+
+  /// Build a database whose small snapshot sits at the end of the file, so
+  /// vacuum has to relocate it (via its temporary append-only copy).
+  fn db_needing_snapshot_relocation(
+    path: &std::path::Path,
+  ) -> (SingleFileDB, SingleFileOpenOptions) {
+    let options = SingleFileOpenOptions::new()
+      .auto_checkpoint(false)
+      .background_checkpoint(false);
+    let db = open_single_file(path, options.clone()).expect("open");
+    db.begin(false).expect("expected value");
+    let mut ids = Vec::new();
+    for index in 0..4000 {
+      ids.push(
+        db.create_node(Some(&format!("bulk-{index}")))
+          .expect("expected value"),
+      );
+    }
+    db.commit().expect("expected value");
+    db.checkpoint().expect("expected value");
+    db.begin(false).expect("expected value");
+    for id in &ids[10..] {
+      db.delete_node(*id).expect("expected value");
+    }
+    db.commit().expect("expected value");
+    db.checkpoint().expect("expected value");
+    (db, options)
+  }
+
+  /// After vacuum both header slots must name a valid layout. Regression:
+  /// vacuum wrote its final header to one slot only, so the other still named
+  /// the temporary snapshot copy vacuum had truncated; tearing the newest slot
+  /// left the database unopenable.
+  #[test]
+  fn vacuum_survives_a_torn_newest_header_slot() {
+    let _serial = checkpoint_test_serial();
+    let temp_dir = tempdir().expect("expected value");
+    let db_path = temp_dir.path().join("vacuum-torn-header.kitedb");
+    let (db, options) = db_needing_snapshot_relocation(&db_path);
+    db.vacuum_single_file(Some(crate::core::single_file::VacuumOptions {
+      shrink_wal: false,
+      min_wal_size: None,
+    }))
+    .expect("vacuum");
+    let newest_slot = db.header_slot.load(Ordering::Acquire);
+    let page_size = db.header.read().page_size as u64;
+    drop(db);
+
+    let mut file = FsOpenOptions::new()
+      .read(true)
+      .write(true)
+      .open(&db_path)
+      .expect("expected value");
+    file
+      .seek(SeekFrom::Start(newest_slot as u64 * page_size + 32))
+      .expect("expected value");
+    file.write_all(&[0xA5]).expect("expected value");
+    file.sync_all().expect("expected value");
+
+    let reopened =
+      open_single_file(&db_path, options).expect("reopen with the newest header slot torn");
+    assert!(reopened.node_by_key("bulk-0").is_some());
+    assert!(reopened.node_by_key("bulk-500").is_none());
+  }
+
+  /// Vacuum must never shrink the WAL below the minimum, whatever
+  /// `min_wal_size` says. Regression: `min_wal_size: Some(0)` produced a
+  /// zero-page WAL.
+  #[test]
+  fn vacuum_never_shrinks_the_wal_below_the_minimum() {
+    let _serial = checkpoint_test_serial();
+    let temp_dir = tempdir().expect("expected value");
+    let db_path = temp_dir.path().join("vacuum-min-wal.kitedb");
+    let options = SingleFileOpenOptions::new().auto_checkpoint(false);
+    let db = open_single_file(&db_path, options).expect("open");
+    db.begin(false).expect("expected value");
+    db.create_node(Some("node")).expect("expected value");
+    db.commit().expect("expected value");
+    db.checkpoint().expect("expected value");
+
+    db.vacuum_single_file(Some(crate::core::single_file::VacuumOptions {
+      shrink_wal: true,
+      min_wal_size: Some(0),
+    }))
+    .expect("vacuum");
+
+    // 16 pages is the compactor's MIN_WAL_PAGES.
+    let wal_pages = db.header.read().wal_page_count;
+    assert!(wal_pages >= 16, "vacuum shrank the WAL to {wal_pages} pages");
+    db.begin(false).expect("expected value");
+    db.create_node(Some("after-vacuum")).expect("write after vacuum");
+    db.commit().expect("commit after vacuum");
+  }
 }
