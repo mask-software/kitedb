@@ -174,7 +174,11 @@ impl ReplicaReplication {
     let mut next_state = state.clone();
     next_state.last_error = Some(message.into());
     next_state.needs_reseed = needs_reseed;
-    clear_transient_missing_state(&mut next_state);
+    // Missing-frame attempts accumulate across pulls until the cursor moves or
+    // the gap escalates; recording a transient error must not reset them.
+    if needs_reseed {
+      clear_transient_missing_state(&mut next_state);
+    }
     persist_cursor_state(&self.cursor_state_path, &next_state)?;
     *state = next_state;
     Ok(())
