@@ -1,539 +1,705 @@
-import { createFileRoute, useLocation } from '@tanstack/solid-router'
-import { Show } from 'solid-js'
-import DocPage from '~/components/doc-page'
-import { findDocBySlug } from '~/lib/docs'
+import { createFileRoute } from "@tanstack/solid-router";
+import { For, type JSX, Match, Show, Switch } from "solid-js";
+import CodeBlock from "~/components/code-block";
+import { DocNotFound } from "~/components/doc-not-found";
+import DocPage from "~/components/doc-page";
+import { GITHUB_URL } from "~/components/github-icon";
+import {
+	type BenchSource,
+	formatNs,
+	formatNsExact,
+	formatRate,
+	GRAPH_LATENCY_ROWS,
+	GRAPH_METRICS,
+	type GraphMetric,
+	MULTI_WRITER,
+	MULTI_WRITER_CONFIG,
+	type Percentiles,
+	PYTHON_GRAPH,
+	PYTHON_GRAPH_SOURCE,
+	RESULTS_DIR,
+	RUST_GRAPH,
+	RUST_GRAPH_SOURCE,
+	RUST_SYNC_SWEEP,
+	RUST_SYNC_SWEEP_LOGS,
+	resultsUrl,
+	SQLITE_BATCH_NODES,
+	SQLITE_BATCH_SOURCE,
+	TS_OVERHEAD,
+	TS_OVERHEAD_SOURCE,
+	VECTOR_INDEX,
+	VECTOR_LATENCY_ROW,
+	VECTOR_SOURCE,
+} from "~/lib/benchmarks";
+import { loadDocSlug } from "~/lib/doc-route";
 
-export const Route = createFileRoute('/docs/benchmarks/$')({
-  component: BenchmarksSplatPage,
-})
+export const Route = createFileRoute("/docs/benchmarks/$")({
+	loader: loadDocSlug,
+	component: BenchmarksSplatPage,
+	notFoundComponent: () => (
+		<DocNotFound backHref="/docs/benchmarks" backLabel="Back to benchmarks" />
+	),
+});
 
 function BenchmarksSplatPage() {
-  const location = useLocation()
-  const slug = () => {
-    const path = location().pathname
-    const match = path.match(/^\/docs\/(.+)$/)
-    return match ? match[1] : ''
-  }
-  const doc = () => findDocBySlug(slug())
-
-  return (
-    <Show
-      when={doc()}
-      fallback={<DocNotFound slug={slug()} />}
-    >
-      <DocPageContent slug={slug()} />
-    </Show>
-  )
+	const data = Route.useLoaderData();
+	return <DocPageContent slug={data().slug} />;
 }
 
-function DocNotFound(props: { slug: string }) {
-  return (
-    <div class="max-w-4xl mx-auto px-6 py-12">
-      <div class="text-center">
-        <h1 class="text-4xl font-extrabold text-slate-900 dark:text-white mb-4">
-          Page Not Found
-        </h1>
-        <p class="text-lg text-slate-600 dark:text-slate-400 mb-8">
-          The benchmark page <code class="px-2 py-1 bg-slate-100 dark:bg-slate-800 rounded">{props.slug}</code> doesn't exist yet.
-        </p>
-        <a
-          href="/docs/benchmarks"
-          class="inline-flex items-center gap-2 px-6 py-3 bg-gradient-to-r from-cyan-500 to-violet-500 text-white font-semibold rounded-xl hover:shadow-lg hover:shadow-cyan-500/25 transition-all duration-200"
-        >
-          Back to Benchmarks
-        </a>
-      </div>
-    </div>
-  )
+// Commands copied from docs/BENCHMARKS.md ("Running Benchmarks").
+const RUST_GRAPH_COMMAND = `cd ray-rs
+cargo run --release --example single_file_raw_bench --no-default-features -- \\
+  --nodes 10000 --edges 50000 --iterations 10000 \\
+  --wal-size 268435456 --no-auto-checkpoint --sync-mode normal`;
+
+const PYTHON_GRAPH_COMMAND = `cd ray-rs/python/benchmarks
+python3 benchmark_single_file_raw.py \\
+  --nodes 10000 --edges 50000 --iterations 10000 \\
+  --wal-size 268435456 --no-auto-checkpoint --sync-mode normal`;
+
+const TS_OVERHEAD_COMMAND = `cd ray-rs
+node --import @oxc-node/core/register benchmark/bench-fluent-vs-lowlevel.ts`;
+
+const VECTOR_COMMAND = `cd ray-rs
+cargo run --release --example vector_bench --no-default-features -- \\
+  --vectors 10000 --dimensions 768 --iterations 1000 --k 10 --n-probe 10`;
+
+const SQLITE_COMMAND = `cd docs/benchmarks
+python3 sqlite_single_file_raw_bench.py \\
+  --nodes 10000 --edges 50000 --iterations 10000 --sync-mode normal`;
+
+const GRAPH_SNAPSHOT_METRICS: GraphMetric[] = [
+	"keyLookup",
+	"traverseOut",
+	"edgeExists",
+	"batchNodes",
+];
+
+const labelFor = (metric: GraphMetric) =>
+	GRAPH_METRICS.find((m) => m.id === metric)?.label ?? metric;
+
+/** Names the raw log(s) behind the table above it, plus the run's settings. */
+function SourceNote(props: { logs: string[]; config: string }) {
+	return (
+		<p class="-mt-4 text-[13px] leading-relaxed text-slate-500">
+			Source:{" "}
+			<For each={props.logs}>
+				{(log, index) => (
+					<>
+						<Show when={index() > 0}>, </Show>
+						<a
+							href={resultsUrl(GITHUB_URL, log.includes("{") ? undefined : log)}
+							target="_blank"
+							rel="noopener noreferrer"
+							class="text-slate-400"
+						>
+							<code>{log}</code>
+						</a>
+					</>
+				)}
+			</For>{" "}
+			({props.config})
+		</p>
+	);
+}
+
+function RunSource(props: { source: BenchSource }) {
+	return <SourceNote logs={[props.source.log]} config={props.source.config} />;
+}
+
+/** Operation | p50 | p95 for one single-file raw run, at log precision. */
+function GraphTable(props: { data: Record<GraphMetric, Percentiles> }) {
+	return (
+		<table>
+			<thead>
+				<tr>
+					<th>Operation</th>
+					<th>p50</th>
+					<th>p95</th>
+				</tr>
+			</thead>
+			<tbody>
+				<For each={GRAPH_METRICS}>
+					{(metric) => (
+						<tr>
+							<td>{metric.label}</td>
+							<td>{formatNsExact(props.data[metric.id].p50)}</td>
+							<td>{formatNsExact(props.data[metric.id].p95)}</td>
+						</tr>
+					)}
+				</For>
+			</tbody>
+		</table>
+	);
+}
+
+function Note(props: { children: JSX.Element }) {
+	return (
+		<div class="not-prose rounded-lg border border-kite-cyan/20 bg-kite-cyan/[0.05] px-4 py-3 text-[14px] leading-relaxed text-slate-300">
+			{props.children}
+		</div>
+	);
+}
+
+function OverviewPage() {
+	return (
+		<DocPage slug="benchmarks">
+			<p>
+				Latency for KiteDB's single-file engine, vector index, and language
+				bindings, measured on one machine. Every table names the raw log in{" "}
+				<code>{RESULTS_DIR}/</code> that its numbers come from, along with the
+				dataset and durability settings of that run.{" "}
+				<code>docs/BENCHMARKS.md</code> has the full notes.
+			</p>
+
+			<h2 id="benchmark-categories">Benchmark pages</h2>
+			<ul>
+				<li>
+					<a href="/docs/benchmarks/graph">Graph benchmarks</a>: single-file
+					engine latency from Rust and Python, sync modes, group commit, and
+					parallel writes
+				</li>
+				<li>
+					<a href="/docs/benchmarks/vector">Vector benchmarks</a>: vector index
+					insert, build, lookup, and search (Rust)
+				</li>
+				<li>
+					<a href="/docs/benchmarks/cross-language">
+						Cross-language benchmarks
+					</a>
+					: Rust and Python side by side, plus the cost of the TypeScript fluent
+					API
+				</li>
+			</ul>
+
+			<h2 id="test-environment">Test environment</h2>
+			<ul>
+				<li>Apple M4, 16 GB RAM</li>
+				<li>macOS, Darwin 25.3.0</li>
+				<li>Rust 1.88.0</li>
+				<li>Node 24.12.0</li>
+				<li>Bun 1.3.5</li>
+				<li>Python 3.12.8</li>
+			</ul>
+
+			<h2 id="highlights">Highlights</h2>
+			<p>
+				These are the numbers on the homepage, rounded. The graph and vector
+				pages list them at full log precision.
+			</p>
+
+			<h3 id="graph-highlights">Graph operations</h3>
+			<table>
+				<thead>
+					<tr>
+						<th>Operation</th>
+						<th>Workload</th>
+						<th>p50</th>
+						<th>p95</th>
+					</tr>
+				</thead>
+				<tbody>
+					<For each={GRAPH_LATENCY_ROWS}>
+						{(row) => (
+							<tr>
+								<td>{row.label}</td>
+								<td>{row.detail}</td>
+								<td>{formatNs(row.p50)}</td>
+								<td>{formatNs(row.p95)}</td>
+							</tr>
+						)}
+					</For>
+				</tbody>
+			</table>
+			<RunSource source={RUST_GRAPH_SOURCE} />
+
+			<h3 id="vector-highlights">Vector index</h3>
+			<table>
+				<thead>
+					<tr>
+						<th>Operation</th>
+						<th>p50</th>
+						<th>p95</th>
+					</tr>
+				</thead>
+				<tbody>
+					<tr>
+						<td>Insert one vector (10k inserts)</td>
+						<td>{formatNs(VECTOR_INDEX.set.p50)}</td>
+						<td>{formatNs(VECTOR_INDEX.set.p95)}</td>
+					</tr>
+					<tr>
+						<td>build_index() (single run)</td>
+						<td>{formatNs(VECTOR_INDEX.buildIndex)}</td>
+						<td>n/a</td>
+					</tr>
+					<tr>
+						<td>Get vector (random)</td>
+						<td>{formatNs(VECTOR_INDEX.get.p50)}</td>
+						<td>{formatNs(VECTOR_INDEX.get.p95)}</td>
+					</tr>
+					<tr>
+						<td>Search ({VECTOR_LATENCY_ROW.detail})</td>
+						<td>{formatNs(VECTOR_LATENCY_ROW.p50)}</td>
+						<td>{formatNs(VECTOR_LATENCY_ROW.p95)}</td>
+					</tr>
+				</tbody>
+			</table>
+			<RunSource source={VECTOR_SOURCE} />
+
+			<Note>
+				Group commit was off for the graph runs. It is built for concurrent
+				writers: in sync=normal mode a commit can wait up to the group-commit
+				window (2 ms by default), so a single-threaded batch write takes
+				milliseconds instead of microseconds. The{" "}
+				<a href="/docs/benchmarks/graph#sync-mode-group-commit">
+					graph benchmarks
+				</a>{" "}
+				show both settings.
+			</Note>
+
+			<h2 id="bindings">Bindings snapshot</h2>
+			<p>
+				p50 latency for the same graph workload from Rust and through the Python
+				bindings.
+			</p>
+			<table>
+				<thead>
+					<tr>
+						<th>Operation</th>
+						<th>Rust</th>
+						<th>Python</th>
+					</tr>
+				</thead>
+				<tbody>
+					<For each={GRAPH_SNAPSHOT_METRICS}>
+						{(metric) => (
+							<tr>
+								<td>{labelFor(metric)}</td>
+								<td>{formatNs(RUST_GRAPH[metric].p50)}</td>
+								<td>{formatNs(PYTHON_GRAPH[metric].p50)}</td>
+							</tr>
+						)}
+					</For>
+				</tbody>
+			</table>
+			<SourceNote
+				logs={[RUST_GRAPH_SOURCE.log, PYTHON_GRAPH_SOURCE.log]}
+				config={RUST_GRAPH_SOURCE.config}
+			/>
+			<p>
+				<a href="/docs/benchmarks/cross-language">Cross-language benchmarks</a>{" "}
+				has every operation, plus the TypeScript API.
+			</p>
+
+			<h2 id="parallel-write-scaling">Parallel write scaling</h2>
+			<p>
+				Write throughput doesn't grow linearly with writer threads. Commits
+				serialize WAL ordering and delta application behind{" "}
+				<code>commit_lock</code>, so the fastest way to ingest is to prepare
+				batches in parallel and send them through one writer using batched
+				transactions. The{" "}
+				<a href="/docs/benchmarks/graph#parallel-write-scaling">
+					graph benchmarks
+				</a>{" "}
+				have the 8-thread measurements.
+			</p>
+
+			<h2 id="running">Running benchmarks</h2>
+			<p>
+				Commands from <code>docs/BENCHMARKS.md</code>, run from the repository
+				root.
+			</p>
+			<p>Rust core, graph operations:</p>
+			<CodeBlock code={RUST_GRAPH_COMMAND} language="bash" />
+			<p>Python bindings, graph operations:</p>
+			<CodeBlock code={PYTHON_GRAPH_COMMAND} language="bash" />
+			<p>TypeScript, fluent vs low-level API:</p>
+			<CodeBlock code={TS_OVERHEAD_COMMAND} language="bash" />
+			<p>Rust vector index:</p>
+			<CodeBlock code={VECTOR_COMMAND} language="bash" />
+		</DocPage>
+	);
+}
+
+function GraphPage() {
+	return (
+		<DocPage slug="benchmarks/graph">
+			<p>
+				Latency of the single-file engine on a graph of 10,000 nodes and 50,000
+				edges, measured from Rust and through the Python bindings. The numbers
+				come from the February 4, 2026 runs, and each table names its raw log.
+			</p>
+
+			<h2 id="test-configuration">Test configuration</h2>
+			<ul>
+				<li>
+					Graph: 10,000 nodes, 50,000 edges, 3 edge types, 10 props per edge
+				</li>
+				<li>Iterations: 10,000</li>
+				<li>Vectors: 1,000 vectors of 128 dimensions (for the vector rows)</li>
+				<li>
+					WAL: 256 MB with auto-checkpoint off, so write timings show the raw
+					commit cost
+				</li>
+				<li>
+					Durability: sync=normal, group commit off, unless a table says
+					otherwise
+				</li>
+			</ul>
+
+			<h2 id="rust-core">Rust core</h2>
+			<p>
+				Measured with the <code>single_file_raw_bench</code> example.
+			</p>
+			<GraphTable data={RUST_GRAPH} />
+			<RunSource source={RUST_GRAPH_SOURCE} />
+
+			<h2 id="python-bindings">Python bindings</h2>
+			<p>
+				The same benchmark through the Python bindings, with{" "}
+				<code>benchmark_single_file_raw.py</code>.
+			</p>
+			<GraphTable data={PYTHON_GRAPH} />
+			<RunSource source={PYTHON_GRAPH_SOURCE} />
+
+			<h2 id="sync-mode-group-commit">Sync mode and group commit</h2>
+			<p>
+				Batch write (100 nodes) p50 from the Rust benchmark on the same graph,
+				for each sync mode with group commit off and on (2 ms window).
+			</p>
+			<table>
+				<thead>
+					<tr>
+						<th>Sync mode</th>
+						<th>Group commit off</th>
+						<th>Group commit on</th>
+					</tr>
+				</thead>
+				<tbody>
+					<For each={RUST_SYNC_SWEEP}>
+						{(row) => (
+							<tr>
+								<td>
+									<code>{row.syncMode}</code>
+								</td>
+								<td>{formatNsExact(row.groupCommitOff)}</td>
+								<td>{formatNsExact(row.groupCommitOn)}</td>
+							</tr>
+						)}
+					</For>
+				</tbody>
+			</table>
+			<SourceNote
+				logs={[RUST_SYNC_SWEEP_LOGS]}
+				config="10k nodes, 50k edges, 3 edge types, 10 edge props; one log per cell"
+			/>
+			<p>
+				Group commit only applies in <code>normal</code> mode and is ignored in{" "}
+				<code>full</code> and <code>off</code>, which is why those rows barely
+				change. In <code>normal</code> mode a single writer can wait up to the
+				group-commit window on each commit, so batch writes go from microseconds
+				to milliseconds. Group commit pays off with concurrent writers, shown
+				below.
+			</p>
+
+			<h2 id="parallel-write-scaling">Parallel writes</h2>
+			<p>
+				Commits serialize WAL ordering and delta application behind{" "}
+				<code>commit_lock</code> (
+				<code>ray-rs/src/core/single_file/mod.rs</code>
+				), so write throughput doesn't scale linearly with writer threads. For
+				the highest ingest rate, prepare batches in parallel and send them
+				through one writer using batched transactions.
+			</p>
+
+			<h3 id="parallel-nodes-edges">Nodes and edges, 8 writer threads</h3>
+			<table>
+				<thead>
+					<tr>
+						<th>Group commit</th>
+						<th>Transaction rate</th>
+						<th>Node rate</th>
+						<th>Edge rate</th>
+					</tr>
+				</thead>
+				<tbody>
+					<For each={MULTI_WRITER}>
+						{(run) => (
+							<tr>
+								<td>{run.groupCommit ? "On" : "Off"}</td>
+								<td>{formatRate(run.txPerSec)}</td>
+								<td>{formatRate(run.nodesPerSec)}</td>
+								<td>{formatRate(run.edgesPerSec)}</td>
+							</tr>
+						)}
+					</For>
+				</tbody>
+			</table>
+			<SourceNote
+				logs={MULTI_WRITER.map((run) => run.log)}
+				config={MULTI_WRITER_CONFIG}
+			/>
+			<p>
+				With eight concurrent writers, group commit raises throughput, the
+				opposite of its effect on a single writer.
+			</p>
+
+			<h3 id="parallel-vectors">Thread-count sweeps</h3>
+			<p>
+				A 2026-02-05 sweep of 1 to 16 writer threads (
+				<code>multi_writer_throughput_bench</code> and{" "}
+				<code>multi_writer_vector_throughput_bench</code>) was run without
+				keeping its raw output, so no numbers are published for it. Its takeaway
+				still holds: commits are serialized, so prepare data in parallel and
+				send it through one writer in batched transactions.
+			</p>
+
+			<h2 id="sqlite">SQLite baseline</h2>
+			<p>
+				<code>docs/benchmarks/sqlite_single_file_raw_bench.py</code> runs the
+				batch-write benchmark against SQLite on a graph of the same size. It
+				configures SQLite with WAL mode, <code>synchronous=normal</code>,{" "}
+				<code>temp_store=MEMORY</code>, <code>locking_mode=EXCLUSIVE</code>,{" "}
+				<code>cache_size=256MB</code>, and WAL autocheckpoint disabled. Edge
+				props live in a separate table; edges use <code>INSERT OR IGNORE</code>{" "}
+				and props use <code>INSERT OR REPLACE</code>.
+			</p>
+			<table>
+				<thead>
+					<tr>
+						<th>Operation</th>
+						<th>p50</th>
+						<th>p95</th>
+					</tr>
+				</thead>
+				<tbody>
+					<tr>
+						<td>Batch write (100 nodes)</td>
+						<td>{formatNsExact(SQLITE_BATCH_NODES.p50)}</td>
+						<td>{formatNsExact(SQLITE_BATCH_NODES.p95)}</td>
+					</tr>
+				</tbody>
+			</table>
+			<RunSource source={SQLITE_BATCH_SOURCE} />
+			<CodeBlock code={SQLITE_COMMAND} language="bash" />
+
+			<h2 id="running">Running benchmarks</h2>
+			<p>
+				Commands from <code>docs/BENCHMARKS.md</code>, run from the repository
+				root. Rust core:
+			</p>
+			<CodeBlock code={RUST_GRAPH_COMMAND} language="bash" />
+			<p>Python bindings:</p>
+			<CodeBlock code={PYTHON_GRAPH_COMMAND} language="bash" />
+			<p>Both scripts accept the same optional flags:</p>
+			<ul>
+				<li>
+					<code>--edge-types N</code> (default 3) and{" "}
+					<code>--edge-props N</code> (default 10)
+				</li>
+				<li>
+					<code>--sync-mode full|normal|off</code> (default <code>normal</code>)
+				</li>
+				<li>
+					<code>--group-commit-enabled</code> and{" "}
+					<code>--group-commit-window-ms N</code> (default 2)
+				</li>
+			</ul>
+			<p>
+				The Rust and Python commands above match the 2026-02-04 logs (256 MB
+				WAL, auto-checkpoint off). Without <code>--wal-size</code> and{" "}
+				<code>--no-auto-checkpoint</code> the scripts use a 64 MB WAL with
+				auto-checkpoint on. Add <code>--group-commit-enabled</code> or change{" "}
+				<code>--sync-mode</code> to reproduce the other sweep files.
+			</p>
+		</DocPage>
+	);
+}
+
+function VectorPage() {
+	return (
+		<DocPage slug="benchmarks/vector">
+			<p>
+				Vector index latency through the Rust API, measured with the{" "}
+				<code>vector_bench</code> example on February 3, 2026.
+			</p>
+
+			<h2 id="config">Test configuration</h2>
+			<ul>
+				<li>Vectors: 10,000 random vectors of 768 dimensions</li>
+				<li>Metric: cosine</li>
+				<li>Index: IVF with 100 clusters</li>
+				<li>Search: k=10, nProbe=10, 1,000 iterations</li>
+			</ul>
+
+			<h2 id="results">Results</h2>
+			<table>
+				<thead>
+					<tr>
+						<th>Operation</th>
+						<th>p50</th>
+						<th>p95</th>
+					</tr>
+				</thead>
+				<tbody>
+					<tr>
+						<td>Insert one vector (10k inserts)</td>
+						<td>{formatNsExact(VECTOR_INDEX.set.p50)}</td>
+						<td>{formatNsExact(VECTOR_INDEX.set.p95)}</td>
+					</tr>
+					<tr>
+						<td>build_index() (single run)</td>
+						<td>{formatNsExact(VECTOR_INDEX.buildIndex)}</td>
+						<td>n/a</td>
+					</tr>
+					<tr>
+						<td>Get vector (random)</td>
+						<td>{formatNsExact(VECTOR_INDEX.get.p50)}</td>
+						<td>{formatNsExact(VECTOR_INDEX.get.p95)}</td>
+					</tr>
+					<tr>
+						<td>Search (k=10, nProbe=10)</td>
+						<td>{formatNsExact(VECTOR_INDEX.search.p50)}</td>
+						<td>{formatNsExact(VECTOR_INDEX.search.p95)}</td>
+					</tr>
+				</tbody>
+			</table>
+			<RunSource source={VECTOR_SOURCE} />
+
+			<Note>
+				This run used IVF. On 2026-02-08 the default ANN algorithm of{" "}
+				<code>VectorIndex</code> changed to IVF-PQ, and{" "}
+				<code>vector_bench</code> uses the default, so rerunning the command
+				below now measures IVF-PQ. <code>docs/BENCHMARKS.md</code> compares IVF
+				and IVF-PQ recall and latency.
+			</Note>
+
+			<h2 id="running">Running benchmarks</h2>
+			<p>
+				Command from <code>docs/BENCHMARKS.md</code>, run from the repository
+				root:
+			</p>
+			<CodeBlock code={VECTOR_COMMAND} language="bash" />
+			<p>
+				A Python version lives at{" "}
+				<code>ray-rs/python/benchmarks/benchmark_vector.py</code>; its results
+				are not published.
+			</p>
+		</DocPage>
+	);
+}
+
+function CrossLanguagePage() {
+	return (
+		<DocPage slug="benchmarks/cross-language">
+			<p>
+				Rust and Python run the same graph benchmark, so their numbers compare
+				directly. The TypeScript benchmark measures the fluent API against the
+				low-level API on a smaller graph.
+			</p>
+
+			<h2 id="graph-benchmarks">Rust and Python</h2>
+			<p>
+				p50 latency from the single-file raw benchmark on the same 10k-node,
+				50k-edge graph.
+			</p>
+			<table>
+				<thead>
+					<tr>
+						<th>Operation</th>
+						<th>Rust p50</th>
+						<th>Python p50</th>
+					</tr>
+				</thead>
+				<tbody>
+					<For each={GRAPH_METRICS}>
+						{(metric) => (
+							<tr>
+								<td>{metric.label}</td>
+								<td>{formatNsExact(RUST_GRAPH[metric.id].p50)}</td>
+								<td>{formatNsExact(PYTHON_GRAPH[metric.id].p50)}</td>
+							</tr>
+						)}
+					</For>
+				</tbody>
+			</table>
+			<SourceNote
+				logs={[RUST_GRAPH_SOURCE.log, PYTHON_GRAPH_SOURCE.log]}
+				config={RUST_GRAPH_SOURCE.config}
+			/>
+
+			<h2 id="typescript-overhead">TypeScript: fluent vs low-level API</h2>
+			<p>
+				What the fluent API (<code>db.get</code>, <code>db.from().out()</code>)
+				costs over the low-level calls it wraps, measured in Node. This run uses
+				a smaller graph (1k nodes, 5k edges), so compare its rows with each
+				other, not with the Rust and Python table.
+			</p>
+			<table>
+				<thead>
+					<tr>
+						<th>Operation</th>
+						<th>Low-level p50</th>
+						<th>Fluent p50</th>
+						<th>Overhead</th>
+					</tr>
+				</thead>
+				<tbody>
+					<For each={TS_OVERHEAD}>
+						{(row) => (
+							<tr>
+								<td>{row.label}</td>
+								<td>{formatNsExact(row.lowLevel)}</td>
+								<td>{formatNsExact(row.fluent)}</td>
+								<td>{row.overhead.toFixed(2)}x</td>
+							</tr>
+						)}
+					</For>
+				</tbody>
+			</table>
+			<RunSource source={TS_OVERHEAD_SOURCE} />
+
+			<p>
+				Vector index numbers are on the{" "}
+				<a href="/docs/benchmarks/vector">vector benchmarks</a> page.
+			</p>
+
+			<h2 id="running">Running benchmarks</h2>
+			<p>
+				Commands from <code>docs/BENCHMARKS.md</code>, run from the repository
+				root. Rust core:
+			</p>
+			<CodeBlock code={RUST_GRAPH_COMMAND} language="bash" />
+			<p>Python bindings:</p>
+			<CodeBlock code={PYTHON_GRAPH_COMMAND} language="bash" />
+			<p>TypeScript, fluent vs low-level API:</p>
+			<CodeBlock code={TS_OVERHEAD_COMMAND} language="bash" />
+		</DocPage>
+	);
 }
 
 function DocPageContent(props: { slug: string }) {
-  const slug = props.slug
-
-  // Benchmarks Overview page (root level)
-  if (slug === 'benchmarks') {
-    return (
-      <DocPage slug={slug}>
-        <p>
-          Performance benchmarks for KiteDB across graph operations, vector
-          search, and bindings. Latest run: February 3, 2026. Raw logs live in{" "}
-          <code>docs/benchmarks/results/</code>.
-        </p>
-
-        <h2 id="benchmark-categories">Benchmark Categories</h2>
-        <ul>
-          <li>
-            <a href="/docs/benchmarks/graph">
-              <strong>Graph Benchmarks</strong>
-            </a>{" "}
-            – Single-file raw results (Rust + Python bindings)
-          </li>
-          <li>
-            <a href="/docs/benchmarks/vector">
-              <strong>Vector Benchmarks</strong>
-            </a>{" "}
-            – Vector index performance (Rust)
-          </li>
-          <li>
-            <a href="/docs/benchmarks/cross-language">
-              <strong>Cross-Language Benchmarks</strong>
-            </a>{" "}
-            – Rust vs Python, plus TypeScript API overhead
-          </li>
-        </ul>
-
-        <h2 id="test-environment">Test Environment</h2>
-        <ul>
-          <li>Apple M4, 16GB RAM</li>
-          <li>macOS 15.3 (Darwin 25.3.0)</li>
-          <li>Rust 1.88.0</li>
-          <li>Node 24.12.0</li>
-          <li>Bun 1.3.5</li>
-          <li>Python 3.12.8</li>
-        </ul>
-
-        <h2 id="highlights">Highlights (p50)</h2>
-
-        <h3 id="graph-highlights">Graph Operations</h3>
-        <table>
-          <thead>
-            <tr>
-              <th>Operation</th>
-              <th>Rust Core</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <td>Key lookup (random existing)</td>
-              <td>125ns</td>
-            </tr>
-            <tr>
-              <td>1-hop traversal (out)</td>
-              <td>208ns</td>
-            </tr>
-            <tr>
-              <td>Edge exists (random)</td>
-              <td>83ns</td>
-            </tr>
-            <tr>
-              <td>Batch write (100 nodes)</td>
-              <td>45.62us</td>
-            </tr>
-          </tbody>
-        </table>
-        <p>
-          <a href="/docs/benchmarks/graph">View detailed graph benchmarks →</a>
-        </p>
-
-        <h3 id="vector-highlights">Vector Index</h3>
-        <table>
-          <thead>
-            <tr>
-              <th>Operation</th>
-              <th>Rust Core</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <td>Set vectors (10k)</td>
-              <td>833ns</td>
-            </tr>
-            <tr>
-              <td>build_index()</td>
-              <td>801.95ms</td>
-            </tr>
-            <tr>
-              <td>get (random)</td>
-              <td>167ns</td>
-            </tr>
-            <tr>
-              <td>search (k=10, nProbe=10)</td>
-              <td>557.54us</td>
-            </tr>
-          </tbody>
-        </table>
-        <p>
-          <a href="/docs/benchmarks/vector">
-            View detailed vector benchmarks →
-          </a>
-        </p>
-
-        <h2 id="bindings">Bindings Snapshot (Single-File Raw, p50)</h2>
-        <table>
-          <thead>
-            <tr>
-              <th>Operation</th>
-              <th>Rust</th>
-              <th>Python</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <td>Key lookup (random existing)</td>
-              <td>125ns</td>
-              <td>208ns</td>
-            </tr>
-            <tr>
-              <td>1-hop traversal (out)</td>
-              <td>208ns</td>
-              <td>375ns</td>
-            </tr>
-            <tr>
-              <td>Edge exists (random)</td>
-              <td>83ns</td>
-              <td>125ns</td>
-            </tr>
-            <tr>
-              <td>Batch write (100 nodes)</td>
-              <td>45.62us</td>
-              <td>253.08us</td>
-            </tr>
-          </tbody>
-        </table>
-        <p>
-          <a href="/docs/benchmarks/cross-language">
-            View cross-language benchmarks →
-          </a>
-        </p>
-
-        <h2 id="parallel-write-scaling">Parallel Write Scaling (Single-File)</h2>
-        <p>
-          Writes don’t scale linearly with more writer threads. Commits must serialize WAL ordering
-          and delta application (see <code>commit_lock</code>), so the best ingest pattern is usually:
-          parallelize batch prep, funnel into 1 writer doing batched transactions.
-        </p>
-        <p class="text-sm text-slate-500">
-          Measured February 5, 2026 on local dev machine (10 CPUs). Full details and configs are in{" "}
-          <code>docs/BENCHMARKS.md</code>.
-        </p>
-
-        <h2 id="running">Running Benchmarks</h2>
-        <table>
-          <thead>
-            <tr>
-              <th>Command</th>
-              <th>Description</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <td>
-                <code>cargo run --release --example single_file_raw_bench --no-default-features</code>
-              </td>
-              <td>Rust single-file raw benchmark</td>
-            </tr>
-            <tr>
-              <td>
-                <code>python3 benchmark_single_file_raw.py</code>
-              </td>
-              <td>Python single-file raw benchmark</td>
-            </tr>
-            <tr>
-              <td>
-                <code>node --import @oxc-node/core/register benchmark/bench-fluent-vs-lowlevel.ts</code>
-              </td>
-              <td>TypeScript fluent vs low-level overhead</td>
-            </tr>
-            <tr>
-              <td>
-                <code>cargo run --release --example vector_bench --no-default-features</code>
-              </td>
-              <td>Rust vector index benchmark</td>
-            </tr>
-          </tbody>
-        </table>
-      </DocPage>
-    )
-  }
-
-  // Graph Benchmarks page
-  if (slug === 'benchmarks/graph') {
-    return (
-      <DocPage slug={slug}>
-        <p>
-          Measured graph performance for the single-file engine. Latest run: February 4, 2026.
-          Raw logs live in <code>docs/benchmarks/results/</code>.
-        </p>
-
-        <h2 id="test-configuration">Test Configuration</h2>
-        <ul>
-          <li>Nodes: 10,000</li>
-          <li>Edges: 50,000</li>
-          <li>Iterations: 10,000</li>
-          <li>Vector dims: 128</li>
-          <li>Vector count: 1,000</li>
-        </ul>
-
-        <h2 id="rust-core">Rust Core (single_file_raw_bench)</h2>
-
-        <table>
-          <thead>
-            <tr>
-              <th>Operation</th>
-              <th>p50</th>
-              <th>p95</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr><td>Key lookup (random existing)</td><td>125ns</td><td>291ns</td></tr>
-            <tr><td>1-hop traversal (out)</td><td>208ns</td><td>292ns</td></tr>
-            <tr><td>Edge exists (random)</td><td>83ns</td><td>125ns</td></tr>
-            <tr><td>Batch write (100 nodes)</td><td>34.08us</td><td>56.54us</td></tr>
-            <tr><td>Batch write (100 edges)</td><td>40.25us</td><td>65.58us</td></tr>
-            <tr><td>Batch write (100 edges + props)</td><td>172.33us</td><td>253.12us</td></tr>
-            <tr><td>get_node_vector()</td><td>125ns</td><td>209ns</td></tr>
-            <tr><td>has_node_vector()</td><td>42ns</td><td>84ns</td></tr>
-            <tr><td>Set vectors (batch 100)</td><td>94.33us</td><td>195.38us</td></tr>
-          </tbody>
-        </table>
-
-        <h2 id="parallel-write-scaling">Parallel Write Scaling Notes (2026-02-05)</h2>
-        <p>
-          Multi-writer write throughput saturates quickly because commits serialize WAL ordering and
-          delta application. For max ingest throughput: parallelize prep, funnel into 1 writer doing
-          batched transactions.
-        </p>
-
-        <h3 id="parallel-nodes-edges">Nodes + Edges (create_nodes_batch + add_edges_batch)</h3>
-        <p class="text-sm text-slate-500">
-          Config: <code>--tx-per-thread 400 --batch-size 500 --edges-per-node 1 --edge-types 3 --edge-props 0 --wal-size 268435456</code>
-          .
-        </p>
-        <table>
-          <thead>
-            <tr>
-              <th>sync_mode</th>
-              <th>threads</th>
-              <th>node rate</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr><td>Normal</td><td>1</td><td>521.89K/s</td></tr>
-            <tr><td>Normal</td><td>2</td><td>577.43K/s</td></tr>
-            <tr><td>Normal</td><td>4</td><td>603.92K/s</td></tr>
-            <tr><td>Off</td><td>1</td><td>771.18K/s</td></tr>
-            <tr><td>Off</td><td>2</td><td>896.99K/s</td></tr>
-            <tr><td>Off</td><td>4</td><td>805.34K/s</td></tr>
-          </tbody>
-        </table>
-
-        <h3 id="parallel-vectors">Vectors (set_node_vector, dims=128)</h3>
-        <p class="text-sm text-slate-500">
-          Config: <code>--vector-dims 128 --tx-per-thread 200 --batch-size 500 --wal-size 1610612736 --sync-mode normal --no-auto-checkpoint</code>
-          .
-        </p>
-        <table>
-          <thead>
-            <tr>
-              <th>threads</th>
-              <th>vector rate</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr><td>1</td><td>529.31K/s</td></tr>
-            <tr><td>2</td><td>452.36K/s</td></tr>
-            <tr><td>4</td><td>388.78K/s</td></tr>
-          </tbody>
-        </table>
-
-        <h2 id="python-bindings">Python Bindings (benchmark_single_file_raw.py)</h2>
-
-        <table>
-          <thead>
-            <tr>
-              <th>Operation</th>
-              <th>p50</th>
-              <th>p95</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr><td>Key lookup (random existing)</td><td>208ns</td><td>334ns</td></tr>
-            <tr><td>1-hop traversal (out)</td><td>458ns</td><td>708ns</td></tr>
-            <tr><td>Edge exists (random)</td><td>167ns</td><td>209ns</td></tr>
-            <tr><td>Batch write (100 nodes)</td><td>49.71us</td><td>57.96us</td></tr>
-            <tr><td>Batch write (100 edges)</td><td>53.96us</td><td>64.21us</td></tr>
-            <tr><td>Batch write (100 edges + props)</td><td>436.58us</td><td>647.46us</td></tr>
-            <tr><td>get_node_vector()</td><td>1.25us</td><td>2.04us</td></tr>
-            <tr><td>has_node_vector()</td><td>167ns</td><td>208ns</td></tr>
-            <tr><td>Set vectors (batch 100)</td><td>241.83us</td><td>658.42us</td></tr>
-          </tbody>
-        </table>
-
-        <h2 id="sqlite">SQLite Baseline (single-file raw)</h2>
-        <p>
-          Apples-to-apples config: WAL mode, <code>synchronous=normal</code>,
-          <code>temp_store=MEMORY</code>, <code>locking_mode=EXCLUSIVE</code>,
-          <code>cache_size=256MB</code>, WAL autocheckpoint disabled. Edge props are
-          stored in a separate table; edges use <code>INSERT OR IGNORE</code> and
-          props use <code>INSERT OR REPLACE</code>. Script:{" "}
-          <code>docs/benchmarks/sqlite_single_file_raw_bench.py</code>.
-        </p>
-        <table>
-          <thead>
-            <tr>
-              <th>Operation</th>
-              <th>p50</th>
-              <th>p95</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr><td>Batch write (100 nodes)</td><td>120.67us</td><td>2.98ms</td></tr>
-          </tbody>
-        </table>
-
-        <h2 id="running">Running Benchmarks</h2>
-        <table>
-          <thead>
-            <tr>
-              <th>Command</th>
-              <th>Description</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <td><code>cargo run --release --example single_file_raw_bench --no-default-features -- --nodes 10000 --edges 50000 --iterations 10000</code></td>
-              <td>Rust single-file raw benchmark</td>
-            </tr>
-            <tr>
-              <td><code>python3 benchmark_single_file_raw.py --nodes 10000 --edges 50000 --iterations 10000</code></td>
-              <td>Python single-file raw benchmark</td>
-            </tr>
-          </tbody>
-        </table>
-      </DocPage>
-    )
-  }
-
-  // Vector Benchmarks page
-  if (slug === 'benchmarks/vector') {
-    return (
-      <DocPage slug={slug}>
-        <p>
-          Vector index benchmarks for KiteDB (Rust API). Latest run: February 3, 2026.
-          Raw logs live in <code>docs/benchmarks/results/2026-02-03-vector-bench-rust.txt</code>.
-        </p>
-
-        <h2 id="config">Test Configuration</h2>
-        <ul>
-          <li>Vectors: 10,000</li>
-          <li>Dimensions: 768</li>
-          <li>Iterations: 1,000</li>
-          <li>k: 10</li>
-          <li>nProbe: 10</li>
-        </ul>
-
-        <h2 id="results">Results (Rust)</h2>
-        <table>
-          <thead>
-            <tr>
-              <th>Operation</th>
-              <th>p50</th>
-              <th>p95</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr><td>Set vectors (10k)</td><td>833ns</td><td>2.12us</td></tr>
-            <tr><td>build_index()</td><td>801.95ms</td><td>801.95ms</td></tr>
-            <tr><td>get (random)</td><td>167ns</td><td>459ns</td></tr>
-            <tr><td>search (k=10, nProbe=10)</td><td>557.54us</td><td>918.79us</td></tr>
-          </tbody>
-        </table>
-
-        <h2 id="running">Running Benchmarks</h2>
-        <table>
-          <thead>
-            <tr>
-              <th>Command</th>
-              <th>Description</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr><td><code>cargo run --release --example vector_bench --no-default-features -- --vectors 10000 --dimensions 768 --iterations 1000 --k 10 --n-probe 10</code></td><td>Rust vector index benchmark</td></tr>
-            <tr><td><code>python3 benchmark_vector.py</code></td><td>Python vector index benchmark</td></tr>
-          </tbody>
-        </table>
-      </DocPage>
-    )
-  }
-
-  // Cross-Language Benchmarks page
-  if (slug === 'benchmarks/cross-language') {
-    return (
-      <DocPage slug={slug}>
-        <p>
-          Cross-language benchmarks for KiteDB bindings. Latest run: February 4, 2026.
-          Raw logs live in <code>docs/benchmarks/results/</code>.
-        </p>
-
-        <h2 id="graph-benchmarks">Single-File Raw (10k nodes / 50k edges)</h2>
-        <table>
-          <thead>
-            <tr>
-              <th>Operation</th>
-              <th>Rust p50</th>
-              <th>Python p50</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr><td>Key lookup (random existing)</td><td>125ns</td><td>208ns</td></tr>
-            <tr><td>1-hop traversal (out)</td><td>208ns</td><td>458ns</td></tr>
-            <tr><td>Edge exists (random)</td><td>83ns</td><td>167ns</td></tr>
-            <tr><td>Batch write (100 nodes)</td><td>34.08us</td><td>49.71us</td></tr>
-            <tr><td>Batch write (100 edges)</td><td>40.25us</td><td>53.96us</td></tr>
-            <tr><td>Batch write (100 edges + props)</td><td>172.33us</td><td>436.58us</td></tr>
-          </tbody>
-        </table>
-
-        <h2 id="typescript-overhead">TypeScript Fluent vs Low-Level (NAPI)</h2>
-        <p>Config: 1k nodes, 5k edges, 1k iterations.</p>
-        <table>
-          <thead>
-            <tr>
-              <th>Operation</th>
-              <th>Low-level p50</th>
-              <th>Fluent p50</th>
-              <th>Overhead</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr><td>Insert (single node + props)</td><td>115.25us</td><td>36.83us</td><td>0.32x</td></tr>
-            <tr><td>Key lookup (get w/ props)</td><td>208ns</td><td>1.63us</td><td>7.81x</td></tr>
-            <tr><td>Key lookup (getRef)</td><td>208ns</td><td>791ns</td><td>3.80x</td></tr>
-            <tr><td>Key lookup (getId)</td><td>208ns</td><td>333ns</td><td>1.60x</td></tr>
-            <tr><td>1-hop traversal (count)</td><td>1.21us</td><td>5.75us</td><td>4.76x</td></tr>
-            <tr><td>1-hop traversal (nodes)</td><td>1.21us</td><td>5.83us</td><td>4.83x</td></tr>
-            <tr><td>1-hop traversal (toArray)</td><td>1.21us</td><td>10.38us</td><td>8.59x</td></tr>
-            <tr><td>Pathfinding BFS (depth 5)</td><td>170.79us</td><td>167.71us</td><td>0.98x</td></tr>
-          </tbody>
-        </table>
-
-        <p>
-          Vector index benchmarks are published on the{" "}
-          <a href="/docs/benchmarks/vector">vector benchmarks</a> page.
-        </p>
-
-        <h2 id="running">Running Benchmarks</h2>
-        <table>
-          <thead>
-            <tr>
-              <th>Command</th>
-              <th>Description</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr><td><code>cargo run --release --example single_file_raw_bench --no-default-features -- --nodes 10000 --edges 50000 --iterations 10000</code></td><td>Rust single-file raw benchmark</td></tr>
-            <tr><td><code>python3 benchmark_single_file_raw.py --nodes 10000 --edges 50000 --iterations 10000</code></td><td>Python single-file raw benchmark</td></tr>
-            <tr><td><code>node --import @oxc-node/core/register benchmark/bench-fluent-vs-lowlevel.ts</code></td><td>TypeScript fluent vs low-level overhead</td></tr>
-          </tbody>
-        </table>
-      </DocPage>
-    )
-  }
-
-  // Default fallback for unknown pages
-  return (
-    <DocPage slug={slug}>
-      <p>This benchmark page is coming soon.</p>
-    </DocPage>
-  )
+	return (
+		<Switch
+			fallback={
+				<DocPage slug={props.slug}>
+					<p>This benchmark page is coming soon.</p>
+				</DocPage>
+			}
+		>
+			<Match when={props.slug === "benchmarks"}>
+				<OverviewPage />
+			</Match>
+			<Match when={props.slug === "benchmarks/graph"}>
+				<GraphPage />
+			</Match>
+			<Match when={props.slug === "benchmarks/vector"}>
+				<VectorPage />
+			</Match>
+			<Match when={props.slug === "benchmarks/cross-language"}>
+				<CrossLanguagePage />
+			</Match>
+		</Switch>
+	);
 }

@@ -9,13 +9,12 @@ export interface DocPage {
 
 export interface DocSection {
 	label: string;
-	collapsed?: boolean;
 	items: DocPage[];
 }
 
 export const docsStructure: DocSection[] = [
 	{
-		label: "Getting Started",
+		label: "Getting started",
 		items: [
 			{
 				title: "Introduction",
@@ -29,7 +28,7 @@ export const docsStructure: DocSection[] = [
 				slug: "getting-started/installation",
 			},
 			{
-				title: "Quick Start",
+				title: "Quick start",
 				description: "Build your first graph database in 5 minutes",
 				slug: "getting-started/quick-start",
 			},
@@ -39,7 +38,7 @@ export const docsStructure: DocSection[] = [
 		label: "Guides",
 		items: [
 			{
-				title: "Schema Definition",
+				title: "Schema definition",
 				description: "Define type-safe node and edge schemas",
 				slug: "guides/schema",
 			},
@@ -49,12 +48,12 @@ export const docsStructure: DocSection[] = [
 				slug: "guides/queries",
 			},
 			{
-				title: "Graph Traversal",
+				title: "Graph traversal",
 				description: "Navigate relationships in your graph",
 				slug: "guides/traversal",
 			},
 			{
-				title: "Vector Search",
+				title: "Vector search",
 				description: "Semantic similarity search with embeddings",
 				slug: "guides/vectors",
 			},
@@ -64,7 +63,7 @@ export const docsStructure: DocSection[] = [
 				slug: "guides/transactions",
 			},
 			{
-				title: "Performance Checklist",
+				title: "Performance checklist",
 				description: "Choose the fastest write path and config presets",
 				slug: "guides/performance",
 			},
@@ -76,15 +75,15 @@ export const docsStructure: DocSection[] = [
 		],
 	},
 	{
-		label: "API Reference",
+		label: "API reference",
 		items: [
 			{
-				title: "High-Level API",
+				title: "High-level API",
 				description: "Drizzle-style fluent API",
 				slug: "api/high-level",
 			},
 			{
-				title: "Low-Level API",
+				title: "Low-level API",
 				description: "Direct database primitives",
 				slug: "api/low-level",
 			},
@@ -104,25 +103,24 @@ export const docsStructure: DocSection[] = [
 				slug: "benchmarks",
 			},
 			{
-				title: "Graph Benchmarks",
+				title: "Graph benchmarks",
 				description: "Graph database performance",
 				slug: "benchmarks/graph",
 			},
 			{
-				title: "Vector Benchmarks",
+				title: "Vector benchmarks",
 				description: "Vector search performance",
 				slug: "benchmarks/vector",
 			},
 			{
-				title: "Cross-Language",
+				title: "Cross-language",
 				description: "Bindings performance comparison",
 				slug: "benchmarks/cross-language",
 			},
 		],
 	},
 	{
-		label: "Deep Dive",
-		collapsed: true,
+		label: "Internals",
 		items: [
 			{
 				title: "Architecture",
@@ -130,38 +128,38 @@ export const docsStructure: DocSection[] = [
 				slug: "internals/architecture",
 			},
 			{
-				title: "Snapshot + Delta",
+				title: "Snapshot and delta",
 				description: "The core storage model",
 				slug: "internals/snapshot-delta",
 			},
 			{
-				title: "CSR Format",
+				title: "CSR format",
 				description: "How edges are stored for fast traversal",
 				slug: "internals/csr",
 			},
 			{
-				title: "Single-File Format",
+				title: "Single-file format",
 				description: "The .kitedb file layout",
 				slug: "internals/single-file",
 			},
 			{
-				title: "WAL & Durability",
+				title: "WAL and durability",
 				description: "Crash recovery and write-ahead logging",
 				slug: "internals/wal",
 			},
 			{
-				title: "MVCC & Transactions",
+				title: "MVCC and transactions",
 				description: "Concurrent access and isolation",
 				slug: "internals/mvcc",
 			},
 			{
-				title: "Key Index",
+				title: "Key index",
 				description: "Fast node lookups by key",
 				slug: "internals/key-index",
 			},
 			{
 				title: "Performance",
-				description: "Why KiteDB is fast",
+				description: "How KiteDB keeps reads and writes fast",
 				slug: "internals/performance",
 			},
 		],

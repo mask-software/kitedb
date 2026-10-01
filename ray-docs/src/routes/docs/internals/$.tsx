@@ -1,7 +1,9 @@
-import { createFileRoute, useLocation } from "@tanstack/solid-router";
-import { Show } from "solid-js";
+import { createFileRoute } from "@tanstack/solid-router";
+import { type Component, Show } from "solid-js";
+import { Dynamic } from "solid-js/web";
+import { DocNotFound } from "~/components/doc-not-found";
 import DocPage from "~/components/doc-page";
-import { findDocBySlug } from "~/lib/docs";
+import { loadDocSlug } from "~/lib/doc-route";
 
 // Import page components
 import { ArchitecturePage } from "./-architecture";
@@ -14,90 +16,43 @@ import { SnapshotDeltaPage } from "./-snapshot-delta";
 import { WALPage } from "./-wal";
 
 export const Route = createFileRoute("/docs/internals/$")({
+	loader: loadDocSlug,
 	component: InternalsSplatPage,
+	notFoundComponent: () => (
+		<DocNotFound
+			backHref="/docs/internals/architecture"
+			backLabel="Back to internals"
+		/>
+	),
 });
 
 function InternalsSplatPage() {
-	const location = useLocation();
-	const slug = () => {
-		const path = location().pathname;
-		const match = path.match(/^\/docs\/(.+)$/);
-		return match ? match[1] : "";
-	};
-	const doc = () => findDocBySlug(slug());
-
-	return (
-		<Show when={doc()} fallback={<DocNotFound slug={slug()} />}>
-			<DocPageContent slug={slug()} />
-		</Show>
-	);
+	const data = Route.useLoaderData();
+	return <DocPageContent slug={data().slug} />;
 }
 
-function DocNotFound(props: { slug: string }) {
-	return (
-		<div class="max-w-4xl mx-auto px-6 py-12">
-			<div class="text-center">
-				<h1 class="text-4xl font-extrabold text-slate-900 dark:text-white mb-4">
-					Page Not Found
-				</h1>
-				<p class="text-lg text-slate-600 dark:text-slate-400 mb-8">
-					The internals page{" "}
-					<code class="px-2 py-1 bg-slate-100 dark:bg-slate-800 rounded">
-						{props.slug}
-					</code>{" "}
-					doesn't exist yet.
-				</p>
-				<a
-					href="/docs"
-					class="inline-flex items-center gap-2 px-6 py-3 bg-gradient-to-r from-cyan-500 to-violet-500 text-white font-semibold rounded-xl hover:shadow-lg hover:shadow-cyan-500/25 transition-all duration-200"
-				>
-					Back to Documentation
-				</a>
-			</div>
-		</div>
-	);
-}
+const PAGES: Record<string, Component> = {
+	"internals/architecture": ArchitecturePage,
+	"internals/snapshot-delta": SnapshotDeltaPage,
+	"internals/csr": CSRPage,
+	"internals/single-file": SingleFilePage,
+	"internals/wal": WALPage,
+	"internals/mvcc": MVCCPage,
+	"internals/key-index": KeyIndexPage,
+	"internals/performance": PerformancePage,
+};
 
 function DocPageContent(props: { slug: string }) {
-	const slug = props.slug;
-
-	// Route to the appropriate page component
-	if (slug === "internals/architecture") {
-		return <ArchitecturePage />;
-	}
-
-	if (slug === "internals/snapshot-delta") {
-		return <SnapshotDeltaPage />;
-	}
-
-	if (slug === "internals/csr") {
-		return <CSRPage />;
-	}
-
-	if (slug === "internals/single-file") {
-		return <SingleFilePage />;
-	}
-
-	if (slug === "internals/wal") {
-		return <WALPage />;
-	}
-
-	if (slug === "internals/mvcc") {
-		return <MVCCPage />;
-	}
-
-	if (slug === "internals/key-index") {
-		return <KeyIndexPage />;
-	}
-
-	if (slug === "internals/performance") {
-		return <PerformancePage />;
-	}
-
-	// Default fallback
 	return (
-		<DocPage slug={slug}>
-			<p>This internals documentation is coming soon.</p>
-		</DocPage>
+		<Show
+			when={PAGES[props.slug]}
+			fallback={
+				<DocPage slug={props.slug}>
+					<p>This internals page is coming soon.</p>
+				</DocPage>
+			}
+		>
+			{(page) => <Dynamic component={page()} />}
+		</Show>
 	);
 }

@@ -53,8 +53,9 @@ export function search(query: string, limit = 10): SearchResult[] {
   if (!query.trim()) return []
   
   const index = getSearchIndex()
-  const results = index.search(query, { limit })
-  
+  // MiniSearch has no limit option; results come back sorted by score
+  const results = index.search(query).slice(0, limit)
+
   return results.map((result) => ({
     id: result.id as string,
     title: result.title as string,

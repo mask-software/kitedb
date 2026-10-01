@@ -1,277 +1,248 @@
-import type { Component } from 'solid-js'
-import { createSignal, createEffect, onMount, onCleanup, For, Show } from 'solid-js'
-import { useNavigate } from '@tanstack/solid-router'
-import { Search, X } from 'lucide-solid'
-import { search, type SearchResult } from '~/lib/search'
+import { useNavigate } from "@tanstack/solid-router";
+import { CornerDownLeft, FileText, Search } from "lucide-solid";
+import type { Component } from "solid-js";
+import {
+	createEffect,
+	createSignal,
+	For,
+	onCleanup,
+	onMount,
+	Show,
+} from "solid-js";
+import { findDocBySlug, findSectionBySlug } from "~/lib/docs";
+import { type SearchResult, search } from "~/lib/search";
 
-// Recommended pages shown when search is empty
-const RECOMMENDED_PAGES: SearchResult[] = [
-  { id: 'quick-start', title: 'Quick Start', description: 'Build your first graph database in 5 minutes', slug: 'getting-started/quick-start', section: 'Getting Started', score: 1 },
-  { id: 'schema', title: 'Schema Definition', description: 'Define type-safe node and edge schemas', slug: 'guides/schema', section: 'Guides', score: 1 },
-  { id: 'vectors', title: 'Vector Search', description: 'Semantic similarity search with embeddings', slug: 'guides/vectors', section: 'Guides', score: 1 },
-]
+// Shown before the user types anything
+const RECOMMENDED_SLUGS = [
+	"getting-started/quick-start",
+	"guides/schema",
+	"guides/traversal",
+	"guides/vectors",
+];
+
+const RECOMMENDED_PAGES: SearchResult[] = RECOMMENDED_SLUGS.flatMap((slug) => {
+	const doc = findDocBySlug(slug);
+	return doc
+		? [
+				{
+					id: slug,
+					title: doc.title,
+					description: doc.description,
+					slug,
+					section: findSectionBySlug(slug)?.label ?? "",
+					score: 1,
+				},
+			]
+		: [];
+});
 
 interface SearchDialogProps {
-  open: boolean
-  onClose: () => void
+	open: boolean;
+	onClose: () => void;
 }
 
 export const SearchDialog: Component<SearchDialogProps> = (props) => {
-  const [query, setQuery] = createSignal('')
-  const [results, setResults] = createSignal<SearchResult[]>([])
-  const [selectedIndex, setSelectedIndex] = createSignal(0)
-  const navigate = useNavigate()
-  let inputRef: HTMLInputElement | undefined
-  let dialogRef: HTMLDivElement | undefined
+	const [query, setQuery] = createSignal("");
+	const [selectedIndex, setSelectedIndex] = createSignal(0);
+	const navigate = useNavigate();
+	let inputRef: HTMLInputElement | undefined;
 
-  // Search when query changes
-  createEffect(() => {
-    const q = query()
-    const searchResults = search(q, 8)
-    setResults(searchResults)
-    setSelectedIndex(0)
-  })
+	const results = () => search(query(), 8);
+	const activeList = () =>
+		query().trim().length === 0 ? RECOMMENDED_PAGES : results();
 
-  // Focus input when dialog opens
-  createEffect(() => {
-    if (props.open) {
-      setTimeout(() => inputRef?.focus(), 10)
-    } else {
-      setQuery('')
-      setResults([])
-    }
-  })
+	createEffect(() => {
+		query();
+		setSelectedIndex(0);
+	});
 
-  // Get active list (search results or recommended pages)
-  const activeList = () => results().length > 0 ? results() : (query().length === 0 ? RECOMMENDED_PAGES : [])
+	createEffect(() => {
+		if (props.open) {
+			setTimeout(() => inputRef?.focus(), 10);
+		} else {
+			setQuery("");
+		}
+	});
 
-  // Handle keyboard navigation
-  const handleKeyDown = (e: KeyboardEvent) => {
-    const list = activeList()
-    
-    switch (e.key) {
-      case 'ArrowDown':
-        e.preventDefault()
-        setSelectedIndex((i) => Math.min(i + 1, list.length - 1))
-        break
-      case 'ArrowUp':
-        e.preventDefault()
-        setSelectedIndex((i) => Math.max(i - 1, 0))
-        break
-      case 'Enter':
-        e.preventDefault()
-        if (list[selectedIndex()]) {
-          navigateToResult(list[selectedIndex()])
-        }
-        break
-      case 'Escape':
-        e.preventDefault()
-        props.onClose()
-        break
-    }
-  }
+	const navigateToResult = (result: SearchResult) => {
+		navigate({ to: result.slug ? `/docs/${result.slug}` : "/docs" });
+		props.onClose();
+	};
 
-  const navigateToResult = (result: SearchResult) => {
-    const path = result.slug ? `/docs/${result.slug}` : '/docs'
-    navigate({ to: path })
-    props.onClose()
-  }
+	const handleKeyDown = (event: KeyboardEvent) => {
+		const list = activeList();
+		switch (event.key) {
+			case "ArrowDown":
+				event.preventDefault();
+				setSelectedIndex((i) => Math.min(i + 1, list.length - 1));
+				break;
+			case "ArrowUp":
+				event.preventDefault();
+				setSelectedIndex((i) => Math.max(i - 1, 0));
+				break;
+			case "Enter": {
+				event.preventDefault();
+				const selected = list[selectedIndex()];
+				if (selected) navigateToResult(selected);
+				break;
+			}
+			case "Escape":
+				event.preventDefault();
+				props.onClose();
+				break;
+		}
+	};
 
-  // Handle click outside
-  const handleBackdropClick = (e: MouseEvent) => {
-    if (e.target === e.currentTarget) {
-      props.onClose()
-    }
-  }
+	return (
+		<Show when={props.open}>
+			<div class="fixed inset-0 z-[100] flex items-start justify-center px-4 pt-[14vh]">
+				{/* Pointer-only dismissal; keyboard users close with Escape from the input */}
+				<div
+					class="absolute inset-0 bg-black/60 backdrop-blur-sm"
+					onClick={() => props.onClose()}
+					aria-hidden="true"
+				/>
+				<div
+					class="relative w-full max-w-xl overflow-hidden rounded-2xl border border-kite-line bg-kite-surface shadow-[0_40px_120px_-30px_rgba(0,0,0,0.9)]"
+					role="dialog"
+					aria-modal="true"
+					aria-label="Search documentation"
+				>
+					<div class="flex items-center gap-3 border-b border-kite-line px-4">
+						<Search
+							size={16}
+							class="shrink-0 text-slate-500"
+							aria-hidden="true"
+						/>
+						<input
+							ref={inputRef}
+							type="text"
+							value={query()}
+							onInput={(event) => setQuery(event.currentTarget.value)}
+							placeholder="Search the docs"
+							class="h-14 flex-1 bg-transparent text-[15px] text-white placeholder-slate-500 outline-none focus:outline-none focus-visible:ring-0"
+							onKeyDown={handleKeyDown}
+							role="combobox"
+							aria-expanded={activeList().length > 0}
+							aria-autocomplete="list"
+							aria-label="Search query"
+							aria-controls="search-results"
+							aria-activedescendant={
+								activeList().length > 0
+									? `search-option-${selectedIndex()}`
+									: undefined
+							}
+						/>
+						<kbd class="rounded border border-kite-line px-1.5 py-px font-mono text-[10px] text-slate-500">
+							esc
+						</kbd>
+					</div>
 
-  return (
-    <Show when={props.open}>
-      <div
-        class="fixed inset-0 z-[100] flex items-start justify-center pt-[15vh] px-4 bg-black/60 backdrop-blur-sm"
-        onClick={handleBackdropClick}
-        role="dialog"
-        aria-modal="true"
-        aria-label="Search documentation"
-      >
-        <div
-          ref={dialogRef}
-          class="w-full max-w-xl console-container overflow-hidden"
-          onKeyDown={handleKeyDown}
-        >
-          <div class="console-scanlines opacity-5" aria-hidden="true" />
-          
-          {/* Console header */}
-          <div class="relative flex items-center gap-3 px-4 py-2.5 bg-[#0a1628] border-b border-[#1a2a42]">
-            <div class="flex gap-1.5" aria-hidden="true">
-              <div class="w-2.5 h-2.5 rounded-full bg-[#ff5f57]" />
-              <div class="w-2.5 h-2.5 rounded-full bg-[#febc2e]" />
-              <div class="w-2.5 h-2.5 rounded-full bg-[#28c840]" />
-            </div>
-            <span class="text-xs font-mono text-slate-500">search — kitedb docs</span>
-          </div>
+					<div class="max-h-[52vh] overflow-y-auto p-2">
+						<Show
+							when={activeList().length > 0}
+							fallback={
+								<p class="px-4 py-10 text-center text-[14px] text-slate-500">
+									No pages match “{query()}”.
+								</p>
+							}
+						>
+							<Show when={query().trim().length === 0}>
+								<p class="px-3 pb-1 pt-2 font-mono text-[11px] uppercase tracking-[0.08em] text-slate-600">
+									Suggested
+								</p>
+							</Show>
+							<div id="search-results" role="listbox" aria-label="Results">
+								<For each={activeList()}>
+									{(result, index) => (
+										<div
+											id={`search-option-${index()}`}
+											role="option"
+											tabIndex={-1}
+											aria-selected={selectedIndex() === index()}
+											class="flex cursor-pointer items-start gap-3 rounded-lg px-3 py-2.5 transition-colors duration-100"
+											classList={{
+												"bg-white/[0.06]": selectedIndex() === index(),
+											}}
+											onClick={() => navigateToResult(result)}
+											onKeyDown={handleKeyDown}
+											onMouseEnter={() => setSelectedIndex(index())}
+										>
+											<FileText
+												size={15}
+												class="mt-0.5 shrink-0 text-slate-600"
+												aria-hidden="true"
+											/>
+											<span class="min-w-0 flex-1">
+												<span class="flex items-baseline gap-2">
+													<span class="text-[14px] font-medium text-slate-100">
+														{result.title}
+													</span>
+													<span class="text-[12px] text-slate-600">
+														{result.section}
+													</span>
+												</span>
+												<span class="mt-0.5 block truncate text-[13px] text-slate-500">
+													{result.description}
+												</span>
+											</span>
+											<Show when={selectedIndex() === index()}>
+												<CornerDownLeft
+													size={14}
+													class="mt-1 shrink-0 text-slate-500"
+													aria-hidden="true"
+												/>
+											</Show>
+										</div>
+									)}
+								</For>
+							</div>
+						</Show>
+					</div>
 
-          {/* Search input - console style */}
-          <div class="relative flex items-center gap-3 mx-4 my-4">
-            <span class="text-[#00d4ff] font-mono text-base flex-shrink-0">❯</span>
-            <input
-              ref={inputRef}
-              type="text"
-              value={query()}
-              onInput={(e) => setQuery(e.currentTarget.value)}
-              placeholder="search_docs..."
-              class="flex-1 px-3 py-1.5 rounded-md bg-[#0a1628]/50 border border-[#1a2a42] text-white placeholder-slate-600 outline-none ring-0 focus:outline-none focus:ring-0 focus-visible:outline-none focus-visible:ring-0 font-mono text-sm caret-[#00d4ff]"
-              aria-label="Search query"
-            />
-            <span class="console-cursor h-5 w-2 flex-shrink-0" aria-hidden="true" />
-          </div>
-
-          {/* Results */}
-          <div class="max-h-[50vh] overflow-y-auto border-t border-[#1a2a42]">
-            <Show
-              when={results().length > 0}
-              fallback={
-                <Show 
-                  when={query().length > 0}
-                  fallback={
-                    /* Recommended pages when no query */
-                    <div class="py-3">
-                      <div class="px-4 py-2 text-xs font-mono text-slate-600">
-                        <span class="text-slate-700">//</span> recommended
-                      </div>
-                      <For each={RECOMMENDED_PAGES}>
-                        {(page, index) => (
-                          <button
-                            type="button"
-                            class={`w-full flex items-start gap-3 px-4 py-3 text-left transition-colors ${
-                              selectedIndex() === index()
-                                ? 'bg-[#00d4ff]/10 border-l-2 border-[#00d4ff]'
-                                : 'hover:bg-[#1a2a42]/50 border-l-2 border-transparent'
-                            }`}
-                            onClick={() => navigateToResult(page)}
-                            onMouseEnter={() => setSelectedIndex(index())}
-                          >
-                            <span class={`font-mono text-xs flex-shrink-0 mt-0.5 ${
-                              selectedIndex() === index() ? 'text-[#00d4ff]' : 'text-slate-600'
-                            }`}>
-                              →
-                            </span>
-                            <div class="flex-1 min-w-0">
-                              <div class={`font-mono text-sm ${
-                                selectedIndex() === index() ? 'text-[#00d4ff]' : 'text-white'
-                              }`}>
-                                {page.title}
-                              </div>
-                              <div class="text-xs text-slate-500 truncate mt-0.5">
-                                {page.description}
-                              </div>
-                            </div>
-                            <Show when={selectedIndex() === index()}>
-                              <kbd class="px-1.5 py-0.5 rounded bg-[#1a2a42] text-[#00d4ff] text-xs font-mono flex-shrink-0">↵</kbd>
-                            </Show>
-                          </button>
-                        )}
-                      </For>
-                    </div>
-                  }
-                >
-                  <div class="px-4 py-8 text-center font-mono">
-                    <span class="text-slate-600">// </span>
-                    <span class="text-slate-500">no results for "</span>
-                    <span class="text-[#00d4ff]">{query()}</span>
-                    <span class="text-slate-500">"</span>
-                  </div>
-                </Show>
-              }
-            >
-              <ul class="py-2" role="listbox">
-                <For each={results()}>
-                  {(result, index) => (
-                    <li role="option" aria-selected={selectedIndex() === index()}>
-                      <button
-                        type="button"
-                        class={`w-full flex items-start gap-3 px-4 py-3 text-left transition-colors ${
-                          selectedIndex() === index()
-                            ? 'bg-[#00d4ff]/10 border-l-2 border-[#00d4ff]'
-                            : 'hover:bg-[#1a2a42]/50 border-l-2 border-transparent'
-                        }`}
-                        onClick={() => navigateToResult(result)}
-                        onMouseEnter={() => setSelectedIndex(index())}
-                      >
-                        <span class={`font-mono text-xs flex-shrink-0 mt-0.5 ${
-                          selectedIndex() === index() ? 'text-[#00d4ff]' : 'text-slate-600'
-                        }`}>
-                          →
-                        </span>
-                        <div class="flex-1 min-w-0">
-                          <div class={`font-mono text-sm ${
-                            selectedIndex() === index() ? 'text-[#00d4ff]' : 'text-white'
-                          }`}>
-                            {result.title}
-                          </div>
-                          <div class="text-xs text-slate-500 truncate mt-0.5">
-                            {result.description}
-                          </div>
-                          <div class="text-xs text-slate-600 mt-1 font-mono">
-                            <span class="text-slate-700">$</span> {result.section.toLowerCase().replace(/\s+/g, '_')}
-                          </div>
-                        </div>
-                        <Show when={selectedIndex() === index()}>
-                          <kbd class="px-1.5 py-0.5 rounded bg-[#1a2a42] text-[#00d4ff] text-xs font-mono flex-shrink-0">↵</kbd>
-                        </Show>
-                      </button>
-                    </li>
-                  )}
-                </For>
-              </ul>
-            </Show>
-          </div>
-
-          {/* Footer with keyboard hints - console style */}
-          <div class="flex items-center gap-6 px-4 py-2.5 border-t border-[#1a2a42] bg-[#0a1628]/50 text-xs font-mono text-slate-600">
-            <span class="flex items-center gap-1.5">
-              <kbd class="px-1.5 py-0.5 rounded bg-[#1a2a42] text-slate-500">↑↓</kbd>
-              <span class="text-slate-500">nav</span>
-            </span>
-            <span class="flex items-center gap-1.5">
-              <kbd class="px-1.5 py-0.5 rounded bg-[#1a2a42] text-slate-500">↵</kbd>
-              <span class="text-slate-500">open</span>
-            </span>
-            <span class="flex items-center gap-1.5">
-              <kbd class="px-1.5 py-0.5 rounded bg-[#1a2a42] text-slate-500">esc</kbd>
-              <span class="text-slate-500">close</span>
-            </span>
-          </div>
-        </div>
-      </div>
-    </Show>
-  )
-}
+					<div class="flex items-center gap-5 border-t border-kite-line px-4 py-2.5 text-[12px] text-slate-500">
+						<span class="flex items-center gap-1.5">
+							<kbd class="rounded border border-kite-line px-1 font-mono text-[10px]">
+								↑↓
+							</kbd>
+							navigate
+						</span>
+						<span class="flex items-center gap-1.5">
+							<kbd class="rounded border border-kite-line px-1 font-mono text-[10px]">
+								↵
+							</kbd>
+							open
+						</span>
+					</div>
+				</div>
+			</div>
+		</Show>
+	);
+};
 
 // Global search state
-const [globalSearchOpen, setGlobalSearchOpen] = createSignal(false)
+const [globalSearchOpen, setGlobalSearchOpen] = createSignal(false);
 
 export const searchDialog = {
-  isOpen: globalSearchOpen,
-  open: () => setGlobalSearchOpen(true),
-  close: () => setGlobalSearchOpen(false),
-}
+	isOpen: globalSearchOpen,
+	open: () => setGlobalSearchOpen(true),
+	close: () => setGlobalSearchOpen(false),
+};
 
-// Component that sets up the keyboard shortcut listener
+/** Registers the ⌘K / Ctrl+K shortcut that opens search. */
 export const SearchKeyboardShortcut: Component = () => {
-  onMount(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      // Cmd/Ctrl + K to open search
-      if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
-        e.preventDefault()
-        setGlobalSearchOpen(true)
-      }
-    }
+	onMount(() => {
+		const handleKeyDown = (event: KeyboardEvent) => {
+			if ((event.metaKey || event.ctrlKey) && event.key === "k") {
+				event.preventDefault();
+				setGlobalSearchOpen(true);
+			}
+		};
+		document.addEventListener("keydown", handleKeyDown);
+		onCleanup(() => document.removeEventListener("keydown", handleKeyDown));
+	});
 
-    document.addEventListener('keydown', handleKeyDown)
-    onCleanup(() => document.removeEventListener('keydown', handleKeyDown))
-  })
+	return null;
+};
 
-  return null
-}
-
-export default SearchDialog
+export default SearchDialog;

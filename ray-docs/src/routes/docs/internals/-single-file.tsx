@@ -1,529 +1,419 @@
+import { For, type JSX, Show } from "solid-js";
 import DocPage from "~/components/doc-page";
+import {
+	Code,
+	Figure,
+	FlowItem,
+	Steps,
+	type Accent,
+	type Step,
+} from "./-components";
 
 // ============================================================================
-// SINGLE-FILE SPECIFIC COMPONENTS
+// SHARED DIAGRAM PIECES
 // ============================================================================
 
-// File layout diagram
-function FileLayoutDiagram() {
+interface Field {
+	name: string;
+	value: string;
+	mono?: boolean;
+	detail?: string;
+}
+
+/** Two-column field list used for the header and snapshot sections. */
+function FieldList(props: { fields: Field[] }) {
 	return (
-		<div class="my-6 rounded-xl border border-cyan-500/30 bg-gradient-to-br from-slate-900 to-slate-800 p-5 shadow-lg">
-			<div class="space-y-0">
-				{/* Header */}
-				<div class="rounded-t-lg border-2 border-cyan-500/40 bg-cyan-500/10 p-4">
-					<div class="flex items-center justify-between">
-						<div class="flex items-center gap-3">
-							<svg
-								class="w-5 h-5 text-cyan-400"
-								viewBox="0 0 24 24"
-								fill="none"
-								stroke="currentColor"
-								stroke-width="2"
-							>
-								<path
-									stroke-linecap="round"
-									stroke-linejoin="round"
-									d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
-								/>
-							</svg>
-							<span class="font-semibold text-cyan-400">Header</span>
-						</div>
-						<span class="text-xs text-cyan-400/70 font-mono">4 KB</span>
-					</div>
-					<p class="text-xs text-slate-400 mt-1 ml-8">
-						Database metadata, pointers, checksums
-					</p>
-				</div>
-
-				{/* WAL Area */}
-				<div class="border-2 border-t-0 border-violet-500/40 bg-violet-500/5 p-4">
-					<div class="flex items-center justify-between mb-3">
-						<div class="flex items-center gap-3">
-							<svg
-								class="w-5 h-5 text-violet-400"
-								viewBox="0 0 24 24"
-								fill="none"
-								stroke="currentColor"
-								stroke-width="2"
-							>
-								<path
-									stroke-linecap="round"
-									stroke-linejoin="round"
-									d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
-								/>
-							</svg>
-							<span class="font-semibold text-violet-400">WAL Area</span>
-						</div>
-						<span class="text-xs text-violet-400/70 font-mono">~64 MB</span>
-					</div>
-					{/* Inner regions */}
-					<div class="ml-8 space-y-2">
-						<div class="rounded border border-violet-500/30 bg-violet-500/10 px-3 py-2 flex justify-between items-center">
-							<span class="text-sm text-violet-300">Primary Region</span>
-							<span class="text-xs text-slate-500">75% — normal writes</span>
-						</div>
-						<div class="rounded border border-violet-500/20 bg-violet-500/5 px-3 py-2 flex justify-between items-center">
-							<span class="text-sm text-violet-300/70">Secondary Region</span>
-							<span class="text-xs text-slate-500">
-								25% — during checkpoint
+		<dl class="divide-y divide-kite-line/70 text-[14px]">
+			<For each={props.fields}>
+				{(field) => (
+					<div class="grid gap-x-4 gap-y-0.5 py-2.5 first:pt-0 last:pb-0 sm:grid-cols-[11rem_1fr]">
+						<dt class="text-slate-200">{field.name}</dt>
+						<dd class="text-slate-400">
+							<span class={field.mono ? "font-mono text-[13px]" : undefined}>
+								{field.value}
 							</span>
-						</div>
+							<Show when={field.detail}>
+								<span class="ml-2 text-[13px] text-slate-500">
+									{field.detail}
+								</span>
+							</Show>
+						</dd>
 					</div>
-				</div>
+				)}
+			</For>
+		</dl>
+	);
+}
 
-				{/* Snapshot Area */}
-				<div class="rounded-b-lg border-2 border-t-0 border-emerald-500/40 bg-emerald-500/5 p-4">
-					<div class="flex items-center justify-between">
-						<div class="flex items-center gap-3">
-							<svg
-								class="w-5 h-5 text-emerald-400"
-								viewBox="0 0 24 24"
-								fill="none"
-								stroke="currentColor"
-								stroke-width="2"
-							>
-								<path
-									stroke-linecap="round"
-									stroke-linejoin="round"
-									d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4"
-								/>
-							</svg>
-							<span class="font-semibold text-emerald-400">Snapshot Area</span>
-						</div>
-						<span class="text-xs text-emerald-400/70 font-mono">grows</span>
-					</div>
-					<p class="text-xs text-slate-400 mt-1 ml-8">
-						CSR data, compressed with zstd
-					</p>
-				</div>
-			</div>
+/** Short note describing how v0.2.18 and earlier behaved. */
+function VersionNote(props: { children: JSX.Element }) {
+	return (
+		<div class="my-6 rounded-lg border border-kite-line bg-white/[0.02] px-4 py-3 text-[14px] text-slate-400">
+			<span class="text-slate-200">v0.2.18 and earlier:</span> {props.children}
 		</div>
 	);
 }
 
-// Header contents visualization
-function HeaderContents() {
+// ============================================================================
+// SINGLE-FILE DIAGRAMS
+// ============================================================================
+
+const REGION_BAR: Record<Accent, string> = {
+	red: "bg-red-400/60",
+	cyan: "bg-kite-cyan/60",
+	violet: "bg-kite-violet/60",
+	mint: "bg-kite-mint/60",
+	amber: "bg-amber-400/60",
+	slate: "bg-slate-500/60",
+};
+
+function FileRegion(props: {
+	name: string;
+	size: string;
+	accent: Accent;
+	children: JSX.Element;
+}) {
 	return (
-		<div class="my-6 rounded-xl border border-cyan-500/30 bg-gradient-to-br from-slate-900 to-slate-800 p-5 shadow-lg">
-			<div class="flex items-center gap-2 mb-4">
-				<svg
-					class="w-5 h-5 text-cyan-400"
-					viewBox="0 0 24 24"
-					fill="none"
-					stroke="currentColor"
-					stroke-width="2"
-				>
-					<path
-						stroke-linecap="round"
-						stroke-linejoin="round"
-						d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
-					/>
-				</svg>
-				<h4 class="font-semibold text-cyan-400">Header Contents</h4>
-				<span class="text-xs text-slate-500 ml-auto">
-					offset 0, always 4 KB
+		<div class="relative px-4 py-3.5">
+			<span
+				class={`absolute top-0 bottom-0 left-0 w-0.5 ${REGION_BAR[props.accent]}`}
+				aria-hidden="true"
+			/>
+			<div class="flex items-baseline justify-between gap-4">
+				<span class="text-[15px] font-semibold text-white">{props.name}</span>
+				<span class="shrink-0 font-mono text-[12px] text-slate-500">
+					{props.size}
 				</span>
 			</div>
-			<div class="space-y-1.5">
-				<HeaderRow
-					connector="├"
-					name="Magic bytes"
-					value={`"KITE" + version`}
-				/>
-				<HeaderRow connector="├" name="Page size" value="4096 (default)" />
-				<HeaderRow
-					connector="├"
-					name="Snapshot location"
-					value="Start page, page count"
-				/>
-				<HeaderRow
-					connector="├"
-					name="WAL location"
-					value="Start page, page count"
-				/>
-				<HeaderRow
-					connector="├"
-					name="WAL pointers"
-					value="Head and tail positions"
-				/>
-				<HeaderRow
-					connector="├"
-					name="Counters"
-					value="Max node ID, next tx ID"
-				/>
-				<HeaderRow
-					connector="├"
-					name="Snapshot generation"
-					value="Incremented on checkpoint"
-				/>
-				<HeaderRow
-					connector="└"
-					name="Checksums"
-					value="CRC32C of header data"
-				/>
-			</div>
+			<div class="mt-1 text-[14px] text-slate-400">{props.children}</div>
 		</div>
 	);
 }
 
-function HeaderRow(props: { connector: string; name: string; value: string }) {
+function FileLayoutDiagram() {
 	return (
-		<div class="flex items-center gap-3 text-sm">
-			<span class="text-slate-600 font-mono">{props.connector}</span>
-			<span class="text-cyan-400 font-medium w-36">{props.name}</span>
-			<span class="text-slate-400">{props.value}</span>
-		</div>
+		<Figure title="Regions of a .kitedb file" accent="cyan">
+			<div class="divide-y divide-kite-line overflow-hidden rounded-lg border border-kite-line bg-white/[0.02]">
+				<FileRegion name="Header" size="pages 0–1" accent="cyan">
+					Two checksummed copies of the database metadata and region pointers
+					<div class="mt-3 flex overflow-hidden rounded-md border border-kite-line font-mono text-[12px]">
+						<div class="min-w-0 flex-1 border-r border-kite-line px-3 py-2">
+							<div class="text-slate-200">Page 0</div>
+							<div class="text-[11px] text-slate-500">header copy A</div>
+						</div>
+						<div class="min-w-0 flex-1 px-3 py-2">
+							<div class="text-slate-200">Page 1</div>
+							<div class="text-[11px] text-slate-500">header copy B</div>
+						</div>
+					</div>
+				</FileRegion>
+				<FileRegion
+					name="WAL area"
+					size="from page 2, 4 MB default"
+					accent="mint"
+				>
+					Write-ahead log, split into two regions
+					<div class="mt-3 flex overflow-hidden rounded-md border border-kite-line font-mono text-[12px]">
+						<div class="min-w-0 flex-1 border-r border-kite-line bg-kite-mint/[0.07] px-3 py-2">
+							<div class="text-slate-200">Primary</div>
+							<div class="text-[11px] text-slate-500">75%, normal writes</div>
+						</div>
+						<div class="w-1/4 min-w-[6.5rem] px-3 py-2">
+							<div class="text-slate-200">Secondary</div>
+							<div class="text-[11px] text-slate-500">
+								25%, during checkpoint
+							</div>
+						</div>
+					</div>
+				</FileRegion>
+				<FileRegion name="Snapshot area" size="grows" accent="violet">
+					CSR graph data, compressed with zstd. Each checkpoint writes a new
+					snapshot to a free region.
+				</FileRegion>
+			</div>
+		</Figure>
 	);
 }
 
-// Atomic checkpoint process
+function HeaderContents() {
+	const fields: Field[] = [
+		{
+			name: "Magic bytes",
+			value: '"KiteDB format 1\\0"',
+			mono: true,
+			detail: "16 bytes",
+		},
+		{ name: "Versions", value: "Format version, minimum reader version" },
+		{ name: "Page size", value: "4096", mono: true, detail: "default" },
+		{
+			name: "Change counter",
+			value: "Incremented on every header write; open uses the higher one",
+		},
+		{ name: "Snapshot location", value: "Start page, page count" },
+		{ name: "Snapshot generation", value: "Incremented on each checkpoint" },
+		{ name: "WAL location", value: "Start page, page count" },
+		{
+			name: "WAL pointers",
+			value: "Head and tail, plus each WAL region's head and the active region",
+		},
+		{
+			name: "Checkpoint flag",
+			value: "Set while a background checkpoint is running",
+		},
+		{
+			name: "Counters",
+			value: "Max node ID, next transaction ID, last commit timestamp",
+		},
+		{
+			name: "Checksums",
+			value: "CRC32C over the header fields and over the whole page",
+		},
+	];
+	return (
+		<Figure title="Header fields" accent="cyan" meta="pages 0 and 1">
+			<FieldList fields={fields} />
+		</Figure>
+	);
+}
+
 function AtomicCheckpointProcess() {
+	const steps: Step[] = [
+		{
+			text: "Build the new snapshot in memory from the current snapshot and the delta",
+			accent: "violet",
+		},
+		{
+			text: "Write it to a free region",
+			sub: "A retired snapshot region if the new snapshot fits, otherwise the end of the file. The current snapshot's pages are never overwritten.",
+			accent: "violet",
+		},
+		{
+			text: (
+				<>
+					<Code>fsync()</Code> so the snapshot is durable
+				</>
+			),
+			accent: "violet",
+		},
+		{
+			text: "Write a header that points to the new snapshot into the inactive header page",
+			accent: "violet",
+		},
+		{
+			text: (
+				<>
+					<Code>fsync()</Code> the header
+				</>
+			),
+			accent: "mint",
+			note: "new snapshot is current",
+		},
+		{
+			text: (
+				<>
+					Write the same header into the other page and <Code>fsync()</Code>
+				</>
+			),
+			sub: "Now neither header page points to the old snapshot",
+			accent: "slate",
+		},
+		{
+			text: "Retire the old snapshot's region so a later checkpoint can reuse it",
+			accent: "slate",
+		},
+	];
 	return (
-		<div class="my-6 rounded-xl border border-emerald-500/30 bg-gradient-to-br from-slate-900 to-slate-800 p-5 shadow-lg">
-			<h4 class="text-sm font-semibold text-slate-400 mb-4">
-				Checkpoint Process
-			</h4>
-
-			<div class="relative">
-				{/* Vertical line */}
-				<div class="absolute left-3 top-3 bottom-16 w-px bg-gradient-to-b from-cyan-500/50 via-violet-500/50 to-emerald-500/50" />
-
-				<div class="space-y-3">
-					<CheckpointAtomicStep
-						num={1}
-						text="Write new snapshot to free space at end of file"
-					/>
-					<CheckpointAtomicStep
-						num={2}
-						text="fsync() to ensure snapshot is durable"
-					/>
-					<CheckpointAtomicStep
-						num={3}
-						text="Update header with new snapshot location"
-					/>
-					<CheckpointAtomicStep num={4} text="fsync() header" highlight />
-					<CheckpointAtomicStep
-						num={5}
-						text="Old snapshot space becomes free"
-					/>
-				</div>
-			</div>
-
-			{/* Crash recovery note */}
-			<div class="mt-5 pt-4 border-t border-slate-700/50 space-y-2">
-				<p class="text-xs text-slate-500 font-medium">If crash occurs:</p>
-				<div class="grid grid-cols-2 gap-3 text-xs">
-					<div class="px-3 py-2 rounded bg-amber-500/10 border border-amber-500/20">
-						<span class="text-amber-400">Before step 4:</span>
-						<span class="text-slate-400 ml-1">Old snapshot valid</span>
+		<Figure title="Checkpoint sequence" accent="violet">
+			<Steps steps={steps} />
+			<div class="mt-5 border-t border-kite-line pt-4">
+				<p class="mb-2 text-[13px] text-slate-500">If the process crashes:</p>
+				<div class="grid gap-2 text-[13px] sm:grid-cols-2">
+					<div class="rounded-md border border-amber-400/25 bg-amber-400/[0.05] px-3 py-2">
+						<span class="font-medium text-amber-300">Before step 5:</span>{" "}
+						<span class="text-slate-300">
+							open uses the previous header, which still points to the old
+							snapshot and the WAL records it needs
+						</span>
 					</div>
-					<div class="px-3 py-2 rounded bg-emerald-500/10 border border-emerald-500/20">
-						<span class="text-emerald-400">After step 4:</span>
-						<span class="text-slate-400 ml-1">New snapshot valid</span>
+					<div class="rounded-md border border-kite-mint/25 bg-kite-mint/[0.05] px-3 py-2">
+						<span class="font-medium text-kite-mint">After step 5:</span>{" "}
+						<span class="text-slate-300">
+							open uses the new header and the new snapshot
+						</span>
 					</div>
 				</div>
-				<p class="text-xs text-slate-500 italic">
-					No intermediate state is possible.
+				<p class="mt-2 text-[13px] text-slate-500">
+					A header write torn by the crash fails its checksum, and open uses the
+					other header page.
 				</p>
 			</div>
-		</div>
+		</Figure>
 	);
 }
 
-function CheckpointAtomicStep(props: {
-	num: number;
-	text: string;
-	highlight?: boolean;
-}) {
-	const bgColor = () => {
-		if (props.highlight) return "bg-emerald-500/20 text-emerald-400";
-		if (props.num <= 2) return "bg-cyan-500/20 text-cyan-400";
-		if (props.num <= 4) return "bg-violet-500/20 text-violet-400";
-		return "bg-slate-500/20 text-slate-400";
-	};
-	return (
-		<div class="flex items-center gap-3 relative">
-			<span
-				class={`flex items-center justify-center w-6 h-6 rounded-full text-xs font-bold shrink-0 z-10 ${bgColor()}`}
-			>
-				{props.num}
-			</span>
-			<span
-				class={`text-sm ${props.highlight ? "text-emerald-300 font-medium" : "text-slate-300"}`}
-			>
-				{props.text}
-			</span>
-		</div>
-	);
-}
-
-// WAL dual region diagram
 function WALDualRegion() {
 	return (
-		<div class="my-6 rounded-xl border border-violet-500/30 bg-gradient-to-br from-slate-900 to-slate-800 p-5 shadow-lg">
-			<div class="flex items-center justify-between mb-4">
-				<h4 class="font-semibold text-violet-400">WAL Area</h4>
-				<span class="text-xs text-slate-500 font-mono">64 MB example</span>
-			</div>
-
-			{/* Visual representation */}
-			<div class="mb-4">
-				<div class="flex rounded-lg overflow-hidden border border-violet-500/30">
-					<div class="w-3/4 bg-violet-500/20 p-3 border-r border-violet-500/30">
-						<div class="text-sm font-medium text-violet-300">Primary</div>
-						<div class="text-xs text-slate-400">48 MB</div>
-					</div>
-					<div class="w-1/4 bg-violet-500/10 p-3">
-						<div class="text-sm font-medium text-violet-300/70">Secondary</div>
-						<div class="text-xs text-slate-400">16 MB</div>
-					</div>
+		<Figure title="WAL regions" accent="mint" meta="64 MB example">
+			<div class="flex overflow-hidden rounded-md border border-kite-line font-mono text-[12px]">
+				<div class="min-w-0 flex-1 border-r border-kite-line bg-kite-mint/[0.07] px-3 py-2.5">
+					<div class="text-slate-200">Primary</div>
+					<div class="text-[11px] text-slate-500">48 MB</div>
+				</div>
+				<div class="w-1/4 min-w-[6.5rem] px-3 py-2.5">
+					<div class="text-slate-200">Secondary</div>
+					<div class="text-[11px] text-slate-500">16 MB</div>
 				</div>
 			</div>
-
-			{/* Explanation */}
-			<div class="space-y-2 text-sm">
-				<p class="text-slate-400">
-					<span class="text-violet-400 font-medium">Why two regions?</span>
-				</p>
-				<ul class="space-y-1 text-slate-400 ml-4">
-					<li class="flex items-start gap-2">
-						<span class="text-violet-400 mt-1">•</span>
-						<span>Checkpoint reads primary to build new snapshot</span>
-					</li>
-					<li class="flex items-start gap-2">
-						<span class="text-violet-400 mt-1">•</span>
-						<span>Concurrent transactions write to secondary</span>
-					</li>
-					<li class="flex items-start gap-2">
-						<span class="text-emerald-400 mt-1">→</span>
-						<span class="text-emerald-400">
-							No blocking between reads and writes
-						</span>
-					</li>
-				</ul>
-			</div>
-		</div>
-	);
-}
-
-// Snapshot sections tree
-function SnapshotSections() {
-	return (
-		<div class="my-6 rounded-xl border border-emerald-500/30 bg-gradient-to-br from-slate-900 to-slate-800 p-5 shadow-lg">
-			<div class="flex items-center gap-2 mb-4">
-				<svg
-					class="w-5 h-5 text-emerald-400"
-					viewBox="0 0 24 24"
-					fill="none"
-					stroke="currentColor"
-					stroke-width="2"
-				>
-					<path
-						stroke-linecap="round"
-						stroke-linejoin="round"
-						d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4"
-					/>
-				</svg>
-				<h4 class="font-semibold text-emerald-400">Snapshot Sections</h4>
-			</div>
+			<p class="mt-4 mb-2 text-[14px] text-slate-300">
+				Two regions let a checkpoint run while writes continue:
+			</p>
 			<div class="space-y-1.5">
-				<SnapshotRow
-					connector="├"
-					name="Node ID mappings"
-					desc="Physical ↔ Logical ID translation"
-				/>
-				<SnapshotRow
-					connector="├"
-					name="Out-edge CSR"
-					desc="offsets[], destinations[], edge_types[]"
-					code
-				/>
-				<SnapshotRow
-					connector="├"
-					name="In-edge CSR"
-					desc="offsets[], sources[], edge_types[]"
-					code
-				/>
-				<SnapshotRow
-					connector="├"
-					name="Properties"
-					desc="Node and edge property values"
-				/>
-				<SnapshotRow
-					connector="├"
-					name="String table"
-					desc="Deduplicated string storage"
-				/>
-				<SnapshotRow
-					connector="├"
-					name="Key index"
-					desc="Hash-bucketed node key lookups"
-				/>
-				<SnapshotRow
-					connector="└"
-					name="Schema"
-					desc="Labels, edge types, property keys"
-				/>
+				<FlowItem color="violet">
+					The checkpoint builds the new snapshot from the in-memory delta, which
+					holds the changes logged in the primary region
+				</FlowItem>
+				<FlowItem color="emerald">
+					Transactions that commit in the meantime write to the secondary
+					region, so writers don't wait for the snapshot to be built
+				</FlowItem>
 			</div>
-			<div class="mt-4 pt-3 border-t border-slate-700/50 text-xs text-slate-500">
-				Each section independently compressed (zstd). Typical ratio: 40-60% of
-				raw size.
-			</div>
-		</div>
+		</Figure>
 	);
 }
 
-function SnapshotRow(props: {
-	connector: string;
-	name: string;
-	desc: string;
-	code?: boolean;
-}) {
+function SnapshotSections() {
+	const fields: Field[] = [
+		{ name: "Node ID mappings", value: "Physical ↔ logical ID translation" },
+		{
+			name: "Out-edge CSR",
+			value: "offsets[], destinations[], edge_types[]",
+			mono: true,
+		},
+		{
+			name: "In-edge CSR",
+			value: "offsets[], sources[], edge_types[]",
+			mono: true,
+		},
+		{ name: "Properties", value: "Node and edge property values" },
+		{ name: "String table", value: "Deduplicated string storage" },
+		{ name: "Key index", value: "Hash-bucketed node key lookups" },
+		{ name: "Schema", value: "Labels, edge types, property keys" },
+	];
 	return (
-		<div class="flex items-center gap-3 text-sm">
-			<span class="text-slate-600 font-mono">{props.connector}</span>
-			<span class="text-emerald-400 font-medium w-32">{props.name}</span>
-			<span
-				class={
-					props.code ? "text-slate-500 font-mono text-xs" : "text-slate-400"
-				}
-			>
-				{props.desc}
-			</span>
-		</div>
+		<Figure title="Snapshot sections" accent="violet">
+			<FieldList fields={fields} />
+			<p class="mt-4 border-t border-kite-line pt-3 text-[13px] text-slate-500">
+				Each section is compressed independently with zstd. Typical size: 40–60%
+				of the raw data.
+			</p>
+		</Figure>
 	);
 }
 
-// File growth visualization
+const GROWTH_ROWS = [
+	{
+		label: "Initial",
+		wal: "flex-1",
+		snapshot: "w-1 bg-kite-violet/25",
+		size: "~64 MB",
+	},
+	{
+		label: "100K nodes",
+		wal: "w-3/4",
+		snapshot: "w-1/5 bg-kite-violet/45",
+		size: "~72 MB",
+	},
+	{
+		label: "1M nodes",
+		wal: "w-1/2",
+		snapshot: "w-2/5 bg-kite-violet/45",
+		size: "~150 MB",
+	},
+];
+
 function FileGrowthDiagram() {
 	return (
-		<div class="my-6 rounded-xl border border-slate-600/30 bg-gradient-to-br from-slate-900 to-slate-800 p-5 shadow-lg">
-			<h4 class="text-sm font-semibold text-slate-400 mb-4">
-				File Size Examples
-			</h4>
-			<p class="text-xs text-slate-500 mb-4">
-				Example below assumes a 64MB WAL. Default WAL size is 1MB and
+		<Figure title="File size examples" accent="cyan" meta="64 MB WAL">
+			<p class="mb-4 text-[13px] text-slate-500">
+				These examples assume a 64 MB WAL. The default WAL size is 4 MB and is
 				configurable.
 			</p>
-
-			<div class="space-y-4">
-				{/* Initial */}
-				<div class="flex items-center gap-4">
-					<div class="w-20 text-xs text-slate-500">Initial</div>
-					<div class="flex-1 flex items-center gap-1">
-						<div class="h-6 w-1 bg-cyan-500/60 rounded" title="Header 4KB" />
-						<div class="h-6 flex-1 bg-violet-500/40 rounded" title="WAL 64MB (example)" />
-						<div
-							class="h-6 w-1 bg-emerald-500/40 rounded"
-							title="Empty snapshot"
-						/>
-					</div>
-					<div class="w-20 text-right text-xs text-slate-400 font-mono">~64 MB</div>
-				</div>
-
-				{/* 100K nodes */}
-				<div class="flex items-center gap-4">
-					<div class="w-20 text-xs text-slate-500">100K nodes</div>
-					<div class="flex-1 flex items-center gap-1">
-						<div class="h-6 w-1 bg-cyan-500/60 rounded" />
-						<div class="h-6 w-3/4 bg-violet-500/40 rounded" />
-						<div class="h-6 w-1/5 bg-emerald-500/60 rounded" />
-					</div>
-					<div class="w-20 text-right text-xs text-slate-400 font-mono">
-						~72 MB
-					</div>
-				</div>
-
-				{/* 1M nodes */}
-				<div class="flex items-center gap-4">
-					<div class="w-20 text-xs text-slate-500">1M nodes</div>
-					<div class="flex-1 flex items-center gap-1">
-						<div class="h-6 w-1 bg-cyan-500/60 rounded" />
-						<div class="h-6 w-1/2 bg-violet-500/40 rounded" />
-						<div class="h-6 w-2/5 bg-emerald-500/60 rounded" />
-					</div>
-					<div class="w-20 text-right text-xs text-slate-400 font-mono">
-						~150 MB
-					</div>
-				</div>
+			<div class="space-y-3">
+				<For each={GROWTH_ROWS}>
+					{(row) => (
+						<div class="grid grid-cols-[5.5rem_1fr_4rem] items-center gap-3">
+							<span class="text-[13px] text-slate-400">{row.label}</span>
+							<div class="flex h-4 items-stretch gap-0.5">
+								<div class="w-1 rounded-sm bg-kite-cyan/70" />
+								<div class={`rounded-sm bg-kite-mint/25 ${row.wal}`} />
+								<div class={`rounded-sm ${row.snapshot}`} />
+							</div>
+							<span class="text-right font-mono text-[12px] text-slate-200">
+								{row.size}
+							</span>
+						</div>
+					)}
+				</For>
 			</div>
-
-			{/* Legend */}
-			<div class="mt-4 pt-3 border-t border-slate-700/50 flex flex-wrap gap-4 text-xs">
-				<div class="flex items-center gap-1.5">
-					<div class="w-2 h-2 rounded-sm bg-cyan-500/60" />
-					<span class="text-slate-500">Header (fixed)</span>
-				</div>
-				<div class="flex items-center gap-1.5">
-					<div class="w-2 h-2 rounded-sm bg-violet-500/40" />
-					<span class="text-slate-500">WAL (configurable)</span>
-				</div>
-				<div class="flex items-center gap-1.5">
-					<div class="w-2 h-2 rounded-sm bg-emerald-500/60" />
-					<span class="text-slate-500">Snapshot (grows)</span>
-				</div>
+			<div class="mt-4 flex flex-wrap gap-x-5 gap-y-1.5 border-t border-kite-line pt-3 text-[12px] text-slate-500">
+				<span class="flex items-center gap-1.5">
+					<span class="h-2 w-2 rounded-sm bg-kite-cyan/70" />
+					Header (fixed)
+				</span>
+				<span class="flex items-center gap-1.5">
+					<span class="h-2 w-2 rounded-sm bg-kite-mint/25" />
+					WAL (configurable)
+				</span>
+				<span class="flex items-center gap-1.5">
+					<span class="h-2 w-2 rounded-sm bg-kite-violet/45" />
+					Snapshot (grows)
+				</span>
 			</div>
-		</div>
+		</Figure>
 	);
 }
 
-// Database open process
 function DatabaseOpenProcess() {
+	const steps: Step[] = [
+		{
+			text: "Lock the file",
+			sub: "Exclusive for a writable open, shared for a read-only open",
+			accent: "cyan",
+		},
+		{
+			text: "Read both header pages and use the newest one that passes its checksums",
+			sub: "A writable open converts a file in the old single-header layout first",
+			accent: "cyan",
+		},
+		{
+			text: "If a background checkpoint was interrupted, merge both WAL regions into the primary region",
+			sub: "Writable opens only; a read-only open fails with an error instead",
+			accent: "amber",
+		},
+		{
+			text: (
+				<>
+					<Code>mmap()</Code> the snapshot area
+				</>
+			),
+			accent: "violet",
+		},
+		{ text: "Parse snapshot sections", accent: "violet" },
+		{
+			text: "Replay committed WAL transactions, in commit order, to rebuild the delta",
+			accent: "slate",
+		},
+		{ text: "Ready for queries", accent: "mint", done: true },
+	];
 	return (
-		<div class="my-6 rounded-xl border border-cyan-500/30 bg-gradient-to-br from-slate-900 to-slate-800 p-5 shadow-lg">
-			<h4 class="text-sm font-semibold text-slate-400 mb-4">
-				Opening a Database
-			</h4>
-
-			<div class="relative">
-				{/* Vertical line */}
-				<div class="absolute left-3 top-3 bottom-12 w-px bg-gradient-to-b from-cyan-500/50 via-violet-500/50 to-emerald-500/50" />
-
-				<div class="space-y-2.5">
-					<OpenStep num={1} text="Read header (4 KB at offset 0)" />
-					<OpenStep num={2} text="Validate magic bytes and checksums" />
-					<OpenStep num={3} text="mmap() snapshot area (zero-copy)" />
-					<OpenStep num={4} text="Parse snapshot sections" />
-					<OpenStep num={5} text="Replay WAL to rebuild delta" />
-					<OpenStep num={6} text="Ready for queries" success />
-				</div>
-			</div>
-
-			{/* Recovery note */}
-			<div class="mt-4 pt-3 border-t border-slate-700/50">
-				<p class="text-xs text-slate-500">
-					<span class="text-amber-400">
-						If WAL replay finds incomplete transaction:
-					</span>
-					<span class="text-slate-400 ml-1">
-						Discard it (never committed). Recovery is automatic and fast.
-					</span>
-				</p>
-			</div>
-		</div>
-	);
-}
-
-function OpenStep(props: { num: number; text: string; success?: boolean }) {
-	const bgColor = () => {
-		if (props.success) return "bg-emerald-500/20 text-emerald-400";
-		if (props.num <= 2) return "bg-cyan-500/20 text-cyan-400";
-		if (props.num <= 4) return "bg-violet-500/20 text-violet-400";
-		return "bg-slate-500/20 text-slate-400";
-	};
-	return (
-		<div class="flex items-center gap-3 relative">
-			<span
-				class={`flex items-center justify-center w-6 h-6 rounded-full text-xs font-bold shrink-0 z-10 ${bgColor()}`}
-			>
-				{props.success ? "✓" : props.num}
-			</span>
-			<span
-				class={`text-sm ${props.success ? "text-emerald-400 font-medium" : "text-slate-300"}`}
-			>
-				{props.text}
-			</span>
-		</div>
+		<Figure title="Open sequence" accent="cyan">
+			<Steps steps={steps} />
+			<p class="mt-5 border-t border-kite-line pt-3 text-[13px] text-slate-400">
+				<span class="text-amber-300">Incomplete transactions</span> found during
+				WAL replay are discarded, since they never committed. Recovery runs
+				automatically on open.
+			</p>
+		</Figure>
 	);
 }
 
@@ -535,58 +425,99 @@ export function SingleFilePage() {
 	return (
 		<DocPage slug="internals/single-file">
 			<p>
-				KiteDB stores everything in a single <code>.kitedb</code> file. This
-				makes databases portable, simplifies deployment, and enables atomic
-				operations.
+				KiteDB stores a database in one <code>.kitedb</code> file containing a
+				header, a write-ahead log, and a snapshot. One file is easy to copy and
+				deploy, and the header records where the current snapshot and WAL are.
 			</p>
 
-			<h2 id="file-layout">File Layout</h2>
+			<h2 id="file-layout">File layout</h2>
 
 			<FileLayoutDiagram />
 
-			<h2 id="header">The Header</h2>
+			<VersionNote>
+				files have one header page (page 0), and the WAL starts at page 1. The
+				current version converts such a file on its first writable open: it
+				writes the recovered database to a temporary file and renames it over
+				the original, so a crash during conversion leaves the original intact.
+				Read-only opens use old files without converting them. Don't open a
+				converted file with v0.2.18 or earlier, which read and write only page
+				0.
+			</VersionNote>
+
+			<h2 id="header">The header</h2>
 
 			<p>
-				The header is 4 KB and contains all metadata needed to open the
-				database:
+				The header holds the metadata needed to open the database. KiteDB keeps
+				two copies of it, in pages 0 and 1 (4 KB each at the default page size).
+				Each header update is written to the copy that is not current, so the
+				current copy is never overwritten. On open, KiteDB checks both copies
+				and uses the valid one with the higher change counter. If a crash tears
+				a header write, that copy fails its checksum and the other copy is used.
 			</p>
 
 			<HeaderContents />
 
-			<h2 id="atomicity">Atomic Updates</h2>
+			<VersionNote>
+				the single header page was rewritten in place, so a torn header write
+				could leave the database unopenable.
+			</VersionNote>
+
+			<h2 id="atomicity">Atomic updates</h2>
 
 			<p>
-				The header enables atomic state transitions. A checkpoint works like
-				this:
+				A checkpoint writes the new snapshot to a different region than the
+				current one and then switches the header to it. Blocking and background
+				checkpoints follow the same order; the{" "}
+				<a href="/docs/internals/wal">WAL page</a> covers how background
+				checkpoints handle writes that arrive in the meantime.
 			</p>
 
 			<AtomicCheckpointProcess />
 
-			<h2 id="wal-area">WAL Area</h2>
+			<VersionNote>
+				the new snapshot overwrote the previous one, right after the WAL, so a
+				crash during a checkpoint could leave the file without a valid snapshot.
+			</VersionNote>
 
-			<p>The WAL area is a circular buffer divided into two regions:</p>
-			<p class="text-sm text-slate-400">
-				Default WAL size is 1MB. Auto-checkpoint is enabled by default and
-				triggers when WAL usage exceeds 80% of the active region. Increase WAL
-				size for high-throughput ingest. WAL size is fixed at creation; change it
-				via `resizeWal` (offline) or rebuild into a new file.
+			<h2 id="wal-area">WAL area</h2>
+
+			<p>
+				The WAL area is a fixed-size, append-only log divided into two regions.
+			</p>
+			<p>
+				The default WAL size is 4 MB. Auto-checkpoint is on by default and runs
+				when the active region is 50% full (<code>checkpointThreshold</code>).
+				Use a larger WAL for high-throughput ingest. The size is fixed when the
+				file is created; change it with <code>resizeWal</code> (offline) or
+				rebuild into a new file.
 			</p>
 
 			<WALDualRegion />
 
-			<h2 id="snapshot-area">Snapshot Area</h2>
+			<h2 id="snapshot-area">Snapshot area</h2>
 
-			<p>The snapshot area holds the CSR-formatted graph data:</p>
+			<p>The snapshot area holds the graph data in CSR format:</p>
 
 			<SnapshotSections />
 
-			<h2 id="growth">File Growth</h2>
+			<h2 id="growth">File growth</h2>
 
-			<p>The file grows in predictable ways:</p>
+			<p>
+				The header and WAL have fixed sizes; the snapshot grows with your data:
+			</p>
 
 			<FileGrowthDiagram />
 
-			<h2 id="vs-directory">Single-File vs Multi-File</h2>
+			<p>
+				Because a checkpoint never overwrites the current snapshot, the file can
+				hold a retired snapshot region next to the current one. A later
+				checkpoint reuses a retired region when the new snapshot fits, and
+				retired space at the end of the file is truncated. Retired regions are
+				tracked in memory, so space that is still retired when the database
+				closes stays in the file until you run <code>vacuum</code>.
+			</p>
+
+			<h2 id="vs-directory">Single-file vs multi-file</h2>
 
 			<p>
 				KiteDB previously supported a directory-based format. Single-file is now
@@ -597,7 +528,7 @@ export function SingleFilePage() {
 				<thead>
 					<tr>
 						<th>Aspect</th>
-						<th>Single-File</th>
+						<th>Single-file</th>
 						<th>Directory (legacy)</th>
 					</tr>
 				</thead>
@@ -625,18 +556,39 @@ export function SingleFilePage() {
 				</tbody>
 			</table>
 
-			<h2 id="opening">Opening a Database</h2>
+			<h2 id="opening">Opening a database</h2>
 
 			<DatabaseOpenProcess />
 
-			<h2 id="next">Next Steps</h2>
+			<p>
+				The file lock lets one writer or any number of readers use a file at a
+				time. A writable open fails if another open of the same file, in this
+				process or another, holds any lock on it. A read-only open fails only if
+				a writer holds it.
+			</p>
+			<p>
+				A read-only open asks the operating system for read access only and
+				never writes to the file. WAL replay rebuilds the delta in memory, and
+				closing the database leaves the file untouched. If recovery would have
+				to write, as after an interrupted background checkpoint, the read-only
+				open returns an error; open the database writable once to repair it.
+			</p>
+
+			<VersionNote>
+				opens took no file lock, so two processes could write the same file at
+				once. Read-only opens still opened the file for writing and could
+				rewrite the header on open and on close. WAL replay applied committed
+				transactions in arbitrary order instead of commit order.
+			</VersionNote>
+
+			<h2 id="next">Next steps</h2>
 			<ul>
 				<li>
-					<a href="/docs/internals/wal">WAL & Durability</a> – How the
+					<a href="/docs/internals/wal">WAL and durability</a>: how the
 					write-ahead log provides crash safety
 				</li>
 				<li>
-					<a href="/docs/internals/snapshot-delta">Snapshot + Delta</a> – How
+					<a href="/docs/internals/snapshot-delta">Snapshot and delta</a>: how
 					reads merge these two sources
 				</li>
 			</ul>

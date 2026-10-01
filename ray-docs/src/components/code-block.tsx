@@ -1,7 +1,6 @@
-import type { Component } from "solid-js";
-import { createSignal, createResource, Suspense, Show, For, createMemo } from "solid-js";
 import { Check, Copy } from "lucide-solid";
-import { highlightCode } from "~/lib/highlighter";
+import { type Component, createSignal, onCleanup, Show } from "solid-js";
+import { CodeView } from "~/components/code-view";
 
 interface CodeBlockProps {
 	code: string;
@@ -10,182 +9,96 @@ interface CodeBlockProps {
 	class?: string;
 	showLineNumbers?: boolean;
 	showHeader?: boolean;
-	/** Minimal inline style - just highlighted code with subtle background */
+	/** Minimal style: highlighted code on a subtle surface, no header or gutter */
 	inline?: boolean;
 }
 
+const LANGUAGE_LABELS: Record<string, string> = {
+	typescript: "TypeScript",
+	ts: "TypeScript",
+	tsx: "TSX",
+	javascript: "JavaScript",
+	js: "JavaScript",
+	rust: "Rust",
+	rs: "Rust",
+	python: "Python",
+	py: "Python",
+	bash: "Shell",
+	sh: "Shell",
+	shell: "Shell",
+	json: "JSON",
+};
+
 export const CodeBlock: Component<CodeBlockProps> = (props) => {
 	const [copied, setCopied] = createSignal(false);
-	const [highlightedHtml] = createResource(
-		() => ({ code: props.code, lang: props.language }),
-		async ({ code, lang }) => {
-			try {
-				return await highlightCode(code, lang || "text");
-			} catch (e) {
-				console.error("Highlighting failed:", e);
-				return null;
-			}
-		}
-	);
+	let resetTimer: ReturnType<typeof setTimeout> | undefined;
+	onCleanup(() => clearTimeout(resetTimer));
 
-	// Calculate line numbers
-	const lineCount = createMemo(() => props.code.split('\n').length);
-	const showLines = () => props.showLineNumbers ?? !props.inline;
-	const showHeader = () => props.showHeader ?? !props.inline;
+	const lang = () => props.language ?? "text";
+	const label = () =>
+		props.filename ??
+		(props.language ? LANGUAGE_LABELS[props.language] : undefined);
+	const showHeader = () => (props.showHeader ?? !props.inline) && !!label();
 
-	const copyToClipboard = async () => {
+	const copy = async () => {
 		try {
 			await navigator.clipboard.writeText(props.code);
 			setCopied(true);
-			setTimeout(() => setCopied(false), 2000);
-		} catch (err) {
-			console.error("Failed to copy:", err);
+			clearTimeout(resetTimer);
+			resetTimer = setTimeout(() => setCopied(false), 1800);
+		} catch (error) {
+			console.error("Failed to copy:", error);
 		}
 	};
+
+	const CopyButton = (buttonProps: { floating?: boolean }) => (
+		<button
+			type="button"
+			onClick={copy}
+			class="grid h-7 w-7 place-items-center rounded-md text-slate-500 transition-colors hover:bg-white/[0.06] hover:text-slate-200"
+			classList={{
+				"absolute right-2.5 top-2.5 bg-kite-bg/80 opacity-0 backdrop-blur group-hover:opacity-100 focus-visible:opacity-100":
+					buttonProps.floating,
+				"ml-auto": !buttonProps.floating,
+			}}
+			aria-label={copied() ? "Copied" : "Copy code"}
+		>
+			<Show when={copied()} fallback={<Copy size={13} aria-hidden="true" />}>
+				<Check size={13} class="text-kite-mint" aria-hidden="true" />
+			</Show>
+		</button>
+	);
 
 	return (
 		<Show
 			when={!props.inline}
 			fallback={
-				// Inline mode - minimal styling with just Shiki highlighting
-				<div class={`group relative ${props.class ?? ""}`}>
-					<Suspense
-						fallback={
-							<pre class="text-sm leading-relaxed p-4 rounded-lg bg-[#0d1117] overflow-x-auto">
-								<code class="font-mono text-slate-300 whitespace-pre">
-									{props.code}
-								</code>
-							</pre>
-						}
-					>
-						<Show
-							when={highlightedHtml()}
-							fallback={
-								<pre class="text-sm leading-relaxed p-4 rounded-lg bg-[#0d1117] overflow-x-auto">
-									<code class="font-mono text-slate-300 whitespace-pre">
-										{props.code}
-									</code>
-								</pre>
-							}
-						>
-							<div
-								class="shiki-wrapper [&_pre]:text-sm [&_pre]:leading-relaxed [&_pre]:p-4 [&_pre]:rounded-lg [&_pre]:overflow-x-auto [&_code]:font-mono"
-								innerHTML={highlightedHtml() ?? undefined}
-							/>
-						</Show>
-					</Suspense>
+				<div
+					class={`group relative my-5 overflow-x-auto rounded-lg border border-kite-line bg-white/[0.02] py-3 ${props.class ?? ""}`}
+				>
+					<CodeView code={props.code} lang={lang()} showLineNumbers={false} />
+					<CopyButton floating />
 				</div>
 			}
 		>
-			{/* Full mode with console styling */}
 			<div
-				class={`group relative console-container overflow-hidden ${props.class ?? ""}`}
+				class={`group relative my-6 overflow-hidden rounded-xl border border-kite-line bg-[#070a12] ${props.class ?? ""}`}
 			>
-				<div class="console-scanlines opacity-5" aria-hidden="true" />
-
-				{/* Console-style header */}
-				<Show when={showHeader() && (props.filename || props.language)}>
-					<div class="relative flex items-center justify-between px-4 py-2.5 bg-[#0a1628] border-b border-[#1a2a42]">
-						<div class="flex items-center gap-3">
-							{/* Terminal dots */}
-							<div class="flex gap-1.5" aria-hidden="true">
-								<div class="w-2.5 h-2.5 rounded-full bg-[#ff5f57]" />
-								<div class="w-2.5 h-2.5 rounded-full bg-[#febc2e]" />
-								<div class="w-2.5 h-2.5 rounded-full bg-[#28c840]" />
-							</div>
-							<Show when={props.filename}>
-								<span class="text-xs font-mono text-slate-400">
-									{props.filename}
-								</span>
-							</Show>
-							<Show when={props.language && !props.filename}>
-								<span class="text-xs font-mono text-slate-500 uppercase tracking-wider">
-									{props.language}
-								</span>
-							</Show>
-						</div>
-						<button
-							type="button"
-							onClick={copyToClipboard}
-							class="flex items-center gap-1.5 px-2 py-1 text-xs font-mono rounded text-slate-500 hover:text-[#00d4ff] bg-[#1a2a42]/50 hover:bg-[#1a2a42] transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#00d4ff]"
-							aria-label={copied() ? "Copied!" : "Copy code to clipboard"}
-						>
-							<Show
-								when={copied()}
-								fallback={<Copy size={12} aria-hidden="true" />}
-							>
-								<Check size={12} class="text-[#28c840]" aria-hidden="true" />
-							</Show>
-							<span>{copied() ? "copied" : "copy"}</span>
-						</button>
+				<Show when={showHeader()}>
+					<div class="flex items-center gap-3 border-b border-kite-line px-4 py-2">
+						<span class="font-mono text-[12px] text-slate-500">{label()}</span>
+						<CopyButton />
 					</div>
 				</Show>
-
-				{/* Code content with Shiki highlighting */}
-				<div class="relative overflow-x-auto scrollbar-thin">
-					<div class="flex">
-						{/* Line numbers column */}
-						<Show when={showLines()}>
-							<div 
-								class="flex-shrink-0 select-none py-4 pl-4 pr-3 text-right border-r border-[#1a2a42]/50"
-								aria-hidden="true"
-							>
-								<For each={Array.from({ length: lineCount() }, (_, i) => i + 1)}>
-									{(lineNum) => (
-										<div class="text-sm leading-relaxed font-mono text-slate-600">
-											{lineNum}
-										</div>
-									)}
-								</For>
-							</div>
-						</Show>
-						
-						{/* Code content */}
-						<div class="flex-1 min-w-0">
-							<Suspense
-								fallback={
-									<pre class={`text-sm leading-relaxed border-0 ${showLines() ? 'py-4 pr-4 pl-3' : 'p-4'}`}>
-										<code class="font-mono text-slate-300 whitespace-pre">
-											{props.code}
-										</code>
-									</pre>
-								}
-							>
-								<Show
-									when={highlightedHtml()}
-									fallback={
-										<pre class={`text-sm leading-relaxed border-0 ${showLines() ? 'py-4 pr-4 pl-3' : 'p-4'}`}>
-											<code class="font-mono text-slate-300 whitespace-pre">
-												{props.code}
-											</code>
-										</pre>
-									}
-								>
-									<div
-										class={`shiki-wrapper [&_pre]:text-sm [&_pre]:leading-relaxed [&_pre]:bg-transparent! [&_pre]:border-0 [&_code]:font-mono ${showLines() ? '[&_pre]:py-4 [&_pre]:pr-4 [&_pre]:pl-3' : '[&_pre]:p-4'}`}
-										innerHTML={highlightedHtml() ?? undefined}
-									/>
-								</Show>
-							</Suspense>
-						</div>
-					</div>
+				<div class="overflow-x-auto py-3.5">
+					<CodeView
+						code={props.code}
+						lang={lang()}
+						showLineNumbers={props.showLineNumbers ?? true}
+					/>
 				</div>
-
-				{/* Copy button overlay for blocks without header */}
-				<Show when={showHeader() && !props.filename && !props.language}>
-					<button
-						type="button"
-						onClick={copyToClipboard}
-						class="absolute top-3 right-3 p-2 rounded text-slate-500 hover:text-[#00d4ff] bg-[#1a2a42]/80 hover:bg-[#1a2a42] transition-all duration-150 opacity-0 group-hover:opacity-100 focus:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#00d4ff]"
-						aria-label={copied() ? "Copied!" : "Copy code to clipboard"}
-					>
-						<Show
-							when={copied()}
-							fallback={<Copy size={14} aria-hidden="true" />}
-						>
-							<Check size={14} class="text-[#28c840]" aria-hidden="true" />
-						</Show>
-					</button>
+				<Show when={!showHeader()}>
+					<CopyButton floating />
 				</Show>
 			</div>
 		</Show>

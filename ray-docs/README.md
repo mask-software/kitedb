@@ -1,150 +1,45 @@
-Welcome to your new TanStack app! 
+# KiteDB docs site
 
-# Getting Started
+Source for the KiteDB homepage and documentation. Built with SolidJS, TanStack Start, and Tailwind CSS v4. Deployed to Vercel (see `vercel.json`).
 
-To run this application:
-
-```bash
-pnpm install
-pnpm dev
-```
-
-# Building For Production
-
-To build this application for production:
+## Develop
 
 ```bash
-pnpm build
+bun install
+bun run dev --port 5311   # http://localhost:5311
+bun run build             # production build into .output/
+bun run start             # serve the build (node .output/server/index.mjs)
+bun run lint              # Biome lint
 ```
 
-## Styling
+The version shown in the docs sidebar is read from `../ray-rs/package.json` at build time.
 
-This project uses [Tailwind CSS](https://tailwindcss.com/) for styling.
+## Test
 
+The tests make HTTP requests against a running server (they check, for example, that unknown docs pages return 404). Start a server first, then run them.
 
-## Solid-UI
-
-This installation of Solid-UI follows the manual instructions but was modified to work with Tailwind V4.
-
-To install the components, run the following command (this install button):
+Against the dev server (the default URL is `http://localhost:5311`):
 
 ```bash
-npx solidui-cli@latest add button
+bun run dev --port 5311
+bun run test
 ```
 
-
-
-## Routing
-This project uses [TanStack Router](https://tanstack.com/router). The initial setup is a file based router. Which means that the routes are managed as files in `src/routes`.
-
-### Adding A Route
-
-To add a new route to your application just add another a new file in the `./src/routes` directory.
-
-TanStack will automatically generate the content of the route file for you.
-
-Now that you have two routes you can use a `Link` component to navigate between them.
-
-### Adding Links
-
-To use SPA (Single Page Application) navigation you will need to import the `Link` component from `@tanstack/solid-router`.
-
-```tsx
-import { Link } from "@tanstack/solid-router";
-```
-
-Then anywhere in your JSX you can use it like so:
-
-```tsx
-<Link to="/about">About</Link>
-```
-
-This will create a link that will navigate to the `/about` route.
-
-More information on the `Link` component can be found in the [Link documentation](https://tanstack.com/router/v1/docs/framework/solid/api/router/linkComponent).
-
-### Using A Layout
-
-In the File Based Routing setup the layout is located in `src/routes/__root.tsx`. Anything you add to the root route will appear in all the routes. The route content will appear in the JSX where you use the `<Outlet />` component.
-
-Here is an example layout that includes a header:
-
-```tsx
-import { Outlet, createRootRoute } from '@tanstack/solid-router'
-import { TanStackRouterDevtools } from '@tanstack/solid-router-devtools'
-
-import { Link } from "@tanstack/solid-router";
-
-export const Route = createRootRoute({
-  component: () => (
-    <>
-      <header>
-        <nav>
-          <Link to="/">Home</Link>
-          <Link to="/about">About</Link>
-        </nav>
-      </header>
-      <Outlet />
-      <TanStackRouterDevtools />
-    </>
-  ),
-})
-```
-
-The `<TanStackRouterDevtools />` component is not required so you can remove it if you don't want it in your layout.
-
-More information on layouts can be found in the [Layouts documentation](https://tanstack.com/router/latest/docs/framework/solid/guide/routing-concepts#layouts).
-
-## Data Fetching
-
-There are multiple ways to fetch data in your application. You can use TanStack Query to fetch data from a server. But you can also use the `loader` functionality built into TanStack Router to load the data for a route before it's rendered.
-
-For example:
-
-```tsx
-const peopleRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: "/people",
-  loader: async () => {
-    const response = await fetch("https://swapi.dev/api/people");
-    return response.json() as Promise<{
-      results: {
-        name: string;
-      }[];
-    }>;
-  },
-  component: () => {
-    const data = peopleRoute.useLoaderData();
-    return (
-      <ul>
-        {data.results.map((person) => (
-          <li key={person.name}>{person.name}</li>
-        ))}
-      </ul>
-    );
-  },
-});
-```
-
-Loaders simplify your data fetching logic dramatically. Check out more information in the [Loader documentation](https://tanstack.com/router/latest/docs/framework/solid/guide/data-loading#loader-parameters).
-
-# Demo files
-
-Files prefixed with `demo` can be safely deleted. They are there to provide a starting point for you to play around with the features you've installed.
-
-
-## Linting & Formatting
-
-This project uses [Biome](https://biomejs.dev/) for linting and formatting. The following scripts are available:
-
+Against a production build:
 
 ```bash
-pnpm lint
-pnpm format
-pnpm check
+bun run build
+PORT=5398 node .output/server/index.mjs &
+DOCS_URL=http://localhost:5398 bun run test
 ```
 
+## Layout
 
-# Learn More
+- `src/routes/`: file-based routes. `index.tsx` is the homepage, `docs.tsx` is the docs layout (sidebar and nav), and `docs/` holds the pages. Each section (`getting-started`, `guides`, `api`, `benchmarks`, `internals`) has a `$.tsx` splat route that renders its pages by slug. Slugs not listed in `lib/docs.ts` return a 404.
+- `src/lib/docs.ts`: the docs navigation (`docsStructure`). To add a page, add an entry here and a matching branch in the section's `$.tsx`.
+- `src/lib/benchmarks.ts`: every benchmark number on the site, each tied to a raw log in `docs/benchmarks/results/`.
+- `src/components/home/`: homepage sections.
+- `src/components/`: shared pieces (doc page shell, code blocks, search, nav).
+- `src/styles.css`: Tailwind setup and design tokens (`--color-kite-*` in `@theme`).
 
-You can learn more about all of the offerings from TanStack in the [TanStack documentation](https://tanstack.com).
+See `AGENTS.md` for the Solid rules this codebase follows.

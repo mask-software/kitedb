@@ -1,71 +1,39 @@
-import { createFileRoute, useLocation } from '@tanstack/solid-router'
-import { Show } from 'solid-js'
-import DocPage from '~/components/doc-page'
-import { MultiLangCode } from '~/components/multi-lang-code'
-import { findDocBySlug } from '~/lib/docs'
+import { createFileRoute } from "@tanstack/solid-router";
+import { DocNotFound } from "~/components/doc-not-found";
+import DocPage from "~/components/doc-page";
+import { MultiLangCode } from "~/components/multi-lang-code";
+import { loadDocSlug } from "~/lib/doc-route";
 
-export const Route = createFileRoute('/docs/guides/$')({
-  component: GuidesSplatPage,
-})
+export const Route = createFileRoute("/docs/guides/$")({
+	loader: loadDocSlug,
+	component: GuidesSplatPage,
+	notFoundComponent: () => <DocNotFound />,
+});
 
 function GuidesSplatPage() {
-  const location = useLocation()
-  const slug = () => {
-    const path = location().pathname
-    const match = path.match(/^\/docs\/(.+)$/)
-    return match ? match[1] : ''
-  }
-  const doc = () => findDocBySlug(slug())
-
-  return (
-    <Show
-      when={doc()}
-      fallback={<DocNotFound slug={slug()} />}
-    >
-      <DocPageContent slug={slug()} />
-    </Show>
-  )
-}
-
-function DocNotFound(props: { slug: string }) {
-  return (
-    <div class="max-w-4xl mx-auto px-6 py-12">
-      <div class="text-center">
-        <h1 class="text-4xl font-extrabold text-slate-900 dark:text-white mb-4">
-          Page Not Found
-        </h1>
-        <p class="text-lg text-slate-600 dark:text-slate-400 mb-8">
-          The guide <code class="px-2 py-1 bg-slate-100 dark:bg-slate-800 rounded">{props.slug}</code> doesn't exist yet.
-        </p>
-        <a
-          href="/docs"
-          class="inline-flex items-center gap-2 px-6 py-3 bg-gradient-to-r from-cyan-500 to-violet-500 text-white font-semibold rounded-xl hover:shadow-lg hover:shadow-cyan-500/25 transition-all duration-200"
-        >
-          Back to Documentation
-        </a>
-      </div>
-    </div>
-  )
+	const data = Route.useLoaderData();
+	return <DocPageContent slug={data().slug} />;
 }
 
 function DocPageContent(props: { slug: string }) {
-  const slug = props.slug
+	const slug = props.slug;
 
-  if (slug === 'guides/schema') {
-    return (
-      <DocPage slug={slug}>
-        <p>
-          KiteDB schemas define the structure of your graph data. 
-          This guide covers how to define nodes, edges, and properties.
-        </p>
+	if (slug === "guides/schema") {
+		return (
+			<DocPage slug={slug}>
+				<p>
+					A schema declares the node and edge types in your graph and the typed
+					properties each type carries. This guide covers nodes, edges, and the
+					available property types.
+				</p>
 
-        <h2 id="defining-nodes">Defining Nodes</h2>
-        <p>
-          Nodes are the vertices in your graph. Each node type needs a unique name 
-          and can have typed properties.
-        </p>
-        <MultiLangCode
-          typescript={`import { kite } from '@kitedb/core';
+				<h2 id="defining-nodes">Defining nodes</h2>
+				<p>
+					Nodes are the vertices of the graph. Each node type needs a unique
+					name and can declare typed properties.
+				</p>
+				<MultiLangCode
+					typescript={`import { kite } from '@kitedb/core';
 
 const db = await kite('./blog.kitedb', {
   nodes: [
@@ -82,21 +50,20 @@ const db = await kite('./blog.kitedb', {
   ],
   edges: [],
 });`}
-          rust={`use kitedb::kite;
+					rust={`use kitedb::api::kite::{kite, KiteOptions, NodeDef, PropDef};
 
-let db = kite("./blog.kitedb", KiteOptions {
-    nodes: vec![
-        NodeSpec::new("article")
-            .prop("title", PropType::String)
-            .prop("content", PropType::String)
-            .prop("published", PropType::Bool)
-            .prop("views", PropType::Int)
-            .prop("rating", PropType::Float),
-    ],
-    edges: vec![],
-    ..Default::default()
-})?;`}
-          python={`from kitedb import kite, define_node, prop
+let db = kite(
+    "./blog.kitedb",
+    KiteOptions::new().node(
+        NodeDef::new("article", "article:")
+            .prop(PropDef::string("title"))
+            .prop(PropDef::string("content"))
+            .prop(PropDef::bool("published"))
+            .prop(PropDef::int("views"))
+            .prop(PropDef::float("rating")),
+    ),
+)?;`}
+					python={`from kitedb import kite, define_node, prop
 
 article = define_node("article",
     key=lambda id: f"article:{id}",
@@ -110,29 +77,41 @@ article = define_node("article",
 )
 
 db = kite("./blog.kitedb", nodes=[article], edges=[])`}
-          filename={{ ts: 'schema.ts', rs: 'schema.rs', py: 'schema.py' }}
-        />
+					filename={{ ts: "schema.ts", rs: "schema.rs", py: "schema.py" }}
+				/>
 
-        <h2 id="property-types">Property Types</h2>
-        <p>KiteDB supports the following property types:</p>
-        <ul>
-          <li><code>string</code> – Text strings</li>
-          <li><code>int</code> – 64-bit integers</li>
-          <li><code>float</code> – 64-bit floating point numbers</li>
-          <li><code>bool</code> – Boolean values</li>
-          <li><code>vector</code> – Float32 embedding vectors</li>
-        </ul>
-        <p>
-          TypeScript builders are available as top-level exports (e.g. <code>string()</code>) or
-          under <code>prop</code> (e.g. <code>prop.string()</code>).
-        </p>
+				<h2 id="property-types">Property types</h2>
+				<p>KiteDB supports the following property types:</p>
+				<ul>
+					<li>
+						<code>string</code> – Text strings
+					</li>
+					<li>
+						<code>int</code> – 64-bit integers
+					</li>
+					<li>
+						<code>float</code> – 64-bit floating point numbers
+					</li>
+					<li>
+						<code>bool</code> – Boolean values
+					</li>
+					<li>
+						<code>vector</code> – Float32 embedding vectors
+					</li>
+				</ul>
+				<p>
+					TypeScript builders are available as top-level exports (e.g.{" "}
+					<code>string()</code>) or under <code>prop</code> (e.g.{" "}
+					<code>prop.string()</code>).
+				</p>
 
-        <h2 id="defining-edges">Defining Edges</h2>
-        <p>
-          Edges connect nodes and can have their own properties.
-        </p>
-        <MultiLangCode
-          typescript={`const db = await kite('./blog.kitedb', {
+				<h2 id="defining-edges">Defining edges</h2>
+				<p>
+					Edges connect two nodes. Like nodes, they can carry their own
+					properties.
+				</p>
+				<MultiLangCode
+					typescript={`const db = await kite('./blog.kitedb', {
   nodes: [
     { name: 'user', props: { name: { type: 'string' } } },
     { name: 'article', props: { title: { type: 'string' } } },
@@ -152,20 +131,17 @@ db = kite("./blog.kitedb", nodes=[article], edges=[])`}
     },
   ],
 });`}
-          rust={`let db = kite("./blog.kitedb", KiteOptions {
-    nodes: vec![
-        NodeSpec::new("user").prop("name", PropType::String),
-        NodeSpec::new("article").prop("title", PropType::String),
-    ],
-    edges: vec![
-        EdgeSpec::new("authored")
-            .prop("role", PropType::String),
-        EdgeSpec::new("likes")
-            .prop("likedAt", PropType::Int),
-    ],
-    ..Default::default()
-})?;`}
-          python={`from kitedb import kite, define_node, define_edge, prop
+					rust={`use kitedb::api::kite::{kite, EdgeDef, KiteOptions, NodeDef, PropDef};
+
+let db = kite(
+    "./blog.kitedb",
+    KiteOptions::new()
+        .node(NodeDef::new("user", "user:").prop(PropDef::string("name")))
+        .node(NodeDef::new("article", "article:").prop(PropDef::string("title")))
+        .edge(EdgeDef::new("authored").prop(PropDef::string("role")))
+        .edge(EdgeDef::new("likes").prop(PropDef::int("likedAt"))),
+)?;`}
+					python={`from kitedb import kite, define_node, define_edge, prop
 
 user = define_node("user",
     key=lambda id: f"user:{id}",
@@ -181,27 +157,35 @@ authored = define_edge("authored", {"role": prop.string("role")})
 likes = define_edge("likes", {"likedAt": prop.int("likedAt")})
 
 db = kite("./blog.kitedb", nodes=[user, article], edges=[authored, likes])`}
-        />
+				/>
 
-        <h2 id="next-steps">Next Steps</h2>
-        <ul>
-          <li><a href="/docs/guides/queries">Queries & CRUD</a> – Perform operations on your schema</li>
-          <li><a href="/docs/guides/vectors">Vector Search</a> – Add embedding vectors</li>
-        </ul>
-      </DocPage>
-    )
-  }
+				<h2 id="next-steps">Next steps</h2>
+				<ul>
+					<li>
+						<a href="/docs/guides/queries">Queries & CRUD</a>: read and write
+						nodes of these types
+					</li>
+					<li>
+						<a href="/docs/guides/vectors">Vector search</a>: attach embedding
+						vectors to nodes
+					</li>
+				</ul>
+			</DocPage>
+		);
+	}
 
-  if (slug === 'guides/queries') {
-    return (
-      <DocPage slug={slug}>
-        <p>
-          Learn how to create, read, update, and delete data in KiteDB.
-        </p>
+	if (slug === "guides/queries") {
+		return (
+			<DocPage slug={slug}>
+				<p>
+					Create, read, update, and delete nodes with the high-level API. The
+					examples use the <code>user</code> schema from the{" "}
+					<a href="/docs/getting-started/quick-start">quick start</a>.
+				</p>
 
-        <h2 id="create">Creating Nodes</h2>
-        <MultiLangCode
-          typescript={`// Create a single node with returning
+				<h2 id="create">Creating nodes</h2>
+				<MultiLangCode
+					typescript={`// Create a single node with returning
 const alice = db.insert('user')
   .values('alice', { name: 'Alice Chen', email: 'alice@example.com' })
   .returning();
@@ -210,22 +194,26 @@ const alice = db.insert('user')
 db.insert('user')
   .values('bob', { name: 'Bob Smith', email: 'bob@example.com' })
   .execute();`}
-          rust={`// Create a single node with returning
-let alice = db.insert("user")
-    .values("alice", json!({
-        "name": "Alice Chen",
-        "email": "alice@example.com"
-    }))
+					rust={`use kitedb::types::PropValue;
+use std::collections::HashMap;
+
+// Create a single node with returning
+let alice = db
+    .insert("user")?
+    .values("alice", HashMap::from([
+        ("name".into(), PropValue::String("Alice Chen".into())),
+        ("email".into(), PropValue::String("alice@example.com".into())),
+    ]))?
     .returning()?;
 
 // Create without returning (slightly faster)
-db.insert("user")
-    .values("bob", json!({
-        "name": "Bob Smith",
-        "email": "bob@example.com"
-    }))
+db.insert("user")?
+    .values("bob", HashMap::from([
+        ("name".into(), PropValue::String("Bob Smith".into())),
+        ("email".into(), PropValue::String("bob@example.com".into())),
+    ]))?
     .execute()?;`}
-          python={`# Create a single node with returning
+					python={`# Create a single node with returning
 alice = (db.insert(user)
     .values(key="alice", name="Alice Chen", email="alice@example.com")
     .returning())
@@ -234,11 +222,11 @@ alice = (db.insert(user)
 (db.insert(user)
     .values(key="bob", name="Bob Smith", email="bob@example.com")
     .execute())`}
-        />
+				/>
 
-        <h2 id="read">Reading Data</h2>
-        <MultiLangCode
-          typescript={`// Get by key
+				<h2 id="read">Reading data</h2>
+				<MultiLangCode
+					typescript={`// Get by key
 const user = db.get('user', 'alice');
 
 // Get by node ID
@@ -252,13 +240,11 @@ const allUsers = db.all('user');
 
 // Count nodes
 const userCount = db.countNodes('user');`}
-          rust={`// Get by key
+					rust={`// Get by key
 let user = db.get("user", "alice")?;
 
-// Get by node ID (filter iterator)
-let user_by_id = db
-    .all("user")?
-    .find(|n| n.id() == alice.id());
+// Get by node ID
+let user_by_id = db.node_by_id(alice.id())?;
 
 // Check if exists
 let exists = db.exists(alice.id());
@@ -268,11 +254,11 @@ let all_users: Vec<_> = db.all("user")?.collect();
 
 // Count nodes
 let user_count = db.count_nodes_by_type("user")?;`}
-          python={`# Get by key
-user = db.get(user, "alice")
+					python={`# Get by key
+alice = db.get(user, "alice")
 
-# Get lightweight ref by key
-user_ref = db.get_ref(user, "alice")
+# Get lightweight ref by key (no properties loaded)
+alice_ref = db.get_ref(user, "alice")
 
 # Check if exists
 exists = alice is not None and db.exists(alice)
@@ -282,40 +268,41 @@ all_users = list(db.all(user))
 
 # Count nodes
 user_count = db.count(user)`}
-        />
+				/>
 
-        <h2 id="update">Updating Data</h2>
-        <MultiLangCode
-          typescript={`// Update by key
-db.update(user, 'alice')
-  .set('name', 'Alice C.')
-  .execute();
+				<h2 id="update">Updating data</h2>
+				<MultiLangCode
+					typescript={`// Update by key. The update builder's methods return void,
+// so call them on the builder rather than chaining.
+const rename = db.update('user', 'alice');
+rename.set('name', 'Alice C.');
+rename.execute();
 
 // Update multiple properties
-db.update(user, 'alice')
-  .setAll({ name: 'Alice Chen', email: 'newemail@example.com' })
-  .execute();
+const edit = db.update('user', 'alice');
+edit.setAll({ name: 'Alice Chen', email: 'newemail@example.com' });
+edit.execute();
 
 // Remove a property
-db.update(user, 'alice')
-  .unset('email')
-  .execute();`}
-          rust={`// Update by node ID
-db.update_by_id(alice.id())
+const clear = db.update('user', 'alice');
+clear.unset('email');
+clear.execute();`}
+					rust={`// Update by node ID
+db.update_by_id(alice.id())?
     .set("name", PropValue::String("Alice C.".into()))
     .execute()?;
 
 // Update multiple properties
-db.update_by_id(alice.id())
+db.update_by_id(alice.id())?
     .set("name", PropValue::String("Alice Chen".into()))
     .set("email", PropValue::String("newemail@example.com".into()))
     .execute()?;
 
 // Remove a property
-db.update_by_id(alice.id())
+db.update_by_id(alice.id())?
     .unset("email")
     .execute()?;`}
-          python={`# Update by node reference
+					python={`# Update by node reference
 (db.update(alice)
     .set(name="Alice C.")
     .execute())
@@ -329,51 +316,58 @@ db.update_by_id(alice.id())
 (db.update(alice)
     .set(email="newemail@example.com")
     .execute())`}
-        />
+				/>
 
-        <h2 id="delete">Deleting Data</h2>
-        <MultiLangCode
-          typescript={`// Delete by node ID
+				<h2 id="delete">Deleting data</h2>
+				<MultiLangCode
+					typescript={`// Delete by node ID
 db.deleteById(alice.id);
 
 // Delete by key
 db.deleteByKey('user', 'alice');`}
-          rust={`// Delete by node ID
+					rust={`// Delete by node ID
 db.delete_node(alice.id())?;
 
 // Delete by key (lookup then delete)
 if let Some(node) = db.get("user", "alice")? {
     db.delete_node(node.id())?;
 }`}
-          python={`# Delete by node reference
+					python={`# Delete by node reference
 db.delete(alice)
 
 # Delete by key (lookup then delete)
 node = db.get(user, "alice")
 if node is not None:
     db.delete(node)`}
-        />
+				/>
 
-        <h2 id="next-steps">Next Steps</h2>
-        <ul>
-          <li><a href="/docs/guides/traversal">Graph Traversal</a> – Navigate relationships</li>
-          <li><a href="/docs/guides/transactions">Transactions</a> – ACID guarantees</li>
-        </ul>
-      </DocPage>
-    )
-  }
+				<h2 id="next-steps">Next steps</h2>
+				<ul>
+					<li>
+						<a href="/docs/guides/traversal">Graph traversal</a>: follow edges
+						between nodes
+					</li>
+					<li>
+						<a href="/docs/guides/transactions">Transactions</a>: commit several
+						writes atomically
+					</li>
+				</ul>
+			</DocPage>
+		);
+	}
 
-  if (slug === 'guides/traversal') {
-    return (
-      <DocPage slug={slug}>
-        <p>
-          KiteDB provides powerful graph traversal capabilities to navigate 
-          relationships between nodes.
-        </p>
+	if (slug === "guides/traversal") {
+		return (
+			<DocPage slug={slug}>
+				<p>
+					A traversal starts at a node and follows edges outgoing, incoming, or
+					in both directions. Steps chain, so a multi-hop query reads left to
+					right.
+				</p>
 
-        <h2 id="basic-traversal">Basic Traversal</h2>
-        <MultiLangCode
-          typescript={`// Find all users that Alice follows (outgoing edges)
+				<h2 id="basic-traversal">Basic traversal</h2>
+				<MultiLangCode
+					typescript={`// Find all users that Alice follows (outgoing edges)
 const following = db
   .from(alice.id)
   .out('follows')
@@ -390,24 +384,24 @@ const connections = db
   .from(alice.id)
   .both('knows')
   .nodes();`}
-          rust={`// Find all users that Alice follows (outgoing edges)
+					rust={`// Find all users that Alice follows (outgoing edges)
 let following = db
     .from(alice.id())
-    .out(Some("follows"))
-    .nodes()?;
+    .out(Some("follows"))?
+    .to_vec();
 
 // Find all followers of Alice (incoming edges)
 let followers = db
     .from(alice.id())
-    .in_(Some("follows"))
-    .nodes()?;
+    .r#in(Some("follows"))?
+    .to_vec();
 
 // Follow edges in both directions
 let connections = db
     .from(alice.id())
-    .both(Some("knows"))
-    .nodes()?;`}
-          python={`# Find all users that Alice follows (outgoing edges)
+    .both(Some("knows"))?
+    .to_vec();`}
+					python={`# Find all users that Alice follows (outgoing edges)
 following = (db
     .from_(alice)
     .out(follows)
@@ -427,11 +421,11 @@ connections = (db
     .both(knows)
     .nodes()
     .to_list())`}
-        />
+				/>
 
-        <h2 id="multi-hop">Multi-Hop Traversal</h2>
-        <MultiLangCode
-          typescript={`// Find friends of friends (2-hop)
+				<h2 id="multi-hop">Multi-hop traversal</h2>
+				<MultiLangCode
+					typescript={`// Find friends of friends (2-hop)
 const friendsOfFriends = db
   .from(alice.id)
   .out('follows')
@@ -444,20 +438,20 @@ const authorsOfLikedArticles = db
   .out('likes')     // Alice -> Articles
   .in('authored')   // Articles <- Users
   .nodes();`}
-          rust={`// Find friends of friends (2-hop)
+					rust={`// Find friends of friends (2-hop)
 let friends_of_friends = db
     .from(alice.id())
-    .out(Some("follows"))
-    .out(Some("follows"))
-    .nodes()?;
+    .out(Some("follows"))?
+    .out(Some("follows"))?
+    .to_vec();
 
 // Chain different edge types
 let authors_of_liked = db
     .from(alice.id())
-    .out(Some("likes"))     // Alice -> Articles
-    .in_(Some("authored"))  // Articles <- Users
-    .nodes()?;`}
-          python={`# Find friends of friends (2-hop)
+    .out(Some("likes"))?       // Alice -> Articles
+    .r#in(Some("authored"))?   // Articles <- Users
+    .to_vec();`}
+					python={`# Find friends of friends (2-hop)
 friends_of_friends = (db
     .from_(alice)
     .out(follows)
@@ -472,11 +466,11 @@ authors_of_liked = (db
     .in_(authored)    # Articles <- Users
     .nodes()
     .to_list())`}
-        />
+				/>
 
-        <h2 id="variable-depth">Variable Depth Traversal</h2>
-        <MultiLangCode
-          typescript={`// Traverse 1-3 hops
+				<h2 id="variable-depth">Variable-depth traversal</h2>
+				<MultiLangCode
+					typescript={`// Traverse 1-3 hops
 const network = db
   .from(alice.id)
   .traverse('follows', { minDepth: 1, maxDepth: 3 })
@@ -488,26 +482,30 @@ const topConnections = db
   .out('follows')
   .take(10)
   .nodes();`}
-          rust={`// Traverse 1-3 hops
+					rust={`use kitedb::api::traversal::TraverseOptions;
+
+// Traverse 1-3 hops
 let network = db
     .from(alice.id())
     .traverse(Some("follows"), TraverseOptions {
-        min_depth: Some(1),
+        min_depth: 1,
         max_depth: 3,
         ..Default::default()
-    })
-    .nodes()?;
+    })?
+    .to_vec();
 
 // Limit results
 let top_connections = db
     .from(alice.id())
-    .out(Some("follows"))
+    .out(Some("follows"))?
     .take(10)
-    .nodes()?;`}
-          python={`# Traverse 1-3 hops
+    .to_vec();`}
+					python={`from kitedb import TraverseOptions
+
+# Traverse 1-3 hops
 network = (db
     .from_(alice)
-    .traverse(follows, min_depth=1, max_depth=3)
+    .traverse(follows, TraverseOptions(min_depth=1, max_depth=3))
     .nodes()
     .to_list())
 
@@ -518,54 +516,62 @@ top_connections = (db
     .take(10)
     .nodes()
     .to_list())`}
-        />
+				/>
 
-        <h2 id="next-steps">Next Steps</h2>
-        <ul>
-          <li><a href="/docs/guides/vectors">Vector Search</a> – Combine with semantic search</li>
-          <li><a href="/docs/api/high-level">API Reference</a> – Full traversal API</li>
-        </ul>
-      </DocPage>
-    )
-  }
+				<h2 id="next-steps">Next steps</h2>
+				<ul>
+					<li>
+						<a href="/docs/guides/vectors">Vector search</a>: find similar
+						nodes, then traverse from them
+					</li>
+					<li>
+						<a href="/docs/api/high-level">High-level API</a>: the full
+						traversal API
+					</li>
+				</ul>
+			</DocPage>
+		);
+	}
 
-  if (slug === 'guides/vectors') {
-    return (
-      <DocPage slug={slug}>
-        <p>
-          KiteDB includes built-in vector search for semantic similarity queries. 
-          Store embeddings and find similar nodes using IVF indexing.
-        </p>
+	if (slug === "guides/vectors") {
+		return (
+			<DocPage slug={slug}>
+				<p>
+					KiteDB has built-in vector search for similarity queries. You store an
+					embedding per node, and an IVF index finds the nearest vectors to a
+					query embedding.
+				</p>
 
-        <h2 id="creating-index">Creating a Vector Index</h2>
-        <MultiLangCode
-          typescript={`import { createVectorIndex } from '@kitedb/core';
+				<h2 id="creating-index">Creating a vector index</h2>
+				<MultiLangCode
+					typescript={`import { createVectorIndex, DistanceMetric } from '@kitedb/core';
 
 // Create an index for 1536-dimensional vectors (OpenAI embeddings)
 const index = createVectorIndex({
   dimensions: 1536,
-  metric: 'Cosine',  // or 'Euclidean', 'DotProduct'
+  metric: DistanceMetric.Cosine, // or Euclidean, DotProduct
 });`}
-          rust={`use kitedb::{VectorIndex, VectorIndexOptions, DistanceMetric};
+					rust={`use kitedb::api::vector_search::{VectorIndex, VectorIndexOptions};
+use kitedb::vector::DistanceMetric;
 
 // Create an index for 1536-dimensional vectors
 let mut index = VectorIndex::new(VectorIndexOptions {
     dimensions: 1536,
     metric: DistanceMetric::Cosine,
     ..Default::default()
-})?;`}
-          python={`from kitedb import create_vector_index
+});`}
+					python={`from kitedb import create_vector_index, VectorIndexOptions
 
 # Create an index for 1536-dimensional vectors
-index = create_vector_index(
+index = create_vector_index(VectorIndexOptions(
     dimensions=1536,
-    metric="Cosine",  # or "Euclidean", "DotProduct"
-)`}
-        />
+    metric="cosine",  # or "euclidean", "dot_product"
+))`}
+				/>
 
-        <h2 id="storing-embeddings">Storing Embeddings</h2>
-        <MultiLangCode
-          typescript={`// Generate embedding with your preferred provider
+				<h2 id="storing-embeddings">Storing embeddings</h2>
+				<MultiLangCode
+					typescript={`// Generate embedding with your preferred provider
 const response = await openai.embeddings.create({
   model: 'text-embedding-ada-002',
   input: 'Your document content here',
@@ -574,25 +580,25 @@ const embedding = response.data[0].embedding;
 
 // Store the vector, associated with a node ID
 index.set(doc.id, embedding);`}
-          rust={`// Get embedding from your provider
+					rust={`// Get embedding from your provider
 let embedding: Vec<f32> = get_embedding("Your document content")?;
 
 // Store the vector, associated with a node ID
 index.set(doc.id(), &embedding)?;`}
-          python={`# Generate embedding with your preferred provider
+					python={`# Generate embedding with your preferred provider
 response = openai.embeddings.create(
     model="text-embedding-ada-002",
     input="Your document content here",
 )
 embedding = response.data[0].embedding
 
-# Store the vector, associated with a node ID
-index.set(doc.id, embedding)`}
-        />
+# Store the vector, associated with a node reference
+index.set(doc, embedding)`}
+				/>
 
-        <h2 id="similarity-search">Similarity Search</h2>
-        <MultiLangCode
-          typescript={`// Search for similar vectors
+				<h2 id="similarity-search">Similarity search</h2>
+				<MultiLangCode
+					typescript={`// Search for similar vectors
 const queryEmbedding = await getEmbedding('search query');
 
 const results = index.search(queryEmbedding, {
@@ -604,32 +610,33 @@ const results = index.search(queryEmbedding, {
 for (const hit of results) {
   console.log(\`Node \${hit.nodeId}: similarity=\${hit.similarity.toFixed(3)}\`);
 }`}
-          rust={`// Search for similar vectors
+					rust={`use kitedb::api::vector_search::SimilarOptions;
+
+// Search for similar vectors
 let query_embedding = get_embedding("search query")?;
 
-let results = index.search(&query_embedding, SimilarOptions {
-    k: 10,
-    threshold: Some(0.7),
-    ..Default::default()
-})?;
+let results = index.search(
+    &query_embedding,
+    SimilarOptions::new(10).with_threshold(0.7),
+)?;
 
 // Results contain node_id, distance, and similarity
 for hit in results {
     println!("Node {}: similarity={:.3}", hit.node_id, hit.similarity);
 }`}
-          python={`# Search for similar vectors
+					python={`# Search for similar vectors
 query_embedding = get_embedding("search query")
 
 results = index.search(query_embedding, k=10, threshold=0.7)
 
-# Results contain node_id, distance, and similarity
+# Results contain node, distance, and similarity
 for hit in results:
-    print(f"Node {hit.node_id}: similarity={hit.similarity:.3f}")`}
-        />
+    print(f"Node {hit.node.key}: similarity={hit.similarity:.3f}")`}
+				/>
 
-        <h2 id="index-management">Index Management</h2>
-        <MultiLangCode
-          typescript={`// Check if a node has a vector
+				<h2 id="index-management">Index management</h2>
+				<MultiLangCode
+					typescript={`// Check if a node has a vector
 const hasVector = index.has(doc.id);
 
 // Get a stored vector
@@ -644,11 +651,11 @@ index.buildIndex();
 // Get index statistics
 const stats = index.stats();
 console.log(\`Total vectors: \${stats.totalVectors}\`);`}
-          rust={`// Check if a node has a vector
-let has_vector = index.has(doc.id())?;
+					rust={`// Check if a node has a vector
+let has_vector = index.has(doc.id());
 
 // Get a stored vector
-let vector = index.get(doc.id())?;
+let vector = index.get(doc.id());
 
 // Delete a vector
 index.delete(doc.id())?;
@@ -657,50 +664,57 @@ index.delete(doc.id())?;
 index.build_index()?;
 
 // Get index statistics
-let stats = index.stats()?;
+let stats = index.stats();
 println!("Total vectors: {}", stats.total_vectors);`}
-          python={`# Check if a node has a vector
-has_vector = index.has(doc.id)
+					python={`# Check if a node has a vector
+has_vector = index.has(doc)
 
 # Get a stored vector
-vector = index.get(doc.id)
+vector = index.get(doc)
 
 # Delete a vector
-index.delete(doc.id)
+index.delete(doc)
 
 # Build/rebuild the IVF index for faster search
 index.build_index()
 
 # Get index statistics
 stats = index.stats()
-print(f"Total vectors: {stats.total_vectors}")`}
-        />
+print(f"Total vectors: {stats['totalVectors']}")`}
+				/>
 
-        <h2 id="next-steps">Next Steps</h2>
-        <ul>
-          <li><a href="/docs/api/vector-api">Vector API Reference</a> – Full vector API</li>
-          <li><a href="/docs/internals/performance">Performance</a> – Optimization tips</li>
-        </ul>
-      </DocPage>
-    )
-  }
+				<h2 id="next-steps">Next steps</h2>
+				<ul>
+					<li>
+						<a href="/docs/api/vector-api">Vector API</a>: every vector index
+						method and option
+					</li>
+					<li>
+						<a href="/docs/internals/performance">Performance</a>: tuning notes
+					</li>
+				</ul>
+			</DocPage>
+		);
+	}
 
-  if (slug === 'guides/transactions') {
-    return (
-      <DocPage slug={slug}>
-        <p>
-          KiteDB supports transactions for atomic operations. The low-level 
-          API provides explicit transaction control.
-        </p>
+	if (slug === "guides/transactions") {
+		return (
+			<DocPage slug={slug}>
+				<p>
+					A transaction groups writes so they commit together or not at all. The
+					high-level API wraps this in <code>transaction()</code> and{" "}
+					<code>batch()</code>; the low-level <code>Database</code> API exposes
+					begin, commit, and rollback directly.
+				</p>
 
-        <h2 id="high-level">High-Level Transactions (Kite)</h2>
-        <p>
-          The high-level <code>Kite</code> API supports explicit transactions for batching
-          multiple operations into a single commit. When the callback completes, the
-          transaction commits; on error it rolls back.
-        </p>
-        <MultiLangCode
-          typescript={`import { kite } from '@kitedb/core';
+				<h2 id="high-level">High-level transactions (Kite)</h2>
+				<p>
+					The high-level <code>Kite</code> API supports explicit transactions
+					for batching multiple operations into a single commit. When the
+					callback completes, the transaction commits; on error it rolls back.
+				</p>
+				<MultiLangCode
+					typescript={`import { kite } from '@kitedb/core';
 
 const db = await kite('./my.kitedb', { nodes: [User], edges: [follows] });
 
@@ -709,7 +723,7 @@ await db.transaction(async (ctx) => {
   const bob = ctx.insert('user').values('bob', { name: 'Bob' }).returning();
   ctx.link(alice.id, 'follows', bob.id, { since: 2024 });
 });`}
-          rust={`use kitedb::api::kite::Kite;
+					rust={`use kitedb::api::kite::Kite;
 use std::collections::HashMap;
 
 let mut db = Kite::open("./my.kitedb", options)?;
@@ -720,7 +734,7 @@ db.transaction(|ctx| {
     ctx.link(alice.id(), "follows", bob.id())?;
     Ok(())
 })?;`}
-          python={`from kitedb import kite
+					python={`from kitedb import kite
 
 db = kite("./my.kitedb", nodes=[user], edges=[follows])
 
@@ -728,39 +742,50 @@ with db.transaction():
     alice = db.insert(user).values(key="alice", name="Alice").returning()
     bob = db.insert(user).values(key="bob", name="Bob").returning()
     db.link(alice, follows, bob, since=2024)`}
-        />
+				/>
 
-        <h2 id="batch">Batch Operations</h2>
-        <p>
-          Batch operations run in a single transaction. This is ideal for fast
-          ingestion (e.g., indexing a codebase) and guarantees atomicity.
-        </p>
-        <MultiLangCode
-          typescript={`// Batch with builder/executor operations (sync)
+				<h2 id="batch">Batch operations</h2>
+				<p>
+					A batch runs its operations in a single transaction, so it is atomic
+					and pays the commit cost once. Use it for ingestion, such as indexing
+					a codebase.
+				</p>
+				<MultiLangCode
+					typescript={`// Batch with builder/executor operations (sync)
 db.batch([
   db.insert('user').values('alice', { name: 'Alice' }),
   db.insert('user').values('bob', { name: 'Bob' }),
   () => db.link(aliceId, 'follows', bobId, { since: 2024 }),
 ]);`}
-          rust={`use kitedb::api::kite::BatchOp;
+					rust={`use kitedb::api::kite::BatchOp;
+use std::collections::HashMap;
 
 db.batch(vec![
-    BatchOp::CreateNode { node_type: "user".into(), key_suffix: "alice".into(), props: HashMap::new() },
-    BatchOp::CreateNode { node_type: "user".into(), key_suffix: "bob".into(), props: HashMap::new() },
+    BatchOp::CreateNode {
+        node_type: "user".into(),
+        key_suffix: "alice".into(),
+        props: HashMap::new(),
+    },
+    BatchOp::CreateNode {
+        node_type: "user".into(),
+        key_suffix: "bob".into(),
+        props: HashMap::new(),
+    },
 ])?;`}
-          python={`db.batch([
+					python={`db.batch([
     db.insert(user).values(key="alice", name="Alice"),
     db.insert(user).values(key="bob", name="Bob"),
 ])`}
-        />
+				/>
 
-        <h2 id="bulk-load">Bulk Load (Max Throughput)</h2>
-        <p>
-          Bulk-load disables MVCC to minimize per-write overhead. Use for one-shot
-          ingest or ETL jobs; avoid concurrent readers/writers while it runs.
-        </p>
-        <MultiLangCode
-          typescript={`import { Database } from '@kitedb/core';
+				<h2 id="bulk-load">Bulk load (max throughput)</h2>
+				<p>
+					A bulk-load transaction bypasses MVCC (if you enabled it) to minimize
+					per-write overhead. Use it for one-shot ingest or ETL jobs, and avoid
+					concurrent readers and writers while it runs.
+				</p>
+				<MultiLangCode
+					typescript={`import { Database } from '@kitedb/core';
 
 const db = Database.open('./my.kitedb');
 db.beginBulk();
@@ -768,15 +793,15 @@ const nodeIds = db.createNodesBatch(keys); // keys: Array<string | null>
 db.addEdgesBatch(edges); // edges: { src, etype, dst }[]
 db.addEdgesWithPropsBatch(edgesWithProps);
 db.commit();`}
-          rust={`use kitedb::Database;
+					rust={`use kitedb::core::single_file::{open_single_file, SingleFileOpenOptions};
 
-let db = Database::open("./my.kitedb", None)?;
+let db = open_single_file("./my.kitedb", SingleFileOpenOptions::default())?;
 db.begin_bulk()?;
-let node_ids = db.create_nodes_batch(&keys)?;
-db.add_edges_batch(&edges)?;
+let node_ids = db.create_nodes_batch(&keys)?; // keys: &[Option<&str>]
+db.add_edges_batch(&edges)?;                  // edges: &[(NodeId, ETypeId, NodeId)]
 db.add_edges_with_props_batch(edges_with_props)?;
 db.commit()?;`}
-          python={`from kitedb import Database
+					python={`from kitedb import Database
 
 db = Database("./my.kitedb")
 db.begin_bulk()
@@ -784,47 +809,53 @@ node_ids = db.create_nodes_batch(keys)  # keys: List[Optional[str]]
 db.add_edges_batch(edges)               # edges: List[Tuple[int, int, int]]
 db.add_edges_with_props_batch(edges_with_props)
 db.commit()`}
-        />
+				/>
 
-        <h2 id="write-path">Choose Your Write Path</h2>
-        <table>
-          <thead>
-            <tr>
-              <th>Goal</th>
-              <th>Recommended API</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <td>Max throughput, single writer</td>
-              <td><code>beginBulk()</code> + batch APIs</td>
-            </tr>
-            <tr>
-              <td>Atomic ingest w/ MVCC</td>
-              <td><code>batch()</code> / <code>transaction()</code></td>
-            </tr>
-            <tr>
-              <td>Multi-writer throughput</td>
-              <td><code>syncMode: 'Normal'</code> + group commit + chunked batches</td>
-            </tr>
-          </tbody>
-        </table>
+				<h2 id="write-path">Choose a write path</h2>
+				<table>
+					<thead>
+						<tr>
+							<th>Goal</th>
+							<th>Recommended API</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td>Max throughput, single writer</td>
+							<td>
+								<code>beginBulk()</code> + batch APIs
+							</td>
+						</tr>
+						<tr>
+							<td>Atomic ingest (MVCC on or off)</td>
+							<td>
+								<code>batch()</code> / <code>transaction()</code>
+							</td>
+						</tr>
+						<tr>
+							<td>Multi-writer throughput</td>
+							<td>
+								<code>syncMode: 'Normal'</code> + group commit + chunked batches
+							</td>
+						</tr>
+					</tbody>
+				</table>
 
-        <h2 id="limitations">Current Limitations</h2>
-        <ul>
-          <li>
-            Traversal and path queries read the committed view. If you need to
-            traverse newly written edges, commit first.
-          </li>
-          <li>
-            JavaScript <code>batch()</code> is synchronous; avoid async work inside
-            a batch (do async work first, then batch the writes).
-          </li>
-        </ul>
+				<h2 id="limitations">Current limitations</h2>
+				<ul>
+					<li>
+						Traversal and path queries read the committed view. If you need to
+						traverse newly written edges, commit first.
+					</li>
+					<li>
+						JavaScript <code>batch()</code> is synchronous; avoid async work
+						inside a batch (do async work first, then batch the writes).
+					</li>
+				</ul>
 
-        <h2 id="basic-transactions">Basic Transactions</h2>
-        <MultiLangCode
-          typescript={`import { Database } from '@kitedb/core';
+				<h2 id="basic-transactions">Basic transactions</h2>
+				<MultiLangCode
+					typescript={`import { Database, PropValueType } from '@kitedb/core';
 
 const db = Database.open('./my.kitedb');
 
@@ -834,9 +865,11 @@ db.begin();
 try {
   // All operations are part of the transaction
   const nodeId = db.createNode('user:alice');
-  const nameKey = db.getOrCreatePropkey('name');
-  db.setNodePropByName(nodeId, 'name', { propType: 'String', stringValue: 'Alice' });
-  
+  db.setNodePropByName(nodeId, 'name', {
+    propType: PropValueType.String,
+    stringValue: 'Alice',
+  });
+
   // Commit the transaction
   db.commit();
 } catch (e) {
@@ -844,9 +877,10 @@ try {
   db.rollback();
   throw e;
 }`}
-          rust={`use kitedb::Database;
+					rust={`use kitedb::core::single_file::{open_single_file, SingleFileOpenOptions};
+use kitedb::types::PropValue;
 
-let db = Database::open("./my.kitedb", None)?;
+let db = open_single_file("./my.kitedb", SingleFileOpenOptions::default())?;
 
 // Begin a read-write transaction
 db.begin(false)?;
@@ -860,7 +894,7 @@ db.commit()?;
 
 // Or rollback on error
 // db.rollback()?;`}
-          python={`from kitedb import Database
+					python={`from kitedb import Database, PropValue
 
 db = Database("./my.kitedb")
 
@@ -878,115 +912,133 @@ except Exception as e:
     # Rollback on error
     db.rollback()
     raise e`}
-        />
+				/>
 
-        <h2 id="read-only">Read-Only Transactions</h2>
-        <MultiLangCode
-          typescript={`// Begin a read-only transaction (faster, no locking)
+				<h2 id="read-only">Read-only transactions</h2>
+				<MultiLangCode
+					typescript={`// Begin a read-only transaction
 db.begin(true);
 
-const node = db.getNodeByKey('user:alice');
-const props = db.getNodeProps(node);
+const node = db.get_node_by_key('user:alice');
+const props = node !== null ? db.get_node_props(node) : null;
 
 // Read-only transactions still need to be ended
 db.commit();  // or db.rollback() - same effect for read-only`}
-          rust={`// Begin a read-only transaction (faster, no locking)
+					rust={`// Begin a read-only transaction
 db.begin(true)?;
 
-let node = db.get_node_by_key("user:alice")?;
-let props = db.get_node_props(node)?;
+if let Some(node) = db.node_by_key("user:alice") {
+    let props = db.node_props(node);
+}
 
 // Read-only transactions still need to be ended
 db.commit()?;`}
-          python={`# Begin a read-only transaction (faster, no locking)
+					python={`# Begin a read-only transaction
 db.begin(read_only=True)
 
 node = db.get_node_by_key("user:alice")
-props = db.get_node_props(node)
+props = db.get_node_props(node) if node is not None else None
 
 # Read-only transactions still need to be ended
 db.commit()  # or db.rollback() - same effect for read-only`}
-        />
+				/>
 
-        <h2 id="transaction-status">Transaction Status</h2>
-        <MultiLangCode
-          typescript={`// Check if there's an active transaction
+				<h2 id="transaction-status">Transaction status</h2>
+				<MultiLangCode
+					typescript={`// Check if there's an active transaction
 if (db.hasTransaction()) {
   console.log('Transaction is active');
 }
 
 // The Kite high-level API auto-manages transactions
 // and also supports explicit db.transaction()/db.batch()`}
-          rust={`// Check if there's an active transaction
+					rust={`// Check if there's an active transaction
 if db.has_transaction() {
     println!("Transaction is active");
 }
 
 // The Kite high-level API auto-manages transactions`}
-          python={`# Check if there's an active transaction
+					python={`# Check if there's an active transaction
 if db.has_transaction():
     print("Transaction is active")
 
 # The Kite high-level API auto-manages transactions`}
-        />
+				/>
 
-        <h2 id="next-steps">Next Steps</h2>
-        <ul>
-          <li><a href="/docs/api/high-level">API Reference</a> – Full transaction API</li>
-          <li><a href="/docs/internals/architecture">Architecture</a> – How transactions work</li>
-        </ul>
-      </DocPage>
-    )
-  }
+				<h2 id="next-steps">Next steps</h2>
+				<ul>
+					<li>
+						<a href="/docs/api/high-level">High-level API</a>: the full
+						transaction API
+					</li>
+					<li>
+						<a href="/docs/internals/mvcc">MVCC and transactions</a>: how
+						transactions are isolated
+					</li>
+				</ul>
+			</DocPage>
+		);
+	}
 
-  if (slug === 'guides/performance') {
-    return (
-      <DocPage slug={slug}>
-        <p>
-          Use this checklist to pick the fastest write path and the right durability
-          preset for your workload. The goal is simple: fewer WAL syncs, fewer
-          per-op allocations, and bigger batches.
-        </p>
+	if (slug === "guides/performance") {
+		return (
+			<DocPage slug={slug}>
+				<p>
+					Use this checklist to pick a write path and a durability preset for
+					your workload. Most write-path gains come from three things: fewer WAL
+					syncs, fewer per-operation allocations, and larger batches.
+				</p>
 
-        <h2 id="decision">Decision Matrix</h2>
-        <table>
-          <thead>
-            <tr>
-              <th>Goal</th>
-              <th>Best Path</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <td>Max ingest throughput, single writer</td>
-              <td><code>beginBulk()</code> + batch APIs</td>
-            </tr>
-            <tr>
-              <td>Atomic ingest with MVCC</td>
-              <td><code>transaction()</code> / <code>batch()</code></td>
-            </tr>
-            <tr>
-              <td>Multi-writer throughput</td>
-              <td><code>syncMode: 'Normal'</code> + group commit (1-2ms)</td>
-            </tr>
-            <tr>
-              <td>Strong durability per commit</td>
-              <td><code>syncMode: 'Full'</code></td>
-            </tr>
-            <tr>
-              <td>Throwaway or test data</td>
-              <td><code>syncMode: 'Off'</code></td>
-            </tr>
-          </tbody>
-        </table>
+				<h2 id="decision">Decision matrix</h2>
+				<table>
+					<thead>
+						<tr>
+							<th>Goal</th>
+							<th>Best path</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td>Max ingest throughput, single writer</td>
+							<td>
+								<code>beginBulk()</code> + batch APIs
+							</td>
+						</tr>
+						<tr>
+							<td>Atomic ingest (MVCC on or off)</td>
+							<td>
+								<code>transaction()</code> / <code>batch()</code>
+							</td>
+						</tr>
+						<tr>
+							<td>Multi-writer throughput</td>
+							<td>
+								<code>syncMode: 'Normal'</code> + group commit (1-2ms)
+							</td>
+						</tr>
+						<tr>
+							<td>Strong durability per commit</td>
+							<td>
+								<code>syncMode: 'Full'</code>
+							</td>
+						</tr>
+						<tr>
+							<td>Throwaway or test data</td>
+							<td>
+								<code>syncMode: 'Off'</code>
+							</td>
+						</tr>
+					</tbody>
+				</table>
 
-        <h2 id="bulk">Bulk Ingest (Fastest Path)</h2>
-        <p>
-          Bulk-load disables MVCC to minimize overhead. Use it for one-shot ingest
-          or ETL jobs. Avoid concurrent readers/writers while it runs.
-        </p>
-        <MultiLangCode
-          typescript={`import { Database } from '@kitedb/core';
+				<h2 id="bulk">Bulk ingest (fastest path)</h2>
+				<p>
+					A bulk-load transaction bypasses MVCC (if you enabled it) to minimize
+					overhead. Use it for one-shot ingest or ETL jobs, and avoid concurrent
+					readers and writers while it runs.
+				</p>
+				<MultiLangCode
+					typescript={`import { Database } from '@kitedb/core';
 
 const db = Database.open('./my.kitedb');
 db.beginBulk();
@@ -994,15 +1046,15 @@ const nodeIds = db.createNodesBatch(keys);
 db.addEdgesBatch(edges);
 db.addEdgesWithPropsBatch(edgesWithProps);
 db.commit();`}
-          rust={`use kitedb::Database;
+					rust={`use kitedb::core::single_file::{open_single_file, SingleFileOpenOptions};
 
-let db = Database::open("./my.kitedb", None)?;
+let db = open_single_file("./my.kitedb", SingleFileOpenOptions::default())?;
 db.begin_bulk()?;
 let node_ids = db.create_nodes_batch(&keys)?;
 db.add_edges_batch(&edges)?;
 db.add_edges_with_props_batch(edges_with_props)?;
 db.commit()?;`}
-          python={`from kitedb import Database
+					python={`from kitedb import Database
 
 db = Database("./my.kitedb")
 db.begin_bulk()
@@ -1010,100 +1062,126 @@ node_ids = db.create_nodes_batch(keys)
 db.add_edges_batch(edges)
 db.add_edges_with_props_batch(edges_with_props)
 db.commit()`}
-        />
+				/>
 
-        <h2 id="presets">Config Presets</h2>
-        <table>
-          <thead>
-            <tr>
-              <th>Preset</th>
-              <th>Settings</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <td>Single-writer ingest</td>
-              <td>
-                <code>syncMode: 'Normal'</code>, <code>groupCommitEnabled: false</code>,
-                WAL ≥ 256MB, <code>autoCheckpoint: false</code>
-              </td>
-            </tr>
-            <tr>
-              <td>Multi-writer throughput</td>
-              <td>
-                <code>syncMode: 'Normal'</code>, <code>groupCommitEnabled: true</code>
-                (1-2ms window), chunked batches
-              </td>
-            </tr>
-            <tr>
-              <td>Max durability</td>
-              <td><code>syncMode: 'Full'</code>, smaller batches</td>
-            </tr>
-            <tr>
-              <td>Max speed (test)</td>
-              <td><code>syncMode: 'Off'</code></td>
-            </tr>
-          </tbody>
-        </table>
+				<h2 id="presets">Config presets</h2>
+				<table>
+					<thead>
+						<tr>
+							<th>Preset</th>
+							<th>Settings</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td>Single-writer ingest</td>
+							<td>
+								<code>syncMode: 'Normal'</code>,{" "}
+								<code>groupCommitEnabled: false</code>, WAL ≥ 256MB,{" "}
+								<code>autoCheckpoint: false</code>
+							</td>
+						</tr>
+						<tr>
+							<td>Multi-writer throughput</td>
+							<td>
+								<code>syncMode: 'Normal'</code>,{" "}
+								<code>groupCommitEnabled: true</code>
+								(1-2ms window), chunked batches
+							</td>
+						</tr>
+						<tr>
+							<td>Max durability</td>
+							<td>
+								<code>syncMode: 'Full'</code>, smaller batches
+							</td>
+						</tr>
+						<tr>
+							<td>Max speed (test)</td>
+							<td>
+								<code>syncMode: 'Off'</code>
+							</td>
+						</tr>
+					</tbody>
+				</table>
 
-        <h2 id="checklist">Checklist</h2>
-        <ul>
-          <li>Use batch APIs: <code>createNodesBatch</code>, <code>addEdgesBatch</code>, <code>addEdgesWithPropsBatch</code></li>
-          <li>Prefer <code>beginBulk()</code> for ingest; commit in chunks</li>
-          <li>Increase WAL size for large ingest (256MB+)</li>
-          <li>Disable auto-checkpoint during ingest; checkpoint once at the end</li>
-          <li>Use low-level API for hot paths in JS/TS</li>
-          <li>Avoid per-edge property sets when you can batch props with the edge</li>
-        </ul>
+				<h2 id="checklist">Checklist</h2>
+				<ul>
+					<li>
+						Use batch APIs: <code>createNodesBatch</code>,{" "}
+						<code>addEdgesBatch</code>, <code>addEdgesWithPropsBatch</code>
+					</li>
+					<li>
+						Prefer <code>beginBulk()</code> for ingest; commit in chunks
+					</li>
+					<li>Increase WAL size for large ingest (256MB+)</li>
+					<li>
+						Disable auto-checkpoint during ingest; checkpoint once at the end
+					</li>
+					<li>Use low-level API for hot paths in JS/TS</li>
+					<li>
+						Avoid per-edge property sets when you can batch props with the edge
+					</li>
+				</ul>
 
-        <h2 id="verify">Verify With Benchmarks</h2>
-        <ul>
-          <li><a href="/docs/benchmarks/graph">Graph Benchmarks</a> – Baselines and numbers</li>
-          <li><a href="/docs/internals/performance">Performance</a> – Deeper tuning notes</li>
-        </ul>
-      </DocPage>
-    )
-  }
+				<h2 id="verify">Verify with benchmarks</h2>
+				<ul>
+					<li>
+						<a href="/docs/benchmarks/graph">Graph benchmarks</a>: baselines to
+						compare your numbers against
+					</li>
+					<li>
+						<a href="/docs/internals/performance">Performance</a>: deeper tuning
+						notes
+					</li>
+				</ul>
+			</DocPage>
+		);
+	}
 
-  if (slug === 'guides/concurrency') {
-    return (
-      <DocPage slug={slug}>
-        <p>
-          KiteDB supports concurrent access from multiple threads, enabling
-          parallel reads for improved throughput in multi-threaded applications.
-        </p>
+	if (slug === "guides/concurrency") {
+		return (
+			<DocPage slug={slug}>
+				<p>
+					Within one process, many threads can read a KiteDB database at the
+					same time. Writes are serialized: one writer commits at a time.
+				</p>
 
-        <h2 id="concurrency-model">Concurrency Model</h2>
-        <p>
-          KiteDB uses a <strong>readers-writer lock</strong> pattern:
-        </p>
-        <ul>
-          <li>
-            <strong>Multiple concurrent readers</strong> – Any number of threads
-            can read simultaneously
-          </li>
-          <li>
-            <strong>Exclusive writer</strong> – Write operations acquire
-            exclusive access
-          </li>
-          <li>
-            <strong>MVCC isolation</strong> – Transactions see consistent
-            snapshots
-          </li>
-        </ul>
+				<h2 id="concurrency-model">Concurrency model</h2>
+				<p>
+					KiteDB uses a <strong>readers-writer lock</strong> pattern:
+				</p>
+				<ul>
+					<li>
+						<strong>Multiple concurrent readers</strong> – Any number of threads
+						can read simultaneously
+					</li>
+					<li>
+						<strong>Exclusive writer</strong> – Write operations acquire
+						exclusive access
+					</li>
+					<li>
+						<strong>MVCC isolation (opt-in)</strong> – With the{" "}
+						<code>mvcc</code> open option enabled, transactions read from
+						consistent snapshots
+					</li>
+				</ul>
 
-        <MultiLangCode
-          typescript={`// Concurrent reads from multiple async operations
-const alice = await db.get(user, 'alice');
-const results = await Promise.all([
-  db.get(user, 'bob'),
-  db.get(user, 'charlie'),
-  db.from(alice).out('follows').toArray(),
-]);
+				<MultiLangCode
+					typescript={`// Reads are synchronous. Calls on one handle run one after
+// another on the JS thread, so there is nothing to await.
+const alice = db.get(user, 'alice');
+const bob = db.get(user, 'bob');
+const following = alice ? db.from(alice).out('follows').toArray() : [];
 
-// With worker threads, share the db path (each worker opens independently)
-// Workers can read concurrently from the same database file`}
-          rust={`use std::sync::{Arc, RwLock};
+// For parallel reads, open the file in each worker thread with
+// readOnly: true. Read-only handles share the file lock; a writable
+// handle holds it exclusively.
+const reader = await kite('./data.kitedb', {
+  nodes: [user],
+  edges: [follows],
+  readOnly: true,
+});`}
+					rust={`use std::sync::{Arc, RwLock};
 use std::thread;
 use kitedb::api::kite::Kite;
 
@@ -1123,13 +1201,14 @@ let handles: Vec<_> = (0..4).map(|i| {
 let results: Vec<_> = handles.into_iter()
     .map(|h| h.join().unwrap())
     .collect();`}
-          python={`import threading
+					python={`import threading
+from kitedb import kite
 
-db = kite("./data.kitedb", nodes=[user])
+db = kite("./data.kitedb", nodes=[user], edges=[])
 results = {}
 
 def read_user(user_id: str):
-    """Each thread can read concurrently"""
+    # Threads can share one handle safely
     results[user_id] = db.get(user, user_id)
 
 # Spawn multiple reader threads
@@ -1143,63 +1222,70 @@ for t in threads:
 for t in threads:
     t.join()
 
-# All reads completed in parallel
+# The binding holds the GIL during each call,
+# so these reads run one at a time
 print(results)`}
-        />
+				/>
 
-        <h2 id="performance">Performance Notes</h2>
-        <p>
-          Read throughput typically improves with parallel readers, while write
-          throughput is constrained by serialized commit ordering. Measure with
-          your workload and tune batch sizes and sync mode accordingly.
-        </p>
+				<h2 id="performance">Performance notes</h2>
+				<p>
+					Read throughput typically improves with parallel readers, while write
+					throughput is constrained by serialized commit ordering. Measure with
+					your workload and tune batch sizes and sync mode accordingly.
+				</p>
 
-        <h2 id="best-practices">Best Practices</h2>
-        <ul>
-          <li>
-            <strong>Batch writes</strong> – Group multiple writes into single
-            operations to minimize exclusive lock time
-          </li>
-          <li>
-            <strong>Use transactions for consistency</strong> – MVCC ensures
-            readers see consistent snapshots even during concurrent writes
-          </li>
-          <li>
-            <strong>Profile your workload</strong> – The optimal thread count
-            depends on your read/write ratio and data access patterns
-          </li>
-          <li>
-            <strong>Avoid long-held locks</strong> – Keep critical sections
-            short; do processing outside the lock
-          </li>
-        </ul>
+				<h2 id="best-practices">Best practices</h2>
+				<ul>
+					<li>
+						<strong>Batch writes</strong> – Group multiple writes into single
+						operations to minimize exclusive lock time
+					</li>
+					<li>
+						<strong>Use transactions for atomicity</strong> – Group related
+						writes; with MVCC enabled, readers also see consistent snapshots
+						while those writes commit
+					</li>
+					<li>
+						<strong>Profile your workload</strong> – The optimal thread count
+						depends on your read/write ratio and data access patterns
+					</li>
+					<li>
+						<strong>Avoid long-held locks</strong> – Keep critical sections
+						short; do processing outside the lock
+					</li>
+				</ul>
 
-        <h2 id="mvcc">MVCC and Transaction Semantics</h2>
-        <p>
-          KiteDB uses Multi-Version Concurrency Control (MVCC) with serialized
-          writes:
-        </p>
-        <ul>
-          <li>Multiple readers can run concurrently</li>
-          <li>
-            A write waits for in-flight reads, then blocks new reads while it
-            commits
-          </li>
-          <li>Each committed transaction is atomic</li>
-          <li>Write conflicts are detected at commit time</li>
-        </ul>
+				<h2 id="mvcc">MVCC and transaction semantics</h2>
+				<p>
+					MVCC (multi-version concurrency control) is off by default. Turn it on
+					with the <code>mvcc</code> open option when readers need snapshot
+					isolation. Writes are serialized either way:
+				</p>
+				<ul>
+					<li>Multiple readers can run concurrently</li>
+					<li>
+						A write waits for in-flight reads, then blocks new reads while it
+						commits
+					</li>
+					<li>Each committed transaction is atomic</li>
+					<li>
+						With MVCC enabled, write conflicts are detected at commit time
+					</li>
+				</ul>
 
-        <MultiLangCode
-          typescript={`// Atomic transaction (auto-commit on success, rollback on error)
+				<MultiLangCode
+					typescript={`// Atomic transaction (auto-commit on success, rollback on error)
 await db.transaction(async (ctx) => {
   const alice = ctx.get(user, 'alice');
   if (alice) {
-    ctx.update(user, 'alice')
-      .set('name', 'Alice Updated')
-      .execute();
+    const update = ctx.update(user, 'alice');
+    update.set('name', 'Alice Updated');
+    update.execute();
   }
 });`}
-          rust={`// Atomic transaction with TxContext
+					rust={`use kitedb::types::PropValue;
+
+// Atomic transaction with TxContext
 db.transaction(|ctx| {
     let alice = ctx.get("user", "alice")?;
     if let Some(node) = alice {
@@ -1207,52 +1293,52 @@ db.transaction(|ctx| {
     }
     Ok(())
 })?;`}
-          python={`# Atomic transaction (context manager handles commit/rollback)
+					python={`# Atomic transaction (context manager handles commit/rollback)
 with db.transaction():
     alice = db.get(user, "alice")
     if alice is not None:
-        db.update(user, "alice").set(name="Alice Updated").execute()`}
-        />
+        db.update(alice).set(name="Alice Updated").execute()`}
+				/>
 
-        <h2 id="limitations">Limitations</h2>
-        <ul>
-          <li>
-            <strong>Single-process only</strong> – Concurrent access is within a
-            single process; multi-process access requires external coordination
-          </li>
-          <li>
-            <strong>Write serialization</strong> – All writes are serialized;
-            high-write workloads may see contention
-          </li>
-          <li>
-            <strong>Memory overhead</strong> – MVCC maintains version history,
-            using additional memory
-          </li>
-        </ul>
+				<h2 id="limitations">Limitations</h2>
+				<ul>
+					<li>
+						<strong>Single-process only</strong> – Concurrent access is within a
+						single process; multi-process access requires external coordination
+					</li>
+					<li>
+						<strong>Write serialization</strong> – All writes are serialized;
+						high-write workloads may see contention
+					</li>
+					<li>
+						<strong>Memory overhead</strong> – With MVCC enabled, version
+						history uses additional memory
+					</li>
+				</ul>
 
-        <h2 id="next-steps">Next Steps</h2>
-        <ul>
-          <li>
-            <a href="/docs/guides/transactions">Transactions</a> – Learn about
-            ACID guarantees
-          </li>
-          <li>
-            <a href="/docs/benchmarks">Benchmarks</a> – See detailed performance
-            numbers
-          </li>
-          <li>
-            <a href="/docs/internals/architecture">Architecture</a> – Understand
-            the internal design
-          </li>
-        </ul>
-      </DocPage>
-    )
-  }
+				<h2 id="next-steps">Next steps</h2>
+				<ul>
+					<li>
+						<a href="/docs/guides/transactions">Transactions</a>: atomic writes,
+						batches, and bulk load
+					</li>
+					<li>
+						<a href="/docs/benchmarks">Benchmarks</a>: measured read and write
+						latencies
+					</li>
+					<li>
+						<a href="/docs/internals/architecture">Architecture</a>: how the
+						storage engine is put together
+					</li>
+				</ul>
+			</DocPage>
+		);
+	}
 
-  // Default fallback
-  return (
-    <DocPage slug={slug}>
-      <p>This guide is coming soon.</p>
-    </DocPage>
-  )
+	// Default fallback
+	return (
+		<DocPage slug={slug}>
+			<p>This guide is coming soon.</p>
+		</DocPage>
+	);
 }

@@ -1,5 +1,6 @@
-import { createHighlighterCore, type HighlighterCore } from 'shiki/core'
+import { createHighlighterCore, type HighlighterCore, type ThemedToken } from 'shiki/core'
 import { createJavaScriptRegexEngine } from 'shiki/engine/javascript'
+import { kiteNight } from './kite-theme'
 
 let highlighterPromise: Promise<HighlighterCore> | null = null
 
@@ -29,43 +30,57 @@ const langAliases: Record<string, keyof typeof langImports> = {
 // Track which languages have been loaded
 const loadedLangs = new Set<string>()
 
-async function getHighlighter(): Promise<HighlighterCore> {
-  if (!highlighterPromise) {
-    const githubDark = await import('shiki/dist/themes/github-dark.mjs').then(m => m.default)
-    highlighterPromise = createHighlighterCore({
-      themes: [githubDark],
-      langs: [], // Start with no languages, load on demand
-      engine: createJavaScriptRegexEngine(),
-    })
-  }
+function getHighlighter(): Promise<HighlighterCore> {
+  // Assign synchronously so concurrent callers share one highlighter instance
+  highlighterPromise ??= createHighlighterCore({
+    themes: [kiteNight],
+    langs: [], // Start with no languages, load on demand
+    engine: createJavaScriptRegexEngine(),
+  })
   return highlighterPromise
 }
 
 async function ensureLangLoaded(highlighter: HighlighterCore, lang: string): Promise<string> {
   // Resolve alias
   const resolvedLang = (langAliases[lang] || lang) as keyof typeof langImports
-  
+
   // Check if it's a supported language
   if (!(resolvedLang in langImports)) {
     return 'text' // Fallback to plain text
   }
-  
+
   // Load language if not already loaded
   if (!loadedLangs.has(resolvedLang)) {
     const langModule = await langImports[resolvedLang]()
     await highlighter.loadLanguage(langModule)
     loadedLangs.add(resolvedLang)
   }
-  
+
   return resolvedLang
 }
 
-export async function highlightCode(code: string, lang: string): Promise<string> {
+export type CodeTokens = ThemedToken[][]
+
+const tokenCache = new Map<string, CodeTokens>()
+const tokenCacheKey = (code: string, lang: string) => `${lang}\u0000${code}`
+
+/** Synchronous cache lookup, so already-highlighted code renders without a flash. */
+export function peekTokens(code: string, lang: string): CodeTokens | undefined {
+  return tokenCache.get(tokenCacheKey(code, lang))
+}
+
+/** Tokenize code with the kite-night theme, one token array per line. */
+export async function highlightTokens(code: string, lang: string): Promise<CodeTokens> {
+  const key = tokenCacheKey(code, lang)
+  const cached = tokenCache.get(key)
+  if (cached) return cached
+
   const highlighter = await getHighlighter()
   const finalLang = await ensureLangLoaded(highlighter, lang)
-  
-  return highlighter.codeToHtml(code, {
-    lang: finalLang,
-    theme: 'github-dark',
+  const { tokens } = highlighter.codeToTokens(code, {
+    lang: finalLang as Parameters<HighlighterCore['codeToTokens']>[1]['lang'],
+    theme: 'kite-night',
   })
+  tokenCache.set(key, tokens)
+  return tokens
 }

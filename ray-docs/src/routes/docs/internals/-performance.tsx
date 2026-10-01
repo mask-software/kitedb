@@ -1,285 +1,389 @@
+import { ArrowRight } from "lucide-solid";
+import { For, Show } from "solid-js";
 import CodeBlock from "~/components/code-block";
 import DocPage from "~/components/doc-page";
+import {
+	CELL,
+	CELL_HIGHLIGHT,
+	CELL_PLAIN,
+	Code,
+	Figure,
+	Panel,
+	type Accent,
+} from "./-components";
 
 // ============================================================================
-// PERFORMANCE-SPECIFIC COMPONENTS
+// SHARED DIAGRAM PRIMITIVES
 // ============================================================================
 
-// Network overhead comparison
+/** Horizontal chain of labelled boxes joined by arrows. */
+function Chain(props: { steps: { label: string; accent?: "cyan" | "red" }[] }) {
+	return (
+		<div class="flex flex-wrap items-center gap-1.5">
+			<For each={props.steps}>
+				{(step, i) => (
+					<>
+						<Show when={i() > 0}>
+							<ArrowRight
+								size={13}
+								class="shrink-0 text-slate-600"
+								aria-hidden="true"
+							/>
+						</Show>
+						<span
+							class={`rounded-md border px-2 py-0.5 text-[12px] ${
+								step.accent === "red"
+									? "border-red-400/25 bg-red-400/10 text-red-300"
+									: step.accent === "cyan"
+										? "border-kite-cyan/25 bg-kite-cyan/10 text-kite-cyan"
+										: "border-kite-line bg-white/[0.03] text-slate-300"
+							}`}
+						>
+							{step.label}
+						</span>
+					</>
+				)}
+			</For>
+		</div>
+	);
+}
+
+/** Measured value with its unit in a quieter color. */
+function Stat(props: { value: string; unit: string }) {
+	return (
+		<span class="whitespace-nowrap font-mono">
+			<span class="font-semibold text-white">{props.value}</span>{" "}
+			<span class="text-slate-500">{props.unit}</span>
+		</span>
+	);
+}
+
+// ============================================================================
+// PERFORMANCE DIAGRAMS
+// ============================================================================
+
+// p50 values from docs/benchmarks/results/2026-02-04-single-file-raw-rust-edges-normal-nogc.txt
+const EMBEDDED_P50 = [
+	{ label: "Key lookup", value: "125", unit: "ns" },
+	{ label: "1-hop traversal", value: "208", unit: "ns" },
+	{ label: "Commit 100 nodes", value: "34.08", unit: "µs" },
+];
+
 function NetworkOverheadComparison() {
 	return (
-		<div class="my-6 grid sm:grid-cols-2 gap-4">
-			{/* Traditional */}
-			<div class="rounded-xl border border-red-500/30 bg-gradient-to-br from-slate-900 to-slate-800 p-4 shadow-lg">
-				<div class="text-sm font-medium text-red-400 mb-3">
-					Traditional Database
-				</div>
-				<div class="flex items-center gap-1 text-xs mb-3 flex-wrap">
-					<span class="px-2 py-1 rounded bg-slate-700 text-slate-300">App</span>
-					<span class="text-slate-500">→</span>
-					<span class="px-2 py-1 rounded bg-red-500/20 text-red-400">
-						Network
-					</span>
-					<span class="text-slate-500">→</span>
-					<span class="px-2 py-1 rounded bg-slate-700 text-slate-300">DB</span>
-					<span class="text-slate-500">→</span>
-					<span class="px-2 py-1 rounded bg-slate-700 text-slate-300">
-						Disk
-					</span>
-					<span class="text-slate-500">→</span>
-					<span class="text-slate-400">...</span>
-				</div>
-				<div class="text-sm">
-					<span class="text-slate-400">Latency:</span>
-					<span class="text-red-400 font-mono ml-2">1-10ms</span>
-					<span class="text-slate-500 text-xs ml-1">per operation</span>
-				</div>
-			</div>
+		<div class="not-prose grid gap-3 sm:grid-cols-2">
+			<Figure title="Client-server database" accent="red" variant="problem">
+				<Chain
+					steps={[
+						{ label: "App" },
+						{ label: "Network", accent: "red" },
+						{ label: "Server" },
+						{ label: "Storage" },
+						{ label: "Network", accent: "red" },
+						{ label: "App" },
+					]}
+				/>
+				<p class="mt-4 text-[14px] text-slate-400">
+					Each query is serialized, sent over a socket, executed in another
+					process, and sent back.
+				</p>
+			</Figure>
 
-			{/* KiteDB */}
-			<div class="rounded-xl border border-emerald-500/30 bg-gradient-to-br from-slate-900 to-slate-800 p-4 shadow-lg">
-				<div class="text-sm font-medium text-emerald-400 mb-3">
-					KiteDB (embedded)
-				</div>
-				<div class="flex items-center gap-1 text-xs mb-3">
-					<span class="px-2 py-1 rounded bg-slate-700 text-slate-300">App</span>
-					<span class="text-slate-500">→</span>
-					<span class="px-2 py-1 rounded bg-emerald-500/20 text-emerald-400">
-						Memory/Disk
-					</span>
-					<span class="text-slate-500">→</span>
-					<span class="px-2 py-1 rounded bg-slate-700 text-slate-300">App</span>
-				</div>
-				<div class="text-sm">
-					<span class="text-slate-400">Latency:</span>
-					<span class="text-emerald-400 font-mono ml-2">1-100μs</span>
-					<span class="text-slate-500 text-xs ml-1">per operation</span>
-				</div>
-			</div>
+			<Figure title="KiteDB, embedded" accent="cyan">
+				<Chain
+					steps={[
+						{ label: "App" },
+						{ label: "KiteDB", accent: "cyan" },
+						{ label: "Memory-mapped file" },
+					]}
+				/>
+				<p class="mt-4 text-[14px] text-slate-400">
+					Queries are function calls into a library in your process.
+				</p>
+				<dl class="mt-4 space-y-1 border-t border-kite-line pt-3 text-[13px]">
+					<For each={EMBEDDED_P50}>
+						{(row) => (
+							<div class="flex items-baseline justify-between gap-4">
+								<dt class="text-slate-400">{row.label}</dt>
+								<dd>
+									<Stat value={row.value} unit={row.unit} />
+								</dd>
+							</div>
+						)}
+					</For>
+				</dl>
+			</Figure>
 		</div>
 	);
 }
 
-// Zero-copy mmap comparison
-function ZeroCopyComparison() {
+function ReadPathComparison() {
 	return (
-		<div class="my-6 grid sm:grid-cols-2 gap-4">
-			{/* Traditional */}
-			<div class="rounded-xl border border-red-500/30 bg-gradient-to-br from-slate-900 to-slate-800 p-4 shadow-lg">
-				<div class="text-sm font-medium text-red-400 mb-3">
-					Traditional Read
-				</div>
-				<div class="space-y-1 text-xs mb-3">
-					<div class="flex items-center gap-2">
-						<span class="w-24 text-slate-400">Disk</span>
-						<span class="text-slate-500">→</span>
-						<span class="text-slate-300">Kernel buffer</span>
-					</div>
-					<div class="flex items-center gap-2">
-						<span class="w-24 text-slate-400" />
-						<span class="text-slate-500">→</span>
-						<span class="text-slate-300">User buffer</span>
-					</div>
-					<div class="flex items-center gap-2">
-						<span class="w-24 text-slate-400" />
-						<span class="text-slate-500">→</span>
-						<span class="text-slate-300">Parse → Use</span>
-					</div>
-				</div>
-				<div class="text-sm text-red-400">
-					2+ memory copies, allocation overhead
-				</div>
-			</div>
+		<div class="not-prose grid gap-3 sm:grid-cols-2">
+			<Figure title="Read into buffers" accent="red" variant="problem">
+				<Chain
+					steps={[
+						{ label: "Disk" },
+						{ label: "Kernel buffer" },
+						{ label: "User buffer", accent: "red" },
+						{ label: "Parse", accent: "red" },
+						{ label: "Use" },
+					]}
+				/>
+				<p class="mt-4 text-[14px] text-slate-400">
+					Data is copied into a user buffer, then decoded into objects before
+					the query can use it.
+				</p>
+			</Figure>
 
-			{/* KiteDB */}
-			<div class="rounded-xl border border-emerald-500/30 bg-gradient-to-br from-slate-900 to-slate-800 p-4 shadow-lg">
-				<div class="text-sm font-medium text-emerald-400 mb-3">
-					KiteDB (mmap)
-				</div>
-				<div class="space-y-1 text-xs mb-3">
-					<div class="flex items-center gap-2">
-						<span class="w-24 text-slate-400">Disk</span>
-						<span class="text-slate-500">→</span>
-						<span class="text-emerald-300">Page cache</span>
-					</div>
-					<div class="flex items-center gap-2">
-						<span class="w-24 text-slate-400" />
-						<span class="text-slate-500">→</span>
-						<span class="text-emerald-300">Direct access</span>
-					</div>
-				</div>
-				<div class="text-sm text-emerald-400">
-					0 copies — OS handles caching
-				</div>
-			</div>
+			<Figure title="KiteDB snapshot, memory-mapped" accent="cyan">
+				<Chain
+					steps={[
+						{ label: "Disk" },
+						{ label: "Page cache" },
+						{ label: "Read in place", accent: "cyan" },
+					]}
+				/>
+				<p class="mt-4 text-[14px] text-slate-400">
+					Uncompressed snapshot sections are read directly from mapped pages.
+					The OS keeps hot pages in RAM and evicts cold ones.
+				</p>
+			</Figure>
 		</div>
 	);
 }
 
-// Cache-friendly layout comparison
+const POINTER_CHAIN = ["0x7f3a10", "0x1c0820", "0x9e4410", "0x2b7730"];
+
+const OFFSETS = [
+	{ index: "n-1", value: "32" },
+	{ index: "n", value: "40", active: true },
+	{ index: "n+1", value: "50", active: true },
+	{ index: "n+2", value: "53" },
+];
+
+/** out_dst slots 38..51; slots 40..49 are node n's neighbors. */
+const DST_SLOTS = Array.from({ length: 14 }, (_, i) => 38 + i);
+
 function CacheFriendlyComparison() {
 	return (
-		<div class="my-6 rounded-xl border border-cyan-500/30 bg-gradient-to-br from-slate-900 to-slate-800 p-5 shadow-lg">
-			<h4 class="font-semibold text-cyan-400 mb-4">Traversing 10 Neighbors</h4>
-
+		<Figure title="Reading 10 neighbors of node n" accent="cyan">
 			<div class="space-y-3">
-				{/* Linked list */}
-				<div class="flex items-center gap-4 p-3 rounded-lg bg-red-500/10 border border-red-500/20">
-					<div class="w-24 text-sm font-medium text-red-400">Linked List</div>
-					<div class="flex-1 text-sm text-slate-400">
-						10 random accesses × <span class="font-mono">100ns</span>
+				<Panel label="Pointer-based adjacency" accent="red">
+					<div class="flex flex-wrap items-center gap-1.5">
+						<For each={POINTER_CHAIN}>
+							{(address, i) => (
+								<>
+									<Show when={i() > 0}>
+										<ArrowRight
+											size={13}
+											class="shrink-0 text-slate-600"
+											aria-hidden="true"
+										/>
+									</Show>
+									<span class={`${CELL} ${CELL_PLAIN}`}>{address}</span>
+								</>
+							)}
+						</For>
+						<span class="font-mono text-[12px] text-slate-500">…</span>
 					</div>
-					<div class="text-red-400 font-mono font-medium">= 1000ns</div>
-				</div>
+					<p class="mt-3 text-[13px] text-slate-400">
+						10 dependent loads at scattered addresses. Each next address is
+						known only after the previous load finishes, and each load can miss
+						the CPU cache.
+					</p>
+				</Panel>
 
-				{/* CSR */}
-				<div class="flex items-center gap-4 p-3 rounded-lg bg-emerald-500/10 border border-emerald-500/20">
-					<div class="w-24 text-sm font-medium text-emerald-400">CSR</div>
-					<div class="flex-1 text-sm text-slate-400">
-						1 seq read × <span class="font-mono">10ns</span> + 10 cache hits ×{" "}
-						<span class="font-mono">1ns</span>
+				<Panel label="CSR adjacency" accent="cyan">
+					<div class="overflow-x-auto">
+						<div class="min-w-[30rem] space-y-3">
+							<div class="flex items-end gap-3">
+								<span class="w-20 shrink-0 pb-1.5 font-mono text-[11px] text-slate-500">
+									out_offsets
+								</span>
+								<div class="flex gap-1">
+									<For each={OFFSETS}>
+										{(slot) => (
+											<div class="w-12">
+												<div class="mb-1 text-center font-mono text-[11px] text-slate-500">
+													{slot.index}
+												</div>
+												<div
+													class={`${CELL} ${slot.active ? CELL_HIGHLIGHT : CELL_PLAIN}`}
+												>
+													{slot.value}
+												</div>
+											</div>
+										)}
+									</For>
+								</div>
+							</div>
+							<div class="flex items-end gap-3">
+								<span class="w-20 shrink-0 pb-1.5 font-mono text-[11px] text-slate-500">
+									out_dst
+								</span>
+								<div class="flex gap-0.5">
+									<For each={DST_SLOTS}>
+										{(slot) => {
+											const active = slot >= 40 && slot < 50;
+											return (
+												<div class="w-7">
+													<div class="mb-1 text-center font-mono text-[10px] text-slate-600">
+														{slot}
+													</div>
+													<div
+														class={`h-6 rounded-sm border ${active ? "border-kite-cyan/30 bg-kite-cyan/15" : "border-kite-line bg-white/[0.03]"}`}
+													/>
+												</div>
+											);
+										}}
+									</For>
+								</div>
+							</div>
+						</div>
 					</div>
-					<div class="text-emerald-400 font-mono font-medium">= 20ns</div>
-				</div>
+					<p class="mt-3 text-[13px] text-slate-400">
+						Two adjacent offsets give the range{" "}
+						<span class="font-mono text-slate-200">[40, 50)</span>. The 10
+						neighbor IDs are contiguous u32 values, 40 bytes in{" "}
+						<span class="font-mono text-slate-200">out_dst</span> and 40 bytes
+						in <span class="font-mono text-slate-200">out_etype</span>: one or
+						two cache lines each, read sequentially.
+					</p>
+				</Panel>
 			</div>
 
-			<div class="mt-4 pt-3 border-t border-slate-700/50 text-center">
-				<span class="text-emerald-400 font-bold text-lg">50x</span>
-				<span class="text-slate-400 text-sm ml-2">
-					speedup for traversal operations
-				</span>
-			</div>
-		</div>
+			<p class="mt-4 border-t border-kite-line pt-3 text-[13px] text-slate-400">
+				Measured 1-hop outgoing traversal from a random node:{" "}
+				<Stat value="208" unit="ns" /> p50 (10k nodes, 50k edges).
+			</p>
+		</Figure>
 	);
 }
 
-// Lazy MVCC comparison
 function LazyMVCCComparison() {
 	return (
-		<div class="my-6 rounded-xl border border-violet-500/30 bg-gradient-to-br from-slate-900 to-slate-800 p-5 shadow-lg">
-			<h4 class="font-semibold text-violet-400 mb-4">
-				Version Chains: Only When Needed
-			</h4>
-
+		<Figure title="Version chains only when needed" accent="violet">
 			<div class="space-y-3">
-				{/* Serial */}
-				<div class="p-3 rounded-lg bg-emerald-500/10 border border-emerald-500/20">
-					<div class="flex items-center justify-between mb-1">
-						<span class="text-sm font-medium text-emerald-400">
-							Serial workload
-						</span>
-						<span class="text-xs text-slate-500">(no concurrent readers)</span>
-					</div>
-					<div class="flex items-center justify-between text-sm">
-						<span class="text-slate-400">Modify → Update in-place</span>
-						<span class="text-emerald-400 font-mono">Overhead: 0</span>
-					</div>
-				</div>
-
-				{/* Concurrent */}
-				<div class="p-3 rounded-lg bg-violet-500/10 border border-violet-500/20">
-					<div class="flex items-center justify-between mb-1">
-						<span class="text-sm font-medium text-violet-400">
-							Concurrent workload
-						</span>
-						<span class="text-xs text-slate-500">(active readers)</span>
-					</div>
-					<div class="flex items-center justify-between text-sm">
-						<span class="text-slate-400">Modify → Create version chain</span>
-						<span class="text-violet-400 font-mono">∝ concurrency</span>
-					</div>
-				</div>
+				<Panel label="No active readers" meta="serial workload">
+					<p class="text-[13px] text-slate-400">
+						A commit applies its changes to the delta. No version chain is
+						written.
+					</p>
+				</Panel>
+				<Panel label="Active readers" meta="concurrent workload">
+					<p class="text-[13px] text-slate-400">
+						A commit also appends a version for each changed node, edge, and
+						property, so readers on older snapshots keep a consistent view. The
+						cost grows with the number of changes made while readers are active.
+					</p>
+				</Panel>
 			</div>
-
-			<p class="text-xs text-slate-500 mt-4 pt-3 border-t border-slate-700/50">
-				Most workloads are mostly serial. MVCC overhead is paid only when
-				required.
+			<p class="mt-4 border-t border-kite-line pt-3 text-[13px] text-slate-500">
+				MVCC is off by default; enable it with <Code>mvcc: true</Code>. Old
+				versions are removed by MVCC garbage collection.
 			</p>
-		</div>
+		</Figure>
 	);
 }
 
-// Memory usage breakdown
+const MEMORY_PARTS: {
+	title: string;
+	meta?: string;
+	accent: Accent;
+	/** Bullet text with an optional inline identifier: `text` + `code` + `after`. */
+	items: { text: string; code?: string; after?: string }[];
+}[] = [
+	{
+		title: "Snapshot",
+		meta: "memory-mapped",
+		accent: "cyan",
+		items: [
+			{
+				text: "File pages live in the OS page cache: hot pages stay in RAM, cold pages are read from disk on demand.",
+			},
+			{
+				text: "Checkpoints compress sections with zstd by default. A compressed section is decompressed into process memory and cached.",
+			},
+		],
+	},
+	{
+		title: "Delta",
+		meta: "in memory",
+		accent: "violet",
+		items: [
+			{
+				text: "Hash maps of created and modified nodes, edge patches, edge properties, and key changes.",
+			},
+			{ text: "Each added edge is recorded twice, once per direction." },
+			{
+				text: "Grows with writes until a checkpoint folds it into a new snapshot.",
+			},
+		],
+	},
+	{
+		title: "Caches",
+		meta: "off by default",
+		accent: "amber",
+		items: [
+			{
+				text: "Enabled with the ",
+				code: "cacheEnabled",
+				after: " open option.",
+			},
+			{
+				text: "Property cache: LRU, 10K node and 10K edge entries by default.",
+			},
+			{ text: "Traversal cache: LRU, invalidated when a node changes." },
+		],
+	},
+	{
+		title: "MVCC version chains",
+		meta: "MVCC only",
+		accent: "mint",
+		items: [
+			{ text: "Only exist when MVCC is enabled (off by default)." },
+			{ text: "Only written while readers are active during a commit." },
+			{ text: "Removed by garbage collection." },
+		],
+	},
+];
+
 function MemoryUsageBreakdown() {
 	return (
-		<div class="my-6 rounded-xl border border-slate-600/30 bg-gradient-to-br from-slate-900 to-slate-800 p-5 shadow-lg">
-			<h4 class="font-semibold text-slate-400 mb-4">Memory Breakdown</h4>
-
-			<div class="space-y-3">
-				{/* Snapshot */}
-				<div class="p-3 rounded-lg bg-cyan-500/10 border border-cyan-500/20">
-					<div class="flex items-center justify-between mb-2">
-						<span class="text-sm font-medium text-cyan-400">
-							1. Snapshot (mmap'd)
-						</span>
-					</div>
-					<ul class="space-y-1 text-xs text-slate-400 ml-4">
-						<li>• Not counted against process memory</li>
-						<li>• OS manages page cache</li>
-						<li>• Hot pages in RAM, cold pages on disk</li>
-					</ul>
-				</div>
-
-				{/* Delta */}
-				<div class="p-3 rounded-lg bg-violet-500/10 border border-violet-500/20">
-					<div class="flex items-center justify-between mb-2">
-						<span class="text-sm font-medium text-violet-400">2. Delta</span>
-					</div>
-					<div class="grid grid-cols-2 gap-2 text-xs ml-4">
-						<div class="flex justify-between">
-							<span class="text-slate-400">Created nodes:</span>
-							<span class="text-slate-300 font-mono">~200 B/node</span>
-						</div>
-						<div class="flex justify-between">
-							<span class="text-slate-400">Modified nodes:</span>
-							<span class="text-slate-300 font-mono">~100 B/change</span>
-						</div>
-						<div class="flex justify-between">
-							<span class="text-slate-400">Edges:</span>
-							<span class="text-slate-300 font-mono">~20 B/edge</span>
-						</div>
-					</div>
-				</div>
-
-				{/* Caches */}
-				<div class="p-3 rounded-lg bg-amber-500/10 border border-amber-500/20">
-					<div class="flex items-center justify-between mb-2">
-						<span class="text-sm font-medium text-amber-400">3. Caches</span>
-						<span class="text-xs text-slate-500">(configurable)</span>
-					</div>
-					<ul class="space-y-1 text-xs text-slate-400 ml-4">
-						<li>• Property cache: LRU, default 10K entries</li>
-						<li>• Traversal cache: LRU, invalidated on writes</li>
-					</ul>
-				</div>
-
-				{/* MVCC */}
-				<div class="p-3 rounded-lg bg-slate-700/30 border border-slate-600/30">
-					<div class="flex items-center justify-between mb-2">
-						<span class="text-sm font-medium text-slate-400">
-							4. MVCC version chains
-						</span>
-					</div>
-					<ul class="space-y-1 text-xs text-slate-500 ml-4">
-						<li>• Only when concurrent transactions exist</li>
-						<li>• Cleaned up by GC</li>
-					</ul>
-				</div>
+		<Figure title="Where memory goes">
+			<div class="grid gap-3 sm:grid-cols-2">
+				<For each={MEMORY_PARTS}>
+					{(part, i) => (
+						<Panel
+							label={`${i() + 1}. ${part.title}`}
+							accent={part.accent}
+							meta={part.meta}
+						>
+							<ul class="space-y-1.5 text-[13px] text-slate-400">
+								<For each={part.items}>
+									{(item) => (
+										<li class="flex gap-2.5">
+											<span
+												class="mt-[0.6em] h-1 w-1 shrink-0 rounded-full bg-slate-600"
+												aria-hidden="true"
+											/>
+											<span>
+												{item.text}
+												<Show when={item.code}>
+													{(code) => <Code>{code()}</Code>}
+												</Show>
+												{item.after}
+											</span>
+										</li>
+									)}
+								</For>
+							</ul>
+						</Panel>
+					)}
+				</For>
 			</div>
-
-			{/* Example */}
-			<div class="mt-4 pt-4 border-t border-slate-700/50 p-3 rounded-lg bg-emerald-500/10 border border-emerald-500/20">
-				<p class="text-xs text-slate-500 mb-2">Typical 100K node graph:</p>
-				<div class="flex justify-between text-sm">
-					<span class="text-slate-400">Snapshot on disk:</span>
-					<span class="text-slate-300 font-mono">~10MB (compressed)</span>
-				</div>
-				<div class="flex justify-between text-sm">
-					<span class="text-slate-400">Memory footprint:</span>
-					<span class="text-emerald-400 font-mono font-medium">~5MB</span>
-				</div>
-			</div>
-		</div>
+		</Figure>
 	);
 }
 
@@ -291,121 +395,142 @@ export function PerformancePage() {
 	return (
 		<DocPage slug="internals/performance">
 			<p>
-				KiteDB is designed for speed. This page explains why it's fast and how
-				to get the best performance from it.
+				This page explains where KiteDB's read and write latency comes from,
+				shows measured results, and covers the settings that trade durability
+				for throughput.
 			</p>
 
-			<h2 id="why-fast">Why KiteDB is Fast</h2>
+			<h2 id="why-fast">What keeps latency low</h2>
 
-			<h3>1. No Network Overhead</h3>
+			<h3>1. No network round trip</h3>
 			<NetworkOverheadComparison />
-			<p class="text-sm text-slate-400 mb-6">
-				<span class="text-emerald-400 font-bold">10-1000x</span> speedup just
-				from eliminating network.
+			<p>
+				The p50 figures come from the benchmark run described under{" "}
+				<a href="#benchmarks">benchmark results</a>.
 			</p>
 
-			<h3>2. Zero-Copy Memory Mapping</h3>
-			<ZeroCopyComparison />
-			<p class="text-sm text-slate-400 mb-6">
-				Hot data stays in RAM automatically. Cold data is paged in on demand.
+			<h3>2. Memory-mapped snapshot</h3>
+			<ReadPathComparison />
+			<p>
+				Hot data stays in RAM and cold data is paged in on demand. Checkpoints
+				compress snapshot sections with zstd by default; a compressed section is
+				decompressed once and cached in memory, so only uncompressed sections
+				are read in place.
 			</p>
 
-			<h3>3. Cache-Friendly Data Layout</h3>
+			<h3>3. Cache-friendly data layout</h3>
 			<CacheFriendlyComparison />
 
 			<h3>4. Lazy MVCC</h3>
 			<LazyMVCCComparison />
 
-			<h2 id="benchmarks">Benchmark Results</h2>
+			<h2 id="benchmarks">Benchmark results</h2>
 
 			<p>
-				Latest snapshot (single-file raw, Rust core, 10k nodes / 50k edges,
-				edge types=3, edge props=10, syncMode=Normal, groupCommitEnabled=false,
-				February 4, 2026):
+				Latest run: single-file raw benchmark on the Rust core, 10k nodes, 50k
+				edges, 3 edge types, 10 edge properties, <code>syncMode=Normal</code>,{" "}
+				<code>groupCommitEnabled=false</code>, Apple M4, February 4, 2026.
 			</p>
 
-			<h3>Node Ops</h3>
+			<h3>Node operations</h3>
 			<table>
 				<thead>
 					<tr>
 						<th>Operation</th>
 						<th>p50</th>
+						<th>p95</th>
 					</tr>
 				</thead>
 				<tbody>
 					<tr>
 						<td>Key lookup (random existing)</td>
-						<td>125ns</td>
+						<td>125 ns</td>
+						<td>291 ns</td>
 					</tr>
 					<tr>
 						<td>Batch write (100 nodes)</td>
-						<td>34.08us</td>
+						<td>34.08 µs</td>
+						<td>56.54 µs</td>
 					</tr>
 				</tbody>
 			</table>
 
-			<h3>Edge Ops</h3>
+			<h3>Edge operations</h3>
 			<table>
 				<thead>
 					<tr>
 						<th>Operation</th>
 						<th>p50</th>
+						<th>p95</th>
 					</tr>
 				</thead>
 				<tbody>
 					<tr>
 						<td>1-hop traversal (out)</td>
-						<td>208ns</td>
+						<td>208 ns</td>
+						<td>292 ns</td>
 					</tr>
 					<tr>
 						<td>Edge exists (random)</td>
-						<td>83ns</td>
+						<td>83 ns</td>
+						<td>125 ns</td>
 					</tr>
 					<tr>
 						<td>Batch write (100 edges)</td>
-						<td>40.25us</td>
+						<td>40.25 µs</td>
+						<td>65.58 µs</td>
 					</tr>
 					<tr>
 						<td>Batch write (100 edges + props)</td>
-						<td>172.33us</td>
+						<td>172.33 µs</td>
+						<td>253.12 µs</td>
 					</tr>
 				</tbody>
 			</table>
 
 			<p>
-				Full logs and run commands are in <code>docs/benchmarks/results/</code>.
+				Raw log:{" "}
+				<code>
+					docs/benchmarks/results/2026-02-04-single-file-raw-rust-edges-normal-nogc.txt
+				</code>
+				. Other runs and their commands are in{" "}
+				<code>docs/benchmarks/results/</code>.
 			</p>
 
-			<h3>Write Durability vs Throughput</h3>
-			<ul class="space-y-2 text-sm text-slate-400">
+			<h3>Write durability vs. throughput</h3>
+			<ul>
 				<li>
-					<b class="text-slate-200">Defaults stay safe:</b> <code>syncMode=Full</code>,{" "}
-					<code>groupCommitEnabled=false</code>.
+					<strong>Defaults:</strong> <code>syncMode=Full</code>,{" "}
+					<code>groupCommitEnabled=false</code>, an fsync on every commit.
 				</li>
 				<li>
-					<b class="text-slate-200">Single-writer, low latency:</b>{" "}
+					<strong>Single writer, low latency:</strong>{" "}
 					<code>syncMode=Normal</code> + <code>groupCommitEnabled=false</code>.
 				</li>
 				<li>
-					<b class="text-slate-200">Multi-writer throughput:</b>{" "}
-					<code>syncMode=Normal</code> + <code>groupCommitEnabled=true</code> (1-2ms).
-					<span class="text-slate-500">
-						{" "}
-						Scaling saturates quickly; prefer prep-parallel + single writer for max ingest. See{" "}
-						<a href="/docs/benchmarks#parallel-write-scaling">benchmarks notes</a>.
-					</span>
+					<strong>Multi-writer throughput:</strong> <code>syncMode=Normal</code>{" "}
+					+ <code>groupCommitEnabled=true</code> (1-2 ms window). In an 8-thread
+					benchmark, group commit raised throughput from 724 to 868 transactions
+					per second. Scaling flattens after a few writers, so for maximum
+					ingest, prepare data in parallel and funnel writes through one writer.
+					See the{" "}
+					<a href="/docs/benchmarks#parallel-write-scaling">
+						parallel write scaling notes
+					</a>
+					.
 				</li>
 				<li>
-					<b class="text-slate-200">Highest speed, weakest durability:</b>{" "}
-					<code>syncMode=Off</code> (testing/throwaway only).
+					<strong>Fastest, least durable:</strong> <code>syncMode=Off</code>,
+					for tests and throwaway data only.
 				</li>
 			</ul>
-			<p class="text-sm text-slate-500 mt-3">
-				Group commit adds intentional latency to coalesce commits; it improves
-				throughput under concurrency, but can slow single-threaded benchmarks.
+			<p>
+				Group commit holds commits for a short window so they can share one
+				sync. That raises throughput with concurrent writers but can slow
+				single-threaded benchmarks.
 			</p>
 
-			<h4 class="mt-6">Decision Table</h4>
+			<h4>Decision table</h4>
 			<table>
 				<thead>
 					<tr>
@@ -431,48 +556,51 @@ export function PerformancePage() {
 					<tr>
 						<td>Multi-writer throughput</td>
 						<td>Normal</td>
-						<td>On (1-2ms)</td>
+						<td>On (1-2 ms)</td>
 						<td>Coalesces commits</td>
 					</tr>
 					<tr>
-						<td>Testing/throwaway data</td>
+						<td>Testing, throwaway data</td>
 						<td>Off</td>
 						<td>Off</td>
-						<td>Max speed, weakest durability</td>
+						<td>Fastest, weakest durability</td>
 					</tr>
 				</tbody>
 			</table>
 
-			<h2 id="playbook">Performance Playbook</h2>
-			<ul class="space-y-2 text-sm text-slate-400">
+			<h2 id="playbook">Performance playbook</h2>
+			<ul>
 				<li>
-					<b class="text-slate-200">Fastest ingest (single writer):</b>{" "}
+					<strong>Fastest ingest (single writer):</strong>{" "}
 					<code>beginBulk()</code> + <code>createNodesBatch()</code> +{" "}
 					<code>addEdgesBatch()</code> / <code>addEdgesWithPropsBatch()</code>,{" "}
-					<code>syncMode=Normal</code>, <code>groupCommitEnabled=false</code>, WAL ≥ 256MB,
-					auto-checkpoint off during ingest, then checkpoint.
+					<code>syncMode=Normal</code>, <code>groupCommitEnabled=false</code>, a
+					WAL of 256 MB or more, auto-checkpoint off during ingest, then a
+					checkpoint.
 				</li>
 				<li>
-					<b class="text-slate-200">Multi-writer throughput:</b>{" "}
-					<code>syncMode=Normal</code> + <code>groupCommitEnabled=true</code> (1-2ms window),
-					batched ops per transaction.
+					<strong>Multi-writer throughput:</strong> <code>syncMode=Normal</code>{" "}
+					+ <code>groupCommitEnabled=true</code> (1-2 ms window), several
+					operations per transaction.
 				</li>
 				<li>
-					<b class="text-slate-200">Read-heavy, mixed workload:</b>{" "}
-					Keep batches small, checkpoint when WAL ≥ 80%, avoid deep traversals.
+					<strong>Read-heavy, mixed workload:</strong> keep write batches small,
+					leave auto-checkpoint on (it runs at 50% WAL usage by default; tune
+					with <code>checkpointThreshold</code>), and bound traversal depth.
 				</li>
 				<li>
-					<b class="text-slate-200">Max speed, lowest durability:</b>{" "}
-					<code>syncMode=Off</code> for testing only.
+					<strong>Fastest, least durable:</strong> <code>syncMode=Off</code>,
+					for testing only.
 				</li>
 			</ul>
-			<p class="text-sm text-slate-500 mt-3">
-				Bulk-load mode requires MVCC disabled. Use it for one-shot ingest or ETL jobs.
+			<p>
+				Bulk-load mode requires MVCC to be disabled, which is the default. Use
+				it for one-shot ingest or ETL jobs.
 			</p>
 
-			<h3 class="mt-6">Bulk Ingest Example (Low-Level)</h3>
+			<h3>Bulk ingest example (low-level API)</h3>
 			<CodeBlock
-				code={`// Fast ingest: low-level API
+				code={`// Bulk ingest with the low-level API
 db.beginBulk();
 const nodeIds = db.createNodesBatch(keys); // keys: string[]
 db.addEdgesBatch(edges); // edges: { src, etype, dst }[]
@@ -484,28 +612,30 @@ db.checkpoint();`}
 				language="typescript"
 			/>
 
-			<h2 id="best-practices">Best Practices</h2>
+			<h2 id="best-practices">Best practices</h2>
 
-			<h3>Batch Writes</h3>
+			<h3>Batch writes</h3>
 			<CodeBlock
-				code={`// Slow: Individual inserts (1 WAL sync per op)
+				code={`// Slow: one transaction (and one WAL sync) per node
 for (const key of keys) {
+  db.begin();
   db.createNode(key);
+  db.commit();
 }
 
-// Fast: Batch + bulk-load transaction
+// Fast: one bulk-load transaction for the whole batch
 db.beginBulk();
 db.createNodesBatch(keys);
 db.commit();
 
-// 1000 nodes × 1μs + 1 WAL sync = ~2ms`}
+// Rust core benchmark: 100 nodes per batch, 34.08 µs p50 (syncMode=Normal)`}
 				language="typescript"
 			/>
 
-			<h3>Limit Traversal Depth</h3>
+			<h3>Limit traversal depth</h3>
 			<CodeBlock
 				code={`// Potentially expensive: deep traversal
-const alice = await db.get(user, 'alice');
+const alice = db.get(user, 'alice');
 const all = db
   .from(alice)
   .traverse(follows, { direction: 'out', maxDepth: 10 })
@@ -522,34 +652,34 @@ const friends = db
 				language="typescript"
 			/>
 
-			<h3>Use Keys for Lookups</h3>
+			<h3>Use keys for lookups</h3>
 			<CodeBlock
-				code={`// Fast: Key lookup (O(1) hash index)
-const alice = await db.get(user, 'alice');
+				code={`// Fast: key lookup (O(1) hash index)
+const alice = db.get(user, 'alice');
 
-// Slower: Property scan (O(n) nodes, done in JS)
+// Slower: property scan (O(n) nodes, done in JS)
 const aliceByName = db.all(user).find((u) => u.name === 'Alice');
 
-Design keys to match your access patterns.`}
+// Design keys to match your access patterns.`}
 				language="typescript"
 			/>
 
-			<h3>Checkpoint Timing</h3>
+			<h3>Checkpoint timing</h3>
 			<CodeBlock
-				code={`// For write-heavy bursts: Compact snapshots after large ingests
+				code={`// After a large ingest, fold the delta into a fresh snapshot
 await importLargeDataset();
-db.optimize();
+db.checkpoint();
 
 // Inspect storage stats
 const stats = db.stats();`}
 				language="typescript"
 			/>
 
-			<h2 id="memory">Memory Usage</h2>
+			<h2 id="memory">Memory usage</h2>
 
 			<MemoryUsageBreakdown />
 
-			<h2 id="profiling">Profiling Tips</h2>
+			<h2 id="profiling">Profiling tips</h2>
 
 			<CodeBlock
 				code={`// Get database statistics
@@ -564,23 +694,23 @@ console.log(stats);
 //   recommendCompact: false
 // }
 
-// If recommendCompact is true:
-// → Run db.checkpoint() or db.optimize()`}
+// If recommendCompact is true, run db.checkpoint()`}
 				language="typescript"
 			/>
 
-			<h2 id="next">Next Steps</h2>
+			<h2 id="next">Next steps</h2>
 			<ul>
 				<li>
-					<a href="/docs/internals/csr">CSR Format</a> – Why traversals are fast
+					<a href="/docs/internals/csr">CSR format</a>: how adjacency is laid
+					out for traversal
 				</li>
 				<li>
-					<a href="/docs/internals/snapshot-delta">Snapshot + Delta</a> – How
-					reads stay fast during writes
+					<a href="/docs/internals/snapshot-delta">Snapshot and delta</a>: how
+					reads stay consistent during writes
 				</li>
 				<li>
-					<a href="/docs/benchmarks">Benchmarks</a> – Detailed performance
-					measurements
+					<a href="/docs/benchmarks">Benchmarks</a>: full measurements and run
+					commands
 				</li>
 			</ul>
 		</DocPage>

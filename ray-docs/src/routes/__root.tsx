@@ -16,18 +16,20 @@ import { SearchDialog, SearchKeyboardShortcut, searchDialog } from "../component
 
 function RootErrorComponent({ error }: { error: Error }) {
   return (
-    <div class="min-h-screen flex items-center justify-center bg-[#030712] text-white p-8">
-      <div class="max-w-md text-center">
-        <h1 class="text-4xl font-bold text-[#00d4ff] mb-4">Oops!</h1>
-        <p class="text-slate-400 mb-6">Something went wrong.</p>
-        <pre class="text-left text-sm bg-[#0a1628] p-4 rounded-lg overflow-auto text-red-400 mb-6">
+    <div class="min-h-screen flex items-center justify-center bg-kite-bg text-white p-8">
+      <div class="w-full max-w-lg">
+        <p class="eyebrow">Error</p>
+        <h1 class="mt-4 text-[2.25rem] font-semibold leading-[1.08] tracking-[-0.035em]">
+          Something went wrong
+        </h1>
+        <pre class="mt-6 overflow-auto rounded-xl border border-kite-line bg-kite-surface p-4 font-mono text-[13px] text-red-300">
           {error.message}
         </pre>
         <a
           href="/"
-          class="inline-flex items-center gap-2 px-6 py-3 bg-[#00d4ff] text-black font-semibold rounded-lg hover:bg-[#00d4ff]/90 transition-colors"
+          class="mt-8 inline-flex h-10 items-center rounded-xl bg-white px-4 text-[14px] font-semibold text-kite-bg transition-colors hover:bg-slate-200"
         >
-          Go Home
+          Back to the homepage
         </a>
       </div>
     </div>
@@ -42,7 +44,7 @@ export const Route = createRootRouteWithContext()({
       {
         name: "description",
         content:
-          "KiteDB - High-performance embedded graph database with vector search for Bun/TypeScript",
+          "KiteDB is an embedded graph database with built-in vector search for TypeScript, Python, and Rust.",
       },
       { name: "theme-color", content: "#05070d" },
     ],
@@ -78,15 +80,15 @@ function RootComponent() {
         <link rel="stylesheet" href={stylesHref} />
         <HydrationScript />
       </head>
-      <body class="min-h-screen bg-[#05070d] text-white antialiased">
+      <body class="min-h-screen bg-kite-bg text-white antialiased">
         <HeadContent />
         <Suspense
           fallback={
-            <div class="min-h-screen flex items-center justify-center bg-[#030712]">
+            <div class="min-h-screen flex items-center justify-center bg-kite-bg">
               <div class="flex items-center gap-3">
-                <div class="w-2 h-2 bg-[#00d4ff] rounded-full animate-pulse" />
-                <div class="w-2 h-2 bg-[#00d4ff] rounded-full animate-pulse [animation-delay:200ms]" />
-                <div class="w-2 h-2 bg-[#00d4ff] rounded-full animate-pulse [animation-delay:400ms]" />
+                <div class="w-2 h-2 bg-kite-cyan rounded-full animate-pulse" />
+                <div class="w-2 h-2 bg-kite-cyan rounded-full animate-pulse [animation-delay:200ms]" />
+                <div class="w-2 h-2 bg-kite-cyan rounded-full animate-pulse [animation-delay:400ms]" />
               </div>
             </div>
           }
