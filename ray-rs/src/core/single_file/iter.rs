@@ -39,21 +39,11 @@ impl NodeIterator {
     let tx_handle = db.current_tx_handle();
     let tx_guard = tx_handle.as_ref().map(|tx| tx.lock());
     let pending = tx_guard.as_ref().map(|tx| &tx.pending);
-    let mut txid = 0;
-    let mut tx_snapshot_ts = 0;
-    let vc_guard = if let Some(mvcc) = db.mvcc.as_ref() {
-      if let Some(tx) = tx_guard.as_ref() {
-        txid = tx.txid;
-        tx_snapshot_ts = tx.snapshot_ts;
-      } else {
-        tx_snapshot_ts = mvcc.tx_manager.lock().next_commit_ts();
-      }
-      Some(mvcc.version_chain.lock())
-    } else {
-      None
-    };
+    // Lock order: see read.rs.
+    let (txid, tx_snapshot_ts) = db.mvcc_read_ts(tx_guard.as_deref());
     let delta = db.delta.read();
     let snapshot = db.snapshot.read();
+    let vc_guard = db.mvcc.as_ref().map(|mvcc| mvcc.version_chain.lock());
 
     // 1. Collect nodes from snapshot (excluding deleted)
     if let Some(ref snap) = *snapshot {
@@ -182,21 +172,11 @@ impl SingleFileDB {
     let tx_handle = self.current_tx_handle();
     let tx_guard = tx_handle.as_ref().map(|tx| tx.lock());
     let pending = tx_guard.as_ref().map(|tx| &tx.pending);
-    let mut txid = 0;
-    let mut tx_snapshot_ts = 0;
-    let vc_guard = if let Some(mvcc) = self.mvcc.as_ref() {
-      if let Some(tx) = tx_guard.as_ref() {
-        txid = tx.txid;
-        tx_snapshot_ts = tx.snapshot_ts;
-      } else {
-        tx_snapshot_ts = mvcc.tx_manager.lock().next_commit_ts();
-      }
-      Some(mvcc.version_chain.lock())
-    } else {
-      None
-    };
+    // Lock order: see read.rs.
+    let (txid, tx_snapshot_ts) = self.mvcc_read_ts(tx_guard.as_deref());
     let delta = self.delta.read();
     let snapshot = self.snapshot.read();
+    let vc_guard = self.mvcc.as_ref().map(|mvcc| mvcc.version_chain.lock());
     let mut edges = Vec::new();
     let mut read_srcs = (self.mvcc.is_some() && txid != 0).then(HashSet::<NodeId>::new);
 
@@ -352,6 +332,7 @@ impl SingleFileDB {
       }
     }
 
+    drop(vc_guard);
     if let (Some(mvcc), Some(srcs)) = (self.mvcc.as_ref(), read_srcs) {
       let mut tx_mgr = mvcc.tx_manager.lock();
       if let Some(filter_etype) = etype_filter {

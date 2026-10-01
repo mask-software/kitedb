@@ -2,6 +2,18 @@
 //!
 //! Handles all query operations: get properties, get edges, key lookups,
 //! label checks, and neighbor traversal.
+//!
+//! # Lock order
+//!
+//! `delta` -> `snapshot` -> `mvcc.tx_manager` -> `mvcc.version_chain` -> `mvcc.gc`
+//!
+//! Every path that holds more than one of these takes them in this order: commit holds
+//! `delta.write()` -> `snapshot.read()` -> `version_chain`, and GC holds `tx_manager` ->
+//! `version_chain` -> `gc` (`mvcc/manager.rs`). Readers compute their MVCC timestamp first,
+//! take `version_chain` last, and drop it before `record_read`. `delta` and `snapshot` are
+//! task-fair RwLocks: a queued writer blocks new readers, so even a read guard must never be
+//! requested while a later lock is held. The calling thread's own tx state mutex is private
+//! to that thread and sits outside this order, but it is not reentrant: never lock it twice.
 
 use std::collections::HashMap;
 
@@ -10,9 +22,33 @@ use crate::mvcc::visibility::{
 };
 use crate::types::*;
 
-use super::SingleFileDB;
+use super::{SingleFileDB, SingleFileTxState};
 
 impl SingleFileDB {
+  /// MVCC visibility context `(txid, snapshot_ts)`: the transaction's snapshot inside a
+  /// transaction, the latest commit outside one, and `(0, 0)` with MVCC disabled.
+  pub(super) fn mvcc_read_ts(&self, tx: Option<&SingleFileTxState>) -> (TxId, Timestamp) {
+    match (self.mvcc.as_ref(), tx) {
+      (None, _) => (0, 0),
+      (Some(_), Some(tx)) => (tx.txid, tx.snapshot_ts),
+      (Some(mvcc), None) => (0, mvcc.tx_manager.lock().next_commit_ts()),
+    }
+  }
+
+  /// MVCC visibility of a node, or `None` when its version chain has no entry.
+  /// Holds `version_chain` only for the lookup.
+  fn mvcc_node_visible(
+    &self,
+    node_id: NodeId,
+    tx_snapshot_ts: Timestamp,
+    txid: TxId,
+  ) -> Option<bool> {
+    let mvcc = self.mvcc.as_ref()?;
+    let vc = mvcc.version_chain.lock();
+    vc.node_version(node_id)
+      .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid))
+  }
+
   // ========================================================================
   // Node Property Reads
   // ========================================================================
@@ -30,17 +66,7 @@ impl SingleFileDB {
       return None;
     }
 
-    let mut txid = 0;
-    let mut tx_snapshot_ts = 0;
-    if let Some(mvcc) = self.mvcc.as_ref() {
-      if let Some(tx) = tx_guard.as_ref() {
-        txid = tx.txid;
-        tx_snapshot_ts = tx.snapshot_ts;
-      } else {
-        tx_snapshot_ts = mvcc.tx_manager.lock().next_commit_ts();
-      }
-    }
-
+    let (txid, tx_snapshot_ts) = self.mvcc_read_ts(tx_guard.as_deref());
     let delta = self.delta.read();
 
     let mut props = HashMap::new();
@@ -263,17 +289,7 @@ impl SingleFileDB {
       return None;
     }
 
-    let mut txid = 0;
-    let mut tx_snapshot_ts = 0;
-    if let Some(mvcc) = self.mvcc.as_ref() {
-      if let Some(tx) = tx_guard.as_ref() {
-        txid = tx.txid;
-        tx_snapshot_ts = tx.snapshot_ts;
-      } else {
-        tx_snapshot_ts = mvcc.tx_manager.lock().next_commit_ts();
-      }
-    }
-
+    let (txid, tx_snapshot_ts) = self.mvcc_read_ts(tx_guard.as_deref());
     let delta = self.delta.read();
 
     let mut mvcc_src_visible = None;
@@ -564,26 +580,16 @@ impl SingleFileDB {
     let tx_handle = self.current_tx_handle();
     let tx_guard = tx_handle.as_ref().map(|tx| tx.lock());
     let pending = tx_guard.as_ref().map(|tx| &tx.pending);
-    let mut txid = 0;
-    let mut tx_snapshot_ts = 0;
-    let vc_guard = if let Some(mvcc) = self.mvcc.as_ref() {
-      if let Some(tx) = tx_guard.as_ref() {
-        txid = tx.txid;
-        tx_snapshot_ts = tx.snapshot_ts;
-      } else {
-        tx_snapshot_ts = mvcc.tx_manager.lock().next_commit_ts();
-      }
-      Some(mvcc.version_chain.lock())
-    } else {
-      None
-    };
 
     // If node is deleted, no edges
     if pending.is_some_and(|p| p.is_node_deleted(node_id)) {
       return Vec::new();
     }
 
+    let (txid, tx_snapshot_ts) = self.mvcc_read_ts(tx_guard.as_deref());
     let delta = self.delta.read();
+    let snapshot = self.snapshot.read();
+    let vc_guard = self.mvcc.as_ref().map(|mvcc| mvcc.version_chain.lock());
 
     // If node is deleted in committed state, no edges
     let node_visible = vc_guard
@@ -594,7 +600,6 @@ impl SingleFileDB {
       return Vec::new();
     }
 
-    let snapshot = self.snapshot.read();
     let mut capacity = 0usize;
     if let Some(ref snap) = *snapshot {
       if let Some(phys) = snap.phys_node(node_id) {
@@ -690,6 +695,7 @@ impl SingleFileDB {
     edges.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     edges.dedup();
 
+    drop(vc_guard);
     if let Some(mvcc) = self.mvcc.as_ref() {
       if txid != 0 {
         let mut tx_mgr = mvcc.tx_manager.lock();
@@ -715,26 +721,16 @@ impl SingleFileDB {
     let tx_handle = self.current_tx_handle();
     let tx_guard = tx_handle.as_ref().map(|tx| tx.lock());
     let pending = tx_guard.as_ref().map(|tx| &tx.pending);
-    let mut txid = 0;
-    let mut tx_snapshot_ts = 0;
-    let vc_guard = if let Some(mvcc) = self.mvcc.as_ref() {
-      if let Some(tx) = tx_guard.as_ref() {
-        txid = tx.txid;
-        tx_snapshot_ts = tx.snapshot_ts;
-      } else {
-        tx_snapshot_ts = mvcc.tx_manager.lock().next_commit_ts();
-      }
-      Some(mvcc.version_chain.lock())
-    } else {
-      None
-    };
 
     // If node is deleted, no edges
     if pending.is_some_and(|p| p.is_node_deleted(node_id)) {
       return Vec::new();
     }
 
+    let (txid, tx_snapshot_ts) = self.mvcc_read_ts(tx_guard.as_deref());
     let delta = self.delta.read();
+    let snapshot = self.snapshot.read();
+    let vc_guard = self.mvcc.as_ref().map(|mvcc| mvcc.version_chain.lock());
 
     // If node is deleted, no edges
     let node_visible = vc_guard
@@ -745,7 +741,6 @@ impl SingleFileDB {
       return Vec::new();
     }
 
-    let snapshot = self.snapshot.read();
     let mut capacity = 0usize;
     if let Some(ref snap) = *snapshot {
       if let Some(phys) = snap.phys_node(node_id) {
@@ -841,6 +836,7 @@ impl SingleFileDB {
     edges.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     edges.dedup();
 
+    drop(vc_guard);
     if let Some(mvcc) = self.mvcc.as_ref() {
       if txid != 0 {
         let mut tx_mgr = mvcc.tx_manager.lock();
@@ -951,104 +947,8 @@ impl SingleFileDB {
       return true;
     }
 
-    let mut txid = 0;
-    let mut tx_snapshot_ts = 0;
-    let vc_guard = if let Some(mvcc) = self.mvcc.as_ref() {
-      if let Some(tx) = tx_guard.as_ref() {
-        txid = tx.txid;
-        tx_snapshot_ts = tx.snapshot_ts;
-      } else {
-        tx_snapshot_ts = mvcc.tx_manager.lock().next_commit_ts();
-      }
-      Some(mvcc.version_chain.lock())
-    } else {
-      None
-    };
-
-    let node_visible = vc_guard
-      .as_ref()
-      .and_then(|vc| vc.node_version(node_id))
-      .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
-    if node_visible == Some(false) {
-      if let Some(mvcc) = self.mvcc.as_ref() {
-        if txid != 0 {
-          let mut tx_mgr = mvcc.tx_manager.lock();
-          tx_mgr.record_read(txid, TxKey::NodeLabels(node_id));
-          tx_mgr.record_read(txid, TxKey::NodeLabel { node_id, label_id });
-        }
-      }
-      return false;
-    }
-
-    if let Some(vc) = vc_guard.as_ref() {
-      if let Some(label_version) = vc.node_label_version(node_id, label_id) {
-        if let Some(visible) = visible_version(&label_version, tx_snapshot_ts, txid) {
-          if let Some(mvcc) = self.mvcc.as_ref() {
-            if txid != 0 {
-              let mut tx_mgr = mvcc.tx_manager.lock();
-              tx_mgr.record_read(txid, TxKey::NodeLabels(node_id));
-              tx_mgr.record_read(txid, TxKey::NodeLabel { node_id, label_id });
-            }
-          }
-          return visible.data.unwrap_or(false);
-        }
-      }
-    }
-
-    let delta = self.delta.read();
-
-    // Check if node is deleted
-    if node_visible.is_none() && delta.is_node_deleted(node_id) {
-      if let Some(mvcc) = self.mvcc.as_ref() {
-        if txid != 0 {
-          let mut tx_mgr = mvcc.tx_manager.lock();
-          tx_mgr.record_read(txid, TxKey::NodeLabels(node_id));
-          tx_mgr.record_read(txid, TxKey::NodeLabel { node_id, label_id });
-        }
-      }
-      return false;
-    }
-
-    // Check if label was removed in delta
-    if delta.is_label_removed(node_id, label_id) {
-      if let Some(mvcc) = self.mvcc.as_ref() {
-        if txid != 0 {
-          let mut tx_mgr = mvcc.tx_manager.lock();
-          tx_mgr.record_read(txid, TxKey::NodeLabels(node_id));
-          tx_mgr.record_read(txid, TxKey::NodeLabel { node_id, label_id });
-        }
-      }
-      return false;
-    }
-
-    // Check if label was added in delta
-    if delta.is_label_added(node_id, label_id) {
-      if let Some(mvcc) = self.mvcc.as_ref() {
-        if txid != 0 {
-          let mut tx_mgr = mvcc.tx_manager.lock();
-          tx_mgr.record_read(txid, TxKey::NodeLabels(node_id));
-          tx_mgr.record_read(txid, TxKey::NodeLabel { node_id, label_id });
-        }
-      }
-      return true;
-    }
-
-    // Check snapshot for label (if present)
-    if let Some(ref snapshot) = *self.snapshot.read() {
-      if let Some(phys) = snapshot.phys_node(node_id) {
-        if let Some(labels) = snapshot.node_labels(phys) {
-          let has_label = labels.contains(&label_id);
-          if let Some(mvcc) = self.mvcc.as_ref() {
-            if txid != 0 {
-              let mut tx_mgr = mvcc.tx_manager.lock();
-              tx_mgr.record_read(txid, TxKey::NodeLabels(node_id));
-              tx_mgr.record_read(txid, TxKey::NodeLabel { node_id, label_id });
-            }
-          }
-          return has_label;
-        }
-      }
-    }
+    let (txid, tx_snapshot_ts) = self.mvcc_read_ts(tx_guard.as_deref());
+    let has_label = self.committed_node_has_label(node_id, label_id, tx_snapshot_ts, txid);
 
     if let Some(mvcc) = self.mvcc.as_ref() {
       if txid != 0 {
@@ -1057,6 +957,60 @@ impl SingleFileDB {
         tx_mgr.record_read(txid, TxKey::NodeLabel { node_id, label_id });
       }
     }
+    has_label
+  }
+
+  /// Label membership in committed state (MVCC versions, delta, snapshot), ignoring the
+  /// current transaction's pending changes.
+  fn committed_node_has_label(
+    &self,
+    node_id: NodeId,
+    label_id: LabelId,
+    tx_snapshot_ts: Timestamp,
+    txid: TxId,
+  ) -> bool {
+    let delta = self.delta.read();
+
+    let mut node_visible = None;
+    if let Some(mvcc) = self.mvcc.as_ref() {
+      let vc = mvcc.version_chain.lock();
+      node_visible = vc
+        .node_version(node_id)
+        .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
+      if node_visible == Some(false) {
+        return false;
+      }
+      if let Some(label_version) = vc.node_label_version(node_id, label_id) {
+        if let Some(visible) = visible_version(&label_version, tx_snapshot_ts, txid) {
+          return visible.data.unwrap_or(false);
+        }
+      }
+    }
+
+    // Check if node is deleted
+    if node_visible.is_none() && delta.is_node_deleted(node_id) {
+      return false;
+    }
+
+    // Check if label was removed in delta
+    if delta.is_label_removed(node_id, label_id) {
+      return false;
+    }
+
+    // Check if label was added in delta
+    if delta.is_label_added(node_id, label_id) {
+      return true;
+    }
+
+    // Check snapshot for label (if present)
+    if let Some(ref snapshot) = *self.snapshot.read() {
+      if let Some(phys) = snapshot.phys_node(node_id) {
+        if let Some(labels) = snapshot.node_labels(phys) {
+          return labels.contains(&label_id);
+        }
+      }
+    }
+
     false
   }
 
@@ -1070,39 +1024,24 @@ impl SingleFileDB {
       return Vec::new();
     }
 
-    let mut txid = 0;
-    let mut tx_snapshot_ts = 0;
-    let vc_guard = if let Some(mvcc) = self.mvcc.as_ref() {
-      if let Some(tx) = tx_guard.as_ref() {
-        txid = tx.txid;
-        tx_snapshot_ts = tx.snapshot_ts;
-      } else {
-        tx_snapshot_ts = mvcc.tx_manager.lock().next_commit_ts();
-      }
-      Some(mvcc.version_chain.lock())
-    } else {
-      None
-    };
+    let (txid, tx_snapshot_ts) = self.mvcc_read_ts(tx_guard.as_deref());
+    let delta = self.delta.read();
+    let snapshot = self.snapshot.read();
+    let vc_guard = self.mvcc.as_ref().map(|mvcc| mvcc.version_chain.lock());
 
+    // Check if node is deleted
     let node_visible = vc_guard
       .as_ref()
       .and_then(|vc| vc.node_version(node_id))
       .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
-    if node_visible == Some(false) {
-      return Vec::new();
-    }
-
-    let delta = self.delta.read();
-
-    // Check if node is deleted
-    if node_visible.is_none() && delta.is_node_deleted(node_id) {
+    if node_visible == Some(false) || (node_visible.is_none() && delta.is_node_deleted(node_id)) {
       return Vec::new();
     }
 
     let mut labels = std::collections::HashSet::new();
 
     // Load labels from snapshot first (if present)
-    if let Some(ref snapshot) = *self.snapshot.read() {
+    if let Some(ref snapshot) = *snapshot {
       if let Some(phys) = snapshot.phys_node(node_id) {
         if let Some(snapshot_labels) = snapshot.node_labels(phys) {
           labels.extend(snapshot_labels);
@@ -1138,6 +1077,7 @@ impl SingleFileDB {
         }
       }
     }
+    drop(vc_guard);
 
     // Apply pending label changes
     if let Some(pending_delta) = pending {
@@ -1183,27 +1123,14 @@ impl SingleFileDB {
     let tx_handle = self.current_tx_handle();
     let tx_guard = tx_handle.as_ref().map(|tx| tx.lock());
     let pending = tx_guard.as_ref().map(|tx| &tx.pending);
-    let mut txid = 0;
-    let mut tx_snapshot_ts = 0;
-    if let Some(mvcc) = self.mvcc.as_ref() {
-      if let Some(handle) = tx_handle.as_ref() {
-        let tx = handle.lock();
-        txid = tx.txid;
-        tx_snapshot_ts = tx.snapshot_ts;
-      } else {
-        tx_snapshot_ts = mvcc.tx_manager.lock().next_commit_ts();
-      }
-    }
+    let (txid, tx_snapshot_ts) = self.mvcc_read_ts(tx_guard.as_deref());
 
     if let Some(mvcc) = self.mvcc.as_ref() {
-      if let Some(handle) = tx_handle.as_ref() {
-        let tx = handle.lock();
+      if txid != 0 {
         let mut tx_mgr = mvcc.tx_manager.lock();
-        tx_mgr.record_read(tx.txid, TxKey::Key(key.into()));
+        tx_mgr.record_read(txid, TxKey::Key(key.into()));
       }
     }
-
-    let vc_guard = self.mvcc.as_ref().map(|mvcc| mvcc.version_chain.lock());
 
     let delta = self.delta.read();
 
@@ -1216,11 +1143,7 @@ impl SingleFileDB {
       if pending.is_some_and(|p| p.is_node_deleted(node_id)) {
         return None;
       }
-      let node_visible = vc_guard
-        .as_ref()
-        .and_then(|vc| vc.node_version(node_id))
-        .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
-      if node_visible == Some(false) {
+      if self.mvcc_node_visible(node_id, tx_snapshot_ts, txid) == Some(false) {
         return None;
       }
       return Some(node_id);
@@ -1236,10 +1159,7 @@ impl SingleFileDB {
       if pending.is_some_and(|p| p.is_node_deleted(node_id)) {
         return None;
       }
-      let node_visible = vc_guard
-        .as_ref()
-        .and_then(|vc| vc.node_version(node_id))
-        .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
+      let node_visible = self.mvcc_node_visible(node_id, tx_snapshot_ts, txid);
       if node_visible == Some(false) {
         return None;
       }
@@ -1255,10 +1175,7 @@ impl SingleFileDB {
         if pending.is_some_and(|p| p.is_node_deleted(node_id)) {
           return None;
         }
-        let node_visible = vc_guard
-          .as_ref()
-          .and_then(|vc| vc.node_version(node_id))
-          .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
+        let node_visible = self.mvcc_node_visible(node_id, tx_snapshot_ts, txid);
         if node_visible == Some(false) {
           return None;
         }
@@ -1278,19 +1195,6 @@ impl SingleFileDB {
     let tx_handle = self.current_tx_handle();
     let tx_guard = tx_handle.as_ref().map(|tx| tx.lock());
     let pending = tx_guard.as_ref().map(|tx| &tx.pending);
-    let mut txid = 0;
-    let mut tx_snapshot_ts = 0;
-    let vc_guard = if let Some(mvcc) = self.mvcc.as_ref() {
-      if let Some(tx) = tx_guard.as_ref() {
-        txid = tx.txid;
-        tx_snapshot_ts = tx.snapshot_ts;
-      } else {
-        tx_snapshot_ts = mvcc.tx_manager.lock().next_commit_ts();
-      }
-      Some(mvcc.version_chain.lock())
-    } else {
-      None
-    };
 
     if pending.is_some_and(|p| p.is_node_deleted(node_id)) {
       return None;
@@ -1300,12 +1204,9 @@ impl SingleFileDB {
       return node_delta.key.clone();
     }
 
-    let node_visible = vc_guard
-      .as_ref()
-      .and_then(|vc| vc.node_version(node_id))
-      .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
-
+    let (txid, tx_snapshot_ts) = self.mvcc_read_ts(tx_guard.as_deref());
     let delta = self.delta.read();
+    let node_visible = self.mvcc_node_visible(node_id, tx_snapshot_ts, txid);
 
     // Check if node is deleted
     if node_visible == Some(false) || (node_visible.is_none() && delta.is_node_deleted(node_id)) {

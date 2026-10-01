@@ -15,6 +15,9 @@ use crate::mvcc::{ConflictDetector, GarbageCollector, GcConfig, TxManager, Versi
 use crate::types::{Timestamp, TxId};
 
 /// MVCC Manager - coordinates all MVCC components
+///
+/// Lock order: `tx_manager` -> `version_chain` -> `gc`, nested inside the database-wide order
+/// documented in `core/single_file/read.rs`.
 pub struct MvccManager {
   pub tx_manager: Arc<Mutex<TxManager>>,
   pub version_chain: Arc<Mutex<VersionChainManager>>,
