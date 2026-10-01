@@ -3,15 +3,16 @@
 This document summarizes **measured** benchmark results. Raw outputs live in
 `docs/benchmarks/results/` so we can trace every number back to an actual run.
 
-> Latest numbers below were captured on **February 4-5, 2026**. Prior results
-> from **February 3, 2026** are retained for comparison. If you need fresh
-> numbers, rerun the commands in the next section and update this doc with the
-> new output files.
+> The results below come from runs dated **2026-02-03 through 2026-02-08**.
+> Dates follow the log file names (UTC); some logs print a local timestamp from
+> the evening before. The 2026-02-03 runs are kept under "Prior Results" for
+> comparison. For fresh numbers, rerun the commands in the next section and
+> update this doc with the new output files.
 
 ## Test Environment
 
 - Apple M4 (16GB)
-- macOS 15.3 (Darwin 25.3.0)
+- macOS, Darwin 25.3.0
 - Rust 1.88.0
 - Node 24.12.0
 - Bun 1.3.5
@@ -24,8 +25,22 @@ This document summarizes **measured** benchmark results. Raw outputs live in
 ```bash
 cd ray-rs
 cargo run --release --example single_file_raw_bench --no-default-features -- \
-  --nodes 10000 --edges 50000 --iterations 10000
+  --nodes 10000 --edges 50000 --iterations 10000 \
+  --wal-size 268435456 --no-auto-checkpoint --sync-mode normal
 ```
+
+This is the configuration of the 2026-02-04 edges-heavy logs
+(`2026-02-04-single-file-raw-rust-edges-*.txt`). The sweep ran it once per
+`--sync-mode` value (`normal`, `full`, `off`), without and with
+`--group-commit-enabled` (files ending in `-nogc` and `-gc`).
+
+Flags for the other logged Rust runs:
+- 100k nodes / 500k edges (`2026-02-04-single-file-raw-rust-100k-500k-*.txt`):
+  `--nodes 100000 --edges 500000 --iterations 5000 --wal-size 1073741824 --no-auto-checkpoint --skip-checkpoint`,
+  plus the same sync-mode and group-commit flags.
+- 2026-02-03 prior results (`2026-02-03-single-file-raw-rust-{gc,nogc}.txt`):
+  `--nodes 10000 --edges 50000 --iterations 10000`, plus `--group-commit-enabled`
+  for the `-gc` log. These used the default 64MB WAL with auto-checkpoint on.
 
 Optional knobs (Rust):
 - `--edge-types N` (default: 3)
@@ -33,6 +48,9 @@ Optional knobs (Rust):
 - `--sync-mode full|normal|off` (default: normal)
 - `--group-commit-enabled`
 - `--group-commit-window-ms N` (default: 2)
+- `--wal-size BYTES` (default: 67108864)
+- `--no-auto-checkpoint` (auto-checkpoint is on by default)
+- `--skip-checkpoint` (skip the checkpoint between vector setup and the read benchmarks)
 
 ### Rust (replication catch-up throughput)
 
@@ -52,8 +70,25 @@ Key outputs:
 ```bash
 cd ray-rs/python/benchmarks
 python3 benchmark_single_file_raw.py \
-  --nodes 10000 --edges 50000 --iterations 10000
+  --nodes 10000 --edges 50000 --iterations 10000 \
+  --wal-size 268435456 --no-auto-checkpoint --sync-mode normal
 ```
+
+This is the configuration of the 2026-02-04 edges-heavy logs
+(`2026-02-04-single-file-raw-python-edges-*.txt`), swept over `--sync-mode` and
+`--group-commit-enabled` the same way as the Rust runs.
+
+Flags for the other logged Python runs:
+- Nodes-only (`2026-02-04-single-file-raw-python-nodes-*.txt`): the command above
+  plus `--edges 0 --edge-types 1 --edge-props 0`.
+- 100k nodes / 500k edges (`2026-02-04-single-file-raw-python-100k-500k-*.txt`):
+  `--nodes 100000 --edges 500000 --iterations 5000 --wal-size 1073741824 --no-auto-checkpoint`.
+- 2026-02-03 prior results (`2026-02-03-single-file-raw-python-{gc,nogc}.txt`):
+  `--nodes 10000 --edges 50000 --iterations 10000`, plus `--group-commit-enabled`
+  for the `-gc` log. These used the default 64MB WAL with auto-checkpoint on.
+
+The script also saves its output under `ray-rs/python/benchmarks/results/`
+unless you pass `--output PATH` or `--no-output`.
 
 Optional knobs (Python):
 - `--edge-types N` (default: 3)
@@ -61,6 +96,9 @@ Optional knobs (Python):
 - `--sync-mode full|normal|off` (default: normal)
 - `--group-commit-enabled`
 - `--group-commit-window-ms N` (default: 2)
+- `--wal-size BYTES` (default: 67108864)
+- `--no-auto-checkpoint` (auto-checkpoint is on by default)
+- `--skip-compact` (skip the compaction between vector setup and the read benchmarks)
 
 ### TypeScript API overhead (fluent vs low-level)
 
@@ -69,6 +107,20 @@ cd ray-rs
 node --import @oxc-node/core/register benchmark/bench-fluent-vs-lowlevel.ts
 ```
 
+The defaults (1k nodes, 5k edges, 3 edge types, 10 edge props, 1k iterations,
+sync=normal, group commit off) match
+`2026-02-04-bench-fluent-vs-lowlevel-edges-normal-nogc.txt`. The script accepts
+`--nodes`, `--edges`, `--edge-types`, `--edge-props`, `--iterations`,
+`--sync-mode`, `--group-commit-enabled`, and `--group-commit-window-ms`. The
+other logs add:
+- Sweep logs: `--sync-mode full|normal|off`, plus `--group-commit-enabled` for `-gc`.
+- Nodes-only logs: `--edges 0 --edge-types 1 --edge-props 0`.
+- 100k/500k logs: `--nodes 100000 --edges 500000`.
+- 2026-02-03 logs: the defaults, plus `--group-commit-enabled` for `-gc`.
+
+The script has no WAL or checkpoint flags; it opens both databases with a fixed
+64MB WAL.
+
 ### Vector index (Rust)
 
 ```bash
@@ -76,6 +128,12 @@ cd ray-rs
 cargo run --release --example vector_bench --no-default-features -- \
   --vectors 10000 --dimensions 768 --iterations 1000 --k 10 --n-probe 10
 ```
+
+`vector_bench` builds `VectorIndex` with its default ANN algorithm and has no
+flag to choose another. That default changed from IVF to IVF-PQ on 2026-02-08
+(commit `b90b91e`), so this command now measures IVF-PQ. The published vector
+results (2026-02-03) were measured with IVF; to reproduce them, run the command
+from a checkout before that commit (for example `git checkout b90b91e~1`).
 
 ### Vector compaction strategy (Rust)
 
@@ -104,7 +162,8 @@ Latest matrix snapshot (2026-02-08, 50k vectors, 384 dims, fragment target 5k):
 - `min_deletion_ratio=0.30`, `max_fragments=4` gives balanced reclaim/latency:
   - `delete_ratio=0.35`: `14.32%` reclaim (single-run latency in low-double-digit ms on this host)
   - `delete_ratio=0.55`: `22.24%` reclaim (single-run latency in single-digit ms on this host)
-- `max_fragments=8` reclaims more (`28.18%` / `44.18%`) but roughly doubles compaction latency.
+- `max_fragments=8` reclaims more (`28.18%` / `44.18%`) but compacts more slowly
+  (`22.29ms` vs `14.21ms` and `8.68ms` vs `4.33ms` at `min_deletion_ratio=0.30`, single runs).
 - `min_deletion_ratio=0.40` can skip moderate-churn compaction (`delete_ratio=0.35`), so stale deleted bytes remain.
 - Recommendation: keep defaults `min_deletion_ratio=0.30`, `max_fragments_per_compaction=4`, `min_vectors_to_compact=10000`.
 
@@ -198,6 +257,10 @@ cargo run --release --example index_pipeline_hypothesis_bench --no-default-featu
   --vector-apply-batch-size 64 --sync-mode normal
 ```
 
+This reproduces `2026-02-05-index-pipeline-hypothesis-embed200.txt`. The
+`embed50` log used `--tree-sitter-latency-ms 1 --scip-latency-ms 1 --embed-latency-ms 50`
+with the other flags unchanged.
+
 Interpretation:
 - If `parallel` hot-path elapsed is much lower than `sequential`, async embed queueing is working.
 - If `parallel` hot-path p95 is lower than `sequential`, TS+SCIP parallel parse plus unified graph commit is working.
@@ -212,6 +275,9 @@ cd docs/benchmarks
 python3 sqlite_single_file_raw_bench.py \
   --nodes 10000 --edges 50000 --iterations 10000 --sync-mode normal
 ```
+
+This reproduces `2026-02-04-sqlite-single-file-raw-edges-normal.txt`. The other
+SQLite logs change `--sync-mode`; the nodes-only logs add `--edges 0 --edge-props 0`.
 
 Notes (SQLite):
 - WAL mode, `synchronous=normal`
@@ -365,19 +431,25 @@ Output:
 - `docs/benchmarks/results/YYYY-MM-DD-replication-soak-gate.attemptN.txt` (multi-attempt mode)
 - `STAMP` can be overridden for run-scoped output naming (used by CI tracking jobs).
 
-## Latest Results (2026-02-04)
+## Latest Results (2026-02-04 and 2026-02-05)
 
-Sync-mode sweep logs (nodes-only + edges-heavy datasets):
+Sync-mode sweep logs:
 
 ```
-docs/benchmarks/results/2026-02-04-single-file-raw-rust-{nodes,edges}-{normal,full,off}-{gc,nogc}.txt
+docs/benchmarks/results/2026-02-04-single-file-raw-rust-edges-{normal,full,off}-{gc,nogc}.txt
 docs/benchmarks/results/2026-02-04-single-file-raw-python-{nodes,edges}-{normal,full,off}-{gc,nogc}.txt
 docs/benchmarks/results/2026-02-04-bench-fluent-vs-lowlevel-{nodes,edges}-{normal,full,off}-{gc,nogc}.txt
 ```
 
 Notes:
 - Group commit only affects `SyncMode::Normal`; in `Full`/`Off` it is ignored.
-- These runs disable auto-checkpoint (`--no-auto-checkpoint`) and use a 256MB WAL to expose raw commit costs.
+- The Rust and Python runs use a 256MB WAL with auto-checkpoint off
+  (`--wal-size 268435456 --no-auto-checkpoint`) to expose raw commit costs. The
+  TypeScript harness has no such flags and uses a fixed 64MB WAL.
+- The `2026-02-04-single-file-raw-rust-nodes-*.txt` files are not nodes-only
+  runs. Commit `f5beb7b` overwrote them with runs of the edges-heavy config (their
+  headers show 50,000 edges, 3 edge types, 10 edge props). No nodes-only Rust log
+  remains, so this doc publishes no nodes-only Rust numbers.
 
 ### Edge Write Microbench (Rust, edges-heavy, sync=Normal, GC off)
 
@@ -397,74 +469,55 @@ docs/benchmarks/results/2026-02-04-single-file-raw-rust-edges-normal-nogc.txt
 
 ### SQLite Baseline (single-file raw)
 
-Batch write (100 nodes), sync=normal:
+Batch write (100 nodes), edges-heavy dataset (10k nodes, 50k edges, 3 edge
+types, 10 edge props), sync=normal:
 
 | Metric | Value |
 |--------|-------|
 | p50 | 120.67us |
 | p95 | 2.98ms |
 
-Raw logs:
+Raw log for this table:
+
+```
+docs/benchmarks/results/2026-02-04-sqlite-single-file-raw-edges-normal.txt
+```
+
+All SQLite logs:
 
 ```
 docs/benchmarks/results/2026-02-04-sqlite-single-file-raw-{nodes,edges}-{normal,full,off}.txt
 ```
 
-Large dataset sweep logs (100k nodes / 500k edges):
-
-```
-docs/benchmarks/results/2026-02-04-single-file-raw-rust-100k-500k-{normal,full,off}-{gc,nogc}.txt
-docs/benchmarks/results/2026-02-04-single-file-raw-python-100k-500k-{normal,full,off}-{gc,nogc}.txt
-docs/benchmarks/results/2026-02-04-bench-fluent-vs-lowlevel-100k-500k-{normal,full,off}-{gc,nogc}.txt
-```
-
-Notes (large dataset sweep):
-- Config: 100k nodes, 500k edges, 3 edge types, 10 edge props, iterations=5k.
-- WAL=1GB; auto-checkpoint disabled; Rust runs skip checkpoint.
-
 ### Sync Mode + Group Commit Sweep (Rust Core)
 
-Config (nodes-only): 10k nodes, 0 edges, edge props=0, iterations=10k, WAL=256MB.
+Config (edges-heavy): 10k nodes, 50k edges, 3 edge types, 10 edge props,
+iterations=10k, WAL=256MB, auto-checkpoint off, checkpoint step not skipped.
 
-Batch write (100 nodes), nodes-only:
-
-| Sync Mode | GC Off | GC On |
-|-----------|--------|-------|
-| Normal | 46.12us | 2.63ms |
-| Full | 82.17us | 74.58us |
-| Off | 39.38us | 51.58us |
-
-Set vectors (batch 100), nodes-only:
+Batch write (100 nodes) p50, edges-heavy:
 
 | Sync Mode | GC Off | GC On |
 |-----------|--------|-------|
-| Normal | 102.71us | 2.79ms |
-| Full | 160.33us | 166.54us |
-| Off | 81.42us | 148.17us |
+| Normal | 34.08us | 2.57ms |
+| Full | 54.92us | 61.42us |
+| Off | 29.25us | 29.33us |
 
-Config (edges-heavy): 10k nodes, 50k edges, 3 edge types, 10 edge props, iterations=10k, WAL=256MB.
-
-Batch write (100 nodes), edges-heavy:
+Set vectors (batch 100) p50, edges-heavy:
 
 | Sync Mode | GC Off | GC On |
 |-----------|--------|-------|
-| Normal | 51.08us | 2.64ms |
-| Full | 95.50us | 90.25us |
-| Off | 43.29us | 36.42us |
+| Normal | 94.33us | 2.69ms |
+| Full | 149.00us | 179.00us |
+| Off | 71.17us | 70.62us |
 
-Set vectors (batch 100), edges-heavy:
-
-| Sync Mode | GC Off | GC On |
-|-----------|--------|-------|
-| Normal | 248.75us | 2.73ms |
-| Full | 231.83us | 190.33us |
-| Off | 75.33us | 80.54us |
+No nodes-only Rust table: see the note at the top of this section.
 
 ### Sync Mode + Group Commit Sweep (Python Bindings)
 
-Config (nodes-only): 10k nodes, 0 edges, edge props=0, iterations=10k, WAL=256MB.
+Config (nodes-only): 10k nodes, 0 edges, 1 edge type, edge props=0,
+iterations=10k, WAL=256MB, auto-checkpoint off.
 
-Batch write (100 nodes), nodes-only:
+Batch write (100 nodes) p50, nodes-only:
 
 | Sync Mode | GC Off | GC On |
 |-----------|--------|-------|
@@ -472,7 +525,7 @@ Batch write (100 nodes), nodes-only:
 | Full | 85.62us | 90.79us |
 | Off | 53.92us | 55.21us |
 
-Set vectors (batch 100), nodes-only:
+Set vectors (batch 100) p50, nodes-only:
 
 | Sync Mode | GC Off | GC On |
 |-----------|--------|-------|
@@ -480,27 +533,33 @@ Set vectors (batch 100), nodes-only:
 | Full | 271.38us | 295.62us |
 | Off | 209.83us | 208.46us |
 
-Config (edges-heavy): 10k nodes, 50k edges, 3 edge types, 10 edge props, iterations=10k, WAL=256MB.
+Config (edges-heavy): 10k nodes, 50k edges, 3 edge types, 10 edge props,
+iterations=10k, WAL=256MB, auto-checkpoint off.
 
-Batch write (100 nodes), edges-heavy:
+Batch write (100 nodes) p50, edges-heavy:
 
 | Sync Mode | GC Off | GC On |
 |-----------|--------|-------|
-| Normal | 57.79us | 2.62ms |
+| Normal | 49.71us | 2.62ms |
 | Full | 95.38us | 81.96us |
 | Off | 55.67us | 52.50us |
 
-Set vectors (batch 100), edges-heavy:
+Set vectors (batch 100) p50, edges-heavy:
 
 | Sync Mode | GC Off | GC On |
 |-----------|--------|-------|
-| Normal | 207.38us | 2.79ms |
+| Normal | 241.83us | 2.79ms |
 | Full | 262.38us | 264.25us |
 | Off | 179.50us | 182.92us |
 
+The edges-heavy Normal / GC-off log is a rerun from commit `f5beb7b` that
+replaced the original run; the other Python sweep logs are from the original
+sweep (commit `13d5fb7`).
+
 ### Sync Mode + Group Commit Sweep (TypeScript Fluent vs Low-Level)
 
-Config (nodes-only): 1k nodes, 0 edges, edge props=0, iterations=1k.
+Config (nodes-only): 1k nodes, 0 edges, 1 edge type, edge props=0,
+iterations=1k, 64MB WAL.
 
 Insert p50 (low-level), nodes-only:
 
@@ -510,7 +569,8 @@ Insert p50 (low-level), nodes-only:
 | Full | 28.54us | 28.63us |
 | Off | 3.50us | 3.58us |
 
-Config (edges-heavy): 1k nodes, 5k edges, 3 edge types, 10 edge props, iterations=1k.
+Config (edges-heavy): 1k nodes, 5k edges, 3 edge types, 10 edge props,
+iterations=1k, 64MB WAL.
 
 Insert p50 (low-level), edges-heavy:
 
@@ -521,6 +581,21 @@ Insert p50 (low-level), edges-heavy:
 | Off | 3.63us | 3.67us |
 
 ### Large Dataset Sweep (100k nodes / 500k edges)
+
+Logs:
+
+```
+docs/benchmarks/results/2026-02-04-single-file-raw-rust-100k-500k-{normal,full,off}-{gc,nogc}.txt
+docs/benchmarks/results/2026-02-04-single-file-raw-python-100k-500k-{normal,full,off}-{gc,nogc}.txt
+docs/benchmarks/results/2026-02-04-bench-fluent-vs-lowlevel-100k-500k-{normal,full,off}-{gc,nogc}.txt
+```
+
+Config:
+- Rust and Python: 100k nodes, 500k edges, 3 edge types, 10 edge props,
+  iterations=5k, WAL=1GB, auto-checkpoint off. Rust runs skip the checkpoint
+  step (`--skip-checkpoint`); Python runs compact.
+- TypeScript: 100k nodes, 500k edges, 3 edge types, 10 edge props,
+  iterations=1k, 64MB WAL.
 
 #### Rust Core
 
@@ -571,59 +646,40 @@ Set vectors p50 (batch 100):
 Config: 8 threads, 200 tx/thread, batch=200 nodes, edges/node=1, 3 edge types,
 10 edge props, WAL=1GB.
 
+```bash
+cd ray-rs
+cargo run --release --example multi_writer_throughput_bench --no-default-features -- \
+  --threads 8 --tx-per-thread 200 --batch-size 200 --edges-per-node 1 \
+  --edge-types 3 --edge-props 10 --wal-size 1073741824 --sync-mode normal
+```
+
+Add `--group-commit-enabled` for the group-commit-on run.
+
 | Group Commit | Tx Rate | Node Rate | Edge Rate |
 |--------------|---------|-----------|-----------|
 | Off | 724.42/s | 144.88K/s | 144.88K/s |
 | On | 868.44/s | 173.69K/s | 173.69K/s |
 
-#### Parallel write scaling notes (2026-02-05)
+Raw logs:
 
-Single-file core write throughput does **not** scale linearly with writer threads because
-commit/WAL + delta ordering is serialized (see `commit_lock` in `ray-rs/src/core/single_file/mod.rs`).
-Best practice for max ingest: **parallelize prep**, funnel into **1 writer** doing **batched txns**
-(or at most a small number of writers if you accept lower per-op latency / higher contention).
+```
+docs/benchmarks/results/2026-02-04-multi-writer-throughput-normal-{nogc,gc}.txt
+```
 
-Hardware: 10 CPUs (local dev machine).
+#### Parallel write scaling notes
 
-**Nodes + edges** (measured via `ray-rs/examples/multi_writer_throughput_bench.rs`, config:
-`--tx-per-thread 400 --batch-size 500 --edges-per-node 1 --edge-types 3 --edge-props 0 --wal-size 268435456`):
+The thread-count sweep added on 2026-02-05 (1 to 16 writer threads, using
+`multi_writer_throughput_bench` and `multi_writer_vector_throughput_bench`) has
+no raw log in `docs/benchmarks/results/`, so its numbers are not published here.
 
-Sync=Normal, GC off:
+Guidance that does not depend on that sweep: single-file commits are serialized
+by `commit_lock` (`ray-rs/src/core/single_file/mod.rs`) to keep WAL and delta
+ordering, so write throughput should not be expected to scale linearly with
+writer threads. For maximum ingest, parallelize data preparation and funnel it
+into one writer that commits batched transactions (or a small number of writers,
+if you accept more contention).
 
-| Threads | Node rate |
-|---------|-----------|
-| 1 | 521.89K/s |
-| 2 | 577.43K/s |
-| 4 | 603.92K/s |
-| 8 | 591.62K/s |
-| 10 | 525.41K/s |
-| 16 | 591.61K/s |
-
-Sync=Off, GC off:
-
-| Threads | Node rate |
-|---------|-----------|
-| 1 | 771.18K/s |
-| 2 | 896.99K/s |
-| 4 | 805.34K/s |
-| 8 | 697.73K/s |
-| 10 | 529.21K/s |
-| 16 | 554.09K/s |
-
-**Vector writes** (`set_node_vector`, dims=128) (measured via
-`ray-rs/examples/multi_writer_vector_throughput_bench.rs`, config:
-`--vector-dims 128 --tx-per-thread 200 --batch-size 500 --wal-size 1610612736 --sync-mode normal --no-auto-checkpoint`):
-
-| Threads | Vector rate |
-|---------|-------------|
-| 1 | 529.31K/s |
-| 2 | 452.36K/s |
-| 4 | 388.78K/s |
-| 8 | 349.01K/s |
-| 10 | 313.67K/s |
-| 16 | 296.99K/s |
-
-#### Index pipeline hypothesis notes (2026-02-05)
+### Index pipeline hypothesis notes (2026-02-05)
 
 Goal: validate whether remote embedding latency dominates enough that we should
 decouple graph hot path from vector persistence using async batching + dedupe.
@@ -667,7 +723,8 @@ Raw logs:
 ### Single-File Raw (Rust Core)
 
 Config: 10k nodes, 50k edges, 3 edge types, 10 edge props, 10k iterations,
-vector dims=128, vector count=1k, sync_mode=Normal, group_commit=true.
+vector dims=128, vector count=1k, sync_mode=Normal, group_commit=true,
+WAL=64MB, auto-checkpoint on.
 
 | Operation | p50 | p95 |
 |-----------|-----|-----|
@@ -682,7 +739,8 @@ vector dims=128, vector count=1k, sync_mode=Normal, group_commit=true.
 ### Single-File Raw (Python Bindings)
 
 Config: 10k nodes, 50k edges, 3 edge types, 10 edge props, 10k iterations,
-vector dims=128, vector count=1k, sync_mode=Normal, group_commit=true.
+vector dims=128, vector count=1k, sync_mode=Normal, group_commit=true,
+WAL=64MB, auto-checkpoint on.
 
 | Operation | p50 | p95 |
 |-----------|-----|-----|
@@ -710,20 +768,20 @@ sync_mode=Normal, group_commit=true.
 | 1-hop traversal (toArray) | 875ns | 6.29us | 7.19x |
 | Pathfinding BFS (depth 5) | 6.04us | 8.25us | 1.37x |
 
-## Group Commit vs No Group Commit (Single-Threaded)
+### Group Commit vs No Group Commit (Single-Threaded)
 
 These runs use the same dataset/configs as above, with only group-commit toggled.
 Group commit is optimized for **concurrent** writers; it can **increase** per-commit
 latency in single-threaded benchmarks because commits may wait up to the window.
 
-### Rust (Single-File Raw)
+#### Rust (Single-File Raw)
 
 | Operation | Group Commit p50 | No Group Commit p50 |
 |-----------|------------------|---------------------|
 | Batch write (100 nodes) | 3.09ms | 42.54us |
 | Set vectors (batch 100) | 3.77ms | 110.29us |
 
-### Python (Single-File Raw)
+#### Python (Single-File Raw)
 
 | Operation | Group Commit p50 | No Group Commit p50 |
 |-----------|------------------|---------------------|
@@ -732,16 +790,26 @@ latency in single-threaded benchmarks because commits may wait up to the window.
 
 ### Vector Index (Rust)
 
-Config: 10k vectors, 768 dims, 1k iterations, k=10, nProbe=10.
+Config: 10k vectors, 768 dims, 1k iterations, k=10, nProbe=10, cosine metric,
+IVF index with 100 clusters.
+
+Raw log: `docs/benchmarks/results/2026-02-03-vector-bench-rust.txt`
 
 | Operation | p50 | p95 |
 |-----------|-----|-----|
 | Set vectors (10k) | 833ns | 2.12us |
-| build_index() | 801.95ms | 801.95ms |
 | get (random) | 167ns | 459ns |
 | search (k=10, nProbe=10) | 557.54us | 918.79us |
+
+`build_index()`: 801.95ms (one build, so no percentiles).
+
+These numbers are for IVF. Since 2026-02-08 (commit `b90b91e`) `vector_bench`
+builds IVF-PQ, the new default, so rerunning it on current code does not
+reproduce this table. See "Vector index (Rust)" under Running Benchmarks.
 
 ## Notes
 
 - These are **local** results. Expect variation across machines and datasets.
-- We do **not** publish third-party comparisons here; run those yourself if needed.
+- The SQLite baseline is included as a reference point. The Memgraph harness
+  above is for running comparisons on your own machine; this doc publishes no
+  numbers for other graph databases.

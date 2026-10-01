@@ -255,8 +255,8 @@ Header contents:
 - Checksums (header + footer)
 
 Notes:
-- Default single-file `walSize` is **1MB**; increase for heavy ingest or large batch commits.
-- `autoCheckpoint` is **on by default** and triggers when WAL usage exceeds `checkpointThreshold` (default **0.8** of the active region).
+- Default single-file `walSize` is **4MB**; increase for heavy ingest or large batch commits.
+- `autoCheckpoint` is **on by default** and triggers when WAL usage exceeds `checkpointThreshold` (default **0.5** of the active region).
 - All three are configurable via open options.
 - WAL size is fixed once the file is created; change it via `resizeWal` (offline) or rebuild into a new `.kitedb`.
 
