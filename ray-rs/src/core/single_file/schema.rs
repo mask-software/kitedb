@@ -6,17 +6,18 @@
 //! transaction gets read-your-writes through its local staging overlay; other
 //! transactions see only the last committed global mapping.
 
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 
 use crate::core::wal::record::{
   build_define_etype_payload, build_define_label_payload, build_define_propkey_payload, WalRecord,
 };
-use crate::error::{KiteError, Result};
+use crate::error::Result;
 use crate::types::*;
 
-use super::SingleFileDB;
+use super::{SchemaReservation, SingleFileDB};
 
-/// Schema namespaces that share the explicit-ID define path.
+/// Schema namespaces that share the replica define path.
 #[derive(Debug, Clone, Copy)]
 enum SchemaKind {
   Label,
@@ -25,11 +26,19 @@ enum SchemaKind {
 }
 
 impl SchemaKind {
-  fn noun(self) -> &'static str {
+  fn define_record_type(self) -> WalRecordType {
     match self {
-      SchemaKind::Label => "label",
-      SchemaKind::EdgeType => "edge type",
-      SchemaKind::PropertyKey => "property key",
+      SchemaKind::Label => WalRecordType::DefineLabel,
+      SchemaKind::EdgeType => WalRecordType::DefineEtype,
+      SchemaKind::PropertyKey => WalRecordType::DefinePropkey,
+    }
+  }
+
+  fn define_payload(self, id: u32, name: &str) -> Vec<u8> {
+    match self {
+      SchemaKind::Label => build_define_label_payload(id, name),
+      SchemaKind::EdgeType => build_define_etype_payload(id, name),
+      SchemaKind::PropertyKey => build_define_propkey_payload(id, name),
     }
   }
 }
@@ -143,117 +152,156 @@ impl SingleFileDB {
     self.propkey_ids.read().get(&id).cloned()
   }
 
-  /// Define a label under the ID the replication primary assigned to it.
-  pub(crate) fn define_label_with_id(&self, id: LabelId, name: &str) -> Result<()> {
-    self.define_schema_with_id(SchemaKind::Label, id, name)
+  /// Local label id for a name the replication primary defined as
+  /// `primary_id`; see `ensure_replica_schema`.
+  pub(crate) fn ensure_replica_label(&self, name: &str, primary_id: LabelId) -> Result<LabelId> {
+    self.ensure_replica_schema(SchemaKind::Label, name, primary_id)
   }
 
-  /// Define an edge type under the ID the replication primary assigned to it.
-  pub(crate) fn define_etype_with_id(&self, id: ETypeId, name: &str) -> Result<()> {
-    self.define_schema_with_id(SchemaKind::EdgeType, id, name)
+  /// Local edge type id for a name the replication primary defined as
+  /// `primary_id`; see `ensure_replica_schema`.
+  pub(crate) fn ensure_replica_etype(&self, name: &str, primary_id: ETypeId) -> Result<ETypeId> {
+    self.ensure_replica_schema(SchemaKind::EdgeType, name, primary_id)
   }
 
-  /// Define a property key under the ID the replication primary assigned to it.
-  pub(crate) fn define_propkey_with_id(&self, id: PropKeyId, name: &str) -> Result<()> {
-    self.define_schema_with_id(SchemaKind::PropertyKey, id, name)
+  /// Local property key id for a name the replication primary defined as
+  /// `primary_id`; see `ensure_replica_schema`.
+  pub(crate) fn ensure_replica_propkey(
+    &self,
+    name: &str,
+    primary_id: PropKeyId,
+  ) -> Result<PropKeyId> {
+    self.ensure_replica_schema(SchemaKind::PropertyKey, name, primary_id)
   }
 
-  /// Mutation records address schema by numeric ID, so a replica must hold
-  /// the primary's exact name/ID pairs. Re-defining an identical pair is a
-  /// no-op. A name or ID already bound differently here (committed, staged,
-  /// or claimed by an in-flight local define) is a divergence that only a
-  /// reseed into a fresh replica database can repair.
-  fn define_schema_with_id(&self, kind: SchemaKind, id: u32, name: &str) -> Result<()> {
+  /// A replica keeps its own schema ids (an application may define names
+  /// before the first pull) and translates the primary's ids by name. An
+  /// existing local id for the name wins. Otherwise the name is defined here,
+  /// under the primary's id when that id is free, so a replica without schema
+  /// of its own mirrors the primary's ids exactly.
+  fn ensure_replica_schema(&self, kind: SchemaKind, name: &str, primary_id: u32) -> Result<u32> {
     let (txid, tx_handle) = self.require_write_tx_handle()?;
-
-    let (bound_id, bound_name) = match kind {
-      SchemaKind::Label => (self.label_id(name), self.label_name(id)),
-      SchemaKind::EdgeType => (self.etype_id(name), self.etype_name(id)),
-      SchemaKind::PropertyKey => (self.propkey_id(name), self.propkey_name(id)),
+    let staged_or_committed = match kind {
+      SchemaKind::Label => self.label_id(name),
+      SchemaKind::EdgeType => self.etype_id(name),
+      SchemaKind::PropertyKey => self.propkey_id(name),
     };
-    match (bound_id, bound_name.as_deref()) {
-      (Some(bound_id), Some(bound_name)) if bound_id == id && bound_name == name => return Ok(()),
-      (None, None) => {}
-      (bound_id, bound_name) => {
-        let detail = match (bound_id.filter(|&bound| bound != id), bound_name) {
-          (Some(bound_id), _) => format!("{name:?} is already id {bound_id} here"),
-          (None, Some(bound_name)) if bound_name != name => {
-            format!("id {id} is already {bound_name:?} here")
-          }
-          _ => "this database maps only one side of the pair".to_string(),
-        };
-        return Err(schema_divergence(kind, id, name, &detail));
-      }
+    if let Some(id) = staged_or_committed {
+      return Ok(id);
     }
 
-    {
-      let reservations = self.schema_reservations.lock();
-      let claims = match kind {
-        SchemaKind::Label => &reservations.labels,
-        SchemaKind::EdgeType => &reservations.etypes,
-        SchemaKind::PropertyKey => &reservations.propkeys,
+    // Claim under the reservation lock, like a local define, so concurrent
+    // local transactions defining the same name share this id.
+    let local_id = {
+      let mut reservations = self.schema_reservations.lock();
+      let (committed_id, primary_id_committed, claims) = match kind {
+        SchemaKind::Label => (
+          self.label_names.read().get(name).copied(),
+          self.label_ids.read().contains_key(&primary_id),
+          &mut reservations.labels,
+        ),
+        SchemaKind::EdgeType => (
+          self.etype_names.read().get(name).copied(),
+          self.etype_ids.read().contains_key(&primary_id),
+          &mut reservations.etypes,
+        ),
+        SchemaKind::PropertyKey => (
+          self.propkey_names.read().get(name).copied(),
+          self.propkey_ids.read().contains_key(&primary_id),
+          &mut reservations.propkeys,
+        ),
       };
-      if let Some((claimed_name, claim)) = claims
-        .iter()
-        .find(|(claimed_name, claim)| (claimed_name.as_str() == name) != (claim.id == id))
-      {
-        return Err(schema_divergence(
-          kind,
-          id,
-          name,
-          &format!(
-            "an in-flight local transaction claims {claimed_name:?} as id {}",
-            claim.id
-          ),
-        ));
+      if let Some(id) = committed_id {
+        return Ok(id);
       }
+      if let Some(claim) = claims.get_mut(name) {
+        claim.owners.insert(txid);
+        claim.id
+      } else {
+        let primary_id_free =
+          !primary_id_committed && !claims.values().any(|claim| claim.id == primary_id);
+        let id = if primary_id_free {
+          // Keep later allocations clear of the adopted id.
+          let allocator = match kind {
+            SchemaKind::Label => &self.next_label_id,
+            SchemaKind::EdgeType => &self.next_etype_id,
+            SchemaKind::PropertyKey => &self.next_propkey_id,
+          };
+          allocator.fetch_max(primary_id.saturating_add(1), Ordering::SeqCst);
+          primary_id
+        } else {
+          match kind {
+            SchemaKind::Label => self.alloc_unclaimed_label_id(),
+            SchemaKind::EdgeType => self.alloc_unclaimed_etype_id(),
+            SchemaKind::PropertyKey => self.alloc_unclaimed_propkey_id(),
+          }
+        };
+        claims.insert(name.to_string(), SchemaReservation::new(id, txid));
+        id
+      }
+    };
+
+    let record = WalRecord::new(
+      kind.define_record_type(),
+      txid,
+      kind.define_payload(local_id, name),
+    );
+    if let Err(error) = self.write_wal_tx(&tx_handle, record) {
+      match kind {
+        SchemaKind::Label => self.release_label_reservation(name, txid),
+        SchemaKind::EdgeType => self.release_etype_reservation(name, txid),
+        SchemaKind::PropertyKey => self.release_propkey_reservation(name, txid),
+      }
+      return Err(error);
     }
 
-    let (record_type, payload) = match kind {
-      SchemaKind::Label => (
-        WalRecordType::DefineLabel,
-        build_define_label_payload(id, name),
-      ),
-      SchemaKind::EdgeType => (
-        WalRecordType::DefineEtype,
-        build_define_etype_payload(id, name),
-      ),
-      SchemaKind::PropertyKey => (
-        WalRecordType::DefinePropkey,
-        build_define_propkey_payload(id, name),
-      ),
-    };
-    self.write_wal_tx(&tx_handle, WalRecord::new(record_type, txid, payload))?;
-
-    // Stage like a local define; commit publishes the pair. Raising the
-    // allocator keeps later local allocations clear of the primary's IDs.
-    let next_id = id.saturating_add(1);
     let mut tx = tx_handle.lock();
     match kind {
       SchemaKind::Label => {
-        tx.schema.define_label(id, name);
-        tx.pending.define_label(id, name);
-        self.next_label_id.fetch_max(next_id, Ordering::SeqCst);
+        tx.schema.define_label(local_id, name);
+        tx.pending.define_label(local_id, name);
       }
       SchemaKind::EdgeType => {
-        tx.schema.define_etype(id, name);
-        tx.pending.define_etype(id, name);
-        self.next_etype_id.fetch_max(next_id, Ordering::SeqCst);
+        tx.schema.define_etype(local_id, name);
+        tx.pending.define_etype(local_id, name);
       }
       SchemaKind::PropertyKey => {
-        tx.schema.define_propkey(id, name);
-        tx.pending.define_propkey(id, name);
-        self.next_propkey_id.fetch_max(next_id, Ordering::SeqCst);
+        tx.schema.define_propkey(local_id, name);
+        tx.pending.define_propkey(local_id, name);
+      }
+    }
+    Ok(local_id)
+  }
+
+  /// WAL-log every committed schema name/id pair in the current transaction.
+  /// A promoted primary uses this to announce its whole schema in the new
+  /// epoch; replaying these records is a no-op.
+  pub(crate) fn log_committed_schema(&self) -> Result<()> {
+    let (txid, tx_handle) = self.require_write_tx_handle()?;
+    let entries = [
+      (SchemaKind::Label, sorted_entries(&self.label_ids.read())),
+      (SchemaKind::EdgeType, sorted_entries(&self.etype_ids.read())),
+      (
+        SchemaKind::PropertyKey,
+        sorted_entries(&self.propkey_ids.read()),
+      ),
+    ];
+    for (kind, pairs) in entries {
+      for (id, name) in pairs {
+        let record = WalRecord::new(
+          kind.define_record_type(),
+          txid,
+          kind.define_payload(id, &name),
+        );
+        self.write_wal_tx(&tx_handle, record)?;
       }
     }
     Ok(())
   }
 }
 
-fn schema_divergence(kind: SchemaKind, id: u32, name: &str, detail: &str) -> KiteError {
-  KiteError::InvalidReplication(format!(
-    "replica schema diverged from the primary: {} {name:?} must have id {id}, but {detail}; \
-     reseed into a fresh replica database",
-    kind.noun()
-  ))
+fn sorted_entries(ids: &HashMap<u32, String>) -> Vec<(u32, String)> {
+  let mut entries: Vec<_> = ids.iter().map(|(&id, name)| (id, name.clone())).collect();
+  entries.sort_unstable_by_key(|&(id, _)| id);
+  entries
 }

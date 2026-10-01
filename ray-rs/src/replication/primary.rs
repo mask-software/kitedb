@@ -85,6 +85,14 @@ pub struct ReplicaLagStatus {
   pub applied_log_index: u64,
 }
 
+/// Result of a promotion request: the epoch this instance now observes, and
+/// whether this instance advanced it (a stale instance only observes it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrimaryPromotion {
+  pub epoch: u64,
+  pub promoted: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PrimaryRetentionOutcome {
   pub pruned_segments: usize,
@@ -350,7 +358,11 @@ impl PrimaryReplication {
   }
 
   pub fn promote_to_next_epoch(&self) -> Result<u64> {
-    self.inner.promote_to_next_epoch()
+    self.promote().map(|promotion| promotion.epoch)
+  }
+
+  pub fn promote(&self) -> Result<PrimaryPromotion> {
+    self.inner.promote()
   }
 
   pub fn report_replica_progress(
@@ -920,7 +932,7 @@ impl PrimaryReplicationInner {
     Ok(token)
   }
 
-  pub fn promote_to_next_epoch(&self) -> Result<u64> {
+  pub fn promote(&self) -> Result<PrimaryPromotion> {
     let _sidecar_guard = self.sidecar_op_lock.lock();
     let mut state = self.state.lock();
     if state.sidecar_needs_repair {
@@ -928,7 +940,10 @@ impl PrimaryReplicationInner {
     }
     let epoch_changed = self.refresh_manifest_locked(&mut state)?;
     if epoch_changed || state.write_fenced {
-      return Ok(state.manifest.epoch);
+      return Ok(PrimaryPromotion {
+        epoch: state.manifest.epoch,
+        promoted: false,
+      });
     }
 
     let mut next_manifest = state.manifest.clone();
@@ -961,7 +976,10 @@ impl PrimaryReplicationInner {
     self
       .epoch_fence
       .store(state.manifest.epoch, Ordering::Release);
-    Ok(state.manifest.epoch)
+    Ok(PrimaryPromotion {
+      epoch: state.manifest.epoch,
+      promoted: true,
+    })
   }
 
   pub fn report_replica_progress(

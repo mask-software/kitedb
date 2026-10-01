@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
-use kitedb::api::kite::{Kite, KiteOptions, NodeDef, PropDef};
+use kitedb::api::kite::{EdgeDef, Kite, KiteOptions, NodeDef, PropDef};
 use kitedb::core::single_file::{
   close_single_file, open_single_file, SingleFileDB, SingleFileOpenOptions, SyncMode,
 };
@@ -967,24 +967,28 @@ fn catch_up_reads_active_segment_past_stale_manifest_end() {
 }
 
 #[test]
-fn diverged_replica_schema_requires_reseed() {
+fn replica_local_schema_translates_colliding_primary_ids() {
   let dir = tempfile::tempdir().expect("tempdir");
-  let primary_path = dir.path().join("diverged-primary.kitedb");
-  let replica_path = dir.path().join("diverged-replica.kitedb");
+  let primary_path = dir.path().join("collide-primary.kitedb");
+  let replica_path = dir.path().join("collide-replica.kitedb");
   let primary = open_primary(&primary_path, SyncMode::Full);
 
   // The replica file already has its own schema before it starts following.
-  let local = open_single_file(&replica_path, SingleFileOpenOptions::new()).expect("open local");
-  local.begin(false).expect("begin local");
-  local
-    .define_propkey("local_only")
-    .expect("define local key");
-  local.commit().expect("commit local");
-  close_single_file(local).expect("close local");
+  predefine_schema(
+    &replica_path,
+    SingleFileOpenOptions::new(),
+    &[],
+    &[],
+    &["local_only"],
+  );
 
   let replica = open_replica(&replica_path, &primary_path);
   primary.begin(false).expect("begin");
   let email = primary.define_propkey("email").expect("define email");
+  let node = primary.create_node(Some("n")).expect("node");
+  primary
+    .set_node_prop(node, email, PropValue::String("e@example.com".into()))
+    .expect("set email");
   commit(&primary);
   assert_eq!(
     replica.propkey_id("local_only"),
@@ -992,14 +996,19 @@ fn diverged_replica_schema_requires_reseed() {
     "test setup: ids must collide"
   );
 
-  let error = catch_up_all(&replica).expect_err("diverged schema must not apply");
-  assert!(
-    error.to_string().contains("reseed"),
-    "divergence must ask for a reseed: {error}"
+  catch_up_all(&replica).expect("catch up translates the colliding id");
+  let local_email = replica.propkey_id("email").expect("email defined locally");
+  assert_ne!(local_email, email, "the primary's id is taken locally");
+  assert_eq!(
+    replica.node_prop(node, local_email),
+    Some(PropValue::String("e@example.com".into()))
   );
-  let status = replica.replica_replication_status().expect("status");
-  assert!(status.needs_reseed, "divergence must set needs_reseed");
-  assert_eq!(replica.propkey_name(email).as_deref(), Some("local_only"));
+  assert_eq!(
+    replica.node_prop(node, email),
+    None,
+    "local_only stays empty"
+  );
+  assert_eq!(named_state(&replica), named_state(&primary));
 
   close_single_file(replica).expect("close replica");
   close_single_file(primary).expect("close primary");
@@ -1095,5 +1104,442 @@ fn clean_close_of_buffered_primary_publishes_and_keeps_sidecar_healthy() {
     status.last_replication_error
   );
   assert_eq!(status.head_log_index, head.log_index);
+  close_single_file(primary).expect("close primary");
+}
+
+// ============================================================================
+// R1 rework: replicas keep their own schema ids and translate the primary's
+// ============================================================================
+
+/// On-disk primary-id -> local-id schema map (`replica.rs` `SCHEMA_MAP_FILE_NAME`).
+const REPLICA_SCHEMA_MAP_FILE: &str = "replica-schema-map.json";
+
+type NamedProps = BTreeMap<String, PropValue>;
+type NamedNode = (Option<String>, BTreeSet<String>, NamedProps);
+type NamedState = (
+  BTreeMap<u64, NamedNode>,
+  BTreeMap<(u64, String, u64), NamedProps>,
+);
+
+/// Graph state with every schema id resolved to its name, so databases that
+/// hold the same data under different local ids compare equal.
+fn named_state(db: &SingleFileDB) -> NamedState {
+  let named_props = |props: Option<HashMap<u32, PropValue>>| -> NamedProps {
+    props
+      .unwrap_or_default()
+      .into_iter()
+      .map(|(key, value)| (db.propkey_name(key).expect("propkey name"), value))
+      .collect()
+  };
+  let nodes = db
+    .list_nodes()
+    .into_iter()
+    .map(|node_id| {
+      let labels = db
+        .node_labels(node_id)
+        .into_iter()
+        .map(|label| db.label_name(label).expect("label name"))
+        .collect();
+      (
+        node_id,
+        (
+          db.node_key(node_id),
+          labels,
+          named_props(db.node_props(node_id)),
+        ),
+      )
+    })
+    .collect();
+  let edges = db
+    .list_edges(None)
+    .into_iter()
+    .map(|edge| {
+      let etype = db.etype_name(edge.etype).expect("etype name");
+      let props = named_props(db.edge_props(edge.src, edge.etype, edge.dst));
+      ((edge.src, etype, edge.dst), props)
+    })
+    .collect();
+  (nodes, edges)
+}
+
+/// Define schema names in this exact order, fixing the file's ids before any
+/// Kite opens it (Kite defines missing names in HashMap order).
+fn predefine_schema(
+  path: &Path,
+  options: SingleFileOpenOptions,
+  labels: &[&str],
+  etypes: &[&str],
+  propkeys: &[&str],
+) {
+  let db = open_single_file(path, options).expect("open for schema");
+  db.begin(false).expect("begin schema");
+  for name in labels {
+    db.define_label(name).expect("define label");
+  }
+  for name in etypes {
+    db.define_etype(name).expect("define etype");
+  }
+  for name in propkeys {
+    db.define_propkey(name).expect("define propkey");
+  }
+  db.commit().expect("commit schema");
+  close_single_file(db).expect("close schema db");
+}
+
+fn primary_db_options() -> SingleFileOpenOptions {
+  SingleFileOpenOptions::new()
+    .sync_mode(SyncMode::Full)
+    .auto_checkpoint(false)
+    .replication_role(ReplicationRole::Primary)
+}
+
+fn project_schema(options: KiteOptions) -> KiteOptions {
+  options
+    .node(
+      NodeDef::new("File", "file:")
+        .prop(PropDef::string("path"))
+        .prop(PropDef::string("language")),
+    )
+    .node(NodeDef::new("Dir", "dir:").prop(PropDef::string("path")))
+    .edge(EdgeDef::new("CONTAINS").prop(PropDef::int("order")))
+}
+
+fn open_primary_kite(path: &Path) -> Kite {
+  Kite::open(
+    path,
+    project_schema(KiteOptions::new()).replication_role(ReplicationRole::Primary),
+  )
+  .expect("open primary kite")
+}
+
+fn open_replica_kite(path: &Path, primary_path: &Path) -> Kite {
+  Kite::open(
+    path,
+    project_schema(KiteOptions::new())
+      .replication_role(ReplicationRole::Replica)
+      .replication_source_db_path(primary_path),
+  )
+  .expect("open replica kite")
+}
+
+/// Primary ids: Dir < File, CONTAINS < LINKS, language < order < path.
+fn predefine_primary_order(primary_path: &Path) {
+  predefine_schema(
+    primary_path,
+    primary_db_options(),
+    &["Dir", "File"],
+    &["CONTAINS", "LINKS"],
+    &["language", "order", "path"],
+  );
+}
+
+/// Replica ids in the opposite order, so no id matches the primary's.
+fn predefine_replica_reverse_order(replica_path: &Path, extra_propkeys: &[&str]) {
+  let mut propkeys = extra_propkeys.to_vec();
+  propkeys.extend(["path", "order", "language"]);
+  predefine_schema(
+    replica_path,
+    SingleFileOpenOptions::new(),
+    &["File", "Dir"],
+    &["LINKS", "CONTAINS"],
+    &propkeys,
+  );
+}
+
+fn write_project(primary: &mut Kite, suffix: &str) -> (u64, u64) {
+  let file = primary
+    .create_node(
+      "File",
+      &format!("a-{suffix}.ts"),
+      HashMap::from([
+        (
+          "path".to_string(),
+          PropValue::String(format!("src/a-{suffix}.ts")),
+        ),
+        (
+          "language".to_string(),
+          PropValue::String("typescript".into()),
+        ),
+      ]),
+    )
+    .expect("create file")
+    .id();
+  let dir = primary
+    .create_node(
+      "Dir",
+      &format!("src-{suffix}"),
+      HashMap::from([(
+        "path".to_string(),
+        PropValue::String(format!("src-{suffix}")),
+      )]),
+    )
+    .expect("create dir")
+    .id();
+  primary
+    .link_with_props(
+      dir,
+      "CONTAINS",
+      file,
+      HashMap::from([("order".to_string(), PropValue::I64(1))]),
+    )
+    .expect("link");
+  (file, dir)
+}
+
+#[test]
+fn kite_replica_with_own_schema_order_reads_primary_values_by_name() {
+  let dir = tempfile::tempdir().expect("tempdir");
+  let primary_path = dir.path().join("kite-order-primary.kitedb");
+  let replica_path = dir.path().join("kite-order-replica.kitedb");
+
+  predefine_primary_order(&primary_path);
+  let mut primary = open_primary_kite(&primary_path);
+  // Playground flow: the replica Kite opens with the same schema before any
+  // pull, so it holds local ids for every name.
+  predefine_replica_reverse_order(&replica_path, &[]);
+  let replica = open_replica_kite(&replica_path, &primary_path);
+  assert_ne!(
+    replica.raw().propkey_id("path"),
+    primary.raw().propkey_id("path"),
+    "test setup: local ids must differ from the primary's"
+  );
+
+  let (file, _) = write_project(&mut primary, "one");
+  catch_up_all(replica.raw()).expect("catch up");
+
+  assert_eq!(
+    replica.prop(file, "path"),
+    Some(PropValue::String("src/a-one.ts".into()))
+  );
+  assert_eq!(
+    replica.prop(file, "language"),
+    Some(PropValue::String("typescript".into()))
+  );
+  assert_eq!(named_state(replica.raw()), named_state(primary.raw()));
+
+  // A snapshot reseed rebuilds the translation from names.
+  replica
+    .raw()
+    .replica_reseed_from_snapshot()
+    .expect("reseed");
+  write_project(&mut primary, "two");
+  catch_up_all(replica.raw()).expect("catch up after reseed");
+  assert_eq!(named_state(replica.raw()), named_state(primary.raw()));
+
+  replica.close().expect("close replica");
+  primary.close().expect("close primary");
+}
+
+#[test]
+fn replica_with_superset_schema_translates_primary_ids() {
+  let dir = tempfile::tempdir().expect("tempdir");
+  let primary_path = dir.path().join("superset-primary.kitedb");
+  let replica_path = dir.path().join("superset-replica.kitedb");
+
+  predefine_primary_order(&primary_path);
+  let mut primary = open_primary_kite(&primary_path);
+  // Replica-only names take the low ids the primary uses for its own names.
+  predefine_replica_reverse_order(&replica_path, &["owner", "reviewer", "notes"]);
+  let replica = open_replica_kite(&replica_path, &primary_path);
+
+  let (file, _) = write_project(&mut primary, "one");
+  catch_up_all(replica.raw()).expect("catch up");
+  assert_eq!(named_state(replica.raw()), named_state(primary.raw()));
+  assert_eq!(
+    replica.prop(file, "path"),
+    Some(PropValue::String("src/a-one.ts".into()))
+  );
+  assert_eq!(replica.prop(file, "owner"), None);
+  assert!(replica.raw().propkey_id("notes").is_some());
+
+  replica.close().expect("close replica");
+  primary.close().expect("close primary");
+}
+
+#[test]
+fn replica_restart_keeps_schema_translation() {
+  let dir = tempfile::tempdir().expect("tempdir");
+  let primary_path = dir.path().join("restart-primary.kitedb");
+  let replica_path = dir.path().join("restart-replica.kitedb");
+
+  predefine_primary_order(&primary_path);
+  let mut primary = open_primary_kite(&primary_path);
+  predefine_replica_reverse_order(&replica_path, &[]);
+  let replica = open_replica_kite(&replica_path, &primary_path);
+  let (file, _) = write_project(&mut primary, "one");
+  catch_up_all(replica.raw()).expect("catch up");
+  replica.close().expect("close replica");
+
+  // Frames after the restart carry only ids; the names arrived earlier.
+  primary
+    .set_prop(file, "language", PropValue::String("rust".into()))
+    .expect("update language");
+  write_project(&mut primary, "two");
+
+  let replica = open_replica_kite(&replica_path, &primary_path);
+  catch_up_all(replica.raw()).expect("catch up after restart");
+  assert_eq!(
+    replica.prop(file, "language"),
+    Some(PropValue::String("rust".into()))
+  );
+  assert_eq!(named_state(replica.raw()), named_state(primary.raw()));
+
+  replica.close().expect("close replica");
+  primary.close().expect("close primary");
+}
+
+#[test]
+fn replica_without_schema_translation_requires_reseed() {
+  let dir = tempfile::tempdir().expect("tempdir");
+  let primary_path = dir.path().join("lost-map-primary.kitedb");
+  let replica_path = dir.path().join("lost-map-replica.kitedb");
+
+  predefine_primary_order(&primary_path);
+  let mut primary = open_primary_kite(&primary_path);
+  predefine_replica_reverse_order(&replica_path, &[]);
+  let replica = open_replica_kite(&replica_path, &primary_path);
+  let (file, _) = write_project(&mut primary, "one");
+  catch_up_all(replica.raw()).expect("catch up");
+  replica.close().expect("close replica");
+
+  let map_path = default_replication_sidecar_path(&replica_path).join(REPLICA_SCHEMA_MAP_FILE);
+  assert!(map_path.exists(), "the translation must be persisted");
+  std::fs::remove_file(&map_path).expect("drop the translation");
+
+  primary
+    .set_prop(file, "language", PropValue::String("rust".into()))
+    .expect("update language");
+  let replica = open_replica_kite(&replica_path, &primary_path);
+  let error = catch_up_all(replica.raw()).expect_err("an unknown primary id must not apply");
+  assert!(error.to_string().contains("reseed"), "{error}");
+  assert!(
+    replica
+      .raw()
+      .replica_replication_status()
+      .expect("status")
+      .needs_reseed
+  );
+  assert_eq!(
+    replica.prop(file, "language"),
+    Some(PropValue::String("typescript".into())),
+    "nothing may be applied under an untranslated id"
+  );
+
+  replica
+    .raw()
+    .replica_reseed_from_snapshot()
+    .expect("reseed rebuilds the translation");
+  assert_eq!(named_state(replica.raw()), named_state(primary.raw()));
+  write_project(&mut primary, "two");
+  catch_up_all(replica.raw()).expect("catch up after reseed");
+  assert_eq!(named_state(replica.raw()), named_state(primary.raw()));
+
+  replica.close().expect("close replica");
+  primary.close().expect("close primary");
+}
+
+#[test]
+fn promotion_announces_schema_and_replica_rebuilds_translation() {
+  let dir = tempfile::tempdir().expect("tempdir");
+  let primary_path = dir.path().join("promote-map-primary.kitedb");
+  let replica_path = dir.path().join("promote-map-replica.kitedb");
+
+  predefine_primary_order(&primary_path);
+  let mut primary = open_primary_kite(&primary_path);
+  predefine_replica_reverse_order(&replica_path, &[]);
+  let replica = open_replica_kite(&replica_path, &primary_path);
+  let (file, _) = write_project(&mut primary, "one");
+  catch_up_all(replica.raw()).expect("catch up");
+  replica.close().expect("close replica");
+
+  // Stale entries must not survive an epoch change: drop the translation and
+  // rely on the new epoch's schema announcement alone.
+  let map_path = default_replication_sidecar_path(&replica_path).join(REPLICA_SCHEMA_MAP_FILE);
+  std::fs::remove_file(&map_path).expect("drop the translation");
+
+  let epoch = primary
+    .raw()
+    .primary_promote_to_next_epoch()
+    .expect("promote");
+  assert_eq!(epoch, 2);
+  primary
+    .set_prop(file, "language", PropValue::String("rust".into()))
+    .expect("update language");
+  write_project(&mut primary, "two");
+
+  let replica = open_replica_kite(&replica_path, &primary_path);
+  catch_up_all(replica.raw()).expect("catch up across the promotion");
+  let status = replica.raw().replica_replication_status().expect("status");
+  assert_eq!(status.applied_epoch, 2);
+  assert_eq!(
+    replica.prop(file, "language"),
+    Some(PropValue::String("rust".into()))
+  );
+  assert_eq!(named_state(replica.raw()), named_state(primary.raw()));
+
+  replica.close().expect("close replica");
+  primary.close().expect("close primary");
+}
+
+#[test]
+fn reseed_recreates_nodes_whose_keys_were_swapped() {
+  reseed_after_key_swap(false);
+}
+
+#[test]
+fn reseed_recreates_checkpointed_nodes_whose_keys_were_swapped() {
+  reseed_after_key_swap(true);
+}
+
+fn reseed_after_key_swap(checkpoint_replica: bool) {
+  let dir = tempfile::tempdir().expect("tempdir");
+  let primary_path = dir.path().join("swap-primary.kitedb");
+  let replica_path = dir.path().join("swap-replica.kitedb");
+  let primary = open_primary(&primary_path, SyncMode::Full);
+  let replica = open_replica(&replica_path, &primary_path);
+  replica
+    .replica_bootstrap_from_snapshot()
+    .expect("bootstrap empty primary");
+
+  primary.begin(false).expect("begin");
+  let n1 = primary.create_node(Some("a")).expect("n1");
+  let n2 = primary.create_node(Some("b")).expect("n2");
+  let n3 = primary.create_node(Some("c")).expect("n3");
+  commit(&primary);
+  catch_up_all(&replica).expect("catch up");
+  if checkpoint_replica {
+    // The replica's copies of n1..n3 now live in its snapshot.
+    replica.checkpoint().expect("checkpoint replica");
+  }
+
+  // While the replica is not following, n1/n2 exchange keys and n3 changes
+  // its key; each id is recreated (keys are immutable on a live node).
+  primary.begin(false).expect("begin delete");
+  for node in [n1, n2, n3] {
+    primary.delete_node(node).expect("delete");
+  }
+  commit(&primary);
+  primary.begin(false).expect("begin recreate");
+  primary.create_node_with_id(n1, Some("b")).expect("n1 b");
+  primary.create_node_with_id(n2, Some("a")).expect("n2 a");
+  primary.create_node_with_id(n3, Some("d")).expect("n3 d");
+  commit(&primary);
+
+  replica.replica_reseed_from_snapshot().expect("reseed");
+  let expected = [("a", n2), ("b", n1), ("c", 0), ("d", n3)];
+  let check = |db: &SingleFileDB| {
+    for (key, node) in expected {
+      let expected = (node != 0).then_some(node);
+      assert_eq!(db.node_by_key(key), expected, "key {key}");
+    }
+    assert_eq!(graph_state(db), graph_state(&primary));
+  };
+  check(&replica);
+
+  close_single_file(replica).expect("close replica");
+  let replica = open_replica(&replica_path, &primary_path);
+  check(&replica);
+
+  close_single_file(replica).expect("close replica");
   close_single_file(primary).expect("close primary");
 }
