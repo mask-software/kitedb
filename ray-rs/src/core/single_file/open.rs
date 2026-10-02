@@ -86,7 +86,13 @@ pub struct SingleFileOpenOptions {
   pub read_only: bool,
   /// Create database if it doesn't exist
   pub create_if_missing: bool,
-  /// Enable MVCC (snapshot isolation + conflict detection)
+  /// MVCC: snapshot-isolated transactions and conflict detection between
+  /// concurrent write transactions (default: true). It is runtime state
+  /// only: the file format is the same either way.
+  ///
+  /// `false` is deprecated and will be removed in a later release. Without
+  /// MVCC, write transactions run one at a time and transactions read the
+  /// latest committed state instead of a snapshot.
   pub mvcc: bool,
   /// MVCC GC interval in ms
   pub mvcc_gc_interval_ms: Option<u64>,
@@ -162,7 +168,7 @@ impl Default for SingleFileOpenOptions {
     Self {
       read_only: false,
       create_if_missing: true,
-      mvcc: false,
+      mvcc: true,
       mvcc_gc_interval_ms: None,
       mvcc_retention_ms: None,
       mvcc_max_chain_depth: None,
@@ -218,6 +224,11 @@ impl SingleFileOpenOptions {
     self
   }
 
+  /// Enable or disable MVCC (default: enabled; see the `mvcc` field).
+  ///
+  /// `mvcc(false)` is deprecated and will be removed in a later release. It
+  /// is not marked `#[deprecated]` because the setter also takes `true`, and
+  /// a warning on every call would break `-D warnings` builds.
   pub fn mvcc(mut self, value: bool) -> Self {
     self.mvcc = value;
     self

@@ -28,7 +28,11 @@ export declare class Database {
   get readOnly(): boolean
   /** Begin a transaction */
   begin(readOnly?: boolean | undefined | null): number
-  /** Begin a bulk-load transaction (fast path, MVCC disabled) */
+  /**
+   * Begin a bulk-load transaction: the fast path for loading data. It runs
+   * alone among writers (it waits for open write transactions, and they
+   * wait for it); readers never wait for it.
+   */
   beginBulk(): number
   /** Commit the current transaction */
   commit(): void
@@ -761,7 +765,11 @@ export declare class Kite {
   check(): CheckResult
   /** Begin a transaction */
   begin(readOnly?: boolean | undefined | null): number
-  /** Begin a bulk-load transaction (fast path, MVCC disabled) */
+  /**
+   * Begin a bulk-load transaction: the fast path for loading data. It runs
+   * alone among writers (it waits for open write transactions, and they
+   * wait for it); readers never wait for it.
+   */
   beginBulk(): number
   /** Commit the current transaction */
   commit(): void
@@ -1375,7 +1383,11 @@ export interface JsKiteOptions {
   readOnly?: boolean
   /** Create database if it doesn't exist */
   createIfMissing?: boolean
-  /** Enable MVCC (snapshot isolation + conflict detection) */
+  /**
+   * MVCC: snapshot-isolated transactions and conflict detection between
+   * concurrent write transactions (default: true). `false` is deprecated
+   * and will be removed in a later release.
+   */
   mvcc?: boolean
   /** MVCC GC interval in ms */
   mvccGcIntervalMs?: number
@@ -1799,7 +1811,11 @@ export interface OpenOptions {
   readOnly?: boolean
   /** Create database if it doesn't exist */
   createIfMissing?: boolean
-  /** Enable MVCC (snapshot isolation + conflict detection) */
+  /**
+   * MVCC: snapshot-isolated transactions and conflict detection between
+   * concurrent write transactions (default: true). `false` is deprecated
+   * and will be removed in a later release.
+   */
   mvcc?: boolean
   /** MVCC GC interval in ms */
   mvccGcIntervalMs?: number

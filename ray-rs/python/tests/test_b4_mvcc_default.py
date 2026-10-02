@@ -43,7 +43,7 @@ def test_open_options_default_leaves_mvcc_to_the_engine_default(tmp_path):
 def test_kite_enables_mvcc_by_default(tmp_path):
     user, knows = _schema()
     with kite(str(tmp_path / "kite.kitedb"), nodes=[user], edges=[knows]) as db:
-        assert db.raw().stats().mvcc_stats is not None
+        assert db.raw.stats().mvcc_stats is not None
 
 
 def test_begin_bulk_works_under_the_default(tmp_path):

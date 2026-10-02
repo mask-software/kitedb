@@ -149,7 +149,9 @@ pub struct OpenOptions {
   pub read_only: Option<bool>,
   /// Create database if it doesn't exist
   pub create_if_missing: Option<bool>,
-  /// Enable MVCC (snapshot isolation + conflict detection)
+  /// MVCC: snapshot-isolated transactions and conflict detection between
+  /// concurrent write transactions (default: true). `false` is deprecated
+  /// and will be removed in a later release.
   pub mvcc: Option<bool>,
   /// MVCC GC interval in ms
   pub mvcc_gc_interval_ms: Option<i64>,

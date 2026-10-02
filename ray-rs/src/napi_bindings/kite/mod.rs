@@ -116,7 +116,9 @@ impl Kite {
 fn apply_kite_open_options(options: &JsKiteOptions, kite_opts: &mut KiteOptions) -> Result<()> {
   kite_opts.read_only = options.read_only.unwrap_or(false);
   kite_opts.create_if_missing = options.create_if_missing.unwrap_or(true);
-  kite_opts.mvcc = options.mvcc.unwrap_or(false);
+  if let Some(mvcc) = options.mvcc {
+    kite_opts.mvcc = mvcc;
+  }
   kite_opts.strict_schema = options.strict_schema.unwrap_or(false);
 
   if let Some(value) = options.mvcc_gc_interval_ms {

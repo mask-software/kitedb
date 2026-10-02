@@ -50,6 +50,8 @@ class OpenOptions:
     """Options for opening a database."""
     read_only: Optional[bool]
     create_if_missing: Optional[bool]
+    # MVCC (snapshot-isolated transactions, conflict detection) is on unless
+    # this is False; mvcc=False is deprecated and will be removed.
     mvcc: Optional[bool]
     mvcc_gc_interval_ms: Optional[int]
     mvcc_retention_ms: Optional[int]

@@ -1820,7 +1820,11 @@ export interface KiteOptions {
   readOnly?: boolean
   /** Create database if it doesn't exist (default: true) */
   createIfMissing?: boolean
-  /** Enable MVCC (snapshot isolation + conflict detection) */
+  /**
+   * MVCC: snapshot-isolated transactions and conflict detection between
+   * concurrent write transactions (default: true). `false` is deprecated and
+   * will be removed in a later release.
+   */
   mvcc?: boolean
   /** MVCC GC interval in ms */
   mvccGcIntervalMs?: number
