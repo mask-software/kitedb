@@ -354,6 +354,12 @@ pub(crate) struct BackgroundCheckpointState {
   /// the last declined cut. A cut is not retried before one of them
   /// finishes: until then the copies only grow.
   pub(crate) declined_carry: Option<HashSet<TxId>>,
+  /// Blocking checkpoints, optimizes, vacuums and WAL resizes waiting in
+  /// `exclusive_checkpoint_gate`. While any wait, new background checkpoints
+  /// decline instead of claiming `status` ahead of them: a waiter that finds
+  /// a run in progress whenever it gets the gate would wait forever behind a
+  /// background checkpoint loop.
+  pub(crate) exclusive_waiters: usize,
 }
 
 impl Default for BackgroundCheckpointState {
@@ -365,6 +371,7 @@ impl Default for BackgroundCheckpointState {
       cut: 0,
       writers_waited: false,
       declined_carry: None,
+      exclusive_waiters: 0,
     }
   }
 }

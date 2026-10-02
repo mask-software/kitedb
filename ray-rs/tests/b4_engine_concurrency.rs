@@ -703,10 +703,12 @@ fn f3_background_checkpoint_loop_does_not_starve_blocking_checkpoints() {
     thread::spawn(move || {
       while !stop.load(Ordering::Relaxed) {
         match db.background_checkpoint() {
-          Ok(()) | Err(KiteError::CheckpointDeclined(_)) => {}
+          Ok(()) => {
+            runs.fetch_add(1, Ordering::Relaxed);
+          }
+          Err(KiteError::CheckpointDeclined(_)) => {}
           Err(error) => panic!("background checkpoint failed: {error}"),
         }
-        runs.fetch_add(1, Ordering::Relaxed);
       }
     })
   };
@@ -742,6 +744,10 @@ fn f3_background_checkpoint_loop_does_not_starve_blocking_checkpoints() {
   background.join().expect("background loop");
   blocking.join().expect("blocking loop");
 
+  println!(
+    "f3: in {WINDOW:?}: {background_done} background checkpoints ran (not declined), {blocking_done} blocking checkpoints, \
+     {optimize_done} optimizes, {commits} commits"
+  );
   assert!(
     blocking_done >= REQUIRED && optimize_done >= REQUIRED,
     "in {WINDOW:?} a zero-pause background checkpoint loop ran {background_done} times while \

@@ -337,6 +337,21 @@ enum BackgroundCheckpointOutcome {
   /// It did not start: the last cut declined, and every transaction it would
   /// have had to copy is still open (see `cut_still_declined`).
   StillDeclined,
+  /// It did not start: a blocking checkpoint, optimize, vacuum or WAL resize
+  /// is waiting for the checkpoint gate (see `exclusive_waiters`).
+  ExclusiveWaiting,
+}
+
+/// A caller of `exclusive_checkpoint_gate`, registered in
+/// `BackgroundCheckpointState::exclusive_waiters` until dropped.
+struct ExclusiveWaiter<'db> {
+  db: &'db SingleFileDB,
+}
+
+impl Drop for ExclusiveWaiter<'_> {
+  fn drop(&mut self) {
+    self.db.checkpoint_state.lock().exclusive_waiters -= 1;
+  }
 }
 
 /// Whether a cut declined (see `cut_background_checkpoint`), changing
@@ -505,7 +520,12 @@ impl SingleFileDB {
   /// checkpoint can cut. A cut no run owns (a run stopped before its install)
   /// is just WAL to the caller: everything committed is in the delta, so a
   /// checkpoint replaces it, and compaction keeps it.
+  ///
+  /// The caller is registered as a waiter throughout, so no background
+  /// checkpoint starts meanwhile: it waits for at most the run in progress.
   pub(crate) fn exclusive_checkpoint_gate(&self) -> Result<RwLockWriteGuard<'_, ()>> {
+    self.checkpoint_state.lock().exclusive_waiters += 1;
+    let _waiter = ExclusiveWaiter { db: self };
     loop {
       let checkpoint_gate = self.checkpoint_gate.write();
       // Only the test hook: a cancelled background run may still hold the
@@ -608,18 +628,29 @@ impl SingleFileDB {
   }
 
   /// Claim the checkpoint status for a new background run, unless one is
-  /// running.
-  fn claim_background_checkpoint(&self) -> Option<BackgroundCheckpointRun<'_>> {
+  /// running or an exclusive operation waits for the gate.
+  fn claim_background_checkpoint(
+    &self,
+  ) -> std::result::Result<BackgroundCheckpointRun<'_>, BackgroundCheckpointOutcome> {
     let mut state = self.checkpoint_state.lock();
     if state.status != CheckpointStatus::Idle {
-      return None;
+      return Err(BackgroundCheckpointOutcome::AlreadyRunning);
+    }
+    if state.exclusive_waiters > 0 {
+      return Err(BackgroundCheckpointOutcome::ExclusiveWaiting);
     }
     state.run += 1;
     state.status = CheckpointStatus::Running;
-    Some(BackgroundCheckpointRun {
+    Ok(BackgroundCheckpointRun {
       db: self,
       run: state.run,
     })
+  }
+
+  /// Whether a blocking checkpoint, optimize, vacuum or WAL resize waits for
+  /// the checkpoint gate.
+  fn exclusive_operation_waiting(&self) -> bool {
+    self.checkpoint_state.lock().exclusive_waiters > 0
   }
 
   fn set_background_checkpoint_status(&self, run: u64, status: CheckpointStatus) {
@@ -685,7 +716,11 @@ impl SingleFileDB {
   ///
   /// Fails with `CheckpointDeclined`, changing nothing, if the open
   /// transactions' records cannot be copied; it is not retried (this returns
-  /// `CheckpointDeclined` at once) until one of them finishes.
+  /// `CheckpointDeclined` at once) until one of them finishes. It also
+  /// declines while a blocking checkpoint, optimize, vacuum or WAL resize
+  /// waits for the checkpoint gate, which checkpoints anyway: starting ahead
+  /// of it would make it wait again, and a loop of background checkpoints
+  /// would starve it.
   ///
   /// Steps:
   /// 1. Switch writes to secondary WAL region, copying there the records of
@@ -709,6 +744,11 @@ impl SingleFileDB {
       BackgroundCheckpointOutcome::StillDeclined => Err(KiteError::CheckpointDeclined(
         "the last attempt could not copy the WAL records of open transactions into the \
          secondary WAL region, and all of them are still open; it starts once one finishes"
+          .to_string(),
+      )),
+      BackgroundCheckpointOutcome::ExclusiveWaiting => Err(KiteError::CheckpointDeclined(
+        "a blocking checkpoint, optimize, vacuum or WAL resize is waiting for the checkpoint \
+         gate, and checkpoints once it has it"
           .to_string(),
       )),
       BackgroundCheckpointOutcome::Installed | BackgroundCheckpointOutcome::AlreadyRunning => {
@@ -765,8 +805,9 @@ impl SingleFileDB {
     // Claim the checkpoint before taking the gate, so commits that cross the
     // threshold meanwhile skip it instead of queueing behind it. Dropping
     // `run`, however this returns (or unwinds), returns the status to idle.
-    let Some(run) = self.claim_background_checkpoint() else {
-      return Ok(BackgroundCheckpointOutcome::AlreadyRunning);
+    let run = match self.claim_background_checkpoint() {
+      Ok(run) => run,
+      Err(outcome) => return Ok(outcome),
     };
 
     let mut extra_passes = 0;
@@ -780,7 +821,12 @@ impl SingleFileDB {
           Err(error)
         };
       }
-      if !self.take_writers_waited() || extra_passes == MAX_EXTRA_BACKGROUND_PASSES {
+      // A waiting exclusive operation checkpoints anyway, and waits for
+      // every pass this run takes.
+      if !self.take_writers_waited()
+        || extra_passes == MAX_EXTRA_BACKGROUND_PASSES
+        || self.exclusive_operation_waiting()
+      {
         return Ok(BackgroundCheckpointOutcome::Installed);
       }
       extra_passes += 1;
