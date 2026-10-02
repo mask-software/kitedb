@@ -70,6 +70,13 @@ impl Crc32Hasher {
     self.hasher.update(data);
   }
 
+  /// Append the state of `next`, a hasher over the bytes that follow this
+  /// one's, as if this hasher had read them too.
+  #[inline]
+  pub fn combine(&mut self, next: &Self) {
+    self.hasher.combine(&next.hasher);
+  }
+
   /// Finalize and return the hash
   #[inline]
   pub fn finalize(self) -> u32 {

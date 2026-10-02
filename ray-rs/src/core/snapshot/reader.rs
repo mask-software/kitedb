@@ -7,10 +7,14 @@
 //! fixed table by `SectionId`, without locks or reference counts. Before
 //! anything is inflated, every declared section size is checked against the
 //! header counts and the snapshot size, so a decompression bomb is refused
-//! from the section table alone.
+//! from the section table alone. Then every section's contents are checked,
+//! so a corrupt snapshot is refused at open rather than on first use. A
+//! large snapshot spreads the CRC, the inflation and the checks over a few
+//! threads; which error a corrupt one reports does not depend on that.
 
 use crate::constants::*;
 use crate::core::snapshot::node_map::{self, NodeIdMapLayout};
+use crate::core::snapshot::parallel;
 use crate::core::snapshot::sections::{
   inflation_budget, parse_section_table, string_offset_size_for_version,
 };
@@ -22,6 +26,7 @@ use crate::util::crc::{crc32, crc32_chunked, Crc32Hasher};
 use crate::util::hash::xxhash64_string;
 use crate::util::mmap::{map_file, Mmap};
 use std::borrow::Cow;
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
@@ -198,7 +203,7 @@ fn compute_crc_with_options(
   let chunk_size = normalized_crc_chunk_size(options.crc_chunk_size, data.len());
   if options.crc_profile_sink.is_none() {
     if chunk_size >= data.len().max(1) {
-      return (crc32(data), None);
+      return (crc32_spread(data), None);
     }
     return (crc32_chunked(data, chunk_size), None);
   }
@@ -292,6 +297,294 @@ fn string_id_in_table(string_id: u64, num_strings: usize) -> bool {
   string_id == 0 || string_id < num_strings as u64
 }
 
+// ============================================================================
+// Load: steps, limits and the fast checks
+// ============================================================================
+
+/// Inflated bytes below which a load stays on one thread, and the least
+/// each extra thread gets: inflating 256 KiB takes 150-250 us, starting a
+/// thread 20-50 us.
+const LOAD_WORK_PER_THREAD: usize = 256 * 1024;
+
+/// The content checks scan bytes about this many times faster than zstd
+/// inflates them, so an uncompressed section counts for this much less.
+const SCAN_WORK_DIVISOR: usize = 8;
+
+/// Bytes the CRC, or a check across sections, scans per extra thread. Both
+/// run at several GB/s.
+const SCAN_BYTES_PER_THREAD: usize = 1 << 20;
+
+/// A step of loading the sections, in the order a single-threaded load runs
+/// them: every section is inflated (in section order) before any content is
+/// checked. When several steps fail, load reports the first, so its error
+/// does not depend on how the work was split across threads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum LoadStep {
+  /// Inflating compressed section `index`.
+  Inflate(usize),
+  NodeIdMaps,
+  OutOffsets,
+  OutDst,
+  InOffsets,
+  InSrc,
+  InOutIndex,
+  StringOffsets,
+  LabelStringIds,
+  EtypeStringIds,
+  PropkeyStringIds,
+  NodeKeyString,
+  KeyEntries,
+  /// KeyBuckets, or the hash order of bucketless KeyEntries.
+  KeyLookup,
+  VectorOffsets,
+  NodePropVals,
+  NodePropOffsets,
+  EdgePropVals,
+  EdgePropOffsets,
+  NodeLabelOffsets,
+  VectorStoreIndex,
+}
+
+struct LoadFailure {
+  step: LoadStep,
+  error: KiteError,
+}
+
+impl LoadFailure {
+  fn new(step: LoadStep, error: KiteError) -> Self {
+    Self { step, error }
+  }
+}
+
+/// Header counts and declared section sizes the content checks compare
+/// against.
+struct ContentLimits {
+  num_nodes: usize,
+  num_edges: usize,
+  num_strings: usize,
+  has_in_edges: bool,
+  has_node_labels: bool,
+  has_vector_stores: bool,
+  has_key_buckets: bool,
+  string_offset_size: usize,
+  string_bytes_len: usize,
+  key_entry_count: usize,
+  /// Vectors in VectorOffsets, if the snapshot has vectors.
+  vector_count: Option<usize>,
+  vector_data_len: usize,
+  vector_store_data_len: usize,
+  node_prop_count: usize,
+  edge_prop_count: usize,
+  node_label_count: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+  /// Makes this thread's validators skip their fast pass, so tests can
+  /// compare it with the precise one.
+  static PRECISE_CHECKS_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with this thread's validators using their precise pass only.
+#[cfg(test)]
+fn with_precise_checks_only<R>(f: impl FnOnce() -> R) -> R {
+  let previous = PRECISE_CHECKS_ONLY.with(|precise| precise.replace(true));
+  let result = f();
+  PRECISE_CHECKS_ONLY.with(|precise| precise.set(previous));
+  result
+}
+
+/// Whether a validator may accept data on its fast pass alone.
+#[inline]
+fn fast_checks() -> bool {
+  #[cfg(test)]
+  {
+    !PRECISE_CHECKS_ONLY.with(std::cell::Cell::get)
+  }
+  #[cfg(not(test))]
+  {
+    true
+  }
+}
+
+/// CRC-32 of `data`; a large buffer is split into chunks hashed on several
+/// threads and combined.
+fn crc32_spread(data: &[u8]) -> u32 {
+  let threads = parallel::threads_for(data.len(), SCAN_BYTES_PER_THREAD, usize::MAX);
+  if threads <= 1 {
+    return crc32(data);
+  }
+  let chunks: Vec<&[u8]> = data.chunks(data.len().div_ceil(threads)).collect();
+  let hashers = parallel::run(chunks.len(), threads, |index| {
+    let mut hasher = Crc32Hasher::new();
+    hasher.update(chunks[index]);
+    hasher
+  });
+  let mut hashers = hashers.into_iter();
+  let mut combined = hashers.next().unwrap_or_default();
+  for hasher in hashers {
+    combined.combine(&hasher);
+  }
+  combined.finalize()
+}
+
+/// Largest value of a little-endian u32 array, or None when it is empty.
+/// A trailing partial value is ignored, as the element reads ignore it.
+#[inline]
+fn u32_max(data: &[u8]) -> Option<u32> {
+  let (values, _) = data.as_chunks::<4>();
+  let max = values
+    .iter()
+    .fold(0, |max, value| max.max(u32::from_le_bytes(*value)));
+  (!values.is_empty()).then_some(max)
+}
+
+/// Whether a u32 offset array is whole, never decreases and ends at most at
+/// `end_limit`.
+fn u32_offsets_valid(data: &[u8], end_limit: usize) -> bool {
+  let (values, rest) = data.as_chunks::<4>();
+  let Some(last) = values.last() else {
+    return rest.is_empty();
+  };
+  let decreasing = values
+    .iter()
+    .zip(&values[1..])
+    .fold(false, |decreasing, (previous, value)| {
+      decreasing | (u32::from_le_bytes(*value) < u32::from_le_bytes(*previous))
+    });
+  rest.is_empty() && !decreasing && u32::from_le_bytes(*last) as usize <= end_limit
+}
+
+/// Whether a u64 offset array is whole, never decreases and ends at most at
+/// `end_limit`.
+fn u64_offsets_valid(data: &[u8], end_limit: usize) -> bool {
+  let (values, rest) = data.as_chunks::<8>();
+  let Some(last) = values.last() else {
+    return rest.is_empty();
+  };
+  let decreasing = values
+    .iter()
+    .zip(&values[1..])
+    .fold(false, |decreasing, (previous, value)| {
+      decreasing | (u64::from_le_bytes(*value) < u64::from_le_bytes(*previous))
+    });
+  rest.is_empty()
+    && !decreasing
+    && usize::try_from(u64::from_le_bytes(*last)).is_ok_and(|last| last <= end_limit)
+}
+
+/// Whether every property value has a known tag, and every string and
+/// vector value indexes its table.
+fn property_values_valid(data: &[u8], num_strings: usize, vector_count: Option<usize>) -> bool {
+  const STRING: u8 = PropValueTag::String as u8;
+  const VECTOR: u8 = PropValueTag::VectorF32 as u8;
+  // ID 0 is always valid, so every string ID must be below max(num_strings, 1).
+  let string_limit = (num_strings as u64).max(1);
+  // Without a vector section no vector index is valid.
+  let vector_limit = vector_count.map_or(0, |count| count as u64);
+  let (values, _) = data.as_chunks::<PROP_VALUE_DISK_SIZE>();
+  let invalid = values.iter().fold(false, |invalid, value| {
+    let [tag, _, _, _, _, _, _, _, payload @ ..] = *value;
+    let payload = u64::from_le_bytes(payload);
+    invalid
+      | (tag > VECTOR)
+      | ((tag == STRING) & (payload >= string_limit))
+      | ((tag == VECTOR) & (payload >= vector_limit))
+  });
+  !invalid
+}
+
+/// Whether NodeIdToPhys and PhysToNodeId are inverse bijections between the
+/// node IDs and `0..num_nodes`, in ascending node ID order: the k-th mapped
+/// ID is at physical node k, and PhysToNodeId maps it back.
+fn node_id_maps_valid(
+  layout: NodeIdMapLayout,
+  map: &[u8],
+  phys_to_node: &[u8],
+  num_nodes: usize,
+  max_node_id: NodeId,
+) -> bool {
+  let (node_ids, _) = phys_to_node.as_chunks::<8>();
+  let node_ids = &node_ids[..num_nodes.min(node_ids.len())];
+  match layout {
+    NodeIdMapLayout::Dense => {
+      let (slots, _) = map.as_chunks::<{ node_map::DENSE_ENTRY_SIZE }>();
+      let mut mapped = 0usize;
+      for (node_id, slot) in slots.iter().enumerate() {
+        let phys = i32::from_le_bytes(*slot);
+        if phys == -1 {
+          continue;
+        }
+        let in_order = usize::try_from(phys).is_ok_and(|phys| phys == mapped);
+        match node_ids.get(mapped) {
+          Some(stored) if in_order && u64::from_le_bytes(*stored) == node_id as NodeId => {
+            mapped += 1;
+          }
+          _ => return false,
+        }
+      }
+      mapped == num_nodes
+    }
+    NodeIdMapLayout::Sparse => {
+      let (entries, _) = map.as_chunks::<{ node_map::SPARSE_ENTRY_SIZE }>();
+      let mut previous = None;
+      for (index, entry) in entries.iter().enumerate() {
+        let [id @ .., p0, p1, p2, p3] = *entry;
+        let node_id = u64::from_le_bytes(id);
+        let phys = u32::from_le_bytes([p0, p1, p2, p3]);
+        let ascending = previous.is_none_or(|previous| previous < node_id);
+        match node_ids.get(index) {
+          Some(stored)
+            if ascending
+              && node_id <= max_node_id
+              && phys as usize == index
+              && u64::from_le_bytes(*stored) == node_id => {}
+          _ => return false,
+        }
+        previous = Some(node_id);
+      }
+      entries.len() == num_nodes
+    }
+  }
+}
+
+/// Whether every KeyEntries record names a string in the table and a node
+/// NodeIdToPhys maps.
+fn key_entries_valid(
+  entries: &[u8],
+  num_strings: usize,
+  layout: NodeIdMapLayout,
+  map: &[u8],
+) -> bool {
+  // ID 0 is always valid, so every string ID must be below max(num_strings, 1).
+  let string_limit = (num_strings as u64).max(1);
+  let (records, _) = entries.as_chunks::<KEY_INDEX_ENTRY_SIZE>();
+  let fields = |record: &[u8; KEY_INDEX_ENTRY_SIZE]| {
+    let [_, _, _, _, _, _, _, _, s0, s1, s2, s3, _, _, _, _, node_id @ ..] = *record;
+    (
+      u64::from(u32::from_le_bytes([s0, s1, s2, s3])),
+      u64::from_le_bytes(node_id),
+    )
+  };
+  match layout {
+    NodeIdMapLayout::Dense => {
+      let (slots, _) = map.as_chunks::<{ node_map::DENSE_ENTRY_SIZE }>();
+      records.iter().all(|record| {
+        let (string_id, node_id) = fields(record);
+        string_id < string_limit
+          && usize::try_from(node_id)
+            .ok()
+            .and_then(|node_id| slots.get(node_id))
+            .is_some_and(|slot| i32::from_le_bytes(*slot) >= 0)
+      })
+    }
+    NodeIdMapLayout::Sparse => records.iter().all(|record| {
+      let (string_id, node_id) = fields(record);
+      string_id < string_limit && node_map::sparse_lookup(map, node_id).is_some()
+    }),
+  }
+}
+
 impl SnapshotData {
   fn from_parsed_parts(
     mmap: Arc<Mmap>,
@@ -318,8 +611,7 @@ impl SnapshotData {
     };
 
     snapshot.validate_section_sizes(snapshot_len)?;
-    snapshot.resolve_sections()?;
-    snapshot.validate_structure()?;
+    snapshot.load_sections()?;
     snapshot.label_names = snapshot.decode_names(SectionId::LabelStringIds);
     snapshot.etype_names = snapshot.decode_names(SectionId::EtypeStringIds);
     snapshot.propkey_names = snapshot.decode_names(SectionId::PropkeyStringIds);
@@ -708,32 +1000,138 @@ impl SnapshotData {
     Ok(())
   }
 
-  /// Maps every uncompressed section and inflates every compressed one.
-  fn resolve_sections(&mut self) -> Result<()> {
-    for (index, entry) in self.sections.iter().enumerate() {
-      if entry.length == 0 {
-        continue;
-      }
-      // parse_section_table checked the range lies within the mmap.
-      let start = entry.offset as usize;
-      let end = start + entry.length as usize;
-      self.views[index] = match CompressionType::from_u32(entry.compression) {
-        Some(CompressionType::None) => SectionView::Mapped { start, end },
-        compression => {
-          let name = SectionId::from_u32(index as u32).map_or("unknown", Self::section_name);
-          let compression =
-            compression.ok_or_else(|| Self::invalid_section(name, "unknown compression type"))?;
-          let inflated = decompress_with_size(
-            &self.mmap[start..end],
-            compression,
-            entry.uncompressed_size as usize,
-          )
-          .map_err(|error| Self::invalid_section(name, format!("cannot decompress: {error}")))?;
-          SectionView::Inflated(inflated.into_boxed_slice())
-        }
-      };
+  /// Work units of loading section `index`: a compressed section counts the
+  /// bytes it inflates to, an uncompressed one the bytes its checks scan,
+  /// which go about `SCAN_WORK_DIVISOR` times faster.
+  fn load_work(&self, index: usize) -> usize {
+    let entry = &self.sections[index];
+    // parse_section_table checked both sizes fit usize.
+    if entry.compression != 0 {
+      entry.uncompressed_size as usize
+    } else {
+      entry.length as usize / SCAN_WORK_DIVISOR
     }
-    Ok(())
+  }
+
+  /// Resolves every section (uncompressed ones are ranges of the mmap,
+  /// compressed ones are inflated) and checks their contents against the
+  /// header counts and each other.
+  ///
+  /// A large snapshot spreads its sections over several threads, each
+  /// checking a section right after inflating it; the two checks that read
+  /// two sections run once all are resolved. However the work is split, a
+  /// snapshot that fails several checks reports the first in `LoadStep`
+  /// order, the order a single thread runs them in.
+  fn load_sections(&mut self) -> Result<()> {
+    let limits = self.content_limits()?;
+    let mut order: Vec<usize> = (0..self.sections.len())
+      .filter(|&index| self.sections[index].length != 0)
+      .collect();
+    // Largest first, so that no long inflation starts last.
+    order.sort_by_key(|&index| Reverse(self.load_work(index)));
+    let work = order.iter().map(|&index| self.load_work(index)).sum();
+    let threads = parallel::threads_for(work, LOAD_WORK_PER_THREAD, order.len());
+
+    let this = &*self;
+    let loaded = parallel::run(order.len(), threads, |task| {
+      this.load_section(order[task], &limits)
+    });
+    let mut failures = Vec::new();
+    for (&index, (view, failure)) in order.iter().zip(loaded) {
+      self.views[index] = view;
+      failures.extend(failure);
+    }
+
+    // An inflation failure is reported before any check, and the checks
+    // across sections need every section.
+    if !failures
+      .iter()
+      .any(|failure| matches!(failure.step, LoadStep::Inflate(_)))
+    {
+      let scanned = [
+        SectionId::NodeIdToPhys,
+        SectionId::PhysToNodeId,
+        SectionId::KeyEntries,
+      ]
+      .map(|id| self.declared_len(id))
+      .iter()
+      .sum();
+      let threads = parallel::threads_for(scanned, SCAN_BYTES_PER_THREAD, 2);
+      let this = &*self;
+      let cross = parallel::run(2, threads, |task| {
+        if task == 0 {
+          this
+            .validate_node_id_maps(limits.num_nodes)
+            .map_err(|error| LoadFailure::new(LoadStep::NodeIdMaps, error))
+        } else {
+          this
+            .validate_key_entries(limits.num_strings)
+            .map_err(|error| LoadFailure::new(LoadStep::KeyEntries, error))
+        }
+      });
+      failures.extend(cross.into_iter().filter_map(|result| result.err()));
+    }
+
+    match failures.into_iter().min_by_key(|failure| failure.step) {
+      Some(failure) => Err(failure.error),
+      None => Ok(()),
+    }
+  }
+
+  /// Resolves section `index` and runs the check its bytes alone decide.
+  /// A section that fails to inflate stays empty and is not checked.
+  fn load_section(
+    &self,
+    index: usize,
+    limits: &ContentLimits,
+  ) -> (SectionView, Option<LoadFailure>) {
+    let view = match self.resolve_section(index) {
+      Ok(view) => view,
+      Err(error) => {
+        return (
+          SectionView::Empty,
+          Some(LoadFailure::new(LoadStep::Inflate(index), error)),
+        )
+      }
+    };
+    let failure = SectionId::from_u32(index as u32)
+      .and_then(|id| Self::check_section(limits, id, self.view_bytes(&view)));
+    (view, failure)
+  }
+
+  /// Section `index` as a range of the mmap, or inflated if compressed.
+  fn resolve_section(&self, index: usize) -> Result<SectionView> {
+    let entry = &self.sections[index];
+    if entry.length == 0 {
+      return Ok(SectionView::Empty);
+    }
+    // parse_section_table checked the range lies within the mmap.
+    let start = entry.offset as usize;
+    let end = start + entry.length as usize;
+    match CompressionType::from_u32(entry.compression) {
+      Some(CompressionType::None) => Ok(SectionView::Mapped { start, end }),
+      compression => {
+        let name = SectionId::from_u32(index as u32).map_or("unknown", Self::section_name);
+        let compression =
+          compression.ok_or_else(|| Self::invalid_section(name, "unknown compression type"))?;
+        let inflated = decompress_with_size(
+          &self.mmap[start..end],
+          compression,
+          entry.uncompressed_size as usize,
+        )
+        .map_err(|error| Self::invalid_section(name, format!("cannot decompress: {error}")))?;
+        Ok(SectionView::Inflated(inflated.into_boxed_slice()))
+      }
+    }
+  }
+
+  /// Bytes of a resolved section.
+  fn view_bytes<'a>(&'a self, view: &'a SectionView) -> &'a [u8] {
+    match view {
+      SectionView::Empty => &[],
+      SectionView::Mapped { start, end } => &self.mmap[*start..*end],
+      SectionView::Inflated(bytes) => bytes,
+    }
   }
 
   /// Bytes of section `id`, or an empty slice when it is absent.
@@ -742,7 +1140,139 @@ impl SnapshotData {
     self.section(id).unwrap_or(&[])
   }
 
+  /// What the content checks compare against. It all comes from the header
+  /// and the declared section sizes (a resolved section has exactly its
+  /// declared size), so each section can be checked as soon as it resolves.
+  fn content_limits(&self) -> Result<ContentLimits> {
+    let flags = self.header.flags;
+    Ok(ContentLimits {
+      num_nodes: Self::checked_count(self.header.num_nodes, "node counts")?,
+      num_edges: Self::checked_count(self.header.num_edges, "edge counts")?,
+      num_strings: Self::checked_count(self.header.num_strings, "StringOffsets")?,
+      has_in_edges: flags.contains(SnapshotFlags::HAS_IN_EDGES),
+      has_node_labels: flags.contains(SnapshotFlags::HAS_NODE_LABELS),
+      has_vector_stores: flags.contains(SnapshotFlags::HAS_VECTOR_STORES),
+      has_key_buckets: self.declared_len(SectionId::KeyBuckets) != 0,
+      string_offset_size: self.string_offset_size,
+      string_bytes_len: self.declared_len(SectionId::StringBytes),
+      key_entry_count: self.declared_len(SectionId::KeyEntries) / KEY_INDEX_ENTRY_SIZE,
+      // validate_section_sizes checked VectorOffsets has at least two offsets.
+      vector_count: flags
+        .contains(SnapshotFlags::HAS_VECTORS)
+        .then(|| (self.declared_len(SectionId::VectorOffsets) / 8).saturating_sub(1)),
+      vector_data_len: self.declared_len(SectionId::VectorData),
+      vector_store_data_len: self.declared_len(SectionId::VectorStoreData),
+      node_prop_count: self.declared_len(SectionId::NodePropVals) / PROP_VALUE_DISK_SIZE,
+      edge_prop_count: self.declared_len(SectionId::EdgePropVals) / PROP_VALUE_DISK_SIZE,
+      node_label_count: self.declared_len(SectionId::NodeLabelIds) / 4,
+    })
+  }
+
+  /// The check that section `id`'s own bytes decide, if it has one.
+  fn check_section(limits: &ContentLimits, id: SectionId, data: &[u8]) -> Option<LoadFailure> {
+    let (step, result) = match id {
+      SectionId::OutOffsets => (
+        LoadStep::OutOffsets,
+        Self::validate_u32_offsets(data, limits.num_edges, "OutOffsets"),
+      ),
+      SectionId::OutDst => (
+        LoadStep::OutDst,
+        Self::validate_u32_values_below(data, limits.num_nodes, "OutDst"),
+      ),
+      SectionId::InOffsets if limits.has_in_edges => (
+        LoadStep::InOffsets,
+        Self::validate_u32_offsets(data, limits.num_edges, "InOffsets"),
+      ),
+      SectionId::InSrc if limits.has_in_edges => (
+        LoadStep::InSrc,
+        Self::validate_u32_values_below(data, limits.num_nodes, "InSrc"),
+      ),
+      SectionId::InOutIndex if limits.has_in_edges => (
+        LoadStep::InOutIndex,
+        Self::validate_u32_values_below(data, limits.num_edges, "InOutIndex"),
+      ),
+      SectionId::StringOffsets => (
+        LoadStep::StringOffsets,
+        if limits.string_offset_size == 8 {
+          Self::validate_u64_offsets(data, limits.string_bytes_len, "StringOffsets")
+        } else {
+          Self::validate_u32_offsets(data, limits.string_bytes_len, "StringOffsets")
+        },
+      ),
+      SectionId::LabelStringIds => (
+        LoadStep::LabelStringIds,
+        Self::validate_string_id_array(data, limits.num_strings, "LabelStringIds"),
+      ),
+      SectionId::EtypeStringIds => (
+        LoadStep::EtypeStringIds,
+        Self::validate_string_id_array(data, limits.num_strings, "EtypeStringIds"),
+      ),
+      SectionId::PropkeyStringIds => (
+        LoadStep::PropkeyStringIds,
+        Self::validate_string_id_array(data, limits.num_strings, "PropkeyStringIds"),
+      ),
+      SectionId::NodeKeyString => (
+        LoadStep::NodeKeyString,
+        Self::validate_string_id_array(data, limits.num_strings, "NodeKeyString"),
+      ),
+      SectionId::KeyEntries if !limits.has_key_buckets => {
+        (LoadStep::KeyLookup, Self::validate_key_order(data))
+      }
+      SectionId::KeyBuckets => (
+        LoadStep::KeyLookup,
+        Self::validate_key_buckets(data, limits.key_entry_count),
+      ),
+      SectionId::VectorOffsets if limits.vector_count.is_some() => (
+        LoadStep::VectorOffsets,
+        Self::validate_u64_offsets(data, limits.vector_data_len, "VectorOffsets"),
+      ),
+      SectionId::NodePropVals => (
+        LoadStep::NodePropVals,
+        Self::validate_property_values(
+          data,
+          limits.num_strings,
+          limits.vector_count,
+          "NodePropVals",
+        ),
+      ),
+      SectionId::NodePropOffsets => (
+        LoadStep::NodePropOffsets,
+        Self::validate_u32_offsets(data, limits.node_prop_count, "NodePropOffsets"),
+      ),
+      SectionId::EdgePropVals => (
+        LoadStep::EdgePropVals,
+        Self::validate_property_values(
+          data,
+          limits.num_strings,
+          limits.vector_count,
+          "EdgePropVals",
+        ),
+      ),
+      SectionId::EdgePropOffsets => (
+        LoadStep::EdgePropOffsets,
+        Self::validate_u32_offsets(data, limits.edge_prop_count, "EdgePropOffsets"),
+      ),
+      SectionId::NodeLabelOffsets if limits.has_node_labels => (
+        LoadStep::NodeLabelOffsets,
+        Self::validate_u32_offsets(data, limits.node_label_count, "NodeLabelOffsets"),
+      ),
+      SectionId::VectorStoreIndex if limits.has_vector_stores => (
+        LoadStep::VectorStoreIndex,
+        Self::validate_vector_store_index(data, limits.vector_store_data_len),
+      ),
+      _ => return None,
+    };
+    result.err().map(|error| LoadFailure::new(step, error))
+  }
+
+  // Each validator first runs a fast pass that only answers whether the data
+  // is valid: branch-free over arrays, so the compiler vectorizes it. Only
+  // when that fails does the precise pass run, to name the first bad entry.
+
   fn validate_u32_offsets(data: &[u8], end_limit: usize, section: &str) -> Result<()> {
+    if fast_checks() && u32_offsets_valid(data, end_limit) {
+      return Ok(());
+    }
     if !data.len().is_multiple_of(4) {
       return Err(Self::invalid_section(
         section,
@@ -771,6 +1301,9 @@ impl SnapshotData {
   }
 
   fn validate_u64_offsets(data: &[u8], end_limit: usize, section: &str) -> Result<()> {
+    if fast_checks() && u64_offsets_valid(data, end_limit) {
+      return Ok(());
+    }
     if !data.len().is_multiple_of(8) {
       return Err(Self::invalid_section(
         section,
@@ -801,6 +1334,11 @@ impl SnapshotData {
   }
 
   fn validate_string_id_array(data: &[u8], num_strings: usize, section: &str) -> Result<()> {
+    // ID 0 is always valid, so every ID must be below max(num_strings, 1).
+    if fast_checks() && u32_max(data).is_none_or(|max| u64::from(max) < (num_strings as u64).max(1))
+    {
+      return Ok(());
+    }
     for index in 0..data.len() / 4 {
       let string_id = read_u32_at(data, index);
       if !string_id_in_table(u64::from(string_id), num_strings) {
@@ -814,6 +1352,9 @@ impl SnapshotData {
   }
 
   fn validate_u32_values_below(data: &[u8], limit: usize, section: &str) -> Result<()> {
+    if fast_checks() && u32_max(data).is_none_or(|max| (max as usize) < limit) {
+      return Ok(());
+    }
     for index in 0..data.len() / 4 {
       let value = read_u32_at(data, index) as usize;
       if value >= limit {
@@ -832,6 +1373,9 @@ impl SnapshotData {
     vector_count: Option<usize>,
     section: &str,
   ) -> Result<()> {
+    if fast_checks() && property_values_valid(data, num_strings, vector_count) {
+      return Ok(());
+    }
     for index in 0..data.len() / PROP_VALUE_DISK_SIZE {
       let offset = index * PROP_VALUE_DISK_SIZE;
       let tag = data[offset];
@@ -883,6 +1427,17 @@ impl SnapshotData {
     const SECTION: &str = "NodeIdToPhys";
     let map = self.bytes(SectionId::NodeIdToPhys);
     let phys_to_node = self.bytes(SectionId::PhysToNodeId);
+    if fast_checks()
+      && node_id_maps_valid(
+        self.node_id_map,
+        map,
+        phys_to_node,
+        num_nodes,
+        self.header.max_node_id,
+      )
+    {
+      return Ok(());
+    }
     // `rank`: how many node IDs below `node_id` are mapped.
     let check_pair = |node_id: NodeId, phys: usize, rank: usize| -> Result<()> {
       if phys >= num_nodes {
@@ -967,90 +1522,20 @@ impl SnapshotData {
     Ok(())
   }
 
-  /// Checks section contents. Sizes were checked by `validate_section_sizes`.
-  fn validate_structure(&self) -> Result<()> {
-    let flags = self.header.flags;
-    let num_nodes = Self::checked_count(self.header.num_nodes, "node counts")?;
-    let num_edges = Self::checked_count(self.header.num_edges, "edge counts")?;
-    let num_strings = Self::checked_count(self.header.num_strings, "StringOffsets")?;
-
-    self.validate_node_id_maps(num_nodes)?;
-
-    Self::validate_u32_offsets(self.bytes(SectionId::OutOffsets), num_edges, "OutOffsets")?;
-    Self::validate_u32_values_below(self.bytes(SectionId::OutDst), num_nodes, "OutDst")?;
-    if flags.contains(SnapshotFlags::HAS_IN_EDGES) {
-      Self::validate_u32_offsets(self.bytes(SectionId::InOffsets), num_edges, "InOffsets")?;
-      Self::validate_u32_values_below(self.bytes(SectionId::InSrc), num_nodes, "InSrc")?;
-      Self::validate_u32_values_below(self.bytes(SectionId::InOutIndex), num_edges, "InOutIndex")?;
-    }
-
-    let string_offsets = self.bytes(SectionId::StringOffsets);
-    let string_bytes_len = self.bytes(SectionId::StringBytes).len();
-    if self.string_offset_size == 8 {
-      Self::validate_u64_offsets(string_offsets, string_bytes_len, "StringOffsets")?;
-    } else {
-      Self::validate_u32_offsets(string_offsets, string_bytes_len, "StringOffsets")?;
-    }
-    for id in [
-      SectionId::LabelStringIds,
-      SectionId::EtypeStringIds,
-      SectionId::PropkeyStringIds,
-      SectionId::NodeKeyString,
-    ] {
-      Self::validate_string_id_array(self.bytes(id), num_strings, Self::section_name(id))?;
-    }
-
-    self.validate_key_index(num_strings)?;
-
-    let vector_count = if flags.contains(SnapshotFlags::HAS_VECTORS) {
-      let vector_offsets = self.bytes(SectionId::VectorOffsets);
-      Self::validate_u64_offsets(
-        vector_offsets,
-        self.bytes(SectionId::VectorData).len(),
-        "VectorOffsets",
-      )?;
-      Some(vector_offsets.len() / 8 - 1)
-    } else {
-      None
-    };
-
-    let node_prop_vals = self.bytes(SectionId::NodePropVals);
-    Self::validate_property_values(node_prop_vals, num_strings, vector_count, "NodePropVals")?;
-    Self::validate_u32_offsets(
-      self.bytes(SectionId::NodePropOffsets),
-      node_prop_vals.len() / PROP_VALUE_DISK_SIZE,
-      "NodePropOffsets",
-    )?;
-    let edge_prop_vals = self.bytes(SectionId::EdgePropVals);
-    Self::validate_property_values(edge_prop_vals, num_strings, vector_count, "EdgePropVals")?;
-    Self::validate_u32_offsets(
-      self.bytes(SectionId::EdgePropOffsets),
-      edge_prop_vals.len() / PROP_VALUE_DISK_SIZE,
-      "EdgePropOffsets",
-    )?;
-
-    if flags.contains(SnapshotFlags::HAS_NODE_LABELS) {
-      Self::validate_u32_offsets(
-        self.bytes(SectionId::NodeLabelOffsets),
-        self.bytes(SectionId::NodeLabelIds).len() / 4,
-        "NodeLabelOffsets",
-      )?;
-    }
-
-    if flags.contains(SnapshotFlags::HAS_VECTOR_STORES) {
-      self.validate_vector_store_index()?;
-    }
-
-    Ok(())
-  }
-
-  /// KeyEntries must reference strings and present nodes, and lookup_by_key
-  /// must be able to find them: through KeyBuckets, or by binary search on
-  /// hash-sorted entries when there are no buckets.
-  fn validate_key_index(&self, num_strings: usize) -> Result<()> {
+  /// KeyEntries must reference strings and present nodes.
+  fn validate_key_entries(&self, num_strings: usize) -> Result<()> {
     let entries = self.bytes(SectionId::KeyEntries);
-    let entry_count = entries.len() / KEY_INDEX_ENTRY_SIZE;
-    for index in 0..entry_count {
+    if fast_checks()
+      && key_entries_valid(
+        entries,
+        num_strings,
+        self.node_id_map,
+        self.bytes(SectionId::NodeIdToPhys),
+      )
+    {
+      return Ok(());
+    }
+    for index in 0..entries.len() / KEY_INDEX_ENTRY_SIZE {
       let entry_offset = index * KEY_INDEX_ENTRY_SIZE;
       let string_id = read_u32(entries, entry_offset + 8);
       if !string_id_in_table(u64::from(string_id), num_strings) {
@@ -1067,39 +1552,43 @@ impl SnapshotData {
         ));
       }
     }
+    Ok(())
+  }
 
-    match self.section(SectionId::KeyBuckets) {
-      Some(buckets) => {
-        Self::validate_u32_offsets(buckets, entry_count, "KeyBuckets")?;
-        if read_u32_at(buckets, 0) != 0
-          || read_u32_at(buckets, buckets.len() / 4 - 1) as usize != entry_count
-        {
-          return Err(Self::invalid_section(
-            "KeyBuckets",
-            "bucket offsets do not cover all key entries",
-          ));
-        }
-      }
-      None => {
-        if let Some(index) = (1..entry_count)
-          .find(|&index| key_entry_hash(entries, index - 1) > key_entry_hash(entries, index))
-        {
-          return Err(Self::invalid_section(
-            "KeyEntries",
-            format!(
-              "entry {index} is out of hash order, and there is no KeyBuckets section to \
-               find entries by bucket"
-            ),
-          ));
-        }
-      }
+  /// lookup_by_key finds entries through KeyBuckets: its offsets must
+  /// partition all `entry_count` entries.
+  fn validate_key_buckets(buckets: &[u8], entry_count: usize) -> Result<()> {
+    Self::validate_u32_offsets(buckets, entry_count, "KeyBuckets")?;
+    // validate_section_sizes checked there are at least two offsets.
+    if read_u32_at(buckets, 0) != 0
+      || read_u32_at(buckets, buckets.len() / 4 - 1) as usize != entry_count
+    {
+      return Err(Self::invalid_section(
+        "KeyBuckets",
+        "bucket offsets do not cover all key entries",
+      ));
     }
     Ok(())
   }
 
-  fn validate_vector_store_index(&self) -> Result<()> {
-    let index = self.bytes(SectionId::VectorStoreIndex);
-    let data_len = self.bytes(SectionId::VectorStoreData).len();
+  /// Without KeyBuckets, lookup_by_key binary-searches entries by hash.
+  fn validate_key_order(entries: &[u8]) -> Result<()> {
+    let entry_count = entries.len() / KEY_INDEX_ENTRY_SIZE;
+    if let Some(index) = (1..entry_count)
+      .find(|&index| key_entry_hash(entries, index - 1) > key_entry_hash(entries, index))
+    {
+      return Err(Self::invalid_section(
+        "KeyEntries",
+        format!(
+          "entry {index} is out of hash order, and there is no KeyBuckets section to \
+           find entries by bucket"
+        ),
+      ));
+    }
+    Ok(())
+  }
+
+  fn validate_vector_store_index(index: &[u8], data_len: usize) -> Result<()> {
     if index.len() < 4 {
       return Err(Self::invalid_section(
         "VectorStoreIndex",
@@ -2368,3 +2857,7 @@ mod audit_tests {
     assert_no_failures(failures);
   }
 }
+
+#[cfg(test)]
+#[path = "b4_open_perf_tests.rs"]
+mod b4_open_perf_tests;
