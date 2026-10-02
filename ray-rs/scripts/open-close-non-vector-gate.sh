@@ -5,10 +5,37 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT_DIR="${OUT_DIR:-$ROOT_DIR/../docs/benchmarks/results}"
 
 ATTEMPTS="${ATTEMPTS:-1}"
-MAX_SMALL_RW_US="${MAX_SMALL_RW_US:-900.0}"
-MAX_SMALL_RO_US="${MAX_SMALL_RO_US:-900.0}"
-MAX_LARGE_RW_US="${MAX_LARGE_RW_US:-5000.0}"
-MAX_LARGE_RO_US="${MAX_LARGE_RO_US:-5000.0}"
+# Limits on the criterion median of open + close, read-write and read-only, for
+# a 10k-node/20k-edge graph (small) and a 100k/200k one (large), calibrated on
+# CI's ubuntu-latest runner.
+#
+# Since the snapshot hardening in 9462079 (July 2026), open checks the whole
+# snapshot structure (bounds, monotonic offsets, node ID maps, key index), and
+# to do so inflates every compressed section up front (zstd checkpoint
+# compression is on by default). Before, open verified the CRC and inflated
+# sections lazily on first use. That made open 4-5x slower, in proportion to
+# the snapshot size. Median of 3 attempts, in us:
+#                               small-rw small-ro large-rw large-ro
+#   macOS  0aefe83 (Feb 2026)        268      269     2002     1982
+#   macOS  9462079 (hardening)      1206     1170    10887    10865
+#   macOS  6ea5f99 (S4-S13 reader)  1180     1137    10610    10563
+#   macOS  2026-10-02 main          1186     1142    10614    10608
+#   Linux  0aefe83 (Docker)          601      631     2315     2423
+#   Linux  2026-10-02 main (Docker) 1623     1073    10840    10333
+# A large open at main spends ~70% inflating, ~25% in the structure checks and
+# ~7% on the CRC. The previous limits (900 and 5000 us) predate the hardening;
+# CI failed them on all eight main pushes of 2026-10-02, measuring:
+#   small-rw 1776-2502 (median 1826), small-ro 831-1573 (1502),
+#   large-rw 10525-20609 (16076), large-ro 8836-15391 (14826).
+# The limits are about 1.75x CI's median read-only time and 1.9x its median
+# read-write time (a read-write close also syncs, and slow runner disks widen
+# its spread): a change that doubles open, such as a second parse or inflate
+# pass or a superlinear check, fails on a typical runner, while the slowest
+# runner seen keeps 1.4-1.7x of headroom.
+MAX_SMALL_RW_US="${MAX_SMALL_RW_US:-3500.0}"
+MAX_SMALL_RO_US="${MAX_SMALL_RO_US:-2600.0}"
+MAX_LARGE_RW_US="${MAX_LARGE_RW_US:-30000.0}"
+MAX_LARGE_RO_US="${MAX_LARGE_RO_US:-26000.0}"
 
 if [[ "$ATTEMPTS" -lt 1 ]]; then
   echo "ATTEMPTS must be >= 1"

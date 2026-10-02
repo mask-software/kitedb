@@ -193,10 +193,11 @@ jobs:
         env:
           STAMP: ci-${{ github.run_id }}-${{ github.run_attempt }}
           ATTEMPTS: "1"
-          MAX_SMALL_RW_US: "900.0"
-          MAX_SMALL_RO_US: "900.0"
-          MAX_LARGE_RW_US: "5000.0"
-          MAX_LARGE_RO_US: "5000.0"
+          # Calibration notes: scripts/open-close-non-vector-gate.sh.
+          MAX_SMALL_RW_US: "3500.0"
+          MAX_SMALL_RO_US: "2600.0"
+          MAX_LARGE_RW_US: "30000.0"
+          MAX_LARGE_RO_US: "26000.0"
       - name: Upload open/close non-vector gate logs
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
