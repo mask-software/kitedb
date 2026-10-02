@@ -13,26 +13,26 @@
     "start": "node .output/server/index.mjs"
   },
   "dependencies": {
-    "@tailwindcss/vite": "^4.0.6",
-    "@tanstack/solid-router": "^1.133.20",
-    "@tanstack/solid-router-devtools": "^1.133.20",
-    "@tanstack/solid-start": "^1.132.25",
+    "@tailwindcss/vite": "^4.3.3",
+    "@tanstack/solid-router": "^1.170.38",
+    "@tanstack/solid-router-devtools": "^1.167.2",
+    "@tanstack/solid-start": "^1.168.57",
     "lucide-solid": "^0.544.0",
     "minisearch": "^7.2.0",
     "nitro": "npm:nitro-nightly@latest",
-    "shiki": "^3.21.0",
-    "solid-js": "^1.9.9",
-    "tailwindcss": "^4.0.6",
-    "vite-plugin-lucide-preprocess": "^1.4.6",
+    "shiki": "^3.23.0",
+    "solid-js": "^1.9.15",
+    "tailwindcss": "^4.3.3",
+    "vite-plugin-lucide-preprocess": "^1.8.0",
     "vite-tsconfig-paths": "^5.1.4"
   },
   "devDependencies": {
     "@biomejs/biome": "2.2.4",
-    "@tanstack/devtools-vite": "^0.3.11",
-    "@types/node": "^26.6.3",
-    "typescript": "^5.7.2",
-    "vite": "^7.1.7",
-    "vite-plugin-solid": "^2.11.10",
-    "vitest": "^3"
+    "@tanstack/devtools-vite": "^0.3.12",
+    "@types/node": "^26.6.4",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.6",
+    "vite-plugin-solid": "^2.11.14",
+    "vitest": "^3.2.7"
   }
 }
