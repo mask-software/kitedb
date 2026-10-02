@@ -7,6 +7,7 @@
 //!   --nodes N                 Number of nodes (default: 10000)
 //!   --edges M                 Number of edges (default: 50000)
 //!   --iterations I            Iterations for latency benchmarks (default: 10000)
+//!   --node-batches N          Batches in the 100-node write benchmark (default: iterations/100, at most 50)
 //!   --wal-size BYTES          WAL size in bytes (default: 67108864)
 //!   --sync-mode MODE          Sync mode: full|normal|off (default: normal)
 //!   --group-commit-enabled    Enable group commit (default: false)
@@ -39,6 +40,7 @@ struct BenchConfig {
   edge_types: usize,
   edge_props: usize,
   iterations: usize,
+  node_batches: Option<usize>,
   wal_size: usize,
   sync_mode: SyncMode,
   group_commit_enabled: bool,
@@ -62,6 +64,7 @@ impl Default for BenchConfig {
       edge_types: 3,
       edge_props: 10,
       iterations: 10_000,
+      node_batches: None,
       wal_size: 64 * 1024 * 1024,
       sync_mode: SyncMode::Normal,
       group_commit_enabled: false,
@@ -113,6 +116,12 @@ fn parse_args() -> BenchConfig {
       "--iterations" => {
         if let Some(value) = args.get(i + 1) {
           config.iterations = value.parse().unwrap_or(config.iterations);
+          i += 1;
+        }
+      }
+      "--node-batches" => {
+        if let Some(value) = args.get(i + 1) {
+          config.node_batches = value.parse().ok();
           i += 1;
         }
       }
@@ -553,10 +562,11 @@ fn benchmark_writes(
   db: &kitedb::core::single_file::SingleFileDB,
   graph: &GraphData,
   iterations: usize,
+  node_batches: Option<usize>,
 ) {
   println!("\n--- Batch Writes (100 nodes) ---");
   let batch_size = 100usize;
-  let batches = (iterations / batch_size).min(50);
+  let batches = node_batches.unwrap_or((iterations / batch_size).min(50));
   let mut samples = Vec::with_capacity(batches);
 
   for b in 0..batches {
@@ -655,6 +665,9 @@ fn main() {
   println!("Edge types: {}", format_number(config.edge_types));
   println!("Edge props: {}", format_number(config.edge_props));
   println!("Iterations: {}", format_number(config.iterations));
+  if let Some(batches) = config.node_batches {
+    println!("Node write batches: {}", format_number(batches));
+  }
   println!("WAL size: {} bytes", format_number(config.wal_size));
   println!("Sync mode: {}", format_sync_mode(config.sync_mode));
   println!(
@@ -742,7 +755,7 @@ fn main() {
   if config.reopen_readonly {
     println!("  Skipped write benchmarks (read-only)");
   } else {
-    benchmark_writes(&db, &graph, config.iterations);
+    benchmark_writes(&db, &graph, config.iterations, config.node_batches);
   }
 
   close_single_file(db).expect("failed to close db");
