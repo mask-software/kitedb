@@ -9,7 +9,9 @@
 //! - f2: `write_wal_tx` encoded every record twice, and kept a copy of every
 //!   record in the transaction even when nothing reads it.
 //! - f3: scanning a WAL region cost one read per page.
-//! - f4: open read the whole WAL area page by page, wherever the head was.
+//! - f4: open read the whole WAL area page by page, wherever the head was;
+//!   a writable open also checked the primary region twice (record types,
+//!   then torn tail).
 //! - f5: moving post-cut records back into the primary region (under the
 //!   commit lock, at a background checkpoint's install) read every secondary
 //!   page, read every primary page it wrote, and wrote them one at a time.
@@ -18,8 +20,9 @@ use tempfile::tempdir;
 
 use super::buffer::WalBuffer;
 use super::record::{build_create_node_payload, built_bytes_during, WalRecord};
+use crate::core::header::read_header_slots;
 use crate::core::pager::io_hooks::{self, SyncKind};
-use crate::core::pager::{create_pager, FilePager};
+use crate::core::pager::{create_pager, open_pager, FilePager};
 use crate::core::single_file::{
   close_single_file, open_single_file, SingleFileDB, SingleFileOpenOptions, SyncMode,
 };
@@ -312,6 +315,38 @@ fn f4_open_reads_only_the_live_wal() {
        took {reads} reads"
     );
   }
+}
+
+/// A writable open reads the live primary region once to check it (records
+/// of an unknown type refuse the open, a torn tail is trimmed) and once more
+/// to replay it; it read it twice to check it, once per check.
+#[test]
+fn f4_writable_open_checks_the_wal_in_one_pass() {
+  let dir = tempdir().expect("tempdir");
+  let path = dir.path().join("f4-one-pass.kitedb");
+  let options = options().wal_size(4 * 1024 * 1024);
+  let db = open_single_file(&path, options.clone()).expect("open");
+  for index in 0..8 {
+    commit_node(&db, &format!("node-{index}"));
+  }
+  close_single_file(db).expect("close");
+
+  let header_reads = {
+    let mut pager = open_pager(&path, PAGE_SIZE, true).expect("pager");
+    let (slots, reads) = io_hooks::reads_during(|| read_header_slots(&mut pager));
+    slots.expect("header slots");
+    reads
+  };
+  let (db, reads) = io_hooks::reads_during(|| open_single_file(&path, options.clone()));
+  let db = db.expect("reopen");
+  assert!(db.node_by_key("node-7").is_some());
+  close_single_file(db).expect("close");
+  assert_eq!(
+    reads - header_reads,
+    2,
+    "a writable open read the WAL {} times (after {header_reads} header reads)",
+    reads - header_reads
+  );
 }
 
 // ============================================================================
