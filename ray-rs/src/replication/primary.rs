@@ -391,6 +391,14 @@ impl PrimaryReplication {
   pub fn flush_for_transport_export(&self) -> Result<()> {
     self.inner.flush_for_transport_export()
   }
+
+  /// Stop the background publisher without publishing, so frames appended
+  /// from now on stay buffered in memory, as they would be at a crash before
+  /// its next tick.
+  #[cfg(test)]
+  pub(crate) fn stop_publisher_for_testing(&mut self) {
+    drop(self.publisher.take());
+  }
 }
 
 impl Drop for PrimaryReplication {

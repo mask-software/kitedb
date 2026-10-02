@@ -4742,3 +4742,8 @@ mod review_regressions {
 #[cfg(test)]
 #[path = "final_review_regressions.rs"]
 mod final_review_regressions;
+
+/// Wave-2 checkpoint reproductions (K1-K5).
+#[cfg(test)]
+#[path = "w2_checkpoint_tests.rs"]
+mod w2_tests;
