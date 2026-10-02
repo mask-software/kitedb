@@ -734,6 +734,26 @@ test('X5: exportToObject / importFromObject keep their shape and round-trip', (t
   t.is(target.countEdges(), 3)
 })
 
+test('X5: exportToObject / importFromObject keep node labels', (t) => {
+  const source = openDb(t)
+  const { ids } = seed(source, 2)
+  source.begin()
+  const person = source.defineLabel('Person')
+  source.addNodeLabel(ids[0], person)
+  source.commit()
+
+  const exported = source.exportToObject() as any
+  const first = exported.nodes.find((n: any) => n.id === ids[0])
+  const second = exported.nodes.find((n: any) => n.id === ids[1])
+  t.deepEqual(first.labels, ['Person'])
+  t.deepEqual(second.labels, [])
+
+  const target = openDb(t)
+  t.is(target.importFromObject(exported).nodeCount, 2)
+  const imported = target.getNodeByKey('n:0')!
+  t.true(target.nodeHasLabel(imported, target.getLabelId('Person')!))
+})
+
 test('X5: importFromObject accepts node ids and integer props above 2^32', (t) => {
   const source = openDb(t)
   const bigId = 2 ** 33 + 1
