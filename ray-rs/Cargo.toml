@@ -74,7 +74,7 @@ libc = "0.2"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # Memory mapping (native only)
-memmap2 = "0.9"
+memmap2 = "0.9.11" # >= 0.9.11: RUSTSEC-2026-0186
 # File locking (native only)
 fs2 = "0.4"
 # Parallelism (native only)
