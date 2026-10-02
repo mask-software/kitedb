@@ -425,23 +425,6 @@ impl WalBuffer {
     Ok(())
   }
 
-  /// Switch writes back to primary region (called after checkpoint completes)
-  /// If reset_primary is true, resets the primary region (checkpoint completed)
-  pub fn switch_to_primary(&mut self, reset_primary: bool) {
-    if self.active_region == 0 && !reset_primary {
-      return; // Already in primary and no reset needed
-    }
-    self.active_region = 0;
-    if reset_primary {
-      // Reset primary head (checkpoint completed, WAL is cleared)
-      self.primary_head = 0;
-      self.tail = 0;
-      self.primary_salt = self.fresh_salt();
-    }
-    // Update head to track active position
-    self.head = self.primary_head;
-  }
-
   /// Retire every primary-region record once a checkpoint snapshot covers them.
   ///
   /// Records written to the secondary region after the checkpoint cut stay in
@@ -567,10 +550,10 @@ impl WalBuffer {
   }
 
   /// Merge secondary records into a fresh primary region (buffered, not
-  /// flushed). Checkpoint completion uses
-  /// [`Self::compact_secondary_into_primary`], which adds the flush, sync, and
-  /// error rollback that make the rewrite safe to install.
-  pub fn merge_secondary_into_primary(&mut self, pager: &mut FilePager) -> Result<()> {
+  /// flushed). Only [`Self::compact_secondary_into_primary`] may call it: it
+  /// adds the flush, sync, and error rollback that make the rewrite safe to
+  /// install.
+  fn merge_secondary_into_primary(&mut self, pager: &mut FilePager) -> Result<()> {
     let has_secondary_records = self.secondary_head > self.secondary_region_start;
     let secondary_records = if has_secondary_records {
       let (records, end) = self.scan_region_to_end(1, pager)?;
@@ -824,6 +807,10 @@ impl WalBuffer {
 
   /// Reserve space for a record, returning the write position
   /// Returns None if buffer is full
+  ///
+  /// Test only: it moves the head past bytes it never writes, which replay
+  /// would then read as records.
+  #[cfg(test)]
   pub fn reserve(&mut self, size: usize) -> Option<u64> {
     let aligned_size = align_up(size, WAL_RECORD_ALIGNMENT) as u64;
 
@@ -1067,11 +1054,6 @@ impl WalBuffer {
   /// Check if there are pending writes
   pub fn has_pending_writes(&self) -> bool {
     !self.pending_writes.is_empty()
-  }
-
-  /// Advance tail after checkpoint
-  pub fn advance_tail(&mut self, new_tail: u64) {
-    self.tail = new_tail;
   }
 
   /// Reset the buffer (after checkpoint). The primary region gets a fresh
