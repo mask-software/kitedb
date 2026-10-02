@@ -46,10 +46,24 @@ thread_local! {
   static SYNC_FAULTS: Cell<usize> = const { Cell::new(0) };
 }
 
+/// The thread whose [`record_io_during`] log starts over at its next event
+/// (see [`restart_io_log_of`]).
+#[cfg(test)]
+static RESTART_IO_LOG: std::sync::Mutex<Option<std::thread::ThreadId>> =
+  std::sync::Mutex::new(None);
+
 #[cfg(test)]
 fn log_io(event: impl FnOnce() -> IoEvent) {
   IO_LOG.with(|log| {
     if let Some(log) = log.borrow_mut().as_mut() {
+      let mut restart = RESTART_IO_LOG
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+      if *restart == Some(std::thread::current().id()) {
+        *restart = None;
+        log.clear();
+      }
+      drop(restart);
       log.push(event());
     }
   });
@@ -218,6 +232,16 @@ pub(crate) fn record_io_during<R>(run: impl FnOnce() -> R) -> (R, Vec<IoEvent>) 
   IO_LOG.with(|log| *log.borrow_mut() = Some(Vec::new()));
   let result = run();
   (result, IO_LOG.with(|log| log.take().unwrap_or_default()))
+}
+
+/// Make `thread`'s [`record_io_during`] log start over at its next write or
+/// sync, so it ends up holding only what that thread does from now on: for a
+/// crash image built on a copy of the file taken now, while `thread` waits.
+#[cfg(test)]
+pub(crate) fn restart_io_log_of(thread: std::thread::ThreadId) {
+  *RESTART_IO_LOG
+    .lock()
+    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(thread);
 }
 
 /// Run `run` with the next `count` pager syncs on this thread failing.

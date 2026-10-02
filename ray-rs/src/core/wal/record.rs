@@ -156,25 +156,48 @@ pub fn read_wal_record(buffer: &[u8], offset: usize) -> WalRecordAt {
 
 /// [`read_wal_record`] for a record written with `salt`.
 pub fn read_wal_record_with_salt(buffer: &[u8], offset: usize, salt: u32) -> WalRecordAt {
-  let Some((record_type_byte, mut record)) = parse_wal_record_frame(buffer, offset, salt) else {
+  let Some(frame) = check_wal_frame(buffer, offset, salt) else {
     return WalRecordAt::Invalid;
   };
-  match WalRecordType::from_u8(record_type_byte) {
-    Some(record_type) => {
-      record.record_type = record_type;
-      WalRecordAt::Record(record)
-    }
-    None => WalRecordAt::UnknownType(record_type_byte),
+  match WalRecordType::from_u8(frame.record_type) {
+    Some(record_type) => WalRecordAt::Record(frame.parse(record_type, buffer)),
+    None => WalRecordAt::UnknownType(frame.record_type),
   }
 }
 
-/// The record at `offset` if its framing and CRC (salted with `salt`) check,
-/// with its type byte (its `record_type` is a placeholder).
-fn parse_wal_record_frame(
-  buffer: &[u8],
-  offset: usize,
-  salt: u32,
-) -> Option<(u8, ParsedWalRecord)> {
+/// Where a WAL record lies in a buffer, its framing and salted CRC checked;
+/// nothing is copied out of the buffer.
+#[derive(Debug, Clone)]
+pub(crate) struct WalFrame {
+  /// Offset of the record.
+  pub start: usize,
+  /// The type byte, which this version may not know.
+  pub record_type: u8,
+  pub flags: u8,
+  pub txid: TxId,
+  /// The payload's bytes; the CRC follows them.
+  pub payload: std::ops::Range<usize>,
+  /// Offset after the record, its padding included.
+  pub end: usize,
+}
+
+impl WalFrame {
+  /// The record of type `record_type` (its type byte's), its payload copied
+  /// out of `buffer`, the one it was checked in.
+  pub(crate) fn parse(&self, record_type: WalRecordType, buffer: &[u8]) -> ParsedWalRecord {
+    ParsedWalRecord {
+      record_type,
+      flags: self.flags,
+      txid: self.txid,
+      payload: buffer[self.payload.clone()].to_vec(),
+      record_end: self.end,
+    }
+  }
+}
+
+/// The frame of the record at `offset` if its length fields and CRC (salted
+/// with `salt`) check.
+pub(crate) fn check_wal_frame(buffer: &[u8], offset: usize, salt: u32) -> Option<WalFrame> {
   if !has_bytes(buffer.len(), offset, 4) {
     return None;
   }
@@ -197,7 +220,7 @@ fn parse_wal_record_frame(
   let flags_offset = offset.checked_add(5)?;
   let txid_offset = offset.checked_add(8)?;
   let payload_len_offset = offset.checked_add(16)?;
-  let record_type_byte = buffer[record_type_offset];
+  let record_type = buffer[record_type_offset];
   let flags = buffer[flags_offset];
   let txid = read_u64(buffer, txid_offset);
   let payload_len = read_u32(buffer, payload_len_offset) as usize;
@@ -210,7 +233,7 @@ fn parse_wal_record_frame(
     return None;
   }
 
-  // Extract payload
+  // Locate payload
   let payload_start = offset.checked_add(WAL_RECORD_HEADER_SIZE)?;
   let payload_end = payload_start.checked_add(payload_len)?;
   if payload_end > buffer.len() {
@@ -227,16 +250,55 @@ fn parse_wal_record_frame(
     return None; // CRC mismatch
   }
 
-  Some((
-    record_type_byte,
-    ParsedWalRecord {
-      record_type: WalRecordType::Begin,
-      flags,
-      txid,
-      payload: buffer[payload_start..payload_end].to_vec(),
-      record_end: offset.checked_add(total_len)?,
-    },
-  ))
+  Some(WalFrame {
+    start: offset,
+    record_type,
+    flags,
+    txid,
+    payload: payload_start..payload_end,
+    end: offset.checked_add(total_len)?,
+  })
+}
+
+/// The frames, with their types, of the records `buffer` starts with, back
+/// to back, up to the first that is not a whole record of a known type
+/// salted with `salt`: the records a scan with [`parse_wal_record_with_salt`]
+/// reads.
+pub(crate) fn wal_frames(
+  buffer: &[u8],
+  salt: u32,
+) -> impl Iterator<Item = (WalRecordType, WalFrame)> + '_ {
+  let mut offset = 0;
+  std::iter::from_fn(move || {
+    let frame = check_wal_frame(buffer, offset, salt)?;
+    let record_type = WalRecordType::from_u8(frame.record_type)?;
+    offset = frame.end;
+    Some((record_type, frame))
+  })
+}
+
+/// Where the records [`wal_frames`] finds in `buffer` end.
+pub(crate) fn wal_records_end(buffer: &[u8], salt: u32) -> usize {
+  wal_frames(buffer, salt)
+    .last()
+    .map_or(0, |(_, frame)| frame.end)
+}
+
+/// Salt (or, applied again, unsalt) `record`, exactly one record as
+/// [`WalRecord::build`] writes it: XOR `salt` into its CRC. Returns `false`,
+/// changing nothing, if `record` is not one whole record.
+pub(crate) fn salt_wal_record(record: &mut [u8], salt: u32) -> bool {
+  let Some(rec_len) = record.get(..4).map(|bytes| read_u32(bytes, 0) as usize) else {
+    return false;
+  };
+  if rec_len < WAL_RECORD_HEADER_SIZE + 4 || checked_padded_len(rec_len) != Some(record.len()) {
+    return false;
+  }
+  if salt != 0 {
+    let crc = read_u32(record, rec_len - 4) ^ salt;
+    write_u32(record, rec_len - 4, crc);
+  }
+  true
 }
 
 /// Salt (or, applied again, unsalt) `records`, whole records back to back as

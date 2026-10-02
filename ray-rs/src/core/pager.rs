@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::util::fs::sync_parent_dir;
@@ -273,6 +274,9 @@ pub struct FilePager {
   /// Make [`Self::sync`] flush the drive's write cache too (`F_FULLFSYNC` on
   /// macOS); see [`Self::set_full_fsync`].
   full_fsync: bool,
+  /// The file's length changed since the last successful [`Self::sync`], so
+  /// [`Self::sync_data`] must sync its metadata too.
+  length_unsynced: AtomicBool,
 }
 
 impl FilePager {
@@ -300,6 +304,7 @@ impl FilePager {
       deferred_free_pages: HashSet::new(),
       mmap: None,
       full_fsync: false,
+      length_unsynced: AtomicBool::new(false),
     })
   }
 
@@ -316,6 +321,7 @@ impl FilePager {
       deferred_free_pages: HashSet::new(),
       mmap: None,
       full_fsync: false,
+      length_unsynced: AtomicBool::new(false),
     }
   }
 
@@ -349,6 +355,18 @@ impl FilePager {
     Ok(buffer)
   }
 
+  /// Read `length` bytes from file `offset` with one positioned read (more
+  /// only if the OS returns fewer bytes than asked). Bytes past the end of
+  /// the file read as zeros.
+  pub fn read_range(&self, offset: u64, length: usize) -> Result<Vec<u8>> {
+    let mut buffer = vec![0u8; length];
+    if length > 0 && offset < self.file_size {
+      let available = (self.file_size - offset).min(length as u64) as usize;
+      read_full_at(&self.file, &mut buffer[..available], offset)?;
+    }
+    Ok(buffer)
+  }
+
   /// Write a single page by page number
   pub fn write_page(&mut self, page_num: u32, data: &[u8]) -> Result<()> {
     if self.read_only {
@@ -361,19 +379,34 @@ impl FilePager {
         data.len()
       )));
     }
+    self.write_range(page_num as u64 * self.page_size as u64, data)
+  }
 
-    self.ensure_no_live_mmap()?;
-
-    let offset = page_num as u64 * self.page_size as u64;
-
-    // Extend file if necessary
-    let required_size = offset + self.page_size as u64;
-    if required_size > self.file_size {
-      self.file.set_len(required_size)?;
-      self.file_size = required_size;
+  /// Write `data` at file `offset` with one positioned write (more only if
+  /// the OS writes fewer bytes than given), extending the file if it ends
+  /// before the data does.
+  pub fn write_range(&mut self, offset: u64, data: &[u8]) -> Result<()> {
+    if self.read_only {
+      return Err(KiteError::ReadOnly);
     }
-
+    self.ensure_no_live_mmap()?;
+    if data.is_empty() {
+      return Ok(());
+    }
+    let required_size = offset + data.len() as u64;
+    if required_size > self.file_size {
+      self.set_file_len(required_size)?;
+    }
     write_all_at(&self.file, data, offset)?;
+    Ok(())
+  }
+
+  /// Set the file's length; the next [`Self::sync_data`] syncs it.
+  fn set_file_len(&mut self, length: u64) -> Result<()> {
+    // Noted first: a failed set_len may still have changed the length.
+    self.length_unsynced.store(true, Ordering::Relaxed);
+    self.file.set_len(length)?;
+    self.file_size = length;
     Ok(())
   }
 
@@ -451,8 +484,7 @@ impl FilePager {
     // bytes at 1 GiB), so no range is ever moved past one.
     let start_page = self.file_size.div_ceil(self.page_size as u64) as u32;
     let new_size = (start_page as u64 + count as u64) * self.page_size as u64;
-    self.file.set_len(new_size)?;
-    self.file_size = new_size;
+    self.set_file_len(new_size)?;
 
     Ok(start_page)
   }
@@ -557,8 +589,7 @@ impl FilePager {
     }
     self.ensure_no_live_mmap()?;
     let new_size = page_count as u64 * self.page_size as u64;
-    self.file.set_len(new_size)?;
-    self.file_size = new_size;
+    self.set_file_len(new_size)?;
     self.free_pages.retain(|page| *page < page_count);
     self.deferred_free_pages.retain(|page| *page < page_count);
     Ok(())
@@ -577,7 +608,8 @@ impl FilePager {
     self.full_fsync = full_fsync;
   }
 
-  /// Sync file to disk
+  /// Sync the file to disk: its data and all its metadata, its length
+  /// included.
   pub fn sync(&self) -> Result<()> {
     if self.read_only {
       return Ok(());
@@ -586,7 +618,49 @@ impl FilePager {
     io_hooks::before_sync()?;
     let synced = self.sync_file();
     io_hooks::synced(synced.is_ok());
+    // No set_len ran since the sync started: that takes `&mut self`.
+    if synced.is_ok() {
+      self.length_unsynced.store(false, Ordering::Relaxed);
+    }
     synced
+  }
+
+  /// Sync the file's data to disk, and the metadata needed to read it back
+  /// (fdatasync where the OS has it), as durable as [`Self::sync`] for
+  /// every byte written; only metadata such as the modification time may
+  /// stay behind. If the file's length changed since the last successful
+  /// [`Self::sync`] this is that full sync, so a crash never cuts the file
+  /// short of bytes this made durable.
+  ///
+  /// macOS has no fdatasync: this is fsync(2) there, or `F_FULLFSYNC` with
+  /// [`Self::set_full_fsync`], exactly as [`Self::sync`].
+  pub fn sync_data(&self) -> Result<()> {
+    if self.read_only {
+      return Ok(());
+    }
+    if self.length_unsynced.load(Ordering::Relaxed) {
+      return self.sync();
+    }
+    io_hooks::sync_kind(io_hooks::SyncKind::Data);
+    io_hooks::before_sync()?;
+    let synced = self.sync_file_data();
+    io_hooks::synced(synced.is_ok());
+    synced
+  }
+
+  fn sync_file_data(&self) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+      self.sync_file()
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+      #[cfg(test)]
+      SYNC_PRIMITIVE_LOG.with(|log| log.borrow_mut().push("sync_data"));
+      self.file.sync_data()?;
+      Ok(())
+    }
   }
 
   fn sync_file(&self) -> Result<()> {
@@ -650,8 +724,7 @@ impl FilePager {
       // Extend file if needed
       let required_size = dst_offset + page_size;
       if required_size > self.file_size {
-        self.file.set_len(required_size)?;
-        self.file_size = required_size;
+        self.set_file_len(required_size)?;
       }
       write_all_at(&self.file, &buffer, dst_offset)?;
     }
@@ -845,6 +918,7 @@ pub(crate) fn create_pager_with_locking<P: AsRef<Path>>(
       deferred_free_pages: HashSet::new(),
       mmap: None,
       full_fsync: false,
+      length_unsynced: AtomicBool::new(false),
     }));
   }
   Err(KiteError::LockFailed(format!(

@@ -128,6 +128,75 @@ fn f1_commit_syncs_only_data() {
   );
 }
 
+/// A data sync is enough only while the file's length is as the last full
+/// sync left it; after any length change (WAL or snapshot allocation, a
+/// write past the end, truncation) the next one is a full sync.
+#[test]
+fn f1_data_sync_is_full_after_the_file_length_changes() {
+  let dir = tempdir().expect("tempdir");
+  let mut pager = create_pager(dir.path().join("lengths.kitedb"), PAGE_SIZE).expect("pager");
+  let page = vec![7u8; PAGE_SIZE];
+  let sync_kinds =
+    |pager: &FilePager| io_hooks::sync_kinds_during(|| pager.sync_data().expect("sync")).1;
+  use SyncKind::{Data, Full};
+
+  pager.allocate_pages(4).expect("allocate");
+  assert_eq!(sync_kinds(&pager), [Full], "after allocating pages");
+  assert_eq!(sync_kinds(&pager), [Data], "with nothing changed since");
+  pager.write_page(2, &page).expect("write");
+  assert_eq!(sync_kinds(&pager), [Data], "after a write inside the file");
+  pager.write_page(9, &page).expect("write");
+  assert_eq!(sync_kinds(&pager), [Full], "after a write past its end");
+  pager.write_range(100, &[1, 2, 3]).expect("write");
+  assert_eq!(sync_kinds(&pager), [Data], "after a range write inside it");
+  pager.truncate_pages(3).expect("truncate");
+  assert_eq!(sync_kinds(&pager), [Full], "after truncating it");
+  pager.allocate_pages(1).expect("allocate");
+  pager.sync().expect("full sync");
+  assert_eq!(sync_kinds(&pager), [Data], "after a full sync");
+}
+
+/// One positioned read for a range; bytes past the end of the file read as
+/// zeros.
+#[test]
+fn f1_read_range_reads_once_and_zero_fills_past_the_end() {
+  let dir = tempdir().expect("tempdir");
+  let mut pager = create_pager(dir.path().join("range.kitedb"), PAGE_SIZE).expect("pager");
+  let data: Vec<u8> = (0..3 * PAGE_SIZE).map(|i| (i % 251) as u8 + 1).collect();
+  pager.write_range(0, &data).expect("write");
+  let (read, reads) = io_hooks::reads_during(|| pager.read_range(100, 3 * PAGE_SIZE));
+  let read = read.expect("read");
+  assert_eq!(reads, 1);
+  assert_eq!(&read[..3 * PAGE_SIZE - 100], &data[100..]);
+  assert!(read[3 * PAGE_SIZE - 100..].iter().all(|byte| *byte == 0));
+}
+
+/// Scans see records still buffered as well as flushed ones.
+#[test]
+fn f1_scan_reads_flushed_and_buffered_records() {
+  let dir = tempdir().expect("tempdir");
+  let (mut pager, mut wal) = wal_fixture(&dir, 40, 32);
+  for txid in 1..=6 {
+    wal
+      .write_record(&big_record(txid), &mut pager)
+      .expect("write");
+  }
+  wal.flush(&mut pager).expect("flush");
+  for txid in 7..=9 {
+    wal
+      .write_record(&big_record(txid), &mut pager)
+      .expect("write");
+  }
+  let txids: Vec<u64> = wal
+    .scan_region(0, &mut pager)
+    .expect("scan")
+    .iter()
+    .map(|record| record.txid)
+    .collect();
+  assert_eq!(txids, (1..=9).collect::<Vec<u64>>());
+  assert!(wal.has_pending_writes());
+}
+
 // ============================================================================
 // f2: record encoding and the per-transaction copy
 // ============================================================================
@@ -285,4 +354,48 @@ fn f5_post_cut_move_back_costs_one_read_and_one_write() {
     syscalls <= 2,
     "moving {moved} bytes of post-cut records back took {syscalls} system calls"
   );
+}
+
+/// The install reuses the post-cut records its replay read and checked
+/// before taking the commit lock: only records an open transaction appended
+/// since are read under it.
+#[test]
+fn f5_move_back_reads_only_records_appended_since_the_replay() {
+  let dir = tempdir().expect("tempdir");
+  let (mut pager, mut wal) = wal_fixture(&dir, 72, 64);
+  for txid in 1..=3 {
+    wal
+      .write_record(&big_record(txid), &mut pager)
+      .expect("write");
+  }
+  wal.switch_to_secondary();
+  for txid in 10..=29 {
+    wal
+      .write_record(&big_record(txid), &mut pager)
+      .expect("write");
+  }
+  wal.flush(&mut pager).expect("flush");
+  let (records, read, _) = wal
+    .scan_region_bytes_from(1, 0, &mut pager)
+    .expect("replay scan");
+  assert_eq!(records.len(), 20);
+  for txid in 30..=33 {
+    wal
+      .write_record(&big_record(txid), &mut pager)
+      .expect("write");
+  }
+  wal.flush(&mut pager).expect("flush");
+  wal.retire_primary_region();
+
+  let (compacted, reads) =
+    io_hooks::reads_during(|| wal.compact_secondary_into_primary_reusing(read, &mut pager));
+  compacted.expect("compact");
+  let txids: Vec<u64> = wal
+    .scan_region(0, &mut pager)
+    .expect("scan")
+    .iter()
+    .map(|record| record.txid)
+    .collect();
+  assert_eq!(txids, (10..=33).collect::<Vec<u64>>());
+  assert_eq!(reads, 1, "only the 4 records appended since need reading");
 }

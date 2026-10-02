@@ -159,6 +159,9 @@ pub struct SingleFileTxState {
   pub pending: DeltaState,
   pub(crate) schema: SchemaStaging,
   pub bulk_load: bool,
+  /// The transaction's WAL records, unsalted, kept only for those that read
+  /// them at commit: a bulk load (written then) and a primary's replication
+  /// sidecar.
   pub pending_wal: Vec<u8>,
   /// A replica's replication apply; the only transactions in which a
   /// replica accepts data writes.
@@ -431,7 +434,9 @@ impl SingleFileDB {
 
     write_header_slot(pager, header, next_slot)?;
     if sync {
-      pager.sync()?;
+      // A header slot lies inside the file, so a data sync makes it durable
+      // (a full sync if the file's length changed since the last one).
+      pager.sync_data()?;
     }
     self.header_slot.store(next_slot, Ordering::Release);
     Ok(())

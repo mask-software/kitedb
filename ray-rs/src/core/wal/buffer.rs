@@ -18,10 +18,11 @@
 //! Records are built unsalted ([`WalRecord::build`], as replication frames
 //! carry them) and salted as they are written here.
 //!
-//! Optimization: Uses page-level write batching to reduce I/O amplification.
-//! Instead of writing each small record individually (causing read-modify-write
-//! for each ~100 byte record on a 4KB page), we buffer writes in memory and
-//! flush entire pages at once.
+//! I/O: records are buffered in memory as contiguous byte runs and flushed
+//! with one positioned write per run, writing exactly the bytes appended (no
+//! page is read back first, and bytes already on disk are never rewritten).
+//! Scans read a region's live bytes with one positioned read and parse them
+//! in memory.
 
 use std::collections::{HashMap, HashSet};
 
@@ -32,8 +33,8 @@ use crate::types::*;
 use crate::util::binary::*;
 
 use super::record::{
-  apply_wal_salt, parse_wal_record_with_salt, read_wal_record_with_salt, ParsedWalRecord,
-  WalRecord, WalRecordAt,
+  apply_wal_salt, parse_wal_record_with_salt, read_wal_record_with_salt, salt_wal_record,
+  wal_frames, wal_records_end, ParsedWalRecord, WalFrame, WalRecord, WalRecordAt,
 };
 
 /// WAL region split ratio: primary gets 75%, secondary gets 25%
@@ -66,11 +67,10 @@ pub struct WalBuffer {
   head: u64,
   /// Current tail position (oldest valid record, relative to base)
   tail: u64,
-  /// Page size for batching
+  /// Page size (for [`WalBufferStats::pending_pages`])
   page_size: usize,
-  /// Pending page writes (page_offset -> page_data)
-  /// page_offset is absolute file offset
-  pending_writes: HashMap<u64, Vec<u8>>,
+  /// Writes not yet flushed to the pager
+  pending: PendingWrites,
 
   // Dual-region support for background checkpointing
   /// Size of primary region (75%)
@@ -116,7 +116,7 @@ impl WalBuffer {
       head: 0,
       tail: 0,
       page_size,
-      pending_writes: HashMap::new(),
+      pending: PendingWrites::default(),
       primary_region_size,
       secondary_region_start,
       secondary_region_size,
@@ -221,7 +221,7 @@ impl WalBuffer {
       head: header.wal_head,
       tail: header.wal_tail,
       page_size: header.page_size as usize,
-      pending_writes: HashMap::new(),
+      pending: PendingWrites::default(),
       primary_region_size,
       secondary_region_start,
       secondary_region_size,
@@ -376,7 +376,8 @@ impl WalBuffer {
       return Ok(carried);
     }
 
-    let records = self.scan_region(0, pager)?;
+    let (_, bytes) = self.region_bytes(0, 0, pager)?;
+    let records: Vec<(WalRecordType, WalFrame)> = wal_frames(&bytes, self.primary_salt).collect();
     let unseen = transactions_without_boundaries(&records, open);
     if !unseen.is_empty() {
       return Err(KiteError::InvalidWal(format!(
@@ -384,33 +385,34 @@ impl WalBuffer {
       )));
     }
     let mut last_begin: HashMap<TxId, usize> = HashMap::new();
-    for (index, record) in records.iter().enumerate() {
-      if !open.contains(&record.txid) {
+    for (index, (record_type, frame)) in records.iter().enumerate() {
+      if !open.contains(&frame.txid) {
         continue;
       }
-      match record.record_type {
+      match record_type {
         WalRecordType::Begin => {
-          last_begin.insert(record.txid, index);
+          last_begin.insert(frame.txid, index);
         }
         WalRecordType::Commit | WalRecordType::Rollback => {
-          last_begin.remove(&record.txid);
+          last_begin.remove(&frame.txid);
         }
         _ => {}
       }
     }
-    for (index, record) in records.into_iter().enumerate() {
+    for (index, (_, frame)) in records.iter().enumerate() {
       if last_begin
-        .get(&record.txid)
+        .get(&frame.txid)
         .is_some_and(|begin| index >= *begin)
       {
-        let record = WalRecord::new(record.record_type, record.txid, record.payload);
-        carried.extend_from_slice(&record.build());
+        carried.extend_from_slice(&bytes[frame.start..frame.end]);
       }
     }
 
     if carried.len() as u64 > self.secondary_region_size {
       return Err(KiteError::WalBufferFull);
     }
+    // The copies are returned unsalted, as built.
+    xor_salt(&mut carried, self.primary_salt)?;
     Ok(carried)
   }
 
@@ -432,7 +434,7 @@ impl WalBuffer {
     self.flush(pager)?;
     let prior = self.region_state();
     if let Err(error) = self.write_record_bytes_batch(records, pager) {
-      self.pending_writes.clear();
+      self.pending.clear();
       self.restore_region_state(prior);
       return Err(error);
     }
@@ -479,16 +481,31 @@ impl WalBuffer {
   /// On error the region state is left unchanged, so it still matches the
   /// durable header that names the secondary records.
   pub fn compact_secondary_into_primary(&mut self, pager: &mut FilePager) -> Result<()> {
-    // Flush earlier writes first so an error below drops only the pages this
+    self.compact_secondary_into_primary_reusing(Vec::new(), pager)
+  }
+
+  /// [`Self::compact_secondary_into_primary`], reusing `read`: the secondary
+  /// region's first records exactly as they lie there now, as
+  /// [`Self::scan_region_bytes_from`] returned them during the cut whose
+  /// records these are (the region only grows while a cut lasts, and keeps
+  /// its records when the install retires the primary region). Only the
+  /// records after them are read and checked here, so a caller holding a
+  /// lock does that work before taking it.
+  pub fn compact_secondary_into_primary_reusing(
+    &mut self,
+    read: Vec<u8>,
+    pager: &mut FilePager,
+  ) -> Result<()> {
+    // Flush earlier writes first so an error below drops only the bytes this
     // rewrite buffered.
     self.flush(pager)?;
     let retained = self.region_state();
     let result = self
-      .merge_secondary_into_primary(pager)
+      .merge_secondary_into_primary(read, pager)
       .and_then(|()| self.flush(pager))
-      .and_then(|()| pager.sync());
+      .and_then(|()| pager.sync_data());
     if result.is_err() {
-      self.pending_writes.clear();
+      self.pending.clear();
       self.restore_region_state(retained);
     }
     result
@@ -554,28 +571,42 @@ impl WalBuffer {
 
   /// Salt `records`, whole unsalted records, for `region`.
   fn salt_for(&self, region: u8, records: &mut [u8]) -> Result<()> {
-    if apply_wal_salt(records, self.region_salt(region)) {
-      Ok(())
-    } else {
-      Err(KiteError::Internal(
-        "WAL record bytes are not whole records".to_string(),
-      ))
+    xor_salt(records, self.region_salt(region))
+  }
+
+  /// The secondary region's records that parse, as they lie there (salted
+  /// with its salt): `read`, its first records as they lie there now (see
+  /// [`Self::compact_secondary_into_primary_reusing`]), then those after
+  /// them, read with one positioned read.
+  fn secondary_record_bytes(&self, mut read: Vec<u8>, pager: &mut FilePager) -> Result<Vec<u8>> {
+    let from = self.secondary_region_start + read.len() as u64;
+    if from > self.secondary_head {
+      return Err(KiteError::Internal(format!(
+        "{} bytes of secondary WAL records read, but the region holds {}",
+        read.len(),
+        self.secondary_head - self.secondary_region_start
+      )));
     }
+    let (start, bytes) = self.region_bytes(1, from, pager)?;
+    let end = wal_records_end(&bytes, self.secondary_salt);
+    warn_dropped_tail("secondary", start + end as u64, self.secondary_head);
+    read.extend_from_slice(&bytes[..end]);
+    Ok(read)
   }
 
   /// Merge secondary records into a fresh primary region (buffered, not
   /// flushed). Only [`Self::compact_secondary_into_primary`] may call it: it
   /// adds the flush, sync, and error rollback that make the rewrite safe to
   /// install.
-  fn merge_secondary_into_primary(&mut self, pager: &mut FilePager) -> Result<()> {
-    let has_secondary_records = self.secondary_head > self.secondary_region_start;
-    let secondary_records = if has_secondary_records {
-      let (records, end) = self.scan_region_to_end(1, pager)?;
-      warn_dropped_tail("secondary", end, self.secondary_head);
-      records
-    } else {
-      Vec::new()
-    };
+  ///
+  /// The records are copied as they are, re-salted for the primary region
+  /// (each CRC XORed with both salts), not decoded and rebuilt.
+  fn merge_secondary_into_primary(&mut self, read: Vec<u8>, pager: &mut FilePager) -> Result<()> {
+    let mut records = self.secondary_record_bytes(read, pager)?;
+    if records.len() as u64 > self.primary_region_size {
+      return Err(KiteError::WalBufferFull);
+    }
+    let secondary_salt = self.secondary_salt;
 
     self.primary_head = 0;
     self.secondary_head = self.secondary_region_start;
@@ -585,13 +616,10 @@ impl WalBuffer {
     // The primary region is rewritten from its start.
     self.primary_salt = self.fresh_salt();
 
-    for record in secondary_records {
-      let mut record_bytes =
-        WalRecord::new(record.record_type, record.txid, record.payload).build();
-      self.salt_for(0, &mut record_bytes)?;
-      self.write_record_bytes_to_primary(&record_bytes, pager)?;
-    }
-
+    xor_salt(&mut records, secondary_salt ^ self.primary_salt)?;
+    self.primary_head = records.len() as u64;
+    self.head = self.primary_head;
+    self.pending.write_vec(self.file_offset(0), records);
     Ok(())
   }
 
@@ -613,37 +641,30 @@ impl WalBuffer {
   pub fn merge_cut_into_primary(&mut self, pager: &mut FilePager) -> Result<bool> {
     // Flush earlier writes first so an error below drops only the merge's.
     self.flush(pager)?;
-    let (_, primary_end) = self.scan_region_to_end(0, pager)?;
-    if primary_end != self.primary_head {
+    if self.region_end(0, pager)? != self.primary_head {
       return Ok(false);
     }
-    let (secondary_records, secondary_end) = self.scan_region_to_end(1, pager)?;
-    warn_dropped_tail("secondary", secondary_end, self.secondary_head);
-    let mut merged = Vec::new();
-    for record in secondary_records {
-      merged.extend_from_slice(
-        &WalRecord::new(record.record_type, record.txid, record.payload).build(),
-      );
-    }
+    let mut merged = self.secondary_record_bytes(Vec::new(), pager)?;
     if self.primary_head + merged.len() as u64 > self.primary_region_size {
       return Ok(false);
     }
     // They join the primary region's records, so they take its salt.
-    self.salt_for(0, &mut merged)?;
+    xor_salt(&mut merged, self.secondary_salt ^ self.primary_salt)?;
 
     let cut = self.region_state();
+    let merged_len = merged.len() as u64;
     if !merged.is_empty() {
-      let written = self
-        .buffer_write(self.file_offset(self.primary_head), &merged, pager)
-        .and_then(|()| self.flush(pager))
-        .and_then(|()| pager.sync());
+      self
+        .pending
+        .write_vec(self.file_offset(self.primary_head), merged);
+      let written = self.flush(pager).and_then(|()| pager.sync_data());
       if let Err(error) = written {
-        self.pending_writes.clear();
+        self.pending.clear();
         self.restore_region_state(cut);
         return Err(error);
       }
     }
-    self.primary_head += merged.len() as u64;
+    self.primary_head += merged_len;
     self.secondary_head = self.secondary_region_start;
     self.active_region = 0;
     self.head = self.primary_head;
@@ -654,8 +675,8 @@ impl WalBuffer {
   /// [`Self::merge_cut_into_primary`] would leave in the primary region.
   #[cfg(test)]
   pub fn merged_cut_size(&mut self, pager: &mut FilePager) -> Result<u64> {
-    let (_, primary_end) = self.scan_region_to_end(0, pager)?;
-    let (_, secondary_end) = self.scan_region_to_end(1, pager)?;
+    let primary_end = self.region_end(0, pager)?;
+    let secondary_end = self.region_end(1, pager)?;
     Ok(primary_end + (secondary_end - self.secondary_region_start))
   }
 
@@ -672,13 +693,13 @@ impl WalBuffer {
   pub fn trim_to_valid_records(&mut self, pager: &mut FilePager) -> Result<bool> {
     let mut trimmed = false;
     if !self.is_primary_retired() {
-      let (_, primary_end) = self.scan_region_to_end(0, pager)?;
+      let primary_end = self.region_end(0, pager)?;
       warn_dropped_tail("primary", primary_end, self.primary_head);
       trimmed |= primary_end != self.primary_head;
       self.primary_head = primary_end;
     }
     if self.active_region == 1 {
-      let (_, secondary_end) = self.scan_region_to_end(1, pager)?;
+      let secondary_end = self.region_end(1, pager)?;
       warn_dropped_tail("secondary", secondary_end, self.secondary_head);
       trimmed |= secondary_end != self.secondary_head;
       self.secondary_head = secondary_end;
@@ -699,7 +720,7 @@ impl WalBuffer {
   /// at such a record either way.
   pub fn check_record_types(&mut self, pager: &mut FilePager) -> Result<()> {
     for (region, head) in [(0, self.primary_head), (1, self.secondary_head)] {
-      let (_, end) = self.scan_region_to_end(region, pager)?;
+      let end = self.region_end(region, pager)?;
       if end >= head {
         continue;
       }
@@ -727,14 +748,15 @@ impl WalBuffer {
   ) -> Result<bool> {
     let mut begun = HashSet::new();
     let mut rolled_back = HashSet::new();
-    for record in self.scan_region(1, pager)? {
-      match record.record_type {
+    let (_, bytes) = self.region_bytes(1, 0, pager)?;
+    for (record_type, frame) in wal_frames(&bytes, self.secondary_salt) {
+      match record_type {
         WalRecordType::Begin => {
-          begun.insert(record.txid);
+          begun.insert(frame.txid);
         }
-        WalRecordType::Commit if !begun.contains(&record.txid) => return Ok(false),
+        WalRecordType::Commit if !begun.contains(&frame.txid) => return Ok(false),
         WalRecordType::Rollback => {
-          rolled_back.insert(record.txid);
+          rolled_back.insert(frame.txid);
         }
         _ => {}
       }
@@ -773,6 +795,41 @@ impl WalBuffer {
     from: u64,
     pager: &mut FilePager,
   ) -> Result<(Vec<ParsedWalRecord>, u64)> {
+    self
+      .scan_region_bytes_from(region, from, pager)
+      .map(|(records, _, end)| (records, end))
+  }
+
+  /// [`Self::scan_region_from`], also returning the bytes of the records
+  /// read, as they lie in the region (salted with its salt).
+  pub fn scan_region_bytes_from(
+    &mut self,
+    region: u8,
+    from: u64,
+    pager: &mut FilePager,
+  ) -> Result<(Vec<ParsedWalRecord>, Vec<u8>, u64)> {
+    let (start, mut bytes) = self.region_bytes(region, from, pager)?;
+    let mut records = Vec::new();
+    let mut end = 0;
+    for (record_type, frame) in wal_frames(&bytes, self.region_salt(region)) {
+      records.push(frame.parse(record_type, &bytes));
+      end = frame.end;
+    }
+    bytes.truncate(end);
+    Ok((records, bytes, start + end as u64))
+  }
+
+  /// Where the records that parse in `region` end (relative to the WAL
+  /// start); none are copied out.
+  fn region_end(&self, region: u8, pager: &mut FilePager) -> Result<u64> {
+    let (start, bytes) = self.region_bytes(region, 0, pager)?;
+    Ok(start + wal_records_end(&bytes, self.region_salt(region)) as u64)
+  }
+
+  /// The bytes of `region` up to its head, from offset `from` (relative to
+  /// the WAL start; the region's start if before it), read with one
+  /// positioned read; and where they start.
+  fn region_bytes(&self, region: u8, from: u64, pager: &mut FilePager) -> Result<(u64, Vec<u8>)> {
     let (start, end) = if region == 0 {
       (self.tail, self.primary_head)
     } else {
@@ -780,51 +837,10 @@ impl WalBuffer {
     };
     let start = start.max(from);
     if start >= end {
-      return Ok((Vec::new(), end));
+      return Ok((end, Vec::new()));
     }
-
-    // Read the region once rather than each record's pages separately.
     let bytes = self.read_at_offset(self.file_offset(start), (end - start) as usize, pager)?;
-    let salt = self.region_salt(region);
-    let mut records = Vec::new();
-    let mut offset = 0;
-    while offset < bytes.len() {
-      match parse_wal_record_with_salt(&bytes, offset, salt) {
-        Some(record) => {
-          offset = record.record_end;
-          records.push(record);
-        }
-        None => break, // Invalid record
-      }
-    }
-    Ok((records, start + offset as u64))
-  }
-
-  /// Write record bytes specifically to primary region (used during merge)
-  fn write_record_bytes_to_primary(
-    &mut self,
-    record_bytes: &[u8],
-    pager: &mut FilePager,
-  ) -> Result<u64> {
-    let record_size = record_bytes.len();
-    let aligned_size = align_up(record_size, WAL_RECORD_ALIGNMENT);
-
-    // Check if fits in primary region
-    if self.primary_head + aligned_size as u64 > self.primary_region_size {
-      return Err(KiteError::WalBufferFull);
-    }
-
-    // Calculate file offset
-    let file_offset = self.file_offset(self.primary_head);
-
-    // Buffer the write
-    self.buffer_write(file_offset, record_bytes, pager)?;
-
-    // Update primary head
-    self.primary_head += aligned_size as u64;
-    self.head = self.primary_head;
-
-    Ok(self.primary_head)
+    Ok((start, bytes))
   }
 
   /// Calculate the file offset for a buffer-relative position
@@ -868,9 +884,25 @@ impl WalBuffer {
   ///
   /// Note: Records are buffered in memory. Call flush() to write to disk.
   pub fn write_record(&mut self, record: &WalRecord, pager: &mut FilePager) -> Result<u64> {
-    let mut record_bytes = record.build();
-    self.salt_for(self.active_region, &mut record_bytes)?;
-    self.write_record_bytes(&record_bytes, pager)
+    self.write_built_record(&mut record.build(), pager)
+  }
+
+  /// Write one record as [`WalRecord::build`] encoded it (unsalted), salted
+  /// for the active region, and return the new head. `record` is salted in
+  /// place and unsalted again before this returns, so a caller can keep the
+  /// bytes it built (a replication frame carries them unsalted) without
+  /// encoding the record twice. Buffered, like [`Self::write_record`]; the
+  /// pager is not touched until [`Self::flush`].
+  pub fn write_built_record(&mut self, record: &mut [u8], _pager: &mut FilePager) -> Result<u64> {
+    let salt = self.region_salt(self.active_region);
+    if !salt_wal_record(record, salt) {
+      return Err(KiteError::Internal(
+        "WAL record bytes are not one whole record".to_string(),
+      ));
+    }
+    let written = self.write_record_bytes(record);
+    salt_wal_record(record, salt);
+    written
   }
 
   /// Write prebuilt record bytes in a single batch
@@ -879,7 +911,7 @@ impl WalBuffer {
   pub fn write_record_bytes_batch(
     &mut self,
     record_bytes: &[u8],
-    pager: &mut FilePager,
+    _pager: &mut FilePager,
   ) -> Result<u64> {
     if record_bytes.is_empty() {
       return Ok(self.head);
@@ -894,29 +926,29 @@ impl WalBuffer {
     if !self.can_fit(record_bytes.len()) {
       return Err(KiteError::WalBufferFull);
     }
+    let length = record_bytes.len() as u64;
     let mut salted = record_bytes.to_vec();
     self.salt_for(self.active_region, &mut salted)?;
-    let record_bytes = salted.as_slice();
 
     if self.active_region == 0 {
-      if self.primary_head + record_bytes.len() as u64 > self.primary_region_size {
+      if self.primary_head + length > self.primary_region_size {
         return Err(KiteError::WalBufferFull);
       }
 
-      let file_offset = self.file_offset(self.primary_head);
-      self.buffer_write(file_offset, record_bytes, pager)?;
-      self.primary_head += record_bytes.len() as u64;
+      self
+        .pending
+        .write_vec(self.file_offset(self.primary_head), salted);
+      self.primary_head += length;
       self.head = self.primary_head;
     } else {
-      if self.secondary_head + record_bytes.len() as u64
-        > self.secondary_region_start + self.secondary_region_size
-      {
+      if self.secondary_head + length > self.secondary_region_start + self.secondary_region_size {
         return Err(KiteError::WalBufferFull);
       }
 
-      let file_offset = self.file_offset(self.secondary_head);
-      self.buffer_write(file_offset, record_bytes, pager)?;
-      self.secondary_head += record_bytes.len() as u64;
+      self
+        .pending
+        .write_vec(self.file_offset(self.secondary_head), salted);
+      self.secondary_head += length;
       self.head = self.secondary_head;
     }
 
@@ -924,7 +956,7 @@ impl WalBuffer {
   }
 
   /// Write raw record bytes to the active region
-  fn write_record_bytes(&mut self, record_bytes: &[u8], pager: &mut FilePager) -> Result<u64> {
+  fn write_record_bytes(&mut self, record_bytes: &[u8]) -> Result<u64> {
     let record_size = record_bytes.len();
     let aligned_size = align_up(record_size, WAL_RECORD_ALIGNMENT);
 
@@ -942,7 +974,7 @@ impl WalBuffer {
       let file_offset = self.file_offset(self.primary_head);
 
       // Buffer the write
-      self.buffer_write(file_offset, record_bytes, pager)?;
+      self.buffer_write(file_offset, record_bytes);
 
       // Update head
       self.primary_head += aligned_size as u64;
@@ -952,7 +984,7 @@ impl WalBuffer {
       let file_offset = self.file_offset(self.secondary_head);
 
       // Buffer the write
-      self.buffer_write(file_offset, record_bytes, pager)?;
+      self.buffer_write(file_offset, record_bytes);
 
       // Update head
       self.secondary_head += aligned_size as u64;
@@ -962,122 +994,43 @@ impl WalBuffer {
     Ok(self.head)
   }
 
-  /// Buffer a write for later flushing (page-level batching)
-  /// This reduces I/O amplification by accumulating writes to the same page
-  fn buffer_write(&mut self, offset: u64, data: &[u8], pager: &mut FilePager) -> Result<()> {
-    let page_size = self.page_size as u64;
-    let start_page = offset / page_size;
-    let end_page = (offset + data.len() as u64 - 1) / page_size;
-
-    let mut data_offset = 0usize;
-
-    for page_idx in start_page..=end_page {
-      let page_file_offset = page_idx * page_size;
-
-      // Get or create the page buffer
-      let page_buffer = match self.pending_writes.entry(page_file_offset) {
-        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-        std::collections::hash_map::Entry::Vacant(entry) => {
-          // First write to this page - load existing content
-          let page_num = (page_file_offset / page_size) as u32;
-          let existing = pager.read_page(page_num)?;
-          entry.insert(existing)
-        }
-      };
-
-      let page_start = page_file_offset;
-      let page_end = page_start + page_size;
-
-      let write_start = offset.max(page_start);
-      let write_end = (offset + data.len() as u64).min(page_end);
-      let write_len = (write_end - write_start) as usize;
-
-      let page_write_offset = (write_start - page_start) as usize;
-
-      page_buffer[page_write_offset..page_write_offset + write_len]
-        .copy_from_slice(&data[data_offset..data_offset + write_len]);
-
-      data_offset += write_len;
-    }
-
-    Ok(())
+  /// Buffer `data` for file `offset` until the next [`Self::flush`].
+  fn buffer_write(&mut self, offset: u64, data: &[u8]) {
+    self.pending.write(offset, data);
   }
 
-  /// Read bytes from a specific file offset
-  /// If there are pending writes, reads from the buffered data
+  /// Read `length` bytes from file `offset`, buffered writes included: one
+  /// positioned read, none if buffered writes cover the range.
   fn read_at_offset(&self, offset: u64, length: usize, pager: &mut FilePager) -> Result<Vec<u8>> {
-    let page_size = self.page_size as u64;
-    let start_page = offset / page_size;
-    let end_page = (offset + length as u64 - 1) / page_size;
-
-    // For reads within a single page
-    if start_page == end_page {
-      let page_file_offset = start_page * page_size;
-      let page_offset = (offset - page_file_offset) as usize;
-
-      // Check for pending writes first
-      if let Some(pending_page) = self.pending_writes.get(&page_file_offset) {
-        return Ok(pending_page[page_offset..page_offset + length].to_vec());
-      }
-
-      let page_num = start_page as u32;
-      let page = pager.read_page(page_num)?;
-      return Ok(page[page_offset..page_offset + length].to_vec());
-    }
-
-    // For reads spanning multiple pages
-    let mut result = vec![0u8; length];
-    let mut result_offset = 0;
-
-    for page_idx in start_page..=end_page {
-      let page_file_offset = page_idx * page_size;
-      let page_start = page_file_offset;
-      let page_end = page_start + page_size;
-
-      let read_start = offset.max(page_start);
-      let read_end = (offset + length as u64).min(page_end);
-      let read_len = (read_end - read_start) as usize;
-
-      let page_read_offset = (read_start - page_start) as usize;
-
-      // Check for pending writes first
-      let page_data = if let Some(pending) = self.pending_writes.get(&page_file_offset) {
-        pending.clone()
-      } else {
-        let page_num = page_idx as u32;
-        pager.read_page(page_num)?
-      };
-
-      result[result_offset..result_offset + read_len]
-        .copy_from_slice(&page_data[page_read_offset..page_read_offset + read_len]);
-
-      result_offset += read_len;
-    }
-
-    Ok(result)
+    let mut bytes = if self.pending.covers(offset, length) {
+      vec![0; length]
+    } else {
+      pager.read_range(offset, length)?
+    };
+    self.pending.overlay(offset, &mut bytes);
+    Ok(bytes)
   }
 
-  /// Flush all pending writes to disk
-  /// This writes all buffered pages in a single batch
+  /// Write every buffered byte run to the pager, in file order, one
+  /// positioned write per run. On error every run stays buffered.
   pub fn flush(&mut self, pager: &mut FilePager) -> Result<()> {
-    let page_size = self.page_size as u64;
-
-    for (&page_file_offset, data) in &self.pending_writes {
-      let page_num = (page_file_offset / page_size) as u32;
-      pager.write_page(page_num, data)?;
+    for run in &self.pending.runs {
+      pager.write_range(run.offset, &run.data)?;
     }
-
-    self.pending_writes.clear();
+    self.pending.clear();
     Ok(())
   }
 
   /// Flush and sync to disk. First the bytes of discarded records (see
   /// [`Self::discard_since`]) past their region's head are overwritten with
   /// zeros, so once this returns they are durably unreadable.
+  ///
+  /// The WAL lies inside the file, so a data sync ([`FilePager::sync_data`])
+  /// makes it durable.
   pub fn sync(&mut self, pager: &mut FilePager) -> Result<()> {
-    self.zero_discarded(pager)?;
+    self.zero_discarded();
     self.flush(pager)?;
-    pager.sync()?;
+    pager.sync_data()?;
     self.discarded.clear();
     Ok(())
   }
@@ -1116,7 +1069,7 @@ impl WalBuffer {
   /// Overwrite with zeros (buffered) the bytes of discarded records that lie
   /// past their region's head. Bytes before it hold newer records already.
   /// Records in a region salted afresh since are unreadable anyway.
-  fn zero_discarded(&mut self, pager: &mut FilePager) -> Result<()> {
+  fn zero_discarded(&mut self) {
     for discarded in self.discarded.clone() {
       let region = u8::from(discarded.start >= self.secondary_region_start);
       if self.region_salt(region) != discarded.salt {
@@ -1130,15 +1083,14 @@ impl WalBuffer {
       let from = discarded.start.max(head);
       if from < discarded.end {
         let zeros = vec![0; (discarded.end - from) as usize];
-        self.buffer_write(self.file_offset(from), &zeros, pager)?;
+        self.buffer_write(self.file_offset(from), &zeros);
       }
     }
-    Ok(())
   }
 
   /// Check if there are pending writes
   pub fn has_pending_writes(&self) -> bool {
-    !self.pending_writes.is_empty()
+    !self.pending.is_empty()
   }
 
   /// Reset the buffer (after checkpoint). The primary region gets a fresh
@@ -1146,7 +1098,7 @@ impl WalBuffer {
   pub fn reset(&mut self) {
     self.head = 0;
     self.tail = 0;
-    self.pending_writes.clear();
+    self.pending.clear();
     // Also reset dual-region state
     self.primary_head = 0;
     self.secondary_head = self.secondary_region_start;
@@ -1156,10 +1108,11 @@ impl WalBuffer {
 
   /// Clear pending writes without flushing
   pub fn discard_pending(&mut self) {
-    self.pending_writes.clear();
+    self.pending.clear();
   }
 
-  /// Scan all valid records from tail to head
+  /// Scan all valid records from tail to head, read with one positioned
+  /// read, each checked with the salt of the region it lies in.
   pub fn scan_records(&mut self, pager: &mut FilePager) -> Result<Vec<ParsedWalRecord>> {
     let mut records = Vec::new();
 
@@ -1173,36 +1126,20 @@ impl WalBuffer {
       ));
     }
 
-    let mut pos = self.tail;
-
-    while pos < self.head {
-      // Read the record header
-      let file_offset = self.file_offset(pos);
-      let header_bytes = self.read_at_offset(file_offset, 8, pager)?;
-
-      let rec_len = read_u32(&header_bytes, 0) as usize;
-
-      if rec_len == 0 {
-        break;
-      }
-
-      // Calculate total record size with alignment
-      let pad_len = padding_for(rec_len, WAL_RECORD_ALIGNMENT);
-      let total_len = rec_len + pad_len;
-      // A record never crosses the head; a length past it is garbage.
-      if pos + total_len as u64 > self.head {
-        break;
-      }
-
-      // Read full record
-      let record_bytes = self.read_at_offset(file_offset, total_len, pager)?;
-
-      // Parse the record
-      let salt = self.region_salt(u8::from(pos >= self.secondary_region_start));
-      match parse_wal_record_with_salt(&record_bytes, 0, salt) {
+    // A record never crosses the head: bytes past it end the scan.
+    let bytes = self.read_at_offset(
+      self.file_offset(self.tail),
+      (self.head - self.tail) as usize,
+      pager,
+    )?;
+    let mut offset = 0;
+    while offset < bytes.len() {
+      let at = self.tail + offset as u64;
+      let salt = self.region_salt(u8::from(at >= self.secondary_region_start));
+      match parse_wal_record_with_salt(&bytes, offset, salt) {
         Some(record) => {
+          offset = record.record_end;
           records.push(record);
-          pos += total_len as u64;
         }
         None => break, // Invalid record
       }
@@ -1219,7 +1156,7 @@ impl WalBuffer {
       free: self.free(),
       head: self.head,
       tail: self.tail,
-      pending_pages: self.pending_writes.len(),
+      pending_pages: self.pending.pages(self.page_size as u64),
       primary_head: self.primary_head,
       secondary_head: self.secondary_head,
       active_region: self.active_region,
@@ -1257,19 +1194,160 @@ fn warn_dropped_tail(region: &str, end: u64, head: u64) {
 
 /// Transactions in `txids` with no BEGIN, COMMIT, or ROLLBACK among `records`.
 fn transactions_without_boundaries(
-  records: &[ParsedWalRecord],
+  records: &[(WalRecordType, WalFrame)],
   txids: &HashSet<TxId>,
 ) -> HashSet<TxId> {
   let mut unseen = txids.clone();
-  for record in records {
+  for (record_type, frame) in records {
     if matches!(
-      record.record_type,
+      record_type,
       WalRecordType::Begin | WalRecordType::Commit | WalRecordType::Rollback
     ) {
-      unseen.remove(&record.txid);
+      unseen.remove(&frame.txid);
     }
   }
   unseen
+}
+
+/// XOR `salt` into the CRC of each of `records`, whole records back to back
+/// (see [`apply_wal_salt`]): salts unsalted records, unsalts salted ones,
+/// and with two salts XORed together moves records from one to the other.
+fn xor_salt(records: &mut [u8], salt: u32) -> Result<()> {
+  if apply_wal_salt(records, salt) {
+    Ok(())
+  } else {
+    Err(KiteError::Internal(
+      "WAL record bytes are not whole records".to_string(),
+    ))
+  }
+}
+
+/// Bytes buffered for the file until the next flush: disjoint byte runs at
+/// absolute file offsets, in offset order. Runs that touch are merged, so
+/// appends (the WAL's only steady write pattern) grow one run.
+#[derive(Debug, Default)]
+struct PendingWrites {
+  runs: Vec<PendingRun>,
+}
+
+#[derive(Debug)]
+struct PendingRun {
+  offset: u64,
+  data: Vec<u8>,
+}
+
+impl PendingRun {
+  fn end(&self) -> u64 {
+    self.offset + self.data.len() as u64
+  }
+}
+
+impl PendingWrites {
+  fn is_empty(&self) -> bool {
+    self.runs.is_empty()
+  }
+
+  fn clear(&mut self) {
+    self.runs.clear();
+  }
+
+  /// Buffer `data` for `offset`, over any bytes buffered there before.
+  fn write(&mut self, offset: u64, data: &[u8]) {
+    if data.is_empty() {
+      return;
+    }
+    let end = offset + data.len() as u64;
+    if let Some(last) = self.runs.last_mut() {
+      if last.end() == offset {
+        last.data.extend_from_slice(data);
+        return;
+      }
+    }
+    // The runs that overlap or touch [offset, end) merge with it.
+    let first = self.runs.partition_point(|run| run.end() < offset);
+    let past = self.runs.partition_point(|run| run.offset <= end);
+    if first == past {
+      self.runs.insert(
+        first,
+        PendingRun {
+          offset,
+          data: data.to_vec(),
+        },
+      );
+      return;
+    }
+    let start = offset.min(self.runs[first].offset);
+    let stop = end.max(self.runs[past - 1].end());
+    let mut merged = vec![0; (stop - start) as usize];
+    for run in self.runs.drain(first..past) {
+      let at = (run.offset - start) as usize;
+      merged[at..at + run.data.len()].copy_from_slice(&run.data);
+    }
+    let at = (offset - start) as usize;
+    merged[at..at + data.len()].copy_from_slice(data);
+    self.runs.insert(
+      first,
+      PendingRun {
+        offset: start,
+        data: merged,
+      },
+    );
+  }
+
+  /// [`Self::write`], keeping `data` itself as a new run when it touches no
+  /// buffered byte (as a whole batch written after a flush does).
+  fn write_vec(&mut self, offset: u64, data: Vec<u8>) {
+    let end = offset + data.len() as u64;
+    let first = self.runs.partition_point(|run| run.end() < offset);
+    if data.is_empty() || self.runs.get(first).is_some_and(|run| run.offset <= end) {
+      self.write(offset, &data);
+    } else {
+      self.runs.insert(first, PendingRun { offset, data });
+    }
+  }
+
+  /// Whether one run holds every byte of `offset..offset + length`.
+  fn covers(&self, offset: u64, length: usize) -> bool {
+    let end = offset + length as u64;
+    self
+      .runs
+      .iter()
+      .any(|run| run.offset <= offset && end <= run.end())
+  }
+
+  /// Copy the buffered bytes of `offset..offset + buffer.len()` into
+  /// `buffer`.
+  fn overlay(&self, offset: u64, buffer: &mut [u8]) {
+    let end = offset + buffer.len() as u64;
+    for run in &self.runs {
+      let (from, to) = (run.offset.max(offset), run.end().min(end));
+      if from < to {
+        let source = (from - run.offset) as usize;
+        let target = (from - offset) as usize;
+        let len = (to - from) as usize;
+        buffer[target..target + len].copy_from_slice(&run.data[source..source + len]);
+      }
+    }
+  }
+
+  /// The pages of `page_size` bytes the runs touch.
+  fn pages(&self, page_size: u64) -> usize {
+    let mut pages = 0;
+    let mut last_page = None;
+    for run in &self.runs {
+      let first = run.offset / page_size;
+      let last = (run.end() - 1) / page_size;
+      let first = match last_page {
+        Some(previous) if previous >= first => previous + 1,
+        _ => first,
+      };
+      if first <= last {
+        pages += (last - first + 1) as usize;
+      }
+      last_page = Some(last);
+    }
+    pages
+  }
 }
 
 /// Saved WAL positions; see [`WalBuffer::region_state`].
@@ -1518,7 +1596,7 @@ mod tests {
 
     // Merge secondary into primary (simulates checkpoint completion)
     buffer
-      .merge_secondary_into_primary(&mut pager)
+      .merge_secondary_into_primary(Vec::new(), &mut pager)
       .expect("expected value");
     buffer.flush(&mut pager).expect("expected value");
 
@@ -1530,6 +1608,43 @@ mod tests {
     let records = buffer.scan_records(&mut pager).expect("expected value");
     assert_eq!(records.len(), 1); // Only secondary record preserved
     assert_eq!(records[0].txid, 2);
+  }
+
+  fn pending_runs(pending: &PendingWrites) -> Vec<(u64, Vec<u8>)> {
+    pending
+      .runs
+      .iter()
+      .map(|run| (run.offset, run.data.clone()))
+      .collect()
+  }
+
+  #[test]
+  fn pending_writes_merge_runs_that_touch_or_overlap() {
+    let mut pending = PendingWrites::default();
+    pending.write(50, &[5; 10]);
+    pending.write(0, &[1; 10]);
+    pending.write(10, &[2; 5]);
+    assert_eq!(
+      pending_runs(&pending),
+      vec![(0, [vec![1; 10], vec![2; 5]].concat()), (50, vec![5; 10])]
+    );
+    // Overlapping both runs: one run, the newest bytes winning.
+    pending.write(12, &[3; 40]);
+    let mut expected = vec![1; 10];
+    expected.extend([2; 2]);
+    expected.extend([3; 40]);
+    expected.extend([5; 8]);
+    assert_eq!(pending_runs(&pending), vec![(0, expected.clone())]);
+    assert!(pending.covers(5, 50) && !pending.covers(55, 10));
+    let mut window = vec![9; 8];
+    pending.overlay(56, &mut window);
+    assert_eq!(window, [5, 5, 5, 5, 9, 9, 9, 9]);
+    assert_eq!(pending.pages(32), 2);
+    pending.write_vec(100, vec![4; 4]);
+    pending.write_vec(60, vec![6; 2]);
+    assert_eq!(pending.runs.len(), 2);
+    assert_eq!(pending_runs(&pending)[0].1.len(), 62);
+    assert_eq!(pending.pages(4096), 1);
   }
 
   /// Header for the 4-page WAL at page 1 used by these tests.
