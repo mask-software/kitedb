@@ -11,6 +11,7 @@ use crate::error::{KiteError, Result};
 use crate::types::*;
 use crate::util::binary::{read_u32, read_u64};
 use crate::util::binary::{read_u32_at, read_u64_at};
+use crate::vector::distance::normalize_in_place;
 use crate::vector::ivf::serialize::deserialize_manifest;
 use crate::vector::store::{
   create_vector_store, validate_vector, vector_store_delete, vector_store_has, vector_store_insert,
@@ -235,18 +236,26 @@ impl SingleFileDB {
     Ok(())
   }
 
-  /// Get a vector embedding for a node
+  /// Get a vector embedding for a node, as its store holds it (normalized
+  /// for the cosine stores this API creates), also inside the transaction
+  /// that set it.
   ///
   /// Checks pending operations first, then falls back to committed storage.
   pub fn node_vector(&self, node_id: NodeId, prop_key_id: PropKeyId) -> Option<VectorRef> {
     let tx_handle = self.current_tx_handle();
     if let Some(handle) = tx_handle.as_ref() {
-      let tx = handle.lock();
-      if tx.pending.is_node_removed(node_id) {
-        return None;
-      }
-      if let Some(pending) = tx.pending.pending_vectors.get(&(node_id, prop_key_id)) {
-        return pending.as_ref().map(Arc::clone);
+      let pending = {
+        let tx = handle.lock();
+        if tx.pending.is_node_removed(node_id) {
+          return None;
+        }
+        tx.pending
+          .pending_vectors
+          .get(&(node_id, prop_key_id))
+          .cloned()
+      };
+      if let Some(pending) = pending {
+        return pending.map(|vector| self.stored_vector(prop_key_id, vector));
       }
     }
 
@@ -260,7 +269,9 @@ impl SingleFileDB {
     // Check pending operations from committed replay (startup)
     if let Some(pending) = delta.pending_vectors.get(&(node_id, prop_key_id)) {
       // Some(vec) = set, None = delete
-      return pending.as_ref().map(Arc::clone);
+      return pending
+        .clone()
+        .map(|vector| self.stored_vector(prop_key_id, vector));
     }
 
     if self.ensure_vector_store_loaded(prop_key_id).is_err() {
@@ -271,6 +282,30 @@ impl SingleFileDB {
     let stores = self.vector_stores.read();
     let store = stores.get(&prop_key_id)?;
     vector_store_node_vector(store, node_id).map(Arc::from)
+  }
+
+  /// `vector`, not in its store yet (set by a transaction, or replayed), as
+  /// the store will hold it: `vector_store_insert` normalizes it in place
+  /// when the store normalizes on insert, as every store this API creates
+  /// does. The same computation, so reads before and after the commit agree.
+  fn stored_vector(&self, prop_key_id: PropKeyId, vector: VectorRef) -> VectorRef {
+    let store_normalizes = self
+      .ensure_vector_store_loaded(prop_key_id)
+      .ok()
+      .and_then(|()| {
+        self
+          .vector_stores
+          .read()
+          .get(&prop_key_id)
+          .map(|store| store.config.normalize_on_insert)
+      })
+      .unwrap_or(VectorStoreConfig::new(vector.len()).normalize_on_insert);
+    if !store_normalizes {
+      return vector;
+    }
+    let mut stored = vector.to_vec();
+    normalize_in_place(&mut stored);
+    VectorRef::from(stored)
   }
 
   /// Check if a node has a vector embedding

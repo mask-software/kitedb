@@ -886,9 +886,10 @@ fn f6_node_vector_inside_the_tx_equals_the_committed_value() {
       approx_eq(committed, &unit(raw)),
       format!("{what}: committed vector {committed:?} is not unit({raw:?})"),
     );
+    // Exactly equal: the same normalization, not just a close one.
     v.expect(
       "inside the writing tx",
-      approx_eq(in_tx, committed),
+      in_tx == committed,
       format!("{what}: read {in_tx:?} inside the tx, {committed:?} after commit"),
     );
   }
