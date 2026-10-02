@@ -7,6 +7,10 @@
  *       newer one's and the graph highlights stale nodes.
  * C10c: a data refresh while the fcose layout is still running adds the new elements without laying
  *       them out, so they stack at the origin.
+ * C10d: opening another database keeps the previous one's selection and path/impact highlights,
+ *       and a request still pending for the previous database highlights its result afterwards.
+ * C10e: when the initial status check resolves after the user has opened a database, its stale
+ *       "disconnected" answer overwrites the connected state.
  *
  * React runs in happy-dom. App's child components are stubs that record their props, and cytoscape
  * runs headless. happy-dom's globals are removed again after this file.
@@ -304,6 +308,63 @@ describe("C10c: graph layout", () => {
     expect(positions.length).toBe(4);
     // Laid-out nodes are spread out; nodes that were never laid out all sit at the origin.
     expect(new Set(positions).size).toBe(4);
+  });
+});
+
+describe("C10d/C10e: switching databases", () => {
+  test("C10d: opening another database clears the selection and highlights, even from a pending request", async () => {
+    const pendingImpact = deferred<unknown>();
+    routes = {
+      ...connectedRoutes(),
+      "/api/graph/impact": () => pendingImpact.promise,
+      "/api/db/demo": async () => ({ success: true }),
+    };
+    await render(<App />);
+    await clickNode("a"); // select mode: selects a
+    await setToolMode("impact");
+    await clickNode("b"); // impact request for b, still pending
+    expect(latestProps.GraphCanvas.selectedNode?.id).toBe("a");
+
+    await act(async () => {
+      await latestProps.Header.onCreateDemo();
+    });
+    await flush();
+    await act(async () => pendingImpact.resolve({ impacted: ["c"], edges: [] }));
+    await flush();
+
+    expect(latestProps.Header.dbPath).toBe("demo.kitedb");
+    expect(latestProps.GraphCanvas.selectedNode).toBeNull();
+    expect(latestProps.GraphCanvas.impactSource).toBeNull();
+    expect(sorted(latestProps.GraphCanvas.impactedNodes)).toEqual([]);
+  });
+
+  test("C10e: a late initial status check does not undo a database opened meanwhile", async () => {
+    const initialStatus = deferred<unknown>();
+    let statusCalls = 0;
+    routes = {
+      ...connectedRoutes(),
+      "/api/status": () => {
+        statusCalls++;
+        return statusCalls === 1
+          ? initialStatus.promise
+          : Promise.resolve({ connected: true, path: "demo.kitedb", isDemo: true, nodeCount: 4, edgeCount: 0 });
+      },
+      "/api/db/demo": async () => ({ success: true }),
+    };
+    await render(<App />);
+    await act(async () => {
+      await latestProps.Header.onCreateDemo();
+    });
+    await flush();
+    expect(latestProps.Header.connected).toBe(true);
+
+    // The first status request answers last, from before the demo was opened.
+    await act(async () => initialStatus.resolve({ connected: false }));
+    await flush();
+
+    expect(latestProps.Header.connected).toBe(true);
+    expect(latestProps.Header.dbPath).toBe("demo.kitedb");
+    expect(latestProps.Header.isDemo).toBe(true);
   });
 });
 
