@@ -563,7 +563,7 @@ fn run_sequential(config: &BenchConfig, events: &[ChangeEvent]) -> BenchResult {
 
   if config.keep_db {
     println!("Sequential DB kept at: {}", fixture.db_path.display());
-    std::mem::forget(fixture.temp_dir);
+    let _ = fixture.temp_dir.keep();
   }
 
   if let Ok(db) = Arc::try_unwrap(fixture.db) {
@@ -795,7 +795,7 @@ fn run_parallel(config: &BenchConfig, events: &[ChangeEvent]) -> BenchResult {
 
   if config.keep_db {
     println!("Parallel DB kept at: {}", fixture.db_path.display());
-    std::mem::forget(fixture.temp_dir);
+    let _ = fixture.temp_dir.keep();
   }
 
   if let Ok(db) = Arc::try_unwrap(fixture.db) {

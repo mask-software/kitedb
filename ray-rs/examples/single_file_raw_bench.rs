@@ -742,6 +742,8 @@ fn main() {
   close_single_file(db).expect("failed to close db");
 
   if config.keep_db {
+    // Dropping the TempDir would delete the database with it.
+    let _ = temp.keep();
     println!("\nDatabase preserved at: {}", db_path.display());
   }
 }
