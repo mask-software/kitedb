@@ -832,11 +832,103 @@ db.batch(vec![
 ])`}
 				/>
 
+				<h2 id="isolation">Isolation and conflicts</h2>
+				<p>
+					Transactions are snapshot-isolated (MVCC, on by default since 0.3.0):
+					a transaction reads the database as of its <code>begin</code>, plus
+					its own writes, and never sees a later commit. Reads outside a
+					transaction see the latest committed state.
+				</p>
+				<p>
+					Write transactions on different threads run at the same time. A commit
+					fails with a conflict if a key the transaction read or wrote was
+					changed by a commit since the transaction began. Nothing from the
+					failed transaction is applied and the transaction has ended, so run it
+					again. Rust returns <code>KiteError::Conflict</code>, Python raises{" "}
+					<code>ConflictError</code>, and JavaScript throws an{" "}
+					<code>Error</code> whose message contains{" "}
+					<code>conflict on keys</code>. Writers that touch different nodes and
+					edges don't conflict. In Node.js, JS on the main thread runs one
+					transaction at a time per handle, so its commits can only conflict
+					with work on other threads, such as <code>importFromJsonAsync()</code>
+					.
+				</p>
+				<MultiLangCode
+					typescript={`function isConflict(e: unknown): boolean {
+  return e instanceof Error && e.message.includes('conflict on keys');
+}
+
+for (let attempt = 1; ; attempt++) {
+  try {
+    db.transaction((ctx) => {
+      const update = ctx.update('user', 'alice');
+      update.set('status', 'active');
+      update.execute();
+    });
+    break;
+  } catch (e) {
+    // Nothing was applied; run the transaction again
+    if (!isConflict(e) || attempt === 5) throw e;
+  }
+}`}
+					rust={`use kitedb::core::single_file::{open_single_file, SingleFileOpenOptions};
+use kitedb::types::PropValue;
+use kitedb::KiteError;
+use std::sync::Arc;
+
+// Threads share one handle; each runs its own transaction
+let db = Arc::new(open_single_file("./my.kitedb", SingleFileOpenOptions::default())?);
+
+loop {
+    let tx = db.begin_guard(false)?; // rolls back if dropped
+    if let Some(node) = db.node_by_key("user:alice") {
+        db.set_node_prop_by_name(node, "status", PropValue::String("active".into()))?;
+    }
+    match tx.commit() {
+        // Nothing was applied; run the transaction again
+        Err(KiteError::Conflict { .. }) => continue,
+        result => break result?,
+    }
+}`}
+					python={`from kitedb import ConflictError, PropValue
+
+# Threads can share one Database; each runs its own transaction
+while True:
+    db.begin()
+    try:
+        node = db.get_node_by_key("user:alice")
+        if node is not None:
+            db.set_node_prop_by_name(node, "status", PropValue.string("active"))
+    except BaseException:
+        db.rollback()
+        raise
+    try:
+        db.commit()
+        break
+    except ConflictError:
+        # Nothing was applied and the transaction has ended; run it again
+        continue`}
+				/>
+				<p>
+					Opening with <code>mvcc: false</code> (Rust <code>.mvcc(false)</code>,
+					Python <code>OpenOptions(mvcc=False)</code>) is deprecated and will be
+					removed in a later release. In that mode write transactions run one at
+					a time, a second writer's <code>begin</code> waits for the first to
+					finish, and transactions read the latest committed state instead of a
+					snapshot. See <a href="/docs/guides/concurrency">Concurrency</a>.
+				</p>
+
 				<h2 id="bulk-load">Bulk load (max throughput)</h2>
 				<p>
-					A bulk-load transaction bypasses MVCC (if you enabled it) to minimize
-					per-write overhead. Use it for one-shot ingest or ETL jobs, and avoid
-					concurrent readers and writers while it runs.
+					A bulk-load transaction is the fastest way to load data, with MVCC or
+					without it. It runs alone among writers: it waits for open write
+					transactions to finish, and write transactions that begin while it is
+					open wait for it. Readers never wait for it. Reads outside a
+					transaction see the whole load once it commits; a read transaction
+					that began before the commit does not see it. If read transactions are
+					open when it commits, the commit records version history for them,
+					which takes time proportional to the size of the load. Use it for
+					one-shot ingest or ETL jobs.
 				</p>
 				<MultiLangCode
 					typescript={`import { Database } from '@kitedb/core';
@@ -875,13 +967,13 @@ db.commit()`}
 					</thead>
 					<tbody>
 						<tr>
-							<td>Max throughput, single writer</td>
+							<td>Fastest ingest</td>
 							<td>
 								<code>beginBulk()</code> + batch APIs
 							</td>
 						</tr>
 						<tr>
-							<td>Atomic ingest (MVCC on or off)</td>
+							<td>Atomic writes</td>
 							<td>
 								<code>batch()</code> / <code>transaction()</code>
 							</td>
@@ -889,9 +981,8 @@ db.commit()`}
 						<tr>
 							<td>Several writer threads</td>
 							<td>
-								<code>mvcc: true</code> + <code>syncMode: 'Normal'</code> + group
-								commit + chunked batches (without MVCC, write transactions run one
-								at a time). One writer sending batches is usually faster
+								A transaction per thread, <code>syncMode: 'Normal'</code> +
+								group commit; retry commits that fail with a conflict
 							</td>
 						</tr>
 					</tbody>
@@ -971,6 +1062,12 @@ except Exception as e:
 				/>
 
 				<h2 id="read-only">Read-only transactions</h2>
+				<p>
+					A read-only transaction reads one snapshot, as of its{" "}
+					<code>begin</code>, for as long as it is open. Keep it short: while
+					any transaction is open, commits record version history for it, and
+					garbage collection can't remove that history until it ends.
+				</p>
 				<MultiLangCode
 					typescript={`// Begin a read-only transaction
 db.begin(true);
@@ -1055,13 +1152,13 @@ if db.has_transaction():
 					</thead>
 					<tbody>
 						<tr>
-							<td>Max ingest throughput, single writer</td>
+							<td>Fastest ingest</td>
 							<td>
 								<code>beginBulk()</code> + batch APIs
 							</td>
 						</tr>
 						<tr>
-							<td>Atomic ingest (MVCC on or off)</td>
+							<td>Atomic writes</td>
 							<td>
 								<code>transaction()</code> / <code>batch()</code>
 							</td>
@@ -1069,8 +1166,8 @@ if db.has_transaction():
 						<tr>
 							<td>Several writer threads</td>
 							<td>
-								<code>mvcc: true</code> + <code>syncMode: 'Normal'</code> + group
-								commit
+								<code>syncMode: 'Normal'</code> + group commit; retry
+								conflicting commits
 							</td>
 						</tr>
 						<tr>
@@ -1090,9 +1187,15 @@ if db.has_transaction():
 
 				<h2 id="bulk">Bulk ingest (fastest path)</h2>
 				<p>
-					A bulk-load transaction bypasses MVCC (if you enabled it) to minimize
-					overhead. Use it for one-shot ingest or ETL jobs, and avoid concurrent
-					readers and writers while it runs.
+					A bulk-load transaction is as fast with MVCC (the default) as without
+					it: for 200k nodes and 1M edges with two properties each, loaded in
+					batches of 5,000, about 1.5–1.7M nodes/s and 0.6M edges/s in both
+					modes on an M-series Mac. It runs alone among writers (it waits for
+					open write transactions, and new ones wait for it), and readers never
+					wait for it. A read transaction left open across the load slows it
+					down, because the load's commits record version history for that
+					reader (about 1.25M nodes/s and 0.38M edges/s in the same test). Use
+					it for one-shot ingest or ETL jobs.
 				</p>
 				<MultiLangCode
 					typescript={`import { Database } from '@kitedb/core';
@@ -1141,7 +1244,7 @@ db.commit()`}
 						<tr>
 							<td>Several writer threads</td>
 							<td>
-								<code>mvcc: true</code>, <code>syncMode: 'Normal'</code>,{" "}
+								<code>syncMode: 'Normal'</code>,{" "}
 								<code>groupCommitEnabled: true</code>, chunked batches
 							</td>
 						</tr>
@@ -1169,6 +1272,7 @@ db.commit()`}
 					<li>
 						Prefer <code>beginBulk()</code> for ingest; commit in chunks
 					</li>
+					<li>Don't hold read transactions open across a bulk load</li>
 					<li>Increase WAL size for large ingest (256MB+)</li>
 					<li>
 						Disable auto-checkpoint during ingest; checkpoint once at the end
@@ -1199,33 +1303,42 @@ db.commit()`}
 			<DocPage slug={slug}>
 				<p>
 					Within one process, many threads can read a KiteDB database at the
-					same time. Without MVCC (the default), one write transaction is open
-					at a time: a second writer waits in <code>begin</code> until the first
-					commits or rolls back. With the <code>mvcc</code> open option, write
-					transactions run concurrently and conflicts are detected at commit.
+					same time, and write transactions on different threads run
+					concurrently. Since 0.3.0, MVCC is on by default: each transaction
+					reads a snapshot, and a commit that conflicts with a write committed
+					since its transaction began fails, so you retry it.
 				</p>
 
 				<h2 id="concurrency-model">Concurrency model</h2>
 				<p>
-					KiteDB uses a <strong>readers-writer lock</strong> pattern:
+					KiteDB uses <strong>multi-version concurrency control</strong> (MVCC):
 				</p>
 				<ul>
 					<li>
 						<strong>Multiple concurrent readers</strong> – Any number of threads
-						can read simultaneously
+						can read simultaneously, without waiting for open write transactions
 					</li>
 					<li>
-						<strong>One writer at a time (default)</strong> – A write
-						transaction waits for the open one to finish, so concurrent
-						read-modify-write transactions cannot lose updates. Read-only
-						transactions never wait for it
+						<strong>Concurrent writers</strong> – Each thread runs its own
+						transaction. Write transactions run at the same time; only their
+						commits are applied one at a time
 					</li>
 					<li>
-						<strong>MVCC (opt-in)</strong> – With the <code>mvcc</code> open
-						option, transactions read from consistent snapshots, and write
-						transactions run concurrently; a commit that conflicts with one
-						committed since its transaction began fails with a conflict error, so
-						retry it
+						<strong>Conflicts at commit</strong> – A commit fails with a
+						conflict error if a key its transaction read or wrote was changed by
+						a commit since the transaction began, so concurrent
+						read-modify-write transactions cannot lose updates. Nothing from the
+						failed transaction is applied; retry it (see{" "}
+						<a href="/docs/guides/transactions#isolation">
+							Isolation and conflicts
+						</a>
+						). Writers that touch different nodes and edges don't conflict
+					</li>
+					<li>
+						<strong>Non-MVCC mode (deprecated)</strong> – With{" "}
+						<code>mvcc: false</code>, a write transaction waits in{" "}
+						<code>begin</code> until the open one commits or rolls back. It will
+						be removed in a later release
 					</li>
 				</ul>
 
@@ -1290,64 +1403,103 @@ for t in threads:
 print(results)`}
 				/>
 
+				<h2 id="writers">Concurrent writers by language</h2>
+				<ul>
+					<li>
+						<strong>Rust</strong> – The high-level <code>Kite</code> takes{" "}
+						<code>&amp;mut self</code> for writes, so behind a lock its writers
+						take turns. For concurrent write transactions, share a low-level{" "}
+						<code>SingleFileDB</code> (from <code>open_single_file</code>) in an{" "}
+						<code>Arc</code>; each thread calls <code>begin</code> and{" "}
+						<code>commit</code> on it
+					</li>
+					<li>
+						<strong>Python</strong> – Threads can share one{" "}
+						<code>Database</code> or <code>Kite</code>; each thread's{" "}
+						<code>begin</code> opens its own transaction
+					</li>
+					<li>
+						<strong>Node.js</strong> – JS on the main thread runs one
+						transaction at a time per handle, and a writable handle locks the
+						file, so writes from JS don't run concurrently
+					</li>
+				</ul>
+
 				<h2 id="performance">Performance notes</h2>
 				<p>
-					Read throughput typically improves with parallel readers. Without
-					MVCC, writer threads take turns for whole transactions, so more writer
-					threads add no write throughput. With MVCC, writers build their
-					transactions in parallel and only the commits are applied one at a
-					time, but its version bookkeeping costs throughput too: for several
-					writer threads, use <code>mvcc: true</code> with{" "}
-					<code>syncMode: 'Normal'</code> and group commit; for the most write
-					throughput, prepare data in parallel and send it through one writer in
-					batched transactions. Measure with your workload and tune batch sizes
-					and sync mode accordingly.
+					Read throughput typically improves with parallel readers. Writer
+					threads build their transactions in parallel and only the commits are
+					applied one at a time: in one measurement, 8 writer threads committed
+					about 5.3K transactions/s (200 nodes each), against 3.6K/s for a
+					single writer without MVCC. For several writer threads, use{" "}
+					<code>syncMode: 'Normal'</code> with group commit. For one-shot
+					ingest, a bulk load (<code>beginBulk()</code>) through one writer is
+					fastest. Measure with your workload and tune batch sizes and sync mode
+					accordingly.
 				</p>
 
 				<h2 id="best-practices">Best practices</h2>
 				<ul>
 					<li>
 						<strong>Batch writes</strong> – Group multiple writes into single
-						operations to minimize exclusive lock time
+						operations to pay the commit cost once
 					</li>
 					<li>
 						<strong>Use transactions for atomicity</strong> – Group related
-						writes; with MVCC enabled, readers also see consistent snapshots
-						while those writes commit
+						writes; readers see all of a commit or none of it
+					</li>
+					<li>
+						<strong>Retry on conflict</strong> – A commit that fails with a
+						conflict applied nothing; run the transaction again. Short
+						transactions conflict less often
+					</li>
+					<li>
+						<strong>Keep transactions short</strong> – While a transaction is
+						open, commits keep version history for it in memory
 					</li>
 					<li>
 						<strong>Profile your workload</strong> – The optimal thread count
 						depends on your read/write ratio and data access patterns
 					</li>
-					<li>
-						<strong>Avoid long-held locks</strong> – Keep critical sections
-						short; do processing outside the lock
-					</li>
 				</ul>
 
 				<h2 id="mvcc">MVCC and transaction semantics</h2>
 				<p>
-					MVCC (multi-version concurrency control) is off by default. Turn it on
-					with the <code>mvcc</code> open option when readers need snapshot
-					isolation or several threads write at once:
+					MVCC (multi-version concurrency control) is on by default since 0.3.0:
 				</p>
 				<ul>
 					<li>Multiple readers can run concurrently</li>
 					<li>
-						Without MVCC, write transactions run one at a time: a write{" "}
-						<code>begin</code> waits until no other write transaction is open
-						(in Python it releases the GIL while it waits)
+						A transaction reads the state as of its <code>begin</code>, plus its
+						own writes, never a later commit. Reads outside a transaction see
+						the latest committed state
 					</li>
 					<li>
-						With MVCC, write transactions run concurrently, and write conflicts
-						are detected at commit time
+						Write transactions run concurrently, and write conflicts are
+						detected at commit time
 					</li>
 					<li>
 						Commits are applied one at a time; a commit briefly blocks new reads
 						while it publishes its changes
 					</li>
 					<li>Each committed transaction is atomic</li>
+					<li>
+						A background thread per writable open database prunes version
+						history every <code>mvccGcIntervalMs</code> (5000 ms by default);
+						read-only opens start none. Closing the database stops it without
+						waiting for the next run
+					</li>
 				</ul>
+				<p>
+					Opening with <code>mvcc: false</code> (Rust <code>.mvcc(false)</code>,
+					Python <code>OpenOptions(mvcc=False)</code>) turns MVCC off. That mode
+					is deprecated and will be removed in a later release; it logs no
+					warning. Without MVCC, write transactions run one at a time: a write{" "}
+					<code>begin</code> waits until no other write transaction is open (in
+					Python it releases the GIL while it waits), and transactions read the
+					latest committed state instead of a snapshot. The file format is the
+					same in both modes, so existing files open under the new default.
+				</p>
 
 				<MultiLangCode
 					typescript={`// Atomic transaction (auto-commit on success, rollback on error)
@@ -1383,13 +1535,14 @@ with db.transaction():
 						single process; multi-process access requires external coordination
 					</li>
 					<li>
-						<strong>Write serialization</strong> – Without MVCC, write
-						transactions run one at a time; with MVCC, commits are applied one
-						at a time. High-write workloads may see contention
+						<strong>Write serialization</strong> – Commits are applied one at a
+						time (without MVCC, whole write transactions are). High-write
+						workloads may see contention
 					</li>
 					<li>
-						<strong>Memory overhead</strong> – With MVCC enabled, version
-						history uses additional memory
+						<strong>Memory overhead</strong> – Version history uses additional
+						memory while transactions are open, until garbage collection removes
+						it
 					</li>
 				</ul>
 

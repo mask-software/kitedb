@@ -6,6 +6,7 @@ This package provides the Python bindings to the Rust core.
 ## Features
 
 - ACID transactions with commit/rollback
+- MVCC (on by default): snapshot-isolated transactions and concurrent writers
 - Node and edge CRUD operations with properties
 - Labels, edge types, and property keys
 - Fluent traversal and pathfinding (BFS, Dijkstra, A\*)
@@ -99,8 +100,14 @@ with Database("my_graph.kitedb") as db:
 
 ## Bulk ingest (max throughput)
 
-Use bulk-load transactions + batch APIs to maximize write throughput.
-Bulk-load disables MVCC, so avoid concurrent readers/writers while it runs.
+Use bulk-load transactions + batch APIs to maximize write throughput. A bulk load
+works with MVCC on (the default) or off, at the same speed. It runs alone among
+writers: it waits for open write transactions to finish, and write transactions that
+begin while it is open wait for it. Readers never wait for it; a read transaction
+that began before its commit does not see it. Avoid holding a read transaction open
+across a large load: the load's commits then record version history for that
+reader, which slows them down. `Kite.bulk()` uses a bulk-load transaction too, as does
+`batch_create_nodes()` (which multi-row fluent inserts use) outside a transaction.
 
 ```python
 from kitedb import Database
@@ -159,8 +166,21 @@ async def read_users():
 **Concurrency model:**
 
 - **Reads are concurrent**: Multiple `get_node_by_key()`, `get_neighbors()`, traversals, etc. can run in parallel
-- **Writes are exclusive**: Write operations (`create_node()`, `add_edge()`, etc.) require exclusive access
+- **Writes are concurrent too** (MVCC, on by default): each thread's `begin()` opens its own
+  transaction, and write transactions on different threads run at the same time (their
+  commits are applied one at a time). A transaction reads the state as of its `begin()`
+  plus its own writes; reads outside a transaction see the latest committed state. A commit
+  that overlaps a write committed since its transaction began raises `ConflictError` (see
+  [Errors](#errors)); retry it
 - **Thread safety**: The `Database` object is safe to share across threads
+
+`OpenOptions(mvcc=False)` turns MVCC off. It is deprecated and will be removed in a later
+release (there is no runtime warning). Without MVCC, write transactions run one at a time
+(a second writer's `begin()` waits, with the GIL released, until the first finishes) and
+transactions read the latest committed state. The file format is the same in both modes.
+Each writable open database runs a background thread that prunes MVCC version history
+(`mvcc_gc_interval_ms`, default 5000; read-only opens start none); `mvcc_retention_ms`
+defaults to 0.
 
 Note: Python's GIL is released during Rust operations, allowing true parallelism for I/O-bound database access.
 
@@ -189,12 +209,19 @@ Failed operations raise `kitedb.KiteError` or one of its subclasses. `KiteError`
 ```python
 from kitedb import ConflictError
 
-try:
+while True:
     db.begin()
-    db.set_node_prop(node_id, key_id, PropValue.int(1))
-    db.commit()
-except ConflictError:
-    db.rollback()  # retry the transaction
+    try:
+        db.set_node_prop(node_id, key_id, PropValue.int(1))
+    except BaseException:
+        db.rollback()
+        raise
+    try:
+        db.commit()
+        break
+    except ConflictError:
+        # The failed commit applied nothing and ended the transaction: run it again
+        continue
 ```
 
 ## Streaming

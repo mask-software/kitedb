@@ -6,7 +6,7 @@ A high-performance embedded graph database written in Rust, with bindings for No
 - **Reliable writes** via WAL (Write-Ahead Log) + in-memory delta overlay
 - **Stable node IDs** that never change or get reused
 - **Periodic compaction** to merge snapshots with deltas
-- **MVCC** for concurrent transaction isolation
+- **MVCC** (on by default) for snapshot-isolated transactions and concurrent writers
 - **Pathfinding** with Dijkstra and A* algorithms
 - **Caching** for frequently accessed nodes, edges, and properties
 
@@ -14,7 +14,8 @@ A high-performance embedded graph database written in Rust, with bindings for No
 
 - Zero-copy mmap reading of snapshot files
 - ACID transactions with commit/rollback
-- **MVCC (Multi-Version Concurrency Control)** for snapshot isolation
+- **MVCC (Multi-Version Concurrency Control)** for snapshot isolation, on by default
+  since 0.3.0 (opening with `mvcc: false` is deprecated)
 - Efficient CSR format for graph traversal
 - Binary search for edge existence checks
 - Key-based node lookup with hash index

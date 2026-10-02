@@ -37,6 +37,66 @@ const db = await kite(path, options);`}
 				language="typescript"
 			/>
 
+			<h3 id="mvcc-options">MVCC options</h3>
+			<p>
+				<code>kite()</code>, <code>kiteSync()</code>, and{" "}
+				<code>Database.open()</code> take the same MVCC options:
+			</p>
+			<table>
+				<thead>
+					<tr>
+						<th>Option</th>
+						<th>Default</th>
+						<th>Description</th>
+					</tr>
+				</thead>
+				<tbody>
+					<tr>
+						<td>
+							<code>mvcc</code>
+						</td>
+						<td>
+							<code>true</code>
+						</td>
+						<td>
+							Snapshot-isolated transactions; concurrent write transactions with
+							conflict detection at commit
+						</td>
+					</tr>
+					<tr>
+						<td>
+							<code>mvccGcIntervalMs</code>
+						</td>
+						<td>5000</td>
+						<td>Milliseconds between background version-history cleanups</td>
+					</tr>
+					<tr>
+						<td>
+							<code>mvccRetentionMs</code>
+						</td>
+						<td>0</td>
+						<td>
+							How long to keep version history beyond what open transactions
+							need
+						</td>
+					</tr>
+					<tr>
+						<td>
+							<code>mvccMaxChainDepth</code>
+						</td>
+						<td>10</td>
+						<td>Version chain depth that cleanup truncates to</td>
+					</tr>
+				</tbody>
+			</table>
+			<p>
+				<code>mvcc: false</code> is deprecated and will be removed in a later
+				release; it logs no warning. Without MVCC, write transactions run one at
+				a time and transactions read the latest committed state instead of a
+				snapshot. The file format is the same in both modes. See{" "}
+				<a href="/docs/internals/mvcc">MVCC and transactions</a>.
+			</p>
+
 			<h2 id="node-methods">Node methods</h2>
 			<CodeBlock
 				code={`// Create nodes
@@ -132,7 +192,26 @@ try {
 				language="typescript"
 			/>
 
+			<p>
+				<code>Database.open()</code> takes the{" "}
+				<a href="/docs/api/high-level#mvcc-options">MVCC options</a>; MVCC is on
+				by default and <code>mvcc: false</code> is deprecated. A commit that
+				conflicts with a write committed since its transaction began throws an{" "}
+				<code>Error</code> whose message reads{" "}
+				<code>
+					Failed to commit: Transaction &lt;id&gt; conflict on keys: [...]
+				</code>
+				. The transaction has then ended and nothing was applied; run it again.
+			</p>
+
 			<h2 id="batch-operations">Batch operations</h2>
+			<p>
+				<code>beginBulk()</code> starts a bulk-load transaction, the fastest way
+				to load data, with MVCC on or off. It runs alone among writers: it waits
+				for open write transactions to finish, and write transactions that begin
+				while it is open wait for it. Readers never wait for it, and a read
+				transaction that began before its commit does not see it.
+			</p>
 			<CodeBlock
 				code={`// High-throughput bulk ingest
 db.beginBulk();
@@ -143,6 +222,21 @@ db.commit();
 
 // Optional maintenance checkpoint after ingest
 db.checkpoint();`}
+				language="typescript"
+			/>
+			<p>
+				<code>bulkWrite()</code> runs a list of synchronous operations in
+				bulk-load transactions of <code>chunkSize</code> operations each
+				(default 1000), committing after each chunk.
+			</p>
+			<CodeBlock
+				code={`import { bulkWrite } from '@kitedb/core';
+
+const nodeIds = bulkWrite(
+  db,
+  keys.map((key) => (d) => d.createNode(key)),
+  { chunkSize: 5000 },
+);`}
 				language="typescript"
 			/>
 

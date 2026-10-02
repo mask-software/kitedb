@@ -265,23 +265,24 @@ function LazyMVCCComparison() {
 	return (
 		<Figure title="Version chains only when needed" accent="violet">
 			<div class="space-y-3">
-				<Panel label="No active readers" meta="serial workload">
+				<Panel label="No other open transactions" meta="serial workload">
 					<p class="text-[13px] text-slate-400">
 						A commit applies its changes to the delta. No version chain is
 						written.
 					</p>
 				</Panel>
-				<Panel label="Active readers" meta="concurrent workload">
+				<Panel label="Other transactions open" meta="concurrent workload">
 					<p class="text-[13px] text-slate-400">
 						A commit also appends a version for each changed node, edge, and
-						property, so readers on older snapshots keep a consistent view. The
-						cost grows with the number of changes made while readers are active.
+						property, so transactions on older snapshots keep a consistent view.
+						The cost grows with the number of changes made while other
+						transactions are open.
 					</p>
 				</Panel>
 			</div>
 			<p class="mt-4 border-t border-kite-line pt-3 text-[13px] text-slate-500">
-				MVCC is off by default; enable it with <Code>mvcc: true</Code>. Old
-				versions are removed by MVCC garbage collection.
+				MVCC is on by default since 0.3.0. Old versions are removed by MVCC
+				garbage collection.
 			</p>
 		</Figure>
 	);
@@ -323,12 +324,15 @@ const MEMORY_PARTS: {
 	},
 	{
 		title: "MVCC version chains",
-		meta: "MVCC only",
+		meta: "while transactions are open",
 		accent: "mint",
 		items: [
-			{ text: "Only exist when MVCC is enabled (off by default)." },
-			{ text: "Only written while readers are active during a commit." },
-			{ text: "Removed by garbage collection." },
+			{
+				text: "Only written when a commit lands while other transactions are open.",
+			},
+			{
+				text: "Removed by garbage collection once no open transaction needs them (every 5 s by default).",
+			},
 		],
 	},
 ];
@@ -413,7 +417,9 @@ export function PerformancePage() {
 			<p>
 				Latest run: single-file raw benchmark on the Rust core, 10k nodes, 50k
 				edges, 3 edge types, 10 edge properties, <code>syncMode=Normal</code>,{" "}
-				<code>groupCommitEnabled=false</code>, Apple M4, February 4, 2026.
+				<code>groupCommitEnabled=false</code>, Apple M4, February 4, 2026. The
+				run predates MVCC as the default and ran without it; see{" "}
+				<a href="#mvcc-cost">MVCC cost</a> for the difference.
 			</p>
 
 			<h3>Node operations</h3>
@@ -481,6 +487,42 @@ export function PerformancePage() {
 				<code>docs/benchmarks/results/</code>.
 			</p>
 
+			<h3 id="mvcc-cost">MVCC cost</h3>
+			<p>Measured against non-MVCC mode when MVCC became the default:</p>
+			<table>
+				<thead>
+					<tr>
+						<th>Workload</th>
+						<th>MVCC vs. non-MVCC</th>
+					</tr>
+				</thead>
+				<tbody>
+					<tr>
+						<td>Single-thread reads</td>
+						<td>Within about 2–7%</td>
+					</tr>
+					<tr>
+						<td>Reads inside read-only transactions</td>
+						<td>About 6% slower</td>
+					</tr>
+					<tr>
+						<td>One writer, small transactions</td>
+						<td>About 7–8% slower</td>
+					</tr>
+					<tr>
+						<td>Writers, 200-node transactions</td>
+						<td>
+							8 MVCC writers: about 5.3K transactions/s; one non-MVCC writer:
+							about 3.6K/s
+						</td>
+					</tr>
+					<tr>
+						<td>Bulk load</td>
+						<td>Same throughput</td>
+					</tr>
+				</tbody>
+			</table>
+
 			<h3>Write durability vs. throughput</h3>
 			<ul>
 				<li>
@@ -492,12 +534,11 @@ export function PerformancePage() {
 					<code>syncMode=Normal</code> + <code>groupCommitEnabled=false</code>.
 				</li>
 				<li>
-					<strong>Several writer threads:</strong> <code>mvcc=true</code> +{" "}
-					<code>syncMode=Normal</code> + <code>groupCommitEnabled=true</code>.
-					Without MVCC, write transactions run one at a time, so extra writer
-					threads add nothing. Even with MVCC, several writers rarely beat one,
-					so for maximum ingest, prepare data in parallel and funnel writes
-					through one writer. See the{" "}
+					<strong>Several writer threads:</strong> <code>syncMode=Normal</code>{" "}
+					+ <code>groupCommitEnabled=true</code>. With MVCC (the default),
+					writers build their transactions in parallel and only the commits are
+					applied one at a time. For one-shot ingest, a bulk load through one
+					writer is still fastest. See the{" "}
 					<a href="/docs/benchmarks#parallel-write-scaling">
 						parallel write scaling notes
 					</a>
@@ -511,8 +552,8 @@ export function PerformancePage() {
 			<p>
 				Group commit writes the commits that arrive while a batch is being
 				written as the next batch, with one WAL flush and one header write; no
-				commit waits for a window. It only helps when several write
-				transactions commit at once, which needs MVCC.
+				commit waits for a window. It works with MVCC and only helps when
+				several threads commit at once.
 			</p>
 
 			<h4>Decision table</h4>
@@ -539,7 +580,7 @@ export function PerformancePage() {
 						<td>Lowest latency per commit</td>
 					</tr>
 					<tr>
-						<td>Several writer threads (with MVCC)</td>
+						<td>Several writer threads</td>
 						<td>Normal</td>
 						<td>On</td>
 						<td>Batches concurrent commits</td>
@@ -564,9 +605,9 @@ export function PerformancePage() {
 					checkpoint.
 				</li>
 				<li>
-					<strong>Several writer threads:</strong> <code>mvcc=true</code>,{" "}
-					<code>syncMode=Normal</code>, <code>groupCommitEnabled=true</code>,
-					several operations per transaction.
+					<strong>Several writer threads:</strong> <code>syncMode=Normal</code>,{" "}
+					<code>groupCommitEnabled=true</code>, several operations per
+					transaction, and a retry for commits that fail with a conflict.
 				</li>
 				<li>
 					<strong>Read-heavy, mixed workload:</strong> keep write batches small,
@@ -579,8 +620,14 @@ export function PerformancePage() {
 				</li>
 			</ul>
 			<p>
-				Bulk-load mode requires MVCC to be disabled, which is the default. Use
-				it for one-shot ingest or ETL jobs.
+				A bulk load is as fast with MVCC as without it: about 1.5–1.7M nodes/s
+				and 0.6M edges/s in both modes for 200k nodes and 1M edges with two
+				properties each, in batches of 5,000, on an M-series Mac (
+				<code>examples/bulk_load_bench.rs</code>). It runs alone among writers,
+				and readers never wait for it. A read transaction held open across the
+				load costs throughput (about 1.25M nodes/s and 0.38M edges/s in the same
+				test), because the load's commits record version history for it. Use it
+				for one-shot ingest or ETL jobs.
 			</p>
 
 			<h3>Bulk ingest example (low-level API)</h3>

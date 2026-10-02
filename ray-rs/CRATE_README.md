@@ -6,6 +6,7 @@ This crate provides the Rust core and the high-level Kite API.
 ## Features
 
 - ACID transactions with WAL-based durability
+- MVCC (on by default): snapshot-isolated transactions and concurrent writers
 - Node and edge CRUD with properties
 - Labels, edge types, and schema helpers
 - Fluent traversal and pathfinding (BFS, Dijkstra, Yen)
@@ -93,6 +94,40 @@ std::thread::spawn(move || {
 - **Reads (`&self`)**: `get()`, `exists()`, `neighbors_out()`, `from()`, traversals - concurrent via `RwLock::read()`
 - **Writes (`&mut self`)**: `create_node()`, `link()`, `set_prop()` - exclusive via `RwLock::write()`
 - The internal data structures use `RwLock` for thread-safe access to delta state and schema mappings
+
+For concurrent write transactions, share the low-level `SingleFileDB` in an `Arc`. Each
+thread runs its own transaction (MVCC, on by default): it reads the database as of its
+`begin`, plus its own writes, and write transactions on different threads run at the same
+time. A commit that overlaps a write committed since its transaction began returns
+`KiteError::Conflict { txid, keys }`; nothing was applied, so run the transaction again.
+
+```rust
+use std::sync::Arc;
+use kitedb::core::single_file::{open_single_file, SingleFileOpenOptions};
+use kitedb::types::PropValue;
+use kitedb::KiteError;
+
+let db = Arc::new(open_single_file("graph.kitedb", SingleFileOpenOptions::default())?);
+
+// On each writer thread:
+loop {
+    let tx = db.begin_guard(false)?; // rolls back if dropped
+    if let Some(node) = db.node_by_key("user:alice") {
+        db.set_node_prop_by_name(node, "status", PropValue::String("active".into()))?;
+    }
+    match tx.commit() {
+        Err(KiteError::Conflict { .. }) => continue,
+        result => break result?,
+    }
+}
+```
+
+`SingleFileOpenOptions::mvcc(false)` and `KiteOptions::mvcc(false)` are deprecated and will
+be removed in a later release (the setter is not marked `#[deprecated]`, because it also
+takes `true`). Without MVCC, write transactions run one at a time and transactions read the
+latest committed state. The file format is the same in both modes. Bulk loads
+(`begin_bulk()`, `begin_bulk_guard()`) work with MVCC on: a bulk load runs alone among
+writers, and readers never wait for it.
 
 ## Documentation
 

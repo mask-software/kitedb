@@ -160,26 +160,32 @@ import { Database } from '@kitedb/core-wasm32-wasi'
 
 ## Concurrent Access
 
-KiteDB supports concurrent read operations. Multiple async calls can read from the database simultaneously without blocking each other:
+Reads and writes on a handle are synchronous and run on the calling JS thread, so there is
+nothing to await. For parallel reads, open the file in each worker thread with `readOnly: true`:
+read-only handles share the file lock, while a writable handle holds it exclusively.
 
 ```ts
-// These execute concurrently - reads don't block each other
-const [user1, user2, user3] = await Promise.all([db.get(User, 'alice'), db.get(User, 'bob'), db.get(User, 'charlie')])
-
-// Traversals can also run concurrently
-const [aliceFriends, bobFriends] = await Promise.all([
-  db.from(alice).out(Knows).toArray(),
-  db.from(bob).out(Knows).toArray(),
-])
+const reader = await kite('./social.kitedb', { nodes: [User], edges: [Knows], readOnly: true })
 ```
 
-**Concurrency model:**
+**Transactions (MVCC, on by default):**
 
-- **Reads are concurrent**: Multiple `get()`, `from()`, `traverse()`, etc. can run in parallel
-- **Writes are exclusive**: Write operations (`insert()`, `link()`, `update()`) require exclusive access
-- **Read-write interaction**: A write will wait for in-progress reads to complete, then block new reads until done
-
-This is implemented using a read-write lock (RwLock) internally, providing good read scalability while maintaining data consistency.
+- A transaction reads the database as of its `begin()` plus its own writes, never a later
+  commit. Reads outside a transaction see the latest committed state.
+- Write transactions run concurrently and conflicts are detected at commit. JS on the main
+  thread runs one transaction at a time per handle, so its commits can only conflict with
+  work on other threads (such as `importFromJsonAsync()`). A conflicting commit throws an
+  `Error` whose message reads `Failed to commit: Transaction <id> conflict on keys: [...]`;
+  nothing was applied, so run the transaction again.
+- Commits are applied one at a time; a commit briefly blocks new reads while it publishes
+  its changes.
+- `beginBulk()` and `bulkWrite()` work with MVCC on: a bulk load runs alone among writers
+  (it waits for open write transactions, and new ones wait for it), and readers never wait
+  for it.
+- `mvcc: false` (in `kite()`, `kiteSync()` or `Database.open()`) is deprecated and will be
+  removed in a later release; there is no runtime warning. Without MVCC, write transactions
+  run one at a time and transactions read the latest committed state. The file format is the
+  same in both modes.
 
 ## Replication Admin (low-level API)
 

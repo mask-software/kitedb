@@ -397,7 +397,7 @@ Optional properties can be omitted or set to `undefined`.
 - **Edge existence**: O(log n) binary search on CSR
 - **Traversal**: O(k) where k = number of edges
 - **Snapshot read**: Zero-copy mmap
-- **MVCC overhead**: ~0% for single transactions, minimal for concurrent
+- **MVCC overhead**: single-thread reads within about 2-7% of non-MVCC mode; a single small writer about 7-8% slower
 - **Pathfinding**: O((V + E) log V) for Dijkstra/A\*
 - **Node count**: O(1) using snapshot metadata + delta adjustments
 - **Edge count**: O(1) when unfiltered, O(n+m) when filtered by type
@@ -406,12 +406,18 @@ Optional properties can be omitted or set to `undefined`.
 
 ## MVCC Details
 
+MVCC is on by default since 0.3.0. Opening with `mvcc: false` (Rust `.mvcc(false)`,
+Python `OpenOptions(mvcc=False)`) is deprecated and will be removed in a later release;
+without MVCC, write transactions run one at a time and transactions read the latest
+committed state. The file format is the same in both modes.
+
 ### Snapshot Isolation
 
-Each transaction sees a consistent snapshot of the database from its start time:
+Each transaction sees a consistent snapshot of the database from its start time, plus its
+own writes. Reads outside a transaction see the latest committed state:
 
 ```typescript
-const db = await openGraphDB("./db", { mvcc: true });
+const db = await openGraphDB("./db"); // MVCC is on by default
 
 const tx1 = beginTx(db); // Snapshot at time T1
 const tx2 = beginTx(db); // Snapshot at time T1 (same)

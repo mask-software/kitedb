@@ -294,10 +294,27 @@ Provides:
 
 ## Transaction Model
 
-**Single-Writer Pattern:**
-- Only one transaction at a time per database
-- Other operations wait for transaction to complete
-- Lock is managed by underlying GraphDB
+**MVCC (default since 0.3.0):**
+- Each thread runs its own transaction; write transactions on different threads run
+  concurrently, and only their commits are applied one at a time
+- A transaction reads the state as of its `begin` plus its own writes; reads outside a
+  transaction see the latest committed state
+- A commit that overlaps a write committed since its transaction began fails with a
+  conflict (Rust `KiteError::Conflict`, Python `ConflictError`, JS an `Error` reading
+  `Failed to commit: Transaction <id> conflict on keys: [...]`); nothing is applied, so
+  retry the transaction
+- A bulk load (`beginBulk()`) runs alone among writers; readers never wait for it
+- A background thread per writable open database prunes version history
+  (`mvccGcIntervalMs`, default 5000 ms; `mvccRetentionMs` default 0; `mvccMaxChainDepth`
+  default 10); read-only opens start none
+
+**Non-MVCC Mode (deprecated):**
+- Opened with `mvcc: false` (Rust `.mvcc(false)`, Python `OpenOptions(mvcc=False)`);
+  will be removed in a later release
+- Only one write transaction at a time per database: a second writer's `begin` waits
+  until the first commits or rolls back
+- Transactions read the latest committed state instead of a snapshot
+- The file format is the same in both modes
 
 **Automatic Rollback:**
 ```typescript

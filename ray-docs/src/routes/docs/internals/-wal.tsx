@@ -545,7 +545,8 @@ export function WALPage() {
 					<code>groupCommitWindowMs = 2</code>
 				</li>
 				<li>
-					<code>beginBulk()</code> + batch APIs for ingest (MVCC disabled)
+					<code>beginBulk()</code> + batch APIs for ingest (with or without
+					MVCC)
 				</li>
 				<li>
 					Optional: increase <code>walSizeMb</code> (e.g., 64 MB) for heavy

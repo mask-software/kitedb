@@ -285,8 +285,9 @@ function MVCCGarbageCollection() {
 					<StepNumber accent="cyan">1</StepNumber>
 					<span class="text-slate-300">
 						Compute the GC horizon: the start of the oldest active transaction,
-						or the retention window (<Code>mvccRetentionMs</Code>, default 60
-						s), whichever is older
+						or the retention window (<Code>mvccRetentionMs</Code>, default 0:
+						keep no history beyond what open transactions need), whichever is
+						older
 					</span>
 				</li>
 				<li class="flex items-start gap-3">
@@ -304,15 +305,24 @@ function MVCCGarbageCollection() {
 						</div>
 					</div>
 				</li>
+				<li class="flex items-start gap-3">
+					<StepNumber accent="cyan">3</StepNumber>
+					<span class="text-slate-300">
+						Truncate chains deeper than <Code>mvccMaxChainDepth</Code> (default
+						10), but never past the version the oldest active transaction reads
+					</span>
+				</li>
 			</ol>
 
 			<div class="mt-4 rounded-lg border border-kite-line bg-white/[0.02] px-4 py-3">
 				<p class="mb-1.5 text-[13px] text-slate-500">Runs:</p>
 				<div class="space-y-1">
-					<FlowItem color="slate">When MVCC starts on open</FlowItem>
+					<FlowItem color="slate">On a writable open</FlowItem>
 					<FlowItem color="slate">
-						Periodically in a background thread (<Code>mvccGcIntervalMs</Code>,
-						default 5 s)
+						Periodically in a background thread, one per writable open database
+						(<Code>mvccGcIntervalMs</Code>, default 5 s). Read-only opens commit
+						nothing, so they start no GC thread. Closing or dropping the
+						database stops it without waiting for the next run
 					</FlowItem>
 				</div>
 			</div>
@@ -333,10 +343,11 @@ export function MVCCPage() {
 	return (
 		<DocPage slug="internals/mvcc">
 			<p>
-				KiteDB supports concurrent transactions using{" "}
+				KiteDB runs transactions under{" "}
 				<strong>Multi-Version Concurrency Control (MVCC)</strong>. Multiple
 				readers can access the database simultaneously without blocking each
-				other or writers.
+				other or writers, and write transactions run concurrently, with
+				conflicts detected at commit.
 			</p>
 			<p>
 				These transactions run inside one process. A writable open takes an
@@ -347,17 +358,23 @@ export function MVCCPage() {
 			</p>
 
 			<div class="my-6 rounded-lg border border-kite-cyan/20 bg-kite-cyan/[0.05] px-4 py-3 text-[14px] text-slate-300">
-				MVCC is off by default. Enable it with the <code>mvcc: true</code> open
-				option; the isolation and conflict behavior on this page applies when it
-				is on.
+				MVCC is on by default since 0.3.0 (before, it was opt-in). Opening with{" "}
+				<code>mvcc: false</code> (Rust <code>.mvcc(false)</code>, Python{" "}
+				<code>OpenOptions(mvcc=False)</code>) is deprecated and will be removed
+				in a later release. Without MVCC, write transactions run one at a time
+				and transactions read the latest committed state instead of a snapshot.
+				MVCC is runtime state only: the file format is the same in both modes,
+				and a file can be opened in either.
 			</div>
 
 			<h2 id="isolation">Snapshot isolation</h2>
 
 			<p>
 				Each transaction sees a consistent snapshot of the database as it
-				existed when the transaction started. Other transactions' uncommitted
-				changes are invisible.
+				existed when the transaction started, plus its own writes. Other
+				transactions' uncommitted changes, and commits made after it started,
+				are invisible. Reads outside a transaction see the latest committed
+				state.
 			</p>
 
 			<SnapshotIsolationTimeline />
@@ -396,6 +413,18 @@ export function MVCCPage() {
 
 			<WriteConflictDiagram />
 
+			<p>
+				The failed commit applies nothing and ends the transaction. Rust returns{" "}
+				<code>KiteError::Conflict {"{ txid, keys }"}</code>, Python raises{" "}
+				<code>ConflictError</code>, and JavaScript throws an <code>Error</code>{" "}
+				whose message reads{" "}
+				<code>
+					Failed to commit: Transaction &lt;id&gt; conflict on keys: [...]
+				</code>
+				. Transactions that touch different nodes and edges don't conflict, so
+				they all commit.
+			</p>
+
 			<CodeBlock
 				code={`// Handling conflicts
 try {
@@ -417,17 +446,94 @@ try {
 			<h2 id="lazy-versioning">Lazy version chains</h2>
 
 			<p>
-				Version chains are only created when necessary. If no other transactions
-				are active, modifications happen in place without versioning overhead.
+				Version chains are only created when necessary: a commit records version
+				history only while other transactions are open. Otherwise, modifications
+				happen in place without versioning overhead.
 			</p>
 
 			<LazyMVCCDiagram />
+
+			<h2 id="bulk-load">Bulk loads</h2>
+
+			<p>
+				A bulk load (<code>beginBulk()</code>) runs alone among writers: it
+				waits for the open write transactions to finish, and write transactions
+				that begin while it is open, or while it waits, wait for it. With no
+				writer beside it, it records nothing for conflict checks. Readers never
+				wait for it. Reads outside a transaction see the whole load once it
+				commits, and a read transaction that began before the commit does not
+				see it: when read transactions are open at the commit, it records
+				version history for them, which takes time proportional to the size of
+				the load.
+			</p>
+
+			<VersionNote>
+				<code>beginBulk()</code> failed with MVCC on ("bulk load requires MVCC
+				disabled"), and the Python and TypeScript bulk helpers fell back to
+				normal transactions.
+			</VersionNote>
 
 			<h2 id="garbage-collection">Garbage collection</h2>
 
 			<p>Old versions are cleaned up when no transaction can see them:</p>
 
 			<MVCCGarbageCollection />
+
+			<h2 id="options">Options</h2>
+
+			<p>
+				Open options, named <code>mvccGcIntervalMs</code> in JavaScript and{" "}
+				<code>mvcc_gc_interval_ms</code> in Rust and Python (likewise for the
+				others):
+			</p>
+
+			<table>
+				<thead>
+					<tr>
+						<th>Option</th>
+						<th>Default</th>
+						<th>Effect</th>
+					</tr>
+				</thead>
+				<tbody>
+					<tr>
+						<td>
+							<code>mvcc</code>
+						</td>
+						<td>
+							<code>true</code>
+						</td>
+						<td>
+							Snapshot isolation and concurrent write transactions.{" "}
+							<code>false</code> is deprecated
+						</td>
+					</tr>
+					<tr>
+						<td>
+							<code>mvccGcIntervalMs</code>
+						</td>
+						<td>5000</td>
+						<td>Milliseconds between background GC runs</td>
+					</tr>
+					<tr>
+						<td>
+							<code>mvccRetentionMs</code>
+						</td>
+						<td>0</td>
+						<td>
+							How long to keep version history beyond what open transactions
+							need
+						</td>
+					</tr>
+					<tr>
+						<td>
+							<code>mvccMaxChainDepth</code>
+						</td>
+						<td>10</td>
+						<td>Version chain depth that GC truncates to</td>
+					</tr>
+				</tbody>
+			</table>
 
 			<h2 id="transaction-api">Transaction API</h2>
 

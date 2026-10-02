@@ -85,6 +85,12 @@ Opens or creates a database with the given schema.
   - `readOnly?: boolean` - Open in read-only mode
   - `createIfMissing?: boolean` - Create if doesn't exist (default: true)
   - `lockFile?: boolean` - Use file locking (default: true)
+  - `mvcc?: boolean` - Snapshot-isolated transactions and concurrent write transactions with
+    conflict detection at commit (default: true; `false` is deprecated and will be removed)
+  - `mvccGcIntervalMs?: number` - Milliseconds between version-history cleanups (default: 5000)
+  - `mvccRetentionMs?: number` - How long to keep version history beyond what open
+    transactions need (default: 0)
+  - `mvccMaxChainDepth?: number` - Version chain depth that cleanup truncates to (default: 10)
 
 **Example:**
 
@@ -402,6 +408,12 @@ const result = await db.transaction(async (ctx) => {
   return { alice, bob };
 });
 ```
+
+Transactions are snapshot-isolated (MVCC, on by default): a transaction reads the state as
+of its start plus its own writes. A commit that overlaps a write committed since the
+transaction began throws an `Error` whose message reads
+`Failed to commit: Transaction <id> conflict on keys: [...]`; nothing was applied, so run
+the transaction again.
 
 ### Batch Operations
 

@@ -59,7 +59,8 @@ export const docsStructure: DocSection[] = [
 			},
 			{
 				title: "Transactions",
-				description: "ACID transactions and isolation levels",
+				description:
+					"Atomic writes, snapshot isolation, conflicts, and bulk load",
 				slug: "guides/transactions",
 			},
 			{
@@ -69,7 +70,7 @@ export const docsStructure: DocSection[] = [
 			},
 			{
 				title: "Concurrency",
-				description: "Multi-threaded access and parallel reads",
+				description: "Parallel readers, concurrent writers, and MVCC",
 				slug: "guides/concurrency",
 			},
 		],

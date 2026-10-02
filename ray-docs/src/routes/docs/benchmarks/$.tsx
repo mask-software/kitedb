@@ -346,6 +346,11 @@ function GraphPage() {
 					Durability: sync=normal, group commit off, unless a table says
 					otherwise
 				</li>
+				<li>
+					MVCC: off. These runs predate MVCC as the default (0.3.0);{" "}
+					<code>single_file_raw_bench</code> now runs with it unless you pass{" "}
+					<code>--no-mvcc</code>
+				</li>
 			</ul>
 
 			<h2 id="rust-core">Rust core</h2>
@@ -446,9 +451,10 @@ function GraphPage() {
 			</p>
 			<p>
 				These runs used concurrent write transactions without MVCC, which
-				releases up to v0.2.18 allowed. Non-MVCC mode now runs one write
-				transaction at a time; concurrent writers need <code>mvcc: true</code>,
-				and these numbers are pending a re-run with it.
+				releases up to v0.2.18 allowed. Since then, non-MVCC mode runs one write
+				transaction at a time and is deprecated; MVCC, the default since 0.3.0,
+				runs write transactions concurrently. These numbers are pending a re-run
+				with MVCC.
 			</p>
 
 			<h3 id="parallel-vectors">Thread-count sweeps</h3>
