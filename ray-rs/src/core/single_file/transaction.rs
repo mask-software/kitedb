@@ -458,9 +458,20 @@ impl SingleFileDB {
   /// checkpoint holds the WAL in a full secondary region, and compacting a
   /// retained WAL that fills it. Callers hold no lock that checkpoint needs.
   fn write_wal_waiting(&self, record: &WalRecord) -> Result<()> {
+    self.write_wal_waiting_then(record, || {})
+  }
+
+  /// `write_wal_waiting`, running `then` under the WAL lock right after the
+  /// record is written.
+  fn write_wal_waiting_then(&self, record: &WalRecord, then: impl Fn()) -> Result<()> {
     loop {
-      match self.try_write_wal(|wal, pager| wal.write_record(record, pager))? {
-        WalWrite::Written(_) => return Ok(()),
+      let written = self.try_write_wal(|wal, pager| {
+        wal.write_record(record, pager)?;
+        then();
+        Ok(())
+      })?;
+      match written {
+        WalWrite::Written(()) => return Ok(()),
         WalWrite::BlockedOn(cut) => self.wait_for_cut_release(cut)?,
         WalWrite::NeedsCompaction => self.compact_retired_wal()?,
       }
@@ -748,8 +759,9 @@ impl SingleFileDB {
         staged_schema,
       )
     };
-    // Dropped last: the transaction counts as open (a background cut copies
-    // its records) until its COMMIT record is written or never will be.
+    // Dropped last: the transaction counts as active (blocking checkpoints
+    // wait for it) until its commit is settled. For background cuts it stops
+    // counting as open once its COMMIT is durable (`publish_commit`).
     let _active_transaction_guard = ActiveTransactionGuard {
       db: self,
       txid,
@@ -1120,6 +1132,14 @@ impl SingleFileDB {
     } = request;
     let on_committer_thread = committer == std::thread::current().id();
 
+    // A background cut (which takes the commit lock) no longer counts it as
+    // open: its records end with a durable COMMIT. Its committer may only
+    // learn that later (a group-commit follower wakes after the batch is
+    // delivered), and a cut taken meanwhile would skip its records, its
+    // install drop them, and the next cut find an open transaction with no
+    // BEGIN record and decline.
+    self.open_write_txids.lock().remove(&txid);
+
     // This is the schema visibility point, right after the durable commit
     // boundary. Publishing before any fallible post-commit work keeps a
     // later error from leaving a committed WAL definition hidden in this
@@ -1281,9 +1301,13 @@ impl SingleFileDB {
     }
 
     if !bulk_load {
-      // Write ROLLBACK record to WAL
+      // Write the ROLLBACK record, and stop counting the transaction as open
+      // under the same WAL lock, which a background cut holds while it reads
+      // the open set (see `publish_commit` for COMMIT records).
       let record = WalRecord::new(WalRecordType::Rollback, txid, build_rollback_payload());
-      self.write_wal_waiting(&record)?;
+      self.write_wal_waiting_then(&record, || {
+        self.open_write_txids.lock().remove(&txid);
+      })?;
     }
 
     Ok(())
