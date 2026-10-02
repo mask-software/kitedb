@@ -486,7 +486,7 @@ impl WalBuffer {
 
   /// [`Self::compact_secondary_into_primary`], reusing `read`: the secondary
   /// region's first records exactly as they lie there now, as
-  /// [`Self::scan_region_bytes_from`] returned them during the cut whose
+  /// [`RegionBytes::parse`] returned them during the cut whose
   /// records these are (the region only grows while a cut lasts, and keeps
   /// its records when the install retires the primary region). Only the
   /// records after them are read and checked here, so a caller holding a
@@ -795,28 +795,25 @@ impl WalBuffer {
     from: u64,
     pager: &mut FilePager,
   ) -> Result<(Vec<ParsedWalRecord>, u64)> {
-    self
-      .scan_region_bytes_from(region, from, pager)
-      .map(|(records, _, end)| (records, end))
+    let (records, _, end) = self.read_region_from(region, from, pager)?.parse();
+    Ok((records, end))
   }
 
-  /// [`Self::scan_region_from`], also returning the bytes of the records
-  /// read, as they lie in the region (salted with its salt).
-  pub fn scan_region_bytes_from(
-    &mut self,
+  /// The bytes [`Self::scan_region_from`] parses, read with one positioned
+  /// read but not parsed, so a caller can parse them
+  /// ([`RegionBytes::parse`]) after releasing the locks writers need.
+  pub fn read_region_from(
+    &self,
     region: u8,
     from: u64,
     pager: &mut FilePager,
-  ) -> Result<(Vec<ParsedWalRecord>, Vec<u8>, u64)> {
-    let (start, mut bytes) = self.region_bytes(region, from, pager)?;
-    let mut records = Vec::new();
-    let mut end = 0;
-    for (record_type, frame) in wal_frames(&bytes, self.region_salt(region)) {
-      records.push(frame.parse(record_type, &bytes));
-      end = frame.end;
-    }
-    bytes.truncate(end);
-    Ok((records, bytes, start + end as u64))
+  ) -> Result<RegionBytes> {
+    let (start, bytes) = self.region_bytes(region, from, pager)?;
+    Ok(RegionBytes {
+      start,
+      bytes,
+      salt: self.region_salt(region),
+    })
   }
 
   /// Where the records that parse in `region` end (relative to the WAL
@@ -1347,6 +1344,32 @@ impl PendingWrites {
       last_page = Some(last);
     }
     pages
+  }
+}
+
+/// Bytes of a WAL region as [`WalBuffer::read_region_from`] read them.
+#[derive(Debug)]
+pub struct RegionBytes {
+  /// Where they start, relative to the WAL start.
+  start: u64,
+  bytes: Vec<u8>,
+  /// The region's salt when they were read.
+  salt: u32,
+}
+
+impl RegionBytes {
+  /// The records that parse, up to the first that does not; their bytes as
+  /// they lie in the region (salted); and where they end, relative to the
+  /// WAL start.
+  pub fn parse(mut self) -> (Vec<ParsedWalRecord>, Vec<u8>, u64) {
+    let mut records = Vec::new();
+    let mut end = 0;
+    for (record_type, frame) in wal_frames(&self.bytes, self.salt) {
+      records.push(frame.parse(record_type, &self.bytes));
+      end = frame.end;
+    }
+    self.bytes.truncate(end);
+    (records, self.bytes, self.start + end as u64)
   }
 }
 

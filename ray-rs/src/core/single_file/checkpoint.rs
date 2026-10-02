@@ -1241,12 +1241,16 @@ impl SingleFileDB {
 
   /// Flush the WAL and read the post-cut records (in the secondary region)
   /// from offset `from` on; also their bytes as they lie there, and where
-  /// they end, to read on from.
+  /// they end, to read on from. The pager and WAL locks, which every commit
+  /// takes, are held for the read only, not while the records are parsed.
   fn scan_post_cut_records(&self, from: u64) -> Result<(Vec<ParsedWalRecord>, Vec<u8>, u64)> {
-    let mut pager = self.pager.lock();
-    let mut wal_buffer = self.wal_buffer.lock();
-    wal_buffer.flush(&mut pager)?;
-    wal_buffer.scan_region_bytes_from(1, from, &mut pager)
+    let read = {
+      let mut pager = self.pager.lock();
+      let mut wal_buffer = self.wal_buffer.lock();
+      wal_buffer.flush(&mut pager)?;
+      wal_buffer.read_region_from(1, from, &mut pager)?
+    };
+    Ok(read.parse())
   }
 
   /// Replay the transactions that commit in `records` (the post-cut records

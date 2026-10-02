@@ -376,8 +376,9 @@ fn f5_move_back_reads_only_records_appended_since_the_replay() {
   }
   wal.flush(&mut pager).expect("flush");
   let (records, read, _) = wal
-    .scan_region_bytes_from(1, 0, &mut pager)
-    .expect("replay scan");
+    .read_region_from(1, 0, &mut pager)
+    .expect("replay scan")
+    .parse();
   assert_eq!(records.len(), 20);
   for txid in 30..=33 {
     wal
