@@ -1958,7 +1958,7 @@ export interface VectorIndexOptions {
   ivf?: JsIvfConfig
   /** Minimum training vectors before index training (default: 1000) */
   trainingThreshold?: number
-  /** Maximum node IDs to cache for search results (0 disables this cache) */
+  /** @deprecated No effect: `VectorIndex` keeps no node cache. Still accepted so existing callers keep working. */
   cacheMaxSize?: number
 }
 
