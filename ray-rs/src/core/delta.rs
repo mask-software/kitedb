@@ -1176,4 +1176,56 @@ mod tests {
     );
     assert_eq!(delta.created_nodes.len(), 40_000);
   }
+
+  /// The bytes of table entries a delta holds.
+  fn entry_bytes(delta: &DeltaState) -> usize {
+    let lens = [
+      delta.created_nodes.len(),
+      delta.deleted_nodes.len(),
+      delta.modified_nodes.len(),
+      delta.out_add.len(),
+      delta.out_del.len(),
+      delta.in_add.len(),
+      delta.in_del.len(),
+      delta.edge_props.len(),
+      delta.key_index.len(),
+    ];
+    tables(delta)
+      .iter()
+      .zip(lens)
+      .map(|((_, bytes), len)| bytes * len)
+      .sum()
+  }
+
+  /// Growing a delta's tables moves their entries (under the delta write lock): a delta that
+  /// grows 1000 nodes a merge must have moved, in all, at most 1.75 times the bytes of the
+  /// entries it holds, at every size past 20K nodes. Grown tables grow four times larger, so
+  /// that holds right after a growth. Regression: each doubled, which moved up to 2.3 times
+  /// over (a third of what merging a 200-node transaction cost).
+  #[test]
+  fn merges_move_table_entries_less_than_twice_over() {
+    let mut delta = DeltaState::new();
+    let (mut moved, mut worst) = (0, (0.0, 0));
+    for batch in 0..200 {
+      let mut pending = created_batch(1 + batch * 1000, 1000);
+      let before = tables(&delta);
+      delta.merge_from(&mut pending);
+      moved += before
+        .iter()
+        .zip(tables(&delta))
+        .filter(|((before, _), (after, _))| before != after)
+        .map(|((capacity, bytes), _)| capacity * bytes)
+        .sum::<usize>();
+      let ratio = moved as f64 / entry_bytes(&delta) as f64;
+      if batch >= 20 && ratio > worst.0 {
+        worst = (ratio, batch);
+      }
+    }
+    assert!(
+      worst.0 <= 1.75,
+      "growing the tables had moved {:.2} times the bytes they held after merge {}",
+      worst.0,
+      worst.1
+    );
+  }
 }
