@@ -107,7 +107,7 @@ src/
 └── util/                 # Utilities
     ├── binary.ts         # Binary encoding/decoding helpers
     ├── compression.ts    # zstd/gzip/deflate compression
-    ├── crc.ts            # CRC32C checksums
+    ├── crc.ts            # CRC-32 (IEEE) checksums
     ├── hash.ts           # xxHash64 for key hashing
     ├── lock.ts           # File locking
     ├── lru.ts            # LRU cache implementation
@@ -305,7 +305,7 @@ reserved (u16)      - Padding
 txid (u64)          - Transaction ID
 payloadLen (u32)    - Payload length
 payload[...]        - Variable-length payload
-crc32c (u32)        - Checksum of type..payload, XORed with the region's salt
+crc32 (u32)         - CRC-32 (IEEE) of type..payload, XORed with the region's salt
 padding             - Align to 8 bytes
 ```
 

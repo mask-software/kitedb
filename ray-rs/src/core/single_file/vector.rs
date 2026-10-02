@@ -751,7 +751,7 @@ mod tests {
     PropValue, SectionId, SnapshotFlags, SECTION_ENTRY_SIZE, SNAPSHOT_HEADER_SIZE,
   };
   use crate::util::binary::{read_u64, write_u32, write_u64};
-  use crate::util::crc::crc32c;
+  use crate::util::crc::crc32;
   use crate::vector::distance::normalize;
   use crate::vector::store::{create_vector_store, vector_store_has, vector_store_insert};
   use crate::vector::types::VectorStoreConfig;
@@ -1012,7 +1012,7 @@ mod tests {
     write_u32(&mut buffer, entry_offset + 16, 0);
     write_u32(&mut buffer, entry_offset + 20, 1);
     let crc_offset = buffer.len() - 4;
-    let crc = crc32c(&buffer[..crc_offset]);
+    let crc = crc32(&buffer[..crc_offset]);
     write_u32(&mut buffer, crc_offset, crc);
 
     let mut tmp = NamedTempFile::new().expect("expected value");

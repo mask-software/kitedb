@@ -7,7 +7,7 @@ use crate::core::pager::FilePager;
 use crate::error::{KiteError, Result};
 use crate::types::{DbHeaderV1, DB_HEADER_FIXED_SIZE};
 use crate::util::binary::*;
-use crate::util::crc::crc32c;
+use crate::util::crc::crc32;
 
 /// Two physical header pages. A new header is written to the inactive page,
 /// synced, and selected by generation during the next open.
@@ -64,7 +64,7 @@ impl DbHeaderV1 {
 
     // Verify the fixed-field checksum before accepting any header state.
     let header_crc = read_u32(data, HEADER_CRC_OFFSET);
-    let computed_header_crc = crc32c(&data[..HEADER_CRC_OFFSET]);
+    let computed_header_crc = crc32(&data[..HEADER_CRC_OFFSET]);
     if header_crc != computed_header_crc {
       return Err(KiteError::CrcMismatch {
         stored: header_crc,
@@ -75,7 +75,7 @@ impl DbHeaderV1 {
     // Verify the page footer as well. It protects the reserved part of the
     // header page, which is outside the fixed-field checksum.
     let footer_crc = read_u32(data, page_size - 4);
-    let computed_footer_crc = crc32c(&data[..page_size - 4]);
+    let computed_footer_crc = crc32(&data[..page_size - 4]);
     if footer_crc != computed_footer_crc {
       return Err(KiteError::CrcMismatch {
         stored: footer_crc,
@@ -198,10 +198,10 @@ impl DbHeaderV1 {
     write_u32(&mut buf, 168, self.wal_secondary_salt);
     // 172..176 reserved
 
-    let header_crc = crc32c(&buf[..HEADER_CRC_OFFSET]);
+    let header_crc = crc32(&buf[..HEADER_CRC_OFFSET]);
     write_u32(&mut buf, HEADER_CRC_OFFSET, header_crc);
 
-    let footer_crc = crc32c(&buf[..page_size - 4]);
+    let footer_crc = crc32(&buf[..page_size - 4]);
     write_u32(&mut buf, page_size - 4, footer_crc);
     buf
   }

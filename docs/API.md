@@ -558,13 +558,13 @@ mydb.kitedb
 - Separate in-edge and out-edge indexes
 - String table for interned strings
 - Key index for fast lookups
-- CRC32C integrity check
+- CRC-32 (IEEE) integrity check
 
 ### WAL Format (`.gdw`)
 
 - Magic: `GDW1`
 - 8-byte aligned records
-- CRC32C per record
+- CRC-32 (IEEE) per record
 - Transaction boundaries
 
 ## Getting Started
