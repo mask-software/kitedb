@@ -99,12 +99,18 @@ src/
 │   ├── visibility.ts     # Snapshot isolation visibility rules
 │   ├── conflict-detector.ts  # Write-write conflict detection
 │   └── gc.ts             # Garbage collection of old versions
+├── cache/                # Caching layer
+│   ├── index.ts          # CacheManager
+│   ├── property-cache.ts
+│   ├── traversal-cache.ts
+│   └── query-cache.ts
 └── util/                 # Utilities
     ├── binary.ts         # Binary encoding/decoding helpers
     ├── compression.ts    # zstd/gzip/deflate compression
     ├── crc.ts            # CRC-32 (IEEE) checksums
     ├── hash.ts           # xxHash64 for key hashing
     ├── lock.ts           # File locking
+    ├── lru.ts            # LRU cache implementation
     └── heap.ts           # Min-heap for pathfinding
 ```
 
@@ -164,7 +170,7 @@ type PropValue =
 
 ## CSR Format
 
-See [CSR.md](./CSR.md) for a detailed explanation.
+See [CSR.md](../CSR.md) for a detailed explanation.
 
 The snapshot uses CSR (Compressed Sparse Row) format for efficient edge traversal. For `N` nodes and `E` edges:
 
@@ -446,6 +452,7 @@ interface TxState {
    - Single-file: Append to linear WAL buffer, update header
 4. **Apply to delta**: Merge transaction state into global delta
 5. **Create version chains**: If MVCC enabled and there are active readers
+6. **Invalidate caches**: Clear affected nodes/edges from cache
 
 ### Non-MVCC Mode
 

@@ -7,7 +7,7 @@
 import { useEffect, useRef, useCallback } from "react";
 import type { MutableRefObject } from "react";
 import cytoscape from "cytoscape";
-import type { Core, ElementDefinition, NodeSingular, EventObject } from "cytoscape";
+import type { Core, ElementDefinition, NodeSingular, EventObject, Layouts } from "cytoscape";
 import fcose from "cytoscape-fcose";
 import type { VisNode, VisEdge, ToolMode } from "../lib/types.ts";
 import { cytoscapeStylesheet, fcoseLayoutOptions, CYTOSCAPE_COLORS } from "../lib/cytoscape-theme.ts";
@@ -105,8 +105,9 @@ export function useCytoscape(options: UseCytoscapeOptions): CytoscapeHandle {
   const cyRef = useRef<Core | null>(null);
   const prevNodesRef = useRef<string>("");
   const prevEdgesRef = useRef<string>("");
-  const layoutRunningRef = useRef(false);
-  
+  // The layout still running, if any. It only positions the elements it started with.
+  const layoutRef = useRef<Layouts | null>(null);
+
   // Store callbacks in refs to avoid re-binding
   const onNodeClickRef = useRef(onNodeClick);
   const onNodeHoverRef = useRef(onNodeHover);
@@ -117,6 +118,22 @@ export function useCytoscape(options: UseCytoscapeOptions): CytoscapeHandle {
     onNodeHoverRef.current = onNodeHover;
     onZoomChangeRef.current = onZoomChange;
   }, [onNodeClick, onNodeHover, onZoomChange]);
+
+  // Lay out the current elements, replacing any layout still running
+  const runLayout = useCallback(() => {
+    const cy = cyRef.current;
+    if (!cy) return;
+
+    layoutRef.current?.stop();
+    const layout = cy.layout(fcoseLayoutOptions);
+    layoutRef.current = layout;
+    layout.one("layoutstop", () => {
+      if (layoutRef.current === layout) {
+        layoutRef.current = null;
+      }
+    });
+    layout.run();
+  }, []);
 
   // Initialize Cytoscape instance
   useEffect(() => {
@@ -215,6 +232,9 @@ export function useCytoscape(options: UseCytoscapeOptions): CytoscapeHandle {
     // Convert and add elements
     const elements = convertToElements(nodes, edges);
 
+    // A running layout only knows the old elements; stop it before they go
+    layoutRef.current?.stop();
+
     // Batch update
     cy.batch(() => {
       cy.elements().remove();
@@ -222,15 +242,10 @@ export function useCytoscape(options: UseCytoscapeOptions): CytoscapeHandle {
     });
 
     // Run layout if we have nodes
-    if (nodes.length > 0 && !layoutRunningRef.current) {
-      layoutRunningRef.current = true;
-      const layout = cy.layout(fcoseLayoutOptions);
-      layout.on("layoutstop", () => {
-        layoutRunningRef.current = false;
-      });
-      layout.run();
+    if (nodes.length > 0) {
+      runLayout();
     }
-  }, [nodes, edges]);
+  }, [nodes, edges, runLayout]);
 
   // Update grabability based on tool mode
   useEffect(() => {
@@ -411,18 +426,6 @@ export function useCytoscape(options: UseCytoscapeOptions): CytoscapeHandle {
   const getZoom = useCallback(() => {
     const cy = cyRef.current;
     return cy ? cy.zoom() : 1;
-  }, []);
-
-  const runLayout = useCallback(() => {
-    const cy = cyRef.current;
-    if (cy && !layoutRunningRef.current) {
-      layoutRunningRef.current = true;
-      const layout = cy.layout(fcoseLayoutOptions);
-      layout.on("layoutstop", () => {
-        layoutRunningRef.current = false;
-      });
-      layout.run();
-    }
   }, []);
 
   return {

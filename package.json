@@ -1,7 +1,7 @@
 {
-	"name": "raydb",
+	"name": "kitedb-monorepo",
 	"private": true,
-	"description": "RayDB monorepo",
+	"description": "KiteDB monorepo",
 	"workspaces": ["ray-rs"],
 	"scripts": {
 		"build": "npm run build --prefix ray-rs",
