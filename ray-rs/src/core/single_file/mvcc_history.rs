@@ -758,3 +758,9 @@ mod recorder_tests {
     assert_eq!(vc.edge_exists_at(N, T, M, OLD, READER), Some(true));
   }
 }
+
+/// raydb-b4 `publish-cost` lane: history for created nodes, and readers
+/// against a reference model.
+#[cfg(test)]
+#[path = "b4_publish_cost_tests.rs"]
+mod b4_publish_cost_tests;
