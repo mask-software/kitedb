@@ -1164,6 +1164,8 @@ fn open_single_file_internal(
     group_commit_enabled: options.group_commit_enabled,
     primary_replication,
     replica_replication,
+    #[cfg(test)]
+    commits_waiting: AtomicUsize::new(0),
     #[cfg(feature = "bench-profile")]
     commit_lock_wait_ns: AtomicU64::new(0),
     #[cfg(feature = "bench-profile")]

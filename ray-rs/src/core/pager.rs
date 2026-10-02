@@ -163,6 +163,7 @@ fn read_full_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<
 
 /// Write all of `data` at file `offset`, writing again after a short write.
 fn write_all_at(file: &File, all: &[u8], start: u64) -> std::io::Result<()> {
+  io_hooks::before_write()?;
   let (mut data, mut offset) = (all, start);
   while !data.is_empty() {
     io_hooks::syscall();

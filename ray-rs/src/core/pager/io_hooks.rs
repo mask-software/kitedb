@@ -44,6 +44,7 @@ thread_local! {
   static BEFORE_CREATE_LOCK: RefCell<Option<CreateHook>> = const { RefCell::new(None) };
   static IO_LOG: RefCell<Option<Vec<IoEvent>>> = const { RefCell::new(None) };
   static SYNC_FAULTS: Cell<usize> = const { Cell::new(0) };
+  static WRITE_FAULTS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// The thread whose [`record_io_during`] log starts over at its next event
@@ -129,6 +130,23 @@ pub(super) fn wrote(offset: u64, data: &[u8]) {
     data: data.to_vec(),
   });
   let _ = (offset, data);
+}
+
+/// Called before a write reaches the OS: fails it if a test armed a fault.
+#[inline]
+pub(super) fn before_write() -> std::io::Result<()> {
+  #[cfg(test)]
+  {
+    let fail = WRITE_FAULTS.with(|faults| {
+      let armed = faults.get();
+      faults.set(armed.saturating_sub(1));
+      armed > 0
+    });
+    if fail {
+      return Err(std::io::Error::other("injected write failure"));
+    }
+  }
+  Ok(())
 }
 
 /// Called before a sync reaches the OS: fails it if a test armed a fault.
@@ -257,4 +275,48 @@ pub(crate) fn with_failing_syncs<R>(count: usize, run: impl FnOnce() -> R) -> R 
   SYNC_FAULTS.with(|faults| faults.set(count));
   let _disarm = Disarm;
   run()
+}
+
+/// Run `run` with the next `count` pager writes on this thread failing.
+#[cfg(test)]
+pub(crate) fn with_failing_writes<R>(count: usize, run: impl FnOnce() -> R) -> R {
+  struct Disarm;
+  impl Drop for Disarm {
+    fn drop(&mut self) {
+      WRITE_FAULTS.with(|faults| faults.set(0));
+    }
+  }
+
+  WRITE_FAULTS.with(|faults| faults.set(count));
+  let _disarm = Disarm;
+  run()
+}
+
+/// The disk after an OS crash at the end of `events`, from `base` (the file
+/// when recording started): every write before the last successful sync
+/// landed; after it, header pages (the first `header_end` bytes) kept their
+/// last write and other pages their first. Without a sync in between the OS
+/// may do just that: write a WAL page back early, then lose the page's next
+/// write while the header write lands.
+#[cfg(test)]
+pub(crate) fn crash_image(base: &[u8], events: &[IoEvent], header_end: u64) -> Vec<u8> {
+  let last_sync = events
+    .iter()
+    .rposition(|event| matches!(event, IoEvent::Sync { ok: true }));
+  let mut image = base.to_vec();
+  let mut written_since_sync = std::collections::HashSet::new();
+  for (index, event) in events.iter().enumerate() {
+    let IoEvent::Write { offset, data } = event else {
+      continue;
+    };
+    let durable = last_sync.is_some_and(|sync| index < sync);
+    if durable || *offset < header_end || written_since_sync.insert(*offset) {
+      let (start, end) = (*offset as usize, *offset as usize + data.len());
+      if image.len() < end {
+        image.resize(end, 0);
+      }
+      image[start..end].copy_from_slice(data);
+    }
+  }
+  image
 }

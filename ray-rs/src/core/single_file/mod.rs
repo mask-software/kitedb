@@ -355,6 +355,10 @@ pub struct SingleFileDB {
   /// Replica replication runtime (enabled only when role=replica)
   pub(crate) replica_replication: Option<crate::replication::replica::ReplicaReplication>,
 
+  /// Committers whose commit is handed over and not written yet (test
+  /// instrumentation).
+  #[cfg(test)]
+  pub(crate) commits_waiting: AtomicUsize,
   #[cfg(feature = "bench-profile")]
   pub(crate) commit_lock_wait_ns: AtomicU64,
   #[cfg(feature = "bench-profile")]

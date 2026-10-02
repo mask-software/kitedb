@@ -95,6 +95,21 @@ fn before_merge_test_hook() {
 
 #[cfg(test)]
 thread_local! {
+  /// Run on the thread that writes this thread's next commit to the file
+  /// (its committer, or the leader of its group), right before the write.
+  pub(crate) static DURING_NEXT_COMMIT_IO: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+    std::cell::RefCell::new(None);
+}
+
+fn during_commit_io_test_hook() {
+  #[cfg(test)]
+  if let Some(hook) = DURING_NEXT_COMMIT_IO.with(|hook| hook.borrow_mut().take()) {
+    hook();
+  }
+}
+
+#[cfg(test)]
+thread_local! {
   /// Run on this thread's next commit right after MVCC gives it its commit
   /// timestamp, before its version chains and delta merge.
   static AFTER_NEXT_COMMIT_TIMESTAMP: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
@@ -1033,6 +1048,8 @@ impl SingleFileDB {
       committer: std::thread::current().id(),
     };
 
+    #[cfg(test)]
+    self.commits_waiting.fetch_add(1, Ordering::SeqCst);
     let outcome = if group_commit_active {
       self.commit_in_group(request)
     } else {
@@ -1044,6 +1061,8 @@ impl SingleFileDB {
           CommitOutcome::failed(KiteError::Internal("commit was not written".to_string()))
         })
     };
+    #[cfg(test)]
+    self.commits_waiting.fetch_sub(1, Ordering::SeqCst);
     mvcc_abort.armed = !outcome.durable;
     if outcome.schema_published {
       schema_reservation_guard.disarm();
@@ -1282,6 +1301,7 @@ impl SingleFileDB {
     wal: &mut WalBuffer,
     commits: usize,
   ) -> Result<()> {
+    during_commit_io_test_hook();
     #[cfg(feature = "bench-profile")]
     let flush_start = Instant::now();
     let flushed = match self.sync_mode {
@@ -2103,3 +2123,7 @@ mod b4_mvcc_default_tests;
 #[cfg(test)]
 #[path = "b4_commit_tests.rs"]
 mod b4_tests;
+/// raydb-b4 `write-scaling` lane: the commit queue.
+#[cfg(test)]
+#[path = "b4_write_scaling_tests.rs"]
+mod b4_write_scaling_tests;

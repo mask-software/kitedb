@@ -25,7 +25,6 @@
 //!
 //! Finding 7 (hazardous test-only `WalBuffer` methods) needs no test.
 
-use std::collections::HashSet;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 
@@ -571,32 +570,10 @@ fn f9_drop_after_close_writes_nothing() {
 // x: a failed commit's records after an OS crash
 // ============================================================================
 
-/// The disk after an OS crash at the end of `events`, from `base` (the file
-/// when recording started): every write before the last successful sync
-/// landed; after it, header pages kept their last write and other pages their
-/// first. Without a sync in between the OS may do just that: write a WAL page
-/// back early, then lose the page's next write while the header write lands.
+/// The disk after an OS crash at the end of `events`, from `base` (see
+/// [`io_hooks::crash_image`]).
 fn crash_image(base: &[u8], events: &[IoEvent]) -> Vec<u8> {
-  let header_end = 2 * PAGE_SIZE as u64;
-  let last_sync = events
-    .iter()
-    .rposition(|event| matches!(event, IoEvent::Sync { ok: true }));
-  let mut image = base.to_vec();
-  let mut written_since_sync = HashSet::new();
-  for (index, event) in events.iter().enumerate() {
-    let IoEvent::Write { offset, data } = event else {
-      continue;
-    };
-    let durable = last_sync.is_some_and(|sync| index < sync);
-    if durable || *offset < header_end || written_since_sync.insert(*offset) {
-      let (start, end) = (*offset as usize, *offset as usize + data.len());
-      if image.len() < end {
-        image.resize(end, 0);
-      }
-      image[start..end].copy_from_slice(data);
-    }
-  }
-  image
+  io_hooks::crash_image(base, events, 2 * PAGE_SIZE as u64)
 }
 
 /// Commit `base`; then `failed-a`, whose header write fails (an in-memory
