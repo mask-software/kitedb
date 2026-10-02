@@ -188,7 +188,6 @@ impl VectorIndexOptions {
 }
 
 /// Options for similarity search
-/// Options for similarity search
 pub struct SimilarOptions {
   /// Number of results to return
   pub k: usize,
@@ -198,6 +197,13 @@ pub struct SimilarOptions {
   pub n_probe: Option<usize>,
   /// Optional filter function to exclude results
   pub filter: Option<std::sync::Arc<dyn Fn(NodeId) -> bool + Send + Sync>>,
+  /// IVF-PQ exact re-rank over-fetch factor: the PQ scan keeps
+  /// `max(k * factor, 80)` candidates and ranks them by exact distance.
+  /// Default [`DEFAULT_RERANK_FACTOR`](crate::vector::DEFAULT_RERANK_FACTOR);
+  /// 0 returns the approximate PQ ranking and distances. Plain IVF and brute
+  /// force are exact already and ignore it. See
+  /// [`IvfPqSearchOptions::rerank_factor`].
+  pub rerank_factor: Option<usize>,
 }
 
 impl std::fmt::Debug for SimilarOptions {
@@ -207,6 +213,7 @@ impl std::fmt::Debug for SimilarOptions {
       .field("threshold", &self.threshold)
       .field("n_probe", &self.n_probe)
       .field("filter", &self.filter.is_some())
+      .field("rerank_factor", &self.rerank_factor)
       .finish()
   }
 }
@@ -219,7 +226,14 @@ impl SimilarOptions {
       threshold: None,
       n_probe: None,
       filter: None,
+      rerank_factor: None,
     }
+  }
+
+  /// Set the IVF-PQ exact re-rank over-fetch factor (0 disables the re-rank)
+  pub fn with_rerank_factor(mut self, rerank_factor: usize) -> Self {
+    self.rerank_factor = Some(rerank_factor);
+    self
   }
 
   /// Set the similarity threshold
@@ -633,6 +647,7 @@ impl VectorIndex {
       threshold,
       n_probe,
       filter,
+      rerank_factor,
     } = options;
 
     let n_probe = n_probe.unwrap_or(self.options.n_probe);
@@ -663,6 +678,7 @@ impl VectorIndex {
               n_probe: Some(n_probe),
               filter: filter_box,
               threshold,
+              rerank_factor,
             };
             ivf_pq_index
               .search(&self.manifest, query, k, Some(search_opts))
@@ -975,6 +991,8 @@ mod tests {
     assert_eq!(opts.k, 10);
     assert_eq!(opts.threshold, Some(0.8));
     assert_eq!(opts.n_probe, Some(5));
+    assert_eq!(opts.rerank_factor, None);
+    assert_eq!(opts.with_rerank_factor(0).rerank_factor, Some(0));
   }
 
   #[test]

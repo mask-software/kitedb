@@ -698,6 +698,18 @@ impl<'a> FragmentLookup<'a> {
       config.dimensions,
     )
   }
+
+  /// Live vector data for `vector_id` in `manifest` (the manifest this
+  /// lookup was built from), or None if it has no live vector under that id.
+  #[inline]
+  pub(crate) fn vector_by_id(
+    &self,
+    manifest: &VectorManifest,
+    vector_id: u64,
+  ) -> Option<&'a [f32]> {
+    let location = manifest.vector_locations.get(&vector_id)?;
+    self.vector(&manifest.config, location)
+  }
 }
 
 // ============================================================================

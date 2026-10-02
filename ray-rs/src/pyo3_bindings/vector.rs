@@ -11,8 +11,9 @@ use crate::pyo3_bindings::validation;
 use crate::vector::distance::{l2_norm, normalize_in_place};
 use crate::vector::{
   DistanceMetric as RustDistanceMetric, IvfConfig as RustIvfConfig, IvfIndex as RustIvfIndex,
-  IvfPqConfig as RustIvfPqConfig, IvfPqIndex as RustIvfPqIndex, MultiQueryAggregation,
-  PqConfig as RustPqConfig, SearchOptions as RustSearchOptions, VectorManifest, VectorSearchResult,
+  IvfPqConfig as RustIvfPqConfig, IvfPqIndex as RustIvfPqIndex,
+  IvfPqSearchOptions as RustIvfPqSearchOptions, MultiQueryAggregation, PqConfig as RustPqConfig,
+  SearchOptions as RustSearchOptions, VectorManifest, VectorSearchResult,
 };
 
 // ============================================================================
@@ -242,24 +243,67 @@ pub struct PySearchOptions {
   /// Minimum similarity threshold (0-1)
   #[pyo3(get, set)]
   pub threshold: Option<f64>,
+  /// IVF-PQ only: re-rank the best `max(k * rerank_factor, 80)` PQ
+  /// candidates by exact distance (default 4; 0 returns the approximate PQ
+  /// ranking and distances). IVF search is exact and ignores it.
+  #[pyo3(get, set)]
+  pub rerank_factor: Option<i32>,
+}
+
+/// Validated `PySearchOptions`.
+struct SearchParams {
+  n_probe: Option<usize>,
+  threshold: Option<f32>,
+  rerank_factor: Option<usize>,
+}
+
+impl SearchParams {
+  fn ivf(self) -> RustSearchOptions {
+    RustSearchOptions {
+      n_probe: self.n_probe,
+      filter: None,
+      threshold: self.threshold,
+    }
+  }
+
+  fn ivf_pq(self) -> RustIvfPqSearchOptions {
+    RustIvfPqSearchOptions {
+      n_probe: self.n_probe,
+      filter: None,
+      threshold: self.threshold,
+      rerank_factor: self.rerank_factor,
+    }
+  }
 }
 
 #[pymethods]
 impl PySearchOptions {
   #[new]
-  #[pyo3(signature = (n_probe=None, threshold=None))]
-  fn new(n_probe: Option<i32>, threshold: Option<f64>) -> Self {
-    Self { n_probe, threshold }
+  #[pyo3(signature = (n_probe=None, threshold=None, rerank_factor=None))]
+  fn new(n_probe: Option<i32>, threshold: Option<f64>, rerank_factor: Option<i32>) -> Self {
+    Self {
+      n_probe,
+      threshold,
+      rerank_factor,
+    }
   }
 
   fn __repr__(&self) -> String {
     format!(
-      "SearchOptions(n_probe={:?}, threshold={:?})",
-      self.n_probe, self.threshold
+      "SearchOptions(n_probe={:?}, threshold={:?}, rerank_factor={:?})",
+      self.n_probe, self.threshold, self.rerank_factor
     )
   }
 
+  /// The validated `(n_probe, threshold)`.
   fn validated(&self) -> PyResult<(Option<usize>, Option<f32>)> {
+    let params = self.params()?;
+    Ok((params.n_probe, params.threshold))
+  }
+}
+
+impl PySearchOptions {
+  fn params(&self) -> PyResult<SearchParams> {
     let n_probe = self
       .n_probe
       .map(|n| validation::positive_usize("n_probe", n as i64, validation::MAX_VECTOR_PARAM))
@@ -268,7 +312,17 @@ impl PySearchOptions {
       .threshold
       .map(|value| validation::ratio("threshold", value).map(|value| value as f32))
       .transpose()?;
-    Ok((n_probe, threshold))
+    let rerank_factor = self
+      .rerank_factor
+      .map(|factor| {
+        validation::non_negative_usize("rerank_factor", factor as i64, validation::MAX_VECTOR_PARAM)
+      })
+      .transpose()?;
+    Ok(SearchParams {
+      n_probe,
+      threshold,
+      rerank_factor,
+    })
   }
 }
 
@@ -490,13 +544,9 @@ impl PyIvfIndex {
 
     let rust_options = options
       .as_ref()
-      .map(PySearchOptions::validated)
+      .map(PySearchOptions::params)
       .transpose()?
-      .map(|(n_probe, threshold)| RustSearchOptions {
-        n_probe,
-        filter: None,
-        threshold,
-      });
+      .map(SearchParams::ivf);
 
     let k = validation::non_negative_usize("k", k as i64, validation::MAX_COUNT)?;
     let results = index
@@ -535,13 +585,9 @@ impl PyIvfIndex {
 
     let rust_options = options
       .as_ref()
-      .map(PySearchOptions::validated)
+      .map(PySearchOptions::params)
       .transpose()?
-      .map(|(n_probe, threshold)| RustSearchOptions {
-        n_probe,
-        filter: None,
-        threshold,
-      });
+      .map(SearchParams::ivf);
 
     let k = validation::non_negative_usize("k", k as i64, validation::MAX_COUNT)?;
     let results = index
@@ -750,15 +796,9 @@ impl PyIvfPqIndex {
 
     let rust_options = options
       .as_ref()
-      .map(PySearchOptions::validated)
+      .map(PySearchOptions::params)
       .transpose()?
-      .map(
-        |(n_probe, threshold)| crate::vector::ivf_pq::IvfPqSearchOptions {
-          n_probe,
-          filter: None,
-          threshold,
-        },
-      );
+      .map(SearchParams::ivf_pq);
 
     let k = validation::non_negative_usize("k", k as i64, validation::MAX_COUNT)?;
     let results = index
@@ -797,15 +837,9 @@ impl PyIvfPqIndex {
 
     let rust_options = options
       .as_ref()
-      .map(PySearchOptions::validated)
+      .map(PySearchOptions::params)
       .transpose()?
-      .map(
-        |(n_probe, threshold)| crate::vector::ivf_pq::IvfPqSearchOptions {
-          n_probe,
-          filter: None,
-          threshold,
-        },
-      );
+      .map(SearchParams::ivf_pq);
 
     let k = validation::non_negative_usize("k", k as i64, validation::MAX_COUNT)?;
     let results = index

@@ -387,11 +387,7 @@ impl IvfIndex {
           continue;
         }
       }
-      let Some(vector) = manifest
-        .vector_locations
-        .get(&vector_id)
-        .and_then(|location| params.fragments.vector(&manifest.config, location))
-      else {
+      let Some(vector) = params.fragments.vector_by_id(manifest, vector_id) else {
         continue;
       };
 
@@ -497,11 +493,7 @@ impl IvfIndex {
       stored_normalized = manifest.config.normalize_on_insert,
       |dist| {
         for candidate in candidates {
-          let Some(vector) = manifest
-            .vector_locations
-            .get(&candidate.vector_id)
-            .and_then(|location| fragments.vector(&manifest.config, location))
-          else {
+          let Some(vector) = fragments.vector_by_id(manifest, candidate.vector_id) else {
             continue;
           };
           distances.clear();

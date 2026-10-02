@@ -1366,6 +1366,12 @@ export interface JsSearchOptions {
   nProbe?: number
   /** Minimum similarity threshold (0-1) */
   threshold?: number
+  /**
+   * IVF-PQ only: re-rank the best `max(k * rerankFactor, 80)` PQ candidates
+   * by exact distance (default 4; 0 returns the approximate PQ ranking and
+   * distances). IVF search is exact and ignores it.
+   */
+  rerankFactor?: number
 }
 
 /** Result of a vector search */
@@ -1751,6 +1757,11 @@ export interface SimilarOptions {
   threshold?: number
   /** Number of clusters to probe for IVF (must be positive) */
   nProbe?: number
+  /**
+   * Re-rank the best `max(k * rerankFactor, 80)` IVF-PQ candidates by exact
+   * distance (default 4; 0 returns the approximate PQ ranking and distances)
+   */
+  rerankFactor?: number
 }
 
 /** Options for optimizing a single-file database */

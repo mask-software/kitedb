@@ -700,11 +700,16 @@ class SearchOptions:
     """Options for vector search."""
     n_probe: Optional[int]
     threshold: Optional[float]
+    rerank_factor: Optional[int]
+    """IVF-PQ only: re-rank the best max(k * rerank_factor, 80) PQ candidates by
+    exact distance (default 4; 0 returns the approximate PQ ranking and
+    distances). IVF search is exact and ignores it."""
     
     def __init__(
         self,
         n_probe: Optional[int] = None,
         threshold: Optional[float] = None,
+        rerank_factor: Optional[int] = None,
     ) -> None: ...
 
 class SearchResult:
