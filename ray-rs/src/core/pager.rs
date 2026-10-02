@@ -289,6 +289,8 @@ fn sync_file(file: &File, full_fsync: bool) -> Result<()> {
 
   #[cfg(not(target_os = "macos"))]
   {
+    // F_FULLFSYNC is macOS-only; elsewhere fsync already reaches the drive.
+    let _ = full_fsync;
     #[cfg(test)]
     SYNC_PRIMITIVE_LOG.with(|log| log.borrow_mut().push("sync_all"));
     file.sync_all()?;
