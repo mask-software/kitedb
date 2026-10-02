@@ -417,7 +417,6 @@ pub struct DeltaState {
 
   // Key index delta
   pub key_index: HashMap<String, NodeId>,
-  pub key_index_deleted: HashSet<String>,
 
   // Pending vector operations (keyed by (node_id, prop_key_id))
   // Some(vec) = set, None = delete

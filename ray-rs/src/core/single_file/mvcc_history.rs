@@ -214,9 +214,6 @@ impl Committed<'_> {
 
   /// The live node holding `key`.
   fn key_owner(&self, key: &str) -> Option<NodeId> {
-    if self.delta.key_index_deleted.contains(key) {
-      return None;
-    }
     if let Some(&node_id) = self.delta.key_index.get(key) {
       if self.exists(node_id) {
         return Some(node_id);

@@ -1246,10 +1246,6 @@ impl SingleFileDB {
     let delta = self.delta.read();
 
     // Check pending key index first
-    if pending.is_some_and(|p| p.key_index_deleted.contains(key)) {
-      return None;
-    }
-
     if let Some(&node_id) = pending.and_then(|p| p.key_index.get(key)) {
       if pending.is_some_and(|p| p.is_node_removed(node_id)) {
         return None;
@@ -1275,10 +1271,6 @@ impl SingleFileDB {
     }
 
     // Check committed delta key index
-    if delta.key_index_deleted.contains(key) {
-      return None;
-    }
-
     if let Some(&node_id) = delta.key_index.get(key) {
       // Verify node isn't deleted
       if pending.is_some_and(|p| p.is_node_deleted(node_id)) {

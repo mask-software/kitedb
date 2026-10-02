@@ -231,7 +231,6 @@ impl DeltaState {
     self.new_etypes.clear();
     self.new_propkeys.clear();
     self.key_index.clear();
-    self.key_index_deleted.clear();
     self.pending_vectors.clear();
   }
 
@@ -632,18 +631,11 @@ impl DeltaState {
 
   /// Lookup node by key in delta
   pub fn node_by_key(&self, key: &str) -> Option<NodeId> {
-    // Check if key was deleted
-    if self.key_index_deleted.contains(key) {
-      return None;
-    }
     self.key_index.get(key).copied()
   }
 
   /// Live node holding `key` through this delta over `snapshot`.
   pub fn key_owner_over(&self, snapshot: Option<&SnapshotData>, key: &str) -> Option<NodeId> {
-    if self.key_index_deleted.contains(key) {
-      return None;
-    }
     if let Some(&node_id) = self.key_index.get(key) {
       if !self.is_node_removed(node_id) {
         return Some(node_id);

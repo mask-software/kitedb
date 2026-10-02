@@ -1428,9 +1428,6 @@ fn merge_pending_delta(target: &mut DeltaState, mut pending: DeltaState) {
   }
 
   target.key_index.extend(pending.key_index.drain());
-  target
-    .key_index_deleted
-    .extend(pending.key_index_deleted.drain());
 }
 
 #[cfg(test)]

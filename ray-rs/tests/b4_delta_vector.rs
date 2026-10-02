@@ -5,8 +5,8 @@
 //! - F1: edge props survive an unlink and come back on relink.
 //! - F2: a deleted delta-created node (or a never-created id) shows orphan
 //!   props, labels, edges or vectors.
-//! - F3: key lookups after deletes (guards for removing the never-populated
-//!   `DeltaState::key_index_deleted`).
+//! - F3: key lookups after deletes (guards for the removal of the
+//!   never-populated `DeltaState::key_index_deleted`).
 //! - F5: `set_node_vector` accepts a node that does not exist.
 //! - F6: `node_vector` is raw inside the writing transaction, normalized after
 //!   commit.
@@ -695,8 +695,8 @@ fn f2_racing_writes_to_node_deleted_meanwhile_leave_no_orphan_state() {
 }
 
 // ============================================================================
-// F3: key lookups after deletes (guards: `key_index_deleted` is never
-// populated, so removing it must keep these green)
+// F3: key lookups after deletes (guards: `key_index_deleted` was never
+// populated and is gone; keys are masked by `key_index` and node deletes)
 // ============================================================================
 
 fn f3_key_after_delete(name: &str, mvcc: bool, in_snapshot: bool, reuse_key: bool) {
