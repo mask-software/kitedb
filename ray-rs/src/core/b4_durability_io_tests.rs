@@ -540,3 +540,23 @@ fn f9_drop_without_close_keeps_sync_off_commits() {
     committed.len()
   );
 }
+
+/// Close persists once; the handle it consumes then drops without writing
+/// again.
+#[test]
+fn f9_drop_after_close_writes_nothing() {
+  let dir = tempdir().expect("tempdir");
+  let path = dir.path().join("close-then-drop.kitedb");
+  let db = open_single_file(&path, options().sync_mode(SyncMode::Off)).expect("open");
+  commit_nodes(&db, &keys("node", 3));
+  let generation = db.header.read().change_counter;
+  close_single_file(db).expect("close");
+
+  let mut pager = open_pager(&path, PAGE_SIZE, true).expect("pager");
+  let (header, _) = read_header_slots(&mut pager).expect("header");
+  assert_eq!(
+    header.change_counter,
+    generation + 1,
+    "close wrote one header; the drop after it must write none"
+  );
+}

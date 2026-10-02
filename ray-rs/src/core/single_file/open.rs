@@ -59,8 +59,12 @@ pub enum SyncMode {
   /// but not if application crashes. ~1000x faster than Full.
   Normal,
 
-  /// No fsync (fastest, least safe)
-  /// Data may be lost on any crash. Only for testing/ephemeral data.
+  /// No fsync, and no WAL write per commit (fastest, least safe).
+  ///
+  /// **Commits stay in memory until a checkpoint, `close_single_file`, or
+  /// dropping the handle writes them.** A crash of the process, not just of
+  /// the OS, loses every commit since the last checkpoint. Only for tests
+  /// and data you can rebuild.
   Off,
 }
 
@@ -319,8 +323,9 @@ impl SingleFileOpenOptions {
     self
   }
 
-  /// Set sync mode to Off (no fsync)
-  /// Only for testing or ephemeral data. Data may be lost on any crash.
+  /// Set sync mode to Off: no fsync, and commits stay in memory until a
+  /// checkpoint, close, or drop writes them, so a process crash loses every
+  /// commit since the last checkpoint. Only for testing or ephemeral data.
   pub fn sync_off(mut self) -> Self {
     self.sync_mode = SyncMode::Off;
     self
@@ -1285,6 +1290,7 @@ fn open_single_file_internal(
   Ok(SingleFileDB {
     path: path.to_path_buf(),
     read_only: options.read_only,
+    closed: AtomicBool::new(false),
     pager: Mutex::new(pager),
     header: RwLock::new(header),
     header_slot: AtomicU32::new(header_slot),
@@ -1521,27 +1527,9 @@ pub fn close_single_file_with_options(
     return Ok(());
   }
 
-  // Flush WAL and sync to disk
-  let mut pager = db.pager.lock();
-  let mut wal_buffer = db.wal_buffer.lock();
-
-  // Flush any pending WAL writes
-  wal_buffer.flush(&mut pager)?;
-
-  // Update header with current WAL state
-  {
-    let mut header = db.header.write();
-    wal_buffer.store_in_header(&mut header);
-    header.max_node_id = db.next_node_id.load(Ordering::SeqCst).saturating_sub(1);
-    header.next_tx_id = db.next_tx_id.load(Ordering::SeqCst);
-
-    // Install the updated header in the inactive slot. The final sync below
-    // makes the WAL and header durable together.
-    db.persist_header(&mut pager, &mut header, false)?;
-  }
-
-  // Final sync
-  pager.sync()?;
+  // On failure, dropping `db` tries once more.
+  db.persist_for_close()?;
+  db.closed.store(true, Ordering::Release);
   Ok(())
 }
 
