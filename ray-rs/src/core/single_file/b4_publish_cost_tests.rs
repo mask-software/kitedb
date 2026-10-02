@@ -222,6 +222,10 @@ fn created_nodes_record_no_version_chains() {
     recorded.iter().all(|&(_, chains)| chains == 0),
     "a commit of 200 new nodes recorded version chains: {recorded:?}"
   );
+  assert_eq!(
+    counts.node_creation_runs, 1,
+    "the 200 consecutive ids take one creation run"
+  );
 
   // The reader sees none of the new nodes, and a new reader sees all of them.
   let (after, hidden) = {

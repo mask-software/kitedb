@@ -363,8 +363,10 @@ fn commits_record_no_history_for_the_nodes_they_create() {
     },
     "the old snapshot sees part of the nodes created after it"
   );
+  // One run of created ids (they are consecutive), no chain.
   assert_eq!(
     (
+      counts.node_creation_runs,
       counts.node_versions,
       counts.node_prop_versions,
       counts.node_label_versions,
@@ -372,8 +374,9 @@ fn commits_record_no_history_for_the_nodes_they_create() {
       counts.edge_versions,
       counts.edge_prop_versions,
     ),
-    (CREATED, 0, 0, 0, 0, 0),
-    "history recorded for {CREATED} created nodes (node, prop, label, key, edge, edge prop chains)"
+    (1, 0, 0, 0, 0, 0, 0),
+    "history recorded for {CREATED} created nodes (creation runs, then node, prop, label, key, \
+     edge, edge prop chains)"
   );
 }
 

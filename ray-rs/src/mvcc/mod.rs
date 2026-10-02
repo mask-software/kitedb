@@ -72,7 +72,7 @@ mod b4_mvcc_phase2_tests;
 // Re-export main types for convenience
 pub use conflict::{ConflictDetector, ConflictError, ConflictInfo, ConflictType};
 pub use gc::{GarbageCollector, GcConfig, GcResult, GcStats, SharedGcState};
-pub use manager::MvccManager;
+pub use manager::{HistoryWriter, MvccManager};
 pub use tx_manager::{CommittedWritesStats, TxKeyGroups, TxManager, TxManagerError};
 pub use version_chain::{
   PooledVersion, SoaPropertyVersions, VersionChainCounts, VersionChainManager,

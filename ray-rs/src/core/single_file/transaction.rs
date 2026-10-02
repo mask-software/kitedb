@@ -52,6 +52,7 @@ use std::thread::ThreadId;
 #[cfg(feature = "bench-profile")]
 use std::time::Instant;
 
+use super::mvcc_history::{record_commit, HistoryPlan};
 use super::open::SyncMode;
 use super::writer_slot::WriterMode;
 use super::{SchemaStaging, SingleFileDB, SingleFileTxState};
@@ -147,6 +148,9 @@ pub(crate) struct CommitRequest {
   /// The size of its COMMIT record, the last of `records`.
   commit_record_len: usize,
   pending: DeltaState,
+  /// Its MVCC history plan, if worked out before it queued (see
+  /// `SingleFileDB::plan_history`).
+  history: Option<HistoryPlan>,
   /// Its data records, for the replication sidecar (empty without one).
   pending_wal: Vec<u8>,
   staged_schema: SchemaStaging,
@@ -366,6 +370,13 @@ impl Drop for CommitLeader<'_> {
     self.release_lead();
   }
 }
+
+/// A publish's hold of the snapshot and the version chains, for the commits
+/// of its group that record history (`SingleFileDB::record_mvcc_history`).
+type HistoryHold<'a> = (
+  parking_lot::RwLockReadGuard<'a, Option<crate::core::snapshot::reader::SnapshotData>>,
+  crate::mvcc::HistoryWriter<'a>,
+);
 
 /// A commit group's publish section (see `publish_commits`): makes
 /// `SingleFileDB::publish_seq` odd until dropped, also on unwind.
@@ -925,29 +936,30 @@ impl SingleFileDB {
     Ok(SingleFileTxGuard::new(self, txid))
   }
 
-  /// Record the changes of a commit in the MVCC version chains, for the transactions still
-  /// open (see `mvcc_history`). With none open, no reader can need the state the commit
-  /// replaces: every later read sees the commit, in the delta.
-  fn apply_mvcc_commit(
-    &self,
+  /// Record the changes of `request`'s commit in the MVCC version chains, for the
+  /// transactions still open (see `mvcc_history`), under `hold`, which the first commit of a
+  /// publish to record takes and keeps for the rest. With none open, no reader can need the
+  /// state the commit replaces: every later read sees the commit, in the delta.
+  fn record_mvcc_history<'a>(
+    &'a self,
+    hold: &mut Option<HistoryHold<'a>>,
     commit_ts_for_mvcc: Option<(u64, bool)>,
-    txid: TxId,
-    pending: &DeltaState,
+    request: &mut CommitRequest,
     delta: &DeltaState,
   ) {
-    let Some((commit_ts, has_active_readers)) = commit_ts_for_mvcc else {
+    let (Some((commit_ts, true)), Some(mvcc)) = (commit_ts_for_mvcc, self.mvcc.as_ref()) else {
       return;
     };
-    let Some(mvcc) = self.mvcc.as_ref() else {
-      return;
-    };
-    if !has_active_readers {
-      return;
-    }
-
-    let snapshot = self.snapshot.read();
-    mvcc.record_history(commit_ts, |vc| {
-      super::mvcc_history::record_commit(vc, delta, snapshot.as_ref(), pending, txid, commit_ts);
+    let (snapshot, history) =
+      hold.get_or_insert_with(|| (self.snapshot.read(), mvcc.history_writer()));
+    let snapshot = snapshot.as_ref();
+    let pending = &request.pending;
+    let plan = request
+      .history
+      .take()
+      .unwrap_or_else(|| HistoryPlan::of(history.chains(), delta, snapshot, pending));
+    history.record(commit_ts, |vc| {
+      record_commit(vc, delta, snapshot, pending, &plan, request.txid, commit_ts);
     });
   }
 
@@ -1277,6 +1289,7 @@ impl SingleFileDB {
         records
       }
     };
+    let history = self.plan_history(&pending);
     let request = Box::new(CommitRequest {
       txid,
       bulk_load,
@@ -1284,6 +1297,7 @@ impl SingleFileDB {
       records,
       commit_record_len,
       pending,
+      history,
       pending_wal,
       staged_schema,
       committer: std::thread::current().id(),
@@ -1803,13 +1817,14 @@ impl SingleFileDB {
     let mut delta = self.delta.write();
     let _publishing = PublishSection::enter(&self.publish_seq);
     let mut released_keys = self.commit_in_mvcc(&mut round);
+    let mut history = None;
     for commit in &mut round {
       let request = &mut commit.request;
       let on_committer_thread = request.committer == this_thread;
       if on_committer_thread {
         after_commit_timestamp_test_hook();
       }
-      self.apply_mvcc_commit(commit.mvcc_commit, request.txid, &request.pending, &delta);
+      self.record_mvcc_history(&mut history, commit.mvcc_commit, request, &delta);
 
       // The stores are loaded and the dimensions checked (`write_commit_round`).
       let vector_fault = if on_committer_thread {
@@ -1825,6 +1840,7 @@ impl SingleFileDB {
         commit.published = vector_result;
       }
     }
+    drop(history);
     drop(_publishing);
     drop(delta);
 

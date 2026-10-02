@@ -20,11 +20,22 @@
 //! the newest version reads the chain. Seeing no version there means the key was absent at
 //! its snapshot, so a baseline is only stored for a present state.
 //!
+//! # Created nodes
+//!
+//! A commit that creates a node no older snapshot can see (an id no committed node held,
+//! with no history) records no chain for it, only the commit, for a run of consecutive ids
+//! at a time (`record_node_creations`): a reader whose snapshot predates the commit sees the
+//! node absent, and every read checks that a node exists before it reads the node's key,
+//! props, labels or edges. Such a node's existence is decided by its run first, then by its
+//! chain: a later change of it (a delete) records its state from before as a baseline, which
+//! holds only since its run's commit.
+//!
 //! Ported from src/mvcc/version-chain.ts
 
 use hashbrown::hash_map::Entry;
 use hashbrown::{HashMap, HashSet};
 use std::borrow::Borrow;
+use std::collections::BTreeMap;
 use std::hash::Hash;
 use std::sync::Arc;
 
@@ -361,6 +372,16 @@ pub struct PooledVersion<T> {
 // Version Chain Manager
 // ============================================================================
 
+/// A run of consecutive node ids one commit created, none of which a snapshot older than the
+/// commit could see (see `VersionChainManager::record_node_creations`).
+#[derive(Debug, Clone, Copy)]
+struct CreatedRun {
+  /// One past the run's last id.
+  end: NodeId,
+  txid: TxId,
+  commit_ts: Timestamp,
+}
+
 /// Version chain manager for MVCC
 ///
 /// Stores version chains for:
@@ -401,6 +422,9 @@ pub struct VersionChainManager {
   edge_prop_index: HashMap<(NodeId, ETypeId, NodeId), Vec<PropKeyId>>,
   /// The label ids of each node's label chains
   node_label_index: HashMap<NodeId, Vec<LabelId>>,
+  /// Runs of node ids created by commits a snapshot may predate, by first id (see
+  /// `record_node_creations`)
+  node_creations: BTreeMap<NodeId, CreatedRun>,
 }
 
 /// Note in `index` that `entity` has a chain for `id`.
@@ -444,6 +468,7 @@ impl VersionChainManager {
       node_prop_index: HashMap::new(),
       edge_prop_index: HashMap::new(),
       node_label_index: HashMap::new(),
+      node_creations: BTreeMap::new(),
     }
   }
 
@@ -1105,6 +1130,73 @@ impl VersionChainManager {
     chains.insert(key, Box::new(version));
   }
 
+  /// Record that commit `commit_ts` (by `txid`) created the nodes of `runs` (`[start, end)`
+  /// each), none of which a snapshot older than the commit can see: ids no committed node
+  /// holds, with no chain (see the module docs). A reader whose snapshot predates the commit
+  /// sees them absent. This stands for a chain per node (absent, then created) at the cost of
+  /// a run. A run over ids of an older run replaces it there: such an id was deleted since, by
+  /// a commit no open snapshot predates (one would have given it a chain).
+  pub fn record_node_creations(
+    &mut self,
+    runs: &[(NodeId, NodeId)],
+    txid: TxId,
+    commit_ts: Timestamp,
+  ) {
+    for &(start, end) in runs {
+      if start >= end {
+        continue;
+      }
+      self.forget_node_creations(start, end);
+      self.node_creations.insert(
+        start,
+        CreatedRun {
+          end,
+          txid,
+          commit_ts,
+        },
+      );
+    }
+  }
+
+  /// Drop the ids `[start, end)` from the creation runs, splitting a run that straddles them.
+  fn forget_node_creations(&mut self, start: NodeId, end: NodeId) {
+    let mut cut = Vec::new();
+    if let Some((&first, run)) = self.node_creations.range(..start).next_back() {
+      if run.end > start {
+        cut.push((first, *run));
+      }
+    }
+    cut.extend(
+      self
+        .node_creations
+        .range(start..end)
+        .map(|(&first, run)| (first, *run)),
+    );
+    for (first, run) in cut {
+      self.node_creations.remove(&first);
+      if first < start {
+        self
+          .node_creations
+          .insert(first, CreatedRun { end: start, ..run });
+      }
+      if run.end > end {
+        self.node_creations.insert(end, run);
+      }
+    }
+  }
+
+  /// Whether node `node_id` was created by a commit a reader at `snapshot_ts` (in transaction
+  /// `txid`) does not see (see `record_node_creations`): it is absent for the reader.
+  fn created_after(&self, node_id: NodeId, snapshot_ts: Timestamp, txid: TxId) -> bool {
+    self
+      .node_creations
+      .range(..=node_id)
+      .next_back()
+      .is_some_and(|(_, run)| {
+        node_id < run.end && !is_visible_at(run.txid, run.commit_ts, snapshot_ts, txid)
+      })
+  }
+
   // ========================================================================
   // History: reads
   // ========================================================================
@@ -1120,12 +1212,16 @@ impl VersionChainManager {
     snapshot_ts: Timestamp,
     txid: TxId,
   ) -> Option<Option<&NodeVersionData>> {
+    if self.created_after(node_id, snapshot_ts, txid) {
+      return Some(None);
+    }
     let head = self.node_versions.get(&TxKey::Node(node_id))?;
     history_version(head, snapshot_ts, txid)
       .map(|version| version.filter(|v| !v.deleted).map(|v| &v.data))
   }
 
-  /// Whether node `node_id` has a version chain.
+  /// Whether node `node_id` has a version chain (a creation run is no chain: see
+  /// `record_node_creations`).
   pub fn has_node_history(&self, node_id: NodeId) -> bool {
     self.node_versions.contains_key(&TxKey::Node(node_id))
   }
@@ -1218,9 +1314,18 @@ impl VersionChainManager {
     Self::history_in(&self.key_owners, key, snapshot_ts, txid).map(|owner| owner.copied())
   }
 
-  /// Nodes that have a version chain.
+  /// Nodes whose existence the history may decide for a reader: those with a version chain or
+  /// in a creation run (some more than once).
   pub fn chained_node_ids(&self) -> impl Iterator<Item = NodeId> + '_ {
-    self.node_versions.values().map(|head| head.data.node_id)
+    let created = self
+      .node_creations
+      .iter()
+      .flat_map(|(&start, run)| start..run.end);
+    self
+      .node_versions
+      .values()
+      .map(|head| head.data.node_id)
+      .chain(created)
   }
 
   /// Nodes that a reader sees in their chains, as existing.
@@ -1230,6 +1335,7 @@ impl VersionChainManager {
         .flatten()
         .filter(|version| !version.deleted)
         .map(|version| version.data.node_id)
+        .filter(|&node_id| !self.created_after(node_id, snapshot_ts, txid))
     })
   }
 
@@ -1358,6 +1464,11 @@ impl VersionChainManager {
       self.unindex_dropped_edge_chains();
     }
     pruned += Self::prune_chains(&mut self.key_owners, horizon_ts);
+    let runs = self.node_creations.len();
+    self
+      .node_creations
+      .retain(|_, run| run.commit_ts >= horizon_ts);
+    pruned += runs - self.node_creations.len();
 
     // Prune property and label versions
     if self.use_soa {
@@ -1563,6 +1674,12 @@ impl VersionChainManager {
       self.soa_node_props.newest_commit_ts(),
       self.soa_edge_props.newest_commit_ts(),
       self.soa_node_labels.newest_commit_ts(),
+      self
+        .node_creations
+        .values()
+        .map(|run| run.commit_ts)
+        .max()
+        .unwrap_or(0),
     ]
     .into_iter()
     .max()
@@ -1602,6 +1719,7 @@ impl VersionChainManager {
     self.node_prop_index.clear();
     self.edge_prop_index.clear();
     self.node_label_index.clear();
+    self.node_creations.clear();
   }
 
   /// Get counts for statistics
@@ -1625,6 +1743,7 @@ impl VersionChainManager {
         self.legacy_node_labels.len()
       },
       key_owner_versions: self.key_owners.len(),
+      node_creation_runs: self.node_creations.len(),
     }
   }
 }
@@ -1644,6 +1763,8 @@ pub struct VersionChainCounts {
   pub edge_prop_versions: usize,
   pub node_label_versions: usize,
   pub key_owner_versions: usize,
+  /// Runs of created node ids (see `VersionChainManager::record_node_creations`)
+  pub node_creation_runs: usize,
 }
 
 // ============================================================================
@@ -2428,5 +2549,100 @@ mod history_tests {
     assert!(!mgr.edge_chains_by_node.contains_key(&NODE));
     let other: Vec<_> = mgr.node_edges_at(OTHER, 20, READER_TXID).collect();
     assert_eq!(other, vec![(OTHER, ETYPE, OTHER)]);
+  }
+
+  /// The created state of node `node_id` with key `key`.
+  fn node_data(node_id: NodeId, key: &str) -> NodeVersionData {
+    NodeVersionData {
+      node_id,
+      delta: NodeDelta {
+        key: Some(key.to_string()),
+        ..NodeDelta::default()
+      },
+    }
+  }
+
+  fn exists_at(mgr: &VersionChainManager, node_id: NodeId, ts: Timestamp) -> Option<bool> {
+    mgr.node_exists_at(node_id, ts, READER_TXID)
+  }
+
+  #[test]
+  fn creation_runs_hide_nodes_from_older_snapshots() {
+    let mut mgr = VersionChainManager::new();
+    mgr.record_node_creations(&[(10, 20), (30, 31)], 7, 5);
+
+    // Commit 5 is visible from snapshot 6 on.
+    for node in [10, 15, 19, 30] {
+      assert_eq!(exists_at(&mgr, node, 5), Some(false), "node {node}");
+      assert_eq!(exists_at(&mgr, node, 6), None, "node {node}");
+    }
+    assert_eq!(exists_at(&mgr, 9, 5), None);
+    assert_eq!(exists_at(&mgr, 20, 5), None);
+    assert_eq!(exists_at(&mgr, 31, 5), None);
+    // Its own transaction sees it.
+    assert_eq!(mgr.node_exists_at(15, 5, 7), None);
+    assert_eq!(mgr.counts().node_creation_runs, 2);
+    assert_eq!(mgr.newest_commit_ts(), 5);
+    let mut ids: Vec<NodeId> = mgr.chained_node_ids().collect();
+    ids.sort_unstable();
+    assert_eq!(ids, (10..20).chain([30]).collect::<Vec<_>>());
+    assert!(!mgr.has_node_history(15), "a run is no chain");
+  }
+
+  #[test]
+  fn a_later_run_replaces_the_ids_it_covers() {
+    let mut mgr = VersionChainManager::new();
+    mgr.record_node_creations(&[(10, 20)], 7, 5);
+    // Ids 12 and 13, deleted since with no snapshot open, created again at 8; then 18-24.
+    mgr.record_node_creations(&[(12, 14)], 8, 8);
+    mgr.record_node_creations(&[(18, 25)], 9, 9);
+
+    for (node, created) in [
+      (10, 5),
+      (11, 5),
+      (12, 8),
+      (13, 8),
+      (14, 5),
+      (17, 5),
+      (18, 9),
+      (24, 9),
+    ] {
+      assert_eq!(exists_at(&mgr, node, created), Some(false), "node {node}");
+      assert_eq!(exists_at(&mgr, node, created + 1), None, "node {node}");
+    }
+    assert_eq!(exists_at(&mgr, 25, 1), None);
+    // [10, 12) at 5, [12, 14) at 8, [14, 18) at 5, [18, 25) at 9.
+    assert_eq!(mgr.counts().node_creation_runs, 4);
+
+    // GC drops the runs every snapshot sees.
+    mgr.prune_old_versions(9);
+    assert_eq!(mgr.counts().node_creation_runs, 1);
+    assert_eq!(exists_at(&mgr, 11, 1), None);
+    assert_eq!(exists_at(&mgr, 18, 9), Some(false));
+    mgr.prune_old_versions(10);
+    assert_eq!(mgr.counts().node_creation_runs, 0);
+    assert_eq!(mgr.newest_commit_ts(), 0);
+  }
+
+  #[test]
+  fn a_created_node_deleted_later_exists_only_between_the_two() {
+    let mut mgr = VersionChainManager::new();
+    mgr.record_node_creations(&[(NODE, NODE + 1)], 7, 5);
+    // Deleted at 9: the delete records the node from before (with no start).
+    mgr.record_node(NODE, Some(node_data(NODE, "a")), None, 8, 9);
+
+    assert_eq!(exists_at(&mgr, NODE, 5), Some(false));
+    assert_eq!(exists_at(&mgr, NODE, 6), Some(true));
+    assert_eq!(exists_at(&mgr, NODE, 9), Some(true));
+    assert_eq!(exists_at(&mgr, NODE, 10), None);
+    assert!(mgr.nodes_at(5, READER_TXID).next().is_none());
+    assert_eq!(mgr.nodes_at(6, READER_TXID).collect::<Vec<_>>(), vec![NODE]);
+    let key = |ts| {
+      mgr
+        .node_at(NODE, ts, READER_TXID)
+        .map(|node| node.and_then(|node| node.delta.key.clone()))
+    };
+    assert_eq!(key(5), Some(None));
+    assert_eq!(key(6), Some(Some("a".to_string())));
   }
 }

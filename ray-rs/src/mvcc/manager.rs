@@ -9,7 +9,7 @@ use std::thread;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::mvcc::gc::GcSleeper;
@@ -78,9 +78,17 @@ impl MvccManager {
     commit_ts: Timestamp,
     record: impl FnOnce(&mut VersionChainManager),
   ) {
-    let mut vc = self.version_chain.write();
-    record(&mut vc);
-    self.history_ts.fetch_max(commit_ts, Ordering::Release);
+    self.history_writer().record(commit_ts, record);
+  }
+
+  /// The version chains, held (write-locked) to record the history of
+  /// several commits, in commit order, under one lock (see `HistoryWriter`).
+  pub fn history_writer(&self) -> HistoryWriter<'_> {
+    HistoryWriter {
+      chains: self.version_chain.write(),
+      history_ts: &self.history_ts,
+      newest: 0,
+    }
   }
 
   /// Run one GC cycle now.
@@ -164,6 +172,39 @@ impl MvccManager {
         let _ = handle.join();
       }
     }
+  }
+}
+
+/// The version chains, write-locked, for recording commits' history
+/// (`MvccManager::history_writer`). Raises `history_ts` to the newest commit
+/// it recorded before it releases the lock.
+pub struct HistoryWriter<'a> {
+  chains: RwLockWriteGuard<'a, VersionChainManager>,
+  history_ts: &'a AtomicU64,
+  newest: Timestamp,
+}
+
+impl HistoryWriter<'_> {
+  /// Record the history of the commit at `commit_ts` with `record`.
+  pub fn record<R>(
+    &mut self,
+    commit_ts: Timestamp,
+    record: impl FnOnce(&mut VersionChainManager) -> R,
+  ) -> R {
+    self.newest = self.newest.max(commit_ts);
+    record(&mut self.chains)
+  }
+
+  /// The chains as they are, for reads that plan a recording.
+  pub fn chains(&self) -> &VersionChainManager {
+    &self.chains
+  }
+}
+
+impl Drop for HistoryWriter<'_> {
+  fn drop(&mut self) {
+    // The chains are still held: GC lowers `history_ts` under them.
+    self.history_ts.fetch_max(self.newest, Ordering::Release);
   }
 }
 

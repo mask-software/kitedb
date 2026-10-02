@@ -6,26 +6,108 @@
 //! edges, and deleting an edge also removes its props. The state before the commit is the
 //! committed delta over the snapshot, which the commit has not been merged into yet.
 //!
-//! A node the commit brings into existence gets only its own history (absent before) when no
-//! open snapshot can see that id (it is not committed, and has no history of an earlier
-//! node): every read of a node's props, labels and key, and of an edge, checks that the node
-//! (each endpoint) exists at the reader's snapshot first, so its props, labels, key and
-//! edges need none.
+//! A node the commit brings into existence where no open snapshot can see that id (it is not
+//! committed, and has no history of an earlier node) is "fresh": it gets no chain, only the
+//! commit, as part of a run of consecutive ids (`VersionChainManager::record_node_creations`).
+//! Every read of a node's props, labels and key, and of an edge, checks that the node (each
+//! endpoint) exists at the reader's snapshot first, so its props, labels, key and edges need
+//! no history either.
+//!
+//! Recording takes two steps. `HistoryPlan::of` works out, without any lock a commit holds,
+//! which nodes are fresh and so what is left to record: nothing else for a commit that only
+//! creates nodes and their edges. `record_commit` then records the plan in the publish.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::core::snapshot::reader::SnapshotData;
 use crate::mvcc::VersionChainManager;
 use crate::types::*;
 
+type Edge = (NodeId, ETypeId, NodeId);
+
+/// What recording a commit's history takes, worked out before its publish (see the module
+/// docs).
+#[derive(Debug, Default)]
+pub(super) struct HistoryPlan {
+  /// The fresh nodes it creates, as runs `[start, end)` of consecutive ids.
+  fresh_runs: Vec<(NodeId, NodeId)>,
+  /// The other nodes it creates (recreates of an id with history, or of one it deletes).
+  created: Vec<NodeId>,
+  /// The edges it adds that have no fresh endpoint.
+  added_edges: Vec<Edge>,
+  /// The edges whose props it changes that have no fresh endpoint.
+  changed_edges: Vec<Edge>,
+}
+
+impl HistoryPlan {
+  /// The plan for the changes `pending` makes to the committed state `delta` over
+  /// `snapshot`, with history `vc`.
+  ///
+  /// It holds until the commit's publish, also when worked out before the commit's group is
+  /// written: until then only commits that write one of `pending`'s nodes could make one of
+  /// them committed or give it history (they create or delete it), and those conflict with it
+  /// (MVCC aborts one of the two; bulk loads run alone). GC may drop a chain meanwhile, which
+  /// only makes the publish record a node in full that it could have recorded as fresh.
+  pub(super) fn of(
+    vc: &VersionChainManager,
+    delta: &DeltaState,
+    snapshot: Option<&SnapshotData>,
+    pending: &DeltaState,
+  ) -> Self {
+    let committed = Committed { delta, snapshot };
+    let mut fresh = Vec::new();
+    let mut created = Vec::new();
+    for &node_id in pending.created_nodes.keys() {
+      if !committed.exists(node_id) && !vc.has_node_history(node_id) {
+        fresh.push(node_id);
+      } else {
+        created.push(node_id);
+      }
+    }
+    fresh.sort_unstable();
+    let mut fresh_runs: Vec<(NodeId, NodeId)> = Vec::new();
+    for &node_id in &fresh {
+      match fresh_runs.last_mut() {
+        Some((_, end)) if *end == node_id => *end += 1,
+        _ => fresh_runs.push((node_id, node_id + 1)),
+      }
+    }
+    let is_fresh = |node_id: NodeId| fresh.binary_search(&node_id).is_ok();
+    let edge_is_fresh = |&(src, _, dst): &Edge| is_fresh(src) || is_fresh(dst);
+    let added_edges = pending
+      .out_add
+      .iter()
+      .flat_map(|(&src, patches)| {
+        patches
+          .iter()
+          .map(move |patch| (src, patch.etype, patch.other))
+      })
+      .filter(|edge| !edge_is_fresh(edge))
+      .collect();
+    let changed_edges = pending
+      .edge_props
+      .keys()
+      .copied()
+      .filter(|edge| !edge_is_fresh(edge))
+      .collect();
+    Self {
+      fresh_runs,
+      created,
+      added_edges,
+      changed_edges,
+    }
+  }
+}
+
 /// Record in `vc` the changes `pending` makes, committed by `txid` at `commit_ts`, to the
-/// committed state `delta` over `snapshot`.
+/// committed state `delta` over `snapshot`, as `plan` (`HistoryPlan::of` for them) lays out.
 pub(super) fn record_commit(
   vc: &mut VersionChainManager,
   delta: &DeltaState,
   snapshot: Option<&SnapshotData>,
   pending: &DeltaState,
+  plan: &HistoryPlan,
   txid: TxId,
   commit_ts: Timestamp,
 ) {
@@ -35,7 +117,7 @@ pub(super) fn record_commit(
     txid,
     commit_ts,
   }
-  .record(pending);
+  .record(pending, plan);
 }
 
 struct CommitRecorder<'a> {
@@ -46,17 +128,11 @@ struct CommitRecorder<'a> {
 }
 
 impl CommitRecorder<'_> {
-  fn record(&mut self, pending: &DeltaState) {
+  fn record(&mut self, pending: &DeltaState, plan: &HistoryPlan) {
     let (txid, commit_ts) = (self.txid, self.commit_ts);
-    // Nodes no older snapshot can see (see the module docs): not in the committed state,
-    // and with no history an open snapshot may still read (a node deleted since it began).
-    let fresh: HashSet<NodeId> = pending
-      .created_nodes
-      .keys()
-      .copied()
-      .filter(|&node_id| !self.committed.exists(node_id) && !self.vc.has_node_history(node_id))
-      .collect();
-    let edge_is_fresh = |src: NodeId, dst: NodeId| fresh.contains(&src) || fresh.contains(&dst);
+    self
+      .vc
+      .record_node_creations(&plan.fresh_runs, txid, commit_ts);
 
     // Removals first. A later change of the same key by this commit (a node deleted and
     // re-created, an edge re-added to a re-created node) replaces what they record.
@@ -69,39 +145,31 @@ impl CommitRecorder<'_> {
       }
     }
 
-    for (&node_id, node_delta) in &pending.created_nodes {
+    let created = plan
+      .created
+      .iter()
+      .filter_map(|node_id| pending.created_nodes.get_key_value(node_id));
+    for (&node_id, node_delta) in created.clone() {
       if let Some(key) = node_delta.key.as_deref() {
         let owner = self.committed.key_owner(key);
-        if owner.is_some() || !fresh.contains(&node_id) {
-          self
-            .vc
-            .record_key_owner(key, owner, Some(node_id), txid, commit_ts);
-        }
+        self
+          .vc
+          .record_key_owner(key, owner, Some(node_id), txid, commit_ts);
       }
       let created = NodeVersionData {
         node_id,
         delta: node_delta.for_version(),
       };
-      let before = if fresh.contains(&node_id) {
-        None
-      } else {
-        self.committed.node(node_id)
-      };
+      let before = self.committed.node(node_id);
       self
         .vc
         .record_node(node_id, before, Some(created), txid, commit_ts);
     }
-    for (&src, patches) in &pending.out_add {
-      for patch in patches
-        .iter()
-        .filter(|patch| !edge_is_fresh(src, patch.other))
-      {
-        self.add_edge(src, patch.etype, patch.other);
-      }
+    for &(src, etype, dst) in &plan.added_edges {
+      self.add_edge(src, etype, dst);
     }
 
-    let changed_nodes = pending.created_nodes.iter().chain(&pending.modified_nodes);
-    for (&node_id, node_delta) in changed_nodes.filter(|(node_id, _)| !fresh.contains(node_id)) {
+    for (&node_id, node_delta) in created.chain(&pending.modified_nodes) {
       for (&key_id, after) in node_delta.props.iter().flatten() {
         let before = self.committed.node_prop(node_id, key_id);
         self
@@ -121,10 +189,11 @@ impl CommitRecorder<'_> {
           .record_node_label(node_id, label_id, before, false, txid, commit_ts);
       }
     }
-    let changed_edges = pending.edge_props.iter();
-    for (&(src, etype, dst), props) in
-      changed_edges.filter(|((src, _, dst), _)| !edge_is_fresh(*src, *dst))
-    {
+    let changed_edges = plan
+      .changed_edges
+      .iter()
+      .filter_map(|edge| Some((*edge, pending.edge_props.get(edge)?)));
+    for ((src, etype, dst), props) in changed_edges {
       for (&key_id, after) in props {
         let before = self.committed.edge_prop(src, etype, dst, key_id);
         self.vc.record_edge_prop(
@@ -201,6 +270,34 @@ impl CommitRecorder<'_> {
     self
       .vc
       .record_edge(src, etype, dst, true, false, txid, commit_ts);
+  }
+}
+
+/// Commits creating fewer nodes, edges and edge props than this leave their history plan to
+/// their publish (see `SingleFileDB::plan_history`).
+const EARLY_PLAN_MIN_CHANGES: usize = 16;
+
+impl super::SingleFileDB {
+  /// The history plan of a commit of `pending` (see `HistoryPlan::of`), worked out by its
+  /// committer before it queues, without any lock a commit group holds: when another
+  /// transaction is open (so the commit records history) and the commit creates enough for
+  /// the plan to matter. `None` leaves the plan to the publish.
+  pub(super) fn plan_history(&self, pending: &DeltaState) -> Option<HistoryPlan> {
+    let mvcc = self.mvcc.as_ref()?;
+    let changes = pending.created_nodes.len() + pending.out_add.len() + pending.edge_props.len();
+    if changes < EARLY_PLAN_MIN_CHANGES
+      || self
+        .active_transactions
+        .load(std::sync::atomic::Ordering::Acquire)
+        <= 1
+    {
+      return None;
+    }
+    // Lock order: see read.rs.
+    let delta = self.delta.read();
+    let snapshot = self.snapshot.read();
+    let vc = mvcc.version_chain.read();
+    Some(HistoryPlan::of(&vc, &delta, snapshot.as_ref(), pending))
   }
 }
 
@@ -623,7 +720,7 @@ mod tests {
 mod recorder_tests {
   use std::sync::Arc;
 
-  use super::record_commit;
+  use super::{record_commit, HistoryPlan};
   use crate::mvcc::VersionChainManager;
   use crate::types::*;
 
@@ -658,7 +755,8 @@ mod recorder_tests {
 
   fn record(delta: &DeltaState, pending: &DeltaState) -> VersionChainManager {
     let mut vc = VersionChainManager::new();
-    record_commit(&mut vc, delta, None, pending, 5, COMMIT_TS);
+    let plan = HistoryPlan::of(&vc, delta, None, pending);
+    record_commit(&mut vc, delta, None, pending, &plan, 5, COMMIT_TS);
     vc
   }
 
