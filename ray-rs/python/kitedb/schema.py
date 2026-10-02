@@ -158,8 +158,9 @@ class NodeDef(Generic[KeyArg]):
     name: str
     key_fn: Callable[[KeyArg], str]
     props: PropsSchema
-    # Internal: resolved prop key IDs (set during db initialization)
-    _prop_key_ids: Dict[str, int] = field(default_factory=dict, repr=False)
+
+    # Schema ids are per database, so they live on the Kite instance that
+    # opened it, never here: one definition can serve several databases.
     
     def __hash__(self) -> int:
         return hash(self.name)
@@ -225,10 +226,8 @@ class EdgeDef:
     """
     name: str
     props: PropsSchema = field(default_factory=dict)
-    # Internal: resolved edge type ID (set during db initialization)
-    _etype_id: Optional[int] = field(default=None, repr=False)
-    # Internal: resolved prop key IDs (set during db initialization)
-    _prop_key_ids: Dict[str, int] = field(default_factory=dict, repr=False)
+
+    # Schema ids are per database and live on the Kite instance (see NodeDef).
     
     def __hash__(self) -> int:
         return hash(self.name)

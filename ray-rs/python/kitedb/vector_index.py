@@ -16,6 +16,7 @@ from kitedb.schema import NodeDef
 _METRIC_MAP = {
     "cosine": "Cosine",
     "euclidean": "Euclidean",
+    "l2": "Euclidean",
     "dot": "DotProduct",
     "dot_product": "DotProduct",
     "dotproduct": "DotProduct",
@@ -89,7 +90,13 @@ class VectorIndex:
     def __init__(self, options: VectorIndexOptions):
         self._dimensions = options.dimensions
         self._metric = options.metric.lower()
-        self._metric_enum = _METRIC_MAP.get(self._metric, "Cosine")
+        metric_enum = _METRIC_MAP.get(self._metric)
+        if metric_enum is None:
+            raise ValueError(
+                f"unknown metric {options.metric!r}; expected one of: "
+                "cosine, euclidean (l2), dot_product (dot)"
+            )
+        self._metric_enum = metric_enum
         self._row_group_size = options.row_group_size
         self._fragment_target_size = options.fragment_target_size
         self._normalize = options.normalize

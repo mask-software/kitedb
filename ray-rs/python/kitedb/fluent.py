@@ -66,7 +66,7 @@ from typing import (
     overload,
 )
 
-from kitedb._kitedb import Database, OpenOptions
+from kitedb._kitedb import CheckResult, Database, OpenOptions
 
 from .builders import (
     DeleteBuilder,
@@ -81,6 +81,7 @@ from .builders import (
     create_link,
     delete_link,
     from_prop_value,
+    prop_names_by_key_id,
 )
 from .schema import EdgeDef, NodeDef, PropsSchema
 from .traversal import PathFindingBuilder, TraversalBuilder, WeightSpec
@@ -156,9 +157,14 @@ class Kite:
         )
         self._nodes: Dict[str, NodeDef[Any]] = {n.name: n for n in nodes}
         self._edges: Dict[str, EdgeDef] = {e.name: e for e in edges}
+        # Schema ids of this database. Definitions can be shared by several
+        # Kite instances on different databases, so the ids live here and the
+        # definitions are never mutated.
         self._etype_ids: Dict[EdgeDef, int] = {}
-        self._prop_key_ids: Dict[str, int] = {}
-        
+        self._label_ids: Dict[NodeDef[Any], int] = {}
+        self._node_prop_key_ids: Dict[str, Dict[str, int]] = {}
+        self._edge_prop_key_ids: Dict[str, Dict[str, int]] = {}
+
         # Build key prefix -> NodeDef cache for fast lookups
         self._key_prefix_to_node_def: Dict[str, NodeDef[Any]] = {}
         for node_def in nodes:
@@ -168,49 +174,77 @@ class Kite:
                 self._key_prefix_to_node_def[prefix] = node_def
             except Exception:
                 pass
-        
-        # Initialize schema
-        self._init_schema(nodes, edges)
-    
+
+        try:
+            self._init_schema(nodes, edges)
+        except BaseException:
+            # Don't leak the handle (and its file lock) when init fails.
+            try:
+                self._db.close()
+            except Exception:
+                pass
+            raise
+
     def _init_schema(
         self,
         nodes: List[NodeDef[Any]],
         edges: List[EdgeDef],
     ) -> None:
-        """Initialize edge types and property keys."""
-        self._db.begin()
-        try:
-            # Define edge types
-            for edge in edges:
-                etype_id = self._db.get_or_create_etype(edge.name)
-                self._etype_ids[edge] = etype_id
-                edge._etype_id = etype_id
-            
-            # Define property keys for nodes
-            for node in nodes:
-                node._prop_key_ids = {}
-                for prop_name, prop_def in node.props.items():
-                    key = f"{node.name}:{prop_def.name}"
-                    if key not in self._prop_key_ids:
-                        prop_key_id = self._db.get_or_create_propkey(prop_def.name)
-                        self._prop_key_ids[key] = prop_key_id
-                    node._prop_key_ids[prop_name] = self._prop_key_ids[key]
-            
-            # Define property keys for edges
-            for edge in edges:
-                edge._prop_key_ids = {}
-                for prop_name, prop_def in edge.props.items():
-                    key = f"{edge.name}:{prop_def.name}"
-                    if key not in self._prop_key_ids:
-                        prop_key_id = self._db.get_or_create_propkey(prop_def.name)
-                        self._prop_key_ids[key] = prop_key_id
-                    edge._prop_key_ids[prop_name] = self._prop_key_ids[key]
-            
-            self._db.commit()
-        except BaseException:
-            self._db.rollback()
-            raise
-    
+        """Resolve labels, edge types and property keys for this database.
+
+        Existing entries are looked up without a transaction, so a read-only
+        database or a replica opens fine when its schema is complete. A write
+        transaction opens only to create missing entries.
+        """
+        db = self._db
+        labels = {node.name: db.get_label_id(node.name) for node in nodes}
+        etypes = {edge.name: db.get_etype_id(edge.name) for edge in edges}
+        propkeys: Dict[str, Optional[int]] = {}
+        for def_ in [*nodes, *edges]:
+            for prop_def in def_.props.values():
+                if prop_def.name not in propkeys:
+                    propkeys[prop_def.name] = db.get_propkey_id(prop_def.name)
+
+        schema_missing = None in etypes.values() or None in propkeys.values()
+        # Labels only tag nodes this Kite creates. A database written before
+        # Kite defined labels may lack them; if it can't take writes anyway,
+        # open it without labels instead of failing.
+        writable = not db.read_only and db.replica_replication_status() is None
+        labels_missing = None in labels.values() and (writable or schema_missing)
+
+        if schema_missing or labels_missing:
+            db.begin()
+            try:
+                for name, label_id in labels.items():
+                    if label_id is None:
+                        labels[name] = db.get_or_create_label(name)
+                for name, etype_id in etypes.items():
+                    if etype_id is None:
+                        etypes[name] = db.get_or_create_etype(name)
+                for name, prop_key_id in propkeys.items():
+                    if prop_key_id is None:
+                        propkeys[name] = db.get_or_create_propkey(name)
+                db.commit()
+            except BaseException:
+                if db.has_transaction():
+                    db.rollback()
+                raise
+
+        for node in nodes:
+            label_id = labels[node.name]
+            if label_id is not None:
+                self._label_ids[node] = label_id
+            self._node_prop_key_ids[node.name] = {
+                prop_name: propkeys[prop_def.name]  # type: ignore[misc]
+                for prop_name, prop_def in node.props.items()
+            }
+        for edge in edges:
+            self._etype_ids[edge] = etypes[edge.name]  # type: ignore[assignment]
+            self._edge_prop_key_ids[edge.name] = {
+                prop_name: propkeys[prop_def.name]  # type: ignore[misc]
+                for prop_name, prop_def in edge.props.items()
+            }
+
     # ==========================================================================
     # Schema Resolution Helpers
     # ==========================================================================
@@ -228,10 +262,18 @@ class Kite:
         prop_name: str,
     ) -> int:
         """Resolve property key ID from definition."""
-        prop_key_id = def_._prop_key_ids.get(prop_name)
+        if isinstance(def_, NodeDef):
+            ids = self._node_prop_key_ids.get(def_.name)
+        else:
+            ids = self._edge_prop_key_ids.get(def_.name)
+        prop_key_id = ids.get(prop_name) if ids is not None else None
         if prop_key_id is None:
             raise ValueError(f"Unknown property: {prop_name} on {def_.name}")
         return prop_key_id
+
+    def _resolve_label_id(self, node_def: NodeDef[Any]) -> Optional[int]:
+        """Label ID for a node type, or None if the database has none for it."""
+        return self._label_ids.get(node_def)
     
     def _get_node_def(self, node_id: int) -> Optional[NodeDef[Any]]:
         """Get node definition from node ID by matching key prefix."""
@@ -254,9 +296,7 @@ class Kite:
         if all_props is None:
             return props
         
-        # Build reverse mapping: prop_key_id -> prop_name
-        # This is cached on node_def._prop_key_ids
-        key_id_to_name = {v: k for k, v in node_def._prop_key_ids.items()}
+        key_id_to_name = prop_names_by_key_id(node_def, self._resolve_prop_key_id)
         
         for node_prop in all_props:
             prop_name = key_id_to_name.get(node_prop.key_id)
@@ -290,6 +330,7 @@ class Kite:
             db=self._db,
             node_def=node,
             resolve_prop_key_id=self._resolve_prop_key_id,
+            label_id=self._resolve_label_id(node),
         )
 
     def upsert(self, node: NodeDef[Any]) -> UpsertBuilder[NodeDef[Any]]:
@@ -313,6 +354,7 @@ class Kite:
             db=self._db,
             node_def=node,
             resolve_prop_key_id=self._resolve_prop_key_id,
+            label_id=self._resolve_label_id(node),
         )
 
     def upsert_by_id(self, node: NodeDef[Any], node_id: int) -> UpsertByIdBuilder[NodeDef[Any]]:
@@ -334,6 +376,7 @@ class Kite:
             node_def=node,
             node_id=node_id,
             resolve_prop_key_id=self._resolve_prop_key_id,
+            label_id=self._resolve_label_id(node),
         )
     
     @overload
@@ -785,15 +828,15 @@ class Kite:
         """Get database statistics."""
         return self._db.stats()
 
-    def check(self) -> Any:
-        """Check database integrity."""
+    def check(self) -> CheckResult:
+        """Check database integrity, plus this Kite's schema bindings."""
         result = self._db.check()
+        warnings = list(result.warnings)
         for edge_name, edge_def in self._edges.items():
-            if getattr(edge_def, "_etype_id", None) is None:
-                result.warnings.append(
-                    f"Edge type '{edge_name}' has no assigned etype_id"
-                )
-        return result
+            if self._etype_ids.get(edge_def) is None:
+                warnings.append(f"Edge type '{edge_name}' has no assigned etype_id")
+        # CheckResult's lists are copies, so build a new result.
+        return CheckResult(result.valid, list(result.errors), warnings)
     
     def optimize(self) -> None:
         """Optimize the database."""

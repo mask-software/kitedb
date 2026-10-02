@@ -4,7 +4,7 @@ use crate::metrics as core_metrics;
 use pyo3::prelude::*;
 
 /// Cache layer metrics (single layer - property, traversal, or query)
-#[pyclass(name = "CacheLayerMetrics")]
+#[pyclass(name = "CacheLayerMetrics", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct CacheLayerMetrics {
   #[pyo3(get)]
@@ -47,7 +47,7 @@ impl From<core_metrics::CacheLayerMetrics> for CacheLayerMetrics {
 }
 
 /// Cache metrics (all cache layers)
-#[pyclass(name = "CacheMetrics")]
+#[pyclass(name = "CacheMetrics", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct CacheMetrics {
   #[pyo3(get)]
@@ -85,7 +85,7 @@ impl From<core_metrics::CacheMetrics> for CacheMetrics {
 }
 
 /// Data metrics (node/edge counts)
-#[pyclass(name = "DataMetrics")]
+#[pyclass(name = "DataMetrics", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct DataMetrics {
   #[pyo3(get)]
@@ -141,7 +141,7 @@ impl From<core_metrics::DataMetrics> for DataMetrics {
 }
 
 /// MVCC metrics
-#[pyclass(name = "MvccMetrics")]
+#[pyclass(name = "MvccMetrics", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct MvccMetrics {
   #[pyo3(get)]
@@ -185,7 +185,7 @@ impl From<core_metrics::MvccMetrics> for MvccMetrics {
 }
 
 /// Primary replication metrics
-#[pyclass(name = "PrimaryReplicationMetrics")]
+#[pyclass(name = "PrimaryReplicationMetrics", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PrimaryReplicationMetrics {
   #[pyo3(get)]
@@ -250,7 +250,7 @@ impl From<core_metrics::PrimaryReplicationMetrics> for PrimaryReplicationMetrics
 }
 
 /// Replica replication metrics
-#[pyclass(name = "ReplicaReplicationMetrics")]
+#[pyclass(name = "ReplicaReplicationMetrics", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct ReplicaReplicationMetrics {
   #[pyo3(get)]
@@ -285,7 +285,7 @@ impl From<core_metrics::ReplicaReplicationMetrics> for ReplicaReplicationMetrics
 }
 
 /// Replication metrics
-#[pyclass(name = "ReplicationMetrics")]
+#[pyclass(name = "ReplicationMetrics", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct ReplicationMetrics {
   #[pyo3(get)]
@@ -320,7 +320,7 @@ impl From<core_metrics::ReplicationMetrics> for ReplicationMetrics {
 }
 
 /// MVCC stats (from stats())
-#[pyclass(name = "MvccStats")]
+#[pyclass(name = "MvccStats", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct MvccStats {
   #[pyo3(get)]
@@ -350,7 +350,7 @@ impl MvccStats {
 }
 
 /// Memory metrics
-#[pyclass(name = "MemoryMetrics")]
+#[pyclass(name = "MemoryMetrics", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct MemoryMetrics {
   #[pyo3(get)]
@@ -405,7 +405,7 @@ impl From<core_metrics::MemoryMetrics> for MemoryMetrics {
 }
 
 /// Database metrics (complete snapshot)
-#[pyclass(name = "DatabaseMetrics")]
+#[pyclass(name = "DatabaseMetrics", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct DatabaseMetrics {
   #[pyo3(get)]
@@ -458,7 +458,7 @@ impl From<core_metrics::DatabaseMetrics> for DatabaseMetrics {
 }
 
 /// Health check entry
-#[pyclass(name = "HealthCheckEntry")]
+#[pyclass(name = "HealthCheckEntry", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct HealthCheckEntry {
   #[pyo3(get)]
@@ -495,7 +495,7 @@ impl From<core_metrics::HealthCheckEntry> for HealthCheckEntry {
 }
 
 /// Health check result
-#[pyclass(name = "HealthCheckResult")]
+#[pyclass(name = "HealthCheckResult", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct HealthCheckResult {
   #[pyo3(get)]

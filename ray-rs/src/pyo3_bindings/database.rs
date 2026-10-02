@@ -3,7 +3,9 @@
 //! Provides Python access to the single-file database format.
 //! This module contains the main Database class and standalone functions.
 
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::PyValueError;
+
+use crate::pyo3_bindings::errors;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use std::path::PathBuf;
@@ -12,10 +14,10 @@ use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 use crate::api::kite::KiteRuntimeProfile as RustKiteRuntimeProfile;
+use crate::api::traversal::TraversalDirection;
 use crate::backup as core_backup;
 use crate::core::single_file::{
-  close_single_file, close_single_file_with_options, is_single_file_path, open_single_file,
-  SingleFileCloseOptions as RustSingleFileCloseOptions, SingleFileDB as RustSingleFileDB,
+  close_single_file, is_single_file_path, open_single_file, SingleFileDB as RustSingleFileDB,
   VacuumOptions as RustVacuumOptions,
 };
 use crate::metrics as core_metrics;
@@ -23,6 +25,7 @@ use crate::replication::types::CommitToken;
 use crate::types::{ETypeId, EdgeWithProps as CoreEdgeWithProps, NodeId, PropKeyId};
 
 // Import from modular structure
+use super::ops::streaming::{EdgeBatchIterator, NodeBatchIterator};
 use super::ops::{
   cache, edges, export_import, graph_traversal, labels, maintenance, nodes, properties, schema,
   streaming as streaming_ops, transaction, vectors,
@@ -34,9 +37,7 @@ use super::options::{
 };
 use super::stats::{CacheStats, CheckResult, DatabaseMetrics, DbStats, HealthCheckResult};
 use super::traversal::{PyPathEdge, PyPathResult, PyTraversalResult};
-use super::types::{
-  Edge, EdgePage, EdgeWithProps, FullEdge, NodePage, NodeProp, NodeWithProps, PropValue,
-};
+use super::types::{Edge, EdgePage, FullEdge, NodePage, NodeProp, PropValue};
 use super::validation;
 
 type EdgePropsInput = (i64, u32, i64, Vec<(u32, PropValue)>);
@@ -57,13 +58,10 @@ pub(crate) enum DatabaseInner {
 /// Uses read lock for concurrent read access
 macro_rules! dispatch {
   ($self:expr, |$sf:ident| $sf_expr:expr, |$gf:ident| $gf_expr:expr) => {{
-    let guard = $self
-      .inner
-      .read()
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = $self.inner.read().map_err(errors::poisoned)?;
     match guard.as_ref() {
       Some(DatabaseInner::SingleFile($sf)) => $sf_expr,
-      None => Err(PyRuntimeError::new_err("Database is closed")),
+      None => Err(errors::closed()),
     }
   }};
 }
@@ -72,13 +70,10 @@ macro_rules! dispatch {
 /// Uses read lock for concurrent read access
 macro_rules! dispatch_ok {
   ($self:expr, |$sf:ident| $sf_expr:expr, |$gf:ident| $gf_expr:expr) => {{
-    let guard = $self
-      .inner
-      .read()
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = $self.inner.read().map_err(errors::poisoned)?;
     match guard.as_ref() {
       Some(DatabaseInner::SingleFile($sf)) => Ok($sf_expr),
-      None => Err(PyRuntimeError::new_err("Database is closed")),
+      None => Err(errors::closed()),
     }
   }};
 }
@@ -86,13 +81,10 @@ macro_rules! dispatch_ok {
 /// Dispatch for write operations
 macro_rules! dispatch_tx {
   ($self:expr, |$sf:ident| $sf_expr:expr, |$handle:ident| $gf_expr:expr) => {{
-    let guard = $self
-      .inner
-      .read()
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = $self.inner.read().map_err(errors::poisoned)?;
     match guard.as_ref() {
       Some(DatabaseInner::SingleFile($sf)) => $sf_expr,
-      None => Err(PyRuntimeError::new_err("Database is closed")),
+      None => Err(errors::closed()),
     }
   }};
 }
@@ -138,47 +130,58 @@ const TOKEN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 impl PyDatabase {
   fn with_db<T>(&self, f: impl FnOnce(&RustSingleFileDB) -> PyResult<T>) -> PyResult<T> {
-    let guard = self
-      .inner
-      .read()
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self.inner.read().map_err(errors::poisoned)?;
     match guard.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => f(db),
-      None => Err(PyRuntimeError::new_err("Database is closed")),
+      None => Err(errors::closed()),
     }
   }
 
   /// Runs `f` under the read lock with the GIL released.
   ///
-  /// The lock is taken inside `allow_threads`, so this thread never holds it
+  /// The lock is taken inside `detach`, so this thread never holds it
   /// while waiting for the GIL (which would deadlock against a thread that
   /// holds the GIL and waits for the lock).
-  fn with_db_nogil<T: Send>(
+  pub(crate) fn with_db_nogil<T: Send>(
     &self,
     py: Python<'_>,
     f: impl FnOnce(&RustSingleFileDB) -> PyResult<T> + Send,
   ) -> PyResult<T> {
-    py.allow_threads(|| self.with_db(f))
+    py.detach(|| self.with_db(f))
   }
 
-  /// Takes the database out of the handle and closes it with the GIL released.
-  fn close_nogil(
-    &self,
-    py: Python<'_>,
-    close: impl FnOnce(RustSingleFileDB) -> crate::error::Result<()> + Send,
-  ) -> PyResult<()> {
-    py.allow_threads(|| {
-      let mut guard = self
-        .inner
-        .write()
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-      match guard.take() {
-        Some(DatabaseInner::SingleFile(db)) => {
-          close(*db).map_err(|e| PyRuntimeError::new_err(format!("Failed to close: {e}")))
-        }
+  /// Closes the database with the GIL released, after an optional close-time
+  /// checkpoint (when WAL usage is at least `checkpoint_threshold`).
+  ///
+  /// The checkpoint runs under the shared lock: core waits for transactions
+  /// open on other threads to finish, and their commits need that lock. Only
+  /// the close itself takes the exclusive lock, so closing can't deadlock
+  /// against another thread's open transaction. A transaction still open when
+  /// the close runs is discarded, as with a plain close. If the checkpoint
+  /// fails the database is still closed (the WAL keeps every commit), and the
+  /// checkpoint error is raised afterwards.
+  fn close_nogil(&self, py: Python<'_>, checkpoint_threshold: Option<f64>) -> PyResult<()> {
+    py.detach(|| {
+      let checkpoint = match checkpoint_threshold {
+        Some(threshold) => self.close_checkpoint(threshold),
         None => Ok(()),
+      };
+      let mut guard = self.inner.write().map_err(errors::poisoned)?;
+      if let Some(DatabaseInner::SingleFile(db)) = guard.take() {
+        close_single_file(*db).map_err(|e| errors::wrap(e, "Failed to close"))?;
       }
+      checkpoint
     })
+  }
+
+  fn close_checkpoint(&self, threshold: f64) -> PyResult<()> {
+    let guard = self.inner.read().map_err(errors::poisoned)?;
+    match guard.as_ref() {
+      Some(DatabaseInner::SingleFile(db)) if !db.read_only && db.should_checkpoint(threshold) => db
+        .checkpoint()
+        .map_err(|e| errors::wrap(e, "Failed to checkpoint on close")),
+      _ => Ok(()),
+    }
   }
 }
 
@@ -195,7 +198,7 @@ impl PyDatabase {
     let path_buf = PathBuf::from(&path);
 
     if path_buf.exists() && path_buf.is_dir() {
-      return Err(PyRuntimeError::new_err(
+      return Err(errors::KiteError::new_err(
         "Single-file databases require a file path, not a directory",
       ));
     }
@@ -205,15 +208,15 @@ impl PyDatabase {
     } else if path_buf.extension().is_none() {
       PathBuf::from(format!("{path}.kitedb"))
     } else {
-      return Err(PyRuntimeError::new_err(
+      return Err(errors::KiteError::new_err(
         "Single-file databases must use the .kitedb extension",
       ));
     };
 
     let opts = options.to_single_file_options()?;
     let db = py
-      .allow_threads(|| open_single_file(&db_path, opts))
-      .map_err(|e| PyRuntimeError::new_err(format!("Failed to open database: {e}")))?;
+      .detach(|| open_single_file(&db_path, opts))
+      .map_err(|e| errors::wrap(e, "Failed to open database"))?;
     Ok(PyDatabase {
       inner: RwLock::new(Some(DatabaseInner::SingleFile(Box::new(db)))),
     })
@@ -226,18 +229,13 @@ impl PyDatabase {
   }
 
   fn close(&self, py: Python<'_>) -> PyResult<()> {
-    self.close_nogil(py, close_single_file)
+    self.close_nogil(py, None)
   }
 
   #[pyo3(signature = (threshold))]
   fn close_with_checkpoint_if_wal_over(&self, py: Python<'_>, threshold: f64) -> PyResult<()> {
     let threshold = validation::ratio("threshold", threshold)?;
-    self.close_nogil(py, |db| {
-      close_single_file_with_options(
-        db,
-        RustSingleFileCloseOptions::new().checkpoint_if_wal_usage_at_least(threshold),
-      )
-    })
+    self.close_nogil(py, Some(threshold))
   }
 
   fn __enter__(slf: PyRef<'_, Self>) -> PyResult<PyRef<'_, Self>> {
@@ -248,9 +246,9 @@ impl PyDatabase {
   fn __exit__(
     &self,
     py: Python<'_>,
-    _exc_type: Option<PyObject>,
-    _exc_value: Option<PyObject>,
-    _traceback: Option<PyObject>,
+    _exc_type: Option<Py<PyAny>>,
+    _exc_value: Option<Py<PyAny>>,
+    _traceback: Option<Py<PyAny>>,
   ) -> PyResult<bool> {
     self.close(py)?;
     Ok(false)
@@ -258,13 +256,7 @@ impl PyDatabase {
 
   #[getter]
   fn is_open(&self) -> PyResult<bool> {
-    Ok(
-      self
-        .inner
-        .read()
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-        .is_some(),
-    )
+    Ok(self.inner.read().map_err(errors::poisoned)?.is_some())
   }
 
   #[getter]
@@ -317,7 +309,7 @@ impl PyDatabase {
     self.with_db_nogil(py, |db| {
       db.commit_with_token()
         .map(|token| token.map(|value| value.to_string()))
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to commit: {e}")))
+        .map_err(|e| errors::wrap(e, "Failed to commit"))
     })
   }
 
@@ -328,14 +320,13 @@ impl PyDatabase {
   fn wait_for_token(&self, py: Python<'_>, token: String, timeout_ms: i64) -> PyResult<bool> {
     let timeout_ms =
       validation::non_negative_u64("timeout_ms", timeout_ms, validation::MAX_DURATION_MS as u64)?;
-    let token = CommitToken::from_str(&token)
-      .map_err(|e| PyRuntimeError::new_err(format!("Invalid token: {e}")))?;
+    let token = CommitToken::from_str(&token).map_err(|e| errors::wrap(e, "Invalid token"))?;
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    py.allow_threads(|| loop {
+    py.detach(|| loop {
       // A zero timeout makes the core call a single non-blocking check.
       let observed = self.with_db(|db| {
         db.wait_for_token(token, 0)
-          .map_err(|e| PyRuntimeError::new_err(format!("Failed waiting for token: {e}")))
+          .map_err(|e| errors::wrap(e, "Failed waiting for token"))
       })?;
       if observed {
         return Ok(true);
@@ -349,18 +340,15 @@ impl PyDatabase {
   }
 
   /// Primary replication status dictionary when role=primary, else None.
-  fn primary_replication_status(&self, py: Python<'_>) -> PyResult<Option<PyObject>> {
-    let guard = self
-      .inner
-      .read()
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+  fn primary_replication_status(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+    let guard = self.inner.read().map_err(errors::poisoned)?;
     match guard.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
         let Some(status) = db.primary_replication_status() else {
           return Ok(None);
         };
 
-        let out = PyDict::new_bound(py);
+        let out = PyDict::new(py);
         out.set_item("role", status.role.to_string())?;
         out.set_item("epoch", status.epoch)?;
         out.set_item("head_log_index", status.head_log_index)?;
@@ -379,9 +367,9 @@ impl PyDatabase {
         out.set_item("append_failures", status.append_failures)?;
         out.set_item("append_successes", status.append_successes)?;
 
-        let lags = PyList::empty_bound(py);
+        let lags = PyList::empty(py);
         for lag in status.replica_lags {
-          let lag_item = PyDict::new_bound(py);
+          let lag_item = PyDict::new(py);
           lag_item.set_item("replica_id", lag.replica_id)?;
           lag_item.set_item("epoch", lag.epoch)?;
           lag_item.set_item("applied_log_index", lag.applied_log_index)?;
@@ -389,25 +377,22 @@ impl PyDatabase {
         }
         out.set_item("replica_lags", lags)?;
 
-        Ok(Some(out.into_py(py)))
+        Ok(Some(out.into_any().unbind()))
       }
-      None => Err(PyRuntimeError::new_err("Database is closed")),
+      None => Err(errors::closed()),
     }
   }
 
   /// Replica replication status dictionary when role=replica, else None.
-  fn replica_replication_status(&self, py: Python<'_>) -> PyResult<Option<PyObject>> {
-    let guard = self
-      .inner
-      .read()
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+  fn replica_replication_status(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+    let guard = self.inner.read().map_err(errors::poisoned)?;
     match guard.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
         let Some(status) = db.replica_replication_status() else {
           return Ok(None);
         };
 
-        let out = PyDict::new_bound(py);
+        let out = PyDict::new(py);
         out.set_item("role", status.role.to_string())?;
         out.set_item(
           "source_db_path",
@@ -425,9 +410,9 @@ impl PyDatabase {
         out.set_item("applied_log_index", status.applied_log_index)?;
         out.set_item("last_error", status.last_error)?;
         out.set_item("needs_reseed", status.needs_reseed)?;
-        Ok(Some(out.into_py(py)))
+        Ok(Some(out.into_any().unbind()))
       }
-      None => Err(PyRuntimeError::new_err("Database is closed")),
+      None => Err(errors::closed()),
     }
   }
 
@@ -438,7 +423,7 @@ impl PyDatabase {
       |db| db
         .primary_promote_to_next_epoch()
         .map(|value| value as i64)
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to promote primary: {e}"))),
+        .map_err(|e| errors::wrap(e, "Failed to promote primary")),
       |_db| { unreachable!("multi-file database support removed") }
     )
   }
@@ -457,7 +442,7 @@ impl PyDatabase {
       self,
       |db| db
         .primary_report_replica_progress(&replica_id, epoch, applied_log_index)
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to report replica progress: {e}"))),
+        .map_err(|e| errors::wrap(e, "Failed to report replica progress")),
       |_db| { unreachable!("multi-file database support removed") }
     )
   }
@@ -472,7 +457,7 @@ impl PyDatabase {
           outcome.pruned_segments as i64,
           outcome.retained_floor as i64
         ))
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to run retention: {e}"))),
+        .map_err(|e| errors::wrap(e, "Failed to run retention")),
       |_db| { unreachable!("multi-file database support removed") }
     )
   }
@@ -484,9 +469,7 @@ impl PyDatabase {
       self,
       |db| db
         .primary_export_snapshot_transport_json(include_data)
-        .map_err(|e| {
-          PyRuntimeError::new_err(format!("Failed to export replication snapshot: {e}"))
-        }),
+        .map_err(|e| errors::wrap(e, "Failed to export replication snapshot")),
       |_db| { unreachable!("multi-file database support removed") }
     )
   }
@@ -511,7 +494,7 @@ impl PyDatabase {
           max_bytes,
           include_payload,
         )
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to export replication log: {e}"))),
+        .map_err(|e| errors::wrap(e, "Failed to export replication log")),
       |_db| { unreachable!("multi-file database support removed") }
     )
   }
@@ -520,7 +503,7 @@ impl PyDatabase {
   fn replica_bootstrap_from_snapshot(&self, py: Python<'_>) -> PyResult<()> {
     self.with_db_nogil(py, |db| {
       db.replica_bootstrap_from_snapshot()
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to bootstrap replica: {e}")))
+        .map_err(|e| errors::wrap(e, "Failed to bootstrap replica"))
     })
   }
 
@@ -531,7 +514,7 @@ impl PyDatabase {
     self.with_db_nogil(py, |db| {
       db.replica_catch_up_once(max_frames)
         .map(|count| count as i64)
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed replica catch-up: {e}")))
+        .map_err(|e| errors::wrap(e, "Failed replica catch-up"))
     })
   }
 
@@ -539,7 +522,7 @@ impl PyDatabase {
   fn replica_reseed_from_snapshot(&self, py: Python<'_>) -> PyResult<()> {
     self.with_db_nogil(py, |db| {
       db.replica_reseed_from_snapshot()
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to reseed replica: {e}")))
+        .map_err(|e| errors::wrap(e, "Failed to reseed replica"))
     })
   }
 
@@ -613,40 +596,55 @@ impl PyDatabase {
     )
   }
 
+  /// Create keyed nodes with properties (and optional labels) in one batch.
+  ///
+  /// Inside an open transaction the batch joins it. Otherwise it runs in its
+  /// own transaction: a bulk-load one (the fast path) unless MVCC is enabled,
+  /// which bulk load does not support.
+  #[pyo3(signature = (input_nodes, labels=None))]
   fn batch_create_nodes(
     &self,
     py: Python<'_>,
     input_nodes: Vec<(String, Vec<(u32, PropValue)>)>,
+    labels: Option<Vec<u32>>,
   ) -> PyResult<Vec<i64>> {
+    let labels = labels.unwrap_or_default();
     self.with_db_nogil(py, |db| {
-      let mut ids = Vec::with_capacity(input_nodes.len());
-      let mut keys = Vec::with_capacity(input_nodes.len());
-      let mut props_list = Vec::with_capacity(input_nodes.len());
-      for (key, props) in input_nodes {
-        keys.push(key);
-        props_list.push(props);
-      }
-
-      db.begin_bulk()
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to begin bulk: {e}")))?;
-      let result: Result<(), PyErr> = (|| {
-        let key_refs: Vec<Option<&str>> = keys.iter().map(|k| Some(k.as_str())).collect();
+      let write = || -> PyResult<Vec<i64>> {
+        let key_refs: Vec<Option<&str>> = input_nodes
+          .iter()
+          .map(|(key, _)| Some(key.as_str()))
+          .collect();
         let node_ids = db
           .create_nodes_batch(&key_refs)
-          .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        for (node_id, props) in node_ids.iter().copied().zip(props_list.iter()) {
-          for (k, v) in props.iter() {
-            db.set_node_prop(node_id, *k as PropKeyId, v.clone().into())
-              .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+          .map_err(|e| errors::wrap(e, "Failed to create nodes"))?;
+        for (node_id, (_, props)) in node_ids.iter().copied().zip(&input_nodes) {
+          for &label_id in &labels {
+            db.add_node_label(node_id, label_id)
+              .map_err(|e| errors::wrap(e, "Failed to add label"))?;
           }
-          ids.push(node_id as i64);
+          for (key_id, value) in props {
+            db.set_node_prop(node_id, *key_id as PropKeyId, value.clone().into())
+              .map_err(|e| errors::wrap(e, "Failed to set property"))?;
+          }
         }
-        Ok(())
-      })();
-      match result {
-        Ok(()) => {
+        Ok(node_ids.into_iter().map(|id| id as i64).collect())
+      };
+
+      if db.has_transaction() {
+        return write();
+      }
+      if db.mvcc_enabled() {
+        db.begin(false)
+          .map_err(|e| errors::wrap(e, "Failed to begin transaction"))?;
+      } else {
+        db.begin_bulk()
+          .map_err(|e| errors::wrap(e, "Failed to begin bulk"))?;
+      }
+      match write() {
+        Ok(ids) => {
           db.commit()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            .map_err(|e| errors::wrap(e, "Failed to commit"))?;
           Ok(ids)
         }
         Err(e) => {
@@ -659,19 +657,16 @@ impl PyDatabase {
 
   /// Create multiple nodes in a single WAL record (fast path)
   fn create_nodes_batch(&self, keys: Vec<Option<String>>) -> PyResult<Vec<i64>> {
-    let guard = self
-      .inner
-      .read()
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self.inner.read().map_err(errors::poisoned)?;
     match guard.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
         let key_refs: Vec<Option<&str>> = keys.iter().map(|k| k.as_deref()).collect();
         let node_ids = db
           .create_nodes_batch(&key_refs)
-          .map_err(|e| PyRuntimeError::new_err(format!("Failed to create nodes: {e}")))?;
+          .map_err(|e| errors::wrap(e, "Failed to create nodes"))?;
         Ok(node_ids.into_iter().map(|id| id as i64).collect())
       }
-      None => Err(PyRuntimeError::new_err("Database is closed")),
+      None => Err(errors::closed()),
     }
   }
 
@@ -687,15 +682,12 @@ impl PyDatabase {
         ))
       })
       .collect::<PyResult<_>>()?;
-    let guard = self
-      .inner
-      .read()
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self.inner.read().map_err(errors::poisoned)?;
     match guard.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => db
         .add_edges_batch(&core_edges)
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to add edges: {e}"))),
-      None => Err(PyRuntimeError::new_err("Database is closed")),
+        .map_err(|e| errors::wrap(e, "Failed to add edges")),
+      None => Err(errors::closed()),
     }
   }
 
@@ -716,15 +708,12 @@ impl PyDatabase {
         ))
       })
       .collect::<PyResult<_>>()?;
-    let guard = self
-      .inner
-      .read()
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self.inner.read().map_err(errors::poisoned)?;
     match guard.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => db
         .add_edges_with_props_batch(core_edges)
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to add edges: {e}"))),
-      None => Err(PyRuntimeError::new_err("Database is closed")),
+        .map_err(|e| errors::wrap(e, "Failed to add edges")),
+      None => Err(errors::closed()),
     }
   }
 
@@ -772,15 +761,12 @@ impl PyDatabase {
   fn add_edge_by_name(&self, src: i64, etype_name: &str, dst: i64) -> PyResult<()> {
     let src = validation::node_id("src", src)?;
     let dst = validation::node_id("dst", dst)?;
-    let guard = self
-      .inner
-      .read()
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self.inner.read().map_err(errors::poisoned)?;
     match guard.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
         edges::add_edge_by_name_single(db, src, etype_name, dst)
       }
-      None => Err(PyRuntimeError::new_err("Database is closed")),
+      None => Err(errors::closed()),
     }
   }
 
@@ -895,15 +881,12 @@ impl PyDatabase {
 
   fn set_node_prop_by_name(&self, node_id: i64, key_name: &str, value: PropValue) -> PyResult<()> {
     let node_id = validation::node_id("node_id", node_id)?;
-    let guard = self
-      .inner
-      .read()
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self.inner.read().map_err(errors::poisoned)?;
     match guard.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
         properties::set_node_prop_by_name_single(db, node_id, key_name, value.into())
       }
-      None => Err(PyRuntimeError::new_err("Database is closed")),
+      None => Err(errors::closed()),
     }
   }
 
@@ -977,10 +960,7 @@ impl PyDatabase {
   ) -> PyResult<()> {
     let src = validation::node_id("src", src)?;
     let dst = validation::node_id("dst", dst)?;
-    let guard = self
-      .inner
-      .read()
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self.inner.read().map_err(errors::poisoned)?;
     match guard.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => properties::set_edge_prop_by_name_single(
         db,
@@ -990,7 +970,7 @@ impl PyDatabase {
         key_name,
         value.into(),
       ),
-      None => Err(PyRuntimeError::new_err("Database is closed")),
+      None => Err(errors::closed()),
     }
   }
 
@@ -1155,15 +1135,12 @@ impl PyDatabase {
 
   fn add_node_label_by_name(&self, node_id: i64, label_name: &str) -> PyResult<()> {
     let node_id = validation::node_id("node_id", node_id)?;
-    let guard = self
-      .inner
-      .read()
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let guard = self.inner.read().map_err(errors::poisoned)?;
     match guard.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
         labels::add_node_label_by_name_single(db, node_id, label_name)
       }
-      None => Err(PyRuntimeError::new_err("Database is closed")),
+      None => Err(errors::closed()),
     }
   }
 
@@ -1315,11 +1292,8 @@ impl PyDatabase {
     for &node_id in &start_ids {
       validation::node_id("start_ids", node_id)?;
     }
-    dispatch_ok!(
-      self,
-      |db| graph_traversal::traverse_multi_single(db, start_ids.clone(), steps.clone()),
-      |db| graph_traversal::traverse_multi_single(db, start_ids.clone(), steps.clone())
-    )
+    let steps = validation::traversal_steps(steps)?;
+    self.with_db(|db| Ok(graph_traversal::traverse_multi_single(db, start_ids, steps)))
   }
 
   fn traverse_multi_count(
@@ -1330,11 +1304,12 @@ impl PyDatabase {
     for &node_id in &start_ids {
       validation::node_id("start_ids", node_id)?;
     }
-    dispatch_ok!(
-      self,
-      |db| graph_traversal::traverse_multi_count_single(db, start_ids.clone(), steps.clone()),
-      |db| graph_traversal::traverse_multi_count_single(db, start_ids.clone(), steps.clone())
-    )
+    let steps = validation::traversal_steps(steps)?;
+    self.with_db(|db| {
+      Ok(graph_traversal::traverse_multi_count_single(
+        db, start_ids, steps,
+      ))
+    })
   }
 
   #[pyo3(signature = (node_id, max_depth, etype=None, min_depth=None, direction=None, unique=None))]
@@ -1353,31 +1328,14 @@ impl PyDatabase {
       .map(|depth| validation::non_negative_usize("min_depth", depth, validation::MAX_DEPTH))
       .transpose()?;
     if min_depth.unwrap_or(1) > max_depth {
-      return Err(pyo3::exceptions::PyValueError::new_err(
-        "min_depth must be <= max_depth",
-      ));
+      return Err(PyValueError::new_err("min_depth must be <= max_depth"));
     }
-    dispatch_ok!(
-      self,
-      |db| graph_traversal::traverse_single(
-        db,
-        node_id,
-        max_depth,
-        etype,
-        min_depth,
-        direction.clone(),
-        unique
-      ),
-      |db| graph_traversal::traverse_single(
-        db,
-        node_id,
-        max_depth,
-        etype,
-        min_depth,
-        direction.clone(),
-        unique
-      )
-    )
+    let direction = validation::direction("direction", direction.as_deref())?;
+    self.with_db(|db| {
+      Ok(graph_traversal::traverse_single(
+        db, node_id, max_depth, etype, min_depth, direction, unique,
+      ))
+    })
   }
 
   #[pyo3(signature = (source, target, etype=None, max_depth=None, direction=None))]
@@ -1389,30 +1347,13 @@ impl PyDatabase {
     max_depth: Option<i64>,
     direction: Option<String>,
   ) -> PyResult<PyPathResult> {
-    let source = validation::node_id("source", source)?;
-    let target = validation::node_id("target", target)?;
-    let max_depth = max_depth
-      .map(|depth| validation::non_negative_usize("max_depth", depth, validation::MAX_DEPTH))
-      .transpose()?;
-    dispatch_ok!(
-      self,
-      |db| graph_traversal::find_path_bfs_single(
-        db,
-        source,
-        target,
-        etype,
-        max_depth,
-        direction.clone()
-      ),
-      |db| graph_traversal::find_path_bfs_single(
-        db,
-        source,
-        target,
-        etype,
-        max_depth,
-        direction.clone()
-      )
-    )
+    let (source, target, max_depth, direction) =
+      path_args(source, target, max_depth, direction.as_deref())?;
+    self.with_db(|db| {
+      Ok(graph_traversal::find_path_bfs_single(
+        db, source, target, etype, max_depth, direction,
+      ))
+    })
   }
 
   #[pyo3(signature = (source, target, etype=None, max_depth=None, direction=None))]
@@ -1424,30 +1365,13 @@ impl PyDatabase {
     max_depth: Option<i64>,
     direction: Option<String>,
   ) -> PyResult<PyPathResult> {
-    let source = validation::node_id("source", source)?;
-    let target = validation::node_id("target", target)?;
-    let max_depth = max_depth
-      .map(|depth| validation::non_negative_usize("max_depth", depth, validation::MAX_DEPTH))
-      .transpose()?;
-    dispatch_ok!(
-      self,
-      |db| graph_traversal::find_path_dijkstra_single(
-        db,
-        source,
-        target,
-        etype,
-        max_depth,
-        direction.clone()
-      ),
-      |db| graph_traversal::find_path_dijkstra_single(
-        db,
-        source,
-        target,
-        etype,
-        max_depth,
-        direction.clone()
-      )
-    )
+    let (source, target, max_depth, direction) =
+      path_args(source, target, max_depth, direction.as_deref())?;
+    self.with_db(|db| {
+      Ok(graph_traversal::find_path_dijkstra_single(
+        db, source, target, etype, max_depth, direction,
+      ))
+    })
   }
 
   #[pyo3(signature = (source, target, etype=None, max_depth=None, direction=None))]
@@ -1459,61 +1383,31 @@ impl PyDatabase {
     max_depth: Option<i64>,
     direction: Option<String>,
   ) -> PyResult<bool> {
-    let source = validation::node_id("source", source)?;
-    let target = validation::node_id("target", target)?;
-    let max_depth = max_depth
-      .map(|depth| validation::non_negative_usize("max_depth", depth, validation::MAX_DEPTH))
-      .transpose()?;
-    let path = dispatch_ok!(
-      self,
-      |db| graph_traversal::find_path_bfs_single(
-        db,
-        source,
-        target,
-        etype,
-        max_depth,
-        direction.clone()
-      ),
-      |db| graph_traversal::find_path_bfs_single(
-        db,
-        source,
-        target,
-        etype,
-        max_depth,
-        direction.clone()
+    let (source, target, max_depth, direction) =
+      path_args(source, target, max_depth, direction.as_deref())?;
+    self.with_db(|db| {
+      Ok(
+        graph_traversal::find_path_bfs_single(db, source, target, etype, max_depth, direction)
+          .found,
       )
-    )?;
-    Ok(path.found)
+    })
   }
 
   #[pyo3(signature = (source, max_depth, etype=None))]
   fn reachable_nodes(&self, source: i64, max_depth: i64, etype: Option<u32>) -> PyResult<Vec<i64>> {
     let source = validation::node_id("source", source)?;
     let max_depth = validation::non_negative_usize("max_depth", max_depth, validation::MAX_DEPTH)?;
-    let min_depth = Some(1);
-    let direction = Some("out".to_string());
-    let unique = Some(true);
-    let results = dispatch_ok!(
-      self,
-      |db| graph_traversal::traverse_single(
+    let results = self.with_db(|db| {
+      Ok(graph_traversal::traverse_single(
         db,
         source,
         max_depth,
         etype,
-        min_depth,
-        direction.clone(),
-        unique
-      ),
-      |db| graph_traversal::traverse_single(
-        db,
-        source,
-        max_depth,
-        etype,
-        min_depth,
-        direction.clone(),
-        unique
-      )
-    )?;
+        Some(1),
+        TraversalDirection::Out,
+        Some(true),
+      ))
+    })?;
     Ok(results.into_iter().map(|r| r.node_id).collect())
   }
 
@@ -1683,62 +1577,48 @@ impl PyDatabase {
   // Streaming Operations
   // ==========================================================================
 
+  /// Iterate node ids in batches (lists of ints), built lazily.
   #[pyo3(signature = (options=None))]
-  fn stream_nodes(&self, options: Option<StreamOptions>) -> PyResult<Vec<Vec<i64>>> {
-    let opts = match options {
-      Some(o) => o.to_rust()?,
-      None => crate::streaming::StreamOptions::default(),
-    };
-    dispatch_ok!(
-      self,
-      |db| streaming_ops::stream_nodes_single(db, opts.clone()),
-      |db| streaming_ops::stream_nodes_single(db, opts.clone())
-    )
+  fn stream_nodes(
+    slf: PyRef<'_, Self>,
+    py: Python<'_>,
+    options: Option<StreamOptions>,
+  ) -> PyResult<NodeBatchIterator> {
+    let opts = options.unwrap_or_default().to_rust()?;
+    NodeBatchIterator::new(py, slf.into(), opts, false)
   }
 
+  /// Iterate nodes with keys and properties in batches, built lazily.
   #[pyo3(signature = (options=None))]
   fn stream_nodes_with_props(
-    &self,
+    slf: PyRef<'_, Self>,
+    py: Python<'_>,
     options: Option<StreamOptions>,
-  ) -> PyResult<Vec<Vec<NodeWithProps>>> {
-    let opts = match options {
-      Some(o) => o.to_rust()?,
-      None => crate::streaming::StreamOptions::default(),
-    };
-    dispatch_ok!(
-      self,
-      |db| streaming_ops::stream_nodes_with_props_single(db, opts.clone()),
-      |db| streaming_ops::stream_nodes_with_props_single(db, opts.clone())
-    )
+  ) -> PyResult<NodeBatchIterator> {
+    let opts = options.unwrap_or_default().to_rust()?;
+    NodeBatchIterator::new(py, slf.into(), opts, true)
   }
 
+  /// Iterate edges in batches (lists of FullEdge), built lazily.
   #[pyo3(signature = (options=None))]
-  fn stream_edges(&self, options: Option<StreamOptions>) -> PyResult<Vec<Vec<FullEdge>>> {
-    let opts = match options {
-      Some(o) => o.to_rust()?,
-      None => crate::streaming::StreamOptions::default(),
-    };
-    dispatch_ok!(
-      self,
-      |db| streaming_ops::stream_edges_single(db, opts.clone()),
-      |db| streaming_ops::stream_edges_single(db, opts.clone())
-    )
+  fn stream_edges(
+    slf: PyRef<'_, Self>,
+    py: Python<'_>,
+    options: Option<StreamOptions>,
+  ) -> PyResult<EdgeBatchIterator> {
+    let opts = options.unwrap_or_default().to_rust()?;
+    EdgeBatchIterator::new(py, slf.into(), opts, false)
   }
 
+  /// Iterate edges with properties in batches, built lazily.
   #[pyo3(signature = (options=None))]
   fn stream_edges_with_props(
-    &self,
+    slf: PyRef<'_, Self>,
+    py: Python<'_>,
     options: Option<StreamOptions>,
-  ) -> PyResult<Vec<Vec<EdgeWithProps>>> {
-    let opts = match options {
-      Some(o) => o.to_rust()?,
-      None => crate::streaming::StreamOptions::default(),
-    };
-    dispatch_ok!(
-      self,
-      |db| streaming_ops::stream_edges_with_props_single(db, opts.clone()),
-      |db| streaming_ops::stream_edges_with_props_single(db, opts.clone())
-    )
+  ) -> PyResult<EdgeBatchIterator> {
+    let opts = options.unwrap_or_default().to_rust()?;
+    EdgeBatchIterator::new(py, slf.into(), opts, true)
   }
 
   #[pyo3(signature = (options=None))]
@@ -1844,57 +1724,45 @@ pub fn recommended_reopen_heavy_profile() -> RuntimeProfile {
 
 #[pyfunction]
 pub fn collect_metrics(db: &PyDatabase) -> PyResult<DatabaseMetrics> {
-  let guard = db
-    .inner
-    .read()
-    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+  let guard = db.inner.read().map_err(errors::poisoned)?;
   match guard.as_ref() {
     Some(DatabaseInner::SingleFile(d)) => Ok(DatabaseMetrics::from(
       core_metrics::collect_metrics_single_file(d),
     )),
-    None => Err(PyRuntimeError::new_err("Database is closed")),
+    None => Err(errors::closed()),
   }
 }
 
 #[pyfunction]
 pub fn collect_replication_metrics_prometheus(db: &PyDatabase) -> PyResult<String> {
-  let guard = db
-    .inner
-    .read()
-    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+  let guard = db.inner.read().map_err(errors::poisoned)?;
   match guard.as_ref() {
     Some(DatabaseInner::SingleFile(d)) => {
       Ok(core_metrics::collect_replication_metrics_prometheus_single_file(d))
     }
-    None => Err(PyRuntimeError::new_err("Database is closed")),
+    None => Err(errors::closed()),
   }
 }
 
 #[pyfunction]
 pub fn collect_replication_metrics_otel_json(db: &PyDatabase) -> PyResult<String> {
-  let guard = db
-    .inner
-    .read()
-    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+  let guard = db.inner.read().map_err(errors::poisoned)?;
   match guard.as_ref() {
     Some(DatabaseInner::SingleFile(d)) => {
       Ok(core_metrics::collect_replication_metrics_otel_json_single_file(d))
     }
-    None => Err(PyRuntimeError::new_err("Database is closed")),
+    None => Err(errors::closed()),
   }
 }
 
 #[pyfunction]
 pub fn collect_replication_metrics_otel_protobuf(db: &PyDatabase) -> PyResult<Vec<u8>> {
-  let guard = db
-    .inner
-    .read()
-    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+  let guard = db.inner.read().map_err(errors::poisoned)?;
   match guard.as_ref() {
     Some(DatabaseInner::SingleFile(d)) => {
       Ok(core_metrics::collect_replication_metrics_otel_protobuf_single_file(d))
     }
-    None => Err(PyRuntimeError::new_err("Database is closed")),
+    None => Err(errors::closed()),
   }
 }
 
@@ -1904,15 +1772,12 @@ pub fn collect_replication_snapshot_transport_json(
   db: &PyDatabase,
   include_data: bool,
 ) -> PyResult<String> {
-  let guard = db
-    .inner
-    .read()
-    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+  let guard = db.inner.read().map_err(errors::poisoned)?;
   match guard.as_ref() {
     Some(DatabaseInner::SingleFile(d)) => d
       .primary_export_snapshot_transport_json(include_data)
-      .map_err(|e| PyRuntimeError::new_err(format!("Failed to export replication snapshot: {e}"))),
-    None => Err(PyRuntimeError::new_err("Database is closed")),
+      .map_err(|e| errors::wrap(e, "Failed to export replication snapshot")),
+    None => Err(errors::closed()),
   }
 }
 
@@ -1928,15 +1793,12 @@ pub fn collect_replication_log_transport_json(
   let max_frames = validation::positive_usize("max_frames", max_frames, validation::MAX_COUNT)?;
   let max_bytes = validation::positive_usize("max_bytes", max_bytes, validation::MAX_BYTES)?;
 
-  let guard = db
-    .inner
-    .read()
-    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+  let guard = db.inner.read().map_err(errors::poisoned)?;
   match guard.as_ref() {
     Some(DatabaseInner::SingleFile(d)) => d
       .primary_export_log_transport_json(cursor.as_deref(), max_frames, max_bytes, include_payload)
-      .map_err(|e| PyRuntimeError::new_err(format!("Failed to export replication log: {e}"))),
-    None => Err(PyRuntimeError::new_err("Database is closed")),
+      .map_err(|e| errors::wrap(e, "Failed to export replication log")),
+    None => Err(errors::closed()),
   }
 }
 
@@ -2005,7 +1867,7 @@ fn build_otel_push_options_py(
     }
     Some(value) if value.eq_ignore_ascii_case("ewma") => core_metrics::OtlpAdaptiveRetryMode::Ewma,
     Some(_) => {
-      return Err(PyRuntimeError::new_err(
+      return Err(errors::KiteError::new_err(
         "adaptive_retry_mode must be one of: linear, ewma",
       ));
     }
@@ -2039,7 +1901,7 @@ fn build_otel_push_options_py(
   }
   if let Some(path) = circuit_breaker_state_path.as_deref() {
     if path.trim().is_empty() {
-      return Err(PyRuntimeError::new_err(
+      return Err(errors::KiteError::new_err(
         "circuit_breaker_state_path must not be empty when provided",
       ));
     }
@@ -2047,38 +1909,38 @@ fn build_otel_push_options_py(
   if let Some(url) = circuit_breaker_state_url.as_deref() {
     let trimmed = url.trim();
     if trimmed.is_empty() {
-      return Err(PyRuntimeError::new_err(
+      return Err(errors::KiteError::new_err(
         "circuit_breaker_state_url must not be empty when provided",
       ));
     }
     if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
-      return Err(PyRuntimeError::new_err(
+      return Err(errors::KiteError::new_err(
         "circuit_breaker_state_url must use http:// or https://",
       ));
     }
     if https_only && trimmed.starts_with("http://") {
-      return Err(PyRuntimeError::new_err(
+      return Err(errors::KiteError::new_err(
         "circuit_breaker_state_url must use https when https_only is enabled",
       ));
     }
   }
   if circuit_breaker_state_path.is_some() && circuit_breaker_state_url.is_some() {
-    return Err(PyRuntimeError::new_err(
+    return Err(errors::KiteError::new_err(
       "circuit_breaker_state_path and circuit_breaker_state_url are mutually exclusive",
     ));
   }
   if circuit_breaker_state_patch && circuit_breaker_state_url.is_none() {
-    return Err(PyRuntimeError::new_err(
+    return Err(errors::KiteError::new_err(
       "circuit_breaker_state_patch requires circuit_breaker_state_url",
     ));
   }
   if circuit_breaker_state_patch_batch && !circuit_breaker_state_patch {
-    return Err(PyRuntimeError::new_err(
+    return Err(errors::KiteError::new_err(
       "circuit_breaker_state_patch_batch requires circuit_breaker_state_patch",
     ));
   }
   if circuit_breaker_state_patch_merge && !circuit_breaker_state_patch {
-    return Err(PyRuntimeError::new_err(
+    return Err(errors::KiteError::new_err(
       "circuit_breaker_state_patch_merge requires circuit_breaker_state_patch",
     ));
   }
@@ -2098,25 +1960,25 @@ fn build_otel_push_options_py(
     validation::MAX_COUNT,
   )?;
   if circuit_breaker_state_cas && circuit_breaker_state_url.is_none() {
-    return Err(PyRuntimeError::new_err(
+    return Err(errors::KiteError::new_err(
       "circuit_breaker_state_cas requires circuit_breaker_state_url",
     ));
   }
   if let Some(lease_id) = circuit_breaker_state_lease_id.as_deref() {
     if lease_id.trim().is_empty() {
-      return Err(PyRuntimeError::new_err(
+      return Err(errors::KiteError::new_err(
         "circuit_breaker_state_lease_id must not be empty when provided",
       ));
     }
     if circuit_breaker_state_url.is_none() {
-      return Err(PyRuntimeError::new_err(
+      return Err(errors::KiteError::new_err(
         "circuit_breaker_state_lease_id requires circuit_breaker_state_url",
       ));
     }
   }
   if let Some(scope_key) = circuit_breaker_scope_key.as_deref() {
     if scope_key.trim().is_empty() {
-      return Err(PyRuntimeError::new_err(
+      return Err(errors::KiteError::new_err(
         "circuit_breaker_scope_key must not be empty when provided",
       ));
     }
@@ -2258,7 +2120,7 @@ pub fn push_replication_metrics_otel_json(
     let result = core_metrics::push_replication_metrics_otel_json_single_file_with_options(
       d, &endpoint, &options,
     )
-    .map_err(|e| PyRuntimeError::new_err(format!("Failed to push replication metrics: {e}")))?;
+    .map_err(|e| errors::wrap(e, "Failed to push replication metrics"))?;
     Ok((result.status_code, result.response_body))
   })
 }
@@ -2365,7 +2227,7 @@ pub fn push_replication_metrics_otel_protobuf(
     let result = core_metrics::push_replication_metrics_otel_protobuf_single_file_with_options(
       d, &endpoint, &options,
     )
-    .map_err(|e| PyRuntimeError::new_err(format!("Failed to push replication metrics: {e}")))?;
+    .map_err(|e| errors::wrap(e, "Failed to push replication metrics"))?;
     Ok((result.status_code, result.response_body))
   })
 }
@@ -2472,22 +2334,19 @@ pub fn push_replication_metrics_otel_grpc(
     let result = core_metrics::push_replication_metrics_otel_grpc_single_file_with_options(
       d, &endpoint, &options,
     )
-    .map_err(|e| PyRuntimeError::new_err(format!("Failed to push replication metrics: {e}")))?;
+    .map_err(|e| errors::wrap(e, "Failed to push replication metrics"))?;
     Ok((result.status_code, result.response_body))
   })
 }
 
 #[pyfunction]
 pub fn health_check(db: &PyDatabase) -> PyResult<HealthCheckResult> {
-  let guard = db
-    .inner
-    .read()
-    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+  let guard = db.inner.read().map_err(errors::poisoned)?;
   match guard.as_ref() {
     Some(DatabaseInner::SingleFile(d)) => Ok(HealthCheckResult::from(
       core_metrics::health_check_single_file(d),
     )),
-    None => Err(PyRuntimeError::new_err("Database is closed")),
+    None => Err(errors::closed()),
   }
 }
 
@@ -2504,7 +2363,7 @@ pub fn create_backup(
   db.with_db_nogil(py, |d| {
     core_backup::create_backup_single_file(d, &path, opts)
       .map(BackupResult::from)
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+      .map_err(errors::wrap_plain)
   })
 }
 
@@ -2517,16 +2376,16 @@ pub fn restore_backup(
   options: Option<RestoreOptions>,
 ) -> PyResult<String> {
   let opts: core_backup::RestoreOptions = options.unwrap_or_default().into();
-  py.allow_threads(|| core_backup::restore_backup(backup_path, restore_path, opts))
+  py.detach(|| core_backup::restore_backup(backup_path, restore_path, opts))
     .map(|p| p.to_string_lossy().to_string())
-    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    .map_err(errors::wrap_plain)
 }
 
 #[pyfunction]
 pub fn backup_info(backup_path: String) -> PyResult<BackupResult> {
   core_backup::backup_info(backup_path)
     .map(BackupResult::from)
-    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    .map_err(errors::wrap_plain)
 }
 
 #[pyfunction]
@@ -2538,9 +2397,25 @@ pub fn create_offline_backup(
   options: Option<OfflineBackupOptions>,
 ) -> PyResult<BackupResult> {
   let opts: core_backup::OfflineBackupOptions = options.unwrap_or_default().into();
-  py.allow_threads(|| core_backup::create_offline_backup(db_path, backup_path, opts))
+  py.detach(|| core_backup::create_offline_backup(db_path, backup_path, opts))
     .map(BackupResult::from)
-    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    .map_err(errors::wrap_plain)
+}
+
+/// Validates the shared pathfinding arguments.
+fn path_args(
+  source: i64,
+  target: i64,
+  max_depth: Option<i64>,
+  direction: Option<&str>,
+) -> PyResult<(NodeId, NodeId, Option<usize>, TraversalDirection)> {
+  let source = validation::node_id("source", source)?;
+  let target = validation::node_id("target", target)?;
+  let max_depth = max_depth
+    .map(|depth| validation::non_negative_usize("max_depth", depth, validation::MAX_DEPTH))
+    .transpose()?;
+  let direction = validation::direction("direction", direction)?;
+  Ok((source, target, max_depth, direction))
 }
 
 // ============================================================================

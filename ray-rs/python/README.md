@@ -164,6 +164,53 @@ async def read_users():
 
 Note: Python's GIL is released during Rust operations, allowing true parallelism for I/O-bound database access.
 
+`close()` never deadlocks against a transaction open on another thread. A close-time
+checkpoint (`close_with_checkpoint_if_wal_over`, and `Kite.close()`) waits for such a
+transaction to finish first; a transaction still open when the database closes is discarded.
+
+## Errors
+
+Failed operations raise `kitedb.KiteError` or one of its subclasses. `KiteError` subclasses
+`RuntimeError`, so existing `except RuntimeError` handlers keep working. Invalid arguments
+(an unknown `direction`, `metric` or `aggregation`, out-of-range numbers) raise `ValueError`.
+
+| Exception | Raised when |
+| --- | --- |
+| `ConflictError` | an MVCC transaction conflicts with a concurrent commit (retry it) |
+| `ReadOnlyError` | a write is attempted on a read-only database |
+| `NotFoundError` | a node, edge or key doesn't exist |
+| `ClosedError` | the database handle is closed |
+| `TransactionError` | no transaction is open on this thread, or one already is |
+| `DuplicateKeyError` | a node with the key already exists |
+| `LockError` | another process holds the database file lock |
+| `CorruptionError` | on-disk data fails validation |
+| `WalFullError` | the WAL is full; checkpoint before writing more |
+
+```python
+from kitedb import ConflictError
+
+try:
+    db.begin()
+    db.set_node_prop(node_id, key_id, PropValue.int(1))
+    db.commit()
+except ConflictError:
+    db.rollback()  # retry the transaction
+```
+
+## Streaming
+
+`stream_nodes`, `stream_nodes_with_props`, `stream_edges` and `stream_edges_with_props`
+return lazy iterators of batches (`StreamOptions(batch_size=...)`, default 1000). Each batch
+is built when you ask for it, so memory stays proportional to one batch.
+
+```python
+from kitedb import StreamOptions
+
+for batch in db.stream_nodes_with_props(StreamOptions(batch_size=500)):
+    for node in batch:
+        print(node.id, node.key, len(node.props))
+```
+
 ## Vector search
 
 ```python
@@ -277,6 +324,27 @@ print(log_json)
 
 replica.close()
 primary.close()
+```
+
+To guard host HTTP endpoints for these controls, use `create_replication_admin_authorizer`
+with a `ReplicationAdminAuthConfig`. `mode` is required (`"none"` disables auth explicitly),
+and a config that can't be checked safely raises `ValueError`. Tokens are compared in constant
+time. The mTLS modes need a check: prefer `mtls_matcher=create_asgi_tls_mtls_matcher()`, which
+reads the server's verified TLS state. A client-certificate header forwarded by a
+TLS-terminating proxy (`mtls_header`, default `x-forwarded-client-cert`) counts only with
+`trust_forwarded_client_cert=True` and an `mtls_subject_regex` that matches the whole header
+value; any client can send that header, so enable it only behind a proxy that verifies client
+certificates and overwrites it on every request.
+
+```python
+import os
+
+from kitedb import ReplicationAdminAuthConfig, create_replication_admin_authorizer
+
+require_admin = create_replication_admin_authorizer(
+    ReplicationAdminAuthConfig(mode="token", token=os.environ["REPLICATION_ADMIN_TOKEN"])
+)
+require_admin(request)  # raises PermissionError when unauthorized
 ```
 
 ## Documentation

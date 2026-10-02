@@ -130,6 +130,20 @@ def from_prop_value(pv: PropValue) -> Any:
     return pv.value()
 
 
+def prop_names_by_key_id(
+    def_: Union[NodeDef[Any], EdgeDef],
+    resolve_prop_key_id: Callable[[Any, str], int],
+) -> Dict[int, str]:
+    """Map property key IDs back to the definition's property names."""
+    names: Dict[int, str] = {}
+    for prop_name in def_.props:
+        try:
+            names[resolve_prop_key_id(def_, prop_name)] = prop_name
+        except ValueError:
+            continue
+    return names
+
+
 # ============================================================================
 # Insert Builder
 # ============================================================================
@@ -139,6 +153,8 @@ class InsertExecutor(Generic[N]):
     Executor for insert operations.
     
     Can either return the created node(s) or execute without returning.
+    The caller's dicts are never modified, and an executor can run again
+    (for example after the transaction it ran in was rolled back).
     """
     
     def __init__(
@@ -148,6 +164,7 @@ class InsertExecutor(Generic[N]):
         data: Union[Dict[str, Any], List[Dict[str, Any]]],
         resolve_prop_key_id: Callable[[NodeDef, str], int],
         use_batch: bool = False,
+        label_id: Optional[int] = None,
     ):
         self._db = db
         self._node_def = node_def
@@ -155,14 +172,45 @@ class InsertExecutor(Generic[N]):
         self._is_single = not isinstance(data, list)
         self._resolve_prop_key_id = resolve_prop_key_id
         self._use_batch = use_batch
+        self._label_id = label_id
+
+    def _prepare(self, item: Dict[str, Any]) -> Tuple[str, Dict[str, Any], List[Tuple[int, PropValue]]]:
+        """Return (full key, props for the NodeRef, property writes) for one item."""
+        from kitedb._kitedb import PropValue
+
+        props = dict(item)  # never mutate the caller's dict
+        key_arg = props.pop("key", None)
+        if key_arg is None:
+            raise ValueError("Insert requires a 'key' field")
+        full_key = self._node_def.key_fn(key_arg)
+
+        writes: List[Tuple[int, PropValue]] = []
+        for prop_name, value in props.items():
+            if value is None:
+                continue
+            prop_def = self._node_def.props.get(prop_name)
+            if prop_def is None:
+                continue
+            prop_key_id = self._resolve_prop_key_id(self._node_def, prop_name)
+            writes.append((prop_key_id, to_prop_value(prop_def, value, PropValue)))
+        return full_key, props, writes
     
     def returning(self) -> Union[NodeRef[N], List[NodeRef[N]]]:
         """Execute insert and return the created node(s)."""
-        from kitedb._kitedb import PropValue
-        
-        # For batch inserts with many items, use Rust batch API
-        if self._use_batch and len(self._data) > 1:
-            return self._returning_batch()
+        prepared = [self._prepare(item) for item in self._data]
+
+        # For batch inserts with many items, use the native batch API. It
+        # joins an open transaction, and otherwise commits on its own.
+        if self._use_batch and len(prepared) > 1:
+            labels = [self._label_id] if self._label_id is not None else None
+            node_ids = self._db.batch_create_nodes(
+                [(full_key, writes) for full_key, _, writes in prepared], labels
+            )
+            results = [
+                NodeRef(id=node_id, key=full_key, node_def=self._node_def, props=props)
+                for node_id, (full_key, props, _) in zip(node_ids, prepared)
+            ]
+            return results[0] if self._is_single else results
         
         results: List[NodeRef[N]] = []
         
@@ -171,33 +219,17 @@ class InsertExecutor(Generic[N]):
         if not in_tx:
             self._db.begin()
         try:
-            for item in self._data:
-                key_arg = item.pop("key", None)
-                if key_arg is None:
-                    raise ValueError("Insert requires a 'key' field")
-                
-                full_key = self._node_def.key_fn(key_arg)
-                
-                # Create the node
+            for full_key, props, writes in prepared:
                 node_id = self._db.create_node(full_key)
-                
-                # Set properties
-                for prop_name, value in item.items():
-                    if value is None:
-                        continue
-                    prop_def = self._node_def.props.get(prop_name)
-                    if prop_def is None:
-                        continue
-                    
-                    prop_key_id = self._resolve_prop_key_id(self._node_def, prop_name)
-                    prop_value = to_prop_value(prop_def, value, PropValue)
+                if self._label_id is not None:
+                    self._db.add_node_label(node_id, self._label_id)
+                for prop_key_id, prop_value in writes:
                     self._db.set_node_prop(node_id, prop_key_id, prop_value)
-                
                 results.append(NodeRef(
                     id=node_id,
                     key=full_key,
                     node_def=self._node_def,
-                    props=item,
+                    props=props,
                 ))
             
             if not in_tx:
@@ -206,53 +238,6 @@ class InsertExecutor(Generic[N]):
             if not in_tx:
                 self._db.rollback()
             raise
-        
-        return results[0] if self._is_single else results
-    
-    def _returning_batch(self) -> Union[NodeRef[N], List[NodeRef[N]]]:
-        """Execute batch insert using Rust batch API."""
-        from kitedb._kitedb import PropValue
-        
-        # Prepare batch data: list of (key, [(prop_key_id, PropValue)])
-        batch_nodes = []
-        items_for_results = []
-        
-        for item in self._data:
-            item_copy = dict(item)  # Copy to preserve for results
-            key_arg = item_copy.pop("key", None)
-            if key_arg is None:
-                raise ValueError("Insert requires a 'key' field")
-            
-            full_key = self._node_def.key_fn(key_arg)
-            
-            # Build props list
-            props_list = []
-            for prop_name, value in item_copy.items():
-                if value is None:
-                    continue
-                prop_def = self._node_def.props.get(prop_name)
-                if prop_def is None:
-                    continue
-                
-                prop_key_id = self._resolve_prop_key_id(self._node_def, prop_name)
-                prop_value = to_prop_value(prop_def, value, PropValue)
-                props_list.append((prop_key_id, prop_value))
-            
-            batch_nodes.append((full_key, props_list))
-            items_for_results.append((full_key, item_copy))
-        
-        # Execute batch insert in Rust
-        node_ids = self._db.batch_create_nodes(batch_nodes)
-        
-        # Build results
-        results = []
-        for node_id, (full_key, item) in zip(node_ids, items_for_results):
-            results.append(NodeRef(
-                id=node_id,
-                key=full_key,
-                node_def=self._node_def,
-                props=item,
-            ))
         
         return results[0] if self._is_single else results
     
@@ -278,10 +263,12 @@ class InsertBuilder(Generic[N]):
         db: Database,
         node_def: N,
         resolve_prop_key_id: Callable[[NodeDef, str], int],
+        label_id: Optional[int] = None,
     ):
         self._db = db
         self._node_def = node_def
         self._resolve_prop_key_id = resolve_prop_key_id
+        self._label_id = label_id
     
     def values(
         self,
@@ -326,16 +313,18 @@ class InsertBuilder(Generic[N]):
                 data=data,
                 resolve_prop_key_id=self._resolve_prop_key_id,
                 use_batch=True,
+                label_id=self._label_id,
             )
         elif kwargs:
             data = {**data, **kwargs}
-        # else: use data as-is
+        # else: use data as-is (the executor copies it)
 
         return InsertExecutor(
             db=self._db,
             node_def=self._node_def,
             data=data,
             resolve_prop_key_id=self._resolve_prop_key_id,
+            label_id=self._label_id,
         )
     
     def values_many(self, data: List[Dict[str, Any]], *, batch: bool = True) -> InsertExecutor[N]:
@@ -362,6 +351,7 @@ class InsertBuilder(Generic[N]):
             data=data,
             resolve_prop_key_id=self._resolve_prop_key_id,
             use_batch=batch,
+            label_id=self._label_id,
         )
 
 
@@ -382,12 +372,14 @@ class UpsertExecutor(Generic[N]):
         node_def: N,
         data: Union[Dict[str, Any], List[Dict[str, Any]]],
         resolve_prop_key_id: Callable[[NodeDef, str], int],
+        label_id: Optional[int] = None,
     ):
         self._db = db
         self._node_def = node_def
         self._data = data if isinstance(data, list) else [data]
         self._is_single = not isinstance(data, list)
         self._resolve_prop_key_id = resolve_prop_key_id
+        self._label_id = label_id
     
     def returning(self) -> Union[NodeRef[N], List[NodeRef[N]]]:
         """Execute upsert and return the node(s)."""
@@ -420,13 +412,18 @@ class UpsertExecutor(Generic[N]):
                         prop_value = to_prop_value(prop_def, value, PropValue)
                         prop_updates.append((prop_key_id, prop_value))
                 
+                created = self._db.get_node_by_key(full_key) is None
                 node_id = self._db.upsert_node(full_key, prop_updates)
+                if created and self._label_id is not None:
+                    self._db.add_node_label(node_id, self._label_id)
                 
                 # Load full props for returning
                 props: Dict[str, Any] = {}
                 all_props = self._db.get_node_props(node_id)
                 if all_props is not None:
-                    key_id_to_name = {v: k for k, v in self._node_def._prop_key_ids.items()}
+                    key_id_to_name = prop_names_by_key_id(
+                        self._node_def, self._resolve_prop_key_id
+                    )
                     for node_prop in all_props:
                         prop_name = key_id_to_name.get(node_prop.key_id)
                         if prop_name is not None:
@@ -470,10 +467,12 @@ class UpsertBuilder(Generic[N]):
         db: Database,
         node_def: N,
         resolve_prop_key_id: Callable[[NodeDef, str], int],
+        label_id: Optional[int] = None,
     ):
         self._db = db
         self._node_def = node_def
         self._resolve_prop_key_id = resolve_prop_key_id
+        self._label_id = label_id
     
     def values(
         self,
@@ -495,6 +494,7 @@ class UpsertBuilder(Generic[N]):
                 node_def=self._node_def,
                 data=data,
                 resolve_prop_key_id=self._resolve_prop_key_id,
+                label_id=self._label_id,
             )
         elif kwargs:
             data = {**data, **kwargs}
@@ -504,6 +504,7 @@ class UpsertBuilder(Generic[N]):
             node_def=self._node_def,
             data=data,
             resolve_prop_key_id=self._resolve_prop_key_id,
+            label_id=self._label_id,
         )
     
     def values_many(self, data: List[Dict[str, Any]]) -> UpsertExecutor[N]:
@@ -515,6 +516,7 @@ class UpsertBuilder(Generic[N]):
             node_def=self._node_def,
             data=data,
             resolve_prop_key_id=self._resolve_prop_key_id,
+            label_id=self._label_id,
         )
 
 # ============================================================================
@@ -748,12 +750,14 @@ class UpsertByIdExecutor:
         node_id: int,
         data: Dict[str, Any],
         resolve_prop_key_id: Callable[[NodeDef, str], int],
+        label_id: Optional[int] = None,
     ):
         self._db = db
         self._node_def = node_def
         self._node_id = node_id
         self._data = data
         self._resolve_prop_key_id = resolve_prop_key_id
+        self._label_id = label_id
 
     def execute(self) -> None:
         """Execute the upsert."""
@@ -778,7 +782,10 @@ class UpsertByIdExecutor:
         if not in_tx:
             self._db.begin()
         try:
+            created = not self._db.node_exists(self._node_id)
             self._db.upsert_node_by_id(self._node_id, prop_updates)
+            if created and self._label_id is not None:
+                self._db.add_node_label(self._node_id, self._label_id)
             if not in_tx:
                 self._db.commit()
         except BaseException:
@@ -801,11 +808,13 @@ class UpsertByIdBuilder(Generic[N]):
         node_def: N,
         node_id: int,
         resolve_prop_key_id: Callable[[NodeDef, str], int],
+        label_id: Optional[int] = None,
     ):
         self._db = db
         self._node_def = node_def
         self._node_id = node_id
         self._resolve_prop_key_id = resolve_prop_key_id
+        self._label_id = label_id
 
     def set(self, data: Optional[Dict[str, Any]] = None, **kwargs: Any) -> UpsertByIdExecutor:
         """
@@ -829,6 +838,7 @@ class UpsertByIdBuilder(Generic[N]):
             node_id=self._node_id,
             data=data,
             resolve_prop_key_id=self._resolve_prop_key_id,
+            label_id=self._label_id,
         )
 
 
@@ -1268,4 +1278,5 @@ __all__ = [
     "delete_link",
     "to_prop_value",
     "from_prop_value",
+    "prop_names_by_key_id",
 ]

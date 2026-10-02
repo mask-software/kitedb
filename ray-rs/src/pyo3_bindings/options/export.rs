@@ -5,7 +5,7 @@ use crate::pyo3_bindings::validation;
 use pyo3::prelude::*;
 
 /// Options for exporting a database
-#[pyclass(name = "ExportOptions")]
+#[pyclass(name = "ExportOptions", from_py_object)]
 #[derive(Debug, Clone, Default)]
 pub struct ExportOptions {
   #[pyo3(get, set)]
@@ -65,7 +65,7 @@ impl ExportOptions {
 }
 
 /// Options for importing into a database
-#[pyclass(name = "ImportOptions")]
+#[pyclass(name = "ImportOptions", from_py_object)]
 #[derive(Debug, Clone, Default)]
 pub struct ImportOptions {
   #[pyo3(get, set)]
@@ -112,7 +112,7 @@ impl ImportOptions {
 }
 
 /// Export result information
-#[pyclass(name = "ExportResult")]
+#[pyclass(name = "ExportResult", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct ExportResult {
   #[pyo3(get)]
@@ -140,7 +140,7 @@ impl ExportResult {
 }
 
 /// Import result information
-#[pyclass(name = "ImportResult")]
+#[pyclass(name = "ImportResult", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct ImportResult {
   #[pyo3(get)]

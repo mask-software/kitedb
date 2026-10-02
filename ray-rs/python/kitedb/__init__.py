@@ -50,12 +50,27 @@ Low-level API (for advanced use):
 """
 
 from kitedb._kitedb import (
+    # Exceptions
+    KiteError,
+    ConflictError,
+    ReadOnlyError,
+    NotFoundError,
+    ClosedError,
+    TransactionError,
+    DuplicateKeyError,
+    LockError,
+    CorruptionError,
+    WalFullError,
+
     # Core classes
     Database,
     OpenOptions,
     RuntimeProfile,
     SyncMode,
     SnapshotParseMode,
+    CompressionOptions,
+    SingleFileOptimizeOptions,
+    VacuumOptions,
     DbStats,
     CheckResult,
     CacheStats,
@@ -69,11 +84,16 @@ from kitedb._kitedb import (
     EdgeWithProps,
     NodePage,
     EdgePage,
+    NodeBatchIterator,
+    EdgeBatchIterator,
     CacheLayerMetrics,
     CacheMetrics,
     DataMetrics,
     MvccMetrics,
     MvccStats,
+    PrimaryReplicationMetrics,
+    ReplicaReplicationMetrics,
+    ReplicationMetrics,
     MemoryMetrics,
     DatabaseMetrics,
     HealthCheckEntry,
@@ -100,6 +120,7 @@ from kitedb._kitedb import (
     SearchOptions,
     SearchResult,
     IvfStats,
+    BruteForceResult,
     
     # Functions
     open_database,
@@ -118,6 +139,7 @@ from kitedb._kitedb import (
     health_check,
     create_backup,
     restore_backup,
+    backup_info,
     backup_info as get_backup_info,
     create_offline_backup,
     version,
@@ -237,6 +259,21 @@ __all__ = [
     "PathResult",
     
     # ==========================================================================
+    # Errors (all subclass KiteError, which subclasses RuntimeError)
+    # ==========================================================================
+
+    "KiteError",
+    "ConflictError",
+    "ReadOnlyError",
+    "NotFoundError",
+    "ClosedError",
+    "TransactionError",
+    "DuplicateKeyError",
+    "LockError",
+    "CorruptionError",
+    "WalFullError",
+
+    # ==========================================================================
     # Low-level API
     # ==========================================================================
     
@@ -246,6 +283,9 @@ __all__ = [
     "RuntimeProfile",
     "SyncMode",
     "SnapshotParseMode",
+    "CompressionOptions",
+    "SingleFileOptimizeOptions",
+    "VacuumOptions",
     "DbStats",
     "CheckResult",
     "CacheStats",
@@ -259,11 +299,16 @@ __all__ = [
     "EdgeWithProps",
     "NodePage",
     "EdgePage",
+    "NodeBatchIterator",
+    "EdgeBatchIterator",
     "CacheLayerMetrics",
     "CacheMetrics",
     "DataMetrics",
     "MvccMetrics",
     "MvccStats",
+    "PrimaryReplicationMetrics",
+    "ReplicaReplicationMetrics",
+    "ReplicationMetrics",
     "MemoryMetrics",
     "DatabaseMetrics",
     "HealthCheckEntry",
@@ -290,6 +335,7 @@ __all__ = [
     "SearchOptions",
     "SearchResult",
     "IvfStats",
+    "BruteForceResult",
     
     # Functions
     "open_database",
@@ -308,6 +354,7 @@ __all__ = [
     "health_check",
     "create_backup",
     "restore_backup",
+    "backup_info",
     "get_backup_info",
     "create_offline_backup",
     "version",

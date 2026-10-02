@@ -115,7 +115,7 @@ def test_traversal_select_edges():
             assert edges[0].props.get("since") == 2020
             assert edges[0]["src"] == alice.id
             assert edges[0]["dst"] == bob.id
-            assert edges[0]["etype"] == knows._etype_id
+            assert edges[0]["etype"] == db._resolve_etype_id(knows)
 
             recent = (
                 db.from_(alice)

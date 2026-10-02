@@ -1,6 +1,6 @@
 //! Maintenance operations for Python bindings
 
-use pyo3::exceptions::PyRuntimeError;
+use crate::pyo3_bindings::errors;
 use pyo3::prelude::*;
 
 use crate::core::single_file::{
@@ -34,12 +34,12 @@ pub trait MaintenanceOps {
 
 pub fn checkpoint_single(db: &RustSingleFileDB) -> PyResult<()> {
   db.checkpoint()
-    .map_err(|e| PyRuntimeError::new_err(format!("Failed to checkpoint: {e}")))
+    .map_err(|e| errors::wrap(e, "Failed to checkpoint"))
 }
 
 pub fn background_checkpoint_single(db: &RustSingleFileDB) -> PyResult<()> {
   db.background_checkpoint()
-    .map_err(|e| PyRuntimeError::new_err(format!("Failed to background checkpoint: {e}")))
+    .map_err(|e| errors::wrap(e, "Failed to background checkpoint"))
 }
 
 pub fn should_checkpoint_single(db: &RustSingleFileDB, threshold: f64) -> bool {
@@ -51,12 +51,12 @@ pub fn optimize_single(
   options: Option<RustSingleFileOptimizeOptions>,
 ) -> PyResult<()> {
   db.optimize_single_file(options)
-    .map_err(|e| PyRuntimeError::new_err(format!("Failed to optimize: {e}")))
+    .map_err(|e| errors::wrap(e, "Failed to optimize"))
 }
 
 pub fn vacuum_single(db: &RustSingleFileDB, options: Option<RustVacuumOptions>) -> PyResult<()> {
   db.vacuum_single_file(options)
-    .map_err(|e| PyRuntimeError::new_err(format!("Failed to vacuum: {e}")))
+    .map_err(|e| errors::wrap(e, "Failed to vacuum"))
 }
 
 pub fn stats_single(db: &RustSingleFileDB) -> DbStats {

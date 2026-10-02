@@ -9,7 +9,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 /// Compression options for database optimization
-#[pyclass(name = "CompressionOptions")]
+#[pyclass(name = "CompressionOptions", from_py_object)]
 #[derive(Debug, Clone, Default)]
 pub struct CompressionOptions {
   #[pyo3(get, set)]
@@ -81,7 +81,7 @@ impl CompressionOptions {
 }
 
 /// Options for optimizing a single-file database
-#[pyclass(name = "SingleFileOptimizeOptions")]
+#[pyclass(name = "SingleFileOptimizeOptions", from_py_object)]
 #[derive(Debug, Clone, Default)]
 pub struct SingleFileOptimizeOptions {
   #[pyo3(get, set)]
@@ -116,7 +116,7 @@ impl SingleFileOptimizeOptions {
 }
 
 /// Options for vacuuming a single-file database
-#[pyclass(name = "VacuumOptions")]
+#[pyclass(name = "VacuumOptions", skip_from_py_object)]
 #[derive(Debug, Clone, Default)]
 pub struct VacuumOptions {
   #[pyo3(get, set)]

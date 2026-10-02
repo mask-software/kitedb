@@ -1,6 +1,6 @@
 //! Vector operations for Python bindings
 
-use pyo3::exceptions::PyRuntimeError;
+use crate::pyo3_bindings::errors;
 use pyo3::prelude::*;
 
 use crate::core::single_file::SingleFileDB as RustSingleFileDB;
@@ -29,7 +29,7 @@ pub fn set_node_vector_single(
   vector: &[f32],
 ) -> PyResult<()> {
   db.set_node_vector(node_id, prop_key_id, vector)
-    .map_err(|e| PyRuntimeError::new_err(format!("Failed to set vector: {e}")))
+    .map_err(|e| errors::wrap(e, "Failed to set vector"))
 }
 
 pub fn node_vector_single(
@@ -47,7 +47,7 @@ pub fn delete_node_vector_single(
   prop_key_id: PropKeyId,
 ) -> PyResult<()> {
   db.delete_node_vector(node_id, prop_key_id)
-    .map_err(|e| PyRuntimeError::new_err(format!("Failed to delete vector: {e}")))
+    .map_err(|e| errors::wrap(e, "Failed to delete vector"))
 }
 
 pub fn has_node_vector_single(

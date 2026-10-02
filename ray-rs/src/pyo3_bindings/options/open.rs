@@ -21,7 +21,7 @@ use std::str::FromStr;
 /// - "full": Fsync on every commit (durable to OS, slowest)
 /// - "normal": Fsync only on checkpoint (~1000x faster, safe from app crash)
 /// - "off": No fsync (fastest, data may be lost on any crash)
-#[pyclass(name = "SyncMode")]
+#[pyclass(name = "SyncMode", from_py_object)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SyncMode {
   pub(crate) mode: RustSyncMode,
@@ -67,7 +67,7 @@ impl SyncMode {
 ///
 /// - "strict": Fail open if snapshot parsing fails
 /// - "salvage": Ignore snapshot parse errors and recover from WAL only
-#[pyclass(name = "SnapshotParseMode")]
+#[pyclass(name = "SnapshotParseMode", from_py_object)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SnapshotParseMode {
   pub(crate) mode: RustSnapshotParseMode,
@@ -100,7 +100,7 @@ impl SnapshotParseMode {
 }
 
 /// Options for opening a database
-#[pyclass(name = "OpenOptions")]
+#[pyclass(name = "OpenOptions", from_py_object)]
 #[derive(Debug, Clone, Default)]
 pub struct OpenOptions {
   /// Open in read-only mode
@@ -597,7 +597,7 @@ impl OpenOptions {
 }
 
 /// Runtime profile preset for open/close behavior.
-#[pyclass(name = "RuntimeProfile")]
+#[pyclass(name = "RuntimeProfile", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct RuntimeProfile {
   /// Open-time options for Database(path, options)

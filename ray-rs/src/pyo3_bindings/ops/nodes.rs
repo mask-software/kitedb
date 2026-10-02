@@ -1,6 +1,6 @@
 //! Node operations for Python bindings
 
-use pyo3::exceptions::PyRuntimeError;
+use crate::pyo3_bindings::errors;
 use pyo3::prelude::*;
 
 use crate::core::single_file::SingleFileDB as RustSingleFileDB;
@@ -38,14 +38,14 @@ pub trait NodeOps {
 pub fn create_node_single(db: &RustSingleFileDB, key: Option<&str>) -> PyResult<i64> {
   let node_id = db
     .create_node(key)
-    .map_err(|e| PyRuntimeError::new_err(format!("Failed to create node: {e}")))?;
+    .map_err(|e| errors::wrap(e, "Failed to create node"))?;
   Ok(node_id as i64)
 }
 
 /// Delete node on single-file database
 pub fn delete_node_single(db: &RustSingleFileDB, node_id: NodeId) -> PyResult<()> {
   db.delete_node(node_id)
-    .map_err(|e| PyRuntimeError::new_err(format!("Failed to delete node: {e}")))
+    .map_err(|e| errors::wrap(e, "Failed to delete node"))
 }
 
 /// Check node exists on single-file database
@@ -83,17 +83,17 @@ pub fn upsert_node_single(
     Some(id) => id,
     None => db
       .create_node(Some(key))
-      .map_err(|e| PyRuntimeError::new_err(format!("Failed to create node: {e}")))?,
+      .map_err(|e| errors::wrap(e, "Failed to create node"))?,
   };
 
   for (prop_key_id, value_opt) in props {
     match value_opt {
       Some(value) => db
         .set_node_prop(node_id, *prop_key_id, value.clone())
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to set prop: {e}")))?,
+        .map_err(|e| errors::wrap(e, "Failed to set prop"))?,
       None => db
         .delete_node_prop(node_id, *prop_key_id)
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to delete prop: {e}")))?,
+        .map_err(|e| errors::wrap(e, "Failed to delete prop"))?,
     }
   }
 
@@ -108,17 +108,17 @@ pub fn upsert_node_by_id_single(
 ) -> PyResult<i64> {
   if !db.node_exists(node_id) {
     db.create_node_with_id(node_id, None)
-      .map_err(|e| PyRuntimeError::new_err(format!("Failed to create node: {e}")))?;
+      .map_err(|e| errors::wrap(e, "Failed to create node"))?;
   }
 
   for (prop_key_id, value_opt) in props {
     match value_opt {
       Some(value) => db
         .set_node_prop(node_id, *prop_key_id, value.clone())
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to set prop: {e}")))?,
+        .map_err(|e| errors::wrap(e, "Failed to set prop"))?,
       None => db
         .delete_node_prop(node_id, *prop_key_id)
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to delete prop: {e}")))?,
+        .map_err(|e| errors::wrap(e, "Failed to delete prop"))?,
     }
   }
 
