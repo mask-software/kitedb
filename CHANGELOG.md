@@ -82,6 +82,7 @@ All notable changes to this project will be documented in this file.
 - Checkpoints drop vectors of nodes that no longer exist instead of copying them into every snapshot.
 - A replication primary in Normal or Off sync mode now publishes and fsyncs its buffered sidecar frames, and persists the manifest, before a checkpoint resets the WAL. A crash right after a checkpoint no longer leaves the sidecar fenced for a reseed. If the publish fails, the sidecar is fenced for repair and the checkpoint still completes.
 - Read-only opens no longer replay a WAL record that extends past the WAL head.
+- Deleting a node created since the last checkpoint scanned every edge added since then, so committing many such deletes was quadratic: 10k deletes among 1M uncheckpointed edges took about 95 s of CPU. Each delete now costs the node's own edges (about 0.1 s for the same commit).
 
 ### Security
 - Playground: uploads are stored under a fixed name in a private temp directory, so a crafted filename can no longer write outside it. The server binds `127.0.0.1` by default (`PLAYGROUND_HOST`), allows only listed CORS origins (`PLAYGROUND_ALLOWED_ORIGINS`), opens databases only inside `PLAYGROUND_DATA_DIR`, and disables replication admin endpoints unless `REPLICATION_ADMIN_TOKEN` or mTLS is configured (tokens compared in constant time).

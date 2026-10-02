@@ -165,13 +165,6 @@ impl DeltaState {
     } else {
       self.in_add.entry(dst).or_default().insert(in_patch);
     }
-
-    // Track reverse index for O(k) cleanup on node deletion
-    self
-      .incoming_edge_sources
-      .entry(dst)
-      .or_default()
-      .insert(src);
   }
 
   /// Delete edge with cancellation logic
@@ -235,7 +228,6 @@ impl DeltaState {
     self.new_propkeys.clear();
     self.key_index.clear();
     self.key_index_deleted.clear();
-    self.incoming_edge_sources.clear();
     self.pending_vectors.clear();
   }
 
@@ -297,28 +289,8 @@ impl DeltaState {
         self.key_index.remove(key);
       }
 
-      // Clean up outgoing edges from this node
-      self.out_add.remove(&node_id);
-
-      // Clean up incoming edges to this node
-      // We need to remove edges where this node is the destination
-      if let Some(sources) = self.incoming_edge_sources.remove(&node_id) {
-        for src in sources {
-          if let Some(patches) = self.out_add.get_mut(&src) {
-            patches.retain(|p| p.other != node_id);
-            if patches.is_empty() {
-              self.out_add.remove(&src);
-            }
-          }
-        }
-      }
-
-      // Clean up in_add entries
-      self.in_add.remove(&node_id);
-      for patches in self.in_add.values_mut() {
-        patches.retain(|p| p.other != node_id);
-      }
-      self.in_add.retain(|_, patches| !patches.is_empty());
+      // Its edges, found through its own patch sets: O(its degree).
+      self.drop_edge_patches(node_id);
 
       return;
     }
@@ -350,7 +322,8 @@ impl DeltaState {
   }
 
   /// Drop every edge patch (add or tombstone, both directions) incident to
-  /// `node_id`.
+  /// `node_id`. Patches are kept in both directions, so the node's own
+  /// `out_*` and `in_*` sets name every one of them.
   fn drop_edge_patches(&mut self, node_id: NodeId) {
     for added in [true, false] {
       let (out_map, in_map) = if added {
@@ -373,7 +346,6 @@ impl DeltaState {
         self.remove_edge_patch(src, etype, dst, added);
       }
     }
-    self.incoming_edge_sources.remove(&node_id);
   }
 
   /// Get node delta (for created or modified nodes)
@@ -771,6 +743,31 @@ mod tests {
     delta.delete_node(n);
     assert!(delta.is_node_removed(n));
     assert_eq!(delta.key_owner_over(None, "new"), None);
+  }
+
+  #[test]
+  fn test_delete_created_node_drops_only_its_edges() {
+    let mut delta = DeltaState::new();
+    for node in 1..=4 {
+      delta.create_node(node, None);
+    }
+    delta.add_edge(1, 10, 2);
+    delta.add_edge(3, 10, 1);
+    delta.add_edge(1, 10, 1);
+    delta.add_edge(3, 10, 4);
+    delta.add_edge(2, 11, 3);
+    delta.delete_node(1);
+    for map in [&delta.out_add, &delta.in_add] {
+      assert!(
+        map
+          .iter()
+          .all(|(&node, patches)| node != 1 && patches.iter().all(|p| p.other != 1)),
+        "an edge patch of the deleted node survived: {map:?}"
+      );
+    }
+    assert!(delta.is_edge_added(3, 10, 4) && delta.is_edge_added(2, 11, 3));
+    assert_eq!(delta.total_edges_added(), 2);
+    assert_eq!(delta.in_add.values().map(|s| s.len()).sum::<usize>(), 2);
   }
 
   #[test]
