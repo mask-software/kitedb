@@ -38,6 +38,8 @@ pub(crate) enum IoEvent {
 #[cfg(test)]
 thread_local! {
   static SYSCALLS: Cell<usize> = const { Cell::new(0) };
+  static READ_SYSCALLS: Cell<usize> = const { Cell::new(0) };
+  static SYNC_KINDS: RefCell<Option<Vec<SyncKind>>> = const { RefCell::new(None) };
   static SHORT_READS: Cell<Option<ShortReads>> = const { Cell::new(None) };
   static BEFORE_CREATE_LOCK: RefCell<Option<CreateHook>> = const { RefCell::new(None) };
   static IO_LOG: RefCell<Option<Vec<IoEvent>>> = const { RefCell::new(None) };
@@ -58,6 +60,35 @@ fn log_io(event: impl FnOnce() -> IoEvent) {
 pub(super) fn syscall() {
   #[cfg(test)]
   SYSCALLS.with(|count| count.set(count.get() + 1));
+}
+
+/// Note one system call made for a read (it counts as a [`syscall`] too).
+#[inline]
+pub(super) fn read_syscall() {
+  syscall();
+  #[cfg(test)]
+  READ_SYSCALLS.with(|count| count.set(count.get() + 1));
+}
+
+/// How much of a file's state a sync makes durable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SyncKind {
+  /// The file's data, and the metadata needed to read it back (fdatasync).
+  Data,
+  /// The file's data and all its metadata, its length included (fsync).
+  Full,
+}
+
+/// Note that a sync of `kind` is about to reach the OS.
+#[inline]
+pub(super) fn sync_kind(kind: SyncKind) {
+  #[cfg(test)]
+  SYNC_KINDS.with(|log| {
+    if let Some(log) = log.borrow_mut().as_mut() {
+      log.push(kind);
+    }
+  });
+  let _ = kind;
 }
 
 /// The part of `buffer` one read at file `offset` may fill: all of it, unless
@@ -129,6 +160,27 @@ pub(crate) fn syscalls_during<R>(run: impl FnOnce() -> R) -> (R, usize) {
   let before = SYSCALLS.with(Cell::get);
   let result = run();
   (result, SYSCALLS.with(Cell::get) - before)
+}
+
+/// Run `run`, returning its result and the read system calls page I/O made
+/// on this thread.
+#[cfg(test)]
+pub(crate) fn reads_during<R>(run: impl FnOnce() -> R) -> (R, usize) {
+  let before = READ_SYSCALLS.with(Cell::get);
+  let result = run();
+  (result, READ_SYSCALLS.with(Cell::get) - before)
+}
+
+/// Run `run`, returning its result and the kinds of the syncs it asked the
+/// pager for on this thread, oldest first.
+#[cfg(test)]
+pub(crate) fn sync_kinds_during<R>(run: impl FnOnce() -> R) -> (R, Vec<SyncKind>) {
+  SYNC_KINDS.with(|log| *log.borrow_mut() = Some(Vec::new()));
+  let result = run();
+  (
+    result,
+    SYNC_KINDS.with(|log| log.take().unwrap_or_default()),
+  )
 }
 
 /// Run `run` with every read at a file offset from `from_offset` on, on this

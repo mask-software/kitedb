@@ -11,6 +11,21 @@ use crate::util::crc::crc32;
 // WAL Record
 // ============================================================================
 
+#[cfg(test)]
+thread_local! {
+  /// Bytes [`WalRecord::build`] encoded on this thread.
+  static BUILT_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Run `run`, returning its result and the record bytes it encoded
+/// ([`WalRecord::build`]) on this thread.
+#[cfg(test)]
+pub(crate) fn built_bytes_during<R>(run: impl FnOnce() -> R) -> (R, usize) {
+  let before = BUILT_BYTES.with(std::cell::Cell::get);
+  let result = run();
+  (result, BUILT_BYTES.with(std::cell::Cell::get) - before)
+}
+
 /// WAL record for writing
 #[derive(Debug, Clone)]
 pub struct WalRecord {
@@ -47,6 +62,8 @@ impl WalRecord {
     let total_size = unpadded + pad_len;
 
     let mut buffer = vec![0u8; total_size];
+    #[cfg(test)]
+    BUILT_BYTES.with(|built| built.set(built.get() + total_size));
 
     // Write header
     write_u32(&mut buffer, 0, unpadded as u32); // recLen

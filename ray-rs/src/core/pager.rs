@@ -149,7 +149,7 @@ fn read_full_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<
   let mut filled = 0;
   while filled < buffer.len() {
     let at = offset + filled as u64;
-    io_hooks::syscall();
+    io_hooks::read_syscall();
     match read_at(file, io_hooks::read_window(at, &mut buffer[filled..]), at) {
       Ok(0) => break,
       Ok(read) => filled += read,
@@ -582,6 +582,7 @@ impl FilePager {
     if self.read_only {
       return Ok(());
     }
+    io_hooks::sync_kind(io_hooks::SyncKind::Full);
     io_hooks::before_sync()?;
     let synced = self.sync_file();
     io_hooks::synced(synced.is_ok());
