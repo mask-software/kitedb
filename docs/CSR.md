@@ -1,6 +1,6 @@
 # CSR (Compressed Sparse Row) Format
 
-This document explains how RayDB stores graph edges using the CSR format for maximum traversal performance.
+This document explains how KiteDB stores graph edges using the CSR format for maximum traversal performance.
 
 ## Table of Contents
 
@@ -177,7 +177,7 @@ CSR keeps neighbors contiguous, so after the first access, subsequent neighbors 
 
 ## Bidirectional Edges
 
-RayDB stores **both directions** for fast traversal either way:
+KiteDB stores **both directions** for fast traversal either way:
 
 ### Out-Edges (A → B means "A connects to B")
 
@@ -199,7 +199,7 @@ This doubles storage but makes incoming neighbor queries equally fast.
 
 ## Edge Types
 
-RayDB supports multiple edge types (like "FOLLOWS", "LIKES", "KNOWS"). These are stored in a parallel array:
+KiteDB supports multiple edge types (like "FOLLOWS", "LIKES", "KNOWS"). These are stored in a parallel array:
 
 ```
 out_offsets = [0, 2, 3, 4, 4]
@@ -236,7 +236,7 @@ function getNeighborsByType(node: number, etype: number): number[] {
 
 ### Snapshot Sections
 
-RayDB snapshots contain these CSR-related sections:
+KiteDB snapshots contain these CSR-related sections:
 
 ```typescript
 enum SectionId {
@@ -345,4 +345,4 @@ Graph:                          CSR Representation:
 ## Further Reading
 
 - [Wikipedia: Sparse Matrix - CSR](https://en.wikipedia.org/wiki/Sparse_matrix#Compressed_sparse_row_(CSR,_CRS_or_Yale_format))
-- [ARCHITECTURE.md](./ARCHITECTURE.md) - Full RayDB architecture overview
+- [Architecture](https://kitedb.vercel.com/docs/internals/architecture) - KiteDB architecture overview on the docs site

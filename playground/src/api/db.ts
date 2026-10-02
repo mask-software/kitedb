@@ -176,6 +176,41 @@ interface DbState {
 
 let currentDb: DbState | null = null;
 
+/**
+ * Tail of the queue every open/close runs through. Unserialized, two concurrent opens both close,
+ * then both open, and the handle opened first is overwritten without being closed.
+ */
+let transitionQueue: Promise<void> = Promise.resolve();
+
+/** Run `fn` once every earlier state transition has settled. */
+function serialized<T>(fn: () => Promise<T>): Promise<T> {
+	const result = transitionQueue.then(fn);
+	// The tail never rejects, so one failed transition doesn't wedge the ones queued after it.
+	transitionQueue = result.then(
+		() => undefined,
+		() => undefined,
+	);
+	return result;
+}
+
+/** Close the current database, if any. Only call while holding the transition queue. */
+async function closeCurrent(): Promise<void> {
+	const state = currentDb;
+	if (!state) {
+		return;
+	}
+	// Dropped first, so requests stop using the handle while it closes.
+	currentDb = null;
+	try {
+		await state.db.close();
+	} catch {
+		// Ignore close errors: the handle is gone either way, and its temp dir must still go.
+	}
+	if (state.tempDir) {
+		await rm(state.tempDir, { recursive: true, force: true }).catch(() => {});
+	}
+}
+
 export type PlaygroundOpenOptions = Omit<KiteOptions, "nodes" | "edges">;
 
 /**
@@ -196,10 +231,11 @@ export async function openDatabase(
 			}
 		}
 
-		await closeDatabase();
-
-		const db = await kite(dbPath, { nodes, edges, ...openOptions });
-		currentDb = { db, path: dbPath, isDemo: false };
+		await serialized(async () => {
+			await closeCurrent();
+			const db = await kite(dbPath, { nodes, edges, ...openOptions });
+			currentDb = { db, path: dbPath, isDemo: false };
+		});
 
 		return { success: true };
 	} catch (error) {
@@ -217,13 +253,14 @@ export async function openFromBuffer(
 	buffer: Uint8Array,
 ): Promise<{ success: boolean; error?: string }> {
 	try {
-		await closeDatabase();
-
-		currentDb = await withTempDir("kitedb-playground-", async (tempDir) => {
-			const tempPath = join(tempDir, UPLOAD_FILE_NAME);
-			await writeFile(tempPath, buffer);
-			const db = await kite(tempPath, { nodes, edges });
-			return { db, path: tempPath, isDemo: false, tempDir };
+		await serialized(async () => {
+			await closeCurrent();
+			currentDb = await withTempDir("kitedb-playground-", async (tempDir) => {
+				const tempPath = join(tempDir, UPLOAD_FILE_NAME);
+				await writeFile(tempPath, buffer);
+				const db = await kite(tempPath, { nodes, edges });
+				return { db, path: tempPath, isDemo: false, tempDir };
+			});
 		});
 
 		return { success: true };
@@ -243,18 +280,23 @@ export async function createDemo(): Promise<{
 	error?: string;
 }> {
 	try {
-		await closeDatabase();
-
-		currentDb = await withTempDir("kitedb-demo-", async (tempDir) => {
-			const demoPath = join(tempDir, "demo.kitedb");
-			const db = await kite(demoPath, { nodes, edges });
-			try {
-				await createDemoGraph(db);
-			} catch (error) {
-				await db.close();
-				throw error;
-			}
-			return { db, path: demoPath, isDemo: true, tempDir };
+		await serialized(async () => {
+			await closeCurrent();
+			currentDb = await withTempDir("kitedb-demo-", async (tempDir) => {
+				const demoPath = join(tempDir, "demo.kitedb");
+				const db = await kite(demoPath, { nodes, edges });
+				try {
+					await createDemoGraph(db);
+				} catch (error) {
+					try {
+						await db.close();
+					} catch {
+						// Report the demo failure, not a secondary close failure.
+					}
+					throw error;
+				}
+				return { db, path: demoPath, isDemo: true, tempDir };
+			});
 		});
 
 		return { success: true };
@@ -273,19 +315,7 @@ export async function createDemo(): Promise<{
  * Close the current database
  */
 export async function closeDatabase(): Promise<{ success: boolean }> {
-	if (currentDb) {
-		try {
-			await currentDb.db.close();
-
-			// Clean up temp directory if it exists
-			if (currentDb.tempDir) {
-				await rm(currentDb.tempDir, { recursive: true, force: true });
-			}
-		} catch {
-			// Ignore close errors
-		}
-		currentDb = null;
-	}
+	await serialized(closeCurrent);
 	return { success: true };
 }
 

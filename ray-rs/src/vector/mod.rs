@@ -21,6 +21,7 @@ pub mod normalize;
 pub mod pq;
 pub mod row_group;
 pub mod store;
+pub(crate) mod top_k;
 pub mod types;
 
 // Re-export main types for convenience

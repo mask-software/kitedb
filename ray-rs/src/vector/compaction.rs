@@ -7,9 +7,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::vector::types::{
-  Fragment, FragmentState, RowGroup, VectorLocation, VectorManifest, VectorStoreConfig,
-};
+use crate::vector::store::{fragment_append, next_fragment_id};
+use crate::vector::types::{Fragment, FragmentState, VectorLocation, VectorManifest};
 
 // ============================================================================
 // Compaction Strategy
@@ -90,7 +89,7 @@ pub fn find_fragments_to_compact(
   }
 
   // Sort by deletion ratio (highest first)
-  candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+  candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
 
   // Select fragments to compact
   let mut selected: Vec<usize> = Vec::new();
@@ -119,34 +118,32 @@ pub fn find_fragments_to_compact(
 /// Clear fragments that have all vectors deleted (100% deletion ratio)
 /// This is more efficient than compaction for fully-deleted fragments.
 ///
+/// Removes those fragments from the manifest, together with sealed fragments
+/// that are already empty, and adjusts the manifest totals to match.
+///
 /// # Returns
-/// Number of fragments cleared
+/// Number of fragments cleared (empty fragments removed along the way are not
+/// counted)
 pub fn clear_deleted_fragments(manifest: &mut VectorManifest) -> usize {
   let mut cleared = 0;
+  let mut removed_vectors = 0;
+  let mut removed_deleted = 0;
 
-  for fragment in &mut manifest.fragments {
-    // Skip active fragment
-    if fragment.state == FragmentState::Active {
-      continue;
+  manifest.fragments.retain(|fragment| {
+    // Keep the active fragment, and any fragment with a live vector.
+    if fragment.state == FragmentState::Active || fragment.deleted_count < fragment.total_vectors {
+      return true;
     }
-
-    // Skip fragments with no vectors (already cleared)
-    if fragment.total_vectors == 0 {
-      continue;
-    }
-
-    // Check if all vectors are deleted
-    if fragment.deleted_count == fragment.total_vectors {
-      // Clear the fragment data
-      fragment.row_groups.clear();
-      fragment.deletion_bitmap.clear();
-      manifest.total_deleted -= fragment.deleted_count;
-      fragment.total_vectors = 0;
-      fragment.deleted_count = 0;
+    if fragment.total_vectors > 0 {
       cleared += 1;
     }
-  }
+    removed_vectors += fragment.total_vectors;
+    removed_deleted += fragment.deleted_count;
+    false
+  });
 
+  manifest.total_vectors -= removed_vectors;
+  manifest.total_deleted -= removed_deleted;
   cleared
 }
 
@@ -160,6 +157,9 @@ pub struct CompactionResult {
 
 /// Compact fragments into a new fragment
 ///
+/// Copies the live vectors of the given sealed fragments into one new sealed
+/// fragment. The active fragment, and ids that name no fragment, are skipped.
+///
 /// # Arguments
 /// * `manifest` - The vector store manifest
 /// * `fragment_ids` - IDs of fragments to compact
@@ -168,10 +168,8 @@ pub struct CompactionResult {
 /// The new compacted fragment and updated location mappings
 pub fn compact_fragments(manifest: &VectorManifest, fragment_ids: &[usize]) -> CompactionResult {
   let config = &manifest.config;
-  let dimensions = config.dimensions;
-  let row_group_size = config.row_group_size;
 
-  let new_fragment_id = manifest.fragments.len();
+  let new_fragment_id = next_fragment_id(manifest);
   let mut new_fragment = Fragment::new(new_fragment_id);
   let mut updated_locations: HashMap<u64, VectorLocation> = HashMap::new();
 
@@ -187,43 +185,42 @@ pub fn compact_fragments(manifest: &VectorManifest, fragment_ids: &[usize]) -> C
 
   // Process each source fragment
   for &fragment_id in fragment_ids {
-    let fragment = match manifest.fragments.iter().find(|f| f.id == fragment_id) {
+    let fragment = match manifest
+      .fragments
+      .iter()
+      .find(|f| f.id == fragment_id && f.state == FragmentState::Sealed)
+    {
       Some(f) => f,
       None => continue,
     };
 
-    // Iterate over all vectors in fragment
     for local_idx in 0..fragment.total_vectors {
-      // Skip deleted vectors
       if fragment.is_deleted(local_idx) {
         continue;
       }
 
-      // Get vector data
-      let row_group_idx = local_idx / row_group_size;
-      let local_row_idx = local_idx % row_group_size;
-
-      let row_group = match fragment.row_groups.get(row_group_idx) {
+      let row_group = match fragment.row_groups.get(local_idx / config.row_group_size) {
         Some(rg) => rg,
         None => continue,
       };
+      let vector = match row_group.get(local_idx % config.row_group_size, config.dimensions) {
+        Some(vector) => vector,
+        None => continue,
+      };
 
-      let offset = local_row_idx * dimensions;
-      if offset + dimensions > row_group.data.len() {
-        continue;
-      }
-      let vector = &row_group.data[offset..offset + dimensions];
-
-      // Find the vector_id for this location
       let vector_id = match location_to_vector_id.get(&(fragment_id, local_idx)) {
         Some(&id) => id,
         None => continue,
       };
 
-      // Append to new fragment (skip normalization since already normalized)
-      let new_local_idx = append_to_fragment(&mut new_fragment, vector, config);
+      // Stored vectors are already normalized if the store normalizes.
+      let new_local_idx = fragment_append(
+        &mut new_fragment,
+        vector,
+        config.row_group_size,
+        config.dimensions,
+      );
 
-      // Record updated location
       updated_locations.insert(
         vector_id,
         VectorLocation {
@@ -234,7 +231,6 @@ pub fn compact_fragments(manifest: &VectorManifest, fragment_ids: &[usize]) -> C
     }
   }
 
-  // Seal the new fragment
   new_fragment.seal();
 
   CompactionResult {
@@ -243,37 +239,15 @@ pub fn compact_fragments(manifest: &VectorManifest, fragment_ids: &[usize]) -> C
   }
 }
 
-/// Append a vector to a fragment
-fn append_to_fragment(
-  fragment: &mut Fragment,
-  vector: &[f32],
-  config: &VectorStoreConfig,
-) -> usize {
-  let dimensions = config.dimensions;
-  let row_group_size = config.row_group_size;
-
-  // Get or create the active row group
-  let rg_idx = fragment.total_vectors / row_group_size;
-
-  while fragment.row_groups.len() <= rg_idx {
-    fragment.row_groups.push(RowGroup::new(
-      fragment.row_groups.len(),
-      row_group_size,
-      dimensions,
-    ));
-  }
-
-  let row_group = &mut fragment.row_groups[rg_idx];
-  row_group.data.extend_from_slice(vector);
-  row_group.count += 1;
-
-  let local_idx = fragment.total_vectors;
-  fragment.total_vectors += 1;
-
-  local_idx
-}
-
 /// Apply compaction results to manifest
+///
+/// Removes the sealed source fragments, adds the compacted fragment, points
+/// the moved vectors at it, and keeps the manifest totals consistent, so the
+/// manifest still passes reload validation.
+///
+/// A result computed before later changes to the manifest still applies
+/// safely: a moved vector deleted in the meantime is marked deleted in the
+/// new fragment, and a new fragment id taken in the meantime is replaced.
 ///
 /// # Arguments
 /// * `manifest` - The vector store manifest
@@ -284,32 +258,63 @@ pub fn apply_compaction(
   fragment_ids: &[usize],
   result: CompactionResult,
 ) {
-  // Add new fragment
-  manifest.fragments.push(result.new_fragment);
+  let CompactionResult {
+    mut new_fragment,
+    updated_locations,
+  } = result;
+  let sources: HashSet<usize> = fragment_ids.iter().copied().collect();
+  let is_source =
+    |fragment: &Fragment| fragment.state == FragmentState::Sealed && sources.contains(&fragment.id);
 
-  // Update vector locations
-  for (vector_id, location) in result.updated_locations {
-    manifest.vector_locations.insert(vector_id, location);
+  // The new fragment's id must not collide with a fragment that stays.
+  if manifest
+    .fragments
+    .iter()
+    .any(|fragment| fragment.id == new_fragment.id && !is_source(fragment))
+  {
+    new_fragment.id = next_fragment_id(manifest);
   }
 
-  // Update deleted count
+  // Point each moved vector at its new slot, if it still lives in a source
+  // fragment; otherwise it was deleted after the compaction was computed.
+  let mut moves = Vec::with_capacity(updated_locations.len());
+  for (vector_id, location) in updated_locations {
+    let still_in_source = manifest
+      .vector_locations
+      .get(&vector_id)
+      .is_some_and(|current| sources.contains(&current.fragment_id));
+    if still_in_source {
+      moves.push((vector_id, location.local_index));
+    } else {
+      new_fragment.delete(location.local_index);
+    }
+  }
+
+  let mut removed_vectors = 0;
   let mut removed_deleted = 0;
-  for &fragment_id in fragment_ids {
-    if let Some(fragment) = manifest.fragments.iter().find(|f| f.id == fragment_id) {
-      removed_deleted += fragment.deleted_count;
+  manifest.fragments.retain(|fragment| {
+    if !is_source(fragment) {
+      return true;
     }
-  }
-  manifest.total_deleted -= removed_deleted;
+    removed_vectors += fragment.total_vectors;
+    removed_deleted += fragment.deleted_count;
+    false
+  });
 
-  // Mark old fragments as empty (keep IDs but clear data)
-  for &fragment_id in fragment_ids {
-    if let Some(fragment) = manifest.fragments.iter_mut().find(|f| f.id == fragment_id) {
-      fragment.row_groups.clear();
-      fragment.deletion_bitmap.clear();
-      fragment.total_vectors = 0;
-      fragment.deleted_count = 0;
-      fragment.state = FragmentState::Sealed;
-    }
+  manifest.total_vectors = manifest.total_vectors - removed_vectors + new_fragment.total_vectors;
+  manifest.total_deleted = manifest.total_deleted - removed_deleted + new_fragment.deleted_count;
+
+  for (vector_id, local_index) in moves {
+    manifest.vector_locations.insert(
+      vector_id,
+      VectorLocation {
+        fragment_id: new_fragment.id,
+        local_index,
+      },
+    );
+  }
+  if new_fragment.total_vectors > 0 {
+    manifest.fragments.push(new_fragment);
   }
 }
 
@@ -398,8 +403,11 @@ pub fn force_full_compaction(manifest: &mut VectorManifest) {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::vector::ivf::{deserialize_manifest, serialize_manifest};
+  use crate::vector::types::VectorStoreConfig;
   use crate::vector::{
-    create_vector_store, vector_store_delete, vector_store_insert, vector_store_seal_active,
+    create_vector_store, vector_store_delete, vector_store_insert, vector_store_node_vector,
+    vector_store_seal_active,
   };
 
   fn create_test_manifest(dimensions: usize) -> VectorManifest {
@@ -460,16 +468,79 @@ mod tests {
 
   #[test]
   fn test_append_to_fragment() {
-    let config = VectorStoreConfig::new(4).with_row_group_size(10);
     let mut fragment = Fragment::new(0);
 
     let vector = vec![1.0, 2.0, 3.0, 4.0];
-    let idx = append_to_fragment(&mut fragment, &vector, &config);
+    let idx = fragment_append(&mut fragment, &vector, 10, 4);
 
     assert_eq!(idx, 0);
     assert_eq!(fragment.total_vectors, 1);
     assert_eq!(fragment.row_groups.len(), 1);
     assert_eq!(fragment.row_groups[0].count, 1);
+    assert_eq!(fragment.deletion_bitmap.len(), 1);
+  }
+
+  fn reload(manifest: &VectorManifest) -> VectorManifest {
+    deserialize_manifest(&serialize_manifest(manifest)).expect("manifest reloads")
+  }
+
+  /// A result computed before later deletes and inserts still applies: the
+  /// vector deleted in between stays deleted, and the new fragment id taken
+  /// in between by a seal is replaced.
+  #[test]
+  fn test_apply_stale_compaction_result() {
+    let mut manifest = create_test_manifest(4);
+    for i in 0..100u64 {
+      vector_store_insert(&mut manifest, i, &[1.0 + i as f32, 2.0, 3.0, 4.0]).expect("insert");
+    }
+    // Fragment 0 is sealed; fragment 1 is active and empty.
+    for i in 0..50u64 {
+      vector_store_delete(&mut manifest, i);
+    }
+    let result = compact_fragments(&manifest, &[0]);
+    assert_eq!(result.new_fragment.id, 2);
+
+    vector_store_delete(&mut manifest, 60);
+    for i in 100..200u64 {
+      // Seals fragment 1 and starts fragment 2.
+      vector_store_insert(&mut manifest, i, &[1.0 + i as f32, 2.0, 3.0, 4.0]).expect("insert");
+    }
+    apply_compaction(&mut manifest, &[0], result);
+
+    let restored = reload(&manifest);
+    assert!(vector_store_node_vector(&restored, 60).is_none());
+    for i in (50..200u64).filter(|&i| i != 60) {
+      assert_eq!(
+        vector_store_node_vector(&restored, i),
+        vector_store_node_vector(&manifest, i),
+        "node {i}"
+      );
+      assert_eq!(
+        vector_store_node_vector(&restored, i).map(|v| v[0]),
+        Some(1.0 + i as f32)
+      );
+    }
+  }
+
+  /// Ids stay unique after compaction removes fragments.
+  #[test]
+  fn test_fragment_ids_stay_unique_after_compaction() {
+    let mut manifest = create_test_manifest(4);
+    for i in 0..300u64 {
+      vector_store_insert(&mut manifest, i, &[1.0 + i as f32, 2.0, 3.0, 4.0]).expect("insert");
+    }
+    for i in 0..300u64 {
+      if i % 3 != 0 {
+        vector_store_delete(&mut manifest, i);
+      }
+    }
+    force_full_compaction(&mut manifest);
+    for i in 300..650u64 {
+      vector_store_insert(&mut manifest, i, &[1.0 + i as f32, 2.0, 3.0, 4.0]).expect("insert");
+    }
+    let ids: HashSet<usize> = manifest.fragments.iter().map(|f| f.id).collect();
+    assert_eq!(ids.len(), manifest.fragments.len());
+    reload(&manifest);
   }
 
   #[test]

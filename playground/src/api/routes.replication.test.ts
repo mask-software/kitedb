@@ -786,11 +786,11 @@ describe("replication log endpoints", () => {
     );
 
     expect(metrics.status).toBe(200);
-    expect(metrics.body).toContain("# HELP raydb_replication_enabled");
-    expect(metrics.body).toContain("# TYPE raydb_replication_enabled gauge");
-    expect(metrics.body).toContain('raydb_replication_enabled{role="primary"} 1');
-    expect(metrics.body).toContain("raydb_replication_primary_head_log_index");
-    expect(metrics.body).toContain("raydb_replication_primary_append_attempts_total");
+    expect(metrics.body).toContain("# HELP kitedb_replication_enabled");
+    expect(metrics.body).toContain("# TYPE kitedb_replication_enabled gauge");
+    expect(metrics.body).toContain('kitedb_replication_enabled{role="primary"} 1');
+    expect(metrics.body).toContain("kitedb_replication_primary_head_log_index");
+    expect(metrics.body).toContain("kitedb_replication_primary_append_attempts_total");
   });
 
   test("replication metrics endpoint requires bearer token", async () => {
