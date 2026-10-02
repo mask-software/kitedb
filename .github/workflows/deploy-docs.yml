@@ -67,5 +67,7 @@ jobs:
         with:
           name: docs-build
           path: ray-docs/.output
+          # upload-artifact skips dot-paths by default, and .output is one.
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 7
