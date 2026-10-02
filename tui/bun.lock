@@ -6,6 +6,7 @@
       "name": "kitedb-tui",
       "dependencies": {
         "@kitedb/core": "file:../ray-rs",
+        "@opentui/core": "^0.1.77",
         "@opentui/solid": "^0.1.73",
         "solid-js": "1.9.9",
       },
