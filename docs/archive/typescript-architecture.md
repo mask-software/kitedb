@@ -170,7 +170,7 @@ type PropValue =
 
 ## CSR Format
 
-See [CSR.md](./CSR.md) for a detailed explanation.
+See [CSR.md](../CSR.md) for a detailed explanation.
 
 The snapshot uses CSR (Compressed Sparse Row) format for efficient edge traversal. For `N` nodes and `E` edges:
 

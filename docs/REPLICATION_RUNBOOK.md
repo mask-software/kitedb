@@ -261,7 +261,7 @@ Playground curl examples:
 - `curl -X POST -H "Authorization: Bearer $REPLICATION_ADMIN_TOKEN" -H "Content-Type: application/json" -d '{"maxFrames":256}' "$BASE/api/replication/pull"`
 - `curl -X POST -H "Authorization: Bearer $REPLICATION_ADMIN_TOKEN" "$BASE/api/replication/reseed"`
 - `curl -X POST -H "Authorization: Bearer $REPLICATION_ADMIN_TOKEN" "$BASE/api/replication/promote"`
-- `curl -H "x-client-cert: CN=allowed-client,O=RayDB" "$BASE/api/replication/metrics"` (when `REPLICATION_ADMIN_AUTH_MODE=mtls`)
+- `curl -H "x-client-cert: CN=allowed-client,O=KiteDB" "$BASE/api/replication/metrics"` (when `REPLICATION_ADMIN_AUTH_MODE=mtls`)
 
 ## 9. Known V1 Limits
 

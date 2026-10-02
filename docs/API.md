@@ -540,7 +540,7 @@ const path = await db
 
 ## File Formats
 
-RayDB uses the single-file `.kitedb` format.
+KiteDB uses the single-file `.kitedb` format.
 
 ### Single-File Format (`.kitedb`)
 

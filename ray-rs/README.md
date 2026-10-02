@@ -7,11 +7,11 @@ Docs: https://kitedb.vercel.com/docs
 ## Install
 
 ```bash
-npm install kitedb
+npm install @kitedb/core
 # or
-pnpm add kitedb
+bun add @kitedb/core
 # or
-yarn add kitedb
+pnpm add @kitedb/core
 ```
 
 This package ships prebuilt binaries for major platforms. If a prebuild isn't available for your target, you'll need a Rust toolchain to build from source.
@@ -21,7 +21,7 @@ This package ships prebuilt binaries for major platforms. If a prebuild isn't av
 The fluent API provides a high-level, type-safe interface for schema-driven workflows:
 
 ```ts
-import { kite, node, edge, prop, optional } from 'kitedb'
+import { kite, node, edge, prop, optional } from '@kitedb/core'
 
 // Define your schema
 const User = node('user', {
@@ -84,7 +84,7 @@ db.close()
 For direct control, use the low-level `Database` class:
 
 ```ts
-import { Database, JsTraversalDirection, PropType, pathConfig, traversalStep } from 'kitedb'
+import { Database, JsTraversalDirection, PropType, pathConfig, traversalStep } from '@kitedb/core'
 
 const db = Database.open('example.kitedb', { createIfMissing: true })
 
@@ -127,7 +127,7 @@ db.close()
 ## Backups and health checks
 
 ```ts
-import { createBackup, restoreBackup, healthCheck } from 'kitedb'
+import { createBackup, restoreBackup, healthCheck } from '@kitedb/core'
 
 const backup = createBackup(db, 'backups/graph')
 const restoredPath = restoreBackup(backup.path, 'restored/graph')
@@ -139,7 +139,7 @@ console.log(health.healthy)
 ## Vector search
 
 ```ts
-import { createVectorIndex } from 'kitedb'
+import { createVectorIndex } from '@kitedb/core'
 
 const index = createVectorIndex({ dimensions: 3 })
 index.set(1, [0.1, 0.2, 0.3])
@@ -152,10 +152,10 @@ console.log(hits)
 
 ## Browser/WASI builds
 
-This package exposes a WASI-compatible build via the `browser` export for bundlers, backed by `kitedb-wasm32-wasi`. If you need to import it directly:
+This package exposes a WASI-compatible build via the `browser` export for bundlers, backed by `@kitedb/core-wasm32-wasi`. If you need to import it directly:
 
 ```ts
-import { Database } from 'kitedb-wasm32-wasi'
+import { Database } from '@kitedb/core-wasm32-wasi'
 ```
 
 ## Concurrent Access
@@ -186,7 +186,7 @@ This is implemented using a read-write lock (RwLock) internally, providing good 
 Phase D replication controls are available on the low-level `Database` API.
 
 ```ts
-import { Database } from 'kitedb'
+import { Database } from '@kitedb/core'
 import {
   collectReplicationLogTransportJson,
   collectReplicationMetricsOtelJson,
@@ -200,7 +200,7 @@ import {
   pushReplicationMetricsOtelJsonWithOptions,
   pushReplicationMetricsOtelProtobuf,
   pushReplicationMetricsOtelProtobufWithOptions,
-} from 'kitedb/native'
+} from '@kitedb/core/native'
 
 const primary = Database.open('cluster-primary.kitedb', {
   replicationRole: 'Primary',
