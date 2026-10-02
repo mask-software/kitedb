@@ -1146,9 +1146,10 @@ fn open_single_file_internal(
       // Replay committed transactions
       #[cfg(feature = "bench-profile")]
       let wal_replay_started = Instant::now();
+      let mut skipped = 0usize;
       for (_txid, records) in &committed_in_order {
         for record in records {
-          replay_wal_record(
+          let applied = replay_wal_record(
             record,
             snapshot.as_ref(),
             &mut delta,
@@ -1162,9 +1163,17 @@ fn open_single_file_internal(
             &mut etype_ids,
             &mut propkey_names,
             &mut propkey_ids,
-          );
+          )?;
+          skipped += usize::from(!applied);
         }
         next_commit_ts += 1;
+      }
+      if skipped > 0 {
+        eprintln!(
+          "Warning: WAL replay of {} skipped {skipped} vector maintenance records \
+           (BatchVectors, SealFragment, CompactFragments), which no version applies",
+          path.display()
+        );
       }
       drop_vectors_of_missing_nodes(&mut delta, snapshot.as_ref());
       #[cfg(feature = "bench-profile")]

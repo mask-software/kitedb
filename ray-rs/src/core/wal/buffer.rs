@@ -530,7 +530,9 @@ impl WalBuffer {
   pub fn merge_secondary_into_primary(&mut self, pager: &mut FilePager) -> Result<()> {
     let has_secondary_records = self.secondary_head > self.secondary_region_start;
     let secondary_records = if has_secondary_records {
-      self.scan_region(1, pager)?
+      let (records, end) = self.scan_region_to_end(1, pager)?;
+      warn_dropped_tail("secondary", end, self.secondary_head);
+      records
     } else {
       Vec::new()
     };
@@ -575,8 +577,10 @@ impl WalBuffer {
     if primary_end != self.primary_head {
       return Ok(false);
     }
+    let (secondary_records, secondary_end) = self.scan_region_to_end(1, pager)?;
+    warn_dropped_tail("secondary", secondary_end, self.secondary_head);
     let mut merged = Vec::new();
-    for record in self.scan_region(1, pager)? {
+    for record in secondary_records {
       merged.extend_from_slice(
         &WalRecord::new(record.record_type, record.txid, record.payload).build(),
       );
@@ -629,11 +633,13 @@ impl WalBuffer {
     let mut trimmed = false;
     if !self.is_primary_retired() {
       let (_, primary_end) = self.scan_region_to_end(0, pager)?;
+      warn_dropped_tail("primary", primary_end, self.primary_head);
       trimmed |= primary_end != self.primary_head;
       self.primary_head = primary_end;
     }
     if self.active_region == 1 {
       let (_, secondary_end) = self.scan_region_to_end(1, pager)?;
+      warn_dropped_tail("secondary", secondary_end, self.secondary_head);
       trimmed |= secondary_end != self.secondary_head;
       self.secondary_head = secondary_end;
     }
@@ -1122,6 +1128,20 @@ impl WalBuffer {
     }
 
     Ok(records)
+  }
+}
+
+/// Report bytes a rewrite of a WAL region drops for good: those from `end`,
+/// where the last record that parses ends, to the `head` a header named. A
+/// crash during a write leaves such a torn tail; anything else there is
+/// corruption.
+fn warn_dropped_tail(region: &str, end: u64, head: u64) {
+  if end < head {
+    eprintln!(
+      "Warning: dropping {} bytes of the {region} WAL region after its last valid record \
+       (offset {end}, head {head}): a write torn by a crash, or corruption",
+      head - end
+    );
   }
 }
 

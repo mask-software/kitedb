@@ -278,16 +278,13 @@ fn f3_create_fsyncs_the_parent_directory() {
 // f4: CRC-valid records that do not parse
 // ============================================================================
 
-/// Commit one record whose frame and CRC check but whose payload does not
-/// parse as its type's.
-fn commit_unparseable_record(db: &SingleFileDB) {
+/// Commit one record of `record_type` whose frame and CRC check but whose
+/// payload does not parse as that type's.
+fn commit_unparseable_record(db: &SingleFileDB, record_type: WalRecordType) {
   db.begin(false).expect("begin");
   let (txid, tx_handle) = db.require_write_tx_handle().expect("write tx");
-  db.write_wal_tx(
-    &tx_handle,
-    WalRecord::new(WalRecordType::SetNodeProp, txid, vec![0xab; 3]),
-  )
-  .expect("write record");
+  db.write_wal_tx(&tx_handle, WalRecord::new(record_type, txid, vec![0xab; 3]))
+    .expect("write record");
   db.commit().expect("commit");
 }
 
@@ -297,7 +294,7 @@ fn f4_open_fails_on_a_crc_valid_record_that_does_not_parse() {
   let path = dir.path().join("unparseable.kitedb");
   let db = open_single_file(&path, options()).expect("open");
   commit_nodes(&db, &keys("before", 3));
-  commit_unparseable_record(&db);
+  commit_unparseable_record(&db, WalRecordType::SetNodeProp);
   commit_nodes(&db, &keys("after", 3));
   close_single_file(db).expect("close");
 
@@ -314,6 +311,24 @@ fn f4_open_fails_on_a_crc_valid_record_that_does_not_parse() {
       }
     }
   }
+}
+
+/// Vector maintenance records (`BatchVectors`, `SealFragment`,
+/// `CompactFragments`) are skipped, whatever their payload: no version
+/// writes or applies them, and replication skips them too.
+#[test]
+fn f4_open_skips_vector_maintenance_records() {
+  let dir = tempdir().expect("tempdir");
+  let path = dir.path().join("vector-maintenance.kitedb");
+  let db = open_single_file(&path, options()).expect("open");
+  commit_unparseable_record(&db, WalRecordType::SealFragment);
+  let committed = keys("after", 3);
+  commit_nodes(&db, &committed);
+  close_single_file(db).expect("close");
+
+  let db = open_single_file(&path, options()).expect("reopen");
+  assert_eq!(missing(&db, &committed), Vec::<&str>::new());
+  close_single_file(db).expect("close");
 }
 
 // ============================================================================
