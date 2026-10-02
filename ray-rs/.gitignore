@@ -129,10 +129,8 @@ python/kitedb/*.so
 /core.wasm32-wasi.debug.wasm
 /wasi-worker.mjs
 .pnp.*
-.yarn/*
-!.yarn/patches
-!.yarn/plugins
-!.yarn/releases
-!.yarn/sdks
-!.yarn/versions
+.yarn/
+# bun resolves this package from the workspace root's bun.lock; lockfiles here would go unused.
+/bun.lock
+/package-lock.json
 /npm
