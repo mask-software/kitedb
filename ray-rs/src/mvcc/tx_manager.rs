@@ -435,7 +435,7 @@ impl TxManager {
     if !staged {
       self.index_recent_commit(commit_ts, tx.write_set, key_groups);
     }
-    self.prune_recent_commits();
+    self.prune_recent_commits(released);
     Ok(commit_ts)
   }
 
@@ -488,13 +488,13 @@ impl TxManager {
   }
 
   /// Drop the recent commits no open transaction can conflict with (older
-  /// than every snapshot), then fold the oldest of the rest into
-  /// `committed_writes` once they are too many: an open transaction has
-  /// pinned them for long, and folding keeps one entry per key however often
-  /// they rewrite it. Prunes `committed_writes` as before, and `group_writes`
-  /// once it outgrows twice what the last prune left (amortized constant
-  /// work per commit).
-  fn prune_recent_commits(&mut self) {
+  /// than every snapshot), handing their key sets to `released`, then fold
+  /// the oldest of the rest into `committed_writes` once they are too many:
+  /// an open transaction has pinned them for long, and folding keeps one
+  /// entry per key however often they rewrite it. Prunes `committed_writes`
+  /// as before, and `group_writes` once it outgrows twice what the last prune
+  /// left (amortized constant work per commit).
+  fn prune_recent_commits(&mut self, released: &mut Vec<TxKeySet>) {
     let min_ts = self.min_active_ts();
     while self
       .recent_commits
@@ -504,6 +504,7 @@ impl TxManager {
       if let Some(commit) = self.recent_commits.pop_front() {
         self.recent_keys -= commit.keys.len();
         self.total_pruned += commit.keys.len();
+        released.push(commit.keys);
       }
     }
 
