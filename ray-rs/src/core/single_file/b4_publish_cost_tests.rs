@@ -279,6 +279,51 @@ fn key_lookup_hides_a_node_created_and_deleted_after_the_snapshot() {
   );
 }
 
+/// Reads, and transactions' writes (which read the delta too), go on while a
+/// commit group commits in MVCC and records its first commit's history, up to
+/// its merge, and see the state before the commit. Regression: the publish
+/// held `delta.write()` from its first step, so every read and write waited
+/// for the group's MVCC commit and history as well as its merges.
+#[test]
+fn reads_go_on_until_a_commit_merges() {
+  use crate::core::single_file::transaction::AFTER_NEXT_COMMIT_TIMESTAMP;
+  let dir = tempdir().expect("tempdir");
+  let db = open(&dir);
+  let schema = seed(&db);
+  let seed_node = db.node_by_key("seed").expect("seed node");
+  let prop = schema.prop;
+  // A reader open across the commit, so it records history.
+  let _reader = Reader::begin(&db);
+
+  let (read_tx, read_rx) = mpsc::channel();
+  let reader_db = Arc::clone(&db);
+  db.begin(false).expect("begin");
+  db.set_node_prop(seed_node, prop, PropValue::I64(1))
+    .expect("set prop");
+  db.create_node(Some("during")).expect("create");
+  AFTER_NEXT_COMMIT_TIMESTAMP.with(|hook| {
+    *hook.borrow_mut() = Some(Box::new(move || {
+      // Inside the publish section, after the commit's timestamp, before its merge.
+      std::thread::spawn(move || {
+        let read = (
+          reader_db.node_prop(seed_node, prop),
+          reader_db.node_by_key("during"),
+        );
+        let _ = read_tx.send(read);
+      });
+      let read = read_rx.recv_timeout(Duration::from_secs(2));
+      assert_eq!(
+        read.ok(),
+        Some((Some(PropValue::I64(-1)), None)),
+        "a read waited for the commit's MVCC timestamp and history, or saw it before its merge"
+      );
+    }));
+  });
+  db.commit().expect("commit");
+  assert_eq!(db.node_prop(seed_node, prop), Some(PropValue::I64(1)));
+  assert!(db.node_by_key("during").is_some());
+}
+
 /// A reader keeps not seeing nodes created after its snapshot once a
 /// background checkpoint moves them into the snapshot, and across GC runs;
 /// once it ends, GC drops what was kept for it.

@@ -124,7 +124,7 @@ fn during_commit_io_test_hook() {
 thread_local! {
   /// Run on this thread's next commit right after MVCC gives it its commit
   /// timestamp, before its version chains and delta merge.
-  static AFTER_NEXT_COMMIT_TIMESTAMP: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+  pub(crate) static AFTER_NEXT_COMMIT_TIMESTAMP: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
     std::cell::RefCell::new(None);
 }
 
