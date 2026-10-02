@@ -12,8 +12,8 @@ pub use database::{
   backup_info, collect_metrics, create_backup, create_offline_backup, health_check, open_database,
   restore_backup, BackupOptions, BackupResult, CacheLayerMetrics, CacheMetrics, CheckResult,
   CompressionOptions, DataMetrics, Database, DatabaseMetrics, DbStats, EdgePage, EdgeWithProps,
-  HealthCheckEntry, HealthCheckResult, JsCompressionType, JsEdge, JsFullEdge, JsNodeProp,
-  JsPropValue, MemoryMetrics, MvccMetrics, MvccStats, NodePage, NodeWithProps,
+  HealthCheckEntry, HealthCheckResult, JsCompressionType, JsEdge, JsFullEdge, JsFullEdgeInput,
+  JsNodeProp, JsPropValue, MemoryMetrics, MvccMetrics, MvccStats, NodePage, NodeWithProps,
   OfflineBackupOptions, OpenOptions, PaginationOptions, PropType, RestoreOptions,
   SingleFileOptimizeOptions, StreamOptions, VacuumOptions,
 };

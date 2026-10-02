@@ -94,7 +94,9 @@ async function awaitPromise<T>(t: ExecutionContext, label: string, call: () => T
 
 const UNREACHED_TOKEN = '999:999'
 
-test('X1: waitForTokenAsync waits without blocking the event loop (sync waitForToken blocks)', async (t) => {
+// Timer-based checks run serially: ava runs a file's other tests concurrently,
+// and their synchronous work would stall the timers being counted here.
+test.serial('X1: waitForTokenAsync waits without blocking the event loop (sync waitForToken blocks)', async (t) => {
   const db = openDb(t)
 
   const sync = await ticksDuring(() => db.waitForToken(UNREACHED_TOKEN, 300))
@@ -118,7 +120,7 @@ test('X1: waitForTokenAsync waits without blocking the event loop (sync waitForT
 // A collector served by this same process can only answer while the JS thread
 // is free. The sync push blocks the thread, so it times out against a healthy
 // collector; an async push must get the collector's 200.
-test('X1: async OTEL push reaches a collector served by the same process (sync push times out)', async (t) => {
+test.serial('X1: async OTEL push reaches a collector served by the same process (sync push times out)', async (t) => {
   let received = 0
   const server = http.createServer((req, res) => {
     req.resume()
@@ -546,4 +548,205 @@ test('X6: getEdgesPage continues after the cursor edge is deleted', (t) => {
   const second = db.getEdgesPage({ limit: 3, cursor: first.nextCursor })
   t.deepEqual(second.items, all.slice(3, 6), `iteration ended early: ${show(second)}`)
   t.true(second.hasMore)
+})
+
+// =============================================================================
+// Contracts of the fixes (beyond the reproductions above)
+// =============================================================================
+
+test('X1: async calls reject inside a transaction instead of waiting forever', async (t) => {
+  const db = openDb(t)
+  seed(db, 5)
+  db.begin()
+  await t.throwsAsync(() => (db as any).checkpointAsync(), { message: /inside a transaction/ })
+  await t.throwsAsync(() => (db as any).exportToJsonAsync(path.join(os.tmpdir(), 'never.json')), {
+    message: /inside a transaction/,
+  })
+  db.rollback()
+  await t.notThrowsAsync(() => (db as any).checkpointAsync())
+})
+
+test('X1: async calls report invalid arguments by rejecting, not throwing', async (t) => {
+  const db = openDb(t)
+  const pending = (db as any).waitForTokenAsync('not-a-token', 10)
+  t.true(pending instanceof Promise)
+  await t.throwsAsync(() => pending, { message: /Invalid commit token/ })
+  await t.throwsAsync(() => native.pushReplicationMetricsOtelJsonAsync(db, 'http://127.0.0.1:1/v1/metrics', 0), {
+    message: /timeoutMs/,
+  })
+})
+
+test('X1: close() refuses while an async call still runs, then succeeds once it settles', async (t) => {
+  const db = Database.open(makeDbPath(), {})
+  const waiting = (db as any).waitForTokenAsync(UNREACHED_TOKEN, 200)
+  t.throws(() => db.close(), { message: /async call on it is still running/ })
+  t.true(db.isOpen)
+  t.is(await waiting, false)
+  t.notThrows(() => db.close())
+  t.false(db.isOpen)
+})
+
+test('X2: vector APIs accept Float32Array as well as number[]', (t) => {
+  const index = native.createVectorIndex({ dimensions: 3, metric: 'Euclidean' })
+  index.set(1, new Float32Array([1, 0, 0]))
+  index.set(2, [0, 1, 0])
+  t.deepEqual(index.get(1), [1, 0, 0])
+  t.is(index.search(new Float32Array([0.9, 0.1, 0]), { k: 1 })[0]?.nodeId, 1)
+  t.is(index.search([0.1, 0.9, 0], { k: 1 })[0]?.nodeId, 2)
+  t.throws(() => index.set(3, new Float64Array([1, 2, 3])))
+
+  const [hit] = native.bruteForceSearch([new Float32Array([0, 1]), [1, 0]], [7, 8], new Float32Array([1, 0]), 1)
+  t.is(hit.nodeId, 8)
+
+  const db = openDb(t)
+  db.begin()
+  const nodeId = db.createNode('v')
+  const keyId = db.getOrCreatePropkey('embedding')
+  db.setNodeVector(nodeId, keyId, new Float32Array([0, 1]))
+  db.commit()
+  t.deepEqual(db.getNodeVector(nodeId, keyId), [0, 1])
+})
+
+test('X2: IVF search reuses a parsed manifest but follows a changed one', (t) => {
+  const manifestFor = (vectors: number[][]) =>
+    JSON.stringify({
+      config: {
+        dimensions: 2,
+        metric: 'Euclidean',
+        row_group_size: 1024,
+        fragment_target_size: 100000,
+        normalize_on_insert: false,
+      },
+      fragments: [
+        {
+          id: 0,
+          state: 'Active',
+          row_groups: [{ id: 0, count: vectors.length, data: vectors.flat() }],
+          total_vectors: vectors.length,
+          deletion_bitmap: [],
+          deleted_count: 0,
+        },
+      ],
+      active_fragment_id: 0,
+      total_vectors: vectors.length,
+      total_deleted: 0,
+      next_vector_id: vectors.length,
+      node_to_vector: Object.fromEntries(vectors.map((_, i) => [i + 1, i])),
+      vector_to_node: Object.fromEntries(vectors.map((_, i) => [i, i + 1])),
+      vector_locations: Object.fromEntries(vectors.map((_, i) => [i, { fragment_id: 0, local_index: i }])),
+    })
+  const ivf = new native.JsIvfIndex(2, { nClusters: 1, nProbe: 1, metric: 'Euclidean' })
+  ivf.addTrainingVectors(new Float32Array(trainingVectors(8)), 8)
+  ivf.train()
+  ivf.insert(0, [1, 0])
+  ivf.insert(1, new Float32Array([0, 1]))
+
+  const first = manifestFor([
+    [1, 0],
+    [0, 1],
+  ])
+  t.is(ivf.search(first, [1, 0], 1)[0]?.nodeId, 1)
+  t.is(ivf.search(first, new Float32Array([0, 1]), 1)[0]?.nodeId, 2)
+  // Same vector IDs, swapped data: a stale cached manifest would answer 1.
+  const swapped = manifestFor([
+    [0, 1],
+    [1, 0],
+  ])
+  t.is(ivf.search(swapped, [1, 0], 1)[0]?.nodeId, 2)
+  t.throws(() => ivf.search('{', [1, 0], 1), { message: /Failed to parse manifest/ })
+})
+
+test('X3: BigInt intValue round-trips through Database props', (t) => {
+  const db = openDb(t)
+  db.begin()
+  const nodeId = db.createNode('big')
+  const keyId = db.getOrCreatePropkey('n')
+  db.setNodeProp(nodeId, keyId, { propType: 'Int', intValue: 2n ** 62n } as any)
+  db.commit()
+  t.is(db.getNodeProp(nodeId, keyId)?.intValue as unknown, 2n ** 62n)
+
+  db.begin()
+  t.throws(() => db.setNodeProp(nodeId, keyId, { propType: 'Int', intValue: 2n ** 63n } as any), {
+    message: /64-bit signed/,
+  })
+  t.throws(() => db.setNodeProp(nodeId, keyId, { propType: 'Int', intValue: 1.5 } as any), {
+    message: /integer/,
+  })
+  db.rollback()
+})
+
+test('X3: invalid u32 values in batch inputs and options are rejected', (t) => {
+  const db = openDb(t)
+  db.begin()
+  const a = db.createNode('a')
+  const b = db.createNode('b')
+  t.throws(() => db.addEdgesBatch([{ src: a, etype: -1, dst: b }]), { message: /etype/ })
+  t.throws(() => db.upsertNode('c', [{ keyId: Number.NaN, value: { propType: 'Bool', boolValue: true } } as any]), {
+    message: /keyId/,
+  })
+  db.rollback()
+  t.throws(() => Database.open(makeDbPath(), { walSize: -1 }), { message: /walSize/ })
+})
+
+test('X6: an invalid cursor is rejected instead of restarting from the first page', (t) => {
+  const db = openDb(t)
+  seed(db, 3)
+  t.throws(() => db.getNodesPage({ cursor: 'garbage' }), { message: /Invalid cursor/ })
+  t.throws(() => db.getEdgesPage({ cursor: 'e:1:2' }), { message: /Invalid cursor/ })
+})
+
+test('X6: paging visits every edge exactly once', (t) => {
+  const db = openDb(t)
+  seed(db, 25)
+  const seen: string[] = []
+  let cursor: string | undefined
+  do {
+    const page = db.getEdgesPage({ limit: 4, cursor })
+    seen.push(...page.items.map((e) => `${e.src}:${e.etype}:${e.dst}`))
+    t.is(page.total, 24)
+    cursor = page.nextCursor ?? undefined
+  } while (cursor)
+  t.is(seen.length, 24)
+  t.is(new Set(seen).size, 24)
+})
+
+test('X5: exportToObject / importFromObject keep their shape and round-trip', (t) => {
+  const source = openDb(t)
+  const { ids } = seed(source, 4)
+  source.begin()
+  const keyId = source.getOrCreatePropkey('n')
+  source.setNodeProp(ids[0], keyId, { propType: 'Int', intValue: 7 } as any)
+  source.commit()
+
+  const exported = source.exportToObject() as any
+  t.is(exported.version, 1)
+  t.is(typeof exported.exported_at, 'string')
+  t.is(exported.stats.node_count, 4)
+  t.is(exported.schema.prop_keys[String(keyId)], 'n')
+  const first = exported.nodes.find((n: any) => n.id === ids[0])
+  t.deepEqual(first.props.n, { type: 'int', value: 7 })
+  t.is(first.key, 'n:0')
+  t.is(typeof exported.edges[0].src, 'number')
+
+  const target = openDb(t)
+  const result = target.importFromObject(exported)
+  t.is(result.nodeCount, 4)
+  t.is(target.countEdges(), 3)
+})
+
+test('X5: importFromObject accepts node ids and integer props above 2^32', (t) => {
+  const source = openDb(t)
+  const bigId = 2 ** 33 + 1
+  source.begin()
+  const keyId = source.getOrCreatePropkey('n')
+  source.upsertNodeById(bigId, [{ keyId, value: { propType: 'Int', intValue: 2 ** 40 } } as any])
+  source.commit()
+
+  const exported = source.exportToObject() as any
+  t.is(exported.nodes[0].id, bigId)
+
+  const target = openDb(t)
+  t.is(target.importFromObject(exported).nodeCount, 1)
+  const [imported] = target.listNodes()
+  t.is(target.getNodeProp(imported, target.getPropkeyId('n')!)?.intValue as unknown, 2 ** 40)
 })
