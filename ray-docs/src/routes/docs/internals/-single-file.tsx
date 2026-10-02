@@ -175,7 +175,7 @@ function HeaderContents() {
 		},
 		{
 			name: "Checksums",
-			value: "CRC32C over the header fields and over the whole page",
+			value: "CRC-32 over the header fields and over the whole page",
 		},
 	];
 	return (

@@ -123,12 +123,12 @@ The `.kitedb` format contains:
 - In-edges and out-edges stored separately
 - String table for interned strings
 - Key index for fast lookups
-- CRC32C integrity checking
+- CRC-32 integrity checking
 
 ### WAL Records
 
 - 8-byte aligned records
-- CRC32C per record
+- CRC-32 per record
 - Transaction boundaries (BEGIN/COMMIT/ROLLBACK)
 
 ## Development
