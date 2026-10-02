@@ -91,27 +91,26 @@ impl<T: PartialOrd + PartialEq> Default for MinHeap<T> {
 use std::collections::HashMap;
 use std::hash::Hash;
 
-/// A priority queue item with key and priority
+/// A heap entry: a key, its priority, and the version of the key's priority it was pushed with.
 #[derive(Debug, Clone)]
 struct IndexedItem<K> {
   key: K,
   priority: f64,
+  version: u64,
 }
 
 impl<K> PartialEq for IndexedItem<K> {
   fn eq(&self, other: &Self) -> bool {
-    self.priority == other.priority
+    self.cmp(other) == Ordering::Equal
   }
 }
 
 impl<K> Eq for IndexedItem<K> {}
 
 impl<K> Ord for IndexedItem<K> {
+  /// Reversed (`BinaryHeap` is a max-heap), in `f64::total_cmp` order.
   fn cmp(&self, other: &Self) -> Ordering {
-    other
-      .priority
-      .partial_cmp(&self.priority)
-      .unwrap_or(Ordering::Equal)
+    other.priority.total_cmp(&self.priority)
   }
 }
 
@@ -124,11 +123,16 @@ impl<K> PartialOrd for IndexedItem<K> {
 /// Indexed min-priority queue for Dijkstra's algorithm
 ///
 /// Supports O(log n) insert, extract_min, and decrease_priority operations.
+/// Priorities are ordered by [`f64::total_cmp`], so every key pops exactly once whatever its
+/// priority: `+inf` after every finite priority, and NaN after `+inf`.
+///
 /// Note: decrease_priority is implemented by re-inserting, which is O(log n)
-/// but may leave stale entries in the heap (they are skipped during extract).
+/// but leaves the old entry in the heap; extract_min skips it.
 pub struct IndexedMinHeap<K: Clone + Hash + Eq> {
   heap: BinaryHeap<IndexedItem<K>>,
-  priorities: HashMap<K, f64>,
+  /// Current priority of each queued key, and the version of the heap entry that carries it.
+  priorities: HashMap<K, (f64, u64)>,
+  next_version: u64,
 }
 
 impl<K: Clone + Hash + Eq> IndexedMinHeap<K> {
@@ -137,41 +141,42 @@ impl<K: Clone + Hash + Eq> IndexedMinHeap<K> {
     Self {
       heap: BinaryHeap::new(),
       priorities: HashMap::new(),
+      next_version: 0,
     }
   }
 
-  /// Insert a key with priority
+  /// Insert a key with priority (replacing its priority if it is already queued)
   pub fn insert(&mut self, key: K, priority: f64) {
-    self.priorities.insert(key.clone(), priority);
-    self.heap.push(IndexedItem { key, priority });
+    let version = self.next_version;
+    self.next_version += 1;
+    self.priorities.insert(key.clone(), (priority, version));
+    self.heap.push(IndexedItem {
+      key,
+      priority,
+      version,
+    });
   }
 
   /// Extract the minimum priority item
   pub fn extract_min(&mut self) -> Option<K> {
     while let Some(item) = self.heap.pop() {
-      // Check if this is the current priority for this key
-      // (may be stale if we did decrease_priority)
-      if let Some(&current_priority) = self.priorities.get(&item.key) {
-        if (item.priority - current_priority).abs() < f64::EPSILON {
-          self.priorities.remove(&item.key);
-          return Some(item.key);
-        }
-        // Stale entry, skip it
+      // Entries superseded by a later insert/decrease_priority, or of keys already
+      // extracted, carry an old version.
+      if self
+        .priorities
+        .get(&item.key)
+        .is_some_and(|&(_, version)| version == item.version)
+      {
+        self.priorities.remove(&item.key);
+        return Some(item.key);
       }
-      // Key was already extracted, skip
     }
     None
   }
 
   /// Decrease the priority of a key (or update if higher)
   pub fn decrease_priority(&mut self, key: K, new_priority: f64) {
-    // Simply re-insert with new priority
-    // The old entry becomes stale and will be skipped in extract_min
-    self.priorities.insert(key.clone(), new_priority);
-    self.heap.push(IndexedItem {
-      key,
-      priority: new_priority,
-    });
+    self.insert(key, new_priority);
   }
 
   /// Check if the queue is empty
@@ -191,7 +196,7 @@ impl<K: Clone + Hash + Eq> IndexedMinHeap<K> {
 
   /// Get the priority of a key
   pub fn priority(&self, key: &K) -> Option<f64> {
-    self.priorities.get(key).copied()
+    self.priorities.get(key).map(|&(priority, _)| priority)
   }
 }
 
@@ -212,7 +217,7 @@ pub type MaxHeap<T> = BinaryHeap<T>;
 // Scored item for k-nearest search
 // ============================================================================
 
-/// Item with a score (distance) for heap operations
+/// Item with a score (distance) for heap operations, ordered by `f32::total_cmp`
 #[derive(Debug, Clone)]
 pub struct ScoredItem<T> {
   pub score: f32,
@@ -227,18 +232,16 @@ impl<T> ScoredItem<T> {
 
 impl<T> PartialEq for ScoredItem<T> {
   fn eq(&self, other: &Self) -> bool {
-    self.score == other.score
+    self.cmp(other) == Ordering::Equal
   }
 }
 
 impl<T> Eq for ScoredItem<T> {}
 
 impl<T> Ord for ScoredItem<T> {
+  /// `f32::total_cmp` order, so a NaN score sorts after every other score.
   fn cmp(&self, other: &Self) -> Ordering {
-    self
-      .score
-      .partial_cmp(&other.score)
-      .unwrap_or(Ordering::Equal)
+    self.score.total_cmp(&other.score)
   }
 }
 
@@ -308,7 +311,7 @@ impl<T> KNearestHeap<T> {
   /// Extract results sorted by score (ascending)
   pub fn into_sorted(self) -> Vec<(f32, T)> {
     let mut items: Vec<_> = self.heap.into_iter().map(|s| (s.score, s.item)).collect();
-    items.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+    items.sort_by(|a, b| a.0.total_cmp(&b.0));
     items
   }
 }
