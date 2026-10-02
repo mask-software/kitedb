@@ -55,7 +55,7 @@ mod tests {
   use tempfile::tempdir;
 
   use crate::api::kite::{EdgeDef, Kite, KiteOptions, NodeDef, PropDef};
-  use crate::core::single_file::{open_single_file, SingleFileOpenOptions, SyncMode};
+  use crate::core::single_file::{open_single_file, SingleFileOpenOptions};
   use crate::mvcc::{ConflictDetector, TxManager};
   use crate::types::{PropValue, TxKey};
 
@@ -78,15 +78,11 @@ mod tests {
     let follows = EdgeDef::new("FOLLOWS");
     let likes = EdgeDef::new("LIKES");
 
-    // These tests exercise in-memory concurrency and never reopen the file.
-    // Full sync (F_FULLFSYNC per commit on macOS, milliseconds each) would
-    // only make their timing assertions depend on disk load.
     KiteOptions::new()
       .node(user)
       .node(post)
       .edge(follows)
       .edge(likes)
-      .sync_mode(SyncMode::Normal)
   }
 
   fn temp_db_path(temp_dir: &tempfile::TempDir) -> std::path::PathBuf {

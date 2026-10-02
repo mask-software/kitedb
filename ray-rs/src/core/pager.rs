@@ -518,8 +518,9 @@ impl FilePager {
     Ok(())
   }
 
-  /// Make every [`Self::sync`] durable against power loss (`SyncMode::Full`),
-  /// not just against a process or OS crash.
+  /// Make every [`Self::sync`] durable against power loss, not just against
+  /// a process or OS crash (`SingleFileOpenOptions::full_fsync` with
+  /// `SyncMode::Full`).
   ///
   /// On macOS, fsync(2) hands data to the drive, whose volatile write cache
   /// can still lose it or persist it out of order (a header before the WAL
@@ -996,10 +997,11 @@ mod tests {
   }
 }
 
-/// Wave-2 `wal-format` W7: `SyncMode::Full` must survive power loss. Plain
-/// fsync(2) on macOS only hands data to the drive, whose volatile cache can
-/// lose it or persist it out of order (the header page before the WAL page it
-/// names, or before the snapshot it points to).
+/// Wave-2 `wal-format` W7: `SyncMode::Full` with `full_fsync` must survive
+/// power loss. Plain fsync(2) on macOS only hands data to the drive, whose
+/// volatile cache can lose it or persist it out of order (the header page
+/// before the WAL page it names, or before the snapshot it points to).
+/// `full_fsync` is opt-in (off by default, like SQLite's `fullfsync`).
 #[cfg(test)]
 mod w2_tests {
   use super::SYNC_PRIMITIVE_LOG;
@@ -1026,7 +1028,8 @@ mod w2_tests {
     let dir = tempfile::tempdir().expect("tempdir");
     let options = SingleFileOpenOptions::new()
       .auto_checkpoint(false)
-      .sync_mode(SyncMode::Full);
+      .sync_mode(SyncMode::Full)
+      .full_fsync(true);
     let db = open_single_file(dir.path().join("w7-commit.kitedb"), options).expect("open");
     let syncs = syncs_during(|| {
       db.begin(false).expect("begin");
@@ -1041,12 +1044,43 @@ mod w2_tests {
     let dir = tempfile::tempdir().expect("tempdir");
     let options = SingleFileOpenOptions::new()
       .auto_checkpoint(false)
-      .sync_mode(SyncMode::Full);
+      .sync_mode(SyncMode::Full)
+      .full_fsync(true);
     let db = open_single_file(dir.path().join("w7-checkpoint.kitedb"), options).expect("open");
     db.begin(false).expect("begin");
     db.create_node(Some("n")).expect("node");
     db.commit().expect("commit");
     let syncs = syncs_during(|| db.checkpoint().expect("checkpoint"));
     assert_drive_cache_flushed("SyncMode::Full checkpoint", &syncs);
+  }
+
+  /// Without the option, Full mode keeps the plain sync primitive (fast, not
+  /// power-loss durable on macOS), and the option never affects Normal mode.
+  #[test]
+  fn w7_full_fsync_is_opt_in_and_only_for_full_mode() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cases = [
+      ("default Full", SyncMode::Full, false),
+      ("Normal with full_fsync", SyncMode::Normal, true),
+    ];
+    for (what, mode, full_fsync) in cases {
+      let options = SingleFileOpenOptions::new()
+        .auto_checkpoint(false)
+        .sync_mode(mode)
+        .full_fsync(full_fsync);
+      let path = dir.path().join(format!("w7-{mode:?}.kitedb"));
+      let db = open_single_file(path, options).expect("open");
+      let syncs = syncs_during(|| {
+        db.begin(false).expect("begin");
+        db.create_node(Some("n")).expect("node");
+        db.commit().expect("commit");
+        db.checkpoint().expect("checkpoint");
+      });
+      assert!(!syncs.is_empty(), "{what}: issued no sync at all");
+      assert!(
+        !syncs.contains(&"F_FULLFSYNC"),
+        "{what}: used F_FULLFSYNC: {syncs:?}"
+      );
+    }
   }
 }

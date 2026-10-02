@@ -178,6 +178,11 @@ pub struct OpenOptions {
   pub cache_query_ttl_ms: Option<i64>,
   /// Sync mode: "Full", "Normal", or "Off" (default: "Full")
   pub sync_mode: Option<JsSyncMode>,
+  /// macOS only: in "Full" sync mode, sync with F_FULLFSYNC so commits
+  /// survive power loss; much slower (milliseconds per commit). Default
+  /// false: "Full" then survives crashes but not power loss on macOS, like
+  /// SQLite's default.
+  pub full_fsync: Option<bool>,
   /// Enable group commit (coalesce WAL flushes across commits)
   pub group_commit_enabled: Option<bool>,
   /// Group commit window in milliseconds (0 adds no coalescing delay)
@@ -329,6 +334,9 @@ impl OpenOptions {
     // Sync mode
     if let Some(mode) = self.sync_mode {
       rust_opts = rust_opts.sync_mode(mode.into());
+    }
+    if let Some(full_fsync) = self.full_fsync {
+      rust_opts = rust_opts.full_fsync(full_fsync);
     }
     if let Some(enabled) = self.group_commit_enabled {
       rust_opts = rust_opts.group_commit_enabled(enabled);
@@ -582,6 +590,21 @@ mod open_option_validation_tests {
   }
 
   #[test]
+  fn full_fsync_is_opt_in() {
+    assert!(
+      !OpenOptions::default()
+        .into_rust()
+        .expect("defaults")
+        .full_fsync
+    );
+    let opted_in = OpenOptions {
+      full_fsync: Some(true),
+      ..Default::default()
+    };
+    assert!(opted_in.into_rust().expect("full_fsync").full_fsync);
+  }
+
+  #[test]
   fn unset_wal_size_reopens_a_file_with_its_own_wal_size() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("napi-wal-size.kitedb");
@@ -643,6 +666,7 @@ fn open_options_from_kite_profile_options(opts: crate::api::kite::KiteOptions) -
     cache_max_query_entries: None,
     cache_query_ttl_ms: None,
     sync_mode: Some(js_sync_mode_from_rust(opts.sync_mode)),
+    full_fsync: None,
     group_commit_enabled: Some(opts.group_commit_enabled),
     group_commit_window_ms: i64::try_from(opts.group_commit_window_ms).ok(),
     snapshot_parse_mode: None,

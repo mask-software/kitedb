@@ -1555,6 +1555,13 @@ export interface OpenOptions {
   cacheQueryTtlMs?: number
   /** Sync mode: "Full", "Normal", or "Off" (default: "Full") */
   syncMode?: JsSyncMode
+  /**
+   * macOS only: in "Full" sync mode, sync with F_FULLFSYNC so commits
+   * survive power loss; much slower (milliseconds per commit). Default
+   * false: "Full" then survives crashes but not power loss on macOS, like
+   * SQLite's default.
+   */
+  fullFsync?: boolean
   /** Enable group commit (coalesce WAL flushes across commits) */
   groupCommitEnabled?: boolean
   /** Group commit window in milliseconds (0 adds no coalescing delay) */

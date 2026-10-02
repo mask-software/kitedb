@@ -48,10 +48,10 @@ use super::{BackgroundCheckpointState, SchemaReservations, SingleFileDB};
 /// Similar to SQLite's PRAGMA synchronous setting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SyncMode {
-  /// Sync on every commit (durable against power loss, slowest).
-  /// On macOS every sync is `F_FULLFSYNC`, which also flushes the drive's
-  /// write cache (plain `fsync` there does not, so a power loss could drop or
-  /// reorder acknowledged writes); it costs a few milliseconds per sync.
+  /// Fsync on every commit (durable to OS, slowest).
+  /// On macOS, fsync leaves writes in the drive's volatile cache, so without
+  /// [`SingleFileOpenOptions::full_fsync`] this mode does not survive power
+  /// loss there (the same as SQLite's default).
   #[default]
   Full,
 
@@ -112,6 +112,9 @@ pub struct SingleFileOpenOptions {
   pub checkpoint_compression: Option<CompressionOptions>,
   /// Synchronization mode for WAL writes (default: Full)
   pub sync_mode: SyncMode,
+  /// macOS only: with `SyncMode::Full`, sync with `F_FULLFSYNC` so commits
+  /// survive power loss (default false). See [`Self::full_fsync`].
+  pub full_fsync: bool,
   /// Enable group commit (coalesce WAL flushes across commits)
   pub group_commit_enabled: bool,
   /// Group commit window in milliseconds
@@ -162,6 +165,7 @@ impl Default for SingleFileOpenOptions {
         ..Default::default()
       }),
       sync_mode: SyncMode::Full,
+      full_fsync: false,
       group_commit_enabled: false,
       group_commit_window_ms: 2,
       snapshot_parse_mode: SnapshotParseMode::Strict,
@@ -275,6 +279,22 @@ impl SingleFileOpenOptions {
 
   pub fn sync_mode(mut self, mode: SyncMode) -> Self {
     self.sync_mode = mode;
+    self
+  }
+
+  /// macOS only: make `SyncMode::Full` durable against power loss (default
+  /// false), like SQLite's `PRAGMA fullfsync`.
+  ///
+  /// On macOS, fsync(2) hands writes to the drive, whose volatile cache can
+  /// lose them, or persist a header before the pages it names, if power
+  /// fails. With this option every sync in `SyncMode::Full` uses
+  /// `F_FULLFSYNC`, which flushes that cache too (falling back to fsync on
+  /// file systems without it). It is much slower: milliseconds per commit
+  /// instead of tens of microseconds. Without it, Full mode on macOS survives
+  /// application and OS crashes but not power loss, the same as SQLite's
+  /// default. Other modes, and other platforms, are unaffected.
+  pub fn full_fsync(mut self, value: bool) -> Self {
+    self.full_fsync = value;
     self
   }
 
@@ -928,7 +948,7 @@ fn open_single_file_internal(
   let (mut pager, mut header, is_new, mut header_slot) = if file_exists {
     // Open existing database
     let mut pager = open_pager_with_locking(path, options.page_size, options.read_only, lock_file)?;
-    pager.set_full_fsync(options.sync_mode == SyncMode::Full);
+    pager.set_full_fsync(options.full_fsync && options.sync_mode == SyncMode::Full);
 
     // Read both independently checksummed header pages and select the newest
     // valid generation. A torn newest slot falls back to the other slot.
@@ -963,7 +983,7 @@ fn open_single_file_internal(
   } else {
     // Create new database
     let mut pager = create_pager_with_locking(path, options.page_size, lock_file)?;
-    pager.set_full_fsync(options.sync_mode == SyncMode::Full);
+    pager.set_full_fsync(options.full_fsync && options.sync_mode == SyncMode::Full);
 
     // Calculate WAL page count
     let wal_size = options.wal_size.unwrap_or(WAL_DEFAULT_SIZE);

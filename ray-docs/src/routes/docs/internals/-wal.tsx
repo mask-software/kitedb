@@ -313,10 +313,9 @@ const SYNC_MODES: {
 		name: "Full",
 		accent: "mint",
 		badge: "default",
-		summary:
-			"Sync on every commit; on macOS F_FULLFSYNC, which also flushes the drive's write cache",
+		summary: "fsync on every commit",
 		tradeoff:
-			"Survives power loss; slowest writes (milliseconds per commit on macOS)",
+			"Safest; slowest writes. On macOS, fsync leaves writes in the drive's cache, so commits survive power loss only with fullFsync (F_FULLFSYNC, milliseconds per commit), as with SQLite",
 	},
 	{
 		name: "Normal",
