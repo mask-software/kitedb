@@ -923,8 +923,22 @@ fn s8_checker_reports_key_entries_disagreeing_with_node_keys() {
   assert_detected("KeyEntries node IDs swapped vs NodeKeyString", &image);
 }
 
-/// Labels, edge types and property keys stored per node/edge must be within
-/// the header's schema bounds (num_labels, num_etypes, num_propkeys).
+/// Ok when the snapshot loads and `check_snapshot` warns about `section`.
+fn warned(image: &Image, section: &str) -> Result<(), String> {
+  match check(image) {
+    Err(error) => Err(format!("load rejected it: {error}")),
+    Ok(report) if report.warnings.iter().any(|w| w.contains(section)) => Ok(()),
+    Ok(report) => Err(format!(
+      "no warning names {section} (valid={}, errors: {:?}, warnings: {:?})",
+      report.valid, report.errors, report.warnings
+    )),
+  }
+}
+
+/// Labels, edge types and property keys stored per node/edge outside the
+/// header's schema bounds (num_labels, num_etypes, num_propkeys) are reported,
+/// as warnings: the low-level API accepts IDs that were never defined, so a
+/// valid database can hold them.
 #[test]
 fn s8_checker_reports_schema_ids_out_of_range() {
   let base = keyed_image();
@@ -937,7 +951,7 @@ fn s8_checker_reports_schema_ids_out_of_range() {
   let mut labels = image.u32s(SectionId::NodeLabelIds);
   labels[0] = num_labels + 1;
   image.set_u32s(SectionId::NodeLabelIds, &labels);
-  if let Err(message) = detected(&image) {
+  if let Err(message) = warned(&image, "NodeLabelIds") {
     failures.push(format!("NodeLabelIds[0] = {}: {message}", num_labels + 1));
   }
 
@@ -948,7 +962,7 @@ fn s8_checker_reports_schema_ids_out_of_range() {
   csr.out_etype[last] = num_etypes + 1;
   csr.rebuild_in_edges();
   csr.write(&mut image);
-  if let Err(message) = detected(&image) {
+  if let Err(message) = warned(&image, "OutEtype") {
     failures.push(format!("OutEtype[{last}] = {}: {message}", num_etypes + 1));
   }
 
@@ -959,7 +973,7 @@ fn s8_checker_reports_schema_ids_out_of_range() {
   let last = offsets[1] as usize - 1;
   keys[last] = num_propkeys + 1;
   image.set_u32s(SectionId::NodePropKeys, &keys);
-  if let Err(message) = detected(&image) {
+  if let Err(message) = warned(&image, "NodePropKeys") {
     failures.push(format!(
       "NodePropKeys[{last}] = {}: {message}",
       num_propkeys + 1
@@ -970,7 +984,7 @@ fn s8_checker_reports_schema_ids_out_of_range() {
   let mut keys = image.u32s(SectionId::EdgePropKeys);
   keys[0] = num_propkeys + 1;
   image.set_u32s(SectionId::EdgePropKeys, &keys);
-  if let Err(message) = detected(&image) {
+  if let Err(message) = warned(&image, "EdgePropKeys") {
     failures.push(format!("EdgePropKeys[0] = {}: {message}", num_propkeys + 1));
   }
 

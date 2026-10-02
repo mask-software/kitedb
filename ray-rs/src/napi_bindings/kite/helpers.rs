@@ -7,9 +7,8 @@ use napi::bindgen_prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::api::kite::{BatchOp, BatchResult, Kite as RustKite};
-use crate::api::traversal::TraversalDirection;
-use crate::core::single_file::SingleFileDB;
+use crate::api::kite::{BatchOp, BatchResult, Kite as RustKite, KiteTraversalProps};
+use crate::api::traversal::{RawEdge, TraversalProps};
 use crate::types::{ETypeId, Edge, NodeId, PropValue};
 
 use super::key_spec::KeySpec;
@@ -105,11 +104,11 @@ pub(crate) struct EdgeFilterData {
   pub props: HashMap<String, PropValue>,
 }
 
-/// Create node filter data from a node ID
+/// Create node filter data from a node ID, with the node props `props` loads
 pub(crate) fn node_filter_data(
   ray: &RustKite,
+  props: &impl TraversalProps,
   node_id: NodeId,
-  selected_props: Option<&HashSet<String>>,
 ) -> NodeFilterData {
   let node_ref = ray.node_by_id(node_id).ok().flatten();
   let (key, node_type) = match node_ref {
@@ -120,32 +119,21 @@ pub(crate) fn node_filter_data(
     None => ("".to_string(), "unknown".to_string()),
   };
 
-  let props = node_props_selected(ray, node_id, selected_props);
-
   NodeFilterData {
     id: node_id,
     key,
     node_type,
-    props,
+    props: props.node_props(node_id),
   }
 }
 
-/// Create edge filter data from an edge
-pub(crate) fn edge_filter_data(ray: &RustKite, edge: &Edge) -> EdgeFilterData {
-  let mut props = HashMap::new();
-  if let Some(props_by_id) = ray.raw().edge_props(edge.src, edge.etype, edge.dst) {
-    for (key_id, value) in props_by_id {
-      if let Some(name) = ray.raw().propkey_name(key_id) {
-        props.insert(name, value);
-      }
-    }
-  }
-
+/// Create edge filter data from an edge, with the edge props `props` loads
+pub(crate) fn edge_filter_data(props: &impl TraversalProps, edge: &Edge) -> EdgeFilterData {
   EdgeFilterData {
     src: edge.src,
     dst: edge.dst,
     etype: edge.etype,
-    props,
+    props: props.edge_props(&RawEdge::from(*edge)),
   }
 }
 
@@ -203,28 +191,15 @@ pub(crate) fn call_filter(env: &Env, filter: &FilterFn, arg: Object<'static>) ->
 // Property Selection Helpers
 // =============================================================================
 
-/// Check if a property should be included based on selection
-pub(crate) fn should_include_prop(selected_props: Option<&HashSet<String>>, name: &str) -> bool {
-  selected_props.is_none_or(|set| set.contains(name))
-}
-
-/// Get node properties with optional selection
+/// Get node properties, only the `selected_props` when given; loaded as the
+/// core traversal loads them (`KiteTraversalProps`)
 pub(crate) fn node_props_selected(
   ray: &RustKite,
   node_id: NodeId,
   selected_props: Option<&HashSet<String>>,
 ) -> HashMap<String, PropValue> {
-  let mut props = HashMap::new();
-  if let Some(props_by_id) = ray.raw().node_props(node_id) {
-    for (key_id, value) in props_by_id {
-      if let Some(name) = ray.raw().propkey_name(key_id) {
-        if should_include_prop(selected_props, &name) {
-          props.insert(name, value);
-        }
-      }
-    }
-  }
-  props
+  let selected: Option<Vec<String>> = selected_props.map(|names| names.iter().cloned().collect());
+  KiteTraversalProps::new(ray.raw(), selected.as_deref()).node_props(node_id)
 }
 
 /// Get all node properties
@@ -256,48 +231,4 @@ pub(crate) fn execute_batch_ops(ray: &mut RustKite, ops: Vec<BatchOp>) -> Result
   ray
     .batch(ops)
     .map_err(|e| Error::from_reason(e.to_string()))
-}
-
-// =============================================================================
-// Neighbor Traversal
-// =============================================================================
-
-/// Get neighbors for a node in a given direction
-pub(crate) fn neighbors(
-  db: &SingleFileDB,
-  node_id: NodeId,
-  direction: TraversalDirection,
-  etype: Option<ETypeId>,
-) -> Vec<Edge> {
-  let mut edges = Vec::new();
-  match direction {
-    TraversalDirection::Out => {
-      for (edge_type, dst) in db.out_edges(node_id) {
-        if etype.is_none() || etype == Some(edge_type) {
-          edges.push(Edge {
-            src: node_id,
-            etype: edge_type,
-            dst,
-          });
-        }
-      }
-    }
-    TraversalDirection::In => {
-      for (edge_type, src) in db.in_edges(node_id) {
-        if etype.is_none() || etype == Some(edge_type) {
-          edges.push(Edge {
-            src,
-            etype: edge_type,
-            dst: node_id,
-          });
-        }
-      }
-    }
-    TraversalDirection::Both => {
-      edges.extend(neighbors(db, node_id, TraversalDirection::Out, etype));
-      edges.extend(neighbors(db, node_id, TraversalDirection::In, etype));
-    }
-  }
-
-  edges
 }
