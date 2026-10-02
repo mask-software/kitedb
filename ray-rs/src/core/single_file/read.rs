@@ -39,6 +39,45 @@ use crate::types::*;
 
 use super::{SingleFileDB, SingleFileTxState};
 
+// ============================================================================
+// Test instrumentation
+// ============================================================================
+
+#[cfg(test)]
+thread_local! {
+  /// Node entries (snapshot nodes; delta, transaction and version-chain node
+  /// entries) that listings visited on this thread.
+  pub(crate) static NODES_EXAMINED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+  /// Edge entries (snapshot edges; delta, transaction and version-chain edge
+  /// entries) that reads visited on this thread.
+  pub(crate) static EDGES_EXAMINED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+  /// Point reads of one node's key or labels on this thread.
+  pub(crate) static NODE_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Count `n` node entries visited (test instrumentation).
+#[inline]
+pub(super) fn examined_nodes(n: usize) {
+  #[cfg(test)]
+  NODES_EXAMINED.with(|count| count.set(count.get() + n));
+  let _ = n;
+}
+
+/// Count `n` edge entries visited (test instrumentation).
+#[inline]
+pub(super) fn examined_edges(n: usize) {
+  #[cfg(test)]
+  EDGES_EXAMINED.with(|count| count.set(count.get() + n));
+  let _ = n;
+}
+
+/// Count one point read of a node's key or labels (test instrumentation).
+#[inline]
+fn node_lookup() {
+  #[cfg(test)]
+  NODE_LOOKUPS.with(|count| count.set(count.get() + 1));
+}
+
 /// Which layers' state of a node a reader sees: its transaction's pending
 /// delta over the committed delta over the snapshot. A layer's delete masks
 /// the node's copies below it (props, labels, key, edges); a recreated node
@@ -703,6 +742,7 @@ impl SingleFileDB {
         .filter(|_| layers.sees_snapshot(node_id, node_visible))
       {
         for (dst_phys, etype) in snap.iter_out_edges(phys) {
+          examined_edges(1);
           // Convert physical dst to NodeId
           if let Some(dst_node_id) = snap.node_id(dst_phys) {
             // Skip edges to deleted nodes
@@ -734,6 +774,7 @@ impl SingleFileDB {
       .get(&node_id)
       .filter(|_| layers.sees_delta(node_id, node_visible))
     {
+      examined_edges(added_edges.len());
       for edge_patch in added_edges {
         // Skip edges to deleted nodes
         let dst_visible = vc_guard
@@ -761,6 +802,7 @@ impl SingleFileDB {
     }
 
     if let Some(added_edges) = pending.and_then(|p| p.out_add.get(&node_id)) {
+      examined_edges(added_edges.len());
       for edge_patch in added_edges {
         let dst_visible = vc_guard
           .as_ref()
@@ -778,6 +820,7 @@ impl SingleFileDB {
       .filter(|_| layers.sees_delta(node_id, node_visible))
     {
       for (src, etype, dst) in vc.node_edges_at(node_id, tx_snapshot_ts, txid) {
+        examined_edges(1);
         if src != node_id || pending.is_some_and(|p| p.is_edge_deleted(src, etype, dst)) {
           continue;
         }
@@ -857,6 +900,7 @@ impl SingleFileDB {
         .filter(|_| layers.sees_snapshot(node_id, node_visible))
       {
         for (src_phys, etype, _out_index) in snap.iter_in_edges(phys) {
+          examined_edges(1);
           // Convert physical src to NodeId
           if let Some(src_node_id) = snap.node_id(src_phys) {
             // Skip edges from deleted nodes
@@ -888,6 +932,7 @@ impl SingleFileDB {
       .get(&node_id)
       .filter(|_| layers.sees_delta(node_id, node_visible))
     {
+      examined_edges(added_edges.len());
       for edge_patch in added_edges {
         // Skip edges from deleted nodes
         let src_visible = vc_guard
@@ -915,6 +960,7 @@ impl SingleFileDB {
     }
 
     if let Some(added_edges) = pending.and_then(|p| p.in_add.get(&node_id)) {
+      examined_edges(added_edges.len());
       for edge_patch in added_edges {
         let src_visible = vc_guard
           .as_ref()
@@ -932,6 +978,7 @@ impl SingleFileDB {
       .filter(|_| layers.sees_delta(node_id, node_visible))
     {
       for (src, etype, dst) in vc.node_edges_at(node_id, tx_snapshot_ts, txid) {
+        examined_edges(1);
         if dst != node_id || pending.is_some_and(|p| p.is_edge_deleted(src, etype, dst)) {
           continue;
         }
@@ -1114,6 +1161,7 @@ impl SingleFileDB {
 
   /// Get all labels for a node
   pub fn node_labels(&self, node_id: NodeId) -> Vec<LabelId> {
+    node_lookup();
     let tx_handle = self.current_tx_handle();
     let mut tx_guard = tx_handle.as_ref().map(|tx| tx.lock());
     let pending = tx_guard.as_ref().map(|tx| &tx.pending);
@@ -1284,6 +1332,7 @@ impl SingleFileDB {
   ///
   /// Returns the key string if the node has one, None otherwise.
   pub fn node_key(&self, node_id: NodeId) -> Option<String> {
+    node_lookup();
     let tx_handle = self.current_tx_handle();
     let tx_guard = tx_handle.as_ref().map(|tx| tx.lock());
     let pending = tx_guard.as_ref().map(|tx| &tx.pending);

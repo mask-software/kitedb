@@ -3923,6 +3923,40 @@ fn neighbors_from_single_file(
   edges
 }
 
+#[cfg(test)]
+mod neighbor_tests {
+  use super::*;
+
+  /// A self-loop is both an out-edge and an in-edge of its node: `Both` lists it once, as
+  /// `Kite::neighbors` does.
+  #[test]
+  fn neighbors_lists_a_self_loop_once_in_both() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = open_single_file(
+      dir.path().join("db.kitedb"),
+      crate::core::single_file::SingleFileOpenOptions::new(),
+    )
+    .expect("open");
+    db.begin(false).expect("begin");
+    let a = db.create_node(Some("a")).expect("a");
+    let b = db.create_node(Some("b")).expect("b");
+    let etype = db.define_etype("E").expect("etype");
+    db.add_edge(a, etype, a).expect("self-loop");
+    db.add_edge(a, etype, b).expect("edge");
+    db.add_edge(b, etype, a).expect("edge");
+    db.commit().expect("commit");
+    let edge = |src, dst| Edge { src, etype, dst };
+    assert_eq!(
+      neighbors_from_single_file(&db, a, TraversalDirection::Both, None),
+      vec![edge(a, a), edge(a, b), edge(b, a)]
+    );
+    assert_eq!(
+      neighbors_from_single_file(&db, a, TraversalDirection::In, Some(etype)),
+      vec![edge(a, a), edge(b, a)]
+    );
+  }
+}
+
 fn resolve_weight_key_single_file(
   db: &RustSingleFileDB,
   config: &JsPathConfig,

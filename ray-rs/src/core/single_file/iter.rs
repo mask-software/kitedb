@@ -5,7 +5,7 @@
 use crate::types::*;
 use std::collections::HashSet;
 
-use super::read::NodeLayers;
+use super::read::{examined_edges, examined_nodes, NodeLayers};
 use super::SingleFileDB;
 
 // ============================================================================
@@ -54,6 +54,7 @@ impl NodeIterator {
     if let Some(ref snap) = *snapshot {
       let num_nodes = snap.header.num_nodes as u32;
       for phys in 0..num_nodes {
+        examined_nodes(1);
         if let Some(node_id) = snap.node_id(phys) {
           // Skip if deleted in delta
           let node_visible = vc_guard
@@ -68,6 +69,7 @@ impl NodeIterator {
     }
 
     // 2. Add nodes created in delta (excluding deleted)
+    examined_nodes(delta.created_nodes.len());
     for &node_id in delta.created_nodes.keys() {
       let node_visible = vc_guard
         .as_ref()
@@ -80,6 +82,7 @@ impl NodeIterator {
 
     // 3. Add nodes created (or recreated) in pending
     if let Some(pending_delta) = pending {
+      examined_nodes(pending_delta.created_nodes.len());
       nodes.extend(pending_delta.created_nodes.keys().copied());
     }
 
@@ -87,6 +90,7 @@ impl NodeIterator {
     if let Some(vc) = vc_guard.as_ref() {
       nodes.extend(
         vc.nodes_at(tx_snapshot_ts, txid)
+          .inspect(|_| examined_nodes(1))
           .filter(|&node_id| !layers.pending_masks(node_id)),
       );
     }
@@ -252,6 +256,7 @@ impl SingleFileDB {
     if let Some(ref snap) = *snapshot {
       let num_nodes = snap.header.num_nodes as u32;
       for phys in 0..num_nodes {
+        examined_nodes(1);
         if let Some(src) = snap.node_id(phys) {
           // Skip deleted nodes
           let src_visible = vc_guard
@@ -265,6 +270,7 @@ impl SingleFileDB {
           }
 
           for (dst_phys, etype) in snap.iter_out_edges(phys) {
+            examined_edges(1);
             // Apply filter
             if let Some(filter_etype) = etype_filter {
               if etype != filter_etype {
@@ -299,6 +305,7 @@ impl SingleFileDB {
 
     // Add delta edges
     for (&src, add_set) in &delta.out_add {
+      examined_edges(add_set.len());
       for patch in add_set {
         // Apply filter
         if let Some(filter_etype) = etype_filter {
@@ -342,6 +349,7 @@ impl SingleFileDB {
 
     if let Some(pending_delta) = pending {
       for (&src, add_set) in &pending_delta.out_add {
+        examined_edges(add_set.len());
         for patch in add_set {
           if let Some(filter_etype) = etype_filter {
             if patch.etype != filter_etype {
@@ -380,6 +388,7 @@ impl SingleFileDB {
       let node_visible =
         |node_id| layers.sees_delta(node_id, vc.node_exists_at(node_id, tx_snapshot_ts, txid));
       for (src, etype, dst) in vc.edges_at(tx_snapshot_ts, txid) {
+        examined_edges(1);
         if etype_filter.is_some_and(|filter_etype| filter_etype != etype)
           || pending.is_some_and(|p| p.is_edge_deleted(src, etype, dst))
           || !node_visible(src)
@@ -469,3 +478,7 @@ impl SingleFileDB {
     self.wal_buffer.lock().stats()
   }
 }
+
+#[cfg(test)]
+#[path = "b4_query_core_tests.rs"]
+mod b4_query_core_tests;

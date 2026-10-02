@@ -814,6 +814,25 @@ mod tests {
     graph
   }
 
+  /// A self-loop is both an out-edge and an in-edge of its node: `Both` lists it once, as
+  /// `Kite::neighbors` does.
+  #[test]
+  fn graph_accessor_lists_a_self_loop_once_in_both() {
+    let mut graph = JsGraphAccessor::new();
+    graph.add_edge(1.0, 1.0, 1.0, None).expect("self-loop");
+    graph.add_edge(1.0, 1.0, 2.0, None).expect("edge");
+    graph.add_edge(3.0, 1.0, 1.0, None).expect("edge");
+    let edge = |src, dst| Edge { src, etype: 1, dst };
+    assert_eq!(
+      graph.neighbors_internal(1, TraversalDirection::Both, None),
+      vec![edge(1, 1), edge(1, 2), edge(3, 1)]
+    );
+    assert_eq!(
+      graph.neighbors_internal(1, TraversalDirection::In, Some(1)),
+      vec![edge(1, 1), edge(3, 1)]
+    );
+  }
+
   #[test]
   fn test_graph_accessor_basic() {
     let graph = create_test_graph();
