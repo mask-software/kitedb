@@ -5,7 +5,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -97,6 +96,86 @@ impl Drop for DatabaseFileLock {
       registry.remove(&self.path);
     }
   }
+}
+
+// ============================================================================
+// Positioned I/O
+// ============================================================================
+
+/// One positioned read; it may return fewer bytes than asked.
+#[cfg(unix)]
+fn read_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+  std::os::unix::fs::FileExt::read_at(file, buffer, offset)
+}
+
+/// One positioned read; it may return fewer bytes than asked. It also moves
+/// the file cursor, which page I/O never relies on.
+#[cfg(windows)]
+fn read_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+  std::os::windows::fs::FileExt::seek_read(file, buffer, offset)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn read_at(mut file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+  use std::io::{Read, Seek, SeekFrom};
+  file.seek(SeekFrom::Start(offset))?;
+  file.read(buffer)
+}
+
+/// One positioned write; it may write fewer bytes than given.
+#[cfg(unix)]
+fn write_at(file: &File, data: &[u8], offset: u64) -> std::io::Result<usize> {
+  std::os::unix::fs::FileExt::write_at(file, data, offset)
+}
+
+/// One positioned write; it may write fewer bytes than given. It also moves
+/// the file cursor, which page I/O never relies on.
+#[cfg(windows)]
+fn write_at(file: &File, data: &[u8], offset: u64) -> std::io::Result<usize> {
+  std::os::windows::fs::FileExt::seek_write(file, data, offset)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn write_at(mut file: &File, data: &[u8], offset: u64) -> std::io::Result<usize> {
+  use std::io::{Seek, SeekFrom, Write};
+  file.seek(SeekFrom::Start(offset))?;
+  file.write(data)
+}
+
+/// Fill `buffer` from file `offset` until it is full or the file ends, and
+/// return the bytes read; the rest of `buffer` is left as it was. A read may
+/// return fewer bytes than asked before the end of the file (POSIX allows it:
+/// NFS, signals), so this reads again until a read returns none.
+fn read_full_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+  let mut filled = 0;
+  while filled < buffer.len() {
+    let at = offset + filled as u64;
+    io_hooks::syscall();
+    match read_at(file, io_hooks::read_window(at, &mut buffer[filled..]), at) {
+      Ok(0) => break,
+      Ok(read) => filled += read,
+      Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+      Err(error) => return Err(error),
+    }
+  }
+  Ok(filled)
+}
+
+/// Write all of `data` at file `offset`, writing again after a short write.
+fn write_all_at(file: &File, mut data: &[u8], mut offset: u64) -> std::io::Result<()> {
+  while !data.is_empty() {
+    io_hooks::syscall();
+    match write_at(file, data, offset) {
+      Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+      Ok(written) => {
+        data = &data[written..];
+        offset += written as u64;
+      }
+      Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+      Err(error) => return Err(error),
+    }
+  }
+  Ok(())
 }
 
 fn normalize_lock_path(path: &Path) -> Result<PathBuf> {
@@ -276,15 +355,9 @@ impl FilePager {
       return Ok(vec![0u8; self.page_size]);
     }
 
+    // Bytes past the end of the file read as zeros.
     let mut buffer = vec![0u8; self.page_size];
-    self.file.seek(SeekFrom::Start(offset))?;
-    io_hooks::syscall();
-
-    // Read as much as we can (may be less than page_size at end of file)
-    let _bytes_read = self.file.read(io_hooks::read_window(offset, &mut buffer))?;
-    io_hooks::syscall();
-
-    // Rest is already zeros
+    read_full_at(&self.file, &mut buffer, offset)?;
     Ok(buffer)
   }
 
@@ -318,11 +391,7 @@ impl FilePager {
       self.file_size = required_size;
     }
 
-    self.file.seek(SeekFrom::Start(offset))?;
-    io_hooks::syscall();
-    self.file.write_all(data)?;
-    io_hooks::syscall();
-
+    write_all_at(&self.file, data, offset)?;
     Ok(())
   }
 
@@ -589,53 +658,30 @@ impl FilePager {
       ));
     }
 
-    // Determine copy direction to avoid overwriting source before reading
+    // Copy the pages furthest into the overlap first, so no source page is
+    // overwritten before it is read.
+    let page_size = self.page_size as u64;
     let copy_forward = src_page < dst_page;
-
-    if copy_forward {
-      // Copy from end to start to avoid overwriting
-      for i in (0..page_count).rev() {
-        let src_offset = (src_page + i) as u64 * self.page_size as u64;
-        let dst_offset = (dst_page + i) as u64 * self.page_size as u64;
-
-        // Read source page
-        let mut buffer = vec![0u8; self.page_size];
-        self.file.seek(SeekFrom::Start(src_offset))?;
-        self.file.read_exact(&mut buffer)?;
-
-        // Extend file if needed
-        let required_size = dst_offset + self.page_size as u64;
-        if required_size > self.file_size {
-          self.file.set_len(required_size)?;
-          self.file_size = required_size;
-        }
-
-        // Write to destination
-        self.file.seek(SeekFrom::Start(dst_offset))?;
-        self.file.write_all(&buffer)?;
+    let mut buffer = vec![0u8; self.page_size];
+    for step in 0..page_count {
+      let i = if copy_forward {
+        page_count - 1 - step
+      } else {
+        step
+      };
+      let src_offset = (src_page + i) as u64 * page_size;
+      let dst_offset = (dst_page + i) as u64 * page_size;
+      if read_full_at(&self.file, &mut buffer, src_offset)? < buffer.len() {
+        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
       }
-    } else {
-      // Copy from start to end
-      for i in 0..page_count {
-        let src_offset = (src_page + i) as u64 * self.page_size as u64;
-        let dst_offset = (dst_page + i) as u64 * self.page_size as u64;
 
-        // Read source page
-        let mut buffer = vec![0u8; self.page_size];
-        self.file.seek(SeekFrom::Start(src_offset))?;
-        self.file.read_exact(&mut buffer)?;
-
-        // Extend file if needed
-        let required_size = dst_offset + self.page_size as u64;
-        if required_size > self.file_size {
-          self.file.set_len(required_size)?;
-          self.file_size = required_size;
-        }
-
-        // Write to destination
-        self.file.seek(SeekFrom::Start(dst_offset))?;
-        self.file.write_all(&buffer)?;
+      // Extend file if needed
+      let required_size = dst_offset + page_size;
+      if required_size > self.file_size {
+        self.file.set_len(required_size)?;
+        self.file_size = required_size;
       }
+      write_all_at(&self.file, &buffer, dst_offset)?;
     }
 
     // Sync to ensure data is durable before marking old pages as free

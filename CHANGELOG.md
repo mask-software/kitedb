@@ -32,6 +32,7 @@ All notable changes to this project will be documented in this file.
 - Replicas reject local data writes (nodes, edges, properties, labels, vectors) with `InvalidReplication`. Previously a replica accepted them and silently diverged from its primary. Schema definitions still work, so a Kite opened on a replica can define the names it uses.
 
 ### Fixed
+- A page read that returns fewer bytes than asked before the end of the file (POSIX allows it, e.g. on NFS or after a signal) is now read again instead of leaving the rest of the page zeroed. During recovery the zeroed bytes looked like the end of the WAL, so replay skipped the commits after them and a writable open trimmed them for good. Page reads and writes now use positioned I/O: one system call per page instead of a seek plus the read or write.
 - Vacuum and WAL resize are crash-safe: both header slots name a valid layout afterwards (a torn newest slot no longer makes the file unopenable), a failure at any step leaves the database readable, `min_wal_size` can no longer shrink the WAL below 16 pages, and vectors committed since the last checkpoint are kept.
 - After a crash leaves a torn WAL record, open moves the WAL head back to the last valid record, so later commits are no longer lost on the next crash.
 - A crash right after a background checkpoint starts on an empty WAL no longer replays stale records from an earlier WAL cycle.
