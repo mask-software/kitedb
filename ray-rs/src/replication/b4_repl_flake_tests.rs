@@ -37,7 +37,7 @@ fn inherited_lock_descriptor(db: &SingleFileDB) -> File {
     .expect("primary replication")
     .inner
     ._sidecar_primary_lock
-    ._file
+    .file
     .try_clone()
     .expect("duplicate primary.lock descriptor")
 }
