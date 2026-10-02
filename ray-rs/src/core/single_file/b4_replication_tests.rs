@@ -337,3 +337,226 @@ fn b4_sidecar_syncs_follow_the_database_sync_policy() {
     close_single_file(db).expect("close");
   }
 }
+
+// ============================================================================
+// Replica cursor durability in Normal and Off modes
+// ============================================================================
+
+/// The replica's file after an OS crash at the end of `events`, from `base`
+/// (the file when recording started): the writes before the last successful
+/// sync landed, none after it. (The OS may write back any subset of the
+/// unsynced writes; losing all of them is one outcome.)
+fn durable_image(base: &[u8], events: &[crate::core::pager::io_hooks::IoEvent]) -> Vec<u8> {
+  use crate::core::pager::io_hooks::IoEvent;
+  let last_sync = events
+    .iter()
+    .rposition(|event| matches!(event, IoEvent::Sync { ok: true }));
+  let mut image = base.to_vec();
+  for (index, event) in events.iter().enumerate() {
+    let IoEvent::Write { offset, data } = event else {
+      continue;
+    };
+    if !last_sync.is_some_and(|sync| index < sync) {
+      continue;
+    }
+    let (start, end) = (*offset as usize, *offset as usize + data.len());
+    if image.len() < end {
+      image.resize(end, 0);
+    }
+    image[start..end].copy_from_slice(data);
+  }
+  image
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+  std::fs::create_dir_all(to).expect("create dir copy");
+  for entry in std::fs::read_dir(from).expect("read dir") {
+    let entry = entry.expect("dir entry");
+    std::fs::copy(entry.path(), to.join(entry.file_name())).expect("copy file");
+  }
+}
+
+fn replica_options(mode: SyncMode, sidecar: &Path, source_db_path: &Path) -> SingleFileOpenOptions {
+  SingleFileOpenOptions::new()
+    .sync_mode(mode)
+    .auto_checkpoint(false)
+    .replication_role(ReplicationRole::Replica)
+    .replication_sidecar_path(sidecar)
+    .replication_source_db_path(source_db_path)
+}
+
+const CURSOR_FILE: &str = "replica-cursor.json";
+
+/// A replica in `mode` catches up five frames; then the OS crashes. Its
+/// sidecar files (the cursor) were synced as they were written; of its
+/// database file only what a sync made durable survives (`all_writes`: every
+/// write landed). With `old_cursor`, the crash came before the cursor moved.
+/// Returns the keys of the five frames the crashed replica holds once it
+/// caught up again.
+fn replica_keys_after_crash(mode: SyncMode, all_writes: bool, old_cursor: bool) -> Vec<String> {
+  let dir = tempdir().expect("tempdir");
+  let primary_path = dir.path().join("crash-primary.kitedb");
+  let primary = open_single_file(&primary_path, primary_options()).expect("open primary");
+  let replica_path = dir.path().join("crash-replica.kitedb");
+  let sidecar = dir.path().join("crash-replica.sidecar");
+  let replica = open_single_file(
+    &replica_path,
+    replica_options(mode, &sidecar, &primary_path),
+  )
+  .expect("open");
+  replica
+    .replica_bootstrap_from_snapshot()
+    .expect("bootstrap empty primary");
+  let keys: Vec<String> = (0..5).map(|i| format!("n{i}")).collect();
+  for key in &keys {
+    commit_node(&primary, key).expect("token");
+  }
+
+  let base = std::fs::read(&replica_path).expect("base image");
+  let base_cursor = std::fs::read(sidecar.join(CURSOR_FILE)).expect("base cursor");
+  let (applied, events) =
+    crate::core::pager::io_hooks::record_io_during(|| replica.replica_catch_up_once(64));
+  assert_eq!(applied.expect("catch up"), 5, "setup: five frames applied");
+
+  let image_path = dir.path().join("crash-image.kitedb");
+  let image_sidecar = dir.path().join("crash-image.sidecar");
+  let image = if all_writes {
+    let mut image = base.clone();
+    for event in &events {
+      if let crate::core::pager::io_hooks::IoEvent::Write { offset, data } = event {
+        let (start, end) = (*offset as usize, *offset as usize + data.len());
+        if image.len() < end {
+          image.resize(end, 0);
+        }
+        image[start..end].copy_from_slice(data);
+      }
+    }
+    image
+  } else {
+    durable_image(&base, &events)
+  };
+  std::fs::write(&image_path, image).expect("write image");
+  copy_dir(&sidecar, &image_sidecar);
+  if old_cursor {
+    std::fs::write(image_sidecar.join(CURSOR_FILE), base_cursor).expect("old cursor");
+  }
+  close_single_file(replica).expect("close replica");
+
+  let crashed = open_single_file(
+    &image_path,
+    replica_options(mode, &image_sidecar, &primary_path),
+  )
+  .expect("open crash image");
+  loop {
+    match crashed.replica_catch_up_once(64) {
+      Ok(0) => break,
+      Ok(_) => {}
+      Err(error) => panic!("{mode:?}: catch-up after the crash failed: {error}"),
+    }
+  }
+  let held = keys
+    .iter()
+    .filter(|key| crashed.node_by_key(key).is_some())
+    .cloned()
+    .collect();
+  assert!(
+    crashed.count_nodes() <= keys.len(),
+    "{mode:?}: no frame may apply twice into a second node: {} nodes",
+    crashed.count_nodes()
+  );
+  close_single_file(crashed).expect("close crashed replica");
+  close_single_file(primary).expect("close primary");
+  held
+}
+
+/// In Normal mode a replica commit writes its WAL and header without a sync
+/// (Off mode does not even write them), but the cursor that covers it was
+/// synced at once. After an OS crash (or, in Off mode, any process crash)
+/// the cursor said the frames were applied while the data was gone, and the
+/// replica silently skipped them. The data must be durable before the cursor.
+#[test]
+fn b4_replica_cursor_is_not_durable_before_the_data_it_covers() {
+  let skipped: Vec<_> = [SyncMode::Normal, SyncMode::Off]
+    .into_iter()
+    .map(|mode| (mode, replica_keys_after_crash(mode, false, false)))
+    .filter(|(_, held)| held.len() != 5)
+    .collect();
+  assert!(
+    skipped.is_empty(),
+    "after a crash the replica's cursor covered frames whose data was lost, so they were \
+     skipped (mode, keys the replica holds of n0..n4): {skipped:?}"
+  );
+}
+
+/// Guard: a crash after the data is durable but before the cursor moves
+/// makes the replica apply those frames again, which must converge.
+#[test]
+fn b4_replica_reapplies_frames_whose_cursor_was_lost() {
+  for mode in [SyncMode::Normal, SyncMode::Off, SyncMode::Full] {
+    let held = replica_keys_after_crash(mode, true, true);
+    assert_eq!(
+      held.len(),
+      5,
+      "{mode:?}: replayed frames converge: {held:?}"
+    );
+  }
+}
+
+/// The same for a snapshot bootstrap: its last batch commits without a sync
+/// in Normal and Off modes, and the cursor it then set (with the incomplete
+/// marker cleared) was durable at once. After a crash the replica believed
+/// it held the copy, without it.
+#[test]
+fn b4_replica_bootstrap_data_is_durable_before_its_cursor() {
+  let skipped: Vec<_> = [SyncMode::Normal, SyncMode::Off]
+    .into_iter()
+    .filter_map(|mode| {
+      let dir = tempdir().expect("tempdir");
+      let primary_path = dir.path().join("boot-crash-primary.kitedb");
+      let primary = open_single_file(&primary_path, primary_options()).expect("open primary");
+      let keys: Vec<String> = (0..5).map(|i| format!("n{i}")).collect();
+      for key in &keys {
+        commit_node(&primary, key).expect("token");
+      }
+      let replica_path = dir.path().join("boot-crash-replica.kitedb");
+      let sidecar = dir.path().join("boot-crash-replica.sidecar");
+      let replica = open_single_file(
+        &replica_path,
+        replica_options(mode, &sidecar, &primary_path),
+      )
+      .expect("open replica");
+      let base = std::fs::read(&replica_path).expect("base image");
+      let (bootstrapped, events) = crate::core::pager::io_hooks::record_io_during(|| {
+        replica.replica_bootstrap_from_snapshot()
+      });
+      bootstrapped.expect("bootstrap");
+
+      let image_path = dir.path().join("boot-crash-image.kitedb");
+      let image_sidecar = dir.path().join("boot-crash-image.sidecar");
+      std::fs::write(&image_path, durable_image(&base, &events)).expect("write image");
+      copy_dir(&sidecar, &image_sidecar);
+      close_single_file(replica).expect("close replica");
+
+      let crashed = open_single_file(
+        &image_path,
+        replica_options(mode, &image_sidecar, &primary_path),
+      )
+      .expect("open crash image");
+      // Catch-up that refuses (needs a reseed) is safe; silently holding
+      // less than the cursor covers is not.
+      let caught_up = crashed.replica_catch_up_once(64);
+      let held = keys
+        .iter()
+        .filter(|key| crashed.node_by_key(key).is_some())
+        .count();
+      close_single_file(crashed).expect("close crashed replica");
+      close_single_file(primary).expect("close primary");
+      (caught_up.is_ok() && held != keys.len()).then_some((mode, held))
+    })
+    .collect();
+  assert!(
+    skipped.is_empty(),
+    "after a crash the bootstrapped replica's cursor covered a copy that was lost, and catch-up \
+     went on without it (mode, nodes held of 5): {skipped:?}"
+  );
+}
