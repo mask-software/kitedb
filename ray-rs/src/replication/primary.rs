@@ -123,7 +123,17 @@ pub struct PrimarySnapshotPosition {
 
 #[derive(Debug)]
 struct PrimarySidecarProcessLock {
-  _file: File,
+  file: File,
+}
+
+impl Drop for PrimarySidecarProcessLock {
+  fn drop(&mut self) {
+    // The lock belongs to the open file description, which a child process
+    // spawned meanwhile shares through its inherited descriptor. Closing only
+    // this descriptor would leave the lock held until the child closes its
+    // copy, so release it explicitly.
+    let _ = FileExt::unlock(&self.file);
+  }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1566,7 +1576,7 @@ fn acquire_sidecar_primary_lock(sidecar_path: &Path) -> Result<SidecarPrimaryLoc
     ))
   })?;
 
-  let lock = Arc::new(PrimarySidecarProcessLock { _file: lock_file });
+  let lock = Arc::new(PrimarySidecarProcessLock { file: lock_file });
   registry.insert(key, Arc::downgrade(&lock));
   Ok(lock)
 }
@@ -1615,3 +1625,9 @@ fn sidecar_epoch_fence(sidecar_path: &Path, initial_epoch: u64) -> SidecarEpochF
 fn normalize_sidecar_path(path: &Path) -> PathBuf {
   std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
+
+/// raydb-b4 repl-flake: closing a primary releases `primary.lock` while a
+/// spawned child still holds a copy of its descriptor.
+#[cfg(all(test, unix))]
+#[path = "b4_repl_flake_tests.rs"]
+mod b4_repl_flake_tests;
