@@ -8,7 +8,6 @@ A high-performance embedded graph database written in Rust, with bindings for No
 - **Periodic compaction** to merge snapshots with deltas
 - **MVCC** (on by default) for snapshot-isolated transactions and concurrent writers
 - **Pathfinding** with Dijkstra and A* algorithms
-- **Caching** for frequently accessed nodes, edges, and properties
 
 ## Features
 
@@ -22,7 +21,6 @@ A high-performance embedded graph database written in Rust, with bindings for No
 - Node and edge properties
 - In/out edge traversal
 - **Graph pathfinding** (shortest path, weighted paths)
-- **Query result caching** with automatic invalidation
 - Snapshot integrity checking
 
 ## Installation
@@ -41,19 +39,10 @@ bun install
 
 ## Browser (WASM) prototype
 
-KiteDB can run in the browser via the WASI build of the core (`@kitedb/core`).
-This uses an in-memory filesystem by default (ephemeral per page load).
-
-Build the WASM bundle locally:
-
-```bash
-cd ray-rs
-bun run build:wasm
-```
-
-Then import `@kitedb/core` in your browser bundler (it uses the `browser` entry).
-Persistence in the browser requires wiring WASI to a persistent FS (e.g. OPFS/IndexedDB).
-See the browser example in the Rust bindings package for a minimal demo (OPFS first, IndexedDB fallback).
+There is no browser build on npm: `@kitedb/core` loads a native addon and runs on Node.js and Bun.
+The repository has an unpublished WASI build of the core (`cd ray-rs && bun run build:wasm`, smoke test
+`bun run test:wasm`, and a demo in `ray-rs/examples/browser` that persists to OPFS or IndexedDB). See
+[ray-rs/README.md](ray-rs/README.md#browserwasi-builds) for what it leaves out.
 
 ## Quick Start
 
@@ -114,7 +103,8 @@ db.close();
 ```
 
 The `.kitedb` format contains:
-- **Header (page 0)**: Magic, version, page size, snapshot/WAL locations
+- **Header (pages 0 and 1)**: two checksummed copies of the magic, format version (2), page size,
+  snapshot/WAL locations and WAL salts; open uses the newest valid copy
 - **WAL Area**: Linear buffer for write-ahead log records (checkpoint to reclaim space)
 - **Snapshot Area**: CSR snapshot data (mmap-friendly)
 
@@ -130,7 +120,8 @@ The `.kitedb` format contains:
 ### WAL Records
 
 - 8-byte aligned records
-- CRC-32 per record
+- CRC-32 (IEEE) per record, XORed with the WAL region's salt, so a leftover record from an earlier
+  WAL cycle fails its check like a torn one
 - Transaction boundaries (BEGIN/COMMIT/ROLLBACK)
 
 ## Development

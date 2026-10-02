@@ -632,7 +632,8 @@ def benchmark_writes(db: Database, graph: GraphData, iterations: int):
     
     for batch_size in batch_sizes:
         tracker = LatencyTracker()
-        batches = min(iterations // batch_size, 20)  # Reduced to avoid WAL overflow
+        # Rounded up (any --iterations runs a batch); capped to avoid WAL overflow.
+        batches = min(-(-iterations // batch_size), 20)
         for b in range(batches):
             start = time.perf_counter_ns()
             db.begin()
@@ -657,7 +658,8 @@ def benchmark_writes(db: Database, graph: GraphData, iterations: int):
     logger.log("\n--- Edge Creation ---")
     for batch_size in batch_sizes:
         tracker = LatencyTracker()
-        batches = min(iterations // batch_size, 20)  # Reduced to avoid WAL overflow
+        # Rounded up (any --iterations runs a batch); capped to avoid WAL overflow.
+        batches = min(-(-iterations // batch_size), 20)
         for b in range(batches):
             start = time.perf_counter_ns()
             db.begin()

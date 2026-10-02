@@ -372,7 +372,7 @@ Phase exit criteria:
 - None blocking V1 scope.
 - Locked for V1 gate:
   - Commit overhead budget: `P95_MAX_RATIO=1.30` (replication-on p95 / baseline p95).
-  - ANN default: latency-first IVF-PQ (`residuals=false`, `pq_subspaces=48`, `pq_centroids=256`).
+  - ANN default: latency-first IVF-PQ (`residuals=false`, `pq_subspaces=48`, `pq_centroids=256`). Superseded: `VectorIndex` now defaults to `auto` (IVF-PQ from 512 dimensions and 50,000 live vectors, plain IVF below).
   - Authoritative vector replication scope: logical vector property mutations (`SetNodeVector` / `DelNodeVector`).
 
 ## 20) Phase D Summary (February 8, 2026)
@@ -428,7 +428,7 @@ Implemented:
 - Vector compaction matrix script + baseline snapshot (`ray-rs/scripts/vector-compaction-matrix.sh`, `docs/benchmarks/results/2026-02-08-vector-compaction-*.{txt,csv}`) with recommendation to keep current compaction defaults.
 - ANN algorithm benchmark harness + matrix script (`ray-rs/examples/vector_ann_bench.rs`, `ray-rs/scripts/vector-ann-matrix.sh`) with baseline artifact snapshot (`docs/benchmarks/results/2026-02-08-vector-ann-matrix.{txt,csv}`).
 - ANN PQ tuning sweep + ANN recall/p95 gate scripts (`ray-rs/scripts/vector-ann-pq-tuning.sh`, `ray-rs/scripts/vector-ann-gate.sh`) with artifact snapshots (`docs/benchmarks/results/2026-02-08-vector-ann-pq-tuning.{txt,csv}`, `docs/benchmarks/results/2026-02-08-vector-ann-gate.attempt*.txt`).
-- Latency-first ANN default selection: IVF-PQ (`residuals=false`, `pq_subspaces=48`, `pq_centroids=256`) with CI quality floor via `vector-ann-gate.sh`.
+- Latency-first ANN default selection: IVF-PQ (`residuals=false`, `pq_subspaces=48`, `pq_centroids=256`) with CI quality floor via `vector-ann-gate.sh`. Superseded: `VectorIndex` now defaults to `auto` (IVF-PQ from 512 dimensions and 50,000 live vectors, plain IVF below).
 - Non-blocking ANN PQ trend tracking in CI (`ann-pq-tracking` job in `.github/workflows/ray-rs.yml`, weekly schedule + manual dispatch with `ann_pq_profile=fast|full`, artifact `ann-pq-tracking-logs`, run-scoped `ci-<run_id>-<run_attempt>` stamp).
 - HTTP transport/admin rollout in playground runtime:
   - `GET /api/replication/status`

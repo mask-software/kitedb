@@ -1397,9 +1397,12 @@ export interface JsKiteOptions {
   mvccMaxChainDepth?: number
   /** Sync mode: "Full", "Normal", or "Off" (default: "Full") */
   syncMode?: JsSyncMode
-  /** Enable group commit (coalesce WAL flushes across commits) */
+  /**
+   * Enable group commit (sync mode Normal only): commits that arrive while
+   * others are written are written together, with one WAL flush
+   */
   groupCommitEnabled?: boolean
-  /** Group commit window in milliseconds (0 adds no coalescing delay) */
+  /** Unused, kept for compatibility: group commit no longer waits for a window */
   groupCommitWindowMs?: number
   /**
    * WAL size in megabytes (must be positive), fixed when the file is created.
@@ -1861,9 +1864,12 @@ export interface OpenOptions {
    * SQLite's default.
    */
   fullFsync?: boolean
-  /** Enable group commit (coalesce WAL flushes across commits) */
+  /**
+   * Enable group commit (sync mode Normal only): commits that arrive while
+   * others are written are written together, with one WAL flush
+   */
   groupCommitEnabled?: boolean
-  /** Group commit window in milliseconds (0 adds no coalescing delay) */
+  /** Unused, kept for compatibility: group commit no longer waits for a window */
   groupCommitWindowMs?: number
   /** Snapshot parse mode: "Strict" or "Salvage" (single-file only) */
   snapshotParseMode?: JsSnapshotParseMode

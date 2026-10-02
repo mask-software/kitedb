@@ -310,6 +310,6 @@ fn main() {
   }
   if config.keep_db {
     println!("DB kept at: {}", db_path.display());
-    std::mem::forget(temp_dir);
+    let _ = temp_dir.keep();
   }
 }

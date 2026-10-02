@@ -1,6 +1,6 @@
 import { test, expect } from "bun:test";
 import { formatPropValue, formatProps, formatEdge } from "../src/db/db-service.ts";
-import type { JsNodeProp, JsFullEdge } from "@kitedb/core";
+import type { NodeProp, FullEdge } from "@kitedb/core";
 
 test("formatPropValue handles string types", () => {
   expect(formatPropValue({ propType: "Null" } as any)).toBe("null");
@@ -12,7 +12,7 @@ test("formatPropValue handles string types", () => {
 });
 
 test("formatProps resolves key names", () => {
-  const props: JsNodeProp[] = [
+  const props: NodeProp[] = [
     { keyId: 1, value: { propType: "String", stringValue: "alpha" } as any },
     { keyId: 2, value: { propType: "Int", intValue: 9 } as any },
   ];
@@ -24,7 +24,7 @@ test("formatProps resolves key names", () => {
 });
 
 test("formatEdge uses fallback when name missing", () => {
-  const edge: JsFullEdge = { src: 1, etype: 42, dst: 2 };
+  const edge: FullEdge = { src: 1, etype: 42, dst: 2 };
   const result = formatEdge(edge, () => null);
   expect(result.etypeName).toBe("#42");
   expect(result.src).toBe(1);

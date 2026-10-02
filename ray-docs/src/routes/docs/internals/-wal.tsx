@@ -539,10 +539,9 @@ export function WALPage() {
 					<code>syncMode = Normal</code>
 				</li>
 				<li>
-					<code>groupCommitEnabled = true</code>
-				</li>
-				<li>
-					<code>groupCommitWindowMs = 2</code>
+					<code>groupCommitEnabled = true</code> when several threads commit at
+					once: commits that arrive while a batch is written are written
+					together, with one WAL flush (no commit waits for a window)
 				</li>
 				<li>
 					<code>beginBulk()</code> + batch APIs for ingest (with or without

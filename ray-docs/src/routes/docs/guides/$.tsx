@@ -1416,7 +1416,10 @@ print(results)`}
 					<li>
 						<strong>Python</strong> – Threads can share one{" "}
 						<code>Database</code> or <code>Kite</code>; each thread's{" "}
-						<code>begin</code> opens its own transaction
+						<code>begin</code> opens its own transaction. Each call holds the
+						GIL, except the ones that can block (<code>begin</code>,{" "}
+						<code>commit</code>, checkpoints, backups and the like), which
+						release it while they wait
 					</li>
 					<li>
 						<strong>Node.js</strong> – JS on the main thread runs one

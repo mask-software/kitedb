@@ -1,6 +1,6 @@
 # kitedb
 
-KiteDB native bindings for Node.js (and WASI/browser builds), powered by Rust + N-API.
+KiteDB native bindings for Node.js and Bun, powered by Rust + N-API.
 
 Docs: https://kitedb.vercel.com/docs
 
@@ -152,11 +152,16 @@ console.log(hits)
 
 ## Browser/WASI builds
 
-This package exposes a WASI-compatible build via the `browser` export for bundlers, backed by `@kitedb/core-wasm32-wasi`. If you need to import it directly:
+There is no browser build on npm: `@kitedb/core` loads a native addon, so it runs on Node.js and Bun only. The
+repository has an unpublished WASI build: `bun run build:wasm` (or `build:wasm:debug`) writes `core.wasm32-wasi.wasm`
+and its loaders (`core.wasi.cjs` for Node, `core.wasi-browser.js` for the demo in `examples/browser`), and
+`bun run test:wasm` smoke-tests it in Node. It needs the `wasm32-wasip1-threads` Rust target. It exposes the native
+API (`Database`, `Kite`, ...), not the `kite()` wrapper, and differs from the native build:
 
-```ts
-import { Database } from '@kitedb/core-wasm32-wasi'
-```
+- no OTLP metrics push (`pushReplicationMetricsOtel*`, `collectReplicationMetricsOtelProtobuf`): it needs sockets;
+- no file locks, which WASI does not have: never open one database file from two processes;
+- no zstd: zstd-compressed snapshots can be neither written nor read;
+- the snapshot is read into memory instead of memory-mapped.
 
 ## Concurrent Access
 

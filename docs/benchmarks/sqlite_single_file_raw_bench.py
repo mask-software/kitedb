@@ -2,6 +2,7 @@
 import argparse
 import os
 import random
+import shutil
 import sqlite3
 import tempfile
 import time
@@ -25,6 +26,9 @@ def format_latency(ns: int) -> str:
 
 
 def print_latency_table(label: str, samples_ns: List[int]) -> None:
+    if not samples_ns:
+        print(f"{label:<40} skipped (no samples)")
+        return
     samples_ns.sort()
     p50 = percentile(samples_ns, 0.50)
     p95 = percentile(samples_ns, 0.95)
@@ -138,7 +142,8 @@ def build_graph(
 def benchmark_writes(conn: sqlite3.Connection, iterations: int) -> None:
     print("\n--- Batch Writes (100 nodes) ---")
     batch_size = 100
-    batches = min(iterations // batch_size, 50)
+    # Rounded up: any --iterations runs at least one batch.
+    batches = min(-(-iterations // batch_size), 50)
     samples_ns: List[int] = []
     cur = conn.cursor()
 
@@ -185,32 +190,36 @@ def main() -> None:
     print(f"Sync mode: {sync_mode}")
     print("=" * 120)
 
-    tmpdir = tempfile.TemporaryDirectory()
-    db_path = os.path.join(tmpdir.name, "sqlite-bench.db")
+    # mkdtemp, not TemporaryDirectory: its finalizer deletes the directory
+    # at exit, which --keep-db must not.
+    tmpdir = tempfile.mkdtemp(prefix="sqlite-bench-")
+    db_path = os.path.join(tmpdir, "sqlite-bench.db")
+    try:
+        conn = sqlite3.connect(db_path)
+        apply_pragmas(conn, sync_mode, args.wal_size)
+        build_schema(conn)
 
-    conn = sqlite3.connect(db_path)
-    apply_pragmas(conn, sync_mode, args.wal_size)
-    build_schema(conn)
+        print("\n[1/2] Building graph...")
+        start_build = time.perf_counter()
+        build_graph(
+            conn,
+            nodes=args.nodes,
+            edges=args.edges,
+            edge_types=args.edge_types,
+            edge_props=args.edge_props,
+            batch_size=5000,
+        )
+        print(f"  Built in {int((time.perf_counter() - start_build) * 1000)}ms")
 
-    print("\n[1/2] Building graph...")
-    start_build = time.perf_counter()
-    build_graph(
-        conn,
-        nodes=args.nodes,
-        edges=args.edges,
-        edge_types=args.edge_types,
-        edge_props=args.edge_props,
-        batch_size=5000,
-    )
-    print(f"  Built in {int((time.perf_counter() - start_build) * 1000)}ms")
+        print("\n[2/2] Write benchmarks...")
+        benchmark_writes(conn, args.iterations)
 
-    print("\n[2/2] Write benchmarks...")
-    benchmark_writes(conn, args.iterations)
-
-    conn.close()
-    if args.keep_db:
-        print(f"\nDatabase preserved at: {db_path}")
-        tmpdir.cleanup = lambda: None
+        conn.close()
+    finally:
+        if args.keep_db:
+            print(f"\nDatabase preserved at: {db_path}")
+        else:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 if __name__ == "__main__":

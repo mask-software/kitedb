@@ -129,18 +129,6 @@ import type {
   InferEdgeProps,
 } from './schema'
 
-declare module '../index' {
-  interface Kite {
-    get_ref(nodeType: string, key: unknown): object | null
-    get_id(nodeType: string, key: unknown): number | null
-    get_by_id(nodeId: number, props?: Array<string> | undefined | null): object | null
-    get_by_ids(nodeIds: Array<number>, props?: Array<string> | undefined | null): Array<object>
-    get_prop(nodeId: number, propName: string): JsPropValue | null
-    get_edge_prop(src: number, edgeType: string, dst: number, propName: string): JsPropValue | null
-    get_edge_props(src: number, edgeType: string, dst: number): Record<string, JsPropValue>
-  }
-}
-
 // =============================================================================
 // Clean Type Aliases (no Js prefix)
 // =============================================================================
@@ -646,13 +634,14 @@ export class KiteTraversal extends NativeKiteTraversal {
     return KiteTraversal.wrap(super.select(props), (this as { __db?: Kite }).__db)
   }
 
-  nodes(): number[] {
+  /** The ids of the result nodes; `.toArray()` loads the nodes with their props. */
+  nodes(): ArrayWithToArray<number, NodeObject> {
     const ids = super.nodes()
     const db = (this as { __db?: Kite }).__db
     if (!db) {
-      return withToArray(ids)
+      return withToArray(ids) as unknown as ArrayWithToArray<number, NodeObject>
     }
-    const loadNodes = () => {
+    const loadNodes = (): Array<NodeObject> => {
       const traversal = this as unknown as { nodesWithProps?: () => Array<NodeObject> }
       if (typeof traversal.nodesWithProps === 'function') {
         return traversal.nodesWithProps()
@@ -671,8 +660,8 @@ export class KiteTraversal extends NativeKiteTraversal {
     return native.nodesWithProps.call(this)
   }
 
-  edges(): Array<JsFullEdge> {
-    return withToArray(super.edges()) as unknown as Array<JsFullEdge>
+  edges(): ArrayWithToArray<JsFullEdge> {
+    return withToArray(super.edges())
   }
 
   toArray(): ArrayWithToArray<NodeObject> {
@@ -1067,25 +1056,41 @@ export class Kite extends NativeKite {
     return results
   }
 
-  get(nodeType: NodeLike, key: unknown, props?: NodePropsSelection): object | null {
-    return super.get(nodeName(nodeType), key, props)
+  /**
+   * Get a node by key, with its props (only those in `props`, if given). With
+   * a node spec, the result is typed from the spec.
+   */
+  get<N extends NodeSpec>(
+    nodeType: N,
+    key: InferNodeInsert<N>['key'],
+    props?: Array<keyof InferNode<N>> | NodePropsSelection,
+  ): InferNode<N> | null
+  get(nodeType: string, key: unknown, props?: NodePropsSelection | null): NodeObject | null
+  get(nodeType: NodeLike, key: unknown, props?: NodePropsSelection | null): NodeObject | null {
+    return super.get(nodeName(nodeType), key, props) as NodeObject | null
   }
 
-  getRef(nodeType: NodeLike, key: unknown): object | null {
-    return super.get_ref(nodeName(nodeType), key)
+  /** Get a node's id, key and type by key, without its props. */
+  getRef<N extends NodeSpec>(nodeType: N, key: InferNodeInsert<N>['key']): NodeRef<N> | null
+  getRef(nodeType: string, key: unknown): NodeRef | null
+  getRef(nodeType: NodeLike, key: unknown): NodeRef | null {
+    return super.get_ref(nodeName(nodeType), key) as NodeRef | null
   }
 
+  /** Get a node's id by key. */
+  getId<N extends NodeSpec>(nodeType: N, key: InferNodeInsert<N>['key']): number | null
+  getId(nodeType: string, key: unknown): number | null
   getId(nodeType: NodeLike, key: unknown): number | null {
     return super.get_id(nodeName(nodeType), key)
   }
 
-  getById(nodeId: number, props?: NodePropsSelection): object | null {
-    return super.get_by_id(nodeId, props)
+  getById(nodeId: number, props?: NodePropsSelection | null): NodeObject | null {
+    return super.get_by_id(nodeId, props) as NodeObject | null
   }
 
-  getByIds(nodeIds: Array<NodeIdLike>, props?: NodePropsSelection): Array<object> {
+  getByIds(nodeIds: Array<NodeIdLike>, props?: NodePropsSelection | null): Array<NodeObject> {
     const ids = nodeIds.map((id) => nodeId(id))
-    return super.get_by_ids(ids, props)
+    return super.get_by_ids(ids, props) as Array<NodeObject>
   }
 
   getProp(node: NodeIdLike, propName: string): JsPropValue | null {
@@ -1112,35 +1117,53 @@ export class Kite extends NativeKite {
     return super.deleteByKey(nodeName(nodeType), key)
   }
 
+  delete<N extends NodeSpec>(nodeType: N, key: InferNodeInsert<N>['key']): boolean
+  delete(nodeType: string, key: unknown): boolean
   delete(nodeType: NodeLike, key: unknown): boolean {
     return this.deleteByKey(nodeType, key)
   }
 
+  insert<N extends NodeSpec>(nodeType: N): KiteInsertBuilder<N>
+  insert(nodeType: string): KiteInsertBuilder
   insert(nodeType: NodeLike): KiteInsertBuilder {
     return KiteInsertBuilder.wrap(super.insert(nodeName(nodeType)), this)
   }
 
+  upsert<N extends NodeSpec>(nodeType: N): KiteUpsertBuilder<N>
+  upsert(nodeType: string): KiteUpsertBuilder
   upsert(nodeType: NodeLike): KiteUpsertBuilder {
     return KiteUpsertBuilder.wrap(super.upsert(nodeName(nodeType)), this)
   }
 
+  updateByKey<N extends NodeSpec>(nodeType: N, key: InferNodeInsert<N>['key']): KiteUpdateBuilder
+  updateByKey(nodeType: string, key: unknown): KiteUpdateBuilder
   updateByKey(nodeType: NodeLike, key: unknown): KiteUpdateBuilder {
     return KiteUpdateBuilder.wrap(super.updateByKey(nodeName(nodeType), key), this)
   }
 
+  update<N extends NodeSpec>(nodeType: N, key: InferNodeInsert<N>['key']): KiteUpdateBuilder
+  update(nodeType: string, key: unknown): KiteUpdateBuilder
   update(nodeType: NodeLike, key: unknown): KiteUpdateBuilder {
-    return this.updateByKey(nodeType, key)
+    return KiteUpdateBuilder.wrap(super.updateByKey(nodeName(nodeType), key), this)
   }
 
   updateById(node: NodeIdLike): KiteUpdateBuilder {
     return KiteUpdateBuilder.wrap(super.updateById(nodeId(node)), this)
   }
 
+  upsertById<N extends NodeSpec>(nodeType: N, nodeId: number): KiteUpsertByIdBuilder
+  upsertById(nodeType: string, nodeId: number): KiteUpsertByIdBuilder
   upsertById(nodeType: NodeLike, nodeId: number): KiteUpsertByIdBuilder {
     return KiteUpsertByIdBuilder.wrap(super.upsertById(nodeName(nodeType), nodeId), this)
   }
 
-  link(src: NodeIdLike, edgeType: EdgeLike, dst: NodeIdLike, props?: object | null): void
+  link<E extends EdgeSpec>(
+    src: NodeIdLike,
+    edgeType: E,
+    dst: NodeIdLike,
+    props?: InferEdgeProps<E> | object | null,
+  ): void
+  link(src: NodeIdLike, edgeType: string, dst: NodeIdLike, props?: object | null): void
   link(src: NodeIdLike): KiteLinkBuilder
   link(
     src: NodeIdLike,
@@ -1213,8 +1236,10 @@ export class Kite extends NativeKite {
     return KiteUpsertEdgeBuilder.wrap(builder, this)
   }
 
-  all(nodeType: NodeLike): Array<object> {
-    return super.all(nodeName(nodeType))
+  all<N extends NodeSpec>(nodeType: N): Array<InferNode<N>>
+  all(nodeType: string): Array<NodeObject>
+  all(nodeType: NodeLike): Array<NodeObject> {
+    return super.all(nodeName(nodeType)) as Array<NodeObject>
   }
 
   countNodes(nodeType?: NodeLike | null): number {
@@ -1258,83 +1283,6 @@ export class Kite extends NativeKite {
   shortestPath(source: NodeIdLike): KiteShortestPathBuilder {
     return new KiteShortestPathBuilder(this, nodeId(source))
   }
-}
-
-export interface Kite {
-  get<N extends NodeSpec>(
-    nodeType: N,
-    key: InferNodeInsert<N>['key'],
-    props?: Array<keyof InferNode<N>> | Array<string>,
-  ): InferNode<N> | null
-  getRef<N extends NodeSpec>(nodeType: N, key: InferNodeInsert<N>['key']): NodeRef<N> | null
-  getId<N extends NodeSpec>(nodeType: N, key: InferNodeInsert<N>['key']): number | null
-  getById(nodeId: number, props?: Array<string>): NodeObject | null
-  getByIds(nodeIds: Array<NodeIdLike>, props?: Array<string>): Array<NodeObject>
-  delete<N extends NodeSpec>(nodeType: N, key: InferNodeInsert<N>['key']): boolean
-  insert<N extends NodeSpec>(nodeType: N): KiteInsertBuilder<N>
-  upsert<N extends NodeSpec>(nodeType: N): KiteUpsertBuilder<N>
-  update<N extends NodeSpec>(nodeType: N, key: InferNodeInsert<N>['key']): KiteUpdateBuilder
-  updateByKey<N extends NodeSpec>(nodeType: N, key: InferNodeInsert<N>['key']): KiteUpdateBuilder
-  upsertById<N extends NodeSpec>(nodeType: N, nodeId: number): KiteUpsertByIdBuilder
-  all<N extends NodeSpec>(nodeType: N): Array<InferNode<N>>
-  countNodes(nodeType?: NodeLike | null): number
-  countEdges(edgeType?: EdgeLike | null): number
-  allEdges(edgeType?: EdgeLike | null): Array<JsFullEdge>
-  link<E extends EdgeSpec>(
-    src: NodeIdLike,
-    edgeType: E,
-    dst: NodeIdLike,
-    props?: InferEdgeProps<E> | object | null,
-  ): void
-  link(src: NodeIdLike): KiteLinkBuilder
-  unlink(src: NodeIdLike, edgeType: EdgeLike, dst: NodeIdLike): boolean
-  hasEdge(src: NodeIdLike, edgeType: EdgeLike, dst: NodeIdLike): boolean
-  getEdgeProp(src: NodeIdLike, edgeType: EdgeLike, dst: NodeIdLike, propName: string): JsPropValue | null
-  getEdgeProps(src: NodeIdLike, edgeType: EdgeLike, dst: NodeIdLike): Record<string, JsPropValue>
-  setEdgeProp(
-    src: NodeIdLike,
-    edgeType: EdgeLike,
-    dst: NodeIdLike,
-    propName: string,
-    value: unknown,
-  ): void
-  batchAdaptive(
-    operations: Array<any>,
-    options?: { maxBatch?: number; minBatch?: number; autoCheckpointOnWalFull?: boolean } | null,
-  ): Array<any>
-  checkpoint(): void
-  setEdgeProps(
-    src: NodeIdLike,
-    edgeType: EdgeLike,
-    dst: NodeIdLike,
-    props: Record<string, unknown>,
-  ): void
-  delEdgeProp(src: NodeIdLike, edgeType: EdgeLike, dst: NodeIdLike, propName: string): void
-  updateEdge(src: NodeIdLike, edgeType: EdgeLike, dst: NodeIdLike): KiteUpdateEdgeBuilder
-  upsertEdge(src: NodeIdLike, edgeType: EdgeLike, dst: NodeIdLike): KiteUpsertEdgeBuilder
-  hasPath(source: NodeIdLike, target: NodeIdLike, edgeType?: EdgeLike | null): boolean
-  reachableFrom(source: NodeIdLike, maxDepth: number, edgeType?: EdgeLike | null): Array<number>
-  from(node: NodeIdLike): KiteTraversal
-  fromNodes(nodeIds: Array<NodeIdLike>): KiteTraversal
-  path(source: NodeIdLike, target: NodeIdLike): KitePath
-  pathToAny(source: NodeIdLike, targets: Array<NodeIdLike>): KitePath
-  shortestPath(source: NodeIdLike): KiteShortestPathBuilder
-}
-
-export interface KiteTraversal {
-  whereEdge(func: unknown): KiteTraversal
-  whereNode(func: unknown): KiteTraversal
-  out(edgeType?: EdgeLike | null): KiteTraversal
-  ['in'](edgeType?: EdgeLike | null): KiteTraversal
-  both(edgeType?: EdgeLike | null): KiteTraversal
-  traverse(edgeType: EdgeLike | undefined | null, options: JsTraverseOptions): KiteTraversal
-  take(limit: number): KiteTraversal
-  select(props: Array<string>): KiteTraversal
-  nodes(): ArrayWithToArray<number, NodeObject>
-  nodesWithProps(): Array<NodeObject>
-  edges(): ArrayWithToArray<JsFullEdge>
-  toArray(): ArrayWithToArray<NodeObject>
-  count(): number
 }
 
 // =============================================================================
@@ -1834,9 +1782,12 @@ export interface KiteOptions {
   mvccMaxChainDepth?: number
   /** Sync mode for durability (default: "Full") */
   syncMode?: SyncMode
-  /** Enable group commit (coalesce WAL flushes across commits) */
+  /**
+   * Enable group commit (syncMode Normal only): commits that arrive while
+   * others are written are written together, with one WAL flush
+   */
   groupCommitEnabled?: boolean
-  /** Group commit window in milliseconds */
+  /** Unused, kept for compatibility: group commit no longer waits for a window */
   groupCommitWindowMs?: number
   /**
    * WAL size in megabytes, fixed when the file is created. Unset: a new file

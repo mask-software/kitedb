@@ -312,8 +312,14 @@ fn main() -> kitedb::Result<()> {
   let primary_db_path = dir.path().join("soak-primary.kitedb");
   let primary_sidecar = dir.path().join("soak-primary.sidecar");
 
+  // The stale writer is a second primary instance on the same sidecar, the
+  // way another node would see it. It gets its own database file: the
+  // primary holds the exclusive lock on its file, and the epoch fence lives
+  // in the sidecar. The probe never commits, so its file stays empty.
+  let stale_probe_db_path = dir.path().join("soak-stale-probe.kitedb");
+
   let primary = open_primary(&primary_db_path, &primary_sidecar, &config)?;
-  let mut stale_probe = open_primary(&primary_db_path, &primary_sidecar, &config)?;
+  let mut stale_probe = open_primary(&stale_probe_db_path, &primary_sidecar, &config)?;
 
   let mut replicas: Vec<ReplicaSlot> = Vec::with_capacity(config.replicas);
   for idx in 0..config.replicas {
@@ -517,7 +523,7 @@ fn main() -> kitedb::Result<()> {
 
       let _ = stale_probe.rollback();
       close_single_file(stale_probe)?;
-      stale_probe = open_primary(&primary_db_path, &primary_sidecar, &config)?;
+      stale_probe = open_primary(&stale_probe_db_path, &primary_sidecar, &config)?;
     }
 
     if cycle % 3 == 0 || cycle + 1 == config.cycles {

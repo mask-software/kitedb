@@ -51,7 +51,7 @@ const FEATURES: Feature[] = [
 	{
 		icon: Binary,
 		title: "One core, three languages",
-		body: "A Rust core with N-API bindings for Node and Bun, PyO3 bindings for Python, and an experimental WASM build for the browser.",
+		body: "A Rust core with N-API bindings for Node and Bun and PyO3 bindings for Python.",
 		accent: "mint",
 	},
 ];

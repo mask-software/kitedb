@@ -223,7 +223,6 @@ Includes:
 - Operation complexity
 - Optimization strategies
 - When to call `optimize()`
-- Caching considerations
 
 ### Real-World Patterns
 Examples for:

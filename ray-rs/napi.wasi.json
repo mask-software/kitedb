@@ -1,0 +1,9 @@
+{
+  "binaryName": "core",
+  "targets": ["wasm32-wasip1-threads"],
+  "wasm": {
+    "browser": {
+      "fs": true
+    }
+  }
+}

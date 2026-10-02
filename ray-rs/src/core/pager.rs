@@ -181,6 +181,7 @@ fn write_all_at(file: &File, all: &[u8], start: u64) -> std::io::Result<()> {
   Ok(())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn normalize_lock_path(path: &Path) -> Result<PathBuf> {
   if path.exists() {
     return Ok(std::fs::canonicalize(path)?);
@@ -197,6 +198,13 @@ fn normalize_lock_path(path: &Path) -> Result<PathBuf> {
     ))
   })?;
   Ok(parent.join(file_name))
+}
+
+/// WASI has no realpath (`canonicalize` fails with Unsupported), so the
+/// in-process registry is keyed by the absolute path as written.
+#[cfg(target_arch = "wasm32")]
+fn normalize_lock_path(path: &Path) -> Result<PathBuf> {
+  Ok(std::path::absolute(path)?)
 }
 
 fn try_lock_file(file: &File, path: &Path, mode: FileLockMode) -> Result<()> {

@@ -37,17 +37,14 @@ pub struct Mmap {
 impl Mmap {
   /// Read the entire file into memory.
   pub fn map(file: &File) -> std::io::Result<Self> {
-    let mut handle = file.try_clone()?;
+    // Through `&File`: WASI cannot duplicate a descriptor (`try_clone`).
+    let mut handle = file;
     handle.seek(SeekFrom::Start(0))?;
     let mut buffer = Vec::new();
     handle.read_to_end(&mut buffer)?;
     Ok(Self {
       data: Arc::new(buffer),
     })
-  }
-
-  pub fn len(&self) -> usize {
-    self.data.len()
   }
 }
 
@@ -153,7 +150,7 @@ pub fn map_file_range(file: &File, offset: u64, length: usize) -> std::io::Resul
 
   #[cfg(target_arch = "wasm32")]
   {
-    let mut handle = file.try_clone()?;
+    let mut handle = file;
     handle.seek(SeekFrom::Start(offset))?;
     let mut buffer = vec![0u8; length];
     handle.read_exact(&mut buffer)?;

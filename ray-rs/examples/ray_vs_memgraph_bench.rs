@@ -421,7 +421,7 @@ fn cypher_quote(value: &str) -> String {
 
 async fn memgraph_connect(cfg: &BenchConfig) -> Result<Graph, Box<dyn Error>> {
   let config = ConfigBuilder::default()
-    .uri(&normalize_memgraph_uri(&cfg.memgraph_uri))
+    .uri(normalize_memgraph_uri(&cfg.memgraph_uri))
     .user(&cfg.memgraph_user)
     .password(&cfg.memgraph_password)
     .db("memgraph")

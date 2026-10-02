@@ -390,7 +390,7 @@ try {
 
 ## Future Considerations
 
-Several items from the original roadmap (MVCC, pathfinding, and the caching layer) are now implemented and documented elsewhere — see [Kite README](../../README.md) for the MVCC, pathfinding, and caching sections, and [API architecture](../API.md) for MVCC layer details. This section tracks only features that remain future work.
+Several items from the original roadmap (MVCC and pathfinding) are now implemented and documented elsewhere — see [Kite README](../../README.md) for the MVCC and pathfinding sections, and [API architecture](../API.md) for MVCC layer details. This section tracks only features that remain future work.
 
 1. **Advanced Traversal**
    - Subgraph matching

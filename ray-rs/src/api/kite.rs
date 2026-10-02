@@ -1040,9 +1040,10 @@ pub struct KiteOptions {
   pub create_if_missing: bool,
   /// Synchronization mode for WAL writes (default: Full)
   pub sync_mode: SyncMode,
-  /// Enable group commit (coalesce WAL flushes across commits)
+  /// Enable group commit (sync mode Normal only): commits that arrive while
+  /// others are written are written together, with one WAL flush
   pub group_commit_enabled: bool,
-  /// Group commit window in milliseconds
+  /// Unused, kept for compatibility: group commit no longer waits for a window
   pub group_commit_window_ms: u64,
   /// MVCC: snapshot-isolated transactions and conflict detection between
   /// concurrent write transactions (default: true). It is runtime state
@@ -1146,13 +1147,13 @@ impl KiteOptions {
     self
   }
 
-  /// Enable or disable group commit (coalesce WAL flushes across commits)
+  /// Enable or disable group commit (see the `group_commit_enabled` field)
   pub fn group_commit_enabled(mut self, value: bool) -> Self {
     self.group_commit_enabled = value;
     self
   }
 
-  /// Set the group commit window in milliseconds
+  /// Unused, kept for compatibility (see the `group_commit_window_ms` field)
   pub fn group_commit_window_ms(mut self, value: u64) -> Self {
     self.group_commit_window_ms = value;
     self

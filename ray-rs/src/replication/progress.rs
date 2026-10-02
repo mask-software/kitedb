@@ -2,7 +2,6 @@
 
 use super::durability::SidecarSync;
 use crate::error::{KiteError, Result};
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
@@ -177,10 +176,10 @@ fn with_progress_lock<T>(sidecar_path: &Path, f: impl FnOnce() -> Result<T>) -> 
     .read(true)
     .write(true)
     .open(lock_file_path(sidecar_path))?;
-  lock_file.lock_exclusive()?;
+  crate::util::fs::lock_exclusive(&lock_file)?;
 
   let result = f();
-  let unlock_result = fs2::FileExt::unlock(&lock_file);
+  let unlock_result = crate::util::fs::unlock(&lock_file);
   match (result, unlock_result) {
     (Ok(value), Ok(())) => Ok(value),
     (Ok(_), Err(error)) => Err(error.into()),
