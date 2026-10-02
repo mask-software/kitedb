@@ -909,6 +909,91 @@ fn f5_count_nodes_semantics_guard() {
   }
 }
 
+/// `count_nodes` equals `list_nodes().len()` through random creates,
+/// deletes, recreates by id, rollbacks, checkpoints, the caller's pending
+/// changes, and (MVCC) readers whose snapshots predate later commits.
+#[test]
+fn f5_count_nodes_matches_list_nodes_under_random_operations_guard() {
+  for mvcc in [false, true] {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = open(&dir.path().join("f5-random.kitedb"), options(mvcc));
+    let mut state = 0x9E37_79B9_7F4A_7C15u64 ^ u64::from(mvcc);
+    let mut random = move |bound: u64| {
+      state ^= state << 13;
+      state ^= state >> 7;
+      state ^= state << 17;
+      state % bound
+    };
+    let mut ids: Vec<NodeId> = Vec::new();
+    let mut reader: Option<(mpsc::Sender<()>, thread::JoinHandle<()>)> = None;
+    for step in 0..300 {
+      db.begin(false).expect("begin");
+      for _ in 0..=random(4) {
+        match random(4) {
+          0 | 1 => ids.push(db.create_node(None).expect("create")),
+          2 if !ids.is_empty() => {
+            let _ = db.delete_node(ids[random(ids.len() as u64) as usize]);
+          }
+          // Recreate by id; refused (ignored) while the node is live.
+          _ if !ids.is_empty() => {
+            let _ = db.create_node_with_id(ids[random(ids.len() as u64) as usize], None);
+          }
+          _ => {}
+        }
+        assert_eq!(
+          db.count_nodes(),
+          db.list_nodes().len(),
+          "mvcc: {mvcc}, step {step}: inside a transaction"
+        );
+      }
+      if random(5) == 0 {
+        db.rollback().expect("rollback");
+      } else {
+        db.commit().expect("commit");
+      }
+      assert_eq!(
+        db.count_nodes(),
+        db.list_nodes().len(),
+        "mvcc: {mvcc}, step {step}"
+      );
+      if step % 50 == 49 {
+        // A blocking checkpoint waits for open transactions, the reader's too.
+        if let Some((go, handle)) = reader.take() {
+          go.send(()).expect("release reader");
+          handle.join().expect("reader");
+        }
+        db.checkpoint().expect("checkpoint");
+      }
+      if mvcc && step % 30 == 0 {
+        if let Some((go, handle)) = reader.take() {
+          go.send(()).expect("release reader");
+          handle.join().expect("reader");
+        }
+        let (began_tx, began_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let reader_db = Arc::clone(&db);
+        let handle = thread::spawn(move || {
+          reader_db.begin(true).expect("reader begin");
+          let before = (reader_db.count_nodes(), reader_db.list_nodes().len());
+          began_tx.send(()).expect("began");
+          go_rx.recv().expect("go");
+          let after = (reader_db.count_nodes(), reader_db.list_nodes().len());
+          reader_db.commit().expect("reader commit");
+          assert_eq!(before.0, before.1, "reader count vs list at its start");
+          assert_eq!(after.0, after.1, "reader count vs list after later commits");
+          assert_eq!(before.0, after.0, "reader snapshot changed");
+        });
+        began_rx.recv().expect("reader began");
+        reader = Some((go_tx, handle));
+      }
+    }
+    if let Some((go, handle)) = reader.take() {
+      go.send(()).expect("release reader");
+      handle.join().expect("reader");
+    }
+  }
+}
+
 /// Transactions are per thread and per database: one thread can hold
 /// transactions on two databases at once, and each sees only its own.
 #[test]
