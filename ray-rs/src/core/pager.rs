@@ -26,6 +26,7 @@ thread_local! {
   pub(crate) static SYNC_PRIMITIVE_LOG: std::cell::RefCell<Vec<&'static str>> =
     const { std::cell::RefCell::new(Vec::new()) };
 }
+pub(crate) mod io_hooks;
 
 static DATABASE_FILE_LOCKS: OnceLock<Mutex<HashMap<PathBuf, InProcessLockState>>> = OnceLock::new();
 const WRITABLE_OPEN_MAX_ATTEMPTS: usize = 4;
@@ -277,9 +278,11 @@ impl FilePager {
 
     let mut buffer = vec![0u8; self.page_size];
     self.file.seek(SeekFrom::Start(offset))?;
+    io_hooks::syscall();
 
     // Read as much as we can (may be less than page_size at end of file)
-    let _bytes_read = self.file.read(&mut buffer)?;
+    let _bytes_read = self.file.read(io_hooks::read_window(offset, &mut buffer))?;
+    io_hooks::syscall();
 
     // Rest is already zeros
     Ok(buffer)
@@ -316,7 +319,9 @@ impl FilePager {
     }
 
     self.file.seek(SeekFrom::Start(offset))?;
+    io_hooks::syscall();
     self.file.write_all(data)?;
+    io_hooks::syscall();
 
     Ok(())
   }
@@ -753,6 +758,7 @@ pub(crate) fn create_pager_with_locking<P: AsRef<Path>>(
   lock_file: bool,
 ) -> Result<FilePager> {
   let file_path = file_path.as_ref();
+  io_hooks::before_create_lock(file_path);
   let attempts = if lock_file {
     WRITABLE_OPEN_MAX_ATTEMPTS
   } else {
