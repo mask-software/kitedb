@@ -256,6 +256,70 @@ fn locked_file_matches_path(_file: &File, _path: &Path) -> Result<bool> {
   Ok(true)
 }
 
+/// [`FilePager::sync`]'s primitive on `file`, with its test hooks.
+fn sync_file_full(file: &File, full_fsync: bool) -> Result<()> {
+  io_hooks::sync_kind(io_hooks::SyncKind::Full);
+  io_hooks::before_sync()?;
+  let synced = sync_file(file, full_fsync);
+  io_hooks::synced(synced.is_ok());
+  synced
+}
+
+/// Sync `file`'s data and all its metadata (see [`FilePager::sync`]).
+fn sync_file(file: &File, full_fsync: bool) -> Result<()> {
+  #[cfg(target_os = "macos")]
+  {
+    use std::os::unix::io::AsRawFd;
+    // F_FULLFSYNC fails on file systems without it (some network and FUSE
+    // mounts); fall back to fsync there, as SQLite does.
+    // SAFETY: file descriptor is valid for the pager file.
+    if full_fsync && unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) } == 0 {
+      #[cfg(test)]
+      SYNC_PRIMITIVE_LOG.with(|log| log.borrow_mut().push("F_FULLFSYNC"));
+      return Ok(());
+    }
+    #[cfg(test)]
+    SYNC_PRIMITIVE_LOG.with(|log| log.borrow_mut().push("fsync"));
+    // SAFETY: file descriptor is valid for the pager file.
+    let result = unsafe { libc::fsync(file.as_raw_fd()) };
+    if result != 0 {
+      return Err(std::io::Error::last_os_error().into());
+    }
+  }
+
+  #[cfg(not(target_os = "macos"))]
+  {
+    #[cfg(test)]
+    SYNC_PRIMITIVE_LOG.with(|log| log.borrow_mut().push("sync_all"));
+    file.sync_all()?;
+  }
+  Ok(())
+}
+
+/// Writes and syncs a range of the file without the pager: a new snapshot's
+/// pages, which no header names until a later install, so a checkpoint
+/// writing them need not hold the pager lock that every commit takes to
+/// append to the WAL. It writes through its own descriptor for the file. The
+/// caller allocates the range first ([`FilePager::allocate_pages`]) and
+/// keeps every other writer out of it.
+pub(crate) struct DetachedWriter {
+  file: File,
+  full_fsync: bool,
+}
+
+impl DetachedWriter {
+  /// Write all of `data` at file `offset`, inside the allocated range.
+  pub(crate) fn write_range(&self, offset: u64, data: &[u8]) -> Result<()> {
+    write_all_at(&self.file, data, offset)?;
+    Ok(())
+  }
+
+  /// Sync the file to disk as [`FilePager::sync`] does.
+  pub(crate) fn sync(&self) -> Result<()> {
+    sync_file_full(&self.file, self.full_fsync)
+  }
+}
+
 /// FilePager implementation for single-file database
 pub struct FilePager {
   file: File,
@@ -614,10 +678,7 @@ impl FilePager {
     if self.read_only {
       return Ok(());
     }
-    io_hooks::sync_kind(io_hooks::SyncKind::Full);
-    io_hooks::before_sync()?;
-    let synced = self.sync_file();
-    io_hooks::synced(synced.is_ok());
+    let synced = sync_file_full(&self.file, self.full_fsync);
     // No set_len ran since the sync started: that takes `&mut self`.
     if synced.is_ok() {
       self.length_unsynced.store(false, Ordering::Relaxed);
@@ -651,7 +712,7 @@ impl FilePager {
   fn sync_file_data(&self) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
-      self.sync_file()
+      sync_file(&self.file, self.full_fsync)
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -663,34 +724,18 @@ impl FilePager {
     }
   }
 
-  fn sync_file(&self) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-      use std::os::unix::io::AsRawFd;
-      // F_FULLFSYNC fails on file systems without it (some network and FUSE
-      // mounts); fall back to fsync there, as SQLite does.
-      // SAFETY: file descriptor is valid for the pager file.
-      if self.full_fsync && unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_FULLFSYNC) } == 0 {
-        #[cfg(test)]
-        SYNC_PRIMITIVE_LOG.with(|log| log.borrow_mut().push("F_FULLFSYNC"));
-        return Ok(());
-      }
-      #[cfg(test)]
-      SYNC_PRIMITIVE_LOG.with(|log| log.borrow_mut().push("fsync"));
-      // SAFETY: file descriptor is valid for the pager file.
-      let result = unsafe { libc::fsync(self.file.as_raw_fd()) };
-      if result != 0 {
-        return Err(std::io::Error::last_os_error().into());
-      }
+  /// A [`DetachedWriter`] for this file: `None` where the platform cannot
+  /// open a second descriptor for it (WASI), or while a mapping of the file
+  /// is live.
+  pub(crate) fn detached_writer(&self) -> Option<DetachedWriter> {
+    if self.read_only || self.mmap.is_some() {
+      return None;
     }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-      #[cfg(test)]
-      SYNC_PRIMITIVE_LOG.with(|log| log.borrow_mut().push("sync_all"));
-      self.file.sync_all()?;
-    }
-    Ok(())
+    let file = self.file.try_clone().ok()?;
+    Some(DetachedWriter {
+      file,
+      full_fsync: self.full_fsync,
+    })
   }
 
   /// Relocate an area to a new location (for growth/compaction)

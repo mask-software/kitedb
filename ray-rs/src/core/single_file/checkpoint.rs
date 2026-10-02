@@ -39,12 +39,16 @@ type GraphData = (
   HashMap<PropKeyId, VectorManifest>,
 );
 
+/// Bytes of a new snapshot written per positioned write.
+const SNAPSHOT_WRITE_CHUNK: usize = 1 << 20;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CheckpointPhase {
   GateAcquired,
   /// A background checkpoint's cut is durable and the gate is open again; its
   /// snapshot is not built yet.
   CutReleased,
+  /// A chunk of the new snapshot's pages is written.
   SnapshotPageWritten,
   /// Every page of the new snapshot is written; the sync comes next.
   SnapshotWritten,
@@ -1765,10 +1769,7 @@ impl SingleFileDB {
     // interrupted checkpoint are also skipped; vacuum owns reclamation.
     let start_page = self.checkpoint_snapshot_start_page(header, page_count)?;
 
-    let written = {
-      let mut pager = self.pager.lock();
-      self.write_snapshot_pages(&mut pager, start_page as u32, buffer, page_size)
-    };
+    let written = self.write_unnamed_snapshot_pages(start_page as u32, buffer, page_size);
     if let Err(error) =
       written.and_then(|()| self.reach_checkpoint_phase(CheckpointPhase::SnapshotDurable))
     {
@@ -1787,7 +1788,35 @@ impl SingleFileDB {
     })
   }
 
-  /// Write snapshot buffer to file pages
+  /// Write `buffer` as the pages from `start_page` on, which no header
+  /// names, and sync them. The pager lock is held only to allocate them:
+  /// commits take it to append to the WAL, and a slow write or fsync of the
+  /// snapshot would stall every one of them. Where the file cannot be written
+  /// without the pager (`FilePager::detached_writer`), it is written under
+  /// the lock.
+  fn write_unnamed_snapshot_pages(
+    &self,
+    start_page: u32,
+    buffer: &[u8],
+    page_size: usize,
+  ) -> Result<()> {
+    let writer = {
+      let mut pager = self.pager.lock();
+      self.allocate_snapshot_pages(&mut pager, start_page, buffer.len(), page_size)?;
+      match pager.detached_writer() {
+        Some(writer) => writer,
+        None => return self.write_snapshot_pages(&mut pager, start_page, buffer, page_size),
+      }
+    };
+    self.write_snapshot_chunks(start_page, buffer, page_size, |offset, data| {
+      writer.write_range(offset, data)
+    })?;
+    self.reach_checkpoint_phase(CheckpointPhase::SnapshotWritten)?;
+    let _step = self.checkpoint_step("sync snapshot");
+    writer.sync()
+  }
+
+  /// Write snapshot buffer to file pages, and sync them.
   pub(crate) fn write_snapshot_pages(
     &self,
     pager: &mut FilePager,
@@ -1795,31 +1824,58 @@ impl SingleFileDB {
     buffer: &[u8],
     page_size: usize,
   ) -> Result<()> {
-    let num_pages = pages_to_store(buffer.len(), page_size);
+    self.allocate_snapshot_pages(pager, start_page, buffer.len(), page_size)?;
+    self.write_snapshot_chunks(start_page, buffer, page_size, |offset, data| {
+      pager.write_range(offset, data)
+    })?;
+    self.reach_checkpoint_phase(CheckpointPhase::SnapshotWritten)?;
+    let _step = self.checkpoint_step("sync snapshot");
+    pager.sync()
+  }
 
-    // Ensure file is large enough
-    let required_pages = start_page + num_pages;
+  /// Extend the file to hold `bytes` from page `start_page` on.
+  fn allocate_snapshot_pages(
+    &self,
+    pager: &mut FilePager,
+    start_page: u32,
+    bytes: usize,
+    page_size: usize,
+  ) -> Result<()> {
+    let required_pages = start_page + pages_to_store(bytes, page_size);
     let current_pages = (pager.file_size() as usize).div_ceil(page_size);
-
     if required_pages as usize > current_pages {
       let _step = self.checkpoint_step("allocate snapshot pages");
       pager.allocate_pages(required_pages - current_pages as u32)?;
     }
+    Ok(())
+  }
 
-    // Write pages
-    for i in 0..num_pages {
-      let mut page_data = vec![0u8; page_size];
-      let src_offset = i as usize * page_size;
-      let src_end = std::cmp::min(src_offset + page_size, buffer.len());
-      page_data[..src_end - src_offset].copy_from_slice(&buffer[src_offset..src_end]);
-      pager.write_page(start_page + i, &page_data)?;
+  /// Write `buffer` with `write` (a file offset and bytes) as the pages from
+  /// `start_page` on, the last padded with zeros, a chunk of
+  /// `SNAPSHOT_WRITE_CHUNK` bytes at a time.
+  fn write_snapshot_chunks(
+    &self,
+    start_page: u32,
+    buffer: &[u8],
+    page_size: usize,
+    mut write: impl FnMut(u64, &[u8]) -> Result<()>,
+  ) -> Result<()> {
+    let padded_len = pages_to_store(buffer.len(), page_size) as usize * page_size;
+    let chunk_len = (SNAPSHOT_WRITE_CHUNK / page_size).max(1) * page_size;
+    let base = start_page as u64 * page_size as u64;
+    let mut offset = 0;
+    while offset < padded_len {
+      let end = (offset + chunk_len).min(padded_len);
+      if end <= buffer.len() {
+        write(base + offset as u64, &buffer[offset..end])?;
+      } else {
+        let mut padded = vec![0u8; end - offset];
+        padded[..buffer.len() - offset].copy_from_slice(&buffer[offset..]);
+        write(base + offset as u64, &padded)?;
+      }
       self.reach_checkpoint_phase(CheckpointPhase::SnapshotPageWritten)?;
+      offset = end;
     }
-    self.reach_checkpoint_phase(CheckpointPhase::SnapshotWritten)?;
-
-    let _step = self.checkpoint_step("sync snapshot");
-    pager.sync()?;
-
     Ok(())
   }
 
