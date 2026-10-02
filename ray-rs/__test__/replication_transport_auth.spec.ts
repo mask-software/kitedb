@@ -31,14 +31,24 @@ test('replication admin auth token mode requires bearer token', (t) => {
   t.false(isReplicationAdminAuthorized(request({}), cfg))
 })
 
-test('replication admin auth mtls mode supports header + subject regex', (t) => {
+test('replication admin auth mtls mode supports a trusted header + whole-value subject regex', (t) => {
   const cfg = {
     mode: 'mtls',
     mtlsHeader: 'x-client-cert',
-    mtlsSubjectRegex: /^CN=replication-admin,/,
+    trustForwardedClientCert: true,
+    mtlsSubjectRegex: /CN=replication-admin,O=RayDB/,
   } as const
   t.true(isReplicationAdminAuthorized(request({ 'x-client-cert': 'CN=replication-admin,O=RayDB' }), cfg))
   t.false(isReplicationAdminAuthorized(request({ 'x-client-cert': 'CN=viewer,O=RayDB' }), cfg))
+  t.false(isReplicationAdminAuthorized(request({ 'x-client-cert': 'CN=replication-admin,O=RayDB,OU=x' }), cfg))
+  // The header is never trusted implicitly.
+  const { trustForwardedClientCert: _, ...untrusted } = cfg
+  t.throws(
+    () => isReplicationAdminAuthorized(request({ 'x-client-cert': 'CN=replication-admin,O=RayDB' }), untrusted),
+    {
+      message: /mTLS check/,
+    },
+  )
 })
 
 test('replication admin auth token_or_mtls accepts either', (t) => {
@@ -46,6 +56,8 @@ test('replication admin auth token_or_mtls accepts either', (t) => {
     mode: 'token_or_mtls',
     token: 'abc123',
     mtlsHeader: 'x-client-cert',
+    trustForwardedClientCert: true,
+    mtlsSubjectRegex: /CN=replication-admin,O=RayDB/,
   } as const
   t.true(isReplicationAdminAuthorized(request({ authorization: 'Bearer abc123' }), cfg))
   t.true(isReplicationAdminAuthorized(request({ 'x-client-cert': 'CN=replication-admin,O=RayDB' }), cfg))
@@ -57,6 +69,8 @@ test('replication admin auth token_and_mtls requires both', (t) => {
     mode: 'token_and_mtls',
     token: 'abc123',
     mtlsHeader: 'x-client-cert',
+    trustForwardedClientCert: true,
+    mtlsSubjectRegex: /CN=replication-admin,O=RayDB/,
   } as const
   t.false(isReplicationAdminAuthorized(request({ authorization: 'Bearer abc123' }), cfg))
   t.false(isReplicationAdminAuthorized(request({ 'x-client-cert': 'CN=replication-admin,O=RayDB' }), cfg))

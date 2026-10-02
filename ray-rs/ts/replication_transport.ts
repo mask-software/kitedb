@@ -1,3 +1,5 @@
+import { createHash, timingSafeEqual } from 'node:crypto'
+
 import {
   collectReplicationLogTransportJson,
   collectReplicationMetricsOtelJson,
@@ -60,13 +62,36 @@ export interface ReplicationAdminAuthRequest {
   headers?: Record<string, string | undefined> | null
 }
 
+/**
+ * Replication admin auth policy.
+ *
+ * The mTLS modes need a check: an `mtlsMatcher` (e.g.
+ * `createNodeTlsMtlsMatcher()` or `createForwardedTlsMtlsMatcher()`), or
+ * `trustForwardedClientCert` with `mtlsSubjectRegex`. A config that cannot be
+ * satisfied safely is rejected when it is used.
+ */
 export interface ReplicationAdminAuthConfig<
   TRequest extends ReplicationAdminAuthRequest = ReplicationAdminAuthRequest,
 > {
-  mode?: ReplicationAdminAuthMode
+  /** Required; `'none'` disables auth explicitly. */
+  mode: ReplicationAdminAuthMode
+  /** Bearer token for the token modes, compared in constant time. */
   token?: string | null
+  /** Header carrying the proxy-verified client certificate (default `x-forwarded-client-cert`). */
   mtlsHeader?: string
+  /**
+   * Pattern the whole `mtlsHeader` value must match: it is anchored at both
+   * ends (as `^(?:pattern)$`), so `/CN=admin/` does not match `CN=x,OU=CN=admin`.
+   */
   mtlsSubjectRegex?: RegExp | null
+  /**
+   * Accept `mtlsHeader` as proof of a client certificate when its value matches
+   * `mtlsSubjectRegex` (required). Enable it only behind a TLS-terminating proxy
+   * that verifies client certificates and overwrites this header on every
+   * request: otherwise any client can send it.
+   */
+  trustForwardedClientCert?: boolean
+  /** Custom mTLS check; takes precedence over the forwarded header. */
   mtlsMatcher?: (request: TRequest) => boolean
 }
 
@@ -202,32 +227,57 @@ type NormalizedReplicationAdminAuthConfig<TRequest extends ReplicationAdminAuthR
     mode: ReplicationAdminAuthMode
     token: string | null
     mtlsHeader: string
-    mtlsSubjectRegex: RegExp | null
+    /** The subject pattern anchored at both ends; set only when the header is trusted. */
+    trustedSubject: RegExp | null
     mtlsMatcher: ((request: TRequest) => boolean) | null
   }
+
+/** `pattern` anchored to match a whole string, without stateful (g, y) or multiline flags. */
+function wholeValuePattern(pattern: RegExp): RegExp {
+  return new RegExp(`^(?:${pattern.source})$`, pattern.flags.replace(/[gmy]/g, ''))
+}
 
 function normalizeReplicationAdminAuthConfig<
   TRequest extends ReplicationAdminAuthRequest = ReplicationAdminAuthRequest,
 >(config: ReplicationAdminAuthConfig<TRequest>): NormalizedReplicationAdminAuthConfig<TRequest> {
-  const modeRaw = config.mode ?? 'none'
-  if (!REPLICATION_ADMIN_AUTH_MODES.has(modeRaw)) {
+  const modeRaw: unknown = config.mode
+  if (modeRaw === undefined || modeRaw === null) {
+    throw new Error(
+      "replication admin auth requires a mode (none|token|mtls|token_or_mtls|token_and_mtls); use mode: 'none' to disable auth explicitly",
+    )
+  }
+  if (!REPLICATION_ADMIN_AUTH_MODES.has(modeRaw as ReplicationAdminAuthMode)) {
     throw new Error(
       `Invalid replication admin auth mode '${String(modeRaw)}'; expected none|token|mtls|token_or_mtls|token_and_mtls`,
     )
   }
+  const mode = modeRaw as ReplicationAdminAuthMode
   const token = config.token?.trim() || null
-  if ((modeRaw === 'token' || modeRaw === 'token_or_mtls' || modeRaw === 'token_and_mtls') && !token) {
-    throw new Error(`replication admin auth mode '${modeRaw}' requires a non-empty token`)
+  if ((mode === 'token' || mode === 'token_or_mtls' || mode === 'token_and_mtls') && !token) {
+    throw new Error(`replication admin auth mode '${mode}' requires a non-empty token`)
   }
   const mtlsHeaderRaw = config.mtlsHeader?.trim().toLowerCase()
   const mtlsHeader = mtlsHeaderRaw && mtlsHeaderRaw.length > 0 ? mtlsHeaderRaw : 'x-forwarded-client-cert'
-  return {
-    mode: modeRaw,
-    token,
-    mtlsHeader,
-    mtlsSubjectRegex: config.mtlsSubjectRegex ?? null,
-    mtlsMatcher: config.mtlsMatcher ?? null,
+  const mtlsMatcher = config.mtlsMatcher ?? null
+
+  let trustedSubject: RegExp | null = null
+  if (config.trustForwardedClientCert) {
+    if (!config.mtlsSubjectRegex) {
+      throw new Error(
+        `replication admin auth: trustForwardedClientCert requires mtlsSubjectRegex, the pattern a trusted '${mtlsHeader}' value must match`,
+      )
+    }
+    trustedSubject = wholeValuePattern(config.mtlsSubjectRegex)
   }
+  const usesMtls = mode === 'mtls' || mode === 'token_or_mtls' || mode === 'token_and_mtls'
+  if (usesMtls && !mtlsMatcher && !trustedSubject) {
+    throw new Error(
+      `replication admin auth mode '${mode}' needs an mTLS check: an mtlsMatcher (e.g. createNodeTlsMtlsMatcher()) ` +
+        `or trustForwardedClientCert: true with mtlsSubjectRegex. A client certificate header is not trusted by default, ` +
+        'since any client can send it.',
+    )
+  }
+  return { mode, token, mtlsHeader, trustedSubject, mtlsMatcher }
 }
 
 function getHeaderValue(request: ReplicationAdminAuthRequest, name: string): string | null {
@@ -246,11 +296,16 @@ function getHeaderValue(request: ReplicationAdminAuthRequest, name: string): str
   return null
 }
 
+function sha256(value: string): Uint8Array {
+  return createHash('sha256').update(value).digest()
+}
+
 function isTokenMatch(request: ReplicationAdminAuthRequest, token: string | null): boolean {
   if (!token) return false
   const authorization = getHeaderValue(request, 'authorization')
   if (!authorization) return false
-  return authorization === `Bearer ${token}`
+  // Equal-length digests: the comparison takes the same time for any input.
+  return timingSafeEqual(sha256(authorization), sha256(`Bearer ${token}`))
 }
 
 function isMtlsMatch<TRequest extends ReplicationAdminAuthRequest = ReplicationAdminAuthRequest>(
@@ -260,30 +315,26 @@ function isMtlsMatch<TRequest extends ReplicationAdminAuthRequest = ReplicationA
   if (config.mtlsMatcher) {
     return config.mtlsMatcher(request)
   }
+  if (!config.trustedSubject) return false
   const certValue = getHeaderValue(request, config.mtlsHeader)
-  if (!certValue) return false
-  if (!config.mtlsSubjectRegex) return true
-  return config.mtlsSubjectRegex.test(certValue)
+  return certValue !== null && config.trustedSubject.test(certValue)
 }
 
 function isAuthorizedWithNormalized<TRequest extends ReplicationAdminAuthRequest = ReplicationAdminAuthRequest>(
   request: TRequest,
   config: NormalizedReplicationAdminAuthConfig<TRequest>,
 ): boolean {
-  const tokenOk = isTokenMatch(request, config.token)
-  const mtlsOk = isMtlsMatch(request, config)
-
   switch (config.mode) {
     case 'none':
       return true
     case 'token':
-      return tokenOk
+      return isTokenMatch(request, config.token)
     case 'mtls':
-      return mtlsOk
+      return isMtlsMatch(request, config)
     case 'token_or_mtls':
-      return tokenOk || mtlsOk
+      return isTokenMatch(request, config.token) || isMtlsMatch(request, config)
     case 'token_and_mtls':
-      return tokenOk && mtlsOk
+      return isTokenMatch(request, config.token) && isMtlsMatch(request, config)
   }
 }
 

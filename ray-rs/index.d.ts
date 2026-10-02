@@ -784,7 +784,17 @@ export declare class KiteInsertExecutorSingle {
 export declare class KitePath {
   via(edgeType: string): void
   maxDepth(depth: number): void
+  /**
+   * Set the direction: 'out' (default), 'in' or 'both', in any letter case. Throws on any
+   * other value.
+   */
   direction(direction: string): void
+  /**
+   * Weigh each edge by its numeric edge prop `propName` in `find` (Dijkstra) and
+   * `findKShortest`; an edge without the prop weighs 1. A non-numeric, negative or
+   * non-finite value makes the search throw. `findBfs` ignores weights.
+   */
+  weight(propName: string): void
   bidirectional(): void
   find(): JsPathResult
   findBfs(): JsPathResult
@@ -792,12 +802,18 @@ export declare class KitePath {
 }
 
 export declare class KiteTraversal {
+  /** Keep only results whose edge passes `func`. Applies to the step it follows. */
   whereEdge(func: unknown): KiteTraversal
+  /**
+   * Keep only results whose node passes `func`. Applies to the step it follows, or to the
+   * start nodes before the first step.
+   */
   whereNode(func: unknown): KiteTraversal
   out(edgeType?: string | undefined | null): KiteTraversal
   in(edgeType?: string | undefined | null): KiteTraversal
   both(edgeType?: string | undefined | null): KiteTraversal
   traverse(edgeType: string | undefined | null, options: JsTraverseOptions): KiteTraversal
+  /** Limit the number of results, counted after `whereEdge`/`whereNode` filtering. */
   take(limit: number): KiteTraversal
   select(props: Array<string>): KiteTraversal
   nodes(): Array<number>
@@ -1302,6 +1318,13 @@ export interface JsKiteOptions {
   replicationRetentionMinEntries?: number
   /** Minimum retained segment age in milliseconds (0 imposes no age floor) */
   replicationRetentionMinMs?: number
+  /**
+   * Enforce node schemas on writes (default: false). Creating a node fails if a required prop
+   * (any prop not marked optional) is missing or null, and every node write fails if a
+   * declared prop's value does not match its type (int<->float only when lossless). Props
+   * outside the schema are kept, and declared defaults are applied on create in both modes.
+   */
+  strictSchema?: boolean
 }
 
 /** Node property key-value pair for JS */

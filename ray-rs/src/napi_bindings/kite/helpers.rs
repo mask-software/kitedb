@@ -105,14 +105,6 @@ pub(crate) struct EdgeFilterData {
   pub props: HashMap<String, PropValue>,
 }
 
-/// Combined filter item for traversal
-pub(crate) struct TraversalFilterItem {
-  pub node_id: NodeId,
-  pub edge: Option<Edge>,
-  pub node: NodeFilterData,
-  pub edge_info: Option<EdgeFilterData>,
-}
-
 /// Create node filter data from a node ID
 pub(crate) fn node_filter_data(
   ray: &RustKite,
@@ -174,13 +166,14 @@ pub(crate) fn node_filter_arg(env: &Env, data: &NodeFilterData) -> Result<Object
 /// Create a JS object for edge filtering
 pub(crate) fn edge_filter_arg(env: &Env, data: &EdgeFilterData) -> Result<Object<'static>> {
   let mut obj = Object::new(env)?;
-  obj.set_named_property("src", data.src as i64)?;
-  obj.set_named_property("dst", data.dst as i64)?;
-  obj.set_named_property("etype", data.etype)?;
   for (name, value) in &data.props {
     let js_value = prop_value_to_js(env, value.clone())?;
     obj.set_named_property(name, js_value)?;
   }
+  // Identity last, as in `node_filter_arg`: a prop named src/dst/etype cannot shadow it.
+  obj.set_named_property("src", data.src as i64)?;
+  obj.set_named_property("dst", data.dst as i64)?;
+  obj.set_named_property("etype", data.etype)?;
   Ok(Object::from_raw(env.raw(), obj.raw()))
 }
 
