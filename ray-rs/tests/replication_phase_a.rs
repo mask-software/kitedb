@@ -92,6 +92,7 @@ fn manifest_interrupted_write_never_yields_partial_valid_state() {
       end_log_index: 41,
       size_bytes: 2048,
     }],
+    generation: 0,
   };
   store.write(&baseline).expect("write baseline");
 
@@ -121,6 +122,7 @@ fn manifest_reload_after_rewrite_is_deterministic() {
       end_log_index: 10,
       size_bytes: 123,
     }],
+    generation: 0,
   };
   let second = ReplicationManifest {
     version: 1,
@@ -142,6 +144,7 @@ fn manifest_reload_after_rewrite_is_deterministic() {
         size_bytes: 64,
       },
     ],
+    generation: 0,
   };
 
   store.write(&first).expect("write first");
