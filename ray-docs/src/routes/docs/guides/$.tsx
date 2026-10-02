@@ -538,8 +538,9 @@ top_connections = (db
 			<DocPage slug={slug}>
 				<p>
 					KiteDB has built-in vector search for similarity queries. You store an
-					embedding per node, and an IVF index finds the nearest vectors to a
-					query embedding.
+					embedding per node, and an approximate nearest-neighbor index (IVF, or
+					IVF-PQ for large high-dimensional collections) finds the nearest
+					vectors to a query embedding.
 				</p>
 
 				<h2 id="creating-index">Creating a vector index</h2>
@@ -681,6 +682,59 @@ index.build_index()
 # Get index statistics
 stats = index.stats()
 print(f"Total vectors: {stats['totalVectors']}")`}
+				/>
+
+				<h2 id="index-backend">Choosing the index backend</h2>
+				<p>
+					By default (<code>auto</code>) the index picks its backend each time it
+					builds, from the live vector count and dimensions at that point:
+				</p>
+				<ul>
+					<li>
+						<strong>Plain IVF</strong> while the collection has fewer than 50,000
+						vectors or fewer than 512 dimensions. Results carry exact distances,
+						and builds are fast.
+					</li>
+					<li>
+						<strong>IVF-PQ</strong> from 512 dimensions and 50,000 vectors on.
+						Searches scan compact product-quantization codes (about 2x faster at
+						that size in our measurements) and re-rank the best candidates by
+						exact distance. Raise <code>rerankFactor</code> for higher recall.
+					</li>
+				</ul>
+				<p>
+					The index rebuilds itself on the next search as it grows (at 4x the
+					size it was built at, or when it crosses the threshold), so a growing
+					collection moves from IVF to IVF-PQ on its own. Set the backend
+					explicitly to keep one:
+				</p>
+				<MultiLangCode
+					typescript={`import { AnnAlgorithm, createVectorIndex } from '@kitedb/core';
+
+const index = createVectorIndex({
+  dimensions: 1536,
+  annAlgorithm: AnnAlgorithm.Ivf, // 'ivf' | 'ivf_pq' | 'auto' (default)
+});
+
+index.buildIndex();
+console.log(index.stats().indexAlgorithm); // 'ivf'`}
+					rust={`use kitedb::api::vector_search::{AnnAlgorithm, VectorIndex, VectorIndexOptions};
+
+let mut index = VectorIndex::new(
+    VectorIndexOptions::new(1536).with_ann_algorithm(AnnAlgorithm::Ivf),
+);
+
+index.build_index()?;
+assert_eq!(index.stats().index_algorithm, Some(AnnAlgorithm::Ivf));`}
+					python={`from kitedb import create_vector_index, VectorIndexOptions
+
+index = create_vector_index(VectorIndexOptions(
+    dimensions=1536,
+    ann_algorithm="ivf",  # "ivf" | "ivf_pq" | "auto" (default)
+))
+
+index.build_index()
+print(index.stats()["indexAlgorithm"])  # "ivf"`}
 				/>
 
 				<h2 id="next-steps">Next steps</h2>

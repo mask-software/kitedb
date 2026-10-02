@@ -1188,6 +1188,19 @@ export declare const enum JsAggregation {
   Sum = 'Sum'
 }
 
+/** ANN backend for `VectorIndex` */
+export declare const enum JsAnnAlgorithm {
+  /** Plain IVF: exact distances over the probed clusters */
+  Ivf = 'ivf',
+  /** IVF-PQ: PQ-ranked candidates re-ranked by exact distance */
+  IvfPq = 'ivf_pq',
+  /**
+   * Plain IVF while the index is small or under 512 dimensions, IVF-PQ from
+   * 512 dimensions and 50,000 vectors on (the default)
+   */
+  Auto = 'auto'
+}
+
 /** Brute force search result */
 export interface JsBruteForceResult {
   nodeId: number
@@ -1282,6 +1295,12 @@ export interface JsIvfConfig {
   nProbe?: number
   /** Distance metric (default: Cosine) */
   metric?: JsDistanceMetric
+  /**
+   * Training seed, an integer from 0 to Number.MAX_SAFE_INTEGER (default:
+   * a fresh seed per training). With a seed, training the same vectors in
+   * the same order builds the same index on any machine.
+   */
+  seed?: number
 }
 
 /** Statistics for IVF index */
@@ -1593,6 +1612,12 @@ export interface JsSearchOptions {
   nProbe?: number
   /** Minimum similarity threshold (0-1) */
   threshold?: number
+  /**
+   * IVF-PQ only: re-rank the best `max(k * rerankFactor, 80)` PQ candidates
+   * by exact distance (default 4; 0 returns the approximate PQ ranking and
+   * distances). IVF search is exact and ignores it.
+   */
+  rerankFactor?: number
 }
 
 /** Result of a vector search */
@@ -2016,6 +2041,11 @@ export interface SimilarOptions {
   threshold?: number
   /** Number of clusters to probe for IVF (must be positive) */
   nProbe?: number
+  /**
+   * Re-rank the best `max(k * rerankFactor, 80)` IVF-PQ candidates by exact
+   * distance (default 4; 0 returns the approximate PQ ranking and distances)
+   */
+  rerankFactor?: number
 }
 
 /** Options for optimizing a single-file database */
@@ -2065,6 +2095,12 @@ export interface VectorIndexOptions {
   trainingThreshold?: number
   /** @deprecated No effect: `VectorIndex` keeps no node cache. Still accepted so existing callers keep working. */
   cacheMaxSize?: number
+  /**
+   * ANN backend (default: 'auto': plain IVF while the index is small or
+   * under 512 dimensions, IVF-PQ from 512 dimensions and 50,000 vectors on;
+   * decided at each build)
+   */
+  annAlgorithm?: JsAnnAlgorithm
 }
 
 /** Vector index statistics */
@@ -2075,6 +2111,11 @@ export interface VectorIndexStats {
   metric: JsDistanceMetric
   indexTrained: boolean
   indexClusters?: number
+  /**
+   * Backend of the built ANN index ('ivf' or 'ivf_pq'; absent before one is
+   * built)
+   */
+  indexAlgorithm?: JsAnnAlgorithm
 }
 
 /** Search result hit */

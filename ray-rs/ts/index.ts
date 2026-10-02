@@ -1659,6 +1659,7 @@ export {
   JsTraversalDirection as TraversalDirection,
   JsDistanceMetric as DistanceMetric,
   JsAggregation as Aggregation,
+  JsAnnAlgorithm as AnnAlgorithm,
   JsSyncMode as SyncMode,
   JsCompressionType as CompressionType,
   PropType as PropValueType,

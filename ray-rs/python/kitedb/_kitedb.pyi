@@ -959,12 +959,17 @@ class IvfConfig:
     n_clusters: Optional[int]
     n_probe: Optional[int]
     metric: Optional[str]
+    seed: Optional[int]
+    """Training seed, 0 to 2**64 - 1 (default: a fresh seed per training).
+    With a seed, training the same vectors in the same order builds the same
+    index on any machine."""
     
     def __init__(
         self,
         n_clusters: Optional[int] = None,
         n_probe: Optional[int] = None,
         metric: Optional[str] = None,
+        seed: Optional[int] = None,
     ) -> None: ...
 
 class PqConfig:
@@ -984,11 +989,16 @@ class SearchOptions:
     """Options for vector search."""
     n_probe: Optional[int]
     threshold: Optional[float]
+    rerank_factor: Optional[int]
+    """IVF-PQ only: re-rank the best max(k * rerank_factor, 80) PQ candidates by
+    exact distance (default 4; 0 returns the approximate PQ ranking and
+    distances). IVF search is exact and ignores it."""
     
     def __init__(
         self,
         n_probe: Optional[int] = None,
         threshold: Optional[float] = None,
+        rerank_factor: Optional[int] = None,
     ) -> None: ...
 
 class SearchResult:
@@ -1083,6 +1093,13 @@ class BruteForceResult:
     node_id: int
     distance: float
     similarity: float
+
+def resolve_ann_algorithm(algorithm: str, dimensions: int, live_vectors: int) -> str:
+    """The backend ``algorithm`` ("auto", "ivf" or "ivf_pq") builds for a
+    vector index of ``dimensions`` with ``live_vectors`` live vectors: "ivf" or
+    "ivf_pq". "auto" picks IVF-PQ from 512 dimensions and 50,000 vectors on,
+    plain IVF otherwise."""
+    ...
 
 def brute_force_search(
     vectors: List[List[float]],

@@ -7,6 +7,8 @@
 //! 1. IVF partitions vectors into clusters using coarse centroids
 //! 2. PQ compresses residuals (vector - centroid) for each cluster
 //! 3. Search: find nearest clusters, then use ADC on PQ codes
+//! 4. Re-rank: order the best ADC candidates by exact distance to their
+//!    stored vectors (see [`IvfPqSearchOptions::rerank_factor`])
 //!
 //! This provides:
 //! - Fast coarse search (IVF centroid comparison)
@@ -28,7 +30,7 @@ use crate::vector::ivf::kmeans::{
   assign_to_centroids, nearest_centroid, training_sample, MAX_TRAINING_POINTS_PER_CLUSTER,
 };
 use crate::vector::ivf::{kmeans_parallel, KMeansConfig};
-use crate::vector::store::{validate_manifest_layout, FragmentLookup};
+use crate::vector::store::{live_vectors_by_id, validate_manifest_layout, FragmentLookup};
 use crate::vector::top_k::TopK;
 use crate::vector::types::{
   DistanceMetric, IvfConfig, MultiQueryAggregation, PqConfig, VectorManifest, VectorSearchResult,
@@ -98,6 +100,13 @@ impl IvfPqConfig {
   /// Set whether to use residual encoding
   pub fn with_residuals(mut self, use_residuals: bool) -> Self {
     self.use_residuals = use_residuals;
+    self
+  }
+
+  /// Set the training seed for the coarse clusters and PQ codebooks (see
+  /// [`IvfConfig::seed`])
+  pub fn with_seed(mut self, seed: u64) -> Self {
+    self.ivf.seed = Some(seed);
     self
   }
 }
@@ -331,9 +340,10 @@ impl IvfPqIndex {
     }
 
     // Step 1: Train IVF centroids with parallel k-means
-    let kmeans_config = KMeansConfig::new(n_clusters)
+    let mut kmeans_config = KMeansConfig::new(n_clusters)
       .with_max_iterations(25)
       .with_tolerance(1e-4);
+    kmeans_config.seed = self.config.ivf.seed;
     let kmeans_result = with_metric_distance!(metric, |dist| kmeans_parallel(
       &sample,
       sample_n,
@@ -406,6 +416,7 @@ impl IvfPqIndex {
     let num_subspaces = self.config.pq.num_subspaces;
     let num_centroids = self.config.pq.num_centroids;
     let max_iterations = self.config.pq.max_iterations;
+    let seed = self.config.ivf.seed;
     let subspace_dims = self.subspace_dims;
     let dimensions = self.dimensions;
     let subvector_capacity = num_vectors
@@ -437,6 +448,7 @@ impl IvfPqIndex {
               subspace_dims,
               num_centroids,
               max_iterations,
+              subspace_seed(seed, m),
             );
             centroids
           })
@@ -462,6 +474,7 @@ impl IvfPqIndex {
               subspace_dims,
               num_centroids,
               max_iterations,
+              subspace_seed(seed, m),
             );
             centroids
           })
@@ -586,6 +599,10 @@ impl IvfPqIndex {
 
   /// Search for k nearest neighbors
   ///
+  /// Ranks the probed clusters' vectors by PQ (ADC) distance, then re-ranks
+  /// the best of them by exact distance to their vectors in `manifest`
+  /// (see [`IvfPqSearchOptions::rerank_factor`]).
+  ///
   /// # Errors
   /// Returns an error if the query or the manifest does not match the index
   /// dimensions, or if the manifest's row groups are malformed.
@@ -598,15 +615,69 @@ impl IvfPqIndex {
   ) -> Result<Vec<VectorSearchResult>, IvfPqError> {
     self.check_dimensions(query)?;
     self.check_manifest(manifest)?;
+    if k == 0 {
+      return Ok(Vec::new());
+    }
     let options = options.unwrap_or_default();
     let query = self.prepare_query(query);
+    let hits = match rerank_candidates(k, options.rerank_factor) {
+      // The threshold applies to the exact distance, after the re-rank.
+      Some(candidates) => self.rerank(
+        manifest,
+        &query,
+        k,
+        self.collect_candidates(manifest, &query, candidates, &options, false),
+        options.threshold,
+      ),
+      None => self.collect_candidates(manifest, &query, k, &options, true),
+    };
     Ok(
-      self
-        .collect_candidates(manifest, &query, k, &options, true)
+      hits
         .into_iter()
         .map(|(candidate, distance)| self.to_result(candidate, distance))
         .collect(),
     )
+  }
+
+  /// The `k` closest of the ADC `candidates` by exact distance from the
+  /// prepared `query` to their vectors in `manifest`, closest first. A
+  /// candidate whose vector the manifest does not hold (one that carries
+  /// only node mappings) keeps its ADC distance.
+  fn rerank(
+    &self,
+    manifest: &VectorManifest,
+    query: &[f32],
+    k: usize,
+    candidates: Vec<(Candidate, f32)>,
+    threshold: Option<f32>,
+  ) -> Vec<(Candidate, f32)> {
+    let metric = self.config.ivf.metric;
+    let fragments = FragmentLookup::new(manifest);
+    let mut top = TopK::new(k);
+    with_metric_distance!(
+      metric,
+      stored_normalized = manifest.config.normalize_on_insert,
+      |dist| {
+        for (candidate, adc_distance) in candidates {
+          let distance = match fragments.vector_by_id(manifest, candidate.vector_id) {
+            Some(vector) => dist(query, vector),
+            None => adc_distance,
+          };
+          if passes_threshold(metric, threshold, distance) {
+            top.push(candidate, distance);
+          }
+        }
+      }
+    );
+    top.into_sorted_vec()
+  }
+
+  /// One ADC table per prepared query (for `cluster`'s residuals, if any).
+  fn distance_tables(&self, queries: &[Cow<'_, [f32]>], cluster: Option<usize>) -> Vec<AdcTable> {
+    queries
+      .iter()
+      .map(|query| self.build_distance_table(query, cluster))
+      .collect()
   }
 
   /// Top-k candidates for a prepared (cosine-normalized) query, best first.
@@ -654,37 +725,35 @@ impl IvfPqIndex {
 
       // Search vectors in this cluster using PQ ADC
       for &vector_id in vector_ids {
-        // A missing mapping is not a valid result. Do this check before the
-        // filter so an unmappable vector can never bypass it.
-        let node_id = match manifest.vector_to_node.get(&vector_id) {
-          Some(&node_id) => node_id,
-          None => continue,
+        // A missing mapping is not a valid result. With a filter, check it
+        // first so an unmappable vector can never bypass the filter.
+        let filtered_node = match &options.filter {
+          Some(filter) => match manifest.vector_to_node.get(&vector_id) {
+            Some(&node_id) if filter(node_id) => Some(node_id),
+            _ => continue,
+          },
+          None => None,
         };
 
-        if let Some(ref filter) = options.filter {
-          if !filter(node_id) {
-            continue;
-          }
-        }
-
-        // Get PQ codes for this vector
-        let codes = match self.pq_codes.get(&vector_id) {
-          Some(c) => c,
-          None => continue,
+        let Some(codes) = self.pq_codes.get(&vector_id) else {
+          continue;
         };
-
-        // Compute approximate distance using ADC
         let dist = self.distance_adc(dist_table, codes);
-
-        // Apply threshold filter
-        if apply_threshold {
-          if let Some(threshold) = options.threshold {
-            let similarity = self.config.ivf.metric.distance_to_similarity(dist);
-            if similarity < threshold {
-              continue;
-            }
-          }
+        // Most scanned vectors cannot enter the top k: skip them before
+        // the node lookup and the threshold.
+        if !top.admits(dist) {
+          continue;
         }
+        if apply_threshold && !passes_threshold(self.config.ivf.metric, options.threshold, dist) {
+          continue;
+        }
+        let node_id = match filtered_node {
+          Some(node_id) => node_id,
+          None => match manifest.vector_to_node.get(&vector_id) {
+            Some(&node_id) => node_id,
+            None => continue,
+          },
+        };
 
         top.push(
           Candidate {
@@ -883,6 +952,7 @@ impl IvfPqIndex {
   /// This is more efficient than running multiple separate searches because it:
   /// 1. Collects all candidate vectors across all queries
   /// 2. Aggregates distances per node using the specified aggregation method
+  ///    (exact distances unless the re-rank is off, as in [`Self::search`])
   /// 3. Returns the top-k results based on aggregated distances
   ///
   /// # Arguments
@@ -890,7 +960,7 @@ impl IvfPqIndex {
   /// * `queries` - Array of query vectors (all must have same dimensions)
   /// * `k` - Number of results to return
   /// * `aggregation` - How to aggregate distances from multiple queries
-  /// * `options` - Search options (n_probe, filter, threshold)
+  /// * `options` - Search options (n_probe, filter, threshold, rerank_factor)
   ///
   /// # Returns
   /// Vector of search results sorted by aggregated distance
@@ -920,19 +990,22 @@ impl IvfPqIndex {
     if max_candidates == 0 {
       return Ok(Vec::new());
     }
-    let mut expanded_k = k.saturating_mul(2).max(k).min(max_candidates);
+    // With the exact re-rank, each query contributes as many ADC candidates
+    // as a single-query search would re-rank.
+    let rerank = rerank_candidates(k, options.rerank_factor);
+    let mut expanded_k = k
+      .saturating_mul(2)
+      .max(rerank.unwrap_or(k))
+      .min(max_candidates);
 
     let prepared: Vec<Cow<[f32]>> = queries
       .iter()
       .map(|query| self.prepare_query(query))
       .collect();
-    // Without residuals the ADC table depends only on the query.
-    let shared_tables: Option<Vec<AdcTable>> = (!self.config.use_residuals).then(|| {
-      prepared
-        .iter()
-        .map(|query| self.build_distance_table(query, None))
-        .collect()
-    });
+    let fragments = rerank.is_some().then(|| FragmentLookup::new(manifest));
+    // ADC tables, built on first use. Without residuals they depend only on
+    // the queries, so they are shared across clusters and passes.
+    let mut shared_tables: Option<Vec<AdcTable>> = None;
     let mut distances = Vec::with_capacity(prepared.len());
 
     loop {
@@ -956,38 +1029,44 @@ impl IvfPqIndex {
 
       // Score every candidate against every query. A candidate found by only
       // one query must not be aggregated over that query's distance alone.
-      // Residual tables depend on the cluster, so build them per cluster.
+      // With the re-rank, a candidate's distances are exact when the manifest
+      // holds its vector, and ADC otherwise.
+      let metric = self.config.ivf.metric;
       let mut top = TopK::new(k);
-      for (cluster, candidates) in by_cluster {
-        let residual_tables: Vec<AdcTable>;
-        let tables = match &shared_tables {
-          Some(tables) => tables,
-          None => {
-            residual_tables = prepared
-              .iter()
-              .map(|query| self.build_distance_table(query, Some(cluster)))
-              .collect();
-            &residual_tables
+      with_metric_distance!(
+        metric,
+        stored_normalized = manifest.config.normalize_on_insert,
+        |dist| {
+          for (cluster, candidates) in by_cluster {
+            // Residual tables depend on the cluster.
+            let mut cluster_tables: Option<Vec<AdcTable>> = None;
+            for candidate in candidates {
+              distances.clear();
+              let stored = fragments
+                .as_ref()
+                .and_then(|fragments| fragments.vector_by_id(manifest, candidate.vector_id));
+              if let Some(vector) = stored {
+                distances.extend(prepared.iter().map(|query| dist(query, vector)));
+              } else {
+                let Some(codes) = self.pq_codes.get(&candidate.vector_id) else {
+                  continue;
+                };
+                let tables = if self.config.use_residuals {
+                  cluster_tables
+                    .get_or_insert_with(|| self.distance_tables(&prepared, Some(cluster)))
+                } else {
+                  shared_tables.get_or_insert_with(|| self.distance_tables(&prepared, None))
+                };
+                distances.extend(tables.iter().map(|table| self.distance_adc(table, codes)));
+              }
+              let distance = aggregation.aggregate(&distances);
+              if passes_threshold(metric, options.threshold, distance) {
+                top.push(candidate, distance);
+              }
+            }
           }
-        };
-        for candidate in candidates {
-          let codes = match self.pq_codes.get(&candidate.vector_id) {
-            Some(codes) => codes,
-            None => continue,
-          };
-          distances.clear();
-          distances.extend(tables.iter().map(|table| self.distance_adc(table, codes)));
-          let distance = aggregation.aggregate(&distances);
-          let similarity = self.config.ivf.metric.distance_to_similarity(distance);
-          if options
-            .threshold
-            .is_some_and(|threshold| similarity < threshold)
-          {
-            continue;
-          }
-          top.push(candidate, distance);
         }
-      }
+      );
 
       // Stop as soon as enough filtered and threshold-qualified nodes are
       // available, or when every query exhausted its selected-cluster
@@ -1017,17 +1096,9 @@ impl IvfPqIndex {
       return Err(IvfPqError::AlreadyTrained);
     }
 
-    // Train on the live vectors only: deleted slots still hold data.
-    let fragments = FragmentLookup::new(manifest);
-    let live: Vec<(u64, &[f32])> = manifest
-      .vector_locations
-      .iter()
-      .filter_map(|(&vector_id, location)| {
-        fragments
-          .vector(&manifest.config, location)
-          .map(|vector| (vector_id, vector))
-      })
-      .collect();
+    // Train on the live vectors only (deleted slots still hold data), in
+    // vector-id order so a seeded build is reproducible.
+    let live = live_vectors_by_id(manifest);
     self
       .training_vectors
       .get_or_insert_with(Vec::new)
@@ -1128,6 +1199,21 @@ struct AdcTable {
   norm_sq: Option<Vec<f32>>,
 }
 
+/// Default exact re-rank over-fetch factor for IVF-PQ search (see
+/// [`IvfPqSearchOptions::rerank_factor`]).
+///
+/// With [`MIN_RERANK_CANDIDATES`], a default search re-ranks the best
+/// `max(k * 4, 80)` ADC candidates. On clustered 128-d data (32 subspaces,
+/// no residuals, 10K-100K vectors) that lifted recall@10 from 0.15-0.68 to
+/// 0.53-1.0 for 10-15% more search time. At k >= 50, 4k candidates already
+/// reached recall@k 0.98; 8k cost a third more time for little gain.
+pub const DEFAULT_RERANK_FACTOR: usize = 4;
+
+/// Fewest candidates an IVF-PQ search re-ranks by exact distance. The PQ
+/// ranking error does not shrink with `k`: recall@1 needs about as many
+/// candidates as recall@10.
+pub const MIN_RERANK_CANDIDATES: usize = 80;
+
 /// Options for IVF-PQ search
 #[derive(Default)]
 pub struct IvfPqSearchOptions {
@@ -1135,8 +1221,18 @@ pub struct IvfPqSearchOptions {
   pub n_probe: Option<usize>,
   /// Filter function (return true to include)
   pub filter: Option<Box<dyn Fn(NodeId) -> bool>>,
-  /// Minimum similarity threshold
+  /// Minimum similarity threshold, applied to the returned distance
   pub threshold: Option<f32>,
+  /// Exact re-rank over-fetch factor.
+  ///
+  /// The PQ (ADC) scan keeps the `k * rerank_factor` closest candidates (at
+  /// least [`MIN_RERANK_CANDIDATES`]), which are then ranked by exact
+  /// distance to their vectors in the search's manifest, so results carry
+  /// exact distances and the threshold applies to them. A candidate whose
+  /// vector the manifest does not hold keeps its ADC distance. `None` uses
+  /// [`DEFAULT_RERANK_FACTOR`]; `Some(0)` skips the re-rank and returns the
+  /// approximate ADC ranking and distances.
+  pub rerank_factor: Option<usize>,
 }
 
 impl std::fmt::Debug for IvfPqSearchOptions {
@@ -1145,8 +1241,22 @@ impl std::fmt::Debug for IvfPqSearchOptions {
       .field("n_probe", &self.n_probe)
       .field("filter", &self.filter.as_ref().map(|_| "<fn>"))
       .field("threshold", &self.threshold)
+      .field("rerank_factor", &self.rerank_factor)
       .finish()
   }
+}
+
+/// How many ADC candidates to re-rank for a top-`k` search, or None when the
+/// re-rank is off (`rerank_factor` of 0).
+fn rerank_candidates(k: usize, rerank_factor: Option<usize>) -> Option<usize> {
+  match rerank_factor.unwrap_or(DEFAULT_RERANK_FACTOR) {
+    0 => None,
+    factor => Some(k.saturating_mul(factor).max(MIN_RERANK_CANDIDATES)),
+  }
+}
+
+fn passes_threshold(metric: DistanceMetric, threshold: Option<f32>, distance: f32) -> bool {
+  threshold.is_none_or(|threshold| metric.distance_to_similarity(distance) >= threshold)
 }
 
 // ============================================================================
@@ -1196,6 +1306,7 @@ fn train_pq_subspace(
   subspace_dims: usize,
   num_centroids: usize,
   max_iterations: usize,
+  seed: Option<u64>,
 ) {
   // Initialize centroids with k-means++
   initialize_pq_centroids_kmeans_pp(
@@ -1204,6 +1315,7 @@ fn train_pq_subspace(
     num_vectors,
     subspace_dims,
     num_centroids,
+    seed,
   );
 
   let mut assignments = vec![u16::MAX; num_vectors];
@@ -1279,16 +1391,29 @@ fn train_pq_subspace(
   }
 }
 
-/// K-means++ initialization for PQ subspace centroids
+/// Seed for PQ subspace `m`'s codebook, derived from the training seed so
+/// subspaces (and the coarse k-means, which uses the seed itself) draw
+/// different sequences.
+fn subspace_seed(seed: Option<u64>, m: usize) -> Option<u64> {
+  seed.map(|seed| seed ^ (m as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+}
+
+/// K-means++ initialization for PQ subspace centroids (from `seed`, or a
+/// fresh one when it is `None`)
 fn initialize_pq_centroids_kmeans_pp(
   centroids: &mut [f32],
   vectors: &[f32],
   num_vectors: usize,
   dims: usize,
   k: usize,
+  seed: Option<u64>,
 ) {
-  use rand::Rng;
-  let mut rng = rand::thread_rng();
+  use rand::rngs::StdRng;
+  use rand::{Rng, SeedableRng};
+  let mut rng = match seed {
+    Some(seed) => StdRng::seed_from_u64(seed),
+    None => StdRng::from_entropy(),
+  };
 
   // First centroid: random vector
   let first_idx = rng.gen_range(0..num_vectors);
@@ -1840,7 +1965,10 @@ pub fn serialize_ivf_pq(index: &IvfPqIndex) -> Vec<u8> {
 
   // Inverted lists
   buffer.extend_from_slice(&(index.inverted_lists.len() as u32).to_le_bytes());
-  for (&cluster, list) in &index.inverted_lists {
+  // Sorted, so the same index always serializes to the same bytes.
+  let mut lists: Vec<(&usize, &Vec<u64>)> = index.inverted_lists.iter().collect();
+  lists.sort_unstable_by_key(|&(&cluster, _)| cluster);
+  for (&cluster, list) in lists {
     buffer.extend_from_slice(&(cluster as u32).to_le_bytes());
     buffer.extend_from_slice(&(list.len() as u32).to_le_bytes());
     for &vector_id in list {
@@ -1859,7 +1987,9 @@ pub fn serialize_ivf_pq(index: &IvfPqIndex) -> Vec<u8> {
 
   // PQ codes
   buffer.extend_from_slice(&(index.pq_codes.len() as u32).to_le_bytes());
-  for (&vector_id, codes) in &index.pq_codes {
+  let mut codes_by_id: Vec<(&u64, &Vec<u8>)> = index.pq_codes.iter().collect();
+  codes_by_id.sort_unstable_by_key(|&(&vector_id, _)| vector_id);
+  for (&vector_id, codes) in codes_by_id {
     buffer.extend_from_slice(&vector_id.to_le_bytes());
     buffer.extend_from_slice(&(codes.len() as u32).to_le_bytes());
     buffer.extend_from_slice(codes);
@@ -1923,6 +2053,7 @@ pub fn deserialize_ivf_pq(buffer: &[u8]) -> Result<IvfPqIndex, SerializeError> {
       n_clusters,
       n_probe,
       metric,
+      seed: None,
     },
     pq: PqConfig {
       num_subspaces,
@@ -2206,6 +2337,7 @@ mod tests {
         n_clusters: 4,
         n_probe: 2,
         metric: DistanceMetric::Euclidean,
+        seed: None,
       },
       pq: PqConfig {
         num_subspaces: 4,
@@ -2224,6 +2356,7 @@ mod tests {
         n_clusters: 1,
         n_probe: 1,
         metric,
+        seed: None,
       },
       pq: PqConfig {
         num_subspaces: 4,
@@ -2366,6 +2499,168 @@ mod tests {
     }
   }
 
+  /// One cluster and one 2-centroid PQ subspace, so the first three vectors
+  /// share a code and tie at ADC distance 1.0 from (1, 0). Their exact
+  /// Euclidean distances are 0.1, 0.9 and 0.0. Node ids are 0..4. With
+  /// `store_vectors` false the manifest carries only node mappings.
+  fn rerank_fixture(store_vectors: bool) -> (IvfPqIndex, VectorManifest) {
+    let config = IvfPqConfig {
+      ivf: IvfConfig {
+        n_clusters: 1,
+        n_probe: 1,
+        metric: DistanceMetric::Euclidean,
+        seed: None,
+      },
+      pq: PqConfig {
+        num_subspaces: 1,
+        num_centroids: 2,
+        max_iterations: 1,
+      },
+      use_residuals: false,
+    };
+    let mut index = IvfPqIndex::new(2, config).expect("fixture config");
+    index.ivf_centroids = vec![0.0, 0.0];
+    index.pq_centroids = vec![vec![0.0, 0.0, 5.0, 5.0]];
+    index.inverted_lists.insert(0, Vec::new());
+    index.trained = true;
+
+    let store_config = VectorStoreConfig::new(2).with_metric(DistanceMetric::Euclidean);
+    let mut stored = VectorManifest::new(store_config.clone());
+    let mut mappings_only = VectorManifest::new(store_config);
+    for (node, vector) in [[0.9, 0.0], [0.1, 0.0], [1.0, 0.0], [5.0, 5.0]]
+      .iter()
+      .enumerate()
+    {
+      let vector_id =
+        crate::vector::store::vector_store_insert(&mut stored, node as NodeId, vector)
+          .expect("store insert");
+      index.insert(vector_id, vector).expect("index insert");
+      mappings_only
+        .vector_to_node
+        .insert(vector_id, node as NodeId);
+      mappings_only
+        .node_to_vector
+        .insert(node as NodeId, vector_id);
+    }
+    (index, if store_vectors { stored } else { mappings_only })
+  }
+
+  fn hits(results: &[VectorSearchResult]) -> Vec<(NodeId, f32)> {
+    results.iter().map(|r| (r.node_id, r.distance)).collect()
+  }
+
+  fn assert_hits(results: &[VectorSearchResult], expected: &[(NodeId, f32)]) {
+    let got = hits(results);
+    assert_eq!(got.len(), expected.len(), "{got:?}");
+    for ((node, distance), (expected_node, expected_distance)) in got.iter().zip(expected) {
+      assert_eq!(node, expected_node, "{got:?}");
+      assert!((distance - expected_distance).abs() < 1e-5, "{got:?}");
+    }
+  }
+
+  fn rerank_options(rerank_factor: Option<usize>, threshold: Option<f32>) -> IvfPqSearchOptions {
+    IvfPqSearchOptions {
+      threshold,
+      rerank_factor,
+      ..Default::default()
+    }
+  }
+
+  #[test]
+  fn test_ivf_pq_rerank_candidate_count() {
+    assert_eq!(DEFAULT_RERANK_FACTOR, 4);
+    assert_eq!(MIN_RERANK_CANDIDATES, 80);
+    assert_eq!(rerank_candidates(10, None), Some(80));
+    assert_eq!(rerank_candidates(1, None), Some(80));
+    assert_eq!(rerank_candidates(50, None), Some(200));
+    assert_eq!(rerank_candidates(50, Some(1)), Some(80));
+    assert_eq!(rerank_candidates(100, Some(3)), Some(300));
+    assert_eq!(rerank_candidates(10, Some(0)), None);
+    assert_eq!(rerank_candidates(usize::MAX, Some(4)), Some(usize::MAX));
+  }
+
+  #[test]
+  fn test_ivf_pq_search_reranks_by_exact_distance() {
+    let (index, manifest) = rerank_fixture(true);
+    let query = [1.0, 0.0];
+
+    let exact = index.search(&manifest, &query, 2, None).expect("search");
+    assert_hits(&exact, &[(2, 0.0), (0, 0.1)]);
+    assert!((exact[0].similarity - 1.0).abs() < 1e-6);
+
+    // Re-rank off: the ADC ranking, where the first three vectors tie.
+    let adc = index
+      .search(&manifest, &query, 2, Some(rerank_options(Some(0), None)))
+      .expect("search");
+    assert_eq!(adc.len(), 2);
+    assert!(adc
+      .iter()
+      .all(|r| r.node_id <= 2 && (r.distance - 1.0).abs() < 1e-5));
+  }
+
+  #[test]
+  fn test_ivf_pq_threshold_applies_to_reranked_distance() {
+    let (index, manifest) = rerank_fixture(true);
+    let query = [1.0, 0.0];
+    // Euclidean similarity is 1 / (1 + d): only the exact match (d = 0)
+    // clears 0.95; every ADC distance is 1.0 (similarity 0.5) or more.
+    let exact = index
+      .search(&manifest, &query, 3, Some(rerank_options(None, Some(0.95))))
+      .expect("search");
+    assert_hits(&exact, &[(2, 0.0)]);
+    let adc = index
+      .search(
+        &manifest,
+        &query,
+        3,
+        Some(rerank_options(Some(0), Some(0.95))),
+      )
+      .expect("search");
+    assert!(adc.is_empty(), "{:?}", hits(&adc));
+  }
+
+  #[test]
+  fn test_ivf_pq_search_multi_reranks_by_exact_distance() {
+    let (index, manifest) = rerank_fixture(true);
+    let (q1, q2) = ([1.0, 0.0], [1.1, 0.0]);
+    let exact = index
+      .search_multi(&manifest, &[&q1, &q2], 2, MultiQueryAggregation::Avg, None)
+      .expect("search_multi");
+    assert_hits(&exact, &[(2, 0.05), (0, 0.15)]);
+
+    let adc = index
+      .search_multi(
+        &manifest,
+        &[&q1, &q2],
+        2,
+        MultiQueryAggregation::Avg,
+        Some(rerank_options(Some(0), None)),
+      )
+      .expect("search_multi");
+    assert_eq!(adc.len(), 2);
+    assert!(
+      adc.iter().all(|r| (r.distance - 1.05).abs() < 1e-5),
+      "{:?}",
+      hits(&adc)
+    );
+  }
+
+  #[test]
+  fn test_ivf_pq_rerank_keeps_adc_distance_without_stored_vectors() {
+    // A manifest with node mappings only (all IVF-PQ search needed before
+    // the re-rank) still returns hits, at their ADC distances.
+    let (index, manifest) = rerank_fixture(false);
+    let query = [1.0, 0.0];
+    let results = index.search(&manifest, &query, 2, None).expect("search");
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|r| (r.distance - 1.0).abs() < 1e-5));
+    let multi = index
+      .search_multi(&manifest, &[&query], 2, MultiQueryAggregation::Min, None)
+      .expect("search_multi");
+    assert_eq!(multi.len(), 2);
+    assert!(multi.iter().all(|r| (r.distance - 1.0).abs() < 1e-5));
+  }
+
   #[test]
   fn test_ivf_pq_cosine_training_uses_normalized_vectors() {
     let config = IvfPqConfig {
@@ -2373,6 +2668,7 @@ mod tests {
         n_clusters: 1,
         n_probe: 1,
         metric: DistanceMetric::Cosine,
+        seed: None,
       },
       pq: PqConfig {
         num_subspaces: 1,
@@ -2403,6 +2699,7 @@ mod tests {
         n_clusters: 2,
         n_probe: 1,
         metric: DistanceMetric::Euclidean,
+        seed: None,
       },
       pq: PqConfig {
         num_subspaces: 1,
@@ -2443,7 +2740,7 @@ mod tests {
         Some(IvfPqSearchOptions {
           n_probe: Some(2),
           filter: Some(Box::new(|node_id| node_id >= 3)),
-          threshold: None,
+          ..Default::default()
         }),
       )
       .expect("search_multi");
@@ -2457,9 +2754,8 @@ mod tests {
         2,
         MultiQueryAggregation::Min,
         Some(IvfPqSearchOptions {
-          n_probe: None,
           filter: Some(Box::new(|node_id| node_id >= 3)),
-          threshold: None,
+          ..Default::default()
         }),
       )
       .expect("search_multi");
@@ -2477,6 +2773,7 @@ mod tests {
         n_clusters: 2,
         n_probe: 1,
         metric: DistanceMetric::Euclidean,
+        seed: None,
       },
       pq: PqConfig {
         num_subspaces: 2,
@@ -2553,6 +2850,7 @@ mod tests {
         n_clusters: 2,
         n_probe: 1,
         metric: DistanceMetric::Euclidean,
+        seed: None,
       },
       pq: PqConfig {
         num_subspaces: 2,
@@ -2598,6 +2896,7 @@ mod tests {
         n_clusters: 1,
         n_probe: 1,
         metric: DistanceMetric::Euclidean,
+        seed: None,
       },
       pq: PqConfig {
         num_subspaces: 1,
@@ -2620,9 +2919,8 @@ mod tests {
         &[0.0, 0.0],
         1,
         Some(IvfPqSearchOptions {
-          n_probe: None,
           filter: Some(Box::new(|node_id| node_id == 0)),
-          threshold: None,
+          ..Default::default()
         }),
       )
       .expect("search");
@@ -2841,6 +3139,7 @@ mod tests {
         n_clusters: 4,
         n_probe: 2,
         metric: DistanceMetric::Euclidean,
+        seed: None,
       },
       pq: PqConfig {
         num_subspaces: 4,
@@ -2951,6 +3250,7 @@ mod tests {
         n_clusters: 1,
         n_probe: 1,
         metric: DistanceMetric::Euclidean,
+        seed: None,
       },
       pq: PqConfig {
         num_subspaces: 1,

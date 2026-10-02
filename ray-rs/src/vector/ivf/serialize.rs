@@ -247,7 +247,10 @@ pub fn serialize_ivf(index: &IvfIndex) -> Vec<u8> {
   // Inverted lists
   buffer.extend_from_slice(&(index.inverted_lists.len() as u32).to_le_bytes());
 
-  for (&cluster, list) in &index.inverted_lists {
+  // Sorted, so the same index always serializes to the same bytes.
+  let mut lists: Vec<(&usize, &Vec<u64>)> = index.inverted_lists.iter().collect();
+  lists.sort_unstable_by_key(|&(&cluster, _)| cluster);
+  for (&cluster, list) in lists {
     buffer.extend_from_slice(&(cluster as u32).to_le_bytes());
     buffer.extend_from_slice(&(list.len() as u32).to_le_bytes());
     for &vector_id in list {
@@ -316,6 +319,7 @@ pub fn deserialize_ivf(buffer: &[u8]) -> Result<IvfIndex, SerializeError> {
     n_clusters,
     n_probe,
     metric,
+    seed: None,
   };
 
   // Centroid count + Centroids

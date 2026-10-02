@@ -181,6 +181,7 @@ pub fn kitedb(m: &Bound<'_, PyModule>) -> PyResult<()> {
   m.add_function(wrap_pyfunction!(database::create_offline_backup, m)?)?;
   m.add_function(wrap_pyfunction!(version, m)?)?;
   m.add_function(wrap_pyfunction!(vector::brute_force_search, m)?)?;
+  m.add_function(wrap_pyfunction!(vector::resolve_ann_algorithm, m)?)?;
 
   Ok(())
 }

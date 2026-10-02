@@ -574,11 +574,12 @@ function VectorPage() {
 			<RunSource source={VECTOR_SOURCE} />
 
 			<Note>
-				This run used IVF. On 2026-02-08 the default ANN algorithm of{" "}
-				<code>VectorIndex</code> changed to IVF-PQ, and{" "}
-				<code>vector_bench</code> uses the default, so rerunning the command
-				below now measures IVF-PQ. <code>docs/BENCHMARKS.md</code> compares IVF
-				and IVF-PQ recall and latency.
+				This run used IVF. <code>vector_bench</code> uses the default ANN
+				algorithm of <code>VectorIndex</code>, which is now <code>auto</code>:
+				plain IVF below 50,000 vectors or 512 dimensions, IVF-PQ from there on.
+				At 10,000 vectors the command below measures IVF, as this run did.{" "}
+				<code>docs/BENCHMARKS.md</code> compares IVF and IVF-PQ recall and
+				latency.
 			</Note>
 
 			<h2 id="running">Running benchmarks</h2>
