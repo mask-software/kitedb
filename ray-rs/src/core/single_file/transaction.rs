@@ -1902,3 +1902,8 @@ mod tests {
 #[cfg(test)]
 #[path = "w2_commit_durability_tests.rs"]
 mod w2_tests;
+
+/// raydb-b4 engine-concurrency: group commit and background cuts.
+#[cfg(test)]
+#[path = "b4_commit_tests.rs"]
+mod b4_tests;

@@ -857,11 +857,9 @@ fn f5_count_nodes_semantics_guard() {
     assert_eq!(db.count_nodes(), 10, "{context}: delta delete");
 
     if mvcc {
-      // A reader that began before a commit keeps counting its snapshot.
-      // (Creates only: a reader that predates the delete of a snapshot node
-      // already stops seeing that node in every read, not just count_nodes,
-      // because the node's version chain holds only the delete; reported to
-      // the MVCC owners, out of scope here.)
+      // A reader that began before a commit keeps counting its snapshot,
+      // through creates and deletes of snapshot nodes.
+      let n2 = db.node_by_key("n2").expect("n2");
       let (began_tx, began_rx) = mpsc::channel();
       let (go_tx, go_rx) = mpsc::channel::<()>();
       let reader = {
@@ -872,19 +870,26 @@ fn f5_count_nodes_semantics_guard() {
           began_tx.send(()).expect("began");
           go_rx.recv().expect("go");
           let after = db.count_nodes();
+          let sees_n2 = db.node_exists(n2);
           db.commit().expect("reader commit");
-          (before, after)
+          (before, after, sees_n2)
         })
       };
       began_rx.recv().expect("reader began");
       db.begin(false).expect("begin");
       db.create_node(Some("late")).expect("late");
-      db.create_node(None).expect("late anonymous");
+      db.delete_node(n2).expect("delete n2");
+      let n3 = db.node_by_key("n3").expect("n3");
+      db.delete_node(n3).expect("delete n3");
       db.commit().expect("commit");
       go_tx.send(()).expect("go");
-      let (before, after) = reader.join().expect("reader");
+      let (before, after, sees_n2) = reader.join().expect("reader");
+      assert!(
+        sees_n2,
+        "{context}: a reader lost a snapshot node deleted after it began"
+      );
       assert_eq!((before, after), (10, 10), "{context}: reader snapshot");
-      assert_eq!(db.count_nodes(), 12, "{context}: latest");
+      assert_eq!(db.count_nodes(), 9, "{context}: latest");
     }
 
     db.checkpoint().expect("checkpoint");
@@ -1171,7 +1176,11 @@ fn readers_during_vacuum_and_resize(mvcc: bool) {
     .collect();
 
   for round in 0..ROUNDS {
-    let size = if round.is_multiple_of(2) { 2 * MIB } else { MIB };
+    let size = if round.is_multiple_of(2) {
+      2 * MIB
+    } else {
+      MIB
+    };
     match round % 3 {
       0 => db
         .resize_wal(

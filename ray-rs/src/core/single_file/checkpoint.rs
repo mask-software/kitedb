@@ -4868,3 +4868,8 @@ mod final_review_regressions;
 #[cfg(test)]
 #[path = "w2_checkpoint_tests.rs"]
 mod w2_tests;
+
+/// raydb-b4 engine-concurrency: checkpoint-gate fairness (F3).
+#[cfg(test)]
+#[path = "b4_checkpoint_tests.rs"]
+mod b4_tests;
