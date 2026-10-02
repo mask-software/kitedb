@@ -1226,6 +1226,11 @@ impl VersionChainManager {
     self.node_versions.contains_key(&TxKey::Node(node_id))
   }
 
+  /// Whether any node has a version chain.
+  pub fn has_any_node_history(&self) -> bool {
+    !self.node_versions.is_empty()
+  }
+
   /// Whether node `node_id` exists.
   pub fn node_exists_at(
     &self,

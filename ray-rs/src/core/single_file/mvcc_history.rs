@@ -41,28 +41,25 @@ pub(super) struct HistoryPlan {
 }
 
 impl HistoryPlan {
-  /// The plan for the changes `pending` makes to the committed state `delta` over
-  /// `snapshot`, with history `vc`.
+  /// The plan for the changes `pending` makes, with `chains` to tell which of the nodes it
+  /// creates have history; `None` takes none to have it (check with `holds_for`).
   ///
-  /// It holds until the commit's publish, also when worked out before the commit's group is
-  /// written: until then only commits that write one of `pending`'s nodes could make one of
-  /// them committed or give it history (they create or delete it), and those conflict with it
-  /// (MVCC aborts one of the two; bulk loads run alone). GC may drop a chain meanwhile, which
-  /// only makes the publish record a node in full that it could have recorded as fresh.
-  pub(super) fn of(
-    vc: &VersionChainManager,
-    delta: &DeltaState,
-    snapshot: Option<&SnapshotData>,
-    pending: &DeltaState,
-  ) -> Self {
-    let committed = Committed { delta, snapshot };
+  /// A node `pending` creates is fresh unless it has a chain or `pending` deletes it too (a
+  /// recreate, of a node that may be committed). It is not committed otherwise: the
+  /// transaction found its id free, and a commit since that created it would conflict with
+  /// this one (both write the node; bulk loads run alone). For the same reason the plan holds
+  /// until the commit's publish, also when worked out before the commit's group is written:
+  /// only a commit that writes one of `pending`'s nodes could give it a chain meanwhile. GC
+  /// may drop a chain, which only makes the plan record a node in full that it could have
+  /// recorded as fresh.
+  pub(super) fn of(pending: &DeltaState, chains: Option<&VersionChainManager>) -> Self {
     let mut fresh = Vec::new();
     let mut created = Vec::new();
     for &node_id in pending.created_nodes.keys() {
-      if !committed.exists(node_id) && !vc.has_node_history(node_id) {
-        fresh.push(node_id);
-      } else {
+      if pending.is_node_deleted(node_id) || chains.is_some_and(|c| c.has_node_history(node_id)) {
         created.push(node_id);
+      } else {
+        fresh.push(node_id);
       }
     }
     fresh.sort_unstable();
@@ -97,6 +94,16 @@ impl HistoryPlan {
       added_edges,
       changed_edges,
     }
+  }
+
+  /// Whether the plan holds with history `chains`: none of the nodes it takes as fresh has a
+  /// chain (constant time while no node has one).
+  pub(super) fn holds_for(&self, chains: &VersionChainManager) -> bool {
+    !chains.has_any_node_history()
+      || self
+        .fresh_runs
+        .iter()
+        .all(|&(start, end)| (start..end).all(|node_id| !chains.has_node_history(node_id)))
   }
 }
 
@@ -279,25 +286,18 @@ const EARLY_PLAN_MIN_CHANGES: usize = 16;
 
 impl super::SingleFileDB {
   /// The history plan of a commit of `pending` (see `HistoryPlan::of`), worked out by its
-  /// committer before it queues, without any lock a commit group holds: when another
-  /// transaction is open (so the commit records history) and the commit creates enough for
-  /// the plan to matter. `None` leaves the plan to the publish.
+  /// committer before it queues, taking no lock (the publish checks it with
+  /// `HistoryPlan::holds_for`): when another transaction is open (so the commit records
+  /// history) and the commit creates enough for the plan to matter. `None` leaves the plan to
+  /// the publish.
   pub(super) fn plan_history(&self, pending: &DeltaState) -> Option<HistoryPlan> {
-    let mvcc = self.mvcc.as_ref()?;
+    self.mvcc.as_ref()?;
     let changes = pending.created_nodes.len() + pending.out_add.len() + pending.edge_props.len();
-    if changes < EARLY_PLAN_MIN_CHANGES
-      || self
-        .active_transactions
-        .load(std::sync::atomic::Ordering::Acquire)
-        <= 1
-    {
-      return None;
-    }
-    // Lock order: see read.rs.
-    let delta = self.delta.read();
-    let snapshot = self.snapshot.read();
-    let vc = mvcc.version_chain.read();
-    Some(HistoryPlan::of(&vc, &delta, snapshot.as_ref(), pending))
+    let others_open = self
+      .active_transactions
+      .load(std::sync::atomic::Ordering::Acquire)
+      > 1;
+    (changes >= EARLY_PLAN_MIN_CHANGES && others_open).then(|| HistoryPlan::of(pending, None))
   }
 }
 
@@ -755,7 +755,7 @@ mod recorder_tests {
 
   fn record(delta: &DeltaState, pending: &DeltaState) -> VersionChainManager {
     let mut vc = VersionChainManager::new();
-    let plan = HistoryPlan::of(&vc, delta, None, pending);
+    let plan = HistoryPlan::of(pending, Some(&vc));
     record_commit(&mut vc, delta, None, pending, &plan, 5, COMMIT_TS);
     vc
   }

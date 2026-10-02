@@ -954,10 +954,10 @@ impl SingleFileDB {
       hold.get_or_insert_with(|| (self.snapshot.read(), mvcc.history_writer()));
     let snapshot = snapshot.as_ref();
     let pending = &request.pending;
-    let plan = request
-      .history
-      .take()
-      .unwrap_or_else(|| HistoryPlan::of(history.chains(), delta, snapshot, pending));
+    let plan = match request.history.take() {
+      Some(plan) if plan.holds_for(history.chains()) => plan,
+      _ => HistoryPlan::of(pending, Some(history.chains())),
+    };
     history.record(commit_ts, |vc| {
       record_commit(vc, delta, snapshot, pending, &plan, request.txid, commit_ts);
     });
