@@ -52,6 +52,13 @@ export interface PageRequest {
   cursor?: string;
 }
 
+/**
+ * How many schema ids to probe when listing labels or edge types. Database can only name an id,
+ * not list them. Ids start at 1 and may have holes (a rolled-back define burns its id), so probe a
+ * fixed range instead of stopping at the first miss.
+ */
+const MAX_SCHEMA_ID = 1024;
+
 class SizedCache<K, V> {
   private map = new Map<K, V>();
   constructor(private maxSize: number) {}
@@ -84,7 +91,7 @@ class SizedCache<K, V> {
 export class DbService {
   private db: Database | null = null;
   private readOnly = true;
-  private nodeKeyCache = new SizedCache<number, string | null>(5000);
+  private nodeKeyCache = new SizedCache<number, string>(5000);
   private etypeNameCache = new SizedCache<number, string>(2000);
   private propKeyNameCache = new SizedCache<number, string>(5000);
   private labelNameCache = new SizedCache<number, string>(2000);
@@ -122,14 +129,14 @@ export class DbService {
     return this.db.stats();
   }
 
-  getNodeTypes(): string[] {
+  getLabels(): string[] {
     if (!this.db) return [];
-    return this.db.nodeTypes();
+    return probeSchemaNames((id) => this.getLabelName(id));
   }
 
   getEdgeTypes(): string[] {
     if (!this.db) return [];
-    return this.db.edgeTypes();
+    return probeSchemaNames((id) => this.getEtypeName(id));
   }
 
   getNodesPage(req: PageRequest): PageState<number> {
@@ -161,7 +168,8 @@ export class DbService {
     const cached = this.nodeKeyCache.get(nodeId);
     if (cached !== undefined) return cached;
     const key = this.db.getNodeKey(nodeId);
-    this.nodeKeyCache.set(nodeId, key);
+    // Misses aren't cached: a missing node can be created later (by an import, or another writer).
+    if (key !== null) this.nodeKeyCache.set(nodeId, key);
     return key;
   }
 
@@ -194,17 +202,18 @@ export class DbService {
     const key = this.getNodeKey(nodeId);
     const props = this.getNodeProps(nodeId);
     const labels = this.getNodeLabels(nodeId);
+    // getOutEdges/getInEdges give the other endpoint as `nodeId`.
     const outEdges = this.db.getOutEdges(nodeId).map((edge) => ({
-      src: edge.src,
+      src: nodeId,
       etype: edge.etype,
       etypeName: this.getEtypeName(edge.etype) ?? `#${edge.etype}`,
-      dst: edge.dst,
+      dst: edge.nodeId,
     }));
     const inEdges = this.db.getInEdges(nodeId).map((edge) => ({
-      src: edge.src,
+      src: edge.nodeId,
       etype: edge.etype,
       etypeName: this.getEtypeName(edge.etype) ?? `#${edge.etype}`,
-      dst: edge.dst,
+      dst: nodeId,
     }));
 
     return {
@@ -242,7 +251,12 @@ export class DbService {
 
   importJson(path: string) {
     if (!this.db) throw new Error("No database open");
-    return this.db.importFromJson(path);
+    try {
+      return this.db.importFromJson(path);
+    } finally {
+      // Even a failed import may have written some nodes and schema names.
+      this.clearCaches();
+    }
   }
 
   resolveEdgeTypeFilter(filter: string): number | null {
@@ -291,6 +305,15 @@ export class DbService {
     this.propKeyNameCache.clear();
     this.labelNameCache.clear();
   }
+}
+
+function probeSchemaNames(nameOf: (id: number) => string | null): string[] {
+  const names: string[] = [];
+  for (let id = 1; id <= MAX_SCHEMA_ID; id++) {
+    const name = nameOf(id);
+    if (name) names.push(name);
+  }
+  return names;
 }
 
 export function formatPropValue(value: JsPropValue): string {

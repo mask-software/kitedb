@@ -7,7 +7,7 @@ use pyo3::prelude::*;
 // ============================================================================
 
 /// A single result from a traversal
-#[pyclass(name = "TraversalResult")]
+#[pyclass(name = "TraversalResult", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyTraversalResult {
   /// The node ID that was reached
@@ -42,7 +42,7 @@ impl PyTraversalResult {
 // ============================================================================
 
 /// Result of a pathfinding query
-#[pyclass(name = "PathResult")]
+#[pyclass(name = "PathResult", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyPathResult {
   /// Nodes in order from source to target
@@ -82,7 +82,7 @@ impl PyPathResult {
 }
 
 /// An edge in a path result
-#[pyclass(name = "PathEdge")]
+#[pyclass(name = "PathEdge", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyPathEdge {
   #[pyo3(get)]

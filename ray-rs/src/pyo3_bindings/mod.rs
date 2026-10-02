@@ -21,6 +21,8 @@
 #[cfg(feature = "python")]
 pub mod database;
 #[cfg(feature = "python")]
+pub mod errors;
+#[cfg(feature = "python")]
 pub mod helpers;
 #[cfg(feature = "python")]
 pub mod ops;
@@ -52,6 +54,9 @@ use pyo3::prelude::*;
 #[pymodule]
 #[pyo3(name = "_kitedb")]
 pub fn kitedb(m: &Bound<'_, PyModule>) -> PyResult<()> {
+  // Exception hierarchy
+  errors::register(m)?;
+
   // Database class
   m.add_class::<database::PyDatabase>()?;
 
@@ -97,6 +102,8 @@ pub fn kitedb(m: &Bound<'_, PyModule>) -> PyResult<()> {
   m.add_class::<types::EdgeWithProps>()?;
   m.add_class::<types::NodePage>()?;
   m.add_class::<types::EdgePage>()?;
+  m.add_class::<ops::streaming::NodeBatchIterator>()?;
+  m.add_class::<ops::streaming::EdgeBatchIterator>()?;
 
   // Result types from options (ExportResult, ImportResult, BackupResult)
   m.add_class::<options::ExportResult>()?;
@@ -116,6 +123,7 @@ pub fn kitedb(m: &Bound<'_, PyModule>) -> PyResult<()> {
   m.add_class::<vector::PySearchOptions>()?;
   m.add_class::<vector::PySearchResult>()?;
   m.add_class::<vector::PyIvfStats>()?;
+  m.add_class::<vector::PyBruteForceResult>()?;
 
   // Standalone functions
   m.add_function(wrap_pyfunction!(database::open_database, m)?)?;

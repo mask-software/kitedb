@@ -1,6 +1,46 @@
-"""Type stubs for kitedb._kitedb native module."""
+"""Type stubs for the kitedb._kitedb native module.
 
-from typing import Optional, List, Any, Tuple
+python/tests/test_w3_py.py checks these against the compiled module (names,
+parameters and literal defaults), so update both together.
+"""
+
+from typing import Any, Dict, Iterator, List, Optional, Tuple
+
+from typing_extensions import deprecated
+
+# ============================================================================
+# Exceptions
+# ============================================================================
+
+class KiteError(RuntimeError):
+    """Base class for errors raised by KiteDB (a RuntimeError subclass)."""
+
+class ConflictError(KiteError):
+    """A transaction conflicted with a concurrent commit (MVCC); retry it."""
+
+class ReadOnlyError(KiteError):
+    """A write was attempted on a read-only database."""
+
+class NotFoundError(KiteError):
+    """A node, edge or key does not exist."""
+
+class ClosedError(KiteError):
+    """The database handle is closed."""
+
+class TransactionError(KiteError):
+    """No transaction is open on this thread, or one already is."""
+
+class DuplicateKeyError(KiteError):
+    """A node with this key already exists."""
+
+class LockError(KiteError):
+    """The database file lock could not be acquired."""
+
+class CorruptionError(KiteError):
+    """On-disk data failed validation (bad magic, checksum, snapshot or WAL)."""
+
+class WalFullError(KiteError):
+    """The WAL is full; checkpoint before writing more."""
 
 # ============================================================================
 # Core Database Types
@@ -10,8 +50,6 @@ class OpenOptions:
     """Options for opening a database."""
     read_only: Optional[bool]
     create_if_missing: Optional[bool]
-    lock_file: Optional[bool]
-    require_locking: Optional[bool]
     mvcc: Optional[bool]
     mvcc_gc_interval_ms: Optional[int]
     mvcc_retention_ms: Optional[int]
@@ -21,6 +59,8 @@ class OpenOptions:
     auto_checkpoint: Optional[bool]
     checkpoint_threshold: Optional[float]
     background_checkpoint: Optional[bool]
+    checkpoint_compression: Optional[CompressionOptions]
+    # Deprecated: cache_snapshot and the cache_* options have no effect.
     cache_snapshot: Optional[bool]
     cache_enabled: Optional[bool]
     cache_max_node_props: Optional[int]
@@ -28,16 +68,24 @@ class OpenOptions:
     cache_max_traversal_entries: Optional[int]
     cache_max_query_entries: Optional[int]
     cache_query_ttl_ms: Optional[int]
-    sync_mode: Optional["SyncMode"]
+    # sync_mode is constructor-only (not readable back).
+    full_fsync: Optional[bool]
     group_commit_enabled: Optional[bool]
     group_commit_window_ms: Optional[int]
-    
+    snapshot_parse_mode: Optional[SnapshotParseMode]
+    replication_role: Optional[str]
+    replication_sidecar_path: Optional[str]
+    replication_source_db_path: Optional[str]
+    replication_source_sidecar_path: Optional[str]
+    replication_segment_max_bytes: Optional[int]
+    replication_retention_min_entries: Optional[int]
+    replication_retention_min_ms: Optional[int]
+    danger_bypass_file_lock_for_multi_node_simulation: Optional[bool]
+
     def __init__(
         self,
         read_only: Optional[bool] = None,
         create_if_missing: Optional[bool] = None,
-        lock_file: Optional[bool] = None,
-        require_locking: Optional[bool] = None,
         mvcc: Optional[bool] = None,
         mvcc_gc_interval_ms: Optional[int] = None,
         mvcc_retention_ms: Optional[int] = None,
@@ -47,6 +95,8 @@ class OpenOptions:
         auto_checkpoint: Optional[bool] = None,
         checkpoint_threshold: Optional[float] = None,
         background_checkpoint: Optional[bool] = None,
+        checkpoint_compression: Optional[CompressionOptions] = None,
+        # Deprecated: cache_snapshot and the cache_* options have no effect.
         cache_snapshot: Optional[bool] = None,
         cache_enabled: Optional[bool] = None,
         cache_max_node_props: Optional[int] = None,
@@ -54,9 +104,19 @@ class OpenOptions:
         cache_max_traversal_entries: Optional[int] = None,
         cache_max_query_entries: Optional[int] = None,
         cache_query_ttl_ms: Optional[int] = None,
-        sync_mode: Optional["SyncMode"] = None,
+        sync_mode: Optional[SyncMode] = None,
+        full_fsync: Optional[bool] = None,
         group_commit_enabled: Optional[bool] = None,
         group_commit_window_ms: Optional[int] = None,
+        snapshot_parse_mode: Optional[SnapshotParseMode] = None,
+        replication_role: Optional[str] = None,
+        replication_sidecar_path: Optional[str] = None,
+        replication_source_db_path: Optional[str] = None,
+        replication_source_sidecar_path: Optional[str] = None,
+        replication_segment_max_bytes: Optional[int] = None,
+        replication_retention_min_entries: Optional[int] = None,
+        replication_retention_min_ms: Optional[int] = None,
+        danger_bypass_file_lock_for_multi_node_simulation: Optional[bool] = None,
     ) -> None: ...
 
 class SyncMode:
@@ -67,6 +127,42 @@ class SyncMode:
     def normal() -> SyncMode: ...
     @staticmethod
     def off() -> SyncMode: ...
+
+class SnapshotParseMode:
+    """How snapshot parse errors are handled on open."""
+    @staticmethod
+    def strict() -> SnapshotParseMode: ...
+    @staticmethod
+    def salvage() -> SnapshotParseMode: ...
+
+class CompressionOptions:
+    """Snapshot compression settings."""
+    enabled: Optional[bool]
+    compression_type: Optional[str]
+    min_size: Optional[int]
+    level: Optional[int]
+    def __init__(
+        self,
+        enabled: Optional[bool] = None,
+        compression_type: Optional[str] = None,
+        min_size: Optional[int] = None,
+        level: Optional[int] = None,
+    ) -> None: ...
+
+class SingleFileOptimizeOptions:
+    """Options for Database.optimize()."""
+    compression: Optional[CompressionOptions]
+    def __init__(self, compression: Optional[CompressionOptions] = None) -> None: ...
+
+class VacuumOptions:
+    """Vacuum options."""
+    shrink_wal: Optional[bool]
+    min_wal_size: Optional[int]
+    def __init__(
+        self,
+        shrink_wal: Optional[bool] = None,
+        min_wal_size: Optional[int] = None,
+    ) -> None: ...
 
 class RuntimeProfile:
     """Preset profile for open/close behavior."""
@@ -87,6 +183,8 @@ class DbStats:
     wal_bytes: int
     recommend_compact: bool
     mvcc_stats: Optional[MvccStats]
+    def node_count(self) -> int: ...
+    def edge_count(self) -> int: ...
 
 class MvccStats:
     """MVCC stats."""
@@ -103,9 +201,21 @@ class CheckResult:
     valid: bool
     errors: List[str]
     warnings: List[str]
+    def __init__(
+        self,
+        valid: bool,
+        errors: Optional[List[str]] = None,
+        warnings: Optional[List[str]] = None,
+    ) -> None: ...
+    def is_valid(self) -> bool: ...
+    def has_warnings(self) -> bool: ...
+    def error_count(self) -> int: ...
+    def warning_count(self) -> int: ...
+    def __bool__(self) -> bool: ...
 
+@deprecated("The cache layer was removed; Database.cache_stats() always returns None.")
 class CacheStats:
-    """Cache statistics."""
+    """Deprecated: the cache layer was removed."""
     property_cache_hits: int
     property_cache_misses: int
     property_cache_size: int
@@ -115,6 +225,9 @@ class CacheStats:
     query_cache_hits: int
     query_cache_misses: int
     query_cache_size: int
+    def property_hit_rate(self) -> float: ...
+    def traversal_hit_rate(self) -> float: ...
+    def query_hit_rate(self) -> float: ...
 
 class ExportOptions:
     """Options for export."""
@@ -144,12 +257,14 @@ class ExportResult:
     """Export result."""
     node_count: int
     edge_count: int
+    def __init__(self, node_count: int, edge_count: int) -> None: ...
 
 class ImportResult:
     """Import result."""
     node_count: int
     edge_count: int
     skipped: int
+    def __init__(self, node_count: int, edge_count: int, skipped: int) -> None: ...
 
 class StreamOptions:
     """Options for streaming node/edge batches."""
@@ -167,6 +282,7 @@ class NodeWithProps:
     id: int
     key: Optional[str]
     props: List[NodeProp]
+    def __init__(self, id: int, key: Optional[str] = None, props: List[NodeProp] = ...) -> None: ...
 
 class EdgeWithProps:
     """Edge entry with properties."""
@@ -174,6 +290,26 @@ class EdgeWithProps:
     etype: int
     dst: int
     props: List[NodeProp]
+    def __init__(self, src: int, etype: int, dst: int, props: List[NodeProp]) -> None: ...
+
+class NodeBatchIterator(Iterator[List[Any]]):
+    """Lazy iterator over node batches, from Database.stream_nodes*.
+
+    Yields lists of node ids (stream_nodes) or NodeWithProps
+    (stream_nodes_with_props). Node ids are listed once when the stream
+    starts; each batch is built on demand.
+    """
+    def __iter__(self) -> NodeBatchIterator: ...
+    def __next__(self) -> List[Any]: ...
+
+class EdgeBatchIterator(Iterator[List[Any]]):
+    """Lazy iterator over edge batches, from Database.stream_edges*.
+
+    Yields lists of FullEdge (stream_edges) or EdgeWithProps
+    (stream_edges_with_props).
+    """
+    def __iter__(self) -> EdgeBatchIterator: ...
+    def __next__(self) -> List[Any]: ...
 
 class NodePage:
     """Page of node IDs."""
@@ -181,6 +317,15 @@ class NodePage:
     next_cursor: Optional[str]
     has_more: bool
     total: Optional[int]
+    def __init__(
+        self,
+        items: List[int],
+        next_cursor: Optional[str] = None,
+        has_more: bool = False,
+        total: Optional[int] = None,
+    ) -> None: ...
+    def __len__(self) -> int: ...
+    def __iter__(self) -> Iterator[int]: ...
 
 class EdgePage:
     """Page of edges."""
@@ -188,9 +333,18 @@ class EdgePage:
     next_cursor: Optional[str]
     has_more: bool
     total: Optional[int]
+    def __init__(
+        self,
+        items: List[FullEdge],
+        next_cursor: Optional[str] = None,
+        has_more: bool = False,
+        total: Optional[int] = None,
+    ) -> None: ...
+    def __len__(self) -> int: ...
 
+@deprecated("The cache layer was removed; every field is zero.")
 class CacheLayerMetrics:
-    """Cache layer metrics."""
+    """Deprecated: the cache layer was removed; every field is zero."""
     hits: int
     misses: int
     hit_rate: float
@@ -198,8 +352,9 @@ class CacheLayerMetrics:
     max_size: int
     utilization_percent: float
 
+@deprecated("The cache layer was removed; enabled is False and every count is zero.")
 class CacheMetrics:
-    """Cache metrics."""
+    """Deprecated: the cache layer was removed; enabled is False and every count is zero."""
     enabled: bool
     property_cache: CacheLayerMetrics
     traversal_cache: CacheLayerMetrics
@@ -229,12 +384,44 @@ class MvccMetrics:
     committed_writes_size: int
     committed_writes_pruned: int
 
+class PrimaryReplicationMetrics:
+    """Primary-side replication metrics."""
+    epoch: int
+    head_log_index: int
+    retained_floor: int
+    replica_count: int
+    stale_epoch_replica_count: int
+    max_replica_lag: int
+    min_replica_applied_log_index: Optional[int]
+    sidecar_path: str
+    last_token: Optional[str]
+    last_replication_error: Optional[str]
+    sidecar_needs_repair: bool
+    append_attempts: int
+    append_failures: int
+    append_successes: int
+
+class ReplicaReplicationMetrics:
+    """Replica-side replication metrics."""
+    applied_epoch: int
+    applied_log_index: int
+    needs_reseed: bool
+    last_error: Optional[str]
+
+class ReplicationMetrics:
+    """Replication metrics."""
+    enabled: bool
+    role: str
+    primary: Optional[PrimaryReplicationMetrics]
+    replica: Optional[ReplicaReplicationMetrics]
+
 class MemoryMetrics:
     """Memory metrics."""
     delta_estimate_bytes: int
-    cache_estimate_bytes: int
+    cache_estimate_bytes: int  # Deprecated: always 0 (the cache layer was removed).
     snapshot_bytes: int
     total_estimate_bytes: int
+    def human_readable(self) -> str: ...
 
 class DatabaseMetrics:
     """Database metrics."""
@@ -242,8 +429,9 @@ class DatabaseMetrics:
     is_single_file: bool
     read_only: bool
     data: DataMetrics
-    cache: CacheMetrics
+    cache: CacheMetrics  # Deprecated: a disabled, empty cache (the cache layer was removed).
     mvcc: Optional[MvccMetrics]
+    replication: ReplicationMetrics
     memory: MemoryMetrics
     collected_at: int
 
@@ -252,11 +440,16 @@ class HealthCheckEntry:
     name: str
     passed: bool
     message: str
+    def __bool__(self) -> bool: ...
 
 class HealthCheckResult:
     """Health check result."""
     healthy: bool
     checks: List[HealthCheckEntry]
+    def passed_count(self) -> int: ...
+    def failed_count(self) -> int: ...
+    def failed_checks(self) -> List[HealthCheckEntry]: ...
+    def __bool__(self) -> bool: ...
 
 class BackupOptions:
     """Options for creating a backup."""
@@ -308,17 +501,20 @@ class Edge:
     """Edge representation (neighbor style)."""
     etype: int
     node_id: int
+    def __init__(self, etype: int, node_id: int) -> None: ...
 
 class FullEdge:
     """Full edge representation."""
     src: int
     etype: int
     dst: int
+    def __init__(self, src: int, etype: int, dst: int) -> None: ...
 
 class NodeProp:
     """Node property key-value pair."""
     key_id: int
     value: PropValue
+    def __init__(self, key_id: int, value: PropValue) -> None: ...
 
 # ============================================================================
 # Traversal Result Types
@@ -353,27 +549,58 @@ class PathEdge:
 # ============================================================================
 
 class Database:
-    """Single-file graph database."""
-    
+    """Single-file graph database.
+
+    Failed operations raise KiteError subclasses; invalid arguments raise
+    ValueError.
+    """
+
     is_open: bool
     path: str
     read_only: bool
-    
+
     def __init__(self, path: str, options: Optional[OpenOptions] = None) -> None: ...
     @staticmethod
     def open(path: str, options: Optional[OpenOptions] = None) -> Database: ...
     def close(self) -> None: ...
     def close_with_checkpoint_if_wal_over(self, threshold: float) -> None: ...
     def __enter__(self) -> Database: ...
-    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> bool: ...
-    
-    # Transaction methods
+    def __exit__(
+        self,
+        _exc_type: Any = None,
+        _exc_value: Any = None,
+        _traceback: Any = None,
+    ) -> bool: ...
+
+    # Transactions
     def begin(self, read_only: Optional[bool] = None) -> int: ...
     def begin_bulk(self) -> int: ...
     def commit(self) -> None: ...
+    def commit_with_token(self) -> Optional[str]: ...
+    def wait_for_token(self, token: str, timeout_ms: int) -> bool: ...
     def rollback(self) -> None: ...
     def has_transaction(self) -> bool: ...
-    
+
+    # Replication
+    def primary_replication_status(self) -> Optional[Dict[str, Any]]: ...
+    def replica_replication_status(self) -> Optional[Dict[str, Any]]: ...
+    def primary_promote_to_next_epoch(self) -> int: ...
+    def primary_report_replica_progress(
+        self, replica_id: str, epoch: int, applied_log_index: int
+    ) -> None: ...
+    def primary_run_retention(self) -> Tuple[int, int]: ...
+    def export_replication_snapshot_transport_json(self, include_data: bool = False) -> str: ...
+    def export_replication_log_transport_json(
+        self,
+        cursor: Optional[str] = None,
+        max_frames: int = 128,
+        max_bytes: int = 1048576,
+        include_payload: bool = True,
+    ) -> str: ...
+    def replica_bootstrap_from_snapshot(self) -> None: ...
+    def replica_catch_up_once(self, max_frames: int) -> int: ...
+    def replica_reseed_from_snapshot(self) -> None: ...
+
     # Node operations
     def create_node(self, key: Optional[str] = None) -> int: ...
     def delete_node(self, node_id: int) -> None: ...
@@ -384,29 +611,35 @@ class Database:
     def count_nodes(self) -> int: ...
     def list_nodes_with_prefix(self, prefix: str) -> List[int]: ...
     def count_nodes_with_prefix(self, prefix: str) -> int: ...
-    def batch_create_nodes(self, nodes: List[Tuple[str, List[Tuple[int, PropValue]]]]) -> List[int]: ...
+    def batch_create_nodes(
+        self,
+        input_nodes: List[Tuple[str, List[Tuple[int, PropValue]]]],
+        labels: Optional[List[int]] = None,
+    ) -> List[int]: ...
     def create_nodes_batch(self, keys: List[Optional[str]]) -> List[int]: ...
     def upsert_node(self, key: str, props: List[Tuple[int, Optional[PropValue]]]) -> int: ...
     def upsert_node_by_id(self, node_id: int, props: List[Tuple[int, Optional[PropValue]]]) -> int: ...
-    
+
     # Edge operations
     def add_edge(self, src: int, etype: int, dst: int) -> None: ...
     def add_edges_batch(self, edges: List[Tuple[int, int, int]]) -> None: ...
-    def add_edges_with_props_batch(self, edges: List[Tuple[int, int, int, List[Tuple[int, PropValue]]]]) -> None: ...
+    def add_edges_with_props_batch(
+        self, edges: List[Tuple[int, int, int, List[Tuple[int, PropValue]]]]
+    ) -> None: ...
     def add_edge_by_name(self, src: int, etype_name: str, dst: int) -> None: ...
     def delete_edge(self, src: int, etype: int, dst: int) -> None: ...
-    def upsert_edge(self, src: int, etype: int, dst: int, props: List[Tuple[int, Optional[PropValue]]]) -> bool: ...
+    def upsert_edge(
+        self, src: int, etype: int, dst: int, props: List[Tuple[int, Optional[PropValue]]]
+    ) -> bool: ...
     def edge_exists(self, src: int, etype: int, dst: int) -> bool: ...
     def get_out_edges(self, node_id: int) -> List[Edge]: ...
     def get_in_edges(self, node_id: int) -> List[Edge]: ...
     def get_out_degree(self, node_id: int) -> int: ...
     def get_in_degree(self, node_id: int) -> int: ...
     def count_edges(self) -> int: ...
-    def list_edges(self, etype: Optional[int] = None) -> List[FullEdge]: ...
-    def list_edges_by_name(self, etype_name: str) -> List[FullEdge]: ...
     def count_edges_by_type(self, etype: int) -> int: ...
-    def count_edges_by_name(self, etype_name: str) -> int: ...
-    
+    def list_edges(self, etype: Optional[int] = None) -> List[FullEdge]: ...
+
     # Property operations
     def set_node_prop(self, node_id: int, key_id: int, value: PropValue) -> None: ...
     def set_node_prop_by_name(self, node_id: int, key_name: str, value: PropValue) -> None: ...
@@ -416,25 +649,23 @@ class Database:
     def get_node_prop_int(self, node_id: int, key_id: int) -> Optional[int]: ...
     def get_node_prop_float(self, node_id: int, key_id: int) -> Optional[float]: ...
     def get_node_prop_bool(self, node_id: int, key_id: int) -> Optional[bool]: ...
-    def set_node_prop_string(self, node_id: int, key_id: int, value: str) -> None: ...
-    def set_node_prop_int(self, node_id: int, key_id: int, value: int) -> None: ...
-    def set_node_prop_float(self, node_id: int, key_id: int, value: float) -> None: ...
-    def set_node_prop_bool(self, node_id: int, key_id: int, value: bool) -> None: ...
     def get_node_props(self, node_id: int) -> Optional[List[NodeProp]]: ...
-    
+
     # Edge property operations
     def set_edge_prop(self, src: int, etype: int, dst: int, key_id: int, value: PropValue) -> None: ...
-    def set_edge_prop_by_name(self, src: int, etype: int, dst: int, key_name: str, value: PropValue) -> None: ...
+    def set_edge_prop_by_name(
+        self, src: int, etype: int, dst: int, key_name: str, value: PropValue
+    ) -> None: ...
     def delete_edge_prop(self, src: int, etype: int, dst: int, key_id: int) -> None: ...
     def get_edge_prop(self, src: int, etype: int, dst: int, key_id: int) -> Optional[PropValue]: ...
     def get_edge_props(self, src: int, etype: int, dst: int) -> Optional[List[NodeProp]]: ...
-    
+
     # Vector operations
     def set_node_vector(self, node_id: int, prop_key_id: int, vector: List[float]) -> None: ...
     def get_node_vector(self, node_id: int, prop_key_id: int) -> Optional[List[float]]: ...
     def delete_node_vector(self, node_id: int, prop_key_id: int) -> None: ...
     def has_node_vector(self, node_id: int, prop_key_id: int) -> bool: ...
-    
+
     # Schema operations
     def get_or_create_label(self, name: str) -> int: ...
     def get_label_id(self, name: str) -> Optional[int]: ...
@@ -445,7 +676,7 @@ class Database:
     def get_or_create_propkey(self, name: str) -> int: ...
     def get_propkey_id(self, name: str) -> Optional[int]: ...
     def get_propkey_name(self, id: int) -> Optional[str]: ...
-    
+
     # Label operations
     def define_label(self, name: str) -> int: ...
     def add_node_label(self, node_id: int, label_id: int) -> None: ...
@@ -453,49 +684,63 @@ class Database:
     def remove_node_label(self, node_id: int, label_id: int) -> None: ...
     def node_has_label(self, node_id: int, label_id: int) -> bool: ...
     def get_node_labels(self, node_id: int) -> List[int]: ...
-    
+
     # Maintenance
     def checkpoint(self) -> None: ...
     def background_checkpoint(self) -> None: ...
-    def should_checkpoint(self, threshold: Optional[float] = None) -> bool: ...
-    def optimize(self) -> None: ...
+    def should_checkpoint(self, threshold: float = 0.5) -> bool: ...
+    def optimize(self, options: Optional[SingleFileOptimizeOptions] = None) -> None: ...
+    def vacuum(self, shrink_wal: bool = True, min_wal_size: Optional[int] = None) -> None: ...
     def stats(self) -> DbStats: ...
     def check(self) -> CheckResult: ...
 
     # Export / Import
-    def export_to_object(self, options: Optional[ExportOptions] = None) -> Any: ...
     def export_to_json(self, path: str, options: Optional[ExportOptions] = None) -> ExportResult: ...
     def export_to_jsonl(self, path: str, options: Optional[ExportOptions] = None) -> ExportResult: ...
-    def import_from_object(self, data: Any, options: Optional[ImportOptions] = None) -> ImportResult: ...
     def import_from_json(self, path: str, options: Optional[ImportOptions] = None) -> ImportResult: ...
 
     # Streaming / Pagination
-    def stream_nodes(self, options: Optional[StreamOptions] = None) -> List[List[int]]: ...
-    def stream_nodes_with_props(self, options: Optional[StreamOptions] = None) -> List[List[NodeWithProps]]: ...
-    def stream_edges(self, options: Optional[StreamOptions] = None) -> List[List[FullEdge]]: ...
-    def stream_edges_with_props(self, options: Optional[StreamOptions] = None) -> List[List[EdgeWithProps]]: ...
+    def stream_nodes(self, options: Optional[StreamOptions] = None) -> NodeBatchIterator: ...
+    def stream_nodes_with_props(self, options: Optional[StreamOptions] = None) -> NodeBatchIterator: ...
+    def stream_edges(self, options: Optional[StreamOptions] = None) -> EdgeBatchIterator: ...
+    def stream_edges_with_props(self, options: Optional[StreamOptions] = None) -> EdgeBatchIterator: ...
     def get_nodes_page(self, options: Optional[PaginationOptions] = None) -> NodePage: ...
     def get_edges_page(self, options: Optional[PaginationOptions] = None) -> EdgePage: ...
-    
-    # Cache operations
+
+    # Cache operations: deprecated no-ops (the cache layer was removed)
+    @deprecated("No effect: the cache layer was removed. Always returns False.")
     def cache_is_enabled(self) -> bool: ...
+    @deprecated("No effect: the cache layer was removed.")
     def cache_invalidate_node(self, node_id: int) -> None: ...
+    @deprecated("No effect: the cache layer was removed.")
     def cache_invalidate_edge(self, src: int, etype: int, dst: int) -> None: ...
+    @deprecated("No effect: the cache layer was removed.")
     def cache_invalidate_key(self, key: str) -> None: ...
+    @deprecated("No effect: the cache layer was removed.")
     def cache_clear(self) -> None: ...
+    @deprecated("No effect: the cache layer was removed.")
     def cache_clear_query(self) -> None: ...
+    @deprecated("No effect: the cache layer was removed.")
     def cache_clear_key(self) -> None: ...
+    @deprecated("No effect: the cache layer was removed.")
     def cache_clear_property(self) -> None: ...
+    @deprecated("No effect: the cache layer was removed.")
     def cache_clear_traversal(self) -> None: ...
+    @deprecated("No effect: the cache layer was removed. Always returns None.")
     def cache_stats(self) -> Optional[CacheStats]: ...
+    @deprecated("No effect: the cache layer was removed.")
     def cache_reset_stats(self) -> None: ...
-    
-    # Graph Traversal
+
+    # Graph traversal (direction: "out", "in" or "both"; others raise ValueError)
     def traverse_out(self, node_id: int, etype: Optional[int] = None) -> List[int]: ...
-    def traverse_out_with_keys(self, node_id: int, etype: Optional[int] = None) -> List[Tuple[int, Optional[str]]]: ...
+    def traverse_out_with_keys(
+        self, node_id: int, etype: Optional[int] = None
+    ) -> List[Tuple[int, Optional[str]]]: ...
     def traverse_out_count(self, node_id: int, etype: Optional[int] = None) -> int: ...
     def traverse_in(self, node_id: int, etype: Optional[int] = None) -> List[int]: ...
-    def traverse_in_with_keys(self, node_id: int, etype: Optional[int] = None) -> List[Tuple[int, Optional[str]]]: ...
+    def traverse_in_with_keys(
+        self, node_id: int, etype: Optional[int] = None
+    ) -> List[Tuple[int, Optional[str]]]: ...
     def traverse_in_count(self, node_id: int, etype: Optional[int] = None) -> int: ...
     def traverse(
         self,
@@ -506,9 +751,11 @@ class Database:
         direction: Optional[str] = None,
         unique: Optional[bool] = None,
     ) -> List[TraversalResult]: ...
-    def traverse_multi(self, start_ids: List[int], steps: List[Tuple[str, Optional[int]]]) -> List[Tuple[int, Optional[str]]]: ...
+    def traverse_multi(
+        self, start_ids: List[int], steps: List[Tuple[str, Optional[int]]]
+    ) -> List[Tuple[int, Optional[str]]]: ...
     def traverse_multi_count(self, start_ids: List[int], steps: List[Tuple[str, Optional[int]]]) -> int: ...
-    
+
     # Pathfinding
     def find_path_bfs(
         self,
@@ -532,6 +779,7 @@ class Database:
         target: int,
         etype: Optional[int] = None,
         max_depth: Optional[int] = None,
+        direction: Optional[str] = None,
     ) -> bool: ...
     def reachable_nodes(
         self,
@@ -658,7 +906,7 @@ def push_replication_metrics_otel_protobuf(
 def health_check(db: Database) -> HealthCheckResult: ...
 def create_backup(db: Database, backup_path: str, options: Optional[BackupOptions] = None) -> BackupResult: ...
 def restore_backup(backup_path: str, restore_path: str, options: Optional[RestoreOptions] = None) -> str: ...
-def get_backup_info(backup_path: str) -> BackupResult: ...
+def backup_info(backup_path: str) -> BackupResult: ...
 def create_offline_backup(
     db_path: str,
     backup_path: str,

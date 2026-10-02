@@ -110,7 +110,7 @@ const RECORD_HEADER: ByteField[] = [
 
 const RECORD_BODY: ByteField[] = [
 	{ name: "Payload", size: "variable", grow: "sm:grow-[14]", tone: "payload" },
-	{ name: "CRC32C", size: "4 B", grow: "sm:grow-[4]" },
+	{ name: "CRC-32", size: "4 B", grow: "sm:grow-[4]" },
 	{ name: "Padding", size: "0–7 B", grow: "sm:grow-[4]", tone: "padding" },
 ];
 
@@ -149,8 +149,11 @@ function WALRecordFormat() {
 				<ByteRow label="body" fields={RECORD_BODY} />
 			</div>
 			<p class="mt-3 text-[13px] text-slate-500">
-				The CRC32C covers everything from Type through the end of the payload.
-				Padding brings each record to an 8-byte boundary.
+				The CRC-32 covers everything from Type through the end of the payload,
+				and is XORed with the salt of the WAL region the record is in. A region
+				gets a new salt whenever a checkpoint empties it for reuse, so records
+				an earlier cycle left behind fail the check. Padding brings each record
+				to an 8-byte boundary.
 			</p>
 
 			<div class="mt-5 border-t border-kite-line pt-4">
@@ -311,7 +314,8 @@ const SYNC_MODES: {
 		accent: "mint",
 		badge: "default",
 		summary: "fsync on every commit",
-		tradeoff: "Safest; slowest writes",
+		tradeoff:
+			"Safest; slowest writes. On macOS, fsync leaves writes in the drive's cache, so commits survive power loss only with fullFsync (F_FULLFSYNC, milliseconds per commit), as with SQLite",
 	},
 	{
 		name: "Normal",
@@ -379,8 +383,8 @@ function RecoveryProcess() {
 		},
 		{ text: "Scan records from tail to head", accent: "cyan" },
 		{
-			text: "Validate each record's CRC32C",
-			sub: "An invalid record ends the scan (incomplete write)",
+			text: "Validate each record's CRC-32",
+			sub: "An invalid record ends the scan: an incomplete write, or a record of an earlier WAL cycle (its salt differs)",
 			accent: "violet",
 		},
 		{

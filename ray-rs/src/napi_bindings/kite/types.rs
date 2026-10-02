@@ -107,4 +107,9 @@ pub struct JsKiteOptions {
   pub replication_retention_min_entries: Option<i64>,
   /// Minimum retained segment age in milliseconds (0 imposes no age floor)
   pub replication_retention_min_ms: Option<i64>,
+  /// Enforce node schemas on writes (default: false). Creating a node fails if a required prop
+  /// (any prop not marked optional) is missing or null, and every node write fails if a
+  /// declared prop's value does not match its type (int<->float only when lossless). Props
+  /// outside the schema are kept, and declared defaults are applied on create in both modes.
+  pub strict_schema: Option<bool>,
 }

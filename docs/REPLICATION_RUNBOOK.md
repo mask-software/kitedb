@@ -89,8 +89,11 @@ Metrics surface:
   - Node NAPI: `collectReplicationSnapshotTransportJson(db, includeData?)`,
     `collectReplicationLogTransportJson(db, cursor?, maxFrames?, maxBytes?, includePayload?)`
   - TypeScript adapter helper: `createReplicationTransportAdapter(db)` in `ray-rs/ts/replication_transport.ts`
-  - TypeScript admin auth helper: `createReplicationAdminAuthorizer({ mode, token, mtlsHeader, mtlsSubjectRegex, mtlsMatcher? })`
-    for `none|token|mtls|token_or_mtls|token_and_mtls` with optional native TLS verifier hook (`mtlsMatcher`).
+  - TypeScript admin auth helper: `createReplicationAdminAuthorizer({ mode, token, mtlsMatcher?, trustForwardedClientCert?, mtlsHeader?, mtlsSubjectRegex? })`
+    for `none|token|mtls|token_or_mtls|token_and_mtls`. `mode` is required (`'none'` disables auth explicitly) and
+    tokens are compared in constant time. The mTLS modes need a native TLS verifier hook (`mtlsMatcher`), or
+    `trustForwardedClientCert: true` with `mtlsSubjectRegex`, which must match the whole `mtlsHeader` value; trust
+    the header only behind a proxy that verifies client certificates and overwrites it on every request.
   - TypeScript native TLS matcher helper: `createNodeTlsMtlsMatcher({ requirePeerCertificate? })`
     and probe helper `isNodeTlsClientAuthorized(request, options?)` for common Node request socket shapes
     (`request.socket`, `request.client`, `request.raw.socket`, `request.req.socket`).
@@ -261,7 +264,7 @@ Playground curl examples:
 - `curl -X POST -H "Authorization: Bearer $REPLICATION_ADMIN_TOKEN" -H "Content-Type: application/json" -d '{"maxFrames":256}' "$BASE/api/replication/pull"`
 - `curl -X POST -H "Authorization: Bearer $REPLICATION_ADMIN_TOKEN" "$BASE/api/replication/reseed"`
 - `curl -X POST -H "Authorization: Bearer $REPLICATION_ADMIN_TOKEN" "$BASE/api/replication/promote"`
-- `curl -H "x-client-cert: CN=allowed-client,O=RayDB" "$BASE/api/replication/metrics"` (when `REPLICATION_ADMIN_AUTH_MODE=mtls`)
+- `curl -H "x-client-cert: CN=allowed-client,O=KiteDB" "$BASE/api/replication/metrics"` (when `REPLICATION_ADMIN_AUTH_MODE=mtls`)
 
 ## 9. Known V1 Limits
 

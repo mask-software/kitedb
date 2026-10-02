@@ -5,7 +5,6 @@
 use std::collections::HashMap;
 
 use crate::constants::*;
-use crate::core::delta::snapshot_has_edge;
 use crate::core::pager::FilePager;
 use crate::core::snapshot::reader::SnapshotData;
 use crate::core::wal::record::{
@@ -18,15 +17,18 @@ use crate::core::wal::record::{
   parse_set_edge_props_payload, parse_set_node_prop_payload, parse_set_node_vector_payload,
   ParsedWalRecord,
 };
-use crate::error::Result;
+use crate::error::{KiteError, Result};
 use crate::types::*;
 
-/// Scan WAL records from the WAL area (linear)
+/// Scan WAL records from the WAL area (linear), from the tail up to the
+/// first record that does not parse with its region's salt or does not end by
+/// the head.
 pub(crate) fn scan_wal_records(
   pager: &mut FilePager,
   header: &DbHeaderV1,
 ) -> Result<Vec<ParsedWalRecord>> {
-  use crate::core::wal::record::parse_wal_record;
+  use crate::core::wal::buffer::header_salt_at;
+  use crate::core::wal::record::parse_wal_record_with_salt;
 
   let mut records = Vec::new();
   let wal_size = header.wal_page_count * header.page_size as u64;
@@ -35,12 +37,12 @@ pub(crate) fn scan_wal_records(
   let head = header.wal_head;
 
   if head < pos {
-    return Err(crate::error::KiteError::InvalidWal(
+    return Err(KiteError::InvalidWal(
       "WAL head cannot be behind tail in linear mode".to_string(),
     ));
   }
   if head > wal_size {
-    return Err(crate::error::KiteError::InvalidWal(
+    return Err(KiteError::InvalidWal(
       "WAL head exceeds WAL size".to_string(),
     ));
   }
@@ -51,8 +53,10 @@ pub(crate) fn scan_wal_records(
   }
 
   // Read the WAL area into memory for scanning
-  // This is simpler than page-by-page reading for now
-  let wal_data = read_wal_area(pager, header)?;
+  // This is simpler than page-by-page reading for now. Records end by the
+  // head: bytes past it belong to no record the header names.
+  let mut wal_data = read_wal_area(pager, header)?;
+  wal_data.truncate(head as usize);
 
   while pos < head {
     let actual_pos = pos;
@@ -78,7 +82,8 @@ pub(crate) fn scan_wal_records(
     }
 
     // Parse the record
-    if let Some(record) = parse_wal_record(&wal_data, offset) {
+    if let Some(record) = parse_wal_record_with_salt(&wal_data, offset, header_salt_at(header, pos))
+    {
       let aligned_size = crate::util::binary::align_up(rec_len, WAL_RECORD_ALIGNMENT);
       pos = actual_pos + aligned_size as u64;
       records.push(record);
@@ -112,7 +117,14 @@ pub(crate) fn committed_transactions(
   extract_committed_transactions_in_order(wal_records)
 }
 
-/// Replay a single WAL record into delta and update allocators/schema
+/// Replay a single WAL record into delta and update allocators/schema.
+///
+/// Returns whether replay applied it: `false` for the vector maintenance
+/// record types (`BatchVectors`, `SealFragment`, `CompactFragments`), which
+/// no version writes and replay skips. Fails with `InvalidWal` on a record
+/// whose payload does not parse: its CRC checked, so it is not torn by a
+/// crash but written by a buggy or incompatible version, and skipping it
+/// would silently drop part of a committed transaction.
 #[allow(clippy::too_many_arguments)]
 pub fn replay_wal_record(
   record: &ParsedWalRecord,
@@ -128,57 +140,49 @@ pub fn replay_wal_record(
   etype_ids: &mut HashMap<ETypeId, String>,
   propkey_names: &mut HashMap<String, PropKeyId>,
   propkey_ids: &mut HashMap<PropKeyId, String>,
-) {
+) -> Result<bool> {
   match record.record_type {
     WalRecordType::CreateNode => {
-      if let Some(data) = parse_create_node_payload(&record.payload) {
-        if let Some(snap) = snapshot {
-          if snap.phys_node(data.node_id).is_none() {
-            delta.create_node(data.node_id, data.key.as_deref());
-          }
-        } else {
-          delta.create_node(data.node_id, data.key.as_deref());
-        }
+      let data = payload(record, parse_create_node_payload(&record.payload))?;
+      replay_create_node(snapshot, delta, data.node_id, data.key.as_deref());
+      if data.node_id >= *next_node_id {
+        *next_node_id = data.node_id.saturating_add(1);
+      }
+    }
+    WalRecordType::CreateNodesBatch => {
+      let nodes = payload(record, parse_create_nodes_batch_payload(&record.payload))?;
+      for data in nodes {
+        replay_create_node(snapshot, delta, data.node_id, data.key.as_deref());
         if data.node_id >= *next_node_id {
           *next_node_id = data.node_id.saturating_add(1);
         }
       }
     }
-    WalRecordType::CreateNodesBatch => {
-      if let Some(nodes) = parse_create_nodes_batch_payload(&record.payload) {
-        for data in nodes {
-          if let Some(snap) = snapshot {
-            if snap.phys_node(data.node_id).is_none() {
-              delta.create_node(data.node_id, data.key.as_deref());
-            }
-          } else {
-            delta.create_node(data.node_id, data.key.as_deref());
-          }
-          if data.node_id >= *next_node_id {
-            *next_node_id = data.node_id.saturating_add(1);
-          }
-        }
-      }
-    }
     WalRecordType::DeleteNode => {
-      if let Some(data) = parse_delete_node_payload(&record.payload) {
-        delta.delete_node(data.node_id);
-      }
+      let data = payload(record, parse_delete_node_payload(&record.payload))?;
+      delta.delete_node(data.node_id);
     }
     WalRecordType::AddEdge => {
-      if let Some(data) = parse_add_edge_payload(&record.payload) {
+      let data = payload(record, parse_add_edge_payload(&record.payload))?;
+      replay_add_edge(snapshot, delta, data.src, data.etype, data.dst);
+    }
+    WalRecordType::AddEdgesBatch => {
+      let edges = payload(record, parse_add_edges_batch_payload(&record.payload))?;
+      for data in edges {
         replay_add_edge(snapshot, delta, data.src, data.etype, data.dst);
       }
     }
-    WalRecordType::AddEdgesBatch => {
-      if let Some(edges) = parse_add_edges_batch_payload(&record.payload) {
-        for data in edges {
-          replay_add_edge(snapshot, delta, data.src, data.etype, data.dst);
+    WalRecordType::AddEdgeProps => {
+      let data = payload(record, parse_add_edge_props_payload(&record.payload))?;
+      if replay_add_edge(snapshot, delta, data.src, data.etype, data.dst) {
+        for (key_id, value) in data.props {
+          delta.set_edge_prop(data.src, data.etype, data.dst, key_id, value);
         }
       }
     }
-    WalRecordType::AddEdgeProps => {
-      if let Some(data) = parse_add_edge_props_payload(&record.payload) {
+    WalRecordType::AddEdgesPropsBatch => {
+      let edges = payload(record, parse_add_edges_props_batch_payload(&record.payload))?;
+      for data in edges {
         if replay_add_edge(snapshot, delta, data.src, data.etype, data.dst) {
           for (key_id, value) in data.props {
             delta.set_edge_prop(data.src, data.etype, data.dst, key_id, value);
@@ -186,109 +190,118 @@ pub fn replay_wal_record(
         }
       }
     }
-    WalRecordType::AddEdgesPropsBatch => {
-      if let Some(edges) = parse_add_edges_props_batch_payload(&record.payload) {
-        for data in edges {
-          if replay_add_edge(snapshot, delta, data.src, data.etype, data.dst) {
-            for (key_id, value) in data.props {
-              delta.set_edge_prop(data.src, data.etype, data.dst, key_id, value);
-            }
-          }
-        }
-      }
-    }
     WalRecordType::DeleteEdge => {
-      if let Some(data) = parse_delete_edge_payload(&record.payload) {
-        let in_snapshot = snapshot_has_edge(snapshot, data.src, data.etype, data.dst);
-        delta.delete_edge_over(data.src, data.etype, data.dst, in_snapshot);
-      }
+      let data = payload(record, parse_delete_edge_payload(&record.payload))?;
+      let in_snapshot = delta.snapshot_edge_over(snapshot, data.src, data.etype, data.dst);
+      delta.delete_edge_over(data.src, data.etype, data.dst, in_snapshot);
     }
+    // Prop and label writes to a node or edge that does not exist (older
+    // versions let them through) are skipped, as `replay_add_edge` skips
+    // edges to missing nodes: they would surface if the id came back.
     WalRecordType::SetNodeProp => {
-      if let Some(data) = parse_set_node_prop_payload(&record.payload) {
+      let data = payload(record, parse_set_node_prop_payload(&record.payload))?;
+      if delta.node_exists_over(snapshot, data.node_id) {
         delta.set_node_prop(data.node_id, data.key_id, data.value);
       }
     }
     WalRecordType::DelNodeProp => {
-      if let Some(data) = parse_del_node_prop_payload(&record.payload) {
+      let data = payload(record, parse_del_node_prop_payload(&record.payload))?;
+      if delta.node_exists_over(snapshot, data.node_id) {
         delta.delete_node_prop(data.node_id, data.key_id);
       }
     }
     WalRecordType::DefineLabel => {
-      if let Some(data) = parse_define_label_payload(&record.payload) {
-        delta.define_label(data.label_id, &data.name);
-        label_names.insert(data.name.clone(), data.label_id);
-        label_ids.insert(data.label_id, data.name);
-        if data.label_id >= *next_label_id {
-          *next_label_id = data.label_id + 1;
-        }
+      let data = payload(record, parse_define_label_payload(&record.payload))?;
+      delta.define_label(data.label_id, &data.name);
+      label_names.insert(data.name.clone(), data.label_id);
+      label_ids.insert(data.label_id, data.name);
+      if data.label_id >= *next_label_id {
+        *next_label_id = data.label_id + 1;
       }
     }
     WalRecordType::DefineEtype => {
-      if let Some(data) = parse_define_etype_payload(&record.payload) {
-        delta.define_etype(data.label_id, &data.name);
-        etype_names.insert(data.name.clone(), data.label_id);
-        etype_ids.insert(data.label_id, data.name);
-        if data.label_id >= *next_etype_id {
-          *next_etype_id = data.label_id + 1;
-        }
+      let data = payload(record, parse_define_etype_payload(&record.payload))?;
+      delta.define_etype(data.label_id, &data.name);
+      etype_names.insert(data.name.clone(), data.label_id);
+      etype_ids.insert(data.label_id, data.name);
+      if data.label_id >= *next_etype_id {
+        *next_etype_id = data.label_id + 1;
       }
     }
     WalRecordType::DefinePropkey => {
-      if let Some(data) = parse_define_propkey_payload(&record.payload) {
-        delta.define_propkey(data.label_id, &data.name);
-        propkey_names.insert(data.name.clone(), data.label_id);
-        propkey_ids.insert(data.label_id, data.name);
-        if data.label_id >= *next_propkey_id {
-          *next_propkey_id = data.label_id + 1;
-        }
+      let data = payload(record, parse_define_propkey_payload(&record.payload))?;
+      delta.define_propkey(data.label_id, &data.name);
+      propkey_names.insert(data.name.clone(), data.label_id);
+      propkey_ids.insert(data.label_id, data.name);
+      if data.label_id >= *next_propkey_id {
+        *next_propkey_id = data.label_id + 1;
       }
     }
     WalRecordType::AddNodeLabel => {
-      if let Some(data) = parse_add_node_label_payload(&record.payload) {
+      let data = payload(record, parse_add_node_label_payload(&record.payload))?;
+      if delta.node_exists_over(snapshot, data.node_id) {
         delta.add_node_label(data.node_id, data.label_id);
       }
     }
     WalRecordType::RemoveNodeLabel => {
-      if let Some(data) = parse_remove_node_label_payload(&record.payload) {
+      let data = payload(record, parse_remove_node_label_payload(&record.payload))?;
+      if delta.node_exists_over(snapshot, data.node_id) {
         delta.remove_node_label(data.node_id, data.label_id);
       }
     }
     WalRecordType::SetEdgeProp => {
-      if let Some(data) = parse_set_edge_prop_payload(&record.payload) {
+      let data = payload(record, parse_set_edge_prop_payload(&record.payload))?;
+      if delta.edge_exists_over(snapshot, data.src, data.etype, data.dst) {
         delta.set_edge_prop(data.src, data.etype, data.dst, data.key_id, data.value);
       }
     }
     WalRecordType::SetEdgeProps => {
-      if let Some(data) = parse_set_edge_props_payload(&record.payload) {
+      let data = payload(record, parse_set_edge_props_payload(&record.payload))?;
+      if delta.edge_exists_over(snapshot, data.src, data.etype, data.dst) {
         for (key_id, value) in data.props {
           delta.set_edge_prop(data.src, data.etype, data.dst, key_id, value);
         }
       }
     }
     WalRecordType::DelEdgeProp => {
-      if let Some(data) = parse_del_edge_prop_payload(&record.payload) {
+      let data = payload(record, parse_del_edge_prop_payload(&record.payload))?;
+      if delta.edge_exists_over(snapshot, data.src, data.etype, data.dst) {
         delta.delete_edge_prop(data.src, data.etype, data.dst, data.key_id);
       }
     }
     WalRecordType::SetNodeVector => {
-      if let Some(data) = parse_set_node_vector_payload(&record.payload) {
-        delta.pending_vectors.insert(
-          (data.node_id, data.prop_key_id),
-          Some(VectorRef::from(data.vector)),
-        );
-      }
+      let data = payload(record, parse_set_node_vector_payload(&record.payload))?;
+      delta.pending_vectors.insert(
+        (data.node_id, data.prop_key_id),
+        Some(VectorRef::from(data.vector)),
+      );
     }
     WalRecordType::DelNodeVector => {
-      if let Some(data) = parse_del_node_vector_payload(&record.payload) {
-        delta
-          .pending_vectors
-          .insert((data.node_id, data.prop_key_id), None);
-      }
+      let data = payload(record, parse_del_node_vector_payload(&record.payload))?;
+      delta
+        .pending_vectors
+        .insert((data.node_id, data.prop_key_id), None);
     }
-    _ => {
-      // Other record types (batch vectors, seal fragment, etc.) - skip for now
+    WalRecordType::BatchVectors | WalRecordType::SealFragment | WalRecordType::CompactFragments => {
+      return Ok(false);
     }
+    // Transaction boundaries: committed_transactions drops them.
+    WalRecordType::Begin | WalRecordType::Commit | WalRecordType::Rollback => {}
   }
+  Ok(true)
+}
+
+/// The parsed payload of `record`, or `InvalidWal` if it did not parse.
+fn payload<T>(record: &ParsedWalRecord, parsed: Option<T>) -> Result<T> {
+  parsed.ok_or_else(|| {
+    KiteError::InvalidWal(format!(
+      "{:?} record of transaction {} passed its checksum but its {}-byte payload does not \
+       parse: it was written by a buggy or incompatible version, not torn by a crash",
+      record.record_type,
+      record.txid,
+      record.payload.len()
+    ))
+  })
 }
 
 /// Replay an edge add under the write path's rules: both endpoints must exist,
@@ -304,9 +317,23 @@ fn replay_add_edge(
   if !delta.node_exists_over(snapshot, src) || !delta.node_exists_over(snapshot, dst) {
     return false;
   }
-  let in_snapshot = snapshot_has_edge(snapshot, src, etype, dst);
+  let in_snapshot = delta.snapshot_edge_over(snapshot, src, etype, dst);
   delta.add_edge_over(src, etype, dst, in_snapshot);
   true
+}
+
+/// Replay a node create under the write path's rule: the id must not exist.
+/// A create of a snapshot node is skipped, unless a replayed delete removed
+/// it: then it is a recreate. Older WALs may repeat a create.
+fn replay_create_node(
+  snapshot: Option<&SnapshotData>,
+  delta: &mut DeltaState,
+  node_id: NodeId,
+  key: Option<&str>,
+) {
+  if !delta.node_exists_over(snapshot, node_id) {
+    delta.create_node(node_id, key);
+  }
 }
 
 /// After replay, turn vector sets for nodes that no longer exist into deletes.
@@ -337,7 +364,7 @@ mod tests {
     build_add_edge_payload, build_create_node_payload, build_delete_edge_payload,
     build_delete_node_payload, WalRecord,
   };
-  use crate::types::{NodeId, WalRecordType};
+  use crate::types::{NodeId, PropValue, WalRecordType};
   use crate::vector::store::vector_store_has;
   use std::path::Path;
   use tempfile::tempdir;
@@ -450,6 +477,34 @@ mod tests {
       "store keeps the vector, so the next checkpoint would persist it"
     );
     drop(stores);
+    close_single_file(db).expect("close");
+  }
+
+  #[test]
+  fn replay_skips_create_of_existing_node() {
+    // Older versions could log a second create for a node (upsert by id did
+    // not see a recreated node). Replay must not wipe the node's state.
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("repeat_create.kitedb");
+    let db = open(&path);
+    db.begin(false).expect("begin");
+    let node = db.create_node(Some("n")).expect("node");
+    let key = db.define_propkey("k").expect("propkey");
+    db.set_node_prop(node, key, PropValue::I64(1))
+      .expect("prop");
+    db.commit().expect("commit");
+    commit_legacy_records(
+      &db,
+      vec![(
+        WalRecordType::CreateNode,
+        build_create_node_payload(node, None),
+      )],
+    );
+    close_single_file(db).expect("close");
+
+    let db = open(&path);
+    assert_eq!(db.node_key(node).as_deref(), Some("n"));
+    assert_eq!(db.node_prop(node, key), Some(PropValue::I64(1)));
     close_single_file(db).expect("close");
   }
 

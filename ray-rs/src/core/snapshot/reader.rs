@@ -1,29 +1,37 @@
 //! CSR Snapshot Reader - mmap-based snapshot reading
 //!
 //! Ported from src/core/snapshot-reader.ts
+//!
+//! Loading resolves every section once: uncompressed sections are ranges of
+//! the mmap, compressed ones are inflated into memory. Accessors then index a
+//! fixed table by `SectionId`, without locks or reference counts. Before
+//! anything is inflated, every declared section size is checked against the
+//! header counts and the snapshot size, so a decompression bomb is refused
+//! from the section table alone.
 
 use crate::constants::*;
 use crate::core::snapshot::node_map::{self, NodeIdMapLayout};
-use crate::core::snapshot::sections::{parse_section_table, string_offset_size_for_version};
+use crate::core::snapshot::sections::{
+  inflation_budget, parse_section_table, string_offset_size_for_version,
+};
 use crate::error::{KiteError, Result};
 use crate::types::*;
 use crate::util::binary::*;
 use crate::util::compression::{decompress_with_size, CompressionType};
-use crate::util::crc::{crc32c, crc32c_chunked, Crc32cHasher};
+use crate::util::crc::{crc32, crc32_chunked, Crc32Hasher};
 use crate::util::hash::xxhash64_string;
 use crate::util::mmap::{map_file, Mmap};
-use parking_lot::RwLock;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 // ============================================================================
 // Snapshot Data Structure
 // ============================================================================
 
-/// Parsed snapshot data with cached section views
+/// Parsed snapshot data with resolved section views
 pub struct SnapshotData {
   /// Memory-mapped file data
   mmap: Arc<Mmap>,
@@ -31,14 +39,28 @@ pub struct SnapshotData {
   pub header: SnapshotHeaderV1,
   /// Section table
   sections: Vec<SectionEntry>,
+  /// Bytes of every section, indexed by `SectionId`, resolved at load
+  views: [SectionView; SectionId::COUNT],
   /// NodeIdToPhys encoding (header flag `SPARSE_NODE_ID_MAP`)
   node_id_map: NodeIdMapLayout,
   /// Bytes per StringOffsets entry (u32 before v5, u64 since)
   string_offset_size: usize,
-  /// Cache for decompressed sections
-  decompressed_cache: RwLock<HashMap<SectionId, Arc<[u8]>>>,
-  /// Cache for string table entries (indexed by StringId)
-  string_cache: Vec<OnceLock<Arc<str>>>,
+  /// Label names by LabelId, decoded at load
+  label_names: Vec<Option<Box<str>>>,
+  /// Edge type names by ETypeId, decoded at load
+  etype_names: Vec<Option<Box<str>>>,
+  /// Property key names by PropKeyId, decoded at load
+  propkey_names: Vec<Option<Box<str>>>,
+}
+
+/// Where a section's bytes live once the snapshot is loaded.
+enum SectionView {
+  /// Absent or empty section.
+  Empty,
+  /// Uncompressed section: `mmap[start..end]`.
+  Mapped { start: usize, end: usize },
+  /// Compressed section, inflated at load.
+  Inflated(Box<[u8]>),
 }
 
 /// Borrowed or shared section bytes.
@@ -47,8 +69,6 @@ pub enum SectionBytes<'a> {
   Borrowed(&'a [u8]),
   Shared(Arc<[u8]>),
 }
-
-impl SectionBytes<'_> {}
 
 impl AsRef<[u8]> for SectionBytes<'_> {
   fn as_ref(&self) -> &[u8] {
@@ -178,13 +198,13 @@ fn compute_crc_with_options(
   let chunk_size = normalized_crc_chunk_size(options.crc_chunk_size, data.len());
   if options.crc_profile_sink.is_none() {
     if chunk_size >= data.len().max(1) {
-      return (crc32c(data), None);
+      return (crc32(data), None);
     }
-    return (crc32c_chunked(data, chunk_size), None);
+    return (crc32_chunked(data, chunk_size), None);
   }
 
   let segments = section_segments(sections, base_offset, data.len());
-  let mut hasher = Crc32cHasher::new();
+  let mut hasher = Crc32Hasher::new();
   let mut profile_sections = Vec::with_capacity(segments.len());
   let mut total_ns: u64 = 0;
 
@@ -243,13 +263,42 @@ fn u32_range_at(offsets: &[u8], index: usize) -> Option<(usize, usize)> {
   (start <= end).then_some((start, end))
 }
 
+/// First index in `0..len` for which `before_target` is false, given that it
+/// is true for a prefix and false after.
+#[inline]
+fn partition_point(len: usize, before_target: impl Fn(usize) -> bool) -> usize {
+  let (mut lo, mut hi) = (0, len);
+  while lo < hi {
+    let mid = lo + (hi - lo) / 2;
+    if before_target(mid) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  lo
+}
+
+/// Hash of KeyEntries entry `index`.
+#[inline]
+fn key_entry_hash(entries: &[u8], index: usize) -> u64 {
+  read_u64(entries, index * KEY_INDEX_ENTRY_SIZE)
+}
+
+/// Whether a nonzero string ID indexes the string table. ID 0 is the
+/// reserved empty string and is always valid.
+#[inline]
+fn string_id_in_table(string_id: u64, num_strings: usize) -> bool {
+  string_id == 0 || string_id < num_strings as u64
+}
+
 impl SnapshotData {
   fn from_parsed_parts(
     mmap: Arc<Mmap>,
     header: SnapshotHeaderV1,
     sections: Vec<SectionEntry>,
+    snapshot_len: usize,
   ) -> Result<Self> {
-    let num_strings = header.num_strings;
     let node_id_map = if header.flags.contains(SnapshotFlags::SPARSE_NODE_ID_MAP) {
       NodeIdMapLayout::Sparse
     } else {
@@ -260,14 +309,20 @@ impl SnapshotData {
       mmap,
       header,
       sections,
+      views: std::array::from_fn(|_| SectionView::Empty),
       node_id_map,
       string_offset_size,
-      decompressed_cache: RwLock::new(HashMap::new()),
-      string_cache: Vec::new(),
+      label_names: Vec::new(),
+      etype_names: Vec::new(),
+      propkey_names: Vec::new(),
     };
 
+    snapshot.validate_section_sizes(snapshot_len)?;
+    snapshot.resolve_sections()?;
     snapshot.validate_structure()?;
-    snapshot.string_cache = Self::init_string_cache(num_strings)?;
+    snapshot.label_names = snapshot.decode_names(SectionId::LabelStringIds);
+    snapshot.etype_names = snapshot.decode_names(SectionId::EtypeStringIds);
+    snapshot.propkey_names = snapshot.decode_names(SectionId::PropkeyStringIds);
     Ok(snapshot)
   }
 
@@ -287,98 +342,7 @@ impl SnapshotData {
 
   /// Parse snapshot from mmap buffer
   pub fn parse(mmap: Arc<Mmap>, options: &ParseSnapshotOptions) -> Result<Self> {
-    let buffer = &mmap[..];
-
-    if buffer.len() < SNAPSHOT_HEADER_SIZE {
-      return Err(KiteError::InvalidSnapshot(format!(
-        "Snapshot too small: {} bytes",
-        buffer.len()
-      )));
-    }
-
-    // Parse header
-    let magic = read_u32(buffer, 0);
-    if magic != MAGIC_SNAPSHOT {
-      return Err(KiteError::InvalidMagic {
-        expected: MAGIC_SNAPSHOT,
-        got: magic,
-      });
-    }
-
-    let version = read_u32(buffer, 4);
-    let min_reader_version = read_u32(buffer, 8);
-
-    if MIN_READER_SNAPSHOT < min_reader_version {
-      return Err(KiteError::VersionMismatch {
-        required: min_reader_version,
-        current: MIN_READER_SNAPSHOT,
-      });
-    }
-
-    let flags = SnapshotFlags::from_bits_truncate(read_u32(buffer, 12));
-    let generation = read_u64(buffer, 16);
-    let created_unix_ns = read_u64(buffer, 24);
-    let num_nodes = read_u64(buffer, 32);
-    let num_edges = read_u64(buffer, 40);
-    let max_node_id = read_u64(buffer, 48);
-    let num_labels = read_u64(buffer, 56);
-    let num_etypes = read_u64(buffer, 64);
-    let num_propkeys = read_u64(buffer, 72);
-    let num_strings = read_u64(buffer, 80);
-
-    let header = SnapshotHeaderV1 {
-      magic,
-      version,
-      min_reader_version,
-      flags,
-      generation,
-      created_unix_ns,
-      num_nodes,
-      num_edges,
-      max_node_id,
-      num_labels,
-      num_etypes,
-      num_propkeys,
-      num_strings,
-    };
-
-    let parsed = parse_section_table(buffer, version, 0)?;
-    let sections = parsed.sections;
-    let aligned_end = parsed
-      .max_section_end
-      .checked_add(SECTION_ALIGNMENT - 1)
-      .map(|value| value & !(SECTION_ALIGNMENT - 1))
-      .ok_or_else(|| KiteError::InvalidSnapshot("Snapshot size alignment overflow".to_string()))?;
-    let actual_snapshot_size = aligned_end
-      .checked_add(4)
-      .ok_or_else(|| KiteError::InvalidSnapshot("Snapshot CRC offset overflow".to_string()))?;
-
-    if actual_snapshot_size > buffer.len() {
-      return Err(KiteError::InvalidSnapshot(format!(
-        "Snapshot truncated: expected {actual_snapshot_size} bytes, found {}",
-        buffer.len()
-      )));
-    }
-
-    // Verify footer CRC
-    if !options.skip_crc_validation {
-      let footer_crc = read_u32(buffer, actual_snapshot_size - 4);
-      let (computed_crc, crc_profile) =
-        compute_crc_with_options(&buffer[..actual_snapshot_size - 4], options, &sections, 0);
-      if let Some(sink) = options.crc_profile_sink.as_ref() {
-        if let Ok(mut guard) = sink.lock() {
-          *guard = crc_profile;
-        }
-      }
-      if footer_crc != computed_crc {
-        return Err(KiteError::CrcMismatch {
-          stored: footer_crc,
-          computed: computed_crc,
-        });
-      }
-    }
-
-    Self::from_parsed_parts(mmap, header, sections)
+    Self::parse_at_offset(mmap, 0, options)
   }
 
   /// Parse snapshot from mmap buffer at a specific byte offset
@@ -422,31 +386,20 @@ impl SnapshotData {
       });
     }
 
-    let flags = SnapshotFlags::from_bits_truncate(read_u32(buffer, 12));
-    let generation = read_u64(buffer, 16);
-    let created_unix_ns = read_u64(buffer, 24);
-    let num_nodes = read_u64(buffer, 32);
-    let num_edges = read_u64(buffer, 40);
-    let max_node_id = read_u64(buffer, 48);
-    let num_labels = read_u64(buffer, 56);
-    let num_etypes = read_u64(buffer, 64);
-    let num_propkeys = read_u64(buffer, 72);
-    let num_strings = read_u64(buffer, 80);
-
     let header = SnapshotHeaderV1 {
       magic,
       version,
       min_reader_version,
-      flags,
-      generation,
-      created_unix_ns,
-      num_nodes,
-      num_edges,
-      max_node_id,
-      num_labels,
-      num_etypes,
-      num_propkeys,
-      num_strings,
+      flags: SnapshotFlags::from_bits_truncate(read_u32(buffer, 12)),
+      generation: read_u64(buffer, 16),
+      created_unix_ns: read_u64(buffer, 24),
+      num_nodes: read_u64(buffer, 32),
+      num_edges: read_u64(buffer, 40),
+      max_node_id: read_u64(buffer, 48),
+      num_labels: read_u64(buffer, 56),
+      num_etypes: read_u64(buffer, 64),
+      num_propkeys: read_u64(buffer, 72),
+      num_strings: read_u64(buffer, 80),
     };
 
     let parsed = parse_section_table(buffer, version, offset)?;
@@ -489,7 +442,7 @@ impl SnapshotData {
       }
     }
 
-    Self::from_parsed_parts(mmap, header, sections)
+    Self::from_parsed_parts(mmap, header, sections, actual_snapshot_size)
   }
 
   fn section_name(id: SectionId) -> &'static str {
@@ -547,52 +500,246 @@ impl SnapshotData {
       .ok_or_else(|| Self::invalid_section(section, "array size overflows"))
   }
 
-  fn section_data_for_validation(
-    &self,
-    id: SectionId,
-    required: bool,
-  ) -> Result<Option<SectionBytes<'_>>> {
-    let Some(section) = self.sections.get(id as usize) else {
-      if required {
-        return Err(Self::invalid_section(
-          Self::section_name(id),
-          "section is missing",
-        ));
-      }
-      return Ok(None);
-    };
+  // ========================================================================
+  // Load: sizes from the section table, then sections, then contents
+  // ========================================================================
 
-    if section.length == 0 {
-      if required {
-        return Err(Self::invalid_section(
-          Self::section_name(id),
-          "section is empty",
-        ));
-      }
-      return Ok(None);
+  /// Bytes section `id` holds once resolved: its declared uncompressed size
+  /// when compressed, its on-disk length otherwise, 0 when absent.
+  fn declared_len(&self, id: SectionId) -> usize {
+    match self.sections.get(id as usize) {
+      // parse_section_table checked both sizes fit usize.
+      Some(entry) if entry.compression != 0 => entry.uncompressed_size as usize,
+      Some(entry) => entry.length as usize,
+      None => 0,
     }
-
-    self
-      .section_data_shared(id)
-      .map(Some)
-      .ok_or_else(|| Self::invalid_section(Self::section_name(id), "cannot decode section"))
   }
 
-  fn validate_exact_section(
-    &self,
-    id: SectionId,
-    expected_len: usize,
-    required: bool,
-  ) -> Result<Option<SectionBytes<'_>>> {
-    let data = self.section_data_for_validation(id, required)?;
-    let actual_len = data.as_ref().map(|bytes| bytes.as_ref().len()).unwrap_or(0);
-    if actual_len != expected_len {
+  fn expect_len(&self, id: SectionId, expected: usize) -> Result<()> {
+    let actual = self.declared_len(id);
+    if actual == expected {
+      return Ok(());
+    }
+    let name = Self::section_name(id);
+    if actual == 0 {
       return Err(Self::invalid_section(
-        Self::section_name(id),
-        format!("expected {expected_len} bytes, found {actual_len}"),
+        name,
+        format!("section is missing (expected {expected} bytes)"),
       ));
     }
-    Ok(data)
+    Err(Self::invalid_section(
+      name,
+      format!("expected {expected} bytes, found {actual}"),
+    ))
+  }
+
+  fn expect_multiple(&self, id: SectionId, element_size: usize) -> Result<usize> {
+    let len = self.declared_len(id);
+    if !len.is_multiple_of(element_size) {
+      return Err(Self::invalid_section(
+        Self::section_name(id),
+        format!("{len} bytes is not a whole number of {element_size}-byte entries"),
+      ));
+    }
+    Ok(len / element_size)
+  }
+
+  fn expect_present(&self, id: SectionId) -> Result<()> {
+    if self.declared_len(id) == 0 {
+      return Err(Self::invalid_section(
+        Self::section_name(id),
+        "section is missing",
+      ));
+    }
+    Ok(())
+  }
+
+  /// Checks every section's declared size against the header counts, the
+  /// other declared sizes and the snapshot size. Reads the section table
+  /// only, so it runs before anything is inflated.
+  fn validate_section_sizes(&self, snapshot_len: usize) -> Result<()> {
+    let mut inflated = 0usize;
+    for entry in self.sections.iter().filter(|entry| entry.compression != 0) {
+      inflated = inflated.saturating_add(entry.uncompressed_size as usize);
+    }
+    let budget = inflation_budget(snapshot_len);
+    if inflated > budget {
+      return Err(KiteError::InvalidSnapshot(format!(
+        "compressed sections declare {inflated} bytes, more than the {budget} bytes a \
+         {snapshot_len}-byte snapshot may inflate to"
+      )));
+    }
+
+    let flags = self.header.flags;
+    let num_nodes = Self::checked_count(self.header.num_nodes, "node counts")?;
+    let num_edges = Self::checked_count(self.header.num_edges, "edge counts")?;
+    let node_offsets_len = Self::checked_bytes(
+      Self::checked_count_plus_one(self.header.num_nodes, "OutOffsets")?,
+      4,
+      "OutOffsets",
+    )?;
+    let edge_array_len = Self::checked_bytes(num_edges, 4, "OutDst")?;
+
+    self.expect_len(
+      SectionId::PhysToNodeId,
+      Self::checked_bytes(num_nodes, 8, "PhysToNodeId")?,
+    )?;
+    let node_map_len = match self.node_id_map {
+      NodeIdMapLayout::Dense => {
+        let slots = usize::try_from(self.header.max_node_id)
+          .ok()
+          .and_then(|max_node_id| max_node_id.checked_add(1))
+          .ok_or_else(|| Self::invalid_section("NodeIdToPhys", "max node ID overflows"))?;
+        Self::checked_bytes(slots, node_map::DENSE_ENTRY_SIZE, "NodeIdToPhys")?
+      }
+      NodeIdMapLayout::Sparse => {
+        Self::checked_bytes(num_nodes, node_map::SPARSE_ENTRY_SIZE, "NodeIdToPhys")?
+      }
+    };
+    self.expect_len(SectionId::NodeIdToPhys, node_map_len)?;
+
+    self.expect_len(SectionId::OutOffsets, node_offsets_len)?;
+    self.expect_len(SectionId::OutDst, edge_array_len)?;
+    self.expect_len(SectionId::OutEtype, edge_array_len)?;
+    if flags.contains(SnapshotFlags::HAS_IN_EDGES) {
+      self.expect_len(SectionId::InOffsets, node_offsets_len)?;
+      self.expect_len(SectionId::InSrc, edge_array_len)?;
+      self.expect_len(SectionId::InEtype, edge_array_len)?;
+      self.expect_len(SectionId::InOutIndex, edge_array_len)?;
+    }
+
+    self.expect_len(
+      SectionId::StringOffsets,
+      Self::checked_bytes(
+        Self::checked_count_plus_one(self.header.num_strings, "StringOffsets")?,
+        self.string_offset_size,
+        "StringOffsets",
+      )?,
+    )?;
+    for (id, count) in [
+      (SectionId::LabelStringIds, self.header.num_labels),
+      (SectionId::EtypeStringIds, self.header.num_etypes),
+      (SectionId::PropkeyStringIds, self.header.num_propkeys),
+    ] {
+      let name = Self::section_name(id);
+      self.expect_len(
+        id,
+        Self::checked_bytes(Self::checked_count_plus_one(count, name)?, 4, name)?,
+      )?;
+    }
+    self.expect_len(
+      SectionId::NodeKeyString,
+      Self::checked_bytes(num_nodes, 4, "NodeKeyString")?,
+    )?;
+
+    let key_entry_count = self.expect_multiple(SectionId::KeyEntries, KEY_INDEX_ENTRY_SIZE)?;
+    if key_entry_count > num_nodes {
+      return Err(Self::invalid_section(
+        "KeyEntries",
+        format!("entry count {key_entry_count} exceeds node count {num_nodes}"),
+      ));
+    }
+    if flags.contains(SnapshotFlags::HAS_KEY_BUCKETS) {
+      self.expect_present(SectionId::KeyBuckets)?;
+    }
+    let bucket_offsets = self.expect_multiple(SectionId::KeyBuckets, 4)?;
+    // The writer uses max(16, 2 * entries) buckets.
+    let max_bucket_offsets = key_entry_count.saturating_mul(2).max(16) + 1;
+    if bucket_offsets != 0 && !(2..=max_bucket_offsets).contains(&bucket_offsets) {
+      return Err(Self::invalid_section(
+        "KeyBuckets",
+        format!(
+          "{bucket_offsets} bucket offsets for {key_entry_count} entries; expected 2 to \
+           {max_bucket_offsets}"
+        ),
+      ));
+    }
+
+    self.expect_len(SectionId::NodePropOffsets, node_offsets_len)?;
+    let node_prop_count = self.expect_multiple(SectionId::NodePropKeys, 4)?;
+    self.expect_len(
+      SectionId::NodePropVals,
+      Self::checked_bytes(node_prop_count, PROP_VALUE_DISK_SIZE, "NodePropVals")?,
+    )?;
+    self.expect_len(
+      SectionId::EdgePropOffsets,
+      Self::checked_bytes(
+        num_edges
+          .checked_add(1)
+          .ok_or_else(|| Self::invalid_section("EdgePropOffsets", "edge count overflows"))?,
+        4,
+        "EdgePropOffsets",
+      )?,
+    )?;
+    let edge_prop_count = self.expect_multiple(SectionId::EdgePropKeys, 4)?;
+    self.expect_len(
+      SectionId::EdgePropVals,
+      Self::checked_bytes(edge_prop_count, PROP_VALUE_DISK_SIZE, "EdgePropVals")?,
+    )?;
+
+    if flags.contains(SnapshotFlags::HAS_NODE_LABELS) {
+      self.expect_len(SectionId::NodeLabelOffsets, node_offsets_len)?;
+      self.expect_multiple(SectionId::NodeLabelIds, 4)?;
+    }
+
+    if flags.contains(SnapshotFlags::HAS_VECTORS) {
+      self.expect_present(SectionId::VectorOffsets)?;
+      self.expect_present(SectionId::VectorData)?;
+      let vector_offsets = self.expect_multiple(SectionId::VectorOffsets, 8)?;
+      self.expect_multiple(SectionId::VectorData, 4)?;
+      // Each vector is the value of one node or edge property.
+      let max_vectors = node_prop_count.saturating_add(edge_prop_count);
+      if vector_offsets < 2 || vector_offsets - 1 > max_vectors {
+        return Err(Self::invalid_section(
+          "VectorOffsets",
+          format!(
+            "{} vectors for {max_vectors} property values",
+            vector_offsets.saturating_sub(1)
+          ),
+        ));
+      }
+    }
+
+    if flags.contains(SnapshotFlags::HAS_VECTOR_STORES) {
+      self.expect_present(SectionId::VectorStoreIndex)?;
+      self.expect_present(SectionId::VectorStoreData)?;
+    }
+
+    Ok(())
+  }
+
+  /// Maps every uncompressed section and inflates every compressed one.
+  fn resolve_sections(&mut self) -> Result<()> {
+    for (index, entry) in self.sections.iter().enumerate() {
+      if entry.length == 0 {
+        continue;
+      }
+      // parse_section_table checked the range lies within the mmap.
+      let start = entry.offset as usize;
+      let end = start + entry.length as usize;
+      self.views[index] = match CompressionType::from_u32(entry.compression) {
+        Some(CompressionType::None) => SectionView::Mapped { start, end },
+        compression => {
+          let name = SectionId::from_u32(index as u32).map_or("unknown", Self::section_name);
+          let compression =
+            compression.ok_or_else(|| Self::invalid_section(name, "unknown compression type"))?;
+          let inflated = decompress_with_size(
+            &self.mmap[start..end],
+            compression,
+            entry.uncompressed_size as usize,
+          )
+          .map_err(|error| Self::invalid_section(name, format!("cannot decompress: {error}")))?;
+          SectionView::Inflated(inflated.into_boxed_slice())
+        }
+      };
+    }
+    Ok(())
+  }
+
+  /// Bytes of section `id`, or an empty slice when it is absent.
+  #[inline]
+  fn bytes(&self, id: SectionId) -> &[u8] {
+    self.section(id).unwrap_or(&[])
   }
 
   fn validate_u32_offsets(data: &[u8], end_limit: usize, section: &str) -> Result<()> {
@@ -654,18 +801,12 @@ impl SnapshotData {
   }
 
   fn validate_string_id_array(data: &[u8], num_strings: usize, section: &str) -> Result<()> {
-    if !data.len().is_multiple_of(4) {
-      return Err(Self::invalid_section(
-        section,
-        "string ID array is not a multiple of 4 bytes",
-      ));
-    }
     for index in 0..data.len() / 4 {
-      let string_id = read_u32_at(data, index) as usize;
-      if string_id > num_strings {
+      let string_id = read_u32_at(data, index);
+      if !string_id_in_table(u64::from(string_id), num_strings) {
         return Err(Self::invalid_section(
           section,
-          format!("string ID {string_id} at index {index} exceeds {num_strings}"),
+          format!("string ID {string_id} at index {index} is outside 0..{num_strings}"),
         ));
       }
     }
@@ -673,12 +814,6 @@ impl SnapshotData {
   }
 
   fn validate_u32_values_below(data: &[u8], limit: usize, section: &str) -> Result<()> {
-    if !data.len().is_multiple_of(4) {
-      return Err(Self::invalid_section(
-        section,
-        "value array is not a multiple of 4 bytes",
-      ));
-    }
     for index in 0..data.len() / 4 {
       let value = read_u32_at(data, index) as usize;
       if value >= limit {
@@ -697,22 +832,16 @@ impl SnapshotData {
     vector_count: Option<usize>,
     section: &str,
   ) -> Result<()> {
-    if !data.len().is_multiple_of(PROP_VALUE_DISK_SIZE) {
-      return Err(Self::invalid_section(
-        section,
-        "value array has a partial entry",
-      ));
-    }
     for index in 0..data.len() / PROP_VALUE_DISK_SIZE {
       let offset = index * PROP_VALUE_DISK_SIZE;
       let tag = data[offset];
       let payload = read_u64(data, offset + 8);
       match PropValueTag::from_u8(tag) {
         Some(PropValueTag::String) => {
-          if payload > num_strings as u64 {
+          if !string_id_in_table(payload, num_strings) {
             return Err(Self::invalid_section(
               section,
-              format!("string ID {payload} at entry {index} exceeds {num_strings}"),
+              format!("string ID {payload} at entry {index} is outside 0..{num_strings}"),
             ));
           }
         }
@@ -723,13 +852,10 @@ impl SnapshotData {
               format!("vector value at entry {index} has no vector section"),
             ));
           };
-          let vector_index = usize::try_from(payload).map_err(|_| {
-            Self::invalid_section(section, format!("vector index at entry {index} overflows"))
-          })?;
-          if vector_index >= vector_count {
+          if payload >= vector_count as u64 {
             return Err(Self::invalid_section(
               section,
-              format!("vector index {vector_index} at entry {index} exceeds {vector_count}"),
+              format!("vector index {payload} at entry {index} is outside 0..{vector_count}"),
             ));
           }
         }
@@ -745,44 +871,55 @@ impl SnapshotData {
     Ok(())
   }
 
-  fn validate_node_id_map(&self, num_nodes: usize) -> Result<()> {
+  /// NodeIdToPhys and PhysToNodeId must be inverse bijections between the
+  /// node IDs and `0..num_nodes`. Every mapped `(node_id, phys)` must have
+  /// `PhysToNodeId[phys] == node_id`; distinct IDs then map to distinct
+  /// physical nodes, and exactly `num_nodes` mapped IDs cover them all.
+  fn validate_node_id_maps(&self, num_nodes: usize) -> Result<()> {
     const SECTION: &str = "NodeIdToPhys";
-    match self.node_id_map {
+    let map = self.bytes(SectionId::NodeIdToPhys);
+    let phys_to_node = self.bytes(SectionId::PhysToNodeId);
+    let check_pair = |node_id: NodeId, phys: usize| -> Result<()> {
+      if phys >= num_nodes {
+        return Err(Self::invalid_section(
+          SECTION,
+          format!("physical node {phys} for node ID {node_id} is outside the node count"),
+        ));
+      }
+      let stored = read_u64_at(phys_to_node, phys);
+      if stored != node_id {
+        return Err(Self::invalid_section(
+          "PhysToNodeId",
+          format!(
+            "physical node {phys} has node ID {stored}, but NodeIdToPhys maps node ID \
+             {node_id} to it"
+          ),
+        ));
+      }
+      Ok(())
+    };
+
+    let mapped = match self.node_id_map {
       NodeIdMapLayout::Dense => {
-        let slots = usize::try_from(self.header.max_node_id)
-          .ok()
-          .and_then(|max_node_id| max_node_id.checked_add(1))
-          .ok_or_else(|| Self::invalid_section(SECTION, "max node ID overflows"))?;
-        let len = Self::checked_bytes(slots, node_map::DENSE_ENTRY_SIZE, SECTION)?;
-        let map = self
-          .validate_exact_section(SectionId::NodeIdToPhys, len, true)?
-          .ok_or_else(|| Self::invalid_section(SECTION, "section is missing"))?;
-        for index in 0..slots {
-          let phys = read_i32_at(map.as_ref(), index);
-          if phys < -1 || (phys >= 0 && (phys as usize) >= num_nodes) {
-            return Err(Self::invalid_section(
-              SECTION,
-              format!("physical node {phys} at node ID {index} is outside the node count"),
-            ));
+        let mut mapped = 0usize;
+        for index in 0..map.len() / node_map::DENSE_ENTRY_SIZE {
+          let phys = read_i32_at(map, index);
+          if phys == -1 {
+            continue;
           }
+          let phys = usize::try_from(phys).map_err(|_| {
+            Self::invalid_section(
+              SECTION,
+              format!("physical node {phys} at node ID {index} is negative"),
+            )
+          })?;
+          check_pair(index as NodeId, phys)?;
+          mapped += 1;
         }
+        mapped
       }
       NodeIdMapLayout::Sparse => {
-        let map = self.section_data_for_validation(SectionId::NodeIdToPhys, false)?;
-        let map = map.as_ref().map(|bytes| bytes.as_ref()).unwrap_or(&[]);
-        if map.len() % node_map::SPARSE_ENTRY_SIZE != 0 {
-          return Err(Self::invalid_section(
-            SECTION,
-            "sparse map has a partial entry",
-          ));
-        }
         let count = node_map::sparse_len(map);
-        if count > num_nodes {
-          return Err(Self::invalid_section(
-            SECTION,
-            format!("{count} entries exceed node count {num_nodes}"),
-          ));
-        }
         let mut previous: Option<NodeId> = None;
         for index in 0..count {
           let (node_id, phys) = node_map::sparse_entry(map, index);
@@ -801,172 +938,114 @@ impl SnapshotData {
               ),
             ));
           }
-          if phys as usize >= num_nodes {
-            return Err(Self::invalid_section(
-              SECTION,
-              format!("physical node {phys} at entry {index} is outside the node count"),
-            ));
-          }
+          check_pair(node_id, phys as usize)?;
           previous = Some(node_id);
         }
+        count
       }
+    };
+    if mapped != num_nodes {
+      return Err(Self::invalid_section(
+        SECTION,
+        format!("maps {mapped} node IDs for {num_nodes} nodes"),
+      ));
     }
     Ok(())
   }
 
+  /// Checks section contents. Sizes were checked by `validate_section_sizes`.
   fn validate_structure(&self) -> Result<()> {
-    for (index, section) in self.sections.iter().enumerate() {
-      if section.length == 0 || section.compression == 0 {
-        continue;
-      }
-      let id = SectionId::from_u32(index as u32)
-        .ok_or_else(|| KiteError::InvalidSnapshot(format!("unknown section {index}")))?;
-      let data = self.section_data_shared(id).ok_or_else(|| {
-        Self::invalid_section(Self::section_name(id), "cannot decompress section")
-      })?;
-      if data.as_ref().len() as u64 != section.uncompressed_size {
-        return Err(Self::invalid_section(
-          Self::section_name(id),
-          format!(
-            "decompressed size mismatch: expected {}, found {}",
-            section.uncompressed_size,
-            data.as_ref().len()
-          ),
-        ));
-      }
-    }
-
+    let flags = self.header.flags;
     let num_nodes = Self::checked_count(self.header.num_nodes, "node counts")?;
     let num_edges = Self::checked_count(self.header.num_edges, "edge counts")?;
     let num_strings = Self::checked_count(self.header.num_strings, "StringOffsets")?;
 
-    let phys_to_node_len = Self::checked_bytes(num_nodes, 8, "PhysToNodeId")?;
-    self.validate_exact_section(
-      SectionId::PhysToNodeId,
-      phys_to_node_len,
-      phys_to_node_len != 0,
-    )?;
+    self.validate_node_id_maps(num_nodes)?;
 
-    self.validate_node_id_map(num_nodes)?;
-
-    let node_offsets_len = Self::checked_bytes(
-      num_nodes
-        .checked_add(1)
-        .ok_or_else(|| Self::invalid_section("OutOffsets", "node count overflows"))?,
-      4,
-      "OutOffsets",
-    )?;
-    let out_offsets = self
-      .validate_exact_section(SectionId::OutOffsets, node_offsets_len, true)?
-      .ok_or_else(|| Self::invalid_section("OutOffsets", "section is missing"))?;
-    Self::validate_u32_offsets(out_offsets.as_ref(), num_edges, "OutOffsets")?;
-
-    let edge_array_len = Self::checked_bytes(num_edges, 4, "OutDst")?;
-    let out_dst = self
-      .validate_exact_section(SectionId::OutDst, edge_array_len, edge_array_len != 0)?
-      .unwrap_or(SectionBytes::Borrowed(&[]));
-    Self::validate_u32_values_below(out_dst.as_ref(), num_nodes, "OutDst")?;
-    self.validate_exact_section(SectionId::OutEtype, edge_array_len, edge_array_len != 0)?;
-
-    if self.header.flags.contains(SnapshotFlags::HAS_IN_EDGES) {
-      let in_offsets = self
-        .validate_exact_section(SectionId::InOffsets, node_offsets_len, true)?
-        .ok_or_else(|| Self::invalid_section("InOffsets", "section is missing"))?;
-      Self::validate_u32_offsets(in_offsets.as_ref(), num_edges, "InOffsets")?;
-      let in_src = self
-        .validate_exact_section(SectionId::InSrc, edge_array_len, edge_array_len != 0)?
-        .unwrap_or(SectionBytes::Borrowed(&[]));
-      Self::validate_u32_values_below(in_src.as_ref(), num_nodes, "InSrc")?;
-      self.validate_exact_section(SectionId::InEtype, edge_array_len, edge_array_len != 0)?;
-      let in_out_index = self
-        .validate_exact_section(SectionId::InOutIndex, edge_array_len, edge_array_len != 0)?
-        .unwrap_or(SectionBytes::Borrowed(&[]));
-      Self::validate_u32_values_below(in_out_index.as_ref(), num_edges, "InOutIndex")?;
+    Self::validate_u32_offsets(self.bytes(SectionId::OutOffsets), num_edges, "OutOffsets")?;
+    Self::validate_u32_values_below(self.bytes(SectionId::OutDst), num_nodes, "OutDst")?;
+    if flags.contains(SnapshotFlags::HAS_IN_EDGES) {
+      Self::validate_u32_offsets(self.bytes(SectionId::InOffsets), num_edges, "InOffsets")?;
+      Self::validate_u32_values_below(self.bytes(SectionId::InSrc), num_nodes, "InSrc")?;
+      Self::validate_u32_values_below(self.bytes(SectionId::InOutIndex), num_edges, "InOutIndex")?;
     }
 
-    let string_offsets_len = Self::checked_bytes(
-      Self::checked_count_plus_one(self.header.num_strings, "StringOffsets")?,
-      self.string_offset_size,
-      "StringOffsets",
-    )?;
-    let string_offsets = self
-      .validate_exact_section(SectionId::StringOffsets, string_offsets_len, true)?
-      .ok_or_else(|| Self::invalid_section("StringOffsets", "section is missing"))?;
-    let string_bytes = self.section_data_for_validation(SectionId::StringBytes, false)?;
-    let string_bytes_len = string_bytes
-      .as_ref()
-      .map(|bytes| bytes.as_ref().len())
-      .unwrap_or(0);
+    let string_offsets = self.bytes(SectionId::StringOffsets);
+    let string_bytes_len = self.bytes(SectionId::StringBytes).len();
     if self.string_offset_size == 8 {
-      Self::validate_u64_offsets(string_offsets.as_ref(), string_bytes_len, "StringOffsets")?;
+      Self::validate_u64_offsets(string_offsets, string_bytes_len, "StringOffsets")?;
     } else {
-      Self::validate_u32_offsets(string_offsets.as_ref(), string_bytes_len, "StringOffsets")?;
+      Self::validate_u32_offsets(string_offsets, string_bytes_len, "StringOffsets")?;
+    }
+    for id in [
+      SectionId::LabelStringIds,
+      SectionId::EtypeStringIds,
+      SectionId::PropkeyStringIds,
+      SectionId::NodeKeyString,
+    ] {
+      Self::validate_string_id_array(self.bytes(id), num_strings, Self::section_name(id))?;
     }
 
-    let label_ids_len = Self::checked_bytes(
-      Self::checked_count_plus_one(self.header.num_labels, "LabelStringIds")?,
-      4,
-      "LabelStringIds",
+    self.validate_key_index(num_strings)?;
+
+    let vector_count = if flags.contains(SnapshotFlags::HAS_VECTORS) {
+      let vector_offsets = self.bytes(SectionId::VectorOffsets);
+      Self::validate_u64_offsets(
+        vector_offsets,
+        self.bytes(SectionId::VectorData).len(),
+        "VectorOffsets",
+      )?;
+      Some(vector_offsets.len() / 8 - 1)
+    } else {
+      None
+    };
+
+    let node_prop_vals = self.bytes(SectionId::NodePropVals);
+    Self::validate_property_values(node_prop_vals, num_strings, vector_count, "NodePropVals")?;
+    Self::validate_u32_offsets(
+      self.bytes(SectionId::NodePropOffsets),
+      node_prop_vals.len() / PROP_VALUE_DISK_SIZE,
+      "NodePropOffsets",
     )?;
-    let label_ids = self
-      .validate_exact_section(SectionId::LabelStringIds, label_ids_len, true)?
-      .ok_or_else(|| Self::invalid_section("LabelStringIds", "section is missing"))?;
-    Self::validate_string_id_array(label_ids.as_ref(), num_strings, "LabelStringIds")?;
-
-    let etype_ids_len = Self::checked_bytes(
-      Self::checked_count_plus_one(self.header.num_etypes, "EtypeStringIds")?,
-      4,
-      "EtypeStringIds",
+    let edge_prop_vals = self.bytes(SectionId::EdgePropVals);
+    Self::validate_property_values(edge_prop_vals, num_strings, vector_count, "EdgePropVals")?;
+    Self::validate_u32_offsets(
+      self.bytes(SectionId::EdgePropOffsets),
+      edge_prop_vals.len() / PROP_VALUE_DISK_SIZE,
+      "EdgePropOffsets",
     )?;
-    let etype_ids = self
-      .validate_exact_section(SectionId::EtypeStringIds, etype_ids_len, true)?
-      .ok_or_else(|| Self::invalid_section("EtypeStringIds", "section is missing"))?;
-    Self::validate_string_id_array(etype_ids.as_ref(), num_strings, "EtypeStringIds")?;
 
-    let propkey_ids_len = Self::checked_bytes(
-      Self::checked_count_plus_one(self.header.num_propkeys, "PropkeyStringIds")?,
-      4,
-      "PropkeyStringIds",
-    )?;
-    let propkey_ids = self
-      .validate_exact_section(SectionId::PropkeyStringIds, propkey_ids_len, true)?
-      .ok_or_else(|| Self::invalid_section("PropkeyStringIds", "section is missing"))?;
-    Self::validate_string_id_array(propkey_ids.as_ref(), num_strings, "PropkeyStringIds")?;
-
-    let node_key_len = Self::checked_bytes(num_nodes, 4, "NodeKeyString")?;
-    let node_keys = self
-      .validate_exact_section(SectionId::NodeKeyString, node_key_len, node_key_len != 0)?
-      .unwrap_or(SectionBytes::Borrowed(&[]));
-    Self::validate_string_id_array(node_keys.as_ref(), num_strings, "NodeKeyString")?;
-
-    let key_entries = self.section_data_for_validation(SectionId::KeyEntries, false)?;
-    let key_entry_bytes = key_entries
-      .as_ref()
-      .map(|bytes| bytes.as_ref())
-      .unwrap_or(&[]);
-    if key_entry_bytes.len() % KEY_INDEX_ENTRY_SIZE != 0 {
-      return Err(Self::invalid_section(
-        "KeyEntries",
-        "entry array has a partial entry",
-      ));
+    if flags.contains(SnapshotFlags::HAS_NODE_LABELS) {
+      Self::validate_u32_offsets(
+        self.bytes(SectionId::NodeLabelOffsets),
+        self.bytes(SectionId::NodeLabelIds).len() / 4,
+        "NodeLabelOffsets",
+      )?;
     }
-    let key_entry_count = key_entry_bytes.len() / KEY_INDEX_ENTRY_SIZE;
-    if key_entry_count > num_nodes {
-      return Err(Self::invalid_section(
-        "KeyEntries",
-        format!("entry count {key_entry_count} exceeds node count {num_nodes}"),
-      ));
+
+    if flags.contains(SnapshotFlags::HAS_VECTOR_STORES) {
+      self.validate_vector_store_index()?;
     }
-    for index in 0..key_entry_count {
+
+    Ok(())
+  }
+
+  /// KeyEntries must reference strings and present nodes, and lookup_by_key
+  /// must be able to find them: through KeyBuckets, or by binary search on
+  /// hash-sorted entries when there are no buckets.
+  fn validate_key_index(&self, num_strings: usize) -> Result<()> {
+    let entries = self.bytes(SectionId::KeyEntries);
+    let entry_count = entries.len() / KEY_INDEX_ENTRY_SIZE;
+    for index in 0..entry_count {
       let entry_offset = index * KEY_INDEX_ENTRY_SIZE;
-      let string_id = read_u32(key_entry_bytes, entry_offset + 8) as usize;
-      if string_id > num_strings {
+      let string_id = read_u32(entries, entry_offset + 8);
+      if !string_id_in_table(u64::from(string_id), num_strings) {
         return Err(Self::invalid_section(
           "KeyEntries",
-          format!("string ID {string_id} at entry {index} exceeds {num_strings}"),
+          format!("string ID {string_id} at entry {index} is outside 0..{num_strings}"),
         ));
       }
-      let node_id = read_u64(key_entry_bytes, entry_offset + 16);
+      let node_id = read_u64(entries, entry_offset + 16);
       if self.phys_node(node_id).is_none() {
         return Err(Self::invalid_section(
           "KeyEntries",
@@ -975,333 +1054,133 @@ impl SnapshotData {
       }
     }
 
-    let key_buckets = self.section_data_for_validation(
-      SectionId::KeyBuckets,
-      self.header.flags.contains(SnapshotFlags::HAS_KEY_BUCKETS),
-    )?;
-    if let Some(key_buckets) = key_buckets {
-      let key_buckets = key_buckets.as_ref();
-      if key_buckets.len() < 8 || key_buckets.len() % 4 != 0 {
-        return Err(Self::invalid_section(
-          "KeyBuckets",
-          "bucket array must contain at least two u32 offsets",
-        ));
-      }
-      Self::validate_u32_offsets(key_buckets, key_entry_count, "KeyBuckets")?;
-      if read_u32_at(key_buckets, 0) != 0
-        || read_u32_at(key_buckets, key_buckets.len() / 4 - 1) as usize != key_entry_count
-      {
-        return Err(Self::invalid_section(
-          "KeyBuckets",
-          "bucket offsets do not cover all key entries",
-        ));
-      }
-    }
-
-    let vector_count = if self.header.flags.contains(SnapshotFlags::HAS_VECTORS) {
-      let vector_offsets = self
-        .section_data_for_validation(SectionId::VectorOffsets, true)?
-        .ok_or_else(|| Self::invalid_section("VectorOffsets", "section is missing"))?;
-      let vector_data = self
-        .section_data_for_validation(SectionId::VectorData, true)?
-        .ok_or_else(|| Self::invalid_section("VectorData", "section is missing"))?;
-      if vector_offsets.as_ref().len() < 16 {
-        return Err(Self::invalid_section(
-          "VectorOffsets",
-          "vector offset array must contain at least one vector",
-        ));
-      }
-      if vector_data.as_ref().len() % 4 != 0 {
-        return Err(Self::invalid_section(
-          "VectorData",
-          "vector data is not a multiple of 4 bytes",
-        ));
-      }
-      Self::validate_u64_offsets(
-        vector_offsets.as_ref(),
-        vector_data.as_ref().len(),
-        "VectorOffsets",
-      )?;
-      Some(vector_offsets.as_ref().len() / 8 - 1)
-    } else {
-      None
-    };
-
-    let node_prop_offsets = self
-      .validate_exact_section(SectionId::NodePropOffsets, node_offsets_len, true)?
-      .ok_or_else(|| Self::invalid_section("NodePropOffsets", "section is missing"))?;
-    let node_prop_keys = self.section_data_for_validation(SectionId::NodePropKeys, false)?;
-    let node_prop_vals = self.section_data_for_validation(SectionId::NodePropVals, false)?;
-    let node_prop_keys = node_prop_keys
-      .as_ref()
-      .map(|bytes| bytes.as_ref())
-      .unwrap_or(&[]);
-    let node_prop_vals = node_prop_vals
-      .as_ref()
-      .map(|bytes| bytes.as_ref())
-      .unwrap_or(&[]);
-    if node_prop_keys.len() % 4 != 0 || node_prop_vals.len() % PROP_VALUE_DISK_SIZE != 0 {
-      return Err(Self::invalid_section(
-        "NodePropKeys",
-        "property arrays contain partial entries",
-      ));
-    }
-    let node_prop_count = node_prop_keys.len() / 4;
-    if node_prop_vals.len() / PROP_VALUE_DISK_SIZE != node_prop_count {
-      return Err(Self::invalid_section(
-        "NodePropVals",
-        "property key/value counts differ",
-      ));
-    }
-    Self::validate_property_values(node_prop_vals, num_strings, vector_count, "NodePropVals")?;
-    Self::validate_u32_offsets(
-      node_prop_offsets.as_ref(),
-      node_prop_count,
-      "NodePropOffsets",
-    )?;
-
-    let edge_offsets_len = Self::checked_bytes(
-      num_edges
-        .checked_add(1)
-        .ok_or_else(|| Self::invalid_section("EdgePropOffsets", "edge count overflows"))?,
-      4,
-      "EdgePropOffsets",
-    )?;
-    let edge_prop_offsets = self
-      .validate_exact_section(SectionId::EdgePropOffsets, edge_offsets_len, true)?
-      .ok_or_else(|| Self::invalid_section("EdgePropOffsets", "section is missing"))?;
-    let edge_prop_keys = self.section_data_for_validation(SectionId::EdgePropKeys, false)?;
-    let edge_prop_vals = self.section_data_for_validation(SectionId::EdgePropVals, false)?;
-    let edge_prop_keys = edge_prop_keys
-      .as_ref()
-      .map(|bytes| bytes.as_ref())
-      .unwrap_or(&[]);
-    let edge_prop_vals = edge_prop_vals
-      .as_ref()
-      .map(|bytes| bytes.as_ref())
-      .unwrap_or(&[]);
-    if edge_prop_keys.len() % 4 != 0 || edge_prop_vals.len() % PROP_VALUE_DISK_SIZE != 0 {
-      return Err(Self::invalid_section(
-        "EdgePropKeys",
-        "property arrays contain partial entries",
-      ));
-    }
-    let edge_prop_count = edge_prop_keys.len() / 4;
-    if edge_prop_vals.len() / PROP_VALUE_DISK_SIZE != edge_prop_count {
-      return Err(Self::invalid_section(
-        "EdgePropVals",
-        "property key/value counts differ",
-      ));
-    }
-    Self::validate_property_values(edge_prop_vals, num_strings, vector_count, "EdgePropVals")?;
-    Self::validate_u32_offsets(
-      edge_prop_offsets.as_ref(),
-      edge_prop_count,
-      "EdgePropOffsets",
-    )?;
-
-    if self.header.flags.contains(SnapshotFlags::HAS_NODE_LABELS) {
-      let label_offsets = self
-        .validate_exact_section(SectionId::NodeLabelOffsets, node_offsets_len, true)?
-        .ok_or_else(|| Self::invalid_section("NodeLabelOffsets", "section is missing"))?;
-      let label_ids = self.section_data_for_validation(SectionId::NodeLabelIds, false)?;
-      let label_ids = label_ids
-        .as_ref()
-        .map(|bytes| bytes.as_ref())
-        .unwrap_or(&[]);
-      if label_ids.len() % 4 != 0 {
-        return Err(Self::invalid_section(
-          "NodeLabelIds",
-          "label array is not a multiple of 4 bytes",
-        ));
-      }
-      Self::validate_u32_offsets(
-        label_offsets.as_ref(),
-        label_ids.len() / 4,
-        "NodeLabelOffsets",
-      )?;
-    }
-
-    if self.header.flags.contains(SnapshotFlags::HAS_VECTOR_STORES) {
-      let index = self
-        .section_data_for_validation(SectionId::VectorStoreIndex, true)?
-        .ok_or_else(|| Self::invalid_section("VectorStoreIndex", "section is missing"))?;
-      let data = self
-        .section_data_for_validation(SectionId::VectorStoreData, true)?
-        .ok_or_else(|| Self::invalid_section("VectorStoreData", "section is missing"))?;
-      let index = index.as_ref();
-      if index.len() < 4 {
-        return Err(Self::invalid_section(
-          "VectorStoreIndex",
-          "index is smaller than its count",
-        ));
-      }
-      let count = read_u32(index, 0) as usize;
-      let entries_len = Self::checked_bytes(count, 20, "VectorStoreIndex")?;
-      let expected_len = entries_len
-        .checked_add(4)
-        .ok_or_else(|| Self::invalid_section("VectorStoreIndex", "index size overflows"))?;
-      if index.len() != expected_len {
-        return Err(Self::invalid_section(
-          "VectorStoreIndex",
-          format!(
-            "count {count} requires {expected_len} bytes, found {}",
-            index.len()
-          ),
-        ));
-      }
-      for entry in 0..count {
-        let entry_offset = 4 + entry * 20;
-        let payload_offset = usize::try_from(read_u64(index, entry_offset + 4)).map_err(|_| {
-          Self::invalid_section(
-            "VectorStoreIndex",
-            format!("entry {entry} offset overflows"),
-          )
-        })?;
-        let payload_len = usize::try_from(read_u64(index, entry_offset + 12)).map_err(|_| {
-          Self::invalid_section(
-            "VectorStoreIndex",
-            format!("entry {entry} length overflows"),
-          )
-        })?;
-        let payload_end = payload_offset.checked_add(payload_len).ok_or_else(|| {
-          Self::invalid_section("VectorStoreIndex", format!("entry {entry} range overflows"))
-        })?;
-        if payload_end > data.as_ref().len() {
+    match self.section(SectionId::KeyBuckets) {
+      Some(buckets) => {
+        Self::validate_u32_offsets(buckets, entry_count, "KeyBuckets")?;
+        if read_u32_at(buckets, 0) != 0
+          || read_u32_at(buckets, buckets.len() / 4 - 1) as usize != entry_count
+        {
           return Err(Self::invalid_section(
-            "VectorStoreIndex",
-            format!("entry {entry} exceeds VectorStoreData"),
+            "KeyBuckets",
+            "bucket offsets do not cover all key entries",
+          ));
+        }
+      }
+      None => {
+        if let Some(index) = (1..entry_count)
+          .find(|&index| key_entry_hash(entries, index - 1) > key_entry_hash(entries, index))
+        {
+          return Err(Self::invalid_section(
+            "KeyEntries",
+            format!(
+              "entry {index} is out of hash order, and there is no KeyBuckets section to \
+               find entries by bucket"
+            ),
           ));
         }
       }
     }
-
     Ok(())
   }
 
-  fn init_string_cache(num_strings: u64) -> Result<Vec<OnceLock<Arc<str>>>> {
-    let base_len = usize::try_from(num_strings)
-      .map_err(|_| KiteError::InvalidSnapshot("Snapshot string table too large".to_string()))?;
-    let len = base_len
-      .checked_add(1)
-      .ok_or_else(|| KiteError::InvalidSnapshot("Snapshot string table too large".to_string()))?;
-    Ok(std::iter::repeat_with(OnceLock::new).take(len).collect())
+  fn validate_vector_store_index(&self) -> Result<()> {
+    let index = self.bytes(SectionId::VectorStoreIndex);
+    let data_len = self.bytes(SectionId::VectorStoreData).len();
+    if index.len() < 4 {
+      return Err(Self::invalid_section(
+        "VectorStoreIndex",
+        "index is smaller than its count",
+      ));
+    }
+    let count = read_u32(index, 0) as usize;
+    let entries_len = Self::checked_bytes(count, 20, "VectorStoreIndex")?;
+    let expected_len = entries_len
+      .checked_add(4)
+      .ok_or_else(|| Self::invalid_section("VectorStoreIndex", "index size overflows"))?;
+    if index.len() != expected_len {
+      return Err(Self::invalid_section(
+        "VectorStoreIndex",
+        format!(
+          "count {count} requires {expected_len} bytes, found {}",
+          index.len()
+        ),
+      ));
+    }
+    for entry in 0..count {
+      let entry_offset = 4 + entry * 20;
+      let payload_offset = usize::try_from(read_u64(index, entry_offset + 4)).map_err(|_| {
+        Self::invalid_section(
+          "VectorStoreIndex",
+          format!("entry {entry} offset overflows"),
+        )
+      })?;
+      let payload_len = usize::try_from(read_u64(index, entry_offset + 12)).map_err(|_| {
+        Self::invalid_section(
+          "VectorStoreIndex",
+          format!("entry {entry} length overflows"),
+        )
+      })?;
+      let payload_end = payload_offset.checked_add(payload_len).ok_or_else(|| {
+        Self::invalid_section("VectorStoreIndex", format!("entry {entry} range overflows"))
+      })?;
+      if payload_end > data_len {
+        return Err(Self::invalid_section(
+          "VectorStoreIndex",
+          format!("entry {entry} exceeds VectorStoreData"),
+        ));
+      }
+    }
+    Ok(())
   }
 
-  /// Get raw section bytes (possibly compressed)
-  fn raw_section_bytes(&self, id: SectionId) -> Option<&[u8]> {
-    let section = self.sections.get(id as usize)?;
-    if section.length == 0 {
-      return None;
+  /// Names for a LabelStringIds/EtypeStringIds/PropkeyStringIds table,
+  /// indexed by schema ID. String ID 0 (and invalid UTF-8) has no name.
+  fn decode_names(&self, id: SectionId) -> Vec<Option<Box<str>>> {
+    let string_ids = self.bytes(id);
+    (0..string_ids.len() / 4)
+      .map(|index| match read_u32_at(string_ids, index) {
+        0 => None,
+        string_id => self.string_str(string_id).map(Box::from),
+      })
+      .collect()
+  }
+
+  // ========================================================================
+  // Section access
+  // ========================================================================
+
+  /// Decompressed bytes of section `id`, or None if it is absent or empty.
+  #[inline]
+  pub(crate) fn section(&self, id: SectionId) -> Option<&[u8]> {
+    match &self.views[id as usize] {
+      SectionView::Empty => None,
+      SectionView::Mapped { start, end } => Some(&self.mmap[*start..*end]),
+      SectionView::Inflated(bytes) => Some(bytes),
     }
-    let start = section.offset as usize;
-    let end = start + section.length as usize;
-    Some(&self.mmap[start..end])
   }
 
   /// Get decompressed section bytes
   pub fn section_bytes(&self, id: SectionId) -> Option<Vec<u8>> {
-    let section = self.sections.get(id as usize)?;
-    if section.length == 0 {
-      return None;
-    }
-
-    // Check cache first
-    {
-      let cache = self.decompressed_cache.read();
-      if let Some(cached) = cache.get(&id) {
-        return Some(cached.as_ref().to_vec());
-      }
-    }
-
-    let raw_bytes = self.raw_section_bytes(id)?;
-
-    // If not compressed, return copy of raw bytes
-    let compression =
-      CompressionType::from_u32(section.compression).unwrap_or(CompressionType::None);
-
-    if compression == CompressionType::None {
-      return Some(raw_bytes.to_vec());
-    }
-
-    // Decompress
-    let uncompressed_size = usize::try_from(section.uncompressed_size).ok()?;
-    let decompressed =
-      Arc::<[u8]>::from(decompress_with_size(raw_bytes, compression, uncompressed_size).ok()?);
-
-    // Cache the result
-    {
-      let mut cache = self.decompressed_cache.write();
-      cache.insert(id, Arc::clone(&decompressed));
-    }
-
-    Some(decompressed.as_ref().to_vec())
+    self.section(id).map(<[u8]>::to_vec)
   }
 
-  /// Get section bytes as a slice (for uncompressed or already-cached sections)
-  /// Returns None if section doesn't exist or is compressed and not cached
+  /// Get section bytes as a slice of the mmap.
+  /// Returns None if the section doesn't exist or is compressed.
   pub fn section_slice(&self, id: SectionId) -> Option<&[u8]> {
-    let section = self.sections.get(id as usize)?;
-    if section.length == 0 {
-      return None;
+    match self.views[id as usize] {
+      SectionView::Mapped { .. } => self.section(id),
+      SectionView::Empty | SectionView::Inflated(_) => None,
     }
-
-    // Only return direct slice for uncompressed sections
-    if section.compression == 0 {
-      return self.raw_section_bytes(id);
-    }
-
-    None
   }
 
   /// Get section data as a slice, decompressing if needed.
   pub fn section_data(&self, id: SectionId) -> Option<Cow<'_, [u8]>> {
-    let data = self.section_data_shared(id)?;
-    match data {
-      SectionBytes::Borrowed(bytes) => Some(Cow::Borrowed(bytes)),
-      SectionBytes::Shared(bytes) => Some(Cow::Owned(bytes.as_ref().to_vec())),
-    }
+    self.section(id).map(Cow::Borrowed)
   }
 
   /// Get section data as a borrowed slice or shared buffer.
   pub fn section_data_shared(&self, id: SectionId) -> Option<SectionBytes<'_>> {
-    if let Some(slice) = self.section_slice(id) {
-      return Some(SectionBytes::Borrowed(slice));
-    }
-
-    let section = self.sections.get(id as usize)?;
-    if section.length == 0 {
-      return None;
-    }
-
-    // Check cache first
-    {
-      let cache = self.decompressed_cache.read();
-      if let Some(cached) = cache.get(&id) {
-        return Some(SectionBytes::Shared(Arc::clone(cached)));
-      }
-    }
-
-    let raw_bytes = self.raw_section_bytes(id)?;
-    let compression =
-      CompressionType::from_u32(section.compression).unwrap_or(CompressionType::None);
-
-    if compression == CompressionType::None {
-      return Some(SectionBytes::Borrowed(raw_bytes));
-    }
-
-    // Decompress
-    let uncompressed_size = usize::try_from(section.uncompressed_size).ok()?;
-    let decompressed =
-      Arc::<[u8]>::from(decompress_with_size(raw_bytes, compression, uncompressed_size).ok()?);
-
-    // Cache the result
-    {
-      let mut cache = self.decompressed_cache.write();
-      cache.insert(id, Arc::clone(&decompressed));
-    }
-
-    Some(SectionBytes::Shared(decompressed))
+    self.section(id).map(SectionBytes::Borrowed)
   }
 
   // ========================================================================
@@ -1311,17 +1190,16 @@ impl SnapshotData {
   /// Get NodeID for a physical node index
   #[inline]
   pub fn node_id(&self, phys: PhysNode) -> Option<NodeId> {
-    let section = self.section_data_shared(SectionId::PhysToNodeId)?;
-    u64_at(section.as_ref(), phys as usize)
+    u64_at(self.section(SectionId::PhysToNodeId)?, phys as usize)
   }
 
   /// Get physical node index for a NodeID, or None if not present
   #[inline]
   pub fn phys_node(&self, node_id: NodeId) -> Option<PhysNode> {
-    let map = self.section_data_shared(SectionId::NodeIdToPhys)?;
+    let map = self.section(SectionId::NodeIdToPhys)?;
     match self.node_id_map {
-      NodeIdMapLayout::Dense => node_map::dense_lookup(map.as_ref(), node_id),
-      NodeIdMapLayout::Sparse => node_map::sparse_lookup(map.as_ref(), node_id),
+      NodeIdMapLayout::Dense => node_map::dense_lookup(map, node_id),
+      NodeIdMapLayout::Sparse => node_map::sparse_lookup(map, node_id),
     }
   }
 
@@ -1367,19 +1245,22 @@ impl SnapshotData {
 
   /// Get string by StringID
   pub fn string(&self, string_id: StringId) -> Option<String> {
+    self.string_str(string_id).map(str::to_owned)
+  }
+
+  /// String `string_id`, borrowed, if it is valid UTF-8.
+  fn string_str(&self, string_id: StringId) -> Option<&str> {
+    std::str::from_utf8(self.string_bytes(string_id)?).ok()
+  }
+
+  /// Raw bytes of string `string_id`.
+  pub(crate) fn string_bytes(&self, string_id: StringId) -> Option<&[u8]> {
     if string_id == 0 {
-      return Some(String::new());
+      return Some(&[]);
     }
-
-    let offsets = self.section_data_shared(SectionId::StringOffsets)?;
-    let bytes = self.section_data_shared(SectionId::StringBytes)?;
-    let bytes = bytes.as_ref();
-    let (start, end) = self.string_range(offsets.as_ref(), string_id as usize)?;
-    if end > bytes.len() {
-      return None;
-    }
-
-    String::from_utf8(bytes[start..end].to_vec()).ok()
+    let offsets = self.section(SectionId::StringOffsets)?;
+    let (start, end) = self.string_range(offsets, string_id as usize)?;
+    self.bytes(SectionId::StringBytes).get(start..end)
   }
 
   /// Byte range of string `index` in StringBytes.
@@ -1393,31 +1274,14 @@ impl SnapshotData {
     (start <= end).then_some((start, end))
   }
 
-  fn string_cached(&self, string_id: StringId) -> Option<&str> {
-    if string_id == 0 {
-      return Some("");
-    }
-
-    let idx = string_id as usize;
-    let cell = self.string_cache.get(idx)?;
-    if let Some(value) = cell.get() {
-      return Some(value.as_ref());
-    }
-
-    let value = self.string(string_id)?;
-    let arc: Arc<str> = Arc::from(value);
-    let _ = cell.set(arc);
-    cell.get().map(|value| value.as_ref())
-  }
-
   // ========================================================================
   // Edge accessors
   // ========================================================================
 
   /// Get out-edge offset range for a physical node
+  #[inline]
   fn out_edge_range(&self, phys: PhysNode) -> Option<(usize, usize)> {
-    let offsets = self.section_data_shared(SectionId::OutOffsets)?;
-    u32_range_at(offsets.as_ref(), phys as usize)
+    u32_range_at(self.section(SectionId::OutOffsets)?, phys as usize)
   }
 
   /// Get out-degree for a physical node
@@ -1428,46 +1292,7 @@ impl SnapshotData {
 
   /// Check if an edge exists in the snapshot (binary search)
   pub fn has_edge(&self, src_phys: PhysNode, etype: ETypeId, dst_phys: PhysNode) -> bool {
-    let (start, end) = match self.out_edge_range(src_phys) {
-      Some(range) => range,
-      None => return false,
-    };
-
-    let out_etype = match self.section_data_shared(SectionId::OutEtype) {
-      Some(s) => s,
-      None => return false,
-    };
-    let out_dst = match self.section_data_shared(SectionId::OutDst) {
-      Some(s) => s,
-      None => return false,
-    };
-    let out_etype = out_etype.as_ref();
-    let out_dst = out_dst.as_ref();
-    let end = end.min(out_etype.len() / 4).min(out_dst.len() / 4);
-
-    // Binary search since edges are sorted by (etype, dst)
-    let mut lo = start;
-    let mut hi = end;
-
-    while lo < hi {
-      let mid = (lo + hi) / 2;
-      let mid_etype = read_u32_at(out_etype, mid);
-      let mid_dst = read_u32_at(out_dst, mid);
-
-      if mid_etype < etype || (mid_etype == etype && mid_dst < dst_phys) {
-        lo = mid + 1;
-      } else {
-        hi = mid;
-      }
-    }
-
-    if lo < end {
-      let found_etype = read_u32_at(out_etype, lo);
-      let found_dst = read_u32_at(out_dst, lo);
-      found_etype == etype && found_dst == dst_phys
-    } else {
-      false
-    }
+    self.find_edge_index(src_phys, etype, dst_phys).is_some()
   }
 
   /// Find edge index for a specific edge (returns None if not found)
@@ -1478,37 +1303,24 @@ impl SnapshotData {
     dst_phys: PhysNode,
   ) -> Option<usize> {
     let (start, end) = self.out_edge_range(src_phys)?;
-    let out_etype = self.section_data_shared(SectionId::OutEtype)?;
-    let out_dst = self.section_data_shared(SectionId::OutDst)?;
-    let out_etype = out_etype.as_ref();
-    let out_dst = out_dst.as_ref();
+    let out_etype = self.section(SectionId::OutEtype)?;
+    let out_dst = self.section(SectionId::OutDst)?;
     let end = end.min(out_etype.len() / 4).min(out_dst.len() / 4);
-
-    // Binary search
-    let mut lo = start;
-    let mut hi = end;
-
-    while lo < hi {
-      let mid = (lo + hi) / 2;
-      let mid_etype = read_u32_at(out_etype, mid);
-      let mid_dst = read_u32_at(out_dst, mid);
-
-      if mid_etype < etype || (mid_etype == etype && mid_dst < dst_phys) {
-        lo = mid + 1;
-      } else {
-        hi = mid;
-      }
+    if start >= end {
+      return None;
     }
 
-    if lo < end {
-      let found_etype = read_u32_at(out_etype, lo);
-      let found_dst = read_u32_at(out_dst, lo);
-      if found_etype == etype && found_dst == dst_phys {
-        return Some(lo);
-      }
-    }
-
-    None
+    // Edges are sorted by (etype, dst) within the node's range.
+    let target = (etype, dst_phys);
+    let index = start
+      + partition_point(end - start, |offset| {
+        let index = start + offset;
+        (read_u32_at(out_etype, index), read_u32_at(out_dst, index)) < target
+      });
+    (index < end
+      && read_u32_at(out_etype, index) == etype
+      && read_u32_at(out_dst, index) == dst_phys)
+      .then_some(index)
   }
 
   /// Iterate out-edges for a physical node
@@ -1517,12 +1329,12 @@ impl SnapshotData {
   }
 
   /// Get in-edge offset range for a physical node
+  #[inline]
   fn in_edge_range(&self, phys: PhysNode) -> Option<(usize, usize)> {
     if !self.header.flags.contains(SnapshotFlags::HAS_IN_EDGES) {
       return None;
     }
-    let offsets = self.section_data_shared(SectionId::InOffsets)?;
-    u32_range_at(offsets.as_ref(), phys as usize)
+    u32_range_at(self.section(SectionId::InOffsets)?, phys as usize)
   }
 
   /// Get in-degree for a physical node
@@ -1542,80 +1354,46 @@ impl SnapshotData {
 
   /// Look up a node by key in the snapshot
   pub fn lookup_by_key(&self, key: &str) -> Option<NodeId> {
-    let hash64 = xxhash64_string(key);
-
-    let key_entries = self.section_data_shared(SectionId::KeyEntries)?;
-    let key_entries = key_entries.as_ref();
-    let num_entries = key_entries.len() / KEY_INDEX_ENTRY_SIZE;
+    let entries = self.section(SectionId::KeyEntries)?;
+    let num_entries = entries.len() / KEY_INDEX_ENTRY_SIZE;
     if num_entries == 0 {
       return None;
     }
+    let hash64 = xxhash64_string(key);
 
-    let (lo, hi) = if let Some(buckets) = self.section_data_shared(SectionId::KeyBuckets) {
-      let buckets = buckets.as_ref();
-      if buckets.len() > 4 {
-        let num_buckets = buckets.len() / 4 - 1;
-        let bucket = (hash64 % num_buckets as u64) as usize;
-        let lo = read_u32_at(buckets, bucket) as usize;
-        let hi = read_u32_at(buckets, bucket + 1) as usize;
-        (lo, hi)
-      } else {
-        self.binary_search_key_hash(key_entries, hash64, num_entries)
+    let (lo, hi) = match self.section(SectionId::KeyBuckets) {
+      Some(buckets) => {
+        // Load checked there are at least two offsets.
+        let num_buckets = (buckets.len() / 4 - 1) as u64;
+        let bucket = (hash64 % num_buckets) as usize;
+        (
+          read_u32_at(buckets, bucket) as usize,
+          read_u32_at(buckets, bucket + 1) as usize,
+        )
       }
-    } else {
-      self.binary_search_key_hash(key_entries, hash64, num_entries)
+      // Load checked that bucketless entries are sorted by hash.
+      None => (
+        partition_point(num_entries, |index| key_entry_hash(entries, index) < hash64),
+        partition_point(num_entries, |index| {
+          key_entry_hash(entries, index) <= hash64
+        }),
+      ),
     };
 
-    // Check all entries in range with matching hash (handle collisions)
-    for i in lo..hi.min(num_entries) {
-      let offset = i * KEY_INDEX_ENTRY_SIZE;
-      let entry_hash = read_u64(key_entries, offset);
-
-      if entry_hash != hash64 {
-        continue;
+    // Check every entry in range with a matching hash (collisions).
+    (lo..hi.min(num_entries)).find_map(|index| {
+      let offset = index * KEY_INDEX_ENTRY_SIZE;
+      if read_u64(entries, offset) != hash64 {
+        return None;
       }
-
-      let string_id = read_u32(key_entries, offset + 8);
-      let node_id = read_u64(key_entries, offset + 16);
-
-      // Compare actual key
-      if let Some(entry_key) = self.string(string_id) {
-        if entry_key == key {
-          return Some(node_id);
-        }
-      }
-    }
-
-    None
-  }
-
-  /// Binary search for first entry with matching hash
-  fn binary_search_key_hash(
-    &self,
-    entries: &[u8],
-    hash64: u64,
-    num_entries: usize,
-  ) -> (usize, usize) {
-    let mut lo = 0;
-    let mut hi = num_entries;
-
-    while lo < hi {
-      let mid = (lo + hi) / 2;
-      let mid_hash = read_u64(entries, mid * KEY_INDEX_ENTRY_SIZE);
-      if mid_hash < hash64 {
-        lo = mid + 1;
-      } else {
-        hi = mid;
-      }
-    }
-
-    (lo, num_entries)
+      let string_id = read_u32(entries, offset + 8);
+      (self.string_bytes(string_id)? == key.as_bytes()).then(|| read_u64(entries, offset + 16))
+    })
   }
 
   /// Get the key for a node, if any
   pub fn node_key(&self, phys: PhysNode) -> Option<String> {
-    let node_key_string = self.section_data_shared(SectionId::NodeKeyString)?;
-    let string_id = u32_at(node_key_string.as_ref(), phys as usize)?;
+    let string_id = u32_at(self.section(SectionId::NodeKeyString)?, phys as usize)?;
     if string_id == 0 {
       return None;
     }
@@ -1632,11 +1410,9 @@ impl SnapshotData {
       return None;
     }
 
-    let offsets = self.section_data_shared(SectionId::NodeLabelOffsets)?;
-    let labels = self.section_data_shared(SectionId::NodeLabelIds)?;
-    let labels = labels.as_ref();
-
-    let (start, end) = u32_range_at(offsets.as_ref(), phys as usize)?;
+    let offsets = self.section(SectionId::NodeLabelOffsets)?;
+    let labels = self.bytes(SectionId::NodeLabelIds);
+    let (start, end) = u32_range_at(offsets, phys as usize)?;
     let end = end.min(labels.len() / 4);
 
     Some(
@@ -1650,84 +1426,70 @@ impl SnapshotData {
   // Property access
   // ========================================================================
 
-  /// Get all properties for a node
-  pub fn node_props(&self, phys: PhysNode) -> Option<HashMap<PropKeyId, PropValue>> {
+  /// Property key and value arrays and the range of `index` in them.
+  #[inline]
+  fn prop_range(
+    &self,
+    offsets: SectionId,
+    keys: SectionId,
+    vals: SectionId,
+    index: usize,
+  ) -> Option<(&[u8], &[u8], usize, usize)> {
     if !self.header.flags.contains(SnapshotFlags::HAS_PROPERTIES) {
       return None;
     }
+    let (start, end) = u32_range_at(self.section(offsets)?, index)?;
+    let keys = self.bytes(keys);
+    Some((keys, self.bytes(vals), start, end.min(keys.len() / 4)))
+  }
 
-    let offsets = self.section_data_shared(SectionId::NodePropOffsets)?;
-    let keys = self.section_data_shared(SectionId::NodePropKeys)?;
-    let vals = self.section_data_shared(SectionId::NodePropVals)?;
-    let offsets = offsets.as_ref();
-    let keys = keys.as_ref();
-    let vals = vals.as_ref();
-
-    let (start, end) = u32_range_at(offsets, phys as usize)?;
-    let end = end.min(keys.len() / 4);
-
-    let mut props = HashMap::new();
+  fn collect_props(
+    &self,
+    offsets: SectionId,
+    keys: SectionId,
+    vals: SectionId,
+    index: usize,
+  ) -> Option<HashMap<PropKeyId, PropValue>> {
+    let (keys, vals, start, end) = self.prop_range(offsets, keys, vals, index)?;
+    let mut props = HashMap::with_capacity(end.saturating_sub(start));
     for i in start..end {
-      let key_id = read_u32_at(keys, i);
       if let Some(value) = self.decode_prop_value(vals, i) {
-        props.insert(key_id, value);
+        props.insert(read_u32_at(keys, i), value);
       }
     }
-
     Some(props)
+  }
+
+  /// Get all properties for a node
+  pub fn node_props(&self, phys: PhysNode) -> Option<HashMap<PropKeyId, PropValue>> {
+    self.collect_props(
+      SectionId::NodePropOffsets,
+      SectionId::NodePropKeys,
+      SectionId::NodePropVals,
+      phys as usize,
+    )
   }
 
   /// Get a specific property for a node
   pub fn node_prop(&self, phys: PhysNode, prop_key_id: PropKeyId) -> Option<PropValue> {
-    if !self.header.flags.contains(SnapshotFlags::HAS_PROPERTIES) {
-      return None;
-    }
-
-    let offsets = self.section_data_shared(SectionId::NodePropOffsets)?;
-    let keys = self.section_data_shared(SectionId::NodePropKeys)?;
-    let vals = self.section_data_shared(SectionId::NodePropVals)?;
-    let offsets = offsets.as_ref();
-    let keys = keys.as_ref();
-    let vals = vals.as_ref();
-
-    let (start, end) = u32_range_at(offsets, phys as usize)?;
-    let end = end.min(keys.len() / 4);
-
-    for i in start..end {
-      let key_id = read_u32_at(keys, i);
-      if key_id == prop_key_id {
-        return self.decode_prop_value(vals, i);
-      }
-    }
-
-    None
+    let (keys, vals, start, end) = self.prop_range(
+      SectionId::NodePropOffsets,
+      SectionId::NodePropKeys,
+      SectionId::NodePropVals,
+      phys as usize,
+    )?;
+    let index = (start..end).find(|&i| read_u32_at(keys, i) == prop_key_id)?;
+    self.decode_prop_value(vals, index)
   }
 
   /// Get all properties for an edge by edge index
   pub fn edge_props(&self, edge_idx: usize) -> Option<HashMap<PropKeyId, PropValue>> {
-    if !self.header.flags.contains(SnapshotFlags::HAS_PROPERTIES) {
-      return None;
-    }
-
-    let offsets = self.section_data_shared(SectionId::EdgePropOffsets)?;
-    let keys = self.section_data_shared(SectionId::EdgePropKeys)?;
-    let vals = self.section_data_shared(SectionId::EdgePropVals)?;
-    let offsets = offsets.as_ref();
-    let keys = keys.as_ref();
-    let vals = vals.as_ref();
-
-    let (start, end) = u32_range_at(offsets, edge_idx)?;
-    let end = end.min(keys.len() / 4);
-
-    let mut props = HashMap::new();
-    for i in start..end {
-      let key_id = read_u32_at(keys, i);
-      if let Some(value) = self.decode_prop_value(vals, i) {
-        props.insert(key_id, value);
-      }
-    }
-
-    Some(props)
+    self.collect_props(
+      SectionId::EdgePropOffsets,
+      SectionId::EdgePropKeys,
+      SectionId::EdgePropVals,
+      edge_idx,
+    )
   }
 
   /// Decode property value `index` from disk format
@@ -1754,28 +1516,23 @@ impl SnapshotData {
           return None;
         }
 
-        let offsets = self.section_data_shared(SectionId::VectorOffsets)?;
-        let data = self.section_data_shared(SectionId::VectorData)?;
-        let offsets = offsets.as_ref();
-        let data = data.as_ref();
+        let offsets = self.section(SectionId::VectorOffsets)?;
+        let data = self.bytes(SectionId::VectorData);
 
         let idx = usize::try_from(payload).ok()?;
         let start = usize::try_from(u64_at(offsets, idx)?).ok()?;
         let end = usize::try_from(u64_at(offsets, idx.checked_add(1)?)?).ok()?;
-        if start > end || end > data.len() {
-          return None;
-        }
-        let bytes = &data[start..end];
+        let bytes = data.get(start..end)?;
         if bytes.len() % 4 != 0 {
           return None;
         }
 
-        let mut vec = Vec::with_capacity(bytes.len() / 4);
-        for chunk in bytes.as_chunks::<4>().0 {
-          let val = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-          vec.push(val);
-        }
-
+        let vec = bytes
+          .as_chunks::<4>()
+          .0
+          .iter()
+          .map(|chunk| f32::from_le_bytes(*chunk))
+          .collect();
         Some(PropValue::VectorF32(vec))
       }
     }
@@ -1788,9 +1545,8 @@ impl SnapshotData {
 
 /// Iterator over out-edges
 pub struct OutEdgeIter<'a> {
-  snapshot: &'a SnapshotData,
-  out_etype: Option<SectionBytes<'a>>,
-  out_dst: Option<SectionBytes<'a>>,
+  out_etype: &'a [u8],
+  out_dst: &'a [u8],
   current: usize,
   end: usize,
 }
@@ -1798,12 +1554,13 @@ pub struct OutEdgeIter<'a> {
 impl<'a> OutEdgeIter<'a> {
   fn new(snapshot: &'a SnapshotData, phys: PhysNode) -> Self {
     let (current, end) = snapshot.out_edge_range(phys).unwrap_or((0, 0));
+    let out_etype = snapshot.bytes(SectionId::OutEtype);
+    let out_dst = snapshot.bytes(SectionId::OutDst);
     Self {
-      snapshot,
-      out_etype: snapshot.section_data_shared(SectionId::OutEtype),
-      out_dst: snapshot.section_data_shared(SectionId::OutDst),
+      out_etype,
+      out_dst,
       current,
-      end,
+      end: end.min(out_etype.len() / 4).min(out_dst.len() / 4),
     }
   }
 }
@@ -1811,24 +1568,14 @@ impl<'a> OutEdgeIter<'a> {
 impl<'a> Iterator for OutEdgeIter<'a> {
   type Item = (PhysNode, ETypeId); // (dst, etype)
 
+  #[inline]
   fn next(&mut self) -> Option<Self::Item> {
     if self.current >= self.end {
       return None;
     }
-
-    let out_etype = self.out_etype.as_ref()?;
-    let out_dst = self.out_dst.as_ref()?;
-    let out_etype = out_etype.as_ref();
-    let out_dst = out_dst.as_ref();
-
-    if self.current >= out_etype.len() / 4 || self.current >= out_dst.len() / 4 {
-      return None;
-    }
-
-    let dst = read_u32_at(out_dst, self.current);
-    let etype = read_u32_at(out_etype, self.current);
+    let dst = read_u32_at(self.out_dst, self.current);
+    let etype = read_u32_at(self.out_etype, self.current);
     self.current += 1;
-
     Some((dst, etype))
   }
 
@@ -1842,10 +1589,9 @@ impl<'a> ExactSizeIterator for OutEdgeIter<'a> {}
 
 /// Iterator over in-edges
 pub struct InEdgeIter<'a> {
-  snapshot: &'a SnapshotData,
-  in_etype: Option<SectionBytes<'a>>,
-  in_src: Option<SectionBytes<'a>>,
-  in_out_index: Option<SectionBytes<'a>>,
+  in_etype: &'a [u8],
+  in_src: &'a [u8],
+  in_out_index: &'a [u8],
   current: usize,
   end: usize,
 }
@@ -1853,13 +1599,14 @@ pub struct InEdgeIter<'a> {
 impl<'a> InEdgeIter<'a> {
   fn new(snapshot: &'a SnapshotData, phys: PhysNode) -> Self {
     let (current, end) = snapshot.in_edge_range(phys).unwrap_or((0, 0));
+    let in_etype = snapshot.bytes(SectionId::InEtype);
+    let in_src = snapshot.bytes(SectionId::InSrc);
     Self {
-      snapshot,
-      in_etype: snapshot.section_data_shared(SectionId::InEtype),
-      in_src: snapshot.section_data_shared(SectionId::InSrc),
-      in_out_index: snapshot.section_data_shared(SectionId::InOutIndex),
+      in_etype,
+      in_src,
+      in_out_index: snapshot.bytes(SectionId::InOutIndex),
       current,
-      end,
+      end: end.min(in_etype.len() / 4).min(in_src.len() / 4),
     }
   }
 }
@@ -1867,30 +1614,15 @@ impl<'a> InEdgeIter<'a> {
 impl<'a> Iterator for InEdgeIter<'a> {
   type Item = (PhysNode, ETypeId, u32); // (src, etype, out_index)
 
+  #[inline]
   fn next(&mut self) -> Option<Self::Item> {
     if self.current >= self.end {
       return None;
     }
-
-    let in_etype = self.in_etype.as_ref()?;
-    let in_src = self.in_src.as_ref()?;
-    let in_etype = in_etype.as_ref();
-    let in_src = in_src.as_ref();
-
-    if self.current >= in_etype.len() / 4 || self.current >= in_src.len() / 4 {
-      return None;
-    }
-
-    let src = read_u32_at(in_src, self.current);
-    let etype = read_u32_at(in_etype, self.current);
-    let out_index = self
-      .in_out_index
-      .as_ref()
-      .and_then(|idx| u32_at(idx.as_ref(), self.current))
-      .unwrap_or(0);
-
+    let src = read_u32_at(self.in_src, self.current);
+    let etype = read_u32_at(self.in_etype, self.current);
+    let out_index = u32_at(self.in_out_index, self.current).unwrap_or(0);
     self.current += 1;
-
     Some((src, etype, out_index))
   }
 
@@ -1915,41 +1647,25 @@ pub struct OutEdgeInfo {
 impl SnapshotData {
   /// Get label name by LabelID
   pub fn label_name(&self, label_id: LabelId) -> Option<&str> {
-    let label_string_ids = self.section_data_shared(SectionId::LabelStringIds)?;
-    let string_id = u32_at(label_string_ids.as_ref(), label_id as usize)?;
-    if string_id == 0 {
-      return None;
-    }
-    self.string_cached(string_id)
+    self.label_names.get(label_id as usize)?.as_deref()
   }
 
   /// Get etype name by ETypeID
   pub fn etype_name(&self, etype_id: ETypeId) -> Option<&str> {
-    let etype_string_ids = self.section_data_shared(SectionId::EtypeStringIds)?;
-    let string_id = u32_at(etype_string_ids.as_ref(), etype_id as usize)?;
-    if string_id == 0 {
-      return None;
-    }
-    self.string_cached(string_id)
+    self.etype_names.get(etype_id as usize)?.as_deref()
   }
 
   /// Get propkey name by PropKeyID
   pub fn propkey_name(&self, propkey_id: PropKeyId) -> Option<&str> {
-    let propkey_string_ids = self.section_data_shared(SectionId::PropkeyStringIds)?;
-    let string_id = u32_at(propkey_string_ids.as_ref(), propkey_id as usize)?;
-    if string_id == 0 {
-      return None;
-    }
-    self.string_cached(string_id)
+    self.propkey_names.get(propkey_id as usize)?.as_deref()
   }
 
   /// Get out-edges as a Vec for compaction purposes
   pub fn out_edges(&self, phys: PhysNode) -> Vec<OutEdgeInfo> {
-    let mut edges = Vec::new();
-    for (dst, etype) in self.iter_out_edges(phys) {
-      edges.push(OutEdgeInfo { dst, etype });
-    }
-    edges
+    self
+      .iter_out_edges(phys)
+      .map(|(dst, etype)| OutEdgeInfo { dst, etype })
+      .collect()
   }
 }
 
@@ -1962,7 +1678,7 @@ mod tests {
   use super::*;
   use crate::core::snapshot::writer::{build_snapshot_to_memory, NodeData, SnapshotBuildInput};
   use crate::types::PropValue;
-  use crate::util::crc::crc32c;
+  use crate::util::crc::crc32;
   use crate::util::mmap::map_file;
   use std::collections::HashMap;
   use std::fs::{self, File};
@@ -2180,7 +1896,7 @@ mod tests {
     for (name, mutate) in mutations {
       let mut corrupted = valid.clone();
       mutate(&mut corrupted);
-      let footer_crc = crc32c(&corrupted[..corrupted.len() - 4]);
+      let footer_crc = crc32(&corrupted[..corrupted.len() - 4]);
       let footer_offset = corrupted.len() - 4;
       write_u32(&mut corrupted, footer_offset, footer_crc);
       let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2207,7 +1923,7 @@ mod tests {
       for &value in values {
         let mut corrupted = valid.clone();
         write_u64(&mut corrupted, field_offset, value);
-        let footer_crc = crc32c(&corrupted[..corrupted.len() - 4]);
+        let footer_crc = crc32(&corrupted[..corrupted.len() - 4]);
         let footer_offset = corrupted.len() - 4;
         write_u32(&mut corrupted, footer_offset, footer_crc);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2224,7 +1940,7 @@ mod tests {
 
   fn rewrite_crc(bytes: &mut [u8]) {
     let footer_offset = bytes.len() - 4;
-    let footer_crc = crc32c(&bytes[..footer_offset]);
+    let footer_crc = crc32(&bytes[..footer_offset]);
     write_u32(bytes, footer_offset, footer_crc);
   }
 

@@ -143,7 +143,11 @@ function HeaderContents() {
 			mono: true,
 			detail: "16 bytes",
 		},
-		{ name: "Versions", value: "Format version, minimum reader version" },
+		{
+			name: "Versions",
+			value:
+				"Format version (2), minimum reader version, and feature flags. Open refuses a file that needs a newer reader or has flags it does not implement, and opens a newer format read-only",
+		},
 		{ name: "Page size", value: "4096", mono: true, detail: "default" },
 		{
 			name: "Change counter",
@@ -161,12 +165,17 @@ function HeaderContents() {
 			value: "Set while a background checkpoint is running",
 		},
 		{
+			name: "WAL salts",
+			value:
+				"One per WAL region, mixed into each record's checksum and replaced whenever the region is reused",
+		},
+		{
 			name: "Counters",
 			value: "Max node ID, next transaction ID, last commit timestamp",
 		},
 		{
 			name: "Checksums",
-			value: "CRC32C over the header fields and over the whole page",
+			value: "CRC-32 over the header fields and over the whole page",
 		},
 	];
 	return (

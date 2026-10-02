@@ -26,7 +26,6 @@ Options:
   --group-commit-window-ms  Group commit window in ms (default: 2)
   --checkpoint-threshold P  Auto-checkpoint threshold (default: 0.8)
   --no-auto-checkpoint      Disable auto-checkpoint
-  --cache-enabled           Enable cache
   --vector-dims N            Vector dimensions (default: 128)
   --vector-count N           Number of vectors to set (default: 1000)
   --skip-compact            Skip optimize/compaction step
@@ -69,7 +68,6 @@ class BenchConfig:
   group_commit_window_ms: int = 2
   checkpoint_threshold: float = 0.8
   auto_checkpoint: bool = True
-  cache_enabled: bool = False
   vector_dims: int = 128
   vector_count: int = 1000
   skip_compact: bool = False
@@ -92,7 +90,6 @@ def parse_args() -> BenchConfig:
   parser.add_argument("--group-commit-window-ms", type=int, default=2)
   parser.add_argument("--checkpoint-threshold", type=float, default=0.8)
   parser.add_argument("--no-auto-checkpoint", action="store_true")
-  parser.add_argument("--cache-enabled", action="store_true")
   parser.add_argument("--vector-dims", type=int, default=128)
   parser.add_argument("--vector-count", type=int, default=1000)
   parser.add_argument("--skip-compact", action="store_true")
@@ -124,7 +121,6 @@ def parse_args() -> BenchConfig:
     group_commit_window_ms=args.group_commit_window_ms,
     checkpoint_threshold=args.checkpoint_threshold,
     auto_checkpoint=not args.no_auto_checkpoint,
-    cache_enabled=args.cache_enabled,
     vector_dims=args.vector_dims,
     vector_count=args.vector_count,
     skip_compact=args.skip_compact,
@@ -470,7 +466,6 @@ def run_benchmarks(config: BenchConfig):
   logger.log(f"Group commit: {config.group_commit_enabled} (window {config.group_commit_window_ms}ms)")
   logger.log(f"Auto-checkpoint: {config.auto_checkpoint}")
   logger.log(f"Checkpoint threshold: {config.checkpoint_threshold}")
-  logger.log(f"Cache enabled: {config.cache_enabled}")
   logger.log(f"Vector dims: {format_number(config.vector_dims)}")
   logger.log(f"Vector count: {format_number(config.vector_count)}")
   logger.log(f"Skip compact: {config.skip_compact}")
@@ -493,7 +488,6 @@ def run_benchmarks(config: BenchConfig):
       wal_size=config.wal_size,
       auto_checkpoint=config.auto_checkpoint,
       checkpoint_threshold=config.checkpoint_threshold,
-      cache_enabled=config.cache_enabled,
       sync_mode=sync_mode,
       group_commit_enabled=config.group_commit_enabled,
       group_commit_window_ms=config.group_commit_window_ms,
@@ -516,7 +510,7 @@ def run_benchmarks(config: BenchConfig):
 
     if config.reopen_readonly:
       db.close()
-      db = Database(db_path, OpenOptions(read_only=True, create_if_missing=False, cache_enabled=config.cache_enabled))
+      db = Database(db_path, OpenOptions(read_only=True, create_if_missing=False))
       logger.log("  Re-opened database in read-only mode")
 
     logger.log("\n[4/6] Key lookup benchmarks...")

@@ -1,14 +1,33 @@
 //! MVCC Version Chain Store
 //!
-//! Manages version chains for nodes, edges, and properties.
+//! Manages version chains for nodes, edges, properties, labels and key owners.
 //! Uses SOA (struct-of-arrays) storage for property versions to reduce memory overhead.
+//!
+//! # Chains hold history, never the current state
+//!
+//! The committed delta and snapshot always hold the latest committed state. A chain records
+//! what its key looked like before the changes that committed while another transaction was
+//! open, because only such a transaction can still need the old state: a baseline version
+//! (txid 0, commit_ts 0) with the state before the first recorded change, then one version
+//! per recorded change. A version holds the state from its commit until the next version's
+//! commit: the `record_*` methods rewrite the newest version to the state they replace when
+//! they append a new one, so a change committed with no other transaction open, which
+//! records nothing, cannot leave an older version stale.
+//!
+//! A reader that sees a chain's newest version reads the delta and snapshot (the `*_at`
+//! lookups return `None`), so a chain never shadows newer committed state, also not after a
+//! checkpoint moves that state into a new snapshot. Only a reader whose snapshot predates
+//! the newest version reads the chain. Seeing no version there means the key was absent at
+//! its snapshot, so a baseline is only stored for a present state.
 //!
 //! Ported from src/mvcc/version-chain.ts
 
-use std::collections::HashMap;
+use std::borrow::Borrow;
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
+use std::sync::Arc;
 
-use crate::mvcc::visibility::VersionedRecord;
+use crate::mvcc::visibility::{history_version, is_visible_at, VersionedRecord};
 use crate::types::{
   ETypeId, EdgeVersionData, LabelId, NodeDelta, NodeId, NodeVersionData, PropKeyId, PropValueRef,
   Timestamp, TxId, TxKey,
@@ -245,6 +264,60 @@ impl<T: Clone, K: Eq + Hash + Clone> Default for SoaPropertyVersions<T, K> {
   }
 }
 
+/// History chains of optional values (`None`: absent), see the module docs.
+impl<V: Clone + PartialEq, K: Eq + Hash + Clone> SoaPropertyVersions<Option<V>, K> {
+  /// Record that commit `commit_ts` changed `key` from `before` to `after`.
+  pub fn record(
+    &mut self,
+    key: K,
+    before: Option<V>,
+    after: Option<V>,
+    txid: TxId,
+    commit_ts: Timestamp,
+  ) {
+    match self.heads.get(&key).map(|&idx| idx as usize) {
+      // Another change of the same commit: it replaces the first.
+      Some(head) if self.commit_ts[head] == commit_ts => {
+        self.data[head] = after;
+        return;
+      }
+      _ if before == after => return,
+      Some(head) => self.data[head] = before,
+      None => {
+        if before.is_some() {
+          self.append(key.clone(), before, 0, 0);
+        }
+      }
+    }
+    self.append(key, after, txid, commit_ts);
+  }
+
+  /// The value a reader at `snapshot_ts` sees in `key`'s history: `None` when it sees the
+  /// newest version (the current state), `Some(None)` when the key was absent.
+  pub fn history<Q>(&self, key: &Q, snapshot_ts: Timestamp, txid: TxId) -> Option<Option<&V>>
+  where
+    K: Borrow<Q>,
+    Q: Eq + Hash + ?Sized,
+  {
+    let mut idx = *self.heads.get(key)?;
+    let visible = |idx: u32| {
+      let i = idx as usize;
+      is_visible_at(self.txids[i], self.commit_ts[i], snapshot_ts, txid)
+    };
+    if visible(idx) {
+      return None;
+    }
+    idx = self.prev_idx[idx as usize];
+    while idx != NULL_IDX {
+      if visible(idx) {
+        return Some(self.data[idx as usize].as_ref());
+      }
+      idx = self.prev_idx[idx as usize];
+    }
+    Some(None)
+  }
+}
+
 /// A version from the pooled SOA storage
 #[derive(Debug, Clone)]
 pub struct PooledVersion<T> {
@@ -266,12 +339,18 @@ pub struct PooledVersion<T> {
 /// - Edge versions (add/delete)
 /// - Node property versions (using SOA storage)
 /// - Edge property versions (using SOA storage)
+/// - Node label versions (using SOA storage)
+/// - Key owners (the node holding a key)
 #[derive(Debug)]
 pub struct VersionChainManager {
   /// Node version chains: TxKey::Node(node_id) -> head version
   node_versions: HashMap<TxKey, Box<VersionedRecord<NodeVersionData>>>,
   /// Edge version chains: TxKey::Edge { src, etype, dst } -> head version
   edge_versions: HashMap<TxKey, Box<VersionedRecord<EdgeVersionData>>>,
+  /// The `(src, etype, dst)` of every edge chain, by endpoint
+  edge_chains_by_node: HashMap<NodeId, HashSet<(NodeId, ETypeId, NodeId)>>,
+  /// Key owner chains: key -> head version (`None`: no live node holds the key)
+  key_owners: HashMap<Arc<str>, Box<VersionedRecord<Option<NodeId>>>>,
   /// SOA-backed storage for node property versions
   soa_node_props: SoaPropertyVersions<Option<PropValueRef>, TxKey>,
   /// SOA-backed storage for edge property versions
@@ -299,6 +378,8 @@ impl VersionChainManager {
     Self {
       node_versions: HashMap::new(),
       edge_versions: HashMap::new(),
+      edge_chains_by_node: HashMap::new(),
+      key_owners: HashMap::new(),
       soa_node_props: SoaPropertyVersions::new(),
       soa_edge_props: SoaPropertyVersions::new(),
       soa_node_labels: SoaPropertyVersions::new(),
@@ -410,6 +491,9 @@ impl VersionChainManager {
   ) {
     let key = Self::edge_key(src, etype, dst);
     let existing = self.edge_versions.remove(&key);
+    if existing.is_none() {
+      self.index_edge_chain(src, etype, dst);
+    }
     let new_version = Box::new(VersionedRecord {
       data: EdgeVersionData {
         src,
@@ -702,6 +786,445 @@ impl VersionChainManager {
   }
 
   // ========================================================================
+  // History: recording commits
+  // ========================================================================
+  //
+  // Each `record_*` method records that commit `commit_ts` (by `txid`) changed a key from
+  // `before`, the committed state it replaced, to `after` (see the module docs). A second
+  // change by the same commit replaces the first; a change to the same state records
+  // nothing.
+
+  /// Record a change of node `node_id`'s existence (`None`: absent) or key.
+  pub fn record_node(
+    &mut self,
+    node_id: NodeId,
+    before: Option<NodeVersionData>,
+    after: Option<NodeVersionData>,
+    txid: TxId,
+    commit_ts: Timestamp,
+  ) {
+    let key = TxKey::Node(node_id);
+    if let Some(head) = self.node_versions.get_mut(&key) {
+      if head.commit_ts == commit_ts {
+        (head.data, head.deleted) = Self::node_state(node_id, after);
+        return;
+      }
+    }
+    if before.as_ref().map(|data| &data.delta.key) == after.as_ref().map(|data| &data.delta.key) {
+      return;
+    }
+    let prev = match self.node_versions.remove(&key) {
+      Some(mut head) => {
+        (head.data, head.deleted) = Self::node_state(node_id, before);
+        Some(head)
+      }
+      None => before.map(|data| Box::new(VersionedRecord::new(data, 0, 0))),
+    };
+    let (data, deleted) = Self::node_state(node_id, after);
+    let version = VersionedRecord {
+      data,
+      txid,
+      commit_ts,
+      prev,
+      deleted,
+    };
+    self.node_versions.insert(key, Box::new(version));
+  }
+
+  /// The version data and deleted flag for a node state (`None`: absent).
+  fn node_state(node_id: NodeId, state: Option<NodeVersionData>) -> (NodeVersionData, bool) {
+    match state {
+      Some(data) => (data, false),
+      None => (
+        NodeVersionData {
+          node_id,
+          delta: NodeDelta::default(),
+        },
+        true,
+      ),
+    }
+  }
+
+  /// Record a change of an edge's existence.
+  #[allow(clippy::too_many_arguments)]
+  pub fn record_edge(
+    &mut self,
+    src: NodeId,
+    etype: ETypeId,
+    dst: NodeId,
+    before: bool,
+    after: bool,
+    txid: TxId,
+    commit_ts: Timestamp,
+  ) {
+    let key = Self::edge_key(src, etype, dst);
+    if let Some(head) = self.edge_versions.get_mut(&key) {
+      if head.commit_ts == commit_ts {
+        head.data.added = after;
+        return;
+      }
+    }
+    if before == after {
+      return;
+    }
+    let data = |added| EdgeVersionData {
+      src,
+      etype,
+      dst,
+      added,
+    };
+    let prev = match self.edge_versions.remove(&key) {
+      Some(mut head) => {
+        head.data.added = before;
+        Some(head)
+      }
+      None => {
+        self.index_edge_chain(src, etype, dst);
+        before.then(|| Box::new(VersionedRecord::new(data(true), 0, 0)))
+      }
+    };
+    let version = VersionedRecord {
+      data: data(after),
+      txid,
+      commit_ts,
+      prev,
+      deleted: false,
+    };
+    self.edge_versions.insert(key, Box::new(version));
+  }
+
+  /// Record a change of a node property (`None`: unset).
+  pub fn record_node_prop(
+    &mut self,
+    node_id: NodeId,
+    prop_key_id: PropKeyId,
+    before: Option<PropValueRef>,
+    after: Option<PropValueRef>,
+    txid: TxId,
+    commit_ts: Timestamp,
+  ) {
+    let key = Self::node_prop_key(node_id, prop_key_id);
+    if self.use_soa {
+      self
+        .soa_node_props
+        .record(key, before, after, txid, commit_ts);
+    } else {
+      Self::record_in(
+        &mut self.legacy_node_props,
+        key,
+        before,
+        after,
+        txid,
+        commit_ts,
+      );
+    }
+  }
+
+  /// Record a change of an edge property (`None`: unset).
+  #[allow(clippy::too_many_arguments)]
+  pub fn record_edge_prop(
+    &mut self,
+    src: NodeId,
+    etype: ETypeId,
+    dst: NodeId,
+    prop_key_id: PropKeyId,
+    before: Option<PropValueRef>,
+    after: Option<PropValueRef>,
+    txid: TxId,
+    commit_ts: Timestamp,
+  ) {
+    let key = Self::edge_prop_key(src, etype, dst, prop_key_id);
+    if self.use_soa {
+      self
+        .soa_edge_props
+        .record(key, before, after, txid, commit_ts);
+    } else {
+      Self::record_in(
+        &mut self.legacy_edge_props,
+        key,
+        before,
+        after,
+        txid,
+        commit_ts,
+      );
+    }
+  }
+
+  /// Record a change of whether node `node_id` has label `label_id`.
+  pub fn record_node_label(
+    &mut self,
+    node_id: NodeId,
+    label_id: LabelId,
+    before: bool,
+    after: bool,
+    txid: TxId,
+    commit_ts: Timestamp,
+  ) {
+    let key = Self::node_label_key(node_id, label_id);
+    let (before, after) = (before.then_some(true), after.then_some(true));
+    if self.use_soa {
+      self
+        .soa_node_labels
+        .record(key, before, after, txid, commit_ts);
+    } else {
+      Self::record_in(
+        &mut self.legacy_node_labels,
+        key,
+        before,
+        after,
+        txid,
+        commit_ts,
+      );
+    }
+  }
+
+  /// Record a change of the live node holding `key` (`None`: none).
+  pub fn record_key_owner(
+    &mut self,
+    key: &str,
+    before: Option<NodeId>,
+    after: Option<NodeId>,
+    txid: TxId,
+    commit_ts: Timestamp,
+  ) {
+    Self::record_in(
+      &mut self.key_owners,
+      Arc::from(key),
+      before,
+      after,
+      txid,
+      commit_ts,
+    );
+  }
+
+  /// `record_*` for a map of boxed chains of optional values (`None`: absent).
+  fn record_in<K: Eq + Hash, V: PartialEq>(
+    chains: &mut HashMap<K, Box<VersionedRecord<Option<V>>>>,
+    key: K,
+    before: Option<V>,
+    after: Option<V>,
+    txid: TxId,
+    commit_ts: Timestamp,
+  ) {
+    if let Some(head) = chains.get_mut(&key) {
+      if head.commit_ts == commit_ts {
+        head.data = after;
+        return;
+      }
+    }
+    if before == after {
+      return;
+    }
+    let prev = match chains.remove(&key) {
+      Some(mut head) => {
+        head.data = before;
+        Some(head)
+      }
+      None => before
+        .is_some()
+        .then(|| Box::new(VersionedRecord::new(before, 0, 0))),
+    };
+    let version = VersionedRecord {
+      data: after,
+      txid,
+      commit_ts,
+      prev,
+      deleted: false,
+    };
+    chains.insert(key, Box::new(version));
+  }
+
+  // ========================================================================
+  // History: reads
+  // ========================================================================
+  //
+  // What a reader at `snapshot_ts` (in transaction `txid`, 0 outside one) sees of a key in
+  // its chain. `None` when there is no chain or the reader sees its newest version: the
+  // reader then reads the committed delta and snapshot.
+
+  /// Node `node_id` (`Some(None)`: absent).
+  pub fn node_at(
+    &self,
+    node_id: NodeId,
+    snapshot_ts: Timestamp,
+    txid: TxId,
+  ) -> Option<Option<&NodeVersionData>> {
+    let head = self.node_versions.get(&TxKey::Node(node_id))?;
+    history_version(head, snapshot_ts, txid)
+      .map(|version| version.filter(|v| !v.deleted).map(|v| &v.data))
+  }
+
+  /// Whether node `node_id` exists.
+  pub fn node_exists_at(
+    &self,
+    node_id: NodeId,
+    snapshot_ts: Timestamp,
+    txid: TxId,
+  ) -> Option<bool> {
+    self
+      .node_at(node_id, snapshot_ts, txid)
+      .map(|node| node.is_some())
+  }
+
+  /// Whether the edge `src -[etype]-> dst` exists.
+  pub fn edge_exists_at(
+    &self,
+    src: NodeId,
+    etype: ETypeId,
+    dst: NodeId,
+    snapshot_ts: Timestamp,
+    txid: TxId,
+  ) -> Option<bool> {
+    let head = self.edge_versions.get(&Self::edge_key(src, etype, dst))?;
+    history_version(head, snapshot_ts, txid).map(|version| version.is_some_and(|v| v.data.added))
+  }
+
+  /// A node property (`Some(None)`: unset).
+  pub fn node_prop_at(
+    &self,
+    node_id: NodeId,
+    prop_key_id: PropKeyId,
+    snapshot_ts: Timestamp,
+    txid: TxId,
+  ) -> Option<Option<PropValueRef>> {
+    let key = Self::node_prop_key(node_id, prop_key_id);
+    let value = if self.use_soa {
+      self.soa_node_props.history(&key, snapshot_ts, txid)
+    } else {
+      Self::history_in(&self.legacy_node_props, &key, snapshot_ts, txid)
+    };
+    value.map(|value| value.cloned())
+  }
+
+  /// An edge property (`Some(None)`: unset).
+  pub fn edge_prop_at(
+    &self,
+    src: NodeId,
+    etype: ETypeId,
+    dst: NodeId,
+    prop_key_id: PropKeyId,
+    snapshot_ts: Timestamp,
+    txid: TxId,
+  ) -> Option<Option<PropValueRef>> {
+    let key = Self::edge_prop_key(src, etype, dst, prop_key_id);
+    let value = if self.use_soa {
+      self.soa_edge_props.history(&key, snapshot_ts, txid)
+    } else {
+      Self::history_in(&self.legacy_edge_props, &key, snapshot_ts, txid)
+    };
+    value.map(|value| value.cloned())
+  }
+
+  /// Whether node `node_id` has label `label_id`.
+  pub fn node_label_at(
+    &self,
+    node_id: NodeId,
+    label_id: LabelId,
+    snapshot_ts: Timestamp,
+    txid: TxId,
+  ) -> Option<bool> {
+    let key = Self::node_label_key(node_id, label_id);
+    let value = if self.use_soa {
+      self.soa_node_labels.history(&key, snapshot_ts, txid)
+    } else {
+      Self::history_in(&self.legacy_node_labels, &key, snapshot_ts, txid)
+    };
+    value.map(|value| value.copied().unwrap_or(false))
+  }
+
+  /// The live node holding `key` (`Some(None)`: none).
+  pub fn key_owner_at(
+    &self,
+    key: &str,
+    snapshot_ts: Timestamp,
+    txid: TxId,
+  ) -> Option<Option<NodeId>> {
+    Self::history_in(&self.key_owners, key, snapshot_ts, txid).map(|owner| owner.copied())
+  }
+
+  /// Nodes that have a version chain.
+  pub fn chained_node_ids(&self) -> impl Iterator<Item = NodeId> + '_ {
+    self.node_versions.values().map(|head| head.data.node_id)
+  }
+
+  /// Nodes that a reader sees in their chains, as existing.
+  pub fn nodes_at(&self, snapshot_ts: Timestamp, txid: TxId) -> impl Iterator<Item = NodeId> + '_ {
+    self.node_versions.values().filter_map(move |head| {
+      history_version(head, snapshot_ts, txid)
+        .flatten()
+        .filter(|version| !version.deleted)
+        .map(|version| version.data.node_id)
+    })
+  }
+
+  /// Edges `(src, etype, dst)` that a reader sees in their chains, as existing.
+  pub fn edges_at(
+    &self,
+    snapshot_ts: Timestamp,
+    txid: TxId,
+  ) -> impl Iterator<Item = (NodeId, ETypeId, NodeId)> + '_ {
+    self.edge_versions.values().filter_map(move |head| {
+      history_version(head, snapshot_ts, txid)
+        .flatten()
+        .filter(|version| version.data.added)
+        .map(|version| (version.data.src, version.data.etype, version.data.dst))
+    })
+  }
+
+  /// Edges `(src, etype, dst)` with endpoint `node_id` that a reader sees in their chains,
+  /// as existing.
+  pub fn node_edges_at(
+    &self,
+    node_id: NodeId,
+    snapshot_ts: Timestamp,
+    txid: TxId,
+  ) -> impl Iterator<Item = (NodeId, ETypeId, NodeId)> + '_ {
+    self
+      .edge_chains_by_node
+      .get(&node_id)
+      .into_iter()
+      .flatten()
+      .copied()
+      .filter(move |&(src, etype, dst)| {
+        self.edge_exists_at(src, etype, dst, snapshot_ts, txid) == Some(true)
+      })
+  }
+
+  /// `*_at` for a map of boxed chains of optional values (`Some(None)`: absent).
+  fn history_in<'a, K, Q, V>(
+    chains: &'a HashMap<K, Box<VersionedRecord<Option<V>>>>,
+    key: &Q,
+    snapshot_ts: Timestamp,
+    txid: TxId,
+  ) -> Option<Option<&'a V>>
+  where
+    K: Borrow<Q> + Eq + Hash,
+    Q: Eq + Hash + ?Sized,
+  {
+    let head = chains.get(key)?;
+    history_version(head, snapshot_ts, txid).map(|version| version.and_then(|v| v.data.as_ref()))
+  }
+
+  fn index_edge_chain(&mut self, src: NodeId, etype: ETypeId, dst: NodeId) {
+    for node_id in [src, dst] {
+      self
+        .edge_chains_by_node
+        .entry(node_id)
+        .or_default()
+        .insert((src, etype, dst));
+    }
+  }
+
+  /// Drop the index entries of edge chains that no longer exist.
+  fn unindex_dropped_edge_chains(&mut self) {
+    let chains = &self.edge_versions;
+    self.edge_chains_by_node.retain(|_, edges| {
+      edges.retain(|&(src, etype, dst)| chains.contains_key(&Self::edge_key(src, etype, dst)));
+      !edges.is_empty()
+    });
+  }
+
+  // ========================================================================
   // Helper methods
   // ========================================================================
 
@@ -753,7 +1276,12 @@ impl VersionChainManager {
     let mut pruned = 0;
 
     pruned += Self::prune_chains(&mut self.node_versions, horizon_ts);
+    let edge_chains = self.edge_versions.len();
     pruned += Self::prune_chains(&mut self.edge_versions, horizon_ts);
+    if self.edge_versions.len() != edge_chains {
+      self.unindex_dropped_edge_chains();
+    }
+    pruned += Self::prune_chains(&mut self.key_owners, horizon_ts);
 
     // Prune property and label versions
     if self.use_soa {
@@ -770,8 +1298,8 @@ impl VersionChainManager {
   }
 
   /// Prune every chain in a map, removing chains that are entirely older than horizon_ts
-  fn prune_chains<T>(
-    chains: &mut HashMap<TxKey, Box<VersionedRecord<T>>>,
+  fn prune_chains<K, T>(
+    chains: &mut HashMap<K, Box<VersionedRecord<T>>>,
     horizon_ts: Timestamp,
   ) -> usize {
     let mut pruned = 0;
@@ -841,6 +1369,7 @@ impl VersionChainManager {
 
     truncated += Self::truncate_chains(&mut self.node_versions, max_depth, min_active_ts);
     truncated += Self::truncate_chains(&mut self.edge_versions, max_depth, min_active_ts);
+    truncated += Self::truncate_chains(&mut self.key_owners, max_depth, min_active_ts);
 
     // Truncate property and label version chains
     if self.use_soa {
@@ -863,8 +1392,8 @@ impl VersionChainManager {
   }
 
   /// Truncate every chain in a map; returns the number of chains truncated
-  fn truncate_chains<T>(
-    chains: &mut HashMap<TxKey, Box<VersionedRecord<T>>>,
+  fn truncate_chains<K, T>(
+    chains: &mut HashMap<K, Box<VersionedRecord<T>>>,
     max_depth: usize,
     min_active_ts: Option<Timestamp>,
   ) -> usize {
@@ -958,6 +1487,8 @@ impl VersionChainManager {
   pub fn clear(&mut self) {
     self.node_versions.clear();
     self.edge_versions.clear();
+    self.edge_chains_by_node.clear();
+    self.key_owners.clear();
     self.soa_node_props.clear();
     self.soa_edge_props.clear();
     self.soa_node_labels.clear();
@@ -986,6 +1517,7 @@ impl VersionChainManager {
       } else {
         self.legacy_node_labels.len()
       },
+      key_owner_versions: self.key_owners.len(),
     }
   }
 }
@@ -1004,6 +1536,7 @@ pub struct VersionChainCounts {
   pub node_prop_versions: usize,
   pub edge_prop_versions: usize,
   pub node_label_versions: usize,
+  pub key_owner_versions: usize,
 }
 
 // ============================================================================
@@ -1666,5 +2199,127 @@ mod audit_tests {
         "reader at ts={READER_TS} must still see the ts=3 edge value (soa={use_soa})"
       );
     }
+  }
+}
+
+#[cfg(test)]
+mod history_tests {
+  use super::*;
+  use crate::types::PropValue;
+
+  const NODE: NodeId = 1;
+  const OTHER: NodeId = 2;
+  const ETYPE: ETypeId = 3;
+  const PROP: PropKeyId = 4;
+  const LABEL: LabelId = 5;
+  const READER_TXID: TxId = 999;
+
+  fn value(value: i64) -> Option<PropValueRef> {
+    Some(Arc::new(PropValue::I64(value)))
+  }
+
+  fn node(key: &str) -> Option<NodeVersionData> {
+    Some(NodeVersionData {
+      node_id: NODE,
+      delta: NodeDelta {
+        key: Some(key.to_string()),
+        ..NodeDelta::default()
+      },
+    })
+  }
+
+  #[test]
+  fn prop_history_answers_only_readers_older_than_the_newest_version() {
+    for use_soa in [true, false] {
+      let mut mgr = VersionChainManager::with_soa(use_soa);
+      mgr.record_node_prop(NODE, PROP, value(1), value(2), 10, 10);
+
+      let at = |mgr: &VersionChainManager, ts| mgr.node_prop_at(NODE, PROP, ts, READER_TXID);
+      assert_eq!(at(&mgr, 10), Some(value(1)), "soa={use_soa}");
+      assert_eq!(
+        at(&mgr, 11),
+        None,
+        "current state from ts 11 (soa={use_soa})"
+      );
+      assert_eq!(mgr.node_prop_at(NODE, PROP, 5, 10), None, "own commit");
+    }
+  }
+
+  #[test]
+  fn record_rewrites_the_newest_version_to_the_state_it_replaces() {
+    for use_soa in [true, false] {
+      let mut mgr = VersionChainManager::with_soa(use_soa);
+      mgr.record_node_prop(NODE, PROP, None, value(1), 10, 10);
+      // Commit 20 set the prop to 2 with no other transaction open, recording nothing.
+      mgr.record_node_prop(NODE, PROP, value(2), value(3), 30, 30);
+
+      let at = |ts| mgr.node_prop_at(NODE, PROP, ts, READER_TXID);
+      assert_eq!(at(10), Some(None), "absent before ts 10 (soa={use_soa})");
+      assert_eq!(at(21), Some(value(2)), "soa={use_soa}");
+      assert_eq!(at(31), None, "soa={use_soa}");
+    }
+  }
+
+  #[test]
+  fn record_by_the_same_commit_replaces_and_unchanged_state_records_nothing() {
+    for use_soa in [true, false] {
+      let mut mgr = VersionChainManager::with_soa(use_soa);
+      mgr.record_node_label(NODE, LABEL, true, true, 10, 10);
+      assert_eq!(mgr.counts().node_label_versions, 0, "soa={use_soa}");
+
+      mgr.record_node_label(NODE, LABEL, true, false, 10, 10);
+      mgr.record_node_label(NODE, LABEL, true, true, 10, 10);
+      assert_eq!(mgr.node_label_at(NODE, LABEL, 10, READER_TXID), Some(true));
+      let head = mgr.node_label_version(NODE, LABEL).expect("label chain");
+      assert_eq!(
+        (head.data, head.chain_depth()),
+        (Some(true), 2),
+        "soa={use_soa}"
+      );
+    }
+  }
+
+  #[test]
+  fn node_and_edge_history() {
+    let mut mgr = VersionChainManager::new();
+    mgr.record_node(NODE, node("a"), None, 10, 10);
+    mgr.record_edge(NODE, ETYPE, OTHER, true, false, 10, 10);
+    mgr.record_edge(OTHER, ETYPE, NODE, false, true, 10, 10);
+    mgr.record_key_owner("a", Some(NODE), None, 10, 10);
+
+    let key = mgr
+      .node_at(NODE, 10, READER_TXID)
+      .map(|node| node.and_then(|node| node.delta.key.clone()));
+    assert_eq!(key, Some(Some("a".to_string())));
+    assert_eq!(mgr.node_exists_at(NODE, 11, READER_TXID), None);
+    assert_eq!(mgr.key_owner_at("a", 10, READER_TXID), Some(Some(NODE)));
+    assert_eq!(mgr.key_owner_at("a", 11, READER_TXID), None);
+    assert_eq!(
+      mgr.nodes_at(10, READER_TXID).collect::<Vec<_>>(),
+      vec![NODE]
+    );
+
+    // Added at ts 10: absent before, with no baseline version.
+    assert_eq!(
+      mgr.edge_exists_at(OTHER, ETYPE, NODE, 10, READER_TXID),
+      Some(false)
+    );
+    let edges: Vec<_> = mgr.node_edges_at(OTHER, 10, READER_TXID).collect();
+    assert_eq!(edges, vec![(NODE, ETYPE, OTHER)]);
+    assert_eq!(mgr.edges_at(10, READER_TXID).count(), 1);
+    assert_eq!(mgr.node_edges_at(OTHER, 11, READER_TXID).count(), 0);
+  }
+
+  #[test]
+  fn prune_drops_the_endpoint_index_of_dropped_edge_chains() {
+    let mut mgr = VersionChainManager::new();
+    mgr.record_edge(NODE, ETYPE, OTHER, true, false, 10, 10);
+    mgr.record_edge(OTHER, ETYPE, OTHER, true, false, 20, 20);
+
+    mgr.prune_old_versions(15);
+
+    assert!(!mgr.edge_chains_by_node.contains_key(&NODE));
+    let other: Vec<_> = mgr.node_edges_at(OTHER, 20, READER_TXID).collect();
+    assert_eq!(other, vec![(OTHER, ETYPE, OTHER)]);
   }
 }

@@ -19,7 +19,7 @@ use crate::replication::replica::{
 use crate::replication::transport::decode_commit_frame_payload;
 use crate::replication::types::{CommitToken, ReplicationCursor};
 use crate::types::{ETypeId, NodeId, PropKeyId, PropValue, TxId, WalRecordType};
-use crate::util::crc::{crc32c, Crc32cHasher};
+use crate::util::crc::{crc32, Crc32Hasher};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use serde_json::json;
@@ -376,7 +376,7 @@ impl SingleFileDB {
     let status = self.primary_replication_status().ok_or_else(|| {
       KiteError::InvalidReplication("database is not opened in primary role".to_string())
     })?;
-    let (byte_length, checksum_crc32c, data_base64) =
+    let (byte_length, checksum_crc32, data_base64) =
       read_snapshot_transport_payload(&self.path, include_data)?;
     let generated_at_ms = std::time::SystemTime::now()
       .duration_since(std::time::UNIX_EPOCH)
@@ -387,7 +387,8 @@ impl SingleFileDB {
       "format": "single-file-db-copy",
       "db_path": self.path.to_string_lossy().to_string(),
       "byte_length": byte_length,
-      "checksum_crc32c": checksum_crc32c,
+      // The value is CRC-32 (IEEE); the field keeps the name clients read.
+      "checksum_crc32c": checksum_crc32,
       "generated_at_ms": generated_at_ms,
       "epoch": status.epoch,
       "head_log_index": status.head_log_index,
@@ -628,7 +629,7 @@ fn read_snapshot_transport_payload(
   }
 
   let mut reader = BufReader::new(File::open(path)?);
-  let mut hasher = Crc32cHasher::new();
+  let mut hasher = Crc32Hasher::new();
   let mut bytes_read = 0u64;
   let mut chunk = [0u8; REPLICATION_IO_CHUNK_BYTES];
 
@@ -807,7 +808,7 @@ fn read_frame_payload(
       .read_exact(&mut payload)
       .map_err(|error| map_frame_payload_read_error(error, segment_id, frame_offset))?;
     if !header.crc_disabled {
-      let computed_crc32 = crc32c(&payload);
+      let computed_crc32 = crc32(&payload);
       if computed_crc32 != header.stored_crc32 {
         return Err(KiteError::CrcMismatch {
           stored: header.stored_crc32,
@@ -818,7 +819,7 @@ fn read_frame_payload(
     return Ok(Some(BASE64_STANDARD.encode(payload)));
   }
 
-  let mut hasher = (!header.crc_disabled).then(Crc32cHasher::new);
+  let mut hasher = (!header.crc_disabled).then(Crc32Hasher::new);
   consume_payload_stream(reader, header.payload_len, |chunk| {
     if let Some(hasher) = hasher.as_mut() {
       hasher.update(chunk);
@@ -877,7 +878,7 @@ fn map_frame_payload_read_error(
 
 fn source_db_fingerprint(path: &Path) -> Result<(u64, u32)> {
   let mut reader = BufReader::new(File::open(path)?);
-  let mut hasher = Crc32cHasher::new();
+  let mut hasher = Crc32Hasher::new();
   let mut chunk = [0u8; REPLICATION_IO_CHUNK_BYTES];
   let mut bytes = 0u64;
 
@@ -935,14 +936,9 @@ fn translate_prop_map(
 
 /// Bootstrap phase 1: delete every replica node that is missing from the
 /// source or holds a different key, in its own transaction. All deletes must
-/// precede all creates (keys move between nodes and an id can return with a
-/// new key), and the delta cannot delete and recreate one id inside a single
-/// transaction. Until the bootstrap completes, catch-up refuses to run over
-/// the partially removed state.
-///
-/// Recreating an id whose deleted copy lives in the snapshot leaves the new
-/// node hidden behind the delete tombstone, so such deletes are folded into
-/// a new snapshot before phase 2 recreates the ids.
+/// precede all creates: keys move between nodes, and an id can return with a
+/// new key (phase 2 recreates it as a fresh node). Until the bootstrap
+/// completes, catch-up refuses to run over the partially removed state.
 fn remove_stale_nodes(
   replica: &SingleFileDB,
   source: &SingleFileDB,
@@ -958,26 +954,13 @@ fn remove_stale_nodes(
   if stale.is_empty() {
     return Ok(());
   }
-  let recreates_snapshot_node = {
-    let snapshot = replica.snapshot.read();
-    stale.iter().any(|&node_id| {
-      source.node_exists(node_id)
-        && snapshot
-          .as_ref()
-          .is_some_and(|snapshot| snapshot.phys_node(node_id).is_some())
-    })
-  };
 
   runtime.mark_bootstrap_incomplete()?;
-  let tx_guard = replica.begin_guard(false)?;
+  let tx_guard = replica.begin_replication_apply()?;
   for node_id in stale {
     replica.delete_node(node_id)?;
   }
-  tx_guard.commit()?;
-  if recreates_snapshot_node {
-    replica.checkpoint()?;
-  }
-  Ok(())
+  tx_guard.commit()
 }
 
 /// Bootstrap phase 2: create the source's nodes and copy schema, properties,
@@ -992,7 +975,7 @@ fn sync_graph_state<F>(
 where
   F: FnOnce() -> Result<()>,
 {
-  let tx_guard = replica.begin_guard(false)?;
+  let tx_guard = replica.begin_replication_apply()?;
 
   let mut schema_map = sync_schema_names(replica, source, epoch)?;
 
@@ -1146,7 +1129,7 @@ fn apply_replication_frame(
     return Ok(());
   }
 
-  let tx_guard = db.begin_guard(false)?;
+  let tx_guard = db.begin_replication_apply()?;
   for record in &records {
     apply_wal_record_idempotent(db, record, schema_map)?;
   }

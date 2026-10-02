@@ -417,11 +417,6 @@ pub struct DeltaState {
 
   // Key index delta
   pub key_index: HashMap<String, NodeId>,
-  pub key_index_deleted: HashSet<String>,
-
-  // Reverse index for efficient edge cleanup on node deletion
-  // Maps destination node -> set of source nodes with edges to it
-  pub incoming_edge_sources: HashMap<NodeId, HashSet<NodeId>>,
 
   // Pending vector operations (keyed by (node_id, prop_key_id))
   // Some(vec) = set, None = delete
@@ -446,7 +441,9 @@ pub struct OpenOptions {
   // Single-file options
   pub auto_checkpoint: bool,     // Default: true
   pub checkpoint_threshold: f64, // Default: 0.8
-  pub cache_snapshot: bool,      // Default: true
+  /// Has no effect: an open database always keeps its snapshot mapped.
+  #[deprecated(note = "has no effect: an open database always keeps its snapshot mapped")]
+  pub cache_snapshot: bool,
 
   // Single-file creation options
   pub page_size: Option<usize>, // Default: 4096
@@ -454,10 +451,15 @@ pub struct OpenOptions {
 }
 
 // ============================================================================
-// Cache Configuration
+// Cache configuration (deprecated, no effect)
 // ============================================================================
+//
+// The cache layer was removed: no read ever consulted it. These types stay so
+// code passing them to `SingleFileOpenOptions::cache` keeps compiling.
 
-/// Cache options
+/// Has no effect; the cache layer was removed.
+#[deprecated(note = "has no effect: the cache layer was removed")]
+#[allow(deprecated)]
 #[derive(Debug, Clone, Default)]
 pub struct CacheOptions {
   pub enabled: bool,
@@ -466,12 +468,15 @@ pub struct CacheOptions {
   pub query_cache: Option<QueryCacheConfig>,
 }
 
+/// Has no effect; the cache layer was removed.
+#[deprecated(note = "has no effect: the cache layer was removed")]
 #[derive(Debug, Clone)]
 pub struct PropertyCacheConfig {
   pub max_node_props: usize, // Default: 10000
   pub max_edge_props: usize, // Default: 10000
 }
 
+#[allow(deprecated)]
 impl Default for PropertyCacheConfig {
   fn default() -> Self {
     Self {
@@ -481,12 +486,15 @@ impl Default for PropertyCacheConfig {
   }
 }
 
+/// Has no effect; the cache layer was removed.
+#[deprecated(note = "has no effect: the cache layer was removed")]
 #[derive(Debug, Clone)]
 pub struct TraversalCacheConfig {
   pub max_entries: usize,             // Default: 5000
   pub max_neighbors_per_entry: usize, // Default: 100
 }
 
+#[allow(deprecated)]
 impl Default for TraversalCacheConfig {
   fn default() -> Self {
     Self {
@@ -496,12 +504,15 @@ impl Default for TraversalCacheConfig {
   }
 }
 
+/// Has no effect; the cache layer was removed.
+#[deprecated(note = "has no effect: the cache layer was removed")]
 #[derive(Debug, Clone)]
 pub struct QueryCacheConfig {
   pub max_entries: usize, // Default: 1000
   pub ttl_ms: Option<u64>,
 }
 
+#[allow(deprecated)]
 impl Default for QueryCacheConfig {
   fn default() -> Self {
     Self {
@@ -509,20 +520,6 @@ impl Default for QueryCacheConfig {
       ttl_ms: None,
     }
   }
-}
-
-/// Cache statistics
-#[derive(Debug, Clone, Default)]
-pub struct CacheStats {
-  pub property_cache_hits: u64,
-  pub property_cache_misses: u64,
-  pub property_cache_size: usize,
-  pub traversal_cache_hits: u64,
-  pub traversal_cache_misses: u64,
-  pub traversal_cache_size: usize,
-  pub query_cache_hits: u64,
-  pub query_cache_misses: u64,
-  pub query_cache_size: usize,
 }
 
 // ============================================================================
@@ -754,13 +751,20 @@ pub struct DbHeaderV1 {
   pub wal_secondary_head: u64,
   pub active_wal_region: u8,      // 0=primary, 1=secondary
   pub checkpoint_in_progress: u8, // for crash recovery
+  // V2 (format version 2) WAL salts; 0 means unsalted (a v1 WAL)
+  /// Salt of the primary WAL region's records: XORed into each record's CRC,
+  /// and replaced whenever the region is emptied for reuse.
+  pub wal_primary_salt: u32,
+  /// Salt of the secondary WAL region's records, replaced whenever a
+  /// background checkpoint starts writing there.
+  pub wal_secondary_salt: u32,
 }
 
 /// Size of fixed header fields before reserved area (in bytes)
 pub const DB_HEADER_FIXED_SIZE: usize = 176;
 
-/// Size of reserved area in header (in bytes)
-pub const DB_HEADER_RESERVED_SIZE: usize = 14;
+/// Size of reserved area in header (in bytes): 162..164 and 172..176
+pub const DB_HEADER_RESERVED_SIZE: usize = 6;
 
 /// Size of V2 fields
 pub const DB_HEADER_V2_FIELDS_SIZE: usize = 8 + 8 + 1 + 1; // 18 bytes

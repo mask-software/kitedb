@@ -5,7 +5,7 @@
 use crate::constants::*;
 use crate::types::*;
 use crate::util::binary::*;
-use crate::util::crc::crc32c;
+use crate::util::crc::crc32;
 
 // ============================================================================
 // WAL Record
@@ -37,7 +37,8 @@ impl WalRecord {
     align_up(unpadded, WAL_RECORD_ALIGNMENT)
   }
 
-  /// Build the WAL record bytes
+  /// Build the WAL record bytes, unsalted (as replication frames carry them).
+  /// The WAL buffer salts records as it writes them; see [`apply_wal_salt`].
   pub fn build(&self) -> Vec<u8> {
     let header_size = WAL_RECORD_HEADER_SIZE;
     let crc_size = 4;
@@ -62,7 +63,7 @@ impl WalRecord {
     // Compute CRC (over type + flags + reserved + txid + payloadLen + payload)
     let crc_start = 4; // After recLen
     let crc_end = WAL_RECORD_HEADER_SIZE + self.payload.len();
-    let crc_value = crc32c(&buffer[crc_start..crc_end]);
+    let crc_value = crc32(&buffer[crc_start..crc_end]);
     write_u32(&mut buffer, crc_end, crc_value);
 
     buffer
@@ -110,19 +111,35 @@ pub enum WalRecordAt {
   Invalid,
 }
 
-/// Parse a single WAL record from buffer at given offset
+/// Parse a single unsalted WAL record (as [`WalRecord::build`] writes it)
+/// from buffer at given offset.
 /// Returns None if record is invalid or truncated
 pub fn parse_wal_record(buffer: &[u8], offset: usize) -> Option<ParsedWalRecord> {
-  match read_wal_record(buffer, offset) {
+  parse_wal_record_with_salt(buffer, offset, 0)
+}
+
+/// Parse a single WAL record written with `salt` (see [`apply_wal_salt`]).
+/// A record written with another salt fails its CRC check like a torn one.
+pub fn parse_wal_record_with_salt(
+  buffer: &[u8],
+  offset: usize,
+  salt: u32,
+) -> Option<ParsedWalRecord> {
+  match read_wal_record_with_salt(buffer, offset, salt) {
     WalRecordAt::Record(record) => Some(record),
     WalRecordAt::UnknownType(_) | WalRecordAt::Invalid => None,
   }
 }
 
-/// Read the WAL record at `offset` of `buffer`, telling a record of an
-/// unknown type apart from bytes that hold no intact record.
+/// Read the unsalted WAL record at `offset` of `buffer`, telling a record of
+/// an unknown type apart from bytes that hold no intact record.
 pub fn read_wal_record(buffer: &[u8], offset: usize) -> WalRecordAt {
-  let Some((record_type_byte, mut record)) = parse_wal_record_frame(buffer, offset) else {
+  read_wal_record_with_salt(buffer, offset, 0)
+}
+
+/// [`read_wal_record`] for a record written with `salt`.
+pub fn read_wal_record_with_salt(buffer: &[u8], offset: usize, salt: u32) -> WalRecordAt {
+  let Some((record_type_byte, mut record)) = parse_wal_record_frame(buffer, offset, salt) else {
     return WalRecordAt::Invalid;
   };
   match WalRecordType::from_u8(record_type_byte) {
@@ -134,9 +151,13 @@ pub fn read_wal_record(buffer: &[u8], offset: usize) -> WalRecordAt {
   }
 }
 
-/// The record at `offset` if its framing and CRC check, with its type byte
-/// (its `record_type` is a placeholder).
-fn parse_wal_record_frame(buffer: &[u8], offset: usize) -> Option<(u8, ParsedWalRecord)> {
+/// The record at `offset` if its framing and CRC (salted with `salt`) check,
+/// with its type byte (its `record_type` is a placeholder).
+fn parse_wal_record_frame(
+  buffer: &[u8],
+  offset: usize,
+  salt: u32,
+) -> Option<(u8, ParsedWalRecord)> {
   if !has_bytes(buffer.len(), offset, 4) {
     return None;
   }
@@ -179,11 +200,11 @@ fn parse_wal_record_frame(buffer: &[u8], offset: usize) -> Option<(u8, ParsedWal
     return None;
   }
 
-  // Verify CRC
+  // Verify CRC (salted: a record of another WAL cycle does not match)
   let crc_start = record_type_offset;
   let crc_end = payload_end;
   let stored_crc = read_u32(buffer, crc_end);
-  let computed_crc = crc32c(&buffer[crc_start..crc_end]);
+  let computed_crc = crc32(&buffer[crc_start..crc_end]) ^ salt;
 
   if stored_crc != computed_crc {
     return None; // CRC mismatch
@@ -201,7 +222,46 @@ fn parse_wal_record_frame(buffer: &[u8], offset: usize) -> Option<(u8, ParsedWal
   ))
 }
 
-/// Scan WAL buffer and return all valid records
+/// Salt (or, applied again, unsalt) `records`, whole records back to back as
+/// [`WalRecord::build`] writes them: XOR `salt` into each record's CRC.
+///
+/// The WAL buffer salts each record with its region's salt (header
+/// `wal_primary_salt` / `wal_secondary_salt`), which changes whenever the
+/// region is emptied for reuse. Records an earlier cycle left in place then
+/// fail the CRC check, so replay stops at them instead of applying them again
+/// after newer commits. Salt 0 leaves records unsalted (the v1 WAL format).
+///
+/// Returns `false`, changing nothing, if `records` is not a sequence of whole
+/// records.
+pub fn apply_wal_salt(records: &mut [u8], salt: u32) -> bool {
+  let mut crc_offsets = Vec::new();
+  let mut offset = 0;
+  while offset < records.len() {
+    let Some(rec_len) = records
+      .get(offset..offset + 4)
+      .map(|bytes| read_u32(bytes, 0) as usize)
+    else {
+      return false;
+    };
+    let Some(total_len) = checked_padded_len(rec_len) else {
+      return false;
+    };
+    if rec_len < WAL_RECORD_HEADER_SIZE + 4 || !has_bytes(records.len(), offset, total_len) {
+      return false;
+    }
+    crc_offsets.push(offset + rec_len - 4);
+    offset += total_len;
+  }
+  if salt != 0 {
+    for crc_offset in crc_offsets {
+      let crc = read_u32(records, crc_offset) ^ salt;
+      write_u32(records, crc_offset, crc);
+    }
+  }
+  true
+}
+
+/// Scan an unsalted WAL buffer and return all valid records
 pub fn scan_wal(buffer: &[u8]) -> Vec<ParsedWalRecord> {
   let mut records = Vec::new();
   let mut offset = 0;
@@ -1218,6 +1278,56 @@ mod tests {
     let data = parse_create_node_payload(&parsed.payload).expect("expected value");
     assert_eq!(data.node_id, 123);
     assert_eq!(data.key, Some("test_key".to_string()));
+  }
+
+  #[test]
+  fn salted_records_parse_only_with_their_salt() {
+    let mut records = WalRecord::new(WalRecordType::Begin, 7, build_begin_payload()).build();
+    records.extend(
+      WalRecord::new(
+        WalRecordType::CreateNode,
+        7,
+        build_create_node_payload(1, Some("k")),
+      )
+      .build(),
+    );
+    let unsalted = records.clone();
+    let second = parse_wal_record(&unsalted, 0)
+      .expect("first record")
+      .record_end;
+
+    assert!(apply_wal_salt(&mut records, 0xDEAD_BEEF));
+    for offset in [0, second] {
+      let record = parse_wal_record_with_salt(&records, offset, 0xDEAD_BEEF).expect("salted");
+      assert_eq!(record.txid, 7);
+      // Unsalted, or with any other salt, it fails like a torn record.
+      for other in [0, 1, 0xDEAD_BEEE] {
+        assert!(parse_wal_record_with_salt(&records, offset, other).is_none());
+        assert!(matches!(
+          read_wal_record_with_salt(&records, offset, other),
+          WalRecordAt::Invalid
+        ));
+      }
+    }
+
+    // Salting again with the same salt restores the unsalted bytes.
+    assert!(apply_wal_salt(&mut records, 0xDEAD_BEEF));
+    assert_eq!(records, unsalted);
+    // Salt 0 is the unsalted (format 1) encoding.
+    assert!(apply_wal_salt(&mut records, 0));
+    assert_eq!(records, unsalted);
+  }
+
+  #[test]
+  fn apply_wal_salt_refuses_bytes_that_are_not_whole_records() {
+    let record = WalRecord::new(WalRecordType::Commit, 3, build_commit_payload()).build();
+    let mut truncated = record[..record.len() - 8].to_vec();
+    let mut trailing = [record.clone(), vec![0u8; 8]].concat();
+    for bytes in [&mut truncated, &mut trailing] {
+      let before = bytes.clone();
+      assert!(!apply_wal_salt(bytes, 5));
+      assert_eq!(*bytes, before, "refused bytes must be left unchanged");
+    }
   }
 
   #[test]

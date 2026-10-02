@@ -4,7 +4,7 @@ use super::values::PropValue;
 use pyo3::prelude::*;
 
 /// Node property key-value pair
-#[pyclass(name = "NodeProp")]
+#[pyclass(name = "NodeProp", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct NodeProp {
   #[pyo3(get)]
@@ -33,7 +33,7 @@ impl NodeProp {
 }
 
 /// Node entry with properties (used in streaming)
-#[pyclass(name = "NodeWithProps")]
+#[pyclass(name = "NodeWithProps", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct NodeWithProps {
   #[pyo3(get)]
@@ -70,7 +70,7 @@ impl NodeWithProps {
 }
 
 /// Edge entry with properties (used in streaming)
-#[pyclass(name = "EdgeWithProps")]
+#[pyclass(name = "EdgeWithProps", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct EdgeWithProps {
   #[pyo3(get)]

@@ -9,19 +9,16 @@ use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::thread::ThreadId;
 
 use parking_lot::{Condvar, Mutex, RwLock};
 
 use self::vector::VectorStoreLazyEntry;
-use crate::cache::manager::CacheManager;
 use crate::constants::*;
 use crate::core::header::{other_header_slot, write_header_slot};
 use crate::core::pager::FilePager;
 use crate::core::snapshot::reader::SnapshotData;
 use crate::core::wal::buffer::WalBuffer;
 use crate::error::Result;
-use crate::mvcc::visibility::{edge_exists as mvcc_edge_exists, node_exists as mvcc_node_exists};
 use crate::mvcc::MvccManager;
 use crate::types::*;
 use crate::util::compression::CompressionOptions;
@@ -32,14 +29,17 @@ mod check;
 mod checkpoint;
 mod compactor;
 mod iter;
+mod mvcc_history;
 mod open;
 mod read;
 mod recovery;
 mod replication;
 mod schema;
 mod transaction;
+mod tx_registry;
 mod vector;
 mod write;
+mod writer_slot;
 
 #[cfg(test)]
 mod stress;
@@ -51,6 +51,7 @@ pub use open::{
   close_single_file, close_single_file_with_options, open_single_file, SingleFileCloseOptions,
   SingleFileOpenOptions, SnapshotParseMode, SyncMode,
 };
+pub(crate) use transaction::GroupCommitState;
 pub use transaction::SingleFileTxGuard;
 
 // Also re-export recovery items that are used externally
@@ -159,6 +160,12 @@ pub struct SingleFileTxState {
   pub(crate) schema: SchemaStaging,
   pub bulk_load: bool,
   pub pending_wal: Vec<u8>,
+  /// A replica's replication apply; the only transactions in which a
+  /// replica accepts data writes.
+  pub(crate) replication_apply: bool,
+  /// It holds non-MVCC mode's writer slot (see `writer_slot`), released when
+  /// it is settled.
+  pub(crate) holds_writer: bool,
 }
 
 impl SingleFileTxState {
@@ -171,6 +178,8 @@ impl SingleFileTxState {
       schema: SchemaStaging::default(),
       bulk_load,
       pending_wal: Vec::new(),
+      replication_apply: false,
+      holds_writer: false,
     }
   }
 }
@@ -185,6 +194,9 @@ pub struct SingleFileDB {
   pub(crate) path: PathBuf,
   /// Read-only mode
   pub(crate) read_only: bool,
+  /// Set once `close_single_file` has persisted everything, so dropping the
+  /// handle afterwards writes nothing.
+  pub(crate) closed: AtomicBool,
   /// Page-based I/O
   pub(crate) pager: Mutex<FilePager>,
   /// Database header
@@ -205,8 +217,9 @@ pub struct SingleFileDB {
   pub(crate) next_propkey_id: AtomicU32,
   pub(crate) next_tx_id: AtomicU64,
 
-  /// Current active transaction
-  pub(crate) current_tx: Mutex<HashMap<ThreadId, std::sync::Arc<Mutex<SingleFileTxState>>>>,
+  /// Shared with the thread-local entries of this database's transactions
+  /// (see `tx_registry`): each thread keeps its own open transaction.
+  pub(crate) tx_shared: std::sync::Arc<tx_registry::TxShared>,
   /// Active write transactions (excludes read-only)
   pub(crate) active_writers: AtomicUsize,
   /// All transactions that have begun and have not finished commit/rollback.
@@ -235,7 +248,8 @@ pub struct SingleFileDB {
   /// Serialize commit operations to preserve WAL/delta ordering
   pub(crate) commit_lock: Mutex<()>,
 
-  /// Group commit state (coalesces WAL flushes)
+  /// Group commit queue (one leader writes a batch of commits with one WAL
+  /// flush and one header); waiters park on `group_commit_cv`
   pub(crate) group_commit_state: Mutex<GroupCommitState>,
   pub(crate) group_commit_cv: Condvar,
 
@@ -284,9 +298,6 @@ pub struct SingleFileDB {
   /// Lazy vector-store section index keyed by property key ID
   pub(crate) vector_store_lazy_entries: RwLock<HashMap<PropKeyId, VectorStoreLazyEntry>>,
 
-  /// Cache manager for property, traversal, query, and key caches
-  pub(crate) cache: RwLock<Option<CacheManager>>,
-
   /// Compression options for checkpoint snapshots
   pub(crate) checkpoint_compression: Option<CompressionOptions>,
 
@@ -295,8 +306,6 @@ pub struct SingleFileDB {
 
   /// Enable group commit (coalesce WAL flushes across commits)
   pub(crate) group_commit_enabled: bool,
-  /// Group commit window in milliseconds
-  pub(crate) group_commit_window_ms: u64,
 
   /// Primary replication runtime (enabled only when role=primary)
   pub(crate) primary_replication: Option<crate::replication::primary::PrimaryReplication>,
@@ -347,6 +356,12 @@ pub(crate) struct BackgroundCheckpointState {
   /// the last declined cut. A cut is not retried before one of them
   /// finishes: until then the copies only grow.
   pub(crate) declined_carry: Option<HashSet<TxId>>,
+  /// Blocking checkpoints, optimizes, vacuums and WAL resizes waiting in
+  /// `exclusive_checkpoint_gate`. While any wait, new background checkpoints
+  /// decline instead of claiming `status` ahead of them: a waiter that finds
+  /// a run in progress whenever it gets the gate would wait forever behind a
+  /// background checkpoint loop.
+  pub(crate) exclusive_waiters: usize,
 }
 
 impl Default for BackgroundCheckpointState {
@@ -358,6 +373,7 @@ impl Default for BackgroundCheckpointState {
       cut: 0,
       writers_waited: false,
       declined_carry: None,
+      exclusive_waiters: 0,
     }
   }
 }
@@ -370,13 +386,27 @@ impl BackgroundCheckpointState {
   }
 }
 
-#[derive(Debug, Default)]
-pub(crate) struct GroupCommitState {
-  pub next_seq: u64,
-  pub flushed_seq: u64,
-  pub flushing: bool,
-  pub last_error_seq: u64,
-  pub last_error: Option<String>,
+/// A database dropped without `close_single_file` still persists what close
+/// would, best effort: without it, `SyncMode::Off` loses every commit since
+/// the last checkpoint. It never panics; a failure is reported on stderr.
+/// After a successful close it does nothing.
+impl Drop for SingleFileDB {
+  fn drop(&mut self) {
+    if self.read_only || self.closed.load(Ordering::Acquire) {
+      return;
+    }
+    let persisted =
+      std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.persist_for_close()));
+    let failure = match persisted {
+      Ok(Ok(())) => return,
+      Ok(Err(error)) => error.to_string(),
+      Err(_) => "it panicked".to_string(),
+    };
+    eprintln!(
+      "Warning: {} was dropped without close, and persisting its commits failed: {failure}",
+      self.path.display()
+    );
+  }
 }
 
 // ============================================================================
@@ -407,11 +437,30 @@ impl SingleFileDB {
     Ok(())
   }
 
-  pub(crate) fn wait_for_no_active_transactions(&self) {
-    let mut wait = self.checkpoint_wait.lock();
-    while self.active_transactions.load(Ordering::Acquire) != 0 {
-      self.checkpoint_cv.wait(&mut wait);
+  /// Flush the WAL buffer, install a header naming every commit, and sync:
+  /// what closing persists. In `SyncMode::Off` nothing else writes commits
+  /// since the last checkpoint to disk.
+  pub(crate) fn persist_for_close(&self) -> Result<()> {
+    let mut pager = self.pager.lock();
+    let mut wal_buffer = self.wal_buffer.lock();
+    // A failed commit's records may still be readable on disk; the header
+    // below must not name bytes past them before their overwrite is durable.
+    if wal_buffer.needs_sync() {
+      wal_buffer.sync(&mut pager)?;
+    } else {
+      wal_buffer.flush(&mut pager)?;
     }
+    {
+      let mut header = self.header.write();
+      wal_buffer.store_in_header(&mut header);
+      header.max_node_id = self.next_node_id.load(Ordering::SeqCst).saturating_sub(1);
+      header.next_tx_id = self.next_tx_id.load(Ordering::SeqCst);
+
+      // Install the updated header in the inactive slot. The sync below makes
+      // the WAL and header durable together.
+      self.persist_header(&mut pager, &mut header, false)?;
+    }
+    pager.sync()
   }
 
   pub(crate) fn transaction_finished(&self, txid: TxId, wrote_begin: bool) {
@@ -657,13 +706,17 @@ impl SingleFileDB {
     let tx_handle = self.current_tx_handle();
     if let Some(handle) = tx_handle.as_ref() {
       let tx = handle.lock();
-      if tx.pending.is_node_deleted(node_id) {
-        return false;
-      }
       if tx.pending.is_node_created(node_id) {
         return true;
       }
+      if tx.pending.is_node_deleted(node_id) {
+        return false;
+      }
     }
+
+    // Read-locked across the MVCC lookup: a commit lands completely before or after this
+    // read (lock order: see read.rs).
+    let delta = self.delta.read();
 
     if let Some(mvcc) = self.mvcc.as_ref() {
       let (txid, tx_snapshot_ts) = if let Some(handle) = tx_handle.as_ref() {
@@ -677,27 +730,13 @@ impl SingleFileDB {
         tx_mgr.record_read(txid, TxKey::Node(node_id));
       }
       let vc = mvcc.version_chain.lock();
-      if let Some(version) = vc.node_version(node_id) {
-        return mvcc_node_exists(Some(version), tx_snapshot_ts, txid);
+      if let Some(exists) = vc.node_exists_at(node_id, tx_snapshot_ts, txid) {
+        return exists;
       }
     }
 
-    let delta = self.delta.read();
-
-    if delta.is_node_deleted(node_id) {
-      return false;
-    }
-
-    if delta.is_node_created(node_id) {
-      return true;
-    }
-
-    // Check snapshot
-    if let Some(ref snapshot) = *self.snapshot.read() {
-      return snapshot.has_node(node_id);
-    }
-
-    false
+    let snapshot = self.snapshot.read();
+    delta.node_exists_over(snapshot.as_ref(), node_id)
   }
 
   /// Check if an edge exists
@@ -705,7 +744,7 @@ impl SingleFileDB {
     let tx_handle = self.current_tx_handle();
     if let Some(handle) = tx_handle.as_ref() {
       let tx = handle.lock();
-      if tx.pending.is_node_deleted(src) || tx.pending.is_node_deleted(dst) {
+      if tx.pending.is_node_removed(src) || tx.pending.is_node_removed(dst) {
         return false;
       }
       if tx.pending.is_edge_deleted(src, etype, dst) {
@@ -714,7 +753,15 @@ impl SingleFileDB {
       if tx.pending.is_edge_added(src, etype, dst) {
         return true;
       }
+      // A node this transaction deleted or recreated masks its committed edges.
+      if tx.pending.is_node_deleted(src) || tx.pending.is_node_deleted(dst) {
+        return false;
+      }
     }
+
+    // Read-locked across the MVCC lookup: a commit lands completely before or after this
+    // read (lock order: see read.rs).
+    let delta = self.delta.read();
 
     if let Some(mvcc) = self.mvcc.as_ref() {
       let (txid, tx_snapshot_ts) = if let Some(handle) = tx_handle.as_ref() {
@@ -728,116 +775,18 @@ impl SingleFileDB {
         tx_mgr.record_read(txid, TxKey::Edge { src, etype, dst });
       }
       let vc = mvcc.version_chain.lock();
-      if let Some(version) = vc.edge_version(src, etype, dst) {
-        return mvcc_edge_exists(Some(version), tx_snapshot_ts, txid);
+      if let Some(exists) = vc.edge_exists_at(src, etype, dst, tx_snapshot_ts, txid) {
+        return exists;
       }
     }
 
-    let delta = self.delta.read();
-
-    if delta.is_edge_deleted(src, etype, dst) {
-      return false;
-    }
-
-    if delta.is_edge_added(src, etype, dst) {
-      return true;
-    }
-
-    // Check snapshot
-    if let Some(ref snapshot) = *self.snapshot.read() {
-      if let (Some(src_phys), Some(dst_phys)) = (snapshot.phys_node(src), snapshot.phys_node(dst)) {
-        return snapshot.has_edge(src_phys, etype, dst_phys);
-      }
-    }
-
-    false
+    let snapshot = self.snapshot.read();
+    delta.edge_exists_over(snapshot.as_ref(), src, etype, dst)
   }
 
   /// Check if MVCC is enabled
   pub fn mvcc_enabled(&self) -> bool {
     self.mvcc.is_some()
-  }
-
-  // ==========================================================================
-  // Cache API
-  // ==========================================================================
-
-  /// Check if caching is enabled
-  pub fn cache_is_enabled(&self) -> bool {
-    self
-      .cache
-      .read()
-      .as_ref()
-      .map(|c| c.is_enabled())
-      .unwrap_or(false)
-  }
-
-  /// Invalidate all caches for a node
-  pub fn cache_invalidate_node(&self, node_id: NodeId) {
-    if let Some(ref mut cache) = *self.cache.write() {
-      cache.invalidate_node(node_id);
-    }
-  }
-
-  /// Invalidate caches for a specific edge
-  pub fn cache_invalidate_edge(&self, src: NodeId, etype: ETypeId, dst: NodeId) {
-    if let Some(ref mut cache) = *self.cache.write() {
-      cache.invalidate_edge(src, etype, dst);
-    }
-  }
-
-  /// Invalidate a cached key lookup
-  pub fn cache_invalidate_key(&self, key: &str) {
-    if let Some(ref mut cache) = *self.cache.write() {
-      cache.invalidate_key(key);
-    }
-  }
-
-  /// Clear all caches
-  pub fn cache_clear(&self) {
-    if let Some(ref mut cache) = *self.cache.write() {
-      cache.clear();
-    }
-  }
-
-  /// Clear only the query cache
-  pub fn cache_clear_query(&self) {
-    if let Some(ref mut cache) = *self.cache.write() {
-      cache.clear_query_cache();
-    }
-  }
-
-  /// Clear only the key cache
-  pub fn cache_clear_key(&self) {
-    if let Some(ref mut cache) = *self.cache.write() {
-      cache.clear_key_cache();
-    }
-  }
-
-  /// Clear only the property cache
-  pub fn cache_clear_property(&self) {
-    if let Some(ref mut cache) = *self.cache.write() {
-      cache.clear_property_cache();
-    }
-  }
-
-  /// Clear only the traversal cache
-  pub fn cache_clear_traversal(&self) {
-    if let Some(ref mut cache) = *self.cache.write() {
-      cache.clear_traversal_cache();
-    }
-  }
-
-  /// Get cache statistics
-  pub fn cache_stats(&self) -> Option<CacheStats> {
-    self.cache.read().as_ref().map(|c| c.stats())
-  }
-
-  /// Reset cache statistics
-  pub fn cache_reset_stats(&self) {
-    if let Some(ref mut cache) = *self.cache.write() {
-      cache.reset_stats();
-    }
   }
 }
 

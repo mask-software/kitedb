@@ -19,8 +19,7 @@ napi = { version = "3.0.0", features = ["napi8", "serde-json"], optional = true 
 napi-derive = { version = "3.0.0", optional = true }
 
 # PyO3 bindings (optional)
-pyo3 = { version = "0.24.1", features = ["extension-module"], optional = true }
-numpy = { version = "0.24.0", optional = true }
+pyo3 = { version = "0.29.3", features = ["extension-module"], optional = true }
 
 # Error handling
 thiserror = "2.0"
@@ -28,13 +27,16 @@ thiserror = "2.0"
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-ureq = "2.10"
 base64 = "0.22"
-rustls-pemfile = "2.2"
-webpki-roots = "1.0"
-opentelemetry-proto = { version = "0.31", default-features = false, features = ["gen-tonic", "metrics"] }
-prost = "0.14"
-tonic = { version = "0.14", features = ["transport", "tls-webpki-roots", "gzip"] }
+
+# OTLP metrics push (optional, `otlp` feature)
+ureq = { version = "2.10", optional = true }
+rustls-pemfile = { version = "2.2", optional = true }
+webpki-roots = { version = "1.0", optional = true }
+opentelemetry-proto = { version = "0.31", default-features = false, features = ["gen-tonic", "metrics"], optional = true }
+prost = { version = "0.14", optional = true }
+tonic = { version = "0.14", features = ["transport", "tls-webpki-roots", "gzip"], optional = true }
+tokio = { version = "1.45", features = ["rt", "rt-multi-thread", "fs", "sync", "time", "net"], optional = true }
 
 # Binary encoding
 byteorder = "1.5"
@@ -49,9 +51,6 @@ flate2 = "1.1"
 # Concurrency
 parking_lot = "0.12"
 crossbeam-channel = "0.5"
-
-# Async runtime
-tokio = { version = "1.45", features = ["rt", "rt-multi-thread", "fs", "sync", "time", "net"] }
 
 # Collections
 hashbrown = "0.15"
@@ -74,7 +73,7 @@ libc = "0.2"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # Memory mapping (native only)
-memmap2 = "0.9"
+memmap2 = "0.9.11" # >= 0.9.11: RUSTSEC-2026-0186
 # File locking (native only)
 fs2 = "0.4"
 # Parallelism (native only)
@@ -87,6 +86,8 @@ napi-build = { version = "2", optional = true }
 
 [dev-dependencies]
 tempfile = "3.20"
+# examples/ray_vs_memgraph_bench.rs drives neo4rs from a runtime of its own
+tokio = { version = "1.45", features = ["rt", "rt-multi-thread", "time", "net"] }
 criterion = "0.5"
 neo4rs = "0.8"
 
@@ -112,8 +113,19 @@ harness = false
 
 [features]
 default = ["napi"]
-napi = ["dep:napi", "dep:napi-derive", "dep:napi-build"]
-python = ["dep:pyo3", "dep:numpy"]
+napi = ["dep:napi", "dep:napi-derive", "dep:napi-build", "otlp"]
+python = ["dep:pyo3", "otlp"]
+# Push replication metrics to an OpenTelemetry collector (HTTP and gRPC).
+# The bindings enable it; Rust users opt in.
+otlp = [
+  "dep:ureq",
+  "dep:rustls-pemfile",
+  "dep:webpki-roots",
+  "dep:opentelemetry-proto",
+  "dep:prost",
+  "dep:tonic",
+  "dep:tokio",
+]
 async = []
 bench-profile = []
 

@@ -1,6 +1,6 @@
 //! Property operations for Python bindings
 
-use pyo3::exceptions::PyRuntimeError;
+use crate::pyo3_bindings::errors;
 use pyo3::prelude::*;
 
 use crate::core::single_file::SingleFileDB as RustSingleFileDB;
@@ -60,7 +60,7 @@ pub fn set_node_prop_single(
   value: CorePropValue,
 ) -> PyResult<()> {
   db.set_node_prop(node_id, key_id, value)
-    .map_err(|e| PyRuntimeError::new_err(format!("Failed to set property: {e}")))
+    .map_err(|e| errors::wrap(e, "Failed to set property"))
 }
 
 /// Set node property by name on single-file database
@@ -71,7 +71,7 @@ pub fn set_node_prop_by_name_single(
   value: CorePropValue,
 ) -> PyResult<()> {
   db.set_node_prop_by_name(node_id, key_name, value)
-    .map_err(|e| PyRuntimeError::new_err(format!("Failed to set property: {e}")))
+    .map_err(|e| errors::wrap(e, "Failed to set property"))
 }
 
 /// Get node property on single-file database
@@ -90,7 +90,7 @@ pub fn delete_node_prop_single(
   key_id: PropKeyId,
 ) -> PyResult<()> {
   db.delete_node_prop(node_id, key_id)
-    .map_err(|e| PyRuntimeError::new_err(format!("Failed to delete property: {e}")))
+    .map_err(|e| errors::wrap(e, "Failed to delete property"))
 }
 
 /// Get all node properties on single-file database
@@ -120,7 +120,7 @@ pub fn set_edge_prop_single(
   value: CorePropValue,
 ) -> PyResult<()> {
   db.set_edge_prop(src, etype, dst, key_id, value)
-    .map_err(|e| PyRuntimeError::new_err(format!("Failed to set edge property: {e}")))
+    .map_err(|e| errors::wrap(e, "Failed to set edge property"))
 }
 
 /// Set edge property by name on single-file database
@@ -133,7 +133,7 @@ pub fn set_edge_prop_by_name_single(
   value: CorePropValue,
 ) -> PyResult<()> {
   db.set_edge_prop_by_name(src, etype, dst, key_name, value)
-    .map_err(|e| PyRuntimeError::new_err(format!("Failed to set edge property: {e}")))
+    .map_err(|e| errors::wrap(e, "Failed to set edge property"))
 }
 
 /// Get edge property on single-file database
@@ -156,7 +156,7 @@ pub fn delete_edge_prop_single(
   key_id: PropKeyId,
 ) -> PyResult<()> {
   db.delete_edge_prop(src, etype, dst, key_id)
-    .map_err(|e| PyRuntimeError::new_err(format!("Failed to delete edge property: {e}")))
+    .map_err(|e| errors::wrap(e, "Failed to delete edge property"))
 }
 
 /// Get all edge properties on single-file database

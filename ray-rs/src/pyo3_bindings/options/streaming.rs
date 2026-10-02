@@ -5,7 +5,7 @@ use crate::streaming;
 use pyo3::prelude::*;
 
 /// Options for streaming node/edge batches
-#[pyclass(name = "StreamOptions")]
+#[pyclass(name = "StreamOptions", from_py_object)]
 #[derive(Debug, Clone, Default)]
 pub struct StreamOptions {
   /// Batch size; 0 preserves the core default.
@@ -39,7 +39,7 @@ impl StreamOptions {
 }
 
 /// Options for cursor-based pagination
-#[pyclass(name = "PaginationOptions")]
+#[pyclass(name = "PaginationOptions", from_py_object)]
 #[derive(Debug, Clone, Default)]
 pub struct PaginationOptions {
   /// Page limit; 0 preserves the core default.

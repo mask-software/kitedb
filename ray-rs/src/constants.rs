@@ -45,9 +45,17 @@ pub const MAGIC_KITEDB: [u8; 16] = [
   0x6f, 0x72, 0x6d, 0x61, 0x74, 0x20, 0x31, 0x00, // "ormat 1\0"
 ];
 
-/// Single-file format version
-pub const VERSION_SINGLE_FILE: u32 = 1;
-pub const MIN_READER_SINGLE_FILE: u32 = 1;
+/// Single-file format version.
+///
+/// v2: each WAL region has a salt in the header (`wal_primary_salt`,
+/// `wal_secondary_salt`), XORed into the CRC of every record written there and
+/// replaced whenever the region is emptied for reuse, so records an earlier
+/// WAL cycle left behind no longer parse. v1 files (unsalted WAL, salts 0)
+/// still open; their WAL replays as is, and the next WAL reset salts it and
+/// upgrades the header to v2.
+pub const VERSION_SINGLE_FILE: u32 = 2;
+/// Readers before v2 cannot verify salted WAL records.
+pub const MIN_READER_SINGLE_FILE: u32 = 2;
 
 /// Single-file extension
 pub const EXT_KITEDB: &str = ".kitedb";
@@ -67,20 +75,14 @@ pub const OS_PAGE_SIZE: usize = 4096;
 /// Database header size (first page)
 pub const DB_HEADER_SIZE: usize = 4096;
 
-/// Database header reserved area size - reduced for V2 fields
-pub const DB_HEADER_RESERVED_SIZE: usize = 14;
+/// Database header reserved area size: bytes 162..164 and 172..176
+pub const DB_HEADER_RESERVED_SIZE: usize = 6;
 
 /// Default WAL size (4MB). The WAL is fixed-size: it does not grow on its own.
 pub const WAL_DEFAULT_SIZE: usize = 4 * 1024 * 1024;
 
 /// Minimum WAL to snapshot ratio (10%)
 pub const WAL_MIN_SNAPSHOT_RATIO: f64 = 0.1;
-
-/// SQLite-style lock byte offset (2^30 = 1GB)
-pub const LOCK_BYTE_OFFSET: u64 = 0x40000000;
-
-/// Lock byte range size
-pub const LOCK_BYTE_RANGE: usize = 512;
 
 // ============================================================================
 // Database header flags
@@ -89,6 +91,11 @@ pub const LOCK_BYTE_RANGE: usize = 512;
 pub const DB_FLAG_WAL_MODE: u32 = 1 << 0;
 pub const DB_FLAG_COMPRESSION: u32 = 1 << 1;
 pub const DB_FLAG_ENCRYPTED: u32 = 1 << 2;
+
+/// Header flags this build implements. Every single-file database uses a WAL,
+/// so `DB_FLAG_WAL_MODE` changes nothing; any other flag makes open fail, since
+/// this build would misread (or, writing, corrupt) such a file.
+pub const SUPPORTED_DB_FLAGS: u32 = DB_FLAG_WAL_MODE;
 
 // ============================================================================
 // Thresholds for compact recommendation
@@ -124,6 +131,9 @@ pub const INITIAL_LABEL_ID: u32 = 1;
 pub const INITIAL_ETYPE_ID: u32 = 1;
 pub const INITIAL_PROPKEY_ID: u32 = 1;
 pub const INITIAL_TX_ID: u64 = 1;
+/// Salt of a new database's primary WAL region. 0 marks an unsalted region
+/// (a v1 WAL, or a secondary region no checkpoint has used yet).
+pub const INITIAL_WAL_SALT: u32 = 1;
 
 // ============================================================================
 // Snapshot generation starts at 1 (0 means no snapshot)

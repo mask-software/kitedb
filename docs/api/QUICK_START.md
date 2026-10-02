@@ -313,8 +313,9 @@ const comment = defineNode('comment', {
   key: (id: number) => `comment:${id}`,
 });
 
+// Multi-part keys need a template (a key function may only add a prefix)
 const postComment = defineNode('postComment', {
-  key: (postId: number, commentId: number) => `post:${postId}:comment:${commentId}`,
+  key: { kind: 'template', template: 'post:{postId}:comment:{commentId}' },
 });
 ```
 

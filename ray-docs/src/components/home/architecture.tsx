@@ -56,7 +56,7 @@ const DISK_BOXES: Box[] = [
 		w: 330,
 		h: 72,
 		title: "Write-ahead log",
-		sub: ["append-only, CRC32C records"],
+		sub: ["append-only, CRC-32 per record"],
 	},
 	{
 		x: 560,
@@ -251,7 +251,7 @@ export function Architecture() {
 					<ol class="space-y-3 md:hidden">
 						<li class="rounded-xl border border-kite-line bg-kite-surface/40 p-4 text-[14px] leading-relaxed text-slate-400">
 							<span class="font-medium text-white">Commit</span>: your code →
-							write-ahead log (CRC32C) → in-memory delta
+							write-ahead log (CRC-32) → in-memory delta
 						</li>
 						<li class="rounded-xl border border-kite-line bg-kite-surface/40 p-4 text-[14px] leading-relaxed text-slate-400">
 							<span class="font-medium text-white">Read</span>: memory-mapped

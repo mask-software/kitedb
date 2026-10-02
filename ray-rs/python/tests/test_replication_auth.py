@@ -51,7 +51,8 @@ def test_replication_auth_mtls_mode_supports_header_and_subject_regex():
     config = ReplicationAdminAuthConfig(
         mode="mtls",
         mtls_header="x-client-cert",
-        mtls_subject_regex=r"^CN=replication-admin,",
+        mtls_subject_regex=r"CN=replication-admin,O=RayDB",
+        trust_forwarded_client_cert=True,
     )
     assert is_replication_admin_authorized(
         FakeRequest(headers={"x-client-cert": "CN=replication-admin,O=RayDB"}),
@@ -68,6 +69,8 @@ def test_replication_auth_token_or_and_modes():
         mode="token_or_mtls",
         token="abc123",
         mtls_header="x-client-cert",
+        mtls_subject_regex=r"CN=replication-admin,O=RayDB",
+        trust_forwarded_client_cert=True,
     )
     assert is_replication_admin_authorized(
         FakeRequest(headers={"authorization": "Bearer abc123"}), either
@@ -81,6 +84,8 @@ def test_replication_auth_token_or_and_modes():
         mode="token_and_mtls",
         token="abc123",
         mtls_header="x-client-cert",
+        mtls_subject_regex=r"CN=replication-admin,O=RayDB",
+        trust_forwarded_client_cert=True,
     )
     assert not is_replication_admin_authorized(
         FakeRequest(headers={"authorization": "Bearer abc123"}), both

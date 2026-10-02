@@ -138,6 +138,9 @@ const SIMILARITY: Record<string, string> = {
 	csr: "0.81",
 	recall: "0.74",
 };
+// Keep `in` out of JSX attributes: Solid's SSR escapes each operand of an
+// attribute expression, and from 1.9.15 that stringifies objects.
+const isHit = (id: string) => id in SIMILARITY;
 
 const nodeById = new Map(NODES.map((n) => [n.id, n]));
 function graphNode(id: string): GraphNode {
@@ -228,7 +231,7 @@ function vectorFrame(step: number): Frame {
 	for (const n of NODES) nodes[n.id] = n.kind === "doc" ? "idle" : "muted";
 	if (step >= 1) for (const id of DOCS) nodes[id] = "candidate";
 	if (step >= 2) {
-		for (const id of DOCS) nodes[id] = id in SIMILARITY ? "hit" : "muted";
+		for (const id of DOCS) nodes[id] = isHit(id) ? "hit" : "muted";
 	}
 	return {
 		nodes,
@@ -490,7 +493,7 @@ export function QueryTheater() {
 									return (
 										<line
 											class="qt-probe"
-											data-hit={id in SIMILARITY}
+											data-hit={isHit(id)}
 											x1={seg.x1}
 											y1={seg.y1}
 											x2={seg.x2}

@@ -11,13 +11,13 @@ use std::time::Instant;
 
 use parking_lot::{Mutex, RwLock};
 
-use crate::cache::manager::CacheManager;
 use crate::constants::*;
 use crate::core::header::{
   other_header_slot, read_header_slots, write_header_slot, HEADER_SLOT_A, HEADER_SLOT_B,
 };
 use crate::core::pager::{
-  create_pager_with_locking, is_valid_page_size, open_pager_with_locking, pages_to_store, FilePager,
+  create_pager_with_locking, is_valid_page_size, open_pager_with_locking, pages_to_store,
+  FilePager, NewPager,
 };
 use crate::core::snapshot::reader::SnapshotData;
 use crate::core::wal::buffer::WalBuffer;
@@ -28,14 +28,13 @@ use crate::replication::replica::ReplicaReplication;
 use crate::replication::types::ReplicationRole;
 use crate::types::*;
 use crate::util::compression::CompressionOptions;
+use crate::util::fs::sync_parent_dir;
 use crate::util::mmap::{map_file_range, Mmap};
-use crate::vector::store::{create_vector_store, vector_store_delete, vector_store_insert};
-use crate::vector::types::VectorStoreConfig;
 
 use super::recovery::{
   committed_transactions, drop_vectors_of_missing_nodes, replay_wal_record, scan_wal_records,
 };
-use super::vector::{materialize_vector_store_from_lazy_entries, vector_store_state_from_snapshot};
+use super::vector::{apply_replayed_vectors, vector_store_state_from_snapshot};
 use super::{BackgroundCheckpointState, SchemaReservations, SingleFileDB};
 
 // ============================================================================
@@ -48,8 +47,10 @@ use super::{BackgroundCheckpointState, SchemaReservations, SingleFileDB};
 /// Similar to SQLite's PRAGMA synchronous setting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SyncMode {
-  /// Fsync on every commit (durable to OS, slowest)
-  /// On macOS this uses fsync for parity with Node/Bun.
+  /// Fsync on every commit (durable to OS, slowest).
+  /// On macOS, fsync leaves writes in the drive's volatile cache, so without
+  /// [`SingleFileOpenOptions::full_fsync`] this mode does not survive power
+  /// loss there (the same as SQLite's default).
   #[default]
   Full,
 
@@ -58,8 +59,12 @@ pub enum SyncMode {
   /// but not if application crashes. ~1000x faster than Full.
   Normal,
 
-  /// No fsync (fastest, least safe)
-  /// Data may be lost on any crash. Only for testing/ephemeral data.
+  /// No fsync, and no WAL write per commit (fastest, least safe).
+  ///
+  /// **Commits stay in memory until a checkpoint, `close_single_file`, or
+  /// dropping the handle writes them.** A crash of the process, not just of
+  /// the OS, loses every commit since the last checkpoint. Only for tests
+  /// and data you can rebuild.
   Off,
 }
 
@@ -104,15 +109,25 @@ pub struct SingleFileOpenOptions {
   pub checkpoint_threshold: f64,
   /// Use background (non-blocking) checkpoint instead of blocking (default true)
   pub background_checkpoint: bool,
-  /// Cache options (None = disabled)
+  /// Has no effect. The cache layer was removed: no read ever consulted it,
+  /// and reads are served from the snapshot and delta. Still accepted so
+  /// existing callers keep compiling.
+  #[deprecated(note = "has no effect: the cache layer was removed")]
+  #[allow(deprecated)]
   pub cache: Option<CacheOptions>,
   /// Compression options for checkpoint snapshots
   pub checkpoint_compression: Option<CompressionOptions>,
   /// Synchronization mode for WAL writes (default: Full)
   pub sync_mode: SyncMode,
-  /// Enable group commit (coalesce WAL flushes across commits)
+  /// macOS only: with `SyncMode::Full`, sync with `F_FULLFSYNC` so commits
+  /// survive power loss (default false). See [`Self::full_fsync`].
+  pub full_fsync: bool,
+  /// Enable group commit (`SyncMode::Normal` only): commits that arrive while
+  /// others are written are written together, with one WAL flush and one
+  /// header write
   pub group_commit_enabled: bool,
-  /// Group commit window in milliseconds
+  /// Unused, kept for compatibility: group commit no longer waits for more
+  /// commits; those arriving while a batch is written form the next one
   pub group_commit_window_ms: u64,
   /// Snapshot parse behavior (default: Strict)
   pub snapshot_parse_mode: SnapshotParseMode,
@@ -141,6 +156,7 @@ pub struct SingleFileOpenOptions {
 }
 
 impl Default for SingleFileOpenOptions {
+  #[allow(deprecated)]
   fn default() -> Self {
     Self {
       read_only: false,
@@ -160,6 +176,7 @@ impl Default for SingleFileOpenOptions {
         ..Default::default()
       }),
       sync_mode: SyncMode::Full,
+      full_fsync: false,
       group_commit_enabled: false,
       group_commit_window_ms: 2,
       snapshot_parse_mode: SnapshotParseMode::Strict,
@@ -248,6 +265,9 @@ impl SingleFileOpenOptions {
     self
   }
 
+  /// Has no effect; see [`SingleFileOpenOptions::cache`].
+  #[deprecated(note = "has no effect: the cache layer was removed")]
+  #[allow(deprecated)]
   pub fn cache(mut self, options: Option<CacheOptions>) -> Self {
     self.cache = options;
     self
@@ -263,6 +283,9 @@ impl SingleFileOpenOptions {
     self
   }
 
+  /// Has no effect; see [`SingleFileOpenOptions::cache`].
+  #[deprecated(note = "has no effect: the cache layer was removed")]
+  #[allow(deprecated)]
   pub fn enable_cache(mut self) -> Self {
     self.cache = Some(CacheOptions {
       enabled: true,
@@ -276,13 +299,29 @@ impl SingleFileOpenOptions {
     self
   }
 
-  /// Enable or disable group commit (coalesce WAL flushes across commits)
+  /// macOS only: make `SyncMode::Full` durable against power loss (default
+  /// false), like SQLite's `PRAGMA fullfsync`.
+  ///
+  /// On macOS, fsync(2) hands writes to the drive, whose volatile cache can
+  /// lose them, or persist a header before the pages it names, if power
+  /// fails. With this option every sync in `SyncMode::Full` uses
+  /// `F_FULLFSYNC`, which flushes that cache too (falling back to fsync on
+  /// file systems without it). It is much slower: milliseconds per commit
+  /// instead of tens of microseconds. Without it, Full mode on macOS survives
+  /// application and OS crashes but not power loss, the same as SQLite's
+  /// default. Other modes, and other platforms, are unaffected.
+  pub fn full_fsync(mut self, value: bool) -> Self {
+    self.full_fsync = value;
+    self
+  }
+
+  /// Enable or disable group commit (see the `group_commit_enabled` field)
   pub fn group_commit_enabled(mut self, value: bool) -> Self {
     self.group_commit_enabled = value;
     self
   }
 
-  /// Set the group commit window in milliseconds
+  /// Unused, kept for compatibility (see the `group_commit_window_ms` field)
   pub fn group_commit_window_ms(mut self, value: u64) -> Self {
     self.group_commit_window_ms = value;
     self
@@ -295,8 +334,9 @@ impl SingleFileOpenOptions {
     self
   }
 
-  /// Set sync mode to Off (no fsync)
-  /// Only for testing or ephemeral data. Data may be lost on any crash.
+  /// Set sync mode to Off: no fsync, and commits stay in memory until a
+  /// checkpoint, close, or drop writes them, so a process crash loses every
+  /// commit since the last checkpoint. Only for testing or ephemeral data.
   pub fn sync_off(mut self) -> Self {
     self.sync_mode = SyncMode::Off;
     self
@@ -924,10 +964,15 @@ fn open_single_file_internal(
   let (mut pager, mut header, is_new, mut header_slot) = if file_exists {
     // Open existing database
     let mut pager = open_pager_with_locking(path, options.page_size, options.read_only, lock_file)?;
+    pager.set_full_fsync(options.full_fsync && options.sync_mode == SyncMode::Full);
 
     // Read both independently checksummed header pages and select the newest
     // valid generation. A torn newest slot falls back to the other slot.
     let (header, header_slot) = read_header_slots(&mut pager)?;
+
+    // Refuse a format this build cannot read, or (writable) cannot write,
+    // before anything below rewrites the file.
+    header.check_supported(!options.read_only)?;
 
     // Files created before the dual-page format have WAL at page one. Migrate
     // through a separately checkpointed file; an in-place shift would destroy
@@ -952,8 +997,13 @@ fn open_single_file_internal(
 
     (pager, header, false, header_slot)
   } else {
-    // Create new database
-    let mut pager = create_pager_with_locking(path, options.page_size, lock_file)?;
+    // Create new database. If another opener created one here since the
+    // existence check above, open that one instead.
+    let mut pager = match create_pager_with_locking(path, options.page_size, lock_file)? {
+      NewPager::Created(pager) => pager,
+      NewPager::Exists => return open_single_file_internal(path, options, lock_file),
+    };
+    pager.set_full_fsync(options.full_fsync && options.sync_mode == SyncMode::Full);
 
     // Calculate WAL page count
     let wal_size = options.wal_size.unwrap_or(WAL_DEFAULT_SIZE);
@@ -978,19 +1028,12 @@ fn open_single_file_internal(
   };
 
   // Initialize WAL buffer
-  let mut wal_buffer = WalBuffer::from_header(&header);
+  // Fails if the header's WAL positions lie outside their regions.
+  let mut wal_buffer = WalBuffer::from_header(&header)?;
 
   // A background checkpoint cut that no install finished. Replay reads both
   // regions in place, primary first, unless a writable open merges them.
   let mut replay_cut_in_place = header.checkpoint_in_progress != 0;
-  if replay_cut_in_place
-    && (wal_buffer.primary_head() > wal_buffer.primary_region_size()
-      || wal_buffer.secondary_head() > wal_buffer.capacity())
-  {
-    return Err(KiteError::InvalidWal(
-      "WAL region heads exceed their regions".to_string(),
-    ));
-  }
   if !options.read_only {
     // Records of a type this version does not know are a newer version's,
     // not torn: refuse rather than trim or compact them away below.
@@ -1112,9 +1155,10 @@ fn open_single_file_internal(
       // Replay committed transactions
       #[cfg(feature = "bench-profile")]
       let wal_replay_started = Instant::now();
+      let mut skipped = 0usize;
       for (_txid, records) in &committed_in_order {
         for record in records {
-          replay_wal_record(
+          let applied = replay_wal_record(
             record,
             snapshot.as_ref(),
             &mut delta,
@@ -1128,9 +1172,17 @@ fn open_single_file_internal(
             &mut etype_ids,
             &mut propkey_names,
             &mut propkey_ids,
-          );
+          )?;
+          skipped += usize::from(!applied);
         }
         next_commit_ts += 1;
+      }
+      if skipped > 0 {
+        eprintln!(
+          "Warning: WAL replay of {} skipped {skipped} vector maintenance records \
+           (BatchVectors, SealFragment, CompactFragments), which no version applies",
+          path.display()
+        );
       }
       drop_vectors_of_missing_nodes(&mut delta, snapshot.as_ref());
       #[cfg(feature = "bench-profile")]
@@ -1164,46 +1216,19 @@ fn open_single_file_internal(
   };
 
   // Apply pending vector operations from WAL replay
-  for ((node_id, prop_key_id), operation) in delta.pending_vectors.drain() {
-    if let Some(ref snapshot) = snapshot {
-      materialize_vector_store_from_lazy_entries(
-        snapshot,
-        &mut vector_stores,
-        &mut vector_store_lazy_entries,
-        prop_key_id,
-      )?;
-    }
-
-    match operation {
-      Some(vector) => {
-        // Get or create vector store
-        let store = vector_stores.entry(prop_key_id).or_insert_with(|| {
-          let config = VectorStoreConfig::new(vector.len());
-          create_vector_store(config)
-        });
-        vector_store_insert(store, node_id, vector.as_ref()).map_err(|e| {
-          KiteError::InvalidWal(format!(
-            "Failed to apply vector insert during WAL replay for node {node_id} (prop {prop_key_id}): {e}"
-          ))
-        })?;
-      }
-      None => {
-        // Delete operation
-        if let Some(store) = vector_stores.get_mut(&prop_key_id) {
-          vector_store_delete(store, node_id);
-        }
-      }
-    }
-  }
+  apply_replayed_vectors(
+    std::mem::take(&mut delta.pending_vectors),
+    &committed_in_order,
+    snapshot.as_ref(),
+    &mut vector_stores,
+    &mut vector_store_lazy_entries,
+  )?;
   #[cfg(feature = "bench-profile")]
   {
     open_profile.vector_init_ns = open_profile
       .vector_init_ns
       .saturating_add(elapsed_ns(vector_init_started));
   }
-
-  // Initialize cache if enabled
-  let cache = options.cache.clone().map(CacheManager::new);
 
   // Initialize MVCC if enabled (after WAL replay)
   let mvcc = init_mvcc_from_wal(
@@ -1273,6 +1298,7 @@ fn open_single_file_internal(
   Ok(SingleFileDB {
     path: path.to_path_buf(),
     read_only: options.read_only,
+    closed: AtomicBool::new(false),
     pager: Mutex::new(pager),
     header: RwLock::new(header),
     header_slot: AtomicU32::new(header_slot),
@@ -1284,7 +1310,7 @@ fn open_single_file_internal(
     next_etype_id: AtomicU32::new(next_etype_id),
     next_propkey_id: AtomicU32::new(next_propkey_id),
     next_tx_id: AtomicU64::new(next_tx_id),
-    current_tx: Mutex::new(HashMap::new()),
+    tx_shared: std::sync::Arc::new(super::tx_registry::TxShared::default()),
     active_writers: AtomicUsize::new(0),
     active_transactions: AtomicUsize::new(0),
     open_write_txids: Mutex::new(HashSet::new()),
@@ -1313,11 +1339,9 @@ fn open_single_file_internal(
     checkpoint_cancelled: AtomicBool::new(false),
     vector_stores: RwLock::new(vector_stores),
     vector_store_lazy_entries: RwLock::new(vector_store_lazy_entries),
-    cache: RwLock::new(cache),
     checkpoint_compression: options.checkpoint_compression.clone(),
     sync_mode: options.sync_mode,
     group_commit_enabled: options.group_commit_enabled,
-    group_commit_window_ms: options.group_commit_window_ms,
     primary_replication,
     replica_replication,
     #[cfg(feature = "bench-profile")]
@@ -1437,12 +1461,12 @@ fn migrate_legacy_single_header(
   {
     let mut header = temp.header.write();
     // Exact semantic-field audit. Layout fields (db/snapshot/WAL locations and
-    // heads) intentionally belong to the fresh dual-header file. Generation
-    // and change counters advance once when checkpoint installs the snapshot.
+    // heads) intentionally belong to the fresh dual-header file, and so do the
+    // format fields (version, min_reader_version, and the WAL salts): it is
+    // written in the current format. Generation and change counters advance
+    // once when checkpoint installs the snapshot.
     header.magic = legacy_header.magic;
     header.page_size = legacy_header.page_size;
-    header.version = legacy_header.version;
-    header.min_reader_version = legacy_header.min_reader_version;
     header.flags = legacy_header.flags;
     header.change_counter = legacy_header.change_counter;
     header.active_snapshot_gen = legacy_header.active_snapshot_gen;
@@ -1455,8 +1479,9 @@ fn migrate_legacy_single_header(
     header.last_commit_ts = legacy_header.last_commit_ts;
     header.schema_cookie = legacy_header.schema_cookie;
     // db_size_pages, snapshot_start_page/count, wal_start_page/count,
-    // wal_head/tail, wal_primary/secondary_head, active_wal_region, and
-    // checkpoint_in_progress are fresh-layout state and remain initialized.
+    // wal_head/tail, wal_primary/secondary_head, active_wal_region,
+    // checkpoint_in_progress, version, min_reader_version, and
+    // wal_primary/secondary_salt are fresh-file state and remain initialized.
   }
 
   let migration_result = (|| {
@@ -1471,10 +1496,9 @@ fn migrate_legacy_single_header(
     // WAL, and a complete snapshot; the second directory sync persists the
     // replacement name.
     std::fs::File::open(&temp_path)?.sync_all()?;
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::File::open(parent)?.sync_all()?;
+    sync_parent_dir(path)?;
     std::fs::rename(&temp_path, path)?;
-    std::fs::File::open(parent)?.sync_all()?;
+    sync_parent_dir(path)?;
     Ok(())
   })();
 
@@ -1510,27 +1534,9 @@ pub fn close_single_file_with_options(
     return Ok(());
   }
 
-  // Flush WAL and sync to disk
-  let mut pager = db.pager.lock();
-  let mut wal_buffer = db.wal_buffer.lock();
-
-  // Flush any pending WAL writes
-  wal_buffer.flush(&mut pager)?;
-
-  // Update header with current WAL state
-  {
-    let mut header = db.header.write();
-    wal_buffer.store_in_header(&mut header);
-    header.max_node_id = db.next_node_id.load(Ordering::SeqCst).saturating_sub(1);
-    header.next_tx_id = db.next_tx_id.load(Ordering::SeqCst);
-
-    // Install the updated header in the inactive slot. The final sync below
-    // makes the WAL and header durable together.
-    db.persist_header(&mut pager, &mut header, false)?;
-  }
-
-  // Final sync
-  pager.sync()?;
+  // On failure, dropping `db` tries once more.
+  db.persist_for_close()?;
+  db.closed.store(true, Ordering::Release);
   Ok(())
 }
 
@@ -1547,7 +1553,8 @@ mod tests {
   use crate::core::single_file::{
     close_single_file, close_single_file_with_options, SingleFileCloseOptions,
   };
-  use crate::core::wal::record::parse_wal_record;
+  use crate::core::wal::buffer::header_salt_at;
+  use crate::core::wal::record::{apply_wal_salt, parse_wal_record_with_salt};
   use crate::util::binary::{align_up, read_u32};
   use std::io::Write;
   use tempfile::tempdir;
@@ -1601,7 +1608,7 @@ mod tests {
     source.commit().expect("commit WAL-only transaction");
 
     let current_header = source.header.read().clone();
-    let (wal_bytes, snapshot_bytes) = {
+    let (mut wal_bytes, snapshot_bytes) = {
       let mut pager = source.pager.lock();
       let mut wal = Vec::new();
       for page in 0..current_header.wal_page_count as u32 {
@@ -1622,7 +1629,17 @@ mod tests {
       (wal, snapshot)
     };
 
+    // Legacy single-header files are format 1: unsalted WAL records.
+    let live_wal = current_header.wal_tail as usize..current_header.wal_head as usize;
+    assert!(
+      apply_wal_salt(&mut wal_bytes[live_wal], current_header.wal_primary_salt),
+      "unsalt the live WAL records"
+    );
     let mut legacy_header = current_header;
+    legacy_header.version = 1;
+    legacy_header.min_reader_version = 1;
+    legacy_header.wal_primary_salt = 0;
+    legacy_header.wal_secondary_salt = 0;
     legacy_header.wal_start_page = 1;
     legacy_header.snapshot_start_page = 1 + legacy_header.wal_page_count;
     legacy_header.db_size_pages =
@@ -1653,7 +1670,7 @@ mod tests {
       if rec_len == 0 {
         break;
       }
-      if parse_wal_record(&wal_data, pos).is_none() {
+      if parse_wal_record_with_salt(&wal_data, pos, header_salt_at(&header, pos as u64)).is_none() {
         break;
       }
       last_start = Some(pos);
@@ -1829,6 +1846,13 @@ mod tests {
       migrated.header.read().max_node_id,
       legacy_header.max_node_id
     );
+    // The migrated file is written in the current format.
+    assert_eq!(migrated.header.read().version, VERSION_SINGLE_FILE);
+    assert_eq!(
+      migrated.header.read().min_reader_version,
+      MIN_READER_SINGLE_FILE
+    );
+    assert_ne!(migrated.header.read().wal_primary_salt, 0);
     assert!(migrated.header.read().next_tx_id >= legacy_header.next_tx_id);
 
     migrated.begin(false).expect("post-migration transaction");

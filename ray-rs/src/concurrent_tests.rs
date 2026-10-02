@@ -857,7 +857,7 @@ mod tests {
   #[test]
   fn test_single_file_sequential_reads() {
     // Note: SingleFileDB is not designed for concurrent access from multiple threads.
-    // The internal LruCache is not Sync. This test verifies sequential performance.
+    // This test verifies sequential performance.
     let temp_dir = tempdir().expect("expected value");
     let db_path = temp_dir.path().join("test.kitedb");
 

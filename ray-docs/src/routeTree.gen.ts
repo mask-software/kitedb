@@ -9,25 +9,25 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
-import { Route as DocsRouteImport } from './routes/docs'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as DocsRouteImport } from './routes/docs'
 import { Route as DocsIndexRouteImport } from './routes/docs/index'
 import { Route as DocsSplatRouteImport } from './routes/docs/$'
-import { Route as DocsInternalsSplatRouteImport } from './routes/docs/internals/$'
-import { Route as DocsGuidesSplatRouteImport } from './routes/docs/guides/$'
-import { Route as DocsGettingStartedInstallationRouteImport } from './routes/docs/getting-started/installation'
-import { Route as DocsGettingStartedSplatRouteImport } from './routes/docs/getting-started/$'
-import { Route as DocsBenchmarksSplatRouteImport } from './routes/docs/benchmarks/$'
 import { Route as DocsApiSplatRouteImport } from './routes/docs/api/$'
+import { Route as DocsBenchmarksSplatRouteImport } from './routes/docs/benchmarks/$'
+import { Route as DocsGettingStartedSplatRouteImport } from './routes/docs/getting-started/$'
+import { Route as DocsGettingStartedInstallationRouteImport } from './routes/docs/getting-started/installation'
+import { Route as DocsGuidesSplatRouteImport } from './routes/docs/guides/$'
+import { Route as DocsInternalsSplatRouteImport } from './routes/docs/internals/$'
 
-const DocsRoute = DocsRouteImport.update({
-  id: '/docs',
-  path: '/docs',
-  getParentRoute: () => rootRouteImport,
-} as any)
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const DocsRoute = DocsRouteImport.update({
+  id: '/docs',
+  path: '/docs',
   getParentRoute: () => rootRouteImport,
 } as any)
 const DocsIndexRoute = DocsIndexRouteImport.update({
@@ -40,14 +40,19 @@ const DocsSplatRoute = DocsSplatRouteImport.update({
   path: '/$',
   getParentRoute: () => DocsRoute,
 } as any)
-const DocsInternalsSplatRoute = DocsInternalsSplatRouteImport.update({
-  id: '/internals/$',
-  path: '/internals/$',
+const DocsApiSplatRoute = DocsApiSplatRouteImport.update({
+  id: '/api/$',
+  path: '/api/$',
   getParentRoute: () => DocsRoute,
 } as any)
-const DocsGuidesSplatRoute = DocsGuidesSplatRouteImport.update({
-  id: '/guides/$',
-  path: '/guides/$',
+const DocsBenchmarksSplatRoute = DocsBenchmarksSplatRouteImport.update({
+  id: '/benchmarks/$',
+  path: '/benchmarks/$',
+  getParentRoute: () => DocsRoute,
+} as any)
+const DocsGettingStartedSplatRoute = DocsGettingStartedSplatRouteImport.update({
+  id: '/getting-started/$',
+  path: '/getting-started/$',
   getParentRoute: () => DocsRoute,
 } as any)
 const DocsGettingStartedInstallationRoute =
@@ -56,19 +61,14 @@ const DocsGettingStartedInstallationRoute =
     path: '/getting-started/installation',
     getParentRoute: () => DocsRoute,
   } as any)
-const DocsGettingStartedSplatRoute = DocsGettingStartedSplatRouteImport.update({
-  id: '/getting-started/$',
-  path: '/getting-started/$',
+const DocsGuidesSplatRoute = DocsGuidesSplatRouteImport.update({
+  id: '/guides/$',
+  path: '/guides/$',
   getParentRoute: () => DocsRoute,
 } as any)
-const DocsBenchmarksSplatRoute = DocsBenchmarksSplatRouteImport.update({
-  id: '/benchmarks/$',
-  path: '/benchmarks/$',
-  getParentRoute: () => DocsRoute,
-} as any)
-const DocsApiSplatRoute = DocsApiSplatRouteImport.update({
-  id: '/api/$',
-  path: '/api/$',
+const DocsInternalsSplatRoute = DocsInternalsSplatRouteImport.update({
+  id: '/internals/$',
+  path: '/internals/$',
   getParentRoute: () => DocsRoute,
 } as any)
 
@@ -153,18 +153,18 @@ export interface RootRouteChildren {
 
 declare module '@tanstack/solid-router' {
   interface FileRoutesByPath {
-    '/docs': {
-      id: '/docs'
-      path: '/docs'
-      fullPath: '/docs'
-      preLoaderRoute: typeof DocsRouteImport
-      parentRoute: typeof rootRouteImport
-    }
     '/': {
       id: '/'
       path: '/'
       fullPath: '/'
       preLoaderRoute: typeof IndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/docs': {
+      id: '/docs'
+      path: '/docs'
+      fullPath: '/docs'
+      preLoaderRoute: typeof DocsRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/docs/': {
@@ -181,32 +181,11 @@ declare module '@tanstack/solid-router' {
       preLoaderRoute: typeof DocsSplatRouteImport
       parentRoute: typeof DocsRoute
     }
-    '/docs/internals/$': {
-      id: '/docs/internals/$'
-      path: '/internals/$'
-      fullPath: '/docs/internals/$'
-      preLoaderRoute: typeof DocsInternalsSplatRouteImport
-      parentRoute: typeof DocsRoute
-    }
-    '/docs/guides/$': {
-      id: '/docs/guides/$'
-      path: '/guides/$'
-      fullPath: '/docs/guides/$'
-      preLoaderRoute: typeof DocsGuidesSplatRouteImport
-      parentRoute: typeof DocsRoute
-    }
-    '/docs/getting-started/installation': {
-      id: '/docs/getting-started/installation'
-      path: '/getting-started/installation'
-      fullPath: '/docs/getting-started/installation'
-      preLoaderRoute: typeof DocsGettingStartedInstallationRouteImport
-      parentRoute: typeof DocsRoute
-    }
-    '/docs/getting-started/$': {
-      id: '/docs/getting-started/$'
-      path: '/getting-started/$'
-      fullPath: '/docs/getting-started/$'
-      preLoaderRoute: typeof DocsGettingStartedSplatRouteImport
+    '/docs/api/$': {
+      id: '/docs/api/$'
+      path: '/api/$'
+      fullPath: '/docs/api/$'
+      preLoaderRoute: typeof DocsApiSplatRouteImport
       parentRoute: typeof DocsRoute
     }
     '/docs/benchmarks/$': {
@@ -216,11 +195,32 @@ declare module '@tanstack/solid-router' {
       preLoaderRoute: typeof DocsBenchmarksSplatRouteImport
       parentRoute: typeof DocsRoute
     }
-    '/docs/api/$': {
-      id: '/docs/api/$'
-      path: '/api/$'
-      fullPath: '/docs/api/$'
-      preLoaderRoute: typeof DocsApiSplatRouteImport
+    '/docs/getting-started/$': {
+      id: '/docs/getting-started/$'
+      path: '/getting-started/$'
+      fullPath: '/docs/getting-started/$'
+      preLoaderRoute: typeof DocsGettingStartedSplatRouteImport
+      parentRoute: typeof DocsRoute
+    }
+    '/docs/getting-started/installation': {
+      id: '/docs/getting-started/installation'
+      path: '/getting-started/installation'
+      fullPath: '/docs/getting-started/installation'
+      preLoaderRoute: typeof DocsGettingStartedInstallationRouteImport
+      parentRoute: typeof DocsRoute
+    }
+    '/docs/guides/$': {
+      id: '/docs/guides/$'
+      path: '/guides/$'
+      fullPath: '/docs/guides/$'
+      preLoaderRoute: typeof DocsGuidesSplatRouteImport
+      parentRoute: typeof DocsRoute
+    }
+    '/docs/internals/$': {
+      id: '/docs/internals/$'
+      path: '/internals/$'
+      fullPath: '/docs/internals/$'
+      preLoaderRoute: typeof DocsInternalsSplatRouteImport
       parentRoute: typeof DocsRoute
     }
   }

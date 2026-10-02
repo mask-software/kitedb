@@ -95,8 +95,9 @@ fn map_error(message: String) -> KiteError {
 
 /// Encode the NodeIdToPhys section for nodes listed in physical order.
 ///
-/// `phys_to_node_id` must be sorted by node ID (the writer sorts nodes) and
-/// bounded by `max_node_id`. A repeated ID maps to its last physical node.
+/// `phys_to_node_id` must be strictly ascending (the writer sorts nodes and
+/// refuses duplicate IDs) and bounded by `max_node_id`: each ID maps to
+/// exactly one physical node, as readers check at load.
 pub fn encode(
   phys_to_node_id: &[NodeId],
   max_node_id: NodeId,
@@ -126,7 +127,11 @@ fn encode_dense(phys_to_node_id: &[NodeId], max_node_id: NodeId) -> Result<Vec<u
     let phys = i32::try_from(phys)
       .map_err(|_| map_error(format!("physical node {phys} does not fit a dense entry")))?;
     // node_id <= max_node_id, which fits usize (checked above).
-    write_i32(&mut data, node_id as usize * DENSE_ENTRY_SIZE, phys);
+    let slot = node_id as usize * DENSE_ENTRY_SIZE;
+    if read_i32(&data, slot) != -1 {
+      return Err(map_error(format!("node ID {node_id} is repeated")));
+    }
+    write_i32(&mut data, slot, phys);
   }
   Ok(data)
 }
@@ -139,13 +144,9 @@ fn encode_sparse(phys_to_node_id: &[NodeId]) -> Result<Vec<u8>> {
   let mut data = Vec::with_capacity(capacity);
   let mut previous: Option<NodeId> = None;
   for (phys, &node_id) in phys_to_node_id.iter().enumerate() {
-    // Repeated ID: keep its last physical node, as the dense map does.
-    if phys_to_node_id.get(phys + 1) == Some(&node_id) {
-      continue;
-    }
     if previous.is_some_and(|previous| previous >= node_id) {
       return Err(map_error(format!(
-        "node IDs are not sorted at physical node {phys}"
+        "node IDs are not strictly ascending at physical node {phys}"
       )));
     }
     previous = Some(node_id);
@@ -221,13 +222,11 @@ mod tests {
     assert_eq!(sparse_lookup(&[], 1), None);
   }
 
+  /// A repeated ID would leave a physical node no ID maps to.
   #[test]
-  fn duplicate_ids_map_to_the_last_physical_node() {
-    let (_, dense) = encode(&[1, 2, 2], 2).expect("dense");
-    assert_eq!(dense_lookup(&dense, 2), Some(2));
-    let (_, sparse) = encode(&[1, 1 << 40, 1 << 40], 1 << 40).expect("sparse");
-    assert_eq!(sparse_len(&sparse), 2);
-    assert_eq!(sparse_lookup(&sparse, 1 << 40), Some(2));
+  fn duplicate_ids_are_rejected() {
+    assert!(encode(&[1, 2, 2], 2).is_err(), "dense");
+    assert!(encode(&[1, 1 << 40, 1 << 40], 1 << 40).is_err(), "sparse");
   }
 
   #[test]

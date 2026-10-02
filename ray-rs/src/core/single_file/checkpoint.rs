@@ -19,6 +19,7 @@ use crate::core::snapshot::writer::{
   build_snapshot_to_memory, EdgeData, NodeData, SnapshotBuildInput,
 };
 use crate::core::wal::buffer::WalBuffer;
+use crate::core::wal::record::ParsedWalRecord;
 use crate::error::{KiteError, Result};
 use crate::types::*;
 use crate::vector::store::{create_vector_store, vector_store_delete, vector_store_insert};
@@ -26,11 +27,8 @@ use crate::vector::types::{VectorManifest, VectorStoreConfig};
 
 use super::open::map_snapshot_range;
 use super::recovery::{committed_transactions, replay_wal_record};
-use super::vector::{
-  materialize_vector_store_from_lazy_entries, vector_store_state_from_snapshot,
-  VectorStoreLazyEntry,
-};
 use super::{CheckpointStatus, SingleFileDB};
+use crate::vector::ivf::serialize::validate_manifest_for_serialization;
 
 type GraphData = (
   Vec<NodeData>,
@@ -252,7 +250,6 @@ pub(crate) struct WrittenSnapshot {
 pub(crate) struct LoadedSnapshot {
   snapshot: Option<SnapshotData>,
   vector_stores: HashMap<PropKeyId, VectorManifest>,
-  lazy_entries: HashMap<PropKeyId, VectorStoreLazyEntry>,
 }
 
 impl LoadedSnapshot {
@@ -262,14 +259,6 @@ impl LoadedSnapshot {
     pending_vectors: &HashMap<(NodeId, PropKeyId), Option<VectorRef>>,
   ) -> Result<()> {
     for (&(node_id, prop_key_id), operation) in pending_vectors {
-      if let Some(snapshot) = self.snapshot.as_ref() {
-        materialize_vector_store_from_lazy_entries(
-          snapshot,
-          &mut self.vector_stores,
-          &mut self.lazy_entries,
-          prop_key_id,
-        )?;
-      }
       match operation {
         Some(vector) => {
           let store = self
@@ -291,6 +280,55 @@ impl LoadedSnapshot {
     }
     Ok(())
   }
+}
+
+/// Check that every vector store a snapshot is about to hold decodes back as
+/// itself (`validate_manifest_for_serialization`, which accepts what
+/// `deserialize_manifest` accepts), and return a copy of them to install with
+/// the snapshot. Copying is cheap next to decoding the snapshot's copy.
+pub(super) fn snapshot_vector_stores(
+  vector_stores: &HashMap<PropKeyId, VectorManifest>,
+) -> Result<HashMap<PropKeyId, VectorManifest>> {
+  for (prop_key_id, store) in vector_stores {
+    validate_manifest_for_serialization(store).map_err(|error| {
+      KiteError::InvalidSnapshot(format!(
+        "vector store for prop key {prop_key_id} would not decode: {error}"
+      ))
+    })?;
+  }
+  Ok(vector_stores.clone())
+}
+
+/// A background checkpoint's replay of the transactions committed after its
+/// cut, in rounds (see `SingleFileDB::replay_post_cut_records`).
+#[derive(Default)]
+struct PostCutReplay {
+  /// The committed transactions replayed so far.
+  delta: DeltaState,
+  /// Records of the transactions not committed or rolled back by the last
+  /// record seen, in order; the next round's records continue them.
+  unfinished: Vec<ParsedWalRecord>,
+}
+
+/// The records of `records`' transactions that neither commit nor roll back
+/// in them.
+fn unfinished_transactions(records: Vec<ParsedWalRecord>) -> Vec<ParsedWalRecord> {
+  let mut open = std::collections::HashSet::new();
+  for record in &records {
+    match record.record_type {
+      WalRecordType::Begin => {
+        open.insert(record.txid);
+      }
+      WalRecordType::Commit | WalRecordType::Rollback => {
+        open.remove(&record.txid);
+      }
+      _ => {}
+    }
+  }
+  records
+    .into_iter()
+    .filter(|record| open.contains(&record.txid))
+    .collect()
 }
 
 /// Return `header` to `prior` after a failed header write, keeping the newer
@@ -332,6 +370,21 @@ enum BackgroundCheckpointOutcome {
   /// It did not start: the last cut declined, and every transaction it would
   /// have had to copy is still open (see `cut_still_declined`).
   StillDeclined,
+  /// It did not start: a blocking checkpoint, optimize, vacuum or WAL resize
+  /// is waiting for the checkpoint gate (see `exclusive_waiters`).
+  ExclusiveWaiting,
+}
+
+/// A caller of `exclusive_checkpoint_gate`, registered in
+/// `BackgroundCheckpointState::exclusive_waiters` until dropped.
+struct ExclusiveWaiter<'db> {
+  db: &'db SingleFileDB,
+}
+
+impl Drop for ExclusiveWaiter<'_> {
+  fn drop(&mut self) {
+    self.db.checkpoint_state.lock().exclusive_waiters -= 1;
+  }
 }
 
 /// Whether a cut declined (see `cut_background_checkpoint`), changing
@@ -443,9 +496,9 @@ impl SingleFileDB {
     let graph = self.collect_graph_data()?;
     let header = self.header.read().clone();
     let generation = header.active_snapshot_gen + 1;
-    let snapshot_buffer = self.build_snapshot_buffer(generation, graph)?;
+    let (snapshot_buffer, vector_stores) = self.build_snapshot_buffer(generation, graph)?;
     let snapshot = self.write_new_snapshot(&header, generation, &snapshot_buffer)?;
-    let loaded = self.load_unnamed_snapshot(snapshot)?;
+    let loaded = self.load_unnamed_snapshot(snapshot, vector_stores)?;
 
     // The snapshot covers every WAL record, so the installed header names an
     // empty WAL.
@@ -471,13 +524,19 @@ impl SingleFileDB {
 
   /// `load_snapshot` for a snapshot just written; if it cannot be loaded, its
   /// pages (which no header names) are freed.
-  pub(crate) fn load_unnamed_snapshot(&self, snapshot: WrittenSnapshot) -> Result<LoadedSnapshot> {
-    self.load_snapshot(&snapshot).inspect_err(|_| {
-      self
-        .pager
-        .lock()
-        .free_pages(snapshot.start_page as u32, snapshot.page_count as u32);
-    })
+  pub(crate) fn load_unnamed_snapshot(
+    &self,
+    snapshot: WrittenSnapshot,
+    vector_stores: HashMap<PropKeyId, VectorManifest>,
+  ) -> Result<LoadedSnapshot> {
+    self
+      .load_snapshot(&snapshot, vector_stores)
+      .inspect_err(|_| {
+        self
+          .pager
+          .lock()
+          .free_pages(snapshot.start_page as u32, snapshot.page_count as u32);
+      })
   }
 
   /// Take the checkpoint gate for work that replaces the snapshot or resets
@@ -494,7 +553,12 @@ impl SingleFileDB {
   /// checkpoint can cut. A cut no run owns (a run stopped before its install)
   /// is just WAL to the caller: everything committed is in the delta, so a
   /// checkpoint replaces it, and compaction keeps it.
+  ///
+  /// The caller is registered as a waiter throughout, so no background
+  /// checkpoint starts meanwhile: it waits for at most the run in progress.
   pub(crate) fn exclusive_checkpoint_gate(&self) -> Result<RwLockWriteGuard<'_, ()>> {
+    self.checkpoint_state.lock().exclusive_waiters += 1;
+    let _waiter = ExclusiveWaiter { db: self };
     loop {
       let checkpoint_gate = self.checkpoint_gate.write();
       // Only the test hook: a cancelled background run may still hold the
@@ -513,7 +577,19 @@ impl SingleFileDB {
   /// installing it. Loading before the install means a failure leaves the
   /// database as it was; once the header is installed,
   /// `install_loaded_snapshot` cannot fail.
-  pub(crate) fn load_snapshot(&self, written: &WrittenSnapshot) -> Result<LoadedSnapshot> {
+  ///
+  /// Everything open would check or decode later is checked: the parse
+  /// (footer CRC and structure) here, and the vector stores, which open
+  /// leaves encoded until first use, before they were serialized
+  /// (`snapshot_vector_stores`). A store that does not decode would otherwise
+  /// be installed, then read as missing, and fail every later checkpoint.
+  /// `vector_stores` are the stores the snapshot was built from, so they are
+  /// installed as they are instead of decoding the snapshot's copy again.
+  pub(crate) fn load_snapshot(
+    &self,
+    written: &WrittenSnapshot,
+    vector_stores: HashMap<PropKeyId, VectorManifest>,
+  ) -> Result<LoadedSnapshot> {
     self.reach_checkpoint_phase(CheckpointPhase::SnapshotReload)?;
     if written.page_count == 0 {
       return Ok(LoadedSnapshot::default());
@@ -530,11 +606,9 @@ impl SingleFileDB {
       mapped,
       &crate::core::snapshot::reader::ParseSnapshotOptions::default(),
     )?;
-    let (vector_stores, lazy_entries) = vector_store_state_from_snapshot(&snapshot)?;
     Ok(LoadedSnapshot {
       snapshot: Some(snapshot),
       vector_stores,
-      lazy_entries,
     })
   }
 
@@ -554,10 +628,8 @@ impl SingleFileDB {
       (
         std::mem::replace(&mut *snapshot_guard, loaded.snapshot),
         std::mem::replace(&mut *self.vector_stores.write(), loaded.vector_stores),
-        std::mem::replace(
-          &mut *self.vector_store_lazy_entries.write(),
-          loaded.lazy_entries,
-        ),
+        // Entries of the replaced snapshot; the new one's stores are decoded.
+        std::mem::take(&mut *self.vector_store_lazy_entries.write()),
         std::mem::replace(&mut *delta_guard, delta),
       )
     };
@@ -589,18 +661,29 @@ impl SingleFileDB {
   }
 
   /// Claim the checkpoint status for a new background run, unless one is
-  /// running.
-  fn claim_background_checkpoint(&self) -> Option<BackgroundCheckpointRun<'_>> {
+  /// running or an exclusive operation waits for the gate.
+  fn claim_background_checkpoint(
+    &self,
+  ) -> std::result::Result<BackgroundCheckpointRun<'_>, BackgroundCheckpointOutcome> {
     let mut state = self.checkpoint_state.lock();
     if state.status != CheckpointStatus::Idle {
-      return None;
+      return Err(BackgroundCheckpointOutcome::AlreadyRunning);
+    }
+    if state.exclusive_waiters > 0 {
+      return Err(BackgroundCheckpointOutcome::ExclusiveWaiting);
     }
     state.run += 1;
     state.status = CheckpointStatus::Running;
-    Some(BackgroundCheckpointRun {
+    Ok(BackgroundCheckpointRun {
       db: self,
       run: state.run,
     })
+  }
+
+  /// Whether a blocking checkpoint, optimize, vacuum or WAL resize waits for
+  /// the checkpoint gate.
+  fn exclusive_operation_waiting(&self) -> bool {
+    self.checkpoint_state.lock().exclusive_waiters > 0
   }
 
   fn set_background_checkpoint_status(&self, run: u64, status: CheckpointStatus) {
@@ -666,7 +749,11 @@ impl SingleFileDB {
   ///
   /// Fails with `CheckpointDeclined`, changing nothing, if the open
   /// transactions' records cannot be copied; it is not retried (this returns
-  /// `CheckpointDeclined` at once) until one of them finishes.
+  /// `CheckpointDeclined` at once) until one of them finishes. It also
+  /// declines while a blocking checkpoint, optimize, vacuum or WAL resize
+  /// waits for the checkpoint gate, which checkpoints anyway: starting ahead
+  /// of it would make it wait again, and a loop of background checkpoints
+  /// would starve it.
   ///
   /// Steps:
   /// 1. Switch writes to secondary WAL region, copying there the records of
@@ -690,6 +777,11 @@ impl SingleFileDB {
       BackgroundCheckpointOutcome::StillDeclined => Err(KiteError::CheckpointDeclined(
         "the last attempt could not copy the WAL records of open transactions into the \
          secondary WAL region, and all of them are still open; it starts once one finishes"
+          .to_string(),
+      )),
+      BackgroundCheckpointOutcome::ExclusiveWaiting => Err(KiteError::CheckpointDeclined(
+        "a blocking checkpoint, optimize, vacuum or WAL resize is waiting for the checkpoint \
+         gate, and checkpoints once it has it"
           .to_string(),
       )),
       BackgroundCheckpointOutcome::Installed | BackgroundCheckpointOutcome::AlreadyRunning => {
@@ -739,6 +831,9 @@ impl SingleFileDB {
     if self.current_tx_handle().is_some() {
       return Err(KiteError::TransactionInProgress);
     }
+    // An abandoned transaction would stay in the open set, copied by every
+    // cut, until rolled back.
+    self.reap_abandoned_transactions();
     if self.cut_still_declined() {
       return Ok(BackgroundCheckpointOutcome::StillDeclined);
     }
@@ -746,8 +841,9 @@ impl SingleFileDB {
     // Claim the checkpoint before taking the gate, so commits that cross the
     // threshold meanwhile skip it instead of queueing behind it. Dropping
     // `run`, however this returns (or unwinds), returns the status to idle.
-    let Some(run) = self.claim_background_checkpoint() else {
-      return Ok(BackgroundCheckpointOutcome::AlreadyRunning);
+    let run = match self.claim_background_checkpoint() {
+      Ok(run) => run,
+      Err(outcome) => return Ok(outcome),
     };
 
     let mut extra_passes = 0;
@@ -761,7 +857,12 @@ impl SingleFileDB {
           Err(error)
         };
       }
-      if !self.take_writers_waited() || extra_passes == MAX_EXTRA_BACKGROUND_PASSES {
+      // A waiting exclusive operation checkpoints anyway, and waits for
+      // every pass this run takes.
+      if !self.take_writers_waited()
+        || extra_passes == MAX_EXTRA_BACKGROUND_PASSES
+        || self.exclusive_operation_waiting()
+      {
         return Ok(BackgroundCheckpointOutcome::Installed);
       }
       extra_passes += 1;
@@ -951,7 +1052,7 @@ impl SingleFileDB {
       ));
     }
     let pre_cut_records = wal_buffer.scan_region(0, pager)?;
-    let cut_delta = self.replay_into_new_delta(&pre_cut_records);
+    let cut_delta = self.replay_into_new_delta(&pre_cut_records)?;
     self.own_cut(run);
     Ok(Cut::Taken(Box::new(cut_delta)))
   }
@@ -972,9 +1073,9 @@ impl SingleFileDB {
     // move the WAL positions.
     let header = self.header.read().clone();
     let generation = header.active_snapshot_gen + 1;
-    let snapshot_buffer = self.build_snapshot_buffer(generation, graph)?;
+    let (snapshot_buffer, vector_stores) = self.build_snapshot_buffer(generation, graph)?;
     let snapshot = self.write_new_snapshot(&header, generation, &snapshot_buffer)?;
-    let loaded = self.load_unnamed_snapshot(snapshot)?;
+    let loaded = self.load_unnamed_snapshot(snapshot, vector_stores)?;
     Ok((snapshot, loaded))
   }
 
@@ -986,6 +1087,29 @@ impl SingleFileDB {
     mut loaded: LoadedSnapshot,
   ) -> Result<()> {
     self.set_background_checkpoint_status(run, CheckpointStatus::Completing);
+    let free_snapshot = || {
+      self
+        .pager
+        .lock()
+        .free_pages(snapshot.start_page as u32, snapshot.page_count as u32);
+    };
+
+    // The delta that replaces the cut's holds only the transactions
+    // committed after the cut, whose records stay in the WAL. Replay them
+    // over the new snapshot before installing it, so a failure leaves the
+    // database as it was. Most are replayed here, without the commit lock,
+    // so commits wait below only for the replay of those that land
+    // meanwhile. The records read here stay as they are: the secondary
+    // region only grows during a cut, and only cancelling the cut moves its
+    // records, which the check under the commit lock below catches.
+    let mut replay = PostCutReplay::default();
+    let early = self
+      .scan_post_cut_records(0)
+      .and_then(|(records, end)| {
+        self.replay_post_cut_records(&mut replay, records, &mut loaded)?;
+        Ok(end)
+      })
+      .inspect_err(|_| free_snapshot())?;
 
     // The gate excludes blocking checkpoints and compaction until the delta
     // is replaced below; the commit lock keeps the retained records and that
@@ -995,12 +1119,6 @@ impl SingleFileDB {
     // that tries waits until the install releases it.
     let _checkpoint_gate = self.checkpoint_gate.write();
     let _commit_guard = self.commit_lock.lock();
-    let free_snapshot = || {
-      self
-        .pager
-        .lock()
-        .free_pages(snapshot.start_page as u32, snapshot.page_count as u32);
-    };
 
     // Writers may have cancelled the cut while this run made no progress
     // (see `wait_for_cut_release`): the WAL is back in the primary region,
@@ -1009,23 +1127,13 @@ impl SingleFileDB {
       free_snapshot();
       return Err(cancelled_checkpoint_error());
     }
-    let scanned = {
-      let mut pager = self.pager.lock();
-      let mut wal_buffer = self.wal_buffer.lock();
-      wal_buffer
-        .flush(&mut pager)
-        .and_then(|()| wal_buffer.scan_region(1, &mut pager))
-    };
-    let post_cut_records = scanned.inspect_err(|_| free_snapshot())?;
-
-    // The delta that replaces the cut's holds only the transactions
-    // committed after the cut, whose records stay in the WAL. Replay them
-    // over the new snapshot before installing it, so a failure leaves the
-    // database as it was. No commit lands meanwhile (the commit lock), though
-    // open transactions may append records, which the install retains.
-    let post_cut_delta = self
-      .replay_records_into_delta(&post_cut_records, &mut loaded)
+    // No commit lands from here (the commit lock), though open transactions
+    // may append records, which the install retains.
+    self
+      .scan_post_cut_records(early)
+      .and_then(|(records, _)| self.replay_post_cut_records(&mut replay, records, &mut loaded))
       .inspect_err(|_| free_snapshot())?;
+    let post_cut_delta = replay.delta;
 
     let compaction_result;
     {
@@ -1108,49 +1216,71 @@ impl SingleFileDB {
     self.persist_checkpoint_header(pager, header)
   }
 
-  /// Replay the transactions committed in `wal_records` into a new delta
-  /// over `loaded`, and their vector operations into its stores. Schema they
+  /// Flush the WAL and read the post-cut records (in the secondary region)
+  /// from offset `from` on; also where they end, to read on from.
+  fn scan_post_cut_records(&self, from: u64) -> Result<(Vec<ParsedWalRecord>, u64)> {
+    let mut pager = self.pager.lock();
+    let mut wal_buffer = self.wal_buffer.lock();
+    wal_buffer.flush(&mut pager)?;
+    wal_buffer.scan_region_from(1, from, &mut pager)
+  }
+
+  /// Replay the transactions that commit in `records` (the post-cut records
+  /// after those `replay` has seen) into `replay`'s delta over `loaded`, in
+  /// commit order, and their vector operations into its stores. Schema they
   /// define joins this database's (it already has it, since they committed
   /// here), and the ID allocators never move backwards.
-  fn replay_records_into_delta(
+  fn replay_post_cut_records(
     &self,
-    wal_records: &[crate::core::wal::record::ParsedWalRecord],
+    replay: &mut PostCutReplay,
+    records: Vec<ParsedWalRecord>,
     loaded: &mut LoadedSnapshot,
-  ) -> Result<DeltaState> {
+  ) -> Result<()> {
     self.reach_checkpoint_phase(CheckpointPhase::PostCutReplay)?;
     let _step = self.checkpoint_step("replay post-cut records");
-    let committed = committed_transactions(wal_records);
-    let mut delta = DeltaState::new();
+    let mut wal_records = std::mem::take(&mut replay.unfinished);
+    wal_records.extend(records);
+    let committed = committed_transactions(&wal_records);
+    let delta = &mut replay.delta;
     let mut next_node_id = self.next_node_id.load(Ordering::Acquire);
     let mut next_label_id = self.next_label_id.load(Ordering::Acquire);
     let mut next_etype_id = self.next_etype_id.load(Ordering::Acquire);
     let mut next_propkey_id = self.next_propkey_id.load(Ordering::Acquire);
-    {
-      let mut label_names = self.label_names.write();
-      let mut label_ids = self.label_ids.write();
-      let mut etype_names = self.etype_names.write();
-      let mut etype_ids = self.etype_ids.write();
-      let mut propkey_names = self.propkey_names.write();
-      let mut propkey_ids = self.propkey_ids.write();
-      for (_txid, records) in committed {
-        for record in records {
-          replay_wal_record(
-            record,
-            loaded.snapshot.as_ref(),
-            &mut delta,
-            &mut next_node_id,
-            &mut next_label_id,
-            &mut next_etype_id,
-            &mut next_propkey_id,
-            &mut label_names,
-            &mut label_ids,
-            &mut etype_names,
-            &mut etype_ids,
-            &mut propkey_names,
-            &mut propkey_ids,
-          );
-        }
+    // The schema they define, replayed into local maps and joined to this
+    // database's after: holding its schema locks for the whole replay would
+    // stall every commit (a commit publishes its schema under them).
+    let mut label_names = HashMap::new();
+    let mut label_ids = HashMap::new();
+    let mut etype_names = HashMap::new();
+    let mut etype_ids = HashMap::new();
+    let mut propkey_names = HashMap::new();
+    let mut propkey_ids = HashMap::new();
+    for (_txid, records) in committed {
+      for record in records {
+        replay_wal_record(
+          record,
+          loaded.snapshot.as_ref(),
+          delta,
+          &mut next_node_id,
+          &mut next_label_id,
+          &mut next_etype_id,
+          &mut next_propkey_id,
+          &mut label_names,
+          &mut label_ids,
+          &mut etype_names,
+          &mut etype_ids,
+          &mut propkey_names,
+          &mut propkey_ids,
+        )?;
       }
+    }
+    if !(label_ids.is_empty() && etype_ids.is_empty() && propkey_ids.is_empty()) {
+      self.label_names.write().extend(label_names);
+      self.label_ids.write().extend(label_ids);
+      self.etype_names.write().extend(etype_names);
+      self.etype_ids.write().extend(etype_ids);
+      self.propkey_names.write().extend(propkey_names);
+      self.propkey_ids.write().extend(propkey_ids);
     }
 
     // Open transactions may allocate IDs meanwhile, so only ever raise them.
@@ -1167,7 +1297,8 @@ impl SingleFileDB {
 
     loaded.apply_pending_vectors(&delta.pending_vectors)?;
     delta.pending_vectors.clear();
-    Ok(delta)
+    replay.unfinished = unfinished_transactions(wal_records);
+    Ok(())
   }
 
   /// Replay the transactions committed in `records` into a new delta over the
@@ -1176,7 +1307,7 @@ impl SingleFileDB {
   fn replay_into_new_delta(
     &self,
     records: &[crate::core::wal::record::ParsedWalRecord],
-  ) -> DeltaState {
+  ) -> Result<DeltaState> {
     let mut delta = DeltaState::new();
     let mut next_node_id = self.next_node_id.load(Ordering::Acquire);
     let mut next_label_id = self.next_label_id.load(Ordering::Acquire);
@@ -1205,10 +1336,10 @@ impl SingleFileDB {
           &mut etype_ids,
           &mut propkey_names,
           &mut propkey_ids,
-        );
+        )?;
       }
     }
-    delta
+    Ok(delta)
   }
 
   /// After a failed pass of background checkpoint `run`: if the run still
@@ -1499,6 +1630,7 @@ impl SingleFileDB {
     // `WalBuffer::reset` drops buffered bytes, which a failed install must
     // keep, so write them out first.
     wal_buffer.flush(pager)?;
+    self.publish_replication_frames();
     let prior_header = header.clone();
     let prior_wal = wal_buffer.region_state();
 
@@ -1538,11 +1670,46 @@ impl SingleFileDB {
     Ok(())
   }
 
-  /// Serialize a checkpoint snapshot of `graph`.
-  fn build_snapshot_buffer(&self, generation: u64, graph: GraphData) -> Result<Vec<u8>> {
+  /// Publish the frames a primary's replication sidecar still buffers in
+  /// memory (Normal and Off sync modes do, for up to 100 ms), durably and
+  /// with a manifest naming them, before an install drops the WAL records of
+  /// their commits: from then on the sidecar is the only copy replicas can
+  /// get them from. Every commit's frame is appended by now: a blocking
+  /// install runs with no transaction open, and a commit appends its frame
+  /// before it stops counting as open; a background install holds the commit
+  /// lock, under which commits append.
+  ///
+  /// A failure fences the sidecar for repair, as a failed append does, and
+  /// the checkpoint goes on: local commits stay authoritative while
+  /// replication is stale, and failing would leave the WAL to fill. A loss
+  /// is never silent: the replication status reports the fence, and the
+  /// `primary-unflushed` marker (written before the first buffered frame,
+  /// removed only once none is) survives, so a reopen after a crash fences
+  /// too. The sidecar locks are leaves, so this is safe under the pager, WAL,
+  /// and header locks.
+  fn publish_replication_frames(&self) {
+    let Some(replication) = self.primary_replication.as_ref() else {
+      return;
+    };
+    if let Err(error) = replication.publish_for_checkpoint() {
+      eprintln!(
+        "Warning: replication sidecar fenced for repair: publishing its buffered frames before \
+         a checkpoint failed: {error}"
+      );
+    }
+  }
+
+  /// Serialize a checkpoint snapshot of `graph`. Returns it with a copy of
+  /// its vector stores to install (`snapshot_vector_stores`).
+  fn build_snapshot_buffer(
+    &self,
+    generation: u64,
+    graph: GraphData,
+  ) -> Result<(Vec<u8>, HashMap<PropKeyId, VectorManifest>)> {
     let _step = self.checkpoint_step("serialize snapshot");
     let (nodes, edges, labels, etypes, propkeys, vector_stores) = graph;
-    build_snapshot_to_memory(SnapshotBuildInput {
+    let installed = snapshot_vector_stores(&vector_stores)?;
+    let buffer = build_snapshot_to_memory(SnapshotBuildInput {
       generation,
       nodes,
       edges,
@@ -1551,7 +1718,8 @@ impl SingleFileDB {
       propkeys,
       vector_stores: Some(vector_stores),
       compression: self.checkpoint_compression.clone(),
-    })
+    })?;
+    Ok((buffer, installed))
   }
 
   /// Write `buffer` to pages no valid header names and sync it.
@@ -1802,15 +1970,16 @@ impl SingleFileDB {
     }
 
     // Add edges from delta
+    let delta_edges_start = edges.len();
     for (&src, patches) in &delta.out_add {
-      // Skip edges from deleted nodes
-      if delta.is_node_deleted(src) {
+      // Skip edges from deleted nodes (a recreated node keeps its new edges)
+      if delta.is_node_removed(src) {
         continue;
       }
 
       for patch in patches {
         // Skip edges to deleted nodes
-        if delta.is_node_deleted(patch.other) {
+        if delta.is_node_removed(patch.other) {
           continue;
         }
 
@@ -1837,8 +2006,14 @@ impl SingleFileDB {
     // Snapshot persistence now stores ANN vectors only in dedicated
     // vector-store sections. Remove duplicate vector payloads from node props.
     self.materialize_all_vector_stores()?;
-    let vector_stores_for_snapshot: HashMap<PropKeyId, VectorManifest> =
+    let mut vector_stores_for_snapshot: HashMap<PropKeyId, VectorManifest> =
       self.vector_stores.read().clone();
+    self.drop_state_of_missing_nodes(
+      delta,
+      &mut edges,
+      delta_edges_start,
+      &mut vector_stores_for_snapshot,
+    );
     if !vector_stores_for_snapshot.is_empty() {
       for node in &mut nodes {
         node.props.retain(|prop_key_id, value| {
@@ -1856,6 +2031,63 @@ impl SingleFileDB {
       propkeys,
       vector_stores_for_snapshot,
     ))
+  }
+
+  /// Drop what the committed state holds for nodes that exist nowhere (see
+  /// `DeltaState::node_exists_over`, also used by WAL replay): the delta
+  /// edges `edges[delta_edges_start..]` with such an endpoint, props
+  /// included, and the vectors of such nodes in `vector_stores`, copies of
+  /// the live stores. The snapshot writer rejects a dangling edge, so one
+  /// would fail this checkpoint and every later one while the WAL fills; a
+  /// vector would be carried into every snapshot. Older versions left both
+  /// behind (their node deletes logged no vector deletes), and so can
+  /// non-MVCC write transactions racing a delete of the node, since nothing
+  /// checks the node again at commit. The install replaces the delta and the
+  /// stores, so they disappear live too. Snapshot edges need no check: both
+  /// ends are snapshot nodes the delta did not delete.
+  ///
+  /// A background checkpoint's store copies may also hold vectors committed
+  /// after its cut for nodes created after it. Dropping those is safe: the
+  /// install replays every post-cut commit over the new snapshot, and so does
+  /// open after a crash.
+  fn drop_state_of_missing_nodes(
+    &self,
+    delta: &DeltaState,
+    edges: &mut Vec<EdgeData>,
+    delta_edges_start: usize,
+    vector_stores: &mut HashMap<PropKeyId, VectorManifest>,
+  ) {
+    let snapshot = self.snapshot.read();
+    let exists = |node_id| delta.node_exists_over(snapshot.as_ref(), node_id);
+
+    let mut delta_edges = edges.split_off(delta_edges_start);
+    let collected = delta_edges.len();
+    delta_edges.retain(|edge| exists(edge.src) && exists(edge.dst));
+    let dropped_edges = collected - delta_edges.len();
+    edges.append(&mut delta_edges);
+
+    let mut dropped_vectors = 0usize;
+    for store in vector_stores.values_mut() {
+      let missing: Vec<NodeId> = store
+        .node_to_vector
+        .keys()
+        .copied()
+        .filter(|&node_id| !exists(node_id))
+        .collect();
+      for node_id in missing {
+        dropped_vectors += usize::from(vector_store_delete(store, node_id));
+      }
+    }
+
+    if dropped_edges > 0 {
+      eprintln!(
+        "Warning: checkpoint dropped {dropped_edges} edges whose source or destination node \
+         does not exist"
+      );
+    }
+    if dropped_vectors > 0 {
+      eprintln!("Warning: checkpoint dropped {dropped_vectors} vectors of nodes that do not exist");
+    }
   }
 
   /// Check if checkpoint is recommended based on WAL usage
@@ -2720,7 +2952,11 @@ mod tests {
     let _serial = checkpoint_test_serial();
     let temp_dir = tempdir().expect("temp dir");
     let db_path = temp_dir.path().join("checkpoint-background-long-tx.kitedb");
-    let options = SingleFileOpenOptions::new().auto_checkpoint(false);
+    // Write transactions open at once need MVCC (without it they run one at a time).
+    let options = SingleFileOpenOptions::new()
+      .mvcc(true)
+      .mvcc_gc_interval_ms(10)
+      .auto_checkpoint(false);
     let db = Arc::new(open_single_file(&db_path, options.clone()).expect("open"));
     commit_node(&db, "before");
 
@@ -2936,7 +3172,10 @@ mod tests {
     let _serial = checkpoint_test_serial();
     let temp_dir = tempdir().expect("temp dir");
     let db_path = temp_dir.path().join("checkpoint-auto-open-tx.kitedb");
+    // Write transactions open at once need MVCC (without it they run one at a time).
     let options = SingleFileOpenOptions::new()
+      .mvcc(true)
+      .mvcc_gc_interval_ms(10)
       .wal_size(64 * 1024)
       .auto_checkpoint(true)
       .checkpoint_threshold(0.5)
@@ -3620,7 +3859,10 @@ mod tests {
     let _serial = checkpoint_test_serial();
     let temp_dir = tempdir().expect("temp dir");
     let db_path = temp_dir.path().join("checkpoint-declined-retry.kitedb");
+    // Write transactions open at once need MVCC (without it they run one at a time).
     let options = SingleFileOpenOptions::new()
+      .mvcc(true)
+      .mvcc_gc_interval_ms(10)
       .wal_size(64 * 1024)
       .auto_checkpoint(true)
       .checkpoint_threshold(0.5)
@@ -4281,7 +4523,10 @@ mod review_regressions {
     let _serial = checkpoint_test_serial();
     let temp_dir = tempdir().expect("temp dir");
     let db_path = temp_dir.path().join("review-carry-overflow.kitedb");
+    // Write transactions open at once need MVCC (without it they run one at a time).
     let options = SingleFileOpenOptions::new()
+      .mvcc(true)
+      .mvcc_gc_interval_ms(10)
       .wal_size(64 * 1024)
       .auto_checkpoint(false);
     let db = Arc::new(open_single_file(&db_path, options.clone()).expect("open"));
@@ -4334,7 +4579,10 @@ mod review_regressions {
     let _serial = checkpoint_test_serial();
     let temp_dir = tempdir().expect("temp dir");
     let db_path = temp_dir.path().join("review-carry-overflow-live.kitedb");
+    // Write transactions open at once need MVCC (without it they run one at a time).
     let options = SingleFileOpenOptions::new()
+      .mvcc(true)
+      .mvcc_gc_interval_ms(10)
       .wal_size(64 * 1024)
       .auto_checkpoint(false);
     let db = Arc::new(open_single_file(&db_path, options.clone()).expect("open"));
@@ -4376,7 +4624,10 @@ mod review_regressions {
   ) -> Result<SingleFileDB> {
     let temp_dir = tempdir().expect("temp dir");
     let db_path = temp_dir.path().join(name);
+    // Write transactions open at once need MVCC (without it they run one at a time).
     let options = SingleFileOpenOptions::new()
+      .mvcc(true)
+      .mvcc_gc_interval_ms(10)
       .wal_size(64 * 1024)
       .auto_checkpoint(false);
     let db = Arc::new(open_single_file(&db_path, options.clone()).expect("open"));
@@ -4444,7 +4695,10 @@ mod review_regressions {
     let _serial = checkpoint_test_serial();
     let temp_dir = tempdir().expect("temp dir");
     let db_path = temp_dir.path().join("review-carry-fills-secondary.kitedb");
+    // Write transactions open at once need MVCC (without it they run one at a time).
     let options = SingleFileOpenOptions::new()
+      .mvcc(true)
+      .mvcc_gc_interval_ms(10)
       .wal_size(64 * 1024)
       .auto_checkpoint(false);
     let db = Arc::new(open_single_file(&db_path, options.clone()).expect("open"));
@@ -4743,3 +4997,13 @@ mod review_regressions {
 #[cfg(test)]
 #[path = "final_review_regressions.rs"]
 mod final_review_regressions;
+
+/// Wave-2 checkpoint reproductions (K1-K5).
+#[cfg(test)]
+#[path = "w2_checkpoint_tests.rs"]
+mod w2_tests;
+
+/// raydb-b4 engine-concurrency: checkpoint-gate fairness (F3).
+#[cfg(test)]
+#[path = "b4_checkpoint_tests.rs"]
+mod b4_tests;

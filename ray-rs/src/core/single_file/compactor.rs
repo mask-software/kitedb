@@ -13,7 +13,7 @@ use crate::error::{KiteError, Result};
 use crate::types::{DbHeaderV1, DeltaState};
 use crate::util::compression::CompressionOptions;
 
-use super::checkpoint::WrittenSnapshot;
+use super::checkpoint::{snapshot_vector_stores, WrittenSnapshot};
 use super::open::map_snapshot_range;
 use super::SingleFileDB;
 
@@ -144,6 +144,7 @@ impl SingleFileDB {
     let _checkpoint_gate = self.exclusive_checkpoint_gate()?;
 
     let (nodes, edges, labels, etypes, propkeys, vector_stores) = self.collect_graph_data()?;
+    let installed_vector_stores = snapshot_vector_stores(&vector_stores)?;
 
     let header = self.header.read().clone();
     let new_gen = header.active_snapshot_gen + 1;
@@ -178,7 +179,7 @@ impl SingleFileDB {
       start_page: new_snapshot_start_page,
       page_count: new_snapshot_page_count,
     };
-    let loaded = self.load_unnamed_snapshot(snapshot)?;
+    let loaded = self.load_unnamed_snapshot(snapshot, installed_vector_stores)?;
 
     // The snapshot covers every WAL record, so the installed header names an
     // empty WAL. The previous snapshot is retired only after both durable
@@ -411,6 +412,7 @@ impl SingleFileDB {
     } else {
       None
     };
+    let wal_buffer = WalBuffer::from_header(layout)?;
 
     let persisted = {
       let mut pager = self.pager.lock();
@@ -426,7 +428,7 @@ impl SingleFileDB {
     }
 
     *self.header.write() = layout.clone();
-    *self.wal_buffer.lock() = WalBuffer::from_header(layout);
+    *self.wal_buffer.lock() = wal_buffer;
     *self.snapshot.write() = snapshot;
     Ok(())
   }

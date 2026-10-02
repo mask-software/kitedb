@@ -4,16 +4,18 @@
 
 use crate::core::snapshot::reader::SnapshotData;
 use crate::core::wal::record::{
-  build_del_node_vector_payload, build_set_node_vector_payload, WalRecord,
+  build_del_node_vector_payload, build_set_node_vector_payload, parse_set_node_vector_payload,
+  ParsedWalRecord, WalRecord,
 };
 use crate::error::{KiteError, Result};
 use crate::types::*;
 use crate::util::binary::{read_u32, read_u64};
 use crate::util::binary::{read_u32_at, read_u64_at};
+use crate::vector::distance::normalize_in_place;
 use crate::vector::ivf::serialize::deserialize_manifest;
 use crate::vector::store::{
   create_vector_store, validate_vector, vector_store_delete, vector_store_has, vector_store_insert,
-  vector_store_node_vector,
+  vector_store_node_vector, VectorStoreError,
 };
 use crate::vector::types::{VectorManifest, VectorStoreConfig};
 use parking_lot::Mutex;
@@ -122,6 +124,8 @@ impl SingleFileDB {
   ///
   /// Each property key can have its own vector store with different dimensions.
   /// The first vector set for a property key determines the dimension.
+  ///
+  /// Fails with `NodeNotFound` if the transaction does not see the node.
   pub fn set_node_vector(
     &self,
     node_id: NodeId,
@@ -129,6 +133,7 @@ impl SingleFileDB {
     vector: &[f32],
   ) -> Result<()> {
     let (txid, tx_handle) = self.require_write_tx_handle()?;
+    self.require_node(txid, &tx_handle, node_id)?;
     self.ensure_vector_store_loaded(prop_key_id)?;
 
     // Check dimensions if store already exists
@@ -177,12 +182,17 @@ impl SingleFileDB {
     self.write_wal_tx(&tx_handle, record)?;
 
     // Queue in pending delta for commit
-    {
+    let bulk_load = {
       let mut tx = tx_handle.lock();
       tx.pending.pending_vectors.insert(
         (node_id, prop_key_id),
         Some(VectorRef::from(vector.to_vec())),
       );
+      tx.bulk_load
+    };
+    // The vector needs its node: a concurrent delete_node conflicts.
+    if !bulk_load {
+      self.record_read(txid, TxKey::Node(node_id));
     }
 
     Ok(())
@@ -190,55 +200,78 @@ impl SingleFileDB {
 
   /// Delete a vector embedding for a node
   ///
-  /// Returns Ok(()) even if the vector doesn't exist (idempotent).
+  /// Returns Ok(()) even if the vector doesn't exist (idempotent), but fails
+  /// with `NodeNotFound` if the transaction does not see the node.
   pub fn delete_node_vector(&self, node_id: NodeId, prop_key_id: PropKeyId) -> Result<()> {
     let (txid, tx_handle) = self.require_write_tx_handle()?;
+    self.require_node(txid, &tx_handle, node_id)?;
+    self.log_delete_node_vector(txid, &tx_handle, node_id, prop_key_id)?;
+    if !tx_handle.lock().bulk_load {
+      self.record_read(txid, TxKey::Node(node_id));
+    }
+    Ok(())
+  }
 
-    // Write WAL record
+  /// Log and queue a vector delete, without checking the node.
+  pub(super) fn log_delete_node_vector(
+    &self,
+    txid: TxId,
+    tx_handle: &Arc<Mutex<SingleFileTxState>>,
+    node_id: NodeId,
+    prop_key_id: PropKeyId,
+  ) -> Result<()> {
     let record = WalRecord::new(
       WalRecordType::DelNodeVector,
       txid,
       build_del_node_vector_payload(node_id, prop_key_id),
     );
-    self.write_wal_tx(&tx_handle, record)?;
+    self.write_wal_tx(tx_handle, record)?;
 
     // Queue delete in pending delta
-    {
-      let mut tx = tx_handle.lock();
-      tx.pending
-        .pending_vectors
-        .insert((node_id, prop_key_id), None); // None means delete
-    }
-
+    tx_handle
+      .lock()
+      .pending
+      .pending_vectors
+      .insert((node_id, prop_key_id), None); // None means delete
     Ok(())
   }
 
-  /// Get a vector embedding for a node
+  /// Get a vector embedding for a node, as its store holds it (normalized
+  /// for the cosine stores this API creates), also inside the transaction
+  /// that set it.
   ///
   /// Checks pending operations first, then falls back to committed storage.
   pub fn node_vector(&self, node_id: NodeId, prop_key_id: PropKeyId) -> Option<VectorRef> {
     let tx_handle = self.current_tx_handle();
     if let Some(handle) = tx_handle.as_ref() {
-      let tx = handle.lock();
-      if tx.pending.is_node_deleted(node_id) {
-        return None;
-      }
-      if let Some(pending) = tx.pending.pending_vectors.get(&(node_id, prop_key_id)) {
-        return pending.as_ref().map(Arc::clone);
+      let pending = {
+        let tx = handle.lock();
+        if tx.pending.is_node_removed(node_id) {
+          return None;
+        }
+        tx.pending
+          .pending_vectors
+          .get(&(node_id, prop_key_id))
+          .cloned()
+      };
+      if let Some(pending) = pending {
+        return pending.map(|vector| self.stored_vector(prop_key_id, vector));
       }
     }
 
     let delta = self.delta.read();
 
     // Check if node is deleted
-    if delta.is_node_deleted(node_id) {
+    if delta.is_node_removed(node_id) {
       return None;
     }
 
     // Check pending operations from committed replay (startup)
     if let Some(pending) = delta.pending_vectors.get(&(node_id, prop_key_id)) {
       // Some(vec) = set, None = delete
-      return pending.as_ref().map(Arc::clone);
+      return pending
+        .clone()
+        .map(|vector| self.stored_vector(prop_key_id, vector));
     }
 
     if self.ensure_vector_store_loaded(prop_key_id).is_err() {
@@ -251,12 +284,36 @@ impl SingleFileDB {
     vector_store_node_vector(store, node_id).map(Arc::from)
   }
 
+  /// `vector`, not in its store yet (set by a transaction, or replayed), as
+  /// the store will hold it: `vector_store_insert` normalizes it in place
+  /// when the store normalizes on insert, as every store this API creates
+  /// does. The same computation, so reads before and after the commit agree.
+  fn stored_vector(&self, prop_key_id: PropKeyId, vector: VectorRef) -> VectorRef {
+    let store_normalizes = self
+      .ensure_vector_store_loaded(prop_key_id)
+      .ok()
+      .and_then(|()| {
+        self
+          .vector_stores
+          .read()
+          .get(&prop_key_id)
+          .map(|store| store.config.normalize_on_insert)
+      })
+      .unwrap_or(VectorStoreConfig::new(vector.len()).normalize_on_insert);
+    if !store_normalizes {
+      return vector;
+    }
+    let mut stored = vector.to_vec();
+    normalize_in_place(&mut stored);
+    VectorRef::from(stored)
+  }
+
   /// Check if a node has a vector embedding
   pub fn has_node_vector(&self, node_id: NodeId, prop_key_id: PropKeyId) -> bool {
     let tx_handle = self.current_tx_handle();
     if let Some(handle) = tx_handle.as_ref() {
       let tx = handle.lock();
-      if tx.pending.is_node_deleted(node_id) {
+      if tx.pending.is_node_removed(node_id) {
         return false;
       }
       if let Some(pending) = tx.pending.pending_vectors.get(&(node_id, prop_key_id)) {
@@ -267,7 +324,7 @@ impl SingleFileDB {
     let delta = self.delta.read();
 
     // Check if node is deleted
-    if delta.is_node_deleted(node_id) {
+    if delta.is_node_removed(node_id) {
       return false;
     }
 
@@ -293,6 +350,10 @@ impl SingleFileDB {
   ///
   /// Creates a new store with the given dimensions if it doesn't exist.
   pub fn vector_store_or_create(&self, prop_key_id: PropKeyId, dimensions: usize) -> Result<()> {
+    // A commit checks its vectors' dimensions against the stores before its
+    // COMMIT record and applies them after, both under the commit lock; a
+    // store created in between would make that apply fail.
+    let _commit_guard = self.commit_lock.lock();
     self.ensure_vector_store_loaded(prop_key_id)?;
 
     let mut stores = self.vector_stores.write();
@@ -478,20 +539,77 @@ pub(crate) fn vector_store_state_from_snapshot(
   Ok((stores, HashMap::new()))
 }
 
-pub(crate) fn vector_stores_from_snapshot(
-  snapshot: &SnapshotData,
-) -> Result<HashMap<PropKeyId, VectorManifest>> {
-  let (stores, lazy_entries) = vector_store_state_from_snapshot(snapshot)?;
-  if lazy_entries.is_empty() {
-    return Ok(stores);
+/// Apply the vector operations WAL replay collected (`pending`: the last
+/// operation per node and property, from the transactions in `committed`) to
+/// `stores`. A property's dimensions are its store's or, for a property
+/// without one, those of its first vector in commit order, as the live
+/// database fixed them.
+///
+/// A vector that disagrees with them, or that the store refuses as invalid,
+/// is skipped with a warning rather than failing the open. Versions without
+/// the commit-time dimension check could commit two transactions that gave a
+/// new property different dimensions; the second never reached the live
+/// store, and a WAL holding it must still open.
+pub(crate) fn apply_replayed_vectors(
+  pending: HashMap<(NodeId, PropKeyId), Option<VectorRef>>,
+  committed: &[(TxId, Vec<&ParsedWalRecord>)],
+  snapshot: Option<&SnapshotData>,
+  stores: &mut HashMap<PropKeyId, VectorManifest>,
+  lazy_entries: &mut HashMap<PropKeyId, VectorStoreLazyEntry>,
+) -> Result<()> {
+  let mut first_dimensions: HashMap<PropKeyId, usize> = HashMap::new();
+  let set_vectors = committed
+    .iter()
+    .flat_map(|(_txid, records)| records)
+    .filter(|record| record.record_type == WalRecordType::SetNodeVector)
+    .filter_map(|record| parse_set_node_vector_payload(&record.payload));
+  for set_vector in set_vectors {
+    first_dimensions
+      .entry(set_vector.prop_key_id)
+      .or_insert(set_vector.vector.len());
   }
 
-  let mut materialized = stores;
-  for (prop_key_id, entry) in lazy_entries {
-    let manifest = deserialize_vector_store_entry(snapshot, prop_key_id, &entry)?;
-    materialized.insert(prop_key_id, manifest);
+  let mut skipped = 0usize;
+  for ((node_id, prop_key_id), operation) in pending {
+    if let Some(snapshot) = snapshot {
+      materialize_vector_store_from_lazy_entries(snapshot, stores, lazy_entries, prop_key_id)?;
+    }
+    match operation {
+      Some(vector) => {
+        let dimensions = first_dimensions
+          .get(&prop_key_id)
+          .copied()
+          .unwrap_or(vector.len());
+        let store = stores
+          .entry(prop_key_id)
+          .or_insert_with(|| create_vector_store(VectorStoreConfig::new(dimensions)));
+        match vector_store_insert(store, node_id, vector.as_ref()) {
+          Ok(_) => {}
+          Err(VectorStoreError::DimensionMismatch { .. } | VectorStoreError::InvalidVector(_)) => {
+            skipped += 1;
+          }
+          Err(error) => {
+            return Err(KiteError::InvalidWal(format!(
+              "Failed to apply vector insert during WAL replay for node {node_id} (prop \
+               {prop_key_id}): {error}"
+            )));
+          }
+        }
+      }
+      None => {
+        if let Some(store) = stores.get_mut(&prop_key_id) {
+          vector_store_delete(store, node_id);
+        }
+      }
+    }
   }
-  Ok(materialized)
+  if skipped > 0 {
+    eprintln!(
+      "Warning: skipped {skipped} committed vector operations in the WAL that do not fit their \
+       property's vector store (other dimensions than its first vector, or an invalid vector)"
+    );
+  }
+  Ok(())
 }
 
 pub(crate) fn materialize_vector_store_from_lazy_entries(
@@ -664,8 +782,23 @@ fn decode_vector_payload(
 #[cfg(test)]
 mod tests {
   use super::{
-    decode_vector_payload, vector_store_state_from_snapshot, vector_stores_from_snapshot,
+    decode_vector_payload, deserialize_vector_store_entry, vector_store_state_from_snapshot,
   };
+  use crate::error::Result;
+  use crate::types::PropKeyId;
+  use crate::vector::types::VectorManifest;
+
+  /// Every vector store of `snapshot`, decoded.
+  fn vector_stores_from_snapshot(
+    snapshot: &SnapshotData,
+  ) -> Result<HashMap<PropKeyId, VectorManifest>> {
+    let (mut stores, lazy_entries) = vector_store_state_from_snapshot(snapshot)?;
+    for (prop_key_id, entry) in lazy_entries {
+      let manifest = deserialize_vector_store_entry(snapshot, prop_key_id, &entry)?;
+      stores.insert(prop_key_id, manifest);
+    }
+    Ok(stores)
+  }
   use crate::core::single_file::{close_single_file, open_single_file, SingleFileOpenOptions};
   use crate::core::snapshot::reader::SnapshotData;
   use crate::core::snapshot::writer::{build_snapshot_to_memory, NodeData, SnapshotBuildInput};
@@ -673,7 +806,7 @@ mod tests {
     PropValue, SectionId, SnapshotFlags, SECTION_ENTRY_SIZE, SNAPSHOT_HEADER_SIZE,
   };
   use crate::util::binary::{read_u64, write_u32, write_u64};
-  use crate::util::crc::crc32c;
+  use crate::util::crc::crc32;
   use crate::vector::distance::normalize;
   use crate::vector::store::{create_vector_store, vector_store_has, vector_store_insert};
   use crate::vector::types::VectorStoreConfig;
@@ -934,7 +1067,7 @@ mod tests {
     write_u32(&mut buffer, entry_offset + 16, 0);
     write_u32(&mut buffer, entry_offset + 20, 1);
     let crc_offset = buffer.len() - 4;
-    let crc = crc32c(&buffer[..crc_offset]);
+    let crc = crc32(&buffer[..crc_offset]);
     write_u32(&mut buffer, crc_offset, crc);
 
     let mut tmp = NamedTempFile::new().expect("expected value");

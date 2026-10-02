@@ -139,7 +139,7 @@ pub(crate) fn prop_spec_to_def(name: &str, spec: &JsPropSpec) -> Result<PropDef>
   }
 
   if let Some(default_value) = spec.r#default.clone() {
-    prop = prop.default(default_value.into());
+    prop = prop.default(default_value.try_into()?);
   }
 
   Ok(prop)

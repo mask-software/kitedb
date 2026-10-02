@@ -1,27 +1,32 @@
-//! CRC32C checksums using hardware acceleration when available
+//! CRC-32 checksums, hardware accelerated when available.
+//!
+//! Every on-disk and wire checksum (database header, WAL records, snapshots,
+//! replication frames) is CRC-32 with the IEEE 802.3 polynomial, as the
+//! crc32fast crate computes it. It is not CRC-32C (Castagnoli), which the
+//! functions here were once named after; changing the polynomial would make
+//! every existing file fail its checksums.
 //!
 //! Ported from src/util/crc.ts
-//! Uses crc32fast crate which auto-detects and uses hardware CRC instructions
 
 use crc32fast::Hasher;
 
-/// Compute CRC32C hash of data
+/// Compute the CRC-32 (IEEE) of `data`
 #[inline]
-pub fn crc32c(data: &[u8]) -> u32 {
+pub fn crc32(data: &[u8]) -> u32 {
   let mut hasher = Hasher::new();
   hasher.update(data);
   hasher.finalize()
 }
 
-/// Compute CRC32C in fixed-size chunks.
+/// Compute the CRC-32 (IEEE) of `data` in fixed-size chunks.
 ///
 /// Useful for throughput experiments that cap per-update buffer size.
-pub fn crc32c_chunked(data: &[u8], chunk_size: usize) -> u32 {
+pub fn crc32_chunked(data: &[u8], chunk_size: usize) -> u32 {
   if data.is_empty() {
-    return crc32c(data);
+    return crc32(data);
   }
   if chunk_size == 0 || chunk_size >= data.len() {
-    return crc32c(data);
+    return crc32(data);
   }
 
   let mut hasher = Hasher::new();
@@ -31,8 +36,8 @@ pub fn crc32c_chunked(data: &[u8], chunk_size: usize) -> u32 {
   hasher.finalize()
 }
 
-/// Compute CRC32C hash of multiple data segments
-pub fn crc32c_multi(segments: &[&[u8]]) -> u32 {
+/// Compute the CRC-32 (IEEE) of multiple data segments, as if concatenated
+pub fn crc32_multi(segments: &[&[u8]]) -> u32 {
   let mut hasher = Hasher::new();
   for segment in segments {
     hasher.update(segment);
@@ -40,18 +45,18 @@ pub fn crc32c_multi(segments: &[&[u8]]) -> u32 {
   hasher.finalize()
 }
 
-/// Verify CRC32C matches expected value
+/// Verify that the CRC-32 (IEEE) of `data` is `expected`
 #[inline]
-pub fn verify_crc32c(data: &[u8], expected: u32) -> bool {
-  crc32c(data) == expected
+pub fn verify_crc32(data: &[u8], expected: u32) -> bool {
+  crc32(data) == expected
 }
 
-/// CRC32C hasher for incremental computation
-pub struct Crc32cHasher {
+/// CRC-32 (IEEE) hasher for incremental computation
+pub struct Crc32Hasher {
   hasher: Hasher,
 }
 
-impl Crc32cHasher {
+impl Crc32Hasher {
   /// Create a new hasher
   pub fn new() -> Self {
     Self {
@@ -77,7 +82,7 @@ impl Crc32cHasher {
   }
 }
 
-impl Default for Crc32cHasher {
+impl Default for Crc32Hasher {
   fn default() -> Self {
     Self::new()
   }
@@ -88,50 +93,47 @@ mod tests {
   use super::*;
 
   #[test]
-  fn test_crc32c_empty() {
-    assert_eq!(crc32c(&[]), 0);
+  fn test_crc32_empty() {
+    assert_eq!(crc32(&[]), 0);
+  }
+
+  /// The check value of CRC-32 (IEEE 802.3). CRC-32C's is 0xE3069283. Every
+  /// stored checksum depends on this staying put.
+  #[test]
+  fn test_crc32_is_ieee() {
+    assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
   }
 
   #[test]
-  fn test_crc32c_known() {
-    // Known test vectors for CRC32 (IEEE)
-    // Note: crc32fast uses CRC32 IEEE polynomial, not CRC32C
-    let data = b"123456789";
-    let crc = crc32c(data);
-    // CRC32 IEEE of "123456789" is 0xCBF43926
-    assert_eq!(crc, 0xCBF43926);
-  }
-
-  #[test]
-  fn test_crc32c_multi() {
+  fn test_crc32_multi() {
     let data = b"hello world";
-    let single = crc32c(data);
-    let multi = crc32c_multi(&[b"hello", b" ", b"world"]);
+    let single = crc32(data);
+    let multi = crc32_multi(&[b"hello", b" ", b"world"]);
     assert_eq!(single, multi);
   }
 
   #[test]
-  fn test_crc32c_chunked_matches_single() {
+  fn test_crc32_chunked_matches_single() {
     let data = b"abcdefghijklmnopqrstuvwxyz0123456789";
-    let single = crc32c(data);
-    let chunked = crc32c_chunked(data, 7);
+    let single = crc32(data);
+    let chunked = crc32_chunked(data, 7);
     assert_eq!(single, chunked);
   }
 
   #[test]
-  fn test_verify_crc32c() {
+  fn test_verify_crc32() {
     let data = b"test data";
-    let crc = crc32c(data);
-    assert!(verify_crc32c(data, crc));
-    assert!(!verify_crc32c(data, crc + 1));
+    let crc = crc32(data);
+    assert!(verify_crc32(data, crc));
+    assert!(!verify_crc32(data, crc + 1));
   }
 
   #[test]
   fn test_incremental_hasher() {
     let data = b"hello world";
-    let single = crc32c(data);
+    let single = crc32(data);
 
-    let mut hasher = Crc32cHasher::new();
+    let mut hasher = Crc32Hasher::new();
     hasher.update(b"hello");
     hasher.update(b" ");
     hasher.update(b"world");

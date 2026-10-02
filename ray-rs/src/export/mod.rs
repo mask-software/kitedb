@@ -10,7 +10,7 @@ use std::path::Path;
 
 use crate::core::single_file::SingleFileDB;
 use crate::error::{KiteError, Result};
-use crate::types::{ETypeId, NodeId, PropKeyId, PropValue};
+use crate::types::{ETypeId, LabelId, NodeId, PropKeyId, PropValue};
 
 // =============================================================================
 // Types
@@ -60,6 +60,10 @@ pub struct ExportedPropValue {
 pub struct ExportedNode {
   pub id: u64,
   pub key: Option<String>,
+  /// Label names, sorted. Exports written before labels were exported have
+  /// none.
+  #[serde(default)]
+  pub labels: Vec<String>,
   pub props: HashMap<String, ExportedPropValue>,
 }
 
@@ -202,10 +206,34 @@ fn etype_name_single(db: &SingleFileDB, etype_id: ETypeId) -> String {
     .unwrap_or_else(|| format!("etype_{etype_id}"))
 }
 
+fn label_name_single(db: &SingleFileDB, label_id: LabelId) -> String {
+  db.label_name(label_id)
+    .unwrap_or_else(|| format!("label_{label_id}"))
+}
+
+/// Run `read` with every commit and checkpoint install kept out, so all it
+/// reads is one point in time. Takes the locks `create_backup_single_file`
+/// takes for its copy: the checkpoint gate's read side, then the commit lock.
+/// Writers wait until `read` returns.
+fn with_commits_paused<T>(db: &SingleFileDB, read: impl FnOnce() -> T) -> T {
+  // A blocking checkpoint can hold the gate's write side while it waits for
+  // this thread's open transaction, so a read permit would never come. That
+  // transaction keeps blocking checkpoints and compaction out by itself.
+  let _checkpoint_gate = (!db.has_transaction()).then(|| db.checkpoint_gate.read());
+  let _commit_guard = db.commit_lock.lock();
+  read()
+}
+
+/// Export the database as one point in time: commits wait until the export
+/// is read.
 pub fn export_to_object_single(
   db: &SingleFileDB,
   options: ExportOptions,
 ) -> Result<ExportedDatabase> {
+  with_commits_paused(db, || export_snapshot(db, options))
+}
+
+fn export_snapshot(db: &SingleFileDB, options: ExportOptions) -> Result<ExportedDatabase> {
   // Read only through the read API, which takes and releases its own guards.
   // Holding `delta.read()` across those calls would re-lock it, and a commit or
   // checkpoint queued on `delta.write()` blocks that nested read forever.
@@ -221,6 +249,12 @@ pub fn export_to_object_single(
   if options.include_nodes {
     for node_id in db.list_nodes() {
       let key = db.node_key(node_id);
+      let mut labels: Vec<String> = db
+        .node_labels(node_id)
+        .into_iter()
+        .map(|label_id| label_name_single(db, label_id))
+        .collect();
+      labels.sort_unstable();
       let mut props = HashMap::new();
       if let Some(props_by_id) = db.node_props(node_id) {
         for (key_id, value) in props_by_id {
@@ -231,6 +265,7 @@ pub fn export_to_object_single(
       nodes.push(ExportedNode {
         id: node_id,
         key,
+        labels,
         props,
       });
     }
@@ -368,6 +403,7 @@ pub fn import_from_object_single(
 ) -> Result<ImportResult> {
   let mut propkey_name_to_id: HashMap<String, PropKeyId> = HashMap::new();
   let mut etype_name_to_id: HashMap<String, ETypeId> = HashMap::new();
+  let mut label_name_to_id: HashMap<String, LabelId> = HashMap::new();
   let schema_tx = db.begin_guard(false)?;
 
   for name in data.schema.prop_keys.values() {
@@ -377,7 +413,7 @@ pub fn import_from_object_single(
     resolve_etype(db, &mut etype_name_to_id, name)?;
   }
   for name in data.schema.labels.values() {
-    db.define_label(name)?;
+    resolve_label(db, &mut label_name_to_id, name)?;
   }
   schema_tx.commit()?;
 
@@ -403,6 +439,10 @@ pub fn import_from_object_single(
       // Older exports can carry a partial schema, so names are resolved here.
       let key_id = resolve_propkey(db, &mut propkey_name_to_id, prop_name)?;
       db.set_node_prop(node_id, key_id, deserialize_prop_value(exported_value))?;
+    }
+    for label in &node.labels {
+      let label_id = resolve_label(db, &mut label_name_to_id, label)?;
+      db.add_node_label(node_id, label_id)?;
     }
 
     old_to_new.insert(node.id as NodeId, node_id);
@@ -485,6 +525,21 @@ fn resolve_propkey(
     return Ok(id);
   }
   let id = db.define_propkey(name)?;
+  known.insert(name.to_string(), id);
+  Ok(id)
+}
+
+/// Returns the id for a label name, defining the label in the open write
+/// transaction when the database does not know it yet.
+fn resolve_label(
+  db: &SingleFileDB,
+  known: &mut HashMap<String, LabelId>,
+  name: &str,
+) -> Result<LabelId> {
+  if let Some(&id) = known.get(name) {
+    return Ok(id);
+  }
+  let id = db.define_label(name)?;
   known.insert(name.to_string(), id);
   Ok(id)
 }

@@ -5,7 +5,7 @@ use crate::types::CheckResult as RustCheckResult;
 use pyo3::prelude::*;
 
 /// Database statistics
-#[pyclass(name = "DbStats")]
+#[pyclass(name = "DbStats", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct DbStats {
   #[pyo3(get)]
@@ -58,7 +58,7 @@ impl DbStats {
 }
 
 /// Database integrity check result
-#[pyclass(name = "CheckResult")]
+#[pyclass(name = "CheckResult", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct CheckResult {
   #[pyo3(get)]
@@ -71,6 +71,16 @@ pub struct CheckResult {
 
 #[pymethods]
 impl CheckResult {
+  #[new]
+  #[pyo3(signature = (valid, errors=None, warnings=None))]
+  fn new(valid: bool, errors: Option<Vec<String>>, warnings: Option<Vec<String>>) -> Self {
+    Self {
+      valid,
+      errors: errors.unwrap_or_default(),
+      warnings: warnings.unwrap_or_default(),
+    }
+  }
+
   /// Check if the database is valid (no errors)
   fn is_valid(&self) -> bool {
     self.valid
@@ -115,8 +125,9 @@ impl From<RustCheckResult> for CheckResult {
   }
 }
 
-/// Cache statistics
-#[pyclass(name = "CacheStats")]
+/// Deprecated: the cache layer was removed; `Database.cache_stats()` always
+/// returns None.
+#[pyclass(name = "CacheStats", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct CacheStats {
   #[pyo3(get)]

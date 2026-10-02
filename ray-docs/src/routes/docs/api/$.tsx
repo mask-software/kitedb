@@ -146,6 +146,27 @@ db.checkpoint();`}
 				language="typescript"
 			/>
 
+			<h2 id="async-maintenance">Long-running calls</h2>
+			<p>
+				Calls that can take a long time have <code>*Async</code> variants that
+				run on the libuv thread pool and return a Promise, so the event loop
+				keeps serving other work: <code>checkpointAsync()</code>,{" "}
+				<code>optimizeAsync()</code>, <code>vacuumAsync()</code>,{" "}
+				<code>exportToJsonAsync()</code>, <code>exportToJsonlAsync()</code>,{" "}
+				<code>importFromJsonAsync()</code>, <code>waitForTokenAsync()</code>,
+				and the functions <code>createBackupAsync()</code>,{" "}
+				<code>restoreBackupAsync()</code>,{" "}
+				<code>createOfflineBackupAsync()</code> and the{" "}
+				<code>pushReplicationMetricsOtel*Async()</code> pushes. They reject
+				inside a transaction (commit or roll back first), and{" "}
+				<code>close()</code> fails while one is still running.
+			</p>
+			<CodeBlock
+				code={`await db.checkpointAsync();
+const reached = await db.waitForTokenAsync(token, 5_000);`}
+				language="typescript"
+			/>
+
 			<h2 id="iterators">Streaming and pagination</h2>
 			<p>
 				<code>streamNodes()</code> returns all node IDs split into batches.{" "}
@@ -199,7 +220,7 @@ embedding: vector('embedding', 1536)`}
 
 const index = createVectorIndex({ dimensions: 1536 });
 
-// Add vectors
+// Add vectors: a Float32Array is read in place, a number[] is converted
 index.set(nodeId, embedding);
 
 // Search: returns Array<{ nodeId, distance, similarity }>
@@ -216,7 +237,10 @@ const hits = index.search(queryVector, {
 				code={`const index = createVectorIndex({ dimensions: 1536 });
 
 // Build or rebuild the ANN index (IVF-PQ by default) for faster search
-index.buildIndex();`}
+index.buildIndex();
+
+// Or build on the libuv thread pool without blocking the event loop
+await index.buildIndexAsync();`}
 				language="typescript"
 			/>
 		</DocPage>

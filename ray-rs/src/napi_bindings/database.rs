@@ -4,14 +4,17 @@
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use super::traversal::{
-  JsPathConfig, JsPathResult, JsTraversalDirection, JsTraversalResult, JsTraversalStep,
-  JsTraverseOptions,
+  check_weight, JsPathConfig, JsPathResult, JsTraversalDirection, JsTraversalResult,
+  JsTraversalStep, JsTraverseOptions,
 };
 use super::validation;
+use super::vector::js_vector_f32;
 use crate::api::kite::KiteRuntimeProfile as RustKiteRuntimeProfile;
 use crate::api::pathfinding::{bfs, dijkstra, yen_k_shortest};
 use crate::api::traversal::{TraversalBuilder as RustTraversalBuilder, TraversalDirection};
@@ -150,12 +153,12 @@ pub struct OpenOptions {
   /// MVCC max version chain depth (must be positive)
   pub mvcc_max_chain_depth: Option<i64>,
   /// Page size in bytes (must be a supported positive power of two)
-  pub page_size: Option<u32>,
+  pub page_size: Option<f64>,
   /// WAL size in bytes (at least 16 pages), fixed when the file is created.
   /// Unset: a new file gets a 4MB WAL and an existing file keeps its own.
   /// Set: a new file gets this size; an existing file with a different WAL
   /// size fails to open.
-  pub wal_size: Option<u32>,
+  pub wal_size: Option<f64>,
   /// Enable auto-checkpoint when WAL usage exceeds threshold
   pub auto_checkpoint: Option<bool>,
   /// WAL usage threshold (0.0-1.0) to trigger auto-checkpoint
@@ -164,20 +167,25 @@ pub struct OpenOptions {
   pub background_checkpoint: Option<bool>,
   /// Compression options for checkpoint snapshots (single-file only)
   pub checkpoint_compression: Option<CompressionOptions>,
-  /// Enable caching
+  /// @deprecated No effect: the cache layer was removed. Still accepted so existing callers keep working.
   pub cache_enabled: Option<bool>,
-  /// Max node properties in cache (0 disables the node-property cache)
+  /// @deprecated No effect: the cache layer was removed. Still accepted so existing callers keep working.
   pub cache_max_node_props: Option<i64>,
-  /// Max edge properties in cache (0 disables the edge-property cache)
+  /// @deprecated No effect: the cache layer was removed. Still accepted so existing callers keep working.
   pub cache_max_edge_props: Option<i64>,
-  /// Max traversal cache entries (0 disables the traversal cache)
+  /// @deprecated No effect: the cache layer was removed. Still accepted so existing callers keep working.
   pub cache_max_traversal_entries: Option<i64>,
-  /// Max query cache entries (0 disables the query cache)
+  /// @deprecated No effect: the cache layer was removed. Still accepted so existing callers keep working.
   pub cache_max_query_entries: Option<i64>,
-  /// Query cache TTL in milliseconds (0 expires entries immediately)
+  /// @deprecated No effect: the cache layer was removed. Still accepted so existing callers keep working.
   pub cache_query_ttl_ms: Option<i64>,
   /// Sync mode: "Full", "Normal", or "Off" (default: "Full")
   pub sync_mode: Option<JsSyncMode>,
+  /// macOS only: in "Full" sync mode, sync with F_FULLFSYNC so commits
+  /// survive power loss; much slower (milliseconds per commit). Default
+  /// false: "Full" then survives crashes but not power loss on macOS, like
+  /// SQLite's default.
+  pub full_fsync: Option<bool>,
   /// Enable group commit (coalesce WAL flushes across commits)
   pub group_commit_enabled: Option<bool>,
   /// Group commit window in milliseconds (0 adds no coalescing delay)
@@ -208,11 +216,9 @@ pub struct OpenOptions {
 
 impl OpenOptions {
   fn into_rust(self) -> Result<RustOpenOptions> {
-    use crate::types::{CacheOptions, PropertyCacheConfig, QueryCacheConfig, TraversalCacheConfig};
-
     let page_size = self
       .page_size
-      .map(validation::page_size)
+      .map(|v| validation::page_size(validation::u32_value("pageSize", v)?))
       .transpose()?
       .unwrap_or(validation::MIN_PAGE_SIZE as usize);
 
@@ -251,6 +257,7 @@ impl OpenOptions {
       rust_opts = rust_opts.page_size(page_size);
     }
     if let Some(v) = self.wal_size {
+      let v = validation::u32_value("walSize", v)?;
       rust_opts = rust_opts.wal_size(validation::wal_size(v, page_size)?);
     }
     if let Some(v) = self.auto_checkpoint {
@@ -266,69 +273,12 @@ impl OpenOptions {
       rust_opts = rust_opts.checkpoint_compression(Some(compression.into_rust()?));
     }
 
-    let max_node_props = self
-      .cache_max_node_props
-      .map(|v| {
-        validation::non_negative_usize("cacheMaxNodeProps", v, validation::MAX_CACHE_ENTRIES)
-      })
-      .transpose()?
-      .unwrap_or(10_000);
-    let max_edge_props = self
-      .cache_max_edge_props
-      .map(|v| {
-        validation::non_negative_usize("cacheMaxEdgeProps", v, validation::MAX_CACHE_ENTRIES)
-      })
-      .transpose()?
-      .unwrap_or(10_000);
-    let max_traversal_entries = self
-      .cache_max_traversal_entries
-      .map(|v| {
-        validation::non_negative_usize("cacheMaxTraversalEntries", v, validation::MAX_CACHE_ENTRIES)
-      })
-      .transpose()?
-      .unwrap_or(5_000);
-    let max_query_entries = self
-      .cache_max_query_entries
-      .map(|v| {
-        validation::non_negative_usize("cacheMaxQueryEntries", v, validation::MAX_CACHE_ENTRIES)
-      })
-      .transpose()?
-      .unwrap_or(1_000);
-    let query_ttl_ms = self
-      .cache_query_ttl_ms
-      .map(|v| {
-        validation::non_negative_u64("cacheQueryTtlMs", v, validation::MAX_DURATION_MS as u64)
-      })
-      .transpose()?;
-
-    // Cache options
-    if self.cache_enabled == Some(true) {
-      let property_cache = Some(PropertyCacheConfig {
-        max_node_props,
-        max_edge_props,
-      });
-
-      let traversal_cache = Some(TraversalCacheConfig {
-        max_entries: max_traversal_entries,
-        max_neighbors_per_entry: 100,
-      });
-
-      let query_cache = Some(QueryCacheConfig {
-        max_entries: max_query_entries,
-        ttl_ms: query_ttl_ms,
-      });
-
-      rust_opts = rust_opts.cache(Some(CacheOptions {
-        enabled: true,
-        property_cache,
-        traversal_cache,
-        query_cache,
-      }));
-    }
-
     // Sync mode
     if let Some(mode) = self.sync_mode {
       rust_opts = rust_opts.sync_mode(mode.into());
+    }
+    if let Some(full_fsync) = self.full_fsync {
+      rust_opts = rust_opts.full_fsync(full_fsync);
     }
     if let Some(enabled) = self.group_commit_enabled {
       rust_opts = rust_opts.group_commit_enabled(enabled);
@@ -401,17 +351,11 @@ mod open_option_validation_tests {
   #[test]
   fn validates_open_numeric_ranges_and_zero_semantics() {
     assert!(OpenOptions {
-      page_size: Some(8192),
-      wal_size: Some(8192 * 16),
+      page_size: Some(8192.0),
+      wal_size: Some(8192.0 * 16.0),
       mvcc_gc_interval_ms: Some(1),
       mvcc_retention_ms: Some(0),
       mvcc_max_chain_depth: Some(1),
-      cache_enabled: Some(true),
-      cache_max_node_props: Some(0),
-      cache_max_edge_props: Some(1),
-      cache_max_traversal_entries: Some(0),
-      cache_max_query_entries: Some(0),
-      cache_query_ttl_ms: Some(0),
       checkpoint_threshold: Some(0.0),
       group_commit_window_ms: Some(0),
       replication_segment_max_bytes: Some(1),
@@ -424,15 +368,24 @@ mod open_option_validation_tests {
 
     for options in [
       OpenOptions {
-        page_size: Some(0),
+        page_size: Some(0.0),
         ..Default::default()
       },
       OpenOptions {
-        page_size: Some(1_000_000),
+        page_size: Some(1_000_000.0),
         ..Default::default()
       },
       OpenOptions {
-        wal_size: Some(0),
+        page_size: Some(4096.5),
+        ..Default::default()
+      },
+      OpenOptions {
+        wal_size: Some(0.0),
+        ..Default::default()
+      },
+      // napi's u32 conversion would turn -1 into a 4GB WAL.
+      OpenOptions {
+        wal_size: Some(-1.0),
         ..Default::default()
       },
       OpenOptions {
@@ -449,14 +402,6 @@ mod open_option_validation_tests {
       },
       OpenOptions {
         mvcc_max_chain_depth: Some(0),
-        ..Default::default()
-      },
-      OpenOptions {
-        cache_max_node_props: Some(-1),
-        ..Default::default()
-      },
-      OpenOptions {
-        cache_max_query_entries: Some(validation::MAX_CACHE_ENTRIES + 1),
         ..Default::default()
       },
       OpenOptions {
@@ -479,9 +424,15 @@ mod open_option_validation_tests {
       assert!(options.into_rust().is_err());
     }
 
+    // The cache layer was removed: its options are accepted and ignored,
+    // out-of-range values included.
     assert!(OpenOptions {
       cache_enabled: Some(true),
-      cache_max_node_props: Some(validation::MAX_CACHE_ENTRIES),
+      cache_max_node_props: Some(-1),
+      cache_max_edge_props: Some(i64::MAX),
+      cache_max_traversal_entries: Some(-1),
+      cache_max_query_entries: Some(i64::MAX),
+      cache_query_ttl_ms: Some(-1),
       ..Default::default()
     }
     .into_rust()
@@ -492,7 +443,7 @@ mod open_option_validation_tests {
   fn validates_maintenance_and_streaming_options() {
     assert!(CompressionOptions {
       r#type: Some(JsCompressionType::Zstd),
-      min_size: Some(1),
+      min_size: Some(1.0),
       level: Some(1),
       ..Default::default()
     }
@@ -582,11 +533,26 @@ mod open_option_validation_tests {
   }
 
   #[test]
+  fn full_fsync_is_opt_in() {
+    assert!(
+      !OpenOptions::default()
+        .into_rust()
+        .expect("defaults")
+        .full_fsync
+    );
+    let opted_in = OpenOptions {
+      full_fsync: Some(true),
+      ..Default::default()
+    };
+    assert!(opted_in.into_rust().expect("full_fsync").full_fsync);
+  }
+
+  #[test]
   fn unset_wal_size_reopens_a_file_with_its_own_wal_size() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("napi-wal-size.kitedb");
     let create = OpenOptions {
-      wal_size: Some(64 * 1024),
+      wal_size: Some(64.0 * 1024.0),
       ..Default::default()
     }
     .into_rust()
@@ -631,7 +597,10 @@ fn open_options_from_kite_profile_options(opts: crate::api::kite::KiteOptions) -
       .mvcc_max_chain_depth
       .and_then(|v| i64::try_from(v).ok()),
     page_size: None,
-    wal_size: opts.wal_size.and_then(|v| u32::try_from(v).ok()),
+    wal_size: opts
+      .wal_size
+      .and_then(|v| u32::try_from(v).ok())
+      .map(f64::from),
     auto_checkpoint: None,
     checkpoint_threshold: opts.checkpoint_threshold,
     background_checkpoint: None,
@@ -643,6 +612,7 @@ fn open_options_from_kite_profile_options(opts: crate::api::kite::KiteOptions) -
     cache_max_query_entries: None,
     cache_query_ttl_ms: None,
     sync_mode: Some(js_sync_mode_from_rust(opts.sync_mode)),
+    full_fsync: None,
     group_commit_enabled: Some(opts.group_commit_enabled),
     group_commit_window_ms: i64::try_from(opts.group_commit_window_ms).ok(),
     snapshot_parse_mode: None,
@@ -762,7 +732,7 @@ pub struct CompressionOptions {
   /// Compression algorithm
   pub r#type: Option<JsCompressionType>,
   /// Minimum section size to compress
-  pub min_size: Option<u32>,
+  pub min_size: Option<f64>,
   /// Compression level
   pub level: Option<i32>,
 }
@@ -777,7 +747,7 @@ impl CompressionOptions {
       out.compression_type = t.into();
     }
     if let Some(min_size) = self.min_size {
-      out.min_size = validation::compression_min_size(min_size)?;
+      out.min_size = validation::compression_min_size(validation::u32_value("minSize", min_size)?)?;
     }
     if let Some(level) = self.level {
       let zstd = matches!(out.compression_type, CompressionType::Zstd);
@@ -949,6 +919,10 @@ pub struct ExportOptions {
 }
 
 impl ExportOptions {
+  fn rust_or_default(options: Option<Self>) -> ray_export::ExportOptions {
+    options.map(Self::into_rust).unwrap_or_default()
+  }
+
   fn into_rust(self) -> ray_export::ExportOptions {
     let mut opts = ray_export::ExportOptions::default();
     if let Some(v) = self.include_nodes {
@@ -976,6 +950,12 @@ pub struct ImportOptions {
 }
 
 impl ImportOptions {
+  fn rust_or_default(options: Option<Self>) -> Result<ray_export::ImportOptions> {
+    options
+      .map(Self::into_rust)
+      .unwrap_or_else(|| Ok(ray_export::ImportOptions::default()))
+  }
+
   fn into_rust(self) -> Result<ray_export::ImportOptions> {
     let mut opts = ray_export::ImportOptions::default();
     if let Some(v) = self.skip_existing {
@@ -1100,7 +1080,7 @@ impl From<RustCheckResult> for CheckResult {
   }
 }
 
-/// Cache statistics
+/// @deprecated The cache layer was removed; `cacheStats()` always returns null.
 #[napi(object)]
 pub struct JsCacheStats {
   pub property_cache_hits: i64,
@@ -1114,7 +1094,7 @@ pub struct JsCacheStats {
   pub query_cache_size: i64,
 }
 
-/// Cache layer metrics
+/// @deprecated The cache layer was removed; every field is zero.
 #[napi(object)]
 pub struct CacheLayerMetrics {
   pub hits: i64,
@@ -1125,13 +1105,33 @@ pub struct CacheLayerMetrics {
   pub utilization_percent: f64,
 }
 
-/// Cache metrics
+/// @deprecated The cache layer was removed; `enabled` is false and every count is zero.
 #[napi(object)]
 pub struct CacheMetrics {
   pub enabled: bool,
   pub property_cache: CacheLayerMetrics,
   pub traversal_cache: CacheLayerMetrics,
   pub query_cache: CacheLayerMetrics,
+}
+
+impl CacheMetrics {
+  /// What `collectMetrics()` reports for the removed cache layer.
+  fn removed() -> Self {
+    let empty = || CacheLayerMetrics {
+      hits: 0,
+      misses: 0,
+      hit_rate: 0.0,
+      size: 0,
+      max_size: 0,
+      utilization_percent: 0.0,
+    };
+    CacheMetrics {
+      enabled: false,
+      property_cache: empty(),
+      traversal_cache: empty(),
+      query_cache: empty(),
+    }
+  }
 }
 
 /// Data metrics
@@ -1203,6 +1203,7 @@ pub struct ReplicationMetrics {
 #[napi(object)]
 pub struct MemoryMetrics {
   pub delta_estimate_bytes: i64,
+  /// @deprecated The cache layer was removed; always 0.
   pub cache_estimate_bytes: i64,
   pub snapshot_bytes: i64,
   pub total_estimate_bytes: i64,
@@ -1215,6 +1216,7 @@ pub struct DatabaseMetrics {
   pub is_single_file: bool,
   pub read_only: bool,
   pub data: DataMetrics,
+  /// @deprecated The cache layer was removed; reports a disabled, empty cache.
   pub cache: CacheMetrics,
   pub mvcc: Option<MvccMetrics>,
   pub replication: ReplicationMetrics,
@@ -1277,30 +1279,6 @@ pub struct PushReplicationMetricsOtelOptions {
   pub ca_cert_pem_path: Option<String>,
   pub client_cert_pem_path: Option<String>,
   pub client_key_pem_path: Option<String>,
-}
-
-impl From<core_metrics::CacheLayerMetrics> for CacheLayerMetrics {
-  fn from(metrics: core_metrics::CacheLayerMetrics) -> Self {
-    CacheLayerMetrics {
-      hits: metrics.hits,
-      misses: metrics.misses,
-      hit_rate: metrics.hit_rate,
-      size: metrics.size,
-      max_size: metrics.max_size,
-      utilization_percent: metrics.utilization_percent,
-    }
-  }
-}
-
-impl From<core_metrics::CacheMetrics> for CacheMetrics {
-  fn from(metrics: core_metrics::CacheMetrics) -> Self {
-    CacheMetrics {
-      enabled: metrics.enabled,
-      property_cache: metrics.property_cache.into(),
-      traversal_cache: metrics.traversal_cache.into(),
-      query_cache: metrics.query_cache.into(),
-    }
-  }
 }
 
 impl From<core_metrics::DataMetrics> for DataMetrics {
@@ -1382,7 +1360,7 @@ impl From<core_metrics::MemoryMetrics> for MemoryMetrics {
   fn from(metrics: core_metrics::MemoryMetrics) -> Self {
     MemoryMetrics {
       delta_estimate_bytes: metrics.delta_estimate_bytes,
-      cache_estimate_bytes: metrics.cache_estimate_bytes,
+      cache_estimate_bytes: 0,
       snapshot_bytes: metrics.snapshot_bytes,
       total_estimate_bytes: metrics.total_estimate_bytes,
     }
@@ -1396,7 +1374,7 @@ impl From<core_metrics::DatabaseMetrics> for DatabaseMetrics {
       is_single_file: metrics.is_single_file,
       read_only: metrics.read_only,
       data: metrics.data.into(),
-      cache: metrics.cache.into(),
+      cache: CacheMetrics::removed(),
       mvcc: metrics.mvcc.map(Into::into),
       replication: metrics.replication.into(),
       memory: metrics.memory.into(),
@@ -1450,15 +1428,37 @@ pub enum PropType {
 }
 
 /// Property value wrapper for JS
+///
+/// The field matching `propType` is required (`Null` needs none).
 #[napi(object)]
 #[derive(Clone)]
 pub struct JsPropValue {
   pub prop_type: PropType,
   pub bool_value: Option<bool>,
-  pub int_value: Option<i64>,
+  /// 64-bit integer. Read back as a number when it is a safe integer
+  /// (`Number.isSafeInteger`), otherwise as a BigInt so no digits are lost.
+  /// Written as a BigInt, or as an integral number within the i64 range.
+  pub int_value: Option<Either<f64, BigInt>>,
   pub float_value: Option<f64>,
   pub string_value: Option<String>,
   pub vector_value: Option<Vec<f64>>,
+}
+
+/// An i64 for JS: a number while it is exact, a BigInt beyond `Number.MAX_SAFE_INTEGER`.
+pub(crate) fn int_to_js(value: i64) -> Either<f64, BigInt> {
+  if value.unsigned_abs() <= validation::MAX_SAFE_INTEGER as u64 {
+    Either::A(value as f64)
+  } else {
+    Either::B(BigInt::from(value))
+  }
+}
+
+/// An i64 from JS: a BigInt within the i64 range, or an integral number.
+pub(crate) fn int_from_js(field: &str, value: &Either<f64, BigInt>) -> Result<i64> {
+  match value {
+    Either::A(number) => validation::integral_i64(field, *number),
+    Either::B(big) => validation::bigint_i64(field, big),
+  }
 }
 
 impl From<PropValue> for JsPropValue {
@@ -1483,7 +1483,7 @@ impl From<PropValue> for JsPropValue {
       PropValue::I64(v) => JsPropValue {
         prop_type: PropType::Int,
         bool_value: None,
-        int_value: Some(v),
+        int_value: Some(int_to_js(v)),
         float_value: None,
         string_value: None,
         vector_value: None,
@@ -1516,19 +1516,48 @@ impl From<PropValue> for JsPropValue {
   }
 }
 
-impl From<JsPropValue> for PropValue {
-  fn from(value: JsPropValue) -> Self {
-    match value.prop_type {
+impl TryFrom<JsPropValue> for PropValue {
+  type Error = Error;
+
+  /// Rejects a value whose field for `propType` is missing, rather than
+  /// storing 0, false or "" in its place.
+  fn try_from(value: JsPropValue) -> Result<Self> {
+    fn missing(prop_type: &str, field: &str) -> Error {
+      validation::invalid_argument(format!(
+        "JsPropValue with propType '{prop_type}' requires {field}"
+      ))
+    }
+    Ok(match value.prop_type {
       PropType::Null => PropValue::Null,
-      PropType::Bool => PropValue::Bool(value.bool_value.unwrap_or(false)),
-      PropType::Int => PropValue::I64(value.int_value.unwrap_or(0)),
-      PropType::Float => PropValue::F64(value.float_value.unwrap_or(0.0)),
-      PropType::String => PropValue::String(value.string_value.unwrap_or_default()),
+      PropType::Bool => PropValue::Bool(
+        value
+          .bool_value
+          .ok_or_else(|| missing("Bool", "boolValue"))?,
+      ),
+      PropType::Int => {
+        let int = value
+          .int_value
+          .as_ref()
+          .ok_or_else(|| missing("Int", "intValue"))?;
+        PropValue::I64(int_from_js("intValue", int)?)
+      }
+      PropType::Float => PropValue::F64(
+        value
+          .float_value
+          .ok_or_else(|| missing("Float", "floatValue"))?,
+      ),
+      PropType::String => PropValue::String(
+        value
+          .string_value
+          .ok_or_else(|| missing("String", "stringValue"))?,
+      ),
       PropType::Vector => {
-        let vector = value.vector_value.unwrap_or_default();
+        let vector = value
+          .vector_value
+          .ok_or_else(|| missing("Vector", "vectorValue"))?;
         PropValue::VectorF32(vector.iter().map(|&x| x as f32).collect())
       }
-    }
+    })
   }
 }
 
@@ -1551,11 +1580,21 @@ pub struct JsFullEdge {
   pub dst: f64,
 }
 
+/// Edge input for batch operations (src, etype, dst); a `JsFullEdge` fits.
+///
+/// Numbers are validated rather than coerced (see `validation::u32_value`).
+#[napi(object)]
+pub struct JsFullEdgeInput {
+  pub src: f64,
+  pub etype: f64,
+  pub dst: f64,
+}
+
 /// Edge input with properties for batch operations
 #[napi(object)]
 pub struct JsEdgeWithPropsInput {
   pub src: f64,
-  pub etype: u32,
+  pub etype: f64,
   pub dst: f64,
   pub props: Vec<JsNodeProp>,
 }
@@ -1567,23 +1606,100 @@ pub struct JsEdgeWithPropsInput {
 /// Node property key-value pair for JS
 #[napi(object)]
 pub struct JsNodeProp {
-  pub key_id: u32,
+  pub key_id: f64,
   pub value: JsPropValue,
+}
+
+impl JsNodeProp {
+  fn from_core(key_id: PropKeyId, value: PropValue) -> Self {
+    JsNodeProp {
+      key_id: f64::from(key_id),
+      value: value.into(),
+    }
+  }
+
+  /// The validated key and value; a `Null` value means "delete".
+  fn into_core(self) -> Result<(PropKeyId, Option<PropValue>)> {
+    let key_id = validation::u32_value("keyId", self.key_id)?;
+    let value = match self.value.prop_type {
+      PropType::Null => None,
+      _ => Some(self.value.try_into()?),
+    };
+    Ok((key_id, value))
+  }
 }
 
 // ============================================================================
 // Database NAPI Wrapper (single-file)
 // ============================================================================
 
-#[allow(clippy::large_enum_variant)]
+/// The open database. Shared with `*Async` calls running on the libuv thread
+/// pool, so close() waits for none of them: it fails while one still runs.
 enum DatabaseInner {
-  SingleFile(RustSingleFileDB),
+  SingleFile(Arc<RustSingleFileDB>),
 }
 
 /// Database handle for single-file storage
+///
+/// Calls that can block for a long time have `*Async` variants that run on
+/// the libuv thread pool and return a Promise, keeping the event loop free.
+/// Other calls on the same database still wait for the locks those hold
+/// (a checkpoint holds out new transactions until it finishes).
 #[napi]
 pub struct Database {
   inner: Option<DatabaseInner>,
+}
+
+// ============================================================================
+// Async Tasks
+// ============================================================================
+
+/// Work run on the libuv thread pool; its result resolves the Promise.
+pub struct BlockingTask<T> {
+  work: Option<Box<dyn FnOnce() -> Result<T> + Send>>,
+}
+
+impl<T: Send + ToNapiValue + TypeName + 'static> BlockingTask<T> {
+  /// Run the prepared work on the pool. A failure to prepare it (invalid
+  /// arguments, closed database) rejects the Promise rather than throwing,
+  /// so every `*Async` call reports errors the same way.
+  pub(crate) fn spawn<W>(prepared: Result<W>) -> AsyncTask<Self>
+  where
+    W: FnOnce() -> Result<T> + Send + 'static,
+  {
+    let work: Box<dyn FnOnce() -> Result<T> + Send> = match prepared {
+      Ok(work) => Box::new(work),
+      Err(err) => Box::new(move || Err(err)),
+    };
+    AsyncTask::new(Self { work: Some(work) })
+  }
+}
+
+impl<T: Send + ToNapiValue + TypeName + 'static> napi::Task for BlockingTask<T> {
+  type Output = T;
+  type JsValue = T;
+
+  fn compute(&mut self) -> Result<T> {
+    let work = self
+      .work
+      .take()
+      .ok_or_else(|| Error::from_reason("async task already ran"))?;
+    // A panic must not unwind out of the libuv worker (that aborts the
+    // process); it rejects the Promise instead, as `catch_unwind` does for
+    // synchronous calls.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).unwrap_or_else(|panic| {
+      let reason = panic
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_string());
+      Err(Error::from_reason(format!("async task panicked: {reason}")))
+    })
+  }
+
+  fn resolve(&mut self, _env: Env, output: T) -> Result<T> {
+    Ok(output)
+  }
 }
 
 #[napi]
@@ -1620,20 +1736,19 @@ impl Database {
     let db = open_single_file(&db_path, opts)
       .map_err(|e| Error::from_reason(format!("Failed to open database: {e}")))?;
     Ok(Database {
-      inner: Some(DatabaseInner::SingleFile(db)),
+      inner: Some(DatabaseInner::SingleFile(Arc::new(db))),
     })
   }
 
   /// Close the database
+  ///
+  /// Fails, leaving the database open, while an `*Async` call on it is still
+  /// running: await it first.
   #[napi]
   pub fn close(&mut self) -> Result<()> {
-    if let Some(db) = self.inner.take() {
-      match db {
-        DatabaseInner::SingleFile(db) => {
-          close_single_file(db)
-            .map_err(|e| Error::from_reason(format!("Failed to close database: {e}")))?;
-        }
-      }
+    if let Some(db) = self.take_for_close()? {
+      close_single_file(db)
+        .map_err(|e| Error::from_reason(format!("Failed to close database: {e}")))?;
     }
     Ok(())
   }
@@ -1642,14 +1757,12 @@ impl Database {
   #[napi]
   pub fn close_with_checkpoint_if_wal_over(&mut self, threshold: f64) -> Result<()> {
     let threshold = validation::ratio("threshold", threshold)?;
-    if let Some(db) = self.inner.take() {
-      match db {
-        DatabaseInner::SingleFile(db) => close_single_file_with_options(
-          db,
-          RustSingleFileCloseOptions::new().checkpoint_if_wal_usage_at_least(threshold),
-        )
-        .map_err(|e| Error::from_reason(format!("Failed to close database: {e}")))?,
-      }
+    if let Some(db) = self.take_for_close()? {
+      close_single_file_with_options(
+        db,
+        RustSingleFileCloseOptions::new().checkpoint_if_wal_usage_at_least(threshold),
+      )
+      .map_err(|e| Error::from_reason(format!("Failed to close database: {e}")))?;
     }
     Ok(())
   }
@@ -1755,19 +1868,28 @@ impl Database {
   }
 
   /// Wait until the DB has observed at least the provided commit token.
+  ///
+  /// Blocks the JS thread (and the event loop) for up to `timeoutMs`; use
+  /// `waitForTokenAsync` anywhere other work must keep running.
   #[napi]
   pub fn wait_for_token(&self, token: String, timeout_ms: i64) -> Result<bool> {
-    let timeout_ms =
-      validation::non_negative_u64("timeoutMs", timeout_ms, validation::MAX_DURATION_MS as u64)?;
-    let token = CommitToken::from_str(&token)
-      .map_err(|e| Error::from_reason(format!("Invalid commit token: {e}")))?;
+    let (token, timeout_ms) = parse_token_wait(&token, timeout_ms)?;
+    wait_for_token_on(self.db()?, token, timeout_ms)
+  }
 
-    match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => db
-        .wait_for_token(token, timeout_ms)
-        .map_err(|e| Error::from_reason(format!("Failed waiting for token: {e}"))),
-      None => Err(Error::from_reason("Database is closed")),
-    }
+  /// Wait until the DB has observed at least the provided commit token,
+  /// on the libuv thread pool. Resolves false if `timeoutMs` passes first.
+  #[napi(ts_return_type = "Promise<boolean>")]
+  pub fn wait_for_token_async(
+    &self,
+    token: String,
+    timeout_ms: i64,
+  ) -> AsyncTask<BlockingTask<bool>> {
+    BlockingTask::spawn((|| -> Result<_> {
+      let (token, timeout_ms) = parse_token_wait(&token, timeout_ms)?;
+      let db = self.shared_db()?;
+      Ok(move || wait_for_token_on(&db, token, timeout_ms))
+    })())
   }
 
   // ========================================================================
@@ -1948,6 +2070,10 @@ impl Database {
   /// Upsert a node by key (create if missing, update props)
   #[napi]
   pub fn upsert_node(&self, key: String, props: Vec<JsNodeProp>) -> Result<i64> {
+    let props = props
+      .into_iter()
+      .map(JsNodeProp::into_core)
+      .collect::<Result<Vec<_>>>()?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
         let node_id = match db.node_by_key(&key) {
@@ -1957,14 +2083,14 @@ impl Database {
             .map_err(|e| Error::from_reason(format!("Failed to create node: {e}")))?,
         };
 
-        for prop in props {
-          let key_id = prop.key_id as PropKeyId;
-          if matches!(prop.value.prop_type, PropType::Null) {
-            db.delete_node_prop(node_id, key_id)
-              .map_err(|e| Error::from_reason(format!("Failed to delete property: {e}")))?;
-          } else {
-            db.set_node_prop(node_id, key_id, prop.value.into())
-              .map_err(|e| Error::from_reason(format!("Failed to set property: {e}")))?;
+        for (key_id, value) in props {
+          match value {
+            None => db
+              .delete_node_prop(node_id, key_id)
+              .map_err(|e| Error::from_reason(format!("Failed to delete property: {e}")))?,
+            Some(value) => db
+              .set_node_prop(node_id, key_id, value)
+              .map_err(|e| Error::from_reason(format!("Failed to set property: {e}")))?,
           }
         }
 
@@ -1978,6 +2104,10 @@ impl Database {
   #[napi]
   pub fn upsert_node_by_id(&self, node_id: f64, props: Vec<JsNodeProp>) -> Result<i64> {
     let node_id = validation::node_id("nodeId", node_id)?;
+    let props = props
+      .into_iter()
+      .map(JsNodeProp::into_core)
+      .collect::<Result<Vec<_>>>()?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
         if !db.node_exists(node_id) {
@@ -1985,14 +2115,14 @@ impl Database {
             .map_err(|e| Error::from_reason(format!("Failed to create node: {e}")))?;
         }
 
-        for prop in props {
-          let key_id = prop.key_id as PropKeyId;
-          if matches!(prop.value.prop_type, PropType::Null) {
-            db.delete_node_prop(node_id, key_id)
-              .map_err(|e| Error::from_reason(format!("Failed to delete property: {e}")))?;
-          } else {
-            db.set_node_prop(node_id, key_id, prop.value.into())
-              .map_err(|e| Error::from_reason(format!("Failed to set property: {e}")))?;
+        for (key_id, value) in props {
+          match value {
+            None => db
+              .delete_node_prop(node_id, key_id)
+              .map_err(|e| Error::from_reason(format!("Failed to delete property: {e}")))?,
+            Some(value) => db
+              .set_node_prop(node_id, key_id, value)
+              .map_err(|e| Error::from_reason(format!("Failed to set property: {e}")))?,
           }
         }
 
@@ -2069,7 +2199,8 @@ impl Database {
 
   /// Add an edge
   #[napi]
-  pub fn add_edge(&self, src: f64, etype: u32, dst: f64) -> Result<()> {
+  pub fn add_edge(&self, src: f64, etype: f64, dst: f64) -> Result<()> {
+    let etype = validation::u32_value("etype", etype)?;
     let src = validation::node_id("src", src)?;
     let dst = validation::node_id("dst", dst)?;
     match self.inner.as_ref() {
@@ -2082,7 +2213,7 @@ impl Database {
 
   /// Add multiple edges in a single WAL record (fast path)
   #[napi]
-  pub fn add_edges_batch(&self, edges: Vec<JsFullEdge>) -> Result<()> {
+  pub fn add_edges_batch(&self, edges: Vec<JsFullEdgeInput>) -> Result<()> {
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
         let core_edges = edges
@@ -2090,7 +2221,7 @@ impl Database {
           .map(|edge| {
             Ok((
               validation::node_id("src", edge.src)?,
-              edge.etype as ETypeId,
+              validation::u32_value("etype", edge.etype)?,
               validation::node_id("dst", edge.dst)?,
             ))
           })
@@ -2113,11 +2244,14 @@ impl Database {
             let props = edge
               .props
               .into_iter()
-              .map(|prop| (prop.key_id as PropKeyId, prop.value.into()))
-              .collect();
+              .map(|prop| {
+                let key_id = validation::u32_value("keyId", prop.key_id)?;
+                Ok((key_id, prop.value.try_into()?))
+              })
+              .collect::<Result<_>>()?;
             Ok((
               validation::node_id("src", edge.src)?,
-              edge.etype as ETypeId,
+              validation::u32_value("etype", edge.etype)?,
               validation::node_id("dst", edge.dst)?,
               props,
             ))
@@ -2150,24 +2284,19 @@ impl Database {
   pub fn upsert_edge(
     &self,
     src: f64,
-    etype: u32,
+    etype: f64,
     dst: f64,
     props: Vec<JsNodeProp>,
   ) -> Result<bool> {
+    let etype = validation::u32_value("etype", etype)?;
     let src = validation::node_id("src", src)?;
     let dst = validation::node_id("dst", dst)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
         let updates: Vec<(PropKeyId, Option<PropValue>)> = props
           .into_iter()
-          .map(|prop| {
-            let value_opt = match prop.value.prop_type {
-              PropType::Null => None,
-              _ => Some(prop.value.into()),
-            };
-            (prop.key_id as PropKeyId, value_opt)
-          })
-          .collect();
+          .map(JsNodeProp::into_core)
+          .collect::<Result<_>>()?;
 
         db.upsert_edge_with_props(src, etype as ETypeId, dst, updates)
           .map_err(|e| Error::from_reason(format!("Failed to upsert edge: {e}")))
@@ -2178,7 +2307,8 @@ impl Database {
 
   /// Delete an edge
   #[napi]
-  pub fn delete_edge(&self, src: f64, etype: u32, dst: f64) -> Result<()> {
+  pub fn delete_edge(&self, src: f64, etype: f64, dst: f64) -> Result<()> {
+    let etype = validation::u32_value("etype", etype)?;
     let src = validation::node_id("src", src)?;
     let dst = validation::node_id("dst", dst)?;
     match self.inner.as_ref() {
@@ -2191,7 +2321,8 @@ impl Database {
 
   /// Check if an edge exists
   #[napi]
-  pub fn edge_exists(&self, src: f64, etype: u32, dst: f64) -> Result<bool> {
+  pub fn edge_exists(&self, src: f64, etype: f64, dst: f64) -> Result<bool> {
+    let etype = validation::u32_value("etype", etype)?;
     let src = validation::node_id("src", src)?;
     let dst = validation::node_id("dst", dst)?;
     match self.inner.as_ref() {
@@ -2270,7 +2401,8 @@ impl Database {
   /// Returns an array of {src, etype, dst} objects representing all edges.
   /// Optionally filter by edge type.
   #[napi]
-  pub fn list_edges(&self, etype: Option<u32>) -> Result<Vec<JsFullEdge>> {
+  pub fn list_edges(&self, etype: Option<f64>) -> Result<Vec<JsFullEdge>> {
+    let etype = validation::opt_u32_value("etype", etype)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(
         db.list_edges(etype)
@@ -2313,7 +2445,8 @@ impl Database {
 
   /// Count edges by type
   #[napi]
-  pub fn count_edges_by_type(&self, etype: u32) -> Result<i64> {
+  pub fn count_edges_by_type(&self, etype: f64) -> Result<i64> {
+    let etype = validation::u32_value("etype", etype)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(db.count_edges_by_type(etype) as i64),
       None => Err(Error::from_reason("Database is closed")),
@@ -2374,10 +2507,7 @@ impl Database {
                   let props = db.node_props(node_id as NodeId).unwrap_or_default();
                   let props = props
                     .into_iter()
-                    .map(|(k, v)| JsNodeProp {
-                      key_id: k,
-                      value: v.into(),
-                    })
+                    .map(|(k, v)| JsNodeProp::from_core(k, v))
                     .collect();
                   NodeWithProps {
                     id: node_id as i64,
@@ -2440,10 +2570,7 @@ impl Database {
                     .unwrap_or_default();
                   let props = props
                     .into_iter()
-                    .map(|(k, v)| JsNodeProp {
-                      key_id: k,
-                      value: v.into(),
-                    })
+                    .map(|(k, v)| JsNodeProp::from_core(k, v))
                     .collect();
                   EdgeWithProps {
                     src: edge.src as i64,
@@ -2462,47 +2589,64 @@ impl Database {
   }
 
   /// Get a page of node IDs
+  ///
+  /// Pages follow node ID order, and a cursor resumes after the ID it names
+  /// even if that node has since been deleted.
   #[napi(js_name = "get_nodes_page")]
   pub fn nodes_page(&self, options: Option<PaginationOptions>) -> Result<NodePage> {
     let options = options.unwrap_or_default().into_rust()?;
-    match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => {
-        let page = streaming::nodes_page_single(db, options);
-        Ok(NodePage {
-          items: page.items.into_iter().map(|id| id as i64).collect(),
-          next_cursor: page.next_cursor,
-          has_more: page.has_more,
-          total: Some(db.count_nodes() as i64),
-        })
-      }
-      None => Err(Error::from_reason("Database is closed")),
-    }
+    let after = options
+      .cursor
+      .as_deref()
+      .map(parse_node_cursor)
+      .transpose()?;
+    let nodes = self.db()?.list_nodes();
+    let page = page_after(&nodes, after, page_limit(options.limit));
+    Ok(NodePage {
+      items: page.items.iter().map(|&id| id as i64).collect(),
+      next_cursor: page.next.map(|id| format!("n:{id}")),
+      has_more: page.next.is_some(),
+      total: Some(nodes.len() as i64),
+    })
   }
 
   /// Get a page of edges
+  ///
+  /// Pages follow (src, etype, dst) order, and a cursor resumes after the
+  /// edge it names even if that edge has since been deleted.
   #[napi(js_name = "get_edges_page")]
   pub fn edges_page(&self, options: Option<PaginationOptions>) -> Result<EdgePage> {
     let options = options.unwrap_or_default().into_rust()?;
-    match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => {
-        let page = streaming::edges_page_single(db, options);
-        Ok(EdgePage {
-          items: page
-            .items
-            .into_iter()
-            .map(|edge| JsFullEdge {
-              src: edge.src as f64,
-              etype: edge.etype,
-              dst: edge.dst as f64,
-            })
-            .collect(),
-          next_cursor: page.next_cursor,
-          has_more: page.has_more,
-          total: Some(db.count_edges() as i64),
+    let after = options
+      .cursor
+      .as_deref()
+      .map(parse_edge_cursor)
+      .transpose()?;
+    let mut edges: Vec<(NodeId, ETypeId, NodeId)> = self
+      .db()?
+      .list_edges(None)
+      .into_iter()
+      .map(|edge| (edge.src, edge.etype, edge.dst))
+      .collect();
+    edges.sort_unstable();
+    let page = page_after(&edges, after, page_limit(options.limit));
+    Ok(EdgePage {
+      items: page
+        .items
+        .iter()
+        .map(|&(src, etype, dst)| JsFullEdge {
+          src: src as f64,
+          etype,
+          dst: dst as f64,
         })
-      }
-      None => Err(Error::from_reason("Database is closed")),
-    }
+        .collect(),
+      next_cursor: page
+        .next
+        .map(|(src, etype, dst)| format!("e:{src}:{etype}:{dst}")),
+      has_more: page.next.is_some(),
+      // Counted from the same listing as the page, not by a second scan.
+      total: Some(edges.len() as i64),
+    })
   }
 
   // ========================================================================
@@ -2511,11 +2655,12 @@ impl Database {
 
   /// Set a node property
   #[napi]
-  pub fn set_node_prop(&self, node_id: f64, key_id: u32, value: JsPropValue) -> Result<()> {
+  pub fn set_node_prop(&self, node_id: f64, key_id: f64, value: JsPropValue) -> Result<()> {
+    let key_id = validation::u32_value("keyId", key_id)?;
     let node_id = validation::node_id("nodeId", node_id)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => db
-        .set_node_prop(node_id, key_id as PropKeyId, value.into())
+        .set_node_prop(node_id, key_id as PropKeyId, value.try_into()?)
         .map_err(|e| Error::from_reason(format!("Failed to set property: {e}"))),
       None => Err(Error::from_reason("Database is closed")),
     }
@@ -2532,7 +2677,7 @@ impl Database {
     let node_id = validation::node_id("nodeId", node_id)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => db
-        .set_node_prop_by_name(node_id, &key_name, value.into())
+        .set_node_prop_by_name(node_id, &key_name, value.try_into()?)
         .map_err(|e| Error::from_reason(format!("Failed to set property: {e}"))),
       None => Err(Error::from_reason("Database is closed")),
     }
@@ -2540,7 +2685,8 @@ impl Database {
 
   /// Delete a node property
   #[napi]
-  pub fn delete_node_prop(&self, node_id: f64, key_id: u32) -> Result<()> {
+  pub fn delete_node_prop(&self, node_id: f64, key_id: f64) -> Result<()> {
+    let key_id = validation::u32_value("keyId", key_id)?;
     let node_id = validation::node_id("nodeId", node_id)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => db
@@ -2552,7 +2698,8 @@ impl Database {
 
   /// Get a specific node property
   #[napi(js_name = "get_node_prop")]
-  pub fn node_prop(&self, node_id: f64, key_id: u32) -> Result<Option<JsPropValue>> {
+  pub fn node_prop(&self, node_id: f64, key_id: f64) -> Result<Option<JsPropValue>> {
+    let key_id = validation::u32_value("keyId", key_id)?;
     let node_id = validation::node_id("nodeId", node_id)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
@@ -2570,10 +2717,7 @@ impl Database {
       Some(DatabaseInner::SingleFile(db)) => Ok(db.node_props(node_id).map(|props| {
         props
           .into_iter()
-          .map(|(k, v)| JsNodeProp {
-            key_id: k,
-            value: v.into(),
-          })
+          .map(|(k, v)| JsNodeProp::from_core(k, v))
           .collect()
       })),
       None => Err(Error::from_reason("Database is closed")),
@@ -2589,11 +2733,13 @@ impl Database {
   pub fn set_edge_prop(
     &self,
     src: f64,
-    etype: u32,
+    etype: f64,
     dst: f64,
-    key_id: u32,
+    key_id: f64,
     value: JsPropValue,
   ) -> Result<()> {
+    let etype = validation::u32_value("etype", etype)?;
+    let key_id = validation::u32_value("keyId", key_id)?;
     let src = validation::node_id("src", src)?;
     let dst = validation::node_id("dst", dst)?;
     match self.inner.as_ref() {
@@ -2603,7 +2749,7 @@ impl Database {
           etype as ETypeId,
           dst,
           key_id as PropKeyId,
-          value.into(),
+          value.try_into()?,
         )
         .map_err(|e| Error::from_reason(format!("Failed to set edge property: {e}"))),
       None => Err(Error::from_reason("Database is closed")),
@@ -2615,16 +2761,17 @@ impl Database {
   pub fn set_edge_prop_by_name(
     &self,
     src: f64,
-    etype: u32,
+    etype: f64,
     dst: f64,
     key_name: String,
     value: JsPropValue,
   ) -> Result<()> {
+    let etype = validation::u32_value("etype", etype)?;
     let src = validation::node_id("src", src)?;
     let dst = validation::node_id("dst", dst)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => db
-        .set_edge_prop_by_name(src, etype as ETypeId, dst, &key_name, value.into())
+        .set_edge_prop_by_name(src, etype as ETypeId, dst, &key_name, value.try_into()?)
         .map_err(|e| Error::from_reason(format!("Failed to set edge property: {e}"))),
       None => Err(Error::from_reason("Database is closed")),
     }
@@ -2632,7 +2779,9 @@ impl Database {
 
   /// Delete an edge property
   #[napi]
-  pub fn delete_edge_prop(&self, src: f64, etype: u32, dst: f64, key_id: u32) -> Result<()> {
+  pub fn delete_edge_prop(&self, src: f64, etype: f64, dst: f64, key_id: f64) -> Result<()> {
+    let etype = validation::u32_value("etype", etype)?;
+    let key_id = validation::u32_value("keyId", key_id)?;
     let src = validation::node_id("src", src)?;
     let dst = validation::node_id("dst", dst)?;
     match self.inner.as_ref() {
@@ -2648,10 +2797,12 @@ impl Database {
   pub fn edge_prop(
     &self,
     src: f64,
-    etype: u32,
+    etype: f64,
     dst: f64,
-    key_id: u32,
+    key_id: f64,
   ) -> Result<Option<JsPropValue>> {
+    let etype = validation::u32_value("etype", etype)?;
+    let key_id = validation::u32_value("keyId", key_id)?;
     let src = validation::node_id("src", src)?;
     let dst = validation::node_id("dst", dst)?;
     match self.inner.as_ref() {
@@ -2665,7 +2816,8 @@ impl Database {
 
   /// Get all properties for an edge (returns array of {key_id, value} pairs)
   #[napi(js_name = "get_edge_props")]
-  pub fn edge_props(&self, src: f64, etype: u32, dst: f64) -> Result<Option<Vec<JsNodeProp>>> {
+  pub fn edge_props(&self, src: f64, etype: f64, dst: f64) -> Result<Option<Vec<JsNodeProp>>> {
+    let etype = validation::u32_value("etype", etype)?;
     let src = validation::node_id("src", src)?;
     let dst = validation::node_id("dst", dst)?;
     match self.inner.as_ref() {
@@ -2673,10 +2825,7 @@ impl Database {
         Ok(db.edge_props(src, etype as ETypeId, dst).map(|props| {
           props
             .into_iter()
-            .map(|(k, v)| JsNodeProp {
-              key_id: k,
-              value: v.into(),
-            })
+            .map(|(k, v)| JsNodeProp::from_core(k, v))
             .collect()
         }))
       }
@@ -2690,9 +2839,15 @@ impl Database {
 
   /// Set a vector embedding for a node
   #[napi]
-  pub fn set_node_vector(&self, node_id: f64, prop_key_id: u32, vector: Vec<f64>) -> Result<()> {
+  pub fn set_node_vector(
+    &self,
+    node_id: f64,
+    prop_key_id: f64,
+    vector: Either<Float32ArraySlice<'_>, Vec<f64>>,
+  ) -> Result<()> {
+    let prop_key_id = validation::u32_value("propKeyId", prop_key_id)?;
     let node_id = validation::node_id("nodeId", node_id)?;
-    let vector_f32: Vec<f32> = vector.iter().map(|&v| v as f32).collect();
+    let vector_f32 = js_vector_f32(&vector);
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => db
         .set_node_vector(node_id, prop_key_id as PropKeyId, &vector_f32)
@@ -2703,7 +2858,8 @@ impl Database {
 
   /// Get a vector embedding for a node
   #[napi(js_name = "get_node_vector")]
-  pub fn node_vector(&self, node_id: f64, prop_key_id: u32) -> Result<Option<Vec<f64>>> {
+  pub fn node_vector(&self, node_id: f64, prop_key_id: f64) -> Result<Option<Vec<f64>>> {
+    let prop_key_id = validation::u32_value("propKeyId", prop_key_id)?;
     let node_id = validation::node_id("nodeId", node_id)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(
@@ -2716,7 +2872,8 @@ impl Database {
 
   /// Delete a vector embedding for a node
   #[napi]
-  pub fn delete_node_vector(&self, node_id: f64, prop_key_id: u32) -> Result<()> {
+  pub fn delete_node_vector(&self, node_id: f64, prop_key_id: f64) -> Result<()> {
+    let prop_key_id = validation::u32_value("propKeyId", prop_key_id)?;
     let node_id = validation::node_id("nodeId", node_id)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => db
@@ -2728,7 +2885,8 @@ impl Database {
 
   /// Check if a node has a vector embedding
   #[napi]
-  pub fn has_node_vector(&self, node_id: f64, prop_key_id: u32) -> Result<bool> {
+  pub fn has_node_vector(&self, node_id: f64, prop_key_id: f64) -> Result<bool> {
+    let prop_key_id = validation::u32_value("propKeyId", prop_key_id)?;
     let node_id = validation::node_id("nodeId", node_id)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
@@ -2764,7 +2922,8 @@ impl Database {
 
   /// Get label name by ID
   #[napi(js_name = "get_label_name")]
-  pub fn label_name(&self, id: u32) -> Result<Option<String>> {
+  pub fn label_name(&self, id: f64) -> Result<Option<String>> {
+    let id = validation::u32_value("id", id)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(db.label_name(id)),
       None => Err(Error::from_reason("Database is closed")),
@@ -2793,7 +2952,8 @@ impl Database {
 
   /// Get edge type name by ID
   #[napi(js_name = "get_etype_name")]
-  pub fn etype_name(&self, id: u32) -> Result<Option<String>> {
+  pub fn etype_name(&self, id: f64) -> Result<Option<String>> {
+    let id = validation::u32_value("id", id)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(db.etype_name(id)),
       None => Err(Error::from_reason("Database is closed")),
@@ -2822,7 +2982,8 @@ impl Database {
 
   /// Get property key name by ID
   #[napi(js_name = "get_propkey_name")]
-  pub fn propkey_name(&self, id: u32) -> Result<Option<String>> {
+  pub fn propkey_name(&self, id: f64) -> Result<Option<String>> {
+    let id = validation::u32_value("id", id)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(db.propkey_name(id)),
       None => Err(Error::from_reason("Database is closed")),
@@ -2846,7 +3007,8 @@ impl Database {
 
   /// Add a label to a node
   #[napi]
-  pub fn add_node_label(&self, node_id: f64, label_id: u32) -> Result<()> {
+  pub fn add_node_label(&self, node_id: f64, label_id: f64) -> Result<()> {
+    let label_id = validation::u32_value("labelId", label_id)?;
     let node_id = validation::node_id("nodeId", node_id)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => db
@@ -2870,7 +3032,8 @@ impl Database {
 
   /// Remove a label from a node
   #[napi]
-  pub fn remove_node_label(&self, node_id: f64, label_id: u32) -> Result<()> {
+  pub fn remove_node_label(&self, node_id: f64, label_id: f64) -> Result<()> {
+    let label_id = validation::u32_value("labelId", label_id)?;
     let node_id = validation::node_id("nodeId", node_id)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => db
@@ -2882,7 +3045,8 @@ impl Database {
 
   /// Check if a node has a label
   #[napi]
-  pub fn node_has_label(&self, node_id: f64, label_id: u32) -> Result<bool> {
+  pub fn node_has_label(&self, node_id: f64, label_id: f64) -> Result<bool> {
+    let label_id = validation::u32_value("labelId", label_id)?;
     let node_id = validation::node_id("nodeId", node_id)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => Ok(db.node_has_label(node_id, label_id)),
@@ -2915,8 +3079,9 @@ impl Database {
     &self,
     start_nodes: Vec<f64>,
     direction: JsTraversalDirection,
-    edge_type: Option<u32>,
+    edge_type: Option<f64>,
   ) -> Result<Vec<JsTraversalResult>> {
+    let edge_type = validation::opt_u32_value("edgeType", edge_type)?;
     let start = validation::node_ids("startNodes", &start_nodes)?;
     let etype = edge_type;
 
@@ -2950,15 +3115,16 @@ impl Database {
     &self,
     start_nodes: Vec<f64>,
     steps: Vec<JsTraversalStep>,
-    limit: Option<u32>,
+    limit: Option<f64>,
   ) -> Result<Vec<JsTraversalResult>> {
+    let limit = validation::opt_u32_value("limit", limit)?;
     let start = validation::node_ids("startNodes", &start_nodes)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
         let mut builder = RustTraversalBuilder::new(start);
 
         for step in steps {
-          let etype = step.edge_type;
+          let etype = step.etype()?;
           builder = match step.direction {
             JsTraversalDirection::Out => builder.out(etype),
             JsTraversalDirection::In => builder.r#in(etype),
@@ -2992,9 +3158,10 @@ impl Database {
   pub fn traverse_depth(
     &self,
     start_nodes: Vec<f64>,
-    edge_type: Option<u32>,
+    edge_type: Option<f64>,
     options: JsTraverseOptions,
   ) -> Result<Vec<JsTraversalResult>> {
+    let edge_type = validation::opt_u32_value("edgeType", edge_type)?;
     let start = validation::node_ids("startNodes", &start_nodes)?;
     let opts = options.to_rust()?;
 
@@ -3023,7 +3190,7 @@ impl Database {
         let mut builder = RustTraversalBuilder::new(start);
 
         for step in steps {
-          let etype = step.edge_type;
+          let etype = step.etype()?;
           builder = match step.direction {
             JsTraversalDirection::Out => builder.out(etype),
             JsTraversalDirection::In => builder.r#in(etype),
@@ -3051,15 +3218,16 @@ impl Database {
     &self,
     start_nodes: Vec<f64>,
     steps: Vec<JsTraversalStep>,
-    limit: Option<u32>,
+    limit: Option<f64>,
   ) -> Result<Vec<i64>> {
+    let limit = validation::opt_u32_value("limit", limit)?;
     let start = validation::node_ids("startNodes", &start_nodes)?;
     match self.inner.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
         let mut builder = RustTraversalBuilder::new(start);
 
         for step in steps {
-          let etype = step.edge_type;
+          let etype = step.etype()?;
           builder = match step.direction {
             JsTraversalDirection::Out => builder.out(etype),
             JsTraversalDirection::In => builder.r#in(etype),
@@ -3096,21 +3264,16 @@ impl Database {
   /// @returns Path result with nodes, edges, and weight
   #[napi]
   pub fn dijkstra(&self, config: JsPathConfig) -> Result<JsPathResult> {
-    match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => {
-        let weight_key = resolve_weight_key_single_file(db, &config)?;
-        let rust_config = config.to_rust()?;
-        Ok(
-          dijkstra(
-            rust_config,
-            |node_id, dir, etype| neighbors_from_single_file(db, node_id, dir, etype),
-            |src, etype, dst| edge_weight_from_single_file(db, src, etype, dst, weight_key),
-          )
-          .into(),
-        )
-      }
-      None => Err(Error::from_reason("Database is closed")),
-    }
+    let db = self.db()?;
+    let weights = EdgeWeights::new(db, &config)?;
+    let rust_config = config.to_rust()?;
+    let result = dijkstra(
+      rust_config,
+      |node_id, dir, etype| neighbors_from_single_file(db, node_id, dir, etype),
+      |src, etype, dst| weights.get(src, etype, dst),
+    );
+    weights.check()?;
+    Ok(result.into())
   }
 
   /// Find shortest path using BFS (unweighted)
@@ -3139,26 +3302,19 @@ impl Database {
   /// @param k - Maximum number of paths to find
   /// @returns Array of path results sorted by weight
   #[napi]
-  pub fn k_shortest(&self, config: JsPathConfig, k: u32) -> Result<Vec<JsPathResult>> {
-    match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => {
-        let weight_key = resolve_weight_key_single_file(db, &config)?;
-        let rust_config = config.to_rust()?;
-        let k = validation::non_negative_usize("k", k as i64, validation::MAX_COUNT)?;
-        Ok(
-          yen_k_shortest(
-            rust_config,
-            k,
-            |node_id, dir, etype| neighbors_from_single_file(db, node_id, dir, etype),
-            |src, etype, dst| edge_weight_from_single_file(db, src, etype, dst, weight_key),
-          )
-          .into_iter()
-          .map(JsPathResult::from)
-          .collect(),
-        )
-      }
-      None => Err(Error::from_reason("Database is closed")),
-    }
+  pub fn k_shortest(&self, config: JsPathConfig, k: f64) -> Result<Vec<JsPathResult>> {
+    let k = validation::count("k", k, validation::MAX_COUNT)?;
+    let db = self.db()?;
+    let weights = EdgeWeights::new(db, &config)?;
+    let rust_config = config.to_rust()?;
+    let paths = yen_k_shortest(
+      rust_config,
+      k,
+      |node_id, dir, etype| neighbors_from_single_file(db, node_id, dir, etype),
+      |src, etype, dst| weights.get(src, etype, dst),
+    );
+    weights.check()?;
+    Ok(paths.into_iter().map(JsPathResult::from).collect())
   }
 
   /// Find shortest path between two nodes (convenience method)
@@ -3173,8 +3329,8 @@ impl Database {
     &self,
     source: f64,
     target: f64,
-    edge_type: Option<u32>,
-    max_depth: Option<u32>,
+    edge_type: Option<f64>,
+    max_depth: Option<f64>,
   ) -> Result<JsPathResult> {
     let config = JsPathConfig {
       source,
@@ -3202,8 +3358,8 @@ impl Database {
     &self,
     source: f64,
     target: f64,
-    edge_type: Option<u32>,
-    max_depth: Option<u32>,
+    edge_type: Option<f64>,
+    max_depth: Option<f64>,
   ) -> Result<bool> {
     Ok(
       self
@@ -3222,12 +3378,12 @@ impl Database {
   pub fn reachable_nodes(
     &self,
     source: f64,
-    max_depth: u32,
-    edge_type: Option<u32>,
+    max_depth: f64,
+    edge_type: Option<f64>,
   ) -> Result<Vec<i64>> {
     let opts = JsTraverseOptions {
       direction: Some(JsTraversalDirection::Out),
-      min_depth: Some(1),
+      min_depth: Some(1.0),
       max_depth,
       unique: Some(true),
     };
@@ -3248,12 +3404,17 @@ impl Database {
   /// Perform a checkpoint (compact WAL into snapshot)
   #[napi]
   pub fn checkpoint(&self) -> Result<()> {
-    match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => db
-        .checkpoint()
-        .map_err(|e| Error::from_reason(format!("Failed to checkpoint: {e}"))),
-      None => Err(Error::from_reason("Database is closed")),
-    }
+    checkpoint_on(self.db()?)
+  }
+
+  /// Perform a checkpoint on the libuv thread pool. Rejects when called
+  /// inside a transaction, like `checkpoint()`.
+  #[napi(ts_return_type = "Promise<void>")]
+  pub fn checkpoint_async(&self) -> AsyncTask<BlockingTask<()>> {
+    BlockingTask::spawn((|| -> Result<_> {
+      let db = self.shared_db_outside_tx("checkpointAsync")?;
+      Ok(move || checkpoint_on(&db))
+    })())
   }
 
   /// Perform a background (non-blocking) checkpoint
@@ -3283,12 +3444,16 @@ impl Database {
   /// (equivalent to optimizeSingleFile in the TypeScript API).
   #[napi]
   pub fn optimize(&mut self) -> Result<()> {
-    match self.inner.as_mut() {
-      Some(DatabaseInner::SingleFile(db)) => db
-        .optimize_single_file(None)
-        .map_err(|e| Error::from_reason(format!("Failed to optimize: {e}"))),
-      None => Err(Error::from_reason("Database is closed")),
-    }
+    optimize_on(self.db()?)
+  }
+
+  /// Optimize (compact) the database on the libuv thread pool.
+  #[napi(ts_return_type = "Promise<void>")]
+  pub fn optimize_async(&self) -> AsyncTask<BlockingTask<()>> {
+    BlockingTask::spawn((|| -> Result<_> {
+      let db = self.shared_db_outside_tx("optimizeAsync")?;
+      Ok(move || optimize_on(&db))
+    })())
   }
 
   /// Optimize (compact) a single-file database with options
@@ -3309,12 +3474,17 @@ impl Database {
   #[napi]
   pub fn vacuum(&mut self, options: Option<VacuumOptions>) -> Result<()> {
     let options = options.map(VacuumOptions::into_rust).transpose()?;
-    match self.inner.as_mut() {
-      Some(DatabaseInner::SingleFile(db)) => db
-        .vacuum_single_file(options)
-        .map_err(|e| Error::from_reason(format!("Failed to vacuum: {e}"))),
-      None => Err(Error::from_reason("Database is closed")),
-    }
+    vacuum_on(self.db()?, options)
+  }
+
+  /// Vacuum a single-file database on the libuv thread pool.
+  #[napi(ts_return_type = "Promise<void>")]
+  pub fn vacuum_async(&self, options: Option<VacuumOptions>) -> AsyncTask<BlockingTask<()>> {
+    BlockingTask::spawn((|| -> Result<_> {
+      let options = options.map(VacuumOptions::into_rust).transpose()?;
+      let db = self.shared_db_outside_tx("vacuumAsync")?;
+      Ok(move || vacuum_on(&db, options))
+    })())
   }
 
   /// Vacuum a single-file database to reclaim free space
@@ -3383,23 +3553,16 @@ impl Database {
   // ========================================================================
 
   /// Export database to a JSON object
-  #[napi]
-  pub fn export_to_object(&self, options: Option<ExportOptions>) -> Result<serde_json::Value> {
-    let opts = options.unwrap_or(ExportOptions {
-      include_nodes: None,
-      include_edges: None,
-      include_schema: None,
-      pretty: None,
-    });
-    let opts = opts.into_rust();
-
-    let data = match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => ray_export::export_to_object_single(db, opts)
-        .map_err(|e| Error::from_reason(e.to_string()))?,
-      None => return Err(Error::from_reason("Database is closed")),
-    };
-
-    serde_json::to_value(data).map_err(|e| Error::from_reason(e.to_string()))
+  #[napi(ts_return_type = "any")]
+  pub fn export_to_object<'env>(
+    &self,
+    env: &'env Env,
+    options: Option<ExportOptions>,
+  ) -> Result<Object<'env>> {
+    let opts = ExportOptions::rust_or_default(options);
+    let data = ray_export::export_to_object_single(self.db()?, opts)
+      .map_err(|e| Error::from_reason(e.to_string()))?;
+    exported_database_to_js(env, data)
   }
 
   /// Export database to a JSON file
@@ -3409,28 +3572,21 @@ impl Database {
     path: String,
     options: Option<ExportOptions>,
   ) -> Result<ExportResult> {
-    let opts = options.unwrap_or(ExportOptions {
-      include_nodes: None,
-      include_edges: None,
-      include_schema: None,
-      pretty: None,
-    });
-    let rust_opts = opts.into_rust();
+    export_json_on(self.db()?, path, ExportOptions::rust_or_default(options))
+  }
 
-    let data = match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => {
-        ray_export::export_to_object_single(db, rust_opts.clone())
-          .map_err(|e| Error::from_reason(e.to_string()))?
-      }
-      None => return Err(Error::from_reason("Database is closed")),
-    };
-
-    let result = ray_export::export_to_json(&data, path, rust_opts.pretty)
-      .map_err(|e| Error::from_reason(e.to_string()))?;
-    Ok(ExportResult {
-      node_count: result.node_count as i64,
-      edge_count: result.edge_count as i64,
-    })
+  /// Export database to a JSON file on the libuv thread pool
+  #[napi(ts_return_type = "Promise<ExportResult>")]
+  pub fn export_to_json_async(
+    &self,
+    path: String,
+    options: Option<ExportOptions>,
+  ) -> AsyncTask<BlockingTask<ExportResult>> {
+    BlockingTask::spawn((|| -> Result<_> {
+      let opts = ExportOptions::rust_or_default(options);
+      let db = self.shared_db_outside_tx("exportToJsonAsync")?;
+      Ok(move || export_json_on(&db, path, opts))
+    })())
   }
 
   /// Export database to JSONL
@@ -3440,56 +3596,34 @@ impl Database {
     path: String,
     options: Option<ExportOptions>,
   ) -> Result<ExportResult> {
-    let opts = options.unwrap_or(ExportOptions {
-      include_nodes: None,
-      include_edges: None,
-      include_schema: None,
-      pretty: None,
-    });
-    let rust_opts = opts.into_rust();
+    export_jsonl_on(self.db()?, path, ExportOptions::rust_or_default(options))
+  }
 
-    let data = match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => ray_export::export_to_object_single(db, rust_opts)
-        .map_err(|e| Error::from_reason(e.to_string()))?,
-      None => return Err(Error::from_reason("Database is closed")),
-    };
-
-    let result =
-      ray_export::export_to_jsonl(&data, path).map_err(|e| Error::from_reason(e.to_string()))?;
-    Ok(ExportResult {
-      node_count: result.node_count as i64,
-      edge_count: result.edge_count as i64,
-    })
+  /// Export database to JSONL on the libuv thread pool
+  #[napi(ts_return_type = "Promise<ExportResult>")]
+  pub fn export_to_jsonl_async(
+    &self,
+    path: String,
+    options: Option<ExportOptions>,
+  ) -> AsyncTask<BlockingTask<ExportResult>> {
+    BlockingTask::spawn((|| -> Result<_> {
+      let opts = ExportOptions::rust_or_default(options);
+      let db = self.shared_db_outside_tx("exportToJsonlAsync")?;
+      Ok(move || export_jsonl_on(&db, path, opts))
+    })())
   }
 
   /// Import database from a JSON object
-  #[napi]
+  #[napi(ts_args_type = "data: any, options?: ImportOptions | undefined | null")]
   pub fn import_from_object(
     &self,
-    data: serde_json::Value,
+    env: &Env,
+    data: Object,
     options: Option<ImportOptions>,
   ) -> Result<ImportResult> {
-    let opts = options.unwrap_or(ImportOptions {
-      skip_existing: None,
-      batch_size: None,
-    });
-    let rust_opts = opts.into_rust()?;
-    let parsed: ray_export::ExportedDatabase =
-      serde_json::from_value(data).map_err(|e| Error::from_reason(e.to_string()))?;
-
-    let result = match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => {
-        ray_export::import_from_object_single(db, &parsed, rust_opts)
-          .map_err(|e| Error::from_reason(e.to_string()))?
-      }
-      None => return Err(Error::from_reason("Database is closed")),
-    };
-
-    Ok(ImportResult {
-      node_count: result.node_count as i64,
-      edge_count: result.edge_count as i64,
-      skipped: result.skipped as i64,
-    })
+    let rust_opts = ImportOptions::rust_or_default(options)?;
+    let parsed = exported_database_from_js(env, &data)?;
+    import_on(self.db()?, &parsed, rust_opts)
   }
 
   /// Import database from a JSON file
@@ -3499,170 +3633,105 @@ impl Database {
     path: String,
     options: Option<ImportOptions>,
   ) -> Result<ImportResult> {
-    let opts = options.unwrap_or(ImportOptions {
-      skip_existing: None,
-      batch_size: None,
-    });
-    let rust_opts = opts.into_rust()?;
-    let parsed =
-      ray_export::import_from_json(path).map_err(|e| Error::from_reason(e.to_string()))?;
+    let rust_opts = ImportOptions::rust_or_default(options)?;
+    import_json_on(self.db()?, path, rust_opts)
+  }
 
-    let result = match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => {
-        ray_export::import_from_object_single(db, &parsed, rust_opts)
-          .map_err(|e| Error::from_reason(e.to_string()))?
-      }
-      None => return Err(Error::from_reason("Database is closed")),
-    };
-
-    Ok(ImportResult {
-      node_count: result.node_count as i64,
-      edge_count: result.edge_count as i64,
-      skipped: result.skipped as i64,
-    })
+  /// Import database from a JSON file on the libuv thread pool
+  #[napi(ts_return_type = "Promise<ImportResult>")]
+  pub fn import_from_json_async(
+    &self,
+    path: String,
+    options: Option<ImportOptions>,
+  ) -> AsyncTask<BlockingTask<ImportResult>> {
+    BlockingTask::spawn((|| -> Result<_> {
+      let rust_opts = ImportOptions::rust_or_default(options)?;
+      let db = self.shared_db_outside_tx("importFromJsonAsync")?;
+      Ok(move || import_json_on(&db, path, rust_opts))
+    })())
   }
 
   // ========================================================================
-  // Cache Operations
+  // Cache Operations (deprecated no-ops: the cache layer was removed)
   // ========================================================================
 
-  /// Check if caching is enabled
+  /// Fails like every other method once the database is closed.
+  fn removed_cache_op(&self) -> Result<()> {
+    match self.inner.as_ref() {
+      Some(DatabaseInner::SingleFile(_)) => Ok(()),
+      None => Err(Error::from_reason("Database is closed")),
+    }
+  }
+
+  /// @deprecated The cache layer was removed; always false.
   #[napi]
   pub fn cache_is_enabled(&self) -> Result<bool> {
-    match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => Ok(db.cache_is_enabled()),
-      None => Err(Error::from_reason("Database is closed")),
-    }
+    self.removed_cache_op().map(|()| false)
   }
 
-  /// Invalidate all caches for a node
+  /// @deprecated No effect: the cache layer was removed.
   #[napi]
   pub fn cache_invalidate_node(&self, node_id: f64) -> Result<()> {
-    let node_id = validation::node_id("nodeId", node_id)?;
-    match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => {
-        db.cache_invalidate_node(node_id);
-        Ok(())
-      }
-      None => Err(Error::from_reason("Database is closed")),
-    }
+    validation::node_id("nodeId", node_id)?;
+    self.removed_cache_op()
   }
 
-  /// Invalidate caches for a specific edge
+  /// @deprecated No effect: the cache layer was removed.
   #[napi]
-  pub fn cache_invalidate_edge(&self, src: f64, etype: u32, dst: f64) -> Result<()> {
-    let src = validation::node_id("src", src)?;
-    let dst = validation::node_id("dst", dst)?;
-    match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => {
-        db.cache_invalidate_edge(src, etype as ETypeId, dst);
-        Ok(())
-      }
-      None => Err(Error::from_reason("Database is closed")),
-    }
+  pub fn cache_invalidate_edge(&self, src: f64, etype: f64, dst: f64) -> Result<()> {
+    validation::u32_value("etype", etype)?;
+    validation::node_id("src", src)?;
+    validation::node_id("dst", dst)?;
+    self.removed_cache_op()
   }
 
-  /// Invalidate a cached key lookup
+  /// @deprecated No effect: the cache layer was removed.
   #[napi]
   pub fn cache_invalidate_key(&self, key: String) -> Result<()> {
-    match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => {
-        db.cache_invalidate_key(&key);
-        Ok(())
-      }
-      None => Err(Error::from_reason("Database is closed")),
-    }
+    let _ = key;
+    self.removed_cache_op()
   }
 
-  /// Clear all caches
+  /// @deprecated No effect: the cache layer was removed.
   #[napi]
   pub fn cache_clear(&self) -> Result<()> {
-    match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => {
-        db.cache_clear();
-        Ok(())
-      }
-      None => Err(Error::from_reason("Database is closed")),
-    }
+    self.removed_cache_op()
   }
 
-  /// Clear only the query cache
+  /// @deprecated No effect: the cache layer was removed.
   #[napi]
   pub fn cache_clear_query(&self) -> Result<()> {
-    match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => {
-        db.cache_clear_query();
-        Ok(())
-      }
-      None => Err(Error::from_reason("Database is closed")),
-    }
+    self.removed_cache_op()
   }
 
-  /// Clear only the key cache
+  /// @deprecated No effect: the cache layer was removed.
   #[napi]
   pub fn cache_clear_key(&self) -> Result<()> {
-    match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => {
-        db.cache_clear_key();
-        Ok(())
-      }
-      None => Err(Error::from_reason("Database is closed")),
-    }
+    self.removed_cache_op()
   }
 
-  /// Clear only the property cache
+  /// @deprecated No effect: the cache layer was removed.
   #[napi]
   pub fn cache_clear_property(&self) -> Result<()> {
-    match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => {
-        db.cache_clear_property();
-        Ok(())
-      }
-      None => Err(Error::from_reason("Database is closed")),
-    }
+    self.removed_cache_op()
   }
 
-  /// Clear only the traversal cache
+  /// @deprecated No effect: the cache layer was removed.
   #[napi]
   pub fn cache_clear_traversal(&self) -> Result<()> {
-    match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => {
-        db.cache_clear_traversal();
-        Ok(())
-      }
-      None => Err(Error::from_reason("Database is closed")),
-    }
+    self.removed_cache_op()
   }
 
-  /// Get cache statistics
+  /// @deprecated The cache layer was removed; always null.
   #[napi]
   pub fn cache_stats(&self) -> Result<Option<JsCacheStats>> {
-    match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => Ok(db.cache_stats().map(|s| JsCacheStats {
-        property_cache_hits: s.property_cache_hits as i64,
-        property_cache_misses: s.property_cache_misses as i64,
-        property_cache_size: s.property_cache_size as i64,
-        traversal_cache_hits: s.traversal_cache_hits as i64,
-        traversal_cache_misses: s.traversal_cache_misses as i64,
-        traversal_cache_size: s.traversal_cache_size as i64,
-        query_cache_hits: s.query_cache_hits as i64,
-        query_cache_misses: s.query_cache_misses as i64,
-        query_cache_size: s.query_cache_size as i64,
-      })),
-      None => Err(Error::from_reason("Database is closed")),
-    }
+    self.removed_cache_op().map(|()| None)
   }
 
-  /// Reset cache statistics
+  /// @deprecated No effect: the cache layer was removed.
   #[napi]
   pub fn cache_reset_stats(&self) -> Result<()> {
-    match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => {
-        db.cache_reset_stats();
-        Ok(())
-      }
-      None => Err(Error::from_reason("Database is closed")),
-    }
+    self.removed_cache_op()
   }
 
   // ========================================================================
@@ -3675,11 +3744,135 @@ impl Database {
       None => Err(Error::from_reason("Database is closed")),
     }
   }
+
+  /// A handle for an `*Async` call to use on the thread pool.
+  fn shared_db(&self) -> Result<Arc<RustSingleFileDB>> {
+    match self.inner.as_ref() {
+      Some(DatabaseInner::SingleFile(db)) => Ok(Arc::clone(db)),
+      None => Err(Error::from_reason("Database is closed")),
+    }
+  }
+
+  /// A handle for an `*Async` call that must not run inside a transaction.
+  ///
+  /// Transactions belong to the thread that began them, and the pool thread
+  /// cannot see this one's: the call would miss its writes or, for a
+  /// checkpoint, wait forever for it to end. Rejecting matches what the
+  /// synchronous calls do for their own transaction.
+  fn shared_db_outside_tx(&self, call: &str) -> Result<Arc<RustSingleFileDB>> {
+    let db = self.shared_db()?;
+    if db.has_transaction() {
+      return Err(Error::from_reason(format!(
+        "{call} cannot run inside a transaction: commit or roll back first"
+      )));
+    }
+    Ok(db)
+  }
+
+  /// Take the database out of this handle to close it.
+  fn take_for_close(&mut self) -> Result<Option<RustSingleFileDB>> {
+    let Some(DatabaseInner::SingleFile(db)) = self.inner.take() else {
+      return Ok(None);
+    };
+    match Arc::try_unwrap(db) {
+      Ok(db) => Ok(Some(db)),
+      Err(db) => {
+        self.inner = Some(DatabaseInner::SingleFile(db));
+        Err(Error::from_reason(
+          "Database is busy: an async call on it is still running; await it before closing",
+        ))
+      }
+    }
+  }
 }
 
 // ============================================================================
 // Helper Functions
 // ============================================================================
+
+// Bodies shared by the synchronous calls and their `*Async` variants.
+
+fn parse_token_wait(token: &str, timeout_ms: i64) -> Result<(CommitToken, u64)> {
+  let timeout_ms =
+    validation::non_negative_u64("timeoutMs", timeout_ms, validation::MAX_DURATION_MS as u64)?;
+  let token = CommitToken::from_str(token)
+    .map_err(|e| Error::from_reason(format!("Invalid commit token: {e}")))?;
+  Ok((token, timeout_ms))
+}
+
+fn wait_for_token_on(db: &RustSingleFileDB, token: CommitToken, timeout_ms: u64) -> Result<bool> {
+  db.wait_for_token(token, timeout_ms)
+    .map_err(|e| Error::from_reason(format!("Failed waiting for token: {e}")))
+}
+
+fn checkpoint_on(db: &RustSingleFileDB) -> Result<()> {
+  db.checkpoint()
+    .map_err(|e| Error::from_reason(format!("Failed to checkpoint: {e}")))
+}
+
+fn optimize_on(db: &RustSingleFileDB) -> Result<()> {
+  db.optimize_single_file(None)
+    .map_err(|e| Error::from_reason(format!("Failed to optimize: {e}")))
+}
+
+fn vacuum_on(db: &RustSingleFileDB, options: Option<RustVacuumOptions>) -> Result<()> {
+  db.vacuum_single_file(options)
+    .map_err(|e| Error::from_reason(format!("Failed to vacuum: {e}")))
+}
+
+fn export_json_on(
+  db: &RustSingleFileDB,
+  path: String,
+  options: ray_export::ExportOptions,
+) -> Result<ExportResult> {
+  let pretty = options.pretty;
+  let data = ray_export::export_to_object_single(db, options)
+    .map_err(|e| Error::from_reason(e.to_string()))?;
+  let result = ray_export::export_to_json(&data, path, pretty)
+    .map_err(|e| Error::from_reason(e.to_string()))?;
+  Ok(ExportResult {
+    node_count: result.node_count as i64,
+    edge_count: result.edge_count as i64,
+  })
+}
+
+fn export_jsonl_on(
+  db: &RustSingleFileDB,
+  path: String,
+  options: ray_export::ExportOptions,
+) -> Result<ExportResult> {
+  let data = ray_export::export_to_object_single(db, options)
+    .map_err(|e| Error::from_reason(e.to_string()))?;
+  let result =
+    ray_export::export_to_jsonl(&data, path).map_err(|e| Error::from_reason(e.to_string()))?;
+  Ok(ExportResult {
+    node_count: result.node_count as i64,
+    edge_count: result.edge_count as i64,
+  })
+}
+
+fn import_on(
+  db: &RustSingleFileDB,
+  data: &ray_export::ExportedDatabase,
+  options: ray_export::ImportOptions,
+) -> Result<ImportResult> {
+  let result = ray_export::import_from_object_single(db, data, options)
+    .map_err(|e| Error::from_reason(e.to_string()))?;
+  Ok(ImportResult {
+    node_count: result.node_count as i64,
+    edge_count: result.edge_count as i64,
+    skipped: result.skipped as i64,
+  })
+}
+
+fn import_json_on(
+  db: &RustSingleFileDB,
+  path: String,
+  options: ray_export::ImportOptions,
+) -> Result<ImportResult> {
+  let data = ray_export::import_from_json(path).map_err(|e| Error::from_reason(e.to_string()))?;
+  import_on(db, &data, options)
+}
 
 /// Get neighbors from database for traversal
 fn neighbors_from_single_file(
@@ -3734,7 +3927,7 @@ fn resolve_weight_key_single_file(
   db: &RustSingleFileDB,
   config: &JsPathConfig,
 ) -> Result<Option<PropKeyId>> {
-  if let Some(key_id) = config.weight_key_id {
+  if let Some(key_id) = config.weight_key_id()? {
     return Ok(Some(key_id as PropKeyId));
   }
 
@@ -3748,40 +3941,231 @@ fn resolve_weight_key_single_file(
   Ok(None)
 }
 
-fn prop_value_to_weight(value: Option<PropValue>) -> f64 {
-  let weight = match value {
-    Some(PropValue::Bool(v)) => {
-      if v {
-        1.0
-      } else {
-        0.0
+/// Edge weights for DB-backed Dijkstra, read from an edge property.
+///
+/// An edge without the property weighs 1.0, and 0 is a valid weight. A weight
+/// Dijkstra cannot use (negative, NaN, not a number) fails the search: it is
+/// recorded and reported by `check` once the search returns, since the
+/// search's weight callback cannot fail.
+struct EdgeWeights<'a> {
+  db: &'a RustSingleFileDB,
+  key: Option<PropKeyId>,
+  invalid: RefCell<Option<String>>,
+}
+
+impl<'a> EdgeWeights<'a> {
+  fn new(db: &'a RustSingleFileDB, config: &JsPathConfig) -> Result<Self> {
+    Ok(Self {
+      db,
+      key: resolve_weight_key_single_file(db, config)?,
+      invalid: RefCell::new(None),
+    })
+  }
+
+  fn get(&self, src: NodeId, etype: ETypeId, dst: NodeId) -> f64 {
+    let Some(key_id) = self.key else {
+      return 1.0;
+    };
+    match prop_value_to_weight(self.db.edge_prop(src, etype, dst, key_id)) {
+      Ok(weight) => weight,
+      Err(reason) => {
+        self
+          .invalid
+          .borrow_mut()
+          .get_or_insert_with(|| format!("edge {src}->{dst} (etype {etype}): {reason}"));
+        // Never the cheaper route, so the search ends normally.
+        f64::INFINITY
       }
     }
-    Some(PropValue::I64(v)) => v as f64,
-    Some(PropValue::F64(v)) => v,
-    Some(PropValue::String(v)) => v.parse::<f64>().unwrap_or(1.0),
-    Some(PropValue::VectorF32(_)) => 1.0,
-    Some(PropValue::Null) | None => 1.0,
-  };
+  }
 
-  if weight.is_finite() && weight > 0.0 {
-    weight
-  } else {
-    1.0
+  fn check(&self) -> Result<()> {
+    match self.invalid.borrow_mut().take() {
+      Some(reason) => Err(validation::invalid_argument(format!(
+        "Invalid edge weight on {reason}"
+      ))),
+      None => Ok(()),
+    }
   }
 }
 
-fn edge_weight_from_single_file(
-  db: &RustSingleFileDB,
-  src: NodeId,
-  etype: ETypeId,
-  dst: NodeId,
-  weight_key: Option<PropKeyId>,
-) -> f64 {
-  match weight_key {
-    Some(key_id) => prop_value_to_weight(db.edge_prop(src, etype, dst, key_id)),
-    None => 1.0,
+fn prop_value_to_weight(value: Option<PropValue>) -> std::result::Result<f64, String> {
+  match value {
+    Some(PropValue::Null) | None => Ok(1.0),
+    Some(PropValue::Bool(v)) => Ok(if v { 1.0 } else { 0.0 }),
+    Some(PropValue::I64(v)) => check_weight(v as f64),
+    Some(PropValue::F64(v)) => check_weight(v),
+    Some(PropValue::String(v)) => match v.trim().parse::<f64>() {
+      Ok(weight) => check_weight(weight),
+      Err(_) => Err(format!("weight \"{v}\" is not a number")),
+    },
+    Some(PropValue::VectorF32(_)) => Err("a vector is not a weight".to_string()),
   }
+}
+
+// ============================================================================
+// Pagination
+// ============================================================================
+
+/// One page of a sorted listing.
+struct PageSlice<'a, T> {
+  items: &'a [T],
+  /// The last item, when more items follow it.
+  next: Option<T>,
+}
+
+/// Page size: 0 keeps the default of 100.
+fn page_limit(limit: usize) -> usize {
+  if limit == 0 {
+    100
+  } else {
+    limit
+  }
+}
+
+/// The `limit` items of `sorted` that come after `after`.
+///
+/// Seeks the first item greater than the cursor instead of the cursor item
+/// itself, so a cursor whose item was deleted still resumes in place.
+fn page_after<T: Ord + Copy>(sorted: &[T], after: Option<T>, limit: usize) -> PageSlice<'_, T> {
+  let start = after.map_or(0, |after| sorted.partition_point(|item| *item <= after));
+  let rest = &sorted[start..];
+  let items = &rest[..rest.len().min(limit)];
+  let next = (rest.len() > limit).then(|| items[items.len() - 1]);
+  PageSlice { items, next }
+}
+
+fn invalid_cursor(cursor: &str) -> Error {
+  validation::invalid_argument(format!(
+    "Invalid cursor \"{cursor}\": pass the nextCursor of a previous page"
+  ))
+}
+
+/// Parse a nodes-page cursor (`n:<id>`).
+fn parse_node_cursor(cursor: &str) -> Result<NodeId> {
+  cursor
+    .strip_prefix("n:")
+    .and_then(|id| id.parse::<NodeId>().ok())
+    .ok_or_else(|| invalid_cursor(cursor))
+}
+
+/// Parse an edges-page cursor (`e:<src>:<etype>:<dst>`).
+fn parse_edge_cursor(cursor: &str) -> Result<(NodeId, ETypeId, NodeId)> {
+  let parse = || {
+    let mut parts = cursor.strip_prefix("e:")?.split(':');
+    let edge = (
+      parts.next()?.parse().ok()?,
+      parts.next()?.parse().ok()?,
+      parts.next()?.parse().ok()?,
+    );
+    parts.next().is_none().then_some(edge)
+  };
+  parse().ok_or_else(|| invalid_cursor(cursor))
+}
+
+// ============================================================================
+// Export Object Conversion
+// ============================================================================
+
+/// Build the JS object for an export directly, without first building a
+/// `serde_json::Value` tree of the whole database.
+///
+/// Keys and number types match what that tree converted to: snake_case keys,
+/// map keys as strings, integers as numbers while they are safe integers.
+fn exported_database_to_js(env: &Env, data: ray_export::ExportedDatabase) -> Result<Object<'_>> {
+  let mut out = Object::new(env)?;
+  out.set_named_property("version", data.version)?;
+  out.set_named_property("exported_at", data.exported_at)?;
+
+  let mut schema = Object::new(env)?;
+  schema.set_named_property("labels", name_map_to_js(env, data.schema.labels)?)?;
+  schema.set_named_property("etypes", name_map_to_js(env, data.schema.etypes)?)?;
+  schema.set_named_property("prop_keys", name_map_to_js(env, data.schema.prop_keys)?)?;
+  out.set_named_property("schema", schema)?;
+
+  let mut nodes = env.create_array(data.nodes.len() as u32)?;
+  for (index, node) in data.nodes.into_iter().enumerate() {
+    let mut js_node = Object::new(env)?;
+    js_node.set_named_property("id", json_u64(node.id))?;
+    js_node.set_named_property("key", node.key)?;
+    js_node.set_named_property("labels", node.labels)?;
+    js_node.set_named_property("props", exported_props_to_js(env, node.props)?)?;
+    nodes.set(index as u32, js_node)?;
+  }
+  out.set_named_property("nodes", nodes)?;
+
+  let mut edges = env.create_array(data.edges.len() as u32)?;
+  for (index, edge) in data.edges.into_iter().enumerate() {
+    let mut js_edge = Object::new(env)?;
+    js_edge.set_named_property("src", json_u64(edge.src))?;
+    js_edge.set_named_property("dst", json_u64(edge.dst))?;
+    js_edge.set_named_property("etype", edge.etype)?;
+    js_edge.set_named_property("etype_name", edge.etype_name)?;
+    js_edge.set_named_property("props", exported_props_to_js(env, edge.props)?)?;
+    edges.set(index as u32, js_edge)?;
+  }
+  out.set_named_property("edges", edges)?;
+
+  let mut stats = Object::new(env)?;
+  stats.set_named_property("node_count", json_u64(data.stats.node_count as u64))?;
+  stats.set_named_property("edge_count", json_u64(data.stats.edge_count as u64))?;
+  out.set_named_property("stats", stats)?;
+  Ok(out)
+}
+
+/// Read an export object without building a `serde_json::Value` tree of the
+/// whole database: nodes and edges are deserialized straight from JS.
+///
+/// The rest (version, schema, stats) is small and keeps the `Value` route,
+/// which parses the schema maps' string keys back into ids.
+fn exported_database_from_js(env: &Env, data: &Object) -> Result<ray_export::ExportedDatabase> {
+  const BULK: [&str; 2] = ["nodes", "edges"];
+  let mut skeleton = serde_json::Map::new();
+  for key in Object::keys(data)? {
+    if !BULK.contains(&key.as_str()) {
+      let value: Unknown = data.get_named_property(&key)?;
+      // SAFETY: the raw handles come from a live JS value in this call.
+      let value = unsafe { serde_json::Value::from_napi_value(env.raw(), value.raw())? };
+      skeleton.insert(key, value);
+    }
+  }
+  for key in BULK {
+    skeleton.insert(key.to_string(), serde_json::Value::Array(Vec::new()));
+  }
+  let mut parsed: ray_export::ExportedDatabase =
+    serde_json::from_value(serde_json::Value::Object(skeleton))
+      .map_err(|e| Error::from_reason(e.to_string()))?;
+  parsed.nodes = env.from_js_value(data.get_named_property::<Unknown>("nodes")?)?;
+  parsed.edges = env.from_js_value(data.get_named_property::<Unknown>("edges")?)?;
+  Ok(parsed)
+}
+
+/// An unsigned integer as `serde_json::Value` converted it: a number while
+/// it is a safe integer, else a BigInt.
+fn json_u64(value: u64) -> serde_json::Value {
+  serde_json::Value::Number(value.into())
+}
+
+fn name_map_to_js(env: &Env, names: std::collections::HashMap<u32, String>) -> Result<Object<'_>> {
+  let mut out = Object::new(env)?;
+  for (id, name) in names {
+    out.set_named_property(&id.to_string(), name)?;
+  }
+  Ok(out)
+}
+
+fn exported_props_to_js(
+  env: &Env,
+  props: std::collections::HashMap<String, ray_export::ExportedPropValue>,
+) -> Result<Object<'_>> {
+  let mut out = Object::new(env)?;
+  for (name, prop) in props {
+    let mut js_prop = Object::new(env)?;
+    js_prop.set_named_property("type", prop.r#type)?;
+    js_prop.set_named_property("value", prop.value)?;
+    out.set_named_property(&name, js_prop)?;
+  }
+  Ok(out)
 }
 
 // ============================================================================
@@ -3893,6 +4277,14 @@ pub fn collect_replication_log_transport_json(
   }
 }
 
+fn otel_timeout_ms(timeout_ms: i64) -> Result<u64> {
+  validation::positive_u64("timeoutMs", timeout_ms, validation::MAX_DURATION_MS as u64)
+}
+
+fn otel_push_error(e: impl std::fmt::Display) -> Error {
+  Error::from_reason(format!("Failed to push replication metrics: {e}"))
+}
+
 #[napi]
 pub fn push_replication_metrics_otel_json(
   db: &Database,
@@ -3900,22 +4292,40 @@ pub fn push_replication_metrics_otel_json(
   timeout_ms: i64,
   bearer_token: Option<String>,
 ) -> Result<OtlpHttpExportResult> {
-  let timeout_ms =
-    validation::positive_u64("timeoutMs", timeout_ms, validation::MAX_DURATION_MS as u64)?;
+  let timeout_ms = otel_timeout_ms(timeout_ms)?;
+  core_metrics::push_replication_metrics_otel_json_single_file(
+    db.db()?,
+    &endpoint,
+    timeout_ms,
+    bearer_token.as_deref(),
+  )
+  .map(Into::into)
+  .map_err(otel_push_error)
+}
 
-  match db.inner.as_ref() {
-    Some(DatabaseInner::SingleFile(db)) => {
+/// `pushReplicationMetricsOtelJson` on the libuv thread pool: the push (network I/O,
+/// retries and backoff) does not block the event loop.
+#[napi(ts_return_type = "Promise<OtlpHttpExportResult>")]
+pub fn push_replication_metrics_otel_json_async(
+  db: &Database,
+  endpoint: String,
+  timeout_ms: i64,
+  bearer_token: Option<String>,
+) -> AsyncTask<BlockingTask<OtlpHttpExportResult>> {
+  BlockingTask::spawn((|| -> Result<_> {
+    let timeout_ms = otel_timeout_ms(timeout_ms)?;
+    let db = db.shared_db()?;
+    Ok(move || {
       core_metrics::push_replication_metrics_otel_json_single_file(
-        db,
+        &db,
         &endpoint,
         timeout_ms,
         bearer_token.as_deref(),
       )
       .map(Into::into)
-      .map_err(|e| Error::from_reason(format!("Failed to push replication metrics: {e}")))
-    }
-    None => Err(Error::from_reason("Database is closed")),
-  }
+      .map_err(otel_push_error)
+    })
+  })())
 }
 
 fn build_core_otel_push_options(
@@ -4136,19 +4546,35 @@ pub fn push_replication_metrics_otel_json_with_options(
   options: Option<PushReplicationMetricsOtelOptions>,
 ) -> Result<OtlpHttpExportResult> {
   let core_options = build_core_otel_push_options(options.unwrap_or_default())?;
+  core_metrics::push_replication_metrics_otel_json_single_file_with_options(
+    db.db()?,
+    &endpoint,
+    &core_options,
+  )
+  .map(Into::into)
+  .map_err(otel_push_error)
+}
 
-  match db.inner.as_ref() {
-    Some(DatabaseInner::SingleFile(db)) => {
+/// `pushReplicationMetricsOtelJsonWithOptions` on the libuv thread pool.
+#[napi(ts_return_type = "Promise<OtlpHttpExportResult>")]
+pub fn push_replication_metrics_otel_json_with_options_async(
+  db: &Database,
+  endpoint: String,
+  options: Option<PushReplicationMetricsOtelOptions>,
+) -> AsyncTask<BlockingTask<OtlpHttpExportResult>> {
+  BlockingTask::spawn((|| -> Result<_> {
+    let core_options = build_core_otel_push_options(options.unwrap_or_default())?;
+    let db = db.shared_db()?;
+    Ok(move || {
       core_metrics::push_replication_metrics_otel_json_single_file_with_options(
-        db,
+        &db,
         &endpoint,
         &core_options,
       )
       .map(Into::into)
-      .map_err(|e| Error::from_reason(format!("Failed to push replication metrics: {e}")))
-    }
-    None => Err(Error::from_reason("Database is closed")),
-  }
+      .map_err(otel_push_error)
+    })
+  })())
 }
 
 #[napi]
@@ -4158,22 +4584,40 @@ pub fn push_replication_metrics_otel_protobuf(
   timeout_ms: i64,
   bearer_token: Option<String>,
 ) -> Result<OtlpHttpExportResult> {
-  let timeout_ms =
-    validation::positive_u64("timeoutMs", timeout_ms, validation::MAX_DURATION_MS as u64)?;
+  let timeout_ms = otel_timeout_ms(timeout_ms)?;
+  core_metrics::push_replication_metrics_otel_protobuf_single_file(
+    db.db()?,
+    &endpoint,
+    timeout_ms,
+    bearer_token.as_deref(),
+  )
+  .map(Into::into)
+  .map_err(otel_push_error)
+}
 
-  match db.inner.as_ref() {
-    Some(DatabaseInner::SingleFile(db)) => {
+/// `pushReplicationMetricsOtelProtobuf` on the libuv thread pool: the push (network I/O,
+/// retries and backoff) does not block the event loop.
+#[napi(ts_return_type = "Promise<OtlpHttpExportResult>")]
+pub fn push_replication_metrics_otel_protobuf_async(
+  db: &Database,
+  endpoint: String,
+  timeout_ms: i64,
+  bearer_token: Option<String>,
+) -> AsyncTask<BlockingTask<OtlpHttpExportResult>> {
+  BlockingTask::spawn((|| -> Result<_> {
+    let timeout_ms = otel_timeout_ms(timeout_ms)?;
+    let db = db.shared_db()?;
+    Ok(move || {
       core_metrics::push_replication_metrics_otel_protobuf_single_file(
-        db,
+        &db,
         &endpoint,
         timeout_ms,
         bearer_token.as_deref(),
       )
       .map(Into::into)
-      .map_err(|e| Error::from_reason(format!("Failed to push replication metrics: {e}")))
-    }
-    None => Err(Error::from_reason("Database is closed")),
-  }
+      .map_err(otel_push_error)
+    })
+  })())
 }
 
 #[napi]
@@ -4183,19 +4627,35 @@ pub fn push_replication_metrics_otel_protobuf_with_options(
   options: Option<PushReplicationMetricsOtelOptions>,
 ) -> Result<OtlpHttpExportResult> {
   let core_options = build_core_otel_push_options(options.unwrap_or_default())?;
+  core_metrics::push_replication_metrics_otel_protobuf_single_file_with_options(
+    db.db()?,
+    &endpoint,
+    &core_options,
+  )
+  .map(Into::into)
+  .map_err(otel_push_error)
+}
 
-  match db.inner.as_ref() {
-    Some(DatabaseInner::SingleFile(db)) => {
+/// `pushReplicationMetricsOtelProtobufWithOptions` on the libuv thread pool.
+#[napi(ts_return_type = "Promise<OtlpHttpExportResult>")]
+pub fn push_replication_metrics_otel_protobuf_with_options_async(
+  db: &Database,
+  endpoint: String,
+  options: Option<PushReplicationMetricsOtelOptions>,
+) -> AsyncTask<BlockingTask<OtlpHttpExportResult>> {
+  BlockingTask::spawn((|| -> Result<_> {
+    let core_options = build_core_otel_push_options(options.unwrap_or_default())?;
+    let db = db.shared_db()?;
+    Ok(move || {
       core_metrics::push_replication_metrics_otel_protobuf_single_file_with_options(
-        db,
+        &db,
         &endpoint,
         &core_options,
       )
       .map(Into::into)
-      .map_err(|e| Error::from_reason(format!("Failed to push replication metrics: {e}")))
-    }
-    None => Err(Error::from_reason("Database is closed")),
-  }
+      .map_err(otel_push_error)
+    })
+  })())
 }
 
 #[napi]
@@ -4205,22 +4665,40 @@ pub fn push_replication_metrics_otel_grpc(
   timeout_ms: i64,
   bearer_token: Option<String>,
 ) -> Result<OtlpHttpExportResult> {
-  let timeout_ms =
-    validation::positive_u64("timeoutMs", timeout_ms, validation::MAX_DURATION_MS as u64)?;
+  let timeout_ms = otel_timeout_ms(timeout_ms)?;
+  core_metrics::push_replication_metrics_otel_grpc_single_file(
+    db.db()?,
+    &endpoint,
+    timeout_ms,
+    bearer_token.as_deref(),
+  )
+  .map(Into::into)
+  .map_err(otel_push_error)
+}
 
-  match db.inner.as_ref() {
-    Some(DatabaseInner::SingleFile(db)) => {
+/// `pushReplicationMetricsOtelGrpc` on the libuv thread pool: the push (network I/O,
+/// retries and backoff) does not block the event loop.
+#[napi(ts_return_type = "Promise<OtlpHttpExportResult>")]
+pub fn push_replication_metrics_otel_grpc_async(
+  db: &Database,
+  endpoint: String,
+  timeout_ms: i64,
+  bearer_token: Option<String>,
+) -> AsyncTask<BlockingTask<OtlpHttpExportResult>> {
+  BlockingTask::spawn((|| -> Result<_> {
+    let timeout_ms = otel_timeout_ms(timeout_ms)?;
+    let db = db.shared_db()?;
+    Ok(move || {
       core_metrics::push_replication_metrics_otel_grpc_single_file(
-        db,
+        &db,
         &endpoint,
         timeout_ms,
         bearer_token.as_deref(),
       )
       .map(Into::into)
-      .map_err(|e| Error::from_reason(format!("Failed to push replication metrics: {e}")))
-    }
-    None => Err(Error::from_reason("Database is closed")),
-  }
+      .map_err(otel_push_error)
+    })
+  })())
 }
 
 #[napi]
@@ -4230,19 +4708,35 @@ pub fn push_replication_metrics_otel_grpc_with_options(
   options: Option<PushReplicationMetricsOtelOptions>,
 ) -> Result<OtlpHttpExportResult> {
   let core_options = build_core_otel_push_options(options.unwrap_or_default())?;
+  core_metrics::push_replication_metrics_otel_grpc_single_file_with_options(
+    db.db()?,
+    &endpoint,
+    &core_options,
+  )
+  .map(Into::into)
+  .map_err(otel_push_error)
+}
 
-  match db.inner.as_ref() {
-    Some(DatabaseInner::SingleFile(db)) => {
+/// `pushReplicationMetricsOtelGrpcWithOptions` on the libuv thread pool.
+#[napi(ts_return_type = "Promise<OtlpHttpExportResult>")]
+pub fn push_replication_metrics_otel_grpc_with_options_async(
+  db: &Database,
+  endpoint: String,
+  options: Option<PushReplicationMetricsOtelOptions>,
+) -> AsyncTask<BlockingTask<OtlpHttpExportResult>> {
+  BlockingTask::spawn((|| -> Result<_> {
+    let core_options = build_core_otel_push_options(options.unwrap_or_default())?;
+    let db = db.shared_db()?;
+    Ok(move || {
       core_metrics::push_replication_metrics_otel_grpc_single_file_with_options(
-        db,
+        &db,
         &endpoint,
         &core_options,
       )
       .map(Into::into)
-      .map_err(|e| Error::from_reason(format!("Failed to push replication metrics: {e}")))
-    }
-    None => Err(Error::from_reason("Database is closed")),
-  }
+      .map_err(otel_push_error)
+    })
+  })())
 }
 
 #[napi]
@@ -4332,6 +4826,16 @@ impl From<core_backup::BackupResult> for BackupResult {
   }
 }
 
+fn create_backup_on(
+  db: &RustSingleFileDB,
+  backup_path: &std::path::Path,
+  options: core_backup::BackupOptions,
+) -> Result<BackupResult> {
+  core_backup::create_backup_single_file(db, backup_path, options)
+    .map(BackupResult::from)
+    .map_err(|e| Error::from_reason(format!("Failed to create backup: {e}")))
+}
+
 /// Create a backup from an open database handle
 #[napi]
 pub fn create_backup(
@@ -4339,18 +4843,34 @@ pub fn create_backup(
   backup_path: String,
   options: Option<BackupOptions>,
 ) -> Result<BackupResult> {
-  let options = options.unwrap_or_default();
-  let core_options: core_backup::BackupOptions = options.clone().into();
-  let backup_path = PathBuf::from(backup_path);
+  let core_options: core_backup::BackupOptions = options.unwrap_or_default().into();
+  create_backup_on(db.db()?, &PathBuf::from(backup_path), core_options)
+}
 
-  match db.inner.as_ref() {
-    Some(DatabaseInner::SingleFile(db)) => {
-      core_backup::create_backup_single_file(db, &backup_path, core_options)
-        .map(BackupResult::from)
-        .map_err(|e| Error::from_reason(format!("Failed to create backup: {e}")))
-    }
-    None => Err(Error::from_reason("Database is closed")),
-  }
+/// Create a backup on the libuv thread pool. Rejects when called inside a
+/// transaction (the backup checkpoints first by default).
+#[napi(ts_return_type = "Promise<BackupResult>")]
+pub fn create_backup_async(
+  db: &Database,
+  backup_path: String,
+  options: Option<BackupOptions>,
+) -> AsyncTask<BlockingTask<BackupResult>> {
+  BlockingTask::spawn((|| -> Result<_> {
+    let core_options: core_backup::BackupOptions = options.unwrap_or_default().into();
+    let db = db.shared_db_outside_tx("createBackupAsync")?;
+    let backup_path = PathBuf::from(backup_path);
+    Ok(move || create_backup_on(&db, &backup_path, core_options))
+  })())
+}
+
+fn restore_backup_to(
+  backup_path: String,
+  restore_path: String,
+  options: core_backup::RestoreOptions,
+) -> Result<String> {
+  core_backup::restore_backup(backup_path, restore_path, options)
+    .map(|p| p.to_string_lossy().to_string())
+    .map_err(|e| Error::from_reason(format!("Failed to restore backup: {e}")))
 }
 
 /// Restore a backup into a target path
@@ -4360,12 +4880,24 @@ pub fn restore_backup(
   restore_path: String,
   options: Option<RestoreOptions>,
 ) -> Result<String> {
-  let options = options.unwrap_or_default();
-  let core_options: core_backup::RestoreOptions = options.into();
+  restore_backup_to(
+    backup_path,
+    restore_path,
+    options.unwrap_or_default().into(),
+  )
+}
 
-  core_backup::restore_backup(backup_path, restore_path, core_options)
-    .map(|p| p.to_string_lossy().to_string())
-    .map_err(|e| Error::from_reason(format!("Failed to restore backup: {e}")))
+/// Restore a backup into a target path on the libuv thread pool
+#[napi(ts_return_type = "Promise<string>")]
+pub fn restore_backup_async(
+  backup_path: String,
+  restore_path: String,
+  options: Option<RestoreOptions>,
+) -> AsyncTask<BlockingTask<String>> {
+  let options: core_backup::RestoreOptions = options.unwrap_or_default().into();
+  BlockingTask::spawn(Ok(move || {
+    restore_backup_to(backup_path, restore_path, options)
+  }))
 }
 
 /// Inspect a backup without restoring it
@@ -4376,6 +4908,16 @@ pub fn backup_info(backup_path: String) -> Result<BackupResult> {
     .map_err(|e| Error::from_reason(format!("Failed to inspect backup: {e}")))
 }
 
+fn create_offline_backup_of(
+  db_path: String,
+  backup_path: String,
+  options: core_backup::OfflineBackupOptions,
+) -> Result<BackupResult> {
+  core_backup::create_offline_backup(db_path, backup_path, options)
+    .map(BackupResult::from)
+    .map_err(|e| Error::from_reason(format!("Failed to create offline backup: {e}")))
+}
+
 /// Create a backup from a database path without opening it
 #[napi]
 pub fn create_offline_backup(
@@ -4383,10 +4925,19 @@ pub fn create_offline_backup(
   backup_path: String,
   options: Option<OfflineBackupOptions>,
 ) -> Result<BackupResult> {
-  let options = options.unwrap_or_default();
-  let core_options: core_backup::OfflineBackupOptions = options.into();
+  create_offline_backup_of(db_path, backup_path, options.unwrap_or_default().into())
+}
 
-  core_backup::create_offline_backup(db_path, backup_path, core_options)
-    .map(BackupResult::from)
-    .map_err(|e| Error::from_reason(format!("Failed to create offline backup: {e}")))
+/// Create a backup from a database path without opening it, on the libuv
+/// thread pool
+#[napi(ts_return_type = "Promise<BackupResult>")]
+pub fn create_offline_backup_async(
+  db_path: String,
+  backup_path: String,
+  options: Option<OfflineBackupOptions>,
+) -> AsyncTask<BlockingTask<BackupResult>> {
+  let options: core_backup::OfflineBackupOptions = options.unwrap_or_default().into();
+  BlockingTask::spawn(Ok(move || {
+    create_offline_backup_of(db_path, backup_path, options)
+  }))
 }

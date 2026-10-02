@@ -2,7 +2,9 @@
 //!
 //! Exposes IVF and IVF-PQ indexes to Python.
 
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::PyValueError;
+
+use crate::pyo3_bindings::errors;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::sync::RwLock;
@@ -28,12 +30,17 @@ pub enum PyDistanceMetricEnum {
   DotProduct,
 }
 
-impl From<&str> for PyDistanceMetricEnum {
-  fn from(s: &str) -> Self {
+impl PyDistanceMetricEnum {
+  /// Parses a metric name; an unknown name is a `ValueError`, not a silent
+  /// fallback to cosine.
+  pub fn parse(s: &str) -> PyResult<Self> {
     match s.to_lowercase().as_str() {
-      "euclidean" | "l2" => PyDistanceMetricEnum::Euclidean,
-      "dot" | "dotproduct" | "dot_product" => PyDistanceMetricEnum::DotProduct,
-      _ => PyDistanceMetricEnum::Cosine,
+      "cosine" => Ok(PyDistanceMetricEnum::Cosine),
+      "euclidean" | "l2" => Ok(PyDistanceMetricEnum::Euclidean),
+      "dot" | "dotproduct" | "dot_product" => Ok(PyDistanceMetricEnum::DotProduct),
+      _ => Err(PyValueError::new_err(format!(
+        "unknown metric {s:?}; expected one of: cosine, euclidean (l2), dot_product (dot)"
+      ))),
     }
   }
 }
@@ -71,13 +78,18 @@ pub enum PyAggregationEnum {
   Sum,
 }
 
-impl From<&str> for PyAggregationEnum {
-  fn from(s: &str) -> Self {
+impl PyAggregationEnum {
+  /// Parses an aggregation name; an unknown name is a `ValueError`, not a
+  /// silent fallback to min.
+  pub fn parse(s: &str) -> PyResult<Self> {
     match s.to_lowercase().as_str() {
-      "max" => PyAggregationEnum::Max,
-      "avg" | "average" => PyAggregationEnum::Avg,
-      "sum" => PyAggregationEnum::Sum,
-      _ => PyAggregationEnum::Min,
+      "min" => Ok(PyAggregationEnum::Min),
+      "max" => Ok(PyAggregationEnum::Max),
+      "avg" | "average" => Ok(PyAggregationEnum::Avg),
+      "sum" => Ok(PyAggregationEnum::Sum),
+      _ => Err(PyValueError::new_err(format!(
+        "unknown aggregation {s:?}; expected one of: min, max, avg, sum"
+      ))),
     }
   }
 }
@@ -96,8 +108,8 @@ impl From<PyAggregationEnum> for MultiQueryAggregation {
 /// Parses a search manifest and checks it matches the index dimensions, since
 /// core distance kernels assert on mismatched vector lengths.
 fn parse_manifest(manifest_json: &str, dimensions: usize) -> PyResult<VectorManifest> {
-  let manifest: VectorManifest = serde_json::from_str(manifest_json)
-    .map_err(|e| PyRuntimeError::new_err(format!("Failed to parse manifest: {e}")))?;
+  let manifest: VectorManifest =
+    serde_json::from_str(manifest_json).map_err(|e| errors::wrap(e, "Failed to parse manifest"))?;
   if manifest.config.dimensions != dimensions {
     return Err(PyValueError::new_err(format!(
       "manifest has {} dimensions, index has {dimensions}",
@@ -112,7 +124,7 @@ fn parse_manifest(manifest_json: &str, dimensions: usize) -> PyResult<VectorMani
 // ============================================================================
 
 /// Configuration for IVF index
-#[pyclass(name = "IvfConfig")]
+#[pyclass(name = "IvfConfig", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyIvfConfig {
   /// Number of clusters (default: 100)
@@ -159,8 +171,7 @@ impl PyIvfConfig {
         validation::positive_usize("n_probe", n as i64, validation::MAX_VECTOR_PARAM)?;
     }
     if let Some(m) = c.metric {
-      let metric: PyDistanceMetricEnum = m.as_str().into();
-      config.metric = metric.into();
+      config.metric = PyDistanceMetricEnum::parse(&m)?.into();
     }
     Ok(config)
   }
@@ -171,7 +182,7 @@ impl PyIvfConfig {
 // ============================================================================
 
 /// Configuration for Product Quantization
-#[pyclass(name = "PqConfig")]
+#[pyclass(name = "PqConfig", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyPqConfig {
   /// Number of subspaces (must divide dimensions evenly)
@@ -234,7 +245,7 @@ impl PyPqConfig {
 // ============================================================================
 
 /// Options for vector search
-#[pyclass(name = "SearchOptions")]
+#[pyclass(name = "SearchOptions", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PySearchOptions {
   /// Number of clusters to probe (overrides index default; must be positive)
@@ -294,8 +305,10 @@ impl PySearchOptions {
       self.n_probe, self.threshold, self.rerank_factor
     )
   }
+}
 
   /// The validated `(n_probe, threshold)`.
+impl PySearchOptions {
   fn validated(&self) -> PyResult<(Option<usize>, Option<f32>)> {
     let params = self.params()?;
     Ok((params.n_probe, params.threshold))
@@ -331,7 +344,7 @@ impl PySearchOptions {
 // ============================================================================
 
 /// Result of a vector search
-#[pyclass(name = "SearchResult")]
+#[pyclass(name = "SearchResult", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PySearchResult {
   /// Vector ID
@@ -374,7 +387,7 @@ impl From<VectorSearchResult> for PySearchResult {
 // ============================================================================
 
 /// Statistics for IVF index
-#[pyclass(name = "IvfStats")]
+#[pyclass(name = "IvfStats", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyIvfStats {
   /// Whether the index is trained
@@ -443,20 +456,14 @@ impl PyIvfIndex {
   /// Get the number of dimensions
   #[getter]
   fn dimensions(&self) -> PyResult<i32> {
-    let index = self
-      .inner
-      .read()
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let index = self.inner.read().map_err(errors::poisoned)?;
     Ok(index.dimensions as i32)
   }
 
   /// Check if the index is trained
   #[getter]
   fn trained(&self) -> PyResult<bool> {
-    let index = self
-      .inner
-      .read()
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let index = self.inner.read().map_err(errors::poisoned)?;
     Ok(index.trained)
   }
 
@@ -464,62 +471,47 @@ impl PyIvfIndex {
   fn add_training_vectors(&self, vectors: Vec<f64>, num_vectors: i32) -> PyResult<()> {
     let num_vectors =
       validation::non_negative_usize("num_vectors", num_vectors as i64, validation::MAX_COUNT)?;
-    let mut index = self
-      .inner
-      .write()
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mut index = self.inner.write().map_err(errors::poisoned)?;
     let vectors_f32: Vec<f32> = vectors.iter().map(|&v| v as f32).collect();
     index
       .add_training_vectors(&vectors_f32, num_vectors)
-      .map_err(|e| PyRuntimeError::new_err(format!("Failed to add training vectors: {e}")))
+      .map_err(|e| errors::wrap(e, "Failed to add training vectors"))
   }
 
   /// Train the index on added training vectors
   fn train(&self, py: Python<'_>) -> PyResult<()> {
-    py.allow_threads(|| {
-      let mut index = self
-        .inner
-        .write()
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    py.detach(|| {
+      let mut index = self.inner.write().map_err(errors::poisoned)?;
       index
         .train()
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to train index: {e}")))
+        .map_err(|e| errors::wrap(e, "Failed to train index"))
     })
   }
 
   /// Insert a vector into the index
   fn insert(&self, vector_id: i64, vector: Vec<f64>) -> PyResult<()> {
     let vector_id = validation::node_id("vector_id", vector_id)?;
-    let mut index = self
-      .inner
-      .write()
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mut index = self.inner.write().map_err(errors::poisoned)?;
     let vector_f32: Vec<f32> = vector.iter().map(|&v| v as f32).collect();
     index
       .insert(vector_id, &vector_f32)
-      .map_err(|e| PyRuntimeError::new_err(format!("Failed to insert vector: {e}")))
+      .map_err(|e| errors::wrap(e, "Failed to insert vector"))
   }
 
   /// Delete a vector from the index
   fn delete(&self, vector_id: i64, vector: Vec<f64>) -> PyResult<bool> {
     let vector_id = validation::node_id("vector_id", vector_id)?;
-    let mut index = self
-      .inner
-      .write()
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mut index = self.inner.write().map_err(errors::poisoned)?;
     validation::vector_len("vector", &vector, index.dimensions)?;
     let vector_f32: Vec<f32> = vector.iter().map(|&v| v as f32).collect();
     index
       .delete(vector_id, &vector_f32)
-      .map_err(|e| PyRuntimeError::new_err(format!("Failed to delete vector: {e}")))
+      .map_err(|e| errors::wrap(e, "Failed to delete vector"))
   }
 
   /// Clear all data from the index
   fn clear(&self) -> PyResult<()> {
-    let mut index = self
-      .inner
-      .write()
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mut index = self.inner.write().map_err(errors::poisoned)?;
     index.clear();
     Ok(())
   }
@@ -533,10 +525,7 @@ impl PyIvfIndex {
     k: i32,
     options: Option<PySearchOptions>,
   ) -> PyResult<Vec<PySearchResult>> {
-    let index = self
-      .inner
-      .read()
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let index = self.inner.read().map_err(errors::poisoned)?;
 
     let manifest = parse_manifest(&manifest_json, index.dimensions)?;
     validation::vector_len("query", &query, index.dimensions)?;
@@ -551,7 +540,7 @@ impl PyIvfIndex {
     let k = validation::non_negative_usize("k", k as i64, validation::MAX_COUNT)?;
     let results = index
       .search(&manifest, &query_f32, k, rust_options)
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+      .map_err(errors::wrap_plain)?;
     Ok(results.into_iter().map(|r| r.into()).collect())
   }
 
@@ -565,10 +554,7 @@ impl PyIvfIndex {
     aggregation: String,
     options: Option<PySearchOptions>,
   ) -> PyResult<Vec<PySearchResult>> {
-    let index = self
-      .inner
-      .read()
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let index = self.inner.read().map_err(errors::poisoned)?;
 
     let manifest = parse_manifest(&manifest_json, index.dimensions)?;
     for (i, query) in queries.iter().enumerate() {
@@ -581,7 +567,7 @@ impl PyIvfIndex {
 
     let query_refs: Vec<&[f32]> = queries_f32.iter().map(|q| q.as_slice()).collect();
 
-    let agg: PyAggregationEnum = aggregation.as_str().into();
+    let agg = PyAggregationEnum::parse(&aggregation)?;
 
     let rust_options = options
       .as_ref()
@@ -592,16 +578,13 @@ impl PyIvfIndex {
     let k = validation::non_negative_usize("k", k as i64, validation::MAX_COUNT)?;
     let results = index
       .search_multi(&manifest, &query_refs, k, agg.into(), rust_options)
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+      .map_err(errors::wrap_plain)?;
     Ok(results.into_iter().map(|r| r.into()).collect())
   }
 
   /// Get index statistics
   fn stats(&self) -> PyResult<PyIvfStats> {
-    let index = self
-      .inner
-      .read()
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let index = self.inner.read().map_err(errors::poisoned)?;
     let s = index.stats();
     Ok(PyIvfStats {
       trained: s.trained,
@@ -616,10 +599,7 @@ impl PyIvfIndex {
 
   /// Serialize the index to bytes
   fn serialize<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-    let index = self
-      .inner
-      .read()
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let index = self.inner.read().map_err(errors::poisoned)?;
     let bytes = crate::vector::ivf::serialize::serialize_ivf(&index);
     Ok(PyBytes::new(py, &bytes))
   }
@@ -628,17 +608,14 @@ impl PyIvfIndex {
   #[staticmethod]
   fn deserialize(data: &[u8]) -> PyResult<PyIvfIndex> {
     let index = crate::vector::ivf::serialize::deserialize_ivf(data)
-      .map_err(|e| PyRuntimeError::new_err(format!("Failed to deserialize: {e}")))?;
+      .map_err(|e| errors::wrap(e, "Failed to deserialize"))?;
     Ok(PyIvfIndex {
       inner: RwLock::new(index),
     })
   }
 
   fn __repr__(&self) -> PyResult<String> {
-    let index = self
-      .inner
-      .read()
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let index = self.inner.read().map_err(errors::poisoned)?;
     Ok(format!(
       "IvfIndex(dimensions={}, trained={})",
       index.dimensions, index.trained
@@ -685,7 +662,7 @@ impl PyIvfPqIndex {
     };
 
     let index = RustIvfPqIndex::new(dimensions, config)
-      .map_err(|e| PyRuntimeError::new_err(format!("Failed to create index: {e}")))?;
+      .map_err(|e| errors::wrap(e, "Failed to create index"))?;
 
     Ok(PyIvfPqIndex {
       inner: RwLock::new(index),
@@ -695,20 +672,14 @@ impl PyIvfPqIndex {
   /// Get the number of dimensions
   #[getter]
   fn dimensions(&self) -> PyResult<i32> {
-    let index = self
-      .inner
-      .read()
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let index = self.inner.read().map_err(errors::poisoned)?;
     Ok(index.dimensions as i32)
   }
 
   /// Check if the index is trained
   #[getter]
   fn trained(&self) -> PyResult<bool> {
-    let index = self
-      .inner
-      .read()
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let index = self.inner.read().map_err(errors::poisoned)?;
     Ok(index.trained)
   }
 
@@ -716,62 +687,47 @@ impl PyIvfPqIndex {
   fn add_training_vectors(&self, vectors: Vec<f64>, num_vectors: i32) -> PyResult<()> {
     let num_vectors =
       validation::non_negative_usize("num_vectors", num_vectors as i64, validation::MAX_COUNT)?;
-    let mut index = self
-      .inner
-      .write()
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mut index = self.inner.write().map_err(errors::poisoned)?;
     let vectors_f32: Vec<f32> = vectors.iter().map(|&v| v as f32).collect();
     index
       .add_training_vectors(&vectors_f32, num_vectors)
-      .map_err(|e| PyRuntimeError::new_err(format!("Failed to add training vectors: {e}")))
+      .map_err(|e| errors::wrap(e, "Failed to add training vectors"))
   }
 
   /// Train the index
   fn train(&self, py: Python<'_>) -> PyResult<()> {
-    py.allow_threads(|| {
-      let mut index = self
-        .inner
-        .write()
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    py.detach(|| {
+      let mut index = self.inner.write().map_err(errors::poisoned)?;
       index
         .train()
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to train index: {e}")))
+        .map_err(|e| errors::wrap(e, "Failed to train index"))
     })
   }
 
   /// Insert a vector
   fn insert(&self, vector_id: i64, vector: Vec<f64>) -> PyResult<()> {
     let vector_id = validation::node_id("vector_id", vector_id)?;
-    let mut index = self
-      .inner
-      .write()
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mut index = self.inner.write().map_err(errors::poisoned)?;
     let vector_f32: Vec<f32> = vector.iter().map(|&v| v as f32).collect();
     index
       .insert(vector_id, &vector_f32)
-      .map_err(|e| PyRuntimeError::new_err(format!("Failed to insert vector: {e}")))
+      .map_err(|e| errors::wrap(e, "Failed to insert vector"))
   }
 
   /// Delete a vector
   fn delete(&self, vector_id: i64, vector: Vec<f64>) -> PyResult<bool> {
     let vector_id = validation::node_id("vector_id", vector_id)?;
-    let mut index = self
-      .inner
-      .write()
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mut index = self.inner.write().map_err(errors::poisoned)?;
     validation::vector_len("vector", &vector, index.dimensions)?;
     let vector_f32: Vec<f32> = vector.iter().map(|&v| v as f32).collect();
     index
       .delete(vector_id, &vector_f32)
-      .map_err(|e| PyRuntimeError::new_err(format!("Failed to delete vector: {e}")))
+      .map_err(|e| errors::wrap(e, "Failed to delete vector"))
   }
 
   /// Clear the index
   fn clear(&self) -> PyResult<()> {
-    let mut index = self
-      .inner
-      .write()
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mut index = self.inner.write().map_err(errors::poisoned)?;
     index.clear();
     Ok(())
   }
@@ -785,10 +741,7 @@ impl PyIvfPqIndex {
     k: i32,
     options: Option<PySearchOptions>,
   ) -> PyResult<Vec<PySearchResult>> {
-    let index = self
-      .inner
-      .read()
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let index = self.inner.read().map_err(errors::poisoned)?;
 
     let manifest = parse_manifest(&manifest_json, index.dimensions)?;
     validation::vector_len("query", &query, index.dimensions)?;
@@ -803,7 +756,7 @@ impl PyIvfPqIndex {
     let k = validation::non_negative_usize("k", k as i64, validation::MAX_COUNT)?;
     let results = index
       .search(&manifest, &query_f32, k, rust_options)
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+      .map_err(errors::wrap_plain)?;
     Ok(results.into_iter().map(|r| r.into()).collect())
   }
 
@@ -817,10 +770,7 @@ impl PyIvfPqIndex {
     aggregation: String,
     options: Option<PySearchOptions>,
   ) -> PyResult<Vec<PySearchResult>> {
-    let index = self
-      .inner
-      .read()
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let index = self.inner.read().map_err(errors::poisoned)?;
 
     let manifest = parse_manifest(&manifest_json, index.dimensions)?;
     for (i, query) in queries.iter().enumerate() {
@@ -833,7 +783,7 @@ impl PyIvfPqIndex {
 
     let query_refs: Vec<&[f32]> = queries_f32.iter().map(|q| q.as_slice()).collect();
 
-    let agg: PyAggregationEnum = aggregation.as_str().into();
+    let agg = PyAggregationEnum::parse(&aggregation)?;
 
     let rust_options = options
       .as_ref()
@@ -844,16 +794,13 @@ impl PyIvfPqIndex {
     let k = validation::non_negative_usize("k", k as i64, validation::MAX_COUNT)?;
     let results = index
       .search_multi(&manifest, &query_refs, k, agg.into(), rust_options)
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+      .map_err(errors::wrap_plain)?;
     Ok(results.into_iter().map(|r| r.into()).collect())
   }
 
   /// Get index statistics
   fn stats(&self) -> PyResult<PyIvfStats> {
-    let index = self
-      .inner
-      .read()
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let index = self.inner.read().map_err(errors::poisoned)?;
     let s = index.stats();
     Ok(PyIvfStats {
       trained: s.trained,
@@ -868,10 +815,7 @@ impl PyIvfPqIndex {
 
   /// Serialize the index to bytes
   fn serialize<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-    let index = self
-      .inner
-      .read()
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let index = self.inner.read().map_err(errors::poisoned)?;
     let bytes = crate::vector::ivf_pq::serialize_ivf_pq(&index);
     Ok(PyBytes::new(py, &bytes))
   }
@@ -880,17 +824,14 @@ impl PyIvfPqIndex {
   #[staticmethod]
   fn deserialize(data: &[u8]) -> PyResult<PyIvfPqIndex> {
     let index = crate::vector::ivf_pq::deserialize_ivf_pq(data)
-      .map_err(|e| PyRuntimeError::new_err(format!("Failed to deserialize: {e}")))?;
+      .map_err(|e| errors::wrap(e, "Failed to deserialize"))?;
     Ok(PyIvfPqIndex {
       inner: RwLock::new(index),
     })
   }
 
   fn __repr__(&self) -> PyResult<String> {
-    let index = self
-      .inner
-      .read()
-      .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let index = self.inner.read().map_err(errors::poisoned)?;
     Ok(format!(
       "IvfPqIndex(dimensions={}, trained={})",
       index.dimensions, index.trained
@@ -903,7 +844,7 @@ impl PyIvfPqIndex {
 // ============================================================================
 
 /// Brute force search result
-#[pyclass(name = "BruteForceResult")]
+#[pyclass(name = "BruteForceResult", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyBruteForceResult {
   #[pyo3(get)]
@@ -953,7 +894,7 @@ pub fn brute_force_search(
   metric: Option<String>,
 ) -> PyResult<Vec<PyBruteForceResult>> {
   if vectors.len() != node_ids.len() {
-    return Err(PyRuntimeError::new_err(
+    return Err(errors::KiteError::new_err(
       "vectors and node_ids must have same length",
     ));
   }
@@ -968,7 +909,7 @@ pub fn brute_force_search(
   }
   let k = validation::non_negative_usize("k", k as i64, validation::MAX_COUNT)?;
 
-  let metric_enum: PyDistanceMetricEnum = metric.as_deref().unwrap_or("cosine").into();
+  let metric_enum = PyDistanceMetricEnum::parse(metric.as_deref().unwrap_or("cosine"))?;
   let rust_metric: RustDistanceMetric = metric_enum.into();
   let distance_fn = rust_metric.distance_fn();
   let cosine = rust_metric == RustDistanceMetric::Cosine;

@@ -1,6 +1,7 @@
 //! Replica progress persistence shared by primary and replicas.
 
 use crate::error::{KiteError, Result};
+use crate::util::fs::sync_parent_dir;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -50,6 +51,23 @@ pub fn upsert_replica_progress(
       },
     );
     write_progress_file(&file_path, &progress)
+  })
+}
+
+/// Forget a replica's progress, so a decommissioned replica stops holding
+/// back retention; the primary applies it on its next retention run. Returns
+/// whether the replica had progress recorded. A replica that reports
+/// progress again is tracked again.
+pub fn remove_replica_progress(sidecar_path: &Path, replica_id: &str) -> Result<bool> {
+  std::fs::create_dir_all(sidecar_path)?;
+  with_progress_lock(sidecar_path, || {
+    let file_path = progress_file_path(sidecar_path);
+    let mut progress = read_progress_file(&file_path)?;
+    if progress.remove(replica_id).is_none() {
+      return Ok(false);
+    }
+    write_progress_file(&file_path, &progress)?;
+    Ok(true)
   })
 }
 
@@ -106,7 +124,7 @@ fn write_progress_file(path: &Path, progress: &HashMap<String, ReplicaProgress>)
   file.write_all(&bytes)?;
   file.sync_all()?;
   fs::rename(&temp_path, path)?;
-  sync_parent_dir(path.parent())?;
+  sync_parent_dir(path)?;
   Ok(())
 }
 
@@ -133,20 +151,4 @@ fn with_progress_lock<T>(sidecar_path: &Path, f: impl FnOnce() -> Result<T>) -> 
     (Ok(_), Err(error)) => Err(error.into()),
     (Err(error), _) => Err(error),
   }
-}
-
-fn sync_parent_dir(parent: Option<&Path>) -> Result<()> {
-  #[cfg(unix)]
-  {
-    if let Some(parent) = parent {
-      std::fs::File::open(parent)?.sync_all()?;
-    }
-  }
-
-  #[cfg(not(unix))]
-  {
-    let _ = parent;
-  }
-
-  Ok(())
 }

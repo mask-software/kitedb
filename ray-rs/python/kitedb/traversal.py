@@ -42,7 +42,7 @@ from typing import (
     Union,
 )
 
-from .builders import NodeRef, from_prop_value
+from .builders import NodeRef, from_prop_value, prop_names_by_key_id
 from .schema import EdgeDef, NodeDef
 
 if TYPE_CHECKING:
@@ -77,6 +77,18 @@ class BothStep:
     edge_def: Optional[EdgeDef] = None
 
 
+_DIRECTIONS = ("out", "in", "both")
+
+
+def _check_direction(direction: str) -> str:
+    """Return `direction`, or raise ValueError if it isn't out, in or both."""
+    if direction not in _DIRECTIONS:
+        raise ValueError(
+            f"unknown direction {direction!r}; expected one of: out, in, both"
+        )
+    return direction
+
+
 @dataclass
 class TraverseOptions:
     """Options for variable-depth traversal."""
@@ -86,6 +98,9 @@ class TraverseOptions:
     unique: bool = True
     where_edge: Optional[Callable[["EdgeResult"], bool]] = None
     where_node: Optional[Callable[[NodeRef[Any]], bool]] = None
+
+    def __post_init__(self) -> None:
+        _check_direction(self.direction)
 
 
 @dataclass
@@ -220,6 +235,21 @@ class TraversalResult(Generic[N]):
         self._resolve_prop_key_id = resolve_prop_key_id
         self._get_node_def = get_node_def
         self._prop_strategy = prop_strategy
+        self._prop_names_cache: Dict[str, Dict[int, str]] = {}
+
+    def _prop_names(self, node_def: NodeDef) -> Dict[int, str]:
+        """Property key ID -> property name for a node type (cached)."""
+        names = self._prop_names_cache.get(node_def.name)
+        if names is None:
+            names = prop_names_by_key_id(node_def, self._resolve_prop_key_id)
+            self._prop_names_cache[node_def.name] = names
+        return names
+
+    def _step_etype_id(self, step: TraversalStep) -> Optional[int]:
+        """Edge type ID a step filters on, or None for any type."""
+        if step.edge_def is None:
+            return None
+        return self._resolve_etype_id(step.edge_def)
     
     def _load_node_props(
         self,
@@ -240,8 +270,7 @@ class TraversalResult(Generic[N]):
         if all_props is None:
             return props
         
-        # Build reverse mapping: prop_key_id -> prop_name
-        key_id_to_name = {v: k for k, v in node_def._prop_key_ids.items()}
+        key_id_to_name = self._prop_names(node_def)
         
         for node_prop in all_props:
             prop_name = key_id_to_name.get(node_prop.key_id)
@@ -568,15 +597,7 @@ class TraversalResult(Generic[N]):
     
     def _build_steps_for_rust(self) -> List[Tuple[str, Optional[int]]]:
         """Build step tuples for Rust traverse_multi call."""
-        rust_steps = []
-        for step in self._steps:
-            etype_id = None
-            if step.edge_def is not None:
-                etype_id = step.edge_def._etype_id
-                if etype_id is None:
-                    etype_id = self._resolve_etype_id(step.edge_def)
-            rust_steps.append((step.type, etype_id))
-        return rust_steps
+        return [(step.type, self._step_etype_id(step)) for step in self._steps]
     
     def _execute_fast(self) -> Generator[int, None, None]:
         """Execute traversal and yield only node IDs (fastest path)."""
@@ -593,11 +614,7 @@ class TraversalResult(Generic[N]):
         # For multi-step, use Rust batch traversal
         if len(self._steps) == 1:
             step = self._steps[0]
-            etype_id = None
-            if step.edge_def is not None:
-                etype_id = step.edge_def._etype_id
-                if etype_id is None:
-                    etype_id = self._resolve_etype_id(step.edge_def)
+            etype_id = self._step_etype_id(step)
             
             visited: Set[int] = set()
             for node in self._start_nodes:
@@ -637,11 +654,7 @@ class TraversalResult(Generic[N]):
         # For single step, use direct batch call (lower overhead)
         if len(self._steps) == 1:
             step = self._steps[0]
-            etype_id = None
-            if step.edge_def is not None:
-                etype_id = step.edge_def._etype_id
-                if etype_id is None:
-                    etype_id = self._resolve_etype_id(step.edge_def)
+            etype_id = self._step_etype_id(step)
             
             visited: Set[int] = set()
             for node in self._start_nodes:
@@ -681,11 +694,7 @@ class TraversalResult(Generic[N]):
         # For single step, count directly
         if len(self._steps) == 1:
             step = self._steps[0]
-            etype_id = None
-            if step.edge_def is not None:
-                etype_id = step.edge_def._etype_id
-                if etype_id is None:
-                    etype_id = self._resolve_etype_id(step.edge_def)
+            etype_id = self._step_etype_id(step)
             
             visited: Set[int] = set()
             for node in self._start_nodes:
@@ -932,6 +941,7 @@ class TraversalBuilder(Generic[N]):
             edge: Edge definition to traverse
             options: TraverseOptions (max_depth required)
         """
+        _check_direction(options.direction)
         clone = self._fork()
         clone._steps.append(TraverseStep(edge_def=edge, options=options))
         return clone
@@ -1241,8 +1251,8 @@ class PathFindingBuilder(Generic[N]):
         return self
     
     def direction(self, dir: Literal["out", "in", "both"]) -> PathFindingBuilder[N]:
-        """Set traversal direction."""
-        self._direction = dir
+        """Set traversal direction ("out", "in" or "both")."""
+        self._direction = _check_direction(dir)
         return self
     
     def with_props(self) -> PathFindingBuilder[N]:

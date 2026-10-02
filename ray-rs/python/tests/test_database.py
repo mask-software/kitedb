@@ -214,8 +214,46 @@ class TestDatabase:
                 
                 labels = db.get_node_labels(node_id)
                 assert person_label in labels
-                
+
                 db.commit()
+
+    def test_writes_to_missing_targets_raise_not_found(self):
+        """Writes to a missing node or edge raise NotFoundError and store nothing."""
+        from kitedb import NotFoundError
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "test.kitedb")
+            with Database(path) as db:
+                db.begin()
+                a = db.create_node("a")
+                b = db.create_node("b")
+                deleted = db.create_node("deleted")
+                knows = db.get_or_create_etype("knows")
+                name = db.get_or_create_propkey("name")
+                embedding = db.get_or_create_propkey("embedding")
+                tag = db.define_label("Tag")
+                db.commit()
+
+                value = PropValue.string("x")
+                db.begin()
+                db.delete_node(deleted)
+                for node_id in (deleted, 424242):
+                    with pytest.raises(NotFoundError, match="Node not found"):
+                        db.set_node_prop(node_id, name, value)
+                    with pytest.raises(NotFoundError, match="Node not found"):
+                        db.add_node_label(node_id, tag)
+                    with pytest.raises(NotFoundError, match="Node not found"):
+                        db.set_node_vector(node_id, embedding, [1.0, 0.0, 0.0])
+                # a and b exist, but no edge joins them.
+                with pytest.raises(NotFoundError, match="Edge not found"):
+                    db.set_edge_prop(a, knows, b, name, value)
+                db.commit()
+
+                for node_id in (deleted, 424242):
+                    assert db.get_node_prop(node_id, name) is None
+                    assert not db.node_has_label(node_id, tag)
+                    assert not db.has_node_vector(node_id, embedding)
+                assert db.get_edge_prop(a, knows, b, name) is None
 
 
 class TestTraversal:

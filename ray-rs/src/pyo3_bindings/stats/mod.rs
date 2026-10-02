@@ -3,8 +3,8 @@
 //! This module contains all statistics and metrics types:
 //! - Database stats (nodes, edges, WAL info)
 //! - Check results
-//! - Cache stats
-//! - Comprehensive metrics (cache, data, MVCC, memory)
+//! - Cache stats (deprecated stubs: the cache layer was removed)
+//! - Comprehensive metrics (data, MVCC, memory, replication)
 //! - Health check results
 
 pub mod database;

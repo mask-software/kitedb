@@ -1,6 +1,6 @@
 # Kite - Embedded Graph Database
 
-A high-performance embedded graph database for Bun/TypeScript with:
+A high-performance embedded graph database written in Rust, with bindings for Node.js/Bun (TypeScript) and Python:
 
 - **Fast reads** via mmap CSR (Compressed Sparse Row) snapshots
 - **Reliable writes** via WAL (Write-Ahead Log) + in-memory delta overlay
@@ -33,8 +33,8 @@ bun add @kitedb/core
 Or for development:
 
 ```bash
-git clone <repo>
-cd raydb
+git clone https://github.com/mask-software/kitedb.git
+cd kitedb
 bun install
 ```
 
@@ -46,7 +46,8 @@ This uses an in-memory filesystem by default (ephemeral per page load).
 Build the WASM bundle locally:
 
 ```bash
-npm run build:wasm
+cd ray-rs
+bun run build:wasm
 ```
 
 Then import `@kitedb/core` in your browser bundler (it uses the `browser` entry).
@@ -123,12 +124,12 @@ The `.kitedb` format contains:
 - In-edges and out-edges stored separately
 - String table for interned strings
 - Key index for fast lookups
-- CRC32C integrity checking
+- CRC-32 integrity checking
 
 ### WAL Records
 
 - 8-byte aligned records
-- CRC32C per record
+- CRC-32 per record
 - Transaction boundaries (BEGIN/COMMIT/ROLLBACK)
 
 ## Development

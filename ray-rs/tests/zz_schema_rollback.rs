@@ -184,7 +184,9 @@ fn uncommitted_schema_is_invisible_to_another_transaction_until_commit() {
 fn concurrent_same_name_definitions_share_id_and_preserve_both_writes() {
   let dir = tempfile::tempdir().expect("tempdir");
   let path = dir.path().join("schema-reservation.kitedb");
-  let db = Arc::new(open_single_file(&path, options()).expect("open"));
+  // Write transactions open at once need MVCC (without it they run one at a time).
+  let db =
+    Arc::new(open_single_file(&path, options().mvcc(true).mvcc_gc_interval_ms(10)).expect("open"));
   let (node_a, node_b) = seed_nodes(&db);
   let barrier = Arc::new(Barrier::new(3));
   let (ids_tx, ids_rx) = mpsc::channel();

@@ -1,7 +1,7 @@
 //! Replication segment log storage.
 
 use crate::error::{KiteError, Result};
-use crate::util::crc::{crc32c, crc32c_multi};
+use crate::util::crc::{crc32, crc32_multi};
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
@@ -177,7 +177,7 @@ impl SegmentLogStore {
       FRAME_FLAG_CRC32_DISABLED
     };
     let crc32 = if with_crc {
-      crc32c_multi(payload_segments)
+      crc32_multi(payload_segments)
     } else {
       0
     };
@@ -247,7 +247,7 @@ impl SegmentLogStore {
         .iter()
         .map(|segment| segment.as_slice())
         .collect();
-      crc32c_multi(&refs)
+      crc32_multi(&refs)
     } else {
       0
     };
@@ -454,7 +454,7 @@ fn read_frame(reader: &mut impl Read) -> Result<Option<ReplicationFrame>> {
     .map_err(|error| map_unexpected_eof(error, "payload"))?;
 
   if !crc_disabled {
-    let computed_crc32 = crc32c(&payload);
+    let computed_crc32 = crc32(&payload);
     if computed_crc32 != stored_crc32 {
       return Err(KiteError::CrcMismatch {
         stored: stored_crc32,

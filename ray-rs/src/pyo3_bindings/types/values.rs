@@ -15,7 +15,7 @@ pub enum PropType {
 }
 
 /// Property value wrapper for Python
-#[pyclass(name = "PropValue")]
+#[pyclass(name = "PropValue", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PropValue {
   #[pyo3(get)]
@@ -114,7 +114,7 @@ impl PropValue {
   }
 
   /// Get the Python value
-  fn value(&self, py: Python<'_>) -> PyResult<PyObject> {
+  fn value(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
     use pyo3::IntoPyObjectExt;
     match self.prop_type.as_str() {
       "null" => Ok(py.None()),

@@ -3,8 +3,8 @@
 use crate::metrics as core_metrics;
 use pyo3::prelude::*;
 
-/// Cache layer metrics (single layer - property, traversal, or query)
-#[pyclass(name = "CacheLayerMetrics")]
+/// Deprecated: the cache layer was removed; every field is zero.
+#[pyclass(name = "CacheLayerMetrics", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct CacheLayerMetrics {
   #[pyo3(get)]
@@ -33,21 +33,9 @@ impl CacheLayerMetrics {
   }
 }
 
-impl From<core_metrics::CacheLayerMetrics> for CacheLayerMetrics {
-  fn from(metrics: core_metrics::CacheLayerMetrics) -> Self {
-    CacheLayerMetrics {
-      hits: metrics.hits,
-      misses: metrics.misses,
-      hit_rate: metrics.hit_rate,
-      size: metrics.size,
-      max_size: metrics.max_size,
-      utilization_percent: metrics.utilization_percent,
-    }
-  }
-}
-
-/// Cache metrics (all cache layers)
-#[pyclass(name = "CacheMetrics")]
+/// Deprecated: the cache layer was removed; `enabled` is False and every
+/// count is zero.
+#[pyclass(name = "CacheMetrics", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct CacheMetrics {
   #[pyo3(get)]
@@ -73,19 +61,28 @@ impl CacheMetrics {
   }
 }
 
-impl From<core_metrics::CacheMetrics> for CacheMetrics {
-  fn from(metrics: core_metrics::CacheMetrics) -> Self {
+impl CacheMetrics {
+  /// What `collect_metrics()` reports for the removed cache layer.
+  fn removed() -> Self {
+    let empty = || CacheLayerMetrics {
+      hits: 0,
+      misses: 0,
+      hit_rate: 0.0,
+      size: 0,
+      max_size: 0,
+      utilization_percent: 0.0,
+    };
     CacheMetrics {
-      enabled: metrics.enabled,
-      property_cache: metrics.property_cache.into(),
-      traversal_cache: metrics.traversal_cache.into(),
-      query_cache: metrics.query_cache.into(),
+      enabled: false,
+      property_cache: empty(),
+      traversal_cache: empty(),
+      query_cache: empty(),
     }
   }
 }
 
 /// Data metrics (node/edge counts)
-#[pyclass(name = "DataMetrics")]
+#[pyclass(name = "DataMetrics", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct DataMetrics {
   #[pyo3(get)]
@@ -141,7 +138,7 @@ impl From<core_metrics::DataMetrics> for DataMetrics {
 }
 
 /// MVCC metrics
-#[pyclass(name = "MvccMetrics")]
+#[pyclass(name = "MvccMetrics", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct MvccMetrics {
   #[pyo3(get)]
@@ -185,7 +182,7 @@ impl From<core_metrics::MvccMetrics> for MvccMetrics {
 }
 
 /// Primary replication metrics
-#[pyclass(name = "PrimaryReplicationMetrics")]
+#[pyclass(name = "PrimaryReplicationMetrics", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PrimaryReplicationMetrics {
   #[pyo3(get)]
@@ -250,7 +247,7 @@ impl From<core_metrics::PrimaryReplicationMetrics> for PrimaryReplicationMetrics
 }
 
 /// Replica replication metrics
-#[pyclass(name = "ReplicaReplicationMetrics")]
+#[pyclass(name = "ReplicaReplicationMetrics", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct ReplicaReplicationMetrics {
   #[pyo3(get)]
@@ -285,7 +282,7 @@ impl From<core_metrics::ReplicaReplicationMetrics> for ReplicaReplicationMetrics
 }
 
 /// Replication metrics
-#[pyclass(name = "ReplicationMetrics")]
+#[pyclass(name = "ReplicationMetrics", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct ReplicationMetrics {
   #[pyo3(get)]
@@ -320,7 +317,7 @@ impl From<core_metrics::ReplicationMetrics> for ReplicationMetrics {
 }
 
 /// MVCC stats (from stats())
-#[pyclass(name = "MvccStats")]
+#[pyclass(name = "MvccStats", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct MvccStats {
   #[pyo3(get)]
@@ -350,11 +347,12 @@ impl MvccStats {
 }
 
 /// Memory metrics
-#[pyclass(name = "MemoryMetrics")]
+#[pyclass(name = "MemoryMetrics", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct MemoryMetrics {
   #[pyo3(get)]
   pub delta_estimate_bytes: i64,
+  /// Deprecated: always 0 (the cache layer was removed).
   #[pyo3(get)]
   pub cache_estimate_bytes: i64,
   #[pyo3(get)]
@@ -397,7 +395,7 @@ impl From<core_metrics::MemoryMetrics> for MemoryMetrics {
   fn from(metrics: core_metrics::MemoryMetrics) -> Self {
     MemoryMetrics {
       delta_estimate_bytes: metrics.delta_estimate_bytes,
-      cache_estimate_bytes: metrics.cache_estimate_bytes,
+      cache_estimate_bytes: 0,
       snapshot_bytes: metrics.snapshot_bytes,
       total_estimate_bytes: metrics.total_estimate_bytes,
     }
@@ -405,7 +403,7 @@ impl From<core_metrics::MemoryMetrics> for MemoryMetrics {
 }
 
 /// Database metrics (complete snapshot)
-#[pyclass(name = "DatabaseMetrics")]
+#[pyclass(name = "DatabaseMetrics", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct DatabaseMetrics {
   #[pyo3(get)]
@@ -416,6 +414,7 @@ pub struct DatabaseMetrics {
   pub read_only: bool,
   #[pyo3(get)]
   pub data: DataMetrics,
+  /// Deprecated: reports a disabled, empty cache (the cache layer was removed).
   #[pyo3(get)]
   pub cache: CacheMetrics,
   #[pyo3(get)]
@@ -448,7 +447,7 @@ impl From<core_metrics::DatabaseMetrics> for DatabaseMetrics {
       is_single_file: metrics.is_single_file,
       read_only: metrics.read_only,
       data: metrics.data.into(),
-      cache: metrics.cache.into(),
+      cache: CacheMetrics::removed(),
       mvcc: metrics.mvcc.map(Into::into),
       replication: metrics.replication.into(),
       memory: metrics.memory.into(),
@@ -458,7 +457,7 @@ impl From<core_metrics::DatabaseMetrics> for DatabaseMetrics {
 }
 
 /// Health check entry
-#[pyclass(name = "HealthCheckEntry")]
+#[pyclass(name = "HealthCheckEntry", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct HealthCheckEntry {
   #[pyo3(get)]
@@ -495,7 +494,7 @@ impl From<core_metrics::HealthCheckEntry> for HealthCheckEntry {
 }
 
 /// Health check result
-#[pyclass(name = "HealthCheckResult")]
+#[pyclass(name = "HealthCheckResult", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct HealthCheckResult {
   #[pyo3(get)]

@@ -43,9 +43,6 @@ pub mod vector;
 pub mod backup;
 pub mod metrics;
 
-// Cache modules
-pub mod cache;
-
 // Export/import
 pub mod export;
 
@@ -61,6 +58,10 @@ pub mod api;
 // Concurrent access tests (test-only)
 #[cfg(test)]
 mod concurrent_tests;
+
+// raydb-b4 engine-concurrency lane repros that need private access
+#[cfg(test)]
+mod b4_engine_concurrency_tests;
 
 // NAPI bindings module
 #[cfg(feature = "napi")]

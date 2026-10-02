@@ -28,36 +28,6 @@ use std::sync::Arc;
 // Single-file transaction wrappers
 // ============================================================================
 
-#[derive(Debug, Clone, Default)]
-struct NodeOpts {
-  key: Option<String>,
-  labels: Option<Vec<LabelId>>,
-  props: Option<Vec<(PropKeyId, PropValue)>>,
-}
-
-impl NodeOpts {
-  fn new() -> Self {
-    Self::default()
-  }
-
-  fn with_key(mut self, key: impl Into<String>) -> Self {
-    self.key = Some(key.into());
-    self
-  }
-
-  #[allow(dead_code)]
-  fn with_label(mut self, label: LabelId) -> Self {
-    self.labels.get_or_insert_with(Vec::new).push(label);
-    self
-  }
-
-  #[allow(dead_code)]
-  fn with_prop(mut self, key: PropKeyId, value: PropValue) -> Self {
-    self.props.get_or_insert_with(Vec::new).push((key, value));
-    self
-  }
-}
-
 struct TxHandle<'a> {
   db: &'a SingleFileDB,
   finished: bool,
@@ -85,6 +55,7 @@ impl<'a> Drop for TxHandle<'a> {
   }
 }
 
+/// Begin a write transaction, or join the one already open on this thread.
 fn begin_tx(db: &SingleFileDB) -> Result<TxHandle<'_>> {
   if db.has_transaction() {
     db.require_write_tx()?;
@@ -103,12 +74,12 @@ fn commit(handle: &mut TxHandle) -> Result<()> {
   Ok(())
 }
 
-fn rollback(handle: &mut TxHandle) -> Result<()> {
-  if handle.owns_tx {
-    handle.db.rollback()?;
-  }
+/// Roll back the transaction `handle` is in, including one it joined: a batch or transaction
+/// that fails inside an open transaction aborts all of it, so none of its writes can be committed
+/// by the outer transaction. A rollback error is ignored: the caller reports the original error.
+fn abort(handle: &mut TxHandle) {
+  let _ = handle.db.rollback();
   handle.finished = true;
-  Ok(())
 }
 
 #[derive(Debug, Clone, Default)]
@@ -116,36 +87,12 @@ struct ListEdgesOptions {
   pub etype: Option<ETypeId>,
 }
 
-fn create_node(handle: &mut TxHandle, opts: NodeOpts) -> Result<NodeId> {
-  let node_id = handle.db.create_node(opts.key.as_deref())?;
-  if let Some(labels) = opts.labels {
-    for label_id in labels {
-      handle.db.add_node_label(node_id, label_id)?;
-    }
+/// Label `node_id` with its type's label (every Kite node carries one).
+fn label_node(handle: &mut TxHandle, node_id: NodeId, node_def: &NodeDef) -> Result<()> {
+  match node_def.label_id {
+    Some(label_id) => handle.db.add_node_label(node_id, label_id),
+    None => Ok(()),
   }
-  if let Some(props) = opts.props {
-    for (key_id, value) in props {
-      handle.db.set_node_prop(node_id, key_id, value)?;
-    }
-  }
-  Ok(node_id)
-}
-
-fn create_node_with_id(handle: &mut TxHandle, node_id: NodeId, opts: NodeOpts) -> Result<NodeId> {
-  let node_id = handle
-    .db
-    .create_node_with_id(node_id, opts.key.as_deref())?;
-  if let Some(labels) = opts.labels {
-    for label_id in labels {
-      handle.db.add_node_label(node_id, label_id)?;
-    }
-  }
-  if let Some(props) = opts.props {
-    for (key_id, value) in props {
-      handle.db.set_node_prop(node_id, key_id, value)?;
-    }
-  }
-  Ok(node_id)
 }
 
 fn delete_node(handle: &mut TxHandle, node_id: NodeId) -> Result<bool> {
@@ -193,36 +140,49 @@ fn del_node_prop(handle: &mut TxHandle, node_id: NodeId, key_id: PropKeyId) -> R
   handle.db.delete_node_prop(node_id, key_id)
 }
 
-fn upsert_node_with_props<I>(
+/// Upsert the node of `node_def`'s type keyed `key_suffix`: update its props if it exists,
+/// else create it like [`create_typed_node`]. Returns the node id and its full key.
+fn upsert_typed_node<I>(
   handle: &mut TxHandle,
-  key: &str,
-  node_def: Option<&NodeDef>,
-  strict: bool,
+  schema: &Schema,
+  node_def: &NodeDef,
+  key_suffix: &str,
   props: I,
-) -> Result<(NodeId, bool)>
+) -> Result<(NodeId, String)>
 where
   I: IntoIterator<Item = (String, Option<PropValue>)>,
 {
-  let existing = handle.db.node_by_key(key);
-  let write = match existing {
-    Some(_) => NodeWrite::Update,
-    None => NodeWrite::Create,
+  let full_key = node_def.key(key_suffix);
+  let Some(node_id) = node_by_key(handle, &full_key) else {
+    let props = resolve_node_props(
+      handle.db,
+      Some(node_def),
+      schema.strict,
+      NodeWrite::Create,
+      props,
+    )?;
+    schema.check_key_owner(node_def, &full_key)?;
+    let node_id = handle.db.create_node(Some(&full_key))?;
+    label_node(handle, node_id, node_def)?;
+    apply_node_props(handle, node_id, props)?;
+    return Ok((node_id, full_key));
   };
-  let props = resolve_node_props(handle.db, node_def, strict, write, props)?;
-
-  let (node_id, created) = match existing {
-    Some(existing) => (existing, false),
-    None => (create_node(handle, NodeOpts::new().with_key(key))?, true),
-  };
+  let props = resolve_node_props(
+    handle.db,
+    Some(node_def),
+    schema.strict,
+    NodeWrite::Update,
+    props,
+  )?;
   apply_node_props(handle, node_id, props)?;
-
-  Ok((node_id, created))
+  Ok((node_id, full_key))
 }
 
+/// Upsert node `node_id`: update its props if it exists, else create it, unkeyed, with
+/// `node_def`'s type label (which is how its type is resolved).
 fn upsert_node_by_id_with_props<I>(
   handle: &mut TxHandle,
   node_id: NodeId,
-  opts: NodeOpts,
   node_def: &NodeDef,
   strict: bool,
   props: I,
@@ -239,7 +199,8 @@ where
   let props = resolve_node_props(handle.db, Some(node_def), strict, write, props)?;
 
   if created {
-    create_node_with_id(handle, node_id, opts)?;
+    handle.db.create_node_with_id(node_id, None)?;
+    label_node(handle, node_id, node_def)?;
   }
   apply_node_props(handle, node_id, props)?;
 
@@ -443,6 +404,10 @@ pub struct NodeDef {
   /// Property definitions
   pub props: HashMap<String, PropDef>,
   /// Key prefix for this node type (e.g., "user:")
+  ///
+  /// A key belongs to the type with the longest prefix it starts with. Types may share a prefix
+  /// (their nodes are told apart by type label), but a type cannot create a key that a longer
+  /// prefix claims: with "user:" and "user:admin:", `User` key "admin:x" fails.
   pub key_prefix: String,
   /// Internal label ID (set after registration)
   pub label_id: Option<LabelId>,
@@ -519,8 +484,9 @@ enum NodeWrite {
 /// - with `strict`, a `required` prop must be present on create, and every value must match its
 ///   `prop_type` (int<->float is coerced only when lossless).
 ///
-/// `None` values are deletions (`unset`) and pass through unchecked. Only prop keys are written,
-/// so callers resolve before creating the node and a rejected write leaves no node behind.
+/// `None` values are deletions (`unset`) and pass through unchecked; unsetting a prop whose key
+/// was never defined is dropped (there is nothing to delete). Only prop keys are written, so
+/// callers resolve before creating the node and a rejected write leaves no node behind.
 fn resolve_node_props<I>(
   db: &SingleFileDB,
   node_def: Option<&NodeDef>,
@@ -556,28 +522,94 @@ where
     }
   }
 
-  props
-    .into_iter()
-    .map(|(name, value)| {
-      let declared = node_def.and_then(|def| def.props.get(&name).map(|prop| (def, prop)));
-      let value = match (value, declared) {
-        (Some(value), Some((def, prop))) if strict => {
-          Some(coerce_prop_value(&def.name, prop, value)?)
-        }
-        (value, _) => value,
-      };
-      let key_id = match node_def.and_then(|def| def.prop_key_ids.get(&name)) {
-        Some(&key_id) => key_id,
-        None => db.define_propkey(&name)?,
-      };
-      Ok((key_id, value))
-    })
-    .collect()
+  let (type_name, declared, key_ids) = match node_def {
+    Some(def) => (def.name.as_str(), Some(&def.props), Some(&def.prop_key_ids)),
+    None => ("", None, None),
+  };
+  resolve_props(db, type_name, declared, key_ids, strict, props)
+}
+
+/// Resolve prop writes into key ids: with `strict`, check each declared prop's value against its
+/// `prop_type` (int<->float is coerced only when lossless). `Some` values define their key on
+/// demand; `None` values (unset) of a never-defined key are dropped.
+fn resolve_props<I>(
+  db: &SingleFileDB,
+  type_name: &str,
+  declared: Option<&HashMap<String, PropDef>>,
+  key_ids: Option<&HashMap<String, PropKeyId>>,
+  strict: bool,
+  props: I,
+) -> Result<Vec<(PropKeyId, Option<PropValue>)>>
+where
+  I: IntoIterator<Item = (String, Option<PropValue>)>,
+{
+  let mut resolved = Vec::new();
+  for (name, value) in props {
+    let known_key = key_ids
+      .and_then(|ids| ids.get(&name).copied())
+      .or_else(|| db.propkey_id(&name));
+    let entry = match value {
+      Some(value) => {
+        let value = match declared.and_then(|props| props.get(&name)) {
+          Some(prop) if strict => coerce_prop_value(type_name, prop, value)?,
+          _ => value,
+        };
+        let key_id = match known_key {
+          Some(key_id) => key_id,
+          None => db.define_propkey(&name)?,
+        };
+        (key_id, Some(value))
+      }
+      None => match known_key {
+        Some(key_id) => (key_id, None),
+        None => continue,
+      },
+    };
+    resolved.push(entry);
+  }
+  Ok(resolved)
+}
+
+/// Resolve the props of an edge write (see [`resolve_props`]); `strict_schema` covers declared
+/// edge props' types.
+fn resolve_edge_props<I>(
+  db: &SingleFileDB,
+  edge_def: &EdgeDef,
+  strict: bool,
+  props: I,
+) -> Result<Vec<(PropKeyId, Option<PropValue>)>>
+where
+  I: IntoIterator<Item = (String, Option<PropValue>)>,
+{
+  resolve_props(
+    db,
+    &edge_def.name,
+    Some(&edge_def.props),
+    Some(&edge_def.prop_key_ids),
+    strict,
+    props,
+  )
+}
+
+/// [`resolve_edge_props`] for values that are all set.
+fn resolve_edge_values(
+  db: &SingleFileDB,
+  edge_def: &EdgeDef,
+  strict: bool,
+  props: HashMap<String, PropValue>,
+) -> Result<Vec<(PropKeyId, PropValue)>> {
+  let props = props.into_iter().map(|(name, value)| (name, Some(value)));
+  Ok(
+    resolve_edge_props(db, edge_def, strict, props)?
+      .into_iter()
+      .filter_map(|(key_id, value)| Some((key_id, value?)))
+      .collect(),
+  )
 }
 
 /// Check `value` against the declared type of `prop`. `Null` and `PropType::Any` always pass;
 /// int<->float is coerced only when the conversion is exact.
-fn coerce_prop_value(node_type: &str, prop: &PropDef, value: PropValue) -> Result<PropValue> {
+fn coerce_prop_value(type_name: &str, prop: &PropDef, value: PropValue) -> Result<PropValue> {
   let coerced = match (prop.prop_type, &value) {
     (PropType::Any, _)
     | (_, PropValue::Null)
@@ -596,7 +628,7 @@ fn coerce_prop_value(node_type: &str, prop: &PropDef, value: PropValue) -> Resul
       other => format!("{:?}", other.tag()),
     };
     KiteError::SchemaViolation(format!(
-      "{node_type}.{} expects {:?}, got {got}",
+      "{type_name}.{} expects {:?}, got {got}",
       prop.name, prop.prop_type
     ))
   })
@@ -615,50 +647,28 @@ fn lossless_f64(int: i64) -> Option<f64> {
   (lossless_i64(float) == Some(int)).then_some(float)
 }
 
-/// Schema type of an existing node: by key prefix (longest match wins), else by label.
-fn node_def_of<'a>(
-  nodes: &'a HashMap<String, NodeDef>,
-  db: &SingleFileDB,
-  node_id: NodeId,
-) -> Option<&'a NodeDef> {
-  let by_key = db.node_key(node_id).and_then(|key| {
-    nodes
-      .values()
-      .filter(|def| key.starts_with(&def.key_prefix))
-      .max_by_key(|def| def.key_prefix.len())
-  });
-  by_key.or_else(|| {
-    let labels = db.node_labels(node_id);
-    nodes
-      .values()
-      .find(|def| def.label_id.is_some_and(|label| labels.contains(&label)))
-  })
-}
-
 /// Resolve the props of an update to an existing node. The node must exist inside the tx.
 fn resolve_node_update<I>(
   handle: &TxHandle,
-  nodes: &HashMap<String, NodeDef>,
-  strict: bool,
+  schema: &Schema,
   node_id: NodeId,
   props: I,
 ) -> Result<Vec<(PropKeyId, Option<PropValue>)>>
 where
   I: IntoIterator<Item = (String, Option<PropValue>)>,
 {
-  if !node_exists(handle, node_id) {
-    return Err(KiteError::NodeNotFound(node_id));
-  }
+  require_node(handle, node_id)?;
   // The node's type only matters for type checks.
-  let node_def = if strict {
-    node_def_of(nodes, handle.db, node_id)
+  let node_def = if schema.strict {
+    schema.node_type_of(handle.db, node_id, handle.db.node_key(node_id).as_deref())
   } else {
     None
   };
-  resolve_node_props(handle.db, node_def, strict, NodeWrite::Update, props)
+  resolve_node_props(handle.db, node_def, schema.strict, NodeWrite::Update, props)
 }
 
-/// Apply resolved props: `Some` sets a value, `None` deletes it.
+/// Apply resolved props: `Some` sets a value, `None` deletes it (writing nothing if the prop is
+/// not set). Callers check that the node exists: an unset on a missing node writes nothing.
 fn apply_node_props(
   handle: &mut TxHandle,
   node_id: NodeId,
@@ -667,37 +677,95 @@ fn apply_node_props(
   for (key_id, value) in props {
     match value {
       Some(value) => set_node_prop(handle, node_id, key_id, value)?,
-      None => del_node_prop(handle, node_id, key_id)?,
+      None if node_prop(handle, node_id, key_id).is_some() => {
+        del_node_prop(handle, node_id, key_id)?
+      }
+      None => {}
     }
   }
   Ok(())
 }
 
-/// Create a keyed, labeled node of `node_def`'s type with `props` (create_node, batch and
-/// transaction paths). Returns the node id and its full key.
+/// Apply resolved edge props: `Some` sets a value, `None` deletes it (writing nothing if the prop
+/// is not set). Callers check that the edge exists: an unset on a missing edge writes nothing.
+fn apply_edge_props(
+  handle: &mut TxHandle,
+  src: NodeId,
+  etype: ETypeId,
+  dst: NodeId,
+  props: Vec<(PropKeyId, Option<PropValue>)>,
+) -> Result<()> {
+  let mut sets = Vec::with_capacity(props.len());
+  for (key_id, value) in props {
+    match value {
+      Some(value) => sets.push((key_id, value)),
+      None if handle.db.edge_prop(src, etype, dst, key_id).is_some() => {
+        del_edge_prop(handle, src, etype, dst, key_id)?
+      }
+      None => {}
+    }
+  }
+  if !sets.is_empty() {
+    handle.db.set_edge_props(src, etype, dst, sets)?;
+  }
+  Ok(())
+}
+
+/// Create a keyed, labeled node of `node_def`'s type with `props`. Every node-creating path
+/// (create_node, insert, upsert, batch, transaction) goes through this or
+/// [`create_typed_nodes`]. Returns the node id and its full key.
 fn create_typed_node(
   handle: &mut TxHandle,
+  schema: &Schema,
   node_def: &NodeDef,
-  strict: bool,
   key_suffix: &str,
   props: HashMap<String, PropValue>,
 ) -> Result<(NodeId, String)> {
   let props = resolve_node_props(
     handle.db,
     Some(node_def),
-    strict,
+    schema.strict,
     NodeWrite::Create,
     props.into_iter().map(|(name, value)| (name, Some(value))),
   )?;
   let full_key = node_def.key(key_suffix);
-  let node_opts = NodeOpts {
-    key: Some(full_key.clone()),
-    labels: node_def.label_id.map(|id| vec![id]),
-    props: None,
-  };
-  let node_id = create_node(handle, node_opts)?;
+  schema.check_key_owner(node_def, &full_key)?;
+  let node_id = handle.db.create_node(Some(&full_key))?;
+  label_node(handle, node_id, node_def)?;
   apply_node_props(handle, node_id, props)?;
   Ok((node_id, full_key))
+}
+
+/// [`create_typed_node`] for many nodes, created with one WAL record. Every node is validated
+/// before any is created. Returns the node ids and full keys, in order.
+fn create_typed_nodes<S: AsRef<str>>(
+  handle: &mut TxHandle,
+  schema: &Schema,
+  node_def: &NodeDef,
+  entries: Vec<(S, HashMap<String, PropValue>)>,
+) -> Result<Vec<(NodeId, String)>> {
+  let mut keys = Vec::with_capacity(entries.len());
+  let mut all_props = Vec::with_capacity(entries.len());
+  for (key_suffix, props) in entries {
+    all_props.push(resolve_node_props(
+      handle.db,
+      Some(node_def),
+      schema.strict,
+      NodeWrite::Create,
+      props.into_iter().map(|(name, value)| (name, Some(value))),
+    )?);
+    let full_key = node_def.key(key_suffix.as_ref());
+    schema.check_key_owner(node_def, &full_key)?;
+    keys.push(full_key);
+  }
+
+  let key_refs: Vec<Option<&str>> = keys.iter().map(|key| Some(key.as_str())).collect();
+  let node_ids = handle.db.create_nodes_batch(&key_refs)?;
+  for (&node_id, props) in node_ids.iter().zip(all_props) {
+    label_node(handle, node_id, node_def)?;
+    apply_node_props(handle, node_id, props)?;
+  }
+  Ok(node_ids.into_iter().zip(keys).collect())
 }
 
 /// Upsert treats a `Null` value as "unset this prop".
@@ -714,6 +782,191 @@ fn require_edge(handle: &TxHandle, src: NodeId, etype: ETypeId, dst: NodeId) -> 
     Ok(())
   } else {
     Err(KiteError::EdgeNotFound { src, etype, dst })
+  }
+}
+
+/// Node props may only be written on an existing node, checked inside the tx.
+fn require_node(handle: &TxHandle, node_id: NodeId) -> Result<()> {
+  if node_exists(handle, node_id) {
+    Ok(())
+  } else {
+    Err(KiteError::NodeNotFound(node_id))
+  }
+}
+
+/// Delete prop `prop_name` of node `node_id`; an undefined prop name is `InvalidSchema`. (Core
+/// reports a missing node.)
+fn delete_node_prop_by_name(handle: &mut TxHandle, node_id: NodeId, prop_name: &str) -> Result<()> {
+  let key_id = handle
+    .db
+    .propkey_id(prop_name)
+    .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown property: {prop_name}").into()))?;
+  del_node_prop(handle, node_id, key_id)
+}
+
+/// Prop values by name.
+fn props_by_name(
+  db: &SingleFileDB,
+  props: HashMap<PropKeyId, PropValue>,
+) -> HashMap<String, PropValue> {
+  props
+    .into_iter()
+    .filter_map(|(key_id, value)| Some((db.propkey_name(key_id)?, value)))
+    .collect()
+}
+
+// ============================================================================
+// Resolved schema
+// ============================================================================
+
+/// The schema a Kite was opened with, resolved against its database.
+struct Schema {
+  /// Node type definitions by name
+  nodes: HashMap<String, NodeDef>,
+  /// Edge type definitions by name
+  edges: HashMap<String, EdgeDef>,
+  /// `(key prefix, node type)`, longest prefix first (then by prefix and name), to find which
+  /// type a key belongs to.
+  key_prefixes: Vec<(String, String)>,
+  /// Node types whose key prefix another type's prefix extends or equals, so not every key that
+  /// starts with their prefix is theirs.
+  shadowed_types: HashSet<String>,
+  /// Enforce `required` and `prop_type` on writes
+  strict: bool,
+}
+
+impl Schema {
+  fn new(nodes: HashMap<String, NodeDef>, edges: HashMap<String, EdgeDef>, strict: bool) -> Self {
+    let mut key_prefixes: Vec<(String, String)> = nodes
+      .values()
+      .map(|def| (def.key_prefix.clone(), def.name.clone()))
+      .collect();
+    key_prefixes.sort_by(|(a_prefix, a_name), (b_prefix, b_name)| {
+      b_prefix
+        .len()
+        .cmp(&a_prefix.len())
+        .then_with(|| a_prefix.cmp(b_prefix))
+        .then_with(|| a_name.cmp(b_name))
+    });
+    let shadowed_types = nodes
+      .values()
+      .filter(|def| {
+        nodes
+          .values()
+          .any(|other| other.name != def.name && other.key_prefix.starts_with(&def.key_prefix))
+      })
+      .map(|def| def.name.clone())
+      .collect();
+    Self {
+      nodes,
+      edges,
+      key_prefixes,
+      shadowed_types,
+      strict,
+    }
+  }
+
+  fn node_def(&self, node_type: &str) -> Result<&NodeDef> {
+    self
+      .nodes
+      .get(node_type)
+      .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown node type: {node_type}").into()))
+  }
+
+  fn edge_def(&self, edge_type: &str) -> Result<&EdgeDef> {
+    self
+      .edges
+      .get(edge_type)
+      .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown edge type: {edge_type}").into()))
+  }
+
+  fn etype_id(&self, edge_type: &str) -> Result<ETypeId> {
+    self.edge_def(edge_type)?.etype_id.ok_or_else(|| {
+      KiteError::InvalidSchema(format!("Edge type not initialized: {edge_type}").into())
+    })
+  }
+
+  /// [`Self::etype_id`] of an optional edge type name (`None`: all edge types).
+  fn etype_filter(&self, edge_type: Option<&str>) -> Result<Option<ETypeId>> {
+    edge_type.map(|name| self.etype_id(name)).transpose()
+  }
+
+  /// The node types owning `key`: those whose key prefix is the longest one `key` starts with
+  /// (several only if they share that prefix).
+  fn key_owners(&self, key: &str) -> &[(String, String)] {
+    let Some(start) = self
+      .key_prefixes
+      .iter()
+      .position(|(prefix, _)| key.starts_with(prefix.as_str()))
+    else {
+      return &[];
+    };
+    let prefix = &self.key_prefixes[start].0;
+    let owners = self.key_prefixes[start..]
+      .iter()
+      .take_while(|(other, _)| other == prefix)
+      .count();
+    &self.key_prefixes[start..start + owners]
+  }
+
+  /// Whether `key` (built from `node_def`'s prefix) belongs to `node_def`'s type, not to a type
+  /// with a longer prefix.
+  fn owns_key(&self, node_def: &NodeDef, key: &str) -> bool {
+    !self.shadowed_types.contains(&node_def.name)
+      || self
+        .key_owners(key)
+        .iter()
+        .any(|(_, owner)| *owner == node_def.name)
+  }
+
+  /// Refuse to create a node whose key another type owns: it would resolve to that type.
+  fn check_key_owner(&self, node_def: &NodeDef, key: &str) -> Result<()> {
+    if self.owns_key(node_def, key) {
+      return Ok(());
+    }
+    let owner = self
+      .key_owners(key)
+      .first()
+      .map_or("", |(_, owner)| owner.as_str());
+    Err(KiteError::InvalidSchema(
+      format!(
+        "Key {key:?} is in the key space of node type {owner} (key prefix {:?}), so a {} node \
+         cannot use it",
+        self.nodes[owner].key_prefix, node_def.name
+      )
+      .into(),
+    ))
+  }
+
+  /// The type of existing node `node_id` with key `key`: the type owning its key (by longest key
+  /// prefix); among types sharing that prefix, or for a node whose key matches no prefix (or
+  /// that has none), the type whose label it carries.
+  fn node_type_of(
+    &self,
+    db: &SingleFileDB,
+    node_id: NodeId,
+    key: Option<&str>,
+  ) -> Option<&NodeDef> {
+    let owners = key.map_or(&[][..], |key| self.key_owners(key));
+    if let [(_, owner)] = owners {
+      return self.nodes.get(owner);
+    }
+    let labels = db.node_labels(node_id);
+    let labeled = |name: &str| {
+      self.nodes[name]
+        .label_id
+        .is_some_and(|label| labels.contains(&label))
+    };
+    let candidates = if owners.is_empty() {
+      &self.key_prefixes[..]
+    } else {
+      owners
+    };
+    candidates
+      .iter()
+      .find(|(_, name)| labeled(name))
+      .or(owners.first())
+      .and_then(|(_, name)| self.nodes.get(name))
   }
 }
 
@@ -811,12 +1064,13 @@ pub struct KiteOptions {
   pub replication_retention_min_entries: Option<u64>,
   /// Minimum retained segment age in milliseconds (primary role only)
   pub replication_retention_min_ms: Option<u64>,
-  /// Enforce node schemas on writes (default: false).
+  /// Enforce node and edge schemas on writes (default: false).
   ///
   /// When enabled, creating a node fails if a `required` prop is missing or `Null`, and every
-  /// node create/update fails if a declared prop's value does not match its `prop_type`
-  /// (int<->float is coerced only when lossless). In both modes props outside the schema are
-  /// kept and declared defaults are applied on create.
+  /// node or edge write fails if a declared prop's value does not match its `prop_type`
+  /// (int<->float is coerced only when lossless). Edge props are type-checked only: `required`
+  /// and `default` apply to nodes. In both modes props outside the schema are kept and declared
+  /// node defaults are applied on create.
   pub strict_schema: bool,
 }
 
@@ -868,7 +1122,7 @@ impl KiteOptions {
     self
   }
 
-  /// Enforce `required` and `prop_type` on node writes (see the `strict_schema` field).
+  /// Enforce `required` and `prop_type` on writes (see the `strict_schema` field).
   pub fn strict_schema(mut self, value: bool) -> Self {
     self.strict_schema = value;
     self
@@ -1099,14 +1353,8 @@ pub struct Kite {
   db: SingleFileDB,
   /// Close-time checkpoint threshold.
   close_checkpoint_if_wal_usage_at_least: Option<f64>,
-  /// Node type definitions by name
-  nodes: HashMap<String, NodeDef>,
-  /// Edge type definitions by name
-  edges: HashMap<String, EdgeDef>,
-  /// Key prefix to node def mapping for fast lookups
-  key_prefix_to_node: HashMap<String, String>,
-  /// Enforce `required` and `prop_type` on node writes
-  strict_schema: bool,
+  /// Node and edge types
+  schema: Schema,
 }
 
 impl Kite {
@@ -1185,7 +1433,6 @@ impl Kite {
     // Initialize schema, opening a write transaction only for new entries.
     let mut nodes: HashMap<String, NodeDef> = HashMap::new();
     let mut edges: HashMap<String, EdgeDef> = HashMap::new();
-    let mut key_prefix_to_node: HashMap<String, String> = HashMap::new();
     {
       let mut schema_handle = None;
 
@@ -1215,7 +1462,6 @@ impl Kite {
           node_def.prop_key_ids.insert(prop_name.clone(), prop_key_id);
         }
 
-        key_prefix_to_node.insert(node_def.key_prefix.clone(), node_def.name.clone());
         nodes.insert(node_def.name.clone(), node_def);
       }
 
@@ -1256,10 +1502,7 @@ impl Kite {
     Ok(Self {
       db,
       close_checkpoint_if_wal_usage_at_least,
-      nodes,
-      edges,
-      key_prefix_to_node,
-      strict_schema: options.strict_schema,
+      schema: Schema::new(nodes, edges, options.strict_schema),
     })
   }
 
@@ -1274,14 +1517,11 @@ impl Kite {
     key_suffix: &str,
     props: HashMap<String, PropValue>,
   ) -> Result<NodeRef> {
-    let node_def = self
-      .nodes
-      .get(node_type)
-      .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown node type: {node_type}").into()))?;
+    let node_def = self.schema.node_def(node_type)?;
 
     let mut handle = begin_tx(&self.db)?;
     let (node_id, full_key) =
-      create_typed_node(&mut handle, node_def, self.strict_schema, key_suffix, props)?;
+      create_typed_node(&mut handle, &self.schema, node_def, key_suffix, props)?;
     commit(&mut handle)?;
 
     Ok(NodeRef::new(node_id, Some(full_key), node_type))
@@ -1315,17 +1555,10 @@ impl Kite {
   /// # }
   /// ```
   pub fn insert(&mut self, node_type: &str) -> Result<KiteInsertBuilder<'_>> {
-    let key_prefix = self
-      .nodes
-      .get(node_type)
-      .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown node type: {node_type}").into()))?
-      .key_prefix
-      .clone();
-
+    self.schema.node_def(node_type)?;
     Ok(KiteInsertBuilder {
       ray: self,
       node_type: node_type.to_string(),
-      key_prefix,
     })
   }
 
@@ -1334,28 +1567,24 @@ impl Kite {
   /// Creates the node if it doesn't exist, otherwise updates properties
   /// on the existing node.
   pub fn upsert(&mut self, node_type: &str) -> Result<KiteUpsertBuilder<'_>> {
-    let key_prefix = self
-      .nodes
-      .get(node_type)
-      .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown node type: {node_type}").into()))?
-      .key_prefix
-      .clone();
-
+    self.schema.node_def(node_type)?;
     Ok(KiteUpsertBuilder {
       ray: self,
       node_type: node_type.to_string(),
-      key_prefix,
     })
   }
 
   /// Get a node by key (direct read, no transaction overhead)
+  ///
+  /// Returns `None` if no node has the key, or if the key belongs to another node type (one
+  /// whose key prefix extends this type's).
   pub fn get(&self, node_type: &str, key_suffix: &str) -> Result<Option<NodeRef>> {
-    let node_def = self
-      .nodes
-      .get(node_type)
-      .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown node type: {node_type}").into()))?;
+    let node_def = self.schema.node_def(node_type)?;
 
     let full_key = node_def.key(key_suffix);
+    if !self.schema.owns_key(node_def, &full_key) {
+      return Ok(None);
+    }
 
     // Direct read without transaction
     let node_id = node_by_key_db(&self.db, &full_key);
@@ -1367,31 +1596,22 @@ impl Kite {
   }
 
   /// Get a node by ID (direct read, no transaction overhead)
+  ///
+  /// The node's type is the one owning its key (the longest matching key prefix); for a node
+  /// without a key (e.g. created by `upsert_by_id`), or whose key prefix several types share,
+  /// it is the type whose label the node carries. A node of no schema type is `"unknown"`.
   pub fn node_by_id(&self, node_id: NodeId) -> Result<Option<NodeRef>> {
     // Direct read without transaction
-    let exists = node_exists_db(&self.db, node_id);
-
-    if exists {
-      // Look up the node's key from snapshot/delta
-      let key = self.db.node_key(node_id);
-
-      // Try to determine node type from key prefix
-      let node_type = if let Some(ref k) = key {
-        // Find matching node def by key prefix
-        self
-          .nodes
-          .values()
-          .find(|def| k.starts_with(&def.key_prefix))
-          .map(|def| def.name.as_str())
-          .unwrap_or("unknown")
-      } else {
-        "unknown"
-      };
-
-      Ok(Some(NodeRef::new(node_id, key, node_type)))
-    } else {
-      Ok(None)
+    if !node_exists_db(&self.db, node_id) {
+      return Ok(None);
     }
+
+    let key = self.db.node_key(node_id);
+    let node_type = self
+      .schema
+      .node_type_of(&self.db, node_id, key.as_deref())
+      .map_or("unknown", |def| def.name.as_str());
+    Ok(Some(NodeRef::new(node_id, key, node_type)))
   }
 
   /// Check if a node exists (direct read, no transaction overhead)
@@ -1436,7 +1656,7 @@ impl Kite {
     }
 
     let mut handle = begin_tx(&self.db)?;
-    let props = resolve_node_update(&handle, &self.nodes, self.strict_schema, node_id, props)?;
+    let props = resolve_node_update(&handle, &self.schema, node_id, props)?;
     apply_node_props(&mut handle, node_id, props)?;
     commit(&mut handle)?;
     Ok(())
@@ -1462,23 +1682,7 @@ impl Kite {
   /// # }
   /// ```
   pub fn update(&mut self, node_ref: &NodeRef) -> Result<KiteUpdateNodeBuilder<'_>> {
-    // Verify node exists
-    let exists = {
-      let mut handle = begin_tx(&self.db)?;
-      let exists = node_exists(&handle, node_ref.id());
-      commit(&mut handle)?;
-      exists
-    };
-
-    if !exists {
-      return Err(KiteError::NodeNotFound(node_ref.id()));
-    }
-
-    Ok(KiteUpdateNodeBuilder {
-      ray: self,
-      node_id: node_ref.id(),
-      updates: HashMap::new(),
-    })
+    self.update_by_id(node_ref.id())
   }
 
   /// Update a node by ID using fluent builder API
@@ -1497,15 +1701,8 @@ impl Kite {
   /// # }
   /// ```
   pub fn update_by_id(&mut self, node_id: NodeId) -> Result<KiteUpdateNodeBuilder<'_>> {
-    // Verify node exists
-    let exists = {
-      let mut handle = begin_tx(&self.db)?;
-      let exists = node_exists(&handle, node_id);
-      commit(&mut handle)?;
-      exists
-    };
-
-    if !exists {
+    // A read: `execute()` checks again inside its transaction.
+    if !node_exists_db(&self.db, node_id) {
       return Err(KiteError::NodeNotFound(node_id));
     }
 
@@ -1524,11 +1721,7 @@ impl Kite {
     node_type: &str,
     node_id: NodeId,
   ) -> Result<KiteUpsertByIdBuilder<'_>> {
-    let node_def = self
-      .nodes
-      .get(node_type)
-      .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown node type: {node_type}").into()))?
-      .clone();
+    let node_def = self.schema.node_def(node_type)?.clone();
 
     Ok(KiteUpsertByIdBuilder {
       ray: self,
@@ -1557,18 +1750,13 @@ impl Kite {
     node_type: &str,
     key_suffix: &str,
   ) -> Result<KiteUpdateNodeBuilder<'_>> {
-    let full_key = self
-      .nodes
-      .get(node_type)
-      .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown node type: {node_type}").into()))?
-      .key(key_suffix);
-
-    let node_id = {
-      let mut handle = begin_tx(&self.db)?;
-      let node_id =
-        node_by_key(&handle, &full_key).ok_or_else(|| KiteError::KeyNotFound(full_key.clone()))?;
-      commit(&mut handle)?;
-      node_id
+    // A read: `execute()` checks the node still exists inside its transaction.
+    let node_id = match self.get(node_type, key_suffix)? {
+      Some(node) => node.id(),
+      None => {
+        let full_key = self.schema.node_def(node_type)?.key(key_suffix);
+        return Err(KiteError::KeyNotFound(full_key));
+      }
     };
 
     Ok(KiteUpdateNodeBuilder {
@@ -1584,14 +1772,7 @@ impl Kite {
 
   /// Create an edge between two nodes
   pub fn link(&mut self, src: NodeId, edge_type: &str, dst: NodeId) -> Result<()> {
-    let edge_def = self
-      .edges
-      .get(edge_type)
-      .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown edge type: {edge_type}").into()))?;
-
-    let etype_id = edge_def
-      .etype_id
-      .ok_or_else(|| KiteError::InvalidSchema("Edge type not initialized".into()))?;
+    let etype_id = self.schema.etype_id(edge_type)?;
 
     let mut handle = begin_tx(&self.db)?;
     add_edge(&mut handle, src, etype_id, dst)?;
@@ -1624,48 +1805,26 @@ impl Kite {
     dst: NodeId,
     props: HashMap<String, PropValue>,
   ) -> Result<()> {
-    let edge_def = self
-      .edges
-      .get(edge_type)
-      .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown edge type: {edge_type}").into()))?
-      .clone();
-
-    let etype_id = edge_def
-      .etype_id
-      .ok_or_else(|| KiteError::InvalidSchema("Edge type not initialized".into()))?;
+    let edge_def = self.schema.edge_def(edge_type)?;
+    let etype_id = self.schema.etype_id(edge_type)?;
 
     let mut handle = begin_tx(&self.db)?;
-    if props.is_empty() {
-      add_edge(&mut handle, src, etype_id, dst)?;
-    } else {
-      let mut prop_pairs = Vec::with_capacity(props.len());
-      for (prop_name, value) in props {
-        let prop_key_id = if let Some(&id) = edge_def.prop_key_ids.get(&prop_name) {
-          id
-        } else {
-          handle.db.define_propkey(&prop_name)?
-        };
-        prop_pairs.push((prop_key_id, value));
-      }
-      handle
-        .db
-        .add_edge_with_props(src, etype_id, dst, prop_pairs)?;
-    }
-
+    link_with_resolved_props(
+      &mut handle,
+      &self.schema,
+      edge_def,
+      src,
+      etype_id,
+      dst,
+      props,
+    )?;
     commit(&mut handle)?;
     Ok(())
   }
 
   /// Remove an edge between two nodes
   pub fn unlink(&mut self, src: NodeId, edge_type: &str, dst: NodeId) -> Result<bool> {
-    let edge_def = self
-      .edges
-      .get(edge_type)
-      .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown edge type: {edge_type}").into()))?;
-
-    let etype_id = edge_def
-      .etype_id
-      .ok_or_else(|| KiteError::InvalidSchema("Edge type not initialized".into()))?;
+    let etype_id = self.schema.etype_id(edge_type)?;
 
     let mut handle = begin_tx(&self.db)?;
     let deleted = delete_edge(&mut handle, src, etype_id, dst)?;
@@ -1675,14 +1834,7 @@ impl Kite {
 
   /// Check if an edge exists (direct read, no transaction overhead)
   pub fn has_edge(&self, src: NodeId, edge_type: &str, dst: NodeId) -> Result<bool> {
-    let edge_def = self
-      .edges
-      .get(edge_type)
-      .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown edge type: {edge_type}").into()))?;
-
-    let etype_id = edge_def
-      .etype_id
-      .ok_or_else(|| KiteError::InvalidSchema("Edge type not initialized".into()))?;
+    let etype_id = self.schema.etype_id(edge_type)?;
 
     // Direct read without transaction
     Ok(edge_exists_db(&self.db, src, etype_id, dst))
@@ -1690,16 +1842,7 @@ impl Kite {
 
   /// Get outgoing neighbors of a node (direct read, no transaction overhead)
   pub fn neighbors_out(&self, node_id: NodeId, edge_type: Option<&str>) -> Result<Vec<NodeId>> {
-    let etype_id = match edge_type {
-      Some(name) => {
-        let edge_def = self
-          .edges
-          .get(name)
-          .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown edge type: {name}").into()))?;
-        edge_def.etype_id
-      }
-      None => None,
-    };
+    let etype_id = self.schema.etype_filter(edge_type)?;
 
     // Direct read without transaction
     Ok(neighbors_out_db(&self.db, node_id, etype_id))
@@ -1707,16 +1850,7 @@ impl Kite {
 
   /// Get incoming neighbors of a node (direct read, no transaction overhead)
   pub fn neighbors_in(&self, node_id: NodeId, edge_type: Option<&str>) -> Result<Vec<NodeId>> {
-    let etype_id = match edge_type {
-      Some(name) => {
-        let edge_def = self
-          .edges
-          .get(name)
-          .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown edge type: {name}").into()))?;
-        edge_def.etype_id
-      }
-      None => None,
-    };
+    let etype_id = self.schema.etype_filter(edge_type)?;
 
     // Direct read without transaction
     let neighbors = neighbors_in_db(&self.db, node_id, etype_id);
@@ -1737,14 +1871,7 @@ impl Kite {
     dst: NodeId,
     prop_name: &str,
   ) -> Result<Option<PropValue>> {
-    let edge_def = self
-      .edges
-      .get(edge_type)
-      .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown edge type: {edge_type}").into()))?;
-
-    let etype_id = edge_def
-      .etype_id
-      .ok_or_else(|| KiteError::InvalidSchema("Edge type not initialized".into()))?;
+    let etype_id = self.schema.etype_id(edge_type)?;
 
     let prop_key_id = match self.db.propkey_id(prop_name) {
       Some(id) => id,
@@ -1764,31 +1891,11 @@ impl Kite {
     edge_type: &str,
     dst: NodeId,
   ) -> Result<Option<HashMap<String, PropValue>>> {
-    let edge_def = self
-      .edges
-      .get(edge_type)
-      .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown edge type: {edge_type}").into()))?;
-
-    let etype_id = edge_def
-      .etype_id
-      .ok_or_else(|| KiteError::InvalidSchema("Edge type not initialized".into()))?;
+    let etype_id = self.schema.etype_id(edge_type)?;
 
     // Direct read without transaction
     let props = edge_props_db(&self.db, src, etype_id, dst);
-
-    // Convert PropKeyId -> String in the result
-    match props {
-      Some(props_by_id) => {
-        let mut result = HashMap::new();
-        for (key_id, value) in props_by_id {
-          if let Some(name) = self.db.propkey_name(key_id) {
-            result.insert(name, value);
-          }
-        }
-        Ok(Some(result))
-      }
-      None => Ok(None),
-    }
+    Ok(props.map(|props| props_by_name(&self.db, props)))
   }
 
   /// Set an edge property. Fails with `EdgeNotFound` if the edge does not exist.
@@ -1800,21 +1907,12 @@ impl Kite {
     prop_name: &str,
     value: PropValue,
   ) -> Result<()> {
-    let edge_def = self
-      .edges
-      .get(edge_type)
-      .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown edge type: {edge_type}").into()))?;
-
-    let etype_id = edge_def
-      .etype_id
-      .ok_or_else(|| KiteError::InvalidSchema("Edge type not initialized".into()))?;
-
-    let mut handle = begin_tx(&self.db)?;
-    require_edge(&handle, src, etype_id, dst)?;
-    let prop_key_id = handle.db.define_propkey(prop_name)?;
-    set_edge_prop(&mut handle, src, etype_id, dst, prop_key_id, value)?;
-    commit(&mut handle)?;
-    Ok(())
+    self.set_edge_props(
+      src,
+      edge_type,
+      dst,
+      HashMap::from([(prop_name.to_string(), value)]),
+    )
   }
 
   /// Set multiple edge properties. Fails with `EdgeNotFound` if the edge does not exist.
@@ -1829,28 +1927,13 @@ impl Kite {
       return Ok(());
     }
 
-    let edge_def = self
-      .edges
-      .get(edge_type)
-      .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown edge type: {edge_type}").into()))?;
-
-    let etype_id = edge_def
-      .etype_id
-      .ok_or_else(|| KiteError::InvalidSchema("Edge type not initialized".into()))?;
+    let edge_def = self.schema.edge_def(edge_type)?;
+    let etype_id = self.schema.etype_id(edge_type)?;
 
     let mut handle = begin_tx(&self.db)?;
     require_edge(&handle, src, etype_id, dst)?;
-    let mut prop_pairs = Vec::with_capacity(props.len());
-    for (prop_name, value) in props {
-      let prop_key_id = if let Some(&id) = edge_def.prop_key_ids.get(&prop_name) {
-        id
-      } else {
-        handle.db.define_propkey(&prop_name)?
-      };
-      prop_pairs.push((prop_key_id, value));
-    }
-
-    handle.db.set_edge_props(src, etype_id, dst, prop_pairs)?;
+    let props = resolve_edge_values(handle.db, edge_def, self.schema.strict, props)?;
+    handle.db.set_edge_props(src, etype_id, dst, props)?;
     commit(&mut handle)?;
     Ok(())
   }
@@ -1863,14 +1946,7 @@ impl Kite {
     dst: NodeId,
     prop_name: &str,
   ) -> Result<()> {
-    let edge_def = self
-      .edges
-      .get(edge_type)
-      .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown edge type: {edge_type}").into()))?;
-
-    let etype_id = edge_def
-      .etype_id
-      .ok_or_else(|| KiteError::InvalidSchema("Edge type not initialized".into()))?;
+    let etype_id = self.schema.etype_id(edge_type)?;
 
     let prop_key_id = self
       .db
@@ -1909,18 +1985,12 @@ impl Kite {
     edge_type: &str,
     dst: NodeId,
   ) -> Result<KiteUpdateEdgeBuilder<'_>> {
-    let edge_def = self
-      .edges
-      .get(edge_type)
-      .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown edge type: {edge_type}").into()))?;
-
-    let etype_id = edge_def
-      .etype_id
-      .ok_or_else(|| KiteError::InvalidSchema("Edge type not initialized".into()))?;
+    let etype_id = self.schema.etype_id(edge_type)?;
 
     Ok(KiteUpdateEdgeBuilder {
       ray: self,
       src,
+      edge_type: edge_type.to_string(),
       etype_id,
       dst,
       updates: HashMap::new(),
@@ -1936,17 +2006,12 @@ impl Kite {
     edge_type: &str,
     dst: NodeId,
   ) -> Result<KiteUpsertEdgeBuilder<'_>> {
-    let edge_def = self
-      .edges
-      .get(edge_type)
-      .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown edge type: {edge_type}").into()))?;
-    let etype_id = edge_def.etype_id.ok_or_else(|| {
-      KiteError::InvalidSchema(format!("Edge type not initialized: {edge_type}").into())
-    })?;
+    let etype_id = self.schema.etype_id(edge_type)?;
 
     Ok(KiteUpsertEdgeBuilder {
       ray: self,
       src,
+      edge_type: edge_type.to_string(),
       etype_id,
       dst,
       updates: HashMap::new(),
@@ -1966,25 +2031,9 @@ impl Kite {
 
   /// Count nodes of a specific type
   ///
-  /// This requires iteration to filter by key prefix.
+  /// This iterates every node and resolves its type like [`Self::node_by_id`].
   pub fn count_nodes_by_type(&self, node_type: &str) -> Result<u64> {
-    let node_def = self
-      .nodes
-      .get(node_type)
-      .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown node type: {node_type}").into()))?;
-
-    let prefix = &node_def.key_prefix;
-    let mut count = 0u64;
-
-    for node_id in list_nodes(&self.db) {
-      if let Some(key) = self.node_key_internal(node_id) {
-        if key.starts_with(prefix) {
-          count += 1;
-        }
-      }
-    }
-
-    Ok(count)
+    Ok(self.all(node_type)?.count() as u64)
   }
 
   /// Count all edges
@@ -1994,14 +2043,7 @@ impl Kite {
 
   /// Count edges of a specific type
   pub fn count_edges_by_type(&self, edge_type: &str) -> Result<u64> {
-    let edge_def = self
-      .edges
-      .get(edge_type)
-      .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown edge type: {edge_type}").into()))?;
-
-    let etype_id = edge_def
-      .etype_id
-      .ok_or_else(|| KiteError::InvalidSchema("Edge type not initialized".into()))?;
+    let etype_id = self.schema.etype_id(edge_type)?;
 
     Ok(count_edges(&self.db, Some(etype_id)))
   }
@@ -2018,8 +2060,8 @@ impl Kite {
 
   /// Iterate over all nodes of a specific type
   ///
-  /// Returns an iterator that yields `NodeRef` for each matching node.
-  /// Filters nodes by matching their key prefix.
+  /// Returns an iterator that yields `NodeRef` for each matching node. A node's type is
+  /// resolved like [`Self::node_by_id`]: by the longest key prefix it matches, else by label.
   ///
   /// # Example
   /// ```rust,no_run
@@ -2033,22 +2075,15 @@ impl Kite {
   /// # }
   /// ```
   pub fn all(&self, node_type: &str) -> Result<impl Iterator<Item = NodeRef> + '_> {
-    let node_def = self
-      .nodes
-      .get(node_type)
-      .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown node type: {node_type}").into()))?
-      .clone();
+    let node_def = self.schema.node_def(node_type)?;
+    let node_type: Arc<str> = node_def.name.as_str().into();
 
-    let prefix = node_def.key_prefix.clone();
-    let node_type_arc: Arc<str> = node_type.to_string().into();
-
-    Ok(list_nodes(&self.db).into_iter().filter_map(move |node_id| {
-      let key = self.node_key_internal(node_id)?;
-      if key.starts_with(&prefix) {
-        Some(NodeRef::new(node_id, Some(key), Arc::clone(&node_type_arc)))
-      } else {
-        None
-      }
+    Ok(self.db.iter_nodes().filter_map(move |node_id| {
+      let key = self.db.node_key(node_id);
+      let resolved = self
+        .schema
+        .node_type_of(&self.db, node_id, key.as_deref())?;
+      (resolved.name == node_def.name).then(|| NodeRef::new(node_id, key, Arc::clone(&node_type)))
     }))
   }
 
@@ -2073,16 +2108,7 @@ impl Kite {
   /// # }
   /// ```
   pub fn all_edges(&self, edge_type: Option<&str>) -> Result<impl Iterator<Item = FullEdge> + '_> {
-    let etype_id = match edge_type {
-      Some(name) => {
-        let edge_def = self
-          .edges
-          .get(name)
-          .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown edge type: {name}").into()))?;
-        edge_def.etype_id
-      }
-      None => None,
-    };
+    let etype_id = self.schema.etype_filter(edge_type)?;
 
     let options = ListEdgesOptions { etype: etype_id };
     Ok(list_edges(&self.db, options).into_iter())
@@ -2124,25 +2150,7 @@ impl Kite {
   /// # }
   /// ```
   pub fn node_ref(&self, node_type: &str, key_suffix: &str) -> Result<Option<NodeRef>> {
-    let node_def = self
-      .nodes
-      .get(node_type)
-      .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown node type: {node_type}").into()))?;
-
-    let full_key = node_def.key(key_suffix);
-
-    // Direct read without transaction
-    let node_id = node_by_key_db(&self.db, &full_key);
-
-    match node_id {
-      Some(id) => Ok(Some(NodeRef::new(id, Some(full_key), node_type))),
-      None => Ok(None),
-    }
-  }
-
-  /// Helper to get node key from database
-  fn node_key_internal(&self, node_id: NodeId) -> Option<String> {
-    self.db.node_key(node_id)
+    self.get(node_type, key_suffix)
   }
 
   // ========================================================================
@@ -2151,22 +2159,22 @@ impl Kite {
 
   /// Get a node definition by name
   pub fn node_def(&self, name: &str) -> Option<&NodeDef> {
-    self.nodes.get(name)
+    self.schema.nodes.get(name)
   }
 
   /// Get an edge definition by name
   pub fn edge_def(&self, name: &str) -> Option<&EdgeDef> {
-    self.edges.get(name)
+    self.schema.edges.get(name)
   }
 
   /// Get all node type names
   pub fn node_types(&self) -> Vec<&str> {
-    self.nodes.keys().map(|s| s.as_str()).collect()
+    self.schema.nodes.keys().map(|s| s.as_str()).collect()
   }
 
   /// Get all edge type names
   pub fn edge_types(&self) -> Vec<&str> {
-    self.edges.keys().map(|s| s.as_str()).collect()
+    self.schema.edges.keys().map(|s| s.as_str()).collect()
   }
 
   // ========================================================================
@@ -2240,23 +2248,17 @@ impl Kite {
     KitePathBuilder::new_multi(self, source, targets)
   }
 
-  /// Check if a path exists between two nodes
+  /// Check if a path exists between two nodes (within the default max depth of 100 hops)
   ///
   /// This is more efficient than `shortest_path()` when you only need to
   /// know if a path exists, not the path itself.
-  pub fn has_path(
-    &mut self,
-    source: NodeId,
-    target: NodeId,
-    edge_type: Option<&str>,
-  ) -> Result<bool> {
+  pub fn has_path(&self, source: NodeId, target: NodeId, edge_type: Option<&str>) -> Result<bool> {
     let path = self.shortest_path(source, target);
-    let path = if let Some(etype) = edge_type {
-      path.via(etype)?
-    } else {
-      path
+    let path = match edge_type {
+      Some(edge_type) => path.via(edge_type)?,
+      None => path,
     };
-    Ok(path.find().found)
+    Ok(path.find_bfs().found)
   }
 
   /// Get all nodes reachable from a source within a certain depth
@@ -2279,16 +2281,7 @@ impl Kite {
     max_depth: usize,
     edge_type: Option<&str>,
   ) -> Result<Vec<NodeId>> {
-    let etype = match edge_type {
-      Some(name) => {
-        let edge_def = self
-          .edges
-          .get(name)
-          .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown edge type: {name}").into()))?;
-        edge_def.etype_id
-      }
-      None => None,
-    };
+    let etype = self.schema.etype_filter(edge_type)?;
 
     use super::traversal::{TraversalBuilder, TraversalDirection, TraverseOptions};
 
@@ -2339,7 +2332,13 @@ impl Kite {
       }
       TraversalDirection::Both => {
         edges.extend(self.neighbors(node_id, TraversalDirection::Out, etype));
-        edges.extend(self.neighbors(node_id, TraversalDirection::In, etype));
+        // A self-loop is also an out-edge: list it once.
+        edges.extend(
+          self
+            .neighbors(node_id, TraversalDirection::In, etype)
+            .into_iter()
+            .filter(|edge| edge.src != edge.dst),
+        );
       }
     }
 
@@ -2394,11 +2393,13 @@ impl Kite {
     let path = self.db.path.display();
     let format = "single-file";
 
-    let node_types: Vec<&str> = self.nodes.keys().map(|s| s.as_str()).collect();
-    let edge_types: Vec<&str> = self.edges.keys().map(|s| s.as_str()).collect();
+    let node_types = self.node_types();
+    let edge_types = self.edge_types();
 
+    // Totals are the snapshot plus the net change in the delta.
     let delta_nodes = stats.delta_nodes_created as i64 - stats.delta_nodes_deleted as i64;
     let delta_edges = stats.delta_edges_added as i64 - stats.delta_edges_deleted as i64;
+    let total = |snapshot: u64, delta: i64| (snapshot as i64).saturating_add(delta).max(0);
 
     format!(
       "KiteDB at {} ({} format)\n\
@@ -2421,15 +2422,11 @@ impl Kite {
       } else {
         edge_types.join(", ")
       },
+      total(stats.snapshot_nodes, delta_nodes),
       stats.snapshot_nodes,
-      stats
-        .snapshot_nodes
-        .saturating_sub(stats.delta_nodes_created as u64),
       delta_nodes,
+      total(stats.snapshot_edges, delta_edges),
       stats.snapshot_edges,
-      stats
-        .snapshot_edges
-        .saturating_sub(stats.delta_edges_added as u64),
       delta_edges,
       if stats.recommend_compact { "yes" } else { "no" }
     )
@@ -2463,7 +2460,7 @@ impl Kite {
     let mut result = self.db.check();
 
     // Schema consistency - verify all registered edge types have valid IDs
-    for (edge_name, edge_def) in &self.edges {
+    for (edge_name, edge_def) in &self.schema.edges {
       if edge_def.etype_id.is_none() {
         result
           .warnings
@@ -2515,11 +2512,62 @@ impl Kite {
 // Traversal Builder for Kite
 // ============================================================================
 
-use super::traversal::{TraversalBuilder, TraversalDirection, TraversalResult, TraverseOptions};
+use super::traversal::{
+  RawEdge, TraversalBuilder, TraversalDirection, TraversalProps, TraversalResult, TraverseOptions,
+};
+
+/// Loads the props traversal filters see from a Kite database.
+struct KiteTraversalProps<'a> {
+  db: &'a SingleFileDB,
+  /// The node props to load (`select()`), by name and key id; `None`: all of them.
+  selected_node_props: Option<Vec<(String, PropKeyId)>>,
+}
+
+impl<'a> KiteTraversalProps<'a> {
+  fn new(db: &'a SingleFileDB, selected: Option<&[String]>) -> Self {
+    // A prop whose key was never defined has no values to load.
+    let selected_node_props = selected.map(|names| {
+      names
+        .iter()
+        .filter_map(|name| Some((name.clone(), db.propkey_id(name)?)))
+        .collect()
+    });
+    Self {
+      db,
+      selected_node_props,
+    }
+  }
+}
+
+impl TraversalProps for KiteTraversalProps<'_> {
+  fn node_props(&self, node_id: NodeId) -> HashMap<String, PropValue> {
+    match &self.selected_node_props {
+      Some(selected) => selected
+        .iter()
+        .filter_map(|(name, key_id)| Some((name.clone(), self.db.node_prop(node_id, *key_id)?)))
+        .collect(),
+      None => self
+        .db
+        .node_props(node_id)
+        .map(|props| props_by_name(self.db, props))
+        .unwrap_or_default(),
+    }
+  }
+
+  fn edge_props(&self, edge: &RawEdge) -> HashMap<String, PropValue> {
+    self
+      .db
+      .edge_props(edge.src, edge.etype, edge.dst)
+      .map(|props| props_by_name(self.db, props))
+      .unwrap_or_default()
+  }
+}
 
 /// Traversal builder bound to a Kite database
 ///
-/// Provides ergonomic traversal operations using edge type names.
+/// Provides ergonomic traversal operations using edge type names. Filters
+/// (`TraverseOptions::with_edge_filter` / `with_node_filter`) see the props of the edges and
+/// nodes they test.
 pub struct KiteTraversalBuilder<'a> {
   ray: &'a Kite,
   builder: TraversalBuilder,
@@ -2569,22 +2617,25 @@ impl<'a> KiteTraversalBuilder<'a> {
     self
   }
 
-  /// Select specific properties to load (optimization)
+  /// Select the node properties that node filters load
   ///
-  /// Only the specified properties will be loaded when collecting results,
-  /// reducing overhead. This is useful when you only need a few properties
-  /// from nodes that have many properties.
+  /// Node filters (`TraverseOptions::with_node_filter`) then see only these props instead of
+  /// all of the node's props, which saves loading props they don't read. Results carry node
+  /// ids, not props.
   ///
   /// # Example
   /// ```rust,no_run
   /// # use kitedb::api::kite::Kite;
-  /// # use kitedb::types::NodeId;
+  /// # use kitedb::api::traversal::{TraversalDirection, TraverseOptions};
+  /// # use kitedb::types::{NodeId, PropValue};
   /// # fn main() -> kitedb::error::Result<()> {
   /// # let kite: Kite = unimplemented!();
   /// # let user_id: NodeId = 1;
+  /// let active = TraverseOptions::new(TraversalDirection::Out, 1)
+  ///     .with_node_filter(|node| node.props.get("active") == Some(&PropValue::Bool(true)));
   /// let friends = kite.from(user_id)
-  ///     .out(Some("FOLLOWS"))?
-  ///     .select(&["name", "avatar"]) // Only load name and avatar
+  ///     .select(&["active"]) // The filter only loads `active`
+  ///     .traverse(Some("FOLLOWS"), active)?
   ///     .to_vec();
   /// # Ok(())
   /// # }
@@ -2596,38 +2647,37 @@ impl<'a> KiteTraversalBuilder<'a> {
 
   /// Execute and collect node IDs
   pub fn to_vec(self) -> Vec<NodeId> {
-    self
-      .builder
-      .collect_node_ids(|node_id, dir, etype| self.ray.neighbors(node_id, dir, etype))
+    self.execute().map(|result| result.node_id).collect()
   }
 
   /// Execute and get first result
   pub fn first(self) -> Option<TraversalResult> {
-    self
-      .builder
-      .first(|node_id, dir, etype| self.ray.neighbors(node_id, dir, etype))
+    self.execute().next()
   }
 
   /// Execute and get first node ID
   pub fn first_node(self) -> Option<NodeId> {
-    self
-      .builder
-      .first_node(|node_id, dir, etype| self.ray.neighbors(node_id, dir, etype))
+    self.first().map(|result| result.node_id)
   }
 
   /// Execute and count results
   pub fn count(self) -> usize {
-    self
-      .builder
-      .count(|node_id, dir, etype| self.ray.neighbors(node_id, dir, etype))
+    let ray = self.ray;
+    let props = KiteTraversalProps::new(&ray.db, self.builder.selected_properties());
+    self.builder.count_with_props(
+      move |node_id, dir, etype| ray.neighbors(node_id, dir, etype),
+      props,
+    )
   }
 
   /// Execute and return iterator over traversal results
   pub fn execute(self) -> impl Iterator<Item = TraversalResult> + 'a {
     let ray = self.ray;
-    self
-      .builder
-      .execute(move |node_id, dir, etype| ray.neighbors(node_id, dir, etype))
+    let props = KiteTraversalProps::new(&ray.db, self.builder.selected_properties());
+    self.builder.execute_with_props(
+      move |node_id, dir, etype| ray.neighbors(node_id, dir, etype),
+      props,
+    )
   }
 
   /// Execute and return iterator over edges only
@@ -2654,48 +2704,30 @@ impl<'a> KiteTraversalBuilder<'a> {
   /// # }
   /// ```
   pub fn edges(self) -> impl Iterator<Item = Edge> + 'a {
-    let ray = self.ray;
-    self
-      .builder
-      .execute(move |node_id, dir, etype| ray.neighbors(node_id, dir, etype))
-      .filter_map(|result| {
-        result.edge.map(|e| Edge {
-          src: e.src,
-          etype: e.etype,
-          dst: e.dst,
-        })
+    self.execute().filter_map(|result| {
+      result.edge.map(|e| Edge {
+        src: e.src,
+        etype: e.etype,
+        dst: e.dst,
       })
+    })
   }
 
   /// Execute and return iterator over full edge details
   ///
   /// Similar to `edges()` but returns FullEdge structs.
   pub fn full_edges(self) -> impl Iterator<Item = FullEdge> + 'a {
-    let ray = self.ray;
-    self
-      .builder
-      .execute(move |node_id, dir, etype| ray.neighbors(node_id, dir, etype))
-      .filter_map(move |result| {
-        result.edge.map(|e| FullEdge {
-          src: e.src,
-          etype: e.etype,
-          dst: e.dst,
-        })
+    self.execute().filter_map(|result| {
+      result.edge.map(|e| FullEdge {
+        src: e.src,
+        etype: e.etype,
+        dst: e.dst,
       })
+    })
   }
 
   fn resolve_etype(&self, edge_type: Option<&str>) -> Result<Option<ETypeId>> {
-    match edge_type {
-      Some(name) => {
-        let edge_def = self
-          .ray
-          .edges
-          .get(name)
-          .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown edge type: {name}").into()))?;
-        Ok(edge_def.etype_id)
-      }
-      None => Ok(None),
-    }
+    self.ray.schema.etype_filter(edge_type)
   }
 }
 
@@ -2705,9 +2737,13 @@ impl<'a> KiteTraversalBuilder<'a> {
 
 use super::pathfinding::{bfs, dijkstra, yen_k_shortest, PathConfig, PathResult};
 
+/// An edge weight function: `(src, etype, dst) -> weight`.
+type EdgeWeightFn<'a> = Box<dyn Fn(NodeId, ETypeId, NodeId) -> f64 + 'a>;
+
 /// Path finding builder bound to a Kite database
 ///
-/// Provides ergonomic pathfinding operations using edge type names.
+/// Provides ergonomic pathfinding operations using edge type names. Edges weigh 1.0 unless
+/// [`Self::weight_by_prop`] or [`Self::weight_fn`] says otherwise.
 pub struct KitePathBuilder<'a> {
   ray: &'a Kite,
   source: NodeId,
@@ -2715,23 +2751,12 @@ pub struct KitePathBuilder<'a> {
   allowed_etypes: HashSet<ETypeId>,
   direction: TraversalDirection,
   max_depth: usize,
-  weights: HashMap<(NodeId, ETypeId, NodeId), f64>,
+  weight: Option<EdgeWeightFn<'a>>,
 }
 
 impl<'a> KitePathBuilder<'a> {
   fn new(ray: &'a Kite, source: NodeId, target: NodeId) -> Self {
-    let mut targets = HashSet::new();
-    targets.insert(target);
-
-    Self {
-      ray,
-      source,
-      targets,
-      allowed_etypes: HashSet::new(),
-      direction: TraversalDirection::Out,
-      max_depth: 100,
-      weights: HashMap::new(),
-    }
+    Self::new_multi(ray, source, vec![target])
   }
 
   fn new_multi(ray: &'a Kite, source: NodeId, targets: Vec<NodeId>) -> Self {
@@ -2742,7 +2767,7 @@ impl<'a> KitePathBuilder<'a> {
       allowed_etypes: HashSet::new(),
       direction: TraversalDirection::Out,
       max_depth: 100,
-      weights: HashMap::new(),
+      weight: None,
     }
   }
 
@@ -2750,16 +2775,39 @@ impl<'a> KitePathBuilder<'a> {
   ///
   /// Can be called multiple times to allow multiple edge types.
   pub fn via(mut self, edge_type: &str) -> Result<Self> {
-    let edge_def =
-      self.ray.edges.get(edge_type).ok_or_else(|| {
-        KiteError::InvalidSchema(format!("Unknown edge type: {edge_type}").into())
-      })?;
-
-    if let Some(etype_id) = edge_def.etype_id {
-      self.allowed_etypes.insert(etype_id);
-    }
-
+    let etype_id = self.ray.schema.etype_id(edge_type)?;
+    self.allowed_etypes.insert(etype_id);
     Ok(self)
+  }
+
+  /// Weight each edge by its numeric `prop_name` prop (`I64` or `F64`) for `find()` and
+  /// `find_k_shortest()`
+  ///
+  /// An edge without a numeric `prop_name` weighs 1.0. Edges whose weight is NaN, infinite or
+  /// negative are skipped (see [`crate::api::pathfinding`]).
+  pub fn weight_by_prop(mut self, prop_name: &str) -> Self {
+    let db = &self.ray.db;
+    let key_id = db.propkey_id(prop_name);
+    self.weight = Some(Box::new(move |src, etype, dst| {
+      match key_id.and_then(|key_id| db.edge_prop(src, etype, dst, key_id)) {
+        Some(PropValue::F64(weight)) => weight,
+        Some(PropValue::I64(weight)) => weight as f64,
+        _ => 1.0,
+      }
+    }));
+    self
+  }
+
+  /// Weight each edge with `weight(src, etype, dst)` for `find()` and `find_k_shortest()`
+  ///
+  /// Edges whose weight is NaN, infinite or negative are skipped (see
+  /// [`crate::api::pathfinding`]).
+  pub fn weight_fn<W>(mut self, weight: W) -> Self
+  where
+    W: Fn(NodeId, ETypeId, NodeId) -> f64 + 'a,
+  {
+    self.weight = Some(Box::new(weight));
+    self
   }
 
   /// Set maximum search depth
@@ -2780,43 +2828,44 @@ impl<'a> KitePathBuilder<'a> {
     self
   }
 
-  /// Find the shortest path using Dijkstra's algorithm
+  /// Find the cheapest path using Dijkstra's algorithm
   pub fn find(self) -> PathResult {
-    let config = PathConfig {
-      source: self.source,
-      targets: self.targets,
-      allowed_etypes: self.allowed_etypes,
-      direction: self.direction,
-      max_depth: self.max_depth,
-    };
-
-    let weights = self.weights;
+    let (ray, config, weight) = self.into_parts();
     dijkstra(
       config,
-      |node_id, dir, etype| self.ray.neighbors(node_id, dir, etype),
-      move |src, etype, dst| weights.get(&(src, etype, dst)).copied().unwrap_or(1.0),
+      |node_id, dir, etype| ray.neighbors(node_id, dir, etype),
+      weight,
     )
   }
 
-  /// Find the shortest path using BFS (unweighted)
+  /// Find the path with the fewest hops using BFS (ignores edge weights)
   ///
   /// Faster than Dijkstra for unweighted graphs.
   pub fn find_bfs(self) -> PathResult {
-    let config = PathConfig {
-      source: self.source,
-      targets: self.targets,
-      allowed_etypes: self.allowed_etypes,
-      direction: self.direction,
-      max_depth: self.max_depth,
-    };
-
+    let (ray, config, _) = self.into_parts();
     bfs(config, |node_id, dir, etype| {
-      self.ray.neighbors(node_id, dir, etype)
+      ray.neighbors(node_id, dir, etype)
     })
   }
 
-  /// Find the k shortest paths using Yen's algorithm
+  /// Find the k cheapest paths using Yen's algorithm
   pub fn find_k_shortest(self, k: usize) -> Vec<PathResult> {
+    let (ray, config, weight) = self.into_parts();
+    yen_k_shortest(
+      config,
+      k,
+      |node_id, dir, etype| ray.neighbors(node_id, dir, etype),
+      weight,
+    )
+  }
+
+  fn into_parts(
+    self,
+  ) -> (
+    &'a Kite,
+    PathConfig,
+    impl Fn(NodeId, ETypeId, NodeId) -> f64 + 'a,
+  ) {
     let config = PathConfig {
       source: self.source,
       targets: self.targets,
@@ -2824,14 +2873,13 @@ impl<'a> KitePathBuilder<'a> {
       direction: self.direction,
       max_depth: self.max_depth,
     };
-
-    let weights = self.weights;
-    yen_k_shortest(
-      config,
-      k,
-      |node_id, dir, etype| self.ray.neighbors(node_id, dir, etype),
-      move |src, etype, dst| weights.get(&(src, etype, dst)).copied().unwrap_or(1.0),
-    )
+    let weight = self.weight;
+    let weight = move |src, etype, dst| {
+      weight
+        .as_ref()
+        .map_or(1.0, |weight| weight(src, etype, dst))
+    };
+    (self.ray, config, weight)
   }
 }
 
@@ -2911,38 +2959,125 @@ pub enum BatchResult {
   PropDeleted,
 }
 
-#[derive(Debug, Clone)]
-struct EdgeCacheEntry {
+/// Create edge `src -[etype_id]-> dst` with `props` (type-checked under `strict_schema`).
+fn link_with_resolved_props(
+  handle: &mut TxHandle,
+  schema: &Schema,
+  edge_def: &EdgeDef,
+  src: NodeId,
   etype_id: ETypeId,
-  prop_key_ids: HashMap<String, PropKeyId>,
+  dst: NodeId,
+  props: HashMap<String, PropValue>,
+) -> Result<()> {
+  if props.is_empty() {
+    return add_edge(handle, src, etype_id, dst);
+  }
+  let props = resolve_edge_values(handle.db, edge_def, schema.strict, props)?;
+  handle.db.add_edge_with_props(src, etype_id, dst, props)
 }
 
-fn resolve_edge_cache_entry<'a>(
-  edge_cache: &'a mut HashMap<String, EdgeCacheEntry>,
-  edges: &HashMap<String, EdgeDef>,
+/// Apply one batch operation inside `handle`'s transaction.
+fn apply_batch_op(handle: &mut TxHandle, schema: &Schema, op: BatchOp) -> Result<BatchResult> {
+  Ok(match op {
+    BatchOp::CreateNode {
+      node_type,
+      key_suffix,
+      props,
+    } => {
+      let node_def = schema.node_def(&node_type)?;
+      let (node_id, full_key) = create_typed_node(handle, schema, node_def, &key_suffix, props)?;
+      BatchResult::NodeCreated(NodeRef::new(node_id, Some(full_key), node_type))
+    }
+
+    BatchOp::DeleteNode { node_id } => BatchResult::NodeDeleted(delete_node(handle, node_id)?),
+
+    BatchOp::Link {
+      src,
+      edge_type,
+      dst,
+    } => {
+      add_edge(handle, src, schema.etype_id(&edge_type)?, dst)?;
+      BatchResult::EdgeCreated
+    }
+
+    BatchOp::LinkWithProps {
+      src,
+      edge_type,
+      dst,
+      props,
+    } => {
+      let edge_def = schema.edge_def(&edge_type)?;
+      let etype_id = schema.etype_id(&edge_type)?;
+      link_with_resolved_props(handle, schema, edge_def, src, etype_id, dst, props)?;
+      BatchResult::EdgeCreated
+    }
+
+    BatchOp::Unlink {
+      src,
+      edge_type,
+      dst,
+    } => BatchResult::EdgeRemoved(delete_edge(handle, src, schema.etype_id(&edge_type)?, dst)?),
+
+    BatchOp::SetProp {
+      node_id,
+      prop_name,
+      value,
+    } => {
+      let props = resolve_node_update(handle, schema, node_id, [(prop_name, Some(value))])?;
+      apply_node_props(handle, node_id, props)?;
+      BatchResult::PropSet
+    }
+
+    BatchOp::SetEdgeProp {
+      src,
+      edge_type,
+      dst,
+      prop_name,
+      value,
+    } => {
+      set_edge_values(
+        handle,
+        schema,
+        src,
+        &edge_type,
+        dst,
+        HashMap::from([(prop_name, value)]),
+      )?;
+      BatchResult::PropSet
+    }
+
+    BatchOp::SetEdgeProps {
+      src,
+      edge_type,
+      dst,
+      props,
+    } => {
+      set_edge_values(handle, schema, src, &edge_type, dst, props)?;
+      BatchResult::PropSet
+    }
+
+    BatchOp::DelProp { node_id, prop_name } => {
+      delete_node_prop_by_name(handle, node_id, &prop_name)?;
+      BatchResult::PropDeleted
+    }
+  })
+}
+
+/// Set props on the existing edge `src -[edge_type]-> dst` (type-checked under
+/// `strict_schema`).
+fn set_edge_values(
+  handle: &mut TxHandle,
+  schema: &Schema,
+  src: NodeId,
   edge_type: &str,
-) -> Result<&'a mut EdgeCacheEntry> {
-  if edge_cache.contains_key(edge_type) {
-    return Ok(edge_cache.get_mut(edge_type).expect("expected value"));
-  }
-
-  let edge_def = edges
-    .get(edge_type)
-    .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown edge type: {edge_type}").into()))?;
-
-  let etype_id = edge_def
-    .etype_id
-    .ok_or_else(|| KiteError::InvalidSchema("Edge type not initialized".into()))?;
-
-  edge_cache.insert(
-    edge_type.to_string(),
-    EdgeCacheEntry {
-      etype_id,
-      prop_key_ids: edge_def.prop_key_ids.clone(),
-    },
-  );
-
-  Ok(edge_cache.get_mut(edge_type).expect("expected value"))
+  dst: NodeId,
+  props: HashMap<String, PropValue>,
+) -> Result<()> {
+  let edge_def = schema.edge_def(edge_type)?;
+  let etype_id = schema.etype_id(edge_type)?;
+  require_edge(handle, src, etype_id, dst)?;
+  let props = resolve_edge_values(handle.db, edge_def, schema.strict, props)?;
+  handle.db.set_edge_props(src, etype_id, dst, props)
 }
 
 impl Kite {
@@ -2950,6 +3085,10 @@ impl Kite {
   ///
   /// All operations succeed or fail together. If any operation fails,
   /// the entire batch is rolled back.
+  ///
+  /// Inside a transaction already open on this thread, the batch joins it: on success its writes
+  /// commit with that transaction; on error the whole open transaction is rolled back (a later
+  /// `commit()` fails with `NoTransaction`) and the operation's error is returned.
   ///
   /// # Example
   /// ```rust,no_run
@@ -2976,176 +3115,20 @@ impl Kite {
   /// ```
   pub fn batch(&mut self, ops: Vec<BatchOp>) -> Result<Vec<BatchResult>> {
     let mut handle = begin_tx(&self.db)?;
-    let mut results = Vec::with_capacity(ops.len());
-    let mut edge_cache: HashMap<String, EdgeCacheEntry> = HashMap::new();
-
-    for op in ops {
-      let result = match op {
-        BatchOp::CreateNode {
-          node_type,
-          key_suffix,
-          props,
-        } => {
-          let node_def = self.nodes.get(&node_type).ok_or_else(|| {
-            KiteError::InvalidSchema(format!("Unknown node type: {node_type}").into())
-          })?;
-
-          let (node_id, full_key) = create_typed_node(
-            &mut handle,
-            node_def,
-            self.strict_schema,
-            &key_suffix,
-            props,
-          )?;
-
-          BatchResult::NodeCreated(NodeRef::new(node_id, Some(full_key), node_type))
-        }
-
-        BatchOp::DeleteNode { node_id } => {
-          let deleted = delete_node(&mut handle, node_id)?;
-          BatchResult::NodeDeleted(deleted)
-        }
-
-        BatchOp::Link {
-          src,
-          edge_type,
-          dst,
-        } => {
-          let entry = resolve_edge_cache_entry(&mut edge_cache, &self.edges, &edge_type)?;
-          let etype_id = entry.etype_id;
-          add_edge(&mut handle, src, etype_id, dst)?;
-          BatchResult::EdgeCreated
-        }
-
-        BatchOp::LinkWithProps {
-          src,
-          edge_type,
-          dst,
-          props,
-        } => {
-          let entry = resolve_edge_cache_entry(&mut edge_cache, &self.edges, &edge_type)?;
-          let etype_id = entry.etype_id;
-
-          if props.is_empty() {
-            add_edge(&mut handle, src, etype_id, dst)?;
-          } else {
-            let mut prop_pairs = Vec::with_capacity(props.len());
-            for (prop_name, value) in props {
-              let prop_key_id = if let Some(&id) = entry.prop_key_ids.get(&prop_name) {
-                id
-              } else {
-                let key_id = handle.db.define_propkey(&prop_name)?;
-                entry.prop_key_ids.insert(prop_name.clone(), key_id);
-                key_id
-              };
-              prop_pairs.push((prop_key_id, value));
-            }
-            handle
-              .db
-              .add_edge_with_props(src, etype_id, dst, prop_pairs)?;
-          }
-
-          BatchResult::EdgeCreated
-        }
-
-        BatchOp::Unlink {
-          src,
-          edge_type,
-          dst,
-        } => {
-          let edge_def = self.edges.get(&edge_type).ok_or_else(|| {
-            KiteError::InvalidSchema(format!("Unknown edge type: {edge_type}").into())
-          })?;
-
-          let etype_id = edge_def
-            .etype_id
-            .ok_or_else(|| KiteError::InvalidSchema("Edge type not initialized".into()))?;
-
-          let deleted = delete_edge(&mut handle, src, etype_id, dst)?;
-          BatchResult::EdgeRemoved(deleted)
-        }
-
-        BatchOp::SetProp {
-          node_id,
-          prop_name,
-          value,
-        } => {
-          let props = resolve_node_update(
-            &handle,
-            &self.nodes,
-            self.strict_schema,
-            node_id,
-            [(prop_name, Some(value))],
-          )?;
-          apply_node_props(&mut handle, node_id, props)?;
-          BatchResult::PropSet
-        }
-
-        BatchOp::SetEdgeProp {
-          src,
-          edge_type,
-          dst,
-          prop_name,
-          value,
-        } => {
-          let entry = resolve_edge_cache_entry(&mut edge_cache, &self.edges, &edge_type)?;
-          let etype_id = entry.etype_id;
-          require_edge(&handle, src, etype_id, dst)?;
-
-          let prop_key_id = if let Some(&id) = entry.prop_key_ids.get(&prop_name) {
-            id
-          } else {
-            let key_id = handle.db.define_propkey(&prop_name)?;
-            entry.prop_key_ids.insert(prop_name.clone(), key_id);
-            key_id
-          };
-
-          set_edge_prop(&mut handle, src, etype_id, dst, prop_key_id, value)?;
-          BatchResult::PropSet
-        }
-
-        BatchOp::SetEdgeProps {
-          src,
-          edge_type,
-          dst,
-          props,
-        } => {
-          let entry = resolve_edge_cache_entry(&mut edge_cache, &self.edges, &edge_type)?;
-          let etype_id = entry.etype_id;
-          require_edge(&handle, src, etype_id, dst)?;
-
-          let mut prop_pairs = Vec::with_capacity(props.len());
-          for (prop_name, value) in props {
-            let prop_key_id = if let Some(&id) = entry.prop_key_ids.get(&prop_name) {
-              id
-            } else {
-              let key_id = handle.db.define_propkey(&prop_name)?;
-              entry.prop_key_ids.insert(prop_name.clone(), key_id);
-              key_id
-            };
-            prop_pairs.push((prop_key_id, value));
-          }
-
-          handle.db.set_edge_props(src, etype_id, dst, prop_pairs)?;
-          BatchResult::PropSet
-        }
-
-        BatchOp::DelProp { node_id, prop_name } => {
-          let prop_key_id = handle.db.propkey_id(&prop_name).ok_or_else(|| {
-            KiteError::InvalidSchema(format!("Unknown property: {prop_name}").into())
-          })?;
-          del_node_prop(&mut handle, node_id, prop_key_id)?;
-          BatchResult::PropDeleted
-        }
-      };
-
-      results.push(result);
+    let results = ops
+      .into_iter()
+      .map(|op| apply_batch_op(&mut handle, &self.schema, op))
+      .collect::<Result<Vec<_>>>();
+    match results {
+      Ok(results) => {
+        commit(&mut handle)?;
+        Ok(results)
+      }
+      Err(error) => {
+        abort(&mut handle);
+        Err(error)
+      }
     }
-
-    // Commit the entire batch
-    commit(&mut handle)?;
-
-    Ok(results)
   }
 }
 
@@ -3158,14 +3141,9 @@ impl Kite {
 /// Provides the same operations as Kite but within an explicit transaction scope.
 /// All operations are committed together when the transaction closure returns Ok,
 /// or rolled back if an error is returned.
-///
-/// Note: TxContext holds references to the schema maps (nodes, edges) separately
-/// from the TxHandle to avoid borrow checker issues.
 pub struct TxContext<'a> {
   handle: TxHandle<'a>,
-  nodes: &'a HashMap<String, NodeDef>,
-  edges: &'a HashMap<String, EdgeDef>,
-  strict_schema: bool,
+  schema: &'a Schema,
 }
 
 impl<'a> TxContext<'a> {
@@ -3176,19 +3154,9 @@ impl<'a> TxContext<'a> {
     key_suffix: &str,
     props: HashMap<String, PropValue>,
   ) -> Result<NodeRef> {
-    let node_def = self
-      .nodes
-      .get(node_type)
-      .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown node type: {node_type}").into()))?;
-
-    let (node_id, full_key) = create_typed_node(
-      &mut self.handle,
-      node_def,
-      self.strict_schema,
-      key_suffix,
-      props,
-    )?;
-
+    let node_def = self.schema.node_def(node_type)?;
+    let (node_id, full_key) =
+      create_typed_node(&mut self.handle, self.schema, node_def, key_suffix, props)?;
     Ok(NodeRef::new(node_id, Some(full_key), node_type))
   }
 
@@ -3199,39 +3167,19 @@ impl<'a> TxContext<'a> {
 
   /// Create an edge
   pub fn link(&mut self, src: NodeId, edge_type: &str, dst: NodeId) -> Result<()> {
-    let edge_def = self
-      .edges
-      .get(edge_type)
-      .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown edge type: {edge_type}").into()))?;
-
-    let etype_id = edge_def
-      .etype_id
-      .ok_or_else(|| KiteError::InvalidSchema("Edge type not initialized".into()))?;
-
-    add_edge(&mut self.handle, src, etype_id, dst)?;
-    Ok(())
+    add_edge(&mut self.handle, src, self.schema.etype_id(edge_type)?, dst)
   }
 
   /// Remove an edge
   pub fn unlink(&mut self, src: NodeId, edge_type: &str, dst: NodeId) -> Result<bool> {
-    let edge_def = self
-      .edges
-      .get(edge_type)
-      .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown edge type: {edge_type}").into()))?;
-
-    let etype_id = edge_def
-      .etype_id
-      .ok_or_else(|| KiteError::InvalidSchema("Edge type not initialized".into()))?;
-
-    delete_edge(&mut self.handle, src, etype_id, dst)
+    delete_edge(&mut self.handle, src, self.schema.etype_id(edge_type)?, dst)
   }
 
   /// Set a node property. Fails with `NodeNotFound` if the node does not exist.
   pub fn set_prop(&mut self, node_id: NodeId, prop_name: &str, value: PropValue) -> Result<()> {
     let props = resolve_node_update(
       &self.handle,
-      self.nodes,
-      self.strict_schema,
+      self.schema,
       node_id,
       [(prop_name.to_string(), Some(value))],
     )?;
@@ -3240,13 +3188,7 @@ impl<'a> TxContext<'a> {
 
   /// Delete a node property
   pub fn del_prop(&mut self, node_id: NodeId, prop_name: &str) -> Result<()> {
-    let prop_key_id = self
-      .handle
-      .db
-      .propkey_id(prop_name)
-      .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown property: {prop_name}").into()))?;
-    del_node_prop(&mut self.handle, node_id, prop_key_id)?;
-    Ok(())
+    delete_node_prop_by_name(&mut self.handle, node_id, prop_name)
   }
 
   /// Check if a node exists
@@ -3256,15 +3198,7 @@ impl<'a> TxContext<'a> {
 
   /// Check if an edge exists
   pub fn has_edge(&self, src: NodeId, edge_type: &str, dst: NodeId) -> Result<bool> {
-    let edge_def = self
-      .edges
-      .get(edge_type)
-      .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown edge type: {edge_type}").into()))?;
-
-    let etype_id = edge_def
-      .etype_id
-      .ok_or_else(|| KiteError::InvalidSchema("Edge type not initialized".into()))?;
-
+    let etype_id = self.schema.etype_id(edge_type)?;
     Ok(edge_exists(&self.handle, src, etype_id, dst))
   }
 
@@ -3281,18 +3215,12 @@ impl<'a> TxContext<'a> {
 
   /// Get a node by key
   pub fn get(&self, node_type: &str, key_suffix: &str) -> Result<Option<NodeRef>> {
-    let node_def = self
-      .nodes
-      .get(node_type)
-      .ok_or_else(|| KiteError::InvalidSchema(format!("Unknown node type: {node_type}").into()))?;
-
+    let node_def = self.schema.node_def(node_type)?;
     let full_key = node_def.key(key_suffix);
-    let node_id = node_by_key(&self.handle, &full_key);
-
-    match node_id {
-      Some(id) => Ok(Some(NodeRef::new(id, Some(full_key), node_type))),
-      None => Ok(None),
+    if !self.schema.owns_key(node_def, &full_key) {
+      return Ok(None);
     }
+    Ok(node_by_key(&self.handle, &full_key).map(|id| NodeRef::new(id, Some(full_key), node_type)))
   }
 }
 
@@ -3301,7 +3229,12 @@ impl Kite {
   ///
   /// The closure receives a TxContext with access to node/edge operations.
   /// All operations performed through the context are committed together when
-  /// the closure returns Ok, or rolled back if an error is returned.
+  /// the closure returns Ok, or rolled back if an error is returned; the closure's error is
+  /// returned even if the rollback fails.
+  ///
+  /// Inside a transaction already open on this thread, the closure joins it: on success its
+  /// writes commit with that transaction; on error the whole open transaction is rolled back (a
+  /// later `commit()` fails with `NoTransaction`).
   ///
   /// # Example
   /// ```rust,no_run
@@ -3323,15 +3256,9 @@ impl Kite {
   where
     F: FnOnce(&mut TxContext) -> Result<T>,
   {
-    // Start the transaction
-    let handle = begin_tx(&self.db)?;
-
-    // Create context with references to schema maps
     let mut ctx = TxContext {
-      handle,
-      nodes: &self.nodes,
-      edges: &self.edges,
-      strict_schema: self.strict_schema,
+      handle: begin_tx(&self.db)?,
+      schema: &self.schema,
     };
 
     match f(&mut ctx) {
@@ -3339,9 +3266,9 @@ impl Kite {
         commit(&mut ctx.handle)?;
         Ok(result)
       }
-      Err(e) => {
-        rollback(&mut ctx.handle)?;
-        Err(e)
+      Err(error) => {
+        abort(&mut ctx.handle);
+        Err(error)
       }
     }
   }
@@ -3479,7 +3406,7 @@ impl TxBuilder {
     self
   }
 
-  /// Execute the transaction on the given Kite instance
+  /// Execute the transaction on the given Kite instance (see [`Kite::batch`])
   pub fn execute(self, ray: &mut Kite) -> Result<Vec<BatchResult>> {
     ray.batch(self.ops)
   }
@@ -3560,14 +3487,9 @@ impl<'a> KiteUpdateNodeBuilder<'a> {
       return Ok(());
     }
 
-    let mut handle = begin_tx(&self.ray.db)?;
-    let props = resolve_node_update(
-      &handle,
-      &self.ray.nodes,
-      self.ray.strict_schema,
-      self.node_id,
-      self.updates,
-    )?;
+    let ray: &Kite = self.ray;
+    let mut handle = begin_tx(&ray.db)?;
+    let props = resolve_node_update(&handle, &ray.schema, self.node_id, self.updates)?;
     apply_node_props(&mut handle, self.node_id, props)?;
     commit(&mut handle)?;
     Ok(())
@@ -3587,6 +3509,7 @@ impl<'a> KiteUpdateNodeBuilder<'a> {
 ///
 /// Created via `kite.upsert_by_id(node_type, node_id)` and allows chaining
 /// property set/unset operations before executing in a single transaction.
+/// A node it creates has no key; its type comes from its type label.
 pub struct KiteUpsertByIdBuilder<'a> {
   ray: &'a mut Kite,
   node_id: NodeId,
@@ -3618,22 +3541,13 @@ impl<'a> KiteUpsertByIdBuilder<'a> {
   /// Execute the upsert, creating the node if missing
   pub fn execute(self) -> Result<()> {
     let mut handle = begin_tx(&self.ray.db)?;
-
-    let opts = NodeOpts {
-      key: None,
-      labels: self.node_def.label_id.map(|id| vec![id]),
-      props: None,
-    };
-
     upsert_node_by_id_with_props(
       &mut handle,
       self.node_id,
-      opts,
       &self.node_def,
-      self.ray.strict_schema,
+      self.ray.schema.strict,
       self.updates,
     )?;
-
     commit(&mut handle)?;
     Ok(())
   }
@@ -3676,7 +3590,6 @@ impl<'a> KiteUpsertByIdBuilder<'a> {
 pub struct KiteInsertBuilder<'a> {
   ray: &'a mut Kite,
   node_type: String,
-  key_prefix: String,
 }
 
 impl<'a> KiteInsertBuilder<'a> {
@@ -3689,11 +3602,10 @@ impl<'a> KiteInsertBuilder<'a> {
     key_suffix: &str,
     props: HashMap<String, PropValue>,
   ) -> Result<InsertExecutorSingle<'a>> {
-    let full_key = format!("{}{}", self.key_prefix, key_suffix);
     Ok(InsertExecutorSingle {
       ray: self.ray,
       node_type: self.node_type,
-      full_key,
+      key_suffix: key_suffix.to_string(),
       props,
     })
   }
@@ -3706,19 +3618,12 @@ impl<'a> KiteInsertBuilder<'a> {
     self,
     items: Vec<(&str, HashMap<String, PropValue>)>,
   ) -> Result<InsertExecutorMultiple<'a>> {
-    let entries: Vec<(String, HashMap<String, PropValue>)> = items
-      .into_iter()
-      .map(|(key_suffix, props)| {
-        let full_key = format!("{}{}", self.key_prefix, key_suffix);
-        (full_key, props)
-      })
-      .collect();
-
-    Ok(InsertExecutorMultiple {
-      ray: self.ray,
-      node_type: self.node_type,
-      entries,
-    })
+    self.values_many_owned(
+      items
+        .into_iter()
+        .map(|(key_suffix, props)| (key_suffix.to_string(), props))
+        .collect(),
+    )
   }
 
   /// Specify values for multiple nodes with owned key suffixes
@@ -3726,18 +3631,10 @@ impl<'a> KiteInsertBuilder<'a> {
     self,
     items: Vec<(String, HashMap<String, PropValue>)>,
   ) -> Result<InsertExecutorMultiple<'a>> {
-    let entries: Vec<(String, HashMap<String, PropValue>)> = items
-      .into_iter()
-      .map(|(key_suffix, props)| {
-        let full_key = format!("{}{}", self.key_prefix, key_suffix);
-        (full_key, props)
-      })
-      .collect();
-
     Ok(InsertExecutorMultiple {
       ray: self.ray,
       node_type: self.node_type,
-      entries,
+      entries: items,
     })
   }
 }
@@ -3746,33 +3643,25 @@ impl<'a> KiteInsertBuilder<'a> {
 pub struct InsertExecutorSingle<'a> {
   ray: &'a mut Kite,
   node_type: String,
-  full_key: String,
+  key_suffix: String,
   props: HashMap<String, PropValue>,
 }
 
 impl<'a> InsertExecutorSingle<'a> {
   /// Execute the insert and return the created node reference
   pub fn returning(self) -> Result<NodeRef> {
-    let node_def = self.ray.nodes.get(&self.node_type);
-    let mut handle = begin_tx(&self.ray.db)?;
-
-    let props = resolve_node_props(
-      handle.db,
+    let ray: &Kite = self.ray;
+    let node_def = ray.schema.node_def(&self.node_type)?;
+    let mut handle = begin_tx(&ray.db)?;
+    let (node_id, full_key) = create_typed_node(
+      &mut handle,
+      &ray.schema,
       node_def,
-      self.ray.strict_schema,
-      NodeWrite::Create,
-      self
-        .props
-        .into_iter()
-        .map(|(name, value)| (name, Some(value))),
+      &self.key_suffix,
+      self.props,
     )?;
-    let node_opts = NodeOpts::new().with_key(self.full_key.clone());
-    let node_id = create_node(&mut handle, node_opts)?;
-    apply_node_props(&mut handle, node_id, props)?;
-
     commit(&mut handle)?;
-
-    Ok(NodeRef::new(node_id, Some(self.full_key), self.node_type))
+    Ok(NodeRef::new(node_id, Some(full_key), self.node_type))
   }
 
   /// Execute the insert without returning the node reference
@@ -3793,38 +3682,26 @@ pub struct InsertExecutorMultiple<'a> {
 
 impl<'a> InsertExecutorMultiple<'a> {
   /// Execute the insert and return all created node references
+  ///
+  /// The nodes are created together, in one transaction and one WAL record.
   pub fn returning(self) -> Result<Vec<NodeRef>> {
     if self.entries.is_empty() {
       return Ok(Vec::new());
     }
 
-    let node_def = self.ray.nodes.get(&self.node_type);
-    let mut handle = begin_tx(&self.ray.db)?;
-    let mut results = Vec::with_capacity(self.entries.len());
-    let node_type: Arc<str> = self.node_type.as_str().into();
-
-    for (full_key, props) in self.entries {
-      let props = resolve_node_props(
-        handle.db,
-        node_def,
-        self.ray.strict_schema,
-        NodeWrite::Create,
-        props.into_iter().map(|(name, value)| (name, Some(value))),
-      )?;
-      let node_opts = NodeOpts::new().with_key(full_key.clone());
-      let node_id = create_node(&mut handle, node_opts)?;
-      apply_node_props(&mut handle, node_id, props)?;
-
-      results.push(NodeRef::new(
-        node_id,
-        Some(full_key),
-        Arc::clone(&node_type),
-      ));
-    }
-
+    let ray: &Kite = self.ray;
+    let node_def = ray.schema.node_def(&self.node_type)?;
+    let mut handle = begin_tx(&ray.db)?;
+    let created = create_typed_nodes(&mut handle, &ray.schema, node_def, self.entries)?;
     commit(&mut handle)?;
 
-    Ok(results)
+    let node_type: Arc<str> = self.node_type.as_str().into();
+    Ok(
+      created
+        .into_iter()
+        .map(|(node_id, full_key)| NodeRef::new(node_id, Some(full_key), Arc::clone(&node_type)))
+        .collect(),
+    )
   }
 
   /// Execute the insert without returning node references
@@ -3842,11 +3719,10 @@ impl<'a> InsertExecutorMultiple<'a> {
 ///
 /// Created via `kite.upsert(node_type)` and provides a fluent API for
 /// creating or updating nodes with the `.values().returning()` or
-/// `.values().execute()` pattern.
+/// `.values().execute()` pattern. A `Null` value unsets the prop.
 pub struct KiteUpsertBuilder<'a> {
   ray: &'a mut Kite,
   node_type: String,
-  key_prefix: String,
 }
 
 impl<'a> KiteUpsertBuilder<'a> {
@@ -3856,11 +3732,10 @@ impl<'a> KiteUpsertBuilder<'a> {
     key_suffix: &str,
     props: HashMap<String, PropValue>,
   ) -> Result<UpsertExecutorSingle<'a>> {
-    let full_key = format!("{}{}", self.key_prefix, key_suffix);
     Ok(UpsertExecutorSingle {
       ray: self.ray,
       node_type: self.node_type,
-      full_key,
+      key_suffix: key_suffix.to_string(),
       props,
     })
   }
@@ -3870,19 +3745,12 @@ impl<'a> KiteUpsertBuilder<'a> {
     self,
     items: Vec<(&str, HashMap<String, PropValue>)>,
   ) -> Result<UpsertExecutorMultiple<'a>> {
-    let entries: Vec<(String, HashMap<String, PropValue>)> = items
-      .into_iter()
-      .map(|(key_suffix, props)| {
-        let full_key = format!("{}{}", self.key_prefix, key_suffix);
-        (full_key, props)
-      })
-      .collect();
-
-    Ok(UpsertExecutorMultiple {
-      ray: self.ray,
-      node_type: self.node_type,
-      entries,
-    })
+    self.values_many_owned(
+      items
+        .into_iter()
+        .map(|(key_suffix, props)| (key_suffix.to_string(), props))
+        .collect(),
+    )
   }
 
   /// Specify values for multiple upserts with owned key suffixes
@@ -3890,18 +3758,10 @@ impl<'a> KiteUpsertBuilder<'a> {
     self,
     items: Vec<(String, HashMap<String, PropValue>)>,
   ) -> Result<UpsertExecutorMultiple<'a>> {
-    let entries: Vec<(String, HashMap<String, PropValue>)> = items
-      .into_iter()
-      .map(|(key_suffix, props)| {
-        let full_key = format!("{}{}", self.key_prefix, key_suffix);
-        (full_key, props)
-      })
-      .collect();
-
     Ok(UpsertExecutorMultiple {
       ray: self.ray,
       node_type: self.node_type,
-      entries,
+      entries: items,
     })
   }
 }
@@ -3910,30 +3770,22 @@ impl<'a> KiteUpsertBuilder<'a> {
 pub struct UpsertExecutorSingle<'a> {
   ray: &'a mut Kite,
   node_type: String,
-  full_key: String,
+  key_suffix: String,
   props: HashMap<String, PropValue>,
 }
 
 impl<'a> UpsertExecutorSingle<'a> {
   /// Execute the upsert and return the node reference
   pub fn returning(self) -> Result<NodeRef> {
-    let node_def = self.ray.nodes.get(&self.node_type);
-    let mut handle = begin_tx(&self.ray.db)?;
-
-    let (node_id, _) = upsert_node_with_props(
-      &mut handle,
-      &self.full_key,
-      node_def,
-      self.ray.strict_schema,
-      self
-        .props
-        .into_iter()
-        .map(|(name, value)| (name, null_as_unset(value))),
-    )?;
-
-    commit(&mut handle)?;
-
-    Ok(NodeRef::new(node_id, Some(self.full_key), self.node_type))
+    let mut nodes = UpsertExecutorMultiple {
+      ray: self.ray,
+      node_type: self.node_type,
+      entries: vec![(self.key_suffix, self.props)],
+    }
+    .returning()?;
+    nodes
+      .pop()
+      .ok_or_else(|| KiteError::Internal("upsert returned no node".to_string()))
   }
 
   /// Execute the upsert without returning the node reference
@@ -3957,28 +3809,23 @@ impl<'a> UpsertExecutorMultiple<'a> {
       return Ok(Vec::new());
     }
 
-    let node_def = self.ray.nodes.get(&self.node_type);
-    let mut handle = begin_tx(&self.ray.db)?;
-    let mut results = Vec::with_capacity(self.entries.len());
+    let ray: &Kite = self.ray;
+    let node_def = ray.schema.node_def(&self.node_type)?;
     let node_type: Arc<str> = self.node_type.as_str().into();
-
-    for (full_key, props) in self.entries {
-      let (node_id, _) = upsert_node_with_props(
-        &mut handle,
-        &full_key,
-        node_def,
-        self.ray.strict_schema,
-        props
-          .into_iter()
-          .map(|(name, value)| (name, null_as_unset(value))),
-      )?;
+    let mut handle = begin_tx(&ray.db)?;
+    let mut results = Vec::with_capacity(self.entries.len());
+    for (key_suffix, props) in self.entries {
+      let props = props
+        .into_iter()
+        .map(|(name, value)| (name, null_as_unset(value)));
+      let (node_id, full_key) =
+        upsert_typed_node(&mut handle, &ray.schema, node_def, &key_suffix, props)?;
       results.push(NodeRef::new(
         node_id,
         Some(full_key),
         Arc::clone(&node_type),
       ));
     }
-
     commit(&mut handle)?;
 
     Ok(results)
@@ -4019,6 +3866,7 @@ impl<'a> UpsertExecutorMultiple<'a> {
 pub struct KiteUpdateEdgeBuilder<'a> {
   ray: &'a mut Kite,
   src: NodeId,
+  edge_type: String,
   etype_id: ETypeId,
   dst: NodeId,
   updates: HashMap<String, Option<PropValue>>,
@@ -4058,38 +3906,12 @@ impl<'a> KiteUpdateEdgeBuilder<'a> {
       return Ok(());
     }
 
-    let mut handle = begin_tx(&self.ray.db)?;
+    let ray: &Kite = self.ray;
+    let edge_def = ray.schema.edge_def(&self.edge_type)?;
+    let mut handle = begin_tx(&ray.db)?;
     require_edge(&handle, self.src, self.etype_id, self.dst)?;
-
-    for (prop_name, value_opt) in self.updates {
-      let prop_key_id = self.ray.db.define_propkey(&prop_name)?;
-
-      match value_opt {
-        Some(value) => {
-          set_edge_prop(
-            &mut handle,
-            self.src,
-            self.etype_id,
-            self.dst,
-            prop_key_id,
-            value,
-          )?;
-        }
-        None => {
-          // Only delete if prop_key exists
-          if let Some(existing_key_id) = self.ray.db.propkey_id(&prop_name) {
-            del_edge_prop(
-              &mut handle,
-              self.src,
-              self.etype_id,
-              self.dst,
-              existing_key_id,
-            )?;
-          }
-        }
-      }
-    }
-
+    let props = resolve_edge_props(handle.db, edge_def, ray.schema.strict, self.updates)?;
+    apply_edge_props(&mut handle, self.src, self.etype_id, self.dst, props)?;
     commit(&mut handle)?;
     Ok(())
   }
@@ -4106,6 +3928,7 @@ impl<'a> KiteUpdateEdgeBuilder<'a> {
 pub struct KiteUpsertEdgeBuilder<'a> {
   ray: &'a mut Kite,
   src: NodeId,
+  edge_type: String,
   etype_id: ETypeId,
   dst: NodeId,
   updates: HashMap<String, Option<PropValue>>,
@@ -4134,16 +3957,11 @@ impl<'a> KiteUpsertEdgeBuilder<'a> {
 
   /// Execute the upsert, creating the edge if missing
   pub fn execute(self) -> Result<()> {
-    let mut handle = begin_tx(&self.ray.db)?;
-
-    let mut updates = Vec::with_capacity(self.updates.len());
-    for (prop_name, value_opt) in self.updates {
-      let prop_key_id = self.ray.db.define_propkey(&prop_name)?;
-      updates.push((prop_key_id, value_opt));
-    }
-
-    upsert_edge_with_props(&mut handle, self.src, self.etype_id, self.dst, updates)?;
-
+    let ray: &Kite = self.ray;
+    let edge_def = ray.schema.edge_def(&self.edge_type)?;
+    let mut handle = begin_tx(&ray.db)?;
+    let props = resolve_edge_props(handle.db, edge_def, ray.schema.strict, self.updates)?;
+    upsert_edge_with_props(&mut handle, self.src, self.etype_id, self.dst, props)?;
     commit(&mut handle)?;
     Ok(())
   }
@@ -5339,8 +5157,7 @@ mod tests {
     assert!(result.is_err());
 
     // Alice should NOT exist because the transaction was rolled back
-    // Note: Due to WAL-based implementation, rollback happens at commit time
-    // so we need to verify the final state
+    assert!(ray.get("User", "alice").expect("get").is_none());
 
     ray.close().expect("expected value");
   }
@@ -6623,5 +6440,44 @@ mod tests {
     assert_eq!(lossless_f64((1 << 53) + 1), None);
     assert_eq!(lossless_f64(i64::MIN), Some(-two_pow_63));
     assert_eq!(lossless_f64(i64::MAX), None);
+  }
+
+  // Wave-3 reproductions that need private access; the rest live in tests/w3_api.rs.
+
+  #[test]
+  fn w3_a13_both_yields_self_loop_once_without_unique() {
+    let temp_dir = tempdir().expect("expected value");
+    let mut ray = Kite::open(temp_db_path(&temp_dir), create_test_schema()).expect("open");
+    let a = ray
+      .create_node("User", "a", HashMap::new())
+      .expect("create a")
+      .id();
+    ray.link(a, "FOLLOWS", a).expect("self-loop");
+
+    let reached = TraversalBuilder::from_node(a)
+      .both(None)
+      .unique(false)
+      .collect_node_ids(|node_id, dir, etype| ray.neighbors(node_id, dir, etype));
+    assert_eq!(
+      reached,
+      vec![a],
+      "A13: one self-loop is one edge, so both() must reach a once"
+    );
+  }
+
+  #[test]
+  fn w3_a14_transaction_keeps_closure_error_when_rollback_fails() {
+    let temp_dir = tempdir().expect("expected value");
+    let mut ray = Kite::open(temp_db_path(&temp_dir), create_test_schema()).expect("open");
+
+    let result: Result<()> = ray.transaction(|ctx| {
+      // End the tx behind the context's back, so the closing rollback fails.
+      ctx.handle.db.rollback()?;
+      Err(KiteError::Internal("closure error".into()))
+    });
+    match result {
+      Err(KiteError::Internal(message)) if message == "closure error" => {}
+      other => panic!("A14: transaction() must return the closure's error, got {other:?}"),
+    }
   }
 }

@@ -2,10 +2,10 @@
 //!
 //! Provides iterators over nodes and database statistics.
 
-use crate::mvcc::visibility::{edge_exists as mvcc_edge_exists, node_exists as mvcc_node_exists};
 use crate::types::*;
 use std::collections::HashSet;
 
+use super::read::NodeLayers;
 use super::SingleFileDB;
 
 // ============================================================================
@@ -44,8 +44,13 @@ impl NodeIterator {
     let delta = db.delta.read();
     let snapshot = db.snapshot.read();
     let vc_guard = db.mvcc.as_ref().map(|mvcc| mvcc.version_chain.lock());
+    let layers = NodeLayers {
+      pending,
+      delta: &delta,
+    };
 
-    // 1. Collect nodes from snapshot (excluding deleted)
+    // 1. Collect nodes from snapshot (excluding deleted ones; a recreated
+    // node is listed with the delta's nodes)
     if let Some(ref snap) = *snapshot {
       let num_nodes = snap.header.num_nodes as u32;
       for phys in 0..num_nodes {
@@ -53,15 +58,8 @@ impl NodeIterator {
           // Skip if deleted in delta
           let node_visible = vc_guard
             .as_ref()
-            .and_then(|vc| vc.node_version(node_id))
-            .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
-          if pending.is_some_and(|p| p.is_node_deleted(node_id)) {
-            continue;
-          }
-          if node_visible == Some(false) {
-            continue;
-          }
-          if node_visible.is_none() && delta.is_node_deleted(node_id) {
+            .and_then(|vc| vc.node_exists_at(node_id, tx_snapshot_ts, txid));
+          if !layers.sees_snapshot(node_id, node_visible) {
             continue;
           }
           nodes.push(node_id);
@@ -71,29 +69,26 @@ impl NodeIterator {
 
     // 2. Add nodes created in delta (excluding deleted)
     for &node_id in delta.created_nodes.keys() {
-      if pending.is_some_and(|p| p.is_node_deleted(node_id)) {
-        continue;
-      }
       let node_visible = vc_guard
         .as_ref()
-        .and_then(|vc| vc.node_version(node_id))
-        .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
-      if node_visible == Some(false) {
-        continue;
-      }
-      if node_visible.is_none() && delta.deleted_nodes.contains(&node_id) {
+        .and_then(|vc| vc.node_exists_at(node_id, tx_snapshot_ts, txid));
+      if !layers.sees_delta(node_id, node_visible) {
         continue;
       }
       nodes.push(node_id);
     }
 
-    // 3. Add nodes created in pending (excluding deleted)
+    // 3. Add nodes created (or recreated) in pending
     if let Some(pending_delta) = pending {
-      for &node_id in pending_delta.created_nodes.keys() {
-        if !pending_delta.deleted_nodes.contains(&node_id) {
-          nodes.push(node_id);
-        }
-      }
+      nodes.extend(pending_delta.created_nodes.keys().copied());
+    }
+
+    // 4. Add nodes deleted since the reader's snapshot: only their version chains hold them
+    if let Some(vc) = vc_guard.as_ref() {
+      nodes.extend(
+        vc.nodes_at(tx_snapshot_ts, txid)
+          .filter(|&node_id| !layers.pending_masks(node_id)),
+      );
     }
 
     // Sort for consistent ordering
@@ -145,12 +140,79 @@ impl SingleFileDB {
     self.iter_nodes().collect()
   }
 
-  /// Count total nodes in the database
+  /// Count total nodes in the database: the length of `iter_nodes()`,
+  /// without listing them.
   ///
-  /// Optimized to avoid full iteration by using snapshot metadata
-  /// and delta size adjustments.
+  /// The snapshot's node count, adjusted only for the nodes the committed
+  /// delta, the caller's transaction, or the MVCC version chains name, so
+  /// the cost follows those (bounded by the WAL and the open transactions),
+  /// not the graph.
   pub fn count_nodes(&self) -> usize {
-    self.iter_nodes().len()
+    let tx_handle = self.current_tx_handle();
+    let tx_guard = tx_handle.as_ref().map(|tx| tx.lock());
+    let pending = tx_guard.as_ref().map(|tx| &tx.pending);
+    // Lock order: see read.rs.
+    let (txid, tx_snapshot_ts) = self.mvcc_read_ts(tx_guard.as_deref());
+    let delta = self.delta.read();
+    let snapshot = self.snapshot.read();
+    let vc_guard = self.mvcc.as_ref().map(|mvcc| mvcc.version_chain.lock());
+    let layers = NodeLayers {
+      pending,
+      delta: &delta,
+    };
+    let snapshot = snapshot.as_ref();
+    let mvcc_visible = |node_id: NodeId| {
+      vc_guard
+        .as_ref()
+        .and_then(|vc| vc.node_exists_at(node_id, tx_snapshot_ts, txid))
+    };
+    // What `NodeIterator` lists from each source.
+    let from_snapshot = |node_id: NodeId, mvcc: Option<bool>| {
+      snapshot.is_some_and(|snap| snap.has_node(node_id)) && layers.sees_snapshot(node_id, mvcc)
+    };
+    let from_elsewhere = |node_id: NodeId, mvcc: Option<bool>| {
+      (delta.is_node_created(node_id) && layers.sees_delta(node_id, mvcc))
+        || pending.is_some_and(|p| p.is_node_created(node_id))
+        || (mvcc == Some(true) && !layers.pending_masks(node_id))
+    };
+    let chained: Vec<NodeId> = vc_guard
+      .as_ref()
+      .map(|vc| vc.chained_node_ids().collect())
+      .unwrap_or_default();
+    let pending_deleted = pending.into_iter().flat_map(|p| p.deleted_nodes.iter());
+    let pending_created = pending.into_iter().flat_map(|p| p.created_nodes.keys());
+
+    // Every snapshot node is listed unless a layer naming it hides it.
+    let mut count = snapshot.map_or(0, |snap| snap.header.num_nodes as usize);
+    let maybe_hidden: HashSet<NodeId> = delta
+      .deleted_nodes
+      .iter()
+      .chain(pending_deleted)
+      .chain(&chained)
+      .copied()
+      .collect();
+    for node_id in maybe_hidden {
+      let in_snapshot = snapshot.is_some_and(|snap| snap.has_node(node_id));
+      if in_snapshot && !from_snapshot(node_id, mvcc_visible(node_id)) {
+        count -= 1;
+      }
+    }
+    // Plus the nodes listed from the delta, the transaction or the chains,
+    // once, unless listed from the snapshot as well.
+    let maybe_added: HashSet<NodeId> = delta
+      .created_nodes
+      .keys()
+      .chain(pending_created)
+      .chain(&chained)
+      .copied()
+      .collect();
+    for node_id in maybe_added {
+      let mvcc = mvcc_visible(node_id);
+      if from_elsewhere(node_id, mvcc) && !from_snapshot(node_id, mvcc) {
+        count += 1;
+      }
+    }
+    count
   }
 
   /// Count total edges in the database
@@ -179,6 +241,10 @@ impl SingleFileDB {
     let vc_guard = self.mvcc.as_ref().map(|mvcc| mvcc.version_chain.lock());
     let mut edges = Vec::new();
     let mut read_srcs = (self.mvcc.is_some() && txid != 0).then(HashSet::<NodeId>::new);
+    let layers = NodeLayers {
+      pending,
+      delta: &delta,
+    };
 
     // From snapshot
     if let Some(ref snap) = *snapshot {
@@ -188,12 +254,8 @@ impl SingleFileDB {
           // Skip deleted nodes
           let src_visible = vc_guard
             .as_ref()
-            .and_then(|vc| vc.node_version(src))
-            .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
-          if src_visible == Some(false)
-            || pending.is_some_and(|p| p.is_node_deleted(src))
-            || (src_visible.is_none() && delta.is_node_deleted(src))
-          {
+            .and_then(|vc| vc.node_exists_at(src, tx_snapshot_ts, txid));
+          if !layers.sees_snapshot(src, src_visible) {
             continue;
           }
           if let Some(ref mut srcs) = read_srcs {
@@ -212,18 +274,13 @@ impl SingleFileDB {
               // Skip deleted edges
               let dst_visible = vc_guard
                 .as_ref()
-                .and_then(|vc| vc.node_version(dst))
-                .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
-              if dst_visible == Some(false)
-                || pending.is_some_and(|p| p.is_node_deleted(dst))
-                || (dst_visible.is_none() && delta.is_node_deleted(dst))
-              {
+                .and_then(|vc| vc.node_exists_at(dst, tx_snapshot_ts, txid));
+              if !layers.sees_snapshot(dst, dst_visible) {
                 continue;
               }
               let edge_visible = vc_guard
                 .as_ref()
-                .and_then(|vc| vc.edge_version(src, etype, dst))
-                .map(|version| mvcc_edge_exists(Some(version), tx_snapshot_ts, txid));
+                .and_then(|vc| vc.edge_exists_at(src, etype, dst, tx_snapshot_ts, txid));
               if edge_visible == Some(false)
                 || pending.is_some_and(|p| p.is_edge_deleted(src, etype, dst))
                 || (edge_visible.is_none() && delta.is_edge_deleted(src, etype, dst))
@@ -250,12 +307,8 @@ impl SingleFileDB {
 
         let src_visible = vc_guard
           .as_ref()
-          .and_then(|vc| vc.node_version(src))
-          .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
-        if src_visible == Some(false)
-          || pending.is_some_and(|p| p.is_node_deleted(src))
-          || (src_visible.is_none() && delta.is_node_deleted(src))
-        {
+          .and_then(|vc| vc.node_exists_at(src, tx_snapshot_ts, txid));
+        if !layers.sees_delta(src, src_visible) {
           continue;
         }
         if let Some(ref mut srcs) = read_srcs {
@@ -263,18 +316,13 @@ impl SingleFileDB {
         }
         let dst_visible = vc_guard
           .as_ref()
-          .and_then(|vc| vc.node_version(patch.other))
-          .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
-        if dst_visible == Some(false)
-          || pending.is_some_and(|p| p.is_node_deleted(patch.other))
-          || (dst_visible.is_none() && delta.is_node_deleted(patch.other))
-        {
+          .and_then(|vc| vc.node_exists_at(patch.other, tx_snapshot_ts, txid));
+        if !layers.sees_delta(patch.other, dst_visible) {
           continue;
         }
         let edge_visible = vc_guard
           .as_ref()
-          .and_then(|vc| vc.edge_version(src, patch.etype, patch.other))
-          .map(|version| mvcc_edge_exists(Some(version), tx_snapshot_ts, txid));
+          .and_then(|vc| vc.edge_exists_at(src, patch.etype, patch.other, tx_snapshot_ts, txid));
         if edge_visible == Some(false) {
           continue;
         }
@@ -301,12 +349,8 @@ impl SingleFileDB {
 
           let src_visible = vc_guard
             .as_ref()
-            .and_then(|vc| vc.node_version(src))
-            .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
-          if src_visible == Some(false)
-            || pending_delta.is_node_deleted(src)
-            || (src_visible.is_none() && delta.is_node_deleted(src))
-          {
+            .and_then(|vc| vc.node_exists_at(src, tx_snapshot_ts, txid));
+          if !layers.sees_pending(src, src_visible) {
             continue;
           }
           if let Some(ref mut srcs) = read_srcs {
@@ -314,12 +358,8 @@ impl SingleFileDB {
           }
           let dst_visible = vc_guard
             .as_ref()
-            .and_then(|vc| vc.node_version(patch.other))
-            .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
-          if dst_visible == Some(false)
-            || pending_delta.is_node_deleted(patch.other)
-            || (dst_visible.is_none() && delta.is_node_deleted(patch.other))
-          {
+            .and_then(|vc| vc.node_exists_at(patch.other, tx_snapshot_ts, txid));
+          if !layers.sees_pending(patch.other, dst_visible) {
             continue;
           }
 
@@ -329,6 +369,31 @@ impl SingleFileDB {
             dst: patch.other,
           });
         }
+      }
+    }
+
+    // Edges deleted since the reader's snapshot: only their version chains hold them
+    if let Some(vc) = vc_guard.as_ref() {
+      let listed = edges.len();
+      let node_visible =
+        |node_id| layers.sees_delta(node_id, vc.node_exists_at(node_id, tx_snapshot_ts, txid));
+      for (src, etype, dst) in vc.edges_at(tx_snapshot_ts, txid) {
+        if etype_filter.is_some_and(|filter_etype| filter_etype != etype)
+          || pending.is_some_and(|p| p.is_edge_deleted(src, etype, dst))
+          || !node_visible(src)
+          || !node_visible(dst)
+        {
+          continue;
+        }
+        if let Some(ref mut srcs) = read_srcs {
+          srcs.insert(src);
+        }
+        edges.push(FullEdge { src, etype, dst });
+      }
+      // Drop the ones the delta or snapshot listed too
+      if edges.len() > listed {
+        let mut seen = HashSet::with_capacity(edges.len());
+        edges.retain(|edge| seen.insert((edge.src, edge.etype, edge.dst)));
       }
     }
 

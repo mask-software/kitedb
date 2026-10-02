@@ -742,7 +742,7 @@ fn bench_mvcc_transaction_overhead(c: &mut Criterion) {
 
 fn bench_single_file_sequential_reads(c: &mut Criterion) {
   // Note: SingleFileDB is not designed for concurrent multi-threaded access.
-  // The internal LruCache is not Sync. This benchmark measures sequential performance.
+  // This benchmark measures sequential performance.
   let mut group = c.benchmark_group("single_file_sequential");
   group.sample_size(20);
 

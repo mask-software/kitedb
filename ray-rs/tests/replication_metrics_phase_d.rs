@@ -1,3 +1,7 @@
+//! Replication metrics: collection, Prometheus and OTLP rendering, and OTLP
+//! push. Needs the `otlp` feature (on by default through `napi`).
+#![cfg(feature = "otlp")]
+
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;

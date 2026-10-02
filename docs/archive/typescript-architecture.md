@@ -107,7 +107,7 @@ src/
 └── util/                 # Utilities
     ├── binary.ts         # Binary encoding/decoding helpers
     ├── compression.ts    # zstd/gzip/deflate compression
-    ├── crc.ts            # CRC32C checksums
+    ├── crc.ts            # CRC-32 (IEEE) checksums
     ├── hash.ts           # xxHash64 for key hashing
     ├── lock.ts           # File locking
     ├── lru.ts            # LRU cache implementation
@@ -170,7 +170,7 @@ type PropValue =
 
 ## CSR Format
 
-See [CSR.md](./CSR.md) for a detailed explanation.
+See [CSR.md](../CSR.md) for a detailed explanation.
 
 The snapshot uses CSR (Compressed Sparse Row) format for efficient edge traversal. For `N` nodes and `E` edges:
 
@@ -305,9 +305,15 @@ reserved (u16)      - Padding
 txid (u64)          - Transaction ID
 payloadLen (u32)    - Payload length
 payload[...]        - Variable-length payload
-crc32c (u32)        - Checksum of type..payload
+crc32 (u32)         - CRC-32 (IEEE) of type..payload, XORed with the region's salt
 padding             - Align to 8 bytes
 ```
+
+Each WAL region's salt is stored in the header (format version 2) and replaced
+whenever a checkpoint empties the region for reuse, so records an earlier WAL
+cycle left in place fail their checksum and are never replayed. Format 1 files
+(unsalted, salt 0) still open and switch to salted records at their next WAL
+reset. Replication frames carry records unsalted.
 
 Record types: `BEGIN`, `COMMIT`, `ROLLBACK`, `CREATE_NODE`, `DELETE_NODE`, `ADD_EDGE`, `DELETE_EDGE`, `SET_NODE_PROP`, `DEL_NODE_PROP`, etc.
 

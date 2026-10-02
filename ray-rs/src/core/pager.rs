@@ -5,16 +5,26 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
+use crate::util::fs::sync_parent_dir;
 use crate::util::mmap::{map_file, Mmap};
 
-use crate::constants::{
-  LOCK_BYTE_OFFSET, LOCK_BYTE_RANGE, MAX_PAGE_SIZE, MIN_PAGE_SIZE, OS_PAGE_SIZE,
-};
+use crate::constants::{MAX_PAGE_SIZE, MIN_PAGE_SIZE, OS_PAGE_SIZE};
 use crate::error::{KiteError, Result};
+
+#[cfg(test)]
+thread_local! {
+  /// Test probe: the OS primitive each `FilePager` sync on this thread issued,
+  /// oldest first. "fsync" is plain fsync(2), which on macOS leaves data in
+  /// the drive's volatile cache; "F_FULLFSYNC" is fcntl(F_FULLFSYNC) (macOS),
+  /// and "sync_all" is `File::sync_all` (other platforms). New sync
+  /// primitives should log here too.
+  pub(crate) static SYNC_PRIMITIVE_LOG: std::cell::RefCell<Vec<&'static str>> =
+    const { std::cell::RefCell::new(Vec::new()) };
+}
+pub(crate) mod io_hooks;
 
 static DATABASE_FILE_LOCKS: OnceLock<Mutex<HashMap<PathBuf, InProcessLockState>>> = OnceLock::new();
 const WRITABLE_OPEN_MAX_ATTEMPTS: usize = 4;
@@ -85,6 +95,88 @@ impl Drop for DatabaseFileLock {
       registry.remove(&self.path);
     }
   }
+}
+
+// ============================================================================
+// Positioned I/O
+// ============================================================================
+
+/// One positioned read; it may return fewer bytes than asked.
+#[cfg(unix)]
+fn read_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+  std::os::unix::fs::FileExt::read_at(file, buffer, offset)
+}
+
+/// One positioned read; it may return fewer bytes than asked. It also moves
+/// the file cursor, which page I/O never relies on.
+#[cfg(windows)]
+fn read_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+  std::os::windows::fs::FileExt::seek_read(file, buffer, offset)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn read_at(mut file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+  use std::io::{Read, Seek, SeekFrom};
+  file.seek(SeekFrom::Start(offset))?;
+  file.read(buffer)
+}
+
+/// One positioned write; it may write fewer bytes than given.
+#[cfg(unix)]
+fn write_at(file: &File, data: &[u8], offset: u64) -> std::io::Result<usize> {
+  std::os::unix::fs::FileExt::write_at(file, data, offset)
+}
+
+/// One positioned write; it may write fewer bytes than given. It also moves
+/// the file cursor, which page I/O never relies on.
+#[cfg(windows)]
+fn write_at(file: &File, data: &[u8], offset: u64) -> std::io::Result<usize> {
+  std::os::windows::fs::FileExt::seek_write(file, data, offset)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn write_at(mut file: &File, data: &[u8], offset: u64) -> std::io::Result<usize> {
+  use std::io::{Seek, SeekFrom, Write};
+  file.seek(SeekFrom::Start(offset))?;
+  file.write(data)
+}
+
+/// Fill `buffer` from file `offset` until it is full or the file ends, and
+/// return the bytes read; the rest of `buffer` is left as it was. A read may
+/// return fewer bytes than asked before the end of the file (POSIX allows it:
+/// NFS, signals), so this reads again until a read returns none.
+fn read_full_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+  let mut filled = 0;
+  while filled < buffer.len() {
+    let at = offset + filled as u64;
+    io_hooks::syscall();
+    match read_at(file, io_hooks::read_window(at, &mut buffer[filled..]), at) {
+      Ok(0) => break,
+      Ok(read) => filled += read,
+      Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+      Err(error) => return Err(error),
+    }
+  }
+  Ok(filled)
+}
+
+/// Write all of `data` at file `offset`, writing again after a short write.
+fn write_all_at(file: &File, all: &[u8], start: u64) -> std::io::Result<()> {
+  let (mut data, mut offset) = (all, start);
+  while !data.is_empty() {
+    io_hooks::syscall();
+    match write_at(file, data, offset) {
+      Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+      Ok(written) => {
+        data = &data[written..];
+        offset += written as u64;
+      }
+      Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+      Err(error) => return Err(error),
+    }
+  }
+  io_hooks::wrote(start, all);
+  Ok(())
 }
 
 fn normalize_lock_path(path: &Path) -> Result<PathBuf> {
@@ -178,6 +270,9 @@ pub struct FilePager {
   deferred_free_pages: HashSet<u32>,
   /// Cached mmap for the entire file (lazily created)
   mmap: Option<Mmap>,
+  /// Make [`Self::sync`] flush the drive's write cache too (`F_FULLFSYNC` on
+  /// macOS); see [`Self::set_full_fsync`].
+  full_fsync: bool,
 }
 
 impl FilePager {
@@ -204,6 +299,7 @@ impl FilePager {
       free_pages: HashSet::new(),
       deferred_free_pages: HashSet::new(),
       mmap: None,
+      full_fsync: false,
     })
   }
 
@@ -219,6 +315,7 @@ impl FilePager {
       free_pages: HashSet::new(),
       deferred_free_pages: HashSet::new(),
       mmap: None,
+      full_fsync: false,
     }
   }
 
@@ -237,19 +334,6 @@ impl FilePager {
     self.file_size
   }
 
-  /// Calculate the page number range for the lock byte region
-  fn lock_byte_page_range(&self) -> (u32, u32) {
-    let start = (LOCK_BYTE_OFFSET / self.page_size as u64) as u32;
-    let end = (LOCK_BYTE_OFFSET + LOCK_BYTE_RANGE as u64).div_ceil(self.page_size as u64) as u32;
-    (start, end)
-  }
-
-  /// Check if a page number overlaps with the lock byte range
-  fn is_lock_byte_page(&self, page_num: u32) -> bool {
-    let (start, end) = self.lock_byte_page_range();
-    page_num >= start && page_num < end
-  }
-
   /// Read a single page by page number
   pub fn read_page(&mut self, page_num: u32) -> Result<Vec<u8>> {
     let offset = page_num as u64 * self.page_size as u64;
@@ -259,13 +343,9 @@ impl FilePager {
       return Ok(vec![0u8; self.page_size]);
     }
 
+    // Bytes past the end of the file read as zeros.
     let mut buffer = vec![0u8; self.page_size];
-    self.file.seek(SeekFrom::Start(offset))?;
-
-    // Read as much as we can (may be less than page_size at end of file)
-    let _bytes_read = self.file.read(&mut buffer)?;
-
-    // Rest is already zeros
+    read_full_at(&self.file, &mut buffer, offset)?;
     Ok(buffer)
   }
 
@@ -282,12 +362,6 @@ impl FilePager {
       )));
     }
 
-    // Safety check: don't write to lock byte range
-    if self.is_lock_byte_page(page_num) {
-      return Err(KiteError::Internal(format!(
-        "Cannot write to lock byte page range (page {page_num})"
-      )));
-    }
     self.ensure_no_live_mmap()?;
 
     let offset = page_num as u64 * self.page_size as u64;
@@ -299,9 +373,7 @@ impl FilePager {
       self.file_size = required_size;
     }
 
-    self.file.seek(SeekFrom::Start(offset))?;
-    self.file.write_all(data)?;
-
+    write_all_at(&self.file, data, offset)?;
     Ok(())
   }
 
@@ -374,21 +446,11 @@ impl FilePager {
     }
     self.ensure_no_live_mmap()?;
 
-    // Calculate current page count
-    let current_page_count = self.file_size.div_ceil(self.page_size as u64) as u32;
-    let mut start_page = current_page_count;
-
-    // Check if we need to skip the lock byte range
-    let (lock_start, lock_end) = self.lock_byte_page_range();
-
-    // If the new allocation would overlap with lock byte range, skip past it
-    if start_page < lock_end && start_page + count > lock_start {
-      // Move start past the lock byte range
-      start_page = lock_end;
-    }
-
-    // Extend file
-    let new_size = (start_page + count) as u64 * self.page_size as u64;
+    // The new pages start at the end of the file. Callers rely on that: no
+    // page is reserved (KiteDB locks the whole file, not SQLite-style lock
+    // bytes at 1 GiB), so no range is ever moved past one.
+    let start_page = self.file_size.div_ceil(self.page_size as u64) as u32;
+    let new_size = (start_page as u64 + count as u64) * self.page_size as u64;
     self.file.set_len(new_size)?;
     self.file_size = new_size;
 
@@ -502,14 +564,44 @@ impl FilePager {
     Ok(())
   }
 
+  /// Make every [`Self::sync`] durable against power loss, not just against
+  /// a process or OS crash (`SingleFileOpenOptions::full_fsync` with
+  /// `SyncMode::Full`).
+  ///
+  /// On macOS, fsync(2) hands data to the drive, whose volatile write cache
+  /// can still lose it or persist it out of order (a header before the WAL
+  /// or snapshot pages it names); `F_FULLFSYNC` flushes that cache too, at a
+  /// cost of milliseconds per sync. Elsewhere `File::sync_all` is used either
+  /// way.
+  pub fn set_full_fsync(&mut self, full_fsync: bool) {
+    self.full_fsync = full_fsync;
+  }
+
   /// Sync file to disk
   pub fn sync(&self) -> Result<()> {
     if self.read_only {
       return Ok(());
     }
+    io_hooks::before_sync()?;
+    let synced = self.sync_file();
+    io_hooks::synced(synced.is_ok());
+    synced
+  }
+
+  fn sync_file(&self) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
       use std::os::unix::io::AsRawFd;
+      // F_FULLFSYNC fails on file systems without it (some network and FUSE
+      // mounts); fall back to fsync there, as SQLite does.
+      // SAFETY: file descriptor is valid for the pager file.
+      if self.full_fsync && unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_FULLFSYNC) } == 0 {
+        #[cfg(test)]
+        SYNC_PRIMITIVE_LOG.with(|log| log.borrow_mut().push("F_FULLFSYNC"));
+        return Ok(());
+      }
+      #[cfg(test)]
+      SYNC_PRIMITIVE_LOG.with(|log| log.borrow_mut().push("fsync"));
       // SAFETY: file descriptor is valid for the pager file.
       let result = unsafe { libc::fsync(self.file.as_raw_fd()) };
       if result != 0 {
@@ -519,6 +611,8 @@ impl FilePager {
 
     #[cfg(not(target_os = "macos"))]
     {
+      #[cfg(test)]
+      SYNC_PRIMITIVE_LOG.with(|log| log.borrow_mut().push("sync_all"));
       self.file.sync_all()?;
     }
     Ok(())
@@ -535,61 +629,30 @@ impl FilePager {
       return Ok(());
     }
 
-    // Validate destination doesn't overlap with lock byte range
-    let (lock_start, lock_end) = self.lock_byte_page_range();
-    if dst_page < lock_end && dst_page + page_count > lock_start {
-      return Err(KiteError::Internal(
-        "Cannot relocate to lock byte range".to_string(),
-      ));
-    }
-
-    // Determine copy direction to avoid overwriting source before reading
+    // Copy the pages furthest into the overlap first, so no source page is
+    // overwritten before it is read.
+    let page_size = self.page_size as u64;
     let copy_forward = src_page < dst_page;
-
-    if copy_forward {
-      // Copy from end to start to avoid overwriting
-      for i in (0..page_count).rev() {
-        let src_offset = (src_page + i) as u64 * self.page_size as u64;
-        let dst_offset = (dst_page + i) as u64 * self.page_size as u64;
-
-        // Read source page
-        let mut buffer = vec![0u8; self.page_size];
-        self.file.seek(SeekFrom::Start(src_offset))?;
-        self.file.read_exact(&mut buffer)?;
-
-        // Extend file if needed
-        let required_size = dst_offset + self.page_size as u64;
-        if required_size > self.file_size {
-          self.file.set_len(required_size)?;
-          self.file_size = required_size;
-        }
-
-        // Write to destination
-        self.file.seek(SeekFrom::Start(dst_offset))?;
-        self.file.write_all(&buffer)?;
+    let mut buffer = vec![0u8; self.page_size];
+    for step in 0..page_count {
+      let i = if copy_forward {
+        page_count - 1 - step
+      } else {
+        step
+      };
+      let src_offset = (src_page + i) as u64 * page_size;
+      let dst_offset = (dst_page + i) as u64 * page_size;
+      if read_full_at(&self.file, &mut buffer, src_offset)? < buffer.len() {
+        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
       }
-    } else {
-      // Copy from start to end
-      for i in 0..page_count {
-        let src_offset = (src_page + i) as u64 * self.page_size as u64;
-        let dst_offset = (dst_page + i) as u64 * self.page_size as u64;
 
-        // Read source page
-        let mut buffer = vec![0u8; self.page_size];
-        self.file.seek(SeekFrom::Start(src_offset))?;
-        self.file.read_exact(&mut buffer)?;
-
-        // Extend file if needed
-        let required_size = dst_offset + self.page_size as u64;
-        if required_size > self.file_size {
-          self.file.set_len(required_size)?;
-          self.file_size = required_size;
-        }
-
-        // Write to destination
-        self.file.seek(SeekFrom::Start(dst_offset))?;
-        self.file.write_all(&buffer)?;
+      // Extend file if needed
+      let required_size = dst_offset + page_size;
+      if required_size > self.file_size {
+        self.file.set_len(required_size)?;
+        self.file_size = required_size;
       }
+      write_all_at(&self.file, &buffer, dst_offset)?;
     }
 
     // Sync to ensure data is durable before marking old pages as free
@@ -701,17 +764,37 @@ pub(crate) fn open_pager_with_locking<P: AsRef<Path>>(
   )))
 }
 
-/// Create a new pager for a new file
+/// Create a pager for a new database file, or claim an empty existing file.
+/// Fails rather than truncate a file that already holds data.
 pub fn create_pager<P: AsRef<Path>>(file_path: P, page_size: usize) -> Result<FilePager> {
-  create_pager_with_locking(file_path, page_size, true)
+  let file_path = file_path.as_ref();
+  match create_pager_with_locking(file_path, page_size, true)? {
+    NewPager::Created(pager) => Ok(pager),
+    NewPager::Exists => Err(KiteError::CreateFailed(format!(
+      "{} already exists and is not empty",
+      file_path.display()
+    ))),
+  }
 }
 
+/// What [`create_pager_with_locking`] found once it held the file lock.
+pub(crate) enum NewPager {
+  /// The file is new (or was empty): a pager for a database to initialize.
+  Created(FilePager),
+  /// The file holds data: something created a database there after the
+  /// caller found no file. Open it instead.
+  Exists,
+}
+
+/// Create (or claim an empty) database file and lock it. The directory
+/// entry is synced, so the new file survives power loss.
 pub(crate) fn create_pager_with_locking<P: AsRef<Path>>(
   file_path: P,
   page_size: usize,
   lock_file: bool,
-) -> Result<FilePager> {
+) -> Result<NewPager> {
   let file_path = file_path.as_ref();
+  io_hooks::before_create_lock(file_path);
   let attempts = if lock_file {
     WRITABLE_OPEN_MAX_ATTEMPTS
   } else {
@@ -743,8 +826,14 @@ pub(crate) fn create_pager_with_locking<P: AsRef<Path>>(
       }
       continue;
     }
-    file.set_len(0)?;
-    return Ok(FilePager {
+    // The caller found no file before this took the lock. Another opener
+    // may have created a database here since, and closed it: truncating it
+    // would destroy it.
+    if file.metadata()?.len() > 0 {
+      return Ok(NewPager::Exists);
+    }
+    sync_parent_dir(file_path)?;
+    return Ok(NewPager::Created(FilePager {
       file,
       file_lock,
       file_path: file_path.to_path_buf(),
@@ -754,7 +843,8 @@ pub(crate) fn create_pager_with_locking<P: AsRef<Path>>(
       free_pages: HashSet::new(),
       deferred_free_pages: HashSet::new(),
       mmap: None,
-    });
+      full_fsync: false,
+    }));
   }
   Err(KiteError::LockFailed(format!(
     "database path changed while acquiring its lock after {attempts} attempts: {}",
@@ -952,5 +1042,93 @@ mod tests {
     assert!(
       locked_file_matches_path(&current_file, &database_path).expect("expected identity check")
     );
+  }
+}
+
+/// Wave-2 `wal-format` W7: `SyncMode::Full` with `full_fsync` must survive
+/// power loss. Plain fsync(2) on macOS only hands data to the drive, whose
+/// volatile cache can lose it or persist it out of order (the header page
+/// before the WAL page it names, or before the snapshot it points to).
+/// `full_fsync` is opt-in (off by default, like SQLite's `fullfsync`).
+#[cfg(test)]
+mod w2_tests {
+  use super::SYNC_PRIMITIVE_LOG;
+  use crate::core::single_file::{open_single_file, SingleFileOpenOptions, SyncMode};
+
+  /// The sync primitives `run` issued on this thread.
+  fn syncs_during(run: impl FnOnce()) -> Vec<&'static str> {
+    SYNC_PRIMITIVE_LOG.with(|log| log.borrow_mut().clear());
+    run();
+    SYNC_PRIMITIVE_LOG.with(|log| log.borrow_mut().drain(..).collect())
+  }
+
+  fn assert_drive_cache_flushed(what: &str, syncs: &[&str]) {
+    assert!(!syncs.is_empty(), "{what}: issued no sync at all");
+    assert!(
+      syncs.iter().all(|primitive| *primitive != "fsync"),
+      "{what}: used plain fsync, which on macOS leaves the data in the drive cache (power \
+       loss can drop it, or persist a header before the pages it names): {syncs:?}"
+    );
+  }
+
+  #[test]
+  fn w7_full_sync_mode_commit_flushes_the_drive_cache() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let options = SingleFileOpenOptions::new()
+      .auto_checkpoint(false)
+      .sync_mode(SyncMode::Full)
+      .full_fsync(true);
+    let db = open_single_file(dir.path().join("w7-commit.kitedb"), options).expect("open");
+    let syncs = syncs_during(|| {
+      db.begin(false).expect("begin");
+      db.create_node(Some("n")).expect("node");
+      db.commit().expect("commit");
+    });
+    assert_drive_cache_flushed("SyncMode::Full commit", &syncs);
+  }
+
+  #[test]
+  fn w7_full_sync_mode_checkpoint_flushes_the_drive_cache() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let options = SingleFileOpenOptions::new()
+      .auto_checkpoint(false)
+      .sync_mode(SyncMode::Full)
+      .full_fsync(true);
+    let db = open_single_file(dir.path().join("w7-checkpoint.kitedb"), options).expect("open");
+    db.begin(false).expect("begin");
+    db.create_node(Some("n")).expect("node");
+    db.commit().expect("commit");
+    let syncs = syncs_during(|| db.checkpoint().expect("checkpoint"));
+    assert_drive_cache_flushed("SyncMode::Full checkpoint", &syncs);
+  }
+
+  /// Without the option, Full mode keeps the plain sync primitive (fast, not
+  /// power-loss durable on macOS), and the option never affects Normal mode.
+  #[test]
+  fn w7_full_fsync_is_opt_in_and_only_for_full_mode() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cases = [
+      ("default Full", SyncMode::Full, false),
+      ("Normal with full_fsync", SyncMode::Normal, true),
+    ];
+    for (what, mode, full_fsync) in cases {
+      let options = SingleFileOpenOptions::new()
+        .auto_checkpoint(false)
+        .sync_mode(mode)
+        .full_fsync(full_fsync);
+      let path = dir.path().join(format!("w7-{mode:?}.kitedb"));
+      let db = open_single_file(path, options).expect("open");
+      let syncs = syncs_during(|| {
+        db.begin(false).expect("begin");
+        db.create_node(Some("n")).expect("node");
+        db.commit().expect("commit");
+        db.checkpoint().expect("checkpoint");
+      });
+      assert!(!syncs.is_empty(), "{what}: issued no sync at all");
+      assert!(
+        !syncs.contains(&"F_FULLFSYNC"),
+        "{what}: used F_FULLFSYNC: {syncs:?}"
+      );
+    }
   }
 }

@@ -2,14 +2,21 @@
 //!
 //! Builds CSR snapshots from nodes and edges for checkpointing.
 //! Ported from src/core/snapshot-writer.ts
+//!
+//! Memory: strings are stored once (in the StringBytes section data, keyed
+//! by borrowed input strings), the CSR arrays are filled in place using the
+//! per-node counts as cursors, and each section goes into the output buffer
+//! as soon as it is encoded, so the writer holds roughly one snapshot of
+//! section data plus its input.
 
 use crate::constants::*;
 use crate::core::snapshot::node_map::{self, NodeIdMapLayout};
+use crate::core::snapshot::sections::inflation_budget;
 use crate::error::{KiteError, Result};
 use crate::types::*;
 use crate::util::binary::*;
-use crate::util::compression::{maybe_compress, CompressionOptions, CompressionType};
-use crate::util::crc::crc32c;
+use crate::util::compression::{try_compress, CompressionOptions, CompressionType};
+use crate::util::crc::crc32;
 use crate::util::hash::xxhash64_string;
 use crate::vector::ivf::serialize::serialize_manifest;
 use crate::vector::types::VectorManifest;
@@ -61,37 +68,117 @@ fn checked_u32(value: usize, what: &str) -> Result<u32> {
   })
 }
 
+fn push_u32(data: &mut Vec<u8>, value: u32) {
+  data.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_u64(data: &mut Vec<u8>, value: u64) {
+  data.extend_from_slice(&value.to_le_bytes());
+}
+
+fn encode_u32_slice(values: &[u32]) -> Vec<u8> {
+  let mut data = Vec::with_capacity(values.len() * 4);
+  for &value in values {
+    push_u32(&mut data, value);
+  }
+  data
+}
+
+fn encode_u64_slice(values: &[u64]) -> Vec<u8> {
+  let mut data = Vec::with_capacity(values.len() * 8);
+  for &value in values {
+    push_u64(&mut data, value);
+  }
+  data
+}
+
 // ============================================================================
 // String table for interning
 // ============================================================================
 
-struct StringTable {
-  strings: Vec<String>,
-  string_to_id: HashMap<String, StringId>,
+/// Interned strings. The bytes and offsets are the StringBytes and
+/// StringOffsets section data; the ID map borrows the input strings, so each
+/// string is stored once.
+struct StringTable<'a> {
+  bytes: Vec<u8>,
+  /// String `id` is `bytes[offsets[id]..offsets[id + 1]]`.
+  offsets: Vec<u64>,
+  ids: hashbrown::HashMap<&'a str, StringId>,
 }
 
-impl StringTable {
+impl<'a> StringTable<'a> {
   fn new() -> Self {
-    let mut table = Self {
-      strings: vec![String::new()], // StringID 0 is reserved/empty
-      string_to_id: HashMap::new(),
-    };
-    table.string_to_id.insert(String::new(), 0);
-    table
+    // StringID 0 is reserved/empty
+    let mut ids = hashbrown::HashMap::new();
+    ids.insert("", 0);
+    Self {
+      bytes: Vec::new(),
+      offsets: vec![0, 0],
+      ids,
+    }
   }
 
-  fn intern(&mut self, s: &str) -> Result<StringId> {
-    if let Some(&id) = self.string_to_id.get(s) {
+  fn intern(&mut self, s: &'a str) -> Result<StringId> {
+    if let Some(&id) = self.ids.get(s) {
       return Ok(id);
     }
-    let id = checked_u32(self.strings.len(), "string count")?;
-    self.strings.push(s.to_string());
-    self.string_to_id.insert(s.to_string(), id);
+    let id = checked_u32(self.len(), "string count")?;
+    self.bytes.extend_from_slice(s.as_bytes());
+    self.offsets.push(self.bytes.len() as u64);
+    self.ids.insert(s, id);
     Ok(id)
   }
 
+  /// ID of an interned string (0 if it was never interned).
+  fn id(&self, s: &str) -> StringId {
+    self.ids.get(s).copied().unwrap_or(0)
+  }
+
   fn len(&self) -> usize {
-    self.strings.len()
+    self.offsets.len() - 1
+  }
+}
+
+// ============================================================================
+// Node index
+// ============================================================================
+
+/// NodeID -> physical node, through the NodeIdToPhys section data itself.
+struct NodeIndex {
+  layout: NodeIdMapLayout,
+  map: Vec<u8>,
+}
+
+impl NodeIndex {
+  /// `phys_to_node_id` lists node IDs in physical order, ascending.
+  fn build(phys_to_node_id: &[NodeId], max_node_id: NodeId) -> Result<Self> {
+    if let Some(pair) = phys_to_node_id.windows(2).find(|pair| pair[0] == pair[1]) {
+      return Err(KiteError::InvalidSnapshot(format!(
+        "duplicate node ID {} in snapshot input",
+        pair[0]
+      )));
+    }
+    let (layout, map) = node_map::encode(phys_to_node_id, max_node_id)?;
+    Ok(Self { layout, map })
+  }
+
+  #[inline]
+  fn phys(&self, node_id: NodeId) -> Option<PhysNode> {
+    match self.layout {
+      NodeIdMapLayout::Dense => node_map::dense_lookup(&self.map, node_id),
+      NodeIdMapLayout::Sparse => node_map::sparse_lookup(&self.map, node_id),
+    }
+  }
+
+  /// Physical node of an edge endpoint, or an error naming the edge.
+  #[inline]
+  fn endpoint(&self, node_id: NodeId, edge: &EdgeData) -> Result<PhysNode> {
+    self.phys(node_id).ok_or_else(|| {
+      KiteError::InvalidSnapshot(format!(
+        "Edge references missing node(s): src={}, dst={}",
+        edge.src, edge.dst
+      ))
+    })
   }
 }
 
@@ -101,137 +188,143 @@ impl StringTable {
 
 struct CSRData {
   offsets: Vec<u32>,
+  /// Destination (out-edges) or source (in-edges) per edge.
   dst: Vec<u32>,
   etype: Vec<u32>,
   /// For in-edges: index back to out-edge
   out_index: Option<Vec<u32>>,
 }
 
-/// Callers bound `edges.len()` by u32::MAX (see `prepare_snapshot_state`), so
-/// per-node counts and prefix sums fit u32.
-fn build_out_edges_csr(
-  nodes: &[NodeData],
-  edges: &[EdgeData],
-  node_id_to_phys: &HashMap<NodeId, PhysNode>,
-) -> CSRData {
-  let num_nodes = nodes.len();
-  let num_edges = edges.len();
-
-  // Count edges per node
-  let mut counts = vec![0u32; num_nodes];
-  for edge in edges {
-    if let Some(&src_phys) = node_id_to_phys.get(&edge.src) {
-      counts[src_phys as usize] += 1;
-    }
+/// Prefix sums of per-node counts; `counts` must fit u32 in total.
+fn prefix_offsets(counts: &[u32]) -> Vec<u32> {
+  let mut offsets = Vec::with_capacity(counts.len() + 1);
+  let mut total = 0u32;
+  offsets.push(0);
+  for &count in counts {
+    total += count;
+    offsets.push(total);
   }
-
-  // Build offsets (prefix sum)
-  let mut offsets = vec![0u32; num_nodes + 1];
-  for i in 0..num_nodes {
-    offsets[i + 1] = offsets[i] + counts[i];
-  }
-
-  // Fill edge arrays (sort by etype, dst within each node)
-  let mut dst_arr = vec![0u32; num_edges];
-  let mut etype_arr = vec![0u32; num_edges];
-
-  // Group edges by source node
-  let mut edges_by_node: HashMap<PhysNode, Vec<(ETypeId, PhysNode)>> = HashMap::new();
-  for edge in edges {
-    if let (Some(&src_phys), Some(&dst_phys)) = (
-      node_id_to_phys.get(&edge.src),
-      node_id_to_phys.get(&edge.dst),
-    ) {
-      edges_by_node
-        .entry(src_phys)
-        .or_default()
-        .push((edge.etype, dst_phys));
-    }
-  }
-
-  // Sort and write edges for each node
-  for (src_phys, mut node_edges) in edges_by_node {
-    // Sort by (etype, dst)
-    node_edges.sort_by(|a, b| {
-      if a.0 != b.0 {
-        a.0.cmp(&b.0)
-      } else {
-        a.1.cmp(&b.1)
-      }
-    });
-
-    let start = offsets[src_phys as usize] as usize;
-    for (pos, (etype, dst_phys)) in (start..).zip(node_edges) {
-      dst_arr[pos] = dst_phys;
-      etype_arr[pos] = etype;
-    }
-  }
-
-  CSRData {
-    offsets,
-    dst: dst_arr,
-    etype: etype_arr,
-    out_index: None,
-  }
+  offsets
 }
 
-/// Same u32 bounds as `build_out_edges_csr`: node and edge counts fit u32.
-fn build_in_edges_csr(nodes: &[NodeData], out_csr: &CSRData) -> CSRData {
-  let num_nodes = nodes.len();
+/// Callers bound `edges.len()` by u32::MAX (see `build_snapshot_to_memory`),
+/// so per-node counts and prefix sums fit u32. Edges are placed in input
+/// order using the offsets as cursors, then each node's range is sorted by
+/// (etype, dst) unless it already is.
+fn build_out_edges_csr(num_nodes: usize, edges: &[EdgeData], index: &NodeIndex) -> Result<CSRData> {
+  // Consecutive edges usually share a source; resolve it once.
+  let mut last_src: Option<(NodeId, PhysNode)> = None;
+  let mut src_phys = |edge: &EdgeData| -> Result<PhysNode> {
+    match last_src {
+      Some((node_id, phys)) if node_id == edge.src => Ok(phys),
+      _ => {
+        let phys = index.endpoint(edge.src, edge)?;
+        last_src = Some((edge.src, phys));
+        Ok(phys)
+      }
+    }
+  };
+
+  let mut counts = vec![0u32; num_nodes];
+  for edge in edges {
+    counts[src_phys(edge)? as usize] += 1;
+  }
+  let offsets = prefix_offsets(&counts);
+  // Reuse the counts as per-node write cursors.
+  let mut cursors = counts;
+  cursors.copy_from_slice(&offsets[..num_nodes]);
+
+  let mut dst = vec![0u32; edges.len()];
+  let mut etype = vec![0u32; edges.len()];
+  for edge in edges {
+    let src = src_phys(edge)? as usize;
+    let pos = cursors[src] as usize;
+    cursors[src] += 1;
+    dst[pos] = index.endpoint(edge.dst, edge)?;
+    etype[pos] = edge.etype;
+  }
+  drop(cursors);
+
+  let mut scratch: Vec<(ETypeId, PhysNode)> = Vec::new();
+  for node in 0..num_nodes {
+    let range = offsets[node] as usize..offsets[node + 1] as usize;
+    let sorted = range
+      .clone()
+      .skip(1)
+      .all(|i| (etype[i - 1], dst[i - 1]) <= (etype[i], dst[i]));
+    if sorted {
+      continue;
+    }
+    scratch.clear();
+    scratch.extend(range.clone().map(|i| (etype[i], dst[i])));
+    // Equal keys are identical edges, so an unstable sort is deterministic.
+    scratch.sort_unstable();
+    for (i, &(edge_etype, edge_dst)) in range.zip(&scratch) {
+      etype[i] = edge_etype;
+      dst[i] = edge_dst;
+    }
+  }
+
+  Ok(CSRData {
+    offsets,
+    dst,
+    etype,
+    out_index: None,
+  })
+}
+
+/// Same u32 bounds as `build_out_edges_csr`. Out-edges are visited in index
+/// order, so each node's in-edges arrive sorted by source; a range needs
+/// sorting by (etype, src, out index) only when its edge types are mixed.
+fn build_in_edges_csr(num_nodes: usize, out_csr: &CSRData) -> CSRData {
   let num_edges = out_csr.dst.len();
 
-  // Count in-edges per node
   let mut counts = vec![0u32; num_nodes];
   for &dst in &out_csr.dst {
     counts[dst as usize] += 1;
   }
+  let offsets = prefix_offsets(&counts);
+  let mut cursors = counts;
+  cursors.copy_from_slice(&offsets[..num_nodes]);
 
-  // Build offsets (prefix sum)
-  let mut offsets = vec![0u32; num_nodes + 1];
-  for i in 0..num_nodes {
-    offsets[i + 1] = offsets[i] + counts[i];
-  }
-
-  // Fill in-edge arrays
   let mut src_arr = vec![0u32; num_edges];
   let mut etype_arr = vec![0u32; num_edges];
   let mut out_index = vec![0u32; num_edges];
-
-  // Collect in-edges with their out-edge indices
-  let mut in_edges_by_node: HashMap<PhysNode, Vec<(PhysNode, ETypeId, u32)>> = HashMap::new();
-
   for src_phys in 0..num_nodes {
     let start = out_csr.offsets[src_phys] as usize;
     let end = out_csr.offsets[src_phys + 1] as usize;
-
     for out_idx in start..end {
-      let dst_phys = out_csr.dst[out_idx];
-      let edge_etype = out_csr.etype[out_idx];
-
-      in_edges_by_node.entry(dst_phys).or_default().push((
-        src_phys as PhysNode,
-        edge_etype,
-        out_idx as u32,
-      ));
+      let dst = out_csr.dst[out_idx] as usize;
+      let pos = cursors[dst] as usize;
+      cursors[dst] += 1;
+      src_arr[pos] = src_phys as PhysNode;
+      etype_arr[pos] = out_csr.etype[out_idx];
+      out_index[pos] = out_idx as u32;
     }
   }
+  drop(cursors);
 
-  // Sort and write in-edges for each node
-  for (dst_phys, mut node_in_edges) in in_edges_by_node {
-    // Sort by (etype, src)
-    node_in_edges.sort_by(|a, b| {
-      if a.1 != b.1 {
-        a.1.cmp(&b.1)
-      } else {
-        a.0.cmp(&b.0)
-      }
-    });
-
-    let start = offsets[dst_phys as usize] as usize;
-    for (pos, (src_phys, etype, out_idx)) in (start..).zip(node_in_edges) {
-      src_arr[pos] = src_phys;
-      etype_arr[pos] = etype;
-      out_index[pos] = out_idx;
+  let mut scratch: Vec<(ETypeId, PhysNode, u32)> = Vec::new();
+  for node in 0..num_nodes {
+    let range = offsets[node] as usize..offsets[node + 1] as usize;
+    if range
+      .clone()
+      .skip(1)
+      .all(|i| etype_arr[i - 1] <= etype_arr[i])
+    {
+      continue;
+    }
+    scratch.clear();
+    scratch.extend(
+      range
+        .clone()
+        .map(|i| (etype_arr[i], src_arr[i], out_index[i])),
+    );
+    scratch.sort_unstable();
+    for (i, &(etype, src, out_idx)) in range.zip(&scratch) {
+      etype_arr[i] = etype;
+      src_arr[i] = src;
+      out_index[i] = out_idx;
     }
   }
 
@@ -247,76 +340,35 @@ fn build_in_edges_csr(nodes: &[NodeData], out_csr: &CSRData) -> CSRData {
 // Key index building
 // ============================================================================
 
-struct KeyEntry {
-  hash64: u64,
-  string_id: StringId,
-  node_id: NodeId,
-}
+/// KeyEntries sorted by (bucket, hash64, string_id, node_id), and the
+/// KeyBuckets offsets, as section data. `node_key_strings` is per node.
+fn build_key_index(nodes: &[NodeData], node_key_strings: &[StringId]) -> (Vec<u8>, Vec<u8>) {
+  let mut entries: Vec<(u64, StringId, NodeId)> = nodes
+    .iter()
+    .zip(node_key_strings)
+    .filter_map(|(node, &string_id)| {
+      let key = node.key.as_deref()?;
+      Some((xxhash64_string(key), string_id, node.node_id))
+    })
+    .collect();
 
-struct KeyIndexData {
-  entries: Vec<KeyEntry>,
-  buckets: Vec<u32>,
-}
-
-fn build_key_index(nodes: &[NodeData], node_key_strings: &[StringId]) -> KeyIndexData {
-  let mut raw_entries: Vec<KeyEntry> = Vec::new();
-
-  for (i, node) in nodes.iter().enumerate() {
-    if let Some(ref key) = node.key {
-      let string_id = node_key_strings[i];
-      raw_entries.push(KeyEntry {
-        hash64: xxhash64_string(key),
-        string_id,
-        node_id: node.node_id,
-      });
-    }
-  }
-
-  // Build bucket array for O(1) bucket lookup
   // Use 2x entries for reasonable load factor, minimum 16 buckets
-  let num_buckets = std::cmp::max(16, raw_entries.len() * 2);
-  let mut buckets = vec![0u32; num_buckets + 1];
-
-  if raw_entries.is_empty() {
-    return KeyIndexData {
-      entries: raw_entries,
-      buckets,
-    };
-  }
-
-  // Sort entries by (bucket, hash64, string_id, node_id)
+  let num_buckets = std::cmp::max(16, entries.len() * 2);
   let num_buckets_u64 = num_buckets as u64;
-  raw_entries.sort_by(|a, b| {
-    let a_bucket = (a.hash64 % num_buckets_u64) as usize;
-    let b_bucket = (b.hash64 % num_buckets_u64) as usize;
-    if a_bucket != b_bucket {
-      return a_bucket.cmp(&b_bucket);
-    }
-    if a.hash64 != b.hash64 {
-      return a.hash64.cmp(&b.hash64);
-    }
-    if a.string_id != b.string_id {
-      return a.string_id.cmp(&b.string_id);
-    }
-    a.node_id.cmp(&b.node_id)
+  entries.sort_unstable_by_key(|&(hash, string_id, node_id)| {
+    (hash % num_buckets_u64, hash, string_id, node_id)
   });
 
-  // Count entries per bucket
   let mut counts = vec![0u32; num_buckets];
-  for entry in &raw_entries {
-    let bucket = (entry.hash64 % num_buckets_u64) as usize;
-    counts[bucket] += 1;
+  let mut entry_data = Vec::with_capacity(entries.len() * KEY_INDEX_ENTRY_SIZE);
+  for &(hash, string_id, node_id) in &entries {
+    counts[(hash % num_buckets_u64) as usize] += 1;
+    push_u64(&mut entry_data, hash);
+    push_u32(&mut entry_data, string_id);
+    push_u32(&mut entry_data, 0);
+    push_u64(&mut entry_data, node_id);
   }
-
-  // Build offsets (prefix sum)
-  for i in 0..num_buckets {
-    buckets[i + 1] = buckets[i] + counts[i];
-  }
-
-  KeyIndexData {
-    entries: raw_entries,
-    buckets,
-  }
+  (entry_data, encode_u32_slice(&prefix_offsets(&counts)))
 }
 
 // ============================================================================
@@ -352,7 +404,7 @@ impl VectorTable {
 
 fn encode_prop_value(
   value: &PropValue,
-  string_table: &StringTable,
+  string_table: &StringTable<'_>,
   vectors: &mut VectorTable,
 ) -> (u8, u64) {
   match value {
@@ -360,94 +412,208 @@ fn encode_prop_value(
     PropValue::Bool(b) => (PropValueTag::Bool as u8, if *b { 1 } else { 0 }),
     PropValue::I64(v) => (PropValueTag::I64 as u8, *v as u64),
     PropValue::F64(v) => (PropValueTag::F64 as u8, v.to_bits()),
-    PropValue::String(s) => {
-      let string_id = string_table.string_to_id.get(s).copied().unwrap_or(0);
-      (PropValueTag::String as u8, string_id as u64)
-    }
+    PropValue::String(s) => (PropValueTag::String as u8, string_table.id(s) as u64),
     PropValue::VectorF32(vec) => (PropValueTag::VectorF32 as u8, vectors.push(vec)),
   }
 }
 
+/// Offsets, keys and values sections for one property list per item.
+struct PropSections {
+  offsets: Vec<u8>,
+  keys: Vec<u8>,
+  vals: Vec<u8>,
+  count: usize,
+}
+
+impl PropSections {
+  fn with_items(items: usize) -> Self {
+    Self {
+      offsets: Vec::with_capacity((items + 1) * 4),
+      keys: Vec::new(),
+      vals: Vec::new(),
+      count: 0,
+    }
+  }
+
+  /// Appends the next item's properties, sorted by key.
+  fn push_item(
+    &mut self,
+    props: Option<&HashMap<PropKeyId, PropValue>>,
+    string_table: &StringTable<'_>,
+    vectors: &mut VectorTable,
+    what: &str,
+  ) -> Result<()> {
+    push_u32(&mut self.offsets, checked_u32(self.count, what)?);
+    let Some(props) = props.filter(|props| !props.is_empty()) else {
+      return Ok(());
+    };
+    let mut sorted: Vec<_> = props.iter().collect();
+    sorted.sort_unstable_by_key(|&(&key, _)| key);
+    for (&key_id, value) in sorted {
+      let (tag, payload) = encode_prop_value(value, string_table, vectors);
+      push_u32(&mut self.keys, key_id);
+      self.vals.push(tag);
+      self.vals.extend_from_slice(&[0; 7]);
+      push_u64(&mut self.vals, payload);
+      self.count += 1;
+    }
+    Ok(())
+  }
+
+  /// Writes the final offset and the three sections.
+  fn write(mut self, out: &mut SectionWriter<'_>, ids: [SectionId; 3], what: &str) -> Result<()> {
+    push_u32(&mut self.offsets, checked_u32(self.count, what)?);
+    out.add(ids[0], self.offsets);
+    out.add(ids[1], self.keys);
+    out.add(ids[2], self.vals);
+    Ok(())
+  }
+}
+
+fn vector_store_sections(
+  vector_stores: Option<&HashMap<PropKeyId, VectorManifest>>,
+) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+  let Some(vector_stores) = vector_stores.filter(|stores| !stores.is_empty()) else {
+    return Ok(None);
+  };
+
+  let mut ordered: Vec<(PropKeyId, &VectorManifest)> =
+    vector_stores.iter().map(|(&k, v)| (k, v)).collect();
+  ordered.sort_by_key(|(prop_key_id, _)| *prop_key_id);
+
+  let mut index_data = Vec::with_capacity(4 + ordered.len() * 20);
+  push_u32(
+    &mut index_data,
+    checked_u32(ordered.len(), "vector store count")?,
+  );
+  let mut blob_data = Vec::new();
+  for (prop_key_id, manifest) in ordered {
+    let encoded = serialize_manifest(manifest);
+    push_u32(&mut index_data, prop_key_id);
+    push_u64(&mut index_data, blob_data.len() as u64);
+    push_u64(&mut index_data, encoded.len() as u64);
+    blob_data.extend_from_slice(&encoded);
+  }
+  Ok(Some((index_data, blob_data)))
+}
+
 // ============================================================================
-// Section data tracking
+// Section output
 // ============================================================================
 
-struct SectionData {
-  id: SectionId,
-  data: Vec<u8>,
-  compression: CompressionType,
+#[derive(Clone, Copy, Default)]
+struct TableEntry {
+  offset: u64,
+  length: u64,
+  compression: u32,
   uncompressed_size: u64,
 }
 
-struct SnapshotBuildState {
-  phys_to_node_id: Vec<NodeId>,
-  node_id_to_phys: HashMap<NodeId, PhysNode>,
-  max_node_id: NodeId,
-  string_table: StringTable,
-  label_string_ids: Vec<StringId>,
-  etype_string_ids: Vec<StringId>,
-  propkey_string_ids: Vec<StringId>,
-  node_key_strings: Vec<StringId>,
-  out_csr: CSRData,
-  in_csr: CSRData,
-  key_index: KeyIndexData,
-  node_label_offsets: Vec<u32>,
-  node_label_ids: Vec<u32>,
-  has_properties: bool,
+/// The snapshot buffer: header and section table space, then each section's
+/// data, 64-byte aligned, appended as it is added.
+struct SectionWriter<'o> {
+  buffer: Vec<u8>,
+  table: [TableEntry; SectionId::COUNT],
+  /// Declared uncompressed bytes of the compressed sections so far.
+  inflated: usize,
+  compression: &'o CompressionOptions,
 }
 
-/// Callers bound `nodes.len()` by u32::MAX, so every index fits PhysNode.
-fn build_node_id_maps(nodes: &[NodeData]) -> (Vec<NodeId>, HashMap<NodeId, PhysNode>, NodeId) {
-  let phys_to_node_id: Vec<NodeId> = nodes.iter().map(|n| n.node_id).collect();
-  let mut node_id_to_phys: HashMap<NodeId, PhysNode> = HashMap::new();
-  let mut max_node_id: NodeId = 0;
-
-  for (i, node) in nodes.iter().enumerate() {
-    node_id_to_phys.insert(node.node_id, i as PhysNode);
-    if node.node_id > max_node_id {
-      max_node_id = node.node_id;
+impl<'o> SectionWriter<'o> {
+  fn new(compression: &'o CompressionOptions) -> Self {
+    let data_start = align_up(
+      SNAPSHOT_HEADER_SIZE + SectionId::COUNT * SECTION_ENTRY_SIZE,
+      SECTION_ALIGNMENT,
+    );
+    Self {
+      buffer: vec![0; data_start],
+      table: [TableEntry::default(); SectionId::COUNT],
+      inflated: 0,
+      compression,
     }
   }
 
-  (phys_to_node_id, node_id_to_phys, max_node_id)
-}
-
-fn validate_edge_nodes(
-  edges: &[EdgeData],
-  node_id_to_phys: &HashMap<NodeId, PhysNode>,
-) -> Result<()> {
-  for edge in edges {
-    let src_missing = !node_id_to_phys.contains_key(&edge.src);
-    let dst_missing = !node_id_to_phys.contains_key(&edge.dst);
-    if src_missing || dst_missing {
-      return Err(KiteError::InvalidSnapshot(format!(
-        "Edge references missing node(s): src={}, dst={}",
-        edge.src, edge.dst
-      )));
+  /// Appends section `id`, compressed when that is smaller and keeps every
+  /// compressed section within what readers inflate (`inflation_budget` of
+  /// the snapshot size, which only grows from here). Empty sections stay
+  /// absent from the table.
+  fn add(&mut self, id: SectionId, data: Vec<u8>) {
+    if data.is_empty() {
+      return;
     }
+    let uncompressed = data.len();
+    // Vector stores are read in place, so they stay uncompressed.
+    let compressible = !matches!(id, SectionId::VectorStoreIndex | SectionId::VectorStoreData);
+    let compressed = compressible
+      .then(|| try_compress(&data, self.compression))
+      .flatten()
+      .filter(|compressed| {
+        // The snapshot if this were its last section; it only grows.
+        let snapshot_len = align_up(self.buffer.len() + compressed.len(), SECTION_ALIGNMENT) + 4;
+        self.inflated.saturating_add(uncompressed) <= inflation_budget(snapshot_len)
+      });
+    let (bytes, compression) = match compressed {
+      Some(compressed) => {
+        self.inflated += uncompressed;
+        drop(data);
+        (compressed, self.compression.compression_type)
+      }
+      None => (data, CompressionType::None),
+    };
+
+    let offset = self.buffer.len();
+    self.buffer.extend_from_slice(&bytes);
+    self
+      .buffer
+      .resize(align_up(self.buffer.len(), SECTION_ALIGNMENT), 0);
+    self.table[id as usize] = TableEntry {
+      offset: offset as u64,
+      length: bytes.len() as u64,
+      compression: compression as u32,
+      uncompressed_size: uncompressed as u64,
+    };
   }
-  Ok(())
+
+  /// Writes the header and section table, and appends the footer CRC.
+  fn finish(mut self, header: &SnapshotHeaderV1) -> Vec<u8> {
+    let fields = [
+      header.generation,
+      header.created_unix_ns,
+      header.num_nodes,
+      header.num_edges,
+      header.max_node_id,
+      header.num_labels,
+      header.num_etypes,
+      header.num_propkeys,
+      header.num_strings,
+    ];
+    let buffer = &mut self.buffer;
+    write_u32(buffer, 0, header.magic);
+    write_u32(buffer, 4, header.version);
+    write_u32(buffer, 8, header.min_reader_version);
+    write_u32(buffer, 12, header.flags.bits());
+    for (index, value) in fields.into_iter().enumerate() {
+      write_u64(buffer, 16 + index * 8, value);
+    }
+
+    for (index, entry) in self.table.iter().enumerate() {
+      let offset = SNAPSHOT_HEADER_SIZE + index * SECTION_ENTRY_SIZE;
+      write_u64(buffer, offset, entry.offset);
+      write_u64(buffer, offset + 8, entry.length);
+      write_u32(buffer, offset + 16, entry.compression);
+      write_u64(buffer, offset + 20, entry.uncompressed_size);
+      // +28: reserved, left zero
+    }
+
+    let footer_crc = crc32(buffer);
+    push_u32(buffer, footer_crc);
+    self.buffer
+  }
 }
 
-fn intern_name_table<'a, F>(
-  count: usize,
-  mut lookup: F,
-  string_table: &mut StringTable,
-) -> Result<Vec<StringId>>
-where
-  F: FnMut(usize) -> Option<&'a str>,
-{
-  let mut ids: Vec<StringId> = vec![0];
-  for i in 1..=count {
-    let name = lookup(i);
-    ids.push(if let Some(n) = name {
-      string_table.intern(n)?
-    } else {
-      0
-    });
-  }
-  Ok(ids)
-}
+// ============================================================================
+// Main snapshot building
+// ============================================================================
 
 /// Schema IDs are array-indexed in the snapshot, so the header/table bound is
 /// the largest committed ID, not the number of map entries. Rollbacks may
@@ -464,458 +630,132 @@ where
     .unwrap_or(0)
 }
 
-fn build_node_key_strings(
-  nodes: &[NodeData],
-  string_table: &mut StringTable,
-) -> Result<Vec<StringId>> {
-  nodes
+/// StringIds of the names `1..=bound` (0 where an ID has no name), with
+/// index 0 reserved.
+fn intern_name_table<'a, Id>(
+  names: &'a HashMap<Id, String>,
+  string_table: &mut StringTable<'a>,
+) -> Result<Vec<StringId>>
+where
+  Id: Copy + Ord + Into<u64> + TryFrom<usize> + std::hash::Hash,
+{
+  let bound = schema_id_bound(names);
+  let mut ids: Vec<StringId> = Vec::with_capacity(bound + 1);
+  ids.push(0);
+  for i in 1..=bound {
+    let name = Id::try_from(i).ok().and_then(|id| names.get(&id));
+    ids.push(match name {
+      Some(name) => string_table.intern(name)?,
+      None => 0,
+    });
+  }
+  Ok(ids)
+}
+
+/// Interns every string the snapshot stores, in a fixed order: schema names,
+/// node keys, then string property values (nodes, then edges, each by key).
+/// Returns the label, etype and propkey name tables and each node's key.
+fn intern_strings<'a>(
+  nodes: &'a [NodeData],
+  edges: &'a [EdgeData],
+  schema: [&'a HashMap<u32, String>; 3],
+  string_table: &mut StringTable<'a>,
+) -> Result<([Vec<StringId>; 3], Vec<StringId>)> {
+  let [labels, etypes, propkeys] = schema;
+  let name_tables = [
+    intern_name_table(labels, string_table)?,
+    intern_name_table(etypes, string_table)?,
+    intern_name_table(propkeys, string_table)?,
+  ];
+  let node_key_strings = nodes
     .iter()
-    .map(|node| match node.key.as_ref() {
+    .map(|node| match node.key.as_deref() {
       Some(key) => string_table.intern(key),
       None => Ok(0),
     })
-    .collect()
-}
+    .collect::<Result<Vec<_>>>()?;
 
-fn intern_string_props(
-  nodes: &[NodeData],
-  edges: &[EdgeData],
-  string_table: &mut StringTable,
-) -> Result<()> {
-  for node in nodes {
-    let mut sorted_props: Vec<_> = node.props.iter().collect();
-    sorted_props.sort_by_key(|(k, _)| *k);
-    for (_, value) in sorted_props {
-      if let PropValue::String(s) = value {
-        string_table.intern(s)?;
-      }
+  let props = nodes
+    .iter()
+    .map(|node| &node.props)
+    .chain(edges.iter().map(|edge| &edge.props));
+  for props in props {
+    let mut strings: Vec<_> = props
+      .iter()
+      .filter_map(|(key, value)| match value {
+        PropValue::String(s) => Some((*key, s.as_str())),
+        _ => None,
+      })
+      .collect();
+    strings.sort_unstable_by_key(|(key, _)| *key);
+    for (_, s) in strings {
+      string_table.intern(s)?;
     }
   }
-  for edge in edges {
-    let mut sorted_props: Vec<_> = edge.props.iter().collect();
-    sorted_props.sort_by_key(|(k, _)| *k);
-    for (_, value) in sorted_props {
-      if let PropValue::String(s) = value {
-        string_table.intern(s)?;
-      }
-    }
-  }
-  Ok(())
+  Ok((name_tables, node_key_strings))
 }
 
-fn build_node_labels(nodes: &[NodeData]) -> Result<(Vec<u32>, Vec<u32>)> {
-  let mut node_label_offsets: Vec<u32> = Vec::with_capacity(nodes.len() + 1);
-  let mut node_label_ids: Vec<u32> = Vec::new();
-  node_label_offsets.push(0);
+/// Node label offsets and sorted, deduplicated label IDs, as section data.
+fn node_label_sections(nodes: &[NodeData]) -> Result<(Vec<u8>, Vec<u8>)> {
+  let mut offsets = Vec::with_capacity((nodes.len() + 1) * 4);
+  let mut label_ids = Vec::new();
+  let mut count = 0usize;
+  push_u32(&mut offsets, 0);
+  let mut labels = Vec::new();
   for node in nodes {
-    let mut labels = node.labels.clone();
+    labels.clear();
+    labels.extend_from_slice(&node.labels);
     labels.sort_unstable();
     labels.dedup();
-    node_label_ids.extend(labels.iter().copied());
-    node_label_offsets.push(checked_u32(node_label_ids.len(), "node label count")?);
+    for &label in &labels {
+      push_u32(&mut label_ids, label);
+    }
+    count += labels.len();
+    push_u32(&mut offsets, checked_u32(count, "node label count")?);
   }
-  Ok((node_label_offsets, node_label_ids))
+  Ok((offsets, label_ids))
 }
 
-fn prepare_snapshot_state(
-  nodes: &[NodeData],
+/// Edge property sections in out-edge order. Duplicate (src, etype, dst)
+/// edges share the properties of the last one in the input.
+fn edge_prop_sections(
   edges: &[EdgeData],
-  labels: &HashMap<LabelId, String>,
-  etypes: &HashMap<ETypeId, String>,
-  propkeys: &HashMap<PropKeyId, String>,
-) -> Result<SnapshotBuildState> {
-  // Physical node and edge indices, CSR offsets and key-bucket offsets are
-  // u32. Bounding both counts here keeps every such cast below lossless.
-  checked_u32(nodes.len(), "node count")?;
-  checked_u32(edges.len(), "edge count")?;
-
-  let (phys_to_node_id, node_id_to_phys, max_node_id) = build_node_id_maps(nodes);
-  validate_edge_nodes(edges, &node_id_to_phys)?;
-
-  let mut string_table = StringTable::new();
-  let label_bound = schema_id_bound(labels);
-  let etype_bound = schema_id_bound(etypes);
-  let propkey_bound = schema_id_bound(propkeys);
-  let label_string_ids = intern_name_table(
-    label_bound,
-    |i| labels.get(&(i as LabelId)).map(|s| s.as_str()),
-    &mut string_table,
-  )?;
-  let etype_string_ids = intern_name_table(
-    etype_bound,
-    |i| etypes.get(&(i as ETypeId)).map(|s| s.as_str()),
-    &mut string_table,
-  )?;
-  let propkey_string_ids = intern_name_table(
-    propkey_bound,
-    |i| propkeys.get(&(i as PropKeyId)).map(|s| s.as_str()),
-    &mut string_table,
-  )?;
-
-  let node_key_strings = build_node_key_strings(nodes, &mut string_table)?;
-
-  let out_csr = build_out_edges_csr(nodes, edges, &node_id_to_phys);
-  let in_csr = build_in_edges_csr(nodes, &out_csr);
-  let key_index = build_key_index(nodes, &node_key_strings);
-
-  intern_string_props(nodes, edges, &mut string_table)?;
-
-  let has_properties =
-    nodes.iter().any(|n| !n.props.is_empty()) || edges.iter().any(|e| !e.props.is_empty());
-
-  let (node_label_offsets, node_label_ids) = build_node_labels(nodes)?;
-
-  Ok(SnapshotBuildState {
-    phys_to_node_id,
-    node_id_to_phys,
-    max_node_id,
-    string_table,
-    label_string_ids,
-    etype_string_ids,
-    propkey_string_ids,
-    node_key_strings,
-    out_csr,
-    in_csr,
-    key_index,
-    node_label_offsets,
-    node_label_ids,
-    has_properties,
-  })
-}
-
-fn encode_u32_slice(values: &[u32]) -> Vec<u8> {
-  let mut data = vec![0u8; values.len() * 4];
-  for (i, &value) in values.iter().enumerate() {
-    write_u32(&mut data, i * 4, value);
-  }
-  data
-}
-
-fn encode_u64_slice(values: &[u64]) -> Vec<u8> {
-  let mut data = vec![0u8; values.len() * 8];
-  for (i, &value) in values.iter().enumerate() {
-    write_u64(&mut data, i * 8, value);
-  }
-  data
-}
-
-/// Returns the NodeIdToPhys layout the header must flag.
-fn add_basic_sections(
-  add_section: &mut impl FnMut(SectionId, Vec<u8>),
-  phys_to_node_id: &[NodeId],
-  max_node_id: NodeId,
+  index: &NodeIndex,
   out_csr: &CSRData,
-  in_csr: &CSRData,
-  num_edges: usize,
-) -> Result<NodeIdMapLayout> {
-  // phys_to_nodeid
-  {
-    let data = encode_u64_slice(phys_to_node_id);
-    add_section(SectionId::PhysToNodeId, data);
+  string_table: &StringTable<'_>,
+  vectors: &mut VectorTable,
+) -> Result<PropSections> {
+  let mut edge_props: hashbrown::HashMap<(PhysNode, ETypeId, PhysNode), &HashMap<_, _>> =
+    hashbrown::HashMap::new();
+  for edge in edges.iter().filter(|edge| !edge.props.is_empty()) {
+    let key = (
+      index.endpoint(edge.src, edge)?,
+      edge.etype,
+      index.endpoint(edge.dst, edge)?,
+    );
+    edge_props.insert(key, &edge.props);
   }
 
-  // nodeid_to_phys: dense array or sparse sorted table, by ID density
-  let (node_id_map, data) = node_map::encode(phys_to_node_id, max_node_id)?;
-  add_section(SectionId::NodeIdToPhys, data);
-
-  // out_offsets
-  {
-    let data = encode_u32_slice(&out_csr.offsets);
-    add_section(SectionId::OutOffsets, data);
-  }
-
-  // out_dst
-  {
-    let data = encode_u32_slice(&out_csr.dst);
-    add_section(SectionId::OutDst, data);
-  }
-
-  // out_etype
-  {
-    let data = encode_u32_slice(&out_csr.etype);
-    add_section(SectionId::OutEtype, data);
-  }
-
-  // in_offsets
-  {
-    let data = encode_u32_slice(&in_csr.offsets);
-    add_section(SectionId::InOffsets, data);
-  }
-
-  // in_src
-  {
-    let data = encode_u32_slice(&in_csr.dst);
-    add_section(SectionId::InSrc, data);
-  }
-
-  // in_etype
-  {
-    let data = encode_u32_slice(&in_csr.etype);
-    add_section(SectionId::InEtype, data);
-  }
-
-  // in_out_index
-  {
-    let mut data = vec![0u8; num_edges * 4];
-    if let Some(ref out_index) = in_csr.out_index {
-      for (i, &idx) in out_index.iter().enumerate() {
-        write_u32(&mut data, i * 4, idx);
-      }
-    }
-    add_section(SectionId::InOutIndex, data);
-  }
-
-  Ok(node_id_map)
-}
-
-/// String offsets are u64 (v5+): the string bytes of a large graph can pass
-/// 4 GiB.
-fn add_string_table_sections(
-  add_section: &mut impl FnMut(SectionId, Vec<u8>),
-  string_table: &StringTable,
-) {
-  let total_bytes: usize = string_table.strings.iter().map(String::len).sum();
-  let mut offsets = Vec::with_capacity(string_table.len() + 1);
-  let mut bytes_data = Vec::with_capacity(total_bytes);
-  for string in &string_table.strings {
-    offsets.push(bytes_data.len() as u64);
-    bytes_data.extend_from_slice(string.as_bytes());
-  }
-  offsets.push(bytes_data.len() as u64);
-
-  add_section(SectionId::StringOffsets, encode_u64_slice(&offsets));
-  add_section(SectionId::StringBytes, bytes_data);
-}
-
-fn add_string_id_sections(
-  add_section: &mut impl FnMut(SectionId, Vec<u8>),
-  label_string_ids: &[StringId],
-  etype_string_ids: &[StringId],
-  propkey_string_ids: &[StringId],
-  node_key_strings: &[StringId],
-) {
-  add_section(
-    SectionId::LabelStringIds,
-    encode_u32_slice(label_string_ids),
-  );
-  add_section(
-    SectionId::EtypeStringIds,
-    encode_u32_slice(etype_string_ids),
-  );
-  add_section(
-    SectionId::PropkeyStringIds,
-    encode_u32_slice(propkey_string_ids),
-  );
-  add_section(SectionId::NodeKeyString, encode_u32_slice(node_key_strings));
-}
-
-fn add_node_label_sections(
-  add_section: &mut impl FnMut(SectionId, Vec<u8>),
-  node_label_offsets: &[u32],
-  node_label_ids: &[u32],
-) {
-  add_section(
-    SectionId::NodeLabelOffsets,
-    encode_u32_slice(node_label_offsets),
-  );
-  add_section(SectionId::NodeLabelIds, encode_u32_slice(node_label_ids));
-}
-
-fn add_key_index_sections(
-  add_section: &mut impl FnMut(SectionId, Vec<u8>),
-  key_index: &KeyIndexData,
-) {
-  let mut data = vec![0u8; key_index.entries.len() * KEY_INDEX_ENTRY_SIZE];
-  for (i, entry) in key_index.entries.iter().enumerate() {
-    let offset = i * KEY_INDEX_ENTRY_SIZE;
-    write_u64(&mut data, offset, entry.hash64);
-    write_u32(&mut data, offset + 8, entry.string_id);
-    write_u32(&mut data, offset + 12, 0);
-    write_u64(&mut data, offset + 16, entry.node_id);
-  }
-  add_section(SectionId::KeyEntries, data);
-
-  add_section(SectionId::KeyBuckets, encode_u32_slice(&key_index.buckets));
-}
-
-fn add_node_prop_sections(
-  add_section: &mut impl FnMut(SectionId, Vec<u8>),
-  nodes: &[NodeData],
-  string_table: &StringTable,
-  vector_table: &mut VectorTable,
-) -> Result<()> {
-  let num_nodes = nodes.len();
-  let mut node_prop_offsets = vec![0u32; num_nodes + 1];
-  let mut node_prop_keys: Vec<u32> = Vec::new();
-  let mut node_prop_vals: Vec<(u8, u64)> = Vec::new();
-
-  for (i, node) in nodes.iter().enumerate() {
-    node_prop_offsets[i] = checked_u32(node_prop_keys.len(), "node property count")?;
-    let mut sorted_props: Vec<_> = node.props.iter().collect();
-    sorted_props.sort_by_key(|(k, _)| *k);
-    for (&key_id, value) in sorted_props {
-      node_prop_keys.push(key_id);
-      node_prop_vals.push(encode_prop_value(value, string_table, vector_table));
+  let num_nodes = out_csr.offsets.len() - 1;
+  let mut sections = PropSections::with_items(out_csr.dst.len());
+  for src in 0..num_nodes {
+    let range = out_csr.offsets[src] as usize..out_csr.offsets[src + 1] as usize;
+    for i in range {
+      let props = if edge_props.is_empty() {
+        None
+      } else {
+        edge_props
+          .get(&(src as PhysNode, out_csr.etype[i], out_csr.dst[i]))
+          .copied()
+      };
+      sections.push_item(props, string_table, vectors, "edge property count")?;
     }
   }
-  node_prop_offsets[num_nodes] = checked_u32(node_prop_keys.len(), "node property count")?;
-
-  add_section(
-    SectionId::NodePropOffsets,
-    encode_u32_slice(&node_prop_offsets),
-  );
-  add_section(SectionId::NodePropKeys, encode_u32_slice(&node_prop_keys));
-
-  let mut vals_data = vec![0u8; node_prop_vals.len() * PROP_VALUE_DISK_SIZE];
-  for (i, (tag, payload)) in node_prop_vals.iter().enumerate() {
-    let offset = i * PROP_VALUE_DISK_SIZE;
-    vals_data[offset] = *tag;
-    write_u64(&mut vals_data, offset + 8, *payload);
-  }
-  add_section(SectionId::NodePropVals, vals_data);
-  Ok(())
+  Ok(sections)
 }
-
-struct EdgePropSectionArgs<'a> {
-  edges: &'a [EdgeData],
-  node_id_to_phys: &'a HashMap<NodeId, PhysNode>,
-  out_csr: &'a CSRData,
-  string_table: &'a StringTable,
-  vector_table: &'a mut VectorTable,
-  num_nodes: usize,
-  num_edges: usize,
-}
-
-fn add_edge_prop_sections(
-  add_section: &mut impl FnMut(SectionId, Vec<u8>),
-  args: EdgePropSectionArgs<'_>,
-) -> Result<()> {
-  let mut edge_prop_map: HashMap<(PhysNode, ETypeId, PhysNode), &HashMap<PropKeyId, PropValue>> =
-    HashMap::new();
-  for edge in args.edges {
-    if !edge.props.is_empty() {
-      if let (Some(&src_phys), Some(&dst_phys)) = (
-        args.node_id_to_phys.get(&edge.src),
-        args.node_id_to_phys.get(&edge.dst),
-      ) {
-        edge_prop_map.insert((src_phys, edge.etype, dst_phys), &edge.props);
-      }
-    }
-  }
-
-  let mut edge_prop_offsets = vec![0u32; args.num_edges + 1];
-  let mut edge_prop_keys: Vec<u32> = Vec::new();
-  let mut edge_prop_vals: Vec<(u8, u64)> = Vec::new();
-
-  let mut edge_idx = 0usize;
-  for src_phys in 0..args.num_nodes {
-    let start = args.out_csr.offsets[src_phys] as usize;
-    let end = args.out_csr.offsets[src_phys + 1] as usize;
-
-    for i in start..end {
-      edge_prop_offsets[edge_idx] = checked_u32(edge_prop_keys.len(), "edge property count")?;
-      let dst_phys = args.out_csr.dst[i];
-      let etype = args.out_csr.etype[i];
-
-      if let Some(props) = edge_prop_map.get(&(src_phys as PhysNode, etype, dst_phys)) {
-        let mut sorted_props: Vec<_> = props.iter().collect();
-        sorted_props.sort_by_key(|(k, _)| *k);
-        for (&key_id, value) in sorted_props {
-          edge_prop_keys.push(key_id);
-          edge_prop_vals.push(encode_prop_value(
-            value,
-            args.string_table,
-            args.vector_table,
-          ));
-        }
-      }
-      edge_idx += 1;
-    }
-  }
-  edge_prop_offsets[args.num_edges] = checked_u32(edge_prop_keys.len(), "edge property count")?;
-
-  add_section(
-    SectionId::EdgePropOffsets,
-    encode_u32_slice(&edge_prop_offsets),
-  );
-  add_section(SectionId::EdgePropKeys, encode_u32_slice(&edge_prop_keys));
-
-  let mut vals_data = vec![0u8; edge_prop_vals.len() * PROP_VALUE_DISK_SIZE];
-  for (i, (tag, payload)) in edge_prop_vals.iter().enumerate() {
-    let offset = i * PROP_VALUE_DISK_SIZE;
-    vals_data[offset] = *tag;
-    write_u64(&mut vals_data, offset + 8, *payload);
-  }
-  add_section(SectionId::EdgePropVals, vals_data);
-  Ok(())
-}
-
-fn add_vector_sections(
-  add_section: &mut impl FnMut(SectionId, Vec<u8>),
-  vector_table: VectorTable,
-) -> bool {
-  if vector_table.is_empty() {
-    return false;
-  }
-
-  let mut offsets_data = vec![0u8; vector_table.offsets.len() * 8];
-  for (i, &offset) in vector_table.offsets.iter().enumerate() {
-    write_u64(&mut offsets_data, i * 8, offset);
-  }
-  add_section(SectionId::VectorOffsets, offsets_data);
-  add_section(SectionId::VectorData, vector_table.data);
-  true
-}
-
-fn add_vector_store_sections(
-  add_section: &mut impl FnMut(SectionId, Vec<u8>),
-  vector_stores: Option<&HashMap<PropKeyId, VectorManifest>>,
-) -> Result<bool> {
-  let Some(vector_stores) = vector_stores else {
-    return Ok(false);
-  };
-  if vector_stores.is_empty() {
-    return Ok(false);
-  }
-
-  let mut ordered: Vec<(PropKeyId, &VectorManifest)> =
-    vector_stores.iter().map(|(&k, v)| (k, v)).collect();
-  ordered.sort_by_key(|(prop_key_id, _)| *prop_key_id);
-
-  let mut index_data = vec![0u8; 4 + ordered.len() * 20];
-  write_u32(
-    &mut index_data,
-    0,
-    checked_u32(ordered.len(), "vector store count")?,
-  );
-  let mut blob_data = Vec::new();
-
-  for (i, (prop_key_id, manifest)) in ordered.iter().enumerate() {
-    let encoded = serialize_manifest(manifest);
-    let offset = blob_data.len() as u64;
-    let length = encoded.len() as u64;
-    blob_data.extend_from_slice(&encoded);
-
-    let entry_offset = 4 + i * 20;
-    write_u32(&mut index_data, entry_offset, *prop_key_id);
-    write_u64(&mut index_data, entry_offset + 4, offset);
-    write_u64(&mut index_data, entry_offset + 12, length);
-  }
-
-  add_section(SectionId::VectorStoreIndex, index_data);
-  add_section(SectionId::VectorStoreData, blob_data);
-  Ok(true)
-}
-
-// ============================================================================
-// Main snapshot building
-// ============================================================================
 
 /// Build a snapshot to memory (useful for single-file format embedding)
 pub fn build_snapshot_to_memory(input: SnapshotBuildInput) -> Result<Vec<u8>> {
-  // This is a simplified version that returns the buffer instead of writing to disk
-  // We'll reuse most of the logic but skip the file I/O
-
   let SnapshotBuildInput {
     generation,
     mut nodes,
@@ -927,124 +767,154 @@ pub fn build_snapshot_to_memory(input: SnapshotBuildInput) -> Result<Vec<u8>> {
     compression,
   } = input;
 
-  // Sort nodes by NodeID for deterministic ordering
-  nodes.sort_by_key(|n| n.node_id);
+  // Physical node and edge indices, CSR offsets and key-bucket offsets are
+  // u32. Bounding both counts here keeps every such cast below lossless.
+  checked_u32(nodes.len(), "node count")?;
+  checked_u32(edges.len(), "edge count")?;
 
-  let state = prepare_snapshot_state(&nodes, &edges, &labels, &etypes, &propkeys)?;
-
-  let compression_opts = compression.unwrap_or_default();
-  let mut section_data: Vec<SectionData> = Vec::new();
+  // Sort nodes by NodeID: physical order is ID order.
+  nodes.sort_unstable_by_key(|n| n.node_id);
   let num_nodes = nodes.len();
   let num_edges = edges.len();
-  let num_strings = state.string_table.len();
+  let phys_to_node_id: Vec<NodeId> = nodes.iter().map(|n| n.node_id).collect();
+  let max_node_id = phys_to_node_id.last().copied().unwrap_or(0);
+  let node_index = NodeIndex::build(&phys_to_node_id, max_node_id)?;
 
-  let mut add_section = |id: SectionId, data: Vec<u8>| {
-    let uncompressed_size = data.len() as u64;
-    let (compressed, compression_type) =
-      if matches!(id, SectionId::VectorStoreIndex | SectionId::VectorStoreData) {
-        (data, CompressionType::None)
-      } else {
-        maybe_compress(&data, &compression_opts)
-      };
-    section_data.push(SectionData {
-      id,
-      uncompressed_size,
-      data: compressed,
-      compression: compression_type,
-    });
+  let mut string_table = StringTable::new();
+  let ([label_string_ids, etype_string_ids, propkey_string_ids], node_key_strings) =
+    intern_strings(
+      &nodes,
+      &edges,
+      [&labels, &etypes, &propkeys],
+      &mut string_table,
+    )?;
+  let num_strings = string_table.len();
+  let out_csr = build_out_edges_csr(num_nodes, &edges, &node_index)?;
+
+  let compression = compression.unwrap_or_default();
+  let mut out = SectionWriter::new(&compression);
+
+  out.add(SectionId::PhysToNodeId, encode_u64_slice(&phys_to_node_id));
+  drop(phys_to_node_id);
+
+  out.add(
+    SectionId::StringOffsets,
+    encode_u64_slice(&std::mem::take(&mut string_table.offsets)),
+  );
+  out.add(
+    SectionId::StringBytes,
+    std::mem::take(&mut string_table.bytes),
+  );
+  out.add(
+    SectionId::LabelStringIds,
+    encode_u32_slice(&label_string_ids),
+  );
+  out.add(
+    SectionId::EtypeStringIds,
+    encode_u32_slice(&etype_string_ids),
+  );
+  out.add(
+    SectionId::PropkeyStringIds,
+    encode_u32_slice(&propkey_string_ids),
+  );
+  out.add(
+    SectionId::NodeKeyString,
+    encode_u32_slice(&node_key_strings),
+  );
+
+  let (label_offsets, label_ids) = node_label_sections(&nodes)?;
+  out.add(SectionId::NodeLabelOffsets, label_offsets);
+  out.add(SectionId::NodeLabelIds, label_ids);
+
+  let (key_entries, key_buckets) = build_key_index(&nodes, &node_key_strings);
+  drop(node_key_strings);
+  out.add(SectionId::KeyEntries, key_entries);
+  out.add(SectionId::KeyBuckets, key_buckets);
+
+  // Node, then edge, properties (vector indices follow that order).
+  let mut vector_table = VectorTable::new();
+  let mut node_props = PropSections::with_items(num_nodes);
+  for node in &nodes {
+    node_props.push_item(
+      Some(&node.props),
+      &string_table,
+      &mut vector_table,
+      "node property count",
+    )?;
+  }
+  let has_properties = node_props.count > 0 || edges.iter().any(|e| !e.props.is_empty());
+  node_props.write(
+    &mut out,
+    [
+      SectionId::NodePropOffsets,
+      SectionId::NodePropKeys,
+      SectionId::NodePropVals,
+    ],
+    "node property count",
+  )?;
+  edge_prop_sections(
+    &edges,
+    &node_index,
+    &out_csr,
+    &string_table,
+    &mut vector_table,
+  )?
+  .write(
+    &mut out,
+    [
+      SectionId::EdgePropOffsets,
+      SectionId::EdgePropKeys,
+      SectionId::EdgePropVals,
+    ],
+    "edge property count",
+  )?;
+  drop(string_table);
+
+  let has_vectors = !vector_table.is_empty();
+  if has_vectors {
+    out.add(
+      SectionId::VectorOffsets,
+      encode_u64_slice(&vector_table.offsets),
+    );
+    out.add(SectionId::VectorData, vector_table.data);
+  }
+
+  let in_csr = build_in_edges_csr(num_nodes, &out_csr);
+  let CSRData {
+    offsets,
+    dst,
+    etype,
+    ..
+  } = out_csr;
+  out.add(SectionId::OutOffsets, encode_u32_slice(&offsets));
+  out.add(SectionId::OutDst, encode_u32_slice(&dst));
+  out.add(SectionId::OutEtype, encode_u32_slice(&etype));
+  drop((offsets, dst, etype));
+  out.add(SectionId::InOffsets, encode_u32_slice(&in_csr.offsets));
+  out.add(SectionId::InSrc, encode_u32_slice(&in_csr.dst));
+  out.add(SectionId::InEtype, encode_u32_slice(&in_csr.etype));
+  out.add(
+    SectionId::InOutIndex,
+    encode_u32_slice(in_csr.out_index.as_deref().unwrap_or_default()),
+  );
+  drop(in_csr);
+
+  let node_id_map = node_index.layout;
+  out.add(SectionId::NodeIdToPhys, node_index.map);
+
+  let has_vector_stores = match vector_store_sections(vector_stores.as_ref())? {
+    Some((index_data, blob_data)) => {
+      out.add(SectionId::VectorStoreIndex, index_data);
+      out.add(SectionId::VectorStoreData, blob_data);
+      true
+    }
+    None => false,
   };
 
-  let node_id_map = add_basic_sections(
-    &mut add_section,
-    &state.phys_to_node_id,
-    state.max_node_id,
-    &state.out_csr,
-    &state.in_csr,
-    num_edges,
-  )?;
-
-  add_string_table_sections(&mut add_section, &state.string_table);
-  add_string_id_sections(
-    &mut add_section,
-    &state.label_string_ids,
-    &state.etype_string_ids,
-    &state.propkey_string_ids,
-    &state.node_key_strings,
-  );
-  add_node_label_sections(
-    &mut add_section,
-    &state.node_label_offsets,
-    &state.node_label_ids,
-  );
-  add_key_index_sections(&mut add_section, &state.key_index);
-
-  // Node/edge properties (including vectors)
-  let mut vector_table = VectorTable::new();
-  add_node_prop_sections(
-    &mut add_section,
-    &nodes,
-    &state.string_table,
-    &mut vector_table,
-  )?;
-  add_edge_prop_sections(
-    &mut add_section,
-    EdgePropSectionArgs {
-      edges: &edges,
-      node_id_to_phys: &state.node_id_to_phys,
-      out_csr: &state.out_csr,
-      string_table: &state.string_table,
-      vector_table: &mut vector_table,
-      num_nodes,
-      num_edges,
-    },
-  )?;
-
-  let has_vectors = add_vector_sections(&mut add_section, vector_table);
-  let has_vector_stores = add_vector_store_sections(&mut add_section, vector_stores.as_ref())?;
-
-  // Calculate total size and offsets
-  let header_size = SNAPSHOT_HEADER_SIZE;
-  let section_table_size = SectionId::COUNT * SECTION_ENTRY_SIZE;
-  let mut data_offset = align_up(header_size + section_table_size, SECTION_ALIGNMENT);
-  let size_overflow = || KiteError::InvalidSnapshot("snapshot size overflows usize".to_string());
-
-  let mut section_offsets: HashMap<SectionId, (u64, u64, CompressionType, u64)> = HashMap::new();
-  for section in &section_data {
-    section_offsets.insert(
-      section.id,
-      (
-        data_offset as u64,
-        section.data.len() as u64,
-        section.compression,
-        section.uncompressed_size,
-      ),
-    );
-    data_offset = data_offset
-      .checked_add(section.data.len())
-      .and_then(|end| end.checked_add(SECTION_ALIGNMENT - 1))
-      .map(|end| end & !(SECTION_ALIGNMENT - 1))
-      .ok_or_else(size_overflow)?;
-  }
-
-  // Build final buffer
-  let total_size = data_offset.checked_add(4).ok_or_else(size_overflow)?;
-  let mut buffer = vec![0u8; total_size];
-
-  // Write header
-  let mut offset = 0;
-  write_u32(&mut buffer, offset, MAGIC_SNAPSHOT);
-  offset += 4;
-  write_u32(&mut buffer, offset, VERSION_SNAPSHOT);
-  offset += 4;
-  write_u32(&mut buffer, offset, MIN_READER_SNAPSHOT);
-  offset += 4;
-
-  let mut flags = SnapshotFlags::HAS_IN_EDGES | SnapshotFlags::HAS_NODE_LABELS;
-  if state.has_properties {
+  let mut flags =
+    SnapshotFlags::HAS_IN_EDGES | SnapshotFlags::HAS_NODE_LABELS | SnapshotFlags::HAS_KEY_BUCKETS;
+  if has_properties {
     flags |= SnapshotFlags::HAS_PROPERTIES;
-  }
-  if state.key_index.buckets.len() > 1 {
-    flags |= SnapshotFlags::HAS_KEY_BUCKETS;
   }
   if has_vectors {
     flags |= SnapshotFlags::HAS_VECTORS;
@@ -1055,69 +925,26 @@ pub fn build_snapshot_to_memory(input: SnapshotBuildInput) -> Result<Vec<u8>> {
   if node_id_map == NodeIdMapLayout::Sparse {
     flags |= SnapshotFlags::SPARSE_NODE_ID_MAP;
   }
-  write_u32(&mut buffer, offset, flags.bits());
-  offset += 4;
-
-  write_u64(&mut buffer, offset, generation);
-  offset += 8;
 
   let created_unix_ns = std::time::SystemTime::now()
     .duration_since(std::time::UNIX_EPOCH)
     .map(|d| d.as_nanos() as u64)
     .unwrap_or(0);
-  write_u64(&mut buffer, offset, created_unix_ns);
-  offset += 8;
-
-  write_u64(&mut buffer, offset, num_nodes as u64);
-  offset += 8;
-  write_u64(&mut buffer, offset, num_edges as u64);
-  offset += 8;
-  write_u64(&mut buffer, offset, state.max_node_id);
-  offset += 8;
-  write_u64(&mut buffer, offset, schema_id_bound(&labels) as u64);
-  offset += 8;
-  write_u64(&mut buffer, offset, schema_id_bound(&etypes) as u64);
-  offset += 8;
-  write_u64(&mut buffer, offset, schema_id_bound(&propkeys) as u64);
-  offset += 8;
-  write_u64(&mut buffer, offset, num_strings as u64);
-
-  // Write section table
-  offset = header_size;
-  for id_num in 0..SectionId::COUNT {
-    let id = SectionId::from_u32(id_num as u32).ok_or_else(|| {
-      KiteError::Internal("section id out of range in snapshot writer".to_string())
-    })?;
-    let (sec_offset, sec_length, compression, uncompressed_size) = section_offsets
-      .get(&id)
-      .copied()
-      .unwrap_or((0, 0, CompressionType::None, 0));
-
-    write_u64(&mut buffer, offset, sec_offset);
-    offset += 8;
-    write_u64(&mut buffer, offset, sec_length);
-    offset += 8;
-    write_u32(&mut buffer, offset, compression as u32);
-    offset += 4;
-    write_u64(&mut buffer, offset, uncompressed_size);
-    offset += 8;
-    // reserved
-    write_u32(&mut buffer, offset, 0);
-    offset += 4;
-  }
-
-  // Write section data
-  for section in &section_data {
-    let (sec_offset, _, _, _) = section_offsets[&section.id];
-    buffer[sec_offset as usize..sec_offset as usize + section.data.len()]
-      .copy_from_slice(&section.data);
-  }
-
-  // Write footer CRC
-  let footer_crc = crc32c(&buffer[..total_size - 4]);
-  write_u32(&mut buffer, total_size - 4, footer_crc);
-
-  Ok(buffer)
+  Ok(out.finish(&SnapshotHeaderV1 {
+    magic: MAGIC_SNAPSHOT,
+    version: VERSION_SNAPSHOT,
+    min_reader_version: MIN_READER_SNAPSHOT,
+    flags,
+    generation,
+    created_unix_ns,
+    num_nodes: num_nodes as u64,
+    num_edges: num_edges as u64,
+    max_node_id,
+    num_labels: schema_id_bound(&labels) as u64,
+    num_etypes: schema_id_bound(&etypes) as u64,
+    num_propkeys: schema_id_bound(&propkeys) as u64,
+    num_strings: num_strings as u64,
+  }))
 }
 
 // ============================================================================
@@ -1129,7 +956,7 @@ mod tests {
   use super::*;
   use crate::core::snapshot::reader::SnapshotData;
   use crate::util::compression::{CompressionOptions, CompressionType};
-  use crate::util::crc::crc32c;
+  use crate::util::crc::crc32;
   use crate::vector::store::{create_vector_store, vector_store_insert};
   use crate::vector::types::VectorStoreConfig;
   use std::io::Write;
@@ -1246,7 +1073,7 @@ mod tests {
     // Verify CRC at the end
     let crc_offset = buffer.len() - 4;
     let stored_crc = read_u32(&buffer, crc_offset);
-    let computed_crc = crc32c(&buffer[..crc_offset]);
+    let computed_crc = crc32(&buffer[..crc_offset]);
     assert_eq!(stored_crc, computed_crc);
   }
 
@@ -1401,65 +1228,47 @@ mod tests {
 
   #[test]
   fn test_csr_building() {
-    let nodes = vec![
-      NodeData {
-        node_id: 1,
-        key: None,
-        labels: vec![],
-        props: HashMap::new(),
-      },
-      NodeData {
-        node_id: 2,
-        key: None,
-        labels: vec![],
-        props: HashMap::new(),
-      },
-      NodeData {
-        node_id: 3,
-        key: None,
-        labels: vec![],
-        props: HashMap::new(),
-      },
-    ];
-
+    let edge = |src, etype, dst| EdgeData {
+      src,
+      etype,
+      dst,
+      props: HashMap::new(),
+    };
+    // Node 1's edges arrive out of (etype, dst) order; node 3 has in-edges of
+    // two types, from sources in descending etype order.
     let edges = vec![
-      EdgeData {
-        src: 1,
-        etype: 1,
-        dst: 2,
-        props: HashMap::new(),
-      },
-      EdgeData {
-        src: 1,
-        etype: 1,
-        dst: 3,
-        props: HashMap::new(),
-      },
-      EdgeData {
-        src: 2,
-        etype: 2,
-        dst: 1,
-        props: HashMap::new(),
-      },
+      edge(1, 2, 3),
+      edge(1, 1, 3),
+      edge(1, 1, 2),
+      edge(2, 2, 1),
+      edge(2, 1, 3),
+      edge(1, 1, 2),
     ];
+    let index = NodeIndex::build(&[1, 2, 3], 3).expect("node index");
 
-    let mut node_id_to_phys = HashMap::new();
-    node_id_to_phys.insert(1, 0);
-    node_id_to_phys.insert(2, 1);
-    node_id_to_phys.insert(3, 2);
+    let out_csr = build_out_edges_csr(3, &edges, &index).expect("out csr");
+    assert_eq!(out_csr.offsets, vec![0, 4, 6, 6]);
+    assert_eq!(out_csr.etype, vec![1, 1, 1, 2, 1, 2]);
+    assert_eq!(out_csr.dst, vec![1, 1, 2, 2, 2, 0]);
 
-    let out_csr = build_out_edges_csr(&nodes, &edges, &node_id_to_phys);
+    let in_csr = build_in_edges_csr(3, &out_csr);
+    assert_eq!(in_csr.offsets, vec![0, 1, 3, 6]);
+    // (etype, src, out index) per destination; duplicates stay apart.
+    assert_eq!(in_csr.etype, vec![2, 1, 1, 1, 1, 2]);
+    assert_eq!(in_csr.dst, vec![1, 0, 0, 0, 1, 0]);
+    assert_eq!(in_csr.out_index, Some(vec![5, 0, 1, 2, 4, 3]));
+  }
 
-    // Check offsets - node 0 has 2 edges, node 1 has 1 edge, node 2 has 0 edges
-    assert_eq!(out_csr.offsets, vec![0, 2, 3, 3]);
-    assert_eq!(out_csr.dst.len(), 3);
-    assert_eq!(out_csr.etype.len(), 3);
-
-    // Build in-edges and verify
-    let in_csr = build_in_edges_csr(&nodes, &out_csr);
-
-    // Check in-edge offsets - node 0 has 1 in-edge, node 1 has 1, node 2 has 1
-    assert_eq!(in_csr.offsets, vec![0, 1, 2, 3]);
+  #[test]
+  fn test_csr_building_rejects_missing_endpoints() {
+    let index = NodeIndex::build(&[1, 2], 2).expect("node index");
+    let edges = vec![EdgeData {
+      src: 1,
+      etype: 1,
+      dst: 3,
+      props: HashMap::new(),
+    }];
+    assert!(build_out_edges_csr(2, &edges, &index).is_err());
   }
 
   #[cfg(target_pointer_width = "64")]

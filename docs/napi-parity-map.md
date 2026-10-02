@@ -6,7 +6,7 @@ behavior while working within JS <-> Rust constraints.
 ## Surface Mapping (TS -> NAPI)
 
 - Single-file only: use `Database.open(path, options)`
-- Low-level database helpers (nodes/edges/props/cache) -> `Database` methods
+- Low-level database helpers (nodes/edges/props) -> `Database` methods
 - `VectorIndex` -> `VectorIndex` (nodeId-only until Kite/NodeRef exists)
 - High-level `kite(path, options)` -> `kite(path, options)` returning `Kite`
 - High-level builders/traversal/pathfinding -> NAPI `Kite` methods + builders

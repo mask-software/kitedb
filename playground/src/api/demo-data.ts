@@ -5,7 +5,7 @@
  * Simulates a small web server project with files, functions, classes, and their relationships.
  */
 
-import type { Kite } from "../../../src/index.ts";
+import type { Kite } from "../../../ray-rs/ts/index.ts";
 import {
   FileNode,
   FunctionNode,

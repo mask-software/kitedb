@@ -25,7 +25,7 @@ The remaining optimizations below can further improve performance.
 
 **Location:** `src/core/snapshot-reader.ts:176-183`
 
-**Problem:** CRC32C is computed over the entire snapshot buffer on every call to `parseSnapshot()`. For a 100MB snapshot, this means ~100MB of memory reads just for validation.
+**Problem:** The CRC-32 is computed over the entire snapshot buffer on every call to `parseSnapshot()`. For a 100MB snapshot, this means ~100MB of memory reads just for validation.
 
 ```typescript
 // Current: Always validates CRC

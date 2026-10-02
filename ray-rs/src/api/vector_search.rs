@@ -5,10 +5,8 @@
 //! Ported from src/api/vector-search.ts
 
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::cache::lru::LruCache;
 use crate::types::NodeId;
 use crate::vector::distance::with_metric_distance;
 use crate::vector::store::{validate_vector, FragmentLookup};
@@ -66,7 +64,8 @@ pub struct VectorIndexOptions {
   pub n_probe: usize,
   /// Minimum training vectors before index training (default: 1000)
   pub training_threshold: usize,
-  /// Maximum node refs to cache for search results (default: 10_000)
+  /// Has no effect. `VectorIndex` keeps no node cache; the option is still
+  /// accepted so existing callers keep compiling.
   pub cache_max_size: usize,
   /// ANN backend algorithm (default: IVF-PQ)
   pub ann_algorithm: AnnAlgorithm,
@@ -156,7 +155,7 @@ impl VectorIndexOptions {
     self
   }
 
-  /// Set the cache max size
+  /// Has no effect; see [`VectorIndexOptions::cache_max_size`].
   pub fn with_cache_max_size(mut self, size: usize) -> Self {
     self.cache_max_size = size;
     self
@@ -366,10 +365,6 @@ pub struct VectorIndex {
   manifest: VectorManifest,
   /// ANN index for approximate search (None if not trained)
   index: Option<BuiltIndex>,
-  /// Cache of node IDs for quick lookup
-  node_cache: LruCache<NodeId, ()>,
-  /// Node ID to vector ID mapping for cache lookups
-  cached_node_ids: HashMap<NodeId, u32>,
   /// Configuration
   options: VectorIndexOptions,
   /// Whether the index needs training
@@ -394,8 +389,6 @@ impl VectorIndex {
     Self {
       manifest,
       index: None,
-      node_cache: LruCache::new(options.cache_max_size),
-      cached_node_ids: HashMap::new(),
       options,
       needs_training: true,
       trained_live_count: 0,
@@ -436,10 +429,6 @@ impl VectorIndex {
     // Insert into store
     let vector_id = vector_store_insert(&mut self.manifest, node_id, vector)
       .map_err(|e| VectorIndexError::StoreError(e.to_string()))?;
-
-    // Cache the node ID
-    self.node_cache.set(node_id, ());
-    self.cached_node_ids.insert(node_id, vector_id as u32);
 
     // Add to index if trained, otherwise mark for training
     if let Some(ref mut index) = self.index {
@@ -499,10 +488,6 @@ impl VectorIndex {
         }
       }
     }
-
-    // Remove from cache
-    self.node_cache.remove(&node_id);
-    self.cached_node_ids.remove(&node_id);
 
     // Remove from store
     let deleted = vector_store_delete(&mut self.manifest, node_id);
@@ -794,8 +779,6 @@ impl VectorIndex {
   /// Clear all vectors and reset the index
   pub fn clear(&mut self) {
     vector_store_clear(&mut self.manifest);
-    self.node_cache = LruCache::new(self.options.cache_max_size);
-    self.cached_node_ids.clear();
     self.index = None;
     self.needs_training = true;
   }

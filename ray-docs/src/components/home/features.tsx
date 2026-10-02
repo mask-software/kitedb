@@ -33,7 +33,7 @@ const FEATURES: Feature[] = [
 	{
 		icon: ShieldCheck,
 		title: "ACID transactions",
-		body: "MVCC snapshot isolation: every transaction reads a consistent view, and every commit lands in a CRC32C-checked write-ahead log first.",
+		body: "MVCC snapshot isolation: every transaction reads a consistent view, and every commit is written to a write-ahead log with CRC-32 checksums first.",
 		accent: "mint",
 	},
 	{

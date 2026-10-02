@@ -4,7 +4,7 @@ use crate::backup as core_backup;
 use pyo3::prelude::*;
 
 /// Options for creating a backup
-#[pyclass(name = "BackupOptions")]
+#[pyclass(name = "BackupOptions", from_py_object)]
 #[derive(Debug, Clone, Default)]
 pub struct BackupOptions {
   #[pyo3(get, set)]
@@ -42,7 +42,7 @@ impl From<BackupOptions> for core_backup::BackupOptions {
 }
 
 /// Options for restoring a backup
-#[pyclass(name = "RestoreOptions")]
+#[pyclass(name = "RestoreOptions", from_py_object)]
 #[derive(Debug, Clone, Default)]
 pub struct RestoreOptions {
   #[pyo3(get, set)]
@@ -71,7 +71,7 @@ impl From<RestoreOptions> for core_backup::RestoreOptions {
 }
 
 /// Options for offline backup
-#[pyclass(name = "OfflineBackupOptions")]
+#[pyclass(name = "OfflineBackupOptions", from_py_object)]
 #[derive(Debug, Clone, Default)]
 pub struct OfflineBackupOptions {
   #[pyo3(get, set)]
@@ -100,7 +100,7 @@ impl From<OfflineBackupOptions> for core_backup::OfflineBackupOptions {
 }
 
 /// Backup result information
-#[pyclass(name = "BackupResult")]
+#[pyclass(name = "BackupResult", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct BackupResult {
   #[pyo3(get)]
