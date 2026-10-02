@@ -204,7 +204,7 @@ impl SingleFileDB {
 
   /// A write that a check turned into a no-op or rejected still depends on
   /// the state it checked.
-  fn record_read(&self, txid: TxId, key: TxKey) {
+  pub(super) fn record_read(&self, txid: TxId, key: TxKey) {
     if let Some(mvcc) = self.mvcc.as_ref() {
       let mut tx_mgr = mvcc.tx_manager.lock();
       tx_mgr.record_read(txid, key);
@@ -214,7 +214,7 @@ impl SingleFileDB {
   /// Fail with `NodeNotFound` unless the transaction sees `node_id`: a prop or
   /// label write to a missing node would otherwise linger in the delta. A
   /// rejected write still depends on the node's absence.
-  fn require_node(
+  pub(super) fn require_node(
     &self,
     txid: TxId,
     tx_handle: &Arc<Mutex<SingleFileTxState>>,
@@ -463,9 +463,10 @@ impl SingleFileDB {
       }
     }
 
-    // A deleted node keeps no vectors, now or after the next checkpoint.
+    // A deleted node keeps no vectors, now or after the next checkpoint
+    // (also a missing node's leftovers from older versions: unchecked).
     for prop_key_id in self.node_vector_keys(&tx_handle, node_id)? {
-      self.delete_node_vector(node_id, prop_key_id)?;
+      self.log_delete_node_vector(txid, &tx_handle, node_id, prop_key_id)?;
     }
 
     // Write WAL record

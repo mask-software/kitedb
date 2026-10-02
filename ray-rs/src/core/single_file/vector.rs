@@ -123,6 +123,8 @@ impl SingleFileDB {
   ///
   /// Each property key can have its own vector store with different dimensions.
   /// The first vector set for a property key determines the dimension.
+  ///
+  /// Fails with `NodeNotFound` if the transaction does not see the node.
   pub fn set_node_vector(
     &self,
     node_id: NodeId,
@@ -130,6 +132,7 @@ impl SingleFileDB {
     vector: &[f32],
   ) -> Result<()> {
     let (txid, tx_handle) = self.require_write_tx_handle()?;
+    self.require_node(txid, &tx_handle, node_id)?;
     self.ensure_vector_store_loaded(prop_key_id)?;
 
     // Check dimensions if store already exists
@@ -178,12 +181,17 @@ impl SingleFileDB {
     self.write_wal_tx(&tx_handle, record)?;
 
     // Queue in pending delta for commit
-    {
+    let bulk_load = {
       let mut tx = tx_handle.lock();
       tx.pending.pending_vectors.insert(
         (node_id, prop_key_id),
         Some(VectorRef::from(vector.to_vec())),
       );
+      tx.bulk_load
+    };
+    // The vector needs its node: a concurrent delete_node conflicts.
+    if !bulk_load {
+      self.record_read(txid, TxKey::Node(node_id));
     }
 
     Ok(())
@@ -191,26 +199,39 @@ impl SingleFileDB {
 
   /// Delete a vector embedding for a node
   ///
-  /// Returns Ok(()) even if the vector doesn't exist (idempotent).
+  /// Returns Ok(()) even if the vector doesn't exist (idempotent), but fails
+  /// with `NodeNotFound` if the transaction does not see the node.
   pub fn delete_node_vector(&self, node_id: NodeId, prop_key_id: PropKeyId) -> Result<()> {
     let (txid, tx_handle) = self.require_write_tx_handle()?;
+    self.require_node(txid, &tx_handle, node_id)?;
+    self.log_delete_node_vector(txid, &tx_handle, node_id, prop_key_id)?;
+    if !tx_handle.lock().bulk_load {
+      self.record_read(txid, TxKey::Node(node_id));
+    }
+    Ok(())
+  }
 
-    // Write WAL record
+  /// Log and queue a vector delete, without checking the node.
+  pub(super) fn log_delete_node_vector(
+    &self,
+    txid: TxId,
+    tx_handle: &Arc<Mutex<SingleFileTxState>>,
+    node_id: NodeId,
+    prop_key_id: PropKeyId,
+  ) -> Result<()> {
     let record = WalRecord::new(
       WalRecordType::DelNodeVector,
       txid,
       build_del_node_vector_payload(node_id, prop_key_id),
     );
-    self.write_wal_tx(&tx_handle, record)?;
+    self.write_wal_tx(tx_handle, record)?;
 
     // Queue delete in pending delta
-    {
-      let mut tx = tx_handle.lock();
-      tx.pending
-        .pending_vectors
-        .insert((node_id, prop_key_id), None); // None means delete
-    }
-
+    tx_handle
+      .lock()
+      .pending
+      .pending_vectors
+      .insert((node_id, prop_key_id), None); // None means delete
     Ok(())
   }
 
