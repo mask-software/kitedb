@@ -27,8 +27,14 @@
 //! let follows = edge("follows").build();
 //! ```
 //!
+//! To open a [`Kite`](crate::api::kite::Kite) with these definitions, convert them:
+//! `KiteOptions::try_from(&database_schema)`, `NodeDef::try_from(&node_schema)` or
+//! `EdgeDef::from(&edge_schema)`.
+//!
 //! Ported from src/api/schema.ts
 
+use super::kite;
+use crate::error::KiteError;
 use crate::types::{PropKeyId, PropValue, PropValueTag};
 use std::collections::HashMap;
 use std::fmt;
@@ -649,8 +655,6 @@ pub struct DatabaseSchema {
   pub nodes: HashMap<String, NodeSchema>,
   /// Edge type definitions by name
   pub edges: HashMap<String, EdgeSchema>,
-  /// Key prefix to node type mapping (for reverse lookups)
-  key_prefix_to_node: HashMap<String, String>,
 }
 
 impl DatabaseSchema {
@@ -661,9 +665,6 @@ impl DatabaseSchema {
 
   /// Add a node type to the schema
   pub fn node(mut self, schema: NodeSchema) -> Self {
-    self
-      .key_prefix_to_node
-      .insert(schema.key_prefix.clone(), schema.name.clone());
     self.nodes.insert(schema.name.clone(), schema);
     self
   }
@@ -684,14 +685,20 @@ impl DatabaseSchema {
     self.edges.get(name)
   }
 
-  /// Get node type from a key prefix
+  /// Get the node type a key belongs to: the one with the longest key prefix the key starts
+  /// with (by name among types sharing that prefix)
   pub fn node_type_from_key(&self, key: &str) -> Option<&str> {
-    for (prefix, node_type) in &self.key_prefix_to_node {
-      if key.starts_with(prefix) {
-        return Some(node_type);
-      }
-    }
-    None
+    self
+      .nodes
+      .values()
+      .filter(|schema| key.starts_with(&schema.key_prefix))
+      .max_by(|a, b| {
+        a.key_prefix
+          .len()
+          .cmp(&b.key_prefix.len())
+          .then_with(|| b.name.cmp(&a.name))
+      })
+      .map(|schema| schema.name.as_str())
   }
 
   /// Get all node type names
@@ -702,6 +709,81 @@ impl DatabaseSchema {
   /// Get all edge type names
   pub fn edge_types(&self) -> Vec<&str> {
     self.edges.keys().map(|s| s.as_str()).collect()
+  }
+}
+
+// ============================================================================
+// Conversion to Kite definitions
+// ============================================================================
+
+impl From<&PropDef> for kite::PropDef {
+  /// `Vector` props become `Any` (Kite checks no vector type); non-optional props are
+  /// `required`.
+  fn from(prop: &PropDef) -> Self {
+    kite::PropDef {
+      name: prop.name.clone(),
+      prop_type: match prop.schema_type {
+        SchemaType::String => kite::PropType::String,
+        SchemaType::Int => kite::PropType::Int,
+        SchemaType::Float => kite::PropType::Float,
+        SchemaType::Bool => kite::PropType::Bool,
+        SchemaType::Vector => kite::PropType::Any,
+      },
+      required: !prop.optional,
+      default: prop.default.clone(),
+    }
+  }
+}
+
+impl TryFrom<&NodeSchema> for kite::NodeDef {
+  type Error = KiteError;
+
+  /// Fails with `InvalidSchema` if the key function is not `key_prefix + id`: Kite always
+  /// builds keys that way.
+  fn try_from(schema: &NodeSchema) -> Result<Self, KiteError> {
+    for probe in ["", "id", "__kite_key_probe__"] {
+      if schema.key(probe) != format!("{}{probe}", schema.key_prefix) {
+        return Err(KiteError::InvalidSchema(
+          format!(
+            "node type {}: its key function is not key_prefix + id (key_prefix {:?}), which is how \
+             Kite builds keys",
+            schema.name, schema.key_prefix
+          )
+          .into(),
+        ));
+      }
+    }
+    Ok(schema.props.values().fold(
+      kite::NodeDef::new(&schema.name, &schema.key_prefix),
+      |def, prop| def.prop(prop.into()),
+    ))
+  }
+}
+
+impl From<&EdgeSchema> for kite::EdgeDef {
+  fn from(schema: &EdgeSchema) -> Self {
+    schema
+      .props
+      .values()
+      .fold(kite::EdgeDef::new(&schema.name), |def, prop| {
+        def.prop(prop.into())
+      })
+  }
+}
+
+impl TryFrom<&DatabaseSchema> for kite::KiteOptions {
+  type Error = KiteError;
+
+  /// Default options with `schema`'s node and edge types (see `NodeDef::try_from`).
+  fn try_from(schema: &DatabaseSchema) -> Result<Self, KiteError> {
+    let mut options = kite::KiteOptions::new();
+    for node in schema.nodes.values() {
+      options = options.node(node.try_into()?);
+    }
+    for edge in schema.edges.values() {
+      options = options.edge(edge.into());
+    }
+    Ok(options)
   }
 }
 

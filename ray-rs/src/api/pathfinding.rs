@@ -3,12 +3,23 @@
 //! Dijkstra and A* shortest path algorithms for graph traversal.
 //! Supports weighted edges via custom weight functions.
 //!
+//! # Edge weights
+//!
+//! Dijkstra, A* and Yen's algorithm need finite, non-negative weights. An edge whose weight is
+//! NaN, infinite or negative is skipped, as if it were absent.
+//!
+//! # Depth limit
+//!
+//! `max_depth` bounds the number of hops. The search returns the cheapest path within that bound,
+//! even when a cheaper but deeper path reaches the same intermediate node.
+//!
 //! Ported from src/api/pathfinding.ts
 
 use super::traversal::TraversalDirection;
 use crate::types::{ETypeId, Edge, NodeId};
-use crate::util::heap::IndexedMinHeap;
-use std::collections::{HashMap, HashSet};
+use hashbrown::{HashMap as FastMap, HashSet as FastSet};
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashSet, VecDeque};
 
 // ============================================================================
 // Types
@@ -37,26 +48,6 @@ impl PathResult {
       found: false,
     }
   }
-}
-
-/// Internal state for pathfinding algorithms
-#[derive(Debug, Clone)]
-struct PathState {
-  node_id: NodeId,
-  cost: f64,    // g(n) - actual cost from source
-  depth: usize, // Hop count from source
-  parent: Option<NodeId>,
-  edge: Option<(NodeId, ETypeId, NodeId)>, // Edge used to reach this node
-}
-
-/// Internal state for A* search
-#[derive(Clone)]
-struct AStarState {
-  g_score: f64,
-  f_score: f64,
-  depth: usize,
-  parent: Option<NodeId>,
-  edge: Option<(NodeId, ETypeId, NodeId)>,
 }
 
 /// Configuration for pathfinding
@@ -117,6 +108,294 @@ impl PathConfig {
     self.direction = direction;
     self
   }
+
+  /// The etype to pass to the neighbors function: the only allowed one, else `None` (and
+  /// edges are filtered with [`Self::allows`]).
+  fn neighbors_etype(&self) -> Option<ETypeId> {
+    if self.allowed_etypes.len() == 1 {
+      self.allowed_etypes.iter().next().copied()
+    } else {
+      None
+    }
+  }
+
+  fn allows(&self, etype: ETypeId) -> bool {
+    self.allowed_etypes.is_empty() || self.allowed_etypes.contains(&etype)
+  }
+}
+
+/// Whether Dijkstra/A* can use an edge weight: finite and non-negative.
+fn usable_weight(weight: f64) -> bool {
+  weight.is_finite() && weight >= 0.0
+}
+
+/// The directions a search expands: `Both` is `Out`, then `In`.
+fn expand_directions(direction: TraversalDirection) -> &'static [TraversalDirection] {
+  match direction {
+    TraversalDirection::Out => &[TraversalDirection::Out],
+    TraversalDirection::In => &[TraversalDirection::In],
+    TraversalDirection::Both => &[TraversalDirection::Out, TraversalDirection::In],
+  }
+}
+
+fn neighbor_id_for_edge(current_id: NodeId, dir: TraversalDirection, edge: &Edge) -> NodeId {
+  match dir {
+    TraversalDirection::Out => edge.dst,
+    TraversalDirection::In => edge.src,
+    TraversalDirection::Both => {
+      if edge.src == current_id {
+        edge.dst
+      } else {
+        edge.src
+      }
+    }
+  }
+}
+
+// ============================================================================
+// Label-setting search (Dijkstra / A*)
+// ============================================================================
+
+/// One way of reaching a node.
+struct Label {
+  node: NodeId,
+  cost: f64,
+  depth: usize,
+  parent: Option<usize>,
+  edge: Option<(NodeId, ETypeId, NodeId)>,
+  /// False once a label that reaches the node at least as cheaply and as shallowly replaced
+  /// it; its queue entry is then skipped.
+  alive: bool,
+}
+
+/// The labels of one node that no other label of it dominates.
+#[derive(Default)]
+struct Frontier {
+  first: Option<usize>,
+  rest: Vec<usize>,
+}
+
+impl Frontier {
+  fn labels(&self) -> impl Iterator<Item = usize> + '_ {
+    self.first.into_iter().chain(self.rest.iter().copied())
+  }
+
+  fn push(&mut self, label: usize) {
+    if self.first.is_none() {
+      self.first = Some(label);
+    } else {
+      self.rest.push(label);
+    }
+  }
+
+  fn retain(&mut self, mut keep: impl FnMut(usize) -> bool) {
+    if self.first.is_some_and(|label| !keep(label)) {
+      self.first = None;
+    }
+    self.rest.retain(|&label| keep(label));
+  }
+}
+
+/// A queued label, popped by lowest priority, then lowest depth.
+struct Queued {
+  priority: f64,
+  depth: usize,
+  label: usize,
+}
+
+impl PartialEq for Queued {
+  fn eq(&self, other: &Self) -> bool {
+    self.cmp(other) == Ordering::Equal
+  }
+}
+
+impl Eq for Queued {}
+
+impl Ord for Queued {
+  fn cmp(&self, other: &Self) -> Ordering {
+    // Reversed: `BinaryHeap` is a max-heap.
+    other
+      .priority
+      .total_cmp(&self.priority)
+      .then_with(|| other.depth.cmp(&self.depth))
+  }
+}
+
+impl PartialOrd for Queued {
+  fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+    Some(self.cmp(other))
+  }
+}
+
+struct Search {
+  result: PathResult,
+  /// Whether a node was left unexpanded because it was at `max_depth`.
+  depth_cut: bool,
+}
+
+/// Best-first search from `config.source` to the first target popped, by `cost + heuristic`.
+///
+/// With `track_depth`, a node is reached once per (cost, depth) trade-off: a costlier but
+/// shallower label survives next to a cheaper, deeper one, so the depth limit cannot hide a
+/// path. Without it, a node keeps only its cheapest label (classic Dijkstra/A*), which is exact
+/// as long as the depth limit cut nothing off.
+fn label_search<F, W, H>(
+  config: &PathConfig,
+  neighbors: &F,
+  edge_weight: &W,
+  heuristic: &H,
+  track_depth: bool,
+) -> Search
+where
+  F: Fn(NodeId, TraversalDirection, Option<ETypeId>) -> Vec<Edge>,
+  W: Fn(NodeId, ETypeId, NodeId) -> f64,
+  H: Fn(NodeId) -> f64,
+{
+  // Labels compare on depth only when tracking it.
+  let key = |depth: usize| if track_depth { depth } else { 0 };
+  let etype_filter = config.neighbors_etype();
+
+  let mut labels = vec![Label {
+    node: config.source,
+    cost: 0.0,
+    depth: 0,
+    parent: None,
+    edge: None,
+    alive: true,
+  }];
+  let mut frontiers: FastMap<NodeId, Frontier> = FastMap::new();
+  frontiers.entry(config.source).or_default().push(0);
+  // The smallest depth key a popped label of each node had.
+  let mut settled: FastMap<NodeId, usize> = FastMap::new();
+  let mut queue = BinaryHeap::new();
+  queue.push(Queued {
+    priority: heuristic(config.source),
+    depth: 0,
+    label: 0,
+  });
+  let mut depth_cut = false;
+
+  while let Some(Queued { label: index, .. }) = queue.pop() {
+    let Label {
+      node,
+      cost,
+      depth,
+      alive,
+      ..
+    } = labels[index];
+    if !alive || settled.get(&node).is_some_and(|&seen| seen <= key(depth)) {
+      continue;
+    }
+    settled.insert(node, key(depth));
+
+    if config.targets.contains(&node) {
+      return Search {
+        result: path_from_label(&labels, index),
+        depth_cut,
+      };
+    }
+    if depth >= config.max_depth {
+      depth_cut = true;
+      continue;
+    }
+
+    let next_depth = depth + 1;
+    for &dir in expand_directions(config.direction) {
+      for edge in neighbors(node, dir, etype_filter) {
+        if !config.allows(edge.etype) {
+          continue;
+        }
+        let next = neighbor_id_for_edge(node, dir, &edge);
+        if settled
+          .get(&next)
+          .is_some_and(|&seen| seen <= key(next_depth))
+        {
+          continue;
+        }
+        let weight = edge_weight(edge.src, edge.etype, edge.dst);
+        if !usable_weight(weight) {
+          continue;
+        }
+        let next_cost = cost + weight;
+
+        let frontier = frontiers.entry(next).or_default();
+        if frontier.labels().any(|other| {
+          labels[other].cost <= next_cost && key(labels[other].depth) <= key(next_depth)
+        }) {
+          continue;
+        }
+        frontier.retain(|other| {
+          let other = &mut labels[other];
+          let dominated = next_cost <= other.cost && key(next_depth) <= key(other.depth);
+          if dominated {
+            other.alive = false;
+          }
+          !dominated
+        });
+        let next_index = labels.len();
+        frontier.push(next_index);
+        labels.push(Label {
+          node: next,
+          cost: next_cost,
+          depth: next_depth,
+          parent: Some(index),
+          edge: Some((edge.src, edge.etype, edge.dst)),
+          alive: true,
+        });
+        queue.push(Queued {
+          priority: next_cost + heuristic(next),
+          depth: next_depth,
+          label: next_index,
+        });
+      }
+    }
+  }
+
+  Search {
+    result: PathResult::not_found(),
+    depth_cut,
+  }
+}
+
+/// The path that reached `index`, following parent labels back to the source.
+fn path_from_label(labels: &[Label], index: usize) -> PathResult {
+  let mut path = Vec::new();
+  let mut edges = Vec::new();
+  let mut current = Some(index);
+  while let Some(label) = current.map(|index| &labels[index]) {
+    path.push(label.node);
+    edges.extend(label.edge);
+    current = label.parent;
+  }
+  path.reverse();
+  edges.reverse();
+
+  PathResult {
+    path,
+    edges,
+    total_weight: labels[index].cost,
+    found: true,
+  }
+}
+
+/// Cheapest path within `config.max_depth`: classic search first, and the depth-tracking
+/// search only if the depth limit cut something off.
+fn shortest_path_search<F, W, H>(
+  config: &PathConfig,
+  neighbors: &F,
+  edge_weight: &W,
+  heuristic: &H,
+) -> PathResult
+where
+  F: Fn(NodeId, TraversalDirection, Option<ETypeId>) -> Vec<Edge>,
+  W: Fn(NodeId, ETypeId, NodeId) -> f64,
+  H: Fn(NodeId) -> f64,
+{
+  let classic = label_search(config, neighbors, edge_weight, heuristic, false);
+  if !classic.depth_cut {
+    return classic.result;
+  }
+  label_search(config, neighbors, edge_weight, heuristic, true).result
 }
 
 // ============================================================================
@@ -128,10 +407,12 @@ impl PathConfig {
 /// # Arguments
 /// * `config` - Pathfinding configuration
 /// * `neighbors` - Function to get neighbors for a node
-/// * `edge_weight` - Function to get edge weight (default: 1.0 for all edges)
+/// * `edge_weight` - Function to get edge weight (default: 1.0 for all edges). Edges with a NaN,
+///   infinite or negative weight are skipped.
 ///
 /// # Returns
-/// PathResult with the shortest path, or not_found() if no path exists
+/// PathResult with the cheapest path within `config.max_depth` hops to any target, or
+/// not_found() if no path exists
 ///
 /// # Example
 /// ```rust,no_run
@@ -169,118 +450,7 @@ where
   F: Fn(NodeId, TraversalDirection, Option<ETypeId>) -> Vec<Edge>,
   W: Fn(NodeId, ETypeId, NodeId) -> f64,
 {
-  let source_id = config.source;
-
-  // Distance map: nodeId -> PathState
-  let mut distances: HashMap<NodeId, PathState> = HashMap::new();
-  let mut visited: HashSet<NodeId> = HashSet::new();
-
-  // Priority queue
-  let mut queue = IndexedMinHeap::new();
-
-  // Initialize source
-  distances.insert(
-    source_id,
-    PathState {
-      node_id: source_id,
-      cost: 0.0,
-      depth: 0,
-      parent: None,
-      edge: None,
-    },
-  );
-  queue.insert(source_id, 0.0);
-
-  while let Some(current_id) = queue.extract_min() {
-    if visited.contains(&current_id) {
-      continue;
-    }
-    visited.insert(current_id);
-
-    // Check if we reached a target
-    if config.targets.contains(&current_id) {
-      return reconstruct_path(&distances, current_id, source_id);
-    }
-
-    let Some(current_state) = distances.get(&current_id).cloned() else {
-      continue;
-    };
-    if current_state.depth >= config.max_depth {
-      continue;
-    }
-
-    // Get neighbors based on direction
-    let directions = match config.direction {
-      TraversalDirection::Both => vec![TraversalDirection::Out, TraversalDirection::In],
-      dir => vec![dir],
-    };
-
-    for dir in directions {
-      // Filter by edge type if specified
-      let etype_filter = if config.allowed_etypes.is_empty() {
-        None
-      } else {
-        // We need to check all allowed etypes
-        // For simplicity, pass None and filter manually
-        None
-      };
-
-      let neighbors = neighbors(current_id, dir, etype_filter);
-
-      for edge in neighbors {
-        // Filter by allowed etypes
-        if !config.allowed_etypes.is_empty() && !config.allowed_etypes.contains(&edge.etype) {
-          continue;
-        }
-
-        let neighbor_id = match dir {
-          TraversalDirection::Out => edge.dst,
-          TraversalDirection::In => edge.src,
-          TraversalDirection::Both => {
-            if edge.src == current_id {
-              edge.dst
-            } else {
-              edge.src
-            }
-          }
-        };
-
-        if visited.contains(&neighbor_id) {
-          continue;
-        }
-
-        let weight = edge_weight(edge.src, edge.etype, edge.dst);
-        let new_cost = current_state.cost + weight;
-
-        // Check if we should update - use entry API to avoid borrow issues
-        let existing_cost = distances.get(&neighbor_id).map(|s| s.cost);
-        let should_update = existing_cost.map(|c| new_cost < c).unwrap_or(true);
-
-        if should_update {
-          let had_existing = existing_cost.is_some();
-
-          distances.insert(
-            neighbor_id,
-            PathState {
-              node_id: neighbor_id,
-              cost: new_cost,
-              depth: current_state.depth + 1,
-              parent: Some(current_id),
-              edge: Some((edge.src, edge.etype, edge.dst)),
-            },
-          );
-
-          if had_existing {
-            queue.decrease_priority(neighbor_id, new_cost);
-          } else {
-            queue.insert(neighbor_id, new_cost);
-          }
-        }
-      }
-    }
-  }
-
-  PathResult::not_found()
+  shortest_path_search(&config, &neighbors, &edge_weight, &|_| 0.0)
 }
 
 /// Execute A* shortest path algorithm with heuristic
@@ -288,8 +458,11 @@ where
 /// # Arguments
 /// * `config` - Pathfinding configuration
 /// * `neighbors` - Function to get neighbors for a node
-/// * `edge_weight` - Function to get edge weight
-/// * `heuristic` - Function estimating distance from node to target
+/// * `edge_weight` - Function to get edge weight. Edges with a NaN, infinite or negative weight
+///   are skipped.
+/// * `heuristic` - `heuristic(node, target)` estimates the cost from `node` to `target`. It must
+///   never overestimate (admissible) for the result to be the cheapest path. With several
+///   targets, the search uses the smallest estimate over all of them.
 ///
 /// # Returns
 /// PathResult with the shortest path, or not_found() if no path exists
@@ -299,222 +472,23 @@ where
   W: Fn(NodeId, ETypeId, NodeId) -> f64,
   H: Fn(NodeId, NodeId) -> f64,
 {
-  let source_id = config.source;
-
-  // We need at least one target for heuristic
-  let Some(primary_target) = first_target(&config) else {
-    return PathResult::not_found();
-  };
-
-  let mut states: HashMap<NodeId, AStarState> = HashMap::new();
-  let mut visited: HashSet<NodeId> = HashSet::new();
-  let mut queue = IndexedMinHeap::new();
-
-  init_astar_state(
-    source_id,
-    primary_target,
-    &heuristic,
-    &mut states,
-    &mut queue,
-  );
-
-  while let Some(current_id) = queue.extract_min() {
-    if visited.contains(&current_id) {
-      continue;
-    }
-    visited.insert(current_id);
-
-    // Check if we reached a target
-    if config.targets.contains(&current_id) {
-      let path_states = build_astar_path_states(&states);
-      return reconstruct_path(&path_states, current_id, source_id);
-    }
-
-    let Some(current_state) = states.get(&current_id).cloned() else {
-      continue;
-    };
-    if current_state.depth >= config.max_depth {
-      continue;
-    }
-
-    for dir in traversal_directions(config.direction) {
-      let neighbors = neighbors(current_id, dir, None);
-
-      for edge in neighbors {
-        // Filter by allowed etypes
-        if !config.allowed_etypes.is_empty() && !config.allowed_etypes.contains(&edge.etype) {
-          continue;
-        }
-
-        let neighbor_id = neighbor_id_for_edge(current_id, dir, &edge);
-
-        if visited.contains(&neighbor_id) {
-          continue;
-        }
-
-        let weight = edge_weight(edge.src, edge.etype, edge.dst);
-        let tentative_g = current_state.g_score + weight;
-
-        // Check if we should update - extract info to avoid borrow issues
-        let existing_g_score = states.get(&neighbor_id).map(|s| s.g_score);
-        let should_update = existing_g_score.map(|g| tentative_g < g).unwrap_or(true);
-
-        if should_update {
-          let had_existing = existing_g_score.is_some();
-          let h = heuristic(neighbor_id, primary_target);
-          let f = tentative_g + h;
-
-          states.insert(
-            neighbor_id,
-            AStarState {
-              g_score: tentative_g,
-              f_score: f,
-              depth: current_state.depth + 1,
-              parent: Some(current_id),
-              edge: Some((edge.src, edge.etype, edge.dst)),
-            },
-          );
-
-          if had_existing {
-            queue.decrease_priority(neighbor_id, f);
-          } else {
-            queue.insert(neighbor_id, f);
-          }
-        }
-      }
-    }
-  }
-
-  PathResult::not_found()
-}
-
-fn init_astar_state<H>(
-  source_id: NodeId,
-  primary_target: NodeId,
-  heuristic: &H,
-  states: &mut HashMap<NodeId, AStarState>,
-  queue: &mut IndexedMinHeap<NodeId>,
-) where
-  H: Fn(NodeId, NodeId) -> f64,
-{
-  let h = heuristic(source_id, primary_target);
-  states.insert(
-    source_id,
-    AStarState {
-      g_score: 0.0,
-      f_score: h,
-      depth: 0,
-      parent: None,
-      edge: None,
-    },
-  );
-  queue.insert(source_id, h);
-}
-
-fn build_astar_path_states(states: &HashMap<NodeId, AStarState>) -> HashMap<NodeId, PathState> {
-  states
-    .iter()
-    .map(|(&id, state)| {
-      (
-        id,
-        PathState {
-          node_id: id,
-          cost: state.g_score,
-          depth: state.depth,
-          parent: state.parent,
-          edge: state.edge,
-        },
-      )
-    })
-    .collect()
-}
-
-fn traversal_directions(direction: TraversalDirection) -> Vec<TraversalDirection> {
-  match direction {
-    TraversalDirection::Both => vec![TraversalDirection::Out, TraversalDirection::In],
-    dir => vec![dir],
-  }
-}
-
-fn neighbor_id_for_edge(current_id: NodeId, dir: TraversalDirection, edge: &Edge) -> NodeId {
-  match dir {
-    TraversalDirection::Out => edge.dst,
-    TraversalDirection::In => edge.src,
-    TraversalDirection::Both => {
-      if edge.src == current_id {
-        edge.dst
-      } else {
-        edge.src
-      }
-    }
-  }
-}
-
-/// Reconstruct path from parent pointers
-fn reconstruct_path(
-  states: &HashMap<NodeId, PathState>,
-  target_id: NodeId,
-  source_id: NodeId,
-) -> PathResult {
-  let mut path = Vec::new();
-  let mut edges = Vec::new();
-
-  let mut current_id = Some(target_id);
-  let mut path_states = Vec::new();
-
-  // Walk backwards from target to source
-  while let Some(id) = current_id {
-    let Some(state) = states.get(&id) else {
-      break;
-    };
-
-    path_states.push(state.clone());
-
-    if id == source_id {
-      break;
-    }
-
-    current_id = state.parent;
-  }
-
-  // Check if we actually reached the source
-  let reached_source = match path_states.last() {
-    Some(last) => last.node_id == source_id,
-    None => false,
-  };
-  if !reached_source {
+  if config.targets.is_empty() {
     return PathResult::not_found();
   }
-
-  // Reverse to get source -> target order
-  path_states.reverse();
-
-  // Build path and edges
-  for (i, state) in path_states.iter().enumerate() {
-    path.push(state.node_id);
-
-    if i > 0 {
-      if let Some(edge) = state.edge {
-        edges.push(edge);
-      }
-    }
-  }
-
-  // Total weight is the cost to reach the target
-  let total_weight = path_states.last().map(|s| s.cost).unwrap_or(0.0);
-
-  PathResult {
-    path,
-    edges,
-    total_weight,
-    found: true,
-  }
+  // Admissible for every target if each per-target estimate is.
+  let targets: Vec<NodeId> = config.targets.iter().copied().collect();
+  let nearest_target_estimate = |node: NodeId| {
+    targets
+      .iter()
+      .map(|&target| heuristic(node, target))
+      .fold(f64::INFINITY, f64::min)
+  };
+  shortest_path_search(&config, &neighbors, &edge_weight, &nearest_target_estimate)
 }
 
 // ============================================================================
 // Pathfinding Builder
 // ============================================================================
-
 /// Builder for configuring pathfinding queries
 pub struct PathFindingBuilder<F, W> {
   source: NodeId,
@@ -646,12 +620,79 @@ where
 
 /// Find shortest path using BFS (unweighted)
 ///
-/// This is faster than Dijkstra for unweighted graphs.
+/// Finds the path with the fewest hops (within `config.max_depth`); `total_weight` is the hop
+/// count. This is faster than Dijkstra for unweighted graphs.
 pub fn bfs<F>(config: PathConfig, neighbors: F) -> PathResult
 where
   F: Fn(NodeId, TraversalDirection, Option<ETypeId>) -> Vec<Edge>,
 {
-  dijkstra(config, neighbors, |_, _, _| 1.0)
+  let source = config.source;
+  if config.targets.contains(&source) {
+    return PathResult {
+      path: vec![source],
+      edges: Vec::new(),
+      total_weight: 0.0,
+      found: true,
+    };
+  }
+
+  let etype_filter = config.neighbors_etype();
+  // Node -> (parent, edge used to reach it).
+  let mut parents: FastMap<NodeId, (NodeId, (NodeId, ETypeId, NodeId))> = FastMap::new();
+  let mut visited: FastSet<NodeId> = FastSet::new();
+  visited.insert(source);
+  let mut queue = VecDeque::new();
+  queue.push_back((source, 0usize));
+
+  while let Some((node, depth)) = queue.pop_front() {
+    if depth >= config.max_depth {
+      continue;
+    }
+    for &dir in expand_directions(config.direction) {
+      for edge in neighbors(node, dir, etype_filter) {
+        if !config.allows(edge.etype) {
+          continue;
+        }
+        let next = neighbor_id_for_edge(node, dir, &edge);
+        if !visited.insert(next) {
+          continue;
+        }
+        parents.insert(next, (node, (edge.src, edge.etype, edge.dst)));
+        if config.targets.contains(&next) {
+          return bfs_path(&parents, source, next);
+        }
+        queue.push_back((next, depth + 1));
+      }
+    }
+  }
+
+  PathResult::not_found()
+}
+
+fn bfs_path(
+  parents: &FastMap<NodeId, (NodeId, (NodeId, ETypeId, NodeId))>,
+  source: NodeId,
+  target: NodeId,
+) -> PathResult {
+  let mut path = vec![target];
+  let mut edges = Vec::new();
+  let mut current = target;
+  while current != source {
+    let (parent, edge) = parents[&current];
+    edges.push(edge);
+    path.push(parent);
+    current = parent;
+  }
+  path.reverse();
+  edges.reverse();
+  let total_weight = edges.len() as f64;
+
+  PathResult {
+    path,
+    edges,
+    total_weight,
+    found: true,
+  }
 }
 
 // ============================================================================
@@ -666,11 +707,15 @@ where
 /// 2. For each subsequent path, systematically "spur" from nodes of previous paths
 /// 3. Use a priority queue to select the next shortest candidate path
 ///
+/// With several targets, the result is the k cheapest paths that end at a target without
+/// passing through another one.
+///
 /// # Arguments
 /// * `config` - Pathfinding configuration (source, target, etc.)
 /// * `k` - Maximum number of paths to find
 /// * `neighbors` - Function to get neighbors for a node
-/// * `edge_weight` - Function to get edge weight
+/// * `edge_weight` - Function to get edge weight. Edges with a NaN, infinite or negative weight
+///   are skipped.
 ///
 /// # Returns
 /// Vector of up to k shortest paths, sorted by total weight
@@ -718,17 +763,59 @@ where
     return Vec::new();
   }
 
-  // We need exactly one target for Yen's algorithm
-  let target = match first_target(&config) {
-    Some(target) => target,
-    None => return Vec::new(),
+  let mut targets: Vec<NodeId> = config.targets.iter().copied().collect();
+  targets.sort_unstable();
+  let [target] = targets[..] else {
+    // Rank the k cheapest paths to each target (avoiding the other targets) together.
+    let mut paths = Vec::new();
+    for &target in &targets {
+      let others: FastSet<NodeId> = targets.iter().copied().filter(|&t| t != target).collect();
+      let avoid_others = |node: NodeId, dir: TraversalDirection, etype: Option<ETypeId>| {
+        neighbors(node, dir, etype)
+          .into_iter()
+          .filter(|edge| !others.contains(&neighbor_id_for_edge(node, dir, edge)))
+          .collect::<Vec<_>>()
+      };
+      paths.extend(yen_single_target(
+        &config,
+        target,
+        k,
+        &avoid_others,
+        &edge_weight,
+      ));
+    }
+    paths.sort_by(|a, b| {
+      a.total_weight
+        .total_cmp(&b.total_weight)
+        .then_with(|| a.path.len().cmp(&b.path.len()))
+        .then_with(|| a.path.cmp(&b.path))
+    });
+    paths.truncate(k);
+    return paths;
   };
+  yen_single_target(&config, target, k, &neighbors, &edge_weight)
+}
 
+fn yen_single_target<F, W>(
+  config: &PathConfig,
+  target: NodeId,
+  k: usize,
+  neighbors: &F,
+  edge_weight: &W,
+) -> Vec<PathResult>
+where
+  F: Fn(NodeId, TraversalDirection, Option<ETypeId>) -> Vec<Edge>,
+  W: Fn(NodeId, ETypeId, NodeId) -> f64,
+{
   // Result: the k shortest paths
   let mut result_paths: Vec<PathResult> = Vec::with_capacity(k);
 
   // Find the first shortest path using Dijkstra
-  let first_path = dijkstra(config.clone(), &neighbors, &edge_weight);
+  let first_path = dijkstra(
+    build_spur_config(config, config.source, target, 0),
+    neighbors,
+    edge_weight,
+  );
   if !first_path.found {
     return Vec::new();
   }
@@ -738,8 +825,7 @@ where
     return result_paths;
   }
 
-  // Candidate paths (potential k-shortest paths) stored as (weight, path)
-  // Using BinaryHeap would be ideal but we need custom ordering
+  // Candidate paths (potential k-shortest paths)
   let mut candidates: Vec<PathResult> = Vec::new();
 
   // For each path we've found (except we keep finding more)
@@ -756,7 +842,7 @@ where
     for (spur_idx, &spur_node) in prev_path_nodes.iter().enumerate().take(max_spur_idx) {
       // Root path: path from source to spur node
       let (root_path, root_edges) = root_segments(prev_path, spur_idx);
-      let root_weight = root_weight(&root_edges, &edge_weight);
+      let root_weight = root_weight(&root_edges, edge_weight);
 
       // Collect edges to exclude (edges used by paths that share this root)
       let mut excluded_edges = HashSet::new();
@@ -776,20 +862,15 @@ where
               return false;
             }
             // Don't go to nodes in the root path
-            let neighbor = if dir == TraversalDirection::In {
-              edge.src
-            } else {
-              edge.dst
-            };
-            !root_nodes.contains(&neighbor)
+            !root_nodes.contains(&neighbor_id_for_edge(node, dir, edge))
           })
           .collect()
       };
 
       // Find spur path from spur_node to target
-      let spur_config = build_spur_config(&config, spur_node, target, spur_idx);
+      let spur_config = build_spur_config(config, spur_node, target, spur_idx);
 
-      let spur_path = dijkstra(spur_config, filtered_neighbors, &edge_weight);
+      let spur_path = dijkstra(spur_config, filtered_neighbors, edge_weight);
 
       if spur_path.found {
         let candidate = combine_paths(root_path, root_edges, root_weight, spur_path);
@@ -802,22 +883,14 @@ where
     }
 
     // If we have candidates, add the shortest one to results
-    if !candidates.is_empty() {
-      // Find the candidate with minimum weight
-      if let Some(best) = pop_best_candidate(&mut candidates) {
-        result_paths.push(best);
-      }
-    } else {
+    match pop_best_candidate(&mut candidates) {
+      Some(best) => result_paths.push(best),
       // No more candidates, we've found all possible paths
-      break;
+      None => break,
     }
   }
 
   result_paths
-}
-
-fn first_target(config: &PathConfig) -> Option<NodeId> {
-  config.targets.iter().next().copied()
 }
 
 fn root_segments(
@@ -825,11 +898,7 @@ fn root_segments(
   spur_idx: usize,
 ) -> (Vec<NodeId>, Vec<(NodeId, ETypeId, NodeId)>) {
   let root_path: Vec<NodeId> = prev_path.path[..=spur_idx].to_vec();
-  let root_edges: Vec<(NodeId, ETypeId, NodeId)> = if spur_idx > 0 {
-    prev_path.edges[..spur_idx].to_vec()
-  } else {
-    Vec::new()
-  };
+  let root_edges: Vec<(NodeId, ETypeId, NodeId)> = prev_path.edges[..spur_idx].to_vec();
   (root_path, root_edges)
 }
 
@@ -862,6 +931,8 @@ fn root_nodes(root_path: &[NodeId], spur_idx: usize) -> HashSet<NodeId> {
   root_path[..spur_idx].iter().copied().collect()
 }
 
+/// `config` searching from `spur_node` (reached in `spur_idx` hops) to `target` alone, with the
+/// hops it has left.
 fn build_spur_config(
   config: &PathConfig,
   spur_node: NodeId,
@@ -902,16 +973,12 @@ fn is_duplicate_path(candidate: &PathResult, paths: &[PathResult]) -> bool {
 }
 
 fn pop_best_candidate(candidates: &mut Vec<PathResult>) -> Option<PathResult> {
-  candidates.sort_by(|a, b| {
-    a.total_weight
-      .partial_cmp(&b.total_weight)
-      .unwrap_or(std::cmp::Ordering::Equal)
-  });
-  if candidates.is_empty() {
-    None
-  } else {
-    Some(candidates.remove(0))
-  }
+  let best = candidates
+    .iter()
+    .enumerate()
+    .min_by(|(_, a), (_, b)| a.total_weight.total_cmp(&b.total_weight))
+    .map(|(index, _)| index)?;
+  Some(candidates.remove(best))
 }
 
 // ============================================================================
