@@ -491,14 +491,20 @@ impl PrimaryReplicationInner {
   ) -> Result<Self> {
     let sidecar_path = sidecar_path.unwrap_or_else(|| default_replication_sidecar_path(db_path));
     std::fs::create_dir_all(&sidecar_path)?;
-    let sidecar_primary_lock = acquire_sidecar_primary_lock(&sidecar_path)?;
+    let (sidecar_primary_lock, held_by_live_instance) =
+      acquire_sidecar_primary_lock(&sidecar_path)?;
 
     let manifest_store = ManifestStore::with_sync(sidecar_path.join(MANIFEST_FILE_NAME), sync);
     let health_store = PrimarySidecarHealthStore::new(&sidecar_path, sync);
     let health = shared_sidecar_health(&sidecar_path, &health_store)?;
     let persisted_health = Some(health.lock().clone());
     let unflushed_marker_path = sidecar_path.join(PRIMARY_UNFLUSHED_MARKER_FILE_NAME);
-    let stopped_with_buffered_frames = unflushed_marker_path.exists();
+    // The marker says a primary stopped with frames in memory. While another
+    // instance in this process holds the sidecar, any marker is that live
+    // instance's: its frames are still buffered, not lost, and it removes
+    // the marker itself once they are published. (The first instance to
+    // take the lock already handled a predecessor's marker.)
+    let stopped_with_buffered_frames = !held_by_live_instance && unflushed_marker_path.exists();
 
     let mut manifest = if manifest_store.path().exists() {
       manifest_store.read()?
@@ -1551,7 +1557,10 @@ fn sidecar_operation_lock(sidecar_path: &Path) -> SidecarOpLock {
     .clone()
 }
 
-fn acquire_sidecar_primary_lock(sidecar_path: &Path) -> Result<SidecarPrimaryLock> {
+/// Take the sidecar's primary lock, or share it with the instance in this
+/// process that holds it. The flag is true when the lock was shared: a live
+/// primary instance in this process owns the sidecar.
+fn acquire_sidecar_primary_lock(sidecar_path: &Path) -> Result<(SidecarPrimaryLock, bool)> {
   let key = normalize_sidecar_path(sidecar_path);
   let registry = SIDECAR_PRIMARY_LOCKS.get_or_init(|| StdMutex::new(HashMap::new()));
   let mut registry = registry
@@ -1559,7 +1568,7 @@ fn acquire_sidecar_primary_lock(sidecar_path: &Path) -> Result<SidecarPrimaryLoc
     .map_err(|_| KiteError::LockFailed("primary sidecar lock registry poisoned".to_string()))?;
 
   if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
-    return Ok(existing);
+    return Ok((existing, true));
   }
 
   let lock_path = key.join(PRIMARY_LOCK_FILE_NAME);
@@ -1578,7 +1587,7 @@ fn acquire_sidecar_primary_lock(sidecar_path: &Path) -> Result<SidecarPrimaryLoc
 
   let lock = Arc::new(PrimarySidecarProcessLock { file: lock_file });
   registry.insert(key, Arc::downgrade(&lock));
-  Ok(lock)
+  Ok((lock, false))
 }
 
 /// The in-process copy of the sidecar's `primary-health.json`, shared by
