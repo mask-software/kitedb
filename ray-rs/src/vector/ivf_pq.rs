@@ -725,31 +725,35 @@ impl IvfPqIndex {
 
       // Search vectors in this cluster using PQ ADC
       for &vector_id in vector_ids {
-        // A missing mapping is not a valid result. Do this check before the
-        // filter so an unmappable vector can never bypass it.
-        let node_id = match manifest.vector_to_node.get(&vector_id) {
-          Some(&node_id) => node_id,
-          None => continue,
+        // A missing mapping is not a valid result. With a filter, check it
+        // first so an unmappable vector can never bypass the filter.
+        let filtered_node = match &options.filter {
+          Some(filter) => match manifest.vector_to_node.get(&vector_id) {
+            Some(&node_id) if filter(node_id) => Some(node_id),
+            _ => continue,
+          },
+          None => None,
         };
 
-        if let Some(ref filter) = options.filter {
-          if !filter(node_id) {
-            continue;
-          }
-        }
-
-        // Get PQ codes for this vector
-        let codes = match self.pq_codes.get(&vector_id) {
-          Some(c) => c,
-          None => continue,
+        let Some(codes) = self.pq_codes.get(&vector_id) else {
+          continue;
         };
-
-        // Compute approximate distance using ADC
         let dist = self.distance_adc(dist_table, codes);
-
+        // Most scanned vectors cannot enter the top k: skip them before
+        // the node lookup and the threshold.
+        if !top.admits(dist) {
+          continue;
+        }
         if apply_threshold && !passes_threshold(self.config.ivf.metric, options.threshold, dist) {
           continue;
         }
+        let node_id = match filtered_node {
+          Some(node_id) => node_id,
+          None => match manifest.vector_to_node.get(&vector_id) {
+            Some(&node_id) => node_id,
+            None => continue,
+          },
+        };
 
         top.push(
           Candidate {
