@@ -1,4 +1,4 @@
-import { solidPlugin } from "@opentui/solid/bun-plugin";
+import solidPlugin from "@opentui/solid/bun-plugin";
 
 const result = await Bun.build({
   entrypoints: ["src/main.tsx"],
@@ -6,7 +6,7 @@ const result = await Bun.build({
   target: "bun",
   sourcemap: "inline",
   minify: false,
-  plugins: [solidPlugin()],
+  plugins: [solidPlugin],
 });
 
 if (!result.success) {

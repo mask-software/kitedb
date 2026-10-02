@@ -1,5 +1,6 @@
-import { createEffect, createMemo, createSignal, For, Show } from "solid-js";
-import { Portal, useKeyboard } from "@opentui/solid";
+import { createEffect, createMemo, createSignal, For, onCleanup, Show } from "solid-js";
+import type { KeyEvent } from "@opentui/core";
+import { Portal, useKeyboard, useRenderer } from "@opentui/solid";
 import { DbService } from "./db/db-service.ts";
 import { nextPage, prevPage } from "./db/paging.ts";
 import type { JsFullEdge, DbStats } from "@kitedb/core";
@@ -16,8 +17,25 @@ type InputTarget =
   | "exportPath"
   | null;
 
+/** One printable character: a single code point that isn't a control character. */
+const PRINTABLE = /^\P{Cc}$/u;
+
+/**
+ * The key an opentui event stands for: the typed character for printable keys, else opentui's key
+ * name ("return", "escape", "backspace", "tab", "up", "pagedown", ...). Ctrl/alt/cmd combinations
+ * give null, so they neither trigger shortcuts nor type text.
+ */
+function keyOf(event: KeyEvent): string | null {
+  if (event.ctrl || event.meta || event.option || event.super) return null;
+  return PRINTABLE.test(event.sequence) ? event.sequence : event.name;
+}
+
 export function App() {
   const db = new DbService();
+  const renderer = useRenderer();
+  // q/Esc, Ctrl+C and exit signals all end the app by destroying the renderer, which disposes this
+  // component: close the database here so every way out closes it.
+  onCleanup(() => db.close());
 
   const [activeTab, setActiveTab] = createSignal<TabKey>("nodes");
   const [openPath, setOpenPath] = createSignal("");
@@ -61,7 +79,7 @@ export function App() {
   const dbPath = createMemo(() => currentPath());
   const dbReadOnly = createMemo(() => currentReadOnly());
 
-  const nodeTypes = createMemo(() => (dbConnected() ? db.getNodeTypes() : []));
+  const labels = createMemo(() => (dbConnected() ? db.getLabels() : []));
   const edgeTypes = createMemo(() => (dbConnected() ? db.getEdgeTypes() : []));
 
   const edgeFilterId = createMemo(() => {
@@ -291,17 +309,18 @@ export function App() {
     loadEdgesPage(move.cursor);
   }
 
-  function handleInputKey(event: any) {
+  function handleInputKey(key: string) {
     const target = activeInput();
     if (!target) return;
 
-    if (event.key === "Escape") {
+    if (key === "escape") {
       setActiveInput(null);
       setStatus(null);
       return;
     }
 
-    if (event.key === "Enter") {
+    // opentui's own inputs submit on both.
+    if (key === "return" || key === "linefeed") {
       if (target === "openPath") {
         openDatabase(openPath(), true);
       } else if (target === "importPath") {
@@ -322,13 +341,13 @@ export function App() {
       return;
     }
 
-    if (event.key === "Backspace") {
+    if (key === "backspace") {
       updateInputValue(target, (value) => value.slice(0, -1));
       return;
     }
 
-    if (event.key.length === 1 && !event.ctrl && !event.alt && !event.ctrlKey && !event.metaKey) {
-      updateInputValue(target, (value) => value + event.key);
+    if (PRINTABLE.test(key)) {
+      updateInputValue(target, (value) => value + key);
     }
   }
 
@@ -354,12 +373,15 @@ export function App() {
     }
   }
 
-  useKeyboard((event: any) => {
+  useKeyboard((event) => {
+    const key = keyOf(event);
+    if (key === null) return;
+
     if (showUnlockConfirm()) {
-      if (event.key.toLowerCase() === "y") {
+      if (key.toLowerCase() === "y") {
         setShowUnlockConfirm(false);
         unlockWrites();
-      } else if (event.key.toLowerCase() === "n" || event.key === "Escape") {
+      } else if (key.toLowerCase() === "n" || key === "escape") {
         setShowUnlockConfirm(false);
         setStatus("Write unlock cancelled");
       }
@@ -367,26 +389,28 @@ export function App() {
     }
 
     if (activeInput()) {
-      handleInputKey(event);
+      handleInputKey(key);
       return;
     }
 
-    if (event.key === "q" || event.key === "Escape") {
-      process.exit(0);
+    if (key === "q" || key === "escape") {
+      // Restores the terminal and disposes the app (closing the database); main.tsx exits then.
+      renderer.destroy();
+      return;
     }
 
-    if (event.key === "o") {
+    if (key === "o") {
       setActiveInput("openPath");
       setStatus("Open path input (Enter to open)");
       return;
     }
 
-    if (event.key === "c") {
+    if (key === "c") {
       closeDatabase();
       return;
     }
 
-    if (event.key === "r") {
+    if (key === "r") {
       setRefreshing(true);
       try {
         refreshAll();
@@ -397,27 +421,27 @@ export function App() {
       return;
     }
 
-    if (event.key === "n") {
+    if (key === "n") {
       setActiveTab("nodes");
       return;
     }
 
-    if (event.key === "e") {
+    if (key === "e") {
       setActiveTab("edges");
       return;
     }
 
-    if (event.key === "s") {
+    if (key === "s") {
       setActiveTab("stats");
       return;
     }
 
-    if (event.key === "p") {
+    if (key === "p") {
       setActiveTab("import");
       return;
     }
 
-    if (event.key === "Tab" || event.key === "tab") {
+    if (key === "tab") {
       const order: TabKey[] = ["nodes", "edges", "stats", "import"];
       const index = order.indexOf(activeTab());
       const next = order[(index + 1) % order.length] ?? "nodes";
@@ -425,26 +449,26 @@ export function App() {
       return;
     }
 
-    if (event.key === "i") {
+    if (key === "i") {
       setActiveTab("import");
       setActiveInput("importPath");
       setStatus("Import path input (Enter to import)");
       return;
     }
 
-    if (event.key === "x") {
+    if (key === "x") {
       setActiveTab("import");
       setActiveInput("exportPath");
       setStatus("Export path input (Enter to export)");
       return;
     }
 
-    if (event.key === "m") {
+    if (key === "m") {
       setExportMode((current) => (current === "json" ? "jsonl" : "json"));
       return;
     }
 
-    if (event.key === "f") {
+    if (key === "f") {
       if (activeTab() === "nodes") {
         setActiveInput("nodeFilter");
         setStatus("Node filter input (prefix)");
@@ -455,32 +479,32 @@ export function App() {
       return;
     }
 
-    if (event.key === "w") {
+    if (key === "w") {
       if (dbConnected() && dbReadOnly()) {
         setShowUnlockConfirm(true);
       }
       return;
     }
 
-    if (event.key === "ArrowDown" || event.key === "Down" || event.key === "j") {
+    if (key === "down" || key === "j") {
       if (activeTab() === "nodes") moveNodeSelection(1);
       if (activeTab() === "edges") moveEdgeSelection(1);
       return;
     }
 
-    if (event.key === "ArrowUp" || event.key === "Up" || event.key === "k") {
+    if (key === "up" || key === "k") {
       if (activeTab() === "nodes") moveNodeSelection(-1);
       if (activeTab() === "edges") moveEdgeSelection(-1);
       return;
     }
 
-    if (event.key === "PageDown") {
+    if (key === "pagedown") {
       if (activeTab() === "nodes") nextNodesPage();
       if (activeTab() === "edges") nextEdgesPage();
       return;
     }
 
-    if (event.key === "PageUp") {
+    if (key === "pageup") {
       if (activeTab() === "nodes") prevNodesPage();
       if (activeTab() === "edges") prevEdgesPage();
     }
@@ -519,7 +543,7 @@ export function App() {
 
   return (
     <box flexDirection="column" height="100%" width="100%" padding={1} gap={1}>
-      <box borderStyle="round" padding={1} gap={2}>
+      <box borderStyle="rounded" padding={1} gap={2}>
         <box flexDirection="column" gap={1} flexGrow={1}>
           <text bold>KiteDB Explorer</text>
           <text fg={dbConnected() ? "green" : "yellow"}>
@@ -542,7 +566,7 @@ export function App() {
       </box>
 
       <box flexGrow={1} gap={1}>
-        <box borderStyle="round" padding={1} width="26%" flexDirection="column" gap={1}>
+        <box borderStyle="rounded" padding={1} width="26%" flexDirection="column" gap={1}>
           <tab_select
             items={tabs}
             selected={tabs.indexOf(activeTab() === "nodes" ? "Nodes" : activeTab() === "edges" ? "Edges" : activeTab() === "stats" ? "Stats" : "Import/Export")}
@@ -573,7 +597,7 @@ export function App() {
           </box>
         </box>
 
-        <box borderStyle="round" padding={1} width="40%" flexDirection="column" gap={1}>
+        <box borderStyle="rounded" padding={1} width="40%" flexDirection="column" gap={1}>
           <Show when={activeTab() === "nodes"}>
             <box flexDirection="column" gap={1}>
               <text bold>Nodes (page {nodeHistory().length + 1})</text>
@@ -631,10 +655,10 @@ export function App() {
                 )}
               </Show>
               <box flexDirection="column" gap={1}>
-                <text bold>Node types</text>
-                <For each={nodeTypes()}>{(name) => <text>- {name}</text>}</For>
-                <Show when={nodeTypes().length === 0}>
-                  <text fg="yellow">No node types</text>
+                <text bold>Labels</text>
+                <For each={labels()}>{(name) => <text>- {name}</text>}</For>
+                <Show when={labels().length === 0}>
+                  <text fg="yellow">No labels</text>
                 </Show>
               </box>
               <box flexDirection="column" gap={1}>
@@ -665,7 +689,7 @@ export function App() {
           </Show>
         </box>
 
-        <box borderStyle="round" padding={1} flexGrow={1} flexDirection="column" gap={1}>
+        <box borderStyle="rounded" padding={1} flexGrow={1} flexDirection="column" gap={1}>
           <text bold>Details</text>
           <Show when={activeTab() === "nodes" && selectedNodeDetail()}>
             {(detail) => (
@@ -723,7 +747,7 @@ export function App() {
         </box>
       </box>
 
-      <box borderStyle="round" padding={1}>
+      <box borderStyle="rounded" padding={1}>
         <text>
           {statusMessage() ?? "Ready"}
         </text>
