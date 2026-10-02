@@ -1944,3 +1944,8 @@ mod w2_tests;
 #[cfg(test)]
 #[path = "b4_commit_tests.rs"]
 mod b4_tests;
+/// raydb-b4 `mvcc` lane, finding 5: transactions that begin during a commit's
+/// publish.
+#[cfg(test)]
+#[path = "b4_mvcc_commit_tests.rs"]
+mod b4_mvcc_commit_tests;
