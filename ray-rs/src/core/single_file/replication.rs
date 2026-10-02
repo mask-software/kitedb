@@ -347,7 +347,8 @@ impl SingleFileDB {
       position: (applied_epoch, applied_log_index),
       applied: 0,
     };
-    let budget = batch_wal_budget(self, CATCH_UP_BATCH_WAL_SHARE);
+    let budget =
+      usize::try_from(batch_wal_budget(self, CATCH_UP_BATCH_WAL_SHARE)).unwrap_or(usize::MAX);
     let mut outcome = Ok(());
     for run in frame_runs(&pending, budget) {
       let applied = apply_frames(self, run, &mut progress).or_else(|error| {
@@ -1011,8 +1012,10 @@ struct BootstrapBatch<'a> {
   replica: &'a SingleFileDB,
   runtime: &'a ReplicaReplication,
   tx: Option<SingleFileTxGuard<'a>>,
+  /// The WAL's active region and usage when the transaction began.
+  tx_wal_start: (u8, u64),
   writes: usize,
-  max_wal_bytes: usize,
+  max_wal_bytes: u64,
 }
 
 impl<'a> BootstrapBatch<'a> {
@@ -1021,6 +1024,7 @@ impl<'a> BootstrapBatch<'a> {
       replica,
       runtime,
       tx: None,
+      tx_wal_start: (0, 0),
       writes: 0,
       max_wal_bytes: batch_wal_budget(replica, BOOTSTRAP_BATCH_WAL_SHARE),
     }
@@ -1031,20 +1035,29 @@ impl<'a> BootstrapBatch<'a> {
   fn write<T>(&mut self, write: impl FnOnce(&SingleFileDB) -> Result<T>) -> Result<T> {
     if self.tx.is_none() {
       self.tx = Some(self.replica.begin_replication_apply()?);
+      let stats = self.replica.wal_stats();
+      self.tx_wal_start = (stats.active_region, stats.used);
     }
     let value = write(self.replica)?;
     self.writes = self.writes.saturating_add(1);
-    if self.writes >= BOOTSTRAP_BATCH_MAX_WRITES || self.pending_wal_bytes() >= self.max_wal_bytes {
+    if self.writes >= BOOTSTRAP_BATCH_MAX_WRITES || self.tx_wal_bytes() >= self.max_wal_bytes {
       self.commit()?;
     }
     Ok(value)
   }
 
-  fn pending_wal_bytes(&self) -> usize {
-    self
-      .replica
-      .current_tx_handle()
-      .map_or(0, |tx| tx.lock().pending_wal.len())
+  /// The WAL the open transaction has filled, read from the WAL itself (a
+  /// replica's transaction keeps no copy of its records). Once a background
+  /// checkpoint moved writes to the other region, what counts is what that
+  /// region holds.
+  fn tx_wal_bytes(&self) -> u64 {
+    let stats = self.replica.wal_stats();
+    let (start_region, start_used) = self.tx_wal_start;
+    if stats.active_region == start_region {
+      stats.used.saturating_sub(start_used)
+    } else {
+      stats.used
+    }
   }
 
   /// Commit the open transaction, if any. The WAL must not fill across
@@ -1074,9 +1087,8 @@ impl<'a> BootstrapBatch<'a> {
 
 /// A transaction's WAL budget: `1/share` of the database's WAL, at least
 /// `MIN_BATCH_WAL_BYTES`.
-fn batch_wal_budget(db: &SingleFileDB, share: u64) -> usize {
-  let capacity = db.wal_stats().capacity;
-  usize::try_from((capacity / share.max(1)).max(MIN_BATCH_WAL_BYTES)).unwrap_or(usize::MAX)
+fn batch_wal_budget(db: &SingleFileDB, share: u64) -> u64 {
+  (db.wal_stats().capacity / share.max(1)).max(MIN_BATCH_WAL_BYTES)
 }
 
 /// Build the schema translation from names: every source name gets a local
