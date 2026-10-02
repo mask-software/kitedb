@@ -49,6 +49,21 @@ fn post_durable_test_fault() -> Result<()> {
   Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+  /// Run on this thread's next commit once it is durable, right before its
+  /// changes merge into the delta (wave-2 D3 reproduction).
+  static BEFORE_NEXT_COMMIT_MERGE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+    std::cell::RefCell::new(None);
+}
+
+fn before_merge_test_hook() {
+  #[cfg(test)]
+  if let Some(hook) = BEFORE_NEXT_COMMIT_MERGE.with(|hook| hook.borrow_mut().take()) {
+    hook();
+  }
+}
+
 /// Outcome of `SingleFileDB::try_write_wal`.
 pub(crate) enum WalWrite<T> {
   Written(T),
@@ -810,6 +825,7 @@ impl SingleFileDB {
       schema_reservation_guard.disarm();
     }
 
+    before_merge_test_hook();
     let mut delta = self.delta.write();
 
     self.apply_mvcc_commit(commit_ts_for_mvcc, txid, &pending, &delta);
@@ -1231,3 +1247,8 @@ mod tests {
     assert!(crashed.node_by_key("four").is_none());
   }
 }
+
+/// Wave-2 commit-durability reproductions (D1-D4), failing until fixed.
+#[cfg(test)]
+#[path = "w2_commit_durability_tests.rs"]
+mod w2_tests;
