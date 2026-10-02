@@ -609,6 +609,7 @@ module.exports.createOfflineBackupAsync = nativeBinding.createOfflineBackupAsync
 module.exports.createVectorIndex = nativeBinding.createVectorIndex
 module.exports.healthCheck = nativeBinding.healthCheck
 module.exports.JsAggregation = nativeBinding.JsAggregation
+module.exports.JsAnnAlgorithm = nativeBinding.JsAnnAlgorithm
 module.exports.JsCompressionType = nativeBinding.JsCompressionType
 module.exports.JsDistanceMetric = nativeBinding.JsDistanceMetric
 module.exports.JsReplicationRole = nativeBinding.JsReplicationRole

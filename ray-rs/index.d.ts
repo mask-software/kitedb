@@ -1142,6 +1142,19 @@ export declare const enum JsAggregation {
   Sum = 'Sum'
 }
 
+/** ANN backend for `VectorIndex` */
+export declare const enum JsAnnAlgorithm {
+  /** Plain IVF: exact distances over the probed clusters */
+  Ivf = 'ivf',
+  /** IVF-PQ: PQ-ranked candidates re-ranked by exact distance */
+  IvfPq = 'ivf_pq',
+  /**
+   * Plain IVF while the index is small or under 512 dimensions, IVF-PQ from
+   * 512 dimensions and 50,000 vectors on (the default)
+   */
+  Auto = 'auto'
+}
+
 /** Brute force search result */
 export interface JsBruteForceResult {
   nodeId: number
@@ -1977,6 +1990,12 @@ export interface VectorIndexOptions {
   trainingThreshold?: number
   /** @deprecated No effect: `VectorIndex` keeps no node cache. Still accepted so existing callers keep working. */
   cacheMaxSize?: number
+  /**
+   * ANN backend (default: 'auto': plain IVF while the index is small or
+   * under 512 dimensions, IVF-PQ from 512 dimensions and 50,000 vectors on;
+   * decided at each build)
+   */
+  annAlgorithm?: JsAnnAlgorithm
 }
 
 /** Vector index statistics */
@@ -1987,6 +2006,11 @@ export interface VectorIndexStats {
   metric: JsDistanceMetric
   indexTrained: boolean
   indexClusters?: number
+  /**
+   * Backend of the built ANN index ('ivf' or 'ivf_pq'; absent before one is
+   * built)
+   */
+  indexAlgorithm?: JsAnnAlgorithm
 }
 
 /** Search result hit */

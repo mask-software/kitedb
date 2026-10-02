@@ -9,6 +9,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::sync::RwLock;
 
+use crate::api::vector_search::AnnAlgorithm as RustAnnAlgorithm;
 use crate::pyo3_bindings::validation;
 use crate::vector::distance::{l2_norm, normalize_in_place};
 use crate::vector::top_k::TopK;
@@ -886,6 +887,32 @@ fn prepare_brute_force_vector(vector: &[f64], cosine: bool) -> Option<Vec<f32>> 
     normalize_in_place(&mut v);
   }
   Some(v)
+}
+
+/// The backend `algorithm` ("auto", "ivf" or "ivf_pq") builds for a vector
+/// index of `dimensions` with `live_vectors` live vectors: "ivf" or "ivf_pq".
+/// "auto" picks IVF-PQ from 512 dimensions and 50,000 vectors on, plain IVF
+/// otherwise (the Rust `AnnAlgorithm::resolve` rule).
+#[pyfunction]
+pub fn resolve_ann_algorithm(
+  algorithm: &str,
+  dimensions: usize,
+  live_vectors: usize,
+) -> PyResult<&'static str> {
+  let algorithm = match algorithm.to_ascii_lowercase().as_str() {
+    "auto" => RustAnnAlgorithm::Auto,
+    "ivf" => RustAnnAlgorithm::Ivf,
+    "ivf_pq" => RustAnnAlgorithm::IvfPq,
+    other => {
+      return Err(PyValueError::new_err(format!(
+        "unknown ANN algorithm {other:?}; expected one of: auto, ivf, ivf_pq"
+      )))
+    }
+  };
+  Ok(match algorithm.resolve(dimensions, live_vectors) {
+    RustAnnAlgorithm::IvfPq => "ivf_pq",
+    _ => "ivf",
+  })
 }
 
 /// Perform brute-force search over all vectors

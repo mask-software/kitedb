@@ -8,7 +8,15 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from kitedb._kitedb import IvfConfig, IvfIndex, SearchOptions, brute_force_search
+from kitedb._kitedb import (
+    IvfConfig,
+    IvfIndex,
+    IvfPqIndex,
+    PqConfig,
+    SearchOptions,
+    brute_force_search,
+    resolve_ann_algorithm,
+)
 from kitedb.builders import NodeRef
 from kitedb.schema import NodeDef
 
@@ -21,6 +29,29 @@ _METRIC_MAP = {
     "dot_product": "DotProduct",
     "dotproduct": "DotProduct",
 }
+
+
+_ANN_ALGORITHMS = ("auto", "ivf", "ivf_pq")
+
+# The index is rebuilt once the live vector count reaches this multiple of the
+# count it was trained on (as in the Rust VectorIndex).
+_RETRAIN_GROWTH_FACTOR = 4
+
+# IVF-PQ settings, as the Rust VectorIndex builds them by default.
+_DEFAULT_PQ_SUBSPACES = 48
+_DEFAULT_PQ_CENTROIDS = 256
+
+
+def _resolve_pq_subspaces(requested: int, dimensions: int) -> int:
+    """PQ subspace count for ``dimensions``: the largest divisor up to the
+    request, or the smallest above it when that divisor is under a quarter of
+    the request (mirrors ``resolve_pq_subspaces`` in api/vector_search.rs)."""
+    dimensions = max(dimensions, 1)
+    target = min(max(requested, 1), dimensions)
+    below = next(c for c in range(target, 0, -1) if dimensions % c == 0)
+    if below * 4 >= target:
+        return below
+    return next(c for c in range(target, dimensions + 1) if dimensions % c == 0)
 
 
 def _validate_vector(vector: Sequence[float]) -> Optional[str]:
@@ -69,6 +100,10 @@ class VectorIndexOptions:
     # Max NodeRefs (with their props snapshot) kept for search hits. Evicted
     # nodes are still returned, as refs carrying only id, key and node_def.
     cache_max_size: int = 10_000
+    # ANN backend: "auto" (plain IVF while the index is small or under 512
+    # dimensions, IVF-PQ from 512 dimensions and 50,000 vectors on, decided at
+    # each build), "ivf" or "ivf_pq".
+    ann_algorithm: str = "auto"
 
 
 @dataclass
@@ -77,6 +112,9 @@ class SimilarOptions:
     threshold: Optional[float] = None
     n_probe: Optional[int] = None
     filter: Optional[Callable[[int], bool]] = None
+    # IVF-PQ: re-rank the best max(k * rerank_factor, 80) PQ candidates by
+    # exact distance (default 4; 0 returns the PQ ranking only).
+    rerank_factor: Optional[int] = None
 
 
 @dataclass
@@ -103,6 +141,12 @@ class VectorIndex:
         if self._normalize is None:
             self._normalize = self._metric == "cosine"
 
+        self._ann_algorithm = options.ann_algorithm.lower()
+        if self._ann_algorithm not in _ANN_ALGORITHMS:
+            raise ValueError(
+                f"unknown ann_algorithm {options.ann_algorithm!r}; expected one of: "
+                + ", ".join(_ANN_ALGORITHMS)
+            )
         self._ivf_config = options.ivf or {}
         self._training_threshold = options.training_threshold
         self._node_ref_cache = _LRUCache(options.cache_max_size)
@@ -113,7 +157,9 @@ class VectorIndex:
         self._vector_to_node: Dict[int, int] = {}
         self._next_vector_id = 0
 
-        self._index: Optional[IvfIndex] = None
+        self._index: Optional[IvfIndex | IvfPqIndex] = None
+        self._index_algorithm: Optional[str] = None
+        self._trained_live_count = 0
         self._needs_training = True
         self._is_building = False
 
@@ -160,6 +206,16 @@ class VectorIndex:
 
         if self._index is not None and self._index.trained:
             self._index.insert(vector_id, vec)
+            # Rebuild on the next search once the corpus has outgrown the
+            # index, or ("auto") has grown from plain IVF into IVF-PQ. Only
+            # growth switches the backend.
+            live = len(self._vectors)
+            grew_into_ivf_pq = (
+                self._index_algorithm == "ivf" and self._resolve_algorithm(live) == "ivf_pq"
+            )
+            retrain_at = max(self._trained_live_count, 1) * _RETRAIN_GROWTH_FACTOR
+            if live >= retrain_at or grew_into_ivf_pq:
+                self._needs_training = True
         else:
             self._needs_training = True
 
@@ -202,6 +258,7 @@ class VectorIndex:
             live_vectors = len(self._vectors)
             if live_vectors < self._training_threshold:
                 self._index = None
+                self._index_algorithm = None
                 self._needs_training = False
                 return
 
@@ -216,7 +273,15 @@ class VectorIndex:
                 metric=self._metric,
                 seed=int(seed) if seed is not None else None,
             )
-            index = IvfIndex(self._dimensions, ivf_config)
+            algorithm = self._resolve_algorithm(live_vectors)
+            if algorithm == "ivf_pq":
+                pq_config = PqConfig(
+                    num_subspaces=_resolve_pq_subspaces(_DEFAULT_PQ_SUBSPACES, self._dimensions),
+                    num_centroids=min(_DEFAULT_PQ_CENTROIDS, max(live_vectors, 2)),
+                )
+                index = IvfPqIndex(self._dimensions, ivf_config, pq_config, use_residuals=False)
+            else:
+                index = IvfIndex(self._dimensions, ivf_config)
 
             training_data, count = self._collect_training_vectors()
             index.add_training_vectors(training_data, num_vectors=count)
@@ -227,6 +292,8 @@ class VectorIndex:
                 index.insert(vector_id, vector)
 
             self._index = index
+            self._index_algorithm = algorithm
+            self._trained_live_count = count
             self._needs_training = False
         finally:
             self._is_building = False
@@ -282,6 +349,7 @@ class VectorIndex:
             "metric": self._metric,
             "indexTrained": self._index.trained if self._index is not None else False,
             "indexClusters": index_stats.n_clusters if index_stats is not None else None,
+            "indexAlgorithm": self._index_algorithm,
         }
 
     def clear(self) -> None:
@@ -292,6 +360,8 @@ class VectorIndex:
         self._node_ref_cache.clear()
         self._next_vector_id = 0
         self._index = None
+        self._index_algorithm = None
+        self._trained_live_count = 0
         self._needs_training = True
         self._manifest_cache = None
         self._manifest_dirty = True
@@ -312,6 +382,10 @@ class VectorIndex:
         node_ref = NodeRef(id=node_id, key=key, node_def=node_def)
         self._node_ref_cache.set(node_id, node_ref)
         return node_ref
+
+    def _resolve_algorithm(self, live_vectors: int) -> str:
+        """The backend a build with ``live_vectors`` live vectors uses."""
+        return resolve_ann_algorithm(self._ann_algorithm, self._dimensions, live_vectors)
 
     def _coerce_vector(self, vector: Sequence[float]) -> List[float]:
         return [float(v) for v in vector]
@@ -375,10 +449,15 @@ class VectorIndex:
             return []
 
         search_options = None
-        if options.n_probe is not None or options.threshold is not None:
+        if (
+            options.n_probe is not None
+            or options.threshold is not None
+            or options.rerank_factor is not None
+        ):
             search_options = SearchOptions(
                 n_probe=options.n_probe,
                 threshold=options.threshold,
+                rerank_factor=options.rerank_factor,
             )
 
         manifest_json = self._build_manifest_json()
@@ -495,6 +574,7 @@ class VectorIndex:
                 threshold=kwargs.get("threshold"),
                 n_probe=kwargs.get("n_probe"),
                 filter=kwargs.get("filter"),
+                rerank_factor=kwargs.get("rerank_factor"),
             )
         return options
 

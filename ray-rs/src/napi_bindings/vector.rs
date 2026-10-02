@@ -8,9 +8,10 @@ use std::borrow::Cow;
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::api::vector_search::{
-  SimilarOptions as RustSimilarOptions, VectorIndex as RustVectorIndex,
-  VectorIndexError as RustVectorIndexError, VectorIndexOptions as RustVectorIndexOptions,
-  VectorIndexStats as RustVectorIndexStats, VectorSearchHit as RustVectorSearchHit,
+  AnnAlgorithm as RustAnnAlgorithm, SimilarOptions as RustSimilarOptions,
+  VectorIndex as RustVectorIndex, VectorIndexError as RustVectorIndexError,
+  VectorIndexOptions as RustVectorIndexOptions, VectorIndexStats as RustVectorIndexStats,
+  VectorSearchHit as RustVectorSearchHit,
 };
 use crate::napi_bindings::database::BlockingTask;
 use crate::napi_bindings::validation;
@@ -941,6 +942,42 @@ pub fn brute_force_search(
 // High-level VectorIndex API
 // =============================================================================
 
+/// ANN backend for `VectorIndex`
+#[napi(string_enum)]
+#[derive(Debug, PartialEq, Eq)]
+pub enum JsAnnAlgorithm {
+  /// Plain IVF: exact distances over the probed clusters
+  #[napi(value = "ivf")]
+  Ivf,
+  /// IVF-PQ: PQ-ranked candidates re-ranked by exact distance
+  #[napi(value = "ivf_pq")]
+  IvfPq,
+  /// Plain IVF while the index is small or under 512 dimensions, IVF-PQ from
+  /// 512 dimensions and 50,000 vectors on (the default)
+  #[napi(value = "auto")]
+  Auto,
+}
+
+impl From<JsAnnAlgorithm> for RustAnnAlgorithm {
+  fn from(algorithm: JsAnnAlgorithm) -> Self {
+    match algorithm {
+      JsAnnAlgorithm::Ivf => RustAnnAlgorithm::Ivf,
+      JsAnnAlgorithm::IvfPq => RustAnnAlgorithm::IvfPq,
+      JsAnnAlgorithm::Auto => RustAnnAlgorithm::Auto,
+    }
+  }
+}
+
+impl From<RustAnnAlgorithm> for JsAnnAlgorithm {
+  fn from(algorithm: RustAnnAlgorithm) -> Self {
+    match algorithm {
+      RustAnnAlgorithm::Ivf => JsAnnAlgorithm::Ivf,
+      RustAnnAlgorithm::IvfPq => JsAnnAlgorithm::IvfPq,
+      RustAnnAlgorithm::Auto => JsAnnAlgorithm::Auto,
+    }
+  }
+}
+
 /// Options for creating a vector index
 #[napi(object)]
 pub struct VectorIndexOptions {
@@ -960,6 +997,10 @@ pub struct VectorIndexOptions {
   pub training_threshold: Option<i32>,
   /// @deprecated No effect: `VectorIndex` keeps no node cache. Still accepted so existing callers keep working.
   pub cache_max_size: Option<i32>,
+  /// ANN backend (default: 'auto': plain IVF while the index is small or
+  /// under 512 dimensions, IVF-PQ from 512 dimensions and 50,000 vectors on;
+  /// decided at each build)
+  pub ann_algorithm: Option<JsAnnAlgorithm>,
 }
 
 impl VectorIndexOptions {
@@ -1039,6 +1080,10 @@ impl VectorIndexOptions {
       options = options.with_normalize(normalize);
     }
 
+    if let Some(algorithm) = self.ann_algorithm {
+      options = options.with_ann_algorithm(algorithm.into());
+    }
+
     Ok(options)
   }
 }
@@ -1103,6 +1148,9 @@ pub struct VectorIndexStats {
   pub metric: JsDistanceMetric,
   pub index_trained: bool,
   pub index_clusters: Option<i32>,
+  /// Backend of the built ANN index ('ivf' or 'ivf_pq'; absent before one is
+  /// built)
+  pub index_algorithm: Option<JsAnnAlgorithm>,
 }
 
 impl From<RustVectorIndexStats> for VectorIndexStats {
@@ -1114,6 +1162,7 @@ impl From<RustVectorIndexStats> for VectorIndexStats {
       metric: stats.metric.into(),
       index_trained: stats.index_trained,
       index_clusters: stats.index_clusters.map(|v| v as i32),
+      index_algorithm: stats.index_algorithm.map(JsAnnAlgorithm::from),
     }
   }
 }
@@ -1372,6 +1421,7 @@ mod tests {
       }),
       training_threshold: None,
       cache_max_size: None,
+      ann_algorithm: None,
     };
     let seeded = options(Some(42.0)).into_rust().expect("valid options");
     assert_eq!(seeded.seed, Some(42));
@@ -1394,6 +1444,7 @@ mod tests {
       ivf: None,
       training_threshold: Some(1),
       cache_max_size: Some(0),
+      ann_algorithm: Some(JsAnnAlgorithm::IvfPq),
     }
     .into_rust()
     .is_ok());
@@ -1406,6 +1457,7 @@ mod tests {
       ivf: None,
       training_threshold: None,
       cache_max_size: None,
+      ann_algorithm: None,
     }
     .into_rust()
     .is_err());

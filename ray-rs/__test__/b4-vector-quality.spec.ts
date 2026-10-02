@@ -77,7 +77,12 @@ for (const { metric, query, vector, distance } of cases) {
 
 // VQ1 plumbing: the IVF-PQ re-rank option reaches the native search.
 test('b4 VQ1: VectorIndex.search takes rerankFactor and returns exact distances by default', (t) => {
-  const index = createVectorIndex({ dimensions: 4, metric: 'Euclidean' as any, trainingThreshold: 64 })
+  const index = createVectorIndex({
+    dimensions: 4,
+    metric: 'Euclidean' as any,
+    trainingThreshold: 64,
+    annAlgorithm: 'ivf_pq' as any,
+  })
   const vectors: number[][] = []
   for (let i = 0; i < 64; i++) {
     const vector = [Math.sin(i), Math.cos(i * 1.3), Math.sin(i * 0.7), Math.cos(i * 0.2)]
@@ -126,4 +131,43 @@ test('b4 VQ3: seeded IVF and IVF-PQ builds serialize identically', (t) => {
     t.false(build(5, pq).equals(build(6, pq)), `pq=${pq}: the seed has no effect`)
   }
   t.throws(() => new native.JsIvfIndex(8, { seed: -1 }), { message: /seed/ })
+})
+
+// annAlgorithm: Node users choose the VectorIndex backend.
+const backendData = (count: number, dims: number) => {
+  const vectors: number[][] = []
+  for (let i = 0; i < count; i++) {
+    const blob = i % 10
+    vectors.push(Array.from({ length: dims }, (_, d) => Math.sin(blob * 5 + d) * 4 + Math.sin(i * 7.3 + d * 1.7)))
+  }
+  return vectors
+}
+
+const euclidean = (a: number[], b: number[]) => Math.hypot(...a.map((v, d) => v - b[d]))
+
+test('b4: VectorIndex annAlgorithm builds and searches with either backend', (t) => {
+  const vectors = backendData(1500, 16)
+  for (const annAlgorithm of ['ivf', 'ivf_pq', 'auto']) {
+    const index = createVectorIndex({ dimensions: 16, metric: 'Euclidean' as any, annAlgorithm: annAlgorithm as any })
+    vectors.forEach((vector, node) => index.set(node, vector))
+    index.buildIndex()
+    const stats = index.stats()
+    t.true(stats.indexTrained, annAlgorithm)
+    // Auto picks plain IVF for a small, low-dimensional index.
+    t.is(stats.indexAlgorithm as string, annAlgorithm === 'ivf_pq' ? 'ivf_pq' : 'ivf', annAlgorithm)
+
+    for (const node of [0, 777, 1499]) {
+      const hits = index.search(vectors[node], { k: 5 })
+      t.is(hits.length, 5, annAlgorithm)
+      t.is(hits[0].nodeId, node, `${annAlgorithm}: a stored vector finds itself first`)
+      if (annAlgorithm !== 'ivf_pq') {
+        // Plain IVF ranks by exact distance.
+        for (const hit of hits) {
+          const exact = euclidean(vectors[node], vectors[hit.nodeId])
+          t.true(Math.abs(hit.distance - exact) < 1e-4 * Math.max(1, exact), `${hit.distance} vs exact ${exact}`)
+        }
+      }
+    }
+  }
+  t.throws(() => createVectorIndex({ dimensions: 16, annAlgorithm: 'hnsw' as any }))
 })

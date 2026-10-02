@@ -1058,6 +1058,13 @@ class BruteForceResult:
     distance: float
     similarity: float
 
+def resolve_ann_algorithm(algorithm: str, dimensions: int, live_vectors: int) -> str:
+    """The backend ``algorithm`` ("auto", "ivf" or "ivf_pq") builds for a
+    vector index of ``dimensions`` with ``live_vectors`` live vectors: "ivf" or
+    "ivf_pq". "auto" picks IVF-PQ from 512 dimensions and 50,000 vectors on,
+    plain IVF otherwise."""
+    ...
+
 def brute_force_search(
     vectors: List[List[float]],
     node_ids: List[int],

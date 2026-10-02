@@ -31,7 +31,8 @@ pub use traversal::{
 };
 
 pub use vector::{
-  brute_force_search, create_vector_index, JsAggregation, JsBruteForceResult, JsDistanceMetric,
-  JsIvfConfig, JsIvfIndex, JsIvfPqIndex, JsIvfStats, JsPqConfig, JsSearchOptions, JsSearchResult,
-  SimilarOptions, VectorIndex, VectorIndexOptions, VectorIndexStats, VectorSearchHit,
+  brute_force_search, create_vector_index, JsAggregation, JsAnnAlgorithm, JsBruteForceResult,
+  JsDistanceMetric, JsIvfConfig, JsIvfIndex, JsIvfPqIndex, JsIvfStats, JsPqConfig, JsSearchOptions,
+  JsSearchResult, SimilarOptions, VectorIndex, VectorIndexOptions, VectorIndexStats,
+  VectorSearchHit,
 };
