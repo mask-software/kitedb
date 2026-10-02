@@ -779,7 +779,11 @@ def test_y10_untrusted_xfcc_header_does_not_authorize(mode):
     auth = _load_auth()
     config = auth.ReplicationAdminAuthConfig(mode=mode, token="abc123")
     request = _Request(headers={"x-forwarded-client-cert": "CN=attacker"})
-    assert not auth.is_replication_admin_authorized(request, config)
+    try:
+        allowed = auth.is_replication_admin_authorized(request, config)
+    except ValueError:
+        return  # rejecting the config outright is also acceptable
+    assert not allowed
 
 
 def test_y10_trusted_xfcc_without_subject_match_is_denied():
@@ -814,6 +818,73 @@ def test_y10_trusted_xfcc_subject_match_is_anchored():
     assert not auth.is_replication_admin_authorized(spoofed, config), (
         "unanchored subject regex matched inside an attacker-controlled value"
     )
+
+
+# Y10 follow-up (parity with the TS helper fix, napi-ts 19a36ad): a missing
+# mode allowed everything, tokens of different lengths compared in variable
+# time, and mTLS configs that can't be checked safely were accepted.
+
+
+def test_y10_config_without_mode_is_rejected():
+    auth = _load_auth()
+    request = _Request(headers={"authorization": "Bearer anything"})
+    with pytest.raises((ValueError, TypeError), match="(?i)mode"):
+        auth.is_replication_admin_authorized(request, auth.ReplicationAdminAuthConfig())
+    with pytest.raises((ValueError, TypeError), match="(?i)mode"):
+        auth.create_replication_admin_authorizer(auth.ReplicationAdminAuthConfig(token="abc123"))
+    # Disabling auth stays possible, but only explicitly.
+    assert auth.is_replication_admin_authorized(
+        _Request(), auth.ReplicationAdminAuthConfig(mode="none")
+    )
+
+
+def test_y10_token_compare_uses_fixed_length_digests(monkeypatch):
+    # compare_digest leaks length differences, so both sides must be
+    # fixed-length (SHA-256) digests, not the raw header and token.
+    calls = []
+    real = hmac.compare_digest
+
+    def spy(a, b):
+        calls.append((a, b))
+        return real(a, b)
+
+    monkeypatch.setattr(hmac, "compare_digest", spy)
+    auth = _load_auth()
+    config = auth.ReplicationAdminAuthConfig(mode="token", token="abc123")
+    assert auth.is_replication_admin_authorized(
+        _Request(headers={"authorization": "Bearer abc123"}), config
+    )
+    assert not auth.is_replication_admin_authorized(
+        _Request(headers={"authorization": "Bearer a-much-longer-wrong-token"}), config
+    )
+    assert calls, "token was not compared with hmac.compare_digest"
+    assert all(len(a) == len(b) == 32 for a, b in calls), (
+        f"compared values are not SHA-256 digests: {calls}"
+    )
+
+
+@pytest.mark.parametrize("mode", ["mtls", "token_or_mtls", "token_and_mtls"])
+def test_y10_mtls_mode_without_a_check_is_rejected(mode):
+    # An mTLS mode needs a matcher or a trusted header plus subject regex;
+    # anything else is a misconfiguration and raises instead of quietly
+    # trusting (or quietly denying) every request.
+    auth = _load_auth()
+    config = auth.ReplicationAdminAuthConfig(mode=mode, token="abc123")
+    with pytest.raises(ValueError, match="(?i)mtls"):
+        auth.is_replication_admin_authorized(_Request(), config)
+    with pytest.raises(ValueError, match="(?i)mtls"):
+        auth.create_replication_admin_authorizer(config)
+    # Either check satisfies the mode.
+    auth.create_replication_admin_authorizer(
+        auth.ReplicationAdminAuthConfig(mode=mode, token="abc123", mtls_matcher=lambda r: False)
+    )
+
+
+def test_y10_trusted_header_requires_subject_regex():
+    auth = _load_auth()
+    config = auth.ReplicationAdminAuthConfig(mode="mtls", trust_forwarded_client_cert=True)
+    with pytest.raises(ValueError, match="(?i)mtls_subject_regex"):
+        auth.create_replication_admin_authorizer(config)
 
 
 # ============================================================================
