@@ -338,6 +338,12 @@ impl TxManager {
       .retain(|(commit_ts, key)| committed_writes.get(key) == Some(commit_ts));
   }
 
+  /// Wall clock entries kept for the retention horizon (test instrumentation)
+  #[cfg(test)]
+  pub(crate) fn wall_clock_len(&self) -> usize {
+    self.commit_ts_to_wall_clock.len()
+  }
+
   /// Length of the commit-order log behind pruning (test instrumentation)
   #[cfg(test)]
   pub(crate) fn committed_writes_log_len(&self) -> usize {

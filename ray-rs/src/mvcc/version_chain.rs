@@ -33,6 +33,19 @@ use crate::types::{
   Timestamp, TxId, TxKey,
 };
 
+#[cfg(test)]
+thread_local! {
+  /// Chain keys the `*_keys` lookups examined on this thread (test instrumentation).
+  pub(crate) static KEYS_EXAMINED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Count one chain key examined by a `*_keys` lookup (test instrumentation).
+#[inline]
+fn examined_key() {
+  #[cfg(test)]
+  KEYS_EXAMINED.with(|count| count.set(count.get() + 1));
+}
+
 // ============================================================================
 // SOA Property Versions
 // ============================================================================
@@ -684,6 +697,7 @@ impl VersionChainManager {
 
     if self.use_soa {
       for key in self.soa_node_props.keys() {
+        examined_key();
         if let TxKey::NodeProp {
           node_id: key_node_id,
           key_id,
@@ -718,6 +732,7 @@ impl VersionChainManager {
 
     if self.use_soa {
       for key in self.soa_node_labels.keys() {
+        examined_key();
         if let TxKey::NodeLabel {
           node_id: key_node_id,
           label_id,
@@ -752,6 +767,7 @@ impl VersionChainManager {
 
     if self.use_soa {
       for key in self.soa_edge_props.keys() {
+        examined_key();
         if let TxKey::EdgeProp {
           src: key_src,
           etype: key_etype,

@@ -65,6 +65,10 @@ pub mod visibility;
 #[path = "b4_mvcc_tests.rs"]
 mod b4_mvcc_tests;
 
+#[cfg(test)]
+#[path = "b4_mvcc_phase2_tests.rs"]
+mod b4_mvcc_phase2_tests;
+
 // Re-export main types for convenience
 pub use conflict::{ConflictDetector, ConflictError, ConflictInfo, ConflictType};
 pub use gc::{GarbageCollector, GcConfig, GcResult, GcStats, SharedGcState};
