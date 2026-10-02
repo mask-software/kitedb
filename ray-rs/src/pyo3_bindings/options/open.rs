@@ -165,6 +165,12 @@ pub struct OpenOptions {
   pub cache_query_ttl_ms: Option<i64>,
   /// Sync mode: "full", "normal", or "off"
   pub sync_mode: Option<SyncMode>,
+  /// macOS only: in full sync mode, sync with F_FULLFSYNC so commits survive
+  /// power loss; much slower (milliseconds per commit). Default False: full
+  /// mode then survives crashes but not power loss on macOS, like SQLite's
+  /// default.
+  #[pyo3(get, set)]
+  pub full_fsync: Option<bool>,
   /// Enable group commit (coalesce WAL flushes across commits)
   #[pyo3(get, set)]
   pub group_commit_enabled: Option<bool>,
@@ -228,6 +234,7 @@ impl OpenOptions {
         cache_max_query_entries=None,
         cache_query_ttl_ms=None,
         sync_mode=None,
+        full_fsync=None,
         group_commit_enabled=None,
         group_commit_window_ms=None,
         snapshot_parse_mode=None,
@@ -262,6 +269,7 @@ impl OpenOptions {
     cache_max_query_entries: Option<i64>,
     cache_query_ttl_ms: Option<i64>,
     sync_mode: Option<SyncMode>,
+    full_fsync: Option<bool>,
     group_commit_enabled: Option<bool>,
     group_commit_window_ms: Option<i64>,
     snapshot_parse_mode: Option<SnapshotParseMode>,
@@ -295,6 +303,7 @@ impl OpenOptions {
       cache_max_query_entries,
       cache_query_ttl_ms,
       sync_mode,
+      full_fsync,
       group_commit_enabled,
       group_commit_window_ms,
       snapshot_parse_mode,
@@ -460,6 +469,9 @@ impl OpenOptions {
     if let Some(sync) = self.sync_mode {
       rust_opts = rust_opts.sync_mode(sync.mode);
     }
+    if let Some(full_fsync) = self.full_fsync {
+      rust_opts = rust_opts.full_fsync(full_fsync);
+    }
     if let Some(enabled) = self.group_commit_enabled {
       rust_opts = rust_opts.group_commit_enabled(enabled);
     }
@@ -556,6 +568,7 @@ impl OpenOptions {
       sync_mode: Some(SyncMode {
         mode: opts.sync_mode,
       }),
+      full_fsync: None,
       group_commit_enabled: Some(opts.group_commit_enabled),
       group_commit_window_ms: i64::try_from(opts.group_commit_window_ms).ok(),
       snapshot_parse_mode: None,
@@ -651,11 +664,13 @@ mod tests {
       page_size: Some(8192),
       group_commit_enabled: Some(true),
       group_commit_window_ms: Some(5),
+      full_fsync: Some(true),
       ..Default::default()
     };
     let rust_opts: RustOpenOptions = opts.try_into().expect("expected value");
     assert!(rust_opts.read_only);
     assert!(!rust_opts.create_if_missing);
+    assert!(rust_opts.full_fsync);
     assert!(rust_opts.group_commit_enabled);
     assert_eq!(rust_opts.group_commit_window_ms, 5);
   }

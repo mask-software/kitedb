@@ -16,6 +16,17 @@ use crate::constants::{
 };
 use crate::error::{KiteError, Result};
 
+#[cfg(test)]
+thread_local! {
+  /// Test probe: the OS primitive each `FilePager` sync on this thread issued,
+  /// oldest first. "fsync" is plain fsync(2), which on macOS leaves data in
+  /// the drive's volatile cache; "F_FULLFSYNC" is fcntl(F_FULLFSYNC) (macOS),
+  /// and "sync_all" is `File::sync_all` (other platforms). New sync
+  /// primitives should log here too.
+  pub(crate) static SYNC_PRIMITIVE_LOG: std::cell::RefCell<Vec<&'static str>> =
+    const { std::cell::RefCell::new(Vec::new()) };
+}
+
 static DATABASE_FILE_LOCKS: OnceLock<Mutex<HashMap<PathBuf, InProcessLockState>>> = OnceLock::new();
 const WRITABLE_OPEN_MAX_ATTEMPTS: usize = 4;
 
@@ -178,6 +189,9 @@ pub struct FilePager {
   deferred_free_pages: HashSet<u32>,
   /// Cached mmap for the entire file (lazily created)
   mmap: Option<Mmap>,
+  /// Make [`Self::sync`] flush the drive's write cache too (`F_FULLFSYNC` on
+  /// macOS); see [`Self::set_full_fsync`].
+  full_fsync: bool,
 }
 
 impl FilePager {
@@ -204,6 +218,7 @@ impl FilePager {
       free_pages: HashSet::new(),
       deferred_free_pages: HashSet::new(),
       mmap: None,
+      full_fsync: false,
     })
   }
 
@@ -219,6 +234,7 @@ impl FilePager {
       free_pages: HashSet::new(),
       deferred_free_pages: HashSet::new(),
       mmap: None,
+      full_fsync: false,
     }
   }
 
@@ -502,6 +518,19 @@ impl FilePager {
     Ok(())
   }
 
+  /// Make every [`Self::sync`] durable against power loss, not just against
+  /// a process or OS crash (`SingleFileOpenOptions::full_fsync` with
+  /// `SyncMode::Full`).
+  ///
+  /// On macOS, fsync(2) hands data to the drive, whose volatile write cache
+  /// can still lose it or persist it out of order (a header before the WAL
+  /// or snapshot pages it names); `F_FULLFSYNC` flushes that cache too, at a
+  /// cost of milliseconds per sync. Elsewhere `File::sync_all` is used either
+  /// way.
+  pub fn set_full_fsync(&mut self, full_fsync: bool) {
+    self.full_fsync = full_fsync;
+  }
+
   /// Sync file to disk
   pub fn sync(&self) -> Result<()> {
     if self.read_only {
@@ -510,6 +539,16 @@ impl FilePager {
     #[cfg(target_os = "macos")]
     {
       use std::os::unix::io::AsRawFd;
+      // F_FULLFSYNC fails on file systems without it (some network and FUSE
+      // mounts); fall back to fsync there, as SQLite does.
+      // SAFETY: file descriptor is valid for the pager file.
+      if self.full_fsync && unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_FULLFSYNC) } == 0 {
+        #[cfg(test)]
+        SYNC_PRIMITIVE_LOG.with(|log| log.borrow_mut().push("F_FULLFSYNC"));
+        return Ok(());
+      }
+      #[cfg(test)]
+      SYNC_PRIMITIVE_LOG.with(|log| log.borrow_mut().push("fsync"));
       // SAFETY: file descriptor is valid for the pager file.
       let result = unsafe { libc::fsync(self.file.as_raw_fd()) };
       if result != 0 {
@@ -519,6 +558,8 @@ impl FilePager {
 
     #[cfg(not(target_os = "macos"))]
     {
+      #[cfg(test)]
+      SYNC_PRIMITIVE_LOG.with(|log| log.borrow_mut().push("sync_all"));
       self.file.sync_all()?;
     }
     Ok(())
@@ -754,6 +795,7 @@ pub(crate) fn create_pager_with_locking<P: AsRef<Path>>(
       free_pages: HashSet::new(),
       deferred_free_pages: HashSet::new(),
       mmap: None,
+      full_fsync: false,
     });
   }
   Err(KiteError::LockFailed(format!(
@@ -952,5 +994,93 @@ mod tests {
     assert!(
       locked_file_matches_path(&current_file, &database_path).expect("expected identity check")
     );
+  }
+}
+
+/// Wave-2 `wal-format` W7: `SyncMode::Full` with `full_fsync` must survive
+/// power loss. Plain fsync(2) on macOS only hands data to the drive, whose
+/// volatile cache can lose it or persist it out of order (the header page
+/// before the WAL page it names, or before the snapshot it points to).
+/// `full_fsync` is opt-in (off by default, like SQLite's `fullfsync`).
+#[cfg(test)]
+mod w2_tests {
+  use super::SYNC_PRIMITIVE_LOG;
+  use crate::core::single_file::{open_single_file, SingleFileOpenOptions, SyncMode};
+
+  /// The sync primitives `run` issued on this thread.
+  fn syncs_during(run: impl FnOnce()) -> Vec<&'static str> {
+    SYNC_PRIMITIVE_LOG.with(|log| log.borrow_mut().clear());
+    run();
+    SYNC_PRIMITIVE_LOG.with(|log| log.borrow_mut().drain(..).collect())
+  }
+
+  fn assert_drive_cache_flushed(what: &str, syncs: &[&str]) {
+    assert!(!syncs.is_empty(), "{what}: issued no sync at all");
+    assert!(
+      syncs.iter().all(|primitive| *primitive != "fsync"),
+      "{what}: used plain fsync, which on macOS leaves the data in the drive cache (power \
+       loss can drop it, or persist a header before the pages it names): {syncs:?}"
+    );
+  }
+
+  #[test]
+  fn w7_full_sync_mode_commit_flushes_the_drive_cache() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let options = SingleFileOpenOptions::new()
+      .auto_checkpoint(false)
+      .sync_mode(SyncMode::Full)
+      .full_fsync(true);
+    let db = open_single_file(dir.path().join("w7-commit.kitedb"), options).expect("open");
+    let syncs = syncs_during(|| {
+      db.begin(false).expect("begin");
+      db.create_node(Some("n")).expect("node");
+      db.commit().expect("commit");
+    });
+    assert_drive_cache_flushed("SyncMode::Full commit", &syncs);
+  }
+
+  #[test]
+  fn w7_full_sync_mode_checkpoint_flushes_the_drive_cache() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let options = SingleFileOpenOptions::new()
+      .auto_checkpoint(false)
+      .sync_mode(SyncMode::Full)
+      .full_fsync(true);
+    let db = open_single_file(dir.path().join("w7-checkpoint.kitedb"), options).expect("open");
+    db.begin(false).expect("begin");
+    db.create_node(Some("n")).expect("node");
+    db.commit().expect("commit");
+    let syncs = syncs_during(|| db.checkpoint().expect("checkpoint"));
+    assert_drive_cache_flushed("SyncMode::Full checkpoint", &syncs);
+  }
+
+  /// Without the option, Full mode keeps the plain sync primitive (fast, not
+  /// power-loss durable on macOS), and the option never affects Normal mode.
+  #[test]
+  fn w7_full_fsync_is_opt_in_and_only_for_full_mode() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cases = [
+      ("default Full", SyncMode::Full, false),
+      ("Normal with full_fsync", SyncMode::Normal, true),
+    ];
+    for (what, mode, full_fsync) in cases {
+      let options = SingleFileOpenOptions::new()
+        .auto_checkpoint(false)
+        .sync_mode(mode)
+        .full_fsync(full_fsync);
+      let path = dir.path().join(format!("w7-{mode:?}.kitedb"));
+      let db = open_single_file(path, options).expect("open");
+      let syncs = syncs_during(|| {
+        db.begin(false).expect("begin");
+        db.create_node(Some("n")).expect("node");
+        db.commit().expect("commit");
+        db.checkpoint().expect("checkpoint");
+      });
+      assert!(!syncs.is_empty(), "{what}: issued no sync at all");
+      assert!(
+        !syncs.contains(&"F_FULLFSYNC"),
+        "{what}: used F_FULLFSYNC: {syncs:?}"
+      );
+    }
   }
 }

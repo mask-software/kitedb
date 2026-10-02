@@ -48,8 +48,10 @@ use super::{BackgroundCheckpointState, SchemaReservations, SingleFileDB};
 /// Similar to SQLite's PRAGMA synchronous setting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SyncMode {
-  /// Fsync on every commit (durable to OS, slowest)
-  /// On macOS this uses fsync for parity with Node/Bun.
+  /// Fsync on every commit (durable to OS, slowest).
+  /// On macOS, fsync leaves writes in the drive's volatile cache, so without
+  /// [`SingleFileOpenOptions::full_fsync`] this mode does not survive power
+  /// loss there (the same as SQLite's default).
   #[default]
   Full,
 
@@ -110,6 +112,9 @@ pub struct SingleFileOpenOptions {
   pub checkpoint_compression: Option<CompressionOptions>,
   /// Synchronization mode for WAL writes (default: Full)
   pub sync_mode: SyncMode,
+  /// macOS only: with `SyncMode::Full`, sync with `F_FULLFSYNC` so commits
+  /// survive power loss (default false). See [`Self::full_fsync`].
+  pub full_fsync: bool,
   /// Enable group commit (coalesce WAL flushes across commits)
   pub group_commit_enabled: bool,
   /// Group commit window in milliseconds
@@ -160,6 +165,7 @@ impl Default for SingleFileOpenOptions {
         ..Default::default()
       }),
       sync_mode: SyncMode::Full,
+      full_fsync: false,
       group_commit_enabled: false,
       group_commit_window_ms: 2,
       snapshot_parse_mode: SnapshotParseMode::Strict,
@@ -273,6 +279,22 @@ impl SingleFileOpenOptions {
 
   pub fn sync_mode(mut self, mode: SyncMode) -> Self {
     self.sync_mode = mode;
+    self
+  }
+
+  /// macOS only: make `SyncMode::Full` durable against power loss (default
+  /// false), like SQLite's `PRAGMA fullfsync`.
+  ///
+  /// On macOS, fsync(2) hands writes to the drive, whose volatile cache can
+  /// lose them, or persist a header before the pages it names, if power
+  /// fails. With this option every sync in `SyncMode::Full` uses
+  /// `F_FULLFSYNC`, which flushes that cache too (falling back to fsync on
+  /// file systems without it). It is much slower: milliseconds per commit
+  /// instead of tens of microseconds. Without it, Full mode on macOS survives
+  /// application and OS crashes but not power loss, the same as SQLite's
+  /// default. Other modes, and other platforms, are unaffected.
+  pub fn full_fsync(mut self, value: bool) -> Self {
+    self.full_fsync = value;
     self
   }
 
@@ -924,10 +946,15 @@ fn open_single_file_internal(
   let (mut pager, mut header, is_new, mut header_slot) = if file_exists {
     // Open existing database
     let mut pager = open_pager_with_locking(path, options.page_size, options.read_only, lock_file)?;
+    pager.set_full_fsync(options.full_fsync && options.sync_mode == SyncMode::Full);
 
     // Read both independently checksummed header pages and select the newest
     // valid generation. A torn newest slot falls back to the other slot.
     let (header, header_slot) = read_header_slots(&mut pager)?;
+
+    // Refuse a format this build cannot read, or (writable) cannot write,
+    // before anything below rewrites the file.
+    header.check_supported(!options.read_only)?;
 
     // Files created before the dual-page format have WAL at page one. Migrate
     // through a separately checkpointed file; an in-place shift would destroy
@@ -954,6 +981,7 @@ fn open_single_file_internal(
   } else {
     // Create new database
     let mut pager = create_pager_with_locking(path, options.page_size, lock_file)?;
+    pager.set_full_fsync(options.full_fsync && options.sync_mode == SyncMode::Full);
 
     // Calculate WAL page count
     let wal_size = options.wal_size.unwrap_or(WAL_DEFAULT_SIZE);
@@ -1437,12 +1465,12 @@ fn migrate_legacy_single_header(
   {
     let mut header = temp.header.write();
     // Exact semantic-field audit. Layout fields (db/snapshot/WAL locations and
-    // heads) intentionally belong to the fresh dual-header file. Generation
-    // and change counters advance once when checkpoint installs the snapshot.
+    // heads) intentionally belong to the fresh dual-header file, and so do the
+    // format fields (version, min_reader_version, and the WAL salts): it is
+    // written in the current format. Generation and change counters advance
+    // once when checkpoint installs the snapshot.
     header.magic = legacy_header.magic;
     header.page_size = legacy_header.page_size;
-    header.version = legacy_header.version;
-    header.min_reader_version = legacy_header.min_reader_version;
     header.flags = legacy_header.flags;
     header.change_counter = legacy_header.change_counter;
     header.active_snapshot_gen = legacy_header.active_snapshot_gen;
@@ -1455,8 +1483,9 @@ fn migrate_legacy_single_header(
     header.last_commit_ts = legacy_header.last_commit_ts;
     header.schema_cookie = legacy_header.schema_cookie;
     // db_size_pages, snapshot_start_page/count, wal_start_page/count,
-    // wal_head/tail, wal_primary/secondary_head, active_wal_region, and
-    // checkpoint_in_progress are fresh-layout state and remain initialized.
+    // wal_head/tail, wal_primary/secondary_head, active_wal_region,
+    // checkpoint_in_progress, version, min_reader_version, and
+    // wal_primary/secondary_salt are fresh-file state and remain initialized.
   }
 
   let migration_result = (|| {
@@ -1547,7 +1576,8 @@ mod tests {
   use crate::core::single_file::{
     close_single_file, close_single_file_with_options, SingleFileCloseOptions,
   };
-  use crate::core::wal::record::parse_wal_record;
+  use crate::core::wal::buffer::header_salt_at;
+  use crate::core::wal::record::{apply_wal_salt, parse_wal_record_with_salt};
   use crate::util::binary::{align_up, read_u32};
   use std::io::Write;
   use tempfile::tempdir;
@@ -1601,7 +1631,7 @@ mod tests {
     source.commit().expect("commit WAL-only transaction");
 
     let current_header = source.header.read().clone();
-    let (wal_bytes, snapshot_bytes) = {
+    let (mut wal_bytes, snapshot_bytes) = {
       let mut pager = source.pager.lock();
       let mut wal = Vec::new();
       for page in 0..current_header.wal_page_count as u32 {
@@ -1622,7 +1652,17 @@ mod tests {
       (wal, snapshot)
     };
 
+    // Legacy single-header files are format 1: unsalted WAL records.
+    let live_wal = current_header.wal_tail as usize..current_header.wal_head as usize;
+    assert!(
+      apply_wal_salt(&mut wal_bytes[live_wal], current_header.wal_primary_salt),
+      "unsalt the live WAL records"
+    );
     let mut legacy_header = current_header;
+    legacy_header.version = 1;
+    legacy_header.min_reader_version = 1;
+    legacy_header.wal_primary_salt = 0;
+    legacy_header.wal_secondary_salt = 0;
     legacy_header.wal_start_page = 1;
     legacy_header.snapshot_start_page = 1 + legacy_header.wal_page_count;
     legacy_header.db_size_pages =
@@ -1653,7 +1693,7 @@ mod tests {
       if rec_len == 0 {
         break;
       }
-      if parse_wal_record(&wal_data, pos).is_none() {
+      if parse_wal_record_with_salt(&wal_data, pos, header_salt_at(&header, pos as u64)).is_none() {
         break;
       }
       last_start = Some(pos);
@@ -1829,6 +1869,13 @@ mod tests {
       migrated.header.read().max_node_id,
       legacy_header.max_node_id
     );
+    // The migrated file is written in the current format.
+    assert_eq!(migrated.header.read().version, VERSION_SINGLE_FILE);
+    assert_eq!(
+      migrated.header.read().min_reader_version,
+      MIN_READER_SINGLE_FILE
+    );
+    assert_ne!(migrated.header.read().wal_primary_salt, 0);
     assert!(migrated.header.read().next_tx_id >= legacy_header.next_tx_id);
 
     migrated.begin(false).expect("post-migration transaction");

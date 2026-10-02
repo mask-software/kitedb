@@ -20,12 +20,15 @@ use crate::core::wal::record::{
 use crate::error::Result;
 use crate::types::*;
 
-/// Scan WAL records from the WAL area (linear)
+/// Scan WAL records from the WAL area (linear), from the tail up to the
+/// first record that does not parse with its region's salt or does not end by
+/// the head.
 pub(crate) fn scan_wal_records(
   pager: &mut FilePager,
   header: &DbHeaderV1,
 ) -> Result<Vec<ParsedWalRecord>> {
-  use crate::core::wal::record::parse_wal_record;
+  use crate::core::wal::buffer::header_salt_at;
+  use crate::core::wal::record::parse_wal_record_with_salt;
 
   let mut records = Vec::new();
   let wal_size = header.wal_page_count * header.page_size as u64;
@@ -50,8 +53,10 @@ pub(crate) fn scan_wal_records(
   }
 
   // Read the WAL area into memory for scanning
-  // This is simpler than page-by-page reading for now
-  let wal_data = read_wal_area(pager, header)?;
+  // This is simpler than page-by-page reading for now. Records end by the
+  // head: bytes past it belong to no record the header names.
+  let mut wal_data = read_wal_area(pager, header)?;
+  wal_data.truncate(head as usize);
 
   while pos < head {
     let actual_pos = pos;
@@ -77,7 +82,8 @@ pub(crate) fn scan_wal_records(
     }
 
     // Parse the record
-    if let Some(record) = parse_wal_record(&wal_data, offset) {
+    if let Some(record) = parse_wal_record_with_salt(&wal_data, offset, header_salt_at(header, pos))
+    {
       let aligned_size = crate::util::binary::align_up(rec_len, WAL_RECORD_ALIGNMENT);
       pos = actual_pos + aligned_size as u64;
       records.push(record);
