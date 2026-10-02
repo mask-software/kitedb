@@ -40,58 +40,25 @@
  */
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { Database } from "@kitedb/core";
-import { TextAttributes, type CapturedFrame, type CapturedSpan } from "@opentui/core";
-import { testRender } from "@opentui/solid";
-import { App } from "../src/app.tsx";
+import { TextAttributes, type CapturedFrame } from "@opentui/core";
+import {
+  type Cell,
+  type TestSetup,
+  cellRows,
+  openViaKeys,
+  press,
+  renderApp,
+  rowText,
+  runCleanups,
+  scratchDir,
+  settle,
+  writeFollowsGraph,
+} from "./harness.ts";
 
-type TestSetup = Awaited<ReturnType<typeof testRender>>;
-
-const cleanups: Array<() => void | Promise<void>> = [];
-
-afterEach(async () => {
-  while (cleanups.length > 0) {
-    const cleanup = cleanups.pop()!;
-    await cleanup();
-  }
-});
-
-async function scratchDir(): Promise<string> {
-  const dir = await mkdtemp(join(tmpdir(), "kitedb-tui-b4-"));
-  cleanups.push(() => rm(dir, { recursive: true, force: true }));
-  return dir;
-}
-
-
-async function renderApp(): Promise<TestSetup> {
-  const setup = await testRender(App, { width: 140, height: 45 });
-  cleanups.push(() => setup.renderer.destroy());
-  await setup.renderOnce();
-  return setup;
-}
-
-/** Give the stdin parser time to flush (a lone ESC waits for a possible escape sequence). */
-async function settle(setup: TestSetup): Promise<void> {
-  await Bun.sleep(40);
-  await setup.renderOnce();
-}
-
-async function press(setup: TestSetup, key: string): Promise<void> {
-  setup.mockInput.pressKey(key);
-  await settle(setup);
-}
-
-/** Open a database read-only through the Open path input, as a user would. */
-async function openViaKeys(setup: TestSetup, path: string): Promise<void> {
-  await press(setup, "o");
-  await setup.mockInput.typeText(path);
-  await settle(setup);
-  setup.mockInput.pressEnter();
-  await settle(setup);
-}
+afterEach(runCleanups);
 
 /**
  * Render the app with a read-only database open: user:alice follows user:bob. The database sits
@@ -101,13 +68,7 @@ async function renderOpenDb(): Promise<TestSetup> {
   const dir = join(await scratchDir(), "a-directory-name-long-enough-to-overflow-the-header-column");
   await mkdir(dir);
   const path = join(dir, "graph.kitedb");
-  const db = Database.open(path);
-  db.begin();
-  const alice = db.createNode("user:alice");
-  const bob = db.createNode("user:bob");
-  db.addEdgeByName(alice, "follows", bob);
-  db.commit();
-  db.close();
+  writeFollowsGraph(path);
 
   const setup = await renderApp();
   await openViaKeys(setup, path);
@@ -120,21 +81,6 @@ async function renderUnlockModal(): Promise<TestSetup> {
   const setup = await renderOpenDb();
   await press(setup, "w");
   return setup;
-}
-
-/** One screen cell: its character and the styled span that drew it. */
-interface Cell {
-  char: string;
-  span: CapturedSpan;
-}
-
-/** The frame as rows of cells (every character on screen here is one cell wide). */
-function cellRows(frame: CapturedFrame): Cell[][] {
-  return frame.lines.map((line) => line.spans.flatMap((span) => Array.from(span.text, (char) => ({ char, span }))));
-}
-
-function rowText(row: Cell[]): string {
-  return row.map((cell) => cell.char).join("");
 }
 
 /** The cells showing the first occurrence of `text` on screen. */
