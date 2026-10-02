@@ -28,6 +28,7 @@
 //! checkpoint gate permit and does not count as an open transaction.
 
 use parking_lot::{Condvar, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// How a write transaction holds the writer slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,12 +39,14 @@ pub(crate) enum WriterMode {
   Exclusive,
 }
 
+/// Set in `WriterSlot::word` while an exclusive claim holds or waits for the
+/// slot; the other bits count the shared holders.
+const BLOCKED: usize = 1 << (usize::BITS - 1);
+
 #[derive(Default)]
 struct SlotState {
   /// An exclusive holder has the slot.
   exclusive: bool,
-  /// Shared holders.
-  shared: usize,
   /// Exclusive claims waiting; shared claims wait behind them.
   exclusive_waiting: usize,
   /// Threads waiting in `claim` (test instrumentation).
@@ -51,8 +54,14 @@ struct SlotState {
   waiting: usize,
 }
 
+/// Shared claims, the common case (every MVCC write transaction makes one),
+/// take and release the slot with one atomic operation on `word` while no
+/// exclusive claim holds or waits for it; the rest goes through `state`.
 #[derive(Default)]
 pub(crate) struct WriterSlot {
+  /// The shared holders, and `BLOCKED`, which only changes under `state`'s
+  /// lock: set iff `exclusive || exclusive_waiting > 0`.
+  word: AtomicUsize,
   state: Mutex<SlotState>,
   released: Condvar,
 }
@@ -61,6 +70,23 @@ impl WriterSlot {
   /// Wait until the slot can be held in `mode`, then hold it, until the
   /// returned claim is kept (`WriterClaim::keep`) or dropped.
   pub(crate) fn claim(&self, mode: WriterMode) -> WriterClaim<'_> {
+    if mode == WriterMode::Shared {
+      let mut word = self.word.load(Ordering::Acquire);
+      while word & BLOCKED == 0 {
+        match self
+          .word
+          .compare_exchange_weak(word, word + 1, Ordering::AcqRel, Ordering::Acquire)
+        {
+          Ok(_) => {
+            return WriterClaim {
+              slot: Some(self),
+              mode,
+            }
+          }
+          Err(current) => word = current,
+        }
+      }
+    }
     let mut state = self.state.lock();
     #[cfg(test)]
     {
@@ -71,11 +97,13 @@ impl WriterSlot {
         while state.exclusive || state.exclusive_waiting > 0 {
           self.released.wait(&mut state);
         }
-        state.shared += 1;
+        // `BLOCKED` is clear, and only set under this lock.
+        self.word.fetch_add(1, Ordering::AcqRel);
       }
       WriterMode::Exclusive => {
         state.exclusive_waiting += 1;
-        while state.exclusive || state.shared > 0 {
+        self.word.fetch_or(BLOCKED, Ordering::AcqRel);
+        while state.exclusive || self.word.load(Ordering::Acquire) & !BLOCKED > 0 {
           self.released.wait(&mut state);
         }
         state.exclusive_waiting -= 1;
@@ -98,30 +126,41 @@ impl WriterSlot {
     self.state.lock().waiting
   }
 
+  /// Shared holders (test instrumentation).
+  #[cfg(test)]
+  fn shared(&self) -> usize {
+    self.word.load(Ordering::Acquire) & !BLOCKED
+  }
+
   /// Release the slot held in `mode` by a kept claim.
   pub(crate) fn release(&self, mode: WriterMode) {
-    let mut state = self.state.lock();
-    let wake = match mode {
+    match mode {
       WriterMode::Shared => {
+        let previous = self.word.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(
-          state.shared > 0,
+          previous & !BLOCKED > 0,
           "released a shared writer claim nobody held"
         );
-        state.shared = state.shared.saturating_sub(1);
-        // Only an exclusive claim waits for the shared holders.
-        state.shared == 0 && state.exclusive_waiting > 0
+        // Only an exclusive claim waits for the shared holders. Notifying
+        // under the lock keeps it from missing the wakeup between its check
+        // and its wait.
+        if previous == BLOCKED | 1 {
+          let _state = self.state.lock();
+          self.released.notify_all();
+        }
       }
       WriterMode::Exclusive => {
+        let mut state = self.state.lock();
         debug_assert!(
           state.exclusive,
           "released an exclusive writer claim nobody held"
         );
         state.exclusive = false;
-        true
+        if state.exclusive_waiting == 0 {
+          self.word.fetch_and(!BLOCKED, Ordering::AcqRel);
+        }
+        self.released.notify_all();
       }
-    };
-    if wake {
-      self.released.notify_all();
     }
   }
 }
@@ -174,10 +213,10 @@ mod tests {
     let slot = WriterSlot::default();
     let first = slot.claim(WriterMode::Shared);
     let second = slot.claim(WriterMode::Shared);
-    assert_eq!(slot.state.lock().shared, 2);
+    assert_eq!(slot.shared(), 2);
     drop(first);
     drop(second);
-    assert_eq!(slot.state.lock().shared, 0);
+    assert_eq!(slot.shared(), 0);
   }
 
   /// An exclusive claim waits for the shared holders, shared claims made
@@ -219,6 +258,7 @@ mod tests {
     slot.release(WriterMode::Exclusive);
     waiter.join().expect("waiter");
     let state = slot.state.lock();
-    assert!(!state.exclusive && state.shared == 0 && state.exclusive_waiting == 0);
+    assert!(!state.exclusive && slot.shared() == 0 && state.exclusive_waiting == 0);
+    assert_eq!(slot.word.load(Ordering::Acquire), 0);
   }
 }
