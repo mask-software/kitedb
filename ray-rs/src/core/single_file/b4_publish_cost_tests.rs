@@ -324,6 +324,36 @@ fn reads_go_on_until_a_commit_merges() {
   assert!(db.node_by_key("during").is_some());
 }
 
+/// The creation runs commits record are dropped as soon as every open snapshot
+/// sees them, not only by the next GC run (5 s by default): each commit
+/// inserts its runs into one ordered map that every old reader's existence
+/// checks and node counts walk. Regression: with writers committing beside
+/// short readers, they piled up, one per commit, until GC.
+#[test]
+fn creation_runs_go_once_every_snapshot_sees_them() {
+  let dir = tempdir().expect("tempdir");
+  let db = open(&dir);
+  seed(&db);
+  let mut reader = Reader::begin(&db);
+  for i in 0..100 {
+    db.begin(false).expect("begin");
+    db.create_node(Some(&format!("n{i}"))).expect("create");
+    db.commit().expect("commit");
+    // A newer reader takes over, so the older commits' runs are seen by all.
+    let newer = Reader::begin(&db);
+    drop(std::mem::replace(&mut reader, newer));
+  }
+  let runs = db
+    .mvcc
+    .as_ref()
+    .expect("mvcc")
+    .version_chain
+    .read()
+    .counts()
+    .node_creation_runs;
+  assert!(runs <= 2, "{runs} creation runs kept for 100 commits");
+}
+
 /// A reader keeps not seeing nodes created after its snapshot once a
 /// background checkpoint moves them into the snapshot, and across GC runs;
 /// once it ends, GC drops what was kept for it.
