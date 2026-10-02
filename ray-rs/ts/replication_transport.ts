@@ -1,22 +1,39 @@
 import { createHash, timingSafeEqual } from 'node:crypto'
 
-import {
-  collectReplicationLogTransportJson,
-  collectReplicationMetricsOtelJson,
-  collectReplicationMetricsPrometheus,
-  collectReplicationSnapshotTransportJson,
-} from '../index'
-import type { Database } from '../index'
+import { Database, collectReplicationMetricsOtelJson, collectReplicationMetricsPrometheus } from '../index'
+import type { JsReplicationLogTransportPage, JsReplicationSnapshotTransport, Kite } from '../index'
 
+/**
+ * A primary to export replication transports from: a `Database` or a `Kite`
+ * (the raw native handle or the `kite()` wrapper).
+ */
+export type ReplicationTransportSource = Database | Kite
+
+/** A snapshot export with its data as raw bytes (`data` is a `Buffer`). */
+export type ReplicationSnapshotTransportBinary = JsReplicationSnapshotTransport
+
+/** A log page with raw frame payloads (`payload` is a `Buffer`). */
+export type ReplicationLogTransportPageBinary = JsReplicationLogTransportPage
+
+/**
+ * A snapshot export, shaped as the JSON transport (snake_case, data in
+ * base64), ready to send as an HTTP JSON body.
+ */
 export interface ReplicationSnapshotTransport {
   format: string
-  db_path: string
   byte_length: number
+  /** CRC-32 (IEEE) of the data, 8 hex digits; the name is kept for clients. */
   checksum_crc32c: string
   generated_at_ms: number
   epoch: number
   head_log_index: number
   retained_floor: number
+  /**
+   * The sidecar log history `start_cursor` belongs to, 16 hex digits. Log
+   * pages from another generation come from a recreated sidecar: reseed.
+   */
+  generation: string
+  /** Pull the log from here: the position right after the snapshot's head frame. */
   start_cursor: string
   data_base64?: string | null
 }
@@ -34,6 +51,8 @@ export interface ReplicationLogTransportPage {
   epoch: number
   head_log_index: number
   retained_floor: number
+  /** The sidecar log history, 16 hex digits (see `ReplicationSnapshotTransport.generation`). */
+  generation: string
   cursor?: string | null
   next_cursor?: string | null
   eof: boolean
@@ -50,8 +69,14 @@ export interface ReplicationLogTransportOptions {
 }
 
 export interface ReplicationTransportAdapter {
+  /** The snapshot as the JSON transport (data in base64). */
   snapshot(includeData?: boolean): ReplicationSnapshotTransport
+  /** The snapshot with raw bytes, for hosts that send binary bodies. */
+  snapshotBinary(includeData?: boolean): ReplicationSnapshotTransportBinary
+  /** A log page as the JSON transport (payloads in base64). */
   log(options?: ReplicationLogTransportOptions): ReplicationLogTransportPage
+  /** A log page with raw payloads, for hosts that send binary bodies. */
+  logBinary(options?: ReplicationLogTransportOptions): ReplicationLogTransportPageBinary
   metricsPrometheus(): string
   metricsOtelJson(): string
 }
@@ -367,47 +392,104 @@ export function createReplicationAdminAuthorizer<
   }
 }
 
-function parseJson<T>(raw: string, label: string): T {
-  try {
-    return JSON.parse(raw) as T
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
-    throw new Error(`Failed to parse ${label}: ${message}`)
-  }
+function crc32Hex(value: number): string {
+  return (value >>> 0).toString(16).padStart(8, '0')
 }
 
-export function readReplicationSnapshotTransport(db: Database, includeData = false): ReplicationSnapshotTransport {
-  const raw = collectReplicationSnapshotTransportJson(db, includeData)
-  return parseJson<ReplicationSnapshotTransport>(raw, 'replication snapshot transport JSON')
+/** Export a snapshot with raw bytes. */
+export function exportReplicationSnapshotTransport(
+  source: ReplicationTransportSource,
+  includeData = false,
+): ReplicationSnapshotTransportBinary {
+  return source.exportReplicationSnapshotTransport(includeData)
 }
 
-export function readReplicationLogTransport(
-  db: Database,
+/** Export a log page with raw frame payloads. */
+export function exportReplicationLogTransport(
+  source: ReplicationTransportSource,
   options: ReplicationLogTransportOptions = {},
-): ReplicationLogTransportPage {
-  const raw = collectReplicationLogTransportJson(
-    db,
+): ReplicationLogTransportPageBinary {
+  return source.exportReplicationLogTransport(
     options.cursor ?? null,
     options.maxFrames ?? 128,
     options.maxBytes ?? 1024 * 1024,
     options.includePayload ?? true,
   )
-  return parseJson<ReplicationLogTransportPage>(raw, 'replication log transport JSON')
 }
 
-export function createReplicationTransportAdapter(db: Database): ReplicationTransportAdapter {
+/**
+ * Export a snapshot shaped as the JSON transport. It is built from the binary
+ * export: the data is base64-encoded once, with no JSON round trip.
+ */
+export function readReplicationSnapshotTransport(
+  source: ReplicationTransportSource,
+  includeData = false,
+): ReplicationSnapshotTransport {
+  const snapshot = exportReplicationSnapshotTransport(source, includeData)
+  return {
+    format: snapshot.format,
+    byte_length: snapshot.byteLength,
+    checksum_crc32c: crc32Hex(snapshot.checksumCrc32),
+    generated_at_ms: snapshot.generatedAtMs,
+    epoch: snapshot.epoch,
+    head_log_index: snapshot.headLogIndex,
+    retained_floor: snapshot.retainedFloor,
+    generation: snapshot.generation,
+    start_cursor: snapshot.startCursor,
+    data_base64: snapshot.data ? snapshot.data.toString('base64') : null,
+  }
+}
+
+/** Export a log page shaped as the JSON transport, built from the binary export. */
+export function readReplicationLogTransport(
+  source: ReplicationTransportSource,
+  options: ReplicationLogTransportOptions = {},
+): ReplicationLogTransportPage {
+  const page = exportReplicationLogTransport(source, options)
+  return {
+    epoch: page.epoch,
+    head_log_index: page.headLogIndex,
+    retained_floor: page.retainedFloor,
+    generation: page.generation,
+    cursor: page.cursor ?? null,
+    next_cursor: page.nextCursor ?? null,
+    eof: page.eof,
+    frame_count: page.frameCount,
+    total_bytes: page.totalBytes,
+    frames: page.frames.map((frame) => ({
+      epoch: frame.epoch,
+      log_index: frame.logIndex,
+      segment_id: frame.segmentId,
+      segment_offset: frame.segmentOffset,
+      bytes: frame.bytes,
+      payload_base64: frame.payload ? frame.payload.toString('base64') : null,
+    })),
+  }
+}
+
+export function createReplicationTransportAdapter(source: ReplicationTransportSource): ReplicationTransportAdapter {
   return {
     snapshot(includeData = false): ReplicationSnapshotTransport {
-      return readReplicationSnapshotTransport(db, includeData)
+      return readReplicationSnapshotTransport(source, includeData)
+    },
+    snapshotBinary(includeData = false): ReplicationSnapshotTransportBinary {
+      return exportReplicationSnapshotTransport(source, includeData)
     },
     log(options: ReplicationLogTransportOptions = {}): ReplicationLogTransportPage {
-      return readReplicationLogTransport(db, options)
+      return readReplicationLogTransport(source, options)
+    },
+    logBinary(options: ReplicationLogTransportOptions = {}): ReplicationLogTransportPageBinary {
+      return exportReplicationLogTransport(source, options)
     },
     metricsPrometheus(): string {
-      return collectReplicationMetricsPrometheus(db)
+      return source instanceof Database
+        ? collectReplicationMetricsPrometheus(source)
+        : source.replicationMetricsPrometheus()
     },
     metricsOtelJson(): string {
-      return collectReplicationMetricsOtelJson(db)
+      return source instanceof Database
+        ? collectReplicationMetricsOtelJson(source)
+        : source.replicationMetricsOtelJson()
     },
   }
 }

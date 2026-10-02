@@ -1,8 +1,8 @@
 //! Replication manifest sidecar storage.
 
+use super::durability::SidecarSync;
 use crate::error::{KiteError, Result};
 use crate::util::crc::crc32;
-use crate::util::fs::sync_parent_dir;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -55,12 +55,19 @@ struct ManifestEnvelope {
 #[derive(Debug, Clone)]
 pub struct ManifestStore {
   path: PathBuf,
+  sync: SidecarSync,
 }
 
 impl ManifestStore {
   pub fn new(path: impl AsRef<Path>) -> Self {
+    Self::with_sync(path, SidecarSync::default())
+  }
+
+  /// A store whose writes sync with the sidecar's policy.
+  pub fn with_sync(path: impl AsRef<Path>, sync: SidecarSync) -> Self {
     Self {
       path: path.as_ref().to_path_buf(),
+      sync,
     }
   }
 
@@ -88,7 +95,7 @@ impl ManifestStore {
   /// the directory synced so the rename survives a crash.
   pub fn write(&self, manifest: &ReplicationManifest) -> Result<()> {
     self.replace(manifest)?;
-    sync_parent_dir(&self.path)?;
+    self.sync.sync_parent_dir(&self.path)?;
     Ok(())
   }
 
@@ -115,7 +122,7 @@ impl ManifestStore {
       .open(&temp_path)?;
 
     temp_file.write_all(&bytes)?;
-    temp_file.sync_all()?;
+    self.sync.sync_file(&temp_file)?;
 
     fs::rename(&temp_path, &self.path)?;
     Ok(())

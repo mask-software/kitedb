@@ -7,7 +7,7 @@ use pyo3::exceptions::PyValueError;
 
 use crate::pyo3_bindings::errors;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyBytes, PyDict, PyList};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::RwLock;
@@ -21,6 +21,7 @@ use crate::core::single_file::{
   VacuumOptions as RustVacuumOptions,
 };
 use crate::metrics as core_metrics;
+use crate::replication::transport::{format_generation, LogTransportPage, SnapshotTransport};
 use crate::replication::types::CommitToken;
 use crate::types::{ETypeId, EdgeWithProps as CoreEdgeWithProps, NodeId, PropKeyId};
 
@@ -460,6 +461,58 @@ impl PyDatabase {
         .map_err(|e| errors::wrap(e, "Failed to run retention")),
       |_db| { unreachable!("multi-file database support removed") }
     )
+  }
+
+  /// Forget a replica's reported progress, so a decommissioned replica stops
+  /// holding back retention. Returns whether it had progress recorded.
+  fn primary_remove_replica_progress(&self, replica_id: String) -> PyResult<bool> {
+    dispatch!(
+      self,
+      |db| db
+        .primary_remove_replica_progress(&replica_id)
+        .map_err(|e| errors::wrap(e, "Failed to remove replica progress")),
+      |_db| { unreachable!("multi-file database support removed") }
+    )
+  }
+
+  /// Export a consistent snapshot as a dict, with the database file copy as
+  /// `data` (bytes, up to 1 GiB) when include_data.
+  #[pyo3(signature = (include_data=false))]
+  fn export_replication_snapshot_transport(
+    &self,
+    py: Python<'_>,
+    include_data: bool,
+  ) -> PyResult<Py<PyAny>> {
+    let snapshot = self.with_db_nogil(py, |db| {
+      db.primary_export_snapshot_transport(include_data)
+        .map_err(|e| errors::wrap(e, "Failed to export replication snapshot"))
+    })?;
+    snapshot_transport_dict(py, snapshot)
+  }
+
+  /// Export a replication log page as a dict, with each frame's payload as
+  /// bytes when include_payload.
+  #[pyo3(signature = (cursor=None, max_frames=128, max_bytes=1048576, include_payload=true))]
+  fn export_replication_log_transport(
+    &self,
+    py: Python<'_>,
+    cursor: Option<String>,
+    max_frames: i64,
+    max_bytes: i64,
+    include_payload: bool,
+  ) -> PyResult<Py<PyAny>> {
+    let max_frames = validation::positive_usize("max_frames", max_frames, validation::MAX_COUNT)?;
+    let max_bytes = validation::positive_usize("max_bytes", max_bytes, validation::MAX_BYTES)?;
+    let page = self.with_db_nogil(py, |db| {
+      export_log_transport(
+        db,
+        cursor.as_deref(),
+        max_frames,
+        max_bytes,
+        include_payload,
+      )
+    })?;
+    log_transport_dict(py, page)
   }
 
   /// Export latest primary snapshot metadata and optional bytes as transport JSON.
@@ -1738,6 +1791,97 @@ pub fn collect_replication_snapshot_transport_json(
       .map_err(|e| errors::wrap(e, "Failed to export replication snapshot")),
     None => Err(errors::closed()),
   }
+}
+
+/// Snapshot export as a dict (see `Database.export_replication_snapshot_transport`).
+#[pyfunction]
+#[pyo3(signature = (db, include_data=false))]
+pub fn collect_replication_snapshot_transport(
+  py: Python<'_>,
+  db: &PyDatabase,
+  include_data: bool,
+) -> PyResult<Py<PyAny>> {
+  db.export_replication_snapshot_transport(py, include_data)
+}
+
+/// Log page export as a dict (see `Database.export_replication_log_transport`).
+#[pyfunction]
+#[pyo3(signature = (db, cursor=None, max_frames=128, max_bytes=1048576, include_payload=true))]
+pub fn collect_replication_log_transport(
+  py: Python<'_>,
+  db: &PyDatabase,
+  cursor: Option<String>,
+  max_frames: i64,
+  max_bytes: i64,
+  include_payload: bool,
+) -> PyResult<Py<PyAny>> {
+  db.export_replication_log_transport(py, cursor, max_frames, max_bytes, include_payload)
+}
+
+fn export_log_transport(
+  db: &RustSingleFileDB,
+  cursor: Option<&str>,
+  max_frames: usize,
+  max_bytes: usize,
+  include_payload: bool,
+) -> PyResult<LogTransportPage> {
+  let wrap = |e| errors::wrap(e, "Failed to export replication log");
+  let cursor = crate::replication::transport::parse_transport_cursor(cursor).map_err(wrap)?;
+  db.primary_export_log_transport(cursor, max_frames, max_bytes, include_payload)
+    .map_err(wrap)
+}
+
+fn snapshot_transport_dict(py: Python<'_>, snapshot: SnapshotTransport) -> PyResult<Py<PyAny>> {
+  let out = PyDict::new(py);
+  out.set_item("format", snapshot.format)?;
+  out.set_item("byte_length", snapshot.byte_length)?;
+  out.set_item("checksum_crc32", snapshot.checksum_crc32)?;
+  out.set_item("generated_at_ms", snapshot.generated_at_ms)?;
+  out.set_item("epoch", snapshot.epoch)?;
+  out.set_item("head_log_index", snapshot.head_log_index)?;
+  out.set_item("retained_floor", snapshot.retained_floor)?;
+  out.set_item("generation", format_generation(snapshot.generation))?;
+  out.set_item("start_cursor", snapshot.start_cursor.to_string())?;
+  out.set_item(
+    "data",
+    snapshot.data.map(|data| PyBytes::new(py, &data).unbind()),
+  )?;
+  Ok(out.into_any().unbind())
+}
+
+fn log_transport_dict(py: Python<'_>, page: LogTransportPage) -> PyResult<Py<PyAny>> {
+  let frames = PyList::empty(py);
+  for frame in &page.frames {
+    let item = PyDict::new(py);
+    item.set_item("epoch", frame.epoch)?;
+    item.set_item("log_index", frame.log_index)?;
+    item.set_item("segment_id", frame.segment_id)?;
+    item.set_item("segment_offset", frame.segment_offset)?;
+    item.set_item("bytes", frame.bytes)?;
+    item.set_item(
+      "payload",
+      frame
+        .payload
+        .as_deref()
+        .map(|payload| PyBytes::new(py, payload).unbind()),
+    )?;
+    frames.append(item)?;
+  }
+  let out = PyDict::new(py);
+  out.set_item("epoch", page.epoch)?;
+  out.set_item("head_log_index", page.head_log_index)?;
+  out.set_item("retained_floor", page.retained_floor)?;
+  out.set_item("generation", format_generation(page.generation))?;
+  out.set_item("cursor", page.cursor.map(|cursor| cursor.to_string()))?;
+  out.set_item(
+    "next_cursor",
+    page.next_cursor.map(|cursor| cursor.to_string()),
+  )?;
+  out.set_item("eof", page.eof)?;
+  out.set_item("frame_count", page.frames.len())?;
+  out.set_item("total_bytes", page.total_bytes)?;
+  out.set_item("frames", frames)?;
+  Ok(out.into_any().unbind())
 }
 
 #[pyfunction]

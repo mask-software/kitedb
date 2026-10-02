@@ -60,10 +60,25 @@ export declare class Database {
   primaryReportReplicaProgress(replicaId: string, epoch: number, appliedLogIndex: number): void
   /** Execute replication retention on primary. */
   primaryRunRetention(): JsPrimaryRetentionOutcome
-  /** Export latest primary snapshot metadata and optional bytes as transport JSON. */
+  /**
+   * Forget a replica's reported progress, so a decommissioned replica stops
+   * holding back retention. Returns whether it had progress recorded.
+   */
+  primaryRemoveReplicaProgress(replicaId: string): boolean
+  /**
+   * Export a consistent snapshot (metadata, and the database file copy when
+   * includeData, up to 32 MiB) as transport JSON, with the data in base64.
+   */
   exportReplicationSnapshotTransportJson(includeData?: boolean | undefined | null): string
+  /**
+   * Export a consistent snapshot with the database file copy (when
+   * includeData, up to 1 GiB) as a Buffer.
+   */
+  exportReplicationSnapshotTransport(includeData?: boolean | undefined | null): JsReplicationSnapshotTransport
   /** Export primary replication log page (cursor + limits) as transport JSON. */
   exportReplicationLogTransportJson(cursor?: string | undefined | null, maxFrames?: number | undefined | null, maxBytes?: number | undefined | null, includePayload?: boolean | undefined | null): string
+  /** Export primary replication log page (cursor + limits) with payloads as Buffers. */
+  exportReplicationLogTransport(cursor?: string | undefined | null, maxFrames?: number | undefined | null, maxBytes?: number | undefined | null, includePayload?: boolean | undefined | null): JsReplicationLogTransportPage
   /** Bootstrap a replica from the primary snapshot. */
   replicaBootstrapFromSnapshot(): void
   /** Pull and apply up to maxFrames replication frames on replica. */
@@ -743,6 +758,33 @@ export declare class Kite {
   replicaReseedFromSnapshot(): void
   /** Promote this primary to the next replication epoch. */
   primaryPromoteToNextEpoch(): number
+  /** Report a replica's applied position (primary role), for retention. */
+  primaryReportReplicaProgress(replicaId: string, epoch: number, appliedLogIndex: number): void
+  /**
+   * Forget a replica's reported progress, so a decommissioned replica stops
+   * holding back retention. Returns whether it had progress recorded.
+   */
+  primaryRemoveReplicaProgress(replicaId: string): boolean
+  /** Run replication retention (primary role). */
+  primaryRunRetention(): JsPrimaryRetentionOutcome
+  /**
+   * Export a consistent snapshot (metadata, and the database file copy when
+   * includeData, up to 32 MiB) as transport JSON, with the data in base64.
+   */
+  exportReplicationSnapshotTransportJson(includeData?: boolean | undefined | null): string
+  /**
+   * Export a consistent snapshot with the database file copy (when
+   * includeData, up to 1 GiB) as a Buffer.
+   */
+  exportReplicationSnapshotTransport(includeData?: boolean | undefined | null): JsReplicationSnapshotTransport
+  /** Export a replication log page (cursor + limits) as transport JSON. */
+  exportReplicationLogTransportJson(cursor?: string | undefined | null, maxFrames?: number | undefined | null, maxBytes?: number | undefined | null, includePayload?: boolean | undefined | null): string
+  /** Export a replication log page (cursor + limits) with payloads as Buffers. */
+  exportReplicationLogTransport(cursor?: string | undefined | null, maxFrames?: number | undefined | null, maxBytes?: number | undefined | null, includePayload?: boolean | undefined | null): JsReplicationLogTransportPage
+  /** Replication metrics in Prometheus text format. */
+  replicationMetricsPrometheus(): string
+  /** Replication metrics as OpenTelemetry JSON. */
+  replicationMetricsOtelJson(): string
   /** Perform a checkpoint (compact WAL into snapshot) */
   checkpoint(): void
   /** Execute a batch of operations atomically */
@@ -982,6 +1024,8 @@ export interface CheckResult {
 
 export declare function collectMetrics(db: Database): DatabaseMetrics
 
+export declare function collectReplicationLogTransport(db: Database, cursor?: string | undefined | null, maxFrames?: number | undefined | null, maxBytes?: number | undefined | null, includePayload?: boolean | undefined | null): JsReplicationLogTransportPage
+
 export declare function collectReplicationLogTransportJson(db: Database, cursor?: string | undefined | null, maxFrames?: number | undefined | null, maxBytes?: number | undefined | null, includePayload?: boolean | undefined | null): string
 
 export declare function collectReplicationMetricsOtelJson(db: Database): string
@@ -989,6 +1033,8 @@ export declare function collectReplicationMetricsOtelJson(db: Database): string
 export declare function collectReplicationMetricsOtelProtobuf(db: Database): Buffer
 
 export declare function collectReplicationMetricsPrometheus(db: Database): string
+
+export declare function collectReplicationSnapshotTransport(db: Database, includeData?: boolean | undefined | null): JsReplicationSnapshotTransport
 
 export declare function collectReplicationSnapshotTransportJson(db: Database, includeData?: boolean | undefined | null): string
 
@@ -1142,6 +1188,19 @@ export declare const enum JsAggregation {
   Sum = 'Sum'
 }
 
+/** ANN backend for `VectorIndex` */
+export declare const enum JsAnnAlgorithm {
+  /** Plain IVF: exact distances over the probed clusters */
+  Ivf = 'ivf',
+  /** IVF-PQ: PQ-ranked candidates re-ranked by exact distance */
+  IvfPq = 'ivf_pq',
+  /**
+   * Plain IVF while the index is small or under 512 dimensions, IVF-PQ from
+   * 512 dimensions and 50,000 vectors on (the default)
+   */
+  Auto = 'auto'
+}
+
 /** Brute force search result */
 export interface JsBruteForceResult {
   nodeId: number
@@ -1236,6 +1295,12 @@ export interface JsIvfConfig {
   nProbe?: number
   /** Distance metric (default: Cosine) */
   metric?: JsDistanceMetric
+  /**
+   * Training seed, an integer from 0 to Number.MAX_SAFE_INTEGER (default:
+   * a fresh seed per training). With a seed, training the same vectors in
+   * the same order builds the same index on any machine.
+   */
+  seed?: number
 }
 
 /** Statistics for IVF index */
@@ -1475,11 +1540,70 @@ export interface JsReplicaReplicationStatus {
   needsReseed: boolean
 }
 
+/** One frame of a replication log page. */
+export interface JsReplicationLogTransportFrame {
+  epoch: number
+  logIndex: number
+  segmentId: number
+  segmentOffset: number
+  /** Size of the frame in its segment, header included. */
+  bytes: number
+  /** The frame payload, when requested. */
+  payload?: Buffer
+}
+
+/**
+ * A page of replication log frames with raw payloads (see
+ * `exportReplicationLogTransportJson` for the JSON form).
+ */
+export interface JsReplicationLogTransportPage {
+  epoch: number
+  headLogIndex: number
+  retainedFloor: number
+  /**
+   * The sidecar log history (16 hex digits); a change means the sidecar was
+   * recreated and a replica must reseed.
+   */
+  generation: string
+  cursor?: string
+  nextCursor?: string
+  eof: boolean
+  frameCount: number
+  totalBytes: number
+  frames: Array<JsReplicationLogTransportFrame>
+}
+
 /** Replication role for single-file open options */
 export declare const enum JsReplicationRole {
   Disabled = 'Disabled',
   Primary = 'Primary',
   Replica = 'Replica'
+}
+
+/**
+ * A replication snapshot export with the data as raw bytes (see
+ * `exportReplicationSnapshotTransportJson` for the JSON form).
+ */
+export interface JsReplicationSnapshotTransport {
+  /** `single-file-db-copy`: the data is a copy of the database file. */
+  format: string
+  byteLength: number
+  /** CRC-32 (IEEE) of the data. */
+  checksumCrc32: number
+  generatedAtMs: number
+  epoch: number
+  /** The copy holds every commit up to this log index, and none after it. */
+  headLogIndex: number
+  retainedFloor: number
+  /**
+   * The sidecar log history `startCursor` belongs to (16 hex digits). Log
+   * pages from another generation come from a recreated sidecar: reseed.
+   */
+  generation: string
+  /** Pull the log from here: right after the snapshot's head frame. */
+  startCursor: string
+  /** The database file copy, when requested. */
+  data?: Buffer
 }
 
 /** Options for vector search */
@@ -1488,6 +1612,12 @@ export interface JsSearchOptions {
   nProbe?: number
   /** Minimum similarity threshold (0-1) */
   threshold?: number
+  /**
+   * IVF-PQ only: re-rank the best `max(k * rerankFactor, 80)` PQ candidates
+   * by exact distance (default 4; 0 returns the approximate PQ ranking and
+   * distances). IVF search is exact and ignores it.
+   */
+  rerankFactor?: number
 }
 
 /** Result of a vector search */
@@ -1911,6 +2041,11 @@ export interface SimilarOptions {
   threshold?: number
   /** Number of clusters to probe for IVF (must be positive) */
   nProbe?: number
+  /**
+   * Re-rank the best `max(k * rerankFactor, 80)` IVF-PQ candidates by exact
+   * distance (default 4; 0 returns the approximate PQ ranking and distances)
+   */
+  rerankFactor?: number
 }
 
 /** Options for optimizing a single-file database */
@@ -1960,6 +2095,12 @@ export interface VectorIndexOptions {
   trainingThreshold?: number
   /** @deprecated No effect: `VectorIndex` keeps no node cache. Still accepted so existing callers keep working. */
   cacheMaxSize?: number
+  /**
+   * ANN backend (default: 'auto': plain IVF while the index is small or
+   * under 512 dimensions, IVF-PQ from 512 dimensions and 50,000 vectors on;
+   * decided at each build)
+   */
+  annAlgorithm?: JsAnnAlgorithm
 }
 
 /** Vector index statistics */
@@ -1970,6 +2111,11 @@ export interface VectorIndexStats {
   metric: JsDistanceMetric
   indexTrained: boolean
   indexClusters?: number
+  /**
+   * Backend of the built ANN index ('ivf' or 'ivf_pq'; absent before one is
+   * built)
+   */
+  indexAlgorithm?: JsAnnAlgorithm
 }
 
 /** Search result hit */

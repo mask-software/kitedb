@@ -377,6 +377,12 @@ pub struct IvfConfig {
   pub n_probe: usize,
   /// Distance metric
   pub metric: DistanceMetric,
+  /// Seed for training (k-means++ initialization; for IVF-PQ also the PQ
+  /// codebooks). With a seed, training the same vectors in the same order
+  /// builds the same index on any machine and thread count. `None` draws a
+  /// fresh seed per training. Training-only: not serialized with the index.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub seed: Option<u64>,
 }
 
 impl Default for IvfConfig {
@@ -385,6 +391,7 @@ impl Default for IvfConfig {
       n_clusters: 100,
       n_probe: 10,
       metric: DistanceMetric::Cosine,
+      seed: None,
     }
   }
 }
@@ -407,6 +414,12 @@ impl IvfConfig {
   /// Set the distance metric
   pub fn with_metric(mut self, metric: DistanceMetric) -> Self {
     self.metric = metric;
+    self
+  }
+
+  /// Set the training seed (see [`IvfConfig::seed`])
+  pub fn with_seed(mut self, seed: u64) -> Self {
+    self.seed = Some(seed);
     self
   }
 }

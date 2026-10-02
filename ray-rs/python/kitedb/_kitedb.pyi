@@ -588,8 +588,33 @@ class Database:
     def primary_report_replica_progress(
         self, replica_id: str, epoch: int, applied_log_index: int
     ) -> None: ...
+    def primary_remove_replica_progress(self, replica_id: str) -> bool:
+        """Forget a replica's progress so it no longer holds back retention.
+
+        Returns whether the replica had progress recorded.
+        """
+        ...
     def primary_run_retention(self) -> Tuple[int, int]: ...
+    def export_replication_snapshot_transport(self, include_data: bool = False) -> Dict[str, Any]:
+        """A consistent snapshot: format, byte_length, checksum_crc32 (int),
+        generated_at_ms, epoch, head_log_index, retained_floor, generation (16 hex
+        digits), start_cursor (pull the log from here), and data (the database
+        file copy as bytes, up to 1 GiB, or None)."""
+        ...
     def export_replication_snapshot_transport_json(self, include_data: bool = False) -> str: ...
+    def export_replication_log_transport(
+        self,
+        cursor: Optional[str] = None,
+        max_frames: int = 128,
+        max_bytes: int = 1048576,
+        include_payload: bool = True,
+    ) -> Dict[str, Any]:
+        """A log page after `cursor`: epoch, head_log_index, retained_floor,
+        generation (16 hex digits; a change means the sidecar was recreated),
+        cursor, next_cursor, eof, frame_count, total_bytes, and frames (each with
+        epoch, log_index, segment_id, segment_offset, bytes, and payload as bytes
+        or None)."""
+        ...
     def export_replication_log_transport_json(
         self,
         cursor: Optional[str] = None,
@@ -793,10 +818,21 @@ def recommended_safe_profile() -> RuntimeProfile: ...
 def recommended_balanced_profile() -> RuntimeProfile: ...
 def recommended_reopen_heavy_profile() -> RuntimeProfile: ...
 def collect_metrics(db: Database) -> DatabaseMetrics: ...
+def collect_replication_snapshot_transport(
+    db: Database,
+    include_data: bool = False,
+) -> Dict[str, Any]: ...
 def collect_replication_snapshot_transport_json(
     db: Database,
     include_data: bool = False,
 ) -> str: ...
+def collect_replication_log_transport(
+    db: Database,
+    cursor: Optional[str] = None,
+    max_frames: int = 128,
+    max_bytes: int = 1048576,
+    include_payload: bool = True,
+) -> Dict[str, Any]: ...
 def collect_replication_log_transport_json(
     db: Database,
     cursor: Optional[str] = None,
@@ -923,12 +959,17 @@ class IvfConfig:
     n_clusters: Optional[int]
     n_probe: Optional[int]
     metric: Optional[str]
+    seed: Optional[int]
+    """Training seed, 0 to 2**64 - 1 (default: a fresh seed per training).
+    With a seed, training the same vectors in the same order builds the same
+    index on any machine."""
     
     def __init__(
         self,
         n_clusters: Optional[int] = None,
         n_probe: Optional[int] = None,
         metric: Optional[str] = None,
+        seed: Optional[int] = None,
     ) -> None: ...
 
 class PqConfig:
@@ -948,11 +989,16 @@ class SearchOptions:
     """Options for vector search."""
     n_probe: Optional[int]
     threshold: Optional[float]
+    rerank_factor: Optional[int]
+    """IVF-PQ only: re-rank the best max(k * rerank_factor, 80) PQ candidates by
+    exact distance (default 4; 0 returns the approximate PQ ranking and
+    distances). IVF search is exact and ignores it."""
     
     def __init__(
         self,
         n_probe: Optional[int] = None,
         threshold: Optional[float] = None,
+        rerank_factor: Optional[int] = None,
     ) -> None: ...
 
 class SearchResult:
@@ -1047,6 +1093,13 @@ class BruteForceResult:
     node_id: int
     distance: float
     similarity: float
+
+def resolve_ann_algorithm(algorithm: str, dimensions: int, live_vectors: int) -> str:
+    """The backend ``algorithm`` ("auto", "ivf" or "ivf_pq") builds for a
+    vector index of ``dimensions`` with ``live_vectors`` live vectors: "ivf" or
+    "ivf_pq". "auto" picks IVF-PQ from 512 dimensions and 50,000 vectors on,
+    plain IVF otherwise."""
+    ...
 
 def brute_force_search(
     vectors: List[List[float]],

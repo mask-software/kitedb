@@ -783,7 +783,9 @@ fn b10_default_index_recall(dims: usize) -> f32 {
     centers[blob].iter().map(|c| c + rng.gaussian()).collect()
   };
 
-  let mut ann = VectorIndex::new(VectorIndexOptions::new(dims));
+  // IVF-PQ explicitly: the default (`Auto`) builds plain IVF at this size.
+  let mut ann =
+    VectorIndex::new(VectorIndexOptions::new(dims).with_ann_algorithm(AnnAlgorithm::IvfPq));
   let mut exact =
     VectorIndex::new(VectorIndexOptions::new(dims).with_training_threshold(usize::MAX));
   for node in 0..N {

@@ -3,9 +3,8 @@
 //! the snapshot transport (P9), and export labels, metrics schema counts and
 //! point-in-time export (P10).
 //!
-//! Every test here fails until its finding is fixed. The P9 tests are ignored:
-//! the snapshot transport payload is built in core, outside this lane. The
-//! OTLP tests use a local port with no listener, so they need no network.
+//! Every test here fails until its finding is fixed. The OTLP tests use a
+//! local port with no listener, so they need no network.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
@@ -569,8 +568,6 @@ fn w3_p8_replica_rejects_newer_epoch_frame_that_breaks_index_continuity() {
 // ============================================================================
 
 #[test]
-#[ignore = "blocked on core: the payload is built in core/single_file/replication.rs \
-            (primary_export_snapshot_transport_json)"]
 fn w3_p9_snapshot_transport_does_not_expose_db_path() {
   let dir = tempfile::tempdir().expect("tempdir");
   let primary_path = dir.path().join("p9-path-primary.kitedb");
@@ -591,8 +588,6 @@ fn w3_p9_snapshot_transport_does_not_expose_db_path() {
 }
 
 #[test]
-#[ignore = "blocked on core: start_cursor is set in core/single_file/replication.rs \
-            (primary_export_snapshot_transport_json)"]
 fn w3_p9_snapshot_transport_start_cursor_resumes_after_the_snapshot() {
   let dir = tempfile::tempdir().expect("tempdir");
   let primary_path = dir.path().join("p9-cursor-primary.kitedb");

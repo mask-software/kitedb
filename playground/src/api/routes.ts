@@ -6,8 +6,13 @@
 
 import { Elysia, t } from "elysia";
 import { createHash, timingSafeEqual } from "node:crypto";
-import { closeSync, fstatSync, openSync, readSync } from "node:fs";
+import { closeSync, fstatSync, openSync, readSync, statSync } from "node:fs";
 import { join } from "node:path";
+import {
+  exportReplicationSnapshotTransport,
+  readReplicationLogTransport,
+  readReplicationSnapshotTransport,
+} from "../../../ray-rs/ts/replication_transport.ts";
 import {
   getDb,
   getDbPath,
@@ -30,7 +35,7 @@ const REPLICATION_PULL_MAX_FRAMES_DEFAULT = 256;
 const REPLICATION_PULL_MAX_FRAMES_LIMIT = 10_000;
 const REPLICATION_LOG_MAX_BYTES_DEFAULT = 1024 * 1024;
 const REPLICATION_LOG_MAX_BYTES_LIMIT = 32 * 1024 * 1024;
-/** Default for PLAYGROUND_SNAPSHOT_MAX_BYTES; same as core's REPLICATION_SNAPSHOT_INLINE_MAX_BYTES. */
+/** Default for PLAYGROUND_SNAPSHOT_MAX_BYTES; the same as core's JSON snapshot transport cap. */
 const SNAPSHOT_INLINE_MAX_BYTES_DEFAULT = 32 * 1024 * 1024;
 const SNAPSHOT_READ_CHUNK_BYTES = 1024 * 1024;
 
@@ -533,51 +538,71 @@ function resolveSnapshotInlineMaxBytes(): number {
 }
 
 /**
- * Size, sha256 and (with `includeData`) base64 of the live database file, all from one read.
+ * Size and sha256 of the live database file, read one chunk at a time.
  *
  * The read is synchronous: Kite's methods run on the JS thread, so no other request's commit can
  * land mid-read. Core's background checkpoint threads still can; a size change is detected, an
- * in-place rewrite is not. A consistent copy needs a Kite-level snapshot API (the napi Kite has no
- * createBackup or replication snapshot export).
+ * in-place rewrite is not. Requests for the data use the consistent snapshot export instead
+ * (`snapshotWithData`).
  */
-function readDbFileSnapshot(
-  path: string,
-  includeData: boolean,
-  maxInlineBytes: number,
-): { byteLength: number; sha256: string; dataBase64?: string } {
+function readDbFileMetadata(path: string): { byteLength: number; sha256: string } {
   const fd = openSync(path, "r");
   try {
     const size = fstatSync(fd).size;
-    if (includeData && size > maxInlineBytes) {
-      throw new Error(`snapshot size ${size} exceeds max inline payload ${maxInlineBytes} bytes`);
-    }
-
-    // The inline payload needs the whole file; a hash alone needs one chunk at a time.
-    const buffer = Buffer.allocUnsafe(includeData ? size : Math.min(size, SNAPSHOT_READ_CHUNK_BYTES));
+    const buffer = Buffer.allocUnsafe(Math.min(size, SNAPSHOT_READ_CHUNK_BYTES));
     const hash = createHash("sha256");
     let byteLength = 0;
     while (byteLength < size) {
-      const offset = includeData ? byteLength : 0;
-      const length = Math.min(buffer.length - offset, size - byteLength);
-      const read = readSync(fd, buffer, offset, length, byteLength);
+      const read = readSync(fd, buffer, 0, Math.min(buffer.length, size - byteLength), byteLength);
       if (read === 0) {
         break;
       }
-      hash.update(buffer.subarray(offset, offset + read));
+      hash.update(buffer.subarray(0, read));
       byteLength += read;
     }
     if (byteLength !== size || fstatSync(fd).size !== size) {
       throw new Error("database file changed while the snapshot was read; retry");
     }
-
-    return {
-      byteLength,
-      sha256: hash.digest("hex"),
-      dataBase64: includeData ? buffer.toString("base64") : undefined,
-    };
+    return { byteLength, sha256: hash.digest("hex") };
   } finally {
     closeSync(fd);
   }
+}
+
+/**
+ * A consistent copy of the database through Kite's snapshot export (copied under the commit lock
+ * and checkpoint gate), refused above `maxInlineBytes`, with the log position it holds.
+ */
+function snapshotWithData(
+  path: string,
+  maxInlineBytes: number,
+): { byteLength: number; sha256: string; dataBase64: string; epoch: number; headLogIndex: number } {
+  const refuse = (size: number) =>
+    new Error(`snapshot size ${size} exceeds max inline payload ${maxInlineBytes} bytes`);
+  // Checked before the copy so an oversized file is never read into memory.
+  const size = statSync(path).size;
+  if (size > maxInlineBytes) {
+    throw refuse(size);
+  }
+  const db = getDb();
+  if (!db) {
+    throw new Error("No database connected");
+  }
+  const snapshot = exportReplicationSnapshotTransport(db, true);
+  const data = snapshot.data;
+  if (!data) {
+    throw new Error("snapshot export returned no data");
+  }
+  if (data.byteLength > maxInlineBytes) {
+    throw refuse(data.byteLength);
+  }
+  return {
+    byteLength: data.byteLength,
+    sha256: createHash("sha256").update(data).digest("hex"),
+    dataBase64: data.toString("base64"),
+    epoch: snapshot.epoch,
+    headLogIndex: snapshot.headLogIndex,
+  };
 }
 
 async function readManifestEnvelope(sidecarPath: string): Promise<{
@@ -959,8 +984,25 @@ export const apiRoutes = new Elysia({ prefix: "/api" })
       }
 
       const includeData = parseBoolean((query as Record<string, unknown>).includeData, false);
-      const file = readDbFileSnapshot(dbPath, includeData, resolveSnapshotInlineMaxBytes());
+      if (includeData) {
+        const copy = snapshotWithData(dbPath, resolveSnapshotInlineMaxBytes());
+        return {
+          success: true,
+          role: resolved.role,
+          epoch: copy.epoch,
+          headLogIndex: copy.headLogIndex,
+          snapshot: {
+            format: "single-file-db-copy",
+            dbPath,
+            byteLength: copy.byteLength,
+            sha256: copy.sha256,
+            generatedAt: new Date().toISOString(),
+            dataBase64: copy.dataBase64,
+          },
+        };
+      }
 
+      const file = readDbFileMetadata(dbPath);
       return {
         success: true,
         role: resolved.role,
@@ -972,7 +1014,6 @@ export const apiRoutes = new Elysia({ prefix: "/api" })
           byteLength: file.byteLength,
           sha256: file.sha256,
           generatedAt: new Date().toISOString(),
-          dataBase64: file.dataBase64,
         },
       };
     } catch (error) {
@@ -1146,25 +1187,16 @@ export const apiRoutes = new Elysia({ prefix: "/api" })
       return { success: false, error: auth.error };
     }
 
-    const raw = getRawDb();
-    if (!raw) {
+    const db = getDb();
+    if (!db) {
       return { success: false, error: "No database connected" };
     }
 
     try {
       const includeData = parseBoolean((query as Record<string, unknown>).includeData, false);
-      const exported = callRawMethod<string>(
-        raw,
-        [
-          "exportReplicationSnapshotTransportJson",
-          "export_replication_snapshot_transport_json",
-        ],
-        includeData,
-      );
-      const snapshot = JSON.parse(exported) as Record<string, unknown>;
       return {
         success: true,
-        snapshot,
+        snapshot: readReplicationSnapshotTransport(db, includeData),
       };
     } catch (error) {
       return {
@@ -1183,8 +1215,8 @@ export const apiRoutes = new Elysia({ prefix: "/api" })
       return { success: false, error: auth.error };
     }
 
-    const raw = getRawDb();
-    if (!raw) {
+    const db = getDb();
+    if (!db) {
       return { success: false, error: "No database connected" };
     }
 
@@ -1205,21 +1237,10 @@ export const apiRoutes = new Elysia({ prefix: "/api" })
       const includePayload = parseBoolean(queryObject.includePayload, true);
       const cursor = typeof queryObject.cursor === "string" ? queryObject.cursor : null;
 
-      const exported = callRawMethod<string>(
-        raw,
-        [
-          "exportReplicationLogTransportJson",
-          "export_replication_log_transport_json",
-        ],
-        cursor,
-        maxFrames,
-        maxBytes,
-        includePayload,
-      );
-      const payload = JSON.parse(exported) as Record<string, unknown>;
+      const page = readReplicationLogTransport(db, { cursor, maxFrames, maxBytes, includePayload });
       return {
         success: true,
-        ...(payload as object),
+        ...page,
       };
     } catch (error) {
       return {

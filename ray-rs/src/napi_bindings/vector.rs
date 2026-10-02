@@ -8,17 +8,20 @@ use std::borrow::Cow;
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::api::vector_search::{
-  SimilarOptions as RustSimilarOptions, VectorIndex as RustVectorIndex,
-  VectorIndexError as RustVectorIndexError, VectorIndexOptions as RustVectorIndexOptions,
-  VectorIndexStats as RustVectorIndexStats, VectorSearchHit as RustVectorSearchHit,
+  AnnAlgorithm as RustAnnAlgorithm, SimilarOptions as RustSimilarOptions,
+  VectorIndex as RustVectorIndex, VectorIndexError as RustVectorIndexError,
+  VectorIndexOptions as RustVectorIndexOptions, VectorIndexStats as RustVectorIndexStats,
+  VectorSearchHit as RustVectorSearchHit,
 };
 use crate::napi_bindings::database::BlockingTask;
 use crate::napi_bindings::validation;
 use crate::vector::distance::l2_norm;
+use crate::vector::top_k::TopK;
 use crate::vector::{
   DistanceMetric as RustDistanceMetric, IvfConfig as RustIvfConfig, IvfIndex as RustIvfIndex,
-  IvfPqConfig as RustIvfPqConfig, IvfPqIndex as RustIvfPqIndex, MultiQueryAggregation,
-  PqConfig as RustPqConfig, SearchOptions as RustSearchOptions, VectorManifest, VectorSearchResult,
+  IvfPqConfig as RustIvfPqConfig, IvfPqIndex as RustIvfPqIndex,
+  IvfPqSearchOptions as RustIvfPqSearchOptions, MultiQueryAggregation, PqConfig as RustPqConfig,
+  SearchOptions as RustSearchOptions, VectorManifest, VectorSearchResult,
 };
 
 // ============================================================================
@@ -139,12 +142,19 @@ pub struct JsIvfConfig {
   pub n_probe: Option<i32>,
   /// Distance metric (default: Cosine)
   pub metric: Option<JsDistanceMetric>,
+  /// Training seed, an integer from 0 to Number.MAX_SAFE_INTEGER (default:
+  /// a fresh seed per training). With a seed, training the same vectors in
+  /// the same order builds the same index on any machine.
+  pub seed: Option<f64>,
 }
 
 impl JsIvfConfig {
   fn into_rust(self) -> Result<RustIvfConfig> {
     let c = self;
     let mut config = RustIvfConfig::default();
+    if let Some(seed) = c.seed {
+      config.seed = Some(training_seed("seed", seed)?);
+    }
     if let Some(n) = c.n_clusters {
       config.n_clusters =
         validation::positive_usize("nClusters", n as i64, validation::MAX_VECTOR_PARAM)?;
@@ -208,10 +218,40 @@ pub struct JsSearchOptions {
   pub n_probe: Option<i32>,
   /// Minimum similarity threshold (0-1)
   pub threshold: Option<f64>,
+  /// IVF-PQ only: re-rank the best `max(k * rerankFactor, 80)` PQ candidates
+  /// by exact distance (default 4; 0 returns the approximate PQ ranking and
+  /// distances). IVF search is exact and ignores it.
+  pub rerank_factor: Option<i32>,
+}
+
+/// Validated `JsSearchOptions`.
+struct SearchParams {
+  n_probe: Option<usize>,
+  threshold: Option<f32>,
+  rerank_factor: Option<usize>,
+}
+
+impl SearchParams {
+  fn ivf(self) -> RustSearchOptions {
+    RustSearchOptions {
+      n_probe: self.n_probe,
+      filter: None,
+      threshold: self.threshold,
+    }
+  }
+
+  fn ivf_pq(self) -> RustIvfPqSearchOptions {
+    RustIvfPqSearchOptions {
+      n_probe: self.n_probe,
+      filter: None,
+      threshold: self.threshold,
+      rerank_factor: self.rerank_factor,
+    }
+  }
 }
 
 impl JsSearchOptions {
-  fn validated(&self) -> Result<(Option<usize>, Option<f32>)> {
+  fn validated(&self) -> Result<SearchParams> {
     let n_probe = self
       .n_probe
       .map(|n| validation::positive_usize("nProbe", n as i64, validation::MAX_VECTOR_PARAM))
@@ -220,8 +260,26 @@ impl JsSearchOptions {
       .threshold
       .map(|value| validation::ratio("threshold", value).map(|value| value as f32))
       .transpose()?;
-    Ok((n_probe, threshold))
+    let rerank_factor = self
+      .rerank_factor
+      .map(|factor| validate_rerank_factor("rerankFactor", factor))
+      .transpose()?;
+    Ok(SearchParams {
+      n_probe,
+      threshold,
+      rerank_factor,
+    })
   }
+}
+
+/// A training seed passed as a JS number: an integer from 0 to
+/// Number.MAX_SAFE_INTEGER (the range node ids use).
+fn training_seed(field: &str, seed: f64) -> Result<u64> {
+  validation::node_id(field, seed)
+}
+
+fn validate_rerank_factor(field: &str, factor: i32) -> Result<usize> {
+  validation::non_negative_usize(field, factor as i64, validation::MAX_VECTOR_PARAM)
 }
 
 // ============================================================================
@@ -437,11 +495,7 @@ impl JsIvfIndex {
       .as_ref()
       .map(JsSearchOptions::validated)
       .transpose()?
-      .map(|(n_probe, threshold)| RustSearchOptions {
-        n_probe,
-        filter: None,
-        threshold,
-      });
+      .map(SearchParams::ivf);
 
     let k = validation::non_negative_usize("k", k as i64, validation::MAX_COUNT)?;
     let results = index
@@ -480,11 +534,7 @@ impl JsIvfIndex {
       .as_ref()
       .map(JsSearchOptions::validated)
       .transpose()?
-      .map(|(n_probe, threshold)| RustSearchOptions {
-        n_probe,
-        filter: None,
-        threshold,
-      });
+      .map(SearchParams::ivf);
 
     let k = validation::non_negative_usize("k", k as i64, validation::MAX_COUNT)?;
     let results = index
@@ -719,13 +769,7 @@ impl JsIvfPqIndex {
       .as_ref()
       .map(JsSearchOptions::validated)
       .transpose()?
-      .map(
-        |(n_probe, threshold)| crate::vector::ivf_pq::IvfPqSearchOptions {
-          n_probe,
-          filter: None,
-          threshold,
-        },
-      );
+      .map(SearchParams::ivf_pq);
 
     let k = validation::non_negative_usize("k", k as i64, validation::MAX_COUNT)?;
     let results = index
@@ -761,13 +805,7 @@ impl JsIvfPqIndex {
       .as_ref()
       .map(JsSearchOptions::validated)
       .transpose()?
-      .map(
-        |(n_probe, threshold)| crate::vector::ivf_pq::IvfPqSearchOptions {
-          n_probe,
-          filter: None,
-          threshold,
-        },
-      );
+      .map(SearchParams::ivf_pq);
 
     let k = validation::non_negative_usize("k", k as i64, validation::MAX_COUNT)?;
     let results = index
@@ -876,21 +914,20 @@ pub fn brute_force_search(
   let cosine = rust_metric == RustDistanceMetric::Cosine;
 
   let query_f32 = search_vector("query", &query, cosine)?;
+  let k = validation::non_negative_usize("k", k as i64, validation::MAX_COUNT)?;
 
-  let mut results: Vec<(i64, f32)> = Vec::with_capacity(vectors.len());
+  // Bounded top-k in a total order; NaN distances (from NaN components)
+  // never enter it.
+  let mut top = TopK::new(k);
   for (i, (v, &node_id)) in vectors.iter().zip(node_ids.iter()).enumerate() {
     let v_f32 = search_vector(format_args!("vectors[{i}]"), v, cosine)?;
     validation::vector_len(format_args!("vectors[{i}]"), v_f32.len(), query_f32.len())?;
-    results.push((node_id as i64, distance_fn(&query_f32, &v_f32)));
+    top.push(node_id as i64, distance_fn(&query_f32, &v_f32));
   }
 
-  // Sort by distance
-  results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-  let k = validation::non_negative_usize("k", k as i64, validation::MAX_COUNT)?;
-  results.truncate(k);
-
   Ok(
-    results
+    top
+      .into_sorted_vec()
       .into_iter()
       .map(|(node_id, distance)| JsBruteForceResult {
         node_id,
@@ -904,6 +941,42 @@ pub fn brute_force_search(
 // =============================================================================
 // High-level VectorIndex API
 // =============================================================================
+
+/// ANN backend for `VectorIndex`
+#[napi(string_enum)]
+#[derive(Debug, PartialEq, Eq)]
+pub enum JsAnnAlgorithm {
+  /// Plain IVF: exact distances over the probed clusters
+  #[napi(value = "ivf")]
+  Ivf,
+  /// IVF-PQ: PQ-ranked candidates re-ranked by exact distance
+  #[napi(value = "ivf_pq")]
+  IvfPq,
+  /// Plain IVF while the index is small or under 512 dimensions, IVF-PQ from
+  /// 512 dimensions and 50,000 vectors on (the default)
+  #[napi(value = "auto")]
+  Auto,
+}
+
+impl From<JsAnnAlgorithm> for RustAnnAlgorithm {
+  fn from(algorithm: JsAnnAlgorithm) -> Self {
+    match algorithm {
+      JsAnnAlgorithm::Ivf => RustAnnAlgorithm::Ivf,
+      JsAnnAlgorithm::IvfPq => RustAnnAlgorithm::IvfPq,
+      JsAnnAlgorithm::Auto => RustAnnAlgorithm::Auto,
+    }
+  }
+}
+
+impl From<RustAnnAlgorithm> for JsAnnAlgorithm {
+  fn from(algorithm: RustAnnAlgorithm) -> Self {
+    match algorithm {
+      RustAnnAlgorithm::Ivf => JsAnnAlgorithm::Ivf,
+      RustAnnAlgorithm::IvfPq => JsAnnAlgorithm::IvfPq,
+      RustAnnAlgorithm::Auto => JsAnnAlgorithm::Auto,
+    }
+  }
+}
 
 /// Options for creating a vector index
 #[napi(object)]
@@ -924,6 +997,10 @@ pub struct VectorIndexOptions {
   pub training_threshold: Option<i32>,
   /// @deprecated No effect: `VectorIndex` keeps no node cache. Still accepted so existing callers keep working.
   pub cache_max_size: Option<i32>,
+  /// ANN backend (default: 'auto': plain IVF while the index is small or
+  /// under 512 dimensions, IVF-PQ from 512 dimensions and 50,000 vectors on;
+  /// decided at each build)
+  pub ann_algorithm: Option<JsAnnAlgorithm>,
 }
 
 impl VectorIndexOptions {
@@ -962,13 +1039,18 @@ impl VectorIndexOptions {
         n_clusters,
         n_probe,
         metric,
+        seed,
       } = ivf;
       JsIvfConfig {
         n_clusters,
         n_probe,
         metric,
+        seed: None,
       }
       .into_rust()?;
+      if let Some(seed) = seed {
+        options = options.with_seed(training_seed("ivf.seed", seed)?);
+      }
       if let Some(n_clusters) = n_clusters {
         options = options.with_n_clusters(validation::positive_usize(
           "ivf.nClusters",
@@ -998,6 +1080,10 @@ impl VectorIndexOptions {
       options = options.with_normalize(normalize);
     }
 
+    if let Some(algorithm) = self.ann_algorithm {
+      options = options.with_ann_algorithm(algorithm.into());
+    }
+
     Ok(options)
   }
 }
@@ -1011,6 +1097,9 @@ pub struct SimilarOptions {
   pub threshold: Option<f64>,
   /// Number of clusters to probe for IVF (must be positive)
   pub n_probe: Option<i32>,
+  /// Re-rank the best `max(k * rerankFactor, 80)` IVF-PQ candidates by exact
+  /// distance (default 4; 0 returns the approximate PQ ranking and distances)
+  pub rerank_factor: Option<i32>,
 }
 
 impl SimilarOptions {
@@ -1024,6 +1113,9 @@ impl SimilarOptions {
       let n_probe =
         validation::positive_usize("nProbe", n_probe as i64, validation::MAX_VECTOR_PARAM)?;
       options = options.with_n_probe(n_probe);
+    }
+    if let Some(factor) = self.rerank_factor {
+      options = options.with_rerank_factor(validate_rerank_factor("rerankFactor", factor)?);
     }
     Ok(options)
   }
@@ -1056,6 +1148,9 @@ pub struct VectorIndexStats {
   pub metric: JsDistanceMetric,
   pub index_trained: bool,
   pub index_clusters: Option<i32>,
+  /// Backend of the built ANN index ('ivf' or 'ivf_pq'; absent before one is
+  /// built)
+  pub index_algorithm: Option<JsAnnAlgorithm>,
 }
 
 impl From<RustVectorIndexStats> for VectorIndexStats {
@@ -1067,6 +1162,7 @@ impl From<RustVectorIndexStats> for VectorIndexStats {
       metric: stats.metric.into(),
       index_trained: stats.index_trained,
       index_clusters: stats.index_clusters.map(|v| v as i32),
+      index_algorithm: stats.index_algorithm.map(JsAnnAlgorithm::from),
     }
   }
 }
@@ -1225,14 +1321,31 @@ mod tests {
       n_clusters: Some(1),
       n_probe: Some(1),
       metric: None,
+      seed: Some(0.0),
     }
     .into_rust()
     .is_ok());
+    let seeded = JsIvfConfig {
+      seed: Some(validation::MAX_SAFE_INTEGER),
+      ..Default::default()
+    }
+    .into_rust()
+    .expect("valid seed");
+    assert_eq!(seeded.seed, Some(validation::MAX_SAFE_INTEGER as u64));
+    for seed in [-1.0, 0.5, f64::NAN, validation::MAX_SAFE_INTEGER + 2.0] {
+      assert!(JsIvfConfig {
+        seed: Some(seed),
+        ..Default::default()
+      }
+      .into_rust()
+      .is_err());
+    }
     for value in [0, -1, (validation::MAX_VECTOR_PARAM + 1) as i32] {
       assert!(JsIvfConfig {
         n_clusters: Some(value),
         n_probe: None,
         metric: None,
+        seed: None,
       }
       .into_rust()
       .is_err());
@@ -1253,21 +1366,67 @@ mod tests {
     assert!(JsSearchOptions {
       n_probe: Some(1),
       threshold: Some(0.0),
+      rerank_factor: Some(0),
     }
     .validated()
     .is_ok());
     assert!(JsSearchOptions {
       n_probe: Some(0),
-      threshold: None,
+      ..Default::default()
     }
     .validated()
     .is_err());
     assert!(JsSearchOptions {
-      n_probe: None,
       threshold: Some(2.0),
+      ..Default::default()
     }
     .validated()
     .is_err());
+    for factor in [-1, (validation::MAX_VECTOR_PARAM + 1) as i32] {
+      assert!(JsSearchOptions {
+        rerank_factor: Some(factor),
+        ..Default::default()
+      }
+      .validated()
+      .is_err());
+      assert!(SimilarOptions {
+        k: 1,
+        threshold: None,
+        n_probe: None,
+        rerank_factor: Some(factor),
+      }
+      .into_rust()
+      .is_err());
+    }
+    let params = JsSearchOptions {
+      rerank_factor: Some(3),
+      ..Default::default()
+    }
+    .validated()
+    .expect("valid options");
+    assert_eq!(params.ivf_pq().rerank_factor, Some(3));
+  }
+
+  #[test]
+  fn vector_index_options_carry_the_ivf_seed() {
+    let options = |seed| VectorIndexOptions {
+      dimensions: 4,
+      metric: None,
+      row_group_size: None,
+      fragment_target_size: None,
+      normalize: None,
+      ivf: Some(JsIvfConfig {
+        seed,
+        ..Default::default()
+      }),
+      training_threshold: None,
+      cache_max_size: None,
+      ann_algorithm: None,
+    };
+    let seeded = options(Some(42.0)).into_rust().expect("valid options");
+    assert_eq!(seeded.seed, Some(42));
+    assert_eq!(options(None).into_rust().expect("valid").seed, None);
+    assert!(options(Some(-3.0)).into_rust().is_err());
   }
 
   #[test]
@@ -1285,6 +1444,7 @@ mod tests {
       ivf: None,
       training_threshold: Some(1),
       cache_max_size: Some(0),
+      ann_algorithm: Some(JsAnnAlgorithm::IvfPq),
     }
     .into_rust()
     .is_ok());
@@ -1297,6 +1457,7 @@ mod tests {
       ivf: None,
       training_threshold: None,
       cache_max_size: None,
+      ann_algorithm: None,
     }
     .into_rust()
     .is_err());
@@ -1304,6 +1465,7 @@ mod tests {
       k: 0,
       threshold: Some(0.0),
       n_probe: None,
+      rerank_factor: Some(0),
     }
     .into_rust()
     .is_ok());
@@ -1311,6 +1473,7 @@ mod tests {
       k: -1,
       threshold: None,
       n_probe: None,
+      rerank_factor: None,
     }
     .into_rust()
     .is_err());

@@ -1,7 +1,7 @@
 //! Replica progress persistence shared by primary and replicas.
 
+use super::durability::SidecarSync;
 use crate::error::{KiteError, Result};
-use crate::util::fs::sync_parent_dir;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -39,6 +39,23 @@ pub fn upsert_replica_progress(
   epoch: u64,
   applied_log_index: u64,
 ) -> Result<()> {
+  upsert_replica_progress_synced(
+    sidecar_path,
+    replica_id,
+    epoch,
+    applied_log_index,
+    SidecarSync::default(),
+  )
+}
+
+/// [`upsert_replica_progress`], syncing with `sync`.
+pub(crate) fn upsert_replica_progress_synced(
+  sidecar_path: &Path,
+  replica_id: &str,
+  epoch: u64,
+  applied_log_index: u64,
+  sync: SidecarSync,
+) -> Result<()> {
   std::fs::create_dir_all(sidecar_path)?;
   with_progress_lock(sidecar_path, || {
     let file_path = progress_file_path(sidecar_path);
@@ -50,7 +67,7 @@ pub fn upsert_replica_progress(
         applied_log_index,
       },
     );
-    write_progress_file(&file_path, &progress)
+    write_progress_file(&file_path, &progress, sync)
   })
 }
 
@@ -59,6 +76,15 @@ pub fn upsert_replica_progress(
 /// whether the replica had progress recorded. A replica that reports
 /// progress again is tracked again.
 pub fn remove_replica_progress(sidecar_path: &Path, replica_id: &str) -> Result<bool> {
+  remove_replica_progress_synced(sidecar_path, replica_id, SidecarSync::default())
+}
+
+/// [`remove_replica_progress`], syncing with `sync`.
+pub(crate) fn remove_replica_progress_synced(
+  sidecar_path: &Path,
+  replica_id: &str,
+  sync: SidecarSync,
+) -> Result<bool> {
   std::fs::create_dir_all(sidecar_path)?;
   with_progress_lock(sidecar_path, || {
     let file_path = progress_file_path(sidecar_path);
@@ -66,15 +92,20 @@ pub fn remove_replica_progress(sidecar_path: &Path, replica_id: &str) -> Result<
     if progress.remove(replica_id).is_none() {
       return Ok(false);
     }
-    write_progress_file(&file_path, &progress)?;
+    write_progress_file(&file_path, &progress, sync)?;
     Ok(true)
   })
 }
 
 pub fn clear_replica_progress(sidecar_path: &Path) -> Result<()> {
+  clear_replica_progress_synced(sidecar_path, SidecarSync::default())
+}
+
+/// [`clear_replica_progress`], syncing with `sync`.
+pub(crate) fn clear_replica_progress_synced(sidecar_path: &Path, sync: SidecarSync) -> Result<()> {
   std::fs::create_dir_all(sidecar_path)?;
   with_progress_lock(sidecar_path, || {
-    write_progress_file(&progress_file_path(sidecar_path), &HashMap::new())
+    write_progress_file(&progress_file_path(sidecar_path), &HashMap::new(), sync)
   })
 }
 
@@ -106,7 +137,11 @@ fn read_progress_file(path: &Path) -> Result<HashMap<String, ReplicaProgress>> {
   Ok(envelope.replicas)
 }
 
-fn write_progress_file(path: &Path, progress: &HashMap<String, ReplicaProgress>) -> Result<()> {
+fn write_progress_file(
+  path: &Path,
+  progress: &HashMap<String, ReplicaProgress>,
+  sync: SidecarSync,
+) -> Result<()> {
   let envelope = ReplicaProgressEnvelope {
     version: REPLICA_PROGRESS_VERSION,
     replicas: progress.clone(),
@@ -122,9 +157,9 @@ fn write_progress_file(path: &Path, progress: &HashMap<String, ReplicaProgress>)
     .write(true)
     .open(&temp_path)?;
   file.write_all(&bytes)?;
-  file.sync_all()?;
+  sync.sync_file(&file)?;
   fs::rename(&temp_path, path)?;
-  sync_parent_dir(path)?;
+  sync.sync_parent_dir(path)?;
   Ok(())
 }
 
