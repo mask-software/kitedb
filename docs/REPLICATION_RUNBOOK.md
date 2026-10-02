@@ -85,10 +85,19 @@ Metrics surface:
       `circuit_breaker_state_path`, `circuit_breaker_state_url`, `circuit_breaker_state_patch`, `circuit_breaker_state_patch_batch`, `circuit_breaker_state_patch_batch_max_keys`, `circuit_breaker_state_patch_merge`, `circuit_breaker_state_patch_merge_max_keys`, `circuit_breaker_state_patch_retry_max_attempts`, `circuit_breaker_state_cas`, `circuit_breaker_state_lease_id`, `circuit_breaker_scope_key`, `compression_gzip`.
   - Note: `circuit_breaker_state_path` and `circuit_breaker_state_url` are mutually exclusive.
   - Note: `circuit_breaker_state_patch`, `circuit_breaker_state_patch_batch`, `circuit_breaker_state_patch_batch_max_keys`, `circuit_breaker_state_patch_merge`, `circuit_breaker_state_patch_merge_max_keys`, `circuit_breaker_state_patch_retry_max_attempts`, `circuit_breaker_state_cas`, and `circuit_breaker_state_lease_id` require `circuit_breaker_state_url`.
-- Host-runtime replication transport JSON export helpers are available via:
-  - Node NAPI: `collectReplicationSnapshotTransportJson(db, includeData?)`,
-    `collectReplicationLogTransportJson(db, cursor?, maxFrames?, maxBytes?, includePayload?)`
-  - TypeScript adapter helper: `createReplicationTransportAdapter(db)` in `ray-rs/ts/replication_transport.ts`
+- Host-runtime replication transport export helpers are available via:
+  - Rust core: `SingleFileDB::primary_export_snapshot_transport(include_data)` returns a `SnapshotTransport` with the
+    database file copy as bytes (up to 1 GiB), and `primary_export_log_transport(cursor, max_frames, max_bytes,
+    include_payload)` a `LogTransportPage` with raw frame payloads. The `*_json` variants serialize the same values
+    as JSON, with the bytes in base64 (snapshot data up to 32 MiB).
+  - Node NAPI, on `Database` and `Kite`: `exportReplicationSnapshotTransport(includeData?)` and
+    `exportReplicationLogTransport(cursor?, maxFrames?, maxBytes?, includePayload?)` return Buffers; the
+    `exportReplication*TransportJson` methods return JSON. Free functions for a `Database`:
+    `collectReplicationSnapshotTransport(db, includeData?)`, `collectReplicationLogTransport(db, ...)` and their
+    `...Json` variants.
+  - TypeScript adapter helper: `createReplicationTransportAdapter(dbOrKite)` in `ray-rs/ts/replication_transport.ts`.
+    `snapshot()` / `log()` return the JSON-shaped objects (built from the binary exports, with no JSON round trip);
+    `snapshotBinary()` / `logBinary()` return the raw Buffers for hosts that send binary bodies.
   - TypeScript admin auth helper: `createReplicationAdminAuthorizer({ mode, token, mtlsMatcher?, trustForwardedClientCert?, mtlsHeader?, mtlsSubjectRegex? })`
     for `none|token|mtls|token_or_mtls|token_and_mtls`. `mode` is required (`'none'` disables auth explicitly) and
     tokens are compared in constant time. The mTLS modes need a native TLS verifier hook (`mtlsMatcher`), or
@@ -99,8 +108,20 @@ Metrics surface:
     (`request.socket`, `request.client`, `request.raw.socket`, `request.req.socket`).
   - TypeScript forwarded-header matcher helper: `createForwardedTlsMtlsMatcher({ requirePeerCertificate?, requireVerifyHeader?, verifyHeaders?, certHeaders?, successValues? })`
     and probe helper `isForwardedTlsClientAuthorized(request, options?)` for proxy-terminated TLS/mTLS in non-Node-native runtimes.
-  - Python PyO3: `collect_replication_snapshot_transport_json(db, include_data=False)`,
-    `collect_replication_log_transport_json(db, cursor=None, max_frames=128, max_bytes=1048576, include_payload=True)`
+  - Python PyO3: `Database.export_replication_snapshot_transport(include_data=False)` and
+    `Database.export_replication_log_transport(cursor=None, max_frames=128, max_bytes=1048576, include_payload=True)`
+    return dicts with `bytes`; `collect_replication_snapshot_transport[_json](db, include_data=False)` and
+    `collect_replication_log_transport[_json](db, ...)` are the module-level forms.
+  - Transport contract:
+    - The snapshot is a consistent copy: it is read under the database's checkpoint gate and commit lock (commits
+      wait for the copy), and it holds every commit up to `head_log_index` and none after it. In `SyncMode::Off`
+      the commits held only in memory are written to the file first.
+    - `start_cursor` is the position right after the head frame: pull the log from it to get exactly the commits
+      after the snapshot.
+    - Both transports carry `generation`, the sidecar's log history (16 hex digits, a string so JSON clients read
+      it exactly). An HTTP replica records it with its cursor; a page with another generation comes from a
+      recreated sidecar, and the replica must reseed, as file-based replicas do.
+    - The snapshot no longer carries `db_path`.
   - Python host auth helper: `create_replication_admin_authorizer(...)` with `ReplicationAdminAuthConfig`
     and ASGI native TLS matcher helpers `create_asgi_tls_mtls_matcher(...)` / `is_asgi_tls_client_authorized(...)`.
   - These are intended for embedding host-side HTTP endpoints beyond playground runtime.
@@ -122,7 +143,13 @@ Alert heuristics:
 Prerequisite:
 
 - Quiesce writes on the source primary during `replica_bootstrap_from_snapshot()`.
-- If writes continue, bootstrap now fails fast with a `quiesce writes and retry` error.
+- If writes continue, bootstrap now fails fast with a `quiesce writes and retry` error. The check compares the
+  source file's length, modification time and header pages, and its replication head, at the start and the end of
+  the copy (it no longer checksums the whole file).
+- The copy commits in batches (10k writes, or 1/8 of the replica's WAL), so a graph larger than the replica's WAL
+  fits; the replica checkpoints between batches once its WAL passes half full, also with auto-checkpoint off. From
+  the first batch until the bootstrap sets its cursor the replica is marked incomplete, and catch-up refuses to run
+  (`needs_reseed`) if the bootstrap stops partway: run it again.
 
 1. Open replica with:
    - `replication_role=replica`
@@ -143,10 +170,17 @@ Replica:
 - Poll `replica_catch_up_once(max_frames)` repeatedly.
 - Persist and monitor `applied_log_index`.
 
+Replica catch-up applies each contiguous run of frames in one transaction (split at 1/8 of the replica's WAL) and
+moves its cursor once per pull. A run that fails is retried one frame per transaction, so the frames before the
+failing one still apply and the error names the failing frame (`replica apply failed at epoch:log_index`).
+
 Primary:
 
 - Report each replica cursor via `primary_report_replica_progress(replica_id, epoch, applied_log_index)`.
 - Run `primary_run_retention()` on an operator cadence.
+- Decommissioned replica: `primary_remove_replica_progress(replica_id)` (Node `primaryRemoveReplicaProgress`)
+  forgets its progress, so it stops holding back the retention floor; the next retention run prunes past it. A
+  replica that reports again is tracked again.
 
 Tuning:
 
@@ -227,8 +261,8 @@ Available endpoints in `playground/src/api/routes.ts`:
 - `GET /api/replication/metrics` (Prometheus text format)
 - `GET /api/replication/snapshot/latest`
 - `GET /api/replication/log`
-- `GET /api/replication/transport/snapshot` (host-runtime transport export passthrough)
-- `GET /api/replication/transport/log` (host-runtime transport export passthrough)
+- `GET /api/replication/transport/snapshot` (the connected Kite's snapshot transport, as JSON)
+- `GET /api/replication/transport/log` (the connected Kite's log transport, as JSON)
 - `POST /api/replication/pull` (runs `replica_catch_up_once`)
 - `POST /api/replication/reseed` (runs `replica_reseed_from_snapshot`)
 - `POST /api/replication/promote` (runs `primary_promote_to_next_epoch`)
@@ -273,6 +307,8 @@ Playground curl examples:
 - OTLP retry policy is bounded attempt/backoff/jitter with optional adaptive multiplier (`linear` or `ewma`) and circuit-breaker half-open probes. Circuit-breaker state is process-local by default; optional file-backed sharing (`circuit_breaker_state_path`) or shared HTTP store (`circuit_breaker_state_url`) is available with `circuit_breaker_scope_key`; URL backend can enable key-scoped patch mode (`circuit_breaker_state_patch`), batched patch mode (`circuit_breaker_state_patch_batch` with `circuit_breaker_state_patch_batch_max_keys`), compacting merge patch mode (`circuit_breaker_state_patch_merge` with `circuit_breaker_state_patch_merge_max_keys`), bounded patch retries (`circuit_breaker_state_patch_retry_max_attempts`), CAS (`circuit_breaker_state_cas`), and lease header propagation (`circuit_breaker_state_lease_id`).
 - Vector authority boundary: logical vector property mutations (`SetNodeVector` / `DelNodeVector`) are authoritative and replicated; vector batch/fragment maintenance records are treated as derived index artifacts and are skipped during replica apply.
 - `SyncMode::Normal` and `SyncMode::Off` optimize commit latency by batching sidecar frame writes in-memory and refreshing manifest fencing periodically (not every commit). For strict per-commit sidecar visibility/fencing, use `SyncMode::Full`.
+- The sidecar syncs as the database does: in `SyncMode::Full` each commit's frame (and the manifest naming it) is synced before the commit returns, with a plain `fsync`, or `F_FULLFSYNC` on macOS with the `full_fsync` opt-in; in Normal and Off modes frames are synced at checkpoint and close. Metadata files (manifest, health, progress, replica cursor) are always replaced atomically with their content synced first.
+- Epoch fencing runs under the commit lock: a primary promoted away while a commit waits for the lock rejects that commit (`stale primary`). A promotion that lands while a commit is being written cannot stop it locally; that commit's sidecar append is fenced instead, and it reaches no replica.
 
 ## 10. V1 Release Checklist
 

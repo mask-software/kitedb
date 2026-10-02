@@ -141,9 +141,12 @@ Binding surface (additive):
 ## 12) Transport Contract (Pull-First)
 
 - `GET /replication/snapshot/latest`
-  - Returns snapshot bytes + metadata (checksum, epoch, start cursor/index).
+  - Returns snapshot bytes + metadata (checksum, epoch, head, sidecar generation, start cursor right after the
+    head frame). The copy is consistent with the head (read under the commit lock).
 - `GET /replication/log?cursor=...&max_bytes=...`
-  - Returns ordered tx frames + next cursor + eof marker.
+  - Returns ordered tx frames + next cursor + eof marker + sidecar generation (a changed generation means the
+    sidecar was recreated: reseed).
+- Core exports both as structs with raw bytes (`SnapshotTransport`, `LogTransportPage`) and as JSON over them.
 - `GET /replication/status`
   - Primary/replica status for observability.
 - `POST /replication/promote`
@@ -391,10 +394,13 @@ Implemented:
 - Host-runtime OpenTelemetry collector push transport (OTLP gRPC Export) in Rust core + Node NAPI + Python PyO3 (`push_replication_metrics_otel_grpc_single_file`, `pushReplicationMetricsOtelGrpc`, `push_replication_metrics_otel_grpc`).
 - Host-runtime OTLP transport hardening for TLS/mTLS (HTTPS-only mode, custom CA trust, optional client cert/key auth).
 - Host-runtime OTLP adaptive retry/backoff/jitter/compression + circuit-breaker controls in Rust core + Node NAPI + Python PyO3 (`adaptive_retry`, `adaptive_retry_mode`, `adaptive_retry_ewma_alpha`, `retry_max_attempts`, `retry_backoff_ms`, `retry_backoff_max_ms`, `retry_jitter_ratio`, `circuit_breaker_failure_threshold`, `circuit_breaker_open_ms`, `circuit_breaker_half_open_probes`, `circuit_breaker_state_path`, `circuit_breaker_state_url`, `circuit_breaker_state_patch`, `circuit_breaker_state_patch_batch`, `circuit_breaker_state_patch_batch_max_keys`, `circuit_breaker_state_patch_merge`, `circuit_breaker_state_patch_merge_max_keys`, `circuit_breaker_state_patch_retry_max_attempts`, `circuit_breaker_state_cas`, `circuit_breaker_state_lease_id`, `circuit_breaker_scope_key`, `compression_gzip`).
-- Host-runtime replication transport JSON export surfaces for embedding HTTP endpoints beyond playground runtime:
+- Host-runtime replication transport export surfaces for embedding HTTP endpoints beyond playground runtime:
   - snapshot export (`collectReplicationSnapshotTransportJson` / `collect_replication_snapshot_transport_json`)
   - log page export with cursor/limits (`collectReplicationLogTransportJson` / `collect_replication_log_transport_json`).
+  - binary variants with raw bytes (`exportReplicationSnapshotTransport` / `exportReplicationLogTransport` on
+    `Database` and `Kite`, `collectReplication*Transport`, Python `export_replication_*_transport`).
   - TypeScript adapter helper (`createReplicationTransportAdapter`) for wiring custom HTTP handlers.
+- Replica progress removal for decommissioned replicas (`primary_remove_replica_progress`).
   - TypeScript admin auth helper (`createReplicationAdminAuthorizer`) with token/mTLS modes and optional native TLS matcher hook.
   - TypeScript Node native TLS matcher helper (`createNodeTlsMtlsMatcher` / `isNodeTlsClientAuthorized`) for common request socket layouts.
   - TypeScript forwarded-header TLS matcher helper (`createForwardedTlsMtlsMatcher` / `isForwardedTlsClientAuthorized`) for proxy-terminated TLS/mTLS runtimes beyond Node-native sockets.
