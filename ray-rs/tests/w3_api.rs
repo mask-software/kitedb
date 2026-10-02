@@ -864,49 +864,160 @@ fn a13_traverse_depth_continues_hop_count() {
 }
 
 // ============================================================================
-// A14: transaction()/batch() inside an open tx must stay atomic
+// A14: transaction()/batch() inside an open tx join it; a failure aborts all of it
 // ============================================================================
 
-#[test]
-fn a14_transaction_inside_open_tx_discards_writes_on_error() {
-  let (_dir, mut kite) = open(schema());
-  kite.raw().begin(false).expect("outer begin");
-  let result: kitedb::Result<()> = kite.transaction(|ctx| {
-    ctx.create_node("User", "alice", Props::new())?;
-    Err(KiteError::Internal("closure failed".into()))
-  });
-  kite.raw().commit().expect("outer commit");
+fn exists(kite: &Kite, key: &str) -> bool {
+  kite.get("User", key).expect("get").is_some()
+}
 
-  assert!(result.is_err(), "the failing transaction returned Ok");
-  assert!(
-    kite.get("User", "alice").expect("get").is_none(),
-    "A14: nested transaction() returned {result:?}, but its write survived the outer commit"
-  );
+/// Run `nested` inside an open transaction that already wrote `outer`, then try to commit it.
+/// Returns the nested result and the outer commit's result.
+fn inside_open_tx<T>(
+  kite: &mut Kite,
+  nested: impl FnOnce(&mut Kite) -> kitedb::Result<T>,
+) -> (kitedb::Result<T>, kitedb::Result<()>) {
+  kite.raw().begin(false).expect("outer begin");
+  user(kite, "outer");
+  let result = nested(kite);
+  let commit = kite.raw().commit();
+  (result, commit)
+}
+
+/// After a failed nested call, nothing of the outer transaction may be committed, and the
+/// caller sees the nested call's own error.
+fn check_aborted<T: std::fmt::Debug>(
+  label: &str,
+  kite: &Kite,
+  result: kitedb::Result<T>,
+  commit: kitedb::Result<()>,
+  original_error: fn(&KiteError) -> bool,
+  failures: &mut Vec<String>,
+) {
+  match &result {
+    Err(error) if original_error(error) => {}
+    other => failures.push(format!("{label}: expected its own error, got {other:?}")),
+  }
+  if !matches!(commit, Err(KiteError::NoTransaction)) {
+    failures.push(format!(
+      "{label}: the outer commit gave {commit:?}, expected NoTransaction (the outer tx is aborted)"
+    ));
+  }
+  for key in ["outer", "alice"] {
+    if exists(kite, key) {
+      failures.push(format!("{label}: {key:?} was committed"));
+    }
+  }
 }
 
 #[test]
-fn a14_batch_inside_open_tx_is_atomic() {
-  let (_dir, mut kite) = open(schema());
-  kite.raw().begin(false).expect("outer begin");
-  let result = kite.batch(vec![
-    BatchOp::CreateNode {
-      node_type: "User".into(),
-      key_suffix: "alice".into(),
-      props: Props::new(),
-    },
-    BatchOp::CreateNode {
-      node_type: "NoSuchType".into(),
-      key_suffix: "bob".into(),
-      props: Props::new(),
-    },
-  ]);
-  kite.raw().commit().expect("outer commit");
+fn a14_failed_nested_transaction_or_batch_aborts_the_open_tx() {
+  let mut failures = Vec::new();
 
-  assert!(result.is_err(), "the failing batch returned Ok");
+  let (_dir, mut kite) = open(schema());
+  let (result, commit) = inside_open_tx(&mut kite, |kite| {
+    kite.transaction(|ctx| -> kitedb::Result<()> {
+      ctx.create_node("User", "alice", Props::new())?;
+      Err(KiteError::Internal("closure failed".into()))
+    })
+  });
+  check_aborted(
+    "transaction()",
+    &kite,
+    result,
+    commit,
+    |error| matches!(error, KiteError::Internal(message) if message == "closure failed"),
+    &mut failures,
+  );
+
+  let failing_ops = || {
+    vec![
+      BatchOp::CreateNode {
+        node_type: "User".into(),
+        key_suffix: "alice".into(),
+        props: Props::new(),
+      },
+      BatchOp::CreateNode {
+        node_type: "NoSuchType".into(),
+        key_suffix: "bob".into(),
+        props: Props::new(),
+      },
+    ]
+  };
+  let unknown_type = |error: &KiteError| matches!(error, KiteError::InvalidSchema(_));
+
+  let (_dir, mut kite) = open(schema());
+  let (result, commit) = inside_open_tx(&mut kite, |kite| kite.batch(failing_ops()));
+  check_aborted(
+    "batch()",
+    &kite,
+    result,
+    commit,
+    unknown_type,
+    &mut failures,
+  );
+
+  let (_dir, mut kite) = open(schema());
+  let (result, commit) = inside_open_tx(&mut kite, |kite| {
+    let mut tx = kite.tx();
+    for op in failing_ops() {
+      tx = match op {
+        BatchOp::CreateNode {
+          node_type,
+          key_suffix,
+          props,
+        } => tx.create_node(node_type, key_suffix, props),
+        _ => unreachable!(),
+      };
+    }
+    tx.execute(kite)
+  });
+  check_aborted(
+    "TxBuilder::execute()",
+    &kite,
+    result,
+    commit,
+    unknown_type,
+    &mut failures,
+  );
+
+  assert_no_failures("A14 (nested failure)", &failures);
+}
+
+#[test]
+fn a14_successful_nested_transaction_and_batch_commit_with_the_open_tx() {
+  let (_dir, mut kite) = open(schema());
+  let (result, commit) = inside_open_tx(&mut kite, |kite| {
+    kite.transaction(|ctx| ctx.create_node("User", "a", Props::new()).map(drop))?;
+    kite.batch(vec![BatchOp::CreateNode {
+      node_type: "User".into(),
+      key_suffix: "b".into(),
+      props: Props::new(),
+    }])?;
+    kite
+      .tx()
+      .create_node("User", "c", Props::new())
+      .execute(kite)
+  });
+  result.expect("nested calls");
+  commit.expect("outer commit");
+  for key in ["outer", "a", "b", "c"] {
+    assert!(exists(&kite, key), "{key:?} must commit with the outer tx");
+  }
+
+  // They joined it: rolling the outer transaction back discards them too.
+  kite.raw().begin(false).expect("begin");
+  kite
+    .batch(vec![BatchOp::CreateNode {
+      node_type: "User".into(),
+      key_suffix: "d".into(),
+      props: Props::new(),
+    }])
+    .expect("nested batch");
+  kite.raw().rollback().expect("outer rollback");
   assert!(
-    kite.get("User", "alice").expect("get").is_none(),
-    "A14: nested batch() failed with {:?}, but its first op survived the outer commit",
-    result.err()
+    !exists(&kite, "d"),
+    "a joined batch rolls back with the outer tx"
   );
 }
 
