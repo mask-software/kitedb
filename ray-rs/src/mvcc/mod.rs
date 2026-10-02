@@ -61,6 +61,10 @@ pub mod tx_manager;
 pub mod version_chain;
 pub mod visibility;
 
+#[cfg(test)]
+#[path = "b4_mvcc_tests.rs"]
+mod b4_mvcc_tests;
+
 // Re-export main types for convenience
 pub use conflict::{ConflictDetector, ConflictError, ConflictInfo, ConflictType};
 pub use gc::{GarbageCollector, GcConfig, GcResult, GcStats, SharedGcState};

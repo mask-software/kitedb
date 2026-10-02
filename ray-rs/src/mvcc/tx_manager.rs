@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::types::{MvccTransaction, MvccTxStatus, Timestamp, TxId, TxKey};
 
 /// Maximum number of committed write entries before pruning
-const MAX_COMMITTED_WRITES: usize = 100_000;
+pub(crate) const MAX_COMMITTED_WRITES: usize = 100_000;
 /// Prune down to this many entries when over the limit
 const PRUNE_THRESHOLD_ENTRIES: usize = 50_000;
 
@@ -42,6 +42,9 @@ pub struct TxManager {
   active_count: usize,
   /// Total committed write entries pruned (for stats)
   total_pruned: usize,
+  /// Committed-write entries visited while pruning (test instrumentation)
+  #[cfg(test)]
+  pub(crate) prune_work: u64,
 }
 
 impl TxManager {
@@ -60,6 +63,8 @@ impl TxManager {
       commit_ts_to_wall_clock: HashMap::new(),
       active_count: 0,
       total_pruned: 0,
+      #[cfg(test)]
+      prune_work: 0,
     }
   }
 
@@ -337,6 +342,10 @@ impl TxManager {
       self.committed_writes.iter().map(|(k, &v)| (k, v)).collect();
 
     entries.sort_by_key(|(_, ts)| *ts);
+    #[cfg(test)]
+    {
+      self.prune_work += entries.len() as u64;
+    }
 
     let target_size = MAX_COMMITTED_WRITES.saturating_sub(PRUNE_THRESHOLD_ENTRIES);
     let mut current_size = self.committed_writes.len();
