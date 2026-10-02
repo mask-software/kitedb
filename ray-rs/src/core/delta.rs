@@ -42,6 +42,10 @@ impl<T: Eq + Hash> Table for DeltaSet<T> {
 /// A table this full (or fuller) may grow ahead of need (see
 /// `DeltaState::grow_tables_for`), as a fraction of its capacity.
 const GROW_AHEAD_LOAD: (usize, usize) = (3, 4);
+/// A table grown ahead of need grows to this many times its capacity: each
+/// entry then moves about a third as often as when tables double, for up to
+/// twice the room.
+const GROW_AHEAD_FACTOR: usize = 4;
 /// Tables smaller than this grow when they fill: their growth takes no time.
 const GROW_AHEAD_MIN_CAPACITY: usize = 4096;
 
@@ -699,15 +703,15 @@ impl DeltaState {
       self.delete_node(node_id);
     }
 
-    let key_index = &pending.key_index;
+    // A transaction's key index names exactly the keys of the nodes it
+    // created (`create_node` adds one, `delete_node` takes it back), and is
+    // copied last.
     for (node_id, node_delta) in pending.created_nodes.drain() {
-      // The key index is copied last; a key it already gives this node needs
-      // no entry before that.
-      let key_indexed = node_delta
+      debug_assert!(node_delta
         .key
         .as_deref()
-        .is_some_and(|key| key_index.get(key) == Some(&node_id));
-      self.merge_created_node(node_id, node_delta, key_indexed);
+        .is_none_or(|key| pending.key_index.get(key) == Some(&node_id)));
+      self.merge_created_node(node_id, node_delta);
     }
     for (node_id, node_delta) in pending.modified_nodes.drain() {
       self.merge_modified_node(node_id, node_delta);
@@ -747,10 +751,11 @@ impl DeltaState {
 
   /// Make room for merging `pending` (see `merge_from`): grow each table the merge would
   /// overflow, and if none, the first table past `GROW_AHEAD_LOAD` of its capacity, ahead of
-  /// need. A merge runs under `delta.write()`, and a table that grows moves all its entries
-  /// meanwhile. A growing delta's tables hold about as many entries each (the created nodes'
-  /// state, keys, edge patches in both directions and edge props), so they would fill up
-  /// together and all grow in one merge: grown ahead, they grow one merge at a time.
+  /// need, by `GROW_AHEAD_FACTOR`. A merge runs under `delta.write()`, and a table that grows
+  /// moves all its entries meanwhile. A growing delta's tables hold about as many entries
+  /// each (the created nodes' state, keys, edge patches in both directions and edge props),
+  /// so they would fill up together and all grow in one merge: grown ahead, they grow one
+  /// merge at a time, and less often.
   fn grow_tables_for(&mut self, pending: &DeltaState) {
     let mut tables: [(&mut dyn Table, usize); 9] = [
       (&mut self.created_nodes, pending.created_nodes.len()),
@@ -779,26 +784,21 @@ impl DeltaState {
         && (table.len() + incoming) * denominator >= table.capacity() * numerator
     });
     if let Some((table, _)) = ahead {
-      // One past its capacity: the next size up.
-      let additional = table.capacity() + 1 - table.len();
+      // One past `GROW_AHEAD_FACTOR - 1` times its capacity: that size up.
+      let additional = (GROW_AHEAD_FACTOR - 1) * table.capacity() + 1 - table.len();
       table.reserve(additional);
     }
   }
 
   /// Merge node `node_id`, created by the merged transaction with the state
   /// `node_delta`: what `create_node` and then its label and prop writes
-  /// give, except the key index entry if `key_indexed`.
-  fn merge_created_node(
-    &mut self,
-    node_id: NodeId,
-    mut node_delta: Box<NodeDelta>,
-    key_indexed: bool,
-  ) {
+  /// give, except the key index entry (the transaction's key index has it).
+  fn merge_created_node(&mut self, node_id: NodeId, mut node_delta: Box<NodeDelta>) {
     let NodeDelta {
-      key,
       labels,
       labels_deleted,
       props,
+      ..
     } = &mut *node_delta;
     // Removing a label from a node created here only drops it from its
     // labels (see `remove_node_label`).
@@ -813,9 +813,6 @@ impl DeltaState {
     *labels_deleted = None;
     if props.as_ref().is_some_and(|props| props.is_empty()) {
       *props = None;
-    }
-    if let (Some(key), false) = (key.as_deref(), key_indexed) {
-      self.key_index.insert(key.to_string(), node_id);
     }
     self.install_created_node(node_id, node_delta);
   }
