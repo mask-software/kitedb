@@ -2294,8 +2294,10 @@ impl Kite {
     Ok(results)
   }
 
-  // Internal helper to get neighbors for traversal/pathfinding (read-only, no transaction)
-  fn neighbors(
+  /// The edges of `node_id` in `direction` (all types, or `etype`), for
+  /// traversal and pathfinding; read-only, outside any transaction. `Both`
+  /// lists a self-loop once. The bindings expand their hops with it too.
+  pub(crate) fn neighbors(
     &self,
     node_id: NodeId,
     direction: super::traversal::TraversalDirection,
@@ -2516,15 +2518,17 @@ use super::traversal::{
   RawEdge, TraversalBuilder, TraversalDirection, TraversalProps, TraversalResult, TraverseOptions,
 };
 
-/// Loads the props traversal filters see from a Kite database.
-struct KiteTraversalProps<'a> {
+/// Loads the props traversal filters see from a Kite database; the bindings
+/// load node and edge props through it too.
+pub(crate) struct KiteTraversalProps<'a> {
   db: &'a SingleFileDB,
   /// The node props to load (`select()`), by name and key id; `None`: all of them.
   selected_node_props: Option<Vec<(String, PropKeyId)>>,
 }
 
 impl<'a> KiteTraversalProps<'a> {
-  fn new(db: &'a SingleFileDB, selected: Option<&[String]>) -> Self {
+  /// Props of `db`; node props limited to `selected` names when given.
+  pub(crate) fn new(db: &'a SingleFileDB, selected: Option<&[String]>) -> Self {
     // A prop whose key was never defined has no values to load.
     let selected_node_props = selected.map(|names| {
       names

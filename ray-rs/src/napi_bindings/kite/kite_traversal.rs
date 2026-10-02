@@ -22,13 +22,13 @@ use parking_lot::RwLock;
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
-use crate::api::kite::Kite as RustKite;
+use crate::api::kite::{Kite as RustKite, KiteTraversalProps};
 use crate::api::traversal::{TraversalBuilder, TraversalDirection, TraversalStep, TraverseOptions};
 use crate::types::{ETypeId, Edge, NodeId};
 
 use super::helpers::{
-  call_filter, edge_filter_arg, edge_filter_data, filter_fn, neighbors, node_filter_arg,
-  node_filter_data, node_to_js, FilterFn,
+  call_filter, edge_filter_arg, edge_filter_data, filter_fn, node_filter_arg, node_filter_data,
+  node_to_js, FilterFn,
 };
 use crate::napi_bindings::database::JsFullEdge;
 use crate::napi_bindings::traversal::JsTraverseOptions;
@@ -109,7 +109,8 @@ pub struct KiteTraversal {
   start_filters: Vec<StepFilter>,
   steps: StepChain,
   limit: Option<usize>,
-  selected_props: Option<Arc<HashSet<String>>>,
+  /// The node props `select()` limits loading to.
+  selected_props: Option<Arc<[String]>>,
 }
 
 impl KiteTraversal {
@@ -192,7 +193,7 @@ impl KiteTraversal {
       return self.with_ray(|ray| {
         Ok(
           builder
-            .execute(|node_id, dir, etype| neighbors(ray.raw(), node_id, dir, etype))
+            .execute(|node_id, dir, etype| ray.neighbors(node_id, dir, etype))
             .map(|result| Hit {
               node_id: result.node_id,
               edge: result.edge.map(|edge| Edge {
@@ -215,7 +216,7 @@ impl KiteTraversal {
     // The lock is taken per expansion and per predicate input, never across a JS call.
     run_plan(
       &plan,
-      |node_id, dir, etype| self.with_ray(|ray| Ok(neighbors(ray.raw(), node_id, dir, etype))),
+      |node_id, dir, etype| self.with_ray(|ray| Ok(ray.neighbors(node_id, dir, etype))),
       |filters, hit| self.passes(env, filters, hit),
     )
   }
@@ -226,12 +227,12 @@ impl KiteTraversal {
     let needs_node = filters.iter().any(|f| matches!(f, StepFilter::Node(_)));
     let needs_edge = filters.iter().any(|f| matches!(f, StepFilter::Edge(_)));
     let (node, edge) = self.with_ray(|ray| {
-      let node =
-        needs_node.then(|| node_filter_data(ray, hit.node_id, self.selected_props.as_deref()));
+      let props = KiteTraversalProps::new(ray.raw(), self.selected_props.as_deref());
+      let node = needs_node.then(|| node_filter_data(ray, &props, hit.node_id));
       let edge = hit
         .edge
         .filter(|_| needs_edge)
-        .map(|edge| edge_filter_data(ray, &edge));
+        .map(|edge| edge_filter_data(&props, &edge));
       Ok((node, edge))
     })?;
 
@@ -325,7 +326,7 @@ impl KiteTraversal {
   #[napi]
   pub fn select(&self, props: Vec<String>) -> Result<KiteTraversal> {
     let mut next = self.fork();
-    next.selected_props = Some(Arc::new(props.into_iter().collect()));
+    next.selected_props = Some(Arc::from(props));
     Ok(next)
   }
 
@@ -344,10 +345,11 @@ impl KiteTraversal {
   pub fn nodes_with_props(&self, env: Env) -> Result<Vec<Object<'_>>> {
     let hits = self.run(&env)?;
     let nodes = self.with_ray(|ray| {
+      let props = KiteTraversalProps::new(ray.raw(), self.selected_props.as_deref());
       Ok(
         hits
           .iter()
-          .map(|hit| node_filter_data(ray, hit.node_id, self.selected_props.as_deref()))
+          .map(|hit| node_filter_data(ray, &props, hit.node_id))
           .collect::<Vec<_>>(),
       )
     })?;
@@ -381,7 +383,7 @@ impl KiteTraversal {
     }
     let builder = self.core_builder(steps);
     self.with_ray(|ray| {
-      Ok(builder.count(|node_id, dir, etype| neighbors(ray.raw(), node_id, dir, etype)) as i64)
+      Ok(builder.count(|node_id, dir, etype| ray.neighbors(node_id, dir, etype)) as i64)
     })
   }
 }
@@ -593,7 +595,7 @@ mod tests {
       Self { edges }
     }
 
-    /// Same contract as `helpers::neighbors`.
+    /// Same contract as `Kite::neighbors`, which the traversal expands its hops with.
     fn neighbors(
       &self,
       node_id: NodeId,
@@ -618,7 +620,13 @@ mod tests {
           .collect(),
         TraversalDirection::Both => {
           let mut out = self.neighbors(node_id, TraversalDirection::Out, etype);
-          out.extend(self.neighbors(node_id, TraversalDirection::In, etype));
+          // A self-loop is also an out-edge: list it once.
+          out.extend(
+            self
+              .neighbors(node_id, TraversalDirection::In, etype)
+              .into_iter()
+              .filter(|edge| edge.src != edge.dst),
+          );
           out
         }
       }
@@ -794,7 +802,7 @@ mod tests {
       .and_then(|def| def.etype_id)
       .expect("etype");
 
-    let edges = neighbors(ray.raw(), a, TraversalDirection::Both, None);
+    let edges = ray.neighbors(a, TraversalDirection::Both, None);
     assert_eq!(
       edges,
       vec![Edge {
