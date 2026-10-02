@@ -123,7 +123,7 @@ fn parse_manifest(manifest_json: &str, dimensions: usize) -> PyResult<VectorMani
 // ============================================================================
 
 /// Configuration for IVF index
-#[pyclass(name = "IvfConfig")]
+#[pyclass(name = "IvfConfig", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyIvfConfig {
   /// Number of clusters (default: 100)
@@ -181,7 +181,7 @@ impl PyIvfConfig {
 // ============================================================================
 
 /// Configuration for Product Quantization
-#[pyclass(name = "PqConfig")]
+#[pyclass(name = "PqConfig", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyPqConfig {
   /// Number of subspaces (must divide dimensions evenly)
@@ -244,7 +244,7 @@ impl PyPqConfig {
 // ============================================================================
 
 /// Options for vector search
-#[pyclass(name = "SearchOptions")]
+#[pyclass(name = "SearchOptions", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PySearchOptions {
   /// Number of clusters to probe (overrides index default; must be positive)
@@ -290,7 +290,7 @@ impl PySearchOptions {
 // ============================================================================
 
 /// Result of a vector search
-#[pyclass(name = "SearchResult")]
+#[pyclass(name = "SearchResult", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PySearchResult {
   /// Vector ID
@@ -333,7 +333,7 @@ impl From<VectorSearchResult> for PySearchResult {
 // ============================================================================
 
 /// Statistics for IVF index
-#[pyclass(name = "IvfStats")]
+#[pyclass(name = "IvfStats", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyIvfStats {
   /// Whether the index is trained
@@ -426,7 +426,7 @@ impl PyIvfIndex {
 
   /// Train the index on added training vectors
   fn train(&self, py: Python<'_>) -> PyResult<()> {
-    py.allow_threads(|| {
+    py.detach(|| {
       let mut index = self.inner.write().map_err(errors::poisoned)?;
       index
         .train()
@@ -650,7 +650,7 @@ impl PyIvfPqIndex {
 
   /// Train the index
   fn train(&self, py: Python<'_>) -> PyResult<()> {
-    py.allow_threads(|| {
+    py.detach(|| {
       let mut index = self.inner.write().map_err(errors::poisoned)?;
       index
         .train()
@@ -810,7 +810,7 @@ impl PyIvfPqIndex {
 // ============================================================================
 
 /// Brute force search result
-#[pyclass(name = "BruteForceResult")]
+#[pyclass(name = "BruteForceResult", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyBruteForceResult {
   #[pyo3(get)]

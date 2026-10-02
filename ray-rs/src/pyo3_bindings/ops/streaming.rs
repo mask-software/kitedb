@@ -80,7 +80,7 @@ impl NodeBatchIterator {
     slf
   }
 
-  fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+  fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
     if self.pos >= self.ids.len() {
       return Ok(None);
     }
@@ -156,7 +156,7 @@ impl EdgeBatchIterator {
     slf
   }
 
-  fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+  fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
     if self.pos >= self.edges.len() {
       return Ok(None);
     }

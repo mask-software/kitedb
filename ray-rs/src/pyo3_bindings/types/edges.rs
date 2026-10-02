@@ -3,7 +3,7 @@
 use pyo3::prelude::*;
 
 /// Edge representation (neighbor style - used for traversal results)
-#[pyclass(name = "Edge")]
+#[pyclass(name = "Edge", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct Edge {
   #[pyo3(get)]
@@ -29,7 +29,7 @@ impl Edge {
 }
 
 /// Full edge representation (src, etype, dst)
-#[pyclass(name = "FullEdge")]
+#[pyclass(name = "FullEdge", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct FullEdge {
   #[pyo3(get)]

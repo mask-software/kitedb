@@ -5,7 +5,7 @@ use crate::types::CheckResult as RustCheckResult;
 use pyo3::prelude::*;
 
 /// Database statistics
-#[pyclass(name = "DbStats")]
+#[pyclass(name = "DbStats", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct DbStats {
   #[pyo3(get)]
@@ -58,7 +58,7 @@ impl DbStats {
 }
 
 /// Database integrity check result
-#[pyclass(name = "CheckResult")]
+#[pyclass(name = "CheckResult", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct CheckResult {
   #[pyo3(get)]
@@ -126,7 +126,7 @@ impl From<RustCheckResult> for CheckResult {
 }
 
 /// Cache statistics
-#[pyclass(name = "CacheStats")]
+#[pyclass(name = "CacheStats", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct CacheStats {
   #[pyo3(get)]

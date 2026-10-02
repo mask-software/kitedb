@@ -4,7 +4,7 @@ use super::edges::FullEdge;
 use pyo3::prelude::*;
 
 /// Page of node IDs (cursor-based pagination)
-#[pyclass(name = "NodePage")]
+#[pyclass(name = "NodePage", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct NodePage {
   #[pyo3(get)]
@@ -77,7 +77,7 @@ impl NodePageIterator {
 }
 
 /// Page of edges (cursor-based pagination)
-#[pyclass(name = "EdgePage")]
+#[pyclass(name = "EdgePage", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct EdgePage {
   #[pyo3(get)]

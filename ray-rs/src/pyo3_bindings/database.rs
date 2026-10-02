@@ -139,7 +139,7 @@ impl PyDatabase {
 
   /// Runs `f` under the read lock with the GIL released.
   ///
-  /// The lock is taken inside `allow_threads`, so this thread never holds it
+  /// The lock is taken inside `detach`, so this thread never holds it
   /// while waiting for the GIL (which would deadlock against a thread that
   /// holds the GIL and waits for the lock).
   pub(crate) fn with_db_nogil<T: Send>(
@@ -147,7 +147,7 @@ impl PyDatabase {
     py: Python<'_>,
     f: impl FnOnce(&RustSingleFileDB) -> PyResult<T> + Send,
   ) -> PyResult<T> {
-    py.allow_threads(|| self.with_db(f))
+    py.detach(|| self.with_db(f))
   }
 
   /// Closes the database with the GIL released, after an optional close-time
@@ -161,7 +161,7 @@ impl PyDatabase {
   /// fails the database is still closed (the WAL keeps every commit), and the
   /// checkpoint error is raised afterwards.
   fn close_nogil(&self, py: Python<'_>, checkpoint_threshold: Option<f64>) -> PyResult<()> {
-    py.allow_threads(|| {
+    py.detach(|| {
       let checkpoint = match checkpoint_threshold {
         Some(threshold) => self.close_checkpoint(threshold),
         None => Ok(()),
@@ -215,7 +215,7 @@ impl PyDatabase {
 
     let opts = options.to_single_file_options()?;
     let db = py
-      .allow_threads(|| open_single_file(&db_path, opts))
+      .detach(|| open_single_file(&db_path, opts))
       .map_err(|e| errors::wrap(e, "Failed to open database"))?;
     Ok(PyDatabase {
       inner: RwLock::new(Some(DatabaseInner::SingleFile(Box::new(db)))),
@@ -246,9 +246,9 @@ impl PyDatabase {
   fn __exit__(
     &self,
     py: Python<'_>,
-    _exc_type: Option<PyObject>,
-    _exc_value: Option<PyObject>,
-    _traceback: Option<PyObject>,
+    _exc_type: Option<Py<PyAny>>,
+    _exc_value: Option<Py<PyAny>>,
+    _traceback: Option<Py<PyAny>>,
   ) -> PyResult<bool> {
     self.close(py)?;
     Ok(false)
@@ -322,7 +322,7 @@ impl PyDatabase {
       validation::non_negative_u64("timeout_ms", timeout_ms, validation::MAX_DURATION_MS as u64)?;
     let token = CommitToken::from_str(&token).map_err(|e| errors::wrap(e, "Invalid token"))?;
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    py.allow_threads(|| loop {
+    py.detach(|| loop {
       // A zero timeout makes the core call a single non-blocking check.
       let observed = self.with_db(|db| {
         db.wait_for_token(token, 0)
@@ -340,7 +340,7 @@ impl PyDatabase {
   }
 
   /// Primary replication status dictionary when role=primary, else None.
-  fn primary_replication_status(&self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+  fn primary_replication_status(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
     let guard = self.inner.read().map_err(errors::poisoned)?;
     match guard.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
@@ -348,7 +348,7 @@ impl PyDatabase {
           return Ok(None);
         };
 
-        let out = PyDict::new_bound(py);
+        let out = PyDict::new(py);
         out.set_item("role", status.role.to_string())?;
         out.set_item("epoch", status.epoch)?;
         out.set_item("head_log_index", status.head_log_index)?;
@@ -367,9 +367,9 @@ impl PyDatabase {
         out.set_item("append_failures", status.append_failures)?;
         out.set_item("append_successes", status.append_successes)?;
 
-        let lags = PyList::empty_bound(py);
+        let lags = PyList::empty(py);
         for lag in status.replica_lags {
-          let lag_item = PyDict::new_bound(py);
+          let lag_item = PyDict::new(py);
           lag_item.set_item("replica_id", lag.replica_id)?;
           lag_item.set_item("epoch", lag.epoch)?;
           lag_item.set_item("applied_log_index", lag.applied_log_index)?;
@@ -377,14 +377,14 @@ impl PyDatabase {
         }
         out.set_item("replica_lags", lags)?;
 
-        Ok(Some(out.into_py(py)))
+        Ok(Some(out.into_any().unbind()))
       }
       None => Err(errors::closed()),
     }
   }
 
   /// Replica replication status dictionary when role=replica, else None.
-  fn replica_replication_status(&self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+  fn replica_replication_status(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
     let guard = self.inner.read().map_err(errors::poisoned)?;
     match guard.as_ref() {
       Some(DatabaseInner::SingleFile(db)) => {
@@ -392,7 +392,7 @@ impl PyDatabase {
           return Ok(None);
         };
 
-        let out = PyDict::new_bound(py);
+        let out = PyDict::new(py);
         out.set_item("role", status.role.to_string())?;
         out.set_item(
           "source_db_path",
@@ -410,7 +410,7 @@ impl PyDatabase {
         out.set_item("applied_log_index", status.applied_log_index)?;
         out.set_item("last_error", status.last_error)?;
         out.set_item("needs_reseed", status.needs_reseed)?;
-        Ok(Some(out.into_py(py)))
+        Ok(Some(out.into_any().unbind()))
       }
       None => Err(errors::closed()),
     }
@@ -2376,7 +2376,7 @@ pub fn restore_backup(
   options: Option<RestoreOptions>,
 ) -> PyResult<String> {
   let opts: core_backup::RestoreOptions = options.unwrap_or_default().into();
-  py.allow_threads(|| core_backup::restore_backup(backup_path, restore_path, opts))
+  py.detach(|| core_backup::restore_backup(backup_path, restore_path, opts))
     .map(|p| p.to_string_lossy().to_string())
     .map_err(errors::wrap_plain)
 }
@@ -2397,7 +2397,7 @@ pub fn create_offline_backup(
   options: Option<OfflineBackupOptions>,
 ) -> PyResult<BackupResult> {
   let opts: core_backup::OfflineBackupOptions = options.unwrap_or_default().into();
-  py.allow_threads(|| core_backup::create_offline_backup(db_path, backup_path, opts))
+  py.detach(|| core_backup::create_offline_backup(db_path, backup_path, opts))
     .map(BackupResult::from)
     .map_err(errors::wrap_plain)
 }
