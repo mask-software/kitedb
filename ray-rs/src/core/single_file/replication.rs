@@ -1858,3 +1858,9 @@ mod b4_tests;
 #[cfg(test)]
 #[path = "b4_repl_flake_catch_up_tests.rs"]
 mod b4_repl_flake_catch_up_tests;
+
+/// raydb-b4 leftovers: a second primary instance on a sidecar a live
+/// instance in this process holds.
+#[cfg(test)]
+#[path = "b4_leftovers_tests.rs"]
+mod b4_leftovers_tests;
