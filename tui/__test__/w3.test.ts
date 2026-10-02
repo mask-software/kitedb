@@ -8,6 +8,10 @@
  * C11a:     q/Esc call process.exit(0) without closing the open database.
  * C11b:     DbService.nodeKeyCache stores null for missing nodes and is not cleared by importJson,
  *           so nodes created by an import keep showing no key.
+ * C11-edges: getNodeDetail reads `src`/`dst` from getOutEdges/getInEdges, which return
+ *           `{ etype, nodeId }`, so every edge in the node details shows undefined endpoints.
+ * C11-build: scripts/build.ts imports a named `solidPlugin` that @opentui/solid/bun-plugin doesn't
+ *           export (it has a default export), so `bun run build` fails.
  *
  * Each test isolates its finding from the others: the C11-open and C11a tests add a `key` field to
  * each key event (withLegacyKeyField), and the C11a tests stub the missing type-list methods
@@ -17,7 +21,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { Database } from "@kitedb/core";
 import { testRender } from "@opentui/solid";
 import { App } from "../src/app.tsx";
@@ -226,5 +230,53 @@ describe("C11b: DbService node key cache", () => {
     expect(page.items.length).toBe(3);
     const keys = page.items.map((id) => service.getNodeKey(id)).sort();
     expect(keys).toEqual(["user:alice", "user:bob", "user:carol"]);
+  });
+});
+
+describe("C11-edges: node details", () => {
+  test("C11-edges: getNodeDetail reports each edge's source and destination", async () => {
+    const dir = await scratchDir();
+    const dbPath = join(dir, "edges.kitedb");
+    const db = Database.open(dbPath);
+    db.begin();
+    const alice = db.createNode("user:alice");
+    const bob = db.createNode("user:bob");
+    db.addEdgeByName(alice, "follows", bob);
+    db.commit();
+    db.close();
+
+    const service = new DbService();
+    cleanups.push(() => service.close());
+    service.open(dbPath, true);
+
+    const aliceDetail = service.getNodeDetail(alice)!;
+    expect(aliceDetail.outEdges.map(({ src, etypeName, dst }) => ({ src, etypeName, dst }))).toEqual([
+      { src: alice, etypeName: "follows", dst: bob },
+    ]);
+    const bobDetail = service.getNodeDetail(bob)!;
+    expect(bobDetail.inEdges.map(({ src, etypeName, dst }) => ({ src, etypeName, dst }))).toEqual([
+      { src: alice, etypeName: "follows", dst: bob },
+    ]);
+  });
+});
+
+describe("C11-build: build script", () => {
+  test("C11-build: bun run build bundles the app", async () => {
+    const outdir = await scratchDir();
+    const tuiDir = resolve(import.meta.dir, "..");
+    // The script writes to dist/; run a copy of it that writes to a scratch directory instead.
+    const script = (await Bun.file(join(tuiDir, "scripts/build.ts")).text()).replace(
+      'outdir: "dist"',
+      `outdir: ${JSON.stringify(outdir)}`,
+    );
+    expect(script).toContain(outdir);
+    const scriptPath = join(tuiDir, "scripts", `.w3-build-${process.pid}.ts`);
+    await Bun.write(scriptPath, script);
+    cleanups.push(() => rm(scriptPath, { force: true }));
+
+    const proc = Bun.spawn(["bun", "run", scriptPath], { cwd: tuiDir, stdout: "pipe", stderr: "pipe" });
+    const [exitCode, stderr] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
+    expect({ exitCode, stderr: stderr.slice(0, 500) }).toEqual({ exitCode: 0, stderr: "" });
+    expect(await Bun.file(join(outdir, "main.js")).exists()).toBe(true);
   });
 });
