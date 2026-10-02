@@ -45,6 +45,40 @@ pub fn crc32_multi(segments: &[&[u8]]) -> u32 {
   hasher.finalize()
 }
 
+/// The CRC-32 (IEEE) of `data` followed by `zeros` zero bytes, without
+/// reading the zeros: their effect on the CRC register is a linear map,
+/// computed once per length and cached (a database header page is a few
+/// hundred bytes of fields and zeros up to its footer checksum).
+pub fn crc32_zero_extended(data: &[u8], zeros: usize) -> u32 {
+  let columns = zero_run_columns(zeros);
+  let register = !crc32(data);
+  let shifted = (0..32)
+    .filter(|bit| register >> bit & 1 == 1)
+    .fold(0, |shifted, bit| shifted ^ columns[bit]);
+  !shifted
+}
+
+/// The images of the CRC register's 32 unit vectors after `len` zero bytes.
+fn zero_run_columns(len: usize) -> [u32; 32] {
+  static CACHE: std::sync::Mutex<Vec<(usize, [u32; 32])>> = std::sync::Mutex::new(Vec::new());
+  let mut cache = CACHE
+    .lock()
+    .unwrap_or_else(|poisoned| poisoned.into_inner());
+  if let Some((_, columns)) = cache.iter().find(|(cached, _)| *cached == len) {
+    return *columns;
+  }
+  let zeros = vec![0u8; len];
+  let mut columns = [0u32; 32];
+  for (bit, column) in columns.iter_mut().enumerate() {
+    // A hasher's state is the finalized CRC, the register inverted.
+    let mut hasher = Hasher::new_with_initial(!(1u32 << bit));
+    hasher.update(&zeros);
+    *column = !hasher.finalize();
+  }
+  cache.push((len, columns));
+  columns
+}
+
 /// Verify that the CRC-32 (IEEE) of `data` is `expected`
 #[inline]
 pub fn verify_crc32(data: &[u8], expected: u32) -> bool {
@@ -109,6 +143,22 @@ mod tests {
   #[test]
   fn test_crc32_is_ieee() {
     assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+  }
+
+  #[test]
+  fn crc32_zero_extended_matches_the_crc_of_the_zeros() {
+    let data: Vec<u8> = (0..300u32).map(|i| (i * 7 + 3) as u8).collect();
+    for zeros in [0, 1, 7, 3916, 65_356] {
+      for prefix in [0, 1, 180, 300] {
+        let mut whole = data[..prefix].to_vec();
+        whole.resize(prefix + zeros, 0);
+        assert_eq!(
+          crc32_zero_extended(&data[..prefix], zeros),
+          crc32(&whole),
+          "{prefix} bytes and {zeros} zeros"
+        );
+      }
+    }
   }
 
   #[test]

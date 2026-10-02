@@ -7,7 +7,7 @@ use crate::core::pager::FilePager;
 use crate::error::{KiteError, Result};
 use crate::types::{DbHeaderV1, DB_HEADER_FIXED_SIZE};
 use crate::util::binary::*;
-use crate::util::crc::crc32;
+use crate::util::crc::{crc32, crc32_zero_extended};
 
 /// Two physical header pages. A new header is written to the inactive page,
 /// synced, and selected by generation during the next open.
@@ -201,7 +201,9 @@ impl DbHeaderV1 {
     let header_crc = crc32(&buf[..HEADER_CRC_OFFSET]);
     write_u32(&mut buf, HEADER_CRC_OFFSET, header_crc);
 
-    let footer_crc = crc32(&buf[..page_size - 4]);
+    // Every byte between the header checksum and the footer is zero.
+    let fields_end = HEADER_CRC_OFFSET + 4;
+    let footer_crc = crc32_zero_extended(&buf[..fields_end], page_size - 4 - fields_end);
     write_u32(&mut buf, page_size - 4, footer_crc);
     buf
   }
