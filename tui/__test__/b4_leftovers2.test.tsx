@@ -137,6 +137,27 @@ describe("small: an 80x24 terminal", () => {
     expect(frame).toMatch(/│ Filters +│ │ Nodes \(page 1\) +│ │ Details +│/);
   });
 
+  test("small: the sidebar's lines stay whole and in order, cut off at the bottom if need be", async () => {
+    const setup = await renderSmall();
+    const frame = setup.captureCharFrame();
+    const sidebar = boxText(frame, boxShowing(frame, "Filters"));
+    const lines = [
+      "Filters",
+      "Node prefix: (empty)",
+      "Edge type: (empty)",
+      "Shortcuts",
+      "o open path",
+      "c close db",
+      "w unlock writes",
+      "n/e/s/p tabs",
+      "f filter field",
+      "i import / x export",
+      "j/k or arrows",
+    ];
+    expect(sidebar.length).toBeGreaterThanOrEqual(4);
+    expect(sidebar).toEqual(lines.slice(0, sidebar.length));
+  });
+
   test("small: the panes have room for a node, its details and the status", async () => {
     const setup = await renderSmallOpenDb();
     const frame = setup.captureCharFrame();
@@ -145,6 +166,26 @@ describe("small: an 80x24 terminal", () => {
     expect(details).toContain("Key: user:alice");
     expect(details).toContainEqual(expect.stringMatching(/^follows -> \d+$/));
     expect(boxText(frame, statusBar(frame))).toEqual(["Opened read-only"]);
+  });
+
+  test("small: resizing between a tall and a short terminal switches the spacing both ways", async () => {
+    const setup = await renderApp(140, 45);
+    const roomy = setup.captureCharFrame();
+    expect(roomy.split("\n")[0]!.trim()).toBe("");
+
+    setup.resize(WIDTH, HEIGHT);
+    await setup.renderOnce();
+    const small = setup.captureCharFrame();
+    expect(small.split("\n")[0]).toStartWith("╭");
+    expect(brokenBorders(small)).toEqual([]);
+    expect(boxText(small, statusBar(small))).toEqual(["Ready"]);
+
+    setup.resize(140, 45);
+    await setup.renderOnce();
+    // The same layout again. (The list's scrollbar thumb, drawn while the empty list's height
+    // settles, may not come back: compare without it.)
+    const thumbless = (frame: string) => frame.replaceAll("█", " ");
+    expect(thumbless(setup.captureCharFrame())).toBe(thumbless(roomy));
   });
 
   test("small: the unlock modal fits, whole", async () => {

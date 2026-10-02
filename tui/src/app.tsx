@@ -1,11 +1,21 @@
 import { createEffect, createMemo, createSignal, For, onCleanup, Show, type Accessor } from "solid-js";
 import type { KeyEvent, TabSelectOption, TabSelectRenderable } from "@opentui/core";
-import { useKeyboard, useRenderer, type JSX } from "@opentui/solid";
+import { useKeyboard, useRenderer, useTerminalDimensions, type JSX } from "@opentui/solid";
 import { DbService } from "./db/db-service.ts";
 import { nextPage, prevPage } from "./db/paging.ts";
 import type { FullEdge, DbStats } from "@kitedb/core";
 
 const PAGE_SIZE = 100;
+
+/**
+ * The layout puts a blank row around and between its blocks when the terminal has at least this
+ * many rows: the 21 rows of the header, tab bar, status bar and their spacing, plus the sidebar's 18.
+ * On a shorter one those rows would leave the panes no room, so they go.
+ */
+const ROOMY_MIN_HEIGHT = 39;
+
+/** The sidebar's narrowest width: its longest line ("Node prefix: (empty)"), padding and border. */
+const SIDEBAR_MIN_WIDTH = 24;
 
 type TabKey = "nodes" | "edges" | "stats" | "import";
 
@@ -44,6 +54,9 @@ function keyOf(event: KeyEvent): string | null {
 export function App() {
   const db = new DbService();
   const renderer = useRenderer();
+  const dimensions = useTerminalDimensions();
+  /** Blank rows around and between blocks: 1, or 0 on a short terminal. */
+  const space = createMemo(() => (dimensions().height >= ROOMY_MIN_HEIGHT ? 1 : 0));
   // q/Esc, Ctrl+C and exit signals all end the app by destroying the renderer, which disposes this
   // component: close the database here so every way out closes it.
   onCleanup(() => db.close());
@@ -556,23 +569,37 @@ export function App() {
   });
 
   return (
-    <box flexDirection="column" height="100%" width="100%" padding={1} gap={1}>
-      {/* Boxes shrink by default: the header and the status bar keep their size, the panes give. */}
-      <box flexDirection="row" flexShrink={0} borderStyle="rounded" padding={1} gap={2}>
+    <box flexDirection="column" height="100%" width="100%" padding={space()} gap={space()}>
+      {/*
+        Boxes shrink by default: the header and the status bar keep their size, the panes give.
+        Every bordered box clips its content (overflow hidden): what doesn't fit is cut off at its
+        border instead of drawing over its neighbours.
+      */}
+      <box
+        flexDirection="row"
+        flexShrink={0}
+        borderStyle="rounded"
+        overflow="hidden"
+        paddingLeft={1}
+        paddingRight={1}
+        paddingTop={space()}
+        paddingBottom={space()}
+        gap={2}
+      >
         {/* The first and last columns share the width the middle one leaves; long paths truncate. */}
-        <box flexDirection="column" gap={1} flexGrow={1} flexBasis={0}>
+        <box flexDirection="column" gap={space()} flexGrow={1} flexBasis={0}>
           <text><b>KiteDB Explorer</b></text>
           <text fg={dbConnected() ? "green" : "yellow"}>
             {dbConnected() ? "Connected" : "No database"}
           </text>
           <text wrapMode="none" truncate>Path: {dbPath() ?? "-"}</text>
         </box>
-        <box flexDirection="column" gap={1} flexShrink={0}>
+        <box flexDirection="column" gap={space()} flexShrink={0}>
           <text>Read-only: {dbReadOnly() ? "yes" : "no"}</text>
           <text>Nodes: {stats()?.snapshotNodes?.toString() ?? "-"}</text>
           <text>Edges: {stats()?.snapshotEdges?.toString() ?? "-"}</text>
         </box>
-        <box flexDirection="column" gap={1} flexGrow={1} flexBasis={0}>
+        <box flexDirection="column" gap={space()} flexGrow={1} flexBasis={0}>
           <InputField label="Open path" value={openPath()} placeholder="(press o)" active={activeInput() === "openPath"} />
           <text fg={dbReadOnly() ? "yellow" : "green"}>
             {dbReadOnly() ? "Press w to unlock" : "Write enabled"}
@@ -591,8 +618,9 @@ export function App() {
       />
 
       <box flexDirection="row" flexGrow={1} gap={1}>
-        <box borderStyle="rounded" padding={1} width="26%" flexDirection="column" gap={1}>
-          <box flexDirection="column" gap={1}>
+        <Pane space={space()} width="26%" minWidth={SIDEBAR_MIN_WIDTH}>
+          {/* Blocks keep their height: what doesn't fit is clipped at the bottom, not overlapped. */}
+          <box flexDirection="column" flexShrink={0} gap={space()}>
             <text><b>Filters</b></text>
             <FilterField label="Node prefix" value={nodeFilter()} active={activeInput() === "nodeFilter"} />
             <FilterField label="Edge type" value={edgeFilter()} active={activeInput() === "edgeFilter"} />
@@ -601,7 +629,7 @@ export function App() {
             </Show>
           </box>
 
-          <box flexDirection="column" gap={1}>
+          <box flexDirection="column" flexShrink={0}>
             <text><b>Shortcuts</b></text>
             <text>o open path</text>
             <text>c close db</text>
@@ -611,16 +639,21 @@ export function App() {
             <text>i import / x export</text>
             <text>j/k or arrows</text>
           </box>
-        </box>
+        </Pane>
 
-        <box borderStyle="rounded" padding={1} width="40%" flexDirection="column" gap={1}>
+        <Pane space={space()} width="40%">
           <Show when={activeTab() === "nodes"}>
-            <box flexDirection="column" gap={1}>
+            <box flexDirection="column" flexGrow={1} gap={space()}>
               <text><b>Nodes (page {nodeHistory().length + 1})</b></text>
               <scrollbox flexGrow={1}>
                 <ListOrEmpty each={nodesPage().items} empty="No nodes on this page">
                   {(nodeId, index) => (
-                    <text bg={index() === selectedNodeIndex() ? "cyan" : undefined} fg={index() === selectedNodeIndex() ? "black" : "white"}>
+                    <text
+                      wrapMode="none"
+                      truncate
+                      bg={index() === selectedNodeIndex() ? "cyan" : undefined}
+                      fg={index() === selectedNodeIndex() ? "black" : "white"}
+                    >
                       {nodeId.toString().padEnd(8)} {db.getNodeKey(nodeId) ?? "(no key)"}
                     </text>
                   )}
@@ -631,14 +664,19 @@ export function App() {
           </Show>
 
           <Show when={activeTab() === "edges"}>
-            <box flexDirection="column" gap={1}>
+            <box flexDirection="column" flexGrow={1} gap={space()}>
               <text><b>Edges (page {edgeHistory().length + 1})</b></text>
               <scrollbox flexGrow={1}>
                 <ListOrEmpty each={edgesPage().items} empty="No edges on this page">
                   {(edge, index) => {
                     const name = db.getEdgeTypeName(edge.etype) ?? `#${edge.etype}`;
                     return (
-                      <text bg={index() === selectedEdgeIndex() ? "cyan" : undefined} fg={index() === selectedEdgeIndex() ? "black" : "white"}>
+                      <text
+                        wrapMode="none"
+                        truncate
+                        bg={index() === selectedEdgeIndex() ? "cyan" : undefined}
+                        fg={index() === selectedEdgeIndex() ? "black" : "white"}
+                      >
                         {`${edge.src} -[${name}]-> ${edge.dst}`}
                       </text>
                     );
@@ -650,11 +688,11 @@ export function App() {
           </Show>
 
           <Show when={activeTab() === "stats"}>
-            <box flexDirection="column" gap={1}>
+            <box flexDirection="column" gap={space()}>
               <text><b>Stats</b></text>
               <Show when={stats()} fallback={<text fg="yellow">No stats available</text>}>
                 {(current) => (
-                  <box flexDirection="column" gap={1}>
+                  <box flexDirection="column" gap={space()}>
                     <text>Snapshot nodes: {current().snapshotNodes.toString()}</text>
                     <text>Snapshot edges: {current().snapshotEdges.toString()}</text>
                     <text>Delta created: {current().deltaNodesCreated}</text>
@@ -664,14 +702,14 @@ export function App() {
                   </box>
                 )}
               </Show>
-              <box flexDirection="column" gap={1}>
+              <box flexDirection="column" gap={space()}>
                 <text><b>Labels</b></text>
                 <For each={labels()}>{(name) => <text>- {name}</text>}</For>
                 <Show when={labels().length === 0}>
                   <text fg="yellow">No labels</text>
                 </Show>
               </box>
-              <box flexDirection="column" gap={1}>
+              <box flexDirection="column" gap={space()}>
                 <text><b>Edge types</b></text>
                 <For each={edgeTypes()}>{(name) => <text>- {name}</text>}</For>
                 <Show when={edgeTypes().length === 0}>
@@ -682,7 +720,7 @@ export function App() {
           </Show>
 
           <Show when={activeTab() === "import"}>
-            <box flexDirection="column" gap={1}>
+            <box flexDirection="column" gap={space()}>
               <text><b>Import / Export</b></text>
               <text>Import (JSON):</text>
               <InputField label="Path" value={importPath()} active={activeInput() === "importPath"} />
@@ -697,9 +735,9 @@ export function App() {
               <text>Press m to toggle export mode</text>
             </box>
           </Show>
-        </box>
+        </Pane>
 
-        <box borderStyle="rounded" padding={1} flexGrow={1} flexBasis={0} flexDirection="column" gap={1}>
+        <Pane space={space()} flexGrow={1} flexBasis={0}>
           <text><b>Details</b></text>
           <Show when={activeTab() === "nodes" && selectedNodeDetail()}>
             {(detail) => (
@@ -742,10 +780,19 @@ export function App() {
           <Show when={activeTab() !== "nodes" && activeTab() !== "edges"}>
             <text fg="yellow">Select Nodes or Edges to inspect details</text>
           </Show>
-        </box>
+        </Pane>
       </box>
 
-      <box flexDirection="row" flexShrink={0} borderStyle="rounded" padding={1}>
+      <box
+        flexDirection="row"
+        flexShrink={0}
+        borderStyle="rounded"
+        overflow="hidden"
+        paddingLeft={1}
+        paddingRight={1}
+        paddingTop={space()}
+        paddingBottom={space()}
+      >
         <text>
           {statusMessage() ?? "Ready"}
         </text>
@@ -783,6 +830,38 @@ export function App() {
           <text>Press y to confirm, n to cancel.</text>
         </box>
       </Show>
+    </box>
+  );
+}
+
+/**
+ * One of the three panes: a bordered column that clips what doesn't fit. `space` is the blank rows
+ * around and between its blocks.
+ */
+function Pane(props: {
+  space: number;
+  width?: `${number}%`;
+  minWidth?: number;
+  flexGrow?: number;
+  flexBasis?: number;
+  children: JSX.Element;
+}) {
+  return (
+    <box
+      borderStyle="rounded"
+      overflow="hidden"
+      flexDirection="column"
+      width={props.width}
+      minWidth={props.minWidth}
+      flexGrow={props.flexGrow}
+      flexBasis={props.flexBasis}
+      paddingLeft={1}
+      paddingRight={1}
+      paddingTop={props.space}
+      paddingBottom={props.space}
+      gap={props.space}
+    >
+      {props.children}
     </box>
   );
 }
