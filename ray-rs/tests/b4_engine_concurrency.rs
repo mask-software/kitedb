@@ -7,7 +7,9 @@
 //! - F3: a zero-pause `background_checkpoint()` loop does not starve blocking
 //!   `checkpoint()` and optimize.
 //! - F5: `count_nodes` does not materialize every node id.
-//! - F6: commits are not blocked for the length of a background checkpoint.
+//! - F6: commits are not blocked for the length of a background checkpoint
+//!   (the guard holds the checkpoint at a phase hook, so it is a unit test:
+//!   `src/core/single_file/b4_commit_pipeline_checkpoint_tests.rs`).
 //! - F7: readers outside a transaction see consistent state while vacuum and
 //!   `resize_wal` relocate the snapshot.
 //!
@@ -1077,36 +1079,9 @@ fn f5_bench_reads_and_count_nodes() {
 // F6: commit latency during a background checkpoint
 // ============================================================================
 
-/// While a background checkpoint of a ~100k-node graph collects and writes its
-/// snapshot, commits keep going: they wait only for the cut (a copy of the
-/// delta) and the install (a replay of the post-cut commits), never for the
-/// snapshot decode. Already the case on main (the background run collects
-/// from the delta copied at its cut); kept as a guard.
-#[test]
-fn f6_commits_are_not_blocked_for_a_whole_background_checkpoint_guard() {
-  let dir = tempfile::tempdir().expect("tempdir");
-  let db = f6_graph(&dir.path().join("f6-latency.kitedb"));
-  // Paced commits: an unpaced writer piles up post-cut commits, whose replay
-  // at the install is measured by `f6_bench_unpaced_commits_during_background_checkpoint`.
-  let (checkpoint_time, latencies) =
-    commits_during_background_checkpoint(&db, Some(Duration::from_micros(500)));
-  let (median, max) = latency_summary(&latencies);
-  println!(
-    "f6 background checkpoint of {F6_NODES} nodes took {checkpoint_time:?}; {} commits ran \
-     meanwhile, median {median:?}, max {max:?}",
-    latencies.len()
-  );
-  assert!(
-    latencies.len() >= 10,
-    "only {} commits completed during a {checkpoint_time:?} background checkpoint",
-    latencies.len()
-  );
-  assert!(
-    max * 3 <= checkpoint_time,
-    "a commit waited {max:?} during a {checkpoint_time:?} background checkpoint"
-  );
-  assert!(db.node_by_key("during-0").is_some());
-}
+// The F6 guard (commits keep going while a background checkpoint collects and
+// writes its snapshot) holds the checkpoint at a phase hook, so it lives in
+// `src/core/single_file/b4_commit_pipeline_checkpoint_tests.rs`.
 
 /// Commits as fast as one thread can during a background checkpoint: all of
 /// them are post-cut commits its install replays. Numbers only:
@@ -1117,7 +1092,7 @@ fn f6_bench_unpaced_commits_during_background_checkpoint() {
   for run in 0..3 {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = f6_graph(&dir.path().join("f6-bench.kitedb"));
-    let (checkpoint_time, latencies) = commits_during_background_checkpoint(&db, None);
+    let (checkpoint_time, latencies) = commits_during_background_checkpoint(&db);
     let (median, max) = latency_summary(&latencies);
     println!(
       "f6 bench run {run}: background checkpoint {checkpoint_time:?}, {} unpaced commits \
@@ -1156,12 +1131,9 @@ fn f6_graph(path: &Path) -> Arc<SingleFileDB> {
   db
 }
 
-/// Run a background checkpoint while this thread commits, `pace` apart; the
-/// checkpoint's duration and each commit's latency.
-fn commits_during_background_checkpoint(
-  db: &Arc<SingleFileDB>,
-  pace: Option<Duration>,
-) -> (Duration, Vec<Duration>) {
+/// Run a background checkpoint while this thread commits; the checkpoint's
+/// duration and each commit's latency.
+fn commits_during_background_checkpoint(db: &Arc<SingleFileDB>) -> (Duration, Vec<Duration>) {
   let running = Arc::new(AtomicBool::new(true));
   let checkpointer = {
     let (db, running) = (Arc::clone(db), Arc::clone(&running));
@@ -1180,9 +1152,6 @@ fn commits_during_background_checkpoint(
     commit_node(db, &format!("during-{index}"));
     latencies.push(started.elapsed());
     index += 1;
-    if let Some(pace) = pace {
-      thread::sleep(pace);
-    }
   }
   let (result, checkpoint_time) = checkpointer.join().expect("checkpointer");
   result.expect("background checkpoint");

@@ -5065,3 +5065,9 @@ mod b4_wal_perf_tests;
 #[cfg(test)]
 #[path = "b4_core_misc_checkpoint_tests.rs"]
 mod b4_core_misc_tests;
+
+/// raydb-b4 commit-pipeline: commits during a background checkpoint, held at
+/// a phase hook.
+#[cfg(test)]
+#[path = "b4_commit_pipeline_checkpoint_tests.rs"]
+mod b4_commit_pipeline_tests;
