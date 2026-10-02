@@ -29,22 +29,7 @@ pub enum DistanceMetric {
 impl DistanceMetric {
   /// Get distance function for this metric
   pub fn distance_fn(&self) -> fn(&[f32], &[f32]) -> f32 {
-    match self {
-      DistanceMetric::Cosine => super::distance::cosine_distance,
-      DistanceMetric::Euclidean => super::distance::euclidean_distance,
-      DistanceMetric::DotProduct => |a, b| -super::distance::dot_product(a, b),
-    }
-  }
-
-  /// Distance from a prepared query (unit length for cosine) to a stored vector.
-  ///
-  /// `distance_fn` assumes cosine operands are unit length. Stores that skip
-  /// normalization on insert need the stored vector's norm divided out.
-  pub(crate) fn stored_distance_fn(&self, stored_normalized: bool) -> fn(&[f32], &[f32]) -> f32 {
-    match self {
-      DistanceMetric::Cosine if !stored_normalized => super::distance::cosine_distance_unit_query,
-      _ => self.distance_fn(),
-    }
+    super::distance::metric_distance_fn(*self)
   }
 
   /// Convert distance to similarity score (0-1 range, higher is more similar)
@@ -135,8 +120,13 @@ impl VectorStoreConfig {
   }
 
   /// Set the distance metric
+  ///
+  /// Also resets `normalize_on_insert` to the metric's default (true only for
+  /// cosine, since normalizing changes Euclidean and dot-product distances).
+  /// Call `with_normalize` afterwards to override.
   pub fn with_metric(mut self, metric: DistanceMetric) -> Self {
     self.metric = metric;
+    self.normalize_on_insert = metric == DistanceMetric::Cosine;
     self
   }
 

@@ -22,9 +22,14 @@ use std::collections::{HashMap, HashSet};
 use rayon::prelude::*;
 
 use crate::types::NodeId;
-use crate::vector::distance::{normalize, normalize_in_place};
+use crate::vector::distance::{normalize, normalize_in_place, with_metric_distance};
+use crate::vector::ivf::index::nearest_first;
+use crate::vector::ivf::kmeans::{
+  assign_to_centroids, nearest_centroid, training_sample, MAX_TRAINING_POINTS_PER_CLUSTER,
+};
 use crate::vector::ivf::{kmeans_parallel, KMeansConfig};
-use crate::vector::store::validate_manifest_layout;
+use crate::vector::store::{validate_manifest_layout, FragmentLookup};
+use crate::vector::top_k::TopK;
 use crate::vector::types::{
   DistanceMetric, IvfConfig, MultiQueryAggregation, PqConfig, VectorManifest, VectorSearchResult,
 };
@@ -224,117 +229,174 @@ impl IvfPqIndex {
   }
 
   /// Train the IVF-PQ index
+  ///
+  /// The coarse clusters train on at most 256 vectors per cluster and the PQ
+  /// codebooks on at most 256 per centroid, sampled from the buffer.
+  ///
+  /// # Errors
+  /// A failed train keeps the buffered vectors, so adding more and retrying
+  /// works.
   pub fn train(&mut self) -> Result<(), IvfPqError> {
     if self.trained {
       return Ok(());
     }
 
-    // Validate before touching the pending buffer.  Keep a working copy so any
-    // later training failure leaves the original buffer available for retry.
+    // Validate before taking the buffer, so a rejected train keeps it.
     validate_ivf_pq_config(self.dimensions, &self.config)?;
+    if self.training_vectors.is_none() {
+      return Err(IvfPqError::NoTrainingVectors);
+    }
+    self.check_training_count(self.training_count)?;
+    let Some(mut vectors) = self.training_vectors.take() else {
+      return Err(IvfPqError::NoTrainingVectors);
+    };
 
-    let pending_training_vectors = self
-      .training_vectors
-      .as_ref()
-      .ok_or(IvfPqError::NoTrainingVectors)?;
+    // Normalizing the buffer in place keeps it valid for a retry.
+    if self.config.ivf.metric == DistanceMetric::Cosine {
+      for vector in vectors.chunks_exact_mut(self.dimensions) {
+        normalize_in_place(vector);
+      }
+    }
 
-    let n = self.training_count;
+    match self.train_on(&vectors, self.training_count, false) {
+      Ok(()) => {
+        self.training_count = 0;
+        Ok(())
+      }
+      Err(err) => {
+        self.training_vectors = Some(vectors);
+        Err(err)
+      }
+    }
+  }
+
+  /// Train on `n` vectors the caller keeps, without copying them into the
+  /// training buffer. `unit_vectors` says they are already unit length (a
+  /// normalizing store), which saves a normalized copy for cosine.
+  pub(crate) fn train_from(
+    &mut self,
+    vectors: &[f32],
+    n: usize,
+    unit_vectors: bool,
+  ) -> Result<(), IvfPqError> {
+    if self.trained {
+      return Err(IvfPqError::AlreadyTrained);
+    }
+    validate_ivf_pq_config(self.dimensions, &self.config)?;
+    self.check_training_count(n)?;
+    let expected_len = n
+      .checked_mul(self.dimensions)
+      .ok_or_else(|| IvfPqError::SizeOverflow("IVF-PQ training input".into()))?;
+    if vectors.len() < expected_len {
+      return Err(IvfPqError::DimensionMismatch {
+        expected: expected_len,
+        got: vectors.len(),
+      });
+    }
+    let normalize = self.config.ivf.metric == DistanceMetric::Cosine && !unit_vectors;
+    self.train_on(&vectors[..expected_len], n, normalize)
+  }
+
+  fn check_training_count(&self, n: usize) -> Result<(), IvfPqError> {
     let n_clusters = self.config.ivf.n_clusters;
-
     if n < n_clusters {
       return Err(IvfPqError::NotEnoughTrainingVectors { n, k: n_clusters });
     }
-
     if n < self.config.pq.num_centroids {
       return Err(IvfPqError::NotEnoughTrainingVectors {
         n,
         k: self.config.pq.num_centroids,
       });
     }
+    Ok(())
+  }
 
-    let mut training_vectors = pending_training_vectors.clone();
-    if self.config.ivf.metric == DistanceMetric::Cosine {
-      for vector in training_vectors.chunks_exact_mut(self.dimensions) {
+  /// Coarse k-means over a sample of `vectors` (normalized first when
+  /// `normalize` is set), then PQ codebooks over a smaller sample.
+  fn train_on(&mut self, vectors: &[f32], n: usize, normalize: bool) -> Result<(), IvfPqError> {
+    let dimensions = self.dimensions;
+    let n_clusters = self.config.ivf.n_clusters;
+    let metric = self.config.ivf.metric;
+
+    let (mut sample, sample_n) = training_sample(
+      vectors,
+      n,
+      dimensions,
+      n_clusters.saturating_mul(MAX_TRAINING_POINTS_PER_CLUSTER),
+    );
+    if normalize {
+      for vector in sample.to_mut().chunks_exact_mut(dimensions) {
         normalize_in_place(vector);
       }
     }
-
-    let distance_fn = self.config.ivf.metric.distance_fn();
 
     // Step 1: Train IVF centroids with parallel k-means
     let kmeans_config = KMeansConfig::new(n_clusters)
       .with_max_iterations(25)
       .with_tolerance(1e-4);
-
-    let kmeans_result = kmeans_parallel(
-      &training_vectors,
-      n,
-      self.dimensions,
+    let kmeans_result = with_metric_distance!(metric, |dist| kmeans_parallel(
+      &sample,
+      sample_n,
+      dimensions,
       &kmeans_config,
-      distance_fn,
-    )
+      dist
+    ))
     .map_err(|e| IvfPqError::TrainingFailed(e.to_string()))?;
 
-    self.ivf_centroids = kmeans_result.centroids;
-    if self.config.ivf.metric == DistanceMetric::Cosine {
+    let mut ivf_centroids = kmeans_result.centroids;
+    if metric == DistanceMetric::Cosine {
       // k-means updates centroids with arithmetic means.  Normalize those
       // means before using them for insert/search/delete, which all compare
       // against normalized cosine vectors.
-      for centroid in self.ivf_centroids.chunks_exact_mut(self.dimensions) {
+      for centroid in ivf_centroids.chunks_exact_mut(dimensions) {
         normalize_in_place(centroid);
       }
     }
 
-    // Recompute assignments against the final centroids.  This is important
-    // for cosine because the centroids are normalized after k-means updates.
-    let mut assignments = Vec::with_capacity(n);
-    for vector in training_vectors.chunks_exact(self.dimensions) {
-      let mut best_cluster = 0;
-      let mut best_dist = f32::INFINITY;
-      for cluster in 0..n_clusters {
-        let cent_offset = cluster * self.dimensions;
-        let centroid = &self.ivf_centroids[cent_offset..cent_offset + self.dimensions];
-        let dist = distance_fn(vector, centroid);
-        if dist < best_dist {
-          best_dist = dist;
-          best_cluster = cluster;
-        }
-      }
-      assignments.push(best_cluster as u32);
-    }
-
-    // Step 2: Compute residuals and train PQ
-    // Train PQ on residuals or raw vectors (avoid cloning full training set)
+    // Step 2: Train PQ on residuals or raw vectors. The codebooks need far
+    // fewer points than the coarse clusters (at most 256 per centroid), and
+    // the sample is drawn from the coarse one.
+    let (pq_sample, pq_n) = training_sample(
+      &sample,
+      sample_n,
+      dimensions,
+      self
+        .config
+        .pq
+        .num_centroids
+        .saturating_mul(MAX_TRAINING_POINTS_PER_CLUSTER),
+    );
     if self.config.use_residuals {
-      // Compute residuals: vector - assigned_centroid
-      let residual_len = n
-        .checked_mul(self.dimensions)
-        .ok_or_else(|| IvfPqError::SizeOverflow("IVF-PQ residual allocation".into()))?;
-      let mut residuals = vec![0.0f32; residual_len];
-      for (i, &cluster_id) in assignments.iter().enumerate().take(n) {
-        let cluster = cluster_id as usize;
-        let vec_offset = i * self.dimensions;
-        let cent_offset = cluster * self.dimensions;
-
-        for d in 0..self.dimensions {
-          residuals[vec_offset + d] =
-            training_vectors[vec_offset + d] - self.ivf_centroids[cent_offset + d];
+      // Assign against the final centroids: for cosine they were normalized
+      // after the k-means updates.
+      let mut assignments = vec![0u32; pq_n];
+      with_metric_distance!(metric, |dist| assign_to_centroids(
+        &pq_sample,
+        dimensions,
+        &ivf_centroids,
+        &mut assignments,
+        &dist,
+        true
+      ));
+      let mut residuals = pq_sample.into_owned();
+      for (vector, &cluster) in residuals.chunks_exact_mut(dimensions).zip(&assignments) {
+        let offset = cluster as usize * dimensions;
+        for (value, &centroid) in vector
+          .iter_mut()
+          .zip(&ivf_centroids[offset..offset + dimensions])
+        {
+          *value -= centroid;
         }
       }
-
-      self.train_pq(&residuals, n)?;
+      self.train_pq(&residuals, pq_n)?;
     } else {
-      self.train_pq(&training_vectors, n)?;
+      self.train_pq(&pq_sample, pq_n)?;
     }
 
-    // Initialize inverted lists
-    for c in 0..n_clusters {
-      self.inverted_lists.insert(c, Vec::new());
-    }
-
+    self.ivf_centroids = ivf_centroids;
+    self.inverted_lists = (0..n_clusters).map(|c| (c, Vec::new())).collect();
     self.trained = true;
     self.training_vectors = None;
-    self.training_count = 0;
 
     Ok(())
   }
@@ -422,26 +484,10 @@ impl IvfPqIndex {
     }
     self.check_dimensions(vector)?;
 
-    let distance_fn = self.config.ivf.metric.distance_fn();
-
     // Prepare vector (normalize for cosine metric)
     let query_vec = self.prepare_query(vector);
     let query_slice = query_vec.as_ref();
-
-    // Find nearest centroid
-    let mut best_cluster = 0;
-    let mut best_dist = f32::INFINITY;
-
-    for c in 0..self.config.ivf.n_clusters {
-      let cent_offset = c * self.dimensions;
-      let centroid = &self.ivf_centroids[cent_offset..cent_offset + self.dimensions];
-      let dist = distance_fn(query_slice, centroid);
-
-      if dist < best_dist {
-        best_dist = dist;
-        best_cluster = c;
-      }
-    }
+    let best_cluster = self.find_nearest_centroid(query_slice);
 
     // Compute residual or use raw vector
     // Encode with PQ (avoid allocation for non-residual paths)
@@ -516,26 +562,9 @@ impl IvfPqIndex {
       return Ok(false);
     }
 
-    let distance_fn = self.config.ivf.metric.distance_fn();
-
     // Prepare vector (normalize for cosine metric)
     let query_vec = self.prepare_query(vector);
-    let query_slice = query_vec.as_ref();
-
-    // Find which cluster it's in
-    let mut best_cluster = 0;
-    let mut best_dist = f32::INFINITY;
-
-    for c in 0..self.config.ivf.n_clusters {
-      let cent_offset = c * self.dimensions;
-      let centroid = &self.ivf_centroids[cent_offset..cent_offset + self.dimensions];
-      let dist = distance_fn(query_slice, centroid);
-
-      if dist < best_dist {
-        best_dist = dist;
-        best_cluster = c;
-      }
-    }
+    let best_cluster = self.find_nearest_centroid(query_vec.as_ref());
 
     // Remove from inverted list
     let removed_from_list = if let Some(list) = self.inverted_lists.get_mut(&best_cluster) {
@@ -595,13 +624,14 @@ impl IvfPqIndex {
       return Vec::new();
     }
 
-    let n_probe = options.n_probe.unwrap_or(self.config.ivf.n_probe);
+    // An n_probe of zero searches one cluster rather than none.
+    let n_probe = options.n_probe.unwrap_or(self.config.ivf.n_probe).max(1);
 
     // Find top n_probe nearest centroids
     let probe_clusters = self.find_nearest_centroids(query, n_probe);
 
-    // Use max-heap to track top-k candidates
-    let mut heap = MaxHeap::new();
+    // Track the top-k candidates (NaN distances never enter)
+    let mut top = TopK::new(k);
 
     // For non-residual mode, build the distance table ONCE
     let shared_table = (!self.config.use_residuals).then(|| self.build_distance_table(query, None));
@@ -656,24 +686,18 @@ impl IvfPqIndex {
           }
         }
 
-        // Add to heap
-        let candidate = Candidate {
-          vector_id,
-          node_id,
-          cluster,
-        };
-        if heap.len() < k {
-          heap.push(candidate, dist);
-        } else if let Some(&(_, max_dist)) = heap.peek() {
-          if dist < max_dist {
-            heap.pop();
-            heap.push(candidate, dist);
-          }
-        }
+        top.push(
+          Candidate {
+            vector_id,
+            node_id,
+            cluster,
+          },
+          dist,
+        );
       }
     }
 
-    heap.into_sorted_vec()
+    top.into_sorted_vec()
   }
 
   fn to_result(&self, candidate: Candidate, distance: f32) -> VectorSearchResult {
@@ -829,34 +853,29 @@ impl IvfPqIndex {
     }
   }
 
-  /// Find the top n nearest centroids
+  /// Nearest coarse centroid to a prepared (cosine-normalized) vector.
+  fn find_nearest_centroid(&self, vector: &[f32]) -> usize {
+    with_metric_distance!(self.config.ivf.metric, |dist| nearest_centroid(
+      vector,
+      &self.ivf_centroids,
+      self.dimensions,
+      &dist
+    )
+    .0)
+  }
+
+  /// Find the `n` nearest centroids, closest first.
   fn find_nearest_centroids(&self, query: &[f32], n: usize) -> Vec<usize> {
-    let distance_fn = self.config.ivf.metric.distance_fn();
-    let n_clusters = self.config.ivf.n_clusters;
-
-    if n == 0 {
-      return Vec::new();
-    }
-
-    let mut centroid_dists: Vec<(usize, f32)> = (0..n_clusters)
-      .map(|c| {
-        let cent_offset = c * self.dimensions;
-        let centroid = &self.ivf_centroids[cent_offset..cent_offset + self.dimensions];
-        let dist = distance_fn(query, centroid);
-        (c, dist)
-      })
-      .collect();
-
-    if n >= n_clusters {
-      centroid_dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-      return centroid_dists.into_iter().map(|(c, _)| c).collect();
-    }
-
-    centroid_dists.select_nth_unstable_by(n - 1, |a, b| {
-      a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-    });
-    centroid_dists[..n].sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-    centroid_dists[..n].iter().map(|(c, _)| *c).collect()
+    let mut centroid_dists: Vec<(usize, f32)> =
+      with_metric_distance!(self.config.ivf.metric, |dist| {
+        self
+          .ivf_centroids
+          .chunks_exact(self.dimensions)
+          .map(|centroid| dist(query, centroid))
+          .enumerate()
+          .collect()
+      });
+    nearest_first(&mut centroid_dists, n)
   }
 
   /// Search with multiple query vectors
@@ -938,7 +957,7 @@ impl IvfPqIndex {
       // Score every candidate against every query. A candidate found by only
       // one query must not be aggregated over that query's distance alone.
       // Residual tables depend on the cluster, so build them per cluster.
-      let mut scored: Vec<VectorSearchResult> = Vec::with_capacity(seen.len());
+      let mut top = TopK::new(k);
       for (cluster, candidates) in by_cluster {
         let residual_tables: Vec<AdcTable>;
         let tables = match &shared_tables {
@@ -958,28 +977,29 @@ impl IvfPqIndex {
           };
           distances.clear();
           distances.extend(tables.iter().map(|table| self.distance_adc(table, codes)));
-          let result = self.to_result(candidate, aggregation.aggregate(&distances));
+          let distance = aggregation.aggregate(&distances);
+          let similarity = self.config.ivf.metric.distance_to_similarity(distance);
           if options
             .threshold
-            .is_some_and(|threshold| result.similarity < threshold)
+            .is_some_and(|threshold| similarity < threshold)
           {
             continue;
           }
-          scored.push(result);
+          top.push(candidate, distance);
         }
       }
 
       // Stop as soon as enough filtered and threshold-qualified nodes are
       // available, or when every query exhausted its selected-cluster
       // candidates.
-      if scored.len() >= k || exhausted {
-        scored.sort_by(|a, b| {
-          a.distance
-            .partial_cmp(&b.distance)
-            .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        scored.truncate(k);
-        return Ok(scored);
+      if top.len() >= k || exhausted {
+        return Ok(
+          top
+            .into_sorted_vec()
+            .into_iter()
+            .map(|(candidate, distance)| self.to_result(candidate, distance))
+            .collect(),
+        );
       }
 
       let next_k = expanded_k.saturating_mul(2).min(max_candidates);
@@ -993,44 +1013,31 @@ impl IvfPqIndex {
   /// Build index from all vectors in the store
   pub fn build_from_store(&mut self, manifest: &VectorManifest) -> Result<(), IvfPqError> {
     self.check_manifest(manifest)?;
-
-    // Collect training vectors
-    for fragment in &manifest.fragments {
-      for row_group in &fragment.row_groups {
-        self.add_training_vectors(&row_group.data, row_group.count)?;
-      }
+    if self.trained {
+      return Err(IvfPqError::AlreadyTrained);
     }
 
-    // Train the index
+    // Train on the live vectors only: deleted slots still hold data.
+    let fragments = FragmentLookup::new(manifest);
+    let live: Vec<(u64, &[f32])> = manifest
+      .vector_locations
+      .iter()
+      .filter_map(|(&vector_id, location)| {
+        fragments
+          .vector(&manifest.config, location)
+          .map(|vector| (vector_id, vector))
+      })
+      .collect();
+    self
+      .training_vectors
+      .get_or_insert_with(Vec::new)
+      .reserve(live.len().saturating_mul(self.dimensions));
+    for (_, vector) in &live {
+      self.add_training_vectors(vector, 1)?;
+    }
     self.train()?;
 
-    // Build fragment lookup map for O(1) access
-    let fragment_map: std::collections::HashMap<usize, &_> =
-      manifest.fragments.iter().map(|f| (f.id, f)).collect();
-
-    // Insert all vectors
-    for (&vector_id, location) in &manifest.vector_locations {
-      // Get fragment with O(1) lookup
-      let fragment = match fragment_map.get(&location.fragment_id) {
-        Some(f) => *f,
-        None => continue,
-      };
-
-      if fragment.is_deleted(location.local_index) {
-        continue;
-      }
-
-      let row_group_idx = location.local_index / manifest.config.row_group_size;
-      let local_row_idx = location.local_index % manifest.config.row_group_size;
-      let vector = match fragment
-        .row_groups
-        .get(row_group_idx)
-        .and_then(|rg| rg.get(local_row_idx, manifest.config.dimensions))
-      {
-        Some(vector) => vector,
-        None => continue,
-      };
-
+    for (vector_id, vector) in live {
       self.insert(vector_id, vector)?;
     }
 
@@ -1162,7 +1169,7 @@ pub struct IvfPqStats {
 }
 
 // ============================================================================
-// Max Heap for Top-K
+// Candidates
 // ============================================================================
 
 /// A search hit before it becomes a `VectorSearchResult`. Multi-query search
@@ -1174,92 +1181,14 @@ struct Candidate {
   cluster: usize,
 }
 
-/// Simple max-heap for top-k selection
-struct MaxHeap<T> {
-  items: Vec<(T, f32)>, // (item, distance)
-}
-
-impl<T> MaxHeap<T> {
-  fn new() -> Self {
-    Self { items: Vec::new() }
-  }
-
-  fn len(&self) -> usize {
-    self.items.len()
-  }
-
-  fn push(&mut self, id: T, dist: f32) {
-    self.items.push((id, dist));
-    self.sift_up(self.items.len() - 1);
-  }
-
-  fn pop(&mut self) -> Option<(T, f32)> {
-    if self.items.is_empty() {
-      return None;
-    }
-    let len = self.items.len();
-    self.items.swap(0, len - 1);
-    let result = self.items.pop();
-    if !self.items.is_empty() {
-      self.sift_down(0);
-    }
-    result
-  }
-
-  fn peek(&self) -> Option<&(T, f32)> {
-    self.items.first()
-  }
-
-  fn sift_up(&mut self, mut idx: usize) {
-    while idx > 0 {
-      let parent = (idx - 1) / 2;
-      if self.items[idx].1 > self.items[parent].1 {
-        self.items.swap(idx, parent);
-        idx = parent;
-      } else {
-        break;
-      }
-    }
-  }
-
-  fn sift_down(&mut self, mut idx: usize) {
-    let len = self.items.len();
-    loop {
-      let left = 2 * idx + 1;
-      let right = 2 * idx + 2;
-      let mut largest = idx;
-
-      if left < len && self.items[left].1 > self.items[largest].1 {
-        largest = left;
-      }
-      if right < len && self.items[right].1 > self.items[largest].1 {
-        largest = right;
-      }
-
-      if largest != idx {
-        self.items.swap(idx, largest);
-        idx = largest;
-      } else {
-        break;
-      }
-    }
-  }
-
-  fn into_sorted_vec(mut self) -> Vec<(T, f32)> {
-    let mut result = Vec::with_capacity(self.items.len());
-    while let Some(item) = self.pop() {
-      result.push(item);
-    }
-    result.reverse();
-    result
-  }
-}
-
 // ============================================================================
 // Training Helpers
 // ============================================================================
 
 /// K-means training for a single PQ subspace
+///
+/// Stops early once an iteration changes no assignment: the centroids would
+/// not move again.
 fn train_pq_subspace(
   centroids: &mut [f32],
   subvectors: &[f32],
@@ -1277,30 +1206,49 @@ fn train_pq_subspace(
     num_centroids,
   );
 
-  let mut assignments = vec![0u16; num_vectors];
+  let mut assignments = vec![u16::MAX; num_vectors];
   let mut cluster_sums = vec![0.0f32; num_centroids * subspace_dims];
   let mut cluster_counts = vec![0u32; num_centroids];
+  // Centroids by dimension (`[d][c]`), so the distances from one subvector
+  // to all centroids accumulate in a loop over contiguous centroids, which
+  // vectorizes, instead of one short loop per centroid.
+  let mut by_dimension = vec![0.0f32; num_centroids * subspace_dims];
+  let mut distances = vec![0.0f32; num_centroids];
 
   for _ in 0..max_iterations {
-    // Assign vectors to nearest centroids
-    for (i, assignment) in assignments.iter_mut().enumerate().take(num_vectors) {
-      let vec_offset = i * subspace_dims;
-      let mut best_centroid = 0;
-      let mut best_dist = f32::INFINITY;
+    for (c, centroid) in centroids.chunks_exact(subspace_dims).enumerate() {
+      for (d, &value) in centroid.iter().enumerate() {
+        by_dimension[d * num_centroids + c] = value;
+      }
+    }
 
-      for c in 0..num_centroids {
-        let cent_offset = c * subspace_dims;
-        let mut dist = 0.0;
-        for d in 0..subspace_dims {
-          let diff = subvectors[vec_offset + d] - centroids[cent_offset + d];
-          dist += diff * diff;
-        }
-        if dist < best_dist {
-          best_dist = dist;
-          best_centroid = c;
+    // Assign vectors to nearest centroids
+    let mut changed = false;
+    for (subvector, assignment) in subvectors
+      .chunks_exact(subspace_dims)
+      .zip(assignments.iter_mut())
+      .take(num_vectors)
+    {
+      distances.fill(0.0);
+      for (&x, column) in subvector
+        .iter()
+        .zip(by_dimension.chunks_exact(num_centroids))
+      {
+        for (dist, &c) in distances.iter_mut().zip(column) {
+          let diff = x - c;
+          *dist += diff * diff;
         }
       }
-      *assignment = best_centroid as u16;
+      // First centroid at the minimum distance, as a strict `<` scan picks.
+      let min = distances.iter().copied().fold(f32::INFINITY, f32::min);
+      let best = distances.iter().position(|&d| d == min).unwrap_or(0) as u16;
+      if *assignment != best {
+        *assignment = best;
+        changed = true;
+      }
+    }
+    if !changed {
+      break;
     }
 
     // Update centroids
@@ -2917,30 +2865,6 @@ mod tests {
     index.train().expect("expected value");
 
     assert!(index.trained);
-  }
-
-  #[test]
-  fn test_max_heap() {
-    let mut heap = MaxHeap::new();
-
-    heap.push(1, 0.5);
-    heap.push(2, 0.3);
-    heap.push(3, 0.8);
-    heap.push(4, 0.1);
-
-    assert_eq!(heap.len(), 4);
-
-    // Max should be 3 (distance 0.8)
-    let (id, dist) = *heap.peek().expect("expected value");
-    assert_eq!(id, 3);
-    assert_eq!(dist, 0.8);
-
-    let sorted = heap.into_sorted_vec();
-    assert_eq!(sorted.len(), 4);
-    // Should be sorted by distance ascending
-    assert!(sorted[0].1 <= sorted[1].1);
-    assert!(sorted[1].1 <= sorted[2].1);
-    assert!(sorted[2].1 <= sorted[3].1);
   }
 
   #[test]
