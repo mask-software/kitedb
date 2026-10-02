@@ -5,7 +5,7 @@
 //! Ported from src/mvcc/conflict-detector.ts
 
 use crate::mvcc::tx_manager::TxManager;
-use crate::types::{MvccTxStatus, TxId, TxKey};
+use crate::types::{TxId, TxKey};
 use std::collections::HashSet;
 
 // ============================================================================
@@ -81,12 +81,10 @@ impl ConflictDetector {
       None => return Vec::new(),
     };
 
-    if tx.status != MvccTxStatus::Active {
-      return Vec::new();
-    }
-
-    // Fast path: if nothing was read or written, no conflicts possible
-    if tx.read_set.is_empty() && tx.write_set.is_empty() {
+    // Fast path: nothing read or written, or nothing committed since it began
+    if (tx.read_set.is_empty() && tx.write_set.is_empty())
+      || !tx_manager.has_writes_since(tx.start_ts)
+    {
       return Vec::new();
     }
 
@@ -116,10 +114,6 @@ impl ConflictDetector {
       Some(tx) => tx,
       None => return false,
     };
-
-    if tx.status != MvccTxStatus::Active {
-      return false;
-    }
 
     let tx_snapshot_ts = tx.start_ts;
 
@@ -156,10 +150,6 @@ impl ConflictDetector {
       Some(tx) => tx,
       None => return false,
     };
-
-    if tx.status != MvccTxStatus::Active {
-      return false;
-    }
 
     tx_manager.has_conflicting_write(key, tx.start_ts)
   }
@@ -202,10 +192,6 @@ impl ConflictDetector {
       Some(tx) => tx,
       None => return Vec::new(),
     };
-
-    if tx.status != MvccTxStatus::Active {
-      return Vec::new();
-    }
 
     let tx_snapshot_ts = tx.start_ts;
     let mut conflicts = Vec::new();

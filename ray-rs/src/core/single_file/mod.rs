@@ -169,6 +169,9 @@ pub struct SingleFileTxState {
   /// It holds non-MVCC mode's writer slot (see `writer_slot`), released when
   /// it is settled.
   pub(crate) holds_writer: bool,
+  /// With MVCC, what a write transaction read, kept here (thread-private)
+  /// and handed to the transaction manager for its conflict check at commit.
+  pub(crate) mvcc_reads: TxKeySet,
 }
 
 impl SingleFileTxState {
@@ -183,6 +186,15 @@ impl SingleFileTxState {
       pending_wal: Vec::new(),
       replication_apply: false,
       holds_writer: false,
+      mvcc_reads: TxKeySet::new(),
+    }
+  }
+
+  /// Note that the transaction read `key`, for its MVCC conflict check at
+  /// commit. A read-only transaction never checks, so it notes nothing.
+  pub(crate) fn record_read(&mut self, key: TxKey) {
+    if !self.read_only {
+      self.mvcc_reads.insert(key);
     }
   }
 }
@@ -723,18 +735,15 @@ impl SingleFileDB {
     // read (lock order: see read.rs).
     let delta = self.delta.read();
 
-    if let Some(mvcc) = self.mvcc.as_ref() {
-      let (txid, tx_snapshot_ts) = if let Some(handle) = tx_handle.as_ref() {
-        let tx = handle.lock();
-        (tx.txid, tx.snapshot_ts)
-      } else {
-        (0, mvcc.tx_manager.lock().next_commit_ts())
-      };
-      if txid != 0 {
-        let mut tx_mgr = mvcc.tx_manager.lock();
-        tx_mgr.record_read(txid, TxKey::Node(node_id));
+    let (txid, tx_snapshot_ts) = match tx_handle.as_ref() {
+      Some(handle) => {
+        let mut tx = handle.lock();
+        self.record_reads(Some(&mut tx), [TxKey::Node(node_id)]);
+        self.mvcc_read_ts(Some(&tx))
       }
-      let vc = mvcc.version_chain.lock();
+      None => self.mvcc_read_ts(None),
+    };
+    if let Some(vc) = self.mvcc_history(tx_snapshot_ts) {
       if let Some(exists) = vc.node_exists_at(node_id, tx_snapshot_ts, txid) {
         return exists;
       }
@@ -768,18 +777,23 @@ impl SingleFileDB {
     // read (lock order: see read.rs).
     let delta = self.delta.read();
 
-    if let Some(mvcc) = self.mvcc.as_ref() {
-      let (txid, tx_snapshot_ts) = if let Some(handle) = tx_handle.as_ref() {
-        let tx = handle.lock();
-        (tx.txid, tx.snapshot_ts)
-      } else {
-        (0, mvcc.tx_manager.lock().next_commit_ts())
-      };
-      if txid != 0 {
-        let mut tx_mgr = mvcc.tx_manager.lock();
-        tx_mgr.record_read(txid, TxKey::Edge { src, etype, dst });
+    let (txid, tx_snapshot_ts) = match tx_handle.as_ref() {
+      Some(handle) => {
+        let mut tx = handle.lock();
+        self.record_reads(Some(&mut tx), [TxKey::Edge { src, etype, dst }]);
+        self.mvcc_read_ts(Some(&tx))
       }
-      let vc = mvcc.version_chain.lock();
+      None => self.mvcc_read_ts(None),
+    };
+    if let Some(vc) = self.mvcc_history(tx_snapshot_ts) {
+      // An endpoint created after the reader's snapshot hides the edge: its
+      // commit records no history for the edge (see `mvcc_history`).
+      let endpoint_gone = [src, dst]
+        .into_iter()
+        .any(|node_id| vc.node_exists_at(node_id, tx_snapshot_ts, txid) == Some(false));
+      if endpoint_gone {
+        return false;
+      }
       if let Some(exists) = vc.edge_exists_at(src, etype, dst, tx_snapshot_ts, txid) {
         return exists;
       }
