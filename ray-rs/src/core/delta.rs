@@ -42,10 +42,6 @@ impl<T: Eq + Hash> Table for DeltaSet<T> {
 /// A table this full (or fuller) may grow ahead of need (see
 /// `DeltaState::grow_tables_for`), as a fraction of its capacity.
 const GROW_AHEAD_LOAD: (usize, usize) = (3, 4);
-/// A table grown ahead of need grows to this many times its capacity: each
-/// entry then moves about a third as often as when tables double, for up to
-/// twice the room.
-const GROW_AHEAD_FACTOR: usize = 4;
 /// Tables smaller than this grow when they fill: their growth takes no time.
 const GROW_AHEAD_MIN_CAPACITY: usize = 4096;
 
@@ -62,6 +58,346 @@ pub fn snapshot_has_edge(
   match (snap.phys_node(src), snap.phys_node(dst)) {
     (Some(src_phys), Some(dst_phys)) => snap.has_edge(src_phys, etype, dst_phys),
     _ => false,
+  }
+}
+
+/// Node ids per chunk of a `NodeMap` dense part.
+const CHUNK_IDS: usize = 64;
+/// A `NodeMap` takes a dense part once it holds this many entries in a map...
+const DENSE_MIN_NODES: usize = 1024;
+/// ...at least half of them among the newest ids of a range this many times
+/// their number.
+const DENSE_MAX_SPREAD: u64 = 4;
+/// A dense part covers at most this many ids from its first.
+const DENSE_MAX_IDS: u64 = 1 << 26;
+
+/// The nodes a delta created (or recreated), with their state.
+pub type CreatedNodes = NodeMap<NodeDelta>;
+/// A delta's edge patches of one kind and direction, by node.
+pub type EdgePatches = NodeMap<BTreeSet<EdgePatch>>;
+
+/// A delta's map from node ids to `V`: its created nodes, and its edge patches
+/// by node.
+///
+/// Node ids mostly come from a counter, so a delta that creates many nodes
+/// holds a dense range of ids: once it does, those live in chunks of
+/// `CHUNK_IDS` ids indexed by id, and the rest in a hash map. A lookup in the
+/// dense part reads one slot, with no hashing; merging an entry into it writes
+/// its slot and moves nothing else; the part grows a chunk at a time, never
+/// moving what it holds; and it lists its entries in id order.
+///
+/// It offers what code uses of a map: `get`, `get_key_value`, `get_mut`,
+/// `contains_key`, `insert`, `remove`, `entry(..).or_default()`, `iter`,
+/// `keys`, `values`, `drain`, `len`, `is_empty`, `clear`.
+#[derive(Debug, Clone)]
+pub struct NodeMap<V> {
+  /// The dense part, if taken: ids `[base, base + DENSE_MAX_IDS)` (some of them).
+  dense: Option<DenseNodes<V>>,
+  /// Entries outside the dense part.
+  sparse: DeltaMap<NodeId, V>,
+}
+
+impl<V> Default for NodeMap<V> {
+  fn default() -> Self {
+    Self {
+      dense: None,
+      sparse: DeltaMap::default(),
+    }
+  }
+}
+
+#[derive(Debug, Clone)]
+struct DenseNodes<V> {
+  /// The first id, a multiple of `CHUNK_IDS`.
+  base: NodeId,
+  /// Chunk `i` holds ids `base + i * CHUNK_IDS ..`; `None` while it holds none.
+  chunks: Vec<Option<Box<NodeChunk<V>>>>,
+  len: usize,
+}
+
+#[derive(Debug, Clone)]
+struct NodeChunk<V> {
+  len: usize,
+  slots: [Option<(NodeId, V)>; CHUNK_IDS],
+}
+
+impl<V> NodeChunk<V> {
+  fn new() -> Box<Self> {
+    Box::new(Self {
+      len: 0,
+      slots: std::array::from_fn(|_| None),
+    })
+  }
+}
+
+impl<V> DenseNodes<V> {
+  /// The chunk and slot of `id`, if the dense part covers it.
+  fn slot_of(&self, id: NodeId) -> Option<(usize, usize)> {
+    let offset = id.checked_sub(self.base)?;
+    (offset < DENSE_MAX_IDS).then(|| {
+      let offset = offset as usize;
+      (offset / CHUNK_IDS, offset % CHUNK_IDS)
+    })
+  }
+
+  fn slot(&self, id: NodeId) -> Option<&(NodeId, V)> {
+    let (chunk, slot) = self.slot_of(id)?;
+    self.chunks.get(chunk)?.as_ref()?.slots[slot].as_ref()
+  }
+}
+
+impl<V> NodeMap<V> {
+  /// Number of entries.
+  pub fn len(&self) -> usize {
+    self.dense.as_ref().map_or(0, |dense| dense.len) + self.sparse.len()
+  }
+
+  pub fn is_empty(&self) -> bool {
+    self.len() == 0
+  }
+
+  /// Whether the dense part, if any, covers `id`: then `id` is there or nowhere.
+  fn dense_covers(&self, id: NodeId) -> bool {
+    self
+      .dense
+      .as_ref()
+      .is_some_and(|dense| dense.slot_of(id).is_some())
+  }
+
+  pub fn contains_key(&self, id: &NodeId) -> bool {
+    self.get(id).is_some()
+  }
+
+  pub fn get(&self, id: &NodeId) -> Option<&V> {
+    self.get_key_value(id).map(|(_, value)| value)
+  }
+
+  pub fn get_key_value(&self, id: &NodeId) -> Option<(&NodeId, &V)> {
+    match &self.dense {
+      Some(dense) if dense.slot_of(*id).is_some() => dense.slot(*id).map(|(id, value)| (id, value)),
+      _ => self.sparse.get_key_value(id),
+    }
+  }
+
+  pub fn get_mut(&mut self, id: &NodeId) -> Option<&mut V> {
+    if !self.dense_covers(*id) {
+      return self.sparse.get_mut(id);
+    }
+    let dense = self.dense.as_mut()?;
+    let (chunk, slot) = dense.slot_of(*id)?;
+    let (_, value) = dense.chunks.get_mut(chunk)?.as_mut()?.slots[slot].as_mut()?;
+    Some(value)
+  }
+
+  /// Insert `value` for `id`, returning the value it replaces.
+  pub fn insert(&mut self, id: NodeId, value: V) -> Option<V> {
+    if !self.dense_covers(id) {
+      let replaced = self.sparse.insert(id, value);
+      if replaced.is_none() {
+        self.take_dense_part();
+      }
+      return replaced;
+    }
+    let dense = self.dense.as_mut()?;
+    let (chunk, slot) = dense.slot_of(id)?;
+    if dense.chunks.len() <= chunk {
+      dense.chunks.resize_with(chunk + 1, || None);
+    }
+    let chunk = dense.chunks[chunk].get_or_insert_with(NodeChunk::new);
+    let replaced = chunk.slots[slot]
+      .replace((id, value))
+      .map(|(_, value)| value);
+    if replaced.is_none() {
+      chunk.len += 1;
+      dense.len += 1;
+    }
+    replaced
+  }
+
+  pub fn remove(&mut self, id: &NodeId) -> Option<V> {
+    if !self.dense_covers(*id) {
+      return self.sparse.remove(id);
+    }
+    let dense = self.dense.as_mut()?;
+    let (chunk_index, slot) = dense.slot_of(*id)?;
+    let chunk = dense.chunks.get_mut(chunk_index)?.as_mut()?;
+    let (_, value) = chunk.slots[slot].take()?;
+    chunk.len -= 1;
+    dense.len -= 1;
+    if chunk.len == 0 {
+      dense.chunks[chunk_index] = None;
+    }
+    Some(value)
+  }
+
+  /// The entry of `id`, to fill if empty.
+  pub fn entry(&mut self, id: NodeId) -> NodeMapEntry<'_, V> {
+    NodeMapEntry { map: self, id }
+  }
+
+  /// The entries, the dense part's in id order, then the rest.
+  pub fn iter(&self) -> NodeMapIter<'_, V> {
+    NodeMapIter {
+      chunks: self
+        .dense
+        .as_ref()
+        .map_or(&[][..], |dense| &dense.chunks)
+        .iter(),
+      slots: [].iter(),
+      sparse: self.sparse.iter(),
+    }
+  }
+
+  pub fn keys(&self) -> impl Iterator<Item = &NodeId> + '_ {
+    self.iter().map(|(id, _)| id)
+  }
+
+  pub fn values(&self) -> impl Iterator<Item = &V> + '_ {
+    self.iter().map(|(_, value)| value)
+  }
+
+  /// Take every entry out, leaving this empty.
+  pub fn drain(&mut self) -> impl Iterator<Item = (NodeId, V)> + '_ {
+    let chunks = self
+      .dense
+      .as_mut()
+      .map(|dense| {
+        dense.len = 0;
+        std::mem::take(&mut dense.chunks)
+      })
+      .unwrap_or_default();
+    let dense = chunks
+      .into_iter()
+      .flatten()
+      .flat_map(|chunk| chunk.slots.into_iter().flatten());
+    dense.chain(self.sparse.drain())
+  }
+
+  pub fn clear(&mut self) {
+    self.dense = None;
+    self.sparse.clear();
+  }
+
+  /// Take the dense part once the map holds `DENSE_MIN_NODES` (and at each
+  /// doubling after) and at least half of them lie among the newest ids of a
+  /// range at most `DENSE_MAX_SPREAD` times their number: those move there.
+  fn take_dense_part(&mut self) {
+    let len = self.sparse.len();
+    if self.dense.is_some() || len < DENSE_MIN_NODES || !len.is_power_of_two() {
+      return;
+    }
+    let Some(&newest) = self.sparse.keys().max() else {
+      return;
+    };
+    let span = DENSE_MAX_SPREAD * len as u64;
+    let base = newest.saturating_sub(span - 1) / CHUNK_IDS as u64 * CHUNK_IDS as u64;
+    let dense_ids = self.sparse.keys().filter(|&&id| id >= base).count();
+    if dense_ids * 2 < len {
+      return;
+    }
+    self.dense = Some(DenseNodes {
+      base,
+      chunks: Vec::new(),
+      len: 0,
+    });
+    let moved: Vec<NodeId> = self
+      .sparse
+      .keys()
+      .copied()
+      .filter(|&id| self.dense_covers(id))
+      .collect();
+    for id in moved {
+      if let Some(value) = self.sparse.remove(&id) {
+        self.insert(id, value);
+      }
+    }
+  }
+
+  /// Capacity of the hash map part (test instrumentation: the dense part never
+  /// moves what it holds).
+  #[cfg(test)]
+  pub(crate) fn map_capacity(&self) -> usize {
+    self.sparse.capacity()
+  }
+}
+
+/// The entry of one id in a `NodeMap` (see `NodeMap::entry`).
+pub struct NodeMapEntry<'a, V> {
+  map: &'a mut NodeMap<V>,
+  id: NodeId,
+}
+
+impl<'a, V> NodeMapEntry<'a, V> {
+  /// The value, inserted with `default` if there is none.
+  pub fn or_insert_with(self, default: impl FnOnce() -> V) -> &'a mut V {
+    let Self { map, id } = self;
+    if !map.contains_key(&id) {
+      map.insert(id, default());
+    }
+    match map.get_mut(&id) {
+      Some(value) => value,
+      None => unreachable!("node map entry {id} inserted just now"),
+    }
+  }
+
+  pub fn or_default(self) -> &'a mut V
+  where
+    V: Default,
+  {
+    self.or_insert_with(V::default)
+  }
+}
+
+/// Iterator over a `NodeMap` (see `NodeMap::iter`).
+pub struct NodeMapIter<'a, V> {
+  chunks: std::slice::Iter<'a, Option<Box<NodeChunk<V>>>>,
+  slots: std::slice::Iter<'a, Option<(NodeId, V)>>,
+  sparse: hashbrown::hash_map::Iter<'a, NodeId, V>,
+}
+
+impl<'a, V> Iterator for NodeMapIter<'a, V> {
+  type Item = (&'a NodeId, &'a V);
+
+  fn next(&mut self) -> Option<Self::Item> {
+    loop {
+      if let Some((id, value)) = self.slots.by_ref().flatten().next() {
+        return Some((id, value));
+      }
+      match self.chunks.next() {
+        Some(Some(chunk)) => self.slots = chunk.slots.iter(),
+        Some(None) => {}
+        None => return self.sparse.next(),
+      }
+    }
+  }
+}
+
+impl<'a, V> IntoIterator for &'a NodeMap<V> {
+  type Item = (&'a NodeId, &'a V);
+  type IntoIter = NodeMapIter<'a, V>;
+
+  fn into_iter(self) -> Self::IntoIter {
+    self.iter()
+  }
+}
+
+impl<V> Table for NodeMap<V> {
+  fn len(&self) -> usize {
+    self.sparse.len()
+  }
+  /// Entries the hash map part takes before it grows; with a dense part, as
+  /// many as needed (the dense part takes new nodes, a chunk at a time).
+  fn capacity(&self) -> usize {
+    if self.dense.is_some() {
+      usize::MAX / 2
+    } else {
+      self.sparse.capacity()
+    }
+  }
+  fn reserve(&mut self, additional: usize) {
+    if self.dense.is_none() {
+      self.sparse.reserve(additional);
+    }
   }
 }
 
@@ -309,12 +645,12 @@ impl DeltaState {
   /// for the old copy. Props of the old copy's base edges have no patch to
   /// find them by, so this scans `edge_props`; recreating an id is rare.
   pub fn create_node(&mut self, node_id: NodeId, key: Option<&str>) {
-    let node_delta = Box::new(NodeDelta {
+    let node_delta = NodeDelta {
       key: key.map(|s| s.to_string()),
       labels: None,
       labels_deleted: None,
       props: None,
-    });
+    };
     self.install_created_node(node_id, node_delta);
 
     // Add to key index if key provided
@@ -325,7 +661,7 @@ impl DeltaState {
 
   /// Make `node_delta` node `node_id`'s own copy here, as `create_node` does,
   /// without touching the key index.
-  fn install_created_node(&mut self, node_id: NodeId, node_delta: Box<NodeDelta>) {
+  fn install_created_node(&mut self, node_id: NodeId, node_delta: NodeDelta) {
     if self.is_node_deleted(node_id) {
       self.modified_nodes.remove(&node_id);
       self.drop_edge_patches(node_id);
@@ -418,7 +754,6 @@ impl DeltaState {
       .created_nodes
       .get(&node_id)
       .or_else(|| self.modified_nodes.get(&node_id))
-      .map(|node_delta| &**node_delta)
   }
 
   // ========================================================================
@@ -640,10 +975,7 @@ impl DeltaState {
     etype: ETypeId,
     dst: NodeId,
   ) -> Option<&HashMap<PropKeyId, Option<PropValueRef>>> {
-    self
-      .edge_props
-      .get(&(src, etype, dst))
-      .map(|props| &**props)
+    self.edge_props.get(&(src, etype, dst))
   }
 
   // ========================================================================
@@ -742,7 +1074,7 @@ impl DeltaState {
         Entry::Vacant(entry) => {
           entry.insert(props);
         }
-        Entry::Occupied(mut entry) => entry.get_mut().extend(*props),
+        Entry::Occupied(mut entry) => entry.get_mut().extend(props),
       }
     }
 
@@ -751,11 +1083,10 @@ impl DeltaState {
 
   /// Make room for merging `pending` (see `merge_from`): grow each table the merge would
   /// overflow, and if none, the first table past `GROW_AHEAD_LOAD` of its capacity, ahead of
-  /// need, by `GROW_AHEAD_FACTOR`. A merge runs under `delta.write()`, and a table that grows
-  /// moves all its entries meanwhile. A growing delta's tables hold about as many entries
-  /// each (the created nodes' state, keys, edge patches in both directions and edge props),
-  /// so they would fill up together and all grow in one merge: grown ahead, they grow one
-  /// merge at a time, and less often.
+  /// need. A merge runs under `delta.write()`, and a table that grows moves all its entries
+  /// meanwhile. A growing delta's tables hold about as many entries each (keys and edge props
+  /// beside the created nodes and edge patches, whose dense parts never move), so they would
+  /// fill up together and all grow in one merge: grown ahead, they grow one merge at a time.
   fn grow_tables_for(&mut self, pending: &DeltaState) {
     let mut tables: [(&mut dyn Table, usize); 9] = [
       (&mut self.created_nodes, pending.created_nodes.len()),
@@ -781,11 +1112,12 @@ impl DeltaState {
     let (numerator, denominator) = GROW_AHEAD_LOAD;
     let ahead = tables.into_iter().find(|(table, incoming)| {
       table.capacity() >= GROW_AHEAD_MIN_CAPACITY
-        && (table.len() + incoming) * denominator >= table.capacity() * numerator
+        && (table.len() + incoming).saturating_mul(denominator)
+          >= table.capacity().saturating_mul(numerator)
     });
     if let Some((table, _)) = ahead {
-      // One past `GROW_AHEAD_FACTOR - 1` times its capacity: that size up.
-      let additional = (GROW_AHEAD_FACTOR - 1) * table.capacity() + 1 - table.len();
+      // One past its capacity: the next size up.
+      let additional = table.capacity() + 1 - table.len();
       table.reserve(additional);
     }
   }
@@ -793,13 +1125,13 @@ impl DeltaState {
   /// Merge node `node_id`, created by the merged transaction with the state
   /// `node_delta`: what `create_node` and then its label and prop writes
   /// give, except the key index entry (the transaction's key index has it).
-  fn merge_created_node(&mut self, node_id: NodeId, mut node_delta: Box<NodeDelta>) {
+  fn merge_created_node(&mut self, node_id: NodeId, mut node_delta: NodeDelta) {
     let NodeDelta {
       labels,
       labels_deleted,
       props,
       ..
-    } = &mut *node_delta;
+    } = &mut node_delta;
     // Removing a label from a node created here only drops it from its
     // labels (see `remove_node_label`).
     if labels.as_ref().is_some_and(|labels| labels.is_empty()) {
@@ -821,13 +1153,13 @@ impl DeltaState {
   /// transaction made to node `node_id`, which it did not create: what its
   /// `add_node_label`, `remove_node_label` and prop writes give, in that
   /// order.
-  fn merge_modified_node(&mut self, node_id: NodeId, mut node_delta: Box<NodeDelta>) {
+  fn merge_modified_node(&mut self, node_id: NodeId, mut node_delta: NodeDelta) {
     let NodeDelta {
       key,
       labels,
       labels_deleted,
       props,
-    } = &mut *node_delta;
+    } = &mut node_delta;
     *key = None;
     for set in [&mut *labels, &mut *labels_deleted] {
       if set.as_ref().is_some_and(|set| set.is_empty()) {
@@ -858,7 +1190,7 @@ impl DeltaState {
       labels_deleted,
       props,
       ..
-    } = *node_delta;
+    } = node_delta;
     for label_id in labels.into_iter().flatten() {
       self.add_node_label(node_id, label_id);
     }
@@ -878,8 +1210,8 @@ impl DeltaState {
 /// that direction's tombstones `tombstones`): each cancels a tombstone, or is
 /// added, as in `DeltaState::add_edge`.
 fn merge_added_patches(
-  adds: &mut DeltaMap<NodeId, BTreeSet<EdgePatch>>,
-  tombstones: &mut DeltaMap<NodeId, BTreeSet<EdgePatch>>,
+  adds: &mut EdgePatches,
+  tombstones: &mut EdgePatches,
   node: NodeId,
   patches: BTreeSet<EdgePatch>,
 ) {
@@ -887,11 +1219,11 @@ fn merge_added_patches(
     return;
   }
   let Some(node_tombstones) = tombstones.get_mut(&node) else {
-    match adds.entry(node) {
-      Entry::Vacant(entry) => {
-        entry.insert(patches);
+    match adds.get_mut(&node) {
+      Some(existing) => existing.extend(patches),
+      None => {
+        adds.insert(node, patches);
       }
-      Entry::Occupied(mut entry) => entry.get_mut().extend(patches),
     }
     return;
   };
@@ -1129,49 +1461,58 @@ mod tests {
     fn set<T>(set: &DeltaSet<T>) -> (usize, usize) {
       (set.capacity(), std::mem::size_of::<T>())
     }
+    fn node_map<V>(map: &NodeMap<V>) -> (usize, usize) {
+      (map.map_capacity(), std::mem::size_of::<(NodeId, V)>())
+    }
     vec![
-      map(&delta.created_nodes),
+      node_map(&delta.created_nodes),
       set(&delta.deleted_nodes),
       map(&delta.modified_nodes),
-      map(&delta.out_add),
-      map(&delta.out_del),
-      map(&delta.in_add),
-      map(&delta.in_del),
+      node_map(&delta.out_add),
+      node_map(&delta.out_del),
+      node_map(&delta.in_add),
+      node_map(&delta.in_del),
       map(&delta.edge_props),
       map(&delta.key_index),
     ]
   }
 
   /// Merges run under the delta write lock, where every reader and writer waits, and a table
-  /// that grows there moves all its entries. One merge must move at most one table, of at most
-  /// 32 bytes per entry. Regression: every table of a growing delta grew in the same merge
-  /// (they hold about as many entries each), and a created node's entry was 176 bytes, so a
-  /// merge stalled for 10 ms at 230K nodes.
+  /// that grows there moves all its entries. One merge must grow at most one table past 16K
+  /// entries, and created nodes, once a dense range, must never move. Regression: every table
+  /// of a growing delta grew in the same merge (they hold about as many entries each), a
+  /// created node's entry being 176 bytes, so a merge stalled for 10 ms at 230K nodes.
   #[test]
-  fn a_merge_moves_at_most_one_compact_table() {
+  fn a_merge_grows_at_most_one_table() {
     let mut delta = DeltaState::new();
-    let mut most_moved = (0, 0);
+    let mut most_grown = (0, 0, 0);
     for batch in 0..40 {
       let mut pending = created_batch(1 + batch * 1000, 1000);
       let before = tables(&delta);
       delta.merge_from(&mut pending);
-      let moved: usize = before
+      let grown: Vec<usize> = before
         .iter()
         .zip(tables(&delta))
-        .filter(|((before, _), (after, _))| before != after)
+        .filter(|((before, _), (after, _))| before != after && *before >= 16 * 1024)
         .map(|((capacity, bytes), _)| capacity * bytes)
-        .sum();
-      if moved > most_moved.0 {
-        most_moved = (moved, batch);
+        .collect();
+      if grown.len() > most_grown.0 {
+        most_grown = (grown.len(), grown.iter().sum(), batch);
       }
     }
     assert!(
-      most_moved.0 <= 1 << 20,
-      "merge {} moved {} bytes of tables",
-      most_moved.1,
-      most_moved.0
+      most_grown.0 <= 1,
+      "merge {} grew {} tables, moving {} bytes",
+      most_grown.2,
+      most_grown.0,
+      most_grown.1
     );
     assert_eq!(delta.created_nodes.len(), 40_000);
+    assert!(
+      delta.created_nodes.map_capacity() < 4096,
+      "created nodes stayed in a map of {} entries",
+      delta.created_nodes.map_capacity()
+    );
   }
 
   /// The bytes of table entries a delta holds.
@@ -1196,9 +1537,9 @@ mod tests {
 
   /// Growing a delta's tables moves their entries (under the delta write lock): a delta that
   /// grows 1000 nodes a merge must have moved, in all, at most 1.75 times the bytes of the
-  /// entries it holds, at every size past 20K nodes. Grown tables grow four times larger, so
-  /// that holds right after a growth. Regression: each doubled, which moved up to 2.3 times
-  /// over (a third of what merging a 200-node transaction cost).
+  /// entries it holds, at every size past 20K nodes. Its created nodes and edge patches take
+  /// dense parts, which never move what they hold. Regression: every table doubled, which
+  /// moved up to 2.6 times over (a third of what merging a 200-node transaction cost).
   #[test]
   fn merges_move_table_entries_less_than_twice_over() {
     let mut delta = DeltaState::new();
@@ -1224,5 +1565,98 @@ mod tests {
       worst.0,
       worst.1
     );
+  }
+
+  fn node(key: &str) -> NodeDelta {
+    NodeDelta {
+      key: Some(key.to_string()),
+      ..NodeDelta::default()
+    }
+  }
+
+  /// `CreatedNodes` answers as a map would through its switch to a dense part,
+  /// for ids in it, below it, past it, recreated and removed.
+  #[test]
+  fn created_nodes_answer_as_a_map() {
+    let mut nodes = CreatedNodes::default();
+    let mut model: std::collections::BTreeMap<NodeId, String> = Default::default();
+    let check = |nodes: &CreatedNodes, model: &std::collections::BTreeMap<NodeId, String>| {
+      assert_eq!(nodes.len(), model.len());
+      let mut listed: Vec<(NodeId, String)> = nodes
+        .iter()
+        .map(|(&id, node)| (id, node.key.clone().unwrap_or_default()))
+        .collect();
+      listed.sort();
+      let expected: Vec<(NodeId, String)> =
+        model.iter().map(|(&id, key)| (id, key.clone())).collect();
+      assert_eq!(listed, expected);
+      for (&id, key) in model {
+        assert_eq!(
+          nodes.get(&id).and_then(|node| node.key.as_deref()),
+          Some(key.as_str())
+        );
+        assert!(nodes.contains_key(&id));
+        assert_eq!(nodes.get_key_value(&id).map(|(&id, _)| id), Some(id));
+      }
+      for id in [0, 7, 999, 5_000, 1 << 40] {
+        assert_eq!(nodes.contains_key(&id), model.contains_key(&id), "id {id}");
+      }
+    };
+    // An old id first, then a run of new ones: the dense part takes the run.
+    for id in std::iter::once(7).chain(10_000..12_100) {
+      assert!(nodes.insert(id, node(&format!("k{id}"))).is_none());
+      model.insert(id, format!("k{id}"));
+    }
+    assert!(nodes.dense.is_some(), "the run took a dense part");
+    check(&nodes, &model);
+    // Replace, remove (freeing a chunk), recreate, and ids far past the dense part.
+    assert_eq!(
+      nodes.insert(10_001, node("again")).and_then(|old| old.key),
+      Some("k10001".to_string())
+    );
+    model.insert(10_001, "again".to_string());
+    for id in 10_048..10_112 {
+      assert!(nodes.remove(&id).is_some());
+      model.remove(&id);
+    }
+    assert!(nodes.remove(&10_050).is_none());
+    nodes.insert(10_050, node("back"));
+    model.insert(10_050, "back".to_string());
+    for id in [1 << 40, 3] {
+      nodes.insert(id, node("far"));
+      model.insert(id, "far".to_string());
+    }
+    if let Some(node) = nodes.get_mut(&12_000) {
+      node.key = Some("changed".to_string());
+    }
+    model.insert(12_000, "changed".to_string());
+    check(&nodes, &model);
+    let clone = nodes.clone();
+    check(&clone, &model);
+
+    let mut drained: Vec<NodeId> = nodes.drain().map(|(id, _)| id).collect();
+    drained.sort_unstable();
+    assert_eq!(drained, model.keys().copied().collect::<Vec<_>>());
+    assert!(nodes.is_empty());
+    assert_eq!(nodes.iter().count(), 0);
+    nodes.insert(10_000, node("after"));
+    assert_eq!(
+      nodes.get(&10_000).and_then(|node| node.key.as_deref()),
+      Some("after")
+    );
+    nodes.clear();
+    assert!(nodes.is_empty() && !nodes.contains_key(&10_000));
+  }
+
+  /// Ids too spread out for a dense part stay in the map.
+  #[test]
+  fn spread_out_created_nodes_stay_in_the_map() {
+    let mut nodes = CreatedNodes::default();
+    for i in 0..4096u64 {
+      nodes.insert(i * 1000, NodeDelta::default());
+    }
+    assert!(nodes.dense.is_none());
+    assert_eq!(nodes.len(), 4096);
+    assert!(nodes.contains_key(&4_095_000));
   }
 }

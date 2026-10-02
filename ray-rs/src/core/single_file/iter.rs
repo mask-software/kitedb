@@ -689,20 +689,33 @@ impl SingleFileDB {
       }
     }
     // Plus the nodes listed from the delta, the transaction or the chains,
-    // once, unless listed from the snapshot as well.
-    let maybe_added: HashSet<NodeId> = delta
+    // once, unless listed from the snapshot as well: each source's nodes but
+    // those an earlier source names (the delta's are distinct, and most).
+    let listed_elsewhere = |node_id: NodeId| {
+      let mvcc = mvcc_visible(node_id);
+      from_elsewhere(node_id, mvcc) && !from_snapshot(node_id, mvcc)
+    };
+    count += delta
       .created_nodes
       .keys()
-      .chain(pending_created)
-      .chain(&chained)
+      .filter(|&&node_id| listed_elsewhere(node_id))
+      .count();
+    let pending_only: HashSet<NodeId> = pending_created
       .copied()
+      .filter(|node_id| !delta.created_nodes.contains_key(node_id))
       .collect();
-    for node_id in maybe_added {
-      let mvcc = mvcc_visible(node_id);
-      if from_elsewhere(node_id, mvcc) && !from_snapshot(node_id, mvcc) {
-        count += 1;
-      }
-    }
+    let chained_only: HashSet<NodeId> = chained
+      .iter()
+      .copied()
+      .filter(|node_id| {
+        !delta.created_nodes.contains_key(node_id) && !pending_only.contains(node_id)
+      })
+      .collect();
+    count += pending_only
+      .into_iter()
+      .chain(chained_only)
+      .filter(|&node_id| listed_elsewhere(node_id))
+      .count();
     count
   }
 

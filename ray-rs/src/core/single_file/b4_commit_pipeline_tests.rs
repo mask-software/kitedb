@@ -239,7 +239,7 @@ mod merge_model {
       if removed.contains(&src) || removed.contains(&dst) {
         continue;
       }
-      for (key_id, value) in *props {
+      for (key_id, value) in props {
         match value {
           Some(value) => target.set_edge_prop_ref(src, etype, dst, key_id, value),
           None => target.delete_edge_prop(src, etype, dst, key_id),
@@ -271,13 +271,12 @@ mod merge_model {
         labels(&delta.labels_deleted)
       )
     }
-    let nodes = |map: &crate::types::DeltaMap<NodeId, Box<crate::types::NodeDelta>>| {
+    let nodes = |map: &mut dyn Iterator<Item = (&NodeId, &crate::types::NodeDelta)>| {
       map
-        .iter()
         .map(|(&id, delta)| (id, node(delta)))
         .collect::<BTreeMap<_, _>>()
     };
-    let patches = |map: &crate::types::DeltaMap<NodeId, BTreeSet<crate::types::EdgePatch>>| {
+    let patches = |map: &crate::core::delta::EdgePatches| {
       map
         .iter()
         .map(|(&id, set)| (id, set.clone()))
@@ -297,9 +296,9 @@ mod merge_model {
     format!(
       "created={:?}\ndeleted={:?}\nmodified={:?}\nout_add={:?}\nout_del={:?}\nin_add={:?}\n\
        in_del={:?}\nedge_props={edge_props:?}\nlabels={:?}\netypes={:?}\npropkeys={:?}\nkeys={:?}",
-      nodes(&delta.created_nodes),
+      nodes(&mut delta.created_nodes.iter()),
       delta.deleted_nodes.iter().collect::<BTreeSet<_>>(),
-      nodes(&delta.modified_nodes),
+      nodes(&mut delta.modified_nodes.iter()),
       patches(&delta.out_add),
       patches(&delta.out_del),
       patches(&delta.in_add),

@@ -398,35 +398,26 @@ impl NodeDelta {
 /// concurrent writers commit: they use hashbrown's default hasher (foldhash,
 /// randomly seeded per map) rather than SipHash. (The keys are internal ids and
 /// node keys; `TxKeySet` makes the same choice.)
-///
-/// For the same reason their entries stay small: a table that grows moves all
-/// its entries, and a merge writes one entry per new node, edge and key. So
-/// node state (`NodeDelta`, 168 bytes) and edge props are boxed, which keeps
-/// every entry within 32 bytes; a transaction allocates the boxes as it
-/// writes, and a merge moves them in.
 pub type DeltaMap<K, V> = hashbrown::HashMap<K, V>;
 /// See [`DeltaMap`].
 pub type DeltaSet<T> = hashbrown::HashSet<T>;
 
-/// An edge's prop changes in a delta (`None`: deleted), boxed (see [`DeltaMap`]).
-pub type EdgePropsDelta = Box<HashMap<PropKeyId, Option<PropValueRef>>>;
-
 /// Delta state - all uncommitted changes
 #[derive(Debug, Default, Clone)]
 pub struct DeltaState {
-  // Node state (boxed: see `DeltaMap`)
-  pub created_nodes: DeltaMap<NodeId, Box<NodeDelta>>,
+  // Node state
+  pub created_nodes: crate::core::delta::CreatedNodes,
   pub deleted_nodes: DeltaSet<NodeId>,
-  pub modified_nodes: DeltaMap<NodeId, Box<NodeDelta>>, // existing nodes with modified labels/props
+  pub modified_nodes: DeltaMap<NodeId, NodeDelta>, // existing nodes with modified labels/props
 
   // Edge patches (both directions maintained)
-  pub out_add: DeltaMap<NodeId, BTreeSet<EdgePatch>>,
-  pub out_del: DeltaMap<NodeId, BTreeSet<EdgePatch>>,
-  pub in_add: DeltaMap<NodeId, BTreeSet<EdgePatch>>,
-  pub in_del: DeltaMap<NodeId, BTreeSet<EdgePatch>>,
+  pub out_add: crate::core::delta::EdgePatches,
+  pub out_del: crate::core::delta::EdgePatches,
+  pub in_add: crate::core::delta::EdgePatches,
+  pub in_del: crate::core::delta::EdgePatches,
 
   // Edge properties (keyed by (src, etype, dst))
-  pub edge_props: DeltaMap<(NodeId, ETypeId, NodeId), EdgePropsDelta>,
+  pub edge_props: DeltaMap<(NodeId, ETypeId, NodeId), HashMap<PropKeyId, Option<PropValueRef>>>,
 
   // New definitions
   pub new_labels: DeltaMap<LabelId, String>,
