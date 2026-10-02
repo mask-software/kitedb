@@ -4,13 +4,15 @@
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
-use std::sync::RwLock;
+use std::borrow::Cow;
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::api::vector_search::{
   SimilarOptions as RustSimilarOptions, VectorIndex as RustVectorIndex,
   VectorIndexError as RustVectorIndexError, VectorIndexOptions as RustVectorIndexOptions,
   VectorIndexStats as RustVectorIndexStats, VectorSearchHit as RustVectorSearchHit,
 };
+use crate::napi_bindings::database::BlockingTask;
 use crate::napi_bindings::validation;
 use crate::vector::distance::l2_norm;
 use crate::vector::{
@@ -18,6 +20,46 @@ use crate::vector::{
   IvfPqConfig as RustIvfPqConfig, IvfPqIndex as RustIvfPqIndex, MultiQueryAggregation,
   PqConfig as RustPqConfig, SearchOptions as RustSearchOptions, VectorManifest, VectorSearchResult,
 };
+
+// ============================================================================
+// Vector Input
+// ============================================================================
+
+/// A vector from JS as f32s: a Float32Array is read in place (one N-API
+/// call), a number[] is converted element by element.
+pub(crate) fn js_vector_f32<'a>(
+  vector: &'a Either<Float32ArraySlice<'_>, Vec<f64>>,
+) -> Cow<'a, [f32]> {
+  match vector {
+    Either::A(values) => Cow::Borrowed(values.as_ref()),
+    Either::B(values) => Cow::Owned(values.iter().map(|&v| v as f32).collect()),
+  }
+}
+
+/// The manifest a search last parsed, so repeated searches with the same
+/// manifest JSON skip re-parsing it (the JSON holds every vector).
+#[derive(Default)]
+struct ManifestCache(Mutex<Option<(String, Arc<VectorManifest>)>>);
+
+impl ManifestCache {
+  fn get(&self, json: String) -> Result<Arc<VectorManifest>> {
+    let mut cached = self
+      .0
+      .lock()
+      .map_err(|e| Error::from_reason(e.to_string()))?;
+    if let Some((cached_json, manifest)) = cached.as_ref() {
+      if *cached_json == json {
+        return Ok(Arc::clone(manifest));
+      }
+    }
+    let manifest: Arc<VectorManifest> = Arc::new(
+      serde_json::from_str(&json)
+        .map_err(|e| Error::from_reason(format!("Failed to parse manifest: {e}")))?,
+    );
+    *cached = Some((json, Arc::clone(&manifest)));
+    Ok(manifest)
+  }
+}
 
 // ============================================================================
 // Distance Metric
@@ -240,7 +282,8 @@ pub struct JsIvfStats {
 /// IVF (Inverted File) index for approximate nearest neighbor search
 #[napi]
 pub struct JsIvfIndex {
-  inner: RwLock<RustIvfIndex>,
+  inner: Arc<RwLock<RustIvfIndex>>,
+  manifest: ManifestCache,
 }
 
 #[napi]
@@ -255,7 +298,8 @@ impl JsIvfIndex {
     )?;
     let rust_config = config.unwrap_or_default().into_rust()?;
     Ok(JsIvfIndex {
-      inner: RwLock::new(RustIvfIndex::new(dimensions, rust_config)),
+      inner: Arc::new(RwLock::new(RustIvfIndex::new(dimensions, rust_config))),
+      manifest: ManifestCache::default(),
     })
   }
 
@@ -283,14 +327,18 @@ impl JsIvfIndex {
   ///
   /// Call this before train() with representative vectors from your dataset.
   #[napi(catch_unwind)]
-  pub fn add_training_vectors(&self, vectors: Vec<f64>, num_vectors: i32) -> Result<()> {
+  pub fn add_training_vectors(
+    &self,
+    vectors: Either<Float32ArraySlice<'_>, Vec<f64>>,
+    num_vectors: i32,
+  ) -> Result<()> {
     let num_vectors =
       validation::non_negative_usize("numVectors", num_vectors as i64, validation::MAX_COUNT)?;
     let mut index = self
       .inner
       .write()
       .map_err(|e| Error::from_reason(e.to_string()))?;
-    let vectors_f32: Vec<f32> = vectors.iter().map(|&v| v as f32).collect();
+    let vectors_f32 = js_vector_f32(&vectors);
     index
       .add_training_vectors(&vectors_f32, num_vectors)
       .map_err(|e| Error::from_reason(format!("Failed to add training vectors: {e}")))
@@ -301,26 +349,32 @@ impl JsIvfIndex {
   /// This runs k-means clustering to create the inverted file structure.
   #[napi(catch_unwind)]
   pub fn train(&self) -> Result<()> {
-    let mut index = self
-      .inner
-      .write()
-      .map_err(|e| Error::from_reason(e.to_string()))?;
-    index
-      .train()
-      .map_err(|e| Error::from_reason(format!("Failed to train index: {e}")))
+    train_ivf(&self.inner)
+  }
+
+  /// Train the index on the libuv thread pool. Other calls on this index
+  /// wait until training finishes.
+  #[napi(ts_return_type = "Promise<void>")]
+  pub fn train_async(&self) -> AsyncTask<BlockingTask<()>> {
+    let inner = Arc::clone(&self.inner);
+    BlockingTask::spawn(Ok(move || train_ivf(&inner)))
   }
 
   /// Insert a vector into the index
   ///
   /// The index must be trained first.
   #[napi(catch_unwind)]
-  pub fn insert(&self, vector_id: f64, vector: Vec<f64>) -> Result<()> {
+  pub fn insert(
+    &self,
+    vector_id: f64,
+    vector: Either<Float32ArraySlice<'_>, Vec<f64>>,
+  ) -> Result<()> {
     let vector_id = validation::node_id("vectorId", vector_id)?;
     let mut index = self
       .inner
       .write()
       .map_err(|e| Error::from_reason(e.to_string()))?;
-    let vector_f32: Vec<f32> = vector.iter().map(|&v| v as f32).collect();
+    let vector_f32 = js_vector_f32(&vector);
     index
       .insert(vector_id, &vector_f32)
       .map_err(|e| Error::from_reason(format!("Failed to insert vector: {e}")))
@@ -330,14 +384,18 @@ impl JsIvfIndex {
   ///
   /// Requires the vector data to determine which cluster to remove from.
   #[napi(catch_unwind)]
-  pub fn delete(&self, vector_id: f64, vector: Vec<f64>) -> Result<bool> {
+  pub fn delete(
+    &self,
+    vector_id: f64,
+    vector: Either<Float32ArraySlice<'_>, Vec<f64>>,
+  ) -> Result<bool> {
     let vector_id = validation::node_id("vectorId", vector_id)?;
     let mut index = self
       .inner
       .write()
       .map_err(|e| Error::from_reason(e.to_string()))?;
-    validation::vector_len("vector", vector.len(), index.dimensions)?;
-    let vector_f32: Vec<f32> = vector.iter().map(|&v| v as f32).collect();
+    let vector_f32 = js_vector_f32(&vector);
+    validation::vector_len("vector", vector_f32.len(), index.dimensions)?;
     index
       .delete(vector_id, &vector_f32)
       .map_err(|e| Error::from_reason(format!("Failed to delete vector: {e}")))
@@ -361,7 +419,7 @@ impl JsIvfIndex {
   pub fn search(
     &self,
     manifest_json: String,
-    query: Vec<f64>,
+    query: Either<Float32ArraySlice<'_>, Vec<f64>>,
     k: i32,
     options: Option<JsSearchOptions>,
   ) -> Result<Vec<JsSearchResult>> {
@@ -369,14 +427,11 @@ impl JsIvfIndex {
       .inner
       .read()
       .map_err(|e| Error::from_reason(e.to_string()))?;
-    validation::vector_len("query", query.len(), index.dimensions)?;
+    let query_f32 = js_vector_f32(&query);
+    validation::vector_len("query", query_f32.len(), index.dimensions)?;
 
-    // Parse manifest from JSON
-    let manifest: VectorManifest = serde_json::from_str(&manifest_json)
-      .map_err(|e| Error::from_reason(format!("Failed to parse manifest: {e}")))?;
+    let manifest = self.manifest.get(manifest_json)?;
     validation::vector_len("manifest", manifest.config.dimensions, index.dimensions)?;
-
-    let query_f32: Vec<f32> = query.iter().map(|&v| v as f32).collect();
 
     let rust_options = options
       .as_ref()
@@ -402,7 +457,7 @@ impl JsIvfIndex {
   pub fn search_multi(
     &self,
     manifest_json: String,
-    queries: Vec<Vec<f64>>,
+    queries: Vec<Either<Float32ArraySlice<'_>, Vec<f64>>>,
     k: i32,
     aggregation: JsAggregation,
     options: Option<JsSearchOptions>,
@@ -411,21 +466,15 @@ impl JsIvfIndex {
       .inner
       .read()
       .map_err(|e| Error::from_reason(e.to_string()))?;
-    for (i, query) in queries.iter().enumerate() {
+    let queries_f32: Vec<Cow<'_, [f32]>> = queries.iter().map(js_vector_f32).collect();
+    for (i, query) in queries_f32.iter().enumerate() {
       validation::vector_len(format_args!("queries[{i}]"), query.len(), index.dimensions)?;
     }
 
-    // Parse manifest from JSON
-    let manifest: VectorManifest = serde_json::from_str(&manifest_json)
-      .map_err(|e| Error::from_reason(format!("Failed to parse manifest: {e}")))?;
+    let manifest = self.manifest.get(manifest_json)?;
     validation::vector_len("manifest", manifest.config.dimensions, index.dimensions)?;
 
-    let queries_f32: Vec<Vec<f32>> = queries
-      .iter()
-      .map(|q| q.iter().map(|&v| v as f32).collect())
-      .collect();
-
-    let query_refs: Vec<&[f32]> = queries_f32.iter().map(|q| q.as_slice()).collect();
+    let query_refs: Vec<&[f32]> = queries_f32.iter().map(|q| q.as_ref()).collect();
 
     let rust_options = options
       .as_ref()
@@ -480,9 +529,28 @@ impl JsIvfIndex {
     let index = crate::vector::ivf::serialize::deserialize_ivf(&data)
       .map_err(|e| Error::from_reason(format!("Failed to deserialize: {e}")))?;
     Ok(JsIvfIndex {
-      inner: RwLock::new(index),
+      inner: Arc::new(RwLock::new(index)),
+      manifest: ManifestCache::default(),
     })
   }
+}
+
+fn train_ivf(inner: &RwLock<RustIvfIndex>) -> Result<()> {
+  let mut index = inner
+    .write()
+    .map_err(|e| Error::from_reason(e.to_string()))?;
+  index
+    .train()
+    .map_err(|e| Error::from_reason(format!("Failed to train index: {e}")))
+}
+
+fn train_ivf_pq(inner: &RwLock<RustIvfPqIndex>) -> Result<()> {
+  let mut index = inner
+    .write()
+    .map_err(|e| Error::from_reason(e.to_string()))?;
+  index
+    .train()
+    .map_err(|e| Error::from_reason(format!("Failed to train index: {e}")))
 }
 
 // ============================================================================
@@ -492,7 +560,8 @@ impl JsIvfIndex {
 /// IVF-PQ combined index for memory-efficient approximate nearest neighbor search
 #[napi]
 pub struct JsIvfPqIndex {
-  inner: RwLock<RustIvfPqIndex>,
+  inner: Arc<RwLock<RustIvfPqIndex>>,
+  manifest: ManifestCache,
 }
 
 #[napi]
@@ -520,7 +589,8 @@ impl JsIvfPqIndex {
       .map_err(|e| Error::from_reason(format!("Failed to create index: {e}")))?;
 
     Ok(JsIvfPqIndex {
-      inner: RwLock::new(index),
+      inner: Arc::new(RwLock::new(index)),
+      manifest: ManifestCache::default(),
     })
   }
 
@@ -546,14 +616,18 @@ impl JsIvfPqIndex {
 
   /// Add training vectors
   #[napi(catch_unwind)]
-  pub fn add_training_vectors(&self, vectors: Vec<f64>, num_vectors: i32) -> Result<()> {
+  pub fn add_training_vectors(
+    &self,
+    vectors: Either<Float32ArraySlice<'_>, Vec<f64>>,
+    num_vectors: i32,
+  ) -> Result<()> {
     let num_vectors =
       validation::non_negative_usize("numVectors", num_vectors as i64, validation::MAX_COUNT)?;
     let mut index = self
       .inner
       .write()
       .map_err(|e| Error::from_reason(e.to_string()))?;
-    let vectors_f32: Vec<f32> = vectors.iter().map(|&v| v as f32).collect();
+    let vectors_f32 = js_vector_f32(&vectors);
     index
       .add_training_vectors(&vectors_f32, num_vectors)
       .map_err(|e| Error::from_reason(format!("Failed to add training vectors: {e}")))
@@ -562,24 +636,30 @@ impl JsIvfPqIndex {
   /// Train the index
   #[napi(catch_unwind)]
   pub fn train(&self) -> Result<()> {
-    let mut index = self
-      .inner
-      .write()
-      .map_err(|e| Error::from_reason(e.to_string()))?;
-    index
-      .train()
-      .map_err(|e| Error::from_reason(format!("Failed to train index: {e}")))
+    train_ivf_pq(&self.inner)
+  }
+
+  /// Train the index on the libuv thread pool. Other calls on this index
+  /// wait until training finishes.
+  #[napi(ts_return_type = "Promise<void>")]
+  pub fn train_async(&self) -> AsyncTask<BlockingTask<()>> {
+    let inner = Arc::clone(&self.inner);
+    BlockingTask::spawn(Ok(move || train_ivf_pq(&inner)))
   }
 
   /// Insert a vector
   #[napi(catch_unwind)]
-  pub fn insert(&self, vector_id: f64, vector: Vec<f64>) -> Result<()> {
+  pub fn insert(
+    &self,
+    vector_id: f64,
+    vector: Either<Float32ArraySlice<'_>, Vec<f64>>,
+  ) -> Result<()> {
     let vector_id = validation::node_id("vectorId", vector_id)?;
     let mut index = self
       .inner
       .write()
       .map_err(|e| Error::from_reason(e.to_string()))?;
-    let vector_f32: Vec<f32> = vector.iter().map(|&v| v as f32).collect();
+    let vector_f32 = js_vector_f32(&vector);
     index
       .insert(vector_id, &vector_f32)
       .map_err(|e| Error::from_reason(format!("Failed to insert vector: {e}")))
@@ -589,14 +669,18 @@ impl JsIvfPqIndex {
   ///
   /// Requires the vector data to determine which cluster to remove from.
   #[napi(catch_unwind)]
-  pub fn delete(&self, vector_id: f64, vector: Vec<f64>) -> Result<bool> {
+  pub fn delete(
+    &self,
+    vector_id: f64,
+    vector: Either<Float32ArraySlice<'_>, Vec<f64>>,
+  ) -> Result<bool> {
     let vector_id = validation::node_id("vectorId", vector_id)?;
     let mut index = self
       .inner
       .write()
       .map_err(|e| Error::from_reason(e.to_string()))?;
-    validation::vector_len("vector", vector.len(), index.dimensions)?;
-    let vector_f32: Vec<f32> = vector.iter().map(|&v| v as f32).collect();
+    let vector_f32 = js_vector_f32(&vector);
+    validation::vector_len("vector", vector_f32.len(), index.dimensions)?;
     index
       .delete(vector_id, &vector_f32)
       .map_err(|e| Error::from_reason(format!("Failed to delete vector: {e}")))
@@ -618,7 +702,7 @@ impl JsIvfPqIndex {
   pub fn search(
     &self,
     manifest_json: String,
-    query: Vec<f64>,
+    query: Either<Float32ArraySlice<'_>, Vec<f64>>,
     k: i32,
     options: Option<JsSearchOptions>,
   ) -> Result<Vec<JsSearchResult>> {
@@ -626,13 +710,10 @@ impl JsIvfPqIndex {
       .inner
       .read()
       .map_err(|e| Error::from_reason(e.to_string()))?;
-    validation::vector_len("query", query.len(), index.dimensions)?;
+    let query_f32 = js_vector_f32(&query);
+    validation::vector_len("query", query_f32.len(), index.dimensions)?;
 
-    // Parse manifest from JSON
-    let manifest: VectorManifest = serde_json::from_str(&manifest_json)
-      .map_err(|e| Error::from_reason(format!("Failed to parse manifest: {e}")))?;
-
-    let query_f32: Vec<f32> = query.iter().map(|&v| v as f32).collect();
+    let manifest = self.manifest.get(manifest_json)?;
 
     let rust_options = options
       .as_ref()
@@ -658,7 +739,7 @@ impl JsIvfPqIndex {
   pub fn search_multi(
     &self,
     manifest_json: String,
-    queries: Vec<Vec<f64>>,
+    queries: Vec<Either<Float32ArraySlice<'_>, Vec<f64>>>,
     k: i32,
     aggregation: JsAggregation,
     options: Option<JsSearchOptions>,
@@ -667,20 +748,14 @@ impl JsIvfPqIndex {
       .inner
       .read()
       .map_err(|e| Error::from_reason(e.to_string()))?;
-    for (i, query) in queries.iter().enumerate() {
+    let queries_f32: Vec<Cow<'_, [f32]>> = queries.iter().map(js_vector_f32).collect();
+    for (i, query) in queries_f32.iter().enumerate() {
       validation::vector_len(format_args!("queries[{i}]"), query.len(), index.dimensions)?;
     }
 
-    // Parse manifest from JSON
-    let manifest: VectorManifest = serde_json::from_str(&manifest_json)
-      .map_err(|e| Error::from_reason(format!("Failed to parse manifest: {e}")))?;
+    let manifest = self.manifest.get(manifest_json)?;
 
-    let queries_f32: Vec<Vec<f32>> = queries
-      .iter()
-      .map(|q| q.iter().map(|&v| v as f32).collect())
-      .collect();
-
-    let query_refs: Vec<&[f32]> = queries_f32.iter().map(|q| q.as_slice()).collect();
+    let query_refs: Vec<&[f32]> = queries_f32.iter().map(|q| q.as_ref()).collect();
 
     let rust_options = options
       .as_ref()
@@ -737,7 +812,8 @@ impl JsIvfPqIndex {
     let index = crate::vector::ivf_pq::deserialize_ivf_pq(&data)
       .map_err(|e| Error::from_reason(format!("Failed to deserialize: {e}")))?;
     Ok(JsIvfPqIndex {
-      inner: RwLock::new(index),
+      inner: Arc::new(RwLock::new(index)),
+      manifest: ManifestCache::default(),
     })
   }
 }
@@ -758,8 +834,12 @@ pub struct JsBruteForceResult {
 ///
 /// Core cosine distance is `1 - dot` and assumes unit vectors, so cosine
 /// inputs are normalized here; a zero vector has no direction and is rejected.
-fn search_vector(field: impl std::fmt::Display, values: &[f64], cosine: bool) -> Result<Vec<f32>> {
-  let mut vector: Vec<f32> = values.iter().map(|&v| v as f32).collect();
+fn search_vector(
+  field: impl std::fmt::Display,
+  values: &Either<Float32ArraySlice<'_>, Vec<f64>>,
+  cosine: bool,
+) -> Result<Vec<f32>> {
+  let mut vector = js_vector_f32(values).into_owned();
   if cosine {
     let norm = l2_norm(&vector);
     if norm <= 0.0 {
@@ -777,9 +857,9 @@ fn search_vector(field: impl std::fmt::Display, values: &[f64], cosine: bool) ->
 /// Useful for small datasets or verifying IVF results.
 #[napi(catch_unwind)]
 pub fn brute_force_search(
-  vectors: Vec<Vec<f64>>,
+  vectors: Vec<Either<Float32ArraySlice<'_>, Vec<f64>>>,
   node_ids: Vec<f64>,
-  query: Vec<f64>,
+  query: Either<Float32ArraySlice<'_>, Vec<f64>>,
   k: i32,
   metric: Option<JsDistanceMetric>,
 ) -> Result<Vec<JsBruteForceResult>> {
@@ -799,8 +879,8 @@ pub fn brute_force_search(
 
   let mut results: Vec<(i64, f32)> = Vec::with_capacity(vectors.len());
   for (i, (v, &node_id)) in vectors.iter().zip(node_ids.iter()).enumerate() {
-    validation::vector_len(format_args!("vectors[{i}]"), v.len(), query.len())?;
     let v_f32 = search_vector(format_args!("vectors[{i}]"), v, cosine)?;
+    validation::vector_len(format_args!("vectors[{i}]"), v_f32.len(), query_f32.len())?;
     results.push((node_id as i64, distance_fn(&query_f32, &v_f32)));
   }
 
@@ -1007,7 +1087,9 @@ fn map_vector_index_error(err: RustVectorIndexError) -> Error {
 /// High-level vector index for similarity search
 #[napi]
 pub struct VectorIndex {
-  inner: RwLock<RustVectorIndex>,
+  // A Mutex, not an RwLock: the index is Send but not Sync (its LRU cache),
+  // and `buildIndexAsync` shares it with a pool thread.
+  inner: Arc<Mutex<RustVectorIndex>>,
 }
 
 #[napi]
@@ -1017,19 +1099,21 @@ impl VectorIndex {
   pub fn new(options: VectorIndexOptions) -> Result<Self> {
     let options = options.into_rust()?;
     Ok(VectorIndex {
-      inner: RwLock::new(RustVectorIndex::new(options)),
+      inner: Arc::new(Mutex::new(RustVectorIndex::new(options))),
     })
   }
 
   /// Set/update a vector for a node
+  ///
+  /// A Float32Array is read in place; a number[] is converted to f32.
   #[napi(catch_unwind)]
-  pub fn set(&self, node_id: f64, vector: Vec<f64>) -> Result<()> {
+  pub fn set(&self, node_id: f64, vector: Either<Float32ArraySlice<'_>, Vec<f64>>) -> Result<()> {
     let node_id = validation::node_id("nodeId", node_id)?;
     let mut index = self
       .inner
-      .write()
+      .lock()
       .map_err(|e| Error::from_reason(e.to_string()))?;
-    let vector_f32: Vec<f32> = vector.iter().map(|&v| v as f32).collect();
+    let vector_f32 = js_vector_f32(&vector);
     index
       .set(node_id, &vector_f32)
       .map_err(map_vector_index_error)
@@ -1041,7 +1125,7 @@ impl VectorIndex {
     let node_id = validation::node_id("nodeId", node_id)?;
     let index = self
       .inner
-      .read()
+      .lock()
       .map_err(|e| Error::from_reason(e.to_string()))?;
     Ok(
       index
@@ -1056,7 +1140,7 @@ impl VectorIndex {
     let node_id = validation::node_id("nodeId", node_id)?;
     let mut index = self
       .inner
-      .write()
+      .lock()
       .map_err(|e| Error::from_reason(e.to_string()))?;
     index.delete(node_id).map_err(map_vector_index_error)
   }
@@ -1067,7 +1151,7 @@ impl VectorIndex {
     let node_id = validation::node_id("nodeId", node_id)?;
     let index = self
       .inner
-      .read()
+      .lock()
       .map_err(|e| Error::from_reason(e.to_string()))?;
     Ok(index.has(node_id))
   }
@@ -1075,21 +1159,29 @@ impl VectorIndex {
   /// Build/rebuild the IVF index for faster search
   #[napi(catch_unwind)]
   pub fn build_index(&self) -> Result<()> {
-    let mut index = self
-      .inner
-      .write()
-      .map_err(|e| Error::from_reason(e.to_string()))?;
-    index.build_index().map_err(map_vector_index_error)
+    build_vector_index(&self.inner)
+  }
+
+  /// Build/rebuild the IVF index on the libuv thread pool. Other calls on
+  /// this index wait until the build finishes.
+  #[napi(ts_return_type = "Promise<void>")]
+  pub fn build_index_async(&self) -> AsyncTask<BlockingTask<()>> {
+    let inner = Arc::clone(&self.inner);
+    BlockingTask::spawn(Ok(move || build_vector_index(&inner)))
   }
 
   /// Search for similar vectors
   #[napi(catch_unwind)]
-  pub fn search(&self, query: Vec<f64>, options: SimilarOptions) -> Result<Vec<VectorSearchHit>> {
+  pub fn search(
+    &self,
+    query: Either<Float32ArraySlice<'_>, Vec<f64>>,
+    options: SimilarOptions,
+  ) -> Result<Vec<VectorSearchHit>> {
     let mut index = self
       .inner
-      .write()
+      .lock()
       .map_err(|e| Error::from_reason(e.to_string()))?;
-    let query_f32: Vec<f32> = query.iter().map(|&v| v as f32).collect();
+    let query_f32 = js_vector_f32(&query);
     let options = options.into_rust()?;
     let hits = index
       .search(&query_f32, options)
@@ -1102,7 +1194,7 @@ impl VectorIndex {
   pub fn stats(&self) -> Result<VectorIndexStats> {
     let index = self
       .inner
-      .read()
+      .lock()
       .map_err(|e| Error::from_reason(e.to_string()))?;
     Ok(VectorIndexStats::from(index.stats()))
   }
@@ -1112,11 +1204,18 @@ impl VectorIndex {
   pub fn clear(&self) -> Result<()> {
     let mut index = self
       .inner
-      .write()
+      .lock()
       .map_err(|e| Error::from_reason(e.to_string()))?;
     index.clear();
     Ok(())
   }
+}
+
+fn build_vector_index(inner: &Mutex<RustVectorIndex>) -> Result<()> {
+  let mut index = inner
+    .lock()
+    .map_err(|e| Error::from_reason(e.to_string()))?;
+  index.build_index().map_err(map_vector_index_error)
 }
 
 /// Create a new vector index

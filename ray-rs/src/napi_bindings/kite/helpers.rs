@@ -23,7 +23,7 @@ pub(crate) fn prop_value_to_js(env: &Env, value: PropValue) -> Result<Unknown<'_
   match value {
     PropValue::Null => Null.into_unknown(env),
     PropValue::Bool(v) => v.into_unknown(env),
-    PropValue::I64(v) => v.into_unknown(env),
+    PropValue::I64(v) => super::conversion::i64_to_js(env, v),
     PropValue::F64(v) => v.into_unknown(env),
     PropValue::String(v) => v.into_unknown(env),
     PropValue::VectorF32(v) => {

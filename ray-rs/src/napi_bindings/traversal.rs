@@ -97,22 +97,21 @@ pub struct JsTraverseOptions {
   /// Direction of traversal
   pub direction: Option<JsTraversalDirection>,
   /// Minimum depth (default: 1; 0 includes the starting node)
-  pub min_depth: Option<u32>,
+  pub min_depth: Option<f64>,
   /// Maximum depth (0 performs no hops)
-  pub max_depth: u32,
+  pub max_depth: f64,
   /// Whether to only visit unique nodes (default: true)
   pub unique: Option<bool>,
 }
 
 impl JsTraverseOptions {
   pub(crate) fn to_rust(&self) -> napi::Result<TraverseOptions> {
-    let min_depth = validation::non_negative_usize(
+    let min_depth = validation::count(
       "minDepth",
-      self.min_depth.unwrap_or(1) as i64,
+      self.min_depth.unwrap_or(1.0),
       validation::MAX_DEPTH,
     )?;
-    let max_depth =
-      validation::non_negative_usize("maxDepth", self.max_depth as i64, validation::MAX_DEPTH)?;
+    let max_depth = validation::count("maxDepth", self.max_depth, validation::MAX_DEPTH)?;
     if min_depth > max_depth {
       return Err(validation::invalid_argument("minDepth must be <= maxDepth"));
     }
@@ -187,18 +186,23 @@ pub struct JsPathConfig {
   /// Multiple target node IDs (find path to any)
   pub targets: Option<Vec<f64>>,
   /// Allowed edge types (empty = all)
-  pub allowed_edge_types: Option<Vec<u32>>,
+  pub allowed_edge_types: Option<Vec<f64>>,
   /// Edge weight property key ID (optional)
-  pub weight_key_id: Option<u32>,
+  pub weight_key_id: Option<f64>,
   /// Edge weight property key name (optional)
   pub weight_key_name: Option<String>,
   /// Traversal direction
   pub direction: Option<JsTraversalDirection>,
   /// Maximum search depth
-  pub max_depth: Option<u32>,
+  pub max_depth: Option<f64>,
 }
 
 impl JsPathConfig {
+  /// The validated `weightKeyId`, if set.
+  pub(crate) fn weight_key_id(&self) -> napi::Result<Option<u32>> {
+    validation::opt_u32_value("weightKeyId", self.weight_key_id)
+  }
+
   pub(crate) fn to_rust(&self) -> napi::Result<PathConfig> {
     let mut targets = HashSet::new();
 
@@ -212,16 +216,16 @@ impl JsPathConfig {
       }
     }
 
-    let allowed_etypes: HashSet<ETypeId> = self
-      .allowed_edge_types
-      .clone()
-      .unwrap_or_default()
-      .into_iter()
-      .collect();
+    let allowed_etypes: HashSet<ETypeId> = validation::u32_values(
+      "allowedEdgeTypes",
+      self.allowed_edge_types.as_deref().unwrap_or_default(),
+    )?
+    .into_iter()
+    .collect();
 
-    let max_depth = validation::non_negative_usize(
+    let max_depth = validation::count(
       "maxDepth",
-      self.max_depth.unwrap_or(100) as i64,
+      self.max_depth.unwrap_or(100.0),
       validation::MAX_DEPTH,
     )?;
 
@@ -280,12 +284,18 @@ impl JsGraphAccessor {
   pub fn add_edge(
     &mut self,
     src: f64,
-    etype: u32,
+    etype: f64,
     dst: f64,
     weight: Option<f64>,
   ) -> napi::Result<()> {
+    let etype = validation::u32_value("etype", etype)?;
     let src = validation::node_id("src", src)?;
     let dst = validation::node_id("dst", dst)?;
+    if let Some(w) = weight {
+      check_weight(w).map_err(|reason| {
+        validation::invalid_argument(format!("weight of edge {src}->{dst}: {reason}"))
+      })?;
+    }
 
     self.out_edges.entry(src).or_default().push((etype, dst));
     self.in_edges.entry(dst).or_default().push((etype, src));
@@ -394,14 +404,20 @@ impl JsGraphAccessor {
   pub fn traverse_single(
     &self,
     start_nodes: Vec<f64>,
-    _direction: JsTraversalDirection,
-    edge_type: Option<u32>,
+    direction: JsTraversalDirection,
+    edge_type: Option<f64>,
   ) -> napi::Result<Vec<JsTraversalResult>> {
+    let edge_type = validation::opt_u32_value("edgeType", edge_type)?;
     let start = Self::start_nodes(start_nodes)?;
+    let builder = TraversalBuilder::new(start);
+    let builder = match direction {
+      JsTraversalDirection::Out => builder.out(edge_type),
+      JsTraversalDirection::In => builder.r#in(edge_type),
+      JsTraversalDirection::Both => builder.both(edge_type),
+    };
 
     Ok(
-      TraversalBuilder::new(start)
-        .out(edge_type) // Note: direction is handled below
+      builder
         .execute(|node_id, dir, etype| self.neighbors_internal(node_id, dir, etype))
         .map(JsTraversalResult::from)
         .collect(),
@@ -419,13 +435,14 @@ impl JsGraphAccessor {
     &self,
     start_nodes: Vec<f64>,
     steps: Vec<JsTraversalStep>,
-    limit: Option<u32>,
+    limit: Option<f64>,
   ) -> napi::Result<Vec<JsTraversalResult>> {
+    let limit = validation::opt_u32_value("limit", limit)?;
     let start = Self::start_nodes(start_nodes)?;
     let mut builder = TraversalBuilder::new(start);
 
     for step in steps {
-      let etype = step.edge_type;
+      let etype = step.etype()?;
       builder = match step.direction {
         JsTraversalDirection::Out => builder.out(etype),
         JsTraversalDirection::In => builder.r#in(etype),
@@ -456,9 +473,10 @@ impl JsGraphAccessor {
   pub fn traverse_depth(
     &self,
     start_nodes: Vec<f64>,
-    edge_type: Option<u32>,
+    edge_type: Option<f64>,
     options: JsTraverseOptions,
   ) -> napi::Result<Vec<JsTraversalResult>> {
+    let edge_type = validation::opt_u32_value("edgeType", edge_type)?;
     let start = Self::start_nodes(start_nodes)?;
     let opts = options.to_rust()?;
 
@@ -486,7 +504,7 @@ impl JsGraphAccessor {
     let mut builder = TraversalBuilder::new(start);
 
     for step in steps {
-      let etype = step.edge_type;
+      let etype = step.etype()?;
       builder = match step.direction {
         JsTraversalDirection::Out => builder.out(etype),
         JsTraversalDirection::In => builder.r#in(etype),
@@ -508,13 +526,14 @@ impl JsGraphAccessor {
     &self,
     start_nodes: Vec<f64>,
     steps: Vec<JsTraversalStep>,
-    limit: Option<u32>,
+    limit: Option<f64>,
   ) -> napi::Result<Vec<i64>> {
+    let limit = validation::opt_u32_value("limit", limit)?;
     let start = Self::start_nodes(start_nodes)?;
     let mut builder = TraversalBuilder::new(start);
 
     for step in steps {
-      let etype = step.edge_type;
+      let etype = step.etype()?;
       builder = match step.direction {
         JsTraversalDirection::Out => builder.out(etype),
         JsTraversalDirection::In => builder.r#in(etype),
@@ -582,7 +601,8 @@ impl JsGraphAccessor {
   /// @param k - Maximum number of paths to find
   /// @returns Array of path results sorted by weight
   #[napi]
-  pub fn k_shortest(&self, config: JsPathConfig, k: u32) -> napi::Result<Vec<JsPathResult>> {
+  pub fn k_shortest(&self, config: JsPathConfig, k: f64) -> napi::Result<Vec<JsPathResult>> {
+    let k = validation::u32_value("k", k)?;
     let rust_config = config.to_rust()?;
     let k = validation::non_negative_usize("k", k as i64, validation::MAX_COUNT)?;
 
@@ -611,8 +631,8 @@ impl JsGraphAccessor {
     &self,
     source: f64,
     target: f64,
-    edge_type: Option<u32>,
-    max_depth: Option<u32>,
+    edge_type: Option<f64>,
+    max_depth: Option<f64>,
   ) -> napi::Result<JsPathResult> {
     let config = JsPathConfig {
       source,
@@ -640,8 +660,8 @@ impl JsGraphAccessor {
     &self,
     source: f64,
     target: f64,
-    edge_type: Option<u32>,
-    max_depth: Option<u32>,
+    edge_type: Option<f64>,
+    max_depth: Option<f64>,
   ) -> napi::Result<bool> {
     Ok(
       self
@@ -660,12 +680,12 @@ impl JsGraphAccessor {
   pub fn reachable_nodes(
     &self,
     source: f64,
-    max_depth: u32,
-    edge_type: Option<u32>,
+    max_depth: f64,
+    edge_type: Option<f64>,
   ) -> napi::Result<Vec<i64>> {
     let opts = JsTraverseOptions {
       direction: Some(JsTraversalDirection::Out),
-      min_depth: Some(1),
+      min_depth: Some(1.0),
       max_depth,
       unique: Some(true),
     };
@@ -689,7 +709,7 @@ impl JsGraphAccessor {
 #[derive(Debug, Clone)]
 pub struct JsEdgeInput {
   pub src: f64,
-  pub etype: u32,
+  pub etype: f64,
   pub dst: f64,
   pub weight: Option<f64>,
 }
@@ -699,7 +719,30 @@ pub struct JsEdgeInput {
 #[derive(Debug, Clone)]
 pub struct JsTraversalStep {
   pub direction: JsTraversalDirection,
-  pub edge_type: Option<u32>,
+  pub edge_type: Option<f64>,
+}
+
+impl JsTraversalStep {
+  /// The validated edge type filter of this step.
+  pub(crate) fn etype(&self) -> napi::Result<Option<ETypeId>> {
+    validation::opt_u32_value("edgeType", self.edge_type)
+  }
+}
+
+/// Why `weight` cannot be a Dijkstra edge weight, if it cannot.
+///
+/// Dijkstra needs non-negative weights: a negative one makes it return paths
+/// that are not the shortest. 0 is a valid weight; NaN breaks the ordering.
+pub(crate) fn check_weight(weight: f64) -> std::result::Result<f64, String> {
+  if weight.is_nan() {
+    Err("NaN is not a valid edge weight".to_string())
+  } else if weight < 0.0 {
+    Err(format!(
+      "negative weight {weight} is not supported (Dijkstra needs weights >= 0)"
+    ))
+  } else {
+    Ok(weight)
+  }
 }
 
 // ============================================================================
@@ -712,11 +755,16 @@ pub struct JsTraversalStep {
 /// @param edgeType - Optional edge type filter
 /// @returns Traversal step object
 #[napi]
-pub fn traversal_step(direction: JsTraversalDirection, edge_type: Option<u32>) -> JsTraversalStep {
-  JsTraversalStep {
+pub fn traversal_step(
+  direction: JsTraversalDirection,
+  edge_type: Option<f64>,
+) -> napi::Result<JsTraversalStep> {
+  let step = JsTraversalStep {
     direction,
     edge_type,
-  }
+  };
+  step.etype()?;
+  Ok(step)
 }
 
 /// Create a path configuration
@@ -751,10 +799,18 @@ mod tests {
     // 1 --knows(1)--> 2 --knows(1)--> 3
     // 1 --follows(2)--> 4
     // 2 --follows(2)--> 5
-    graph.add_edge(1.0, 1, 2.0, Some(1.0)).expect("valid edge"); // 1 -knows-> 2
-    graph.add_edge(2.0, 1, 3.0, Some(1.0)).expect("valid edge"); // 2 -knows-> 3
-    graph.add_edge(1.0, 2, 4.0, Some(2.0)).expect("valid edge"); // 1 -follows-> 4
-    graph.add_edge(2.0, 2, 5.0, Some(2.0)).expect("valid edge"); // 2 -follows-> 5
+    graph
+      .add_edge(1.0, 1.0, 2.0, Some(1.0))
+      .expect("valid edge"); // 1 -knows-> 2
+    graph
+      .add_edge(2.0, 1.0, 3.0, Some(1.0))
+      .expect("valid edge"); // 2 -knows-> 3
+    graph
+      .add_edge(1.0, 2.0, 4.0, Some(2.0))
+      .expect("valid edge"); // 1 -follows-> 4
+    graph
+      .add_edge(2.0, 2.0, 5.0, Some(2.0))
+      .expect("valid edge"); // 2 -follows-> 5
     graph
   }
 
@@ -774,7 +830,7 @@ mod tests {
         vec![1.0],
         vec![JsTraversalStep {
           direction: JsTraversalDirection::Out,
-          edge_type: Some(1),
+          edge_type: Some(1.0),
         }],
         None,
       )
@@ -794,11 +850,11 @@ mod tests {
         vec![
           JsTraversalStep {
             direction: JsTraversalDirection::Out,
-            edge_type: Some(1),
+            edge_type: Some(1.0),
           },
           JsTraversalStep {
             direction: JsTraversalDirection::Out,
-            edge_type: Some(1),
+            edge_type: Some(1.0),
           },
         ],
         None,
@@ -854,7 +910,7 @@ mod tests {
         vec![1.0],
         vec![JsTraversalStep {
           direction: JsTraversalDirection::Out,
-          edge_type: Some(1),
+          edge_type: Some(1.0),
         }],
         None,
       )
@@ -932,7 +988,7 @@ mod tests {
     let graph = create_test_graph();
 
     let reachable = graph
-      .reachable_nodes(1.0, 2, None)
+      .reachable_nodes(1.0, 2.0, None)
       .expect("valid traversal");
 
     assert_eq!(reachable.len(), 4); // 2, 3, 4, 5
@@ -952,10 +1008,18 @@ mod tests {
     //   1   4
     //    \ /
     //     3
-    graph.add_edge(1.0, 1, 2.0, Some(1.0)).expect("valid edge");
-    graph.add_edge(1.0, 1, 3.0, Some(2.0)).expect("valid edge");
-    graph.add_edge(2.0, 1, 4.0, Some(1.0)).expect("valid edge");
-    graph.add_edge(3.0, 1, 4.0, Some(1.0)).expect("valid edge");
+    graph
+      .add_edge(1.0, 1.0, 2.0, Some(1.0))
+      .expect("valid edge");
+    graph
+      .add_edge(1.0, 1.0, 3.0, Some(2.0))
+      .expect("valid edge");
+    graph
+      .add_edge(2.0, 1.0, 4.0, Some(1.0))
+      .expect("valid edge");
+    graph
+      .add_edge(3.0, 1.0, 4.0, Some(1.0))
+      .expect("valid edge");
 
     let paths = graph
       .k_shortest(
@@ -969,7 +1033,7 @@ mod tests {
           direction: None,
           max_depth: None,
         },
-        2,
+        2.0,
       )
       .expect("valid paths");
 
@@ -995,7 +1059,7 @@ mod tests {
           direction: JsTraversalDirection::Out,
           edge_type: None,
         }],
-        Some(1),
+        Some(1.0),
       )
       .expect("valid traversal");
 
@@ -1009,11 +1073,11 @@ mod tests {
     let results = graph
       .traverse_depth(
         vec![1.0],
-        Some(1), // Only "knows" edges
+        Some(1.0), // Only "knows" edges
         JsTraverseOptions {
           direction: Some(JsTraversalDirection::Out),
-          min_depth: Some(1),
-          max_depth: 2,
+          min_depth: Some(1.0),
+          max_depth: 2.0,
           unique: Some(true),
         },
       )
@@ -1035,25 +1099,26 @@ mod tests {
 
   #[test]
   fn test_traversal_step_helper() {
-    let step = traversal_step(JsTraversalDirection::Out, Some(1));
+    let step = traversal_step(JsTraversalDirection::Out, Some(1.0)).expect("valid step");
     assert_eq!(step.direction, JsTraversalDirection::Out);
-    assert_eq!(step.edge_type, Some(1));
+    assert_eq!(step.edge_type, Some(1.0));
+    assert!(traversal_step(JsTraversalDirection::Out, Some(-1.0)).is_err());
   }
 
   #[test]
   fn validates_depth_limits_and_zero_semantics() {
     assert!(JsTraverseOptions {
       direction: None,
-      min_depth: Some(0),
-      max_depth: 0,
+      min_depth: Some(0.0),
+      max_depth: 0.0,
       unique: None,
     }
     .to_rust()
     .is_ok());
     assert!(JsTraverseOptions {
       direction: None,
-      min_depth: Some(1),
-      max_depth: 0,
+      min_depth: Some(1.0),
+      max_depth: 0.0,
       unique: None,
     }
     .to_rust()
@@ -1061,7 +1126,7 @@ mod tests {
     assert!(JsTraverseOptions {
       direction: None,
       min_depth: None,
-      max_depth: u32::MAX,
+      max_depth: u32::MAX as f64,
       unique: None,
     }
     .to_rust()
@@ -1078,5 +1143,24 @@ mod tests {
     }
     .to_rust()
     .is_err());
+  }
+
+  #[test]
+  fn traverse_single_honours_direction() {
+    let graph = create_test_graph();
+    let incoming = graph
+      .traverse_single(vec![2.0], JsTraversalDirection::In, None)
+      .expect("valid traversal");
+    let sources: Vec<i64> = incoming.iter().map(|r| r.node_id).collect();
+    assert_eq!(sources, vec![1]);
+  }
+
+  #[test]
+  fn add_edge_rejects_negative_and_nan_weights() {
+    let mut graph = JsGraphAccessor::new();
+    assert!(graph.add_edge(1.0, 1.0, 2.0, Some(0.0)).is_ok());
+    assert!(graph.add_edge(1.0, 1.0, 3.0, Some(-1.0)).is_err());
+    assert!(graph.add_edge(1.0, 1.0, 4.0, Some(f64::NAN)).is_err());
+    assert!(graph.add_edge(1.0, -1.0, 5.0, None).is_err());
   }
 }
