@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::util::fs::sync_parent_dir;
-use crate::util::mmap::{map_file, Mmap};
+use crate::util::mmap::{map_file, map_file_range, private_map, Mmap};
 
 use crate::constants::{MAX_PAGE_SIZE, MIN_PAGE_SIZE, OS_PAGE_SIZE};
 use crate::error::{KiteError, Result};
@@ -472,6 +472,40 @@ impl FilePager {
     self.file.set_len(length)?;
     self.file_size = length;
     Ok(())
+  }
+
+  /// Bytes `offset..offset + length` of the file, as a mapping, for a range
+  /// that stays unchanged while the mapping lives (an installed snapshot).
+  ///
+  /// The file is mapped only while this pager holds the database file lock:
+  /// then no other handle writes the file, and this process retires a mapped
+  /// range only after dropping its mapping. Without the lock (a replica
+  /// reading its live primary, multi-node simulation), another writer may
+  /// reuse or truncate the range at any time, and touching a mapped page past
+  /// the new end of the file kills the process (SIGBUS). The range is copied
+  /// into private memory then, where no later change reaches it: a change
+  /// during the copy shows as a short read (an error) or as bytes that fail
+  /// the snapshot's checks.
+  pub(crate) fn map_immutable_range(&self, offset: u64, length: usize) -> Result<Mmap> {
+    if self.file_lock.is_some() {
+      return Ok(map_file_range(&self.file, offset, length)?);
+    }
+    let past_end = || {
+      std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        "range exceeds file length",
+      )
+    };
+    // Checked first so a damaged header cannot size the copy.
+    if offset.saturating_add(length as u64) > self.file.metadata()?.len() {
+      return Err(past_end().into());
+    }
+    Ok(private_map(length, |buffer| {
+      if read_full_at(&self.file, buffer, offset)? < buffer.len() {
+        return Err(past_end());
+      }
+      Ok(())
+    })?)
   }
 
   /// Memory-map the entire file for read-only pager tests and tooling.

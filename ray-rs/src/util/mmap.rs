@@ -8,6 +8,11 @@
 //! mapping is dropped. Embedded single-file snapshots use `map_file_range` so
 //! only the immutable snapshot pages are mapped; headers and WAL pages remain
 //! ordinary mutable I/O ranges.
+//!
+//! Only a handle that can keep every other writer out of the file can uphold
+//! that: touching a mapped page that another handle truncated from the file
+//! kills the process (SIGBUS). Without that guarantee, copy the range into
+//! `private_map` memory instead.
 
 use std::fs::File;
 
@@ -74,6 +79,38 @@ pub fn map_file(file: &File) -> std::io::Result<Mmap> {
   #[cfg(target_arch = "wasm32")]
   {
     Mmap::map(file)
+  }
+}
+
+/// Private, read-only memory of `length` bytes, filled by `fill`.
+///
+/// No file backs it, so no change to any file can fault it, unlike a file
+/// mapping: for a range of a file that another handle may change meanwhile.
+pub fn private_map(
+  length: usize,
+  fill: impl FnOnce(&mut [u8]) -> std::io::Result<()>,
+) -> std::io::Result<Mmap> {
+  if length == 0 {
+    return Err(std::io::Error::new(
+      std::io::ErrorKind::InvalidInput,
+      "cannot map an empty range",
+    ));
+  }
+
+  #[cfg(not(target_arch = "wasm32"))]
+  {
+    let mut memory = memmap2::MmapMut::map_anon(length)?;
+    fill(&mut memory)?;
+    memory.make_read_only()
+  }
+
+  #[cfg(target_arch = "wasm32")]
+  {
+    let mut buffer = vec![0u8; length];
+    fill(&mut buffer)?;
+    Ok(Mmap {
+      data: Arc::new(buffer),
+    })
   }
 }
 

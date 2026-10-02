@@ -30,7 +30,7 @@ use crate::replication::types::ReplicationRole;
 use crate::types::*;
 use crate::util::compression::CompressionOptions;
 use crate::util::fs::sync_parent_dir;
-use crate::util::mmap::{map_file_range, Mmap};
+use crate::util::mmap::Mmap;
 
 use super::recovery::{
   committed_transactions, drop_vectors_of_missing_nodes, replay_wal_record, scan_wal_records,
@@ -447,6 +447,8 @@ struct SnapshotLoadState<'a> {
   snapshot_profile: Option<&'a mut SnapshotOpenProfile>,
 }
 
+/// The snapshot range `header` names, mapped or copied as
+/// [`FilePager::map_immutable_range`] decides.
 pub(crate) fn map_snapshot_range(pager: &FilePager, header: &DbHeaderV1) -> Result<Arc<Mmap>> {
   let offset = header
     .snapshot_start_page
@@ -459,7 +461,7 @@ pub(crate) fn map_snapshot_range(pager: &FilePager, header: &DbHeaderV1) -> Resu
   let length = usize::try_from(length)
     .map_err(|_| KiteError::InvalidSnapshot("snapshot is too large to map".to_string()))?;
 
-  Ok(Arc::new(map_file_range(pager.file(), offset, length)?))
+  Ok(Arc::new(pager.map_immutable_range(offset, length)?))
 }
 
 #[cfg(feature = "bench-profile")]
