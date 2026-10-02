@@ -694,7 +694,7 @@ fn x_failed_group_commits_are_rolled_back_durably_before_the_next_header() {
   write(&mut wal, WalRecordType::CreateNode, 2);
   let before_commit = wal.head();
   write(&mut wal, WalRecordType::Commit, 2);
-  let sealed = wal.seal();
+  let sealed = wal.seal(false);
   sealed.write(&mut pager).expect("write the group");
   // Transaction 3 appends while the group's I/O runs.
   write(&mut wal, WalRecordType::Begin, 3);

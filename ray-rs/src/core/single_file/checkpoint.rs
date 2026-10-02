@@ -5131,3 +5131,8 @@ mod b4_core_misc_tests;
 #[cfg(test)]
 #[path = "b4_commit_pipeline_checkpoint_tests.rs"]
 mod b4_commit_pipeline_tests;
+
+/// raydb-b4 `fsync-group` lane: Full-mode groups right after a region switch.
+#[cfg(test)]
+#[path = "b4_fsync_group_checkpoint_tests.rs"]
+mod b4_fsync_group_tests;

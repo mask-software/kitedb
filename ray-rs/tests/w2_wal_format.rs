@@ -137,6 +137,11 @@ fn edit_header(path: &Path, edit: impl FnOnce(&mut DbHeaderV1)) -> Vec<u8> {
 /// persist the header page first), recovery reads the previous cycle's
 /// committed BEGIN/SET/COMMIT records there, and replays them after the newer
 /// acknowledged commit.
+///
+/// Records are now written only over zeros a sync made durable first (see
+/// `WalBuffer`'s "Zeros ahead"), so CCCC's commit erases BBBB's bytes before
+/// it writes; the image puts them back, as they lay after the reset, to check
+/// that the salt alone still rejects them.
 #[test]
 fn w2_stale_records_of_an_earlier_wal_cycle_are_not_replayed() {
   let dir = tempdir().expect("tempdir");
@@ -152,6 +157,7 @@ fn w2_stale_records_of_an_earlier_wal_cycle_are_not_replayed() {
   set_prop(&db, node, key, "AAAA");
   set_prop(&db, node, key, "BBBB");
   db.checkpoint().expect("checkpoint 1");
+  let reset = fs::read(&path).expect("read");
   // Cycle 2: CCCC overwrites AAAA's bytes; BBBB's records stay right after.
   set_prop(&db, node, key, "CCCC");
   let acked = fs::read(&path).expect("read");
@@ -171,14 +177,16 @@ fn w2_stale_records_of_an_earlier_wal_cycle_are_not_replayed() {
   let wal = wal_area(&header);
   let stale = wal.start + tx_len as usize..wal.start + 2 * tx_len as usize;
   assert!(
-    acked[stale].iter().any(|byte| *byte != 0),
-    "precondition: BBBB's records are still in the WAL after CCCC"
+    reset[stale.clone()].iter().any(|byte| *byte != 0),
+    "precondition: BBBB's records are still in the WAL after the reset"
   );
 
   // Crash during DDDD's commit sync: its header page is durable, its WAL page
-  // is not (the WAL holds what it held after CCCC).
+  // is not (the WAL holds what it held after CCCC, with BBBB's bytes as the
+  // reset left them).
   let mut image = after.clone();
   image[wal.clone()].copy_from_slice(&acked[wal]);
+  image[stale.clone()].copy_from_slice(&reset[stale]);
 
   let mut recovered = Vec::new();
   for read_only in [true, false] {
