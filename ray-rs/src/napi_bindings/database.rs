@@ -151,7 +151,6 @@ pub struct OpenOptions {
   pub mvcc_max_chain_depth: Option<i64>,
   /// Page size in bytes (must be a supported positive power of two)
   pub page_size: Option<u32>,
-  /// WAL size in bytes (must be positive and at least 16 pages; default: 4MB)
   /// WAL size in bytes (at least 16 pages), fixed when the file is created.
   /// Unset: a new file gets a 4MB WAL and an existing file keeps its own.
   /// Set: a new file gets this size; an existing file with a different WAL

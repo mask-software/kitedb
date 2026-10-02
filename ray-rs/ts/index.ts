@@ -1637,7 +1637,11 @@ export interface KiteOptions {
   groupCommitEnabled?: boolean
   /** Group commit window in milliseconds */
   groupCommitWindowMs?: number
-  /** WAL size in megabytes (default: 4) */
+  /**
+   * WAL size in megabytes, fixed when the file is created. Unset: a new file
+   * gets 4MB and an existing file keeps its own size. Set: an existing file
+   * with a different WAL size fails to open.
+   */
   walSizeMb?: number
   /** WAL usage threshold (0.0-1.0) to trigger auto-checkpoint */
   checkpointThreshold?: number

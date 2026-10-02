@@ -1188,7 +1188,12 @@ export interface JsKiteOptions {
   groupCommitEnabled?: boolean
   /** Group commit window in milliseconds (0 adds no coalescing delay) */
   groupCommitWindowMs?: number
-  /** WAL size in megabytes (must be positive; default: 4) */
+  /**
+   * WAL size in megabytes (must be positive), fixed when the file is created.
+   * Unset: a new file gets a 4MB WAL and an existing file keeps its own.
+   * Set: a new file gets this size; an existing file with a different WAL
+   * size fails to open.
+   */
   walSizeMb?: number
   /** WAL usage threshold (0.0-1.0) to trigger auto-checkpoint */
   checkpointThreshold?: number
@@ -1521,7 +1526,12 @@ export interface OpenOptions {
   mvccMaxChainDepth?: number
   /** Page size in bytes (must be a supported positive power of two) */
   pageSize?: number
-  /** WAL size in bytes (must be positive and at least 16 pages; default: 4MB) */
+  /**
+   * WAL size in bytes (at least 16 pages), fixed when the file is created.
+   * Unset: a new file gets a 4MB WAL and an existing file keeps its own.
+   * Set: a new file gets this size; an existing file with a different WAL
+   * size fails to open.
+   */
   walSize?: number
   /** Enable auto-checkpoint when WAL usage exceeds threshold */
   autoCheckpoint?: boolean
