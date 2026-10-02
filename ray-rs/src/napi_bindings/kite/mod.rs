@@ -113,6 +113,7 @@ fn apply_kite_open_options(options: &JsKiteOptions, kite_opts: &mut KiteOptions)
   kite_opts.read_only = options.read_only.unwrap_or(false);
   kite_opts.create_if_missing = options.create_if_missing.unwrap_or(true);
   kite_opts.mvcc = options.mvcc.unwrap_or(false);
+  kite_opts.strict_schema = options.strict_schema.unwrap_or(false);
 
   if let Some(value) = options.mvcc_gc_interval_ms {
     kite_opts.mvcc_gc_interval_ms = Some(validation::positive_u64(
@@ -1152,29 +1153,16 @@ impl Kite {
   #[napi]
   pub fn from(&self, node_id: f64) -> Result<KiteTraversal> {
     let node_id = validation::node_id("nodeId", node_id)?;
-    Ok(KiteTraversal {
-      ray: self.inner.clone(),
-      start_nodes: vec![node_id],
-      steps: kite_traversal::StepChain::default(),
-      limit: None,
-      selected_props: None,
-      where_edge: None,
-      where_node: None,
-    })
+    Ok(KiteTraversal::new(self.inner.clone(), vec![node_id]))
   }
 
   /// Begin a traversal from multiple nodes
   #[napi]
   pub fn from_nodes(&self, node_ids: Vec<f64>) -> Result<KiteTraversal> {
-    Ok(KiteTraversal {
-      ray: self.inner.clone(),
-      start_nodes: validation::node_ids("nodeIds", &node_ids)?,
-      steps: kite_traversal::StepChain::default(),
-      limit: None,
-      selected_props: None,
-      where_edge: None,
-      where_node: None,
-    })
+    Ok(KiteTraversal::new(
+      self.inner.clone(),
+      validation::node_ids("nodeIds", &node_ids)?,
+    ))
   }
 
   /// Begin a path finding query
@@ -1303,6 +1291,7 @@ mod option_validation_tests {
       replication_segment_max_bytes: None,
       replication_retention_min_entries: None,
       replication_retention_min_ms: None,
+      strict_schema: None,
     }
   }
 

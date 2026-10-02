@@ -166,7 +166,10 @@ Defines a node type with schema.
 
 - `name: string` - Node type name
 - `config: NodeConfig<KeyArg, Props>`
-  - `key: (id: KeyArg) => string` - Key generation function
+  - `key: (id: KeyArg) => string` - Key generation function. It is called once, at definition,
+    to read its prefix (keys are stored as `<prefix><id>`), so it must return the prefix followed by
+    the unchanged id; `node()` throws otherwise. Use a `{ kind: 'template' | 'parts', ... }` key spec
+    for other key shapes.
   - `props: PropsSchema` - Property definitions
 
 ```typescript

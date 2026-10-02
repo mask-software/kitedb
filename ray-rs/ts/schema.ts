@@ -106,7 +106,8 @@ export const vector = prop.vector
 export const any = prop.any
 
 /**
- * Mark a property as optional.
+ * Mark a property as optional. Properties are required otherwise, which the
+ * `strictSchema` Kite option enforces when a node is created.
  *
  * @example
  * ```typescript
@@ -118,7 +119,11 @@ export function optional<T extends PropSpec>(spec: T): T & { optional: true } {
 }
 
 /**
- * Set a default value for a property.
+ * Set a default value for a property, applied when a node is created without it.
+ *
+ * The value must match the property type (a string for `string()`, an integer
+ * for `int()`, a number for `float()`, a boolean for `bool()`, an array of
+ * numbers for `vector()`); `kite()` rejects a mismatch.
  *
  * @example
  * ```typescript
@@ -169,6 +174,35 @@ export interface NodeSpec<
  */
 const RESERVED_NODE_PROPS: ReadonlyArray<string> = ['id', 'key', 'type']
 
+/** The id a key function is probed with to read its prefix. */
+const KEY_PROBE = '__test__'
+
+/**
+ * The prefix of a key function: what it returns before the id. Throws unless it
+ * returns the prefix followed by the unchanged id, since only the prefix is kept.
+ */
+function keyFunctionPrefix<K extends string>(name: string, keyFn: (arg: K) => string): string {
+  const shape =
+    'A key function is called once, at definition, to read its prefix, and keys are stored as ' +
+    '`<prefix><id>`; it must return the prefix followed by the unchanged id for any id. Use a ' +
+    "template or parts key spec (e.g. { kind: 'template', template: 'user:{id}:v2' }) for other key shapes."
+  let probed: unknown
+  try {
+    probed = keyFn(KEY_PROBE as K)
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err)
+    throw new Error(`node('${name}'): the key function threw for the prefix probe id '${KEY_PROBE}' (${reason}). ${shape}`)
+  }
+  const at = typeof probed === 'string' ? probed.indexOf(KEY_PROBE) : -1
+  if (typeof probed !== 'string' || at === -1 || at + KEY_PROBE.length !== probed.length) {
+    throw new Error(
+      `node('${name}'): the key function returned ${JSON.stringify(probed)} for id '${KEY_PROBE}', ` +
+        `not a key prefix followed by the id. ${shape}`,
+    )
+  }
+  return probed.slice(0, at)
+}
+
 /** Configuration for node() */
 export interface NodeConfig<
   K extends string = string,
@@ -177,7 +211,11 @@ export interface NodeConfig<
   /**
    * Key generator function or key specification.
    *
-   * If a function is provided, it will be analyzed to extract the key prefix.
+   * A function is called once, at definition, with a placeholder id to read
+   * its prefix: keys are always stored as `<prefix><id>`. It must therefore
+   * return the prefix followed by the unchanged id, for any id; `node()`
+   * throws for a function that adds text after the id, transforms the id, or
+   * throws. Use a template or parts key spec for other key shapes.
    *
    * @example
    * ```typescript
@@ -204,7 +242,8 @@ export interface NodeConfig<
  * @param name - The node type name (must be unique)
  * @param config - Node configuration with key function and properties
  * @returns A NodeSpec that can be passed to kite()
- * @throws If a prop is named `id`, `key` or `type` (reserved for node identity)
+ * @throws If a prop is named `id`, `key` or `type` (reserved for node identity),
+ *   or if a key function does not return `<prefix>${id}` (see `NodeConfig.key`)
  *
  * @example
  * ```typescript
@@ -245,16 +284,7 @@ export function node<
   let keySpec: KeySpec | undefined
 
   if (typeof config.key === 'function') {
-    // Extract prefix from key function by calling it with a test value
-    const testKey = config.key('__test__' as K)
-    const testIdx = testKey.indexOf('__test__')
-    if (testIdx !== -1) {
-      const prefix = testKey.slice(0, testIdx)
-      keySpec = { kind: 'prefix', prefix }
-    } else {
-      // Couldn't extract prefix, use default
-      keySpec = { kind: 'prefix', prefix: `${name}:` }
-    }
+    keySpec = { kind: 'prefix', prefix: keyFunctionPrefix(name, config.key) }
   } else if (config.key) {
     keySpec = config.key
   }
@@ -285,6 +315,10 @@ export interface EdgeSpec<
  *
  * Creates an edge definition that can be used for all edge operations
  * (link, unlink, query). Edges are directional and can have properties.
+ *
+ * In `whereEdge` callbacks, `src`, `dst` and `etype` are always the edge's
+ * identity, so a prop with one of these names is not visible there (read it
+ * with `getEdgeProp`).
  *
  * @param name - The edge type name (must be unique)
  * @param props - Optional property definitions

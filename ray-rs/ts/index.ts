@@ -103,6 +103,7 @@ import type {
   JsPropValue,
   JsSyncMode,
   JsTraverseOptions,
+  JsTraversalDirection,
   JsPathResult,
   JsFullEdge,
   JsEdge,
@@ -178,6 +179,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
 }
 
+/** `value` if it is a positive safe integer; throws otherwise (NaN, 0, 1.5, ...). */
+function positiveInteger(fn: string, name: string, value: unknown): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) {
+    throw new RangeError(`${fn}: ${name} must be a positive integer, got ${String(value)}`)
+  }
+  return value
+}
+
 /**
  * Roll back only an owned transaction that is still active. Native commit
  * failures can consume the transaction before throwing; a second rollback in
@@ -217,7 +226,8 @@ function rollbackIfActive(
 // JS on the main thread shares that thread. While an async `transaction()` is
 // suspended at an `await`, unrelated code runs, and its writes would silently
 // join (and roll back with) the open transaction. Ownership is therefore
-// tracked per async context; see `Kite.transaction()` for the semantics.
+// tracked per async context; see `Kite.transaction()` for the semantics, which
+// `Database.transaction()` shares.
 
 /** An async `transaction()` that has not committed or rolled back yet. */
 interface OpenTransaction {
@@ -225,7 +235,7 @@ interface OpenTransaction {
   readonly settled: Promise<void>
 }
 
-/** The open async transaction of each Kite instance. */
+/** The open async transaction of each Kite or Database instance. */
 const openTransactions = new WeakMap<object, OpenTransaction>()
 /** Transactions owned by the current async context (inherited across awaits). */
 const ownedTransactions = new AsyncLocalStorage<ReadonlySet<OpenTransaction>>()
@@ -245,6 +255,77 @@ function assertWriteAllowed(db: object | undefined): void {
   const open = db && openTransactions.get(db)
   if (open && !ownedTransactions.getStore()?.has(open)) {
     throw transactionConflict()
+  }
+}
+
+/** The transaction primitives `runTransaction` drives (Kite and Database both have them). */
+interface TransactionHost {
+  begin(): number
+  commit(): void
+  rollback(): void
+  hasTransaction(): boolean
+}
+
+/**
+ * Run `fn` in a transaction on `db`, tracking async ownership; see
+ * `Kite.transaction()` for the semantics. `db.begin/commit/rollback` must run
+ * the write guard (`assertWriteAllowed`).
+ */
+function runTransaction<H extends TransactionHost, T>(
+  db: H,
+  fn: (ctx: H) => T | Promise<T>,
+): T | Promise<T> {
+  const open = openTransactions.get(db)
+  if (open) {
+    if (ownedTransactions.getStore()?.has(open)) {
+      return fn(db)
+    }
+    if (fn instanceof AsyncFunction) {
+      return open.settled.then(() => runTransaction(db, fn))
+    }
+    throw transactionConflict()
+  }
+  if (db.hasTransaction()) {
+    return fn(db)
+  }
+
+  let settle!: () => void
+  const tx: OpenTransaction = { settled: new Promise<void>((resolve) => (settle = resolve)) }
+  const owned = new Set(ownedTransactions.getStore())
+  owned.add(tx)
+
+  db.begin()
+  try {
+    const result = ownedTransactions.run(owned, () => fn(db))
+    if (result && typeof (result as Promise<T>).then === 'function') {
+      openTransactions.set(db, tx)
+      return Promise.resolve(result).then(
+        (value) => {
+          // Release ownership first: commit() is guarded against outside callers.
+          openTransactions.delete(db)
+          try {
+            db.commit()
+          } catch (err) {
+            rollbackIfActive(db, true)
+            throw err
+          } finally {
+            settle()
+          }
+          return value
+        },
+        (err) => {
+          openTransactions.delete(db)
+          rollbackIfActive(db, true)
+          settle()
+          throw err
+        },
+      )
+    }
+    db.commit()
+    return result
+  } catch (err) {
+    rollbackIfActive(db, true)
+    throw err
   }
 }
 
@@ -492,6 +573,15 @@ export class KiteUpsertEdgeBuilder extends chainablePropBuilder(NativeKiteUpsert
   }
 }
 
+/**
+ * Fluent traversal. Each call returns a new traversal; the original is unchanged.
+ *
+ * `whereEdge`/`whereNode` filter the step they follow (`out`, `in`, `both`,
+ * `traverse`), or the start nodes before the first step. Several filters on a
+ * step must all pass, and a node a filter rejects does not continue to later
+ * steps. After `traverse()`, filters select which of the reached nodes are kept;
+ * they do not prune the search. `take(n)` counts results after filtering.
+ */
 export class KiteTraversal extends NativeKiteTraversal {
   static wrap(traversal: NativeKiteTraversal, db?: Kite): KiteTraversal {
     Object.setPrototypeOf(traversal, KiteTraversal.prototype)
@@ -501,10 +591,21 @@ export class KiteTraversal extends NativeKiteTraversal {
     return traversal as KiteTraversal
   }
 
+  /**
+   * Keep the results of the previous step whose edge passes `func`, called with
+   * the edge props plus `src`, `dst` and `etype`. These three are always the
+   * edge's identity: an edge prop with one of these names is not visible here
+   * (read it with `getEdgeProp`).
+   */
   whereEdge(func: unknown): KiteTraversal {
     return KiteTraversal.wrap(super.whereEdge(func), (this as { __db?: Kite }).__db)
   }
 
+  /**
+   * Keep the results of the previous step (or the start nodes, before any
+   * step) whose node passes `func`, called with the node props (only the
+   * `select()`ed ones, if any) plus `id`, `key` and `type`.
+   */
   whereNode(func: unknown): KiteTraversal {
     return KiteTraversal.wrap(super.whereNode(func), (this as { __db?: Kite }).__db)
   }
@@ -592,6 +693,9 @@ export class KiteTraversal extends NativeKiteTraversal {
   }
 }
 
+/** A path search direction: 'out', 'in' or 'both' in any letter case, e.g. `TraversalDirection.In`. */
+type PathDirection = 'out' | 'in' | 'both' | JsTraversalDirection | (string & {})
+
 export class KitePath extends NativeKitePath {
   static wrap(path: NativeKitePath): KitePath {
     Object.setPrototypeOf(path, KitePath.prototype)
@@ -608,8 +712,19 @@ export class KitePath extends NativeKitePath {
     return this
   }
 
-  direction(direction: string): this {
+  /** Follow edges 'out' (default), 'in' or 'both', in any letter case. Throws on other values. */
+  direction(direction: PathDirection): this {
     super.direction(direction)
+    return this
+  }
+
+  /**
+   * Weigh each edge by its numeric edge prop `propName` in `dijkstra()` and
+   * `kShortest()`; an edge without the prop weighs 1. A non-numeric, negative
+   * or non-finite value makes the search throw. `bfs()` ignores weights.
+   */
+  weight(propName: string): this {
+    super.weight(propName)
     return this
   }
 
@@ -618,6 +733,7 @@ export class KitePath extends NativeKitePath {
     return this
   }
 
+  /** Shortest path by total weight (each edge weighs 1 unless `weight()` is set). */
   dijkstra(): JsPathResult {
     return super.find()
   }
@@ -637,7 +753,8 @@ export class KiteShortestPathBuilder {
   private target: number | null = null
   private edgeTypes: EdgeLike[] = []
   private maxDepthValue: number | null = null
-  private directionValue: string | null = null
+  private directionValue: PathDirection | null = null
+  private weightProp: string | null = null
   private useBidirectional = false
 
   constructor(db: Kite, source: number) {
@@ -660,8 +777,15 @@ export class KiteShortestPathBuilder {
     return this
   }
 
-  direction(direction: string): this {
+  /** See `KitePath.direction()`. */
+  direction(direction: PathDirection): this {
     this.directionValue = direction
+    return this
+  }
+
+  /** See `KitePath.weight()`. */
+  weight(propName: string): this {
+    this.weightProp = propName
     return this
   }
 
@@ -695,6 +819,9 @@ export class KiteShortestPathBuilder {
     }
     if (this.maxDepthValue !== null) {
       path.maxDepth(this.maxDepthValue)
+    }
+    if (this.weightProp !== null) {
+      path.weight(this.weightProp)
     }
     if (this.useBidirectional) {
       path.bidirectional()
@@ -780,58 +907,7 @@ export class Kite extends NativeKite {
    * The tracking lives in this wrapper; the raw native bindings do not have it.
    */
   transaction<T>(fn: (ctx: Kite) => T | Promise<T>): T | Promise<T> {
-    const open = openTransactions.get(this)
-    if (open) {
-      if (ownedTransactions.getStore()?.has(open)) {
-        return fn(this)
-      }
-      if (fn instanceof AsyncFunction) {
-        return open.settled.then(() => this.transaction(fn))
-      }
-      throw transactionConflict()
-    }
-    if (this.hasTransaction()) {
-      return fn(this)
-    }
-
-    let settle!: () => void
-    const tx: OpenTransaction = { settled: new Promise<void>((resolve) => (settle = resolve)) }
-    const owned = new Set(ownedTransactions.getStore())
-    owned.add(tx)
-
-    this.begin()
-    try {
-      const result = ownedTransactions.run(owned, () => fn(this))
-      if (result && typeof (result as Promise<T>).then === 'function') {
-        openTransactions.set(this, tx)
-        return Promise.resolve(result).then(
-          (value) => {
-            // Release ownership first: commit() is guarded against outside callers.
-            openTransactions.delete(this)
-            try {
-              this.commit()
-            } catch (err) {
-              rollbackIfActive(this, true)
-              throw err
-            } finally {
-              settle()
-            }
-            return value
-          },
-          (err) => {
-            openTransactions.delete(this)
-            rollbackIfActive(this, true)
-            settle()
-            throw err
-          },
-        )
-      }
-      this.commit()
-      return result
-    } catch (err) {
-      rollbackIfActive(this, true)
-      throw err
-    }
+    return runTransaction(this, fn)
   }
 
   begin(readOnly?: boolean | null): number {
@@ -926,24 +1002,34 @@ export class Kite extends NativeKite {
     }
   }
 
+  /**
+   * Run `operations` in consecutive `batch()` transactions of up to `maxBatch`
+   * (default 3000) operations. When a batch fails because the WAL is full, it
+   * checkpoints (with `autoCheckpointOnWalFull`, default true) and retries,
+   * then halves the batch size down to `minBatch` (default 1), checkpointing
+   * again at each new size. Not atomic as a whole: earlier batches stay
+   * committed when a later one fails.
+   *
+   * @throws If `maxBatch` or `minBatch` is not a positive integer.
+   */
   batchAdaptive(
     operations: Array<any>,
     options?: { maxBatch?: number; minBatch?: number; autoCheckpointOnWalFull?: boolean } | null,
   ): any[] {
+    const maxBatch = positiveInteger('batchAdaptive', 'maxBatch', options?.maxBatch ?? 3000)
+    const minBatch = Math.min(
+      positiveInteger('batchAdaptive', 'minBatch', options?.minBatch ?? 1),
+      maxBatch,
+    )
+    const autoCheckpointOnWalFull = options?.autoCheckpointOnWalFull ?? true
     if (operations.length === 0) {
       return []
     }
 
-    let maxBatch = options?.maxBatch ?? 3000
-    let minBatch = options?.minBatch ?? 1
-    const autoCheckpointOnWalFull = options?.autoCheckpointOnWalFull ?? true
-    if (maxBatch < 1) maxBatch = 1
-    if (minBatch < 1) minBatch = 1
-    if (minBatch > maxBatch) minBatch = maxBatch
-
     const results: any[] = []
     let cursor = 0
     let batchSize = Math.min(maxBatch, operations.length)
+    // Whether the current batch size has already been retried after a checkpoint.
     let checkpointed = false
 
     while (cursor < operations.length) {
@@ -968,6 +1054,9 @@ export class Kite extends NativeKite {
           }
           if (batchSize > minBatch) {
             batchSize = Math.max(minBatch, Math.floor(batchSize / 2))
+            // The failed attempt left its records in the WAL: the smaller size
+            // gets its own checkpoint before it can fit.
+            checkpointed = false
             continue
           }
         }
@@ -1270,6 +1359,22 @@ export class Database extends NativeDatabase {
     return toDatabase(NativeDatabase.open(path, options))
   }
 
+  /**
+   * Run `fn` in a transaction: commit when it returns (or its promise resolves),
+   * roll back when it throws (or its promise rejects). A call made while this
+   * context already has a transaction open joins that transaction.
+   *
+   * Async transactions get the same per-async-context ownership as
+   * `Kite.transaction()`: while one waits at an `await`, an async
+   * `transaction()` from outside waits for it to finish, and a write, `begin`,
+   * `commit`, `rollback` or synchronous `transaction()` from outside throws
+   * instead of joining it. Reads are not isolated. Only this wrapper tracks
+   * ownership; the raw native `Database` does not.
+   */
+  transaction<T>(fn: (db: Database) => T | Promise<T>): T | Promise<T> {
+    return runTransaction(this, fn)
+  }
+
   /** Get node ID by key */
   getNodeByKey(key: string): number | null {
     return super.get_node_by_key(key)
@@ -1337,7 +1442,7 @@ export class Database extends NativeDatabase {
 
   /** Get or create a label ID */
   getOrCreateLabel(name: string): number {
-    return super.get_or_create_label(name)
+    return this.get_or_create_label(name)
   }
 
   /** Get label ID by name */
@@ -1352,7 +1457,7 @@ export class Database extends NativeDatabase {
 
   /** Get or create an edge type ID */
   getOrCreateEtype(name: string): number {
-    return super.get_or_create_etype(name)
+    return this.get_or_create_etype(name)
   }
 
   /** Get edge type ID by name */
@@ -1367,7 +1472,7 @@ export class Database extends NativeDatabase {
 
   /** Get or create a property key ID */
   getOrCreatePropkey(name: string): number {
-    return super.get_or_create_propkey(name)
+    return this.get_or_create_propkey(name)
   }
 
   /** Get property key ID by name */
@@ -1386,6 +1491,85 @@ export class Database extends NativeDatabase {
   }
 }
 
+/**
+ * Database methods that write (or begin, commit or roll back): they run the
+ * async-transaction write guard (see `Database.transaction()`). A new native
+ * write method must be added here.
+ */
+const DATABASE_WRITE_METHODS = [
+  'begin',
+  'beginBulk',
+  'commit',
+  'commitWithToken',
+  'rollback',
+  'createNode',
+  'createNodesBatch',
+  'upsertNode',
+  'upsertNodeById',
+  'deleteNode',
+  'addEdge',
+  'addEdgesBatch',
+  'addEdgesWithPropsBatch',
+  'addEdgeByName',
+  'upsertEdge',
+  'deleteEdge',
+  'setNodeProp',
+  'setNodePropByName',
+  'deleteNodeProp',
+  'setEdgeProp',
+  'setEdgePropByName',
+  'deleteEdgeProp',
+  'setNodeVector',
+  'deleteNodeVector',
+  'addNodeLabel',
+  'addNodeLabelByName',
+  'removeNodeLabel',
+  'importFromObject',
+  'importFromJson',
+] as const satisfies ReadonlyArray<keyof NativeDatabase>
+
+/**
+ * Methods that write only when the name is new (defining it joins the open
+ * transaction), each with the lookup that tells.
+ */
+const DATABASE_DEFINE_METHODS = {
+  defineLabel: 'get_label_id',
+  get_or_create_label: 'get_label_id',
+  get_or_create_etype: 'get_etype_id',
+  get_or_create_propkey: 'get_propkey_id',
+} as const satisfies Partial<Record<keyof NativeDatabase, keyof NativeDatabase>>
+
+function defineDatabaseMethod(name: string, method: (this: Database, ...args: any[]) => unknown): void {
+  Object.defineProperty(Database.prototype, name, { value: method, writable: true, configurable: true })
+}
+
+function nativeDatabaseMethod(name: string): (...args: any[]) => any {
+  const method = (NativeDatabase.prototype as unknown as Record<string, unknown>)[name]
+  if (typeof method !== 'function') {
+    throw new Error(`kitedb: the native Database has no method '${name}'`)
+  }
+  return method as (...args: any[]) => any
+}
+
+for (const name of DATABASE_WRITE_METHODS) {
+  const write = nativeDatabaseMethod(name)
+  defineDatabaseMethod(name, function (...args) {
+    assertWriteAllowed(this)
+    return write.apply(this, args)
+  })
+}
+
+for (const [name, lookupName] of Object.entries(DATABASE_DEFINE_METHODS)) {
+  const define = nativeDatabaseMethod(name)
+  const lookup = nativeDatabaseMethod(lookupName)
+  defineDatabaseMethod(name, function (label: string) {
+    if ((lookup.call(this, label) ?? null) === null) {
+      assertWriteAllowed(this)
+    }
+    return define.call(this, label)
+  })
+}
+
 /** Open a database file (standalone function) */
 export function openDatabase(path: string, options?: OpenOptions | null): Database {
   return toDatabase(nativeOpenDatabase(path, options))
@@ -1396,7 +1580,7 @@ export function openDatabase(path: string, options?: OpenOptions | null): Databa
 // =============================================================================
 
 export interface BulkWriteOptions {
-  /** Max operations per transaction (default: 1000) */
+  /** Max operations per transaction, a positive integer (default: 1000) */
   chunkSize?: number
   /** Call checkpoint when recommended between chunks (default: false) */
   checkpoint?: boolean
@@ -1409,17 +1593,13 @@ export function bulkWrite<T, D extends NativeDatabase = Database>(
   operations: Array<(db: D) => T>,
   options?: BulkWriteOptions,
 ): Array<T> {
+  const chunkSize = positiveInteger('bulkWrite', 'chunkSize', options?.chunkSize ?? 1000)
   if (operations.length === 0) {
     return []
   }
 
   if (db.hasTransaction()) {
     throw new Error('bulkWrite cannot run inside an active transaction')
-  }
-
-  const chunkSize = options?.chunkSize ?? 1000
-  if (chunkSize <= 0) {
-    throw new Error('chunkSize must be greater than 0')
   }
 
   const checkpointThreshold = options?.checkpointThreshold ?? 0.8
@@ -1659,29 +1839,92 @@ export interface KiteOptions {
   replicationRetentionMinEntries?: number
   /** Minimum retained segment age in milliseconds (primary role only) */
   replicationRetentionMinMs?: number
+  /**
+   * Enforce node schemas on writes (default: false). Every prop declared
+   * without `optional()` is required: creating a node fails if one is missing
+   * or null. Every node write fails if a declared prop's value does not match
+   * its type (int<->float only when lossless). Props outside the schema are
+   * kept, and `withDefault()` values are applied on create in both modes.
+   */
+  strictSchema?: boolean
 }
 
 // =============================================================================
 // Type Conversion Helpers
 // =============================================================================
 
-function propSpecToNative(spec: PropSpec): JsPropSpec {
-  return {
-    type: spec.type,
-    optional: spec.optional,
-    default: spec.default as JsPropValue | undefined,
+type NativePropType = 'Null' | 'Bool' | 'Int' | 'Float' | 'String' | 'Vector'
+
+/** A native prop value; the cast bridges a string to the ambient const enum `PropType`. */
+function nativeValue(propType: NativePropType, value: Omit<JsPropValue, 'propType'> = {}): JsPropValue {
+  return { propType: propType as unknown as JsPropValue['propType'], ...value }
+}
+
+function isNumberArray(value: unknown): value is number[] {
+  return Array.isArray(value) && value.every((item) => typeof item === 'number')
+}
+
+/** A `withDefault()` value as the native prop value of its declared type. */
+function defaultToNative(owner: string, propName: string, spec: PropSpec): JsPropValue | undefined {
+  const value = spec.default
+  if (value === undefined) {
+    return undefined
+  }
+  const invalid = (expected: string) => {
+    const shown = typeof value === 'string' ? JSON.stringify(value) : String(value)
+    return new TypeError(`${owner}: the default of ${spec.type} prop '${propName}' must be ${expected}, got ${shown}`)
+  }
+  switch (spec.type) {
+    case 'string':
+      if (typeof value !== 'string') throw invalid('a string')
+      return nativeValue('String', { stringValue: value })
+    case 'int':
+      if (typeof value !== 'number' || !Number.isSafeInteger(value)) throw invalid('a safe integer')
+      return nativeValue('Int', { intValue: value })
+    case 'float':
+      if (typeof value !== 'number') throw invalid('a number')
+      return nativeValue('Float', { floatValue: value })
+    case 'bool':
+      if (typeof value !== 'boolean') throw invalid('a boolean')
+      return nativeValue('Bool', { boolValue: value })
+    case 'vector':
+      if (!isNumberArray(value)) throw invalid('an array of numbers')
+      return nativeValue('Vector', { vectorValue: value })
+    case 'any':
+      // As when written: JS numbers are stored as floats.
+      if (value === null) return nativeValue('Null')
+      if (typeof value === 'string') return nativeValue('String', { stringValue: value })
+      if (typeof value === 'number') return nativeValue('Float', { floatValue: value })
+      if (typeof value === 'boolean') return nativeValue('Bool', { boolValue: value })
+      if (isNumberArray(value)) return nativeValue('Vector', { vectorValue: value })
+      throw invalid('a string, number, boolean, null or array of numbers')
   }
 }
 
-function nodeSpecToNative(spec: NodeSpec): JsNodeSpec {
-  let props: Record<string, JsPropSpec> | undefined
-
-  if (spec.props) {
-    props = {}
-    for (const [k, v] of Object.entries(spec.props)) {
-      props[k] = propSpecToNative(v)
-    }
+function propSpecToNative(owner: string, propName: string, spec: PropSpec): JsPropSpec {
+  return {
+    type: spec.type,
+    optional: spec.optional,
+    default: defaultToNative(owner, propName, spec),
   }
+}
+
+function propsToNative(
+  owner: string,
+  specs: Record<string, PropSpec> | undefined,
+): Record<string, JsPropSpec> | undefined {
+  if (!specs) {
+    return undefined
+  }
+  const props: Record<string, JsPropSpec> = {}
+  for (const [name, spec] of Object.entries(specs)) {
+    props[name] = propSpecToNative(owner, name, spec)
+  }
+  return props
+}
+
+function nodeSpecToNative(spec: NodeSpec): JsNodeSpec {
+  const props = propsToNative(`node '${spec.name}'`, spec.props)
 
   return {
     name: spec.name,
@@ -1691,14 +1934,7 @@ function nodeSpecToNative(spec: NodeSpec): JsNodeSpec {
 }
 
 function edgeSpecToNative(spec: EdgeSpec): JsEdgeSpec {
-  let props: Record<string, JsPropSpec> | undefined
-
-  if (spec.props) {
-    props = {}
-    for (const [k, v] of Object.entries(spec.props)) {
-      props[k] = propSpecToNative(v)
-    }
-  }
+  const props = propsToNative(`edge '${spec.name}'`, spec.props)
 
   return {
     name: spec.name,
@@ -1732,6 +1968,7 @@ function optionsToNative(options: KiteOptions): JsKiteOptions {
     groupCommitWindowMs: options.groupCommitWindowMs,
     walSizeMb: options.walSizeMb,
     checkpointThreshold: options.checkpointThreshold,
+    strictSchema: options.strictSchema,
   }
 
   const mutable = nativeOptions as unknown as Record<string, unknown>
