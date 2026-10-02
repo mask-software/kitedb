@@ -26,6 +26,9 @@ def format_latency(ns: int) -> str:
 
 
 def print_latency_table(label: str, samples_ns: List[int]) -> None:
+    if not samples_ns:
+        print(f"{label:<40} skipped (no samples)")
+        return
     samples_ns.sort()
     p50 = percentile(samples_ns, 0.50)
     p95 = percentile(samples_ns, 0.95)
@@ -139,7 +142,8 @@ def build_graph(
 def benchmark_writes(conn: sqlite3.Connection, iterations: int) -> None:
     print("\n--- Batch Writes (100 nodes) ---")
     batch_size = 100
-    batches = min(iterations // batch_size, 50)
+    # Rounded up: any --iterations runs at least one batch.
+    batches = min(-(-iterations // batch_size), 50)
     samples_ns: List[int] = []
     cur = conn.cursor()
 

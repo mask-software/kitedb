@@ -7,7 +7,7 @@
 //!   --nodes N                 Number of nodes (default: 10000)
 //!   --edges M                 Number of edges (default: 50000)
 //!   --iterations I            Iterations for latency benchmarks (default: 10000)
-//!   --node-batches N          Batches in the 100-node write benchmark (default: iterations/100, at most 50)
+//!   --node-batches N          Batches in the 100-node write benchmark (default: iterations/100 rounded up, at most 50)
 //!   --wal-size BYTES          WAL size in bytes (default: 67108864)
 //!   --sync-mode MODE          Sync mode: full|normal|off (default: normal)
 //!   --group-commit-enabled    Enable group commit (default: false)
@@ -252,6 +252,9 @@ fn print_latency_table(name: &str, stats: LatencyStats) {
 }
 
 fn latency_row(name: &str, stats: &LatencyStats) -> String {
+  if stats.count == 0 {
+    return format!("{name:<45} skipped (no samples)");
+  }
   let ops_per_sec = if stats.sum > 0 {
     stats.count as f64 / (stats.sum as f64 / 1_000_000_000.0)
   } else {
@@ -268,10 +271,10 @@ fn latency_row(name: &str, stats: &LatencyStats) -> String {
   )
 }
 
-/// Batches of `batch_size` operations for an `--iterations` budget, at most
-/// `max_batches`.
+/// Batches of `batch_size` operations for an `--iterations` budget: rounded
+/// up, so any budget runs at least one batch, and at most `max_batches`.
 fn batch_count(iterations: usize, batch_size: usize, max_batches: usize) -> usize {
-  (iterations / batch_size).min(max_batches)
+  iterations.div_ceil(batch_size).min(max_batches)
 }
 
 fn build_random_vector(rng: &mut StdRng, dimensions: usize) -> Vec<f32> {

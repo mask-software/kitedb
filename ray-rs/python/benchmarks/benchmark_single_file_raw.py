@@ -211,6 +211,9 @@ def format_number(n: int) -> str:
 
 
 def print_latency_table(name: str, stats: LatencyStats):
+  if stats.count == 0:
+    logger.log(f"{name:<45} skipped (no samples)")
+    return
   ops_per_sec = stats.count / (stats.sum_ns / 1_000_000_000) if stats.sum_ns > 0 else 0
   logger.log(
     f"{name:<45} p50={format_latency(stats.p50):>10} "
@@ -401,7 +404,8 @@ def create_bench_nodes(db: Database, label: str, count: int) -> List[int]:
 def benchmark_writes(db: Database, graph: GraphData, iterations: int):
   logger.log("\n--- Batch Writes (100 nodes) ---")
   batch_size = 100
-  batches = min(iterations // batch_size, 50)
+  # Rounded up: any --iterations runs at least one batch.
+  batches = min(-(-iterations // batch_size), 50)
   tracker = LatencyTracker()
   for b in range(batches):
     start = time.perf_counter_ns()
@@ -416,7 +420,7 @@ def benchmark_writes(db: Database, graph: GraphData, iterations: int):
     return
 
   edge_batch_size = 100
-  edge_batches = min(iterations // edge_batch_size, 50)
+  edge_batches = min(-(-iterations // edge_batch_size), 50)
   if edge_batches == 0:
     return
 
