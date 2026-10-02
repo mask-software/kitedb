@@ -4221,6 +4221,7 @@ fn exported_database_to_js(env: &Env, data: ray_export::ExportedDatabase) -> Res
     let mut js_node = Object::new(env)?;
     js_node.set_named_property("id", json_u64(node.id))?;
     js_node.set_named_property("key", node.key)?;
+    js_node.set_named_property("labels", node.labels)?;
     js_node.set_named_property("props", exported_props_to_js(env, node.props)?)?;
     nodes.set(index as u32, js_node)?;
   }
