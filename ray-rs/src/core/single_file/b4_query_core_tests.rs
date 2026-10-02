@@ -10,7 +10,7 @@
 //! changes, for an MVCC reader that sees version history, with deletes and recreates, and
 //! after a checkpoint and a reopen.
 use crate::api::kite::{EdgeDef, Kite, KiteOptions, NodeDef};
-use crate::api::traversal::{TraversalDirection, TraverseOptions};
+use crate::api::traversal::{DbNeighbors, NeighborSource, TraversalDirection, TraverseOptions};
 use crate::core::single_file::read::{EDGES_EXAMINED, NODES_EXAMINED, NODE_LOOKUPS};
 use crate::core::single_file::{
   close_single_file, open_single_file, SingleFileDB, SingleFileOpenOptions, SyncMode,
@@ -19,7 +19,7 @@ use crate::streaming::{edges_page_single, nodes_page_single, PaginationOptions};
 use crate::types::{ETypeId, Edge, LabelId, NodeId};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::mpsc;
 use tempfile::tempdir;
@@ -307,7 +307,8 @@ fn query_core_f3_take_one_from_a_hub_examines_few_edges() {
     })
     .expect("delta");
 
-  let cases: Vec<(&str, Box<dyn Fn() -> usize>)> = vec![
+  type Case<'k> = (&'static str, Box<dyn Fn() -> usize + 'k>);
+  let cases: Vec<Case<'_>> = vec![
     (
       "from(hub).out(None).take(1)",
       Box::new(|| {
@@ -403,10 +404,13 @@ const KEY_PREFIXES: [&str; 5] = ["user:", "user:admin:", "post:", "tag:", "zz:"]
 struct Ids {
   labels: Vec<LabelId>,
   etypes: Vec<ETypeId>,
+  /// Few nodes with many edges each, so neighbor reads span several slices
+  dense: bool,
 }
 
-fn ids(kite: &Kite) -> Ids {
+fn ids(kite: &Kite, dense: bool) -> Ids {
   Ids {
+    dense,
     labels: NODE_TYPES
       .iter()
       .map(|name| {
@@ -436,6 +440,22 @@ fn random_writes(db: &SingleFileDB, ids: &Ids, rng: &mut StdRng, seq: &mut usize
     let nodes = db.list_nodes();
     let pick = |rng: &mut StdRng| nodes[rng.gen_range(0..nodes.len())];
     let roll = rng.gen_range(0..100);
+    // Dense graphs create nodes only to stay at about 12, delete few, and add
+    // half of their edges to or from the first node (a hub).
+    let roll = match ids.dense {
+      false => roll,
+      true if nodes.len() < 12 => 0,
+      true if roll < 1 => 22,
+      true if roll < 3 => 28 + roll,
+      true => 34 + roll * 66 / 100,
+    };
+    let hub = |rng: &mut StdRng| {
+      if ids.dense && rng.gen_bool(0.5) {
+        nodes[0]
+      } else {
+        pick(rng)
+      }
+    };
     if nodes.len() < 4 || roll < 22 {
       *seq += 1;
       let key = random_key(rng, *seq);
@@ -454,8 +474,12 @@ fn random_writes(db: &SingleFileDB, ids: &Ids, rng: &mut StdRng, seq: &mut usize
         add_random_labels(db, ids, rng, id);
       }
     } else if roll < 80 {
-      let src = pick(rng);
-      let dst = if rng.gen_bool(0.1) { src } else { pick(rng) };
+      let (src, dst) = if rng.gen_bool(0.5) {
+        (hub(rng), pick(rng))
+      } else {
+        (pick(rng), hub(rng))
+      };
+      let dst = if rng.gen_bool(0.1) { src } else { dst };
       let etype = ids.etypes[rng.gen_range(0..ids.etypes.len())];
       db.add_edge(src, etype, dst).expect("add edge");
     } else if roll < 88 {
@@ -670,10 +694,18 @@ fn check_traversals(kite: &Kite, ids: &Ids, rng: &mut StdRng, at: &str) {
   for &node_id in &nodes {
     for direction in directions {
       for etype in [None, Some(ids.etypes[0]), Some(ids.etypes[1])] {
+        let expected = expected_neighbors(db, node_id, direction, etype);
         assert_eq!(
           kite.neighbors(node_id, direction, etype),
-          expected_neighbors(db, node_id, direction, etype),
+          expected,
           "{at}: neighbors({node_id}, {direction:?}, {etype:?})"
+        );
+        let lazy: Vec<_> = DbNeighbors::new(db)
+          .edges(node_id, direction, etype)
+          .collect();
+        assert_eq!(
+          lazy, expected,
+          "{at}: lazy neighbors({node_id}, {direction:?}, {etype:?})"
         );
       }
     }
@@ -714,19 +746,153 @@ fn check_traversals(kite: &Kite, ids: &Ids, rng: &mut StdRng, at: &str) {
   }
 }
 
+/// The seek, label, key-prefix and count reads against the full listings.
+fn check_listings(db: &SingleFileDB, ids: &Ids, rng: &mut StdRng, at: &str) {
+  let nodes = db.list_nodes();
+  let edges = sorted_edges(db);
+  let max_id = nodes.last().copied().unwrap_or(0);
+
+  // nodes_after / edges_after
+  for _ in 0..16 {
+    let after = rng.gen_bool(0.2).then(|| rng.gen_range(0..=max_id + 2));
+    let limit = rng.gen_range(0..8);
+    let expected: Vec<_> = nodes
+      .iter()
+      .copied()
+      .filter(|&id| after.is_none_or(|after| id > after))
+      .take(limit)
+      .collect();
+    assert_eq!(
+      db.nodes_after(after, limit),
+      expected,
+      "{at}: nodes_after({after:?}, {limit})"
+    );
+
+    let after = rng
+      .gen_bool(0.8)
+      .then(|| match edges.get(rng.gen_range(0..edges.len().max(1))) {
+        Some(&(src, etype, dst)) if rng.gen_bool(0.6) => (src, etype, dst),
+        _ => (
+          rng.gen_range(0..=max_id + 2),
+          rng.gen_range(0..4),
+          rng.gen_range(0..=max_id + 2),
+        ),
+      });
+    let expected: Vec<_> = edges
+      .iter()
+      .copied()
+      .filter(|&edge| after.is_none_or(|after| edge > after))
+      .take(limit)
+      .collect();
+    let got: Vec<_> = db
+      .edges_after(after, limit)
+      .into_iter()
+      .map(|edge| (edge.src, edge.etype, edge.dst))
+      .collect();
+    assert_eq!(got, expected, "{at}: edges_after({after:?}, {limit})");
+  }
+  assert_eq!(db.count_edges(), edges.len(), "{at}: count_edges");
+
+  // out_edges_after / in_edges_after, from every node (and a missing one)
+  for node_id in nodes.iter().copied().chain([max_id + 1]) {
+    let out = db.out_edges(node_id);
+    let incoming = db.in_edges(node_id);
+    for (all, slice) in [
+      (
+        &out,
+        &(|e, a, l| db.out_edges_after(node_id, e, a, l)) as &dyn Fn(_, _, _) -> _,
+      ),
+      (&incoming, &|e, a, l| db.in_edges_after(node_id, e, a, l)),
+    ] {
+      for _ in 0..4 {
+        let etype = [None, Some(ids.etypes[0]), Some(ids.etypes[1]), Some(99)][rng.gen_range(0..4)];
+        let after = match rng.gen_range(0..3) {
+          0 => None,
+          1 if !all.is_empty() => Some(all[rng.gen_range(0..all.len())]),
+          _ => Some((rng.gen_range(0..4), rng.gen_range(0..=max_id + 2))),
+        };
+        let limit = [0, 1, 2, 5, usize::MAX][rng.gen_range(0..5)];
+        let expected: Vec<_> = all
+          .iter()
+          .copied()
+          .filter(|&(e, _)| etype.is_none_or(|t| t == e))
+          .filter(|&key| after.is_none_or(|after| key > after))
+          .take(limit)
+          .collect();
+        assert_eq!(
+          slice(etype, after, limit),
+          expected,
+          "{at}: edges of {node_id} ({etype:?}, after {after:?}, {limit})"
+        );
+      }
+    }
+  }
+
+  // nodes_with_label / count_nodes_with_label
+  for &label in ids.labels.iter().chain(&[9999]) {
+    let expected: Vec<_> = nodes
+      .iter()
+      .copied()
+      .filter(|&id| db.node_labels(id).contains(&label))
+      .collect();
+    assert_eq!(
+      db.nodes_with_label(label),
+      expected,
+      "{at}: nodes_with_label({label})"
+    );
+    assert_eq!(
+      db.count_nodes_with_label(label),
+      expected.len(),
+      "{at}: count_nodes_with_label({label})"
+    );
+    for &id in &expected {
+      assert!(
+        db.node_has_label(id, label),
+        "{at}: node_has_label({id}, {label})"
+      );
+    }
+  }
+
+  // nodes_with_key_prefix
+  for prefix in KEY_PREFIXES
+    .iter()
+    .copied()
+    .chain(["", "user:a", "post:1", "nope"])
+  {
+    let expected: Vec<_> = nodes
+      .iter()
+      .filter_map(|&id| {
+        let key = db.node_key(id)?;
+        key.starts_with(prefix).then_some((id, key))
+      })
+      .collect();
+    assert_eq!(
+      db.nodes_with_key_prefix(prefix),
+      expected,
+      "{at}: nodes_with_key_prefix({prefix:?})"
+    );
+  }
+}
+
 fn check_all(kite: &Kite, ids: &Ids, rng: &mut StdRng, at: &str) {
   check_pages(kite.raw(), rng, at);
+  check_listings(kite.raw(), ids, rng, at);
   check_types(kite, at);
   check_traversals(kite, ids, rng, at);
 }
 
 /// Run the checks in every state the lane cares about, for one seed and MVCC mode.
-fn run_random_states(path: &Path, mvcc: bool, seed: u64) {
+fn run_random_states(path: &Path, mvcc: bool, dense: bool, seed: u64) {
   let mut rng = StdRng::seed_from_u64(seed);
   let mut seq = 0;
   let kite = Kite::open(path, random_kite_options(mvcc)).expect("open");
-  let ids = ids(&kite);
-  let mode = if mvcc { "mvcc" } else { "no mvcc" };
+  let ids = ids(&kite, dense);
+  let mode = match (mvcc, dense) {
+    (false, false) => "no mvcc",
+    (true, false) => "mvcc",
+    (false, true) => "no mvcc dense",
+    (true, true) => "mvcc dense",
+  };
 
   // Committed, partly in the snapshot and partly in the delta.
   for _ in 0..4 {
@@ -803,19 +969,11 @@ fn run_random_states(path: &Path, mvcc: bool, seed: u64) {
 #[test]
 fn query_core_reads_match_full_listings_randomized() {
   for mvcc in [false, true] {
-    for seed in 0..6u64 {
-      let dir = tempdir().expect("temp dir");
-      run_random_states(&dir.path().join("db.kitedb"), mvcc, seed);
+    for dense in [false, true] {
+      for seed in 0..6u64 {
+        let dir = tempdir().expect("temp dir");
+        run_random_states(&dir.path().join("db.kitedb"), mvcc, dense, seed);
+      }
     }
   }
-}
-
-/// The node sets the label and key-prefix listings are built on stay what `node_labels`
-/// and `node_key` say, for ids in any state (used by later checks).
-#[allow(dead_code)]
-fn labeled(db: &SingleFileDB, label: LabelId) -> BTreeSet<NodeId> {
-  db.list_nodes()
-    .into_iter()
-    .filter(|&node_id| db.node_labels(node_id).contains(&label))
-    .collect()
 }

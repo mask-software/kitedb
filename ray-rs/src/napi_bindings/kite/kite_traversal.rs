@@ -23,7 +23,9 @@ use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
 use crate::api::kite::{Kite as RustKite, KiteTraversalProps};
-use crate::api::traversal::{TraversalBuilder, TraversalDirection, TraversalStep, TraverseOptions};
+use crate::api::traversal::{
+  NoProps, TraversalBuilder, TraversalDirection, TraversalStep, TraverseOptions,
+};
 use crate::types::{ETypeId, Edge, NodeId};
 
 use super::helpers::{
@@ -193,7 +195,7 @@ impl KiteTraversal {
       return self.with_ray(|ray| {
         Ok(
           builder
-            .execute(|node_id, dir, etype| ray.neighbors(node_id, dir, etype))
+            .execute_source(ray.neighbor_source(), NoProps)
             .map(|result| Hit {
               node_id: result.node_id,
               edge: result.edge.map(|edge| Edge {
@@ -382,9 +384,7 @@ impl KiteTraversal {
       return Ok(self.run(&env)?.len() as i64);
     }
     let builder = self.core_builder(steps);
-    self.with_ray(|ray| {
-      Ok(builder.count(|node_id, dir, etype| ray.neighbors(node_id, dir, etype)) as i64)
-    })
+    self.with_ray(|ray| Ok(builder.count_source(ray.neighbor_source(), NoProps) as i64))
   }
 }
 

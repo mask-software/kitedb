@@ -2591,7 +2591,8 @@ impl Database {
   /// Get a page of node IDs
   ///
   /// Pages follow node ID order, and a cursor resumes after the ID it names
-  /// even if that node has since been deleted.
+  /// even if that node has since been deleted. A page seeks to its cursor, so
+  /// it costs what it returns; `total` is the node count when it is read.
   #[napi(js_name = "get_nodes_page")]
   pub fn nodes_page(&self, options: Option<PaginationOptions>) -> Result<NodePage> {
     let options = options.unwrap_or_default().into_rust()?;
@@ -2600,20 +2601,23 @@ impl Database {
       .as_deref()
       .map(parse_node_cursor)
       .transpose()?;
-    let nodes = self.db()?.list_nodes();
-    let page = page_after(&nodes, after, page_limit(options.limit));
+    let db = self.db()?;
+    let limit = page_limit(options.limit);
+    let (items, next) = page_of(db.nodes_after(after, limit.saturating_add(1)), limit);
     Ok(NodePage {
-      items: page.items.iter().map(|&id| id as i64).collect(),
-      next_cursor: page.next.map(|id| format!("n:{id}")),
-      has_more: page.next.is_some(),
-      total: Some(nodes.len() as i64),
+      items: items.iter().map(|&id| id as i64).collect(),
+      next_cursor: next.map(|id| format!("n:{id}")),
+      has_more: next.is_some(),
+      total: Some(db.count_nodes() as i64),
     })
   }
 
   /// Get a page of edges
   ///
   /// Pages follow (src, etype, dst) order, and a cursor resumes after the
-  /// edge it names even if that edge has since been deleted.
+  /// edge it names even if that edge has since been deleted. A page seeks to
+  /// its cursor, so it costs what it returns; `total` is the edge count when
+  /// it is read.
   #[napi(js_name = "get_edges_page")]
   pub fn edges_page(&self, options: Option<PaginationOptions>) -> Result<EdgePage> {
     let options = options.unwrap_or_default().into_rust()?;
@@ -2622,30 +2626,21 @@ impl Database {
       .as_deref()
       .map(parse_edge_cursor)
       .transpose()?;
-    let mut edges: Vec<(NodeId, ETypeId, NodeId)> = self
-      .db()?
-      .list_edges(None)
-      .into_iter()
-      .map(|edge| (edge.src, edge.etype, edge.dst))
-      .collect();
-    edges.sort_unstable();
-    let page = page_after(&edges, after, page_limit(options.limit));
+    let db = self.db()?;
+    let limit = page_limit(options.limit);
+    let (items, next) = page_of(db.edges_after(after, limit.saturating_add(1)), limit);
     Ok(EdgePage {
-      items: page
-        .items
+      items: items
         .iter()
-        .map(|&(src, etype, dst)| JsFullEdge {
-          src: src as f64,
-          etype,
-          dst: dst as f64,
+        .map(|edge| JsFullEdge {
+          src: edge.src as f64,
+          etype: edge.etype,
+          dst: edge.dst as f64,
         })
         .collect(),
-      next_cursor: page
-        .next
-        .map(|(src, etype, dst)| format!("e:{src}:{etype}:{dst}")),
-      has_more: page.next.is_some(),
-      // Counted from the same listing as the page, not by a second scan.
-      total: Some(edges.len() as i64),
+      next_cursor: next.map(|edge| format!("e:{}:{}:{}", edge.src, edge.etype, edge.dst)),
+      has_more: next.is_some(),
+      total: Some(db.count_edges() as i64),
     })
   }
 
@@ -4041,13 +4036,6 @@ fn prop_value_to_weight(value: Option<PropValue>) -> std::result::Result<f64, St
 // Pagination
 // ============================================================================
 
-/// One page of a sorted listing.
-struct PageSlice<'a, T> {
-  items: &'a [T],
-  /// The last item, when more items follow it.
-  next: Option<T>,
-}
-
 /// Page size: 0 keeps the default of 100.
 fn page_limit(limit: usize) -> usize {
   if limit == 0 {
@@ -4057,16 +4045,13 @@ fn page_limit(limit: usize) -> usize {
   }
 }
 
-/// The `limit` items of `sorted` that come after `after`.
-///
-/// Seeks the first item greater than the cursor instead of the cursor item
-/// itself, so a cursor whose item was deleted still resumes in place.
-fn page_after<T: Ord + Copy>(sorted: &[T], after: Option<T>, limit: usize) -> PageSlice<'_, T> {
-  let start = after.map_or(0, |after| sorted.partition_point(|item| *item <= after));
-  let rest = &sorted[start..];
-  let items = &rest[..rest.len().min(limit)];
-  let next = (rest.len() > limit).then(|| items[items.len() - 1]);
-  PageSlice { items, next }
+/// The first `limit` of `items` (up to `limit + 1` read after a cursor), and
+/// the last of them when more follow.
+fn page_of<T: Copy>(mut items: Vec<T>, limit: usize) -> (Vec<T>, Option<T>) {
+  let has_more = items.len() > limit;
+  items.truncate(limit);
+  let next = has_more.then(|| items[items.len() - 1]);
+  (items, next)
 }
 
 fn invalid_cursor(cursor: &str) -> Error {

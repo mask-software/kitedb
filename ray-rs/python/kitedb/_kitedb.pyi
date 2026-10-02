@@ -296,8 +296,10 @@ class NodeBatchIterator(Iterator[List[Any]]):
     """Lazy iterator over node batches, from Database.stream_nodes*.
 
     Yields lists of node ids (stream_nodes) or NodeWithProps
-    (stream_nodes_with_props). Node ids are listed once when the stream
-    starts; each batch is built on demand.
+    (stream_nodes_with_props), in id order. The stream reads nodes with a
+    cursor, a batch (or the nodes created since the last checkpoint) at a
+    time, so memory stays proportional to a batch: a node created past the
+    cursor during the stream is listed, one deleted before it is read is not.
     """
     def __iter__(self) -> NodeBatchIterator: ...
     def __next__(self) -> List[Any]: ...
@@ -306,7 +308,8 @@ class EdgeBatchIterator(Iterator[List[Any]]):
     """Lazy iterator over edge batches, from Database.stream_edges*.
 
     Yields lists of FullEdge (stream_edges) or EdgeWithProps
-    (stream_edges_with_props).
+    (stream_edges_with_props), in (src, etype, dst) order, read with a cursor
+    like NodeBatchIterator.
     """
     def __iter__(self) -> EdgeBatchIterator: ...
     def __next__(self) -> List[Any]: ...

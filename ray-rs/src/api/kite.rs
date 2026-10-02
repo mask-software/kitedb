@@ -228,25 +228,17 @@ fn edge_exists_db(db: &SingleFileDB, src: NodeId, etype: ETypeId, dst: NodeId) -
 }
 
 fn neighbors_out_db(db: &SingleFileDB, node_id: NodeId, etype: Option<ETypeId>) -> Vec<NodeId> {
-  match etype {
-    Some(filter) => db.out_neighbors(node_id, filter),
-    None => db
-      .out_edges(node_id)
-      .into_iter()
-      .map(|(_, dst)| dst)
-      .collect(),
-  }
+  db.out_edges_after(node_id, etype, None, usize::MAX)
+    .into_iter()
+    .map(|(_, dst)| dst)
+    .collect()
 }
 
 fn neighbors_in_db(db: &SingleFileDB, node_id: NodeId, etype: Option<ETypeId>) -> Vec<NodeId> {
-  match etype {
-    Some(filter) => db.in_neighbors(node_id, filter),
-    None => db
-      .in_edges(node_id)
-      .into_iter()
-      .map(|(_, src)| src)
-      .collect(),
-  }
+  db.in_edges_after(node_id, etype, None, usize::MAX)
+    .into_iter()
+    .map(|(_, src)| src)
+    .collect()
 }
 
 fn edge_prop_db(
@@ -2031,7 +2023,8 @@ impl Kite {
 
   /// Count nodes of a specific type
   ///
-  /// This iterates every node and resolves its type like [`Self::node_by_id`].
+  /// Counts what [`Self::all`] lists: it resolves the type only of the nodes
+  /// that may have it.
   pub fn count_nodes_by_type(&self, node_type: &str) -> Result<u64> {
     Ok(self.all(node_type)?.count() as u64)
   }
@@ -2078,8 +2071,30 @@ impl Kite {
     let node_def = self.schema.node_def(node_type)?;
     let node_type: Arc<str> = node_def.name.as_str().into();
 
-    Ok(self.db.iter_nodes().filter_map(move |node_id| {
-      let key = self.db.node_key(node_id);
+    // A node of this type has a key starting with its prefix (the prefix owns
+    // the key, or shares it with other types), or no owned key and its label.
+    // Only those nodes can resolve to it: merge the key and label listings
+    // (both sorted by ID) instead of reading every node. `None`: the key is
+    // not read yet.
+    let keyed = self.db.nodes_with_key_prefix(&node_def.key_prefix);
+    let labeled = node_def
+      .label_id
+      .map(|label_id| self.db.nodes_with_label(label_id))
+      .unwrap_or_default();
+    let mut candidates: Vec<(NodeId, Option<Option<String>>)> =
+      Vec::with_capacity(keyed.len().max(labeled.len()));
+    let mut labeled = labeled.into_iter().peekable();
+    for (node_id, key) in keyed {
+      while let Some(other) = labeled.next_if(|&other| other < node_id) {
+        candidates.push((other, None));
+      }
+      labeled.next_if_eq(&node_id);
+      candidates.push((node_id, Some(Some(key))));
+    }
+    candidates.extend(labeled.map(|node_id| (node_id, None)));
+
+    Ok(candidates.into_iter().filter_map(move |(node_id, key)| {
+      let key = key.unwrap_or_else(|| self.db.node_key(node_id));
       let resolved = self
         .schema
         .node_type_of(&self.db, node_id, key.as_deref())?;
@@ -2283,13 +2298,15 @@ impl Kite {
   ) -> Result<Vec<NodeId>> {
     let etype = self.schema.etype_filter(edge_type)?;
 
-    use super::traversal::{TraversalBuilder, TraversalDirection, TraverseOptions};
+    use super::traversal::{NoProps, TraversalBuilder, TraversalDirection, TraverseOptions};
 
     let options = TraverseOptions::new(TraversalDirection::Out, max_depth);
 
     let results = TraversalBuilder::from_node(source)
       .traverse(etype, options)
-      .collect_node_ids(|node_id, dir, etype_filter| self.neighbors(node_id, dir, etype_filter));
+      .execute_source(self.neighbor_source(), NoProps)
+      .map(|result| result.node_id)
+      .collect();
 
     Ok(results)
   }
@@ -2303,48 +2320,15 @@ impl Kite {
     direction: super::traversal::TraversalDirection,
     etype: Option<ETypeId>,
   ) -> Vec<Edge> {
-    use super::traversal::TraversalDirection;
+    self.neighbor_source().neighbors(node_id, direction, etype)
+  }
 
-    let mut edges = Vec::new();
-
-    match direction {
-      TraversalDirection::Out => {
-        for (edge_etype, dst) in self.db.out_edges(node_id) {
-          if etype.is_some() && etype != Some(edge_etype) {
-            continue;
-          }
-          edges.push(Edge {
-            src: node_id,
-            etype: edge_etype,
-            dst,
-          });
-        }
-      }
-      TraversalDirection::In => {
-        for (edge_etype, src) in self.db.in_edges(node_id) {
-          if etype.is_some() && etype != Some(edge_etype) {
-            continue;
-          }
-          edges.push(Edge {
-            src,
-            etype: edge_etype,
-            dst: node_id,
-          });
-        }
-      }
-      TraversalDirection::Both => {
-        edges.extend(self.neighbors(node_id, TraversalDirection::Out, etype));
-        // A self-loop is also an out-edge: list it once.
-        edges.extend(
-          self
-            .neighbors(node_id, TraversalDirection::In, etype)
-            .into_iter()
-            .filter(|edge| edge.src != edge.dst),
-        );
-      }
-    }
-
-    edges
+  /// [`Self::neighbors`] as a traversal's [`NeighborSource`]: it reads each
+  /// node's edges lazily, so a `take(n)` reads about `n` of them.
+  ///
+  /// [`NeighborSource`]: super::traversal::NeighborSource
+  pub(crate) fn neighbor_source(&self) -> super::traversal::DbNeighbors<'_> {
+    super::traversal::DbNeighbors::new(&self.db)
   }
 
   // ========================================================================
@@ -2668,20 +2652,17 @@ impl<'a> KiteTraversalBuilder<'a> {
   pub fn count(self) -> usize {
     let ray = self.ray;
     let props = KiteTraversalProps::new(&ray.db, self.builder.selected_properties());
-    self.builder.count_with_props(
-      move |node_id, dir, etype| ray.neighbors(node_id, dir, etype),
-      props,
-    )
+    self.builder.count_source(ray.neighbor_source(), props)
   }
 
   /// Execute and return iterator over traversal results
+  ///
+  /// Lazy in the last step: with `take(n)`, it reads about `n` edges of the
+  /// nodes it expands, however many edges they have.
   pub fn execute(self) -> impl Iterator<Item = TraversalResult> + 'a {
     let ray = self.ray;
     let props = KiteTraversalProps::new(&ray.db, self.builder.selected_properties());
-    self.builder.execute_with_props(
-      move |node_id, dir, etype| ray.neighbors(node_id, dir, etype),
-      props,
-    )
+    self.builder.execute_source(ray.neighbor_source(), props)
   }
 
   /// Execute and return iterator over edges only

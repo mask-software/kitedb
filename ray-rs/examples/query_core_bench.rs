@@ -8,7 +8,8 @@
 //!   types   `Kite::all(type).count()` and `Kite::count_nodes_by_type` over
 //!           `--type-nodes` nodes spread over 5 types.
 //!   hub     `kite.from(hub).out(None).take(1)` from a node with `--hub-edges`
-//!           out-edges, and the hub's whole neighbor list for comparison.
+//!           out-edges, and the hub's whole neighbor list and traversal for
+//!           comparison.
 //!
 //! Each section measures its graph twice: with every change still in the WAL
 //! (`delta`) and after a checkpoint folded it into the snapshot (`snapshot`).
@@ -313,6 +314,23 @@ fn hub(config: &Config) {
       "neighbors_out(hub) (all edges)",
       config.repeat,
       || kite.neighbors_out(hub, None).expect("neighbors").len(),
+    );
+    report(
+      state,
+      "neighbors_out(hub, LINK) (all edges)",
+      config.repeat,
+      || {
+        kite
+          .neighbors_out(hub, Some("LINK"))
+          .expect("neighbors")
+          .len()
+      },
+    );
+    report(
+      state,
+      "from(hub).out(None).to_vec() (all)",
+      config.repeat,
+      || kite.from(hub).out(None).expect("out").to_vec().len(),
     );
   }
   kite.close().expect("close");

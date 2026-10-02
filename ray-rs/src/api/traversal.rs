@@ -4,6 +4,7 @@
 //!
 //! Ported from src/api/traversal.ts
 
+use crate::core::single_file::SingleFileDB;
 use crate::types::{ETypeId, Edge, NodeId, PropValue};
 use hashbrown::{HashMap as FastMap, HashSet as FastSet};
 use std::collections::{HashMap, VecDeque};
@@ -221,6 +222,247 @@ fn node_info<P: TraversalProps>(props: &P, node_id: NodeId) -> NodeInfo {
   NodeInfo {
     id: node_id,
     props: props.node_props(node_id),
+  }
+}
+
+// ============================================================================
+// Neighbor Sources
+// ============================================================================
+
+/// Where a traversal reads each node's edges from.
+///
+/// [`TraversalBuilder::execute`] takes a function `(node, direction, etype) -> Vec<Edge>`,
+/// which is a `NeighborSource` too. A source may yield edges lazily: the last step of a
+/// traversal reads only as many as it needs, so `take(n)` from a node with many edges reads
+/// about `n` of them ([`DbNeighbors`] does).
+pub trait NeighborSource {
+  /// The edges of one node
+  type Edges: Iterator<Item = Edge>;
+
+  /// The edges of `node_id` in `direction`, of type `etype` (every type for `None`). `Both`
+  /// lists the out-edges, then the in-edges that are not self-loops (a self-loop is an out-edge
+  /// too), so each edge once.
+  fn edges(
+    &self,
+    node_id: NodeId,
+    direction: TraversalDirection,
+    etype: Option<ETypeId>,
+  ) -> Self::Edges;
+
+  /// Every edge [`Self::edges`] yields, at once: for a step that reads them all.
+  fn all_edges(
+    &self,
+    node_id: NodeId,
+    direction: TraversalDirection,
+    etype: Option<ETypeId>,
+  ) -> Vec<Edge> {
+    self.edges(node_id, direction, etype).collect()
+  }
+}
+
+impl<F> NeighborSource for F
+where
+  F: Fn(NodeId, TraversalDirection, Option<ETypeId>) -> Vec<Edge>,
+{
+  type Edges = std::vec::IntoIter<Edge>;
+
+  fn edges(
+    &self,
+    node_id: NodeId,
+    direction: TraversalDirection,
+    etype: Option<ETypeId>,
+  ) -> Self::Edges {
+    self(node_id, direction, etype).into_iter()
+  }
+}
+
+/// The edges of `node_id` in `direction`, from its out-edges `(etype, dst)` and in-edges
+/// `(etype, src)`, each read only if `direction` needs it: `Both` lists the out-edges, then the
+/// in-edges that are not self-loops (a self-loop is an out-edge too), as
+/// [`NeighborSource::edges`] does.
+pub fn edges_in_direction<O, I>(
+  node_id: NodeId,
+  direction: TraversalDirection,
+  out_edges: impl FnOnce() -> O,
+  in_edges: impl FnOnce() -> I,
+) -> Vec<Edge>
+where
+  O: IntoIterator<Item = (ETypeId, NodeId)>,
+  I: IntoIterator<Item = (ETypeId, NodeId)>,
+{
+  let out = || {
+    out_edges().into_iter().map(move |(etype, dst)| Edge {
+      src: node_id,
+      etype,
+      dst,
+    })
+  };
+  let incoming = || {
+    in_edges().into_iter().map(move |(etype, src)| Edge {
+      src,
+      etype,
+      dst: node_id,
+    })
+  };
+  match direction {
+    TraversalDirection::Out => out().collect(),
+    TraversalDirection::In => incoming().collect(),
+    TraversalDirection::Both => out()
+      .chain(incoming().filter(|edge| edge.src != edge.dst))
+      .collect(),
+  }
+}
+
+/// A database's edges for traversal and pathfinding: what `Kite` and the bindings expand hops
+/// with. [`Self::neighbors`] lists a node's edges; as a [`NeighborSource`] it reads them lazily,
+/// in slices.
+#[derive(Clone, Copy)]
+pub struct DbNeighbors<'a> {
+  db: &'a SingleFileDB,
+}
+
+impl<'a> DbNeighbors<'a> {
+  pub fn new(db: &'a SingleFileDB) -> Self {
+    Self { db }
+  }
+
+  /// The edges of `node_id` in `direction`, of type `etype` (every type for `None`), as
+  /// [`NeighborSource::edges`] lists them: out-edges in `(etype, dst)` order, in-edges in
+  /// `(etype, src)` order.
+  pub fn neighbors(
+    &self,
+    node_id: NodeId,
+    direction: TraversalDirection,
+    etype: Option<ETypeId>,
+  ) -> Vec<Edge> {
+    edges_in_direction(
+      node_id,
+      direction,
+      || self.db.out_edges_after(node_id, etype, None, usize::MAX),
+      || self.db.in_edges_after(node_id, etype, None, usize::MAX),
+    )
+  }
+}
+
+impl<'a> NeighborSource for DbNeighbors<'a> {
+  type Edges = DbEdges<'a>;
+
+  fn edges(
+    &self,
+    node_id: NodeId,
+    direction: TraversalDirection,
+    etype: Option<ETypeId>,
+  ) -> DbEdges<'a> {
+    DbEdges {
+      db: self.db,
+      node_id,
+      etype,
+      direction,
+      incoming: direction == TraversalDirection::In,
+      after: None,
+      slice: Vec::new().into_iter(),
+      slice_incoming: false,
+      slice_len: DbEdges::FIRST_SLICE,
+      done: false,
+    }
+  }
+
+  fn all_edges(
+    &self,
+    node_id: NodeId,
+    direction: TraversalDirection,
+    etype: Option<ETypeId>,
+  ) -> Vec<Edge> {
+    self.neighbors(node_id, direction, etype)
+  }
+}
+
+/// One node's edges, read from the database in slices that double in size, each a seek to
+/// where the previous one ended ([`SingleFileDB::out_edges_after`]). No database lock is held
+/// between slices, so outside a transaction a slice reflects the commits made before it.
+pub struct DbEdges<'a> {
+  db: &'a SingleFileDB,
+  node_id: NodeId,
+  etype: Option<ETypeId>,
+  direction: TraversalDirection,
+  /// Whether the in-edges are being read (else the out-edges)
+  incoming: bool,
+  /// The key `(etype, other endpoint)` the last slice ended at
+  after: Option<(ETypeId, NodeId)>,
+  /// The slice being yielded, and whether it holds in-edges
+  slice: std::vec::IntoIter<(ETypeId, NodeId)>,
+  slice_incoming: bool,
+  slice_len: usize,
+  done: bool,
+}
+
+impl DbEdges<'_> {
+  // Tests use small slices, so neighbor reads cross many slice boundaries.
+  const FIRST_SLICE: usize = if cfg!(test) { 2 } else { 16 };
+  const MAX_SLICE: usize = if cfg!(test) { 8 } else { 4096 };
+
+  /// Read the next non-empty slice; `false` when no edges remain.
+  fn read_slice(&mut self) -> bool {
+    while !self.done {
+      let incoming = self.incoming;
+      let slice = if incoming {
+        self
+          .db
+          .in_edges_after(self.node_id, self.etype, self.after, self.slice_len)
+      } else {
+        self
+          .db
+          .out_edges_after(self.node_id, self.etype, self.after, self.slice_len)
+      };
+      if slice.len() < self.slice_len {
+        // This side is exhausted: `Both` reads the in-edges next.
+        if self.direction == TraversalDirection::Both && !self.incoming {
+          self.incoming = true;
+          self.after = None;
+          self.slice_len = Self::FIRST_SLICE;
+        } else {
+          self.done = true;
+        }
+      } else {
+        self.after = slice.last().copied();
+        self.slice_len = (self.slice_len * 2).min(Self::MAX_SLICE);
+      }
+      if !slice.is_empty() {
+        self.slice = slice.into_iter();
+        self.slice_incoming = incoming;
+        return true;
+      }
+    }
+    false
+  }
+}
+
+impl Iterator for DbEdges<'_> {
+  type Item = Edge;
+
+  fn next(&mut self) -> Option<Edge> {
+    loop {
+      for (etype, other) in self.slice.by_ref() {
+        if !self.slice_incoming {
+          return Some(Edge {
+            src: self.node_id,
+            etype,
+            dst: other,
+          });
+        }
+        // In `Both`, a self-loop was listed with the out-edges.
+        if other != self.node_id || self.direction != TraversalDirection::Both {
+          return Some(Edge {
+            src: other,
+            etype,
+            dst: self.node_id,
+          });
+        }
+      }
+      if !self.read_slice() {
+        return None;
+      }
+    }
   }
 }
 
@@ -577,7 +819,21 @@ impl TraversalBuilder {
     F: Fn(NodeId, TraversalDirection, Option<ETypeId>) -> Vec<Edge>,
     P: TraversalProps,
   {
-    TraversalIterator::new(self, neighbors, props)
+    self.execute_source(neighbors, props)
+  }
+
+  /// Execute the traversal over the edges `source` yields, with filters seeing the props
+  /// `props` loads
+  ///
+  /// The iterator is lazy in the last step, down to the edges of each node: with `take(n)`, it
+  /// stops reading edges once it has yielded `n` results, so a source that yields edges lazily
+  /// (like [`DbNeighbors`]) reads about `n` edges even from a node with many.
+  pub fn execute_source<S, P>(self, source: S, props: P) -> TraversalIterator<S, P>
+  where
+    S: NeighborSource,
+    P: TraversalProps,
+  {
+    TraversalIterator::new(self, source, props)
   }
 
   /// Execute the traversal and collect all node IDs
@@ -602,13 +858,23 @@ impl TraversalBuilder {
     F: Fn(NodeId, TraversalDirection, Option<ETypeId>) -> Vec<Edge>,
     P: TraversalProps,
   {
+    self.count_source(neighbors, props)
+  }
+
+  /// Count the results of a traversal over the edges `source` yields, with filters seeing the
+  /// props `props` loads
+  pub fn count_source<S, P>(self, source: S, props: P) -> usize
+  where
+    S: NeighborSource,
+    P: TraversalProps,
+  {
     // For simple traversals without variable-depth, use fast counting
     if self.can_use_fast_count() {
-      return self.count_fast(&neighbors);
+      return self.count_fast(&source);
     }
 
     // Fall back to full iteration
-    self.execute_with_props(neighbors, props).count()
+    self.execute_source(source, props).count()
   }
 
   /// Check if we can use the fast count path
@@ -633,10 +899,7 @@ impl TraversalBuilder {
   /// `unique`, the start nodes seed `visited` and each node is counted once across all steps;
   /// without it, every traversed edge yields a result, so the frontier tracks how many times
   /// each node was reached.
-  fn count_fast<F>(&self, neighbors: &F) -> usize
-  where
-    F: Fn(NodeId, TraversalDirection, Option<ETypeId>) -> Vec<Edge>,
-  {
+  fn count_fast<S: NeighborSource>(&self, source: &S) -> usize {
     let mut frontier: FastMap<NodeId, usize> = FastMap::new();
     for &node_id in &self.start_nodes {
       *frontier.entry(node_id).or_insert(0) += 1;
@@ -657,7 +920,7 @@ impl TraversalBuilder {
 
       let mut next: FastMap<NodeId, usize> = FastMap::new();
       for (&node_id, &times_reached) in &frontier {
-        for edge in neighbors(node_id, *direction, *etype) {
+        for edge in source.all_edges(node_id, *direction, *etype) {
           let neighbor = neighbor_of(&edge, node_id, *direction);
           if self.unique_nodes {
             if visited.insert(neighbor) {
@@ -697,24 +960,84 @@ impl TraversalBuilder {
 // ============================================================================
 
 /// The work of the step being run.
-#[derive(Default)]
-struct StepRun {
+struct StepRun<E> {
   /// Nodes to expand: (node, depth of the result that entered the step, hops taken within the
   /// step).
   queue: VecDeque<(NodeId, usize, usize)>,
+  /// The node being expanded, with the edges of it not read yet.
+  expanding: Option<Expansion<E>>,
   /// Nodes a `traverse()` step with `unique` has reached.
   local_visited: FastSet<NodeId>,
   /// Results produced and not consumed yet.
   results: VecDeque<TraversalResult>,
 }
 
+impl<E> Default for StepRun<E> {
+  fn default() -> Self {
+    Self {
+      queue: VecDeque::new(),
+      expanding: None,
+      local_visited: FastSet::new(),
+      results: VecDeque::new(),
+    }
+  }
+}
+
+/// A node being expanded: its edges in the direction being read, read one at a time.
+struct Expansion<E> {
+  node_id: NodeId,
+  /// Depth of the result that entered the step
+  base_depth: usize,
+  /// Hops taken within the step
+  hops: usize,
+  /// Index into the step's directions (`Both` in a `traverse()` step reads `Out`, then `In`)
+  direction: usize,
+  edges: StepEdges<E>,
+}
+
+/// The edges of a node being expanded: read lazily by the last step of a traversal with a
+/// limit (it may stop early), read at once otherwise (every edge will be read).
+enum StepEdges<E> {
+  Lazy(E),
+  All(std::vec::IntoIter<Edge>),
+}
+
+impl<E: Iterator<Item = Edge>> Iterator for StepEdges<E> {
+  type Item = Edge;
+
+  fn next(&mut self) -> Option<Edge> {
+    match self {
+      Self::Lazy(edges) => edges.next(),
+      Self::All(edges) => edges.next(),
+    }
+  }
+}
+
+/// The directions a step reads each node's edges in, one after the other.
+fn step_directions(step: &TraversalStep) -> &'static [TraversalDirection] {
+  match step {
+    TraversalStep::SingleHop { direction, .. } => match direction {
+      TraversalDirection::Out => &[TraversalDirection::Out],
+      TraversalDirection::In => &[TraversalDirection::In],
+      TraversalDirection::Both => &[TraversalDirection::Both],
+    },
+    TraversalStep::Traverse { options, .. } => expand_directions(options.direction),
+  }
+}
+
+fn step_etype(step: &TraversalStep) -> Option<ETypeId> {
+  match step {
+    TraversalStep::SingleHop { etype, .. } | TraversalStep::Traverse { etype, .. } => *etype,
+  }
+}
+
 /// Iterator for traversal results
 ///
 /// Every step but the last runs to completion when the iterator reaches it, since the next
-/// step expands its whole result set. The last step runs lazily, one expanded node at a time,
-/// so the iterator stops early once `take(n)` has `n` results.
-pub struct TraversalIterator<F, P = NoProps> {
-  /// The neighbors function
+/// step expands its whole result set. The last step runs lazily, one edge at a time, so the
+/// iterator stops reading edges once `take(n)` has `n` results.
+pub struct TraversalIterator<F: NeighborSource, P = NoProps> {
+  /// Where edges are read from
   neighbors: F,
   /// Loads the props filters see
   props: P,
@@ -723,7 +1046,7 @@ pub struct TraversalIterator<F, P = NoProps> {
   /// Number of steps started (the last started one is being run)
   steps_started: usize,
   /// Work of the step being run; before the first step, its results are the start nodes
-  run: StepRun,
+  run: StepRun<F::Edges>,
   /// Visited nodes (for uniqueness)
   visited: FastSet<NodeId>,
   /// Whether to track unique nodes
@@ -742,7 +1065,7 @@ pub struct TraversalIterator<F, P = NoProps> {
 
 impl<F, P> TraversalIterator<F, P>
 where
-  F: Fn(NodeId, TraversalDirection, Option<ETypeId>) -> Vec<Edge>,
+  F: NeighborSource,
   P: TraversalProps,
 {
   fn new(builder: TraversalBuilder, neighbors: F, props: P) -> Self {
@@ -801,6 +1124,7 @@ where
       .into_iter()
       .map(|result| (result.node_id, result.depth, 0))
       .collect();
+    self.run.expanding = None;
     self.run.local_visited = match step {
       TraversalStep::Traverse { options, .. } if options.unique => self
         .run
@@ -812,8 +1136,8 @@ where
     };
   }
 
-  /// Expand the next queued node of the step being run into `run.results`. Returns false if
-  /// the step has nothing left to expand.
+  /// Read edges of the step being run until one produces a result in `run.results`, or the
+  /// node being expanded has none left. Returns false if the step has nothing left to expand.
   fn expand_next(&mut self) -> bool {
     let Self {
       neighbors,
@@ -823,24 +1147,68 @@ where
       run,
       visited,
       unique_nodes,
+      limit,
       ..
     } = self;
     let Some(step) = steps_started.checked_sub(1).map(|index| &steps[index]) else {
       return false;
     };
-    let Some((node_id, base_depth, hops)) = run.queue.pop_front() else {
-      return false;
+    let directions = step_directions(step);
+    let etype = step_etype(step);
+    let lazy = limit.is_some() && *steps_started == steps.len();
+    let read = |node_id, direction| {
+      if lazy {
+        StepEdges::Lazy(neighbors.edges(node_id, direction, etype))
+      } else {
+        StepEdges::All(neighbors.all_edges(node_id, direction, etype).into_iter())
+      }
     };
 
-    match step {
-      TraversalStep::SingleHop {
-        direction,
-        etype,
-        edge_filter,
-        node_filter,
-      } => {
-        for edge in neighbors(node_id, *direction, *etype) {
-          let neighbor_id = neighbor_of(&edge, node_id, *direction);
+    loop {
+      let expansion = match run.expanding.as_mut() {
+        Some(expansion) => expansion,
+        None => {
+          let Some((node_id, base_depth, hops)) = run.queue.pop_front() else {
+            return false;
+          };
+          if let TraversalStep::Traverse { options, .. } = step {
+            if hops >= options.max_depth {
+              continue;
+            }
+          }
+          run.expanding.insert(Expansion {
+            node_id,
+            base_depth,
+            hops,
+            direction: 0,
+            edges: read(node_id, directions[0]),
+          })
+        }
+      };
+      let Some(edge) = expansion.edges.next() else {
+        // The edges in this direction are done: read the next direction, or the next node.
+        expansion.direction += 1;
+        match directions.get(expansion.direction) {
+          Some(&direction) => {
+            expansion.edges = read(expansion.node_id, direction);
+            continue;
+          }
+          None => {
+            run.expanding = None;
+            return true;
+          }
+        }
+      };
+      let (node_id, base_depth, hops) = (expansion.node_id, expansion.base_depth, expansion.hops);
+      let dir = directions[expansion.direction];
+
+      match step {
+        TraversalStep::SingleHop {
+          edge_filter,
+          node_filter,
+          ..
+        } => {
+          let neighbor_id = neighbor_of(&edge, node_id, dir);
           if *unique_nodes && visited.contains(&neighbor_id) {
             continue;
           }
@@ -865,69 +1233,63 @@ where
             edge: Some(raw_edge),
             depth: base_depth + 1,
           });
-        }
-      }
-      TraversalStep::Traverse { etype, options } => {
-        if hops >= options.max_depth {
           return true;
         }
-        for &dir in expand_directions(options.direction) {
-          for edge in neighbors(node_id, dir, *etype) {
-            // A self-loop is both an out- and an in-edge: follow it once.
-            if options.direction == TraversalDirection::Both
-              && dir == TraversalDirection::In
-              && edge.src == edge.dst
-            {
-              continue;
-            }
-            let neighbor_id = neighbor_of(&edge, node_id, dir);
-            if options.unique && run.local_visited.contains(&neighbor_id) {
-              continue;
-            }
-            let raw_edge = RawEdge::from(edge);
-            if options
-              .where_edge
-              .as_ref()
-              .is_some_and(|filter| !filter(&edge_info(props, raw_edge)))
-            {
-              continue;
-            }
-            if options
-              .where_node
-              .as_ref()
-              .is_some_and(|filter| !filter(&node_info(props, neighbor_id)))
-            {
-              continue;
-            }
-            if options.unique {
-              run.local_visited.insert(neighbor_id);
-            }
-            if *unique_nodes && !visited.insert(neighbor_id) {
-              continue;
-            }
+        TraversalStep::Traverse { options, .. } => {
+          // A self-loop is both an out- and an in-edge: follow it once.
+          if options.direction == TraversalDirection::Both
+            && dir == TraversalDirection::In
+            && edge.src == edge.dst
+          {
+            continue;
+          }
+          let neighbor_id = neighbor_of(&edge, node_id, dir);
+          if options.unique && run.local_visited.contains(&neighbor_id) {
+            continue;
+          }
+          let raw_edge = RawEdge::from(edge);
+          if options
+            .where_edge
+            .as_ref()
+            .is_some_and(|filter| !filter(&edge_info(props, raw_edge)))
+          {
+            continue;
+          }
+          if options
+            .where_node
+            .as_ref()
+            .is_some_and(|filter| !filter(&node_info(props, neighbor_id)))
+          {
+            continue;
+          }
+          if options.unique {
+            run.local_visited.insert(neighbor_id);
+          }
+          if *unique_nodes && !visited.insert(neighbor_id) {
+            continue;
+          }
 
-            let next_hops = hops + 1;
-            if next_hops >= options.min_depth {
-              run.results.push_back(TraversalResult {
-                node_id: neighbor_id,
-                edge: Some(raw_edge),
-                depth: base_depth + next_hops,
-              });
-            }
-            if next_hops < options.max_depth {
-              run.queue.push_back((neighbor_id, base_depth, next_hops));
-            }
+          let next_hops = hops + 1;
+          if next_hops < options.max_depth {
+            run.queue.push_back((neighbor_id, base_depth, next_hops));
+          }
+          if next_hops >= options.min_depth {
+            run.results.push_back(TraversalResult {
+              node_id: neighbor_id,
+              edge: Some(raw_edge),
+              depth: base_depth + next_hops,
+            });
+            return true;
           }
         }
       }
     }
-    true
   }
 }
 
 impl<F, P> Iterator for TraversalIterator<F, P>
 where
-  F: Fn(NodeId, TraversalDirection, Option<ETypeId>) -> Vec<Edge>,
+  F: NeighborSource,
   P: TraversalProps,
 {
   type Item = TraversalResult;
@@ -973,14 +1335,11 @@ where
 // ============================================================================
 
 /// Iterator over the edges that reached each traversal result (no property loading)
-pub struct RawEdgeIterator<F> {
+pub struct RawEdgeIterator<F: NeighborSource> {
   inner: TraversalIterator<F>,
 }
 
-impl<F> Iterator for RawEdgeIterator<F>
-where
-  F: Fn(NodeId, TraversalDirection, Option<ETypeId>) -> Vec<Edge>,
-{
+impl<F: NeighborSource> Iterator for RawEdgeIterator<F> {
   type Item = RawEdge;
 
   fn next(&mut self) -> Option<Self::Item> {
