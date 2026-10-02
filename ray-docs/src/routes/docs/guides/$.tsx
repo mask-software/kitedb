@@ -833,9 +833,11 @@ db.commit()`}
 							</td>
 						</tr>
 						<tr>
-							<td>Multi-writer throughput</td>
+							<td>Several writer threads</td>
 							<td>
-								<code>syncMode: 'Normal'</code> + group commit + chunked batches
+								<code>mvcc: true</code> + <code>syncMode: 'Normal'</code> + group
+								commit + chunked batches (without MVCC, write transactions run one
+								at a time). One writer sending batches is usually faster
 							</td>
 						</tr>
 					</tbody>
@@ -1011,9 +1013,10 @@ if db.has_transaction():
 							</td>
 						</tr>
 						<tr>
-							<td>Multi-writer throughput</td>
+							<td>Several writer threads</td>
 							<td>
-								<code>syncMode: 'Normal'</code> + group commit (1-2ms)
+								<code>mvcc: true</code> + <code>syncMode: 'Normal'</code> + group
+								commit
 							</td>
 						</tr>
 						<tr>
@@ -1082,11 +1085,10 @@ db.commit()`}
 							</td>
 						</tr>
 						<tr>
-							<td>Multi-writer throughput</td>
+							<td>Several writer threads</td>
 							<td>
-								<code>syncMode: 'Normal'</code>,{" "}
-								<code>groupCommitEnabled: true</code>
-								(1-2ms window), chunked batches
+								<code>mvcc: true</code>, <code>syncMode: 'Normal'</code>,{" "}
+								<code>groupCommitEnabled: true</code>, chunked batches
 							</td>
 						</tr>
 						<tr>
@@ -1143,7 +1145,10 @@ db.commit()`}
 			<DocPage slug={slug}>
 				<p>
 					Within one process, many threads can read a KiteDB database at the
-					same time. Writes are serialized: one writer commits at a time.
+					same time. Without MVCC (the default), one write transaction is open
+					at a time: a second writer waits in <code>begin</code> until the first
+					commits or rolls back. With the <code>mvcc</code> open option, write
+					transactions run concurrently and conflicts are detected at commit.
 				</p>
 
 				<h2 id="concurrency-model">Concurrency model</h2>
@@ -1156,13 +1161,17 @@ db.commit()`}
 						can read simultaneously
 					</li>
 					<li>
-						<strong>Exclusive writer</strong> – Write operations acquire
-						exclusive access
+						<strong>One writer at a time (default)</strong> – A write
+						transaction waits for the open one to finish, so concurrent
+						read-modify-write transactions cannot lose updates. Read-only
+						transactions never wait for it
 					</li>
 					<li>
-						<strong>MVCC isolation (opt-in)</strong> – With the{" "}
-						<code>mvcc</code> open option enabled, transactions read from
-						consistent snapshots
+						<strong>MVCC (opt-in)</strong> – With the <code>mvcc</code> open
+						option, transactions read from consistent snapshots, and write
+						transactions run concurrently; a commit that conflicts with one
+						committed since its transaction began fails with a conflict error, so
+						retry it
 					</li>
 				</ul>
 
@@ -1229,9 +1238,16 @@ print(results)`}
 
 				<h2 id="performance">Performance notes</h2>
 				<p>
-					Read throughput typically improves with parallel readers, while write
-					throughput is constrained by serialized commit ordering. Measure with
-					your workload and tune batch sizes and sync mode accordingly.
+					Read throughput typically improves with parallel readers. Without
+					MVCC, writer threads take turns for whole transactions, so more writer
+					threads add no write throughput. With MVCC, writers build their
+					transactions in parallel and only the commits are applied one at a
+					time, but its version bookkeeping costs throughput too: for several
+					writer threads, use <code>mvcc: true</code> with{" "}
+					<code>syncMode: 'Normal'</code> and group commit; for the most write
+					throughput, prepare data in parallel and send it through one writer in
+					batched transactions. Measure with your workload and tune batch sizes
+					and sync mode accordingly.
 				</p>
 
 				<h2 id="best-practices">Best practices</h2>
@@ -1259,18 +1275,24 @@ print(results)`}
 				<p>
 					MVCC (multi-version concurrency control) is off by default. Turn it on
 					with the <code>mvcc</code> open option when readers need snapshot
-					isolation. Writes are serialized either way:
+					isolation or several threads write at once:
 				</p>
 				<ul>
 					<li>Multiple readers can run concurrently</li>
 					<li>
-						A write waits for in-flight reads, then blocks new reads while it
-						commits
+						Without MVCC, write transactions run one at a time: a write{" "}
+						<code>begin</code> waits until no other write transaction is open
+						(in Python it releases the GIL while it waits)
+					</li>
+					<li>
+						With MVCC, write transactions run concurrently, and write conflicts
+						are detected at commit time
+					</li>
+					<li>
+						Commits are applied one at a time; a commit briefly blocks new reads
+						while it publishes its changes
 					</li>
 					<li>Each committed transaction is atomic</li>
-					<li>
-						With MVCC enabled, write conflicts are detected at commit time
-					</li>
 				</ul>
 
 				<MultiLangCode
@@ -1307,8 +1329,9 @@ with db.transaction():
 						single process; multi-process access requires external coordination
 					</li>
 					<li>
-						<strong>Write serialization</strong> – All writes are serialized;
-						high-write workloads may see contention
+						<strong>Write serialization</strong> – Without MVCC, write
+						transactions run one at a time; with MVCC, commits are applied one
+						at a time. High-write workloads may see contention
 					</li>
 					<li>
 						<strong>Memory overhead</strong> – With MVCC enabled, version

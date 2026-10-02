@@ -444,6 +444,12 @@ function GraphPage() {
 				With eight concurrent writers, group commit raises throughput, the
 				opposite of its effect on a single writer.
 			</p>
+			<p>
+				These runs used concurrent write transactions without MVCC, which
+				releases up to v0.2.18 allowed. Non-MVCC mode now runs one write
+				transaction at a time; concurrent writers need <code>mvcc: true</code>,
+				and these numbers are pending a re-run with it.
+			</p>
 
 			<h3 id="parallel-vectors">Thread-count sweeps</h3>
 			<p>
