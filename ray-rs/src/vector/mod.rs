@@ -35,7 +35,7 @@ pub use ivf::{
 };
 pub use ivf_pq::{
   deserialize_ivf_pq, ivf_pq_serialized_size, serialize_ivf_pq, IvfPqConfig, IvfPqError,
-  IvfPqIndex, IvfPqSearchOptions, IvfPqStats,
+  IvfPqIndex, IvfPqSearchOptions, IvfPqStats, DEFAULT_RERANK_FACTOR, MIN_RERANK_CANDIDATES,
 };
 pub use pq::{PqError, PqIndex, PqSearchResult, PqStats};
 pub use store::{

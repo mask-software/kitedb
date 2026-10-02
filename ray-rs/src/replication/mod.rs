@@ -3,6 +3,7 @@
 //! Phase A focuses on deterministic token/cursor parsing and durable sidecar
 //! storage primitives.
 
+pub mod durability;
 pub mod log_store;
 pub mod manifest;
 pub mod primary;

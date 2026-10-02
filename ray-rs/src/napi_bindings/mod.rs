@@ -13,7 +13,8 @@ pub use database::{
   restore_backup, BackupOptions, BackupResult, CacheLayerMetrics, CacheMetrics, CheckResult,
   CompressionOptions, DataMetrics, Database, DatabaseMetrics, DbStats, EdgePage, EdgeWithProps,
   HealthCheckEntry, HealthCheckResult, JsCompressionType, JsEdge, JsFullEdge, JsFullEdgeInput,
-  JsNodeProp, JsPropValue, MemoryMetrics, MvccMetrics, MvccStats, NodePage, NodeWithProps,
+  JsNodeProp, JsPropValue, JsReplicationLogTransportFrame, JsReplicationLogTransportPage,
+  JsReplicationSnapshotTransport, MemoryMetrics, MvccMetrics, MvccStats, NodePage, NodeWithProps,
   OfflineBackupOptions, OpenOptions, PaginationOptions, PropType, RestoreOptions,
   SingleFileOptimizeOptions, StreamOptions, VacuumOptions,
 };
@@ -31,7 +32,8 @@ pub use traversal::{
 };
 
 pub use vector::{
-  brute_force_search, create_vector_index, JsAggregation, JsBruteForceResult, JsDistanceMetric,
-  JsIvfConfig, JsIvfIndex, JsIvfPqIndex, JsIvfStats, JsPqConfig, JsSearchOptions, JsSearchResult,
-  SimilarOptions, VectorIndex, VectorIndexOptions, VectorIndexStats, VectorSearchHit,
+  brute_force_search, create_vector_index, JsAggregation, JsAnnAlgorithm, JsBruteForceResult,
+  JsDistanceMetric, JsIvfConfig, JsIvfIndex, JsIvfPqIndex, JsIvfStats, JsPqConfig, JsSearchOptions,
+  JsSearchResult, SimilarOptions, VectorIndex, VectorIndexOptions, VectorIndexStats,
+  VectorSearchHit,
 };

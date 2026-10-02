@@ -1,5 +1,6 @@
 //! Replication segment log storage.
 
+use super::durability::SidecarSync;
 use crate::error::{KiteError, Result};
 use crate::util::crc::{crc32, crc32_multi};
 use byteorder::{LittleEndian, ReadBytesExt};
@@ -49,6 +50,7 @@ pub struct SegmentLogStore {
   queued_bytes: usize,
   write_buffer_limit: usize,
   writable: bool,
+  sync: SidecarSync,
 }
 
 impl SegmentLogStore {
@@ -74,6 +76,7 @@ impl SegmentLogStore {
       queued_bytes: 0,
       write_buffer_limit: 0,
       writable: true,
+      sync: SidecarSync::default(),
     })
   }
 
@@ -89,6 +92,7 @@ impl SegmentLogStore {
       queued_bytes: 0,
       write_buffer_limit: 0,
       writable: false,
+      sync: SidecarSync::default(),
     })
   }
 
@@ -99,6 +103,16 @@ impl SegmentLogStore {
   pub fn open_or_create_append_with_buffer(
     path: impl AsRef<Path>,
     write_buffer_limit: usize,
+  ) -> Result<Self> {
+    Self::open_append(path, write_buffer_limit, SidecarSync::default())
+  }
+
+  /// Open (or create) a segment for appends that buffers up to
+  /// `write_buffer_limit` bytes in memory and makes them durable with `sync`.
+  pub fn open_append(
+    path: impl AsRef<Path>,
+    write_buffer_limit: usize,
+    sync: SidecarSync,
   ) -> Result<Self> {
     let path = path.as_ref().to_path_buf();
 
@@ -120,6 +134,7 @@ impl SegmentLogStore {
       queued_bytes: 0,
       write_buffer_limit,
       writable: true,
+      sync,
     })
   }
 
@@ -320,7 +335,7 @@ impl SegmentLogStore {
   pub fn sync(&mut self) -> Result<()> {
     if self.writable {
       self.flush()?;
-      self.file.sync_all()?;
+      self.sync.sync_file(&self.file)?;
     }
 
     Ok(())

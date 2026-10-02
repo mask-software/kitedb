@@ -400,8 +400,15 @@ fn weighted_pick(weights: &[f32], rng: &mut StdRng) -> usize {
   weights.iter().rposition(|&w| w > 0.0).unwrap_or(0)
 }
 
+/// Vectors per partial inertia sum. Fixed, so the sum adds the same partials
+/// in the same order however many threads computed them.
+const INERTIA_CHUNK: usize = MIN_VECTORS_PER_THREAD / 4;
+
 /// Assigns every vector to its nearest centroid and returns the inertia (the
 /// sum of the distances to the assigned centroids).
+///
+/// The inertia adds per-chunk partial sums in chunk order, so it is the same
+/// with or without `parallel` and on any thread count.
 pub(crate) fn assign_to_centroids<D>(
   vectors: &[f32],
   dimensions: usize,
@@ -413,30 +420,41 @@ pub(crate) fn assign_to_centroids<D>(
 where
   D: Fn(&[f32], &[f32]) -> f32 + Sync,
 {
-  let assign = |(vector, assignment): (&[f32], &mut u32)| {
-    let (cluster, dist) = nearest_centroid(vector, centroids, dimensions, distance_fn);
-    *assignment = cluster as u32;
-    f64::from(dist)
+  let assign_chunk = |(chunk, chunk_assignments): (&[f32], &mut [u32])| {
+    chunk
+      .chunks_exact(dimensions)
+      .zip(chunk_assignments.iter_mut())
+      .map(|(vector, assignment)| {
+        let (cluster, dist) = nearest_centroid(vector, centroids, dimensions, distance_fn);
+        *assignment = cluster as u32;
+        f64::from(dist)
+      })
+      .sum::<f64>()
   };
+  let chunk_len = INERTIA_CHUNK * dimensions;
   #[cfg(not(target_arch = "wasm32"))]
   if parallel {
-    return vectors
-      .par_chunks_exact(dimensions)
-      .zip(assignments.par_iter_mut())
-      .with_min_len(MIN_VECTORS_PER_THREAD / 4)
-      .map(assign)
-      .sum::<f64>() as f32;
+    let partials: Vec<f64> = vectors
+      .par_chunks(chunk_len)
+      .zip(assignments.par_chunks_mut(INERTIA_CHUNK))
+      .map(assign_chunk)
+      .collect();
+    return partials.iter().sum::<f64>() as f32;
   }
   let _ = parallel;
   vectors
-    .chunks_exact(dimensions)
-    .zip(assignments.iter_mut())
-    .map(assign)
+    .chunks(chunk_len)
+    .zip(assignments.chunks_mut(INERTIA_CHUNK))
+    .map(assign_chunk)
     .sum::<f64>() as f32
 }
 
 /// Moves each centroid to the mean of its assigned vectors. A centroid with
 /// no vectors keeps its position.
+///
+/// Each centroid adds its vectors in index order (in parallel across
+/// centroids when `parallel` is set), so the result is the same with or
+/// without `parallel` and on any thread count.
 fn update_centroids(
   vectors: &[f32],
   dimensions: usize,
@@ -445,63 +463,53 @@ fn update_centroids(
   centroids: &mut [f32],
   parallel: bool,
 ) {
-  let accumulate = |(mut sums, mut counts): (Vec<f32>, Vec<u32>),
-                    (vector, &cluster): (&[f32], &u32)| {
-    let offset = cluster as usize * dimensions;
-    for (sum, &x) in sums[offset..offset + dimensions].iter_mut().zip(vector) {
-      *sum += x;
-    }
-    counts[cluster as usize] += 1;
-    (sums, counts)
-  };
-  let empty = || (vec![0.0f32; k * dimensions], vec![0u32; k]);
-
-  #[cfg(not(target_arch = "wasm32"))]
-  let (sums, counts) = if parallel {
-    vectors
-      .par_chunks_exact(dimensions)
-      .zip(assignments.par_iter())
-      .with_min_len(MIN_VECTORS_PER_THREAD)
-      .fold(empty, accumulate)
-      .reduce(
-        empty,
-        |(mut sums, mut counts), (other_sums, other_counts)| {
-          for (sum, other) in sums.iter_mut().zip(other_sums) {
-            *sum += other;
-          }
-          for (count, other) in counts.iter_mut().zip(other_counts) {
-            *count += other;
-          }
-          (sums, counts)
-        },
-      )
-  } else {
-    vectors
-      .chunks_exact(dimensions)
-      .zip(assignments)
-      .fold(empty(), accumulate)
-  };
-  #[cfg(target_arch = "wasm32")]
-  let (sums, counts) = {
-    let _ = parallel;
-    vectors
-      .chunks_exact(dimensions)
-      .zip(assignments)
-      .fold(empty(), accumulate)
-  };
-
-  for (c, &count) in counts.iter().enumerate() {
-    if count == 0 {
-      continue;
-    }
-    let offset = c * dimensions;
-    for (centroid, &sum) in centroids[offset..offset + dimensions]
-      .iter_mut()
-      .zip(&sums[offset..offset + dimensions])
-    {
-      *centroid = sum / count as f32;
-    }
+  // Vector indices grouped by cluster, each group in index order (a
+  // counting sort): cluster c's vectors are members[starts[c]..starts[c + 1]].
+  let mut starts = vec![0usize; k + 1];
+  for &cluster in assignments {
+    starts[cluster as usize + 1] += 1;
   }
+  for c in 0..k {
+    starts[c + 1] += starts[c];
+  }
+  let mut next = starts[..k].to_vec();
+  let mut members = vec![0usize; assignments.len()];
+  for (index, &cluster) in assignments.iter().enumerate() {
+    let slot = &mut next[cluster as usize];
+    members[*slot] = index;
+    *slot += 1;
+  }
+
+  let update = |(c, centroid): (usize, &mut [f32])| {
+    let group = &members[starts[c]..starts[c + 1]];
+    if group.is_empty() {
+      return;
+    }
+    centroid.fill(0.0);
+    for &index in group {
+      let vector = &vectors[index * dimensions..(index + 1) * dimensions];
+      for (sum, &x) in centroid.iter_mut().zip(vector) {
+        *sum += x;
+      }
+    }
+    let count = group.len() as f32;
+    for sum in centroid.iter_mut() {
+      *sum /= count;
+    }
+  };
+  #[cfg(not(target_arch = "wasm32"))]
+  if parallel {
+    centroids
+      .par_chunks_mut(dimensions)
+      .enumerate()
+      .for_each(update);
+    return;
+  }
+  let _ = parallel;
+  centroids
+    .chunks_mut(dimensions)
+    .enumerate()
+    .for_each(update);
 }
 
 // ============================================================================

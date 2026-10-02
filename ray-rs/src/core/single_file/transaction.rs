@@ -3,12 +3,13 @@
 //! Handles begin, commit, and rollback operations.
 //!
 //! Commit ordering is:
-//! `room for the COMMIT record (waiting for a background install if needed)
-//! -> MVCC conflict check -> WAL COMMIT -> WAL flush (and fsync, in Full
-//! mode) -> durable header -> schema publish -> MVCC commit timestamp,
-//! version chains, vector and delta merge -> sidecar attempt`, all under the
-//! commit lock. Until the header is durable a failure leaves no trace of the
-//! commit: its COMMIT record is forgotten, and MVCC aborts it. From there on
+//! `epoch fence check (primaries) -> room for the COMMIT record (waiting for
+//! a background install if needed) -> MVCC conflict check -> WAL COMMIT ->
+//! WAL flush (and fsync, in Full mode) -> durable header -> schema publish
+//! -> MVCC commit timestamp, version chains, vector and delta merge ->
+//! sidecar attempt`, all under the commit lock. Until the header is durable
+//! a failure leaves no trace of the commit: its COMMIT record is forgotten,
+//! and MVCC aborts it. From there on
 //! every step runs. The MVCC timestamp, version chains and delta merge share
 //! one `delta.write()` critical section, and MVCC transactions begin under
 //! `delta.read()`, so a snapshot holds a commit entirely or not at all.
@@ -65,8 +66,22 @@ fn post_durable_test_fault() -> Result<()> {
 thread_local! {
   /// Run on this thread's next commit once it is durable, right before its
   /// changes merge into the delta (wave-2 D3 reproduction).
-  static BEFORE_NEXT_COMMIT_MERGE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+  pub(crate) static BEFORE_NEXT_COMMIT_MERGE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
     std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+thread_local! {
+  /// Run on this thread's next commit right before it takes the commit lock.
+  pub(crate) static BEFORE_NEXT_COMMIT_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+    std::cell::RefCell::new(None);
+}
+
+fn before_commit_lock_test_hook() {
+  #[cfg(test)]
+  if let Some(hook) = BEFORE_NEXT_COMMIT_LOCK.with(|hook| hook.borrow_mut().take()) {
+    hook();
+  }
 }
 
 fn before_merge_test_hook() {
@@ -99,7 +114,7 @@ pub(crate) struct CommitRequest {
   /// Its COMMIT record, or a bulk load's whole transaction.
   records: Vec<u8>,
   pending: DeltaState,
-  /// Its data records, for the replication sidecar.
+  /// Its data records, for the replication sidecar (empty without one).
   pending_wal: Vec<u8>,
   staged_schema: SchemaStaging,
   /// The committing thread; its test hooks fire only there.
@@ -463,19 +478,21 @@ impl SingleFileDB {
     }
   }
 
-  /// `try_write_wal`, waiting and retrying for as long as a background
-  /// checkpoint holds the WAL in a full secondary region, and compacting a
-  /// retained WAL that fills it. Callers hold no lock that checkpoint needs.
-  fn write_wal_waiting(&self, record: &WalRecord) -> Result<()> {
-    self.write_wal_waiting_then(record, || {})
+  /// Write `record` with `try_write_wal`, waiting and retrying for as long
+  /// as a background checkpoint holds the WAL in a full secondary region, and
+  /// compacting a retained WAL that fills it, then run `then` under the WAL
+  /// lock right after the record is written. Callers hold no lock that
+  /// checkpoint needs.
+  fn write_wal_waiting_then(&self, record: &WalRecord, then: impl Fn()) -> Result<()> {
+    self.write_built_wal_waiting_then(&mut record.build(), then)
   }
 
-  /// `write_wal_waiting`, running `then` under the WAL lock right after the
-  /// record is written.
-  fn write_wal_waiting_then(&self, record: &WalRecord, then: impl Fn()) -> Result<()> {
+  /// `write_wal_waiting_then` for a record already built (unsalted, as
+  /// `WalRecord::build` returns it); `record` is unsalted again on return.
+  fn write_built_wal_waiting_then(&self, record: &mut [u8], then: impl Fn()) -> Result<()> {
     loop {
       let written = self.try_write_wal(|wal, pager| {
-        wal.write_record(record, pager)?;
+        wal.write_built_record(record, pager)?;
         then();
         Ok(())
       })?;
@@ -796,13 +813,6 @@ impl SingleFileDB {
       armed: true,
     };
 
-    // Fencing must happen before MVCC marks the transaction committed or the
-    // local WAL gets a COMMIT record. A repair fence is deliberately allowed
-    // through; it affects only replication, not local commit authority.
-    if let Some(replication) = self.primary_replication.as_ref() {
-      replication.ensure_local_commit_allowed()?;
-    }
-
     let replication_enabled = self.primary_replication.is_some();
     let group_commit_active =
       self.group_commit_enabled && self.sync_mode == SyncMode::Normal && !replication_enabled;
@@ -890,6 +900,7 @@ impl SingleFileDB {
     let mut outcomes: Vec<Option<CommitOutcome>> = requests.iter().map(|_| None).collect();
     let mut queue: VecDeque<(usize, CommitRequest)> = requests.into_iter().enumerate().collect();
     while !queue.is_empty() {
+      before_commit_lock_test_hook();
       #[cfg(feature = "bench-profile")]
       let commit_lock_start = Instant::now();
       let commit_guard = self.commit_lock.lock();
@@ -951,8 +962,17 @@ impl SingleFileDB {
       // recorded a read of its node or edge), except bulk loads, which record
       // nothing.
       let check_targets = self.mvcc.is_none() || request.bulk_load;
+      // Epoch fencing, under the commit lock so a promotion that landed while
+      // this commit waited for it is seen, and before MVCC or the WAL records
+      // the commit. A repair fence is let through: it affects replication,
+      // not local commit authority.
       let checked = self
-        .load_vector_stores(&request.pending.pending_vectors)
+        .primary_replication
+        .as_ref()
+        .map_or(Ok(()), |replication| {
+          replication.ensure_local_commit_allowed()
+        })
+        .and_then(|()| self.load_vector_stores(&request.pending.pending_vectors))
         .and_then(|()| {
           if check_targets {
             self.check_commit_targets(&request.pending, &deleted_in_round)
@@ -1368,28 +1388,31 @@ impl SingleFileDB {
       .map(|replication| replication.status())
   }
 
-  /// Write a WAL record (internal helper)
-  pub(crate) fn write_wal(&self, record: WalRecord) -> Result<()> {
-    self.write_wal_waiting(&record)
-  }
-
+  /// Log `record` for the transaction `tx_handle`: to the WAL now, or, for a
+  /// bulk load, at its commit. It is encoded once. The transaction keeps a
+  /// copy only when something reads it later: a bulk load's commit writes
+  /// its records then, and a primary's commit hands them to the replication
+  /// sidecar (`publish_commit`).
   pub(crate) fn write_wal_tx(
     &self,
     tx_handle: &Arc<Mutex<SingleFileTxState>>,
     record: WalRecord,
   ) -> Result<()> {
+    let mut record_bytes = record.build();
     let mut tx = tx_handle.lock();
-    let record_bytes = record.build();
     if tx.bulk_load {
       tx.pending_wal.extend_from_slice(&record_bytes);
-      Ok(())
-    } else {
-      drop(tx);
-      self.write_wal(record)?;
-      let mut tx = tx_handle.lock();
-      tx.pending_wal.extend_from_slice(&record_bytes);
-      Ok(())
+      return Ok(());
     }
+    drop(tx);
+    self.write_built_wal_waiting_then(&mut record_bytes, || {})?;
+    if self.primary_replication.is_some() {
+      tx_handle
+        .lock()
+        .pending_wal
+        .extend_from_slice(&record_bytes);
+    }
+    Ok(())
   }
 
   /// Get current transaction ID or error

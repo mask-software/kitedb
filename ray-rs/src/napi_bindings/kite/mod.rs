@@ -35,6 +35,10 @@ use std::sync::Arc;
 use crate::api::kite::{BatchOp, EdgeDef, Kite as RustKite, KiteOptions, NodeDef};
 
 use super::database::{
+  log_transport, log_transport_json, snapshot_transport, snapshot_transport_json,
+  JsPrimaryRetentionOutcome, JsReplicationLogTransportPage, JsReplicationSnapshotTransport,
+};
+use super::database::{
   CheckResult, DbStats, JsPrimaryReplicationStatus, JsReplicaReplicationStatus, MvccStats,
 };
 use super::database::{JsFullEdge, JsPropValue};
@@ -1011,6 +1015,111 @@ impl Kite {
         .primary_promote_to_next_epoch()
         .map(|epoch| epoch as i64)
         .map_err(|e| Error::from_reason(format!("Failed to promote primary: {e}")))
+    })
+  }
+
+  /// Report a replica's applied position (primary role), for retention.
+  #[napi]
+  pub fn primary_report_replica_progress(
+    &self,
+    replica_id: String,
+    epoch: i64,
+    applied_log_index: i64,
+  ) -> Result<()> {
+    let epoch = validation::non_negative_u64("epoch", epoch, i64::MAX as u64)?;
+    let applied_log_index =
+      validation::non_negative_u64("appliedLogIndex", applied_log_index, i64::MAX as u64)?;
+    self.with_kite(|ray| {
+      ray
+        .raw()
+        .primary_report_replica_progress(&replica_id, epoch, applied_log_index)
+        .map_err(|e| Error::from_reason(format!("Failed to report replica progress: {e}")))
+    })
+  }
+
+  /// Forget a replica's reported progress, so a decommissioned replica stops
+  /// holding back retention. Returns whether it had progress recorded.
+  #[napi]
+  pub fn primary_remove_replica_progress(&self, replica_id: String) -> Result<bool> {
+    self.with_kite(|ray| {
+      ray
+        .raw()
+        .primary_remove_replica_progress(&replica_id)
+        .map_err(|e| Error::from_reason(format!("Failed to remove replica progress: {e}")))
+    })
+  }
+
+  /// Run replication retention (primary role).
+  #[napi]
+  pub fn primary_run_retention(&self) -> Result<JsPrimaryRetentionOutcome> {
+    self.with_kite(|ray| {
+      ray
+        .raw()
+        .primary_run_retention()
+        .map(Into::into)
+        .map_err(|e| Error::from_reason(format!("Failed to run retention: {e}")))
+    })
+  }
+
+  /// Export a consistent snapshot (metadata, and the database file copy when
+  /// includeData, up to 32 MiB) as transport JSON, with the data in base64.
+  #[napi]
+  pub fn export_replication_snapshot_transport_json(
+    &self,
+    include_data: Option<bool>,
+  ) -> Result<String> {
+    self.with_kite(|ray| snapshot_transport_json(ray.raw(), include_data))
+  }
+
+  /// Export a consistent snapshot with the database file copy (when
+  /// includeData, up to 1 GiB) as a Buffer.
+  #[napi]
+  pub fn export_replication_snapshot_transport(
+    &self,
+    include_data: Option<bool>,
+  ) -> Result<JsReplicationSnapshotTransport> {
+    self.with_kite(|ray| snapshot_transport(ray.raw(), include_data))
+  }
+
+  /// Export a replication log page (cursor + limits) as transport JSON.
+  #[napi]
+  pub fn export_replication_log_transport_json(
+    &self,
+    cursor: Option<String>,
+    max_frames: Option<i64>,
+    max_bytes: Option<i64>,
+    include_payload: Option<bool>,
+  ) -> Result<String> {
+    self.with_kite(|ray| {
+      log_transport_json(ray.raw(), cursor, max_frames, max_bytes, include_payload)
+    })
+  }
+
+  /// Export a replication log page (cursor + limits) with payloads as Buffers.
+  #[napi]
+  pub fn export_replication_log_transport(
+    &self,
+    cursor: Option<String>,
+    max_frames: Option<i64>,
+    max_bytes: Option<i64>,
+    include_payload: Option<bool>,
+  ) -> Result<JsReplicationLogTransportPage> {
+    self.with_kite(|ray| log_transport(ray.raw(), cursor, max_frames, max_bytes, include_payload))
+  }
+
+  /// Replication metrics in Prometheus text format.
+  #[napi]
+  pub fn replication_metrics_prometheus(&self) -> Result<String> {
+    self.with_kite(|ray| {
+      Ok(crate::metrics::collect_replication_metrics_prometheus_single_file(ray.raw()))
+    })
+  }
+
+  /// Replication metrics as OpenTelemetry JSON.
+  #[napi]
+  pub fn replication_metrics_otel_json(&self) -> Result<String> {
+    self.with_kite(|ray| {
+      Ok(crate::metrics::collect_replication_metrics_otel_json_single_file(ray.raw()))
     })
   }
 

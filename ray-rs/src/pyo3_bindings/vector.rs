@@ -9,12 +9,15 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::sync::RwLock;
 
+use crate::api::vector_search::AnnAlgorithm as RustAnnAlgorithm;
 use crate::pyo3_bindings::validation;
 use crate::vector::distance::{l2_norm, normalize_in_place};
+use crate::vector::top_k::TopK;
 use crate::vector::{
   DistanceMetric as RustDistanceMetric, IvfConfig as RustIvfConfig, IvfIndex as RustIvfIndex,
-  IvfPqConfig as RustIvfPqConfig, IvfPqIndex as RustIvfPqIndex, MultiQueryAggregation,
-  PqConfig as RustPqConfig, SearchOptions as RustSearchOptions, VectorManifest, VectorSearchResult,
+  IvfPqConfig as RustIvfPqConfig, IvfPqIndex as RustIvfPqIndex,
+  IvfPqSearchOptions as RustIvfPqSearchOptions, MultiQueryAggregation, PqConfig as RustPqConfig,
+  SearchOptions as RustSearchOptions, VectorManifest, VectorSearchResult,
 };
 
 // ============================================================================
@@ -135,24 +138,35 @@ pub struct PyIvfConfig {
   /// Distance metric ("cosine", "euclidean", "dot_product")
   #[pyo3(get, set)]
   pub metric: Option<String>,
+  /// Training seed, 0 to 2**64 - 1 (default: a fresh seed per training).
+  /// With a seed, training the same vectors in the same order builds the
+  /// same index on any machine.
+  #[pyo3(get, set)]
+  pub seed: Option<u64>,
 }
 
 #[pymethods]
 impl PyIvfConfig {
   #[new]
-  #[pyo3(signature = (n_clusters=None, n_probe=None, metric=None))]
-  fn new(n_clusters: Option<i32>, n_probe: Option<i32>, metric: Option<String>) -> Self {
+  #[pyo3(signature = (n_clusters=None, n_probe=None, metric=None, seed=None))]
+  fn new(
+    n_clusters: Option<i32>,
+    n_probe: Option<i32>,
+    metric: Option<String>,
+    seed: Option<u64>,
+  ) -> Self {
     Self {
       n_clusters,
       n_probe,
       metric,
+      seed,
     }
   }
 
   fn __repr__(&self) -> String {
     format!(
-      "IvfConfig(n_clusters={:?}, n_probe={:?}, metric={:?})",
-      self.n_clusters, self.n_probe, self.metric
+      "IvfConfig(n_clusters={:?}, n_probe={:?}, metric={:?}, seed={:?})",
+      self.n_clusters, self.n_probe, self.metric, self.seed
     )
   }
 }
@@ -169,6 +183,7 @@ impl PyIvfConfig {
       config.n_probe =
         validation::positive_usize("n_probe", n as i64, validation::MAX_VECTOR_PARAM)?;
     }
+    config.seed = c.seed;
     if let Some(m) = c.metric {
       config.metric = PyDistanceMetricEnum::parse(&m)?.into();
     }
@@ -253,26 +268,61 @@ pub struct PySearchOptions {
   /// Minimum similarity threshold (0-1)
   #[pyo3(get, set)]
   pub threshold: Option<f64>,
+  /// IVF-PQ only: re-rank the best `max(k * rerank_factor, 80)` PQ
+  /// candidates by exact distance (default 4; 0 returns the approximate PQ
+  /// ranking and distances). IVF search is exact and ignores it.
+  #[pyo3(get, set)]
+  pub rerank_factor: Option<i32>,
+}
+
+/// Validated `PySearchOptions`.
+struct SearchParams {
+  n_probe: Option<usize>,
+  threshold: Option<f32>,
+  rerank_factor: Option<usize>,
+}
+
+impl SearchParams {
+  fn ivf(self) -> RustSearchOptions {
+    RustSearchOptions {
+      n_probe: self.n_probe,
+      filter: None,
+      threshold: self.threshold,
+    }
+  }
+
+  fn ivf_pq(self) -> RustIvfPqSearchOptions {
+    RustIvfPqSearchOptions {
+      n_probe: self.n_probe,
+      filter: None,
+      threshold: self.threshold,
+      rerank_factor: self.rerank_factor,
+    }
+  }
 }
 
 #[pymethods]
 impl PySearchOptions {
   #[new]
-  #[pyo3(signature = (n_probe=None, threshold=None))]
-  fn new(n_probe: Option<i32>, threshold: Option<f64>) -> Self {
-    Self { n_probe, threshold }
+  #[pyo3(signature = (n_probe=None, threshold=None, rerank_factor=None))]
+  fn new(n_probe: Option<i32>, threshold: Option<f64>, rerank_factor: Option<i32>) -> Self {
+    Self {
+      n_probe,
+      threshold,
+      rerank_factor,
+    }
   }
 
   fn __repr__(&self) -> String {
     format!(
-      "SearchOptions(n_probe={:?}, threshold={:?})",
-      self.n_probe, self.threshold
+      "SearchOptions(n_probe={:?}, threshold={:?}, rerank_factor={:?})",
+      self.n_probe, self.threshold, self.rerank_factor
     )
   }
 }
 
 impl PySearchOptions {
-  fn validated(&self) -> PyResult<(Option<usize>, Option<f32>)> {
+  fn validated(&self) -> PyResult<SearchParams> {
     let n_probe = self
       .n_probe
       .map(|n| validation::positive_usize("n_probe", n as i64, validation::MAX_VECTOR_PARAM))
@@ -281,7 +331,17 @@ impl PySearchOptions {
       .threshold
       .map(|value| validation::ratio("threshold", value).map(|value| value as f32))
       .transpose()?;
-    Ok((n_probe, threshold))
+    let rerank_factor = self
+      .rerank_factor
+      .map(|factor| {
+        validation::non_negative_usize("rerank_factor", factor as i64, validation::MAX_VECTOR_PARAM)
+      })
+      .transpose()?;
+    Ok(SearchParams {
+      n_probe,
+      threshold,
+      rerank_factor,
+    })
   }
 }
 
@@ -481,11 +541,7 @@ impl PyIvfIndex {
       .as_ref()
       .map(PySearchOptions::validated)
       .transpose()?
-      .map(|(n_probe, threshold)| RustSearchOptions {
-        n_probe,
-        filter: None,
-        threshold,
-      });
+      .map(SearchParams::ivf);
 
     let k = validation::non_negative_usize("k", k as i64, validation::MAX_COUNT)?;
     let results = index
@@ -523,11 +579,7 @@ impl PyIvfIndex {
       .as_ref()
       .map(PySearchOptions::validated)
       .transpose()?
-      .map(|(n_probe, threshold)| RustSearchOptions {
-        n_probe,
-        filter: None,
-        threshold,
-      });
+      .map(SearchParams::ivf);
 
     let k = validation::non_negative_usize("k", k as i64, validation::MAX_COUNT)?;
     let results = index
@@ -705,13 +757,7 @@ impl PyIvfPqIndex {
       .as_ref()
       .map(PySearchOptions::validated)
       .transpose()?
-      .map(
-        |(n_probe, threshold)| crate::vector::ivf_pq::IvfPqSearchOptions {
-          n_probe,
-          filter: None,
-          threshold,
-        },
-      );
+      .map(SearchParams::ivf_pq);
 
     let k = validation::non_negative_usize("k", k as i64, validation::MAX_COUNT)?;
     let results = index
@@ -749,13 +795,7 @@ impl PyIvfPqIndex {
       .as_ref()
       .map(PySearchOptions::validated)
       .transpose()?
-      .map(
-        |(n_probe, threshold)| crate::vector::ivf_pq::IvfPqSearchOptions {
-          n_probe,
-          filter: None,
-          threshold,
-        },
-      );
+      .map(SearchParams::ivf_pq);
 
     let k = validation::non_negative_usize("k", k as i64, validation::MAX_COUNT)?;
     let results = index
@@ -849,6 +889,32 @@ fn prepare_brute_force_vector(vector: &[f64], cosine: bool) -> Option<Vec<f32>> 
   Some(v)
 }
 
+/// The backend `algorithm` ("auto", "ivf" or "ivf_pq") builds for a vector
+/// index of `dimensions` with `live_vectors` live vectors: "ivf" or "ivf_pq".
+/// "auto" picks IVF-PQ from 512 dimensions and 50,000 vectors on, plain IVF
+/// otherwise (the Rust `AnnAlgorithm::resolve` rule).
+#[pyfunction]
+pub fn resolve_ann_algorithm(
+  algorithm: &str,
+  dimensions: usize,
+  live_vectors: usize,
+) -> PyResult<&'static str> {
+  let algorithm = match algorithm.to_ascii_lowercase().as_str() {
+    "auto" => RustAnnAlgorithm::Auto,
+    "ivf" => RustAnnAlgorithm::Ivf,
+    "ivf_pq" => RustAnnAlgorithm::IvfPq,
+    other => {
+      return Err(PyValueError::new_err(format!(
+        "unknown ANN algorithm {other:?}; expected one of: auto, ivf, ivf_pq"
+      )))
+    }
+  };
+  Ok(match algorithm.resolve(dimensions, live_vectors) {
+    RustAnnAlgorithm::IvfPq => "ivf_pq",
+    _ => "ivf",
+  })
+}
+
 /// Perform brute-force search over all vectors
 #[pyfunction]
 #[pyo3(signature = (vectors, node_ids, query, k, metric=None))]
@@ -888,23 +954,18 @@ pub fn brute_force_search(
   let query_f32 =
     prepare_brute_force_vector(&query, cosine).ok_or_else(|| zero_norm("query".to_string()))?;
 
-  let mut results: Vec<(i64, f32)> = vectors
-    .iter()
-    .zip(node_ids.iter())
-    .enumerate()
-    .map(|(i, (v, &node_id))| {
-      let v_f32 =
-        prepare_brute_force_vector(v, cosine).ok_or_else(|| zero_norm(format!("vectors[{i}]")))?;
-      Ok((node_id, distance_fn(&query_f32, &v_f32)))
-    })
-    .collect::<PyResult<_>>()?;
-
-  // Sort by distance
-  results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-  results.truncate(k);
+  // Bounded top-k in a total order; NaN distances (from NaN components)
+  // never enter it.
+  let mut top = TopK::new(k);
+  for (i, (v, &node_id)) in vectors.iter().zip(node_ids.iter()).enumerate() {
+    let v_f32 =
+      prepare_brute_force_vector(v, cosine).ok_or_else(|| zero_norm(format!("vectors[{i}]")))?;
+    top.push(node_id, distance_fn(&query_f32, &v_f32));
+  }
 
   Ok(
-    results
+    top
+      .into_sorted_vec()
       .into_iter()
       .map(|(node_id, distance)| PyBruteForceResult {
         node_id,
@@ -925,14 +986,23 @@ mod tests {
       n_clusters: Some(1),
       n_probe: Some(1),
       metric: None,
+      seed: None,
     }
     .into_rust()
     .is_ok());
+    assert_eq!(
+      PyIvfConfig::new(None, None, None, Some(u64::MAX))
+        .into_rust()
+        .expect("valid seed")
+        .seed,
+      Some(u64::MAX)
+    );
     for value in [0, -1, (validation::MAX_VECTOR_PARAM + 1) as i32] {
       assert!(PyIvfConfig {
         n_clusters: Some(value),
         n_probe: None,
         metric: None,
+        seed: None,
       }
       .into_rust()
       .is_err());
@@ -954,21 +1024,33 @@ mod tests {
     assert!(PySearchOptions {
       n_probe: Some(1),
       threshold: Some(0.0),
+      rerank_factor: Some(0),
     }
     .validated()
     .is_ok());
     assert!(PySearchOptions {
       n_probe: Some(0),
       threshold: None,
+      rerank_factor: None,
     }
     .validated()
     .is_err());
     assert!(PySearchOptions {
       n_probe: None,
       threshold: Some(2.0),
+      rerank_factor: None,
     }
     .validated()
     .is_err());
+    for factor in [-1, (validation::MAX_VECTOR_PARAM + 1) as i32] {
+      assert!(PySearchOptions::new(None, None, Some(factor))
+        .validated()
+        .is_err());
+    }
+    let params = PySearchOptions::new(None, None, Some(3))
+      .validated()
+      .expect("valid options");
+    assert_eq!(params.ivf_pq().rerank_factor, Some(3));
   }
 
   #[test]
