@@ -17,7 +17,8 @@ use crate::core::header::{
   other_header_slot, read_header_slots, write_header_slot, HEADER_SLOT_A, HEADER_SLOT_B,
 };
 use crate::core::pager::{
-  create_pager_with_locking, is_valid_page_size, open_pager_with_locking, pages_to_store, FilePager,
+  create_pager_with_locking, is_valid_page_size, open_pager_with_locking, pages_to_store,
+  sync_parent_dir, FilePager, NewPager,
 };
 use crate::core::snapshot::reader::SnapshotData;
 use crate::core::wal::buffer::WalBuffer;
@@ -980,8 +981,12 @@ fn open_single_file_internal(
 
     (pager, header, false, header_slot)
   } else {
-    // Create new database
-    let mut pager = create_pager_with_locking(path, options.page_size, lock_file)?;
+    // Create new database. If another opener created one here since the
+    // existence check above, open that one instead.
+    let mut pager = match create_pager_with_locking(path, options.page_size, lock_file)? {
+      NewPager::Created(pager) => pager,
+      NewPager::Exists => return open_single_file_internal(path, options, lock_file),
+    };
     pager.set_full_fsync(options.full_fsync && options.sync_mode == SyncMode::Full);
 
     // Calculate WAL page count
@@ -1476,10 +1481,9 @@ fn migrate_legacy_single_header(
     // WAL, and a complete snapshot; the second directory sync persists the
     // replacement name.
     std::fs::File::open(&temp_path)?.sync_all()?;
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::File::open(parent)?.sync_all()?;
+    sync_parent_dir(path)?;
     std::fs::rename(&temp_path, path)?;
-    std::fs::File::open(parent)?.sync_all()?;
+    sync_parent_dir(path)?;
     Ok(())
   })();
 

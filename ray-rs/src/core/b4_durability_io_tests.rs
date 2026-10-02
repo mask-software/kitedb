@@ -237,6 +237,24 @@ fn f3_create_never_truncates_a_database_created_since_the_exists_check() {
   );
 }
 
+/// `create_pager` claims an empty file, and refuses one that holds data
+/// rather than truncate it.
+#[test]
+fn f3_create_pager_never_truncates_a_file_that_holds_data() {
+  let dir = tempdir().expect("tempdir");
+  let empty = dir.path().join("empty.kitedb");
+  std::fs::write(&empty, b"").expect("empty file");
+  create_pager(&empty, PAGE_SIZE).expect("claim an empty file");
+
+  let full = dir.path().join("full.kitedb");
+  std::fs::write(&full, b"data").expect("file with data");
+  assert!(matches!(
+    create_pager(&full, PAGE_SIZE),
+    Err(KiteError::CreateFailed(_))
+  ));
+  assert_eq!(std::fs::read(&full).expect("read"), b"data");
+}
+
 /// Until its directory is fsynced, a new file can vanish on power loss.
 #[cfg(unix)]
 #[test]

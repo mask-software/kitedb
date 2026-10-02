@@ -754,16 +754,35 @@ pub(crate) fn open_pager_with_locking<P: AsRef<Path>>(
   )))
 }
 
-/// Create a new pager for a new file
+/// Create a pager for a new database file, or claim an empty existing file.
+/// Fails rather than truncate a file that already holds data.
 pub fn create_pager<P: AsRef<Path>>(file_path: P, page_size: usize) -> Result<FilePager> {
-  create_pager_with_locking(file_path, page_size, true)
+  let file_path = file_path.as_ref();
+  match create_pager_with_locking(file_path, page_size, true)? {
+    NewPager::Created(pager) => Ok(pager),
+    NewPager::Exists => Err(KiteError::CreateFailed(format!(
+      "{} already exists and is not empty",
+      file_path.display()
+    ))),
+  }
 }
 
+/// What [`create_pager_with_locking`] found once it held the file lock.
+pub(crate) enum NewPager {
+  /// The file is new (or was empty): a pager for a database to initialize.
+  Created(FilePager),
+  /// The file holds data: something created a database there after the
+  /// caller found no file. Open it instead.
+  Exists,
+}
+
+/// Create (or claim an empty) database file and lock it. The directory
+/// entry is synced, so the new file survives power loss.
 pub(crate) fn create_pager_with_locking<P: AsRef<Path>>(
   file_path: P,
   page_size: usize,
   lock_file: bool,
-) -> Result<FilePager> {
+) -> Result<NewPager> {
   let file_path = file_path.as_ref();
   io_hooks::before_create_lock(file_path);
   let attempts = if lock_file {
@@ -797,8 +816,14 @@ pub(crate) fn create_pager_with_locking<P: AsRef<Path>>(
       }
       continue;
     }
-    file.set_len(0)?;
-    return Ok(FilePager {
+    // The caller found no file before this took the lock. Another opener
+    // may have created a database here since, and closed it: truncating it
+    // would destroy it.
+    if file.metadata()?.len() > 0 {
+      return Ok(NewPager::Exists);
+    }
+    sync_parent_dir(file_path)?;
+    return Ok(NewPager::Created(FilePager {
       file,
       file_lock,
       file_path: file_path.to_path_buf(),
@@ -809,12 +834,30 @@ pub(crate) fn create_pager_with_locking<P: AsRef<Path>>(
       deferred_free_pages: HashSet::new(),
       mmap: None,
       full_fsync: false,
-    });
+    }));
   }
   Err(KiteError::LockFailed(format!(
     "database path changed while acquiring its lock after {attempts} attempts: {}",
     file_path.display()
   )))
+}
+
+/// Make the directory entry of `path` durable: until its directory is
+/// synced, a newly created or renamed file can vanish on power loss. A no-op
+/// where directories cannot be synced (Windows).
+pub(crate) fn sync_parent_dir(path: &Path) -> Result<()> {
+  let parent = path
+    .parent()
+    .filter(|parent| !parent.as_os_str().is_empty())
+    .unwrap_or_else(|| Path::new("."));
+  #[cfg(unix)]
+  {
+    File::open(parent)?.sync_all()?;
+    io_hooks::dir_synced(parent);
+  }
+  #[cfg(not(unix))]
+  let _ = parent;
+  Ok(())
 }
 
 /// Validate that a page size is valid (power of 2, within bounds)

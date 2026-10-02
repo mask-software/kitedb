@@ -66,6 +66,15 @@ pub(super) fn before_create_lock(path: &Path) {
   let _ = path;
 }
 
+/// Note that directory `dir` was synced.
+#[cfg(unix)]
+#[inline]
+pub(super) fn dir_synced(dir: &Path) {
+  #[cfg(test)]
+  DIR_SYNCS.with(|synced| synced.borrow_mut().push(dir.to_path_buf()));
+  let _ = dir;
+}
+
 /// Run `run`, returning its result and the page I/O system calls it made on
 /// this thread.
 #[cfg(test)]
