@@ -1040,10 +1040,12 @@ pub struct KiteOptions {
   pub create_if_missing: bool,
   /// Synchronization mode for WAL writes (default: Full)
   pub sync_mode: SyncMode,
-  /// Enable group commit (sync mode Normal only): commits that arrive while
-  /// others are written are written together, with one WAL flush
+  /// Has no effect, kept for compatibility: every commit is group-committed
+  /// (commits that arrive while others are written are written together, in
+  /// every sync mode)
   pub group_commit_enabled: bool,
-  /// Unused, kept for compatibility: group commit no longer waits for a window
+  /// Has no effect, kept for compatibility: no commit waits for others to
+  /// join its group
   pub group_commit_window_ms: u64,
   /// MVCC: snapshot-isolated transactions and conflict detection between
   /// concurrent write transactions (default: true). It is runtime state
@@ -1147,13 +1149,13 @@ impl KiteOptions {
     self
   }
 
-  /// Enable or disable group commit (see the `group_commit_enabled` field)
+  /// Has no effect (see the `group_commit_enabled` field)
   pub fn group_commit_enabled(mut self, value: bool) -> Self {
     self.group_commit_enabled = value;
     self
   }
 
-  /// Unused, kept for compatibility (see the `group_commit_window_ms` field)
+  /// Has no effect (see the `group_commit_window_ms` field)
   pub fn group_commit_window_ms(mut self, value: u64) -> Self {
     self.group_commit_window_ms = value;
     self
@@ -1276,7 +1278,6 @@ impl KiteOptions {
   pub fn recommended_safe() -> Self {
     Self::new()
       .sync_mode(SyncMode::Full)
-      .group_commit_enabled(false)
       .checkpoint_threshold(0.5)
   }
 
@@ -1284,8 +1285,6 @@ impl KiteOptions {
   pub fn recommended_balanced() -> Self {
     Self::new()
       .sync_mode(SyncMode::Normal)
-      .group_commit_enabled(true)
-      .group_commit_window_ms(2)
       .wal_size_mb(64)
       .checkpoint_threshold(0.5)
   }
@@ -1296,8 +1295,6 @@ impl KiteOptions {
   pub fn recommended_reopen_heavy() -> Self {
     Self::new()
       .sync_mode(SyncMode::Normal)
-      .group_commit_enabled(true)
-      .group_commit_window_ms(2)
       .wal_size_mb(16)
       .checkpoint_threshold(0.2)
   }
@@ -4020,20 +4017,16 @@ mod tests {
   fn test_recommended_kite_options_profiles() {
     let safe = KiteOptions::recommended_safe();
     assert_eq!(safe.sync_mode, SyncMode::Full);
-    assert!(!safe.group_commit_enabled);
     assert_eq!(safe.close_checkpoint_if_wal_usage_at_least, Some(0.2));
 
     let balanced = KiteOptions::recommended_balanced();
     assert_eq!(balanced.sync_mode, SyncMode::Normal);
-    assert!(balanced.group_commit_enabled);
-    assert_eq!(balanced.group_commit_window_ms, 2);
     assert_eq!(balanced.wal_size, Some(64 * 1024 * 1024));
     assert_eq!(balanced.checkpoint_threshold, Some(0.5));
     assert_eq!(balanced.close_checkpoint_if_wal_usage_at_least, Some(0.2));
 
     let reopen = KiteOptions::recommended_reopen_heavy();
     assert_eq!(reopen.sync_mode, SyncMode::Normal);
-    assert!(reopen.group_commit_enabled);
     assert_eq!(reopen.wal_size, Some(16 * 1024 * 1024));
     assert_eq!(reopen.checkpoint_threshold, Some(0.2));
     assert_eq!(reopen.close_checkpoint_if_wal_usage_at_least, Some(0.2));

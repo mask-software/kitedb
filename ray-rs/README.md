@@ -182,8 +182,9 @@ const reader = await kite('./social.kitedb', { nodes: [User], edges: [Knows], re
   work on other threads (such as `importFromJsonAsync()`). A conflicting commit throws an
   `Error` whose message reads `Failed to commit: Transaction <id> conflict on keys: [...]`;
   nothing was applied, so run the transaction again.
-- Commits are applied one at a time; a commit briefly blocks new reads while it publishes
-  its changes.
+- Commits that arrive together are written as one group (one WAL write, one header write,
+  and in `Full` sync mode one fsync), and each is applied whole, in order; publishing a group
+  briefly blocks new reads.
 - `beginBulk()` and `bulkWrite()` work with MVCC on: a bulk load runs alone among writers
   (it waits for open write transactions, and new ones wait for it), and readers never wait
   for it.

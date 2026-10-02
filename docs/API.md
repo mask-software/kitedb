@@ -56,9 +56,10 @@ Kite is organized into several key layers:
 Recommended profile for high write throughput:
 
 - `sync_mode = Normal`
-- `group_commit_enabled = true` when several threads commit at once: commits that arrive while
-  a batch is written are written together as the next batch, with one WAL flush (no commit
-  waits for a window; `group_commit_window_ms` is unused)
+- Commit from several threads: commits that arrive while others are written are written
+  together, in any sync mode, with one WAL write, one header write and (in `Full` mode) one
+  fsync for the group. This is always on; `group_commit_enabled` and
+  `group_commit_window_ms` have no effect, and no commit waits for others to join
 - Optional: increase `wal_size` (e.g., 64MB) for heavy ingest to reduce checkpoints
 
 Durability note: `Normal` mode does not `fsync` on every commit. An OS crash can

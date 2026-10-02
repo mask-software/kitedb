@@ -179,11 +179,13 @@ pub struct OpenOptions {
   /// default.
   #[pyo3(get, set)]
   pub full_fsync: Option<bool>,
-  /// Enable group commit (sync mode Normal only): commits that arrive while
-  /// others are written are written together, with one WAL flush
+  /// Has no effect, kept for compatibility: every commit is group-committed
+  /// (commits that arrive while others are written are written together, in
+  /// every sync mode)
   #[pyo3(get, set)]
   pub group_commit_enabled: Option<bool>,
-  /// Unused, kept for compatibility: group commit no longer waits for a window
+  /// Has no effect, kept for compatibility: no commit waits for others to
+  /// join its group
   #[pyo3(get, set)]
   pub group_commit_window_ms: Option<i64>,
   /// Snapshot parse mode: "strict" or "salvage" (single-file only)

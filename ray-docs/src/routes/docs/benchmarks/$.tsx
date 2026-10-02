@@ -251,8 +251,9 @@ function OverviewPage() {
 				Group commit was off for the graph runs. When they were made, a commit
 				in sync=normal mode with group commit on could wait up to the
 				group-commit window (2 ms by default), so a single-threaded batch write
-				took milliseconds instead of microseconds. Group commit no longer waits
-				for a window. The{" "}
+				took milliseconds instead of microseconds. Since then every commit is
+				group-committed, no commit waits for others, and the option has no
+				effect. The{" "}
 				<a href="/docs/benchmarks/graph#sync-mode-group-commit">
 					graph benchmarks
 				</a>{" "}
@@ -402,19 +403,23 @@ function GraphPage() {
 				config="10k nodes, 50k edges, 3 edge types, 10 edge props; one log per cell"
 			/>
 			<p>
-				Group commit only applies in <code>normal</code> mode and is ignored in{" "}
-				<code>full</code> and <code>off</code>, which is why those rows barely
-				change. In <code>normal</code> mode a single writer waited up to the
-				group-commit window on each commit in these runs, so batch writes went
-				from microseconds to milliseconds; group commit no longer waits for a
-				window. Group commit pays off with concurrent writers, shown below.
+				When these runs were made, group commit was an option that applied
+				only in <code>normal</code> mode (ignored in <code>full</code> and{" "}
+				<code>off</code>, which is why those rows barely change), and a single
+				writer waited up to the group-commit window on each commit, so batch
+				writes went from microseconds to milliseconds. Now every commit is
+				group-committed in every mode, and no commit waits for others: a single
+				writer pays nothing, and concurrent writers share WAL writes, headers
+				and (in <code>full</code> mode) fsyncs.
 			</p>
 
 			<h2 id="parallel-write-scaling">Parallel writes</h2>
 			<p>
-				Commits serialize WAL ordering and delta application behind{" "}
-				<code>commit_lock</code> (
-				<code>ray-rs/src/core/single_file/mod.rs</code>
+				Commits that arrive together are written as one group (one WAL write,
+				one header write, one fsync in <code>full</code> mode), and the next
+				group is written while one publishes. Publishing (each commit's merge
+				into the in-memory delta) still runs one group at a time (
+				<code>ray-rs/src/core/single_file/transaction.rs</code>
 				), so write throughput doesn't scale linearly with writer threads. For
 				the highest ingest rate, prepare batches in parallel and send them
 				through one writer using batched transactions.
@@ -448,8 +453,9 @@ function GraphPage() {
 				config={MULTI_WRITER_CONFIG}
 			/>
 			<p>
-				With eight concurrent writers, group commit raises throughput, the
-				opposite of its effect on a single writer.
+				With eight concurrent writers, the group-commit option (since replaced
+				by group commit for every commit) raised throughput, the opposite of
+				its effect on a single writer at the time.
 			</p>
 			<p>
 				These runs used concurrent write transactions without MVCC, which
@@ -517,16 +523,17 @@ function GraphPage() {
 				</li>
 				<li>
 					<code>--group-commit-enabled</code> and{" "}
-					<code>--group-commit-window-ms N</code> (default 2; accepted, but it
-					has no effect now that group commit no longer waits for a window)
+					<code>--group-commit-window-ms N</code> (accepted, but they have no
+					effect now that every commit is group-committed)
 				</li>
 			</ul>
 			<p>
 				The Rust and Python commands above match the 2026-02-04 logs (256 MB
 				WAL, auto-checkpoint off). Without <code>--wal-size</code> and{" "}
 				<code>--no-auto-checkpoint</code> the scripts use a 64 MB WAL with
-				auto-checkpoint on. Add <code>--group-commit-enabled</code> or change{" "}
-				<code>--sync-mode</code> to reproduce the other sweep files.
+				auto-checkpoint on. Change <code>--sync-mode</code> to reproduce the
+				other sweep files (the <code>-gc</code> files used{" "}
+				<code>--group-commit-enabled</code>, which no longer has an effect).
 			</p>
 		</DocPage>
 	);

@@ -296,7 +296,8 @@ Provides:
 
 **MVCC (default since 0.3.0):**
 - Each thread runs its own transaction; write transactions on different threads run
-  concurrently, and only their commits are applied one at a time
+  concurrently, and commits that arrive together are written as one group (one WAL write,
+  one header, one fsync in `Full` mode), each still applied whole and in order
 - A transaction reads the state as of its `begin` plus its own writes; reads outside a
   transaction see the latest committed state
 - A commit that overlaps a write committed since its transaction began fails with a

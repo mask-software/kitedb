@@ -82,10 +82,12 @@ pub struct JsKiteOptions {
   pub mvcc_max_chain_depth: Option<i64>,
   /// Sync mode: "Full", "Normal", or "Off" (default: "Full")
   pub sync_mode: Option<JsSyncMode>,
-  /// Enable group commit (sync mode Normal only): commits that arrive while
-  /// others are written are written together, with one WAL flush
+  /// Has no effect, kept for compatibility: every commit is group-committed
+  /// (commits that arrive while others are written are written together, in
+  /// every sync mode)
   pub group_commit_enabled: Option<bool>,
-  /// Unused, kept for compatibility: group commit no longer waits for a window
+  /// Has no effect, kept for compatibility: no commit waits for others to
+  /// join its group
   pub group_commit_window_ms: Option<i64>,
   /// WAL size in megabytes (must be positive), fixed when the file is created.
   /// Unset: a new file gets a 4MB WAL and an existing file keeps its own.

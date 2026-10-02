@@ -169,8 +169,9 @@ async def read_users():
 - **Reads don't wait for writers**: `get_node_by_key()`, `get_out_edges()`, traversals, etc. don't wait for
   other threads' open transactions, but they hold the GIL while they run, so they don't run in parallel
 - **Writes are concurrent too** (MVCC, on by default): each thread's `begin()` opens its own
-  transaction, and write transactions on different threads run at the same time (their
-  commits are applied one at a time). A transaction reads the state as of its `begin()`
+  transaction, and write transactions on different threads run at the same time (commits
+  that arrive together are written as one group, each applied whole and in order). A
+  transaction reads the state as of its `begin()`
   plus its own writes; reads outside a transaction see the latest committed state. A commit
   that overlaps a write committed since its transaction began raises `ConflictError` (see
   [Errors](#errors)); retry it

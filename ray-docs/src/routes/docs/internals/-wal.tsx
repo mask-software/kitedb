@@ -363,8 +363,10 @@ function DurabilityModes() {
 			</div>
 			<p class="mt-4 border-t border-kite-line pt-3 text-[13px] text-slate-400">
 				For most applications, <Code>Full</Code> is the right choice. Use{" "}
-				<Code>Normal</Code> (with group commit) when you need more write
-				throughput and can accept losing recent commits on an OS crash.
+				<Code>Normal</Code> when you need more write throughput and can accept
+				losing recent commits on an OS crash. In either mode, commits that
+				arrive together share one WAL write and one header write (and, in{" "}
+				<Code>Full</Code>, one fsync).
 			</p>
 		</Figure>
 	);
@@ -539,9 +541,11 @@ export function WALPage() {
 					<code>syncMode = Normal</code>
 				</li>
 				<li>
-					<code>groupCommitEnabled = true</code> when several threads commit at
-					once: commits that arrive while a batch is written are written
-					together, with one WAL flush (no commit waits for a window)
+					Commit from several threads: commits that arrive while others are
+					written are written together, with one WAL write, one header write
+					and (in <code>Full</code> mode) one fsync. This is always on;{" "}
+					<code>groupCommitEnabled</code> has no effect, and no commit waits for
+					others to join
 				</li>
 				<li>
 					<code>beginBulk()</code> + batch APIs for ingest (with or without

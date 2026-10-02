@@ -129,12 +129,13 @@ pub struct SingleFileOpenOptions {
   /// macOS only: with `SyncMode::Full`, sync with `F_FULLFSYNC` so commits
   /// survive power loss (default false). See [`Self::full_fsync`].
   pub full_fsync: bool,
-  /// Enable group commit (`SyncMode::Normal` only): commits that arrive while
-  /// others are written are written together, with one WAL flush and one
-  /// header write
+  /// Has no effect, kept for compatibility: every commit is group-committed.
+  /// Commits that arrive while others are written are written together, in
+  /// every sync mode: one WAL write, one fsync in `SyncMode::Full`, and one
+  /// header write for the group. A single writer pays nothing for it.
   pub group_commit_enabled: bool,
-  /// Unused, kept for compatibility: group commit no longer waits for more
-  /// commits; those arriving while a batch is written form the next one
+  /// Has no effect, kept for compatibility: no commit waits for others to
+  /// join its group; those arriving while a group is written form the next
   pub group_commit_window_ms: u64,
   /// Snapshot parse behavior (default: Strict)
   pub snapshot_parse_mode: SnapshotParseMode,
@@ -327,13 +328,13 @@ impl SingleFileOpenOptions {
     self
   }
 
-  /// Enable or disable group commit (see the `group_commit_enabled` field)
+  /// Has no effect (see the `group_commit_enabled` field)
   pub fn group_commit_enabled(mut self, value: bool) -> Self {
     self.group_commit_enabled = value;
     self
   }
 
-  /// Unused, kept for compatibility (see the `group_commit_window_ms` field)
+  /// Has no effect (see the `group_commit_window_ms` field)
   pub fn group_commit_window_ms(mut self, value: u64) -> Self {
     self.group_commit_window_ms = value;
     self

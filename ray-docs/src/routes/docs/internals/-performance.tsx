@@ -526,19 +526,20 @@ export function PerformancePage() {
 			<h3>Write durability vs. throughput</h3>
 			<ul>
 				<li>
-					<strong>Defaults:</strong> <code>syncMode=Full</code>,{" "}
-					<code>groupCommitEnabled=false</code>, an fsync on every commit.
+					<strong>Defaults:</strong> <code>syncMode=Full</code>: a commit
+					returns once it is fsynced; commits that arrive together share the
+					fsync.
 				</li>
 				<li>
 					<strong>Single writer, low latency:</strong>{" "}
-					<code>syncMode=Normal</code> + <code>groupCommitEnabled=false</code>.
+					<code>syncMode=Normal</code>.
 				</li>
 				<li>
 					<strong>Several writer threads:</strong> <code>syncMode=Normal</code>{" "}
-					+ <code>groupCommitEnabled=true</code>. With MVCC (the default),
-					writers build their transactions in parallel and only the commits are
-					applied one at a time. For one-shot ingest, a bulk load through one
-					writer is still fastest. See the{" "}
+					(or <code>Full</code>, whose fsyncs the commits share). With MVCC (the
+					default), writers build their transactions in parallel, and commits
+					that arrive together are written as one group. For one-shot ingest, a
+					bulk load through one writer is still fastest. See the{" "}
 					<a href="/docs/benchmarks#parallel-write-scaling">
 						parallel write scaling notes
 					</a>
@@ -550,12 +551,13 @@ export function PerformancePage() {
 				</li>
 			</ul>
 			<p>
-				Group commit writes the commits that arrive while a batch is being
-				written as the next batch, with one WAL flush and one header write; no
-				commit waits for a window (<code>groupCommitWindowMs</code> is unused).
-				It applies only with <code>syncMode=Normal</code> and not on a
-				replication primary, works with MVCC, and only helps when several
-				threads commit at once.
+				Every commit is group-committed: the commits that arrive while a group
+				is written form the next group, written with one WAL write, one header
+				write and, in <code>Full</code> mode, one fsync, then published in
+				order (each commit whole). No commit waits for others to join, so a
+				single writer pays nothing for it. This works in every sync mode, with
+				MVCC and on a replication primary; <code>groupCommitEnabled</code> and{" "}
+				<code>groupCommitWindowMs</code> have no effect.
 			</p>
 
 			<h4>Decision table</h4>
@@ -564,7 +566,6 @@ export function PerformancePage() {
 					<tr>
 						<th>Workload</th>
 						<th>syncMode</th>
-						<th>groupCommitEnabled</th>
 						<th>Why</th>
 					</tr>
 				</thead>
@@ -572,24 +573,20 @@ export function PerformancePage() {
 					<tr>
 						<td>Production, high durability</td>
 						<td>Full</td>
-						<td>Off</td>
-						<td>fsync per commit</td>
+						<td>A commit returns once fsynced; concurrent commits share it</td>
 					</tr>
 					<tr>
 						<td>Single-writer ingest</td>
 						<td>Normal</td>
-						<td>Off</td>
 						<td>Lowest latency per commit</td>
 					</tr>
 					<tr>
 						<td>Several writer threads</td>
 						<td>Normal</td>
-						<td>On</td>
-						<td>Batches concurrent commits</td>
+						<td>Concurrent commits share a WAL write and a header</td>
 					</tr>
 					<tr>
 						<td>Testing, throwaway data</td>
-						<td>Off</td>
 						<td>Off</td>
 						<td>Fastest, weakest durability</td>
 					</tr>
@@ -602,14 +599,13 @@ export function PerformancePage() {
 					<strong>Fastest ingest (single writer):</strong>{" "}
 					<code>beginBulk()</code> + <code>createNodesBatch()</code> +{" "}
 					<code>addEdgesBatch()</code> / <code>addEdgesWithPropsBatch()</code>,{" "}
-					<code>syncMode=Normal</code>, <code>groupCommitEnabled=false</code>, a
-					WAL of 256 MB or more, auto-checkpoint off during ingest, then a
-					checkpoint.
+					<code>syncMode=Normal</code>, a WAL of 256 MB or more,
+					auto-checkpoint off during ingest, then a checkpoint.
 				</li>
 				<li>
-					<strong>Several writer threads:</strong> <code>syncMode=Normal</code>,{" "}
-					<code>groupCommitEnabled=true</code>, several operations per
-					transaction, and a retry for commits that fail with a conflict.
+					<strong>Several writer threads:</strong> <code>syncMode=Normal</code>,
+					several operations per transaction, and a retry for commits that fail
+					with a conflict.
 				</li>
 				<li>
 					<strong>Read-heavy, mixed workload:</strong> keep write batches small,

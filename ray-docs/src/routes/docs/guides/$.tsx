@@ -981,8 +981,9 @@ db.commit()`}
 						<tr>
 							<td>Several writer threads</td>
 							<td>
-								A transaction per thread, <code>syncMode: 'Normal'</code> +
-								group commit; retry commits that fail with a conflict
+								A transaction per thread, <code>syncMode: 'Normal'</code>;
+								concurrent commits are written together. Retry commits that
+								fail with a conflict
 							</td>
 						</tr>
 					</tbody>
@@ -1166,8 +1167,8 @@ if db.has_transaction():
 						<tr>
 							<td>Several writer threads</td>
 							<td>
-								<code>syncMode: 'Normal'</code> + group commit; retry
-								conflicting commits
+								<code>syncMode: 'Normal'</code> (concurrent commits are written
+								together); retry conflicting commits
 							</td>
 						</tr>
 						<tr>
@@ -1236,16 +1237,14 @@ db.commit()`}
 						<tr>
 							<td>Single-writer ingest</td>
 							<td>
-								<code>syncMode: 'Normal'</code>,{" "}
-								<code>groupCommitEnabled: false</code>, WAL ≥ 256MB,{" "}
+								<code>syncMode: 'Normal'</code>, WAL ≥ 256MB,{" "}
 								<code>autoCheckpoint: false</code>
 							</td>
 						</tr>
 						<tr>
 							<td>Several writer threads</td>
 							<td>
-								<code>syncMode: 'Normal'</code>,{" "}
-								<code>groupCommitEnabled: true</code>, chunked batches
+								<code>syncMode: 'Normal'</code>, chunked batches
 							</td>
 						</tr>
 						<tr>
@@ -1320,8 +1319,9 @@ db.commit()`}
 					</li>
 					<li>
 						<strong>Concurrent writers</strong> – Each thread runs its own
-						transaction. Write transactions run at the same time; only their
-						commits are applied one at a time
+						transaction. Write transactions run at the same time; commits that
+						arrive together are written as one group, each applied whole and in
+						order
 					</li>
 					<li>
 						<strong>Conflicts at commit</strong> – A commit fails with a
@@ -1431,14 +1431,15 @@ print(results)`}
 				<h2 id="performance">Performance notes</h2>
 				<p>
 					Read throughput typically improves with parallel readers. Writer
-					threads build their transactions in parallel and only the commits are
-					applied one at a time: in one measurement, 8 writer threads committed
-					about 5.3K transactions/s (200 nodes each), against 3.6K/s for a
-					single writer without MVCC. For several writer threads, use{" "}
-					<code>syncMode: 'Normal'</code> with group commit. For one-shot
-					ingest, a bulk load (<code>beginBulk()</code>) through one writer is
-					fastest. Measure with your workload and tune batch sizes and sync mode
-					accordingly.
+					threads build their transactions in parallel, and commits that arrive
+					together are written as one group: one WAL write, one header write
+					and, with <code>syncMode: 'Full'</code>, one fsync. See the{" "}
+					<a href="/docs/benchmarks#parallel-write-scaling">
+						parallel write scaling notes
+					</a>{" "}
+					for measurements. For one-shot ingest, a bulk load (
+					<code>beginBulk()</code>) through one writer is fastest. Measure with
+					your workload and tune batch sizes and sync mode accordingly.
 				</p>
 
 				<h2 id="best-practices">Best practices</h2>
