@@ -1007,15 +1007,33 @@ impl SingleFileDB {
       return;
     };
     let pending = &request.pending;
+    // A commit that creates no node needs no chains to plan (`HistoryPlan::of`).
+    let mut plan = request.history.take().or_else(|| {
+      pending
+        .created_nodes
+        .is_empty()
+        .then(|| HistoryPlan::of(pending, None))
+    });
+    // Lock order (see read.rs): the snapshot before the chains.
+    let take_snapshot = |hold: &mut PublishHistory<'a>| {
+      if hold.snapshot.is_none() {
+        hold.chains = None;
+        hold.snapshot = Some(self.snapshot.read());
+      }
+    };
+    if plan
+      .as_ref()
+      .is_some_and(|plan| plan.reads_committed_state(pending))
+    {
+      take_snapshot(hold);
+    }
     let chains = hold.chains.get_or_insert_with(|| mvcc.history_writer());
-    let plan = match request.history.take() {
+    let plan = match plan.take() {
       Some(plan) if plan.holds_for(chains.chains()) => plan,
       _ => HistoryPlan::of(pending, Some(chains.chains())),
     };
-    if plan.reads_committed_state(pending) && hold.snapshot.is_none() {
-      // Lock order (see read.rs): the snapshot before the chains.
-      hold.chains = None;
-      hold.snapshot = Some(self.snapshot.read());
+    if plan.reads_committed_state(pending) {
+      take_snapshot(hold);
     }
     let snapshot = hold
       .snapshot

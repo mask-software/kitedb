@@ -257,7 +257,7 @@ impl<V> NodeMap<V> {
   }
 
   /// Take every entry out, leaving this empty.
-  pub fn drain(&mut self) -> impl Iterator<Item = (NodeId, V)> + '_ {
+  pub fn drain(&mut self) -> NodeMapDrain<'_, V> {
     let chunks = self
       .dense
       .as_mut()
@@ -266,11 +266,11 @@ impl<V> NodeMap<V> {
         std::mem::take(&mut dense.chunks)
       })
       .unwrap_or_default();
-    let dense = chunks
-      .into_iter()
-      .flatten()
-      .flat_map(|chunk| chunk.slots.into_iter().flatten());
-    dense.chain(self.sparse.drain())
+    NodeMapDrain {
+      chunks: chunks.into_iter(),
+      chunk: None,
+      sparse: self.sparse.drain(),
+    }
   }
 
   pub fn clear(&mut self) {
@@ -345,6 +345,39 @@ impl<'a, V> NodeMapEntry<'a, V> {
     V: Default,
   {
     self.or_insert_with(V::default)
+  }
+}
+
+/// Draining iterator of a `NodeMap` (see `NodeMap::drain`). It takes a dense
+/// chunk's entries one slot at a time, in place.
+pub struct NodeMapDrain<'a, V> {
+  chunks: std::vec::IntoIter<Option<Box<NodeChunk<V>>>>,
+  /// The chunk being drained, and its next slot.
+  chunk: Option<(Box<NodeChunk<V>>, usize)>,
+  sparse: hashbrown::hash_map::Drain<'a, NodeId, V>,
+}
+
+impl<V> Iterator for NodeMapDrain<'_, V> {
+  type Item = (NodeId, V);
+
+  fn next(&mut self) -> Option<Self::Item> {
+    loop {
+      if let Some((chunk, next)) = &mut self.chunk {
+        while *next < CHUNK_IDS {
+          let slot = chunk.slots[*next].take();
+          *next += 1;
+          if slot.is_some() {
+            return slot;
+          }
+        }
+        self.chunk = None;
+      }
+      match self.chunks.next() {
+        Some(Some(chunk)) => self.chunk = Some((chunk, 0)),
+        Some(None) => {}
+        None => return self.sparse.next(),
+      }
+    }
   }
 }
 
@@ -1016,69 +1049,92 @@ impl DeltaState {
   /// way the transaction made them; both give the same result.
   pub(crate) fn merge_from(&mut self, pending: &mut DeltaState) {
     self.grow_tables_for(pending);
-    self.new_labels.extend(pending.new_labels.drain());
-    self.new_etypes.extend(pending.new_etypes.drain());
-    self.new_propkeys.extend(pending.new_propkeys.drain());
+    // Small transactions touch few of the tables: the rest are skipped.
+    if !(pending.new_labels.is_empty()
+      && pending.new_etypes.is_empty()
+      && pending.new_propkeys.is_empty())
+    {
+      self.new_labels.extend(pending.new_labels.drain());
+      self.new_etypes.extend(pending.new_etypes.drain());
+      self.new_propkeys.extend(pending.new_propkeys.drain());
+    }
 
     // A node the transaction deleted (and did not recreate) takes the props
     // of its edges with it, also those it wrote to its committed edges.
-    let removed: DeltaSet<NodeId> = pending
-      .deleted_nodes
-      .iter()
-      .copied()
-      .filter(|&node_id| pending.is_node_removed(node_id))
-      .collect();
-
-    // Deletes first: a node the transaction deleted and created again is a
-    // recreate, whose new copy replaces the committed one.
-    for node_id in pending.deleted_nodes.drain() {
-      self.delete_node(node_id);
+    let mut removed = DeltaSet::new();
+    if !pending.deleted_nodes.is_empty() {
+      removed.extend(
+        pending
+          .deleted_nodes
+          .iter()
+          .copied()
+          .filter(|&node_id| pending.is_node_removed(node_id)),
+      );
+      // Deletes first: a node the transaction deleted and created again is a
+      // recreate, whose new copy replaces the committed one.
+      for node_id in pending.deleted_nodes.drain() {
+        self.delete_node(node_id);
+      }
     }
 
     // A transaction's key index names exactly the keys of the nodes it
     // created (`create_node` adds one, `delete_node` takes it back), and is
     // copied last.
-    for (node_id, node_delta) in pending.created_nodes.drain() {
-      debug_assert!(node_delta
-        .key
-        .as_deref()
-        .is_none_or(|key| pending.key_index.get(key) == Some(&node_id)));
-      self.merge_created_node(node_id, node_delta);
+    if !pending.created_nodes.is_empty() {
+      for (node_id, node_delta) in pending.created_nodes.drain() {
+        debug_assert!(node_delta
+          .key
+          .as_deref()
+          .is_none_or(|key| pending.key_index.get(key) == Some(&node_id)));
+        self.merge_created_node(node_id, node_delta);
+      }
     }
-    for (node_id, node_delta) in pending.modified_nodes.drain() {
-      self.merge_modified_node(node_id, node_delta);
+    if !pending.modified_nodes.is_empty() {
+      for (node_id, node_delta) in pending.modified_nodes.drain() {
+        self.merge_modified_node(node_id, node_delta);
+      }
     }
 
     // Each direction merges from its own patches (a delta keeps them in
     // both): an add cancels a tombstone in its direction, as in `add_edge`.
-    for (src, patches) in pending.out_add.drain() {
-      merge_added_patches(&mut self.out_add, &mut self.out_del, src, patches);
+    if !pending.out_add.is_empty() {
+      for (src, patches) in pending.out_add.drain() {
+        merge_added_patches(&mut self.out_add, &mut self.out_del, src, patches);
+      }
     }
-    for (dst, patches) in pending.in_add.drain() {
-      merge_added_patches(&mut self.in_add, &mut self.in_del, dst, patches);
+    if !pending.in_add.is_empty() {
+      for (dst, patches) in pending.in_add.drain() {
+        merge_added_patches(&mut self.in_add, &mut self.in_del, dst, patches);
+      }
     }
     // `delete_edge` keeps both directions of a tombstone itself.
-    pending.in_del.clear();
-    for (src, patches) in pending.out_del.drain() {
-      for patch in patches {
-        self.delete_edge(src, patch.etype, patch.other);
-      }
-    }
-
-    for (edge, props) in pending.edge_props.drain() {
-      let (src, _, dst) = edge;
-      if props.is_empty() || removed.contains(&src) || removed.contains(&dst) {
-        continue;
-      }
-      match self.edge_props.entry(edge) {
-        Entry::Vacant(entry) => {
-          entry.insert(props);
+    if !pending.out_del.is_empty() {
+      pending.in_del.clear();
+      for (src, patches) in pending.out_del.drain() {
+        for patch in patches {
+          self.delete_edge(src, patch.etype, patch.other);
         }
-        Entry::Occupied(mut entry) => entry.get_mut().extend(props),
       }
     }
 
-    self.key_index.extend(pending.key_index.drain());
+    if !pending.edge_props.is_empty() {
+      for (edge, props) in pending.edge_props.drain() {
+        let (src, _, dst) = edge;
+        if props.is_empty() || removed.contains(&src) || removed.contains(&dst) {
+          continue;
+        }
+        match self.edge_props.entry(edge) {
+          Entry::Vacant(entry) => {
+            entry.insert(props);
+          }
+          Entry::Occupied(mut entry) => entry.get_mut().extend(props),
+        }
+      }
+    }
+
+    if !pending.key_index.is_empty() {
+      self.key_index.extend(pending.key_index.drain());
+    }
   }
 
   /// Make room for merging `pending` (see `merge_from`): grow each table the merge would
@@ -1088,38 +1144,50 @@ impl DeltaState {
   /// beside the created nodes and edge patches, whose dense parts never move), so they would
   /// fill up together and all grow in one merge: grown ahead, they grow one merge at a time.
   fn grow_tables_for(&mut self, pending: &DeltaState) {
-    let mut tables: [(&mut dyn Table, usize); 9] = [
-      (&mut self.created_nodes, pending.created_nodes.len()),
-      (&mut self.deleted_nodes, pending.deleted_nodes.len()),
-      (&mut self.modified_nodes, pending.modified_nodes.len()),
-      (&mut self.out_add, pending.out_add.len()),
-      (&mut self.out_del, pending.out_del.len()),
-      (&mut self.in_add, pending.in_add.len()),
-      (&mut self.in_del, pending.in_del.len()),
-      (&mut self.edge_props, pending.edge_props.len()),
-      (&mut self.key_index, pending.key_index.len()),
-    ];
-    let mut grown = false;
-    for (table, incoming) in &mut tables {
-      if table.len() + *incoming > table.capacity() {
-        table.reserve(*incoming);
-        grown = true;
-      }
+    // Each table by name, so the checks compile to straight-line code: small
+    // merges pay a few compares.
+    macro_rules! each_table {
+      ($check:ident) => {
+        $check!(created_nodes);
+        $check!(deleted_nodes);
+        $check!(modified_nodes);
+        $check!(out_add);
+        $check!(out_del);
+        $check!(in_add);
+        $check!(in_del);
+        $check!(edge_props);
+        $check!(key_index);
+      };
     }
+    let mut grown = false;
+    macro_rules! grow_if_overflowing {
+      ($table:ident) => {
+        let incoming = pending.$table.len();
+        if Table::len(&self.$table) + incoming > Table::capacity(&self.$table) {
+          Table::reserve(&mut self.$table, incoming);
+          grown = true;
+        }
+      };
+    }
+    each_table!(grow_if_overflowing);
     if grown {
       return;
     }
     let (numerator, denominator) = GROW_AHEAD_LOAD;
-    let ahead = tables.into_iter().find(|(table, incoming)| {
-      table.capacity() >= GROW_AHEAD_MIN_CAPACITY
-        && (table.len() + incoming).saturating_mul(denominator)
-          >= table.capacity().saturating_mul(numerator)
-    });
-    if let Some((table, _)) = ahead {
-      // One past its capacity: the next size up.
-      let additional = table.capacity() + 1 - table.len();
-      table.reserve(additional);
+    macro_rules! grow_if_filling {
+      ($table:ident) => {
+        let (len, capacity) = (Table::len(&self.$table), Table::capacity(&self.$table));
+        if capacity >= GROW_AHEAD_MIN_CAPACITY
+          && (len + pending.$table.len()).saturating_mul(denominator)
+            >= capacity.saturating_mul(numerator)
+        {
+          // One past its capacity: the next size up.
+          Table::reserve(&mut self.$table, capacity + 1 - len);
+          return;
+        }
+      };
     }
+    each_table!(grow_if_filling);
   }
 
   /// Merge node `node_id`, created by the merged transaction with the state

@@ -34,6 +34,8 @@ pub struct MvccManager {
   /// `mvcc::version_chain`) and it skips them. Raised by commits that record
   /// history, lowered by GC, both under the version chain write lock.
   history_ts: Arc<AtomicU64>,
+  /// GC's retention period (`GcConfig::retention_ms`), for `history_horizon`.
+  retention_ms: u64,
   gc_stop: Arc<AtomicBool>,
   /// Wakes the GC thread from its sleep between runs on stop
   #[cfg(not(target_arch = "wasm32"))]
@@ -47,6 +49,7 @@ pub struct MvccManager {
 impl MvccManager {
   /// Create a new MVCC manager
   pub fn new(initial_tx_id: TxId, initial_commit_ts: Timestamp, gc_config: GcConfig) -> Self {
+    let retention_ms = gc_config.retention_ms;
     Self {
       tx_manager: Arc::new(Mutex::new(TxManager::with_initial(
         initial_tx_id,
@@ -56,6 +59,7 @@ impl MvccManager {
       conflict_detector: ConflictDetector::new(),
       gc: Arc::new(Mutex::new(GarbageCollector::with_config(gc_config))),
       history_ts: Arc::new(AtomicU64::new(0)),
+      retention_ms,
       gc_stop: Arc::new(AtomicBool::new(false)),
       #[cfg(not(target_arch = "wasm32"))]
       gc_sleeper: Arc::new(GcSleeper::default()),
@@ -96,10 +100,12 @@ impl MvccManager {
   /// transaction's snapshot, or older while the retention period keeps
   /// commits. `tx_manager` is the transaction manager, locked.
   pub fn history_horizon(&self, tx_manager: &TxManager) -> Timestamp {
-    let retention_ms = self.gc.lock().config().retention_ms;
-    tx_manager
-      .min_active_ts()
-      .min(tx_manager.retention_horizon_ts(retention_ms))
+    let min_active_ts = tx_manager.min_active_ts();
+    if self.retention_ms == 0 {
+      // The retention horizon is then the next commit's, no older.
+      return min_active_ts;
+    }
+    min_active_ts.min(tx_manager.retention_horizon_ts(self.retention_ms))
   }
 
   /// Run one GC cycle now.
