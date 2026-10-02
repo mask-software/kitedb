@@ -6,8 +6,8 @@ import path from 'node:path'
 
 import { fromBinary } from '@bufbuild/protobuf'
 
-import { Database, PropType } from '../index'
-import { IndexSchema } from './scip/scip_pb'
+import { Database, PropType } from '../index.js'
+import { IndexSchema } from './scip/scip_pb.js'
 
 type Mode = 'clean' | 'incremental'
 type ProfileName = 'minimal' | 'argus' | 'argus-fast'
@@ -640,7 +640,7 @@ function syncEdges(
   batchSize: number,
   autoCommit: boolean,
 ): void {
-  const existingEdges = db.getOutEdges(src)
+  const existingEdges = db.get_out_edges(src)
   const existing = new Map<string, EdgeSpec>()
   for (const edge of existingEdges) {
     existing.set(edgeKey(edge.etype, edge.nodeId), {
@@ -687,14 +687,14 @@ function clearFileEdges(
   batchSize: number,
   autoCommit: boolean,
 ): void {
-  const outEdges = db.getOutEdges(fileId)
+  const outEdges = db.get_out_edges(fileId)
   for (const edge of outEdges) {
     db.deleteEdge(fileId, edge.etype, edge.nodeId)
     bumpOps(state)
     flushIfNeeded(db, state, batchSize, autoCommit)
   }
 
-  const inEdges = db.getInEdges(fileId)
+  const inEdges = db.get_in_edges(fileId)
   for (const edge of inEdges) {
     db.deleteEdge(edge.nodeId, edge.etype, fileId)
     bumpOps(state)
@@ -719,17 +719,17 @@ function applyDoc(
   const nameProp = 'name'
   const kindProp = 'kind'
 
-  const contains = db.getOrCreateEtype('CONTAINS')
-  const defines = db.getOrCreateEtype('DEFINES')
-  const references = db.getOrCreateEtype('REFERENCES')
-  const imports = db.getOrCreateEtype('IMPORTS')
-  const exports = db.getOrCreateEtype('EXPORTS')
-  const calls = db.getOrCreateEtype('CALLS')
+  const contains = db.get_or_create_etype('CONTAINS')
+  const defines = db.get_or_create_etype('DEFINES')
+  const references = db.get_or_create_etype('REFERENCES')
+  const imports = db.get_or_create_etype('IMPORTS')
+  const exports = db.get_or_create_etype('EXPORTS')
+  const calls = db.get_or_create_etype('CALLS')
 
   const ensureNode = (key: string): number => {
     const cached = nodeCache.get(key)
     if (cached !== undefined) return cached
-    const existing = db.getNodeByKey(key)
+    const existing = db.get_node_by_key(key)
     if (existing !== null) {
       nodeCache.set(key, existing)
       return existing
@@ -798,7 +798,7 @@ function applyDoc(
   if (updateMode && profile.chunkMax > chunkCount) {
     for (let i = chunkCount; i < profile.chunkMax; i += 1) {
       const chunkKey = `chunk:${doc.relativePath}:${i}`
-      const chunkId = db.getNodeByKey(chunkKey)
+      const chunkId = db.get_node_by_key(chunkKey)
       if (chunkId === null) continue
       clearFileEdges(db, chunkId, state, batchSize, autoCommit)
       db.deleteNode(chunkId)
@@ -894,12 +894,12 @@ function deleteDoc(
   profile: GraphProfile,
 ): void {
   const fileKey = `file:${doc.relativePath}`
-  const fileId = db.getNodeByKey(fileKey)
+  const fileId = db.get_node_by_key(fileKey)
   if (fileId === null) return
   clearFileEdges(db, fileId, state, batchSize, autoCommit)
   if (profile.chunkMax > 0) {
     for (let i = 0; i < profile.chunkMax; i += 1) {
-      const chunkId = db.getNodeByKey(`chunk:${doc.relativePath}:${i}`)
+      const chunkId = db.get_node_by_key(`chunk:${doc.relativePath}:${i}`)
       if (chunkId === null) continue
       clearFileEdges(db, chunkId, state, batchSize, autoCommit)
       db.deleteNode(chunkId)

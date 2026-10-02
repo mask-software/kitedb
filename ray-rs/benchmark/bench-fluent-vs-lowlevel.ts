@@ -255,9 +255,9 @@ function benchmarkLowLevelInserts(
 	config: BenchConfig,
 ): LatencyStats {
 	const tracker = new LatencyTracker();
-	const nameKey = db.getOrCreatePropkey("name");
-	const emailKey = db.getOrCreatePropkey("email");
-	const ageKey = db.getOrCreatePropkey("age");
+	const nameKey = db.get_or_create_propkey("name");
+	const emailKey = db.get_or_create_propkey("email");
+	const ageKey = db.get_or_create_propkey("age");
 
 	for (let i = 0; i < config.iterations; i++) {
 		const start = process.hrtime.bigint();
@@ -313,7 +313,7 @@ function benchmarkLowLevelKeyLookup(
 	for (let i = 0; i < iterations; i++) {
 		const key = keys[Math.floor(Math.random() * keys.length)];
 		const start = process.hrtime.bigint();
-		db.getNodeByKey(key);
+		db.get_node_by_key(key);
 		tracker.record(Number(process.hrtime.bigint() - start));
 	}
 
@@ -548,14 +548,14 @@ async function runBenchmarks(config: BenchConfig): Promise<void> {
 		...mvccOption,
 	});
 	const edgeTypeIds = edgeTypeNames.map((name) =>
-		lowLevelDb.getOrCreateEtype(name),
+		lowLevelDb.get_or_create_etype(name),
 	);
 	const edgePropKeyIds = edgePropNames.map((name) =>
-		lowLevelDb.getOrCreatePropkey(name),
+		lowLevelDb.get_or_create_propkey(name),
 	);
-	const nameKey = lowLevelDb.getOrCreatePropkey("name");
-	const emailKey = lowLevelDb.getOrCreatePropkey("email");
-	const ageKey = lowLevelDb.getOrCreatePropkey("age");
+	const nameKey = lowLevelDb.get_or_create_propkey("name");
+	const emailKey = lowLevelDb.get_or_create_propkey("email");
+	const ageKey = lowLevelDb.get_or_create_propkey("age");
 
 	// Fluent database setup
 	const edgeDefs = edgeTypeNames.map((name) =>
@@ -885,7 +885,7 @@ async function runBenchmarks(config: BenchConfig): Promise<void> {
 
 		bench
 			.add("Low-level: key lookup", () => {
-				lowLevelDb.getNodeByKey(randomKey);
+				lowLevelDb.get_node_by_key(randomKey);
 			})
 			.add("Fluent: get (with props)", () => {
 				fluentDb.get(User, randomKeyArg);
