@@ -1591,6 +1591,7 @@ impl From<core_metrics::HealthCheckResult> for HealthCheckResult {
   }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl From<core_metrics::OtlpHttpExportResult> for OtlpHttpExportResult {
   fn from(result: core_metrics::OtlpHttpExportResult) -> Self {
     OtlpHttpExportResult {
@@ -4485,6 +4486,7 @@ pub fn collect_replication_metrics_otel_json(db: &Database) -> Result<String> {
   }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[napi]
 pub fn collect_replication_metrics_otel_protobuf(db: &Database) -> Result<Buffer> {
   match db.inner.as_ref() {
@@ -4549,14 +4551,19 @@ pub fn collect_replication_log_transport(
   }
 }
 
+// OTLP push needs sockets, so a wasm32 build has no push functions and no
+// `collectReplicationMetricsOtelProtobuf` (see `metrics/mod.rs`).
+#[cfg(not(target_arch = "wasm32"))]
 fn otel_timeout_ms(timeout_ms: i64) -> Result<u64> {
   validation::positive_u64("timeoutMs", timeout_ms, validation::MAX_DURATION_MS as u64)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn otel_push_error(e: impl std::fmt::Display) -> Error {
   Error::from_reason(format!("Failed to push replication metrics: {e}"))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[napi]
 pub fn push_replication_metrics_otel_json(
   db: &Database,
@@ -4577,6 +4584,7 @@ pub fn push_replication_metrics_otel_json(
 
 /// `pushReplicationMetricsOtelJson` on the libuv thread pool: the push (network I/O,
 /// retries and backoff) does not block the event loop.
+#[cfg(not(target_arch = "wasm32"))]
 #[napi(ts_return_type = "Promise<OtlpHttpExportResult>")]
 pub fn push_replication_metrics_otel_json_async(
   db: &Database,
@@ -4600,6 +4608,7 @@ pub fn push_replication_metrics_otel_json_async(
   })())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn build_core_otel_push_options(
   options: PushReplicationMetricsOtelOptions,
 ) -> Result<core_metrics::OtlpHttpPushOptions> {
@@ -4811,6 +4820,7 @@ fn build_core_otel_push_options(
   })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[napi]
 pub fn push_replication_metrics_otel_json_with_options(
   db: &Database,
@@ -4828,6 +4838,7 @@ pub fn push_replication_metrics_otel_json_with_options(
 }
 
 /// `pushReplicationMetricsOtelJsonWithOptions` on the libuv thread pool.
+#[cfg(not(target_arch = "wasm32"))]
 #[napi(ts_return_type = "Promise<OtlpHttpExportResult>")]
 pub fn push_replication_metrics_otel_json_with_options_async(
   db: &Database,
@@ -4849,6 +4860,7 @@ pub fn push_replication_metrics_otel_json_with_options_async(
   })())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[napi]
 pub fn push_replication_metrics_otel_protobuf(
   db: &Database,
@@ -4869,6 +4881,7 @@ pub fn push_replication_metrics_otel_protobuf(
 
 /// `pushReplicationMetricsOtelProtobuf` on the libuv thread pool: the push (network I/O,
 /// retries and backoff) does not block the event loop.
+#[cfg(not(target_arch = "wasm32"))]
 #[napi(ts_return_type = "Promise<OtlpHttpExportResult>")]
 pub fn push_replication_metrics_otel_protobuf_async(
   db: &Database,
@@ -4892,6 +4905,7 @@ pub fn push_replication_metrics_otel_protobuf_async(
   })())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[napi]
 pub fn push_replication_metrics_otel_protobuf_with_options(
   db: &Database,
@@ -4909,6 +4923,7 @@ pub fn push_replication_metrics_otel_protobuf_with_options(
 }
 
 /// `pushReplicationMetricsOtelProtobufWithOptions` on the libuv thread pool.
+#[cfg(not(target_arch = "wasm32"))]
 #[napi(ts_return_type = "Promise<OtlpHttpExportResult>")]
 pub fn push_replication_metrics_otel_protobuf_with_options_async(
   db: &Database,
@@ -4930,6 +4945,7 @@ pub fn push_replication_metrics_otel_protobuf_with_options_async(
   })())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[napi]
 pub fn push_replication_metrics_otel_grpc(
   db: &Database,
@@ -4950,6 +4966,7 @@ pub fn push_replication_metrics_otel_grpc(
 
 /// `pushReplicationMetricsOtelGrpc` on the libuv thread pool: the push (network I/O,
 /// retries and backoff) does not block the event loop.
+#[cfg(not(target_arch = "wasm32"))]
 #[napi(ts_return_type = "Promise<OtlpHttpExportResult>")]
 pub fn push_replication_metrics_otel_grpc_async(
   db: &Database,
@@ -4973,6 +4990,7 @@ pub fn push_replication_metrics_otel_grpc_async(
   })())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[napi]
 pub fn push_replication_metrics_otel_grpc_with_options(
   db: &Database,
@@ -4990,6 +5008,7 @@ pub fn push_replication_metrics_otel_grpc_with_options(
 }
 
 /// `pushReplicationMetricsOtelGrpcWithOptions` on the libuv thread pool.
+#[cfg(not(target_arch = "wasm32"))]
 #[napi(ts_return_type = "Promise<OtlpHttpExportResult>")]
 pub fn push_replication_metrics_otel_grpc_with_options_async(
   db: &Database,

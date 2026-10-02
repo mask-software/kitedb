@@ -11,9 +11,11 @@ use crate::replication::primary::PrimaryReplicationStatus;
 use crate::replication::replica::ReplicaReplicationStatus;
 use crate::types::DeltaState;
 
-#[cfg(feature = "otlp")]
+// OTLP push needs sockets: wasm32 builds leave it out (its dependencies are
+// native-only in Cargo.toml).
+#[cfg(all(feature = "otlp", not(target_arch = "wasm32")))]
 mod otlp;
-#[cfg(feature = "otlp")]
+#[cfg(all(feature = "otlp", not(target_arch = "wasm32")))]
 pub use otlp::*;
 
 /// Data metrics

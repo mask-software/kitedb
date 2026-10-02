@@ -1,5 +1,6 @@
 //! File system helpers.
 
+use std::fs::File;
 use std::io;
 use std::path::Path;
 
@@ -34,6 +35,50 @@ pub fn sync_parent_dir(path: &Path) -> io::Result<()> {
   let _ = path;
 
   Ok(())
+}
+
+// Advisory whole-file locks (flock on Unix, LockFileEx on Windows). WASI has
+// no file locking, so on wasm32 they succeed without locking anything, as the
+// database file lock in the pager does: a wasm32 build cannot keep two
+// processes off the same files.
+
+/// Block until this process holds an exclusive lock on `file`.
+pub(crate) fn lock_exclusive(file: &File) -> io::Result<()> {
+  #[cfg(not(target_arch = "wasm32"))]
+  {
+    fs2::FileExt::lock_exclusive(file)
+  }
+  #[cfg(target_arch = "wasm32")]
+  {
+    let _ = file;
+    Ok(())
+  }
+}
+
+/// Take an exclusive lock on `file`, or fail at once if another holds a lock.
+pub(crate) fn try_lock_exclusive(file: &File) -> io::Result<()> {
+  #[cfg(not(target_arch = "wasm32"))]
+  {
+    fs2::FileExt::try_lock_exclusive(file)
+  }
+  #[cfg(target_arch = "wasm32")]
+  {
+    let _ = file;
+    Ok(())
+  }
+}
+
+/// Release this process's lock on `file`.
+pub(crate) fn unlock(file: &File) -> io::Result<()> {
+  #[cfg(not(target_arch = "wasm32"))]
+  {
+    fs2::FileExt::unlock(file)
+  }
+  #[cfg(target_arch = "wasm32")]
+  {
+    let _ = file;
+    Ok(())
+  }
 }
 
 /// Run `run`, returning its result and the directories [`sync_parent_dir`]

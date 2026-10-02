@@ -124,6 +124,7 @@ python/kitedb/*.so
 *.node
 /core.wasi.cjs
 /core.wasi-browser.js
+/core.wasi.d.ts
 # Written by `napi build` for wasm targets; there is no published WASI package.
 /browser.js
 /core.wasm

@@ -40,9 +40,9 @@ bun install
 ## Browser (WASM) prototype
 
 There is no browser build on npm: `@kitedb/core` loads a native addon and runs on Node.js and Bun.
-The repository has a WASI prototype of the core (`cd ray-rs && bun run build:wasm`, with a demo in
-`ray-rs/examples/browser` that persists to OPFS or IndexedDB), but it is not published and does not
-build at the moment.
+The repository has an unpublished WASI build of the core (`cd ray-rs && bun run build:wasm`, smoke test
+`bun run test:wasm`, and a demo in `ray-rs/examples/browser` that persists to OPFS or IndexedDB). See
+[ray-rs/README.md](ray-rs/README.md#browserwasi-builds) for what it leaves out.
 
 ## Quick Start
 

@@ -29,15 +29,6 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 base64 = "0.22"
 
-# OTLP metrics push (optional, `otlp` feature)
-ureq = { version = "2.10", optional = true }
-rustls-pemfile = { version = "2.2", optional = true }
-webpki-roots = { version = "1.0", optional = true }
-opentelemetry-proto = { version = "0.31", default-features = false, features = ["gen-tonic", "metrics"], optional = true }
-prost = { version = "0.14", optional = true }
-tonic = { version = "0.14", features = ["transport", "tls-webpki-roots", "gzip"], optional = true }
-tokio = { version = "1.45", features = ["rt", "rt-multi-thread", "fs", "sync", "time", "net"], optional = true }
-
 # Binary encoding
 byteorder = "1.5"
 
@@ -80,6 +71,15 @@ fs2 = "0.4"
 rayon = "1.10"
 # Compression (native only)
 zstd = "0.13"
+# OTLP metrics push (optional, `otlp` feature; native only: these need sockets,
+# which wasm32 doesn't have, so `otlp` adds nothing to a wasm32 build)
+ureq = { version = "2.10", optional = true }
+rustls-pemfile = { version = "2.2", optional = true }
+webpki-roots = { version = "1.0", optional = true }
+opentelemetry-proto = { version = "0.31", default-features = false, features = ["gen-tonic", "metrics"], optional = true }
+prost = { version = "0.14", optional = true }
+tonic = { version = "0.14", features = ["transport", "tls-webpki-roots", "gzip"], optional = true }
+tokio = { version = "1.45", features = ["rt", "rt-multi-thread", "fs", "sync", "time", "net"], optional = true }
 
 [build-dependencies]
 napi-build = { version = "2", optional = true }
@@ -116,7 +116,7 @@ default = ["napi"]
 napi = ["dep:napi", "dep:napi-derive", "dep:napi-build", "otlp"]
 python = ["dep:pyo3", "otlp"]
 # Push replication metrics to an OpenTelemetry collector (HTTP and gRPC).
-# The bindings enable it; Rust users opt in.
+# The bindings enable it; Rust users opt in. No effect on wasm32 targets.
 otlp = [
   "dep:ureq",
   "dep:rustls-pemfile",

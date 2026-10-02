@@ -31,7 +31,6 @@ use super::transport::{build_commit_payload_header, decode_commit_frame_payload}
 use super::types::{CommitToken, ReplicationCursor, ReplicationRole};
 use crate::core::single_file::SyncMode;
 use crate::error::{KiteError, Result};
-use fs2::FileExt;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -132,7 +131,7 @@ impl Drop for PrimarySidecarProcessLock {
     // spawned meanwhile shares through its inherited descriptor. Closing only
     // this descriptor would leave the lock held until the child closes its
     // copy, so release it explicitly.
-    let _ = FileExt::unlock(&self.file);
+    let _ = crate::util::fs::unlock(&self.file);
   }
 }
 
@@ -1578,7 +1577,7 @@ fn acquire_sidecar_primary_lock(sidecar_path: &Path) -> Result<(SidecarPrimaryLo
     .read(true)
     .write(true)
     .open(&lock_path)?;
-  lock_file.try_lock_exclusive().map_err(|error| {
+  crate::util::fs::try_lock_exclusive(&lock_file).map_err(|error| {
     KiteError::LockFailed(format!(
       "primary sidecar lock is held by another process: {} ({error})",
       lock_path.display()

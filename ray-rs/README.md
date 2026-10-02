@@ -153,8 +153,15 @@ console.log(hits)
 ## Browser/WASI builds
 
 There is no browser build on npm: `@kitedb/core` loads a native addon, so it runs on Node.js and Bun only. The
-repository has a WASI prototype (`bun run build:wasm`, demo in `examples/browser`), but it is not published and does
-not build at the moment.
+repository has an unpublished WASI build: `bun run build:wasm` (or `build:wasm:debug`) writes `core.wasm32-wasi.wasm`
+and its loaders (`core.wasi.cjs` for Node, `core.wasi-browser.js` for the demo in `examples/browser`), and
+`bun run test:wasm` smoke-tests it in Node. It needs the `wasm32-wasip1-threads` Rust target. It exposes the native
+API (`Database`, `Kite`, ...), not the `kite()` wrapper, and differs from the native build:
+
+- no OTLP metrics push (`pushReplicationMetricsOtel*`, `collectReplicationMetricsOtelProtobuf`): it needs sockets;
+- no file locks, which WASI does not have: never open one database file from two processes;
+- no zstd: zstd-compressed snapshots can be neither written nor read;
+- the snapshot is read into memory instead of memory-mapped.
 
 ## Concurrent Access
 
