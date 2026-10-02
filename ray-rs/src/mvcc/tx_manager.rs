@@ -1243,4 +1243,37 @@ mod tests {
     let err1 = TxManagerError::TxNotFound(42);
     assert_eq!(err1.to_string(), "Transaction 42 not found");
   }
+
+  /// A commit drops the recent commits no open transaction can conflict with any more. Their
+  /// key sets go to `released`, for the caller to free outside its locks: the publish commits
+  /// in MVCC under the delta write lock, where every reader and writer waits, and a 200-node
+  /// transaction writes thousands of keys. Regression: they were freed there.
+  #[test]
+  fn pruned_commits_hand_their_keys_to_released() {
+    let mut tx_mgr = TxManager::new();
+    let (reader, _) = tx_mgr.begin_tx();
+    let (writer, _) = tx_mgr.begin_tx();
+    for i in 0..100 {
+      tx_mgr.record_write(writer, TxKey::Node(i));
+    }
+    tx_mgr
+      .commit_tx_releasing(writer, &mut Vec::new())
+      .expect("commit");
+
+    // A transaction that began after it, so the writer's keys go once the reader ends.
+    let (later, _) = tx_mgr.begin_tx();
+    tx_mgr.abort_tx(reader);
+    let (next, _) = tx_mgr.begin_tx();
+    tx_mgr.record_write(next, TxKey::Node(1000));
+    let mut released = Vec::new();
+    tx_mgr
+      .commit_tx_releasing(next, &mut released)
+      .expect("commit");
+    assert!(
+      released.iter().any(|keys| keys.len() == 100),
+      "the pruned commit's keys were freed under the lock: released {:?}",
+      released.iter().map(|keys| keys.len()).collect::<Vec<_>>()
+    );
+    tx_mgr.abort_tx(later);
+  }
 }

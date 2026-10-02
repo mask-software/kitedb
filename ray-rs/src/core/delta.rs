@@ -1041,4 +1041,80 @@ mod tests {
     assert!(!delta.is_edge_deleted(1, 10, 2));
     assert!(delta.in_add.is_empty() && delta.in_del.is_empty());
   }
+
+  /// A transaction's delta that creates `count` keyed nodes from `first` on, each with a
+  /// prop and a label, and an edge from each to the next with three props.
+  fn created_batch(first: NodeId, count: u64) -> DeltaState {
+    let mut pending = DeltaState::new();
+    for id in first..first + count {
+      pending.create_node(id, Some(&format!("n{id}")));
+      pending.set_node_prop(id, 1, PropValue::I64(id as i64));
+      pending.add_node_label(id, 1);
+    }
+    for id in first..first + count {
+      let dst = if id + 1 < first + count {
+        id + 1
+      } else {
+        first
+      };
+      pending.add_edge(id, 1, dst);
+      for key in 1..=3 {
+        pending.set_edge_prop(id, 1, dst, key, PropValue::I64(key as i64));
+      }
+    }
+    pending
+  }
+
+  /// Each table of `delta` as (capacity, bytes per entry).
+  fn tables(delta: &DeltaState) -> Vec<(usize, usize)> {
+    fn map<K, V>(map: &DeltaMap<K, V>) -> (usize, usize) {
+      (map.capacity(), std::mem::size_of::<(K, V)>())
+    }
+    fn set<T>(set: &DeltaSet<T>) -> (usize, usize) {
+      (set.capacity(), std::mem::size_of::<T>())
+    }
+    vec![
+      map(&delta.created_nodes),
+      set(&delta.deleted_nodes),
+      map(&delta.modified_nodes),
+      map(&delta.out_add),
+      map(&delta.out_del),
+      map(&delta.in_add),
+      map(&delta.in_del),
+      map(&delta.edge_props),
+      map(&delta.key_index),
+    ]
+  }
+
+  /// Merges run under the delta write lock, where every reader and writer waits, and a table
+  /// that grows there moves all its entries. One merge must move at most one table, of at most
+  /// 32 bytes per entry. Regression: every table of a growing delta grew in the same merge
+  /// (they hold about as many entries each), and a created node's entry was 176 bytes, so a
+  /// merge stalled for 10 ms at 230K nodes.
+  #[test]
+  fn a_merge_moves_at_most_one_compact_table() {
+    let mut delta = DeltaState::new();
+    let mut most_moved = (0, 0);
+    for batch in 0..40 {
+      let mut pending = created_batch(1 + batch * 1000, 1000);
+      let before = tables(&delta);
+      delta.merge_from(&mut pending);
+      let moved: usize = before
+        .iter()
+        .zip(tables(&delta))
+        .filter(|((before, _), (after, _))| before != after)
+        .map(|((capacity, bytes), _)| capacity * bytes)
+        .sum();
+      if moved > most_moved.0 {
+        most_moved = (moved, batch);
+      }
+    }
+    assert!(
+      most_moved.0 <= 1 << 20,
+      "merge {} moved {} bytes of tables",
+      most_moved.1,
+      most_moved.0
+    );
+    assert_eq!(delta.created_nodes.len(), 40_000);
+  }
 }
