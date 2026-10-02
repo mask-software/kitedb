@@ -1761,9 +1761,14 @@ impl SingleFileDB {
       return Some(node_id);
     }
 
-    // The key's owner at the reader's snapshot, if it changed since
+    // The key's owner at the reader's snapshot, if it changed since. A node
+    // created after the snapshot gets no key history of its own (see
+    // `mvcc_history`): a later change of the key records the node as its
+    // owner from before, so the owner must exist at the snapshot too.
     if let Some(vc) = self.mvcc_history(tx_snapshot_ts) {
-      let owner = vc.key_owner_at(key, tx_snapshot_ts, txid);
+      let owner = vc.key_owner_at(key, tx_snapshot_ts, txid).map(|owner| {
+        owner.filter(|&node_id| vc.node_exists_at(node_id, tx_snapshot_ts, txid) != Some(false))
+      });
       drop(vc);
       if let Some(owner) = owner {
         return owner.filter(|&node_id| !pending.is_some_and(|p| p.is_node_deleted(node_id)));
