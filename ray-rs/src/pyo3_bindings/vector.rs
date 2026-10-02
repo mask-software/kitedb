@@ -11,6 +11,7 @@ use std::sync::RwLock;
 
 use crate::pyo3_bindings::validation;
 use crate::vector::distance::{l2_norm, normalize_in_place};
+use crate::vector::top_k::TopK;
 use crate::vector::{
   DistanceMetric as RustDistanceMetric, IvfConfig as RustIvfConfig, IvfIndex as RustIvfIndex,
   IvfPqConfig as RustIvfPqConfig, IvfPqIndex as RustIvfPqIndex,
@@ -307,16 +308,8 @@ impl PySearchOptions {
   }
 }
 
-  /// The validated `(n_probe, threshold)`.
 impl PySearchOptions {
-  fn validated(&self) -> PyResult<(Option<usize>, Option<f32>)> {
-    let params = self.params()?;
-    Ok((params.n_probe, params.threshold))
-  }
-}
-
-impl PySearchOptions {
-  fn params(&self) -> PyResult<SearchParams> {
+  fn validated(&self) -> PyResult<SearchParams> {
     let n_probe = self
       .n_probe
       .map(|n| validation::positive_usize("n_probe", n as i64, validation::MAX_VECTOR_PARAM))
@@ -533,7 +526,7 @@ impl PyIvfIndex {
 
     let rust_options = options
       .as_ref()
-      .map(PySearchOptions::params)
+      .map(PySearchOptions::validated)
       .transpose()?
       .map(SearchParams::ivf);
 
@@ -571,7 +564,7 @@ impl PyIvfIndex {
 
     let rust_options = options
       .as_ref()
-      .map(PySearchOptions::params)
+      .map(PySearchOptions::validated)
       .transpose()?
       .map(SearchParams::ivf);
 
@@ -749,7 +742,7 @@ impl PyIvfPqIndex {
 
     let rust_options = options
       .as_ref()
-      .map(PySearchOptions::params)
+      .map(PySearchOptions::validated)
       .transpose()?
       .map(SearchParams::ivf_pq);
 
@@ -787,7 +780,7 @@ impl PyIvfPqIndex {
 
     let rust_options = options
       .as_ref()
-      .map(PySearchOptions::params)
+      .map(PySearchOptions::validated)
       .transpose()?
       .map(SearchParams::ivf_pq);
 
@@ -922,23 +915,18 @@ pub fn brute_force_search(
   let query_f32 =
     prepare_brute_force_vector(&query, cosine).ok_or_else(|| zero_norm("query".to_string()))?;
 
-  let mut results: Vec<(i64, f32)> = vectors
-    .iter()
-    .zip(node_ids.iter())
-    .enumerate()
-    .map(|(i, (v, &node_id))| {
-      let v_f32 =
-        prepare_brute_force_vector(v, cosine).ok_or_else(|| zero_norm(format!("vectors[{i}]")))?;
-      Ok((node_id, distance_fn(&query_f32, &v_f32)))
-    })
-    .collect::<PyResult<_>>()?;
-
-  // Sort by distance
-  results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-  results.truncate(k);
+  // Bounded top-k in a total order; NaN distances (from NaN components)
+  // never enter it.
+  let mut top = TopK::new(k);
+  for (i, (v, &node_id)) in vectors.iter().zip(node_ids.iter()).enumerate() {
+    let v_f32 =
+      prepare_brute_force_vector(v, cosine).ok_or_else(|| zero_norm(format!("vectors[{i}]")))?;
+    top.push(node_id, distance_fn(&query_f32, &v_f32));
+  }
 
   Ok(
-    results
+    top
+      .into_sorted_vec()
       .into_iter()
       .map(|(node_id, distance)| PyBruteForceResult {
         node_id,
@@ -988,21 +976,33 @@ mod tests {
     assert!(PySearchOptions {
       n_probe: Some(1),
       threshold: Some(0.0),
+      rerank_factor: Some(0),
     }
     .validated()
     .is_ok());
     assert!(PySearchOptions {
       n_probe: Some(0),
       threshold: None,
+      rerank_factor: None,
     }
     .validated()
     .is_err());
     assert!(PySearchOptions {
       n_probe: None,
       threshold: Some(2.0),
+      rerank_factor: None,
     }
     .validated()
     .is_err());
+    for factor in [-1, (validation::MAX_VECTOR_PARAM + 1) as i32] {
+      assert!(PySearchOptions::new(None, None, Some(factor))
+        .validated()
+        .is_err());
+    }
+    let params = PySearchOptions::new(None, None, Some(3))
+      .validated()
+      .expect("valid options");
+    assert_eq!(params.ivf_pq().rerank_factor, Some(3));
   }
 
   #[test]
