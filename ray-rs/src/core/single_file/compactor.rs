@@ -173,6 +173,12 @@ impl SingleFileDB {
         header.page_size as usize,
       )?;
     }
+    let snapshot = WrittenSnapshot {
+      generation: new_gen,
+      start_page: new_snapshot_start_page,
+      page_count: new_snapshot_page_count,
+    };
+    let loaded = self.load_unnamed_snapshot(snapshot)?;
 
     // The snapshot covers every WAL record, so the installed header names an
     // empty WAL. The previous snapshot is retired only after both durable
@@ -185,17 +191,14 @@ impl SingleFileDB {
         &mut pager,
         &mut wal_buffer,
         &mut header,
-        WrittenSnapshot {
-          generation: new_gen,
-          start_page: new_snapshot_start_page,
-          page_count: new_snapshot_page_count,
-        },
+        snapshot,
         WalBuffer::reset,
       )?;
     }
 
+    // The installed snapshot holds everything the delta did.
     self.delta.write().clear();
-    self.reload_snapshot()?;
+    self.swap_in_snapshot(loaded);
 
     Ok(())
   }

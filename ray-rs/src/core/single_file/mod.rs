@@ -226,6 +226,11 @@ pub struct SingleFileDB {
   /// Signaled when the last open transaction finishes and when a background
   /// checkpoint returns to idle.
   pub(crate) checkpoint_cv: Condvar,
+  /// Paired with `cut_cv`, like `checkpoint_wait` with `checkpoint_cv`.
+  pub(crate) cut_wait: Mutex<()>,
+  /// Signaled when a background checkpoint's cut is installed or released;
+  /// writers waiting for that in `wait_for_cut_release` park here.
+  pub(crate) cut_cv: Condvar,
 
   /// Serialize commit operations to preserve WAL/delta ordering
   pub(crate) commit_lock: Mutex<()>,
@@ -258,8 +263,11 @@ pub struct SingleFileDB {
   pub(crate) checkpoint_threshold: f64,
   /// Use background (non-blocking) checkpoint instead of blocking
   pub(crate) background_checkpoint: bool,
-  /// Current checkpoint state
-  pub(crate) checkpoint_status: Mutex<CheckpointStatus>,
+  /// Which background checkpoint runs, and which one owns the current cut
+  pub(crate) checkpoint_state: Mutex<BackgroundCheckpointState>,
+  /// Bumped as a background checkpoint makes progress, so writers waiting
+  /// for its install can tell a slow checkpoint from a stalled one.
+  pub(crate) checkpoint_progress: AtomicU64,
 
   /// Vector stores keyed by property key ID
   /// Each property key can have its own vector store with different dimensions
@@ -301,6 +309,56 @@ pub enum CheckpointStatus {
   Running,
   /// Completing checkpoint (brief lock for final updates)
   Completing,
+}
+
+/// Ownership of background checkpoints.
+///
+/// One background checkpoint runs at a time. A run claims `status` under
+/// this lock and only that run (identified by `run`) returns it to idle, once,
+/// when it ends, so a finished run can never reset a later run's status.
+#[derive(Debug)]
+pub(crate) struct BackgroundCheckpointState {
+  pub(crate) status: CheckpointStatus,
+  /// The latest run to claim `status`.
+  pub(crate) run: u64,
+  /// The run whose cut is durable but neither installed nor released. It is
+  /// set by that run's cut under the checkpoint gate and the commit lock, and
+  /// cleared under the commit lock (and the WAL lock) by its install, by its
+  /// release of the cut after a failure, or by a writer cancelling it as
+  /// stalled; or, last resort, when the run ends. Writers that find the
+  /// secondary region full wait only while some run owns the cut.
+  pub(crate) cut_owner: Option<u64>,
+  /// Counts cuts taken. Writers wait for one cut by its number, so a run's
+  /// next pass cannot keep them waiting after the cut they hit is installed.
+  pub(crate) cut: u64,
+  /// A writer waited for the current cut's install, so its run takes another
+  /// pass once it installs.
+  pub(crate) writers_waited: bool,
+  /// Open transactions whose records did not fit in the secondary region at
+  /// the last declined cut. A cut is not retried before one of them
+  /// finishes: until then the copies only grow.
+  pub(crate) declined_carry: Option<HashSet<TxId>>,
+}
+
+impl Default for BackgroundCheckpointState {
+  fn default() -> Self {
+    Self {
+      status: CheckpointStatus::Idle,
+      run: 0,
+      cut_owner: None,
+      cut: 0,
+      writers_waited: false,
+      declined_carry: None,
+    }
+  }
+}
+
+impl BackgroundCheckpointState {
+  /// Whether cut number `cut` is still durable and neither installed nor
+  /// released.
+  pub(crate) fn holds_cut(&self, cut: u64) -> bool {
+    self.cut_owner.is_some() && self.cut == cut
+  }
 }
 
 #[derive(Debug, Default)]
@@ -365,6 +423,12 @@ impl SingleFileDB {
   pub(crate) fn notify_checkpoint_waiters(&self) {
     let _wait = self.checkpoint_wait.lock();
     self.checkpoint_cv.notify_all();
+  }
+
+  /// Wake writers in `wait_for_cut_release`, the same way.
+  pub(crate) fn notify_cut_waiters(&self) {
+    let _wait = self.cut_wait.lock();
+    self.cut_cv.notify_all();
   }
 
   /// Database file path

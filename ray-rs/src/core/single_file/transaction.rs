@@ -17,6 +17,7 @@ use crate::replication::primary::PrimaryReplicationStatus;
 use crate::replication::types::CommitToken;
 use crate::types::*;
 use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
@@ -27,6 +28,33 @@ use std::time::Instant;
 
 use super::open::SyncMode;
 use super::{SingleFileDB, SingleFileTxState};
+use crate::core::pager::FilePager;
+use crate::core::wal::buffer::WalBuffer;
+
+#[cfg(test)]
+thread_local! {
+  /// Fail this thread's next commit right after its durable point, the way a
+  /// failing vector apply does.
+  static FAIL_NEXT_COMMIT_AFTER_DURABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn post_durable_test_fault() -> Result<()> {
+  #[cfg(test)]
+  if FAIL_NEXT_COMMIT_AFTER_DURABLE.with(|fail| fail.replace(false)) {
+    return Err(KiteError::Internal(
+      "injected failure after the commit's durable point".to_string(),
+    ));
+  }
+  Ok(())
+}
+
+/// Outcome of `SingleFileDB::try_write_wal`.
+pub(crate) enum WalWrite<T> {
+  Written(T),
+  /// The WAL refused the record until background checkpoint cut `.0` is
+  /// installed or released.
+  BlockedOn(u64),
+}
 
 /// Marks a transaction finished once commit or rollback is done with it,
 /// including on error paths. A successful commit drops it only after its
@@ -143,30 +171,46 @@ impl SingleFileDB {
 
     // A checkpoint takes the write side. Holding this read permit through
     // insertion makes the gate atomic with transaction creation.
-    let _checkpoint_gate = self.checkpoint_gate.read();
-
-    let (txid, snapshot_ts) = if let Some(mvcc) = self.mvcc.as_ref() {
-      let (txid, snapshot_ts) = {
-        let mut tx_mgr = mvcc.tx_manager.lock();
-        tx_mgr.begin_tx()
+    let (_checkpoint_gate, txid, snapshot_ts) = loop {
+      let checkpoint_gate = self.checkpoint_gate.read();
+      let (txid, snapshot_ts) = if let Some(mvcc) = self.mvcc.as_ref() {
+        let (txid, snapshot_ts) = {
+          let mut tx_mgr = mvcc.tx_manager.lock();
+          tx_mgr.begin_tx()
+        };
+        self
+          .next_tx_id
+          .store(txid.saturating_add(1), std::sync::atomic::Ordering::SeqCst);
+        (txid, snapshot_ts)
+      } else {
+        (self.alloc_tx_id(), 0)
       };
-      self
-        .next_tx_id
-        .store(txid.saturating_add(1), std::sync::atomic::Ordering::SeqCst);
-      (txid, snapshot_ts)
-    } else {
-      (self.alloc_tx_id(), 0)
-    };
 
-    // Write BEGIN record to WAL (for write transactions). Bulk loads write
-    // all their records at commit instead.
-    if !read_only && !bulk_load {
+      // Write BEGIN record to WAL (for write transactions). Bulk loads write
+      // all their records at commit instead.
+      if read_only || bulk_load {
+        break (checkpoint_gate, txid, snapshot_ts);
+      }
       let record = WalRecord::new(WalRecordType::Begin, txid, build_begin_payload());
-      let mut pager = self.pager.lock();
-      let mut wal = self.wal_buffer.lock();
-      wal.write_record(&record, &mut pager)?;
-      self.open_write_txids.lock().insert(txid);
-    }
+      let written = self.try_write_wal(|wal, pager| wal.write_record(&record, pager));
+      match written {
+        Ok(WalWrite::Written(_)) => {
+          self.open_write_txids.lock().insert(txid);
+          break (checkpoint_gate, txid, snapshot_ts);
+        }
+        // The background checkpoint must take the gate to install, so wait
+        // without the permit, then begin afresh.
+        Ok(WalWrite::BlockedOn(cut)) => {
+          self.abort_unregistered_transaction(txid);
+          drop(checkpoint_gate);
+          self.wait_for_cut_release(cut)?;
+        }
+        Err(error) => {
+          self.abort_unregistered_transaction(txid);
+          return Err(error);
+        }
+      }
+    };
 
     let tx_state = Arc::new(Mutex::new(SingleFileTxState::new(
       txid,
@@ -181,6 +225,47 @@ impl SingleFileDB {
       self.active_writers.fetch_add(1, Ordering::SeqCst);
     }
     Ok(txid)
+  }
+
+  /// Drop the MVCC state of a transaction whose begin failed before it was
+  /// registered.
+  fn abort_unregistered_transaction(&self, txid: TxId) {
+    if let Some(mvcc) = self.mvcc.as_ref() {
+      mvcc.tx_manager.lock().abort_tx(txid);
+    }
+  }
+
+  /// Run `write` under the pager and WAL locks. If the WAL refuses the record
+  /// because the secondary region filled during a background checkpoint,
+  /// returns the cut to wait for: the caller releases every lock that
+  /// checkpoint needs (the checkpoint gate, the commit lock), waits with
+  /// `wait_for_cut_release`, and retries. Refused records are not written.
+  pub(crate) fn try_write_wal<T>(
+    &self,
+    write: impl FnOnce(&mut WalBuffer, &mut FilePager) -> Result<T>,
+  ) -> Result<WalWrite<T>> {
+    let mut pager = self.pager.lock();
+    let mut wal = self.wal_buffer.lock();
+    match write(&mut wal, &mut pager) {
+      Ok(value) => Ok(WalWrite::Written(value)),
+      Err(KiteError::WalBufferFull) => self
+        .cut_blocking_wal_writes(&wal)
+        .map(WalWrite::BlockedOn)
+        .ok_or(KiteError::WalBufferFull),
+      Err(error) => Err(error),
+    }
+  }
+
+  /// `try_write_wal`, waiting and retrying for as long as a background
+  /// checkpoint holds the WAL in a full secondary region. Callers hold no
+  /// lock that checkpoint needs.
+  fn write_wal_waiting(&self, record: &WalRecord) -> Result<()> {
+    loop {
+      match self.try_write_wal(|wal, pager| wal.write_record(record, pager))? {
+        WalWrite::Written(_) => return Ok(()),
+        WalWrite::BlockedOn(cut) => self.wait_for_cut_release(cut)?,
+      }
+    }
   }
 
   pub(crate) fn current_tx_handle(&self) -> Option<Arc<Mutex<SingleFileTxState>>> {
@@ -424,6 +509,32 @@ impl SingleFileDB {
     }
   }
 
+  /// Refuse, before its COMMIT record is written, a commit whose vectors
+  /// cannot be applied: another transaction fixed the store's dimensions
+  /// after this one set its vectors (`set_node_vector` checks only the store
+  /// as it was then). Callers hold the commit lock, so no store changes
+  /// meanwhile.
+  fn check_pending_vectors(
+    &self,
+    pending_vectors: &HashMap<(NodeId, PropKeyId), Option<VectorRef>>,
+  ) -> Result<()> {
+    for (&(_node_id, prop_key_id), operation) in pending_vectors {
+      let Some(vector) = operation else {
+        continue;
+      };
+      self.ensure_vector_store_loaded(prop_key_id)?;
+      if let Some(store) = self.vector_stores.read().get(&prop_key_id) {
+        if store.config.dimensions != vector.len() {
+          return Err(KiteError::VectorDimensionMismatch {
+            expected: store.config.dimensions,
+            got: vector.len(),
+          });
+        }
+      }
+    }
+    Ok(())
+  }
+
   /// Commit the current transaction
   pub fn commit(&self) -> Result<()> {
     self.commit_with_token().map(|_| ())
@@ -503,33 +614,51 @@ impl SingleFileDB {
     let mut group_commit_seq = 0u64;
     let mut commit_token = None;
 
+    // A bulk load writes its whole transaction now, in one batch, so a WAL
+    // that refuses it is left without a partial copy.
+    let commit_records = {
+      let commit = WalRecord::new(WalRecordType::Commit, txid, build_commit_payload()).build();
+      if bulk_load {
+        let mut records = WalRecord::new(WalRecordType::Begin, txid, build_begin_payload()).build();
+        records.extend_from_slice(&pending_wal);
+        records.extend_from_slice(&commit);
+        records
+      } else {
+        commit
+      }
+    };
+
     // Serialize the WAL and delta portions together. The checkpoint cut uses
     // the same lock, so a commit is either completely before or completely
     // after a background snapshot cut.
-    #[cfg(feature = "bench-profile")]
-    let commit_lock_start = Instant::now();
-    let _commit_guard = self.commit_lock.lock();
-    #[cfg(feature = "bench-profile")]
-    self.commit_lock_wait_ns.fetch_add(
-      commit_lock_start.elapsed().as_nanos() as u64,
-      Ordering::Relaxed,
-    );
+    let _commit_guard = loop {
+      #[cfg(feature = "bench-profile")]
+      let commit_lock_start = Instant::now();
+      let commit_guard = self.commit_lock.lock();
+      #[cfg(feature = "bench-profile")]
+      self.commit_lock_wait_ns.fetch_add(
+        commit_lock_start.elapsed().as_nanos() as u64,
+        Ordering::Relaxed,
+      );
 
-    {
+      self.check_pending_vectors(&pending.pending_vectors)?;
       let mut pager = self.pager.lock();
       let mut wal = self.wal_buffer.lock();
-      if bulk_load {
-        let begin_record = WalRecord::new(WalRecordType::Begin, txid, build_begin_payload());
-        wal.write_record(&begin_record, &mut pager)?;
-        if !pending_wal.is_empty() {
-          wal.write_record_bytes_batch(&pending_wal, &mut pager)?;
-        }
-        let commit_record = WalRecord::new(WalRecordType::Commit, txid, build_commit_payload());
-        wal.write_record(&commit_record, &mut pager)?;
-      } else {
-        // Write COMMIT record to WAL
-        let record = WalRecord::new(WalRecordType::Commit, txid, build_commit_payload());
-        wal.write_record(&record, &mut pager)?;
+      if let Err(error) = wal.write_record_bytes_batch(&commit_records, &mut pager) {
+        let blocked_on = match error {
+          KiteError::WalBufferFull => self.cut_blocking_wal_writes(&wal),
+          _ => None,
+        };
+        let Some(cut) = blocked_on else {
+          return Err(error);
+        };
+        // The background checkpoint takes the commit lock to install; nothing
+        // of this commit is written yet.
+        drop(wal);
+        drop(pager);
+        drop(commit_guard);
+        self.wait_for_cut_release(cut)?;
+        continue;
       }
 
       // Flush WAL to disk based on sync mode
@@ -576,25 +705,36 @@ impl SingleFileDB {
         state.next_seq = state.next_seq.saturating_add(1);
         group_commit_seq = state.next_seq;
       }
-    }
+      break commit_guard;
+    };
 
-    if group_commit_active {
-      self.wait_for_group_commit(group_commit_seq)?;
-    }
+    // The commit is durable from here on (with group commit, once its flush
+    // lands). Every step below runs even if an earlier one fails: returning
+    // early would leave a durable transaction out of the delta, invisible
+    // until a reopen replays it, and the next checkpoint (a snapshot of the
+    // delta) would drop it. The first failure is reported at the end.
+    let group_commit_result = if group_commit_active {
+      self.wait_for_group_commit(group_commit_seq)
+    } else {
+      Ok(())
+    };
 
     // This is the schema visibility point. It occurs immediately after the
     // durable commit boundary, while commit_lock still serializes writers.
     // Publishing before any fallible post-commit work prevents a later error
     // from leaving a committed WAL definition hidden in this process.
-    self.publish_staged_schema(&staged_schema)?;
-    schema_reservation_guard.disarm();
+    let schema_result = self.publish_staged_schema(&staged_schema);
+    if schema_result.is_ok() {
+      schema_reservation_guard.disarm();
+    }
 
     let mut delta = self.delta.write();
 
     self.apply_mvcc_commit(commit_ts_for_mvcc, txid, &pending, &delta);
 
     // Apply pending vector operations
-    self.apply_pending_vectors(&pending.pending_vectors)?;
+    let vector_result =
+      post_durable_test_fault().and_then(|()| self.apply_pending_vectors(&pending.pending_vectors));
 
     merge_pending_delta(&mut delta, pending);
     if bulk_load {
@@ -618,6 +758,7 @@ impl SingleFileDB {
 
     drop(_commit_guard);
     drop(active_transaction_guard);
+    group_commit_result.and(schema_result).and(vector_result)?;
 
     // Check if auto-checkpoint should be triggered. Every lock is released and
     // this thread's transaction is finished, so the checkpoint may wait for
@@ -627,7 +768,7 @@ impl SingleFileDB {
       if !self.is_checkpoint_running() {
         // Use background or blocking checkpoint based on config
         let result = if self.background_checkpoint {
-          self.background_checkpoint()
+          self.auto_background_checkpoint()
         } else {
           self.checkpoint()
         };
@@ -679,9 +820,7 @@ impl SingleFileDB {
     if !bulk_load {
       // Write ROLLBACK record to WAL
       let record = WalRecord::new(WalRecordType::Rollback, txid, build_rollback_payload());
-      let mut pager = self.pager.lock();
-      let mut wal = self.wal_buffer.lock();
-      wal.write_record(&record, &mut pager)?;
+      self.write_wal_waiting(&record)?;
     }
 
     Ok(())
@@ -719,10 +858,7 @@ impl SingleFileDB {
 
   /// Write a WAL record (internal helper)
   pub(crate) fn write_wal(&self, record: WalRecord) -> Result<()> {
-    let mut pager = self.pager.lock();
-    let mut wal = self.wal_buffer.lock();
-    wal.write_record(&record, &mut pager)?;
-    Ok(())
+    self.write_wal_waiting(&record)
   }
 
   pub(crate) fn write_wal_tx(
@@ -913,5 +1049,90 @@ mod tests {
     close_single_file(db)?;
 
     Ok(())
+  }
+
+  /// A commit whose COMMIT record is durable is committed even if a later
+  /// step fails: it must be visible, and survive the next checkpoint (which
+  /// replaces the WAL with a snapshot of the delta). Regression: the error
+  /// returned before the transaction merged into the delta, so the next
+  /// checkpoint dropped it.
+  #[test]
+  fn commit_failing_after_its_durable_point_is_kept() {
+    let temp_dir = tempdir().expect("temp dir");
+    let db_path = temp_dir.path().join("post-durable-failure.kitedb");
+    let options = SingleFileOpenOptions::new().auto_checkpoint(false);
+    let db = open_single_file(&db_path, options.clone()).expect("open");
+    db.begin(false).expect("begin");
+    db.create_node(Some("kept")).expect("create");
+    FAIL_NEXT_COMMIT_AFTER_DURABLE.with(|fail| fail.set(true));
+    assert!(db.commit().is_err());
+    assert!(!db.has_transaction());
+    assert!(
+      db.node_by_key("kept").is_some(),
+      "a durable commit is missing from reads"
+    );
+
+    db.checkpoint().expect("checkpoint");
+    drop(db);
+    let reopened = open_single_file(&db_path, options).expect("reopen");
+    assert!(
+      reopened.node_by_key("kept").is_some(),
+      "the checkpoint dropped a durable commit"
+    );
+  }
+
+  /// Two transactions that give a new vector property different dimensions
+  /// cannot both commit; the second is refused before its COMMIT record is
+  /// written. Regression: that COMMIT became durable before its vector failed
+  /// to apply, so the commit reported an error and its changes stayed
+  /// invisible, yet a reopen replayed it and failed on the mismatch: the
+  /// database could not be opened until a checkpoint dropped it.
+  #[test]
+  fn vector_dimension_conflict_is_refused_before_the_commit_is_durable() {
+    use std::sync::{mpsc, Arc};
+    let temp_dir = tempdir().expect("temp dir");
+    let db_path = temp_dir.path().join("vector-dimension-race.kitedb");
+    let options = SingleFileOpenOptions::new().auto_checkpoint(false);
+    let db = Arc::new(open_single_file(&db_path, options.clone()).expect("open"));
+    db.begin(false).expect("begin");
+    let embedding = db.define_propkey("embedding").expect("propkey");
+    db.commit().expect("commit");
+
+    // Each transaction stages a vector before either commits, so neither
+    // sees the other's dimensions when it sets its vector.
+    let stage = |key: &'static str, dimensions: usize| {
+      let (staged_tx, staged_rx) = mpsc::channel();
+      let (go_tx, go_rx) = mpsc::channel::<()>();
+      let writer_db = Arc::clone(&db);
+      let writer = std::thread::spawn(move || {
+        writer_db.begin(false).expect("begin");
+        let node = writer_db.create_node(Some(key)).expect("create");
+        writer_db
+          .set_node_vector(node, embedding, &vec![0.5; dimensions])
+          .expect("stage vector");
+        staged_tx.send(()).expect("signal staged");
+        go_rx.recv().expect("wait");
+        writer_db.commit()
+      });
+      staged_rx.recv().expect("staged");
+      (go_tx, writer)
+    };
+    let (first_go, first) = stage("three", 3);
+    let (second_go, second) = stage("four", 4);
+    first_go.send(()).expect("release first");
+    first.join().expect("first thread").expect("first commit");
+    second_go.send(()).expect("release second");
+    let second_result = second.join().expect("second thread");
+
+    assert!(second_result.is_err(), "both dimensions committed");
+    assert!(db.node_by_key("three").is_some());
+    assert!(db.node_by_key("four").is_none());
+
+    // Crash, then reopen.
+    let copy_path = db_path.with_extension("crash.kitedb");
+    std::fs::copy(&db_path, &copy_path).expect("copy");
+    let crashed = open_single_file(&copy_path, options).expect("reopen after the refused commit");
+    assert!(crashed.node_by_key("three").is_some());
+    assert!(crashed.node_by_key("four").is_none());
   }
 }

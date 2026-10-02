@@ -36,7 +36,7 @@ use super::recovery::{
   committed_transactions, drop_vectors_of_missing_nodes, replay_wal_record, scan_wal_records,
 };
 use super::vector::{materialize_vector_store_from_lazy_entries, vector_store_state_from_snapshot};
-use super::{CheckpointStatus, SchemaReservations, SingleFileDB};
+use super::{BackgroundCheckpointState, SchemaReservations, SingleFileDB};
 
 // ============================================================================
 // Open Options
@@ -982,37 +982,49 @@ fn open_single_file_internal(
   // Initialize WAL buffer
   let mut wal_buffer = WalBuffer::from_header(&header);
 
-  // Finish an interrupted background checkpoint. Each branch leaves the WAL
-  // bytes synced before a header naming them is installed in the other slot,
-  // so the selected header stays the crash fallback.
-  let rebuilt_wal = if header.checkpoint_in_progress != 0 {
-    if options.read_only {
-      return Err(KiteError::InvalidSnapshot(
-        "read-only open cannot recover an incomplete checkpoint; reopen writable to repair it"
-          .to_string(),
-      ));
+  // A background checkpoint cut that no install finished. Replay reads both
+  // regions in place, primary first, unless a writable open merges them.
+  let mut replay_cut_in_place = header.checkpoint_in_progress != 0;
+  if replay_cut_in_place
+    && (wal_buffer.primary_head() > wal_buffer.primary_region_size()
+      || wal_buffer.secondary_head() > wal_buffer.capacity())
+  {
+    return Err(KiteError::InvalidWal(
+      "WAL region heads exceed their regions".to_string(),
+    ));
+  }
+  if !options.read_only {
+    // A crash during a commit's sync can leave a durable header naming WAL
+    // bytes that never landed. Replay stops at them, so drop them before
+    // anything is appended after them, out of replay's reach. (A retired
+    // primary region is compacted below, which keeps only readable records.)
+    if !wal_buffer.is_primary_retired() && wal_buffer.trim_to_valid_records(&mut pager)? {
+      wal_buffer.store_in_header(&mut header);
+      install_recovered_header(&mut pager, &mut header, &mut header_slot)?;
     }
-    wal_buffer.recover_incomplete_checkpoint(&mut pager)?;
-    wal_buffer.flush(&mut pager)?;
-    pager.sync()?;
-    true
-  } else if wal_buffer.is_primary_retired() && !options.read_only {
-    // The new snapshot was installed with the post-cut records still in the
-    // secondary region, and the process stopped before compacting them into
-    // the primary region. Read-only opens replay them in place instead.
-    wal_buffer.compact_secondary_into_primary(&mut pager)?;
-    true
-  } else {
-    false
-  };
-  if rebuilt_wal {
-    wal_buffer.store_in_header(&mut header);
-    header.checkpoint_in_progress = 0;
-    header.change_counter += 1;
-    let next_header_slot = other_header_slot(header_slot);
-    write_header_slot(&mut pager, &header, next_header_slot)?;
-    pager.sync()?;
-    header_slot = next_header_slot;
+
+    // Finish an interrupted background checkpoint. Each branch leaves the WAL
+    // bytes synced before a header naming them is installed in the other
+    // slot, so the selected header stays the crash fallback.
+    let rebuilt_wal = if replay_cut_in_place {
+      // If the secondary region's records do not fit after the primary
+      // region's, the cut stays: the first checkpoint finishes it.
+      replay_cut_in_place = !wal_buffer.merge_cut_into_primary(&mut pager)?;
+      !replay_cut_in_place
+    } else if wal_buffer.is_primary_retired() {
+      // The new snapshot was installed with the post-cut records still in the
+      // secondary region, and the process stopped before compacting them into
+      // the primary region. Read-only opens replay them in place instead.
+      wal_buffer.compact_secondary_into_primary(&mut pager)?;
+      true
+    } else {
+      false
+    };
+    if rebuilt_wal {
+      wal_buffer.store_in_header(&mut header);
+      header.checkpoint_in_progress = 0;
+      install_recovered_header(&mut pager, &mut header, &mut header_slot)?;
+    }
   }
 
   // Initialize ID allocators from header
@@ -1081,7 +1093,11 @@ fn open_single_file_internal(
   if !is_new && header.wal_head > 0 {
     #[cfg(feature = "bench-profile")]
     let wal_scan_started = Instant::now();
-    _wal_records_storage = Some(scan_wal_records(&mut pager, &header)?);
+    _wal_records_storage = Some(if replay_cut_in_place {
+      wal_buffer.records_for_recovery(&mut pager)?
+    } else {
+      scan_wal_records(&mut pager, &header)?
+    });
     #[cfg(feature = "bench-profile")]
     {
       open_profile.wal_scan_ns = open_profile
@@ -1273,6 +1289,8 @@ fn open_single_file_internal(
     checkpoint_gate: RwLock::new(()),
     checkpoint_wait: Mutex::new(()),
     checkpoint_cv: parking_lot::Condvar::new(),
+    cut_wait: Mutex::new(()),
+    cut_cv: parking_lot::Condvar::new(),
     commit_lock: Mutex::new(()),
     group_commit_state: Mutex::new(super::GroupCommitState::default()),
     group_commit_cv: parking_lot::Condvar::new(),
@@ -1287,7 +1305,8 @@ fn open_single_file_internal(
     auto_checkpoint: options.auto_checkpoint,
     checkpoint_threshold: options.checkpoint_threshold,
     background_checkpoint: options.background_checkpoint,
-    checkpoint_status: Mutex::new(CheckpointStatus::Idle),
+    checkpoint_state: Mutex::new(BackgroundCheckpointState::default()),
+    checkpoint_progress: AtomicU64::new(0),
     vector_stores: RwLock::new(vector_stores),
     vector_store_lazy_entries: RwLock::new(vector_store_lazy_entries),
     cache: RwLock::new(cache),
@@ -1302,6 +1321,21 @@ fn open_single_file_internal(
     #[cfg(feature = "bench-profile")]
     wal_flush_ns: AtomicU64::new(0),
   })
+}
+
+/// Install a header written while opening in the slot after `header_slot`,
+/// durably, keeping the selected header as the fallback until it lands.
+fn install_recovered_header(
+  pager: &mut FilePager,
+  header: &mut DbHeaderV1,
+  header_slot: &mut u32,
+) -> Result<()> {
+  header.change_counter += 1;
+  let next_header_slot = other_header_slot(*header_slot);
+  write_header_slot(pager, header, next_header_slot)?;
+  pager.sync()?;
+  *header_slot = next_header_slot;
+  Ok(())
 }
 
 fn legacy_migration_temp_path(path: &Path) -> Result<PathBuf> {
