@@ -26,8 +26,8 @@ use crate::vector::types::{VectorManifest, VectorStoreConfig};
 
 use super::open::map_snapshot_range;
 use super::recovery::{committed_transactions, replay_wal_record};
-use super::vector::vector_stores_from_snapshot;
 use super::{CheckpointStatus, SingleFileDB};
+use crate::vector::ivf::serialize::validate_manifest_for_serialization;
 
 type GraphData = (
   Vec<NodeData>,
@@ -244,7 +244,7 @@ pub(crate) struct WrittenSnapshot {
 }
 
 /// A snapshot mapped and parsed (see `SingleFileDB::load_snapshot`), with
-/// all its vector stores decoded, ready to replace the in-memory one.
+/// its vector stores, ready to replace the in-memory one.
 #[derive(Default)]
 pub(crate) struct LoadedSnapshot {
   snapshot: Option<SnapshotData>,
@@ -279,6 +279,23 @@ impl LoadedSnapshot {
     }
     Ok(())
   }
+}
+
+/// Check that every vector store a snapshot is about to hold decodes back as
+/// itself (`validate_manifest_for_serialization`, which accepts what
+/// `deserialize_manifest` accepts), and return a copy of them to install with
+/// the snapshot. Copying is cheap next to decoding the snapshot's copy.
+pub(super) fn snapshot_vector_stores(
+  vector_stores: &HashMap<PropKeyId, VectorManifest>,
+) -> Result<HashMap<PropKeyId, VectorManifest>> {
+  for (prop_key_id, store) in vector_stores {
+    validate_manifest_for_serialization(store).map_err(|error| {
+      KiteError::InvalidSnapshot(format!(
+        "vector store for prop key {prop_key_id} would not decode: {error}"
+      ))
+    })?;
+  }
+  Ok(vector_stores.clone())
 }
 
 /// Return `header` to `prior` after a failed header write, keeping the newer
@@ -431,9 +448,9 @@ impl SingleFileDB {
     let graph = self.collect_graph_data()?;
     let header = self.header.read().clone();
     let generation = header.active_snapshot_gen + 1;
-    let snapshot_buffer = self.build_snapshot_buffer(generation, graph)?;
+    let (snapshot_buffer, vector_stores) = self.build_snapshot_buffer(generation, graph)?;
     let snapshot = self.write_new_snapshot(&header, generation, &snapshot_buffer)?;
-    let loaded = self.load_unnamed_snapshot(snapshot)?;
+    let loaded = self.load_unnamed_snapshot(snapshot, vector_stores)?;
 
     // The snapshot covers every WAL record, so the installed header names an
     // empty WAL.
@@ -459,13 +476,19 @@ impl SingleFileDB {
 
   /// `load_snapshot` for a snapshot just written; if it cannot be loaded, its
   /// pages (which no header names) are freed.
-  pub(crate) fn load_unnamed_snapshot(&self, snapshot: WrittenSnapshot) -> Result<LoadedSnapshot> {
-    self.load_snapshot(&snapshot).inspect_err(|_| {
-      self
-        .pager
-        .lock()
-        .free_pages(snapshot.start_page as u32, snapshot.page_count as u32);
-    })
+  pub(crate) fn load_unnamed_snapshot(
+    &self,
+    snapshot: WrittenSnapshot,
+    vector_stores: HashMap<PropKeyId, VectorManifest>,
+  ) -> Result<LoadedSnapshot> {
+    self
+      .load_snapshot(&snapshot, vector_stores)
+      .inspect_err(|_| {
+        self
+          .pager
+          .lock()
+          .free_pages(snapshot.start_page as u32, snapshot.page_count as u32);
+      })
   }
 
   /// Take the checkpoint gate for work that replaces the snapshot or resets
@@ -502,14 +525,18 @@ impl SingleFileDB {
   /// database as it was; once the header is installed,
   /// `install_loaded_snapshot` cannot fail.
   ///
-  /// Everything open would check or decode later is checked here: the parse
-  /// (footer CRC and structure), and the vector stores, which open leaves
-  /// encoded until first use. A store that does not decode would otherwise
+  /// Everything open would check or decode later is checked: the parse
+  /// (footer CRC and structure) here, and the vector stores, which open
+  /// leaves encoded until first use, before they were serialized
+  /// (`snapshot_vector_stores`). A store that does not decode would otherwise
   /// be installed, then read as missing, and fail every later checkpoint.
-  /// Keeping the decoded stores costs no extra memory: the checkpoint
-  /// materialized every live store to build this snapshot, and these replace
-  /// them.
-  pub(crate) fn load_snapshot(&self, written: &WrittenSnapshot) -> Result<LoadedSnapshot> {
+  /// `vector_stores` are the stores the snapshot was built from, so they are
+  /// installed as they are instead of decoding the snapshot's copy again.
+  pub(crate) fn load_snapshot(
+    &self,
+    written: &WrittenSnapshot,
+    vector_stores: HashMap<PropKeyId, VectorManifest>,
+  ) -> Result<LoadedSnapshot> {
     self.reach_checkpoint_phase(CheckpointPhase::SnapshotReload)?;
     if written.page_count == 0 {
       return Ok(LoadedSnapshot::default());
@@ -526,7 +553,6 @@ impl SingleFileDB {
       mapped,
       &crate::core::snapshot::reader::ParseSnapshotOptions::default(),
     )?;
-    let vector_stores = vector_stores_from_snapshot(&snapshot)?;
     Ok(LoadedSnapshot {
       snapshot: Some(snapshot),
       vector_stores,
@@ -965,9 +991,9 @@ impl SingleFileDB {
     // move the WAL positions.
     let header = self.header.read().clone();
     let generation = header.active_snapshot_gen + 1;
-    let snapshot_buffer = self.build_snapshot_buffer(generation, graph)?;
+    let (snapshot_buffer, vector_stores) = self.build_snapshot_buffer(generation, graph)?;
     let snapshot = self.write_new_snapshot(&header, generation, &snapshot_buffer)?;
-    let loaded = self.load_unnamed_snapshot(snapshot)?;
+    let loaded = self.load_unnamed_snapshot(snapshot, vector_stores)?;
     Ok((snapshot, loaded))
   }
 
@@ -1561,11 +1587,17 @@ impl SingleFileDB {
     }
   }
 
-  /// Serialize a checkpoint snapshot of `graph`.
-  fn build_snapshot_buffer(&self, generation: u64, graph: GraphData) -> Result<Vec<u8>> {
+  /// Serialize a checkpoint snapshot of `graph`. Returns it with a copy of
+  /// its vector stores to install (`snapshot_vector_stores`).
+  fn build_snapshot_buffer(
+    &self,
+    generation: u64,
+    graph: GraphData,
+  ) -> Result<(Vec<u8>, HashMap<PropKeyId, VectorManifest>)> {
     let _step = self.checkpoint_step("serialize snapshot");
     let (nodes, edges, labels, etypes, propkeys, vector_stores) = graph;
-    build_snapshot_to_memory(SnapshotBuildInput {
+    let installed = snapshot_vector_stores(&vector_stores)?;
+    let buffer = build_snapshot_to_memory(SnapshotBuildInput {
       generation,
       nodes,
       edges,
@@ -1574,7 +1606,8 @@ impl SingleFileDB {
       propkeys,
       vector_stores: Some(vector_stores),
       compression: self.checkpoint_compression.clone(),
-    })
+    })?;
+    Ok((buffer, installed))
   }
 
   /// Write `buffer` to pages no valid header names and sync it.

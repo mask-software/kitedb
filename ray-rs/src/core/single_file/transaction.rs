@@ -599,6 +599,64 @@ impl SingleFileDB {
     Ok(())
   }
 
+  /// Refuse, before MVCC or a COMMIT record records it, a commit that writes
+  /// to a node or edge that no longer exists: each write checked it, but
+  /// another transaction deleted it before this one commits (a node in
+  /// `deleted_in_round` is deleted by a commit earlier in this round, not
+  /// merged yet). The writes would otherwise land as props, labels, edges or
+  /// vectors of a missing node. Writes to a node the transaction deleted
+  /// itself go with it at merge. Callers hold the commit lock, so the
+  /// committed state does not change before the merge.
+  fn check_commit_targets(
+    &self,
+    pending: &DeltaState,
+    deleted_in_round: &HashSet<NodeId>,
+  ) -> Result<()> {
+    let delta = self.delta.read();
+    let snapshot = self.snapshot.read();
+    let snapshot = snapshot.as_ref();
+    // The transaction's own copy, or one it deleted: nothing to re-check.
+    let own =
+      |node_id: NodeId| pending.is_node_deleted(node_id) || pending.is_node_created(node_id);
+    let committed = |node_id: NodeId| {
+      !deleted_in_round.contains(&node_id) && delta.node_exists_over(snapshot, node_id)
+    };
+    let edge_endpoints = pending
+      .out_add
+      .iter()
+      .flat_map(|(&src, patches)| patches.iter().flat_map(move |patch| [src, patch.other]));
+    let vector_nodes = pending
+      .pending_vectors
+      .iter()
+      .filter(|(_, operation)| operation.is_some())
+      .map(|(&(node_id, _), _)| node_id);
+    let touched = pending
+      .modified_nodes
+      .keys()
+      .copied()
+      .chain(edge_endpoints)
+      .chain(vector_nodes);
+    for node_id in touched {
+      if !own(node_id) && !committed(node_id) {
+        return Err(KiteError::NodeNotFound(node_id));
+      }
+    }
+    for &(src, etype, dst) in pending.edge_props.keys() {
+      if pending.is_node_removed(src) || pending.is_node_removed(dst) {
+        continue;
+      }
+      let in_base = committed(src)
+        && committed(dst)
+        && !pending.is_node_deleted(src)
+        && !pending.is_node_deleted(dst)
+        && delta.edge_exists_over(snapshot, src, etype, dst);
+      if !pending.edge_visible(src, etype, dst, in_base) {
+        return Err(KiteError::EdgeNotFound { src, etype, dst });
+      }
+    }
+    Ok(())
+  }
+
   /// Refuse, before MVCC or a COMMIT record records it, a commit whose
   /// vectors cannot be applied: their dimensions disagree with their
   /// property's store, or with the dimensions `claimed` by commits earlier in
@@ -860,11 +918,31 @@ impl SingleFileDB {
     outcomes: &mut [Option<CommitOutcome>],
   ) -> CommitRound {
     let mut round = CommitRound::default();
-    // Loading a store takes the snapshot lock, so before the pager lock.
+    // Loading a store and checking targets take the snapshot lock, so before
+    // the pager lock.
     let mut loaded = VecDeque::with_capacity(queue.len());
+    let mut deleted_in_round = HashSet::new();
     for (index, request) in queue.drain(..) {
-      match self.load_vector_stores(&request.pending.pending_vectors) {
-        Ok(()) => loaded.push_back((index, request)),
+      // With MVCC, conflict detection refuses these commits (each write
+      // recorded a read of its node or edge), except bulk loads, which record
+      // nothing.
+      let check_targets = self.mvcc.is_none() || request.bulk_load;
+      let checked = self
+        .load_vector_stores(&request.pending.pending_vectors)
+        .and_then(|()| {
+          if check_targets {
+            self.check_commit_targets(&request.pending, &deleted_in_round)
+          } else {
+            Ok(())
+          }
+        });
+      match checked {
+        Ok(()) => {
+          // Conservative: if this commit is refused later in the round, a
+          // later one writing to these nodes is refused too.
+          deleted_in_round.extend(request.pending.deleted_nodes.iter().copied());
+          loaded.push_back((index, request));
+        }
         Err(error) => outcomes[index] = Some(CommitOutcome::failed(error)),
       }
     }
@@ -1274,6 +1352,15 @@ fn merge_pending_delta(target: &mut DeltaState, mut pending: DeltaState) {
   target.new_etypes.extend(pending.new_etypes.drain());
   target.new_propkeys.extend(pending.new_propkeys.drain());
 
+  // A node the transaction deleted (and did not recreate) takes the props of
+  // its edges with it, also those it wrote to its committed edges.
+  let removed: HashSet<NodeId> = pending
+    .deleted_nodes
+    .iter()
+    .copied()
+    .filter(|&node_id| pending.is_node_removed(node_id))
+    .collect();
+
   // Deletes first: a node the transaction deleted and created again is a
   // recreate, whose new copy replaces the committed one.
   for node_id in pending.deleted_nodes.drain() {
@@ -1337,6 +1424,9 @@ fn merge_pending_delta(target: &mut DeltaState, mut pending: DeltaState) {
   }
 
   for ((src, etype, dst), props) in pending.edge_props.drain() {
+    if removed.contains(&src) || removed.contains(&dst) {
+      continue;
+    }
     for (key_id, value) in props {
       match value {
         Some(value) => target.set_edge_prop_ref(src, etype, dst, key_id, value),
@@ -1346,9 +1436,6 @@ fn merge_pending_delta(target: &mut DeltaState, mut pending: DeltaState) {
   }
 
   target.key_index.extend(pending.key_index.drain());
-  target
-    .key_index_deleted
-    .extend(pending.key_index_deleted.drain());
 }
 
 #[cfg(test)]

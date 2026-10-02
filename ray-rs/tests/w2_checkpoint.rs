@@ -2,9 +2,11 @@
 //!
 //! K2 and K3 fail until fixed: two non-MVCC write transactions race, one
 //! deleting a node while the other, already past its existence check, adds an
-//! edge to it or sets its vector. Both commit (non-MVCC has no conflict
-//! check), leaving a dangling edge or a vector of a missing node in the
-//! committed state. K5 is a guard that passes on 39fefea. The tests that need
+//! edge to it or sets its vector. When both commit, the committed state holds
+//! a dangling edge or a vector of a missing node. (A commit-time existence
+//! check now refuses the racing commit, and serialized writers make the
+//! delete run after it; either way nothing may be left behind.) K5 is a guard
+//! that passes on 39fefea. The tests that need
 //! private access or checkpoint phase hooks (K1, K4, and the legacy-state
 //! variants of K2 and K3) live in `src/core/single_file/w2_checkpoint_tests.rs`.
 
@@ -21,12 +23,14 @@ fn options() -> SingleFileOpenOptions {
 }
 
 /// Run `racing` in a write transaction on another thread, commit a
-/// transaction that runs `deleting` on this thread while it is open, then
-/// commit the racing one.
+/// transaction that runs `deleting` while it is open, then commit the racing
+/// one. The racing commit may be refused by the commit-time existence check.
+/// If writers are serialized at begin, the deleting transaction waits for the
+/// racing one and runs after it.
 fn race_against_delete(
   db: &Arc<SingleFileDB>,
   racing: impl FnOnce(&SingleFileDB) + Send + 'static,
-  deleting: impl FnOnce(&SingleFileDB),
+  deleting: impl FnOnce(&SingleFileDB) + Send + 'static,
 ) {
   let (ready_tx, ready_rx) = mpsc::channel();
   let (go_tx, go_rx) = mpsc::channel::<()>();
@@ -39,14 +43,23 @@ fn race_against_delete(
     worker_db.commit()
   });
   ready_rx.recv().expect("racing transaction ready");
-  db.begin(false).expect("begin deleting transaction");
-  deleting(db);
-  db.commit().expect("commit delete");
+  let (deleted_tx, deleted_rx) = mpsc::channel();
+  let deleter_db = Arc::clone(db);
+  let deleter = std::thread::spawn(move || {
+    deleter_db.begin(false).expect("begin deleting transaction");
+    deleting(&deleter_db);
+    deleter_db.commit().expect("commit delete");
+    let _ = deleted_tx.send(());
+  });
+  // A begin serialized behind the racing transaction cannot finish first.
+  let _ = deleted_rx.recv_timeout(Duration::from_secs(2));
   go_tx.send(()).expect("release racing transaction");
-  worker
-    .join()
-    .expect("racing thread")
-    .expect("test setup: the racing transaction commits (non-MVCC has no conflict check)");
+  let racing_commit = worker.join().expect("racing thread");
+  deleter.join().expect("deleting thread");
+  match racing_commit {
+    Ok(()) | Err(KiteError::NodeNotFound(_)) | Err(KiteError::EdgeNotFound { .. }) => {}
+    Err(error) => panic!("the racing commit failed unexpectedly: {error}"),
+  }
 }
 
 fn reopen(db: Arc<SingleFileDB>) -> SingleFileDB {
@@ -72,7 +85,7 @@ fn k2_edge_racing_a_delete_of_its_endpoint_does_not_fail_checkpoints() {
   race_against_delete(
     &db,
     move |db| db.add_edge(a, knows, x).expect("add edge to a live node"),
-    |db| db.delete_node(x).expect("delete x"),
+    move |db| db.delete_node(x).expect("delete x"),
   );
   assert!(!db.node_exists(x), "test setup: x must be deleted");
 
@@ -118,7 +131,7 @@ fn k3_vector_racing_a_delete_of_its_node_is_not_checkpointed() {
       db.set_node_vector(gone, embedding, &[0.0, 1.0, 0.0])
         .expect("set vector of a live node")
     },
-    |db| db.delete_node(gone).expect("delete node"),
+    move |db| db.delete_node(gone).expect("delete node"),
   );
   assert!(!db.node_exists(gone), "test setup: node must be deleted");
 

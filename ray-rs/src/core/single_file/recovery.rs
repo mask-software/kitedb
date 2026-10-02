@@ -195,13 +195,20 @@ pub fn replay_wal_record(
       let in_snapshot = delta.snapshot_edge_over(snapshot, data.src, data.etype, data.dst);
       delta.delete_edge_over(data.src, data.etype, data.dst, in_snapshot);
     }
+    // Prop and label writes to a node or edge that does not exist (older
+    // versions let them through) are skipped, as `replay_add_edge` skips
+    // edges to missing nodes: they would surface if the id came back.
     WalRecordType::SetNodeProp => {
       let data = payload(record, parse_set_node_prop_payload(&record.payload))?;
-      delta.set_node_prop(data.node_id, data.key_id, data.value);
+      if delta.node_exists_over(snapshot, data.node_id) {
+        delta.set_node_prop(data.node_id, data.key_id, data.value);
+      }
     }
     WalRecordType::DelNodeProp => {
       let data = payload(record, parse_del_node_prop_payload(&record.payload))?;
-      delta.delete_node_prop(data.node_id, data.key_id);
+      if delta.node_exists_over(snapshot, data.node_id) {
+        delta.delete_node_prop(data.node_id, data.key_id);
+      }
     }
     WalRecordType::DefineLabel => {
       let data = payload(record, parse_define_label_payload(&record.payload))?;
@@ -232,25 +239,35 @@ pub fn replay_wal_record(
     }
     WalRecordType::AddNodeLabel => {
       let data = payload(record, parse_add_node_label_payload(&record.payload))?;
-      delta.add_node_label(data.node_id, data.label_id);
+      if delta.node_exists_over(snapshot, data.node_id) {
+        delta.add_node_label(data.node_id, data.label_id);
+      }
     }
     WalRecordType::RemoveNodeLabel => {
       let data = payload(record, parse_remove_node_label_payload(&record.payload))?;
-      delta.remove_node_label(data.node_id, data.label_id);
+      if delta.node_exists_over(snapshot, data.node_id) {
+        delta.remove_node_label(data.node_id, data.label_id);
+      }
     }
     WalRecordType::SetEdgeProp => {
       let data = payload(record, parse_set_edge_prop_payload(&record.payload))?;
-      delta.set_edge_prop(data.src, data.etype, data.dst, data.key_id, data.value);
+      if delta.edge_exists_over(snapshot, data.src, data.etype, data.dst) {
+        delta.set_edge_prop(data.src, data.etype, data.dst, data.key_id, data.value);
+      }
     }
     WalRecordType::SetEdgeProps => {
       let data = payload(record, parse_set_edge_props_payload(&record.payload))?;
-      for (key_id, value) in data.props {
-        delta.set_edge_prop(data.src, data.etype, data.dst, key_id, value);
+      if delta.edge_exists_over(snapshot, data.src, data.etype, data.dst) {
+        for (key_id, value) in data.props {
+          delta.set_edge_prop(data.src, data.etype, data.dst, key_id, value);
+        }
       }
     }
     WalRecordType::DelEdgeProp => {
       let data = payload(record, parse_del_edge_prop_payload(&record.payload))?;
-      delta.delete_edge_prop(data.src, data.etype, data.dst, data.key_id);
+      if delta.edge_exists_over(snapshot, data.src, data.etype, data.dst) {
+        delta.delete_edge_prop(data.src, data.etype, data.dst, data.key_id);
+      }
     }
     WalRecordType::SetNodeVector => {
       let data = payload(record, parse_set_node_vector_payload(&record.payload))?;

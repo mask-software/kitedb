@@ -17,7 +17,7 @@ use crate::error::{KiteError, Result};
 use crate::mvcc::TxManager;
 use crate::types::*;
 use parking_lot::Mutex;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use super::{SingleFileDB, SingleFileTxState, MAX_NODE_ID};
@@ -86,6 +86,68 @@ impl TxView<'_> {
     Ok((in_base, self.pending.edge_visible(src, etype, dst, in_base)))
   }
 
+  /// `edge_to_add`, plus the props an add would bring back
+  /// (`revealed_edge_props`), except those in `keep` (which the add sets).
+  fn edge_to_add_revealing(
+    &self,
+    src: NodeId,
+    etype: ETypeId,
+    dst: NodeId,
+    keep: &[PropKeyId],
+  ) -> Result<(bool, bool, Vec<PropKeyId>)> {
+    let (in_base, exists) = self.edge_to_add(src, etype, dst)?;
+    let revealed = if exists {
+      Vec::new()
+    } else {
+      let mut keys = self.revealed_edge_props(src, etype, dst, in_base);
+      keys.retain(|key_id| !keep.contains(key_id));
+      keys
+    };
+    Ok((in_base, exists, revealed))
+  }
+
+  /// Props of the deleted copy of an edge that adding it brings back. An add
+  /// over a tombstone cancels the tombstone, which exposes the copy below it:
+  /// the committed edge this transaction deleted (`in_base`), or the snapshot
+  /// edge the committed delta deleted. The re-added edge is a new edge, so the
+  /// caller masks these. Sorted, so the WAL is deterministic.
+  fn revealed_edge_props(
+    &self,
+    src: NodeId,
+    etype: ETypeId,
+    dst: NodeId,
+    in_base: bool,
+  ) -> Vec<PropKeyId> {
+    let snapshot_copy = !self.delta.is_edge_added(src, etype, dst)
+      && self
+        .delta
+        .snapshot_edge_over(self.snapshot, src, etype, dst);
+    let revealed = in_base || (snapshot_copy && self.delta.is_edge_deleted(src, etype, dst));
+    if !revealed {
+      return Vec::new();
+    }
+    let mut props: HashMap<PropKeyId, bool> = HashMap::new();
+    if snapshot_copy {
+      if let Some(snapshot_props) = self.snapshot.and_then(|snap| {
+        let (src_phys, dst_phys) = (snap.phys_node(src)?, snap.phys_node(dst)?);
+        snap.edge_props(snap.find_edge_index(src_phys, etype, dst_phys)?)
+      }) {
+        props.extend(snapshot_props.into_keys().map(|key_id| (key_id, true)));
+      }
+    }
+    if let Some(delta_props) = self.delta.edge_props_delta(src, etype, dst) {
+      for (&key_id, value) in delta_props {
+        props.insert(key_id, value.is_some());
+      }
+    }
+    let mut keys: Vec<PropKeyId> = props
+      .into_iter()
+      .filter_map(|(key_id, set)| set.then_some(key_id))
+      .collect();
+    keys.sort_unstable();
+    keys
+  }
+
   /// Whether the committed state holds the edge (the pending delta's base),
   /// and whether the transaction sees it. A node this transaction deleted or
   /// recreated masks its committed edges.
@@ -142,11 +204,87 @@ impl SingleFileDB {
 
   /// A write that a check turned into a no-op or rejected still depends on
   /// the state it checked.
-  fn record_read(&self, txid: TxId, key: TxKey) {
+  pub(super) fn record_read(&self, txid: TxId, key: TxKey) {
     if let Some(mvcc) = self.mvcc.as_ref() {
       let mut tx_mgr = mvcc.tx_manager.lock();
       tx_mgr.record_read(txid, key);
     }
+  }
+
+  /// Fail with `NodeNotFound` unless the transaction sees `node_id`: a prop or
+  /// label write to a missing node would otherwise linger in the delta. A
+  /// rejected write still depends on the node's absence.
+  pub(super) fn require_node(
+    &self,
+    txid: TxId,
+    tx_handle: &Arc<Mutex<SingleFileTxState>>,
+    node_id: NodeId,
+  ) -> Result<()> {
+    // Bulk loads write to nodes they just created: skip the committed state.
+    if tx_handle.lock().pending.is_node_created(node_id) {
+      return Ok(());
+    }
+    if self.with_tx_view(tx_handle, |view| view.node_exists(node_id)) {
+      return Ok(());
+    }
+    self.record_read(txid, TxKey::Node(node_id));
+    Err(KiteError::NodeNotFound(node_id))
+  }
+
+  /// Fail with `EdgeNotFound` unless the transaction sees the edge.
+  fn require_edge(
+    &self,
+    txid: TxId,
+    tx_handle: &Arc<Mutex<SingleFileTxState>>,
+    src: NodeId,
+    etype: ETypeId,
+    dst: NodeId,
+  ) -> Result<()> {
+    let (_, visible) = self.with_tx_view(tx_handle, |view| view.edge(src, etype, dst));
+    if visible {
+      return Ok(());
+    }
+    self.record_read(txid, TxKey::Edge { src, etype, dst });
+    Err(KiteError::EdgeNotFound { src, etype, dst })
+  }
+
+  /// Delete the props a re-add brought back (`TxView::revealed_edge_props`),
+  /// one `DelEdgeProp` record each, so the re-added edge starts without them
+  /// here, after WAL replay, and on replicas. Call after the add is logged
+  /// and applied.
+  fn mask_revealed_edge_props(
+    &self,
+    txid: TxId,
+    tx_handle: &Arc<Mutex<SingleFileTxState>>,
+    revealed: Vec<((NodeId, ETypeId, NodeId), Vec<PropKeyId>)>,
+  ) -> Result<()> {
+    for ((src, etype, dst), key_ids) in revealed {
+      for key_id in key_ids {
+        let record = WalRecord::new(
+          WalRecordType::DelEdgeProp,
+          txid,
+          build_del_edge_prop_payload(src, etype, dst, key_id),
+        );
+        self.write_wal_tx(tx_handle, record)?;
+        let bulk_load = {
+          let mut tx = tx_handle.lock();
+          tx.pending.delete_edge_prop(src, etype, dst, key_id);
+          tx.bulk_load
+        };
+        if let Some(mvcc) = self.mvcc.as_ref().filter(|_| !bulk_load) {
+          mvcc.tx_manager.lock().record_write(
+            txid,
+            TxKey::EdgeProp {
+              src,
+              etype,
+              dst,
+              key_id,
+            },
+          );
+        }
+      }
+    }
+    Ok(())
   }
 
   // ========================================================================
@@ -325,9 +463,10 @@ impl SingleFileDB {
       }
     }
 
-    // A deleted node keeps no vectors, now or after the next checkpoint.
+    // A deleted node keeps no vectors, now or after the next checkpoint
+    // (also a missing node's leftovers from older versions: unchecked).
     for prop_key_id in self.node_vector_keys(&tx_handle, node_id)? {
-      self.delete_node_vector(node_id, prop_key_id)?;
+      self.log_delete_node_vector(txid, &tx_handle, node_id, prop_key_id)?;
     }
 
     // Write WAL record
@@ -393,8 +532,9 @@ impl SingleFileDB {
   /// `add_edge`, returning whether the edge was added (false if it existed).
   fn add_missing_edge(&self, src: NodeId, etype: ETypeId, dst: NodeId) -> Result<bool> {
     let (txid, tx_handle) = self.require_write_tx_handle()?;
-    let (in_base, exists) =
-      self.with_tx_view(&tx_handle, |view| view.edge_to_add(src, etype, dst))?;
+    let (in_base, exists, revealed) = self.with_tx_view(&tx_handle, |view| {
+      view.edge_to_add_revealing(src, etype, dst, &[])
+    })?;
     if exists {
       self.record_read(txid, TxKey::Edge { src, etype, dst });
       return Ok(false);
@@ -414,6 +554,7 @@ impl SingleFileDB {
       tx.pending.add_edge_over(src, etype, dst, in_base);
       tx.bulk_load
     };
+    self.mask_revealed_edge_props(txid, &tx_handle, vec![((src, etype, dst), revealed)])?;
 
     if let Some(mvcc) = self.mvcc.as_ref() {
       if bulk_load {
@@ -472,14 +613,18 @@ impl SingleFileDB {
     let mut existing = Vec::new();
     let mut new_edges = Vec::with_capacity(edges.len());
     let mut new_in_base = Vec::with_capacity(edges.len());
+    let mut revealed = Vec::new();
     self.with_tx_view(&tx_handle, |view| {
       for &(src, etype, dst) in edges {
-        let (in_base, exists) = view.edge_to_add(src, etype, dst)?;
+        let (in_base, exists, keys) = view.edge_to_add_revealing(src, etype, dst, &[])?;
         if exists {
           existing.push((src, etype, dst));
         } else {
           new_edges.push((src, etype, dst));
           new_in_base.push(in_base);
+          if !keys.is_empty() {
+            revealed.push(((src, etype, dst), keys));
+          }
         }
       }
       Ok::<_, KiteError>(())
@@ -506,6 +651,7 @@ impl SingleFileDB {
       }
       tx.bulk_load
     };
+    self.mask_revealed_edge_props(txid, &tx_handle, revealed)?;
 
     if let Some(mvcc) = self.mvcc.as_ref() {
       if !bulk_load {
@@ -573,7 +719,10 @@ impl SingleFileDB {
     }
 
     let (txid, tx_handle) = self.require_write_tx_handle()?;
-    let (in_base, _) = self.with_tx_view(&tx_handle, |view| view.edge_to_add(src, etype, dst))?;
+    let set_keys: Vec<PropKeyId> = props.iter().map(|(key_id, _)| *key_id).collect();
+    let (in_base, _, revealed) = self.with_tx_view(&tx_handle, |view| {
+      view.edge_to_add_revealing(src, etype, dst, &set_keys)
+    })?;
 
     let record = WalRecord::new(
       WalRecordType::AddEdgeProps,
@@ -640,6 +789,7 @@ impl SingleFileDB {
         tx.pending.set_edge_prop(src, etype, dst, key_id, value);
       }
     }
+    self.mask_revealed_edge_props(txid, &tx_handle, vec![((src, etype, dst), revealed)])?;
 
     if !bulk_load {
       self.cache_invalidate_edge(src, etype, dst);
@@ -655,12 +805,19 @@ impl SingleFileDB {
     }
 
     let (txid, tx_handle) = self.require_write_tx_handle()?;
-    let in_base = self.with_tx_view(&tx_handle, |view| {
-      edges
-        .iter()
-        .map(|&(src, etype, dst, _)| Ok(view.edge_to_add(src, etype, dst)?.0))
-        .collect::<Result<Vec<bool>>>()
-    })?;
+    let (in_base, revealed): (Vec<bool>, Vec<_>) = self
+      .with_tx_view(&tx_handle, |view| {
+        edges
+          .iter()
+          .map(|(src, etype, dst, props)| {
+            let set_keys: Vec<PropKeyId> = props.iter().map(|(key_id, _)| *key_id).collect();
+            let (in_base, _, keys) = view.edge_to_add_revealing(*src, *etype, *dst, &set_keys)?;
+            Ok((in_base, ((*src, *etype, *dst), keys)))
+          })
+          .collect::<Result<Vec<_>>>()
+      })?
+      .into_iter()
+      .unzip();
     let mut edge_meta: Vec<(NodeId, ETypeId, NodeId, Vec<PropKeyId>)> =
       Vec::with_capacity(edges.len());
     for (src, etype, dst, props) in edges.iter() {
@@ -684,6 +841,7 @@ impl SingleFileDB {
       }
       tx.bulk_load
     };
+    self.mask_revealed_edge_props(txid, &tx_handle, revealed)?;
 
     if let Some(mvcc) = self.mvcc.as_ref() {
       if !bulk_load {
@@ -856,6 +1014,7 @@ impl SingleFileDB {
   /// Set a node property
   pub fn set_node_prop(&self, node_id: NodeId, key_id: PropKeyId, value: PropValue) -> Result<()> {
     let (txid, tx_handle) = self.require_write_tx_handle()?;
+    self.require_node(txid, &tx_handle, node_id)?;
 
     // Write WAL record
     let record = WalRecord::new(
@@ -905,6 +1064,7 @@ impl SingleFileDB {
   /// Delete a node property
   pub fn delete_node_prop(&self, node_id: NodeId, key_id: PropKeyId) -> Result<()> {
     let (txid, tx_handle) = self.require_write_tx_handle()?;
+    self.require_node(txid, &tx_handle, node_id)?;
 
     // Write WAL record
     let record = WalRecord::new(
@@ -954,6 +1114,7 @@ impl SingleFileDB {
     value: PropValue,
   ) -> Result<()> {
     let (txid, tx_handle) = self.require_write_tx_handle()?;
+    self.require_edge(txid, &tx_handle, src, etype, dst)?;
 
     // Write WAL record
     let record = WalRecord::new(
@@ -1008,6 +1169,7 @@ impl SingleFileDB {
     }
 
     let (txid, tx_handle) = self.require_write_tx_handle()?;
+    self.require_edge(txid, &tx_handle, src, etype, dst)?;
 
     let key_ids: Vec<PropKeyId> = props.iter().map(|(key_id, _)| *key_id).collect();
 
@@ -1073,6 +1235,7 @@ impl SingleFileDB {
     key_id: PropKeyId,
   ) -> Result<()> {
     let (txid, tx_handle) = self.require_write_tx_handle()?;
+    self.require_edge(txid, &tx_handle, src, etype, dst)?;
 
     // Write WAL record
     let record = WalRecord::new(
@@ -1121,6 +1284,7 @@ impl SingleFileDB {
   /// Add a label to a node
   pub fn add_node_label(&self, node_id: NodeId, label_id: LabelId) -> Result<()> {
     let (txid, tx_handle) = self.require_write_tx_handle()?;
+    self.require_node(txid, &tx_handle, node_id)?;
 
     // Write WAL record
     let record = WalRecord::new(
@@ -1166,6 +1330,7 @@ impl SingleFileDB {
   /// Remove a label from a node
   pub fn remove_node_label(&self, node_id: NodeId, label_id: LabelId) -> Result<()> {
     let (txid, tx_handle) = self.require_write_tx_handle()?;
+    self.require_node(txid, &tx_handle, node_id)?;
 
     // Write WAL record
     let record = WalRecord::new(

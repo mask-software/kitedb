@@ -56,11 +56,13 @@ impl DeltaState {
   }
 
   /// Delete an edge if it is visible. A base edge always gets a tombstone,
-  /// even when the delta also held an add patch for it.
+  /// even when the delta also held an add patch for it. The edge's props in
+  /// this delta go with it.
   pub fn delete_edge_over(&mut self, src: NodeId, etype: ETypeId, dst: NodeId, in_base: bool) {
     if !self.edge_visible(src, etype, dst, in_base) {
       return;
     }
+    self.edge_props.remove(&(src, etype, dst));
     self.remove_edge_patch(src, etype, dst, true);
     if in_base {
       self
@@ -165,17 +167,12 @@ impl DeltaState {
     } else {
       self.in_add.entry(dst).or_default().insert(in_patch);
     }
-
-    // Track reverse index for O(k) cleanup on node deletion
-    self
-      .incoming_edge_sources
-      .entry(dst)
-      .or_default()
-      .insert(src);
   }
 
-  /// Delete edge with cancellation logic
+  /// Delete edge with cancellation logic. The edge's props in this delta go
+  /// with it: a later add of the same triple is a new edge.
   pub fn delete_edge(&mut self, src: NodeId, etype: ETypeId, dst: NodeId) {
+    self.edge_props.remove(&(src, etype, dst));
     let patch = EdgePatch { etype, other: dst };
 
     // Check if cancels a pending add
@@ -234,8 +231,6 @@ impl DeltaState {
     self.new_etypes.clear();
     self.new_propkeys.clear();
     self.key_index.clear();
-    self.key_index_deleted.clear();
-    self.incoming_edge_sources.clear();
     self.pending_vectors.clear();
   }
 
@@ -267,11 +262,16 @@ impl DeltaState {
   ///
   /// Over a deleted id this recreates the node: the delete stays and keeps
   /// masking the base copy (its props, labels, key and edges), and the node
-  /// starts fresh, without the edge patches this delta held for the old copy.
+  /// starts fresh, without the edge patches or edge props this delta held
+  /// for the old copy. Props of the old copy's base edges have no patch to
+  /// find them by, so this scans `edge_props`; recreating an id is rare.
   pub fn create_node(&mut self, node_id: NodeId, key: Option<&str>) {
     if self.is_node_deleted(node_id) {
       self.modified_nodes.remove(&node_id);
       self.drop_edge_patches(node_id);
+      self
+        .edge_props
+        .retain(|&(src, _, dst), _| src != node_id && dst != node_id);
     }
     let node_delta = NodeDelta {
       key: key.map(|s| s.to_string()),
@@ -297,28 +297,11 @@ impl DeltaState {
         self.key_index.remove(key);
       }
 
-      // Clean up outgoing edges from this node
-      self.out_add.remove(&node_id);
-
-      // Clean up incoming edges to this node
-      // We need to remove edges where this node is the destination
-      if let Some(sources) = self.incoming_edge_sources.remove(&node_id) {
-        for src in sources {
-          if let Some(patches) = self.out_add.get_mut(&src) {
-            patches.retain(|p| p.other != node_id);
-            if patches.is_empty() {
-              self.out_add.remove(&src);
-            }
-          }
-        }
-      }
-
-      // Clean up in_add entries
-      self.in_add.remove(&node_id);
-      for patches in self.in_add.values_mut() {
-        patches.retain(|p| p.other != node_id);
-      }
-      self.in_add.retain(|_, patches| !patches.is_empty());
+      // State written to the node after it was created here (older versions
+      // let writes to a deleted node through), and its edges, found through
+      // its own patch sets: O(its degree).
+      self.modified_nodes.remove(&node_id);
+      self.drop_edge_patches(node_id);
 
       return;
     }
@@ -326,8 +309,10 @@ impl DeltaState {
     // Mark as deleted
     self.deleted_nodes.insert(node_id);
 
-    // Remove any modified state
+    // Remove any modified state, and this delta's patches of its edges: the
+    // delete masks the base copies, and an add patch would outlive the node.
     self.modified_nodes.remove(&node_id);
+    self.drop_edge_patches(node_id);
   }
 
   /// Whether this delta holds its own copy of the node: created here, or
@@ -350,7 +335,9 @@ impl DeltaState {
   }
 
   /// Drop every edge patch (add or tombstone, both directions) incident to
-  /// `node_id`.
+  /// `node_id`, with the props of those edges. Patches are kept in both
+  /// directions, so the node's own `out_*` and `in_*` sets name every one of
+  /// them.
   fn drop_edge_patches(&mut self, node_id: NodeId) {
     for added in [true, false] {
       let (out_map, in_map) = if added {
@@ -371,9 +358,9 @@ impl DeltaState {
       let edges: Vec<_> = out_edges.chain(in_edges).collect();
       for (src, etype, dst) in edges {
         self.remove_edge_patch(src, etype, dst, added);
+        self.edge_props.remove(&(src, etype, dst));
       }
     }
-    self.incoming_edge_sources.remove(&node_id);
   }
 
   /// Get node delta (for created or modified nodes)
@@ -644,18 +631,11 @@ impl DeltaState {
 
   /// Lookup node by key in delta
   pub fn node_by_key(&self, key: &str) -> Option<NodeId> {
-    // Check if key was deleted
-    if self.key_index_deleted.contains(key) {
-      return None;
-    }
     self.key_index.get(key).copied()
   }
 
   /// Live node holding `key` through this delta over `snapshot`.
   pub fn key_owner_over(&self, snapshot: Option<&SnapshotData>, key: &str) -> Option<NodeId> {
-    if self.key_index_deleted.contains(key) {
-      return None;
-    }
     if let Some(&node_id) = self.key_index.get(key) {
       if !self.is_node_removed(node_id) {
         return Some(node_id);
@@ -771,6 +751,73 @@ mod tests {
     delta.delete_node(n);
     assert!(delta.is_node_removed(n));
     assert_eq!(delta.key_owner_over(None, "new"), None);
+  }
+
+  #[test]
+  fn test_delete_created_node_drops_only_its_edges() {
+    let mut delta = DeltaState::new();
+    for node in 1..=4 {
+      delta.create_node(node, None);
+    }
+    delta.add_edge(1, 10, 2);
+    delta.add_edge(3, 10, 1);
+    delta.add_edge(1, 10, 1);
+    delta.add_edge(3, 10, 4);
+    delta.add_edge(2, 11, 3);
+    delta.delete_node(1);
+    for map in [&delta.out_add, &delta.in_add] {
+      assert!(
+        map
+          .iter()
+          .all(|(&node, patches)| node != 1 && patches.iter().all(|p| p.other != 1)),
+        "an edge patch of the deleted node survived: {map:?}"
+      );
+    }
+    assert!(delta.is_edge_added(3, 10, 4) && delta.is_edge_added(2, 11, 3));
+    assert_eq!(delta.total_edges_added(), 2);
+    assert_eq!(delta.in_add.values().map(|s| s.len()).sum::<usize>(), 2);
+  }
+
+  #[test]
+  fn test_edge_props_go_with_the_edge() {
+    let mut delta = DeltaState::new();
+    // A delta edge: deleting cancels the add patch and drops its props.
+    delta.add_edge(1, 10, 2);
+    delta.set_edge_prop(1, 10, 2, 7, PropValue::I64(5));
+    delta.delete_edge(1, 10, 2);
+    assert!(delta.edge_props_delta(1, 10, 2).is_none());
+
+    // A base edge: the tombstone drops the props the delta held for it.
+    delta.set_edge_prop(3, 10, 4, 7, PropValue::I64(6));
+    delta.delete_edge_over(3, 10, 4, true);
+    assert!(delta.is_edge_deleted(3, 10, 4));
+    assert!(delta.edge_props_delta(3, 10, 4).is_none());
+
+    // A deleted node's delta edges lose their props.
+    delta.create_node(5, None);
+    delta.create_node(6, None);
+    delta.add_edge(5, 10, 6);
+    delta.add_edge(6, 10, 5);
+    delta.set_edge_prop(5, 10, 6, 7, PropValue::I64(7));
+    delta.set_edge_prop(6, 10, 5, 7, PropValue::I64(8));
+    delta.delete_node(6);
+    assert!(delta.edge_props.is_empty(), "{:?}", delta.edge_props);
+  }
+
+  #[test]
+  fn test_recreate_drops_props_of_the_old_copys_base_edges() {
+    let mut delta = DeltaState::new();
+    // Props the delta held for base edges of node 1, then its delete.
+    delta.set_edge_prop(1, 10, 2, 7, PropValue::I64(5));
+    delta.set_edge_prop(3, 10, 1, 7, PropValue::I64(6));
+    delta.set_edge_prop(2, 10, 3, 7, PropValue::I64(7));
+    delta.delete_node(1);
+    delta.create_node(1, None);
+    assert_eq!(
+      delta.edge_props.keys().copied().collect::<Vec<_>>(),
+      vec![(2, 10, 3)],
+      "only the unrelated edge keeps its props"
+    );
   }
 
   #[test]

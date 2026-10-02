@@ -417,11 +417,6 @@ pub struct DeltaState {
 
   // Key index delta
   pub key_index: HashMap<String, NodeId>,
-  pub key_index_deleted: HashSet<String>,
-
-  // Reverse index for efficient edge cleanup on node deletion
-  // Maps destination node -> set of source nodes with edges to it
-  pub incoming_edge_sources: HashMap<NodeId, HashSet<NodeId>>,
 
   // Pending vector operations (keyed by (node_id, prop_key_id))
   // Some(vec) = set, None = delete
