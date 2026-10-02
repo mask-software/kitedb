@@ -160,11 +160,10 @@ fn build_out_edges_csr(
       }
     });
 
-    let mut pos = offsets[src_phys as usize] as usize;
-    for (etype, dst_phys) in node_edges {
+    let start = offsets[src_phys as usize] as usize;
+    for (pos, (etype, dst_phys)) in (start..).zip(node_edges) {
       dst_arr[pos] = dst_phys;
       etype_arr[pos] = etype;
-      pos += 1;
     }
   }
 
@@ -228,12 +227,11 @@ fn build_in_edges_csr(nodes: &[NodeData], out_csr: &CSRData) -> CSRData {
       }
     });
 
-    let mut pos = offsets[dst_phys as usize] as usize;
-    for (src_phys, etype, out_idx) in node_in_edges {
+    let start = offsets[dst_phys as usize] as usize;
+    for (pos, (src_phys, etype, out_idx)) in (start..).zip(node_in_edges) {
       src_arr[pos] = src_phys;
       etype_arr[pos] = etype;
       out_index[pos] = out_idx;
-      pos += 1;
     }
   }
 

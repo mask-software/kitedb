@@ -335,7 +335,7 @@ impl FilePager {
     let length = page_count as usize * self.page_size;
 
     // Validate mmap alignment
-    if start_offset % OS_PAGE_SIZE != 0 {
+    if !start_offset.is_multiple_of(OS_PAGE_SIZE) {
       return Err(KiteError::Internal(format!(
         "mmap offset {start_offset} must be aligned to OS page size {OS_PAGE_SIZE}"
       )));

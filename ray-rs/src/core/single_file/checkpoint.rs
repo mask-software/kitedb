@@ -1698,7 +1698,7 @@ impl SingleFileDB {
         let mut node_labels: std::collections::HashSet<LabelId> = std::collections::HashSet::new();
 
         if let Some(snapshot_labels) = snapshot.node_labels(phys as u32) {
-          node_labels.extend(snapshot_labels.into_iter());
+          node_labels.extend(snapshot_labels);
         }
 
         if let Some(node_delta) = delta.node_delta(node_id) {

@@ -447,11 +447,7 @@ impl SingleFileDB {
 
       let mut reader = BufReader::new(File::open(&segment_path)?);
       let mut offset = 0u64;
-      loop {
-        let Some(header) = read_frame_header(&mut reader, segment.id, offset)? else {
-          break;
-        };
-
+      while let Some(header) = read_frame_header(&mut reader, segment.id, offset)? {
         let frame_offset = offset;
         let frame_bytes = REPLICATION_FRAME_HEADER_BYTES
           .checked_add(header.payload_len)

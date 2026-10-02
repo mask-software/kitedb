@@ -641,7 +641,7 @@ fn validate_pq_config(dimensions: usize, config: &PqConfig) -> Result<usize, PqE
       "max_iterations must be nonzero".into(),
     ));
   }
-  if dimensions % config.num_subspaces != 0 {
+  if !dimensions.is_multiple_of(config.num_subspaces) {
     return Err(PqError::DimensionNotDivisible {
       dimensions,
       num_subspaces: config.num_subspaces,

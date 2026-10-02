@@ -673,8 +673,7 @@ fn init_mvcc_from_wal(
       parse_set_edge_prop_payload, parse_set_edge_props_payload, parse_set_node_prop_payload,
     };
 
-    let mut commit_ts: u64 = 1;
-    for (txid, records) in committed_in_order {
+    for (commit_ts, (txid, records)) in (1u64..).zip(committed_in_order) {
       for record in records {
         match record.record_type {
           WalRecordType::CreateNode => {
@@ -856,7 +855,6 @@ fn init_mvcc_from_wal(
           _ => {}
         }
       }
-      commit_ts += 1;
     }
   }
 

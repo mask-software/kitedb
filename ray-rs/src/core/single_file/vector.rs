@@ -647,7 +647,7 @@ fn decode_vector_payload(
   }
 
   let bytes = &vector_data[start..end];
-  if bytes.len() % 4 != 0 {
+  if !bytes.len().is_multiple_of(4) {
     return Err(KiteError::InvalidSnapshot(format!(
       "Vector byte length is not multiple of 4 for idx={idx}: {}",
       bytes.len()
@@ -655,7 +655,7 @@ fn decode_vector_payload(
   }
 
   let mut vec = Vec::with_capacity(bytes.len() / 4);
-  for chunk in bytes.chunks_exact(4) {
+  for chunk in bytes.as_chunks::<4>().0 {
     vec.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
   }
   Ok(vec)

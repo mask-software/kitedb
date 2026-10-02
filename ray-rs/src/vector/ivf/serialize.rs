@@ -672,7 +672,7 @@ pub fn deserialize_manifest(buffer: &[u8]) -> Result<VectorManifest, SerializeEr
       offset += 4;
       offset += 4; // reserved
 
-      if data_length % 4 != 0 {
+      if !data_length.is_multiple_of(4) {
         return Err(SerializeError::InvalidStructure(format!(
           "fragment {f} row group {r} data length {data_length} is not a multiple of 4"
         )));
@@ -711,7 +711,7 @@ pub fn deserialize_manifest(buffer: &[u8]) -> Result<VectorManifest, SerializeEr
     }
 
     // Deletion bitmap
-    if deletion_bitmap_length % 4 != 0 {
+    if !deletion_bitmap_length.is_multiple_of(4) {
       return Err(SerializeError::InvalidStructure(format!(
         "fragment {f} deletion bitmap length {deletion_bitmap_length} is not a multiple of 4"
       )));

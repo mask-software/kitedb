@@ -596,7 +596,7 @@ impl SnapshotData {
   }
 
   fn validate_u32_offsets(data: &[u8], end_limit: usize, section: &str) -> Result<()> {
-    if data.len() % 4 != 0 {
+    if !data.len().is_multiple_of(4) {
       return Err(Self::invalid_section(
         section,
         "offset array is not a multiple of 4 bytes",
@@ -624,7 +624,7 @@ impl SnapshotData {
   }
 
   fn validate_u64_offsets(data: &[u8], end_limit: usize, section: &str) -> Result<()> {
-    if data.len() % 8 != 0 {
+    if !data.len().is_multiple_of(8) {
       return Err(Self::invalid_section(
         section,
         "offset array is not a multiple of 8 bytes",
@@ -654,7 +654,7 @@ impl SnapshotData {
   }
 
   fn validate_string_id_array(data: &[u8], num_strings: usize, section: &str) -> Result<()> {
-    if data.len() % 4 != 0 {
+    if !data.len().is_multiple_of(4) {
       return Err(Self::invalid_section(
         section,
         "string ID array is not a multiple of 4 bytes",
@@ -673,7 +673,7 @@ impl SnapshotData {
   }
 
   fn validate_u32_values_below(data: &[u8], limit: usize, section: &str) -> Result<()> {
-    if data.len() % 4 != 0 {
+    if !data.len().is_multiple_of(4) {
       return Err(Self::invalid_section(
         section,
         "value array is not a multiple of 4 bytes",
@@ -697,7 +697,7 @@ impl SnapshotData {
     vector_count: Option<usize>,
     section: &str,
   ) -> Result<()> {
-    if data.len() % PROP_VALUE_DISK_SIZE != 0 {
+    if !data.len().is_multiple_of(PROP_VALUE_DISK_SIZE) {
       return Err(Self::invalid_section(
         section,
         "value array has a partial entry",
@@ -1771,7 +1771,7 @@ impl SnapshotData {
         }
 
         let mut vec = Vec::with_capacity(bytes.len() / 4);
-        for chunk in bytes.chunks_exact(4) {
+        for chunk in bytes.as_chunks::<4>().0 {
           let val = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
           vec.push(val);
         }

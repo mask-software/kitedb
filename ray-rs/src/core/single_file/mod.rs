@@ -451,6 +451,9 @@ impl SingleFileDB {
   }
 
   /// Allocate a new node ID. Fails once every ID up to [`MAX_NODE_ID`] is taken.
+  // `fetch_update` is renamed `try_update` in newer Rust; keep the old name so
+  // older toolchains still build.
+  #[allow(deprecated)]
   pub fn alloc_node_id(&self) -> Result<NodeId> {
     self
       .next_node_id

@@ -1150,14 +1150,12 @@ where
 
   fn next(&mut self) -> Option<Self::Item> {
     loop {
-      match self.inner.next() {
-        Some(result) => {
-          if let Some(edge) = result.edge {
-            return Some(edge);
-          }
-          // Skip results without edges (start nodes)
+      {
+        let result = self.inner.next()?;
+        if let Some(edge) = result.edge {
+          return Some(edge);
         }
-        None => return None,
+        // Skip results without edges (start nodes)
       }
     }
   }

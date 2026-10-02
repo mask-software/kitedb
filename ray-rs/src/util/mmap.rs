@@ -102,7 +102,7 @@ pub fn map_file_range(file: &File, offset: u64, length: usize) -> std::io::Resul
         "mmap range exceeds file length",
       ));
     }
-    if offset % 4096 != 0 {
+    if !offset.is_multiple_of(4096) {
       return Err(std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
         "mmap offset must be aligned to 4096 bytes",

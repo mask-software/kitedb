@@ -732,7 +732,7 @@ impl WalBuffer {
       return Ok(self.head);
     }
 
-    if record_bytes.len() % WAL_RECORD_ALIGNMENT != 0 {
+    if !record_bytes.len().is_multiple_of(WAL_RECORD_ALIGNMENT) {
       return Err(KiteError::Internal(
         "WAL batch bytes must be alignment-sized".to_string(),
       ));

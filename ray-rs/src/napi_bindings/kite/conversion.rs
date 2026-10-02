@@ -148,8 +148,7 @@ pub(crate) fn js_value_to_string(_env: &Env, value: Unknown, field: &str) -> Res
 pub(crate) fn render_template(template: &str, args: &HashMap<String, String>) -> Result<String> {
   let mut out = String::new();
   let mut chars = template.chars().peekable();
-  loop {
-    let Some(ch) = chars.next() else { break };
+  while let Some(ch) = chars.next() {
     if ch == '{' {
       let mut field = String::new();
       for c in chars.by_ref() {

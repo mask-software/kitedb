@@ -288,7 +288,7 @@ impl DeltaState {
 
       // Clean up in_add entries
       self.in_add.remove(&node_id);
-      for (_, patches) in self.in_add.iter_mut() {
+      for patches in self.in_add.values_mut() {
         patches.retain(|p| p.other != node_id);
       }
       self.in_add.retain(|_, patches| !patches.is_empty());

@@ -1477,7 +1477,7 @@ fn validate_ivf_pq_config(dimensions: usize, config: &IvfPqConfig) -> Result<usi
       "max_iterations must be nonzero".into(),
     ));
   }
-  if dimensions % config.pq.num_subspaces != 0 {
+  if !dimensions.is_multiple_of(config.pq.num_subspaces) {
     return Err(IvfPqError::DimensionNotDivisible {
       dimensions,
       num_subspaces: config.pq.num_subspaces,

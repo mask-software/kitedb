@@ -422,10 +422,10 @@ impl VectorIndex {
         if let Some(stored_vector) = vector_store_node_vector(&self.manifest, node_id) {
           let insert_result = match index {
             BuiltIndex::Ivf(ivf_index) => ivf_index
-              .insert(vector_id as u64, stored_vector)
+              .insert(vector_id, stored_vector)
               .map_err(ivf_error_to_index_error),
             BuiltIndex::IvfPq(ivf_pq_index) => ivf_pq_index
-              .insert(vector_id as u64, stored_vector)
+              .insert(vector_id, stored_vector)
               .map_err(ivf_pq_error_to_index_error),
           };
           if let Err(err) = insert_result {
@@ -909,7 +909,7 @@ fn ivf_pq_error_to_index_error(err: IvfPqError) -> VectorIndexError {
 fn resolve_pq_subspaces(requested: usize, dimensions: usize) -> usize {
   let capped = requested.max(1).min(dimensions.max(1));
   for candidate in (1..=capped).rev() {
-    if dimensions % candidate == 0 {
+    if dimensions.is_multiple_of(candidate) {
       return candidate;
     }
   }
