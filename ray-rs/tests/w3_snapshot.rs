@@ -1052,6 +1052,29 @@ fn s9_checker_accepts_duplicate_edges() {
   );
 }
 
+/// Found while fixing S9: with no nodes, PhysToNodeId is empty and therefore
+/// absent, and check_snapshot reported "node/phys mapping sections missing"
+/// for every empty snapshot.
+#[test]
+fn s9_checker_accepts_empty_snapshot() {
+  let image = Image::build(SnapshotBuildInput {
+    generation: 1,
+    nodes: Vec::new(),
+    edges: Vec::new(),
+    labels: HashMap::new(),
+    etypes: HashMap::new(),
+    propkeys: HashMap::new(),
+    vector_stores: None,
+    compression: None,
+  });
+  let report = check(&image).expect("empty snapshot loads");
+  assert!(
+    report.valid,
+    "S9: empty snapshot reported as corrupt: {:?}",
+    report.errors
+  );
+}
+
 // ============================================================================
 // S10: string ID off-by-one
 // ============================================================================
