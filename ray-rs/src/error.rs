@@ -82,6 +82,12 @@ pub enum KiteError {
   #[error("Transaction already in progress")]
   TransactionInProgress,
 
+  /// A savepoint that is not live in the current transaction: taken in
+  /// another transaction, released, or taken after the savepoint the
+  /// transaction last rolled back to or released.
+  #[error("Savepoint is not live: {0}")]
+  InvalidSavepoint(String),
+
   /// Database already closed
   #[error("Database is closed")]
   DatabaseClosed,

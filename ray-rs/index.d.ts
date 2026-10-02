@@ -36,6 +36,24 @@ export declare class Database {
   commitWithToken(): string | null
   /** Rollback the current transaction */
   rollback(): void
+  /**
+   * Take a savepoint in the current write transaction.
+   *
+   * `rollbackTo(savepoint)` undoes what the transaction did since (its
+   * writes, the schema names it defined, and its MVCC writes, which then
+   * cause no conflict) and keeps the savepoint; `releaseSavepoint(savepoint)`
+   * keeps those changes. Savepoints nest: rolling back to or releasing one
+   * ends every savepoint taken after it. Taking one copies the transaction's
+   * pending changes.
+   */
+  savepoint(): Savepoint
+  /**
+   * Undo what the current transaction did since `savepoint`, which stays
+   * usable.
+   */
+  rollbackTo(savepoint: Savepoint): void
+  /** Release `savepoint`, keeping what the current transaction did since. */
+  releaseSavepoint(savepoint: Savepoint): void
   /** Check if there's an active transaction */
   hasTransaction(): boolean
   /**
@@ -934,6 +952,15 @@ export declare class KiteUpsertExecutorSingle {
   execute(): void
   /** Execute the upsert and return the node */
   returning(): object
+}
+
+/**
+ * A savepoint in a write transaction, from `Database.savepoint()`: roll back
+ * to it with `rollbackTo`, or keep what came after it with
+ * `releaseSavepoint`.
+ */
+export declare class Savepoint {
+
 }
 
 /** High-level vector index for similarity search */

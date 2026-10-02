@@ -524,3 +524,318 @@ mod conflict_model {
     }
   }
 }
+
+// ============================================================================
+// Finding 2: savepoints
+// ============================================================================
+
+mod savepoints {
+  use std::sync::Arc;
+
+  use tempfile::tempdir;
+
+  use super::mvcc_options;
+  use crate::core::single_file::{open_single_file, SingleFileDB, SingleFileOpenOptions, SyncMode};
+  use crate::error::KiteError;
+  use crate::types::PropValue;
+
+  fn options() -> SingleFileOpenOptions {
+    SingleFileOpenOptions::new()
+      .sync_mode(SyncMode::Normal)
+      .auto_checkpoint(false)
+  }
+
+  fn open(dir: &tempfile::TempDir, options: SingleFileOpenOptions) -> SingleFileDB {
+    open_single_file(dir.path().join("savepoints.kitedb"), options).expect("open")
+  }
+
+  /// A crash image of `db`'s file, opened: recovery replays its WAL.
+  fn crash_image(db: &SingleFileDB, options: SingleFileOpenOptions) -> SingleFileDB {
+    let image = db.path().with_extension("image.kitedb");
+    std::fs::copy(db.path(), &image).expect("copy");
+    open_single_file(&image, options).expect("open image")
+  }
+
+  /// Rolling back to a savepoint undoes every kind of write made since (in
+  /// the transaction's own reads too) and keeps the earlier ones, which
+  /// commit with the later ones.
+  #[test]
+  fn rollback_to_undoes_the_writes_since_and_keeps_the_rest() {
+    let dir = tempdir().expect("tempdir");
+    let db = open(&dir, options());
+    db.begin(false).expect("begin");
+    let etype = db.define_etype("knows").expect("etype");
+    let prop = db.define_propkey("age").expect("propkey");
+    let label = db.define_label("Person").expect("label");
+    let a = db.create_node(Some("a")).expect("a");
+    db.set_node_prop(a, prop, PropValue::I64(1)).expect("prop");
+
+    let savepoint = db.savepoint().expect("savepoint");
+    let b = db.create_node(Some("b")).expect("b");
+    db.set_node_prop(a, prop, PropValue::I64(2)).expect("prop");
+    db.add_edge(a, etype, b).expect("edge");
+    db.add_node_label(a, label).expect("label");
+    db.delete_node_prop(a, prop).expect("delete prop");
+    db.rollback_to(&savepoint).expect("rollback to");
+
+    assert!(db.node_by_key("b").is_none(), "b is rolled back");
+    assert_eq!(db.node_prop(a, prop), Some(PropValue::I64(1)));
+    assert!(db.node_labels(a).is_empty());
+    let c = db.create_node(Some("c")).expect("c");
+    db.release_savepoint(savepoint).expect("release");
+    db.commit().expect("commit");
+
+    assert!(db.node_by_key("a").is_some() && db.node_by_key("c").is_some());
+    assert!(db.node_by_key("b").is_none());
+    assert_eq!(db.node_prop(a, prop), Some(PropValue::I64(1)));
+    assert!(!db.edge_exists(a, etype, c));
+    assert_eq!(db.count_edges(), 0);
+  }
+
+  /// A savepoint stays live after a rollback to it; rolling back to or
+  /// releasing one ends those taken after it; a savepoint works only in the
+  /// transaction that took it, and only in a write transaction.
+  #[test]
+  fn savepoints_nest_and_belong_to_their_transaction() {
+    let dir = tempdir().expect("tempdir");
+    let db = open(&dir, options());
+    assert!(matches!(db.savepoint(), Err(KiteError::NoTransaction)));
+    db.begin(true).expect("read-only begin");
+    assert!(matches!(db.savepoint(), Err(KiteError::ReadOnly)));
+    db.rollback().expect("end");
+
+    db.begin(false).expect("begin");
+    let outer = db.savepoint().expect("outer");
+    db.create_node(Some("one")).expect("one");
+    let inner = db.savepoint().expect("inner");
+    db.create_node(Some("two")).expect("two");
+    db.rollback_to(&outer).expect("rollback to outer");
+    assert!(matches!(
+      db.rollback_to(&inner),
+      Err(KiteError::InvalidSavepoint(_))
+    ));
+    assert!(matches!(
+      db.release_savepoint(inner),
+      Err(KiteError::InvalidSavepoint(_))
+    ));
+    db.create_node(Some("three")).expect("three");
+    db.rollback_to(&outer).expect("again");
+    assert!(db.node_by_key("one").is_none() && db.node_by_key("three").is_none());
+
+    // Releasing an outer savepoint ends the inner ones.
+    let inner = db.savepoint().expect("inner");
+    db.release_savepoint(outer).expect("release outer");
+    assert!(matches!(
+      db.rollback_to(&inner),
+      Err(KiteError::InvalidSavepoint(_))
+    ));
+    db.commit().expect("commit");
+
+    db.begin(false).expect("next transaction");
+    assert!(matches!(
+      db.rollback_to(&inner),
+      Err(KiteError::InvalidSavepoint(_))
+    ));
+    db.rollback().expect("rollback");
+  }
+
+  /// Rolling back past schema definitions unstages them and releases this
+  /// transaction's claims on their names; defining them again works, and a
+  /// name only rolled back never reaches the WAL.
+  #[test]
+  fn rollback_to_after_a_schema_define() {
+    let dir = tempdir().expect("tempdir");
+    let db = open(&dir, options());
+    db.begin(false).expect("begin");
+    let node = db.create_node(Some("n")).expect("node");
+    let savepoint = db.savepoint().expect("savepoint");
+    let label = db.define_label("Gone").expect("label");
+    db.define_etype("GoneType").expect("etype");
+    db.define_propkey("gone_prop").expect("propkey");
+    db.add_node_label(node, label).expect("use label");
+    db.rollback_to(&savepoint).expect("rollback to");
+
+    assert_eq!(db.label_id("Gone"), None);
+    assert_eq!(db.etype_id("GoneType"), None);
+    assert_eq!(db.propkey_id("gone_prop"), None);
+    {
+      let reservations = db.schema_reservations.lock();
+      assert!(
+        reservations.labels.is_empty()
+          && reservations.etypes.is_empty()
+          && reservations.propkeys.is_empty(),
+        "the rolled-back definitions still hold their names: {reservations:?}"
+      );
+    }
+    let kept = db.define_label("Kept").expect("define after the rollback");
+    db.add_node_label(node, kept).expect("use it");
+    db.commit().expect("commit");
+    assert_eq!(db.label_id("Gone"), None);
+    assert_eq!(db.label_id("Kept"), Some(kept));
+
+    let reopened = crash_image(&db, options());
+    assert_eq!(reopened.label_id("Gone"), None);
+    assert_eq!(reopened.etype_id("GoneType"), None);
+    assert_eq!(reopened.label_id("Kept"), Some(kept));
+  }
+
+  /// With MVCC, writes rolled back to a savepoint are not the transaction's
+  /// any more: a concurrent commit of the same keys does not make it
+  /// conflict. Writes kept past a released savepoint still do.
+  #[test]
+  fn rolled_back_writes_cause_no_mvcc_conflict() {
+    let dir = tempdir().expect("tempdir");
+    let db = Arc::new(open(&dir, mvcc_options()));
+    db.begin(false).expect("begin");
+    let prop = db.define_propkey("count").expect("propkey");
+    let node = db.create_node(Some("counter")).expect("node");
+    db.commit().expect("commit");
+    let concurrent_write = |value: i64| {
+      let db = Arc::clone(&db);
+      std::thread::spawn(move || {
+        db.begin(false)?;
+        db.set_node_prop(node, prop, PropValue::I64(value))?;
+        db.commit()
+      })
+      .join()
+      .expect("writer")
+    };
+
+    db.begin(false).expect("begin");
+    db.create_node(Some("other")).expect("other");
+    let savepoint = db.savepoint().expect("savepoint");
+    db.set_node_prop(node, prop, PropValue::I64(1))
+      .expect("set");
+    db.rollback_to(&savepoint).expect("rollback to");
+    concurrent_write(2).expect("concurrent commit");
+    db.commit()
+      .expect("the rolled-back write must not conflict");
+    assert_eq!(db.node_prop(node, prop), Some(PropValue::I64(2)));
+
+    db.begin(false).expect("begin");
+    let savepoint = db.savepoint().expect("savepoint");
+    db.set_node_prop(node, prop, PropValue::I64(3))
+      .expect("set");
+    db.release_savepoint(savepoint).expect("release");
+    concurrent_write(4).expect("concurrent commit");
+    assert!(
+      matches!(db.commit(), Err(KiteError::Conflict { .. })),
+      "a kept write still conflicts"
+    );
+  }
+
+  /// While a savepoint is live, the transaction's records stay out of the
+  /// WAL; releasing the last one writes them. After the commit, neither a
+  /// reopen nor a crash image replays a rolled-back record.
+  #[test]
+  fn wal_replay_after_commit_contains_no_rolled_back_records() {
+    let dir = tempdir().expect("tempdir");
+    let db = open(&dir, options());
+    db.begin(false).expect("begin");
+    db.create_node(Some("before")).expect("before");
+    let head = db.wal_stats().head;
+    let savepoint = db.savepoint().expect("savepoint");
+    db.create_node(Some("rolled-back")).expect("rolled back");
+    assert_eq!(
+      db.wal_stats().head,
+      head,
+      "a live savepoint keeps records back"
+    );
+    db.rollback_to(&savepoint).expect("rollback to");
+    db.create_node(Some("kept")).expect("kept");
+    db.release_savepoint(savepoint).expect("release");
+    assert!(db.wal_stats().head > head, "releasing it writes them");
+    db.create_node(Some("after")).expect("after");
+    db.commit().expect("commit");
+
+    let crashed = crash_image(&db, options());
+    let path = db.path().to_path_buf();
+    drop(db);
+    let reopened = open_single_file(&path, options()).expect("reopen");
+    for opened in [&crashed, &reopened] {
+      for key in ["before", "kept", "after"] {
+        assert!(opened.node_by_key(key).is_some(), "{key} is missing");
+      }
+      assert!(opened.node_by_key("rolled-back").is_none());
+    }
+  }
+
+  /// A transaction committed with its savepoint still live writes the
+  /// records it kept back with its COMMIT record; one rolled back writes
+  /// none of them.
+  #[test]
+  fn records_kept_back_are_written_by_the_commit() {
+    let dir = tempdir().expect("tempdir");
+    let db = open(&dir, options());
+    db.begin(false).expect("begin");
+    let _savepoint = db.savepoint().expect("savepoint");
+    db.create_node(Some("committed")).expect("node");
+    db.commit().expect("commit");
+
+    db.begin(false).expect("begin");
+    let _savepoint = db.savepoint().expect("savepoint");
+    db.create_node(Some("rolled-back")).expect("node");
+    db.rollback().expect("rollback");
+
+    let crashed = crash_image(&db, options());
+    assert!(crashed.node_by_key("committed").is_some());
+    assert!(crashed.node_by_key("rolled-back").is_none());
+  }
+
+  /// In a bulk load, which keeps every record until its commit, rolling back
+  /// to a savepoint drops the records since.
+  #[test]
+  fn bulk_load_rolls_back_to_a_savepoint() {
+    let dir = tempdir().expect("tempdir");
+    let db = open(&dir, options());
+    db.begin_bulk().expect("begin bulk");
+    db.create_nodes_batch(&[Some("a")]).expect("a");
+    let savepoint = db.savepoint().expect("savepoint");
+    db.create_nodes_batch(&[Some("b")]).expect("b");
+    db.rollback_to(&savepoint).expect("rollback to");
+    db.commit().expect("commit");
+    let crashed = crash_image(&db, options());
+    for opened in [&db, &crashed] {
+      assert!(opened.node_by_key("a").is_some());
+      assert!(opened.node_by_key("b").is_none());
+    }
+  }
+
+  /// Records kept back by a savepoint across a background checkpoint (the
+  /// cut cannot copy them: they are not in the WAL) are written after it, and
+  /// the commit is whole live, after a reopen and in a crash image.
+  #[test]
+  fn records_kept_back_across_a_background_checkpoint() {
+    let dir = tempdir().expect("tempdir");
+    let db = Arc::new(open(&dir, options()));
+    for index in 0..20 {
+      db.begin(false).expect("begin");
+      db.create_node(Some(&format!("pre-{index}"))).expect("node");
+      db.commit().expect("commit");
+    }
+    db.begin(false).expect("begin");
+    db.create_node(Some("open-before-cut")).expect("node");
+    let savepoint = db.savepoint().expect("savepoint");
+    db.create_node(Some("kept-back")).expect("node");
+    {
+      let db = Arc::clone(&db);
+      std::thread::spawn(move || db.background_checkpoint())
+        .join()
+        .expect("checkpointer")
+        .expect("background checkpoint");
+    }
+    db.release_savepoint(savepoint).expect("release");
+    db.create_node(Some("after-cut")).expect("node");
+    db.commit().expect("commit");
+
+    let crashed = crash_image(&db, options());
+    let path = db.path().to_path_buf();
+    drop(db);
+    let reopened = open_single_file(&path, options()).expect("reopen");
+    for opened in [&crashed, &reopened] {
+      for key in ["pre-0", "open-before-cut", "kept-back", "after-cut"] {
+        assert!(opened.node_by_key(key).is_some(), "{key} is missing");
+      }
+    }
+  }
+}

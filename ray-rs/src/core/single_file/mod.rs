@@ -52,7 +52,7 @@ pub use open::{
   SingleFileOpenOptions, SnapshotParseMode, SyncMode,
 };
 pub(crate) use transaction::GroupCommitState;
-pub use transaction::SingleFileTxGuard;
+pub use transaction::{Savepoint, SingleFileTxGuard};
 
 // Also re-export recovery items that are used externally
 pub use recovery::replay_wal_record;
@@ -180,6 +180,15 @@ pub struct SingleFileTxState {
   /// What it wrote, kept and handed over the same way: writers never take
   /// the transaction manager's lock, which every commit takes.
   pub(crate) mvcc_writes: TxKeySet,
+  /// Ids of its live savepoints, oldest first (see `SingleFileDB::savepoint`).
+  pub(crate) savepoints: Vec<u64>,
+  /// The id its next savepoint gets.
+  pub(crate) next_savepoint_id: u64,
+  /// While a savepoint is live, the WAL records it writes stay here, in
+  /// `pending_wal` from this offset on, so rolling back drops them before
+  /// they reach the WAL. They are written once no savepoint is live, or by
+  /// its commit.
+  pub(crate) wal_deferred_from: Option<usize>,
 }
 
 impl SingleFileTxState {
@@ -196,6 +205,9 @@ impl SingleFileTxState {
       holds_writer: false,
       mvcc_reads: TxKeySet::new(),
       mvcc_writes: TxKeySet::new(),
+      savepoints: Vec::new(),
+      next_savepoint_id: 0,
+      wal_deferred_from: None,
     }
   }
 

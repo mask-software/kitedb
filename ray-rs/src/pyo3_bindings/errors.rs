@@ -101,9 +101,9 @@ pub(crate) fn core_error(err: &CoreError, message: String) -> PyErr {
       NotFoundError::new_err(message)
     }
     CoreError::DatabaseClosed => ClosedError::new_err(message),
-    CoreError::NoTransaction | CoreError::TransactionInProgress => {
-      TransactionError::new_err(message)
-    }
+    CoreError::NoTransaction
+    | CoreError::TransactionInProgress
+    | CoreError::InvalidSavepoint(_) => TransactionError::new_err(message),
     CoreError::DuplicateKey(_) => DuplicateKeyError::new_err(message),
     CoreError::LockFailed(_) => LockError::new_err(message),
     CoreError::InvalidMagic { .. }

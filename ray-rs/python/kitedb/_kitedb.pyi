@@ -548,6 +548,9 @@ class PathEdge:
 # Database Class
 # ============================================================================
 
+class Savepoint:
+    """A savepoint in a write transaction, from ``Database.savepoint()``."""
+
 class Database:
     """Single-file graph database.
 
@@ -580,6 +583,18 @@ class Database:
     def wait_for_token(self, token: str, timeout_ms: int) -> bool: ...
     def rollback(self) -> None: ...
     def has_transaction(self) -> bool: ...
+    def savepoint(self) -> Savepoint:
+        """Take a savepoint in the current write transaction.
+
+        ``rollback_to(savepoint)`` undoes what the transaction did since (its
+        writes, the schema names it defined, and its MVCC writes, which then
+        cause no conflict) and keeps the savepoint; ``release_savepoint``
+        keeps those changes. Savepoints nest: rolling back to or releasing one
+        ends every savepoint taken after it.
+        """
+        ...
+    def rollback_to(self, savepoint: Savepoint) -> None: ...
+    def release_savepoint(self, savepoint: Savepoint) -> None: ...
 
     # Replication
     def primary_replication_status(self) -> Optional[Dict[str, Any]]: ...

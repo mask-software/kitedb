@@ -13,8 +13,8 @@
 
 use crate::core::single_file::{
   close_single_file, close_single_file_with_options, is_single_file_path, open_single_file,
-  single_file_extension, FullEdge, SingleFileCloseOptions, SingleFileDB, SingleFileOpenOptions,
-  SyncMode,
+  single_file_extension, FullEdge, Savepoint, SingleFileCloseOptions, SingleFileDB,
+  SingleFileOpenOptions, SyncMode,
 };
 use crate::error::{KiteError, Result};
 use crate::replication::types::ReplicationRole;
@@ -32,6 +32,9 @@ struct TxHandle<'a> {
   db: &'a SingleFileDB,
   finished: bool,
   owns_tx: bool,
+  /// Taken when a batch or transaction joins one already open: its writes
+  /// roll back to it if it fails.
+  savepoint: Option<Savepoint>,
 }
 
 impl<'a> TxHandle<'a> {
@@ -40,6 +43,7 @@ impl<'a> TxHandle<'a> {
       db,
       finished: false,
       owns_tx,
+      savepoint: None,
     }
   }
 }
@@ -47,10 +51,7 @@ impl<'a> TxHandle<'a> {
 impl<'a> Drop for TxHandle<'a> {
   fn drop(&mut self) {
     if !self.finished {
-      if self.owns_tx {
-        let _ = self.db.rollback();
-      }
-      self.finished = true;
+      abort(self);
     }
   }
 }
@@ -66,19 +67,38 @@ fn begin_tx(db: &SingleFileDB) -> Result<TxHandle<'_>> {
   Ok(TxHandle::new(db, true))
 }
 
+/// `begin_tx` for a batch or transaction: one that joins an open transaction
+/// takes a savepoint, so a failure rolls back only its own writes.
+fn begin_nested_tx(db: &SingleFileDB) -> Result<TxHandle<'_>> {
+  let mut handle = begin_tx(db)?;
+  if !handle.owns_tx {
+    handle.savepoint = Some(db.savepoint()?);
+  }
+  Ok(handle)
+}
+
 fn commit(handle: &mut TxHandle) -> Result<()> {
   if handle.owns_tx {
     handle.db.commit()?;
+  } else if let Some(savepoint) = handle.savepoint.take() {
+    handle.db.release_savepoint(savepoint)?;
   }
   handle.finished = true;
   Ok(())
 }
 
-/// Roll back the transaction `handle` is in, including one it joined: a batch or transaction
-/// that fails inside an open transaction aborts all of it, so none of its writes can be committed
-/// by the outer transaction. A rollback error is ignored: the caller reports the original error.
+/// Undo what `handle` did: roll back the transaction it began, or, in one it
+/// joined under a savepoint, roll back to that savepoint (the open
+/// transaction stays usable). Errors are ignored: the caller reports the
+/// original error.
 fn abort(handle: &mut TxHandle) {
-  let _ = handle.db.rollback();
+  if handle.owns_tx {
+    let _ = handle.db.rollback();
+  } else if let Some(savepoint) = handle.savepoint.take() {
+    if handle.db.rollback_to(&savepoint).is_ok() {
+      let _ = handle.db.release_savepoint(savepoint);
+    }
+  }
   handle.finished = true;
 }
 
@@ -3090,9 +3110,9 @@ impl Kite {
   /// All operations succeed or fail together. If any operation fails,
   /// the entire batch is rolled back.
   ///
-  /// Inside a transaction already open on this thread, the batch joins it: on success its writes
-  /// commit with that transaction; on error the whole open transaction is rolled back (a later
-  /// `commit()` fails with `NoTransaction`) and the operation's error is returned.
+  /// Inside a transaction already open on this thread, the batch joins it under a savepoint: on
+  /// success its writes commit with that transaction; on error they are rolled back to the
+  /// savepoint, the operation's error is returned, and the open transaction stays usable.
   ///
   /// # Example
   /// ```rust,no_run
@@ -3118,7 +3138,7 @@ impl Kite {
   /// # }
   /// ```
   pub fn batch(&mut self, ops: Vec<BatchOp>) -> Result<Vec<BatchResult>> {
-    let mut handle = begin_tx(&self.db)?;
+    let mut handle = begin_nested_tx(&self.db)?;
     let results = ops
       .into_iter()
       .map(|op| apply_batch_op(&mut handle, &self.schema, op))
@@ -3236,9 +3256,9 @@ impl Kite {
   /// the closure returns Ok, or rolled back if an error is returned; the closure's error is
   /// returned even if the rollback fails.
   ///
-  /// Inside a transaction already open on this thread, the closure joins it: on success its
-  /// writes commit with that transaction; on error the whole open transaction is rolled back (a
-  /// later `commit()` fails with `NoTransaction`).
+  /// Inside a transaction already open on this thread, the closure joins it under a savepoint:
+  /// on success its writes commit with that transaction; on error they are rolled back to the
+  /// savepoint and the open transaction stays usable.
   ///
   /// # Example
   /// ```rust,no_run
@@ -3261,7 +3281,7 @@ impl Kite {
     F: FnOnce(&mut TxContext) -> Result<T>,
   {
     let mut ctx = TxContext {
-      handle: begin_tx(&self.db)?,
+      handle: begin_nested_tx(&self.db)?,
       schema: &self.schema,
     };
 

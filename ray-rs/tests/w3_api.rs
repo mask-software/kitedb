@@ -864,7 +864,8 @@ fn a13_traverse_depth_continues_hop_count() {
 }
 
 // ============================================================================
-// A14: transaction()/batch() inside an open tx join it; a failure aborts all of it
+// A14: transaction()/batch() inside an open tx join it under a savepoint; a failure rolls
+// back only its own writes
 // ============================================================================
 
 fn exists(kite: &Kite, key: &str) -> bool {
@@ -884,9 +885,9 @@ fn inside_open_tx<T>(
   (result, commit)
 }
 
-/// After a failed nested call, nothing of the outer transaction may be committed, and the
-/// caller sees the nested call's own error.
-fn check_aborted<T: std::fmt::Debug>(
+/// After a failed nested call, the caller sees its own error, none of its writes is committed,
+/// and the outer transaction's writes are.
+fn check_rolled_back<T: std::fmt::Debug>(
   label: &str,
   kite: &Kite,
   result: kitedb::Result<T>,
@@ -898,20 +899,21 @@ fn check_aborted<T: std::fmt::Debug>(
     Err(error) if original_error(error) => {}
     other => failures.push(format!("{label}: expected its own error, got {other:?}")),
   }
-  if !matches!(commit, Err(KiteError::NoTransaction)) {
+  if let Err(error) = &commit {
     failures.push(format!(
-      "{label}: the outer commit gave {commit:?}, expected NoTransaction (the outer tx is aborted)"
+      "{label}: the outer commit failed ({error}); the outer tx must stay usable"
     ));
   }
-  for key in ["outer", "alice"] {
-    if exists(kite, key) {
-      failures.push(format!("{label}: {key:?} was committed"));
-    }
+  if !exists(kite, "outer") {
+    failures.push(format!("{label}: the outer write was not committed"));
+  }
+  if exists(kite, "alice") {
+    failures.push(format!("{label}: the failed call's write was committed"));
   }
 }
 
 #[test]
-fn a14_failed_nested_transaction_or_batch_aborts_the_open_tx() {
+fn a14_failed_nested_transaction_or_batch_rolls_back_only_its_own_writes() {
   let mut failures = Vec::new();
 
   let (_dir, mut kite) = open(schema());
@@ -921,7 +923,7 @@ fn a14_failed_nested_transaction_or_batch_aborts_the_open_tx() {
       Err(KiteError::Internal("closure failed".into()))
     })
   });
-  check_aborted(
+  check_rolled_back(
     "transaction()",
     &kite,
     result,
@@ -948,7 +950,7 @@ fn a14_failed_nested_transaction_or_batch_aborts_the_open_tx() {
 
   let (_dir, mut kite) = open(schema());
   let (result, commit) = inside_open_tx(&mut kite, |kite| kite.batch(failing_ops()));
-  check_aborted(
+  check_rolled_back(
     "batch()",
     &kite,
     result,
@@ -972,7 +974,7 @@ fn a14_failed_nested_transaction_or_batch_aborts_the_open_tx() {
     }
     tx.execute(kite)
   });
-  check_aborted(
+  check_rolled_back(
     "TxBuilder::execute()",
     &kite,
     result,

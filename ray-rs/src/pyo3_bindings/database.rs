@@ -305,6 +305,42 @@ impl PyDatabase {
     dispatch_ok!(self, |db| db.has_transaction(), |_db| false)
   }
 
+  /// Take a savepoint in the current write transaction.
+  ///
+  /// ``rollback_to(savepoint)`` undoes what the transaction did since (its
+  /// writes, the schema names it defined, and its MVCC writes, which then
+  /// cause no conflict) and keeps the savepoint; ``release_savepoint(savepoint)``
+  /// keeps those changes. Savepoints nest: rolling back to or releasing one
+  /// ends every savepoint taken after it. Taking one copies the
+  /// transaction's pending changes.
+  fn savepoint(&self, py: Python<'_>) -> PyResult<transaction::PySavepoint> {
+    self.with_db_nogil(py, transaction::savepoint_single_file)
+  }
+
+  /// Undo what the current transaction did since ``savepoint``, which stays
+  /// usable.
+  fn rollback_to(&self, py: Python<'_>, savepoint: &transaction::PySavepoint) -> PyResult<()> {
+    let core = savepoint.take("Failed to roll back to the savepoint")?;
+    let (core, result) = py.detach(|| {
+      let result = self.with_db(|db| transaction::rollback_to_single_file(db, &core));
+      (core, result)
+    });
+    savepoint.put(core)?;
+    result
+  }
+
+  /// Release ``savepoint``, keeping what the current transaction did since.
+  fn release_savepoint(
+    &self,
+    py: Python<'_>,
+    savepoint: &transaction::PySavepoint,
+  ) -> PyResult<()> {
+    let core = savepoint.take("Failed to release the savepoint")?;
+    self.with_db_nogil(py, |db| {
+      transaction::release_savepoint_single_file(db, core)
+    })
+  }
+
   /// Commit and return replication commit token (e.g. "2:41") when available.
   fn commit_with_token(&self, py: Python<'_>) -> PyResult<Option<String>> {
     self.with_db_nogil(py, |db| {

@@ -64,6 +64,7 @@ from kitedb._kitedb import (
 
     # Core classes
     Database,
+    Savepoint,
     OpenOptions,
     RuntimeProfile,
     SyncMode,
@@ -281,6 +282,7 @@ __all__ = [
     
     # Core
     "Database",
+    "Savepoint",
     "OpenOptions",
     "RuntimeProfile",
     "SyncMode",

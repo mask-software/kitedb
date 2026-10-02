@@ -21,7 +21,7 @@ use crate::api::traversal::{TraversalBuilder as RustTraversalBuilder, TraversalD
 use crate::backup as core_backup;
 use crate::core::single_file::{
   close_single_file, close_single_file_with_options, is_single_file_path, open_single_file,
-  single_file_extension, ResizeWalOptions as RustResizeWalOptions,
+  single_file_extension, ResizeWalOptions as RustResizeWalOptions, Savepoint as RustSavepoint,
   SingleFileCloseOptions as RustSingleFileCloseOptions, SingleFileDB as RustSingleFileDB,
   SingleFileOpenOptions as RustOpenOptions,
   SingleFileOptimizeOptions as RustSingleFileOptimizeOptions,
@@ -1823,6 +1823,14 @@ enum DatabaseInner {
   SingleFile(Arc<RustSingleFileDB>),
 }
 
+/// A savepoint in a write transaction, from `Database.savepoint()`: roll back
+/// to it with `rollbackTo`, or keep what came after it with
+/// `releaseSavepoint`.
+#[napi]
+pub struct Savepoint {
+  inner: Option<RustSavepoint>,
+}
+
 /// Database handle for single-file storage
 ///
 /// Calls that can block for a long time have `*Async` variants that run on
@@ -2038,6 +2046,58 @@ impl Database {
       Some(DatabaseInner::SingleFile(db)) => db
         .rollback()
         .map_err(|e| Error::from_reason(format!("Failed to rollback: {e}"))),
+      None => Err(Error::from_reason("Database is closed")),
+    }
+  }
+
+  /// Take a savepoint in the current write transaction.
+  ///
+  /// `rollbackTo(savepoint)` undoes what the transaction did since (its
+  /// writes, the schema names it defined, and its MVCC writes, which then
+  /// cause no conflict) and keeps the savepoint; `releaseSavepoint(savepoint)`
+  /// keeps those changes. Savepoints nest: rolling back to or releasing one
+  /// ends every savepoint taken after it. Taking one copies the transaction's
+  /// pending changes.
+  #[napi]
+  pub fn savepoint(&self) -> Result<Savepoint> {
+    match self.inner.as_ref() {
+      Some(DatabaseInner::SingleFile(db)) => db
+        .savepoint()
+        .map(|savepoint| Savepoint {
+          inner: Some(savepoint),
+        })
+        .map_err(|e| Error::from_reason(format!("Failed to take a savepoint: {e}"))),
+      None => Err(Error::from_reason("Database is closed")),
+    }
+  }
+
+  /// Undo what the current transaction did since `savepoint`, which stays
+  /// usable.
+  #[napi]
+  pub fn rollback_to(&self, savepoint: &Savepoint) -> Result<()> {
+    match self.inner.as_ref() {
+      Some(DatabaseInner::SingleFile(db)) => {
+        let savepoint = savepoint.inner.as_ref().ok_or_else(|| {
+          Error::from_reason("Failed to roll back to the savepoint: it was released")
+        })?;
+        db.rollback_to(savepoint)
+          .map_err(|e| Error::from_reason(format!("Failed to roll back to the savepoint: {e}")))
+      }
+      None => Err(Error::from_reason("Database is closed")),
+    }
+  }
+
+  /// Release `savepoint`, keeping what the current transaction did since.
+  #[napi]
+  pub fn release_savepoint(&self, savepoint: &mut Savepoint) -> Result<()> {
+    match self.inner.as_ref() {
+      Some(DatabaseInner::SingleFile(db)) => {
+        let savepoint = savepoint.inner.take().ok_or_else(|| {
+          Error::from_reason("Failed to release the savepoint: it was released already")
+        })?;
+        db.release_savepoint(savepoint)
+          .map_err(|e| Error::from_reason(format!("Failed to release the savepoint: {e}")))
+      }
       None => Err(Error::from_reason("Database is closed")),
     }
   }

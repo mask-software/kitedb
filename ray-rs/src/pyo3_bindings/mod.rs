@@ -59,6 +59,7 @@ pub fn kitedb(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
   // Database class
   m.add_class::<database::PyDatabase>()?;
+  m.add_class::<ops::transaction::PySavepoint>()?;
 
   // Options classes
   m.add_class::<options::OpenOptions>()?;

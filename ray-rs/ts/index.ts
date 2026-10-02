@@ -1502,6 +1502,9 @@ const DATABASE_WRITE_METHODS = [
   'commit',
   'commitWithToken',
   'rollback',
+  'savepoint',
+  'rollbackTo',
+  'releaseSavepoint',
   'createNode',
   'createNodesBatch',
   'upsertNode',
@@ -1647,6 +1650,7 @@ export function bulkWrite<T, D extends NativeDatabase = Database>(
 
 // Re-export other classes with clean names
 export {
+  Savepoint,
   VectorIndex,
   KiteInsertExecutorSingle,
   KiteInsertExecutorMany,

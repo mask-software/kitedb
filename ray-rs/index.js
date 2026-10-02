@@ -593,6 +593,7 @@ module.exports.KiteUpsertByIdBuilder = nativeBinding.KiteUpsertByIdBuilder
 module.exports.KiteUpsertEdgeBuilder = nativeBinding.KiteUpsertEdgeBuilder
 module.exports.KiteUpsertExecutorMany = nativeBinding.KiteUpsertExecutorMany
 module.exports.KiteUpsertExecutorSingle = nativeBinding.KiteUpsertExecutorSingle
+module.exports.Savepoint = nativeBinding.Savepoint
 module.exports.VectorIndex = nativeBinding.VectorIndex
 module.exports.backupInfo = nativeBinding.backupInfo
 module.exports.bruteForceSearch = nativeBinding.bruteForceSearch

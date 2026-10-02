@@ -332,6 +332,64 @@ impl Drop for SingleFileTxGuard<'_> {
   }
 }
 
+/// A point in a write transaction to roll back to: what the transaction had
+/// changed when [`SingleFileDB::savepoint`] took it. Rolling back to it
+/// ([`SingleFileDB::rollback_to`]) undoes the transaction's changes since and
+/// keeps it; releasing it ([`SingleFileDB::release_savepoint`]) keeps them.
+/// Savepoints nest: rolling back to or releasing one ends every savepoint
+/// taken after it. A savepoint belongs to the transaction that took it.
+#[derive(Debug)]
+pub struct Savepoint {
+  txid: TxId,
+  id: u64,
+  pending: DeltaState,
+  schema: SchemaStaging,
+  mvcc_writes: TxKeySet,
+  pending_wal_len: usize,
+}
+
+impl Savepoint {
+  /// The transaction it belongs to.
+  pub fn txid(&self) -> TxId {
+    self.txid
+  }
+}
+
+/// Where `savepoint` is among `tx`'s live savepoints.
+fn live_savepoint(tx: &SingleFileTxState, savepoint: &Savepoint) -> Result<usize> {
+  if tx.txid != savepoint.txid {
+    return Err(KiteError::InvalidSavepoint(format!(
+      "it belongs to transaction {}, not {}",
+      savepoint.txid, tx.txid
+    )));
+  }
+  tx.savepoints
+    .iter()
+    .position(|&id| id == savepoint.id)
+    .ok_or_else(|| {
+      KiteError::InvalidSavepoint(
+        "it was released, or the transaction rolled back to or released an earlier one".into(),
+      )
+    })
+}
+
+/// Names `now` stages that `then` did not, per kind (labels, edge types,
+/// property keys).
+fn names_staged_since(now: &SchemaStaging, then: &SchemaStaging) -> [Vec<String>; 3] {
+  fn since<Id>(now: &HashMap<String, Id>, then: &HashMap<String, Id>) -> Vec<String> {
+    now
+      .keys()
+      .filter(|name| !then.contains_key(*name))
+      .cloned()
+      .collect()
+  }
+  [
+    since(&now.label_names, &then.label_names),
+    since(&now.etype_names, &then.etype_names),
+    since(&now.propkey_names, &then.propkey_names),
+  ]
+}
+
 impl SingleFileDB {
   fn begin_with_mode(&self, read_only: bool, bulk_load: bool) -> Result<TxId> {
     if self.read_only && !read_only {
@@ -499,6 +557,17 @@ impl SingleFileDB {
       })?;
       match written {
         WalWrite::Written(()) => return Ok(()),
+        WalWrite::BlockedOn(cut) => self.wait_for_cut_release(cut)?,
+        WalWrite::NeedsCompaction => self.compact_retired_wal()?,
+      }
+    }
+  }
+
+  /// `write_wal_waiting` for records already built (`WalRecord::build`).
+  fn write_wal_bytes_waiting(&self, records: &[u8]) -> Result<()> {
+    loop {
+      match self.try_write_wal(|wal, pager| wal.write_record_bytes_batch(records, pager))? {
+        WalWrite::Written(_) => return Ok(()),
         WalWrite::BlockedOn(cut) => self.wait_for_cut_release(cut)?,
         WalWrite::NeedsCompaction => self.compact_retired_wal()?,
       }
@@ -733,6 +802,98 @@ impl SingleFileDB {
     Ok(new_dimensions)
   }
 
+  /// Take a savepoint in the calling thread's write transaction (see
+  /// [`Savepoint`]).
+  ///
+  /// It copies the transaction's pending changes, so it costs time and memory
+  /// in proportion to what the transaction changed so far. While a savepoint
+  /// is live, the transaction's WAL records stay in memory; they are written
+  /// once none is live, or by its commit, so rolling back never leaves one in
+  /// the WAL.
+  pub fn savepoint(&self) -> Result<Savepoint> {
+    let (_, handle) = self.require_schema_tx_handle()?;
+    let mut tx = handle.lock();
+    let id = tx.next_savepoint_id;
+    tx.next_savepoint_id += 1;
+    if !tx.bulk_load && tx.wal_deferred_from.is_none() {
+      tx.wal_deferred_from = Some(tx.pending_wal.len());
+    }
+    tx.savepoints.push(id);
+    Ok(Savepoint {
+      txid: tx.txid,
+      id,
+      pending: tx.pending.clone(),
+      schema: tx.schema.clone(),
+      mvcc_writes: tx.mvcc_writes.clone(),
+      pending_wal_len: tx.pending_wal.len(),
+    })
+  }
+
+  /// Undo what the calling thread's transaction changed since `savepoint`:
+  /// its writes and their WAL records, the schema names it defined (and its
+  /// claims on them), and the MVCC writes it recorded, so they cause no
+  /// conflict. Its reads stay recorded: what it does next may depend on
+  /// them. `savepoint` stays live; savepoints taken after it end.
+  pub fn rollback_to(&self, savepoint: &Savepoint) -> Result<()> {
+    let handle = self.current_tx_handle().ok_or(KiteError::NoTransaction)?;
+    let (txid, [labels, etypes, propkeys]) = {
+      let mut tx = handle.lock();
+      let position = live_savepoint(&tx, savepoint)?;
+      tx.savepoints.truncate(position + 1);
+      let staged_since = names_staged_since(&tx.schema, &savepoint.schema);
+      tx.pending = savepoint.pending.clone();
+      tx.schema = savepoint.schema.clone();
+      tx.mvcc_writes = savepoint.mvcc_writes.clone();
+      // A live savepoint keeps every record since it in memory.
+      tx.pending_wal.truncate(savepoint.pending_wal_len);
+      (tx.txid, staged_since)
+    };
+    for name in &labels {
+      self.release_label_reservation(name, txid);
+    }
+    for name in &etypes {
+      self.release_etype_reservation(name, txid);
+    }
+    for name in &propkeys {
+      self.release_propkey_reservation(name, txid);
+    }
+    Ok(())
+  }
+
+  /// Release `savepoint`, keeping what the calling thread's transaction
+  /// changed since; savepoints taken after it end too. Once no savepoint is
+  /// live, the WAL records kept in memory are written (or, if the WAL cannot
+  /// take them now, by the commit).
+  pub fn release_savepoint(&self, savepoint: Savepoint) -> Result<()> {
+    let handle = self.current_tx_handle().ok_or(KiteError::NoTransaction)?;
+    let (deferred_from, records) = {
+      let mut tx = handle.lock();
+      let position = live_savepoint(&tx, &savepoint)?;
+      tx.savepoints.truncate(position);
+      if !tx.savepoints.is_empty() {
+        return Ok(());
+      }
+      let Some(from) = tx.wal_deferred_from.take() else {
+        return Ok(());
+      };
+      (from, tx.pending_wal[from..].to_vec())
+    };
+    if records.is_empty() {
+      return Ok(());
+    }
+    // No lock is held here: a background checkpoint may need to install
+    // before the WAL takes the records.
+    let written = self.write_wal_bytes_waiting(&records);
+    let mut tx = handle.lock();
+    match written {
+      // Only a primary's commit reads the copy (for the replication sidecar).
+      Ok(()) if self.primary_replication.is_none() => tx.pending_wal.truncate(deferred_from),
+      Ok(()) => {}
+      Err(_) => tx.wal_deferred_from = Some(deferred_from),
+    }
+    Ok(())
+  }
+
   /// Commit the current transaction
   pub fn commit(&self) -> Result<()> {
     self.commit_with_token().map(|_| ())
@@ -765,7 +926,7 @@ impl SingleFileDB {
     &self,
     tx_handle: &Arc<Mutex<SingleFileTxState>>,
   ) -> Result<Option<CommitToken>> {
-    let (txid, read_only, bulk_load, holds_writer, pending, pending_wal, staged_schema) = {
+    let (txid, read_only, bulk_load, holds_writer, pending, pending_wal, staged_schema, deferred) = {
       let mut tx = tx_handle.lock();
       let pending = std::mem::take(&mut tx.pending);
       let staged_schema = std::mem::take(&mut tx.schema);
@@ -793,6 +954,7 @@ impl SingleFileDB {
         pending,
         pending_wal,
         staged_schema,
+        tx.wal_deferred_from,
       )
     };
     // Dropped last: the transaction counts as active (blocking checkpoints
@@ -829,12 +991,17 @@ impl SingleFileDB {
       self.group_commit_enabled && self.sync_mode == SyncMode::Normal && !replication_enabled;
 
     // A bulk load writes its whole transaction now, in one batch, so a WAL
-    // that refuses it is left without a partial copy.
+    // that refuses it is left without a partial copy; so are the records a
+    // savepoint kept back.
     let records = {
       let commit = WalRecord::new(WalRecordType::Commit, txid, build_commit_payload()).build();
       if bulk_load {
         let mut records = WalRecord::new(WalRecordType::Begin, txid, build_begin_payload()).build();
         records.extend_from_slice(&pending_wal);
+        records.extend_from_slice(&commit);
+        records
+      } else if let Some(from) = deferred {
+        let mut records = pending_wal[from..].to_vec();
         records.extend_from_slice(&commit);
         records
       } else {
@@ -1402,10 +1569,11 @@ impl SingleFileDB {
   }
 
   /// Log `record` for the transaction `tx_handle`: to the WAL now, or, for a
-  /// bulk load, at its commit. It is encoded once. The transaction keeps a
-  /// copy only when something reads it later: a bulk load's commit writes
-  /// its records then, and a primary's commit hands them to the replication
-  /// sidecar (`publish_commit`).
+  /// bulk load or while a savepoint is live, later (see
+  /// `SingleFileTxState::wal_deferred_from`). It is encoded once. The
+  /// transaction keeps a copy only when something reads it later: its commit
+  /// or savepoint release writes the records it kept back, and a primary's
+  /// commit hands them all to the replication sidecar (`publish_commit`).
   pub(crate) fn write_wal_tx(
     &self,
     tx_handle: &Arc<Mutex<SingleFileTxState>>,
@@ -1413,7 +1581,7 @@ impl SingleFileDB {
   ) -> Result<()> {
     let mut record_bytes = record.build();
     let mut tx = tx_handle.lock();
-    if tx.bulk_load {
+    if tx.bulk_load || tx.wal_deferred_from.is_some() {
       tx.pending_wal.extend_from_slice(&record_bytes);
       return Ok(());
     }
