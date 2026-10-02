@@ -18,7 +18,7 @@ use crate::mvcc::tx_manager::MAX_COMMITTED_WRITES;
 use crate::mvcc::{
   ConflictDetector, GarbageCollector, GcConfig, MvccManager, TxManager, VersionChainManager,
 };
-use crate::types::{MvccTxStatus, NodeId, PropKeyId, PropValue, TxKey};
+use crate::types::{NodeId, PropKeyId, PropValue, TxKey};
 
 fn node_key(i: usize) -> TxKey {
   TxKey::Node(i as NodeId)
@@ -31,15 +31,16 @@ fn prop_key(i: usize) -> TxKey {
   }
 }
 
-/// Committed transactions still held by the manager, and the read/write-set
-/// entries they keep alive.
-fn retained_committed(tx_mgr: &TxManager) -> (usize, usize) {
-  tx_mgr
+/// Transaction records the manager holds beyond the `open` ones the test
+/// keeps open, and the read/write-set entries all records hold (the open ones
+/// record none).
+fn retained(tx_mgr: &TxManager, open: usize) -> (usize, usize) {
+  let records = tx_mgr.all_txs().count();
+  let keys = tx_mgr
     .all_txs()
-    .filter(|(_, tx)| tx.status != MvccTxStatus::Active)
-    .fold((0, 0), |(txs, keys), (_, tx)| {
-      (txs + 1, keys + tx.read_set.len() + tx.write_set.len())
-    })
+    .map(|(_, tx)| tx.read_set.len() + tx.write_set.len())
+    .sum();
+  (records.saturating_sub(open), keys)
 }
 
 fn mvcc_options() -> SingleFileOpenOptions {
@@ -214,6 +215,8 @@ fn prune_keeps_rewritten_keys_a_snapshot_still_needs() {
   let mut tx_mgr = TxManager::new();
   let detector = ConflictDetector::new();
 
+  // An old reader keeps the bulk commit indexed.
+  let (old_reader, _) = tx_mgr.begin_tx();
   let (bulk, _) = tx_mgr.begin_tx();
   for i in 0..MAX_COMMITTED_WRITES {
     tx_mgr.record_write(bulk, node_key(i));
@@ -222,6 +225,7 @@ fn prune_keeps_rewritten_keys_a_snapshot_still_needs() {
 
   let (reader, _) = tx_mgr.begin_tx();
   tx_mgr.record_read(reader, node_key(3));
+  tx_mgr.abort_tx(old_reader);
 
   let (writer, _) = tx_mgr.begin_tx();
   tx_mgr.record_write(writer, node_key(3));
@@ -273,7 +277,7 @@ fn committed_txs_do_not_keep_read_write_sets_while_a_reader_is_open() {
   let _ = gc.run_gc(&mut tx_mgr, &mut version_chain);
 
   assert_eq!(
-    retained_committed(&tx_mgr),
+    retained(&tx_mgr, 1),
     (0, 0),
     "committed transactions (and their read+write-set keys) retained next to one open reader"
   );
@@ -304,7 +308,7 @@ fn db_commits_next_to_a_long_lived_reader_do_not_retain_tx_records() {
   let retained = {
     let mvcc = db.mvcc.as_ref().expect("mvcc enabled");
     let tx_mgr = mvcc.tx_manager.lock();
-    retained_committed(&tx_mgr)
+    retained(&tx_mgr, 1)
   };
   drop(reader);
   assert_eq!(

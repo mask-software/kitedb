@@ -29,7 +29,7 @@ use kitedb::core::single_file::{
   close_single_file, open_single_file, SingleFileDB, SingleFileOpenOptions, SyncMode,
 };
 use kitedb::mvcc::TxManager;
-use kitedb::types::{MvccTxStatus, NodeId, PropValue, TxKey};
+use kitedb::types::{NodeId, PropValue, TxKey};
 
 struct BenchConfig {
   keys: usize,
@@ -72,7 +72,7 @@ fn report(level: &str, mut samples: Vec<Duration>, committed_writes: usize, extr
 
 fn bench_tx_manager(config: &BenchConfig) {
   let mut tx_mgr = TxManager::new();
-  let (_reader, _) = tx_mgr.begin_tx();
+  let (reader, _) = tx_mgr.begin_tx();
 
   let (bulk, _) = tx_mgr.begin_tx();
   for i in 0..config.keys {
@@ -92,7 +92,7 @@ fn bench_tx_manager(config: &BenchConfig) {
 
   let (retained_txs, retained_keys) = tx_mgr
     .all_txs()
-    .filter(|(_, tx)| tx.status != MvccTxStatus::Active)
+    .filter(|(&txid, _)| txid != reader)
     .fold((0, 0), |(txs, keys), (_, tx)| {
       (txs + 1, keys + tx.read_set.len() + tx.write_set.len())
     });

@@ -680,12 +680,10 @@ fn load_snapshot_and_schema(state: &mut SnapshotLoadState<'_>) -> Result<Option<
   }
 }
 
-fn init_mvcc_from_wal(
+fn init_mvcc(
   options: &SingleFileOpenOptions,
   next_tx_id: TxId,
   next_commit_ts: u64,
-  committed_in_order: &[(TxId, Vec<&crate::core::wal::record::ParsedWalRecord>)],
-  delta: &DeltaState,
 ) -> Option<std::sync::Arc<MvccManager>> {
   if !options.mvcc {
     return None;
@@ -702,202 +700,9 @@ fn init_mvcc_from_wal(
     gc_config.max_chain_depth = v;
   }
 
+  // The replayed commits need no version history: no transaction is open
+  // yet, and every one that begins sees them all.
   let mvcc = std::sync::Arc::new(MvccManager::new(next_tx_id, next_commit_ts, gc_config));
-
-  if !committed_in_order.is_empty() {
-    use crate::core::wal::record::{
-      parse_add_edge_payload, parse_add_edge_props_payload, parse_add_edges_batch_payload,
-      parse_add_edges_props_batch_payload, parse_add_node_label_payload, parse_create_node_payload,
-      parse_create_nodes_batch_payload, parse_del_edge_prop_payload, parse_del_node_prop_payload,
-      parse_delete_edge_payload, parse_delete_node_payload, parse_remove_node_label_payload,
-      parse_set_edge_prop_payload, parse_set_edge_props_payload, parse_set_node_prop_payload,
-    };
-
-    for (commit_ts, (txid, records)) in (1u64..).zip(committed_in_order) {
-      for record in records {
-        match record.record_type {
-          WalRecordType::CreateNode => {
-            if let Some(data) = parse_create_node_payload(&record.payload) {
-              if let Some(node_delta) = delta.created_nodes.get(&data.node_id) {
-                let mut vc = mvcc.version_chain.lock();
-                vc.append_node_version(
-                  data.node_id,
-                  NodeVersionData {
-                    node_id: data.node_id,
-                    delta: node_delta.for_version(),
-                  },
-                  *txid,
-                  commit_ts,
-                );
-              }
-            }
-          }
-          WalRecordType::CreateNodesBatch => {
-            if let Some(nodes) = parse_create_nodes_batch_payload(&record.payload) {
-              for data in nodes {
-                if let Some(node_delta) = delta.created_nodes.get(&data.node_id) {
-                  let mut vc = mvcc.version_chain.lock();
-                  vc.append_node_version(
-                    data.node_id,
-                    NodeVersionData {
-                      node_id: data.node_id,
-                      delta: node_delta.for_version(),
-                    },
-                    *txid,
-                    commit_ts,
-                  );
-                }
-              }
-            }
-          }
-          WalRecordType::DeleteNode => {
-            if let Some(data) = parse_delete_node_payload(&record.payload) {
-              let mut vc = mvcc.version_chain.lock();
-              vc.delete_node_version(data.node_id, *txid, commit_ts);
-            }
-          }
-          WalRecordType::AddEdge => {
-            if let Some(data) = parse_add_edge_payload(&record.payload) {
-              let mut vc = mvcc.version_chain.lock();
-              vc.append_edge_version(data.src, data.etype, data.dst, true, *txid, commit_ts);
-            }
-          }
-          WalRecordType::AddEdgesBatch => {
-            if let Some(edges) = parse_add_edges_batch_payload(&record.payload) {
-              let mut vc = mvcc.version_chain.lock();
-              for data in edges {
-                vc.append_edge_version(data.src, data.etype, data.dst, true, *txid, commit_ts);
-              }
-            }
-          }
-          WalRecordType::AddEdgeProps => {
-            if let Some(data) = parse_add_edge_props_payload(&record.payload) {
-              let mut vc = mvcc.version_chain.lock();
-              vc.append_edge_version(data.src, data.etype, data.dst, true, *txid, commit_ts);
-              for (key_id, value) in data.props {
-                vc.append_edge_prop_version(
-                  data.src,
-                  data.etype,
-                  data.dst,
-                  key_id,
-                  Some(std::sync::Arc::new(value)),
-                  *txid,
-                  commit_ts,
-                );
-              }
-            }
-          }
-          WalRecordType::AddEdgesPropsBatch => {
-            if let Some(edges) = parse_add_edges_props_batch_payload(&record.payload) {
-              let mut vc = mvcc.version_chain.lock();
-              for data in edges {
-                vc.append_edge_version(data.src, data.etype, data.dst, true, *txid, commit_ts);
-                for (key_id, value) in data.props {
-                  vc.append_edge_prop_version(
-                    data.src,
-                    data.etype,
-                    data.dst,
-                    key_id,
-                    Some(std::sync::Arc::new(value)),
-                    *txid,
-                    commit_ts,
-                  );
-                }
-              }
-            }
-          }
-          WalRecordType::DeleteEdge => {
-            if let Some(data) = parse_delete_edge_payload(&record.payload) {
-              let mut vc = mvcc.version_chain.lock();
-              vc.append_edge_version(data.src, data.etype, data.dst, false, *txid, commit_ts);
-            }
-          }
-          WalRecordType::SetNodeProp => {
-            if let Some(data) = parse_set_node_prop_payload(&record.payload) {
-              let mut vc = mvcc.version_chain.lock();
-              vc.append_node_prop_version(
-                data.node_id,
-                data.key_id,
-                Some(std::sync::Arc::new(data.value)),
-                *txid,
-                commit_ts,
-              );
-            }
-          }
-          WalRecordType::DelNodeProp => {
-            if let Some(data) = parse_del_node_prop_payload(&record.payload) {
-              let mut vc = mvcc.version_chain.lock();
-              vc.append_node_prop_version(data.node_id, data.key_id, None, *txid, commit_ts);
-            }
-          }
-          WalRecordType::SetEdgeProp => {
-            if let Some(data) = parse_set_edge_prop_payload(&record.payload) {
-              let mut vc = mvcc.version_chain.lock();
-              vc.append_edge_prop_version(
-                data.src,
-                data.etype,
-                data.dst,
-                data.key_id,
-                Some(std::sync::Arc::new(data.value)),
-                *txid,
-                commit_ts,
-              );
-            }
-          }
-          WalRecordType::SetEdgeProps => {
-            if let Some(data) = parse_set_edge_props_payload(&record.payload) {
-              let mut vc = mvcc.version_chain.lock();
-              for (key_id, value) in data.props {
-                vc.append_edge_prop_version(
-                  data.src,
-                  data.etype,
-                  data.dst,
-                  key_id,
-                  Some(std::sync::Arc::new(value)),
-                  *txid,
-                  commit_ts,
-                );
-              }
-            }
-          }
-          WalRecordType::DelEdgeProp => {
-            if let Some(data) = parse_del_edge_prop_payload(&record.payload) {
-              let mut vc = mvcc.version_chain.lock();
-              vc.append_edge_prop_version(
-                data.src,
-                data.etype,
-                data.dst,
-                data.key_id,
-                None,
-                *txid,
-                commit_ts,
-              );
-            }
-          }
-          WalRecordType::AddNodeLabel => {
-            if let Some(data) = parse_add_node_label_payload(&record.payload) {
-              let mut vc = mvcc.version_chain.lock();
-              vc.append_node_label_version(
-                data.node_id,
-                data.label_id,
-                Some(true),
-                *txid,
-                commit_ts,
-              );
-            }
-          }
-          WalRecordType::RemoveNodeLabel => {
-            if let Some(data) = parse_remove_node_label_payload(&record.payload) {
-              let mut vc = mvcc.version_chain.lock();
-              vc.append_node_label_version(data.node_id, data.label_id, None, *txid, commit_ts);
-            }
-          }
-          _ => {}
-        }
-      }
-    }
-  }
-
   mvcc.start();
   Some(mvcc)
 }
@@ -1231,13 +1036,7 @@ fn open_single_file_internal(
   }
 
   // Initialize MVCC if enabled (after WAL replay)
-  let mvcc = init_mvcc_from_wal(
-    &options,
-    next_tx_id,
-    next_commit_ts,
-    &committed_in_order,
-    &delta,
-  );
+  let mvcc = init_mvcc(&options, next_tx_id, next_commit_ts);
 
   if options.read_only && options.replication_role != ReplicationRole::Disabled {
     return Err(KiteError::ReadOnly);

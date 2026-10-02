@@ -107,7 +107,7 @@ impl MvccLocksHeld {
     let handle = thread::spawn(move || {
       let mvcc = db.mvcc.as_ref().expect("mvcc");
       let _tx_manager = mvcc.tx_manager.lock();
-      let _version_chain = mvcc.version_chain.lock();
+      let _version_chain = mvcc.version_chain.write();
       held_tx.send(()).expect("held");
       let _ = release_rx.recv();
     });
@@ -350,7 +350,7 @@ fn commits_record_no_history_for_the_nodes_they_create() {
     .as_ref()
     .expect("mvcc")
     .version_chain
-    .lock()
+    .read()
     .counts();
   let after = old.view(created[0]);
   drop(old);
@@ -385,7 +385,7 @@ fn gc_does_not_hold_the_tx_manager_while_pruning() {
   let holder = {
     let mvcc = Arc::clone(&mvcc);
     thread::spawn(move || {
-      let _version_chain = mvcc.version_chain.lock();
+      let _version_chain = mvcc.version_chain.write();
       held_tx.send(()).expect("held");
       let _ = release_rx.recv();
     })
@@ -434,7 +434,7 @@ fn history_is_dropped_once_no_transaction_needs_it() {
   let mvcc = db.mvcc.as_ref().expect("mvcc");
   let counts = {
     let mut tx_mgr = mvcc.tx_manager.lock();
-    let mut vc = mvcc.version_chain.lock();
+    let mut vc = mvcc.version_chain.write();
     let mut gc = mvcc.gc.lock();
     let _ = gc.run_gc(&mut tx_mgr, &mut vc);
     vc.counts()

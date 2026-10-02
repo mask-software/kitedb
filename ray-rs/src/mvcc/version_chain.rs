@@ -136,6 +136,21 @@ impl<T: Clone, K: Eq + Hash + Clone> SoaPropertyVersions<T, K> {
     self.heads.keys().cloned()
   }
 
+  /// Whether `key` has a chain.
+  pub fn contains(&self, key: &K) -> bool {
+    self.heads.contains_key(key)
+  }
+
+  /// The newest commit timestamp of any chain's head (0 when there is none).
+  pub fn newest_commit_ts(&self) -> Timestamp {
+    self
+      .heads
+      .values()
+      .map(|&idx| self.commit_ts[idx as usize])
+      .max()
+      .unwrap_or(0)
+  }
+
   /// Prune old versions older than the given timestamp
   /// Returns the number of versions pruned
   pub fn prune_old_versions(&mut self, horizon_ts: Timestamp) -> usize {
@@ -378,6 +393,31 @@ pub struct VersionChainManager {
   legacy_edge_props: HashMap<TxKey, Box<VersionedRecord<Option<PropValueRef>>>>,
   /// Legacy node label versions (when SOA is disabled)
   legacy_node_labels: HashMap<TxKey, Box<VersionedRecord<Option<bool>>>>,
+  /// The prop key ids of each node's prop chains, so `node_prop_keys` does not
+  /// scan every chain
+  node_prop_index: HashMap<NodeId, Vec<PropKeyId>>,
+  /// The prop key ids of each edge's prop chains
+  edge_prop_index: HashMap<(NodeId, ETypeId, NodeId), Vec<PropKeyId>>,
+  /// The label ids of each node's label chains
+  node_label_index: HashMap<NodeId, Vec<LabelId>>,
+}
+
+/// Note in `index` that `entity` has a chain for `id`.
+fn index_chain<E: Eq + Hash, I: PartialEq>(index: &mut HashMap<E, Vec<I>>, entity: E, id: I) {
+  let ids = index.entry(entity).or_default();
+  if !ids.contains(&id) {
+    ids.push(id);
+  }
+}
+
+/// The ids `index` holds for `entity`, sorted.
+fn indexed_chains<E: Eq + Hash, I: Copy + Ord>(index: &HashMap<E, Vec<I>>, entity: &E) -> Vec<I> {
+  let mut ids = index.get(entity).cloned().unwrap_or_default();
+  for _ in &ids {
+    examined_key();
+  }
+  ids.sort_unstable();
+  ids
 }
 
 impl VersionChainManager {
@@ -400,7 +440,92 @@ impl VersionChainManager {
       legacy_node_props: HashMap::new(),
       legacy_edge_props: HashMap::new(),
       legacy_node_labels: HashMap::new(),
+      node_prop_index: HashMap::new(),
+      edge_prop_index: HashMap::new(),
+      node_label_index: HashMap::new(),
     }
+  }
+
+  /// Index the chain of node prop `key`, if the last change left one.
+  fn index_node_prop(&mut self, node_id: NodeId, prop_key_id: PropKeyId, key: &TxKey) {
+    let exists = if self.use_soa {
+      self.soa_node_props.contains(key)
+    } else {
+      self.legacy_node_props.contains_key(key)
+    };
+    if exists {
+      index_chain(&mut self.node_prop_index, node_id, prop_key_id);
+    }
+  }
+
+  /// Index the chain of edge prop `key`, if the last change left one.
+  fn index_edge_prop(
+    &mut self,
+    edge: (NodeId, ETypeId, NodeId),
+    prop_key_id: PropKeyId,
+    key: &TxKey,
+  ) {
+    let exists = if self.use_soa {
+      self.soa_edge_props.contains(key)
+    } else {
+      self.legacy_edge_props.contains_key(key)
+    };
+    if exists {
+      index_chain(&mut self.edge_prop_index, edge, prop_key_id);
+    }
+  }
+
+  /// Index the chain of node label `key`, if the last change left one.
+  fn index_node_label(&mut self, node_id: NodeId, label_id: LabelId, key: &TxKey) {
+    let exists = if self.use_soa {
+      self.soa_node_labels.contains(key)
+    } else {
+      self.legacy_node_labels.contains_key(key)
+    };
+    if exists {
+      index_chain(&mut self.node_label_index, node_id, label_id);
+    }
+  }
+
+  /// Drop the index entries of prop and label chains that no longer exist.
+  fn unindex_dropped_prop_chains(&mut self) {
+    let use_soa = self.use_soa;
+    let (soa, legacy) = (&self.soa_node_props, &self.legacy_node_props);
+    self.node_prop_index.retain(|&node_id, ids| {
+      ids.retain(|&id| {
+        let key = Self::node_prop_key(node_id, id);
+        if use_soa {
+          soa.contains(&key)
+        } else {
+          legacy.contains_key(&key)
+        }
+      });
+      !ids.is_empty()
+    });
+    let (soa, legacy) = (&self.soa_edge_props, &self.legacy_edge_props);
+    self.edge_prop_index.retain(|&(src, etype, dst), ids| {
+      ids.retain(|&id| {
+        let key = Self::edge_prop_key(src, etype, dst, id);
+        if use_soa {
+          soa.contains(&key)
+        } else {
+          legacy.contains_key(&key)
+        }
+      });
+      !ids.is_empty()
+    });
+    let (soa, legacy) = (&self.soa_node_labels, &self.legacy_node_labels);
+    self.node_label_index.retain(|&node_id, ids| {
+      ids.retain(|&id| {
+        let key = Self::node_label_key(node_id, id);
+        if use_soa {
+          soa.contains(&key)
+        } else {
+          legacy.contains_key(&key)
+        }
+      });
+      !ids.is_empty()
+    });
   }
 
   // ========================================================================
@@ -549,7 +674,9 @@ impl VersionChainManager {
     let key = Self::node_prop_key(node_id, prop_key_id);
 
     if self.use_soa {
-      self.soa_node_props.append(key, value, txid, commit_ts);
+      self
+        .soa_node_props
+        .append(key.clone(), value, txid, commit_ts);
     } else {
       let existing = self.legacy_node_props.remove(&key);
       let new_version = Box::new(VersionedRecord {
@@ -559,8 +686,9 @@ impl VersionChainManager {
         prev: existing,
         deleted: false,
       });
-      self.legacy_node_props.insert(key, new_version);
+      self.legacy_node_props.insert(key.clone(), new_version);
     }
+    self.index_node_prop(node_id, prop_key_id, &key);
   }
 
   /// Get the latest version for a node property
@@ -604,7 +732,9 @@ impl VersionChainManager {
     let key = Self::edge_prop_key(src, etype, dst, prop_key_id);
 
     if self.use_soa {
-      self.soa_edge_props.append(key, value, txid, commit_ts);
+      self
+        .soa_edge_props
+        .append(key.clone(), value, txid, commit_ts);
     } else {
       let existing = self.legacy_edge_props.remove(&key);
       let new_version = Box::new(VersionedRecord {
@@ -614,8 +744,9 @@ impl VersionChainManager {
         prev: existing,
         deleted: false,
       });
-      self.legacy_edge_props.insert(key, new_version);
+      self.legacy_edge_props.insert(key.clone(), new_version);
     }
+    self.index_edge_prop((src, etype, dst), prop_key_id, &key);
   }
 
   /// Get the latest version for an edge property
@@ -657,7 +788,9 @@ impl VersionChainManager {
     let key = Self::node_label_key(node_id, label_id);
 
     if self.use_soa {
-      self.soa_node_labels.append(key, value, txid, commit_ts);
+      self
+        .soa_node_labels
+        .append(key.clone(), value, txid, commit_ts);
     } else {
       let existing = self.legacy_node_labels.remove(&key);
       let new_version = Box::new(VersionedRecord {
@@ -667,8 +800,9 @@ impl VersionChainManager {
         prev: existing,
         deleted: false,
       });
-      self.legacy_node_labels.insert(key, new_version);
+      self.legacy_node_labels.insert(key.clone(), new_version);
     }
+    self.index_node_label(node_id, label_id, &key);
   }
 
   /// Get the latest version for a node label
@@ -693,112 +827,15 @@ impl VersionChainManager {
   }
 
   pub fn node_prop_keys(&self, node_id: NodeId) -> Vec<PropKeyId> {
-    let mut keys = Vec::new();
-
-    if self.use_soa {
-      for key in self.soa_node_props.keys() {
-        examined_key();
-        if let TxKey::NodeProp {
-          node_id: key_node_id,
-          key_id,
-        } = key
-        {
-          if key_node_id == node_id {
-            keys.push(key_id);
-          }
-        }
-      }
-    } else {
-      for key in self.legacy_node_props.keys() {
-        if let TxKey::NodeProp {
-          node_id: key_node_id,
-          key_id,
-        } = key
-        {
-          if *key_node_id == node_id {
-            keys.push(*key_id);
-          }
-        }
-      }
-    }
-
-    keys.sort_unstable();
-    keys.dedup();
-    keys
+    indexed_chains(&self.node_prop_index, &node_id)
   }
 
   pub fn node_label_keys(&self, node_id: NodeId) -> Vec<LabelId> {
-    let mut keys = Vec::new();
-
-    if self.use_soa {
-      for key in self.soa_node_labels.keys() {
-        examined_key();
-        if let TxKey::NodeLabel {
-          node_id: key_node_id,
-          label_id,
-        } = key
-        {
-          if key_node_id == node_id {
-            keys.push(label_id);
-          }
-        }
-      }
-    } else {
-      for key in self.legacy_node_labels.keys() {
-        if let TxKey::NodeLabel {
-          node_id: key_node_id,
-          label_id,
-        } = key
-        {
-          if *key_node_id == node_id {
-            keys.push(*label_id);
-          }
-        }
-      }
-    }
-
-    keys.sort_unstable();
-    keys.dedup();
-    keys
+    indexed_chains(&self.node_label_index, &node_id)
   }
 
   pub fn edge_prop_keys(&self, src: NodeId, etype: ETypeId, dst: NodeId) -> Vec<PropKeyId> {
-    let mut keys = Vec::new();
-
-    if self.use_soa {
-      for key in self.soa_edge_props.keys() {
-        examined_key();
-        if let TxKey::EdgeProp {
-          src: key_src,
-          etype: key_etype,
-          dst: key_dst,
-          key_id,
-        } = key
-        {
-          if key_src == src && key_etype == etype && key_dst == dst {
-            keys.push(key_id);
-          }
-        }
-      }
-    } else {
-      for key in self.legacy_edge_props.keys() {
-        if let TxKey::EdgeProp {
-          src: key_src,
-          etype: key_etype,
-          dst: key_dst,
-          key_id,
-        } = key
-        {
-          if *key_src == src && *key_etype == etype && *key_dst == dst {
-            keys.push(*key_id);
-          }
-        }
-      }
-    }
-
-    keys.sort_unstable();
-    keys.dedup();
-    keys
+    indexed_chains(&self.edge_prop_index, &(src, etype, dst))
   }
 
   // ========================================================================
@@ -923,17 +960,18 @@ impl VersionChainManager {
     if self.use_soa {
       self
         .soa_node_props
-        .record(key, before, after, txid, commit_ts);
+        .record(key.clone(), before, after, txid, commit_ts);
     } else {
       Self::record_in(
         &mut self.legacy_node_props,
-        key,
+        key.clone(),
         before,
         after,
         txid,
         commit_ts,
       );
     }
+    self.index_node_prop(node_id, prop_key_id, &key);
   }
 
   /// Record a change of an edge property (`None`: unset).
@@ -953,17 +991,18 @@ impl VersionChainManager {
     if self.use_soa {
       self
         .soa_edge_props
-        .record(key, before, after, txid, commit_ts);
+        .record(key.clone(), before, after, txid, commit_ts);
     } else {
       Self::record_in(
         &mut self.legacy_edge_props,
-        key,
+        key.clone(),
         before,
         after,
         txid,
         commit_ts,
       );
     }
+    self.index_edge_prop((src, etype, dst), prop_key_id, &key);
   }
 
   /// Record a change of whether node `node_id` has label `label_id`.
@@ -981,17 +1020,18 @@ impl VersionChainManager {
     if self.use_soa {
       self
         .soa_node_labels
-        .record(key, before, after, txid, commit_ts);
+        .record(key.clone(), before, after, txid, commit_ts);
     } else {
       Self::record_in(
         &mut self.legacy_node_labels,
-        key,
+        key.clone(),
         before,
         after,
         txid,
         commit_ts,
       );
     }
+    self.index_node_label(node_id, label_id, &key);
   }
 
   /// Record a change of the live node holding `key` (`None`: none).
@@ -1068,6 +1108,11 @@ impl VersionChainManager {
     let head = self.node_versions.get(&TxKey::Node(node_id))?;
     history_version(head, snapshot_ts, txid)
       .map(|version| version.filter(|v| !v.deleted).map(|v| &v.data))
+  }
+
+  /// Whether node `node_id` has a version chain.
+  pub fn has_node_history(&self, node_id: NodeId) -> bool {
+    self.node_versions.contains_key(&TxKey::Node(node_id))
   }
 
   /// Whether node `node_id` exists.
@@ -1309,6 +1354,7 @@ impl VersionChainManager {
       pruned += Self::prune_chains(&mut self.legacy_edge_props, horizon_ts);
       pruned += Self::prune_chains(&mut self.legacy_node_labels, horizon_ts);
     }
+    self.unindex_dropped_prop_chains();
 
     pruned
   }
@@ -1481,6 +1527,33 @@ impl VersionChainManager {
   // Utility methods
   // ========================================================================
 
+  /// The newest commit timestamp any chain holds a version for (0 when the
+  /// chains are empty): a reader whose snapshot is newer sees every chain's
+  /// newest version, so no `*_at` lookup answers for it.
+  pub fn newest_commit_ts(&self) -> Timestamp {
+    fn newest<K, T>(chains: &HashMap<K, Box<VersionedRecord<T>>>) -> Timestamp {
+      chains
+        .values()
+        .map(|head| head.commit_ts)
+        .max()
+        .unwrap_or(0)
+    }
+    [
+      newest(&self.node_versions),
+      newest(&self.edge_versions),
+      newest(&self.key_owners),
+      newest(&self.legacy_node_props),
+      newest(&self.legacy_edge_props),
+      newest(&self.legacy_node_labels),
+      self.soa_node_props.newest_commit_ts(),
+      self.soa_edge_props.newest_commit_ts(),
+      self.soa_node_labels.newest_commit_ts(),
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(0)
+  }
+
   /// Check if any edge versions exist
   pub fn has_any_edge_versions(&self) -> bool {
     !self.edge_versions.is_empty()
@@ -1511,6 +1584,9 @@ impl VersionChainManager {
     self.legacy_node_props.clear();
     self.legacy_edge_props.clear();
     self.legacy_node_labels.clear();
+    self.node_prop_index.clear();
+    self.edge_prop_index.clear();
+    self.node_label_index.clear();
   }
 
   /// Get counts for statistics
@@ -2125,7 +2201,7 @@ mod audit_tests {
 
     let mvcc = db.mvcc.as_ref().expect("mvcc enabled").clone();
     {
-      let vc = mvcc.version_chain.lock();
+      let vc = mvcc.version_chain.read();
       assert!(vc.counts().node_prop_versions > 0, "prop versions created");
       assert!(
         vc.counts().node_label_versions > 0,
@@ -2139,13 +2215,13 @@ mod audit_tests {
 
     {
       let mut tx_mgr = mvcc.tx_manager.lock();
-      let mut vc = mvcc.version_chain.lock();
+      let mut vc = mvcc.version_chain.write();
       let mut gc = mvcc.gc.lock();
       let _ = gc.run_gc(&mut tx_mgr, &mut vc);
     }
 
     {
-      let vc = mvcc.version_chain.lock();
+      let vc = mvcc.version_chain.read();
       let counts = vc.counts();
       assert_eq!(
         counts.node_prop_versions, 0,

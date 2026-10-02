@@ -43,7 +43,7 @@ impl NodeIterator {
     let (txid, tx_snapshot_ts) = db.mvcc_read_ts(tx_guard.as_deref());
     let delta = db.delta.read();
     let snapshot = db.snapshot.read();
-    let vc_guard = db.mvcc.as_ref().map(|mvcc| mvcc.version_chain.lock());
+    let vc_guard = db.mvcc_history(tx_snapshot_ts);
     let layers = NodeLayers {
       pending,
       delta: &delta,
@@ -155,7 +155,7 @@ impl SingleFileDB {
     let (txid, tx_snapshot_ts) = self.mvcc_read_ts(tx_guard.as_deref());
     let delta = self.delta.read();
     let snapshot = self.snapshot.read();
-    let vc_guard = self.mvcc.as_ref().map(|mvcc| mvcc.version_chain.lock());
+    let vc_guard = self.mvcc_history(tx_snapshot_ts);
     let layers = NodeLayers {
       pending,
       delta: &delta,
@@ -232,15 +232,17 @@ impl SingleFileDB {
   /// Optionally filter by edge type.
   pub fn list_edges(&self, etype_filter: Option<ETypeId>) -> Vec<FullEdge> {
     let tx_handle = self.current_tx_handle();
-    let tx_guard = tx_handle.as_ref().map(|tx| tx.lock());
+    let mut tx_guard = tx_handle.as_ref().map(|tx| tx.lock());
     let pending = tx_guard.as_ref().map(|tx| &tx.pending);
     // Lock order: see read.rs.
     let (txid, tx_snapshot_ts) = self.mvcc_read_ts(tx_guard.as_deref());
     let delta = self.delta.read();
     let snapshot = self.snapshot.read();
-    let vc_guard = self.mvcc.as_ref().map(|mvcc| mvcc.version_chain.lock());
+    let vc_guard = self.mvcc_history(tx_snapshot_ts);
     let mut edges = Vec::new();
-    let mut read_srcs = (self.mvcc.is_some() && txid != 0).then(HashSet::<NodeId>::new);
+    // A write transaction's reads, for its MVCC conflict check
+    let mut read_srcs = (self.mvcc.is_some() && tx_guard.as_ref().is_some_and(|tx| !tx.read_only))
+      .then(HashSet::<NodeId>::new);
     let layers = NodeLayers {
       pending,
       delta: &delta,
@@ -398,30 +400,16 @@ impl SingleFileDB {
     }
 
     drop(vc_guard);
-    if let (Some(mvcc), Some(srcs)) = (self.mvcc.as_ref(), read_srcs) {
-      let mut tx_mgr = mvcc.tx_manager.lock();
-      if let Some(filter_etype) = etype_filter {
-        for src in srcs {
-          tx_mgr.record_read(
-            txid,
-            TxKey::NeighborsOut {
-              node_id: src,
-              etype: Some(filter_etype),
-            },
-          );
-        }
-      } else {
-        for src in srcs {
-          tx_mgr.record_read(
-            txid,
-            TxKey::NeighborsOut {
-              node_id: src,
-              etype: None,
-            },
-          );
-        }
-      }
-    }
+    self.record_reads(
+      tx_guard.as_deref_mut(),
+      read_srcs
+        .into_iter()
+        .flatten()
+        .map(|src| TxKey::NeighborsOut {
+          node_id: src,
+          etype: etype_filter,
+        }),
+    );
 
     edges
   }

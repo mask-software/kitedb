@@ -182,7 +182,7 @@ struct RoundClaims {
   vector_dimensions: HashMap<PropKeyId, usize>,
   /// MVCC keys written: a later commit of the round that read or wrote one
   /// conflicts, as it would once the earlier one had committed.
-  mvcc_writes: HashSet<TxKey>,
+  mvcc_writes: TxKeySet,
 }
 
 /// A copy of `error` for every further commit of a round it failed.
@@ -594,8 +594,9 @@ impl SingleFileDB {
     }
 
     let snapshot = self.snapshot.read();
-    let mut vc = mvcc.version_chain.lock();
-    super::mvcc_history::record_commit(&mut vc, delta, snapshot.as_ref(), pending, txid, commit_ts);
+    mvcc.record_history(commit_ts, |vc| {
+      super::mvcc_history::record_commit(vc, delta, snapshot.as_ref(), pending, txid, commit_ts);
+    });
   }
 
   /// Load the vector stores `pending_vectors` touches, so the commit's
@@ -751,6 +752,11 @@ impl SingleFileDB {
       let pending = std::mem::take(&mut tx.pending);
       let staged_schema = std::mem::take(&mut tx.schema);
       let pending_wal = std::mem::take(&mut tx.pending_wal);
+      // Its reads join its MVCC read set before the conflict check.
+      let reads = std::mem::take(&mut tx.mvcc_reads);
+      if let (Some(mvcc), false) = (self.mvcc.as_ref(), reads.is_empty()) {
+        mvcc.tx_manager.lock().record_reads(tx.txid, reads);
+      }
       (
         tx.txid,
         tx.read_only,
@@ -1006,13 +1012,16 @@ impl SingleFileDB {
         }
         continue;
       }
-      let mvcc_writes = match self.check_commit_in_mvcc(request.txid, &claims.mvcc_writes) {
-        Ok(mvcc_writes) => mvcc_writes,
-        Err(error) => {
-          outcomes[index] = Some(CommitOutcome::failed(error));
-          continue;
-        }
-      };
+      // Only a later commit of the round needs this one's writes.
+      let claim_writes = !queue.is_empty();
+      let mvcc_writes =
+        match self.check_commit_in_mvcc(request.txid, &claims.mvcc_writes, claim_writes) {
+          Ok(mvcc_writes) => mvcc_writes,
+          Err(error) => {
+            outcomes[index] = Some(CommitOutcome::failed(error));
+            continue;
+          }
+        };
       let before = wal.region_state();
       if let Err(error) = wal.write_record_bytes_batch(&request.records, &mut pager) {
         outcomes[index] = Some(CommitOutcome::failed(error));
@@ -1199,24 +1208,38 @@ impl SingleFileDB {
   /// Check `txid` for MVCC conflicts before its COMMIT record is written:
   /// with the transactions committed since it began, and with `claimed`, the
   /// keys written by commits earlier in its round (committed in MVCC only
-  /// once the round is durable). Returns the keys it writes. A conflict
-  /// aborts it. Callers hold the commit lock, so nothing commits between
+  /// once the round is durable). Returns the keys it writes if
+  /// `claim_writes` (later commits of the round check against them). A
+  /// conflict aborts it. Callers hold the commit lock, so nothing commits between
   /// this check and its MVCC commit (`commit_in_mvcc`).
-  fn check_commit_in_mvcc(&self, txid: TxId, claimed: &HashSet<TxKey>) -> Result<Vec<TxKey>> {
+  fn check_commit_in_mvcc(
+    &self,
+    txid: TxId,
+    claimed: &TxKeySet,
+    claim_writes: bool,
+  ) -> Result<Vec<TxKey>> {
     let Some(mvcc) = self.mvcc.as_ref() else {
       return Ok(Vec::new());
     };
     let mut tx_mgr = mvcc.tx_manager.lock();
     let (mut conflicts, writes) = match tx_mgr.tx(txid) {
-      Some(tx) if tx.status == MvccTxStatus::Active => (
-        tx.read_set
-          .union(&tx.write_set)
-          .filter(|key| claimed.contains(*key))
-          .map(|key| key.to_string())
-          .collect::<Vec<_>>(),
-        tx.write_set.iter().cloned().collect::<Vec<_>>(),
+      Some(tx) => (
+        if claimed.is_empty() {
+          Vec::new()
+        } else {
+          tx.read_set
+            .union(&tx.write_set)
+            .filter(|key| claimed.contains(*key))
+            .map(|key| key.to_string())
+            .collect::<Vec<_>>()
+        },
+        if claim_writes {
+          tx.write_set.iter().cloned().collect::<Vec<_>>()
+        } else {
+          Vec::new()
+        },
       ),
-      _ => {
+      None => {
         return Err(KiteError::Internal(format!(
           "transaction {txid} is not active in MVCC"
         )))
@@ -1940,12 +1963,12 @@ mod tests {
 #[path = "w2_commit_durability_tests.rs"]
 mod w2_tests;
 
-/// raydb-b4 engine-concurrency: group commit and background cuts.
-#[cfg(test)]
-#[path = "b4_commit_tests.rs"]
-mod b4_tests;
 /// raydb-b4 `mvcc` lane, finding 5: transactions that begin during a commit's
 /// publish.
 #[cfg(test)]
 #[path = "b4_mvcc_commit_tests.rs"]
 mod b4_mvcc_commit_tests;
+/// raydb-b4 engine-concurrency: group commit and background cuts.
+#[cfg(test)]
+#[path = "b4_commit_tests.rs"]
+mod b4_tests;

@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use parking_lot::{Mutex, RwLock};
+
 use crate::mvcc::tx_manager::TxManager;
 use crate::mvcc::version_chain::VersionChainManager;
 
@@ -21,8 +23,9 @@ pub const DEFAULT_MAX_CHAIN_DEPTH: usize = 10;
 /// Default GC interval in milliseconds
 pub const DEFAULT_GC_INTERVAL_MS: u64 = 5000;
 
-/// Default retention period in milliseconds
-pub const DEFAULT_RETENTION_MS: u64 = 60000;
+/// Default retention period in milliseconds: none. No transaction can begin
+/// at an older snapshot, so history no open transaction needs is never read.
+pub const DEFAULT_RETENTION_MS: u64 = 0;
 
 // ============================================================================
 // GC Statistics
@@ -141,9 +144,72 @@ impl GarbageCollector {
     let result = self.do_gc(tx_manager, version_chain);
 
     self.running.store(false, Ordering::SeqCst);
-    self.last_run = Some(Instant::now());
 
     result
+  }
+
+  /// Run a GC cycle taking each lock only for its own step, never two at
+  /// once: `gc` for the config and the stats, `tx_manager` for the horizon and
+  /// again for the wall clock mappings, `version_chain` to prune. Commits and
+  /// readers wait only for the step that needs what they need. `pruned` runs
+  /// under the version chain write lock after pruning.
+  ///
+  /// The horizon may be stale by the time the chains are pruned, which is
+  /// safe: transactions begun since have snapshots at or past it, and commits
+  /// since record versions at or past it, so pruning keeps what they need.
+  pub fn run_scoped(
+    gc: &Mutex<GarbageCollector>,
+    tx_manager: &Mutex<TxManager>,
+    version_chain: &RwLock<VersionChainManager>,
+    pruned: impl FnOnce(&VersionChainManager),
+  ) -> GcResult {
+    let config = {
+      let gc = gc.lock();
+      if gc.running.swap(true, Ordering::SeqCst) {
+        return GcResult {
+          skipped: true,
+          ..GcResult::default()
+        };
+      }
+      gc.config.clone()
+    };
+
+    let (min_active_ts, horizon_ts) = {
+      let tx_manager = tx_manager.lock();
+      let min_active_ts = tx_manager.min_active_ts();
+      let retention_horizon_ts = tx_manager.retention_horizon_ts(config.retention_ms);
+      (min_active_ts, min_active_ts.min(retention_horizon_ts))
+    };
+
+    let (versions_pruned, chains_truncated) = {
+      let mut version_chain = version_chain.write();
+      let versions_pruned = version_chain.prune_old_versions(horizon_ts);
+      let chains_truncated =
+        version_chain.truncate_deep_chains(config.max_chain_depth, Some(min_active_ts));
+      pruned(&version_chain);
+      (versions_pruned, chains_truncated)
+    };
+
+    tx_manager.lock().prune_wall_clock_mappings(horizon_ts);
+
+    let mut gc = gc.lock();
+    gc.record_run(versions_pruned, chains_truncated);
+    gc.running.store(false, Ordering::SeqCst);
+    GcResult {
+      versions_pruned,
+      chains_truncated,
+      txs_cleaned: 0,
+      skipped: false,
+    }
+  }
+
+  /// Update the stats after a cycle.
+  fn record_run(&mut self, versions_pruned: usize, chains_truncated: usize) {
+    self.stats.versions_pruned += versions_pruned as u64;
+    self.stats.chains_truncated += chains_truncated as u64;
+    self.stats.gc_runs += 1;
+    self.stats.last_gc_time = current_time_ms();
+    self.last_run = Some(Instant::now());
   }
 
   /// Internal GC implementation
@@ -170,12 +236,7 @@ impl GarbageCollector {
       version_chain.truncate_deep_chains(self.config.max_chain_depth, Some(min_active_ts));
 
     tx_manager.prune_wall_clock_mappings(horizon_ts);
-
-    // Update stats
-    self.stats.versions_pruned += pruned as u64;
-    self.stats.chains_truncated += truncated as u64;
-    self.stats.gc_runs += 1;
-    self.stats.last_gc_time = current_time_ms();
+    self.record_run(pruned, truncated);
 
     GcResult {
       versions_pruned: pruned,
