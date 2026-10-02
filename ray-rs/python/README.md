@@ -137,13 +137,14 @@ results = db.from_(alice).traverse(
 
 ## Concurrent Access
 
-KiteDB supports concurrent read operations from multiple threads. Read operations don't block each other:
+Threads can share one `Database` (or `Kite`). Reads don't wait for other readers or for open write
+transactions, but each read call holds the GIL, so reads from Python threads run one at a time:
 
 ```python
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
-# Multiple threads can read concurrently
+# Threads can share the handle; their reads run one at a time
 def read_user(key):
     return db.get_node_by_key(key)
 
@@ -151,7 +152,7 @@ with ThreadPoolExecutor(max_workers=4) as executor:
     futures = [executor.submit(read_user, f"user:{i}") for i in range(100)]
     results = [f.result() for f in futures]
 
-# Or with asyncio (reads run concurrently)
+# Or with asyncio (keeps the event loop free; the reads still run one at a time)
 import asyncio
 
 async def read_users():
@@ -165,7 +166,8 @@ async def read_users():
 
 **Concurrency model:**
 
-- **Reads are concurrent**: Multiple `get_node_by_key()`, `get_neighbors()`, traversals, etc. can run in parallel
+- **Reads don't wait for writers**: `get_node_by_key()`, `get_out_edges()`, traversals, etc. don't wait for
+  other threads' open transactions, but they hold the GIL while they run, so they don't run in parallel
 - **Writes are concurrent too** (MVCC, on by default): each thread's `begin()` opens its own
   transaction, and write transactions on different threads run at the same time (their
   commits are applied one at a time). A transaction reads the state as of its `begin()`
@@ -182,7 +184,13 @@ Each writable open database runs a background thread that prunes MVCC version hi
 (`mvcc_gc_interval_ms`, default 5000; read-only opens start none); `mvcc_retention_ms`
 defaults to 0.
 
-Note: Python's GIL is released during Rust operations, allowing true parallelism for I/O-bound database access.
+The GIL: point reads and single writes (`get_node_by_key()`, `create_node()`, `set_node_prop()`, ...)
+hold it while they run. Calls that can block or run long release it: `open`/`close`,
+`begin`/`begin_bulk`/`commit`, savepoints, `batch_create_nodes`, `checkpoint`/`optimize`/`vacuum`,
+JSON export/import, backups, replication catch-up and export, `wait_for_token`, streaming chunks and
+vector index training. Other Python threads keep running while a commit syncs the WAL, but read-heavy
+code gets no faster with more threads. For parallel reads, open the file read-only in several processes
+(read-only handles share the file lock; a writable handle holds it alone).
 
 `close()` never deadlocks against a transaction open on another thread. A close-time
 checkpoint (`close_with_checkpoint_if_wal_over`, and `Kite.close()`) waits for such a

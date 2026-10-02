@@ -8,7 +8,6 @@ A high-performance embedded graph database written in Rust, with bindings for No
 - **Periodic compaction** to merge snapshots with deltas
 - **MVCC** (on by default) for snapshot-isolated transactions and concurrent writers
 - **Pathfinding** with Dijkstra and A* algorithms
-- **Caching** for frequently accessed nodes, edges, and properties
 
 ## Features
 
@@ -22,7 +21,6 @@ A high-performance embedded graph database written in Rust, with bindings for No
 - Node and edge properties
 - In/out edge traversal
 - **Graph pathfinding** (shortest path, weighted paths)
-- **Query result caching** with automatic invalidation
 - Snapshot integrity checking
 
 ## Installation
@@ -105,7 +103,8 @@ db.close();
 ```
 
 The `.kitedb` format contains:
-- **Header (page 0)**: Magic, version, page size, snapshot/WAL locations
+- **Header (pages 0 and 1)**: two checksummed copies of the magic, format version (2), page size,
+  snapshot/WAL locations and WAL salts; open uses the newest valid copy
 - **WAL Area**: Linear buffer for write-ahead log records (checkpoint to reclaim space)
 - **Snapshot Area**: CSR snapshot data (mmap-friendly)
 
@@ -121,7 +120,8 @@ The `.kitedb` format contains:
 ### WAL Records
 
 - 8-byte aligned records
-- CRC-32 per record
+- CRC-32 (IEEE) per record, XORed with the WAL region's salt, so a leftover record from an earlier
+  WAL cycle fails its check like a torn one
 - Transaction boundaries (BEGIN/COMMIT/ROLLBACK)
 
 ## Development

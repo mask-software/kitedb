@@ -1834,9 +1834,12 @@ export interface KiteOptions {
   mvccMaxChainDepth?: number
   /** Sync mode for durability (default: "Full") */
   syncMode?: SyncMode
-  /** Enable group commit (coalesce WAL flushes across commits) */
+  /**
+   * Enable group commit (syncMode Normal only): commits that arrive while
+   * others are written are written together, with one WAL flush
+   */
   groupCommitEnabled?: boolean
-  /** Group commit window in milliseconds */
+  /** Unused, kept for compatibility: group commit no longer waits for a window */
   groupCommitWindowMs?: number
   /**
    * WAL size in megabytes, fixed when the file is created. Unset: a new file

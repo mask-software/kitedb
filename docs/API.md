@@ -56,8 +56,9 @@ Kite is organized into several key layers:
 Recommended profile for high write throughput:
 
 - `sync_mode = Normal`
-- `group_commit_enabled = true`
-- `group_commit_window_ms = 2`
+- `group_commit_enabled = true` when several threads commit at once: commits that arrive while
+  a batch is written are written together as the next batch, with one WAL flush (no commit
+  waits for a window; `group_commit_window_ms` is unused)
 - Optional: increase `wal_size` (e.g., 64MB) for heavy ingest to reduce checkpoints
 
 Durability note: `Normal` mode does not `fsync` on every commit. An OS crash can
@@ -527,12 +528,14 @@ KiteDB uses the single-file `.kitedb` format.
 
 ```
 mydb.kitedb
-  Header (page 0)
+  Header (pages 0 and 1: two checksummed copies; open uses the newest valid one)
   WAL Area (linear buffer; checkpoint to reclaim space)
   Snapshot Area (CSR)
 ```
 
-### Snapshot Format (`.gds`)
+The file format version is 2.
+
+### Snapshot Section
 
 - Magic: `GDS1`
 - CSR (Compressed Sparse Row) format for edges
@@ -541,12 +544,12 @@ mydb.kitedb
 - Key index for fast lookups
 - CRC-32 (IEEE) integrity check
 
-### WAL Format (`.gdw`)
+### WAL Records
 
-- Magic: `GDW1`
 - 8-byte aligned records
-- CRC-32 (IEEE) per record
-- Transaction boundaries
+- CRC-32 (IEEE) per record, XORed with the WAL region's salt (stored in the header), so a
+  leftover record from an earlier WAL cycle fails its check like a torn one
+- Transaction boundaries (BEGIN/COMMIT/ROLLBACK)
 
 ## Getting Started
 

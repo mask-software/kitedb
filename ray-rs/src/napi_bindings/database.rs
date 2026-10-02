@@ -193,9 +193,10 @@ pub struct OpenOptions {
   /// false: "Full" then survives crashes but not power loss on macOS, like
   /// SQLite's default.
   pub full_fsync: Option<bool>,
-  /// Enable group commit (coalesce WAL flushes across commits)
+  /// Enable group commit (sync mode Normal only): commits that arrive while
+  /// others are written are written together, with one WAL flush
   pub group_commit_enabled: Option<bool>,
-  /// Group commit window in milliseconds (0 adds no coalescing delay)
+  /// Unused, kept for compatibility: group commit no longer waits for a window
   pub group_commit_window_ms: Option<i64>,
   /// Snapshot parse mode: "Strict" or "Salvage" (single-file only)
   pub snapshot_parse_mode: Option<JsSnapshotParseMode>,

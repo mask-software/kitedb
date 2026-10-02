@@ -552,8 +552,10 @@ export function PerformancePage() {
 			<p>
 				Group commit writes the commits that arrive while a batch is being
 				written as the next batch, with one WAL flush and one header write; no
-				commit waits for a window. It works with MVCC and only helps when
-				several threads commit at once.
+				commit waits for a window (<code>groupCommitWindowMs</code> is unused).
+				It applies only with <code>syncMode=Normal</code> and not on a
+				replication primary, works with MVCC, and only helps when several
+				threads commit at once.
 			</p>
 
 			<h4>Decision table</h4>

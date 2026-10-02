@@ -248,10 +248,11 @@ function OverviewPage() {
 			<RunSource source={VECTOR_SOURCE} />
 
 			<Note>
-				Group commit was off for the graph runs. It is built for concurrent
-				writers: in sync=normal mode a commit can wait up to the group-commit
-				window (2 ms by default), so a single-threaded batch write takes
-				milliseconds instead of microseconds. The{" "}
+				Group commit was off for the graph runs. When they were made, a commit
+				in sync=normal mode with group commit on could wait up to the
+				group-commit window (2 ms by default), so a single-threaded batch write
+				took milliseconds instead of microseconds. Group commit no longer waits
+				for a window. The{" "}
 				<a href="/docs/benchmarks/graph#sync-mode-group-commit">
 					graph benchmarks
 				</a>{" "}
@@ -371,7 +372,8 @@ function GraphPage() {
 			<h2 id="sync-mode-group-commit">Sync mode and group commit</h2>
 			<p>
 				Batch write (100 nodes) p50 from the Rust benchmark on the same graph,
-				for each sync mode with group commit off and on (2 ms window).
+				for each sync mode with group commit off and on (2 ms window; these
+				runs predate the removal of the window).
 			</p>
 			<table>
 				<thead>
@@ -402,10 +404,10 @@ function GraphPage() {
 			<p>
 				Group commit only applies in <code>normal</code> mode and is ignored in{" "}
 				<code>full</code> and <code>off</code>, which is why those rows barely
-				change. In <code>normal</code> mode a single writer can wait up to the
-				group-commit window on each commit, so batch writes go from microseconds
-				to milliseconds. Group commit pays off with concurrent writers, shown
-				below.
+				change. In <code>normal</code> mode a single writer waited up to the
+				group-commit window on each commit in these runs, so batch writes went
+				from microseconds to milliseconds; group commit no longer waits for a
+				window. Group commit pays off with concurrent writers, shown below.
 			</p>
 
 			<h2 id="parallel-write-scaling">Parallel writes</h2>
@@ -515,7 +517,8 @@ function GraphPage() {
 				</li>
 				<li>
 					<code>--group-commit-enabled</code> and{" "}
-					<code>--group-commit-window-ms N</code> (default 2)
+					<code>--group-commit-window-ms N</code> (default 2; accepted, but it
+					has no effect now that group commit no longer waits for a window)
 				</li>
 			</ul>
 			<p>

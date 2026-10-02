@@ -56,7 +56,7 @@ const DISK_BOXES: Box[] = [
 		w: 330,
 		h: 72,
 		title: "Write-ahead log",
-		sub: ["append-only, CRC-32 per record"],
+		sub: ["append-only, salted CRC-32 per record"],
 	},
 	{
 		x: 560,
