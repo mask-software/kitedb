@@ -1549,3 +1549,9 @@ mod tests {
     close_single_file(db).expect("close db");
   }
 }
+
+/// raydb-b4 replication-core: fencing under the commit lock, the snapshot
+/// copy, batched replica apply.
+#[cfg(test)]
+#[path = "b4_replication_tests.rs"]
+mod b4_tests;

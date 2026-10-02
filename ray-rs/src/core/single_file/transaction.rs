@@ -65,8 +65,22 @@ fn post_durable_test_fault() -> Result<()> {
 thread_local! {
   /// Run on this thread's next commit once it is durable, right before its
   /// changes merge into the delta (wave-2 D3 reproduction).
-  static BEFORE_NEXT_COMMIT_MERGE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+  pub(crate) static BEFORE_NEXT_COMMIT_MERGE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
     std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+thread_local! {
+  /// Run on this thread's next commit right before it takes the commit lock.
+  pub(crate) static BEFORE_NEXT_COMMIT_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+    std::cell::RefCell::new(None);
+}
+
+fn before_commit_lock_test_hook() {
+  #[cfg(test)]
+  if let Some(hook) = BEFORE_NEXT_COMMIT_LOCK.with(|hook| hook.borrow_mut().take()) {
+    hook();
+  }
 }
 
 fn before_merge_test_hook() {
@@ -884,6 +898,7 @@ impl SingleFileDB {
     let mut outcomes: Vec<Option<CommitOutcome>> = requests.iter().map(|_| None).collect();
     let mut queue: VecDeque<(usize, CommitRequest)> = requests.into_iter().enumerate().collect();
     while !queue.is_empty() {
+      before_commit_lock_test_hook();
       #[cfg(feature = "bench-profile")]
       let commit_lock_start = Instant::now();
       let commit_guard = self.commit_lock.lock();
