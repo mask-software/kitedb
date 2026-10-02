@@ -955,7 +955,7 @@ fn remove_stale_nodes(
   }
 
   runtime.mark_bootstrap_incomplete()?;
-  let tx_guard = replica.begin_guard(false)?;
+  let tx_guard = replica.begin_replication_apply()?;
   for node_id in stale {
     replica.delete_node(node_id)?;
   }
@@ -974,7 +974,7 @@ fn sync_graph_state<F>(
 where
   F: FnOnce() -> Result<()>,
 {
-  let tx_guard = replica.begin_guard(false)?;
+  let tx_guard = replica.begin_replication_apply()?;
 
   let mut schema_map = sync_schema_names(replica, source, epoch)?;
 
@@ -1128,7 +1128,7 @@ fn apply_replication_frame(
     return Ok(());
   }
 
-  let tx_guard = db.begin_guard(false)?;
+  let tx_guard = db.begin_replication_apply()?;
   for record in &records {
     apply_wal_record_idempotent(db, record, schema_map)?;
   }

@@ -29,13 +29,11 @@ use crate::replication::types::ReplicationRole;
 use crate::types::*;
 use crate::util::compression::CompressionOptions;
 use crate::util::mmap::{map_file_range, Mmap};
-use crate::vector::store::{create_vector_store, vector_store_delete, vector_store_insert};
-use crate::vector::types::VectorStoreConfig;
 
 use super::recovery::{
   committed_transactions, drop_vectors_of_missing_nodes, replay_wal_record, scan_wal_records,
 };
-use super::vector::{materialize_vector_store_from_lazy_entries, vector_store_state_from_snapshot};
+use super::vector::{apply_replayed_vectors, vector_store_state_from_snapshot};
 use super::{BackgroundCheckpointState, SchemaReservations, SingleFileDB};
 
 // ============================================================================
@@ -115,9 +113,12 @@ pub struct SingleFileOpenOptions {
   /// macOS only: with `SyncMode::Full`, sync with `F_FULLFSYNC` so commits
   /// survive power loss (default false). See [`Self::full_fsync`].
   pub full_fsync: bool,
-  /// Enable group commit (coalesce WAL flushes across commits)
+  /// Enable group commit (`SyncMode::Normal` only): commits that arrive while
+  /// others are written are written together, with one WAL flush and one
+  /// header write
   pub group_commit_enabled: bool,
-  /// Group commit window in milliseconds
+  /// Unused, kept for compatibility: group commit no longer waits for more
+  /// commits; those arriving while a batch is written form the next one
   pub group_commit_window_ms: u64,
   /// Snapshot parse behavior (default: Strict)
   pub snapshot_parse_mode: SnapshotParseMode,
@@ -298,13 +299,13 @@ impl SingleFileOpenOptions {
     self
   }
 
-  /// Enable or disable group commit (coalesce WAL flushes across commits)
+  /// Enable or disable group commit (see the `group_commit_enabled` field)
   pub fn group_commit_enabled(mut self, value: bool) -> Self {
     self.group_commit_enabled = value;
     self
   }
 
-  /// Set the group commit window in milliseconds
+  /// Unused, kept for compatibility (see the `group_commit_window_ms` field)
   pub fn group_commit_window_ms(mut self, value: u64) -> Self {
     self.group_commit_window_ms = value;
     self
@@ -1192,37 +1193,13 @@ fn open_single_file_internal(
   };
 
   // Apply pending vector operations from WAL replay
-  for ((node_id, prop_key_id), operation) in delta.pending_vectors.drain() {
-    if let Some(ref snapshot) = snapshot {
-      materialize_vector_store_from_lazy_entries(
-        snapshot,
-        &mut vector_stores,
-        &mut vector_store_lazy_entries,
-        prop_key_id,
-      )?;
-    }
-
-    match operation {
-      Some(vector) => {
-        // Get or create vector store
-        let store = vector_stores.entry(prop_key_id).or_insert_with(|| {
-          let config = VectorStoreConfig::new(vector.len());
-          create_vector_store(config)
-        });
-        vector_store_insert(store, node_id, vector.as_ref()).map_err(|e| {
-          KiteError::InvalidWal(format!(
-            "Failed to apply vector insert during WAL replay for node {node_id} (prop {prop_key_id}): {e}"
-          ))
-        })?;
-      }
-      None => {
-        // Delete operation
-        if let Some(store) = vector_stores.get_mut(&prop_key_id) {
-          vector_store_delete(store, node_id);
-        }
-      }
-    }
-  }
+  apply_replayed_vectors(
+    std::mem::take(&mut delta.pending_vectors),
+    &committed_in_order,
+    snapshot.as_ref(),
+    &mut vector_stores,
+    &mut vector_store_lazy_entries,
+  )?;
   #[cfg(feature = "bench-profile")]
   {
     open_profile.vector_init_ns = open_profile
@@ -1345,7 +1322,6 @@ fn open_single_file_internal(
     checkpoint_compression: options.checkpoint_compression.clone(),
     sync_mode: options.sync_mode,
     group_commit_enabled: options.group_commit_enabled,
-    group_commit_window_ms: options.group_commit_window_ms,
     primary_replication,
     replica_replication,
     #[cfg(feature = "bench-profile")]
