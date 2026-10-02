@@ -349,6 +349,57 @@ fn f4_writable_open_checks_the_wal_in_one_pass() {
   );
 }
 
+/// `check_and_trim` keeps both checks' semantics: a torn tail is trimmed
+/// (and the head moves back to the last readable record), and a CRC-valid
+/// record of an unknown type, here in the secondary region, refuses.
+#[test]
+fn f4_check_and_trim_trims_torn_tails_and_refuses_unknown_types() {
+  use crate::util::crc::crc32;
+  let dir = tempdir().expect("tempdir");
+  let (mut pager, mut wal) = wal_fixture(&dir, 40, 32);
+  for txid in 1..=4 {
+    wal
+      .write_record(&big_record(txid), &mut pager)
+      .expect("write");
+  }
+  let readable = wal.head();
+  wal.write_record(&big_record(5), &mut pager).expect("write");
+  wal.flush(&mut pager).expect("flush");
+  // Tear the last record: its tail never reached the disk.
+  let torn_at = PAGE_SIZE as u64 + wal.head() - 8;
+  pager.write_range(torn_at, &[0xEE; 8]).expect("tear");
+  let (trimmed, reads) = io_hooks::reads_during(|| wal.check_and_trim(&mut pager));
+  assert!(trimmed.expect("check and trim"), "the torn tail was kept");
+  assert_eq!(wal.head(), readable);
+  assert_eq!(
+    reads, 1,
+    "one read of the primary region (the secondary is empty)"
+  );
+
+  // A record of a type this version does not know, its CRC valid.
+  wal.switch_to_secondary();
+  let mut header = crate::types::DbHeaderV1::new(PAGE_SIZE as u32, 32);
+  wal.store_in_header(&mut header);
+  let mut record = big_record(6).build();
+  record[4] = 200;
+  let crc_end =
+    crate::types::WAL_RECORD_HEADER_SIZE + crate::util::binary::read_u32(&record, 16) as usize;
+  let crc = crc32(&record[4..crc_end]) ^ header.wal_secondary_salt;
+  record[crc_end..crc_end + 4].copy_from_slice(&crc.to_le_bytes());
+  pager
+    .write_range(PAGE_SIZE as u64 + wal.head(), &record)
+    .expect("write unknown record");
+  header.wal_start_page = 1;
+  header.wal_secondary_head = wal.head() + record.len() as u64;
+  header.wal_head = header.wal_secondary_head;
+  let mut reopened = WalBuffer::from_header(&header).expect("from header");
+  let refused = reopened.check_and_trim(&mut pager);
+  assert!(
+    matches!(refused, Err(crate::error::KiteError::InvalidWal(_))),
+    "a CRC-valid record of an unknown type was trimmed: {refused:?}"
+  );
+}
+
 // ============================================================================
 // f5: moving post-cut records back into the primary region
 // ============================================================================

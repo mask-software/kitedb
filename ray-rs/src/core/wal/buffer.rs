@@ -691,50 +691,84 @@ impl WalBuffer {
   /// head moved; the caller then persists a header naming the trimmed WAL
   /// before writing more records.
   pub fn trim_to_valid_records(&mut self, pager: &mut FilePager) -> Result<bool> {
+    let primary_end = if self.is_primary_retired() {
+      self.primary_head
+    } else {
+      self.region_end(0, pager)?
+    };
+    let secondary_end = if self.active_region == 1 {
+      self.region_end(1, pager)?
+    } else {
+      self.secondary_head
+    };
+    Ok(self.trim_to(primary_end, secondary_end))
+  }
+
+  /// Prepare the WAL a writable open found for appends, reading and checking
+  /// each region's records once for both steps:
+  ///
+  /// 1. Fail with `InvalidWal` if a region's records stop before its head at
+  ///    a record whose CRC checks but whose type this version does not know
+  ///    (a newer version wrote it). It is not torn, so trimming or compacting
+  ///    the region, which keeps only the records before it, would drop it and
+  ///    every record after it for good. Replay stops at such a record either
+  ///    way.
+  /// 2. Unless the primary region is retired (compacting it keeps only
+  ///    readable records), trim the regions in use as
+  ///    [`Self::trim_to_valid_records`] does, reporting each dropped tail.
+  ///
+  /// Returns whether a head moved; the caller then persists a header naming
+  /// the trimmed WAL before writing more records.
+  pub fn check_and_trim(&mut self, pager: &mut FilePager) -> Result<bool> {
+    let mut ends = [0; 2];
+    for region in [0, 1] {
+      let (start, bytes) = self.region_bytes(region, 0, pager)?;
+      let salt = self.region_salt(region);
+      let valid = wal_records_end(&bytes, salt);
+      let end = start + valid as u64;
+      if end < self.region_head(region) {
+        if let WalRecordAt::UnknownType(record_type) =
+          read_wal_record_with_salt(&bytes, valid, salt)
+        {
+          return Err(KiteError::InvalidWal(format!(
+            "WAL record of unknown type {record_type} at offset {end}, probably written by a \
+             newer version; open the database read-only, or with that version"
+          )));
+        }
+      }
+      ends[usize::from(region)] = end;
+    }
+    if self.is_primary_retired() {
+      return Ok(false);
+    }
+    Ok(self.trim_to(ends[0], ends[1]))
+  }
+
+  /// Trim the regions in use (see [`Self::trim_to_valid_records`]) to where
+  /// their readable records end; returns whether a head moved.
+  fn trim_to(&mut self, primary_end: u64, secondary_end: u64) -> bool {
     let mut trimmed = false;
     if !self.is_primary_retired() {
-      let primary_end = self.region_end(0, pager)?;
       warn_dropped_tail("primary", primary_end, self.primary_head);
       trimmed |= primary_end != self.primary_head;
       self.primary_head = primary_end;
     }
     if self.active_region == 1 {
-      let secondary_end = self.region_end(1, pager)?;
       warn_dropped_tail("secondary", secondary_end, self.secondary_head);
       trimmed |= secondary_end != self.secondary_head;
       self.secondary_head = secondary_end;
     }
-    self.head = if self.active_region == 0 {
+    self.head = self.region_head(self.active_region);
+    trimmed
+  }
+
+  /// The head of `region` (0: primary, 1: secondary).
+  fn region_head(&self, region: u8) -> u64 {
+    if region == 0 {
       self.primary_head
     } else {
       self.secondary_head
-    };
-    Ok(trimmed)
-  }
-
-  /// Fail if a region's records stop before its head at a record whose CRC
-  /// checks but whose type this version does not know (a newer version wrote
-  /// it). It is not torn, so trimming or compacting the region, which keeps
-  /// only the records before it, would drop it and every record after it for
-  /// good. Writable opens check this before rewriting anything; replay stops
-  /// at such a record either way.
-  pub fn check_record_types(&mut self, pager: &mut FilePager) -> Result<()> {
-    for (region, head) in [(0, self.primary_head), (1, self.secondary_head)] {
-      let end = self.region_end(region, pager)?;
-      if end >= head {
-        continue;
-      }
-      let bytes = self.read_at_offset(self.file_offset(end), (head - end) as usize, pager)?;
-      if let WalRecordAt::UnknownType(record_type) =
-        read_wal_record_with_salt(&bytes, 0, self.region_salt(region))
-      {
-        return Err(KiteError::InvalidWal(format!(
-          "WAL record of unknown type {record_type} at offset {end}, probably written by a \
-           newer version; open the database read-only, or with that version"
-        )));
-      }
     }
-    Ok(())
   }
 
   /// Whether the secondary region holds every transaction it commits whole
