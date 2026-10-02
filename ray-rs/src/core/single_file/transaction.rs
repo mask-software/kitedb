@@ -2003,7 +2003,7 @@ impl SingleFileDB {
     };
     let mut tx_mgr = mvcc.tx_manager.lock();
     let mut released = Vec::new();
-    for commit in round {
+    for commit in round.iter_mut() {
       match tx_mgr.commit_tx_releasing(commit.request.txid, &mut released) {
         Ok(commit_ts) => commit.mvcc_commit = Some((commit_ts, tx_mgr.has_open_readers())),
         Err(error) => {
@@ -2013,7 +2013,15 @@ impl SingleFileDB {
         }
       }
     }
-    let horizon = mvcc.history_horizon(&tx_mgr);
+    // Only commits that record history need it.
+    let records_history = round
+      .iter()
+      .any(|commit| matches!(commit.mvcc_commit, Some((_, true))));
+    let horizon = if records_history {
+      mvcc.history_horizon(&tx_mgr)
+    } else {
+      0
+    };
     (released, horizon)
   }
 
