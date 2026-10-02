@@ -10,9 +10,7 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::util::mmap::{map_file, Mmap};
 
-use crate::constants::{
-  LOCK_BYTE_OFFSET, LOCK_BYTE_RANGE, MAX_PAGE_SIZE, MIN_PAGE_SIZE, OS_PAGE_SIZE,
-};
+use crate::constants::{MAX_PAGE_SIZE, MIN_PAGE_SIZE, OS_PAGE_SIZE};
 use crate::error::{KiteError, Result};
 
 #[cfg(test)]
@@ -333,19 +331,6 @@ impl FilePager {
     self.file_size
   }
 
-  /// Calculate the page number range for the lock byte region
-  fn lock_byte_page_range(&self) -> (u32, u32) {
-    let start = (LOCK_BYTE_OFFSET / self.page_size as u64) as u32;
-    let end = (LOCK_BYTE_OFFSET + LOCK_BYTE_RANGE as u64).div_ceil(self.page_size as u64) as u32;
-    (start, end)
-  }
-
-  /// Check if a page number overlaps with the lock byte range
-  fn is_lock_byte_page(&self, page_num: u32) -> bool {
-    let (start, end) = self.lock_byte_page_range();
-    page_num >= start && page_num < end
-  }
-
   /// Read a single page by page number
   pub fn read_page(&mut self, page_num: u32) -> Result<Vec<u8>> {
     let offset = page_num as u64 * self.page_size as u64;
@@ -374,12 +359,6 @@ impl FilePager {
       )));
     }
 
-    // Safety check: don't write to lock byte range
-    if self.is_lock_byte_page(page_num) {
-      return Err(KiteError::Internal(format!(
-        "Cannot write to lock byte page range (page {page_num})"
-      )));
-    }
     self.ensure_no_live_mmap()?;
 
     let offset = page_num as u64 * self.page_size as u64;
@@ -464,21 +443,11 @@ impl FilePager {
     }
     self.ensure_no_live_mmap()?;
 
-    // Calculate current page count
-    let current_page_count = self.file_size.div_ceil(self.page_size as u64) as u32;
-    let mut start_page = current_page_count;
-
-    // Check if we need to skip the lock byte range
-    let (lock_start, lock_end) = self.lock_byte_page_range();
-
-    // If the new allocation would overlap with lock byte range, skip past it
-    if start_page < lock_end && start_page + count > lock_start {
-      // Move start past the lock byte range
-      start_page = lock_end;
-    }
-
-    // Extend file
-    let new_size = (start_page + count) as u64 * self.page_size as u64;
+    // The new pages start at the end of the file. Callers rely on that: no
+    // page is reserved (KiteDB locks the whole file, not SQLite-style lock
+    // bytes at 1 GiB), so no range is ever moved past one.
+    let start_page = self.file_size.div_ceil(self.page_size as u64) as u32;
+    let new_size = (start_page as u64 + count as u64) * self.page_size as u64;
     self.file.set_len(new_size)?;
     self.file_size = new_size;
 
@@ -648,14 +617,6 @@ impl FilePager {
     self.ensure_no_live_mmap()?;
     if src_page == dst_page {
       return Ok(());
-    }
-
-    // Validate destination doesn't overlap with lock byte range
-    let (lock_start, lock_end) = self.lock_byte_page_range();
-    if dst_page < lock_end && dst_page + page_count > lock_start {
-      return Err(KiteError::Internal(
-        "Cannot relocate to lock byte range".to_string(),
-      ));
     }
 
     // Copy the pages furthest into the overlap first, so no source page is

@@ -84,12 +84,6 @@ pub const WAL_DEFAULT_SIZE: usize = 4 * 1024 * 1024;
 /// Minimum WAL to snapshot ratio (10%)
 pub const WAL_MIN_SNAPSHOT_RATIO: f64 = 0.1;
 
-/// SQLite-style lock byte offset (2^30 = 1GB)
-pub const LOCK_BYTE_OFFSET: u64 = 0x40000000;
-
-/// Lock byte range size
-pub const LOCK_BYTE_RANGE: usize = 512;
-
 // ============================================================================
 // Database header flags
 // ============================================================================
