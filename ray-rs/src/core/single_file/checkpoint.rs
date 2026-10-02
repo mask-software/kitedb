@@ -2014,6 +2014,26 @@ impl SingleFileDB {
       delta_edges_start,
       &mut vector_stores_for_snapshot,
     );
+    // A delete only marks its vector deleted in its fragment. The snapshot is
+    // rewritten anyway, so drop fully deleted fragments and copy the live
+    // vectors of sparse ones into new fragments. Vector ids and the node
+    // mappings stay, so the post-cut replay (by node and property) applies
+    // as before. These are the copies `snapshot_vector_stores` validates, so
+    // the compacted stores are the ones serialized and installed.
+    for store in vector_stores_for_snapshot.values_mut() {
+      if store.total_deleted == 0 {
+        continue;
+      }
+      crate::vector::compaction::clear_deleted_fragments(store);
+      // A round compacts a few fragments; each round that compacts removes
+      // at least one, so this many rounds always finish.
+      let strategy = crate::vector::compaction::CompactionStrategy::default();
+      for _ in 0..store.fragments.len() {
+        if !crate::vector::compaction::run_compaction_if_needed(store, &strategy) {
+          break;
+        }
+      }
+    }
     if !vector_stores_for_snapshot.is_empty() {
       for node in &mut nodes {
         node.props.retain(|prop_key_id, value| {
