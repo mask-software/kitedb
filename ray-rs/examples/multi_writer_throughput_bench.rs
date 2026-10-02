@@ -14,6 +14,8 @@
 //!   --sync-mode MODE          Sync mode: full|normal|off (default: normal)
 //!   --group-commit-enabled    Enable group commit (default: false)
 //!   --group-commit-window-ms  Group commit window in ms (default: 2)
+//!   --mvcc                    Enable MVCC (default: false; without it, write
+//!                             transactions run one at a time)
 //!   --keep-db                 Keep the database file after benchmark
 
 use std::env;
@@ -40,6 +42,7 @@ struct BenchConfig {
   sync_mode: SyncMode,
   group_commit_enabled: bool,
   group_commit_window_ms: u64,
+  mvcc: bool,
   keep_db: bool,
 }
 
@@ -56,6 +59,7 @@ impl Default for BenchConfig {
       sync_mode: SyncMode::Normal,
       group_commit_enabled: false,
       group_commit_window_ms: 2,
+      mvcc: false,
       keep_db: false,
     }
   }
@@ -129,6 +133,9 @@ fn parse_args() -> BenchConfig {
           i += 1;
         }
       }
+      "--mvcc" => {
+        config.mvcc = true;
+      }
       "--keep-db" => {
         config.keep_db = true;
       }
@@ -176,6 +183,7 @@ fn main() {
     "Group commit: {} (window {}ms)",
     config.group_commit_enabled, config.group_commit_window_ms
   );
+  println!("MVCC: {}", config.mvcc);
   println!("==================================================================");
 
   let temp_dir = tempdir().expect("temp dir");
@@ -186,6 +194,7 @@ fn main() {
     .sync_mode(config.sync_mode)
     .group_commit_enabled(config.group_commit_enabled)
     .group_commit_window_ms(config.group_commit_window_ms)
+    .mvcc(config.mvcc)
     .auto_checkpoint(false);
 
   let db = open_single_file(&db_path, open_opts).expect("open db");

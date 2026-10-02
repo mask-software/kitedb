@@ -492,12 +492,12 @@ export function PerformancePage() {
 					<code>syncMode=Normal</code> + <code>groupCommitEnabled=false</code>.
 				</li>
 				<li>
-					<strong>Multi-writer throughput:</strong> <code>syncMode=Normal</code>{" "}
-					+ <code>groupCommitEnabled=true</code> (1-2 ms window). In an 8-thread
-					benchmark, group commit raised throughput from 724 to 868 transactions
-					per second. Scaling flattens after a few writers, so for maximum
-					ingest, prepare data in parallel and funnel writes through one writer.
-					See the{" "}
+					<strong>Several writer threads:</strong> <code>mvcc=true</code> +{" "}
+					<code>syncMode=Normal</code> + <code>groupCommitEnabled=true</code>.
+					Without MVCC, write transactions run one at a time, so extra writer
+					threads add nothing. Even with MVCC, several writers rarely beat one,
+					so for maximum ingest, prepare data in parallel and funnel writes
+					through one writer. See the{" "}
 					<a href="/docs/benchmarks#parallel-write-scaling">
 						parallel write scaling notes
 					</a>
@@ -509,9 +509,10 @@ export function PerformancePage() {
 				</li>
 			</ul>
 			<p>
-				Group commit holds commits for a short window so they can share one
-				sync. That raises throughput with concurrent writers but can slow
-				single-threaded benchmarks.
+				Group commit writes the commits that arrive while a batch is being
+				written as the next batch, with one WAL flush and one header write; no
+				commit waits for a window. It only helps when several write
+				transactions commit at once, which needs MVCC.
 			</p>
 
 			<h4>Decision table</h4>
@@ -538,10 +539,10 @@ export function PerformancePage() {
 						<td>Lowest latency per commit</td>
 					</tr>
 					<tr>
-						<td>Multi-writer throughput</td>
+						<td>Several writer threads (with MVCC)</td>
 						<td>Normal</td>
-						<td>On (1-2 ms)</td>
-						<td>Coalesces commits</td>
+						<td>On</td>
+						<td>Batches concurrent commits</td>
 					</tr>
 					<tr>
 						<td>Testing, throwaway data</td>
@@ -563,9 +564,9 @@ export function PerformancePage() {
 					checkpoint.
 				</li>
 				<li>
-					<strong>Multi-writer throughput:</strong> <code>syncMode=Normal</code>{" "}
-					+ <code>groupCommitEnabled=true</code> (1-2 ms window), several
-					operations per transaction.
+					<strong>Several writer threads:</strong> <code>mvcc=true</code>,{" "}
+					<code>syncMode=Normal</code>, <code>groupCommitEnabled=true</code>,
+					several operations per transaction.
 				</li>
 				<li>
 					<strong>Read-heavy, mixed workload:</strong> keep write batches small,

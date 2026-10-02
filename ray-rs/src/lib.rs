@@ -59,6 +59,10 @@ pub mod api;
 #[cfg(test)]
 mod concurrent_tests;
 
+// raydb-b4 engine-concurrency lane repros that need private access
+#[cfg(test)]
+mod b4_engine_concurrency_tests;
+
 // NAPI bindings module
 #[cfg(feature = "napi")]
 pub mod napi_bindings;

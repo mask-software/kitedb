@@ -761,11 +761,24 @@ impl WalBuffer {
     region: u8,
     pager: &mut FilePager,
   ) -> Result<(Vec<ParsedWalRecord>, u64)> {
+    self.scan_region_from(region, 0, pager)
+  }
+
+  /// `scan_region_to_end`, starting at offset `from` (relative to the WAL
+  /// start, a record boundary such as an end this returned; at the region's
+  /// start if before it), to scan on after records already read.
+  pub fn scan_region_from(
+    &mut self,
+    region: u8,
+    from: u64,
+    pager: &mut FilePager,
+  ) -> Result<(Vec<ParsedWalRecord>, u64)> {
     let (start, end) = if region == 0 {
       (self.tail, self.primary_head)
     } else {
       (self.secondary_region_start, self.secondary_head)
     };
+    let start = start.max(from);
     if start >= end {
       return Ok((Vec::new(), end));
     }

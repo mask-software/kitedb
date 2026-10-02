@@ -1142,6 +1142,11 @@ impl VersionChainManager {
     Self::history_in(&self.key_owners, key, snapshot_ts, txid).map(|owner| owner.copied())
   }
 
+  /// Nodes that have a version chain.
+  pub fn chained_node_ids(&self) -> impl Iterator<Item = NodeId> + '_ {
+    self.node_versions.values().map(|head| head.data.node_id)
+  }
+
   /// Nodes that a reader sees in their chains, as existing.
   pub fn nodes_at(&self, snapshot_ts: Timestamp, txid: TxId) -> impl Iterator<Item = NodeId> + '_ {
     self.node_versions.values().filter_map(move |head| {

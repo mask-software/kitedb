@@ -18,25 +18,6 @@ fn set_string_prop(db: &SingleFileDB, node: NodeId, key: PropKeyId, value: &str)
   db.commit().expect("commit");
 }
 
-/// Hold a bulk-load transaction open on another thread until the returned
-/// sender is used (or dropped): an open writer (`active_writers > 0`) that
-/// writes no WAL record.
-fn hold_open_bulk_writer(
-  db: &Arc<SingleFileDB>,
-) -> (mpsc::Sender<()>, std::thread::JoinHandle<()>) {
-  let (opened_tx, opened_rx) = mpsc::channel();
-  let (release_tx, release_rx) = mpsc::channel::<()>();
-  let holder_db = Arc::clone(db);
-  let holder = std::thread::spawn(move || {
-    holder_db.begin_bulk().expect("holder begin");
-    opened_tx.send(()).expect("signal open");
-    let _ = release_rx.recv();
-    holder_db.rollback().expect("holder rollback");
-  });
-  opened_rx.recv().expect("holder opened");
-  (release_tx, holder)
-}
-
 // ---------------------------------------------------------------------------
 // D1: group commit persists the header before the WAL bytes it names.
 // ---------------------------------------------------------------------------
@@ -81,10 +62,10 @@ fn d1_group_commit_crash_image_keeps_acknowledged_commit() {
   set_string_prop(&db, node, key, "CCCC");
   let head_after_ack = db.header.read().wal_head;
 
-  // A bulk transaction writes no WAL record, so the layout matches cycle 1,
-  // but it counts as an open writer: the group-commit leader waits out its
-  // window.
-  let (release_holder, holder) = hold_open_bulk_writer(&db);
+  // (On 39fefea a bulk transaction held open here made the group-commit
+  // leader sleep its window between the header and the WAL flush. Group
+  // commit no longer sleeps, and without MVCC a second writer can no longer be
+  // open beside DDDD's, so the image is taken right after DDDD's header.)
 
   let writer_db = Arc::clone(&db);
   let writer = std::thread::spawn(move || {
@@ -117,8 +98,6 @@ fn d1_group_commit_crash_image_keeps_acknowledged_commit() {
     db.header.read().wal_head
   );
   writer.join().expect("writer thread").expect("DDDD commit");
-  release_holder.send(()).expect("release holder");
-  holder.join().expect("holder thread");
 
   let crashed = open_single_file(&image, options.clone().group_commit_enabled(false))
     .expect("crash image taken after an acknowledged group commit must open");

@@ -1310,7 +1310,7 @@ fn open_single_file_internal(
     next_etype_id: AtomicU32::new(next_etype_id),
     next_propkey_id: AtomicU32::new(next_propkey_id),
     next_tx_id: AtomicU64::new(next_tx_id),
-    current_tx: Mutex::new(HashMap::new()),
+    tx_shared: std::sync::Arc::new(super::tx_registry::TxShared::default()),
     active_writers: AtomicUsize::new(0),
     active_transactions: AtomicUsize::new(0),
     open_write_txids: Mutex::new(HashSet::new()),

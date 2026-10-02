@@ -140,12 +140,79 @@ impl SingleFileDB {
     self.iter_nodes().collect()
   }
 
-  /// Count total nodes in the database
+  /// Count total nodes in the database: the length of `iter_nodes()`,
+  /// without listing them.
   ///
-  /// Optimized to avoid full iteration by using snapshot metadata
-  /// and delta size adjustments.
+  /// The snapshot's node count, adjusted only for the nodes the committed
+  /// delta, the caller's transaction, or the MVCC version chains name, so
+  /// the cost follows those (bounded by the WAL and the open transactions),
+  /// not the graph.
   pub fn count_nodes(&self) -> usize {
-    self.iter_nodes().len()
+    let tx_handle = self.current_tx_handle();
+    let tx_guard = tx_handle.as_ref().map(|tx| tx.lock());
+    let pending = tx_guard.as_ref().map(|tx| &tx.pending);
+    // Lock order: see read.rs.
+    let (txid, tx_snapshot_ts) = self.mvcc_read_ts(tx_guard.as_deref());
+    let delta = self.delta.read();
+    let snapshot = self.snapshot.read();
+    let vc_guard = self.mvcc.as_ref().map(|mvcc| mvcc.version_chain.lock());
+    let layers = NodeLayers {
+      pending,
+      delta: &delta,
+    };
+    let snapshot = snapshot.as_ref();
+    let mvcc_visible = |node_id: NodeId| {
+      vc_guard
+        .as_ref()
+        .and_then(|vc| vc.node_exists_at(node_id, tx_snapshot_ts, txid))
+    };
+    // What `NodeIterator` lists from each source.
+    let from_snapshot = |node_id: NodeId, mvcc: Option<bool>| {
+      snapshot.is_some_and(|snap| snap.has_node(node_id)) && layers.sees_snapshot(node_id, mvcc)
+    };
+    let from_elsewhere = |node_id: NodeId, mvcc: Option<bool>| {
+      (delta.is_node_created(node_id) && layers.sees_delta(node_id, mvcc))
+        || pending.is_some_and(|p| p.is_node_created(node_id))
+        || (mvcc == Some(true) && !layers.pending_masks(node_id))
+    };
+    let chained: Vec<NodeId> = vc_guard
+      .as_ref()
+      .map(|vc| vc.chained_node_ids().collect())
+      .unwrap_or_default();
+    let pending_deleted = pending.into_iter().flat_map(|p| p.deleted_nodes.iter());
+    let pending_created = pending.into_iter().flat_map(|p| p.created_nodes.keys());
+
+    // Every snapshot node is listed unless a layer naming it hides it.
+    let mut count = snapshot.map_or(0, |snap| snap.header.num_nodes as usize);
+    let maybe_hidden: HashSet<NodeId> = delta
+      .deleted_nodes
+      .iter()
+      .chain(pending_deleted)
+      .chain(&chained)
+      .copied()
+      .collect();
+    for node_id in maybe_hidden {
+      let in_snapshot = snapshot.is_some_and(|snap| snap.has_node(node_id));
+      if in_snapshot && !from_snapshot(node_id, mvcc_visible(node_id)) {
+        count -= 1;
+      }
+    }
+    // Plus the nodes listed from the delta, the transaction or the chains,
+    // once, unless listed from the snapshot as well.
+    let maybe_added: HashSet<NodeId> = delta
+      .created_nodes
+      .keys()
+      .chain(pending_created)
+      .chain(&chained)
+      .copied()
+      .collect();
+    for node_id in maybe_added {
+      let mvcc = mvcc_visible(node_id);
+      if from_elsewhere(node_id, mvcc) && !from_snapshot(node_id, mvcc) {
+        count += 1;
+      }
+    }
+    count
   }
 
   /// Count total edges in the database

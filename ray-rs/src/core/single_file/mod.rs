@@ -9,7 +9,6 @@ use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::thread::ThreadId;
 
 use parking_lot::{Condvar, Mutex, RwLock};
 
@@ -37,8 +36,10 @@ mod recovery;
 mod replication;
 mod schema;
 mod transaction;
+mod tx_registry;
 mod vector;
 mod write;
+mod writer_slot;
 
 #[cfg(test)]
 mod stress;
@@ -162,6 +163,9 @@ pub struct SingleFileTxState {
   /// A replica's replication apply; the only transactions in which a
   /// replica accepts data writes.
   pub(crate) replication_apply: bool,
+  /// It holds non-MVCC mode's writer slot (see `writer_slot`), released when
+  /// it is settled.
+  pub(crate) holds_writer: bool,
 }
 
 impl SingleFileTxState {
@@ -175,6 +179,7 @@ impl SingleFileTxState {
       bulk_load,
       pending_wal: Vec::new(),
       replication_apply: false,
+      holds_writer: false,
     }
   }
 }
@@ -212,8 +217,9 @@ pub struct SingleFileDB {
   pub(crate) next_propkey_id: AtomicU32,
   pub(crate) next_tx_id: AtomicU64,
 
-  /// Current active transaction
-  pub(crate) current_tx: Mutex<HashMap<ThreadId, std::sync::Arc<Mutex<SingleFileTxState>>>>,
+  /// Shared with the thread-local entries of this database's transactions
+  /// (see `tx_registry`): each thread keeps its own open transaction.
+  pub(crate) tx_shared: std::sync::Arc<tx_registry::TxShared>,
   /// Active write transactions (excludes read-only)
   pub(crate) active_writers: AtomicUsize,
   /// All transactions that have begun and have not finished commit/rollback.
@@ -350,6 +356,12 @@ pub(crate) struct BackgroundCheckpointState {
   /// the last declined cut. A cut is not retried before one of them
   /// finishes: until then the copies only grow.
   pub(crate) declined_carry: Option<HashSet<TxId>>,
+  /// Blocking checkpoints, optimizes, vacuums and WAL resizes waiting in
+  /// `exclusive_checkpoint_gate`. While any wait, new background checkpoints
+  /// decline instead of claiming `status` ahead of them: a waiter that finds
+  /// a run in progress whenever it gets the gate would wait forever behind a
+  /// background checkpoint loop.
+  pub(crate) exclusive_waiters: usize,
 }
 
 impl Default for BackgroundCheckpointState {
@@ -361,6 +373,7 @@ impl Default for BackgroundCheckpointState {
       cut: 0,
       writers_waited: false,
       declined_carry: None,
+      exclusive_waiters: 0,
     }
   }
 }
@@ -448,13 +461,6 @@ impl SingleFileDB {
       self.persist_header(&mut pager, &mut header, false)?;
     }
     pager.sync()
-  }
-
-  pub(crate) fn wait_for_no_active_transactions(&self) {
-    let mut wait = self.checkpoint_wait.lock();
-    while self.active_transactions.load(Ordering::Acquire) != 0 {
-      self.checkpoint_cv.wait(&mut wait);
-    }
   }
 
   pub(crate) fn transaction_finished(&self, txid: TxId, wrote_begin: bool) {
