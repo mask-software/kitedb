@@ -5,6 +5,9 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT_DIR="${OUT_DIR:-$ROOT_DIR/../docs/benchmarks/results}"
 
 ITERATIONS="${ITERATIONS:-20000}"
+# Commits (each a bulk batch of 100 nodes) sampled for the p95 write latency.
+# See the P95_MAX_RATIO note for why this is large.
+NODE_BATCHES="${NODE_BATCHES:-2000}"
 NODES="${NODES:-10000}"
 EDGES="${EDGES:-0}"
 EDGE_TYPES="${EDGE_TYPES:-1}"
@@ -12,11 +15,34 @@ EDGE_PROPS="${EDGE_PROPS:-0}"
 VECTOR_COUNT="${VECTOR_COUNT:-0}"
 SYNC_MODE="${SYNC_MODE:-normal}"
 REPLICATION_SEGMENT_MAX_BYTES="${REPLICATION_SEGMENT_MAX_BYTES:-1073741824}"
+# P95_MAX_RATIO bounds the p95 commit latency with a primary sidecar over the
+# same run with replication off, as the median over ATTEMPTS pairs of runs.
+#
+# In Normal and Off sync the sidecar buffers frames in memory, so a commit adds
+# only its epoch-fence check (a stat of the manifest), the frame bookkeeping,
+# and, once per 100 ms publish, a primary-unflushed marker create. That is
+# irreducible work, a few microseconds on a ~40 us commit.
+#
+# The sample used to be fixed at 50 commits, so the p95 was the third slowest:
+# a few slow commits (warm-up after the checkpoint, the first marker create)
+# and runner noise decided it, not the steady-state cost. Gate values measured
+# 2026-10-02:
+#   50 commits, median of 3: CI 1.33 and 1.54 (the last two main pushes;
+#                 earlier pushes, with slower baseline commits, 0.86-1.18),
+#                 Linux in Docker 1.16-1.31, macOS 1.18-1.30.
+#   2000 commits, 8 gate runs each (median of 3 or 5): Linux in Docker
+#                 1.06-1.10, macOS 0.94-1.10. Single pairs ranged 0.95-1.47
+#                 and 0.71-1.46; the median outvotes them, and CI runs 5
+#                 attempts so two noisy pairs cannot fail it.
+# Regressions it still catches, injected and measured on Linux at 2000 commits:
+# persisting the manifest on every append 47x, syncing every append 44x. One
+# write(2) per append (no buffering) costs 1.13x on Linux and passes, as would
+# any cost under about 30% of a commit (some 12 us here).
 P95_MAX_RATIO="${P95_MAX_RATIO:-1.30}"
 ATTEMPTS="${ATTEMPTS:-7}"
 
-if [[ "$ITERATIONS" -lt 100 ]]; then
-  echo "ITERATIONS must be >= 100 (single_file_raw_bench writes run iterations/100 batches)"
+if [[ "$NODE_BATCHES" -lt 200 ]]; then
+  echo "NODE_BATCHES must be >= 200 (a p95 over fewer commits is a handful of outliers)"
   exit 1
 fi
 if [[ "$ATTEMPTS" -lt 1 ]]; then
@@ -41,6 +67,7 @@ run_bench() {
       --edge-props "$EDGE_PROPS" \
       --vector-count "$VECTOR_COUNT" \
       --iterations "$ITERATIONS" \
+      --node-batches "$NODE_BATCHES" \
       --sync-mode "$SYNC_MODE" \
       --replication-segment-max-bytes "$REPLICATION_SEGMENT_MAX_BYTES" \
       --no-auto-checkpoint \

@@ -109,9 +109,11 @@ jobs:
           STAMP: ci-${{ github.run_id }}-${{ github.run_attempt }}
           # CI-tuned defaults to reduce runtime while keeping meaningful signal.
           ITERATIONS: "10000"
+          # See P95_MAX_RATIO in scripts/replication-bench-gate.sh.
+          NODE_BATCHES: "2000"
           SEED_COMMITS: "1000"
           BACKLOG_COMMITS: "3000"
-          ATTEMPTS: "3"
+          ATTEMPTS: "5"
           P95_MAX_RATIO: "1.30"
           MIN_CATCHUP_FPS: "2500"
           MIN_THROUGHPUT_RATIO: "0.10"
