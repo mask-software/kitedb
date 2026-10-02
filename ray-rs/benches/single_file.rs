@@ -36,15 +36,30 @@ struct OpenCloseFixture {
   wal_size: usize,
 }
 
-fn seed_graph_fixture(
-  path: &Path,
-  node_count: usize,
-  edge_count: usize,
+const MIB: usize = 1024 * 1024;
+
+/// What an open/close fixture file holds.
+#[derive(Clone, Copy, Default)]
+struct FixtureSpec {
+  nodes: usize,
+  edges: usize,
+  /// Nodes created after the final checkpoint, so they stay in the WAL.
   dirty_wal_tail: usize,
-  vector_count: usize,
+  /// Nodes (the first ones) that get a vector of `vector_dims` dimensions.
+  vectors: usize,
   vector_dims: usize,
   wal_size: usize,
-) {
+}
+
+fn seed_graph_fixture(path: &Path, spec: FixtureSpec) {
+  let FixtureSpec {
+    nodes: node_count,
+    edges: edge_count,
+    dirty_wal_tail,
+    vectors: vector_count,
+    vector_dims,
+    wal_size,
+  } = spec;
   let db = open_single_file(
     path,
     SingleFileOpenOptions::new()
@@ -111,12 +126,12 @@ fn seed_graph_fixture(
       for start in (0..vector_count).step_by(VECTOR_BATCH_SIZE) {
         let end = (start + VECTOR_BATCH_SIZE).min(vector_count);
         db.begin(false).expect("expected value");
-        for i in start..end {
+        for (i, &node_id) in node_ids.iter().enumerate().take(end).skip(start) {
           let mut vector = vec![0.0f32; vector_dims];
           for (dim, value) in vector.iter_mut().enumerate() {
             *value = (((i + dim + 1) % 97) as f32) / 97.0;
           }
-          db.set_node_vector(node_ids[i], vector_prop, &vector)
+          db.set_node_vector(node_id, vector_prop, &vector)
             .expect("expected value");
         }
         db.commit().expect("expected value");
@@ -145,34 +160,21 @@ fn seed_graph_fixture(
 fn build_open_close_fixture(
   temp_dir: &tempfile::TempDir,
   name: &'static str,
-  node_count: usize,
-  edge_count: usize,
-  dirty_wal_tail: usize,
-  vector_count: usize,
-  vector_dims: usize,
-  wal_size: usize,
+  spec: FixtureSpec,
 ) -> OpenCloseFixture {
   let path = temp_dir.path().join(format!("open-close-{name}.kitedb"));
-  seed_graph_fixture(
-    &path,
-    node_count,
-    edge_count,
-    dirty_wal_tail,
-    vector_count,
-    vector_dims,
-    wal_size,
-  );
+  seed_graph_fixture(&path, spec);
 
   let size = fs::metadata(&path).expect("expected value").len();
   println!(
-    "prepared fixture {name}: nodes={node_count}, edges={edge_count}, vectors={vector_count}, vector_dims={vector_dims}, wal_size={} bytes, file_size={} bytes",
-    wal_size, size
+    "prepared fixture {name}: nodes={}, edges={}, vectors={}, vector_dims={}, wal_size={} bytes, file_size={} bytes",
+    spec.nodes, spec.edges, spec.vectors, spec.vector_dims, spec.wal_size, size
   );
 
   OpenCloseFixture {
     name,
     path,
-    wal_size,
+    wal_size: spec.wal_size,
   }
 }
 
@@ -252,36 +254,45 @@ fn bench_single_file_open_close(c: &mut Criterion) {
 
   let temp_dir = tempdir().expect("expected value");
   let fixtures = vec![
-    build_open_close_fixture(&temp_dir, "empty", 0, 0, 0, 0, 0, 4 * 1024 * 1024),
+    build_open_close_fixture(
+      &temp_dir,
+      "empty",
+      FixtureSpec {
+        wal_size: 4 * MIB,
+        ..FixtureSpec::default()
+      },
+    ),
     build_open_close_fixture(
       &temp_dir,
       "graph_1k_2k",
-      1_000,
-      2_000,
-      0,
-      0,
-      0,
-      4 * 1024 * 1024,
+      FixtureSpec {
+        nodes: 1_000,
+        edges: 2_000,
+        wal_size: 4 * MIB,
+        ..FixtureSpec::default()
+      },
     ),
     build_open_close_fixture(
       &temp_dir,
       "graph_10k_20k",
-      10_000,
-      20_000,
-      0,
-      0,
-      0,
-      4 * 1024 * 1024,
+      FixtureSpec {
+        nodes: 10_000,
+        edges: 20_000,
+        wal_size: 4 * MIB,
+        ..FixtureSpec::default()
+      },
     ),
     build_open_close_fixture(
       &temp_dir,
       "graph_10k_20k_vec5k",
-      10_000,
-      20_000,
-      0,
-      5_000,
-      128,
-      4 * 1024 * 1024,
+      FixtureSpec {
+        nodes: 10_000,
+        edges: 20_000,
+        vectors: 5_000,
+        vector_dims: 128,
+        wal_size: 4 * MIB,
+        ..FixtureSpec::default()
+      },
     ),
   ];
 
@@ -377,42 +388,46 @@ fn bench_single_file_open_close_limits(c: &mut Criterion) {
     build_open_close_fixture(
       &temp_dir,
       "graph_10k_20k_dirty_wal",
-      10_000,
-      20_000,
-      2_000,
-      0,
-      0,
-      64 * 1024 * 1024,
+      FixtureSpec {
+        nodes: 10_000,
+        edges: 20_000,
+        dirty_wal_tail: 2_000,
+        wal_size: 64 * MIB,
+        ..FixtureSpec::default()
+      },
     ),
     build_open_close_fixture(
       &temp_dir,
       "graph_100k_200k",
-      100_000,
-      200_000,
-      0,
-      0,
-      0,
-      64 * 1024 * 1024,
+      FixtureSpec {
+        nodes: 100_000,
+        edges: 200_000,
+        wal_size: 64 * MIB,
+        ..FixtureSpec::default()
+      },
     ),
     build_open_close_fixture(
       &temp_dir,
       "graph_100k_200k_vec20k",
-      100_000,
-      200_000,
-      0,
-      20_000,
-      128,
-      64 * 1024 * 1024,
+      FixtureSpec {
+        nodes: 100_000,
+        edges: 200_000,
+        vectors: 20_000,
+        vector_dims: 128,
+        wal_size: 64 * MIB,
+        ..FixtureSpec::default()
+      },
     ),
     build_open_close_fixture(
       &temp_dir,
       "graph_100k_200k_dirty_wal",
-      100_000,
-      200_000,
-      20_000,
-      0,
-      0,
-      64 * 1024 * 1024,
+      FixtureSpec {
+        nodes: 100_000,
+        edges: 200_000,
+        dirty_wal_tail: 20_000,
+        wal_size: 64 * MIB,
+        ..FixtureSpec::default()
+      },
     ),
   ];
 

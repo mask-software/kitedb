@@ -80,11 +80,12 @@ jobs:
         with:
           workspaces: ray-rs
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      # Lints the lib, its unit tests and the integration tests; any finding fails.
+      # Lints the lib, its unit tests, the integration tests, the examples and
+      # the benches; any finding fails.
       - name: cargo clippy (no default features)
-        run: cargo clippy --lib --tests --no-default-features -- -D warnings
+        run: cargo clippy --lib --tests --examples --benches --no-default-features -- -D warnings
       - name: cargo clippy (default features)
-        run: cargo clippy --lib --tests -- -D warnings
+        run: cargo clippy --lib --tests --examples --benches -- -D warnings
 
   rust-fmt:
     name: Rust fmt

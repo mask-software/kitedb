@@ -2,9 +2,9 @@
 //!
 //! Tests two modes:
 //! 1) Sequential: tree-sitter parse -> TS graph write -> SCIP parse -> SCIP graph write ->
-//!                embed (simulated network) -> vector write.
-//! 2) Parallel:   tree-sitter + SCIP parse in parallel -> unified graph write -> enqueue;
-//!                async embed workers batch results; vector writer applies batched writes.
+//!    embed (simulated network) -> vector write.
+//! 2) Parallel: tree-sitter + SCIP parse in parallel -> unified graph write -> enqueue;
+//!    async embed workers batch results; vector writer applies batched writes.
 //!
 //! Goal: verify whether network latency dominates enough that async batching is the
 //! right architecture choice.
@@ -676,8 +676,6 @@ fn run_parallel(config: &BenchConfig, events: &[ChangeEvent]) -> BenchResult {
     let queue = Arc::clone(&queue);
     let tx = result_tx.clone();
     let batch_size = config.embed_batch_size;
-    let embed_sleep = embed_sleep;
-    let embed_flush = embed_flush;
     embed_handles.push(thread::spawn(move || {
       while let Some(batch) = take_embed_batch(&queue, batch_size, embed_flush) {
         if !embed_sleep.is_zero() {
