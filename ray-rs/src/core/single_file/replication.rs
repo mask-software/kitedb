@@ -453,7 +453,7 @@ impl SingleFileDB {
 
     let (position, (byte_length, checksum_crc32, data)) = {
       let _checkpoint_gate = self.checkpoint_gate.read();
-      let _commit_guard = self.commit_lock.lock();
+      let _commit_guard = self.lock_commits();
       if self.sync_mode == SyncMode::Off {
         self.persist_for_close()?;
       }

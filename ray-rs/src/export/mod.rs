@@ -220,7 +220,7 @@ fn with_commits_paused<T>(db: &SingleFileDB, read: impl FnOnce() -> T) -> T {
   // this thread's open transaction, so a read permit would never come. That
   // transaction keeps blocking checkpoints and compaction out by itself.
   let _checkpoint_gate = (!db.has_transaction()).then(|| db.checkpoint_gate.read());
-  let _commit_guard = db.commit_lock.lock();
+  let _commit_guard = db.lock_commits();
   read()
 }
 

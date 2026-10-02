@@ -82,7 +82,7 @@ pub fn create_backup_single_file(
   // write side. Holding both keeps every writer out of the file mid-copy.
   let size = {
     let _checkpoint_gate = db.checkpoint_gate.read();
-    let _commit_guard = db.commit_lock.lock();
+    let _commit_guard = db.lock_commits();
     replace_file_durably(&db.path, &backup_path)?
   };
 

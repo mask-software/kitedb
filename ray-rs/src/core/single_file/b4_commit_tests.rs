@@ -67,7 +67,7 @@ fn group_committed_transaction_does_not_make_background_cuts_decline() {
   publishing_rx.recv().expect("commit durable and publishing");
   // The leader finishes publishing, then waits for this lock to deliver the
   // batch's outcomes, so its committer cannot finish its transaction.
-  let held = db.group_commit_state.lock();
+  let held = db.commit_queue.state.lock();
   go_tx.send(()).expect("let it publish");
   wait_until("the grouped commit to merge", || {
     db.node_by_key("grouped").is_some()

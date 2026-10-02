@@ -51,7 +51,7 @@ pub use open::{
   close_single_file, close_single_file_with_options, open_single_file, SingleFileCloseOptions,
   SingleFileOpenOptions, SnapshotParseMode, SyncMode,
 };
-pub(crate) use transaction::GroupCommitState;
+pub(crate) use transaction::CommitQueue;
 pub use transaction::{Savepoint, SingleFileTxGuard};
 
 // Also re-export recovery items that are used externally
@@ -164,9 +164,9 @@ pub struct SingleFileTxState {
   pub pending: DeltaState,
   pub(crate) schema: SchemaStaging,
   pub bulk_load: bool,
-  /// The transaction's WAL records, unsalted, kept only for those that read
-  /// them at commit: a bulk load (written then) and a primary's replication
-  /// sidecar.
+  /// The transaction's WAL records, unsalted: those not written to the WAL
+  /// yet (see `wal_deferred_from`), and all of them for a primary's
+  /// replication sidecar, which reads them at commit.
   pub pending_wal: Vec<u8>,
   /// A replica's replication apply; the only transactions in which a
   /// replica accepts data writes.
@@ -184,12 +184,27 @@ pub struct SingleFileTxState {
   pub(crate) savepoints: Vec<u64>,
   /// The id its next savepoint gets.
   pub(crate) next_savepoint_id: u64,
-  /// While a savepoint is live, the WAL records it writes stay here, in
-  /// `pending_wal` from this offset on, so rolling back drops them before
-  /// they reach the WAL. They are written once no savepoint is live, or by
-  /// its commit.
+  /// The WAL records not written to the WAL yet: those in `pending_wal`
+  /// from this offset on. A write transaction keeps its records here from
+  /// its begin, its BEGIN record included (unwritten until `wal_begun`), so
+  /// a small one reaches the WAL whole at commit, written by its commit
+  /// group with no lock of its own. Once they outgrow `WAL_DEFER_BYTES`
+  /// with no savepoint live, they are written (with the BEGIN record), and
+  /// the transaction's later records go straight to the WAL. While a
+  /// savepoint is live they always stay here, so rolling back to it drops
+  /// them before they reach the WAL. A bulk load writes all its records at
+  /// commit.
   pub(crate) wal_deferred_from: Option<usize>,
+  /// Its BEGIN record is in the WAL (it is among `open_write_txids`, which
+  /// a background checkpoint cut copies the records of).
+  pub(crate) wal_begun: bool,
 }
+
+/// Bytes of WAL records a write transaction keeps to itself before it
+/// writes them to the WAL (see `SingleFileTxState::wal_deferred_from`).
+/// Below this the copy into the WAL under its commit group's locks is cheap;
+/// above it, the transaction writes its records itself, as it makes them.
+pub(crate) const WAL_DEFER_BYTES: usize = 16 * 1024;
 
 impl SingleFileTxState {
   pub fn new(txid: TxId, read_only: bool, snapshot_ts: u64, bulk_load: bool) -> Self {
@@ -207,7 +222,8 @@ impl SingleFileTxState {
       mvcc_writes: TxKeySet::new(),
       savepoints: Vec::new(),
       next_savepoint_id: 0,
-      wal_deferred_from: None,
+      wal_deferred_from: (!read_only && !bulk_load).then_some(0),
+      wal_begun: false,
     }
   }
 
@@ -288,13 +304,22 @@ pub struct SingleFileDB {
   /// writers waiting for that in `wait_for_cut_release` park here.
   pub(crate) cut_cv: Condvar,
 
-  /// Serialize commit operations to preserve WAL/delta ordering
+  /// Serializes writing commits: a commit group's checks, WAL records,
+  /// header and replication frames (see `transaction::write_commit_round`).
+  /// A group publishes (merges into the delta) after releasing it, under
+  /// `publish_lock`; take both with `lock_commits` to hold off commits.
   pub(crate) commit_lock: Mutex<()>,
+  /// Serializes publishing commit groups, in the order they took the commit
+  /// lock (a group takes this before it releases that).
+  pub(crate) publish_lock: Mutex<()>,
+  /// Odd while a commit group publishes (gives its members MVCC timestamps
+  /// and merges them, under `delta.write()`): an MVCC begin that sees it
+  /// change begins again (see `begin_with_mode`).
+  pub(crate) publish_seq: AtomicU64,
 
-  /// Group commit queue (one leader writes a batch of commits with one WAL
-  /// flush and one header); waiters park on `group_commit_cv`
-  pub(crate) group_commit_state: Mutex<GroupCommitState>,
-  pub(crate) group_commit_cv: Condvar,
+  /// Commits waiting to be written: one committer at a time leads, and
+  /// writes everything queued as one group (one WAL write and one header)
+  pub(crate) commit_queue: CommitQueue,
 
   /// MVCC manager (if enabled)
   pub(crate) mvcc: Option<std::sync::Arc<MvccManager>>,
@@ -346,9 +371,6 @@ pub struct SingleFileDB {
 
   /// Synchronization mode for WAL writes
   pub(crate) sync_mode: open::SyncMode,
-
-  /// Enable group commit (coalesce WAL flushes across commits)
-  pub(crate) group_commit_enabled: bool,
 
   /// Primary replication runtime (enabled only when role=primary)
   pub(crate) primary_replication: Option<crate::replication::primary::PrimaryReplication>,

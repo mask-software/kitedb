@@ -938,7 +938,7 @@ impl SingleFileDB {
   fn cut_background_checkpoint(&self, run: u64) -> Result<Cut> {
     #[cfg(test)]
     count_checkpoint_test_cut(&self.path);
-    let _commit_guard = self.commit_lock.lock();
+    let _commit_guard = self.lock_commits();
     {
       let mut pager = self.pager.lock();
       let mut wal_buffer = self.wal_buffer.lock();
@@ -1128,7 +1128,7 @@ impl SingleFileDB {
     // here writers cannot cancel the cut (that takes the commit lock): one
     // that tries waits until the install releases it.
     let _checkpoint_gate = self.checkpoint_gate.write();
-    let _commit_guard = self.commit_lock.lock();
+    let _commit_guard = self.lock_commits();
 
     // Writers may have cancelled the cut while this run made no progress
     // (see `wait_for_cut_release`): the WAL is back in the primary region,
@@ -1383,7 +1383,7 @@ impl SingleFileDB {
   /// from both regions on open, and finished by the next checkpoint.
   fn release_cut(&self, run: u64) {
     {
-      let _commit_guard = self.commit_lock.lock();
+      let _commit_guard = self.lock_commits();
       let mut pager = self.pager.lock();
       let mut wal_buffer = self.wal_buffer.lock();
       let mut header = self.header.write();
@@ -1500,7 +1500,7 @@ impl SingleFileDB {
   /// leaving it (see `leave_cut`).
   fn cancel_stalled_cut(&self, cut: u64) -> Result<()> {
     {
-      let _commit_guard = self.commit_lock.lock();
+      let _commit_guard = self.lock_commits();
       let mut pager = self.pager.lock();
       let mut wal_buffer = self.wal_buffer.lock();
       let mut header = self.header.write();
@@ -4198,7 +4198,8 @@ mod tests {
     }
 
     // One transaction writes more than the 16 KiB secondary region holds, so
-    // it waits for the background install part-way.
+    // it waits for the background install part-way (or, once its records
+    // outgrow what it keeps back, all at once).
     let writer_db = Arc::clone(&db);
     let writer = std::thread::spawn(move || {
       writer_db.begin(false)?;
@@ -4212,7 +4213,7 @@ mod tests {
       writer_db.commit()
     });
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while db.wal_buffer.lock().free() > 2048 {
+    while db.wal_buffer.lock().free() > 2048 && !db.checkpoint_state.lock().writers_waited {
       assert!(
         std::time::Instant::now() < deadline,
         "writer never filled the secondary region"

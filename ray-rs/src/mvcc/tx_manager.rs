@@ -68,6 +68,12 @@ const COMMIT_LOG_SLACK: usize = 1024;
 /// commit moves its write set in whole, with no per-key indexing: a large
 /// transaction would otherwise hold every concurrent commit up while it
 /// indexed each key. Conflict checks find the keys through `group_writes`.
+///
+/// A commit group checks its members in order before any of them is durable:
+/// each that passes is staged (`stage_commit`), so the members after it
+/// conflict with its writes as if it had committed, and commits
+/// (`commit_tx`) in staging order once the group is durable, or is unstaged
+/// with the rest of its group (`unstage_commits`) if the group fails.
 #[derive(Debug)]
 pub struct TxManager {
   /// Active transactions
@@ -110,6 +116,13 @@ pub struct TxManager {
   /// times never decrease: a commit while the clock stepped back counts as
   /// the newest entry's millisecond.
   commit_wall_clock: VecDeque<(Timestamp, u64)>,
+  /// Some recent commit is `unindexed`.
+  has_unindexed: bool,
+  /// Staged transactions (`stage_commit`), in staging order, with the
+  /// commit timestamps `commit_tx` gives them: consecutive from
+  /// `next_commit_ts`. They are still active, and their writes already in
+  /// `recent_commits`.
+  staged: VecDeque<(TxId, Timestamp)>,
   /// Total committed write entries pruned (for stats)
   total_pruned: usize,
   /// Commit-log entries visited while pruning or compacting (test instrumentation)
@@ -140,6 +153,8 @@ impl TxManager {
       committed_writes_log: VecDeque::new(),
       newest_indexed_ts: 0,
       commit_wall_clock: VecDeque::new(),
+      has_unindexed: false,
+      staged: VecDeque::new(),
       total_pruned: 0,
       #[cfg(test)]
       prune_work: 0,
@@ -159,6 +174,8 @@ impl TxManager {
   /// Begin a new transaction
   /// Returns transaction ID and snapshot timestamp
   pub fn begin_tx(&mut self) -> (TxId, Timestamp) {
+    // It may check against the staged writes once they commit.
+    self.index_staged_writes();
     let txid = self.next_tx_id;
     self.next_tx_id += 1;
     let start_ts = self.next_commit_ts; // Snapshot at current commit timestamp
@@ -271,9 +288,114 @@ impl TxManager {
     )
   }
 
+  /// Stage `txid` for commit, after its conflict check passed: from now on
+  /// conflict checks treat its writes as committed at the timestamp this
+  /// returns (the next one not yet given or staged), which `commit_tx` gives
+  /// it. Transactions are committed in the order they are staged.
+  pub fn stage_commit(&mut self, txid: TxId) -> Result<Timestamp, TxManagerError> {
+    let commit_ts = self.next_commit_ts + self.staged.len() as Timestamp;
+    let tx = self
+      .active_txs
+      .get_mut(&txid)
+      .ok_or(TxManagerError::TxNotFound(txid))?;
+    if self.staged.iter().any(|&(staged, _)| staged == txid) {
+      return Err(TxManagerError::InvalidState(format!(
+        "transaction {txid} is staged already"
+      )));
+    }
+    let writes = std::mem::take(&mut tx.write_set);
+    let key_groups = self.tx_key_groups.remove(&txid);
+    self.staged.push_back((txid, commit_ts));
+    // With no transaction open but the staged ones (and this), none checks
+    // against these writes unless one begins before they commit (`begin_tx`
+    // notes them then); if none does, the commit drops them unnoted. A
+    // writer alone thus never indexes its keys.
+    if self.active_txs.len() == self.staged.len() && !writes.is_empty() {
+      self.recent_keys += writes.len();
+      self.recent_commits.push_back(CommitWrites {
+        commit_ts,
+        keys: writes,
+        unindexed: Some(key_groups),
+      });
+      self.has_unindexed = true;
+    } else {
+      self.index_recent_commit(commit_ts, writes, key_groups);
+    }
+    Ok(commit_ts)
+  }
+
+  /// Unstage every staged transaction, newest first (see `unstage_last`).
+  pub fn unstage_commits(&mut self) {
+    while !self.staged.is_empty() {
+      self.unstage_last();
+    }
+  }
+
+  /// Unstage the transaction staged last: its commit group failed. It gets
+  /// its writes back from the recent commits, so they cause no conflict,
+  /// and is active as before it was staged; the ones staged before it stay
+  /// staged. `newest_indexed_ts` and a few `group_writes` entries may keep
+  /// naming its timestamp, which only costs later checks an exact lookup.
+  pub fn unstage_last(&mut self) {
+    let Some((txid, commit_ts)) = self.staged.pop_back() else {
+      return;
+    };
+    if self
+      .recent_commits
+      .back()
+      .is_some_and(|commit| commit.commit_ts == commit_ts)
+    {
+      if let Some(commit) = self.recent_commits.pop_back() {
+        self.recent_keys -= commit.keys.len();
+        if let Some(tx) = self.active_txs.get_mut(&txid) {
+          tx.write_set = commit.keys;
+        }
+      }
+    }
+  }
+
+  /// The commit timestamp of the transaction staged last, if any.
+  pub fn newest_staged_ts(&self) -> Option<Timestamp> {
+    self.staged.back().map(|&(_, commit_ts)| commit_ts)
+  }
+
+  /// Whether a transaction other than the staged ones is active: a reader
+  /// that may still read the state a commit replaces. Staged transactions
+  /// read nothing more; they only wait to commit.
+  pub fn has_open_readers(&self) -> bool {
+    self.active_txs.len() > self.staged.len()
+  }
+
   /// Commit a transaction and drop its record
   /// Returns commit timestamp
   pub fn commit_tx(&mut self, txid: TxId) -> Result<Timestamp, TxManagerError> {
+    self.commit_tx_releasing(txid, &mut Vec::new())
+  }
+
+  /// `commit_tx`, handing the key sets the commit no longer needs to
+  /// `released`, for the caller to free once it releases its locks (a large
+  /// transaction's take a while).
+  pub fn commit_tx_releasing(
+    &mut self,
+    txid: TxId,
+    released: &mut Vec<TxKeySet>,
+  ) -> Result<Timestamp, TxManagerError> {
+    let staged = match self.staged.front() {
+      Some(&(first, commit_ts)) if first == txid => {
+        debug_assert_eq!(
+          commit_ts, self.next_commit_ts,
+          "staged timestamps are consecutive"
+        );
+        self.staged.pop_front();
+        true
+      }
+      _ if self.staged.iter().any(|&(staged, _)| staged == txid) => {
+        return Err(TxManagerError::InvalidState(format!(
+          "transaction {txid} commits before the transactions staged ahead of it"
+        )));
+      }
+      _ => false,
+    };
     let tx = self
       .active_txs
       .remove(&txid)
@@ -296,38 +418,73 @@ impl TxManager {
 
     // Only a transaction that began before a commit can conflict with it:
     // with none open, nothing kept can conflict any more.
+    if !tx.read_set.is_empty() {
+      released.push(tx.read_set);
+    }
     if self.active_txs.is_empty() {
+      // Staged transactions are active, so none is left.
       self.total_pruned += self.committed_writes.len() + self.recent_keys;
-      self.recent_commits.clear();
+      released.extend(self.recent_commits.drain(..).map(|commit| commit.keys));
+      self.has_unindexed = false;
       self.recent_keys = 0;
       self.group_writes.clear();
       self.committed_writes.clear();
       self.committed_writes_log.clear();
       return Ok(commit_ts);
     }
-    if !tx.write_set.is_empty() {
-      self.newest_indexed_ts = commit_ts;
-      // Commit timestamps only grow, so this is each group's newest.
-      match key_groups {
-        Some(groups) => {
-          for group in groups.writes {
-            self.group_writes.insert(group, commit_ts);
-          }
-        }
-        None => {
-          for key in &tx.write_set {
-            self.group_writes.insert(key_group(key), commit_ts);
-          }
-        }
-      }
-      self.recent_keys += tx.write_set.len();
-      self.recent_commits.push_back(CommitWrites {
-        commit_ts,
-        keys: tx.write_set,
-      });
+    if !staged {
+      self.index_recent_commit(commit_ts, tx.write_set, key_groups);
     }
     self.prune_recent_commits();
     Ok(commit_ts)
+  }
+
+  /// Keep `writes`, a commit's at `commit_ts` (newer than every kept one),
+  /// for the conflict checks of the transactions open beside it.
+  fn index_recent_commit(
+    &mut self,
+    commit_ts: Timestamp,
+    writes: TxKeySet,
+    key_groups: Option<TxKeyGroups>,
+  ) {
+    if writes.is_empty() {
+      return;
+    }
+    note_group_writes(&mut self.group_writes, commit_ts, &writes, key_groups);
+    self.newest_indexed_ts = commit_ts;
+    self.recent_keys += writes.len();
+    self.recent_commits.push_back(CommitWrites {
+      commit_ts,
+      keys: writes,
+      unindexed: None,
+    });
+  }
+
+  /// Note in `group_writes` the staged writes `stage_commit` left unnoted,
+  /// before a transaction that may check against them begins. Those of
+  /// transactions committed since need no note: a transaction that begins
+  /// now cannot conflict with them.
+  fn index_staged_writes(&mut self) {
+    if !self.has_unindexed {
+      return;
+    }
+    self.has_unindexed = false;
+    let next_commit_ts = self.next_commit_ts;
+    for commit in self.recent_commits.iter_mut().rev() {
+      if commit.commit_ts < next_commit_ts {
+        break;
+      }
+      let Some(key_groups) = commit.unindexed.take() else {
+        continue;
+      };
+      note_group_writes(
+        &mut self.group_writes,
+        commit.commit_ts,
+        &commit.keys,
+        key_groups,
+      );
+      self.newest_indexed_ts = self.newest_indexed_ts.max(commit.commit_ts);
+    }
   }
 
   /// Drop the recent commits no open transaction can conflict with (older
@@ -351,10 +508,17 @@ impl TxManager {
     }
 
     let limits = self.limits;
+    // Staged writes stay whole, so unstaging can take them back.
+    let first_staged = self.staged.front().map(|&(_, commit_ts)| commit_ts);
     if self.recent_commits.len() > limits.recent_commits || self.recent_keys > limits.recent_keys {
       while self.recent_commits.len() > limits.recent_commits / 2
         || self.recent_keys > limits.recent_keys / 2
       {
+        if self.recent_commits.front().is_some_and(|commit| {
+          first_staged.is_some_and(|first_staged| commit.commit_ts >= first_staged)
+        }) {
+          break;
+        }
         let Some(commit) = self.recent_commits.pop_front() else {
           break;
         };
@@ -404,8 +568,17 @@ impl TxManager {
     }
   }
 
-  /// Abort a transaction and drop its record
+  /// Abort a transaction and drop its record. A staged transaction's
+  /// group is unstaged first (its commit path unstages it before it aborts,
+  /// so this is a fallback).
   pub fn abort_tx(&mut self, txid: TxId) {
+    if self.staged.iter().any(|&(staged, _)| staged == txid) {
+      debug_assert!(
+        false,
+        "staged transaction {txid} aborted before its group was unstaged"
+      );
+      self.unstage_commits();
+    }
     self.active_txs.remove(&txid);
     self.tx_key_groups.remove(&txid);
   }
@@ -413,8 +586,7 @@ impl TxManager {
   /// Drop a transaction's record without committing it. Commit and abort
   /// already drop theirs.
   pub fn remove_tx(&mut self, txid: TxId) {
-    self.active_txs.remove(&txid);
-    self.tx_key_groups.remove(&txid);
+    self.abort_tx(txid);
   }
 
   /// Get all active transaction IDs
@@ -493,6 +665,8 @@ impl TxManager {
     self.committed_writes_log.clear();
     self.newest_indexed_ts = 0;
     self.commit_wall_clock.clear();
+    self.has_unindexed = false;
+    self.staged.clear();
     self.total_pruned = 0;
   }
 
@@ -632,6 +806,10 @@ impl TxManager {
 struct CommitWrites {
   commit_ts: Timestamp,
   keys: TxKeySet,
+  /// Not noted in `group_writes` yet (with the groups to note, if known):
+  /// staged while no transaction could check against them (see
+  /// `TxManager::stage_commit`).
+  unindexed: Option<Option<TxKeyGroups>>,
 }
 
 /// The key groups (see `key_group`) of a transaction's reads and writes,
@@ -684,6 +862,29 @@ pub fn key_group(key: &TxKey) -> u64 {
   }
 }
 
+/// Note in `group_writes` that the commit at `commit_ts` wrote `writes`
+/// (whose groups are `key_groups`, if known). Commit timestamps only grow,
+/// so this is each group's newest.
+fn note_group_writes(
+  group_writes: &mut HashMap<u64, Timestamp>,
+  commit_ts: Timestamp,
+  writes: &TxKeySet,
+  key_groups: Option<TxKeyGroups>,
+) {
+  match key_groups {
+    Some(groups) => {
+      for group in groups.writes {
+        group_writes.insert(group, commit_ts);
+      }
+    }
+    None => {
+      for key in writes {
+        group_writes.insert(key_group(key), commit_ts);
+      }
+    }
+  }
+}
+
 /// Add `keys` to `set`, moving them in whole when `set` is empty.
 fn absorb(set: &mut TxKeySet, keys: TxKeySet) {
   if set.is_empty() {
@@ -725,12 +926,15 @@ pub struct CommittedWritesStats {
 pub enum TxManagerError {
   /// Transaction not found (never begun, or already committed or aborted)
   TxNotFound(TxId),
+  /// Staged out of order (see `TxManager::stage_commit`)
+  InvalidState(String),
 }
 
 impl std::fmt::Display for TxManagerError {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     match self {
       TxManagerError::TxNotFound(txid) => write!(f, "Transaction {txid} not found"),
+      TxManagerError::InvalidState(message) => f.write_str(message),
     }
   }
 }

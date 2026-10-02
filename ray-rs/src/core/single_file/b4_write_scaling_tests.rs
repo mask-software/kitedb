@@ -157,7 +157,9 @@ fn b4_ws_full_mode_queued_commits_share_syncs() {
 }
 
 /// Finding 2: a transaction writes its BEGIN and data records while another
-/// commit's file I/O runs.
+/// commit's file I/O runs: a small one keeps them back until its commit, and
+/// a large one (here a 20 KB key, past `WAL_DEFER_BYTES`) appends them to the
+/// WAL buffer, which the I/O does not hold.
 #[test]
 fn b4_ws_wal_appends_do_not_wait_for_commit_io() {
   let dir = tempdir().expect("tempdir");
@@ -172,6 +174,12 @@ fn b4_ws_wal_appends_do_not_wait_for_commit_io() {
     in_io_rx.recv().expect("commit in its I/O");
     writer_db.begin(false)?;
     writer_db.create_node(Some("during"))?;
+    writer_db.create_node(Some(&"x".repeat(20_000)))?;
+    let (_, tx) = writer_db.require_write_tx_handle()?;
+    assert!(
+      tx.lock().wal_begun,
+      "setup: the large transaction wrote its records"
+    );
     // The commit's hook stops listening once it gives up on this.
     let _ = appended_tx.send(());
     commit_rx.recv().expect("go commit");
@@ -199,6 +207,7 @@ fn b4_ws_wal_appends_do_not_wait_for_commit_io() {
   );
   assert!(db.node_by_key("first").is_some());
   assert!(db.node_by_key("during").is_some());
+  assert!(db.node_by_key(&"x".repeat(20_000)).is_some());
 }
 
 /// A member that conflicts with an earlier member of its group aborts, and
@@ -616,4 +625,104 @@ fn b4_ws_group_is_published_atomically() {
     seen.iter().all(|&v| v) || seen.iter().all(|&v| !v),
     "a transaction begun during a group's publish saw part of it: {seen:?}"
   );
+}
+
+/// The transaction manager's staging, which the commit groups above rely on.
+mod staging {
+  use crate::mvcc::{ConflictDetector, TxManager};
+  use crate::types::{TxKey, TxKeySet};
+
+  fn key(name: &str) -> TxKey {
+    TxKey::Key(std::sync::Arc::from(name))
+  }
+
+  fn write(tx_mgr: &mut TxManager, txid: u64, keys: &[&str]) {
+    let writes: TxKeySet = keys.iter().map(|name| key(name)).collect();
+    tx_mgr.record_reads_and_writes(txid, TxKeySet::new(), writes, None);
+  }
+
+  fn conflicts(tx_mgr: &TxManager, txid: u64) -> bool {
+    ConflictDetector::new()
+      .validate_commit(tx_mgr, txid)
+      .is_err()
+  }
+
+  /// A later member conflicts with what an earlier member of its group
+  /// wrote, before either is committed.
+  #[test]
+  fn staged_writes_conflict_with_later_members() {
+    let mut tx_mgr = TxManager::new();
+    let (a, _) = tx_mgr.begin_tx();
+    let (b, _) = tx_mgr.begin_tx();
+    let (c, _) = tx_mgr.begin_tx();
+    write(&mut tx_mgr, a, &["k"]);
+    write(&mut tx_mgr, b, &["k"]);
+    write(&mut tx_mgr, c, &["other"]);
+    assert!(!conflicts(&tx_mgr, a));
+    let staged_ts = tx_mgr.stage_commit(a).expect("stage a");
+    assert!(conflicts(&tx_mgr, b), "b wrote what staged a wrote");
+    assert!(!conflicts(&tx_mgr, c));
+    assert_eq!(tx_mgr.stage_commit(c).expect("stage c"), staged_ts + 1);
+    assert!(tx_mgr.has_open_readers(), "b may still read");
+    tx_mgr.abort_tx(b);
+    assert!(
+      !tx_mgr.has_open_readers(),
+      "only staged transactions are left"
+    );
+    assert_eq!(tx_mgr.commit_tx(a).expect("commit a"), staged_ts);
+    assert_eq!(tx_mgr.commit_tx(c).expect("commit c"), staged_ts + 1);
+  }
+
+  /// Unstaged transactions get their writes back and cause no conflict;
+  /// staged ones commit only in staging order.
+  #[test]
+  fn unstaged_writes_cause_no_conflict_and_order_holds() {
+    let mut tx_mgr = TxManager::new();
+    let (a, _) = tx_mgr.begin_tx();
+    let (b, _) = tx_mgr.begin_tx();
+    let (reader, _) = tx_mgr.begin_tx();
+    write(&mut tx_mgr, a, &["k"]);
+    write(&mut tx_mgr, b, &["j"]);
+    write(&mut tx_mgr, reader, &["k", "j"]);
+    tx_mgr.stage_commit(a).expect("stage a");
+    tx_mgr.stage_commit(b).expect("stage b");
+    assert!(
+      tx_mgr.commit_tx(b).is_err(),
+      "b committed before a, staged ahead of it"
+    );
+    tx_mgr.unstage_last();
+    tx_mgr.unstage_last();
+    assert!(!conflicts(&tx_mgr, reader), "unstaged writes conflict");
+    assert_eq!(tx_mgr.tx(a).expect("a").write_set.len(), 1, "a's writes");
+    let staged_ts = tx_mgr.stage_commit(a).expect("stage a again");
+    assert_eq!(tx_mgr.commit_tx(a).expect("commit a"), staged_ts);
+    assert!(conflicts(&tx_mgr, reader), "a committed after reader began");
+  }
+
+  /// A writer staged alone indexes nothing, but a transaction that begins
+  /// before it commits still conflicts with it.
+  #[test]
+  fn writes_staged_alone_are_indexed_for_a_transaction_begun_before_their_commit() {
+    let mut tx_mgr = TxManager::new();
+    let (a, _) = tx_mgr.begin_tx();
+    write(&mut tx_mgr, a, &["k"]);
+    tx_mgr.stage_commit(a).expect("stage a");
+    let (late, _) = tx_mgr.begin_tx();
+    tx_mgr.commit_tx(a).expect("commit a");
+    write(&mut tx_mgr, late, &["k"]);
+    assert!(
+      conflicts(&tx_mgr, late),
+      "a transaction begun before a staged commit missed its writes"
+    );
+
+    // With no transaction beside it, a commit leaves nothing to check.
+    let (b, _) = tx_mgr.begin_tx();
+    tx_mgr.abort_tx(late);
+    write(&mut tx_mgr, b, &["k"]);
+    tx_mgr.stage_commit(b).expect("stage b");
+    tx_mgr.commit_tx(b).expect("commit b");
+    let (after, _) = tx_mgr.begin_tx();
+    write(&mut tx_mgr, after, &["k"]);
+    assert!(!conflicts(&tx_mgr, after));
+  }
 }

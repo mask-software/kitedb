@@ -353,7 +353,7 @@ impl SingleFileDB {
     // A commit checks its vectors' dimensions against the stores before its
     // COMMIT record and applies them after, both under the commit lock; a
     // store created in between would make that apply fail.
-    let _commit_guard = self.commit_lock.lock();
+    let _commit_guard = self.lock_commits();
     self.ensure_vector_store_loaded(prop_key_id)?;
 
     let mut stores = self.vector_stores.write();

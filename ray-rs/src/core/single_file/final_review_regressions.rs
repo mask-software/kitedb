@@ -1345,9 +1345,7 @@ fn writable_open_refuses_rather_than_trims_records_of_unknown_types() {
     let crc_end = WAL_RECORD_HEADER_SIZE + 12;
     let crc = crc32(&record[4..crc_end]);
     record[crc_end..crc_end + 4].copy_from_slice(&crc.to_le_bytes());
-    wal
-      .write_record_bytes_batch(&record, &mut pager)
-      .expect("append");
+    wal.write_record_bytes_batch(&record).expect("append");
     wal.flush(&mut pager).expect("flush");
     wal.store_in_header(&mut header);
     db.persist_header(&mut pager, &mut header, true)

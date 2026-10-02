@@ -38,7 +38,9 @@ use crate::core::single_file::{
   SyncMode,
 };
 use crate::core::wal::buffer::WalBuffer;
-use crate::core::wal::record::{build_create_node_payload, WalRecord};
+use crate::core::wal::record::{
+  build_create_node_payload, extract_committed_transactions_in_order, WalRecord,
+};
 use crate::error::KiteError;
 use crate::types::{DbHeaderV1, WalRecordType};
 
@@ -658,65 +660,70 @@ fn x_full_mode_failed_commit_stays_failed_after_an_os_crash() {
   );
 }
 
-/// After a failed round, the next sync zeroes the discarded bytes past the
-/// head, and only those: here the scrub's own sync fails, a shorter record
-/// then overwrites the start of the span, and the next sync zeroes the rest.
+/// A failed commit group's COMMIT records become ROLLBACK records, and the
+/// rewrite is synced before any later header can name them: here the
+/// rewrite's own sync fails, a transaction appends after the group (the head
+/// is not rewound, so the bytes stay where they are), and the next flush
+/// syncs.
 #[test]
-fn x_sync_zeroes_only_discarded_bytes_past_the_head() {
+fn x_failed_group_commits_are_rolled_back_durably_before_the_next_header() {
   let dir = tempdir().expect("tempdir");
-  let mut pager = create_pager(dir.path().join("discard.kitedb"), PAGE_SIZE).expect("pager");
+  let mut pager = create_pager(dir.path().join("rollback.kitedb"), PAGE_SIZE).expect("pager");
   pager.allocate_pages(9).expect("allocate");
   let mut wal = WalBuffer::new(PAGE_SIZE as u64, 8 * PAGE_SIZE as u64, PAGE_SIZE);
-  let record = |txid: u64, key: &str| {
-    WalRecord::new(
-      WalRecordType::CreateNode,
-      txid,
-      build_create_node_payload(txid, Some(key)),
-    )
+  let write = |wal: &mut WalBuffer, record_type: WalRecordType, txid: u64| {
+    let payload = match record_type {
+      WalRecordType::CreateNode => build_create_node_payload(txid, Some(&format!("n{txid}"))),
+      _ => Vec::new(),
+    };
+    wal
+      .write_record(&WalRecord::new(record_type, txid, payload))
+      .expect("write");
   };
-  wal
-    .write_record(&record(1, "kept"), &mut pager)
-    .expect("write");
+  for record_type in [
+    WalRecordType::Begin,
+    WalRecordType::CreateNode,
+    WalRecordType::Commit,
+  ] {
+    write(&mut wal, record_type, 1);
+  }
   wal.sync(&mut pager).expect("sync");
 
-  let before = wal.region_state();
-  let start = wal.head();
-  wal
-    .write_record(&record(2, "failed-with-a-long-key"), &mut pager)
-    .expect("write");
-  wal
-    .write_record(&record(3, "failed"), &mut pager)
-    .expect("write");
-  let end = wal.head();
-  wal.flush(&mut pager).expect("flush");
+  // Transaction 2's group: sealed and written, then its header fails.
+  write(&mut wal, WalRecordType::Begin, 2);
+  write(&mut wal, WalRecordType::CreateNode, 2);
+  let before_commit = wal.head();
+  write(&mut wal, WalRecordType::Commit, 2);
+  let sealed = wal.seal();
+  sealed.write(&mut pager).expect("write the group");
+  // Transaction 3 appends while the group's I/O runs.
+  write(&mut wal, WalRecordType::Begin, 3);
+  write(&mut wal, WalRecordType::CreateNode, 3);
 
-  let scrubbed = io_hooks::with_failing_syncs(1, || wal.discard_since(before, &mut pager));
-  assert!(scrubbed.is_err(), "the scrub's sync was made to fail");
-  assert_eq!(wal.head(), start);
+  let restored = io_hooks::with_failing_syncs(1, || {
+    wal
+      .restore_sealed(sealed, [(before_commit, 2)])
+      .and_then(|()| wal.flush(&mut pager))
+  });
+  assert!(restored.is_err(), "the rollback's sync was made to fail");
   assert!(wal.needs_sync());
 
-  wal
-    .write_record(&record(4, "next"), &mut pager)
-    .expect("write");
-  let next_end = wal.head();
+  write(&mut wal, WalRecordType::Commit, 3);
+  let (flushed, syncs) = io_hooks::sync_kinds_during(|| wal.flush(&mut pager));
+  flushed.expect("flush");
   assert!(
-    next_end < end,
-    "the next record must be shorter than the span"
+    !syncs.is_empty(),
+    "a flush, after which a header may name the rolled-back group, did not sync"
   );
-  wal.sync(&mut pager).expect("sync");
   assert!(!wal.needs_sync());
 
-  let mut bytes = Vec::new();
-  for page in 1..9 {
-    bytes.extend(pager.read_page(page).expect("read"));
-  }
-  let (start, next_end, end) = (start as usize, next_end as usize, end as usize);
-  assert!(
-    bytes[start..next_end].iter().any(|byte| *byte != 0),
-    "the next record was zeroed"
-  );
-  assert!(
-    bytes[next_end..end].iter().all(|byte| *byte == 0),
-    "discarded bytes past the head survived the sync"
-  );
+  let records = wal.scan_records(&mut pager).expect("scan");
+  let committed: Vec<u64> = extract_committed_transactions_in_order(&records)
+    .into_iter()
+    .map(|(txid, _)| txid)
+    .collect();
+  assert_eq!(committed, vec![1, 3], "the failed group's commit replays");
+  assert!(records
+    .iter()
+    .any(|record| record.record_type == WalRecordType::Rollback && record.txid == 2));
 }

@@ -2,27 +2,38 @@
 //!
 //! Handles begin, commit, and rollback operations.
 //!
-//! Commit ordering is:
-//! `epoch fence check (primaries) -> room for the COMMIT record (waiting for
-//! a background install if needed) -> MVCC conflict check -> WAL COMMIT ->
-//! WAL flush (and fsync, in Full mode) -> durable header -> schema publish
-//! -> MVCC commit timestamp, version chains, vector and delta merge ->
-//! sidecar attempt`, all under the commit lock. Until the header is durable
-//! a failure leaves no trace of the commit: its COMMIT record is forgotten,
-//! and MVCC aborts it. From there on
-//! every step runs. The MVCC timestamp, version chains and delta merge share
-//! one `delta.write()` critical section, and MVCC transactions begin under
-//! `delta.read()`, so a snapshot holds a commit entirely or not at all.
+//! A write transaction keeps its WAL records to itself (see
+//! `SingleFileTxState::wal_deferred_from`): a small one hands them to its
+//! commit whole, BEGIN record first, so it takes no WAL lock of its own.
 //!
-//! With group commit, commits queue and one committer at a time (the leader)
-//! runs these steps for everything queued: one WAL flush and one header for
-//! the batch, then each commit's publish, in order.
+//! Commits go through a commit queue (see `commit_queued`). A committer
+//! queues its prepared commit; the first to find no leader leads, and writes
+//! everything queued as one group (`write_commits`), in two stages:
 //!
-//! The sidecar attempt is deliberately non-authoritative after the local
-//! durability boundary: an error records primary replication lag and fences
-//! future sidecar appends, while this commit still completes locally and
-//! returns success.
-
+//! 1. Under the commit lock (`write_commit_round`): `epoch fence check
+//!    (primaries) -> for each member in order: vector check, MVCC conflict
+//!    check against the committed transactions and those staged before it
+//!    (a conflict aborts that member alone; the others are staged) -> under
+//!    the WAL lock, each member's records while they fit (waiting for a
+//!    background install if needed) -> one WAL write, without the WAL lock,
+//!    and one fsync in Full mode -> one durable header -> each member's
+//!    sidecar frame, in order`. Until the header is durable a failure leaves
+//!    no trace of the group: its COMMIT records become ROLLBACK records,
+//!    MVCC unstages its members, and each fails.
+//! 2. Under the publish lock, taken before the commit lock is released, so
+//!    groups publish in order (`publish_commits`): `for each member: schema
+//!    publish -> one delta.write() section with each member's MVCC commit
+//!    timestamp, version chains, vectors and delta merge, in order`. Every
+//!    step runs: the group is durable. Meanwhile the lead has passed on, and
+//!    the next group is written.
+//!
+//! An MVCC transaction never begins inside a publish section (see
+//! `begin_with_mode`), so a snapshot holds each commit entirely or not at
+//! all. The other members wait for their outcome without the commit lock;
+//! the commits that arrive while a group is written form the next one.
+//! Code that needs the delta and the WAL to agree takes both locks
+//! (`lock_commits`).
+//!
 use crate::core::wal::record::{
   build_begin_payload, build_commit_payload, build_rollback_payload, WalRecord,
 };
@@ -35,7 +46,7 @@ use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::marker::PhantomData;
 use std::rc::Rc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::thread::ThreadId;
 #[cfg(feature = "bench-profile")]
@@ -45,7 +56,7 @@ use super::open::SyncMode;
 use super::writer_slot::WriterMode;
 use super::{SchemaStaging, SingleFileDB, SingleFileTxState};
 use crate::core::pager::FilePager;
-use crate::core::wal::buffer::{WalBuffer, WalRegionState};
+use crate::core::wal::buffer::{SealedWrites, WalBuffer};
 
 #[cfg(test)]
 thread_local! {
@@ -124,18 +135,32 @@ fn after_commit_timestamp_test_hook() {
 }
 
 /// A transaction's commit, as handed to the thread that writes it: its
-/// committer, or the group-commit leader.
+/// committer, or the leader of its group.
 pub(crate) struct CommitRequest {
   txid: TxId,
   bulk_load: bool,
-  /// Its COMMIT record, or a bulk load's whole transaction.
+  /// What it read and wrote, for its MVCC conflict check (none: nothing).
+  mvcc_keys: Option<MvccKeys>,
+  /// The records it kept back (its BEGIN record first, unless written
+  /// already), and its COMMIT record last.
   records: Vec<u8>,
+  /// The size of its COMMIT record, the last of `records`.
+  commit_record_len: usize,
   pending: DeltaState,
   /// Its data records, for the replication sidecar (empty without one).
   pending_wal: Vec<u8>,
   staged_schema: SchemaStaging,
   /// The committing thread; its test hooks fire only there.
   committer: ThreadId,
+}
+
+/// A transaction's MVCC reads and writes, and their key groups, handed to
+/// the transaction manager in its commit group, under the lock its conflict
+/// check takes anyway.
+struct MvccKeys {
+  reads: TxKeySet,
+  writes: TxKeySet,
+  groups: Option<TxKeyGroups>,
 }
 
 /// How far a commit got, so its committer can settle its guards.
@@ -146,6 +171,11 @@ pub(crate) struct CommitOutcome {
   /// Its staged schema names are published.
   schema_published: bool,
   result: Result<Option<CommitToken>>,
+  /// What is left of its request (the emptied delta, record buffers) and
+  /// key sets MVCC released, for its committer to free: off the commit
+  /// path, and mostly on the thread that allocated it.
+  _leftovers: Option<Box<CommitRequest>>,
+  _released_keys: Vec<TxKeySet>,
 }
 
 impl CommitOutcome {
@@ -154,67 +184,261 @@ impl CommitOutcome {
       durable: false,
       schema_published: false,
       result: Err(error),
+      _leftovers: None,
+      _released_keys: Vec::new(),
     }
   }
 }
 
-/// Group-commit queue. Commits queue here; the first committer to find no
-/// leader becomes it, takes everything queued, and writes it as one batch.
+/// Most commits one group writes; the rest form the next group.
+const MAX_GROUP_COMMITS: usize = 256;
+
+/// The commit queue: commits wait here for the leader to write them.
 #[derive(Default)]
-pub(crate) struct GroupCommitState {
-  queue: VecDeque<(u64, CommitRequest)>,
-  /// Outcomes of written commits, by ticket, until their committers take them.
-  outcomes: HashMap<u64, CommitOutcome>,
-  next_ticket: u64,
-  leader_active: bool,
+pub(crate) struct CommitQueue {
+  pub(crate) state: Mutex<CommitQueueState>,
 }
 
-/// The lead of a group commit: once dropped, its batch's outcomes are
-/// delivered and the next leader may start. A leader that unwinds fails the
-/// commits it has no outcome for, so their committers stop waiting.
-struct GroupCommitLeader<'db> {
-  db: &'db SingleFileDB,
-  tickets: Vec<u64>,
-  /// Outcomes of the batch, in ticket order.
-  outcomes: Vec<CommitOutcome>,
+#[derive(Default)]
+pub(crate) struct CommitQueueState {
+  /// Commits waiting for a group, oldest first.
+  pub(crate) queued: VecDeque<QueuedCommit>,
+  /// A committer leads: it writes the queued commits, or was handed the lead
+  /// and is about to.
+  pub(crate) leading: bool,
 }
 
-impl Drop for GroupCommitLeader<'_> {
-  fn drop(&mut self) {
-    let mut state = self.db.group_commit_state.lock();
-    let mut outcomes = std::mem::take(&mut self.outcomes).into_iter();
-    for &ticket in &self.tickets {
-      let outcome = outcomes.next().unwrap_or_else(|| {
-        CommitOutcome::failed(KiteError::Internal(
-          "the group commit writing this commit panicked".to_string(),
-        ))
-      });
-      state.outcomes.insert(ticket, outcome);
+pub(crate) struct QueuedCommit {
+  request: Box<CommitRequest>,
+  ticket: Arc<CommitTicket>,
+}
+
+/// How long a queued committer spins (yielding its CPU) for its outcome
+/// before it parks. A group takes microseconds in `SyncMode::Normal`, and
+/// waking a parked thread costs its leader a system call per member, so a
+/// committer that waits out a group or two without parking frees the
+/// leader for the next group sooner.
+const COMMIT_WAIT_SPIN: std::time::Duration = std::time::Duration::from_micros(100);
+
+/// A queued commit's slot: its committer waits here until the leader
+/// delivers its outcome or hands it the lead.
+struct CommitTicket {
+  /// `TICKET_*`.
+  state: AtomicU8,
+  outcome: Mutex<Option<CommitOutcome>>,
+  /// The committer, to unpark once it parked.
+  committer: std::thread::Thread,
+}
+
+/// Queued, its committer spinning.
+const TICKET_QUEUED: u8 = 0;
+/// Queued, its committer parked (or about to park).
+const TICKET_PARKED: u8 = 1;
+/// Its outcome is delivered.
+const TICKET_DONE: u8 = 2;
+/// Its committer is handed the lead.
+const TICKET_LEAD: u8 = 3;
+
+impl CommitTicket {
+  fn new() -> Self {
+    Self {
+      state: AtomicU8::new(TICKET_QUEUED),
+      outcome: Mutex::new(None),
+      committer: std::thread::current(),
     }
-    state.leader_active = false;
-    self.db.group_commit_cv.notify_all();
+  }
+
+  /// Deliver `outcome`.
+  fn deliver(&self, outcome: CommitOutcome) {
+    *self.outcome.lock() = Some(outcome);
+    self.set(TICKET_DONE);
+  }
+
+  /// Hand the committer the lead.
+  fn hand_lead(&self) {
+    self.set(TICKET_LEAD);
+  }
+
+  fn set(&self, state: u8) {
+    if self.state.swap(state, Ordering::AcqRel) == TICKET_PARKED {
+      self.committer.unpark();
+    }
+  }
+
+  /// Wait until the commit is written (its outcome) or this committer is
+  /// handed the lead (`None`). Spins for up to `COMMIT_WAIT_SPIN`, then
+  /// parks; `std::thread::park` may return spuriously, so it rechecks.
+  fn wait(&self) -> Option<CommitOutcome> {
+    let spin_until = std::time::Instant::now() + COMMIT_WAIT_SPIN;
+    let mut spins = 0u32;
+    loop {
+      match self.state.load(Ordering::Acquire) {
+        TICKET_DONE => {
+          let outcome = self.outcome.lock().take();
+          return Some(outcome.unwrap_or_else(|| {
+            CommitOutcome::failed(KiteError::Internal(
+              "commit outcome delivered twice".to_string(),
+            ))
+          }));
+        }
+        TICKET_LEAD => return None,
+        TICKET_PARKED => std::thread::park(),
+        _ => {
+          spins += 1;
+          if spins < 64 {
+            std::hint::spin_loop();
+          } else if std::time::Instant::now() < spin_until {
+            std::thread::yield_now();
+          } else {
+            // Fails if the leader got here first; the loop sees its state.
+            let _ = self.state.compare_exchange(
+              TICKET_QUEUED,
+              TICKET_PARKED,
+              Ordering::AcqRel,
+              Ordering::Acquire,
+            );
+          }
+        }
+      }
+    }
+  }
+}
+
+/// The lead of the commit queue, held while a committer writes groups.
+/// Released (`release`, or when dropped), it passes to the oldest queued
+/// committer, if any, which then leads. A leader that unwinds also fails the
+/// commits of its group it has no outcome for, so their committers stop
+/// waiting.
+struct CommitLeader<'db> {
+  db: &'db SingleFileDB,
+  /// The group being written, in order: the queued commits' tickets, and
+  /// `None` for the leader's own commit.
+  group: Vec<Option<Arc<CommitTicket>>>,
+  released: bool,
+}
+
+impl CommitLeader<'_> {
+  /// Deliver `outcomes`, in group order; returns the leader's own: that of
+  /// its own commit, or of the queued one with ticket `own`.
+  fn deliver(
+    &mut self,
+    own: Option<&Arc<CommitTicket>>,
+    outcomes: Vec<CommitOutcome>,
+  ) -> Option<CommitOutcome> {
+    let mut own_outcome = None;
+    for (ticket, outcome) in self.group.drain(..).zip(outcomes) {
+      match ticket {
+        Some(ticket) if !own.is_some_and(|own| Arc::ptr_eq(&ticket, own)) => {
+          ticket.deliver(outcome)
+        }
+        _ => own_outcome = Some(outcome),
+      }
+    }
+    own_outcome
+  }
+
+  /// Give up the lead, unless given up already (see `release`).
+  fn release_lead(&mut self) {
+    if !self.released {
+      let db = self.db;
+      self.release(&mut db.commit_queue.state.lock());
+    }
+  }
+
+  /// Give up the lead: to the oldest queued committer, or to whoever queues
+  /// next. `state` is the commit queue's, locked.
+  fn release(&mut self, state: &mut CommitQueueState) {
+    match state.queued.front() {
+      Some(next) => next.ticket.hand_lead(),
+      None => state.leading = false,
+    }
+    self.released = true;
+  }
+}
+
+impl Drop for CommitLeader<'_> {
+  fn drop(&mut self) {
+    for ticket in self.group.drain(..).flatten() {
+      ticket.deliver(CommitOutcome::failed(KiteError::Internal(
+        "the commit group writing this commit panicked".to_string(),
+      )));
+    }
+    self.release_lead();
+  }
+}
+
+/// A commit group's publish section (see `publish_commits`): makes
+/// `SingleFileDB::publish_seq` odd until dropped, also on unwind.
+struct PublishSection<'a>(&'a AtomicU64);
+
+impl<'a> PublishSection<'a> {
+  fn enter(seq: &'a AtomicU64) -> Self {
+    seq.fetch_add(1, Ordering::SeqCst);
+    Self(seq)
+  }
+}
+
+impl Drop for PublishSection<'_> {
+  fn drop(&mut self) {
+    self.0.fetch_add(1, Ordering::SeqCst);
   }
 }
 
 /// One round of `SingleFileDB::write_commits`.
 #[derive(Default)]
 struct CommitRound {
-  /// Requests whose commits are durable, in WAL order, with their indexes.
-  durable: Vec<(usize, CommitRequest)>,
+  /// Commits made durable, in WAL order.
+  durable: Vec<DurableCommit>,
   /// The next request found the WAL full until this background checkpoint
   /// cut is installed or released.
   wait_for_cut: Option<u64>,
+  /// The next request found the WAL full, and no checkpoint in the way.
+  wal_full: bool,
 }
 
-/// What the commits written earlier in a round claim, which the ones after
-/// them must agree with.
-#[derive(Default)]
-struct RoundClaims {
-  /// Dimensions given to vector properties that have no store yet.
-  vector_dimensions: HashMap<PropKeyId, usize>,
-  /// MVCC keys written: a later commit of the round that read or wrote one
-  /// conflicts, as it would once the earlier one had committed.
-  mvcc_writes: TxKeySet,
+/// A commit made durable by a round of `SingleFileDB::write_commits`, to
+/// publish.
+struct DurableCommit {
+  /// Its request's index among the commits written.
+  index: usize,
+  request: Box<CommitRequest>,
+  /// Its replication commit token (a primary's sidecar took its frame).
+  token: Option<CommitToken>,
+}
+
+/// Check `request`'s transaction for MVCC conflicts before its COMMIT record
+/// is written, once its reads and writes join its sets: with the
+/// transactions committed since it began, and those staged before it
+/// (earlier members of its group, or of a group still publishing, committed
+/// in MVCC only once durable). A conflict aborts it; otherwise it is staged
+/// (`TxManager::stage_commit`), so later commits check against its writes.
+/// Callers hold the commit lock, so nothing else stages before it commits in
+/// MVCC (`SingleFileDB::commit_in_mvcc`).
+fn check_and_stage_in_mvcc(
+  mvcc: &crate::mvcc::MvccManager,
+  tx_mgr: &mut crate::mvcc::TxManager,
+  request: &mut CommitRequest,
+) -> Result<()> {
+  let txid = request.txid;
+  if tx_mgr.tx(txid).is_none() {
+    return Err(KiteError::Internal(format!(
+      "transaction {txid} is not active in MVCC"
+    )));
+  }
+  if let Some(keys) = request.mvcc_keys.take() {
+    tx_mgr.record_reads_and_writes(txid, keys.reads, keys.writes, keys.groups);
+  }
+  if let Err(err) = mvcc.conflict_detector.validate_commit(tx_mgr, txid) {
+    tx_mgr.abort_tx(txid);
+    let mut keys = err.conflicting_keys;
+    keys.sort_unstable();
+    keys.dedup();
+    return Err(KiteError::Conflict { txid, keys });
+  }
+  tx_mgr
+    .stage_commit(txid)
+    .map(|_| ())
+    .map_err(|error| KiteError::Internal(error.to_string()))
 }
 
 /// A copy of `error` for every further commit of a round it failed.
@@ -243,7 +467,8 @@ pub(crate) enum WalWrite<T> {
 struct ActiveTransactionGuard<'db> {
   db: &'db SingleFileDB,
   txid: TxId,
-  /// The transaction wrote a BEGIN record (a non-bulk write transaction).
+  /// Its BEGIN record is in the WAL and its COMMIT or ROLLBACK is not, so it
+  /// is among the open transactions (`open_write_txids`).
   wrote_begin: bool,
   /// How it holds the writer slot (write transactions), released here.
   writer: Option<WriterMode>,
@@ -436,75 +661,40 @@ impl SingleFileDB {
     });
 
     // A checkpoint takes the write side. Holding this read permit through
-    // insertion makes the gate atomic with transaction creation.
-    let mut checkpointed_for_room = false;
-    let (_checkpoint_gate, txid, snapshot_ts) = loop {
-      let checkpoint_gate = self.checkpoint_gate.read();
-      let (txid, snapshot_ts) = if let Some(mvcc) = self.mvcc.as_ref() {
-        let (txid, snapshot_ts) = {
-          // A commit takes its timestamp, adds its version chains and
-          // merges into the delta under `delta.write()` (see
-          // `publish_commit`), so this snapshot holds it entirely or not at
-          // all, and a commit that has not taken its timestamp yet sees this
-          // transaction as a reader that needs version chains.
-          let _delta = self.delta.read();
-          let mut tx_mgr = mvcc.tx_manager.lock();
-          tx_mgr.begin_tx()
-        };
-        // Only ever raise it: a concurrent begin that took a later txid may
-        // have stored already, and the header persists this value, so a lower
-        // one would issue a used txid again after reopen.
-        self
-          .next_tx_id
-          .fetch_max(txid.saturating_add(1), Ordering::SeqCst);
-        (txid, snapshot_ts)
-      } else {
-        (self.alloc_tx_id(), 0)
+    // registration makes the gate atomic with transaction creation. No WAL
+    // record is written here: a write transaction's BEGIN record goes with
+    // its other records (see `SingleFileTxState::wal_deferred_from`).
+    let _checkpoint_gate = self.checkpoint_gate.read();
+    let (txid, snapshot_ts) = if let Some(mvcc) = self.mvcc.as_ref() {
+      // A commit group takes its members' timestamps, adds their version
+      // chains and merges them into the delta in one `delta.write()` section
+      // (see `publish_commits`), so this snapshot holds each entirely or not
+      // at all, and a commit that has not taken its timestamp yet sees this
+      // transaction as a reader that needs version chains. A begin does not
+      // complete inside such a section: it waits for the section, and
+      // begins again if one started meanwhile (`publish_seq` is odd during
+      // one). Outside them it takes no delta lock.
+      let (txid, snapshot_ts) = loop {
+        let seq = self.publish_seq.load(Ordering::SeqCst);
+        if seq % 2 == 1 {
+          drop(self.delta.read());
+          continue;
+        }
+        let begun = mvcc.tx_manager.lock().begin_tx();
+        if self.publish_seq.load(Ordering::SeqCst) == seq {
+          break begun;
+        }
+        mvcc.tx_manager.lock().abort_tx(begun.0);
       };
-
-      // Write BEGIN record to WAL (for write transactions). Bulk loads write
-      // all their records at commit instead.
-      if read_only || bulk_load {
-        break (checkpoint_gate, txid, snapshot_ts);
-      }
-      let record = WalRecord::new(WalRecordType::Begin, txid, build_begin_payload());
-      let written = self.try_write_wal(|wal, pager| wal.write_record(&record, pager));
-      match written {
-        Ok(WalWrite::Written(_)) => {
-          self.open_write_txids.lock().insert(txid);
-          break (checkpoint_gate, txid, snapshot_ts);
-        }
-        // The background checkpoint must take the gate to install, so wait
-        // without the permit, then begin afresh.
-        Ok(WalWrite::BlockedOn(cut)) => {
-          self.abort_unregistered_transaction(txid);
-          drop(checkpoint_gate);
-          self.wait_for_cut_release(cut)?;
-        }
-        // Compacting under the permit keeps blocking checkpoints and
-        // compaction out, as an open transaction would.
-        Ok(WalWrite::NeedsCompaction) => {
-          self.abort_unregistered_transaction(txid);
-          let compacted = self.compact_retired_wal();
-          drop(checkpoint_gate);
-          compacted?;
-        }
-        // The WAL is full and no checkpoint is in the way. This thread has no
-        // transaction open, so it can checkpoint now, as the next commit
-        // would: if every thread only began transactions, none would.
-        Err(KiteError::WalBufferFull) if !checkpointed_for_room => {
-          self.abort_unregistered_transaction(txid);
-          drop(checkpoint_gate);
-          if !self.auto_checkpoint_if_needed(true) {
-            return Err(KiteError::WalBufferFull);
-          }
-          checkpointed_for_room = true;
-        }
-        Err(error) => {
-          self.abort_unregistered_transaction(txid);
-          return Err(error);
-        }
-      }
+      // Only ever raise it: a concurrent begin that took a later txid may
+      // have stored already, and the header persists this value, so a lower
+      // one would issue a used txid again after reopen.
+      self
+        .next_tx_id
+        .fetch_max(txid.saturating_add(1), Ordering::SeqCst);
+      (txid, snapshot_ts)
+    } else {
+      (self.alloc_tx_id(), 0)
     };
 
     let mut tx_state = SingleFileTxState::new(txid, read_only, snapshot_ts, bulk_load);
@@ -522,26 +712,21 @@ impl SingleFileDB {
     Ok(txid)
   }
 
-  /// Drop the MVCC state of a transaction whose begin failed before it was
-  /// registered.
-  fn abort_unregistered_transaction(&self, txid: TxId) {
-    if let Some(mvcc) = self.mvcc.as_ref() {
-      mvcc.tx_manager.lock().abort_tx(txid);
-    }
-  }
-
-  /// Run `write` under the pager and WAL locks. If the WAL refuses the record
-  /// because the secondary region filled during a background checkpoint,
-  /// returns the cut to wait for: the caller releases every lock that
-  /// checkpoint needs (the checkpoint gate, the commit lock), waits with
+  /// Run `write` under the WAL lock. If the WAL refuses the record because
+  /// the secondary region filled during a background checkpoint, returns the
+  /// cut to wait for: the caller releases every lock that checkpoint needs
+  /// (the checkpoint gate, the commit lock), waits with
   /// `wait_for_cut_release`, and retries. Refused records are not written.
+  ///
+  /// Records are only buffered here, so this never waits for file I/O: a
+  /// commit group writes the buffered records without the WAL lock (see
+  /// `WalBuffer::seal`).
   pub(crate) fn try_write_wal<T>(
     &self,
-    write: impl FnOnce(&mut WalBuffer, &mut FilePager) -> Result<T>,
+    write: impl FnOnce(&mut WalBuffer) -> Result<T>,
   ) -> Result<WalWrite<T>> {
-    let mut pager = self.pager.lock();
     let mut wal = self.wal_buffer.lock();
-    match write(&mut wal, &mut pager) {
+    match write(&mut wal) {
       Ok(value) => Ok(WalWrite::Written(value)),
       Err(KiteError::WalBufferFull) => {
         if let Some(cut) = self.cut_blocking_wal_writes(&wal) {
@@ -569,8 +754,8 @@ impl SingleFileDB {
   /// `WalRecord::build` returns it); `record` is unsalted again on return.
   fn write_built_wal_waiting_then(&self, record: &mut [u8], then: impl Fn()) -> Result<()> {
     loop {
-      let written = self.try_write_wal(|wal, pager| {
-        wal.write_built_record(record, pager)?;
+      let written = self.try_write_wal(|wal| {
+        wal.write_built_record(record)?;
         then();
         Ok(())
       })?;
@@ -582,15 +767,59 @@ impl SingleFileDB {
     }
   }
 
-  /// `write_wal_waiting` for records already built (`WalRecord::build`).
-  fn write_wal_bytes_waiting(&self, records: &[u8]) -> Result<()> {
+  /// `write_wal_waiting_then` for records already built
+  /// (`WalRecord::build`), written together.
+  fn write_wal_bytes_waiting_then(&self, records: &[u8], then: impl Fn()) -> Result<()> {
     loop {
-      match self.try_write_wal(|wal, pager| wal.write_record_bytes_batch(records, pager))? {
-        WalWrite::Written(_) => return Ok(()),
+      let written = self.try_write_wal(|wal| {
+        wal.write_record_bytes_batch(records)?;
+        then();
+        Ok(())
+      })?;
+      match written {
+        WalWrite::Written(()) => return Ok(()),
         WalWrite::BlockedOn(cut) => self.wait_for_cut_release(cut)?,
         WalWrite::NeedsCompaction => self.compact_retired_wal()?,
       }
     }
+  }
+
+  /// Write the records `tx_handle`'s transaction kept back (see
+  /// `SingleFileTxState::wal_deferred_from`) to the WAL, after its BEGIN
+  /// record if that is not there yet; from then on it writes its records as
+  /// it makes them. Callers checked that no savepoint is live. On error
+  /// nothing is written, and the records stay kept back.
+  fn write_deferred_records(&self, tx_handle: &Arc<Mutex<SingleFileTxState>>) -> Result<()> {
+    let (txid, from, records, writes_begin) = {
+      let tx = tx_handle.lock();
+      let Some(from) = tx.wal_deferred_from else {
+        return Ok(());
+      };
+      let mut records = if tx.wal_begun {
+        Vec::new()
+      } else {
+        WalRecord::new(WalRecordType::Begin, tx.txid, build_begin_payload()).build()
+      };
+      records.extend_from_slice(&tx.pending_wal[from..]);
+      (tx.txid, from, records, !tx.wal_begun)
+    };
+    // No lock is held here: a background checkpoint may need to install
+    // before the WAL takes the records. A transaction whose BEGIN record is
+    // written joins the open set under the WAL lock, which a background cut
+    // holds while it reads that set.
+    self.write_wal_bytes_waiting_then(&records, || {
+      if writes_begin {
+        self.open_write_txids.lock().insert(txid);
+      }
+    })?;
+    let mut tx = tx_handle.lock();
+    tx.wal_begun = true;
+    tx.wal_deferred_from = None;
+    // Only a primary's commit reads the copy (for the replication sidecar).
+    if self.primary_replication.is_none() {
+      tx.pending_wal.truncate(from);
+    }
+    Ok(())
   }
 
   /// Compact WAL records retained in the secondary region by a background
@@ -602,7 +831,7 @@ impl SingleFileDB {
   /// the same compaction first). The caller keeps blocking checkpoints and
   /// compaction out with its open transaction or a checkpoint gate permit.
   pub(crate) fn compact_retired_wal(&self) -> Result<()> {
-    let _commit_guard = self.commit_lock.lock();
+    let _commit_guard = self.lock_commits();
     let mut pager = self.pager.lock();
     let mut wal = self.wal_buffer.lock();
     let mut header = self.header.write();
@@ -837,9 +1066,9 @@ impl SingleFileDB {
   ///
   /// It copies the transaction's pending changes, so it costs time and memory
   /// in proportion to what the transaction changed so far. While a savepoint
-  /// is live, the transaction's WAL records stay in memory; they are written
-  /// once none is live, or by its commit, so rolling back never leaves one in
-  /// the WAL.
+  /// is live, the transaction's WAL records stay in memory (see
+  /// `SingleFileTxState::wal_deferred_from`), so rolling back never leaves
+  /// one in the WAL.
   pub fn savepoint(&self) -> Result<Savepoint> {
     let (_, handle) = self.require_schema_tx_handle()?;
     let mut tx = handle.lock();
@@ -892,34 +1121,24 @@ impl SingleFileDB {
 
   /// Release `savepoint`, keeping what the calling thread's transaction
   /// changed since; savepoints taken after it end too. Once no savepoint is
-  /// live, the WAL records kept in memory are written (or, if the WAL cannot
-  /// take them now, by the commit).
+  /// live, the WAL records kept in memory are written if the transaction
+  /// writes its records itself (see `SingleFileTxState::wal_deferred_from`),
+  /// or else by its commit, as are those the WAL cannot take now.
   pub fn release_savepoint(&self, savepoint: Savepoint) -> Result<()> {
     let handle = self.current_tx_handle().ok_or(KiteError::NoTransaction)?;
-    let (deferred_from, records) = {
+    let write_now = {
       let mut tx = handle.lock();
       let position = live_savepoint(&tx, &savepoint)?;
       tx.savepoints.truncate(position);
-      if !tx.savepoints.is_empty() {
-        return Ok(());
-      }
-      let Some(from) = tx.wal_deferred_from.take() else {
-        return Ok(());
-      };
-      (from, tx.pending_wal[from..].to_vec())
+      tx.savepoints.is_empty()
+        && !tx.bulk_load
+        && tx
+          .wal_deferred_from
+          .is_some_and(|from| tx.wal_begun || tx.pending_wal.len() - from > super::WAL_DEFER_BYTES)
     };
-    if records.is_empty() {
-      return Ok(());
-    }
-    // No lock is held here: a background checkpoint may need to install
-    // before the WAL takes the records.
-    let written = self.write_wal_bytes_waiting(&records);
-    let mut tx = handle.lock();
-    match written {
-      // Only a primary's commit reads the copy (for the replication sidecar).
-      Ok(()) if self.primary_replication.is_none() => tx.pending_wal.truncate(deferred_from),
-      Ok(()) => {}
-      Err(_) => tx.wal_deferred_from = Some(deferred_from),
+    if write_now {
+      // A failure leaves them to the commit.
+      let _ = self.write_deferred_records(&handle);
     }
     Ok(())
   }
@@ -956,26 +1175,40 @@ impl SingleFileDB {
     &self,
     tx_handle: &Arc<Mutex<SingleFileTxState>>,
   ) -> Result<Option<CommitToken>> {
-    let (txid, read_only, bulk_load, writer, pending, pending_wal, staged_schema, deferred) = {
+    let (
+      txid,
+      read_only,
+      bulk_load,
+      writer,
+      pending,
+      pending_wal,
+      staged_schema,
+      deferred,
+      wal_begun,
+      mvcc_keys,
+    ) = {
       let mut tx = tx_handle.lock();
       let pending = std::mem::take(&mut tx.pending);
       let staged_schema = std::mem::take(&mut tx.schema);
       let pending_wal = std::mem::take(&mut tx.pending_wal);
-      // Its reads and writes join its MVCC sets before the conflict check.
+      // Its reads and writes join its MVCC sets right before its conflict
+      // check, in its group's (`write_commit_round`).
       let reads = std::mem::take(&mut tx.mvcc_reads);
       let writes = std::mem::take(&mut tx.mvcc_writes);
-      if let (Some(mvcc), false) = (self.mvcc.as_ref(), reads.is_empty() && writes.is_empty()) {
-        // Grouped here, without any lock: with other transactions open, the
-        // check and the commit, which every other commit waits for, then
-        // look up and note groups instead of keys. Alone, it commits with no
-        // check and nothing to note.
-        let groups = (self.active_transactions.load(Ordering::Acquire) > 1)
-          .then(|| TxKeyGroups::of(&reads, &writes));
-        mvcc
-          .tx_manager
-          .lock()
-          .record_reads_and_writes(tx.txid, reads, writes, groups);
-      }
+      let mvcc_keys =
+        (self.mvcc.is_some() && !(reads.is_empty() && writes.is_empty())).then(|| {
+          // Grouped here, without any lock: with other transactions open, the
+          // check and the commit, which every other commit waits for, then
+          // look up and note groups instead of keys. Alone, it commits with no
+          // check and nothing to note.
+          let groups = (self.active_transactions.load(Ordering::Acquire) > 1)
+            .then(|| TxKeyGroups::of(&reads, &writes));
+          MvccKeys {
+            reads,
+            writes,
+            groups,
+          }
+        });
       (
         tx.txid,
         tx.read_only,
@@ -985,15 +1218,17 @@ impl SingleFileDB {
         pending_wal,
         staged_schema,
         tx.wal_deferred_from,
+        tx.wal_begun,
+        mvcc_keys,
       )
     };
     // Dropped last: the transaction counts as active (blocking checkpoints
     // wait for it) until its commit is settled. For background cuts it stops
-    // counting as open once its COMMIT is durable (`publish_commit`).
-    let _active_transaction_guard = ActiveTransactionGuard {
+    // counting as open once its COMMIT is durable (`publish_commits`).
+    let mut active_transaction_guard = ActiveTransactionGuard {
       db: self,
       txid,
-      wrote_begin: !read_only && !bulk_load,
+      wrote_begin: wal_begun,
       writer,
     };
     let mut schema_reservation_guard = SchemaReservationGuard::new(self, txid);
@@ -1016,103 +1251,134 @@ impl SingleFileDB {
       armed: true,
     };
 
-    let replication_enabled = self.primary_replication.is_some();
-    let group_commit_active =
-      self.group_commit_enabled && self.sync_mode == SyncMode::Normal && !replication_enabled;
-
-    // A bulk load writes its whole transaction now, in one batch, so a WAL
-    // that refuses it is left without a partial copy; so are the records a
-    // savepoint kept back.
-    let records = {
-      let commit = WalRecord::new(WalRecordType::Commit, txid, build_commit_payload()).build();
-      if bulk_load {
-        let mut records = WalRecord::new(WalRecordType::Begin, txid, build_begin_payload()).build();
-        records.extend_from_slice(&pending_wal);
+    // The records it kept back go with its COMMIT record, in one batch, so a
+    // WAL that refuses them is left without a partial copy: a bulk load's
+    // whole transaction, and a write transaction's records since its BEGIN
+    // record (with it, if not written yet) or since a savepoint.
+    let commit = WalRecord::new(WalRecordType::Commit, txid, build_commit_payload()).build();
+    let commit_record_len = commit.len();
+    let records = match (bulk_load, deferred) {
+      (false, None) => commit,
+      (_, deferred) => {
+        let from = if bulk_load { 0 } else { deferred.unwrap_or(0) };
+        let mut records = if wal_begun {
+          Vec::with_capacity(pending_wal.len() - from + commit.len())
+        } else {
+          WalRecord::new(WalRecordType::Begin, txid, build_begin_payload()).build()
+        };
+        records.extend_from_slice(&pending_wal[from..]);
         records.extend_from_slice(&commit);
         records
-      } else if let Some(from) = deferred {
-        let mut records = pending_wal[from..].to_vec();
-        records.extend_from_slice(&commit);
-        records
-      } else {
-        commit
       }
     };
-    let request = CommitRequest {
+    let request = Box::new(CommitRequest {
       txid,
       bulk_load,
+      mvcc_keys,
       records,
+      commit_record_len,
       pending,
       pending_wal,
       staged_schema,
       committer: std::thread::current().id(),
-    };
+    });
 
     #[cfg(test)]
     self.commits_waiting.fetch_add(1, Ordering::SeqCst);
-    let outcome = if group_commit_active {
-      self.commit_in_group(request)
-    } else {
-      self
-        .write_commits(vec![request])
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| {
-          CommitOutcome::failed(KiteError::Internal("commit was not written".to_string()))
-        })
-    };
+    let outcome = self.commit_queued(request);
     #[cfg(test)]
     self.commits_waiting.fetch_sub(1, Ordering::SeqCst);
     mvcc_abort.armed = !outcome.durable;
+    // Its publish took it out of the open set already.
+    active_transaction_guard.wrote_begin &= !outcome.durable;
     if outcome.schema_published {
       schema_reservation_guard.disarm();
     }
     outcome.result
   }
 
-  /// Group commit. Queue `request`; the first committer to find no leader
-  /// leads: it takes everything queued and writes it as one batch
-  /// (`write_commits`: one WAL flush and one header for all). The others
-  /// wait for their outcome without the commit lock, so the commits that
-  /// arrive while a batch is written form the next one. Nobody sleeps to
-  /// wait for more.
-  fn commit_in_group(&self, request: CommitRequest) -> CommitOutcome {
-    let mut state = self.group_commit_state.lock();
-    let ticket = state.next_ticket;
-    state.next_ticket += 1;
-    state.queue.push_back((ticket, request));
-    loop {
-      if let Some(outcome) = state.outcomes.remove(&ticket) {
-        return outcome;
-      }
-      if state.leader_active {
-        self.group_commit_cv.wait(&mut state);
-        continue;
-      }
-      state.leader_active = true;
-      let (tickets, requests): (Vec<u64>, Vec<CommitRequest>) = state.queue.drain(..).unzip();
+  /// Queue `request` and return its outcome once it is written. The first
+  /// committer to find no leader leads: it takes everything queued (at most
+  /// `MAX_GROUP_COMMITS`) and writes it as one group (`write_commits`: one
+  /// WAL write, one sync if the mode asks for one, and one header for all).
+  /// The others wait without the commit lock, so the commits that arrive
+  /// while a group is written form the next one, which the oldest of them
+  /// leads once the group is durable. Nobody sleeps to wait for more
+  /// commits.
+  fn commit_queued(&self, request: Box<CommitRequest>) -> CommitOutcome {
+    let mut state = self.commit_queue.state.lock();
+    if !state.leading {
+      state.leading = true;
       drop(state);
-      let mut leader = GroupCommitLeader {
-        db: self,
-        tickets,
-        outcomes: Vec::new(),
-      };
-      leader.outcomes = self.write_commits(requests);
-      drop(leader);
-      state = self.group_commit_state.lock();
+      return self.lead_commits(Some(request), None);
     }
+    let ticket = Arc::new(CommitTicket::new());
+    state.queued.push_back(QueuedCommit {
+      request,
+      ticket: Arc::clone(&ticket),
+    });
+    drop(state);
+    match ticket.wait() {
+      Some(outcome) => outcome,
+      // Handed the lead: this commit is the oldest queued.
+      None => self.lead_commits(None, Some(&ticket)),
+    }
+  }
+
+  /// Lead the commit queue (see `commit_queued`): write one group, this
+  /// committer's commit (`own_request`, or the queued one of `own_ticket`)
+  /// and the commits queued before the leader took them, at most
+  /// `MAX_GROUP_COMMITS`. Once the group is durable the lead passes on, so
+  /// the next group is written while this one publishes. Returns this
+  /// committer's outcome.
+  fn lead_commits(
+    &self,
+    own_request: Option<Box<CommitRequest>>,
+    own_ticket: Option<&Arc<CommitTicket>>,
+  ) -> CommitOutcome {
+    let mut leader = CommitLeader {
+      db: self,
+      group: Vec::new(),
+      released: false,
+    };
+    before_commit_lock_test_hook();
+    let mut requests = Vec::new();
+    if let Some(request) = own_request {
+      requests.push(request);
+      leader.group.push(None);
+    }
+    {
+      let mut state = self.commit_queue.state.lock();
+      let take = state.queued.len().min(MAX_GROUP_COMMITS - requests.len());
+      for queued in state.queued.drain(..take) {
+        leader.group.push(Some(queued.ticket));
+        requests.push(queued.request);
+      }
+    }
+    let outcomes = self.write_commits(requests, &mut leader);
+    leader.deliver(own_ticket, outcomes).unwrap_or_else(|| {
+      CommitOutcome::failed(KiteError::Internal("commit was not written".to_string()))
+    })
   }
 
   /// Write `requests`' commits in order, and return their outcomes in the
   /// same order. Each round, under the commit lock, writes the COMMIT records
-  /// of those that fit and makes them durable with one WAL flush and one
-  /// header (`write_commit_round`), then publishes each (`publish_commit`).
+  /// of those that fit and makes them durable with one WAL write and one
+  /// header (`write_commit_round`); then, under the publish lock, which it
+  /// takes before it releases the commit lock (so rounds publish in commit
+  /// order), publishes them (`publish_commits`). Once a round leaves nothing
+  /// of `requests` to write, `leader` passes the lead on before the publish.
   /// Callers hold no lock.
-  fn write_commits(&self, requests: Vec<CommitRequest>) -> Vec<CommitOutcome> {
+  fn write_commits(
+    &self,
+    requests: Vec<Box<CommitRequest>>,
+    leader: &mut CommitLeader<'_>,
+  ) -> Vec<CommitOutcome> {
     let mut outcomes: Vec<Option<CommitOutcome>> = requests.iter().map(|_| None).collect();
-    let mut queue: VecDeque<(usize, CommitRequest)> = requests.into_iter().enumerate().collect();
+    let mut queue: VecDeque<(usize, Box<CommitRequest>)> =
+      requests.into_iter().enumerate().collect();
+    let mut checkpointed_for_room = false;
     while !queue.is_empty() {
-      before_commit_lock_test_hook();
       #[cfg(feature = "bench-profile")]
       let commit_lock_start = Instant::now();
       let commit_guard = self.commit_lock.lock();
@@ -1123,16 +1389,35 @@ impl SingleFileDB {
       );
 
       let round = self.write_commit_round(&mut queue, &mut outcomes);
-      for (index, request) in round.durable {
-        outcomes[index] = Some(self.publish_commit(request));
-      }
+      let publish_guard = self.publish_lock.lock();
       drop(commit_guard);
+      if queue.is_empty() {
+        leader.release_lead();
+      }
+      for (index, outcome) in self.publish_commits(round.durable) {
+        outcomes[index] = Some(outcome);
+      }
+      drop(publish_guard);
 
       // The background checkpoint takes the commit lock to install.
       if let Some(cut) = round.wait_for_cut {
         if let Err(error) = self.wait_for_cut_release(cut) {
           if let Some((index, _)) = queue.pop_front() {
             outcomes[index] = Some(CommitOutcome::failed(error));
+          }
+        }
+      }
+      // A background checkpoint makes room without waiting for the open
+      // transactions (these among them); a blocking one would wait for them
+      // forever. Once one ran, a commit that still does not fit fails.
+      if round.wal_full {
+        let made_room = !checkpointed_for_room
+          && self.background_checkpoint
+          && self.auto_checkpoint_if_needed(true);
+        checkpointed_for_room |= made_room;
+        if !made_room {
+          if let Some((index, _)) = queue.pop_front() {
+            outcomes[index] = Some(CommitOutcome::failed(KiteError::WalBufferFull));
           }
         }
       }
@@ -1147,24 +1432,45 @@ impl SingleFileDB {
       .collect()
   }
 
-  /// One round of `write_commits`, under the commit lock: write the COMMIT
-  /// records of `queue`'s requests, in order, while they fit, then make them
-  /// durable (`persist_commit_header`). Returns the durable ones, to publish;
-  /// a request refused before that gets its outcome in `outcomes`, with
-  /// nothing of it recorded.
+  /// Hold off commits: take the commit lock, and wait until every commit
+  /// that took it before has published (merged into the delta). Callers
+  /// that need the delta, the vector stores and the WAL to agree
+  /// (checkpoints, exports, backups, vector store creation) take this instead
+  /// of the bare commit lock: a commit publishes after it releases it.
+  pub(crate) fn lock_commits(&self) -> parking_lot::MutexGuard<'_, ()> {
+    let commit_guard = self.commit_lock.lock();
+    drop(self.publish_lock.lock());
+    commit_guard
+  }
+
+  /// One round of `write_commits`, under the commit lock: append the COMMIT
+  /// records of `queue`'s requests, in order, while they fit, each after its
+  /// MVCC conflict check stages it, then make them durable
+  /// (`persist_commit_round`). Returns the durable ones, to publish; a
+  /// request refused before that gets its outcome in `outcomes`, with nothing
+  /// of it recorded.
   ///
-  /// The pager and WAL locks are held from the first record to the header,
-  /// so the round's records follow every record written before them and
-  /// none follows them. If the round fails before its header is durable,
-  /// rewinding the WAL head forgets exactly its records: later records
-  /// overwrite their bytes before any header names them, so a failed commit
-  /// never becomes durable later.
+  /// The pager lock is held from the first record to the header, so no one
+  /// reads, flushes or names the WAL past the round's records meanwhile. The
+  /// WAL lock is held only to append and seal them: transactions keep
+  /// appending while the round's file I/O runs, after its records. If the
+  /// round fails before its header is durable, its COMMIT records become
+  /// ROLLBACK records (`WalBuffer::restore_sealed`), so a failed commit never
+  /// becomes durable later, and MVCC unstages its members.
   fn write_commit_round(
     &self,
-    queue: &mut VecDeque<(usize, CommitRequest)>,
+    queue: &mut VecDeque<(usize, Box<CommitRequest>)>,
     outcomes: &mut [Option<CommitOutcome>],
   ) -> CommitRound {
     let mut round = CommitRound::default();
+    // Vector checks read the stores, which a group still publishing may be
+    // changing (creating one, or adding to it): let it finish first.
+    if queue
+      .iter()
+      .any(|(_, request)| !request.pending.pending_vectors.is_empty())
+    {
+      drop(self.publish_lock.lock());
+    }
     // Loading a store and checking targets take the snapshot lock, so before
     // the pager lock.
     let mut loaded = VecDeque::with_capacity(queue.len());
@@ -1204,79 +1510,115 @@ impl SingleFileDB {
     }
     *queue = loaded;
 
-    let mut pager = self.pager.lock();
-    let mut wal = self.wal_buffer.lock();
-    let mut staged = Vec::new();
-    let mut wal_before_round: Option<WalRegionState> = None;
-    let mut claims = RoundClaims::default();
-    while let Some((index, request)) = queue.pop_front() {
-      let new_dimensions = match self
-        .check_commit_vectors(&request.pending.pending_vectors, &claims.vector_dimensions)
-      {
-        Ok(new_dimensions) => new_dimensions,
-        Err(error) => {
-          outcomes[index] = Some(CommitOutcome::failed(error));
-          continue;
-        }
-      };
-      if !wal.can_fit(request.records.len()) {
-        // Make what fits durable first; this one waits for the next round.
-        if !staged.is_empty() {
-          queue.push_front((index, request));
-          break;
-        }
-        // Nothing of this commit is recorded yet, so make room and retry.
-        if wal.is_primary_retired() {
-          let mut header = self.header.write();
-          match self.compact_retained_wal(&mut pager, &mut wal, &mut header) {
-            Ok(()) => queue.push_front((index, request)),
-            Err(error) => outcomes[index] = Some(CommitOutcome::failed(error)),
+    // Vector and MVCC checks, in order, without the WAL lock: each commit
+    // that passes is staged, so the ones after it check against its writes.
+    // The transaction manager's lock is taken once for the commits without
+    // vectors (their check takes the vector stores' lock).
+    let mut checked = VecDeque::with_capacity(queue.len());
+    {
+      // Dimensions given by commits earlier in the round to vector
+      // properties that have no store yet.
+      let mut claimed_dimensions = HashMap::new();
+      let mut tx_mgr: Option<parking_lot::MutexGuard<'_, crate::mvcc::TxManager>> = None;
+      for (index, mut request) in queue.drain(..) {
+        let new_dimensions = if request.pending.pending_vectors.is_empty() {
+          HashMap::new()
+        } else {
+          tx_mgr = None;
+          match self.check_commit_vectors(&request.pending.pending_vectors, &claimed_dimensions) {
+            Ok(new_dimensions) => new_dimensions,
+            Err(error) => {
+              outcomes[index] = Some(CommitOutcome::failed(error));
+              continue;
+            }
           }
-          continue;
-        }
-        match self.cut_blocking_wal_writes(&wal) {
-          Some(cut) => {
-            queue.push_front((index, request));
-            round.wait_for_cut = Some(cut);
-            break;
-          }
-          None => outcomes[index] = Some(CommitOutcome::failed(KiteError::WalBufferFull)),
-        }
-        continue;
-      }
-      // Only a later commit of the round needs this one's writes.
-      let claim_writes = !queue.is_empty();
-      let mvcc_writes =
-        match self.check_commit_in_mvcc(request.txid, &claims.mvcc_writes, claim_writes) {
-          Ok(mvcc_writes) => mvcc_writes,
-          Err(error) => {
+        };
+        if let Some(mvcc) = self.mvcc.as_ref() {
+          let tx_mgr = tx_mgr.get_or_insert_with(|| mvcc.tx_manager.lock());
+          if let Err(error) = check_and_stage_in_mvcc(mvcc, tx_mgr, &mut request) {
             outcomes[index] = Some(CommitOutcome::failed(error));
             continue;
           }
-        };
-      let before = wal.region_state();
-      if let Err(error) = wal.write_record_bytes_batch(&request.records, &mut pager) {
-        outcomes[index] = Some(CommitOutcome::failed(error));
-        continue;
+        }
+        claimed_dimensions.extend(new_dimensions);
+        checked.push_back((index, request));
       }
-      wal_before_round.get_or_insert(before);
-      claims.vector_dimensions.extend(new_dimensions);
-      claims.mvcc_writes.extend(mvcc_writes);
-      staged.push((index, request));
     }
-    let Some(wal_before_round) = wal_before_round else {
-      return round;
+
+    // Their records, in order, while they fit. Those that do not wait for
+    // the next round, unstaged (they are the newest staged), and are checked
+    // again then.
+    let mut pager = self.pager.lock();
+    let mut staged = Vec::new();
+    // The WAL position of each staged commit's COMMIT record.
+    let mut commit_records = Vec::new();
+    let sealed = {
+      let mut wal = self.wal_buffer.lock();
+      while let Some((index, mut request)) = checked.pop_front() {
+        if wal.can_fit(request.records.len()) {
+          if let Err(error) = wal.write_owned_record_bytes(std::mem::take(&mut request.records)) {
+            self.unstage_newest_in_mvcc(checked.len() + 1);
+            outcomes[index] = Some(CommitOutcome::failed(error));
+            queue.extend(checked.drain(..));
+            break;
+          }
+          commit_records.push((wal.head() - request.commit_record_len as u64, request.txid));
+          staged.push((index, request));
+          continue;
+        }
+        self.unstage_newest_in_mvcc(checked.len() + 1);
+        // Make what fits durable first; this one waits for the next round.
+        if !staged.is_empty() {
+          queue.push_back((index, request));
+          queue.extend(checked.drain(..));
+          break;
+        }
+        // Nothing of this round is recorded yet, so make room and retry.
+        if wal.is_primary_retired() {
+          let mut header = self.header.write();
+          match self.compact_retained_wal(&mut pager, &mut wal, &mut header) {
+            Ok(()) => queue.push_back((index, request)),
+            Err(error) => outcomes[index] = Some(CommitOutcome::failed(error)),
+          }
+        } else if let Some(cut) = self.cut_blocking_wal_writes(&wal) {
+          queue.push_back((index, request));
+          round.wait_for_cut = Some(cut);
+        } else {
+          queue.push_back((index, request));
+          round.wal_full = true;
+        }
+        queue.extend(checked.drain(..));
+        break;
+      }
+      if staged.is_empty() {
+        return round;
+      }
+      // `SyncMode::Off` leaves the records buffered (checkpoints and close
+      // write them) and names them in the in-memory header only.
+      (self.sync_mode != SyncMode::Off).then(|| wal.seal())
     };
 
-    match self.persist_commit_header(&mut pager, &mut wal, staged.len()) {
-      Ok(()) => round.durable = staged,
+    match self.persist_commit_round(&mut pager, sealed.as_ref(), staged.len()) {
+      Ok(()) => {
+        drop(pager);
+        round.durable = self.settle_durable_commits(staged);
+      }
       Err(error) => {
-        if let Err(scrub) = wal.discard_since(wal_before_round, &mut pager) {
-          eprintln!(
-            "Warning: could not sync the discarded records of a failed commit; the next commit \
-             syncs them before its header: {scrub}"
-          );
+        if let Some(sealed) = sealed {
+          let mut wal = self.wal_buffer.lock();
+          let scrubbed = wal
+            .restore_sealed(sealed, commit_records)
+            .and_then(|()| wal.flush(&mut pager));
+          if let Err(scrub) = scrubbed {
+            eprintln!(
+              "Warning: could not make the failed commits' rollback durable; the next header \
+               syncs it first: {scrub}"
+            );
+          }
         }
+        // This round's commits are the newest staged; those of a round
+        // still publishing stay staged.
+        self.unstage_newest_in_mvcc(staged.len());
         let mut errors: Vec<KiteError> =
           staged.iter().skip(1).map(|_| round_error(&error)).collect();
         errors.insert(0, error);
@@ -1288,54 +1630,68 @@ impl SingleFileDB {
     round
   }
 
-  /// Make the WAL records written so far durable as the sync mode asks:
-  /// flush them (and in Full mode fsync them) before a header names them,
+  /// Make a round's commits durable as the sync mode asks: write the sealed
+  /// WAL bytes (and in Full mode fsync them) before a header names them,
   /// then install that header. `commits` is the number of commits the round
-  /// wrote. A header written before its WAL bytes names bytes a crash can
+  /// staged. A header written before its WAL bytes names bytes a crash can
   /// leave unwritten, where recovery reads stale records of an earlier WAL
   /// cycle. On error the in-memory header is as it was, but for its newer
   /// change counter (the next header must outrank every slot on disk).
-  fn persist_commit_header(
+  ///
+  /// `sealed` is `None` in `SyncMode::Off`, which writes nothing.
+  fn persist_commit_round(
     &self,
     pager: &mut FilePager,
-    wal: &mut WalBuffer,
+    sealed: Option<&SealedWrites>,
     commits: usize,
   ) -> Result<()> {
     during_commit_io_test_hook();
-    #[cfg(feature = "bench-profile")]
-    let flush_start = Instant::now();
-    let flushed = match self.sync_mode {
-      SyncMode::Full => wal.sync(pager),
-      // A failed round's records may still be readable on disk, and this
-      // header names bytes past them: make their overwrite durable first.
-      SyncMode::Normal if wal.needs_sync() => wal.sync(pager),
-      SyncMode::Normal => wal.flush(pager),
-      SyncMode::Off => Ok(()),
-    };
-    #[cfg(feature = "bench-profile")]
-    self
-      .wal_flush_ns
-      .fetch_add(flush_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    flushed?;
+    if let Some(sealed) = sealed {
+      #[cfg(feature = "bench-profile")]
+      let flush_start = Instant::now();
+      let written = sealed.write(pager).and_then(|()| {
+        // A failed round's rewritten records may not be durable yet, and
+        // this header names bytes past them: make them durable first.
+        if self.sync_mode == SyncMode::Full || sealed.needs_sync() {
+          pager.sync_data()?;
+          self.wal_buffer.lock().note_sealed_synced(sealed);
+        }
+        Ok(())
+      });
+      #[cfg(feature = "bench-profile")]
+      self
+        .wal_flush_ns
+        .fetch_add(flush_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+      written?;
+    }
 
-    // MVCC commits the round's commits in order from its next timestamp.
+    // MVCC commits the staged commits in order, this round's last.
     let last_commit_ts = match self.mvcc.as_ref() {
-      Some(mvcc) => mvcc.tx_manager.lock().next_commit_ts() + (commits as u64).saturating_sub(1),
+      Some(mvcc) => {
+        let tx_mgr = mvcc.tx_manager.lock();
+        tx_mgr
+          .newest_staged_ts()
+          .unwrap_or_else(|| tx_mgr.next_commit_ts() + (commits as u64).saturating_sub(1))
+      }
       None => std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0),
     };
+    let wal_state = match sealed {
+      Some(sealed) => *sealed.state(),
+      None => self.wal_buffer.lock().region_state(),
+    };
     let mut header = self.header.write();
     let prior = header.clone();
-    wal.store_in_header(&mut header);
+    wal_state.store_in_header(&mut header);
     header.max_node_id = self
       .next_node_id
       .load(std::sync::atomic::Ordering::SeqCst)
       .saturating_sub(1);
     header.next_tx_id = self.next_tx_id.load(std::sync::atomic::Ordering::SeqCst);
     header.last_commit_ts = last_commit_ts;
-    if self.sync_mode != SyncMode::Off {
+    if sealed.is_some() {
       #[cfg(feature = "bench-profile")]
       let sync_start = Instant::now();
       let persisted = self.persist_header(pager, &mut header, self.sync_mode == SyncMode::Full);
@@ -1353,161 +1709,172 @@ impl SingleFileDB {
     Ok(())
   }
 
-  /// Make a durable commit visible, under the commit lock and in WAL order:
-  /// publish its schema; then, in one `delta.write()` critical section,
-  /// commit it in MVCC (its timestamp), add its version chains, apply its
-  /// vectors and merge it into the delta; then hand it to the replication
-  /// sidecar. Transactions begin under `delta.read()`, so none begins between
-  /// the timestamp and the merge, and each one begun before counts as a
-  /// reader that needs version chains.
+  /// The steps of a round's durable commits that stay under the commit
+  /// lock, in WAL order: they stop counting as open, and a primary's
+  /// replication sidecar takes their frames. Returns them, to publish.
   ///
-  /// Every step runs even if an earlier one fails: stopping early would leave
-  /// a durable transaction out of the delta, invisible until a reopen replays
-  /// it, and the next checkpoint (a snapshot of the delta) would drop it. The
-  /// first failure is reported.
-  fn publish_commit(&self, request: CommitRequest) -> CommitOutcome {
-    let CommitRequest {
-      txid,
-      mut pending,
-      pending_wal,
-      staged_schema,
-      committer,
-      ..
-    } = request;
-    let on_committer_thread = committer == std::thread::current().id();
+  /// A background cut (which takes the commit lock) must no longer count
+  /// them as open: their records end with a durable COMMIT. Their committers
+  /// learn that only later, and a cut taken meanwhile would skip their
+  /// records, its install drop them, and the next cut find an open
+  /// transaction with no BEGIN record and decline. The sidecar frames are
+  /// appended under the commit lock, in order, with the epoch fence checked
+  /// under it (`write_commit_round`), so a copy of the database taken under
+  /// the commit lock never holds a commit its frame position misses.
+  fn settle_durable_commits(&self, staged: Vec<(usize, Box<CommitRequest>)>) -> Vec<DurableCommit> {
+    {
+      let mut open = self.open_write_txids.lock();
+      for (_, request) in &staged {
+        open.remove(&request.txid);
+      }
+    }
+    staged
+      .into_iter()
+      .map(|(index, mut request)| {
+        let mut token = None;
+        if let Some(replication) = self.primary_replication.as_ref() {
+          if replication.crash_after_local_commit_for_testing() {
+            // Test-only abrupt-stop hook for the exact local-durable/sidecar
+            // boundary: the main WAL and header are complete.
+            std::process::abort();
+          }
+          match replication
+            .append_commit_wal_frame(request.txid, std::mem::take(&mut request.pending_wal))
+          {
+            Ok(commit_token) => token = Some(commit_token),
+            Err(error) => {
+              eprintln!(
+                "Warning: local commit durable but replication sidecar append failed: {error}"
+              )
+            }
+          }
+        }
+        DurableCommit {
+          index,
+          request,
+          token,
+        }
+      })
+      .collect()
+  }
 
-    // A background cut (which takes the commit lock) no longer counts it as
-    // open: its records end with a durable COMMIT. Its committer may only
-    // learn that later (a group-commit follower wakes after the batch is
-    // delivered), and a cut taken meanwhile would skip its records, its
-    // install drop them, and the next cut find an open transaction with no
-    // BEGIN record and decline.
-    self.open_write_txids.lock().remove(&txid);
+  /// Make a round's durable commits visible, in WAL order, under the publish
+  /// lock (rounds publish in the order they took the commit lock): publish
+  /// their schema; then, in one `delta.write()` critical section, for each
+  /// in order, commit it in MVCC (its timestamp), add its version chains,
+  /// apply its vectors and merge it into the delta. Transactions begin under
+  /// `delta.read()`, so none begins inside the section, and each one begun
+  /// before counts as a reader that needs version chains.
+  ///
+  /// Every step runs for every commit even if an earlier one fails: stopping
+  /// early would leave a durable transaction out of the delta, invisible
+  /// until a reopen replays it, and the next checkpoint (a snapshot of the
+  /// delta) would drop it. Each commit reports its first failure.
+  fn publish_commits(&self, round: Vec<DurableCommit>) -> Vec<(usize, CommitOutcome)> {
+    if round.is_empty() {
+      return Vec::new();
+    }
+    let this_thread = std::thread::current().id();
 
     // This is the schema visibility point, right after the durable commit
     // boundary. Publishing before any fallible post-commit work keeps a
     // later error from leaving a committed WAL definition hidden in this
     // process.
-    let schema_result = self.publish_staged_schema(&staged_schema);
-
-    if on_committer_thread {
-      before_merge_test_hook();
+    let mut published: Vec<(DurableCommit, Result<()>)> = round
+      .into_iter()
+      .map(|commit| {
+        let schema = self.publish_staged_schema(&commit.request.staged_schema);
+        (commit, schema)
+      })
+      .collect();
+    for (commit, _) in &published {
+      if commit.request.committer == this_thread {
+        before_merge_test_hook();
+      }
     }
+
+    let mut results = Vec::with_capacity(published.len());
     let mut delta = self.delta.write();
-    let mvcc_commit = self.commit_in_mvcc(txid);
-    if on_committer_thread {
-      after_commit_timestamp_test_hook();
+    let _publishing = PublishSection::enter(&self.publish_seq);
+    let (mvcc_commits, mut released_keys) =
+      self.commit_in_mvcc(published.iter().map(|(commit, _)| commit.request.txid));
+    for ((commit, _), mvcc_commit) in published.iter_mut().zip(mvcc_commits) {
+      let request = &mut commit.request;
+      let on_committer_thread = request.committer == this_thread;
+      if on_committer_thread {
+        after_commit_timestamp_test_hook();
+      }
+      let commit_ts_for_mvcc = mvcc_commit.as_ref().ok().copied().flatten();
+      self.apply_mvcc_commit(commit_ts_for_mvcc, request.txid, &request.pending, &delta);
+
+      // The stores are loaded and the dimensions checked (`write_commit_round`).
+      let vector_fault = if on_committer_thread {
+        post_durable_test_fault()
+      } else {
+        Ok(())
+      };
+      let vector_result =
+        vector_fault.and_then(|()| self.apply_pending_vectors(&request.pending.pending_vectors));
+
+      delta.merge_from(&mut request.pending);
+      results.push(mvcc_commit.map(|_| ()).and(vector_result));
     }
-    let commit_ts_for_mvcc = mvcc_commit.as_ref().ok().copied().flatten();
-    self.apply_mvcc_commit(commit_ts_for_mvcc, txid, &pending, &delta);
-
-    // The stores are loaded and the dimensions checked (`write_commit_round`).
-    let vector_fault = if on_committer_thread {
-      post_durable_test_fault()
-    } else {
-      Ok(())
-    };
-    let vector_result =
-      vector_fault.and_then(|()| self.apply_pending_vectors(&pending.pending_vectors));
-
-    delta.merge_from(&mut pending);
+    drop(_publishing);
     drop(delta);
-    // Its emptied maps are freed without the lock.
-    drop(pending);
 
-    let mut commit_token = None;
-    if let Some(replication) = self.primary_replication.as_ref() {
-      if replication.crash_after_local_commit_for_testing() {
-        // Test-only abrupt-stop hook for the exact local-durable/sidecar
-        // boundary. The main WAL, header, and in-memory state are complete.
-        std::process::abort();
-      }
-      match replication.append_commit_wal_frame(txid, pending_wal) {
-        Ok(token) => commit_token = Some(token),
-        Err(error) => {
-          eprintln!("Warning: local commit durable but replication sidecar append failed: {error}")
-        }
-      }
-    }
+    published
+      .into_iter()
+      .zip(results)
+      .map(|((commit, schema_result), result)| {
+        let outcome = CommitOutcome {
+          durable: true,
+          schema_published: schema_result.is_ok(),
+          result: schema_result.and(result).map(|()| commit.token),
+          _leftovers: Some(commit.request),
+          _released_keys: std::mem::take(&mut released_keys),
+        };
+        (commit.index, outcome)
+      })
+      .collect()
+  }
 
-    CommitOutcome {
-      durable: true,
-      schema_published: schema_result.is_ok(),
-      result: schema_result
-        .and(mvcc_commit.map(|_| ()))
-        .and(vector_result)
-        .map(|()| commit_token),
+  /// Unstage the `count` commits `check_and_stage_in_mvcc` staged last,
+  /// whose records the WAL did not take this round.
+  fn unstage_newest_in_mvcc(&self, count: usize) {
+    if let Some(mvcc) = self.mvcc.as_ref() {
+      let mut tx_mgr = mvcc.tx_manager.lock();
+      for _ in 0..count {
+        tx_mgr.unstage_last();
+      }
     }
   }
 
-  /// Check `txid` for MVCC conflicts before its COMMIT record is written:
-  /// with the transactions committed since it began, and with `claimed`, the
-  /// keys written by commits earlier in its round (committed in MVCC only
-  /// once the round is durable). Returns the keys it writes if
-  /// `claim_writes` (later commits of the round check against them). A
-  /// conflict aborts it. Callers hold the commit lock, so nothing commits between
-  /// this check and its MVCC commit (`commit_in_mvcc`).
-  fn check_commit_in_mvcc(
+  /// Commit `txids` in MVCC, in order, if enabled, at their durable point:
+  /// for each, its commit timestamp, and whether a transaction that may still
+  /// read was active once it committed (which then needs version chains).
+  /// Callers hold `delta.write()` (see `publish_commits`) and staged them
+  /// (`check_and_stage_in_mvcc`).
+  /// Also returns the key sets the commits released, to free without the
+  /// locks.
+  #[allow(clippy::type_complexity)]
+  fn commit_in_mvcc(
     &self,
-    txid: TxId,
-    claimed: &TxKeySet,
-    claim_writes: bool,
-  ) -> Result<Vec<TxKey>> {
+    txids: impl Iterator<Item = TxId>,
+  ) -> (Vec<Result<Option<(u64, bool)>>>, Vec<TxKeySet>) {
     let Some(mvcc) = self.mvcc.as_ref() else {
-      return Ok(Vec::new());
+      return (txids.map(|_| Ok(None)).collect(), Vec::new());
     };
     let mut tx_mgr = mvcc.tx_manager.lock();
-    let (mut conflicts, writes) = match tx_mgr.tx(txid) {
-      Some(tx) => (
-        if claimed.is_empty() {
-          Vec::new()
-        } else {
-          tx.read_set
-            .union(&tx.write_set)
-            .filter(|key| claimed.contains(*key))
-            .map(|key| key.to_string())
-            .collect::<Vec<_>>()
-        },
-        if claim_writes {
-          tx.write_set.iter().cloned().collect::<Vec<_>>()
-        } else {
-          Vec::new()
-        },
-      ),
-      None => {
-        return Err(KiteError::Internal(format!(
-          "transaction {txid} is not active in MVCC"
-        )))
-      }
-    };
-    if let Err(err) = mvcc.conflict_detector.validate_commit(&tx_mgr, txid) {
-      conflicts.extend(err.conflicting_keys);
-    }
-    if !conflicts.is_empty() {
-      tx_mgr.abort_tx(txid);
-      conflicts.sort_unstable();
-      conflicts.dedup();
-      return Err(KiteError::Conflict {
-        txid,
-        keys: conflicts,
-      });
-    }
-    Ok(writes)
-  }
-
-  /// Commit `txid` in MVCC, if enabled, at its durable point: its commit
-  /// timestamp, and whether any transaction is still active (which then
-  /// needs version chains). Callers hold `delta.write()` (see
-  /// `publish_commit`) and checked its conflicts (`check_commit_in_mvcc`).
-  fn commit_in_mvcc(&self, txid: TxId) -> Result<Option<(u64, bool)>> {
-    let Some(mvcc) = self.mvcc.as_ref() else {
-      return Ok(None);
-    };
-    let mut tx_mgr = mvcc.tx_manager.lock();
-    let commit_ts = tx_mgr
-      .commit_tx(txid)
-      .map_err(|e| KiteError::Internal(e.to_string()))?;
-    Ok(Some((commit_ts, tx_mgr.active_count() > 0)))
+    let mut released = Vec::new();
+    let committed = txids
+      .map(|txid| {
+        let commit_ts = tx_mgr
+          .commit_tx_releasing(txid, &mut released)
+          .map_err(|e| KiteError::Internal(e.to_string()))?;
+        Ok(Some((commit_ts, tx_mgr.has_open_readers())))
+      })
+      .collect();
+    (committed, released)
   }
 
   /// Rollback the current transaction
@@ -1531,14 +1898,14 @@ impl SingleFileDB {
     &self,
     tx_handle: &Arc<Mutex<SingleFileTxState>>,
   ) -> Result<()> {
-    let (txid, read_only, bulk_load, writer) = {
+    let (txid, read_only, wal_begun, writer) = {
       let mut tx = tx_handle.lock();
-      (tx.txid, tx.read_only, tx.bulk_load, tx.writer.take())
+      (tx.txid, tx.read_only, tx.wal_begun, tx.writer.take())
     };
     let _active_transaction_guard = ActiveTransactionGuard {
       db: self,
       txid,
-      wrote_begin: !read_only && !bulk_load,
+      wrote_begin: wal_begun,
       writer,
     };
     let _schema_reservation_guard = SchemaReservationGuard::new(self, txid);
@@ -1559,10 +1926,13 @@ impl SingleFileDB {
       tx_mgr.abort_tx(txid);
     }
 
-    if !bulk_load {
+    // A transaction with no record in the WAL leaves nothing to roll back
+    // there: its records were kept back (a bulk load's, and a write
+    // transaction's until it writes its BEGIN record).
+    if wal_begun {
       // Write the ROLLBACK record, and stop counting the transaction as open
       // under the same WAL lock, which a background cut holds while it reads
-      // the open set (see `publish_commit` for COMMIT records).
+      // the open set (see `settle_durable_commits` for COMMIT records).
       let record = WalRecord::new(WalRecordType::Rollback, txid, build_rollback_payload());
       self.write_wal_waiting_then(&record, || {
         self.open_write_txids.lock().remove(&txid);
@@ -1598,12 +1968,14 @@ impl SingleFileDB {
       .map(|replication| replication.status())
   }
 
-  /// Log `record` for the transaction `tx_handle`: to the WAL now, or, for a
-  /// bulk load or while a savepoint is live, later (see
-  /// `SingleFileTxState::wal_deferred_from`). It is encoded once. The
-  /// transaction keeps a copy only when something reads it later: its commit
-  /// or savepoint release writes the records it kept back, and a primary's
-  /// commit hands them all to the replication sidecar (`publish_commit`).
+  /// Log `record` for the transaction `tx_handle`: keep it back with the
+  /// transaction's other records (see `SingleFileTxState::wal_deferred_from`;
+  /// they are written once they outgrow `WAL_DEFER_BYTES`, or by the
+  /// commit), or write it to the WAL now. It is encoded once. The
+  /// transaction keeps a copy of a record it wrote only for a primary's
+  /// commit, which hands them all to the replication sidecar.
+  ///
+  /// On error the record is dropped: callers apply only a logged write.
   pub(crate) fn write_wal_tx(
     &self,
     tx_handle: &Arc<Mutex<SingleFileTxState>>,
@@ -1612,7 +1984,20 @@ impl SingleFileDB {
     let mut record_bytes = record.build();
     let mut tx = tx_handle.lock();
     if tx.bulk_load || tx.wal_deferred_from.is_some() {
+      let before = tx.pending_wal.len();
       tx.pending_wal.extend_from_slice(&record_bytes);
+      let write_now = !tx.bulk_load
+        && tx.savepoints.is_empty()
+        && tx
+          .wal_deferred_from
+          .is_some_and(|from| tx.pending_wal.len() - from > super::WAL_DEFER_BYTES);
+      drop(tx);
+      if write_now {
+        if let Err(error) = self.write_deferred_records(tx_handle) {
+          tx_handle.lock().pending_wal.truncate(before);
+          return Err(error);
+        }
+      }
       return Ok(());
     }
     drop(tx);
@@ -1791,15 +2176,15 @@ mod tests {
       leader_db.commit()
     });
     wait_until("the group-commit leader", || {
-      let state = db.group_commit_state.lock();
-      state.leader_active && state.queue.is_empty()
+      let state = db.commit_queue.state.lock();
+      state.leading && state.queued.is_empty()
     });
     (leader, commit_lock)
   }
 
   fn wait_for_queued_commits(db: &SingleFileDB, count: usize) {
     wait_until("queued commits", || {
-      db.group_commit_state.lock().queue.len() == count
+      db.commit_queue.state.lock().queued.len() == count
     });
   }
 

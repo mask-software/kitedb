@@ -21,8 +21,9 @@
 //! I/O: records are buffered in memory as contiguous byte runs and flushed
 //! with one positioned write per run, writing exactly the bytes appended (no
 //! page is read back first, and bytes already on disk are never rewritten).
-//! Scans read a region's live bytes with one positioned read and parse them
-//! in memory.
+//! A commit group seals the runs ([`WalBuffer::seal`]) and writes them
+//! without the WAL lock, so transactions keep appending meanwhile. Scans read
+//! a region's live bytes with one positioned read and parse them in memory.
 
 use std::collections::{HashMap, HashSet};
 
@@ -33,8 +34,8 @@ use crate::types::*;
 use crate::util::binary::*;
 
 use super::record::{
-  apply_wal_salt, parse_wal_record_with_salt, read_wal_record_with_salt, salt_wal_record,
-  wal_frames, wal_records_end, ParsedWalRecord, WalFrame, WalRecord, WalRecordAt,
+  apply_wal_salt, build_rollback_payload, parse_wal_record_with_salt, read_wal_record_with_salt,
+  salt_wal_record, wal_frames, wal_records_end, ParsedWalRecord, WalFrame, WalRecord, WalRecordAt,
 };
 
 /// WAL region split ratio: primary gets 75%, secondary gets 25%
@@ -89,18 +90,45 @@ pub struct WalBuffer {
   primary_salt: u32,
   /// Salt of the secondary region's records (0: unsalted, or never used)
   secondary_salt: u32,
-  /// Records of failed commit rounds still in the file, not yet durably
-  /// unreadable (see [`Self::discard_since`]).
-  discarded: Vec<DiscardedRecords>,
+  /// A failed commit group's COMMIT records were rewritten as ROLLBACK
+  /// records (see [`Self::restore_sealed`]), and the rewrite is not durable
+  /// yet: the next flush syncs.
+  unsynced_rollbacks: bool,
 }
 
-/// Bytes `start..end` (relative to the WAL start) of records a failed commit
-/// round wrote, readable under `salt` until overwritten.
-#[derive(Debug, Clone, Copy)]
-struct DiscardedRecords {
-  start: u64,
-  end: u64,
-  salt: u32,
+/// The buffered writes [`WalBuffer::seal`] took for a commit group to write
+/// to the file without the WAL lock, and the WAL positions that group's
+/// header names.
+#[derive(Debug)]
+pub struct SealedWrites {
+  runs: Vec<PendingRun>,
+  state: WalRegionState,
+  /// Rewritten records of a failed group are among the runs, or were
+  /// flushed and not synced: the group syncs before its header.
+  sync_first: bool,
+}
+
+impl SealedWrites {
+  /// Write the sealed runs to the pager, in file order, one positioned write
+  /// per run. Callers hold the pager lock from [`WalBuffer::seal`] on, so no
+  /// one reads or flushes the WAL meanwhile.
+  pub fn write(&self, pager: &mut FilePager) -> Result<()> {
+    for run in &self.runs {
+      pager.write_range(run.offset, &run.data)?;
+    }
+    Ok(())
+  }
+
+  /// The WAL positions as of the seal, for the header naming the records.
+  pub fn state(&self) -> &WalRegionState {
+    &self.state
+  }
+
+  /// Whether a sync must make these writes durable before a header names
+  /// them, whatever the sync mode (see [`WalBuffer::needs_sync`]).
+  pub fn needs_sync(&self) -> bool {
+    self.sync_first
+  }
 }
 
 impl WalBuffer {
@@ -125,7 +153,7 @@ impl WalBuffer {
       secondary_head: secondary_region_start,
       primary_salt: INITIAL_WAL_SALT,
       secondary_salt: 0,
-      discarded: Vec::new(),
+      unsynced_rollbacks: false,
     }
   }
 
@@ -230,7 +258,7 @@ impl WalBuffer {
       secondary_head,
       primary_salt: header.wal_primary_salt,
       secondary_salt: header.wal_secondary_salt,
-      discarded: Vec::new(),
+      unsynced_rollbacks: false,
     })
   }
 
@@ -433,7 +461,7 @@ impl WalBuffer {
     // Flush earlier writes first so an error below drops only the copies.
     self.flush(pager)?;
     let prior = self.region_state();
-    if let Err(error) = self.write_record_bytes_batch(records, pager) {
+    if let Err(error) = self.write_record_bytes_batch(records) {
       self.pending.clear();
       self.restore_region_state(prior);
       return Err(error);
@@ -539,12 +567,7 @@ impl WalBuffer {
 
   /// Record this buffer's positions, active region, and salts in `header`.
   pub fn store_in_header(&self, header: &mut DbHeaderV1) {
-    header.wal_head = self.head;
-    header.wal_tail = self.tail;
-    header.wal_primary_head = self.primary_head;
-    header.wal_secondary_head = self.secondary_head;
-    header.active_wal_region = self.active_region;
-    header.set_wal_salts(self.primary_salt, self.secondary_salt);
+    self.region_state().store_in_header(header);
   }
 
   /// A salt neither region uses now, for a region about to be reused: one
@@ -914,8 +937,8 @@ impl WalBuffer {
   /// Returns the new head position
   ///
   /// Note: Records are buffered in memory. Call flush() to write to disk.
-  pub fn write_record(&mut self, record: &WalRecord, pager: &mut FilePager) -> Result<u64> {
-    self.write_built_record(&mut record.build(), pager)
+  pub fn write_record(&mut self, record: &WalRecord) -> Result<u64> {
+    self.write_built_record(&mut record.build())
   }
 
   /// Write one record as [`WalRecord::build`] encoded it (unsalted), salted
@@ -924,7 +947,7 @@ impl WalBuffer {
   /// bytes it built (a replication frame carries them unsalted) without
   /// encoding the record twice. Buffered, like [`Self::write_record`]; the
   /// pager is not touched until [`Self::flush`].
-  pub fn write_built_record(&mut self, record: &mut [u8], _pager: &mut FilePager) -> Result<u64> {
+  pub fn write_built_record(&mut self, record: &mut [u8]) -> Result<u64> {
     let salt = self.region_salt(self.active_region);
     if !salt_wal_record(record, salt) {
       return Err(KiteError::Internal(
@@ -939,50 +962,48 @@ impl WalBuffer {
   /// Write prebuilt record bytes in a single batch
   /// The buffer must contain a sequence of padded, unsalted records (as
   /// [`WalRecord::build`] writes them); they are salted for the active region.
-  pub fn write_record_bytes_batch(
-    &mut self,
-    record_bytes: &[u8],
-    _pager: &mut FilePager,
-  ) -> Result<u64> {
-    if record_bytes.is_empty() {
+  pub fn write_record_bytes_batch(&mut self, record_bytes: &[u8]) -> Result<u64> {
+    self.write_owned_record_bytes(record_bytes.to_vec())
+  }
+
+  /// [`Self::write_record_bytes_batch`] for bytes the caller gives up: they
+  /// are salted in place and buffered without another copy where they start
+  /// a run. On error nothing is written.
+  pub fn write_owned_record_bytes(&mut self, mut records: Vec<u8>) -> Result<u64> {
+    if records.is_empty() {
       return Ok(self.head);
     }
 
-    if !record_bytes.len().is_multiple_of(WAL_RECORD_ALIGNMENT) {
+    if !records.len().is_multiple_of(WAL_RECORD_ALIGNMENT) {
       return Err(KiteError::Internal(
         "WAL batch bytes must be alignment-sized".to_string(),
       ));
     }
 
-    if !self.can_fit(record_bytes.len()) {
+    if !self.can_fit(records.len()) {
       return Err(KiteError::WalBufferFull);
     }
-    let length = record_bytes.len() as u64;
-    let mut salted = record_bytes.to_vec();
-    self.salt_for(self.active_region, &mut salted)?;
-
+    let length = records.len() as u64;
+    let (head, region_end) = if self.active_region == 0 {
+      (self.primary_head, self.primary_region_size)
+    } else {
+      (
+        self.secondary_head,
+        self.secondary_region_start + self.secondary_region_size,
+      )
+    };
+    if head + length > region_end {
+      return Err(KiteError::WalBufferFull);
+    }
+    self.salt_for(self.active_region, &mut records)?;
+    self.pending.write_vec(self.file_offset(head), records);
     if self.active_region == 0 {
-      if self.primary_head + length > self.primary_region_size {
-        return Err(KiteError::WalBufferFull);
-      }
-
-      self
-        .pending
-        .write_vec(self.file_offset(self.primary_head), salted);
       self.primary_head += length;
       self.head = self.primary_head;
     } else {
-      if self.secondary_head + length > self.secondary_region_start + self.secondary_region_size {
-        return Err(KiteError::WalBufferFull);
-      }
-
-      self
-        .pending
-        .write_vec(self.file_offset(self.secondary_head), salted);
       self.secondary_head += length;
       self.head = self.secondary_head;
     }
-
     Ok(self.head)
   }
 
@@ -1043,80 +1064,99 @@ impl WalBuffer {
   }
 
   /// Write every buffered byte run to the pager, in file order, one
-  /// positioned write per run. On error every run stays buffered.
+  /// positioned write per run, then sync if a failed commit group's records
+  /// were rewritten and not synced yet (see [`Self::restore_sealed`]): every
+  /// header written after a flush may name bytes past them. On error every
+  /// run stays buffered.
   pub fn flush(&mut self, pager: &mut FilePager) -> Result<()> {
     for run in &self.pending.runs {
       pager.write_range(run.offset, &run.data)?;
     }
     self.pending.clear();
+    if self.unsynced_rollbacks {
+      pager.sync_data()?;
+      self.unsynced_rollbacks = false;
+    }
     Ok(())
   }
 
-  /// Flush and sync to disk. First the bytes of discarded records (see
-  /// [`Self::discard_since`]) past their region's head are overwritten with
-  /// zeros, so once this returns they are durably unreadable.
+  /// Flush and sync to disk.
   ///
   /// The WAL lies inside the file, so a data sync ([`FilePager::sync_data`])
   /// makes it durable.
   pub fn sync(&mut self, pager: &mut FilePager) -> Result<()> {
-    self.zero_discarded();
     self.flush(pager)?;
     pager.sync_data()?;
-    self.discarded.clear();
+    self.unsynced_rollbacks = false;
     Ok(())
   }
 
-  /// Forget the records written since `before`: a commit round whose header
-  /// failed to persist. Restores the positions, then makes the records'
-  /// bytes durably unreadable ([`Self::sync`]).
+  /// Take every buffered write, for a commit group to write to the file
+  /// without the WAL lock ([`SealedWrites::write`]), with the positions the
+  /// group's header names. Records appended meanwhile are buffered after the
+  /// sealed ones, and no header names them before a later flush or seal.
   ///
-  /// Rewinding the head alone is not enough: the records stay in the file
-  /// under the region's salt, and the next header names bytes past the
-  /// rewound head. Without a sync between the next round's overwrite and
-  /// its header (`SyncMode::Normal`), an OS crash can keep an early
-  /// write-back of the failed records, lose the overwrite, and keep the
-  /// header, so recovery would replay a commit that returned an error.
-  ///
-  /// If the sync fails (its error is returned), the records stay listed and
-  /// [`Self::needs_sync`] holds until a later sync succeeds: the caller must
-  /// sync before installing a header that names bytes past them.
-  pub fn discard_since(&mut self, before: WalRegionState, pager: &mut FilePager) -> Result<()> {
-    // A round writes to one region, the one active throughout.
-    let (start, end) = (before.head, self.head);
-    let salt = self.region_salt(self.active_region);
-    self.restore_region_state(before);
-    if end > start {
-      self.discarded.push(DiscardedRecords { start, end, salt });
+  /// The caller holds the pager lock until the sealed writes are written
+  /// (or given back with [`Self::restore_sealed`]): reads and flushes of the
+  /// WAL take it, and must not miss the sealed bytes.
+  pub fn seal(&mut self) -> SealedWrites {
+    SealedWrites {
+      runs: std::mem::take(&mut self.pending.runs),
+      state: self.region_state(),
+      sync_first: self.unsynced_rollbacks,
     }
-    self.sync(pager)
   }
 
-  /// Whether discarded records may still be readable on disk: a header must
-  /// not name bytes past them before a [`Self::sync`].
+  /// The sealed writes are durable (written and synced): a rewrite of a
+  /// failed group among them needs no further sync.
+  pub fn note_sealed_synced(&mut self, sealed: &SealedWrites) {
+    if sealed.sync_first {
+      self.unsynced_rollbacks = false;
+    }
+  }
+
+  /// Give back the writes of a commit group whose write or header failed,
+  /// and make its commits fail for good: each COMMIT record at the WAL
+  /// positions `commits` (with its transaction id) becomes a ROLLBACK record
+  /// of the same size, so replay discards the transaction.
+  ///
+  /// The head is not rewound: other transactions may have appended records
+  /// after the group's since the seal. The sealed bytes go back into the
+  /// buffer (a failed write may have left them torn on disk), before the
+  /// records appended since. Until a sync makes the rewrite durable,
+  /// [`Self::needs_sync`] holds and every flush syncs: an OS crash could
+  /// otherwise keep an early write-back of a COMMIT record, lose its
+  /// rewrite, and keep a later header that names it, and recovery would
+  /// replay a commit that returned an error.
+  pub fn restore_sealed(
+    &mut self,
+    sealed: SealedWrites,
+    commits: impl IntoIterator<Item = (u64, TxId)>,
+  ) -> Result<()> {
+    let appended = std::mem::replace(&mut self.pending.runs, sealed.runs);
+    for run in appended {
+      self.pending.write_vec(run.offset, run.data);
+    }
+    self.unsynced_rollbacks = true;
+    for (position, txid) in commits {
+      let region = u8::from(position >= self.secondary_region_start);
+      let mut rollback =
+        WalRecord::new(WalRecordType::Rollback, txid, build_rollback_payload()).build();
+      if !salt_wal_record(&mut rollback, self.region_salt(region)) {
+        return Err(KiteError::Internal(
+          "a ROLLBACK record is not one whole record".to_string(),
+        ));
+      }
+      self.buffer_write(self.file_offset(position), &rollback);
+    }
+    Ok(())
+  }
+
+  /// Whether a failed commit group's rewritten records may not be durable
+  /// yet: a header must not name bytes past them before a sync, which the
+  /// next flush does.
   pub fn needs_sync(&self) -> bool {
-    !self.discarded.is_empty()
-  }
-
-  /// Overwrite with zeros (buffered) the bytes of discarded records that lie
-  /// past their region's head. Bytes before it hold newer records already.
-  /// Records in a region salted afresh since are unreadable anyway.
-  fn zero_discarded(&mut self) {
-    for discarded in self.discarded.clone() {
-      let region = u8::from(discarded.start >= self.secondary_region_start);
-      if self.region_salt(region) != discarded.salt {
-        continue;
-      }
-      let head = if region == 0 {
-        self.primary_head
-      } else {
-        self.secondary_head
-      };
-      let from = discarded.start.max(head);
-      if from < discarded.end {
-        let zeros = vec![0; (discarded.end - from) as usize];
-        self.buffer_write(self.file_offset(from), &zeros);
-      }
-    }
+    self.unsynced_rollbacks
   }
 
   /// Check if there are pending writes
@@ -1419,6 +1459,18 @@ pub struct WalRegionState {
   secondary_salt: u32,
 }
 
+impl WalRegionState {
+  /// Record these positions, active region, and salts in `header`.
+  pub fn store_in_header(&self, header: &mut DbHeaderV1) {
+    header.wal_head = self.head;
+    header.wal_tail = self.tail;
+    header.wal_primary_head = self.primary_head;
+    header.wal_secondary_head = self.secondary_head;
+    header.active_wal_region = self.active_region;
+    header.set_wal_salts(self.primary_salt, self.secondary_salt);
+  }
+}
+
 /// WAL buffer statistics
 #[derive(Debug, Clone)]
 pub struct WalBufferStats {
@@ -1516,9 +1568,7 @@ mod tests {
       build_create_node_payload(100, Some("test_key")),
     );
 
-    let new_head = buffer
-      .write_record(&record, &mut pager)
-      .expect("expected value");
+    let new_head = buffer.write_record(&record).expect("expected value");
     assert!(new_head > 0);
     assert!(buffer.has_pending_writes());
 
@@ -1541,9 +1591,7 @@ mod tests {
         i,
         build_create_node_payload(100 + i, None),
       );
-      buffer
-        .write_record(&record, &mut pager)
-        .expect("expected value");
+      buffer.write_record(&record).expect("expected value");
     }
 
     // Flush
@@ -1571,13 +1619,10 @@ mod tests {
 
   #[test]
   fn test_wal_buffer_discard_pending() {
-    let (mut pager, _temp) = create_test_pager();
     let mut buffer = WalBuffer::new(4096, 4 * 4096, 4096);
 
     let record = WalRecord::new(WalRecordType::Begin, 1, Vec::new());
-    buffer
-      .write_record(&record, &mut pager)
-      .expect("expected value");
+    buffer.write_record(&record).expect("expected value");
     assert!(buffer.has_pending_writes());
 
     buffer.discard_pending();
@@ -1594,9 +1639,7 @@ mod tests {
 
     // Write to primary
     let record1 = WalRecord::new(WalRecordType::Begin, 1, Vec::new());
-    buffer
-      .write_record(&record1, &mut pager)
-      .expect("expected value");
+    buffer.write_record(&record1).expect("expected value");
     buffer.flush(&mut pager).expect("expected value");
 
     let primary_head_before = buffer.primary_head();
@@ -1608,9 +1651,7 @@ mod tests {
 
     // Write to secondary
     let record2 = WalRecord::new(WalRecordType::Begin, 2, Vec::new());
-    buffer
-      .write_record(&record2, &mut pager)
-      .expect("expected value");
+    buffer.write_record(&record2).expect("expected value");
     buffer.flush(&mut pager).expect("expected value");
 
     // Primary head should be unchanged
@@ -1630,9 +1671,7 @@ mod tests {
       1,
       build_create_node_payload(100, Some("node1")),
     );
-    buffer
-      .write_record(&record1, &mut pager)
-      .expect("expected value");
+    buffer.write_record(&record1).expect("expected value");
     buffer.flush(&mut pager).expect("expected value");
 
     // Switch to secondary and write more
@@ -1642,9 +1681,7 @@ mod tests {
       2,
       build_create_node_payload(101, Some("node2")),
     );
-    buffer
-      .write_record(&record2, &mut pager)
-      .expect("expected value");
+    buffer.write_record(&record2).expect("expected value");
     buffer.flush(&mut pager).expect("expected value");
 
     // Verify both regions have data
@@ -1711,13 +1748,13 @@ mod tests {
     header
   }
 
-  fn write_node_record(buffer: &mut WalBuffer, pager: &mut FilePager, txid: u64) {
+  fn write_node_record(buffer: &mut WalBuffer, txid: u64) {
     let record = WalRecord::new(
       WalRecordType::CreateNode,
       txid,
       build_create_node_payload(txid, Some(&format!("node-{txid}"))),
     );
-    buffer.write_record(&record, pager).expect("write record");
+    buffer.write_record(&record).expect("write record");
   }
 
   fn txids(buffer: &mut WalBuffer, pager: &mut FilePager) -> Vec<u64> {
@@ -1730,11 +1767,11 @@ mod tests {
   fn buffer_with_cut(pager: &mut FilePager, pre_cut: u64, post_cut: &[u64]) -> WalBuffer {
     let mut buffer = WalBuffer::new(4096, 4 * 4096, 4096);
     for txid in 1..=pre_cut {
-      write_node_record(&mut buffer, pager, txid);
+      write_node_record(&mut buffer, txid);
     }
     buffer.switch_to_secondary();
     for &txid in post_cut {
-      write_node_record(&mut buffer, pager, txid);
+      write_node_record(&mut buffer, txid);
     }
     buffer.flush(pager).expect("flush");
     buffer
@@ -1861,19 +1898,13 @@ mod tests {
     assert_eq!(txids(&mut buffer, &mut pager), vec![10, 11]);
   }
 
-  fn write_tx_record(
-    buffer: &mut WalBuffer,
-    pager: &mut FilePager,
-    record_type: WalRecordType,
-    txid: u64,
-    node_id: u64,
-  ) {
+  fn write_tx_record(buffer: &mut WalBuffer, record_type: WalRecordType, txid: u64, node_id: u64) {
     let payload = match record_type {
       WalRecordType::CreateNode => build_create_node_payload(node_id, None),
       _ => Vec::new(),
     };
     let record = WalRecord::new(record_type, txid, payload);
-    buffer.write_record(&record, pager).expect("write record");
+    buffer.write_record(&record).expect("write record");
   }
 
   fn record_ids(records: &[ParsedWalRecord]) -> Vec<(WalRecordType, u64, Vec<u8>)> {
@@ -1908,7 +1939,7 @@ mod tests {
       (CreateNode, 5, 51),
       (CreateNode, 2, 21),
     ] {
-      write_tx_record(&mut buffer, &mut pager, record_type, txid, node_id);
+      write_tx_record(&mut buffer, record_type, txid, node_id);
     }
     let primary_records = buffer.scan_region(0, &mut pager).expect("scan primary");
     let primary_head = buffer.primary_head();
@@ -1935,9 +1966,9 @@ mod tests {
 
     // The open transactions finish after the cut. Merging both regions, as
     // crash recovery does, replays each committed transaction's records once.
-    write_tx_record(&mut buffer, &mut pager, CreateNode, 2, 22);
-    write_tx_record(&mut buffer, &mut pager, Commit, 2, 0);
-    write_tx_record(&mut buffer, &mut pager, Commit, 5, 0);
+    write_tx_record(&mut buffer, CreateNode, 2, 22);
+    write_tx_record(&mut buffer, Commit, 2, 0);
+    write_tx_record(&mut buffer, Commit, 5, 0);
     buffer.flush(&mut pager).expect("flush");
     let merged = buffer.records_for_recovery(&mut pager).expect("merge");
     let committed: Vec<(u64, Vec<u64>)> =
@@ -1966,7 +1997,7 @@ mod tests {
     let (mut pager, _temp) = create_test_pager();
     // The secondary region is a quarter of the WAL: too small for tx 7.
     let mut buffer = WalBuffer::new(4096, 4 * 4096, 4096);
-    write_tx_record(&mut buffer, &mut pager, WalRecordType::Begin, 7, 0);
+    write_tx_record(&mut buffer, WalRecordType::Begin, 7, 0);
     let key = "k".repeat(1500);
     for node_id in 0..3 {
       let record = WalRecord::new(
@@ -1974,7 +2005,7 @@ mod tests {
         7,
         build_create_node_payload(node_id, Some(&key)),
       );
-      buffer.write_record(&record, &mut pager).expect("write");
+      buffer.write_record(&record).expect("write");
     }
     buffer.flush(&mut pager).expect("flush");
     let before = buffer.region_state();
@@ -1997,20 +2028,20 @@ mod tests {
   ) -> WalBuffer {
     let key = "k".repeat(key_len);
     let mut buffer = WalBuffer::new(4096, 4 * 4096, 4096);
-    let write = |buffer: &mut WalBuffer, pager: &mut FilePager, (record_type, txid)| {
+    let write = |buffer: &mut WalBuffer, (record_type, txid)| {
       let payload = match record_type {
         WalRecordType::CreateNode => build_create_node_payload(txid, Some(&key)),
         _ => Vec::new(),
       };
       let record = WalRecord::new(record_type, txid, payload);
-      buffer.write_record(&record, pager).expect("write record");
+      buffer.write_record(&record).expect("write record");
     };
     for &record in primary {
-      write(&mut buffer, pager, record);
+      write(&mut buffer, record);
     }
     buffer.switch_to_secondary();
     for &record in secondary {
-      write(&mut buffer, pager, record);
+      write(&mut buffer, record);
     }
     buffer.flush(pager).expect("flush");
     buffer
@@ -2108,11 +2139,11 @@ mod tests {
     let (mut pager, _temp) = create_test_pager();
     let mut buffer = WalBuffer::new(4096, 4 * 4096, 4096);
     for (record_type, txid) in [(Begin, 1), (CreateNode, 1), (Commit, 1)] {
-      write_tx_record(&mut buffer, &mut pager, record_type, txid, txid);
+      write_tx_record(&mut buffer, record_type, txid, txid);
     }
     let valid_end = buffer.primary_head();
     for (record_type, txid) in [(Begin, 2), (CreateNode, 2), (Commit, 2)] {
-      write_tx_record(&mut buffer, &mut pager, record_type, txid, txid);
+      write_tx_record(&mut buffer, record_type, txid, txid);
     }
     buffer.flush(&mut pager).expect("flush");
     let head = buffer.primary_head();
@@ -2132,7 +2163,7 @@ mod tests {
       .expect("trim again"));
 
     // The next record lands where replay reaches it.
-    write_tx_record(&mut buffer, &mut pager, Begin, 3, 0);
+    write_tx_record(&mut buffer, Begin, 3, 0);
     buffer.flush(&mut pager).expect("flush");
     assert_eq!(txids(&mut buffer, &mut pager), vec![1, 1, 1, 3]);
   }
@@ -2158,16 +2189,16 @@ mod tests {
   fn reset_salts_the_primary_region_afresh() {
     let (mut pager, _temp) = create_test_pager();
     let mut buffer = WalBuffer::new(4096, 4 * 4096, 4096);
-    write_node_record(&mut buffer, &mut pager, 1);
+    write_node_record(&mut buffer, 1);
     let record_len = buffer.primary_head();
-    write_node_record(&mut buffer, &mut pager, 2);
+    write_node_record(&mut buffer, 2);
     buffer.flush(&mut pager).expect("flush");
     let old_salt = buffer.primary_salt;
 
     buffer.reset();
     assert_ne!(buffer.primary_salt, old_salt);
     assert_ne!(buffer.primary_salt, 0);
-    write_node_record(&mut buffer, &mut pager, 3);
+    write_node_record(&mut buffer, 3);
     buffer.flush(&mut pager).expect("flush");
     assert_eq!(buffer.primary_head(), record_len);
 
@@ -2193,7 +2224,7 @@ mod tests {
     buffer.switch_to_secondary();
     assert_ne!(buffer.secondary_salt, first_cut_salt);
     assert_ne!(buffer.secondary_salt, buffer.primary_salt);
-    write_node_record(&mut buffer, &mut pager, 12);
+    write_node_record(&mut buffer, 12);
     buffer.flush(&mut pager).expect("flush");
     let record_len = buffer.secondary_head() - buffer.secondary_region_start;
 

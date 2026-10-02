@@ -122,9 +122,11 @@ fn active_mvcc_transactions(db: &SingleFileDB) -> usize {
     .active_transactions
 }
 
-/// D5 [medium]. A begin whose BEGIN record the full WAL refuses must not
-/// leave its MVCC transaction active (that would pin min_active_ts and stop
-/// GC for good).
+/// D5 [medium]. A transaction the full WAL refuses must not leave its MVCC
+/// transaction active (that would pin min_active_ts and stop GC for good).
+/// Its begin wrote a BEGIN record, which the WAL could refuse; now a write
+/// transaction's records, BEGIN included, go to the WAL with its commit, so
+/// the commit is refused instead.
 #[test]
 fn d5_begin_refused_by_full_wal_leaves_no_active_mvcc_transaction() {
   let dir = tempfile::tempdir().expect("tempdir");
@@ -139,9 +141,7 @@ fn d5_begin_refused_by_full_wal_leaves_no_active_mvcc_transaction() {
   )
   .expect("open");
 
-  // Fill the WAL with commits, then with begins (each commit of an empty
-  // transaction that no longer fits fails and aborts), until begin itself
-  // is refused.
+  // Fill the WAL with commits until one is refused.
   let big_key = "k".repeat(1000);
   let mut n = 0;
   loop {
@@ -161,32 +161,24 @@ fn d5_begin_refused_by_full_wal_leaves_no_active_mvcc_transaction() {
     }
     assert!(n < 10_000, "WAL never filled");
   }
-  let mut begin_refused = false;
-  for _ in 0..10_000 {
-    match db.begin(false) {
-      Ok(_) => {
-        let _ = db.commit();
-        if db.has_transaction() {
-          let _ = db.rollback();
-        }
-      }
-      Err(KiteError::WalBufferFull) => {
-        begin_refused = true;
-        break;
-      }
-      Err(error) => panic!("unexpected begin error: {error:?}"),
+  // Even a transaction that writes nothing no longer fits (its BEGIN and
+  // COMMIT records).
+  let mut refused = 0;
+  for _ in 0..100 {
+    db.begin(false).expect("begin");
+    match db.commit() {
+      Ok(()) => {}
+      Err(KiteError::WalBufferFull) => refused += 1,
+      Err(error) => panic!("unexpected commit error: {error:?}"),
     }
+    assert!(!db.has_transaction());
   }
-  assert!(
-    begin_refused,
-    "test setup: the WAL never refused a BEGIN record"
-  );
-  assert!(!db.has_transaction());
+  assert!(refused > 0, "test setup: the WAL never refused a commit");
 
   let stats = db.stats().mvcc_stats.expect("MVCC enabled");
   assert_eq!(
     stats.active_transactions, 0,
-    "a refused begin leaked an active MVCC transaction (min_active_ts={})",
+    "a refused commit leaked an active MVCC transaction (min_active_ts={})",
     stats.min_active_ts
   );
 

@@ -91,15 +91,13 @@ fn f1_commit_reads_nothing_back_from_disk() {
 fn f1_flush_writes_a_contiguous_append_in_one_call() {
   let dir = tempdir().expect("tempdir");
   let (mut pager, mut wal) = wal_fixture(&dir, 40, 32);
-  wal.write_record(&big_record(1), &mut pager).expect("write");
+  wal.write_record(&big_record(1)).expect("write");
   wal.flush(&mut pager).expect("flush");
 
   let start = wal.head();
   let ((), syscalls) = io_hooks::syscalls_during(|| {
     for txid in 2..=12 {
-      wal
-        .write_record(&big_record(txid), &mut pager)
-        .expect("write");
+      wal.write_record(&big_record(txid)).expect("write");
     }
     wal.flush(&mut pager).expect("flush");
   });
@@ -180,15 +178,11 @@ fn f1_scan_reads_flushed_and_buffered_records() {
   let dir = tempdir().expect("tempdir");
   let (mut pager, mut wal) = wal_fixture(&dir, 40, 32);
   for txid in 1..=6 {
-    wal
-      .write_record(&big_record(txid), &mut pager)
-      .expect("write");
+    wal.write_record(&big_record(txid)).expect("write");
   }
   wal.flush(&mut pager).expect("flush");
   for txid in 7..=9 {
-    wal
-      .write_record(&big_record(txid), &mut pager)
-      .expect("write");
+    wal.write_record(&big_record(txid)).expect("write");
   }
   let txids: Vec<u64> = wal
     .scan_region(0, &mut pager)
@@ -204,38 +198,56 @@ fn f1_scan_reads_flushed_and_buffered_records() {
 // f2: record encoding and the per-transaction copy
 // ============================================================================
 
-/// A transaction's records are encoded (and checksummed) once each.
+/// A transaction's records are encoded (and checksummed) once each, whether
+/// it keeps them back until its commit or writes them as it goes.
 #[test]
 fn f2_write_wal_tx_encodes_each_record_once() {
   let dir = tempdir().expect("tempdir");
   let db = open_single_file(dir.path().join("f2-encode.kitedb"), options()).expect("open");
-  db.begin(false).expect("begin");
-  let head = db.wal_stats().head;
-  let ((), built) = built_bytes_during(|| {
-    for index in 0..10 {
-      db.create_node(Some(&format!("node-{index}")))
-        .expect("create");
-    }
-  });
-  let written = db.wal_stats().head - head;
-  db.commit().expect("commit");
+  for (creates, key_len) in [(10, 8), (40, 1000)] {
+    let head = db.wal_stats().head;
+    let ((), built) = built_bytes_during(|| {
+      db.begin(false).expect("begin");
+      for index in 0..creates {
+        db.create_node(Some(&format!("node-{index}-{}", "k".repeat(key_len))))
+          .expect("create");
+      }
+      db.commit().expect("commit");
+    });
+    let written = db.wal_stats().head - head;
+    assert_eq!(
+      built as u64, written,
+      "a transaction of {creates} creates wrote {written} WAL bytes but encoded {built}"
+    );
+  }
   close_single_file(db).expect("close");
-  assert_eq!(
-    built as u64, written,
-    "10 creates wrote {written} WAL bytes but encoded {built}"
-  );
 }
 
-/// Only a bulk load (written whole at commit) and the replication sidecar
-/// read a transaction's copy of its records.
+/// A transaction keeps a copy of its records only while they wait to be
+/// written: a bulk load's (written whole at commit) and those a write
+/// transaction keeps back (see `SingleFileTxState::wal_deferred_from`), and
+/// for the replication sidecar. Once written, without replication, the copy
+/// goes.
 #[test]
 fn f2_transaction_copies_its_records_only_when_read() {
   let dir = tempdir().expect("tempdir");
   let db = open_single_file(dir.path().join("f2-copy.kitedb"), options()).expect("open");
   db.begin(false).expect("begin");
-  db.create_node(Some("plain")).expect("create");
+  let head = db.wal_stats().head;
+  let key = |index: usize| format!("plain-{index}-{}", "k".repeat(1000));
+  let mut index = 0;
   let (_, tx) = db.require_write_tx_handle().expect("write tx");
+  while db.wal_stats().head == head {
+    db.create_node(Some(&key(index))).expect("create");
+    index += 1;
+    assert!(
+      index * 1000 <= 2 * crate::core::single_file::WAL_DEFER_BYTES,
+      "the records kept back were never written"
+    );
+  }
   let copied = tx.lock().pending_wal.len();
+  db.create_node(Some(&key(index))).expect("create");
+  let copied_after = tx.lock().pending_wal.len();
   db.commit().expect("commit");
 
   db.begin_bulk().expect("begin bulk");
@@ -243,7 +255,7 @@ fn f2_transaction_copies_its_records_only_when_read() {
   let (_, tx) = db.require_write_tx_handle().expect("write tx");
   let bulk_copied = tx.lock().pending_wal.len();
   db.commit().expect("commit");
-  assert!(db.node_by_key("plain").is_some() && db.node_by_key("bulk").is_some());
+  assert!(db.node_by_key(&key(index)).is_some() && db.node_by_key("bulk").is_some());
   close_single_file(db).expect("close");
 
   assert!(
@@ -251,8 +263,9 @@ fn f2_transaction_copies_its_records_only_when_read() {
     "a bulk load must keep its records to write them at commit"
   );
   assert_eq!(
-    copied, 0,
-    "a transaction without replication or bulk load kept a {copied}-byte copy of its records"
+    (copied, copied_after),
+    (0, 0),
+    "a transaction without replication or bulk load kept a copy of records it wrote"
   );
 }
 
@@ -266,9 +279,7 @@ fn f3_scan_region_reads_once() {
   let dir = tempdir().expect("tempdir");
   let (mut pager, mut wal) = wal_fixture(&dir, 40, 32);
   for txid in 1..=12 {
-    wal
-      .write_record(&big_record(txid), &mut pager)
-      .expect("write");
+    wal.write_record(&big_record(txid)).expect("write");
   }
   wal.flush(&mut pager).expect("flush");
   let pages = wal.head().div_ceil(PAGE_SIZE as u64);
@@ -358,12 +369,10 @@ fn f4_check_and_trim_trims_torn_tails_and_refuses_unknown_types() {
   let dir = tempdir().expect("tempdir");
   let (mut pager, mut wal) = wal_fixture(&dir, 40, 32);
   for txid in 1..=4 {
-    wal
-      .write_record(&big_record(txid), &mut pager)
-      .expect("write");
+    wal.write_record(&big_record(txid)).expect("write");
   }
   let readable = wal.head();
-  wal.write_record(&big_record(5), &mut pager).expect("write");
+  wal.write_record(&big_record(5)).expect("write");
   wal.flush(&mut pager).expect("flush");
   // Tear the last record: its tail never reached the disk.
   let torn_at = PAGE_SIZE as u64 + wal.head() - 8;
@@ -412,15 +421,11 @@ fn f5_post_cut_move_back_costs_one_read_and_one_write() {
   let dir = tempdir().expect("tempdir");
   let (mut pager, mut wal) = wal_fixture(&dir, 72, 64);
   for txid in 1..=3 {
-    wal
-      .write_record(&big_record(txid), &mut pager)
-      .expect("write");
+    wal.write_record(&big_record(txid)).expect("write");
   }
   wal.switch_to_secondary();
   for txid in 10..=33 {
-    wal
-      .write_record(&big_record(txid), &mut pager)
-      .expect("write");
+    wal.write_record(&big_record(txid)).expect("write");
   }
   wal.flush(&mut pager).expect("flush");
   wal.retire_primary_region();
@@ -450,15 +455,11 @@ fn f5_move_back_reads_only_records_appended_since_the_replay() {
   let dir = tempdir().expect("tempdir");
   let (mut pager, mut wal) = wal_fixture(&dir, 72, 64);
   for txid in 1..=3 {
-    wal
-      .write_record(&big_record(txid), &mut pager)
-      .expect("write");
+    wal.write_record(&big_record(txid)).expect("write");
   }
   wal.switch_to_secondary();
   for txid in 10..=29 {
-    wal
-      .write_record(&big_record(txid), &mut pager)
-      .expect("write");
+    wal.write_record(&big_record(txid)).expect("write");
   }
   wal.flush(&mut pager).expect("flush");
   let (records, read, _) = wal
@@ -467,9 +468,7 @@ fn f5_move_back_reads_only_records_appended_since_the_replay() {
     .parse();
   assert_eq!(records.len(), 20);
   for txid in 30..=33 {
-    wal
-      .write_record(&big_record(txid), &mut pager)
-      .expect("write");
+    wal.write_record(&big_record(txid)).expect("write");
   }
   wal.flush(&mut pager).expect("flush");
   wal.retire_primary_region();

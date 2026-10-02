@@ -95,7 +95,7 @@ fn f5_reads_outside_a_transaction_take_no_transaction_bookkeeping_lock() {
 
   let held = (
     db.open_write_txids.lock(),
-    db.group_commit_state.lock(),
+    db.commit_queue.state.lock(),
     db.checkpoint_state.lock(),
   );
   let (read_tx, read_rx) = mpsc::channel();

@@ -725,8 +725,10 @@ mod savepoints {
   }
 
   /// While a savepoint is live, the transaction's records stay out of the
-  /// WAL; releasing the last one writes them. After the commit, neither a
-  /// reopen nor a crash image replays a rolled-back record.
+  /// WAL; once the last one is released they follow the transaction's
+  /// policy (a small one keeps them back until its commit). After the
+  /// commit, neither a reopen nor a crash image replays a rolled-back
+  /// record.
   #[test]
   fn wal_replay_after_commit_contains_no_rolled_back_records() {
     let dir = tempdir().expect("tempdir");
@@ -744,9 +746,9 @@ mod savepoints {
     db.rollback_to(&savepoint).expect("rollback to");
     db.create_node(Some("kept")).expect("kept");
     db.release_savepoint(savepoint).expect("release");
-    assert!(db.wal_stats().head > head, "releasing it writes them");
     db.create_node(Some("after")).expect("after");
     db.commit().expect("commit");
+    assert!(db.wal_stats().head > head, "the commit writes them");
 
     let crashed = crash_image(&db, options());
     let path = db.path().to_path_buf();
