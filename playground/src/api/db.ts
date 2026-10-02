@@ -288,7 +288,11 @@ export async function createDemo(): Promise<{
 				try {
 					await createDemoGraph(db);
 				} catch (error) {
-					await db.close();
+					try {
+						await db.close();
+					} catch {
+						// Report the demo failure, not a secondary close failure.
+					}
 					throw error;
 				}
 				return { db, path: demoPath, isDemo: true, tempDir };

@@ -93,17 +93,24 @@ export function App() {
 	const pathRequestRef = useRef(0);
 	const impactRequestRef = useRef(0);
 
+	// Bumped whenever the user opens or closes a database, so the initial status check can tell
+	// that its answer is out of date.
+	const dbGenerationRef = useRef(0);
+
 	// Check initial connection status
 	useEffect(() => {
+		const generation = dbGenerationRef.current;
 		api
 			.getStatus()
 			.then((status) => {
+				if (generation !== dbGenerationRef.current) return;
 				setConnected(status.connected);
 				setDbPath(status.path || null);
 				setIsDemo(status.isDemo || false);
 			})
 			.catch(() => {
 				// Server unreachable: stay disconnected.
+				if (generation !== dbGenerationRef.current) return;
 				setConnected(false);
 			});
 	}, []);
@@ -122,19 +129,34 @@ export function App() {
 		setImpactedNodes(new Set());
 	}, []);
 
+	/**
+	 * Show the database the user just opened (`null` after a close). The previous database's
+	 * selection, highlights and pending requests don't apply to it.
+	 */
+	const switchDatabase = useCallback(
+		(path: string | null, demo: boolean) => {
+			dbGenerationRef.current++;
+			setConnected(path !== null);
+			setDbPath(path);
+			setIsDemo(demo);
+			setSelectedNode(null);
+			resetPath(null);
+			resetImpact(null);
+		},
+		[resetPath, resetImpact],
+	);
+
 	// Handle database open
 	const handleOpenDatabase = useCallback(
 		async (path: string) => {
 			const result = await api.openDatabase(path);
 			if (result.success) {
-				setConnected(true);
-				setDbPath(path);
-				setIsDemo(false);
+				switchDatabase(path, false);
 				refresh();
 			}
 			return result;
 		},
-		[refresh],
+		[refresh, switchDatabase],
 	);
 
 	// Handle file upload
@@ -142,38 +164,29 @@ export function App() {
 		async (file: File) => {
 			const result = await api.uploadDatabase(file);
 			if (result.success) {
-				setConnected(true);
-				setDbPath(file.name);
-				setIsDemo(false);
+				switchDatabase(file.name, false);
 				refresh();
 			}
 			return result;
 		},
-		[refresh],
+		[refresh, switchDatabase],
 	);
 
 	// Handle demo creation
 	const handleCreateDemo = useCallback(async () => {
 		const result = await api.createDemo();
 		if (result.success) {
-			setConnected(true);
-			setDbPath("demo.kitedb");
-			setIsDemo(true);
+			switchDatabase("demo.kitedb", true);
 			refresh();
 		}
 		return result;
-	}, [refresh]);
+	}, [refresh, switchDatabase]);
 
 	// Handle database close
 	const handleCloseDatabase = useCallback(async () => {
 		await api.closeDatabase();
-		setConnected(false);
-		setDbPath(null);
-		setIsDemo(false);
-		setSelectedNode(null);
-		resetPath(null);
-		resetImpact(null);
-	}, [resetPath, resetImpact]);
+		switchDatabase(null, false);
+	}, [switchDatabase]);
 
 	// Handle node click based on tool mode
 	const handleNodeClick = useCallback(
