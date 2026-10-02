@@ -40,6 +40,7 @@ mod transaction;
 mod tx_registry;
 mod vector;
 mod write;
+mod writer_slot;
 
 #[cfg(test)]
 mod stress;
@@ -163,6 +164,9 @@ pub struct SingleFileTxState {
   /// A replica's replication apply; the only transactions in which a
   /// replica accepts data writes.
   pub(crate) replication_apply: bool,
+  /// It holds non-MVCC mode's writer slot (see `writer_slot`), released when
+  /// it is settled.
+  pub(crate) holds_writer: bool,
 }
 
 impl SingleFileTxState {
@@ -176,6 +180,7 @@ impl SingleFileTxState {
       bulk_load,
       pending_wal: Vec::new(),
       replication_apply: false,
+      holds_writer: false,
     }
   }
 }

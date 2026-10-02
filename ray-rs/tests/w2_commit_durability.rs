@@ -33,7 +33,11 @@ fn d4_concurrent_vector_dimensions_one_wins_and_reopen_succeeds() {
   for round in 0..20 {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join(format!("d4-race-{round}.kitedb"));
-    let options = SingleFileOpenOptions::new().auto_checkpoint(false);
+    // Write transactions open at once need MVCC (without it they run one at a time).
+    let options = SingleFileOpenOptions::new()
+      .mvcc(true)
+      .mvcc_gc_interval_ms(10)
+      .auto_checkpoint(false);
     let db = Arc::new(open_single_file(&db_path, options.clone()).expect("open"));
     db.begin(false).expect("begin");
     let embedding = db.define_propkey("embedding").expect("propkey");

@@ -2889,7 +2889,11 @@ mod tests {
     let _serial = checkpoint_test_serial();
     let temp_dir = tempdir().expect("temp dir");
     let db_path = temp_dir.path().join("checkpoint-background-long-tx.kitedb");
-    let options = SingleFileOpenOptions::new().auto_checkpoint(false);
+    // Write transactions open at once need MVCC (without it they run one at a time).
+    let options = SingleFileOpenOptions::new()
+      .mvcc(true)
+      .mvcc_gc_interval_ms(10)
+      .auto_checkpoint(false);
     let db = Arc::new(open_single_file(&db_path, options.clone()).expect("open"));
     commit_node(&db, "before");
 
@@ -3105,7 +3109,10 @@ mod tests {
     let _serial = checkpoint_test_serial();
     let temp_dir = tempdir().expect("temp dir");
     let db_path = temp_dir.path().join("checkpoint-auto-open-tx.kitedb");
+    // Write transactions open at once need MVCC (without it they run one at a time).
     let options = SingleFileOpenOptions::new()
+      .mvcc(true)
+      .mvcc_gc_interval_ms(10)
       .wal_size(64 * 1024)
       .auto_checkpoint(true)
       .checkpoint_threshold(0.5)
@@ -3789,7 +3796,10 @@ mod tests {
     let _serial = checkpoint_test_serial();
     let temp_dir = tempdir().expect("temp dir");
     let db_path = temp_dir.path().join("checkpoint-declined-retry.kitedb");
+    // Write transactions open at once need MVCC (without it they run one at a time).
     let options = SingleFileOpenOptions::new()
+      .mvcc(true)
+      .mvcc_gc_interval_ms(10)
       .wal_size(64 * 1024)
       .auto_checkpoint(true)
       .checkpoint_threshold(0.5)
@@ -4450,7 +4460,10 @@ mod review_regressions {
     let _serial = checkpoint_test_serial();
     let temp_dir = tempdir().expect("temp dir");
     let db_path = temp_dir.path().join("review-carry-overflow.kitedb");
+    // Write transactions open at once need MVCC (without it they run one at a time).
     let options = SingleFileOpenOptions::new()
+      .mvcc(true)
+      .mvcc_gc_interval_ms(10)
       .wal_size(64 * 1024)
       .auto_checkpoint(false);
     let db = Arc::new(open_single_file(&db_path, options.clone()).expect("open"));
@@ -4503,7 +4516,10 @@ mod review_regressions {
     let _serial = checkpoint_test_serial();
     let temp_dir = tempdir().expect("temp dir");
     let db_path = temp_dir.path().join("review-carry-overflow-live.kitedb");
+    // Write transactions open at once need MVCC (without it they run one at a time).
     let options = SingleFileOpenOptions::new()
+      .mvcc(true)
+      .mvcc_gc_interval_ms(10)
       .wal_size(64 * 1024)
       .auto_checkpoint(false);
     let db = Arc::new(open_single_file(&db_path, options.clone()).expect("open"));
@@ -4545,7 +4561,10 @@ mod review_regressions {
   ) -> Result<SingleFileDB> {
     let temp_dir = tempdir().expect("temp dir");
     let db_path = temp_dir.path().join(name);
+    // Write transactions open at once need MVCC (without it they run one at a time).
     let options = SingleFileOpenOptions::new()
+      .mvcc(true)
+      .mvcc_gc_interval_ms(10)
       .wal_size(64 * 1024)
       .auto_checkpoint(false);
     let db = Arc::new(open_single_file(&db_path, options.clone()).expect("open"));
@@ -4613,7 +4632,10 @@ mod review_regressions {
     let _serial = checkpoint_test_serial();
     let temp_dir = tempdir().expect("temp dir");
     let db_path = temp_dir.path().join("review-carry-fills-secondary.kitedb");
+    // Write transactions open at once need MVCC (without it they run one at a time).
     let options = SingleFileOpenOptions::new()
+      .mvcc(true)
+      .mvcc_gc_interval_ms(10)
       .wal_size(64 * 1024)
       .auto_checkpoint(false);
     let db = Arc::new(open_single_file(&db_path, options.clone()).expect("open"));

@@ -213,11 +213,16 @@ struct ActiveTransactionGuard<'db> {
   txid: TxId,
   /// The transaction wrote a BEGIN record (a non-bulk write transaction).
   wrote_begin: bool,
+  /// It holds non-MVCC mode's writer slot, released here.
+  holds_writer: bool,
 }
 
 impl Drop for ActiveTransactionGuard<'_> {
   fn drop(&mut self) {
     self.db.transaction_finished(self.txid, self.wrote_begin);
+    if self.holds_writer {
+      self.db.tx_shared.writer.release();
+    }
   }
 }
 
@@ -332,6 +337,10 @@ impl SingleFileDB {
       return Err(KiteError::TransactionInProgress);
     }
     self.reap_abandoned_transactions();
+    // Without MVCC, write transactions run one at a time (see
+    // `writer_slot`). Taken before the checkpoint gate, holding nothing; a
+    // failed begin releases it.
+    let writer_claim = (self.mvcc.is_none() && !read_only).then(|| self.tx_shared.writer.claim());
 
     // A checkpoint takes the write side. Holding this read permit through
     // insertion makes the gate atomic with transaction creation.
@@ -405,14 +414,14 @@ impl SingleFileDB {
       }
     };
 
-    let tx_state = Arc::new(Mutex::new(SingleFileTxState::new(
-      txid,
-      read_only,
-      snapshot_ts,
-      bulk_load,
-    )));
+    let mut tx_state = SingleFileTxState::new(txid, read_only, snapshot_ts, bulk_load);
+    tx_state.holds_writer = writer_claim.is_some();
+    let tx_state = Arc::new(Mutex::new(tx_state));
 
     self.register_thread_transaction(tx_state);
+    if let Some(claim) = writer_claim {
+      claim.keep();
+    }
     self.active_transactions.fetch_add(1, Ordering::Release);
     if !read_only {
       self.active_writers.fetch_add(1, Ordering::SeqCst);
@@ -737,7 +746,7 @@ impl SingleFileDB {
     &self,
     tx_handle: &Arc<Mutex<SingleFileTxState>>,
   ) -> Result<Option<CommitToken>> {
-    let (txid, read_only, bulk_load, pending, pending_wal, staged_schema) = {
+    let (txid, read_only, bulk_load, holds_writer, pending, pending_wal, staged_schema) = {
       let mut tx = tx_handle.lock();
       let pending = std::mem::take(&mut tx.pending);
       let staged_schema = std::mem::take(&mut tx.schema);
@@ -746,6 +755,7 @@ impl SingleFileDB {
         tx.txid,
         tx.read_only,
         tx.bulk_load,
+        std::mem::take(&mut tx.holds_writer),
         pending,
         pending_wal,
         staged_schema,
@@ -758,6 +768,7 @@ impl SingleFileDB {
       db: self,
       txid,
       wrote_begin: !read_only && !bulk_load,
+      holds_writer,
     };
     let mut schema_reservation_guard = SchemaReservationGuard::new(self, txid);
 
@@ -1266,14 +1277,20 @@ impl SingleFileDB {
     &self,
     tx_handle: &Arc<Mutex<SingleFileTxState>>,
   ) -> Result<()> {
-    let (txid, read_only, bulk_load) = {
-      let tx = tx_handle.lock();
-      (tx.txid, tx.read_only, tx.bulk_load)
+    let (txid, read_only, bulk_load, holds_writer) = {
+      let mut tx = tx_handle.lock();
+      (
+        tx.txid,
+        tx.read_only,
+        tx.bulk_load,
+        std::mem::take(&mut tx.holds_writer),
+      )
     };
     let _active_transaction_guard = ActiveTransactionGuard {
       db: self,
       txid,
       wrote_begin: !read_only && !bulk_load,
+      holds_writer,
     };
     let _schema_reservation_guard = SchemaReservationGuard::new(self, txid);
 
@@ -1524,7 +1541,11 @@ mod tests {
     use std::sync::{mpsc, Arc};
     let temp_dir = tempdir().expect("temp dir");
     let db_path = temp_dir.path().join("vector-dimension-race.kitedb");
-    let options = SingleFileOpenOptions::new().auto_checkpoint(false);
+    // Write transactions open at once need MVCC (without it they run one at a time).
+    let options = SingleFileOpenOptions::new()
+      .mvcc(true)
+      .mvcc_gc_interval_ms(10)
+      .auto_checkpoint(false);
     let db = Arc::new(open_single_file(&db_path, options.clone()).expect("open"));
     db.begin(false).expect("begin");
     let embedding = db.define_propkey("embedding").expect("propkey");
@@ -1568,8 +1589,12 @@ mod tests {
     assert!(crashed.node_by_key("four").is_none());
   }
 
+  /// MVCC: the batches these tests build need several write transactions
+  /// open at once, and without MVCC they run one at a time.
   fn group_commit_options() -> SingleFileOpenOptions {
     SingleFileOpenOptions::new()
+      .mvcc(true)
+      .mvcc_gc_interval_ms(10)
       .auto_checkpoint(false)
       .sync_mode(SyncMode::Normal)
       .group_commit_enabled(true)

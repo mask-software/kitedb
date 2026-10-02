@@ -32,6 +32,8 @@ pub(crate) struct TxShared {
   abandoned: Mutex<Vec<Arc<Mutex<SingleFileTxState>>>>,
   /// Set when a transaction is abandoned, so hot paths check without a lock.
   has_abandoned: AtomicBool,
+  /// Non-MVCC mode's single writer.
+  pub(crate) writer: super::writer_slot::WriterSlot,
 }
 
 /// A transaction open on the current thread.
@@ -47,6 +49,14 @@ struct ThreadTxs(Vec<ThreadTx>);
 impl Drop for ThreadTxs {
   fn drop(&mut self) {
     for tx in self.0.drain(..) {
+      // Other writers may be waiting for the slot now; the rollback of the
+      // rest waits for the database to reap it.
+      {
+        let mut state = tx.state.lock();
+        if std::mem::take(&mut state.holds_writer) {
+          tx.db.writer.release();
+        }
+      }
       tx.db.abandoned.lock().push(tx.state);
       tx.db.has_abandoned.store(true, Ordering::Release);
     }

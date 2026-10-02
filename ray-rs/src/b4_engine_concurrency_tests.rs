@@ -16,6 +16,8 @@ use crate::vector::store::vector_store_has;
 fn options(mvcc: bool) -> SingleFileOpenOptions {
   SingleFileOpenOptions::new()
     .mvcc(mvcc)
+    // Dropping an MVCC database waits up to one GC interval.
+    .mvcc_gc_interval_ms(10)
     .sync_mode(SyncMode::Normal)
     .auto_checkpoint(false)
 }

@@ -41,6 +41,8 @@ const DEADLOCK_TIMEOUT: Duration = Duration::from_secs(20);
 fn options(mvcc: bool) -> SingleFileOpenOptions {
   SingleFileOpenOptions::new()
     .mvcc(mvcc)
+    // Dropping an MVCC database waits up to one GC interval.
+    .mvcc_gc_interval_ms(10)
     .sync_mode(SyncMode::Normal)
     .auto_checkpoint(false)
     .wal_size(4 * MIB)
