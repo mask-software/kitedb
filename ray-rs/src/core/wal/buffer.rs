@@ -10,6 +10,14 @@
 //! - Primary region: 75% of WAL space (normal writes)
 //! - Secondary region: 25% of WAL space (writes during checkpoint)
 //!
+//! Salts: each region's records carry its salt (header `wal_primary_salt` /
+//! `wal_secondary_salt`) XORed into their CRC. A region gets a fresh salt
+//! whenever it is emptied for reuse, so records an earlier cycle left in place
+//! (a checkpoint rewinds the head but does not erase them) fail their CRC, and
+//! replay stops there rather than applying them again after newer commits.
+//! Records are built unsalted ([`WalRecord::build`], as replication frames
+//! carry them) and salted as they are written here.
+//!
 //! Optimization: Uses page-level write batching to reduce I/O amplification.
 //! Instead of writing each small record individually (causing read-modify-write
 //! for each ~100 byte record on a 4KB page), we buffer writes in memory and
@@ -23,10 +31,30 @@ use crate::error::{KiteError, Result};
 use crate::types::*;
 use crate::util::binary::*;
 
-use super::record::{parse_wal_record, read_wal_record, ParsedWalRecord, WalRecord, WalRecordAt};
+use super::record::{
+  apply_wal_salt, parse_wal_record_with_salt, read_wal_record_with_salt, ParsedWalRecord,
+  WalRecord, WalRecordAt,
+};
 
 /// WAL region split ratio: primary gets 75%, secondary gets 25%
 const PRIMARY_REGION_RATIO: f64 = 0.75;
+
+/// Where the secondary region of a WAL of `capacity` bytes starts (the
+/// primary region's size).
+fn secondary_region_start(capacity: u64) -> u64 {
+  (capacity as f64 * PRIMARY_REGION_RATIO) as u64
+}
+
+/// The salt of the records at `offset` (relative to the WAL start) of the WAL
+/// `header` describes: the salt of the region holding that offset.
+pub(crate) fn header_salt_at(header: &DbHeaderV1, offset: u64) -> u32 {
+  let capacity = header.wal_page_count * header.page_size as u64;
+  if offset >= secondary_region_start(capacity) {
+    header.wal_secondary_salt
+  } else {
+    header.wal_primary_salt
+  }
+}
 
 /// WAL buffer for single-file database format
 pub struct WalBuffer {
@@ -57,12 +85,16 @@ pub struct WalBuffer {
   primary_head: u64,
   /// Secondary region write position (relative to base)
   secondary_head: u64,
+  /// Salt of the primary region's records (0: unsalted, a v1 WAL)
+  primary_salt: u32,
+  /// Salt of the secondary region's records (0: unsalted, or never used)
+  secondary_salt: u32,
 }
 
 impl WalBuffer {
   /// Create a new WAL buffer
   pub fn new(base_offset: u64, capacity: u64, page_size: usize) -> Self {
-    let primary_region_size = (capacity as f64 * PRIMARY_REGION_RATIO) as u64;
+    let primary_region_size = secondary_region_start(capacity);
     let secondary_region_start = primary_region_size;
     let secondary_region_size = capacity - primary_region_size;
 
@@ -79,6 +111,8 @@ impl WalBuffer {
       active_region: 0,
       primary_head: 0,
       secondary_head: secondary_region_start,
+      primary_salt: INITIAL_WAL_SALT,
+      secondary_salt: 0,
     }
   }
 
@@ -87,7 +121,7 @@ impl WalBuffer {
     let base_offset = header.wal_start_page * header.page_size as u64;
     let capacity = header.wal_page_count * header.page_size as u64;
 
-    let primary_region_size = (capacity as f64 * PRIMARY_REGION_RATIO) as u64;
+    let primary_region_size = secondary_region_start(capacity);
     let secondary_region_start = primary_region_size;
     let secondary_region_size = capacity - primary_region_size;
 
@@ -138,6 +172,8 @@ impl WalBuffer {
       active_region,
       primary_head,
       secondary_head,
+      primary_salt: header.wal_primary_salt,
+      secondary_salt: header.wal_secondary_salt,
     }
   }
 
@@ -248,6 +284,11 @@ impl WalBuffer {
     if self.active_region == 1 {
       return; // Already in secondary
     }
+    // Writing starts over at the region's start: earlier cuts' records there
+    // must not parse as this one's.
+    if !self.has_secondary_records() {
+      self.secondary_salt = self.fresh_salt();
+    }
     self.active_region = 1;
     // Update head to track active position
     self.head = self.secondary_head;
@@ -352,6 +393,7 @@ impl WalBuffer {
       // Reset primary head (checkpoint completed, WAL is cleared)
       self.primary_head = 0;
       self.tail = 0;
+      self.primary_salt = self.fresh_salt();
     }
     // Update head to track active position
     self.head = self.primary_head;
@@ -421,26 +463,64 @@ impl WalBuffer {
       primary_head: self.primary_head,
       secondary_head: self.secondary_head,
       active_region: self.active_region,
+      primary_salt: self.primary_salt,
+      secondary_salt: self.secondary_salt,
     }
   }
 
-  /// Restore positions captured by [`Self::region_state`]. Pending writes are
-  /// not touched.
+  /// Restore positions (and salts) captured by [`Self::region_state`].
+  /// Pending writes are not touched.
   pub fn restore_region_state(&mut self, state: WalRegionState) {
     self.head = state.head;
     self.tail = state.tail;
     self.primary_head = state.primary_head;
     self.secondary_head = state.secondary_head;
     self.active_region = state.active_region;
+    self.primary_salt = state.primary_salt;
+    self.secondary_salt = state.secondary_salt;
   }
 
-  /// Record this buffer's positions and active region in `header`.
+  /// Record this buffer's positions, active region, and salts in `header`.
   pub fn store_in_header(&self, header: &mut DbHeaderV1) {
     header.wal_head = self.head;
     header.wal_tail = self.tail;
     header.wal_primary_head = self.primary_head;
     header.wal_secondary_head = self.secondary_head;
     header.active_wal_region = self.active_region;
+    header.set_wal_salts(self.primary_salt, self.secondary_salt);
+  }
+
+  /// A salt neither region uses now, for a region about to be reused: one
+  /// past the newest, so a salt recurs only after 2^32 resets. Never 0, which
+  /// marks an unsalted (v1) region.
+  fn fresh_salt(&self) -> u32 {
+    let mut salt = self.primary_salt.max(self.secondary_salt);
+    loop {
+      salt = salt.wrapping_add(1);
+      if salt != 0 && salt != self.primary_salt && salt != self.secondary_salt {
+        return salt;
+      }
+    }
+  }
+
+  /// Salt of `region`'s records (0: primary, 1: secondary).
+  fn region_salt(&self, region: u8) -> u32 {
+    if region == 0 {
+      self.primary_salt
+    } else {
+      self.secondary_salt
+    }
+  }
+
+  /// Salt `records`, whole unsalted records, for `region`.
+  fn salt_for(&self, region: u8, records: &mut [u8]) -> Result<()> {
+    if apply_wal_salt(records, self.region_salt(region)) {
+      Ok(())
+    } else {
+      Err(KiteError::Internal(
+        "WAL record bytes are not whole records".to_string(),
+      ))
+    }
   }
 
   /// Merge secondary records into a fresh primary region (buffered, not
@@ -460,10 +540,13 @@ impl WalBuffer {
     self.tail = 0;
     self.active_region = 0;
     self.head = 0;
+    // The primary region is rewritten from its start.
+    self.primary_salt = self.fresh_salt();
 
     for record in secondary_records {
-      let wal_record = WalRecord::new(record.record_type, record.txid, record.payload);
-      let record_bytes = wal_record.build();
+      let mut record_bytes =
+        WalRecord::new(record.record_type, record.txid, record.payload).build();
+      self.salt_for(0, &mut record_bytes)?;
       self.write_record_bytes_to_primary(&record_bytes, pager)?;
     }
 
@@ -501,6 +584,8 @@ impl WalBuffer {
     if self.primary_head + merged.len() as u64 > self.primary_region_size {
       return Ok(false);
     }
+    // They join the primary region's records, so they take its salt.
+    self.salt_for(0, &mut merged)?;
 
     let cut = self.region_state();
     if !merged.is_empty() {
@@ -573,7 +658,9 @@ impl WalBuffer {
         continue;
       }
       let bytes = self.read_at_offset(self.file_offset(end), (head - end) as usize, pager)?;
-      if let WalRecordAt::UnknownType(record_type) = read_wal_record(&bytes, 0) {
+      if let WalRecordAt::UnknownType(record_type) =
+        read_wal_record_with_salt(&bytes, 0, self.region_salt(region))
+      {
         return Err(KiteError::InvalidWal(format!(
           "WAL record of unknown type {record_type} at offset {end}, probably written by a \
            newer version; open the database read-only, or with that version"
@@ -639,10 +726,11 @@ impl WalBuffer {
 
     // Read the region once rather than each record's pages separately.
     let bytes = self.read_at_offset(self.file_offset(start), (end - start) as usize, pager)?;
+    let salt = self.region_salt(region);
     let mut records = Vec::new();
     let mut offset = 0;
     while offset < bytes.len() {
-      match parse_wal_record(&bytes, offset) {
+      match parse_wal_record_with_salt(&bytes, offset, salt) {
         Some(record) => {
           offset = record.record_end;
           records.push(record);
@@ -717,12 +805,14 @@ impl WalBuffer {
   ///
   /// Note: Records are buffered in memory. Call flush() to write to disk.
   pub fn write_record(&mut self, record: &WalRecord, pager: &mut FilePager) -> Result<u64> {
-    let record_bytes = record.build();
+    let mut record_bytes = record.build();
+    self.salt_for(self.active_region, &mut record_bytes)?;
     self.write_record_bytes(&record_bytes, pager)
   }
 
   /// Write prebuilt record bytes in a single batch
-  /// The buffer must contain a sequence of padded records (alignment-sized).
+  /// The buffer must contain a sequence of padded, unsalted records (as
+  /// [`WalRecord::build`] writes them); they are salted for the active region.
   pub fn write_record_bytes_batch(
     &mut self,
     record_bytes: &[u8],
@@ -741,6 +831,9 @@ impl WalBuffer {
     if !self.can_fit(record_bytes.len()) {
       return Err(KiteError::WalBufferFull);
     }
+    let mut salted = record_bytes.to_vec();
+    self.salt_for(self.active_region, &mut salted)?;
+    let record_bytes = salted.as_slice();
 
     if self.active_region == 0 {
       if self.primary_head + record_bytes.len() as u64 > self.primary_region_size {
@@ -932,7 +1025,8 @@ impl WalBuffer {
     self.tail = new_tail;
   }
 
-  /// Reset the buffer (after checkpoint)
+  /// Reset the buffer (after checkpoint). The primary region gets a fresh
+  /// salt: the records left in place must not replay as the new cycle's.
   pub fn reset(&mut self) {
     self.head = 0;
     self.tail = 0;
@@ -941,6 +1035,7 @@ impl WalBuffer {
     self.primary_head = 0;
     self.secondary_head = self.secondary_region_start;
     self.active_region = 0;
+    self.primary_salt = self.fresh_salt();
   }
 
   /// Clear pending writes without flushing
@@ -978,12 +1073,17 @@ impl WalBuffer {
       // Calculate total record size with alignment
       let pad_len = padding_for(rec_len, WAL_RECORD_ALIGNMENT);
       let total_len = rec_len + pad_len;
+      // A record never crosses the head; a length past it is garbage.
+      if pos + total_len as u64 > self.head {
+        break;
+      }
 
       // Read full record
       let record_bytes = self.read_at_offset(file_offset, total_len, pager)?;
 
       // Parse the record
-      match parse_wal_record(&record_bytes, 0) {
+      let salt = self.region_salt(u8::from(pos >= self.secondary_region_start));
+      match parse_wal_record_with_salt(&record_bytes, 0, salt) {
         Some(record) => {
           records.push(record);
           pos += total_len as u64;
@@ -1050,6 +1150,8 @@ pub struct WalRegionState {
   primary_head: u64,
   secondary_head: u64,
   active_region: u8,
+  primary_salt: u32,
+  secondary_salt: u32,
 }
 
 /// WAL buffer statistics
@@ -1725,6 +1827,137 @@ mod tests {
     write_tx_record(&mut buffer, &mut pager, Begin, 3, 0);
     buffer.flush(&mut pager).expect("flush");
     assert_eq!(txids(&mut buffer, &mut pager), vec![1, 1, 1, 3]);
+  }
+
+  /// A header naming `head` bytes of `region` (as after a crash in which the
+  /// header naming a commit landed but its WAL page did not), reopened.
+  fn reopened_naming(buffer: &WalBuffer, region: u8, head: u64) -> WalBuffer {
+    let mut header = test_header();
+    buffer.store_in_header(&mut header);
+    if region == 0 {
+      header.wal_primary_head = head;
+    } else {
+      header.wal_secondary_head = head;
+    }
+    header.wal_head = head;
+    WalBuffer::from_header(&header)
+  }
+
+  /// A reset rewinds the primary head but leaves the records in place. With
+  /// a fresh salt they no longer parse, so a header naming bytes past the
+  /// last record written since does not replay the previous cycle's.
+  #[test]
+  fn reset_salts_the_primary_region_afresh() {
+    let (mut pager, _temp) = create_test_pager();
+    let mut buffer = WalBuffer::new(4096, 4 * 4096, 4096);
+    write_node_record(&mut buffer, &mut pager, 1);
+    let record_len = buffer.primary_head();
+    write_node_record(&mut buffer, &mut pager, 2);
+    buffer.flush(&mut pager).expect("flush");
+    let old_salt = buffer.primary_salt;
+
+    buffer.reset();
+    assert_ne!(buffer.primary_salt, old_salt);
+    assert_ne!(buffer.primary_salt, 0);
+    write_node_record(&mut buffer, &mut pager, 3);
+    buffer.flush(&mut pager).expect("flush");
+    assert_eq!(buffer.primary_head(), record_len);
+
+    let mut crashed = reopened_naming(&buffer, 0, 2 * record_len);
+    assert_eq!(txids(&mut crashed, &mut pager), vec![3]);
+    assert!(crashed.trim_to_valid_records(&mut pager).expect("trim"));
+    assert_eq!(crashed.primary_head(), record_len);
+  }
+
+  /// Leaving a cut keeps the secondary region's bytes. The next cut writes
+  /// there with a fresh salt, so the earlier cut's records are not its own.
+  #[test]
+  fn each_cut_salts_the_secondary_region_afresh() {
+    let (mut pager, _temp) = create_test_pager();
+    let mut buffer = buffer_with_cut(&mut pager, 1, &[10, 11]);
+    let first_cut_salt = buffer.secondary_salt;
+    assert_ne!(first_cut_salt, 0);
+    assert!(buffer
+      .merge_cut_into_primary(&mut pager)
+      .expect("leave cut"));
+    assert_eq!(txids(&mut buffer, &mut pager), vec![1, 10, 11]);
+
+    buffer.switch_to_secondary();
+    assert_ne!(buffer.secondary_salt, first_cut_salt);
+    assert_ne!(buffer.secondary_salt, buffer.primary_salt);
+    write_node_record(&mut buffer, &mut pager, 12);
+    buffer.flush(&mut pager).expect("flush");
+    let record_len = buffer.secondary_head() - buffer.secondary_region_start;
+
+    let mut crashed = reopened_naming(&buffer, 1, buffer.secondary_region_start + 2 * record_len);
+    let secondary: Vec<u64> = crashed
+      .scan_region(1, &mut pager)
+      .expect("scan")
+      .iter()
+      .map(|record| record.txid)
+      .collect();
+    assert_eq!(secondary, vec![12]);
+  }
+
+  /// Compaction rewrites the retained records from the primary region's
+  /// start, so it salts them afresh. Restoring a saved region state (as a
+  /// failed install does) restores the salts with the positions, matching
+  /// the durable header.
+  #[test]
+  fn compaction_salts_afresh_and_region_state_restores_salts() {
+    let (mut pager, _temp) = create_test_pager();
+    let mut buffer = buffer_with_cut(&mut pager, 3, &[10]);
+    buffer.retire_primary_region();
+    let retained = buffer.region_state();
+    let (primary_salt, secondary_salt) = (buffer.primary_salt, buffer.secondary_salt);
+
+    buffer
+      .compact_secondary_into_primary(&mut pager)
+      .expect("compact");
+    assert_ne!(buffer.primary_salt, primary_salt);
+    assert_ne!(buffer.primary_salt, secondary_salt);
+    assert_eq!(txids(&mut buffer, &mut pager), vec![10]);
+
+    buffer.restore_region_state(retained);
+    assert_eq!(buffer.region_state(), retained);
+    assert_eq!(
+      (buffer.primary_salt, buffer.secondary_salt),
+      (primary_salt, secondary_salt)
+    );
+    assert_eq!(txids(&mut buffer, &mut pager), vec![10]);
+  }
+
+  #[test]
+  fn fresh_salt_is_never_zero_or_in_use() {
+    let mut buffer = WalBuffer::new(4096, 4 * 4096, 4096);
+    buffer.primary_salt = 7;
+    buffer.secondary_salt = 3;
+    assert_eq!(buffer.fresh_salt(), 8);
+    buffer.primary_salt = u32::MAX;
+    buffer.secondary_salt = 1;
+    assert_eq!(buffer.fresh_salt(), 2);
+  }
+
+  /// A v1 WAL (salts 0) stays unsalted, and its header v1, until a reset
+  /// salts the emptied region; from then on the header needs a v2 reader.
+  #[test]
+  fn first_salt_upgrades_a_v1_header() {
+    let mut header = test_header();
+    header.version = 1;
+    header.min_reader_version = 1;
+    header.wal_primary_salt = 0;
+    header.wal_secondary_salt = 0;
+    let mut buffer = WalBuffer::from_header(&header);
+    buffer.store_in_header(&mut header);
+    assert_eq!((header.version, header.min_reader_version), (1, 1));
+
+    buffer.reset();
+    buffer.store_in_header(&mut header);
+    assert_ne!(header.wal_primary_salt, 0);
+    assert_eq!(
+      (header.version, header.min_reader_version),
+      (VERSION_SINGLE_FILE, MIN_READER_SINGLE_FILE)
+    );
   }
 
   #[test]

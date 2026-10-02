@@ -20,8 +20,9 @@ use crate::error::{KiteError, Result};
 thread_local! {
   /// Test probe: the OS primitive each `FilePager` sync on this thread issued,
   /// oldest first. "fsync" is plain fsync(2), which on macOS leaves data in
-  /// the drive's volatile cache; "sync_all" is `File::sync_all` (F_FULLFSYNC
-  /// on macOS). New sync primitives should log here too.
+  /// the drive's volatile cache; "F_FULLFSYNC" is fcntl(F_FULLFSYNC) (macOS),
+  /// and "sync_all" is `File::sync_all` (other platforms). New sync
+  /// primitives should log here too.
   pub(crate) static SYNC_PRIMITIVE_LOG: std::cell::RefCell<Vec<&'static str>> =
     const { std::cell::RefCell::new(Vec::new()) };
 }
@@ -188,6 +189,9 @@ pub struct FilePager {
   deferred_free_pages: HashSet<u32>,
   /// Cached mmap for the entire file (lazily created)
   mmap: Option<Mmap>,
+  /// Make [`Self::sync`] flush the drive's write cache too (`F_FULLFSYNC` on
+  /// macOS); see [`Self::set_full_fsync`].
+  full_fsync: bool,
 }
 
 impl FilePager {
@@ -214,6 +218,7 @@ impl FilePager {
       free_pages: HashSet::new(),
       deferred_free_pages: HashSet::new(),
       mmap: None,
+      full_fsync: false,
     })
   }
 
@@ -229,6 +234,7 @@ impl FilePager {
       free_pages: HashSet::new(),
       deferred_free_pages: HashSet::new(),
       mmap: None,
+      full_fsync: false,
     }
   }
 
@@ -512,6 +518,18 @@ impl FilePager {
     Ok(())
   }
 
+  /// Make every [`Self::sync`] durable against power loss (`SyncMode::Full`),
+  /// not just against a process or OS crash.
+  ///
+  /// On macOS, fsync(2) hands data to the drive, whose volatile write cache
+  /// can still lose it or persist it out of order (a header before the WAL
+  /// or snapshot pages it names); `F_FULLFSYNC` flushes that cache too, at a
+  /// cost of milliseconds per sync. Elsewhere `File::sync_all` is used either
+  /// way.
+  pub fn set_full_fsync(&mut self, full_fsync: bool) {
+    self.full_fsync = full_fsync;
+  }
+
   /// Sync file to disk
   pub fn sync(&self) -> Result<()> {
     if self.read_only {
@@ -519,9 +537,17 @@ impl FilePager {
     }
     #[cfg(target_os = "macos")]
     {
+      use std::os::unix::io::AsRawFd;
+      // F_FULLFSYNC fails on file systems without it (some network and FUSE
+      // mounts); fall back to fsync there, as SQLite does.
+      // SAFETY: file descriptor is valid for the pager file.
+      if self.full_fsync && unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_FULLFSYNC) } == 0 {
+        #[cfg(test)]
+        SYNC_PRIMITIVE_LOG.with(|log| log.borrow_mut().push("F_FULLFSYNC"));
+        return Ok(());
+      }
       #[cfg(test)]
       SYNC_PRIMITIVE_LOG.with(|log| log.borrow_mut().push("fsync"));
-      use std::os::unix::io::AsRawFd;
       // SAFETY: file descriptor is valid for the pager file.
       let result = unsafe { libc::fsync(self.file.as_raw_fd()) };
       if result != 0 {
@@ -768,6 +794,7 @@ pub(crate) fn create_pager_with_locking<P: AsRef<Path>>(
       free_pages: HashSet::new(),
       deferred_free_pages: HashSet::new(),
       mmap: None,
+      full_fsync: false,
     });
   }
   Err(KiteError::LockFailed(format!(

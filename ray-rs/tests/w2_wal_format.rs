@@ -15,6 +15,9 @@
 //! - W8: header `version`, `min_reader_version`, and `flags` are checked
 //!   against what this build supports.
 //! - W9 (medium): the read-only WAL scan bounds each record by the WAL head.
+//! - Format 1 -> 2 migration (W2's salts): a format-1 file written before
+//!   salts existed (`tests/fixtures/wal_format_v1.kitedb`) opens, replays its
+//!   unsalted WAL, and is salted from its next WAL reset on.
 //!
 //! W7 (fsync) needs a crate-internal probe; see `w2_tests` in `core/pager.rs`.
 
@@ -25,7 +28,7 @@ use std::path::{Path, PathBuf};
 use kitedb::constants::{DB_FLAG_ENCRYPTED, MIN_READER_SINGLE_FILE, VERSION_SINGLE_FILE};
 use kitedb::core::single_file::{open_single_file, SingleFileDB, SingleFileOpenOptions};
 use kitedb::core::wal::record::{
-  build_begin_payload, build_commit_payload, build_create_node_payload, WalRecord,
+  build_begin_payload, build_commit_payload, build_create_node_payload, parse_wal_record, WalRecord,
 };
 use kitedb::types::{DbHeaderV1, NodeId, PropKeyId, PropValue, WalRecordType};
 use tempfile::tempdir;
@@ -466,6 +469,25 @@ fn w8_newer_format_version_is_not_written() {
   assert_not_written_by_this_build(&path, "newer format version");
 }
 
+/// That newer version declares this build a capable reader, so a read-only
+/// open works and changes nothing.
+#[test]
+fn w8_newer_format_version_opens_read_only() {
+  let dir = tempdir().expect("tempdir");
+  let path = closed_db_with_a_node(dir.path(), "w8-newer-version-ro.kitedb");
+  let image = edit_header(&path, |header| {
+    header.version = VERSION_SINGLE_FILE + 1;
+    header.min_reader_version = MIN_READER_SINGLE_FILE;
+  });
+  let db = open_single_file(&path, options().read_only(true)).expect("read-only open");
+  assert!(db.node_by_key("existing").is_some());
+  drop(db);
+  assert!(
+    fs::read(&path).expect("read") == image,
+    "read-only open modified the file"
+  );
+}
+
 // ============================================================================
 // W9 (medium): WAL scan bounded by the head
 // ============================================================================
@@ -500,4 +522,160 @@ fn w9_read_only_replay_stops_at_a_record_crossing_the_wal_head() {
     vec![(true, false), (false, false)],
     "(read_only, transaction with a COMMIT past the WAL head replayed)"
   );
+}
+
+// ============================================================================
+// Format 1 -> 2 migration
+// ============================================================================
+
+fn fixture_path(name: &str) -> PathBuf {
+  PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    .join("tests/fixtures")
+    .join(name)
+}
+
+/// A copy of `wal_format_v1.kitedb`, written by the format-1 writer (commit
+/// bf147f6, before WAL salts) with a 64 KiB WAL and auto-checkpoint off:
+/// - checkpointed: label Person, edge type KNOWS, property keys name and
+///   note; alice (1, Person, name "Alice", note "snapshot") and bob (2, name
+///   "Bob"); alice -KNOWS-> bob.
+/// - WAL only, unsalted: tx A creates carol (3), sets alice's note to
+///   "v1-wal-first", and adds bob -KNOWS-> carol; tx B sets alice's note to
+///   "v1-wal-second" and carol's name to "Carol".
+fn v1_fixture_copy(dir: &Path, name: &str) -> PathBuf {
+  let path = dir.join(name);
+  fs::copy(fixture_path("wal_format_v1.kitedb"), &path).expect("copy fixture");
+  path
+}
+
+fn assert_v1_fixture_state(db: &SingleFileDB, what: &str) {
+  let note = db.propkey_id("note").expect("note key");
+  let name = db.propkey_id("name").expect("name key");
+  let knows = db.etype_id("KNOWS").expect("KNOWS");
+  let person = db.label_id("Person").expect("Person");
+  let alice = db.node_by_key("alice").expect("alice");
+  let bob = db.node_by_key("bob").expect("bob");
+  let carol = db.node_by_key("carol");
+  assert_eq!((alice, bob, carol), (1, 2, Some(3)), "{what}: node ids");
+  assert_eq!(
+    string_prop(db, alice, note).as_deref(),
+    Some("v1-wal-second"),
+    "{what}: alice's note"
+  );
+  assert_eq!(
+    string_prop(db, alice, name).as_deref(),
+    Some("Alice"),
+    "{what}"
+  );
+  assert_eq!(string_prop(db, 3, name).as_deref(), Some("Carol"), "{what}");
+  assert!(db.node_labels(alice).contains(&person), "{what}: label");
+  assert!(db.edge_exists(alice, knows, bob), "{what}: snapshot edge");
+  assert!(db.edge_exists(bob, knows, 3), "{what}: WAL edge");
+}
+
+/// A format-1 file opens read-only without being written, and writable with
+/// its unsalted WAL replayed and appended to, unsalted, in the same cycle;
+/// its next checkpoint (a WAL reset) moves it to the salted format 2.
+#[test]
+fn format_1_file_replays_its_wal_and_upgrades_at_the_next_reset() {
+  let dir = tempdir().expect("tempdir");
+  let path = v1_fixture_copy(dir.path(), "v1.kitedb");
+  let original = fs::read(&path).expect("read");
+  let v1 = newest_header(&original);
+  assert_eq!(
+    (
+      v1.version,
+      v1.min_reader_version,
+      v1.wal_primary_salt,
+      v1.wal_secondary_salt
+    ),
+    (1, 1, 0, 0),
+    "precondition: a format-1 header"
+  );
+  assert!(v1.wal_head > 0, "precondition: WAL-only commits");
+
+  let db = open_single_file(&path, options().read_only(true)).expect("read-only open");
+  assert_v1_fixture_state(&db, "read-only");
+  drop(db);
+  assert!(
+    fs::read(&path).expect("read") == original,
+    "read-only open wrote the file"
+  );
+
+  // Unsalted records are not followed by salted ones in the same WAL cycle.
+  let db = open_single_file(&path, options()).expect("writable open");
+  assert_v1_fixture_state(&db, "writable");
+  commit_node(&db, "v1-cycle");
+  let header = newest_header(&fs::read(&path).expect("read"));
+  assert_eq!((header.version, header.wal_primary_salt), (1, 0));
+  drop(db);
+
+  let db = open_single_file(&path, options()).expect("reopen");
+  assert_v1_fixture_state(&db, "reopened");
+  assert!(db.node_by_key("v1-cycle").is_some());
+  db.checkpoint().expect("checkpoint");
+  let header = newest_header(&fs::read(&path).expect("read"));
+  assert_eq!(
+    (header.version, header.min_reader_version),
+    (VERSION_SINGLE_FILE, MIN_READER_SINGLE_FILE),
+    "the WAL reset upgrades the header"
+  );
+  assert_ne!(header.wal_primary_salt, 0);
+  commit_node(&db, "salted");
+  drop(db);
+
+  for read_only in [true, false] {
+    let db = open_single_file(&path, options().read_only(read_only)).expect("open upgraded");
+    assert_v1_fixture_state(&db, &format!("upgraded, read_only={read_only}"));
+    for key in ["v1-cycle", "salted"] {
+      assert!(
+        db.node_by_key(key).is_some(),
+        "read_only={read_only}: {key} lost"
+      );
+    }
+  }
+}
+
+/// The upgrade's reset leaves the format-1 records in place after the WAL
+/// head. A crash that leaves a header naming those bytes (the next commit's
+/// header landed, its WAL page did not) must not replay them: tx A would set
+/// alice's note back to "v1-wal-first".
+#[test]
+fn format_1_records_do_not_replay_after_the_upgrade() {
+  let dir = tempdir().expect("tempdir");
+  let path = v1_fixture_copy(dir.path(), "v1-stale.kitedb");
+  let db = open_single_file(&path, options()).expect("writable open");
+  db.checkpoint().expect("checkpoint");
+  drop(db);
+
+  let mut image = fs::read(&path).expect("read");
+  let mut header = newest_header(&image);
+  assert_eq!(header.version, VERSION_SINGLE_FILE);
+  assert_eq!(header.wal_head, 0);
+  let wal = &image[wal_area(&header)];
+  let mut tx_a_end = 0;
+  while let Some(record) = parse_wal_record(wal, tx_a_end) {
+    tx_a_end = record.record_end;
+    if record.record_type == WalRecordType::Commit {
+      break;
+    }
+  }
+  assert!(
+    tx_a_end > 0,
+    "precondition: tx A's unsalted records are in place"
+  );
+  header.wal_head = tx_a_end as u64;
+  header.wal_primary_head = tx_a_end as u64;
+  header.change_counter += 1;
+  install_header_in_both_slots(&mut image, &header);
+
+  for read_only in [true, false] {
+    let crashed = write_image(
+      dir.path(),
+      &format!("v1-stale-ro{read_only}.kitedb"),
+      &image,
+    );
+    let db = open_single_file(&crashed, options().read_only(read_only)).expect("open crash image");
+    assert_v1_fixture_state(&db, &format!("crash image, read_only={read_only}"));
+  }
 }

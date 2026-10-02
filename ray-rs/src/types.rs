@@ -754,13 +754,20 @@ pub struct DbHeaderV1 {
   pub wal_secondary_head: u64,
   pub active_wal_region: u8,      // 0=primary, 1=secondary
   pub checkpoint_in_progress: u8, // for crash recovery
+  // V2 (format version 2) WAL salts; 0 means unsalted (a v1 WAL)
+  /// Salt of the primary WAL region's records: XORed into each record's CRC,
+  /// and replaced whenever the region is emptied for reuse.
+  pub wal_primary_salt: u32,
+  /// Salt of the secondary WAL region's records, replaced whenever a
+  /// background checkpoint starts writing there.
+  pub wal_secondary_salt: u32,
 }
 
 /// Size of fixed header fields before reserved area (in bytes)
 pub const DB_HEADER_FIXED_SIZE: usize = 176;
 
-/// Size of reserved area in header (in bytes)
-pub const DB_HEADER_RESERVED_SIZE: usize = 14;
+/// Size of reserved area in header (in bytes): 162..164 and 172..176
+pub const DB_HEADER_RESERVED_SIZE: usize = 6;
 
 /// Size of V2 fields
 pub const DB_HEADER_V2_FIELDS_SIZE: usize = 8 + 8 + 1 + 1; // 18 bytes

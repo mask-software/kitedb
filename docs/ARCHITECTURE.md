@@ -305,9 +305,15 @@ reserved (u16)      - Padding
 txid (u64)          - Transaction ID
 payloadLen (u32)    - Payload length
 payload[...]        - Variable-length payload
-crc32c (u32)        - Checksum of type..payload
+crc32c (u32)        - Checksum of type..payload, XORed with the region's salt
 padding             - Align to 8 bytes
 ```
+
+Each WAL region's salt is stored in the header (format version 2) and replaced
+whenever a checkpoint empties the region for reuse, so records an earlier WAL
+cycle left in place fail their checksum and are never replayed. Format 1 files
+(unsalted, salt 0) still open and switch to salted records at their next WAL
+reset. Replication frames carry records unsalted.
 
 Record types: `BEGIN`, `COMMIT`, `ROLLBACK`, `CREATE_NODE`, `DELETE_NODE`, `ADD_EDGE`, `DELETE_EDGE`, `SET_NODE_PROP`, `DEL_NODE_PROP`, etc.
 

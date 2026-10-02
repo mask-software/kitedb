@@ -110,7 +110,50 @@ impl DbHeaderV1 {
       wal_secondary_head: read_u64(data, 152),
       active_wal_region: data[160],
       checkpoint_in_progress: data[161],
+      wal_primary_salt: read_u32(data, 164),
+      wal_secondary_salt: read_u32(data, 168),
     })
+  }
+
+  /// Fail unless this build can open the file this header describes:
+  /// `min_reader_version` and `flags` must be ones it supports, and a writable
+  /// open also needs a format `version` it can write. A newer version that
+  /// still declares this build a capable reader opens read-only only: writing
+  /// would drop or break whatever that version added.
+  pub fn check_supported(&self, writable: bool) -> Result<()> {
+    if self.min_reader_version > VERSION_SINGLE_FILE {
+      return Err(KiteError::VersionMismatch {
+        required: self.min_reader_version,
+        current: VERSION_SINGLE_FILE,
+      });
+    }
+    let unsupported_flags = self.flags & !SUPPORTED_DB_FLAGS;
+    if unsupported_flags != 0 {
+      return Err(KiteError::InvalidSnapshot(format!(
+        "database header flags 0x{unsupported_flags:08X} are not supported by this version \
+         (it supports 0x{SUPPORTED_DB_FLAGS:08X})"
+      )));
+    }
+    if writable && self.version > VERSION_SINGLE_FILE {
+      return Err(KiteError::VersionMismatch {
+        required: self.version,
+        current: VERSION_SINGLE_FILE,
+      });
+    }
+    Ok(())
+  }
+
+  /// Record the WAL regions' salts. A salted region needs a reader that
+  /// verifies salts, so a v1 header is upgraded to the current format here:
+  /// this happens when a v1 file's WAL is first reset, and from then on no
+  /// unsalted record is written to it.
+  pub(crate) fn set_wal_salts(&mut self, primary: u32, secondary: u32) {
+    self.wal_primary_salt = primary;
+    self.wal_secondary_salt = secondary;
+    if primary != 0 || secondary != 0 {
+      self.version = self.version.max(VERSION_SINGLE_FILE);
+      self.min_reader_version = self.min_reader_version.max(MIN_READER_SINGLE_FILE);
+    }
   }
 
   /// Serialize header to fixed 4KB buffer (default page size).
@@ -150,6 +193,10 @@ impl DbHeaderV1 {
     write_u64(&mut buf, 152, self.wal_secondary_head);
     buf[160] = self.active_wal_region;
     buf[161] = self.checkpoint_in_progress;
+    // 162..164 reserved
+    write_u32(&mut buf, 164, self.wal_primary_salt);
+    write_u32(&mut buf, 168, self.wal_secondary_salt);
+    // 172..176 reserved
 
     let header_crc = crc32c(&buf[..HEADER_CRC_OFFSET]);
     write_u32(&mut buf, HEADER_CRC_OFFSET, header_crc);
@@ -188,6 +235,9 @@ impl DbHeaderV1 {
       wal_secondary_head: 0,
       active_wal_region: 0,
       checkpoint_in_progress: 0,
+      // The secondary region gets a salt when a checkpoint first writes there.
+      wal_primary_salt: INITIAL_WAL_SALT,
+      wal_secondary_salt: 0,
     }
   }
 }
@@ -241,4 +291,75 @@ pub(crate) fn write_header_slot(
     )));
   }
   pager.write_page(slot, &header.serialize_to_page())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn wal_salts_round_trip_inside_the_checksummed_fields() {
+    let mut header = DbHeaderV1::new(4096, 16);
+    header.set_wal_salts(0xA1B2_C3D4, 0x0102_0304);
+    let page = header.serialize_to_page();
+    assert_eq!(read_u32(&page, 164), 0xA1B2_C3D4);
+    assert_eq!(read_u32(&page, 168), 0x0102_0304);
+    let parsed = DbHeaderV1::parse(&page).expect("parse");
+    assert_eq!(
+      (parsed.wal_primary_salt, parsed.wal_secondary_salt),
+      (0xA1B2_C3D4, 0x0102_0304)
+    );
+    assert_eq!(parsed.serialize_to_page(), page);
+
+    let mut torn = page.clone();
+    torn[168] ^= 1;
+    assert!(DbHeaderV1::parse(&torn).is_err());
+  }
+
+  #[test]
+  fn new_headers_are_the_current_salted_format() {
+    let header = DbHeaderV1::new(4096, 16);
+    assert_eq!(header.version, VERSION_SINGLE_FILE);
+    assert_eq!(header.min_reader_version, MIN_READER_SINGLE_FILE);
+    assert_eq!(header.wal_primary_salt, INITIAL_WAL_SALT);
+    assert_ne!(header.wal_primary_salt, 0);
+    assert!(header.check_supported(true).is_ok());
+  }
+
+  #[test]
+  fn check_supported_gates_versions_and_flags() {
+    let header = |version, min_reader_version, flags| {
+      let mut header = DbHeaderV1::new(4096, 16);
+      header.version = version;
+      header.min_reader_version = min_reader_version;
+      header.flags = flags;
+      header
+    };
+    let current = VERSION_SINGLE_FILE;
+    for writable in [false, true] {
+      // Format 1 files open and are upgraded; WAL mode is implied.
+      assert!(header(1, 1, 0).check_supported(writable).is_ok());
+      assert!(header(current, current, DB_FLAG_WAL_MODE)
+        .check_supported(writable)
+        .is_ok());
+      // A file that needs a newer reader, or has flags this build lacks.
+      assert!(matches!(
+        header(current + 1, current + 1, 0).check_supported(writable),
+        Err(KiteError::VersionMismatch { required, current: supported })
+          if required == current + 1 && supported == current
+      ));
+      for flag in [DB_FLAG_COMPRESSION, DB_FLAG_ENCRYPTED, 1 << 31] {
+        assert!(header(current, current, flag)
+          .check_supported(writable)
+          .is_err());
+      }
+    }
+    // A newer format this build can still read opens read-only only.
+    let newer = header(current + 1, MIN_READER_SINGLE_FILE, 0);
+    assert!(newer.check_supported(false).is_ok());
+    assert!(matches!(
+      newer.check_supported(true),
+      Err(KiteError::VersionMismatch { .. })
+    ));
+  }
 }

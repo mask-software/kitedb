@@ -149,8 +149,11 @@ function WALRecordFormat() {
 				<ByteRow label="body" fields={RECORD_BODY} />
 			</div>
 			<p class="mt-3 text-[13px] text-slate-500">
-				The CRC32C covers everything from Type through the end of the payload.
-				Padding brings each record to an 8-byte boundary.
+				The CRC32C covers everything from Type through the end of the payload,
+				and is XORed with the salt of the WAL region the record is in. A region
+				gets a new salt whenever a checkpoint empties it for reuse, so records
+				an earlier cycle left behind fail the check. Padding brings each record
+				to an 8-byte boundary.
 			</p>
 
 			<div class="mt-5 border-t border-kite-line pt-4">
@@ -310,8 +313,10 @@ const SYNC_MODES: {
 		name: "Full",
 		accent: "mint",
 		badge: "default",
-		summary: "fsync on every commit",
-		tradeoff: "Safest; slowest writes",
+		summary:
+			"Sync on every commit; on macOS F_FULLFSYNC, which also flushes the drive's write cache",
+		tradeoff:
+			"Survives power loss; slowest writes (milliseconds per commit on macOS)",
 	},
 	{
 		name: "Normal",
@@ -380,7 +385,7 @@ function RecoveryProcess() {
 		{ text: "Scan records from tail to head", accent: "cyan" },
 		{
 			text: "Validate each record's CRC32C",
-			sub: "An invalid record ends the scan (incomplete write)",
+			sub: "An invalid record ends the scan: an incomplete write, or a record of an earlier WAL cycle (its salt differs)",
 			accent: "violet",
 		},
 		{
