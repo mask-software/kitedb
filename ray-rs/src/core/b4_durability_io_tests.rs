@@ -39,7 +39,7 @@ use crate::core::single_file::{
   SyncMode,
 };
 use crate::core::wal::buffer::WalBuffer;
-use crate::core::wal::record::WalRecord;
+use crate::core::wal::record::{build_create_node_payload, WalRecord};
 use crate::error::KiteError;
 use crate::types::{DbHeaderV1, WalRecordType};
 
@@ -678,5 +678,68 @@ fn x_full_mode_failed_commit_stays_failed_after_an_os_crash() {
     (failed_a, b),
     (false, true),
     "(failed commit replayed, acknowledged commit kept)"
+  );
+}
+
+/// After a failed round, the next sync zeroes the discarded bytes past the
+/// head, and only those: here the scrub's own sync fails, a shorter record
+/// then overwrites the start of the span, and the next sync zeroes the rest.
+#[test]
+fn x_sync_zeroes_only_discarded_bytes_past_the_head() {
+  let dir = tempdir().expect("tempdir");
+  let mut pager = create_pager(dir.path().join("discard.kitedb"), PAGE_SIZE).expect("pager");
+  pager.allocate_pages(9).expect("allocate");
+  let mut wal = WalBuffer::new(PAGE_SIZE as u64, 8 * PAGE_SIZE as u64, PAGE_SIZE);
+  let record = |txid: u64, key: &str| {
+    WalRecord::new(
+      WalRecordType::CreateNode,
+      txid,
+      build_create_node_payload(txid, Some(key)),
+    )
+  };
+  wal
+    .write_record(&record(1, "kept"), &mut pager)
+    .expect("write");
+  wal.sync(&mut pager).expect("sync");
+
+  let before = wal.region_state();
+  let start = wal.head();
+  wal
+    .write_record(&record(2, "failed-with-a-long-key"), &mut pager)
+    .expect("write");
+  wal
+    .write_record(&record(3, "failed"), &mut pager)
+    .expect("write");
+  let end = wal.head();
+  wal.flush(&mut pager).expect("flush");
+
+  let scrubbed = io_hooks::with_failing_syncs(1, || wal.discard_since(before, &mut pager));
+  assert!(scrubbed.is_err(), "the scrub's sync was made to fail");
+  assert_eq!(wal.head(), start);
+  assert!(wal.needs_sync());
+
+  wal
+    .write_record(&record(4, "next"), &mut pager)
+    .expect("write");
+  let next_end = wal.head();
+  assert!(
+    next_end < end,
+    "the next record must be shorter than the span"
+  );
+  wal.sync(&mut pager).expect("sync");
+  assert!(!wal.needs_sync());
+
+  let mut bytes = Vec::new();
+  for page in 1..9 {
+    bytes.extend(pager.read_page(page).expect("read"));
+  }
+  let (start, next_end, end) = (start as usize, next_end as usize, end as usize);
+  assert!(
+    bytes[start..next_end].iter().any(|byte| *byte != 0),
+    "the next record was zeroed"
+  );
+  assert!(
+    bytes[next_end..end].iter().all(|byte| *byte == 0),
+    "discarded bytes past the head survived the sync"
   );
 }

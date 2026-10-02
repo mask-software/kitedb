@@ -434,7 +434,13 @@ impl SingleFileDB {
   pub(crate) fn persist_for_close(&self) -> Result<()> {
     let mut pager = self.pager.lock();
     let mut wal_buffer = self.wal_buffer.lock();
-    wal_buffer.flush(&mut pager)?;
+    // A failed commit's records may still be readable on disk; the header
+    // below must not name bytes past them before their overwrite is durable.
+    if wal_buffer.needs_sync() {
+      wal_buffer.sync(&mut pager)?;
+    } else {
+      wal_buffer.flush(&mut pager)?;
+    }
     {
       let mut header = self.header.write();
       wal_buffer.store_in_header(&mut header);

@@ -934,7 +934,12 @@ impl SingleFileDB {
     match self.persist_commit_header(&mut pager, &mut wal, staged.len()) {
       Ok(()) => round.durable = staged,
       Err(error) => {
-        wal.restore_region_state(wal_before_round);
+        if let Err(scrub) = wal.discard_since(wal_before_round, &mut pager) {
+          eprintln!(
+            "Warning: could not sync the discarded records of a failed commit; the next commit \
+             syncs them before its header: {scrub}"
+          );
+        }
         let mut errors: Vec<KiteError> =
           staged.iter().skip(1).map(|_| round_error(&error)).collect();
         errors.insert(0, error);
@@ -962,7 +967,10 @@ impl SingleFileDB {
     #[cfg(feature = "bench-profile")]
     let flush_start = Instant::now();
     let flushed = match self.sync_mode {
-      SyncMode::Full => wal.flush(pager).and_then(|()| pager.sync()),
+      SyncMode::Full => wal.sync(pager),
+      // A failed round's records may still be readable on disk, and this
+      // header names bytes past them: make their overwrite durable first.
+      SyncMode::Normal if wal.needs_sync() => wal.sync(pager),
       SyncMode::Normal => wal.flush(pager),
       SyncMode::Off => Ok(()),
     };

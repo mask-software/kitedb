@@ -89,6 +89,18 @@ pub struct WalBuffer {
   primary_salt: u32,
   /// Salt of the secondary region's records (0: unsalted, or never used)
   secondary_salt: u32,
+  /// Records of failed commit rounds still in the file, not yet durably
+  /// unreadable (see [`Self::discard_since`]).
+  discarded: Vec<DiscardedRecords>,
+}
+
+/// Bytes `start..end` (relative to the WAL start) of records a failed commit
+/// round wrote, readable under `salt` until overwritten.
+#[derive(Debug, Clone, Copy)]
+struct DiscardedRecords {
+  start: u64,
+  end: u64,
+  salt: u32,
 }
 
 impl WalBuffer {
@@ -113,6 +125,7 @@ impl WalBuffer {
       secondary_head: secondary_region_start,
       primary_salt: INITIAL_WAL_SALT,
       secondary_salt: 0,
+      discarded: Vec::new(),
     }
   }
 
@@ -217,6 +230,7 @@ impl WalBuffer {
       secondary_head,
       primary_salt: header.wal_primary_salt,
       secondary_salt: header.wal_secondary_salt,
+      discarded: Vec::new(),
     })
   }
 
@@ -1044,10 +1058,68 @@ impl WalBuffer {
     Ok(())
   }
 
-  /// Flush and sync to disk
+  /// Flush and sync to disk. First the bytes of discarded records (see
+  /// [`Self::discard_since`]) past their region's head are overwritten with
+  /// zeros, so once this returns they are durably unreadable.
   pub fn sync(&mut self, pager: &mut FilePager) -> Result<()> {
+    self.zero_discarded(pager)?;
     self.flush(pager)?;
     pager.sync()?;
+    self.discarded.clear();
+    Ok(())
+  }
+
+  /// Forget the records written since `before`: a commit round whose header
+  /// failed to persist. Restores the positions, then makes the records'
+  /// bytes durably unreadable ([`Self::sync`]).
+  ///
+  /// Rewinding the head alone is not enough: the records stay in the file
+  /// under the region's salt, and the next header names bytes past the
+  /// rewound head. Without a sync between the next round's overwrite and
+  /// its header (`SyncMode::Normal`), an OS crash can keep an early
+  /// write-back of the failed records, lose the overwrite, and keep the
+  /// header, so recovery would replay a commit that returned an error.
+  ///
+  /// If the sync fails (its error is returned), the records stay listed and
+  /// [`Self::needs_sync`] holds until a later sync succeeds: the caller must
+  /// sync before installing a header that names bytes past them.
+  pub fn discard_since(&mut self, before: WalRegionState, pager: &mut FilePager) -> Result<()> {
+    // A round writes to one region, the one active throughout.
+    let (start, end) = (before.head, self.head);
+    let salt = self.region_salt(self.active_region);
+    self.restore_region_state(before);
+    if end > start {
+      self.discarded.push(DiscardedRecords { start, end, salt });
+    }
+    self.sync(pager)
+  }
+
+  /// Whether discarded records may still be readable on disk: a header must
+  /// not name bytes past them before a [`Self::sync`].
+  pub fn needs_sync(&self) -> bool {
+    !self.discarded.is_empty()
+  }
+
+  /// Overwrite with zeros (buffered) the bytes of discarded records that lie
+  /// past their region's head. Bytes before it hold newer records already.
+  /// Records in a region salted afresh since are unreadable anyway.
+  fn zero_discarded(&mut self, pager: &mut FilePager) -> Result<()> {
+    for discarded in self.discarded.clone() {
+      let region = u8::from(discarded.start >= self.secondary_region_start);
+      if self.region_salt(region) != discarded.salt {
+        continue;
+      }
+      let head = if region == 0 {
+        self.primary_head
+      } else {
+        self.secondary_head
+      };
+      let from = discarded.start.max(head);
+      if from < discarded.end {
+        let zeros = vec![0; (discarded.end - from) as usize];
+        self.buffer_write(self.file_offset(from), &zeros, pager)?;
+      }
+    }
     Ok(())
   }
 
