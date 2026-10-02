@@ -110,6 +110,40 @@ test('db-backed traversal APIs', (t) => {
   db.close()
 })
 
+test('db-backed writes to a missing node or edge throw and store nothing', (t) => {
+  const db = Database.open(makeDbPath())
+  db.begin()
+  const a = db.createNode('a')
+  const b = db.createNode('b')
+  const deleted = db.createNode('deleted')
+  const knows = db.get_or_create_etype('knows')
+  const name = db.get_or_create_propkey('name')
+  const embedding = db.get_or_create_propkey('embedding')
+  const tag = db.defineLabel('Tag')
+  db.commit()
+
+  const value = { propType: PropType.String, stringValue: 'x' }
+  db.begin()
+  db.deleteNode(deleted)
+  for (const id of [deleted, 424242]) {
+    t.throws(() => db.setNodeProp(id, name, value), { message: /Node not found/ })
+    t.throws(() => db.addNodeLabel(id, tag), { message: /Node not found/ })
+    t.throws(() => db.setNodeVector(id, embedding, [1, 0, 0]), { message: /Node not found/ })
+  }
+  // a and b exist, but no edge joins them.
+  t.throws(() => db.setEdgeProp(a, knows, b, name, value), { message: /Edge not found/ })
+  db.commit()
+
+  for (const id of [deleted, 424242]) {
+    t.is(db.get_node_prop(id, name), null)
+    t.false(db.nodeHasLabel(id, tag))
+    t.false(db.hasNodeVector(id, embedding))
+  }
+  t.is(db.get_edge_prop(a, knows, b, name), null)
+
+  db.close()
+})
+
 test('db-backed upsertNode', (t) => {
   const db = Database.open(makeDbPath())
 
