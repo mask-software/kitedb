@@ -1615,3 +1615,9 @@ fn sidecar_epoch_fence(sidecar_path: &Path, initial_epoch: u64) -> SidecarEpochF
 fn normalize_sidecar_path(path: &Path) -> PathBuf {
   std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
+
+/// raydb-b4 repl-flake: closing a primary releases `primary.lock` while a
+/// spawned child still holds a copy of its descriptor.
+#[cfg(all(test, unix))]
+#[path = "b4_repl_flake_tests.rs"]
+mod b4_repl_flake_tests;
