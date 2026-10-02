@@ -717,7 +717,12 @@ fn init_mvcc(
   // The replayed commits need no version history: no transaction is open
   // yet, and every one that begins sees them all.
   let mvcc = std::sync::Arc::new(MvccManager::new(next_tx_id, next_commit_ts, gc_config));
-  mvcc.start();
+  // A read-only handle commits nothing, so it never has version history or
+  // commit times for GC to collect: no GC thread to start on open and join
+  // on close.
+  if !options.read_only {
+    mvcc.start();
+  }
   Some(mvcc)
 }
 
