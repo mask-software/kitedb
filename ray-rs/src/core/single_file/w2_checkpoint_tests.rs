@@ -431,6 +431,83 @@ fn k4_background_checkpoint_publishes_buffered_sidecar_frames_first() {
   sidecar_holds_commits_folded_by_checkpoint(true);
 }
 
+/// Restores a directory's permissions when dropped, also on panic.
+#[cfg(unix)]
+struct RestoreMode<'a>(&'a std::path::Path);
+
+#[cfg(unix)]
+impl Drop for RestoreMode<'_> {
+  fn drop(&mut self) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o755));
+  }
+}
+
+/// The publish before the install fails (here the sidecar directory turned
+/// read-only, so its manifest cannot be written). The sidecar is fenced for
+/// repair, as after a failed append, and the checkpoint still installs:
+/// failing it would leave the WAL to fill. The fence is not silent: the
+/// status reports it, and a crash copy reopens fenced too, since the marker
+/// of buffered frames could not be removed.
+#[cfg(unix)]
+#[test]
+fn k4_failed_sidecar_publish_fences_the_sidecar_and_the_checkpoint_proceeds() {
+  use std::os::unix::fs::PermissionsExt;
+  let _serial = checkpoint_test_serial();
+  let replication_options = || {
+    options()
+      .sync_mode(SyncMode::Normal)
+      .replication_role(ReplicationRole::Primary)
+  };
+  let dir = tempdir().expect("tempdir");
+  let db_path = dir.path().join("k4-publish-fails.kitedb");
+  let mut db = open_single_file(&db_path, replication_options()).expect("open primary");
+  db.primary_replication
+    .as_mut()
+    .expect("primary replication")
+    .stop_publisher_for_testing();
+  commit_nodes(&db, "k4-fenced", 3);
+
+  let sidecar = default_replication_sidecar_path(&db_path);
+  let _restore = RestoreMode(&sidecar);
+  std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o555))
+    .expect("make sidecar read-only");
+  if std::fs::File::create(sidecar.join("probe")).is_ok() {
+    eprintln!("skipped: permissions are not enforced here (running as root?)");
+    return;
+  }
+
+  let checkpoint = db.checkpoint();
+  let status = db.primary_replication_status().expect("primary status");
+  assert!(
+    checkpoint.is_ok() && status.sidecar_needs_repair,
+    "a failed sidecar publish must fence the sidecar, not fail the checkpoint: checkpoint \
+     {checkpoint:?}, sidecar_needs_repair={}",
+    status.sidecar_needs_repair
+  );
+  assert_eq!(
+    db.wal_stats().primary_head,
+    0,
+    "the install must reset the WAL"
+  );
+  assert_eq!(missing_nodes(&db, "k4-fenced", 3), Vec::<String>::new());
+  let crashed = crash_copy(&db_path, "k4-fenced");
+  drop(db);
+
+  let reopened = open_single_file(&crashed, replication_options()).expect("reopen crash copy");
+  assert_eq!(
+    missing_nodes(&reopened, "k4-fenced", 3),
+    Vec::<String>::new()
+  );
+  assert!(
+    reopened
+      .primary_replication_status()
+      .expect("primary status")
+      .sidecar_needs_repair,
+    "the crash copy must reopen fenced"
+  );
+}
+
 // ============================================================================
 // K5: blocking checkpoint / optimize vs a running background checkpoint
 // ============================================================================
