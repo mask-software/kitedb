@@ -7,6 +7,9 @@
 //!           `count_edges` the bindings report as a page's `total`.
 //!   types   `Kite::all(type).count()` and `Kite::count_nodes_by_type` over
 //!           `--type-nodes` nodes spread over 5 types.
+//!   open    Opening a checkpointed database of `--nodes` nodes (read-only,
+//!           so nothing but the open runs), as the snapshot checks it.
+//!           Not in the default sections.
 //!   hub     `kite.from(hub).out(None).take(1)` from a node with `--hub-edges`
 //!           out-edges, and the hub's whole neighbor list and traversal for
 //!           comparison.
@@ -38,7 +41,9 @@ use rand::{Rng, SeedableRng};
 use tempfile::tempdir;
 
 use kitedb::api::kite::{EdgeDef, Kite, KiteOptions, NodeDef};
-use kitedb::core::single_file::{open_single_file, SingleFileDB, SingleFileOpenOptions, SyncMode};
+use kitedb::core::single_file::{
+  close_single_file, open_single_file, SingleFileDB, SingleFileOpenOptions, SyncMode,
+};
 use kitedb::streaming::{edges_page_single, nodes_page_single, PaginationOptions};
 use kitedb::types::NodeId;
 
@@ -336,6 +341,30 @@ fn hub(config: &Config) {
   kite.close().expect("close");
 }
 
+fn open(config: &Config) {
+  println!(
+    "open: {} nodes, {} edges, checkpointed",
+    config.nodes,
+    config.nodes * config.edges_per_node
+  );
+  let dir = tempdir().expect("temp dir");
+  let path = dir.path().join("open.kitedb");
+  let db = open_single_file(&path, db_options()).expect("open");
+  load_paging_graph(&db, config);
+  db.checkpoint().expect("checkpoint");
+  close_single_file(db).expect("close");
+  let options = || SingleFileOpenOptions::new().read_only(true);
+  report(
+    "snapshot",
+    "open_single_file (read-only)",
+    config.repeat,
+    || {
+      let db = open_single_file(&path, options()).expect("reopen");
+      close_single_file(db).expect("close")
+    },
+  );
+}
+
 fn main() {
   let config = Config::parse();
   for section in &config.sections {
@@ -343,6 +372,7 @@ fn main() {
       "paging" => paging(&config),
       "types" => types(&config),
       "hub" => hub(&config),
+      "open" => open(&config),
       other => panic!("unknown section {other}"),
     }
   }

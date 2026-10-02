@@ -875,11 +875,16 @@ impl SnapshotData {
   /// node IDs and `0..num_nodes`. Every mapped `(node_id, phys)` must have
   /// `PhysToNodeId[phys] == node_id`; distinct IDs then map to distinct
   /// physical nodes, and exactly `num_nodes` mapped IDs cover them all.
+  /// Physical order must also be node ID order (the writer sorts nodes by
+  /// ID): reads that seek, like pages and edge slices, binary-search physical
+  /// indexes by node ID. Both maps are walked in ascending node ID, so that
+  /// holds when the k-th mapped ID is at physical node k.
   fn validate_node_id_maps(&self, num_nodes: usize) -> Result<()> {
     const SECTION: &str = "NodeIdToPhys";
     let map = self.bytes(SectionId::NodeIdToPhys);
     let phys_to_node = self.bytes(SectionId::PhysToNodeId);
-    let check_pair = |node_id: NodeId, phys: usize| -> Result<()> {
+    // `rank`: how many node IDs below `node_id` are mapped.
+    let check_pair = |node_id: NodeId, phys: usize, rank: usize| -> Result<()> {
       if phys >= num_nodes {
         return Err(Self::invalid_section(
           SECTION,
@@ -893,6 +898,15 @@ impl SnapshotData {
           format!(
             "physical node {phys} has node ID {stored}, but NodeIdToPhys maps node ID \
              {node_id} to it"
+          ),
+        ));
+      }
+      if phys != rank {
+        return Err(Self::invalid_section(
+          "PhysToNodeId",
+          format!(
+            "node ID {node_id} is at physical node {phys}, out of order: physical nodes must \
+             be in ascending node ID order (expected physical node {rank})"
           ),
         ));
       }
@@ -913,7 +927,7 @@ impl SnapshotData {
               format!("physical node {phys} at node ID {index} is negative"),
             )
           })?;
-          check_pair(index as NodeId, phys)?;
+          check_pair(index as NodeId, phys, mapped)?;
           mapped += 1;
         }
         mapped
@@ -938,7 +952,7 @@ impl SnapshotData {
               ),
             ));
           }
-          check_pair(node_id, phys as usize)?;
+          check_pair(node_id, phys as usize, index)?;
           previous = Some(node_id);
         }
         count
