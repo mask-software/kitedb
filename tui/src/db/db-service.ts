@@ -1,9 +1,9 @@
 import {
   Database,
   type DbStats,
-  type JsNodeProp,
-  type JsPropValue,
-  type JsFullEdge,
+  type NodeProp,
+  type PropValue,
+  type FullEdge,
   type NodePage,
   type EdgePage,
 } from "@kitedb/core";
@@ -151,7 +151,7 @@ export class DbService {
     };
   }
 
-  getEdgesPage(req: PageRequest): PageState<JsFullEdge> {
+  getEdgesPage(req: PageRequest): PageState<FullEdge> {
     if (!this.db) return { items: [], hasMore: false };
     const page: EdgePage = this.db.getEdgesPage({ limit: req.limit, cursor: req.cursor });
     return {
@@ -228,7 +228,7 @@ export class DbService {
     };
   }
 
-  getEdgeDetail(edge: JsFullEdge): EdgeDetail | null {
+  getEdgeDetail(edge: FullEdge): EdgeDetail | null {
     if (!this.db) return null;
     return {
       src: edge.src,
@@ -316,7 +316,7 @@ function probeSchemaNames(nameOf: (id: number) => string | null): string[] {
   return names;
 }
 
-export function formatPropValue(value: JsPropValue): string {
+export function formatPropValue(value: PropValue): string {
   const propType = value.propType as unknown as string | number;
   switch (propType) {
     case "Null":
@@ -342,14 +342,14 @@ export function formatPropValue(value: JsPropValue): string {
   }
 }
 
-export function formatProps(props: JsNodeProp[], getName: (keyId: number) => string | null): NamedProp[] {
+export function formatProps(props: NodeProp[], getName: (keyId: number) => string | null): NamedProp[] {
   return props.map((prop) => ({
     key: getName(prop.keyId) ?? `#${prop.keyId}`,
     value: formatPropValue(prop.value),
   }));
 }
 
-export function formatEdge(edge: JsFullEdge, getEtypeName: (etype: number) => string | null): EdgeRef {
+export function formatEdge(edge: FullEdge, getEtypeName: (etype: number) => string | null): EdgeRef {
   return {
     src: edge.src,
     etype: edge.etype,

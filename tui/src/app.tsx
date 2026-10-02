@@ -1,13 +1,24 @@
-import { createEffect, createMemo, createSignal, For, onCleanup, Show } from "solid-js";
-import type { KeyEvent } from "@opentui/core";
-import { Portal, useKeyboard, useRenderer } from "@opentui/solid";
+import { createEffect, createMemo, createSignal, For, onCleanup, Show, type Accessor } from "solid-js";
+import type { KeyEvent, TabSelectOption, TabSelectRenderable } from "@opentui/core";
+import { useKeyboard, useRenderer, type JSX } from "@opentui/solid";
 import { DbService } from "./db/db-service.ts";
 import { nextPage, prevPage } from "./db/paging.ts";
-import type { JsFullEdge, DbStats } from "@kitedb/core";
+import type { FullEdge, DbStats } from "@kitedb/core";
 
 const PAGE_SIZE = 100;
 
 type TabKey = "nodes" | "edges" | "stats" | "import";
+
+/** The tab bar's tabs, in order. */
+const TABS: Array<TabSelectOption & { value: TabKey }> = [
+  { name: "Nodes", description: "Browse nodes (n)", value: "nodes" },
+  { name: "Edges", description: "Browse edges (e)", value: "edges" },
+  { name: "Stats", description: "Database stats (s)", value: "stats" },
+  { name: "Import/Export", description: "Import and export JSON (p)", value: "import" },
+];
+
+/** Wide enough for the longest tab name plus a space on each side. */
+const TAB_WIDTH = Math.max(...TABS.map((tab) => tab.name.length)) + 2;
 
 type InputTarget =
   | "openPath"
@@ -50,7 +61,7 @@ export function App() {
     items: [],
     hasMore: false,
   });
-  const [edgesPage, setEdgesPage] = createSignal<{ items: JsFullEdge[]; cursor?: string; nextCursor?: string; hasMore: boolean; total?: number }>({
+  const [edgesPage, setEdgesPage] = createSignal<{ items: FullEdge[]; cursor?: string; nextCursor?: string; hasMore: boolean; total?: number }>({
     items: [],
     hasMore: false,
   });
@@ -60,7 +71,7 @@ export function App() {
   const [selectedNodeIndex, setSelectedNodeIndex] = createSignal(0);
   const [selectedEdgeIndex, setSelectedEdgeIndex] = createSignal(0);
   const [selectedNodeId, setSelectedNodeId] = createSignal<number | null>(null);
-  const [selectedEdge, setSelectedEdge] = createSignal<JsFullEdge | null>(null);
+  const [selectedEdge, setSelectedEdge] = createSignal<FullEdge | null>(null);
 
   const [activeInput, setActiveInput] = createSignal<InputTarget>(null);
   const [statusMessage, setStatusMessage] = createSignal<string | null>(null);
@@ -442,10 +453,8 @@ export function App() {
     }
 
     if (key === "tab") {
-      const order: TabKey[] = ["nodes", "edges", "stats", "import"];
-      const index = order.indexOf(activeTab());
-      const next = order[(index + 1) % order.length] ?? "nodes";
-      setActiveTab(next);
+      const index = TABS.findIndex((tab) => tab.value === activeTab());
+      setActiveTab(TABS[(index + 1) % TABS.length].value);
       return;
     }
 
@@ -539,24 +548,31 @@ export function App() {
     setSelectedEdge(items[idx]);
   });
 
-  const tabs = ["Nodes", "Edges", "Stats", "Import/Export"];
+  let tabBar: TabSelectRenderable | undefined;
+  // <tab_select> takes no selected-tab prop; keep its selection on the active tab.
+  createEffect(() => {
+    const index = TABS.findIndex((tab) => tab.value === activeTab());
+    tabBar?.setSelectedIndex(index);
+  });
 
   return (
     <box flexDirection="column" height="100%" width="100%" padding={1} gap={1}>
-      <box borderStyle="rounded" padding={1} gap={2}>
-        <box flexDirection="column" gap={1} flexGrow={1}>
-          <text bold>KiteDB Explorer</text>
+      {/* Boxes shrink by default: the header and the status bar keep their size, the panes give. */}
+      <box flexDirection="row" flexShrink={0} borderStyle="rounded" padding={1} gap={2}>
+        {/* The first and last columns share the width the middle one leaves; long paths truncate. */}
+        <box flexDirection="column" gap={1} flexGrow={1} flexBasis={0}>
+          <text><b>KiteDB Explorer</b></text>
           <text fg={dbConnected() ? "green" : "yellow"}>
             {dbConnected() ? "Connected" : "No database"}
           </text>
-          <text>Path: {dbPath() ?? "-"}</text>
+          <text wrapMode="none" truncate>Path: {dbPath() ?? "-"}</text>
         </box>
-        <box flexDirection="column" gap={1}>
+        <box flexDirection="column" gap={1} flexShrink={0}>
           <text>Read-only: {dbReadOnly() ? "yes" : "no"}</text>
           <text>Nodes: {stats()?.snapshotNodes?.toString() ?? "-"}</text>
           <text>Edges: {stats()?.snapshotEdges?.toString() ?? "-"}</text>
         </box>
-        <box flexDirection="column" gap={1}>
+        <box flexDirection="column" gap={1} flexGrow={1} flexBasis={0}>
           <InputField label="Open path" value={openPath()} placeholder="(press o)" active={activeInput() === "openPath"} />
           <text fg={dbReadOnly() ? "yellow" : "green"}>
             {dbReadOnly() ? "Press w to unlock" : "Write enabled"}
@@ -565,19 +581,19 @@ export function App() {
         </box>
       </box>
 
-      <box flexGrow={1} gap={1}>
-        <box borderStyle="rounded" padding={1} width="26%" flexDirection="column" gap={1}>
-          <tab_select
-            items={tabs}
-            selected={tabs.indexOf(activeTab() === "nodes" ? "Nodes" : activeTab() === "edges" ? "Edges" : activeTab() === "stats" ? "Stats" : "Import/Export")}
-            onSelect={(index: number) => {
-              const next = index === 0 ? "nodes" : index === 1 ? "edges" : index === 2 ? "stats" : "import";
-              setActiveTab(next);
-            }}
-          />
+      {/* A clicked tab bar takes focus and moves its selection with the arrow keys: follow it. */}
+      <tab_select
+        ref={tabBar}
+        options={TABS}
+        tabWidth={TAB_WIDTH}
+        showDescription={false}
+        onChange={(index) => setActiveTab(TABS[index].value)}
+      />
 
+      <box flexDirection="row" flexGrow={1} gap={1}>
+        <box borderStyle="rounded" padding={1} width="26%" flexDirection="column" gap={1}>
           <box flexDirection="column" gap={1}>
-            <text bold>Filters</text>
+            <text><b>Filters</b></text>
             <FilterField label="Node prefix" value={nodeFilter()} active={activeInput() === "nodeFilter"} />
             <FilterField label="Edge type" value={edgeFilter()} active={activeInput() === "edgeFilter"} />
             <Show when={edgeFilterError()}>
@@ -586,7 +602,7 @@ export function App() {
           </box>
 
           <box flexDirection="column" gap={1}>
-            <text bold>Shortcuts</text>
+            <text><b>Shortcuts</b></text>
             <text>o open path</text>
             <text>c close db</text>
             <text>w unlock writes</text>
@@ -600,18 +616,15 @@ export function App() {
         <box borderStyle="rounded" padding={1} width="40%" flexDirection="column" gap={1}>
           <Show when={activeTab() === "nodes"}>
             <box flexDirection="column" gap={1}>
-              <text bold>Nodes (page {nodeHistory().length + 1})</text>
+              <text><b>Nodes (page {nodeHistory().length + 1})</b></text>
               <scrollbox flexGrow={1}>
-                <For each={nodesPage().items}>
+                <ListOrEmpty each={nodesPage().items} empty="No nodes on this page">
                   {(nodeId, index) => (
                     <text bg={index() === selectedNodeIndex() ? "cyan" : undefined} fg={index() === selectedNodeIndex() ? "black" : "white"}>
                       {nodeId.toString().padEnd(8)} {db.getNodeKey(nodeId) ?? "(no key)"}
                     </text>
                   )}
-                </For>
-                <Show when={nodesPage().items.length === 0}>
-                  <text fg="yellow">No nodes on this page</text>
-                </Show>
+                </ListOrEmpty>
               </scrollbox>
               <text>PageUp/PageDown to navigate</text>
             </box>
@@ -619,21 +632,18 @@ export function App() {
 
           <Show when={activeTab() === "edges"}>
             <box flexDirection="column" gap={1}>
-              <text bold>Edges (page {edgeHistory().length + 1})</text>
+              <text><b>Edges (page {edgeHistory().length + 1})</b></text>
               <scrollbox flexGrow={1}>
-                <For each={edgesPage().items}>
+                <ListOrEmpty each={edgesPage().items} empty="No edges on this page">
                   {(edge, index) => {
                     const name = db.getEdgeTypeName(edge.etype) ?? `#${edge.etype}`;
                     return (
                       <text bg={index() === selectedEdgeIndex() ? "cyan" : undefined} fg={index() === selectedEdgeIndex() ? "black" : "white"}>
-                        {edge.src} -[{name}]-&gt; {edge.dst}
+                        {`${edge.src} -[${name}]-> ${edge.dst}`}
                       </text>
                     );
                   }}
-                </For>
-                <Show when={edgesPage().items.length === 0}>
-                  <text fg="yellow">No edges on this page</text>
-                </Show>
+                </ListOrEmpty>
               </scrollbox>
               <text>PageUp/PageDown to navigate</text>
             </box>
@@ -641,7 +651,7 @@ export function App() {
 
           <Show when={activeTab() === "stats"}>
             <box flexDirection="column" gap={1}>
-              <text bold>Stats</text>
+              <text><b>Stats</b></text>
               <Show when={stats()} fallback={<text fg="yellow">No stats available</text>}>
                 {(current) => (
                   <box flexDirection="column" gap={1}>
@@ -655,14 +665,14 @@ export function App() {
                 )}
               </Show>
               <box flexDirection="column" gap={1}>
-                <text bold>Labels</text>
+                <text><b>Labels</b></text>
                 <For each={labels()}>{(name) => <text>- {name}</text>}</For>
                 <Show when={labels().length === 0}>
                   <text fg="yellow">No labels</text>
                 </Show>
               </box>
               <box flexDirection="column" gap={1}>
-                <text bold>Edge types</text>
+                <text><b>Edge types</b></text>
                 <For each={edgeTypes()}>{(name) => <text>- {name}</text>}</For>
                 <Show when={edgeTypes().length === 0}>
                   <text fg="yellow">No edge types</text>
@@ -673,7 +683,7 @@ export function App() {
 
           <Show when={activeTab() === "import"}>
             <box flexDirection="column" gap={1}>
-              <text bold>Import / Export</text>
+              <text><b>Import / Export</b></text>
               <text>Import (JSON):</text>
               <InputField label="Path" value={importPath()} active={activeInput() === "importPath"} />
               <text>Export:</text>
@@ -689,8 +699,8 @@ export function App() {
           </Show>
         </box>
 
-        <box borderStyle="rounded" padding={1} flexGrow={1} flexDirection="column" gap={1}>
-          <text bold>Details</text>
+        <box borderStyle="rounded" padding={1} flexGrow={1} flexBasis={0} flexDirection="column" gap={1}>
+          <text><b>Details</b></text>
           <Show when={activeTab() === "nodes" && selectedNodeDetail()}>
             {(detail) => (
               <scrollbox flexGrow={1}>
@@ -699,27 +709,18 @@ export function App() {
                 <text>Labels: {detail().labels.join(", ") || "-"}</text>
                 <text>Out degree: {detail().outDegree}</text>
                 <text>In degree: {detail().inDegree}</text>
-                <text bold>Props</text>
-                <For each={detail().props}>
+                <text><b>Props</b></text>
+                <ListOrEmpty each={detail().props} empty="No props">
                   {(prop) => <text>{prop.key}: {prop.value}</text>}
-                </For>
-                <Show when={detail().props.length === 0}>
-                  <text fg="yellow">No props</text>
-                </Show>
-                <text bold>Outgoing</text>
-                <For each={detail().outEdges}>
-                  {(edge) => <text>{edge.etypeName} -&gt; {edge.dst}</text>}
-                </For>
-                <Show when={detail().outEdges.length === 0}>
-                  <text fg="yellow">No outgoing edges</text>
-                </Show>
-                <text bold>Incoming</text>
-                <For each={detail().inEdges}>
-                  {(edge) => <text>{edge.src} -&gt; {edge.etypeName}</text>}
-                </For>
-                <Show when={detail().inEdges.length === 0}>
-                  <text fg="yellow">No incoming edges</text>
-                </Show>
+                </ListOrEmpty>
+                <text><b>Outgoing</b></text>
+                <ListOrEmpty each={detail().outEdges} empty="No outgoing edges">
+                  {(edge) => <text>{`${edge.etypeName} -> ${edge.dst}`}</text>}
+                </ListOrEmpty>
+                <text><b>Incoming</b></text>
+                <ListOrEmpty each={detail().inEdges} empty="No incoming edges">
+                  {(edge) => <text>{`${edge.src} -> ${edge.etypeName}`}</text>}
+                </ListOrEmpty>
               </scrollbox>
             )}
           </Show>
@@ -730,13 +731,10 @@ export function App() {
                 <text>Src: {detail().src}</text>
                 <text>Type: {detail().etypeName}</text>
                 <text>Dst: {detail().dst}</text>
-                <text bold>Props</text>
-                <For each={detail().props}>
+                <text><b>Props</b></text>
+                <ListOrEmpty each={detail().props} empty="No props">
                   {(prop) => <text>{prop.key}: {prop.value}</text>}
-                </For>
-                <Show when={detail().props.length === 0}>
-                  <text fg="yellow">No props</text>
-                </Show>
+                </ListOrEmpty>
               </scrollbox>
             )}
           </Show>
@@ -747,7 +745,7 @@ export function App() {
         </box>
       </box>
 
-      <box borderStyle="rounded" padding={1}>
+      <box flexDirection="row" flexShrink={0} borderStyle="rounded" padding={1}>
         <text>
           {statusMessage() ?? "Ready"}
         </text>
@@ -765,22 +763,46 @@ export function App() {
         </text>
       </box>
 
+      {/*
+        An absolute child of the full-screen root box, drawn over the panes. Not a <Portal>: that
+        mounts into the renderer's root, which stacks it below this full-height box, off screen.
+      */}
       <Show when={showUnlockConfirm()}>
-        <Portal>
-          <box
-            position="absolute"
-            top={4}
-            left={8}
-            width={50}
-            borderStyle="double"
-            padding={1}
-            bg="black"
-          >
-            <text bold fg="yellow">Unlock write mode?</text>
-            <text>Reopen the database with write access.</text>
-            <text>Press y to confirm, n to cancel.</text>
-          </box>
-        </Portal>
+        <box
+          position="absolute"
+          top={4}
+          left={8}
+          zIndex={1}
+          width={50}
+          borderStyle="double"
+          padding={1}
+          backgroundColor="black"
+        >
+          <text fg="yellow"><b>Unlock write mode?</b></text>
+          <text>Reopen the database with write access.</text>
+          <text>Press y to confirm, n to cancel.</text>
+        </box>
+      </Show>
+    </box>
+  );
+}
+
+/**
+ * A list, or a line saying it is empty, in a box of its own. @opentui/solid 0.1.77 mishandles a
+ * <For> or <Show> that shares its parent: directly in a <scrollbox> the children they drop stay on
+ * screen, and a <For> that was empty adds its items after the siblings that follow it. Here the
+ * only sibling after the <For> is the empty-state line, which goes as the items come.
+ */
+function ListOrEmpty<T>(props: {
+  each: readonly T[];
+  empty: string;
+  children: (item: T, index: Accessor<number>) => JSX.Element;
+}) {
+  return (
+    <box flexDirection="column">
+      <For each={props.each}>{props.children}</For>
+      <Show when={props.each.length === 0}>
+        <text fg="yellow">{props.empty}</text>
       </Show>
     </box>
   );
@@ -798,12 +820,11 @@ function FilterField(props: { label: string; value: string; active: boolean }) {
 }
 
 function InputField(props: { label: string; value: string; active: boolean; placeholder?: string }) {
-  const display = props.value || props.placeholder || "(empty)";
   return (
     <box flexDirection="row" gap={1}>
-      <text>{props.label}:</text>
-      <text bg={props.active ? "blue" : undefined} fg={props.active ? "white" : "gray"}>
-        {display}
+      <text flexShrink={0}>{props.label}:</text>
+      <text wrapMode="none" truncate bg={props.active ? "blue" : undefined} fg={props.active ? "white" : "gray"}>
+        {props.value || props.placeholder || "(empty)"}
       </text>
     </box>
   );
