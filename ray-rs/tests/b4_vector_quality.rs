@@ -208,21 +208,23 @@ fn check_results(
 // VQ1: IVF-PQ recall
 // ============================================================================
 
-/// Contract: the default `VectorIndex` (IVF-PQ) reaches recall@10 >= 0.9 on
-/// clustered 128-d data whose neighbors the coarse probe always finds.
+/// Contract: an IVF-PQ `VectorIndex` with the default PQ settings reaches
+/// recall@10 >= 0.9 on clustered 128-d data whose neighbors the coarse probe
+/// always finds. (IVF-PQ was the default backend when this was written; the
+/// default `Auto` now builds plain IVF at this size.)
 #[test]
-fn b4_vq1_default_vector_index_recall_at_10_128d() {
+fn b4_vq1_ivf_pq_vector_index_recall_at_10_128d() {
   let (vectors, blobs, mut rng) = dataset(0x0B4_0001);
   let queries = queries(&blobs, &mut rng);
-  let mut index = VectorIndex::new(VectorIndexOptions::new(DIMS));
+  let mut index =
+    VectorIndex::new(VectorIndexOptions::new(DIMS).with_ann_algorithm(AnnAlgorithm::IvfPq));
   for (node, vector) in vectors.iter().enumerate() {
     index.set(node as u64, vector).expect("set");
   }
   index.build_index().expect("build index");
-  assert!(
-    index.stats().index_trained,
-    "the default index should train"
-  );
+  let stats = index.stats();
+  assert!(stats.index_trained, "the index should train");
+  assert_eq!(stats.index_algorithm, Some(AnnAlgorithm::IvfPq));
 
   let mut found = 0usize;
   for query in &queries {
@@ -236,7 +238,7 @@ fn b4_vq1_default_vector_index_recall_at_10_128d() {
   let recall = found as f64 / (queries.len() * K) as f64;
   assert!(
     recall >= MIN_RECALL,
-    "default VectorIndex (IVF-PQ) recall@10 at 128 dims is {recall:.3} (< {MIN_RECALL}): \
+    "IVF-PQ VectorIndex recall@10 at 128 dims is {recall:.3} (< {MIN_RECALL}): \
      candidates are ranked by PQ distance only, with no exact re-rank"
   );
 }

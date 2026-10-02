@@ -34,11 +34,70 @@ const DEFAULT_PQ_CENTROIDS: usize = 256;
 /// lists approaches a full scan.
 const RETRAIN_GROWTH_FACTOR: usize = 4;
 
+/// `AnnAlgorithm::Auto` builds IVF-PQ when the index has at least this many
+/// dimensions...
+pub const AUTO_IVF_PQ_MIN_DIMENSIONS: usize = 512;
+/// ...and at least this many live vectors; plain IVF otherwise.
+///
+/// Measured at k=10 with 10 probes and the default re-rank: from 512
+/// dimensions and 50K vectors on, IVF-PQ searched about 2x faster than plain
+/// IVF (2.1-3.6x up to 1536-d/100K) at recall@10 0.84-0.96. Below that the
+/// speedup was 1.1-1.9x and uneven, while plain IVF stays exact and builds
+/// 3-20x faster.
+pub const AUTO_IVF_PQ_MIN_VECTORS: usize = 50_000;
+
+/// ANN backend for [`VectorIndex`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AnnAlgorithm {
+  /// Plain IVF: exact distances over the probed clusters.
   Ivf,
-  #[default]
+  /// IVF-PQ: PQ-ranked candidates, re-ranked by exact distance (see
+  /// [`IvfPqSearchOptions::rerank_factor`]).
   IvfPq,
+  /// Plain IVF while the index is small or low-dimensional, IVF-PQ from
+  /// [`AUTO_IVF_PQ_MIN_DIMENSIONS`] dimensions and [`AUTO_IVF_PQ_MIN_VECTORS`]
+  /// live vectors on. Decided at each build from the live count then. A
+  /// growing collection that crosses the threshold rebuilds as IVF-PQ on the
+  /// next search; one that shrinks keeps IVF-PQ until its next rebuild.
+  #[default]
+  Auto,
+}
+
+impl AnnAlgorithm {
+  /// The backend this setting builds for an index of `dimensions` with
+  /// `live_vectors` live vectors: `Ivf` or `IvfPq` (never `Auto`).
+  pub fn resolve(self, dimensions: usize, live_vectors: usize) -> AnnAlgorithm {
+    self.resolve_with(AutoPolicy::default(), dimensions, live_vectors)
+  }
+
+  fn resolve_with(self, policy: AutoPolicy, dimensions: usize, live_vectors: usize) -> Self {
+    match self {
+      AnnAlgorithm::Auto
+        if dimensions >= policy.min_dimensions && live_vectors >= policy.min_vectors =>
+      {
+        AnnAlgorithm::IvfPq
+      }
+      AnnAlgorithm::Auto => AnnAlgorithm::Ivf,
+      explicit => explicit,
+    }
+  }
+}
+
+/// Where `AnnAlgorithm::Auto` switches to IVF-PQ. Tests lower it so a small
+/// index can cross it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AutoPolicy {
+  min_dimensions: usize,
+  min_vectors: usize,
+}
+
+impl Default for AutoPolicy {
+  fn default() -> Self {
+    Self {
+      min_dimensions: AUTO_IVF_PQ_MIN_DIMENSIONS,
+      min_vectors: AUTO_IVF_PQ_MIN_VECTORS,
+    }
+  }
 }
 
 // ============================================================================
@@ -67,7 +126,8 @@ pub struct VectorIndexOptions {
   /// Has no effect. `VectorIndex` keeps no node cache; the option is still
   /// accepted so existing callers keep compiling.
   pub cache_max_size: usize,
-  /// ANN backend algorithm (default: IVF-PQ)
+  /// ANN backend algorithm (default: `Auto`, plain IVF for small or
+  /// low-dimensional indexes and IVF-PQ for large high-dimensional ones)
   pub ann_algorithm: AnnAlgorithm,
   /// PQ subspaces for IVF-PQ (default: 48)
   pub pq_subspaces: usize,
@@ -307,6 +367,9 @@ pub struct VectorIndexStats {
   pub index_trained: bool,
   /// Number of IVF clusters (if trained)
   pub index_clusters: Option<usize>,
+  /// Backend of the built ANN index, `Ivf` or `IvfPq` (None before one is
+  /// built, e.g. below the training threshold)
+  pub index_algorithm: Option<AnnAlgorithm>,
 }
 
 // ============================================================================
@@ -358,6 +421,13 @@ impl BuiltIndex {
     }
   }
 
+  fn algorithm(&self) -> AnnAlgorithm {
+    match self {
+      BuiltIndex::Ivf(_) => AnnAlgorithm::Ivf,
+      BuiltIndex::IvfPq(_) => AnnAlgorithm::IvfPq,
+    }
+  }
+
   /// Remove a vector from the ANN index (a no-op until trained).
   fn delete(&mut self, vector_id: u64, vector: &[f32]) -> Result<bool, VectorIndexError> {
     match self {
@@ -384,6 +454,8 @@ pub struct VectorIndex {
   trained_live_count: usize,
   /// Whether index build is in progress
   is_building: bool,
+  /// Where `AnnAlgorithm::Auto` switches to IVF-PQ
+  auto_policy: AutoPolicy,
 }
 
 impl VectorIndex {
@@ -404,6 +476,7 @@ impl VectorIndex {
       needs_training: true,
       trained_live_count: 0,
       is_building: false,
+      auto_policy: AutoPolicy::default(),
     }
   }
 
@@ -459,12 +532,20 @@ impl VectorIndex {
             return Err(err);
           }
         }
-        // Retrain on the next search once the corpus has outgrown the index.
+        // Retrain on the next search once the corpus has outgrown the
+        // index, or (`Auto`) has grown from plain IVF into IVF-PQ. Only
+        // growth switches: a shrinking index keeps its backend until its next
+        // rebuild, so churn around the threshold cannot rebuild it over and
+        // over.
+        let live = self.manifest.live_count();
         let retrain_at = self
           .trained_live_count
           .max(1)
           .saturating_mul(RETRAIN_GROWTH_FACTOR);
-        if self.manifest.live_count() >= retrain_at {
+        let grew_into_ivf_pq = self.index.as_ref().map(BuiltIndex::algorithm)
+          == Some(AnnAlgorithm::Ivf)
+          && self.resolved_algorithm(live) == AnnAlgorithm::IvfPq;
+        if live >= retrain_at || grew_into_ivf_pq {
           self.needs_training = true;
         }
       } else {
@@ -556,8 +637,9 @@ impl VectorIndex {
     }
     let unit_vectors = self.manifest.config.normalize_on_insert;
 
-    // Create and train the configured ANN index.
-    let built = match self.options.ann_algorithm {
+    // Create and train the configured ANN index. `Auto` resolves to `Ivf` or
+    // `IvfPq` by size here, so the last arm only ever sees `IvfPq`.
+    let built = match self.resolved_algorithm(vector_ids.len()) {
       AnnAlgorithm::Ivf => {
         let mut ivf_config = IvfConfig::new(n_clusters)
           .with_n_probe(self.options.n_probe)
@@ -577,7 +659,7 @@ impl VectorIndex {
         }
         BuiltIndex::Ivf(index)
       }
-      AnnAlgorithm::IvfPq => {
+      AnnAlgorithm::IvfPq | AnnAlgorithm::Auto => {
         let pq_subspaces = resolve_pq_subspaces(self.options.pq_subspaces, dimensions);
         let pq_centroids = self.options.pq_centroids.max(2).min(live_vectors.max(2));
         let mut ivf_pq_config = IvfPqConfig::new()
@@ -771,6 +853,14 @@ impl VectorIndex {
       .collect()
   }
 
+  /// The backend a build with `live_vectors` live vectors uses.
+  fn resolved_algorithm(&self, live_vectors: usize) -> AnnAlgorithm {
+    self
+      .options
+      .ann_algorithm
+      .resolve_with(self.auto_policy, self.options.dimensions, live_vectors)
+  }
+
   /// Get index statistics
   pub fn stats(&self) -> VectorIndexStats {
     let store_stats = vector_store_stats(&self.manifest);
@@ -785,6 +875,7 @@ impl VectorIndex {
         .map(BuiltIndex::trained)
         .unwrap_or(false),
       index_clusters: self.index.as_ref().map(BuiltIndex::n_clusters),
+      index_algorithm: self.index.as_ref().map(BuiltIndex::algorithm),
     }
   }
 
@@ -950,7 +1041,7 @@ mod tests {
     assert_eq!(opts.metric, DistanceMetric::Cosine);
     assert!(opts.normalize);
     assert_eq!(opts.training_threshold, DEFAULT_TRAINING_THRESHOLD);
-    assert_eq!(opts.ann_algorithm, AnnAlgorithm::IvfPq);
+    assert_eq!(opts.ann_algorithm, AnnAlgorithm::Auto);
     assert_eq!(opts.pq_subspaces, DEFAULT_PQ_SUBSPACES);
     assert_eq!(opts.pq_centroids, DEFAULT_PQ_CENTROIDS);
     assert!(!opts.pq_residuals);
@@ -1218,6 +1309,174 @@ mod tests {
     assert_eq!(resolve_pq_subspaces(48, 5), 5);
     assert_eq!(resolve_pq_subspaces(0, 12), 1);
     assert_eq!(resolve_pq_subspaces(48, 0), 1);
+  }
+
+  // ==========================================================================
+  // AnnAlgorithm::Auto
+  // ==========================================================================
+
+  /// `n` vectors of `dims` around 20 well-separated centers (deterministic).
+  fn auto_vectors(n: usize, dims: usize, seed: u64) -> Vec<Vec<f32>> {
+    let mut state = seed;
+    let mut next = move || {
+      state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+      let mut z = state;
+      z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+      z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+      ((z ^ (z >> 31)) >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+    };
+    let centers: Vec<Vec<f32>> = (0..20)
+      .map(|_| (0..dims).map(|_| 8.0 * next()).collect())
+      .collect();
+    (0..n)
+      .map(|i| centers[i % 20].iter().map(|&c| c + next()).collect())
+      .collect()
+  }
+
+  /// An Euclidean index (raw vectors, so distances are easy to check).
+  fn auto_index(dims: usize, algorithm: AnnAlgorithm, policy: Option<AutoPolicy>) -> VectorIndex {
+    let mut index = VectorIndex::new(
+      VectorIndexOptions::new(dims)
+        .with_metric(DistanceMetric::Euclidean)
+        .with_ann_algorithm(algorithm)
+        .with_seed(3),
+    );
+    if let Some(policy) = policy {
+      index.auto_policy = policy;
+    }
+    index
+  }
+
+  fn set_all(index: &mut VectorIndex, vectors: &[Vec<f32>], first_node: usize) {
+    for (offset, vector) in vectors.iter().enumerate() {
+      index
+        .set((first_node + offset) as NodeId, vector)
+        .expect("set");
+    }
+  }
+
+  /// Searches with every stored vector of `probe` as the query: each must
+  /// find itself first at distance 0, and every hit must carry its exact
+  /// Euclidean distance.
+  fn assert_search_correct(index: &mut VectorIndex, all: &[Vec<f32>], probe: &[usize]) {
+    for &node in probe {
+      let hits = index
+        .search(&all[node], SimilarOptions::new(5))
+        .expect("search");
+      assert_eq!(hits.first().map(|hit| hit.node_id), Some(node as NodeId));
+      for hit in &hits {
+        let exact = crate::vector::euclidean_distance(&all[node], &all[hit.node_id as usize]);
+        assert!(
+          (hit.distance - exact).abs() <= 1e-4 * exact.max(1.0),
+          "node {node}: hit {} distance {} is not exact ({exact})",
+          hit.node_id,
+          hit.distance
+        );
+      }
+    }
+  }
+
+  const LOW: AutoPolicy = AutoPolicy {
+    min_dimensions: 16,
+    min_vectors: 3000,
+  };
+
+  #[test]
+  fn test_auto_resolution_rule() {
+    let auto = AnnAlgorithm::Auto;
+    assert_eq!(VectorIndexOptions::new(8).ann_algorithm, auto);
+    assert_eq!(auto.resolve(128, 10_000_000), AnnAlgorithm::Ivf);
+    assert_eq!(auto.resolve(511, 10_000_000), AnnAlgorithm::Ivf);
+    assert_eq!(auto.resolve(768, 49_999), AnnAlgorithm::Ivf);
+    assert_eq!(auto.resolve(512, 50_000), AnnAlgorithm::IvfPq);
+    assert_eq!(auto.resolve(1536, 1_000_000), AnnAlgorithm::IvfPq);
+    assert_eq!(
+      AnnAlgorithm::Ivf.resolve(1536, 1_000_000),
+      AnnAlgorithm::Ivf
+    );
+    assert_eq!(AnnAlgorithm::IvfPq.resolve(4, 10), AnnAlgorithm::IvfPq);
+  }
+
+  #[test]
+  fn test_auto_small_index_builds_ivf_with_exact_distances() {
+    let vectors = auto_vectors(2000, 32, 1);
+    let mut index = auto_index(32, AnnAlgorithm::Auto, None);
+    set_all(&mut index, &vectors, 0);
+    index.build_index().expect("build");
+    assert_eq!(index.stats().index_algorithm, Some(AnnAlgorithm::Ivf));
+    assert_search_correct(&mut index, &vectors, &[0, 7, 1999]);
+  }
+
+  #[test]
+  fn test_auto_large_index_builds_ivf_pq() {
+    let vectors = auto_vectors(3000, 16, 2);
+    let mut index = auto_index(16, AnnAlgorithm::Auto, Some(LOW));
+    set_all(&mut index, &vectors, 0);
+    index.build_index().expect("build");
+    assert_eq!(index.stats().index_algorithm, Some(AnnAlgorithm::IvfPq));
+    assert_search_correct(&mut index, &vectors, &[0, 7, 2999]);
+  }
+
+  #[test]
+  fn test_auto_switches_to_ivf_pq_when_growth_crosses_the_threshold() {
+    let vectors = auto_vectors(3000, 16, 4);
+    let mut index = auto_index(16, AnnAlgorithm::Auto, Some(LOW));
+    set_all(&mut index, &vectors[..2000], 0);
+    assert_search_correct(&mut index, &vectors, &[0, 1999]);
+    assert_eq!(index.stats().index_algorithm, Some(AnnAlgorithm::Ivf));
+
+    // Up to one short of the threshold (and short of 4x growth) the IVF
+    // index takes the inserts.
+    set_all(&mut index, &vectors[2000..2999], 2000);
+    assert_search_correct(&mut index, &vectors, &[2998]);
+    assert_eq!(index.stats().index_algorithm, Some(AnnAlgorithm::Ivf));
+
+    // The insert that reaches it rebuilds the index as IVF-PQ on the next
+    // search, and old and new vectors are all found.
+    set_all(&mut index, &vectors[2999..], 2999);
+    assert_eq!(index.stats().index_algorithm, Some(AnnAlgorithm::Ivf));
+    assert_search_correct(&mut index, &vectors, &[0, 1999, 2500, 2999]);
+    let stats = index.stats();
+    assert_eq!(stats.index_algorithm, Some(AnnAlgorithm::IvfPq));
+    assert_eq!(stats.live_vectors, 3000);
+  }
+
+  #[test]
+  fn test_auto_shrinking_index_keeps_ivf_pq_until_its_next_rebuild() {
+    let vectors = auto_vectors(3000, 16, 5);
+    let mut index = auto_index(16, AnnAlgorithm::Auto, Some(LOW));
+    set_all(&mut index, &vectors, 0);
+    index.build_index().expect("build");
+    assert_eq!(index.stats().index_algorithm, Some(AnnAlgorithm::IvfPq));
+
+    // Below the threshold again: deletes and a re-insert do not rebuild.
+    for node in 2900..3000 {
+      assert!(index.delete(node as NodeId).expect("delete"));
+    }
+    index.set(2950, &vectors[2950]).expect("set");
+    assert_search_correct(&mut index, &vectors, &[0, 2950]);
+    assert_eq!(index.stats().index_algorithm, Some(AnnAlgorithm::IvfPq));
+
+    // An explicit rebuild picks by size again.
+    index.build_index().expect("build");
+    assert_eq!(index.stats().index_algorithm, Some(AnnAlgorithm::Ivf));
+    assert_search_correct(&mut index, &vectors, &[0, 2950]);
+  }
+
+  #[test]
+  fn test_explicit_ann_algorithm_overrides_auto() {
+    let vectors = auto_vectors(3000, 16, 6);
+    // Auto would pick IVF-PQ here; Ivf forces plain IVF.
+    let mut ivf = auto_index(16, AnnAlgorithm::Ivf, Some(LOW));
+    set_all(&mut ivf, &vectors, 0);
+    ivf.build_index().expect("build");
+    assert_eq!(ivf.stats().index_algorithm, Some(AnnAlgorithm::Ivf));
+    // Auto would pick IVF here; IvfPq forces IVF-PQ.
+    let mut ivf_pq = auto_index(16, AnnAlgorithm::IvfPq, None);
+    set_all(&mut ivf_pq, &vectors, 0);
+    ivf_pq.build_index().expect("build");
+    assert_eq!(ivf_pq.stats().index_algorithm, Some(AnnAlgorithm::IvfPq));
+    assert_search_correct(&mut ivf_pq, &vectors, &[0, 2999]);
   }
 
   #[test]
