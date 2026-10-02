@@ -1677,10 +1677,12 @@ export {
   createOfflineBackup,
   createOfflineBackupAsync,
   collectMetrics,
+  collectReplicationLogTransport,
   collectReplicationLogTransportJson,
   collectReplicationMetricsOtelJson,
   collectReplicationMetricsOtelProtobuf,
   collectReplicationMetricsPrometheus,
+  collectReplicationSnapshotTransport,
   collectReplicationSnapshotTransportJson,
   pushReplicationMetricsOtelJson,
   pushReplicationMetricsOtelJsonAsync,
@@ -1708,6 +1710,8 @@ export {
   createReplicationAdminAuthorizer,
   createNodeTlsMtlsMatcher,
   createReplicationTransportAdapter,
+  exportReplicationLogTransport,
+  exportReplicationSnapshotTransport,
   isForwardedTlsClientAuthorized,
   isReplicationAdminAuthorized,
   isNodeTlsClientAuthorized,
@@ -1726,8 +1730,11 @@ export type {
   ReplicationLogTransportFrame,
   ReplicationLogTransportOptions,
   ReplicationLogTransportPage,
+  ReplicationLogTransportPageBinary,
   ReplicationSnapshotTransport,
+  ReplicationSnapshotTransportBinary,
   ReplicationTransportAdapter,
+  ReplicationTransportSource,
 } from './replication_transport'
 
 // Re-export common types with clean names

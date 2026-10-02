@@ -34,6 +34,9 @@ use crate::replication::primary::{
   PrimaryReplicationStatus, PrimaryRetentionOutcome, ReplicaLagStatus,
 };
 use crate::replication::replica::ReplicaReplicationStatus;
+use crate::replication::transport::{
+  format_generation, parse_transport_cursor, LogTransportFrame, LogTransportPage, SnapshotTransport,
+};
 use crate::replication::types::{CommitToken, ReplicationRole as RustReplicationRole};
 use crate::streaming;
 use crate::types::{
@@ -851,6 +854,187 @@ pub struct JsReplicaReplicationStatus {
 pub struct JsPrimaryRetentionOutcome {
   pub pruned_segments: i64,
   pub retained_floor: i64,
+}
+
+/// A replication snapshot export with the data as raw bytes (see
+/// `exportReplicationSnapshotTransportJson` for the JSON form).
+#[napi(object)]
+pub struct JsReplicationSnapshotTransport {
+  /// `single-file-db-copy`: the data is a copy of the database file.
+  pub format: String,
+  pub byte_length: i64,
+  /// CRC-32 (IEEE) of the data.
+  pub checksum_crc32: u32,
+  pub generated_at_ms: i64,
+  pub epoch: i64,
+  /// The copy holds every commit up to this log index, and none after it.
+  pub head_log_index: i64,
+  pub retained_floor: i64,
+  /// The sidecar log history `startCursor` belongs to (16 hex digits). Log
+  /// pages from another generation come from a recreated sidecar: reseed.
+  pub generation: String,
+  /// Pull the log from here: right after the snapshot's head frame.
+  pub start_cursor: String,
+  /// The database file copy, when requested.
+  pub data: Option<Buffer>,
+}
+
+/// One frame of a replication log page.
+#[napi(object)]
+pub struct JsReplicationLogTransportFrame {
+  pub epoch: i64,
+  pub log_index: i64,
+  pub segment_id: i64,
+  pub segment_offset: i64,
+  /// Size of the frame in its segment, header included.
+  pub bytes: i64,
+  /// The frame payload, when requested.
+  pub payload: Option<Buffer>,
+}
+
+/// A page of replication log frames with raw payloads (see
+/// `exportReplicationLogTransportJson` for the JSON form).
+#[napi(object)]
+pub struct JsReplicationLogTransportPage {
+  pub epoch: i64,
+  pub head_log_index: i64,
+  pub retained_floor: i64,
+  /// The sidecar log history (16 hex digits); a change means the sidecar was
+  /// recreated and a replica must reseed.
+  pub generation: String,
+  pub cursor: Option<String>,
+  pub next_cursor: Option<String>,
+  pub eof: bool,
+  pub frame_count: i64,
+  pub total_bytes: i64,
+  pub frames: Vec<JsReplicationLogTransportFrame>,
+}
+
+impl From<SnapshotTransport> for JsReplicationSnapshotTransport {
+  fn from(value: SnapshotTransport) -> Self {
+    Self {
+      format: value.format.to_string(),
+      byte_length: value.byte_length as i64,
+      checksum_crc32: value.checksum_crc32,
+      generated_at_ms: value.generated_at_ms as i64,
+      epoch: value.epoch as i64,
+      head_log_index: value.head_log_index as i64,
+      retained_floor: value.retained_floor as i64,
+      generation: format_generation(value.generation),
+      start_cursor: value.start_cursor.to_string(),
+      data: value.data.map(Buffer::from),
+    }
+  }
+}
+
+impl From<LogTransportFrame> for JsReplicationLogTransportFrame {
+  fn from(value: LogTransportFrame) -> Self {
+    Self {
+      epoch: value.epoch as i64,
+      log_index: value.log_index as i64,
+      segment_id: value.segment_id as i64,
+      segment_offset: value.segment_offset as i64,
+      bytes: value.bytes as i64,
+      payload: value.payload.map(Buffer::from),
+    }
+  }
+}
+
+impl From<LogTransportPage> for JsReplicationLogTransportPage {
+  fn from(value: LogTransportPage) -> Self {
+    Self {
+      epoch: value.epoch as i64,
+      head_log_index: value.head_log_index as i64,
+      retained_floor: value.retained_floor as i64,
+      generation: format_generation(value.generation),
+      cursor: value.cursor.map(|cursor| cursor.to_string()),
+      next_cursor: value.next_cursor.map(|cursor| cursor.to_string()),
+      eof: value.eof,
+      frame_count: value.frames.len() as i64,
+      total_bytes: value.total_bytes as i64,
+      frames: value.frames.into_iter().map(Into::into).collect(),
+    }
+  }
+}
+
+/// Validated `maxFrames` / `maxBytes` of a log export (defaults 128 and 1 MiB).
+fn log_transport_limits(max_frames: Option<i64>, max_bytes: Option<i64>) -> Result<(usize, usize)> {
+  let max_frames = validation::positive_usize(
+    "maxFrames",
+    max_frames.unwrap_or(128),
+    validation::MAX_COUNT,
+  )?;
+  let max_bytes = validation::positive_usize(
+    "maxBytes",
+    max_bytes.unwrap_or(1_048_576),
+    validation::MAX_BYTES,
+  )?;
+  Ok((max_frames, max_bytes))
+}
+
+fn snapshot_export_error(e: impl std::fmt::Display) -> Error {
+  Error::from_reason(format!("Failed to export replication snapshot: {e}"))
+}
+
+fn log_export_error(e: impl std::fmt::Display) -> Error {
+  Error::from_reason(format!("Failed to export replication log: {e}"))
+}
+
+/// Snapshot export as transport JSON (shared by Database, Kite and the free function).
+pub(crate) fn snapshot_transport_json(
+  db: &RustSingleFileDB,
+  include_data: Option<bool>,
+) -> Result<String> {
+  db.primary_export_snapshot_transport_json(include_data.unwrap_or(false))
+    .map_err(snapshot_export_error)
+}
+
+/// Snapshot export with raw bytes.
+pub(crate) fn snapshot_transport(
+  db: &RustSingleFileDB,
+  include_data: Option<bool>,
+) -> Result<JsReplicationSnapshotTransport> {
+  db.primary_export_snapshot_transport(include_data.unwrap_or(false))
+    .map(Into::into)
+    .map_err(snapshot_export_error)
+}
+
+/// Log page export as transport JSON.
+pub(crate) fn log_transport_json(
+  db: &RustSingleFileDB,
+  cursor: Option<String>,
+  max_frames: Option<i64>,
+  max_bytes: Option<i64>,
+  include_payload: Option<bool>,
+) -> Result<String> {
+  let (max_frames, max_bytes) = log_transport_limits(max_frames, max_bytes)?;
+  db.primary_export_log_transport_json(
+    cursor.as_deref(),
+    max_frames,
+    max_bytes,
+    include_payload.unwrap_or(true),
+  )
+  .map_err(log_export_error)
+}
+
+/// Log page export with raw payloads.
+pub(crate) fn log_transport(
+  db: &RustSingleFileDB,
+  cursor: Option<String>,
+  max_frames: Option<i64>,
+  max_bytes: Option<i64>,
+  include_payload: Option<bool>,
+) -> Result<JsReplicationLogTransportPage> {
+  let (max_frames, max_bytes) = log_transport_limits(max_frames, max_bytes)?;
+  let cursor = parse_transport_cursor(cursor.as_deref()).map_err(log_export_error)?;
+  db.primary_export_log_transport(
+    cursor,
+    max_frames,
+    max_bytes,
+    include_payload.unwrap_or(true),
+  )
+  .map(Into::into)
+  .map_err(log_export_error)
 }
 
 impl From<ReplicaLagStatus> for JsReplicaLagStatus {
@@ -1957,16 +2141,40 @@ impl Database {
     }
   }
 
-  /// Export latest primary snapshot metadata and optional bytes as transport JSON.
+  /// Forget a replica's reported progress, so a decommissioned replica stops
+  /// holding back retention. Returns whether it had progress recorded.
+  #[napi]
+  pub fn primary_remove_replica_progress(&self, replica_id: String) -> Result<bool> {
+    match self.inner.as_ref() {
+      Some(DatabaseInner::SingleFile(db)) => db
+        .primary_remove_replica_progress(&replica_id)
+        .map_err(|e| Error::from_reason(format!("Failed to remove replica progress: {e}"))),
+      None => Err(Error::from_reason("Database is closed")),
+    }
+  }
+
+  /// Export a consistent snapshot (metadata, and the database file copy when
+  /// includeData, up to 32 MiB) as transport JSON, with the data in base64.
   #[napi]
   pub fn export_replication_snapshot_transport_json(
     &self,
     include_data: Option<bool>,
   ) -> Result<String> {
     match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => db
-        .primary_export_snapshot_transport_json(include_data.unwrap_or(false))
-        .map_err(|e| Error::from_reason(format!("Failed to export replication snapshot: {e}"))),
+      Some(DatabaseInner::SingleFile(db)) => snapshot_transport_json(db, include_data),
+      None => Err(Error::from_reason("Database is closed")),
+    }
+  }
+
+  /// Export a consistent snapshot with the database file copy (when
+  /// includeData, up to 1 GiB) as a Buffer.
+  #[napi]
+  pub fn export_replication_snapshot_transport(
+    &self,
+    include_data: Option<bool>,
+  ) -> Result<JsReplicationSnapshotTransport> {
+    match self.inner.as_ref() {
+      Some(DatabaseInner::SingleFile(db)) => snapshot_transport(db, include_data),
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -1980,20 +2188,27 @@ impl Database {
     max_bytes: Option<i64>,
     include_payload: Option<bool>,
   ) -> Result<String> {
-    let max_frames = max_frames.unwrap_or(128);
-    let max_bytes = max_bytes.unwrap_or(1_048_576);
-    let max_frames = validation::positive_usize("maxFrames", max_frames, validation::MAX_COUNT)?;
-    let max_bytes = validation::positive_usize("maxBytes", max_bytes, validation::MAX_BYTES)?;
-
     match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => db
-        .primary_export_log_transport_json(
-          cursor.as_deref(),
-          max_frames,
-          max_bytes,
-          include_payload.unwrap_or(true),
-        )
-        .map_err(|e| Error::from_reason(format!("Failed to export replication log: {e}"))),
+      Some(DatabaseInner::SingleFile(db)) => {
+        log_transport_json(db, cursor, max_frames, max_bytes, include_payload)
+      }
+      None => Err(Error::from_reason("Database is closed")),
+    }
+  }
+
+  /// Export primary replication log page (cursor + limits) with payloads as Buffers.
+  #[napi]
+  pub fn export_replication_log_transport(
+    &self,
+    cursor: Option<String>,
+    max_frames: Option<i64>,
+    max_bytes: Option<i64>,
+    include_payload: Option<bool>,
+  ) -> Result<JsReplicationLogTransportPage> {
+    match self.inner.as_ref() {
+      Some(DatabaseInner::SingleFile(db)) => {
+        log_transport(db, cursor, max_frames, max_bytes, include_payload)
+      }
       None => Err(Error::from_reason("Database is closed")),
     }
   }
@@ -4244,9 +4459,18 @@ pub fn collect_replication_snapshot_transport_json(
   include_data: Option<bool>,
 ) -> Result<String> {
   match db.inner.as_ref() {
-    Some(DatabaseInner::SingleFile(db)) => db
-      .primary_export_snapshot_transport_json(include_data.unwrap_or(false))
-      .map_err(|e| Error::from_reason(format!("Failed to export replication snapshot: {e}"))),
+    Some(DatabaseInner::SingleFile(db)) => snapshot_transport_json(db, include_data),
+    None => Err(Error::from_reason("Database is closed")),
+  }
+}
+
+#[napi]
+pub fn collect_replication_snapshot_transport(
+  db: &Database,
+  include_data: Option<bool>,
+) -> Result<JsReplicationSnapshotTransport> {
+  match db.inner.as_ref() {
+    Some(DatabaseInner::SingleFile(db)) => snapshot_transport(db, include_data),
     None => Err(Error::from_reason("Database is closed")),
   }
 }
@@ -4259,20 +4483,26 @@ pub fn collect_replication_log_transport_json(
   max_bytes: Option<i64>,
   include_payload: Option<bool>,
 ) -> Result<String> {
-  let max_frames = max_frames.unwrap_or(128);
-  let max_bytes = max_bytes.unwrap_or(1_048_576);
-  let max_frames = validation::positive_usize("maxFrames", max_frames, validation::MAX_COUNT)?;
-  let max_bytes = validation::positive_usize("maxBytes", max_bytes, validation::MAX_BYTES)?;
-
   match db.inner.as_ref() {
-    Some(DatabaseInner::SingleFile(db)) => db
-      .primary_export_log_transport_json(
-        cursor.as_deref(),
-        max_frames,
-        max_bytes,
-        include_payload.unwrap_or(true),
-      )
-      .map_err(|e| Error::from_reason(format!("Failed to export replication log: {e}"))),
+    Some(DatabaseInner::SingleFile(db)) => {
+      log_transport_json(db, cursor, max_frames, max_bytes, include_payload)
+    }
+    None => Err(Error::from_reason("Database is closed")),
+  }
+}
+
+#[napi]
+pub fn collect_replication_log_transport(
+  db: &Database,
+  cursor: Option<String>,
+  max_frames: Option<i64>,
+  max_bytes: Option<i64>,
+  include_payload: Option<bool>,
+) -> Result<JsReplicationLogTransportPage> {
+  match db.inner.as_ref() {
+    Some(DatabaseInner::SingleFile(db)) => {
+      log_transport(db, cursor, max_frames, max_bytes, include_payload)
+    }
     None => Err(Error::from_reason("Database is closed")),
   }
 }

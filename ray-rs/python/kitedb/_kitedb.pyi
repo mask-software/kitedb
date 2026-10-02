@@ -588,8 +588,33 @@ class Database:
     def primary_report_replica_progress(
         self, replica_id: str, epoch: int, applied_log_index: int
     ) -> None: ...
+    def primary_remove_replica_progress(self, replica_id: str) -> bool:
+        """Forget a replica's progress so it no longer holds back retention.
+
+        Returns whether the replica had progress recorded.
+        """
+        ...
     def primary_run_retention(self) -> Tuple[int, int]: ...
+    def export_replication_snapshot_transport(self, include_data: bool = False) -> Dict[str, Any]:
+        """A consistent snapshot: format, byte_length, checksum_crc32 (int),
+        generated_at_ms, epoch, head_log_index, retained_floor, generation (16 hex
+        digits), start_cursor (pull the log from here), and data (the database
+        file copy as bytes, up to 1 GiB, or None)."""
+        ...
     def export_replication_snapshot_transport_json(self, include_data: bool = False) -> str: ...
+    def export_replication_log_transport(
+        self,
+        cursor: Optional[str] = None,
+        max_frames: int = 128,
+        max_bytes: int = 1048576,
+        include_payload: bool = True,
+    ) -> Dict[str, Any]:
+        """A log page after `cursor`: epoch, head_log_index, retained_floor,
+        generation (16 hex digits; a change means the sidecar was recreated),
+        cursor, next_cursor, eof, frame_count, total_bytes, and frames (each with
+        epoch, log_index, segment_id, segment_offset, bytes, and payload as bytes
+        or None)."""
+        ...
     def export_replication_log_transport_json(
         self,
         cursor: Optional[str] = None,
@@ -793,10 +818,21 @@ def recommended_safe_profile() -> RuntimeProfile: ...
 def recommended_balanced_profile() -> RuntimeProfile: ...
 def recommended_reopen_heavy_profile() -> RuntimeProfile: ...
 def collect_metrics(db: Database) -> DatabaseMetrics: ...
+def collect_replication_snapshot_transport(
+    db: Database,
+    include_data: bool = False,
+) -> Dict[str, Any]: ...
 def collect_replication_snapshot_transport_json(
     db: Database,
     include_data: bool = False,
 ) -> str: ...
+def collect_replication_log_transport(
+    db: Database,
+    cursor: Optional[str] = None,
+    max_frames: int = 128,
+    max_bytes: int = 1048576,
+    include_payload: bool = True,
+) -> Dict[str, Any]: ...
 def collect_replication_log_transport_json(
     db: Database,
     cursor: Optional[str] = None,

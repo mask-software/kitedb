@@ -13,7 +13,8 @@ pub use database::{
   restore_backup, BackupOptions, BackupResult, CacheLayerMetrics, CacheMetrics, CheckResult,
   CompressionOptions, DataMetrics, Database, DatabaseMetrics, DbStats, EdgePage, EdgeWithProps,
   HealthCheckEntry, HealthCheckResult, JsCompressionType, JsEdge, JsFullEdge, JsFullEdgeInput,
-  JsNodeProp, JsPropValue, MemoryMetrics, MvccMetrics, MvccStats, NodePage, NodeWithProps,
+  JsNodeProp, JsPropValue, JsReplicationLogTransportFrame, JsReplicationLogTransportPage,
+  JsReplicationSnapshotTransport, MemoryMetrics, MvccMetrics, MvccStats, NodePage, NodeWithProps,
   OfflineBackupOptions, OpenOptions, PaginationOptions, PropType, RestoreOptions,
   SingleFileOptimizeOptions, StreamOptions, VacuumOptions,
 };

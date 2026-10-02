@@ -57,7 +57,8 @@ test('binary snapshot transport matches the JSON export and has no db_path', (t)
 
   const binary = primary.exportReplicationSnapshotTransport(true)
   t.true(Buffer.isBuffer(binary.data))
-  t.deepEqual(binary.data, Buffer.from(json.data_base64, 'base64'))
+  // Buffer.equals: ava's deepEqual walks a multi-MB buffer byte by byte.
+  t.true(binary.data!.equals(Buffer.from(json.data_base64, 'base64')))
   t.is(binary.byteLength, json.byte_length)
   t.is(binary.checksumCrc32.toString(16).padStart(8, '0'), json.checksum_crc32c)
   t.is(binary.headLogIndex, 3)
@@ -128,13 +129,15 @@ test('Kite exports the replication transports and works with the TS adapter', (t
   })
   t.teardown(() => db.close())
   for (let i = 0; i < 3; i += 1) {
-    db.insert(File).values({ key: `f${i}`, path: `src/f${i}.ts` }).returning()
+    db.insert(File)
+      .values({ key: `f${i}`, path: `src/f${i}.ts` })
+      .returning()
   }
 
   const json = JSON.parse(db.exportReplicationSnapshotTransportJson(true))
   t.is(json.head_log_index, db.primaryReplicationStatus()!.headLogIndex)
   const binary = db.exportReplicationSnapshotTransport(true)
-  t.deepEqual(binary.data, Buffer.from(json.data_base64, 'base64'))
+  t.true(binary.data!.equals(Buffer.from(json.data_base64, 'base64')))
 
   const log = db.exportReplicationLogTransport(null, 64, 1 << 20, true)
   const logJson = JSON.parse(db.exportReplicationLogTransportJson(null, 64, 1 << 20, true))
@@ -146,7 +149,7 @@ test('Kite exports the replication transports and works with the TS adapter', (t
   t.false('db_path' in snapshot)
   t.is(snapshot.generation, binary.generation)
   t.is(snapshot.start_cursor, binary.startCursor)
-  t.deepEqual(Buffer.from(snapshot.data_base64!, 'base64'), binary.data)
+  t.true(Buffer.from(snapshot.data_base64!, 'base64').equals(binary.data!))
   const adapterLog = adapter.log({ includePayload: true })
   t.is(adapterLog.generation, log.generation)
   t.is(adapterLog.frame_count, log.frames.length)
