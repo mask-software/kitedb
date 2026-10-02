@@ -13,8 +13,9 @@
 //! Included from checkpoint.rs, so its test hooks are in scope. The randomized
 //! crash-image stress test runs one short round by default; `SCRATCH_ITERS`,
 //! `SCRATCH_MS`, `SCRATCH_CHAOS` (e.g. `bg,cp,opt,vac`), `SCRATCH_MODE`
-//! (`ro`/`rw`), `SCRATCH_MVCC`, `SCRATCH_GROUP`, `SCRATCH_BLOCKING`, and
-//! `SCRATCH_WAL_KIB` tune it. The two large-database measurements are
+//! (`ro`/`rw`), `SCRATCH_MVCC` (`0` runs it without MVCC; MVCC is the
+//! default), `SCRATCH_GROUP`, `SCRATCH_BLOCKING`, and `SCRATCH_WAL_KIB` tune
+//! it. The two large-database measurements are
 //! `#[ignore]`d (see their docs).
 use super::*;
 use crate::core::single_file::{open_single_file, SingleFileOpenOptions, SyncMode};
@@ -192,7 +193,7 @@ fn scratch_stress_crash_images_under_concurrent_background_checkpoints() {
       .checkpoint_threshold(0.5)
       .background_checkpoint(std::env::var("SCRATCH_BLOCKING").is_err())
       .sync_mode(crate::core::single_file::SyncMode::Normal)
-      .mvcc(std::env::var("SCRATCH_MVCC").is_ok())
+      .mvcc(std::env::var("SCRATCH_MVCC").map_or(true, |mode| mode != "0"))
       .mvcc_gc_interval_ms(2)
       .group_commit_enabled(std::env::var("SCRATCH_GROUP").is_ok());
     let db = Arc::new(open_single_file(&db_path, options.clone()).expect("open"));

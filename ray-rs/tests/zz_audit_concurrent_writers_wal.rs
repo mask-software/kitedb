@@ -1,5 +1,7 @@
 //! Auto-checkpoints must keep the WAL from filling up when several threads
-//! commit concurrently, in both blocking and background mode.
+//! commit concurrently, in both blocking and background mode, with MVCC (the
+//! default: the writers' transactions run together) and without it
+//! (deprecated: they run one at a time).
 //!
 //! Regression: a background checkpoint only starts when no transaction is
 //! open. With writers in tight loops some transaction is almost always open,
@@ -13,8 +15,9 @@ const WAL_SIZE: usize = 64 * 1024;
 const WRITERS: usize = 4;
 const COMMITS_PER_WRITER: usize = 1000;
 
-fn options(background: bool) -> SingleFileOpenOptions {
+fn options(background: bool, mvcc: bool) -> SingleFileOpenOptions {
   SingleFileOpenOptions::new()
+    .mvcc(mvcc)
     .wal_size(WAL_SIZE)
     .auto_checkpoint(true)
     .checkpoint_threshold(0.5)
@@ -30,10 +33,10 @@ fn assert_all_nodes_present(db: &kitedb::core::single_file::SingleFileDB) {
   }
 }
 
-fn concurrent_writers(background: bool) {
+fn concurrent_writers(background: bool, mvcc: bool) {
   let dir = tempfile::tempdir().expect("tempdir");
   let path = dir.path().join("concurrent-writers.kitedb");
-  let db = Arc::new(open_single_file(&path, options(background)).expect("open"));
+  let db = Arc::new(open_single_file(&path, options(background, mvcc)).expect("open"));
 
   let writers: Vec<_> = (0..WRITERS)
     .map(|writer| {
@@ -60,17 +63,27 @@ fn concurrent_writers(background: bool) {
     .expect("sole owner of the database");
   close_single_file(db).expect("close");
 
-  let reopened = open_single_file(&path, options(background)).expect("reopen");
+  let reopened = open_single_file(&path, options(background, mvcc)).expect("reopen");
   assert_all_nodes_present(&reopened);
   close_single_file(reopened).expect("close reopened");
 }
 
 #[test]
 fn concurrent_writers_with_background_checkpoints_keep_the_wal_from_filling() {
-  concurrent_writers(true);
+  concurrent_writers(true, true);
 }
 
 #[test]
 fn concurrent_writers_with_blocking_checkpoints_keep_the_wal_from_filling() {
-  concurrent_writers(false);
+  concurrent_writers(false, true);
+}
+
+#[test]
+fn non_mvcc_writers_with_background_checkpoints_keep_the_wal_from_filling() {
+  concurrent_writers(true, false);
+}
+
+#[test]
+fn non_mvcc_writers_with_blocking_checkpoints_keep_the_wal_from_filling() {
+  concurrent_writers(false, false);
 }

@@ -1,12 +1,13 @@
 //! Wave-2 checkpoint reproductions (K2, K3, K5) through the public API.
 //!
-//! K2 and K3 fail until fixed: two non-MVCC write transactions race, one
-//! deleting a node while the other, already past its existence check, adds an
-//! edge to it or sets its vector. When both commit, the committed state holds
-//! a dangling edge or a vector of a missing node. (A commit-time existence
-//! check now refuses the racing commit, and serialized writers make the
-//! delete run after it; either way nothing may be left behind.) K5 is a guard
-//! that passes on 39fefea. The tests that need
+//! K2 and K3 fail until fixed: two write transactions race, one deleting a
+//! node while the other, already past its existence check, adds an edge to it
+//! or sets its vector. When both commit, the committed state holds a dangling
+//! edge or a vector of a missing node. They run without MVCC (deprecated),
+//! where a commit-time existence check now refuses the racing commit and
+//! serialized writers make the delete run after it, and with MVCC (the
+//! default), where the racing commit conflicts with the delete; either way
+//! nothing may be left behind. K5 is a guard that passes on 39fefea. The tests that need
 //! private access or checkpoint phase hooks (K1, K4, and the legacy-state
 //! variants of K2 and K3) live in `src/core/single_file/w2_checkpoint_tests.rs`.
 
@@ -22,11 +23,15 @@ fn options() -> SingleFileOpenOptions {
   SingleFileOpenOptions::new().auto_checkpoint(false)
 }
 
+/// Both modes: without MVCC (deprecated) and with it (the default).
+const MODES: [bool; 2] = [false, true];
+
 /// Run `racing` in a write transaction on another thread, commit a
 /// transaction that runs `deleting` while it is open, then commit the racing
-/// one. The racing commit may be refused by the commit-time existence check.
-/// If writers are serialized at begin, the deleting transaction waits for the
-/// racing one and runs after it.
+/// one. Without MVCC, the racing commit may be refused by the commit-time
+/// existence check, and if writers are serialized at begin, the deleting
+/// transaction waits for the racing one and runs after it. With MVCC, the
+/// racing commit conflicts with the delete.
 fn race_against_delete(
   db: &Arc<SingleFileDB>,
   racing: impl FnOnce(&SingleFileDB) + Send + 'static,
@@ -56,9 +61,11 @@ fn race_against_delete(
   go_tx.send(()).expect("release racing transaction");
   let racing_commit = worker.join().expect("racing thread");
   deleter.join().expect("deleting thread");
+  let mvcc = db.mvcc_enabled();
   match racing_commit {
     Ok(()) | Err(KiteError::NodeNotFound(_)) | Err(KiteError::EdgeNotFound { .. }) => {}
-    Err(error) => panic!("the racing commit failed unexpectedly: {error}"),
+    Err(KiteError::Conflict { .. }) if mvcc => {}
+    Err(error) => panic!("the racing commit failed unexpectedly (mvcc: {mvcc}): {error}"),
   }
 }
 
@@ -74,8 +81,16 @@ fn reopen(db: Arc<SingleFileDB>) -> SingleFileDB {
 
 #[test]
 fn k2_edge_racing_a_delete_of_its_endpoint_does_not_fail_checkpoints() {
+  for mvcc in MODES {
+    k2_edge_racing_a_delete_of_its_endpoint(mvcc);
+  }
+}
+
+fn k2_edge_racing_a_delete_of_its_endpoint(mvcc: bool) {
   let dir = tempfile::tempdir().expect("tempdir");
-  let db = Arc::new(open_single_file(dir.path().join("k2-race.kitedb"), options()).expect("open"));
+  let db = Arc::new(
+    open_single_file(dir.path().join("k2-race.kitedb"), options().mvcc(mvcc)).expect("open"),
+  );
   db.begin(false).expect("begin");
   let a = db.create_node(Some("k2-a")).expect("node a");
   let x = db.create_node(Some("k2-x")).expect("node x");
@@ -115,8 +130,16 @@ fn k2_edge_racing_a_delete_of_its_endpoint_does_not_fail_checkpoints() {
 
 #[test]
 fn k3_vector_racing_a_delete_of_its_node_is_not_checkpointed() {
+  for mvcc in MODES {
+    k3_vector_racing_a_delete_of_its_node(mvcc);
+  }
+}
+
+fn k3_vector_racing_a_delete_of_its_node(mvcc: bool) {
   let dir = tempfile::tempdir().expect("tempdir");
-  let db = Arc::new(open_single_file(dir.path().join("k3-race.kitedb"), options()).expect("open"));
+  let db = Arc::new(
+    open_single_file(dir.path().join("k3-race.kitedb"), options().mvcc(mvcc)).expect("open"),
+  );
   db.begin(false).expect("begin");
   let keep = db.create_node(Some("k3-keep")).expect("node keep");
   let gone = db.create_node(Some("k3-gone")).expect("node gone");

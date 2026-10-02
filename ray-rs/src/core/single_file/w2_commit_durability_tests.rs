@@ -203,7 +203,6 @@ fn read_count(db: &SingleFileDB, node: NodeId, key: PropKeyId) -> i64 {
 fn d3_setup() -> (tempfile::TempDir, Arc<SingleFileDB>, NodeId, PropKeyId) {
   let temp_dir = tempdir().expect("temp dir");
   let db_path = temp_dir.path().join("d3-mvcc.kitedb");
-  // A short GC interval only keeps close fast (it waits out the GC sleep).
   let options = SingleFileOpenOptions::new()
     .auto_checkpoint(false)
     .mvcc(true)

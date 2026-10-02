@@ -56,8 +56,7 @@ macro_rules! in_both_modes {
 }
 
 /// MVCC GC runs every few ms and keeps nothing for retention, so it prunes all
-/// history no open transaction needs while a scenario runs (and close does not
-/// wait out the default 5 s GC interval).
+/// history no open transaction needs while a scenario runs.
 const GC_INTERVAL_MS: u64 = 5;
 
 fn options(mode: Mode) -> SingleFileOpenOptions {

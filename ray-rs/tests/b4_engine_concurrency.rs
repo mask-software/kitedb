@@ -43,7 +43,7 @@ const DEADLOCK_TIMEOUT: Duration = Duration::from_secs(20);
 fn options(mvcc: bool) -> SingleFileOpenOptions {
   SingleFileOpenOptions::new()
     .mvcc(mvcc)
-    // Dropping an MVCC database waits up to one GC interval.
+    // GC runs often while the tests run (close does not wait for it).
     .mvcc_gc_interval_ms(10)
     .sync_mode(SyncMode::Normal)
     .auto_checkpoint(false)
@@ -354,13 +354,15 @@ fn f1_checkpoint_and_queued_writer_behind_an_open_writer_guard() {
 }
 
 /// Writers, a bulk loader, group commit, and auto-checkpoints (blocking and
-/// background) on a small WAL all make progress together.
+/// background) on a small WAL all make progress together, with MVCC (the
+/// writers run together, the bulk loader alone) and without it (deprecated:
+/// every writer runs alone).
 #[test]
 fn f1_writers_bulk_load_group_commit_and_auto_checkpoints_guard() {
-  for background in [false, true] {
+  for (mvcc, background) in [(false, false), (false, true), (true, false), (true, true)] {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("f1-mixed.kitedb");
-    let opts = SingleFileOpenOptions::new()
+    let opts = options(mvcc)
       .sync_mode(SyncMode::Normal)
       .group_commit_enabled(true)
       .group_commit_window_ms(1)
@@ -371,7 +373,7 @@ fn f1_writers_bulk_load_group_commit_and_auto_checkpoints_guard() {
     let db = open(&path, opts.clone());
     let scenario_db = Arc::clone(&db);
     finishes_within(
-      &format!("mixed writers (background checkpoints: {background})"),
+      &format!("mixed writers (mvcc: {mvcc}, background checkpoints: {background})"),
       DEADLOCK_TIMEOUT,
       move || {
         let mut handles = Vec::new();
