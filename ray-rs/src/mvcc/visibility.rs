@@ -92,23 +92,49 @@ impl<T> VersionedRecord<T> {
 /// 2. OR it was created by the transaction itself (own writes)
 /// 3. AND it's not deleted (unless checking for deletion)
 pub fn is_visible<T>(version: &VersionedRecord<T>, snapshot_ts: Timestamp, txid: TxId) -> bool {
+  is_visible_at(version.txid, version.commit_ts, snapshot_ts, txid)
+}
+
+/// [`is_visible`] for a version given by its `version_txid` and `version_commit_ts`.
+pub fn is_visible_at(
+  version_txid: TxId,
+  version_commit_ts: Timestamp,
+  snapshot_ts: Timestamp,
+  txid: TxId,
+) -> bool {
   // Baseline versions (txid=0, commit_ts=0) are visible to all snapshots.
-  if version.txid == 0 && version.commit_ts == 0 {
+  if version_txid == 0 && version_commit_ts == 0 {
     return true;
   }
 
   // Own writes are always visible (even if uncommitted)
-  if version.txid == txid {
+  if version_txid == txid {
     return true;
   }
 
   // Uncommitted transactions (commit_ts = 0) are not visible to others
-  if version.commit_ts == 0 {
+  if version_commit_ts == 0 {
     return false;
   }
 
   // Must be committed before snapshot
-  version.commit_ts < snapshot_ts
+  version_commit_ts < snapshot_ts
+}
+
+/// The version of a history chain (see `version_chain`) a reader sees.
+///
+/// `None` when the reader sees the newest version: the committed delta and snapshot hold
+/// the state from there on, so the reader reads them instead. Otherwise the newest version
+/// it sees, or `Some(None)` if it sees none (the key was absent at its snapshot).
+pub fn history_version<T>(
+  head: &VersionedRecord<T>,
+  snapshot_ts: Timestamp,
+  txid: TxId,
+) -> Option<Option<&VersionedRecord<T>>> {
+  if is_visible(head, snapshot_ts, txid) {
+    return None;
+  }
+  Some(visible_version(head, snapshot_ts, txid))
 }
 
 /// Get the visible version from a version chain
@@ -341,6 +367,25 @@ mod tests {
 
     // After deletion
     assert!(!edge_exists(Some(&v2), 25, 100));
+  }
+
+  #[test]
+  fn test_history_version_defers_to_current_state_at_the_head() {
+    let v1 = VersionedRecord::new(1, 0, 0);
+    let v2 = VersionedRecord::with_prev(2, 2, 20, Box::new(v1));
+    let v3 = VersionedRecord::with_prev(3, 3, 30, Box::new(v2));
+
+    // A reader that sees the head reads the current state, not the chain.
+    assert!(history_version(&v3, 31, 100).is_none());
+    let older = |ts| history_version(&v3, ts, 100).map(|v| v.map(|v| v.data));
+    assert_eq!(older(30), Some(Some(2)));
+    assert_eq!(older(20), Some(Some(1)));
+
+    let created = VersionedRecord::new(1, 1, 10);
+    assert_eq!(
+      history_version(&created, 10, 100).map(|v| v.is_none()),
+      Some(true)
+    );
   }
 
   #[test]

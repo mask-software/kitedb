@@ -14,6 +14,7 @@ use crate::core::wal::record::{
   WalRecord,
 };
 use crate::error::{KiteError, Result};
+use crate::mvcc::TxManager;
 use crate::types::*;
 use parking_lot::Mutex;
 use std::collections::HashSet;
@@ -102,6 +103,21 @@ impl TxView<'_> {
       None => Ok(()),
     }
   }
+}
+
+/// An edge prop write needs the edge and its endpoints: it conflicts with a concurrent
+/// delete_edge (which writes `Edge`) or delete_node of an endpoint (which writes `Node`), but
+/// not with writes to the edge's other props.
+fn record_edge_prop_dependencies(
+  tx_mgr: &mut TxManager,
+  txid: TxId,
+  src: NodeId,
+  etype: ETypeId,
+  dst: NodeId,
+) {
+  tx_mgr.record_read(txid, TxKey::Edge { src, etype, dst });
+  tx_mgr.record_read(txid, TxKey::Node(src));
+  tx_mgr.record_read(txid, TxKey::Node(dst));
 }
 
 impl SingleFileDB {
@@ -858,6 +874,9 @@ impl SingleFileDB {
       }
       let mut tx_mgr = mvcc.tx_manager.lock();
       tx_mgr.record_write(txid, TxKey::NodeProp { node_id, key_id });
+      // The write needs the node: it conflicts with a concurrent delete_node, not with
+      // writes to the node's other props.
+      tx_mgr.record_read(txid, TxKey::Node(node_id));
     }
 
     // Invalidate cache
@@ -904,6 +923,9 @@ impl SingleFileDB {
       }
       let mut tx_mgr = mvcc.tx_manager.lock();
       tx_mgr.record_write(txid, TxKey::NodeProp { node_id, key_id });
+      // The write needs the node: it conflicts with a concurrent delete_node, not with
+      // writes to the node's other props.
+      tx_mgr.record_read(txid, TxKey::Node(node_id));
     }
 
     // Invalidate cache
@@ -958,6 +980,7 @@ impl SingleFileDB {
           key_id,
         },
       );
+      record_edge_prop_dependencies(&mut tx_mgr, txid, src, etype, dst);
     }
 
     // Invalidate cache
@@ -1013,6 +1036,7 @@ impl SingleFileDB {
             },
           );
         }
+        record_edge_prop_dependencies(&mut tx_mgr, txid, src, etype, dst);
       }
     }
 
@@ -1075,6 +1099,7 @@ impl SingleFileDB {
           key_id,
         },
       );
+      record_edge_prop_dependencies(&mut tx_mgr, txid, src, etype, dst);
     }
 
     // Invalidate cache
@@ -1113,7 +1138,9 @@ impl SingleFileDB {
         return Ok(());
       }
       let mut tx_mgr = mvcc.tx_manager.lock();
-      tx_mgr.record_write(txid, TxKey::Node(node_id));
+      // The write needs the node (a concurrent delete_node conflicts), but does not change
+      // whether it exists.
+      tx_mgr.record_read(txid, TxKey::Node(node_id));
       tx_mgr.record_write(txid, TxKey::NodeLabels(node_id));
       tx_mgr.record_write(txid, TxKey::NodeLabel { node_id, label_id });
     }
@@ -1156,7 +1183,9 @@ impl SingleFileDB {
         return Ok(());
       }
       let mut tx_mgr = mvcc.tx_manager.lock();
-      tx_mgr.record_write(txid, TxKey::Node(node_id));
+      // The write needs the node (a concurrent delete_node conflicts), but does not change
+      // whether it exists.
+      tx_mgr.record_read(txid, TxKey::Node(node_id));
       tx_mgr.record_write(txid, TxKey::NodeLabels(node_id));
       tx_mgr.record_write(txid, TxKey::NodeLabel { node_id, label_id });
     }
