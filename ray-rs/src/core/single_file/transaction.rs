@@ -325,13 +325,13 @@ impl SingleFileDB {
       ));
     }
 
-    // Only this thread inserts its own entry, so checking before the gate is
-    // race-free. It must come first: a blocking checkpoint holding the gate
-    // may be waiting for this thread's open transaction.
-    let tid = std::thread::current().id();
-    if self.current_tx.lock().contains_key(&tid) {
+    // Only this thread registers its own transaction, so checking before the
+    // gate is race-free. It must come first: a blocking checkpoint holding
+    // the gate may be waiting for this thread's open transaction.
+    if self.current_tx_handle().is_some() {
       return Err(KiteError::TransactionInProgress);
     }
+    self.reap_abandoned_transactions();
 
     // A checkpoint takes the write side. Holding this read permit through
     // insertion makes the gate atomic with transaction creation.
@@ -412,7 +412,7 @@ impl SingleFileDB {
       bulk_load,
     )));
 
-    self.current_tx.lock().insert(tid, tx_state);
+    self.register_thread_transaction(tx_state);
     self.active_transactions.fetch_add(1, Ordering::Release);
     if !read_only {
       self.active_writers.fetch_add(1, Ordering::SeqCst);
@@ -495,12 +495,6 @@ impl SingleFileDB {
       self.compact_retained_wal(&mut pager, &mut wal, &mut header)?;
     }
     Ok(())
-  }
-
-  pub(crate) fn current_tx_handle(&self) -> Option<Arc<Mutex<SingleFileTxState>>> {
-    let tid = std::thread::current().id();
-    let current_tx = self.current_tx.lock();
-    current_tx.get(&tid).cloned()
   }
 
   /// The current write transaction, for a data write (nodes, edges,
@@ -722,11 +716,9 @@ impl SingleFileDB {
       return Err(KiteError::ReadOnly);
     }
 
-    let tx_handle = {
-      let tid = std::thread::current().id();
-      let mut current_tx = self.current_tx.lock();
-      current_tx.remove(&tid).ok_or(KiteError::NoTransaction)?
-    };
+    let tx_handle = self
+      .take_thread_transaction()
+      .ok_or(KiteError::NoTransaction)?;
     let read_only = tx_handle.lock().read_only;
     let result = self.commit_transaction(&tx_handle);
     if !read_only {
@@ -740,7 +732,7 @@ impl SingleFileDB {
     result
   }
 
-  /// Commit the transaction `tx_handle`, already removed from `current_tx`.
+  /// Commit the transaction `tx_handle`, already taken from its thread.
   fn commit_transaction(
     &self,
     tx_handle: &Arc<Mutex<SingleFileTxState>>,
@@ -1255,11 +1247,9 @@ impl SingleFileDB {
 
   /// Rollback the current transaction
   pub fn rollback(&self) -> Result<()> {
-    let tx_handle = {
-      let tid = std::thread::current().id();
-      let mut current_tx = self.current_tx.lock();
-      current_tx.remove(&tid).ok_or(KiteError::NoTransaction)?
-    };
+    let tx_handle = self
+      .take_thread_transaction()
+      .ok_or(KiteError::NoTransaction)?;
     let read_only = tx_handle.lock().read_only;
     let result = self.rollback_transaction(&tx_handle);
     if !read_only {
@@ -1270,9 +1260,12 @@ impl SingleFileDB {
     result
   }
 
-  /// Roll back the transaction `tx_handle`, already removed from
-  /// `current_tx`.
-  fn rollback_transaction(&self, tx_handle: &Arc<Mutex<SingleFileTxState>>) -> Result<()> {
+  /// Roll back the transaction `tx_handle`, already taken from its thread
+  /// (by `rollback`, or abandoned by a thread that ended with it open).
+  pub(super) fn rollback_transaction(
+    &self,
+    tx_handle: &Arc<Mutex<SingleFileTxState>>,
+  ) -> Result<()> {
     let (txid, read_only, bulk_load) = {
       let tx = tx_handle.lock();
       (tx.txid, tx.read_only, tx.bulk_load)
@@ -1316,10 +1309,6 @@ impl SingleFileDB {
   /// Check if there's an active transaction
   pub fn has_transaction(&self) -> bool {
     self.current_tx_handle().is_some()
-  }
-
-  pub(crate) fn has_any_transaction(&self) -> bool {
-    !self.current_tx.lock().is_empty()
   }
 
   /// Get the current transaction ID (if any)

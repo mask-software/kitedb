@@ -54,13 +54,16 @@ fn f4_mvcc_begin_never_moves_next_tx_id_backwards() {
 // F5: reads and the global transaction map
 // ============================================================================
 
-/// Every read looks up the calling thread's transaction in the global
-/// `current_tx` map (keyed by thread id) under its mutex, so all reads in the
-/// process serialize on one lock, and wait whenever any thread is inside
-/// begin/commit/rollback holding it. A read outside a transaction must not
-/// touch that lock at all.
+/// Every read used to look up the calling thread's transaction in one
+/// process-wide map (keyed by thread id) under its mutex, so all reads
+/// serialized on that lock and waited whenever a thread inside begin, commit
+/// or rollback held it. Transactions now live in thread-local entries: a read
+/// outside a transaction takes no lock of the transaction bookkeeping. Here
+/// another thread holds a write transaction open, and this test holds every
+/// bookkeeping lock begin, commit and checkpoint take (the open set, the group
+/// commit queue, the checkpoint state); reads still complete.
 #[test]
-fn f5_reads_outside_a_transaction_do_not_lock_the_global_transaction_map() {
+fn f5_reads_outside_a_transaction_take_no_transaction_bookkeeping_lock() {
   let dir = tempdir().expect("tempdir");
   let db =
     Arc::new(open_single_file(dir.path().join("f5-map.kitedb"), options(false)).expect("open"));
@@ -74,9 +77,26 @@ fn f5_reads_outside_a_transaction_do_not_lock_the_global_transaction_map() {
     .expect("prop");
   db.commit().expect("commit");
 
-  // Another thread "inside begin/commit" holds the map's lock.
-  let held = db.current_tx.lock();
-  let (done_tx, done_rx) = mpsc::channel();
+  let (open_tx, open_rx) = mpsc::channel();
+  let (done_tx, done_rx) = mpsc::channel::<()>();
+  let writer = {
+    let db = Arc::clone(&db);
+    thread::spawn(move || {
+      db.begin(false).expect("writer begin");
+      db.create_node(Some("pending")).expect("pending");
+      open_tx.send(()).expect("open");
+      done_rx.recv().expect("done");
+      db.rollback().expect("rollback");
+    })
+  };
+  open_rx.recv().expect("writer open");
+
+  let held = (
+    db.open_write_txids.lock(),
+    db.group_commit_state.lock(),
+    db.checkpoint_state.lock(),
+  );
+  let (read_tx, read_rx) = mpsc::channel();
   let reader = {
     let db = Arc::clone(&db);
     thread::spawn(move || {
@@ -84,15 +104,19 @@ fn f5_reads_outside_a_transaction_do_not_lock_the_global_transaction_map() {
       assert_eq!(db.out_edges(a), vec![(knows, b)]);
       assert!(db.node_prop(a, rank).is_some());
       assert_eq!(db.node_by_key("b"), Some(b));
-      let _ = done_tx.send(());
+      assert_eq!(db.node_by_key("pending"), None);
+      assert!(!db.has_transaction());
+      let _ = read_tx.send(());
     })
   };
-  let finished = done_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+  let finished = read_rx.recv_timeout(Duration::from_secs(2)).is_ok();
   drop(held);
   reader.join().expect("reader");
+  done_tx.send(()).expect("release writer");
+  writer.join().expect("writer");
   assert!(
     finished,
-    "reads outside any transaction waited for the global current_tx lock"
+    "reads outside any transaction waited for a transaction bookkeeping lock"
   );
 }
 

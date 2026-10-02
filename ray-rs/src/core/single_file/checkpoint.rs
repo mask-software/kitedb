@@ -798,6 +798,9 @@ impl SingleFileDB {
     if self.current_tx_handle().is_some() {
       return Err(KiteError::TransactionInProgress);
     }
+    // An abandoned transaction would stay in the open set, copied by every
+    // cut, until rolled back.
+    self.reap_abandoned_transactions();
     if self.cut_still_declined() {
       return Ok(BackgroundCheckpointOutcome::StillDeclined);
     }

@@ -60,6 +60,7 @@ All notable changes to this project will be documented in this file.
 - Export pauses commits and checkpoint installs while it reads, as backup does, so an export is one point in time. Previously an export taken under writes could hold an edge whose endpoint it did not hold.
 - Replication primary manifests carry a random generation id. A replica whose primary's sidecar was deleted and recreated now reports `needs_reseed` (previously a replica at log 5 silently skipped the new sidecar's frames 1..5), and its reseed follows the new sidecar.
 - Full-sync primaries no longer sync the sidecar directory on every commit (only the manifest's contents; a head reverted by a crash is recovered from the segment on open), about halving commit time with replication on macOS.
+- Reads no longer take a process-wide lock to find the calling thread's transaction: each thread keeps its open transactions in thread-local storage. Single-threaded reads were up to 30% faster, and reads no longer wait for other threads' begin, commit or rollback.
 
 ### Fixed
 - A crafted snapshot whose compressed sections declare gigabytes no longer makes open allocate them before failing (a 57 KiB file could make it try to inflate 1.75 GiB).
@@ -162,6 +163,7 @@ All notable changes to this project will be documented in this file.
 - With MVCC enabled, concurrent `begin` calls could leave the next transaction id at or below an id already handed out; a commit persisted it, and after reopen that id was issued again, so two transactions' WAL records could share one id. Begin now only ever raises it.
 - With group commit enabled, background checkpoints often declined with "no BEGIN record found for open transactions": a transaction counted as open until its committing thread woke after the batch's flush, after its COMMIT was already durable, so a checkpoint taken in between dropped its records and the next one could not start. A transaction now stops counting as open as soon as its COMMIT (or ROLLBACK) is written.
 - A blocking `checkpoint()`, optimize, vacuum or `resize_wal` could wait indefinitely while `background_checkpoint()` was called in a loop: each new background run claimed the checkpoint ahead of the waiting operation (measured: 0-2 blocking checkpoints in 1.5 s against about 100 background runs). While such an operation waits, `background_checkpoint()` now returns `CheckpointDeclined` (the auto-checkpoint skips quietly), so the operation waits for at most the run in progress.
+- A thread that ended (or died) with a transaction still open left it open forever, so every later blocking `checkpoint()`, optimize, vacuum and `resize_wal` waited for it indefinitely. Such a transaction is now rolled back.
 
 ### Security
 - TS replication admin auth helper: `mode` is required (`'none'` disables auth explicitly); a config without one allowed every request. A client-certificate header no longer authorizes by its mere presence: it is trusted only with `trustForwardedClientCert: true` and an `mtlsSubjectRegex`, which must now match the whole header value, and the mTLS modes need that or an `mtlsMatcher`. Bearer tokens are compared in constant time.
