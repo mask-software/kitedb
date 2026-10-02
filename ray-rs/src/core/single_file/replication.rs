@@ -67,6 +67,21 @@ const REPLICA_BOOTSTRAP_MAX_BACKOFF_MS: u64 = 320;
 const SOURCE_FRAME_UNPUBLISHED_ERROR: &str =
   "source primary has not published the replication frame for its last commit";
 
+#[cfg(test)]
+thread_local! {
+  /// Run on this thread's next replica catch-up retry, after the failed
+  /// attempt and before the backoff sleep.
+  pub(crate) static BEFORE_NEXT_CATCH_UP_RETRY: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+    std::cell::RefCell::new(None);
+}
+
+fn before_catch_up_retry_test_hook() {
+  #[cfg(test)]
+  if let Some(hook) = BEFORE_NEXT_CATCH_UP_RETRY.with(|hook| hook.borrow_mut().take()) {
+    hook();
+  }
+}
+
 impl SingleFileDB {
   /// Promote this primary instance to the next replication epoch.
   ///
@@ -307,6 +322,7 @@ impl SingleFileDB {
             return Err(error);
           }
 
+          before_catch_up_retry_test_hook();
           std::thread::sleep(Duration::from_millis(backoff_ms));
           backoff_ms = backoff_ms
             .saturating_mul(2)
@@ -1836,3 +1852,9 @@ mod tests {
 #[cfg(test)]
 #[path = "b4_replication_tests.rs"]
 mod b4_tests;
+
+/// raydb-b4 repl-flake: catch-up retries, driven by the retry hook instead of
+/// a timer.
+#[cfg(test)]
+#[path = "b4_repl_flake_catch_up_tests.rs"]
+mod b4_repl_flake_catch_up_tests;
