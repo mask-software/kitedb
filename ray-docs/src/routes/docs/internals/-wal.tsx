@@ -44,6 +44,7 @@ function WALPrincipleDiagram() {
 	const steps: Step[] = [
 		{
 			text: "Write the transaction's records and a Commit record to the WAL",
+			sub: "Over bytes already zeroed and synced (see below)",
 			accent: "slate",
 		},
 		{
@@ -53,7 +54,7 @@ function WALPrincipleDiagram() {
 		{
 			text: (
 				<>
-					<Code>fsync()</Code> the file
+					<Code>fsync()</Code> the file, once for both
 				</>
 			),
 			accent: "mint",
@@ -88,6 +89,16 @@ function WALPrincipleDiagram() {
 					</span>
 				</div>
 			</div>
+			<p class="mt-4 border-t border-kite-line pt-3 text-[13px] text-slate-400">
+				Commits that arrive together share steps 1 to 3. A crash during the
+				fsync can leave the new header on disk without some of the WAL pages it
+				points at. Those pages then still hold what was there before, and KiteDB
+				keeps that harmless: it only writes records over bytes it zeroed and
+				synced first, a chunk ahead of the head (topped up in the same write, so
+				it costs no extra fsync in steady state). Recovery reads zeros there and
+				stops, keeping every commit acknowledged before, and never replays a
+				record a torn write or an earlier WAL cycle left behind.
+			</p>
 		</Figure>
 	);
 }
@@ -313,7 +324,8 @@ const SYNC_MODES: {
 		name: "Full",
 		accent: "mint",
 		badge: "default",
-		summary: "fsync on every commit",
+		summary:
+			"One fsync per commit, or per group of commits that arrive together",
 		tradeoff:
 			"Safest; slowest writes. On macOS, fsync leaves writes in the drive's cache, so commits survive power loss only with fullFsync (F_FULLFSYNC, milliseconds per commit), as with SQLite",
 	},
@@ -386,7 +398,7 @@ function RecoveryProcess() {
 		{ text: "Scan records from tail to head", accent: "cyan" },
 		{
 			text: "Validate each record's CRC-32",
-			sub: "An invalid record ends the scan: an incomplete write, or a record of an earlier WAL cycle (its salt differs)",
+			sub: "An invalid record ends the scan: an incomplete write (pages that never landed read as the zeros written before them), or a record of an earlier WAL cycle (its salt differs)",
 			accent: "violet",
 		},
 		{
@@ -542,8 +554,8 @@ export function WALPage() {
 				</li>
 				<li>
 					Commit from several threads: commits that arrive while others are
-					written are written together, with one WAL write, one header write
-					and (in <code>Full</code> mode) one fsync. This is always on;{" "}
+					written are written together, with one WAL write, one header write and
+					(in <code>Full</code> mode) one fsync. This is always on;{" "}
 					<code>groupCommitEnabled</code> has no effect, and no commit waits for
 					others to join
 				</li>
