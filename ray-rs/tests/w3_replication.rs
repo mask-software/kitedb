@@ -803,9 +803,10 @@ fn w3_p10_export_is_a_point_in_time_view_under_concurrent_writes() {
 }
 
 // ============================================================================
-// P5, P7: OTLP push. Gate this module with the OTLP feature if one is added.
+// P5, P7: OTLP push
 // ============================================================================
 
+#[cfg(feature = "otlp")]
 mod otlp {
   use std::net::TcpListener;
   use std::time::Duration;
