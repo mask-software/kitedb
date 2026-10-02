@@ -495,7 +495,7 @@ jobs:
   # Python Builds (maturin)
   # ===========================================
   build-python-linux:
-    name: Build Python - Linux ${{ matrix.target }}
+    name: Build Python - Linux ${{ matrix.platform.target }}
     runs-on: ${{ matrix.platform.runner }}
     env:
       CFLAGS_aarch64_unknown_linux_gnu: -D__ARM_ARCH=8
