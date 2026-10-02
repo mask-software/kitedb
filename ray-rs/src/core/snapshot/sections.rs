@@ -51,6 +51,24 @@ pub fn string_offset_size_for_version(version: u32) -> usize {
   }
 }
 
+/// Compressed sections may inflate, in total, to this many times the size of
+/// the snapshot holding them (S5). Real snapshots stay far below it: their
+/// incompressible arrays (node IDs, CSR offsets) dominate the ratio.
+pub(crate) const MAX_INFLATION_RATIO: usize = 1024;
+
+/// Inflation every snapshot may use regardless of its size, so a small
+/// snapshot of very compressible sections still loads.
+pub(crate) const MIN_INFLATION_BUDGET: usize = 64 * 1024 * 1024;
+
+/// Bytes all compressed sections of a `snapshot_len`-byte snapshot may
+/// declare together. The reader refuses snapshots above it before inflating
+/// anything, and the writer stores sections raw rather than exceed it.
+pub(crate) fn inflation_budget(snapshot_len: usize) -> usize {
+  snapshot_len
+    .saturating_mul(MAX_INFLATION_RATIO)
+    .max(MIN_INFLATION_BUDGET)
+}
+
 /// Compressed sections are inflated into memory, so their declared size is
 /// capped. Uncompressed sections are borrowed from the mmap and only need to
 /// match their on-disk length.

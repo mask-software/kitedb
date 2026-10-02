@@ -1429,9 +1429,10 @@ fn open_rss_in_child(path: &std::path::Path) -> String {
     .output()
     .expect("spawn RSS child");
   let stdout = String::from_utf8_lossy(&output.stdout);
+  // libtest prints "test <name> ... " before the child's own output.
   let line = stdout
     .lines()
-    .find(|line| line.starts_with("RSS "))
+    .find_map(|line| line.find("RSS before=").map(|start| &line[start..]))
     .unwrap_or("RSS child printed nothing");
   let values: HashMap<&str, f64> = line
     .trim_start_matches("RSS ")
@@ -1586,16 +1587,13 @@ fn baseline_snapshot_perf() {
     let (snapshot, open_stats) = measure(false, || SnapshotData::load(file.path()));
     let open_elapsed = start.elapsed();
     let snapshot = snapshot.expect("load snapshot");
-    let num_strings = snapshot.header.num_strings;
-    let cache_slot = std::mem::size_of::<std::sync::OnceLock<std::sync::Arc<str>>>();
     println!(
-      "[{label}] S4/S6 open: {:.1} ms, heap {:.1} MiB live after open ({:.1} MiB allocated); \
-       string cache {} strings x {cache_slot} B = {:.1} MiB",
+      "[{label}] S4/S6 open: {:.1} ms, heap {:.1} MiB live after open ({:.1} MiB allocated) \
+       for {} strings",
       open_elapsed.as_secs_f64() * 1e3,
       mib(open_stats.peak_live),
       mib(open_stats.allocated),
-      num_strings + 1,
-      mib((num_strings as usize + 1) * cache_slot),
+      snapshot.header.num_strings,
     );
     println!("[{label}] S4 {}", open_rss_in_child(file.path()));
 
