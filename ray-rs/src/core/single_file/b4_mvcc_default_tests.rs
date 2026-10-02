@@ -572,3 +572,33 @@ fn thread_ending_inside_a_bulk_load_lets_writers_go_on() {
   assert!(db.node_by_key("abandoned").is_none());
   assert!(db.node_by_key("after").is_some());
 }
+
+/// A read-only open commits nothing, so MVCC has nothing to collect: it
+/// starts no GC thread (one thread per read-only handle, started and joined
+/// on every open and close). Writable opens run it.
+#[test]
+fn read_only_open_starts_no_gc_thread() {
+  let dir = tempdir().expect("tempdir");
+  let path = dir.path().join("read-only-gc.kitedb");
+  let db = open_single_file(&path, SingleFileOpenOptions::new()).expect("open");
+  let mvcc = db.mvcc.as_ref().expect("MVCC is the default");
+  assert!(mvcc.gc_thread_running(), "a writable open runs GC");
+  commit_node(&db, "a");
+  close_single_file(db).expect("close");
+
+  let read_only =
+    open_single_file(&path, SingleFileOpenOptions::new().read_only(true)).expect("open read-only");
+  assert!(read_only.mvcc_enabled());
+  assert!(
+    !read_only
+      .mvcc
+      .as_ref()
+      .expect("MVCC is the default")
+      .gc_thread_running(),
+    "a read-only open started a GC thread"
+  );
+  read_only.begin(true).expect("read transaction");
+  assert!(read_only.node_by_key("a").is_some());
+  read_only.rollback().expect("end");
+  close_single_file(read_only).expect("close read-only");
+}

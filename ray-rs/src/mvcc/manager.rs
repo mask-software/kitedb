@@ -142,6 +142,12 @@ impl MvccManager {
     *handle_guard = Some(handle);
   }
 
+  /// Whether the background GC thread runs (test instrumentation).
+  #[cfg(all(test, not(target_arch = "wasm32")))]
+  pub(crate) fn gc_thread_running(&self) -> bool {
+    self.gc_handle.lock().is_some()
+  }
+
   #[cfg(target_arch = "wasm32")]
   pub fn start(&self) {
     // No background threads on wasm; run one GC cycle and return.
