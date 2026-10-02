@@ -373,14 +373,19 @@ function RecoveryProcess() {
 			accent: "cyan",
 		},
 		{
-			text: "If a background checkpoint was interrupted, merge both WAL regions into the primary region",
-			sub: "Writable opens only; a read-only open fails with an error instead",
+			text: "If a background checkpoint was interrupted, finish or undo its cut",
+			sub: "If the secondary region's records fit after the primary's, a writable open appends them; otherwise both regions are replayed in place and the next background checkpoint resumes the cut. Read-only opens replay in place without writing.",
 			accent: "amber",
 		},
 		{ text: "Scan records from tail to head", accent: "cyan" },
 		{
 			text: "Validate each record's CRC32C",
 			sub: "An invalid record ends the scan (incomplete write)",
+			accent: "violet",
+		},
+		{
+			text: "Move each WAL head back to the last valid record",
+			sub: "Writable opens save this before writing anything, so new commits never land after a torn record",
 			accent: "violet",
 		},
 		{
@@ -448,14 +453,22 @@ function CheckpointTriggers() {
 						Writes continue, into the secondary WAL region
 					</FlowItem>
 					<FlowItem color="amber">
-						It starts only when no transaction is open. At the end, new
-						transactions wait while it lets open ones finish and installs the
-						new header.
+						It starts even while other threads have write transactions open:
+						their WAL records so far are copied into the secondary region, and
+						they can commit during or after the checkpoint. New transactions
+						pause only for the brief start and the header install. If the open
+						transactions' records don't fit in the secondary region, the
+						checkpoint is skipped until one of them finishes. If the secondary
+						region fills before the checkpoint installs, writers wait for the
+						install instead of failing.
 					</FlowItem>
 				</div>
 				<p class="mt-3 text-[13px] text-slate-500">
 					A blocking checkpoint, such as <Code>db.checkpoint()</Code>, makes new
 					transactions wait for its whole run and lets open ones finish first.
+					If installing its header fails, it returns an error and the database
+					keeps the previous snapshot and WAL, so later commits append after the
+					existing records.
 				</p>
 			</div>
 		</Figure>

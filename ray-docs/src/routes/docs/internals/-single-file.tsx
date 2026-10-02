@@ -386,8 +386,8 @@ function DatabaseOpenProcess() {
 			accent: "cyan",
 		},
 		{
-			text: "If a background checkpoint was interrupted, merge both WAL regions into the primary region",
-			sub: "Writable opens only; a read-only open fails with an error instead",
+			text: "If a background checkpoint was interrupted, finish or undo its cut",
+			sub: "If the secondary region's records fit after the primary's, a writable open appends them; otherwise both regions are replayed in place and the next background checkpoint resumes the cut. Read-only opens replay in place without writing.",
 			accent: "amber",
 		},
 		{
@@ -569,9 +569,9 @@ export function SingleFilePage() {
 			<p>
 				A read-only open asks the operating system for read access only and
 				never writes to the file. WAL replay rebuilds the delta in memory, and
-				closing the database leaves the file untouched. If recovery would have
-				to write, as after an interrupted background checkpoint, the read-only
-				open returns an error; open the database writable once to repair it.
+				closing the database leaves the file untouched. After an interrupted
+				background checkpoint, a read-only open replays both WAL regions in
+				place; the next writable open finishes the repair.
 			</p>
 
 			<VersionNote>
