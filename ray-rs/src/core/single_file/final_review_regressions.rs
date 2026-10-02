@@ -1323,7 +1323,7 @@ fn writers_compact_the_wal_after_a_failed_post_install_compaction() {
 /// record after it, for good.
 #[test]
 fn writable_open_refuses_rather_than_trims_records_of_unknown_types() {
-  use crate::util::crc::crc32c;
+  use crate::util::crc::crc32;
   let _serial = checkpoint_test_serial();
   let temp_dir = tempdir().expect("temp dir");
   let db_path = temp_dir.path().join("unknown-record-type.kitedb");
@@ -1342,7 +1342,7 @@ fn writable_open_refuses_rather_than_trims_records_of_unknown_types() {
     .build();
     record[4] = 200; // no such record type
     let crc_end = WAL_RECORD_HEADER_SIZE + 12;
-    let crc = crc32c(&record[4..crc_end]);
+    let crc = crc32(&record[4..crc_end]);
     record[crc_end..crc_end + 4].copy_from_slice(&crc.to_le_bytes());
     wal
       .write_record_bytes_batch(&record, &mut pager)

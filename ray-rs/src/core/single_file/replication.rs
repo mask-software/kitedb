@@ -19,7 +19,7 @@ use crate::replication::replica::{
 use crate::replication::transport::decode_commit_frame_payload;
 use crate::replication::types::{CommitToken, ReplicationCursor};
 use crate::types::{ETypeId, NodeId, PropKeyId, PropValue, TxId, WalRecordType};
-use crate::util::crc::{crc32c, Crc32cHasher};
+use crate::util::crc::{crc32, Crc32Hasher};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use serde_json::json;
@@ -376,7 +376,7 @@ impl SingleFileDB {
     let status = self.primary_replication_status().ok_or_else(|| {
       KiteError::InvalidReplication("database is not opened in primary role".to_string())
     })?;
-    let (byte_length, checksum_crc32c, data_base64) =
+    let (byte_length, checksum_crc32, data_base64) =
       read_snapshot_transport_payload(&self.path, include_data)?;
     let generated_at_ms = std::time::SystemTime::now()
       .duration_since(std::time::UNIX_EPOCH)
@@ -387,7 +387,8 @@ impl SingleFileDB {
       "format": "single-file-db-copy",
       "db_path": self.path.to_string_lossy().to_string(),
       "byte_length": byte_length,
-      "checksum_crc32c": checksum_crc32c,
+      // The value is CRC-32 (IEEE); the field keeps the name clients read.
+      "checksum_crc32c": checksum_crc32,
       "generated_at_ms": generated_at_ms,
       "epoch": status.epoch,
       "head_log_index": status.head_log_index,
@@ -628,7 +629,7 @@ fn read_snapshot_transport_payload(
   }
 
   let mut reader = BufReader::new(File::open(path)?);
-  let mut hasher = Crc32cHasher::new();
+  let mut hasher = Crc32Hasher::new();
   let mut bytes_read = 0u64;
   let mut chunk = [0u8; REPLICATION_IO_CHUNK_BYTES];
 
@@ -807,7 +808,7 @@ fn read_frame_payload(
       .read_exact(&mut payload)
       .map_err(|error| map_frame_payload_read_error(error, segment_id, frame_offset))?;
     if !header.crc_disabled {
-      let computed_crc32 = crc32c(&payload);
+      let computed_crc32 = crc32(&payload);
       if computed_crc32 != header.stored_crc32 {
         return Err(KiteError::CrcMismatch {
           stored: header.stored_crc32,
@@ -818,7 +819,7 @@ fn read_frame_payload(
     return Ok(Some(BASE64_STANDARD.encode(payload)));
   }
 
-  let mut hasher = (!header.crc_disabled).then(Crc32cHasher::new);
+  let mut hasher = (!header.crc_disabled).then(Crc32Hasher::new);
   consume_payload_stream(reader, header.payload_len, |chunk| {
     if let Some(hasher) = hasher.as_mut() {
       hasher.update(chunk);
@@ -877,7 +878,7 @@ fn map_frame_payload_read_error(
 
 fn source_db_fingerprint(path: &Path) -> Result<(u64, u32)> {
   let mut reader = BufReader::new(File::open(path)?);
-  let mut hasher = Crc32cHasher::new();
+  let mut hasher = Crc32Hasher::new();
   let mut chunk = [0u8; REPLICATION_IO_CHUNK_BYTES];
   let mut bytes = 0u64;
 

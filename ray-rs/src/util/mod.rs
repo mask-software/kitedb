@@ -13,5 +13,5 @@ pub mod mmap;
 // Re-export commonly used items
 pub use binary::{align_up, padding_for, BufferBuilder};
 pub use compression::{compress, decompress, CompressionType};
-pub use crc::crc32c;
+pub use crc::{crc32, crc32c};
 pub use hash::{xxhash64, xxhash64_string};

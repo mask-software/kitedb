@@ -17,7 +17,8 @@ use crate::core::header::{
   other_header_slot, read_header_slots, write_header_slot, HEADER_SLOT_A, HEADER_SLOT_B,
 };
 use crate::core::pager::{
-  create_pager_with_locking, is_valid_page_size, open_pager_with_locking, pages_to_store, FilePager,
+  create_pager_with_locking, is_valid_page_size, open_pager_with_locking, pages_to_store,
+  sync_parent_dir, FilePager, NewPager,
 };
 use crate::core::snapshot::reader::SnapshotData;
 use crate::core::wal::buffer::WalBuffer;
@@ -58,8 +59,12 @@ pub enum SyncMode {
   /// but not if application crashes. ~1000x faster than Full.
   Normal,
 
-  /// No fsync (fastest, least safe)
-  /// Data may be lost on any crash. Only for testing/ephemeral data.
+  /// No fsync, and no WAL write per commit (fastest, least safe).
+  ///
+  /// **Commits stay in memory until a checkpoint, `close_single_file`, or
+  /// dropping the handle writes them.** A crash of the process, not just of
+  /// the OS, loses every commit since the last checkpoint. Only for tests
+  /// and data you can rebuild.
   Off,
 }
 
@@ -318,8 +323,9 @@ impl SingleFileOpenOptions {
     self
   }
 
-  /// Set sync mode to Off (no fsync)
-  /// Only for testing or ephemeral data. Data may be lost on any crash.
+  /// Set sync mode to Off: no fsync, and commits stay in memory until a
+  /// checkpoint, close, or drop writes them, so a process crash loses every
+  /// commit since the last checkpoint. Only for testing or ephemeral data.
   pub fn sync_off(mut self) -> Self {
     self.sync_mode = SyncMode::Off;
     self
@@ -980,8 +986,12 @@ fn open_single_file_internal(
 
     (pager, header, false, header_slot)
   } else {
-    // Create new database
-    let mut pager = create_pager_with_locking(path, options.page_size, lock_file)?;
+    // Create new database. If another opener created one here since the
+    // existence check above, open that one instead.
+    let mut pager = match create_pager_with_locking(path, options.page_size, lock_file)? {
+      NewPager::Created(pager) => pager,
+      NewPager::Exists => return open_single_file_internal(path, options, lock_file),
+    };
     pager.set_full_fsync(options.full_fsync && options.sync_mode == SyncMode::Full);
 
     // Calculate WAL page count
@@ -1007,19 +1017,12 @@ fn open_single_file_internal(
   };
 
   // Initialize WAL buffer
-  let mut wal_buffer = WalBuffer::from_header(&header);
+  // Fails if the header's WAL positions lie outside their regions.
+  let mut wal_buffer = WalBuffer::from_header(&header)?;
 
   // A background checkpoint cut that no install finished. Replay reads both
   // regions in place, primary first, unless a writable open merges them.
   let mut replay_cut_in_place = header.checkpoint_in_progress != 0;
-  if replay_cut_in_place
-    && (wal_buffer.primary_head() > wal_buffer.primary_region_size()
-      || wal_buffer.secondary_head() > wal_buffer.capacity())
-  {
-    return Err(KiteError::InvalidWal(
-      "WAL region heads exceed their regions".to_string(),
-    ));
-  }
   if !options.read_only {
     // Records of a type this version does not know are a newer version's,
     // not torn: refuse rather than trim or compact them away below.
@@ -1141,9 +1144,10 @@ fn open_single_file_internal(
       // Replay committed transactions
       #[cfg(feature = "bench-profile")]
       let wal_replay_started = Instant::now();
+      let mut skipped = 0usize;
       for (_txid, records) in &committed_in_order {
         for record in records {
-          replay_wal_record(
+          let applied = replay_wal_record(
             record,
             snapshot.as_ref(),
             &mut delta,
@@ -1157,9 +1161,17 @@ fn open_single_file_internal(
             &mut etype_ids,
             &mut propkey_names,
             &mut propkey_ids,
-          );
+          )?;
+          skipped += usize::from(!applied);
         }
         next_commit_ts += 1;
+      }
+      if skipped > 0 {
+        eprintln!(
+          "Warning: WAL replay of {} skipped {skipped} vector maintenance records \
+           (BatchVectors, SealFragment, CompactFragments), which no version applies",
+          path.display()
+        );
       }
       drop_vectors_of_missing_nodes(&mut delta, snapshot.as_ref());
       #[cfg(feature = "bench-profile")]
@@ -1278,6 +1290,7 @@ fn open_single_file_internal(
   Ok(SingleFileDB {
     path: path.to_path_buf(),
     read_only: options.read_only,
+    closed: AtomicBool::new(false),
     pager: Mutex::new(pager),
     header: RwLock::new(header),
     header_slot: AtomicU32::new(header_slot),
@@ -1476,10 +1489,9 @@ fn migrate_legacy_single_header(
     // WAL, and a complete snapshot; the second directory sync persists the
     // replacement name.
     std::fs::File::open(&temp_path)?.sync_all()?;
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::File::open(parent)?.sync_all()?;
+    sync_parent_dir(path)?;
     std::fs::rename(&temp_path, path)?;
-    std::fs::File::open(parent)?.sync_all()?;
+    sync_parent_dir(path)?;
     Ok(())
   })();
 
@@ -1515,27 +1527,9 @@ pub fn close_single_file_with_options(
     return Ok(());
   }
 
-  // Flush WAL and sync to disk
-  let mut pager = db.pager.lock();
-  let mut wal_buffer = db.wal_buffer.lock();
-
-  // Flush any pending WAL writes
-  wal_buffer.flush(&mut pager)?;
-
-  // Update header with current WAL state
-  {
-    let mut header = db.header.write();
-    wal_buffer.store_in_header(&mut header);
-    header.max_node_id = db.next_node_id.load(Ordering::SeqCst).saturating_sub(1);
-    header.next_tx_id = db.next_tx_id.load(Ordering::SeqCst);
-
-    // Install the updated header in the inactive slot. The final sync below
-    // makes the WAL and header durable together.
-    db.persist_header(&mut pager, &mut header, false)?;
-  }
-
-  // Final sync
-  pager.sync()?;
+  // On failure, dropping `db` tries once more.
+  db.persist_for_close()?;
+  db.closed.store(true, Ordering::Release);
   Ok(())
 }
 

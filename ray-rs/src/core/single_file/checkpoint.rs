@@ -944,7 +944,7 @@ impl SingleFileDB {
       ));
     }
     let pre_cut_records = wal_buffer.scan_region(0, pager)?;
-    let cut_delta = self.replay_into_new_delta(&pre_cut_records);
+    let cut_delta = self.replay_into_new_delta(&pre_cut_records)?;
     self.own_cut(run);
     Ok(Cut::Taken(Box::new(cut_delta)))
   }
@@ -1141,7 +1141,7 @@ impl SingleFileDB {
             &mut etype_ids,
             &mut propkey_names,
             &mut propkey_ids,
-          );
+          )?;
         }
       }
     }
@@ -1169,7 +1169,7 @@ impl SingleFileDB {
   fn replay_into_new_delta(
     &self,
     records: &[crate::core::wal::record::ParsedWalRecord],
-  ) -> DeltaState {
+  ) -> Result<DeltaState> {
     let mut delta = DeltaState::new();
     let mut next_node_id = self.next_node_id.load(Ordering::Acquire);
     let mut next_label_id = self.next_label_id.load(Ordering::Acquire);
@@ -1198,10 +1198,10 @@ impl SingleFileDB {
           &mut etype_ids,
           &mut propkey_names,
           &mut propkey_ids,
-        );
+        )?;
       }
     }
-    delta
+    Ok(delta)
   }
 
   /// After a failed pass of background checkpoint `run`: if the run still

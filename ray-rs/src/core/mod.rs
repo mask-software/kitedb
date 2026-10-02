@@ -6,3 +6,6 @@ pub mod pager;
 pub mod single_file;
 pub mod snapshot;
 pub mod wal;
+
+#[cfg(test)]
+mod b4_durability_io_tests;

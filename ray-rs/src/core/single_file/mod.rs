@@ -190,6 +190,9 @@ pub struct SingleFileDB {
   pub(crate) path: PathBuf,
   /// Read-only mode
   pub(crate) read_only: bool,
+  /// Set once `close_single_file` has persisted everything, so dropping the
+  /// handle afterwards writes nothing.
+  pub(crate) closed: AtomicBool,
   /// Page-based I/O
   pub(crate) pager: Mutex<FilePager>,
   /// Database header
@@ -374,6 +377,29 @@ impl BackgroundCheckpointState {
   }
 }
 
+/// A database dropped without `close_single_file` still persists what close
+/// would, best effort: without it, `SyncMode::Off` loses every commit since
+/// the last checkpoint. It never panics; a failure is reported on stderr.
+/// After a successful close it does nothing.
+impl Drop for SingleFileDB {
+  fn drop(&mut self) {
+    if self.read_only || self.closed.load(Ordering::Acquire) {
+      return;
+    }
+    let persisted =
+      std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.persist_for_close()));
+    let failure = match persisted {
+      Ok(Ok(())) => return,
+      Ok(Err(error)) => error.to_string(),
+      Err(_) => "it panicked".to_string(),
+    };
+    eprintln!(
+      "Warning: {} was dropped without close, and persisting its commits failed: {failure}",
+      self.path.display()
+    );
+  }
+}
+
 // ============================================================================
 // SingleFileDB Implementation - ID Allocators
 // ============================================================================
@@ -400,6 +426,32 @@ impl SingleFileDB {
     }
     self.header_slot.store(next_slot, Ordering::Release);
     Ok(())
+  }
+
+  /// Flush the WAL buffer, install a header naming every commit, and sync:
+  /// what closing persists. In `SyncMode::Off` nothing else writes commits
+  /// since the last checkpoint to disk.
+  pub(crate) fn persist_for_close(&self) -> Result<()> {
+    let mut pager = self.pager.lock();
+    let mut wal_buffer = self.wal_buffer.lock();
+    // A failed commit's records may still be readable on disk; the header
+    // below must not name bytes past them before their overwrite is durable.
+    if wal_buffer.needs_sync() {
+      wal_buffer.sync(&mut pager)?;
+    } else {
+      wal_buffer.flush(&mut pager)?;
+    }
+    {
+      let mut header = self.header.write();
+      wal_buffer.store_in_header(&mut header);
+      header.max_node_id = self.next_node_id.load(Ordering::SeqCst).saturating_sub(1);
+      header.next_tx_id = self.next_tx_id.load(Ordering::SeqCst);
+
+      // Install the updated header in the inactive slot. The sync below makes
+      // the WAL and header durable together.
+      self.persist_header(&mut pager, &mut header, false)?;
+    }
+    pager.sync()
   }
 
   pub(crate) fn wait_for_no_active_transactions(&self) {

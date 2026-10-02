@@ -5,7 +5,7 @@
 use crate::constants::*;
 use crate::types::*;
 use crate::util::binary::*;
-use crate::util::crc::crc32c;
+use crate::util::crc::crc32;
 
 // ============================================================================
 // WAL Record
@@ -63,7 +63,7 @@ impl WalRecord {
     // Compute CRC (over type + flags + reserved + txid + payloadLen + payload)
     let crc_start = 4; // After recLen
     let crc_end = WAL_RECORD_HEADER_SIZE + self.payload.len();
-    let crc_value = crc32c(&buffer[crc_start..crc_end]);
+    let crc_value = crc32(&buffer[crc_start..crc_end]);
     write_u32(&mut buffer, crc_end, crc_value);
 
     buffer
@@ -204,7 +204,7 @@ fn parse_wal_record_frame(
   let crc_start = record_type_offset;
   let crc_end = payload_end;
   let stored_crc = read_u32(buffer, crc_end);
-  let computed_crc = crc32c(&buffer[crc_start..crc_end]) ^ salt;
+  let computed_crc = crc32(&buffer[crc_start..crc_end]) ^ salt;
 
   if stored_crc != computed_crc {
     return None; // CRC mismatch

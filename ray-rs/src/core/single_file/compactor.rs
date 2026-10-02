@@ -411,6 +411,7 @@ impl SingleFileDB {
     } else {
       None
     };
+    let wal_buffer = WalBuffer::from_header(layout)?;
 
     let persisted = {
       let mut pager = self.pager.lock();
@@ -426,7 +427,7 @@ impl SingleFileDB {
     }
 
     *self.header.write() = layout.clone();
-    *self.wal_buffer.lock() = WalBuffer::from_header(layout);
+    *self.wal_buffer.lock() = wal_buffer;
     *self.snapshot.write() = snapshot;
     Ok(())
   }
