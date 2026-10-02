@@ -4,15 +4,20 @@
 //!
 //! Ported from src/mvcc/tx-manager.ts
 
-use std::collections::{HashMap, HashSet};
+use std::collections::VecDeque;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::types::{MvccTransaction, MvccTxStatus, Timestamp, TxId, TxKey};
+use hashbrown::HashMap;
+
+use crate::types::{MvccTransaction, Timestamp, TxId, TxKey, TxKeySet};
 
 /// Maximum number of committed write entries before pruning
-const MAX_COMMITTED_WRITES: usize = 100_000;
+pub(crate) const MAX_COMMITTED_WRITES: usize = 100_000;
 /// Prune down to this many entries when over the limit
 const PRUNE_THRESHOLD_ENTRIES: usize = 50_000;
+/// Stale entries the commit-order log may hold beyond twice the live ones
+/// before it is compacted.
+const COMMIT_LOG_SLACK: usize = 1024;
 
 // ============================================================================
 // Transaction Manager
@@ -26,9 +31,13 @@ const PRUNE_THRESHOLD_ENTRIES: usize = 50_000;
 /// - Track read/write sets for conflict detection
 /// - Support begin, commit, abort operations
 /// - Provide minActiveTs for GC horizon calculation
+///
+/// Only active transactions are tracked: commit and abort drop the record. What
+/// conflict checks need from a committed transaction lives on in
+/// `committed_writes`.
 #[derive(Debug)]
 pub struct TxManager {
-  /// Active and recently committed transactions
+  /// Active transactions
   active_txs: HashMap<TxId, MvccTransaction>,
   /// Next transaction ID to assign
   next_tx_id: TxId,
@@ -36,12 +45,22 @@ pub struct TxManager {
   next_commit_ts: Timestamp,
   /// Inverted index: key -> max commitTs for conflict detection
   committed_writes: HashMap<TxKey, Timestamp>,
-  /// Map commit timestamp -> wall clock time (ms since epoch)
-  commit_ts_to_wall_clock: HashMap<Timestamp, u64>,
-  /// O(1) tracking of active transaction count
-  active_count: usize,
+  /// `committed_writes` updates in commit order, so pruning pops the oldest
+  /// first. An entry is stale once its key has a newer commit.
+  committed_writes_log: VecDeque<(Timestamp, TxKey)>,
+  /// The newest commit whose writes are in `committed_writes` (0: none). A
+  /// transaction that began after it cannot conflict with any.
+  newest_indexed_ts: Timestamp,
+  /// The first commit timestamp of each wall clock millisecond (since the
+  /// epoch) that had a commit, oldest first, for the retention horizon. The
+  /// times never decrease: a commit while the clock stepped back counts as
+  /// the newest entry's millisecond.
+  commit_wall_clock: VecDeque<(Timestamp, u64)>,
   /// Total committed write entries pruned (for stats)
   total_pruned: usize,
+  /// Commit-log entries visited while pruning or compacting (test instrumentation)
+  #[cfg(test)]
+  pub(crate) prune_work: u64,
 }
 
 impl TxManager {
@@ -57,26 +76,23 @@ impl TxManager {
       next_tx_id: initial_tx_id,
       next_commit_ts: initial_commit_ts,
       committed_writes: HashMap::new(),
-      commit_ts_to_wall_clock: HashMap::new(),
-      active_count: 0,
+      committed_writes_log: VecDeque::new(),
+      newest_indexed_ts: 0,
+      commit_wall_clock: VecDeque::new(),
       total_pruned: 0,
+      #[cfg(test)]
+      prune_work: 0,
     }
   }
 
   /// Get the minimum active timestamp (oldest active transaction snapshot)
   /// Used for GC horizon calculation
   pub fn min_active_ts(&self) -> Timestamp {
-    if self.active_txs.is_empty() {
-      return self.next_commit_ts;
-    }
-
-    let mut min = self.next_commit_ts;
-    for tx in self.active_txs.values() {
-      if tx.status == MvccTxStatus::Active && tx.start_ts < min {
-        min = tx.start_ts;
-      }
-    }
-    min
+    self
+      .active_txs
+      .values()
+      .map(|tx| tx.start_ts)
+      .fold(self.next_commit_ts, Timestamp::min)
   }
 
   /// Begin a new transaction
@@ -89,155 +105,131 @@ impl TxManager {
     let tx = MvccTransaction {
       txid,
       start_ts,
-      commit_ts: None,
-      status: MvccTxStatus::Active,
-      read_set: HashSet::new(),
-      write_set: HashSet::new(),
+      read_set: TxKeySet::new(),
+      write_set: TxKeySet::new(),
     };
 
     self.active_txs.insert(txid, tx);
-    self.active_count += 1;
     (txid, start_ts)
   }
 
-  /// Get transaction by ID
+  /// Get an active transaction by ID
   pub fn tx(&self, txid: TxId) -> Option<&MvccTransaction> {
     self.active_txs.get(&txid)
   }
 
-  /// Get mutable transaction by ID
+  /// Get a mutable active transaction by ID
   pub fn tx_mut(&mut self, txid: TxId) -> Option<&mut MvccTransaction> {
     self.active_txs.get_mut(&txid)
   }
 
   /// Check if transaction is active
   pub fn is_active(&self, txid: TxId) -> bool {
-    self
-      .active_txs
-      .get(&txid)
-      .map(|tx| tx.status == MvccTxStatus::Active)
-      .unwrap_or(false)
+    self.active_txs.contains_key(&txid)
   }
 
   /// Record a read operation
   pub fn record_read(&mut self, txid: TxId, key: TxKey) {
     if let Some(tx) = self.active_txs.get_mut(&txid) {
-      if tx.status == MvccTxStatus::Active {
-        tx.read_set.insert(key);
-      }
+      tx.read_set.insert(key);
     }
   }
 
   /// Record a write operation
   pub fn record_write(&mut self, txid: TxId, key: TxKey) {
     if let Some(tx) = self.active_txs.get_mut(&txid) {
-      if tx.status == MvccTxStatus::Active {
-        tx.write_set.insert(key);
-      }
+      tx.write_set.insert(key);
     }
   }
 
-  /// Commit a transaction
+  /// Record reads made earlier (the database buffers a write transaction's
+  /// reads and hands them over at commit, before the conflict check)
+  pub fn record_reads(&mut self, txid: TxId, keys: impl IntoIterator<Item = TxKey>) {
+    if let Some(tx) = self.active_txs.get_mut(&txid) {
+      tx.read_set.extend(keys);
+    }
+  }
+
+  /// Commit a transaction and drop its record
   /// Returns commit timestamp
   pub fn commit_tx(&mut self, txid: TxId) -> Result<Timestamp, TxManagerError> {
     let tx = self
       .active_txs
-      .get_mut(&txid)
+      .remove(&txid)
       .ok_or(TxManagerError::TxNotFound(txid))?;
 
-    if tx.status != MvccTxStatus::Active {
-      return Err(TxManagerError::TxNotActive(txid, tx.status));
-    }
-
-    self.active_count -= 1;
     let commit_ts = self.next_commit_ts;
     self.next_commit_ts += 1;
-    tx.commit_ts = Some(commit_ts);
-    tx.status = MvccTxStatus::Committed;
 
-    // Track wall clock time for retention mapping
-    self
-      .commit_ts_to_wall_clock
-      .insert(commit_ts, current_time_ms());
+    // Track wall clock time for the retention horizon: the first commit of
+    // each millisecond stands for the rest.
+    let now = current_time_ms();
+    if self
+      .commit_wall_clock
+      .back()
+      .is_none_or(|&(_, last)| now > last)
+    {
+      self.commit_wall_clock.push_back((commit_ts, now));
+    }
 
-    // Index writes for fast conflict detection
-    // Store only the max commitTs per key (simpler and faster than array)
-    let write_set: Vec<TxKey> = tx.write_set.iter().cloned().collect();
-    for key in write_set {
-      let existing = self.committed_writes.get(&key).copied();
-      let should_update = match existing {
-        None => true,
-        Some(existing_ts) => commit_ts > existing_ts,
-      };
-      if should_update {
-        self.committed_writes.insert(key, commit_ts);
+    // Index writes for fast conflict detection, storing only the max commitTs
+    // per key. Only a transaction that began before a commit can conflict
+    // with it: with none open, nothing indexed can conflict any more.
+    if self.active_txs.is_empty() {
+      self.total_pruned += self.committed_writes.len();
+      self.committed_writes.clear();
+      self.committed_writes_log.clear();
+      return Ok(commit_ts);
+    }
+    if !tx.write_set.is_empty() {
+      self.newest_indexed_ts = commit_ts;
+    }
+    for key in tx.write_set {
+      let newer = self
+        .committed_writes
+        .get(&key)
+        .is_none_or(|&existing_ts| commit_ts > existing_ts);
+      if newer {
+        self.committed_writes.insert(key.clone(), commit_ts);
+        self.committed_writes_log.push_back((commit_ts, key));
       }
     }
 
     if self.committed_writes.len() > MAX_COMMITTED_WRITES {
       self.prune_committed_writes();
     }
-
-    // Eager cleanup: if no other active transactions, clean up immediately
-    // This prevents unbounded growth of activeTxs in serial workloads
-    if self.active_count == 0 {
-      self.active_txs.remove(&txid);
+    if self.committed_writes_log.len() > 2 * self.committed_writes.len() + COMMIT_LOG_SLACK {
+      self.compact_committed_writes_log();
     }
 
     Ok(commit_ts)
   }
 
-  /// Abort a transaction
+  /// Abort a transaction and drop its record
   pub fn abort_tx(&mut self, txid: TxId) {
-    if let Some(tx) = self.active_txs.get_mut(&txid) {
-      if tx.status == MvccTxStatus::Active {
-        self.active_count -= 1;
-      }
-      tx.status = MvccTxStatus::Aborted;
-      tx.commit_ts = None;
-    }
-    // Remove immediately on abort
     self.active_txs.remove(&txid);
   }
 
-  /// Remove a committed transaction (called by GC when safe)
+  /// Drop a transaction's record without committing it. Commit and abort
+  /// already drop theirs.
   pub fn remove_tx(&mut self, txid: TxId) {
-    if let Some(tx) = self.active_txs.get(&txid) {
-      if tx.status == MvccTxStatus::Active {
-        // This shouldn't happen, but handle it gracefully
-        // Note: We can't decrement active_count here because we have immutable borrow
-      }
-    }
-    // Need separate removal to avoid borrow issues
-    if let Some(tx) = self.active_txs.remove(&txid) {
-      if tx.status == MvccTxStatus::Active {
-        // Adjust count after removal if it was still active
-        // This is a safety measure, normally remove_tx is called on committed txs
-      }
-    }
+    self.active_txs.remove(&txid);
   }
 
   /// Get all active transaction IDs
   pub fn active_tx_ids(&self) -> Vec<TxId> {
-    self
-      .active_txs
-      .values()
-      .filter(|tx| tx.status == MvccTxStatus::Active)
-      .map(|tx| tx.txid)
-      .collect()
+    self.active_txs.keys().copied().collect()
   }
 
-  /// Get transaction count (O(1) using tracked counter)
+  /// Number of active transactions
   pub fn active_count(&self) -> usize {
-    self.active_count
+    self.active_txs.len()
   }
 
   /// Check if there are other active transactions besides the given one
   /// Fast path for determining if version chains are needed
-  /// O(1) using tracked counter
   pub fn has_other_active_transactions(&self, _exclude_txid: TxId) -> bool {
-    // Fast path: if only 0 or 1 active, no need to iterate
-    self.active_count > 1
+    self.active_txs.len() > 1
   }
 
   /// Get the next commit timestamp (for snapshot reads outside transactions)
@@ -245,7 +237,7 @@ impl TxManager {
     self.next_commit_ts
   }
 
-  /// Get all transactions (for debugging/recovery)
+  /// Get all active transactions (for debugging/recovery)
   pub fn all_txs(&self) -> impl Iterator<Item = (&TxId, &MvccTransaction)> {
     self.active_txs.iter()
   }
@@ -262,6 +254,12 @@ impl TxManager {
     })
   }
 
+  /// Whether a transaction that began at `start_ts` can conflict with any
+  /// indexed write (`has_conflicting_write` is false for every key otherwise)
+  pub fn has_writes_since(&self, start_ts: Timestamp) -> bool {
+    self.newest_indexed_ts >= start_ts
+  }
+
   /// Check if there's a conflicting write for a key (fast path for conflict detection)
   /// Returns true if any transaction wrote this key with commitTs >= minCommitTs
   pub fn has_conflicting_write(&self, key: &TxKey, min_commit_ts: Timestamp) -> bool {
@@ -276,8 +274,9 @@ impl TxManager {
   pub fn clear(&mut self) {
     self.active_txs.clear();
     self.committed_writes.clear();
-    self.commit_ts_to_wall_clock.clear();
-    self.active_count = 0;
+    self.committed_writes_log.clear();
+    self.newest_indexed_ts = 0;
+    self.commit_wall_clock.clear();
     self.total_pruned = 0;
   }
 
@@ -296,30 +295,29 @@ impl TxManager {
     self.next_commit_ts = commit_ts;
   }
 
-  /// Get the oldest commit timestamp that is newer than the retention period
+  /// Get the oldest commit timestamp younger than the retention period (the
+  /// next commit timestamp when none is)
   pub fn retention_horizon_ts(&self, retention_ms: u64) -> Timestamp {
     let cutoff_time = current_time_ms().saturating_sub(retention_ms);
-    let mut oldest_within_retention = self.next_commit_ts;
-
-    for (commit_ts, wall_clock) in &self.commit_ts_to_wall_clock {
-      if *wall_clock >= cutoff_time && *commit_ts < oldest_within_retention {
-        oldest_within_retention = *commit_ts;
-      }
-    }
-
-    oldest_within_retention
+    let first_retained = self
+      .commit_wall_clock
+      .partition_point(|&(_, wall_clock)| wall_clock <= cutoff_time);
+    self
+      .commit_wall_clock
+      .get(first_retained)
+      .map_or(self.next_commit_ts, |&(commit_ts, _)| commit_ts)
   }
 
   /// Prune old wall clock mappings older than the given horizon
   pub fn prune_wall_clock_mappings(&mut self, horizon_ts: Timestamp) {
-    let to_remove: Vec<Timestamp> = self
-      .commit_ts_to_wall_clock
-      .keys()
-      .copied()
-      .filter(|ts| *ts < horizon_ts)
-      .collect();
-    for ts in to_remove {
-      self.commit_ts_to_wall_clock.remove(&ts);
+    // An entry stands for the commits up to the next entry's: drop it once
+    // all of them are older than the horizon.
+    while self
+      .commit_wall_clock
+      .get(1)
+      .is_some_and(|&(next_ts, _)| next_ts <= horizon_ts)
+    {
+      self.commit_wall_clock.pop_front();
     }
   }
 
@@ -331,38 +329,62 @@ impl TxManager {
     }
   }
 
+  /// Drop the oldest committed-write entries, down to the prune target. Only
+  /// entries older than every active snapshot (`commit_ts < min_active_ts`) can
+  /// go: no active or future transaction can conflict with them. Stops at the
+  /// first entry a snapshot still needs, so with a long-lived reader it costs
+  /// one look at the oldest entry.
   fn prune_committed_writes(&mut self) {
     let min_ts = self.min_active_ts();
-    let mut entries: Vec<(&TxKey, Timestamp)> =
-      self.committed_writes.iter().map(|(k, &v)| (k, v)).collect();
-
-    entries.sort_by_key(|(_, ts)| *ts);
-
     let target_size = MAX_COMMITTED_WRITES.saturating_sub(PRUNE_THRESHOLD_ENTRIES);
-    let mut current_size = self.committed_writes.len();
-    let mut to_remove: Vec<TxKey> = Vec::new();
-
-    for (key, commit_ts) in entries {
-      if current_size <= target_size {
-        break;
-      }
-
-      if commit_ts < min_ts {
-        to_remove.push(key.clone());
-        current_size = current_size.saturating_sub(1);
-      } else {
-        break;
-      }
-    }
-
     let mut pruned = 0;
-    for key in to_remove {
-      if self.committed_writes.remove(&key).is_some() {
+
+    while self.committed_writes.len() > target_size {
+      #[cfg(test)]
+      {
+        self.prune_work += 1;
+      }
+      match self.committed_writes_log.front() {
+        Some((commit_ts, _)) if *commit_ts < min_ts => {}
+        _ => break,
+      }
+      let Some((commit_ts, key)) = self.committed_writes_log.pop_front() else {
+        break;
+      };
+      // A stale entry's key was rewritten later; that entry still holds it.
+      if self.committed_writes.get(&key) == Some(&commit_ts) {
+        self.committed_writes.remove(&key);
         pruned += 1;
       }
     }
 
     self.total_pruned += pruned;
+  }
+
+  /// Drop stale log entries (keys a later commit rewrote). Runs once stale
+  /// entries outnumber live ones, so its cost is amortized over the commits
+  /// that made them.
+  fn compact_committed_writes_log(&mut self) {
+    #[cfg(test)]
+    {
+      self.prune_work += self.committed_writes_log.len() as u64;
+    }
+    let committed_writes = &self.committed_writes;
+    self
+      .committed_writes_log
+      .retain(|(commit_ts, key)| committed_writes.get(key) == Some(commit_ts));
+  }
+
+  /// Wall clock entries kept for the retention horizon (test instrumentation)
+  #[cfg(test)]
+  pub(crate) fn wall_clock_len(&self) -> usize {
+    self.commit_wall_clock.len()
+  }
+
+  /// Length of the commit-order log behind pruning (test instrumentation)
+  #[cfg(test)]
+  pub(crate) fn committed_writes_log_len(&self) -> usize {
+    self.committed_writes_log.len()
   }
 }
 
@@ -396,19 +418,14 @@ pub struct CommittedWritesStats {
 /// Errors that can occur in the transaction manager
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TxManagerError {
-  /// Transaction not found
+  /// Transaction not found (never begun, or already committed or aborted)
   TxNotFound(TxId),
-  /// Transaction is not active
-  TxNotActive(TxId, MvccTxStatus),
 }
 
 impl std::fmt::Display for TxManagerError {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     match self {
       TxManagerError::TxNotFound(txid) => write!(f, "Transaction {txid} not found"),
-      TxManagerError::TxNotActive(txid, status) => {
-        write!(f, "Transaction {txid} is not active (status: {status:?})")
-      }
     }
   }
 }
@@ -494,16 +511,24 @@ mod tests {
   #[test]
   fn test_commit_tx() {
     let mut tx_mgr = TxManager::new();
+    let (other, _) = tx_mgr.begin_tx();
     let (txid, _) = tx_mgr.begin_tx();
 
     tx_mgr.record_write(txid, key("key1"));
 
     let commit_ts = tx_mgr.commit_tx(txid).expect("expected value");
     assert_eq!(commit_ts, 1);
-    assert_eq!(tx_mgr.active_count(), 0);
+    assert_eq!(tx_mgr.active_count(), 1);
 
-    // Check committed writes tracking
+    // Indexed for the transaction still open, which began before it
     assert!(tx_mgr.has_conflicting_write(&key("key1"), 1));
+
+    // With nothing open, nothing indexed can conflict any more
+    tx_mgr.abort_tx(other);
+    let (last, _) = tx_mgr.begin_tx();
+    tx_mgr.commit_tx(last).expect("commit last");
+    assert!(!tx_mgr.has_conflicting_write(&key("key1"), 0));
+    assert_eq!(tx_mgr.committed_writes_stats().size, 0);
   }
 
   #[test]
@@ -595,6 +620,7 @@ mod tests {
     // No writes yet
     assert!(!tx_mgr.has_conflicting_write(&key("key1"), 0));
 
+    let (_open, _) = tx_mgr.begin_tx();
     let (txid, _) = tx_mgr.begin_tx();
     tx_mgr.record_write(txid, key("key1"));
     tx_mgr.commit_tx(txid).expect("expected value");
@@ -609,6 +635,7 @@ mod tests {
   #[test]
   fn test_committed_write_ts() {
     let mut tx_mgr = TxManager::new();
+    let (_open, _) = tx_mgr.begin_tx();
     let (txid, _) = tx_mgr.begin_tx();
     tx_mgr.record_write(txid, key("key1"));
     tx_mgr.commit_tx(txid).expect("expected value");
@@ -686,30 +713,25 @@ mod tests {
   fn test_remove_tx() {
     let mut tx_mgr = TxManager::new();
 
-    // Start two transactions so committed one isn't auto-cleaned
     let (txid1, _) = tx_mgr.begin_tx();
     let (txid2, _) = tx_mgr.begin_tx();
 
+    // Commit drops the record even while another transaction is active
     tx_mgr.commit_tx(txid1).expect("expected value");
-
-    // tx1 should still be in active_txs because there's another active tx
-    assert!(tx_mgr.tx(txid1).is_some());
-
-    // Remove it manually (like GC would do)
-    tx_mgr.remove_tx(txid1);
     assert!(tx_mgr.tx(txid1).is_none());
+    assert_eq!(
+      tx_mgr.commit_tx(txid1),
+      Err(TxManagerError::TxNotFound(txid1))
+    );
 
-    // tx2 should still be there
-    assert!(tx_mgr.tx(txid2).is_some());
+    tx_mgr.remove_tx(txid2);
+    assert!(tx_mgr.tx(txid2).is_none());
+    assert_eq!(tx_mgr.active_count(), 0);
   }
 
   #[test]
   fn test_error_display() {
     let err1 = TxManagerError::TxNotFound(42);
     assert_eq!(err1.to_string(), "Transaction 42 not found");
-
-    let err2 = TxManagerError::TxNotActive(42, MvccTxStatus::Committed);
-    assert!(err2.to_string().contains("42"));
-    assert!(err2.to_string().contains("not active"));
   }
 }

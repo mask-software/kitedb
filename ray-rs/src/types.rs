@@ -676,22 +676,17 @@ impl fmt::Display for TxKey {
   }
 }
 
-/// MVCC transaction metadata
+/// A set of conflict keys, hashed fast (keys are internal ids, not user input).
+pub type TxKeySet = hashbrown::HashSet<TxKey>;
+
+/// An active MVCC transaction: its snapshot and what it read and wrote, for
+/// its commit-time conflict check. Commit and abort drop it.
 #[derive(Debug, Clone)]
 pub struct MvccTransaction {
   pub txid: TxId,
   pub start_ts: Timestamp,
-  pub commit_ts: Option<Timestamp>,
-  pub status: MvccTxStatus,
-  pub read_set: HashSet<TxKey>,
-  pub write_set: HashSet<TxKey>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MvccTxStatus {
-  Active,
-  Committed,
-  Aborted,
+  pub read_set: TxKeySet,
+  pub write_set: TxKeySet,
 }
 
 /// Versioned record for MVCC

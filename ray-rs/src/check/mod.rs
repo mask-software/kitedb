@@ -5,9 +5,13 @@
 //! Loading a snapshot checks what its accessors need to stay in bounds.
 //! `check_snapshot` also checks the invariants the accessors silently rely
 //! on: the sort orders binary searches assume, in/out edge reciprocity, the
-//! node ID mapping, the key index, schema ID ranges and string encoding. It
-//! never panics on a corrupt snapshot, and keeps at most
-//! `MAX_REPORTED_MESSAGES` errors and warnings each.
+//! node ID mapping, the key index and string encoding. It never panics on a
+//! corrupt snapshot, and keeps at most `MAX_REPORTED_MESSAGES` errors and
+//! warnings each.
+//!
+//! Schema IDs outside the defined ranges are warnings, not errors: the
+//! low-level API accepts label, edge type and property key IDs that were
+//! never defined, and every name lookup is bounds-checked.
 
 use crate::core::snapshot::node_map::{self, NodeIdMapLayout};
 use crate::core::snapshot::reader::SnapshotData;
@@ -520,8 +524,11 @@ fn check_string_table(report: &mut Report, snapshot: &SnapshotData, num_strings:
   true
 }
 
-/// Labels, edge types and property keys stored per node or edge must be
-/// schema IDs: `1..=num_labels`, `1..=num_etypes`, `1..=num_propkeys`.
+/// Labels, edge types and property keys stored per node or edge should be
+/// defined schema IDs: `1..=num_labels`, `1..=num_etypes`, `1..=num_propkeys`.
+/// Others are warnings: the low-level API (`add_edge`, `add_node_label`,
+/// `set_node_prop`) accepts IDs that were never defined, and the snapshot
+/// stores them as they are.
 fn check_schema_ids(report: &mut Report, snapshot: &SnapshotData, counts: &Counts) {
   let mut check = |name: &str, kind: &str, data: &[u8], len: usize, max_id: u64| {
     let len = len.min(data.len() / 4);
@@ -531,8 +538,9 @@ fn check_schema_ids(report: &mut Report, snapshot: &SnapshotData, counts: &Count
     });
     if let Some(first) = outside.next() {
       let total = 1 + outside.count();
-      report.error(format!(
-        "{name}: {total} entries are not {kind} IDs 1..={max_id} (first: {name}[{first}] = {})",
+      report.warning(format!(
+        "{name}: {total} entries are not defined {kind} IDs 1..={max_id} (first: \
+         {name}[{first}] = {})",
         read_u32_at(data, first)
       ));
     }
