@@ -7,6 +7,9 @@ All notable changes to this project will be documented in this file.
 ### Added
 - `KiteOptions::strict_schema(true)` (Rust) enforces `required` props on create and checks values against their declared `prop_type` on every create/update (int<->float coerced only when lossless), failing with the new `KiteError::SchemaViolation`. Off by default.
 - CI runs Rust tests, clippy, rustfmt, and the Node (ava), Python (pytest) and Bun (playground, tui) suites on every pull request and push to main.
+- Node: `strictSchema` in the Kite options turns on the strict schema mode; every prop declared without `optional()` is then required on create.
+- Node: `KitePath.weight(prop)` and `shortestPath().weight(prop)` weigh edges by a numeric edge prop in `dijkstra()` and `kShortest()` (an edge without the prop weighs 1). Previously Kite's `dijkstra()` always counted hops.
+- Node: `Database.transaction(fn)`, with the same async-context ownership as `Kite.transaction()`: while an async transaction is open, writes from other async contexts throw and other async transactions wait.
 
 ### Changed
 - **Snapshot format v5**: the node-id map switches to a sparse sorted table when ids are spread out, and section sizes and string offsets are 64-bit. Huge custom node ids (e.g. 3e9, 2^40, `i64::MAX`) no longer make checkpoints and opens allocate gigabytes or leave the database unopenable, and sections beyond 4 GiB round-trip. v4 databases still open and are upgraded at the next checkpoint; older releases cannot open v5 snapshots.
@@ -25,6 +28,9 @@ All notable changes to this project will be documented in this file.
 - The WAL size is optional when reopening a database. `SingleFileOpenOptions.wal_size` is now `Option<usize>` (default `None`): an existing file opens with the WAL size recorded in its header, and a new file gets the 4MB default. An explicit size (`.wal_size(n)`, unchanged) still creates new files with that size and rejects existing files whose WAL differs. The Node (`walSize`, `walSizeMb`) and Python (`wal_size`) options follow the same rule when left unset. Rust code that reads or assigns the field directly must now handle an `Option`.
 - Writers that fill the WAL's secondary region while a background checkpoint runs now wait for it to install instead of failing with `WalBufferFull`. The auto-checkpoint can also run after a failed commit, after a rollback, and in `begin` when the WAL is full.
 - `background_checkpoint()` returns the new `KiteError::CheckpointDeclined` when it declines to start (previously `WalBufferFull` or `InvalidWal`).
+- TS: `node()` throws when a key function does not return `<prefix>${id}`. Key functions are only probed for their prefix, so one like ``(id) => `user:${id}:v2` `` silently stored `user:<id>`, and a validating one failed with its own error. Use a template or parts key spec for other key shapes.
+- TS: `bulkWrite`'s `chunkSize` and `batchAdaptive`'s `maxBatch`/`minBatch` must be positive integers. Previously `chunkSize: NaN` looped forever, `maxBatch: NaN` silently dropped every operation, and `0` was treated as 1.
+- Node: `KitePath.direction()` accepts any letter case, including `TraversalDirection.In`, and throws on unknown values. Previously anything but lowercase `'out'`/`'in'`/`'both'` silently meant `'out'`.
 
 ### Fixed
 - Vacuum and WAL resize are crash-safe: both header slots name a valid layout afterwards (a torn newest slot no longer makes the file unopenable), a failure at any step leaves the database readable, `min_wal_size` can no longer shrink the WAL below 16 pages, and vectors committed since the last checkpoint are kept.
@@ -60,7 +66,12 @@ All notable changes to this project will be documented in this file.
 - With MVCC on, `create_node_with_id` and `upsert_edge_with_props` decide against the committed state plus the transaction's own changes instead of possibly stale version chains, so an upsert can no longer silently drop an edge and an explicit id can no longer duplicate a live node. `upsert_edge_with_props` / `Kite::upsert_edge` to a deleted endpoint now fails with `NodeNotFound` instead of storing a stray edge property.
 - Python: long-running calls (open/close, begin/commit, checkpoint, optimize, vacuum, export/import, backup/restore, replication catch-up, `wait_for_token`, index training, OTLP pushes) release the GIL; interrupted transactions are rolled back; `VectorIndex.search` no longer drops hits evicted from its cache; multi-hop traversals no longer return duplicates.
 - Node: retried insert/upsert executors (e.g. `batchAdaptive` after WAL-full) keep their props, and `whereNode`/`whereEdge` callbacks are released when the traversal is collected.
+- Node: Kite traversal filters apply where they are written. `whereNode(f).take(n)` returns up to n matching nodes (the limit was applied before the filter, so it could return none), a second `whereNode`/`whereEdge` narrows the first instead of replacing it, and a filter between two hops filters the first hop instead of the last. Unfiltered `nodes()`, `edges()` and `count()` no longer load every result's props.
+- Node: schemas using `withDefault()` open. `kite()`/`kiteSync()` rejected them with "Missing field `propType`"; the defaults are now applied on insert.
+- Node: edge props named `src`, `dst` or `etype` no longer overwrite the edge's identity in `whereEdge` callbacks.
+- Node: `batchAdaptive` checkpoints again after shrinking a batch that hit a full WAL. Previously it checkpointed only once and then failed.
 - Playground graph view, path finding and impact analysis work again on the native engine.
 
 ### Security
+- TS replication admin auth helper: `mode` is required (`'none'` disables auth explicitly); a config without one allowed every request. A client-certificate header no longer authorizes by its mere presence: it is trusted only with `trustForwardedClientCert: true` and an `mtlsSubjectRegex`, which must now match the whole header value, and the mTLS modes need that or an `mtlsMatcher`. Bearer tokens are compared in constant time.
 - Playground: uploads are stored under a fixed name in a private temp directory, so a crafted filename can no longer write outside it. The server binds `127.0.0.1` by default (`PLAYGROUND_HOST`), allows only listed CORS origins (`PLAYGROUND_ALLOWED_ORIGINS`), opens databases only inside `PLAYGROUND_DATA_DIR`, and disables replication admin endpoints unless `REPLICATION_ADMIN_TOKEN` or mTLS is configured (tokens compared in constant time).
