@@ -46,6 +46,8 @@ enum CheckpointPhase {
   /// snapshot is not built yet.
   CutReleased,
   SnapshotPageWritten,
+  /// Every page of the new snapshot is written; the sync comes next.
+  SnapshotWritten,
   SnapshotDurable,
   HeaderWritten,
   HeaderDurable,
@@ -1813,6 +1815,7 @@ impl SingleFileDB {
       pager.write_page(start_page + i, &page_data)?;
       self.reach_checkpoint_phase(CheckpointPhase::SnapshotPageWritten)?;
     }
+    self.reach_checkpoint_phase(CheckpointPhase::SnapshotWritten)?;
 
     let _step = self.checkpoint_step("sync snapshot");
     pager.sync()?;

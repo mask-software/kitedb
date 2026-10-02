@@ -1,5 +1,5 @@
 //! raydb-b4 `commit-pipeline` lane: commits during a background checkpoint
-//! (engine-concurrency F6), held at a phase hook instead of timed. Included
+//! (engine-concurrency F6), held at phase hooks instead of timed. Included
 //! from checkpoint.rs for its phase hooks.
 use super::*;
 use crate::core::single_file::{open_single_file, SingleFileOpenOptions, SyncMode};
@@ -10,7 +10,7 @@ use tempfile::tempdir;
 /// Commits made while the checkpoint is held.
 const COMMITS: usize = 20;
 /// How long they get. Each takes milliseconds; only commits that wait for the
-/// checkpoint to finish run out of it.
+/// checkpoint to move on run out of it.
 const COMMIT_DEADLINE: Duration = Duration::from_secs(20);
 
 fn commit_node(db: &SingleFileDB, key: &str) {
@@ -29,11 +29,39 @@ fn commit_node(db: &SingleFileDB, key: &str) {
 #[test]
 fn f6_commits_complete_while_a_background_checkpoint_is_held_after_its_cut() {
   for mvcc in [false, true] {
-    commits_while_background_checkpoint_is_held(mvcc);
+    commits_while_background_checkpoint_is_held(
+      CheckpointPhase::CutReleased,
+      CheckpointPhase::SnapshotDurable,
+      mvcc,
+    );
   }
 }
 
-fn commits_while_background_checkpoint_is_held(mvcc: bool) {
+/// Commits complete while a background checkpoint writes and syncs its
+/// snapshot: held after its first page is written, then again before its
+/// sync. No header names those pages until the install, so nothing orders
+/// commits after them. Under machine load the checkpoint wrote and synced
+/// them holding the pager lock, which every commit takes to append to the
+/// WAL, and a slow fsync stalled every commit.
+#[test]
+fn f6_commits_complete_while_a_background_checkpoint_writes_its_snapshot() {
+  for mvcc in [false, true] {
+    commits_while_background_checkpoint_is_held(
+      CheckpointPhase::SnapshotPageWritten,
+      CheckpointPhase::SnapshotWritten,
+      mvcc,
+    );
+  }
+}
+
+/// Run a background checkpoint, and once it has reached `reached`, commit
+/// while it is held at `held` (reached at or after `reached`); the commits
+/// must complete before it is released.
+fn commits_while_background_checkpoint_is_held(
+  reached: CheckpointPhase,
+  held: CheckpointPhase,
+  mvcc: bool,
+) {
   let dir = tempdir().expect("tempdir");
   let path = dir.path().join(format!("f6-held-mvcc-{mvcc}.kitedb"));
   let options = SingleFileOpenOptions::new()
@@ -46,21 +74,16 @@ fn commits_while_background_checkpoint_is_held(mvcc: bool) {
     commit_node(&db, &format!("pre-{index}"));
   }
 
-  let cut_released = Arc::new(Barrier::new(2));
-  let snapshot_durable = Arc::new(Barrier::new(2));
-  set_checkpoint_test_barrier(&db, CheckpointPhase::CutReleased, Arc::clone(&cut_released));
-  set_checkpoint_test_barrier(
-    &db,
-    CheckpointPhase::SnapshotDurable,
-    Arc::clone(&snapshot_durable),
-  );
+  let reached_barrier = Arc::new(Barrier::new(2));
+  let held_barrier = Arc::new(Barrier::new(2));
+  set_checkpoint_test_barrier(&db, reached, Arc::clone(&reached_barrier));
+  set_checkpoint_test_barrier(&db, held, Arc::clone(&held_barrier));
   let checkpointer = {
     let db = Arc::clone(&db);
     std::thread::spawn(move || db.background_checkpoint())
   };
-  // Its cut is taken and the gate open again. From here it collects, writes
-  // and syncs its snapshot, then parks before its install.
-  cut_released.wait();
+  // From here it runs on to `held` and parks there.
+  reached_barrier.wait();
 
   let (done_tx, done_rx) = mpsc::channel();
   let committer = {
@@ -75,7 +98,7 @@ fn commits_while_background_checkpoint_is_held(mvcc: bool) {
   let finished = done_rx.recv_timeout(COMMIT_DEADLINE).is_ok();
   let still_running = db.checkpoint_state.lock().status == CheckpointStatus::Running;
   // Release the run either way, so a failure ends instead of hanging.
-  snapshot_durable.wait();
+  held_barrier.wait();
   checkpointer
     .join()
     .expect("checkpointer")
@@ -85,7 +108,7 @@ fn commits_while_background_checkpoint_is_held(mvcc: bool) {
   assert!(
     finished,
     "{COMMITS} commits did not finish within {COMMIT_DEADLINE:?} while a background checkpoint \
-     (mvcc: {mvcc}) was held between its cut and its install"
+     (mvcc: {mvcc}) was held at {held:?}"
   );
   assert!(still_running, "the checkpoint was not running meanwhile");
   for index in 0..COMMITS {
