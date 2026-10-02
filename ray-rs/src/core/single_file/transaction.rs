@@ -22,10 +22,11 @@
 //!    MVCC unstages its members, and each fails.
 //! 2. Under the publish lock, taken before the commit lock is released, so
 //!    groups publish in order (`publish_commits`): `for each member: schema
-//!    publish -> one delta.write() section with each member's MVCC commit
-//!    timestamp, version chains, vectors and delta merge, in order`. Every
-//!    step runs: the group is durable. Meanwhile the lead has passed on, and
-//!    the next group is written.
+//!    publish -> one publish section, holding the delta (upgradable, written
+//!    from the first merge on), with each member's MVCC commit timestamp,
+//!    version chains, vectors and delta merge, in order`. Every step runs:
+//!    the group is durable. Meanwhile the lead has passed on, and the next
+//!    group is written.
 //!
 //! An MVCC transaction never begins inside a publish section (see
 //! `begin_with_mode`), so a snapshot holds each commit entirely or not at
@@ -42,7 +43,7 @@ use crate::mvcc::TxKeyGroups;
 use crate::replication::primary::PrimaryReplicationStatus;
 use crate::replication::types::CommitToken;
 use crate::types::*;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLockUpgradableReadGuard, RwLockWriteGuard};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::marker::PhantomData;
 use std::rc::Rc;
@@ -371,12 +372,29 @@ impl Drop for CommitLeader<'_> {
   }
 }
 
-/// A publish's hold of the snapshot and the version chains, for the commits
-/// of its group that record history (`SingleFileDB::record_mvcc_history`).
-type HistoryHold<'a> = (
-  parking_lot::RwLockReadGuard<'a, Option<crate::core::snapshot::reader::SnapshotData>>,
-  crate::mvcc::HistoryWriter<'a>,
-);
+/// A publish's hold of the committed delta (see `publish_commits`):
+/// upgradable, so reads go on, until its first merge, then written.
+enum PublishDelta<'a> {
+  Reading(RwLockUpgradableReadGuard<'a, DeltaState>),
+  Merging(RwLockWriteGuard<'a, DeltaState>),
+}
+
+impl<'a> PublishDelta<'a> {
+  fn state(&self) -> &DeltaState {
+    match self {
+      Self::Reading(delta) => delta,
+      Self::Merging(delta) => delta,
+    }
+  }
+
+  /// The delta, written: once its readers are done, the first time.
+  fn merging(self) -> RwLockWriteGuard<'a, DeltaState> {
+    match self {
+      Self::Reading(delta) => RwLockUpgradableReadGuard::upgrade(delta),
+      Self::Merging(delta) => delta,
+    }
+  }
+}
 
 /// A commit group's publish section (see `publish_commits`): makes
 /// `SingleFileDB::publish_seq` odd until dropped, also on unwind.
@@ -683,9 +701,9 @@ impl SingleFileDB {
     let _checkpoint_gate = self.checkpoint_gate.read();
     let (txid, snapshot_ts) = if let Some(mvcc) = self.mvcc.as_ref() {
       // A commit group takes its members' timestamps, adds their version
-      // chains and merges them into the delta in one `delta.write()` section
-      // (see `publish_commits`), so this snapshot holds each entirely or not
-      // at all, and a commit that has not taken its timestamp yet sees this
+      // chains and merges them into the delta in one publish section (see
+      // `publish_commits`), so this snapshot holds each entirely or not at
+      // all, and a commit that has not taken its timestamp yet sees this
       // transaction as a reader that needs version chains. A begin does not
       // complete inside such a section: it waits for the section, and
       // begins again if one started meanwhile (`publish_seq` is odd during
@@ -693,7 +711,7 @@ impl SingleFileDB {
       let (txid, snapshot_ts) = loop {
         let seq = self.publish_seq.load(Ordering::SeqCst);
         if seq % 2 == 1 {
-          drop(self.delta.read());
+          self.wait_for_publish_section(seq);
           continue;
         }
         let begun = mvcc.tx_manager.lock().begin_tx();
@@ -726,6 +744,21 @@ impl SingleFileDB {
       self.active_writers.fetch_add(1, Ordering::SeqCst);
     }
     Ok(txid)
+  }
+
+  /// Wait for the publish section `seq` (odd: see `publish_commits`) to end:
+  /// spin briefly, then wait for its merges (`delta.write()`) or yield.
+  fn wait_for_publish_section(&self, seq: u64) {
+    let mut spins = 0u32;
+    while self.publish_seq.load(Ordering::SeqCst) == seq {
+      if spins < 64 {
+        spins += 1;
+        std::hint::spin_loop();
+      } else {
+        drop(self.delta.read());
+        std::thread::yield_now();
+      }
+    }
   }
 
   /// Run `write` under the WAL lock. If the WAL refuses the record because
@@ -937,12 +970,11 @@ impl SingleFileDB {
   }
 
   /// Record the changes of `request`'s commit in the MVCC version chains, for the
-  /// transactions still open (see `mvcc_history`), under `hold`, which the first commit of a
-  /// publish to record takes and keeps for the rest. With none open, no reader can need the
-  /// state the commit replaces: every later read sees the commit, in the delta.
-  fn record_mvcc_history<'a>(
-    &'a self,
-    hold: &mut Option<HistoryHold<'a>>,
+  /// transactions still open (see `mvcc_history`), against the committed state `delta` (its
+  /// group's earlier commits merged). With none open, no reader can need the state the
+  /// commit replaces: every later read sees the commit, in the delta.
+  fn record_mvcc_history(
+    &self,
     commit_ts_for_mvcc: Option<(u64, bool)>,
     request: &mut CommitRequest,
     delta: &DeltaState,
@@ -950,16 +982,24 @@ impl SingleFileDB {
     let (Some((commit_ts, true)), Some(mvcc)) = (commit_ts_for_mvcc, self.mvcc.as_ref()) else {
       return;
     };
-    let (snapshot, history) =
-      hold.get_or_insert_with(|| (self.snapshot.read(), mvcc.history_writer()));
-    let snapshot = snapshot.as_ref();
+    // Lock order: see read.rs.
+    let snapshot = self.snapshot.read();
+    let mut history = mvcc.history_writer();
     let pending = &request.pending;
     let plan = match request.history.take() {
       Some(plan) if plan.holds_for(history.chains()) => plan,
       _ => HistoryPlan::of(pending, Some(history.chains())),
     };
     history.record(commit_ts, |vc| {
-      record_commit(vc, delta, snapshot, pending, &plan, request.txid, commit_ts);
+      record_commit(
+        vc,
+        delta,
+        snapshot.as_ref(),
+        pending,
+        &plan,
+        request.txid,
+        commit_ts,
+      );
     });
   }
 
@@ -1784,11 +1824,20 @@ impl SingleFileDB {
 
   /// Make a round's durable commits visible, in WAL order, under the publish
   /// lock (rounds publish in the order they took the commit lock): publish
-  /// their schema; then, in one `delta.write()` critical section, for each
-  /// in order, commit it in MVCC (its timestamp), add its version chains,
-  /// apply its vectors and merge it into the delta. Transactions begin under
-  /// `delta.read()`, so none begins inside the section, and each one begun
-  /// before counts as a reader that needs version chains.
+  /// their schema; then, in one publish section (`publish_seq` odd), commit
+  /// them in MVCC (their timestamps), and for each in order add its version
+  /// chains, apply its vectors and merge it into the delta. No transaction
+  /// begins inside the section, and each one begun before counts as a reader
+  /// that needs version chains.
+  ///
+  /// The section holds the delta upgradable, so reads go on, until its first
+  /// merge, then written. A reader sees no commit of the group until its
+  /// merge: a reader whose snapshot predates the group reads the delta and,
+  /// where the chains answer for it, their versions from before; both hold the
+  /// state before each commit until the commit merges, which waits for the
+  /// reader to release the delta. The chains are held only to record a
+  /// commit, never across the wait for readers: a reader waits for them
+  /// holding the delta.
   ///
   /// Every step runs for every commit even if an earlier one fails: stopping
   /// early would leave a durable transaction out of the delta, invisible
@@ -1814,17 +1863,19 @@ impl SingleFileDB {
       }
     }
 
-    let mut delta = self.delta.write();
+    // Upgradable: reads (and transactions, which read the delta as they
+    // write) go on until the first merge.
+    let mut delta = PublishDelta::Reading(self.delta.upgradable_read());
     let _publishing = PublishSection::enter(&self.publish_seq);
     let mut released_keys = self.commit_in_mvcc(&mut round);
-    let mut history = None;
     for commit in &mut round {
       let request = &mut commit.request;
       let on_committer_thread = request.committer == this_thread;
       if on_committer_thread {
         after_commit_timestamp_test_hook();
       }
-      self.record_mvcc_history(&mut history, commit.mvcc_commit, request, &delta);
+      self.record_mvcc_history(commit.mvcc_commit, request, delta.state());
+      let mut merged = delta.merging();
 
       // The stores are loaded and the dimensions checked (`write_commit_round`).
       let vector_fault = if on_committer_thread {
@@ -1835,12 +1886,12 @@ impl SingleFileDB {
       let vector_result =
         vector_fault.and_then(|()| self.apply_pending_vectors(&request.pending.pending_vectors));
 
-      delta.merge_from(&mut request.pending);
+      merged.merge_from(&mut request.pending);
+      delta = PublishDelta::Merging(merged);
       if commit.published.is_ok() {
         commit.published = vector_result;
       }
     }
-    drop(history);
     drop(_publishing);
     drop(delta);
 

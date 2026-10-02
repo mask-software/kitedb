@@ -7,8 +7,9 @@
 //!
 //! `delta` -> `snapshot` -> `mvcc.tx_manager` -> `mvcc.version_chain` -> `mvcc.gc`
 //!
-//! Every path that holds more than one of these takes them in this order: commit holds
-//! `delta.write()` -> `snapshot.read()` -> `version_chain`, checkpoint installs hold
+//! Every path that holds more than one of these takes them in this order: a commit's publish
+//! holds `delta` (upgradable, then written) -> `snapshot.read()` -> `version_chain`, and
+//! releases the last two before it waits to write the delta; checkpoint installs hold
 //! `delta.write()` -> `snapshot.write()` (then the vector stores) to replace both in one
 //! step (`install_loaded_snapshot`), and GC takes `tx_manager`, `version_chain` and `gc` one
 //! at a time (`mvcc/manager.rs`). Readers take `version_chain` (shared) last, and only when
@@ -24,9 +25,11 @@
 //! hold history (see `mvcc::version_chain`): a read consults them first, and their `*_at`
 //! lookups answer only for a reader whose snapshot predates a change, `None` otherwise, so a
 //! reader newer than every recorded change skips them (`mvcc_history`). Reads
-//! hold `delta` across those lookups, so a commit (which records its versions and merges into
-//! the delta under `delta.write()`) lands completely before or after them. Enumerations add
-//! what only the chains still hold: nodes, edges and keys deleted since the reader's snapshot.
+//! hold `delta` across those lookups. A commit records its versions while reads go on, then
+//! merges into the delta under `delta.write()`: until the merge, which waits for the read, the
+//! delta and the commit's versions both hold the state before it, and a reader that sees the
+//! commit cannot begin before the merge. Enumerations add what only the chains still hold:
+//! nodes, edges and keys deleted since the reader's snapshot.
 
 use std::collections::HashMap;
 use std::ops::{Bound, ControlFlow};
@@ -541,8 +544,9 @@ impl SingleFileDB {
 
   /// The version chains, shared, when they can answer for a reader at `snapshot_ts`: only
   /// when a commit at or after it recorded history (`MvccManager::history_ts`). Call it
-  /// holding `delta.read()`: commits record history under `delta.write()`, so the answer
-  /// holds for the whole read.
+  /// holding `delta.read()`. A commit may record history meanwhile, but merges only once the
+  /// read is done, so the delta answers for a reader that skips the chains (see the module
+  /// docs).
   pub(super) fn mvcc_history(
     &self,
     snapshot_ts: Timestamp,
