@@ -161,7 +161,19 @@ fn bench_db(config: &BenchConfig) {
   close_single_file(db).expect("close");
 }
 
+/// Asks macOS to keep the calling thread on performance cores. Hybrid Apple
+/// chips otherwise move bench threads between performance and efficiency
+/// cores, which swings results by 2-5x between runs.
+fn prefer_performance_cores() {
+  #[cfg(target_os = "macos")]
+  // SAFETY: sets the calling thread's QoS class; takes no pointers.
+  unsafe {
+    libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
+  }
+}
+
 fn main() {
+  prefer_performance_cores();
   let config = parse_args();
   println!(
     "mvcc_commit_prune_bench: keys={} commits={} (one reader open throughout)",

@@ -6,7 +6,8 @@
 //!   mixed   4 reader threads (`node_prop`) plus 1 writer committing `update_prop`
 //!   writes  1 writer thread committing small transactions
 //!
-//! Modes (each gets a fresh database with the same seeded graph):
+//! Modes (each gets its own database with the same seeded graph; all stay open,
+//! and every repeat of a case runs the modes back to back):
 //!   off     MVCC disabled
 //!   on      MVCC enabled, no transaction left open
 //!   reader  MVCC enabled, with one read transaction open for the whole run, so every
@@ -25,7 +26,8 @@
 //!   insert        create a keyed node, set one prop, add one edge to a random node
 //!
 //! Each case runs `--repeat` times and reports the median. Sync mode defaults to
-//! off so commit costs are CPU costs, not fsync waits.
+//! off so commit costs are CPU costs, not fsync waits. On macOS, bench threads
+//! ask for performance cores (QoS user-interactive).
 //!
 //! Usage:
 //!   cargo run --release --example mvcc_overhead_bench --no-default-features -- [options]
@@ -36,7 +38,7 @@
 //!   --props-per-node N    Properties per node (default: 4)
 //!   --threads LIST        Reader thread counts for `reads` (default: 1,4,8)
 //!   --duration-ms N       Measurement time per run (default: 1000)
-//!   --repeat N            Runs per case; the median is reported (default: 3)
+//!   --repeat N            Runs per case; the median is reported (default: 5)
 //!   --modes LIST          Comma-separated modes (default: off,on,reader)
 //!   --sections LIST       Comma-separated sections (default: reads,mixed,writes)
 //!   --ops LIST            Read ops for `reads` (default: node_prop,node_props,out_edges,tx_node_prop)
@@ -44,6 +46,9 @@
 //!   --history-nodes N     Nodes with version history in `reader` mode (default: 2000)
 //!   --history-rounds N    History commits in `reader` mode (default: 8)
 //!   --sync-mode MODE      off|normal|full (default: off)
+//!   --wal-mb N            WAL size per database in MiB (default: 4096). Nothing
+//!                         checkpoints during the run, so every commit stays in
+//!                         the WAL; the file is sparse, so only written bytes count.
 
 use std::env;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -51,7 +56,7 @@ use std::sync::{mpsc, Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use tempfile::tempdir;
+use tempfile::{tempdir, TempDir};
 
 use kitedb::core::single_file::{
   close_single_file, open_single_file, SingleFileDB, SingleFileOpenOptions, SyncMode,
@@ -80,6 +85,7 @@ struct BenchConfig {
   history_nodes: usize,
   history_rounds: usize,
   sync_mode: SyncMode,
+  wal_mb: usize,
 }
 
 impl Default for BenchConfig {
@@ -90,7 +96,7 @@ impl Default for BenchConfig {
       props_per_node: 4,
       threads: vec![1, 4, 8],
       duration: Duration::from_millis(1000),
-      repeat: 3,
+      repeat: 5,
       modes: vec![Mode::Off, Mode::On, Mode::Reader],
       sections: vec![Section::Reads, Section::Mixed, Section::Writes],
       ops: vec![
@@ -103,6 +109,7 @@ impl Default for BenchConfig {
       history_nodes: 2_000,
       history_rounds: 8,
       sync_mode: SyncMode::Off,
+      wal_mb: 4096,
     }
   }
 }
@@ -171,6 +178,7 @@ fn parse_args() -> BenchConfig {
       ("--write-ops", Some(v)) => config.write_ops = parse_list(v, WriteOp::parse),
       ("--history-nodes", Some(v)) => config.history_nodes = v.parse().expect("--history-nodes"),
       ("--history-rounds", Some(v)) => config.history_rounds = v.parse().expect("--history-rounds"),
+      ("--wal-mb", Some(v)) => config.wal_mb = v.parse().expect("--wal-mb"),
       ("--sync-mode", Some(v)) => {
         config.sync_mode = match v {
           "off" => SyncMode::Off,
@@ -294,6 +302,17 @@ fn build_history(db: &SingleFileDB, graph: &Graph, config: &BenchConfig) {
   }
 }
 
+/// Asks macOS to keep the calling thread on performance cores. Hybrid Apple
+/// chips otherwise move bench threads between performance and efficiency
+/// cores, which swings results by 2-5x between runs.
+fn prefer_performance_cores() {
+  #[cfg(target_os = "macos")]
+  // SAFETY: sets the calling thread's QoS class; takes no pointers.
+  unsafe {
+    libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
+  }
+}
+
 struct XorShift(u64);
 
 impl XorShift {
@@ -371,6 +390,9 @@ fn write_loop(db: &SingleFileDB, graph: &Graph, op: WriteOp, seed: u64, stop: &A
   commits
 }
 
+/// A worker thread's loop: returns how many operations it ran.
+type Work = Box<dyn FnOnce(&SingleFileDB, &Graph, &AtomicBool) -> u64 + Send>;
+
 /// Runs `readers` threads of `read_op` and, if given, one writer for `duration`.
 /// Returns (reads/s, commits/s).
 fn run_once(
@@ -385,12 +407,13 @@ fn run_once(
   let workers = readers + usize::from(writer.is_some());
   let barrier = Arc::new(Barrier::new(workers + 1));
 
-  let spawn = |work: Box<dyn FnOnce(&SingleFileDB, &Graph, &AtomicBool) -> u64 + Send>| {
+  let spawn = |work: Work| {
     let db = Arc::clone(db);
     let graph = Arc::clone(graph);
     let stop = Arc::clone(&stop);
     let barrier = Arc::clone(&barrier);
     thread::spawn(move || {
+      prefer_performance_cores();
       barrier.wait();
       work(&db, &graph, &stop)
     })
@@ -438,89 +461,150 @@ struct Row {
   value: f64,
 }
 
-fn bench_mode(mode: Mode, config: &BenchConfig, rows: &mut Vec<Row>) {
-  let dir = tempdir().expect("tempdir");
-  let options = SingleFileOpenOptions::new()
-    .mvcc(mode != Mode::Off)
-    .auto_checkpoint(false)
-    .background_checkpoint(false)
-    .sync_mode(config.sync_mode)
-    .wal_size(1024 * 1024 * 1024);
-  let db = Arc::new(open_single_file(dir.path().join("bench.kitedb"), options).expect("open"));
-  let graph = Arc::new(seed(&db, config));
-  let reader = (mode == Mode::Reader).then(|| {
-    let reader = OpenReader::open(&db);
-    build_history(&db, &graph, config);
-    reader
-  });
+/// A seeded database for one mode.
+struct Bench {
+  mode: Mode,
+  db: Arc<SingleFileDB>,
+  graph: Arc<Graph>,
+  reader: Option<OpenReader>,
+  _dir: TempDir,
+}
 
-  let measure = |readers: usize, read_op: ReadOp, writer: Option<WriteOp>| {
-    let runs: Vec<(f64, f64)> = (0..config.repeat)
-      .map(|_| run_once(&db, &graph, readers, read_op, writer, config.duration))
-      .collect();
-    (
-      median(runs.iter().map(|run| run.0).collect()),
-      median(runs.iter().map(|run| run.1).collect()),
-    )
-  };
+impl Bench {
+  fn open(mode: Mode, config: &BenchConfig) -> Self {
+    let dir = tempdir().expect("tempdir");
+    let options = SingleFileOpenOptions::new()
+      .mvcc(mode != Mode::Off)
+      .auto_checkpoint(false)
+      .background_checkpoint(false)
+      .sync_mode(config.sync_mode)
+      .wal_size(config.wal_mb * 1024 * 1024);
+    let db = Arc::new(open_single_file(dir.path().join("bench.kitedb"), options).expect("open"));
+    let graph = Arc::new(seed(&db, config));
+    let reader = (mode == Mode::Reader).then(|| {
+      let reader = OpenReader::open(&db);
+      build_history(&db, &graph, config);
+      reader
+    });
+    Self {
+      mode,
+      db,
+      graph,
+      reader,
+      _dir: dir,
+    }
+  }
 
+  fn close(self) {
+    drop(self.reader);
+    drop(self.graph);
+    let db = Arc::try_unwrap(self.db).unwrap_or_else(|_| panic!("db still shared"));
+    close_single_file(db).expect("close");
+  }
+}
+
+/// One measured workload.
+#[derive(Clone, Copy)]
+enum Case {
+  Read(ReadOp, usize),
+  Mixed,
+  Write(WriteOp),
+}
+
+fn cases(config: &BenchConfig) -> Vec<Case> {
+  let mut cases = Vec::new();
   for &section in &config.sections {
     match section {
       Section::Reads => {
         for &op in &config.ops {
-          for &threads in &config.threads {
-            let (reads, _) = measure(threads, op, None);
-            rows.push(Row {
-              section,
-              op: op.name(),
-              threads: threads.to_string(),
-              metric: "reads/s",
-              mode,
-              value: reads,
-            });
-          }
+          cases.extend(
+            config
+              .threads
+              .iter()
+              .map(|&threads| Case::Read(op, threads)),
+          );
         }
       }
-      Section::Mixed => {
-        let (reads, commits) = measure(MIXED_READERS, ReadOp::NodeProp, Some(WriteOp::UpdateProp));
-        let threads = format!("{MIXED_READERS}r+1w");
+      Section::Mixed => cases.push(Case::Mixed),
+      Section::Writes => cases.extend(config.write_ops.iter().map(|&op| Case::Write(op))),
+    }
+  }
+  cases
+}
+
+/// Runs every case on every mode's database. Each repeat runs the modes back
+/// to back, so load changes on the machine hit all modes alike.
+fn bench_all(config: &BenchConfig, benches: &[Bench]) -> Vec<Row> {
+  let mut rows = Vec::new();
+  for case in cases(config) {
+    let mut samples: Vec<Vec<(f64, f64)>> = vec![Vec::new(); benches.len()];
+    for _ in 0..config.repeat {
+      for (bench, samples) in benches.iter().zip(&mut samples) {
+        let (readers, read_op, writer) = match case {
+          Case::Read(op, threads) => (threads, op, None),
+          Case::Mixed => (MIXED_READERS, ReadOp::NodeProp, Some(WriteOp::UpdateProp)),
+          Case::Write(op) => (0, ReadOp::NodeProp, Some(op)),
+        };
+        samples.push(run_once(
+          &bench.db,
+          &bench.graph,
+          readers,
+          read_op,
+          writer,
+          config.duration,
+        ));
+      }
+    }
+
+    for (bench, samples) in benches.iter().zip(samples) {
+      let reads = median(samples.iter().map(|s| s.0).collect());
+      let commits = median(samples.iter().map(|s| s.1).collect());
+      let mut row = |section, op, threads: String, metric, value| {
         rows.push(Row {
           section,
-          op: ReadOp::NodeProp.name(),
-          threads: threads.clone(),
-          metric: "reads/s",
-          mode,
-          value: reads,
-        });
-        rows.push(Row {
-          section,
-          op: WriteOp::UpdateProp.name(),
+          op,
           threads,
-          metric: "commits/s",
-          mode,
-          value: commits,
-        });
-      }
-      Section::Writes => {
-        for &op in &config.write_ops {
-          let (_, commits) = measure(0, ReadOp::NodeProp, Some(op));
-          rows.push(Row {
-            section,
-            op: op.name(),
-            threads: "1w".to_string(),
-            metric: "commits/s",
-            mode,
-            value: commits,
-          });
+          metric,
+          mode: bench.mode,
+          value,
+        })
+      };
+      match case {
+        Case::Read(op, threads) => row(
+          Section::Reads,
+          op.name(),
+          threads.to_string(),
+          "reads/s",
+          reads,
+        ),
+        Case::Mixed => {
+          let threads = format!("{MIXED_READERS}r+1w");
+          row(
+            Section::Mixed,
+            ReadOp::NodeProp.name(),
+            threads.clone(),
+            "reads/s",
+            reads,
+          );
+          row(
+            Section::Mixed,
+            WriteOp::UpdateProp.name(),
+            threads,
+            "commits/s",
+            commits,
+          );
         }
+        Case::Write(op) => row(
+          Section::Writes,
+          op.name(),
+          "1w".to_string(),
+          "commits/s",
+          commits,
+        ),
       }
     }
   }
-
-  drop(reader);
-  drop(graph);
-  let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("db still shared"));
-  close_single_file(db).expect("close");
+  rows
 }
 
 fn print_table(config: &BenchConfig, rows: &[Row]) {
@@ -575,6 +659,7 @@ fn print_table(config: &BenchConfig, rows: &[Row]) {
 }
 
 fn main() {
+  prefer_performance_cores();
   let config = parse_args();
   println!(
     "mvcc_overhead_bench: nodes={} edges/node={} props/node={} duration={:?} repeat={} \
@@ -590,11 +675,21 @@ fn main() {
     thread::available_parallelism().map_or(0, |n| n.get())
   );
 
-  let mut rows = Vec::new();
-  for &mode in &config.modes {
-    let started = Instant::now();
-    bench_mode(mode, &config, &mut rows);
-    eprintln!("mode {} done in {:?}", mode.name(), started.elapsed());
+  let started = Instant::now();
+  let benches: Vec<Bench> = config
+    .modes
+    .iter()
+    .map(|&mode| Bench::open(mode, &config))
+    .collect();
+  eprintln!(
+    "seeded {} databases in {:?}",
+    benches.len(),
+    started.elapsed()
+  );
+  let rows = bench_all(&config, &benches);
+  eprintln!("measured in {:?}", started.elapsed());
+  for bench in benches {
+    bench.close();
   }
   print_table(&config, &rows);
 }
