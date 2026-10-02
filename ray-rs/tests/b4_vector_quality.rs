@@ -8,15 +8,20 @@
 //     cluster. Nothing re-ranks the candidates by exact distance against the
 //     stored vectors, and the returned distances are the approximate ones.
 //
+// VQ3 Seeded training is not reproducible: parallel k-means sums floats in an
+//     order set by rayon's work split, which depends on the thread count.
+//
 // The datasets are seeded. Index training draws its own k-means seeds, so the
 // recall floors sit well below the measured recall.
 
 use std::collections::HashSet;
 
 use kitedb::api::vector_search::{SimilarOptions, VectorIndex, VectorIndexOptions};
+use kitedb::vector::ivf::kmeans_parallel;
 use kitedb::vector::{
-  create_vector_store, vector_store_insert, DistanceMetric, IvfPqConfig, IvfPqIndex,
-  MultiQueryAggregation, VectorManifest, VectorSearchResult, VectorStoreConfig,
+  create_vector_store, squared_euclidean, vector_store_insert, DistanceMetric, IvfPqConfig,
+  IvfPqIndex, KMeansConfig, MultiQueryAggregation, VectorManifest, VectorSearchResult,
+  VectorStoreConfig,
 };
 
 const DIMS: usize = 128;
@@ -312,4 +317,62 @@ fn b4_vq1_ivf_pq_search_multi_recall_and_exact_distances() {
     ));
   }
   assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+// ============================================================================
+// VQ3: seeded training is not reproducible
+// ============================================================================
+
+/// Contract: parallel k-means with a fixed seed returns the same centroids,
+/// assignments and iteration count however many threads run it (a machine
+/// with another core count rebuilds the same index).
+///
+/// The seed fixes the k-means++ draws, but the parallel centroid update and
+/// inertia sum add floats in an order set by how rayon splits the work, which
+/// depends on the thread count, so the low bits (and through the
+/// convergence check, the iteration count) vary.
+#[test]
+fn b4_vq3_seeded_parallel_kmeans_is_reproducible() {
+  const N: usize = 20_000;
+  const D: usize = 32;
+  let mut rng = Rng::new(0x0B4_0004);
+  let centers: Vec<Vec<f32>> = (0..64)
+    .map(|_| (0..D).map(|_| 4.0 * rng.gaussian()).collect())
+    .collect();
+  let data: Vec<f32> = (0..N)
+    .flat_map(|i| {
+      centers[i % centers.len()]
+        .iter()
+        .map(|&c| c + rng.gaussian())
+        .collect::<Vec<f32>>()
+    })
+    .collect();
+  let config = KMeansConfig::new(64)
+    .with_seed(7)
+    .with_max_iterations(25)
+    .with_tolerance(0.0);
+
+  let run = |threads: usize| {
+    let pool = rayon::ThreadPoolBuilder::new()
+      .num_threads(threads)
+      .build()
+      .expect("thread pool");
+    let result = pool
+      .install(|| kmeans_parallel(&data, N, D, &config, squared_euclidean))
+      .expect("kmeans");
+    let bits: Vec<u32> = result.centroids.iter().map(|c| c.to_bits()).collect();
+    (bits, result.assignments, result.iterations)
+  };
+  let first = run(1);
+  for threads in [2, 3, 8] {
+    let again = run(threads);
+    assert!(
+      again == first,
+      "seeded parallel k-means on {threads} threads differs from 1 thread (iterations {} vs \
+       {}, {} centroid components differ)",
+      again.2,
+      first.2,
+      again.0.iter().zip(&first.0).filter(|(a, b)| a != b).count()
+    );
+  }
 }
