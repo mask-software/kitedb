@@ -71,6 +71,16 @@ pub struct CheckResult {
 
 #[pymethods]
 impl CheckResult {
+  #[new]
+  #[pyo3(signature = (valid, errors=None, warnings=None))]
+  fn new(valid: bool, errors: Option<Vec<String>>, warnings: Option<Vec<String>>) -> Self {
+    Self {
+      valid,
+      errors: errors.unwrap_or_default(),
+      warnings: warnings.unwrap_or_default(),
+    }
+  }
+
   /// Check if the database is valid (no errors)
   fn is_valid(&self) -> bool {
     self.valid

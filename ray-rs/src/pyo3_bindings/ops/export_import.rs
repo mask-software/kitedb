@@ -1,6 +1,6 @@
 //! Export and import operations for Python bindings
 
-use pyo3::exceptions::PyRuntimeError;
+use crate::pyo3_bindings::errors;
 use pyo3::prelude::*;
 
 use crate::core::single_file::SingleFileDB as RustSingleFileDB;
@@ -28,8 +28,7 @@ pub fn export_to_object_single(
   db: &RustSingleFileDB,
   options: ray_export::ExportOptions,
 ) -> PyResult<ray_export::ExportedDatabase> {
-  ray_export::export_to_object_single(db, options)
-    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+  ray_export::export_to_object_single(db, options).map_err(errors::wrap_plain)
 }
 
 pub fn export_to_json_single(
@@ -38,11 +37,9 @@ pub fn export_to_json_single(
   options: ExportOptions,
 ) -> PyResult<ExportResult> {
   let opts = options.to_rust();
-  let data = ray_export::export_to_object_single(db, opts.clone())
-    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+  let data = ray_export::export_to_object_single(db, opts.clone()).map_err(errors::wrap_plain)?;
 
-  let result = ray_export::export_to_json(&data, path, opts.pretty)
-    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+  let result = ray_export::export_to_json(&data, path, opts.pretty).map_err(errors::wrap_plain)?;
 
   Ok(ExportResult {
     node_count: result.node_count as i64,
@@ -56,11 +53,9 @@ pub fn export_to_jsonl_single(
   options: ExportOptions,
 ) -> PyResult<ExportResult> {
   let opts = options.to_rust();
-  let data = ray_export::export_to_object_single(db, opts)
-    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+  let data = ray_export::export_to_object_single(db, opts).map_err(errors::wrap_plain)?;
 
-  let result =
-    ray_export::export_to_jsonl(&data, path).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+  let result = ray_export::export_to_jsonl(&data, path).map_err(errors::wrap_plain)?;
 
   Ok(ExportResult {
     node_count: result.node_count as i64,
@@ -74,8 +69,7 @@ pub fn import_from_object_single(
   options: ImportOptions,
 ) -> PyResult<ImportResult> {
   let opts = options.to_rust()?;
-  let result = ray_export::import_from_object_single(db, data, opts)
-    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+  let result = ray_export::import_from_object_single(db, data, opts).map_err(errors::wrap_plain)?;
 
   Ok(ImportResult {
     node_count: result.node_count as i64,
@@ -90,11 +84,10 @@ pub fn import_from_json_single(
   options: ImportOptions,
 ) -> PyResult<ImportResult> {
   let opts = options.to_rust()?;
-  let parsed =
-    ray_export::import_from_json(path).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+  let parsed = ray_export::import_from_json(path).map_err(errors::wrap_plain)?;
 
-  let result = ray_export::import_from_object_single(db, &parsed, opts)
-    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+  let result =
+    ray_export::import_from_object_single(db, &parsed, opts).map_err(errors::wrap_plain)?;
 
   Ok(ImportResult {
     node_count: result.node_count as i64,

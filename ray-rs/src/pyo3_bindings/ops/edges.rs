@@ -1,6 +1,6 @@
 //! Edge operations for Python bindings
 
-use pyo3::exceptions::PyRuntimeError;
+use crate::pyo3_bindings::errors;
 use pyo3::prelude::*;
 
 use crate::core::single_file::SingleFileDB as RustSingleFileDB;
@@ -44,7 +44,7 @@ pub fn add_edge_single(
   dst: NodeId,
 ) -> PyResult<()> {
   db.add_edge(src, etype, dst)
-    .map_err(|e| PyRuntimeError::new_err(format!("Failed to add edge: {e}")))
+    .map_err(|e| errors::wrap(e, "Failed to add edge"))
 }
 
 /// Add edge by type name on single-file database
@@ -55,7 +55,7 @@ pub fn add_edge_by_name_single(
   dst: NodeId,
 ) -> PyResult<()> {
   db.add_edge_by_name(src, etype_name, dst)
-    .map_err(|e| PyRuntimeError::new_err(format!("Failed to add edge: {e}")))
+    .map_err(|e| errors::wrap(e, "Failed to add edge"))
 }
 
 /// Delete edge on single-file database
@@ -66,7 +66,7 @@ pub fn delete_edge_single(
   dst: NodeId,
 ) -> PyResult<()> {
   db.delete_edge(src, etype, dst)
-    .map_err(|e| PyRuntimeError::new_err(format!("Failed to delete edge: {e}")))
+    .map_err(|e| errors::wrap(e, "Failed to delete edge"))
 }
 
 /// Upsert edge on single-file database
@@ -78,7 +78,7 @@ pub fn upsert_edge_single(
   props: &[(PropKeyId, Option<PropValue>)],
 ) -> PyResult<bool> {
   db.upsert_edge_with_props(src, etype, dst, props.iter().cloned())
-    .map_err(|e| PyRuntimeError::new_err(format!("Failed to upsert edge: {e}")))
+    .map_err(|e| errors::wrap(e, "Failed to upsert edge"))
 }
 
 /// Check edge exists on single-file database

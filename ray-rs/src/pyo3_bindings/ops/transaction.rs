@@ -1,6 +1,6 @@
 //! Transaction operations for Python bindings
 
-use pyo3::exceptions::PyRuntimeError;
+use crate::pyo3_bindings::errors;
 use pyo3::prelude::*;
 
 use crate::core::single_file::SingleFileDB as RustSingleFileDB;
@@ -27,7 +27,7 @@ pub trait TransactionOps {
 pub fn begin_single_file(db: &RustSingleFileDB, read_only: bool) -> PyResult<i64> {
   let txid = db
     .begin(read_only)
-    .map_err(|e| PyRuntimeError::new_err(format!("Failed to begin transaction: {e}")))?;
+    .map_err(|e| errors::wrap(e, "Failed to begin transaction"))?;
   Ok(txid as i64)
 }
 
@@ -35,20 +35,19 @@ pub fn begin_single_file(db: &RustSingleFileDB, read_only: bool) -> PyResult<i64
 pub fn begin_bulk_single_file(db: &RustSingleFileDB) -> PyResult<i64> {
   let txid = db
     .begin_bulk()
-    .map_err(|e| PyRuntimeError::new_err(format!("Failed to begin bulk transaction: {e}")))?;
+    .map_err(|e| errors::wrap(e, "Failed to begin bulk transaction"))?;
   Ok(txid as i64)
 }
 
 /// Commit transaction on single-file database
 pub fn commit_single_file(db: &RustSingleFileDB) -> PyResult<()> {
-  db.commit()
-    .map_err(|e| PyRuntimeError::new_err(format!("Failed to commit: {e}")))
+  db.commit().map_err(|e| errors::wrap(e, "Failed to commit"))
 }
 
 /// Rollback transaction on single-file database
 pub fn rollback_single_file(db: &RustSingleFileDB) -> PyResult<()> {
   db.rollback()
-    .map_err(|e| PyRuntimeError::new_err(format!("Failed to rollback: {e}")))
+    .map_err(|e| errors::wrap(e, "Failed to rollback"))
 }
 
 #[cfg(test)]

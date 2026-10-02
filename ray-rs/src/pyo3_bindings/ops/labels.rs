@@ -1,6 +1,6 @@
 //! Node label operations for Python bindings
 
-use pyo3::exceptions::PyRuntimeError;
+use crate::pyo3_bindings::errors;
 use pyo3::prelude::*;
 
 use crate::core::single_file::SingleFileDB as RustSingleFileDB;
@@ -26,7 +26,7 @@ pub trait LabelOps {
 
 pub fn define_label_single(db: &RustSingleFileDB, name: &str) -> PyResult<u32> {
   db.define_label(name)
-    .map_err(|e| PyRuntimeError::new_err(format!("Failed to define label: {e}")))
+    .map_err(|e| errors::wrap(e, "Failed to define label"))
 }
 
 pub fn add_node_label_single(
@@ -35,7 +35,7 @@ pub fn add_node_label_single(
   label_id: u32,
 ) -> PyResult<()> {
   db.add_node_label(node_id, label_id)
-    .map_err(|e| PyRuntimeError::new_err(format!("Failed to add label: {e}")))
+    .map_err(|e| errors::wrap(e, "Failed to add label"))
 }
 
 pub fn add_node_label_by_name_single(
@@ -44,7 +44,7 @@ pub fn add_node_label_by_name_single(
   label_name: &str,
 ) -> PyResult<()> {
   db.add_node_label_by_name(node_id, label_name)
-    .map_err(|e| PyRuntimeError::new_err(format!("Failed to add label: {e}")))
+    .map_err(|e| errors::wrap(e, "Failed to add label"))
 }
 
 pub fn remove_node_label_single(
@@ -53,7 +53,7 @@ pub fn remove_node_label_single(
   label_id: u32,
 ) -> PyResult<()> {
   db.remove_node_label(node_id, label_id)
-    .map_err(|e| PyRuntimeError::new_err(format!("Failed to remove label: {e}")))
+    .map_err(|e| errors::wrap(e, "Failed to remove label"))
 }
 
 pub fn node_has_label_single(db: &RustSingleFileDB, node_id: NodeId, label_id: u32) -> bool {

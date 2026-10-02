@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hmac
 import re
 from typing import Any, Callable, Mapping, Optional, Pattern, Union, Literal
 
@@ -17,11 +18,24 @@ ReplicationAdminAuthMode = Literal[
 
 @dataclass(frozen=True)
 class ReplicationAdminAuthConfig:
+    """Replication admin auth settings.
+
+    mTLS is checked by `mtls_matcher` when set (for example
+    `create_asgi_tls_mtls_matcher()`, which reads the server's verified TLS
+    state). Without a matcher, a client-certificate header forwarded by a
+    TLS-terminating proxy (`mtls_header`) counts only when
+    `trust_forwarded_client_cert` is True and the whole header value matches
+    `mtls_subject_regex`. Any client can send that header, so trust it only
+    behind a proxy that strips or overwrites it. Otherwise mTLS never
+    authorizes.
+    """
+
     mode: ReplicationAdminAuthMode = "none"
     token: Optional[str] = None
     mtls_header: str = "x-forwarded-client-cert"
     mtls_subject_regex: Optional[Union[str, Pattern[str]]] = None
     mtls_matcher: Optional[Callable[[Any], bool]] = None
+    trust_forwarded_client_cert: bool = False
 
 
 @dataclass(frozen=True)
@@ -67,6 +81,7 @@ def _normalize_config(config: ReplicationAdminAuthConfig) -> ReplicationAdminAut
         mtls_header=mtls_header,
         mtls_subject_regex=_normalize_regex(config.mtls_subject_regex),
         mtls_matcher=config.mtls_matcher,
+        trust_forwarded_client_cert=bool(config.trust_forwarded_client_cert),
     )
 
 
@@ -143,6 +158,24 @@ def create_asgi_tls_mtls_matcher(
     return _matcher
 
 
+def _forwarded_client_cert_ok(headers: Any, config: ReplicationAdminAuthConfig) -> bool:
+    """Whether a proxy-forwarded client-cert header authorizes the request.
+
+    Denied unless forwarded certs are explicitly trusted and a subject regex
+    matches the entire header value (so a matching substring smuggled into an
+    attacker-controlled value doesn't pass).
+    """
+    if not config.trust_forwarded_client_cert:
+        return False
+    pattern = config.mtls_subject_regex
+    if pattern is None:
+        return False
+    value = _get_header_value(headers, config.mtls_header)
+    if value is None:
+        return False
+    return pattern.fullmatch(value) is not None  # type: ignore[union-attr]
+
+
 def is_replication_admin_authorized(
     request: Any, config: ReplicationAdminAuthConfig
 ) -> bool:
@@ -152,16 +185,17 @@ def is_replication_admin_authorized(
     token_ok = False
     if normalized.token:
         authorization = _get_header_value(headers, "authorization")
-        token_ok = authorization == f"Bearer {normalized.token}"
+        if authorization is not None:
+            # Constant-time comparison, so response timing doesn't leak the token.
+            token_ok = hmac.compare_digest(
+                authorization.encode("utf-8"),
+                f"Bearer {normalized.token}".encode("utf-8"),
+            )
 
     if normalized.mtls_matcher is not None:
         mtls_ok = bool(normalized.mtls_matcher(request))
     else:
-        mtls_value = _get_header_value(headers, normalized.mtls_header)
-        mtls_ok = mtls_value is not None
-        pattern = normalized.mtls_subject_regex
-        if mtls_ok and pattern is not None:
-            mtls_ok = bool(pattern.search(mtls_value))
+        mtls_ok = _forwarded_client_cert_ok(headers, normalized)
 
     if normalized.mode == "none":
         return True

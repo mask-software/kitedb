@@ -2,7 +2,8 @@
 
 Each test encodes the contract the fix must satisfy and fails on the unfixed
 code (base 4d57e73). Y5 (streaming memory), Y9 (numpy / packaging hygiene)
-and Y13 (pyo3 bump) are perf/hygiene items and have no failing test here.
+and Y13 (pyo3 bump) are perf/hygiene items without a reproduction; Y5 has a
+behavior guard added with its fix.
 
 Run one finding with `.venv/bin/python -m pytest python/tests/test_w3_py.py -k y<N>`.
 """
@@ -473,6 +474,61 @@ def test_y4_stub_signatures_match_runtime():
             if not _same_params(expected, actual):
                 problems.append(f"{label}: stub {_show(expected)} != runtime {_show(actual)}")
     assert problems == [], "stub signatures drifted:\n" + "\n".join(problems)
+
+
+# ============================================================================
+# Y5: streams are lazy batch iterators (perf item; behavior guard)
+# ============================================================================
+
+
+def test_y5_streams_are_lazy_batch_iterators(tmp_path):
+    from kitedb import ClosedError, StreamOptions
+
+    db = Database(str(tmp_path / "db.kitedb"))
+    try:
+        db.begin()
+        ids = db.create_nodes_batch([f"n:{i}" for i in range(5)])
+        key = db.get_or_create_propkey("v")
+        for i, node_id in enumerate(ids):
+            db.set_node_prop(node_id, key, PropValue.int(i))
+        etype = db.get_or_create_etype("next")
+        db.add_edges_batch([(ids[i], etype, ids[i + 1]) for i in range(4)])
+        db.set_edge_prop(ids[0], etype, ids[1], key, PropValue.int(7))
+        db.commit()
+
+        stream = db.stream_nodes(StreamOptions(batch_size=2))
+        assert iter(stream) is stream
+        batches = list(stream)
+        assert [len(b) for b in batches] == [2, 2, 1]
+        assert sorted(x for b in batches for x in b) == sorted(ids)
+
+        nodes = [n for b in db.stream_nodes_with_props(StreamOptions(batch_size=2)) for n in b]
+        assert sorted(n.key for n in nodes) == [f"n:{i}" for i in range(5)]
+        assert all([p.value.value() for p in n.props] == [int(n.key[2:])] for n in nodes)
+
+        edges = [e for b in db.stream_edges(StreamOptions(batch_size=3)) for e in b]
+        assert sorted((e.src, e.dst) for e in edges) == [(ids[i], ids[i + 1]) for i in range(4)]
+        with_props = [e for b in db.stream_edges_with_props() for e in b]
+        props = {(e.src, e.dst): [p.value.value() for p in e.props] for e in with_props}
+        assert props[(ids[0], ids[1])] == [7]
+
+        # Batches are built on demand: a node deleted mid-stream is skipped.
+        lazy = db.stream_nodes_with_props(StreamOptions(batch_size=2))
+        first = next(lazy)
+        remaining = [n.id for n in first]
+        victim = next(i for i in ids if i not in remaining)
+        db.begin()
+        db.delete_node(victim)
+        db.commit()
+        rest = [n.id for b in lazy for n in b]
+        assert victim not in rest and len(remaining) + len(rest) == 4
+
+        pending = db.stream_nodes_with_props(StreamOptions(batch_size=1))
+        next(pending)
+    finally:
+        db.close()
+    with pytest.raises(ClosedError):
+        next(pending)
 
 
 # ============================================================================

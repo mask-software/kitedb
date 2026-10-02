@@ -140,7 +140,7 @@ pub fn traverse_in_count_single(
 pub fn traverse_multi_single(
   db: &RustSingleFileDB,
   start_ids: Vec<i64>,
-  steps: Vec<(String, Option<u32>)>,
+  steps: Vec<(TraversalDirection, Option<u32>)>,
 ) -> Vec<(i64, Option<String>)> {
   let mut current_ids: Vec<NodeId> = start_ids.iter().map(|&id| id as NodeId).collect();
 
@@ -149,20 +149,20 @@ pub fn traverse_multi_single(
     let mut visited: HashSet<NodeId> = HashSet::new();
 
     for node_id in &current_ids {
-      let neighbors: Vec<NodeId> = match direction.as_str() {
-        "out" => db
+      let neighbors: Vec<NodeId> = match direction {
+        TraversalDirection::Out => db
           .out_edges(*node_id)
           .into_iter()
           .filter(|(e, _)| etype.is_none() || etype == Some(*e))
           .map(|(_, dst)| dst)
           .collect(),
-        "in" => db
+        TraversalDirection::In => db
           .in_edges(*node_id)
           .into_iter()
           .filter(|(e, _)| etype.is_none() || etype == Some(*e))
           .map(|(_, src)| src)
           .collect(),
-        _ => {
+        TraversalDirection::Both => {
           let mut out: Vec<NodeId> = db
             .out_edges(*node_id)
             .into_iter()
@@ -203,7 +203,7 @@ pub fn traverse_multi_single(
 pub fn traverse_multi_count_single(
   db: &RustSingleFileDB,
   start_ids: Vec<i64>,
-  steps: Vec<(String, Option<u32>)>,
+  steps: Vec<(TraversalDirection, Option<u32>)>,
 ) -> i64 {
   let mut current_ids: Vec<NodeId> = start_ids.iter().map(|&id| id as NodeId).collect();
 
@@ -212,20 +212,20 @@ pub fn traverse_multi_count_single(
     let mut visited: HashSet<NodeId> = HashSet::new();
 
     for node_id in &current_ids {
-      let neighbors: Vec<NodeId> = match direction.as_str() {
-        "out" => db
+      let neighbors: Vec<NodeId> = match direction {
+        TraversalDirection::Out => db
           .out_edges(*node_id)
           .into_iter()
           .filter(|(e, _)| etype.is_none() || etype == Some(*e))
           .map(|(_, dst)| dst)
           .collect(),
-        "in" => db
+        TraversalDirection::In => db
           .in_edges(*node_id)
           .into_iter()
           .filter(|(e, _)| etype.is_none() || etype == Some(*e))
           .map(|(_, src)| src)
           .collect(),
-        _ => {
+        TraversalDirection::Both => {
           let mut out: Vec<NodeId> = db
             .out_edges(*node_id)
             .into_iter()
@@ -263,15 +263,9 @@ pub fn traverse_single(
   max_depth: usize,
   etype: Option<u32>,
   min_depth: Option<usize>,
-  direction: Option<String>,
+  dir: TraversalDirection,
   unique: Option<bool>,
 ) -> Vec<TraversalResult> {
-  let dir = match direction.as_deref() {
-    Some("in") => TraversalDirection::In,
-    Some("both") => TraversalDirection::Both,
-    _ => TraversalDirection::Out,
-  };
-
   let opts = TraverseOptions {
     direction: dir,
     min_depth: min_depth.unwrap_or(1),
@@ -310,14 +304,8 @@ pub fn find_path_bfs_single(
   target: NodeId,
   etype: Option<u32>,
   max_depth: Option<usize>,
-  direction: Option<String>,
+  dir: TraversalDirection,
 ) -> PyPathResult {
-  let dir = match direction.as_deref() {
-    Some("in") => TraversalDirection::In,
-    Some("both") => TraversalDirection::Both,
-    _ => TraversalDirection::Out,
-  };
-
   let mut targets = HashSet::new();
   targets.insert(target);
 
@@ -347,14 +335,8 @@ pub fn find_path_dijkstra_single(
   target: NodeId,
   etype: Option<u32>,
   max_depth: Option<usize>,
-  direction: Option<String>,
+  dir: TraversalDirection,
 ) -> PyPathResult {
-  let dir = match direction.as_deref() {
-    Some("in") => TraversalDirection::In,
-    Some("both") => TraversalDirection::Both,
-    _ => TraversalDirection::Out,
-  };
-
   let mut targets = HashSet::new();
   targets.insert(target);
 

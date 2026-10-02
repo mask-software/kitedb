@@ -3,6 +3,7 @@
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
+use crate::api::traversal::TraversalDirection;
 use crate::types::NodeId;
 
 pub(crate) const MAX_CACHE_ENTRIES: i64 = 10_000_000;
@@ -152,4 +153,28 @@ pub(crate) fn compression_level(field: &str, value: i32, zstd: bool) -> PyResult
     )));
   }
   Ok(value)
+}
+
+/// Parses a traversal direction. `None` means the default, `out`; an unknown
+/// name is a `ValueError` instead of a silent fallback.
+pub(crate) fn direction(field: &str, value: Option<&str>) -> PyResult<TraversalDirection> {
+  match value {
+    None | Some("out") => Ok(TraversalDirection::Out),
+    Some("in") => Ok(TraversalDirection::In),
+    Some("both") => Ok(TraversalDirection::Both),
+    Some(other) => Err(PyValueError::new_err(format!(
+      "{field}: unknown direction {other:?}; expected one of: out, in, both"
+    ))),
+  }
+}
+
+/// Parses `traverse_multi` steps: `(direction, etype)` pairs.
+pub(crate) fn traversal_steps(
+  steps: Vec<(String, Option<u32>)>,
+) -> PyResult<Vec<(TraversalDirection, Option<u32>)>> {
+  steps
+    .into_iter()
+    .enumerate()
+    .map(|(i, (dir, etype))| Ok((direction(&format!("steps[{i}]"), Some(&dir))?, etype)))
+    .collect()
 }
