@@ -658,21 +658,21 @@ function renderReplicationPrometheusMetrics(
 
   pushPrometheusMetricHelp(
     lines,
-    "raydb_replication_enabled",
+    "kitedb_replication_enabled",
     "gauge",
     "Whether replication is enabled for the connected database (1 enabled, 0 disabled).",
   );
-  pushPrometheusMetricSample(lines, "raydb_replication_enabled", resolved.role === "disabled" ? 0 : 1, {
+  pushPrometheusMetricSample(lines, "kitedb_replication_enabled", resolved.role === "disabled" ? 0 : 1, {
     role: resolved.role,
   });
 
   pushPrometheusMetricHelp(
     lines,
-    "raydb_replication_auth_enabled",
+    "kitedb_replication_auth_enabled",
     "gauge",
     "Whether replication admin token auth is enabled for admin endpoints.",
   );
-  pushPrometheusMetricSample(lines, "raydb_replication_auth_enabled", authEnabled ? 1 : 0);
+  pushPrometheusMetricSample(lines, "kitedb_replication_auth_enabled", authEnabled ? 1 : 0);
 
   if (resolved.primary) {
     const epoch = toMetricNumber(resolved.primary.epoch, 0);
@@ -685,39 +685,39 @@ function renderReplicationPrometheusMetrics(
 
     pushPrometheusMetricHelp(
       lines,
-      "raydb_replication_primary_epoch",
+      "kitedb_replication_primary_epoch",
       "gauge",
       "Primary replication epoch.",
     );
-    pushPrometheusMetricSample(lines, "raydb_replication_primary_epoch", epoch);
+    pushPrometheusMetricSample(lines, "kitedb_replication_primary_epoch", epoch);
 
     pushPrometheusMetricHelp(
       lines,
-      "raydb_replication_primary_head_log_index",
+      "kitedb_replication_primary_head_log_index",
       "gauge",
       "Primary replication head log index.",
     );
-    pushPrometheusMetricSample(lines, "raydb_replication_primary_head_log_index", headLogIndex);
+    pushPrometheusMetricSample(lines, "kitedb_replication_primary_head_log_index", headLogIndex);
 
     pushPrometheusMetricHelp(
       lines,
-      "raydb_replication_primary_retained_floor",
+      "kitedb_replication_primary_retained_floor",
       "gauge",
       "Primary replication retained floor log index.",
     );
-    pushPrometheusMetricSample(lines, "raydb_replication_primary_retained_floor", retainedFloor);
+    pushPrometheusMetricSample(lines, "kitedb_replication_primary_retained_floor", retainedFloor);
 
     pushPrometheusMetricHelp(
       lines,
-      "raydb_replication_primary_replica_count",
+      "kitedb_replication_primary_replica_count",
       "gauge",
       "Number of replicas reporting progress to the primary.",
     );
-    pushPrometheusMetricSample(lines, "raydb_replication_primary_replica_count", replicaLags.length);
+    pushPrometheusMetricSample(lines, "kitedb_replication_primary_replica_count", replicaLags.length);
 
     pushPrometheusMetricHelp(
       lines,
-      "raydb_replication_primary_replica_lag",
+      "kitedb_replication_primary_replica_lag",
       "gauge",
       "Replica lag in frames relative to primary head index.",
     );
@@ -733,7 +733,7 @@ function renderReplicationPrometheusMetrics(
       maxReplicaLag = Math.max(maxReplicaLag, lagFrames);
       pushPrometheusMetricSample(
         lines,
-        "raydb_replication_primary_replica_lag",
+        "kitedb_replication_primary_replica_lag",
         lagFrames,
         {
           replica_id: lag.replicaId,
@@ -744,57 +744,57 @@ function renderReplicationPrometheusMetrics(
 
     pushPrometheusMetricHelp(
       lines,
-      "raydb_replication_primary_stale_epoch_replica_count",
+      "kitedb_replication_primary_stale_epoch_replica_count",
       "gauge",
       "Count of replicas reporting progress from a stale epoch.",
     );
     pushPrometheusMetricSample(
       lines,
-      "raydb_replication_primary_stale_epoch_replica_count",
+      "kitedb_replication_primary_stale_epoch_replica_count",
       staleReplicaCount,
     );
 
     pushPrometheusMetricHelp(
       lines,
-      "raydb_replication_primary_max_replica_lag",
+      "kitedb_replication_primary_max_replica_lag",
       "gauge",
       "Maximum replica lag in frames among replicas reporting progress.",
     );
-    pushPrometheusMetricSample(lines, "raydb_replication_primary_max_replica_lag", maxReplicaLag);
+    pushPrometheusMetricSample(lines, "kitedb_replication_primary_max_replica_lag", maxReplicaLag);
 
     pushPrometheusMetricHelp(
       lines,
-      "raydb_replication_primary_append_attempts_total",
+      "kitedb_replication_primary_append_attempts_total",
       "counter",
       "Total replication append attempts on primary commit path.",
     );
     pushPrometheusMetricSample(
       lines,
-      "raydb_replication_primary_append_attempts_total",
+      "kitedb_replication_primary_append_attempts_total",
       toMetricNumber(resolved.primary.appendAttempts, 0),
     );
 
     pushPrometheusMetricHelp(
       lines,
-      "raydb_replication_primary_append_failures_total",
+      "kitedb_replication_primary_append_failures_total",
       "counter",
       "Total replication append failures on primary commit path.",
     );
     pushPrometheusMetricSample(
       lines,
-      "raydb_replication_primary_append_failures_total",
+      "kitedb_replication_primary_append_failures_total",
       toMetricNumber(resolved.primary.appendFailures, 0),
     );
 
     pushPrometheusMetricHelp(
       lines,
-      "raydb_replication_primary_append_successes_total",
+      "kitedb_replication_primary_append_successes_total",
       "counter",
       "Total replication append successes on primary commit path.",
     );
     pushPrometheusMetricSample(
       lines,
-      "raydb_replication_primary_append_successes_total",
+      "kitedb_replication_primary_append_successes_total",
       toMetricNumber(resolved.primary.appendSuccesses, 0),
     );
   }
@@ -802,48 +802,48 @@ function renderReplicationPrometheusMetrics(
   if (resolved.replica) {
     pushPrometheusMetricHelp(
       lines,
-      "raydb_replication_replica_applied_epoch",
+      "kitedb_replication_replica_applied_epoch",
       "gauge",
       "Replica applied epoch.",
     );
     pushPrometheusMetricSample(
       lines,
-      "raydb_replication_replica_applied_epoch",
+      "kitedb_replication_replica_applied_epoch",
       toMetricNumber(resolved.replica.appliedEpoch, 0),
     );
 
     pushPrometheusMetricHelp(
       lines,
-      "raydb_replication_replica_applied_log_index",
+      "kitedb_replication_replica_applied_log_index",
       "gauge",
       "Replica applied log index.",
     );
     pushPrometheusMetricSample(
       lines,
-      "raydb_replication_replica_applied_log_index",
+      "kitedb_replication_replica_applied_log_index",
       toMetricNumber(resolved.replica.appliedLogIndex, 0),
     );
 
     pushPrometheusMetricHelp(
       lines,
-      "raydb_replication_replica_needs_reseed",
+      "kitedb_replication_replica_needs_reseed",
       "gauge",
       "Whether replica currently requires reseed (1 yes, 0 no).",
     );
     pushPrometheusMetricSample(
       lines,
-      "raydb_replication_replica_needs_reseed",
+      "kitedb_replication_replica_needs_reseed",
       resolved.replica.needsReseed ? 1 : 0,
     );
 
     pushPrometheusMetricHelp(
       lines,
-      "raydb_replication_replica_last_error_present",
+      "kitedb_replication_replica_last_error_present",
       "gauge",
       "Whether replica has a non-empty last_error value (1 yes, 0 no).",
     );
     const hasError = resolved.replica.lastError ? 1 : 0;
-    pushPrometheusMetricSample(lines, "raydb_replication_replica_last_error_present", hasError);
+    pushPrometheusMetricSample(lines, "kitedb_replication_replica_last_error_present", hasError);
   }
 
   return `${lines.join("\n")}\n`;

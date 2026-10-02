@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "@ray-db/playground",
+      "name": "kitedb-playground",
       "dependencies": {
         "@elysiajs/cors": "^1.2.0",
         "@elysiajs/static": "^1.2.0",
