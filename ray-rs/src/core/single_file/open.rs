@@ -23,6 +23,7 @@ use crate::core::snapshot::reader::SnapshotData;
 use crate::core::wal::buffer::WalBuffer;
 use crate::error::{KiteError, Result};
 use crate::mvcc::{GcConfig, MvccManager};
+use crate::replication::durability::SidecarSync;
 use crate::replication::primary::PrimaryReplication;
 use crate::replication::replica::ReplicaReplication;
 use crate::replication::types::ReplicationRole;
@@ -1252,7 +1253,7 @@ fn open_single_file_internal(
         options.replication_segment_max_bytes,
         options.replication_retention_min_entries,
         options.replication_retention_min_ms,
-        options.sync_mode,
+        SidecarSync::new(options.sync_mode, options.full_fsync),
         options.replication_fail_after_append_for_testing,
         committed_in_order.last().map(|(txid, _)| *txid),
         options.replication_crash_after_local_commit_for_testing,
@@ -1261,12 +1262,15 @@ fn open_single_file_internal(
     ),
     ReplicationRole::Replica => (
       None,
-      Some(ReplicaReplication::open(
-        path,
-        options.replication_sidecar_path.clone(),
-        options.replication_source_db_path.clone(),
-        options.replication_source_sidecar_path.clone(),
-      )?),
+      Some(
+        ReplicaReplication::open(
+          path,
+          options.replication_sidecar_path.clone(),
+          options.replication_source_db_path.clone(),
+          options.replication_source_sidecar_path.clone(),
+        )?
+        .with_sync(SidecarSync::new(options.sync_mode, options.full_fsync)),
+      ),
     ),
   };
 

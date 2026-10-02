@@ -194,3 +194,146 @@ fn b4_p6_catch_up_applies_a_run_of_frames_in_one_transaction() {
   close_single_file(replica).expect("close replica");
   close_single_file(primary).expect("close primary");
 }
+
+/// P4: a bootstrap commits about every 10k writes, not the whole graph at
+/// once.
+#[test]
+fn b4_p4_bootstrap_commits_in_bounded_batches() {
+  const NODES: usize = 25_000;
+  let dir = tempdir().expect("tempdir");
+  let primary_path = dir.path().join("p4-batches-primary.kitedb");
+  let primary =
+    open_single_file(&primary_path, primary_options().wal_size(16 << 20)).expect("open primary");
+  primary.begin(false).expect("begin");
+  for i in 0..NODES {
+    primary
+      .create_node(Some(&format!("n{i}")))
+      .expect("create node");
+  }
+  primary.commit().expect("commit");
+
+  let replica = open_replica(&dir.path().join("p4-batches-replica.kitedb"), &primary_path);
+  let before = replica.next_tx_id.load(Ordering::SeqCst);
+  replica
+    .replica_bootstrap_from_snapshot()
+    .expect("bootstrap");
+  let transactions = replica.next_tx_id.load(Ordering::SeqCst) - before;
+  assert_eq!(replica.count_nodes(), NODES);
+  assert!(
+    (3..=4).contains(&transactions),
+    "{NODES} creates commit in batches of 10k: {transactions} transactions"
+  );
+
+  close_single_file(replica).expect("close replica");
+  close_single_file(primary).expect("close primary");
+}
+
+/// P4: once a batch commits, the replica holds part of a copy; until the
+/// bootstrap sets its cursor, catch-up must refuse to run over it.
+#[test]
+fn b4_p4_a_committed_batch_marks_the_replica_incomplete_until_the_cursor_is_set() {
+  let dir = tempdir().expect("tempdir");
+  let primary_path = dir.path().join("p4-incomplete-primary.kitedb");
+  let primary = open_single_file(&primary_path, primary_options()).expect("open primary");
+  let replica = open_replica(
+    &dir.path().join("p4-incomplete-replica.kitedb"),
+    &primary_path,
+  );
+  replica
+    .replica_bootstrap_from_snapshot()
+    .expect("bootstrap empty primary");
+  commit_node(&primary, "n0").expect("token");
+
+  // An attempt that commits a batch and stops before its cursor.
+  {
+    let runtime = replica
+      .replica_replication
+      .as_ref()
+      .expect("replica runtime");
+    let mut batch = super::BootstrapBatch::new(&replica, runtime);
+    batch
+      .write(|db| db.create_node_with_id(500, Some("partial")))
+      .expect("write");
+    batch.finish().expect("commit batch");
+  }
+
+  let error = replica
+    .replica_catch_up_once(64)
+    .expect_err("catch-up over a partial copy");
+  assert!(error.to_string().contains("interrupted"), "{error}");
+  assert!(
+    replica
+      .replica_replication_status()
+      .expect("status")
+      .needs_reseed
+  );
+
+  replica.replica_reseed_from_snapshot().expect("reseed");
+  assert!(replica.node_by_key("partial").is_none());
+  assert!(replica.node_by_key("n0").is_some());
+  commit_node(&primary, "n1").expect("token");
+  assert_eq!(replica.replica_catch_up_once(64).expect("catch up"), 1);
+
+  close_single_file(replica).expect("close replica");
+  close_single_file(primary).expect("close primary");
+}
+
+/// The sidecar syncs as the database does: in Full mode each commit's frame
+/// (and the manifest naming it) with plain fsync, or `F_FULLFSYNC` with the
+/// `full_fsync` opt-in; in Normal and Off modes nothing per commit, and the
+/// buffered frames at a checkpoint. `File::sync_all`, which the sidecar used
+/// everywhere, is `F_FULLFSYNC` on macOS.
+#[test]
+fn b4_sidecar_syncs_follow_the_database_sync_policy() {
+  use crate::replication::durability::sidecar_syncs_during;
+
+  let full_sync = if cfg!(target_os = "macos") {
+    "F_FULLFSYNC"
+  } else {
+    "sync_all"
+  };
+  let plain_sync = if cfg!(target_os = "macos") {
+    "fsync"
+  } else {
+    "sync_all"
+  };
+  let dir = tempdir().expect("tempdir");
+  for (name, mode, full_fsync) in [
+    ("full", SyncMode::Full, false),
+    ("full-fullfsync", SyncMode::Full, true),
+    ("normal", SyncMode::Normal, true),
+    ("off", SyncMode::Off, false),
+  ] {
+    let db = open_single_file(
+      dir.path().join(format!("sync-{name}.kitedb")),
+      primary_options().sync_mode(mode).full_fsync(full_fsync),
+    )
+    .expect("open primary");
+    let (token, commit_syncs) = sidecar_syncs_during(|| commit_node(&db, "n0"));
+    assert!(token.is_some(), "{name}: commit appended its frame");
+    let (checkpointed, checkpoint_syncs) = sidecar_syncs_during(|| db.checkpoint());
+    checkpointed.expect("checkpoint");
+
+    match mode {
+      SyncMode::Full => {
+        let expected = if full_fsync { full_sync } else { plain_sync };
+        assert!(
+          commit_syncs.len() >= 2 && commit_syncs.iter().all(|sync| *sync == expected),
+          "{name}: the frame and the manifest are synced before the commit returns, with \
+           {expected}: {commit_syncs:?}"
+        );
+      }
+      SyncMode::Normal | SyncMode::Off => {
+        assert!(
+          commit_syncs.is_empty(),
+          "{name}: no sidecar sync per commit: {commit_syncs:?}"
+        );
+        assert!(
+          !checkpoint_syncs.is_empty() && checkpoint_syncs.iter().all(|sync| *sync == plain_sync),
+          "{name}: a checkpoint syncs the buffered frames with {plain_sync}: {checkpoint_syncs:?}"
+        );
+      }
+    }
+    close_single_file(db).expect("close");
+  }
+}

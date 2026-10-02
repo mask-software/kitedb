@@ -1,13 +1,13 @@
 //! Replica-side bootstrap/pull/apply orchestration support.
 
+use super::durability::SidecarSync;
 use super::log_store::{ReplicationFrame, SegmentLogStore};
 use super::manifest::{ManifestStore, ReplicationManifest};
 use super::primary::default_replication_sidecar_path;
-use super::progress::upsert_replica_progress;
+use super::progress::upsert_replica_progress_synced;
 use super::transport::decode_commit_frame_payload;
 use super::types::ReplicationRole;
 use crate::error::{KiteError, Result};
-use crate::util::fs::sync_parent_dir;
 use parking_lot::Mutex;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -164,6 +164,9 @@ pub struct ReplicaReplication {
   /// Source sidecar generation of the frames or snapshot being applied, read
   /// with them; `mark_applied` records it with the cursor.
   applying_generation: Mutex<Option<u64>>,
+  /// The replica database's sync policy, for the cursor, schema map and
+  /// progress files.
+  sync: SidecarSync,
 }
 
 impl ReplicaReplication {
@@ -239,7 +242,14 @@ impl ReplicaReplication {
       schema_map: Mutex::new(schema_map),
       scan_hint: Mutex::new(None),
       applying_generation: Mutex::new(None),
+      sync: SidecarSync::default(),
     })
+  }
+
+  /// Sync the replica's state files with the replica database's policy.
+  pub fn with_sync(mut self, sync: SidecarSync) -> Self {
+    self.sync = sync;
+    self
   }
 
   pub fn source_db_path(&self) -> Option<PathBuf> {
@@ -315,7 +325,12 @@ impl ReplicaReplication {
     if *current == schema_map {
       return Ok(());
     }
-    persist_json_state(&self.schema_map_path, &schema_map, "replica schema map")?;
+    persist_json_state(
+      &self.schema_map_path,
+      &schema_map,
+      "replica schema map",
+      self.sync,
+    )?;
     *current = schema_map;
     Ok(())
   }
@@ -350,7 +365,7 @@ impl ReplicaReplication {
     next_state.needs_reseed = false;
     next_state.bootstrap_incomplete = false;
     clear_transient_missing_state(&mut next_state);
-    persist_cursor_state(&self.cursor_state_path, &next_state)?;
+    persist_cursor_state(&self.cursor_state_path, &next_state, self.sync)?;
     *state = next_state;
     drop(state);
     self.report_source_progress(epoch, log_index)
@@ -365,7 +380,7 @@ impl ReplicaReplication {
     }
     let mut next_state = state.clone();
     next_state.bootstrap_incomplete = true;
-    persist_cursor_state(&self.cursor_state_path, &next_state)?;
+    persist_cursor_state(&self.cursor_state_path, &next_state, self.sync)?;
     *state = next_state;
     Ok(())
   }
@@ -380,7 +395,7 @@ impl ReplicaReplication {
     if needs_reseed {
       clear_transient_missing_state(&mut next_state);
     }
-    persist_cursor_state(&self.cursor_state_path, &next_state)?;
+    persist_cursor_state(&self.cursor_state_path, &next_state, self.sync)?;
     *state = next_state;
     Ok(())
   }
@@ -394,7 +409,7 @@ impl ReplicaReplication {
     next_state.last_error = None;
     next_state.needs_reseed = false;
     clear_transient_missing_state(&mut next_state);
-    persist_cursor_state(&self.cursor_state_path, &next_state)?;
+    persist_cursor_state(&self.cursor_state_path, &next_state, self.sync)?;
     *state = next_state;
     Ok(())
   }
@@ -513,7 +528,13 @@ impl ReplicaReplication {
 
   fn report_source_progress(&self, epoch: u64, log_index: u64) -> Result<()> {
     if let Some(source_sidecar_path) = self.source_sidecar_path.as_ref() {
-      upsert_replica_progress(source_sidecar_path, &self.replica_id, epoch, log_index)?;
+      upsert_replica_progress_synced(
+        source_sidecar_path,
+        &self.replica_id,
+        epoch,
+        log_index,
+        self.sync,
+      )?;
     }
     Ok(())
   }
@@ -548,7 +569,7 @@ impl ReplicaReplication {
     if needs_reseed {
       clear_transient_missing_state(&mut next_state);
     }
-    persist_cursor_state(&self.cursor_state_path, &next_state)?;
+    persist_cursor_state(&self.cursor_state_path, &next_state, self.sync)?;
     *state = next_state;
     Err(KiteError::InvalidReplication(error_message))
   }
@@ -564,12 +585,17 @@ fn load_json_state<T: DeserializeOwned + Default>(path: &Path, what: &str) -> Re
     .map_err(|error| KiteError::Serialization(format!("decode {what} failed: {error}")))
 }
 
-fn persist_cursor_state(path: &Path, state: &ReplicaCursorState) -> Result<()> {
-  persist_json_state(path, state, "replica cursor state")
+fn persist_cursor_state(path: &Path, state: &ReplicaCursorState, sync: SidecarSync) -> Result<()> {
+  persist_json_state(path, state, "replica cursor state", sync)
 }
 
-/// Atomic replace: write a temp file, fsync it, rename, fsync the directory.
-fn persist_json_state<T: Serialize>(path: &Path, state: &T, what: &str) -> Result<()> {
+/// Atomic replace: write a temp file, sync it, rename, sync the directory.
+fn persist_json_state<T: Serialize>(
+  path: &Path,
+  state: &T,
+  what: &str,
+  sync: SidecarSync,
+) -> Result<()> {
   let tmp_path = path.with_extension("json.tmp");
   let bytes = serde_json::to_vec(state)
     .map_err(|error| KiteError::Serialization(format!("encode {what} failed: {error}")))?;
@@ -580,9 +606,9 @@ fn persist_json_state<T: Serialize>(path: &Path, state: &T, what: &str) -> Resul
     .write(true)
     .open(&tmp_path)?;
   file.write_all(&bytes)?;
-  file.sync_all()?;
+  sync.sync_file(&file)?;
   std::fs::rename(&tmp_path, path)?;
-  sync_parent_dir(path)?;
+  sync.sync_parent_dir(path)?;
   Ok(())
 }
 

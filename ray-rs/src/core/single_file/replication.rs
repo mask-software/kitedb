@@ -10,28 +10,29 @@ use crate::core::wal::record::{
   parse_set_node_prop_payload, parse_set_node_vector_payload, parse_wal_record, ParsedWalRecord,
 };
 use crate::error::{KiteError, Result};
+use crate::replication::log_store::ReplicationFrame;
 use crate::replication::manifest::ManifestStore;
 use crate::replication::primary::{primary_sidecar_needs_repair, PrimaryRetentionOutcome};
 use crate::replication::replica::{
-  ReplicaReplicationStatus, ReplicaSchemaMap,
+  ReplicaReplication, ReplicaReplicationStatus, ReplicaSchemaMap,
   SchemaIdKind::{self, EdgeType, Label, PropertyKey},
 };
-use crate::replication::transport::decode_commit_frame_payload;
+use crate::replication::transport::{
+  decode_commit_frame_payload, parse_transport_cursor, LogTransportFrame, LogTransportPage,
+  SnapshotTransport, SNAPSHOT_TRANSPORT_FORMAT,
+};
 use crate::replication::types::{CommitToken, ReplicationCursor};
 use crate::types::{ETypeId, NodeId, PropKeyId, PropValue, TxId, WalRecordType};
 use crate::util::crc::{crc32, Crc32Hasher};
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use base64::Engine;
-use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufReader, Read, Write};
+use std::io::{BufReader, Read};
 use std::path::Path;
-use std::str::FromStr;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use super::open::open_replication_source;
+use super::open::{open_replication_source, SyncMode};
 use super::recovery::{committed_transactions, scan_wal_records};
+use super::transaction::SingleFileTxGuard;
 use super::{close_single_file, SingleFileDB};
 
 const REPLICATION_MANIFEST_FILE: &str = "manifest.json";
@@ -41,7 +42,22 @@ const REPLICATION_FRAME_FLAG_CRC32_DISABLED: u16 = 0x0001;
 const REPLICATION_FRAME_HEADER_BYTES: usize = 32;
 const REPLICATION_MAX_FRAME_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 const REPLICATION_IO_CHUNK_BYTES: usize = 64 * 1024;
-const REPLICATION_SNAPSHOT_INLINE_MAX_BYTES: u64 = 32 * 1024 * 1024;
+/// Largest snapshot the JSON transport inlines: base64 inside a JSON string
+/// holds about 2.7 copies of the data in memory at once.
+const REPLICATION_SNAPSHOT_JSON_MAX_BYTES: u64 = 32 * 1024 * 1024;
+/// Largest snapshot the binary transport inlines.
+const REPLICATION_SNAPSHOT_BINARY_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+/// A snapshot bootstrap commits after this many writes...
+const BOOTSTRAP_BATCH_MAX_WRITES: usize = 10_000;
+/// ...or once its transaction's WAL records reach this share of the WAL.
+const BOOTSTRAP_BATCH_WAL_SHARE: u64 = 8;
+/// Catch-up applies a run of frames in one transaction until their WAL
+/// records reach this share of the replica's WAL.
+const CATCH_UP_BATCH_WAL_SHARE: u64 = 8;
+/// Floor of both batch budgets, for small WALs.
+const MIN_BATCH_WAL_BYTES: u64 = 16 * 1024;
+/// Both header pages, at the largest page size.
+const SOURCE_FINGERPRINT_HEAD_BYTES: u64 = 2 * 64 * 1024;
 const REPLICA_CATCH_UP_MAX_ATTEMPTS: usize = 5;
 const REPLICA_CATCH_UP_INITIAL_BACKOFF_MS: u64 = 10;
 const REPLICA_CATCH_UP_MAX_BACKOFF_MS: u64 = 160;
@@ -106,6 +122,20 @@ impl SingleFileDB {
       .report_replica_progress(replica_id, epoch, applied_log_index)
   }
 
+  /// Forget a replica's reported progress, so a decommissioned replica stops
+  /// holding back retention (the next `primary_run_retention` applies it).
+  /// Returns whether the replica had progress recorded. A replica that
+  /// reports progress again is tracked again.
+  pub fn primary_remove_replica_progress(&self, replica_id: &str) -> Result<bool> {
+    self
+      .primary_replication
+      .as_ref()
+      .ok_or_else(|| {
+        KiteError::InvalidReplication("database is not opened in primary role".to_string())
+      })?
+      .remove_replica_progress(replica_id)
+  }
+
   /// Run retention pruning on primary replication segments.
   pub fn primary_run_retention(&self) -> Result<PrimaryRetentionOutcome> {
     self
@@ -126,6 +156,13 @@ impl SingleFileDB {
   }
 
   /// Bootstrap replica state from source primary snapshot.
+  ///
+  /// The source's state is copied in bounded transactions; the replica is
+  /// marked incomplete before the first one commits, until the cursor is set
+  /// at the end, so catch-up never runs over a partial copy. The source must
+  /// stay quiet for the copy: a change to its file (length, modification
+  /// time, header) or to its replication head between the start and the end
+  /// makes the attempt retry.
   pub fn replica_bootstrap_from_snapshot(&self) -> Result<()> {
     let runtime = self.replica_replication.as_ref().ok_or_else(|| {
       KiteError::InvalidReplication("database is not opened in replica role".to_string())
@@ -153,57 +190,20 @@ impl SingleFileDB {
         Err(error) => return Err(error),
       };
 
-      let bootstrap_start = runtime.source_head_position()?;
-      let bootstrap_source_fingerprint = source_db_fingerprint(&source_db_path)?;
       let sync_result = (|| {
+        let start = SourceState::read(runtime, &source_db_path)?;
         let bootstrap_position = bootstrap_log_position(runtime, &source)?;
         std::thread::sleep(Duration::from_millis(10));
-        let quiesce_head = runtime.source_head_position()?;
-        let quiesce_fingerprint = source_db_fingerprint(&source_db_path)?;
-        if quiesce_head != bootstrap_start || quiesce_fingerprint != bootstrap_source_fingerprint {
-          return Err(KiteError::InvalidReplication(format!(
-            "source primary did not quiesce for snapshot bootstrap; start={}:{}, observed={}:{}, start_crc={:08x}, observed_crc={:08x}; quiesce writes and retry",
-            bootstrap_start.0,
-            bootstrap_start.1,
-            quiesce_head.0,
-            quiesce_head.1,
-            bootstrap_source_fingerprint.1,
-            quiesce_fingerprint.1
-          )));
-        }
-        remove_stale_nodes(self, &source, runtime)?;
-        let schema_map = sync_graph_state(self, &source, bootstrap_position.0, || {
-          let bootstrap_end = runtime.source_head_position()?;
-          let bootstrap_end_fingerprint = source_db_fingerprint(&source_db_path)?;
-          if bootstrap_end != bootstrap_start
-            || bootstrap_end_fingerprint != bootstrap_source_fingerprint
-          {
-            return Err(KiteError::InvalidReplication(format!(
-              "source primary advanced during snapshot bootstrap; start={}:{}, end={}:{}, start_crc={:08x}, end_crc={:08x}; quiesce writes and retry",
-              bootstrap_start.0,
-              bootstrap_start.1,
-              bootstrap_end.0,
-              bootstrap_end.1,
-              bootstrap_source_fingerprint.1,
-              bootstrap_end_fingerprint.1
-            )));
-          }
-          std::thread::sleep(Duration::from_millis(10));
-          let quiesce_head = runtime.source_head_position()?;
-          let quiesce_fingerprint = source_db_fingerprint(&source_db_path)?;
-          if quiesce_head != bootstrap_start || quiesce_fingerprint != bootstrap_source_fingerprint {
-            return Err(KiteError::InvalidReplication(format!(
-              "source primary did not quiesce for snapshot bootstrap; start={}:{}, observed={}:{}, start_crc={:08x}, observed_crc={:08x}; quiesce writes and retry",
-              bootstrap_start.0,
-              bootstrap_start.1,
-              quiesce_head.0,
-              quiesce_head.1,
-              bootstrap_source_fingerprint.1,
-              quiesce_fingerprint.1
-            )));
-          }
-          Ok(())
-        })?;
+        start.check_quiet(runtime, &source_db_path, "did not quiesce for")?;
+
+        let mut batch = BootstrapBatch::new(self, runtime);
+        remove_stale_nodes(&source, &mut batch)?;
+        let schema_map = sync_graph_state(&source, bootstrap_position.0, &mut batch)?;
+        batch.finish()?;
+
+        start.check_quiet(runtime, &source_db_path, "advanced during")?;
+        std::thread::sleep(Duration::from_millis(10));
+        start.check_quiet(runtime, &source_db_path, "did not quiesce for")?;
         Ok((bootstrap_position, schema_map))
       })()
       .and_then(|((epoch, log_index), schema_map)| {
@@ -313,9 +313,14 @@ impl SingleFileDB {
     }
   }
 
+  /// Apply the frames after the cursor: each contiguous run in one
+  /// transaction (split when its WAL records outgrow the batch budget), with
+  /// one cursor update at the end. A run that fails is applied again one
+  /// frame per transaction, which applies the frames before the failing one,
+  /// moves the cursor past them, and names the failing frame.
   fn replica_catch_up_attempt(
     &self,
-    runtime: &crate::replication::replica::ReplicaReplication,
+    runtime: &ReplicaReplication,
     max_frames: usize,
     replay_last: bool,
   ) -> Result<usize> {
@@ -325,91 +330,132 @@ impl SingleFileDB {
       return Ok(0);
     }
 
-    let (mut applied_epoch, mut applied_log_index) = runtime.applied_position();
-    let mut schema_map = runtime.schema_map();
-    let mut applied = 0usize;
-    for frame in frames {
-      let already_applied = applied_epoch > frame.epoch
-        || (applied_epoch == frame.epoch && applied_log_index >= frame.log_index);
-      if already_applied {
-        continue;
-      }
+    let (applied_epoch, applied_log_index) = runtime.applied_position();
+    let pending: Vec<&ReplicationFrame> = frames
+      .iter()
+      .filter(|frame| {
+        frame.epoch > applied_epoch
+          || (frame.epoch == applied_epoch && frame.log_index > applied_log_index)
+      })
+      .collect();
 
-      // The frame's defines join the translation only if the frame commits.
-      let mut frame_schema_map = schema_map.clone();
-      frame_schema_map.enter_epoch(frame.epoch);
-      if let Err(error) = apply_replication_frame(self, &frame.payload, &mut frame_schema_map) {
-        if applied > 0 {
-          let _ = runtime
-            .store_schema_map(schema_map)
-            .and_then(|_| runtime.mark_applied(applied_epoch, applied_log_index));
+    let mut progress = ApplyProgress {
+      schema_map: runtime.schema_map(),
+      position: (applied_epoch, applied_log_index),
+      applied: 0,
+    };
+    let budget = batch_wal_budget(self, CATCH_UP_BATCH_WAL_SHARE);
+    let mut outcome = Ok(());
+    for run in frame_runs(&pending, budget) {
+      let applied = apply_frames(self, run, &mut progress).or_else(|error| {
+        if run.len() == 1 {
+          return Err(error);
         }
-        return Err(KiteError::InvalidReplication(format!(
-          "replica apply failed at {}:{}: {error}",
-          frame.epoch, frame.log_index
-        )));
+        run
+          .iter()
+          .try_for_each(|frame| apply_frames(self, std::slice::from_ref(frame), &mut progress))
+      });
+      if let Err(error) = applied {
+        outcome = Err(error);
+        break;
       }
-
-      schema_map = frame_schema_map;
-      applied_epoch = frame.epoch;
-      applied_log_index = frame.log_index;
-      applied = applied.saturating_add(1);
     }
 
-    if applied > 0 {
-      runtime
-        .store_schema_map(schema_map)
-        .and_then(|_| runtime.mark_applied(applied_epoch, applied_log_index))
-        .map_err(|error| {
-          KiteError::InvalidReplication(format!(
-            "replica cursor persist failed at {applied_epoch}:{applied_log_index}: {error}"
-          ))
-        })?;
+    if progress.applied > 0 {
+      let (epoch, log_index) = progress.position;
+      let persisted = runtime
+        .store_schema_map(progress.schema_map)
+        .and_then(|_| runtime.mark_applied(epoch, log_index));
+      if let Err(error) = persisted {
+        return Err(match outcome {
+          Err(apply_error) => apply_error.into_error(),
+          Ok(()) => KiteError::InvalidReplication(format!(
+            "replica cursor persist failed at {epoch}:{log_index}: {error}"
+          )),
+        });
+      }
     }
+    outcome.map_err(FrameApplyError::into_error)?;
 
     runtime.clear_error()?;
-    Ok(applied)
+    Ok(progress.applied)
   }
 
-  /// Export latest primary snapshot metadata and optional bytes as transport JSON.
+  /// Export a snapshot of this primary, with a copy of the database file
+  /// when `include_data` (up to 1 GiB).
+  ///
+  /// The copy is consistent and matches the log position it reports: it is
+  /// read under the checkpoint gate and the commit lock, as backups are, so
+  /// no commit, checkpoint, optimize or vacuum changes the file meanwhile,
+  /// and commits append their frames under that lock. In `SyncMode::Off`
+  /// the commits held only in memory are written to the file first. Commits
+  /// wait for the copy.
+  pub fn primary_export_snapshot_transport(&self, include_data: bool) -> Result<SnapshotTransport> {
+    self.export_snapshot_transport(include_data, REPLICATION_SNAPSHOT_BINARY_MAX_BYTES)
+  }
+
+  /// [`Self::primary_export_snapshot_transport`] as transport JSON, with the
+  /// data in base64 (up to 32 MiB of data).
   pub fn primary_export_snapshot_transport_json(&self, include_data: bool) -> Result<String> {
-    let status = self.primary_replication_status().ok_or_else(|| {
+    self
+      .export_snapshot_transport(include_data, REPLICATION_SNAPSHOT_JSON_MAX_BYTES)?
+      .to_json()
+  }
+
+  fn export_snapshot_transport(
+    &self,
+    include_data: bool,
+    max_data_bytes: u64,
+  ) -> Result<SnapshotTransport> {
+    let replication = self.primary_replication.as_ref().ok_or_else(|| {
       KiteError::InvalidReplication("database is not opened in primary role".to_string())
     })?;
-    let (byte_length, checksum_crc32, data_base64) =
-      read_snapshot_transport_payload(&self.path, include_data)?;
-    let generated_at_ms = std::time::SystemTime::now()
-      .duration_since(std::time::UNIX_EPOCH)
-      .unwrap_or_default()
-      .as_millis() as u64;
+    // The copy holds the checkpoint gate, and a blocking checkpoint that
+    // waits for this thread's open transaction to finish would never get it.
+    if self.has_transaction() {
+      return Err(KiteError::TransactionInProgress);
+    }
 
-    let payload = json!({
-      "format": "single-file-db-copy",
-      "db_path": self.path.to_string_lossy().to_string(),
-      "byte_length": byte_length,
-      // The value is CRC-32 (IEEE); the field keeps the name clients read.
-      "checksum_crc32c": checksum_crc32,
-      "generated_at_ms": generated_at_ms,
-      "epoch": status.epoch,
-      "head_log_index": status.head_log_index,
-      "retained_floor": status.retained_floor,
-      "start_cursor": ReplicationCursor::new(status.epoch, 0, 0, status.retained_floor).to_string(),
-      "data_base64": data_base64,
-    });
+    let (position, (byte_length, checksum_crc32, data)) = {
+      let _checkpoint_gate = self.checkpoint_gate.read();
+      let _commit_guard = self.commit_lock.lock();
+      if self.sync_mode == SyncMode::Off {
+        self.persist_for_close()?;
+      }
+      (
+        replication.snapshot_position(),
+        read_database_copy(&self.path, include_data, max_data_bytes)?,
+      )
+    };
 
-    serde_json::to_string(&payload).map_err(|error| {
-      KiteError::Serialization(format!("encode replication snapshot export: {error}"))
+    Ok(SnapshotTransport {
+      format: SNAPSHOT_TRANSPORT_FORMAT,
+      byte_length,
+      checksum_crc32,
+      generated_at_ms: SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64,
+      epoch: position.epoch,
+      head_log_index: position.head_log_index,
+      retained_floor: position.retained_floor,
+      generation: position.generation,
+      start_cursor: position.start_cursor,
+      data,
     })
   }
 
-  /// Export primary replication log frames with cursor paging as transport JSON.
-  pub fn primary_export_log_transport_json(
+  /// Export a page of this primary's replication frames after `cursor` (from
+  /// the start of the retained log when `None`): at most `max_frames`
+  /// frames and `max_bytes` bytes, a frame larger than `max_bytes` being an
+  /// error. Payloads are included when `include_payload`.
+  pub fn primary_export_log_transport(
     &self,
-    cursor: Option<&str>,
+    cursor: Option<ReplicationCursor>,
     max_frames: usize,
     max_bytes: usize,
     include_payload: bool,
-  ) -> Result<String> {
+  ) -> Result<LogTransportPage> {
     if max_frames == 0 {
       return Err(KiteError::InvalidQuery("max_frames must be > 0".into()));
     }
@@ -424,20 +470,13 @@ impl SingleFileDB {
     let status = primary_replication.status();
     let sidecar_path = status.sidecar_path;
     let manifest = ManifestStore::new(sidecar_path.join(REPLICATION_MANIFEST_FILE)).read()?;
-    let parsed_cursor = match cursor {
-      Some(raw) if !raw.trim().is_empty() => Some(
-        ReplicationCursor::from_str(raw)
-          .map_err(|error| KiteError::InvalidReplication(format!("invalid cursor: {error}")))?,
-      ),
-      _ => None,
-    };
 
     let mut segments = manifest.segments.clone();
     segments.sort_by_key(|segment| segment.id);
 
     let mut frames = Vec::new();
     let mut total_bytes = 0usize;
-    let mut next_cursor: Option<String> = None;
+    let mut next_cursor = None;
     let mut limited = false;
 
     'outer: for segment in segments {
@@ -462,7 +501,7 @@ impl SingleFileDB {
           })?;
 
         let include_frame = frame_after_cursor(
-          parsed_cursor,
+          cursor,
           header.epoch,
           segment.id,
           frame_offset,
@@ -481,7 +520,7 @@ impl SingleFileDB {
           }
         }
 
-        let payload_base64 = read_frame_payload(
+        let payload = read_frame_payload(
           &mut reader,
           segment.id,
           frame_offset,
@@ -490,18 +529,20 @@ impl SingleFileDB {
         )?;
 
         if include_frame {
-          next_cursor = Some(
-            ReplicationCursor::new(header.epoch, segment.id, payload_end, header.log_index)
-              .to_string(),
-          );
-          frames.push(json!({
-            "epoch": header.epoch,
-            "log_index": header.log_index,
-            "segment_id": segment.id,
-            "segment_offset": frame_offset,
-            "bytes": frame_bytes,
-            "payload_base64": payload_base64,
-          }));
+          next_cursor = Some(ReplicationCursor::new(
+            header.epoch,
+            segment.id,
+            payload_end,
+            header.log_index,
+          ));
+          frames.push(LogTransportFrame {
+            epoch: header.epoch,
+            log_index: header.log_index,
+            segment_id: segment.id,
+            segment_offset: frame_offset,
+            bytes: frame_bytes as u64,
+            payload,
+          });
           total_bytes = total_bytes.saturating_add(frame_bytes);
         }
 
@@ -509,20 +550,32 @@ impl SingleFileDB {
       }
     }
 
-    let payload = json!({
-      "epoch": manifest.epoch,
-      "head_log_index": manifest.head_log_index,
-      "retained_floor": manifest.retained_floor,
-      "cursor": parsed_cursor.map(|value| value.to_string()),
-      "next_cursor": next_cursor,
-      "eof": !limited,
-      "frame_count": frames.len(),
-      "total_bytes": total_bytes,
-      "frames": frames,
-    });
+    Ok(LogTransportPage {
+      epoch: manifest.epoch,
+      head_log_index: manifest.head_log_index,
+      retained_floor: manifest.retained_floor,
+      generation: manifest.generation,
+      cursor,
+      next_cursor,
+      eof: !limited,
+      total_bytes: total_bytes as u64,
+      frames,
+    })
+  }
 
-    serde_json::to_string(&payload)
-      .map_err(|error| KiteError::Serialization(format!("encode replication log export: {error}")))
+  /// [`Self::primary_export_log_transport`] as transport JSON, with the
+  /// payloads in base64. `cursor` is `epoch:segment_id:segment_offset:log_index`.
+  pub fn primary_export_log_transport_json(
+    &self,
+    cursor: Option<&str>,
+    max_frames: usize,
+    max_bytes: usize,
+    include_payload: bool,
+  ) -> Result<String> {
+    let cursor = parse_transport_cursor(cursor)?;
+    self
+      .primary_export_log_transport(cursor, max_frames, max_bytes, include_payload)?
+      .to_json()
   }
 }
 
@@ -615,53 +668,31 @@ fn is_bootstrap_retryable_error(error: &KiteError) -> bool {
     )
 }
 
-fn read_snapshot_transport_payload(
+/// Size, CRC-32 and (when `include_data`, up to `max_data_bytes`) a copy
+/// of the database file. Callers hold the locks that keep writers out.
+fn read_database_copy(
   path: &Path,
   include_data: bool,
-) -> Result<(u64, String, Option<String>)> {
-  let metadata = std::fs::metadata(path)?;
-  if include_data && metadata.len() > REPLICATION_SNAPSHOT_INLINE_MAX_BYTES {
+  max_data_bytes: u64,
+) -> Result<(u64, u32, Option<Vec<u8>>)> {
+  let mut file = File::open(path)?;
+  let len = file.metadata()?.len();
+  if include_data && len > max_data_bytes {
     return Err(KiteError::InvalidReplication(format!(
-      "snapshot size {} exceeds max inline payload {} bytes",
-      metadata.len(),
-      REPLICATION_SNAPSHOT_INLINE_MAX_BYTES
+      "snapshot size {len} exceeds max inline payload {max_data_bytes} bytes"
     )));
   }
 
-  let mut reader = BufReader::new(File::open(path)?);
-  let mut hasher = Crc32Hasher::new();
-  let mut bytes_read = 0u64;
-  let mut chunk = [0u8; REPLICATION_IO_CHUNK_BYTES];
-
   if include_data {
-    let mut encoder = base64::write::EncoderWriter::new(Vec::new(), &BASE64_STANDARD);
-    loop {
-      let read = reader.read(&mut chunk)?;
-      if read == 0 {
-        break;
-      }
-
-      let payload = &chunk[..read];
-      bytes_read = bytes_read.saturating_add(read as u64);
-      if bytes_read > REPLICATION_SNAPSHOT_INLINE_MAX_BYTES {
-        return Err(KiteError::InvalidReplication(format!(
-          "snapshot size {bytes_read} exceeds max inline payload {REPLICATION_SNAPSHOT_INLINE_MAX_BYTES} bytes"
-        )));
-      }
-      hasher.update(payload);
-      encoder.write_all(payload)?;
-    }
-
-    let encoded = String::from_utf8(encoder.finish()?).map_err(|error| {
-      KiteError::Serialization(format!("snapshot base64 encoding failed: {error}"))
-    })?;
-    return Ok((
-      bytes_read,
-      format!("{:08x}", hasher.finalize()),
-      Some(encoded),
-    ));
+    let mut data = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
+    file.read_to_end(&mut data)?;
+    return Ok((data.len() as u64, crc32(&data), Some(data)));
   }
 
+  let mut reader = BufReader::with_capacity(REPLICATION_IO_CHUNK_BYTES, file);
+  let mut hasher = Crc32Hasher::new();
+  let mut bytes_read = 0u64;
+  let mut chunk = vec![0u8; REPLICATION_IO_CHUNK_BYTES];
   loop {
     let read = reader.read(&mut chunk)?;
     if read == 0 {
@@ -670,8 +701,7 @@ fn read_snapshot_transport_payload(
     bytes_read = bytes_read.saturating_add(read as u64);
     hasher.update(&chunk[..read]);
   }
-
-  Ok((bytes_read, format!("{:08x}", hasher.finalize()), None))
+  Ok((bytes_read, hasher.finalize(), None))
 }
 
 fn frame_after_cursor(
@@ -800,9 +830,9 @@ fn read_frame_payload(
   segment_id: u64,
   frame_offset: u64,
   header: &ParsedFrameHeader,
-  capture_base64: bool,
-) -> Result<Option<String>> {
-  if capture_base64 {
+  capture: bool,
+) -> Result<Option<Vec<u8>>> {
+  if capture {
     let mut payload = vec![0u8; header.payload_len];
     reader
       .read_exact(&mut payload)
@@ -816,7 +846,7 @@ fn read_frame_payload(
         });
       }
     }
-    return Ok(Some(BASE64_STANDARD.encode(payload)));
+    return Ok(Some(payload));
   }
 
   let mut hasher = (!header.crc_disabled).then(Crc32Hasher::new);
@@ -876,43 +906,184 @@ fn map_frame_payload_read_error(
   }
 }
 
-fn source_db_fingerprint(path: &Path) -> Result<(u64, u32)> {
-  let mut reader = BufReader::new(File::open(path)?);
-  let mut hasher = Crc32Hasher::new();
-  let mut chunk = [0u8; REPLICATION_IO_CHUNK_BYTES];
-  let mut bytes = 0u64;
+/// What changes whenever the source's database file does: its length, its
+/// modification time, and both header pages (every commit and checkpoint
+/// rewrites a header). Reads at most 128 KiB, not the whole file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SourceFingerprint {
+  len: u64,
+  modified_unix_nanos: Option<u128>,
+  header_crc32: u32,
+}
 
-  loop {
-    let read = reader.read(&mut chunk)?;
-    if read == 0 {
-      break;
-    }
-    hasher.update(&chunk[..read]);
-    bytes = bytes.saturating_add(read as u64);
+impl SourceFingerprint {
+  fn read(path: &Path) -> Result<Self> {
+    let file = File::open(path)?;
+    let metadata = file.metadata()?;
+    let modified_unix_nanos = metadata
+      .modified()
+      .ok()
+      .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+      .map(|since| since.as_nanos());
+    let mut head = Vec::new();
+    file
+      .take(SOURCE_FINGERPRINT_HEAD_BYTES)
+      .read_to_end(&mut head)?;
+    Ok(Self {
+      len: metadata.len(),
+      modified_unix_nanos,
+      header_crc32: crc32(&head),
+    })
+  }
+}
+
+impl std::fmt::Display for SourceFingerprint {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(
+      f,
+      "len={} mtime_ns={} header_crc={:08x}",
+      self.len,
+      self
+        .modified_unix_nanos
+        .map_or_else(|| "?".to_string(), |nanos| nanos.to_string()),
+      self.header_crc32
+    )
+  }
+}
+
+/// The source's replication head and file at the start of a bootstrap
+/// attempt.
+struct SourceState {
+  head: (u64, u64),
+  file: SourceFingerprint,
+}
+
+impl SourceState {
+  fn read(runtime: &ReplicaReplication, source_db_path: &Path) -> Result<Self> {
+    Ok(Self {
+      head: runtime.source_head_position()?,
+      file: SourceFingerprint::read(source_db_path)?,
+    })
   }
 
-  Ok((bytes, hasher.finalize()))
+  /// Fail (retryably) if the source changed since `self`; `what` completes
+  /// "source primary ... snapshot bootstrap".
+  fn check_quiet(
+    &self,
+    runtime: &ReplicaReplication,
+    source_db_path: &Path,
+    what: &str,
+  ) -> Result<()> {
+    let now = Self::read(runtime, source_db_path)?;
+    if now.head == self.head && now.file == self.file {
+      return Ok(());
+    }
+    Err(KiteError::InvalidReplication(format!(
+      "source primary {what} snapshot bootstrap; start={}:{}, observed={}:{}, start_file=[{}], \
+       observed_file=[{}]; quiesce writes and retry",
+      self.head.0, self.head.1, now.head.0, now.head.1, self.file, now.file
+    )))
+  }
+}
+
+/// The writes of a snapshot bootstrap, committed in bounded transactions:
+/// one transaction cannot outgrow the replica's WAL, and memory stays
+/// bounded. Before the first commit the replica is marked incomplete
+/// (`mark_bootstrap_incomplete`); the bootstrap's `mark_applied` clears it.
+struct BootstrapBatch<'a> {
+  replica: &'a SingleFileDB,
+  runtime: &'a ReplicaReplication,
+  tx: Option<SingleFileTxGuard<'a>>,
+  writes: usize,
+  max_wal_bytes: usize,
+}
+
+impl<'a> BootstrapBatch<'a> {
+  fn new(replica: &'a SingleFileDB, runtime: &'a ReplicaReplication) -> Self {
+    Self {
+      replica,
+      runtime,
+      tx: None,
+      writes: 0,
+      max_wal_bytes: batch_wal_budget(replica, BOOTSTRAP_BATCH_WAL_SHARE),
+    }
+  }
+
+  /// Run one write in the batch's transaction (begun on demand), and commit
+  /// the batch once it is full.
+  fn write<T>(&mut self, write: impl FnOnce(&SingleFileDB) -> Result<T>) -> Result<T> {
+    if self.tx.is_none() {
+      self.tx = Some(self.replica.begin_replication_apply()?);
+    }
+    let value = write(self.replica)?;
+    self.writes = self.writes.saturating_add(1);
+    if self.writes >= BOOTSTRAP_BATCH_MAX_WRITES || self.pending_wal_bytes() >= self.max_wal_bytes {
+      self.commit()?;
+    }
+    Ok(value)
+  }
+
+  fn pending_wal_bytes(&self) -> usize {
+    self
+      .replica
+      .current_tx_handle()
+      .map_or(0, |tx| tx.lock().pending_wal.len())
+  }
+
+  /// Commit the open transaction, if any. The WAL must not fill across
+  /// batches either: past half full (when no checkpoint is already running,
+  /// as after the auto-checkpoint of the commit), the replica checkpoints,
+  /// also with auto-checkpoint off, since the copy has to fit.
+  fn commit(&mut self) -> Result<()> {
+    let Some(tx) = self.tx.take() else {
+      return Ok(());
+    };
+    self.writes = 0;
+    if let Err(error) = self.runtime.mark_bootstrap_incomplete() {
+      let _ = tx.rollback();
+      return Err(error);
+    }
+    tx.commit()?;
+    if !self.replica.is_checkpoint_running() && self.replica.should_checkpoint(0.5) {
+      self.replica.checkpoint()?;
+    }
+    Ok(())
+  }
+
+  fn finish(mut self) -> Result<()> {
+    self.commit()
+  }
+}
+
+/// A transaction's WAL budget: `1/share` of the database's WAL, at least
+/// `MIN_BATCH_WAL_BYTES`.
+fn batch_wal_budget(db: &SingleFileDB, share: u64) -> usize {
+  let capacity = db.wal_stats().capacity;
+  usize::try_from((capacity / share.max(1)).max(MIN_BATCH_WAL_BYTES)).unwrap_or(usize::MAX)
 }
 
 /// Build the schema translation from names: every source name gets a local
 /// id (its existing one, else the source's id when free here).
 fn sync_schema_names(
-  replica: &SingleFileDB,
   source: &SingleFileDB,
   epoch: u64,
+  batch: &mut BootstrapBatch<'_>,
 ) -> Result<ReplicaSchemaMap> {
   let labels = sorted_schema_entries(&source.label_ids.read());
   let etypes = sorted_schema_entries(&source.etype_ids.read());
   let propkeys = sorted_schema_entries(&source.propkey_ids.read());
   let mut schema_map = ReplicaSchemaMap::for_epoch(epoch);
   for (id, name) in labels {
-    schema_map.insert(Label, id, replica.ensure_replica_label(&name, id)?);
+    let local_id = batch.write(|replica| replica.ensure_replica_label(&name, id))?;
+    schema_map.insert(Label, id, local_id);
   }
   for (id, name) in etypes {
-    schema_map.insert(EdgeType, id, replica.ensure_replica_etype(&name, id)?);
+    let local_id = batch.write(|replica| replica.ensure_replica_etype(&name, id))?;
+    schema_map.insert(EdgeType, id, local_id);
   }
   for (id, name) in propkeys {
-    schema_map.insert(PropertyKey, id, replica.ensure_replica_propkey(&name, id)?);
+    let local_id = batch.write(|replica| replica.ensure_replica_propkey(&name, id))?;
+    schema_map.insert(PropertyKey, id, local_id);
   }
   Ok(schema_map)
 }
@@ -935,15 +1106,11 @@ fn translate_prop_map(
 }
 
 /// Bootstrap phase 1: delete every replica node that is missing from the
-/// source or holds a different key, in its own transaction. All deletes must
-/// precede all creates: keys move between nodes, and an id can return with a
-/// new key (phase 2 recreates it as a fresh node). Until the bootstrap
-/// completes, catch-up refuses to run over the partially removed state.
-fn remove_stale_nodes(
-  replica: &SingleFileDB,
-  source: &SingleFileDB,
-  runtime: &crate::replication::replica::ReplicaReplication,
-) -> Result<()> {
+/// source or holds a different key. All deletes commit before any create:
+/// keys move between nodes, and an id can return with a new key (phase 2
+/// recreates it as a fresh node).
+fn remove_stale_nodes(source: &SingleFileDB, batch: &mut BootstrapBatch<'_>) -> Result<()> {
+  let replica = batch.replica;
   let stale: Vec<NodeId> = replica
     .list_nodes()
     .into_iter()
@@ -951,39 +1118,29 @@ fn remove_stale_nodes(
       !source.node_exists(node_id) || source.node_key(node_id) != replica.node_key(node_id)
     })
     .collect();
-  if stale.is_empty() {
-    return Ok(());
-  }
-
-  runtime.mark_bootstrap_incomplete()?;
-  let tx_guard = replica.begin_replication_apply()?;
   for node_id in stale {
-    replica.delete_node(node_id)?;
+    batch.write(|replica| replica.delete_node(node_id))?;
   }
-  tx_guard.commit()
+  batch.commit()
 }
 
 /// Bootstrap phase 2: create the source's nodes and copy schema, properties,
 /// labels, vectors, and edges, translating the source's schema ids. Returns
 /// the translation for the replica to persist.
-fn sync_graph_state<F>(
-  replica: &SingleFileDB,
+fn sync_graph_state(
   source: &SingleFileDB,
   epoch: u64,
-  before_commit: F,
-) -> Result<ReplicaSchemaMap>
-where
-  F: FnOnce() -> Result<()>,
-{
-  let tx_guard = replica.begin_replication_apply()?;
-
-  let mut schema_map = sync_schema_names(replica, source, epoch)?;
+  batch: &mut BootstrapBatch<'_>,
+) -> Result<ReplicaSchemaMap> {
+  let replica = batch.replica;
+  let mut schema_map = sync_schema_names(source, epoch, batch)?;
 
   // Phase 1 removed every node whose key differs, so existing ones match.
   let source_nodes = source.list_nodes();
   for &node_id in &source_nodes {
     if !replica.node_exists(node_id) {
-      replica.create_node_with_id(node_id, source.node_key(node_id).as_deref())?;
+      let key = source.node_key(node_id);
+      batch.write(|replica| replica.create_node_with_id(node_id, key.as_deref()))?;
     }
   }
 
@@ -996,12 +1153,12 @@ where
     let replica_props = replica.node_props(node_id).unwrap_or_default();
     for (&key_id, value) in &source_props {
       if replica_props.get(&key_id) != Some(value) {
-        replica.set_node_prop(node_id, key_id, value.clone())?;
+        batch.write(|replica| replica.set_node_prop(node_id, key_id, value.clone()))?;
       }
     }
     for &key_id in replica_props.keys() {
       if !source_props.contains_key(&key_id) {
-        replica.delete_node_prop(node_id, key_id)?;
+        batch.write(|replica| replica.delete_node_prop(node_id, key_id))?;
       }
     }
 
@@ -1013,12 +1170,12 @@ where
     let replica_labels: HashSet<_> = replica.node_labels(node_id).into_iter().collect();
     for &label_id in &source_labels {
       if !replica_labels.contains(&label_id) {
-        replica.add_node_label(node_id, label_id)?;
+        batch.write(|replica| replica.add_node_label(node_id, label_id))?;
       }
     }
     for &label_id in &replica_labels {
       if !source_labels.contains(&label_id) {
-        replica.remove_node_label(node_id, label_id)?;
+        batch.write(|replica| replica.remove_node_label(node_id, label_id))?;
       }
     }
   }
@@ -1042,14 +1199,18 @@ where
       match (source_vector, replica_vector) {
         (Some(source_value), Some(replica_value)) => {
           if source_value.as_ref() != replica_value.as_ref() {
-            replica.set_node_vector(node_id, prop_key_id, source_value.as_ref())?;
+            batch.write(|replica| {
+              replica.set_node_vector(node_id, prop_key_id, source_value.as_ref())
+            })?;
           }
         }
         (Some(source_value), None) => {
-          replica.set_node_vector(node_id, prop_key_id, source_value.as_ref())?;
+          batch.write(|replica| {
+            replica.set_node_vector(node_id, prop_key_id, source_value.as_ref())
+          })?;
         }
         (None, Some(_)) => {
-          replica.delete_node_vector(node_id, prop_key_id)?;
+          batch.write(|replica| replica.delete_node_vector(node_id, prop_key_id))?;
         }
         (None, None) => {}
       }
@@ -1077,13 +1238,13 @@ where
   // A dangling source edge (legacy data) has no live endpoint to attach to.
   for &(src, _, etype, dst) in &source_edges {
     if endpoints_exist(replica, src, dst) && !replica.edge_exists(src, etype, dst) {
-      replica.add_edge(src, etype, dst)?;
+      batch.write(|replica| replica.add_edge(src, etype, dst))?;
     }
   }
 
   for edge in replica.list_edges(None) {
     if !source_edge_set.contains(&(edge.src, edge.etype, edge.dst)) {
-      replica.delete_edge(edge.src, edge.etype, edge.dst)?;
+      batch.write(|replica| replica.delete_edge(edge.src, edge.etype, edge.dst))?;
     }
   }
 
@@ -1102,39 +1263,114 @@ where
 
     for (&key_id, value) in &source_props {
       if replica_props.get(&key_id) != Some(value) {
-        replica.set_edge_prop(src, etype, dst, key_id, value.clone())?;
+        batch.write(|replica| replica.set_edge_prop(src, etype, dst, key_id, value.clone()))?;
       }
     }
     for &key_id in replica_props.keys() {
       if !source_props.contains_key(&key_id) {
-        replica.delete_edge_prop(src, etype, dst, key_id)?;
+        batch.write(|replica| replica.delete_edge_prop(src, etype, dst, key_id))?;
       }
     }
   }
 
-  before_commit()?;
-  tx_guard.commit()?;
   Ok(schema_map)
 }
 
-fn apply_replication_frame(
+/// Catch-up state across the transactions of one pull.
+struct ApplyProgress {
+  schema_map: ReplicaSchemaMap,
+  /// The last applied frame.
+  position: (u64, u64),
+  applied: usize,
+}
+
+/// A frame that failed to apply, and why.
+struct FrameApplyError {
+  epoch: u64,
+  log_index: u64,
+  error: KiteError,
+}
+
+impl FrameApplyError {
+  fn into_error(self) -> KiteError {
+    KiteError::InvalidReplication(format!(
+      "replica apply failed at {}:{}: {}",
+      self.epoch, self.log_index, self.error
+    ))
+  }
+}
+
+/// Split contiguous frames into runs whose payloads fit `budget` bytes; a
+/// run holds at least one frame.
+fn frame_runs<'f, 'a>(
+  frames: &'f [&'a ReplicationFrame],
+  budget: usize,
+) -> Vec<&'f [&'a ReplicationFrame]> {
+  let mut runs = Vec::new();
+  let mut start = 0usize;
+  let mut bytes = 0usize;
+  for (index, frame) in frames.iter().enumerate() {
+    if index > start && bytes.saturating_add(frame.payload.len()) > budget {
+      runs.push(&frames[start..index]);
+      start = index;
+      bytes = 0;
+    }
+    bytes = bytes.saturating_add(frame.payload.len());
+  }
+  if start < frames.len() {
+    runs.push(&frames[start..]);
+  }
+  runs
+}
+
+/// Apply `frames` in one replica transaction. Their defines join the
+/// translation, and the progress moves past them, only if it commits; on an
+/// error nothing of them is applied.
+fn apply_frames(
   db: &SingleFileDB,
-  payload: &[u8],
-  schema_map: &mut ReplicaSchemaMap,
-) -> Result<()> {
-  let decoded = decode_commit_frame_payload(payload)?;
-  let records = parse_wal_records(&decoded.wal_bytes)?;
-
-  if records.is_empty() {
+  frames: &[&ReplicationFrame],
+  progress: &mut ApplyProgress,
+) -> std::result::Result<(), FrameApplyError> {
+  let failed = |frame: &ReplicationFrame, error| FrameApplyError {
+    epoch: frame.epoch,
+    log_index: frame.log_index,
+    error,
+  };
+  let (Some(first), Some(last)) = (frames.first(), frames.last()) else {
     return Ok(());
+  };
+  let decoded = frames
+    .iter()
+    .map(|frame| {
+      decode_commit_frame_payload(&frame.payload)
+        .and_then(|payload| parse_wal_records(&payload.wal_bytes))
+        .map_err(|error| failed(frame, error))
+    })
+    .collect::<std::result::Result<Vec<_>, _>>()?;
+
+  let mut schema_map = progress.schema_map.clone();
+  if decoded.iter().any(|records| !records.is_empty()) {
+    let tx_guard = db
+      .begin_replication_apply()
+      .map_err(|error| failed(first, error))?;
+    for (frame, records) in frames.iter().zip(&decoded) {
+      schema_map.enter_epoch(frame.epoch);
+      for record in records {
+        apply_wal_record_idempotent(db, record, &mut schema_map)
+          .map_err(|error| failed(frame, error))?;
+      }
+    }
+    tx_guard.commit().map_err(|error| failed(last, error))?;
+  } else {
+    for frame in frames {
+      schema_map.enter_epoch(frame.epoch);
+    }
   }
 
-  let tx_guard = db.begin_replication_apply()?;
-  for record in &records {
-    apply_wal_record_idempotent(db, record, schema_map)?;
-  }
-
-  tx_guard.commit()
+  progress.schema_map = schema_map;
+  progress.position = (last.epoch, last.log_index);
+  progress.applied = progress.applied.saturating_add(frames.len());
+  Ok(())
 }
 
 fn parse_wal_records(wal_bytes: &[u8]) -> Result<Vec<ParsedWalRecord>> {

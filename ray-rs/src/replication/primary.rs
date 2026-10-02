@@ -17,20 +17,20 @@
 //! from the sidecar with no WAL record left to compare, so the sidecar is
 //! fenced for repair.
 
+use super::durability::SidecarSync;
 use super::log_store::{ReplicationFrame, SegmentLogStore};
 use super::manifest::{
   new_manifest_generation, ManifestStore, ReplicationManifest, SegmentMeta,
   MANIFEST_ENVELOPE_VERSION,
 };
 use super::progress::{
-  clear_replica_progress, load_replica_progress, upsert_replica_progress,
-  ReplicaProgress as ReplicaProgressEntry,
+  clear_replica_progress_synced, load_replica_progress, remove_replica_progress_synced,
+  upsert_replica_progress_synced, ReplicaProgress as ReplicaProgressEntry,
 };
 use super::transport::{build_commit_payload_header, decode_commit_frame_payload};
-use super::types::{CommitToken, ReplicationRole};
+use super::types::{CommitToken, ReplicationCursor, ReplicationRole};
 use crate::core::single_file::SyncMode;
 use crate::error::{KiteError, Result};
-use crate::util::fs::sync_parent_dir;
 use fs2::FileExt;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -106,6 +106,21 @@ pub struct PrimaryRetentionOutcome {
   pub retained_floor: u64,
 }
 
+/// The replication log position a snapshot of the primary holds: read under
+/// the database's commit lock (commits append their frames under it), it
+/// matches the database file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrimarySnapshotPosition {
+  pub epoch: u64,
+  pub head_log_index: u64,
+  pub retained_floor: u64,
+  /// The sidecar's log history (`ReplicationManifest::generation`).
+  pub generation: u64,
+  /// Right after the head frame: a log pull from here skips every frame the
+  /// snapshot holds and returns the next one.
+  pub start_cursor: ReplicationCursor,
+}
+
 #[derive(Debug)]
 struct PrimarySidecarProcessLock {
   _file: File,
@@ -159,6 +174,7 @@ struct PrimaryReplicationInner {
   segment_max_bytes: u64,
   retention_min_entries: u64,
   retention_min_duration: Option<Duration>,
+  sync: SidecarSync,
   durable_append: bool,
   checksum_payload: bool,
   persist_manifest_each_append: bool,
@@ -237,12 +253,14 @@ struct PrimarySidecarHealth {
 #[derive(Debug, Clone)]
 struct PrimarySidecarHealthStore {
   path: PathBuf,
+  sync: SidecarSync,
 }
 
 impl PrimarySidecarHealthStore {
-  fn new(sidecar_path: &Path) -> Self {
+  fn new(sidecar_path: &Path, sync: SidecarSync) -> Self {
     Self {
       path: sidecar_path.join(PRIMARY_HEALTH_FILE_NAME),
+      sync,
     }
   }
 
@@ -282,11 +300,11 @@ impl PrimarySidecarHealthStore {
       .write(true)
       .open(&temp_path)?;
     temp_file.write_all(&bytes)?;
-    temp_file.sync_all()?;
+    self.sync.sync_file(&temp_file)?;
     drop(temp_file);
 
     std::fs::rename(&temp_path, &self.path)?;
-    sync_parent_dir(&self.path)?;
+    self.sync.sync_parent_dir(&self.path)?;
     Ok(())
   }
 }
@@ -308,7 +326,7 @@ impl PrimaryReplication {
       segment_max_bytes,
       retention_min_entries,
       retention_min_ms,
-      sync_mode,
+      SidecarSync::new(sync_mode, false),
       fail_after_append_for_testing,
       None,
       false,
@@ -316,6 +334,7 @@ impl PrimaryReplication {
   }
 
   /// Open a primary and reconcile a local WAL commit boundary during recovery.
+  /// The sidecar follows the database's sync policy, `sync`.
   #[allow(clippy::too_many_arguments)]
   pub fn open_with_recovery(
     db_path: &Path,
@@ -323,7 +342,7 @@ impl PrimaryReplication {
     segment_max_bytes: Option<u64>,
     retention_min_entries: Option<u64>,
     retention_min_ms: Option<u64>,
-    sync_mode: SyncMode,
+    sync: SidecarSync,
     fail_after_append_for_testing: Option<u64>,
     local_latest_committed_txid: Option<u64>,
     crash_after_local_commit_for_testing: bool,
@@ -334,7 +353,7 @@ impl PrimaryReplication {
       segment_max_bytes,
       retention_min_entries,
       retention_min_ms,
-      sync_mode,
+      sync,
       fail_after_append_for_testing,
       local_latest_committed_txid,
       crash_after_local_commit_for_testing,
@@ -366,8 +385,10 @@ impl PrimaryReplication {
   /// fenced by a newer primary epoch. A sidecar-repair fence is intentionally
   /// excluded: local commits remain authoritative while replication is stale.
   ///
-  /// The check runs before the caller takes its commit lock, so a promotion
-  /// that lands in between is not seen until the next commit.
+  /// The database runs it under its commit lock, right before it writes the
+  /// commit, so a promotion that lands while the commit waits for the lock
+  /// fences it. One that lands after the check, while the commit is written,
+  /// fences the commit's sidecar append instead.
   pub fn ensure_local_commit_allowed(&self) -> Result<()> {
     self.inner.ensure_local_commit_allowed()
   }
@@ -391,12 +412,25 @@ impl PrimaryReplication {
       .report_replica_progress(replica_id, epoch, applied_log_index)
   }
 
+  /// Forget a replica's progress, so a decommissioned replica stops holding
+  /// back retention. Returns whether it had progress recorded. A replica
+  /// that reports progress again is tracked again.
+  pub fn remove_replica_progress(&self, replica_id: &str) -> Result<bool> {
+    self.inner.remove_replica_progress(replica_id)
+  }
+
   pub fn run_retention(&self) -> Result<PrimaryRetentionOutcome> {
     self.inner.run_retention()
   }
 
   pub fn last_token(&self) -> Option<CommitToken> {
     self.inner.last_token()
+  }
+
+  /// The log position a snapshot taken now holds. Call it under the
+  /// database's commit lock, so no commit appends a frame meanwhile.
+  pub fn snapshot_position(&self) -> PrimarySnapshotPosition {
+    self.inner.snapshot_position()
   }
 
   pub fn status(&self) -> PrimaryReplicationStatus {
@@ -440,7 +474,7 @@ impl PrimaryReplicationInner {
     segment_max_bytes: Option<u64>,
     retention_min_entries: Option<u64>,
     retention_min_ms: Option<u64>,
-    sync_mode: SyncMode,
+    sync: SidecarSync,
     fail_after_append_for_testing: Option<u64>,
     local_latest_committed_txid: Option<u64>,
     crash_after_local_commit_for_testing: bool,
@@ -449,8 +483,8 @@ impl PrimaryReplicationInner {
     std::fs::create_dir_all(&sidecar_path)?;
     let sidecar_primary_lock = acquire_sidecar_primary_lock(&sidecar_path)?;
 
-    let manifest_store = ManifestStore::new(sidecar_path.join(MANIFEST_FILE_NAME));
-    let health_store = PrimarySidecarHealthStore::new(&sidecar_path);
+    let manifest_store = ManifestStore::with_sync(sidecar_path.join(MANIFEST_FILE_NAME), sync);
+    let health_store = PrimarySidecarHealthStore::new(&sidecar_path, sync);
     let health = shared_sidecar_health(&sidecar_path, &health_store)?;
     let persisted_health = Some(health.lock().clone());
     let unflushed_marker_path = sidecar_path.join(PRIMARY_UNFLUSHED_MARKER_FILE_NAME);
@@ -557,13 +591,13 @@ impl PrimaryReplicationInner {
 
     let segment_path = sidecar_path.join(segment_file_name(manifest.active_segment_id));
     let active_segment_size_bytes = segment_file_len(&segment_path)?;
-    let append_write_buffer_bytes = if matches!(sync_mode, SyncMode::Full) {
+    let durable_append = sync.durable_append();
+    let append_write_buffer_bytes = if durable_append {
       0
     } else {
       DEFAULT_APPEND_WRITE_BUFFER_BYTES
     };
-    let log_store =
-      SegmentLogStore::open_or_create_append_with_buffer(&segment_path, append_write_buffer_bytes)?;
+    let log_store = SegmentLogStore::open_append(&segment_path, append_write_buffer_bytes, sync)?;
     let manifest_disk_stamp = read_manifest_disk_stamp(manifest_store.path())?;
     let replica_progress = load_replica_progress(&sidecar_path)?;
 
@@ -597,10 +631,11 @@ impl PrimaryReplicationInner {
         .max(1),
       retention_min_entries: retention_min_entries.unwrap_or(DEFAULT_RETENTION_MIN_ENTRIES),
       retention_min_duration: retention_min_ms.map(Duration::from_millis),
-      durable_append: matches!(sync_mode, SyncMode::Full),
-      checksum_payload: matches!(sync_mode, SyncMode::Full),
-      persist_manifest_each_append: matches!(sync_mode, SyncMode::Full),
-      manifest_refresh_append_interval: if matches!(sync_mode, SyncMode::Full) {
+      sync,
+      durable_append,
+      checksum_payload: durable_append,
+      persist_manifest_each_append: durable_append,
+      manifest_refresh_append_interval: if durable_append {
         1
       } else {
         DEFAULT_MANIFEST_REFRESH_APPEND_INTERVAL
@@ -821,11 +856,12 @@ impl PrimaryReplicationInner {
 
     let token = CommitToken::new(epoch, next_log_index);
     if rotated {
-      state.log_store = SegmentLogStore::open_or_create_append_with_buffer(
+      state.log_store = SegmentLogStore::open_append(
         self
           .sidecar_path
           .join(segment_file_name(next_manifest.active_segment_id)),
         self.append_write_buffer_bytes,
+        self.sync,
       )?;
       state.active_segment_size_bytes = 0;
     }
@@ -869,18 +905,19 @@ impl PrimaryReplicationInner {
     self.manifest_store.write(&next_manifest)?;
     state.manifest_disk_stamp = read_manifest_disk_stamp(self.manifest_store.path())?;
 
-    state.log_store = SegmentLogStore::open_or_create_append_with_buffer(
+    state.log_store = SegmentLogStore::open_append(
       self
         .sidecar_path
         .join(segment_file_name(next_manifest.active_segment_id)),
       self.append_write_buffer_bytes,
+      self.sync,
     )?;
     state.active_segment_size_bytes = 0;
     state.manifest = next_manifest;
     state.manifest_dirty = false;
     state.last_token = None;
     state.replica_progress.clear();
-    clear_replica_progress(&self.sidecar_path)?;
+    clear_replica_progress_synced(&self.sidecar_path, self.sync)?;
     state.write_fenced = false;
     state.appends_since_manifest_refresh = 0;
     self
@@ -914,7 +951,13 @@ impl PrimaryReplicationInner {
       )));
     }
 
-    upsert_replica_progress(&self.sidecar_path, replica_id, epoch, applied_log_index)?;
+    upsert_replica_progress_synced(
+      &self.sidecar_path,
+      replica_id,
+      epoch,
+      applied_log_index,
+      self.sync,
+    )?;
     state.replica_progress.insert(
       replica_id.to_string(),
       ReplicaProgressEntry {
@@ -923,6 +966,22 @@ impl PrimaryReplicationInner {
       },
     );
     Ok(())
+  }
+
+  pub fn remove_replica_progress(&self, replica_id: &str) -> Result<bool> {
+    let _sidecar_guard = self.sidecar_op_lock.lock();
+    let mut state = self.state.lock();
+    if state.sidecar_needs_repair {
+      return Err(sidecar_repair_error());
+    }
+    let epoch_changed = self.refresh_manifest_locked(&mut state)?;
+    if epoch_changed || state.write_fenced {
+      return Err(stale_primary_error());
+    }
+
+    let removed = remove_replica_progress_synced(&self.sidecar_path, replica_id, self.sync)?;
+    state.replica_progress.remove(replica_id);
+    Ok(removed)
   }
 
   pub fn run_retention(&self) -> Result<PrimaryRetentionOutcome> {
@@ -1002,6 +1061,37 @@ impl PrimaryReplicationInner {
 
   pub fn last_token(&self) -> Option<CommitToken> {
     self.state.lock().last_token
+  }
+
+  /// The head frame ends the active segment, or, when that segment is still
+  /// empty, a segment with a lower id; either way a cursor at the active
+  /// segment's end with the head's log index follows it. Frames after the
+  /// head have higher log indexes, and a promoted epoch's frames the new
+  /// epoch, so the cursor precedes all of them. The end is the larger of
+  /// this instance's count (which includes frames still buffered) and the
+  /// file's length (which includes frames another instance on this sidecar
+  /// appended).
+  pub fn snapshot_position(&self) -> PrimarySnapshotPosition {
+    let state = self.state.lock();
+    let manifest = &state.manifest;
+    let active_segment_path = self
+      .sidecar_path
+      .join(segment_file_name(manifest.active_segment_id));
+    let active_segment_end = segment_file_len(&active_segment_path)
+      .unwrap_or(0)
+      .max(state.active_segment_size_bytes);
+    PrimarySnapshotPosition {
+      epoch: manifest.epoch,
+      head_log_index: manifest.head_log_index,
+      retained_floor: manifest.retained_floor,
+      generation: manifest.generation,
+      start_cursor: ReplicationCursor::new(
+        manifest.epoch,
+        manifest.active_segment_id,
+        active_segment_end,
+        manifest.head_log_index,
+      ),
+    }
   }
 
   pub fn status(&self) -> PrimaryReplicationStatus {
@@ -1191,11 +1281,12 @@ impl PrimaryReplicationInner {
         .epoch_fence
         .store(state.manifest.epoch, Ordering::Release);
       if active_changed {
-        state.log_store = SegmentLogStore::open_or_create_append_with_buffer(
+        state.log_store = SegmentLogStore::open_append(
           self
             .sidecar_path
             .join(segment_file_name(state.manifest.active_segment_id)),
           self.append_write_buffer_bytes,
+          self.sync,
         )?;
         state.active_segment_size_bytes = segment_file_len(
           &self
@@ -1209,11 +1300,12 @@ impl PrimaryReplicationInner {
     if self.persist_manifest_each_append {
       state.manifest = persisted;
       if active_changed {
-        state.log_store = SegmentLogStore::open_or_create_append_with_buffer(
+        state.log_store = SegmentLogStore::open_append(
           self
             .sidecar_path
             .join(segment_file_name(state.manifest.active_segment_id)),
           self.append_write_buffer_bytes,
+          self.sync,
         )?;
         state.active_segment_size_bytes = segment_file_len(
           &self
@@ -1230,11 +1322,12 @@ impl PrimaryReplicationInner {
       self
         .epoch_fence
         .store(state.manifest.epoch, Ordering::Release);
-      state.log_store = SegmentLogStore::open_or_create_append_with_buffer(
+      state.log_store = SegmentLogStore::open_append(
         self
           .sidecar_path
           .join(segment_file_name(state.manifest.active_segment_id)),
         self.append_write_buffer_bytes,
+        self.sync,
       )?;
       state.active_segment_size_bytes = segment_file_len(
         &self
@@ -1395,7 +1488,7 @@ fn remove_unflushed_marker(path: &Path) -> Result<()> {
 /// Whether a primary sidecar is fenced for repair/resync (`primary-health.json`).
 pub fn primary_sidecar_needs_repair(sidecar_path: &Path) -> Result<bool> {
   Ok(
-    PrimarySidecarHealthStore::new(sidecar_path)
+    PrimarySidecarHealthStore::new(sidecar_path, SidecarSync::default())
       .read()?
       .is_some_and(|health| health.sidecar_needs_repair),
   )

@@ -168,21 +168,26 @@ fn commit_latency(commits: usize, full_fsync: bool, with_primary: bool) -> kited
 }
 
 fn build_blob(path: &Path, mb: usize) -> kitedb::Result<()> {
+  const WAL_MB: usize = 4;
   let _ = std::fs::remove_file(path);
-  let db = open_single_file(path, primary_options(SyncMode::Normal))?;
+  let db = open_single_file(
+    path,
+    primary_options(SyncMode::Normal).wal_size(WAL_MB << 20),
+  )?;
   db.begin(false)?;
   let blob = db.define_propkey("blob")?;
   db.commit()?;
-  let nodes = mb * 1024;
-  for chunk_start in (0..nodes).step_by(2_000) {
+  // About 1 KiB per node; the file also holds the WAL.
+  let nodes = mb.saturating_sub(WAL_MB).max(1) * 1024;
+  for chunk_start in (0..nodes).step_by(1_000) {
     db.begin(false)?;
-    for i in chunk_start..(chunk_start + 2_000).min(nodes) {
+    for i in chunk_start..(chunk_start + 1_000).min(nodes) {
       let node = db.create_node(Some(&format!("blob-{i}")))?;
       db.set_node_prop(node, blob, PropValue::String(noise(i as u64, 1024)))?;
     }
     db.commit()?;
+    db.checkpoint()?;
   }
-  db.checkpoint()?;
   close_single_file(db)?;
   println!(
     "blob_bytes: {}",

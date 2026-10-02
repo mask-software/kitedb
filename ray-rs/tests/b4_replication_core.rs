@@ -230,7 +230,7 @@ fn b4_p4_bootstrap_copies_a_graph_larger_than_the_replica_wal() {
 
   let primary = open_single_file(
     &primary_path,
-    primary_options(SyncMode::Normal).wal_size(16 << 20),
+    primary_options(SyncMode::Full).wal_size(16 << 20),
   )
   .expect("open primary");
   primary.begin(false).expect("begin");
