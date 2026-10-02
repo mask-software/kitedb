@@ -26,10 +26,7 @@ use crate::vector::types::{VectorManifest, VectorStoreConfig};
 
 use super::open::map_snapshot_range;
 use super::recovery::{committed_transactions, replay_wal_record};
-use super::vector::{
-  materialize_vector_store_from_lazy_entries, vector_store_state_from_snapshot,
-  VectorStoreLazyEntry,
-};
+use super::vector::vector_stores_from_snapshot;
 use super::{CheckpointStatus, SingleFileDB};
 
 type GraphData = (
@@ -247,12 +244,11 @@ pub(crate) struct WrittenSnapshot {
 }
 
 /// A snapshot mapped and parsed (see `SingleFileDB::load_snapshot`), with
-/// its vector stores, ready to replace the in-memory one.
+/// all its vector stores decoded, ready to replace the in-memory one.
 #[derive(Default)]
 pub(crate) struct LoadedSnapshot {
   snapshot: Option<SnapshotData>,
   vector_stores: HashMap<PropKeyId, VectorManifest>,
-  lazy_entries: HashMap<PropKeyId, VectorStoreLazyEntry>,
 }
 
 impl LoadedSnapshot {
@@ -262,14 +258,6 @@ impl LoadedSnapshot {
     pending_vectors: &HashMap<(NodeId, PropKeyId), Option<VectorRef>>,
   ) -> Result<()> {
     for (&(node_id, prop_key_id), operation) in pending_vectors {
-      if let Some(snapshot) = self.snapshot.as_ref() {
-        materialize_vector_store_from_lazy_entries(
-          snapshot,
-          &mut self.vector_stores,
-          &mut self.lazy_entries,
-          prop_key_id,
-        )?;
-      }
       match operation {
         Some(vector) => {
           let store = self
@@ -513,6 +501,14 @@ impl SingleFileDB {
   /// installing it. Loading before the install means a failure leaves the
   /// database as it was; once the header is installed,
   /// `install_loaded_snapshot` cannot fail.
+  ///
+  /// Everything open would check or decode later is checked here: the parse
+  /// (footer CRC and structure), and the vector stores, which open leaves
+  /// encoded until first use. A store that does not decode would otherwise
+  /// be installed, then read as missing, and fail every later checkpoint.
+  /// Keeping the decoded stores costs no extra memory: the checkpoint
+  /// materialized every live store to build this snapshot, and these replace
+  /// them.
   pub(crate) fn load_snapshot(&self, written: &WrittenSnapshot) -> Result<LoadedSnapshot> {
     self.reach_checkpoint_phase(CheckpointPhase::SnapshotReload)?;
     if written.page_count == 0 {
@@ -530,11 +526,10 @@ impl SingleFileDB {
       mapped,
       &crate::core::snapshot::reader::ParseSnapshotOptions::default(),
     )?;
-    let (vector_stores, lazy_entries) = vector_store_state_from_snapshot(&snapshot)?;
+    let vector_stores = vector_stores_from_snapshot(&snapshot)?;
     Ok(LoadedSnapshot {
       snapshot: Some(snapshot),
       vector_stores,
-      lazy_entries,
     })
   }
 
@@ -554,10 +549,8 @@ impl SingleFileDB {
       (
         std::mem::replace(&mut *snapshot_guard, loaded.snapshot),
         std::mem::replace(&mut *self.vector_stores.write(), loaded.vector_stores),
-        std::mem::replace(
-          &mut *self.vector_store_lazy_entries.write(),
-          loaded.lazy_entries,
-        ),
+        // Entries of the replaced snapshot; the new one's stores are decoded.
+        std::mem::take(&mut *self.vector_store_lazy_entries.write()),
         std::mem::replace(&mut *delta_guard, delta),
       )
     };
@@ -1499,6 +1492,7 @@ impl SingleFileDB {
     // `WalBuffer::reset` drops buffered bytes, which a failed install must
     // keep, so write them out first.
     wal_buffer.flush(pager)?;
+    self.publish_replication_frames();
     let prior_header = header.clone();
     let prior_wal = wal_buffer.region_state();
 
@@ -1536,6 +1530,35 @@ impl SingleFileDB {
     }
     pager.release_deferred_free_pages();
     Ok(())
+  }
+
+  /// Publish the frames a primary's replication sidecar still buffers in
+  /// memory (Normal and Off sync modes do, for up to 100 ms), durably and
+  /// with a manifest naming them, before an install drops the WAL records of
+  /// their commits: from then on the sidecar is the only copy replicas can
+  /// get them from. Every commit's frame is appended by now: a blocking
+  /// install runs with no transaction open, and a commit appends its frame
+  /// before it stops counting as open; a background install holds the commit
+  /// lock, under which commits append.
+  ///
+  /// A failure fences the sidecar for repair, as a failed append does, and
+  /// the checkpoint goes on: local commits stay authoritative while
+  /// replication is stale, and failing would leave the WAL to fill. A loss
+  /// is never silent: the replication status reports the fence, and the
+  /// `primary-unflushed` marker (written before the first buffered frame,
+  /// removed only once none is) survives, so a reopen after a crash fences
+  /// too. The sidecar locks are leaves, so this is safe under the pager, WAL,
+  /// and header locks.
+  fn publish_replication_frames(&self) {
+    let Some(replication) = self.primary_replication.as_ref() else {
+      return;
+    };
+    if let Err(error) = replication.publish_for_checkpoint() {
+      eprintln!(
+        "Warning: replication sidecar fenced for repair: publishing its buffered frames before \
+         a checkpoint failed: {error}"
+      );
+    }
   }
 
   /// Serialize a checkpoint snapshot of `graph`.
@@ -1802,6 +1825,7 @@ impl SingleFileDB {
     }
 
     // Add edges from delta
+    let delta_edges_start = edges.len();
     for (&src, patches) in &delta.out_add {
       // Skip edges from deleted nodes
       if delta.is_node_deleted(src) {
@@ -1837,8 +1861,14 @@ impl SingleFileDB {
     // Snapshot persistence now stores ANN vectors only in dedicated
     // vector-store sections. Remove duplicate vector payloads from node props.
     self.materialize_all_vector_stores()?;
-    let vector_stores_for_snapshot: HashMap<PropKeyId, VectorManifest> =
+    let mut vector_stores_for_snapshot: HashMap<PropKeyId, VectorManifest> =
       self.vector_stores.read().clone();
+    self.drop_state_of_missing_nodes(
+      delta,
+      &mut edges,
+      delta_edges_start,
+      &mut vector_stores_for_snapshot,
+    );
     if !vector_stores_for_snapshot.is_empty() {
       for node in &mut nodes {
         node.props.retain(|prop_key_id, value| {
@@ -1856,6 +1886,63 @@ impl SingleFileDB {
       propkeys,
       vector_stores_for_snapshot,
     ))
+  }
+
+  /// Drop what the committed state holds for nodes that exist nowhere (see
+  /// `DeltaState::node_exists_over`, also used by WAL replay): the delta
+  /// edges `edges[delta_edges_start..]` with such an endpoint, props
+  /// included, and the vectors of such nodes in `vector_stores`, copies of
+  /// the live stores. The snapshot writer rejects a dangling edge, so one
+  /// would fail this checkpoint and every later one while the WAL fills; a
+  /// vector would be carried into every snapshot. Older versions left both
+  /// behind (their node deletes logged no vector deletes), and so can
+  /// non-MVCC write transactions racing a delete of the node, since nothing
+  /// checks the node again at commit. The install replaces the delta and the
+  /// stores, so they disappear live too. Snapshot edges need no check: both
+  /// ends are snapshot nodes the delta did not delete.
+  ///
+  /// A background checkpoint's store copies may also hold vectors committed
+  /// after its cut for nodes created after it. Dropping those is safe: the
+  /// install replays every post-cut commit over the new snapshot, and so does
+  /// open after a crash.
+  fn drop_state_of_missing_nodes(
+    &self,
+    delta: &DeltaState,
+    edges: &mut Vec<EdgeData>,
+    delta_edges_start: usize,
+    vector_stores: &mut HashMap<PropKeyId, VectorManifest>,
+  ) {
+    let snapshot = self.snapshot.read();
+    let exists = |node_id| delta.node_exists_over(snapshot.as_ref(), node_id);
+
+    let mut delta_edges = edges.split_off(delta_edges_start);
+    let collected = delta_edges.len();
+    delta_edges.retain(|edge| exists(edge.src) && exists(edge.dst));
+    let dropped_edges = collected - delta_edges.len();
+    edges.append(&mut delta_edges);
+
+    let mut dropped_vectors = 0usize;
+    for store in vector_stores.values_mut() {
+      let missing: Vec<NodeId> = store
+        .node_to_vector
+        .keys()
+        .copied()
+        .filter(|&node_id| !exists(node_id))
+        .collect();
+      for node_id in missing {
+        dropped_vectors += usize::from(vector_store_delete(store, node_id));
+      }
+    }
+
+    if dropped_edges > 0 {
+      eprintln!(
+        "Warning: checkpoint dropped {dropped_edges} edges whose source or destination node \
+         does not exist"
+      );
+    }
+    if dropped_vectors > 0 {
+      eprintln!("Warning: checkpoint dropped {dropped_vectors} vectors of nodes that do not exist");
+    }
   }
 
   /// Check if checkpoint is recommended based on WAL usage
@@ -4743,3 +4830,8 @@ mod review_regressions {
 #[cfg(test)]
 #[path = "final_review_regressions.rs"]
 mod final_review_regressions;
+
+/// Wave-2 checkpoint reproductions (K1-K5).
+#[cfg(test)]
+#[path = "w2_checkpoint_tests.rs"]
+mod w2_tests;

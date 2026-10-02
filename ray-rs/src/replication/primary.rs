@@ -391,6 +391,22 @@ impl PrimaryReplication {
   pub fn flush_for_transport_export(&self) -> Result<()> {
     self.inner.flush_for_transport_export()
   }
+
+  /// Make every frame appended so far durable, with a manifest naming it,
+  /// before a checkpoint drops the WAL records of their commits. On failure
+  /// the sidecar is fenced for repair, as after a failed append, and the
+  /// error is returned for the caller to report.
+  pub fn publish_for_checkpoint(&self) -> Result<()> {
+    self.inner.publish_for_checkpoint()
+  }
+
+  /// Stop the background publisher without publishing, so frames appended
+  /// from now on stay buffered in memory, as they would be at a crash before
+  /// its next tick.
+  #[cfg(test)]
+  pub(crate) fn stop_publisher_for_testing(&mut self) {
+    drop(self.publisher.take());
+  }
 }
 
 impl Drop for PrimaryReplication {
@@ -1161,6 +1177,28 @@ impl PrimaryReplicationInner {
     let _sidecar_guard = self.sidecar_op_lock.lock();
     let mut state = self.state.lock();
     self.publish_locked(&mut state, false)
+  }
+
+  /// See `PrimaryReplication::publish_for_checkpoint`. Full sync appends are
+  /// durable, with their manifest, as they return, so only buffered modes
+  /// have anything to do. The frames are synced before `publish_locked`
+  /// persists the manifest and removes the `primary-unflushed` marker.
+  pub fn publish_for_checkpoint(&self) -> Result<()> {
+    if self.durable_append {
+      return Ok(());
+    }
+    let result = {
+      let _sidecar_guard = self.sidecar_op_lock.lock();
+      let mut state = self.state.lock();
+      state
+        .log_store
+        .sync()
+        .and_then(|()| self.publish_locked(&mut state, true))
+    };
+    if let Err(error) = &result {
+      self.mark_append_failure(error);
+    }
+    result
   }
 
   /// Record on disk that frames are about to sit in memory, before the first
