@@ -774,6 +774,39 @@ mod tests {
     }
   }
 
+  /// The edges a hop expands list a self-loop once in `Both`, as `Kite::neighbors` does (A13):
+  /// it is one edge, both an out- and an in-edge.
+  #[test]
+  fn hop_neighbors_list_a_self_loop_once_in_both() {
+    use crate::api::kite::{EdgeDef, KiteOptions, NodeDef};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let options = KiteOptions::new()
+      .node(NodeDef::new("User", "user:"))
+      .edge(EdgeDef::new("FOLLOWS"));
+    let mut ray = RustKite::open(dir.path().join("self-loop.kitedb"), options).expect("open");
+    let a = ray
+      .create_node("User", "a", std::collections::HashMap::new())
+      .expect("create a")
+      .id();
+    ray.link(a, "FOLLOWS", a).expect("self-loop");
+    let etype = ray
+      .edge_def("FOLLOWS")
+      .and_then(|def| def.etype_id)
+      .expect("etype");
+
+    let edges = neighbors(ray.raw(), a, TraversalDirection::Both, None);
+    assert_eq!(
+      edges,
+      vec![Edge {
+        src: a,
+        etype,
+        dst: a
+      }],
+      "one self-loop is one edge in both directions"
+    );
+    ray.close().expect("close");
+  }
+
   #[test]
   fn limit_counts_filtered_results_and_stops_calling_predicates() {
     // 1 -> 2..=11; only even nodes pass.

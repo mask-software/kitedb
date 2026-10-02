@@ -5007,3 +5007,8 @@ mod w2_tests;
 #[cfg(test)]
 #[path = "b4_checkpoint_tests.rs"]
 mod b4_tests;
+
+/// raydb-b4 core-misc: vector-store compaction at checkpoint (B12).
+#[cfg(test)]
+#[path = "b4_core_misc_checkpoint_tests.rs"]
+mod b4_core_misc_tests;

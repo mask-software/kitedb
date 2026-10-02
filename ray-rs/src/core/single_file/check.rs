@@ -77,3 +77,8 @@ impl SingleFileDB {
     }
   }
 }
+
+/// raydb-b4 core-misc: `check()` runs the snapshot checks.
+#[cfg(test)]
+#[path = "b4_core_misc_check_tests.rs"]
+mod b4_core_misc_tests;
