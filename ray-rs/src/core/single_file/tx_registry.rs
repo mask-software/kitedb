@@ -10,7 +10,8 @@
 //! destructor hands the transaction to its database, which rolls it back
 //! (`reap_abandoned_transactions`) at the next begin, background checkpoint,
 //! or wait for open transactions. Left open, it would hold off every blocking
-//! checkpoint forever, and every writer its writer slot claim excludes.
+//! checkpoint forever, and, through its writer slot claim, the writers that
+//! claim excludes.
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
