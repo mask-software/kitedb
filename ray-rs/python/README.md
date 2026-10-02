@@ -327,12 +327,25 @@ primary.close()
 ```
 
 To guard host HTTP endpoints for these controls, use `create_replication_admin_authorizer`
-with a `ReplicationAdminAuthConfig`. Tokens are compared in constant time. For mTLS, prefer
-`mtls_matcher=create_asgi_tls_mtls_matcher()`, which reads the server's verified TLS state.
-A client-certificate header forwarded by a TLS-terminating proxy (`mtls_header`, default
-`x-forwarded-client-cert`) counts only with `trust_forwarded_client_cert=True` and an
-`mtls_subject_regex` that matches the whole header value; any client can send that header,
-so enable it only behind a proxy that strips or overwrites it.
+with a `ReplicationAdminAuthConfig`. `mode` is required (`"none"` disables auth explicitly),
+and a config that can't be checked safely raises `ValueError`. Tokens are compared in constant
+time. The mTLS modes need a check: prefer `mtls_matcher=create_asgi_tls_mtls_matcher()`, which
+reads the server's verified TLS state. A client-certificate header forwarded by a
+TLS-terminating proxy (`mtls_header`, default `x-forwarded-client-cert`) counts only with
+`trust_forwarded_client_cert=True` and an `mtls_subject_regex` that matches the whole header
+value; any client can send that header, so enable it only behind a proxy that verifies client
+certificates and overwrites it on every request.
+
+```python
+import os
+
+from kitedb import ReplicationAdminAuthConfig, create_replication_admin_authorizer
+
+require_admin = create_replication_admin_authorizer(
+    ReplicationAdminAuthConfig(mode="token", token=os.environ["REPLICATION_ADMIN_TOKEN"])
+)
+require_admin(request)  # raises PermissionError when unauthorized
+```
 
 ## Documentation
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import hmac
 import re
 from typing import Any, Callable, Mapping, Optional, Pattern, Union, Literal
@@ -20,17 +21,20 @@ ReplicationAdminAuthMode = Literal[
 class ReplicationAdminAuthConfig:
     """Replication admin auth settings.
 
-    mTLS is checked by `mtls_matcher` when set (for example
+    `mode` is required; `"none"` disables auth explicitly. A config that can't
+    be checked safely raises `ValueError` when it is used.
+
+    The token modes compare `Authorization: Bearer <token>` in constant time.
+    The mTLS modes need a check: `mtls_matcher` (for example
     `create_asgi_tls_mtls_matcher()`, which reads the server's verified TLS
-    state). Without a matcher, a client-certificate header forwarded by a
-    TLS-terminating proxy (`mtls_header`) counts only when
-    `trust_forwarded_client_cert` is True and the whole header value matches
-    `mtls_subject_regex`. Any client can send that header, so trust it only
-    behind a proxy that strips or overwrites it. Otherwise mTLS never
-    authorizes.
+    state), or `trust_forwarded_client_cert=True` with `mtls_subject_regex`.
+    The latter accepts the `mtls_header` set by a TLS-terminating proxy when
+    the whole value matches the regex. Any client can send that header, so
+    enable it only behind a proxy that verifies client certificates and
+    overwrites the header on every request.
     """
 
-    mode: ReplicationAdminAuthMode = "none"
+    mode: Optional[ReplicationAdminAuthMode] = None
     token: Optional[str] = None
     mtls_header: str = "x-forwarded-client-cert"
     mtls_subject_regex: Optional[Union[str, Pattern[str]]] = None
@@ -63,7 +67,13 @@ def _normalize_regex(
 
 
 def _normalize_config(config: ReplicationAdminAuthConfig) -> ReplicationAdminAuthConfig:
-    mode = (config.mode or "none").strip().lower()
+    if config.mode is None:
+        raise ValueError(
+            "replication admin auth requires a mode "
+            "(none|token|mtls|token_or_mtls|token_and_mtls); "
+            "use mode='none' to disable auth explicitly"
+        )
+    mode = str(config.mode).strip().lower()
     if mode not in _VALID_REPLICATION_ADMIN_AUTH_MODES:
         raise ValueError(
             f"Invalid replication admin auth mode '{mode}'; expected "
@@ -75,13 +85,28 @@ def _normalize_config(config: ReplicationAdminAuthConfig) -> ReplicationAdminAut
             f"replication admin auth mode '{mode}' requires a non-empty token"
         )
     mtls_header = (config.mtls_header or "").strip().lower() or "x-forwarded-client-cert"
+    subject_regex = _normalize_regex(config.mtls_subject_regex)
+    trust_forwarded = bool(config.trust_forwarded_client_cert)
+    if trust_forwarded and subject_regex is None:
+        raise ValueError(
+            "replication admin auth: trust_forwarded_client_cert requires "
+            f"mtls_subject_regex, the pattern a trusted '{mtls_header}' value must match"
+        )
+    uses_mtls = mode in {"mtls", "token_or_mtls", "token_and_mtls"}
+    if uses_mtls and config.mtls_matcher is None and not trust_forwarded:
+        raise ValueError(
+            f"replication admin auth mode '{mode}' needs an mTLS check: an "
+            "mtls_matcher (e.g. create_asgi_tls_mtls_matcher()) or "
+            "trust_forwarded_client_cert=True with mtls_subject_regex. A client "
+            "certificate header is not trusted by default, since any client can send it."
+        )
     return ReplicationAdminAuthConfig(
         mode=mode,  # type: ignore[arg-type]
         token=token,
         mtls_header=mtls_header,
-        mtls_subject_regex=_normalize_regex(config.mtls_subject_regex),
+        mtls_subject_regex=subject_regex,
         mtls_matcher=config.mtls_matcher,
-        trust_forwarded_client_cert=bool(config.trust_forwarded_client_cert),
+        trust_forwarded_client_cert=trust_forwarded,
     )
 
 
@@ -158,10 +183,14 @@ def create_asgi_tls_mtls_matcher(
     return _matcher
 
 
+def _sha256(value: str) -> bytes:
+    return hashlib.sha256(value.encode("utf-8")).digest()
+
+
 def _forwarded_client_cert_ok(headers: Any, config: ReplicationAdminAuthConfig) -> bool:
     """Whether a proxy-forwarded client-cert header authorizes the request.
 
-    Denied unless forwarded certs are explicitly trusted and a subject regex
+    Denied unless forwarded certs are explicitly trusted and the subject regex
     matches the entire header value (so a matching substring smuggled into an
     attacker-controlled value doesn't pass).
     """
@@ -182,30 +211,32 @@ def is_replication_admin_authorized(
     normalized = _normalize_config(config)
     headers = getattr(request, "headers", None)
 
-    token_ok = False
-    if normalized.token:
+    def token_ok() -> bool:
+        if not normalized.token:
+            return False
         authorization = _get_header_value(headers, "authorization")
-        if authorization is not None:
-            # Constant-time comparison, so response timing doesn't leak the token.
-            token_ok = hmac.compare_digest(
-                authorization.encode("utf-8"),
-                f"Bearer {normalized.token}".encode("utf-8"),
-            )
+        if authorization is None:
+            return False
+        # Compare fixed-length digests in constant time, so response timing
+        # leaks neither the token nor its length.
+        return hmac.compare_digest(
+            _sha256(authorization), _sha256(f"Bearer {normalized.token}")
+        )
 
-    if normalized.mtls_matcher is not None:
-        mtls_ok = bool(normalized.mtls_matcher(request))
-    else:
-        mtls_ok = _forwarded_client_cert_ok(headers, normalized)
+    def mtls_ok() -> bool:
+        if normalized.mtls_matcher is not None:
+            return bool(normalized.mtls_matcher(request))
+        return _forwarded_client_cert_ok(headers, normalized)
 
     if normalized.mode == "none":
         return True
     if normalized.mode == "token":
-        return token_ok
+        return token_ok()
     if normalized.mode == "mtls":
-        return mtls_ok
+        return mtls_ok()
     if normalized.mode == "token_or_mtls":
-        return token_ok or mtls_ok
-    return token_ok and mtls_ok
+        return token_ok() or mtls_ok()
+    return token_ok() and mtls_ok()
 
 
 def authorize_replication_admin_request(
