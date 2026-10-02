@@ -88,13 +88,38 @@ export function App() {
 	const zoomInRef = useRef<(() => void) | null>(null);
 	const zoomOutRef = useRef<(() => void) | null>(null);
 
+	// Request tokens: bumped on every path/impact request and on every reset that invalidates one,
+	// so a response that resolves after a newer request (or a reset) is recognized as stale.
+	const pathRequestRef = useRef(0);
+	const impactRequestRef = useRef(0);
+
 	// Check initial connection status
 	useEffect(() => {
-		api.getStatus().then((status) => {
-			setConnected(status.connected);
-			setDbPath(status.path || null);
-			setIsDemo(status.isDemo || false);
-		});
+		api
+			.getStatus()
+			.then((status) => {
+				setConnected(status.connected);
+				setDbPath(status.path || null);
+				setIsDemo(status.isDemo || false);
+			})
+			.catch(() => {
+				// Server unreachable: stay disconnected.
+				setConnected(false);
+			});
+	}, []);
+
+	const resetPath = useCallback((start: VisNode | null) => {
+		pathRequestRef.current++;
+		setPathStart(start);
+		setPathEnd(null);
+		setPathNodes(new Set());
+		setPathSequence([]);
+	}, []);
+
+	const resetImpact = useCallback((source: VisNode | null) => {
+		impactRequestRef.current++;
+		setImpactSource(source);
+		setImpactedNodes(new Set());
 	}, []);
 
 	// Handle database open
@@ -146,13 +171,9 @@ export function App() {
 		setDbPath(null);
 		setIsDemo(false);
 		setSelectedNode(null);
-		setPathStart(null);
-		setPathEnd(null);
-		setPathNodes(new Set());
-		setPathSequence([]);
-		setImpactSource(null);
-		setImpactedNodes(new Set());
-	}, []);
+		resetPath(null);
+		resetImpact(null);
+	}, [resetPath, resetImpact]);
 
 	// Handle node click based on tool mode
 	const handleNodeClick = useCallback(
@@ -163,62 +184,58 @@ export function App() {
 			}
 
 			if (toolMode === "path") {
-				if (!pathStart) {
-					setPathStart(node);
-					setPathEnd(null);
-					setPathNodes(new Set());
-					setPathSequence([]);
-					return;
-				}
-
-				if (!pathEnd) {
+				if (pathStart && !pathEnd) {
+					const request = ++pathRequestRef.current;
 					setPathEnd(node);
-					const result = await api.findPath(pathStart.id, node.id);
-					if (result.path && result.path.length > 0) {
-						setPathNodes(new Set(result.path));
-						setPathSequence(result.path);
-					} else {
-						setPathNodes(new Set());
-						setPathSequence([]);
+					let path: string[] = [];
+					try {
+						path = (await api.findPath(pathStart.id, node.id)).path ?? [];
+					} catch {
+						// A failed request clears the highlight, like "no path".
+					}
+					if (request === pathRequestRef.current) {
+						setPathNodes(new Set(path));
+						setPathSequence(path);
 					}
 					return;
 				}
 
-				setPathStart(node);
-				setPathEnd(null);
-				setPathNodes(new Set());
-				setPathSequence([]);
+				// First click, or a new start after a finished path.
+				resetPath(node);
 				return;
 			}
 
 			if (toolMode === "impact") {
-				setImpactSource(node);
-				const result = await api.analyzeImpact(node.id);
-				if (result.impacted) {
-					setImpactedNodes(new Set(result.impacted));
-				} else {
-					setImpactedNodes(new Set());
+				resetImpact(node);
+				const request = impactRequestRef.current;
+				let impacted: string[] = [];
+				try {
+					impacted = (await api.analyzeImpact(node.id)).impacted ?? [];
+				} catch {
+					// A failed request clears the highlight, like "nothing impacted".
+				}
+				if (request === impactRequestRef.current) {
+					setImpactedNodes(new Set(impacted));
 				}
 			}
 		},
-		[toolMode, pathStart, pathEnd],
+		[toolMode, pathStart, pathEnd, resetPath, resetImpact],
 	);
 
 	// Handle tool mode change
-	const handleToolModeChange = useCallback((mode: ToolMode) => {
-		setToolMode(mode);
-		// Clear mode-specific state
-		if (mode !== "path") {
-			setPathStart(null);
-			setPathEnd(null);
-			setPathNodes(new Set());
-			setPathSequence([]);
-		}
-		if (mode !== "impact") {
-			setImpactSource(null);
-			setImpactedNodes(new Set());
-		}
-	}, []);
+	const handleToolModeChange = useCallback(
+		(mode: ToolMode) => {
+			setToolMode(mode);
+			// Clear mode-specific state
+			if (mode !== "path") {
+				resetPath(null);
+			}
+			if (mode !== "impact") {
+				resetImpact(null);
+			}
+		},
+		[resetPath, resetImpact],
+	);
 
 	// Handle zoom via Cytoscape refs
 	const handleZoomIn = useCallback(() => {

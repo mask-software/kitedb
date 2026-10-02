@@ -6,6 +6,7 @@
 
 import { Elysia, t } from "elysia";
 import { createHash, timingSafeEqual } from "node:crypto";
+import { closeSync, fstatSync, openSync, readSync } from "node:fs";
 import { join } from "node:path";
 import {
   getDb,
@@ -29,6 +30,9 @@ const REPLICATION_PULL_MAX_FRAMES_DEFAULT = 256;
 const REPLICATION_PULL_MAX_FRAMES_LIMIT = 10_000;
 const REPLICATION_LOG_MAX_BYTES_DEFAULT = 1024 * 1024;
 const REPLICATION_LOG_MAX_BYTES_LIMIT = 32 * 1024 * 1024;
+/** Default for PLAYGROUND_SNAPSHOT_MAX_BYTES; same as core's REPLICATION_SNAPSHOT_INLINE_MAX_BYTES. */
+const SNAPSHOT_INLINE_MAX_BYTES_DEFAULT = 32 * 1024 * 1024;
+const SNAPSHOT_READ_CHUNK_BYTES = 1024 * 1024;
 
 // ============================================================================
 // Types
@@ -522,6 +526,60 @@ async function readFileBytes(path: string): Promise<Uint8Array> {
   return new Uint8Array(arrayBuffer);
 }
 
+/** PLAYGROUND_SNAPSHOT_MAX_BYTES, read per request; invalid or non-positive values use the default. */
+function resolveSnapshotInlineMaxBytes(): number {
+  const parsed = Number(process.env.PLAYGROUND_SNAPSHOT_MAX_BYTES);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : SNAPSHOT_INLINE_MAX_BYTES_DEFAULT;
+}
+
+/**
+ * Size, sha256 and (with `includeData`) base64 of the live database file, all from one read.
+ *
+ * The read is synchronous: Kite's methods run on the JS thread, so no other request's commit can
+ * land mid-read. Core's background checkpoint threads still can; a size change is detected, an
+ * in-place rewrite is not. A consistent copy needs a Kite-level snapshot API (the napi Kite has no
+ * createBackup or replication snapshot export).
+ */
+function readDbFileSnapshot(
+  path: string,
+  includeData: boolean,
+  maxInlineBytes: number,
+): { byteLength: number; sha256: string; dataBase64?: string } {
+  const fd = openSync(path, "r");
+  try {
+    const size = fstatSync(fd).size;
+    if (includeData && size > maxInlineBytes) {
+      throw new Error(`snapshot size ${size} exceeds max inline payload ${maxInlineBytes} bytes`);
+    }
+
+    // The inline payload needs the whole file; a hash alone needs one chunk at a time.
+    const buffer = Buffer.allocUnsafe(includeData ? size : Math.min(size, SNAPSHOT_READ_CHUNK_BYTES));
+    const hash = createHash("sha256");
+    let byteLength = 0;
+    while (byteLength < size) {
+      const offset = includeData ? byteLength : 0;
+      const length = Math.min(buffer.length - offset, size - byteLength);
+      const read = readSync(fd, buffer, offset, length, byteLength);
+      if (read === 0) {
+        break;
+      }
+      hash.update(buffer.subarray(offset, offset + read));
+      byteLength += read;
+    }
+    if (byteLength !== size || fstatSync(fd).size !== size) {
+      throw new Error("database file changed while the snapshot was read; retry");
+    }
+
+    return {
+      byteLength,
+      sha256: hash.digest("hex"),
+      dataBase64: includeData ? buffer.toString("base64") : undefined,
+    };
+  } finally {
+    closeSync(fd);
+  }
+}
+
 async function readManifestEnvelope(sidecarPath: string): Promise<{
   version: number;
   payload_crc32: number;
@@ -901,8 +959,7 @@ export const apiRoutes = new Elysia({ prefix: "/api" })
       }
 
       const includeData = parseBoolean((query as Record<string, unknown>).includeData, false);
-      const bytes = await readFileBytes(dbPath);
-      const sha256 = createHash("sha256").update(bytes).digest("hex");
+      const file = readDbFileSnapshot(dbPath, includeData, resolveSnapshotInlineMaxBytes());
 
       return {
         success: true,
@@ -912,10 +969,10 @@ export const apiRoutes = new Elysia({ prefix: "/api" })
         snapshot: {
           format: "single-file-db-copy",
           dbPath,
-          byteLength: bytes.byteLength,
-          sha256,
+          byteLength: file.byteLength,
+          sha256: file.sha256,
           generatedAt: new Date().toISOString(),
-          dataBase64: includeData ? Buffer.from(bytes).toString("base64") : undefined,
+          dataBase64: file.dataBase64,
         },
       };
     } catch (error) {
@@ -968,6 +1025,10 @@ export const apiRoutes = new Elysia({ prefix: "/api" })
       const envelope = await readManifestEnvelope(resolved.primary.sidecarPath);
       const manifest = envelope.manifest;
       const segments = [...manifest.segments].sort((left, right) => left.id - right.id);
+      // With the cursor at or past the manifest epoch no frame has a later epoch, so the log index
+      // alone decides whether a frame follows the cursor (see cursorAfterFrame).
+      const skipBelowLogIndex =
+        cursor && cursor.epoch >= BigInt(manifest.epoch) ? cursor.logIndex : null;
 
       const frames: Array<ReplicationFrameResponse> = [];
       let totalBytes = 0;
@@ -975,6 +1036,18 @@ export const apiRoutes = new Elysia({ prefix: "/api" })
       let limited = false;
 
       outer: for (const segment of segments) {
+        // Skip sealed segments that end before the cursor; same rule as core's replica pull. The
+        // active segment is always read: core appends to it before persisting the manifest, so its
+        // end_log_index can lag.
+        if (
+          skipBelowLogIndex !== null &&
+          segment.id !== manifest.active_segment_id &&
+          segment.end_log_index > 0 &&
+          BigInt(segment.end_log_index) < skipBelowLogIndex
+        ) {
+          continue;
+        }
+
         const segmentId = BigInt(segment.id);
         const segmentPath = join(
           resolved.primary.sidecarPath,
