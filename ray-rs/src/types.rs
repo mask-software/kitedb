@@ -441,7 +441,9 @@ pub struct OpenOptions {
   // Single-file options
   pub auto_checkpoint: bool,     // Default: true
   pub checkpoint_threshold: f64, // Default: 0.8
-  pub cache_snapshot: bool,      // Default: true
+  /// Has no effect: an open database always keeps its snapshot mapped.
+  #[deprecated(note = "has no effect: an open database always keeps its snapshot mapped")]
+  pub cache_snapshot: bool,
 
   // Single-file creation options
   pub page_size: Option<usize>, // Default: 4096

@@ -1,8 +1,9 @@
 """b4 cache lane: the cache layer was removed.
 
-Its open options are accepted and ignored (out-of-range values included), and
-the ``cache_*`` methods, ``CacheStats`` and the cache metrics are deprecated
-no-op stubs kept for one release so existing callers keep working.
+Its open options, and the equally dead ``cache_snapshot``, are accepted and
+ignored (out-of-range values included), and the ``cache_*`` methods,
+``CacheStats`` and the cache metrics are deprecated no-op stubs kept for one
+release so existing callers keep working.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ import pytest
 from kitedb import CacheStats, Database, OpenOptions, PropValue, collect_metrics, health_check
 
 CACHE_OPTIONS = dict(
+    cache_snapshot=False,
     cache_enabled=True,
     cache_max_node_props=-1,
     cache_max_edge_props=0,
@@ -36,7 +38,9 @@ def test_cache_open_options_are_accepted_and_ignored(tmp_path):
     assert db.get_node_prop_string(node, name) == "second"
     db.close()
 
-    db = Database(path, OpenOptions(**CACHE_OPTIONS))
+    options = OpenOptions(**CACHE_OPTIONS)
+    assert options.cache_snapshot is False and options.cache_enabled is True
+    db = Database(path, options)
     assert db.get_node_by_key("a") == node
     assert db.get_node_prop_string(node, name) == "second"
     db.close()

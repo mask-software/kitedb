@@ -922,7 +922,7 @@ pub struct VectorIndexOptions {
   pub ivf: Option<JsIvfConfig>,
   /// Minimum training vectors before index training (default: 1000)
   pub training_threshold: Option<i32>,
-  /// Maximum node IDs to cache for search results (0 disables this cache)
+  /// @deprecated No effect: `VectorIndex` keeps no node cache. Still accepted so existing callers keep working.
   pub cache_max_size: Option<i32>,
 }
 
@@ -992,15 +992,6 @@ impl VectorIndexOptions {
         validation::MAX_COUNT,
       )?;
       options = options.with_training_threshold(training_threshold);
-    }
-
-    if let Some(cache_max_size) = self.cache_max_size {
-      let cache_max_size = validation::non_negative_usize(
-        "cacheMaxSize",
-        cache_max_size as i64,
-        validation::MAX_CACHE_ENTRIES,
-      )?;
-      options = options.with_cache_max_size(cache_max_size);
     }
 
     if let Some(normalize) = self.normalize {

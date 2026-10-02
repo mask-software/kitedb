@@ -141,7 +141,8 @@ pub struct OpenOptions {
   /// Compression options for checkpoint snapshots (single-file only)
   #[pyo3(get, set)]
   pub checkpoint_compression: Option<CompressionOptions>,
-  /// Cache parsed snapshot in memory (single-file only)
+  /// Deprecated: has no effect (an open database always keeps its snapshot
+  /// mapped). Still accepted so existing callers keep working.
   #[pyo3(get, set)]
   pub cache_snapshot: Option<bool>,
   /// Deprecated: has no effect (the cache layer was removed). Still accepted

@@ -7,7 +7,6 @@ use std::fmt::Display;
 use crate::types::NodeId;
 
 /// Keep binding-provided cache allocations bounded even on 64-bit hosts.
-pub(crate) const MAX_CACHE_ENTRIES: i64 = 10_000_000;
 /// Upper bound for general result, batch, and traversal counts.
 pub(crate) const MAX_COUNT: i64 = 1_000_000_000;
 /// Upper bound for depth-like options.

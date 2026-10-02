@@ -8,7 +8,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-import { Database, PropType, collectMetrics, healthCheck } from '../index'
+import { Database, PropType, VectorIndex, collectMetrics, healthCheck } from '../index'
 
 const makeDbPath = () => path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'kitedb-b4-cache-')), 'test.kitedb')
 
@@ -79,4 +79,13 @@ test('metrics report the removed cache as disabled and empty', (t) => {
   t.is(metrics.memory.totalEstimateBytes, metrics.memory.deltaEstimateBytes + metrics.memory.snapshotBytes)
   t.false(healthCheck(db).checks.some((check) => check.name === 'cache_efficiency'))
   db.close()
+})
+
+test('VectorIndex cacheMaxSize is accepted and ignored', (t) => {
+  // VectorIndex keeps no node cache, so even a negative size is accepted, and
+  // every vector stays searchable.
+  const index = new VectorIndex({ dimensions: 2, cacheMaxSize: -1 })
+  for (let id = 1; id <= 5; id++) index.set(id, [1, id])
+  const hits = index.search([1, 0], { k: 5 })
+  t.deepEqual(hits.map((hit) => hit.nodeId).sort(), [1, 2, 3, 4, 5])
 })

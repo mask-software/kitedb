@@ -431,7 +431,7 @@ mod open_option_validation_tests {
       cache_max_node_props: Some(-1),
       cache_max_edge_props: Some(i64::MAX),
       cache_max_traversal_entries: Some(-1),
-      cache_max_query_entries: Some(validation::MAX_CACHE_ENTRIES + 1),
+      cache_max_query_entries: Some(i64::MAX),
       cache_query_ttl_ms: Some(-1),
       ..Default::default()
     }

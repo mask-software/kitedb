@@ -60,8 +60,8 @@ class OpenOptions:
     checkpoint_threshold: Optional[float]
     background_checkpoint: Optional[bool]
     checkpoint_compression: Optional[CompressionOptions]
+    # Deprecated: cache_snapshot and the cache_* options have no effect.
     cache_snapshot: Optional[bool]
-    # Deprecated: the cache_* options have no effect (the cache layer was removed).
     cache_enabled: Optional[bool]
     cache_max_node_props: Optional[int]
     cache_max_edge_props: Optional[int]
@@ -96,8 +96,8 @@ class OpenOptions:
         checkpoint_threshold: Optional[float] = None,
         background_checkpoint: Optional[bool] = None,
         checkpoint_compression: Optional[CompressionOptions] = None,
+        # Deprecated: cache_snapshot and the cache_* options have no effect.
         cache_snapshot: Optional[bool] = None,
-        # Deprecated: the cache_* options have no effect.
         cache_enabled: Optional[bool] = None,
         cache_max_node_props: Optional[int] = None,
         cache_max_edge_props: Optional[int] = None,

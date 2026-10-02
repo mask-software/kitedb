@@ -137,6 +137,18 @@ fn cache_options_are_accepted_and_ignored() {
   }
 }
 
+/// `types::OpenOptions::cache_snapshot` never did anything either: an open
+/// database always keeps its snapshot mapped. It stays, deprecated, for one
+/// release.
+#[test]
+fn legacy_open_options_still_accept_cache_snapshot() {
+  let options = kitedb::types::OpenOptions {
+    cache_snapshot: true,
+    ..Default::default()
+  };
+  assert!(options.cache_snapshot);
+}
+
 // ============================================================================
 // Write path, cache options on vs off
 // ============================================================================
