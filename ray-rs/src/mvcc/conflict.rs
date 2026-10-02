@@ -4,7 +4,7 @@
 //!
 //! Ported from src/mvcc/conflict-detector.ts
 
-use crate::mvcc::tx_manager::TxManager;
+use crate::mvcc::tx_manager::{key_group, TxManager};
 use crate::types::{TxId, TxKey};
 use std::collections::HashSet;
 
@@ -89,17 +89,31 @@ impl ConflictDetector {
     }
 
     let tx_snapshot_ts = tx.start_ts;
+    // With its key groups known, only keys of a group some commit since its
+    // snapshot wrote can conflict.
+    let written_groups = tx_manager.groups_written_since(txid, tx_snapshot_ts);
+    if written_groups
+      .as_ref()
+      .is_some_and(|groups| groups.is_empty())
+    {
+      return Vec::new();
+    }
+    let may_conflict = |key: &TxKey| {
+      written_groups
+        .as_ref()
+        .is_none_or(|groups| groups.contains(&key_group(key)))
+    };
     let mut conflicts: HashSet<String> = HashSet::new();
 
     // Check read-write conflicts
-    for read_key in &tx.read_set {
+    for read_key in tx.read_set.iter().filter(|key| may_conflict(key)) {
       if tx_manager.has_conflicting_write(read_key, tx_snapshot_ts) {
         conflicts.insert(read_key.to_string());
       }
     }
 
     // Check write-write conflicts
-    for write_key in &tx.write_set {
+    for write_key in tx.write_set.iter().filter(|key| may_conflict(key)) {
       if tx_manager.has_conflicting_write(write_key, tx_snapshot_ts) {
         conflicts.insert(write_key.to_string());
       }

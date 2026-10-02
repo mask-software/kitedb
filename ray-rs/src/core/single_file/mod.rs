@@ -81,6 +81,11 @@ pub(crate) struct SchemaStaging {
 }
 
 impl SchemaStaging {
+  /// Whether nothing is staged.
+  pub(crate) fn is_empty(&self) -> bool {
+    self.label_names.is_empty() && self.etype_names.is_empty() && self.propkey_names.is_empty()
+  }
+
   pub(crate) fn label_id(&self, name: &str) -> Option<LabelId> {
     self.label_names.get(name).copied()
   }
@@ -172,6 +177,9 @@ pub struct SingleFileTxState {
   /// With MVCC, what a write transaction read, kept here (thread-private)
   /// and handed to the transaction manager for its conflict check at commit.
   pub(crate) mvcc_reads: TxKeySet,
+  /// What it wrote, kept and handed over the same way: writers never take
+  /// the transaction manager's lock, which every commit takes.
+  pub(crate) mvcc_writes: TxKeySet,
 }
 
 impl SingleFileTxState {
@@ -187,6 +195,7 @@ impl SingleFileTxState {
       replication_apply: false,
       holds_writer: false,
       mvcc_reads: TxKeySet::new(),
+      mvcc_writes: TxKeySet::new(),
     }
   }
 
@@ -631,6 +640,11 @@ impl SingleFileDB {
   /// delta merge. The caller holds `commit_lock`, which gives schema and data
   /// one serialized commit order.
   pub(crate) fn publish_staged_schema(&self, staged: &SchemaStaging) -> Result<()> {
+    // Most commits define nothing: skip the seven locks every reader of a
+    // name or id takes.
+    if staged.is_empty() {
+      return Ok(());
+    }
     let mut reservations = self.schema_reservations.lock();
     let mut label_names = self.label_names.write();
     let mut label_ids = self.label_ids.write();

@@ -4,7 +4,8 @@
 
 use crate::core::snapshot::reader::SnapshotData;
 use crate::types::*;
-use std::collections::HashMap;
+use hashbrown::hash_map::Entry;
+use std::collections::{BTreeSet, HashMap};
 
 /// Whether `snapshot` holds the edge `src -[etype]-> dst`.
 pub fn snapshot_has_edge(
@@ -266,6 +267,23 @@ impl DeltaState {
   /// for the old copy. Props of the old copy's base edges have no patch to
   /// find them by, so this scans `edge_props`; recreating an id is rare.
   pub fn create_node(&mut self, node_id: NodeId, key: Option<&str>) {
+    let node_delta = NodeDelta {
+      key: key.map(|s| s.to_string()),
+      labels: None,
+      labels_deleted: None,
+      props: None,
+    };
+    self.install_created_node(node_id, node_delta);
+
+    // Add to key index if key provided
+    if let Some(k) = key {
+      self.key_index.insert(k.to_string(), node_id);
+    }
+  }
+
+  /// Make `node_delta` node `node_id`'s own copy here, as `create_node` does,
+  /// without touching the key index.
+  fn install_created_node(&mut self, node_id: NodeId, node_delta: NodeDelta) {
     if self.is_node_deleted(node_id) {
       self.modified_nodes.remove(&node_id);
       self.drop_edge_patches(node_id);
@@ -273,18 +291,7 @@ impl DeltaState {
         .edge_props
         .retain(|&(src, _, dst), _| src != node_id && dst != node_id);
     }
-    let node_delta = NodeDelta {
-      key: key.map(|s| s.to_string()),
-      labels: None,
-      labels_deleted: None,
-      props: None,
-    };
     self.created_nodes.insert(node_id, node_delta);
-
-    // Add to key index if key provided
-    if let Some(k) = key {
-      self.key_index.insert(k.to_string(), node_id);
-    }
   }
 
   /// Delete a node
@@ -645,6 +652,200 @@ impl DeltaState {
     snapshot
       .and_then(|snap| snap.lookup_by_key(key))
       .filter(|&node_id| !self.is_node_deleted(node_id))
+  }
+
+  // ========================================================================
+  // Commit Merge
+  // ========================================================================
+
+  /// Merge `pending`, a committed transaction's delta over this one, into
+  /// this delta, and leave `pending` drained (its allocations are the
+  /// caller's to drop, outside its locks).
+  ///
+  /// Commits merge under `delta.write()`, where every reader and writer
+  /// waits. So wherever this delta holds nothing yet for an entry of
+  /// `pending` (a new node's state, a new node's edge patches, a new edge's
+  /// props: all of a typical commit), the entry moves in whole, with one map
+  /// insert and no allocation. Elsewhere its changes apply one at a time, the
+  /// way the transaction made them; both give the same result.
+  pub(crate) fn merge_from(&mut self, pending: &mut DeltaState) {
+    self.new_labels.extend(pending.new_labels.drain());
+    self.new_etypes.extend(pending.new_etypes.drain());
+    self.new_propkeys.extend(pending.new_propkeys.drain());
+
+    // A node the transaction deleted (and did not recreate) takes the props
+    // of its edges with it, also those it wrote to its committed edges.
+    let removed: DeltaSet<NodeId> = pending
+      .deleted_nodes
+      .iter()
+      .copied()
+      .filter(|&node_id| pending.is_node_removed(node_id))
+      .collect();
+
+    // Deletes first: a node the transaction deleted and created again is a
+    // recreate, whose new copy replaces the committed one.
+    for node_id in pending.deleted_nodes.drain() {
+      self.delete_node(node_id);
+    }
+
+    let key_index = &pending.key_index;
+    for (node_id, node_delta) in pending.created_nodes.drain() {
+      // The key index is copied last; a key it already gives this node needs
+      // no entry before that.
+      let key_indexed = node_delta
+        .key
+        .as_deref()
+        .is_some_and(|key| key_index.get(key) == Some(&node_id));
+      self.merge_created_node(node_id, node_delta, key_indexed);
+    }
+    for (node_id, node_delta) in pending.modified_nodes.drain() {
+      self.merge_modified_node(node_id, node_delta);
+    }
+
+    // Each direction merges from its own patches (a delta keeps them in
+    // both): an add cancels a tombstone in its direction, as in `add_edge`.
+    for (src, patches) in pending.out_add.drain() {
+      merge_added_patches(&mut self.out_add, &mut self.out_del, src, patches);
+    }
+    for (dst, patches) in pending.in_add.drain() {
+      merge_added_patches(&mut self.in_add, &mut self.in_del, dst, patches);
+    }
+    // `delete_edge` keeps both directions of a tombstone itself.
+    pending.in_del.clear();
+    for (src, patches) in pending.out_del.drain() {
+      for patch in patches {
+        self.delete_edge(src, patch.etype, patch.other);
+      }
+    }
+
+    for (edge, props) in pending.edge_props.drain() {
+      let (src, _, dst) = edge;
+      if props.is_empty() || removed.contains(&src) || removed.contains(&dst) {
+        continue;
+      }
+      match self.edge_props.entry(edge) {
+        Entry::Vacant(entry) => {
+          entry.insert(props);
+        }
+        Entry::Occupied(mut entry) => entry.get_mut().extend(props),
+      }
+    }
+
+    self.key_index.extend(pending.key_index.drain());
+  }
+
+  /// Merge node `node_id`, created by the merged transaction with the state
+  /// `node_delta`: what `create_node` and then its label and prop writes
+  /// give, except the key index entry if `key_indexed`.
+  fn merge_created_node(&mut self, node_id: NodeId, node_delta: NodeDelta, key_indexed: bool) {
+    let NodeDelta {
+      key,
+      labels,
+      labels_deleted,
+      props,
+    } = node_delta;
+    // Removing a label from a node created here only drops it from its
+    // labels (see `remove_node_label`).
+    let labels = labels
+      .filter(|labels| !labels.is_empty())
+      .map(|mut labels| {
+        for label_id in labels_deleted.iter().flatten() {
+          labels.remove(label_id);
+        }
+        labels
+      });
+    let props = props.filter(|props| !props.is_empty());
+    if let (Some(key), false) = (key.as_deref(), key_indexed) {
+      self.key_index.insert(key.to_string(), node_id);
+    }
+    let node_delta = NodeDelta {
+      key,
+      labels,
+      labels_deleted: None,
+      props,
+    };
+    self.install_created_node(node_id, node_delta);
+  }
+
+  /// Merge the label and prop changes `node_delta` that the merged
+  /// transaction made to node `node_id`, which it did not create: what its
+  /// `add_node_label`, `remove_node_label` and prop writes give, in that
+  /// order.
+  fn merge_modified_node(&mut self, node_id: NodeId, node_delta: NodeDelta) {
+    let NodeDelta {
+      labels,
+      labels_deleted,
+      props,
+      ..
+    } = node_delta;
+    let labels = labels.filter(|labels| !labels.is_empty());
+    let labels_deleted = labels_deleted.filter(|labels| !labels.is_empty());
+    let props = props.filter(|props| !props.is_empty());
+    if labels.is_none() && labels_deleted.is_none() && props.is_none() {
+      return;
+    }
+
+    if !self.created_nodes.contains_key(&node_id) {
+      if let Entry::Vacant(entry) = self.modified_nodes.entry(node_id) {
+        let labels = labels.map(|mut labels| {
+          for label_id in labels_deleted.iter().flatten() {
+            labels.remove(label_id);
+          }
+          labels
+        });
+        entry.insert(NodeDelta {
+          key: None,
+          labels,
+          labels_deleted,
+          props,
+        });
+        return;
+      }
+    }
+
+    for label_id in labels.into_iter().flatten() {
+      self.add_node_label(node_id, label_id);
+    }
+    for label_id in labels_deleted.into_iter().flatten() {
+      self.remove_node_label(node_id, label_id);
+    }
+    for (key_id, value) in props.into_iter().flatten() {
+      match value {
+        Some(value) => self.set_node_prop_ref(node_id, key_id, value),
+        None => self.delete_node_prop(node_id, key_id),
+      }
+    }
+  }
+}
+
+/// Merge a transaction's add patches of `node` in one direction (`adds`, with
+/// that direction's tombstones `tombstones`): each cancels a tombstone, or is
+/// added, as in `DeltaState::add_edge`.
+fn merge_added_patches(
+  adds: &mut DeltaMap<NodeId, BTreeSet<EdgePatch>>,
+  tombstones: &mut DeltaMap<NodeId, BTreeSet<EdgePatch>>,
+  node: NodeId,
+  patches: BTreeSet<EdgePatch>,
+) {
+  if patches.is_empty() {
+    return;
+  }
+  let Some(node_tombstones) = tombstones.get_mut(&node) else {
+    match adds.entry(node) {
+      Entry::Vacant(entry) => {
+        entry.insert(patches);
+      }
+      Entry::Occupied(mut entry) => entry.get_mut().extend(patches),
+    }
+    return;
+  };
+  for patch in patches {
+    if !node_tombstones.remove(&patch) {
+      adds.entry(node).or_default().insert(patch);
+    }
+  }
+  if node_tombstones.is_empty() {
+    tombstones.remove(&node);
   }
 }
 

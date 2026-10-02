@@ -82,7 +82,11 @@ impl CommitRecorder<'_> {
         node_id,
         delta: node_delta.for_version(),
       };
-      let before = self.committed.node(node_id);
+      let before = if fresh.contains(&node_id) {
+        None
+      } else {
+        self.committed.node(node_id)
+      };
       self
         .vc
         .record_node(node_id, before, Some(created), txid, commit_ts);

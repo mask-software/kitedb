@@ -27,6 +27,7 @@ use crate::core::wal::record::{
   build_begin_payload, build_commit_payload, build_rollback_payload, WalRecord,
 };
 use crate::error::{KiteError, Result};
+use crate::mvcc::TxKeyGroups;
 use crate::replication::primary::PrimaryReplicationStatus;
 use crate::replication::types::CommitToken;
 use crate::types::*;
@@ -769,10 +770,20 @@ impl SingleFileDB {
       let pending = std::mem::take(&mut tx.pending);
       let staged_schema = std::mem::take(&mut tx.schema);
       let pending_wal = std::mem::take(&mut tx.pending_wal);
-      // Its reads join its MVCC read set before the conflict check.
+      // Its reads and writes join its MVCC sets before the conflict check.
       let reads = std::mem::take(&mut tx.mvcc_reads);
-      if let (Some(mvcc), false) = (self.mvcc.as_ref(), reads.is_empty()) {
-        mvcc.tx_manager.lock().record_reads(tx.txid, reads);
+      let writes = std::mem::take(&mut tx.mvcc_writes);
+      if let (Some(mvcc), false) = (self.mvcc.as_ref(), reads.is_empty() && writes.is_empty()) {
+        // Grouped here, without any lock: with other transactions open, the
+        // check and the commit, which every other commit waits for, then
+        // look up and note groups instead of keys. Alone, it commits with no
+        // check and nothing to note.
+        let groups = (self.active_transactions.load(Ordering::Acquire) > 1)
+          .then(|| TxKeyGroups::of(&reads, &writes));
+        mvcc
+          .tx_manager
+          .lock()
+          .record_reads_and_writes(tx.txid, reads, writes, groups);
       }
       (
         tx.txid,
@@ -1155,7 +1166,7 @@ impl SingleFileDB {
   fn publish_commit(&self, request: CommitRequest) -> CommitOutcome {
     let CommitRequest {
       txid,
-      pending,
+      mut pending,
       pending_wal,
       staged_schema,
       committer,
@@ -1197,8 +1208,10 @@ impl SingleFileDB {
     let vector_result =
       vector_fault.and_then(|()| self.apply_pending_vectors(&pending.pending_vectors));
 
-    merge_pending_delta(&mut delta, pending);
+    delta.merge_from(&mut pending);
     drop(delta);
+    // Its emptied maps are freed without the lock.
+    drop(pending);
 
     let mut commit_token = None;
     if let Some(replication) = self.primary_replication.as_ref() {
@@ -1420,97 +1433,6 @@ impl SingleFileDB {
     let (txid, _) = self.require_write_tx_handle()?;
     Ok(txid)
   }
-}
-
-fn merge_pending_delta(target: &mut DeltaState, mut pending: DeltaState) {
-  target.new_labels.extend(pending.new_labels.drain());
-  target.new_etypes.extend(pending.new_etypes.drain());
-  target.new_propkeys.extend(pending.new_propkeys.drain());
-
-  // A node the transaction deleted (and did not recreate) takes the props of
-  // its edges with it, also those it wrote to its committed edges.
-  let removed: HashSet<NodeId> = pending
-    .deleted_nodes
-    .iter()
-    .copied()
-    .filter(|&node_id| pending.is_node_removed(node_id))
-    .collect();
-
-  // Deletes first: a node the transaction deleted and created again is a
-  // recreate, whose new copy replaces the committed one.
-  for node_id in pending.deleted_nodes.drain() {
-    target.delete_node(node_id);
-  }
-
-  for (node_id, mut node_delta) in pending.created_nodes.drain() {
-    target.create_node(node_id, node_delta.key.as_deref());
-
-    if let Some(labels) = node_delta.labels.take() {
-      for label_id in labels {
-        target.add_node_label(node_id, label_id);
-      }
-    }
-    if let Some(labels_deleted) = node_delta.labels_deleted.take() {
-      for label_id in labels_deleted {
-        target.remove_node_label(node_id, label_id);
-      }
-    }
-    if let Some(props) = node_delta.props.take() {
-      for (key_id, value) in props {
-        match value {
-          Some(value) => target.set_node_prop_ref(node_id, key_id, value),
-          None => target.delete_node_prop(node_id, key_id),
-        }
-      }
-    }
-  }
-
-  for (node_id, mut node_delta) in pending.modified_nodes.drain() {
-    if let Some(labels) = node_delta.labels.take() {
-      for label_id in labels {
-        target.add_node_label(node_id, label_id);
-      }
-    }
-    if let Some(labels_deleted) = node_delta.labels_deleted.take() {
-      for label_id in labels_deleted {
-        target.remove_node_label(node_id, label_id);
-      }
-    }
-    if let Some(props) = node_delta.props.take() {
-      for (key_id, value) in props {
-        match value {
-          Some(value) => target.set_node_prop_ref(node_id, key_id, value),
-          None => target.delete_node_prop(node_id, key_id),
-        }
-      }
-    }
-  }
-
-  for (src, patches) in pending.out_add.drain() {
-    for patch in patches {
-      target.add_edge(src, patch.etype, patch.other);
-    }
-  }
-
-  for (src, patches) in pending.out_del.drain() {
-    for patch in patches {
-      target.delete_edge(src, patch.etype, patch.other);
-    }
-  }
-
-  for ((src, etype, dst), props) in pending.edge_props.drain() {
-    if removed.contains(&src) || removed.contains(&dst) {
-      continue;
-    }
-    for (key_id, value) in props {
-      match value {
-        Some(value) => target.set_edge_prop_ref(src, etype, dst, key_id, value),
-        None => target.delete_edge_prop(src, etype, dst, key_id),
-      }
-    }
-  }
-
-  target.key_index.extend(pending.key_index.drain());
 }
 
 #[cfg(test)]

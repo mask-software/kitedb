@@ -14,7 +14,6 @@ use crate::core::wal::record::{
   WalRecord,
 };
 use crate::error::{KiteError, Result};
-use crate::mvcc::TxManager;
 use crate::types::*;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
@@ -171,19 +170,40 @@ impl TxView<'_> {
   }
 }
 
-/// An edge prop write needs the edge and its endpoints: it conflicts with a concurrent
-/// delete_edge (which writes `Edge`) or delete_node of an endpoint (which writes `Node`), but
-/// not with writes to the edge's other props.
-fn record_edge_prop_dependencies(
-  tx_mgr: &mut TxManager,
-  txid: TxId,
-  src: NodeId,
-  etype: ETypeId,
-  dst: NodeId,
-) {
-  tx_mgr.record_read(txid, TxKey::Edge { src, etype, dst });
-  tx_mgr.record_read(txid, TxKey::Node(src));
-  tx_mgr.record_read(txid, TxKey::Node(dst));
+/// The MVCC keys an edge add or delete writes: the edge, and its endpoints'
+/// neighbor lists, with and without its type.
+fn edge_write_keys(src: NodeId, etype: ETypeId, dst: NodeId) -> [TxKey; 5] {
+  [
+    TxKey::Edge { src, etype, dst },
+    TxKey::NeighborsOut {
+      node_id: src,
+      etype: None,
+    },
+    TxKey::NeighborsIn {
+      node_id: dst,
+      etype: None,
+    },
+    TxKey::NeighborsOut {
+      node_id: src,
+      etype: Some(etype),
+    },
+    TxKey::NeighborsIn {
+      node_id: dst,
+      etype: Some(etype),
+    },
+  ]
+}
+
+/// What an edge prop write reads: the edge and its endpoints. It conflicts
+/// with a concurrent delete_edge (which writes `Edge`) or delete_node of an
+/// endpoint (which writes `Node`), but not with writes to the edge's other
+/// props.
+fn edge_prop_dependencies(src: NodeId, etype: ETypeId, dst: NodeId) -> [TxKey; 3] {
+  [
+    TxKey::Edge { src, etype, dst },
+    TxKey::Node(src),
+    TxKey::Node(dst),
+  ]
 }
 
 impl SingleFileDB {
@@ -203,11 +223,36 @@ impl SingleFileDB {
   }
 
   /// A write that a check turned into a no-op or rejected still depends on
-  /// the state it checked.
+  /// the state it checked: note the read for the MVCC conflict check of the
+  /// calling thread's transaction `txid`.
   pub(super) fn record_read(&self, txid: TxId, key: TxKey) {
-    if let Some(mvcc) = self.mvcc.as_ref() {
-      let mut tx_mgr = mvcc.tx_manager.lock();
-      tx_mgr.record_read(txid, key);
+    if self.mvcc.is_none() {
+      return;
+    }
+    if let Some(handle) = self.current_tx_handle() {
+      let mut tx = handle.lock();
+      if tx.txid == txid {
+        tx.record_read(key);
+      }
+    }
+  }
+
+  /// Note what the write transaction `tx` wrote (`writes`) and read
+  /// (`reads`) for its MVCC conflict check at commit. The keys stay with the
+  /// transaction until then (see `SingleFileTxState::mvcc_writes`). A bulk
+  /// load, which runs without MVCC, records nothing.
+  fn record_tx_keys(
+    &self,
+    tx: &mut SingleFileTxState,
+    writes: impl IntoIterator<Item = TxKey>,
+    reads: impl IntoIterator<Item = TxKey>,
+  ) {
+    if self.mvcc.is_none() || tx.bulk_load {
+      return;
+    }
+    tx.mvcc_writes.extend(writes);
+    for key in reads {
+      tx.record_read(key);
     }
   }
 
@@ -266,22 +311,15 @@ impl SingleFileDB {
           build_del_edge_prop_payload(src, etype, dst, key_id),
         );
         self.write_wal_tx(tx_handle, record)?;
-        let bulk_load = {
-          let mut tx = tx_handle.lock();
-          tx.pending.delete_edge_prop(src, etype, dst, key_id);
-          tx.bulk_load
+        let mut tx = tx_handle.lock();
+        tx.pending.delete_edge_prop(src, etype, dst, key_id);
+        let written = TxKey::EdgeProp {
+          src,
+          etype,
+          dst,
+          key_id,
         };
-        if let Some(mvcc) = self.mvcc.as_ref().filter(|_| !bulk_load) {
-          mvcc.tx_manager.lock().record_write(
-            txid,
-            TxKey::EdgeProp {
-              src,
-              etype,
-              dst,
-              key_id,
-            },
-          );
-        }
+        self.record_tx_keys(&mut tx, [written], []);
       }
     }
     Ok(())
@@ -310,22 +348,14 @@ impl SingleFileDB {
     self.write_wal_tx(&tx_handle, record)?;
 
     // Update pending delta
-    let bulk_load = {
-      let mut tx = tx_handle.lock();
-      tx.pending.create_node(node_id, key);
-      tx.bulk_load
-    };
-
-    if let Some(mvcc) = self.mvcc.as_ref() {
-      if bulk_load {
-        return Ok(node_id);
-      }
-      let mut tx_mgr = mvcc.tx_manager.lock();
-      tx_mgr.record_write(txid, TxKey::Node(node_id));
-      if let Some(key) = key {
-        tx_mgr.record_write(txid, TxKey::Key(key.into()));
-      }
-    }
+    let mut tx = tx_handle.lock();
+    tx.pending.create_node(node_id, key);
+    let key_written = key.map(|key| TxKey::Key(key.into()));
+    self.record_tx_keys(
+      &mut tx,
+      [TxKey::Node(node_id)].into_iter().chain(key_written),
+      [],
+    );
 
     Ok(node_id)
   }
@@ -362,22 +392,14 @@ impl SingleFileDB {
     self.write_wal_tx(&tx_handle, record)?;
 
     // Update pending delta
-    let bulk_load = {
-      let mut tx = tx_handle.lock();
-      tx.pending.create_node(node_id, key);
-      tx.bulk_load
-    };
-
-    if let Some(mvcc) = self.mvcc.as_ref() {
-      if bulk_load {
-        return Ok(node_id);
-      }
-      let mut tx_mgr = mvcc.tx_manager.lock();
-      tx_mgr.record_write(txid, TxKey::Node(node_id));
-      if let Some(key) = key {
-        tx_mgr.record_write(txid, TxKey::Key(key.into()));
-      }
-    }
+    let mut tx = tx_handle.lock();
+    tx.pending.create_node(node_id, key);
+    let key_written = key.map(|key| TxKey::Key(key.into()));
+    self.record_tx_keys(
+      &mut tx,
+      [TxKey::Node(node_id)].into_iter().chain(key_written),
+      [],
+    );
 
     Ok(node_id)
   }
@@ -416,25 +438,16 @@ impl SingleFileDB {
     );
     self.write_wal_tx(&tx_handle, record)?;
 
-    let bulk_load = {
-      let mut tx = tx_handle.lock();
-      for (node_id, key) in entries.iter() {
-        tx.pending.create_node(*node_id, *key);
-      }
-      tx.bulk_load
-    };
-
-    if let Some(mvcc) = self.mvcc.as_ref() {
-      if !bulk_load {
-        let mut tx_mgr = mvcc.tx_manager.lock();
-        for (node_id, key) in entries.iter() {
-          tx_mgr.record_write(txid, TxKey::Node(*node_id));
-          if let Some(key) = key {
-            tx_mgr.record_write(txid, TxKey::Key((*key).into()));
-          }
-        }
-      }
+    let mut tx = tx_handle.lock();
+    for (node_id, key) in entries.iter() {
+      tx.pending.create_node(*node_id, *key);
     }
+    let written = entries.iter().flat_map(|&(node_id, key)| {
+      [TxKey::Node(node_id)]
+        .into_iter()
+        .chain(key.map(|key| TxKey::Key(key.into())))
+    });
+    self.record_tx_keys(&mut tx, written, []);
 
     Ok(node_ids)
   }
@@ -478,36 +491,22 @@ impl SingleFileDB {
     self.write_wal_tx(&tx_handle, record)?;
 
     // Update pending delta
-    {
-      let mut tx = tx_handle.lock();
-      tx.pending.delete_node(node_id);
-    }
-
-    if let Some(mvcc) = self.mvcc.as_ref() {
-      if bulk_load {
-        return Ok(());
-      }
-      let mut tx_mgr = mvcc.tx_manager.lock();
-      tx_mgr.record_write(txid, TxKey::Node(node_id));
-      tx_mgr.record_write(
-        txid,
-        TxKey::NeighborsOut {
-          node_id,
-          etype: None,
-        },
-      );
-      tx_mgr.record_write(
-        txid,
-        TxKey::NeighborsIn {
-          node_id,
-          etype: None,
-        },
-      );
-      tx_mgr.record_write(txid, TxKey::NodeLabels(node_id));
-      if let Some(key) = key_to_record.as_ref() {
-        tx_mgr.record_write(txid, TxKey::Key(key.as_str().into()));
-      }
-    }
+    let mut tx = tx_handle.lock();
+    tx.pending.delete_node(node_id);
+    let written = [
+      TxKey::Node(node_id),
+      TxKey::NeighborsOut {
+        node_id,
+        etype: None,
+      },
+      TxKey::NeighborsIn {
+        node_id,
+        etype: None,
+      },
+      TxKey::NodeLabels(node_id),
+    ];
+    let key_written = key_to_record.map(|key| TxKey::Key(key.as_str().into()));
+    self.record_tx_keys(&mut tx, written.into_iter().chain(key_written), []);
 
     Ok(())
   }
@@ -544,48 +543,12 @@ impl SingleFileDB {
     self.write_wal_tx(&tx_handle, record)?;
 
     // Update pending delta
-    let bulk_load = {
+    {
       let mut tx = tx_handle.lock();
       tx.pending.add_edge_over(src, etype, dst, in_base);
-      tx.bulk_load
-    };
-    self.mask_revealed_edge_props(txid, &tx_handle, vec![((src, etype, dst), revealed)])?;
-
-    if let Some(mvcc) = self.mvcc.as_ref() {
-      if bulk_load {
-        return Ok(true);
-      }
-      let mut tx_mgr = mvcc.tx_manager.lock();
-      tx_mgr.record_write(txid, TxKey::Edge { src, etype, dst });
-      tx_mgr.record_write(
-        txid,
-        TxKey::NeighborsOut {
-          node_id: src,
-          etype: None,
-        },
-      );
-      tx_mgr.record_write(
-        txid,
-        TxKey::NeighborsIn {
-          node_id: dst,
-          etype: None,
-        },
-      );
-      tx_mgr.record_write(
-        txid,
-        TxKey::NeighborsOut {
-          node_id: src,
-          etype: Some(etype),
-        },
-      );
-      tx_mgr.record_write(
-        txid,
-        TxKey::NeighborsIn {
-          node_id: dst,
-          etype: Some(etype),
-        },
-      );
+      self.record_tx_keys(&mut tx, edge_write_keys(src, etype, dst), []);
     }
+    self.mask_revealed_edge_props(txid, &tx_handle, vec![((src, etype, dst), revealed)])?;
 
     Ok(true)
   }
@@ -634,58 +597,17 @@ impl SingleFileDB {
     );
     self.write_wal_tx(&tx_handle, record)?;
 
-    let bulk_load = {
+    {
       let mut tx = tx_handle.lock();
       for (&(src, etype, dst), &in_base) in edges.iter().zip(&new_in_base) {
         tx.pending.add_edge_over(src, etype, dst, in_base);
       }
-      tx.bulk_load
-    };
-    self.mask_revealed_edge_props(txid, &tx_handle, revealed)?;
-
-    if let Some(mvcc) = self.mvcc.as_ref() {
-      if !bulk_load {
-        let mut tx_mgr = mvcc.tx_manager.lock();
-        for (src, etype, dst) in edges.iter() {
-          tx_mgr.record_write(
-            txid,
-            TxKey::Edge {
-              src: *src,
-              etype: *etype,
-              dst: *dst,
-            },
-          );
-          tx_mgr.record_write(
-            txid,
-            TxKey::NeighborsOut {
-              node_id: *src,
-              etype: None,
-            },
-          );
-          tx_mgr.record_write(
-            txid,
-            TxKey::NeighborsIn {
-              node_id: *dst,
-              etype: None,
-            },
-          );
-          tx_mgr.record_write(
-            txid,
-            TxKey::NeighborsOut {
-              node_id: *src,
-              etype: Some(*etype),
-            },
-          );
-          tx_mgr.record_write(
-            txid,
-            TxKey::NeighborsIn {
-              node_id: *dst,
-              etype: Some(*etype),
-            },
-          );
-        }
-      }
+      let written = edges
+        .iter()
+        .flat_map(|&(src, etype, dst)| edge_write_keys(src, etype, dst));
+      self.record_tx_keys(&mut tx, written, []);
     }
+    self.mask_revealed_edge_props(txid, &tx_handle, revealed)?;
 
     Ok(())
   }
@@ -715,63 +637,25 @@ impl SingleFileDB {
     );
     self.write_wal_tx(&tx_handle, record)?;
 
-    let bulk_load = {
-      let tx = tx_handle.lock();
-      tx.bulk_load
-    };
-
-    if let Some(mvcc) = self.mvcc.as_ref() {
-      if !bulk_load {
-        let mut tx_mgr = mvcc.tx_manager.lock();
-        tx_mgr.record_write(txid, TxKey::Edge { src, etype, dst });
-        tx_mgr.record_write(
-          txid,
-          TxKey::NeighborsOut {
-            node_id: src,
-            etype: None,
-          },
-        );
-        tx_mgr.record_write(
-          txid,
-          TxKey::NeighborsIn {
-            node_id: dst,
-            etype: None,
-          },
-        );
-        tx_mgr.record_write(
-          txid,
-          TxKey::NeighborsOut {
-            node_id: src,
-            etype: Some(etype),
-          },
-        );
-        tx_mgr.record_write(
-          txid,
-          TxKey::NeighborsIn {
-            node_id: dst,
-            etype: Some(etype),
-          },
-        );
-        for (key_id, _) in props.iter() {
-          tx_mgr.record_write(
-            txid,
-            TxKey::EdgeProp {
-              src,
-              etype,
-              dst,
-              key_id: *key_id,
-            },
-          );
-        }
-      }
-    }
-
     {
       let mut tx = tx_handle.lock();
       tx.pending.add_edge_over(src, etype, dst, in_base);
       for (key_id, value) in props.into_iter() {
         tx.pending.set_edge_prop(src, etype, dst, key_id, value);
       }
+      let props_written = set_keys.iter().map(|&key_id| TxKey::EdgeProp {
+        src,
+        etype,
+        dst,
+        key_id,
+      });
+      self.record_tx_keys(
+        &mut tx,
+        edge_write_keys(src, etype, dst)
+          .into_iter()
+          .chain(props_written),
+        [],
+      );
     }
     self.mask_revealed_edge_props(txid, &tx_handle, vec![((src, etype, dst), revealed)])?;
 
@@ -798,12 +682,6 @@ impl SingleFileDB {
       })?
       .into_iter()
       .unzip();
-    let mut edge_meta: Vec<(NodeId, ETypeId, NodeId, Vec<PropKeyId>)> =
-      Vec::with_capacity(edges.len());
-    for (src, etype, dst, props) in edges.iter() {
-      let key_ids = props.iter().map(|(key_id, _)| *key_id).collect();
-      edge_meta.push((*src, *etype, *dst, key_ids));
-    }
     let record = WalRecord::new(
       WalRecordType::AddEdgesPropsBatch,
       txid,
@@ -811,72 +689,25 @@ impl SingleFileDB {
     );
     self.write_wal_tx(&tx_handle, record)?;
 
-    let bulk_load = {
+    {
       let mut tx = tx_handle.lock();
+      let mut written = Vec::new();
       for ((src, etype, dst, props), in_base) in edges.into_iter().zip(in_base) {
         tx.pending.add_edge_over(src, etype, dst, in_base);
+        written.extend(edge_write_keys(src, etype, dst));
         for (key_id, value) in props {
           tx.pending.set_edge_prop(src, etype, dst, key_id, value);
+          written.push(TxKey::EdgeProp {
+            src,
+            etype,
+            dst,
+            key_id,
+          });
         }
       }
-      tx.bulk_load
-    };
-    self.mask_revealed_edge_props(txid, &tx_handle, revealed)?;
-
-    if let Some(mvcc) = self.mvcc.as_ref() {
-      if !bulk_load {
-        let mut tx_mgr = mvcc.tx_manager.lock();
-        for (src, etype, dst, key_ids) in edge_meta.iter() {
-          tx_mgr.record_write(
-            txid,
-            TxKey::Edge {
-              src: *src,
-              etype: *etype,
-              dst: *dst,
-            },
-          );
-          tx_mgr.record_write(
-            txid,
-            TxKey::NeighborsOut {
-              node_id: *src,
-              etype: None,
-            },
-          );
-          tx_mgr.record_write(
-            txid,
-            TxKey::NeighborsIn {
-              node_id: *dst,
-              etype: None,
-            },
-          );
-          tx_mgr.record_write(
-            txid,
-            TxKey::NeighborsOut {
-              node_id: *src,
-              etype: Some(*etype),
-            },
-          );
-          tx_mgr.record_write(
-            txid,
-            TxKey::NeighborsIn {
-              node_id: *dst,
-              etype: Some(*etype),
-            },
-          );
-          for key_id in key_ids.iter() {
-            tx_mgr.record_write(
-              txid,
-              TxKey::EdgeProp {
-                src: *src,
-                etype: *etype,
-                dst: *dst,
-                key_id: *key_id,
-              },
-            );
-          }
-        }
-      }
+      self.record_tx_keys(&mut tx, written, []);
     }
+    self.mask_revealed_edge_props(txid, &tx_handle, revealed)?;
 
     Ok(())
   }
@@ -905,47 +736,9 @@ impl SingleFileDB {
     self.write_wal_tx(&tx_handle, record)?;
 
     // Update pending delta
-    let bulk_load = {
-      let mut tx = tx_handle.lock();
-      tx.pending.delete_edge_over(src, etype, dst, in_base);
-      tx.bulk_load
-    };
-
-    if let Some(mvcc) = self.mvcc.as_ref() {
-      if bulk_load {
-        return Ok(());
-      }
-      let mut tx_mgr = mvcc.tx_manager.lock();
-      tx_mgr.record_write(txid, TxKey::Edge { src, etype, dst });
-      tx_mgr.record_write(
-        txid,
-        TxKey::NeighborsOut {
-          node_id: src,
-          etype: None,
-        },
-      );
-      tx_mgr.record_write(
-        txid,
-        TxKey::NeighborsIn {
-          node_id: dst,
-          etype: None,
-        },
-      );
-      tx_mgr.record_write(
-        txid,
-        TxKey::NeighborsOut {
-          node_id: src,
-          etype: Some(etype),
-        },
-      );
-      tx_mgr.record_write(
-        txid,
-        TxKey::NeighborsIn {
-          node_id: dst,
-          etype: Some(etype),
-        },
-      );
-    }
+    let mut tx = tx_handle.lock();
+    tx.pending.delete_edge_over(src, etype, dst, in_base);
+    self.record_tx_keys(&mut tx, edge_write_keys(src, etype, dst), []);
 
     Ok(())
   }
@@ -994,22 +787,15 @@ impl SingleFileDB {
     self.write_wal_tx(&tx_handle, record)?;
 
     // Update pending delta
-    let bulk_load = {
-      let mut tx = tx_handle.lock();
-      tx.pending.set_node_prop(node_id, key_id, value);
-      tx.bulk_load
-    };
-
-    if let Some(mvcc) = self.mvcc.as_ref() {
-      if bulk_load {
-        return Ok(());
-      }
-      let mut tx_mgr = mvcc.tx_manager.lock();
-      tx_mgr.record_write(txid, TxKey::NodeProp { node_id, key_id });
-      // The write needs the node: it conflicts with a concurrent delete_node, not with
-      // writes to the node's other props.
-      tx_mgr.record_read(txid, TxKey::Node(node_id));
-    }
+    let mut tx = tx_handle.lock();
+    tx.pending.set_node_prop(node_id, key_id, value);
+    // The write needs the node: it conflicts with a concurrent delete_node,
+    // not with writes to the node's other props.
+    self.record_tx_keys(
+      &mut tx,
+      [TxKey::NodeProp { node_id, key_id }],
+      [TxKey::Node(node_id)],
+    );
 
     Ok(())
   }
@@ -1039,22 +825,15 @@ impl SingleFileDB {
     self.write_wal_tx(&tx_handle, record)?;
 
     // Update pending delta
-    let bulk_load = {
-      let mut tx = tx_handle.lock();
-      tx.pending.delete_node_prop(node_id, key_id);
-      tx.bulk_load
-    };
-
-    if let Some(mvcc) = self.mvcc.as_ref() {
-      if bulk_load {
-        return Ok(());
-      }
-      let mut tx_mgr = mvcc.tx_manager.lock();
-      tx_mgr.record_write(txid, TxKey::NodeProp { node_id, key_id });
-      // The write needs the node: it conflicts with a concurrent delete_node, not with
-      // writes to the node's other props.
-      tx_mgr.record_read(txid, TxKey::Node(node_id));
-    }
+    let mut tx = tx_handle.lock();
+    tx.pending.delete_node_prop(node_id, key_id);
+    // The write needs the node: it conflicts with a concurrent delete_node,
+    // not with writes to the node's other props.
+    self.record_tx_keys(
+      &mut tx,
+      [TxKey::NodeProp { node_id, key_id }],
+      [TxKey::Node(node_id)],
+    );
 
     Ok(())
   }
@@ -1084,28 +863,15 @@ impl SingleFileDB {
     self.write_wal_tx(&tx_handle, record)?;
 
     // Update pending delta
-    let bulk_load = {
-      let mut tx = tx_handle.lock();
-      tx.pending.set_edge_prop(src, etype, dst, key_id, value);
-      tx.bulk_load
+    let mut tx = tx_handle.lock();
+    tx.pending.set_edge_prop(src, etype, dst, key_id, value);
+    let written = TxKey::EdgeProp {
+      src,
+      etype,
+      dst,
+      key_id,
     };
-
-    if let Some(mvcc) = self.mvcc.as_ref() {
-      if bulk_load {
-        return Ok(());
-      }
-      let mut tx_mgr = mvcc.tx_manager.lock();
-      tx_mgr.record_write(
-        txid,
-        TxKey::EdgeProp {
-          src,
-          etype,
-          dst,
-          key_id,
-        },
-      );
-      record_edge_prop_dependencies(&mut tx_mgr, txid, src, etype, dst);
-    }
+    self.record_tx_keys(&mut tx, [written], edge_prop_dependencies(src, etype, dst));
 
     Ok(())
   }
@@ -1134,31 +900,17 @@ impl SingleFileDB {
     );
     self.write_wal_tx(&tx_handle, record)?;
 
-    let bulk_load = {
-      let mut tx = tx_handle.lock();
-      for (key_id, value) in props.into_iter() {
-        tx.pending.set_edge_prop(src, etype, dst, key_id, value);
-      }
-      tx.bulk_load
-    };
-
-    if let Some(mvcc) = self.mvcc.as_ref() {
-      if !bulk_load {
-        let mut tx_mgr = mvcc.tx_manager.lock();
-        for key_id in key_ids {
-          tx_mgr.record_write(
-            txid,
-            TxKey::EdgeProp {
-              src,
-              etype,
-              dst,
-              key_id,
-            },
-          );
-        }
-        record_edge_prop_dependencies(&mut tx_mgr, txid, src, etype, dst);
-      }
+    let mut tx = tx_handle.lock();
+    for (key_id, value) in props.into_iter() {
+      tx.pending.set_edge_prop(src, etype, dst, key_id, value);
     }
+    let written = key_ids.into_iter().map(|key_id| TxKey::EdgeProp {
+      src,
+      etype,
+      dst,
+      key_id,
+    });
+    self.record_tx_keys(&mut tx, written, edge_prop_dependencies(src, etype, dst));
 
     Ok(())
   }
@@ -1196,28 +948,15 @@ impl SingleFileDB {
     self.write_wal_tx(&tx_handle, record)?;
 
     // Update pending delta
-    let bulk_load = {
-      let mut tx = tx_handle.lock();
-      tx.pending.delete_edge_prop(src, etype, dst, key_id);
-      tx.bulk_load
+    let mut tx = tx_handle.lock();
+    tx.pending.delete_edge_prop(src, etype, dst, key_id);
+    let written = TxKey::EdgeProp {
+      src,
+      etype,
+      dst,
+      key_id,
     };
-
-    if let Some(mvcc) = self.mvcc.as_ref() {
-      if bulk_load {
-        return Ok(());
-      }
-      let mut tx_mgr = mvcc.tx_manager.lock();
-      tx_mgr.record_write(
-        txid,
-        TxKey::EdgeProp {
-          src,
-          etype,
-          dst,
-          key_id,
-        },
-      );
-      record_edge_prop_dependencies(&mut tx_mgr, txid, src, etype, dst);
-    }
+    self.record_tx_keys(&mut tx, [written], edge_prop_dependencies(src, etype, dst));
 
     Ok(())
   }
@@ -1240,23 +979,18 @@ impl SingleFileDB {
     self.write_wal_tx(&tx_handle, record)?;
 
     // Update pending delta
-    let bulk_load = {
-      let mut tx = tx_handle.lock();
-      tx.pending.add_node_label(node_id, label_id);
-      tx.bulk_load
-    };
-
-    if let Some(mvcc) = self.mvcc.as_ref() {
-      if bulk_load {
-        return Ok(());
-      }
-      let mut tx_mgr = mvcc.tx_manager.lock();
-      // The write needs the node (a concurrent delete_node conflicts), but does not change
-      // whether it exists.
-      tx_mgr.record_read(txid, TxKey::Node(node_id));
-      tx_mgr.record_write(txid, TxKey::NodeLabels(node_id));
-      tx_mgr.record_write(txid, TxKey::NodeLabel { node_id, label_id });
-    }
+    let mut tx = tx_handle.lock();
+    tx.pending.add_node_label(node_id, label_id);
+    // The write needs the node (a concurrent delete_node conflicts), but does
+    // not change whether it exists.
+    self.record_tx_keys(
+      &mut tx,
+      [
+        TxKey::NodeLabels(node_id),
+        TxKey::NodeLabel { node_id, label_id },
+      ],
+      [TxKey::Node(node_id)],
+    );
 
     Ok(())
   }
@@ -1281,23 +1015,18 @@ impl SingleFileDB {
     self.write_wal_tx(&tx_handle, record)?;
 
     // Update pending delta
-    let bulk_load = {
-      let mut tx = tx_handle.lock();
-      tx.pending.remove_node_label(node_id, label_id);
-      tx.bulk_load
-    };
-
-    if let Some(mvcc) = self.mvcc.as_ref() {
-      if bulk_load {
-        return Ok(());
-      }
-      let mut tx_mgr = mvcc.tx_manager.lock();
-      // The write needs the node (a concurrent delete_node conflicts), but does not change
-      // whether it exists.
-      tx_mgr.record_read(txid, TxKey::Node(node_id));
-      tx_mgr.record_write(txid, TxKey::NodeLabels(node_id));
-      tx_mgr.record_write(txid, TxKey::NodeLabel { node_id, label_id });
-    }
+    let mut tx = tx_handle.lock();
+    tx.pending.remove_node_label(node_id, label_id);
+    // The write needs the node (a concurrent delete_node conflicts), but does
+    // not change whether it exists.
+    self.record_tx_keys(
+      &mut tx,
+      [
+        TxKey::NodeLabels(node_id),
+        TxKey::NodeLabel { node_id, label_id },
+      ],
+      [TxKey::Node(node_id)],
+    );
 
     Ok(())
   }

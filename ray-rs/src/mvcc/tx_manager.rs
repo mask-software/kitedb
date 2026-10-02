@@ -13,6 +13,34 @@ use crate::types::{MvccTransaction, Timestamp, TxId, TxKey, TxKeySet};
 
 /// Maximum number of committed write entries before pruning
 pub(crate) const MAX_COMMITTED_WRITES: usize = 100_000;
+/// Recent commits, and the keys they wrote, kept whole before the oldest are
+/// folded into `committed_writes` (only commits an open transaction still
+/// pins stay that long).
+pub(crate) const RECENT_COMMITS_MAX: usize = 1024;
+pub(crate) const RECENT_KEYS_MAX: usize = 256 * 1024;
+/// `group_writes` entries before the first prune.
+const GROUP_WRITES_PRUNE_MIN: usize = 64 * 1024;
+
+/// When `TxManager` folds, prunes and compacts what it keeps for conflict
+/// checks (the constants above; tests lower them).
+#[derive(Debug, Clone, Copy)]
+struct KeepLimits {
+  recent_commits: usize,
+  recent_keys: usize,
+  group_writes_min: usize,
+  committed_writes: usize,
+}
+
+impl Default for KeepLimits {
+  fn default() -> Self {
+    Self {
+      recent_commits: RECENT_COMMITS_MAX,
+      recent_keys: RECENT_KEYS_MAX,
+      group_writes_min: GROUP_WRITES_PRUNE_MIN,
+      committed_writes: MAX_COMMITTED_WRITES,
+    }
+  }
+}
 /// Prune down to this many entries when over the limit
 const PRUNE_THRESHOLD_ENTRIES: usize = 50_000;
 /// Stale entries the commit-order log may hold beyond twice the live ones
@@ -34,7 +62,12 @@ const COMMIT_LOG_SLACK: usize = 1024;
 ///
 /// Only active transactions are tracked: commit and abort drop the record. What
 /// conflict checks need from a committed transaction lives on in
-/// `committed_writes`.
+/// `recent_commits`, then `committed_writes`.
+///
+/// Commits run one at a time (the database commits under one lock), so a
+/// commit moves its write set in whole, with no per-key indexing: a large
+/// transaction would otherwise hold every concurrent commit up while it
+/// indexed each key. Conflict checks find the keys through `group_writes`.
 #[derive(Debug)]
 pub struct TxManager {
   /// Active transactions
@@ -43,13 +76,34 @@ pub struct TxManager {
   next_tx_id: TxId,
   /// Next commit timestamp to assign
   next_commit_ts: Timestamp,
-  /// Inverted index: key -> max commitTs for conflict detection
+  /// The write sets of recent commits an open transaction may conflict
+  /// with, oldest first, as they committed. Each commit's timestamp is newer
+  /// than every one in `committed_writes`.
+  recent_commits: VecDeque<CommitWrites>,
+  /// Keys in `recent_commits`.
+  recent_keys: usize,
+  /// For each key group (`key_group`), the newest commit, in
+  /// `recent_commits` or `committed_writes`, that wrote a key of it: a
+  /// conflict check skips the exact lookup of a key whose group no commit
+  /// since its snapshot wrote.
+  group_writes: HashMap<u64, Timestamp>,
+  /// Pruning drops `group_writes` entries older than this, so checks for
+  /// older snapshots skip the filter.
+  group_floor: Timestamp,
+  /// `group_writes` is pruned once it holds more entries than this.
+  group_writes_prune_at: usize,
+  limits: KeepLimits,
+  /// The key groups of open transactions that handed their reads and writes
+  /// over with them (`record_reads_and_writes`) and recorded nothing since.
+  tx_key_groups: HashMap<TxId, TxKeyGroups>,
+  /// Older commits' writes, folded out of `recent_commits` while an open
+  /// transaction still pinned them: key -> newest commit timestamp.
   committed_writes: HashMap<TxKey, Timestamp>,
   /// `committed_writes` updates in commit order, so pruning pops the oldest
   /// first. An entry is stale once its key has a newer commit.
   committed_writes_log: VecDeque<(Timestamp, TxKey)>,
-  /// The newest commit whose writes are in `committed_writes` (0: none). A
-  /// transaction that began after it cannot conflict with any.
+  /// The newest commit whose writes are kept (0: none). A transaction that
+  /// began after it cannot conflict with any.
   newest_indexed_ts: Timestamp,
   /// The first commit timestamp of each wall clock millisecond (since the
   /// epoch) that had a commit, oldest first, for the retention horizon. The
@@ -75,6 +129,13 @@ impl TxManager {
       active_txs: HashMap::new(),
       next_tx_id: initial_tx_id,
       next_commit_ts: initial_commit_ts,
+      recent_commits: VecDeque::new(),
+      recent_keys: 0,
+      group_writes: HashMap::new(),
+      group_floor: 0,
+      group_writes_prune_at: GROUP_WRITES_PRUNE_MIN,
+      limits: KeepLimits::default(),
+      tx_key_groups: HashMap::new(),
       committed_writes: HashMap::new(),
       committed_writes_log: VecDeque::new(),
       newest_indexed_ts: 0,
@@ -132,6 +193,7 @@ impl TxManager {
   pub fn record_read(&mut self, txid: TxId, key: TxKey) {
     if let Some(tx) = self.active_txs.get_mut(&txid) {
       tx.read_set.insert(key);
+      self.tx_key_groups.remove(&txid);
     }
   }
 
@@ -139,6 +201,7 @@ impl TxManager {
   pub fn record_write(&mut self, txid: TxId, key: TxKey) {
     if let Some(tx) = self.active_txs.get_mut(&txid) {
       tx.write_set.insert(key);
+      self.tx_key_groups.remove(&txid);
     }
   }
 
@@ -147,7 +210,65 @@ impl TxManager {
   pub fn record_reads(&mut self, txid: TxId, keys: impl IntoIterator<Item = TxKey>) {
     if let Some(tx) = self.active_txs.get_mut(&txid) {
       tx.read_set.extend(keys);
+      self.tx_key_groups.remove(&txid);
     }
+  }
+
+  /// Record reads and writes made earlier (the database keeps a write
+  /// transaction's sets with it and hands them over at commit, before the
+  /// conflict check). A set moves in whole when the transaction has none yet.
+  /// `groups`, if given, are their key groups (`TxKeyGroups::of`), which the
+  /// conflict check and the commit then use instead of every key; they are
+  /// kept only while they cover everything the transaction recorded.
+  pub fn record_reads_and_writes(
+    &mut self,
+    txid: TxId,
+    reads: TxKeySet,
+    writes: TxKeySet,
+    groups: Option<TxKeyGroups>,
+  ) {
+    let Some(tx) = self.active_txs.get_mut(&txid) else {
+      return;
+    };
+    let complete = tx.read_set.is_empty() && tx.write_set.is_empty();
+    absorb(&mut tx.read_set, reads);
+    absorb(&mut tx.write_set, writes);
+    match groups.filter(|_| complete) {
+      Some(groups) => {
+        self.tx_key_groups.insert(txid, groups);
+      }
+      None => {
+        self.tx_key_groups.remove(&txid);
+      }
+    }
+  }
+
+  /// The key groups of transaction `txid`'s reads and writes that a commit
+  /// since `start_ts` wrote: only its keys in them can conflict. `None` if
+  /// that is not known (its groups were not handed over, or `start_ts` is
+  /// older than what `group_writes` keeps), and every key must be checked.
+  pub fn groups_written_since(
+    &self,
+    txid: TxId,
+    start_ts: Timestamp,
+  ) -> Option<hashbrown::HashSet<u64>> {
+    if start_ts < self.group_floor {
+      return None;
+    }
+    let groups = self.tx_key_groups.get(&txid)?;
+    Some(
+      groups
+        .reads_and_writes
+        .iter()
+        .copied()
+        .filter(|group| {
+          self
+            .group_writes
+            .get(group)
+            .is_some_and(|&commit_ts| commit_ts >= start_ts)
+        })
+        .collect(),
+    )
   }
 
   /// Commit a transaction and drop its record
@@ -157,6 +278,7 @@ impl TxManager {
       .active_txs
       .remove(&txid)
       .ok_or(TxManagerError::TxNotFound(txid))?;
+    let key_groups = self.tx_key_groups.remove(&txid);
 
     let commit_ts = self.next_commit_ts;
     self.next_commit_ts += 1;
@@ -172,19 +294,98 @@ impl TxManager {
       self.commit_wall_clock.push_back((commit_ts, now));
     }
 
-    // Index writes for fast conflict detection, storing only the max commitTs
-    // per key. Only a transaction that began before a commit can conflict
-    // with it: with none open, nothing indexed can conflict any more.
+    // Only a transaction that began before a commit can conflict with it:
+    // with none open, nothing kept can conflict any more.
     if self.active_txs.is_empty() {
-      self.total_pruned += self.committed_writes.len();
+      self.total_pruned += self.committed_writes.len() + self.recent_keys;
+      self.recent_commits.clear();
+      self.recent_keys = 0;
+      self.group_writes.clear();
       self.committed_writes.clear();
       self.committed_writes_log.clear();
       return Ok(commit_ts);
     }
     if !tx.write_set.is_empty() {
       self.newest_indexed_ts = commit_ts;
+      // Commit timestamps only grow, so this is each group's newest.
+      match key_groups {
+        Some(groups) => {
+          for group in groups.writes {
+            self.group_writes.insert(group, commit_ts);
+          }
+        }
+        None => {
+          for key in &tx.write_set {
+            self.group_writes.insert(key_group(key), commit_ts);
+          }
+        }
+      }
+      self.recent_keys += tx.write_set.len();
+      self.recent_commits.push_back(CommitWrites {
+        commit_ts,
+        keys: tx.write_set,
+      });
     }
-    for key in tx.write_set {
+    self.prune_recent_commits();
+    Ok(commit_ts)
+  }
+
+  /// Drop the recent commits no open transaction can conflict with (older
+  /// than every snapshot), then fold the oldest of the rest into
+  /// `committed_writes` once they are too many: an open transaction has
+  /// pinned them for long, and folding keeps one entry per key however often
+  /// they rewrite it. Prunes `committed_writes` as before, and `group_writes`
+  /// once it outgrows twice what the last prune left (amortized constant
+  /// work per commit).
+  fn prune_recent_commits(&mut self) {
+    let min_ts = self.min_active_ts();
+    while self
+      .recent_commits
+      .front()
+      .is_some_and(|commit| commit.commit_ts < min_ts)
+    {
+      if let Some(commit) = self.recent_commits.pop_front() {
+        self.recent_keys -= commit.keys.len();
+        self.total_pruned += commit.keys.len();
+      }
+    }
+
+    let limits = self.limits;
+    if self.recent_commits.len() > limits.recent_commits || self.recent_keys > limits.recent_keys {
+      while self.recent_commits.len() > limits.recent_commits / 2
+        || self.recent_keys > limits.recent_keys / 2
+      {
+        let Some(commit) = self.recent_commits.pop_front() else {
+          break;
+        };
+        self.recent_keys -= commit.keys.len();
+        self.index_committed_writes(commit);
+      }
+    }
+    // Folded writes go once every snapshot is past them (constant work while
+    // none is: see `prune_committed_writes`).
+    if self.committed_writes.len() > self.limits.committed_writes {
+      self.prune_committed_writes();
+    }
+
+    if self.group_writes.len() > self.group_writes_prune_at {
+      #[cfg(test)]
+      {
+        self.prune_work += self.group_writes.len() as u64;
+      }
+      self
+        .group_writes
+        .retain(|_, commit_ts| *commit_ts >= min_ts);
+      self.group_floor = self.group_floor.max(min_ts);
+      self.group_writes_prune_at = limits.group_writes_min.max(2 * self.group_writes.len());
+    }
+  }
+
+  /// Index `commit`'s writes in `committed_writes`, keeping the newest
+  /// commit timestamp per key.
+  fn index_committed_writes(&mut self, commit: CommitWrites) {
+    let commit_ts = commit.commit_ts;
+    for key in commit.keys {
       let newer = self
         .committed_writes
         .get(&key)
@@ -195,25 +396,25 @@ impl TxManager {
       }
     }
 
-    if self.committed_writes.len() > MAX_COMMITTED_WRITES {
+    if self.committed_writes.len() > self.limits.committed_writes {
       self.prune_committed_writes();
     }
     if self.committed_writes_log.len() > 2 * self.committed_writes.len() + COMMIT_LOG_SLACK {
       self.compact_committed_writes_log();
     }
-
-    Ok(commit_ts)
   }
 
   /// Abort a transaction and drop its record
   pub fn abort_tx(&mut self, txid: TxId) {
     self.active_txs.remove(&txid);
+    self.tx_key_groups.remove(&txid);
   }
 
   /// Drop a transaction's record without committing it. Commit and abort
   /// already drop theirs.
   pub fn remove_tx(&mut self, txid: TxId) {
     self.active_txs.remove(&txid);
+    self.tx_key_groups.remove(&txid);
   }
 
   /// Get all active transaction IDs
@@ -245,13 +446,28 @@ impl TxManager {
   /// Get committed writes for a key (for conflict detection)
   /// Returns the max commitTs for the key if >= minCommitTs, otherwise None
   pub fn committed_write_ts(&self, key: &TxKey, min_commit_ts: Timestamp) -> Option<Timestamp> {
-    self.committed_writes.get(key).and_then(|&max_ts| {
-      if max_ts >= min_commit_ts {
-        Some(max_ts)
-      } else {
-        None
+    if min_commit_ts >= self.group_floor
+      && self
+        .group_writes
+        .get(&key_group(key))
+        .is_none_or(|&commit_ts| commit_ts < min_commit_ts)
+    {
+      return None;
+    }
+    // Newest first; every recent commit is newer than the folded ones.
+    for commit in self.recent_commits.iter().rev() {
+      if commit.commit_ts < min_commit_ts {
+        return None;
       }
-    })
+      if commit.keys.contains(key) {
+        return Some(commit.commit_ts);
+      }
+    }
+    self
+      .committed_writes
+      .get(key)
+      .copied()
+      .filter(|&max_ts| max_ts >= min_commit_ts)
   }
 
   /// Whether a transaction that began at `start_ts` can conflict with any
@@ -263,16 +479,16 @@ impl TxManager {
   /// Check if there's a conflicting write for a key (fast path for conflict detection)
   /// Returns true if any transaction wrote this key with commitTs >= minCommitTs
   pub fn has_conflicting_write(&self, key: &TxKey, min_commit_ts: Timestamp) -> bool {
-    self
-      .committed_writes
-      .get(key)
-      .map(|&max_ts| max_ts >= min_commit_ts)
-      .unwrap_or(false)
+    self.committed_write_ts(key, min_commit_ts).is_some()
   }
 
   /// Clear all transactions (for testing/recovery)
   pub fn clear(&mut self) {
     self.active_txs.clear();
+    self.tx_key_groups.clear();
+    self.recent_commits.clear();
+    self.recent_keys = 0;
+    self.group_writes.clear();
     self.committed_writes.clear();
     self.committed_writes_log.clear();
     self.newest_indexed_ts = 0;
@@ -324,7 +540,7 @@ impl TxManager {
   /// Get statistics about committed writes
   pub fn committed_writes_stats(&self) -> CommittedWritesStats {
     CommittedWritesStats {
-      size: self.committed_writes.len(),
+      size: self.committed_writes.len() + self.recent_keys,
       pruned: self.total_pruned,
     }
   }
@@ -336,7 +552,9 @@ impl TxManager {
   /// one look at the oldest entry.
   fn prune_committed_writes(&mut self) {
     let min_ts = self.min_active_ts();
-    let target_size = MAX_COMMITTED_WRITES.saturating_sub(PRUNE_THRESHOLD_ENTRIES);
+    let target_size = self.limits.committed_writes.saturating_sub(
+      PRUNE_THRESHOLD_ENTRIES * self.limits.committed_writes / MAX_COMMITTED_WRITES,
+    );
     let mut pruned = 0;
 
     while self.committed_writes.len() > target_size {
@@ -375,6 +593,27 @@ impl TxManager {
       .retain(|(commit_ts, key)| committed_writes.get(key) == Some(commit_ts));
   }
 
+  /// Fold, prune and compact at these sizes instead (test instrumentation):
+  /// `recent_commits` and `recent_keys` recent commits and keys kept whole,
+  /// `group_writes` entries before the first prune, `committed_writes`
+  /// entries before pruning (down to half).
+  #[cfg(test)]
+  pub(crate) fn set_keep_limits_for_test(
+    &mut self,
+    recent_commits: usize,
+    recent_keys: usize,
+    group_writes: usize,
+    committed_writes: usize,
+  ) {
+    self.limits = KeepLimits {
+      recent_commits,
+      recent_keys,
+      group_writes_min: group_writes,
+      committed_writes,
+    };
+    self.group_writes_prune_at = group_writes;
+  }
+
   /// Wall clock entries kept for the retention horizon (test instrumentation)
   #[cfg(test)]
   pub(crate) fn wall_clock_len(&self) -> usize {
@@ -385,6 +624,72 @@ impl TxManager {
   #[cfg(test)]
   pub(crate) fn committed_writes_log_len(&self) -> usize {
     self.committed_writes_log.len()
+  }
+}
+
+/// One commit's writes, kept whole in `TxManager::recent_commits`.
+#[derive(Debug)]
+struct CommitWrites {
+  commit_ts: Timestamp,
+  keys: TxKeySet,
+}
+
+/// The key groups (see `key_group`) of a transaction's reads and writes,
+/// each once. Its conflict check and its commit then look up and note a few
+/// groups instead of every key. The database computes them before it takes
+/// any lock.
+#[derive(Debug, Clone, Default)]
+pub struct TxKeyGroups {
+  reads_and_writes: Vec<u64>,
+  writes: Vec<u64>,
+}
+
+impl TxKeyGroups {
+  /// The groups of `reads` and `writes`.
+  pub fn of(reads: &TxKeySet, writes: &TxKeySet) -> Self {
+    let mut seen = hashbrown::HashSet::with_capacity(writes.len() / 4 + reads.len());
+    let writes: Vec<u64> = writes
+      .iter()
+      .map(key_group)
+      .filter(|&group| seen.insert(group))
+      .collect();
+    let mut reads_and_writes = writes.clone();
+    reads_and_writes.extend(
+      reads
+        .iter()
+        .map(key_group)
+        .filter(|&group| seen.insert(group)),
+    );
+    Self {
+      reads_and_writes,
+      writes,
+    }
+  }
+}
+
+/// The group of `key` in `TxManager::group_writes`: the node it concerns (an
+/// edge's source), so most of a transaction's keys share few groups, or a
+/// hash of a node key string. Groups only filter: two keys sharing one cost a
+/// lookup, never a missed conflict.
+pub fn key_group(key: &TxKey) -> u64 {
+  match key {
+    TxKey::Node(node_id) | TxKey::NodeLabels(node_id) => *node_id,
+    TxKey::NodeProp { node_id, .. }
+    | TxKey::NeighborsOut { node_id, .. }
+    | TxKey::NeighborsIn { node_id, .. }
+    | TxKey::NodeLabel { node_id, .. } => *node_id,
+    TxKey::Edge { src, .. } | TxKey::EdgeProp { src, .. } => *src,
+    // Node ids leave the top bit clear (they stay within i64).
+    TxKey::Key(key) => xxhash_rust::xxh64::xxh64(key.as_bytes(), 0) | (1 << 63),
+  }
+}
+
+/// Add `keys` to `set`, moving them in whole when `set` is empty.
+fn absorb(set: &mut TxKeySet, keys: TxKeySet) {
+  if set.is_empty() {
+    *set = keys;
+  } else {
+    set.extend(keys);
   }
 }
 

@@ -14,7 +14,7 @@ use crate::core::single_file::{
 };
 use crate::error::KiteError;
 use crate::mvcc::gc::start_background_gc;
-use crate::mvcc::tx_manager::MAX_COMMITTED_WRITES;
+use crate::mvcc::tx_manager::{MAX_COMMITTED_WRITES, RECENT_COMMITS_MAX};
 use crate::mvcc::{
   ConflictDetector, GarbageCollector, GcConfig, MvccManager, TxManager, VersionChainManager,
 };
@@ -181,7 +181,8 @@ fn prune_drops_old_entries_once_the_reader_finishes() {
 
 /// Rewriting the same keys while a reader pins every entry leaves stale
 /// entries in pruning's commit-order log; compaction keeps it near the live
-/// size at amortized constant cost.
+/// size at amortized constant cost. The recent commits, kept whole, are
+/// folded into the index (one entry per key) past `RECENT_COMMITS_MAX`.
 #[test]
 fn commit_log_stays_bounded_when_keys_are_rewritten() {
   const COMMITS: usize = 20_000;
@@ -195,7 +196,11 @@ fn commit_log_stays_bounded_when_keys_are_rewritten() {
     tx_mgr.commit_tx(txid).expect("commit");
   }
 
-  assert_eq!(tx_mgr.committed_writes_stats().size, HOT_KEYS);
+  let size = tx_mgr.committed_writes_stats().size;
+  assert!(
+    size <= HOT_KEYS + RECENT_COMMITS_MAX,
+    "{size} committed writes kept for {HOT_KEYS} keys rewritten {COMMITS} times"
+  );
   let log_len = tx_mgr.committed_writes_log_len();
   assert!(
     log_len <= 2 * HOT_KEYS + 1024 + 1,
@@ -215,13 +220,19 @@ fn prune_keeps_rewritten_keys_a_snapshot_still_needs() {
   let mut tx_mgr = TxManager::new();
   let detector = ConflictDetector::new();
 
-  // An old reader keeps the bulk commit indexed.
+  // An old reader keeps the bulk commit indexed, and enough later commits
+  // fold it out of the recent ones into the index.
   let (old_reader, _) = tx_mgr.begin_tx();
   let (bulk, _) = tx_mgr.begin_tx();
   for i in 0..MAX_COMMITTED_WRITES {
     tx_mgr.record_write(bulk, node_key(i));
   }
   let bulk_ts = tx_mgr.commit_tx(bulk).expect("commit bulk");
+  for i in 0..=RECENT_COMMITS_MAX {
+    let (filler, _) = tx_mgr.begin_tx();
+    tx_mgr.record_write(filler, prop_key(i));
+    tx_mgr.commit_tx(filler).expect("commit filler");
+  }
 
   let (reader, _) = tx_mgr.begin_tx();
   tx_mgr.record_read(reader, node_key(3));
@@ -236,8 +247,9 @@ fn prune_keeps_rewritten_keys_a_snapshot_still_needs() {
   let stats = tx_mgr.committed_writes_stats();
   assert_eq!(
     stats.size,
-    MAX_COMMITTED_WRITES / 2,
-    "bulk entries predate the reader, so pruning must reach its target"
+    MAX_COMMITTED_WRITES / 2 + 2,
+    "bulk entries predate the reader, so pruning must reach its target (the writer's two \
+     keys are recent)"
   );
   assert_eq!(tx_mgr.committed_write_ts(&node_key(3), 0), Some(writer_ts));
   assert_eq!(

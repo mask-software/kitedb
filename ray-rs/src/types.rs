@@ -393,30 +393,39 @@ impl NodeDelta {
   }
 }
 
+/// The delta's maps and sets. Commits merge each transaction's changes into
+/// the committed delta under its write lock, so their hashing bounds how fast
+/// concurrent writers commit: they use hashbrown's default hasher (foldhash,
+/// randomly seeded per map) rather than SipHash. (The keys are internal ids and
+/// node keys; `TxKeySet` makes the same choice.)
+pub type DeltaMap<K, V> = hashbrown::HashMap<K, V>;
+/// See [`DeltaMap`].
+pub type DeltaSet<T> = hashbrown::HashSet<T>;
+
 /// Delta state - all uncommitted changes
 #[derive(Debug, Default, Clone)]
 pub struct DeltaState {
   // Node state
-  pub created_nodes: HashMap<NodeId, NodeDelta>,
-  pub deleted_nodes: HashSet<NodeId>,
-  pub modified_nodes: HashMap<NodeId, NodeDelta>, // existing nodes with modified labels/props
+  pub created_nodes: DeltaMap<NodeId, NodeDelta>,
+  pub deleted_nodes: DeltaSet<NodeId>,
+  pub modified_nodes: DeltaMap<NodeId, NodeDelta>, // existing nodes with modified labels/props
 
   // Edge patches (both directions maintained)
-  pub out_add: HashMap<NodeId, BTreeSet<EdgePatch>>,
-  pub out_del: HashMap<NodeId, BTreeSet<EdgePatch>>,
-  pub in_add: HashMap<NodeId, BTreeSet<EdgePatch>>,
-  pub in_del: HashMap<NodeId, BTreeSet<EdgePatch>>,
+  pub out_add: DeltaMap<NodeId, BTreeSet<EdgePatch>>,
+  pub out_del: DeltaMap<NodeId, BTreeSet<EdgePatch>>,
+  pub in_add: DeltaMap<NodeId, BTreeSet<EdgePatch>>,
+  pub in_del: DeltaMap<NodeId, BTreeSet<EdgePatch>>,
 
   // Edge properties (keyed by (src, etype, dst))
-  pub edge_props: HashMap<(NodeId, ETypeId, NodeId), HashMap<PropKeyId, Option<PropValueRef>>>,
+  pub edge_props: DeltaMap<(NodeId, ETypeId, NodeId), HashMap<PropKeyId, Option<PropValueRef>>>,
 
   // New definitions
-  pub new_labels: HashMap<LabelId, String>,
-  pub new_etypes: HashMap<ETypeId, String>,
-  pub new_propkeys: HashMap<PropKeyId, String>,
+  pub new_labels: DeltaMap<LabelId, String>,
+  pub new_etypes: DeltaMap<ETypeId, String>,
+  pub new_propkeys: DeltaMap<PropKeyId, String>,
 
   // Key index delta
-  pub key_index: HashMap<String, NodeId>,
+  pub key_index: DeltaMap<String, NodeId>,
 
   // Pending vector operations (keyed by (node_id, prop_key_id))
   // Some(vec) = set, None = delete

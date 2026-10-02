@@ -22,8 +22,9 @@
 //!
 //! Ported from src/mvcc/version-chain.ts
 
+use hashbrown::hash_map::Entry;
+use hashbrown::{HashMap, HashSet};
 use std::borrow::Borrow;
-use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::sync::Arc;
 
@@ -856,32 +857,46 @@ impl VersionChainManager {
     txid: TxId,
     commit_ts: Timestamp,
   ) {
-    let key = TxKey::Node(node_id);
-    if let Some(head) = self.node_versions.get_mut(&key) {
-      if head.commit_ts == commit_ts {
-        (head.data, head.deleted) = Self::node_state(node_id, after);
-        return;
+    let unchanged =
+      before.as_ref().map(|data| &data.delta.key) == after.as_ref().map(|data| &data.delta.key);
+    match self.node_versions.entry(TxKey::Node(node_id)) {
+      Entry::Occupied(mut entry) => {
+        let head = entry.get_mut();
+        if head.commit_ts == commit_ts {
+          (head.data, head.deleted) = Self::node_state(node_id, after);
+          return;
+        }
+        if unchanged {
+          return;
+        }
+        // The old head becomes the previous version, holding `before`.
+        let (data, deleted) = Self::node_state(node_id, after);
+        let version = VersionedRecord {
+          data,
+          txid,
+          commit_ts,
+          prev: None,
+          deleted,
+        };
+        let mut prev = std::mem::replace(head, Box::new(version));
+        (prev.data, prev.deleted) = Self::node_state(node_id, before);
+        head.prev = Some(prev);
+      }
+      Entry::Vacant(entry) => {
+        if unchanged {
+          return;
+        }
+        let prev = before.map(|data| Box::new(VersionedRecord::new(data, 0, 0)));
+        let (data, deleted) = Self::node_state(node_id, after);
+        entry.insert(Box::new(VersionedRecord {
+          data,
+          txid,
+          commit_ts,
+          prev,
+          deleted,
+        }));
       }
     }
-    if before.as_ref().map(|data| &data.delta.key) == after.as_ref().map(|data| &data.delta.key) {
-      return;
-    }
-    let prev = match self.node_versions.remove(&key) {
-      Some(mut head) => {
-        (head.data, head.deleted) = Self::node_state(node_id, before);
-        Some(head)
-      }
-      None => before.map(|data| Box::new(VersionedRecord::new(data, 0, 0))),
-    };
-    let (data, deleted) = Self::node_state(node_id, after);
-    let version = VersionedRecord {
-      data,
-      txid,
-      commit_ts,
-      prev,
-      deleted,
-    };
-    self.node_versions.insert(key, Box::new(version));
   }
 
   /// The version data and deleted flag for a node state (`None`: absent).
