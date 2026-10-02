@@ -20,6 +20,7 @@ use kitedb::api::vector_search::{AnnAlgorithm, SimilarOptions, VectorIndex, Vect
 use kitedb::vector::compaction::{
   clear_deleted_fragments, force_full_compaction, run_compaction_if_needed, CompactionStrategy,
 };
+use kitedb::vector::ivf::serialize::validate_manifest_for_serialization;
 use kitedb::vector::ivf::{deserialize_manifest, kmeans, kmeans_parallel, serialize_manifest};
 use kitedb::vector::{
   create_vector_store, normalize, vector_store_delete, vector_store_insert,
@@ -891,8 +892,12 @@ fn b12_manifest() -> VectorManifest {
 }
 
 /// Contract: a manifest produced by the compaction functions serializes,
-/// deserializes, and passes validation, and every live vector survives.
+/// deserializes, and passes validation, and every live vector survives. The
+/// check a checkpoint runs before serializing a store agrees with the decode.
 fn assert_round_trips(label: &str, manifest: &VectorManifest) {
+  if let Err(err) = validate_manifest_for_serialization(manifest) {
+    panic!("{label}: the pre-serialize check refuses a manifest that should reload: {err}");
+  }
   let bytes = serialize_manifest(manifest);
   let restored = deserialize_manifest(&bytes).unwrap_or_else(|err| {
     let fragments: Vec<(usize, usize, usize, usize)> = manifest
