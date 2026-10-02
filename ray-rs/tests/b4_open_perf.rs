@@ -644,6 +644,20 @@ fn sparse_node_map_corruptions_refused_with_the_same_error() {
     "Invalid snapshot: NodeIdToPhys section: node ID 701002103 at entry 701 is not strictly ascending",
   );
 
+  // Two entries swapped in both maps: the maps agree, only the order breaks.
+  let mut image = sparse_base().clone();
+  phys_to_node_swapped(&mut image);
+  image.edit_bytes(SectionId::NodeIdToPhys, |map| {
+    let (a, b) = (read_u64(map, 500 * 12), read_u64(map, 501 * 12));
+    write_u64(map, 500 * 12, b);
+    write_u64(map, 501 * 12, a);
+  });
+  expect(
+    "agreeing maps out of order",
+    image,
+    "Invalid snapshot: NodeIdToPhys section: node ID 501001503 at entry 501 is not strictly ascending",
+  );
+
   let mut image = sparse_base().clone();
   key_entry_node_missing(&mut image);
   expect(
