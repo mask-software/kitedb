@@ -502,3 +502,9 @@ mod tests {
     close_single_file(db).expect("close");
   }
 }
+
+/// raydb-b4 `fsync-group` lane: one sync per Full-mode commit group, and the
+/// crash images it must survive.
+#[cfg(test)]
+#[path = "b4_fsync_group_tests.rs"]
+pub(crate) mod b4_fsync_group_tests;
