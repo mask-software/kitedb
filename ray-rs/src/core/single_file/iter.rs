@@ -2,7 +2,6 @@
 //!
 //! Provides iterators over nodes and database statistics.
 
-use crate::mvcc::visibility::{edge_exists as mvcc_edge_exists, node_exists as mvcc_node_exists};
 use crate::types::*;
 use std::collections::HashSet;
 
@@ -59,8 +58,7 @@ impl NodeIterator {
           // Skip if deleted in delta
           let node_visible = vc_guard
             .as_ref()
-            .and_then(|vc| vc.node_version(node_id))
-            .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
+            .and_then(|vc| vc.node_exists_at(node_id, tx_snapshot_ts, txid));
           if !layers.sees_snapshot(node_id, node_visible) {
             continue;
           }
@@ -73,8 +71,7 @@ impl NodeIterator {
     for &node_id in delta.created_nodes.keys() {
       let node_visible = vc_guard
         .as_ref()
-        .and_then(|vc| vc.node_version(node_id))
-        .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
+        .and_then(|vc| vc.node_exists_at(node_id, tx_snapshot_ts, txid));
       if !layers.sees_delta(node_id, node_visible) {
         continue;
       }
@@ -84,6 +81,14 @@ impl NodeIterator {
     // 3. Add nodes created (or recreated) in pending
     if let Some(pending_delta) = pending {
       nodes.extend(pending_delta.created_nodes.keys().copied());
+    }
+
+    // 4. Add nodes deleted since the reader's snapshot: only their version chains hold them
+    if let Some(vc) = vc_guard.as_ref() {
+      nodes.extend(
+        vc.nodes_at(tx_snapshot_ts, txid)
+          .filter(|&node_id| !layers.pending_masks(node_id)),
+      );
     }
 
     // Sort for consistent ordering
@@ -182,8 +187,7 @@ impl SingleFileDB {
           // Skip deleted nodes
           let src_visible = vc_guard
             .as_ref()
-            .and_then(|vc| vc.node_version(src))
-            .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
+            .and_then(|vc| vc.node_exists_at(src, tx_snapshot_ts, txid));
           if !layers.sees_snapshot(src, src_visible) {
             continue;
           }
@@ -203,15 +207,13 @@ impl SingleFileDB {
               // Skip deleted edges
               let dst_visible = vc_guard
                 .as_ref()
-                .and_then(|vc| vc.node_version(dst))
-                .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
+                .and_then(|vc| vc.node_exists_at(dst, tx_snapshot_ts, txid));
               if !layers.sees_snapshot(dst, dst_visible) {
                 continue;
               }
               let edge_visible = vc_guard
                 .as_ref()
-                .and_then(|vc| vc.edge_version(src, etype, dst))
-                .map(|version| mvcc_edge_exists(Some(version), tx_snapshot_ts, txid));
+                .and_then(|vc| vc.edge_exists_at(src, etype, dst, tx_snapshot_ts, txid));
               if edge_visible == Some(false)
                 || pending.is_some_and(|p| p.is_edge_deleted(src, etype, dst))
                 || (edge_visible.is_none() && delta.is_edge_deleted(src, etype, dst))
@@ -238,8 +240,7 @@ impl SingleFileDB {
 
         let src_visible = vc_guard
           .as_ref()
-          .and_then(|vc| vc.node_version(src))
-          .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
+          .and_then(|vc| vc.node_exists_at(src, tx_snapshot_ts, txid));
         if !layers.sees_delta(src, src_visible) {
           continue;
         }
@@ -248,15 +249,13 @@ impl SingleFileDB {
         }
         let dst_visible = vc_guard
           .as_ref()
-          .and_then(|vc| vc.node_version(patch.other))
-          .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
+          .and_then(|vc| vc.node_exists_at(patch.other, tx_snapshot_ts, txid));
         if !layers.sees_delta(patch.other, dst_visible) {
           continue;
         }
         let edge_visible = vc_guard
           .as_ref()
-          .and_then(|vc| vc.edge_version(src, patch.etype, patch.other))
-          .map(|version| mvcc_edge_exists(Some(version), tx_snapshot_ts, txid));
+          .and_then(|vc| vc.edge_exists_at(src, patch.etype, patch.other, tx_snapshot_ts, txid));
         if edge_visible == Some(false) {
           continue;
         }
@@ -283,8 +282,7 @@ impl SingleFileDB {
 
           let src_visible = vc_guard
             .as_ref()
-            .and_then(|vc| vc.node_version(src))
-            .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
+            .and_then(|vc| vc.node_exists_at(src, tx_snapshot_ts, txid));
           if !layers.sees_pending(src, src_visible) {
             continue;
           }
@@ -293,8 +291,7 @@ impl SingleFileDB {
           }
           let dst_visible = vc_guard
             .as_ref()
-            .and_then(|vc| vc.node_version(patch.other))
-            .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
+            .and_then(|vc| vc.node_exists_at(patch.other, tx_snapshot_ts, txid));
           if !layers.sees_pending(patch.other, dst_visible) {
             continue;
           }
@@ -305,6 +302,31 @@ impl SingleFileDB {
             dst: patch.other,
           });
         }
+      }
+    }
+
+    // Edges deleted since the reader's snapshot: only their version chains hold them
+    if let Some(vc) = vc_guard.as_ref() {
+      let listed = edges.len();
+      let node_visible =
+        |node_id| layers.sees_delta(node_id, vc.node_exists_at(node_id, tx_snapshot_ts, txid));
+      for (src, etype, dst) in vc.edges_at(tx_snapshot_ts, txid) {
+        if etype_filter.is_some_and(|filter_etype| filter_etype != etype)
+          || pending.is_some_and(|p| p.is_edge_deleted(src, etype, dst))
+          || !node_visible(src)
+          || !node_visible(dst)
+        {
+          continue;
+        }
+        if let Some(ref mut srcs) = read_srcs {
+          srcs.insert(src);
+        }
+        edges.push(FullEdge { src, etype, dst });
+      }
+      // Drop the ones the delta or snapshot listed too
+      if edges.len() > listed {
+        let mut seen = HashSet::with_capacity(edges.len());
+        edges.retain(|edge| seen.insert((edge.src, edge.etype, edge.dst)));
       }
     }
 

@@ -11,6 +11,13 @@
 //! new node adds again) stay masked: in session, after a checkpoint, after WAL
 //! replay, and after reopen.
 //!
+//! Each scenario runs twice: with MVCC off, and (`*_mvcc`) with MVCC on and a
+//! witness: a read transaction on another thread that begins before the
+//! scenario's first write and stays open across its commits, so they record
+//! version chains. Reads outside it must see the recreated node exactly as
+//! without MVCC, and the witness must keep seeing the old node until the first
+//! reopen.
+//!
 //! Run: `cargo test --no-default-features --test w2_delta_recreate`
 
 use kitedb::api::kite::{EdgeDef, Kite, KiteOptions, NodeDef};
@@ -20,17 +27,55 @@ use kitedb::core::single_file::{
 use kitedb::types::{ETypeId, LabelId, NodeId, PropKeyId, PropValue};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
 
 const OLD_KEY: &str = "node:old";
 const NEW_KEY: &str = "node:new";
 
-fn options() -> SingleFileOpenOptions {
-  // Deterministic: checkpoints happen only where a test asks for one.
-  SingleFileOpenOptions::new().auto_checkpoint(false)
+/// MVCC off, or on with a witness (see the module docs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+  Plain,
+  Mvcc,
 }
 
-fn open(path: &Path) -> SingleFileDB {
-  open_single_file(path, options()).expect("open")
+/// Runs `$scenario` as test `$plain` with MVCC off and as `$mvcc` with MVCC on.
+macro_rules! in_both_modes {
+  ($scenario:ident: $plain:ident, $mvcc:ident) => {
+    #[test]
+    fn $plain() {
+      $scenario(Mode::Plain);
+    }
+
+    #[test]
+    fn $mvcc() {
+      $scenario(Mode::Mvcc);
+    }
+  };
+}
+
+/// MVCC GC runs every few ms and keeps nothing for retention, so it prunes all
+/// history no open transaction needs while a scenario runs (and close does not
+/// wait out the default 5 s GC interval).
+const GC_INTERVAL_MS: u64 = 5;
+
+fn options(mode: Mode) -> SingleFileOpenOptions {
+  // Deterministic: checkpoints happen only where a test asks for one.
+  SingleFileOpenOptions::new()
+    .auto_checkpoint(false)
+    .mvcc(mode == Mode::Mvcc)
+    .mvcc_gc_interval_ms(GC_INTERVAL_MS)
+    .mvcc_retention_ms(0)
+}
+
+fn open(path: &Path, mode: Mode) -> Arc<SingleFileDB> {
+  Arc::new(open_single_file(path, options(mode)).expect("open"))
+}
+
+fn close(db: Arc<SingleFileDB>) {
+  let db = Arc::into_inner(db).expect("no other reference to the database");
+  close_single_file(db).expect("close");
 }
 
 /// Ids of the fixture: the old node `n` and its neighbours `a` and `b`.
@@ -325,128 +370,292 @@ enum Step {
 use Step::{Check, Checkpoint, Reopen};
 
 /// Runs `steps` after the recreating commit, checking the recreated node at
-/// each `Check`. The failure context names the steps so far.
-fn run_steps(path: &Path, db: SingleFileDB, fx: &Fx, spec: Spec, steps: &[Step]) {
-  let mut db = db;
+/// each `Check`. The failure context names the steps so far. A witness must
+/// keep its view at each `Check` until the first `Reopen` ends it; while it is
+/// open, `Checkpoint` runs a background checkpoint (a blocking one waits for
+/// every open transaction).
+fn run_steps(
+  path: &Path,
+  mode: Mode,
+  db: Arc<SingleFileDB>,
+  witness: Option<Witness>,
+  fx: &Fx,
+  spec: Spec,
+  steps: &[Step],
+) {
+  let (mut db, mut witness) = (db, witness);
   let mut ctx = String::from("commit");
   for step in steps {
     match step {
-      Step::Check => assert_recreated(&db, fx, spec, &ctx),
+      Step::Check => {
+        assert_recreated(&db, fx, spec, &ctx);
+        if let Some(witness) = &witness {
+          witness.assert_unchanged(&ctx);
+        }
+      }
       Step::Checkpoint => {
-        db.checkpoint()
-          .unwrap_or_else(|e| panic!("{ctx}: checkpoint failed: {e:?}"));
+        let result = if witness.is_some() {
+          db.background_checkpoint()
+        } else {
+          db.checkpoint()
+        };
+        result.unwrap_or_else(|e| panic!("{ctx}: checkpoint failed: {e:?}"));
         ctx.push_str(" > checkpoint");
       }
       Step::Reopen => {
-        close_single_file(db).expect("close");
-        db = open_single_file(path, options())
-          .unwrap_or_else(|e| panic!("{ctx}: reopen failed: {e:?}"));
+        if let Some(witness) = witness.take() {
+          witness.finish(&ctx);
+        }
+        close(db);
+        db = Arc::new(
+          open_single_file(path, options(mode))
+            .unwrap_or_else(|e| panic!("{ctx}: reopen failed: {e:?}")),
+        );
         ctx.push_str(" > reopen");
       }
     }
   }
-  close_single_file(db).expect("close");
+  if let Some(witness) = witness {
+    witness.finish(&ctx);
+  }
+  close(db);
+}
+
+// ============================================================================
+// MVCC witness
+// ============================================================================
+
+/// What a reader sees of the fixture.
+#[derive(Debug, PartialEq)]
+struct View {
+  n_exists: bool,
+  n_key: Option<String>,
+  by_old_key: Option<NodeId>,
+  by_new_key: Option<NodeId>,
+  n_props: Option<HashMap<PropKeyId, PropValue>>,
+  /// `node_prop` of `old_only`, `shared` and `new_only`.
+  n_prop: [Option<PropValue>; 3],
+  n_labels: Vec<LabelId>,
+  /// `node_has_label` of `old_label` and `new_label`.
+  n_has_label: [bool; 2],
+  /// `(out_edges, in_edges)` of `n`, `a` and `b`.
+  adjacency: [(Vec<(ETypeId, NodeId)>, Vec<(ETypeId, NodeId)>); 3],
+  /// `edge_exists` of n->a, a->n, n->b and b->n.
+  edge_exists: [bool; 4],
+  n_a_weight: Option<PropValue>,
+  n_a_props: Option<HashMap<PropKeyId, PropValue>>,
+  nodes: Vec<NodeId>,
+  edges: Vec<(NodeId, ETypeId, NodeId)>,
+}
+
+fn view(db: &SingleFileDB, fx: &Fx) -> View {
+  let Fx { n, a, b, t, .. } = *fx;
+  View {
+    n_exists: db.node_exists(n),
+    n_key: db.node_key(n),
+    by_old_key: db.node_by_key(OLD_KEY),
+    by_new_key: db.node_by_key(NEW_KEY),
+    n_props: db.node_props(n),
+    n_prop: [fx.old_only, fx.shared, fx.new_only].map(|key_id| db.node_prop(n, key_id)),
+    n_labels: sorted(db.node_labels(n)),
+    n_has_label: [fx.old_label, fx.new_label].map(|label_id| db.node_has_label(n, label_id)),
+    adjacency: [n, a, b].map(|node| (sorted(db.out_edges(node)), sorted(db.in_edges(node)))),
+    edge_exists: [(n, a), (a, n), (n, b), (b, n)].map(|(src, dst)| db.edge_exists(src, t, dst)),
+    n_a_weight: db.edge_prop(n, t, a, fx.weight),
+    n_a_props: db.edge_props(n, t, a),
+    nodes: db.list_nodes(),
+    edges: sorted(
+      db.list_edges(None)
+        .into_iter()
+        .map(|e| (e.src, e.etype, e.dst))
+        .collect(),
+    ),
+  }
+}
+
+/// A read transaction on another thread, open from `begin` to `finish`.
+struct Witness {
+  ask: mpsc::Sender<()>,
+  answers: mpsc::Receiver<View>,
+  /// What it saw when it began: what reads outside it saw then.
+  seen: View,
+  thread: thread::JoinHandle<()>,
+}
+
+impl Witness {
+  fn begin(db: &Arc<SingleFileDB>, fx: &Fx) -> Self {
+    let (ask, asks) = mpsc::channel::<()>();
+    let (answer, answers) = mpsc::channel();
+    let (reader, fx_copy) = (Arc::clone(db), *fx);
+    let thread = thread::spawn(move || {
+      reader.begin(true).expect("begin witness");
+      // Answer every ask until `finish` hangs up.
+      while answer.send(view(&reader, &fx_copy)).is_ok() && asks.recv().is_ok() {}
+      reader.commit().expect("end witness");
+    });
+    let seen = answers.recv().expect("witness began");
+    assert_eq!(
+      seen,
+      view(db, fx),
+      "a witness that just began must see the committed state"
+    );
+    Self {
+      ask,
+      answers,
+      seen,
+      thread,
+    }
+  }
+
+  /// The witness still sees what it saw when it began.
+  fn assert_unchanged(&self, ctx: &str) {
+    self.ask.send(()).expect("ask witness");
+    let now = self.answers.recv().expect("witness view");
+    assert_eq!(now, self.seen, "{ctx}: the witness's snapshot changed");
+  }
+
+  fn finish(self, ctx: &str) {
+    self.assert_unchanged(ctx);
+    drop(self.ask);
+    self.thread.join().expect("witness thread");
+  }
+}
+
+/// With MVCC, a witness of the old node `n`, begun before it is deleted.
+fn witness(db: &Arc<SingleFileDB>, fx: &Fx, mode: Mode) -> Option<Witness> {
+  (mode == Mode::Mvcc).then(|| {
+    let witness = Witness::begin(db, fx);
+    assert_eq!(
+      witness.seen.n_key.as_deref(),
+      Some(OLD_KEY),
+      "the witness must see the old node"
+    );
+    witness
+  })
 }
 
 // ============================================================================
 // Recreate in a later transaction (create_node_with_id)
 // ============================================================================
 
-#[test]
-fn r1_recreate_snapshot_node_visible_after_commit() {
+fn recreate_snapshot_node_visible_after_commit(mode: Mode) {
   let dir = tempfile::tempdir().expect("tempdir");
   let path = dir.path().join("visible.kitedb");
-  let db = open(&path);
+  let db = open(&path, mode);
   let fx = snapshot_fixture(&db);
+  let witness = witness(&db, &fx, mode);
   delete_then_recreate(&db, &fx, FULL_NEW_KEY);
-  run_steps(&path, db, &fx, FULL_NEW_KEY, &[Check]);
+  run_steps(&path, mode, db, witness, &fx, FULL_NEW_KEY, &[Check]);
 }
+in_both_modes!(recreate_snapshot_node_visible_after_commit:
+  r1_recreate_snapshot_node_visible_after_commit,
+  r1_recreate_snapshot_node_visible_after_commit_mvcc);
 
 /// The checkpoint path on its own: no read before the checkpoint.
-#[test]
-fn r1_recreate_snapshot_node_survives_checkpoint_and_reopen() {
+fn recreate_snapshot_node_survives_checkpoint_and_reopen(mode: Mode) {
   let dir = tempfile::tempdir().expect("tempdir");
   let path = dir.path().join("checkpoint.kitedb");
-  let db = open(&path);
+  let db = open(&path, mode);
   let fx = snapshot_fixture(&db);
+  let witness = witness(&db, &fx, mode);
   delete_then_recreate(&db, &fx, FULL_NEW_KEY);
   run_steps(
     &path,
+    mode,
     db,
+    witness,
     &fx,
     FULL_NEW_KEY,
     &[Checkpoint, Check, Reopen, Check],
   );
 }
+in_both_modes!(recreate_snapshot_node_survives_checkpoint_and_reopen:
+  r1_recreate_snapshot_node_survives_checkpoint_and_reopen,
+  r1_recreate_snapshot_node_survives_checkpoint_and_reopen_mvcc);
 
 /// WAL replay without a checkpoint: reopen right after the commit.
-#[test]
-fn r1_recreate_snapshot_node_survives_wal_replay() {
+fn recreate_snapshot_node_survives_wal_replay(mode: Mode) {
   let dir = tempfile::tempdir().expect("tempdir");
   let path = dir.path().join("replay.kitedb");
-  let db = open(&path);
+  let db = open(&path, mode);
   let fx = snapshot_fixture(&db);
+  let witness = witness(&db, &fx, mode);
   delete_then_recreate(&db, &fx, FULL_NEW_KEY);
   run_steps(
     &path,
+    mode,
     db,
+    witness,
     &fx,
     FULL_NEW_KEY,
     &[Reopen, Check, Checkpoint, Check, Reopen, Check],
   );
 }
+in_both_modes!(recreate_snapshot_node_survives_wal_replay:
+  r1_recreate_snapshot_node_survives_wal_replay,
+  r1_recreate_snapshot_node_survives_wal_replay_mvcc);
 
 /// The recreated node takes the old node's key again.
-#[test]
-fn r1_recreated_node_reuses_old_key() {
+fn recreated_node_reuses_old_key(mode: Mode) {
   let spec = Spec {
     key: Some(OLD_KEY),
     labels_and_edges: true,
   };
   let dir = tempfile::tempdir().expect("tempdir");
   let path = dir.path().join("key_reuse.kitedb");
-  let db = open(&path);
+  let db = open(&path, mode);
   let fx = snapshot_fixture(&db);
+  let witness = witness(&db, &fx, mode);
   delete_then_recreate(&db, &fx, spec);
   run_steps(
     &path,
+    mode,
     db,
+    witness,
     &fx,
     spec,
     &[Check, Reopen, Check, Checkpoint, Check, Reopen, Check],
   );
 }
+in_both_modes!(recreated_node_reuses_old_key:
+  r1_recreated_node_reuses_old_key,
+  r1_recreated_node_reuses_old_key_mvcc);
 
 /// Guard (passes before the fix): the same scenario when the old node never
 /// reached the snapshot. The old edge n->a carries no prop here: a delta edge's
 /// props outlive an unlink and reattach on relink with or without a node
 /// delete, which is a separate, general issue and not R1.
-#[test]
-fn r1_guard_recreate_delta_node() {
+fn guard_recreate_delta_node(mode: Mode) {
   let dir = tempfile::tempdir().expect("tempdir");
   let path = dir.path().join("delta_only.kitedb");
-  let db = open(&path);
+  let db = open(&path, mode);
   let fx = build_fixture(&db, false);
+  let witness = witness(&db, &fx, mode);
   delete_then_recreate(&db, &fx, FULL_NEW_KEY);
   run_steps(
     &path,
+    mode,
     db,
+    witness,
     &fx,
     FULL_NEW_KEY,
     &[Check, Reopen, Check, Checkpoint, Check, Reopen, Check],
   );
 }
+in_both_modes!(guard_recreate_delta_node:
+  r1_guard_recreate_delta_node,
+  r1_guard_recreate_delta_node_mvcc);
 
 // ============================================================================
 // Delete and recreate within one transaction
 // ============================================================================
 
-#[test]
-fn r1_delete_and_recreate_in_one_tx() {
+fn delete_and_recreate_in_one_tx(mode: Mode) {
   let dir = tempfile::tempdir().expect("tempdir");
   let path = dir.path().join("same_tx.kitedb");
-  let db = open(&path);
+  let db = open(&path, mode);
   let fx = snapshot_fixture(&db);
+  let witness = witness(&db, &fx, mode);
 
   db.begin(false).expect("begin");
   db.delete_node(fx.n).expect("delete n");
@@ -462,24 +671,29 @@ fn r1_delete_and_recreate_in_one_tx() {
 
   run_steps(
     &path,
+    mode,
     db,
+    witness,
     &fx,
     FULL_NEW_KEY,
     &[Check, Reopen, Check, Checkpoint, Check, Reopen, Check],
   );
 }
+in_both_modes!(delete_and_recreate_in_one_tx:
+  r1_delete_and_recreate_in_one_tx,
+  r1_delete_and_recreate_in_one_tx_mvcc);
 
 /// Without reads inside the tx: the commit must not bring the old node back.
-#[test]
-fn r1_delete_and_recreate_in_one_tx_does_not_resurrect_old_node() {
+fn delete_and_recreate_in_one_tx_does_not_resurrect_old_node(mode: Mode) {
   let spec = Spec {
     key: Some(NEW_KEY),
     labels_and_edges: false,
   };
   let dir = tempfile::tempdir().expect("tempdir");
   let path = dir.path().join("same_tx_merge.kitedb");
-  let db = open(&path);
+  let db = open(&path, mode);
   let fx = snapshot_fixture(&db);
+  let witness = witness(&db, &fx, mode);
 
   db.begin(false).expect("begin");
   db.delete_node(fx.n).expect("delete n");
@@ -488,19 +702,23 @@ fn r1_delete_and_recreate_in_one_tx_does_not_resurrect_old_node() {
 
   run_steps(
     &path,
+    mode,
     db,
+    witness,
     &fx,
     spec,
     &[Check, Reopen, Check, Checkpoint, Check, Reopen, Check],
   );
 }
+in_both_modes!(delete_and_recreate_in_one_tx_does_not_resurrect_old_node:
+  r1_delete_and_recreate_in_one_tx_does_not_resurrect_old_node,
+  r1_delete_and_recreate_in_one_tx_does_not_resurrect_old_node_mvcc);
 
 /// The old node's state can also live in the delta: edges added after the
 /// checkpoint (one a self-loop), a label, a prop, and an edge prop on a
 /// snapshot edge. The recreate drops all of it, whether the delete commits on
 /// its own, or that state, the delete and the recreate share one transaction.
-#[test]
-fn r1_recreate_masks_old_state_held_in_the_delta() {
+fn recreate_masks_old_state_held_in_the_delta(mode: Mode) {
   let spec = Spec {
     key: Some(NEW_KEY),
     labels_and_edges: false,
@@ -508,8 +726,9 @@ fn r1_recreate_masks_old_state_held_in_the_delta() {
   for same_tx in [false, true] {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("delta_held.kitedb");
-    let db = open(&path);
+    let db = open(&path, mode);
     let fx = snapshot_fixture(&db);
+    let witness = witness(&db, &fx, mode);
     let next_tx = |what: &str| {
       if !same_tx {
         db.commit()
@@ -535,13 +754,18 @@ fn r1_recreate_masks_old_state_held_in_the_delta() {
 
     run_steps(
       &path,
+      mode,
       db,
+      witness,
       &fx,
       spec,
       &[Check, Reopen, Check, Checkpoint, Check, Reopen, Check],
     );
   }
 }
+in_both_modes!(recreate_masks_old_state_held_in_the_delta:
+  r1_recreate_masks_old_state_held_in_the_delta,
+  r1_recreate_masks_old_state_held_in_the_delta_mvcc);
 
 // ============================================================================
 // Upsert by id
@@ -561,16 +785,16 @@ fn upsert_node_by_id(db: &SingleFileDB, node_id: NodeId, props: &[(PropKeyId, Pr
   }
 }
 
-#[test]
-fn r1_upsert_node_by_id_recreates_deleted_snapshot_node() {
+fn upsert_node_by_id_recreates_deleted_snapshot_node(mode: Mode) {
   let spec = Spec {
     key: None,
     labels_and_edges: false,
   };
   let dir = tempfile::tempdir().expect("tempdir");
   let path = dir.path().join("upsert.kitedb");
-  let db = open(&path);
+  let db = open(&path, mode);
   let fx = snapshot_fixture(&db);
+  let witness = witness(&db, &fx, mode);
 
   db.begin(false).expect("begin delete");
   db.delete_node(fx.n).expect("delete n");
@@ -591,20 +815,111 @@ fn r1_upsert_node_by_id_recreates_deleted_snapshot_node() {
 
   run_steps(
     &path,
+    mode,
     db,
+    witness,
     &fx,
     spec,
     &[Check, Reopen, Check, Checkpoint, Check, Reopen, Check],
   );
 }
+in_both_modes!(upsert_node_by_id_recreates_deleted_snapshot_node:
+  r1_upsert_node_by_id_recreates_deleted_snapshot_node,
+  r1_upsert_node_by_id_recreates_deleted_snapshot_node_mvcc);
 
-#[test]
-fn r1_kite_upsert_by_id_recreates_deleted_snapshot_node() {
+/// What a reader sees of the Kite fixture's `alice` and `bob`.
+#[derive(Debug, PartialEq)]
+struct KiteView {
+  exists: bool,
+  props: [Option<PropValue>; 2],
+  key: Option<Option<String>>,
+  by_key: Option<NodeId>,
+  neighbors: [Vec<NodeId>; 2],
+  has_edge: [bool; 2],
+  counts: (u64, u64),
+}
+
+fn kite_view(kite: &Kite, alice: NodeId, bob: NodeId) -> KiteView {
+  KiteView {
+    exists: kite.exists(alice),
+    props: ["name", "age"].map(|name| kite.prop(alice, name)),
+    key: kite
+      .node_by_id(alice)
+      .expect("node_by_id")
+      .map(|node| node.key().map(str::to_string)),
+    by_key: kite
+      .get("User", "alice")
+      .expect("get")
+      .map(|node| node.id()),
+    neighbors: [
+      kite.neighbors_out(alice, None).expect("out"),
+      kite.neighbors_in(alice, None).expect("in"),
+    ],
+    has_edge: [(alice, bob), (bob, alice)]
+      .map(|(src, dst)| kite.has_edge(src, "FOLLOWS", dst).expect("has_edge")),
+    counts: (kite.count_nodes(), kite.count_edges()),
+  }
+}
+
+/// Runs `write` while a read transaction on another thread stays open across
+/// it (see the module docs), then checks the reader still sees what it saw.
+/// The writes need `&mut Kite`, so both threads share it through a mutex,
+/// each holding it only for a call.
+fn with_kite_witness(
+  kite: Kite,
+  alice: NodeId,
+  bob: NodeId,
+  write: impl FnOnce(&mut Kite),
+) -> Kite {
+  let kite = Mutex::new(kite);
+  let (ask, asks) = mpsc::channel::<()>();
+  let (answer, answers) = mpsc::channel();
+  thread::scope(|scope| {
+    let kite = &kite;
+    scope.spawn(move || {
+      kite
+        .lock()
+        .expect("kite")
+        .raw()
+        .begin(true)
+        .expect("begin witness");
+      loop {
+        let view = kite_view(&kite.lock().expect("kite"), alice, bob);
+        if answer.send(view).is_err() || asks.recv().is_err() {
+          break;
+        }
+      }
+      kite
+        .lock()
+        .expect("kite")
+        .raw()
+        .commit()
+        .expect("end witness");
+    });
+    let seen = answers.recv().expect("witness began");
+    assert_eq!(
+      seen.props[1],
+      Some(PropValue::I64(30)),
+      "the witness must see the old alice"
+    );
+    write(&mut kite.lock().expect("kite"));
+    ask.send(()).expect("ask witness");
+    let now = answers.recv().expect("witness view");
+    assert_eq!(now, seen, "the witness's snapshot changed");
+    drop(ask);
+  });
+  kite.into_inner().expect("kite")
+}
+
+fn kite_upsert_by_id_recreates_deleted_snapshot_node(mode: Mode) {
   let dir = tempfile::tempdir().expect("tempdir");
   let path = dir.path().join("kite");
   let schema = || {
     KiteOptions::new()
       .disable_close_checkpoint()
+      .mvcc(mode == Mode::Mvcc)
+      .mvcc_gc_interval_ms(GC_INTERVAL_MS)
+      .mvcc_retention_ms(0)
       .node(NodeDef::new("User", "user:"))
       .edge(EdgeDef::new("FOLLOWS"))
   };
@@ -629,15 +944,16 @@ fn r1_kite_upsert_by_id_recreates_deleted_snapshot_node() {
   kite.link(bob, "FOLLOWS", alice).expect("link bob->alice");
   kite.raw().checkpoint().expect("checkpoint");
 
-  assert!(kite.delete_node(alice).expect("delete alice"));
-  assert!(!kite.exists(alice));
-  kite
-    .upsert_by_id("User", alice)
-    .expect("upsert_by_id builder")
-    .set("name", PropValue::String("Recreated".into()))
-    .execute()
-    .expect("upsert_by_id of a deleted snapshot node");
-
+  let recreate = |kite: &mut Kite| {
+    assert!(kite.delete_node(alice).expect("delete alice"));
+    assert!(!kite.exists(alice));
+    kite
+      .upsert_by_id("User", alice)
+      .expect("upsert_by_id builder")
+      .set("name", PropValue::String("Recreated".into()))
+      .execute()
+      .expect("upsert_by_id of a deleted snapshot node");
+  };
   let check = |kite: &Kite, ctx: &str| {
     assert!(
       kite.exists(alice),
@@ -681,7 +997,17 @@ fn r1_kite_upsert_by_id_recreates_deleted_snapshot_node() {
     assert_eq!(kite.count_edges(), 0, "{ctx}: count_edges");
   };
 
-  check(&kite, "after upsert_by_id");
+  let write = |kite: &mut Kite| {
+    recreate(kite);
+    check(kite, "after upsert_by_id");
+  };
+  let kite = match mode {
+    Mode::Plain => {
+      write(&mut kite);
+      kite
+    }
+    Mode::Mvcc => with_kite_witness(kite, alice, bob, write),
+  };
   kite.close().expect("close");
   let kite = Kite::open(&path, schema()).expect("reopen");
   check(&kite, "after WAL replay");
@@ -691,4 +1017,40 @@ fn r1_kite_upsert_by_id_recreates_deleted_snapshot_node() {
   let kite = Kite::open(&path, schema()).expect("reopen");
   check(&kite, "after replay > checkpoint > reopen");
   kite.close().expect("close");
+}
+in_both_modes!(kite_upsert_by_id_recreates_deleted_snapshot_node:
+  r1_kite_upsert_by_id_recreates_deleted_snapshot_node,
+  r1_kite_upsert_by_id_recreates_deleted_snapshot_node_mvcc);
+
+// ============================================================================
+// MVCC: a reader of the recreated node
+// ============================================================================
+
+/// A reader that began after the recreate keeps the recreated node when it is
+/// deleted again, without the old node's state (the old copy is still in the
+/// snapshot, masked by the first delete), and after a checkpoint drops it.
+#[test]
+fn r1_mvcc_reader_keeps_recreated_node_deleted_again() {
+  let dir = tempfile::tempdir().expect("tempdir");
+  let path = dir.path().join("deleted_again.kitedb");
+  let db = open(&path, Mode::Mvcc);
+  let fx = snapshot_fixture(&db);
+  delete_then_recreate(&db, &fx, FULL_NEW_KEY);
+  assert_recreated(&db, &fx, FULL_NEW_KEY, "recreated");
+  // It sees what `assert_recreated` checked (`Witness::begin` compares).
+  let witness = Witness::begin(&db, &fx);
+
+  db.begin(false).expect("begin second delete");
+  db.delete_node(fx.n).expect("delete the recreated n");
+  db.commit().expect("commit second delete");
+  assert!(!db.node_exists(fx.n), "the second delete must hide n");
+  witness.assert_unchanged("deleted again");
+
+  db.background_checkpoint().expect("background checkpoint");
+  assert!(
+    !db.node_exists(fx.n),
+    "deleted again > checkpoint: n is back"
+  );
+  witness.finish("deleted again > checkpoint");
+  close(db);
 }

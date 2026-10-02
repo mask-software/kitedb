@@ -21,7 +21,6 @@ use crate::core::pager::FilePager;
 use crate::core::snapshot::reader::SnapshotData;
 use crate::core::wal::buffer::WalBuffer;
 use crate::error::Result;
-use crate::mvcc::visibility::{edge_exists as mvcc_edge_exists, node_exists as mvcc_node_exists};
 use crate::mvcc::MvccManager;
 use crate::types::*;
 use crate::util::compression::CompressionOptions;
@@ -32,6 +31,7 @@ mod check;
 mod checkpoint;
 mod compactor;
 mod iter;
+mod mvcc_history;
 mod open;
 mod read;
 mod recovery;
@@ -665,6 +665,10 @@ impl SingleFileDB {
       }
     }
 
+    // Read-locked across the MVCC lookup: a commit lands completely before or after this
+    // read (lock order: see read.rs).
+    let delta = self.delta.read();
+
     if let Some(mvcc) = self.mvcc.as_ref() {
       let (txid, tx_snapshot_ts) = if let Some(handle) = tx_handle.as_ref() {
         let tx = handle.lock();
@@ -677,12 +681,11 @@ impl SingleFileDB {
         tx_mgr.record_read(txid, TxKey::Node(node_id));
       }
       let vc = mvcc.version_chain.lock();
-      if let Some(version) = vc.node_version(node_id) {
-        return mvcc_node_exists(Some(version), tx_snapshot_ts, txid);
+      if let Some(exists) = vc.node_exists_at(node_id, tx_snapshot_ts, txid) {
+        return exists;
       }
     }
 
-    let delta = self.delta.read();
     let snapshot = self.snapshot.read();
     delta.node_exists_over(snapshot.as_ref(), node_id)
   }
@@ -707,6 +710,10 @@ impl SingleFileDB {
       }
     }
 
+    // Read-locked across the MVCC lookup: a commit lands completely before or after this
+    // read (lock order: see read.rs).
+    let delta = self.delta.read();
+
     if let Some(mvcc) = self.mvcc.as_ref() {
       let (txid, tx_snapshot_ts) = if let Some(handle) = tx_handle.as_ref() {
         let tx = handle.lock();
@@ -719,12 +726,11 @@ impl SingleFileDB {
         tx_mgr.record_read(txid, TxKey::Edge { src, etype, dst });
       }
       let vc = mvcc.version_chain.lock();
-      if let Some(version) = vc.edge_version(src, etype, dst) {
-        return mvcc_edge_exists(Some(version), tx_snapshot_ts, txid);
+      if let Some(exists) = vc.edge_exists_at(src, etype, dst, tx_snapshot_ts, txid) {
+        return exists;
       }
     }
 
-    let delta = self.delta.read();
     let snapshot = self.snapshot.read();
     delta.edge_exists_over(snapshot.as_ref(), src, etype, dst)
   }

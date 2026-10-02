@@ -16,12 +16,18 @@
 //! task-fair RwLocks: a queued writer blocks new readers, so even a read guard must never be
 //! requested while a later lock is held. The calling thread's own tx state mutex is private
 //! to that thread and sits outside this order, but it is not reentrant: never lock it twice.
+//!
+//! # MVCC
+//!
+//! The committed delta and snapshot hold the latest committed state. The version chains only
+//! hold history (see `mvcc::version_chain`): a read consults them first, and their `*_at`
+//! lookups answer only for a reader whose snapshot predates a change, `None` otherwise. Reads
+//! hold `delta` across those lookups, so a commit (which records its versions and merges into
+//! the delta under `delta.write()`) lands completely before or after them. Enumerations add
+//! what only the chains still hold: nodes, edges and keys deleted since the reader's snapshot.
 
 use std::collections::HashMap;
 
-use crate::mvcc::visibility::{
-  edge_exists as mvcc_edge_exists, node_exists as mvcc_node_exists, visible_version,
-};
 use crate::types::*;
 
 use super::{SingleFileDB, SingleFileTxState};
@@ -29,9 +35,9 @@ use super::{SingleFileDB, SingleFileTxState};
 /// Which layers' state of a node a reader sees: its transaction's pending
 /// delta over the committed delta over the snapshot. A layer's delete masks
 /// the node's copies below it (props, labels, key, edges); a recreated node
-/// holds a fresh copy in the layer that recreated it. `mvcc` is the node's
-/// MVCC visibility (`None` without a version chain), which takes precedence
-/// over the committed delta's node state.
+/// holds a fresh copy in the layer that recreated it. `mvcc` is whether the
+/// node existed at the reader's MVCC snapshot, if it changed since (`None`
+/// when the delta and snapshot decide, see the module docs).
 #[derive(Clone, Copy)]
 pub(super) struct NodeLayers<'a> {
   pub(super) pending: Option<&'a DeltaState>,
@@ -40,14 +46,12 @@ pub(super) struct NodeLayers<'a> {
 
 impl NodeLayers<'_> {
   /// The snapshot's copy of the node: its props, labels, key and edges. A
-  /// node the committed delta recreated never shows its old copy, even when
-  /// its version chain says it is visible.
+  /// delete in the committed delta masks it for every reader, also for one
+  /// that saw it before the delete: the version chains record what the
+  /// delete removed, and a reader that saw a recreated node never saw the
+  /// old copy.
   pub(super) fn sees_snapshot(&self, node_id: NodeId, mvcc: Option<bool>) -> bool {
-    !self.pending_masks(node_id)
-      && match mvcc {
-        Some(visible) => visible && !self.delta.is_node_created(node_id),
-        None => !self.delta.is_node_deleted(node_id),
-      }
+    !self.pending_masks(node_id) && mvcc != Some(false) && !self.delta.is_node_deleted(node_id)
   }
 
   /// The committed delta's state of the node: its copy (if created there)
@@ -83,8 +87,9 @@ impl SingleFileDB {
     }
   }
 
-  /// MVCC visibility of a node, or `None` when its version chain has no entry.
-  /// Holds `version_chain` only for the lookup.
+  /// Whether a node existed at the reader's snapshot, if it changed since (see the module
+  /// docs); `None` when the delta and snapshot decide. Holds `version_chain` only for the
+  /// lookup.
   fn mvcc_node_visible(
     &self,
     node_id: NodeId,
@@ -93,8 +98,7 @@ impl SingleFileDB {
   ) -> Option<bool> {
     let mvcc = self.mvcc.as_ref()?;
     let vc = mvcc.version_chain.lock();
-    vc.node_version(node_id)
-      .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid))
+    vc.node_exists_at(node_id, tx_snapshot_ts, txid)
   }
 
   // ========================================================================
@@ -126,8 +130,7 @@ impl SingleFileDB {
     let vc_guard = self.mvcc.as_ref().map(|mvcc| mvcc.version_chain.lock());
     let mvcc_node_visible = vc_guard
       .as_ref()
-      .and_then(|vc| vc.node_version(node_id))
-      .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
+      .and_then(|vc| vc.node_exists_at(node_id, tx_snapshot_ts, txid));
 
     // Get properties from snapshot first
     if let Some(ref snap) = *snapshot {
@@ -161,17 +164,16 @@ impl SingleFileDB {
       }
     }
 
+    // What changed since the reader's snapshot, unless the transaction recreated the node
     if let Some(vc) = vc_guard.as_ref().filter(|_| !layers.pending_masks(node_id)) {
       for key_id in vc.node_prop_keys(node_id) {
-        if let Some(prop_version) = vc.node_prop_version(node_id, key_id) {
-          if let Some(visible) = visible_version(&prop_version, tx_snapshot_ts, txid) {
-            match &visible.data {
-              Some(v) => {
-                props.insert(key_id, v.as_ref().clone());
-              }
-              None => {
-                props.remove(&key_id);
-              }
+        if let Some(value) = vc.node_prop_at(node_id, key_id, tx_snapshot_ts, txid) {
+          match value {
+            Some(v) => {
+              props.insert(key_id, v.as_ref().clone());
+            }
+            None => {
+              props.remove(&key_id);
             }
           }
         }
@@ -263,6 +265,8 @@ impl SingleFileDB {
       }
     }
 
+    let delta = self.delta.read();
+
     let mut mvcc_node_visible = None;
     if let Some(mvcc) = self.mvcc.as_ref() {
       let (txid, tx_snapshot_ts) = if let Some(handle) = tx_handle.as_ref() {
@@ -276,17 +280,13 @@ impl SingleFileDB {
         tx_mgr.record_read(txid, TxKey::NodeProp { node_id, key_id });
       }
       let vc = mvcc.version_chain.lock();
-      if let Some(version) = vc.node_version(node_id) {
-        mvcc_node_visible = Some(mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
-      }
-      if let Some(prop_version) = vc.node_prop_version(node_id, key_id) {
-        if let Some(visible) = visible_version(&prop_version, tx_snapshot_ts, txid) {
-          return visible.data.as_deref().cloned();
+      mvcc_node_visible = vc.node_exists_at(node_id, tx_snapshot_ts, txid);
+      if mvcc_node_visible != Some(false) {
+        if let Some(value) = vc.node_prop_at(node_id, key_id, tx_snapshot_ts, txid) {
+          return value.as_deref().cloned();
         }
       }
     }
-
-    let delta = self.delta.read();
 
     // Check if node is deleted (unless MVCC snapshot says otherwise)
     if mvcc_node_visible == Some(false) {
@@ -306,8 +306,9 @@ impl SingleFileDB {
       }
     }
 
-    // A node created (or recreated) in the delta has no snapshot props.
-    if delta.is_node_created(node_id) {
+    // A node created (or recreated) in the delta has no snapshot props, and a delete masks
+    // them (see `NodeLayers::sees_snapshot`).
+    if delta.is_node_created(node_id) || delta.is_node_deleted(node_id) {
       return None;
     }
 
@@ -365,8 +366,7 @@ impl SingleFileDB {
     let node_visible = |node_id| {
       vc_guard
         .as_ref()
-        .and_then(|vc| vc.node_version(node_id))
-        .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid))
+        .and_then(|vc| vc.node_exists_at(node_id, tx_snapshot_ts, txid))
     };
     let mvcc_src_visible = node_visible(src);
     let mvcc_dst_visible = node_visible(dst);
@@ -393,20 +393,32 @@ impl SingleFileDB {
       }
     }
 
-    if let Some(vc) = vc_guard.as_ref().filter(|_| !committed_masked) {
-      if let Some(version) = vc.edge_version(src, etype, dst) {
-        mvcc_edge_visible = Some(mvcc_edge_exists(Some(version), tx_snapshot_ts, txid));
+    // Apply committed delta modifications, then what changed since the reader's snapshot
+    if !committed_masked {
+      if let Some(delta_props) = delta.edge_props_delta(src, etype, dst) {
+        props.reserve(delta_props.len());
+        for (&key_id, value) in delta_props {
+          match value {
+            Some(v) => {
+              props.insert(key_id, v.as_ref().clone());
+            }
+            None => {
+              props.remove(&key_id);
+            }
+          }
+        }
       }
+    }
+    if let Some(vc) = vc_guard.as_ref().filter(|_| !committed_masked) {
+      mvcc_edge_visible = vc.edge_exists_at(src, etype, dst, tx_snapshot_ts, txid);
       for key_id in vc.edge_prop_keys(src, etype, dst) {
-        if let Some(prop_version) = vc.edge_prop_version(src, etype, dst, key_id) {
-          if let Some(visible) = visible_version(&prop_version, tx_snapshot_ts, txid) {
-            match &visible.data {
-              Some(v) => {
-                props.insert(key_id, v.as_ref().clone());
-              }
-              None => {
-                props.remove(&key_id);
-              }
+        if let Some(value) = vc.edge_prop_at(src, etype, dst, key_id, tx_snapshot_ts, txid) {
+          match value {
+            Some(v) => {
+              props.insert(key_id, v.as_ref().clone());
+            }
+            None => {
+              props.remove(&key_id);
             }
           }
         }
@@ -442,21 +454,6 @@ impl SingleFileDB {
         && !edge_exists_in_snapshot
       {
         return None;
-      }
-
-      // Apply committed delta modifications (only if edge exists)
-      if let Some(delta_props) = delta.edge_props_delta(src, etype, dst) {
-        props.reserve(delta_props.len());
-        for (&key_id, value) in delta_props {
-          match value {
-            Some(v) => {
-              props.insert(key_id, v.as_ref().clone());
-            }
-            None => {
-              props.remove(&key_id);
-            }
-          }
-        }
       }
     }
 
@@ -527,6 +524,8 @@ impl SingleFileDB {
       }
     }
 
+    let delta = self.delta.read();
+
     let mut mvcc_src_visible = None;
     let mut mvcc_dst_visible = None;
     let mut mvcc_edge_visible = None;
@@ -550,23 +549,16 @@ impl SingleFileDB {
         );
       }
       let vc = mvcc.version_chain.lock();
-      if let Some(version) = vc.node_version(src) {
-        mvcc_src_visible = Some(mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
-      }
-      if let Some(version) = vc.node_version(dst) {
-        mvcc_dst_visible = Some(mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
-      }
-      if let Some(version) = vc.edge_version(src, etype, dst) {
-        mvcc_edge_visible = Some(mvcc_edge_exists(Some(version), tx_snapshot_ts, txid));
-      }
-      if let Some(prop_version) = vc.edge_prop_version(src, etype, dst, key_id) {
-        if let Some(visible) = visible_version(&prop_version, tx_snapshot_ts, txid) {
-          return visible.data.as_deref().cloned();
+      mvcc_src_visible = vc.node_exists_at(src, tx_snapshot_ts, txid);
+      mvcc_dst_visible = vc.node_exists_at(dst, tx_snapshot_ts, txid);
+      mvcc_edge_visible = vc.edge_exists_at(src, etype, dst, tx_snapshot_ts, txid);
+      let gone = [mvcc_src_visible, mvcc_dst_visible, mvcc_edge_visible].contains(&Some(false));
+      if !gone {
+        if let Some(value) = vc.edge_prop_at(src, etype, dst, key_id, tx_snapshot_ts, txid) {
+          return value.as_deref().cloned();
         }
       }
     }
-
-    let delta = self.delta.read();
 
     if mvcc_src_visible == Some(false) || mvcc_dst_visible == Some(false) {
       return None;
@@ -664,8 +656,7 @@ impl SingleFileDB {
     // If node is deleted in committed state, no edges
     let node_visible = vc_guard
       .as_ref()
-      .and_then(|vc| vc.node_version(node_id))
-      .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
+      .and_then(|vc| vc.node_exists_at(node_id, tx_snapshot_ts, txid));
     if !layers.sees_pending(node_id, node_visible) {
       return Vec::new();
     }
@@ -696,16 +687,14 @@ impl SingleFileDB {
             // Skip edges to deleted nodes
             let dst_visible = vc_guard
               .as_ref()
-              .and_then(|vc| vc.node_version(dst_node_id))
-              .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
+              .and_then(|vc| vc.node_exists_at(dst_node_id, tx_snapshot_ts, txid));
             if !layers.sees_snapshot(dst_node_id, dst_visible) {
               continue;
             }
             // Skip edges deleted in delta
             let edge_visible = vc_guard
               .as_ref()
-              .and_then(|vc| vc.edge_version(node_id, etype, dst_node_id))
-              .map(|version| mvcc_edge_exists(Some(version), tx_snapshot_ts, txid));
+              .and_then(|vc| vc.edge_exists_at(node_id, etype, dst_node_id, tx_snapshot_ts, txid));
             if edge_visible == Some(false)
               || pending.is_some_and(|p| p.is_edge_deleted(node_id, etype, dst_node_id))
               || (edge_visible.is_none() && delta.is_edge_deleted(node_id, etype, dst_node_id))
@@ -728,15 +717,19 @@ impl SingleFileDB {
         // Skip edges to deleted nodes
         let dst_visible = vc_guard
           .as_ref()
-          .and_then(|vc| vc.node_version(edge_patch.other))
-          .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
+          .and_then(|vc| vc.node_exists_at(edge_patch.other, tx_snapshot_ts, txid));
         if !layers.sees_delta(edge_patch.other, dst_visible) {
           continue;
         }
-        let edge_visible = vc_guard
-          .as_ref()
-          .and_then(|vc| vc.edge_version(node_id, edge_patch.etype, edge_patch.other))
-          .map(|version| mvcc_edge_exists(Some(version), tx_snapshot_ts, txid));
+        let edge_visible = vc_guard.as_ref().and_then(|vc| {
+          vc.edge_exists_at(
+            node_id,
+            edge_patch.etype,
+            edge_patch.other,
+            tx_snapshot_ts,
+            txid,
+          )
+        });
         if edge_visible == Some(false)
           || pending.is_some_and(|p| p.is_edge_deleted(node_id, edge_patch.etype, edge_patch.other))
         {
@@ -750,12 +743,27 @@ impl SingleFileDB {
       for edge_patch in added_edges {
         let dst_visible = vc_guard
           .as_ref()
-          .and_then(|vc| vc.node_version(edge_patch.other))
-          .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
+          .and_then(|vc| vc.node_exists_at(edge_patch.other, tx_snapshot_ts, txid));
         if !layers.sees_pending(edge_patch.other, dst_visible) {
           continue;
         }
         edges.push((edge_patch.etype, edge_patch.other));
+      }
+    }
+
+    // Edges deleted since the reader's snapshot remain only in their version chains
+    if let Some(vc) = vc_guard
+      .as_ref()
+      .filter(|_| layers.sees_delta(node_id, node_visible))
+    {
+      for (src, etype, dst) in vc.node_edges_at(node_id, tx_snapshot_ts, txid) {
+        if src != node_id || pending.is_some_and(|p| p.is_edge_deleted(src, etype, dst)) {
+          continue;
+        }
+        if !layers.sees_delta(dst, vc.node_exists_at(dst, tx_snapshot_ts, txid)) {
+          continue;
+        }
+        edges.push((etype, dst));
       }
     }
 
@@ -807,8 +815,7 @@ impl SingleFileDB {
     // If node is deleted, no edges
     let node_visible = vc_guard
       .as_ref()
-      .and_then(|vc| vc.node_version(node_id))
-      .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
+      .and_then(|vc| vc.node_exists_at(node_id, tx_snapshot_ts, txid));
     if !layers.sees_pending(node_id, node_visible) {
       return Vec::new();
     }
@@ -839,16 +846,14 @@ impl SingleFileDB {
             // Skip edges from deleted nodes
             let src_visible = vc_guard
               .as_ref()
-              .and_then(|vc| vc.node_version(src_node_id))
-              .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
+              .and_then(|vc| vc.node_exists_at(src_node_id, tx_snapshot_ts, txid));
             if !layers.sees_snapshot(src_node_id, src_visible) {
               continue;
             }
             // Skip edges deleted in delta
             let edge_visible = vc_guard
               .as_ref()
-              .and_then(|vc| vc.edge_version(src_node_id, etype, node_id))
-              .map(|version| mvcc_edge_exists(Some(version), tx_snapshot_ts, txid));
+              .and_then(|vc| vc.edge_exists_at(src_node_id, etype, node_id, tx_snapshot_ts, txid));
             if edge_visible == Some(false)
               || pending.is_some_and(|p| p.is_edge_deleted(src_node_id, etype, node_id))
               || (edge_visible.is_none() && delta.is_edge_deleted(src_node_id, etype, node_id))
@@ -871,15 +876,19 @@ impl SingleFileDB {
         // Skip edges from deleted nodes
         let src_visible = vc_guard
           .as_ref()
-          .and_then(|vc| vc.node_version(edge_patch.other))
-          .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
+          .and_then(|vc| vc.node_exists_at(edge_patch.other, tx_snapshot_ts, txid));
         if !layers.sees_delta(edge_patch.other, src_visible) {
           continue;
         }
-        let edge_visible = vc_guard
-          .as_ref()
-          .and_then(|vc| vc.edge_version(edge_patch.other, edge_patch.etype, node_id))
-          .map(|version| mvcc_edge_exists(Some(version), tx_snapshot_ts, txid));
+        let edge_visible = vc_guard.as_ref().and_then(|vc| {
+          vc.edge_exists_at(
+            edge_patch.other,
+            edge_patch.etype,
+            node_id,
+            tx_snapshot_ts,
+            txid,
+          )
+        });
         if edge_visible == Some(false)
           || pending.is_some_and(|p| p.is_edge_deleted(edge_patch.other, edge_patch.etype, node_id))
         {
@@ -893,12 +902,27 @@ impl SingleFileDB {
       for edge_patch in added_edges {
         let src_visible = vc_guard
           .as_ref()
-          .and_then(|vc| vc.node_version(edge_patch.other))
-          .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
+          .and_then(|vc| vc.node_exists_at(edge_patch.other, tx_snapshot_ts, txid));
         if !layers.sees_pending(edge_patch.other, src_visible) {
           continue;
         }
         edges.push((edge_patch.etype, edge_patch.other));
+      }
+    }
+
+    // Edges deleted since the reader's snapshot remain only in their version chains
+    if let Some(vc) = vc_guard
+      .as_ref()
+      .filter(|_| layers.sees_delta(node_id, node_visible))
+    {
+      for (src, etype, dst) in vc.node_edges_at(node_id, tx_snapshot_ts, txid) {
+        if dst != node_id || pending.is_some_and(|p| p.is_edge_deleted(src, etype, dst)) {
+          continue;
+        }
+        if !layers.sees_delta(src, vc.node_exists_at(src, tx_snapshot_ts, txid)) {
+          continue;
+        }
+        edges.push((etype, src));
       }
     }
 
@@ -1048,16 +1072,12 @@ impl SingleFileDB {
     let mut node_visible = None;
     if let Some(mvcc) = self.mvcc.as_ref() {
       let vc = mvcc.version_chain.lock();
-      node_visible = vc
-        .node_version(node_id)
-        .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
+      node_visible = vc.node_exists_at(node_id, tx_snapshot_ts, txid);
       if node_visible == Some(false) {
         return false;
       }
-      if let Some(label_version) = vc.node_label_version(node_id, label_id) {
-        if let Some(visible) = visible_version(&label_version, tx_snapshot_ts, txid) {
-          return visible.data.unwrap_or(false);
-        }
+      if let Some(has_label) = vc.node_label_at(node_id, label_id, tx_snapshot_ts, txid) {
+        return has_label;
       }
     }
 
@@ -1076,8 +1096,9 @@ impl SingleFileDB {
       return true;
     }
 
-    // A node created (or recreated) in the delta has no snapshot labels.
-    if delta.is_node_created(node_id) {
+    // A node created (or recreated) in the delta has no snapshot labels, and a delete masks
+    // them (see `NodeLayers::sees_snapshot`).
+    if delta.is_node_created(node_id) || delta.is_node_deleted(node_id) {
       return false;
     }
 
@@ -1115,8 +1136,7 @@ impl SingleFileDB {
     // Check if node is deleted
     let node_visible = vc_guard
       .as_ref()
-      .and_then(|vc| vc.node_version(node_id))
-      .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
+      .and_then(|vc| vc.node_exists_at(node_id, tx_snapshot_ts, txid));
     if !layers.sees_pending(node_id, node_visible) {
       return Vec::new();
     }
@@ -1153,17 +1173,14 @@ impl SingleFileDB {
 
     if let Some(vc) = vc_guard.as_ref().filter(|_| committed) {
       for label_id in vc.node_label_keys(node_id) {
-        if let Some(label_version) = vc.node_label_version(node_id, label_id) {
-          if let Some(visible) = visible_version(&label_version, tx_snapshot_ts, txid) {
-            match visible.data {
-              Some(true) => {
-                labels.insert(label_id);
-              }
-              _ => {
-                labels.remove(&label_id);
-              }
-            }
+        match vc.node_label_at(node_id, label_id, tx_snapshot_ts, txid) {
+          Some(true) => {
+            labels.insert(label_id);
           }
+          Some(false) => {
+            labels.remove(&label_id);
+          }
+          None => {}
         }
       }
     }
@@ -1242,6 +1259,17 @@ impl SingleFileDB {
       return Some(node_id);
     }
 
+    // The key's owner at the reader's snapshot, if it changed since
+    if let Some(mvcc) = self.mvcc.as_ref() {
+      let owner = mvcc
+        .version_chain
+        .lock()
+        .key_owner_at(key, tx_snapshot_ts, txid);
+      if let Some(owner) = owner {
+        return owner.filter(|&node_id| !pending.is_some_and(|p| p.is_node_deleted(node_id)));
+      }
+    }
+
     // Check committed delta key index
     if delta.key_index_deleted.contains(key) {
       return None;
@@ -1295,10 +1323,17 @@ impl SingleFileDB {
 
     let (txid, tx_snapshot_ts) = self.mvcc_read_ts(tx_guard.as_deref());
     let delta = self.delta.read();
-    let node_visible = self.mvcc_node_visible(node_id, tx_snapshot_ts, txid);
+
+    // The node at the reader's snapshot, with its key, if it changed since
+    if let Some(mvcc) = self.mvcc.as_ref() {
+      let vc = mvcc.version_chain.lock();
+      if let Some(node) = vc.node_at(node_id, tx_snapshot_ts, txid) {
+        return node.and_then(|node| node.delta.key.clone());
+      }
+    }
 
     // Check if node is deleted
-    if node_visible == Some(false) || (node_visible.is_none() && delta.is_node_removed(node_id)) {
+    if delta.is_node_removed(node_id) {
       return None;
     }
 
