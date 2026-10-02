@@ -5,7 +5,7 @@
 //!
 //! Ported from src/vector/columnar-store.ts
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::types::NodeId;
 
@@ -286,10 +286,7 @@ pub fn vector_store_seal_active(manifest: &mut VectorManifest) {
   if let Some(fragment) = manifest.active_fragment_mut() {
     if fragment.state == FragmentState::Active {
       fragment.seal();
-
-      let new_id = manifest.fragments.len();
-      manifest.fragments.push(Fragment::new(new_id));
-      manifest.active_fragment_id = new_id;
+      start_active_fragment(manifest);
     }
   }
 }
@@ -314,21 +311,7 @@ pub fn vector_store_clear(manifest: &mut VectorManifest) {
 /// branch-light traversal behavior.
 pub(crate) fn validate_vector_manifest(manifest: &VectorManifest) -> Result<(), VectorStoreError> {
   let config = &manifest.config;
-  if config.dimensions == 0 {
-    return Err(VectorStoreError::Invariant(
-      "manifest dimensions must be nonzero".into(),
-    ));
-  }
-  if config.row_group_size == 0 {
-    return Err(VectorStoreError::Invariant(
-      "manifest row_group_size must be nonzero".into(),
-    ));
-  }
-  if config.fragment_target_size == 0 {
-    return Err(VectorStoreError::Invariant(
-      "manifest fragment_target_size must be nonzero".into(),
-    ));
-  }
+  validate_store_config(config)?;
   if manifest.fragments.is_empty() {
     return Err(VectorStoreError::Invariant(
       "manifest must contain at least one fragment".into(),
@@ -618,6 +601,105 @@ fn validate_live_location(
   Ok(())
 }
 
+/// Rejects configurations a manifest cannot be stored with: they would divide
+/// by zero on reads, and a reload rejects them.
+pub(crate) fn validate_store_config(config: &VectorStoreConfig) -> Result<(), VectorStoreError> {
+  if config.dimensions == 0 {
+    return Err(VectorStoreError::Invariant(
+      "manifest dimensions must be nonzero".into(),
+    ));
+  }
+  if config.row_group_size == 0 {
+    return Err(VectorStoreError::Invariant(
+      "manifest row_group_size must be nonzero".into(),
+    ));
+  }
+  if config.fragment_target_size == 0 {
+    return Err(VectorStoreError::Invariant(
+      "manifest fragment_target_size must be nonzero".into(),
+    ));
+  }
+  Ok(())
+}
+
+/// An id no fragment in the manifest uses. Compaction removes fragments, so
+/// the fragment count is not a free id.
+pub(crate) fn next_fragment_id(manifest: &VectorManifest) -> usize {
+  manifest
+    .fragments
+    .iter()
+    .map(|fragment| fragment.id + 1)
+    .max()
+    .unwrap_or(0)
+}
+
+/// Appends `vector` to `fragment`, growing its row groups and deletion
+/// bitmap, and returns the vector's local index.
+pub(crate) fn fragment_append(
+  fragment: &mut Fragment,
+  vector: &[f32],
+  row_group_size: usize,
+  dimensions: usize,
+) -> usize {
+  let row_group_idx = ensure_row_group(fragment, row_group_size, dimensions);
+  let local_row_idx = fragment.row_groups[row_group_idx].append(vector);
+  let local_index = row_group_idx * row_group_size + local_row_idx;
+  extend_deletion_bitmap(fragment, local_index);
+  fragment.total_vectors += 1;
+  local_index
+}
+
+/// O(1) fragment lookup by id, for loops over many vectors.
+pub(crate) enum FragmentLookup<'a> {
+  /// Every fragment's id equals its position (no compaction has run).
+  Dense(&'a [Fragment]),
+  Sparse(HashMap<usize, &'a Fragment>),
+}
+
+impl<'a> FragmentLookup<'a> {
+  pub(crate) fn new(manifest: &'a VectorManifest) -> Self {
+    let fragments = manifest.fragments.as_slice();
+    if fragments
+      .iter()
+      .enumerate()
+      .all(|(position, fragment)| fragment.id == position)
+    {
+      FragmentLookup::Dense(fragments)
+    } else {
+      FragmentLookup::Sparse(fragments.iter().map(|f| (f.id, f)).collect())
+    }
+  }
+
+  #[inline]
+  pub(crate) fn get(&self, fragment_id: usize) -> Option<&'a Fragment> {
+    match self {
+      FragmentLookup::Dense(fragments) => fragments.get(fragment_id),
+      FragmentLookup::Sparse(map) => map.get(&fragment_id).copied(),
+    }
+  }
+
+  /// Live vector data at `location`, or None if it is deleted or outside the
+  /// fragment. The manifest must have passed `validate_manifest_layout`.
+  #[inline]
+  pub(crate) fn vector(
+    &self,
+    config: &VectorStoreConfig,
+    location: &VectorLocation,
+  ) -> Option<&'a [f32]> {
+    let fragment = self.get(location.fragment_id)?;
+    if fragment.is_deleted(location.local_index) {
+      return None;
+    }
+    let row_group = fragment
+      .row_groups
+      .get(location.local_index / config.row_group_size)?;
+    row_group.get(
+      location.local_index % config.row_group_size,
+      config.dimensions,
+    )
+  }
+}
+
 // ============================================================================
 // Helper Functions
 // ============================================================================
@@ -630,13 +712,19 @@ fn ensure_active_fragment(manifest: &mut VectorManifest) {
     .unwrap_or(true);
 
   if needs_new {
-    let new_id = manifest.fragments.len();
-    manifest.fragments.push(Fragment::new(new_id));
-    manifest.active_fragment_id = new_id;
+    start_active_fragment(manifest);
   }
 }
 
+/// Adds an empty active fragment under a fresh id and makes it the target.
+fn start_active_fragment(manifest: &mut VectorManifest) {
+  let new_id = next_fragment_id(manifest);
+  manifest.fragments.push(Fragment::new(new_id));
+  manifest.active_fragment_id = new_id;
+}
+
 fn validate_insert(manifest: &VectorManifest, vector: &[f32]) -> Result<(), VectorStoreError> {
+  validate_store_config(&manifest.config)?;
   let dimensions = manifest.config.dimensions;
   if vector.len() != dimensions {
     return Err(VectorStoreError::DimensionMismatch {
@@ -682,22 +770,9 @@ fn append_to_fragment(
 ) -> (usize, usize) {
   let row_group_size = manifest.config.row_group_size;
   let dimensions = manifest.config.dimensions;
-  let fragment_id = manifest.fragments[fragment_idx].id;
-
-  let row_group_idx = ensure_row_group(
-    &mut manifest.fragments[fragment_idx],
-    row_group_size,
-    dimensions,
-  );
-
   let fragment = &mut manifest.fragments[fragment_idx];
-  let local_row_idx = fragment.row_groups[row_group_idx].append(vec_data);
-  let local_index = row_group_idx * row_group_size + local_row_idx;
-
-  extend_deletion_bitmap(fragment, local_index);
-  fragment.total_vectors += 1;
-
-  (fragment_id, local_index)
+  let local_index = fragment_append(fragment, vec_data, row_group_size, dimensions);
+  (fragment.id, local_index)
 }
 
 fn ensure_row_group(fragment: &mut Fragment, row_group_size: usize, dimensions: usize) -> usize {
@@ -752,9 +827,7 @@ fn maybe_seal_fragment(manifest: &mut VectorManifest, fragment_idx: usize) {
   let fragment = &mut manifest.fragments[fragment_idx];
   if fragment.total_vectors >= fragment_target_size {
     fragment.seal();
-    let new_id = manifest.fragments.len();
-    manifest.fragments.push(Fragment::new(new_id));
-    manifest.active_fragment_id = new_id;
+    start_active_fragment(manifest);
   }
 }
 

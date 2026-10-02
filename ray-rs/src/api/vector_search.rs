@@ -4,12 +4,15 @@
 //!
 //! Ported from src/api/vector-search.ts
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::cache::lru::LruCache;
 use crate::types::NodeId;
-use crate::vector::store::validate_vector;
+use crate::vector::distance::with_metric_distance;
+use crate::vector::store::{validate_vector, FragmentLookup};
+use crate::vector::top_k::TopK;
 use crate::vector::{
   create_vector_store, vector_store_clear, vector_store_delete, vector_store_insert,
   vector_store_node_vector, vector_store_stats, DistanceMetric, IvfConfig, IvfError, IvfIndex,
@@ -27,6 +30,11 @@ const MIN_CLUSTERS: usize = 16;
 const MAX_CLUSTERS: usize = 1024;
 const DEFAULT_PQ_SUBSPACES: usize = 48;
 const DEFAULT_PQ_CENTROIDS: usize = 256;
+/// The ANN index is rebuilt once the live vector count reaches this multiple
+/// of the count it was trained on: its cluster count and centroids were
+/// sized for the smaller corpus, and probing a fixed number of ever larger
+/// lists approaches a full scan.
+const RETRAIN_GROWTH_FACTOR: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AnnAlgorithm {
@@ -352,6 +360,8 @@ pub struct VectorIndex {
   options: VectorIndexOptions,
   /// Whether the index needs training
   needs_training: bool,
+  /// Live vector count when the ANN index was last trained
+  trained_live_count: usize,
   /// Whether index build is in progress
   is_building: bool,
 }
@@ -374,6 +384,7 @@ impl VectorIndex {
       cached_node_ids: HashMap::new(),
       options,
       needs_training: true,
+      trained_live_count: 0,
       is_building: false,
     }
   }
@@ -433,6 +444,14 @@ impl VectorIndex {
             self.needs_training = true;
             return Err(err);
           }
+        }
+        // Retrain on the next search once the corpus has outgrown the index.
+        let retrain_at = self
+          .trained_live_count
+          .max(1)
+          .saturating_mul(RETRAIN_GROWTH_FACTOR);
+        if self.manifest.live_count() >= retrain_at {
+          self.needs_training = true;
         }
       } else {
         self.needs_training = true;
@@ -500,8 +519,7 @@ impl VectorIndex {
 
   fn build_index_internal(&mut self) -> Result<(), VectorIndexError> {
     let dimensions = self.options.dimensions;
-    let stats = vector_store_stats(&self.manifest);
-    let live_vectors = stats.live_vectors;
+    let live_vectors = self.manifest.live_count();
 
     if live_vectors < self.options.training_threshold {
       // Not enough vectors for index - will use brute force search
@@ -516,36 +534,31 @@ impl VectorIndex {
       sqrt_n.clamp(MIN_CLUSTERS, MAX_CLUSTERS)
     });
 
-    // Collect training vectors
+    // One contiguous copy of the live vectors: the training input (the index
+    // trains on it in place, sampling as needed) and the insert source.
+    let fragments = FragmentLookup::new(&self.manifest);
     let mut training_data = Vec::with_capacity(live_vectors * dimensions);
     let mut vector_ids = Vec::with_capacity(live_vectors);
-
-    for (&node_id, &vector_id) in &self.manifest.node_to_vector {
-      if let Some(vector) = vector_store_node_vector(&self.manifest, node_id) {
+    for (&vector_id, location) in &self.manifest.vector_locations {
+      if let Some(vector) = fragments.vector(&self.manifest.config, location) {
         training_data.extend_from_slice(vector);
         vector_ids.push(vector_id);
       }
     }
+    let unit_vectors = self.manifest.config.normalize_on_insert;
 
     // Create and train the configured ANN index.
-    self.index = Some(match self.options.ann_algorithm {
+    let built = match self.options.ann_algorithm {
       AnnAlgorithm::Ivf => {
         let ivf_config = IvfConfig::new(n_clusters)
           .with_n_probe(self.options.n_probe)
           .with_metric(self.options.metric);
         let mut index = IvfIndex::new(dimensions, ivf_config);
-
         index
-          .add_training_vectors(&training_data, vector_ids.len())
+          .train_from(&training_data, vector_ids.len(), unit_vectors)
           .map_err(|e| VectorIndexError::TrainingError(e.to_string()))?;
 
-        index
-          .train()
-          .map_err(|e| VectorIndexError::TrainingError(e.to_string()))?;
-
-        for (i, &vector_id) in vector_ids.iter().enumerate() {
-          let offset = i * dimensions;
-          let vector = &training_data[offset..offset + dimensions];
+        for (vector, &vector_id) in training_data.chunks_exact(dimensions).zip(&vector_ids) {
           if let Err(err) = index.insert(vector_id, vector) {
             self.index = None;
             self.needs_training = true;
@@ -566,15 +579,11 @@ impl VectorIndex {
           .with_residuals(self.options.pq_residuals);
         let mut index =
           IvfPqIndex::new(dimensions, ivf_pq_config).map_err(ivf_pq_error_to_index_error)?;
-
         index
-          .add_training_vectors(&training_data, vector_ids.len())
+          .train_from(&training_data, vector_ids.len(), unit_vectors)
           .map_err(ivf_pq_error_to_index_error)?;
-        index.train().map_err(ivf_pq_error_to_index_error)?;
 
-        for (i, &vector_id) in vector_ids.iter().enumerate() {
-          let offset = i * dimensions;
-          let vector = &training_data[offset..offset + dimensions];
+        for (vector, &vector_id) in training_data.chunks_exact(dimensions).zip(&vector_ids) {
           if let Err(err) = index.insert(vector_id, vector) {
             self.index = None;
             self.needs_training = true;
@@ -583,8 +592,10 @@ impl VectorIndex {
         }
         BuiltIndex::IvfPq(index)
       }
-    });
+    };
+    self.index = Some(built);
     self.needs_training = false;
+    self.trained_live_count = vector_ids.len();
 
     Ok(())
   }
@@ -659,10 +670,10 @@ impl VectorIndex {
           }
         }
       } else {
-        self.brute_force_search_filtered(query, k, threshold, filter.as_ref())
+        self.brute_force_search(query, k, threshold, filter.as_ref())
       }
     } else {
-      self.brute_force_search_filtered(query, k, threshold, filter.as_ref())
+      self.brute_force_search(query, k, threshold, filter.as_ref())
     };
 
     Ok(
@@ -678,117 +689,73 @@ impl VectorIndex {
     )
   }
 
-  /// Brute force search (fallback when index not available)
-  fn brute_force_search(&self, query: &[f32], k: usize) -> Vec<VectorSearchResult> {
-    use crate::vector::normalize;
-
-    let metric = self.options.metric;
-    let distance_fn = self.stored_distance_fn();
-
-    // Normalize query for cosine similarity
-    let query_normalized: Vec<f32>;
-    let query_for_search = if metric == DistanceMetric::Cosine {
-      query_normalized = normalize(query);
-      &query_normalized
-    } else {
-      query
-    };
-
-    let mut candidates: Vec<VectorSearchResult> = Vec::new();
-
-    for (&node_id, &vector_id) in &self.manifest.node_to_vector {
-      if let Some(vector) = vector_store_node_vector(&self.manifest, node_id) {
-        let distance = distance_fn(query_for_search, vector);
-
-        let similarity = metric.distance_to_similarity(distance);
-
-        candidates.push(VectorSearchResult {
-          vector_id,
-          node_id,
-          distance,
-          similarity,
-        });
-      }
-    }
-
-    // Sort by distance and return top k
-    candidates.sort_by(|a, b| {
-      a.distance
-        .partial_cmp(&b.distance)
-        .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    candidates.truncate(k);
-    candidates
-  }
-
-  fn brute_force_search_filtered(
+  /// Exact search over every live vector (when no ANN index is trained).
+  ///
+  /// Keeps a bounded top-k, so it never sorts the whole store; NaN distances
+  /// are skipped. Without a filter, a vector's node is looked up only when
+  /// its distance would enter the top-k.
+  fn brute_force_search(
     &self,
     query: &[f32],
     k: usize,
     threshold: Option<f32>,
     filter: Option<&Arc<dyn Fn(NodeId) -> bool + Send + Sync>>,
   ) -> Vec<VectorSearchResult> {
-    if threshold.is_none() && filter.is_none() {
-      return self.brute_force_search(query, k);
-    }
-
-    use crate::vector::normalize;
-
     let metric = self.options.metric;
-    let distance_fn = self.stored_distance_fn();
-
-    let query_normalized: Vec<f32>;
-    let query_for_search = if metric == DistanceMetric::Cosine {
-      query_normalized = normalize(query);
-      &query_normalized
+    let manifest = &self.manifest;
+    let query: Cow<'_, [f32]> = if metric == DistanceMetric::Cosine {
+      Cow::Owned(crate::vector::normalize(query))
     } else {
-      query
+      Cow::Borrowed(query)
     };
+    let fragments = FragmentLookup::new(manifest);
+    let mut top: TopK<(u64, NodeId)> = TopK::new(k);
 
-    let mut candidates: Vec<VectorSearchResult> = Vec::new();
-
-    for (&node_id, &vector_id) in &self.manifest.node_to_vector {
-      if let Some(filter) = filter {
-        if !filter(node_id) {
-          continue;
-        }
-      }
-
-      if let Some(vector) = vector_store_node_vector(&self.manifest, node_id) {
-        let distance = distance_fn(query_for_search, vector);
-
-        let similarity = metric.distance_to_similarity(distance);
-        if let Some(threshold) = threshold {
-          if similarity < threshold {
+    with_metric_distance!(
+      metric,
+      stored_normalized = manifest.config.normalize_on_insert,
+      |dist| {
+        for (&vector_id, location) in &manifest.vector_locations {
+          let filtered_node = match filter {
+            Some(filter) => match manifest.vector_to_node.get(&vector_id) {
+              Some(&node_id) if filter(node_id) => Some(node_id),
+              _ => continue,
+            },
+            None => None,
+          };
+          let Some(vector) = fragments.vector(&manifest.config, location) else {
+            continue;
+          };
+          let distance = dist(&query, vector);
+          if !top.admits(distance) {
             continue;
           }
+          if threshold.is_some_and(|threshold| metric.distance_to_similarity(distance) < threshold)
+          {
+            continue;
+          }
+          let node_id = match filtered_node {
+            Some(node_id) => node_id,
+            None => match manifest.vector_to_node.get(&vector_id) {
+              Some(&node_id) => node_id,
+              None => continue,
+            },
+          };
+          top.push((vector_id, node_id), distance);
         }
-
-        candidates.push(VectorSearchResult {
-          vector_id,
-          node_id,
-          distance,
-          similarity,
-        });
       }
-    }
+    );
 
-    candidates.sort_by(|a, b| {
-      a.distance
-        .partial_cmp(&b.distance)
-        .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    candidates.truncate(k);
-    candidates
-  }
-
-  /// Exact distance from a prepared query to a stored vector. Cosine divides
-  /// out the stored norm when the store keeps raw vectors.
-  fn stored_distance_fn(&self) -> fn(&[f32], &[f32]) -> f32 {
-    self
-      .options
-      .metric
-      .stored_distance_fn(self.manifest.config.normalize_on_insert)
+    top
+      .into_sorted_vec()
+      .into_iter()
+      .map(|((vector_id, node_id), distance)| VectorSearchResult {
+        vector_id,
+        node_id,
+        distance,
+        similarity: metric.distance_to_similarity(distance),
+      })
+      .collect()
   }
 
   /// Get index statistics
@@ -906,14 +873,27 @@ fn ivf_pq_error_to_index_error(err: IvfPqError) -> VectorIndexError {
   }
 }
 
+/// PQ subspace count for `dimensions`: the largest divisor of `dimensions`
+/// up to the requested count.
+///
+/// When that divisor is degenerate (under a quarter of the request, as for a
+/// prime dimension, where it is 1), each subspace would span so many
+/// dimensions that one byte per subspace cannot rank vectors inside a list,
+/// and recall collapses. Then the smallest divisor above the request is used
+/// instead (for a prime dimension, one dimension per subspace).
 fn resolve_pq_subspaces(requested: usize, dimensions: usize) -> usize {
-  let capped = requested.max(1).min(dimensions.max(1));
-  for candidate in (1..=capped).rev() {
-    if dimensions.is_multiple_of(candidate) {
-      return candidate;
-    }
+  let dimensions = dimensions.max(1);
+  let target = requested.clamp(1, dimensions);
+  let below = (1..=target)
+    .rev()
+    .find(|&c| dimensions.is_multiple_of(c))
+    .unwrap_or(1);
+  if below.saturating_mul(4) >= target {
+    return below;
   }
-  1
+  (target..=dimensions)
+    .find(|&c| dimensions.is_multiple_of(c))
+    .unwrap_or(dimensions)
 }
 
 // ============================================================================
@@ -1205,6 +1185,26 @@ mod tests {
     assert!(!is_valid_vector(&[1.0, f32::NAN, 3.0]));
     assert!(!is_valid_vector(&[1.0, f32::INFINITY, 3.0]));
     assert!(!is_valid_vector(&[f32::NEG_INFINITY, 2.0, 3.0]));
+  }
+
+  #[test]
+  fn test_resolve_pq_subspaces() {
+    // Common embedding sizes keep the largest divisor up to the request.
+    assert_eq!(resolve_pq_subspaces(48, 384), 48);
+    assert_eq!(resolve_pq_subspaces(48, 768), 48);
+    assert_eq!(resolve_pq_subspaces(48, 1024), 32);
+    assert_eq!(resolve_pq_subspaces(48, 100), 25);
+    assert_eq!(resolve_pq_subspaces(48, 128), 32);
+    assert_eq!(resolve_pq_subspaces(48, 8), 8);
+    // Degenerate divisors move above the request.
+    assert_eq!(resolve_pq_subspaces(48, 97), 97);
+    assert_eq!(resolve_pq_subspaces(48, 194), 97);
+    assert_eq!(resolve_pq_subspaces(48, 53), 53);
+    assert_eq!(resolve_pq_subspaces(16, 7 * 11), 11);
+    // Never more subspaces than dimensions; zero inputs stay usable.
+    assert_eq!(resolve_pq_subspaces(48, 5), 5);
+    assert_eq!(resolve_pq_subspaces(0, 12), 1);
+    assert_eq!(resolve_pq_subspaces(48, 0), 1);
   }
 
   #[test]

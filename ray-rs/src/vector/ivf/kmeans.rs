@@ -1,9 +1,12 @@
 //! K-means clustering for IVF index training
 //!
-//! Implements k-means++ initialization and Lloyd's algorithm.
-//! Includes parallel versions using rayon for multi-core speedup.
+//! Implements k-means++ initialization and Lloyd's algorithm. The parallel
+//! entry point uses rayon for the initialization passes, the assignment step
+//! and the centroid update.
 //!
 //! Ported from src/vector/ivf-index.ts (training portion)
+
+use std::borrow::Cow;
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -76,7 +79,7 @@ pub struct KMeansResult {
   pub centroids: Vec<f32>,
   /// Cluster assignments for each vector
   pub assignments: Vec<u32>,
-  /// Final inertia (sum of squared distances to centroids)
+  /// Final inertia (sum of distances to the assigned centroids)
   pub inertia: f32,
   /// Number of iterations performed
   pub iterations: usize,
@@ -85,8 +88,45 @@ pub struct KMeansResult {
 }
 
 // ============================================================================
+// Training Input
+// ============================================================================
+
+/// k-means quality stops improving at around this many training points per
+/// cluster (FAISS uses the same cap); more points only cost build time.
+pub(crate) const MAX_TRAINING_POINTS_PER_CLUSTER: usize = 256;
+
+const TRAINING_SAMPLE_SEED: u64 = 0x6b6d_6561_6e73_5f31;
+
+/// At most `max_points` of the `n` vectors in `vectors`, drawn without
+/// replacement and kept in their original order. The seed is fixed, so a
+/// rebuild over the same data trains on the same sample. Borrows `vectors`
+/// when no sampling is needed.
+pub(crate) fn training_sample(
+  vectors: &[f32],
+  n: usize,
+  dimensions: usize,
+  max_points: usize,
+) -> (Cow<'_, [f32]>, usize) {
+  if n <= max_points {
+    return (Cow::Borrowed(&vectors[..n * dimensions]), n);
+  }
+  let mut rng = StdRng::seed_from_u64(TRAINING_SAMPLE_SEED ^ n as u64);
+  let mut picked = rand::seq::index::sample(&mut rng, n, max_points).into_vec();
+  picked.sort_unstable();
+  let mut sample = Vec::with_capacity(max_points * dimensions);
+  for index in picked {
+    let offset = index * dimensions;
+    sample.extend_from_slice(&vectors[offset..offset + dimensions]);
+  }
+  (Cow::Owned(sample), max_points)
+}
+
+// ============================================================================
 // K-Means Algorithm
 // ============================================================================
+
+/// Minimum vectors per thread for parallelization to be beneficial
+const MIN_VECTORS_PER_THREAD: usize = 1000;
 
 /// Run k-means clustering on vectors
 ///
@@ -95,37 +135,96 @@ pub struct KMeansResult {
 /// * `n` - Number of vectors
 /// * `dimensions` - Number of dimensions per vector
 /// * `config` - K-means configuration
-/// * `distance_fn` - Distance function to use
+/// * `distance_fn` - Distance function to use. Passing a function item (for
+///   example `squared_euclidean`) rather than a `fn` pointer lets the hot
+///   loops inline it.
 ///
 /// # Returns
 /// K-means result with centroids and assignments
-pub fn kmeans(
+///
+/// # Errors
+/// Returns an error if `n_clusters` or `dimensions` is zero, if there are
+/// fewer vectors than clusters, or if `vectors` is not `n * dimensions` long.
+pub fn kmeans<D>(
   vectors: &[f32],
   n: usize,
   dimensions: usize,
   config: &KMeansConfig,
-  distance_fn: fn(&[f32], &[f32]) -> f32,
-) -> Result<KMeansResult, KMeansError> {
+  distance_fn: D,
+) -> Result<KMeansResult, KMeansError>
+where
+  D: Fn(&[f32], &[f32]) -> f32 + Sync,
+{
+  run_kmeans(vectors, n, dimensions, config, &distance_fn, false)
+}
+
+/// Run parallel k-means clustering on vectors
+///
+/// Uses rayon for the k-means++ passes, the assignment step and the centroid
+/// update. Runs sequentially for small datasets, where parallelization
+/// overhead would outweigh the benefits. Arguments, result and errors are as
+/// for [`kmeans`].
+pub fn kmeans_parallel<D>(
+  vectors: &[f32],
+  n: usize,
+  dimensions: usize,
+  config: &KMeansConfig,
+  distance_fn: D,
+) -> Result<KMeansResult, KMeansError>
+where
+  D: Fn(&[f32], &[f32]) -> f32 + Sync,
+{
+  let parallel = n >= MIN_VECTORS_PER_THREAD * 2;
+  run_kmeans(vectors, n, dimensions, config, &distance_fn, parallel)
+}
+
+fn run_kmeans<D>(
+  vectors: &[f32],
+  n: usize,
+  dimensions: usize,
+  config: &KMeansConfig,
+  distance_fn: &D,
+  parallel: bool,
+) -> Result<KMeansResult, KMeansError>
+where
+  D: Fn(&[f32], &[f32]) -> f32 + Sync,
+{
+  if config.n_clusters == 0 {
+    return Err(KMeansError::InvalidInput(
+      "n_clusters must be nonzero".into(),
+    ));
+  }
+  if dimensions == 0 {
+    return Err(KMeansError::InvalidInput(
+      "dimensions must be nonzero".into(),
+    ));
+  }
   if n < config.n_clusters {
     return Err(KMeansError::NotEnoughVectors {
       n,
       k: config.n_clusters,
     });
   }
-
-  if vectors.len() != n * dimensions {
+  let expected = n.checked_mul(dimensions);
+  if expected != Some(vectors.len()) {
     return Err(KMeansError::DimensionMismatch {
-      expected: n * dimensions,
+      expected: expected.unwrap_or(usize::MAX),
       got: vectors.len(),
     });
   }
 
   let k = config.n_clusters;
+  let mut centroids = kmeans_plus_plus_init(
+    vectors,
+    n,
+    dimensions,
+    k,
+    distance_fn,
+    config.seed,
+    parallel,
+  );
 
-  // Initialize centroids using k-means++
-  let mut centroids = kmeans_plus_plus_init(vectors, n, dimensions, k, distance_fn, config.seed);
-
-  // Run Lloyd's algorithm
+  // Lloyd's algorithm
   let mut assignments = vec![0u32; n];
   let mut prev_inertia = f32::INFINITY;
   let mut iterations = 0;
@@ -134,18 +233,15 @@ pub fn kmeans(
   for iter in 0..config.max_iterations {
     iterations = iter + 1;
 
-    // Assign vectors to nearest centroids
     let inertia = assign_to_centroids(
       vectors,
-      n,
       dimensions,
       &centroids,
-      k,
       &mut assignments,
       distance_fn,
+      parallel,
     );
 
-    // Check for convergence
     let inertia_change = (prev_inertia - inertia).abs() / inertia.max(1.0);
     if inertia_change < config.tolerance {
       converged = true;
@@ -153,19 +249,24 @@ pub fn kmeans(
     }
     prev_inertia = inertia;
 
-    // Update centroids
-    update_centroids(vectors, n, dimensions, &assignments, k, &mut centroids);
+    update_centroids(
+      vectors,
+      dimensions,
+      &assignments,
+      k,
+      &mut centroids,
+      parallel,
+    );
   }
 
   // Final assignment pass
   let inertia = assign_to_centroids(
     vectors,
-    n,
     dimensions,
     &centroids,
-    k,
     &mut assignments,
     distance_fn,
+    parallel,
   );
 
   Ok(KMeansResult {
@@ -177,566 +278,230 @@ pub fn kmeans(
   })
 }
 
-/// K-means++ initialization for better starting positions
-fn kmeans_plus_plus_init(
+/// Index and distance of the centroid nearest to `vector`. Ties keep the
+/// lowest index; NaN distances never win.
+#[inline]
+pub(crate) fn nearest_centroid<D>(
+  vector: &[f32],
+  centroids: &[f32],
+  dimensions: usize,
+  distance_fn: &D,
+) -> (usize, f32)
+where
+  D: Fn(&[f32], &[f32]) -> f32,
+{
+  let mut best_cluster = 0;
+  let mut best_dist = f32::INFINITY;
+  for (cluster, centroid) in centroids.chunks_exact(dimensions).enumerate() {
+    let dist = distance_fn(vector, centroid);
+    if dist < best_dist {
+      best_dist = dist;
+      best_cluster = cluster;
+    }
+  }
+  (best_cluster, best_dist)
+}
+
+/// K-means++ initialization: each next centroid is a vector drawn with
+/// probability proportional to its squared distance to the nearest centroid
+/// so far. The distance passes run in parallel when `parallel` is set; the
+/// draw stays sequential, so a seeded run picks the same centroids either
+/// way.
+fn kmeans_plus_plus_init<D>(
   vectors: &[f32],
   n: usize,
   dimensions: usize,
   k: usize,
-  distance_fn: fn(&[f32], &[f32]) -> f32,
+  distance_fn: &D,
   seed: Option<u64>,
-) -> Vec<f32> {
+  parallel: bool,
+) -> Vec<f32>
+where
+  D: Fn(&[f32], &[f32]) -> f32 + Sync,
+{
   let mut rng: StdRng = match seed {
     Some(s) => StdRng::seed_from_u64(s),
     None => StdRng::from_entropy(),
   };
 
   let mut centroids = Vec::with_capacity(k * dimensions);
-
-  // First centroid: random vector
-  let first_idx = rng.gen_range(0..n);
-  let first_offset = first_idx * dimensions;
+  let first_offset = rng.gen_range(0..n) * dimensions;
   centroids.extend_from_slice(&vectors[first_offset..first_offset + dimensions]);
 
-  // Remaining centroids: weighted by distance squared
   let mut min_dists = vec![f32::INFINITY; n];
-
   for c in 1..k {
-    // Update min distances to nearest centroid
-    let prev_cent_offset = (c - 1) * dimensions;
-    let prev_centroid = &centroids[prev_cent_offset..prev_cent_offset + dimensions];
-
-    let mut total_dist = 0.0;
-    for (i, min_dist) in min_dists.iter_mut().enumerate().take(n) {
-      let vec_offset = i * dimensions;
-      let vec = &vectors[vec_offset..vec_offset + dimensions];
-      let dist = distance_fn(vec, prev_centroid);
-      // Use abs(dist)^2 for k-means++ (handles negative distances like dot product)
-      let abs_dist = dist.abs();
-      *min_dist = (*min_dist).min(abs_dist * abs_dist);
-      total_dist += *min_dist;
-    }
-
-    // Weighted random selection
-    let mut r = rng.gen::<f32>() * total_dist;
-    let mut selected_idx = 0;
-
-    for (i, dist) in min_dists.iter().enumerate().take(n) {
-      r -= *dist;
-      if r <= 0.0 {
-        selected_idx = i;
-        break;
-      }
-    }
-
-    // Copy selected vector to centroids
-    let selected_offset = selected_idx * dimensions;
+    let latest = &centroids[(c - 1) * dimensions..c * dimensions];
+    update_min_distances(
+      vectors,
+      dimensions,
+      latest,
+      &mut min_dists,
+      distance_fn,
+      parallel,
+    );
+    let selected_offset = weighted_pick(&min_dists, &mut rng) * dimensions;
     centroids.extend_from_slice(&vectors[selected_offset..selected_offset + dimensions]);
   }
 
   centroids
 }
 
-/// Assign vectors to nearest centroids
-/// Returns total inertia (sum of squared distances)
-fn assign_to_centroids(
+/// Lowers each `min_dists[i]` to the squared distance from vector `i` to
+/// `centroid`. Uses `|distance|^2`, so negative distances (dot product) work.
+fn update_min_distances<D>(
   vectors: &[f32],
-  n: usize,
   dimensions: usize,
-  centroids: &[f32],
-  k: usize,
-  assignments: &mut [u32],
-  distance_fn: fn(&[f32], &[f32]) -> f32,
-) -> f32 {
-  let mut inertia = 0.0;
-
-  for (i, assignment) in assignments.iter_mut().enumerate().take(n) {
-    let vec_offset = i * dimensions;
-    let vec = &vectors[vec_offset..vec_offset + dimensions];
-
-    let mut best_cluster = 0;
-    let mut best_dist = f32::INFINITY;
-
-    for c in 0..k {
-      let cent_offset = c * dimensions;
-      let centroid = &centroids[cent_offset..cent_offset + dimensions];
-      let dist = distance_fn(vec, centroid);
-
-      if dist < best_dist {
-        best_dist = dist;
-        best_cluster = c;
-      }
+  centroid: &[f32],
+  min_dists: &mut [f32],
+  distance_fn: &D,
+  parallel: bool,
+) where
+  D: Fn(&[f32], &[f32]) -> f32 + Sync,
+{
+  let update = |(vector, min_dist): (&[f32], &mut f32)| {
+    let dist = distance_fn(vector, centroid).abs();
+    let squared = dist * dist;
+    if squared < *min_dist {
+      *min_dist = squared;
     }
-
-    *assignment = best_cluster as u32;
-    inertia += best_dist;
+  };
+  #[cfg(not(target_arch = "wasm32"))]
+  if parallel {
+    vectors
+      .par_chunks_exact(dimensions)
+      .zip(min_dists.par_iter_mut())
+      .with_min_len(MIN_VECTORS_PER_THREAD)
+      .for_each(update);
+    return;
   }
-
-  inertia
+  let _ = parallel;
+  vectors
+    .chunks_exact(dimensions)
+    .zip(min_dists.iter_mut())
+    .for_each(update);
 }
 
-/// Update centroids based on current assignments
+/// Index drawn with probability proportional to `weights[i]`. Falls back to
+/// a uniform draw when the weights carry no information (all zero, or not
+/// finite).
+fn weighted_pick(weights: &[f32], rng: &mut StdRng) -> usize {
+  let total: f64 = weights.iter().map(|&w| f64::from(w)).sum();
+  if !total.is_finite() || total <= 0.0 {
+    return rng.gen_range(0..weights.len());
+  }
+  let mut r = rng.gen::<f64>() * total;
+  for (i, &weight) in weights.iter().enumerate() {
+    r -= f64::from(weight);
+    if r <= 0.0 {
+      return i;
+    }
+  }
+  // Rounding left a sliver of `r`: take the last vector that has weight.
+  weights.iter().rposition(|&w| w > 0.0).unwrap_or(0)
+}
+
+/// Assigns every vector to its nearest centroid and returns the inertia (the
+/// sum of the distances to the assigned centroids).
+pub(crate) fn assign_to_centroids<D>(
+  vectors: &[f32],
+  dimensions: usize,
+  centroids: &[f32],
+  assignments: &mut [u32],
+  distance_fn: &D,
+  parallel: bool,
+) -> f32
+where
+  D: Fn(&[f32], &[f32]) -> f32 + Sync,
+{
+  let assign = |(vector, assignment): (&[f32], &mut u32)| {
+    let (cluster, dist) = nearest_centroid(vector, centroids, dimensions, distance_fn);
+    *assignment = cluster as u32;
+    f64::from(dist)
+  };
+  #[cfg(not(target_arch = "wasm32"))]
+  if parallel {
+    return vectors
+      .par_chunks_exact(dimensions)
+      .zip(assignments.par_iter_mut())
+      .with_min_len(MIN_VECTORS_PER_THREAD / 4)
+      .map(assign)
+      .sum::<f64>() as f32;
+  }
+  let _ = parallel;
+  vectors
+    .chunks_exact(dimensions)
+    .zip(assignments.iter_mut())
+    .map(assign)
+    .sum::<f64>() as f32
+}
+
+/// Moves each centroid to the mean of its assigned vectors. A centroid with
+/// no vectors keeps its position.
 fn update_centroids(
   vectors: &[f32],
-  n: usize,
   dimensions: usize,
   assignments: &[u32],
   k: usize,
   centroids: &mut [f32],
+  parallel: bool,
 ) {
-  // Compute cluster sums and counts
-  let mut cluster_sums = vec![0.0f32; k * dimensions];
-  let mut cluster_counts = vec![0u32; k];
-
-  for (i, &cluster_id) in assignments.iter().enumerate().take(n) {
-    let cluster = cluster_id as usize;
-    let vec_offset = i * dimensions;
-    let sum_offset = cluster * dimensions;
-
-    for d in 0..dimensions {
-      cluster_sums[sum_offset + d] += vectors[vec_offset + d];
+  let accumulate = |(mut sums, mut counts): (Vec<f32>, Vec<u32>),
+                    (vector, &cluster): (&[f32], &u32)| {
+    let offset = cluster as usize * dimensions;
+    for (sum, &x) in sums[offset..offset + dimensions].iter_mut().zip(vector) {
+      *sum += x;
     }
-    cluster_counts[cluster] += 1;
-  }
+    counts[cluster as usize] += 1;
+    (sums, counts)
+  };
+  let empty = || (vec![0.0f32; k * dimensions], vec![0u32; k]);
 
-  // Update centroids
-  for (c, &count) in cluster_counts.iter().enumerate().take(k) {
-    if count == 0 {
-      // Keep existing centroid (shouldn't happen with k-means++)
-      continue;
-    }
-
-    let offset = c * dimensions;
-    for d in 0..dimensions {
-      centroids[offset + d] = cluster_sums[offset + d] / count as f32;
-    }
-  }
-}
-
-/// Reinitialize empty clusters with random vectors
-#[allow(dead_code)]
-fn reinitialize_empty_clusters(
-  vectors: &[f32],
-  n: usize,
-  dimensions: usize,
-  cluster_counts: &[u32],
-  centroids: &mut [f32],
-) {
-  let mut rng = rand::thread_rng();
-
-  for (c, &count) in cluster_counts.iter().enumerate() {
-    if count == 0 {
-      let rand_idx = rng.gen_range(0..n);
-      let rand_offset = rand_idx * dimensions;
-      let cent_offset = c * dimensions;
-
-      centroids[cent_offset..cent_offset + dimensions]
-        .copy_from_slice(&vectors[rand_offset..rand_offset + dimensions]);
-    }
-  }
-}
-
-// ============================================================================
-// Parallel K-Means Algorithm
-// ============================================================================
-
-/// Minimum vectors per thread for parallelization to be beneficial
-const MIN_VECTORS_PER_THREAD: usize = 1000;
-
-/// Run parallel k-means clustering on vectors
-///
-/// Uses rayon for parallel assignment and centroid update steps.
-/// Falls back to sequential for small datasets where parallelization overhead
-/// would outweigh benefits.
-///
-/// # Arguments
-/// * `vectors` - Contiguous vector data (n * dimensions)
-/// * `n` - Number of vectors
-/// * `dimensions` - Number of dimensions per vector
-/// * `config` - K-means configuration
-/// * `distance_fn` - Distance function to use
-///
-/// # Returns
-/// K-means result with centroids and assignments
-pub fn kmeans_parallel(
-  vectors: &[f32],
-  n: usize,
-  dimensions: usize,
-  config: &KMeansConfig,
-  distance_fn: fn(&[f32], &[f32]) -> f32,
-) -> Result<KMeansResult, KMeansError> {
-  // Fall back to sequential for small datasets
-  if n < MIN_VECTORS_PER_THREAD * 2 {
-    return kmeans(vectors, n, dimensions, config, distance_fn);
-  }
-
-  if n < config.n_clusters {
-    return Err(KMeansError::NotEnoughVectors {
-      n,
-      k: config.n_clusters,
-    });
-  }
-
-  if vectors.len() != n * dimensions {
-    return Err(KMeansError::DimensionMismatch {
-      expected: n * dimensions,
-      got: vectors.len(),
-    });
-  }
-
-  let k = config.n_clusters;
-
-  // Initialize centroids using k-means++ (sequential, relatively fast)
-  let mut centroids = kmeans_plus_plus_init(vectors, n, dimensions, k, distance_fn, config.seed);
-
-  // Run Lloyd's algorithm with parallel steps
-  let mut assignments = vec![0u32; n];
-  let mut prev_inertia = f32::INFINITY;
-  let mut iterations = 0;
-  let mut converged = false;
-
-  for iter in 0..config.max_iterations {
-    iterations = iter + 1;
-
-    // Parallel assign vectors to nearest centroids
-    let inertia = assign_to_centroids_parallel(
-      vectors,
-      n,
-      dimensions,
-      &centroids,
-      k,
-      &mut assignments,
-      distance_fn,
-    );
-
-    // Check for convergence
-    let inertia_change = (prev_inertia - inertia).abs() / inertia.max(1.0);
-    if inertia_change < config.tolerance {
-      converged = true;
-      break;
-    }
-    prev_inertia = inertia;
-
-    // Parallel update centroids
-    update_centroids_parallel(vectors, n, dimensions, &assignments, k, &mut centroids);
-  }
-
-  // Final assignment pass
-  let inertia = assign_to_centroids_parallel(
-    vectors,
-    n,
-    dimensions,
-    &centroids,
-    k,
-    &mut assignments,
-    distance_fn,
-  );
-
-  Ok(KMeansResult {
-    centroids,
-    assignments,
-    inertia,
-    iterations,
-    converged,
-  })
-}
-
-/// Parallel assign vectors to nearest centroids
-/// Returns total inertia (sum of squared distances)
-#[cfg(not(target_arch = "wasm32"))]
-fn assign_to_centroids_parallel(
-  vectors: &[f32],
-  n: usize,
-  dimensions: usize,
-  centroids: &[f32],
-  k: usize,
-  assignments: &mut [u32],
-  distance_fn: fn(&[f32], &[f32]) -> f32,
-) -> f32 {
-  // Parallel compute assignments and total inertia without extra allocation
-  assignments
-    .par_iter_mut()
-    .enumerate()
-    .take(n)
-    .map(|(i, assignment)| {
-      let vec_offset = i * dimensions;
-      let vec = &vectors[vec_offset..vec_offset + dimensions];
-
-      let mut best_cluster = 0u32;
-      let mut best_dist = f32::INFINITY;
-
-      for c in 0..k {
-        let cent_offset = c * dimensions;
-        let centroid = &centroids[cent_offset..cent_offset + dimensions];
-        let dist = distance_fn(vec, centroid);
-
-        if dist < best_dist {
-          best_dist = dist;
-          best_cluster = c as u32;
-        }
-      }
-
-      *assignment = best_cluster;
-      best_dist
-    })
-    .sum()
-}
-
-#[cfg(target_arch = "wasm32")]
-fn assign_to_centroids_parallel(
-  vectors: &[f32],
-  n: usize,
-  dimensions: usize,
-  centroids: &[f32],
-  k: usize,
-  assignments: &mut [u32],
-  distance_fn: fn(&[f32], &[f32]) -> f32,
-) -> f32 {
-  let mut inertia = 0.0f32;
-  for i in 0..n {
-    let vec_offset = i * dimensions;
-    let vec = &vectors[vec_offset..vec_offset + dimensions];
-
-    let mut best_cluster = 0u32;
-    let mut best_dist = f32::INFINITY;
-
-    for c in 0..k {
-      let cent_offset = c * dimensions;
-      let centroid = &centroids[cent_offset..cent_offset + dimensions];
-      let dist = distance_fn(vec, centroid);
-
-      if dist < best_dist {
-        best_dist = dist;
-        best_cluster = c as u32;
-      }
-    }
-
-    assignments[i] = best_cluster;
-    inertia += best_dist;
-  }
-
-  inertia
-}
-
-/// Parallel update centroids based on current assignments
-#[cfg(not(target_arch = "wasm32"))]
-fn update_centroids_parallel(
-  vectors: &[f32],
-  n: usize,
-  dimensions: usize,
-  assignments: &[u32],
-  k: usize,
-  centroids: &mut [f32],
-) {
-  // Parallel compute cluster sums using thread-local accumulators
-  // Then reduce to final sums
-  let (cluster_sums, cluster_counts) = (0..n)
-    .into_par_iter()
-    .fold(
-      || (vec![0.0f32; k * dimensions], vec![0u32; k]),
-      |(mut sums, mut counts), i| {
-        let cluster = assignments[i] as usize;
-        let vec_offset = i * dimensions;
-        let sum_offset = cluster * dimensions;
-
-        for d in 0..dimensions {
-          sums[sum_offset + d] += vectors[vec_offset + d];
-        }
-        counts[cluster] += 1;
-
-        (sums, counts)
-      },
-    )
-    .reduce(
-      || (vec![0.0f32; k * dimensions], vec![0u32; k]),
-      |(mut sums1, mut counts1), (sums2, counts2)| {
-        for i in 0..sums1.len() {
-          sums1[i] += sums2[i];
-        }
-        for i in 0..counts1.len() {
-          counts1[i] += counts2[i];
-        }
-        (sums1, counts1)
-      },
-    );
-
-  // Update centroids (sequential, small work)
-  for (c, &count) in cluster_counts.iter().enumerate() {
-    if count == 0 {
-      continue;
-    }
-
-    let offset = c * dimensions;
-    for d in 0..dimensions {
-      centroids[offset + d] = cluster_sums[offset + d] / count as f32;
-    }
-  }
-}
-
-#[cfg(target_arch = "wasm32")]
-fn update_centroids_parallel(
-  vectors: &[f32],
-  n: usize,
-  dimensions: usize,
-  assignments: &[u32],
-  k: usize,
-  centroids: &mut [f32],
-) {
-  let mut cluster_sums = vec![0.0f32; k * dimensions];
-  let mut cluster_counts = vec![0u32; k];
-
-  for i in 0..n {
-    let cluster = assignments[i] as usize;
-    let vec_offset = i * dimensions;
-    let sum_offset = cluster * dimensions;
-
-    for d in 0..dimensions {
-      cluster_sums[sum_offset + d] += vectors[vec_offset + d];
-    }
-    cluster_counts[cluster] += 1;
-  }
-
-  for (c, &count) in cluster_counts.iter().enumerate() {
-    if count == 0 {
-      continue;
-    }
-
-    let offset = c * dimensions;
-    for d in 0..dimensions {
-      centroids[offset + d] = cluster_sums[offset + d] / count as f32;
-    }
-  }
-}
-
-/// Parallel k-means++ initialization
-///
-/// Note: This is partially parallel - the distance updates are parallel,
-/// but the weighted selection is sequential (inherently serial).
-#[allow(dead_code)]
-#[cfg(not(target_arch = "wasm32"))]
-fn kmeans_plus_plus_init_parallel(
-  vectors: &[f32],
-  n: usize,
-  dimensions: usize,
-  k: usize,
-  distance_fn: fn(&[f32], &[f32]) -> f32,
-  seed: Option<u64>,
-) -> Vec<f32> {
-  let mut rng: StdRng = match seed {
-    Some(s) => StdRng::seed_from_u64(s),
-    None => StdRng::from_entropy(),
+  #[cfg(not(target_arch = "wasm32"))]
+  let (sums, counts) = if parallel {
+    vectors
+      .par_chunks_exact(dimensions)
+      .zip(assignments.par_iter())
+      .with_min_len(MIN_VECTORS_PER_THREAD)
+      .fold(empty, accumulate)
+      .reduce(
+        empty,
+        |(mut sums, mut counts), (other_sums, other_counts)| {
+          for (sum, other) in sums.iter_mut().zip(other_sums) {
+            *sum += other;
+          }
+          for (count, other) in counts.iter_mut().zip(other_counts) {
+            *count += other;
+          }
+          (sums, counts)
+        },
+      )
+  } else {
+    vectors
+      .chunks_exact(dimensions)
+      .zip(assignments)
+      .fold(empty(), accumulate)
+  };
+  #[cfg(target_arch = "wasm32")]
+  let (sums, counts) = {
+    let _ = parallel;
+    vectors
+      .chunks_exact(dimensions)
+      .zip(assignments)
+      .fold(empty(), accumulate)
   };
 
-  let mut centroids = Vec::with_capacity(k * dimensions);
-
-  // First centroid: random vector
-  let first_idx = rng.gen_range(0..n);
-  let first_offset = first_idx * dimensions;
-  centroids.extend_from_slice(&vectors[first_offset..first_offset + dimensions]);
-
-  let mut min_dists = vec![f32::INFINITY; n];
-
-  for c in 1..k {
-    let prev_cent_offset = (c - 1) * dimensions;
-    let prev_centroid = &centroids[prev_cent_offset..prev_cent_offset + dimensions];
-
-    // Parallel update min distances
-    let new_dists: Vec<f32> = (0..n)
-      .into_par_iter()
-      .map(|i| {
-        let vec_offset = i * dimensions;
-        let vec = &vectors[vec_offset..vec_offset + dimensions];
-        let dist = distance_fn(vec, prev_centroid);
-        let abs_dist = dist.abs();
-        min_dists[i].min(abs_dist * abs_dist)
-      })
-      .collect();
-
-    // Update min_dists and compute total
-    let mut total_dist = 0.0f32;
-    for (i, dist) in new_dists.into_iter().enumerate() {
-      min_dists[i] = dist;
-      total_dist += dist;
+  for (c, &count) in counts.iter().enumerate() {
+    if count == 0 {
+      continue;
     }
-
-    // Weighted random selection (sequential)
-    let mut r = rng.gen::<f32>() * total_dist;
-    let mut selected_idx = 0;
-
-    for (i, dist) in min_dists.iter().enumerate().take(n) {
-      r -= *dist;
-      if r <= 0.0 {
-        selected_idx = i;
-        break;
-      }
+    let offset = c * dimensions;
+    for (centroid, &sum) in centroids[offset..offset + dimensions]
+      .iter_mut()
+      .zip(&sums[offset..offset + dimensions])
+    {
+      *centroid = sum / count as f32;
     }
-
-    let selected_offset = selected_idx * dimensions;
-    centroids.extend_from_slice(&vectors[selected_offset..selected_offset + dimensions]);
   }
-
-  centroids
-}
-
-#[allow(dead_code)]
-#[cfg(target_arch = "wasm32")]
-fn kmeans_plus_plus_init_parallel(
-  vectors: &[f32],
-  n: usize,
-  dimensions: usize,
-  k: usize,
-  distance_fn: fn(&[f32], &[f32]) -> f32,
-  seed: Option<u64>,
-) -> Vec<f32> {
-  let mut rng: StdRng = match seed {
-    Some(s) => StdRng::seed_from_u64(s),
-    None => StdRng::from_entropy(),
-  };
-
-  let mut centroids = Vec::with_capacity(k * dimensions);
-
-  let first_idx = rng.gen_range(0..n);
-  let first_offset = first_idx * dimensions;
-  centroids.extend_from_slice(&vectors[first_offset..first_offset + dimensions]);
-
-  let mut min_dists = vec![f32::INFINITY; n];
-
-  for c in 1..k {
-    let prev_cent_offset = (c - 1) * dimensions;
-    let prev_centroid = &centroids[prev_cent_offset..prev_cent_offset + dimensions];
-
-    for i in 0..n {
-      let vec_offset = i * dimensions;
-      let vec = &vectors[vec_offset..vec_offset + dimensions];
-      let dist = distance_fn(vec, prev_centroid);
-      let abs_dist = dist.abs();
-      let candidate = abs_dist * abs_dist;
-      if candidate < min_dists[i] {
-        min_dists[i] = candidate;
-      }
-    }
-
-    let mut total_dist = 0.0f32;
-    for dist in min_dists.iter().take(n) {
-      total_dist += *dist;
-    }
-
-    let mut r = rng.gen::<f32>() * total_dist;
-    let mut selected_idx = 0;
-
-    for (i, dist) in min_dists.iter().enumerate().take(n) {
-      r -= *dist;
-      if r <= 0.0 {
-        selected_idx = i;
-        break;
-      }
-    }
-
-    let selected_offset = selected_idx * dimensions;
-    centroids.extend_from_slice(&vectors[selected_offset..selected_offset + dimensions]);
-  }
-
-  centroids
 }
 
 // ============================================================================
@@ -745,8 +510,16 @@ fn kmeans_plus_plus_init_parallel(
 
 #[derive(Debug, Clone)]
 pub enum KMeansError {
-  NotEnoughVectors { n: usize, k: usize },
-  DimensionMismatch { expected: usize, got: usize },
+  NotEnoughVectors {
+    n: usize,
+    k: usize,
+  },
+  DimensionMismatch {
+    expected: usize,
+    got: usize,
+  },
+  /// A zero cluster count or zero dimensions.
+  InvalidInput(String),
 }
 
 impl std::fmt::Display for KMeansError {
@@ -758,6 +531,7 @@ impl std::fmt::Display for KMeansError {
       KMeansError::DimensionMismatch { expected, got } => {
         write!(f, "Dimension mismatch: expected {expected}, got {got}")
       }
+      KMeansError::InvalidInput(msg) => write!(f, "Invalid k-means input: {msg}"),
     }
   }
 }
@@ -884,6 +658,56 @@ mod tests {
     };
     assert!(err2.to_string().contains("100"));
     assert!(err2.to_string().contains("50"));
+  }
+
+  #[test]
+  fn test_kmeans_rejects_zero_dimensions() {
+    let config = KMeansConfig::new(1);
+    assert!(matches!(
+      kmeans(&[], 3, 0, &config, squared_euclidean),
+      Err(KMeansError::InvalidInput(_))
+    ));
+  }
+
+  #[test]
+  fn test_training_sample_borrows_small_inputs_and_samples_large_ones() {
+    let vectors: Vec<f32> = (0..40).map(|i| i as f32).collect(); // 20 x 2
+    let (all, n) = training_sample(&vectors, 20, 2, 32);
+    assert!(matches!(all, Cow::Borrowed(_)));
+    assert_eq!((all.len(), n), (40, 20));
+
+    let (sample, n) = training_sample(&vectors, 20, 2, 8);
+    assert_eq!((sample.len(), n), (16, 8));
+    // Whole vectors, in their original order, without repeats.
+    let firsts: Vec<f32> = sample.as_chunks::<2>().0.iter().map(|v| v[0]).collect();
+    assert!(sample.as_chunks::<2>().0.iter().all(|v| v[1] == v[0] + 1.0));
+    assert!(firsts.windows(2).all(|w| w[0] < w[1]));
+    // The seed is fixed: the same input gives the same sample.
+    assert_eq!(training_sample(&vectors, 20, 2, 8).0, sample);
+  }
+
+  #[test]
+  fn test_weighted_pick_never_picks_zero_weight() {
+    let mut rng = StdRng::seed_from_u64(9);
+    let weights = [0.0, 3.0, 0.0, 1.0, 0.0];
+    for _ in 0..200 {
+      let picked = weighted_pick(&weights, &mut rng);
+      assert!(picked == 1 || picked == 3, "picked {picked}");
+    }
+    // No information: any index, never out of range.
+    assert!(weighted_pick(&[0.0; 4], &mut rng) < 4);
+    assert!(weighted_pick(&[f32::INFINITY, 1.0], &mut rng) < 2);
+  }
+
+  #[test]
+  fn test_seeded_init_is_identical_sequential_and_parallel() {
+    let n = 3000;
+    let dims = 4;
+    let vectors: Vec<f32> = (0..n * dims).map(|i| ((i * 7919) % 1000) as f32).collect();
+    let sequential =
+      kmeans_plus_plus_init(&vectors, n, dims, 8, &squared_euclidean, Some(5), false);
+    let parallel = kmeans_plus_plus_init(&vectors, n, dims, 8, &squared_euclidean, Some(5), true);
+    assert_eq!(sequential, parallel);
   }
 
   // ========================================================================

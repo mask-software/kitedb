@@ -14,6 +14,7 @@
 //!
 //! Ported from src/vector/pq.ts
 
+use crate::vector::top_k::TopK;
 use crate::vector::types::PqConfig;
 
 const MAX_CODEBOOK_SIZE: usize = u8::MAX as usize + 1;
@@ -296,37 +297,22 @@ impl PqIndex {
     let table = self.build_distance_table(query)?;
     let num_subspaces = self.config.num_subspaces;
 
-    let search_indices: Vec<usize> = match vector_ids {
-      Some(ids) => ids.to_vec(),
-      None => (0..self.num_vectors).collect(),
-    };
-
-    // Simple array for top-k (could optimize with heap for large k)
-    let mut results: Vec<(usize, f32)> = Vec::new();
-    let mut max_dist = f32::INFINITY;
-
-    for &idx in &search_indices {
-      let code_offset = idx * num_subspaces;
-      let dist = self.distance_adc(&table, code_offset);
-
-      if results.len() < k {
-        results.push((idx, dist));
-        if results.len() == k {
-          results.sort_by(|a, b| b.1.total_cmp(&a.1));
-          max_dist = results[0].1;
-        }
-      } else if dist < max_dist {
-        results[0] = (idx, dist);
-        results.sort_by(|a, b| b.1.total_cmp(&a.1));
-        max_dist = results[0].1;
-      }
+    // Bounded top-k; k = 0 keeps nothing, and NaN distances never enter.
+    let mut top = TopK::new(k);
+    let mut offer = |idx: usize| top.push(idx, self.distance_adc(&table, idx * num_subspaces));
+    match vector_ids {
+      // Ids without codes have no distance; skip them.
+      Some(ids) => ids
+        .iter()
+        .copied()
+        .filter(|&idx| idx < self.num_vectors)
+        .for_each(&mut offer),
+      None => (0..self.num_vectors).for_each(&mut offer),
     }
 
-    // Sort by distance ascending
-    results.sort_by(|a, b| a.1.total_cmp(&b.1));
-
     Ok(
-      results
+      top
+        .into_sorted_vec()
         .into_iter()
         .map(|(index, distance)| PqSearchResult { index, distance })
         .collect(),
