@@ -1601,8 +1601,10 @@ impl SingleFileDB {
         return round;
       }
       // `SyncMode::Off` leaves the records buffered (checkpoints and close
-      // write them) and names them in the in-memory header only.
-      (self.sync_mode != SyncMode::Off).then(|| wal.seal())
+      // write them) and names them in the in-memory header only. A
+      // Full-mode round syncs once its writes are done, so it tops up the
+      // zeros ahead of the head in them.
+      (self.sync_mode != SyncMode::Off).then(|| wal.seal(self.sync_mode == SyncMode::Full))
     };
 
     match self.persist_commit_round(&mut pager, sealed.as_ref(), staged.len()) {
@@ -1657,6 +1659,7 @@ impl SingleFileDB {
       #[cfg(feature = "bench-profile")]
       let flush_start = Instant::now();
       let written = sealed.write(pager).and_then(|()| {
+        self.wal_buffer.lock().note_sealed_written(sealed);
         // A failed round's rewritten records may not be durable yet, and
         // this header names bytes past them: make them durable first.
         if self.sync_mode == SyncMode::Full || sealed.needs_sync() {

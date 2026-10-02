@@ -422,6 +422,102 @@ fn fg1_full_fsync_is_the_one_sync() {
 }
 
 // ============================================================================
+// Records land only on synced zeros
+// ============================================================================
+
+/// The invariant the crash images rely on, checked on the pager's log of a
+/// workload on a reopened database (commits of several sizes from several
+/// threads, and a blocking checkpoint that resets the WAL): every byte of
+/// WAL records written to the file lands where zeros were written and then
+/// synced, since the open. (A database's first open creates its WAL as
+/// synced zeros, so its records need no zeros written first.)
+fn wal_records_land_only_on_synced_zeros(sync_mode: SyncMode) {
+  let dir = tempdir().expect("tempdir");
+  let path = dir.path().join("zeros.kitedb");
+  let options = options(sync_mode).wal_size(256 * 1024);
+  let db = open_single_file(&path, options.clone()).expect("create");
+  commit_node(&db, "created").expect("commit");
+  close_single_file(db).expect("close");
+  let db = Arc::new(open_single_file(&path, options).expect("reopen"));
+  let wal_start = db.header.read().wal_start_page * PAGE;
+  let wal_end = wal_start + db.header.read().wal_page_count * PAGE;
+  // Every writer's I/O is logged on its own thread; only a group's leader
+  // writes, so the logs, merged by when each commit returned, keep the
+  // order of the writes to any one byte within this check's needs: each
+  // commit's zeros and sync come before its records.
+  let mut logs: Vec<Vec<IoEvent>> = Vec::new();
+  let (_, events) = io_hooks::record_io_during(|| {
+    for key in mixed_keys("solo", 6) {
+      commit_node(&db, &key).expect("commit");
+    }
+  });
+  logs.push(events);
+  let members = (0..4)
+    .map(|index| -> Member<(Result<TxId>, Vec<IoEvent>)> {
+      Box::new(move |db: &SingleFileDB| {
+        io_hooks::record_io_during(|| {
+          commit_node(db, &format!("group-{index}-{}", "g".repeat(9000)))
+        })
+      })
+    })
+    .collect();
+  for (committed, events) in run_group(&db, members) {
+    committed.expect("member commit");
+    logs.push(events);
+  }
+  let (_, events) = io_hooks::record_io_during(|| {
+    db.checkpoint().expect("checkpoint");
+    for key in mixed_keys("after", 9) {
+      commit_node(&db, &key).expect("commit");
+    }
+  });
+  logs.push(events);
+
+  let mut zero_written = vec![false; (wal_end - wal_start) as usize];
+  let mut zero_durable = vec![false; (wal_end - wal_start) as usize];
+  let mut record_bytes = 0usize;
+  for event in logs.iter().flatten() {
+    match event {
+      IoEvent::Sync { ok: true } => {
+        for (durable, written) in zero_durable.iter_mut().zip(&zero_written) {
+          *durable |= *written;
+        }
+      }
+      IoEvent::Write { offset, data } if *offset >= wal_start && *offset < wal_end => {
+        let at = (*offset - wal_start) as usize;
+        if data.iter().all(|byte| *byte == 0) {
+          zero_written[at..at + data.len()].fill(true);
+          continue;
+        }
+        let unprepared = (at..at + data.len()).find(|byte| !zero_durable[*byte]);
+        assert!(
+          unprepared.is_none(),
+          "a {}-byte WAL write at WAL offset {at} covers offset {:?}, never zeroed and synced",
+          data.len(),
+          unprepared
+        );
+        // Records (and then a page's other bytes) are no longer zeros.
+        zero_written[at..at + data.len()].fill(false);
+        zero_durable[at..at + data.len()].fill(false);
+        record_bytes += data.len();
+      }
+      _ => {}
+    }
+  }
+  assert!(record_bytes > 0, "the workload wrote no WAL records");
+}
+
+#[test]
+fn fg_wal_records_land_only_on_synced_zeros_in_full_mode() {
+  wal_records_land_only_on_synced_zeros(SyncMode::Full);
+}
+
+#[test]
+fn fg_wal_records_land_only_on_synced_zeros_in_normal_mode() {
+  wal_records_land_only_on_synced_zeros(SyncMode::Normal);
+}
+
+// ============================================================================
 // Crash images of Full-mode groups
 // ============================================================================
 

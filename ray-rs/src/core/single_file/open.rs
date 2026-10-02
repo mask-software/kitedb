@@ -855,6 +855,9 @@ fn open_single_file_internal(
   // Initialize WAL buffer
   // Fails if the header's WAL positions lie outside their regions.
   let mut wal_buffer = WalBuffer::from_header(&header)?;
+  if is_new {
+    wal_buffer.note_created_zeroed();
+  }
 
   // A background checkpoint cut that no install finished. Replay reads both
   // regions in place, primary first, unless a writable open merges them.
