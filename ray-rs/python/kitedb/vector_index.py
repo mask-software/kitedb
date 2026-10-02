@@ -209,10 +209,12 @@ class VectorIndex:
             if n_clusters is None:
                 n_clusters = min(1024, max(16, int(math.sqrt(live_vectors))))
             n_probe = self._ivf_config.get("n_probe")
+            seed = self._ivf_config.get("seed")
             ivf_config = IvfConfig(
                 n_clusters=n_clusters,
                 n_probe=int(n_probe) if n_probe is not None else None,
                 metric=self._metric,
+                seed=int(seed) if seed is not None else None,
             )
             index = IvfIndex(self._dimensions, ivf_config)
 

@@ -44,3 +44,37 @@ def test_brute_force_search_keeps_nan_out_and_top_k_in_order(metric, query, vect
         (hit.node_id, hit.distance) for hit in hits
     ]
     assert [hit.node_id for hit in hits] == expected
+
+
+# VQ3: a training seed (IvfConfig(seed=...)) makes builds reproducible.
+def _seeded_data():
+    data = []
+    for i in range(3000):
+        blob = i % 20
+        data.extend(math.sin(blob * 7 + d) * 4 + math.sin(i * 13.7 + d * 3.1) for d in range(8))
+    return data
+
+
+@pytest.mark.parametrize("pq", [False, True], ids=["ivf", "ivf_pq"])
+def test_seeded_builds_serialize_identically(pq):
+    from kitedb import IvfConfig, IvfIndex, IvfPqIndex, PqConfig
+
+    data = _seeded_data()
+
+    def build(seed):
+        config = IvfConfig(n_clusters=20, seed=seed)
+        if pq:
+            index = IvfPqIndex(8, config, PqConfig(num_subspaces=4, num_centroids=32))
+        else:
+            index = IvfIndex(8, config)
+        index.add_training_vectors(data, 3000)
+        index.train()
+        for i in range(3000):
+            index.insert(i, data[i * 8 : i * 8 + 8])
+        return index.serialize()
+
+    assert build(5) == build(5)
+    assert build(5) != build(6)
+    assert IvfConfig(seed=2**64 - 1).seed == 2**64 - 1
+    with pytest.raises(OverflowError):
+        IvfConfig(seed=-1)

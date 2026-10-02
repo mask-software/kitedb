@@ -10,18 +10,20 @@
 //
 // VQ3 Seeded training is not reproducible: parallel k-means sums floats in an
 //     order set by rayon's work split, which depends on the thread count.
+//     (The seed options on IVF/IVF-PQ/VectorIndex and their identical-build
+//     tests came with the fix.)
 //
 // The datasets are seeded. Index training draws its own k-means seeds, so the
 // recall floors sit well below the measured recall.
 
 use std::collections::HashSet;
 
-use kitedb::api::vector_search::{SimilarOptions, VectorIndex, VectorIndexOptions};
-use kitedb::vector::ivf::kmeans_parallel;
+use kitedb::api::vector_search::{AnnAlgorithm, SimilarOptions, VectorIndex, VectorIndexOptions};
+use kitedb::vector::ivf::{kmeans_parallel, serialize_ivf};
 use kitedb::vector::{
-  create_vector_store, squared_euclidean, vector_store_insert, DistanceMetric, IvfPqConfig,
-  IvfPqIndex, KMeansConfig, MultiQueryAggregation, VectorManifest, VectorSearchResult,
-  VectorStoreConfig,
+  create_vector_store, serialize_ivf_pq, squared_euclidean, vector_store_insert, DistanceMetric,
+  IvfConfig, IvfIndex, IvfPqConfig, IvfPqIndex, KMeansConfig, MultiQueryAggregation,
+  VectorManifest, VectorSearchResult, VectorStoreConfig,
 };
 
 const DIMS: usize = 128;
@@ -374,5 +376,115 @@ fn b4_vq3_seeded_parallel_kmeans_is_reproducible() {
       first.2,
       again.0.iter().zip(&first.0).filter(|(a, b)| a != b).count()
     );
+  }
+}
+
+/// A seeded-build corpus: blobs in 32 dims, enough vectors (5000) for the
+/// parallel k-means path. Built anew per call, so every store has its own
+/// hash-map iteration order.
+fn seeded_store(metric: DistanceMetric) -> VectorManifest {
+  const N: usize = 5000;
+  const D: usize = 32;
+  let mut rng = Rng::new(0x0B4_0005);
+  let centers: Vec<Vec<f32>> = (0..40)
+    .map(|_| (0..D).map(|_| 4.0 * rng.gaussian()).collect())
+    .collect();
+  let mut manifest = create_vector_store(VectorStoreConfig::new(D).with_metric(metric));
+  for node in 0..N {
+    let vector: Vec<f32> = centers[node % centers.len()]
+      .iter()
+      .map(|&c| c + rng.gaussian())
+      .collect();
+    vector_store_insert(&mut manifest, node as u64, &vector).expect("store insert");
+  }
+  manifest
+}
+
+fn on_threads<T: Send>(threads: usize, f: impl FnOnce() -> T + Send) -> T {
+  rayon::ThreadPoolBuilder::new()
+    .num_threads(threads)
+    .build()
+    .expect("thread pool")
+    .install(f)
+}
+
+fn ivf_build(seed: u64, threads: usize) -> Vec<u8> {
+  let manifest = seeded_store(DistanceMetric::Cosine);
+  let mut index = IvfIndex::new(32, IvfConfig::new(40).with_seed(seed));
+  on_threads(threads, || index.build_from_store(&manifest)).expect("build");
+  serialize_ivf(&index)
+}
+
+fn ivf_pq_build(seed: u64, threads: usize, residuals: bool) -> Vec<u8> {
+  let manifest = seeded_store(DistanceMetric::Euclidean);
+  let config = IvfPqConfig::new()
+    .with_n_clusters(40)
+    .with_metric(DistanceMetric::Euclidean)
+    .with_num_subspaces(8)
+    .with_num_centroids(64)
+    .with_residuals(residuals)
+    .with_seed(seed);
+  let mut index = IvfPqIndex::new(32, config).expect("valid config");
+  on_threads(threads, || index.build_from_store(&manifest)).expect("build");
+  serialize_ivf_pq(&index)
+}
+
+/// Contract: two seeded IVF builds over the same vectors serialize to the
+/// same bytes, on any thread count; another seed gives another index.
+#[test]
+fn b4_vq3_seeded_ivf_builds_are_identical() {
+  let first = ivf_build(11, 1);
+  assert!(first == ivf_build(11, 4), "seeded IVF builds differ");
+  assert!(first != ivf_build(12, 4), "the seed has no effect");
+}
+
+/// Contract: two seeded IVF-PQ builds (coarse clusters, PQ codebooks and
+/// codes) over the same vectors serialize to the same bytes, on any thread
+/// count, with or without residuals.
+#[test]
+fn b4_vq3_seeded_ivf_pq_builds_are_identical() {
+  for residuals in [false, true] {
+    let first = ivf_pq_build(21, 1, residuals);
+    assert!(
+      first == ivf_pq_build(21, 4, residuals),
+      "seeded IVF-PQ builds differ (residuals {residuals})"
+    );
+    assert!(
+      first != ivf_pq_build(22, 4, residuals),
+      "the seed has no effect (residuals {residuals})"
+    );
+  }
+}
+
+/// Contract: two `VectorIndex`es with the same seed, given the same vectors,
+/// return the same hits and distances, for either ANN backend.
+#[test]
+fn b4_vq3_seeded_vector_index_builds_are_identical() {
+  let (vectors, blobs, mut rng) = dataset(0x0B4_0006);
+  let queries: Vec<Vec<f32>> = (0..10).map(|q| blobs.sample(&mut rng, q)).collect();
+  for algorithm in [AnnAlgorithm::Ivf, AnnAlgorithm::IvfPq] {
+    let build = || {
+      let mut index = VectorIndex::new(
+        VectorIndexOptions::new(DIMS)
+          .with_ann_algorithm(algorithm)
+          .with_seed(31),
+      );
+      for (node, vector) in vectors.iter().enumerate() {
+        index.set(node as u64, vector).expect("set");
+      }
+      index.build_index().expect("build");
+      queries
+        .iter()
+        .map(|query| {
+          index
+            .search(query, SimilarOptions::new(K).with_rerank_factor(0))
+            .expect("search")
+            .iter()
+            .map(|hit| (hit.node_id, hit.distance.to_bits()))
+            .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>()
+    };
+    assert!(build() == build(), "{algorithm:?}: seeded builds differ");
   }
 }

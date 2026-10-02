@@ -649,6 +649,23 @@ pub(crate) fn fragment_append(
   local_index
 }
 
+/// The manifest's live vectors in vector-id order (a deterministic order,
+/// unlike the location map's, so seeded training is reproducible).
+pub(crate) fn live_vectors_by_id(manifest: &VectorManifest) -> Vec<(u64, &[f32])> {
+  let fragments = FragmentLookup::new(manifest);
+  let mut live: Vec<(u64, &[f32])> = manifest
+    .vector_locations
+    .iter()
+    .filter_map(|(&vector_id, location)| {
+      fragments
+        .vector(&manifest.config, location)
+        .map(|vector| (vector_id, vector))
+    })
+    .collect();
+  live.sort_unstable_by_key(|&(vector_id, _)| vector_id);
+  live
+}
+
 /// O(1) fragment lookup by id, for loops over many vectors.
 pub(crate) enum FragmentLookup<'a> {
   /// Every fragment's id equals its position (no compaction has run).

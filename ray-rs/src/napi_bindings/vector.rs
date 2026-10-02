@@ -141,12 +141,19 @@ pub struct JsIvfConfig {
   pub n_probe: Option<i32>,
   /// Distance metric (default: Cosine)
   pub metric: Option<JsDistanceMetric>,
+  /// Training seed, an integer from 0 to Number.MAX_SAFE_INTEGER (default:
+  /// a fresh seed per training). With a seed, training the same vectors in
+  /// the same order builds the same index on any machine.
+  pub seed: Option<f64>,
 }
 
 impl JsIvfConfig {
   fn into_rust(self) -> Result<RustIvfConfig> {
     let c = self;
     let mut config = RustIvfConfig::default();
+    if let Some(seed) = c.seed {
+      config.seed = Some(training_seed("seed", seed)?);
+    }
     if let Some(n) = c.n_clusters {
       config.n_clusters =
         validation::positive_usize("nClusters", n as i64, validation::MAX_VECTOR_PARAM)?;
@@ -262,6 +269,12 @@ impl JsSearchOptions {
       rerank_factor,
     })
   }
+}
+
+/// A training seed passed as a JS number: an integer from 0 to
+/// Number.MAX_SAFE_INTEGER (the range node ids use).
+fn training_seed(field: &str, seed: f64) -> Result<u64> {
+  validation::node_id(field, seed)
 }
 
 fn validate_rerank_factor(field: &str, factor: i32) -> Result<usize> {
@@ -985,13 +998,18 @@ impl VectorIndexOptions {
         n_clusters,
         n_probe,
         metric,
+        seed,
       } = ivf;
       JsIvfConfig {
         n_clusters,
         n_probe,
         metric,
+        seed: None,
       }
       .into_rust()?;
+      if let Some(seed) = seed {
+        options = options.with_seed(training_seed("ivf.seed", seed)?);
+      }
       if let Some(n_clusters) = n_clusters {
         options = options.with_n_clusters(validation::positive_usize(
           "ivf.nClusters",
@@ -1254,14 +1272,31 @@ mod tests {
       n_clusters: Some(1),
       n_probe: Some(1),
       metric: None,
+      seed: Some(0.0),
     }
     .into_rust()
     .is_ok());
+    let seeded = JsIvfConfig {
+      seed: Some(validation::MAX_SAFE_INTEGER),
+      ..Default::default()
+    }
+    .into_rust()
+    .expect("valid seed");
+    assert_eq!(seeded.seed, Some(validation::MAX_SAFE_INTEGER as u64));
+    for seed in [-1.0, 0.5, f64::NAN, validation::MAX_SAFE_INTEGER + 2.0] {
+      assert!(JsIvfConfig {
+        seed: Some(seed),
+        ..Default::default()
+      }
+      .into_rust()
+      .is_err());
+    }
     for value in [0, -1, (validation::MAX_VECTOR_PARAM + 1) as i32] {
       assert!(JsIvfConfig {
         n_clusters: Some(value),
         n_probe: None,
         metric: None,
+        seed: None,
       }
       .into_rust()
       .is_err());
@@ -1321,6 +1356,27 @@ mod tests {
     .validated()
     .expect("valid options");
     assert_eq!(params.ivf_pq().rerank_factor, Some(3));
+  }
+
+  #[test]
+  fn vector_index_options_carry_the_ivf_seed() {
+    let options = |seed| VectorIndexOptions {
+      dimensions: 4,
+      metric: None,
+      row_group_size: None,
+      fragment_target_size: None,
+      normalize: None,
+      ivf: Some(JsIvfConfig {
+        seed,
+        ..Default::default()
+      }),
+      training_threshold: None,
+      cache_max_size: None,
+    };
+    let seeded = options(Some(42.0)).into_rust().expect("valid options");
+    assert_eq!(seeded.seed, Some(42));
+    assert_eq!(options(None).into_rust().expect("valid").seed, None);
+    assert!(options(Some(-3.0)).into_rust().is_err());
   }
 
   #[test]

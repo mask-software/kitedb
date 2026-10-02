@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crate::types::NodeId;
 use crate::vector::distance::with_metric_distance;
-use crate::vector::store::{validate_vector, FragmentLookup};
+use crate::vector::store::{live_vectors_by_id, validate_vector, FragmentLookup};
 use crate::vector::top_k::TopK;
 use crate::vector::{
   create_vector_store, vector_store_clear, vector_store_delete, vector_store_insert,
@@ -75,6 +75,10 @@ pub struct VectorIndexOptions {
   pub pq_centroids: usize,
   /// Use residual encoding for IVF-PQ (default: false)
   pub pq_residuals: bool,
+  /// Seed for training the ANN index (default: none, a fresh seed per
+  /// build). With a seed, building over the same vectors gives the same
+  /// index on any machine. See [`IvfConfig::seed`].
+  pub seed: Option<u64>,
 }
 
 impl Default for VectorIndexOptions {
@@ -93,6 +97,7 @@ impl Default for VectorIndexOptions {
       pq_subspaces: DEFAULT_PQ_SUBSPACES,
       pq_centroids: DEFAULT_PQ_CENTROIDS,
       pq_residuals: false,
+      seed: None,
     }
   }
 }
@@ -182,6 +187,12 @@ impl VectorIndexOptions {
   /// Set residual encoding mode for IVF-PQ backend.
   pub fn with_pq_residuals(mut self, residuals: bool) -> Self {
     self.pq_residuals = residuals;
+    self
+  }
+
+  /// Set the ANN training seed (see [`VectorIndexOptions::seed`]).
+  pub fn with_seed(mut self, seed: u64) -> Self {
+    self.seed = Some(seed);
     self
   }
 }
@@ -534,24 +545,24 @@ impl VectorIndex {
     });
 
     // One contiguous copy of the live vectors: the training input (the index
-    // trains on it in place, sampling as needed) and the insert source.
-    let fragments = FragmentLookup::new(&self.manifest);
-    let mut training_data = Vec::with_capacity(live_vectors * dimensions);
-    let mut vector_ids = Vec::with_capacity(live_vectors);
-    for (&vector_id, location) in &self.manifest.vector_locations {
-      if let Some(vector) = fragments.vector(&self.manifest.config, location) {
-        training_data.extend_from_slice(vector);
-        vector_ids.push(vector_id);
-      }
+    // trains on it in place, sampling as needed) and the insert source. In
+    // vector-id order, so a seeded build is reproducible.
+    let live = live_vectors_by_id(&self.manifest);
+    let mut training_data = Vec::with_capacity(live.len() * dimensions);
+    let mut vector_ids = Vec::with_capacity(live.len());
+    for (vector_id, vector) in live {
+      training_data.extend_from_slice(vector);
+      vector_ids.push(vector_id);
     }
     let unit_vectors = self.manifest.config.normalize_on_insert;
 
     // Create and train the configured ANN index.
     let built = match self.options.ann_algorithm {
       AnnAlgorithm::Ivf => {
-        let ivf_config = IvfConfig::new(n_clusters)
+        let mut ivf_config = IvfConfig::new(n_clusters)
           .with_n_probe(self.options.n_probe)
           .with_metric(self.options.metric);
+        ivf_config.seed = self.options.seed;
         let mut index = IvfIndex::new(dimensions, ivf_config);
         index
           .train_from(&training_data, vector_ids.len(), unit_vectors)
@@ -569,13 +580,14 @@ impl VectorIndex {
       AnnAlgorithm::IvfPq => {
         let pq_subspaces = resolve_pq_subspaces(self.options.pq_subspaces, dimensions);
         let pq_centroids = self.options.pq_centroids.max(2).min(live_vectors.max(2));
-        let ivf_pq_config = IvfPqConfig::new()
+        let mut ivf_pq_config = IvfPqConfig::new()
           .with_n_clusters(n_clusters)
           .with_n_probe(self.options.n_probe)
           .with_metric(self.options.metric)
           .with_num_subspaces(pq_subspaces)
           .with_num_centroids(pq_centroids)
           .with_residuals(self.options.pq_residuals);
+        ivf_pq_config.ivf.seed = self.options.seed;
         let mut index =
           IvfPqIndex::new(dimensions, ivf_pq_config).map_err(ivf_pq_error_to_index_error)?;
         index

@@ -30,7 +30,7 @@ use crate::vector::ivf::kmeans::{
   assign_to_centroids, nearest_centroid, training_sample, MAX_TRAINING_POINTS_PER_CLUSTER,
 };
 use crate::vector::ivf::{kmeans_parallel, KMeansConfig};
-use crate::vector::store::{validate_manifest_layout, FragmentLookup};
+use crate::vector::store::{live_vectors_by_id, validate_manifest_layout, FragmentLookup};
 use crate::vector::top_k::TopK;
 use crate::vector::types::{
   DistanceMetric, IvfConfig, MultiQueryAggregation, PqConfig, VectorManifest, VectorSearchResult,
@@ -100,6 +100,13 @@ impl IvfPqConfig {
   /// Set whether to use residual encoding
   pub fn with_residuals(mut self, use_residuals: bool) -> Self {
     self.use_residuals = use_residuals;
+    self
+  }
+
+  /// Set the training seed for the coarse clusters and PQ codebooks (see
+  /// [`IvfConfig::seed`])
+  pub fn with_seed(mut self, seed: u64) -> Self {
+    self.ivf.seed = Some(seed);
     self
   }
 }
@@ -333,9 +340,10 @@ impl IvfPqIndex {
     }
 
     // Step 1: Train IVF centroids with parallel k-means
-    let kmeans_config = KMeansConfig::new(n_clusters)
+    let mut kmeans_config = KMeansConfig::new(n_clusters)
       .with_max_iterations(25)
       .with_tolerance(1e-4);
+    kmeans_config.seed = self.config.ivf.seed;
     let kmeans_result = with_metric_distance!(metric, |dist| kmeans_parallel(
       &sample,
       sample_n,
@@ -408,6 +416,7 @@ impl IvfPqIndex {
     let num_subspaces = self.config.pq.num_subspaces;
     let num_centroids = self.config.pq.num_centroids;
     let max_iterations = self.config.pq.max_iterations;
+    let seed = self.config.ivf.seed;
     let subspace_dims = self.subspace_dims;
     let dimensions = self.dimensions;
     let subvector_capacity = num_vectors
@@ -439,6 +448,7 @@ impl IvfPqIndex {
               subspace_dims,
               num_centroids,
               max_iterations,
+              subspace_seed(seed, m),
             );
             centroids
           })
@@ -464,6 +474,7 @@ impl IvfPqIndex {
               subspace_dims,
               num_centroids,
               max_iterations,
+              subspace_seed(seed, m),
             );
             centroids
           })
@@ -1081,17 +1092,9 @@ impl IvfPqIndex {
       return Err(IvfPqError::AlreadyTrained);
     }
 
-    // Train on the live vectors only: deleted slots still hold data.
-    let fragments = FragmentLookup::new(manifest);
-    let live: Vec<(u64, &[f32])> = manifest
-      .vector_locations
-      .iter()
-      .filter_map(|(&vector_id, location)| {
-        fragments
-          .vector(&manifest.config, location)
-          .map(|vector| (vector_id, vector))
-      })
-      .collect();
+    // Train on the live vectors only (deleted slots still hold data), in
+    // vector-id order so a seeded build is reproducible.
+    let live = live_vectors_by_id(manifest);
     self
       .training_vectors
       .get_or_insert_with(Vec::new)
@@ -1299,6 +1302,7 @@ fn train_pq_subspace(
   subspace_dims: usize,
   num_centroids: usize,
   max_iterations: usize,
+  seed: Option<u64>,
 ) {
   // Initialize centroids with k-means++
   initialize_pq_centroids_kmeans_pp(
@@ -1307,6 +1311,7 @@ fn train_pq_subspace(
     num_vectors,
     subspace_dims,
     num_centroids,
+    seed,
   );
 
   let mut assignments = vec![u16::MAX; num_vectors];
@@ -1382,16 +1387,29 @@ fn train_pq_subspace(
   }
 }
 
-/// K-means++ initialization for PQ subspace centroids
+/// Seed for PQ subspace `m`'s codebook, derived from the training seed so
+/// subspaces (and the coarse k-means, which uses the seed itself) draw
+/// different sequences.
+fn subspace_seed(seed: Option<u64>, m: usize) -> Option<u64> {
+  seed.map(|seed| seed ^ (m as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+}
+
+/// K-means++ initialization for PQ subspace centroids (from `seed`, or a
+/// fresh one when it is `None`)
 fn initialize_pq_centroids_kmeans_pp(
   centroids: &mut [f32],
   vectors: &[f32],
   num_vectors: usize,
   dims: usize,
   k: usize,
+  seed: Option<u64>,
 ) {
-  use rand::Rng;
-  let mut rng = rand::thread_rng();
+  use rand::rngs::StdRng;
+  use rand::{Rng, SeedableRng};
+  let mut rng = match seed {
+    Some(seed) => StdRng::seed_from_u64(seed),
+    None => StdRng::from_entropy(),
+  };
 
   // First centroid: random vector
   let first_idx = rng.gen_range(0..num_vectors);
@@ -1943,7 +1961,10 @@ pub fn serialize_ivf_pq(index: &IvfPqIndex) -> Vec<u8> {
 
   // Inverted lists
   buffer.extend_from_slice(&(index.inverted_lists.len() as u32).to_le_bytes());
-  for (&cluster, list) in &index.inverted_lists {
+  // Sorted, so the same index always serializes to the same bytes.
+  let mut lists: Vec<(&usize, &Vec<u64>)> = index.inverted_lists.iter().collect();
+  lists.sort_unstable_by_key(|&(&cluster, _)| cluster);
+  for (&cluster, list) in lists {
     buffer.extend_from_slice(&(cluster as u32).to_le_bytes());
     buffer.extend_from_slice(&(list.len() as u32).to_le_bytes());
     for &vector_id in list {
@@ -1962,7 +1983,9 @@ pub fn serialize_ivf_pq(index: &IvfPqIndex) -> Vec<u8> {
 
   // PQ codes
   buffer.extend_from_slice(&(index.pq_codes.len() as u32).to_le_bytes());
-  for (&vector_id, codes) in &index.pq_codes {
+  let mut codes_by_id: Vec<(&u64, &Vec<u8>)> = index.pq_codes.iter().collect();
+  codes_by_id.sort_unstable_by_key(|&(&vector_id, _)| vector_id);
+  for (&vector_id, codes) in codes_by_id {
     buffer.extend_from_slice(&vector_id.to_le_bytes());
     buffer.extend_from_slice(&(codes.len() as u32).to_le_bytes());
     buffer.extend_from_slice(codes);
@@ -2026,6 +2049,7 @@ pub fn deserialize_ivf_pq(buffer: &[u8]) -> Result<IvfPqIndex, SerializeError> {
       n_clusters,
       n_probe,
       metric,
+      seed: None,
     },
     pq: PqConfig {
       num_subspaces,
@@ -2309,6 +2333,7 @@ mod tests {
         n_clusters: 4,
         n_probe: 2,
         metric: DistanceMetric::Euclidean,
+        seed: None,
       },
       pq: PqConfig {
         num_subspaces: 4,
@@ -2327,6 +2352,7 @@ mod tests {
         n_clusters: 1,
         n_probe: 1,
         metric,
+        seed: None,
       },
       pq: PqConfig {
         num_subspaces: 4,
@@ -2479,6 +2505,7 @@ mod tests {
         n_clusters: 1,
         n_probe: 1,
         metric: DistanceMetric::Euclidean,
+        seed: None,
       },
       pq: PqConfig {
         num_subspaces: 1,
@@ -2637,6 +2664,7 @@ mod tests {
         n_clusters: 1,
         n_probe: 1,
         metric: DistanceMetric::Cosine,
+        seed: None,
       },
       pq: PqConfig {
         num_subspaces: 1,
@@ -2667,6 +2695,7 @@ mod tests {
         n_clusters: 2,
         n_probe: 1,
         metric: DistanceMetric::Euclidean,
+        seed: None,
       },
       pq: PqConfig {
         num_subspaces: 1,
@@ -2740,6 +2769,7 @@ mod tests {
         n_clusters: 2,
         n_probe: 1,
         metric: DistanceMetric::Euclidean,
+        seed: None,
       },
       pq: PqConfig {
         num_subspaces: 2,
@@ -2816,6 +2846,7 @@ mod tests {
         n_clusters: 2,
         n_probe: 1,
         metric: DistanceMetric::Euclidean,
+        seed: None,
       },
       pq: PqConfig {
         num_subspaces: 2,
@@ -2861,6 +2892,7 @@ mod tests {
         n_clusters: 1,
         n_probe: 1,
         metric: DistanceMetric::Euclidean,
+        seed: None,
       },
       pq: PqConfig {
         num_subspaces: 1,
@@ -3103,6 +3135,7 @@ mod tests {
         n_clusters: 4,
         n_probe: 2,
         metric: DistanceMetric::Euclidean,
+        seed: None,
       },
       pq: PqConfig {
         num_subspaces: 4,
@@ -3213,6 +3246,7 @@ mod tests {
         n_clusters: 1,
         n_probe: 1,
         metric: DistanceMetric::Euclidean,
+        seed: None,
       },
       pq: PqConfig {
         num_subspaces: 1,

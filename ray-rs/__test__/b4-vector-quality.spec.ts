@@ -5,11 +5,17 @@
 //     the sort is not a total order. NaN hits can land in the top k and the
 //     finite hits can come back out of order.
 // VQ1 (Rust tests in tests/b4_vector_quality.rs) adds an IVF-PQ exact
-//     re-rank; the last test checks its `rerankFactor` option end to end.
+//     re-rank; a test here checks its `rerankFactor` option end to end.
+// VQ3 adds a training seed (`ivf.seed`); seeded builds serialize the same.
+
+import { createRequire } from 'node:module'
 
 import test from 'ava'
 
 import { bruteForceSearch, createVectorIndex } from '../dist/index.js'
+
+// The IVF index classes are native-only (not re-exported by the TS layer).
+const native = createRequire(import.meta.url)('../index.js')
 
 type Metric = 'Cosine' | 'Euclidean' | 'DotProduct'
 
@@ -92,4 +98,32 @@ test('b4 VQ1: VectorIndex.search takes rerankFactor and returns exact distances 
   }
   t.is(index.search(query, { k: 5, rerankFactor: 0 }).length, 5)
   t.throws(() => index.search(query, { k: 5, rerankFactor: -1 }), { message: /rerankFactor/ })
+})
+
+// VQ3: a training seed makes builds reproducible.
+const seededData = () => {
+  const vectors: number[] = []
+  for (let i = 0; i < 3000; i++) {
+    const blob = i % 20
+    for (let d = 0; d < 8; d++) vectors.push(Math.sin(blob * 7 + d) * 4 + Math.sin(i * 13.7 + d * 3.1))
+  }
+  return vectors
+}
+
+test('b4 VQ3: seeded IVF and IVF-PQ builds serialize identically', (t) => {
+  const data = seededData()
+  const build = (seed: number, pq: boolean) => {
+    const index = pq
+      ? new native.JsIvfPqIndex(8, { nClusters: 20, seed }, { numSubspaces: 4, numCentroids: 32 })
+      : new native.JsIvfIndex(8, { nClusters: 20, seed })
+    index.addTrainingVectors(data, 3000)
+    index.train()
+    for (let i = 0; i < 3000; i++) index.insert(i, data.slice(i * 8, i * 8 + 8))
+    return index.serialize()
+  }
+  for (const pq of [false, true]) {
+    t.true(build(5, pq).equals(build(5, pq)), `pq=${pq}: same seed, different index`)
+    t.false(build(5, pq).equals(build(6, pq)), `pq=${pq}: the seed has no effect`)
+  }
+  t.throws(() => new native.JsIvfIndex(8, { seed: -1 }), { message: /seed/ })
 })

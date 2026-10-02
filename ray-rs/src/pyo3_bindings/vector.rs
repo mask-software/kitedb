@@ -137,24 +137,35 @@ pub struct PyIvfConfig {
   /// Distance metric ("cosine", "euclidean", "dot_product")
   #[pyo3(get, set)]
   pub metric: Option<String>,
+  /// Training seed, 0 to 2**64 - 1 (default: a fresh seed per training).
+  /// With a seed, training the same vectors in the same order builds the
+  /// same index on any machine.
+  #[pyo3(get, set)]
+  pub seed: Option<u64>,
 }
 
 #[pymethods]
 impl PyIvfConfig {
   #[new]
-  #[pyo3(signature = (n_clusters=None, n_probe=None, metric=None))]
-  fn new(n_clusters: Option<i32>, n_probe: Option<i32>, metric: Option<String>) -> Self {
+  #[pyo3(signature = (n_clusters=None, n_probe=None, metric=None, seed=None))]
+  fn new(
+    n_clusters: Option<i32>,
+    n_probe: Option<i32>,
+    metric: Option<String>,
+    seed: Option<u64>,
+  ) -> Self {
     Self {
       n_clusters,
       n_probe,
       metric,
+      seed,
     }
   }
 
   fn __repr__(&self) -> String {
     format!(
-      "IvfConfig(n_clusters={:?}, n_probe={:?}, metric={:?})",
-      self.n_clusters, self.n_probe, self.metric
+      "IvfConfig(n_clusters={:?}, n_probe={:?}, metric={:?}, seed={:?})",
+      self.n_clusters, self.n_probe, self.metric, self.seed
     )
   }
 }
@@ -171,6 +182,7 @@ impl PyIvfConfig {
       config.n_probe =
         validation::positive_usize("n_probe", n as i64, validation::MAX_VECTOR_PARAM)?;
     }
+    config.seed = c.seed;
     if let Some(m) = c.metric {
       config.metric = PyDistanceMetricEnum::parse(&m)?.into();
     }
@@ -947,14 +959,23 @@ mod tests {
       n_clusters: Some(1),
       n_probe: Some(1),
       metric: None,
+      seed: None,
     }
     .into_rust()
     .is_ok());
+    assert_eq!(
+      PyIvfConfig::new(None, None, None, Some(u64::MAX))
+        .into_rust()
+        .expect("valid seed")
+        .seed,
+      Some(u64::MAX)
+    );
     for value in [0, -1, (validation::MAX_VECTOR_PARAM + 1) as i32] {
       assert!(PyIvfConfig {
         n_clusters: Some(value),
         n_probe: None,
         metric: None,
+        seed: None,
       }
       .into_rust()
       .is_err());

@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::types::NodeId;
 use crate::vector::distance::{normalize, normalize_in_place, with_metric_distance};
-use crate::vector::store::{validate_manifest_layout, FragmentLookup};
+use crate::vector::store::{live_vectors_by_id, validate_manifest_layout, FragmentLookup};
 use crate::vector::top_k::TopK;
 use crate::vector::types::{
   DistanceMetric, IvfConfig, MultiQueryAggregation, VectorManifest, VectorSearchResult,
@@ -217,9 +217,10 @@ impl IvfIndex {
       }
     }
 
-    let kmeans_config = KMeansConfig::new(n_clusters)
+    let mut kmeans_config = KMeansConfig::new(n_clusters)
       .with_max_iterations(25)
       .with_tolerance(1e-4);
+    kmeans_config.seed = self.config.seed;
     let result = with_metric_distance!(self.config.metric, |dist| kmeans_parallel(
       &sample,
       sample_n,
@@ -519,22 +520,14 @@ impl IvfIndex {
   /// Build index from all vectors in the store
   ///
   /// Trains on the store's live vectors (plus any vectors already added for
-  /// training), then indexes every live vector.
+  /// training), then indexes every live vector, both in vector-id order, so
+  /// a seeded build is reproducible.
   pub fn build_from_store(&mut self, manifest: &VectorManifest) -> Result<(), IvfError> {
     self.check_manifest(manifest)?;
     if self.trained {
       return Err(IvfError::AlreadyTrained);
     }
-    let fragments = FragmentLookup::new(manifest);
-    let live: Vec<(u64, &[f32])> = manifest
-      .vector_locations
-      .iter()
-      .filter_map(|(&vector_id, location)| {
-        fragments
-          .vector(&manifest.config, location)
-          .map(|vector| (vector_id, vector))
-      })
-      .collect();
+    let live = live_vectors_by_id(manifest);
 
     self
       .training_vectors

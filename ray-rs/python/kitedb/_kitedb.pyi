@@ -923,12 +923,17 @@ class IvfConfig:
     n_clusters: Optional[int]
     n_probe: Optional[int]
     metric: Optional[str]
+    seed: Optional[int]
+    """Training seed, 0 to 2**64 - 1 (default: a fresh seed per training).
+    With a seed, training the same vectors in the same order builds the same
+    index on any machine."""
     
     def __init__(
         self,
         n_clusters: Optional[int] = None,
         n_probe: Optional[int] = None,
         metric: Optional[str] = None,
+        seed: Optional[int] = None,
     ) -> None: ...
 
 class PqConfig:

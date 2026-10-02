@@ -1236,6 +1236,12 @@ export interface JsIvfConfig {
   nProbe?: number
   /** Distance metric (default: Cosine) */
   metric?: JsDistanceMetric
+  /**
+   * Training seed, an integer from 0 to Number.MAX_SAFE_INTEGER (default:
+   * a fresh seed per training). With a seed, training the same vectors in
+   * the same order builds the same index on any machine.
+   */
+  seed?: number
 }
 
 /** Statistics for IVF index */
