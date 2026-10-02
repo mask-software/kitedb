@@ -25,7 +25,9 @@ fn reopen_with_default_options_uses_the_files_wal_size() {
     open_single_file(&path, SingleFileOpenOptions::new()).expect("reopen with default options");
   assert!(reopened.node_by_key("node").is_some());
   reopened.begin(false).expect("begin");
-  reopened.create_node(Some("after-reopen")).expect("write after reopen");
+  reopened
+    .create_node(Some("after-reopen"))
+    .expect("write after reopen");
   reopened.commit().expect("commit after reopen");
   close_single_file(reopened).expect("close reopened");
 }
@@ -54,11 +56,14 @@ fn reopen_after_default_vacuum_with_default_options_succeeds() {
 fn explicit_mismatched_wal_size_is_still_rejected() {
   let dir = tempfile::tempdir().expect("tempdir");
   let path = dir.path().join("strict.kitedb");
-  let db = open_single_file(&path, SingleFileOpenOptions::new().wal_size(64 * 1024))
-    .expect("create");
+  let db =
+    open_single_file(&path, SingleFileOpenOptions::new().wal_size(64 * 1024)).expect("create");
   close_single_file(db).expect("close");
 
-  let result = open_single_file(&path, SingleFileOpenOptions::new().wal_size(8 * 1024 * 1024));
+  let result = open_single_file(
+    &path,
+    SingleFileOpenOptions::new().wal_size(8 * 1024 * 1024),
+  );
   assert!(
     result.is_err(),
     "an explicit WAL size that doesn't match the file must be rejected"
