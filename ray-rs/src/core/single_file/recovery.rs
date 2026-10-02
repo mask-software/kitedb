@@ -4,7 +4,6 @@
 
 use std::collections::HashMap;
 
-use crate::constants::*;
 use crate::core::pager::FilePager;
 use crate::core::snapshot::reader::SnapshotData;
 use crate::core::wal::record::{
@@ -23,6 +22,9 @@ use crate::types::*;
 /// Scan WAL records from the WAL area (linear), from the tail up to the
 /// first record that does not parse with its region's salt or does not end by
 /// the head.
+///
+/// Only the bytes from the tail to the head are read, with one positioned
+/// read: nothing past the head belongs to a record the header names.
 pub(crate) fn scan_wal_records(
   pager: &mut FilePager,
   header: &DbHeaderV1,
@@ -32,11 +34,9 @@ pub(crate) fn scan_wal_records(
 
   let mut records = Vec::new();
   let wal_size = header.wal_page_count * header.page_size as u64;
+  let (tail, head) = (header.wal_tail, header.wal_head);
 
-  let mut pos = header.wal_tail;
-  let head = header.wal_head;
-
-  if head < pos {
+  if head < tail {
     return Err(KiteError::InvalidWal(
       "WAL head cannot be behind tail in linear mode".to_string(),
     ));
@@ -48,66 +48,35 @@ pub(crate) fn scan_wal_records(
   }
 
   // If tail == head, WAL is empty
-  if pos == head {
+  if tail == head {
     return Ok(records);
   }
 
-  // Read the WAL area into memory for scanning
-  // This is simpler than page-by-page reading for now. Records end by the
-  // head: bytes past it belong to no record the header names.
-  let mut wal_data = read_wal_area(pager, header)?;
-  wal_data.truncate(head as usize);
-
-  while pos < head {
-    let actual_pos = pos;
-
-    if actual_pos + 8 > wal_size {
-      break;
-    }
-
-    let offset = actual_pos as usize;
-    if offset + 4 > wal_data.len() {
-      break;
-    }
-
-    let rec_len = u32::from_le_bytes([
-      wal_data[offset],
-      wal_data[offset + 1],
-      wal_data[offset + 2],
-      wal_data[offset + 3],
-    ]) as usize;
-
-    if rec_len == 0 {
-      break; // Invalid record
-    }
-
-    // Parse the record
-    if let Some(record) = parse_wal_record_with_salt(&wal_data, offset, header_salt_at(header, pos))
-    {
-      let aligned_size = crate::util::binary::align_up(rec_len, WAL_RECORD_ALIGNMENT);
-      pos = actual_pos + aligned_size as u64;
-      records.push(record);
-    } else {
-      break; // Invalid record
+  let wal_offset = header.wal_start_page * header.page_size as u64;
+  let live = pager.read_range(wal_offset + tail, (head - tail) as usize)?;
+  let mut offset = 0;
+  while offset < live.len() {
+    let salt = header_salt_at(header, tail + offset as u64);
+    match parse_wal_record_with_salt(&live, offset, salt) {
+      Some(record) => {
+        offset = record.record_end;
+        records.push(record);
+      }
+      None => break, // Invalid record
     }
   }
 
   Ok(records)
 }
 
-/// Read the entire WAL area into memory
+/// Read the entire WAL area into memory, with one positioned read.
+#[cfg(test)]
 pub(crate) fn read_wal_area(pager: &mut FilePager, header: &DbHeaderV1) -> Result<Vec<u8>> {
-  let wal_pages = header.wal_page_count as u32;
-  let page_size = header.page_size as usize;
-  let mut wal_data = Vec::with_capacity(wal_pages as usize * page_size);
-
-  for i in 0..wal_pages {
-    let page_num = header.wal_start_page as u32 + i;
-    let page = pager.read_page(page_num)?;
-    wal_data.extend_from_slice(&page);
-  }
-
-  Ok(wal_data)
+  let page_size = header.page_size as u64;
+  pager.read_range(
+    header.wal_start_page * page_size,
+    (header.wal_page_count * page_size) as usize,
+  )
 }
 
 /// Extract committed transactions from WAL records in COMMIT-record order.

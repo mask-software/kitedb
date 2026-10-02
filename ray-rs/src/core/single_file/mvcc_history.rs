@@ -5,8 +5,14 @@
 //! what a change implies: deleting a node also removes its key, props, labels and incident
 //! edges, and deleting an edge also removes its props. The state before the commit is the
 //! committed delta over the snapshot, which the commit has not been merged into yet.
+//!
+//! A node the commit brings into existence gets only its own history (absent before) when no
+//! open snapshot can see that id (it is not committed, and has no history of an earlier
+//! node): every read of a node's props, labels and key, and of an edge, checks that the node
+//! (each endpoint) exists at the reader's snapshot first, so its props, labels, key and
+//! edges need none.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::core::snapshot::reader::SnapshotData;
@@ -42,6 +48,15 @@ struct CommitRecorder<'a> {
 impl CommitRecorder<'_> {
   fn record(&mut self, pending: &DeltaState) {
     let (txid, commit_ts) = (self.txid, self.commit_ts);
+    // Nodes no older snapshot can see (see the module docs): not in the committed state,
+    // and with no history an open snapshot may still read (a node deleted since it began).
+    let fresh: HashSet<NodeId> = pending
+      .created_nodes
+      .keys()
+      .copied()
+      .filter(|&node_id| !self.committed.exists(node_id) && !self.vc.has_node_history(node_id))
+      .collect();
+    let edge_is_fresh = |src: NodeId, dst: NodeId| fresh.contains(&src) || fresh.contains(&dst);
 
     // Removals first. A later change of the same key by this commit (a node deleted and
     // re-created, an edge re-added to a re-created node) replaces what they record.
@@ -57,9 +72,11 @@ impl CommitRecorder<'_> {
     for (&node_id, node_delta) in &pending.created_nodes {
       if let Some(key) = node_delta.key.as_deref() {
         let owner = self.committed.key_owner(key);
-        self
-          .vc
-          .record_key_owner(key, owner, Some(node_id), txid, commit_ts);
+        if owner.is_some() || !fresh.contains(&node_id) {
+          self
+            .vc
+            .record_key_owner(key, owner, Some(node_id), txid, commit_ts);
+        }
       }
       let created = NodeVersionData {
         node_id,
@@ -71,12 +88,16 @@ impl CommitRecorder<'_> {
         .record_node(node_id, before, Some(created), txid, commit_ts);
     }
     for (&src, patches) in &pending.out_add {
-      for patch in patches {
+      for patch in patches
+        .iter()
+        .filter(|patch| !edge_is_fresh(src, patch.other))
+      {
         self.add_edge(src, patch.etype, patch.other);
       }
     }
 
-    for (&node_id, node_delta) in pending.created_nodes.iter().chain(&pending.modified_nodes) {
+    let changed_nodes = pending.created_nodes.iter().chain(&pending.modified_nodes);
+    for (&node_id, node_delta) in changed_nodes.filter(|(node_id, _)| !fresh.contains(node_id)) {
       for (&key_id, after) in node_delta.props.iter().flatten() {
         let before = self.committed.node_prop(node_id, key_id);
         self
@@ -96,7 +117,10 @@ impl CommitRecorder<'_> {
           .record_node_label(node_id, label_id, before, false, txid, commit_ts);
       }
     }
-    for (&(src, etype, dst), props) in &pending.edge_props {
+    let changed_edges = pending.edge_props.iter();
+    for (&(src, etype, dst), props) in
+      changed_edges.filter(|((src, _, dst), _)| !edge_is_fresh(*src, *dst))
+    {
       for (&key_id, after) in props {
         let before = self.committed.edge_prop(src, etype, dst, key_id);
         self.vc.record_edge_prop(
