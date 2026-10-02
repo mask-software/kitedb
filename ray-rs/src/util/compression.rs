@@ -15,14 +15,47 @@ use std::io::{Read, Write};
 /// capped: 4 GiB on 64-bit targets, and a lower ceiling on 32-bit and wasm32
 /// targets to avoid exhausting the address space. `maybe_compress` leaves
 /// larger data uncompressed, so writers never emit a section readers refuse.
-/// `decompress_with_size` uses the CRC-covered declared size exactly; this
-/// ceiling is enforced while validating the section table. The sizeless
-/// `decompress` API uses it as its fallback bomb limit.
+/// The snapshot reader enforces this ceiling, and tighter header-derived
+/// limits, on declared sizes before `decompress_with_size` allocates them.
+/// The sizeless `decompress` API uses it as its fallback bomb limit.
 #[cfg(target_pointer_width = "64")]
 pub(crate) const MAX_DECOMPRESSED_BYTES: usize = 4 * 1024 * 1024 * 1024;
 
 #[cfg(not(target_pointer_width = "64"))]
 pub(crate) const MAX_DECOMPRESSED_BYTES: usize = 256 * 1024 * 1024;
+
+/// Reads exactly `size` bytes into one allocation of that size; more or
+/// fewer bytes are an error.
+fn read_declared_size<R: Read>(mut reader: R, size: usize) -> Result<Vec<u8>> {
+  let mut output = reserve_declared_size(size)?;
+  let limit = u64::try_from(size).unwrap_or(u64::MAX);
+  (&mut reader)
+    .take(limit)
+    .read_to_end(&mut output)
+    .map_err(|e| KiteError::Compression(e.to_string()))?;
+  if output.len() == size {
+    // One more byte means the data is larger than declared. The probe also
+    // lets gzip verify its trailer.
+    let mut probe = [0u8; 1];
+    let extra = reader
+      .read(&mut probe)
+      .map_err(|e| KiteError::Compression(e.to_string()))?;
+    if extra != 0 {
+      return Err(KiteError::Compression(format!(
+        "decompressed data exceeds its declared size of {size} bytes"
+      )));
+    }
+  }
+  Ok(output)
+}
+
+fn reserve_declared_size(size: usize) -> Result<Vec<u8>> {
+  let mut output = Vec::new();
+  output
+    .try_reserve_exact(size)
+    .map_err(|e| KiteError::Compression(format!("decompressed data allocation failed: {e}")))?;
+  Ok(output)
+}
 
 fn read_limited<R: Read>(reader: &mut R, limit: usize) -> Result<Vec<u8>> {
   let mut output = Vec::new();
@@ -170,7 +203,10 @@ pub fn decompress(data: &[u8], compression_type: CompressionType) -> Result<Vec<
 
 /// Decompress data with a declared uncompressed size.
 ///
-/// The declared size is a validation hint, never an allocation request.
+/// Decompresses into a single allocation of exactly `uncompressed_size`
+/// bytes, made up front (fallibly), and fails if the data inflates to any
+/// other size. Callers must bound the declared size first: the snapshot
+/// reader checks it against the header counts and the file size.
 pub fn decompress_with_size(
   data: &[u8],
   compression_type: CompressionType,
@@ -181,15 +217,9 @@ pub fn decompress_with_size(
 
     CompressionType::Zstd => zstd_decode_with_size(data, uncompressed_size),
 
-    CompressionType::Gzip => {
-      let mut decoder = GzDecoder::new(data);
-      read_limited(&mut decoder, uncompressed_size)
-    }
+    CompressionType::Gzip => read_declared_size(GzDecoder::new(data), uncompressed_size),
 
-    CompressionType::Deflate => {
-      let mut decoder = DeflateDecoder::new(data);
-      read_limited(&mut decoder, uncompressed_size)
-    }
+    CompressionType::Deflate => read_declared_size(DeflateDecoder::new(data), uncompressed_size),
   }?;
 
   if output.len() != uncompressed_size {
@@ -208,19 +238,30 @@ fn should_try_compress(len: usize, options: &CompressionOptions) -> bool {
   options.enabled && len >= options.min_size && len <= MAX_DECOMPRESSED_BYTES
 }
 
+/// Compress `data` with `options.compression_type` if that is beneficial.
+///
+/// Returns the compressed bytes only if:
+/// 1. compression is enabled and minSize <= data size <= MAX_DECOMPRESSED_BYTES
+/// 2. Compressed size < original size
+///
+/// Otherwise returns None, and the caller keeps (and can move) its raw data.
+pub fn try_compress(data: &[u8], options: &CompressionOptions) -> Option<Vec<u8>> {
+  if !should_try_compress(data.len(), options) {
+    return None;
+  }
+  compress(data, options.compression_type, options.level)
+    .ok()
+    .filter(|compressed| compressed.len() < data.len())
+}
+
 /// Determine if compression is beneficial for the given data
 ///
-/// Only compresses if:
-/// 1. minSize <= data size <= MAX_DECOMPRESSED_BYTES
-/// 2. Compressed size < original size
+/// Compresses under the same conditions as `try_compress`; otherwise returns
+/// a copy of `data` tagged `CompressionType::None`.
 pub fn maybe_compress(data: &[u8], options: &CompressionOptions) -> (Vec<u8>, CompressionType) {
-  if !should_try_compress(data.len(), options) {
-    return (data.to_vec(), CompressionType::None);
-  }
-
-  match compress(data, options.compression_type, options.level) {
-    Ok(compressed) if compressed.len() < data.len() => (compressed, options.compression_type),
-    _ => (data.to_vec(), CompressionType::None),
+  match try_compress(data, options) {
+    Some(compressed) => (compressed, options.compression_type),
+    None => (data.to_vec(), CompressionType::None),
   }
 }
 
@@ -230,7 +271,7 @@ pub fn maybe_compress(data: &[u8], options: &CompressionOptions) -> (Vec<u8>, Co
 
 #[cfg(not(target_arch = "wasm32"))]
 fn zstd_encode(data: &[u8], level: i32) -> Result<Vec<u8>> {
-  zstd::encode_all(data, level).map_err(|e| KiteError::Compression(e.to_string()))
+  zstd::bulk::compress(data, level).map_err(|e| KiteError::Compression(e.to_string()))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -253,10 +294,17 @@ fn zstd_decode(_data: &[u8]) -> Result<Vec<u8>> {
   ))
 }
 
+/// Decompresses every frame in `data` straight into one allocation of the
+/// declared size; output that does not fit fails instead of growing it.
 #[cfg(not(target_arch = "wasm32"))]
 fn zstd_decode_with_size(data: &[u8], uncompressed_size: usize) -> Result<Vec<u8>> {
-  let mut decoder = zstd::Decoder::new(data).map_err(|e| KiteError::Compression(e.to_string()))?;
-  read_limited(&mut decoder, uncompressed_size)
+  let mut output = reserve_declared_size(uncompressed_size)?;
+  zstd::bulk::Decompressor::new()
+    .and_then(|mut decompressor| decompressor.decompress_to_buffer(data, &mut output))
+    .map_err(|e| {
+      KiteError::Compression(format!("{e} (declared size {uncompressed_size} bytes)"))
+    })?;
+  Ok(output)
 }
 
 #[cfg(target_arch = "wasm32")]
