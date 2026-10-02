@@ -404,6 +404,11 @@ struct DurableCommit {
   request: Box<CommitRequest>,
   /// Its replication commit token (a primary's sidecar took its frame).
   token: Option<CommitToken>,
+  /// Its schema publish's result, then the first failure of its publish.
+  published: Result<()>,
+  schema_published: bool,
+  /// Its MVCC commit timestamp, and whether a reader needs version chains.
+  mvcc_commit: Option<(u64, bool)>,
 }
 
 /// Check `request`'s transaction for MVCC conflicts before its COMMIT record
@@ -1398,9 +1403,7 @@ impl SingleFileDB {
       if queue.is_empty() {
         leader.release_lead();
       }
-      for (index, outcome) in self.publish_commits(round.durable) {
-        outcomes[index] = Some(outcome);
-      }
+      self.publish_commits(round.durable, &mut outcomes);
       drop(publish_guard);
 
       // The background checkpoint takes the commit lock to install.
@@ -1757,6 +1760,9 @@ impl SingleFileDB {
           index,
           request,
           token,
+          published: Ok(()),
+          schema_published: false,
+          mvcc_commit: None,
         }
       })
       .collect()
@@ -1774,9 +1780,9 @@ impl SingleFileDB {
   /// early would leave a durable transaction out of the delta, invisible
   /// until a reopen replays it, and the next checkpoint (a snapshot of the
   /// delta) would drop it. Each commit reports its first failure.
-  fn publish_commits(&self, round: Vec<DurableCommit>) -> Vec<(usize, CommitOutcome)> {
+  fn publish_commits(&self, mut round: Vec<DurableCommit>, outcomes: &mut [Option<CommitOutcome>]) {
     if round.is_empty() {
-      return Vec::new();
+      return;
     }
     let this_thread = std::thread::current().id();
 
@@ -1784,32 +1790,26 @@ impl SingleFileDB {
     // boundary. Publishing before any fallible post-commit work keeps a
     // later error from leaving a committed WAL definition hidden in this
     // process.
-    let mut published: Vec<(DurableCommit, Result<()>)> = round
-      .into_iter()
-      .map(|commit| {
-        let schema = self.publish_staged_schema(&commit.request.staged_schema);
-        (commit, schema)
-      })
-      .collect();
-    for (commit, _) in &published {
+    for commit in &mut round {
+      commit.published = self.publish_staged_schema(&commit.request.staged_schema);
+      commit.schema_published = commit.published.is_ok();
+    }
+    for commit in &round {
       if commit.request.committer == this_thread {
         before_merge_test_hook();
       }
     }
 
-    let mut results = Vec::with_capacity(published.len());
     let mut delta = self.delta.write();
     let _publishing = PublishSection::enter(&self.publish_seq);
-    let (mvcc_commits, mut released_keys) =
-      self.commit_in_mvcc(published.iter().map(|(commit, _)| commit.request.txid));
-    for ((commit, _), mvcc_commit) in published.iter_mut().zip(mvcc_commits) {
+    let mut released_keys = self.commit_in_mvcc(&mut round);
+    for commit in &mut round {
       let request = &mut commit.request;
       let on_committer_thread = request.committer == this_thread;
       if on_committer_thread {
         after_commit_timestamp_test_hook();
       }
-      let commit_ts_for_mvcc = mvcc_commit.as_ref().ok().copied().flatten();
-      self.apply_mvcc_commit(commit_ts_for_mvcc, request.txid, &request.pending, &delta);
+      self.apply_mvcc_commit(commit.mvcc_commit, request.txid, &request.pending, &delta);
 
       // The stores are loaded and the dimensions checked (`write_commit_round`).
       let vector_fault = if on_committer_thread {
@@ -1821,25 +1821,22 @@ impl SingleFileDB {
         vector_fault.and_then(|()| self.apply_pending_vectors(&request.pending.pending_vectors));
 
       delta.merge_from(&mut request.pending);
-      results.push(mvcc_commit.map(|_| ()).and(vector_result));
+      if commit.published.is_ok() {
+        commit.published = vector_result;
+      }
     }
     drop(_publishing);
     drop(delta);
 
-    published
-      .into_iter()
-      .zip(results)
-      .map(|((commit, schema_result), result)| {
-        let outcome = CommitOutcome {
-          durable: true,
-          schema_published: schema_result.is_ok(),
-          result: schema_result.and(result).map(|()| commit.token),
-          _leftovers: Some(commit.request),
-          _released_keys: std::mem::take(&mut released_keys),
-        };
-        (commit.index, outcome)
-      })
-      .collect()
+    for commit in round {
+      outcomes[commit.index] = Some(CommitOutcome {
+        durable: true,
+        schema_published: commit.schema_published,
+        result: commit.published.map(|()| commit.token),
+        _leftovers: Some(commit.request),
+        _released_keys: std::mem::take(&mut released_keys),
+      });
+    }
   }
 
   /// Unstage the `count` commits `check_and_stage_in_mvcc` staged last,
@@ -1853,32 +1850,30 @@ impl SingleFileDB {
     }
   }
 
-  /// Commit `txids` in MVCC, in order, if enabled, at their durable point:
-  /// for each, its commit timestamp, and whether a transaction that may still
-  /// read was active once it committed (which then needs version chains).
-  /// Callers hold `delta.write()` (see `publish_commits`) and staged them
+  /// Commit `round`'s transactions in MVCC, in order, if enabled, at their
+  /// durable point: each gets its commit timestamp, and whether a
+  /// transaction that may still read was active once it committed (which
+  /// then needs version chains); a failure becomes its result. Returns the
+  /// key sets the commits released, to free without the locks. Callers hold
+  /// `delta.write()` (see `publish_commits`) and staged them
   /// (`check_and_stage_in_mvcc`).
-  /// Also returns the key sets the commits released, to free without the
-  /// locks.
-  #[allow(clippy::type_complexity)]
-  fn commit_in_mvcc(
-    &self,
-    txids: impl Iterator<Item = TxId>,
-  ) -> (Vec<Result<Option<(u64, bool)>>>, Vec<TxKeySet>) {
+  fn commit_in_mvcc(&self, round: &mut [DurableCommit]) -> Vec<TxKeySet> {
     let Some(mvcc) = self.mvcc.as_ref() else {
-      return (txids.map(|_| Ok(None)).collect(), Vec::new());
+      return Vec::new();
     };
     let mut tx_mgr = mvcc.tx_manager.lock();
     let mut released = Vec::new();
-    let committed = txids
-      .map(|txid| {
-        let commit_ts = tx_mgr
-          .commit_tx_releasing(txid, &mut released)
-          .map_err(|e| KiteError::Internal(e.to_string()))?;
-        Ok(Some((commit_ts, tx_mgr.has_open_readers())))
-      })
-      .collect();
-    (committed, released)
+    for commit in round {
+      match tx_mgr.commit_tx_releasing(commit.request.txid, &mut released) {
+        Ok(commit_ts) => commit.mvcc_commit = Some((commit_ts, tx_mgr.has_open_readers())),
+        Err(error) => {
+          if commit.published.is_ok() {
+            commit.published = Err(KiteError::Internal(error.to_string()));
+          }
+        }
+      }
+    }
+    released
   }
 
   /// Rollback the current transaction

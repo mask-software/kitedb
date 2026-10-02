@@ -167,45 +167,58 @@ impl DbHeaderV1 {
 
   /// Serialize header to a Vec matching the page size.
   pub fn serialize_to_page(&self) -> Vec<u8> {
+    let mut buf = Vec::new();
+    self.serialize_into_page(&mut buf);
+    buf
+  }
+
+  /// Serialize header into `buf`, a page: resized (with zeros) to the page
+  /// size unless it has that size already, in which case its bytes between
+  /// the fields and the footer must be zero, as this leaves them (a buffer
+  /// reused for every header write).
+  pub(crate) fn serialize_into_page(&self, buf: &mut Vec<u8>) {
     let page_size = self.page_size as usize;
-    let mut buf = vec![0u8; page_size];
+    if buf.len() != page_size {
+      buf.clear();
+      buf.resize(page_size, 0);
+    }
+    let buf = buf.as_mut_slice();
 
     buf[0..16].copy_from_slice(&self.magic);
-    write_u32(&mut buf, 16, self.page_size);
-    write_u32(&mut buf, 20, self.version);
-    write_u32(&mut buf, 24, self.min_reader_version);
-    write_u32(&mut buf, 28, self.flags);
-    write_u64(&mut buf, 32, self.change_counter);
-    write_u64(&mut buf, 40, self.db_size_pages);
-    write_u64(&mut buf, 48, self.snapshot_start_page);
-    write_u64(&mut buf, 56, self.snapshot_page_count);
-    write_u64(&mut buf, 64, self.wal_start_page);
-    write_u64(&mut buf, 72, self.wal_page_count);
-    write_u64(&mut buf, 80, self.wal_head);
-    write_u64(&mut buf, 88, self.wal_tail);
-    write_u64(&mut buf, 96, self.active_snapshot_gen);
-    write_u64(&mut buf, 104, self.prev_snapshot_gen);
-    write_u64(&mut buf, 112, self.max_node_id);
-    write_u64(&mut buf, 120, self.next_tx_id);
-    write_u64(&mut buf, 128, self.last_commit_ts);
-    write_u64(&mut buf, 136, self.schema_cookie);
-    write_u64(&mut buf, 144, self.wal_primary_head);
-    write_u64(&mut buf, 152, self.wal_secondary_head);
+    write_u32(buf, 16, self.page_size);
+    write_u32(buf, 20, self.version);
+    write_u32(buf, 24, self.min_reader_version);
+    write_u32(buf, 28, self.flags);
+    write_u64(buf, 32, self.change_counter);
+    write_u64(buf, 40, self.db_size_pages);
+    write_u64(buf, 48, self.snapshot_start_page);
+    write_u64(buf, 56, self.snapshot_page_count);
+    write_u64(buf, 64, self.wal_start_page);
+    write_u64(buf, 72, self.wal_page_count);
+    write_u64(buf, 80, self.wal_head);
+    write_u64(buf, 88, self.wal_tail);
+    write_u64(buf, 96, self.active_snapshot_gen);
+    write_u64(buf, 104, self.prev_snapshot_gen);
+    write_u64(buf, 112, self.max_node_id);
+    write_u64(buf, 120, self.next_tx_id);
+    write_u64(buf, 128, self.last_commit_ts);
+    write_u64(buf, 136, self.schema_cookie);
+    write_u64(buf, 144, self.wal_primary_head);
+    write_u64(buf, 152, self.wal_secondary_head);
     buf[160] = self.active_wal_region;
     buf[161] = self.checkpoint_in_progress;
     // 162..164 reserved
-    write_u32(&mut buf, 164, self.wal_primary_salt);
-    write_u32(&mut buf, 168, self.wal_secondary_salt);
+    write_u32(buf, 164, self.wal_primary_salt);
+    write_u32(buf, 168, self.wal_secondary_salt);
     // 172..176 reserved
 
     let header_crc = crc32(&buf[..HEADER_CRC_OFFSET]);
-    write_u32(&mut buf, HEADER_CRC_OFFSET, header_crc);
+    write_u32(buf, HEADER_CRC_OFFSET, header_crc);
 
     // Every byte between the header checksum and the footer is zero.
     let fields_end = HEADER_CRC_OFFSET + 4;
     let footer_crc = crc32_zero_extended(&buf[..fields_end], page_size - 4 - fields_end);
-    write_u32(&mut buf, page_size - 4, footer_crc);
-    buf
+    write_u32(buf, page_size - 4, footer_crc);
   }
 
   /// Create a new header with default values.
@@ -292,7 +305,15 @@ pub(crate) fn write_header_slot(
       pager.page_size()
     )));
   }
-  pager.write_page(slot, &header.serialize_to_page())
+  // Every commit group writes a header: reuse one page buffer per thread.
+  thread_local! {
+    static PAGE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+  }
+  PAGE.with(|page| {
+    let mut page = page.borrow_mut();
+    header.serialize_into_page(&mut page);
+    pager.write_page(slot, &page)
+  })
 }
 
 #[cfg(test)]
