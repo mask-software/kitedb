@@ -1042,6 +1042,12 @@ fn merge_pending_delta(target: &mut DeltaState, mut pending: DeltaState) {
   target.new_etypes.extend(pending.new_etypes.drain());
   target.new_propkeys.extend(pending.new_propkeys.drain());
 
+  // Deletes first: a node the transaction deleted and created again is a
+  // recreate, whose new copy replaces the committed one.
+  for node_id in pending.deleted_nodes.drain() {
+    target.delete_node(node_id);
+  }
+
   for (node_id, mut node_delta) in pending.created_nodes.drain() {
     target.create_node(node_id, node_delta.key.as_deref());
 
@@ -1063,10 +1069,6 @@ fn merge_pending_delta(target: &mut DeltaState, mut pending: DeltaState) {
         }
       }
     }
-  }
-
-  for node_id in pending.deleted_nodes.drain() {
-    target.delete_node(node_id);
   }
 
   for (node_id, mut node_delta) in pending.modified_nodes.drain() {

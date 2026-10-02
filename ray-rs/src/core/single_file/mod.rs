@@ -654,11 +654,11 @@ impl SingleFileDB {
     let tx_handle = self.current_tx_handle();
     if let Some(handle) = tx_handle.as_ref() {
       let tx = handle.lock();
-      if tx.pending.is_node_deleted(node_id) {
-        return false;
-      }
       if tx.pending.is_node_created(node_id) {
         return true;
+      }
+      if tx.pending.is_node_deleted(node_id) {
+        return false;
       }
     }
 
@@ -680,21 +680,8 @@ impl SingleFileDB {
     }
 
     let delta = self.delta.read();
-
-    if delta.is_node_deleted(node_id) {
-      return false;
-    }
-
-    if delta.is_node_created(node_id) {
-      return true;
-    }
-
-    // Check snapshot
-    if let Some(ref snapshot) = *self.snapshot.read() {
-      return snapshot.has_node(node_id);
-    }
-
-    false
+    let snapshot = self.snapshot.read();
+    delta.node_exists_over(snapshot.as_ref(), node_id)
   }
 
   /// Check if an edge exists
@@ -702,7 +689,7 @@ impl SingleFileDB {
     let tx_handle = self.current_tx_handle();
     if let Some(handle) = tx_handle.as_ref() {
       let tx = handle.lock();
-      if tx.pending.is_node_deleted(src) || tx.pending.is_node_deleted(dst) {
+      if tx.pending.is_node_removed(src) || tx.pending.is_node_removed(dst) {
         return false;
       }
       if tx.pending.is_edge_deleted(src, etype, dst) {
@@ -710,6 +697,10 @@ impl SingleFileDB {
       }
       if tx.pending.is_edge_added(src, etype, dst) {
         return true;
+      }
+      // A node this transaction deleted or recreated masks its committed edges.
+      if tx.pending.is_node_deleted(src) || tx.pending.is_node_deleted(dst) {
+        return false;
       }
     }
 
@@ -731,23 +722,8 @@ impl SingleFileDB {
     }
 
     let delta = self.delta.read();
-
-    if delta.is_edge_deleted(src, etype, dst) {
-      return false;
-    }
-
-    if delta.is_edge_added(src, etype, dst) {
-      return true;
-    }
-
-    // Check snapshot
-    if let Some(ref snapshot) = *self.snapshot.read() {
-      if let (Some(src_phys), Some(dst_phys)) = (snapshot.phys_node(src), snapshot.phys_node(dst)) {
-        return snapshot.has_edge(src_phys, etype, dst_phys);
-      }
-    }
-
-    false
+    let snapshot = self.snapshot.read();
+    delta.edge_exists_over(snapshot.as_ref(), src, etype, dst)
   }
 
   /// Check if MVCC is enabled

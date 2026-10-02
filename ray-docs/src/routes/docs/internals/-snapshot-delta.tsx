@@ -98,13 +98,13 @@ const DELTA_FIELDS: DeltaField[] = [
 	{
 		name: "created_nodes",
 		type: "HashMap<NodeId, NodeDelta>",
-		desc: "New nodes",
+		desc: "New and recreated nodes",
 		dot: "bg-kite-mint",
 	},
 	{
 		name: "deleted_nodes",
 		type: "HashSet<NodeId>",
-		desc: "Tombstones",
+		desc: "Tombstones; they keep hiding a recreated node's old snapshot copy",
 		dot: "bg-red-400",
 	},
 	{
@@ -180,20 +180,20 @@ const READ_STEPS: ReadStep[] = [
 	{
 		question: () => (
 			<>
+				Is <Code>node_id</Code> in <Code>delta.created_nodes</Code>?
+			</>
+		),
+		answer: "Yes",
+		outcome: "return the node from the delta (new or recreated node)",
+	},
+	{
+		question: () => (
+			<>
 				Is <Code>node_id</Code> in <Code>delta.deleted_nodes</Code>?
 			</>
 		),
 		answer: "Yes",
 		outcome: "not found (deleted)",
-	},
-	{
-		question: () => (
-			<>
-				Is <Code>node_id</Code> in <Code>delta.created_nodes</Code>?
-			</>
-		),
-		answer: "Yes",
-		outcome: "return the node from the delta (new node)",
 	},
 	{
 		question: () => <>Does the snapshot have this node?</>,
@@ -414,7 +414,8 @@ export function SnapshotDeltaPage() {
 
 			<p>
 				Edge traversals work the same way: scan the snapshot's edges, skip the
-				ones deleted in the delta, and add new ones from the delta.
+				ones deleted in the delta or touching a deleted (or recreated) node, and
+				add new ones from the delta.
 			</p>
 
 			<h2 id="writing">How writes work</h2>

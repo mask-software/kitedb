@@ -41,20 +41,22 @@ enum Endpoint {
 }
 
 impl TxView<'_> {
-  /// Resolve an edge endpoint with `node_exists` precedence.
+  /// Resolve an edge endpoint with `node_exists` precedence: a layer's own
+  /// copy of a node (created or recreated there) wins over its delete, which
+  /// masks the copies below.
   fn endpoint(&self, node_id: NodeId) -> Result<Endpoint> {
     let missing = Err(KiteError::NodeNotFound(node_id));
-    if self.pending.is_node_deleted(node_id) {
-      return missing;
-    }
     if self.pending.is_node_created(node_id) {
       return Ok(Endpoint::Pending);
     }
-    if self.delta.is_node_deleted(node_id) {
+    if self.pending.is_node_deleted(node_id) {
       return missing;
     }
     if self.delta.is_node_created(node_id) {
       return Ok(Endpoint::Delta);
+    }
+    if self.delta.is_node_deleted(node_id) {
+      return missing;
     }
     match self.snapshot.and_then(|snap| snap.phys_node(node_id)) {
       Some(phys) => Ok(Endpoint::Snapshot(phys)),
@@ -84,9 +86,11 @@ impl TxView<'_> {
   }
 
   /// Whether the committed state holds the edge (the pending delta's base),
-  /// and whether the transaction sees it.
+  /// and whether the transaction sees it. A node this transaction deleted or
+  /// recreated masks its committed edges.
   fn edge(&self, src: NodeId, etype: ETypeId, dst: NodeId) -> (bool, bool) {
-    let in_base = self.delta.edge_exists_over(self.snapshot, src, etype, dst);
+    let masked = self.pending.is_node_deleted(src) || self.pending.is_node_deleted(dst);
+    let in_base = !masked && self.delta.edge_exists_over(self.snapshot, src, etype, dst);
     (in_base, self.pending.edge_visible(src, etype, dst, in_base))
   }
 

@@ -5,7 +5,6 @@
 use std::collections::HashMap;
 
 use crate::constants::*;
-use crate::core::delta::snapshot_has_edge;
 use crate::core::pager::FilePager;
 use crate::core::snapshot::reader::SnapshotData;
 use crate::core::wal::record::{
@@ -132,13 +131,7 @@ pub fn replay_wal_record(
   match record.record_type {
     WalRecordType::CreateNode => {
       if let Some(data) = parse_create_node_payload(&record.payload) {
-        if let Some(snap) = snapshot {
-          if snap.phys_node(data.node_id).is_none() {
-            delta.create_node(data.node_id, data.key.as_deref());
-          }
-        } else {
-          delta.create_node(data.node_id, data.key.as_deref());
-        }
+        replay_create_node(snapshot, delta, data.node_id, data.key.as_deref());
         if data.node_id >= *next_node_id {
           *next_node_id = data.node_id.saturating_add(1);
         }
@@ -147,13 +140,7 @@ pub fn replay_wal_record(
     WalRecordType::CreateNodesBatch => {
       if let Some(nodes) = parse_create_nodes_batch_payload(&record.payload) {
         for data in nodes {
-          if let Some(snap) = snapshot {
-            if snap.phys_node(data.node_id).is_none() {
-              delta.create_node(data.node_id, data.key.as_deref());
-            }
-          } else {
-            delta.create_node(data.node_id, data.key.as_deref());
-          }
+          replay_create_node(snapshot, delta, data.node_id, data.key.as_deref());
           if data.node_id >= *next_node_id {
             *next_node_id = data.node_id.saturating_add(1);
           }
@@ -199,7 +186,7 @@ pub fn replay_wal_record(
     }
     WalRecordType::DeleteEdge => {
       if let Some(data) = parse_delete_edge_payload(&record.payload) {
-        let in_snapshot = snapshot_has_edge(snapshot, data.src, data.etype, data.dst);
+        let in_snapshot = delta.snapshot_edge_over(snapshot, data.src, data.etype, data.dst);
         delta.delete_edge_over(data.src, data.etype, data.dst, in_snapshot);
       }
     }
@@ -304,9 +291,23 @@ fn replay_add_edge(
   if !delta.node_exists_over(snapshot, src) || !delta.node_exists_over(snapshot, dst) {
     return false;
   }
-  let in_snapshot = snapshot_has_edge(snapshot, src, etype, dst);
+  let in_snapshot = delta.snapshot_edge_over(snapshot, src, etype, dst);
   delta.add_edge_over(src, etype, dst, in_snapshot);
   true
+}
+
+/// Replay a node create under the write path's rule: the id must not exist.
+/// A create of a snapshot node is skipped, unless a replayed delete removed
+/// it: then it is a recreate. Older WALs may repeat a create.
+fn replay_create_node(
+  snapshot: Option<&SnapshotData>,
+  delta: &mut DeltaState,
+  node_id: NodeId,
+  key: Option<&str>,
+) {
+  if !delta.node_exists_over(snapshot, node_id) {
+    delta.create_node(node_id, key);
+  }
 }
 
 /// After replay, turn vector sets for nodes that no longer exist into deletes.
@@ -337,7 +338,7 @@ mod tests {
     build_add_edge_payload, build_create_node_payload, build_delete_edge_payload,
     build_delete_node_payload, WalRecord,
   };
-  use crate::types::{NodeId, WalRecordType};
+  use crate::types::{NodeId, PropValue, WalRecordType};
   use crate::vector::store::vector_store_has;
   use std::path::Path;
   use tempfile::tempdir;
@@ -450,6 +451,34 @@ mod tests {
       "store keeps the vector, so the next checkpoint would persist it"
     );
     drop(stores);
+    close_single_file(db).expect("close");
+  }
+
+  #[test]
+  fn replay_skips_create_of_existing_node() {
+    // Older versions could log a second create for a node (upsert by id did
+    // not see a recreated node). Replay must not wipe the node's state.
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("repeat_create.kitedb");
+    let db = open(&path);
+    db.begin(false).expect("begin");
+    let node = db.create_node(Some("n")).expect("node");
+    let key = db.define_propkey("k").expect("propkey");
+    db.set_node_prop(node, key, PropValue::I64(1))
+      .expect("prop");
+    db.commit().expect("commit");
+    commit_legacy_records(
+      &db,
+      vec![(
+        WalRecordType::CreateNode,
+        build_create_node_payload(node, None),
+      )],
+    );
+    close_single_file(db).expect("close");
+
+    let db = open(&path);
+    assert_eq!(db.node_key(node).as_deref(), Some("n"));
+    assert_eq!(db.node_prop(node, key), Some(PropValue::I64(1)));
     close_single_file(db).expect("close");
   }
 

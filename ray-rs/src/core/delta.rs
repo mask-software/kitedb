@@ -97,10 +97,25 @@ impl DeltaState {
 
   /// Whether `node_id` exists through this delta over `snapshot`.
   pub fn node_exists_over(&self, snapshot: Option<&SnapshotData>, node_id: NodeId) -> bool {
-    if self.is_node_deleted(node_id) {
-      return false;
+    if self.is_node_created(node_id) {
+      return true;
     }
-    self.is_node_created(node_id) || snapshot.is_some_and(|snap| snap.has_node(node_id))
+    !self.is_node_deleted(node_id) && snapshot.is_some_and(|snap| snap.has_node(node_id))
+  }
+
+  /// Whether `snapshot` holds the edge and this delta keeps the snapshot
+  /// copies of both endpoints: a deleted or recreated endpoint masks the
+  /// snapshot's edges. Edge tombstones are not applied here.
+  pub fn snapshot_edge_over(
+    &self,
+    snapshot: Option<&SnapshotData>,
+    src: NodeId,
+    etype: ETypeId,
+    dst: NodeId,
+  ) -> bool {
+    !self.is_node_deleted(src)
+      && !self.is_node_deleted(dst)
+      && snapshot_has_edge(snapshot, src, etype, dst)
   }
 
   /// Whether the edge is visible through this delta over `snapshot`.
@@ -111,10 +126,13 @@ impl DeltaState {
     etype: ETypeId,
     dst: NodeId,
   ) -> bool {
+    if self.is_node_removed(src) || self.is_node_removed(dst) {
+      return false;
+    }
     if self.is_edge_added(src, etype, dst) {
       return true;
     }
-    !self.is_edge_deleted(src, etype, dst) && snapshot_has_edge(snapshot, src, etype, dst)
+    !self.is_edge_deleted(src, etype, dst) && self.snapshot_edge_over(snapshot, src, etype, dst)
   }
 
   /// Add edge with cancellation logic
@@ -245,8 +263,16 @@ impl DeltaState {
   // Node Operations
   // ========================================================================
 
-  /// Create a new node
+  /// Create a new node.
+  ///
+  /// Over a deleted id this recreates the node: the delete stays and keeps
+  /// masking the base copy (its props, labels, key and edges), and the node
+  /// starts fresh, without the edge patches this delta held for the old copy.
   pub fn create_node(&mut self, node_id: NodeId, key: Option<&str>) {
+    if self.is_node_deleted(node_id) {
+      self.modified_nodes.remove(&node_id);
+      self.drop_edge_patches(node_id);
+    }
     let node_delta = NodeDelta {
       key: key.map(|s| s.to_string()),
       labels: None,
@@ -263,7 +289,8 @@ impl DeltaState {
 
   /// Delete a node
   pub fn delete_node(&mut self, node_id: NodeId) {
-    // If it was just created in this delta, remove it instead
+    // If it was created in this delta, remove it instead. A recreated node
+    // keeps the delete that masks its base copy.
     if let Some(removed) = self.created_nodes.remove(&node_id) {
       // Remove from key index
       if let Some(key) = &removed.key {
@@ -303,14 +330,50 @@ impl DeltaState {
     self.modified_nodes.remove(&node_id);
   }
 
-  /// Check if node was created in delta
+  /// Whether this delta holds its own copy of the node: created here, or
+  /// recreated over a deleted base copy. Its state is the delta's alone.
   pub fn is_node_created(&self, node_id: NodeId) -> bool {
     self.created_nodes.contains_key(&node_id)
   }
 
-  /// Check if node was deleted in delta
+  /// Whether this delta deleted the node's base copy, masking its props,
+  /// labels, key and edges. True for a recreated node as well: check
+  /// [`Self::is_node_removed`] for whether the node is gone.
   pub fn is_node_deleted(&self, node_id: NodeId) -> bool {
     self.deleted_nodes.contains(&node_id)
+  }
+
+  /// Whether the node is gone through this delta: deleted, and not created
+  /// again.
+  pub fn is_node_removed(&self, node_id: NodeId) -> bool {
+    self.is_node_deleted(node_id) && !self.is_node_created(node_id)
+  }
+
+  /// Drop every edge patch (add or tombstone, both directions) incident to
+  /// `node_id`.
+  fn drop_edge_patches(&mut self, node_id: NodeId) {
+    for added in [true, false] {
+      let (out_map, in_map) = if added {
+        (&self.out_add, &self.in_add)
+      } else {
+        (&self.out_del, &self.in_del)
+      };
+      let out_edges = out_map
+        .get(&node_id)
+        .into_iter()
+        .flatten()
+        .map(|patch| (node_id, patch.etype, patch.other));
+      let in_edges = in_map
+        .get(&node_id)
+        .into_iter()
+        .flatten()
+        .map(|patch| (patch.other, patch.etype, node_id));
+      let edges: Vec<_> = out_edges.chain(in_edges).collect();
+      for (src, etype, dst) in edges {
+        self.remove_edge_patch(src, etype, dst, added);
+      }
+    }
+    self.incoming_edge_sources.remove(&node_id);
   }
 
   /// Get node delta (for created or modified nodes)
@@ -594,10 +657,11 @@ impl DeltaState {
       return None;
     }
     if let Some(&node_id) = self.key_index.get(key) {
-      if !self.is_node_deleted(node_id) {
+      if !self.is_node_removed(node_id) {
         return Some(node_id);
       }
     }
+    // A deleted or recreated node's snapshot key is masked with its copy.
     snapshot
       .and_then(|snap| snap.lookup_by_key(key))
       .filter(|&node_id| !self.is_node_deleted(node_id))
@@ -671,6 +735,42 @@ mod tests {
     delta.add_edge_over(1, 10, 2, true);
     assert!(!delta.is_edge_deleted(1, 10, 2));
     assert!(!delta.is_edge_added(1, 10, 2));
+  }
+
+  #[test]
+  fn test_recreate_keeps_base_masked_and_starts_fresh() {
+    let (n, a, b, c) = (1, 2, 3, 4);
+    let mut delta = DeltaState::new();
+    // State the delta held for the base node n before its delete.
+    delta.add_edge(n, 10, a);
+    delta.add_edge(b, 10, n);
+    delta.delete_edge(n, 10, c); // tombstone of a base edge
+    delta.add_edge(a, 10, b); // unrelated
+    delta.add_node_label(n, 7);
+    delta.delete_node(n);
+    assert!(delta.is_node_removed(n));
+
+    delta.create_node(n, Some("new"));
+    assert!(delta.is_node_created(n));
+    assert!(delta.is_node_deleted(n), "the base copy stays masked");
+    assert!(!delta.is_node_removed(n));
+    assert!(delta.node_exists_over(None, n));
+    assert_eq!(delta.key_owner_over(None, "new"), Some(n));
+    assert!(delta.modified_nodes.is_empty());
+    for map in [&delta.out_add, &delta.in_add, &delta.out_del, &delta.in_del] {
+      assert!(
+        map
+          .iter()
+          .all(|(&node, patches)| node != n && patches.iter().all(|p| p.other != n)),
+        "an old edge patch of n survived the recreate: {map:?}"
+      );
+    }
+    assert!(delta.is_edge_added(a, 10, b), "unrelated patches stay");
+
+    // Deleting the recreated node removes it again, base copy still masked.
+    delta.delete_node(n);
+    assert!(delta.is_node_removed(n));
+    assert_eq!(delta.key_owner_over(None, "new"), None);
   }
 
   #[test]

@@ -495,6 +495,54 @@ fn r1_delete_and_recreate_in_one_tx_does_not_resurrect_old_node() {
   );
 }
 
+/// The old node's state can also live in the delta: edges added after the
+/// checkpoint (one a self-loop), a label, a prop, and an edge prop on a
+/// snapshot edge. The recreate drops all of it, whether the delete commits on
+/// its own, or that state, the delete and the recreate share one transaction.
+#[test]
+fn r1_recreate_masks_old_state_held_in_the_delta() {
+  let spec = Spec {
+    key: Some(NEW_KEY),
+    labels_and_edges: false,
+  };
+  for same_tx in [false, true] {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("delta_held.kitedb");
+    let db = open(&path);
+    let fx = snapshot_fixture(&db);
+    let next_tx = |what: &str| {
+      if !same_tx {
+        db.commit()
+          .unwrap_or_else(|e| panic!("commit {what}: {e:?}"));
+        db.begin(false).expect("begin");
+      }
+    };
+
+    db.begin(false).expect("begin");
+    db.add_edge(fx.a, fx.t, fx.n).expect("edge a->n");
+    db.add_edge(fx.n, fx.t, fx.n).expect("self-loop n->n");
+    db.add_node_label(fx.n, fx.new_label).expect("label");
+    db.set_node_prop(fx.n, fx.old_only, PropValue::I64(9))
+      .expect("prop");
+    db.set_edge_prop(fx.n, fx.t, fx.b, fx.weight, PropValue::I64(3))
+      .expect("edge prop");
+    next_tx("old delta state");
+    db.delete_node(fx.n).expect("delete n");
+    next_tx("delete");
+    write_recreated(&db, &fx, spec);
+    db.commit().expect("commit recreate");
+    assert!(db.check().valid, "same_tx={same_tx}: {:?}", db.check());
+
+    run_steps(
+      &path,
+      db,
+      &fx,
+      spec,
+      &[Check, Reopen, Check, Checkpoint, Check, Reopen, Check],
+    );
+  }
+}
+
 // ============================================================================
 // Upsert by id
 // ============================================================================
