@@ -591,7 +591,8 @@ fn f2_edge_linked_then_endpoint_deleted_in_one_tx_does_not_dangle() {
 /// carol and commits first, then the first one commits. Nothing re-checks
 /// carol at commit, so the committed state holds writes to a missing node.
 /// Either refusing the late commit or dropping those writes is fine; showing
-/// them is not.
+/// them is not. If writers are serialized (the delete's begin waits), the
+/// writes commit first and the delete must remove all of them.
 #[test]
 fn f2_racing_writes_to_node_deleted_meanwhile_leave_no_orphan_state() {
   let mut fx = Fixture::new("f2-race", false);
@@ -641,10 +642,30 @@ fn f2_racing_writes_to_node_deleted_meanwhile_leave_no_orphan_state() {
       return;
     }
   }
-  tx(fx.db(), |db| db.delete_node(carol).expect("delete carol"));
+  // The delete runs on its own thread. With writers serialized at begin, its
+  // begin waits for the writer's transaction: the writes commit first and
+  // the delete then removes them, which must leave the same state.
+  let (deleted_tx, deleted_rx) = mpsc::channel::<()>();
+  let deleter_db = fx.shared();
+  let deleter = std::thread::spawn(move || -> Result<()> {
+    let result = deleter_db.begin(false).and_then(|_| {
+      deleter_db.delete_node(carol)?;
+      deleter_db.commit()
+    });
+    let _ = deleted_tx.send(());
+    result
+  });
+  let delete_first = deleted_rx.recv_timeout(Duration::from_secs(2)).is_ok();
   go_tx.send(()).expect("release writer");
   let late_commit = writer.join().expect("writer thread");
-  eprintln!("late commit: {late_commit:?}");
+  let delete = deleter.join().expect("deleter thread");
+  eprintln!(
+    "delete committed first: {delete_first}; late commit: {late_commit:?}; delete: {delete:?}"
+  );
+  if delete.is_err() {
+    // A refused concurrent begin: delete after the writer instead.
+    tx(fx.db(), |db| db.delete_node(carol).expect("delete carol"));
+  }
 
   fx.check_stages(&mut v, |db, stage, v| {
     check_node_absent(db, stage, v, carol, name, label);
