@@ -74,6 +74,7 @@
     "prepublishOnly": "napi prepublish -t npm",
     "test": "ava",
     "test:wasm": "node scripts/wasm-smoke.mjs",
+    "typecheck:consumer": "node scripts/typecheck-consumer.mjs",
     "preversion": "napi build --platform && bun run build:ts && git add .",
     "version": "napi version",
     "prepare": "husky"
@@ -90,6 +91,7 @@
     "@oxc-node/core-darwin-arm64": "0.0.35",
     "@taplo/cli": "^0.7.0",
     "@tybys/wasm-util": "^0.10.0",
+    "@types/node": "^22.20.5",
     "ava": "^6.4.1",
     "chalk": "^5.6.2",
     "husky": "^9.1.7",
