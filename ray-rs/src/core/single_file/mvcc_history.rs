@@ -194,7 +194,7 @@ impl CommitRecorder<'_> {
       .iter()
       .filter_map(|edge| Some((*edge, pending.edge_props.get(edge)?)));
     for ((src, etype, dst), props) in changed_edges {
-      for (&key_id, after) in props {
+      for (&key_id, after) in props.iter() {
         let before = self.committed.edge_prop(src, etype, dst, key_id);
         self.vc.record_edge_prop(
           src,

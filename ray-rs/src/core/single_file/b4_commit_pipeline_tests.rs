@@ -239,7 +239,7 @@ mod merge_model {
       if removed.contains(&src) || removed.contains(&dst) {
         continue;
       }
-      for (key_id, value) in props {
+      for (key_id, value) in *props {
         match value {
           Some(value) => target.set_edge_prop_ref(src, etype, dst, key_id, value),
           None => target.delete_edge_prop(src, etype, dst, key_id),
@@ -271,7 +271,7 @@ mod merge_model {
         labels(&delta.labels_deleted)
       )
     }
-    let nodes = |map: &crate::types::DeltaMap<NodeId, crate::types::NodeDelta>| {
+    let nodes = |map: &crate::types::DeltaMap<NodeId, Box<crate::types::NodeDelta>>| {
       map
         .iter()
         .map(|(&id, delta)| (id, node(delta)))

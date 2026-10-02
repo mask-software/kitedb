@@ -2008,7 +2008,7 @@ impl SingleFileDB {
           // Apply delta edge prop modifications
           let edge_key = (node_id, edge_info.etype, dst_node_id);
           if let Some(delta_edge_props) = delta.edge_props.get(&edge_key) {
-            for (&key_id, value) in delta_edge_props {
+            for (&key_id, value) in delta_edge_props.iter() {
               match value {
                 Some(v) => {
                   edge_props.insert(key_id, v.as_ref().clone());
@@ -2074,7 +2074,7 @@ impl SingleFileDB {
         let mut edge_props = HashMap::new();
         let edge_key = (src, patch.etype, patch.other);
         if let Some(delta_edge_props) = delta.edge_props.get(&edge_key) {
-          for (&key_id, value) in delta_edge_props {
+          for (&key_id, value) in delta_edge_props.iter() {
             if let Some(v) = value {
               edge_props.insert(key_id, v.as_ref().clone());
             }

@@ -6,6 +6,44 @@ use crate::core::snapshot::reader::SnapshotData;
 use crate::types::*;
 use hashbrown::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap};
+use std::hash::Hash;
+
+/// A table of a delta (one of its maps or sets), for `DeltaState::grow_tables_for`.
+trait Table {
+  fn len(&self) -> usize;
+  fn capacity(&self) -> usize;
+  fn reserve(&mut self, additional: usize);
+}
+
+impl<K: Eq + Hash, V> Table for DeltaMap<K, V> {
+  fn len(&self) -> usize {
+    hashbrown::HashMap::len(self)
+  }
+  fn capacity(&self) -> usize {
+    hashbrown::HashMap::capacity(self)
+  }
+  fn reserve(&mut self, additional: usize) {
+    hashbrown::HashMap::reserve(self, additional)
+  }
+}
+
+impl<T: Eq + Hash> Table for DeltaSet<T> {
+  fn len(&self) -> usize {
+    hashbrown::HashSet::len(self)
+  }
+  fn capacity(&self) -> usize {
+    hashbrown::HashSet::capacity(self)
+  }
+  fn reserve(&mut self, additional: usize) {
+    hashbrown::HashSet::reserve(self, additional)
+  }
+}
+
+/// A table this full (or fuller) may grow ahead of need (see
+/// `DeltaState::grow_tables_for`), as a fraction of its capacity.
+const GROW_AHEAD_LOAD: (usize, usize) = (3, 4);
+/// Tables smaller than this grow when they fill: their growth takes no time.
+const GROW_AHEAD_MIN_CAPACITY: usize = 4096;
 
 /// Whether `snapshot` holds the edge `src -[etype]-> dst`.
 pub fn snapshot_has_edge(
@@ -267,12 +305,12 @@ impl DeltaState {
   /// for the old copy. Props of the old copy's base edges have no patch to
   /// find them by, so this scans `edge_props`; recreating an id is rare.
   pub fn create_node(&mut self, node_id: NodeId, key: Option<&str>) {
-    let node_delta = NodeDelta {
+    let node_delta = Box::new(NodeDelta {
       key: key.map(|s| s.to_string()),
       labels: None,
       labels_deleted: None,
       props: None,
-    };
+    });
     self.install_created_node(node_id, node_delta);
 
     // Add to key index if key provided
@@ -283,7 +321,7 @@ impl DeltaState {
 
   /// Make `node_delta` node `node_id`'s own copy here, as `create_node` does,
   /// without touching the key index.
-  fn install_created_node(&mut self, node_id: NodeId, node_delta: NodeDelta) {
+  fn install_created_node(&mut self, node_id: NodeId, node_delta: Box<NodeDelta>) {
     if self.is_node_deleted(node_id) {
       self.modified_nodes.remove(&node_id);
       self.drop_edge_patches(node_id);
@@ -376,6 +414,7 @@ impl DeltaState {
       .created_nodes
       .get(&node_id)
       .or_else(|| self.modified_nodes.get(&node_id))
+      .map(|node_delta| &**node_delta)
   }
 
   // ========================================================================
@@ -393,15 +432,7 @@ impl DeltaState {
     let node_delta = if let Some(node_delta) = self.created_nodes.get_mut(&node_id) {
       node_delta
     } else {
-      self
-        .modified_nodes
-        .entry(node_id)
-        .or_insert_with(|| NodeDelta {
-          key: None,
-          labels: None,
-          labels_deleted: None,
-          props: None,
-        })
+      self.modified_nodes.entry(node_id).or_default()
     };
 
     let props = node_delta
@@ -415,15 +446,7 @@ impl DeltaState {
     let node_delta = if let Some(node_delta) = self.created_nodes.get_mut(&node_id) {
       node_delta
     } else {
-      self
-        .modified_nodes
-        .entry(node_id)
-        .or_insert_with(|| NodeDelta {
-          key: None,
-          labels: None,
-          labels_deleted: None,
-          props: None,
-        })
+      self.modified_nodes.entry(node_id).or_default()
     };
 
     let props = node_delta
@@ -453,15 +476,7 @@ impl DeltaState {
     let node_delta = if let Some(node_delta) = self.created_nodes.get_mut(&node_id) {
       node_delta
     } else {
-      self
-        .modified_nodes
-        .entry(node_id)
-        .or_insert_with(|| NodeDelta {
-          key: None,
-          labels: None,
-          labels_deleted: None,
-          props: None,
-        })
+      self.modified_nodes.entry(node_id).or_default()
     };
 
     // Remove from deleted set if present
@@ -483,15 +498,7 @@ impl DeltaState {
     let node_delta = if let Some(node_delta) = self.created_nodes.get_mut(&node_id) {
       node_delta
     } else {
-      self
-        .modified_nodes
-        .entry(node_id)
-        .or_insert_with(|| NodeDelta {
-          key: None,
-          labels: None,
-          labels_deleted: None,
-          props: None,
-        })
+      self.modified_nodes.entry(node_id).or_default()
     };
 
     // Remove from added labels if present
@@ -629,7 +636,10 @@ impl DeltaState {
     etype: ETypeId,
     dst: NodeId,
   ) -> Option<&HashMap<PropKeyId, Option<PropValueRef>>> {
-    self.edge_props.get(&(src, etype, dst))
+    self
+      .edge_props
+      .get(&(src, etype, dst))
+      .map(|props| &**props)
   }
 
   // ========================================================================
@@ -669,6 +679,7 @@ impl DeltaState {
   /// insert and no allocation. Elsewhere its changes apply one at a time, the
   /// way the transaction made them; both give the same result.
   pub(crate) fn merge_from(&mut self, pending: &mut DeltaState) {
+    self.grow_tables_for(pending);
     self.new_labels.extend(pending.new_labels.drain());
     self.new_etypes.extend(pending.new_etypes.drain());
     self.new_propkeys.extend(pending.new_propkeys.drain());
@@ -727,43 +738,85 @@ impl DeltaState {
         Entry::Vacant(entry) => {
           entry.insert(props);
         }
-        Entry::Occupied(mut entry) => entry.get_mut().extend(props),
+        Entry::Occupied(mut entry) => entry.get_mut().extend(*props),
       }
     }
 
     self.key_index.extend(pending.key_index.drain());
   }
 
+  /// Make room for merging `pending` (see `merge_from`): grow each table the merge would
+  /// overflow, and if none, the first table past `GROW_AHEAD_LOAD` of its capacity, ahead of
+  /// need. A merge runs under `delta.write()`, and a table that grows moves all its entries
+  /// meanwhile. A growing delta's tables hold about as many entries each (the created nodes'
+  /// state, keys, edge patches in both directions and edge props), so they would fill up
+  /// together and all grow in one merge: grown ahead, they grow one merge at a time.
+  fn grow_tables_for(&mut self, pending: &DeltaState) {
+    let mut tables: [(&mut dyn Table, usize); 9] = [
+      (&mut self.created_nodes, pending.created_nodes.len()),
+      (&mut self.deleted_nodes, pending.deleted_nodes.len()),
+      (&mut self.modified_nodes, pending.modified_nodes.len()),
+      (&mut self.out_add, pending.out_add.len()),
+      (&mut self.out_del, pending.out_del.len()),
+      (&mut self.in_add, pending.in_add.len()),
+      (&mut self.in_del, pending.in_del.len()),
+      (&mut self.edge_props, pending.edge_props.len()),
+      (&mut self.key_index, pending.key_index.len()),
+    ];
+    let mut grown = false;
+    for (table, incoming) in &mut tables {
+      if table.len() + *incoming > table.capacity() {
+        table.reserve(*incoming);
+        grown = true;
+      }
+    }
+    if grown {
+      return;
+    }
+    let (numerator, denominator) = GROW_AHEAD_LOAD;
+    let ahead = tables.into_iter().find(|(table, incoming)| {
+      table.capacity() >= GROW_AHEAD_MIN_CAPACITY
+        && (table.len() + incoming) * denominator >= table.capacity() * numerator
+    });
+    if let Some((table, _)) = ahead {
+      // One past its capacity: the next size up.
+      let additional = table.capacity() + 1 - table.len();
+      table.reserve(additional);
+    }
+  }
+
   /// Merge node `node_id`, created by the merged transaction with the state
   /// `node_delta`: what `create_node` and then its label and prop writes
   /// give, except the key index entry if `key_indexed`.
-  fn merge_created_node(&mut self, node_id: NodeId, node_delta: NodeDelta, key_indexed: bool) {
+  fn merge_created_node(
+    &mut self,
+    node_id: NodeId,
+    mut node_delta: Box<NodeDelta>,
+    key_indexed: bool,
+  ) {
     let NodeDelta {
       key,
       labels,
       labels_deleted,
       props,
-    } = node_delta;
+    } = &mut *node_delta;
     // Removing a label from a node created here only drops it from its
     // labels (see `remove_node_label`).
-    let labels = labels
-      .filter(|labels| !labels.is_empty())
-      .map(|mut labels| {
-        for label_id in labels_deleted.iter().flatten() {
-          labels.remove(label_id);
-        }
-        labels
-      });
-    let props = props.filter(|props| !props.is_empty());
+    if labels.as_ref().is_some_and(|labels| labels.is_empty()) {
+      *labels = None;
+    }
+    if let Some(added) = labels.as_mut() {
+      for label_id in labels_deleted.iter().flatten() {
+        added.remove(label_id);
+      }
+    }
+    *labels_deleted = None;
+    if props.as_ref().is_some_and(|props| props.is_empty()) {
+      *props = None;
+    }
     if let (Some(key), false) = (key.as_deref(), key_indexed) {
       self.key_index.insert(key.to_string(), node_id);
     }
-    let node_delta = NodeDelta {
-      key,
-      labels,
-      labels_deleted: None,
-      props,
-    };
     self.install_created_node(node_id, node_delta);
   }
 
@@ -771,38 +824,44 @@ impl DeltaState {
   /// transaction made to node `node_id`, which it did not create: what its
   /// `add_node_label`, `remove_node_label` and prop writes give, in that
   /// order.
-  fn merge_modified_node(&mut self, node_id: NodeId, node_delta: NodeDelta) {
+  fn merge_modified_node(&mut self, node_id: NodeId, mut node_delta: Box<NodeDelta>) {
     let NodeDelta {
+      key,
       labels,
       labels_deleted,
       props,
-      ..
-    } = node_delta;
-    let labels = labels.filter(|labels| !labels.is_empty());
-    let labels_deleted = labels_deleted.filter(|labels| !labels.is_empty());
-    let props = props.filter(|props| !props.is_empty());
+    } = &mut *node_delta;
+    *key = None;
+    for set in [&mut *labels, &mut *labels_deleted] {
+      if set.as_ref().is_some_and(|set| set.is_empty()) {
+        *set = None;
+      }
+    }
+    if props.as_ref().is_some_and(|props| props.is_empty()) {
+      *props = None;
+    }
     if labels.is_none() && labels_deleted.is_none() && props.is_none() {
       return;
     }
 
     if !self.created_nodes.contains_key(&node_id) {
       if let Entry::Vacant(entry) = self.modified_nodes.entry(node_id) {
-        let labels = labels.map(|mut labels| {
+        if let Some(added) = labels.as_mut() {
           for label_id in labels_deleted.iter().flatten() {
-            labels.remove(label_id);
+            added.remove(label_id);
           }
-          labels
-        });
-        entry.insert(NodeDelta {
-          key: None,
-          labels,
-          labels_deleted,
-          props,
-        });
+        }
+        entry.insert(node_delta);
         return;
       }
     }
 
+    let NodeDelta {
+      labels,
+      labels_deleted,
+      props,
+      ..
+    } = *node_delta;
     for label_id in labels.into_iter().flatten() {
       self.add_node_label(node_id, label_id);
     }
