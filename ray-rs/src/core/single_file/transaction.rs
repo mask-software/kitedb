@@ -16,10 +16,11 @@
 //!    (a conflict aborts that member alone; the others are staged) -> under
 //!    the WAL lock, each member's records while they fit (waiting for a
 //!    background install if needed) -> one WAL write, without the WAL lock,
-//!    and one fsync in Full mode -> one durable header -> each member's
-//!    sidecar frame, in order`. Until the header is durable a failure leaves
-//!    no trace of the group: its COMMIT records become ROLLBACK records,
-//!    MVCC unstages its members, and each fails.
+//!    then the header naming the records, and in Full mode one sync for both
+//!    -> each member's sidecar frame, in order`. Until that sync returns a
+//!    failure leaves no trace of the group: its COMMIT records become
+//!    ROLLBACK records, a header naming only the commits before it replaces
+//!    its header, MVCC unstages its members, and each fails.
 //! 2. Under the publish lock, taken before the commit lock is released, so
 //!    groups publish in order (`publish_commits`): `for each member: schema
 //!    publish -> one delta.write() section with each member's MVCC commit
@@ -1463,7 +1464,10 @@ impl SingleFileDB {
   /// appending while the round's file I/O runs, after its records. If the
   /// round fails before its header is durable, its COMMIT records become
   /// ROLLBACK records (`WalBuffer::restore_sealed`), so a failed commit never
-  /// becomes durable later, and MVCC unstages its members.
+  /// becomes durable later, and MVCC unstages its members. In Full mode a
+  /// header naming only the commits before the round is written over the
+  /// one written with it (whose sync may have failed after it reached the
+  /// disk), and synced with the rollback.
   fn write_commit_round(
     &self,
     queue: &mut VecDeque<(usize, Box<CommitRequest>)>,
@@ -1615,9 +1619,19 @@ impl SingleFileDB {
       Err(error) => {
         if let Some(sealed) = sealed {
           let mut wal = self.wal_buffer.lock();
-          let scrubbed = wal
-            .restore_sealed(sealed, commit_records)
-            .and_then(|()| wal.flush(&mut pager));
+          let scrubbed = wal.restore_sealed(sealed, commit_records).and_then(|()| {
+            // In Full mode the round's header was written before its sync,
+            // which may have failed after the header reached the disk: write
+            // one naming only the commits before the round, into the slot
+            // that one went to, so the rollback's sync below covers both.
+            if self.sync_mode == SyncMode::Full {
+              let mut header = self.header.write();
+              if let Err(retract) = self.persist_header(&mut pager, &mut header, false) {
+                eprintln!("Warning: could not rewrite the header after a failed commit: {retract}");
+              }
+            }
+            wal.flush(&mut pager)
+          });
           if let Err(scrub) = scrubbed {
             eprintln!(
               "Warning: could not make the failed commits' rollback durable; the next header \
@@ -1640,12 +1654,19 @@ impl SingleFileDB {
   }
 
   /// Make a round's commits durable as the sync mode asks: write the sealed
-  /// WAL bytes (and in Full mode fsync them) before a header names them,
-  /// then install that header. `commits` is the number of commits the round
-  /// staged. A header written before its WAL bytes names bytes a crash can
-  /// leave unwritten, where recovery reads stale records of an earlier WAL
-  /// cycle. On error the in-memory header is as it was, but for its newer
-  /// change counter (the next header must outrank every slot on disk).
+  /// WAL bytes, then the header naming them, and in Full mode sync once,
+  /// making both durable together. `commits` is the number of commits the
+  /// round staged. On error the in-memory header is as it was, but for its
+  /// newer change counter (the next header must outrank every slot on disk).
+  ///
+  /// A crash during that sync can leave the header on disk without some of
+  /// the WAL pages it names (in Normal mode, which never syncs here, any
+  /// time). Recovery stops at the first record that does not parse, and
+  /// those pages read as the zeros `SealedWrites` wrote and synced there
+  /// before (see `WalBuffer::seal`), never as records an earlier crash or
+  /// WAL cycle left: so it recovers a prefix of the WAL, every commit
+  /// acknowledged before (each round's sync returned before the next round
+  /// wrote) and at most a prefix of this round's, none acknowledged.
   ///
   /// `sealed` is `None` in `SyncMode::Off`, which writes nothing.
   fn persist_commit_round(
@@ -1662,7 +1683,7 @@ impl SingleFileDB {
         self.wal_buffer.lock().note_sealed_written(sealed);
         // A failed round's rewritten records may not be durable yet, and
         // this header names bytes past them: make them durable first.
-        if self.sync_mode == SyncMode::Full || sealed.needs_sync() {
+        if sealed.needs_sync() {
           pager.sync_data()?;
           self.wal_buffer.lock().note_sealed_synced(sealed);
         }
@@ -1701,10 +1722,11 @@ impl SingleFileDB {
       .saturating_sub(1);
     header.next_tx_id = self.next_tx_id.load(std::sync::atomic::Ordering::SeqCst);
     header.last_commit_ts = last_commit_ts;
-    if sealed.is_some() {
+    if let Some(sealed) = sealed {
       #[cfg(feature = "bench-profile")]
       let sync_start = Instant::now();
-      let persisted = self.persist_header(pager, &mut header, self.sync_mode == SyncMode::Full);
+      let full = self.sync_mode == SyncMode::Full;
+      let persisted = self.persist_header(pager, &mut header, full);
       #[cfg(feature = "bench-profile")]
       self
         .wal_flush_ns
@@ -1714,6 +1736,10 @@ impl SingleFileDB {
         *header = prior;
         header.change_counter = change_counter;
         return Err(error);
+      }
+      drop(header);
+      if full {
+        self.wal_buffer.lock().note_sealed_synced(sealed);
       }
     }
     Ok(())

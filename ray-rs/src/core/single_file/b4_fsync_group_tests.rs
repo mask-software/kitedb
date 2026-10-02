@@ -507,6 +507,68 @@ fn wal_records_land_only_on_synced_zeros(sync_mode: SyncMode) {
   assert!(record_bytes > 0, "the workload wrote no WAL records");
 }
 
+/// Zeros ahead cost a small session little: a new database's WAL is created
+/// zeroed, so its commits write no zeros; a reopened one zeroes 64 KiB (and
+/// syncs) before its first commit's records, and nothing more for the next
+/// few small commits.
+#[test]
+fn fg_zeros_ahead_cost_a_small_session_little() {
+  let zero_bytes = |events: &[IoEvent]| -> (usize, usize) {
+    let zeros = events
+      .iter()
+      .filter_map(|event| match event {
+        IoEvent::Write { offset, data }
+          if *offset >= HEADER_END && data.iter().all(|b| *b == 0) =>
+        {
+          Some(data.len())
+        }
+        _ => None,
+      })
+      .sum();
+    let syncs = events
+      .iter()
+      .filter(|event| matches!(event, IoEvent::Sync { .. }))
+      .count();
+    (zeros, syncs)
+  };
+  for sync_mode in [SyncMode::Full, SyncMode::Normal] {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("small-session.kitedb");
+    let db = open_single_file(&path, options(sync_mode)).expect("create");
+    let (_, created) = io_hooks::record_io_during(|| {
+      for index in 0..20 {
+        commit_node(&db, &format!("new-{index}")).expect("commit");
+      }
+    });
+    close_single_file(db).expect("close");
+    let db = open_single_file(&path, options(sync_mode)).expect("reopen");
+    let (_, first) = io_hooks::record_io_during(|| commit_node(&db, "first").expect("commit"));
+    let (_, next) = io_hooks::record_io_during(|| {
+      for index in 0..20 {
+        commit_node(&db, &format!("next-{index}")).expect("commit");
+      }
+    });
+    close_single_file(db).expect("close");
+    let commit_syncs = usize::from(sync_mode == SyncMode::Full);
+    // 64 KiB past the first commit's records, page aligned.
+    let (first_zeros, first_syncs) = zero_bytes(&first);
+    assert!(
+      (64 * 1024..=68 * 1024).contains(&first_zeros),
+      "{sync_mode:?}: the first commit after a reopen zeroed {first_zeros} bytes"
+    );
+    assert_eq!(
+      (zero_bytes(&created), first_syncs, zero_bytes(&next)),
+      (
+        (0, 20 * commit_syncs),
+        1 + commit_syncs,
+        (0, 20 * commit_syncs)
+      ),
+      "{sync_mode:?}: (zero bytes, syncs) of 20 commits to a new database, of the first commit \
+       after a reopen, and of the 20 after it"
+    );
+  }
+}
+
 #[test]
 fn fg_wal_records_land_only_on_synced_zeros_in_full_mode() {
   wal_records_land_only_on_synced_zeros(SyncMode::Full);

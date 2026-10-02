@@ -129,13 +129,16 @@ fn b4_ws_queued_commits_share_one_header() {
 }
 
 /// Finding 1, `SyncMode::Full`: a group makes its records durable with one
-/// WAL sync and one header sync, not two per commit.
+/// sync (of its WAL records and the header naming them), not two per commit.
+/// (The first commit after an open also zeroes the WAL ahead of its records,
+/// and syncs that first; see `WalBuffer`'s "Zeros ahead".)
 #[test]
 fn b4_ws_full_mode_queued_commits_share_syncs() {
   const MEMBERS: usize = 6;
   let dir = tempdir().expect("tempdir");
   let path = dir.path().join("full-syncs.kitedb");
   let db = Arc::new(open_single_file(&path, options(SyncMode::Full)).expect("open"));
+  commit_node(&db, "warm").expect("warm commit");
   let members = (0..MEMBERS)
     .map(|i| -> Member<(Result<()>, usize)> {
       Box::new(move |db: &SingleFileDB| {
@@ -151,7 +154,7 @@ fn b4_ws_full_mode_queued_commits_share_syncs() {
   let syncs: usize = results.iter().map(|(_, syncs)| syncs).sum();
   assert_eq!(
     (headers, syncs),
-    (1, 2),
+    (1, 1),
     "(headers, syncs) of {MEMBERS} queued Full-mode commits"
   );
 }
@@ -324,8 +327,15 @@ fn b4_ws_full_mode_failed_group_sync_fails_every_member() {
     io_hooks::with_failing_syncs(1, || db.commit())
   })];
   members.extend((1..MEMBERS).map(|i| creator(format!("m{i}"))));
-  let (results, headers) = run_group(&db, members);
-  assert_eq!(headers, 0, "no header names the failed group");
+  let head_before = db.header.read().wal_head;
+  let (results, _) = run_group(&db, members);
+  // The header written with the group, before its sync, is overwritten by
+  // one naming only the commits before it.
+  assert_eq!(
+    db.header.read().wal_head,
+    head_before,
+    "the header names the failed group"
+  );
   assert!(
     results.iter().all(Result::is_err),
     "a follower acknowledged before its group's sync: {results:?}"
