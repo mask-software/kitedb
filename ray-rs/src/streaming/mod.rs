@@ -1,7 +1,7 @@
 //! Streaming and pagination helpers
 
 use crate::core::single_file::SingleFileDB;
-use crate::types::{Edge, NodeId};
+use crate::types::{ETypeId, Edge, NodeId};
 
 #[derive(Debug, Clone, Default)]
 pub struct StreamOptions {
@@ -75,48 +75,61 @@ pub fn stream_edges_single(db: &SingleFileDB, options: StreamOptions) -> Vec<Vec
 // =============================================================================
 // Pagination (SingleFileDB)
 // =============================================================================
+//
+// A cursor names the last item of the previous page; the next page starts at
+// the first item ordered after it. A page resumes in place even if the
+// cursor's own node or edge was deleted, and adding or deleting other items
+// never makes a page repeat or skip one (items added before the cursor are
+// not returned). Nodes are ordered by id, edges by (src, etype, dst).
+//
+// Each page lists and sorts every node or edge: O(N log N) per page, until
+// the core offers iterators that seek to a key.
+
+const DEFAULT_PAGE_LIMIT: usize = 100;
 
 pub fn nodes_page_single(db: &SingleFileDB, options: PaginationOptions) -> Page<NodeId> {
-  let limit = if options.limit == 0 {
-    100
+  let start_after = options.cursor.as_deref().and_then(parse_node_cursor);
+  // `list_nodes` is sorted by id.
+  let nodes = db.list_nodes();
+  let start = start_after.map_or(0, |cursor| nodes.partition_point(|&id| id <= cursor));
+  page_of(&nodes[start..], options.limit, |id| format!("n:{id}"))
+}
+
+pub fn edges_page_single(db: &SingleFileDB, options: PaginationOptions) -> Page<Edge> {
+  let start_after = options.cursor.as_deref().and_then(parse_edge_cursor);
+  let mut edges: Vec<Edge> = db
+    .list_edges(None)
+    .into_iter()
+    .map(|edge| Edge {
+      src: edge.src,
+      etype: edge.etype,
+      dst: edge.dst,
+    })
+    .collect();
+  edges.sort_unstable_by_key(edge_order);
+  let start = start_after.map_or(0, |cursor| {
+    edges.partition_point(|edge| edge_order(edge) <= cursor)
+  });
+  page_of(&edges[start..], options.limit, |edge| {
+    format!("e:{}:{}:{}", edge.src, edge.etype, edge.dst)
+  })
+}
+
+/// The first `limit` items (100 for 0) of `rest`, with a cursor at the last
+/// one if more follow.
+fn page_of<T: Copy>(rest: &[T], limit: usize, cursor_of: impl Fn(&T) -> String) -> Page<T> {
+  let limit = if limit == 0 {
+    DEFAULT_PAGE_LIMIT
   } else {
-    options.limit
+    limit
   };
-  let mut start_after: Option<NodeId> = None;
-  if let Some(cursor) = options.cursor.as_ref() {
-    if let Some(stripped) = cursor.strip_prefix("n:") {
-      if let Ok(id) = stripped.parse::<u64>() {
-        start_after = Some(id);
-      }
-    }
-  }
-
-  let mut items = Vec::new();
-  let mut found_start = start_after.is_none();
-  for node_id in db.list_nodes() {
-    if !found_start {
-      if Some(node_id) == start_after {
-        found_start = true;
-      }
-      continue;
-    }
-    items.push(node_id);
-    if items.len() > limit {
-      break;
-    }
-  }
-
-  let has_more = items.len() > limit;
-  if has_more {
-    items.pop();
-  }
-
+  let has_more = rest.len() > limit;
+  let items = rest[..rest.len().min(limit)].to_vec();
   let next_cursor = if has_more {
-    items.last().map(|id| format!("n:{id}"))
+    items.last().map(cursor_of)
   } else {
     None
   };
-
   Page {
     items,
     next_cursor,
@@ -125,66 +138,20 @@ pub fn nodes_page_single(db: &SingleFileDB, options: PaginationOptions) -> Page<
   }
 }
 
-pub fn edges_page_single(db: &SingleFileDB, options: PaginationOptions) -> Page<Edge> {
-  let limit = if options.limit == 0 {
-    100
-  } else {
-    options.limit
-  };
-  let mut start_after: Option<(NodeId, u32, NodeId)> = None;
-  if let Some(cursor) = options.cursor.as_ref() {
-    if let Some(stripped) = cursor.strip_prefix("e:") {
-      let parts: Vec<&str> = stripped.split(':').collect();
-      if parts.len() == 3 {
-        if let (Ok(src), Ok(etype), Ok(dst)) = (
-          parts[0].parse::<u64>(),
-          parts[1].parse::<u32>(),
-          parts[2].parse::<u64>(),
-        ) {
-          start_after = Some((src, etype, dst));
-        }
-      }
-    }
-  }
+fn edge_order(edge: &Edge) -> (NodeId, ETypeId, NodeId) {
+  (edge.src, edge.etype, edge.dst)
+}
 
-  let mut items = Vec::new();
-  let mut found_start = start_after.is_none();
-  for edge in db.list_edges(None) {
-    if !found_start {
-      if let Some((src, etype, dst)) = start_after {
-        if edge.src == src && edge.etype == etype && edge.dst == dst {
-          found_start = true;
-        }
-      }
-      continue;
-    }
-    items.push(Edge {
-      src: edge.src,
-      etype: edge.etype,
-      dst: edge.dst,
-    });
-    if items.len() > limit {
-      break;
-    }
-  }
+/// `n:<id>`. An unparsable cursor starts from the beginning.
+fn parse_node_cursor(cursor: &str) -> Option<NodeId> {
+  cursor.strip_prefix("n:")?.parse().ok()
+}
 
-  let has_more = items.len() > limit;
-  if has_more {
-    items.pop();
-  }
-
-  let next_cursor = if has_more {
-    items
-      .last()
-      .map(|edge| format!("e:{}:{}:{}", edge.src, edge.etype, edge.dst))
-  } else {
-    None
-  };
-
-  Page {
-    items,
-    next_cursor,
-    has_more,
-    total: None,
-  }
+/// `e:<src>:<etype>:<dst>`. An unparsable cursor starts from the beginning.
+fn parse_edge_cursor(cursor: &str) -> Option<(NodeId, ETypeId, NodeId)> {
+  let mut parts = cursor.strip_prefix("e:")?.split(':');
+  let src = parts.next()?.parse().ok()?;
+  let etype = parts.next()?.parse().ok()?;
+  let dst = parts.next()?.parse().ok()?;
+  parts.next().is_none().then_some((src, etype, dst))
 }
