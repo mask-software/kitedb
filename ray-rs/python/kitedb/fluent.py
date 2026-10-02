@@ -881,7 +881,7 @@ class Kite:
             self._db.commit()
             return results
         except BaseException:
-            self._db.rollback()
+            self._rollback_if_open()
             raise
 
     def bulk(self, operations: List[Any]) -> List[Any]:
@@ -914,7 +914,7 @@ class Kite:
             self._db.commit()
             return results
         except BaseException:
-            self._db.rollback()
+            self._rollback_if_open()
             raise
     
     @contextmanager
@@ -939,12 +939,20 @@ class Kite:
             yield self
             self._db.commit()
         except BaseException:
-            self._db.rollback()
+            self._rollback_if_open()
             raise
     
     def in_transaction(self) -> bool:
         """Check if currently in a transaction."""
         return self._db.has_transaction()
+
+    def _rollback_if_open(self) -> None:
+        """Roll back this thread's transaction after a failure, if it is
+        still open. A failed commit has already ended it (a ConflictError, for
+        one), and rolling back then would raise TransactionError in place of
+        the error the caller needs."""
+        if self._db.has_transaction():
+            self._db.rollback()
     
     # ==========================================================================
     # Context Manager
