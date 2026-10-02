@@ -749,7 +749,9 @@ fn decode_vector_payload(
   vector_data: &[u8],
   idx: usize,
 ) -> Result<Vec<f32>> {
-  if (idx + 1) * 8 > vector_offsets.len() {
+  // Vector `idx` spans offsets `idx` and `idx + 1`.
+  let offsets_end = idx.checked_add(2).and_then(|count| count.checked_mul(8));
+  if offsets_end.is_none_or(|end| end > vector_offsets.len()) {
     return Err(KiteError::InvalidSnapshot(format!(
       "Vector index out of range: {idx}"
     )));
@@ -830,6 +832,27 @@ mod tests {
 
     let second = decode_vector_payload(&offsets, &data, 1).expect("expected value");
     assert_eq!(second, vec![0.3, 1.0, 2.0]);
+  }
+
+  /// Vector `idx` spans `offsets[idx]..offsets[idx + 1]`, so it needs
+  /// `idx + 2` offsets. The bound checked for `idx + 1`, so the last offset's
+  /// index passed and reading its end panicked (and a huge index overflowed).
+  /// Unreachable from a loaded snapshot, whose load rejects such an index.
+  #[test]
+  fn decode_vector_payload_rejects_an_index_without_an_end_offset() {
+    let offsets: Vec<u8> = [0u64, 8].iter().flat_map(|off| off.to_le_bytes()).collect();
+    let data: Vec<u8> = [0.5f32, 1.5].iter().flat_map(|v| v.to_le_bytes()).collect();
+    assert_eq!(
+      decode_vector_payload(&offsets, &data, 0).expect("vector 0"),
+      vec![0.5, 1.5]
+    );
+    for idx in [1, 2, usize::MAX / 8, usize::MAX] {
+      let decoded = std::panic::catch_unwind(|| decode_vector_payload(&offsets, &data, idx));
+      assert!(
+        matches!(decoded, Ok(Err(_))),
+        "index {idx} of 2 offsets must be an error, got {decoded:?}"
+      );
+    }
   }
 
   #[test]

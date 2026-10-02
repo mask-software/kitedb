@@ -13,7 +13,7 @@
 //!
 //! ## Reader-Writer Contention Tests
 //! - `test_readers_during_write` - Verifies readers complete during writes
-//! - `test_write_does_not_starve_readers` - Ensures fair scheduling
+//! - `test_write_does_not_starve_readers` - Readers queued behind a write batch read before the next
 //!
 //! ## MVCC Transaction Isolation Tests
 //! - `test_mvcc_concurrent_transactions_no_conflict` - Non-conflicting transactions
@@ -466,95 +466,160 @@ mod tests {
     assert_eq!(total_writes, 20, "All writes should complete");
   }
 
+  /// Readers queued behind a writer's batch get the lock before its next batch. Checked by
+  /// ordering, not wall-clock time (a loaded machine can stall any thread for longer than a
+  /// time bound): for each batch the writer takes the write lock, waits until every reader is
+  /// about to read, so each read waits behind the batch, writes the batch, releases the lock,
+  /// and waits until every reader has read. A writer that held the lock across its batches
+  /// would wait for reads that cannot happen, and fail after `STARVATION_TIMEOUT`.
   #[test]
   fn test_write_does_not_starve_readers() {
-    let (_temp_dir, ray) = setup_test_db(50, 25);
+    const READERS: usize = 2;
+    const BATCHES: usize = 10;
+    const BATCH_SIZE: usize = 5;
+    const INITIAL_NODES: usize = 50;
+    /// Only a writer that never lets readers in waits this long; a loaded machine does not.
+    const STARVATION_TIMEOUT: Duration = Duration::from_secs(30);
+
+    #[derive(Default)]
+    struct Progress {
+      /// The batch holding (or last holding) the write lock.
+      batch: Option<usize>,
+      /// Per reader: the batch it is about to read behind.
+      queued: [Option<usize>; READERS],
+      /// Per reader: the last batch it read behind.
+      read: [Option<usize>; READERS],
+      /// (batch, nodes seen) for every read.
+      seen: Vec<(usize, u64)>,
+      writer_done: bool,
+    }
+    type Shared = (parking_lot::Mutex<Progress>, parking_lot::Condvar);
+
+    /// Wait until `done`, or fail with `what` after `STARVATION_TIMEOUT`.
+    fn wait_for(
+      shared: &Shared,
+      what: &str,
+      done: impl Fn(&Progress) -> bool,
+    ) -> Result<(), String> {
+      let (progress, changed) = shared;
+      let deadline = Instant::now() + STARVATION_TIMEOUT;
+      let mut progress = progress.lock();
+      while !done(&progress) {
+        if changed.wait_until(&mut progress, deadline).timed_out() && !done(&progress) {
+          return Err(format!(
+            "{what} within {STARVATION_TIMEOUT:?}: writer starves readers"
+          ));
+        }
+      }
+      Ok(())
+    }
+
+    let (_temp_dir, ray) = setup_test_db(INITIAL_NODES, 25);
     let ray = Arc::new(parking_lot::RwLock::new(ray));
-    let barrier = Arc::new(Barrier::new(3)); // 2 readers + 1 writer
-    let reader_times = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let shared: Arc<Shared> = Arc::default();
 
-    // Reader 1
-    let reader1_handle = {
-      let ray = Arc::clone(&ray);
-      let barrier = Arc::clone(&barrier);
-      let times = Arc::clone(&reader_times);
-
-      thread::spawn(move || {
-        barrier.wait();
-
-        for _ in 0..50 {
-          let start = Instant::now();
-          {
-            let ray_guard = ray.read();
-            let _ = ray_guard.get("User", "user0");
+    let readers: Vec<_> = (0..READERS)
+      .map(|reader| {
+        let ray = Arc::clone(&ray);
+        let shared = Arc::clone(&shared);
+        thread::spawn(move || {
+          let (progress, changed) = &*shared;
+          let mut last = None;
+          loop {
+            let batch = {
+              let mut progress = progress.lock();
+              loop {
+                if progress.writer_done {
+                  return;
+                }
+                if let Some(batch) = progress.batch.filter(|&batch| Some(batch) != last) {
+                  progress.queued[reader] = Some(batch);
+                  changed.notify_all();
+                  break batch;
+                }
+                changed.wait(&mut progress);
+              }
+            };
+            // Waits for the writer to release the batch.
+            let nodes = {
+              let ray_guard = ray.read();
+              let found = ray_guard.get("User", "user0");
+              assert!(matches!(found, Ok(Some(_))), "read user0: {found:?}");
+              ray_guard.count_nodes()
+            };
+            last = Some(batch);
+            let mut progress = progress.lock();
+            progress.read[reader] = Some(batch);
+            progress.seen.push((batch, nodes));
+            changed.notify_all();
           }
-          let elapsed = start.elapsed();
-          times.lock().push(elapsed);
-          thread::sleep(Duration::from_micros(100));
+        })
+      })
+      .collect();
+
+    let writer = {
+      let ray = Arc::clone(&ray);
+      let shared = Arc::clone(&shared);
+      thread::spawn(move || {
+        let mut outcome = Ok(());
+        for batch in 0..BATCHES {
+          let mut ray_guard = ray.write();
+          {
+            let (progress, changed) = &*shared;
+            progress.lock().batch = Some(batch);
+            changed.notify_all();
+          }
+          outcome = wait_for(
+            &shared,
+            "readers did not queue behind the batch",
+            |progress| progress.queued.iter().all(|queued| *queued == Some(batch)),
+          );
+          if outcome.is_err() {
+            break;
+          }
+          for j in 0..BATCH_SIZE {
+            let mut props = HashMap::new();
+            props.insert(
+              "name".to_string(),
+              PropValue::String(format!("BatchUser{batch}_{j}")),
+            );
+            ray_guard
+              .create_node("User", &format!("batch{batch}_{j}"), props)
+              .expect("create node");
+          }
+          drop(ray_guard);
+          outcome = wait_for(
+            &shared,
+            "readers did not read between batches",
+            |progress| progress.read.iter().all(|read| *read == Some(batch)),
+          );
+          if outcome.is_err() {
+            break;
+          }
         }
+        let (progress, changed) = &*shared;
+        progress.lock().writer_done = true;
+        changed.notify_all();
+        outcome
       })
     };
 
-    // Reader 2
-    let reader2_handle = {
-      let ray = Arc::clone(&ray);
-      let barrier = Arc::clone(&barrier);
-      let times = Arc::clone(&reader_times);
+    let outcome = writer.join().expect("writer thread");
+    for reader in readers {
+      reader.join().expect("reader thread");
+    }
+    outcome.unwrap_or_else(|message| panic!("{message}"));
 
-      thread::spawn(move || {
-        barrier.wait();
-
-        for _ in 0..50 {
-          let start = Instant::now();
-          {
-            let ray_guard = ray.read();
-            let _ = ray_guard.get("User", "user1");
-          }
-          let elapsed = start.elapsed();
-          times.lock().push(elapsed);
-          thread::sleep(Duration::from_micros(100));
-        }
-      })
-    };
-
-    // Writer (does longer writes)
-    let writer_handle = {
-      let ray = Arc::clone(&ray);
-      let barrier = Arc::clone(&barrier);
-
-      thread::spawn(move || {
-        barrier.wait();
-
-        for i in 0..10 {
-          {
-            let mut ray_guard = ray.write();
-            // Simulate longer write operation
-            for j in 0..5 {
-              let mut props = HashMap::new();
-              props.insert(
-                "name".to_string(),
-                PropValue::String(format!("BatchUser{i}_{j}")),
-              );
-              let _ = ray_guard.create_node("User", &format!("batch{i}_{j}"), props);
-            }
-          }
-          thread::sleep(Duration::from_micros(500));
-        }
-      })
-    };
-
-    reader1_handle.join().expect("expected value");
-    reader2_handle.join().expect("expected value");
-    writer_handle.join().expect("expected value");
-
-    let times = reader_times.lock();
-    let max_read_time = times.iter().max().expect("expected value");
-
-    // Reads should not be blocked for more than 100ms (generous threshold)
-    assert!(
-      *max_read_time < Duration::from_millis(100),
-      "Max read time {max_read_time:?} exceeded threshold - possible writer starvation"
-    );
+    // Each read ran between two batches, and saw every batch before it whole.
+    let progress = shared.0.lock();
+    assert_eq!(progress.seen.len(), READERS * BATCHES);
+    for &(batch, nodes) in &progress.seen {
+      assert_eq!(
+        nodes,
+        (INITIAL_NODES + BATCH_SIZE * (batch + 1)) as u64,
+        "a read behind batch {batch} saw {nodes} nodes"
+      );
+    }
   }
 
   // ============================================================================

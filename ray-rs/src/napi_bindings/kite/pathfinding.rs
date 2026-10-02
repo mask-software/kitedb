@@ -12,7 +12,6 @@ use crate::api::pathfinding::{bfs, dijkstra, yen_k_shortest, PathConfig, PathRes
 use crate::api::traversal::TraversalDirection;
 use crate::types::{ETypeId, NodeId, PropKeyId, PropValue};
 
-use super::helpers::neighbors;
 use crate::napi_bindings::validation;
 
 // =============================================================================
@@ -174,7 +173,7 @@ impl KitePath {
       let weights = EdgeWeights::new(ray, self.weight_prop.as_deref());
       let result = dijkstra(
         self.config(),
-        |node_id, dir, etype| neighbors(ray.raw(), node_id, dir, etype),
+        |node_id, dir, etype| ray.neighbors(node_id, dir, etype),
         |src, etype, dst| weights.weight(src, etype, dst),
       );
       weights.finish(JsPathResult::from(result))
@@ -185,7 +184,7 @@ impl KitePath {
   pub fn find_bfs(&self) -> Result<JsPathResult> {
     self.with_ray(|ray| {
       let result = bfs(self.config(), |node_id, dir, etype| {
-        neighbors(ray.raw(), node_id, dir, etype)
+        ray.neighbors(node_id, dir, etype)
       });
       Ok(JsPathResult::from(result))
     })
@@ -199,7 +198,7 @@ impl KitePath {
       let results = yen_k_shortest(
         self.config(),
         k,
-        |node_id, dir, etype| neighbors(ray.raw(), node_id, dir, etype),
+        |node_id, dir, etype| ray.neighbors(node_id, dir, etype),
         |src, etype, dst| weights.weight(src, etype, dst),
       );
       weights.finish(results.into_iter().map(JsPathResult::from).collect())

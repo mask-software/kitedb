@@ -8,6 +8,8 @@ impl SingleFileDB {
   /// Check database integrity.
   ///
   /// Performs validation checks on the database structure:
+  /// - Checks the snapshot's invariants (`check_snapshot`), reported with a
+  ///   `snapshot: ` prefix
   /// - Verifies edge endpoints exist
   /// - Validates edge existence via edge_exists
   /// - Compares list counts against count_* helpers
@@ -15,13 +17,24 @@ impl SingleFileDB {
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
 
+    if let Some(snapshot) = self.snapshot.read().as_ref() {
+      let report = crate::check::check_snapshot(snapshot);
+      errors.extend(report.errors.into_iter().map(|e| format!("snapshot: {e}")));
+      warnings.extend(
+        report
+          .warnings
+          .into_iter()
+          .map(|w| format!("snapshot: {w}")),
+      );
+    }
+
     let all_nodes = self.list_nodes();
     let node_count = all_nodes.len();
 
     if node_count == 0 {
       warnings.push("No nodes in database".to_string());
       return CheckResult {
-        valid: true,
+        valid: errors.is_empty(),
         errors,
         warnings,
       };
@@ -77,3 +90,8 @@ impl SingleFileDB {
     }
   }
 }
+
+/// raydb-b4 core-misc: `check()` runs the snapshot checks.
+#[cfg(test)]
+#[path = "b4_core_misc_check_tests.rs"]
+mod b4_core_misc_tests;
