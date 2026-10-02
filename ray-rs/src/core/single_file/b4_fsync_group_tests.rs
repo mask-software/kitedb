@@ -426,11 +426,13 @@ fn fg1_full_fsync_is_the_one_sync() {
 // ============================================================================
 
 /// The invariant the crash images rely on, checked on the pager's log of a
-/// workload on a reopened database (commits of several sizes from several
-/// threads, and a blocking checkpoint that resets the WAL): every byte of
-/// WAL records written to the file lands where zeros were written and then
-/// synced, since the open. (A database's first open creates its WAL as
-/// synced zeros, so its records need no zeros written first.)
+/// workload on a reopened database (commits of several sizes, alone and in
+/// a group): every byte of WAL records written to the file lands where zeros
+/// were written and then synced, since the open. (A database's first open
+/// creates its WAL as synced zeros, and a checkpoint gives the region it
+/// empties a fresh salt, which no record past the head can have: records
+/// need no zeros written first there; see
+/// `fg_zeros_ahead_cost_a_small_session_little`.)
 fn wal_records_land_only_on_synced_zeros(sync_mode: SyncMode) {
   let dir = tempdir().expect("tempdir");
   let path = dir.path().join("zeros.kitedb");
@@ -466,7 +468,6 @@ fn wal_records_land_only_on_synced_zeros(sync_mode: SyncMode) {
     logs.push(events);
   }
   let (_, events) = io_hooks::record_io_during(|| {
-    db.checkpoint().expect("checkpoint");
     for key in mixed_keys("after", 9) {
       commit_node(&db, &key).expect("commit");
     }
@@ -510,7 +511,10 @@ fn wal_records_land_only_on_synced_zeros(sync_mode: SyncMode) {
 /// Zeros ahead cost a small session little: a new database's WAL is created
 /// zeroed, so its commits write no zeros; a reopened one zeroes 64 KiB (and
 /// syncs) before its first commit's records, and nothing more for the next
-/// few small commits.
+/// few small commits; and after a checkpoint (blocking, or background),
+/// whose region has a fresh salt, none. (After a background checkpoint that
+/// retained commits, see `fg_crash_after_a_region_switch_keeps_acknowledged_
+/// commits`.)
 #[test]
 fn fg_zeros_ahead_cost_a_small_session_little() {
   let zero_bytes = |events: &[IoEvent]| -> (usize, usize) {
@@ -548,6 +552,18 @@ fn fg_zeros_ahead_cost_a_small_session_little() {
         commit_node(&db, &format!("next-{index}")).expect("commit");
       }
     });
+    db.checkpoint().expect("checkpoint");
+    let (_, after_reset) = io_hooks::record_io_during(|| {
+      for index in 0..20 {
+        commit_node(&db, &format!("reset-{index}")).expect("commit");
+      }
+    });
+    db.background_checkpoint().expect("background checkpoint");
+    let (_, after_install) = io_hooks::record_io_during(|| {
+      for index in 0..20 {
+        commit_node(&db, &format!("install-{index}")).expect("commit");
+      }
+    });
     close_single_file(db).expect("close");
     let commit_syncs = usize::from(sync_mode == SyncMode::Full);
     // 64 KiB past the first commit's records, page aligned.
@@ -556,15 +572,19 @@ fn fg_zeros_ahead_cost_a_small_session_little() {
       (64 * 1024..=68 * 1024).contains(&first_zeros),
       "{sync_mode:?}: the first commit after a reopen zeroed {first_zeros} bytes"
     );
+    let twenty = (0, 20 * commit_syncs);
     assert_eq!(
-      (zero_bytes(&created), first_syncs, zero_bytes(&next)),
       (
-        (0, 20 * commit_syncs),
-        1 + commit_syncs,
-        (0, 20 * commit_syncs)
+        zero_bytes(&created),
+        first_syncs,
+        zero_bytes(&next),
+        zero_bytes(&after_reset),
+        zero_bytes(&after_install)
       ),
-      "{sync_mode:?}: (zero bytes, syncs) of 20 commits to a new database, of the first commit \
-       after a reopen, and of the 20 after it"
+      (twenty, 1 + commit_syncs, twenty, twenty, twenty),
+      "{sync_mode:?}: (zero bytes, syncs) of 20 commits to a new database, syncs of the first \
+       commit after a reopen, (zero bytes, syncs) of the 20 after it, after a checkpoint, and \
+       after a background checkpoint"
     );
   }
 }

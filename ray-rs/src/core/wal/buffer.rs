@@ -42,6 +42,17 @@
 //! its own for them. Writes a sync makes durable before any header names
 //! them (a compaction's or merge's) need no zeros, and neither does a new
 //! database, whose WAL is created as zeros its creating sync made durable.
+//!
+//! Nor does a region just given a fresh salt: no byte is ever written under
+//! a salt before a durable header names it, and a fresh salt is past every
+//! salt a header ever named (salts only grow), so no byte past the head
+//! holds a record under it. A blocking checkpoint's reset and a background
+//! checkpoint's cut install their header before writing; a compaction
+//! rewrites the primary region under the salt the install that retired it
+//! gave it (see [`WalBuffer::retire_primary_region`]). Only the first
+//! compaction after that retire, in the same process, counts as fresh: a
+//! retried one, or one finished on open, may find an earlier attempt's
+//! records past its own.
 
 use std::collections::{HashMap, HashSet};
 
@@ -125,6 +136,10 @@ pub struct WalBuffer {
   /// about as far past the records as records were written since (see
   /// [`Self::zero_ahead`]).
   zero_base: u64,
+  /// The primary region's salt was given by [`Self::retire_primary_region`]
+  /// and nothing was written under it since: the compaction that follows
+  /// rewrites a region holding no record under its salt.
+  primary_salt_unwritten: bool,
 }
 
 /// The buffered writes [`WalBuffer::seal`] took for a commit group to write
@@ -210,6 +225,7 @@ impl WalBuffer {
       unsynced_rollbacks: false,
       zeroed_end: 0,
       zero_base: 0,
+      primary_salt_unwritten: false,
     }
   }
 
@@ -318,6 +334,8 @@ impl WalBuffer {
       // Past the head lies whatever a crash left there.
       zeroed_end: header.wal_head,
       zero_base: header.wal_head,
+      // An earlier process may have begun compacting under it.
+      primary_salt_unwritten: false,
     })
   }
 
@@ -436,13 +454,19 @@ impl WalBuffer {
     }
     // Writing starts over at the region's start: earlier cuts' records there
     // must not parse as this one's.
-    if !self.has_secondary_records() {
+    let fresh = !self.has_secondary_records();
+    if fresh {
       self.secondary_salt = self.fresh_salt();
     }
     self.active_region = 1;
     // Update head to track active position
     self.head = self.secondary_head;
-    self.forget_zeros();
+    if fresh {
+      // The cut's header names the salt before anything is written there.
+      self.trust_fresh_salt();
+    } else {
+      self.forget_zeros();
+    }
   }
 
   /// The records a background checkpoint cut must copy into the secondary
@@ -544,12 +568,19 @@ impl WalBuffer {
   /// [`Self::compact_secondary_into_primary`] rewrites the retained records at
   /// its start. No bytes are written, so the WAL named by the previous header
   /// stays intact until a header for this state is durable.
+  ///
+  /// The primary region gets its next salt here, which the header for this
+  /// state names (no reader of a retired primary region uses it) before the
+  /// compaction writes any record under it: so it is fresh for that
+  /// compaction (see "Zeros ahead" in the module docs).
   pub fn retire_primary_region(&mut self) {
     let switches = self.active_region != 1;
     self.primary_head = self.primary_region_size;
     self.tail = self.secondary_region_start;
     self.active_region = 1;
     self.head = self.secondary_head;
+    self.primary_salt = self.fresh_salt();
+    self.primary_salt_unwritten = true;
     if switches {
       self.forget_zeros();
     }
@@ -635,6 +666,7 @@ impl WalBuffer {
     self.primary_salt = state.primary_salt;
     self.secondary_salt = state.secondary_salt;
     // Bytes written past the head since the state was saved may lie there.
+    self.primary_salt_unwritten = false;
     self.forget_zeros();
   }
 
@@ -696,7 +728,10 @@ impl WalBuffer {
   /// install.
   ///
   /// The records are copied as they are, re-salted for the primary region
-  /// (each CRC XORed with both salts), not decoded and rebuilt.
+  /// (each CRC XORed with both salts), not decoded and rebuilt. The primary
+  /// region keeps the salt [`Self::retire_primary_region`] gave it, which a
+  /// durable header names: a salt given here could be one an attempt a crash
+  /// interrupted wrote under, and a later fresh salt could repeat it.
   fn merge_secondary_into_primary(&mut self, read: Vec<u8>, pager: &mut FilePager) -> Result<()> {
     let mut records = self.secondary_record_bytes(read, pager)?;
     if records.len() as u64 > self.primary_region_size {
@@ -709,13 +744,15 @@ impl WalBuffer {
     self.tail = 0;
     self.active_region = 0;
     self.head = 0;
-    // The primary region is rewritten from its start.
-    self.primary_salt = self.fresh_salt();
 
     xor_salt(&mut records, secondary_salt ^ self.primary_salt)?;
     self.primary_head = records.len() as u64;
     self.head = self.primary_head;
-    self.forget_zeros();
+    if std::mem::take(&mut self.primary_salt_unwritten) {
+      self.trust_fresh_salt();
+    } else {
+      self.forget_zeros();
+    }
     self.pending.write_vec(self.file_offset(0), records);
     Ok(())
   }
@@ -1193,6 +1230,14 @@ impl WalBuffer {
     self.zero_base = self.head;
   }
 
+  /// The active region was just given a fresh salt, which a durable header
+  /// names before anything is written under it: no byte past the head holds
+  /// a record under it (see "Zeros ahead" in the module docs).
+  fn trust_fresh_salt(&mut self) {
+    self.zeroed_end = self.active_region_end();
+    self.zero_base = self.head;
+  }
+
   /// How far past the buffered runs, which end at `records_end`, the zeros
   /// ahead reach: as far as records were written since they started over
   /// (`zero_base`), so a database written to a little pays little and one
@@ -1396,7 +1441,9 @@ impl WalBuffer {
     self.secondary_head = self.secondary_region_start;
     self.active_region = 0;
     self.primary_salt = self.fresh_salt();
-    self.forget_zeros();
+    self.primary_salt_unwritten = false;
+    // The header naming the salt is installed before anything is written.
+    self.trust_fresh_salt();
   }
 
   /// Clear pending writes without flushing
@@ -1728,6 +1775,7 @@ pub struct WalBufferStats {
 mod tests {
   use super::*;
   use crate::core::pager::create_pager;
+  use crate::core::pager::io_hooks::{self, IoEvent};
   use crate::core::wal::record::build_create_node_payload;
   use tempfile::NamedTempFile;
 
@@ -2474,22 +2522,26 @@ mod tests {
   }
 
   /// Compaction rewrites the retained records from the primary region's
-  /// start, so it salts them afresh. Restoring a saved region state (as a
-  /// failed install does) restores the salts with the positions, matching
-  /// the durable header.
+  /// start, so they get a fresh salt: the one retiring the primary region
+  /// gave it, which the header naming the retired state records before the
+  /// compaction writes under it. Restoring a saved region state (as a failed
+  /// install does) restores the salts with the positions, matching the
+  /// durable header.
   #[test]
   fn compaction_salts_afresh_and_region_state_restores_salts() {
     let (mut pager, _temp) = create_test_pager();
     let mut buffer = buffer_with_cut(&mut pager, 3, &[10]);
+    let (cut_primary_salt, secondary_salt) = (buffer.primary_salt, buffer.secondary_salt);
     buffer.retire_primary_region();
     let retained = buffer.region_state();
-    let (primary_salt, secondary_salt) = (buffer.primary_salt, buffer.secondary_salt);
+    let primary_salt = buffer.primary_salt;
+    assert_ne!(primary_salt, cut_primary_salt);
+    assert_ne!(primary_salt, secondary_salt);
 
     buffer
       .compact_secondary_into_primary(&mut pager)
       .expect("compact");
-    assert_ne!(buffer.primary_salt, primary_salt);
-    assert_ne!(buffer.primary_salt, secondary_salt);
+    assert_eq!(buffer.primary_salt, primary_salt);
     assert_eq!(txids(&mut buffer, &mut pager), vec![10]);
 
     buffer.restore_region_state(retained);
@@ -2499,6 +2551,81 @@ mod tests {
       (primary_salt, secondary_salt)
     );
     assert_eq!(txids(&mut buffer, &mut pager), vec![10]);
+  }
+
+  /// Zeros ahead start over where nothing is known past the head, and are
+  /// not needed where the region was just given a salt no record has: a
+  /// reset, a cut that starts the secondary region afresh, and the first
+  /// compaction after a retire (whose salt the retired state's header
+  /// names). A compaction retried after a failed one, or begun from a header
+  /// (on open), may find an earlier attempt's records past its own.
+  #[test]
+  fn zeros_ahead_trust_only_regions_with_a_fresh_salt() {
+    let (mut pager, _temp) = create_test_pager();
+    let mut buffer = buffer_with_cut(&mut pager, 3, &[10]);
+    assert_eq!(
+      buffer.zeroed_end, buffer.capacity,
+      "a cut into an empty secondary region"
+    );
+    buffer.retire_primary_region();
+    let retained = buffer.region_state();
+    let mut header = test_header();
+    buffer.store_in_header(&mut header);
+    buffer
+      .compact_secondary_into_primary(&mut pager)
+      .expect("compact");
+    assert_eq!(
+      buffer.zeroed_end, buffer.primary_region_size,
+      "the first compaction after a retire"
+    );
+
+    // A failed attempt, then a retry: the retry may land short of the
+    // records the failed attempt wrote.
+    buffer.restore_region_state(retained);
+    assert_eq!(buffer.zeroed_end, buffer.head);
+    buffer
+      .compact_secondary_into_primary(&mut pager)
+      .expect("compact again");
+    assert_eq!(buffer.zeroed_end, buffer.head, "a retried compaction");
+
+    // Finished on open, from the retired state's header.
+    let mut reopened = WalBuffer::from_header(&header).expect("from header");
+    reopened
+      .compact_secondary_into_primary(&mut pager)
+      .expect("compact on open");
+    assert_eq!(
+      reopened.zeroed_end, reopened.head,
+      "a compaction begun from a header"
+    );
+
+    reopened.reset();
+    assert_eq!(reopened.zeroed_end, reopened.primary_region_size, "a reset");
+  }
+
+  /// Records reaching past the durable zeros are preceded by zeros up to
+  /// past them, and a sync, in one flush; records within them are not.
+  #[test]
+  fn flush_zeroes_and_syncs_ahead_of_records_past_the_zeros() {
+    let (mut pager, _temp) = create_test_pager();
+    let mut header = test_header();
+    header.wal_head = 0;
+    let mut buffer = WalBuffer::from_header(&header).expect("from header");
+    write_node_record(&mut buffer, 1);
+    let ((), events) = io_hooks::record_io_during(|| buffer.flush(&mut pager).expect("flush"));
+    let kinds: Vec<&str> = events
+      .iter()
+      .map(|event| match event {
+        IoEvent::Write { data, .. } if data.iter().all(|byte| *byte == 0) => "zeros",
+        IoEvent::Write { .. } => "records",
+        IoEvent::Sync { .. } => "sync",
+      })
+      .collect();
+    assert_eq!(kinds, ["zeros", "sync", "records"]);
+    assert!(buffer.zeroed_end > buffer.head);
+
+    write_node_record(&mut buffer, 2);
+    let ((), events) = io_hooks::record_io_during(|| buffer.flush(&mut pager).expect("flush"));
+    assert_eq!(events.len(), 1, "records within the zeros: {events:?}");
   }
 
   #[test]
