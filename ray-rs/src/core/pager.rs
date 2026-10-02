@@ -160,7 +160,8 @@ fn read_full_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<
 }
 
 /// Write all of `data` at file `offset`, writing again after a short write.
-fn write_all_at(file: &File, mut data: &[u8], mut offset: u64) -> std::io::Result<()> {
+fn write_all_at(file: &File, all: &[u8], start: u64) -> std::io::Result<()> {
+  let (mut data, mut offset) = (all, start);
   while !data.is_empty() {
     io_hooks::syscall();
     match write_at(file, data, offset) {
@@ -173,6 +174,7 @@ fn write_all_at(file: &File, mut data: &[u8], mut offset: u64) -> std::io::Resul
       Err(error) => return Err(error),
     }
   }
+  io_hooks::wrote(start, all);
   Ok(())
 }
 
@@ -579,6 +581,13 @@ impl FilePager {
     if self.read_only {
       return Ok(());
     }
+    io_hooks::before_sync()?;
+    let synced = self.sync_file();
+    io_hooks::synced(synced.is_ok());
+    synced
+  }
+
+  fn sync_file(&self) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
       use std::os::unix::io::AsRawFd;

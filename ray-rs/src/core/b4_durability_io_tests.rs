@@ -18,16 +18,22 @@
 //!   not reproduce on the crash-safe compactor).
 //! - f9: dropping a `SyncMode::Off` database without closing it lost every
 //!   commit since the last checkpoint.
+//! - x (from the wave-2 integration report): in `SyncMode::Normal`, a commit
+//!   whose header write failed left its COMMIT record in the file under the
+//!   region's salt; an OS crash after the next commit's header write, before
+//!   its WAL page landed, replayed the failed commit.
 //!
 //! Finding 7 (hazardous test-only `WalBuffer` methods) needs no test.
 
+use std::collections::HashSet;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 
 use tempfile::tempdir;
 
 use crate::core::header::{read_header_slots, write_header_slot, HEADER_SLOT_A, HEADER_SLOT_B};
-use crate::core::pager::{create_pager, io_hooks, open_pager};
+use crate::core::pager::io_hooks::{self, IoEvent};
+use crate::core::pager::{create_pager, open_pager};
 use crate::core::single_file::{
   close_single_file, open_single_file, ResizeWalOptions, SingleFileDB, SingleFileOpenOptions,
   SyncMode,
@@ -558,5 +564,119 @@ fn f9_drop_after_close_writes_nothing() {
     header.change_counter,
     generation + 1,
     "close wrote one header; the drop after it must write none"
+  );
+}
+
+// ============================================================================
+// x: a failed commit's records after an OS crash
+// ============================================================================
+
+/// The disk after an OS crash at the end of `events`, from `base` (the file
+/// when recording started): every write before the last successful sync
+/// landed; after it, header pages kept their last write and other pages their
+/// first. Without a sync in between the OS may do just that: write a WAL page
+/// back early, then lose the page's next write while the header write lands.
+fn crash_image(base: &[u8], events: &[IoEvent]) -> Vec<u8> {
+  let header_end = 2 * PAGE_SIZE as u64;
+  let last_sync = events
+    .iter()
+    .rposition(|event| matches!(event, IoEvent::Sync { ok: true }));
+  let mut image = base.to_vec();
+  let mut written_since_sync = HashSet::new();
+  for (index, event) in events.iter().enumerate() {
+    let IoEvent::Write { offset, data } = event else {
+      continue;
+    };
+    let durable = last_sync.is_some_and(|sync| index < sync);
+    if durable || *offset < header_end || written_since_sync.insert(*offset) {
+      let (start, end) = (*offset as usize, *offset as usize + data.len());
+      if image.len() < end {
+        image.resize(end, 0);
+      }
+      image[start..end].copy_from_slice(data);
+    }
+  }
+  image
+}
+
+/// Commit `base`; then `failed-a`, whose header write fails (an in-memory
+/// header generation of u64::MAX makes `persist_header` fail after the WAL
+/// flush, as an I/O error there would), with the next `failing_syncs` syncs
+/// failing too; then `b`. Returns whether the crash image (see
+/// [`crash_image`]) holds `failed-a`, and `b`.
+fn failed_commit_after_os_crash(
+  options: SingleFileOpenOptions,
+  failing_syncs: usize,
+) -> (bool, bool) {
+  let dir = tempdir().expect("tempdir");
+  let path = dir.path().join("failed-commit.kitedb");
+  let db = open_single_file(&path, options.clone()).expect("open");
+  commit_nodes(&db, &["base".to_string()]);
+  let base = std::fs::read(&path).expect("base image");
+
+  let ((), events) = io_hooks::record_io_during(|| {
+    db.begin(false).expect("begin");
+    db.create_node(Some("failed-a")).expect("create node");
+    let generation = db.header.read().change_counter;
+    db.header.write().change_counter = u64::MAX;
+    let failed = io_hooks::with_failing_syncs(failing_syncs, || db.commit());
+    db.header.write().change_counter = generation;
+    failed.expect_err("the header write was made to fail");
+    assert!(db.node_by_key("failed-a").is_none());
+    commit_nodes(&db, &["b".to_string()]);
+  });
+  drop(db);
+
+  let image = dir.path().join("crash-image.kitedb");
+  std::fs::write(&image, crash_image(&base, &events)).expect("write image");
+  let crashed =
+    open_single_file(&image, options.group_commit_enabled(false)).expect("open crash image");
+  let found = (
+    crashed.node_by_key("failed-a").is_some(),
+    crashed.node_by_key("b").is_some(),
+  );
+  close_single_file(crashed).expect("close");
+  found
+}
+
+#[test]
+fn x_failed_commit_stays_failed_after_an_os_crash() {
+  let replayed: Vec<bool> = [false, true]
+    .into_iter()
+    .filter(|group_commit| {
+      let options = options()
+        .sync_mode(SyncMode::Normal)
+        .group_commit_enabled(*group_commit);
+      failed_commit_after_os_crash(options, 0).0
+    })
+    .collect();
+  assert!(
+    replayed.is_empty(),
+    "a commit that returned Err was replayed (group_commit = {replayed:?}): its COMMIT record \
+     stayed in the WAL page the OS wrote back, and the next commit's header named it"
+  );
+}
+
+/// If the failed record's bytes cannot be made durably dead right away (the
+/// sync fails), the next header must still not name them unsynced.
+#[test]
+fn x_failed_commit_stays_failed_when_its_scrub_cannot_sync() {
+  let options = options().sync_mode(SyncMode::Normal);
+  let (failed_a, _) = failed_commit_after_os_crash(options, 1);
+  assert!(
+    !failed_a,
+    "a commit that returned Err was replayed after its scrub's sync failed"
+  );
+}
+
+/// Full mode syncs the WAL before every header, so it was already safe; it
+/// must stay so, and keep the acknowledged commit.
+#[test]
+fn x_full_mode_failed_commit_stays_failed_after_an_os_crash() {
+  let (failed_a, b) = failed_commit_after_os_crash(options().sync_mode(SyncMode::Full), 0);
+  assert_eq!(
+    (failed_a, b),
+    (false, true),
+    "(failed commit replayed, acknowledged commit kept)"
   );
 }

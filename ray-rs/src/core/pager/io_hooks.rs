@@ -3,7 +3,8 @@
 //! Outside `cfg(test)` every hook is an empty inline function. Tests use them
 //! to make the OS behave in ways POSIX allows but a local disk rarely shows
 //! (a read returning fewer bytes than asked before EOF, as on NFS or after a
-//! signal), to count the system calls page I/O costs, and to run code at a
+//! signal), or a sync fail, to count the system calls page I/O costs, to log
+//! the writes and syncs a crash image is built from, and to run code at a
 //! point no barrier reaches (just before `create_pager` takes the file lock).
 //! The state is per thread, so tests running in parallel never see each
 //! other's.
@@ -26,12 +27,33 @@ struct ShortReads {
 #[cfg(test)]
 type CreateHook = Box<dyn FnOnce(&Path)>;
 
+/// A write to or sync of a pager's file, as [`record_io_during`] logs them.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) enum IoEvent {
+  /// `data` was written at file `offset`.
+  Write { offset: u64, data: Vec<u8> },
+  /// A sync returned (`ok`: successfully).
+  Sync { ok: bool },
+}
+
 #[cfg(test)]
 thread_local! {
   static SYSCALLS: Cell<usize> = const { Cell::new(0) };
   static SHORT_READS: Cell<Option<ShortReads>> = const { Cell::new(None) };
   static BEFORE_CREATE_LOCK: RefCell<Option<CreateHook>> = const { RefCell::new(None) };
   static DIR_SYNCS: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+  static IO_LOG: RefCell<Option<Vec<IoEvent>>> = const { RefCell::new(None) };
+  static SYNC_FAULTS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+fn log_io(event: impl FnOnce() -> IoEvent) {
+  IO_LOG.with(|log| {
+    if let Some(log) = log.borrow_mut().as_mut() {
+      log.push(event());
+    }
+  });
 }
 
 /// Note one system call made for page I/O.
@@ -54,6 +76,43 @@ pub(super) fn read_window(offset: u64, buffer: &mut [u8]) -> &mut [u8] {
   }
   let _ = offset;
   buffer
+}
+
+/// Note that `data` was written at file `offset`.
+#[inline]
+pub(super) fn wrote(offset: u64, data: &[u8]) {
+  #[cfg(test)]
+  log_io(|| IoEvent::Write {
+    offset,
+    data: data.to_vec(),
+  });
+  let _ = (offset, data);
+}
+
+/// Called before a sync reaches the OS: fails it if a test armed a fault.
+#[inline]
+pub(super) fn before_sync() -> std::io::Result<()> {
+  #[cfg(test)]
+  {
+    let fail = SYNC_FAULTS.with(|faults| {
+      let armed = faults.get();
+      faults.set(armed.saturating_sub(1));
+      armed > 0
+    });
+    if fail {
+      synced(false);
+      return Err(std::io::Error::other("injected sync failure"));
+    }
+  }
+  Ok(())
+}
+
+/// Note that a sync returned, successfully or not.
+#[inline]
+pub(super) fn synced(ok: bool) {
+  #[cfg(test)]
+  log_io(|| IoEvent::Sync { ok });
+  let _ = ok;
 }
 
 /// Called by `create_pager` before it takes the file lock.
@@ -119,4 +178,28 @@ pub(crate) fn dir_syncs_during<R>(run: impl FnOnce() -> R) -> (R, Vec<PathBuf>) 
   DIR_SYNCS.with(|synced| synced.borrow_mut().clear());
   let result = run();
   (result, DIR_SYNCS.with(|synced| synced.take()))
+}
+
+/// Run `run`, returning its result and the pager writes and syncs it made on
+/// this thread, oldest first.
+#[cfg(test)]
+pub(crate) fn record_io_during<R>(run: impl FnOnce() -> R) -> (R, Vec<IoEvent>) {
+  IO_LOG.with(|log| *log.borrow_mut() = Some(Vec::new()));
+  let result = run();
+  (result, IO_LOG.with(|log| log.take().unwrap_or_default()))
+}
+
+/// Run `run` with the next `count` pager syncs on this thread failing.
+#[cfg(test)]
+pub(crate) fn with_failing_syncs<R>(count: usize, run: impl FnOnce() -> R) -> R {
+  struct Disarm;
+  impl Drop for Disarm {
+    fn drop(&mut self) {
+      SYNC_FAULTS.with(|faults| faults.set(0));
+    }
+  }
+
+  SYNC_FAULTS.with(|faults| faults.set(count));
+  let _disarm = Disarm;
+  run()
 }
