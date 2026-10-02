@@ -349,9 +349,12 @@ impl SingleFileDB {
           let mut tx_mgr = mvcc.tx_manager.lock();
           tx_mgr.begin_tx()
         };
+        // Only ever raise it: a concurrent begin that took a later txid may
+        // have stored already, and the header persists this value, so a lower
+        // one would issue a used txid again after reopen.
         self
           .next_tx_id
-          .store(txid.saturating_add(1), std::sync::atomic::Ordering::SeqCst);
+          .fetch_max(txid.saturating_add(1), Ordering::SeqCst);
         (txid, snapshot_ts)
       } else {
         (self.alloc_tx_id(), 0)
