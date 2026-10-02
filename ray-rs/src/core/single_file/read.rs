@@ -28,6 +28,7 @@
 
 use std::collections::HashMap;
 
+use crate::core::snapshot::reader::SnapshotData;
 use crate::types::*;
 
 use super::{SingleFileDB, SingleFileTxState};
@@ -73,6 +74,26 @@ impl NodeLayers<'_> {
   /// committed copy.
   pub(super) fn pending_masks(&self, node_id: NodeId) -> bool {
     self.pending.is_some_and(|p| p.is_node_deleted(node_id))
+  }
+
+  /// Whether the node exists for the reader: created by its transaction, or
+  /// committed and not deleted by it. A node's delta state alone is not
+  /// existence: props or labels written to a missing node (by older versions
+  /// or racing commits) must not make it appear.
+  pub(super) fn node_exists(
+    &self,
+    snapshot: Option<&SnapshotData>,
+    node_id: NodeId,
+    mvcc: Option<bool>,
+  ) -> bool {
+    if self.pending.is_some_and(|p| p.is_node_created(node_id)) {
+      return true;
+    }
+    !self.pending_masks(node_id)
+      && match mvcc {
+        Some(visible) => visible,
+        None => self.delta.node_exists_over(snapshot, node_id),
+      }
   }
 }
 
@@ -200,28 +221,7 @@ impl SingleFileDB {
       }
     }
 
-    // Check if node exists at all
-    let node_exists_in_pending =
-      pending.is_some_and(|p| p.is_node_created(node_id) || p.node_delta(node_id).is_some());
-    let node_exists = if node_exists_in_pending {
-      true
-    } else if let Some(visible) = mvcc_node_visible {
-      visible
-    } else if delta.is_node_removed(node_id) {
-      false
-    } else {
-      let node_exists_in_delta =
-        delta.is_node_created(node_id) || delta.node_delta(node_id).is_some();
-      if node_exists_in_delta {
-        true
-      } else if let Some(ref snap) = *snapshot {
-        snap.phys_node(node_id).is_some()
-      } else {
-        false
-      }
-    };
-
-    if !node_exists {
+    if !layers.node_exists(snapshot.as_ref(), node_id, mvcc_node_visible) {
       return None;
     }
 
@@ -288,11 +288,14 @@ impl SingleFileDB {
       }
     }
 
-    // Check if node is deleted (unless MVCC snapshot says otherwise)
-    if mvcc_node_visible == Some(false) {
-      return None;
-    }
-    if mvcc_node_visible.is_none() && delta.is_node_removed(node_id) {
+    // Check if node exists (at the reader's MVCC snapshot, if that differs). Its delta
+    // state alone does not count, see `NodeLayers::node_exists`.
+    let snapshot = self.snapshot.read();
+    let exists = match mvcc_node_visible {
+      Some(visible) => visible,
+      None => delta.node_exists_over(snapshot.as_ref(), node_id),
+    };
+    if !exists {
       return None;
     }
 
@@ -313,7 +316,6 @@ impl SingleFileDB {
     }
 
     // Fall back to snapshot
-    let snapshot = self.snapshot.read();
     if let Some(ref snap) = *snapshot {
       if let Some(phys) = snap.phys_node(node_id) {
         return snap.node_prop(phys, key_id);
@@ -1081,8 +1083,10 @@ impl SingleFileDB {
       }
     }
 
-    // Check if node is deleted
-    if node_visible.is_none() && delta.is_node_removed(node_id) {
+    // Check if node exists; its delta state alone does not count (see
+    // `NodeLayers::node_exists`)
+    let snapshot = self.snapshot.read();
+    if node_visible.is_none() && !delta.node_exists_over(snapshot.as_ref(), node_id) {
       return false;
     }
 
@@ -1103,7 +1107,7 @@ impl SingleFileDB {
     }
 
     // Check snapshot for label (if present)
-    if let Some(ref snapshot) = *self.snapshot.read() {
+    if let Some(ref snapshot) = *snapshot {
       if let Some(phys) = snapshot.phys_node(node_id) {
         if let Some(labels) = snapshot.node_labels(phys) {
           return labels.contains(&label_id);
@@ -1137,7 +1141,7 @@ impl SingleFileDB {
     let node_visible = vc_guard
       .as_ref()
       .and_then(|vc| vc.node_exists_at(node_id, tx_snapshot_ts, txid));
-    if !layers.sees_pending(node_id, node_visible) {
+    if !layers.node_exists(snapshot.as_ref(), node_id, node_visible) {
       return Vec::new();
     }
 

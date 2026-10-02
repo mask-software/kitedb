@@ -211,6 +211,43 @@ impl SingleFileDB {
     }
   }
 
+  /// Fail with `NodeNotFound` unless the transaction sees `node_id`: a prop or
+  /// label write to a missing node would otherwise linger in the delta. A
+  /// rejected write still depends on the node's absence.
+  fn require_node(
+    &self,
+    txid: TxId,
+    tx_handle: &Arc<Mutex<SingleFileTxState>>,
+    node_id: NodeId,
+  ) -> Result<()> {
+    // Bulk loads write to nodes they just created: skip the committed state.
+    if tx_handle.lock().pending.is_node_created(node_id) {
+      return Ok(());
+    }
+    if self.with_tx_view(tx_handle, |view| view.node_exists(node_id)) {
+      return Ok(());
+    }
+    self.record_read(txid, TxKey::Node(node_id));
+    Err(KiteError::NodeNotFound(node_id))
+  }
+
+  /// Fail with `EdgeNotFound` unless the transaction sees the edge.
+  fn require_edge(
+    &self,
+    txid: TxId,
+    tx_handle: &Arc<Mutex<SingleFileTxState>>,
+    src: NodeId,
+    etype: ETypeId,
+    dst: NodeId,
+  ) -> Result<()> {
+    let (_, visible) = self.with_tx_view(tx_handle, |view| view.edge(src, etype, dst));
+    if visible {
+      return Ok(());
+    }
+    self.record_read(txid, TxKey::Edge { src, etype, dst });
+    Err(KiteError::EdgeNotFound { src, etype, dst })
+  }
+
   /// Delete the props a re-add brought back (`TxView::revealed_edge_props`),
   /// one `DelEdgeProp` record each, so the re-added edge starts without them
   /// here, after WAL replay, and on replicas. Call after the add is logged
@@ -976,6 +1013,7 @@ impl SingleFileDB {
   /// Set a node property
   pub fn set_node_prop(&self, node_id: NodeId, key_id: PropKeyId, value: PropValue) -> Result<()> {
     let (txid, tx_handle) = self.require_write_tx_handle()?;
+    self.require_node(txid, &tx_handle, node_id)?;
 
     // Write WAL record
     let record = WalRecord::new(
@@ -1025,6 +1063,7 @@ impl SingleFileDB {
   /// Delete a node property
   pub fn delete_node_prop(&self, node_id: NodeId, key_id: PropKeyId) -> Result<()> {
     let (txid, tx_handle) = self.require_write_tx_handle()?;
+    self.require_node(txid, &tx_handle, node_id)?;
 
     // Write WAL record
     let record = WalRecord::new(
@@ -1074,6 +1113,7 @@ impl SingleFileDB {
     value: PropValue,
   ) -> Result<()> {
     let (txid, tx_handle) = self.require_write_tx_handle()?;
+    self.require_edge(txid, &tx_handle, src, etype, dst)?;
 
     // Write WAL record
     let record = WalRecord::new(
@@ -1128,6 +1168,7 @@ impl SingleFileDB {
     }
 
     let (txid, tx_handle) = self.require_write_tx_handle()?;
+    self.require_edge(txid, &tx_handle, src, etype, dst)?;
 
     let key_ids: Vec<PropKeyId> = props.iter().map(|(key_id, _)| *key_id).collect();
 
@@ -1193,6 +1234,7 @@ impl SingleFileDB {
     key_id: PropKeyId,
   ) -> Result<()> {
     let (txid, tx_handle) = self.require_write_tx_handle()?;
+    self.require_edge(txid, &tx_handle, src, etype, dst)?;
 
     // Write WAL record
     let record = WalRecord::new(
@@ -1241,6 +1283,7 @@ impl SingleFileDB {
   /// Add a label to a node
   pub fn add_node_label(&self, node_id: NodeId, label_id: LabelId) -> Result<()> {
     let (txid, tx_handle) = self.require_write_tx_handle()?;
+    self.require_node(txid, &tx_handle, node_id)?;
 
     // Write WAL record
     let record = WalRecord::new(
@@ -1286,6 +1329,7 @@ impl SingleFileDB {
   /// Remove a label from a node
   pub fn remove_node_label(&self, node_id: NodeId, label_id: LabelId) -> Result<()> {
     let (txid, tx_handle) = self.require_write_tx_handle()?;
+    self.require_node(txid, &tx_handle, node_id)?;
 
     // Write WAL record
     let record = WalRecord::new(

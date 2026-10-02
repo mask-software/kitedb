@@ -298,7 +298,10 @@ impl DeltaState {
         self.key_index.remove(key);
       }
 
-      // Its edges, found through its own patch sets: O(its degree).
+      // State written to the node after it was created here (older versions
+      // let writes to a deleted node through), and its edges, found through
+      // its own patch sets: O(its degree).
+      self.modified_nodes.remove(&node_id);
       self.drop_edge_patches(node_id);
 
       return;
@@ -307,8 +310,10 @@ impl DeltaState {
     // Mark as deleted
     self.deleted_nodes.insert(node_id);
 
-    // Remove any modified state
+    // Remove any modified state, and this delta's patches of its edges: the
+    // delete masks the base copies, and an add patch would outlive the node.
     self.modified_nodes.remove(&node_id);
+    self.drop_edge_patches(node_id);
   }
 
   /// Whether this delta holds its own copy of the node: created here, or
