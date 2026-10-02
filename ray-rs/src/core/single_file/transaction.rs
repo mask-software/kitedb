@@ -2085,6 +2085,10 @@ mod b4_commit_pipeline_tests;
 #[cfg(test)]
 #[path = "b4_mvcc_commit_tests.rs"]
 mod b4_mvcc_commit_tests;
+/// raydb-b4 `mvcc-default` lane: MVCC as the default, bulk loads under MVCC.
+#[cfg(test)]
+#[path = "b4_mvcc_default_tests.rs"]
+mod b4_mvcc_default_tests;
 /// raydb-b4 engine-concurrency: group commit and background cuts.
 #[cfg(test)]
 #[path = "b4_commit_tests.rs"]

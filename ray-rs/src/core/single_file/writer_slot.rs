@@ -26,6 +26,9 @@ use parking_lot::{Condvar, Mutex};
 pub(crate) struct WriterSlot {
   held: Mutex<bool>,
   released: Condvar,
+  /// Threads waiting in `claim` (test instrumentation).
+  #[cfg(test)]
+  waiting: std::sync::atomic::AtomicUsize,
 }
 
 impl WriterSlot {
@@ -33,11 +36,25 @@ impl WriterSlot {
   /// kept (`WriterClaim::keep`) or dropped.
   pub(crate) fn claim(&self) -> WriterClaim<'_> {
     let mut held = self.held.lock();
+    #[cfg(test)]
+    self
+      .waiting
+      .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     while *held {
       self.released.wait(&mut held);
     }
+    #[cfg(test)]
+    self
+      .waiting
+      .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     *held = true;
     WriterClaim { slot: Some(self) }
+  }
+
+  /// Threads waiting to claim the slot (test instrumentation).
+  #[cfg(test)]
+  pub(crate) fn waiting(&self) -> usize {
+    self.waiting.load(std::sync::atomic::Ordering::SeqCst)
   }
 
   /// Release the slot taken by a kept claim.
