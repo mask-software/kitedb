@@ -50,8 +50,12 @@ ray-rs/python/raydb/_raydb*.so
 ray-rs/python/benchmarks/results/*.txt
 
 # Bench/trace outputs
-ray-rs/flamegraph.svg
-ray-rs/*.trace/
+flamegraph*.svg
+*.trace
+
+# Databases from local runs (test fixtures are tracked on purpose)
+*.kitedb
+!ray-rs/tests/fixtures/*.kitedb
 
 # code-intelligence
 .code-intelligence/

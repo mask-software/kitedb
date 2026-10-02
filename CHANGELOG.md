@@ -17,6 +17,7 @@ All notable changes to this project will be documented in this file.
 - Rust: traversal filters can see props through the new `TraversalProps` trait (`TraversalBuilder::execute_with_props` / `count_with_props`), and `api::schema` definitions convert into Kite's (`KiteOptions::try_from(&DatabaseSchema)`, `NodeDef::try_from(&NodeSchema)`, `EdgeDef::from(&EdgeSchema)`).
 - `replication::progress::remove_replica_progress(sidecar_path, replica_id)` (Rust) forgets a decommissioned replica's progress. Previously a replica that stopped reporting pinned the primary's log retention forever, so its sidecar segments were never pruned.
 - Export writes each node's labels (`labels`, sorted names) and import restores them. Exports written before labels were exported still import.
+- CI fails on RustSec vulnerabilities in `ray-rs/Cargo.lock` (`cargo audit`), and builds the docs site and server-renders every page on docs changes.
 
 ### Changed
 - **Snapshot format v5**: the node-id map switches to a sparse sorted table when ids are spread out, and section sizes and string offsets are 64-bit. Huge custom node ids (e.g. 3e9, 2^40, `i64::MAX`) no longer make checkpoints and opens allocate gigabytes or leave the database unopenable, and sections beyond 4 GiB round-trip. v4 databases still open and are upgraded at the next checkpoint; older releases cannot open v5 snapshots.
@@ -65,6 +66,8 @@ All notable changes to this project will be documented in this file.
 - Rust: `VectorStoreConfig::with_metric` resets `normalize_on_insert` to the metric's default (on only for cosine), like `VectorIndexOptions::with_metric`; call `with_normalize` afterwards to override. `KMeansError` has a new `InvalidInput` variant (zero clusters or dimensions).
 - An IVF `n_probe` of 0 (in the index config or per search) probes one cluster instead of silently returning no results. Vector stores reject a `row_group_size`, `fragment_target_size` or dimension count of 0 on insert.
 - IVF-PQ indexes over a dimension with no divisor near the requested PQ subspace count (e.g. a prime like 97) use one subspace per dimension instead of a single subspace, which had collapsed recall (recall@10 0.98 instead of 0.22 at 97 dims).
+- `ray-rs/Cargo.lock` is committed, so CI and release builds resolve the same dependency versions. memmap2 must be at least 0.9.11 (RUSTSEC-2026-0186), and rustls, rustls-webpki, h2 and crossbeam-epoch are on patched releases.
+- Playground: `GET /api/replication/snapshot/latest?includeData=true` refuses databases larger than `PLAYGROUND_SNAPSHOT_MAX_BYTES` (default 32 MiB) instead of loading any size into memory, and `/api/replication/metrics` names its series `kitedb_replication_*` (was `raydb_replication_*`), like core's exporter.
 
 ### Fixed
 - A crafted snapshot whose compressed sections declare gigabytes no longer makes open allocate them before failing (a 57 KiB file could make it try to inflate 1.75 GiB).
@@ -170,6 +173,10 @@ All notable changes to this project will be documented in this file.
 - Normalizing a vector whose squared components overflow or underflow f32 (components around 1e20 or 1e-25) yields its unit direction. Previously such vectors became all zeros or stayed unnormalized, and cosine indexes ranked them wrongly.
 - Zero clusters, zero dimensions, `PqIndex::search` with `k = 0` and a vector store with `row_group_size = 0` return errors (or empty results) instead of panicking.
 - Vector store compaction (`run_compaction_if_needed`, `force_full_compaction`, `clear_deleted_fragments`) leaves manifests that reload: it keeps the store totals and deletion bitmaps consistent, removes emptied fragments, and never reuses a fragment id.
+- TUI: keyboard shortcuts and text input work (the handlers read a `key` field opentui's events don't have), opening a database no longer fails with "this.db.nodeTypes is not a function", q/Esc close the database before exiting, nodes created by an import show their keys, node details show edge endpoints instead of `undefined`, and `bun run build` works.
+- Playground: concurrent database opens no longer leak a handle, a failing close still removes its temp directory, and snapshots are read in one synchronous pass so concurrent requests can't tear them. `/api/replication/log` polls skip segments before the cursor (about 8x faster at the log head with 137 segments). The client handles failed status, path and impact requests, ignores responses superseded by a newer request or a database switch, clears highlights when another database is opened, and lays out nodes that arrive while a layout is running instead of stacking them at the origin.
+- `examples/ts-package` installs @kitedb/core 0.2.18 (its lockfiles resolved 0.2.7), and its `dev` and `typecheck` scripts work.
+- The npm package README told users to `npm install kitedb`, which is unpublished; it now says `@kitedb/core`.
 
 ### Security
 - TS replication admin auth helper: `mode` is required (`'none'` disables auth explicitly); a config without one allowed every request. A client-certificate header no longer authorizes by its mere presence: it is trusted only with `trustForwardedClientCert: true` and an `mtlsSubjectRegex`, which must now match the whole header value, and the mTLS modes need that or an `mtlsMatcher`. Bearer tokens are compared in constant time.
