@@ -466,3 +466,74 @@ fn create_node_with_id_reuses_deleted_id_without_chain() {
   let owner = reopen_without_mvcc(&path, db, |db| db.node_by_key("again"));
   assert_eq!(owner, Some(node));
 }
+
+// ============================================================================
+// Conflict semantics: when a write-side check turns the write into a no-op or
+// rejects it, the transaction still records a read of the checked key, so a
+// commit to that key after the transaction started makes it conflict.
+// ============================================================================
+
+/// Commits `ops` from another thread while this thread's transaction is open.
+fn commit_on_other_thread<T: Send>(
+  db: &SingleFileDB,
+  ops: impl FnOnce(&SingleFileDB) -> Result<T> + Send,
+) -> T {
+  thread::scope(|scope| {
+    scope
+      .spawn(|| write_tx(db, ops))
+      .join()
+      .expect("writer thread")
+  })
+  .expect("concurrent commit")
+}
+
+#[test]
+fn upsert_edge_noop_conflicts_with_edge_committed_after_start() {
+  let Fixture {
+    _dir,
+    db,
+    a,
+    b,
+    t,
+    weight,
+    ..
+  } = fixture();
+  db.begin(false).expect("begin");
+  commit_on_other_thread(&db, |db| db.add_edge(a, t, b));
+
+  let created = db
+    .upsert_edge_with_props(a, t, b, [(weight, Some(PropValue::I64(7)))])
+    .expect("upsert edge");
+
+  assert!(
+    !created,
+    "the edge is committed, so upsert must not add it again"
+  );
+  let result = db.commit();
+  assert!(
+    matches!(result, Err(KiteError::Conflict { .. })),
+    "the no-op upsert depends on an edge committed after the tx started, got {result:?}"
+  );
+  close_single_file(db).expect("close");
+}
+
+#[test]
+fn create_node_with_id_rejection_conflicts_with_node_committed_after_start() {
+  let Fixture { _dir, db, .. } = fixture();
+  let id: NodeId = 100;
+  db.begin(false).expect("begin");
+  commit_on_other_thread(&db, |db| db.create_node_with_id(id, None));
+
+  let result = db.create_node_with_id(id, None);
+  assert!(
+    result.is_err(),
+    "node {id} is committed, so create_node_with_id must fail, got {result:?}"
+  );
+  db.create_node(None).expect("unrelated create");
+  let result = db.commit();
+  assert!(
+    matches!(result, Err(KiteError::Conflict { .. })),
+    "the rejected create depends on node {id}, committed after the tx started, got {result:?}"
+  );
+  close_single_file(db).expect("close");
+}

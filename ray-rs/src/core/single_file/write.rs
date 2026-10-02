@@ -62,6 +62,10 @@ impl TxView<'_> {
     }
   }
 
+  fn node_exists(&self, node_id: NodeId) -> bool {
+    self.endpoint(node_id).is_ok()
+  }
+
   /// Like `edge`, but both endpoints must exist (`NodeNotFound` otherwise).
   fn edge_to_add(&self, src: NodeId, etype: ETypeId, dst: NodeId) -> Result<(bool, bool)> {
     let in_base = match (self.endpoint(src)?, self.endpoint(dst)?) {
@@ -116,11 +120,12 @@ impl SingleFileDB {
     })
   }
 
-  /// A write that turned out to be a no-op still depends on the edge's state.
-  fn record_edge_read(&self, txid: TxId, src: NodeId, etype: ETypeId, dst: NodeId) {
+  /// A write that a check turned into a no-op or rejected still depends on
+  /// the state it checked.
+  fn record_read(&self, txid: TxId, key: TxKey) {
     if let Some(mvcc) = self.mvcc.as_ref() {
       let mut tx_mgr = mvcc.tx_manager.lock();
-      tx_mgr.record_read(txid, TxKey::Edge { src, etype, dst });
+      tx_mgr.record_read(txid, key);
     }
   }
 
@@ -177,7 +182,8 @@ impl SingleFileDB {
       ));
     }
 
-    if self.node_exists(node_id) {
+    if self.with_tx_view(&tx_handle, |view| view.node_exists(node_id)) {
+      self.record_read(txid, TxKey::Node(node_id));
       return Err(KiteError::Internal(format!(
         "Node ID already exists: {node_id}"
       )));
@@ -361,12 +367,17 @@ impl SingleFileDB {
   /// Both endpoints must exist (`NodeNotFound` otherwise). Adding an edge
   /// that already exists is a no-op.
   pub fn add_edge(&self, src: NodeId, etype: ETypeId, dst: NodeId) -> Result<()> {
+    self.add_missing_edge(src, etype, dst).map(|_| ())
+  }
+
+  /// `add_edge`, returning whether the edge was added (false if it existed).
+  fn add_missing_edge(&self, src: NodeId, etype: ETypeId, dst: NodeId) -> Result<bool> {
     let (txid, tx_handle) = self.require_write_tx_handle()?;
     let (in_base, exists) =
       self.with_tx_view(&tx_handle, |view| view.edge_to_add(src, etype, dst))?;
     if exists {
-      self.record_edge_read(txid, src, etype, dst);
-      return Ok(());
+      self.record_read(txid, TxKey::Edge { src, etype, dst });
+      return Ok(false);
     }
 
     // Write WAL record
@@ -386,7 +397,7 @@ impl SingleFileDB {
 
     if let Some(mvcc) = self.mvcc.as_ref() {
       if bulk_load {
-        return Ok(());
+        return Ok(true);
       }
       let mut tx_mgr = mvcc.tx_manager.lock();
       tx_mgr.record_write(txid, TxKey::Edge { src, etype, dst });
@@ -425,7 +436,7 @@ impl SingleFileDB {
       self.cache_invalidate_edge(src, etype, dst);
     }
 
-    Ok(())
+    Ok(true)
   }
 
   /// Add multiple edges in a single WAL record
@@ -454,7 +465,7 @@ impl SingleFileDB {
       Ok::<_, KiteError>(())
     })?;
     for &(src, etype, dst) in &existing {
-      self.record_edge_read(txid, src, etype, dst);
+      self.record_read(txid, TxKey::Edge { src, etype, dst });
     }
     if new_edges.is_empty() {
       return Ok(());
@@ -729,7 +740,7 @@ impl SingleFileDB {
     let (txid, tx_handle) = self.require_write_tx_handle()?;
     let (in_base, exists) = self.with_tx_view(&tx_handle, |view| view.edge(src, etype, dst));
     if !exists {
-      self.record_edge_read(txid, src, etype, dst);
+      self.record_read(txid, TxKey::Edge { src, etype, dst });
       return Ok(());
     }
 
@@ -794,7 +805,8 @@ impl SingleFileDB {
 
   /// Upsert an edge (create if missing, otherwise update props)
   ///
-  /// Returns a flag indicating whether the edge was created.
+  /// Both endpoints must exist (`NodeNotFound` otherwise). Returns a flag
+  /// indicating whether the edge was created.
   pub fn upsert_edge_with_props<I>(
     &self,
     src: NodeId,
@@ -805,12 +817,7 @@ impl SingleFileDB {
   where
     I: IntoIterator<Item = (PropKeyId, Option<PropValue>)>,
   {
-    let created = if self.edge_exists(src, etype, dst) {
-      false
-    } else {
-      self.add_edge(src, etype, dst)?;
-      true
-    };
+    let created = self.add_missing_edge(src, etype, dst)?;
 
     for (key_id, value_opt) in props {
       match value_opt {
