@@ -188,7 +188,7 @@ impl SingleFileDB {
             .min(REPLICA_BOOTSTRAP_MAX_BACKOFF_MS);
           continue;
         }
-        Err(error) => return Err(error),
+        Err(error) => return Err(bootstrap_gave_up(error, attempts)),
       };
 
       let sync_result = (|| {
@@ -223,6 +223,7 @@ impl SingleFileDB {
             .min(REPLICA_BOOTSTRAP_MAX_BACKOFF_MS);
           continue;
         }
+        let error = bootstrap_gave_up(error, attempts);
         let _ = runtime.mark_error(error.to_string(), false);
         return Err(error);
       }
@@ -672,6 +673,21 @@ fn source_last_committed_txid(source: &SingleFileDB) -> Result<Option<TxId>> {
       .last()
       .map(|(txid, _)| *txid),
   )
+}
+
+/// The error a bootstrap reports when it stops. Out of attempts on a
+/// retryable error, the source kept changing under the copy: a torn read
+/// (a frame or WAL record half written, a checksum over a page mid-write)
+/// says so less clearly than a quiesce error, so it is reported as one,
+/// naming the last error. Other errors pass through.
+fn bootstrap_gave_up(error: KiteError, attempts: usize) -> KiteError {
+  if is_bootstrap_quiesce_error(&error) || !is_bootstrap_retryable_error(&error) {
+    return error;
+  }
+  KiteError::InvalidReplication(format!(
+    "source primary did not quiesce for snapshot bootstrap: it could not be read consistently \
+     in {attempts} attempts (last error: {error}); quiesce writes and retry"
+  ))
 }
 
 fn is_bootstrap_retryable_error(error: &KiteError) -> bool {

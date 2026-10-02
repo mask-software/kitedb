@@ -560,3 +560,33 @@ fn b4_replica_bootstrap_data_is_durable_before_its_cursor() {
      went on without it (mode, nodes held of 5): {skipped:?}"
   );
 }
+
+/// Out of attempts on a torn read of a source that kept changing (here a
+/// frame half appended to its segment), a bootstrap reported the bare read
+/// error; it reports that the source did not quiesce, naming the last error.
+/// Errors a retry cannot fix pass through.
+#[test]
+fn b4_bootstrap_out_of_attempts_on_a_torn_read_reports_a_quiesce_error() {
+  use crate::error::KiteError;
+  let torn = super::bootstrap_gave_up(
+    KiteError::InvalidWal("truncated replication segment while reading payload".to_string()),
+    20,
+  );
+  let message = torn.to_string();
+  assert!(
+    super::is_bootstrap_quiesce_error(&torn)
+      && message.contains("quiesce writes and retry")
+      && message.contains("truncated replication segment"),
+    "{message}"
+  );
+  let quiesce = KiteError::InvalidReplication(
+    "source primary advanced during snapshot bootstrap; quiesce writes and retry".to_string(),
+  );
+  assert_eq!(
+    super::bootstrap_gave_up(quiesce, 20).to_string(),
+    "Invalid replication state: source primary advanced during snapshot bootstrap; quiesce writes \
+     and retry"
+  );
+  let other = super::bootstrap_gave_up(KiteError::InvalidQuery("bad".into()), 20);
+  assert!(matches!(other, KiteError::InvalidQuery(_)), "{other}");
+}
