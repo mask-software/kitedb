@@ -1,6 +1,6 @@
 # kitedb
 
-KiteDB native bindings for Node.js (and WASI/browser builds), powered by Rust + N-API.
+KiteDB native bindings for Node.js and Bun, powered by Rust + N-API.
 
 Docs: https://kitedb.vercel.com/docs
 
@@ -152,11 +152,9 @@ console.log(hits)
 
 ## Browser/WASI builds
 
-This package exposes a WASI-compatible build via the `browser` export for bundlers, backed by `@kitedb/core-wasm32-wasi`. If you need to import it directly:
-
-```ts
-import { Database } from '@kitedb/core-wasm32-wasi'
-```
+There is no browser build on npm: `@kitedb/core` loads a native addon, so it runs on Node.js and Bun only. The
+repository has a WASI prototype (`bun run build:wasm`, demo in `examples/browser`), but it is not published and does
+not build at the moment.
 
 ## Concurrent Access
 

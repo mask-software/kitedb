@@ -200,7 +200,7 @@ const addRandomEdge = () => {
   }
 
   const db = state.db
-  const etype = db.getOrCreateEtype(EDGE_TYPE)
+  const etype = db.get_or_create_etype(EDGE_TYPE)
 
   const pickNodeId = () => state.nodes[Math.floor(Math.random() * state.nodes.length)].id
 
@@ -249,7 +249,7 @@ const init = async () => {
   state.db = ray.Database.open(DB_PATH)
   state.db.begin()
   try {
-    state.db.getOrCreateEtype(EDGE_TYPE)
+    state.db.get_or_create_etype(EDGE_TYPE)
     state.db.commit()
   } catch (err) {
     state.db.rollback()

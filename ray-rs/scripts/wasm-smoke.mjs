@@ -18,7 +18,7 @@ const db = Database.open('/tmp/kitedb-wasm-smoke.kitedb')
 db.begin()
 const a = db.createNode('a')
 const b = db.createNode('b')
-const edge = db.getOrCreateEtype('knows')
+const edge = db.get_or_create_etype('knows')
 
 db.addEdge(a, edge, b)
 db.commit()

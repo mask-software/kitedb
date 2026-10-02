@@ -41,19 +41,10 @@ bun install
 
 ## Browser (WASM) prototype
 
-KiteDB can run in the browser via the WASI build of the core (`@kitedb/core`).
-This uses an in-memory filesystem by default (ephemeral per page load).
-
-Build the WASM bundle locally:
-
-```bash
-cd ray-rs
-bun run build:wasm
-```
-
-Then import `@kitedb/core` in your browser bundler (it uses the `browser` entry).
-Persistence in the browser requires wiring WASI to a persistent FS (e.g. OPFS/IndexedDB).
-See the browser example in the Rust bindings package for a minimal demo (OPFS first, IndexedDB fallback).
+There is no browser build on npm: `@kitedb/core` loads a native addon and runs on Node.js and Bun.
+The repository has a WASI prototype of the core (`cd ray-rs && bun run build:wasm`, with a demo in
+`ray-rs/examples/browser` that persists to OPFS or IndexedDB), but it is not published and does not
+build at the moment.
 
 ## Quick Start
 

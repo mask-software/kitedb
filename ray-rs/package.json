@@ -26,7 +26,6 @@
     "url": "https://github.com/mask-software/kitedb/issues"
   },
   "license": "MIT",
-  "browser": "browser.js",
   "keywords": [
     "kitedb",
     "graph-database",
@@ -38,7 +37,6 @@
   "files": [
     "index.d.ts",
     "index.js",
-    "browser.js",
     "dist"
   ],
   "napi": {
