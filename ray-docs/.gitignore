@@ -9,7 +9,6 @@ dist-ssr
 .wrangler
 .output
 .vscode
-bun.lock
 pnpm-lock.yaml
 
 # Build artifacts from dev server
