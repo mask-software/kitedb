@@ -42,12 +42,17 @@ ATTEMPTS="${ATTEMPTS:-1}"
 # read-only and 1.9x the read-write estimate: a change that doubles open
 # fails on a runner like the estimate, and one as slow as the 2-CPU estimate
 # keeps 1.4-1.7x of headroom. Main's open fails every limit but small-rw,
-# which is mostly the close's sync. Recalibrate on the first CI runs: if they
-# come in near the 4-CPU estimate (about 850, 530, 5050, 3800), tighten.
+# which is mostly the close's sync.
+#
+# First CI run with open-perf (7f963db): small-rw 918, small-ro 735, large-rw
+# 6194, large-ro 5849, so read-only came in ~14% above the estimate and the
+# read-only limits had only ~1.55x headroom. They are now 1.75x that run
+# (small-ro 1300, large-ro 10250); the read-write limits already sit at
+# 1.9-2.0x of it. Main's open still fails every limit but small-rw.
 MAX_SMALL_RW_US="${MAX_SMALL_RW_US:-1850.0}"
-MAX_SMALL_RO_US="${MAX_SMALL_RO_US:-1150.0}"
+MAX_SMALL_RO_US="${MAX_SMALL_RO_US:-1300.0}"
 MAX_LARGE_RW_US="${MAX_LARGE_RW_US:-12000.0}"
-MAX_LARGE_RO_US="${MAX_LARGE_RO_US:-9000.0}"
+MAX_LARGE_RO_US="${MAX_LARGE_RO_US:-10250.0}"
 
 if [[ "$ATTEMPTS" -lt 1 ]]; then
   echo "ATTEMPTS must be >= 1"
