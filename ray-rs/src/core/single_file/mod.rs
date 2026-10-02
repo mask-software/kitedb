@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::thread::ThreadId;
 
 use parking_lot::{Condvar, Mutex, RwLock};
@@ -268,6 +268,15 @@ pub struct SingleFileDB {
   /// Bumped as a background checkpoint makes progress, so writers waiting
   /// for its install can tell a slow checkpoint from a stalled one.
   pub(crate) checkpoint_progress: AtomicU64,
+  /// Checkpoint steps running that note no progress until they end (one
+  /// serialization, parse, or fsync of a whole snapshot, which takes seconds
+  /// on a large database). Writers waiting for an install treat a checkpoint
+  /// inside one as working, however long it takes.
+  pub(crate) checkpoint_steps_running: AtomicUsize,
+  /// Set when writers cancel the running background checkpoint's cut, until
+  /// that run ends: it stops at its next progress point instead of finishing
+  /// a snapshot no header will name while it holds the checkpoint status.
+  pub(crate) checkpoint_cancelled: AtomicBool,
 
   /// Vector stores keyed by property key ID
   /// Each property key can have its own vector store with different dimensions

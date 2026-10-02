@@ -10,7 +10,7 @@ use crate::core::snapshot::reader::{ParseSnapshotOptions, SnapshotData};
 use crate::core::snapshot::writer::{build_snapshot_to_memory, SnapshotBuildInput};
 use crate::core::wal::buffer::WalBuffer;
 use crate::error::{KiteError, Result};
-use crate::types::DbHeaderV1;
+use crate::types::{DbHeaderV1, DeltaState};
 use crate::util::compression::CompressionOptions;
 
 use super::checkpoint::WrittenSnapshot;
@@ -197,8 +197,7 @@ impl SingleFileDB {
     }
 
     // The installed snapshot holds everything the delta did.
-    self.delta.write().clear();
-    self.swap_in_snapshot(loaded);
+    self.install_loaded_snapshot(loaded, DeltaState::new());
 
     Ok(())
   }

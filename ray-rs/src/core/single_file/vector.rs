@@ -34,6 +34,11 @@ impl SingleFileDB {
       return Ok(());
     }
 
+    // A lazy entry is an offset into the snapshot installed with it, and a
+    // checkpoint install replaces both while holding `snapshot.write()`; so
+    // read the entry, decode it, and store the result under one snapshot
+    // guard (lock order `snapshot` -> vector stores, as in the install).
+    let snapshot_guard = self.snapshot.read();
     let entry = {
       let lazy_entries = self.vector_store_lazy_entries.read();
       lazy_entries.get(&prop_key_id).cloned()
@@ -41,19 +46,15 @@ impl SingleFileDB {
     let Some(entry) = entry else {
       return Ok(());
     };
-
-    let manifest = {
-      let snapshot_guard = self.snapshot.read();
-      let snapshot = snapshot_guard.as_ref().ok_or_else(|| {
-        KiteError::Internal("lazy vector-store entry present without loaded snapshot".to_string())
-      })?;
-      deserialize_vector_store_entry(snapshot, prop_key_id, &entry)?
-    };
-
-    {
-      let mut stores = self.vector_stores.write();
-      stores.entry(prop_key_id).or_insert(manifest);
-    }
+    let snapshot = snapshot_guard.as_ref().ok_or_else(|| {
+      KiteError::Internal("lazy vector-store entry present without loaded snapshot".to_string())
+    })?;
+    let manifest = deserialize_vector_store_entry(snapshot, prop_key_id, &entry)?;
+    self
+      .vector_stores
+      .write()
+      .entry(prop_key_id)
+      .or_insert(manifest);
     self.vector_store_lazy_entries.write().remove(&prop_key_id);
     Ok(())
   }

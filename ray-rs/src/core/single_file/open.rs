@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 #[cfg(feature = "bench-profile")]
 use std::time::Instant;
@@ -994,6 +994,10 @@ fn open_single_file_internal(
     ));
   }
   if !options.read_only {
+    // Records of a type this version does not know are a newer version's,
+    // not torn: refuse rather than trim or compact them away below.
+    wal_buffer.check_record_types(&mut pager)?;
+
     // A crash during a commit's sync can leave a durable header naming WAL
     // bytes that never landed. Replay stops at them, so drop them before
     // anything is appended after them, out of replay's reach. (A retired
@@ -1307,6 +1311,8 @@ fn open_single_file_internal(
     background_checkpoint: options.background_checkpoint,
     checkpoint_state: Mutex::new(BackgroundCheckpointState::default()),
     checkpoint_progress: AtomicU64::new(0),
+    checkpoint_steps_running: AtomicUsize::new(0),
+    checkpoint_cancelled: AtomicBool::new(false),
     vector_stores: RwLock::new(vector_stores),
     vector_store_lazy_entries: RwLock::new(vector_store_lazy_entries),
     cache: RwLock::new(cache),

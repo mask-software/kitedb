@@ -53,6 +53,11 @@ pub enum KiteError {
   #[error("WAL buffer full: checkpoint required before continuing writes")]
   WalBufferFull,
 
+  /// A background checkpoint did not start, and nothing changed. The reason
+  /// says what has to happen first (usually an open transaction finishing).
+  #[error("Background checkpoint declined: {0}")]
+  CheckpointDeclined(String),
+
   /// Attempted write on read-only database
   #[error("Database is read-only")]
   ReadOnly,

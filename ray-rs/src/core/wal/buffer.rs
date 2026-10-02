@@ -23,7 +23,7 @@ use crate::error::{KiteError, Result};
 use crate::types::*;
 use crate::util::binary::*;
 
-use super::record::{parse_wal_record, ParsedWalRecord, WalRecord};
+use super::record::{parse_wal_record, read_wal_record, ParsedWalRecord, WalRecord, WalRecordAt};
 
 /// WAL region split ratio: primary gets 75%, secondary gets 25%
 const PRIMARY_REGION_RATIO: f64 = 0.75;
@@ -96,9 +96,18 @@ impl WalBuffer {
     let mut primary_head = header.wal_primary_head;
     let mut secondary_head = header.wal_secondary_head;
 
-    // Backward compatibility: if V2 fields are 0 and head is non-zero,
-    // initialize primaryHead from head
-    if primary_head == 0 && header.wal_head > 0 {
+    // Headers written before the region fields existed carry only wal_head, a
+    // primary-region position. Every header with the region fields records
+    // wal_primary_head == wal_head while the primary region is active, and a
+    // wal_head in the secondary region while it is active (a cut, which may
+    // leave the primary region empty, or a retired primary region). So
+    // wal_head stands in for a missing primary head only if it can be one:
+    // taking a secondary position as the primary head would replay stale bytes
+    // of an earlier WAL cycle, or put the head past the primary region.
+    if primary_head == 0
+      && header.wal_head > 0
+      && (active_region == 0 || header.wal_head < secondary_region_start)
+    {
       primary_head = header.wal_head;
     }
 
@@ -549,6 +558,29 @@ impl WalBuffer {
       self.secondary_head
     };
     Ok(trimmed)
+  }
+
+  /// Fail if a region's records stop before its head at a record whose CRC
+  /// checks but whose type this version does not know (a newer version wrote
+  /// it). It is not torn, so trimming or compacting the region, which keeps
+  /// only the records before it, would drop it and every record after it for
+  /// good. Writable opens check this before rewriting anything; replay stops
+  /// at such a record either way.
+  pub fn check_record_types(&mut self, pager: &mut FilePager) -> Result<()> {
+    for (region, head) in [(0, self.primary_head), (1, self.secondary_head)] {
+      let (_, end) = self.scan_region_to_end(region, pager)?;
+      if end >= head {
+        continue;
+      }
+      let bytes = self.read_at_offset(self.file_offset(end), (head - end) as usize, pager)?;
+      if let WalRecordAt::UnknownType(record_type) = read_wal_record(&bytes, 0) {
+        return Err(KiteError::InvalidWal(format!(
+          "WAL record of unknown type {record_type} at offset {end}, probably written by a \
+           newer version; open the database read-only, or with that version"
+        )));
+      }
+    }
+    Ok(())
   }
 
   /// Whether the secondary region holds every transaction it commits whole
@@ -1302,6 +1334,31 @@ mod tests {
     }
     buffer.flush(pager).expect("flush");
     buffer
+  }
+
+  /// A cut taken while the primary region is empty records
+  /// wal_primary_head = 0 and a wal_head in the secondary region. Reading
+  /// that wal_head as the primary head (the shim for headers that predate
+  /// the region fields) put the head at or past the end of the primary
+  /// region.
+  #[test]
+  fn from_header_keeps_the_empty_primary_region_of_a_cut() {
+    let (mut pager, _temp) = create_test_pager();
+    for post_cut in [&[][..], &[10, 11][..]] {
+      let buffer = buffer_with_cut(&mut pager, 0, post_cut);
+      let mut header = test_header();
+      buffer.store_in_header(&mut header);
+      let reopened = WalBuffer::from_header(&header);
+      assert_eq!(reopened.region_state(), buffer.region_state());
+      assert_eq!(reopened.primary_head(), 0);
+    }
+
+    // A header without the region fields still names its primary head.
+    let mut legacy = test_header();
+    legacy.wal_head = 96;
+    legacy.wal_primary_head = 0;
+    legacy.wal_secondary_head = 0;
+    assert_eq!(WalBuffer::from_header(&legacy).primary_head(), 96);
   }
 
   #[test]

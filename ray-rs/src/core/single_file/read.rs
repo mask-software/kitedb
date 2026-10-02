@@ -8,7 +8,9 @@
 //! `delta` -> `snapshot` -> `mvcc.tx_manager` -> `mvcc.version_chain` -> `mvcc.gc`
 //!
 //! Every path that holds more than one of these takes them in this order: commit holds
-//! `delta.write()` -> `snapshot.read()` -> `version_chain`, and GC holds `tx_manager` ->
+//! `delta.write()` -> `snapshot.read()` -> `version_chain`, checkpoint installs hold
+//! `delta.write()` -> `snapshot.write()` (then the vector stores) to replace both in one
+//! step (`install_loaded_snapshot`), and GC holds `tx_manager` ->
 //! `version_chain` -> `gc` (`mvcc/manager.rs`). Readers compute their MVCC timestamp first,
 //! take `version_chain` last, and drop it before `record_read`. `delta` and `snapshot` are
 //! task-fair RwLocks: a queued writer blocks new readers, so even a read guard must never be

@@ -98,9 +98,45 @@ fn checked_padded_len(length: usize) -> Option<usize> {
     .map(|aligned| aligned & !(WAL_RECORD_ALIGNMENT - 1))
 }
 
+/// What lies at an offset of a WAL region.
+#[derive(Debug)]
+pub enum WalRecordAt {
+  /// A whole record of a type this version knows.
+  Record(ParsedWalRecord),
+  /// A whole record whose CRC checks but whose type this version does not
+  /// know: a newer version wrote it. It is not torn.
+  UnknownType(u8),
+  /// No whole, intact record: torn, truncated, or never written.
+  Invalid,
+}
+
 /// Parse a single WAL record from buffer at given offset
 /// Returns None if record is invalid or truncated
 pub fn parse_wal_record(buffer: &[u8], offset: usize) -> Option<ParsedWalRecord> {
+  match read_wal_record(buffer, offset) {
+    WalRecordAt::Record(record) => Some(record),
+    WalRecordAt::UnknownType(_) | WalRecordAt::Invalid => None,
+  }
+}
+
+/// Read the WAL record at `offset` of `buffer`, telling a record of an
+/// unknown type apart from bytes that hold no intact record.
+pub fn read_wal_record(buffer: &[u8], offset: usize) -> WalRecordAt {
+  let Some((record_type_byte, mut record)) = parse_wal_record_frame(buffer, offset) else {
+    return WalRecordAt::Invalid;
+  };
+  match WalRecordType::from_u8(record_type_byte) {
+    Some(record_type) => {
+      record.record_type = record_type;
+      WalRecordAt::Record(record)
+    }
+    None => WalRecordAt::UnknownType(record_type_byte),
+  }
+}
+
+/// The record at `offset` if its framing and CRC check, with its type byte
+/// (its `record_type` is a placeholder).
+fn parse_wal_record_frame(buffer: &[u8], offset: usize) -> Option<(u8, ParsedWalRecord)> {
   if !has_bytes(buffer.len(), offset, 4) {
     return None;
   }
@@ -142,7 +178,6 @@ pub fn parse_wal_record(buffer: &[u8], offset: usize) -> Option<ParsedWalRecord>
   if payload_end > buffer.len() {
     return None;
   }
-  let payload = buffer[payload_start..payload_end].to_vec();
 
   // Verify CRC
   let crc_start = record_type_offset;
@@ -154,15 +189,16 @@ pub fn parse_wal_record(buffer: &[u8], offset: usize) -> Option<ParsedWalRecord>
     return None; // CRC mismatch
   }
 
-  let record_type = WalRecordType::from_u8(record_type_byte)?;
-
-  Some(ParsedWalRecord {
-    record_type,
-    flags,
-    txid,
-    payload,
-    record_end: offset.checked_add(total_len)?,
-  })
+  Some((
+    record_type_byte,
+    ParsedWalRecord {
+      record_type: WalRecordType::Begin,
+      flags,
+      txid,
+      payload: buffer[payload_start..payload_end].to_vec(),
+      record_end: offset.checked_add(total_len)?,
+    },
+  ))
 }
 
 /// Scan WAL buffer and return all valid records

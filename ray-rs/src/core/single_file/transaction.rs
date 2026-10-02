@@ -3,8 +3,9 @@
 //! Handles begin, commit, and rollback operations.
 //!
 //! Commit ordering is:
-//! `WAL COMMIT -> WAL flush -> durable header -> delta / vector / bookkeeping
-//! merge -> sidecar attempt`. The sidecar attempt is deliberately
+//! `room for the COMMIT record (waiting for a background install if needed)
+//! -> MVCC commit timestamp -> WAL COMMIT -> WAL flush -> durable header ->
+//! delta / vector / bookkeeping merge -> sidecar attempt`. The sidecar attempt is deliberately
 //! non-authoritative after the local durability boundary: an error records
 //! primary replication lag and fences future sidecar appends, while this
 //! commit still completes locally and returns success.
@@ -54,6 +55,10 @@ pub(crate) enum WalWrite<T> {
   /// The WAL refused the record until background checkpoint cut `.0` is
   /// installed or released.
   BlockedOn(u64),
+  /// The WAL refused the record because it lives in the secondary region
+  /// after a background install whose compaction failed, with the primary
+  /// region empty; `compact_retired_wal` makes room.
+  NeedsCompaction,
 }
 
 /// Marks a transaction finished once commit or rollback is done with it,
@@ -69,6 +74,21 @@ struct ActiveTransactionGuard<'db> {
 impl Drop for ActiveTransactionGuard<'_> {
   fn drop(&mut self) {
     self.db.transaction_finished(self.txid, self.wrote_begin);
+  }
+}
+
+/// Aborts a transaction in MVCC when its commit fails before MVCC commits it.
+struct MvccAbortGuard<'db> {
+  db: &'db SingleFileDB,
+  txid: TxId,
+  armed: bool,
+}
+
+impl Drop for MvccAbortGuard<'_> {
+  fn drop(&mut self) {
+    if let (true, Some(mvcc)) = (self.armed, self.db.mvcc.as_ref()) {
+      mvcc.tx_manager.lock().abort_tx(self.txid);
+    }
   }
 }
 
@@ -171,6 +191,7 @@ impl SingleFileDB {
 
     // A checkpoint takes the write side. Holding this read permit through
     // insertion makes the gate atomic with transaction creation.
+    let mut checkpointed_for_room = false;
     let (_checkpoint_gate, txid, snapshot_ts) = loop {
       let checkpoint_gate = self.checkpoint_gate.read();
       let (txid, snapshot_ts) = if let Some(mvcc) = self.mvcc.as_ref() {
@@ -204,6 +225,25 @@ impl SingleFileDB {
           self.abort_unregistered_transaction(txid);
           drop(checkpoint_gate);
           self.wait_for_cut_release(cut)?;
+        }
+        // Compacting under the permit keeps blocking checkpoints and
+        // compaction out, as an open transaction would.
+        Ok(WalWrite::NeedsCompaction) => {
+          self.abort_unregistered_transaction(txid);
+          let compacted = self.compact_retired_wal();
+          drop(checkpoint_gate);
+          compacted?;
+        }
+        // The WAL is full and no checkpoint is in the way. This thread has no
+        // transaction open, so it can checkpoint now, as the next commit
+        // would: if every thread only began transactions, none would.
+        Err(KiteError::WalBufferFull) if !checkpointed_for_room => {
+          self.abort_unregistered_transaction(txid);
+          drop(checkpoint_gate);
+          if !self.auto_checkpoint_if_needed(true) {
+            return Err(KiteError::WalBufferFull);
+          }
+          checkpointed_for_room = true;
         }
         Err(error) => {
           self.abort_unregistered_transaction(txid);
@@ -248,24 +288,49 @@ impl SingleFileDB {
     let mut wal = self.wal_buffer.lock();
     match write(&mut wal, &mut pager) {
       Ok(value) => Ok(WalWrite::Written(value)),
-      Err(KiteError::WalBufferFull) => self
-        .cut_blocking_wal_writes(&wal)
-        .map(WalWrite::BlockedOn)
-        .ok_or(KiteError::WalBufferFull),
+      Err(KiteError::WalBufferFull) => {
+        if let Some(cut) = self.cut_blocking_wal_writes(&wal) {
+          Ok(WalWrite::BlockedOn(cut))
+        } else if wal.is_primary_retired() {
+          Ok(WalWrite::NeedsCompaction)
+        } else {
+          Err(KiteError::WalBufferFull)
+        }
+      }
       Err(error) => Err(error),
     }
   }
 
   /// `try_write_wal`, waiting and retrying for as long as a background
-  /// checkpoint holds the WAL in a full secondary region. Callers hold no
-  /// lock that checkpoint needs.
+  /// checkpoint holds the WAL in a full secondary region, and compacting a
+  /// retained WAL that fills it. Callers hold no lock that checkpoint needs.
   fn write_wal_waiting(&self, record: &WalRecord) -> Result<()> {
     loop {
       match self.try_write_wal(|wal, pager| wal.write_record(record, pager))? {
         WalWrite::Written(_) => return Ok(()),
         WalWrite::BlockedOn(cut) => self.wait_for_cut_release(cut)?,
+        WalWrite::NeedsCompaction => self.compact_retired_wal()?,
       }
     }
+  }
+
+  /// Compact WAL records retained in the secondary region by a background
+  /// install whose own compaction failed (see `compact_retained_wal`), so
+  /// writers that fill that region get the empty primary region instead of
+  /// `WalBufferFull`. Callers hold no lock.
+  ///
+  /// The commit lock excludes background cuts and installs (a cut finishes
+  /// the same compaction first). The caller keeps blocking checkpoints and
+  /// compaction out with its open transaction or a checkpoint gate permit.
+  pub(crate) fn compact_retired_wal(&self) -> Result<()> {
+    let _commit_guard = self.commit_lock.lock();
+    let mut pager = self.pager.lock();
+    let mut wal = self.wal_buffer.lock();
+    let mut header = self.header.write();
+    if wal.is_primary_retired() {
+      self.compact_retained_wal(&mut pager, &mut wal, &mut header)?;
+    }
+    Ok(())
   }
 
   pub(crate) fn current_tx_handle(&self) -> Option<Arc<Mutex<SingleFileTxState>>> {
@@ -509,11 +574,11 @@ impl SingleFileDB {
     }
   }
 
-  /// Refuse, before its COMMIT record is written, a commit whose vectors
-  /// cannot be applied: another transaction fixed the store's dimensions
-  /// after this one set its vectors (`set_node_vector` checks only the store
-  /// as it was then). Callers hold the commit lock, so no store changes
-  /// meanwhile.
+  /// Refuse, before MVCC or a COMMIT record records it, a commit whose
+  /// vectors cannot be applied: another transaction fixed the store's
+  /// dimensions after this one set its vectors (`set_node_vector` checks only
+  /// the store as it was then). Callers hold the commit lock, so no store
+  /// changes meanwhile.
   fn check_pending_vectors(
     &self,
     pending_vectors: &HashMap<(NodeId, PropKeyId), Option<VectorRef>>,
@@ -551,7 +616,24 @@ impl SingleFileDB {
       let mut current_tx = self.current_tx.lock();
       current_tx.remove(&tid).ok_or(KiteError::NoTransaction)?
     };
+    let read_only = tx_handle.lock().read_only;
+    let result = self.commit_transaction(&tx_handle);
+    if !read_only {
+      // Every lock is released and this thread's transaction is finished, so
+      // the checkpoint may wait for other threads' open transactions without
+      // ever waiting on its own. A failed commit checkpoints too: when the
+      // WAL refused its COMMIT record, every later commit would fail the same
+      // way, and nothing else would ever checkpoint.
+      self.auto_checkpoint_if_needed(matches!(result, Err(KiteError::WalBufferFull)));
+    }
+    result
+  }
 
+  /// Commit the transaction `tx_handle`, already removed from `current_tx`.
+  fn commit_transaction(
+    &self,
+    tx_handle: &Arc<Mutex<SingleFileTxState>>,
+  ) -> Result<Option<CommitToken>> {
     let (txid, read_only, bulk_load, pending, pending_wal, staged_schema) = {
       let mut tx = tx_handle.lock();
       let pending = std::mem::take(&mut tx.pending);
@@ -583,29 +665,19 @@ impl SingleFileDB {
     }
     let prev_writers = self.active_writers.fetch_sub(1, Ordering::SeqCst);
     debug_assert!(prev_writers > 0, "active_writers underflow in commit");
+    // Until MVCC commits it (right before its COMMIT record), every failure
+    // aborts it there.
+    let mut mvcc_abort = MvccAbortGuard {
+      db: self,
+      txid,
+      armed: true,
+    };
 
     // Fencing must happen before MVCC marks the transaction committed or the
     // local WAL gets a COMMIT record. A repair fence is deliberately allowed
     // through; it affects only replication, not local commit authority.
     if let Some(replication) = self.primary_replication.as_ref() {
       replication.ensure_local_commit_allowed()?;
-    }
-
-    let mut commit_ts_for_mvcc = None;
-    if let Some(mvcc) = self.mvcc.as_ref() {
-      let mut tx_mgr = mvcc.tx_manager.lock();
-      if let Err(err) = mvcc.conflict_detector.validate_commit(&tx_mgr, txid) {
-        tx_mgr.abort_tx(txid);
-        return Err(KiteError::Conflict {
-          txid: err.txid,
-          keys: err.conflicting_keys,
-        });
-      }
-
-      let commit_ts = tx_mgr
-        .commit_tx(txid)
-        .map_err(|e| KiteError::Internal(e.to_string()))?;
-      commit_ts_for_mvcc = Some((commit_ts, tx_mgr.active_count() > 0));
     }
 
     let replication_enabled = self.primary_replication.is_some();
@@ -631,7 +703,7 @@ impl SingleFileDB {
     // Serialize the WAL and delta portions together. The checkpoint cut uses
     // the same lock, so a commit is either completely before or completely
     // after a background snapshot cut.
-    let _commit_guard = loop {
+    let (_commit_guard, commit_ts_for_mvcc) = loop {
       #[cfg(feature = "bench-profile")]
       let commit_lock_start = Instant::now();
       let commit_guard = self.commit_lock.lock();
@@ -641,25 +713,35 @@ impl SingleFileDB {
         Ordering::Relaxed,
       );
 
+      // Refused here, nothing records the commit: not MVCC, not the WAL.
       self.check_pending_vectors(&pending.pending_vectors)?;
       let mut pager = self.pager.lock();
       let mut wal = self.wal_buffer.lock();
-      if let Err(error) = wal.write_record_bytes_batch(&commit_records, &mut pager) {
-        let blocked_on = match error {
-          KiteError::WalBufferFull => self.cut_blocking_wal_writes(&wal),
-          _ => None,
+      if !wal.can_fit(commit_records.len()) {
+        // Nothing of this commit is recorded yet, so make room and retry.
+        if wal.is_primary_retired() {
+          let mut header = self.header.write();
+          self.compact_retained_wal(&mut pager, &mut wal, &mut header)?;
+          continue;
+        }
+        let Some(cut) = self.cut_blocking_wal_writes(&wal) else {
+          return Err(KiteError::WalBufferFull);
         };
-        let Some(cut) = blocked_on else {
-          return Err(error);
-        };
-        // The background checkpoint takes the commit lock to install; nothing
-        // of this commit is written yet.
+        // The background checkpoint takes the commit lock to install.
         drop(wal);
         drop(pager);
         drop(commit_guard);
         self.wait_for_cut_release(cut)?;
         continue;
       }
+
+      // MVCC commits here, after any wait for WAL space and right before the
+      // COMMIT record, under the commit lock: commit timestamps follow WAL
+      // and delta order, and a transaction that began while this commit
+      // waited does not see it.
+      let commit_ts_for_mvcc = self.commit_in_mvcc(txid)?;
+      mvcc_abort.armed = false;
+      wal.write_record_bytes_batch(&commit_records, &mut pager)?;
 
       // Flush WAL to disk based on sync mode
       let should_flush = matches!(self.sync_mode, SyncMode::Full | SyncMode::Normal);
@@ -705,7 +787,7 @@ impl SingleFileDB {
         state.next_seq = state.next_seq.saturating_add(1);
         group_commit_seq = state.next_seq;
       }
-      break commit_guard;
+      break (commit_guard, commit_ts_for_mvcc);
     };
 
     // The commit is durable from here on (with group commit, once its flush
@@ -759,28 +841,28 @@ impl SingleFileDB {
     drop(_commit_guard);
     drop(active_transaction_guard);
     group_commit_result.and(schema_result).and(vector_result)?;
-
-    // Check if auto-checkpoint should be triggered. Every lock is released and
-    // this thread's transaction is finished, so the checkpoint may wait for
-    // other threads' open transactions without ever waiting on its own.
-    if self.auto_checkpoint && self.should_checkpoint(self.checkpoint_threshold) {
-      // Don't trigger if checkpoint is already running
-      if !self.is_checkpoint_running() {
-        // Use background or blocking checkpoint based on config
-        let result = if self.background_checkpoint {
-          self.auto_background_checkpoint()
-        } else {
-          self.checkpoint()
-        };
-
-        // Log errors but don't fail the commit
-        if let Err(e) = result {
-          eprintln!("Warning: Auto-checkpoint failed: {e}");
-        }
-      }
-    }
-
     Ok(commit_token)
+  }
+
+  /// Validate and commit `txid` in MVCC, if enabled: its commit timestamp,
+  /// and whether any transaction is still active (which then needs version
+  /// chains). A conflict aborts it.
+  fn commit_in_mvcc(&self, txid: TxId) -> Result<Option<(u64, bool)>> {
+    let Some(mvcc) = self.mvcc.as_ref() else {
+      return Ok(None);
+    };
+    let mut tx_mgr = mvcc.tx_manager.lock();
+    if let Err(err) = mvcc.conflict_detector.validate_commit(&tx_mgr, txid) {
+      tx_mgr.abort_tx(txid);
+      return Err(KiteError::Conflict {
+        txid: err.txid,
+        keys: err.conflicting_keys,
+      });
+    }
+    let commit_ts = tx_mgr
+      .commit_tx(txid)
+      .map_err(|e| KiteError::Internal(e.to_string()))?;
+    Ok(Some((commit_ts, tx_mgr.active_count() > 0)))
   }
 
   /// Rollback the current transaction
@@ -790,6 +872,19 @@ impl SingleFileDB {
       let mut current_tx = self.current_tx.lock();
       current_tx.remove(&tid).ok_or(KiteError::NoTransaction)?
     };
+    let read_only = tx_handle.lock().read_only;
+    let result = self.rollback_transaction(&tx_handle);
+    if !read_only {
+      // As after a commit: a rollback often follows a write the full WAL
+      // refused, and nothing else may checkpoint.
+      self.auto_checkpoint_if_needed(false);
+    }
+    result
+  }
+
+  /// Roll back the transaction `tx_handle`, already removed from
+  /// `current_tx`.
+  fn rollback_transaction(&self, tx_handle: &Arc<Mutex<SingleFileTxState>>) -> Result<()> {
     let (txid, read_only, bulk_load) = {
       let tx = tx_handle.lock();
       (tx.txid, tx.read_only, tx.bulk_load)
