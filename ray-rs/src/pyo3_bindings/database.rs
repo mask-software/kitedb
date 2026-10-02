@@ -286,7 +286,9 @@ impl PyDatabase {
     self.with_db_nogil(py, |db| transaction::begin_single_file(db, read_only))
   }
 
-  /// Begin a bulk-load transaction (fast path, MVCC disabled)
+  /// Begin a bulk-load transaction: the fast path for loading data. It runs
+  /// alone among writers (it waits for open write transactions, and they
+  /// wait for it); readers never wait for it.
   fn begin_bulk(&self, py: Python<'_>) -> PyResult<i64> {
     self.with_db_nogil(py, transaction::begin_bulk_single_file)
   }
@@ -688,8 +690,7 @@ impl PyDatabase {
   /// Create keyed nodes with properties (and optional labels) in one batch.
   ///
   /// Inside an open transaction the batch joins it. Otherwise it runs in its
-  /// own transaction: a bulk-load one (the fast path) unless MVCC is enabled,
-  /// which bulk load does not support.
+  /// own bulk-load transaction (the fast path).
   #[pyo3(signature = (input_nodes, labels=None))]
   fn batch_create_nodes(
     &self,
@@ -723,13 +724,8 @@ impl PyDatabase {
       if db.has_transaction() {
         return write();
       }
-      if db.mvcc_enabled() {
-        db.begin(false)
-          .map_err(|e| errors::wrap(e, "Failed to begin transaction"))?;
-      } else {
-        db.begin_bulk()
-          .map_err(|e| errors::wrap(e, "Failed to begin bulk"))?;
-      }
+      db.begin_bulk()
+        .map_err(|e| errors::wrap(e, "Failed to begin bulk"))?;
       match write() {
         Ok(ids) => {
           db.commit()

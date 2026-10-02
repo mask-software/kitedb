@@ -1616,11 +1616,7 @@ export function bulkWrite<T, D extends NativeDatabase = Database>(
 
   while (index < operations.length) {
     if (beginBulk) {
-      try {
-        beginBulk()
-      } catch {
-        db.begin()
-      }
+      beginBulk()
     } else {
       db.begin()
     }

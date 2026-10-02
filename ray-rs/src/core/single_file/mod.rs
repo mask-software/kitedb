@@ -171,9 +171,9 @@ pub struct SingleFileTxState {
   /// A replica's replication apply; the only transactions in which a
   /// replica accepts data writes.
   pub(crate) replication_apply: bool,
-  /// It holds non-MVCC mode's writer slot (see `writer_slot`), released when
-  /// it is settled.
-  pub(crate) holds_writer: bool,
+  /// How it holds the writer slot (see `writer_slot`): every write
+  /// transaction does, until it is settled.
+  pub(crate) writer: Option<writer_slot::WriterMode>,
   /// With MVCC, what a write transaction read, kept here (thread-private)
   /// and handed to the transaction manager for its conflict check at commit.
   pub(crate) mvcc_reads: TxKeySet,
@@ -202,7 +202,7 @@ impl SingleFileTxState {
       bulk_load,
       pending_wal: Vec::new(),
       replication_apply: false,
-      holds_writer: false,
+      writer: None,
       mvcc_reads: TxKeySet::new(),
       mvcc_writes: TxKeySet::new(),
       savepoints: Vec::new(),
@@ -211,10 +211,17 @@ impl SingleFileTxState {
     }
   }
 
+  /// Whether the transaction's reads go to its MVCC conflict check. A
+  /// read-only transaction never checks, and a bulk load has no other write
+  /// transaction beside it to conflict with, so they note nothing.
+  pub(crate) fn tracks_reads(&self) -> bool {
+    !self.read_only && !self.bulk_load
+  }
+
   /// Note that the transaction read `key`, for its MVCC conflict check at
-  /// commit. A read-only transaction never checks, so it notes nothing.
+  /// commit (see `tracks_reads`).
   pub(crate) fn record_read(&mut self, key: TxKey) {
-    if !self.read_only {
+    if self.tracks_reads() {
       self.mvcc_reads.insert(key);
     }
   }

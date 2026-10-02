@@ -926,7 +926,9 @@ impl Kite {
       .map_err(|e| Error::from_reason(format!("Failed to begin transaction: {e}")))
   }
 
-  /// Begin a bulk-load transaction (fast path, MVCC disabled)
+  /// Begin a bulk-load transaction: the fast path for loading data. It runs
+  /// alone among writers (it waits for open write transactions, and they
+  /// wait for it); readers never wait for it.
   #[napi]
   pub fn begin_bulk(&self) -> Result<i64> {
     let guard = self.inner.read();

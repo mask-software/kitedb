@@ -2004,7 +2004,9 @@ impl Database {
     }
   }
 
-  /// Begin a bulk-load transaction (fast path, MVCC disabled)
+  /// Begin a bulk-load transaction: the fast path for loading data. It runs
+  /// alone among writers (it waits for open write transactions, and they
+  /// wait for it); readers never wait for it.
   #[napi]
   pub fn begin_bulk(&self) -> Result<i64> {
     match self.inner.as_ref() {

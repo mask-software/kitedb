@@ -888,7 +888,8 @@ class Kite:
         """
         Execute multiple operations in a bulk-load transaction (max throughput).
 
-        Note: bulk-load disables MVCC. Use for one-shot ingest/ETL jobs.
+        The bulk load runs alone among writers: it waits for open write
+        transactions, and they wait for it. Readers never wait for it.
         """
         if self._db.has_transaction():
             raise ValueError("bulk() cannot run inside an active transaction")
@@ -897,10 +898,7 @@ class Kite:
         if begin_bulk is None:
             return self.batch(operations)
 
-        try:
-            begin_bulk()
-        except Exception:
-            self._db.begin()
+        begin_bulk()
 
         try:
             results: List[Any] = []

@@ -240,7 +240,7 @@ impl SingleFileDB {
   /// Note what the write transaction `tx` wrote (`writes`) and read
   /// (`reads`) for its MVCC conflict check at commit. The keys stay with the
   /// transaction until then (see `SingleFileTxState::mvcc_writes`). A bulk
-  /// load, which runs without MVCC, records nothing.
+  /// load records nothing: no other write transaction runs beside it.
   fn record_tx_keys(
     &self,
     tx: &mut SingleFileTxState,

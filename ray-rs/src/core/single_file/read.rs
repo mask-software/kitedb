@@ -585,7 +585,7 @@ impl SingleFileDB {
     let tx_handle = self.current_tx_handle();
     let mut tx_guard = tx_handle.as_ref().map(|tx| tx.lock());
     let (txid, snapshot_ts) = self.mvcc_read_ts(tx_guard.as_deref());
-    let tracks_reads = self.mvcc.is_some() && tx_guard.as_ref().is_some_and(|tx| !tx.read_only);
+    let tracks_reads = self.mvcc.is_some() && tx_guard.as_ref().is_some_and(|tx| tx.tracks_reads());
     let mut reads = Vec::new();
     let result = {
       let delta = self.delta.read();

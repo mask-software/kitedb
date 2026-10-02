@@ -42,6 +42,7 @@ use std::thread::ThreadId;
 use std::time::Instant;
 
 use super::open::SyncMode;
+use super::writer_slot::WriterMode;
 use super::{SchemaStaging, SingleFileDB, SingleFileTxState};
 use crate::core::pager::FilePager;
 use crate::core::wal::buffer::{WalBuffer, WalRegionState};
@@ -229,15 +230,15 @@ struct ActiveTransactionGuard<'db> {
   txid: TxId,
   /// The transaction wrote a BEGIN record (a non-bulk write transaction).
   wrote_begin: bool,
-  /// It holds non-MVCC mode's writer slot, released here.
-  holds_writer: bool,
+  /// How it holds the writer slot (write transactions), released here.
+  writer: Option<WriterMode>,
 }
 
 impl Drop for ActiveTransactionGuard<'_> {
   fn drop(&mut self) {
     self.db.transaction_finished(self.txid, self.wrote_begin);
-    if self.holds_writer {
-      self.db.tx_shared.writer.release();
+    if let Some(mode) = self.writer {
+      self.db.tx_shared.writer.release(mode);
     }
   }
 }
@@ -398,11 +399,6 @@ impl SingleFileDB {
     if bulk_load && read_only {
       return Err(KiteError::ReadOnly);
     }
-    if bulk_load && self.mvcc.is_some() {
-      return Err(KiteError::Internal(
-        "bulk load requires MVCC disabled".to_string(),
-      ));
-    }
 
     // Only this thread registers its own transaction, so checking before the
     // gate is race-free. It must come first: a blocking checkpoint holding
@@ -411,10 +407,18 @@ impl SingleFileDB {
       return Err(KiteError::TransactionInProgress);
     }
     self.reap_abandoned_transactions();
-    // Without MVCC, write transactions run one at a time (see
-    // `writer_slot`). Taken before the checkpoint gate, holding nothing; a
-    // failed begin releases it.
-    let writer_claim = (self.mvcc.is_none() && !read_only).then(|| self.tx_shared.writer.claim());
+    // Write transactions claim the writer slot (see `writer_slot`): MVCC ones
+    // together, a bulk load or a write transaction without MVCC alone. Taken
+    // before the checkpoint gate, holding nothing; a failed begin releases
+    // it.
+    let writer_claim = (!read_only).then(|| {
+      let mode = if bulk_load || self.mvcc.is_none() {
+        WriterMode::Exclusive
+      } else {
+        WriterMode::Shared
+      };
+      self.tx_shared.writer.claim(mode)
+    });
 
     // A checkpoint takes the write side. Holding this read permit through
     // insertion makes the gate atomic with transaction creation.
@@ -489,7 +493,7 @@ impl SingleFileDB {
     };
 
     let mut tx_state = SingleFileTxState::new(txid, read_only, snapshot_ts, bulk_load);
-    tx_state.holds_writer = writer_claim.is_some();
+    tx_state.writer = writer_claim.as_ref().map(|claim| claim.mode());
     let tx_state = Arc::new(Mutex::new(tx_state));
 
     self.register_thread_transaction(tx_state);
@@ -649,12 +653,23 @@ impl SingleFileDB {
     Ok(guard)
   }
 
-  /// Begin a bulk-load transaction (fast path, MVCC disabled)
+  /// Begin a bulk-load transaction: the fast path for loading data, with or
+  /// without MVCC.
+  ///
+  /// It runs alone among writers: it waits for the open write transactions
+  /// to finish, and write transactions that begin while it is open, or while
+  /// it waits, wait for it. Its WAL records are written at commit, in one
+  /// batch, and it records nothing for MVCC conflict checks (no write
+  /// transaction runs beside it). Readers never wait for it: reads outside a
+  /// transaction see it whole once it commits, and a read transaction that
+  /// began before its commit never sees it (snapshot isolation; its commit
+  /// keeps the version history such a reader needs, as any commit does).
   pub fn begin_bulk(&self) -> Result<TxId> {
     self.begin_with_mode(false, true)
   }
 
-  /// Begin a bulk-load transaction guard (rolls back on drop)
+  /// Begin a bulk-load transaction guard (rolls back on drop); see
+  /// [`Self::begin_bulk`].
   pub fn begin_bulk_guard(&self) -> Result<SingleFileTxGuard<'_>> {
     let txid = self.begin_with_mode(false, true)?;
     Ok(SingleFileTxGuard::new(self, txid))
@@ -926,7 +941,7 @@ impl SingleFileDB {
     &self,
     tx_handle: &Arc<Mutex<SingleFileTxState>>,
   ) -> Result<Option<CommitToken>> {
-    let (txid, read_only, bulk_load, holds_writer, pending, pending_wal, staged_schema, deferred) = {
+    let (txid, read_only, bulk_load, writer, pending, pending_wal, staged_schema, deferred) = {
       let mut tx = tx_handle.lock();
       let pending = std::mem::take(&mut tx.pending);
       let staged_schema = std::mem::take(&mut tx.schema);
@@ -950,7 +965,7 @@ impl SingleFileDB {
         tx.txid,
         tx.read_only,
         tx.bulk_load,
-        std::mem::take(&mut tx.holds_writer),
+        tx.writer.take(),
         pending,
         pending_wal,
         staged_schema,
@@ -964,7 +979,7 @@ impl SingleFileDB {
       db: self,
       txid,
       wrote_begin: !read_only && !bulk_load,
-      holds_writer,
+      writer,
     };
     let mut schema_reservation_guard = SchemaReservationGuard::new(self, txid);
 
@@ -1496,20 +1511,15 @@ impl SingleFileDB {
     &self,
     tx_handle: &Arc<Mutex<SingleFileTxState>>,
   ) -> Result<()> {
-    let (txid, read_only, bulk_load, holds_writer) = {
+    let (txid, read_only, bulk_load, writer) = {
       let mut tx = tx_handle.lock();
-      (
-        tx.txid,
-        tx.read_only,
-        tx.bulk_load,
-        std::mem::take(&mut tx.holds_writer),
-      )
+      (tx.txid, tx.read_only, tx.bulk_load, tx.writer.take())
     };
     let _active_transaction_guard = ActiveTransactionGuard {
       db: self,
       txid,
       wrote_begin: !read_only && !bulk_load,
-      holds_writer,
+      writer,
     };
     let _schema_reservation_guard = SchemaReservationGuard::new(self, txid);
 

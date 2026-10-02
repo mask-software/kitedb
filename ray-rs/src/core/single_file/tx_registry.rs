@@ -10,7 +10,7 @@
 //! destructor hands the transaction to its database, which rolls it back
 //! (`reap_abandoned_transactions`) at the next begin, background checkpoint,
 //! or wait for open transactions. Left open, it would hold off every blocking
-//! checkpoint forever (and, in non-MVCC mode, every other writer).
+//! checkpoint forever, and every writer its writer slot claim excludes.
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,7 +32,7 @@ pub(crate) struct TxShared {
   abandoned: Mutex<Vec<Arc<Mutex<SingleFileTxState>>>>,
   /// Set when a transaction is abandoned, so hot paths check without a lock.
   has_abandoned: AtomicBool,
-  /// Non-MVCC mode's single writer.
+  /// Which write transactions may be open at once (see `writer_slot`).
   pub(crate) writer: super::writer_slot::WriterSlot,
 }
 
@@ -53,8 +53,8 @@ impl Drop for ThreadTxs {
       // rest waits for the database to reap it.
       {
         let mut state = tx.state.lock();
-        if std::mem::take(&mut state.holds_writer) {
-          tx.db.writer.release();
+        if let Some(mode) = state.writer.take() {
+          tx.db.writer.release(mode);
         }
       }
       tx.db.abandoned.lock().push(tx.state);
