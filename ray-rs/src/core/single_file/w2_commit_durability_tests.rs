@@ -326,6 +326,125 @@ fn d3_tx_begun_during_in_flight_commit_reads_repeatably() {
   );
 }
 
+/// What a reader sees of node `n` and its neighbour `a` in
+/// `d3_tx_begun_during_in_flight_recreate_keeps_the_old_node`.
+#[derive(Debug, PartialEq)]
+struct RecreateView {
+  exists: bool,
+  key: Option<String>,
+  by_old_key: Option<NodeId>,
+  by_new_key: Option<NodeId>,
+  prop: Option<PropValue>,
+  labels: Vec<LabelId>,
+  out_edges: Vec<(ETypeId, NodeId)>,
+  a_in_edges: Vec<(ETypeId, NodeId)>,
+  weight: Option<PropValue>,
+  nodes: Vec<NodeId>,
+}
+
+/// Wave-2 lanes together: delta-recreate (a recreated id starts fresh),
+/// mvcc-chains (chains hold the history older readers need) and D3 (the MVCC
+/// timestamp, version chains and delta merge land at once). T1 deletes a
+/// snapshot node and recreates its id in one transaction; T2 begins while
+/// T1's commit is durable but not merged. T2 must keep seeing the old node
+/// (key, prop, label, edges, edge prop) after T1 merges, and reads after T2
+/// see only the recreated node.
+#[test]
+fn d3_tx_begun_during_in_flight_recreate_keeps_the_old_node() {
+  let temp_dir = tempdir().expect("temp dir");
+  let db_path = temp_dir.path().join("d3-recreate.kitedb");
+  let options = SingleFileOpenOptions::new()
+    .auto_checkpoint(false)
+    .mvcc(true)
+    .mvcc_gc_interval_ms(5)
+    .mvcc_retention_ms(0);
+  let db = Arc::new(open_single_file(&db_path, options).expect("open"));
+  db.begin(false).expect("begin");
+  let a = db.create_node(Some("a")).expect("a");
+  let n = db.create_node(Some("old")).expect("n");
+  let p = db.define_propkey("p").expect("propkey p");
+  let weight = db.define_propkey("weight").expect("propkey weight");
+  let label = db.define_label("Old").expect("label");
+  let t = db.define_etype("T").expect("etype");
+  db.set_node_prop(n, p, PropValue::I64(1)).expect("prop");
+  db.add_node_label(n, label).expect("label n");
+  db.add_edge(n, t, a).expect("edge");
+  db.set_edge_prop(n, t, a, weight, PropValue::I64(5))
+    .expect("edge prop");
+  db.commit().expect("commit");
+  db.checkpoint().expect("checkpoint");
+
+  let view = |db: &SingleFileDB| RecreateView {
+    exists: db.node_exists(n),
+    key: db.node_key(n),
+    by_old_key: db.node_by_key("old"),
+    by_new_key: db.node_by_key("new"),
+    prop: db.node_prop(n, p),
+    labels: db.node_labels(n),
+    out_edges: db.out_edges(n),
+    a_in_edges: db.in_edges(a),
+    weight: db.edge_prop(n, t, a, weight),
+    nodes: db.list_nodes(),
+  };
+  let old = view(&db);
+  assert_eq!(old.key.as_deref(), Some("old"));
+  assert_eq!(old.weight, Some(PropValue::I64(5)));
+
+  let (paused_tx, paused_rx) = mpsc::channel::<()>();
+  let (go_tx, go_rx) = mpsc::channel::<()>();
+  let t1_db = Arc::clone(&db);
+  let t1 = std::thread::spawn(move || {
+    t1_db.begin(false).expect("T1 begin");
+    t1_db.delete_node(n).expect("T1 delete n");
+    t1_db
+      .create_node_with_id(n, Some("new"))
+      .expect("T1 recreate n");
+    t1_db
+      .set_node_prop(n, p, PropValue::I64(2))
+      .expect("T1 prop");
+    BEFORE_NEXT_COMMIT_MERGE.with(|hook| {
+      *hook.borrow_mut() = Some(Box::new(move || {
+        paused_tx.send(()).expect("signal paused");
+        let _ = go_rx.recv_timeout(Duration::from_secs(1));
+      }));
+    });
+    t1_db.commit()
+  });
+  paused_rx
+    .recv_timeout(Duration::from_secs(20))
+    .expect("T1 never reached the point between its durable commit and its delta merge");
+
+  db.begin(true).expect("T2 begin");
+  let before_merge = view(&db);
+  let _ = go_tx.send(());
+  t1.join().expect("T1 thread").expect("T1 commit");
+  let after_merge = view(&db);
+  db.rollback().expect("T2 end");
+
+  assert_eq!(before_merge, old, "T2 began before T1 merged");
+  assert_eq!(
+    after_merge, old,
+    "T2's snapshot changed when the in-flight recreate merged"
+  );
+  let recreated = view(&db);
+  assert_eq!(
+    recreated,
+    RecreateView {
+      exists: true,
+      key: Some("new".to_string()),
+      by_old_key: None,
+      by_new_key: Some(n),
+      prop: Some(PropValue::I64(2)),
+      labels: Vec::new(),
+      out_edges: Vec::new(),
+      a_in_edges: Vec::new(),
+      weight: None,
+      nodes: old.nodes.clone(),
+    },
+    "after T2: only the recreated node"
+  );
+}
+
 // ---------------------------------------------------------------------------
 // D4: replay of a mismatched vector record.
 // ---------------------------------------------------------------------------
