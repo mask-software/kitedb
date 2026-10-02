@@ -3,11 +3,11 @@
 //! Handles begin, commit, and rollback operations.
 //!
 //! Commit ordering is:
-//! `room for the COMMIT record (waiting for a background install if needed)
-//! -> MVCC conflict check -> WAL COMMIT -> WAL flush (and fsync, in Full
-//! mode) -> durable header -> schema publish -> MVCC commit timestamp,
-//! version chains, vector and delta merge -> sidecar attempt`, all under the
-//! commit lock. Until the header is durable a failure leaves no trace of the
+//! `epoch fence check (primaries) -> room for the COMMIT record (waiting for
+//! a background install if needed) -> MVCC conflict check -> WAL COMMIT ->
+//! WAL flush (and fsync, in Full mode) -> durable header -> schema publish
+//! -> MVCC commit timestamp, version chains, vector and delta merge ->
+//! sidecar attempt`, all under the commit lock. Until the header is durable a failure leaves no trace of the
 //! commit: its COMMIT record is forgotten, and MVCC aborts it. From there on
 //! every step runs. The MVCC timestamp, version chains and delta merge share
 //! one `delta.write()` critical section, and MVCC transactions begin under
@@ -804,13 +804,6 @@ impl SingleFileDB {
       armed: true,
     };
 
-    // Fencing must happen before MVCC marks the transaction committed or the
-    // local WAL gets a COMMIT record. A repair fence is deliberately allowed
-    // through; it affects only replication, not local commit authority.
-    if let Some(replication) = self.primary_replication.as_ref() {
-      replication.ensure_local_commit_allowed()?;
-    }
-
     let replication_enabled = self.primary_replication.is_some();
     let group_commit_active =
       self.group_commit_enabled && self.sync_mode == SyncMode::Normal && !replication_enabled;
@@ -960,8 +953,17 @@ impl SingleFileDB {
       // recorded a read of its node or edge), except bulk loads, which record
       // nothing.
       let check_targets = self.mvcc.is_none() || request.bulk_load;
+      // Epoch fencing, under the commit lock so a promotion that landed while
+      // this commit waited for it is seen, and before MVCC or the WAL records
+      // the commit. A repair fence is let through: it affects replication,
+      // not local commit authority.
       let checked = self
-        .load_vector_stores(&request.pending.pending_vectors)
+        .primary_replication
+        .as_ref()
+        .map_or(Ok(()), |replication| {
+          replication.ensure_local_commit_allowed()
+        })
+        .and_then(|()| self.load_vector_stores(&request.pending.pending_vectors))
         .and_then(|()| {
           if check_targets {
             self.check_commit_targets(&request.pending, &deleted_in_round)
