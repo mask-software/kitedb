@@ -5,7 +5,8 @@
 //! Ported from src/api/traversal.ts
 
 use crate::types::{ETypeId, Edge, NodeId, PropValue};
-use std::collections::{HashMap, HashSet, VecDeque};
+use hashbrown::{HashMap as FastMap, HashSet as FastSet};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 /// Type alias for edge filter predicates
@@ -92,6 +93,8 @@ impl TraverseOptions {
   }
 
   /// Add an edge filter predicate for variable-depth traversal
+  ///
+  /// Applied at every hop: the traversal does not follow an edge the predicate rejects.
   pub fn with_edge_filter<F>(mut self, predicate: F) -> Self
   where
     F: Fn(&EdgeInfo) -> bool + Send + Sync + 'static,
@@ -101,6 +104,9 @@ impl TraverseOptions {
   }
 
   /// Add a node filter predicate for variable-depth traversal
+  ///
+  /// Applied at every hop: the traversal neither yields nor expands a node the predicate
+  /// rejects.
   pub fn with_node_filter<F>(mut self, predicate: F) -> Self
   where
     F: Fn(&NodeInfo) -> bool + Send + Sync + 'static,
@@ -151,6 +157,8 @@ pub struct EdgeInfo {
   pub src: NodeId,
   pub dst: NodeId,
   pub etype: ETypeId,
+  /// The edge's props, as loaded by the traversal's [`TraversalProps`] (empty with
+  /// [`NoProps`], i.e. for [`TraversalBuilder::execute`]).
   pub props: HashMap<String, PropValue>,
 }
 
@@ -169,7 +177,51 @@ impl From<RawEdge> for EdgeInfo {
 #[derive(Debug, Clone)]
 pub struct NodeInfo {
   pub id: NodeId,
+  /// The node's props, as loaded by the traversal's [`TraversalProps`] (empty with
+  /// [`NoProps`], i.e. for [`TraversalBuilder::execute`]).
   pub props: HashMap<String, PropValue>,
+}
+
+/// Supplies the props that filter predicates see in [`EdgeInfo::props`] and
+/// [`NodeInfo::props`].
+///
+/// Props are loaded only to evaluate a filter. Traversals started from `Kite` load them from the
+/// database; [`TraversalBuilder::execute`] uses [`NoProps`].
+pub trait TraversalProps {
+  /// Props of a node
+  fn node_props(&self, node_id: NodeId) -> HashMap<String, PropValue>;
+  /// Props of an edge
+  fn edge_props(&self, edge: &RawEdge) -> HashMap<String, PropValue>;
+}
+
+/// [`TraversalProps`] that loads nothing: filters see empty prop maps.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoProps;
+
+impl TraversalProps for NoProps {
+  fn node_props(&self, _node_id: NodeId) -> HashMap<String, PropValue> {
+    HashMap::new()
+  }
+
+  fn edge_props(&self, _edge: &RawEdge) -> HashMap<String, PropValue> {
+    HashMap::new()
+  }
+}
+
+fn edge_info<P: TraversalProps>(props: &P, edge: RawEdge) -> EdgeInfo {
+  EdgeInfo {
+    src: edge.src,
+    dst: edge.dst,
+    etype: edge.etype,
+    props: props.edge_props(&edge),
+  }
+}
+
+fn node_info<P: TraversalProps>(props: &P, node_id: NodeId) -> NodeInfo {
+  NodeInfo {
+    id: node_id,
+    props: props.node_props(node_id),
+  }
 }
 
 // ============================================================================
@@ -216,6 +268,15 @@ impl std::fmt::Debug for TraversalStep {
         .field("options", options)
         .finish(),
     }
+  }
+}
+
+/// The directions a variable-depth step expands: `Both` is `Out`, then `In`.
+fn expand_directions(direction: TraversalDirection) -> &'static [TraversalDirection] {
+  match direction {
+    TraversalDirection::Out => &[TraversalDirection::Out],
+    TraversalDirection::In => &[TraversalDirection::In],
+    TraversalDirection::Both => &[TraversalDirection::Out, TraversalDirection::In],
   }
 }
 
@@ -374,8 +435,10 @@ impl TraversalBuilder {
 
   /// Add a global edge filter predicate
   ///
-  /// This filter is applied to all edges traversed. Only edges where
-  /// the predicate returns `true` will be included in results.
+  /// Filters the results: a result is kept only if the edge that reached it passes. It does not
+  /// prune the traversal, so the edges of earlier hops are not checked; use
+  /// [`TraverseOptions::with_edge_filter`] to filter every hop. Start nodes (which have no edge)
+  /// always pass.
   ///
   /// # Example
   /// ```rust,no_run
@@ -398,8 +461,9 @@ impl TraversalBuilder {
 
   /// Add a global node filter predicate
   ///
-  /// This filter is applied to all nodes traversed. Only nodes where
-  /// the predicate returns `true` will be included in results.
+  /// Filters the results: only result nodes where the predicate returns `true` are kept. It
+  /// does not prune the traversal, so nodes of earlier hops are not checked; use
+  /// [`TraverseOptions::with_node_filter`] to filter every hop.
   ///
   /// # Example
   /// ```rust,no_run
@@ -420,11 +484,11 @@ impl TraversalBuilder {
     self
   }
 
-  /// Select specific properties to load (optimization)
+  /// Select the node properties to load
   ///
-  /// Only the specified properties will be loaded when collecting results,
-  /// reducing overhead. This is useful when you only need a few properties
-  /// from nodes that have many properties.
+  /// Records which node props a caller that loads props (a [`TraversalProps`], or the
+  /// bindings when they materialize results) should load, instead of all of them. Traversals
+  /// started from `Kite` pass only these props to node filters.
   ///
   /// # Example
   /// ```rust,no_run
@@ -435,8 +499,6 @@ impl TraversalBuilder {
   /// let builder = TraversalBuilder::from_node(1)
   ///     .out(Some(knows_etype))
   ///     .select(vec!["name".to_string(), "age".to_string()]);
-  ///
-  /// // Only "name" and "age" properties will be loaded
   /// # }
   /// ```
   pub fn select(mut self, props: Vec<String>) -> Self {
@@ -497,12 +559,25 @@ impl TraversalBuilder {
 
   /// Execute the traversal and return an iterator of results
   ///
-  /// The `neighbors` function should return neighbors for a given node and direction.
+  /// The `neighbors` function should return neighbors for a given node and direction. Filters
+  /// see empty props ([`NoProps`]); see [`Self::execute_with_props`].
   pub fn execute<F>(self, neighbors: F) -> TraversalIterator<F>
   where
     F: Fn(NodeId, TraversalDirection, Option<ETypeId>) -> Vec<Edge>,
   {
-    TraversalIterator::new(self, neighbors)
+    self.execute_with_props(neighbors, NoProps)
+  }
+
+  /// Execute the traversal, with filters seeing the props `props` loads
+  ///
+  /// The iterator is lazy in the last step: with `take(n)`, it stops expanding once it has
+  /// yielded `n` results.
+  pub fn execute_with_props<F, P>(self, neighbors: F, props: P) -> TraversalIterator<F, P>
+  where
+    F: Fn(NodeId, TraversalDirection, Option<ETypeId>) -> Vec<Edge>,
+    P: TraversalProps,
+  {
+    TraversalIterator::new(self, neighbors, props)
   }
 
   /// Execute the traversal and collect all node IDs
@@ -518,13 +593,22 @@ impl TraversalBuilder {
   where
     F: Fn(NodeId, TraversalDirection, Option<ETypeId>) -> Vec<Edge>,
   {
+    self.count_with_props(neighbors, NoProps)
+  }
+
+  /// Count results, with filters seeing the props `props` loads
+  pub fn count_with_props<F, P>(self, neighbors: F, props: P) -> usize
+  where
+    F: Fn(NodeId, TraversalDirection, Option<ETypeId>) -> Vec<Edge>,
+    P: TraversalProps,
+  {
     // For simple traversals without variable-depth, use fast counting
     if self.can_use_fast_count() {
       return self.count_fast(&neighbors);
     }
 
     // Fall back to full iteration
-    self.execute(neighbors).count()
+    self.execute_with_props(neighbors, props).count()
   }
 
   /// Check if we can use the fast count path
@@ -553,14 +637,14 @@ impl TraversalBuilder {
   where
     F: Fn(NodeId, TraversalDirection, Option<ETypeId>) -> Vec<Edge>,
   {
-    let mut frontier: HashMap<NodeId, usize> = HashMap::new();
+    let mut frontier: FastMap<NodeId, usize> = FastMap::new();
     for &node_id in &self.start_nodes {
       *frontier.entry(node_id).or_insert(0) += 1;
     }
-    let mut visited: HashSet<NodeId> = if self.unique_nodes {
+    let mut visited: FastSet<NodeId> = if self.unique_nodes {
       frontier.keys().copied().collect()
     } else {
-      HashSet::new()
+      FastSet::new()
     };
 
     for step in &self.steps {
@@ -571,7 +655,7 @@ impl TraversalBuilder {
         unreachable!()
       };
 
-      let mut next: HashMap<NodeId, usize> = HashMap::new();
+      let mut next: FastMap<NodeId, usize> = FastMap::new();
       for (&node_id, &times_reached) in &frontier {
         for edge in neighbors(node_id, *direction, *etype) {
           let neighbor = neighbor_of(&edge, node_id, *direction);
@@ -594,12 +678,17 @@ impl TraversalBuilder {
     self.limit.map_or(total, |limit| total.min(limit))
   }
 
-  /// Get raw edges without property loading (fastest traversal mode)
+  /// Get the edges that reached each result (no property loading)
+  ///
+  /// Yields exactly the `edge` of each result [`Self::execute`] yields, honoring every step,
+  /// `take`, `unique` and filter. Start nodes (no edge) yield nothing.
   pub fn raw_edges<F>(self, neighbors: F) -> RawEdgeIterator<F>
   where
     F: Fn(NodeId, TraversalDirection, Option<ETypeId>) -> Vec<Edge>,
   {
-    RawEdgeIterator::new(self, neighbors)
+    RawEdgeIterator {
+      inner: self.execute(neighbors),
+    }
   }
 }
 
@@ -607,18 +696,36 @@ impl TraversalBuilder {
 // Traversal Iterator
 // ============================================================================
 
+/// The work of the step being run.
+#[derive(Default)]
+struct StepRun {
+  /// Nodes to expand: (node, depth of the result that entered the step, hops taken within the
+  /// step).
+  queue: VecDeque<(NodeId, usize, usize)>,
+  /// Nodes a `traverse()` step with `unique` has reached.
+  local_visited: FastSet<NodeId>,
+  /// Results produced and not consumed yet.
+  results: VecDeque<TraversalResult>,
+}
+
 /// Iterator for traversal results
-pub struct TraversalIterator<F> {
+///
+/// Every step but the last runs to completion when the iterator reaches it, since the next
+/// step expands its whole result set. The last step runs lazily, one expanded node at a time,
+/// so the iterator stops early once `take(n)` has `n` results.
+pub struct TraversalIterator<F, P = NoProps> {
   /// The neighbors function
   neighbors: F,
-  /// Current step index
-  step_index: usize,
+  /// Loads the props filters see
+  props: P,
   /// Steps to execute
   steps: Vec<TraversalStep>,
-  /// Current frontier of node IDs to process
-  current_frontier: VecDeque<TraversalResult>,
+  /// Number of steps started (the last started one is being run)
+  steps_started: usize,
+  /// Work of the step being run; before the first step, its results are the start nodes
+  run: StepRun,
   /// Visited nodes (for uniqueness)
-  visited: HashSet<NodeId>,
+  visited: FastSet<NodeId>,
   /// Whether to track unique nodes
   unique_nodes: bool,
   /// Maximum results
@@ -633,20 +740,21 @@ pub struct TraversalIterator<F> {
   node_filter: Option<NodeFilter>,
 }
 
-impl<F> TraversalIterator<F>
+impl<F, P> TraversalIterator<F, P>
 where
   F: Fn(NodeId, TraversalDirection, Option<ETypeId>) -> Vec<Edge>,
+  P: TraversalProps,
 {
-  fn new(builder: TraversalBuilder, neighbors: F) -> Self {
-    let mut frontier = VecDeque::new();
-    let mut visited = HashSet::new();
+  fn new(builder: TraversalBuilder, neighbors: F, props: P) -> Self {
+    let mut run = StepRun::default();
+    let mut visited = FastSet::new();
 
-    // Initialize with start nodes
+    // The start nodes are the results of "no step yet".
     for node_id in builder.start_nodes {
       if builder.unique_nodes {
         visited.insert(node_id);
       }
-      frontier.push_back(TraversalResult {
+      run.results.push_back(TraversalResult {
         node_id,
         edge: None,
         depth: 0,
@@ -655,9 +763,10 @@ where
 
     Self {
       neighbors,
-      step_index: 0,
+      props,
       steps: builder.steps,
-      current_frontier: frontier,
+      steps_started: 0,
+      run,
       visited,
       unique_nodes: builder.unique_nodes,
       limit: builder.limit,
@@ -668,256 +777,192 @@ where
     }
   }
 
-  /// Check if a result passes all filters
+  /// Check if a result passes the global filters
   fn passes_filters(&self, result: &TraversalResult) -> bool {
-    // Check edge filter
-    if let Some(ref edge_filter) = self.edge_filter {
-      if let Some(ref raw_edge) = result.edge {
-        let edge_info = EdgeInfo::from(*raw_edge);
-        if !edge_filter(&edge_info) {
-          return false;
-        }
-      }
-    }
-
-    // Check node filter
-    if let Some(ref node_filter) = self.node_filter {
-      let node_info = NodeInfo {
-        id: result.node_id,
-        props: HashMap::new(), // Note: props would need to be loaded if used
-      };
-      if !node_filter(&node_info) {
+    if let (Some(edge_filter), Some(edge)) = (&self.edge_filter, result.edge) {
+      if !edge_filter(&edge_info(&self.props, edge)) {
         return false;
       }
     }
-
+    if let Some(node_filter) = &self.node_filter {
+      if !node_filter(&node_info(&self.props, result.node_id)) {
+        return false;
+      }
+    }
     true
   }
 
-  /// Process a single-hop step
-  fn process_single_hop(
-    &mut self,
-    direction: TraversalDirection,
-    etype: Option<ETypeId>,
-    step_edge_filter: &Option<EdgeFilter>,
-    step_node_filter: &Option<NodeFilter>,
-  ) -> VecDeque<TraversalResult> {
-    let mut next_frontier = VecDeque::new();
-
-    for result in self.current_frontier.drain(..) {
-      let edges = (self.neighbors)(result.node_id, direction, etype);
-
-      for edge in edges {
-        let neighbor_id = neighbor_of(&edge, result.node_id, direction);
-
-        // Skip if already visited (and uniqueness is enabled)
-        if self.unique_nodes && self.visited.contains(&neighbor_id) {
-          continue;
-        }
-
-        let raw_edge = RawEdge::from(edge);
-
-        // Apply step-level edge filter
-        if let Some(ref edge_filter) = step_edge_filter {
-          let edge_info = EdgeInfo::from(raw_edge);
-          if !edge_filter(&edge_info) {
-            continue;
-          }
-        }
-
-        // Apply step-level node filter
-        if let Some(ref node_filter) = step_node_filter {
-          let node_info = NodeInfo {
-            id: neighbor_id,
-            props: HashMap::new(),
-          };
-          if !node_filter(&node_info) {
-            continue;
-          }
-        }
-
-        if self.unique_nodes {
-          self.visited.insert(neighbor_id);
-        }
-
-        next_frontier.push_back(TraversalResult {
-          node_id: neighbor_id,
-          edge: Some(raw_edge),
-          depth: result.depth + 1,
-        });
-      }
-    }
-
-    next_frontier
+  /// Start the next step: its input is every result of the previous one.
+  fn start_step(&mut self) {
+    let step = &self.steps[self.steps_started];
+    self.steps_started += 1;
+    let inputs = std::mem::take(&mut self.run.results);
+    self.run.queue = inputs
+      .into_iter()
+      .map(|result| (result.node_id, result.depth, 0))
+      .collect();
+    self.run.local_visited = match step {
+      TraversalStep::Traverse { options, .. } if options.unique => self
+        .run
+        .queue
+        .iter()
+        .map(|&(node_id, ..)| node_id)
+        .collect(),
+      _ => FastSet::new(),
+    };
   }
 
-  /// Process a variable-depth traversal step (BFS)
-  fn process_traverse(
-    &mut self,
-    etype: Option<ETypeId>,
-    options: &TraverseOptions,
-  ) -> VecDeque<TraversalResult> {
-    let mut results = VecDeque::new();
-    let mut local_visited: HashSet<NodeId> = if options.unique {
-      self.current_frontier.iter().map(|r| r.node_id).collect()
-    } else {
-      HashSet::new()
+  /// Expand the next queued node of the step being run into `run.results`. Returns false if
+  /// the step has nothing left to expand.
+  fn expand_next(&mut self) -> bool {
+    let Self {
+      neighbors,
+      props,
+      steps,
+      steps_started,
+      run,
+      visited,
+      unique_nodes,
+      ..
+    } = self;
+    let Some(step) = steps_started.checked_sub(1).map(|index| &steps[index]) else {
+      return false;
+    };
+    let Some((node_id, base_depth, hops)) = run.queue.pop_front() else {
+      return false;
     };
 
-    // BFS queue: (node_id, depth)
-    let mut queue: VecDeque<(NodeId, usize)> = self
-      .current_frontier
-      .drain(..)
-      .map(|r| (r.node_id, 0))
-      .collect();
-
-    while let Some((current_id, depth)) = queue.pop_front() {
-      if depth >= options.max_depth {
-        continue;
-      }
-
-      // Get neighbors based on direction
-      let directions = match options.direction {
-        TraversalDirection::Both => vec![TraversalDirection::Out, TraversalDirection::In],
-        dir => vec![dir],
-      };
-
-      for dir in directions {
-        let edges = (self.neighbors)(current_id, dir, etype);
-
-        for edge in edges {
-          let neighbor_id = match dir {
-            TraversalDirection::Out => edge.dst,
-            TraversalDirection::In => edge.src,
-            TraversalDirection::Both => unreachable!(),
-          };
-
-          // Check uniqueness
-          if options.unique && local_visited.contains(&neighbor_id) {
+    match step {
+      TraversalStep::SingleHop {
+        direction,
+        etype,
+        edge_filter,
+        node_filter,
+      } => {
+        for edge in neighbors(node_id, *direction, *etype) {
+          let neighbor_id = neighbor_of(&edge, node_id, *direction);
+          if *unique_nodes && visited.contains(&neighbor_id) {
             continue;
           }
-
           let raw_edge = RawEdge::from(edge);
-
-          // Apply edge filter from TraverseOptions
-          if let Some(ref edge_filter) = options.where_edge {
-            let edge_info = EdgeInfo::from(raw_edge);
-            if !edge_filter(&edge_info) {
-              continue;
-            }
-          }
-
-          // Apply node filter from TraverseOptions
-          if let Some(ref node_filter) = options.where_node {
-            let node_info = NodeInfo {
-              id: neighbor_id,
-              props: HashMap::new(),
-            };
-            if !node_filter(&node_info) {
-              continue;
-            }
-          }
-
-          if options.unique {
-            local_visited.insert(neighbor_id);
-          }
-
-          // Also check global visited set
-          if self.unique_nodes && self.visited.contains(&neighbor_id) {
+          if edge_filter
+            .as_ref()
+            .is_some_and(|filter| !filter(&edge_info(props, raw_edge)))
+          {
             continue;
           }
-          if self.unique_nodes {
-            self.visited.insert(neighbor_id);
+          if node_filter
+            .as_ref()
+            .is_some_and(|filter| !filter(&node_info(props, neighbor_id)))
+          {
+            continue;
           }
-
-          let new_depth = depth + 1;
-
-          // Yield if at or past min_depth
-          if new_depth >= options.min_depth {
-            results.push_back(TraversalResult {
-              node_id: neighbor_id,
-              edge: Some(raw_edge),
-              depth: new_depth,
-            });
+          if *unique_nodes {
+            visited.insert(neighbor_id);
           }
+          run.results.push_back(TraversalResult {
+            node_id: neighbor_id,
+            edge: Some(raw_edge),
+            depth: base_depth + 1,
+          });
+        }
+      }
+      TraversalStep::Traverse { etype, options } => {
+        if hops >= options.max_depth {
+          return true;
+        }
+        for &dir in expand_directions(options.direction) {
+          for edge in neighbors(node_id, dir, *etype) {
+            // A self-loop is both an out- and an in-edge: follow it once.
+            if options.direction == TraversalDirection::Both
+              && dir == TraversalDirection::In
+              && edge.src == edge.dst
+            {
+              continue;
+            }
+            let neighbor_id = neighbor_of(&edge, node_id, dir);
+            if options.unique && run.local_visited.contains(&neighbor_id) {
+              continue;
+            }
+            let raw_edge = RawEdge::from(edge);
+            if options
+              .where_edge
+              .as_ref()
+              .is_some_and(|filter| !filter(&edge_info(props, raw_edge)))
+            {
+              continue;
+            }
+            if options
+              .where_node
+              .as_ref()
+              .is_some_and(|filter| !filter(&node_info(props, neighbor_id)))
+            {
+              continue;
+            }
+            if options.unique {
+              run.local_visited.insert(neighbor_id);
+            }
+            if *unique_nodes && !visited.insert(neighbor_id) {
+              continue;
+            }
 
-          // Continue BFS if not at max depth
-          if new_depth < options.max_depth {
-            queue.push_back((neighbor_id, new_depth));
+            let next_hops = hops + 1;
+            if next_hops >= options.min_depth {
+              run.results.push_back(TraversalResult {
+                node_id: neighbor_id,
+                edge: Some(raw_edge),
+                depth: base_depth + next_hops,
+              });
+            }
+            if next_hops < options.max_depth {
+              run.queue.push_back((neighbor_id, base_depth, next_hops));
+            }
           }
         }
       }
     }
-
-    results
+    true
   }
 }
 
-impl<F> Iterator for TraversalIterator<F>
+impl<F, P> Iterator for TraversalIterator<F, P>
 where
   F: Fn(NodeId, TraversalDirection, Option<ETypeId>) -> Vec<Edge>,
+  P: TraversalProps,
 {
   type Item = TraversalResult;
 
   fn next(&mut self) -> Option<Self::Item> {
-    // Check if we're done
     if self.done {
       return None;
     }
 
-    // Check limit
-    if let Some(limit) = self.limit {
-      if self.yielded >= limit {
-        self.done = true;
-        return None;
+    // Run every step but the last to completion.
+    while self.steps_started < self.steps.len() {
+      if self.steps_started > 0 {
+        while self.expand_next() {}
       }
+      self.start_step();
     }
 
     loop {
-      // If we have results in the current frontier, yield one
-      if !self.current_frontier.is_empty() {
-        // If we've processed all steps, yield from frontier
-        if self.step_index >= self.steps.len() {
-          let result = self.current_frontier.pop_front()?;
-
-          // Apply global filters
-          if !self.passes_filters(&result) {
-            continue;
-          }
-
-          self.yielded += 1;
-
-          // Check limit
-          if let Some(limit) = self.limit {
-            if self.yielded >= limit {
-              self.done = true;
-            }
-          }
-
-          return Some(result);
-        }
-      }
-
-      // Process the next step
-      if self.step_index < self.steps.len() {
-        let step = self.steps[self.step_index].clone();
-        self.step_index += 1;
-
-        let next_frontier = match step {
-          TraversalStep::SingleHop {
-            direction,
-            etype,
-            edge_filter,
-            node_filter,
-          } => self.process_single_hop(direction, etype, &edge_filter, &node_filter),
-          TraversalStep::Traverse { etype, options } => self.process_traverse(etype, &options),
-        };
-
-        self.current_frontier = next_frontier;
-      } else {
-        // No more steps and empty frontier
+      if self.limit.is_some_and(|limit| self.yielded >= limit) {
         self.done = true;
         return None;
+      }
+      match self.run.results.pop_front() {
+        Some(result) => {
+          if self.passes_filters(&result) {
+            self.yielded += 1;
+            return Some(result);
+          }
+        }
+        None => {
+          if !self.expand_next() {
+            self.done = true;
+            return None;
+          }
+        }
       }
     }
   }
@@ -927,37 +972,9 @@ where
 // Raw Edge Iterator
 // ============================================================================
 
-/// Iterator for raw edges (fastest traversal mode, no property loading)
+/// Iterator over the edges that reached each traversal result (no property loading)
 pub struct RawEdgeIterator<F> {
-  neighbors: F,
-  steps: Vec<TraversalStep>,
-  step_index: usize,
-  current_nodes: VecDeque<NodeId>,
-  pending_edges: VecDeque<RawEdge>,
-}
-
-impl<F> RawEdgeIterator<F>
-where
-  F: Fn(NodeId, TraversalDirection, Option<ETypeId>) -> Vec<Edge>,
-{
-  fn new(builder: TraversalBuilder, neighbors: F) -> Self {
-    // Check that there are no variable-depth steps
-    for step in &builder.steps {
-      if matches!(step, TraversalStep::Traverse { .. }) {
-        panic!("raw_edges() does not support variable-depth traverse()");
-      }
-    }
-
-    let current_nodes = builder.start_nodes.into_iter().collect();
-
-    Self {
-      neighbors,
-      steps: builder.steps,
-      step_index: 0,
-      current_nodes,
-      pending_edges: VecDeque::new(),
-    }
-  }
+  inner: TraversalIterator<F>,
 }
 
 impl<F> Iterator for RawEdgeIterator<F>
@@ -968,46 +985,8 @@ where
 
   fn next(&mut self) -> Option<Self::Item> {
     loop {
-      // Return pending edge if available
-      if let Some(edge) = self.pending_edges.pop_front() {
+      if let Some(edge) = self.inner.next()?.edge {
         return Some(edge);
-      }
-
-      // Process next node
-      if let Some(node_id) = self.current_nodes.pop_front() {
-        if self.step_index < self.steps.len() {
-          let TraversalStep::SingleHop {
-            direction, etype, ..
-          } = &self.steps[self.step_index]
-          else {
-            unreachable!()
-          };
-
-          let edges = (self.neighbors)(node_id, *direction, *etype);
-          for edge in edges {
-            self.pending_edges.push_back(RawEdge::from(edge));
-          }
-        }
-      } else {
-        // Move to next step
-        if self.step_index < self.steps.len() {
-          self.step_index += 1;
-
-          // Collect neighbors from pending edges for next step
-          if self.step_index < self.steps.len() {
-            let TraversalStep::SingleHop { .. } = &self.steps[self.step_index - 1] else {
-              unreachable!()
-            };
-
-            // The pending edges from previous step become the nodes for next step
-            // This isn't quite right - we need to track this differently
-            // For now, return None to end iteration
-          }
-        }
-
-        if self.pending_edges.is_empty() {
-          return None;
-        }
       }
     }
   }
@@ -1395,6 +1374,7 @@ impl CollectOptions {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use std::collections::HashSet;
 
   fn mock_graph() -> impl Fn(NodeId, TraversalDirection, Option<ETypeId>) -> Vec<Edge> {
     // Create a simple graph:
