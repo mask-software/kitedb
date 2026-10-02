@@ -767,57 +767,58 @@ impl SingleFileDB {
     }
   }
 
-  /// `write_wal_waiting_then` for records already built
-  /// (`WalRecord::build`), written together.
-  fn write_wal_bytes_waiting_then(&self, records: &[u8], then: impl Fn()) -> Result<()> {
-    loop {
-      let written = self.try_write_wal(|wal| {
-        wal.write_record_bytes_batch(records)?;
-        then();
-        Ok(())
-      })?;
-      match written {
-        WalWrite::Written(()) => return Ok(()),
-        WalWrite::BlockedOn(cut) => self.wait_for_cut_release(cut)?,
-        WalWrite::NeedsCompaction => self.compact_retired_wal()?,
-      }
-    }
-  }
-
   /// Write the records `tx_handle`'s transaction kept back (see
   /// `SingleFileTxState::wal_deferred_from`) to the WAL, after its BEGIN
-  /// record if that is not there yet; from then on it writes its records as
-  /// it makes them. Callers checked that no savepoint is live. On error
-  /// nothing is written, and the records stay kept back.
-  fn write_deferred_records(&self, tx_handle: &Arc<Mutex<SingleFileTxState>>) -> Result<()> {
-    let (txid, from, records, writes_begin) = {
+  /// record if that is not there yet, and then `record` (a record it logs
+  /// now, or none); from then on it writes its records as it makes them.
+  /// Callers checked that no savepoint is live. On error nothing is written,
+  /// and the records stay kept back.
+  fn write_deferred_records(
+    &self,
+    tx_handle: &Arc<Mutex<SingleFileTxState>>,
+    record: &[u8],
+  ) -> Result<()> {
+    let (txid, from, mut records, writes_begin) = {
       let tx = tx_handle.lock();
       let Some(from) = tx.wal_deferred_from else {
         return Ok(());
       };
+      let kept = tx.pending_wal.len() - from;
       let mut records = if tx.wal_begun {
-        Vec::new()
+        Vec::with_capacity(kept + record.len())
       } else {
         WalRecord::new(WalRecordType::Begin, tx.txid, build_begin_payload()).build()
       };
       records.extend_from_slice(&tx.pending_wal[from..]);
+      records.extend_from_slice(record);
       (tx.txid, from, records, !tx.wal_begun)
     };
     // No lock is held here: a background checkpoint may need to install
     // before the WAL takes the records. A transaction whose BEGIN record is
     // written joins the open set under the WAL lock, which a background cut
     // holds while it reads that set.
-    self.write_wal_bytes_waiting_then(&records, || {
-      if writes_begin {
-        self.open_write_txids.lock().insert(txid);
+    loop {
+      let written = self.try_write_wal(|wal| {
+        wal.write_owned_record_bytes(&mut records)?;
+        if writes_begin {
+          self.open_write_txids.lock().insert(txid);
+        }
+        Ok(())
+      })?;
+      match written {
+        WalWrite::Written(()) => break,
+        WalWrite::BlockedOn(cut) => self.wait_for_cut_release(cut)?,
+        WalWrite::NeedsCompaction => self.compact_retired_wal()?,
       }
-    })?;
+    }
     let mut tx = tx_handle.lock();
     tx.wal_begun = true;
     tx.wal_deferred_from = None;
     // Only a primary's commit reads the copy (for the replication sidecar).
     if self.primary_replication.is_none() {
       tx.pending_wal.truncate(from);
+    } else {
+      tx.pending_wal.extend_from_slice(record);
     }
     Ok(())
   }
@@ -1138,7 +1139,7 @@ impl SingleFileDB {
     };
     if write_now {
       // A failure leaves them to the commit.
-      let _ = self.write_deferred_records(&handle);
+      let _ = self.write_deferred_records(&handle, &[]);
     }
     Ok(())
   }
@@ -1369,6 +1370,9 @@ impl SingleFileDB {
   /// order), publishes them (`publish_commits`). Once a round leaves nothing
   /// of `requests` to write, `leader` passes the lead on before the publish.
   /// Callers hold no lock.
+  // A commit is boxed once, and moves by pointer from its committer through
+  // the queue and a group's stages.
+  #[allow(clippy::vec_box)]
   fn write_commits(
     &self,
     requests: Vec<Box<CommitRequest>>,
@@ -1556,7 +1560,7 @@ impl SingleFileDB {
       let mut wal = self.wal_buffer.lock();
       while let Some((index, mut request)) = checked.pop_front() {
         if wal.can_fit(request.records.len()) {
-          if let Err(error) = wal.write_owned_record_bytes(std::mem::take(&mut request.records)) {
+          if let Err(error) = wal.write_owned_record_bytes(&mut request.records) {
             self.unstage_newest_in_mvcc(checked.len() + 1);
             outcomes[index] = Some(CommitOutcome::failed(error));
             queue.extend(checked.drain(..));
@@ -1983,21 +1987,17 @@ impl SingleFileDB {
   ) -> Result<()> {
     let mut record_bytes = record.build();
     let mut tx = tx_handle.lock();
-    if tx.bulk_load || tx.wal_deferred_from.is_some() {
-      let before = tx.pending_wal.len();
-      tx.pending_wal.extend_from_slice(&record_bytes);
-      let write_now = !tx.bulk_load
-        && tx.savepoints.is_empty()
-        && tx
-          .wal_deferred_from
-          .is_some_and(|from| tx.pending_wal.len() - from > super::WAL_DEFER_BYTES);
-      drop(tx);
-      if write_now {
-        if let Err(error) = self.write_deferred_records(tx_handle) {
-          tx_handle.lock().pending_wal.truncate(before);
-          return Err(error);
-        }
+    if let (false, Some(from)) = (tx.bulk_load, tx.wal_deferred_from) {
+      let kept = tx.pending_wal.len() - from + record_bytes.len();
+      if !tx.savepoints.is_empty() || kept <= super::WAL_DEFER_BYTES {
+        tx.pending_wal.extend_from_slice(&record_bytes);
+        return Ok(());
       }
+      drop(tx);
+      return self.write_deferred_records(tx_handle, &record_bytes);
+    }
+    if tx.bulk_load {
+      tx.pending_wal.extend_from_slice(&record_bytes);
       return Ok(());
     }
     drop(tx);

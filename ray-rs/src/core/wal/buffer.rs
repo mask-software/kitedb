@@ -963,13 +963,14 @@ impl WalBuffer {
   /// The buffer must contain a sequence of padded, unsalted records (as
   /// [`WalRecord::build`] writes them); they are salted for the active region.
   pub fn write_record_bytes_batch(&mut self, record_bytes: &[u8]) -> Result<u64> {
-    self.write_owned_record_bytes(record_bytes.to_vec())
+    self.write_owned_record_bytes(&mut record_bytes.to_vec())
   }
 
-  /// [`Self::write_record_bytes_batch`] for bytes the caller gives up: they
-  /// are salted in place and buffered without another copy where they start
-  /// a run. On error nothing is written.
-  pub fn write_owned_record_bytes(&mut self, mut records: Vec<u8>) -> Result<u64> {
+  /// [`Self::write_record_bytes_batch`] for bytes the caller gives up: once
+  /// they fit, they are salted in place and taken (left empty), buffered
+  /// without another copy where they start a run. If they do not fit
+  /// (`WalBufferFull`) they are left as they are, and nothing is written.
+  pub fn write_owned_record_bytes(&mut self, records: &mut Vec<u8>) -> Result<u64> {
     if records.is_empty() {
       return Ok(self.head);
     }
@@ -995,8 +996,10 @@ impl WalBuffer {
     if head + length > region_end {
       return Err(KiteError::WalBufferFull);
     }
-    self.salt_for(self.active_region, &mut records)?;
-    self.pending.write_vec(self.file_offset(head), records);
+    self.salt_for(self.active_region, records)?;
+    self
+      .pending
+      .write_vec(self.file_offset(head), std::mem::take(records));
     if self.active_region == 0 {
       self.primary_head += length;
       self.head = self.primary_head;
