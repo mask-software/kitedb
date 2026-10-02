@@ -12,6 +12,9 @@
 //!   --edge-props N            Number of props per edge (default: 10)
 //!   --wal-size BYTES          WAL size in bytes (default: 268435456)
 //!   --sync-mode MODE          Sync mode: full|normal|off (default: normal)
+//!   --full-fsync              With --sync-mode full, sync with F_FULLFSYNC on
+//!                             macOS, which flushes the drive's write cache
+//!                             (plain fsync there does not)
 //!   --group-commit-enabled    Enable group commit (default: false)
 //!   --group-commit-window-ms  Group commit window in ms (default: 2)
 //!   --mvcc | --no-mvcc        MVCC mode (default: the library default; without
@@ -43,6 +46,7 @@ struct BenchConfig {
   edge_props: usize,
   wal_size: usize,
   sync_mode: SyncMode,
+  full_fsync: bool,
   group_commit_enabled: bool,
   group_commit_window_ms: u64,
   /// None: the library default.
@@ -61,6 +65,7 @@ impl Default for BenchConfig {
       edge_props: 10,
       wal_size: 256 * 1024 * 1024,
       sync_mode: SyncMode::Normal,
+      full_fsync: false,
       group_commit_enabled: false,
       group_commit_window_ms: 2,
       mvcc: None,
@@ -111,6 +116,7 @@ fn parse_args() -> BenchConfig {
           )),
         };
       }
+      "--full-fsync" => config.full_fsync = true,
       "--group-commit-enabled" => config.group_commit_enabled = true,
       "--group-commit-window-ms" => config.group_commit_window_ms = value(&args, &mut i, flag),
       "--mvcc" => config.mvcc = Some(true),
@@ -170,6 +176,7 @@ fn main() {
   println!("Edge props: {}", config.edge_props);
   println!("WAL size: {} bytes", config.wal_size);
   println!("Sync mode: {:?}", config.sync_mode);
+  println!("Full fsync: {}", config.full_fsync);
   println!(
     "Group commit: {} (window {}ms)",
     config.group_commit_enabled, config.group_commit_window_ms
@@ -183,6 +190,7 @@ fn main() {
   let mut open_opts = SingleFileOpenOptions::new()
     .wal_size(config.wal_size)
     .sync_mode(config.sync_mode)
+    .full_fsync(config.full_fsync)
     .group_commit_enabled(config.group_commit_enabled)
     .group_commit_window_ms(config.group_commit_window_ms)
     .auto_checkpoint(false);
