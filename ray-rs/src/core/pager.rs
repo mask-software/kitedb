@@ -16,6 +16,16 @@ use crate::constants::{
 };
 use crate::error::{KiteError, Result};
 
+#[cfg(test)]
+thread_local! {
+  /// Test probe: the OS primitive each `FilePager` sync on this thread issued,
+  /// oldest first. "fsync" is plain fsync(2), which on macOS leaves data in
+  /// the drive's volatile cache; "sync_all" is `File::sync_all` (F_FULLFSYNC
+  /// on macOS). New sync primitives should log here too.
+  pub(crate) static SYNC_PRIMITIVE_LOG: std::cell::RefCell<Vec<&'static str>> =
+    const { std::cell::RefCell::new(Vec::new()) };
+}
+
 static DATABASE_FILE_LOCKS: OnceLock<Mutex<HashMap<PathBuf, InProcessLockState>>> = OnceLock::new();
 const WRITABLE_OPEN_MAX_ATTEMPTS: usize = 4;
 
@@ -509,6 +519,8 @@ impl FilePager {
     }
     #[cfg(target_os = "macos")]
     {
+      #[cfg(test)]
+      SYNC_PRIMITIVE_LOG.with(|log| log.borrow_mut().push("fsync"));
       use std::os::unix::io::AsRawFd;
       // SAFETY: file descriptor is valid for the pager file.
       let result = unsafe { libc::fsync(self.file.as_raw_fd()) };
@@ -519,6 +531,8 @@ impl FilePager {
 
     #[cfg(not(target_os = "macos"))]
     {
+      #[cfg(test)]
+      SYNC_PRIMITIVE_LOG.with(|log| log.borrow_mut().push("sync_all"));
       self.file.sync_all()?;
     }
     Ok(())
@@ -952,5 +966,60 @@ mod tests {
     assert!(
       locked_file_matches_path(&current_file, &database_path).expect("expected identity check")
     );
+  }
+}
+
+/// Wave-2 `wal-format` W7: `SyncMode::Full` must survive power loss. Plain
+/// fsync(2) on macOS only hands data to the drive, whose volatile cache can
+/// lose it or persist it out of order (the header page before the WAL page it
+/// names, or before the snapshot it points to).
+#[cfg(test)]
+mod w2_tests {
+  use super::SYNC_PRIMITIVE_LOG;
+  use crate::core::single_file::{open_single_file, SingleFileOpenOptions, SyncMode};
+
+  /// The sync primitives `run` issued on this thread.
+  fn syncs_during(run: impl FnOnce()) -> Vec<&'static str> {
+    SYNC_PRIMITIVE_LOG.with(|log| log.borrow_mut().clear());
+    run();
+    SYNC_PRIMITIVE_LOG.with(|log| log.borrow_mut().drain(..).collect())
+  }
+
+  fn assert_drive_cache_flushed(what: &str, syncs: &[&str]) {
+    assert!(!syncs.is_empty(), "{what}: issued no sync at all");
+    assert!(
+      syncs.iter().all(|primitive| *primitive != "fsync"),
+      "{what}: used plain fsync, which on macOS leaves the data in the drive cache (power \
+       loss can drop it, or persist a header before the pages it names): {syncs:?}"
+    );
+  }
+
+  #[test]
+  fn w7_full_sync_mode_commit_flushes_the_drive_cache() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let options = SingleFileOpenOptions::new()
+      .auto_checkpoint(false)
+      .sync_mode(SyncMode::Full);
+    let db = open_single_file(dir.path().join("w7-commit.kitedb"), options).expect("open");
+    let syncs = syncs_during(|| {
+      db.begin(false).expect("begin");
+      db.create_node(Some("n")).expect("node");
+      db.commit().expect("commit");
+    });
+    assert_drive_cache_flushed("SyncMode::Full commit", &syncs);
+  }
+
+  #[test]
+  fn w7_full_sync_mode_checkpoint_flushes_the_drive_cache() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let options = SingleFileOpenOptions::new()
+      .auto_checkpoint(false)
+      .sync_mode(SyncMode::Full);
+    let db = open_single_file(dir.path().join("w7-checkpoint.kitedb"), options).expect("open");
+    db.begin(false).expect("begin");
+    db.create_node(Some("n")).expect("node");
+    db.commit().expect("commit");
+    let syncs = syncs_during(|| db.checkpoint().expect("checkpoint"));
+    assert_drive_cache_flushed("SyncMode::Full checkpoint", &syncs);
   }
 }
