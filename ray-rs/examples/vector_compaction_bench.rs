@@ -14,6 +14,9 @@
 //!   --max-fragments N             Max fragments per compaction run (default: 4)
 //!   --min-vectors-to-compact N    Min live vectors required for compaction (default: 10000)
 //!   --seed N                      RNG seed (default: 42)
+//!
+//! Unknown options are an error. The bench drives the vector store directly
+//! and opens no database, so it has no MVCC mode.
 
 use kitedb::types::NodeId;
 use kitedb::vector::compaction::{
@@ -26,6 +29,7 @@ use kitedb::vector::{
 };
 use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
 use std::env;
+use std::process::exit;
 use std::time::Instant;
 
 #[derive(Debug, Clone)]
@@ -51,67 +55,43 @@ impl Default for BenchConfig {
   }
 }
 
+fn usage_error(message: &str) -> ! {
+  eprintln!("error: {message}");
+  eprintln!("see the header of examples/vector_compaction_bench.rs for the options");
+  exit(2);
+}
+
+fn value<T: std::str::FromStr>(args: &[String], i: &mut usize, flag: &str) -> T {
+  *i += 1;
+  let Some(raw) = args.get(*i) else {
+    usage_error(&format!("{flag} needs a value"));
+  };
+  raw
+    .parse()
+    .unwrap_or_else(|_| usage_error(&format!("invalid value for {flag}: {raw}")))
+}
+
 fn parse_args() -> BenchConfig {
   let mut config = BenchConfig::default();
   let args: Vec<String> = env::args().collect();
   let mut i = 1usize;
 
   while i < args.len() {
-    match args[i].as_str() {
-      "--vectors" => {
-        if let Some(value) = args.get(i + 1) {
-          config.vectors = value.parse().unwrap_or(config.vectors);
-          i += 1;
-        }
-      }
-      "--dimensions" => {
-        if let Some(value) = args.get(i + 1) {
-          config.dimensions = value.parse().unwrap_or(config.dimensions);
-          i += 1;
-        }
-      }
-      "--fragment-target-size" => {
-        if let Some(value) = args.get(i + 1) {
-          config.fragment_target_size = value.parse().unwrap_or(config.fragment_target_size);
-          i += 1;
-        }
-      }
-      "--delete-ratio" => {
-        if let Some(value) = args.get(i + 1) {
-          config.delete_ratio = value.parse().unwrap_or(config.delete_ratio);
-          i += 1;
-        }
-      }
-      "--min-deletion-ratio" => {
-        if let Some(value) = args.get(i + 1) {
-          config.strategy.min_deletion_ratio =
-            value.parse().unwrap_or(config.strategy.min_deletion_ratio);
-          i += 1;
-        }
-      }
+    let flag = args[i].as_str();
+    match flag {
+      "--vectors" => config.vectors = value(&args, &mut i, flag),
+      "--dimensions" => config.dimensions = value(&args, &mut i, flag),
+      "--fragment-target-size" => config.fragment_target_size = value(&args, &mut i, flag),
+      "--delete-ratio" => config.delete_ratio = value(&args, &mut i, flag),
+      "--min-deletion-ratio" => config.strategy.min_deletion_ratio = value(&args, &mut i, flag),
       "--max-fragments" => {
-        if let Some(value) = args.get(i + 1) {
-          config.strategy.max_fragments_per_compaction = value
-            .parse()
-            .unwrap_or(config.strategy.max_fragments_per_compaction);
-          i += 1;
-        }
+        config.strategy.max_fragments_per_compaction = value(&args, &mut i, flag)
       }
       "--min-vectors-to-compact" => {
-        if let Some(value) = args.get(i + 1) {
-          config.strategy.min_vectors_to_compact = value
-            .parse()
-            .unwrap_or(config.strategy.min_vectors_to_compact);
-          i += 1;
-        }
+        config.strategy.min_vectors_to_compact = value(&args, &mut i, flag)
       }
-      "--seed" => {
-        if let Some(value) = args.get(i + 1) {
-          config.seed = value.parse().unwrap_or(config.seed);
-          i += 1;
-        }
-      }
-      _ => {}
+      "--seed" => config.seed = value(&args, &mut i, flag),
+      other => usage_error(&format!("unknown option {other}")),
     }
     i += 1;
   }

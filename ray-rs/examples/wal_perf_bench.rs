@@ -18,6 +18,9 @@
 //!   --runs R        repetitions of each measurement (default: 3)
 //!   --nodes N       graph size for `checkpoint` (default: 100000)
 //!   --dir PATH      where to create the databases (default: a temp dir)
+//!   --mvcc | --no-mvcc  MVCC mode (default: the library default)
+//!
+//! Unknown options are an error.
 //!
 //! Every number depends on the machine's load and its file system (macOS
 //! fsync and Linux fdatasync cost very differently): compare runs taken on
@@ -25,6 +28,7 @@
 
 use std::env;
 use std::path::{Path, PathBuf};
+use std::process::exit;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -43,6 +47,14 @@ struct Config {
   runs: usize,
   nodes: usize,
   dir: Option<PathBuf>,
+  /// None: the library default.
+  mvcc: Option<bool>,
+}
+
+fn usage_error(message: &str) -> ! {
+  eprintln!("error: {message}");
+  eprintln!("see the header of examples/wal_perf_bench.rs for the sections and options");
+  exit(2);
 }
 
 fn parse_args() -> Config {
@@ -52,21 +64,29 @@ fn parse_args() -> Config {
     runs: 3,
     nodes: 100_000,
     dir: None,
+    mvcc: None,
   };
   let mut args = env::args().skip(1);
   while let Some(arg) = args.next() {
     let mut value = |name: &str| {
       args
         .next()
-        .unwrap_or_else(|| panic!("{name} needs a value"))
+        .unwrap_or_else(|| usage_error(&format!("{name} needs a value")))
+    };
+    let number = |name: &str, raw: String| -> usize {
+      raw
+        .parse()
+        .unwrap_or_else(|_| usage_error(&format!("invalid value for {name}: {raw}")))
     };
     match arg.as_str() {
-      "--commits" => config.commits = value("--commits").parse().expect("--commits N"),
-      "--runs" => config.runs = value("--runs").parse().expect("--runs R"),
-      "--nodes" => config.nodes = value("--nodes").parse().expect("--nodes N"),
+      "--commits" => config.commits = number("--commits", value("--commits")),
+      "--runs" => config.runs = number("--runs", value("--runs")),
+      "--nodes" => config.nodes = number("--nodes", value("--nodes")),
       "--dir" => config.dir = Some(PathBuf::from(value("--dir"))),
+      "--mvcc" => config.mvcc = Some(true),
+      "--no-mvcc" => config.mvcc = Some(false),
       "commits" | "open" | "checkpoint" | "all" => config.sections.push(arg),
-      other => panic!("unknown argument {other}"),
+      other => usage_error(&format!("unknown argument {other}")),
     }
   }
   if config.sections.is_empty() || config.sections.iter().any(|s| s == "all") {
@@ -75,12 +95,30 @@ fn parse_args() -> Config {
   config
 }
 
-fn options(sync_mode: SyncMode, wal_size: usize) -> SingleFileOpenOptions {
-  SingleFileOpenOptions::new()
+/// The MVCC mode the bench runs in, for its header.
+fn mvcc_label(requested: Option<bool>) -> String {
+  let on = requested.unwrap_or(SingleFileOpenOptions::new().mvcc);
+  format!(
+    "{}{}",
+    if on { "on" } else { "off" },
+    if requested.is_none() {
+      " (library default)"
+    } else {
+      ""
+    }
+  )
+}
+
+fn options(sync_mode: SyncMode, wal_size: usize, mvcc: Option<bool>) -> SingleFileOpenOptions {
+  let options = SingleFileOpenOptions::new()
     .sync_mode(sync_mode)
     .wal_size(wal_size)
     .auto_checkpoint(false)
-    .background_checkpoint(false)
+    .background_checkpoint(false);
+  match mvcc {
+    Some(mvcc) => options.mvcc(mvcc),
+    None => options,
+  }
 }
 
 fn median(mut values: Vec<Duration>) -> Duration {
@@ -111,7 +149,7 @@ fn bench_commits(config: &Config, dir: &Path) {
     let mut rates = Vec::new();
     for run in 0..config.runs {
       let path = dir.join(format!("commits-{name}-{run}.kitedb"));
-      let db = open_single_file(&path, options(sync_mode, 64 * MIB)).expect("open");
+      let db = open_single_file(&path, options(sync_mode, 64 * MIB, config.mvcc)).expect("open");
       // Warm up: the first commits pay for page-cache misses.
       for index in 0..50 {
         commit_node(&db, &format!("warm-{index}"));
@@ -146,8 +184,8 @@ fn bench_commits(config: &Config, dir: &Path) {
 /// true commits 4 KiB property writes (cycling over 64 nodes, so replay is
 /// cheap and the open time is mostly WAL I/O) until the primary region is
 /// ~95% full.
-fn build_wal(path: &Path, wal_size: usize, fill: bool) -> (u64, usize) {
-  let db = open_single_file(path, options(SyncMode::Normal, wal_size)).expect("open");
+fn build_wal(path: &Path, wal_size: usize, fill: bool, mvcc: Option<bool>) -> (u64, usize) {
+  let db = open_single_file(path, options(SyncMode::Normal, wal_size, mvcc)).expect("open");
   db.begin(false).expect("begin");
   let blob = db.define_propkey("blob").expect("propkey");
   let nodes: Vec<NodeId> = (0..64)
@@ -179,13 +217,19 @@ fn build_wal(path: &Path, wal_size: usize, fill: bool) -> (u64, usize) {
   (used, commits)
 }
 
-fn time_open(path: &Path, wal_size: usize, read_only: bool, runs: usize) -> Duration {
+fn time_open(
+  path: &Path,
+  wal_size: usize,
+  read_only: bool,
+  runs: usize,
+  mvcc: Option<bool>,
+) -> Duration {
   let mut times = Vec::new();
   for _ in 0..runs.max(3) {
     let started = Instant::now();
     let db = open_single_file(
       path,
-      options(SyncMode::Normal, wal_size).read_only(read_only),
+      options(SyncMode::Normal, wal_size, mvcc).read_only(read_only),
     )
     .expect("open");
     times.push(started.elapsed());
@@ -206,9 +250,9 @@ fn bench_open(config: &Config, dir: &Path) {
   for wal_mib in [64usize, 256] {
     for fill in [false, true] {
       let path = dir.join(format!("open-{wal_mib}-{fill}.kitedb"));
-      let (used, commits) = build_wal(&path, wal_mib * MIB, fill);
-      let writable = time_open(&path, wal_mib * MIB, false, config.runs);
-      let read_only = time_open(&path, wal_mib * MIB, true, config.runs);
+      let (used, commits) = build_wal(&path, wal_mib * MIB, fill, config.mvcc);
+      let writable = time_open(&path, wal_mib * MIB, false, config.runs, config.mvcc);
+      let read_only = time_open(&path, wal_mib * MIB, true, config.runs, config.mvcc);
       println!(
         "  WAL {wal_mib:>3} MiB, live {:>7.2} MiB ({commits:>6} commits): writable {:>8.2} ms, \
          read-only {:>8.2} ms",
@@ -225,8 +269,9 @@ fn bench_open(config: &Config, dir: &Path) {
 // checkpoint
 // ============================================================================
 
-fn checkpoint_graph(path: &Path, nodes: usize) -> Arc<SingleFileDB> {
-  let db = Arc::new(open_single_file(path, options(SyncMode::Normal, 64 * MIB)).expect("open"));
+fn checkpoint_graph(path: &Path, nodes: usize, mvcc: Option<bool>) -> Arc<SingleFileDB> {
+  let db =
+    Arc::new(open_single_file(path, options(SyncMode::Normal, 64 * MIB, mvcc)).expect("open"));
   let keys: Vec<String> = (0..nodes).map(|index| format!("n{index}")).collect();
   for chunk in keys.chunks(10_000) {
     db.begin(false).expect("begin");
@@ -264,7 +309,7 @@ fn bench_checkpoint(config: &Config, dir: &Path) {
   );
   for run in 0..config.runs {
     let path = dir.join(format!("checkpoint-{run}.kitedb"));
-    let db = checkpoint_graph(&path, config.nodes);
+    let db = checkpoint_graph(&path, config.nodes, config.mvcc);
     let running = Arc::new(AtomicBool::new(true));
     let checkpointer = {
       let (db, running) = (Arc::clone(&db), Arc::clone(&running));
@@ -304,6 +349,7 @@ fn bench_checkpoint(config: &Config, dir: &Path) {
 
 fn main() {
   let config = parse_args();
+  println!("MVCC: {}", mvcc_label(config.mvcc));
   let temp = tempfile::tempdir().expect("tempdir");
   let dir = config
     .dir

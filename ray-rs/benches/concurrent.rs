@@ -6,7 +6,10 @@
 //! - Multi-threaded read throughput
 //! - Read scaling across thread counts
 //! - Reader-writer contention impact
-//! - MVCC transaction overhead
+//! - MVCC transaction overhead (`mvcc_transaction`: the `TxManager` alone, no
+//!   database)
+//!
+//! Every database here opens with the library's default MVCC mode (on).
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::collections::HashMap;
@@ -682,7 +685,7 @@ fn bench_reader_writer_contention_batched_group_commit(c: &mut Criterion) {
 }
 
 // ============================================================================
-// MVCC Transaction Overhead Benchmarks
+// MVCC Transaction Overhead Benchmarks (TxManager alone, no database)
 // ============================================================================
 
 fn bench_mvcc_transaction_overhead(c: &mut Criterion) {

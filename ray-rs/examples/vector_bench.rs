@@ -14,6 +14,9 @@
 //!   --n-probe N         IVF nProbe (default: 10)
 //!   --output FILE      Output file path (default: auto-generated)
 //!   --no-output        Disable file output
+//!
+//! Unknown options are an error. The bench uses an in-memory `VectorIndex`
+//! and opens no database, so it has no MVCC mode.
 
 use kitedb::api::vector_search::{SimilarOptions, VectorIndex, VectorIndexOptions};
 use kitedb::types::NodeId;
@@ -22,6 +25,7 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::exit;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
@@ -47,6 +51,22 @@ impl Default for BenchConfig {
   }
 }
 
+fn usage_error(message: &str) -> ! {
+  eprintln!("error: {message}");
+  eprintln!("see the header of examples/vector_bench.rs for the options");
+  exit(2);
+}
+
+fn value<T: std::str::FromStr>(args: &[String], i: &mut usize, flag: &str) -> T {
+  *i += 1;
+  let Some(raw) = args.get(*i) else {
+    usage_error(&format!("{flag} needs a value"));
+  };
+  raw
+    .parse()
+    .unwrap_or_else(|_| usage_error(&format!("invalid value for {flag}: {raw}")))
+}
+
 fn parse_args() -> BenchConfig {
   let mut config = BenchConfig::default();
   let mut no_output = false;
@@ -54,47 +74,16 @@ fn parse_args() -> BenchConfig {
 
   let mut i = 1;
   while i < args.len() {
-    match args[i].as_str() {
-      "--vectors" => {
-        if let Some(value) = args.get(i + 1) {
-          config.vectors = value.parse().unwrap_or(config.vectors);
-          i += 1;
-        }
-      }
-      "--dimensions" => {
-        if let Some(value) = args.get(i + 1) {
-          config.dimensions = value.parse().unwrap_or(config.dimensions);
-          i += 1;
-        }
-      }
-      "--iterations" => {
-        if let Some(value) = args.get(i + 1) {
-          config.iterations = value.parse().unwrap_or(config.iterations);
-          i += 1;
-        }
-      }
-      "--k" => {
-        if let Some(value) = args.get(i + 1) {
-          config.k = value.parse().unwrap_or(config.k);
-          i += 1;
-        }
-      }
-      "--n-probe" => {
-        if let Some(value) = args.get(i + 1) {
-          config.n_probe = value.parse().unwrap_or(config.n_probe);
-          i += 1;
-        }
-      }
-      "--output" => {
-        if let Some(value) = args.get(i + 1) {
-          config.output_file = Some(PathBuf::from(value));
-          i += 1;
-        }
-      }
-      "--no-output" => {
-        no_output = true;
-      }
-      _ => {}
+    let flag = args[i].as_str();
+    match flag {
+      "--vectors" => config.vectors = value(&args, &mut i, flag),
+      "--dimensions" => config.dimensions = value(&args, &mut i, flag),
+      "--iterations" => config.iterations = value(&args, &mut i, flag),
+      "--k" => config.k = value(&args, &mut i, flag),
+      "--n-probe" => config.n_probe = value(&args, &mut i, flag),
+      "--output" => config.output_file = Some(value(&args, &mut i, flag)),
+      "--no-output" => no_output = true,
+      other => usage_error(&format!("unknown option {other}")),
     }
     i += 1;
   }

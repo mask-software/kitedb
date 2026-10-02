@@ -30,11 +30,15 @@
 //!   --group-commit-window-ms N     Group commit window in ms (default: 2)
 //!   --auto-checkpoint              Enable auto-checkpoint (default: false)
 //!   --seed N                       RNG seed for event generation (default: 42)
+//!   --mvcc | --no-mvcc             MVCC mode (default: the library default)
 //!   --keep-db                      Keep generated DB files for inspection
+//!
+//! Unknown options are an error.
 
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::path::PathBuf;
+use std::process::exit;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -74,6 +78,8 @@ struct BenchConfig {
   group_commit_window_ms: u64,
   auto_checkpoint: bool,
   seed: u64,
+  /// None: the library default.
+  mvcc: Option<bool>,
   keep_db: bool,
 }
 
@@ -97,6 +103,7 @@ impl Default for BenchConfig {
       group_commit_window_ms: 2,
       auto_checkpoint: false,
       seed: 42,
+      mvcc: None,
       keep_db: false,
     }
   }
@@ -177,121 +184,71 @@ struct BenchResult {
   queue_avg_depth: f64,
 }
 
+fn usage_error(message: &str) -> ! {
+  eprintln!("error: {message}");
+  eprintln!("see the header of examples/index_pipeline_hypothesis_bench.rs for the options");
+  exit(2);
+}
+
+fn value<T: std::str::FromStr>(args: &[String], i: &mut usize, flag: &str) -> T {
+  *i += 1;
+  let Some(raw) = args.get(*i) else {
+    usage_error(&format!("{flag} needs a value"));
+  };
+  raw
+    .parse()
+    .unwrap_or_else(|_| usage_error(&format!("invalid value for {flag}: {raw}")))
+}
+
 fn parse_args() -> BenchConfig {
   let mut config = BenchConfig::default();
   let args: Vec<String> = env::args().collect();
   let mut i = 1;
 
   while i < args.len() {
-    match args[i].as_str() {
+    let flag = args[i].as_str();
+    match flag {
       "--mode" => {
-        if let Some(value) = args.get(i + 1) {
-          config.mode = match value.to_lowercase().as_str() {
-            "sequential" => Mode::Sequential,
-            "parallel" => Mode::Parallel,
-            _ => Mode::Both,
-          };
-          i += 1;
-        }
+        let mode: String = value(&args, &mut i, flag);
+        config.mode = match mode.to_lowercase().as_str() {
+          "sequential" => Mode::Sequential,
+          "parallel" => Mode::Parallel,
+          "both" => Mode::Both,
+          other => usage_error(&format!(
+            "--mode must be sequential, parallel or both, not {other}"
+          )),
+        };
       }
-      "--changes" => {
-        if let Some(value) = args.get(i + 1) {
-          config.changes = value.parse().unwrap_or(config.changes);
-          i += 1;
-        }
-      }
-      "--working-set" => {
-        if let Some(value) = args.get(i + 1) {
-          config.working_set = value.parse().unwrap_or(config.working_set);
-          i += 1;
-        }
-      }
-      "--vector-dims" => {
-        if let Some(value) = args.get(i + 1) {
-          config.vector_dims = value.parse().unwrap_or(config.vector_dims);
-          i += 1;
-        }
-      }
-      "--tree-sitter-latency-ms" => {
-        if let Some(value) = args.get(i + 1) {
-          config.tree_sitter_latency_ms = value.parse().unwrap_or(config.tree_sitter_latency_ms);
-          i += 1;
-        }
-      }
-      "--scip-latency-ms" => {
-        if let Some(value) = args.get(i + 1) {
-          config.scip_latency_ms = value.parse().unwrap_or(config.scip_latency_ms);
-          i += 1;
-        }
-      }
-      "--embed-latency-ms" => {
-        if let Some(value) = args.get(i + 1) {
-          config.embed_latency_ms = value.parse().unwrap_or(config.embed_latency_ms);
-          i += 1;
-        }
-      }
-      "--embed-batch-size" => {
-        if let Some(value) = args.get(i + 1) {
-          config.embed_batch_size = value.parse().unwrap_or(config.embed_batch_size);
-          i += 1;
-        }
-      }
-      "--embed-flush-ms" => {
-        if let Some(value) = args.get(i + 1) {
-          config.embed_flush_ms = value.parse().unwrap_or(config.embed_flush_ms);
-          i += 1;
-        }
-      }
-      "--embed-inflight" => {
-        if let Some(value) = args.get(i + 1) {
-          config.embed_inflight = value.parse().unwrap_or(config.embed_inflight);
-          i += 1;
-        }
-      }
-      "--vector-apply-batch-size" => {
-        if let Some(value) = args.get(i + 1) {
-          config.vector_apply_batch_size = value.parse().unwrap_or(config.vector_apply_batch_size);
-          i += 1;
-        }
-      }
-      "--wal-size" => {
-        if let Some(value) = args.get(i + 1) {
-          config.wal_size = value.parse().unwrap_or(config.wal_size);
-          i += 1;
-        }
-      }
+      "--changes" => config.changes = value(&args, &mut i, flag),
+      "--working-set" => config.working_set = value(&args, &mut i, flag),
+      "--vector-dims" => config.vector_dims = value(&args, &mut i, flag),
+      "--tree-sitter-latency-ms" => config.tree_sitter_latency_ms = value(&args, &mut i, flag),
+      "--scip-latency-ms" => config.scip_latency_ms = value(&args, &mut i, flag),
+      "--embed-latency-ms" => config.embed_latency_ms = value(&args, &mut i, flag),
+      "--embed-batch-size" => config.embed_batch_size = value(&args, &mut i, flag),
+      "--embed-flush-ms" => config.embed_flush_ms = value(&args, &mut i, flag),
+      "--embed-inflight" => config.embed_inflight = value(&args, &mut i, flag),
+      "--vector-apply-batch-size" => config.vector_apply_batch_size = value(&args, &mut i, flag),
+      "--wal-size" => config.wal_size = value(&args, &mut i, flag),
       "--sync-mode" => {
-        if let Some(value) = args.get(i + 1) {
-          config.sync_mode = match value.to_lowercase().as_str() {
-            "full" => SyncMode::Full,
-            "off" => SyncMode::Off,
-            _ => SyncMode::Normal,
-          };
-          i += 1;
-        }
+        let mode: String = value(&args, &mut i, flag);
+        config.sync_mode = match mode.to_lowercase().as_str() {
+          "full" => SyncMode::Full,
+          "normal" => SyncMode::Normal,
+          "off" => SyncMode::Off,
+          other => usage_error(&format!(
+            "--sync-mode must be full, normal or off, not {other}"
+          )),
+        };
       }
-      "--group-commit-enabled" => {
-        config.group_commit_enabled = true;
-      }
-      "--group-commit-window-ms" => {
-        if let Some(value) = args.get(i + 1) {
-          config.group_commit_window_ms = value.parse().unwrap_or(config.group_commit_window_ms);
-          i += 1;
-        }
-      }
-      "--auto-checkpoint" => {
-        config.auto_checkpoint = true;
-      }
-      "--seed" => {
-        if let Some(value) = args.get(i + 1) {
-          config.seed = value.parse().unwrap_or(config.seed);
-          i += 1;
-        }
-      }
-      "--keep-db" => {
-        config.keep_db = true;
-      }
-      _ => {}
+      "--group-commit-enabled" => config.group_commit_enabled = true,
+      "--group-commit-window-ms" => config.group_commit_window_ms = value(&args, &mut i, flag),
+      "--auto-checkpoint" => config.auto_checkpoint = true,
+      "--seed" => config.seed = value(&args, &mut i, flag),
+      "--mvcc" => config.mvcc = Some(true),
+      "--no-mvcc" => config.mvcc = Some(false),
+      "--keep-db" => config.keep_db = true,
+      other => usage_error(&format!("unknown option {other}")),
     }
     i += 1;
   }
@@ -316,6 +273,20 @@ fn parse_args() -> BenchConfig {
   }
 
   config
+}
+
+/// The MVCC mode the bench runs in, for its header.
+fn mvcc_label(requested: Option<bool>) -> String {
+  let on = requested.unwrap_or(SingleFileOpenOptions::new().mvcc);
+  format!(
+    "{}{}",
+    if on { "on" } else { "off" },
+    if requested.is_none() {
+      " (library default)"
+    } else {
+      ""
+    }
+  )
 }
 
 fn generate_events(config: &BenchConfig) -> Vec<ChangeEvent> {
@@ -378,12 +349,15 @@ fn setup_fixture(config: &BenchConfig, label: &str) -> DbFixture {
     .path()
     .join(format!("index-pipeline-{label}.kitedb"));
 
-  let open_opts = SingleFileOpenOptions::new()
+  let mut open_opts = SingleFileOpenOptions::new()
     .wal_size(config.wal_size)
     .sync_mode(config.sync_mode)
     .group_commit_enabled(config.group_commit_enabled)
     .group_commit_window_ms(config.group_commit_window_ms)
     .auto_checkpoint(config.auto_checkpoint);
+  if let Some(mvcc) = config.mvcc {
+    open_opts = open_opts.mvcc(mvcc);
+  }
 
   let db = open_single_file(&db_path, open_opts).expect("expected value");
   let db = Arc::new(db);
@@ -954,6 +928,7 @@ fn main() {
     config.group_commit_enabled, config.group_commit_window_ms
   );
   println!("Auto-checkpoint: {}", config.auto_checkpoint);
+  println!("MVCC: {}", mvcc_label(config.mvcc));
   println!("Seed: {}", config.seed);
   println!("==================================================================");
 

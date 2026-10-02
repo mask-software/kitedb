@@ -16,6 +16,9 @@
  *   --sync-mode MODE  Sync mode: full|normal|off (default: normal)
  *   --group-commit-enabled    Enable group commit (default: false)
  *   --group-commit-window-ms  Group commit window in ms (default: 2)
+ *   --mvcc | --no-mvcc        MVCC mode of both databases (default: the library default)
+ *
+ * Unknown options are an error.
  */
 
 import fs from "node:fs";
@@ -49,6 +52,16 @@ interface BenchConfig {
 	syncMode: string;
 	groupCommitEnabled: boolean;
 	groupCommitWindowMs: number;
+	/** undefined: the library default. */
+	mvcc: boolean | undefined;
+}
+
+function usageError(message: string): never {
+	console.error(`error: ${message}`);
+	console.error(
+		"see the header of benchmark/bench-fluent-vs-lowlevel.ts for the options",
+	);
+	process.exit(2);
 }
 
 function parseArgs(): BenchConfig {
@@ -62,36 +75,59 @@ function parseArgs(): BenchConfig {
 		syncMode: "normal",
 		groupCommitEnabled: false,
 		groupCommitWindowMs: 2,
+		mvcc: undefined,
 	};
 
-	for (let i = 0; i < args.length; i++) {
-		if (args[i] === "--nodes" && args[i + 1]) {
-			config.nodes = Number.parseInt(args[i + 1], 10);
-			i++;
-		} else if (args[i] === "--edges" && args[i + 1]) {
-			config.edges = Number.parseInt(args[i + 1], 10);
-			i++;
-		} else if (args[i] === "--iterations" && args[i + 1]) {
-			config.iterations = Number.parseInt(args[i + 1], 10);
-			i++;
-		} else if (args[i] === "--edge-types" && args[i + 1]) {
-			config.edgeTypes = Math.max(1, Number.parseInt(args[i + 1], 10));
-			i++;
-		} else if (args[i] === "--edge-props" && args[i + 1]) {
-			config.edgeProps = Math.max(0, Number.parseInt(args[i + 1], 10));
-			i++;
-		} else if (args[i] === "--sync-mode" && args[i + 1]) {
-			config.syncMode = args[i + 1].toLowerCase();
-			i++;
-		} else if (args[i] === "--group-commit-enabled") {
+	let i = 0;
+	const value = (flag: string): string => {
+		const raw = args[++i];
+		if (raw === undefined) usageError(`${flag} needs a value`);
+		return raw;
+	};
+	const int = (flag: string): number => {
+		const raw = value(flag);
+		if (!/^\d+$/.test(raw)) usageError(`invalid value for ${flag}: ${raw}`);
+		return Number.parseInt(raw, 10);
+	};
+
+	for (; i < args.length; i++) {
+		const flag = args[i];
+		if (flag === "--nodes") {
+			config.nodes = int(flag);
+		} else if (flag === "--edges") {
+			config.edges = int(flag);
+		} else if (flag === "--iterations") {
+			config.iterations = int(flag);
+		} else if (flag === "--edge-types") {
+			config.edgeTypes = Math.max(1, int(flag));
+		} else if (flag === "--edge-props") {
+			config.edgeProps = int(flag);
+		} else if (flag === "--sync-mode") {
+			const mode = value(flag).toLowerCase();
+			if (mode !== "full" && mode !== "normal" && mode !== "off") {
+				usageError(`--sync-mode must be full, normal or off, not ${mode}`);
+			}
+			config.syncMode = mode;
+		} else if (flag === "--group-commit-enabled") {
 			config.groupCommitEnabled = true;
-		} else if (args[i] === "--group-commit-window-ms" && args[i + 1]) {
-			config.groupCommitWindowMs = Number.parseInt(args[i + 1], 10);
-			i++;
+		} else if (flag === "--group-commit-window-ms") {
+			config.groupCommitWindowMs = int(flag);
+		} else if (flag === "--mvcc") {
+			config.mvcc = true;
+		} else if (flag === "--no-mvcc") {
+			config.mvcc = false;
+		} else {
+			usageError(`unknown option ${flag}`);
 		}
 	}
 
 	return config;
+}
+
+/** The MVCC mode the bench runs in, for its header. */
+function mvccLabel(requested: boolean | undefined): string {
+	if (requested === undefined) return "on (library default)";
+	return requested ? "on" : "off";
 }
 
 // =============================================================================
@@ -473,6 +509,7 @@ async function runBenchmarks(config: BenchConfig): Promise<void> {
 	console.log(`Edge props: ${formatNumber(config.edgeProps)}`);
 	console.log(`Iterations: ${formatNumber(config.iterations)}`);
 	console.log(`Sync mode: ${config.syncMode}`);
+	console.log(`MVCC: ${mvccLabel(config.mvcc)}`);
 	console.log(
 		`Group commit: ${config.groupCommitEnabled} (window ${config.groupCommitWindowMs}ms)`,
 	);
@@ -501,11 +538,14 @@ async function runBenchmarks(config: BenchConfig): Promise<void> {
 	);
 
 	// Low-level database setup
+	// mvcc is passed only when given, so the run gets the library default.
+	const mvccOption = config.mvcc === undefined ? {} : { mvcc: config.mvcc };
 	const lowLevelDb = Database.open(path.join(lowLevelDir, "test.kitedb"), {
 		syncMode,
 		groupCommitEnabled: config.groupCommitEnabled,
 		groupCommitWindowMs: config.groupCommitWindowMs,
 		walSize: 64 * 1024 * 1024,
+		...mvccOption,
 	});
 	const edgeTypeIds = edgeTypeNames.map((name) =>
 		lowLevelDb.getOrCreateEtype(name),
@@ -529,6 +569,7 @@ async function runBenchmarks(config: BenchConfig): Promise<void> {
 		groupCommitEnabled: config.groupCommitEnabled,
 		groupCommitWindowMs: config.groupCommitWindowMs,
 		walSizeMb: 64,
+		...mvccOption,
 	});
 
 		// =================================================================

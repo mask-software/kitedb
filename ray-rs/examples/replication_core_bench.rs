@@ -18,9 +18,15 @@
 //!   export --path P [--format json|binary] [--repeat N]
 //!                                      Snapshot transport export with data (binary: the
 //!                                      SnapshotTransport struct, json: its JSON serializer).
+//!
+//! Every scenario also takes `--mvcc` / `--no-mvcc`: the MVCC mode of the
+//! databases it opens (default: the library default). Options a scenario does
+//! not take are an error.
 
 use std::env;
 use std::path::{Path, PathBuf};
+use std::process::exit;
+use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use kitedb::core::single_file::{
@@ -28,6 +34,35 @@ use kitedb::core::single_file::{
 };
 use kitedb::replication::types::ReplicationRole;
 use kitedb::types::PropValue;
+
+const USAGE: &str =
+  "usage: replication_core_bench <build-source|bootstrap|commit-latency|build-blob|export> ...";
+
+fn usage_error(message: &str) -> ! {
+  eprintln!("error: {message}");
+  eprintln!("{USAGE}");
+  eprintln!("see the header of examples/replication_core_bench.rs for each scenario's options");
+  exit(2);
+}
+
+/// Rejects any argument after the scenario that is not one of `values`
+/// (each followed by a value) or `flags` (`--mvcc` / `--no-mvcc` are always
+/// allowed).
+fn check_args(args: &[String], values: &[&str], flags: &[&str]) {
+  let mut i = 2;
+  while i < args.len() {
+    let arg = args[i].as_str();
+    if values.contains(&arg) {
+      if args.get(i + 1).is_none() {
+        usage_error(&format!("{arg} needs a value"));
+      }
+      i += 1;
+    } else if !flags.contains(&arg) && arg != "--mvcc" && arg != "--no-mvcc" {
+      usage_error(&format!("unknown option {arg} for {}", args[1]));
+    }
+    i += 1;
+  }
+}
 
 fn arg_value(args: &[String], name: &str) -> Option<String> {
   args
@@ -37,8 +72,47 @@ fn arg_value(args: &[String], name: &str) -> Option<String> {
     .cloned()
 }
 
+/// The parsed value of `name`, if given; an invalid value is an error.
+fn arg_parsed<T: FromStr>(args: &[String], name: &str) -> Option<T> {
+  arg_value(args, name).map(|raw| {
+    raw
+      .parse()
+      .unwrap_or_else(|_| usage_error(&format!("invalid value for {name}: {raw}")))
+  })
+}
+
 fn arg_flag(args: &[String], name: &str) -> bool {
   args.iter().any(|arg| arg == name)
+}
+
+/// `--mvcc` / `--no-mvcc`, the last one given wins; None: the library default.
+fn arg_mvcc(args: &[String]) -> Option<bool> {
+  args.iter().rev().find_map(|arg| match arg.as_str() {
+    "--mvcc" => Some(true),
+    "--no-mvcc" => Some(false),
+    _ => None,
+  })
+}
+
+/// The MVCC mode the scenario runs in, for its output.
+fn mvcc_label(requested: Option<bool>) -> String {
+  let on = requested.unwrap_or(SingleFileOpenOptions::new().mvcc);
+  format!(
+    "{}{}",
+    if on { "on" } else { "off" },
+    if requested.is_none() {
+      " (library default)"
+    } else {
+      ""
+    }
+  )
+}
+
+fn with_mvcc(options: SingleFileOpenOptions, mvcc: Option<bool>) -> SingleFileOpenOptions {
+  match mvcc {
+    Some(mvcc) => options.mvcc(mvcc),
+    None => options,
+  }
 }
 
 fn peak_rss_mb() -> f64 {
@@ -57,12 +131,15 @@ fn ms(duration: Duration) -> f64 {
   duration.as_secs_f64() * 1000.0
 }
 
-fn primary_options(sync_mode: SyncMode) -> SingleFileOpenOptions {
-  SingleFileOpenOptions::new()
-    .sync_mode(sync_mode)
-    .auto_checkpoint(false)
-    .wal_size(64 << 20)
-    .replication_role(ReplicationRole::Primary)
+fn primary_options(sync_mode: SyncMode, mvcc: Option<bool>) -> SingleFileOpenOptions {
+  with_mvcc(
+    SingleFileOpenOptions::new()
+      .sync_mode(sync_mode)
+      .auto_checkpoint(false)
+      .wal_size(64 << 20)
+      .replication_role(ReplicationRole::Primary),
+    mvcc,
+  )
 }
 
 /// Deterministic pseudo-random hex, so checkpoint compression cannot shrink it.
@@ -79,10 +156,10 @@ fn noise(seed: u64, len: usize) -> String {
   out
 }
 
-fn build_source(path: &Path, nodes: usize) -> kitedb::Result<()> {
+fn build_source(path: &Path, nodes: usize, mvcc: Option<bool>) -> kitedb::Result<()> {
   let _ = std::fs::remove_file(path);
   let started = Instant::now();
-  let db = open_single_file(path, primary_options(SyncMode::Normal))?;
+  let db = open_single_file(path, primary_options(SyncMode::Normal, mvcc))?;
   db.begin(false)?;
   let name = db.define_propkey("name")?;
   let bio = db.define_propkey("bio")?;
@@ -114,12 +191,19 @@ fn build_source(path: &Path, nodes: usize) -> kitedb::Result<()> {
   Ok(())
 }
 
-fn bootstrap(source: &Path, replica_wal_mb: Option<usize>) -> kitedb::Result<()> {
+fn bootstrap(
+  source: &Path,
+  replica_wal_mb: Option<usize>,
+  mvcc: Option<bool>,
+) -> kitedb::Result<()> {
   let dir = tempfile::tempdir()?;
   let replica_path = dir.path().join("bench-replica.kitedb");
-  let mut options = SingleFileOpenOptions::new()
-    .replication_role(ReplicationRole::Replica)
-    .replication_source_db_path(source);
+  let mut options = with_mvcc(
+    SingleFileOpenOptions::new()
+      .replication_role(ReplicationRole::Replica)
+      .replication_source_db_path(source),
+    mvcc,
+  );
   if let Some(mb) = replica_wal_mb {
     options = options.wal_size(mb << 20);
   }
@@ -137,14 +221,22 @@ fn bootstrap(source: &Path, replica_wal_mb: Option<usize>) -> kitedb::Result<()>
   Ok(())
 }
 
-fn commit_latency(commits: usize, full_fsync: bool, with_primary: bool) -> kitedb::Result<()> {
+fn commit_latency(
+  commits: usize,
+  full_fsync: bool,
+  with_primary: bool,
+  mvcc: Option<bool>,
+) -> kitedb::Result<()> {
   let dir = tempfile::tempdir()?;
   let path = dir.path().join("bench-commit.kitedb");
-  let mut options = SingleFileOpenOptions::new()
-    .sync_mode(SyncMode::Full)
-    .full_fsync(full_fsync)
-    .auto_checkpoint(false)
-    .wal_size(64 << 20);
+  let mut options = with_mvcc(
+    SingleFileOpenOptions::new()
+      .sync_mode(SyncMode::Full)
+      .full_fsync(full_fsync)
+      .auto_checkpoint(false)
+      .wal_size(64 << 20),
+    mvcc,
+  );
   if with_primary {
     options = options.replication_role(ReplicationRole::Primary);
   }
@@ -168,12 +260,12 @@ fn commit_latency(commits: usize, full_fsync: bool, with_primary: bool) -> kited
   Ok(())
 }
 
-fn build_blob(path: &Path, mb: usize) -> kitedb::Result<()> {
+fn build_blob(path: &Path, mb: usize, mvcc: Option<bool>) -> kitedb::Result<()> {
   const WAL_MB: usize = 4;
   let _ = std::fs::remove_file(path);
   let db = open_single_file(
     path,
-    primary_options(SyncMode::Normal).wal_size(WAL_MB << 20),
+    primary_options(SyncMode::Normal, mvcc).wal_size(WAL_MB << 20),
   )?;
   db.begin(false)?;
   let blob = db.define_propkey("blob")?;
@@ -197,14 +289,17 @@ fn build_blob(path: &Path, mb: usize) -> kitedb::Result<()> {
   Ok(())
 }
 
-fn export(path: &Path, format: &str, repeat: usize) -> kitedb::Result<()> {
+fn export(path: &Path, format: &str, repeat: usize, mvcc: Option<bool>) -> kitedb::Result<()> {
   // The file keeps the WAL size it was built with.
   let db = open_single_file(
     path,
-    SingleFileOpenOptions::new()
-      .sync_mode(SyncMode::Normal)
-      .auto_checkpoint(false)
-      .replication_role(ReplicationRole::Primary),
+    with_mvcc(
+      SingleFileOpenOptions::new()
+        .sync_mode(SyncMode::Normal)
+        .auto_checkpoint(false)
+        .replication_role(ReplicationRole::Primary),
+      mvcc,
+    ),
   )?;
   let rss_before = peak_rss_mb();
   let mut best = Duration::MAX;
@@ -217,10 +312,7 @@ fn export(path: &Path, format: &str, repeat: usize) -> kitedb::Result<()> {
       "binary" => db
         .primary_export_snapshot_transport(true)
         .map(|snapshot| snapshot.data.map_or(0, |data| data.len())),
-      other => {
-        eprintln!("unknown format {other}");
-        std::process::exit(2);
-      }
+      other => unreachable!("--format is checked when parsed: {other}"),
     };
     let elapsed = started.elapsed();
     best = best.min(elapsed);
@@ -242,43 +334,59 @@ fn export(path: &Path, format: &str, repeat: usize) -> kitedb::Result<()> {
 fn main() -> kitedb::Result<()> {
   let args: Vec<String> = env::args().collect();
   let scenario = args.get(1).cloned().unwrap_or_default();
+  match scenario.as_str() {
+    "build-source" => check_args(&args, &["--path", "--nodes"], &[]),
+    "bootstrap" => check_args(&args, &["--source", "--replica-wal-mb"], &[]),
+    "commit-latency" => check_args(&args, &["--commits"], &["--full-fsync", "--no-primary"]),
+    "build-blob" => check_args(&args, &["--path", "--mb"], &[]),
+    "export" => check_args(&args, &["--path", "--format", "--repeat"], &[]),
+    "" => usage_error("missing scenario"),
+    other => usage_error(&format!("unknown scenario {other}")),
+  }
   let path = arg_value(&args, "--path").map(PathBuf::from);
+  let required_path = || {
+    path
+      .clone()
+      .unwrap_or_else(|| usage_error("--path is required"))
+  };
+  let mvcc = arg_mvcc(&args);
+  println!("mvcc: {}", mvcc_label(mvcc));
   match scenario.as_str() {
     "build-source" => build_source(
-      &path.expect("--path"),
-      arg_value(&args, "--nodes")
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(200_000),
+      &required_path(),
+      arg_parsed(&args, "--nodes").unwrap_or(200_000),
+      mvcc,
     ),
     "bootstrap" => bootstrap(
-      &PathBuf::from(arg_value(&args, "--source").expect("--source")),
-      arg_value(&args, "--replica-wal-mb").and_then(|value| value.parse().ok()),
+      &PathBuf::from(
+        arg_value(&args, "--source").unwrap_or_else(|| usage_error("--source is required")),
+      ),
+      arg_parsed(&args, "--replica-wal-mb"),
+      mvcc,
     ),
     "commit-latency" => commit_latency(
-      arg_value(&args, "--commits")
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(200),
+      arg_parsed(&args, "--commits").unwrap_or(200),
       arg_flag(&args, "--full-fsync"),
       !arg_flag(&args, "--no-primary"),
+      mvcc,
     ),
     "build-blob" => build_blob(
-      &path.expect("--path"),
-      arg_value(&args, "--mb")
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(50),
+      &required_path(),
+      arg_parsed(&args, "--mb").unwrap_or(50),
+      mvcc,
     ),
-    "export" => export(
-      &path.expect("--path"),
-      &arg_value(&args, "--format").unwrap_or_else(|| "json".to_string()),
-      arg_value(&args, "--repeat")
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(3),
-    ),
-    _ => {
-      eprintln!(
-        "usage: replication_core_bench <build-source|bootstrap|commit-latency|build-blob|export> ..."
-      );
-      std::process::exit(2);
+    "export" => {
+      let format = arg_value(&args, "--format").unwrap_or_else(|| "json".to_string());
+      if format != "json" && format != "binary" {
+        usage_error(&format!("--format must be json or binary, not {format}"));
+      }
+      export(
+        &required_path(),
+        &format,
+        arg_parsed(&args, "--repeat").unwrap_or(3),
+        mvcc,
+      )
     }
+    _ => unreachable!("scenarios are checked above"),
   }
 }

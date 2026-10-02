@@ -30,6 +30,7 @@ Options:
   --vector-count N           Number of vectors to set (default: 1000)
   --skip-compact            Skip optimize/compaction step
   --reopen-readonly         Re-open database in read-only mode after compaction
+  --mvcc | --no-mvcc        MVCC mode (default: the library default)
 """
 
 import argparse
@@ -72,6 +73,8 @@ class BenchConfig:
   vector_count: int = 1000
   skip_compact: bool = False
   reopen_readonly: bool = False
+  # None: the library default.
+  mvcc: Optional[bool] = None
 
 
 def parse_args() -> BenchConfig:
@@ -85,7 +88,9 @@ def parse_args() -> BenchConfig:
   parser.add_argument("--no-output", action="store_true")
   parser.add_argument("--keep-db", action="store_true")
   parser.add_argument("--wal-size", type=int, default=64 * 1024 * 1024)
-  parser.add_argument("--sync-mode", type=str, default="normal")
+  parser.add_argument(
+    "--sync-mode", type=str.lower, choices=["full", "normal", "off"], default="normal"
+  )
   parser.add_argument("--group-commit-enabled", action="store_true")
   parser.add_argument("--group-commit-window-ms", type=int, default=2)
   parser.add_argument("--checkpoint-threshold", type=float, default=0.8)
@@ -94,6 +99,9 @@ def parse_args() -> BenchConfig:
   parser.add_argument("--vector-count", type=int, default=1000)
   parser.add_argument("--skip-compact", action="store_true")
   parser.add_argument("--reopen-readonly", action="store_true")
+  mvcc = parser.add_mutually_exclusive_group()
+  mvcc.add_argument("--mvcc", dest="mvcc", action="store_true", default=None)
+  mvcc.add_argument("--no-mvcc", dest="mvcc", action="store_false")
 
   args = parser.parse_args()
 
@@ -125,7 +133,15 @@ def parse_args() -> BenchConfig:
     vector_count=args.vector_count,
     skip_compact=args.skip_compact,
     reopen_readonly=args.reopen_readonly,
+    mvcc=args.mvcc,
   )
+
+
+def mvcc_label(requested: Optional[bool]) -> str:
+  """The MVCC mode the bench runs in, for its header."""
+  if requested is None:
+    return "on (library default)"
+  return "on" if requested else "off"
 
 
 class Logger:
@@ -463,6 +479,7 @@ def run_benchmarks(config: BenchConfig):
   logger.log(f"Iterations: {format_number(config.iterations)}")
   logger.log(f"WAL size: {format_number(config.wal_size)} bytes")
   logger.log(f"Sync mode: {config.sync_mode}")
+  logger.log(f"MVCC: {mvcc_label(config.mvcc)}")
   logger.log(f"Group commit: {config.group_commit_enabled} (window {config.group_commit_window_ms}ms)")
   logger.log(f"Auto-checkpoint: {config.auto_checkpoint}")
   logger.log(f"Checkpoint threshold: {config.checkpoint_threshold}")
@@ -484,6 +501,8 @@ def run_benchmarks(config: BenchConfig):
     elif config.sync_mode == "off":
       sync_mode = SyncMode.off()
 
+    # mvcc is passed only when given, so the run gets the library default.
+    mvcc_option = {} if config.mvcc is None else {"mvcc": config.mvcc}
     options = OpenOptions(
       wal_size=config.wal_size,
       auto_checkpoint=config.auto_checkpoint,
@@ -491,6 +510,7 @@ def run_benchmarks(config: BenchConfig):
       sync_mode=sync_mode,
       group_commit_enabled=config.group_commit_enabled,
       group_commit_window_ms=config.group_commit_window_ms,
+      **mvcc_option,
     )
     db = Database(db_path, options)
     start_build = time.perf_counter()
@@ -510,7 +530,9 @@ def run_benchmarks(config: BenchConfig):
 
     if config.reopen_readonly:
       db.close()
-      db = Database(db_path, OpenOptions(read_only=True, create_if_missing=False))
+      db = Database(
+        db_path, OpenOptions(read_only=True, create_if_missing=False, **mvcc_option)
+      )
       logger.log("  Re-opened database in read-only mode")
 
     logger.log("\n[4/6] Key lookup benchmarks...")

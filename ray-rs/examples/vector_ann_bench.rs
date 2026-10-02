@@ -31,6 +31,9 @@
 //!   --rounds N                         Timed passes over the queries, interleaving the
 //!                                      re-rank factors (default: 1)
 //!   --seed N                           RNG seed (default: 42)
+//!
+//! Unknown options are an error. The bench builds its indexes in memory and
+//! opens no database, so it has no MVCC mode.
 
 use kitedb::types::NodeId;
 use kitedb::vector::{
@@ -41,6 +44,7 @@ use kitedb::vector::{
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::collections::HashSet;
 use std::env;
+use std::process::exit;
 use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,125 +149,83 @@ impl Default for BenchConfig {
   }
 }
 
+fn usage_error(message: &str) -> ! {
+  eprintln!("error: {message}");
+  eprintln!("see the header of examples/vector_ann_bench.rs for the options");
+  exit(2);
+}
+
+fn value<T: std::str::FromStr>(args: &[String], i: &mut usize, flag: &str) -> T {
+  *i += 1;
+  let Some(raw) = args.get(*i) else {
+    usage_error(&format!("{flag} needs a value"));
+  };
+  raw
+    .parse()
+    .unwrap_or_else(|_| usage_error(&format!("invalid value for {flag}: {raw}")))
+}
+
 fn parse_args() -> BenchConfig {
   let mut config = BenchConfig::default();
   let args: Vec<String> = env::args().collect();
   let mut i = 1usize;
 
   while i < args.len() {
-    match args[i].as_str() {
+    let flag = args[i].as_str();
+    match flag {
       "--algorithm" => {
-        if let Some(value) = args.get(i + 1) {
-          if let Some(parsed) = Algorithm::parse(value) {
-            config.algorithm = parsed;
-          }
-          i += 1;
-        }
+        let raw: String = value(&args, &mut i, flag);
+        config.algorithm = Algorithm::parse(&raw)
+          .unwrap_or_else(|| usage_error(&format!("--algorithm must be ivf or ivf_pq, not {raw}")));
       }
-      "--vectors" => {
-        if let Some(value) = args.get(i + 1) {
-          config.vectors = value.parse().unwrap_or(config.vectors);
-          i += 1;
-        }
-      }
-      "--dimensions" => {
-        if let Some(value) = args.get(i + 1) {
-          config.dimensions = value.parse().unwrap_or(config.dimensions);
-          i += 1;
-        }
-      }
-      "--queries" => {
-        if let Some(value) = args.get(i + 1) {
-          config.queries = value.parse().unwrap_or(config.queries);
-          i += 1;
-        }
-      }
-      "--k" => {
-        if let Some(value) = args.get(i + 1) {
-          config.k = value.parse().unwrap_or(config.k);
-          i += 1;
-        }
-      }
-      "--n-clusters" => {
-        if let Some(value) = args.get(i + 1) {
-          config.n_clusters = value.parse::<usize>().ok();
-          i += 1;
-        }
-      }
-      "--n-probe" => {
-        if let Some(value) = args.get(i + 1) {
-          config.n_probe = value.parse().unwrap_or(config.n_probe);
-          i += 1;
-        }
-      }
-      "--pq-subspaces" => {
-        if let Some(value) = args.get(i + 1) {
-          config.pq_subspaces = value.parse().unwrap_or(config.pq_subspaces);
-          i += 1;
-        }
-      }
-      "--pq-centroids" => {
-        if let Some(value) = args.get(i + 1) {
-          config.pq_centroids = value.parse().unwrap_or(config.pq_centroids);
-          i += 1;
-        }
-      }
+      "--vectors" => config.vectors = value(&args, &mut i, flag),
+      "--dimensions" => config.dimensions = value(&args, &mut i, flag),
+      "--queries" => config.queries = value(&args, &mut i, flag),
+      "--k" => config.k = value(&args, &mut i, flag),
+      "--n-clusters" => config.n_clusters = Some(value(&args, &mut i, flag)),
+      "--n-probe" => config.n_probe = value(&args, &mut i, flag),
+      "--pq-subspaces" => config.pq_subspaces = value(&args, &mut i, flag),
+      "--pq-centroids" => config.pq_centroids = value(&args, &mut i, flag),
       "--residuals" => {
-        if let Some(value) = args.get(i + 1) {
-          config.residuals = matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes"
-          );
-          i += 1;
-        }
+        let raw: String = value(&args, &mut i, flag);
+        config.residuals = match raw.trim().to_ascii_lowercase().as_str() {
+          "1" | "true" | "yes" => true,
+          "0" | "false" | "no" => false,
+          _ => usage_error(&format!("--residuals must be true or false, not {raw}")),
+        };
       }
       "--metric" => {
-        if let Some(value) = args.get(i + 1) {
-          if let Some(parsed) = parse_metric(value) {
-            config.metric = parsed;
-          }
-          i += 1;
-        }
+        let raw: String = value(&args, &mut i, flag);
+        config.metric = parse_metric(&raw).unwrap_or_else(|| {
+          usage_error(&format!(
+            "--metric must be cosine, euclidean or dot, not {raw}"
+          ))
+        });
       }
       "--dataset" => {
-        if let Some(value) = args.get(i + 1) {
-          if let Some(parsed) = Dataset::parse(value) {
-            config.dataset = parsed;
-          }
-          i += 1;
-        }
+        let raw: String = value(&args, &mut i, flag);
+        config.dataset = Dataset::parse(&raw).unwrap_or_else(|| {
+          usage_error(&format!(
+            "--dataset must be uniform, clustered or lowrank, not {raw}"
+          ))
+        });
       }
-      "--blobs" => {
-        if let Some(value) = args.get(i + 1) {
-          config.blobs = value.parse().unwrap_or(config.blobs);
-          i += 1;
-        }
-      }
+      "--blobs" => config.blobs = value(&args, &mut i, flag),
       "--rerank-factor" | "--rerank-factors" => {
-        if let Some(value) = args.get(i + 1) {
-          config.rerank_factors = value
-            .split(',')
-            .filter_map(|factor| match factor.trim() {
-              "default" => Some(None),
-              factor => factor.parse().ok().map(Some),
-            })
-            .collect();
-          i += 1;
-        }
+        let raw: String = value(&args, &mut i, flag);
+        config.rerank_factors = raw
+          .split(',')
+          .map(|factor| match factor.trim() {
+            "default" => None,
+            factor => Some(factor.parse().unwrap_or_else(|_| {
+              usage_error(&format!("invalid re-rank factor in {flag}: {factor}"))
+            })),
+          })
+          .collect();
       }
-      "--rounds" => {
-        if let Some(value) = args.get(i + 1) {
-          config.rounds = value.parse().unwrap_or(config.rounds);
-          i += 1;
-        }
-      }
-      "--seed" => {
-        if let Some(value) = args.get(i + 1) {
-          config.seed = value.parse().unwrap_or(config.seed);
-          i += 1;
-        }
-      }
-      _ => {}
+      "--rounds" => config.rounds = value(&args, &mut i, flag),
+      "--seed" => config.seed = value(&args, &mut i, flag),
+      other => usage_error(&format!("unknown option {other}")),
     }
     i += 1;
   }

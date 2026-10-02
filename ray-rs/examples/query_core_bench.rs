@@ -31,9 +31,13 @@
 //!   --hub-edges N     Out-edges of the hub for `hub` (default: 200000)
 //!   --repeat N        Runs per op (default: 7)
 //!   --states LIST     delta,snapshot (default: both)
+//!   --mvcc | --no-mvcc  MVCC mode of every database (default: the library default)
+//!
+//! Unknown options are an error.
 
 use std::collections::HashMap;
 use std::env;
+use std::process::exit;
 use std::time::{Duration, Instant};
 
 use rand::rngs::StdRng;
@@ -60,6 +64,39 @@ struct Config {
   hub_edges: usize,
   repeat: usize,
   states: Vec<String>,
+  /// None: the library default.
+  mvcc: Option<bool>,
+}
+
+fn usage_error(message: &str) -> ! {
+  eprintln!("error: {message}");
+  eprintln!("see the header of examples/query_core_bench.rs for the options");
+  exit(2);
+}
+
+fn value<T: std::str::FromStr>(args: &[String], i: &mut usize, flag: &str) -> T {
+  *i += 1;
+  let Some(raw) = args.get(*i) else {
+    usage_error(&format!("{flag} needs a value"));
+  };
+  raw
+    .parse()
+    .unwrap_or_else(|_| usage_error(&format!("invalid value for {flag}: {raw}")))
+}
+
+/// A comma-separated list whose items must all be in `allowed`.
+fn list(args: &[String], i: &mut usize, flag: &str, allowed: &[&str]) -> Vec<String> {
+  let raw: String = value(args, i, flag);
+  let items: Vec<String> = raw.split(',').map(str::to_string).collect();
+  for item in &items {
+    if !allowed.contains(&item.as_str()) {
+      usage_error(&format!(
+        "{flag}: unknown item {item:?} (expected some of {})",
+        allowed.join(",")
+      ));
+    }
+  }
+  items
 }
 
 impl Config {
@@ -74,26 +111,29 @@ impl Config {
       hub_edges: 200_000,
       repeat: 7,
       states: vec!["delta".into(), "snapshot".into()],
+      mvcc: None,
     };
-    let args: Vec<String> = env::args().skip(1).collect();
-    let mut i = 0;
+    let args: Vec<String> = env::args().collect();
+    let mut i = 1;
     while i < args.len() {
-      let value = args.get(i + 1).cloned().unwrap_or_default();
-      let list = || value.split(',').map(str::to_string).collect::<Vec<_>>();
-      let number = || value.parse::<usize>().expect("a number");
-      match args[i].as_str() {
-        "--sections" => config.sections = list(),
-        "--nodes" => config.nodes = number(),
-        "--edges-per-node" => config.edges_per_node = number(),
-        "--limit" => config.limit = number(),
-        "--page" => config.page = number(),
-        "--type-nodes" => config.type_nodes = number(),
-        "--hub-edges" => config.hub_edges = number(),
-        "--repeat" => config.repeat = number(),
-        "--states" => config.states = list(),
-        other => panic!("unknown option {other}"),
+      let flag = args[i].as_str();
+      match flag {
+        "--sections" => {
+          config.sections = list(&args, &mut i, flag, &["paging", "types", "hub", "open"])
+        }
+        "--nodes" => config.nodes = value(&args, &mut i, flag),
+        "--edges-per-node" => config.edges_per_node = value(&args, &mut i, flag),
+        "--limit" => config.limit = value(&args, &mut i, flag),
+        "--page" => config.page = value(&args, &mut i, flag),
+        "--type-nodes" => config.type_nodes = value(&args, &mut i, flag),
+        "--hub-edges" => config.hub_edges = value(&args, &mut i, flag),
+        "--repeat" => config.repeat = value(&args, &mut i, flag),
+        "--states" => config.states = list(&args, &mut i, flag, &["delta", "snapshot"]),
+        "--mvcc" => config.mvcc = Some(true),
+        "--no-mvcc" => config.mvcc = Some(false),
+        other => usage_error(&format!("unknown option {other}")),
       }
-      i += 2;
+      i += 1;
     }
     config
   }
@@ -121,15 +161,36 @@ fn report<T>(state: &str, name: &str, repeat: usize, op: impl FnMut() -> T) {
   );
 }
 
-fn db_options() -> SingleFileOpenOptions {
-  SingleFileOpenOptions::new()
-    .sync_mode(SyncMode::Off)
-    .wal_size(WAL_BYTES)
-    .auto_checkpoint(false)
+/// The MVCC mode the bench runs in, for its header.
+fn mvcc_label(requested: Option<bool>) -> String {
+  let on = requested.unwrap_or(SingleFileOpenOptions::new().mvcc);
+  format!(
+    "{}{}",
+    if on { "on" } else { "off" },
+    if requested.is_none() {
+      " (library default)"
+    } else {
+      ""
+    }
+  )
 }
 
-fn kite_options() -> KiteOptions {
+fn db_options(config: &Config) -> SingleFileOpenOptions {
+  let options = SingleFileOpenOptions::new()
+    .sync_mode(SyncMode::Off)
+    .wal_size(WAL_BYTES)
+    .auto_checkpoint(false);
+  match config.mvcc {
+    Some(mvcc) => options.mvcc(mvcc),
+    None => options,
+  }
+}
+
+fn kite_options(config: &Config) -> KiteOptions {
   let mut options = KiteOptions::new();
+  if let Some(mvcc) = config.mvcc {
+    options = options.mvcc(mvcc);
+  }
   for t in 0..TYPES {
     options = options.node(NodeDef::new(&format!("T{t}"), &format!("t{t}:")));
   }
@@ -151,7 +212,7 @@ fn paging(config: &Config) {
     config.page
   );
   let dir = tempdir().expect("temp dir");
-  let db = open_single_file(dir.path().join("paging.kitedb"), db_options()).expect("open");
+  let db = open_single_file(dir.path().join("paging.kitedb"), db_options(config)).expect("open");
   load_paging_graph(&db, config);
   for state in ["delta", "snapshot"] {
     if state == "snapshot" {
@@ -238,7 +299,7 @@ fn types(config: &Config) {
     config.type_nodes
   );
   let dir = tempdir().expect("temp dir");
-  let mut kite = Kite::open(dir.path().join("types.kitedb"), kite_options()).expect("open");
+  let mut kite = Kite::open(dir.path().join("types.kitedb"), kite_options(config)).expect("open");
   let per_chunk = 10_000;
   let mut created = 0;
   while created < config.type_nodes {
@@ -276,7 +337,7 @@ fn hub(config: &Config) {
     config.hub_edges
   );
   let dir = tempdir().expect("temp dir");
-  let mut kite = Kite::open(dir.path().join("hub.kitedb"), kite_options()).expect("open");
+  let mut kite = Kite::open(dir.path().join("hub.kitedb"), kite_options(config)).expect("open");
   let hub = kite
     .create_node("T0", "hub", HashMap::new())
     .expect("hub")
@@ -349,11 +410,17 @@ fn open(config: &Config) {
   );
   let dir = tempdir().expect("temp dir");
   let path = dir.path().join("open.kitedb");
-  let db = open_single_file(&path, db_options()).expect("open");
+  let db = open_single_file(&path, db_options(config)).expect("open");
   load_paging_graph(&db, config);
   db.checkpoint().expect("checkpoint");
   close_single_file(db).expect("close");
-  let options = || SingleFileOpenOptions::new().read_only(true);
+  let options = || {
+    let options = SingleFileOpenOptions::new().read_only(true);
+    match config.mvcc {
+      Some(mvcc) => options.mvcc(mvcc),
+      None => options,
+    }
+  };
   report(
     "snapshot",
     "open_single_file (read-only)",
@@ -367,13 +434,14 @@ fn open(config: &Config) {
 
 fn main() {
   let config = Config::parse();
+  println!("MVCC: {}", mvcc_label(config.mvcc));
   for section in &config.sections {
     match section.as_str() {
       "paging" => paging(&config),
       "types" => types(&config),
       "hub" => hub(&config),
       "open" => open(&config),
-      other => panic!("unknown section {other}"),
+      _ => unreachable!("sections are checked when parsed"),
     }
   }
 }

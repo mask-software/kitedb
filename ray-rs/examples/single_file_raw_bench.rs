@@ -20,10 +20,17 @@
 //!   --vector-count N           Number of vectors to set (default: 1000)
 //!   --replication-primary      Enable primary replication sidecar on open options
 //!   --replication-segment-max-bytes BYTES  Primary segment rotation threshold when replication is enabled
+//!   --mvcc | --no-mvcc        MVCC mode (default: the library default)
+//!   --skip-checkpoint         Skip the checkpoint after the graph build
+//!   --reopen-readonly         Re-open the database read-only after the checkpoint
+//!                             (skips the write benchmarks)
 //!   --keep-db                 Keep the database file after benchmark
+//!
+//! Unknown options are an error.
 
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::env;
+use std::process::exit;
 use std::time::Instant;
 use tempfile::tempdir;
 
@@ -51,6 +58,8 @@ struct BenchConfig {
   vector_count: usize,
   replication_primary: bool,
   replication_segment_max_bytes: Option<u64>,
+  /// None: the library default.
+  mvcc: Option<bool>,
   keep_db: bool,
   skip_checkpoint: bool,
   reopen_readonly: bool,
@@ -75,11 +84,28 @@ impl Default for BenchConfig {
       vector_count: 1000,
       replication_primary: false,
       replication_segment_max_bytes: None,
+      mvcc: None,
       keep_db: false,
       skip_checkpoint: false,
       reopen_readonly: false,
     }
   }
+}
+
+fn usage_error(message: &str) -> ! {
+  eprintln!("error: {message}");
+  eprintln!("see the header of examples/single_file_raw_bench.rs for the options");
+  exit(2);
+}
+
+fn value<T: std::str::FromStr>(args: &[String], i: &mut usize, flag: &str) -> T {
+  *i += 1;
+  let Some(raw) = args.get(*i) else {
+    usage_error(&format!("{flag} needs a value"));
+  };
+  raw
+    .parse()
+    .unwrap_or_else(|_| usage_error(&format!("invalid value for {flag}: {raw}")))
 }
 
 fn parse_args() -> BenchConfig {
@@ -88,109 +114,43 @@ fn parse_args() -> BenchConfig {
 
   let mut i = 1;
   while i < args.len() {
-    match args[i].as_str() {
-      "--nodes" => {
-        if let Some(value) = args.get(i + 1) {
-          config.nodes = value.parse().unwrap_or(config.nodes);
-          i += 1;
-        }
-      }
-      "--edges" => {
-        if let Some(value) = args.get(i + 1) {
-          config.edges = value.parse().unwrap_or(config.edges);
-          i += 1;
-        }
-      }
-      "--edge-types" => {
-        if let Some(value) = args.get(i + 1) {
-          config.edge_types = value.parse().unwrap_or(config.edge_types);
-          i += 1;
-        }
-      }
-      "--edge-props" => {
-        if let Some(value) = args.get(i + 1) {
-          config.edge_props = value.parse().unwrap_or(config.edge_props);
-          i += 1;
-        }
-      }
-      "--iterations" => {
-        if let Some(value) = args.get(i + 1) {
-          config.iterations = value.parse().unwrap_or(config.iterations);
-          i += 1;
-        }
-      }
-      "--node-batches" => {
-        if let Some(value) = args.get(i + 1) {
-          config.node_batches = value.parse().ok();
-          i += 1;
-        }
-      }
-      "--wal-size" => {
-        if let Some(value) = args.get(i + 1) {
-          config.wal_size = value.parse().unwrap_or(config.wal_size);
-          i += 1;
-        }
-      }
+    let flag = args[i].as_str();
+    match flag {
+      "--nodes" => config.nodes = value(&args, &mut i, flag),
+      "--edges" => config.edges = value(&args, &mut i, flag),
+      "--edge-types" => config.edge_types = value(&args, &mut i, flag),
+      "--edge-props" => config.edge_props = value(&args, &mut i, flag),
+      "--iterations" => config.iterations = value(&args, &mut i, flag),
+      "--node-batches" => config.node_batches = Some(value(&args, &mut i, flag)),
+      "--wal-size" => config.wal_size = value(&args, &mut i, flag),
       "--sync-mode" => {
-        if let Some(value) = args.get(i + 1) {
-          match value.to_lowercase().as_str() {
-            "full" => config.sync_mode = SyncMode::Full,
-            "off" => config.sync_mode = SyncMode::Off,
-            _ => config.sync_mode = SyncMode::Normal,
-          }
-          i += 1;
-        }
+        let mode: String = value(&args, &mut i, flag);
+        config.sync_mode = match mode.to_lowercase().as_str() {
+          "full" => SyncMode::Full,
+          "normal" => SyncMode::Normal,
+          "off" => SyncMode::Off,
+          other => usage_error(&format!(
+            "--sync-mode must be full, normal or off, not {other}"
+          )),
+        };
       }
-      "--group-commit-enabled" => {
-        config.group_commit_enabled = true;
-      }
-      "--group-commit-window-ms" => {
-        if let Some(value) = args.get(i + 1) {
-          config.group_commit_window_ms = value.parse().unwrap_or(config.group_commit_window_ms);
-          i += 1;
-        }
-      }
-      "--checkpoint-threshold" => {
-        if let Some(value) = args.get(i + 1) {
-          config.checkpoint_threshold = value.parse().unwrap_or(config.checkpoint_threshold);
-          i += 1;
-        }
-      }
-      "--no-auto-checkpoint" => {
-        config.auto_checkpoint = false;
-      }
-      "--vector-dims" => {
-        if let Some(value) = args.get(i + 1) {
-          config.vector_dims = value.parse().unwrap_or(config.vector_dims);
-          i += 1;
-        }
-      }
-      "--vector-count" => {
-        if let Some(value) = args.get(i + 1) {
-          config.vector_count = value.parse().unwrap_or(config.vector_count);
-          i += 1;
-        }
-      }
-      "--replication-primary" => {
-        config.replication_primary = true;
-      }
+      "--group-commit-enabled" => config.group_commit_enabled = true,
+      "--group-commit-window-ms" => config.group_commit_window_ms = value(&args, &mut i, flag),
+      "--checkpoint-threshold" => config.checkpoint_threshold = value(&args, &mut i, flag),
+      "--no-auto-checkpoint" => config.auto_checkpoint = false,
+      "--vector-dims" => config.vector_dims = value(&args, &mut i, flag),
+      "--vector-count" => config.vector_count = value(&args, &mut i, flag),
+      "--replication-primary" => config.replication_primary = true,
       "--replication-segment-max-bytes" => {
-        if let Some(value) = args.get(i + 1) {
-          config.replication_segment_max_bytes =
-            value.parse().ok().filter(|parsed: &u64| *parsed > 0);
-          i += 1;
-        }
+        let bytes: u64 = value(&args, &mut i, flag);
+        config.replication_segment_max_bytes = (bytes > 0).then_some(bytes);
       }
-      "--skip-checkpoint" => {
-        config.skip_checkpoint = true;
-      }
-      "--reopen-readonly" => {
-        config.reopen_readonly = true;
-      }
-      "--keep-db" => {
-        config.keep_db = true;
-      }
-      _ => {}
+      "--mvcc" => config.mvcc = Some(true),
+      "--no-mvcc" => config.mvcc = Some(false),
+      "--skip-checkpoint" => config.skip_checkpoint = true,
+      "--reopen-readonly" => config.reopen_readonly = true,
+      "--keep-db" => config.keep_db = true,
+      other => usage_error(&format!("unknown option {other}")),
     }
     i += 1;
   }
@@ -200,6 +160,20 @@ fn parse_args() -> BenchConfig {
   }
 
   config
+}
+
+/// The MVCC mode the bench runs in, for its header.
+fn mvcc_label(requested: Option<bool>) -> String {
+  let on = requested.unwrap_or(SingleFileOpenOptions::new().mvcc);
+  format!(
+    "{}{}",
+    if on { "on" } else { "off" },
+    if requested.is_none() {
+      " (library default)"
+    } else {
+      ""
+    }
+  )
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -670,6 +644,7 @@ fn main() {
   }
   println!("WAL size: {} bytes", format_number(config.wal_size));
   println!("Sync mode: {}", format_sync_mode(config.sync_mode));
+  println!("MVCC: {}", mvcc_label(config.mvcc));
   println!(
     "Group commit: {} (window {}ms)",
     config.group_commit_enabled, config.group_commit_window_ms
@@ -698,6 +673,9 @@ fn main() {
     .checkpoint_threshold(config.checkpoint_threshold)
     .sync_mode(config.sync_mode);
 
+  if let Some(mvcc) = config.mvcc {
+    options = options.mvcc(mvcc);
+  }
   if config.group_commit_enabled {
     options = options
       .group_commit_enabled(true)
@@ -731,9 +709,12 @@ fn main() {
 
   if config.reopen_readonly {
     close_single_file(db).expect("failed to close db before reopen");
-    let read_options = SingleFileOpenOptions::new()
+    let mut read_options = SingleFileOpenOptions::new()
       .read_only(true)
       .create_if_missing(false);
+    if let Some(mvcc) = config.mvcc {
+      read_options = read_options.mvcc(mvcc);
+    }
     db = open_single_file(&db_path, read_options).expect("failed to reopen db");
     println!("  Re-opened database in read-only mode");
   }

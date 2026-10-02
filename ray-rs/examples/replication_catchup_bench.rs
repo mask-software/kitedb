@@ -10,8 +10,12 @@
 //!   --sync-mode MODE      Sync mode: full|normal|off (default: normal)
 //!   --segment-max-bytes N Segment rotation threshold (default: 67108864)
 //!   --retention-min N     Retention minimum entries (default: 20000)
+//!   --mvcc | --no-mvcc    MVCC mode of primary and replica (default: the library default)
+//!
+//! Unknown options are an error.
 
 use std::env;
+use std::process::exit;
 use std::time::{Duration, Instant};
 
 use tempfile::tempdir;
@@ -29,6 +33,8 @@ struct BenchConfig {
   sync_mode: SyncMode,
   segment_max_bytes: u64,
   retention_min_entries: u64,
+  /// None: the library default.
+  mvcc: Option<bool>,
 }
 
 impl Default for BenchConfig {
@@ -40,8 +46,25 @@ impl Default for BenchConfig {
       sync_mode: SyncMode::Normal,
       segment_max_bytes: 64 * 1024 * 1024,
       retention_min_entries: 20_000,
+      mvcc: None,
     }
   }
+}
+
+fn usage_error(message: &str) -> ! {
+  eprintln!("error: {message}");
+  eprintln!("see the header of examples/replication_catchup_bench.rs for the options");
+  exit(2);
+}
+
+fn value<T: std::str::FromStr>(args: &[String], i: &mut usize, flag: &str) -> T {
+  *i += 1;
+  let Some(raw) = args.get(*i) else {
+    usage_error(&format!("{flag} needs a value"));
+  };
+  raw
+    .parse()
+    .unwrap_or_else(|_| usage_error(&format!("invalid value for {flag}: {raw}")))
 }
 
 fn parse_args() -> BenchConfig {
@@ -50,48 +73,27 @@ fn parse_args() -> BenchConfig {
 
   let mut i = 1;
   while i < args.len() {
-    match args[i].as_str() {
-      "--seed-commits" => {
-        if let Some(value) = args.get(i + 1) {
-          config.seed_commits = value.parse().unwrap_or(config.seed_commits);
-          i += 1;
-        }
-      }
-      "--backlog-commits" => {
-        if let Some(value) = args.get(i + 1) {
-          config.backlog_commits = value.parse().unwrap_or(config.backlog_commits);
-          i += 1;
-        }
-      }
-      "--max-frames" => {
-        if let Some(value) = args.get(i + 1) {
-          config.max_frames = value.parse().unwrap_or(config.max_frames);
-          i += 1;
-        }
-      }
+    let flag = args[i].as_str();
+    match flag {
+      "--seed-commits" => config.seed_commits = value(&args, &mut i, flag),
+      "--backlog-commits" => config.backlog_commits = value(&args, &mut i, flag),
+      "--max-frames" => config.max_frames = value(&args, &mut i, flag),
       "--sync-mode" => {
-        if let Some(value) = args.get(i + 1) {
-          config.sync_mode = match value.to_ascii_lowercase().as_str() {
-            "full" => SyncMode::Full,
-            "off" => SyncMode::Off,
-            _ => SyncMode::Normal,
-          };
-          i += 1;
-        }
+        let mode: String = value(&args, &mut i, flag);
+        config.sync_mode = match mode.to_ascii_lowercase().as_str() {
+          "full" => SyncMode::Full,
+          "normal" => SyncMode::Normal,
+          "off" => SyncMode::Off,
+          other => usage_error(&format!(
+            "--sync-mode must be full, normal or off, not {other}"
+          )),
+        };
       }
-      "--segment-max-bytes" => {
-        if let Some(value) = args.get(i + 1) {
-          config.segment_max_bytes = value.parse().unwrap_or(config.segment_max_bytes);
-          i += 1;
-        }
-      }
-      "--retention-min" => {
-        if let Some(value) = args.get(i + 1) {
-          config.retention_min_entries = value.parse().unwrap_or(config.retention_min_entries);
-          i += 1;
-        }
-      }
-      _ => {}
+      "--segment-max-bytes" => config.segment_max_bytes = value(&args, &mut i, flag),
+      "--retention-min" => config.retention_min_entries = value(&args, &mut i, flag),
+      "--mvcc" => config.mvcc = Some(true),
+      "--no-mvcc" => config.mvcc = Some(false),
+      other => usage_error(&format!("unknown option {other}")),
     }
     i += 1;
   }
@@ -116,6 +118,31 @@ fn sync_mode_label(mode: SyncMode) -> &'static str {
   }
 }
 
+/// The MVCC mode the bench runs in, for its header.
+fn mvcc_label(requested: Option<bool>) -> String {
+  let on = requested.unwrap_or(SingleFileOpenOptions::new().mvcc);
+  format!(
+    "{}{}",
+    if on { "on" } else { "off" },
+    if requested.is_none() {
+      " (library default)"
+    } else {
+      ""
+    }
+  )
+}
+
+/// Base open options shared by the primary and the replica.
+fn base_options(config: &BenchConfig) -> SingleFileOpenOptions {
+  let options = SingleFileOpenOptions::new()
+    .sync_mode(config.sync_mode)
+    .auto_checkpoint(false);
+  match config.mvcc {
+    Some(mvcc) => options.mvcc(mvcc),
+    None => options,
+  }
+}
+
 fn throughput(frames: usize, elapsed: Duration) -> f64 {
   if frames == 0 {
     return 0.0;
@@ -135,9 +162,7 @@ fn open_primary(
 ) -> kitedb::Result<SingleFileDB> {
   open_single_file(
     path,
-    SingleFileOpenOptions::new()
-      .sync_mode(config.sync_mode)
-      .auto_checkpoint(false)
+    base_options(config)
       .replication_role(ReplicationRole::Primary)
       .replication_sidecar_path(sidecar)
       .replication_segment_max_bytes(config.segment_max_bytes)
@@ -154,9 +179,7 @@ fn open_replica(
 ) -> kitedb::Result<SingleFileDB> {
   open_single_file(
     path,
-    SingleFileOpenOptions::new()
-      .sync_mode(config.sync_mode)
-      .auto_checkpoint(false)
+    base_options(config)
       .replication_role(ReplicationRole::Replica)
       .replication_sidecar_path(sidecar)
       .replication_source_db_path(source_db_path)
@@ -182,6 +205,7 @@ fn main() -> kitedb::Result<()> {
   let config = parse_args();
   println!("replication_catchup_bench");
   println!("sync_mode: {}", sync_mode_label(config.sync_mode));
+  println!("mvcc: {}", mvcc_label(config.mvcc));
   println!("seed_commits: {}", config.seed_commits);
   println!("backlog_commits: {}", config.backlog_commits);
   println!("max_frames: {}", config.max_frames);

@@ -16,8 +16,12 @@
 //!   --segment-max-bytes N        Sidecar segment rotation threshold (default: 1)
 //!   --retention-min N            Primary retention min entries (default: 64)
 //!   --sync-mode MODE             Sync mode: full|normal|off (default: normal)
+//!   --mvcc | --no-mvcc           MVCC mode of every database (default: the library default)
+//!
+//! Unknown options are an error.
 
 use std::env;
+use std::process::exit;
 use std::time::Instant;
 
 use tempfile::tempdir;
@@ -41,6 +45,8 @@ struct SoakConfig {
   segment_max_bytes: u64,
   retention_min_entries: u64,
   sync_mode: SyncMode,
+  /// None: the library default.
+  mvcc: Option<bool>,
 }
 
 impl Default for SoakConfig {
@@ -58,6 +64,7 @@ impl Default for SoakConfig {
       segment_max_bytes: 1,
       retention_min_entries: 64,
       sync_mode: SyncMode::Normal,
+      mvcc: None,
     }
   }
 }
@@ -67,91 +74,55 @@ struct ReplicaSlot {
   db: SingleFileDB,
 }
 
+fn usage_error(message: &str) -> ! {
+  eprintln!("error: {message}");
+  eprintln!("see the header of examples/replication_soak_bench.rs for the options");
+  exit(2);
+}
+
+fn value<T: std::str::FromStr>(args: &[String], i: &mut usize, flag: &str) -> T {
+  *i += 1;
+  let Some(raw) = args.get(*i) else {
+    usage_error(&format!("{flag} needs a value"));
+  };
+  raw
+    .parse()
+    .unwrap_or_else(|_| usage_error(&format!("invalid value for {flag}: {raw}")))
+}
+
 fn parse_args() -> SoakConfig {
   let mut config = SoakConfig::default();
   let args: Vec<String> = env::args().collect();
 
   let mut i = 1;
   while i < args.len() {
-    match args[i].as_str() {
-      "--replicas" => {
-        if let Some(value) = args.get(i + 1) {
-          config.replicas = value.parse().unwrap_or(config.replicas);
-          i += 1;
-        }
-      }
-      "--cycles" => {
-        if let Some(value) = args.get(i + 1) {
-          config.cycles = value.parse().unwrap_or(config.cycles);
-          i += 1;
-        }
-      }
-      "--commits-per-cycle" => {
-        if let Some(value) = args.get(i + 1) {
-          config.commits_per_cycle = value.parse().unwrap_or(config.commits_per_cycle);
-          i += 1;
-        }
-      }
-      "--active-replicas" => {
-        if let Some(value) = args.get(i + 1) {
-          config.active_replicas_per_cycle =
-            value.parse().unwrap_or(config.active_replicas_per_cycle);
-          i += 1;
-        }
-      }
-      "--churn-interval" => {
-        if let Some(value) = args.get(i + 1) {
-          config.churn_interval = value.parse().unwrap_or(config.churn_interval);
-          i += 1;
-        }
-      }
-      "--promotion-interval" => {
-        if let Some(value) = args.get(i + 1) {
-          config.promotion_interval = value.parse().unwrap_or(config.promotion_interval);
-          i += 1;
-        }
-      }
-      "--reseed-check-interval" => {
-        if let Some(value) = args.get(i + 1) {
-          config.reseed_check_interval = value.parse().unwrap_or(config.reseed_check_interval);
-          i += 1;
-        }
-      }
-      "--max-frames" => {
-        if let Some(value) = args.get(i + 1) {
-          config.max_frames = value.parse().unwrap_or(config.max_frames);
-          i += 1;
-        }
-      }
-      "--recovery-max-loops" => {
-        if let Some(value) = args.get(i + 1) {
-          config.recovery_max_loops = value.parse().unwrap_or(config.recovery_max_loops);
-          i += 1;
-        }
-      }
-      "--segment-max-bytes" => {
-        if let Some(value) = args.get(i + 1) {
-          config.segment_max_bytes = value.parse().unwrap_or(config.segment_max_bytes);
-          i += 1;
-        }
-      }
-      "--retention-min" => {
-        if let Some(value) = args.get(i + 1) {
-          config.retention_min_entries = value.parse().unwrap_or(config.retention_min_entries);
-          i += 1;
-        }
-      }
+    let flag = args[i].as_str();
+    match flag {
+      "--replicas" => config.replicas = value(&args, &mut i, flag),
+      "--cycles" => config.cycles = value(&args, &mut i, flag),
+      "--commits-per-cycle" => config.commits_per_cycle = value(&args, &mut i, flag),
+      "--active-replicas" => config.active_replicas_per_cycle = value(&args, &mut i, flag),
+      "--churn-interval" => config.churn_interval = value(&args, &mut i, flag),
+      "--promotion-interval" => config.promotion_interval = value(&args, &mut i, flag),
+      "--reseed-check-interval" => config.reseed_check_interval = value(&args, &mut i, flag),
+      "--max-frames" => config.max_frames = value(&args, &mut i, flag),
+      "--recovery-max-loops" => config.recovery_max_loops = value(&args, &mut i, flag),
+      "--segment-max-bytes" => config.segment_max_bytes = value(&args, &mut i, flag),
+      "--retention-min" => config.retention_min_entries = value(&args, &mut i, flag),
       "--sync-mode" => {
-        if let Some(value) = args.get(i + 1) {
-          config.sync_mode = match value.to_ascii_lowercase().as_str() {
-            "full" => SyncMode::Full,
-            "off" => SyncMode::Off,
-            _ => SyncMode::Normal,
-          };
-          i += 1;
-        }
+        let mode: String = value(&args, &mut i, flag);
+        config.sync_mode = match mode.to_ascii_lowercase().as_str() {
+          "full" => SyncMode::Full,
+          "normal" => SyncMode::Normal,
+          "off" => SyncMode::Off,
+          other => usage_error(&format!(
+            "--sync-mode must be full, normal or off, not {other}"
+          )),
+        };
       }
-      _ => {}
+      "--mvcc" => config.mvcc = Some(true),
+      "--no-mvcc" => config.mvcc = Some(false),
+      other => usage_error(&format!("unknown option {other}")),
     }
     i += 1;
   }
@@ -176,6 +147,31 @@ fn sync_mode_label(mode: SyncMode) -> &'static str {
   }
 }
 
+/// The MVCC mode the bench runs in, for its header.
+fn mvcc_label(requested: Option<bool>) -> String {
+  let on = requested.unwrap_or(SingleFileOpenOptions::new().mvcc);
+  format!(
+    "{}{}",
+    if on { "on" } else { "off" },
+    if requested.is_none() {
+      " (library default)"
+    } else {
+      ""
+    }
+  )
+}
+
+/// Base open options shared by the primary and the replicas.
+fn base_options(config: &SoakConfig) -> SingleFileOpenOptions {
+  let options = SingleFileOpenOptions::new()
+    .sync_mode(config.sync_mode)
+    .auto_checkpoint(false);
+  match config.mvcc {
+    Some(mvcc) => options.mvcc(mvcc),
+    None => options,
+  }
+}
+
 fn open_primary(
   path: &std::path::Path,
   sidecar: &std::path::Path,
@@ -183,9 +179,7 @@ fn open_primary(
 ) -> kitedb::Result<SingleFileDB> {
   open_single_file(
     path,
-    SingleFileOpenOptions::new()
-      .sync_mode(config.sync_mode)
-      .auto_checkpoint(false)
+    base_options(config)
       .replication_role(ReplicationRole::Primary)
       .replication_sidecar_path(sidecar)
       .replication_segment_max_bytes(config.segment_max_bytes)
@@ -202,9 +196,7 @@ fn open_replica(
 ) -> kitedb::Result<SingleFileDB> {
   open_single_file(
     path,
-    SingleFileOpenOptions::new()
-      .sync_mode(config.sync_mode)
-      .auto_checkpoint(false)
+    base_options(config)
       .replication_role(ReplicationRole::Replica)
       .replication_sidecar_path(sidecar)
       .replication_source_db_path(source_db)
@@ -301,6 +293,7 @@ fn main() -> kitedb::Result<()> {
   let config = parse_args();
   println!("replication_soak_bench");
   println!("sync_mode: {}", sync_mode_label(config.sync_mode));
+  println!("mvcc: {}", mvcc_label(config.mvcc));
   println!("replicas: {}", config.replicas);
   println!("cycles: {}", config.cycles);
   println!("commits_per_cycle: {}", config.commits_per_cycle);

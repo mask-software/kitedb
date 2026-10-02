@@ -14,12 +14,15 @@
 //!   --sync-mode MODE          Sync mode: full|normal|off (default: normal)
 //!   --group-commit-enabled    Enable group commit (default: false)
 //!   --group-commit-window-ms  Group commit window in ms (default: 2)
-//!   --mvcc                    Enable MVCC (default: false; without it, write
-//!                             transactions run one at a time)
+//!   --mvcc | --no-mvcc        MVCC mode (default: the library default; without
+//!                             MVCC, write transactions run one at a time)
 //!   --keep-db                 Keep the database file after benchmark
+//!
+//! Unknown options are an error.
 
 use std::env;
 use std::path::PathBuf;
+use std::process::exit;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -42,7 +45,8 @@ struct BenchConfig {
   sync_mode: SyncMode,
   group_commit_enabled: bool,
   group_commit_window_ms: u64,
-  mvcc: bool,
+  /// None: the library default.
+  mvcc: Option<bool>,
   keep_db: bool,
 }
 
@@ -59,10 +63,26 @@ impl Default for BenchConfig {
       sync_mode: SyncMode::Normal,
       group_commit_enabled: false,
       group_commit_window_ms: 2,
-      mvcc: false,
+      mvcc: None,
       keep_db: false,
     }
   }
+}
+
+fn usage_error(message: &str) -> ! {
+  eprintln!("error: {message}");
+  eprintln!("see the header of examples/multi_writer_throughput_bench.rs for the options");
+  exit(2);
+}
+
+fn value<T: std::str::FromStr>(args: &[String], i: &mut usize, flag: &str) -> T {
+  *i += 1;
+  let Some(raw) = args.get(*i) else {
+    usage_error(&format!("{flag} needs a value"));
+  };
+  raw
+    .parse()
+    .unwrap_or_else(|_| usage_error(&format!("invalid value for {flag}: {raw}")))
 }
 
 fn parse_args() -> BenchConfig {
@@ -71,75 +91,32 @@ fn parse_args() -> BenchConfig {
 
   let mut i = 1;
   while i < args.len() {
-    match args[i].as_str() {
-      "--threads" => {
-        if let Some(value) = args.get(i + 1) {
-          config.threads = value.parse().unwrap_or(config.threads);
-          i += 1;
-        }
-      }
-      "--tx-per-thread" => {
-        if let Some(value) = args.get(i + 1) {
-          config.tx_per_thread = value.parse().unwrap_or(config.tx_per_thread);
-          i += 1;
-        }
-      }
-      "--batch-size" => {
-        if let Some(value) = args.get(i + 1) {
-          config.batch_size = value.parse().unwrap_or(config.batch_size);
-          i += 1;
-        }
-      }
-      "--edges-per-node" => {
-        if let Some(value) = args.get(i + 1) {
-          config.edges_per_node = value.parse().unwrap_or(config.edges_per_node);
-          i += 1;
-        }
-      }
-      "--edge-types" => {
-        if let Some(value) = args.get(i + 1) {
-          config.edge_types = value.parse().unwrap_or(config.edge_types);
-          i += 1;
-        }
-      }
-      "--edge-props" => {
-        if let Some(value) = args.get(i + 1) {
-          config.edge_props = value.parse().unwrap_or(config.edge_props);
-          i += 1;
-        }
-      }
-      "--wal-size" => {
-        if let Some(value) = args.get(i + 1) {
-          config.wal_size = value.parse().unwrap_or(config.wal_size);
-          i += 1;
-        }
-      }
+    let flag = args[i].as_str();
+    match flag {
+      "--threads" => config.threads = value(&args, &mut i, flag),
+      "--tx-per-thread" => config.tx_per_thread = value(&args, &mut i, flag),
+      "--batch-size" => config.batch_size = value(&args, &mut i, flag),
+      "--edges-per-node" => config.edges_per_node = value(&args, &mut i, flag),
+      "--edge-types" => config.edge_types = value(&args, &mut i, flag),
+      "--edge-props" => config.edge_props = value(&args, &mut i, flag),
+      "--wal-size" => config.wal_size = value(&args, &mut i, flag),
       "--sync-mode" => {
-        if let Some(value) = args.get(i + 1) {
-          match value.to_lowercase().as_str() {
-            "full" => config.sync_mode = SyncMode::Full,
-            "off" => config.sync_mode = SyncMode::Off,
-            _ => config.sync_mode = SyncMode::Normal,
-          }
-          i += 1;
-        }
+        let mode: String = value(&args, &mut i, flag);
+        config.sync_mode = match mode.to_lowercase().as_str() {
+          "full" => SyncMode::Full,
+          "normal" => SyncMode::Normal,
+          "off" => SyncMode::Off,
+          other => usage_error(&format!(
+            "--sync-mode must be full, normal or off, not {other}"
+          )),
+        };
       }
-      "--group-commit-enabled" => {
-        config.group_commit_enabled = true;
-      }
-      "--group-commit-window-ms" => {
-        if let Some(value) = args.get(i + 1) {
-          config.group_commit_window_ms = value.parse().unwrap_or(config.group_commit_window_ms);
-          i += 1;
-        }
-      }
-      "--mvcc" => {
-        config.mvcc = true;
-      }
-      "--keep-db" => {
-        config.keep_db = true;
-      }
-      _ => {}
+      "--group-commit-enabled" => config.group_commit_enabled = true,
+      "--group-commit-window-ms" => config.group_commit_window_ms = value(&args, &mut i, flag),
+      "--mvcc" => config.mvcc = Some(true),
+      "--no-mvcc" => config.mvcc = Some(false),
+      "--keep-db" => config.keep_db = true,
+      other => usage_error(&format!("unknown option {other}")),
     }
     i += 1;
   }
@@ -149,6 +126,20 @@ fn parse_args() -> BenchConfig {
   }
 
   config
+}
+
+/// The MVCC mode the bench runs in, for its header.
+fn mvcc_label(requested: Option<bool>) -> String {
+  let on = requested.unwrap_or(SingleFileOpenOptions::new().mvcc);
+  format!(
+    "{}{}",
+    if on { "on" } else { "off" },
+    if requested.is_none() {
+      " (library default)"
+    } else {
+      ""
+    }
+  )
 }
 
 fn format_rate(count: u64, seconds: f64) -> String {
@@ -183,19 +174,21 @@ fn main() {
     "Group commit: {} (window {}ms)",
     config.group_commit_enabled, config.group_commit_window_ms
   );
-  println!("MVCC: {}", config.mvcc);
+  println!("MVCC: {}", mvcc_label(config.mvcc));
   println!("==================================================================");
 
   let temp_dir = tempdir().expect("temp dir");
   let db_path: PathBuf = temp_dir.path().join("multi-writer-throughput.kitedb");
 
-  let open_opts = SingleFileOpenOptions::new()
+  let mut open_opts = SingleFileOpenOptions::new()
     .wal_size(config.wal_size)
     .sync_mode(config.sync_mode)
     .group_commit_enabled(config.group_commit_enabled)
     .group_commit_window_ms(config.group_commit_window_ms)
-    .mvcc(config.mvcc)
     .auto_checkpoint(false);
+  if let Some(mvcc) = config.mvcc {
+    open_opts = open_opts.mvcc(mvcc);
+  }
 
   let db = open_single_file(&db_path, open_opts).expect("open db");
   let db = Arc::new(db);

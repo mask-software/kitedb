@@ -40,6 +40,8 @@ type Args = {
   walSizeMb: number
   checkpointThreshold: number
   backgroundCheckpoint: boolean
+  /** --mvcc / --no-mvcc; undefined: the library default. */
+  mvcc?: boolean
 }
 
 type GraphProfile = {
@@ -99,6 +101,18 @@ function profileDefaults(name: ProfileName): GraphProfile {
   }
 }
 
+function usageError(message: string): never {
+  console.error(`error: ${message}`)
+  console.error('see parseArgs() in benchmark/scip-stress.ts for the options')
+  process.exit(2)
+}
+
+/** The MVCC mode of the run, for its output. */
+function mvccLabel(requested: boolean | undefined): string {
+  if (requested === undefined) return 'on (library default)'
+  return requested ? 'on' : 'off'
+}
+
 function parseArgs(argv: string[]): Args {
   const profile = scanProfile(argv)
   const defaults = profileDefaults(profile)
@@ -134,59 +148,84 @@ function parseArgs(argv: string[]): Args {
     backgroundCheckpoint: process.env.SCIP_BACKGROUND_CHECKPOINT === '1',
   }
 
-  for (let i = 0; i < argv.length; i += 1) {
+  let i = 0
+  const value = (flag: string): string => {
+    const raw = argv[++i]
+    if (raw === undefined) usageError(`${flag} needs a value`)
+    return raw
+  }
+  const int = (flag: string): number => {
+    const raw = value(flag)
+    if (!/^\d+$/.test(raw)) usageError(`invalid value for ${flag}: ${raw}`)
+    return Number.parseInt(raw, 10)
+  }
+  const float = (flag: string): number => {
+    const raw = value(flag)
+    const parsed = Number(raw)
+    if (raw.trim() === '' || !Number.isFinite(parsed)) usageError(`invalid value for ${flag}: ${raw}`)
+    return parsed
+  }
+  const choice = <T extends string>(flag: string, allowed: readonly T[]): T => {
+    const raw = value(flag)
+    if (!(allowed as readonly string[]).includes(raw)) {
+      usageError(`${flag} must be one of ${allowed.join(', ')}, not ${raw}`)
+    }
+    return raw as T
+  }
+
+  for (; i < argv.length; i += 1) {
     const arg = argv[i]
     switch (arg) {
       case '--repo':
-        args.repo = argv[++i]
+        args.repo = value(arg)
         break
       case '--scip':
-        args.scipPath = argv[++i]
+        args.scipPath = value(arg)
         break
       case '--scip-base':
-        args.scipBasePath = argv[++i]
+        args.scipBasePath = value(arg)
         break
       case '--scip-next':
-        args.scipNextPath = argv[++i]
+        args.scipNextPath = value(arg)
         break
       case '--db':
-        args.dbPath = argv[++i]
+        args.dbPath = value(arg)
         break
       case '--mode':
-        args.mode = (argv[++i] as Mode) ?? 'clean'
+        args.mode = choice<Mode>(arg, ['clean', 'incremental'])
         break
       case '--profile':
-        args.profile = (argv[++i] as ProfileName) ?? args.profile
+        args.profile = choice<ProfileName>(arg, ['minimal', 'argus', 'argus-fast'])
         break
       case '--edge-cleanup':
-        args.edgeCleanup = (argv[++i] as EdgeCleanup) ?? args.edgeCleanup
+        args.edgeCleanup = choice<EdgeCleanup>(arg, ['clear', 'allowlist'])
         break
       case '--chunk-target':
-        args.chunkTarget = Number.parseInt(argv[++i] ?? String(args.chunkTarget), 10)
+        args.chunkTarget = int(arg)
         break
       case '--chunk-max':
-        args.chunkMax = Number.parseInt(argv[++i] ?? String(args.chunkMax), 10)
+        args.chunkMax = int(arg)
         break
       case '--import-edges':
-        args.importEdges = Number.parseInt(argv[++i] ?? String(args.importEdges), 10)
+        args.importEdges = int(arg)
         break
       case '--export-symbols':
-        args.exportSymbols = Number.parseInt(argv[++i] ?? String(args.exportSymbols), 10)
+        args.exportSymbols = int(arg)
         break
       case '--call-edges':
-        args.callEdgesPerChunk = Number.parseInt(argv[++i] ?? String(args.callEdgesPerChunk), 10)
+        args.callEdgesPerChunk = int(arg)
         break
       case '--node-props':
-        args.nodeProps = Number.parseInt(argv[++i] ?? String(args.nodeProps), 10)
+        args.nodeProps = int(arg)
         break
       case '--edge-props':
-        args.edgeProps = Number.parseInt(argv[++i] ?? String(args.edgeProps), 10)
+        args.edgeProps = int(arg)
         break
       case '--indexer':
-        args.indexer = argv[++i] ?? args.indexer
+        args.indexer = value(arg)
         break
       case '--indexer-args':
-        args.indexerArgs = (argv[++i] ?? '')
+        args.indexerArgs = value(arg)
           .split(' ')
           .map((item) => item.trim())
           .filter(Boolean)
@@ -195,10 +234,10 @@ function parseArgs(argv: string[]): Args {
         args.skipIndex = true
         break
       case '--batch-size':
-        args.batchSize = Number.parseInt(argv[++i] ?? String(args.batchSize), 10)
+        args.batchSize = int(arg)
         break
       case '--file-batch':
-        args.fileBatch = Number.parseInt(argv[++i] ?? String(args.fileBatch), 10)
+        args.fileBatch = int(arg)
         break
       case '--retry-batch':
         args.retryBatch = true
@@ -207,22 +246,28 @@ function parseArgs(argv: string[]): Args {
         args.retryBatch = false
         break
       case '--change-ratio':
-        args.changeRatio = Number.parseFloat(argv[++i] ?? String(args.changeRatio))
+        args.changeRatio = float(arg)
         break
       case '--delete-ratio':
-        args.deleteRatio = Number.parseFloat(argv[++i] ?? String(args.deleteRatio))
+        args.deleteRatio = float(arg)
         break
       case '--wal-size-mb':
-        args.walSizeMb = Number.parseInt(argv[++i] ?? String(args.walSizeMb), 10)
+        args.walSizeMb = int(arg)
         break
       case '--checkpoint-threshold':
-        args.checkpointThreshold = Number.parseFloat(argv[++i] ?? String(args.checkpointThreshold))
+        args.checkpointThreshold = float(arg)
         break
       case '--background-checkpoint':
         args.backgroundCheckpoint = true
         break
-      default:
+      case '--mvcc':
+        args.mvcc = true
         break
+      case '--no-mvcc':
+        args.mvcc = false
+        break
+      default:
+        usageError(`unknown option ${arg}`)
     }
   }
 
@@ -531,6 +576,8 @@ function openDb(dbPath: string, args: Args): Database {
     autoCheckpoint: true,
     checkpointThreshold: args.checkpointThreshold,
     backgroundCheckpoint: args.backgroundCheckpoint,
+    // Passed only when given, so the run gets the library default.
+    ...(args.mvcc === undefined ? {} : { mvcc: args.mvcc }),
   })
 }
 
@@ -1025,6 +1072,7 @@ function incrementalGraphDiff(
 
 function main(): void {
   const args = parseArgs(process.argv.slice(2))
+  console.log(`[db] mvcc=${mvccLabel(args.mvcc)}`)
   const profile = resolveProfile(args)
   const fileBatch = normalizeFileBatch(args.fileBatch)
   const autoCommitOps = fileBatch === 0

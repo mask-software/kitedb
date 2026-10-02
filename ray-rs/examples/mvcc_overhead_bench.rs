@@ -49,8 +49,11 @@
 //!   --wal-mb N            WAL size per database in MiB (default: 4096). Nothing
 //!                         checkpoints during the run, so every commit stays in
 //!                         the WAL; the file is sparse, so only written bytes count.
+//!
+//! Unknown options are an error.
 
 use std::env;
+use std::process::exit;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Barrier};
 use std::thread;
@@ -148,12 +151,26 @@ named_enum!(ReadOp {
 });
 named_enum!(WriteOp { UpdateProp => "update_prop", Insert => "insert" });
 
-fn parse_list<T>(value: &str, parse: impl Fn(&str) -> Option<T>) -> Vec<T> {
+fn usage_error(message: &str) -> ! {
+  eprintln!("error: {message}");
+  eprintln!("see the header of examples/mvcc_overhead_bench.rs for the options");
+  exit(2);
+}
+
+fn number<T: std::str::FromStr>(flag: &str, value: &str) -> T {
+  value
+    .parse()
+    .unwrap_or_else(|_| usage_error(&format!("invalid value for {flag}: {value}")))
+}
+
+fn parse_list<T>(flag: &str, value: &str, parse: impl Fn(&str) -> Option<T>) -> Vec<T> {
   value
     .split(',')
     .map(str::trim)
     .filter(|item| !item.is_empty())
-    .map(|item| parse(item).unwrap_or_else(|| panic!("unknown list item: {item}")))
+    .map(|item| {
+      parse(item).unwrap_or_else(|| usage_error(&format!("{flag}: unknown list item {item}")))
+    })
     .collect()
 }
 
@@ -162,32 +179,39 @@ fn parse_args() -> BenchConfig {
   let args: Vec<String> = env::args().collect();
   let mut i = 1;
   while i < args.len() {
+    let flag = args[i].as_str();
     let value = args.get(i + 1).map(String::as_str);
-    match (args[i].as_str(), value) {
-      ("--nodes", Some(v)) => config.nodes = v.parse().expect("--nodes"),
-      ("--edges-per-node", Some(v)) => config.edges_per_node = v.parse().expect("--edges-per-node"),
-      ("--props-per-node", Some(v)) => config.props_per_node = v.parse().expect("--props-per-node"),
-      ("--threads", Some(v)) => config.threads = parse_list(v, |t| t.parse().ok()),
-      ("--duration-ms", Some(v)) => {
-        config.duration = Duration::from_millis(v.parse().expect("--duration-ms"))
-      }
-      ("--repeat", Some(v)) => config.repeat = v.parse().expect("--repeat"),
-      ("--modes", Some(v)) => config.modes = parse_list(v, Mode::parse),
-      ("--sections", Some(v)) => config.sections = parse_list(v, Section::parse),
-      ("--ops", Some(v)) => config.ops = parse_list(v, ReadOp::parse),
-      ("--write-ops", Some(v)) => config.write_ops = parse_list(v, WriteOp::parse),
-      ("--history-nodes", Some(v)) => config.history_nodes = v.parse().expect("--history-nodes"),
-      ("--history-rounds", Some(v)) => config.history_rounds = v.parse().expect("--history-rounds"),
-      ("--wal-mb", Some(v)) => config.wal_mb = v.parse().expect("--wal-mb"),
+    match (flag, value) {
+      ("--nodes", Some(v)) => config.nodes = number(flag, v),
+      ("--edges-per-node", Some(v)) => config.edges_per_node = number(flag, v),
+      ("--props-per-node", Some(v)) => config.props_per_node = number(flag, v),
+      ("--threads", Some(v)) => config.threads = parse_list(flag, v, |t| t.parse().ok()),
+      ("--duration-ms", Some(v)) => config.duration = Duration::from_millis(number(flag, v)),
+      ("--repeat", Some(v)) => config.repeat = number(flag, v),
+      ("--modes", Some(v)) => config.modes = parse_list(flag, v, Mode::parse),
+      ("--sections", Some(v)) => config.sections = parse_list(flag, v, Section::parse),
+      ("--ops", Some(v)) => config.ops = parse_list(flag, v, ReadOp::parse),
+      ("--write-ops", Some(v)) => config.write_ops = parse_list(flag, v, WriteOp::parse),
+      ("--history-nodes", Some(v)) => config.history_nodes = number(flag, v),
+      ("--history-rounds", Some(v)) => config.history_rounds = number(flag, v),
+      ("--wal-mb", Some(v)) => config.wal_mb = number(flag, v),
       ("--sync-mode", Some(v)) => {
         config.sync_mode = match v {
           "off" => SyncMode::Off,
           "normal" => SyncMode::Normal,
           "full" => SyncMode::Full,
-          other => panic!("unknown sync mode: {other}"),
+          other => usage_error(&format!(
+            "--sync-mode must be off, normal or full, not {other}"
+          )),
         }
       }
-      (flag, _) => panic!("unknown or incomplete option: {flag}"),
+      (
+        "--nodes" | "--edges-per-node" | "--props-per-node" | "--threads" | "--duration-ms"
+        | "--repeat" | "--modes" | "--sections" | "--ops" | "--write-ops" | "--history-nodes"
+        | "--history-rounds" | "--wal-mb" | "--sync-mode",
+        None,
+      ) => usage_error(&format!("{flag} needs a value")),
+      (other, _) => usage_error(&format!("unknown option {other}")),
     }
     i += 2;
   }
@@ -662,8 +686,14 @@ fn main() {
   prefer_performance_cores();
   let config = parse_args();
   println!(
-    "mvcc_overhead_bench: nodes={} edges/node={} props/node={} duration={:?} repeat={} \
-     history={}x{} sync={:?} cpus={}",
+    "mvcc_overhead_bench: modes={} nodes={} edges/node={} props/node={} duration={:?} \
+     repeat={} history={}x{} sync={:?} cpus={}",
+    config
+      .modes
+      .iter()
+      .map(|mode| mode.name())
+      .collect::<Vec<_>>()
+      .join(","),
     config.nodes,
     config.edges_per_node,
     config.props_per_node,

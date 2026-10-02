@@ -9,6 +9,10 @@
 //! Usage:
 //!   cargo run --release --example ray_vs_memgraph_bench --no-default-features -- \
 //!     --nodes 10000 --edges 20000 --query-results 10 --iterations 5000
+//!
+//! `--help` lists the options (among them `--mvcc` / `--no-mvcc`, the MVCC
+//! mode of the RayDB side; default: the library default). Unknown options are
+//! an error.
 
 use std::collections::HashSet;
 use std::env;
@@ -37,6 +41,8 @@ struct BenchConfig {
   memgraph_uri: String,
   memgraph_user: String,
   memgraph_password: String,
+  /// None: the library default.
+  mvcc: Option<bool>,
   keep_db: bool,
 }
 
@@ -53,6 +59,7 @@ impl Default for BenchConfig {
       memgraph_uri: "127.0.0.1:7687".to_string(),
       memgraph_user: String::new(),
       memgraph_password: String::new(),
+      mvcc: None,
       keep_db: false,
     }
   }
@@ -182,6 +189,12 @@ fn parse_args() -> Result<BenchConfig, String> {
           .ok_or("--memgraph-password requires value")?
           .to_string();
       }
+      "--mvcc" => {
+        cfg.mvcc = Some(true);
+      }
+      "--no-mvcc" => {
+        cfg.mvcc = Some(false);
+      }
       "--keep-db" => {
         cfg.keep_db = true;
       }
@@ -233,7 +246,22 @@ fn print_help() {
   println!("  --memgraph-uri URI     Memgraph Bolt URI (default: 127.0.0.1:7687)");
   println!("  --memgraph-user USER   Memgraph username (default: empty)");
   println!("  --memgraph-password P  Memgraph password (default: empty)");
+  println!("  --mvcc | --no-mvcc     RayDB MVCC mode (default: the library default)");
   println!("  --keep-db              Keep local RayDB file");
+}
+
+/// The MVCC mode of the RayDB side, for the header.
+fn mvcc_label(requested: Option<bool>) -> String {
+  let on = requested.unwrap_or(SingleFileOpenOptions::new().mvcc);
+  format!(
+    "{}{}",
+    if on { "on" } else { "off" },
+    if requested.is_none() {
+      " (library default)"
+    } else {
+      ""
+    }
+  )
 }
 
 fn format_latency(ns: u128) -> String {
@@ -306,9 +334,12 @@ fn ingest_raydb(
   edges: &[(usize, usize)],
 ) -> Result<(u128, ETypeId), Box<dyn Error>> {
   let started = Instant::now();
-  let options = SingleFileOpenOptions::new()
+  let mut options = SingleFileOpenOptions::new()
     .sync_mode(SyncMode::Normal)
     .create_if_missing(true);
+  if let Some(mvcc) = cfg.mvcc {
+    options = options.mvcc(mvcc);
+  }
   let db = open_single_file(raydb_path, options)?;
 
   db.begin_bulk()?;
@@ -346,10 +377,13 @@ fn benchmark_raydb_query(
 ) -> Result<(LatencyStats, usize), Box<dyn Error>> {
   let user = NodeDef::new("User", "user:");
   let knows = EdgeDef::new("KNOWS");
-  let options = KiteOptions::new()
+  let mut options = KiteOptions::new()
     .node(user)
     .edge(knows)
     .sync_mode(SyncMode::Normal);
+  if let Some(mvcc) = cfg.mvcc {
+    options = options.mvcc(mvcc);
+  }
   let kite = Kite::open(raydb_path, options)?;
   let alice = kite
     .raw()
@@ -484,8 +518,7 @@ async fn benchmark_memgraph_query(
   Ok((compute_stats(&mut samples), result_count))
 }
 
-async fn async_main() -> Result<(), Box<dyn Error>> {
-  let cfg = parse_args().map_err(|e| format!("argument error: {e}"))?;
+async fn async_main(cfg: BenchConfig) -> Result<(), Box<dyn Error>> {
   let (keys, edges) = build_workload(&cfg);
 
   let temp = tempdir()?;
@@ -500,6 +533,7 @@ async fn async_main() -> Result<(), Box<dyn Error>> {
     format_number(cfg.iterations),
     format_number(cfg.warmup)
   );
+  println!("RayDB MVCC: {}", mvcc_label(cfg.mvcc));
   println!();
 
   let (ray_ingest_ms, _knows_id) = ingest_raydb(&raydb_path, &cfg, &keys, &edges)?;
@@ -561,8 +595,13 @@ fn persist_temp(temp: TempDir, raydb_path: &std::path::Path) -> Result<(), Box<d
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+  let cfg = parse_args().unwrap_or_else(|error| {
+    eprintln!("error: {error}");
+    eprintln!("run with --help, or see the header of examples/ray_vs_memgraph_bench.rs");
+    std::process::exit(2);
+  });
   let rt = tokio::runtime::Builder::new_current_thread()
     .enable_all()
     .build()?;
-  rt.block_on(async_main())
+  rt.block_on(async_main(cfg))
 }

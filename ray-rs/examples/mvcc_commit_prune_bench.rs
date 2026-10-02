@@ -17,8 +17,11 @@
 //! Options:
 //!   --keys N      Committed write keys pinned by the reader (default: 120000)
 //!   --commits N   Measured commits (default: 2000)
+//!
+//! The `db` level always opens with `.mvcc(true)`. Unknown options are an error.
 
 use std::env;
+use std::process::exit;
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -36,6 +39,12 @@ struct BenchConfig {
   commits: usize,
 }
 
+fn usage_error(message: &str) -> ! {
+  eprintln!("error: {message}");
+  eprintln!("see the header of examples/mvcc_commit_prune_bench.rs for the options");
+  exit(2);
+}
+
 fn parse_args() -> BenchConfig {
   let mut config = BenchConfig {
     keys: 120_000,
@@ -44,11 +53,16 @@ fn parse_args() -> BenchConfig {
   let args: Vec<String> = env::args().collect();
   let mut i = 1;
   while i < args.len() {
-    let value = args.get(i + 1).map(String::as_str);
-    match (args[i].as_str(), value) {
-      ("--keys", Some(v)) => config.keys = v.parse().expect("--keys"),
-      ("--commits", Some(v)) => config.commits = v.parse().expect("--commits"),
-      (flag, _) => panic!("unknown or incomplete option: {flag}"),
+    let flag = args[i].as_str();
+    let number = |v: &str| -> usize {
+      v.parse()
+        .unwrap_or_else(|_| usage_error(&format!("invalid value for {flag}: {v}")))
+    };
+    match (flag, args.get(i + 1).map(String::as_str)) {
+      ("--keys", Some(v)) => config.keys = number(v),
+      ("--commits", Some(v)) => config.commits = number(v),
+      ("--keys" | "--commits", None) => usage_error(&format!("{flag} needs a value")),
+      (other, _) => usage_error(&format!("unknown option {other}")),
     }
     i += 2;
   }
@@ -176,7 +190,8 @@ fn main() {
   prefer_performance_cores();
   let config = parse_args();
   println!(
-    "mvcc_commit_prune_bench: keys={} commits={} (one reader open throughout)",
+    "mvcc_commit_prune_bench: keys={} commits={} db mvcc=on (explicit; one reader open \
+     throughout)",
     config.keys, config.commits
   );
   bench_tx_manager(&config);

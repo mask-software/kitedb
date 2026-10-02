@@ -1,3 +1,20 @@
+//! Snapshot CRC chunk-size sweep: snapshot parse and CRC time, and open/close
+//! time, of a checkpointed vector fixture for several CRC chunk sizes.
+//!
+//! Usage:
+//!   cargo run --release --example open_crc_sweep --no-default-features -- [options]
+//!
+//! Options:
+//!   --mvcc | --no-mvcc   MVCC mode of the fixture build and the timed opens
+//!                        (default: the library default)
+//!
+//! Unknown options are an error. Environment:
+//!   OPEN_CRC_SWEEP_VERBOSE       1|true|yes or 0|false|no (default: true)
+//!   OPEN_CRC_SWEEP_OPEN_ROUNDS   Open/close rounds per chunk size (default: 20)
+//!   OPEN_CRC_SWEEP_PARSE_ROUNDS  Parse rounds per chunk size (default: 40)
+//!   OPEN_CRC_SWEEP_NODES         Fixture nodes (default: 10000)
+//!   OPEN_CRC_SWEEP_DIM           Fixture vector dimensions (default: 128)
+
 use kitedb::core::single_file::{
   close_single_file, open_single_file, SingleFileOpenOptions, SyncMode,
 };
@@ -6,6 +23,7 @@ use kitedb::types::{DbHeaderV1, SectionId, SnapshotFlags};
 use kitedb::util::mmap::map_file;
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::process::exit;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -27,34 +45,82 @@ struct SampleSet {
   crc_ns: Vec<u64>,
 }
 
+fn usage_error(message: &str) -> ! {
+  eprintln!("error: {message}");
+  eprintln!("see the header of examples/open_crc_sweep.rs for the options");
+  exit(2);
+}
+
+/// `--mvcc` / `--no-mvcc`, the last one given wins; None: the library default.
+fn parse_args() -> Option<bool> {
+  let mut mvcc = None;
+  for arg in std::env::args().skip(1) {
+    match arg.as_str() {
+      "--mvcc" => mvcc = Some(true),
+      "--no-mvcc" => mvcc = Some(false),
+      other => usage_error(&format!("unknown option {other}")),
+    }
+  }
+  mvcc
+}
+
 fn parse_bool_env(name: &str, default: bool) -> bool {
-  std::env::var(name)
-    .ok()
-    .map(|value| {
-      let value = value.to_ascii_lowercase();
-      value == "1" || value == "true" || value == "yes"
-    })
-    .unwrap_or(default)
+  match std::env::var(name) {
+    Ok(value) => match value.to_ascii_lowercase().as_str() {
+      "1" | "true" | "yes" => true,
+      "0" | "false" | "no" => false,
+      _ => usage_error(&format!(
+        "{name} must be 1|true|yes or 0|false|no, not {value}"
+      )),
+    },
+    Err(_) => default,
+  }
 }
 
 fn parse_usize_env(name: &str, default: usize) -> usize {
-  std::env::var(name)
-    .ok()
-    .and_then(|value| value.parse::<usize>().ok())
-    .unwrap_or(default)
+  match std::env::var(name) {
+    Ok(value) => value
+      .parse()
+      .unwrap_or_else(|_| usage_error(&format!("invalid value for {name}: {value}"))),
+    Err(_) => default,
+  }
 }
 
-fn fixture_open_options() -> SingleFileOpenOptions {
-  SingleFileOpenOptions::new()
+/// The MVCC mode the sweep runs in, for its output.
+fn mvcc_label(requested: Option<bool>) -> String {
+  let on = requested.unwrap_or(SingleFileOpenOptions::new().mvcc);
+  format!(
+    "{}{}",
+    if on { "on" } else { "off" },
+    if requested.is_none() {
+      " (library default)"
+    } else {
+      ""
+    }
+  )
+}
+
+fn fixture_open_options(mvcc: Option<bool>) -> SingleFileOpenOptions {
+  let options = SingleFileOpenOptions::new()
     .sync_mode(SyncMode::Normal)
     .wal_size(128 * 1024 * 1024)
     .auto_checkpoint(false)
     .background_checkpoint(false)
-    .disable_checkpoint_compression()
+    .disable_checkpoint_compression();
+  match mvcc {
+    Some(mvcc) => options.mvcc(mvcc),
+    None => options,
+  }
 }
 
-fn build_vector_fixture(path: &Path, node_count: usize, vector_dim: usize, verbose: bool) {
-  let db = open_single_file(path, fixture_open_options()).expect("open fixture db");
+fn build_vector_fixture(
+  path: &Path,
+  node_count: usize,
+  vector_dim: usize,
+  verbose: bool,
+  mvcc: Option<bool>,
+) {
+  let db = open_single_file(path, fixture_open_options(mvcc)).expect("open fixture db");
 
   db.begin(false).expect("begin");
   let prop_key_id = db.define_propkey("embedding").expect("define propkey");
@@ -203,28 +269,30 @@ fn sample_parse_crc(
   (parse_ns, profile.total_ns)
 }
 
-fn sample_open_close(path: &Path, chunk: Option<usize>) -> u64 {
+fn sample_open_close(path: &Path, chunk: Option<usize>, mvcc: Option<bool>) -> u64 {
   match chunk {
     Some(bytes) => std::env::set_var("KITEDB_SNAPSHOT_CRC_CHUNK_BYTES", bytes.to_string()),
     None => std::env::remove_var("KITEDB_SNAPSHOT_CRC_CHUNK_BYTES"),
   }
 
   let start = Instant::now();
-  let db = open_single_file(path, fixture_open_options()).expect("open");
+  let db = open_single_file(path, fixture_open_options(mvcc)).expect("open");
   close_single_file(db).expect("close");
   start.elapsed().as_nanos() as u64
 }
 
 fn main() {
+  let mvcc = parse_args();
   let verbose = parse_bool_env("OPEN_CRC_SWEEP_VERBOSE", true);
   let open_rounds = parse_usize_env("OPEN_CRC_SWEEP_OPEN_ROUNDS", OPEN_ROUNDS);
   let parse_rounds = parse_usize_env("OPEN_CRC_SWEEP_PARSE_ROUNDS", PARSE_ROUNDS);
   let node_count = parse_usize_env("OPEN_CRC_SWEEP_NODES", DEFAULT_NODE_COUNT);
   let vector_dim = parse_usize_env("OPEN_CRC_SWEEP_DIM", DEFAULT_VECTOR_DIM);
+  println!("[open_crc_sweep] MVCC: {}", mvcc_label(mvcc));
 
   let temp_dir = tempfile::tempdir().expect("temp dir");
   let path: PathBuf = temp_dir.path().join("open-crc-sweep.kitedb");
-  build_vector_fixture(&path, node_count, vector_dim, verbose);
+  build_vector_fixture(&path, node_count, vector_dim, verbose, mvcc);
   let (snapshot_offset, mmap) = read_snapshot_offset(&path);
   let baseline_snapshot = SnapshotData::parse_at_offset(
     Arc::clone(&mmap),
@@ -273,7 +341,7 @@ fn main() {
 
   for _ in 0..open_rounds {
     for (i, chunk) in chunks.iter().enumerate() {
-      let open_ns = sample_open_close(&path, chunk.bytes);
+      let open_ns = sample_open_close(&path, chunk.bytes, mvcc);
       samples[i].open_close_ns.push(open_ns);
     }
   }
