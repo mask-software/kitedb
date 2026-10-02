@@ -2001,3 +2001,8 @@ mod tests {
     close_single_file(reopened).expect("expected value");
   }
 }
+
+/// raydb-b4 sigbus: the replica's lockless view of a live primary file.
+#[cfg(test)]
+#[path = "b4_sigbus_tests.rs"]
+mod b4_sigbus_tests;
