@@ -236,12 +236,21 @@ const hits = index.search(queryVector, {
 
 			<h2 id="indexing">Vector indexing</h2>
 			<CodeBlock
-				code={`// ivf.seed (optional) makes builds reproducible: the same vectors give
-// the same index on any machine
-const index = createVectorIndex({ dimensions: 1536, ivf: { seed: 42 } });
+				code={`import { AnnAlgorithm, createVectorIndex } from '@kitedb/core';
 
-// Build or rebuild the ANN index (IVF-PQ by default) for faster search
+const index = createVectorIndex({
+  dimensions: 1536,
+  // ivf.seed (optional) makes builds reproducible: the same vectors give
+  // the same index on any machine
+  ivf: { seed: 42 },
+  // AnnAlgorithm.Auto (default): plain IVF below 50,000 vectors or 512
+  // dimensions, IVF-PQ from there on; or force AnnAlgorithm.Ivf / IvfPq
+  annAlgorithm: AnnAlgorithm.Auto,
+});
+
+// Build or rebuild the ANN index for faster search
 index.buildIndex();
+index.stats().indexAlgorithm; // 'ivf' or 'ivf_pq'
 
 // Or build on the libuv thread pool without blocking the event loop
 await index.buildIndexAsync();`}

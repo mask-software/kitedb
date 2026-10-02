@@ -131,9 +131,9 @@ cargo run --release --example vector_bench --no-default-features -- \
 
 `vector_bench` builds `VectorIndex` with its default ANN algorithm and has no
 flag to choose another. That default changed from IVF to IVF-PQ on 2026-02-08
-(commit `b90b91e`), so this command now measures IVF-PQ. The published vector
-results (2026-02-03) were measured with IVF; to reproduce them, run the command
-from a checkout before that commit (for example `git checkout b90b91e~1`).
+(commit `b90b91e`), and then to `auto`, which builds plain IVF below 50,000
+vectors or 512 dimensions and IVF-PQ from there on. With 10,000 vectors this
+command measures IVF again, as the published vector results (2026-02-03) did.
 
 ### Vector compaction strategy (Rust)
 
@@ -198,6 +198,9 @@ Latest matrix snapshot (2026-02-08, 20k vectors, 384 dims, 200 queries, k=10):
 - IVF-PQ build time was much higher than IVF in this baseline.
 - Current recommendation: use latency-first IVF-PQ as default ANN path with
   `residuals=false`, `pq_subspaces=48`, `pq_centroids=256`; monitor recall floor via ANN gate.
+  (Superseded: `VectorIndex` now defaults to `auto`, plain IVF below 50,000 vectors or 512
+  dimensions and IVF-PQ from there on, and IVF-PQ re-ranks its best candidates by exact
+  distance. See the CHANGELOG.)
 
 PQ tuning sweep:
 
@@ -803,9 +806,9 @@ Raw log: `docs/benchmarks/results/2026-02-03-vector-bench-rust.txt`
 
 `build_index()`: 801.95ms (one build, so no percentiles).
 
-These numbers are for IVF. Since 2026-02-08 (commit `b90b91e`) `vector_bench`
-builds IVF-PQ, the new default, so rerunning it on current code does not
-reproduce this table. See "Vector index (Rust)" under Running Benchmarks.
+These numbers are for IVF, which `vector_bench` builds again at this size now
+that the default is `auto` (between 2026-02-08, commit `b90b91e`, and that
+change it built IVF-PQ). See "Vector index (Rust)" under Running Benchmarks.
 
 ## Notes
 
