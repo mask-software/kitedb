@@ -437,8 +437,9 @@ impl SingleFileDB {
   }
 
   /// The blocking checkpoint, for a caller that holds the checkpoint gate
-  /// while no transaction is open.
-  fn checkpoint_holding_gate(&self) -> Result<()> {
+  /// while no transaction is open. Holding the gate on afterwards keeps the
+  /// WAL empty for work that needs it so (see `resize_wal`).
+  pub(crate) fn checkpoint_holding_gate(&self) -> Result<()> {
     let graph = self.collect_graph_data()?;
     let header = self.header.read().clone();
     let generation = header.active_snapshot_gen + 1;

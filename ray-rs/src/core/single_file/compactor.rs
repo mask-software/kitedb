@@ -248,8 +248,10 @@ impl SingleFileDB {
   /// Resize the WAL region (single-file only).
   ///
   /// This operation is offline (no active transactions). By default it
-  /// checkpoints to clear WAL before resizing. The snapshot moves to directly
-  /// after the resized WAL; see `compact` for the crash protocol.
+  /// checkpoints to clear WAL before resizing, under the same hold of the
+  /// checkpoint gate, so no commit can refill the WAL in between. The
+  /// snapshot moves to directly after the resized WAL; see `compact` for the
+  /// crash protocol.
   pub fn resize_wal(&self, wal_size_bytes: usize, options: Option<ResizeWalOptions>) -> Result<()> {
     if self.read_only {
       return Err(KiteError::ReadOnly);
@@ -265,11 +267,10 @@ impl SingleFileDB {
       return Err(KiteError::Internal("WAL size must be > 0".to_string()));
     }
 
-    if options.checkpoint {
-      self.checkpoint()?;
-    }
-
     let _checkpoint_gate = self.exclusive_checkpoint_gate()?;
+    if options.checkpoint {
+      self.checkpoint_holding_gate()?;
+    }
 
     let header = self.header.read().clone();
     let wal_is_empty =
@@ -904,5 +905,108 @@ mod tests {
       Some(before),
       "vacuum dropped a vector committed since the last checkpoint"
     );
+  }
+
+  /// `resize_wal` with `checkpoint: true` must checkpoint and resize as one
+  /// step. Regression: it checkpointed, released the gate, then took it again
+  /// to resize, so a concurrent commit in between failed the resize with
+  /// "WAL must be empty before resize".
+  #[test]
+  fn resize_wal_with_checkpoint_succeeds_under_concurrent_writes() {
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    use std::sync::Arc;
+
+    let temp_dir = tempdir().expect("temp dir");
+    let db_path = temp_dir.path().join("resize-concurrent.kitedb");
+    let small = 64 * 1024;
+    let large = 128 * 1024;
+    let db = Arc::new(
+      open_single_file(
+        &db_path,
+        SingleFileOpenOptions::new()
+          .wal_size(small)
+          .auto_checkpoint(false),
+      )
+      .expect("open"),
+    );
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+      let db = Arc::clone(&db);
+      let stop = Arc::clone(&stop);
+      std::thread::spawn(move || {
+        let mut index = 0u64;
+        while !stop.load(AtomicOrdering::Relaxed) {
+          db.begin(false).expect("writer begin");
+          db.create_node(Some(&format!("w-{index}")))
+            .expect("writer create");
+          db.commit().expect("writer commit");
+          index += 1;
+        }
+        index
+      })
+    };
+
+    let mut failures = Vec::new();
+    for attempt in 0..30 {
+      let target = if attempt % 2 == 0 { large } else { small };
+      if let Err(error) = db.resize_wal(
+        target,
+        Some(ResizeWalOptions {
+          allow_shrink: true,
+          checkpoint: true,
+        }),
+      ) {
+        failures.push(format!("resize #{attempt} to {target}: {error}"));
+      }
+    }
+    stop.store(true, AtomicOrdering::Relaxed);
+    let committed = writer.join().expect("writer thread");
+
+    assert!(
+      failures.is_empty(),
+      "resize_wal(checkpoint: true) failed under concurrent writes ({} of 30, {committed} writer commits): {:?}",
+      failures.len(),
+      failures
+    );
+    assert!(db.node_by_key("w-0").is_some());
+  }
+
+  /// Compaction waits under the gate for open transactions to finish, so a
+  /// caller inside its own transaction is refused rather than left waiting
+  /// for itself.
+  #[test]
+  fn compaction_refuses_callers_open_transaction() {
+    let temp_dir = tempdir().expect("temp dir");
+    let db_path = temp_dir.path().join("compaction-own-tx.kitedb");
+    let db = open_single_file(&db_path, test_options(MIB)).expect("open");
+    db.begin(false).expect("begin");
+    db.create_node(Some("mine")).expect("create node");
+
+    for checkpoint in [true, false] {
+      let result = db.resize_wal(
+        2 * MIB,
+        Some(ResizeWalOptions {
+          allow_shrink: false,
+          checkpoint,
+        }),
+      );
+      assert!(
+        matches!(result, Err(KiteError::TransactionInProgress)),
+        "resize_wal(checkpoint: {checkpoint}) with an open transaction: {result:?}"
+      );
+    }
+    assert!(matches!(
+      db.vacuum_single_file(None),
+      Err(KiteError::TransactionInProgress)
+    ));
+    assert!(matches!(
+      db.optimize_single_file(None),
+      Err(KiteError::TransactionInProgress)
+    ));
+
+    db.commit().expect("commit");
+    db.resize_wal(2 * MIB, None).expect("resize after commit");
+    assert!(db.node_by_key("mine").is_some());
   }
 }
