@@ -96,6 +96,17 @@ impl HistoryPlan {
     }
   }
 
+  /// Whether recording the plan for `pending` reads the committed state: it records more
+  /// than the creation of fresh nodes.
+  pub(super) fn reads_committed_state(&self, pending: &DeltaState) -> bool {
+    !(self.created.is_empty()
+      && self.added_edges.is_empty()
+      && self.changed_edges.is_empty()
+      && pending.deleted_nodes.is_empty()
+      && pending.out_del.is_empty()
+      && pending.modified_nodes.is_empty())
+  }
+
   /// Whether the plan holds with history `chains`: none of the nodes it takes as fresh has a
   /// chain (constant time while no node has one).
   pub(super) fn holds_for(&self, chains: &VersionChainManager) -> bool {
@@ -109,6 +120,7 @@ impl HistoryPlan {
 
 /// Record in `vc` the changes `pending` makes, committed by `txid` at `commit_ts`, to the
 /// committed state `delta` over `snapshot`, as `plan` (`HistoryPlan::of` for them) lays out.
+/// The committed state is read only if `plan.reads_committed_state(pending)`.
 pub(super) fn record_commit(
   vc: &mut VersionChainManager,
   delta: &DeltaState,
