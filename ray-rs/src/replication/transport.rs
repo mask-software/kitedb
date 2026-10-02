@@ -11,7 +11,7 @@ use crate::error::{KiteError, Result};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use byteorder::{LittleEndian, ReadBytesExt};
-use serde_json::json;
+use serde::Serialize;
 use std::io::{Cursor, Read};
 use std::str::FromStr;
 
@@ -44,21 +44,37 @@ pub struct SnapshotTransport {
 impl SnapshotTransport {
   /// The JSON transport: these fields, `checksum_crc32c` (the CRC-32 in 8 hex
   /// digits; the name is kept for clients), `generation` in 16 hex digits
-  /// (exact in JSON), and the data in base64.
-  pub fn to_json(&self) -> Result<String> {
-    let payload = json!({
-      "format": self.format,
-      "byte_length": self.byte_length,
-      "checksum_crc32c": format!("{:08x}", self.checksum_crc32),
-      "generated_at_ms": self.generated_at_ms,
-      "epoch": self.epoch,
-      "head_log_index": self.head_log_index,
-      "retained_floor": self.retained_floor,
-      "generation": format_generation(self.generation),
-      "start_cursor": self.start_cursor.to_string(),
-      "data_base64": self.data.as_deref().map(|data| BASE64_STANDARD.encode(data)),
-    });
-    serde_json::to_string(&payload).map_err(|error| {
+  /// (exact in JSON), and the data in base64. The data is dropped once
+  /// encoded, so at most the base64 and the JSON text are held besides it.
+  pub fn into_json(self) -> Result<String> {
+    #[derive(Serialize)]
+    struct SnapshotJson<'a> {
+      format: &'a str,
+      byte_length: u64,
+      checksum_crc32c: String,
+      generated_at_ms: u64,
+      epoch: u64,
+      head_log_index: u64,
+      retained_floor: u64,
+      generation: String,
+      start_cursor: String,
+      data_base64: Option<String>,
+    }
+
+    let data_base64 = self.data.map(|data| BASE64_STANDARD.encode(data));
+    serde_json::to_string(&SnapshotJson {
+      format: self.format,
+      byte_length: self.byte_length,
+      checksum_crc32c: format!("{:08x}", self.checksum_crc32),
+      generated_at_ms: self.generated_at_ms,
+      epoch: self.epoch,
+      head_log_index: self.head_log_index,
+      retained_floor: self.retained_floor,
+      generation: format_generation(self.generation),
+      start_cursor: self.start_cursor.to_string(),
+      data_base64,
+    })
+    .map_err(|error| {
       KiteError::Serialization(format!("encode replication snapshot export: {error}"))
     })
   }
@@ -101,35 +117,57 @@ pub struct LogTransportPage {
 impl LogTransportPage {
   /// The JSON transport: these fields, `frame_count`, `generation` in 16 hex
   /// digits, and each frame's payload in base64 (`payload_base64`).
-  pub fn to_json(&self) -> Result<String> {
-    let frames: Vec<_> = self
+  pub fn into_json(self) -> Result<String> {
+    #[derive(Serialize)]
+    struct FrameJson {
+      epoch: u64,
+      log_index: u64,
+      segment_id: u64,
+      segment_offset: u64,
+      bytes: u64,
+      payload_base64: Option<String>,
+    }
+
+    #[derive(Serialize)]
+    struct PageJson {
+      epoch: u64,
+      head_log_index: u64,
+      retained_floor: u64,
+      generation: String,
+      cursor: Option<String>,
+      next_cursor: Option<String>,
+      eof: bool,
+      frame_count: usize,
+      total_bytes: u64,
+      frames: Vec<FrameJson>,
+    }
+
+    let frame_count = self.frames.len();
+    let frames = self
       .frames
-      .iter()
-      .map(|frame| {
-        json!({
-          "epoch": frame.epoch,
-          "log_index": frame.log_index,
-          "segment_id": frame.segment_id,
-          "segment_offset": frame.segment_offset,
-          "bytes": frame.bytes,
-          "payload_base64": frame.payload.as_deref().map(|payload| BASE64_STANDARD.encode(payload)),
-        })
+      .into_iter()
+      .map(|frame| FrameJson {
+        epoch: frame.epoch,
+        log_index: frame.log_index,
+        segment_id: frame.segment_id,
+        segment_offset: frame.segment_offset,
+        bytes: frame.bytes,
+        payload_base64: frame.payload.map(|payload| BASE64_STANDARD.encode(payload)),
       })
       .collect();
-    let payload = json!({
-      "epoch": self.epoch,
-      "head_log_index": self.head_log_index,
-      "retained_floor": self.retained_floor,
-      "generation": format_generation(self.generation),
-      "cursor": self.cursor.map(|cursor| cursor.to_string()),
-      "next_cursor": self.next_cursor.map(|cursor| cursor.to_string()),
-      "eof": self.eof,
-      "frame_count": self.frames.len(),
-      "total_bytes": self.total_bytes,
-      "frames": frames,
-    });
-    serde_json::to_string(&payload)
-      .map_err(|error| KiteError::Serialization(format!("encode replication log export: {error}")))
+    serde_json::to_string(&PageJson {
+      epoch: self.epoch,
+      head_log_index: self.head_log_index,
+      retained_floor: self.retained_floor,
+      generation: format_generation(self.generation),
+      cursor: self.cursor.map(|cursor| cursor.to_string()),
+      next_cursor: self.next_cursor.map(|cursor| cursor.to_string()),
+      eof: self.eof,
+      frame_count,
+      total_bytes: self.total_bytes,
+      frames,
+    })
+    .map_err(|error| KiteError::Serialization(format!("encode replication log export: {error}")))
   }
 }
 

@@ -399,7 +399,7 @@ impl SingleFileDB {
   pub fn primary_export_snapshot_transport_json(&self, include_data: bool) -> Result<String> {
     self
       .export_snapshot_transport(include_data, REPLICATION_SNAPSHOT_JSON_MAX_BYTES)?
-      .to_json()
+      .into_json()
   }
 
   fn export_snapshot_transport(
@@ -575,7 +575,7 @@ impl SingleFileDB {
     let cursor = parse_transport_cursor(cursor)?;
     self
       .primary_export_log_transport(cursor, max_frames, max_bytes, include_payload)?
-      .to_json()
+      .into_json()
   }
 }
 

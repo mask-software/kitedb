@@ -16,7 +16,8 @@
 //!                                      Full-mode single-node commits; per-commit latency.
 //!   build-blob --path P --mb M         Primary of about M MB (1 KiB random props), checkpointed.
 //!   export --path P [--format json|binary] [--repeat N]
-//!                                      Snapshot transport export with data.
+//!                                      Snapshot transport export with data (binary: the
+//!                                      SnapshotTransport struct, json: its JSON serializer).
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -197,7 +198,14 @@ fn build_blob(path: &Path, mb: usize) -> kitedb::Result<()> {
 }
 
 fn export(path: &Path, format: &str, repeat: usize) -> kitedb::Result<()> {
-  let db = open_single_file(path, primary_options(SyncMode::Normal))?;
+  // The file keeps the WAL size it was built with.
+  let db = open_single_file(
+    path,
+    SingleFileOpenOptions::new()
+      .sync_mode(SyncMode::Normal)
+      .auto_checkpoint(false)
+      .replication_role(ReplicationRole::Primary),
+  )?;
   let rss_before = peak_rss_mb();
   let mut best = Duration::MAX;
   for _ in 0..repeat.max(1) {
@@ -206,6 +214,9 @@ fn export(path: &Path, format: &str, repeat: usize) -> kitedb::Result<()> {
       "json" => db
         .primary_export_snapshot_transport_json(true)
         .map(|json| json.len()),
+      "binary" => db
+        .primary_export_snapshot_transport(true)
+        .map(|snapshot| snapshot.data.map_or(0, |data| data.len())),
       other => {
         eprintln!("unknown format {other}");
         std::process::exit(2);
