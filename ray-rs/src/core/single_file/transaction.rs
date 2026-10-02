@@ -7,8 +7,9 @@
 //! a background install if needed) -> MVCC conflict check -> WAL COMMIT ->
 //! WAL flush (and fsync, in Full mode) -> durable header -> schema publish
 //! -> MVCC commit timestamp, version chains, vector and delta merge ->
-//! sidecar attempt`, all under the commit lock. Until the header is durable a failure leaves no trace of the
-//! commit: its COMMIT record is forgotten, and MVCC aborts it. From there on
+//! sidecar attempt`, all under the commit lock. Until the header is durable
+//! a failure leaves no trace of the commit: its COMMIT record is forgotten,
+//! and MVCC aborts it. From there on
 //! every step runs. The MVCC timestamp, version chains and delta merge share
 //! one `delta.write()` critical section, and MVCC transactions begin under
 //! `delta.read()`, so a snapshot holds a commit entirely or not at all.
