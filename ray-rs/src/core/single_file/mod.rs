@@ -51,6 +51,7 @@ pub use open::{
   close_single_file, close_single_file_with_options, open_single_file, SingleFileCloseOptions,
   SingleFileOpenOptions, SnapshotParseMode, SyncMode,
 };
+pub(crate) use transaction::GroupCommitState;
 pub use transaction::SingleFileTxGuard;
 
 // Also re-export recovery items that are used externally
@@ -159,6 +160,9 @@ pub struct SingleFileTxState {
   pub(crate) schema: SchemaStaging,
   pub bulk_load: bool,
   pub pending_wal: Vec<u8>,
+  /// A replica's replication apply; the only transactions in which a
+  /// replica accepts data writes.
+  pub(crate) replication_apply: bool,
 }
 
 impl SingleFileTxState {
@@ -171,6 +175,7 @@ impl SingleFileTxState {
       schema: SchemaStaging::default(),
       bulk_load,
       pending_wal: Vec::new(),
+      replication_apply: false,
     }
   }
 }
@@ -235,7 +240,8 @@ pub struct SingleFileDB {
   /// Serialize commit operations to preserve WAL/delta ordering
   pub(crate) commit_lock: Mutex<()>,
 
-  /// Group commit state (coalesces WAL flushes)
+  /// Group commit queue (one leader writes a batch of commits with one WAL
+  /// flush and one header); waiters park on `group_commit_cv`
   pub(crate) group_commit_state: Mutex<GroupCommitState>,
   pub(crate) group_commit_cv: Condvar,
 
@@ -295,8 +301,6 @@ pub struct SingleFileDB {
 
   /// Enable group commit (coalesce WAL flushes across commits)
   pub(crate) group_commit_enabled: bool,
-  /// Group commit window in milliseconds
-  pub(crate) group_commit_window_ms: u64,
 
   /// Primary replication runtime (enabled only when role=primary)
   pub(crate) primary_replication: Option<crate::replication::primary::PrimaryReplication>,
@@ -368,15 +372,6 @@ impl BackgroundCheckpointState {
   pub(crate) fn holds_cut(&self, cut: u64) -> bool {
     self.cut_owner.is_some() && self.cut == cut
   }
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct GroupCommitState {
-  pub next_seq: u64,
-  pub flushed_seq: u64,
-  pub flushing: bool,
-  pub last_error_seq: u64,
-  pub last_error: Option<String>,
 }
 
 // ============================================================================

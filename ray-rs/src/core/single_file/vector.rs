@@ -4,7 +4,8 @@
 
 use crate::core::snapshot::reader::SnapshotData;
 use crate::core::wal::record::{
-  build_del_node_vector_payload, build_set_node_vector_payload, WalRecord,
+  build_del_node_vector_payload, build_set_node_vector_payload, parse_set_node_vector_payload,
+  ParsedWalRecord, WalRecord,
 };
 use crate::error::{KiteError, Result};
 use crate::types::*;
@@ -13,7 +14,7 @@ use crate::util::binary::{read_u32_at, read_u64_at};
 use crate::vector::ivf::serialize::deserialize_manifest;
 use crate::vector::store::{
   create_vector_store, validate_vector, vector_store_delete, vector_store_has, vector_store_insert,
-  vector_store_node_vector,
+  vector_store_node_vector, VectorStoreError,
 };
 use crate::vector::types::{VectorManifest, VectorStoreConfig};
 use parking_lot::Mutex;
@@ -293,6 +294,10 @@ impl SingleFileDB {
   ///
   /// Creates a new store with the given dimensions if it doesn't exist.
   pub fn vector_store_or_create(&self, prop_key_id: PropKeyId, dimensions: usize) -> Result<()> {
+    // A commit checks its vectors' dimensions against the stores before its
+    // COMMIT record and applies them after, both under the commit lock; a
+    // store created in between would make that apply fail.
+    let _commit_guard = self.commit_lock.lock();
     self.ensure_vector_store_loaded(prop_key_id)?;
 
     let mut stores = self.vector_stores.write();
@@ -492,6 +497,79 @@ pub(crate) fn vector_stores_from_snapshot(
     materialized.insert(prop_key_id, manifest);
   }
   Ok(materialized)
+}
+
+/// Apply the vector operations WAL replay collected (`pending`: the last
+/// operation per node and property, from the transactions in `committed`) to
+/// `stores`. A property's dimensions are its store's or, for a property
+/// without one, those of its first vector in commit order, as the live
+/// database fixed them.
+///
+/// A vector that disagrees with them, or that the store refuses as invalid,
+/// is skipped with a warning rather than failing the open. Versions without
+/// the commit-time dimension check could commit two transactions that gave a
+/// new property different dimensions; the second never reached the live
+/// store, and a WAL holding it must still open.
+pub(crate) fn apply_replayed_vectors(
+  pending: HashMap<(NodeId, PropKeyId), Option<VectorRef>>,
+  committed: &[(TxId, Vec<&ParsedWalRecord>)],
+  snapshot: Option<&SnapshotData>,
+  stores: &mut HashMap<PropKeyId, VectorManifest>,
+  lazy_entries: &mut HashMap<PropKeyId, VectorStoreLazyEntry>,
+) -> Result<()> {
+  let mut first_dimensions: HashMap<PropKeyId, usize> = HashMap::new();
+  let set_vectors = committed
+    .iter()
+    .flat_map(|(_txid, records)| records)
+    .filter(|record| record.record_type == WalRecordType::SetNodeVector)
+    .filter_map(|record| parse_set_node_vector_payload(&record.payload));
+  for set_vector in set_vectors {
+    first_dimensions
+      .entry(set_vector.prop_key_id)
+      .or_insert(set_vector.vector.len());
+  }
+
+  let mut skipped = 0usize;
+  for ((node_id, prop_key_id), operation) in pending {
+    if let Some(snapshot) = snapshot {
+      materialize_vector_store_from_lazy_entries(snapshot, stores, lazy_entries, prop_key_id)?;
+    }
+    match operation {
+      Some(vector) => {
+        let dimensions = first_dimensions
+          .get(&prop_key_id)
+          .copied()
+          .unwrap_or(vector.len());
+        let store = stores
+          .entry(prop_key_id)
+          .or_insert_with(|| create_vector_store(VectorStoreConfig::new(dimensions)));
+        match vector_store_insert(store, node_id, vector.as_ref()) {
+          Ok(_) => {}
+          Err(VectorStoreError::DimensionMismatch { .. } | VectorStoreError::InvalidVector(_)) => {
+            skipped += 1;
+          }
+          Err(error) => {
+            return Err(KiteError::InvalidWal(format!(
+              "Failed to apply vector insert during WAL replay for node {node_id} (prop \
+               {prop_key_id}): {error}"
+            )));
+          }
+        }
+      }
+      None => {
+        if let Some(store) = stores.get_mut(&prop_key_id) {
+          vector_store_delete(store, node_id);
+        }
+      }
+    }
+  }
+  if skipped > 0 {
+    eprintln!(
+      "Warning: skipped {skipped} committed vector operations in the WAL that do not fit their \
+       property's vector store (other dimensions than its first vector, or an invalid vector)"
+    );
+  }
+  Ok(())
 }
 
 pub(crate) fn materialize_vector_store_from_lazy_entries(

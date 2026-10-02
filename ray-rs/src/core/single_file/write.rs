@@ -1189,7 +1189,7 @@ impl SingleFileDB {
       return Ok(id);
     }
 
-    let (txid, tx_handle) = self.require_write_tx_handle()?;
+    let (txid, tx_handle) = self.require_schema_tx_handle()?;
 
     // A concurrent writer may have defined it while this transaction was starting.
     if let Some(id) = self.label_id(name) {
@@ -1227,7 +1227,7 @@ impl SingleFileDB {
       return Ok(id);
     }
 
-    let (txid, tx_handle) = self.require_write_tx_handle()?;
+    let (txid, tx_handle) = self.require_schema_tx_handle()?;
 
     // A concurrent writer may have defined it while this transaction was starting.
     if let Some(id) = self.etype_id(name) {
@@ -1265,7 +1265,7 @@ impl SingleFileDB {
       return Ok(id);
     }
 
-    let (txid, tx_handle) = self.require_write_tx_handle()?;
+    let (txid, tx_handle) = self.require_schema_tx_handle()?;
 
     // A concurrent writer may have defined it while this transaction was starting.
     if let Some(id) = self.propkey_id(name) {
