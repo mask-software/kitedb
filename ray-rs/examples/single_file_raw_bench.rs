@@ -248,12 +248,16 @@ fn format_sync_mode(mode: SyncMode) -> &'static str {
 }
 
 fn print_latency_table(name: &str, stats: LatencyStats) {
+  println!("{}", latency_row(name, &stats));
+}
+
+fn latency_row(name: &str, stats: &LatencyStats) -> String {
   let ops_per_sec = if stats.sum > 0 {
     stats.count as f64 / (stats.sum as f64 / 1_000_000_000.0)
   } else {
     0.0
   };
-  println!(
+  format!(
     "{:<45} p50={:>10} p95={:>10} p99={:>10} max={:>10} ({:.0} ops/sec)",
     name,
     format_latency(stats.p50),
@@ -261,7 +265,13 @@ fn print_latency_table(name: &str, stats: LatencyStats) {
     format_latency(stats.p99),
     format_latency(stats.max),
     ops_per_sec
-  );
+  )
+}
+
+/// Batches of `batch_size` operations for an `--iterations` budget, at most
+/// `max_batches`.
+fn batch_count(iterations: usize, batch_size: usize, max_batches: usize) -> usize {
+  (iterations / batch_size).min(max_batches)
 }
 
 fn build_random_vector(rng: &mut StdRng, dimensions: usize) -> Vec<f32> {
@@ -540,7 +550,7 @@ fn benchmark_writes(
 ) {
   println!("\n--- Batch Writes (100 nodes) ---");
   let batch_size = 100usize;
-  let batches = node_batches.unwrap_or((iterations / batch_size).min(50));
+  let batches = node_batches.unwrap_or_else(|| batch_count(iterations, batch_size, 50));
   let mut samples = Vec::with_capacity(batches);
 
   for b in 0..batches {
@@ -564,7 +574,7 @@ fn benchmark_writes(
   }
 
   let edge_batch_size = 100usize;
-  let edge_batches = (iterations / edge_batch_size).min(50);
+  let edge_batches = batch_count(iterations, edge_batch_size, 50);
   if edge_batches == 0 {
     return;
   }
@@ -745,5 +755,27 @@ fn main() {
     // Dropping the TempDir would delete the database with it.
     let _ = temp.keep();
     println!("\nDatabase preserved at: {}", db_path.display());
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn small_iteration_counts_still_run_a_batch() {
+    assert_eq!(batch_count(1, 100, 50), 1);
+    assert_eq!(batch_count(50, 100, 50), 1);
+    assert_eq!(batch_count(100, 100, 50), 1);
+    assert_eq!(batch_count(150, 100, 50), 2);
+    assert_eq!(batch_count(10_000, 100, 50), 50);
+    assert_eq!(batch_count(0, 100, 50), 0);
+  }
+
+  #[test]
+  fn no_samples_print_as_skipped_not_as_zero_latency() {
+    let row = latency_row("Batch of 100 nodes", &compute_stats(&mut []));
+    assert!(row.contains("skipped"), "{row}");
+    assert!(!row.contains("0 ops/sec"), "{row}");
   }
 }

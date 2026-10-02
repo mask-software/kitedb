@@ -111,6 +111,11 @@ harness = false
 name = "write_path"
 harness = false
 
+# `cargo test` runs this example's unit tests (its batch sizing).
+[[example]]
+name = "single_file_raw_bench"
+test = true
+
 [features]
 default = ["napi"]
 napi = ["dep:napi", "dep:napi-derive", "dep:napi-build", "otlp"]
