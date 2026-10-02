@@ -2139,7 +2139,6 @@ mod tests {
       .mvcc_gc_interval_ms(10)
       .auto_checkpoint(false)
       .sync_mode(SyncMode::Normal)
-      .group_commit_enabled(true)
   }
 
   fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {

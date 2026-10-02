@@ -11,7 +11,6 @@ fn group_commit_options(mvcc: bool) -> SingleFileOpenOptions {
     .mvcc(mvcc)
     .mvcc_gc_interval_ms(10)
     .sync_mode(SyncMode::Normal)
-    .group_commit_enabled(true)
     .auto_checkpoint(false)
 }
 
