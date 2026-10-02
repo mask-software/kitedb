@@ -75,6 +75,12 @@ export function readsBySpec(db: Kite): void {
   const id: number | null = db.getId(User, 'alice')
   const users: Array<UserNode> = db.all(User)
   void [name, age, some, id, users]
+
+  // A spec types the key and the result: these must not compile.
+  // @ts-expect-error a spec's key is a string
+  db.get(User, 42)
+  // @ts-expect-error `email` is not a prop of User
+  void alice?.email
 }
 
 export function readsByName(db: Kite): void {
@@ -156,7 +162,10 @@ export function traversals(db: Kite): void {
   const loadedId: number | undefined = loaded[0]?.id
   const edges: Array<FullEdge> = traversal.edges()
   const count: number = traversal.count()
-  const nodes = db.fromNodes([1, { id: 2 }]).traverse(knows, { maxDepth: 2 }).toArray()
+  const nodes = db
+    .fromNodes([1, { id: 2 }])
+    .traverse(knows, { maxDepth: 2 })
+    .toArray()
   void [ids, loadedId, edges, count, nodes]
 }
 

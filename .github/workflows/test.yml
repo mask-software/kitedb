@@ -184,6 +184,10 @@ jobs:
         with:
           name: napi-binding
           path: ray-rs
+      # Type-checks dist/*.d.ts and index.d.ts from a consumer project with
+      # strict and skipLibCheck: false (the package's own build skips them).
+      - name: Consumer typecheck
+        run: bun run typecheck:consumer
       - name: ava
         run: bun run test
 
