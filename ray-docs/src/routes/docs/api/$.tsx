@@ -228,13 +228,17 @@ const hits = index.search(queryVector, {
   k: 10,          // Max results
   threshold: 0.8, // Min similarity score (cosine)
   nProbe: 10,     // IVF probe count (optional)
+  rerankFactor: 4, // IVF-PQ: re-rank the best max(k * 4, 80) candidates
+                   // by exact distance (optional; 0 = PQ ranking only)
 });`}
 				language="typescript"
 			/>
 
 			<h2 id="indexing">Vector indexing</h2>
 			<CodeBlock
-				code={`const index = createVectorIndex({ dimensions: 1536 });
+				code={`// ivf.seed (optional) makes builds reproducible: the same vectors give
+// the same index on any machine
+const index = createVectorIndex({ dimensions: 1536, ivf: { seed: 42 } });
 
 // Build or rebuild the ANN index (IVF-PQ by default) for faster search
 index.buildIndex();
