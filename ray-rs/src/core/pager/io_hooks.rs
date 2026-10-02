@@ -13,8 +13,6 @@ use std::path::Path;
 
 #[cfg(test)]
 use std::cell::{Cell, RefCell};
-#[cfg(test)]
-use std::path::PathBuf;
 
 /// Reads at file offsets from `from_offset` on return at most `max_len` bytes.
 #[cfg(test)]
@@ -42,7 +40,6 @@ thread_local! {
   static SYSCALLS: Cell<usize> = const { Cell::new(0) };
   static SHORT_READS: Cell<Option<ShortReads>> = const { Cell::new(None) };
   static BEFORE_CREATE_LOCK: RefCell<Option<CreateHook>> = const { RefCell::new(None) };
-  static DIR_SYNCS: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
   static IO_LOG: RefCell<Option<Vec<IoEvent>>> = const { RefCell::new(None) };
   static SYNC_FAULTS: Cell<usize> = const { Cell::new(0) };
 }
@@ -125,15 +122,6 @@ pub(super) fn before_create_lock(path: &Path) {
   let _ = path;
 }
 
-/// Note that directory `dir` was synced.
-#[cfg(unix)]
-#[inline]
-pub(super) fn dir_synced(dir: &Path) {
-  #[cfg(test)]
-  DIR_SYNCS.with(|synced| synced.borrow_mut().push(dir.to_path_buf()));
-  let _ = dir;
-}
-
 /// Run `run`, returning its result and the page I/O system calls it made on
 /// this thread.
 #[cfg(test)]
@@ -169,15 +157,6 @@ pub(crate) fn with_short_reads<R>(from_offset: u64, max_len: usize, run: impl Fn
 #[cfg(test)]
 pub(crate) fn before_next_create_lock(hook: impl FnOnce(&Path) + 'static) {
   BEFORE_CREATE_LOCK.with(|armed| *armed.borrow_mut() = Some(Box::new(hook)));
-}
-
-/// Run `run`, returning its result and the directories it fsynced on this
-/// thread.
-#[cfg(test)]
-pub(crate) fn dir_syncs_during<R>(run: impl FnOnce() -> R) -> (R, Vec<PathBuf>) {
-  DIR_SYNCS.with(|synced| synced.borrow_mut().clear());
-  let result = run();
-  (result, DIR_SYNCS.with(|synced| synced.take()))
 }
 
 /// Run `run`, returning its result and the pager writes and syncs it made on

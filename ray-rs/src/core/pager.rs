@@ -8,6 +8,7 @@ use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
+use crate::util::fs::sync_parent_dir;
 use crate::util::mmap::{map_file, Mmap};
 
 use crate::constants::{MAX_PAGE_SIZE, MIN_PAGE_SIZE, OS_PAGE_SIZE};
@@ -849,24 +850,6 @@ pub(crate) fn create_pager_with_locking<P: AsRef<Path>>(
     "database path changed while acquiring its lock after {attempts} attempts: {}",
     file_path.display()
   )))
-}
-
-/// Make the directory entry of `path` durable: until its directory is
-/// synced, a newly created or renamed file can vanish on power loss. A no-op
-/// where directories cannot be synced (Windows).
-pub(crate) fn sync_parent_dir(path: &Path) -> Result<()> {
-  let parent = path
-    .parent()
-    .filter(|parent| !parent.as_os_str().is_empty())
-    .unwrap_or_else(|| Path::new("."));
-  #[cfg(unix)]
-  {
-    File::open(parent)?.sync_all()?;
-    io_hooks::dir_synced(parent);
-  }
-  #[cfg(not(unix))]
-  let _ = parent;
-  Ok(())
 }
 
 /// Validate that a page size is valid (power of 2, within bounds)

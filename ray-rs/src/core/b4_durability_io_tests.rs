@@ -268,7 +268,7 @@ fn f3_create_pager_never_truncates_a_file_that_holds_data() {
 fn f3_create_fsyncs_the_parent_directory() {
   let dir = tempdir().expect("tempdir");
   let path = dir.path().join("new.kitedb");
-  let (db, synced) = io_hooks::dir_syncs_during(|| open_single_file(&path, options()));
+  let (db, synced) = crate::util::fs::dir_syncs_during(|| open_single_file(&path, options()));
   close_single_file(db.expect("open")).expect("close");
 
   let parent = std::fs::canonicalize(dir.path()).expect("canonical dir");

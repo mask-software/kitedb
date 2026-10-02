@@ -18,7 +18,7 @@ use crate::core::header::{
 };
 use crate::core::pager::{
   create_pager_with_locking, is_valid_page_size, open_pager_with_locking, pages_to_store,
-  sync_parent_dir, FilePager, NewPager,
+  FilePager, NewPager,
 };
 use crate::core::snapshot::reader::SnapshotData;
 use crate::core::wal::buffer::WalBuffer;
@@ -29,6 +29,7 @@ use crate::replication::replica::ReplicaReplication;
 use crate::replication::types::ReplicationRole;
 use crate::types::*;
 use crate::util::compression::CompressionOptions;
+use crate::util::fs::sync_parent_dir;
 use crate::util::mmap::{map_file_range, Mmap};
 
 use super::recovery::{
