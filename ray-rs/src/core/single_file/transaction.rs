@@ -114,7 +114,7 @@ pub(crate) struct CommitRequest {
   /// Its COMMIT record, or a bulk load's whole transaction.
   records: Vec<u8>,
   pending: DeltaState,
-  /// Its data records, for the replication sidecar.
+  /// Its data records, for the replication sidecar (empty without one).
   pending_wal: Vec<u8>,
   staged_schema: SchemaStaging,
   /// The committing thread; its test hooks fire only there.
@@ -478,19 +478,21 @@ impl SingleFileDB {
     }
   }
 
-  /// `try_write_wal`, waiting and retrying for as long as a background
-  /// checkpoint holds the WAL in a full secondary region, and compacting a
-  /// retained WAL that fills it. Callers hold no lock that checkpoint needs.
-  fn write_wal_waiting(&self, record: &WalRecord) -> Result<()> {
-    self.write_wal_waiting_then(record, || {})
+  /// Write `record` with `try_write_wal`, waiting and retrying for as long
+  /// as a background checkpoint holds the WAL in a full secondary region, and
+  /// compacting a retained WAL that fills it, then run `then` under the WAL
+  /// lock right after the record is written. Callers hold no lock that
+  /// checkpoint needs.
+  fn write_wal_waiting_then(&self, record: &WalRecord, then: impl Fn()) -> Result<()> {
+    self.write_built_wal_waiting_then(&mut record.build(), then)
   }
 
-  /// `write_wal_waiting`, running `then` under the WAL lock right after the
-  /// record is written.
-  fn write_wal_waiting_then(&self, record: &WalRecord, then: impl Fn()) -> Result<()> {
+  /// `write_wal_waiting_then` for a record already built (unsalted, as
+  /// `WalRecord::build` returns it); `record` is unsalted again on return.
+  fn write_built_wal_waiting_then(&self, record: &mut [u8], then: impl Fn()) -> Result<()> {
     loop {
       let written = self.try_write_wal(|wal, pager| {
-        wal.write_record(record, pager)?;
+        wal.write_built_record(record, pager)?;
         then();
         Ok(())
       })?;
@@ -1386,28 +1388,31 @@ impl SingleFileDB {
       .map(|replication| replication.status())
   }
 
-  /// Write a WAL record (internal helper)
-  pub(crate) fn write_wal(&self, record: WalRecord) -> Result<()> {
-    self.write_wal_waiting(&record)
-  }
-
+  /// Log `record` for the transaction `tx_handle`: to the WAL now, or, for a
+  /// bulk load, at its commit. It is encoded once. The transaction keeps a
+  /// copy only when something reads it later: a bulk load's commit writes
+  /// its records then, and a primary's commit hands them to the replication
+  /// sidecar (`publish_commit`).
   pub(crate) fn write_wal_tx(
     &self,
     tx_handle: &Arc<Mutex<SingleFileTxState>>,
     record: WalRecord,
   ) -> Result<()> {
+    let mut record_bytes = record.build();
     let mut tx = tx_handle.lock();
-    let record_bytes = record.build();
     if tx.bulk_load {
       tx.pending_wal.extend_from_slice(&record_bytes);
-      Ok(())
-    } else {
-      drop(tx);
-      self.write_wal(record)?;
-      let mut tx = tx_handle.lock();
-      tx.pending_wal.extend_from_slice(&record_bytes);
-      Ok(())
+      return Ok(());
     }
+    drop(tx);
+    self.write_built_wal_waiting_then(&mut record_bytes, || {})?;
+    if self.primary_replication.is_some() {
+      tx_handle
+        .lock()
+        .pending_wal
+        .extend_from_slice(&record_bytes);
+    }
+    Ok(())
   }
 
   /// Get current transaction ID or error

@@ -308,6 +308,9 @@ struct PostCutReplay {
   /// Records of the transactions not committed or rolled back by the last
   /// record seen, in order; the next round's records continue them.
   unfinished: Vec<ParsedWalRecord>,
+  /// Every post-cut record read so far, as it lies in the secondary region,
+  /// for the install's move-back to reuse.
+  read: Vec<u8>,
 }
 
 /// The records of `records`' transactions that neither commit nor roll back
@@ -1105,7 +1108,8 @@ impl SingleFileDB {
     let mut replay = PostCutReplay::default();
     let early = self
       .scan_post_cut_records(0)
-      .and_then(|(records, end)| {
+      .and_then(|(records, read, end)| {
+        replay.read = read;
         self.replay_post_cut_records(&mut replay, records, &mut loaded)?;
         Ok(end)
       })
@@ -1131,7 +1135,10 @@ impl SingleFileDB {
     // may append records, which the install retains.
     self
       .scan_post_cut_records(early)
-      .and_then(|(records, _)| self.replay_post_cut_records(&mut replay, records, &mut loaded))
+      .and_then(|(records, read, _)| {
+        replay.read.extend_from_slice(&read);
+        self.replay_post_cut_records(&mut replay, records, &mut loaded)
+      })
       .inspect_err(|_| free_snapshot())?;
     let post_cut_delta = replay.delta;
 
@@ -1171,9 +1178,12 @@ impl SingleFileDB {
       // Both slots now name the retained secondary records, so the primary
       // region is free to rewrite. A failure leaves the retained state, which
       // is consistent on disk and finished by the next background checkpoint
-      // or open; the new snapshot is installed either way.
+      // or open; the new snapshot is installed either way. The records read
+      // and checked by the replay above are reused (the secondary region only
+      // grew since), so only those open transactions appended since are read
+      // here.
       compaction_result = if retain_post_cut {
-        self.compact_retained_wal(&mut pager, &mut wal_buffer, &mut header)
+        self.compact_retained_wal_reusing(&mut pager, &mut wal_buffer, &mut header, replay.read)
       } else {
         Ok(())
       };
@@ -1207,22 +1217,40 @@ impl SingleFileDB {
     wal_buffer: &mut WalBuffer,
     header: &mut DbHeaderV1,
   ) -> Result<()> {
+    self.compact_retained_wal_reusing(pager, wal_buffer, header, Vec::new())
+  }
+
+  /// `compact_retained_wal`, reusing `read`, the retained records' first
+  /// bytes as they lie in the secondary region now (see
+  /// `WalBuffer::compact_secondary_into_primary_reusing`).
+  fn compact_retained_wal_reusing(
+    &self,
+    pager: &mut FilePager,
+    wal_buffer: &mut WalBuffer,
+    header: &mut DbHeaderV1,
+    read: Vec<u8>,
+  ) -> Result<()> {
     self.reach_checkpoint_phase(CheckpointPhase::PostCutWalRetained)?;
     {
       let _step = self.checkpoint_step("compact retained WAL");
-      wal_buffer.compact_secondary_into_primary(pager)?;
+      wal_buffer.compact_secondary_into_primary_reusing(read, pager)?;
     }
     wal_buffer.store_in_header(header);
     self.persist_checkpoint_header(pager, header)
   }
 
   /// Flush the WAL and read the post-cut records (in the secondary region)
-  /// from offset `from` on; also where they end, to read on from.
-  fn scan_post_cut_records(&self, from: u64) -> Result<(Vec<ParsedWalRecord>, u64)> {
-    let mut pager = self.pager.lock();
-    let mut wal_buffer = self.wal_buffer.lock();
-    wal_buffer.flush(&mut pager)?;
-    wal_buffer.scan_region_from(1, from, &mut pager)
+  /// from offset `from` on; also their bytes as they lie there, and where
+  /// they end, to read on from. The pager and WAL locks, which every commit
+  /// takes, are held for the read only, not while the records are parsed.
+  fn scan_post_cut_records(&self, from: u64) -> Result<(Vec<ParsedWalRecord>, Vec<u8>, u64)> {
+    let read = {
+      let mut pager = self.pager.lock();
+      let mut wal_buffer = self.wal_buffer.lock();
+      wal_buffer.flush(&mut pager)?;
+      wal_buffer.read_region_from(1, from, &mut pager)?
+    };
+    Ok(read.parse())
   }
 
   /// Replay the transactions that commit in `records` (the post-cut records
@@ -5027,6 +5055,11 @@ mod w2_tests;
 #[cfg(test)]
 #[path = "b4_checkpoint_tests.rs"]
 mod b4_tests;
+
+/// raydb-b4 wal-perf: crash images of the install's post-cut move-back (F5).
+#[cfg(test)]
+#[path = "b4_wal_perf_checkpoint_tests.rs"]
+mod b4_wal_perf_tests;
 
 /// raydb-b4 core-misc: vector-store compaction at checkpoint (B12).
 #[cfg(test)]

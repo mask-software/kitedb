@@ -4,3 +4,6 @@
 
 pub mod buffer;
 pub mod record;
+
+#[cfg(test)]
+mod b4_wal_perf_tests;

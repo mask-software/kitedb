@@ -841,15 +841,14 @@ fn open_single_file_internal(
   // regions in place, primary first, unless a writable open merges them.
   let mut replay_cut_in_place = header.checkpoint_in_progress != 0;
   if !options.read_only {
-    // Records of a type this version does not know are a newer version's,
-    // not torn: refuse rather than trim or compact them away below.
-    wal_buffer.check_record_types(&mut pager)?;
-
-    // A crash during a commit's sync can leave a durable header naming WAL
-    // bytes that never landed. Replay stops at them, so drop them before
-    // anything is appended after them, out of replay's reach. (A retired
-    // primary region is compacted below, which keeps only readable records.)
-    if !wal_buffer.is_primary_retired() && wal_buffer.trim_to_valid_records(&mut pager)? {
+    // One pass over each region does both checks. Records of a type this
+    // version does not know are a newer version's, not torn: refuse rather
+    // than trim or compact them away below. And a crash during a commit's
+    // sync can leave a durable header naming WAL bytes that never landed.
+    // Replay stops at them, so drop them before anything is appended after
+    // them, out of replay's reach. (A retired primary region is compacted
+    // below, which keeps only readable records.)
+    if wal_buffer.check_and_trim(&mut pager)? {
       wal_buffer.store_in_header(&mut header);
       install_recovered_header(&mut pager, &mut header, &mut header_slot)?;
     }
