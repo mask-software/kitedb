@@ -10,7 +10,6 @@ use crate::core::single_file::{
 };
 use crate::pyo3_bindings::validation;
 use crate::replication::types::ReplicationRole;
-use crate::types::{CacheOptions, PropertyCacheConfig, QueryCacheConfig, TraversalCacheConfig};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use std::str::FromStr;
@@ -145,22 +144,28 @@ pub struct OpenOptions {
   /// Cache parsed snapshot in memory (single-file only)
   #[pyo3(get, set)]
   pub cache_snapshot: Option<bool>,
-  /// Enable caching
+  /// Deprecated: has no effect (the cache layer was removed). Still accepted
+  /// so existing callers keep working.
   #[pyo3(get, set)]
   pub cache_enabled: Option<bool>,
-  /// Max node properties in cache (0 disables the node-property cache)
+  /// Deprecated: has no effect (the cache layer was removed). Still accepted
+  /// so existing callers keep working.
   #[pyo3(get, set)]
   pub cache_max_node_props: Option<i64>,
-  /// Max edge properties in cache (0 disables the edge-property cache)
+  /// Deprecated: has no effect (the cache layer was removed). Still accepted
+  /// so existing callers keep working.
   #[pyo3(get, set)]
   pub cache_max_edge_props: Option<i64>,
-  /// Max traversal cache entries (0 disables the traversal cache)
+  /// Deprecated: has no effect (the cache layer was removed). Still accepted
+  /// so existing callers keep working.
   #[pyo3(get, set)]
   pub cache_max_traversal_entries: Option<i64>,
-  /// Max query cache entries (0 disables the query cache)
+  /// Deprecated: has no effect (the cache layer was removed). Still accepted
+  /// so existing callers keep working.
   #[pyo3(get, set)]
   pub cache_max_query_entries: Option<i64>,
-  /// Query cache TTL in milliseconds (0 expires entries immediately)
+  /// Deprecated: has no effect (the cache layer was removed). Still accepted
+  /// so existing callers keep working.
   #[pyo3(get, set)]
   pub cache_query_ttl_ms: Option<i64>,
   /// Sync mode: "full", "normal", or "off"
@@ -320,8 +325,8 @@ impl OpenOptions {
 
   fn __repr__(&self) -> String {
     format!(
-      "OpenOptions(read_only={:?}, create_if_missing={:?}, cache_enabled={:?})",
-      self.read_only, self.create_if_missing, self.cache_enabled
+      "OpenOptions(read_only={:?}, create_if_missing={:?})",
+      self.read_only, self.create_if_missing
     )
   }
 }
@@ -390,79 +395,6 @@ impl OpenOptions {
     }
     if let Some(ref compression) = self.checkpoint_compression {
       rust_opts = rust_opts.checkpoint_compression(Some(compression.to_core()?));
-    }
-
-    let max_node_props = self
-      .cache_max_node_props
-      .map(|value| {
-        validation::non_negative_usize("cache_max_node_props", value, validation::MAX_CACHE_ENTRIES)
-      })
-      .transpose()?
-      .unwrap_or(10_000);
-    let max_edge_props = self
-      .cache_max_edge_props
-      .map(|value| {
-        validation::non_negative_usize("cache_max_edge_props", value, validation::MAX_CACHE_ENTRIES)
-      })
-      .transpose()?
-      .unwrap_or(10_000);
-    let max_traversal_entries = self
-      .cache_max_traversal_entries
-      .map(|value| {
-        validation::non_negative_usize(
-          "cache_max_traversal_entries",
-          value,
-          validation::MAX_CACHE_ENTRIES,
-        )
-      })
-      .transpose()?
-      .unwrap_or(5_000);
-    let max_query_entries = self
-      .cache_max_query_entries
-      .map(|value| {
-        validation::non_negative_usize(
-          "cache_max_query_entries",
-          value,
-          validation::MAX_CACHE_ENTRIES,
-        )
-      })
-      .transpose()?
-      .unwrap_or(1_000);
-    let query_ttl_ms = self
-      .cache_query_ttl_ms
-      .map(|value| {
-        validation::non_negative_u64(
-          "cache_query_ttl_ms",
-          value,
-          validation::MAX_DURATION_MS as u64,
-        )
-      })
-      .transpose()?;
-
-    // A zero cache capacity disables that cache. A zero TTL keeps the cache
-    // enabled but makes entries immediately stale, matching core semantics.
-    if self.cache_enabled == Some(true) {
-      let property_cache = Some(PropertyCacheConfig {
-        max_node_props,
-        max_edge_props,
-      });
-
-      let traversal_cache = Some(TraversalCacheConfig {
-        max_entries: max_traversal_entries,
-        max_neighbors_per_entry: 100,
-      });
-
-      let query_cache = Some(QueryCacheConfig {
-        max_entries: max_query_entries,
-        ttl_ms: query_ttl_ms,
-      });
-
-      rust_opts = rust_opts.cache(Some(CacheOptions {
-        enabled: true,
-        property_cache,
-        traversal_cache,
-        query_cache,
-      }));
     }
 
     // Sync mode
@@ -683,12 +615,6 @@ mod tests {
       mvcc_gc_interval_ms: Some(1),
       mvcc_retention_ms: Some(0),
       mvcc_max_chain_depth: Some(1),
-      cache_enabled: Some(true),
-      cache_max_node_props: Some(0),
-      cache_max_edge_props: Some(1),
-      cache_max_traversal_entries: Some(0),
-      cache_max_query_entries: Some(0),
-      cache_query_ttl_ms: Some(0),
       checkpoint_threshold: Some(0.0),
       group_commit_window_ms: Some(0),
       replication_segment_max_bytes: Some(1),
@@ -740,14 +666,6 @@ mod tests {
         ..Default::default()
       },
       OpenOptions {
-        cache_max_node_props: Some(-1),
-        ..Default::default()
-      },
-      OpenOptions {
-        cache_max_query_entries: Some(validation::MAX_CACHE_ENTRIES + 1),
-        ..Default::default()
-      },
-      OpenOptions {
         checkpoint_threshold: Some(2.0),
         ..Default::default()
       },
@@ -766,9 +684,15 @@ mod tests {
     ] {
       assert!(options.to_single_file_options().is_err());
     }
+    // The cache layer was removed: its options are accepted and ignored,
+    // out-of-range values included.
     assert!(OpenOptions {
       cache_enabled: Some(true),
-      cache_max_node_props: Some(validation::MAX_CACHE_ENTRIES),
+      cache_max_node_props: Some(-1),
+      cache_max_edge_props: Some(i64::MAX),
+      cache_max_traversal_entries: Some(-1),
+      cache_max_query_entries: Some(i64::MAX),
+      cache_query_ttl_ms: Some(-1),
       ..Default::default()
     }
     .to_single_file_options()

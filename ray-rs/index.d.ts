@@ -362,27 +362,27 @@ export declare class Database {
   importFromJson(path: string, options?: ImportOptions | undefined | null): ImportResult
   /** Import database from a JSON file on the libuv thread pool */
   importFromJsonAsync(path: string, options?: ImportOptions | undefined | null): Promise<ImportResult>
-  /** Check if caching is enabled */
+  /** @deprecated The cache layer was removed; always false. */
   cacheIsEnabled(): boolean
-  /** Invalidate all caches for a node */
+  /** @deprecated No effect: the cache layer was removed. */
   cacheInvalidateNode(nodeId: number): void
-  /** Invalidate caches for a specific edge */
+  /** @deprecated No effect: the cache layer was removed. */
   cacheInvalidateEdge(src: number, etype: number, dst: number): void
-  /** Invalidate a cached key lookup */
+  /** @deprecated No effect: the cache layer was removed. */
   cacheInvalidateKey(key: string): void
-  /** Clear all caches */
+  /** @deprecated No effect: the cache layer was removed. */
   cacheClear(): void
-  /** Clear only the query cache */
+  /** @deprecated No effect: the cache layer was removed. */
   cacheClearQuery(): void
-  /** Clear only the key cache */
+  /** @deprecated No effect: the cache layer was removed. */
   cacheClearKey(): void
-  /** Clear only the property cache */
+  /** @deprecated No effect: the cache layer was removed. */
   cacheClearProperty(): void
-  /** Clear only the traversal cache */
+  /** @deprecated No effect: the cache layer was removed. */
   cacheClearTraversal(): void
-  /** Get cache statistics */
+  /** @deprecated The cache layer was removed; always null. */
   cacheStats(): JsCacheStats | null
-  /** Reset cache statistics */
+  /** @deprecated No effect: the cache layer was removed. */
   cacheResetStats(): void
 }
 
@@ -955,7 +955,7 @@ export interface BackupResult {
  */
 export declare function bruteForceSearch(vectors: Array<Float32Array | Array<number>>, nodeIds: Array<number>, query: Float32Array | Array<number>, k: number, metric?: JsDistanceMetric | undefined | null): Array<JsBruteForceResult>
 
-/** Cache layer metrics */
+/** @deprecated The cache layer was removed; every field is zero. */
 export interface CacheLayerMetrics {
   hits: number
   misses: number
@@ -965,7 +965,7 @@ export interface CacheLayerMetrics {
   utilizationPercent: number
 }
 
-/** Cache metrics */
+/** @deprecated The cache layer was removed; `enabled` is false and every count is zero. */
 export interface CacheMetrics {
   enabled: boolean
   propertyCache: CacheLayerMetrics
@@ -1031,6 +1031,7 @@ export interface DatabaseMetrics {
   isSingleFile: boolean
   readOnly: boolean
   data: DataMetrics
+  /** @deprecated The cache layer was removed; reports a disabled, empty cache. */
   cache: CacheMetrics
   mvcc?: MvccMetrics
   replication: ReplicationMetrics
@@ -1148,7 +1149,7 @@ export interface JsBruteForceResult {
   similarity: number
 }
 
-/** Cache statistics */
+/** @deprecated The cache layer was removed; `cacheStats()` always returns null. */
 export interface JsCacheStats {
   propertyCacheHits: number
   propertyCacheMisses: number
@@ -1580,6 +1581,7 @@ export declare function kiteSync(path: string, options: JsKiteOptions): Kite
 /** Memory metrics */
 export interface MemoryMetrics {
   deltaEstimateBytes: number
+  /** @deprecated The cache layer was removed; always 0. */
   cacheEstimateBytes: number
   snapshotBytes: number
   totalEstimateBytes: number
@@ -1662,17 +1664,17 @@ export interface OpenOptions {
   backgroundCheckpoint?: boolean
   /** Compression options for checkpoint snapshots (single-file only) */
   checkpointCompression?: CompressionOptions
-  /** Enable caching */
+  /** @deprecated No effect: the cache layer was removed. Still accepted so existing callers keep working. */
   cacheEnabled?: boolean
-  /** Max node properties in cache (0 disables the node-property cache) */
+  /** @deprecated No effect: the cache layer was removed. Still accepted so existing callers keep working. */
   cacheMaxNodeProps?: number
-  /** Max edge properties in cache (0 disables the edge-property cache) */
+  /** @deprecated No effect: the cache layer was removed. Still accepted so existing callers keep working. */
   cacheMaxEdgeProps?: number
-  /** Max traversal cache entries (0 disables the traversal cache) */
+  /** @deprecated No effect: the cache layer was removed. Still accepted so existing callers keep working. */
   cacheMaxTraversalEntries?: number
-  /** Max query cache entries (0 disables the query cache) */
+  /** @deprecated No effect: the cache layer was removed. Still accepted so existing callers keep working. */
   cacheMaxQueryEntries?: number
-  /** Query cache TTL in milliseconds (0 expires entries immediately) */
+  /** @deprecated No effect: the cache layer was removed. Still accepted so existing callers keep working. */
   cacheQueryTtlMs?: number
   /** Sync mode: "Full", "Normal", or "Off" (default: "Full") */
   syncMode?: JsSyncMode

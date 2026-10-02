@@ -6,7 +6,6 @@ use pyo3::prelude::*;
 use crate::api::traversal::TraversalDirection;
 use crate::types::NodeId;
 
-pub(crate) const MAX_CACHE_ENTRIES: i64 = 10_000_000;
 pub(crate) const MAX_COUNT: i64 = 1_000_000_000;
 pub(crate) const MAX_DEPTH: i64 = 1_000_000;
 pub(crate) const MAX_DURATION_MS: i64 = 3_153_600_000_000;

@@ -43,9 +43,6 @@ pub mod vector;
 pub mod backup;
 pub mod metrics;
 
-// Cache modules
-pub mod cache;
-
 // Export/import
 pub mod export;
 

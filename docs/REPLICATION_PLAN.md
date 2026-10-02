@@ -42,7 +42,6 @@ Status: Phase D complete; V1 release cut pending
 
 ### Derived/rebuildable state (not required for correctness replication)
 
-- Caches (`cache::*`).
 - In-memory overlays reconstructed from snapshot + replicated tx stream.
 - Rebuildable vector/search side structures (unless explicitly marked authoritative in future phases).
 

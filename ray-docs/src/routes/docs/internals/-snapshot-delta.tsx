@@ -266,11 +266,6 @@ const WRITE_STEPS = [
 		action: "Update in-memory state (visible to reads)",
 		tint: "border-kite-violet/25 bg-kite-violet/10 text-kite-violet",
 	},
-	{
-		name: "Cache",
-		action: "Invalidate affected entries",
-		tint: "border-amber-400/25 bg-amber-400/10 text-amber-300",
-	},
 ];
 
 // Write flow

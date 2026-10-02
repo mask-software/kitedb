@@ -449,10 +449,15 @@ pub struct OpenOptions {
 }
 
 // ============================================================================
-// Cache Configuration
+// Cache configuration (deprecated, no effect)
 // ============================================================================
+//
+// The cache layer was removed: no read ever consulted it. These types stay so
+// code passing them to `SingleFileOpenOptions::cache` keeps compiling.
 
-/// Cache options
+/// Has no effect; the cache layer was removed.
+#[deprecated(note = "has no effect: the cache layer was removed")]
+#[allow(deprecated)]
 #[derive(Debug, Clone, Default)]
 pub struct CacheOptions {
   pub enabled: bool,
@@ -461,12 +466,15 @@ pub struct CacheOptions {
   pub query_cache: Option<QueryCacheConfig>,
 }
 
+/// Has no effect; the cache layer was removed.
+#[deprecated(note = "has no effect: the cache layer was removed")]
 #[derive(Debug, Clone)]
 pub struct PropertyCacheConfig {
   pub max_node_props: usize, // Default: 10000
   pub max_edge_props: usize, // Default: 10000
 }
 
+#[allow(deprecated)]
 impl Default for PropertyCacheConfig {
   fn default() -> Self {
     Self {
@@ -476,12 +484,15 @@ impl Default for PropertyCacheConfig {
   }
 }
 
+/// Has no effect; the cache layer was removed.
+#[deprecated(note = "has no effect: the cache layer was removed")]
 #[derive(Debug, Clone)]
 pub struct TraversalCacheConfig {
   pub max_entries: usize,             // Default: 5000
   pub max_neighbors_per_entry: usize, // Default: 100
 }
 
+#[allow(deprecated)]
 impl Default for TraversalCacheConfig {
   fn default() -> Self {
     Self {
@@ -491,12 +502,15 @@ impl Default for TraversalCacheConfig {
   }
 }
 
+/// Has no effect; the cache layer was removed.
+#[deprecated(note = "has no effect: the cache layer was removed")]
 #[derive(Debug, Clone)]
 pub struct QueryCacheConfig {
   pub max_entries: usize, // Default: 1000
   pub ttl_ms: Option<u64>,
 }
 
+#[allow(deprecated)]
 impl Default for QueryCacheConfig {
   fn default() -> Self {
     Self {
@@ -504,20 +518,6 @@ impl Default for QueryCacheConfig {
       ttl_ms: None,
     }
   }
-}
-
-/// Cache statistics
-#[derive(Debug, Clone, Default)]
-pub struct CacheStats {
-  pub property_cache_hits: u64,
-  pub property_cache_misses: u64,
-  pub property_cache_size: usize,
-  pub traversal_cache_hits: u64,
-  pub traversal_cache_misses: u64,
-  pub traversal_cache_size: usize,
-  pub query_cache_hits: u64,
-  pub query_cache_misses: u64,
-  pub query_cache_size: usize,
 }
 
 // ============================================================================

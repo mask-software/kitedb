@@ -1108,7 +1108,6 @@ impl SingleFileDB {
   fn publish_commit(&self, request: CommitRequest) -> CommitOutcome {
     let CommitRequest {
       txid,
-      bulk_load,
       pending,
       pending_wal,
       staged_schema,
@@ -1144,9 +1143,6 @@ impl SingleFileDB {
       vector_fault.and_then(|()| self.apply_pending_vectors(&pending.pending_vectors));
 
     merge_pending_delta(&mut delta, pending);
-    if bulk_load {
-      self.cache_clear();
-    }
     drop(delta);
 
     let mut commit_token = None;

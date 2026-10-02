@@ -6,7 +6,6 @@ use std::time::SystemTime;
 
 use serde_json::{json, Value};
 
-use crate::cache::manager::CacheManagerStats;
 use crate::core::single_file::SingleFileDB;
 use crate::replication::primary::PrimaryReplicationStatus;
 use crate::replication::replica::ReplicaReplicationStatus;
@@ -16,26 +15,6 @@ use crate::types::DeltaState;
 mod otlp;
 #[cfg(feature = "otlp")]
 pub use otlp::*;
-
-/// Cache layer metrics
-#[derive(Debug, Clone)]
-pub struct CacheLayerMetrics {
-  pub hits: i64,
-  pub misses: i64,
-  pub hit_rate: f64,
-  pub size: i64,
-  pub max_size: i64,
-  pub utilization_percent: f64,
-}
-
-/// Cache metrics
-#[derive(Debug, Clone)]
-pub struct CacheMetrics {
-  pub enabled: bool,
-  pub property_cache: CacheLayerMetrics,
-  pub traversal_cache: CacheLayerMetrics,
-  pub query_cache: CacheLayerMetrics,
-}
 
 /// Data metrics
 #[derive(Debug, Clone)]
@@ -106,7 +85,6 @@ pub struct ReplicationMetrics {
 #[derive(Debug, Clone)]
 pub struct MemoryMetrics {
   pub delta_estimate_bytes: i64,
-  pub cache_estimate_bytes: i64,
   pub snapshot_bytes: i64,
   pub total_estimate_bytes: i64,
 }
@@ -118,7 +96,6 @@ pub struct DatabaseMetrics {
   pub is_single_file: bool,
   pub read_only: bool,
   pub data: DataMetrics,
-  pub cache: CacheMetrics,
   pub mvcc: Option<MvccMetrics>,
   pub replication: ReplicationMetrics,
   pub memory: MemoryMetrics,
@@ -148,8 +125,6 @@ pub fn collect_metrics_single_file(db: &SingleFileDB) -> DatabaseMetrics {
   let schema_etypes = db.etype_ids.read().len() as i64;
   let schema_prop_keys = db.propkey_ids.read().len() as i64;
   let delta = db.delta.read();
-  let cache_stats = db.cache.read().as_ref().map(|cache| cache.manager_stats());
-
   let node_count = stats.snapshot_nodes as i64 + stats.delta_nodes_created as i64
     - stats.delta_nodes_deleted as i64;
   let edge_count =
@@ -169,13 +144,11 @@ pub fn collect_metrics_single_file(db: &SingleFileDB) -> DatabaseMetrics {
     schema_prop_keys,
   };
 
-  let cache = build_cache_metrics(cache_stats.as_ref());
   let replication = build_replication_metrics(
     db.primary_replication_status(),
     db.replica_replication_status(),
   );
   let delta_bytes = estimate_delta_memory(&delta);
-  let cache_bytes = estimate_cache_memory(cache_stats.as_ref());
   let snapshot_bytes = (stats.snapshot_nodes as i64 * 50) + (stats.snapshot_edges as i64 * 20);
 
   let mvcc = db.mvcc.as_ref().map(|mvcc| {
@@ -199,14 +172,12 @@ pub fn collect_metrics_single_file(db: &SingleFileDB) -> DatabaseMetrics {
     is_single_file: true,
     read_only: db.read_only,
     data,
-    cache,
     mvcc,
     replication,
     memory: MemoryMetrics {
       delta_estimate_bytes: delta_bytes,
-      cache_estimate_bytes: cache_bytes,
       snapshot_bytes,
-      total_estimate_bytes: delta_bytes + cache_bytes + snapshot_bytes,
+      total_estimate_bytes: delta_bytes + snapshot_bytes,
     },
     collected_at_ms: system_time_to_millis(SystemTime::now()),
   }
@@ -668,31 +639,6 @@ pub fn health_check_single_file(db: &SingleFileDB) -> HealthCheckResult {
     },
   });
 
-  let cache_stats = db.cache.read().as_ref().map(|cache| cache.manager_stats());
-  if let Some(stats) = cache_stats {
-    let total_hits = stats.property_cache_hits + stats.traversal_cache_hits;
-    let total_misses = stats.property_cache_misses + stats.traversal_cache_misses;
-    let total = total_hits + total_misses;
-    let hit_rate = if total > 0 {
-      total_hits as f64 / total as f64
-    } else {
-      1.0
-    };
-    let cache_ok = hit_rate > 0.5 || total < 100;
-    checks.push(HealthCheckEntry {
-      name: "cache_efficiency".to_string(),
-      passed: cache_ok,
-      message: if cache_ok {
-        format!("Cache hit rate: {:.1}%", hit_rate * 100.0)
-      } else {
-        format!(
-          "Low cache hit rate: {:.1}% - consider adjusting cache size",
-          hit_rate * 100.0
-        )
-      },
-    });
-  }
-
   if db.read_only {
     checks.push(HealthCheckEntry {
       name: "write_access".to_string(),
@@ -778,79 +724,6 @@ fn build_replica_replication_metrics(
   }
 }
 
-fn calc_hit_rate(hits: u64, misses: u64) -> f64 {
-  let total = hits + misses;
-  if total > 0 {
-    hits as f64 / total as f64
-  } else {
-    0.0
-  }
-}
-
-fn build_cache_metrics(stats: Option<&CacheManagerStats>) -> CacheMetrics {
-  if let Some(stats) = stats {
-    CacheMetrics {
-      enabled: true,
-      property_cache: build_cache_layer_metrics(
-        stats.property_cache_hits,
-        stats.property_cache_misses,
-        stats.property_cache_size,
-        stats.property_cache_max_size,
-      ),
-      traversal_cache: build_cache_layer_metrics(
-        stats.traversal_cache_hits,
-        stats.traversal_cache_misses,
-        stats.traversal_cache_size,
-        stats.traversal_cache_max_size,
-      ),
-      query_cache: build_cache_layer_metrics(
-        stats.query_cache_hits,
-        stats.query_cache_misses,
-        stats.query_cache_size,
-        stats.query_cache_max_size,
-      ),
-    }
-  } else {
-    let empty = CacheLayerMetrics {
-      hits: 0,
-      misses: 0,
-      hit_rate: 0.0,
-      size: 0,
-      max_size: 0,
-      utilization_percent: 0.0,
-    };
-    CacheMetrics {
-      enabled: false,
-      property_cache: empty.clone(),
-      traversal_cache: empty.clone(),
-      query_cache: empty,
-    }
-  }
-}
-
-fn build_cache_layer_metrics(
-  hits: u64,
-  misses: u64,
-  size: usize,
-  max_size: usize,
-) -> CacheLayerMetrics {
-  let hit_rate = calc_hit_rate(hits, misses);
-  let utilization_percent = if max_size > 0 {
-    (size as f64 / max_size as f64) * 100.0
-  } else {
-    0.0
-  };
-
-  CacheLayerMetrics {
-    hits: hits as i64,
-    misses: misses as i64,
-    hit_rate,
-    size: size as i64,
-    max_size: max_size as i64,
-    utilization_percent,
-  }
-}
-
 fn estimate_delta_memory(delta: &DeltaState) -> i64 {
   let mut bytes = 0i64;
 
@@ -875,17 +748,6 @@ fn estimate_delta_memory(delta: &DeltaState) -> i64 {
   bytes += delta.key_index.len() as i64 * 40;
 
   bytes
-}
-
-fn estimate_cache_memory(stats: Option<&CacheManagerStats>) -> i64 {
-  match stats {
-    Some(stats) => {
-      (stats.property_cache_size as i64 * 100)
-        + (stats.traversal_cache_size as i64 * 200)
-        + (stats.query_cache_size as i64 * 500)
-    }
-    None => 0,
-  }
 }
 
 fn delta_health_size(delta: &DeltaState) -> usize {

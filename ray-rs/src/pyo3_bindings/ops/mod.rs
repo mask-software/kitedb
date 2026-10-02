@@ -7,7 +7,6 @@
 //! The traits are designed to be used internally - the actual Python methods
 //! are defined in the main database module and delegate to these traits.
 
-pub mod cache;
 pub mod edges;
 pub mod export_import;
 pub mod graph_traversal;
@@ -21,7 +20,6 @@ pub mod transaction;
 pub mod vectors;
 
 // Re-export all operation traits
-pub use cache::CacheOps;
 pub use edges::EdgeOps;
 pub use export_import::ExportImportOps;
 pub use graph_traversal::GraphTraversalOps;

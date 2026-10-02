@@ -16,7 +16,7 @@ Legend
 | Feature area | TypeScript | Python | NAPI | Notes |
 | --- | --- | --- | --- | --- |
 | Single-file DB open/close | Full | Full | Full | `Database`/`open_database`/`openDatabase` |
-| Single-file open options | Full | Full | Full | Page size, WAL size, cache, sync mode |
+| Single-file open options | Full | Full | Full | Page size, WAL size, sync mode (the `cache*` options are accepted and ignored) |
 | Locking utility | Full | Missing | Missing | TS-only helper (`isProperLockingAvailable`) |
 | Backup/restore | Full | Missing | Full | `createBackup`, `restoreBackup`, `createOfflineBackup` |
 | Export/import | Full | Missing | Full | JSON export/import + JSONL export (TS has no JSONL import either) |
@@ -28,7 +28,7 @@ Legend
 | Properties (node/edge) | Full | Full | Full | `set/get/del` node/edge props |
 | Vector PropValue | Full | Missing | Full | Python bindings do not expose PropValue VectorF32 |
 | Schema IDs/labels | Full | Full | Full | Labels, edge types, prop keys |
-| Cache API | Full | Full | Full | Python/NAPI include extra cache control |
+| Cache API (deprecated) | Full | Full | Full | No-op stubs kept for one release: the cache layer was removed |
 | Replication controls + status (Phase D) | Full | Full | Full | Promote, retention, reseed, token wait, primary/replica status |
 | Integrity check | Full | Missing | Full | Single-file uses full snapshot check |
 | Optimize/compact | Full | Partial | Full | Single-file checkpoint + vacuum/options exposed |

@@ -27,7 +27,7 @@ use crate::types::{ETypeId, EdgeWithProps as CoreEdgeWithProps, NodeId, PropKeyI
 // Import from modular structure
 use super::ops::streaming::{EdgeBatchIterator, NodeBatchIterator};
 use super::ops::{
-  cache, edges, export_import, graph_traversal, labels, maintenance, nodes, properties, schema,
+  edges, export_import, graph_traversal, labels, maintenance, nodes, properties, schema,
   streaming as streaming_ops, transaction, vectors,
 };
 use super::options::{
@@ -1469,108 +1469,67 @@ impl PyDatabase {
   }
 
   // ==========================================================================
-  // Cache Operations (Single-file only)
+  // Cache Operations (deprecated no-ops: the cache layer was removed)
   // ==========================================================================
 
+  /// Deprecated: always False (the cache layer was removed).
   fn cache_is_enabled(&self) -> PyResult<bool> {
-    dispatch_ok!(self, |db| cache::cache_is_enabled(db), |_db| false)
+    self.with_db(|_| Ok(false))
   }
 
+  /// Deprecated: has no effect (the cache layer was removed).
   fn cache_invalidate_node(&self, node_id: i64) -> PyResult<()> {
-    let node_id = validation::node_id("node_id", node_id)?;
-    dispatch_ok!(
-      self,
-      |db| {
-        cache::cache_invalidate_node(db, node_id);
-      },
-      |_db| ()
-    )
+    validation::node_id("node_id", node_id)?;
+    self.with_db(|_| Ok(()))
   }
 
+  /// Deprecated: has no effect (the cache layer was removed).
   fn cache_invalidate_edge(&self, src: i64, etype: u32, dst: i64) -> PyResult<()> {
-    let src = validation::node_id("src", src)?;
-    let dst = validation::node_id("dst", dst)?;
-    dispatch_ok!(
-      self,
-      |db| {
-        cache::cache_invalidate_edge(db, src, etype as ETypeId, dst);
-      },
-      |_db| ()
-    )
+    validation::node_id("src", src)?;
+    validation::node_id("dst", dst)?;
+    let _ = etype;
+    self.with_db(|_| Ok(()))
   }
 
+  /// Deprecated: has no effect (the cache layer was removed).
   fn cache_invalidate_key(&self, key: &str) -> PyResult<()> {
-    dispatch_ok!(
-      self,
-      |db| {
-        cache::cache_invalidate_key(db, key);
-      },
-      |_db| ()
-    )
+    let _ = key;
+    self.with_db(|_| Ok(()))
   }
 
+  /// Deprecated: has no effect (the cache layer was removed).
   fn cache_clear(&self) -> PyResult<()> {
-    dispatch_ok!(
-      self,
-      |db| {
-        cache::cache_clear(db);
-      },
-      |_db| ()
-    )
+    self.with_db(|_| Ok(()))
   }
 
+  /// Deprecated: has no effect (the cache layer was removed).
   fn cache_clear_query(&self) -> PyResult<()> {
-    dispatch_ok!(
-      self,
-      |db| {
-        cache::cache_clear_query(db);
-      },
-      |_db| ()
-    )
+    self.with_db(|_| Ok(()))
   }
 
+  /// Deprecated: has no effect (the cache layer was removed).
   fn cache_clear_key(&self) -> PyResult<()> {
-    dispatch_ok!(
-      self,
-      |db| {
-        cache::cache_clear_key(db);
-      },
-      |_db| ()
-    )
+    self.with_db(|_| Ok(()))
   }
 
+  /// Deprecated: has no effect (the cache layer was removed).
   fn cache_clear_property(&self) -> PyResult<()> {
-    dispatch_ok!(
-      self,
-      |db| {
-        cache::cache_clear_property(db);
-      },
-      |_db| ()
-    )
+    self.with_db(|_| Ok(()))
   }
 
+  /// Deprecated: has no effect (the cache layer was removed).
   fn cache_clear_traversal(&self) -> PyResult<()> {
-    dispatch_ok!(
-      self,
-      |db| {
-        cache::cache_clear_traversal(db);
-      },
-      |_db| ()
-    )
+    self.with_db(|_| Ok(()))
   }
 
+  /// Deprecated: always None (the cache layer was removed).
   fn cache_stats(&self) -> PyResult<Option<CacheStats>> {
-    dispatch_ok!(self, |db| cache::cache_stats(db), |_db| None)
+    self.with_db(|_| Ok(None))
   }
 
+  /// Deprecated: has no effect (the cache layer was removed).
   fn cache_reset_stats(&self) -> PyResult<()> {
-    dispatch_ok!(
-      self,
-      |db| {
-        cache::cache_reset_stats(db);
-      },
-      |_db| ()
-    )
+    self.with_db(|_| Ok(()))
   }
 
   // ==========================================================================

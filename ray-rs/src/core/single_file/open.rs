@@ -11,7 +11,6 @@ use std::time::Instant;
 
 use parking_lot::{Mutex, RwLock};
 
-use crate::cache::manager::CacheManager;
 use crate::constants::*;
 use crate::core::header::{
   other_header_slot, read_header_slots, write_header_slot, HEADER_SLOT_A, HEADER_SLOT_B,
@@ -110,7 +109,11 @@ pub struct SingleFileOpenOptions {
   pub checkpoint_threshold: f64,
   /// Use background (non-blocking) checkpoint instead of blocking (default true)
   pub background_checkpoint: bool,
-  /// Cache options (None = disabled)
+  /// Has no effect. The cache layer was removed: no read ever consulted it,
+  /// and reads are served from the snapshot and delta. Still accepted so
+  /// existing callers keep compiling.
+  #[deprecated(note = "has no effect: the cache layer was removed")]
+  #[allow(deprecated)]
   pub cache: Option<CacheOptions>,
   /// Compression options for checkpoint snapshots
   pub checkpoint_compression: Option<CompressionOptions>,
@@ -153,6 +156,7 @@ pub struct SingleFileOpenOptions {
 }
 
 impl Default for SingleFileOpenOptions {
+  #[allow(deprecated)]
   fn default() -> Self {
     Self {
       read_only: false,
@@ -261,6 +265,9 @@ impl SingleFileOpenOptions {
     self
   }
 
+  /// Has no effect; see [`SingleFileOpenOptions::cache`].
+  #[deprecated(note = "has no effect: the cache layer was removed")]
+  #[allow(deprecated)]
   pub fn cache(mut self, options: Option<CacheOptions>) -> Self {
     self.cache = options;
     self
@@ -276,6 +283,9 @@ impl SingleFileOpenOptions {
     self
   }
 
+  /// Has no effect; see [`SingleFileOpenOptions::cache`].
+  #[deprecated(note = "has no effect: the cache layer was removed")]
+  #[allow(deprecated)]
   pub fn enable_cache(mut self) -> Self {
     self.cache = Some(CacheOptions {
       enabled: true,
@@ -1220,9 +1230,6 @@ fn open_single_file_internal(
       .saturating_add(elapsed_ns(vector_init_started));
   }
 
-  // Initialize cache if enabled
-  let cache = options.cache.clone().map(CacheManager::new);
-
   // Initialize MVCC if enabled (after WAL replay)
   let mvcc = init_mvcc_from_wal(
     &options,
@@ -1332,7 +1339,6 @@ fn open_single_file_internal(
     checkpoint_cancelled: AtomicBool::new(false),
     vector_stores: RwLock::new(vector_stores),
     vector_store_lazy_entries: RwLock::new(vector_store_lazy_entries),
-    cache: RwLock::new(cache),
     checkpoint_compression: options.checkpoint_compression.clone(),
     sync_mode: options.sync_mode,
     group_commit_enabled: options.group_commit_enabled,

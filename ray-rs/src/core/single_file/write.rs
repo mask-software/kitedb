@@ -509,11 +509,6 @@ impl SingleFileDB {
       }
     }
 
-    // Invalidate cache
-    if !bulk_load {
-      self.cache_invalidate_node(node_id);
-    }
-
     Ok(())
   }
 
@@ -590,11 +585,6 @@ impl SingleFileDB {
           etype: Some(etype),
         },
       );
-    }
-
-    // Invalidate cache (traversal cache for both src and dst)
-    if !bulk_load {
-      self.cache_invalidate_edge(src, etype, dst);
     }
 
     Ok(true)
@@ -697,12 +687,6 @@ impl SingleFileDB {
       }
     }
 
-    if !bulk_load {
-      for (src, etype, dst) in edges.iter() {
-        self.cache_invalidate_edge(*src, *etype, *dst);
-      }
-    }
-
     Ok(())
   }
 
@@ -790,10 +774,6 @@ impl SingleFileDB {
       }
     }
     self.mask_revealed_edge_props(txid, &tx_handle, vec![((src, etype, dst), revealed)])?;
-
-    if !bulk_load {
-      self.cache_invalidate_edge(src, etype, dst);
-    }
 
     Ok(())
   }
@@ -898,12 +878,6 @@ impl SingleFileDB {
       }
     }
 
-    if !bulk_load {
-      for (src, etype, dst, _) in edge_meta.iter() {
-        self.cache_invalidate_edge(*src, *etype, *dst);
-      }
-    }
-
     Ok(())
   }
 
@@ -973,11 +947,6 @@ impl SingleFileDB {
       );
     }
 
-    // Invalidate cache
-    if !bulk_load {
-      self.cache_invalidate_edge(src, etype, dst);
-    }
-
     Ok(())
   }
 
@@ -1042,11 +1011,6 @@ impl SingleFileDB {
       tx_mgr.record_read(txid, TxKey::Node(node_id));
     }
 
-    // Invalidate cache
-    if !bulk_load {
-      self.cache_invalidate_node(node_id);
-    }
-
     Ok(())
   }
 
@@ -1090,11 +1054,6 @@ impl SingleFileDB {
       // The write needs the node: it conflicts with a concurrent delete_node, not with
       // writes to the node's other props.
       tx_mgr.record_read(txid, TxKey::Node(node_id));
-    }
-
-    // Invalidate cache
-    if !bulk_load {
-      self.cache_invalidate_node(node_id);
     }
 
     Ok(())
@@ -1148,11 +1107,6 @@ impl SingleFileDB {
       record_edge_prop_dependencies(&mut tx_mgr, txid, src, etype, dst);
     }
 
-    // Invalidate cache
-    if !bulk_load {
-      self.cache_invalidate_edge(src, etype, dst);
-    }
-
     Ok(())
   }
 
@@ -1204,10 +1158,6 @@ impl SingleFileDB {
         }
         record_edge_prop_dependencies(&mut tx_mgr, txid, src, etype, dst);
       }
-    }
-
-    if !bulk_load {
-      self.cache_invalidate_edge(src, etype, dst);
     }
 
     Ok(())
@@ -1269,11 +1219,6 @@ impl SingleFileDB {
       record_edge_prop_dependencies(&mut tx_mgr, txid, src, etype, dst);
     }
 
-    // Invalidate cache
-    if !bulk_load {
-      self.cache_invalidate_edge(src, etype, dst);
-    }
-
     Ok(())
   }
 
@@ -1311,11 +1256,6 @@ impl SingleFileDB {
       tx_mgr.record_read(txid, TxKey::Node(node_id));
       tx_mgr.record_write(txid, TxKey::NodeLabels(node_id));
       tx_mgr.record_write(txid, TxKey::NodeLabel { node_id, label_id });
-    }
-
-    // Invalidate cache (label changes affect node)
-    if !bulk_load {
-      self.cache_invalidate_node(node_id);
     }
 
     Ok(())
@@ -1357,11 +1297,6 @@ impl SingleFileDB {
       tx_mgr.record_read(txid, TxKey::Node(node_id));
       tx_mgr.record_write(txid, TxKey::NodeLabels(node_id));
       tx_mgr.record_write(txid, TxKey::NodeLabel { node_id, label_id });
-    }
-
-    // Invalidate cache (label changes affect node)
-    if !bulk_load {
-      self.cache_invalidate_node(node_id);
     }
 
     Ok(())

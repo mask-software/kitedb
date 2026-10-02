@@ -14,7 +14,6 @@ use std::thread::ThreadId;
 use parking_lot::{Condvar, Mutex, RwLock};
 
 use self::vector::VectorStoreLazyEntry;
-use crate::cache::manager::CacheManager;
 use crate::constants::*;
 use crate::core::header::{other_header_slot, write_header_slot};
 use crate::core::pager::FilePager;
@@ -292,9 +291,6 @@ pub struct SingleFileDB {
   pub(crate) vector_stores: RwLock<HashMap<PropKeyId, VectorManifest>>,
   /// Lazy vector-store section index keyed by property key ID
   pub(crate) vector_store_lazy_entries: RwLock<HashMap<PropKeyId, VectorStoreLazyEntry>>,
-
-  /// Cache manager for property, traversal, query, and key caches
-  pub(crate) cache: RwLock<Option<CacheManager>>,
 
   /// Compression options for checkpoint snapshots
   pub(crate) checkpoint_compression: Option<CompressionOptions>,
@@ -785,88 +781,6 @@ impl SingleFileDB {
   /// Check if MVCC is enabled
   pub fn mvcc_enabled(&self) -> bool {
     self.mvcc.is_some()
-  }
-
-  // ==========================================================================
-  // Cache API
-  // ==========================================================================
-
-  /// Check if caching is enabled
-  pub fn cache_is_enabled(&self) -> bool {
-    self
-      .cache
-      .read()
-      .as_ref()
-      .map(|c| c.is_enabled())
-      .unwrap_or(false)
-  }
-
-  /// Invalidate all caches for a node
-  pub fn cache_invalidate_node(&self, node_id: NodeId) {
-    if let Some(ref mut cache) = *self.cache.write() {
-      cache.invalidate_node(node_id);
-    }
-  }
-
-  /// Invalidate caches for a specific edge
-  pub fn cache_invalidate_edge(&self, src: NodeId, etype: ETypeId, dst: NodeId) {
-    if let Some(ref mut cache) = *self.cache.write() {
-      cache.invalidate_edge(src, etype, dst);
-    }
-  }
-
-  /// Invalidate a cached key lookup
-  pub fn cache_invalidate_key(&self, key: &str) {
-    if let Some(ref mut cache) = *self.cache.write() {
-      cache.invalidate_key(key);
-    }
-  }
-
-  /// Clear all caches
-  pub fn cache_clear(&self) {
-    if let Some(ref mut cache) = *self.cache.write() {
-      cache.clear();
-    }
-  }
-
-  /// Clear only the query cache
-  pub fn cache_clear_query(&self) {
-    if let Some(ref mut cache) = *self.cache.write() {
-      cache.clear_query_cache();
-    }
-  }
-
-  /// Clear only the key cache
-  pub fn cache_clear_key(&self) {
-    if let Some(ref mut cache) = *self.cache.write() {
-      cache.clear_key_cache();
-    }
-  }
-
-  /// Clear only the property cache
-  pub fn cache_clear_property(&self) {
-    if let Some(ref mut cache) = *self.cache.write() {
-      cache.clear_property_cache();
-    }
-  }
-
-  /// Clear only the traversal cache
-  pub fn cache_clear_traversal(&self) {
-    if let Some(ref mut cache) = *self.cache.write() {
-      cache.clear_traversal_cache();
-    }
-  }
-
-  /// Get cache statistics
-  pub fn cache_stats(&self) -> Option<CacheStats> {
-    self.cache.read().as_ref().map(|c| c.stats())
-  }
-
-  /// Reset cache statistics
-  pub fn cache_reset_stats(&self) {
-    if let Some(ref mut cache) = *self.cache.write() {
-      cache.reset_stats();
-    }
   }
 }
 

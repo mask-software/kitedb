@@ -125,7 +125,8 @@ impl From<RustCheckResult> for CheckResult {
   }
 }
 
-/// Cache statistics
+/// Deprecated: the cache layer was removed; `Database.cache_stats()` always
+/// returns None.
 #[pyclass(name = "CacheStats", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct CacheStats {

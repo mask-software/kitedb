@@ -36,13 +36,6 @@ Kite is organized into several key layers:
 └──────────────────┬──────────────────────┘
                    │
 ┌──────────────────▼──────────────────────┐
-│  Cache Layer (src/cache/)               │
-│  - Property cache                       │
-│  - Query cache                          │
-│  - Traversal cache                      │
-└──────────────────┬──────────────────────┘
-                   │
-┌──────────────────▼──────────────────────┐
 │  Storage Layer (src/core/)              │
 │  - WAL (Write-Ahead Log)                │
 │  - Snapshots (CSR format)               │
@@ -179,18 +172,7 @@ Components:
 - **Conflict Detection** - Prevents lost updates on concurrent modifications
 - **Garbage Collection** - Automatically prunes old versions
 
-### 4. Cache Layer (`src/cache/`)
-
-**Internal** - Provides caching for read-heavy workloads.
-
-Components:
-
-- `property-cache.ts` - Caches node and edge properties
-- `query-cache.ts` - Caches query results
-- `traversal-cache.ts` - Caches traversal results
-- `index.ts` - CacheManager coordinator
-
-### 5. Core Storage (`src/core/`)
+### 4. Core Storage (`src/core/`)
 
 **Internal** - Handles persistence and optimization.
 
@@ -230,12 +212,6 @@ src/
 │   ├── gc.ts              # Garbage collection
 │   └── index.ts           # Exports
 │
-├── cache/                 # Caching layer
-│   ├── property-cache.ts  # Property caching
-│   ├── query-cache.ts     # Query result caching
-│   ├── traversal-cache.ts # Traversal caching
-│   └── index.ts           # Exports
-│
 ├── core/                  # Storage layer
 │   ├── wal.ts             # Write-ahead log
 │   ├── snapshot-reader.ts # Snapshot reading
@@ -251,7 +227,6 @@ src/
 │   ├── crc.ts             # Checksums
 │   ├── hash.ts            # Hashing
 │   ├── lock.ts            # File locks
-│   ├── lru.ts             # LRU cache
 │   └── index.ts           # Exports
 │
 ├── check/                 # Verification

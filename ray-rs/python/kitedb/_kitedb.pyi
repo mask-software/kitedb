@@ -6,6 +6,8 @@ parameters and literal defaults), so update both together.
 
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
+from typing_extensions import deprecated
+
 # ============================================================================
 # Exceptions
 # ============================================================================
@@ -59,6 +61,7 @@ class OpenOptions:
     background_checkpoint: Optional[bool]
     checkpoint_compression: Optional[CompressionOptions]
     cache_snapshot: Optional[bool]
+    # Deprecated: the cache_* options have no effect (the cache layer was removed).
     cache_enabled: Optional[bool]
     cache_max_node_props: Optional[int]
     cache_max_edge_props: Optional[int]
@@ -94,6 +97,7 @@ class OpenOptions:
         background_checkpoint: Optional[bool] = None,
         checkpoint_compression: Optional[CompressionOptions] = None,
         cache_snapshot: Optional[bool] = None,
+        # Deprecated: the cache_* options have no effect.
         cache_enabled: Optional[bool] = None,
         cache_max_node_props: Optional[int] = None,
         cache_max_edge_props: Optional[int] = None,
@@ -209,8 +213,9 @@ class CheckResult:
     def warning_count(self) -> int: ...
     def __bool__(self) -> bool: ...
 
+@deprecated("The cache layer was removed; Database.cache_stats() always returns None.")
 class CacheStats:
-    """Cache statistics."""
+    """Deprecated: the cache layer was removed."""
     property_cache_hits: int
     property_cache_misses: int
     property_cache_size: int
@@ -337,8 +342,9 @@ class EdgePage:
     ) -> None: ...
     def __len__(self) -> int: ...
 
+@deprecated("The cache layer was removed; every field is zero.")
 class CacheLayerMetrics:
-    """Cache layer metrics."""
+    """Deprecated: the cache layer was removed; every field is zero."""
     hits: int
     misses: int
     hit_rate: float
@@ -346,8 +352,9 @@ class CacheLayerMetrics:
     max_size: int
     utilization_percent: float
 
+@deprecated("The cache layer was removed; enabled is False and every count is zero.")
 class CacheMetrics:
-    """Cache metrics."""
+    """Deprecated: the cache layer was removed; enabled is False and every count is zero."""
     enabled: bool
     property_cache: CacheLayerMetrics
     traversal_cache: CacheLayerMetrics
@@ -411,7 +418,7 @@ class ReplicationMetrics:
 class MemoryMetrics:
     """Memory metrics."""
     delta_estimate_bytes: int
-    cache_estimate_bytes: int
+    cache_estimate_bytes: int  # Deprecated: always 0 (the cache layer was removed).
     snapshot_bytes: int
     total_estimate_bytes: int
     def human_readable(self) -> str: ...
@@ -422,7 +429,7 @@ class DatabaseMetrics:
     is_single_file: bool
     read_only: bool
     data: DataMetrics
-    cache: CacheMetrics
+    cache: CacheMetrics  # Deprecated: a disabled, empty cache (the cache layer was removed).
     mvcc: Optional[MvccMetrics]
     replication: ReplicationMetrics
     memory: MemoryMetrics
@@ -700,17 +707,28 @@ class Database:
     def get_nodes_page(self, options: Optional[PaginationOptions] = None) -> NodePage: ...
     def get_edges_page(self, options: Optional[PaginationOptions] = None) -> EdgePage: ...
 
-    # Cache operations
+    # Cache operations: deprecated no-ops (the cache layer was removed)
+    @deprecated("No effect: the cache layer was removed. Always returns False.")
     def cache_is_enabled(self) -> bool: ...
+    @deprecated("No effect: the cache layer was removed.")
     def cache_invalidate_node(self, node_id: int) -> None: ...
+    @deprecated("No effect: the cache layer was removed.")
     def cache_invalidate_edge(self, src: int, etype: int, dst: int) -> None: ...
+    @deprecated("No effect: the cache layer was removed.")
     def cache_invalidate_key(self, key: str) -> None: ...
+    @deprecated("No effect: the cache layer was removed.")
     def cache_clear(self) -> None: ...
+    @deprecated("No effect: the cache layer was removed.")
     def cache_clear_query(self) -> None: ...
+    @deprecated("No effect: the cache layer was removed.")
     def cache_clear_key(self) -> None: ...
+    @deprecated("No effect: the cache layer was removed.")
     def cache_clear_property(self) -> None: ...
+    @deprecated("No effect: the cache layer was removed.")
     def cache_clear_traversal(self) -> None: ...
+    @deprecated("No effect: the cache layer was removed. Always returns None.")
     def cache_stats(self) -> Optional[CacheStats]: ...
+    @deprecated("No effect: the cache layer was removed.")
     def cache_reset_stats(self) -> None: ...
 
     # Graph traversal (direction: "out", "in" or "both"; others raise ValueError)

@@ -322,22 +322,6 @@ const MEMORY_PARTS: {
 		],
 	},
 	{
-		title: "Caches",
-		meta: "off by default",
-		accent: "amber",
-		items: [
-			{
-				text: "Enabled with the ",
-				code: "cacheEnabled",
-				after: " open option.",
-			},
-			{
-				text: "Property cache: LRU, 10K node and 10K edge entries by default.",
-			},
-			{ text: "Traversal cache: LRU, invalidated when a node changes." },
-		],
-	},
-	{
 		title: "MVCC version chains",
 		meta: "MVCC only",
 		accent: "mint",

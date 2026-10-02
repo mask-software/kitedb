@@ -167,17 +167,17 @@ pub struct OpenOptions {
   pub background_checkpoint: Option<bool>,
   /// Compression options for checkpoint snapshots (single-file only)
   pub checkpoint_compression: Option<CompressionOptions>,
-  /// Enable caching
+  /// @deprecated No effect: the cache layer was removed. Still accepted so existing callers keep working.
   pub cache_enabled: Option<bool>,
-  /// Max node properties in cache (0 disables the node-property cache)
+  /// @deprecated No effect: the cache layer was removed. Still accepted so existing callers keep working.
   pub cache_max_node_props: Option<i64>,
-  /// Max edge properties in cache (0 disables the edge-property cache)
+  /// @deprecated No effect: the cache layer was removed. Still accepted so existing callers keep working.
   pub cache_max_edge_props: Option<i64>,
-  /// Max traversal cache entries (0 disables the traversal cache)
+  /// @deprecated No effect: the cache layer was removed. Still accepted so existing callers keep working.
   pub cache_max_traversal_entries: Option<i64>,
-  /// Max query cache entries (0 disables the query cache)
+  /// @deprecated No effect: the cache layer was removed. Still accepted so existing callers keep working.
   pub cache_max_query_entries: Option<i64>,
-  /// Query cache TTL in milliseconds (0 expires entries immediately)
+  /// @deprecated No effect: the cache layer was removed. Still accepted so existing callers keep working.
   pub cache_query_ttl_ms: Option<i64>,
   /// Sync mode: "Full", "Normal", or "Off" (default: "Full")
   pub sync_mode: Option<JsSyncMode>,
@@ -216,8 +216,6 @@ pub struct OpenOptions {
 
 impl OpenOptions {
   fn into_rust(self) -> Result<RustOpenOptions> {
-    use crate::types::{CacheOptions, PropertyCacheConfig, QueryCacheConfig, TraversalCacheConfig};
-
     let page_size = self
       .page_size
       .map(|v| validation::page_size(validation::u32_value("pageSize", v)?))
@@ -273,66 +271,6 @@ impl OpenOptions {
     }
     if let Some(compression) = self.checkpoint_compression {
       rust_opts = rust_opts.checkpoint_compression(Some(compression.into_rust()?));
-    }
-
-    let max_node_props = self
-      .cache_max_node_props
-      .map(|v| {
-        validation::non_negative_usize("cacheMaxNodeProps", v, validation::MAX_CACHE_ENTRIES)
-      })
-      .transpose()?
-      .unwrap_or(10_000);
-    let max_edge_props = self
-      .cache_max_edge_props
-      .map(|v| {
-        validation::non_negative_usize("cacheMaxEdgeProps", v, validation::MAX_CACHE_ENTRIES)
-      })
-      .transpose()?
-      .unwrap_or(10_000);
-    let max_traversal_entries = self
-      .cache_max_traversal_entries
-      .map(|v| {
-        validation::non_negative_usize("cacheMaxTraversalEntries", v, validation::MAX_CACHE_ENTRIES)
-      })
-      .transpose()?
-      .unwrap_or(5_000);
-    let max_query_entries = self
-      .cache_max_query_entries
-      .map(|v| {
-        validation::non_negative_usize("cacheMaxQueryEntries", v, validation::MAX_CACHE_ENTRIES)
-      })
-      .transpose()?
-      .unwrap_or(1_000);
-    let query_ttl_ms = self
-      .cache_query_ttl_ms
-      .map(|v| {
-        validation::non_negative_u64("cacheQueryTtlMs", v, validation::MAX_DURATION_MS as u64)
-      })
-      .transpose()?;
-
-    // Cache options
-    if self.cache_enabled == Some(true) {
-      let property_cache = Some(PropertyCacheConfig {
-        max_node_props,
-        max_edge_props,
-      });
-
-      let traversal_cache = Some(TraversalCacheConfig {
-        max_entries: max_traversal_entries,
-        max_neighbors_per_entry: 100,
-      });
-
-      let query_cache = Some(QueryCacheConfig {
-        max_entries: max_query_entries,
-        ttl_ms: query_ttl_ms,
-      });
-
-      rust_opts = rust_opts.cache(Some(CacheOptions {
-        enabled: true,
-        property_cache,
-        traversal_cache,
-        query_cache,
-      }));
     }
 
     // Sync mode
@@ -418,12 +356,6 @@ mod open_option_validation_tests {
       mvcc_gc_interval_ms: Some(1),
       mvcc_retention_ms: Some(0),
       mvcc_max_chain_depth: Some(1),
-      cache_enabled: Some(true),
-      cache_max_node_props: Some(0),
-      cache_max_edge_props: Some(1),
-      cache_max_traversal_entries: Some(0),
-      cache_max_query_entries: Some(0),
-      cache_query_ttl_ms: Some(0),
       checkpoint_threshold: Some(0.0),
       group_commit_window_ms: Some(0),
       replication_segment_max_bytes: Some(1),
@@ -473,14 +405,6 @@ mod open_option_validation_tests {
         ..Default::default()
       },
       OpenOptions {
-        cache_max_node_props: Some(-1),
-        ..Default::default()
-      },
-      OpenOptions {
-        cache_max_query_entries: Some(validation::MAX_CACHE_ENTRIES + 1),
-        ..Default::default()
-      },
-      OpenOptions {
         checkpoint_threshold: Some(2.0),
         ..Default::default()
       },
@@ -500,9 +424,15 @@ mod open_option_validation_tests {
       assert!(options.into_rust().is_err());
     }
 
+    // The cache layer was removed: its options are accepted and ignored,
+    // out-of-range values included.
     assert!(OpenOptions {
       cache_enabled: Some(true),
-      cache_max_node_props: Some(validation::MAX_CACHE_ENTRIES),
+      cache_max_node_props: Some(-1),
+      cache_max_edge_props: Some(i64::MAX),
+      cache_max_traversal_entries: Some(-1),
+      cache_max_query_entries: Some(validation::MAX_CACHE_ENTRIES + 1),
+      cache_query_ttl_ms: Some(-1),
       ..Default::default()
     }
     .into_rust()
@@ -1150,7 +1080,7 @@ impl From<RustCheckResult> for CheckResult {
   }
 }
 
-/// Cache statistics
+/// @deprecated The cache layer was removed; `cacheStats()` always returns null.
 #[napi(object)]
 pub struct JsCacheStats {
   pub property_cache_hits: i64,
@@ -1164,7 +1094,7 @@ pub struct JsCacheStats {
   pub query_cache_size: i64,
 }
 
-/// Cache layer metrics
+/// @deprecated The cache layer was removed; every field is zero.
 #[napi(object)]
 pub struct CacheLayerMetrics {
   pub hits: i64,
@@ -1175,13 +1105,33 @@ pub struct CacheLayerMetrics {
   pub utilization_percent: f64,
 }
 
-/// Cache metrics
+/// @deprecated The cache layer was removed; `enabled` is false and every count is zero.
 #[napi(object)]
 pub struct CacheMetrics {
   pub enabled: bool,
   pub property_cache: CacheLayerMetrics,
   pub traversal_cache: CacheLayerMetrics,
   pub query_cache: CacheLayerMetrics,
+}
+
+impl CacheMetrics {
+  /// What `collectMetrics()` reports for the removed cache layer.
+  fn removed() -> Self {
+    let empty = || CacheLayerMetrics {
+      hits: 0,
+      misses: 0,
+      hit_rate: 0.0,
+      size: 0,
+      max_size: 0,
+      utilization_percent: 0.0,
+    };
+    CacheMetrics {
+      enabled: false,
+      property_cache: empty(),
+      traversal_cache: empty(),
+      query_cache: empty(),
+    }
+  }
 }
 
 /// Data metrics
@@ -1253,6 +1203,7 @@ pub struct ReplicationMetrics {
 #[napi(object)]
 pub struct MemoryMetrics {
   pub delta_estimate_bytes: i64,
+  /// @deprecated The cache layer was removed; always 0.
   pub cache_estimate_bytes: i64,
   pub snapshot_bytes: i64,
   pub total_estimate_bytes: i64,
@@ -1265,6 +1216,7 @@ pub struct DatabaseMetrics {
   pub is_single_file: bool,
   pub read_only: bool,
   pub data: DataMetrics,
+  /// @deprecated The cache layer was removed; reports a disabled, empty cache.
   pub cache: CacheMetrics,
   pub mvcc: Option<MvccMetrics>,
   pub replication: ReplicationMetrics,
@@ -1327,30 +1279,6 @@ pub struct PushReplicationMetricsOtelOptions {
   pub ca_cert_pem_path: Option<String>,
   pub client_cert_pem_path: Option<String>,
   pub client_key_pem_path: Option<String>,
-}
-
-impl From<core_metrics::CacheLayerMetrics> for CacheLayerMetrics {
-  fn from(metrics: core_metrics::CacheLayerMetrics) -> Self {
-    CacheLayerMetrics {
-      hits: metrics.hits,
-      misses: metrics.misses,
-      hit_rate: metrics.hit_rate,
-      size: metrics.size,
-      max_size: metrics.max_size,
-      utilization_percent: metrics.utilization_percent,
-    }
-  }
-}
-
-impl From<core_metrics::CacheMetrics> for CacheMetrics {
-  fn from(metrics: core_metrics::CacheMetrics) -> Self {
-    CacheMetrics {
-      enabled: metrics.enabled,
-      property_cache: metrics.property_cache.into(),
-      traversal_cache: metrics.traversal_cache.into(),
-      query_cache: metrics.query_cache.into(),
-    }
-  }
 }
 
 impl From<core_metrics::DataMetrics> for DataMetrics {
@@ -1432,7 +1360,7 @@ impl From<core_metrics::MemoryMetrics> for MemoryMetrics {
   fn from(metrics: core_metrics::MemoryMetrics) -> Self {
     MemoryMetrics {
       delta_estimate_bytes: metrics.delta_estimate_bytes,
-      cache_estimate_bytes: metrics.cache_estimate_bytes,
+      cache_estimate_bytes: 0,
       snapshot_bytes: metrics.snapshot_bytes,
       total_estimate_bytes: metrics.total_estimate_bytes,
     }
@@ -1446,7 +1374,7 @@ impl From<core_metrics::DatabaseMetrics> for DatabaseMetrics {
       is_single_file: metrics.is_single_file,
       read_only: metrics.read_only,
       data: metrics.data.into(),
-      cache: metrics.cache.into(),
+      cache: CacheMetrics::removed(),
       mvcc: metrics.mvcc.map(Into::into),
       replication: metrics.replication.into(),
       memory: metrics.memory.into(),
@@ -3724,147 +3652,86 @@ impl Database {
   }
 
   // ========================================================================
-  // Cache Operations
+  // Cache Operations (deprecated no-ops: the cache layer was removed)
   // ========================================================================
 
-  /// Check if caching is enabled
+  /// Fails like every other method once the database is closed.
+  fn removed_cache_op(&self) -> Result<()> {
+    match self.inner.as_ref() {
+      Some(DatabaseInner::SingleFile(_)) => Ok(()),
+      None => Err(Error::from_reason("Database is closed")),
+    }
+  }
+
+  /// @deprecated The cache layer was removed; always false.
   #[napi]
   pub fn cache_is_enabled(&self) -> Result<bool> {
-    match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => Ok(db.cache_is_enabled()),
-      None => Err(Error::from_reason("Database is closed")),
-    }
+    self.removed_cache_op().map(|()| false)
   }
 
-  /// Invalidate all caches for a node
+  /// @deprecated No effect: the cache layer was removed.
   #[napi]
   pub fn cache_invalidate_node(&self, node_id: f64) -> Result<()> {
-    let node_id = validation::node_id("nodeId", node_id)?;
-    match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => {
-        db.cache_invalidate_node(node_id);
-        Ok(())
-      }
-      None => Err(Error::from_reason("Database is closed")),
-    }
+    validation::node_id("nodeId", node_id)?;
+    self.removed_cache_op()
   }
 
-  /// Invalidate caches for a specific edge
+  /// @deprecated No effect: the cache layer was removed.
   #[napi]
   pub fn cache_invalidate_edge(&self, src: f64, etype: f64, dst: f64) -> Result<()> {
-    let etype = validation::u32_value("etype", etype)?;
-    let src = validation::node_id("src", src)?;
-    let dst = validation::node_id("dst", dst)?;
-    match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => {
-        db.cache_invalidate_edge(src, etype as ETypeId, dst);
-        Ok(())
-      }
-      None => Err(Error::from_reason("Database is closed")),
-    }
+    validation::u32_value("etype", etype)?;
+    validation::node_id("src", src)?;
+    validation::node_id("dst", dst)?;
+    self.removed_cache_op()
   }
 
-  /// Invalidate a cached key lookup
+  /// @deprecated No effect: the cache layer was removed.
   #[napi]
   pub fn cache_invalidate_key(&self, key: String) -> Result<()> {
-    match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => {
-        db.cache_invalidate_key(&key);
-        Ok(())
-      }
-      None => Err(Error::from_reason("Database is closed")),
-    }
+    let _ = key;
+    self.removed_cache_op()
   }
 
-  /// Clear all caches
+  /// @deprecated No effect: the cache layer was removed.
   #[napi]
   pub fn cache_clear(&self) -> Result<()> {
-    match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => {
-        db.cache_clear();
-        Ok(())
-      }
-      None => Err(Error::from_reason("Database is closed")),
-    }
+    self.removed_cache_op()
   }
 
-  /// Clear only the query cache
+  /// @deprecated No effect: the cache layer was removed.
   #[napi]
   pub fn cache_clear_query(&self) -> Result<()> {
-    match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => {
-        db.cache_clear_query();
-        Ok(())
-      }
-      None => Err(Error::from_reason("Database is closed")),
-    }
+    self.removed_cache_op()
   }
 
-  /// Clear only the key cache
+  /// @deprecated No effect: the cache layer was removed.
   #[napi]
   pub fn cache_clear_key(&self) -> Result<()> {
-    match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => {
-        db.cache_clear_key();
-        Ok(())
-      }
-      None => Err(Error::from_reason("Database is closed")),
-    }
+    self.removed_cache_op()
   }
 
-  /// Clear only the property cache
+  /// @deprecated No effect: the cache layer was removed.
   #[napi]
   pub fn cache_clear_property(&self) -> Result<()> {
-    match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => {
-        db.cache_clear_property();
-        Ok(())
-      }
-      None => Err(Error::from_reason("Database is closed")),
-    }
+    self.removed_cache_op()
   }
 
-  /// Clear only the traversal cache
+  /// @deprecated No effect: the cache layer was removed.
   #[napi]
   pub fn cache_clear_traversal(&self) -> Result<()> {
-    match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => {
-        db.cache_clear_traversal();
-        Ok(())
-      }
-      None => Err(Error::from_reason("Database is closed")),
-    }
+    self.removed_cache_op()
   }
 
-  /// Get cache statistics
+  /// @deprecated The cache layer was removed; always null.
   #[napi]
   pub fn cache_stats(&self) -> Result<Option<JsCacheStats>> {
-    match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => Ok(db.cache_stats().map(|s| JsCacheStats {
-        property_cache_hits: s.property_cache_hits as i64,
-        property_cache_misses: s.property_cache_misses as i64,
-        property_cache_size: s.property_cache_size as i64,
-        traversal_cache_hits: s.traversal_cache_hits as i64,
-        traversal_cache_misses: s.traversal_cache_misses as i64,
-        traversal_cache_size: s.traversal_cache_size as i64,
-        query_cache_hits: s.query_cache_hits as i64,
-        query_cache_misses: s.query_cache_misses as i64,
-        query_cache_size: s.query_cache_size as i64,
-      })),
-      None => Err(Error::from_reason("Database is closed")),
-    }
+    self.removed_cache_op().map(|()| None)
   }
 
-  /// Reset cache statistics
+  /// @deprecated No effect: the cache layer was removed.
   #[napi]
   pub fn cache_reset_stats(&self) -> Result<()> {
-    match self.inner.as_ref() {
-      Some(DatabaseInner::SingleFile(db)) => {
-        db.cache_reset_stats();
-        Ok(())
-      }
-      None => Err(Error::from_reason("Database is closed")),
-    }
+    self.removed_cache_op()
   }
 
   // ========================================================================

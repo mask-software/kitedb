@@ -1,23 +1,27 @@
-//! b4 cache lane: the single-file cache layer is dead code.
+//! b4 cache lane: the single-file cache layer was removed.
 //!
-//! `SingleFileOpenOptions::cache` / `enable_cache()` (and `cacheEnabled` /
-//! `cache_enabled` in the Node and Python bindings) build a `CacheManager`, and
-//! every write invalidates it under a global lock, but no read path ever looks a
-//! value up in it or stores one. The first test asserts what the option
-//! advertises, that an enabled cache serves repeated reads, and fails: every
-//! counter stays at zero. The ignored test measures what the dead layer costs
-//! the write path.
+//! It was never read: no lookup consulted it, so enabling it gave zero hits
+//! and only added a global lock plus invalidation work to every write. The
+//! open options that configured it (`SingleFileOpenOptions::cache`,
+//! `enable_cache()`) are still accepted, deprecated, and have no effect. These
+//! tests pin that down; the ignored test measures the write path with the
+//! options on and off.
 
+// The deprecated cache options are exercised on purpose.
+#![allow(deprecated)]
+
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use kitedb::core::single_file::{
   close_single_file, open_single_file, SingleFileDB, SingleFileOpenOptions, SyncMode,
 };
-use kitedb::metrics::collect_metrics_single_file;
-use kitedb::types::{ETypeId, NodeId, PropKeyId, PropValue};
+use kitedb::types::{
+  CacheOptions, ETypeId, NodeId, PropKeyId, PropValue, PropertyCacheConfig, QueryCacheConfig,
+  TraversalCacheConfig,
+};
 
 const NODES: usize = 64;
-const READ_ROUNDS: usize = 50;
 
 struct Graph {
   nodes: Vec<NodeId>,
@@ -52,17 +56,16 @@ fn seed_ring(db: &SingleFileDB) -> Graph {
   }
 }
 
-/// Reads every key, node prop, edge list, and edge prop `READ_ROUNDS` times
-/// through the public read API. Returns the number of read calls made.
-fn read_ring(db: &SingleFileDB, g: &Graph) -> usize {
-  let mut reads = 0;
-  for _ in 0..READ_ROUNDS {
+/// Reads every key, node prop, edge list, and edge prop twice through the
+/// public read API, expecting node `i` to be named `name_of(i)`.
+fn read_ring(db: &SingleFileDB, g: &Graph, name_of: impl Fn(usize) -> String) {
+  for _ in 0..2 {
     for (i, &node) in g.nodes.iter().enumerate() {
       let next = g.nodes[(i + 1) % NODES];
       assert_eq!(db.node_by_key(&format!("n{i}")), Some(node));
       assert_eq!(
         db.node_prop(node, g.name),
-        Some(PropValue::String(format!("node {i}")))
+        Some(PropValue::String(name_of(i)))
       );
       assert_eq!(db.node_props(node).map(|props| props.len()), Some(1));
       assert_eq!(db.out_neighbors(node, g.knows), vec![next]);
@@ -72,63 +75,70 @@ fn read_ring(db: &SingleFileDB, g: &Graph) -> usize {
         db.edge_prop(node, g.knows, next, g.weight),
         Some(PropValue::I64(i as i64))
       );
-      assert_eq!(
-        db.edge_props(node, g.knows, next).map(|props| props.len()),
-        Some(1)
-      );
-      reads += 8;
     }
   }
-  reads
+}
+
+/// Seeds, reads, overwrites every name, reads again, checkpoints, and reopens,
+/// checking every read sees the latest write.
+fn exercise(path: &Path, options: SingleFileOpenOptions) {
+  let db = open_single_file(path, options.clone()).expect("open");
+  let g = seed_ring(&db);
+  read_ring(&db, &g, |i| format!("node {i}"));
+
+  db.begin(false).expect("begin");
+  for (i, &node) in g.nodes.iter().enumerate() {
+    db.set_node_prop(node, g.name, PropValue::String(format!("renamed {i}")))
+      .expect("rename");
+  }
+  db.commit().expect("commit");
+  read_ring(&db, &g, |i| format!("renamed {i}"));
+
+  db.checkpoint().expect("checkpoint");
+  read_ring(&db, &g, |i| format!("renamed {i}"));
+  close_single_file(db).expect("close");
+
+  let db = open_single_file(path, options).expect("reopen");
+  read_ring(&db, &g, |i| format!("renamed {i}"));
+  close_single_file(db).expect("close");
 }
 
 #[test]
-fn enabled_cache_serves_repeated_reads() {
+fn cache_options_are_accepted_and_ignored() {
+  let base = || SingleFileOpenOptions::new().auto_checkpoint(false);
+  let tiny_caches = CacheOptions {
+    enabled: true,
+    property_cache: Some(PropertyCacheConfig {
+      max_node_props: 0,
+      max_edge_props: 1,
+    }),
+    traversal_cache: Some(TraversalCacheConfig {
+      max_entries: 1,
+      max_neighbors_per_entry: 0,
+    }),
+    query_cache: Some(QueryCacheConfig {
+      max_entries: 0,
+      ttl_ms: Some(0),
+    }),
+  };
+  let variants = [
+    ("plain", base()),
+    ("enable_cache", base().enable_cache()),
+    ("cache(tiny)", base().cache(Some(tiny_caches))),
+    (
+      "cache(disabled)",
+      base().cache(Some(CacheOptions::default())),
+    ),
+  ];
+
   let dir = tempfile::tempdir().expect("tempdir");
-  let path = dir.path().join("cache.kitedb");
-  let db = open_single_file(
-    &path,
-    SingleFileOpenOptions::new()
-      .auto_checkpoint(false)
-      .enable_cache(),
-  )
-  .expect("open");
-  assert!(db.cache_is_enabled(), "enable_cache() left the cache off");
-
-  let g = seed_ring(&db);
-  // Served from the delta first, then from the snapshot after a checkpoint.
-  let mut reads = read_ring(&db, &g);
-  db.checkpoint().expect("checkpoint");
-  reads += read_ring(&db, &g);
-
-  let stats = db.cache_stats().expect("an enabled cache reports stats");
-  let metrics = collect_metrics_single_file(&db).cache;
-  close_single_file(db).expect("close");
-
-  // Every cache lookup counts a hit or a miss, so `lookups == 0` means no
-  // read consulted the cache, and `entries == 0` means none populated it.
-  let lookups = stats.property_cache_hits
-    + stats.property_cache_misses
-    + stats.traversal_cache_hits
-    + stats.traversal_cache_misses
-    + stats.query_cache_hits
-    + stats.query_cache_misses;
-  let hits = stats.property_cache_hits + stats.traversal_cache_hits + stats.query_cache_hits;
-  let entries = stats.property_cache_size + stats.traversal_cache_size + stats.query_cache_size;
-  assert!(
-    metrics.enabled,
-    "metrics report the enabled cache as off: {metrics:?}"
-  );
-  assert!(
-    lookups > 0 && hits > 0 && entries > 0,
-    "cache enabled, but {reads} reads (each key/prop/edge read {} times) never consulted it: \
-     lookups={lookups} hits={hits} entries={entries}\n  cache_stats: {stats:?}\n  metrics: {metrics:?}",
-    2 * READ_ROUNDS,
-  );
+  for (name, options) in variants {
+    exercise(&dir.path().join(format!("{name}.kitedb")), options);
+  }
 }
 
 // ============================================================================
-// Write-path overhead of the dead layer
+// Write path, cache options on vs off
 // ============================================================================
 
 const BENCH_NODES: usize = 1_000;
@@ -156,7 +166,6 @@ fn commit_loop(shape: Shape, cache: bool) -> Duration {
     options = options.enable_cache();
   }
   let db = open_single_file(&path, options).expect("open");
-  assert_eq!(db.cache_is_enabled(), cache);
 
   db.begin(false).expect("begin");
   let knows = db.define_etype("KNOWS").expect("etype");
@@ -204,44 +213,9 @@ fn ms(runs: &[Duration]) -> Vec<u128> {
   runs.iter().map(Duration::as_millis).collect()
 }
 
-/// Time `INVALIDATIONS` direct calls of the hook every write makes
-/// (`cache_invalidate_node` / `cache_invalidate_edge`). Returns ns per call.
-fn invalidation_calls(cache: bool, edge: bool) -> f64 {
-  const INVALIDATIONS: u64 = 10_000_000;
-  let dir = tempfile::tempdir().expect("tempdir");
-  let mut options = SingleFileOpenOptions::new().sync_mode(SyncMode::Off);
-  if cache {
-    options = options.enable_cache();
-  }
-  let db = open_single_file(dir.path().join("hook.kitedb"), options).expect("open");
-  let started = Instant::now();
-  for i in 0..INVALIDATIONS {
-    let node = std::hint::black_box(i % BENCH_NODES as u64);
-    if edge {
-      db.cache_invalidate_edge(node, 1, node + 1);
-    } else {
-      db.cache_invalidate_node(node);
-    }
-  }
-  let ns = started.elapsed().as_nanos() as f64 / INVALIDATIONS as f64;
-  close_single_file(db).expect("close");
-  ns
-}
-
 #[test]
 #[ignore = "benchmark: cargo test --release --no-default-features --test b4_cache -- --ignored --nocapture"]
-fn write_overhead_cache_enabled_vs_disabled() {
-  for edge in [false, true] {
-    let best = |cache| {
-      (0..BENCH_RUNS)
-        .map(|_| invalidation_calls(cache, edge))
-        .fold(f64::INFINITY, f64::min)
-    };
-    let (off, on) = (best(false), best(true));
-    let hook = if edge { "edge" } else { "node" };
-    println!("invalidate_{hook} hook, best of {BENCH_RUNS}: cache off {off:.1} ns/call, on {on:.1} ns/call");
-  }
-
+fn write_path_cache_options_on_vs_off() {
   for shape in [Shape::OneProp, Shape::HundredProps, Shape::HundredEdges] {
     commit_loop(shape, false);
     commit_loop(shape, true);
@@ -260,14 +234,11 @@ fn write_overhead_cache_enabled_vs_disabled() {
     let (off_med, on_med) = (median(off.clone()), median(on.clone()));
     println!(
       "{shape:?}: {BENCH_WRITES} writes, ns/write cache off min {:.0} / median {:.0}, \
-       on min {:.0} / median {:.0} (min {:+.1}%, median {:+.1}%)\n  \
-       off runs (ms): {:?}\n  on runs (ms):  {:?}",
+       on min {:.0} / median {:.0}\n  off runs (ms): {:?}\n  on runs (ms):  {:?}",
       ns_per_write(off_min),
       ns_per_write(off_med),
       ns_per_write(on_min),
       ns_per_write(on_med),
-      (on_min.as_secs_f64() / off_min.as_secs_f64() - 1.0) * 100.0,
-      (on_med.as_secs_f64() / off_med.as_secs_f64() - 1.0) * 100.0,
       ms(&off),
       ms(&on),
     );
