@@ -935,14 +935,9 @@ fn translate_prop_map(
 
 /// Bootstrap phase 1: delete every replica node that is missing from the
 /// source or holds a different key, in its own transaction. All deletes must
-/// precede all creates (keys move between nodes and an id can return with a
-/// new key), and the delta cannot delete and recreate one id inside a single
-/// transaction. Until the bootstrap completes, catch-up refuses to run over
-/// the partially removed state.
-///
-/// Recreating an id whose deleted copy lives in the snapshot leaves the new
-/// node hidden behind the delete tombstone, so such deletes are folded into
-/// a new snapshot before phase 2 recreates the ids.
+/// precede all creates: keys move between nodes, and an id can return with a
+/// new key (phase 2 recreates it as a fresh node). Until the bootstrap
+/// completes, catch-up refuses to run over the partially removed state.
 fn remove_stale_nodes(
   replica: &SingleFileDB,
   source: &SingleFileDB,
@@ -958,26 +953,13 @@ fn remove_stale_nodes(
   if stale.is_empty() {
     return Ok(());
   }
-  let recreates_snapshot_node = {
-    let snapshot = replica.snapshot.read();
-    stale.iter().any(|&node_id| {
-      source.node_exists(node_id)
-        && snapshot
-          .as_ref()
-          .is_some_and(|snapshot| snapshot.phys_node(node_id).is_some())
-    })
-  };
 
   runtime.mark_bootstrap_incomplete()?;
   let tx_guard = replica.begin_guard(false)?;
   for node_id in stale {
     replica.delete_node(node_id)?;
   }
-  tx_guard.commit()?;
-  if recreates_snapshot_node {
-    replica.checkpoint()?;
-  }
-  Ok(())
+  tx_guard.commit()
 }
 
 /// Bootstrap phase 2: create the source's nodes and copy schema, properties,

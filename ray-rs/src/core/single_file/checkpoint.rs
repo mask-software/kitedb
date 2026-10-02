@@ -1827,14 +1827,14 @@ impl SingleFileDB {
     // Add edges from delta
     let delta_edges_start = edges.len();
     for (&src, patches) in &delta.out_add {
-      // Skip edges from deleted nodes
-      if delta.is_node_deleted(src) {
+      // Skip edges from deleted nodes (a recreated node keeps its new edges)
+      if delta.is_node_removed(src) {
         continue;
       }
 
       for patch in patches {
         // Skip edges to deleted nodes
-        if delta.is_node_deleted(patch.other) {
+        if delta.is_node_removed(patch.other) {
           continue;
         }
 

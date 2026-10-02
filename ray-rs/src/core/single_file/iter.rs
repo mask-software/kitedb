@@ -6,6 +6,7 @@ use crate::mvcc::visibility::{edge_exists as mvcc_edge_exists, node_exists as mv
 use crate::types::*;
 use std::collections::HashSet;
 
+use super::read::NodeLayers;
 use super::SingleFileDB;
 
 // ============================================================================
@@ -44,8 +45,13 @@ impl NodeIterator {
     let delta = db.delta.read();
     let snapshot = db.snapshot.read();
     let vc_guard = db.mvcc.as_ref().map(|mvcc| mvcc.version_chain.lock());
+    let layers = NodeLayers {
+      pending,
+      delta: &delta,
+    };
 
-    // 1. Collect nodes from snapshot (excluding deleted)
+    // 1. Collect nodes from snapshot (excluding deleted ones; a recreated
+    // node is listed with the delta's nodes)
     if let Some(ref snap) = *snapshot {
       let num_nodes = snap.header.num_nodes as u32;
       for phys in 0..num_nodes {
@@ -55,13 +61,7 @@ impl NodeIterator {
             .as_ref()
             .and_then(|vc| vc.node_version(node_id))
             .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
-          if pending.is_some_and(|p| p.is_node_deleted(node_id)) {
-            continue;
-          }
-          if node_visible == Some(false) {
-            continue;
-          }
-          if node_visible.is_none() && delta.is_node_deleted(node_id) {
+          if !layers.sees_snapshot(node_id, node_visible) {
             continue;
           }
           nodes.push(node_id);
@@ -71,29 +71,19 @@ impl NodeIterator {
 
     // 2. Add nodes created in delta (excluding deleted)
     for &node_id in delta.created_nodes.keys() {
-      if pending.is_some_and(|p| p.is_node_deleted(node_id)) {
-        continue;
-      }
       let node_visible = vc_guard
         .as_ref()
         .and_then(|vc| vc.node_version(node_id))
         .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
-      if node_visible == Some(false) {
-        continue;
-      }
-      if node_visible.is_none() && delta.deleted_nodes.contains(&node_id) {
+      if !layers.sees_delta(node_id, node_visible) {
         continue;
       }
       nodes.push(node_id);
     }
 
-    // 3. Add nodes created in pending (excluding deleted)
+    // 3. Add nodes created (or recreated) in pending
     if let Some(pending_delta) = pending {
-      for &node_id in pending_delta.created_nodes.keys() {
-        if !pending_delta.deleted_nodes.contains(&node_id) {
-          nodes.push(node_id);
-        }
-      }
+      nodes.extend(pending_delta.created_nodes.keys().copied());
     }
 
     // Sort for consistent ordering
@@ -179,6 +169,10 @@ impl SingleFileDB {
     let vc_guard = self.mvcc.as_ref().map(|mvcc| mvcc.version_chain.lock());
     let mut edges = Vec::new();
     let mut read_srcs = (self.mvcc.is_some() && txid != 0).then(HashSet::<NodeId>::new);
+    let layers = NodeLayers {
+      pending,
+      delta: &delta,
+    };
 
     // From snapshot
     if let Some(ref snap) = *snapshot {
@@ -190,10 +184,7 @@ impl SingleFileDB {
             .as_ref()
             .and_then(|vc| vc.node_version(src))
             .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
-          if src_visible == Some(false)
-            || pending.is_some_and(|p| p.is_node_deleted(src))
-            || (src_visible.is_none() && delta.is_node_deleted(src))
-          {
+          if !layers.sees_snapshot(src, src_visible) {
             continue;
           }
           if let Some(ref mut srcs) = read_srcs {
@@ -214,10 +205,7 @@ impl SingleFileDB {
                 .as_ref()
                 .and_then(|vc| vc.node_version(dst))
                 .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
-              if dst_visible == Some(false)
-                || pending.is_some_and(|p| p.is_node_deleted(dst))
-                || (dst_visible.is_none() && delta.is_node_deleted(dst))
-              {
+              if !layers.sees_snapshot(dst, dst_visible) {
                 continue;
               }
               let edge_visible = vc_guard
@@ -252,10 +240,7 @@ impl SingleFileDB {
           .as_ref()
           .and_then(|vc| vc.node_version(src))
           .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
-        if src_visible == Some(false)
-          || pending.is_some_and(|p| p.is_node_deleted(src))
-          || (src_visible.is_none() && delta.is_node_deleted(src))
-        {
+        if !layers.sees_delta(src, src_visible) {
           continue;
         }
         if let Some(ref mut srcs) = read_srcs {
@@ -265,10 +250,7 @@ impl SingleFileDB {
           .as_ref()
           .and_then(|vc| vc.node_version(patch.other))
           .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
-        if dst_visible == Some(false)
-          || pending.is_some_and(|p| p.is_node_deleted(patch.other))
-          || (dst_visible.is_none() && delta.is_node_deleted(patch.other))
-        {
+        if !layers.sees_delta(patch.other, dst_visible) {
           continue;
         }
         let edge_visible = vc_guard
@@ -303,10 +285,7 @@ impl SingleFileDB {
             .as_ref()
             .and_then(|vc| vc.node_version(src))
             .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
-          if src_visible == Some(false)
-            || pending_delta.is_node_deleted(src)
-            || (src_visible.is_none() && delta.is_node_deleted(src))
-          {
+          if !layers.sees_pending(src, src_visible) {
             continue;
           }
           if let Some(ref mut srcs) = read_srcs {
@@ -316,10 +295,7 @@ impl SingleFileDB {
             .as_ref()
             .and_then(|vc| vc.node_version(patch.other))
             .map(|version| mvcc_node_exists(Some(version), tx_snapshot_ts, txid));
-          if dst_visible == Some(false)
-            || pending_delta.is_node_deleted(patch.other)
-            || (dst_visible.is_none() && delta.is_node_deleted(patch.other))
-          {
+          if !layers.sees_pending(patch.other, dst_visible) {
             continue;
           }
 

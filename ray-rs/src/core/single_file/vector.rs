@@ -220,7 +220,7 @@ impl SingleFileDB {
     let tx_handle = self.current_tx_handle();
     if let Some(handle) = tx_handle.as_ref() {
       let tx = handle.lock();
-      if tx.pending.is_node_deleted(node_id) {
+      if tx.pending.is_node_removed(node_id) {
         return None;
       }
       if let Some(pending) = tx.pending.pending_vectors.get(&(node_id, prop_key_id)) {
@@ -231,7 +231,7 @@ impl SingleFileDB {
     let delta = self.delta.read();
 
     // Check if node is deleted
-    if delta.is_node_deleted(node_id) {
+    if delta.is_node_removed(node_id) {
       return None;
     }
 
@@ -256,7 +256,7 @@ impl SingleFileDB {
     let tx_handle = self.current_tx_handle();
     if let Some(handle) = tx_handle.as_ref() {
       let tx = handle.lock();
-      if tx.pending.is_node_deleted(node_id) {
+      if tx.pending.is_node_removed(node_id) {
         return false;
       }
       if let Some(pending) = tx.pending.pending_vectors.get(&(node_id, prop_key_id)) {
@@ -267,7 +267,7 @@ impl SingleFileDB {
     let delta = self.delta.read();
 
     // Check if node is deleted
-    if delta.is_node_deleted(node_id) {
+    if delta.is_node_removed(node_id) {
       return false;
     }
 
