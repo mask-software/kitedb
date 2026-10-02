@@ -178,6 +178,74 @@ fn prune_drops_old_entries_once_the_reader_finishes() {
   assert!(stats.pruned >= MAX_COMMITTED_WRITES / 2);
 }
 
+/// Rewriting the same keys while a reader pins every entry leaves stale
+/// entries in pruning's commit-order log; compaction keeps it near the live
+/// size at amortized constant cost.
+#[test]
+fn commit_log_stays_bounded_when_keys_are_rewritten() {
+  const COMMITS: usize = 20_000;
+  const HOT_KEYS: usize = 10;
+  let mut tx_mgr = TxManager::new();
+  let (_reader, _) = tx_mgr.begin_tx();
+
+  for c in 0..COMMITS {
+    let (txid, _) = tx_mgr.begin_tx();
+    tx_mgr.record_write(txid, node_key(c % HOT_KEYS));
+    tx_mgr.commit_tx(txid).expect("commit");
+  }
+
+  assert_eq!(tx_mgr.committed_writes_stats().size, HOT_KEYS);
+  let log_len = tx_mgr.committed_writes_log_len();
+  assert!(
+    log_len <= 2 * HOT_KEYS + 1024 + 1,
+    "commit log holds {log_len} entries for {HOT_KEYS} live keys"
+  );
+  assert!(
+    tx_mgr.prune_work <= 3 * COMMITS as u64,
+    "compaction visited {} entries over {COMMITS} commits",
+    tx_mgr.prune_work
+  );
+}
+
+/// Pruning skips a key's stale entries: a key rewritten after the reader's
+/// snapshot keeps its newest commit indexed, so it still conflicts.
+#[test]
+fn prune_keeps_rewritten_keys_a_snapshot_still_needs() {
+  let mut tx_mgr = TxManager::new();
+  let detector = ConflictDetector::new();
+
+  let (bulk, _) = tx_mgr.begin_tx();
+  for i in 0..MAX_COMMITTED_WRITES {
+    tx_mgr.record_write(bulk, node_key(i));
+  }
+  let bulk_ts = tx_mgr.commit_tx(bulk).expect("commit bulk");
+
+  let (reader, _) = tx_mgr.begin_tx();
+  tx_mgr.record_read(reader, node_key(3));
+
+  let (writer, _) = tx_mgr.begin_tx();
+  tx_mgr.record_write(writer, node_key(3));
+  tx_mgr.record_write(writer, node_key(MAX_COMMITTED_WRITES));
+  let writer_ts = tx_mgr.commit_tx(writer).expect("commit writer");
+  assert!(writer_ts > bulk_ts);
+
+  let stats = tx_mgr.committed_writes_stats();
+  assert_eq!(
+    stats.size,
+    MAX_COMMITTED_WRITES / 2,
+    "bulk entries predate the reader, so pruning must reach its target"
+  );
+  assert_eq!(tx_mgr.committed_write_ts(&node_key(3), 0), Some(writer_ts));
+  assert_eq!(
+    tx_mgr.committed_write_ts(&node_key(MAX_COMMITTED_WRITES), 0),
+    Some(writer_ts)
+  );
+  assert!(
+    detector.validate_commit(&tx_mgr, reader).is_err(),
+    "the reader read a key rewritten after its snapshot"
+  );
+}
+
 // ============================================================================
 // Finding 2: committed transactions keep their read/write sets
 // ============================================================================

@@ -11,6 +11,8 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::mvcc::gc::GcSleeper;
 use crate::mvcc::{ConflictDetector, GarbageCollector, GcConfig, TxManager, VersionChainManager};
 use crate::types::{Timestamp, TxId};
 
@@ -24,6 +26,9 @@ pub struct MvccManager {
   pub conflict_detector: ConflictDetector,
   pub gc: Arc<Mutex<GarbageCollector>>,
   gc_stop: Arc<AtomicBool>,
+  /// Wakes the GC thread from its sleep between runs on stop
+  #[cfg(not(target_arch = "wasm32"))]
+  gc_sleeper: Arc<GcSleeper>,
   #[cfg(not(target_arch = "wasm32"))]
   gc_handle: Mutex<Option<thread::JoinHandle<()>>>,
   #[cfg(target_arch = "wasm32")]
@@ -42,6 +47,8 @@ impl MvccManager {
       conflict_detector: ConflictDetector::new(),
       gc: Arc::new(Mutex::new(GarbageCollector::with_config(gc_config))),
       gc_stop: Arc::new(AtomicBool::new(false)),
+      #[cfg(not(target_arch = "wasm32"))]
+      gc_sleeper: Arc::new(GcSleeper::default()),
       #[cfg(not(target_arch = "wasm32"))]
       gc_handle: Mutex::new(None),
       #[cfg(target_arch = "wasm32")]
@@ -71,6 +78,7 @@ impl MvccManager {
     let vc = self.version_chain.clone();
     let gc = self.gc.clone();
     let stop_flag = self.gc_stop.clone();
+    let sleeper = self.gc_sleeper.clone();
 
     let handle = thread::spawn(move || loop {
       let interval_ms = {
@@ -78,9 +86,7 @@ impl MvccManager {
         gc.config().interval_ms
       };
 
-      thread::sleep(Duration::from_millis(interval_ms));
-
-      if stop_flag.load(Ordering::SeqCst) {
+      if sleeper.sleep(&stop_flag, Duration::from_millis(interval_ms)) {
         break;
       }
 
@@ -107,6 +113,7 @@ impl MvccManager {
     self.gc_stop.store(true, Ordering::SeqCst);
     #[cfg(not(target_arch = "wasm32"))]
     {
+      self.gc_sleeper.wake();
       if let Some(handle) = self.gc_handle.lock().take() {
         let _ = handle.join();
       }
