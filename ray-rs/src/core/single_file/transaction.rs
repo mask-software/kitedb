@@ -1986,6 +1986,10 @@ mod tests {
 #[path = "w2_commit_durability_tests.rs"]
 mod w2_tests;
 
+/// raydb-b4 commit-pipeline: concurrent MVCC commits.
+#[cfg(test)]
+#[path = "b4_commit_pipeline_tests.rs"]
+mod b4_commit_pipeline_tests;
 /// raydb-b4 `mvcc` lane, finding 5: transactions that begin during a commit's
 /// publish.
 #[cfg(test)]
