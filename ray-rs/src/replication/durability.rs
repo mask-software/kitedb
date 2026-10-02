@@ -10,7 +10,9 @@
 //!
 //! In every mode a small metadata file (manifest, health, replica progress,
 //! replica cursor) is replaced atomically with its content synced first, so
-//! a crash can revert it but never leave it torn.
+//! a crash can revert it but never leave it torn. A replica in Normal or Off
+//! mode makes its applied commits durable before it writes the cursor that
+//! covers them, once per pull.
 //!
 //! A sync is a plain `fsync`, and `F_FULLFSYNC` (macOS) only with the
 //! database's `full_fsync` opt-in in Full mode, as for the database file.

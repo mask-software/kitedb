@@ -171,7 +171,10 @@ Replica:
 - Persist and monitor `applied_log_index`.
 
 Replica catch-up applies each contiguous run of frames in one transaction (split at 1/8 of the replica's WAL) and
-moves its cursor once per pull. A run that fails is retried one frame per transaction, so the frames before the
+moves its cursor once per pull. In Normal and Off sync modes the replica first makes the applied commits durable
+(writes its WAL and header and syncs, as close does), so a crash never leaves the cursor ahead of the data; a crash
+before the cursor moves makes the replica apply those frames again, which converges. A bootstrap does the same
+before it sets its cursor. A run that fails is retried one frame per transaction, so the frames before the
 failing one still apply and the error names the failing frame (`replica apply failed at epoch:log_index`).
 
 Primary:

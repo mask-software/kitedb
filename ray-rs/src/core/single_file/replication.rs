@@ -159,7 +159,8 @@ impl SingleFileDB {
   ///
   /// The source's state is copied in bounded transactions; the replica is
   /// marked incomplete before the first one commits, until the cursor is set
-  /// at the end, so catch-up never runs over a partial copy. The source must
+  /// at the end (once the copy is durable), so catch-up never runs over a
+  /// partial copy. The source must
   /// stay quiet for the copy: a change to its file (length, modification
   /// time, header) or to its replication head between the start and the end
   /// makes the attempt retry.
@@ -207,6 +208,7 @@ impl SingleFileDB {
         Ok((bootstrap_position, schema_map))
       })()
       .and_then(|((epoch, log_index), schema_map)| {
+        self.make_applied_durable()?;
         runtime.store_schema_map(schema_map)?;
         runtime.mark_applied(epoch, log_index)?;
         runtime.clear_error()
@@ -315,9 +317,10 @@ impl SingleFileDB {
 
   /// Apply the frames after the cursor: each contiguous run in one
   /// transaction (split when its WAL records outgrow the batch budget), with
-  /// one cursor update at the end. A run that fails is applied again one
-  /// frame per transaction, which applies the frames before the failing one,
-  /// moves the cursor past them, and names the failing frame.
+  /// one cursor update at the end, after the applied commits are durable
+  /// (`make_applied_durable`). A run that fails is applied again one frame
+  /// per transaction, which applies the frames before the failing one, moves
+  /// the cursor past them, and names the failing frame.
   fn replica_catch_up_attempt(
     &self,
     runtime: &ReplicaReplication,
@@ -363,8 +366,9 @@ impl SingleFileDB {
 
     if progress.applied > 0 {
       let (epoch, log_index) = progress.position;
-      let persisted = runtime
-        .store_schema_map(progress.schema_map)
+      let persisted = self
+        .make_applied_durable()
+        .and_then(|()| runtime.store_schema_map(progress.schema_map))
         .and_then(|_| runtime.mark_applied(epoch, log_index));
       if let Err(error) = persisted {
         return Err(match outcome {
@@ -379,6 +383,19 @@ impl SingleFileDB {
 
     runtime.clear_error()?;
     Ok(progress.applied)
+  }
+
+  /// Make this replica's applied commits durable, before a cursor that
+  /// covers them is written: the cursor file is synced at once, and a cursor
+  /// that survives a crash its data did not makes catch-up skip that data.
+  /// Full-mode commits are durable already. In Normal mode a commit's WAL
+  /// and header are written but not synced, and in Off mode not written at
+  /// all: write them and sync, once per pull, as close does.
+  fn make_applied_durable(&self) -> Result<()> {
+    if self.sync_mode == SyncMode::Full {
+      return Ok(());
+    }
+    self.persist_for_close()
   }
 
   /// Export a snapshot of this primary, with a copy of the database file
