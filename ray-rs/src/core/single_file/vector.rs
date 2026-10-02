@@ -539,22 +539,6 @@ pub(crate) fn vector_store_state_from_snapshot(
   Ok((stores, HashMap::new()))
 }
 
-pub(crate) fn vector_stores_from_snapshot(
-  snapshot: &SnapshotData,
-) -> Result<HashMap<PropKeyId, VectorManifest>> {
-  let (stores, lazy_entries) = vector_store_state_from_snapshot(snapshot)?;
-  if lazy_entries.is_empty() {
-    return Ok(stores);
-  }
-
-  let mut materialized = stores;
-  for (prop_key_id, entry) in lazy_entries {
-    let manifest = deserialize_vector_store_entry(snapshot, prop_key_id, &entry)?;
-    materialized.insert(prop_key_id, manifest);
-  }
-  Ok(materialized)
-}
-
 /// Apply the vector operations WAL replay collected (`pending`: the last
 /// operation per node and property, from the transactions in `committed`) to
 /// `stores`. A property's dimensions are its store's or, for a property
@@ -798,8 +782,23 @@ fn decode_vector_payload(
 #[cfg(test)]
 mod tests {
   use super::{
-    decode_vector_payload, vector_store_state_from_snapshot, vector_stores_from_snapshot,
+    decode_vector_payload, deserialize_vector_store_entry, vector_store_state_from_snapshot,
   };
+  use crate::error::Result;
+  use crate::types::PropKeyId;
+  use crate::vector::types::VectorManifest;
+
+  /// Every vector store of `snapshot`, decoded.
+  fn vector_stores_from_snapshot(
+    snapshot: &SnapshotData,
+  ) -> Result<HashMap<PropKeyId, VectorManifest>> {
+    let (mut stores, lazy_entries) = vector_store_state_from_snapshot(snapshot)?;
+    for (prop_key_id, entry) in lazy_entries {
+      let manifest = deserialize_vector_store_entry(snapshot, prop_key_id, &entry)?;
+      stores.insert(prop_key_id, manifest);
+    }
+    Ok(stores)
+  }
   use crate::core::single_file::{close_single_file, open_single_file, SingleFileOpenOptions};
   use crate::core::snapshot::reader::SnapshotData;
   use crate::core::snapshot::writer::{build_snapshot_to_memory, NodeData, SnapshotBuildInput};

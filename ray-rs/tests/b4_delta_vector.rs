@@ -1126,8 +1126,10 @@ fn bench_f4_delete_delta_nodes() {
 }
 
 /// F8: checkpoint cost and first-read cost with `B4_VECTORS` vectors of
-/// `B4_DIMS` dimensions. Every checkpoint clones every manifest, and the
-/// install leaves the stores to be decoded again by the next access.
+/// `B4_DIMS` dimensions. Every checkpoint clones every manifest. On a0d26a2
+/// the install left the stores to be decoded again by the next access; wave
+/// 2 decoded them in every checkpoint instead; now the checkpoint installs
+/// the stores it serialized.
 #[test]
 #[ignore = "perf baseline; run with --ignored --nocapture"]
 fn bench_f8_vector_checkpoint() {
@@ -1187,8 +1189,8 @@ fn bench_f8_vector_checkpoint() {
   let ((), second_read1) = Cost::of(|| read(db, ids[1]));
   add_one(db, 0);
   let ((), cp2) = Cost::of(|| db.checkpoint().expect("checkpoint 2"));
-  // No vector access in between (a vector write would decode the store):
-  // the next checkpoint has to decode the store first.
+  // No vector access in between (a vector write would decode a lazy store):
+  // on a0d26a2 the next checkpoint had to decode the store first.
   tx(db, |db| db.create_node(None).expect("node"));
   let ((), cp3) = Cost::of(|| db.checkpoint().expect("checkpoint 3"));
   let ((), first_read3) = Cost::of(|| read(db, ids[2]));
@@ -1206,7 +1208,7 @@ fn bench_f8_vector_checkpoint() {
      first node_vector after checkpoint 1       {first_read1}\n  \
      second node_vector                         {second_read1}\n  \
      checkpoint 2 (+1 vector, store decoded)    {cp2}\n  \
-     checkpoint 3 (+1 node, store still lazy)   {cp3}\n  \
+     checkpoint 3 (+1 node, no vector access)   {cp3}\n  \
      first node_vector after checkpoint 3       {first_read3}\n  \
      background checkpoint (+1 vector)          {bg}\n  \
      first node_vector after background         {first_read_bg}\n  \

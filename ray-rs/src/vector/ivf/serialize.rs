@@ -527,6 +527,59 @@ pub fn serialize_manifest(manifest: &VectorManifest) -> Vec<u8> {
   buffer
 }
 
+/// Check, before `serialize_manifest`, that `deserialize_manifest` accepts
+/// the bytes as this same manifest, without serializing or decoding it: the
+/// structural invariants the decode checks last (`validate_vector_manifest`),
+/// and every count, id and length it stores as a u32 in range (a larger one
+/// would be truncated, and decode differently or not at all). The writer
+/// emits the framing the decode checks (magic, flags, states, lengths,
+/// mapping counts, no trailing bytes) correctly by construction.
+pub fn validate_manifest_for_serialization(
+  manifest: &VectorManifest,
+) -> Result<(), SerializeError> {
+  validate_vector_manifest(manifest)
+    .map_err(|error| SerializeError::InvalidStructure(format!("manifest: {error}")))?;
+  let fits = |value: Option<usize>, what: &str| match value {
+    Some(value) if u32::try_from(value).is_ok() => Ok(()),
+    _ => Err(SerializeError::InvalidStructure(format!(
+      "manifest {what} does not fit the serialized u32"
+    ))),
+  };
+  let config = &manifest.config;
+  fits(Some(config.dimensions), "dimensions")?;
+  fits(Some(config.row_group_size), "row_group_size")?;
+  fits(Some(config.fragment_target_size), "fragment_target_size")?;
+  fits(Some(manifest.fragments.len()), "fragment count")?;
+  fits(Some(manifest.active_fragment_id), "active_fragment_id")?;
+  fits(Some(manifest.total_vectors), "total_vectors")?;
+  fits(Some(manifest.total_deleted), "total_deleted")?;
+  for fragment in &manifest.fragments {
+    fits(Some(fragment.id), "fragment id")?;
+    fits(Some(fragment.row_groups.len()), "row group count")?;
+    fits(Some(fragment.total_vectors), "fragment total_vectors")?;
+    fits(Some(fragment.deleted_count), "fragment deleted_count")?;
+    fits(
+      fragment.deletion_bitmap.len().checked_mul(4),
+      "deletion bitmap length",
+    )?;
+    for row_group in &fragment.row_groups {
+      fits(Some(row_group.id), "row group id")?;
+      fits(Some(row_group.count), "row group count")?;
+      fits(row_group.data.len().checked_mul(4), "row group data length")?;
+    }
+  }
+  fits(Some(manifest.node_to_vector.len()), "node-to-vector count")?;
+  fits(
+    Some(manifest.vector_locations.len()),
+    "vector-to-location count",
+  )?;
+  for location in manifest.vector_locations.values() {
+    fits(Some(location.fragment_id), "location fragment id")?;
+    fits(Some(location.local_index), "location local index")?;
+  }
+  Ok(())
+}
+
 /// Deserialize vector manifest from binary
 pub fn deserialize_manifest(buffer: &[u8]) -> Result<VectorManifest, SerializeError> {
   let buf_len = buffer.len();
@@ -867,6 +920,58 @@ pub fn read_manifest<R: Read>(reader: &mut R) -> Result<VectorManifest, Serializ
 mod tests {
   use super::*;
   use crate::vector::{create_vector_store, vector_store_insert, IvfConfig, VectorStoreConfig};
+
+  /// The pre-serialization check accepts exactly what the decode accepts.
+  #[test]
+  fn validate_for_serialization_agrees_with_deserialize() {
+    let mut base = create_vector_store(VectorStoreConfig::new(3));
+    for node_id in 0..40u64 {
+      vector_store_insert(&mut base, node_id, &[1.0, node_id as f32, 2.0]).expect("insert");
+    }
+    crate::vector::vector_store_delete(&mut base, 7);
+    type Mutation = fn(&mut VectorManifest);
+    let cases: [(&str, Mutation); 9] = [
+      ("valid", |_| {}),
+      ("row_group_size 0", |m| m.config.row_group_size = 0),
+      ("dimensions 0", |m| m.config.dimensions = 0),
+      ("fragment_target_size 0", |m| {
+        m.config.fragment_target_size = 0
+      }),
+      ("no fragments", |m| m.fragments.clear()),
+      ("total_vectors off", |m| m.total_vectors += 1),
+      ("node mapped to an unknown vector", |m| {
+        m.node_to_vector.insert(1_000, 1_000);
+      }),
+      ("vector id at next_vector_id", |m| m.next_vector_id = 1),
+      ("row group over row_group_size", |m| {
+        m.config.row_group_size = 1
+      }),
+    ];
+    for (name, mutate) in cases {
+      let mut manifest = base.clone();
+      mutate(&mut manifest);
+      let checked = validate_manifest_for_serialization(&manifest).is_ok();
+      let decoded = deserialize_manifest(&serialize_manifest(&manifest)).is_ok();
+      assert_eq!(
+        checked, decoded,
+        "{name}: check {checked}, decode {decoded}"
+      );
+    }
+    assert!(validate_manifest_for_serialization(&base).is_ok());
+
+    // A value the u32 field would truncate is refused before it is written.
+    let mut huge = base.clone();
+    huge.fragments[0].id = u32::MAX as usize + 1;
+    huge.active_fragment_id = huge.fragments[0].id;
+    for location in huge.vector_locations.values_mut() {
+      location.fragment_id = huge.fragments[0].id;
+    }
+    assert!(
+      validate_vector_manifest(&huge).is_ok(),
+      "only the u32 range is wrong"
+    );
+    assert!(validate_manifest_for_serialization(&huge).is_err());
+  }
 
   #[test]
   fn test_metric_conversion() {
