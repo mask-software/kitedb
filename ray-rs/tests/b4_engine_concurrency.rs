@@ -1084,10 +1084,55 @@ fn f5_bench_reads_and_count_nodes() {
 /// from the delta copied at its cut); kept as a guard.
 #[test]
 fn f6_commits_are_not_blocked_for_a_whole_background_checkpoint_guard() {
-  const NODES: usize = 100_000;
   let dir = tempfile::tempdir().expect("tempdir");
-  let db = snapshot_graph(&dir.path().join("f6-latency.kitedb"), NODES, false);
-  // Give the snapshot edges and props too, so collecting it is real work.
+  let db = f6_graph(&dir.path().join("f6-latency.kitedb"));
+  // Paced commits: an unpaced writer piles up post-cut commits, whose replay
+  // at the install is measured by `f6_bench_unpaced_commits_during_background_checkpoint`.
+  let (checkpoint_time, latencies) =
+    commits_during_background_checkpoint(&db, Some(Duration::from_micros(500)));
+  let (median, max) = latency_summary(&latencies);
+  println!(
+    "f6 background checkpoint of {F6_NODES} nodes took {checkpoint_time:?}; {} commits ran \
+     meanwhile, median {median:?}, max {max:?}",
+    latencies.len()
+  );
+  assert!(
+    latencies.len() >= 10,
+    "only {} commits completed during a {checkpoint_time:?} background checkpoint",
+    latencies.len()
+  );
+  assert!(
+    max * 3 <= checkpoint_time,
+    "a commit waited {max:?} during a {checkpoint_time:?} background checkpoint"
+  );
+  assert!(db.node_by_key("during-0").is_some());
+}
+
+/// Commits as fast as one thread can during a background checkpoint: all of
+/// them are post-cut commits its install replays. Numbers only:
+/// `cargo test --test b4_engine_concurrency f6_bench -- --ignored --nocapture`.
+#[test]
+#[ignore = "benchmark"]
+fn f6_bench_unpaced_commits_during_background_checkpoint() {
+  for run in 0..3 {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = f6_graph(&dir.path().join("f6-bench.kitedb"));
+    let (checkpoint_time, latencies) = commits_during_background_checkpoint(&db, None);
+    let (median, max) = latency_summary(&latencies);
+    println!(
+      "f6 bench run {run}: background checkpoint {checkpoint_time:?}, {} unpaced commits \
+       meanwhile, median {median:?}, max {max:?}",
+      latencies.len()
+    );
+  }
+}
+
+const F6_NODES: usize = 100_000;
+
+/// A ~100k-node snapshot with edges and props, so collecting it is real work,
+/// and some commits in the WAL.
+fn f6_graph(path: &Path) -> Arc<SingleFileDB> {
+  let db = snapshot_graph(path, F6_NODES, false);
   db.begin(false).expect("begin");
   let knows = db.define_etype("knows").expect("etype");
   let weight = db.define_propkey("weight").expect("propkey");
@@ -1108,10 +1153,18 @@ fn f6_commits_are_not_blocked_for_a_whole_background_checkpoint_guard() {
   for index in 0..200 {
     commit_node(&db, &format!("pre-{index}"));
   }
+  db
+}
 
+/// Run a background checkpoint while this thread commits, `pace` apart; the
+/// checkpoint's duration and each commit's latency.
+fn commits_during_background_checkpoint(
+  db: &Arc<SingleFileDB>,
+  pace: Option<Duration>,
+) -> (Duration, Vec<Duration>) {
   let running = Arc::new(AtomicBool::new(true));
   let checkpointer = {
-    let (db, running) = (Arc::clone(&db), Arc::clone(&running));
+    let (db, running) = (Arc::clone(db), Arc::clone(&running));
     thread::spawn(move || {
       let started = Instant::now();
       let result = db.background_checkpoint();
@@ -1120,41 +1173,28 @@ fn f6_commits_are_not_blocked_for_a_whole_background_checkpoint_guard() {
       (result, elapsed)
     })
   };
-  // Paced commits: an unpaced writer piles up post-cut commits, which the
-  // install replays under the commit lock (a separate, smaller stall; see the
-  // lane report), and would measure that instead of the snapshot decode.
   let mut latencies = Vec::new();
   let mut index = 0usize;
   while running.load(Ordering::Acquire) {
     let started = Instant::now();
-    commit_node(&db, &format!("during-{index}"));
+    commit_node(db, &format!("during-{index}"));
     latencies.push(started.elapsed());
     index += 1;
-    thread::sleep(Duration::from_micros(500));
+    if let Some(pace) = pace {
+      thread::sleep(pace);
+    }
   }
   let (result, checkpoint_time) = checkpointer.join().expect("checkpointer");
   result.expect("background checkpoint");
-  latencies.sort_unstable();
-  let max = latencies.last().copied().unwrap_or_default();
-  let median = latencies
-    .get(latencies.len() / 2)
-    .copied()
-    .unwrap_or_default();
-  println!(
-    "f6 background checkpoint of {NODES} nodes took {checkpoint_time:?}; {} commits ran \
-     meanwhile, median {median:?}, max {max:?}",
-    latencies.len()
-  );
-  assert!(
-    latencies.len() >= 10,
-    "only {} commits completed during a {checkpoint_time:?} background checkpoint",
-    latencies.len()
-  );
-  assert!(
-    max * 3 <= checkpoint_time,
-    "a commit waited {max:?} during a {checkpoint_time:?} background checkpoint"
-  );
-  assert!(db.node_by_key("during-0").is_some());
+  (checkpoint_time, latencies)
+}
+
+fn latency_summary(latencies: &[Duration]) -> (Duration, Duration) {
+  let mut sorted = latencies.to_vec();
+  sorted.sort_unstable();
+  let median = sorted.get(sorted.len() / 2).copied().unwrap_or_default();
+  let max = sorted.last().copied().unwrap_or_default();
+  (median, max)
 }
 
 // ============================================================================

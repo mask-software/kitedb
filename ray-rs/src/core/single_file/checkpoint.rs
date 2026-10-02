@@ -19,6 +19,7 @@ use crate::core::snapshot::writer::{
   build_snapshot_to_memory, EdgeData, NodeData, SnapshotBuildInput,
 };
 use crate::core::wal::buffer::WalBuffer;
+use crate::core::wal::record::ParsedWalRecord;
 use crate::error::{KiteError, Result};
 use crate::types::*;
 use crate::vector::store::{create_vector_store, vector_store_delete, vector_store_insert};
@@ -296,6 +297,38 @@ pub(super) fn snapshot_vector_stores(
     })?;
   }
   Ok(vector_stores.clone())
+}
+
+/// A background checkpoint's replay of the transactions committed after its
+/// cut, in rounds (see `SingleFileDB::replay_post_cut_records`).
+#[derive(Default)]
+struct PostCutReplay {
+  /// The committed transactions replayed so far.
+  delta: DeltaState,
+  /// Records of the transactions not committed or rolled back by the last
+  /// record seen, in order; the next round's records continue them.
+  unfinished: Vec<ParsedWalRecord>,
+}
+
+/// The records of `records`' transactions that neither commit nor roll back
+/// in them.
+fn unfinished_transactions(records: Vec<ParsedWalRecord>) -> Vec<ParsedWalRecord> {
+  let mut open = std::collections::HashSet::new();
+  for record in &records {
+    match record.record_type {
+      WalRecordType::Begin => {
+        open.insert(record.txid);
+      }
+      WalRecordType::Commit | WalRecordType::Rollback => {
+        open.remove(&record.txid);
+      }
+      _ => {}
+    }
+  }
+  records
+    .into_iter()
+    .filter(|record| open.contains(&record.txid))
+    .collect()
 }
 
 /// Return `header` to `prior` after a failed header write, keeping the newer
@@ -1054,6 +1087,29 @@ impl SingleFileDB {
     mut loaded: LoadedSnapshot,
   ) -> Result<()> {
     self.set_background_checkpoint_status(run, CheckpointStatus::Completing);
+    let free_snapshot = || {
+      self
+        .pager
+        .lock()
+        .free_pages(snapshot.start_page as u32, snapshot.page_count as u32);
+    };
+
+    // The delta that replaces the cut's holds only the transactions
+    // committed after the cut, whose records stay in the WAL. Replay them
+    // over the new snapshot before installing it, so a failure leaves the
+    // database as it was. Most are replayed here, without the commit lock,
+    // so commits wait below only for the replay of those that land
+    // meanwhile. The records read here stay as they are: the secondary
+    // region only grows during a cut, and only cancelling the cut moves its
+    // records, which the check under the commit lock below catches.
+    let mut replay = PostCutReplay::default();
+    let early = self
+      .scan_post_cut_records(0)
+      .and_then(|(records, end)| {
+        self.replay_post_cut_records(&mut replay, records, &mut loaded)?;
+        Ok(end)
+      })
+      .inspect_err(|_| free_snapshot())?;
 
     // The gate excludes blocking checkpoints and compaction until the delta
     // is replaced below; the commit lock keeps the retained records and that
@@ -1063,12 +1119,6 @@ impl SingleFileDB {
     // that tries waits until the install releases it.
     let _checkpoint_gate = self.checkpoint_gate.write();
     let _commit_guard = self.commit_lock.lock();
-    let free_snapshot = || {
-      self
-        .pager
-        .lock()
-        .free_pages(snapshot.start_page as u32, snapshot.page_count as u32);
-    };
 
     // Writers may have cancelled the cut while this run made no progress
     // (see `wait_for_cut_release`): the WAL is back in the primary region,
@@ -1077,23 +1127,13 @@ impl SingleFileDB {
       free_snapshot();
       return Err(cancelled_checkpoint_error());
     }
-    let scanned = {
-      let mut pager = self.pager.lock();
-      let mut wal_buffer = self.wal_buffer.lock();
-      wal_buffer
-        .flush(&mut pager)
-        .and_then(|()| wal_buffer.scan_region(1, &mut pager))
-    };
-    let post_cut_records = scanned.inspect_err(|_| free_snapshot())?;
-
-    // The delta that replaces the cut's holds only the transactions
-    // committed after the cut, whose records stay in the WAL. Replay them
-    // over the new snapshot before installing it, so a failure leaves the
-    // database as it was. No commit lands meanwhile (the commit lock), though
-    // open transactions may append records, which the install retains.
-    let post_cut_delta = self
-      .replay_records_into_delta(&post_cut_records, &mut loaded)
+    // No commit lands from here (the commit lock), though open transactions
+    // may append records, which the install retains.
+    self
+      .scan_post_cut_records(early)
+      .and_then(|(records, _)| self.replay_post_cut_records(&mut replay, records, &mut loaded))
       .inspect_err(|_| free_snapshot())?;
+    let post_cut_delta = replay.delta;
 
     let compaction_result;
     {
@@ -1176,49 +1216,71 @@ impl SingleFileDB {
     self.persist_checkpoint_header(pager, header)
   }
 
-  /// Replay the transactions committed in `wal_records` into a new delta
-  /// over `loaded`, and their vector operations into its stores. Schema they
+  /// Flush the WAL and read the post-cut records (in the secondary region)
+  /// from offset `from` on; also where they end, to read on from.
+  fn scan_post_cut_records(&self, from: u64) -> Result<(Vec<ParsedWalRecord>, u64)> {
+    let mut pager = self.pager.lock();
+    let mut wal_buffer = self.wal_buffer.lock();
+    wal_buffer.flush(&mut pager)?;
+    wal_buffer.scan_region_from(1, from, &mut pager)
+  }
+
+  /// Replay the transactions that commit in `records` (the post-cut records
+  /// after those `replay` has seen) into `replay`'s delta over `loaded`, in
+  /// commit order, and their vector operations into its stores. Schema they
   /// define joins this database's (it already has it, since they committed
   /// here), and the ID allocators never move backwards.
-  fn replay_records_into_delta(
+  fn replay_post_cut_records(
     &self,
-    wal_records: &[crate::core::wal::record::ParsedWalRecord],
+    replay: &mut PostCutReplay,
+    records: Vec<ParsedWalRecord>,
     loaded: &mut LoadedSnapshot,
-  ) -> Result<DeltaState> {
+  ) -> Result<()> {
     self.reach_checkpoint_phase(CheckpointPhase::PostCutReplay)?;
     let _step = self.checkpoint_step("replay post-cut records");
-    let committed = committed_transactions(wal_records);
-    let mut delta = DeltaState::new();
+    let mut wal_records = std::mem::take(&mut replay.unfinished);
+    wal_records.extend(records);
+    let committed = committed_transactions(&wal_records);
+    let delta = &mut replay.delta;
     let mut next_node_id = self.next_node_id.load(Ordering::Acquire);
     let mut next_label_id = self.next_label_id.load(Ordering::Acquire);
     let mut next_etype_id = self.next_etype_id.load(Ordering::Acquire);
     let mut next_propkey_id = self.next_propkey_id.load(Ordering::Acquire);
-    {
-      let mut label_names = self.label_names.write();
-      let mut label_ids = self.label_ids.write();
-      let mut etype_names = self.etype_names.write();
-      let mut etype_ids = self.etype_ids.write();
-      let mut propkey_names = self.propkey_names.write();
-      let mut propkey_ids = self.propkey_ids.write();
-      for (_txid, records) in committed {
-        for record in records {
-          replay_wal_record(
-            record,
-            loaded.snapshot.as_ref(),
-            &mut delta,
-            &mut next_node_id,
-            &mut next_label_id,
-            &mut next_etype_id,
-            &mut next_propkey_id,
-            &mut label_names,
-            &mut label_ids,
-            &mut etype_names,
-            &mut etype_ids,
-            &mut propkey_names,
-            &mut propkey_ids,
-          )?;
-        }
+    // The schema they define, replayed into local maps and joined to this
+    // database's after: holding its schema locks for the whole replay would
+    // stall every commit (a commit publishes its schema under them).
+    let mut label_names = HashMap::new();
+    let mut label_ids = HashMap::new();
+    let mut etype_names = HashMap::new();
+    let mut etype_ids = HashMap::new();
+    let mut propkey_names = HashMap::new();
+    let mut propkey_ids = HashMap::new();
+    for (_txid, records) in committed {
+      for record in records {
+        replay_wal_record(
+          record,
+          loaded.snapshot.as_ref(),
+          delta,
+          &mut next_node_id,
+          &mut next_label_id,
+          &mut next_etype_id,
+          &mut next_propkey_id,
+          &mut label_names,
+          &mut label_ids,
+          &mut etype_names,
+          &mut etype_ids,
+          &mut propkey_names,
+          &mut propkey_ids,
+        )?;
       }
+    }
+    if !(label_ids.is_empty() && etype_ids.is_empty() && propkey_ids.is_empty()) {
+      self.label_names.write().extend(label_names);
+      self.label_ids.write().extend(label_ids);
+      self.etype_names.write().extend(etype_names);
+      self.etype_ids.write().extend(etype_ids);
+      self.propkey_names.write().extend(propkey_names);
+      self.propkey_ids.write().extend(propkey_ids);
     }
 
     // Open transactions may allocate IDs meanwhile, so only ever raise them.
@@ -1235,7 +1297,8 @@ impl SingleFileDB {
 
     loaded.apply_pending_vectors(&delta.pending_vectors)?;
     delta.pending_vectors.clear();
-    Ok(delta)
+    replay.unfinished = unfinished_transactions(wal_records);
+    Ok(())
   }
 
   /// Replay the transactions committed in `records` into a new delta over the
