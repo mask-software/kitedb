@@ -5,6 +5,7 @@
 pub mod binary;
 pub mod compression;
 pub mod crc;
+pub mod fs;
 pub mod hash;
 pub mod heap;
 pub mod mmap;

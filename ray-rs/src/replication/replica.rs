@@ -7,6 +7,7 @@ use super::progress::upsert_replica_progress;
 use super::transport::decode_commit_frame_payload;
 use super::types::ReplicationRole;
 use crate::error::{KiteError, Result};
+use crate::util::fs::sync_parent_dir;
 use parking_lot::Mutex;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -125,6 +126,20 @@ struct ReplicaCursorState {
   transient_missing_log_index: u64,
   /// A bootstrap removed stale nodes but has not installed the source state.
   bootstrap_incomplete: bool,
+  /// Generation of the source sidecar the cursor indexes into (see
+  /// `ReplicationManifest::generation`). `None` until the first apply; a
+  /// cursor written before generations existed followed generation 0.
+  source_generation: Option<u64>,
+}
+
+impl ReplicaCursorState {
+  /// The source generation this cursor's position belongs to, if any.
+  fn followed_generation(&self) -> Option<u64> {
+    let pristine = self.applied_epoch == 0 && self.applied_log_index == 0;
+    self
+      .source_generation
+      .or(if pristine { None } else { Some(0) })
+  }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -146,6 +161,9 @@ pub struct ReplicaReplication {
   state: Mutex<ReplicaCursorState>,
   schema_map: Mutex<ReplicaSchemaMap>,
   scan_hint: Mutex<Option<SegmentScanHint>>,
+  /// Source sidecar generation of the frames or snapshot being applied, read
+  /// with them; `mark_applied` records it with the cursor.
+  applying_generation: Mutex<Option<u64>>,
 }
 
 impl ReplicaReplication {
@@ -220,6 +238,7 @@ impl ReplicaReplication {
       state: Mutex::new(state),
       schema_map: Mutex::new(schema_map),
       scan_hint: Mutex::new(None),
+      applying_generation: Mutex::new(None),
     })
   }
 
@@ -248,12 +267,16 @@ impl ReplicaReplication {
   /// Manifest head plus the newest frame in the source segment files. A
   /// buffered (Normal/Off) primary writes frames before it persists the
   /// manifest, so the newest frame can be ahead of the manifest head.
+  ///
+  /// A snapshot bootstrap anchors its cursor here, so the source generation
+  /// read here is the one its `mark_applied` records.
   pub fn source_published_head(&self) -> Result<SourcePublishedHead> {
     let source_sidecar_path = self.source_sidecar_path.as_ref().ok_or_else(|| {
       KiteError::InvalidReplication("replica source sidecar path is not configured".to_string())
     })?;
 
     let manifest = ManifestStore::new(source_sidecar_path.join(MANIFEST_FILE_NAME)).read()?;
+    *self.applying_generation.lock() = Some(manifest.generation);
     let mut segment_ids: Vec<u64> = manifest.segments.iter().map(|segment| segment.id).collect();
     segment_ids.sort_unstable_by(|left, right| right.cmp(left));
     for segment_id in segment_ids {
@@ -297,11 +320,19 @@ impl ReplicaReplication {
     Ok(())
   }
 
+  /// Move the cursor to `epoch:log_index` in the source generation the
+  /// applied frames or snapshot were read from. The cursor never moves back
+  /// within one generation; a reseed from a recreated sidecar starts over in
+  /// the new one.
   pub fn mark_applied(&self, epoch: u64, log_index: u64) -> Result<()> {
     let mut state = self.state.lock();
+    let applying_generation = self.applying_generation.lock().take();
+    let new_history =
+      applying_generation.is_some_and(|generation| state.followed_generation() != Some(generation));
 
-    if state.applied_epoch > epoch
-      || (state.applied_epoch == epoch && state.applied_log_index > log_index)
+    if !new_history
+      && (state.applied_epoch > epoch
+        || (state.applied_epoch == epoch && state.applied_log_index > log_index))
     {
       return Err(KiteError::InvalidReplication(format!(
         "attempted to move replica cursor backwards: {}:{} -> {}:{}",
@@ -312,6 +343,9 @@ impl ReplicaReplication {
     let mut next_state = state.clone();
     next_state.applied_epoch = epoch;
     next_state.applied_log_index = log_index;
+    if applying_generation.is_some() {
+      next_state.source_generation = applying_generation;
+    }
     next_state.last_error = None;
     next_state.needs_reseed = false;
     next_state.bootstrap_incomplete = false;
@@ -397,6 +431,18 @@ impl ReplicaReplication {
 
     let (applied_epoch, applied_log_index) = self.applied_position();
     let manifest = ManifestStore::new(source_sidecar_path.join(MANIFEST_FILE_NAME)).read()?;
+    let followed_generation = self.state.lock().followed_generation();
+    if followed_generation.is_some_and(|generation| generation != manifest.generation) {
+      let message = format!(
+        "replica needs reseed: the source replication sidecar was recreated (log generation \
+         {:016x}, the cursor {applied_epoch}:{applied_log_index} belongs to {:016x})",
+        manifest.generation,
+        followed_generation.unwrap_or_default()
+      );
+      self.mark_error(message.clone(), true)?;
+      return Err(KiteError::InvalidReplication(message));
+    }
+    *self.applying_generation.lock() = Some(manifest.generation);
     let expected_next_log = applied_log_index.saturating_add(1);
     if expected_next_log < manifest.retained_floor {
       let message = format!(
@@ -408,7 +454,7 @@ impl ReplicaReplication {
     }
 
     let mut scan_hint = self.scan_hint.lock();
-    let filtered = read_frames_after(
+    let mut filtered = read_frames_after(
       source_sidecar_path,
       &manifest,
       applied_epoch,
@@ -419,6 +465,18 @@ impl ReplicaReplication {
     )?;
 
     if let Some(first) = filtered.first() {
+      // Log indexes run on across epochs (a promotion keeps the head), so a
+      // newer epoch that does not continue the cursor's log is a different
+      // history.
+      if first.epoch > applied_epoch && first.log_index < expected_next_log {
+        let message = format!(
+          "replica needs reseed: source frame {}:{} does not continue the replica's log at \
+           {applied_epoch}:{applied_log_index}",
+          first.epoch, first.log_index
+        );
+        self.mark_error(message.clone(), true)?;
+        return Err(KiteError::InvalidReplication(message));
+      }
       if first.log_index > expected_next_log {
         let detail = format!(
           "missing log range {}..{}",
@@ -427,6 +485,15 @@ impl ReplicaReplication {
         );
         return self.transient_gap_error(applied_epoch, expected_next_log, detail);
       }
+    }
+
+    // Apply only a contiguous run; the next pull starts at a break and
+    // reports it.
+    if let Some(last_contiguous) = filtered
+      .windows(2)
+      .position(|pair| pair[1].log_index != pair[0].log_index.saturating_add(1))
+    {
+      filtered.truncate(last_contiguous + 1);
     }
 
     if filtered.is_empty() && manifest.head_log_index > applied_log_index {
@@ -515,37 +582,7 @@ fn persist_json_state<T: Serialize>(path: &Path, state: &T, what: &str) -> Resul
   file.write_all(&bytes)?;
   file.sync_all()?;
   std::fs::rename(&tmp_path, path)?;
-  sync_parent_dir(path.parent())?;
-  Ok(())
-}
-
-fn sync_parent_dir(parent: Option<&Path>) -> Result<()> {
-  #[cfg(unix)]
-  {
-    if let Some(parent) = parent {
-      std::fs::File::open(parent)?.sync_all()?;
-    }
-  }
-
-  #[cfg(windows)]
-  {
-    if let Some(parent) = parent {
-      use std::os::windows::fs::OpenOptionsExt;
-
-      const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000;
-      let directory = OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(parent)?;
-      directory.sync_all()?;
-    }
-  }
-
-  #[cfg(not(any(unix, windows)))]
-  {
-    let _ = parent;
-  }
-
+  sync_parent_dir(path)?;
   Ok(())
 }
 

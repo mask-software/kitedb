@@ -11,6 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::constants::EXT_KITEDB;
 use crate::core::single_file::SingleFileDB;
 use crate::error::{KiteError, Result};
+use crate::util::fs::sync_parent_dir;
 
 /// Backup options
 #[derive(Debug, Clone)]
@@ -309,22 +310,6 @@ fn temp_path_for(path: &Path) -> PathBuf {
     system_time_to_millis(SystemTime::now()),
     SEQUENCE.fetch_add(1, Ordering::Relaxed)
   ))
-}
-
-fn sync_parent_dir(path: &Path) -> Result<()> {
-  #[cfg(unix)]
-  {
-    let parent = path
-      .parent()
-      .filter(|parent| !parent.as_os_str().is_empty())
-      .unwrap_or_else(|| Path::new("."));
-    File::open(parent)?.sync_all()?;
-  }
-
-  #[cfg(not(unix))]
-  let _ = path;
-
-  Ok(())
 }
 
 #[cfg(test)]

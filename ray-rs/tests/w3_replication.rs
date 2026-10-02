@@ -23,11 +23,10 @@ use kitedb::export::{
 };
 use kitedb::metrics::collect_metrics_single_file;
 use kitedb::replication::primary::default_replication_sidecar_path;
-use kitedb::replication::progress::load_replica_progress;
+use kitedb::replication::progress::{load_replica_progress, remove_replica_progress};
 use kitedb::replication::types::{CommitToken, ReplicationCursor, ReplicationRole};
 use kitedb::streaming::{edges_page_single, nodes_page_single, PaginationOptions};
 use kitedb::types::{Edge, NodeId, PropValue};
-use kitedb::KiteError;
 
 fn open_db(path: &Path) -> SingleFileDB {
   open_single_file(path, SingleFileOpenOptions::new().auto_checkpoint(false)).expect("open db")
@@ -271,16 +270,6 @@ fn w3_p1_edge_pages_return_each_edge_once_while_edges_are_added() {
 // P2: stale replica progress pins retention; a reset sidecar is not detected
 // ============================================================================
 
-/// P2 needs an API that forgets a decommissioned replica's progress; none
-/// exists, so this shim fails. FIXER: call the new API here (for example a
-/// `SingleFileDB::primary_remove_replica_progress(replica_id)`).
-fn remove_replica_progress(_primary: &SingleFileDB, replica_id: &str) -> kitedb::Result<()> {
-  Err(KiteError::InvalidReplication(format!(
-    "no API removes the progress of replica {replica_id}, so a decommissioned replica pins \
-     retention and stays in replica-progress.json forever"
-  )))
-}
-
 #[test]
 fn w3_p2_decommissioned_replica_progress_can_be_removed() {
   const DECOMMISSIONED: &str = "decommissioned-replica";
@@ -310,8 +299,11 @@ fn w3_p2_decommissioned_replica_progress_can_be_removed() {
     "setup: the replica at log 1 pins the floor"
   );
 
-  remove_replica_progress(&primary, DECOMMISSIONED)
-    .expect("remove decommissioned replica progress");
+  assert!(
+    remove_replica_progress(&sidecar, DECOMMISSIONED)
+      .expect("remove decommissioned replica progress"),
+    "the decommissioned replica had progress recorded"
+  );
 
   let outcome = primary
     .primary_run_retention()
