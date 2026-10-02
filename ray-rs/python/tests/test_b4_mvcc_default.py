@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import pytest
 
-from kitedb import Database, OpenOptions, edge, kite, node, prop
+from kitedb import ConflictError, Database, OpenOptions, edge, kite, node, prop
 
 
 def _schema():
@@ -94,3 +94,54 @@ def test_fluent_bulk_surfaces_a_failing_begin_bulk(tmp_path):
             assert refusing.begins == 0, "bulk() fell back to a normal transaction"
         finally:
             db._db = refusing._inner
+
+
+def _conflict_inside(tmp_path, name, run_in_transaction):
+    """Run ``run_in_transaction(db, write)`` on a worker thread, where
+    ``write`` updates user "a" and then waits while the main thread commits a
+    conflicting update. Returns the exception the worker's helper raised."""
+    import threading
+
+    user, knows = _schema()
+    with kite(str(tmp_path / name), nodes=[user], edges=[knows]) as db:
+        db.insert(user).values(key="a", name="A").execute()
+        written = threading.Event()
+        other_committed = threading.Event()
+        outcome = {}
+
+        def write():
+            db.update(user).set(name="worker").where(key="user:a").execute()
+            written.set()
+            assert other_committed.wait(10), "the main thread never committed"
+
+        def worker():
+            try:
+                run_in_transaction(db, write)
+                outcome["error"] = None
+            except BaseException as exc:  # noqa: BLE001
+                outcome["error"] = exc
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        assert written.wait(10), "the worker never wrote"
+        db.update(user).set(name="main").where(key="user:a").execute()
+        other_committed.set()
+        thread.join(10)
+        assert not thread.is_alive()
+        assert not db.in_transaction()
+        assert db.get(user, "a").name == "main"
+        return outcome["error"]
+
+
+def test_transaction_conflict_surfaces_as_conflict_error(tmp_path):
+    def run(db, write):
+        with db.transaction():
+            write()
+
+    error = _conflict_inside(tmp_path, "tx-conflict.kitedb", run)
+    assert isinstance(error, ConflictError), f"got {error!r}"
+
+
+def test_batch_conflict_surfaces_as_conflict_error(tmp_path):
+    error = _conflict_inside(tmp_path, "batch-conflict.kitedb", lambda db, write: db.batch([write]))
+    assert isinstance(error, ConflictError), f"got {error!r}"
