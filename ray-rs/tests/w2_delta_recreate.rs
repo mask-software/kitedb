@@ -425,6 +425,9 @@ fn run_steps(
 // MVCC witness
 // ============================================================================
 
+/// A node's edges as `(etype, other end)`.
+type Adjacent = Vec<(ETypeId, NodeId)>;
+
 /// What a reader sees of the fixture.
 #[derive(Debug, PartialEq)]
 struct View {
@@ -439,7 +442,7 @@ struct View {
   /// `node_has_label` of `old_label` and `new_label`.
   n_has_label: [bool; 2],
   /// `(out_edges, in_edges)` of `n`, `a` and `b`.
-  adjacency: [(Vec<(ETypeId, NodeId)>, Vec<(ETypeId, NodeId)>); 3],
+  adjacency: [(Adjacent, Adjacent); 3],
   /// `edge_exists` of n->a, a->n, n->b and b->n.
   edge_exists: [bool; 4],
   n_a_weight: Option<PropValue>,
