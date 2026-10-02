@@ -749,7 +749,9 @@ fn decode_vector_payload(
   vector_data: &[u8],
   idx: usize,
 ) -> Result<Vec<f32>> {
-  if (idx + 1) * 8 > vector_offsets.len() {
+  // Vector `idx` spans offsets `idx` and `idx + 1`.
+  let offsets_end = idx.checked_add(2).and_then(|count| count.checked_mul(8));
+  if offsets_end.is_none_or(|end| end > vector_offsets.len()) {
     return Err(KiteError::InvalidSnapshot(format!(
       "Vector index out of range: {idx}"
     )));
