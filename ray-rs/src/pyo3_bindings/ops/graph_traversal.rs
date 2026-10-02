@@ -5,7 +5,8 @@ use std::collections::HashSet;
 
 use crate::api::pathfinding::{bfs, dijkstra, PathConfig};
 use crate::api::traversal::{
-  TraversalBuilder as RustTraversalBuilder, TraversalDirection, TraverseOptions,
+  DbNeighbors, NoProps, TraversalBuilder as RustTraversalBuilder, TraversalDirection,
+  TraverseOptions,
 };
 use crate::core::single_file::SingleFileDB as RustSingleFileDB;
 use crate::types::{ETypeId, Edge, NodeId};
@@ -275,13 +276,9 @@ pub fn traverse_single(
     where_node: None,
   };
 
-  let neighbors = |nid: NodeId, d: TraversalDirection, et: Option<ETypeId>| -> Vec<Edge> {
-    neighbors_from_single_file(db, nid, d, et)
-  };
-
   RustTraversalBuilder::new(vec![node_id])
     .traverse(etype, opts)
-    .execute(neighbors)
+    .execute_source(DbNeighbors::new(db), NoProps)
     .map(|r| {
       let (edge_src, edge_dst, edge_type) = match r.edge {
         Some(e) => (Some(e.src as i64), Some(e.dst as i64), Some(e.etype)),

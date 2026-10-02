@@ -7,7 +7,7 @@ use std::collections::HashSet;
 
 use crate::api::pathfinding::{bfs, dijkstra, yen_k_shortest, PathConfig, PathResult};
 use crate::api::traversal::{
-  TraversalBuilder, TraversalDirection, TraversalResult, TraverseOptions,
+  edges_in_direction, TraversalBuilder, TraversalDirection, TraversalResult, TraverseOptions,
 };
 use crate::types::{ETypeId, Edge, NodeId};
 
@@ -340,49 +340,30 @@ impl JsGraphAccessor {
     nodes.len() as u32
   }
 
-  // Internal method to get neighbors
+  /// The edges a hop expands from `node_id`, as the database's traversals list
+  /// them (`edges_in_direction`): `Both` lists a self-loop once.
   fn neighbors_internal(
     &self,
     node_id: NodeId,
     direction: TraversalDirection,
     etype: Option<ETypeId>,
   ) -> Vec<Edge> {
-    let mut edges = Vec::new();
-
-    match direction {
-      TraversalDirection::Out => {
-        if let Some(out_list) = self.out_edges.get(&node_id) {
-          for &(e, dst) in out_list {
-            if etype.is_none() || etype == Some(e) {
-              edges.push(Edge {
-                src: node_id,
-                etype: e,
-                dst,
-              });
-            }
-          }
-        }
-      }
-      TraversalDirection::In => {
-        if let Some(in_list) = self.in_edges.get(&node_id) {
-          for &(e, src) in in_list {
-            if etype.is_none() || etype == Some(e) {
-              edges.push(Edge {
-                src,
-                etype: e,
-                dst: node_id,
-              });
-            }
-          }
-        }
-      }
-      TraversalDirection::Both => {
-        edges.extend(self.neighbors_internal(node_id, TraversalDirection::Out, etype));
-        edges.extend(self.neighbors_internal(node_id, TraversalDirection::In, etype));
-      }
-    }
-
-    edges
+    type Adjacency = std::collections::HashMap<NodeId, Vec<(ETypeId, NodeId)>>;
+    let typed = |adjacency: &Adjacency| -> Vec<(ETypeId, NodeId)> {
+      adjacency
+        .get(&node_id)
+        .into_iter()
+        .flatten()
+        .copied()
+        .filter(|&(e, _)| etype.is_none_or(|etype| etype == e))
+        .collect()
+    };
+    edges_in_direction(
+      node_id,
+      direction,
+      || typed(&self.out_edges),
+      || typed(&self.in_edges),
+    )
   }
 
   // Internal method to get edge weight

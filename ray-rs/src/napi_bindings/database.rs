@@ -17,7 +17,9 @@ use super::validation;
 use super::vector::js_vector_f32;
 use crate::api::kite::KiteRuntimeProfile as RustKiteRuntimeProfile;
 use crate::api::pathfinding::{bfs, dijkstra, yen_k_shortest};
-use crate::api::traversal::{TraversalBuilder as RustTraversalBuilder, TraversalDirection};
+use crate::api::traversal::{
+  DbNeighbors, NoProps, TraversalBuilder as RustTraversalBuilder, TraversalDirection,
+};
 use crate::backup as core_backup;
 use crate::core::single_file::{
   close_single_file, close_single_file_with_options, is_single_file_path, open_single_file,
@@ -3090,7 +3092,7 @@ impl Database {
 
         Ok(
           builder
-            .execute(|node_id, dir, etype| neighbors_from_single_file(db, node_id, dir, etype))
+            .execute_source(DbNeighbors::new(db), NoProps)
             .map(JsTraversalResult::from)
             .collect(),
         )
@@ -3134,7 +3136,7 @@ impl Database {
 
         Ok(
           builder
-            .execute(|node_id, dir, etype| neighbors_from_single_file(db, node_id, dir, etype))
+            .execute_source(DbNeighbors::new(db), NoProps)
             .map(JsTraversalResult::from)
             .collect(),
         )
@@ -3164,7 +3166,7 @@ impl Database {
       Some(DatabaseInner::SingleFile(db)) => Ok(
         RustTraversalBuilder::new(start)
           .traverse(edge_type, opts)
-          .execute(|node_id, dir, etype| neighbors_from_single_file(db, node_id, dir, etype))
+          .execute_source(DbNeighbors::new(db), NoProps)
           .map(JsTraversalResult::from)
           .collect(),
       ),
@@ -3193,10 +3195,7 @@ impl Database {
           };
         }
 
-        Ok(
-          builder.count(|node_id, dir, etype| neighbors_from_single_file(db, node_id, dir, etype))
-            as u32,
-        )
+        Ok(builder.count_source(DbNeighbors::new(db), NoProps) as u32)
       }
       None => Err(Error::from_reason("Database is closed")),
     }
@@ -3237,11 +3236,8 @@ impl Database {
 
         Ok(
           builder
-            .collect_node_ids(|node_id, dir, etype| {
-              neighbors_from_single_file(db, node_id, dir, etype)
-            })
-            .into_iter()
-            .map(|id| id as i64)
+            .execute_source(DbNeighbors::new(db), NoProps)
+            .map(|result| result.node_id as i64)
             .collect(),
         )
       }
@@ -3869,53 +3865,15 @@ fn import_json_on(
   import_on(db, &data, options)
 }
 
-/// Get neighbors from database for traversal
+/// The edges a hop expands, for traversal and pathfinding: the shared
+/// implementation `Kite` uses too.
 fn neighbors_from_single_file(
   db: &RustSingleFileDB,
   node_id: NodeId,
   direction: TraversalDirection,
   etype: Option<ETypeId>,
 ) -> Vec<Edge> {
-  let mut edges = Vec::new();
-  match direction {
-    TraversalDirection::Out => {
-      for (e, dst) in db.out_edges(node_id) {
-        if etype.is_none() || etype == Some(e) {
-          edges.push(Edge {
-            src: node_id,
-            etype: e,
-            dst,
-          });
-        }
-      }
-    }
-    TraversalDirection::In => {
-      for (e, src) in db.in_edges(node_id) {
-        if etype.is_none() || etype == Some(e) {
-          edges.push(Edge {
-            src,
-            etype: e,
-            dst: node_id,
-          });
-        }
-      }
-    }
-    TraversalDirection::Both => {
-      edges.extend(neighbors_from_single_file(
-        db,
-        node_id,
-        TraversalDirection::Out,
-        etype,
-      ));
-      edges.extend(neighbors_from_single_file(
-        db,
-        node_id,
-        TraversalDirection::In,
-        etype,
-      ));
-    }
-  }
-  edges
+  DbNeighbors::new(db).neighbors(node_id, direction, etype)
 }
 
 #[cfg(test)]
