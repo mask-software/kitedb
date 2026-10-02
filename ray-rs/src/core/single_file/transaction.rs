@@ -992,11 +992,13 @@ impl SingleFileDB {
 
   /// Record the changes of `request`'s commit in the MVCC version chains, for the
   /// transactions still open (see `mvcc_history`), against the committed state `delta` (its
-  /// group's earlier commits merged), under `hold`. With none open, no reader can need the
-  /// state the commit replaces: every later read sees the commit, in the delta.
+  /// group's earlier commits merged), under `hold`; `horizon` is the history's
+  /// (`MvccManager::history_horizon`). With none open, no reader can need the state the commit
+  /// replaces: every later read sees the commit, in the delta.
   fn record_mvcc_history<'a>(
     &'a self,
     hold: &mut PublishHistory<'a>,
+    horizon: Timestamp,
     commit_ts_for_mvcc: Option<(u64, bool)>,
     request: &mut CommitRequest,
     delta: &DeltaState,
@@ -1021,7 +1023,16 @@ impl SingleFileDB {
       .and_then(|snapshot| snapshot.as_ref());
     let chains = hold.chains.get_or_insert_with(|| mvcc.history_writer());
     chains.record(commit_ts, |vc| {
-      record_commit(vc, delta, snapshot, pending, &plan, request.txid, commit_ts);
+      record_commit(
+        vc,
+        delta,
+        snapshot,
+        pending,
+        &plan,
+        request.txid,
+        commit_ts,
+        horizon,
+      );
     });
   }
 
@@ -1917,7 +1928,7 @@ impl SingleFileDB {
     // write) go on until the first merge.
     let mut delta = PublishDelta::Reading(self.delta.upgradable_read());
     let _publishing = PublishSection::enter(&self.publish_seq);
-    let mut released_keys = self.commit_in_mvcc(&mut round);
+    let (mut released_keys, horizon) = self.commit_in_mvcc(&mut round);
     let mut history = PublishHistory::default();
     for commit in &mut round {
       let request = &mut commit.request;
@@ -1925,7 +1936,13 @@ impl SingleFileDB {
       if on_committer_thread {
         after_commit_timestamp_test_hook();
       }
-      self.record_mvcc_history(&mut history, commit.mvcc_commit, request, delta.state());
+      self.record_mvcc_history(
+        &mut history,
+        horizon,
+        commit.mvcc_commit,
+        request,
+        delta.state(),
+      );
       if delta.is_reading() {
         history = PublishHistory::default();
       }
@@ -1976,12 +1993,13 @@ impl SingleFileDB {
   /// durable point: each gets its commit timestamp, and whether a
   /// transaction that may still read was active once it committed (which
   /// then needs version chains); a failure becomes its result. Returns the
-  /// key sets the commits released, to free without the locks. Callers hold
-  /// `delta.write()` (see `publish_commits`) and staged them
-  /// (`check_and_stage_in_mvcc`).
-  fn commit_in_mvcc(&self, round: &mut [DurableCommit]) -> Vec<TxKeySet> {
+  /// key sets the commits released, to free without the locks, and the
+  /// history horizon after them (`MvccManager::history_horizon`). Callers
+  /// hold the delta in a publish section (see `publish_commits`) and staged
+  /// them (`check_and_stage_in_mvcc`).
+  fn commit_in_mvcc(&self, round: &mut [DurableCommit]) -> (Vec<TxKeySet>, Timestamp) {
     let Some(mvcc) = self.mvcc.as_ref() else {
-      return Vec::new();
+      return (Vec::new(), 0);
     };
     let mut tx_mgr = mvcc.tx_manager.lock();
     let mut released = Vec::new();
@@ -1995,7 +2013,8 @@ impl SingleFileDB {
         }
       }
     }
-    released
+    let horizon = mvcc.history_horizon(&tx_mgr);
+    (released, horizon)
   }
 
   /// Rollback the current transaction

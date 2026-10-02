@@ -1136,12 +1136,23 @@ impl VersionChainManager {
   /// sees them absent. This stands for a chain per node (absent, then created) at the cost of
   /// a run. A run over ids of an older run replaces it there: such an id was deleted since, by
   /// a commit no open snapshot predates (one would have given it a chain).
+  ///
+  /// `horizon` is GC's (see `prune_old_versions`): the first runs, those of the lowest ids,
+  /// go while every snapshot sees them, so commits that create nodes beside short readers
+  /// keep few runs, not one each until the next GC run.
   pub fn record_node_creations(
     &mut self,
     runs: &[(NodeId, NodeId)],
     txid: TxId,
     commit_ts: Timestamp,
+    horizon: Timestamp,
   ) {
+    while let Some(first) = self.node_creations.first_entry() {
+      if first.get().commit_ts >= horizon {
+        break;
+      }
+      first.remove();
+    }
     for &(start, end) in runs {
       if start >= end {
         continue;
@@ -2574,7 +2585,7 @@ mod history_tests {
   #[test]
   fn creation_runs_hide_nodes_from_older_snapshots() {
     let mut mgr = VersionChainManager::new();
-    mgr.record_node_creations(&[(10, 20), (30, 31)], 7, 5);
+    mgr.record_node_creations(&[(10, 20), (30, 31)], 7, 5, 0);
 
     // Commit 5 is visible from snapshot 6 on.
     for node in [10, 15, 19, 30] {
@@ -2597,10 +2608,10 @@ mod history_tests {
   #[test]
   fn a_later_run_replaces_the_ids_it_covers() {
     let mut mgr = VersionChainManager::new();
-    mgr.record_node_creations(&[(10, 20)], 7, 5);
+    mgr.record_node_creations(&[(10, 20)], 7, 5, 0);
     // Ids 12 and 13, deleted since with no snapshot open, created again at 8; then 18-24.
-    mgr.record_node_creations(&[(12, 14)], 8, 8);
-    mgr.record_node_creations(&[(18, 25)], 9, 9);
+    mgr.record_node_creations(&[(12, 14)], 8, 8, 0);
+    mgr.record_node_creations(&[(18, 25)], 9, 9, 0);
 
     for (node, created) in [
       (10, 5),
@@ -2632,7 +2643,7 @@ mod history_tests {
   #[test]
   fn a_created_node_deleted_later_exists_only_between_the_two() {
     let mut mgr = VersionChainManager::new();
-    mgr.record_node_creations(&[(NODE, NODE + 1)], 7, 5);
+    mgr.record_node_creations(&[(NODE, NODE + 1)], 7, 5, 0);
     // Deleted at 9: the delete records the node from before (with no start).
     mgr.record_node(NODE, Some(node_data(NODE, "a")), None, 8, 9);
 
@@ -2649,5 +2660,23 @@ mod history_tests {
     };
     assert_eq!(key(5), Some(None));
     assert_eq!(key(6), Some(Some("a".to_string())));
+  }
+
+  #[test]
+  fn runs_every_snapshot_sees_go_as_runs_are_recorded() {
+    let mut mgr = VersionChainManager::new();
+    mgr.record_node_creations(&[(10, 12)], 7, 5, 0);
+    mgr.record_node_creations(&[(12, 13)], 8, 6, 0);
+    mgr.record_node_creations(&[(5, 6)], 9, 9, 0);
+    // Every snapshot is at 7 or later, but the run of the lowest id (5, commit 9) is first:
+    // nothing goes yet.
+    mgr.record_node_creations(&[(20, 21)], 10, 10, 7);
+    assert_eq!(mgr.counts().node_creation_runs, 4);
+    // At 10, the runs from id 5 on go up to the first a snapshot may not see (id 20, 10).
+    mgr.record_node_creations(&[(30, 31)], 11, 11, 10);
+    assert_eq!(mgr.counts().node_creation_runs, 2);
+    assert_eq!(exists_at(&mgr, 20, 10), Some(false));
+    assert_eq!(exists_at(&mgr, 30, 11), Some(false));
+    assert_eq!(exists_at(&mgr, 10, 1), None, "dropped");
   }
 }

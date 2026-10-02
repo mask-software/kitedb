@@ -91,6 +91,17 @@ impl MvccManager {
     }
   }
 
+  /// The oldest snapshot the version history must still answer for: GC's
+  /// horizon (see `GarbageCollector::run_scoped`), the oldest open
+  /// transaction's snapshot, or older while the retention period keeps
+  /// commits. `tx_manager` is the transaction manager, locked.
+  pub fn history_horizon(&self, tx_manager: &TxManager) -> Timestamp {
+    let retention_ms = self.gc.lock().config().retention_ms;
+    tx_manager
+      .min_active_ts()
+      .min(tx_manager.retention_horizon_ts(retention_ms))
+  }
+
   /// Run one GC cycle now.
   pub fn run_gc(&self) -> GcResult {
     Self::gc_pass(

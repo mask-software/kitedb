@@ -120,7 +120,9 @@ impl HistoryPlan {
 
 /// Record in `vc` the changes `pending` makes, committed by `txid` at `commit_ts`, to the
 /// committed state `delta` over `snapshot`, as `plan` (`HistoryPlan::of` for them) lays out.
-/// The committed state is read only if `plan.reads_committed_state(pending)`.
+/// The committed state is read only if `plan.reads_committed_state(pending)`. `horizon` is
+/// GC's (see `VersionChainManager::record_node_creations`).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn record_commit(
   vc: &mut VersionChainManager,
   delta: &DeltaState,
@@ -129,7 +131,9 @@ pub(super) fn record_commit(
   plan: &HistoryPlan,
   txid: TxId,
   commit_ts: Timestamp,
+  horizon: Timestamp,
 ) {
+  vc.record_node_creations(&plan.fresh_runs, txid, commit_ts, horizon);
   CommitRecorder {
     vc,
     committed: Committed { delta, snapshot },
@@ -149,9 +153,6 @@ struct CommitRecorder<'a> {
 impl CommitRecorder<'_> {
   fn record(&mut self, pending: &DeltaState, plan: &HistoryPlan) {
     let (txid, commit_ts) = (self.txid, self.commit_ts);
-    self
-      .vc
-      .record_node_creations(&plan.fresh_runs, txid, commit_ts);
 
     // Removals first. A later change of the same key by this commit (a node deleted and
     // re-created, an edge re-added to a re-created node) replaces what they record.
@@ -768,7 +769,7 @@ mod recorder_tests {
   fn record(delta: &DeltaState, pending: &DeltaState) -> VersionChainManager {
     let mut vc = VersionChainManager::new();
     let plan = HistoryPlan::of(pending, Some(&vc));
-    record_commit(&mut vc, delta, None, pending, &plan, 5, COMMIT_TS);
+    record_commit(&mut vc, delta, None, pending, &plan, 5, COMMIT_TS, 0);
     vc
   }
 
