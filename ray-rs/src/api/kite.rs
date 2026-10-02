@@ -5339,8 +5339,7 @@ mod tests {
     assert!(result.is_err());
 
     // Alice should NOT exist because the transaction was rolled back
-    // Note: Due to WAL-based implementation, rollback happens at commit time
-    // so we need to verify the final state
+    assert!(ray.get("User", "alice").expect("get").is_none());
 
     ray.close().expect("expected value");
   }
@@ -6623,5 +6622,44 @@ mod tests {
     assert_eq!(lossless_f64((1 << 53) + 1), None);
     assert_eq!(lossless_f64(i64::MIN), Some(-two_pow_63));
     assert_eq!(lossless_f64(i64::MAX), None);
+  }
+
+  // Wave-3 reproductions that need private access; the rest live in tests/w3_api.rs.
+
+  #[test]
+  fn w3_a13_both_yields_self_loop_once_without_unique() {
+    let temp_dir = tempdir().expect("expected value");
+    let mut ray = Kite::open(temp_db_path(&temp_dir), create_test_schema()).expect("open");
+    let a = ray
+      .create_node("User", "a", HashMap::new())
+      .expect("create a")
+      .id();
+    ray.link(a, "FOLLOWS", a).expect("self-loop");
+
+    let reached = TraversalBuilder::from_node(a)
+      .both(None)
+      .unique(false)
+      .collect_node_ids(|node_id, dir, etype| ray.neighbors(node_id, dir, etype));
+    assert_eq!(
+      reached,
+      vec![a],
+      "A13: one self-loop is one edge, so both() must reach a once"
+    );
+  }
+
+  #[test]
+  fn w3_a14_transaction_keeps_closure_error_when_rollback_fails() {
+    let temp_dir = tempdir().expect("expected value");
+    let mut ray = Kite::open(temp_db_path(&temp_dir), create_test_schema()).expect("open");
+
+    let result: Result<()> = ray.transaction(|ctx| {
+      // End the tx behind the context's back, so the closing rollback fails.
+      ctx.handle.db.rollback()?;
+      Err(KiteError::Internal("closure error".into()))
+    });
+    match result {
+      Err(KiteError::Internal(message)) if message == "closure error" => {}
+      other => panic!("A14: transaction() must return the closure's error, got {other:?}"),
+    }
   }
 }
