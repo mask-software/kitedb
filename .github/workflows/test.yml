@@ -75,11 +75,11 @@ jobs:
         with:
           workspaces: ray-rs
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      # The lib sets #![deny(clippy::all)], so any clippy finding fails these steps.
+      # Lints the lib, its unit tests and the integration tests; any finding fails.
       - name: cargo clippy (no default features)
-        run: cargo clippy --lib --no-default-features
+        run: cargo clippy --lib --tests --no-default-features -- -D warnings
       - name: cargo clippy (default features)
-        run: cargo clippy --lib
+        run: cargo clippy --lib --tests -- -D warnings
 
   rust-fmt:
     name: Rust fmt

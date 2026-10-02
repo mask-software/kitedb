@@ -226,7 +226,7 @@ fn scratch_stress_crash_images_under_concurrent_background_checkpoints() {
         let mut n = 0u64;
         while !stop.load(AO::Relaxed) {
           n += 1;
-          let rollback = n % 9 == 0;
+          let rollback = n.is_multiple_of(9);
           let next = seq + 1;
           let r = (|| -> Result<()> {
             db.begin(false)?;

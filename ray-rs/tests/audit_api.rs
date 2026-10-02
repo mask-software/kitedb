@@ -78,7 +78,7 @@ fn raw_neighbors(
 ) -> impl Fn(NodeId, TraversalDirection, Option<ETypeId>) -> Vec<Edge> + '_ {
   move |node_id, direction, etype| {
     let db = kite.raw();
-    let wanted = |edge_etype: ETypeId| etype.map_or(true, |e| e == edge_etype);
+    let wanted = |edge_etype: ETypeId| etype.is_none_or(|e| e == edge_etype);
     let mut edges = Vec::new();
     if matches!(
       direction,

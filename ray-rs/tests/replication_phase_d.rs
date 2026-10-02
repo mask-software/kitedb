@@ -667,7 +667,7 @@ fn bootstrap_handles_concurrent_primary_writes_safely() {
           Ok(_) => {
             writer_wrote.fetch_add(1, Ordering::Relaxed);
             local_commits = local_commits.saturating_add(1);
-            if local_commits % 64 == 0 {
+            if local_commits.is_multiple_of(64) {
               let _ = writer_primary.checkpoint();
             }
           }

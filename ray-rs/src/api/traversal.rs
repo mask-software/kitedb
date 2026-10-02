@@ -1401,94 +1401,39 @@ mod tests {
     // 1 --knows--> 2 --knows--> 3
     // 1 --follows--> 4
     // 2 --follows--> 5
+    const GRAPH: [Edge; 4] = [
+      Edge {
+        src: 1,
+        etype: 1,
+        dst: 2,
+      },
+      Edge {
+        src: 1,
+        etype: 2,
+        dst: 4,
+      },
+      Edge {
+        src: 2,
+        etype: 1,
+        dst: 3,
+      },
+      Edge {
+        src: 2,
+        etype: 2,
+        dst: 5,
+      },
+    ];
     move |node_id: NodeId, direction: TraversalDirection, etype: Option<ETypeId>| {
-      let mut edges = Vec::new();
-
+      let edges = GRAPH
+        .into_iter()
+        .filter(move |edge| etype.is_none_or(|etype| edge.etype == etype));
+      let out = edges.clone().filter(|edge| edge.src == node_id);
+      let incoming = edges.filter(|edge| edge.dst == node_id);
       match direction {
-        TraversalDirection::Out => match node_id {
-          1 => {
-            if etype.is_none() || etype == Some(1) {
-              edges.push(Edge {
-                src: 1,
-                etype: 1,
-                dst: 2,
-              });
-            }
-            if etype.is_none() || etype == Some(2) {
-              edges.push(Edge {
-                src: 1,
-                etype: 2,
-                dst: 4,
-              });
-            }
-          }
-          2 => {
-            if etype.is_none() || etype == Some(1) {
-              edges.push(Edge {
-                src: 2,
-                etype: 1,
-                dst: 3,
-              });
-            }
-            if etype.is_none() || etype == Some(2) {
-              edges.push(Edge {
-                src: 2,
-                etype: 2,
-                dst: 5,
-              });
-            }
-          }
-          _ => {}
-        },
-        TraversalDirection::In => match node_id {
-          2 => {
-            if etype.is_none() || etype == Some(1) {
-              edges.push(Edge {
-                src: 1,
-                etype: 1,
-                dst: 2,
-              });
-            }
-          }
-          3 => {
-            if etype.is_none() || etype == Some(1) {
-              edges.push(Edge {
-                src: 2,
-                etype: 1,
-                dst: 3,
-              });
-            }
-          }
-          4 => {
-            if etype.is_none() || etype == Some(2) {
-              edges.push(Edge {
-                src: 1,
-                etype: 2,
-                dst: 4,
-              });
-            }
-          }
-          5 => {
-            if etype.is_none() || etype == Some(2) {
-              edges.push(Edge {
-                src: 2,
-                etype: 2,
-                dst: 5,
-              });
-            }
-          }
-          _ => {}
-        },
-        TraversalDirection::Both => {
-          // Combine out and in edges
-          let out_edges = mock_graph()(node_id, TraversalDirection::Out, etype);
-          let in_edges = mock_graph()(node_id, TraversalDirection::In, etype);
-          edges.extend(out_edges);
-          edges.extend(in_edges);
-        }
+        TraversalDirection::Out => out.collect(),
+        TraversalDirection::In => incoming.collect(),
+        TraversalDirection::Both => out.chain(incoming).collect(),
       }
-
-      edges
     }
   }
 
@@ -1868,7 +1813,7 @@ mod tests {
       graph
         .iter()
         .copied()
-        .filter(|edge| etype.map_or(true, |etype| edge.etype == etype))
+        .filter(|edge| etype.is_none_or(|etype| edge.etype == etype))
         .filter(|edge| match direction {
           TraversalDirection::Out => edge.src == node_id,
           TraversalDirection::In => edge.dst == node_id,
