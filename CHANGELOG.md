@@ -7,6 +7,7 @@ All notable changes to this project will be documented in this file.
 ### Added
 - `KiteOptions::strict_schema(true)` (Rust) enforces `required` props on create and checks values against their declared `prop_type` on every create/update (int<->float coerced only when lossless), failing with the new `KiteError::SchemaViolation`. Off by default.
 - CI runs Rust tests, clippy, rustfmt, and the Node (ava), Python (pytest) and Bun (playground, tui) suites on every pull request and push to main.
+- CI fails on RustSec vulnerabilities in `ray-rs/Cargo.lock` (`cargo audit`), and builds the docs site and server-renders every page on docs changes.
 
 ### Changed
 - **Snapshot format v5**: the node-id map switches to a sparse sorted table when ids are spread out, and section sizes and string offsets are 64-bit. Huge custom node ids (e.g. 3e9, 2^40, `i64::MAX`) no longer make checkpoints and opens allocate gigabytes or leave the database unopenable, and sections beyond 4 GiB round-trip. v4 databases still open and are upgraded at the next checkpoint; older releases cannot open v5 snapshots.
@@ -25,6 +26,8 @@ All notable changes to this project will be documented in this file.
 - The WAL size is optional when reopening a database. `SingleFileOpenOptions.wal_size` is now `Option<usize>` (default `None`): an existing file opens with the WAL size recorded in its header, and a new file gets the 4MB default. An explicit size (`.wal_size(n)`, unchanged) still creates new files with that size and rejects existing files whose WAL differs. The Node (`walSize`, `walSizeMb`) and Python (`wal_size`) options follow the same rule when left unset. Rust code that reads or assigns the field directly must now handle an `Option`.
 - Writers that fill the WAL's secondary region while a background checkpoint runs now wait for it to install instead of failing with `WalBufferFull`. The auto-checkpoint can also run after a failed commit, after a rollback, and in `begin` when the WAL is full.
 - `background_checkpoint()` returns the new `KiteError::CheckpointDeclined` when it declines to start (previously `WalBufferFull` or `InvalidWal`).
+- `ray-rs/Cargo.lock` is committed, so CI and release builds resolve the same dependency versions. memmap2 must be at least 0.9.11 (RUSTSEC-2026-0186), and rustls, rustls-webpki, h2 and crossbeam-epoch are on patched releases.
+- Playground: `GET /api/replication/snapshot/latest?includeData=true` refuses databases larger than `PLAYGROUND_SNAPSHOT_MAX_BYTES` (default 32 MiB) instead of loading any size into memory, and `/api/replication/metrics` names its series `kitedb_replication_*` (was `raydb_replication_*`), like core's exporter.
 
 ### Fixed
 - Vacuum and WAL resize are crash-safe: both header slots name a valid layout afterwards (a torn newest slot no longer makes the file unopenable), a failure at any step leaves the database readable, `min_wal_size` can no longer shrink the WAL below 16 pages, and vectors committed since the last checkpoint are kept.
@@ -61,6 +64,10 @@ All notable changes to this project will be documented in this file.
 - Python: long-running calls (open/close, begin/commit, checkpoint, optimize, vacuum, export/import, backup/restore, replication catch-up, `wait_for_token`, index training, OTLP pushes) release the GIL; interrupted transactions are rolled back; `VectorIndex.search` no longer drops hits evicted from its cache; multi-hop traversals no longer return duplicates.
 - Node: retried insert/upsert executors (e.g. `batchAdaptive` after WAL-full) keep their props, and `whereNode`/`whereEdge` callbacks are released when the traversal is collected.
 - Playground graph view, path finding and impact analysis work again on the native engine.
+- TUI: keyboard shortcuts and text input work (the handlers read a `key` field opentui's events don't have), opening a database no longer fails with "this.db.nodeTypes is not a function", q/Esc close the database before exiting, nodes created by an import show their keys, node details show edge endpoints instead of `undefined`, and `bun run build` works.
+- Playground: concurrent database opens no longer leak a handle, a failing close still removes its temp directory, and snapshots are read in one synchronous pass so concurrent requests can't tear them. `/api/replication/log` polls skip segments before the cursor (about 8x faster at the log head with 137 segments). The client handles failed status, path and impact requests, ignores responses superseded by a newer request or a database switch, clears highlights when another database is opened, and lays out nodes that arrive while a layout is running instead of stacking them at the origin.
+- `examples/ts-package` installs @kitedb/core 0.2.18 (its lockfiles resolved 0.2.7), and its `dev` and `typecheck` scripts work.
+- The npm package README told users to `npm install kitedb`, which is unpublished; it now says `@kitedb/core`.
 
 ### Security
 - Playground: uploads are stored under a fixed name in a private temp directory, so a crafted filename can no longer write outside it. The server binds `127.0.0.1` by default (`PLAYGROUND_HOST`), allows only listed CORS origins (`PLAYGROUND_ALLOWED_ORIGINS`), opens databases only inside `PLAYGROUND_DATA_DIR`, and disables replication admin endpoints unless `REPLICATION_ADMIN_TOKEN` or mTLS is configured (tokens compared in constant time).
