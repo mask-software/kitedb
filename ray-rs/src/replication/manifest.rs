@@ -1,7 +1,7 @@
 //! Replication manifest sidecar storage.
 
 use crate::error::{KiteError, Result};
-use crate::util::crc::crc32c;
+use crate::util::crc::crc32;
 use crate::util::fs::sync_parent_dir;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
@@ -129,7 +129,7 @@ fn encode_manifest_bytes(manifest: &ReplicationManifest) -> Result<Vec<u8>> {
 
   let envelope = ManifestEnvelope {
     version: MANIFEST_ENVELOPE_VERSION,
-    payload_crc32: crc32c(&payload),
+    payload_crc32: crc32(&payload),
     manifest: manifest.clone(),
   };
 
@@ -154,7 +154,7 @@ fn decode_manifest_bytes(bytes: &[u8]) -> Result<ReplicationManifest> {
     KiteError::Serialization(format!("encode replication manifest payload: {error}"))
   })?;
 
-  let computed = crc32c(&payload);
+  let computed = crc32(&payload);
   if computed != envelope.payload_crc32 {
     return Err(KiteError::CrcMismatch {
       stored: envelope.payload_crc32,
@@ -221,7 +221,7 @@ mod tests {
     assert!(!String::from_utf8_lossy(&payload).contains("generation"));
     let envelope = ManifestEnvelope {
       version: 1,
-      payload_crc32: crate::util::crc::crc32c(&payload),
+      payload_crc32: crate::util::crc::crc32(&payload),
       manifest: legacy.clone(),
     };
     std::fs::write(

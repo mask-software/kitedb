@@ -49,7 +49,7 @@ use kitedb::util::binary::{
   align_up, read_u32, read_u32_at, read_u64, read_u64_at, write_u32, write_u64,
 };
 use kitedb::util::compression::{decompress_with_size, CompressionOptions, CompressionType};
-use kitedb::util::crc::crc32c;
+use kitedb::util::crc::crc32;
 use kitedb::util::hash::xxhash64_string;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -278,7 +278,7 @@ impl Image {
       write_u64(&mut bytes, entry + 20, section.uncompressed_size);
       bytes[offset..offset + section.payload.len()].copy_from_slice(&section.payload);
     }
-    let crc = crc32c(&bytes[..cursor]);
+    let crc = crc32(&bytes[..cursor]);
     write_u32(&mut bytes, cursor, crc);
     bytes
   }
@@ -1292,7 +1292,7 @@ fn s14_unknown_bytes_before_known_sections_are_crc_covered_and_ignored() {
       write_u64(&mut shifted, entry, offset + gap as u64);
     }
   }
-  let crc = crc32c(&shifted);
+  let crc = crc32(&shifted);
   shifted.extend_from_slice(&crc.to_le_bytes());
 
   let loaded = load_bytes(&shifted).expect("unknown bytes before the sections load");

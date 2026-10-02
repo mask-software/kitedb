@@ -88,14 +88,6 @@ impl Default for Crc32Hasher {
   }
 }
 
-// The names these had before: they compute CRC-32 (IEEE), not CRC-32C. Kept
-// for callers not yet renamed (core/snapshot, replication).
-pub use self::crc32 as crc32c;
-pub use self::crc32_chunked as crc32c_chunked;
-pub use self::crc32_multi as crc32c_multi;
-pub use self::verify_crc32 as verify_crc32c;
-pub use self::Crc32Hasher as Crc32cHasher;
-
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -148,17 +140,5 @@ mod tests {
     let incremental = hasher.finalize();
 
     assert_eq!(single, incremental);
-  }
-
-  #[test]
-  fn old_names_compute_the_same_checksum() {
-    let data = b"hello world";
-    assert_eq!(crc32c(data), crc32(data));
-    assert_eq!(crc32c_chunked(data, 3), crc32(data));
-    assert_eq!(crc32c_multi(&[b"hello", b" world"]), crc32(data));
-    assert!(verify_crc32c(data, crc32(data)));
-    let mut hasher = Crc32cHasher::new();
-    hasher.update(data);
-    assert_eq!(hasher.finalize(), crc32(data));
   }
 }

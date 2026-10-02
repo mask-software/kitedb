@@ -18,7 +18,7 @@ use crate::error::{KiteError, Result};
 use crate::types::*;
 use crate::util::binary::*;
 use crate::util::compression::{decompress_with_size, CompressionType};
-use crate::util::crc::{crc32c, crc32c_chunked, Crc32cHasher};
+use crate::util::crc::{crc32, crc32_chunked, Crc32Hasher};
 use crate::util::hash::xxhash64_string;
 use crate::util::mmap::{map_file, Mmap};
 use std::borrow::Cow;
@@ -198,13 +198,13 @@ fn compute_crc_with_options(
   let chunk_size = normalized_crc_chunk_size(options.crc_chunk_size, data.len());
   if options.crc_profile_sink.is_none() {
     if chunk_size >= data.len().max(1) {
-      return (crc32c(data), None);
+      return (crc32(data), None);
     }
-    return (crc32c_chunked(data, chunk_size), None);
+    return (crc32_chunked(data, chunk_size), None);
   }
 
   let segments = section_segments(sections, base_offset, data.len());
-  let mut hasher = Crc32cHasher::new();
+  let mut hasher = Crc32Hasher::new();
   let mut profile_sections = Vec::with_capacity(segments.len());
   let mut total_ns: u64 = 0;
 
@@ -1678,7 +1678,7 @@ mod tests {
   use super::*;
   use crate::core::snapshot::writer::{build_snapshot_to_memory, NodeData, SnapshotBuildInput};
   use crate::types::PropValue;
-  use crate::util::crc::crc32c;
+  use crate::util::crc::crc32;
   use crate::util::mmap::map_file;
   use std::collections::HashMap;
   use std::fs::{self, File};
@@ -1896,7 +1896,7 @@ mod tests {
     for (name, mutate) in mutations {
       let mut corrupted = valid.clone();
       mutate(&mut corrupted);
-      let footer_crc = crc32c(&corrupted[..corrupted.len() - 4]);
+      let footer_crc = crc32(&corrupted[..corrupted.len() - 4]);
       let footer_offset = corrupted.len() - 4;
       write_u32(&mut corrupted, footer_offset, footer_crc);
       let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1923,7 +1923,7 @@ mod tests {
       for &value in values {
         let mut corrupted = valid.clone();
         write_u64(&mut corrupted, field_offset, value);
-        let footer_crc = crc32c(&corrupted[..corrupted.len() - 4]);
+        let footer_crc = crc32(&corrupted[..corrupted.len() - 4]);
         let footer_offset = corrupted.len() - 4;
         write_u32(&mut corrupted, footer_offset, footer_crc);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1940,7 +1940,7 @@ mod tests {
 
   fn rewrite_crc(bytes: &mut [u8]) {
     let footer_offset = bytes.len() - 4;
-    let footer_crc = crc32c(&bytes[..footer_offset]);
+    let footer_crc = crc32(&bytes[..footer_offset]);
     write_u32(bytes, footer_offset, footer_crc);
   }
 

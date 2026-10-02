@@ -16,7 +16,7 @@ use crate::error::{KiteError, Result};
 use crate::types::*;
 use crate::util::binary::*;
 use crate::util::compression::{try_compress, CompressionOptions, CompressionType};
-use crate::util::crc::crc32c;
+use crate::util::crc::crc32;
 use crate::util::hash::xxhash64_string;
 use crate::vector::ivf::serialize::serialize_manifest;
 use crate::vector::types::VectorManifest;
@@ -605,7 +605,7 @@ impl<'o> SectionWriter<'o> {
       // +28: reserved, left zero
     }
 
-    let footer_crc = crc32c(buffer);
+    let footer_crc = crc32(buffer);
     push_u32(buffer, footer_crc);
     self.buffer
   }
@@ -956,7 +956,7 @@ mod tests {
   use super::*;
   use crate::core::snapshot::reader::SnapshotData;
   use crate::util::compression::{CompressionOptions, CompressionType};
-  use crate::util::crc::crc32c;
+  use crate::util::crc::crc32;
   use crate::vector::store::{create_vector_store, vector_store_insert};
   use crate::vector::types::VectorStoreConfig;
   use std::io::Write;
@@ -1073,7 +1073,7 @@ mod tests {
     // Verify CRC at the end
     let crc_offset = buffer.len() - 4;
     let stored_crc = read_u32(&buffer, crc_offset);
-    let computed_crc = crc32c(&buffer[..crc_offset]);
+    let computed_crc = crc32(&buffer[..crc_offset]);
     assert_eq!(stored_crc, computed_crc);
   }
 
