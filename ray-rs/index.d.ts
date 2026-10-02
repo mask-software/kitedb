@@ -180,14 +180,17 @@ export declare class Database {
    * Get a page of node IDs
    *
    * Pages follow node ID order, and a cursor resumes after the ID it names
-   * even if that node has since been deleted.
+   * even if that node has since been deleted. A page seeks to its cursor, so
+   * it costs what it returns; `total` is the node count when it is read.
    */
   get_nodes_page(options?: PaginationOptions | undefined | null): NodePage
   /**
    * Get a page of edges
    *
    * Pages follow (src, etype, dst) order, and a cursor resumes after the
-   * edge it names even if that edge has since been deleted.
+   * edge it names even if that edge has since been deleted. A page seeks to
+   * its cursor, so it costs what it returns; `total` is the edge count when
+   * it is read.
    */
   get_edges_page(options?: PaginationOptions | undefined | null): EdgePage
   /** Set a node property */

@@ -1,11 +1,17 @@
-//! Node iteration and statistics for SingleFileDB
+//! Node iteration, listings and statistics for SingleFileDB
 //!
-//! Provides iterators over nodes and database statistics.
+//! Full listings (`iter_nodes`, `list_edges`), listings that seek instead of
+//! scanning (`nodes_after` / `edges_after` pages, nodes by label or key
+//! prefix), counts, and database statistics. The seeking listings return what
+//! the full listings would, from the same view; their cost follows what they
+//! return plus the changes since the last checkpoint, not the graph.
 
+use crate::core::delta::snapshot_has_edge;
 use crate::types::*;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
+use std::ops::ControlFlow;
 
-use super::read::NodeLayers;
+use super::read::{examined_edges, examined_nodes, merge_sorted, EdgeSide, NodeLayers, ReadView};
 use super::SingleFileDB;
 
 // ============================================================================
@@ -27,7 +33,7 @@ pub struct FullEdge {
 /// Iterator over all nodes in the database
 ///
 /// This iterator collects node IDs upfront to avoid holding locks during iteration.
-/// For very large databases, consider using `list_nodes()` with chunking.
+/// For very large databases, page through them with `nodes_after()`.
 pub struct NodeIterator {
   nodes: Vec<NodeId>,
   index: usize,
@@ -35,67 +41,486 @@ pub struct NodeIterator {
 
 impl NodeIterator {
   pub(crate) fn new(db: &SingleFileDB) -> Self {
-    let mut nodes = Vec::new();
-    let tx_handle = db.current_tx_handle();
-    let tx_guard = tx_handle.as_ref().map(|tx| tx.lock());
-    let pending = tx_guard.as_ref().map(|tx| &tx.pending);
-    // Lock order: see read.rs.
-    let (txid, tx_snapshot_ts) = db.mvcc_read_ts(tx_guard.as_deref());
-    let delta = db.delta.read();
-    let snapshot = db.snapshot.read();
-    let vc_guard = db.mvcc_history(tx_snapshot_ts);
-    let layers = NodeLayers {
-      pending,
-      delta: &delta,
-    };
+    let nodes = db.read_view(|view, _| view.listed_nodes());
+    Self { nodes, index: 0 }
+  }
+}
 
-    // 1. Collect nodes from snapshot (excluding deleted ones; a recreated
-    // node is listed with the delta's nodes)
-    if let Some(ref snap) = *snapshot {
+impl ReadView<'_> {
+  /// Every node the reader sees, sorted by ID: what `iter_nodes` lists.
+  pub(super) fn listed_nodes(&self) -> Vec<NodeId> {
+    let layers = self.layers;
+    let mut nodes = Vec::new();
+
+    // 1. Nodes from the snapshot (excluding deleted ones; a recreated node is
+    // listed with the delta's nodes)
+    if let Some(snap) = self.snapshot {
       let num_nodes = snap.header.num_nodes as u32;
       for phys in 0..num_nodes {
+        examined_nodes(1);
         if let Some(node_id) = snap.node_id(phys) {
-          // Skip if deleted in delta
-          let node_visible = vc_guard
-            .as_ref()
-            .and_then(|vc| vc.node_exists_at(node_id, tx_snapshot_ts, txid));
-          if !layers.sees_snapshot(node_id, node_visible) {
-            continue;
+          if layers.sees_snapshot(node_id, self.node_mvcc(node_id)) {
+            nodes.push(node_id);
           }
-          nodes.push(node_id);
         }
       }
     }
 
-    // 2. Add nodes created in delta (excluding deleted)
-    for &node_id in delta.created_nodes.keys() {
-      let node_visible = vc_guard
-        .as_ref()
-        .and_then(|vc| vc.node_exists_at(node_id, tx_snapshot_ts, txid));
-      if !layers.sees_delta(node_id, node_visible) {
-        continue;
+    // 2. Nodes created in the delta, and those the transaction created or
+    // recreated, and those deleted since the reader's snapshot (only their
+    // version chains hold them)
+    self.for_each_unsorted_node(|node_id, listed| {
+      if listed(node_id) {
+        nodes.push(node_id);
       }
-      nodes.push(node_id);
-    }
+    });
 
-    // 3. Add nodes created (or recreated) in pending
-    if let Some(pending_delta) = pending {
-      nodes.extend(pending_delta.created_nodes.keys().copied());
-    }
-
-    // 4. Add nodes deleted since the reader's snapshot: only their version chains hold them
-    if let Some(vc) = vc_guard.as_ref() {
-      nodes.extend(
-        vc.nodes_at(tx_snapshot_ts, txid)
-          .filter(|&node_id| !layers.pending_masks(node_id)),
-      );
-    }
-
-    // Sort for consistent ordering
     nodes.sort_unstable();
     nodes.dedup();
+    nodes
+  }
 
-    Self { nodes, index: 0 }
+  /// The nodes `listed_nodes` may list from the delta, the transaction and the
+  /// version chains, in no particular order (some more than once), each with
+  /// the check whether it lists it. They follow the changes since the last
+  /// checkpoint, not the graph.
+  fn for_each_unsorted_node(&self, mut f: impl FnMut(NodeId, &dyn Fn(NodeId) -> bool)) {
+    let layers = self.layers;
+    examined_nodes(layers.delta.created_nodes.len());
+    let from_delta = |node_id| layers.sees_delta(node_id, self.node_mvcc(node_id));
+    for &node_id in layers.delta.created_nodes.keys() {
+      f(node_id, &from_delta);
+    }
+    if let Some(pending) = layers.pending {
+      examined_nodes(pending.created_nodes.len());
+      for &node_id in pending.created_nodes.keys() {
+        f(node_id, &|_| true);
+      }
+    }
+    if let Some(vc) = self.history {
+      let from_history = |node_id| !layers.pending_masks(node_id);
+      for node_id in vc.nodes_at(self.snapshot_ts, self.txid) {
+        examined_nodes(1);
+        f(node_id, &from_history);
+      }
+    }
+  }
+
+  /// The first `limit` nodes of `listed_nodes` after `after`.
+  fn nodes_after(&self, after: Option<NodeId>, limit: usize) -> Vec<NodeId> {
+    let layers = self.layers;
+
+    // The few nodes from the delta, the transaction and the version chains:
+    // keep the first `limit` after the cursor.
+    let mut unsorted = Smallest::new(limit);
+    self.for_each_unsorted_node(|node_id, listed| {
+      if after.is_none_or(|after| node_id > after) && unsorted.wants(node_id) && listed(node_id) {
+        unsorted.insert(node_id);
+      }
+    });
+
+    // The snapshot's nodes, in ID order from the first after the cursor
+    let mut from_snapshot = self
+      .snapshot
+      .into_iter()
+      .flat_map(|snap| {
+        let start = after.map_or(0, |after| snap.phys_after(after));
+        (start..snap.header.num_nodes as u32).filter_map(move |phys| {
+          examined_nodes(1);
+          snap.node_id(phys)
+        })
+      })
+      .filter(|&node_id| layers.sees_snapshot(node_id, self.node_mvcc(node_id)));
+
+    let mut nodes = Vec::with_capacity(limit.min(1024));
+    let _ = merge_sorted([&mut from_snapshot, &mut unsorted.into_iter()], |node_id| {
+      nodes.push(node_id);
+      if nodes.len() >= limit {
+        ControlFlow::Break(())
+      } else {
+        ControlFlow::Continue(())
+      }
+    });
+    nodes
+  }
+
+  /// The first `limit` edges of the sorted `list_edges(None)` after `after`,
+  /// noting in `reads` the sources whose out-edges it read.
+  fn edges_after(
+    &self,
+    after: Option<(NodeId, ETypeId, NodeId)>,
+    limit: usize,
+    reads: &mut Vec<TxKey>,
+  ) -> Vec<FullEdge> {
+    let first_src = after.map_or(0, |(src, _, _)| src);
+
+    // Sources with out-edges outside the snapshot, in ID order
+    let mut unsorted = UnsortedSources {
+      view: self,
+      from: Some(first_src),
+      batch: limit.saturating_add(1),
+      sorted: BTreeSet::new().into_iter(),
+      exhausted: false,
+    };
+
+    // The snapshot's nodes, in ID order from the cursor's source
+    let mut from_snapshot = self.snapshot.into_iter().flat_map(|snap| {
+      let start = first_src
+        .checked_sub(1)
+        .map_or(0, |before| snap.phys_after(before));
+      (start..snap.header.num_nodes as u32).filter_map(move |phys| {
+        examined_nodes(1);
+        snap.node_id(phys)
+      })
+    });
+
+    let mut edges = Vec::with_capacity(limit.min(1024));
+    let _ = merge_sorted([&mut from_snapshot, &mut unsorted], |src| {
+      let start = after
+        .filter(|&(after_src, _, _)| after_src == src)
+        .map(|(_, etype, dst)| (etype, dst));
+      let visible = self.for_each_edge(EdgeSide::Out, src, None, start, |etype, dst| {
+        edges.push(FullEdge { src, etype, dst });
+        if edges.len() >= limit {
+          ControlFlow::Break(())
+        } else {
+          ControlFlow::Continue(())
+        }
+      });
+      if visible.is_some() && self.tracks_reads {
+        reads.push(TxKey::NeighborsOut {
+          node_id: src,
+          etype: None,
+        });
+      }
+      if edges.len() >= limit {
+        ControlFlow::Break(())
+      } else {
+        ControlFlow::Continue(())
+      }
+    });
+    edges
+  }
+
+  /// `list_edges(None).len()`, from the snapshot's edge count and the changes
+  /// since: the snapshot edges of deleted nodes and tombstoned edges, and the
+  /// delta's and transaction's added edges. `None` when that does not answer:
+  /// with version history (which has no index of what it hides), or a
+  /// snapshot without in-edges.
+  fn count_edges(&self) -> Option<usize> {
+    if self.history.is_some() {
+      return None;
+    }
+    let layers = self.layers;
+    let delta = layers.delta;
+    let pending = layers.pending;
+    let snapshot = self.snapshot;
+    if snapshot.is_some_and(|snap| !snap.header.flags.contains(SnapshotFlags::HAS_IN_EDGES)) {
+      return None;
+    }
+    let pending_deleted =
+      |src, etype, dst| pending.is_some_and(|p| p.is_edge_deleted(src, etype, dst));
+    let layers_iter = || std::iter::once(delta).chain(pending);
+
+    // Every snapshot edge is listed unless a layer hides it: an endpoint's
+    // delete, or a tombstone.
+    let mut count = snapshot.map_or(0, |snap| snap.header.num_edges as usize);
+    let mut maybe_hidden = HashSet::new();
+    if let Some(snap) = snapshot {
+      for &node_id in layers_iter().flat_map(|layer| layer.deleted_nodes.iter()) {
+        let Some(phys) = snap.phys_node(node_id) else {
+          continue;
+        };
+        for (dst_phys, etype) in snap.iter_out_edges(phys) {
+          examined_edges(1);
+          if let Some(dst) = snap.node_id(dst_phys) {
+            maybe_hidden.insert((node_id, etype, dst));
+          }
+        }
+        for (src_phys, etype, _) in snap.iter_in_edges(phys) {
+          examined_edges(1);
+          if let Some(src) = snap.node_id(src_phys) {
+            maybe_hidden.insert((src, etype, node_id));
+          }
+        }
+      }
+      for (&src, patches) in layers_iter().flat_map(|layer| layer.out_del.iter()) {
+        examined_edges(patches.len());
+        maybe_hidden.extend(patches.iter().map(|patch| (src, patch.etype, patch.other)));
+      }
+    }
+    for (src, etype, dst) in maybe_hidden {
+      let listed = layers.sees_snapshot(src, None)
+        && layers.sees_snapshot(dst, None)
+        && !pending_deleted(src, etype, dst)
+        && !delta.is_edge_deleted(src, etype, dst);
+      if !listed && snapshot_has_edge(snapshot, src, etype, dst) {
+        count -= 1;
+      }
+    }
+
+    // Plus the edges `list_edges` lists from the delta and the transaction.
+    for (&src, patches) in &delta.out_add {
+      examined_edges(patches.len());
+      if !layers.sees_delta(src, None) {
+        continue;
+      }
+      count += patches
+        .iter()
+        .filter(|patch| {
+          layers.sees_delta(patch.other, None) && !pending_deleted(src, patch.etype, patch.other)
+        })
+        .count();
+    }
+    for (&src, patches) in pending.into_iter().flat_map(|p| p.out_add.iter()) {
+      examined_edges(patches.len());
+      if !layers.sees_pending(src, None) {
+        continue;
+      }
+      count += patches
+        .iter()
+        .filter(|patch| layers.sees_pending(patch.other, None))
+        .count();
+    }
+    Some(count)
+  }
+
+  /// Whether no layer above the snapshot names `node_id`: then the snapshot's
+  /// copy (its key and labels) is the node, and the reader sees it.
+  fn snapshot_copy_untouched(&self, node_id: NodeId) -> bool {
+    let untouched = |layer: &DeltaState| {
+      !layer.deleted_nodes.contains(&node_id)
+        && !layer.created_nodes.contains_key(&node_id)
+        && !layer.modified_nodes.contains_key(&node_id)
+    };
+    self.history.is_none()
+      && untouched(self.layers.delta)
+      && self.layers.pending.is_none_or(untouched)
+  }
+
+  /// Visit each node the reader sees with label `label_id`, once, in no
+  /// particular order.
+  fn for_each_labeled(&self, label_id: LabelId, mut f: impl FnMut(NodeId)) {
+    if self.history.is_some() {
+      // Version history may hold a label change of any node.
+      for node_id in self.listed_nodes() {
+        if self.node_has_label(node_id, label_id) {
+          f(node_id);
+        }
+      }
+      return;
+    }
+    // Otherwise a node has the label through its snapshot copy, or through the
+    // delta or the transaction adding it.
+    let in_snapshot_labels = |node_id| {
+      self.snapshot.is_some_and(|snap| {
+        snap
+          .phys_node(node_id)
+          .is_some_and(|phys| snap.node_has_label(phys, label_id))
+      })
+    };
+    if let Some(snap) = self.snapshot {
+      for phys in 0..snap.header.num_nodes as u32 {
+        examined_nodes(1);
+        if !snap.node_has_label(phys, label_id) {
+          continue;
+        }
+        if let Some(node_id) = snap.node_id(phys) {
+          if self.snapshot_copy_untouched(node_id) || self.node_has_label(node_id, label_id) {
+            f(node_id);
+          }
+        }
+      }
+    }
+    let mut added = HashSet::new();
+    for layer in std::iter::once(self.layers.delta).chain(self.layers.pending) {
+      for (&node_id, node) in layer.created_nodes.iter().chain(&layer.modified_nodes) {
+        examined_nodes(1);
+        if node
+          .labels
+          .as_ref()
+          .is_some_and(|labels| labels.contains(&label_id))
+          && !in_snapshot_labels(node_id)
+        {
+          added.insert(node_id);
+        }
+      }
+    }
+    for node_id in added {
+      if self.node_has_label(node_id, label_id) {
+        f(node_id);
+      }
+    }
+  }
+
+  /// The nodes the reader sees whose key starts with `prefix`, with their
+  /// keys, sorted by ID.
+  fn nodes_with_key_prefix(&self, prefix: &str) -> Vec<(NodeId, String)> {
+    let mut nodes = Vec::new();
+    // `known`: the node's key, when its snapshot copy is untouched.
+    let mut take = |node_id, known: Option<&str>| {
+      let key = match known {
+        Some(key) => Some(key),
+        None => self
+          .node_key(node_id)
+          .filter(|key| key.starts_with(prefix) && self.node_exists(node_id)),
+      };
+      if let Some(key) = key {
+        nodes.push((node_id, key.to_owned()));
+      }
+    };
+    if self.history.is_some() {
+      // Version history may hold the key of any node deleted since.
+      for node_id in self.listed_nodes() {
+        take(node_id, None);
+      }
+      return nodes;
+    }
+    // Otherwise a node's key is its snapshot copy's, or the one it was created
+    // (or recreated) with in the delta or the transaction.
+    let snapshot_key_matches = |node_id| {
+      self.snapshot.is_some_and(|snap| {
+        snap
+          .phys_node(node_id)
+          .and_then(|phys| snap.node_key_str(phys))
+          .is_some_and(|key| key.starts_with(prefix))
+      })
+    };
+    if let Some(snap) = self.snapshot {
+      for phys in 0..snap.header.num_nodes as u32 {
+        examined_nodes(1);
+        let Some(key) = snap
+          .node_key_str(phys)
+          .filter(|key| key.starts_with(prefix))
+        else {
+          continue;
+        };
+        let Some(node_id) = snap.node_id(phys) else {
+          continue;
+        };
+        let known = self.snapshot_copy_untouched(node_id).then_some(key);
+        take(node_id, known);
+      }
+    }
+    let mut created = HashSet::new();
+    for layer in std::iter::once(self.layers.delta).chain(self.layers.pending) {
+      examined_nodes(layer.created_nodes.len());
+      for (&node_id, node) in &layer.created_nodes {
+        if node
+          .key
+          .as_deref()
+          .is_some_and(|key| key.starts_with(prefix))
+          && !snapshot_key_matches(node_id)
+        {
+          created.insert(node_id);
+        }
+      }
+    }
+    for node_id in created {
+      take(node_id, None);
+    }
+    nodes.sort_unstable_by_key(|&(node_id, _)| node_id);
+    nodes
+  }
+}
+
+/// The `limit` smallest keys inserted, sorted: what a page needs of keys that
+/// arrive in hash order.
+struct Smallest<K> {
+  keys: BTreeSet<K>,
+  limit: usize,
+  /// The largest key kept, once `limit` are kept
+  max: Option<K>,
+}
+
+impl<K: Ord + Copy> Smallest<K> {
+  fn new(limit: usize) -> Self {
+    Self {
+      keys: BTreeSet::new(),
+      limit,
+      max: None,
+    }
+  }
+
+  /// Whether inserting `key` would keep it: a comparison, once full.
+  fn wants(&self, key: K) -> bool {
+    self.limit > 0 && self.max.is_none_or(|max| key < max)
+  }
+
+  fn insert(&mut self, key: K) {
+    if !self.wants(key) || !self.keys.insert(key) {
+      return;
+    }
+    if self.keys.len() > self.limit {
+      self.keys.pop_last();
+    }
+    if self.keys.len() == self.limit {
+      self.max = self.keys.last().copied();
+    }
+  }
+
+  fn len(&self) -> usize {
+    self.keys.len()
+  }
+
+  fn into_iter(self) -> std::collections::btree_set::IntoIter<K> {
+    self.keys.into_iter()
+  }
+}
+
+/// The sources with out-edges outside the snapshot (added in the delta or the
+/// transaction, or held by version chains), from `from` on in ID order. They
+/// come in hash order, so each `batch` of them takes a pass over all of them:
+/// one pass per page unless many of them have no edges left.
+struct UnsortedSources<'v> {
+  view: &'v ReadView<'v>,
+  /// The smallest source not yielded yet (`None`: past the largest ID)
+  from: Option<NodeId>,
+  batch: usize,
+  sorted: std::collections::btree_set::IntoIter<NodeId>,
+  /// Whether the last pass found every remaining source
+  exhausted: bool,
+}
+
+impl UnsortedSources<'_> {
+  fn next_batch(&mut self) {
+    let Some(from) = self.from else {
+      self.exhausted = true;
+      return;
+    };
+    let layers = self.view.layers;
+    let mut batch = Smallest::new(self.batch);
+    let mut offer = |src: NodeId| {
+      if src >= from && batch.wants(src) {
+        batch.insert(src);
+      }
+    };
+    for layer in std::iter::once(layers.delta).chain(layers.pending) {
+      layer.out_add.keys().copied().for_each(&mut offer);
+    }
+    if let Some(vc) = self.view.history {
+      vc.edges_at(self.view.snapshot_ts, self.view.txid)
+        .for_each(|(src, _, _)| offer(src));
+    }
+    self.exhausted = batch.len() < self.batch;
+    self.sorted = batch.into_iter();
+  }
+}
+
+impl Iterator for UnsortedSources<'_> {
+  type Item = NodeId;
+
+  fn next(&mut self) -> Option<NodeId> {
+    loop {
+      if let Some(src) = self.sorted.next() {
+        self.from = src.checked_add(1);
+        return Some(src);
+      }
+      if self.exhausted {
+        return None;
+      }
+      self.next_batch();
+    }
   }
 }
 
@@ -138,6 +563,72 @@ impl SingleFileDB {
   /// For large databases, prefer `iter_nodes()` to avoid memory allocation.
   pub fn list_nodes(&self) -> Vec<NodeId> {
     self.iter_nodes().collect()
+  }
+
+  /// The first `limit` nodes of [`Self::list_nodes`] with an ID greater than
+  /// `after` (from the first node for `None`), sorted by ID.
+  ///
+  /// Seeks into the snapshot instead of listing it: a page costs a binary
+  /// search plus the nodes it returns, plus one pass over the nodes created
+  /// since the last checkpoint. Pass the last node of one page as `after` to
+  /// get the next; a node deleted in between does not move the cursor.
+  pub fn nodes_after(&self, after: Option<NodeId>, limit: usize) -> Vec<NodeId> {
+    if limit == 0 {
+      return Vec::new();
+    }
+    self.read_view(|view, _| view.nodes_after(after, limit))
+  }
+
+  /// The first `limit` edges of [`Self::list_edges`]`(None)` that come after
+  /// `after` in `(src, etype, dst)` order, in that order.
+  ///
+  /// Seeks into the snapshot instead of listing it: a page costs a binary
+  /// search plus the sources and edges it walks, plus one pass over the
+  /// sources with edges added since the last checkpoint. Pass the last edge of
+  /// one page as `after` to get the next; an edge deleted in between does not
+  /// move the cursor.
+  pub fn edges_after(
+    &self,
+    after: Option<(NodeId, ETypeId, NodeId)>,
+    limit: usize,
+  ) -> Vec<FullEdge> {
+    if limit == 0 {
+      return Vec::new();
+    }
+    self.read_view(|view, reads| view.edges_after(after, limit, reads))
+  }
+
+  /// The nodes with label `label_id`, sorted by ID: those of
+  /// [`Self::list_nodes`] whose [`Self::node_labels`] include it.
+  ///
+  /// Reads the snapshot's label lists in one pass and the label changes since
+  /// the last checkpoint, instead of each node's labels.
+  pub fn nodes_with_label(&self, label_id: LabelId) -> Vec<NodeId> {
+    let mut nodes = self.read_view(|view, _| {
+      let mut nodes = Vec::new();
+      view.for_each_labeled(label_id, |node_id| nodes.push(node_id));
+      nodes
+    });
+    nodes.sort_unstable();
+    nodes
+  }
+
+  /// The number of nodes [`Self::nodes_with_label`] lists, without listing them.
+  pub fn count_nodes_with_label(&self, label_id: LabelId) -> usize {
+    self.read_view(|view, _| {
+      let mut count = 0;
+      view.for_each_labeled(label_id, |_| count += 1);
+      count
+    })
+  }
+
+  /// The nodes whose key starts with `prefix`, with their keys, sorted by ID:
+  /// those of [`Self::list_nodes`] whose [`Self::node_key`] starts with it.
+  ///
+  /// Reads the snapshot's keys in one pass and the nodes created since the
+  /// last checkpoint, instead of looking up each node's key.
+  pub fn nodes_with_key_prefix(&self, prefix: &str) -> Vec<(NodeId, String)> {
+    self.read_view(|view, _| view.nodes_with_key_prefix(prefix))
   }
 
   /// Count total nodes in the database: the length of `iter_nodes()`,
@@ -215,11 +706,23 @@ impl SingleFileDB {
     count
   }
 
-  /// Count total edges in the database
+  /// Count total edges in the database: the length of `list_edges(None)`,
+  /// without listing them.
   ///
-  /// Note: This may be slow for large graphs as it needs to iterate.
+  /// The snapshot's edge count, adjusted for the changes since the last
+  /// checkpoint (the edges of deleted nodes, tombstones, added edges), so the
+  /// cost follows those, not the graph. It lists the edges instead inside an
+  /// MVCC write transaction (whose conflict check notes the sources it read)
+  /// and for an MVCC reader that reads version history.
   pub fn count_edges(&self) -> usize {
-    self.list_edges(None).len()
+    self
+      .read_view(|view, _| {
+        if view.tracks_reads {
+          return None;
+        }
+        view.count_edges()
+      })
+      .unwrap_or_else(|| self.list_edges(None).len())
   }
 
   /// Count edges of a specific type
@@ -252,6 +755,7 @@ impl SingleFileDB {
     if let Some(ref snap) = *snapshot {
       let num_nodes = snap.header.num_nodes as u32;
       for phys in 0..num_nodes {
+        examined_nodes(1);
         if let Some(src) = snap.node_id(phys) {
           // Skip deleted nodes
           let src_visible = vc_guard
@@ -265,6 +769,7 @@ impl SingleFileDB {
           }
 
           for (dst_phys, etype) in snap.iter_out_edges(phys) {
+            examined_edges(1);
             // Apply filter
             if let Some(filter_etype) = etype_filter {
               if etype != filter_etype {
@@ -299,6 +804,7 @@ impl SingleFileDB {
 
     // Add delta edges
     for (&src, add_set) in &delta.out_add {
+      examined_edges(add_set.len());
       for patch in add_set {
         // Apply filter
         if let Some(filter_etype) = etype_filter {
@@ -342,6 +848,7 @@ impl SingleFileDB {
 
     if let Some(pending_delta) = pending {
       for (&src, add_set) in &pending_delta.out_add {
+        examined_edges(add_set.len());
         for patch in add_set {
           if let Some(filter_etype) = etype_filter {
             if patch.etype != filter_etype {
@@ -380,6 +887,7 @@ impl SingleFileDB {
       let node_visible =
         |node_id| layers.sees_delta(node_id, vc.node_exists_at(node_id, tx_snapshot_ts, txid));
       for (src, etype, dst) in vc.edges_at(tx_snapshot_ts, txid) {
+        examined_edges(1);
         if etype_filter.is_some_and(|filter_etype| filter_etype != etype)
           || pending.is_some_and(|p| p.is_edge_deleted(src, etype, dst))
           || !node_visible(src)
@@ -469,3 +977,7 @@ impl SingleFileDB {
     self.wal_buffer.lock().stats()
   }
 }
+
+#[cfg(test)]
+#[path = "b4_query_core_tests.rs"]
+mod b4_query_core_tests;

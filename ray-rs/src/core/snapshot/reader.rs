@@ -875,11 +875,16 @@ impl SnapshotData {
   /// node IDs and `0..num_nodes`. Every mapped `(node_id, phys)` must have
   /// `PhysToNodeId[phys] == node_id`; distinct IDs then map to distinct
   /// physical nodes, and exactly `num_nodes` mapped IDs cover them all.
+  /// Physical order must also be node ID order (the writer sorts nodes by
+  /// ID): reads that seek, like pages and edge slices, binary-search physical
+  /// indexes by node ID. Both maps are walked in ascending node ID, so that
+  /// holds when the k-th mapped ID is at physical node k.
   fn validate_node_id_maps(&self, num_nodes: usize) -> Result<()> {
     const SECTION: &str = "NodeIdToPhys";
     let map = self.bytes(SectionId::NodeIdToPhys);
     let phys_to_node = self.bytes(SectionId::PhysToNodeId);
-    let check_pair = |node_id: NodeId, phys: usize| -> Result<()> {
+    // `rank`: how many node IDs below `node_id` are mapped.
+    let check_pair = |node_id: NodeId, phys: usize, rank: usize| -> Result<()> {
       if phys >= num_nodes {
         return Err(Self::invalid_section(
           SECTION,
@@ -893,6 +898,15 @@ impl SnapshotData {
           format!(
             "physical node {phys} has node ID {stored}, but NodeIdToPhys maps node ID \
              {node_id} to it"
+          ),
+        ));
+      }
+      if phys != rank {
+        return Err(Self::invalid_section(
+          "PhysToNodeId",
+          format!(
+            "node ID {node_id} is at physical node {phys}, out of order: physical nodes must \
+             be in ascending node ID order (expected physical node {rank})"
           ),
         ));
       }
@@ -913,7 +927,7 @@ impl SnapshotData {
               format!("physical node {phys} at node ID {index} is negative"),
             )
           })?;
-          check_pair(index as NodeId, phys)?;
+          check_pair(index as NodeId, phys, mapped)?;
           mapped += 1;
         }
         mapped
@@ -938,7 +952,7 @@ impl SnapshotData {
               ),
             ));
           }
-          check_pair(node_id, phys as usize)?;
+          check_pair(node_id, phys as usize, index)?;
           previous = Some(node_id);
         }
         count
@@ -1221,6 +1235,16 @@ impl SnapshotData {
     self.phys_node(node_id).is_some()
   }
 
+  /// Physical index of the first node with an ID greater than `node_id`
+  /// (`num_nodes` if there is none). Physical order is ID order.
+  pub fn phys_after(&self, node_id: NodeId) -> PhysNode {
+    let Some(ids) = self.section(SectionId::PhysToNodeId) else {
+      return 0;
+    };
+    let count = (ids.len() / 8).min(self.header.num_nodes as usize);
+    partition_point(count, |phys| read_u64_at(ids, phys) <= node_id) as PhysNode
+  }
+
   /// Get the number of nodes in the snapshot
   #[inline]
   pub fn num_nodes(&self) -> u64 {
@@ -1348,6 +1372,26 @@ impl SnapshotData {
     InEdgeIter::new(self, phys)
   }
 
+  /// A node's out-edges as `(etype, dst)` keys, seekable.
+  pub fn out_edge_keys(&self, phys: PhysNode) -> EdgeKeyIter<'_> {
+    EdgeKeyIter::new(
+      self,
+      self.out_edge_range(phys),
+      SectionId::OutEtype,
+      SectionId::OutDst,
+    )
+  }
+
+  /// A node's in-edges as `(etype, src)` keys, seekable.
+  pub fn in_edge_keys(&self, phys: PhysNode) -> EdgeKeyIter<'_> {
+    EdgeKeyIter::new(
+      self,
+      self.in_edge_range(phys),
+      SectionId::InEtype,
+      SectionId::InSrc,
+    )
+  }
+
   // ========================================================================
   // Key index lookup
   // ========================================================================
@@ -1393,11 +1437,16 @@ impl SnapshotData {
 
   /// Get the key for a node, if any
   pub fn node_key(&self, phys: PhysNode) -> Option<String> {
+    self.node_key_str(phys).map(str::to_owned)
+  }
+
+  /// The key of a node, borrowed, if it has one.
+  pub fn node_key_str(&self, phys: PhysNode) -> Option<&str> {
     let string_id = u32_at(self.section(SectionId::NodeKeyString)?, phys as usize)?;
     if string_id == 0 {
       return None;
     }
-    self.string(string_id)
+    self.string_str(string_id)
   }
 
   // ========================================================================
@@ -1420,6 +1469,21 @@ impl SnapshotData {
         .map(|i| read_u32_at(labels, i) as LabelId)
         .collect(),
     )
+  }
+
+  /// Whether a node has label `label_id`, without listing its labels.
+  pub fn node_has_label(&self, phys: PhysNode, label_id: LabelId) -> bool {
+    if !self.header.flags.contains(SnapshotFlags::HAS_NODE_LABELS) {
+      return false;
+    }
+    let Some(offsets) = self.section(SectionId::NodeLabelOffsets) else {
+      return false;
+    };
+    let labels = self.bytes(SectionId::NodeLabelIds);
+    let Some((start, end)) = u32_range_at(offsets, phys as usize) else {
+      return false;
+    };
+    (start..end.min(labels.len() / 4)).any(|i| read_u32_at(labels, i) == label_id)
   }
 
   // ========================================================================
@@ -1633,6 +1697,87 @@ impl<'a> Iterator for InEdgeIter<'a> {
 }
 
 impl<'a> ExactSizeIterator for InEdgeIter<'a> {}
+
+/// A node's out-edges as `(etype, dst)` or in-edges as `(etype, src)`, with
+/// the other endpoint's node ID, in that key order (the order the snapshot
+/// stores them in, by physical index, which is ID order), seekable by key. The
+/// default holds no edges.
+#[derive(Default)]
+pub struct EdgeKeyIter<'a> {
+  etypes: &'a [u8],
+  others: &'a [u8],
+  node_ids: &'a [u8],
+  current: usize,
+  end: usize,
+}
+
+impl<'a> EdgeKeyIter<'a> {
+  fn new(
+    snapshot: &'a SnapshotData,
+    range: Option<(usize, usize)>,
+    etypes: SectionId,
+    others: SectionId,
+  ) -> Self {
+    let (current, end) = range.unwrap_or((0, 0));
+    let etypes = snapshot.bytes(etypes);
+    let others = snapshot.bytes(others);
+    Self {
+      etypes,
+      others,
+      node_ids: snapshot.bytes(SectionId::PhysToNodeId),
+      current,
+      end: end.min(etypes.len() / 4).min(others.len() / 4),
+    }
+  }
+
+  fn key(&self, index: usize) -> (ETypeId, PhysNode) {
+    (
+      read_u32_at(self.etypes, index),
+      read_u32_at(self.others, index),
+    )
+  }
+
+  /// Skip to the first remaining edge at or after `(etype, other)`, the other
+  /// endpoint given as a physical index (see [`SnapshotData::phys_after`]): a
+  /// binary search.
+  pub fn seek(&mut self, from: (ETypeId, PhysNode)) {
+    let start = self.current;
+    self.current = start
+      + partition_point(self.end.saturating_sub(start), |offset| {
+        self.key(start + offset) < from
+      });
+  }
+
+  /// Stop after the edges of type `etype`: a binary search.
+  pub fn end_after_etype(&mut self, etype: ETypeId) {
+    let start = self.current;
+    self.end = start
+      + partition_point(self.end.saturating_sub(start), |offset| {
+        read_u32_at(self.etypes, start + offset) <= etype
+      });
+  }
+}
+
+impl Iterator for EdgeKeyIter<'_> {
+  /// `(etype, other endpoint's node ID)`
+  type Item = (ETypeId, NodeId);
+
+  #[inline]
+  fn next(&mut self) -> Option<Self::Item> {
+    while self.current < self.end {
+      let (etype, other) = self.key(self.current);
+      self.current += 1;
+      if let Some(node_id) = u64_at(self.node_ids, other as usize) {
+        return Some((etype, node_id));
+      }
+    }
+    None
+  }
+
+  fn size_hint(&self) -> (usize, Option<usize>) {
+    (0, Some(self.end.saturating_sub(self.current)))
+  }
+}
 
 // ============================================================================
 // Extended SnapshotData methods for compaction

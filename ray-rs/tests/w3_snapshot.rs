@@ -1279,6 +1279,60 @@ fn s13_writer_rejects_duplicate_node_ids() {
 }
 
 // ============================================================================
+// query-core (raydb-b4): physical order is node ID order
+// ============================================================================
+
+/// Pages and edge slices seek by binary search over physical indexes, which
+/// is right only if physical order is node ID order (the writer sorts nodes by
+/// ID). A snapshot whose ID maps agree with each other but put a larger ID
+/// before a smaller one must be refused at open.
+#[test]
+fn query_core_physical_order_out_of_id_order_refused_at_load() {
+  let mut accepted = Vec::new();
+  for (layout, ids) in [("dense", DENSE_IDS), ("sparse", SPARSE_IDS)] {
+    let base = Image::build(people(ids, true));
+    let sparse = base.flags().contains(SnapshotFlags::SPARSE_NODE_ID_MAP);
+    assert_eq!(sparse, layout == "sparse", "fixture layout");
+    assert!(base.load().is_ok(), "{layout}: fixture must load");
+
+    // Swap the physical nodes of the first two IDs in both maps, so they stay
+    // inverse bijections and only the order breaks.
+    let mut image = base.clone();
+    let mut phys_to_node = image.u64s(SectionId::PhysToNodeId);
+    phys_to_node.swap(0, 1);
+    image.set_u64s(SectionId::PhysToNodeId, &phys_to_node);
+    let mut map = image.raw(SectionId::NodeIdToPhys).to_vec();
+    if sparse {
+      // (node_id: u64, phys: u32) entries, ascending by node ID
+      write_u32(&mut map, 8, 1);
+      write_u32(&mut map, 12 + 8, 0);
+    } else {
+      // One i32 phys per node ID
+      write_u32(&mut map, 4 * ids[0] as usize, 1);
+      write_u32(&mut map, 4 * ids[1] as usize, 0);
+    }
+    image.set_raw(SectionId::NodeIdToPhys, map);
+
+    match image.load() {
+      Ok(loaded) => accepted.push(format!(
+        "{layout}: loaded with node_id(0) = {:?}, node_id(1) = {:?}",
+        loaded.snapshot.node_id(0),
+        loaded.snapshot.node_id(1)
+      )),
+      Err(error) => assert!(
+        error.contains("PhysToNodeId") && error.contains("order"),
+        "{layout}: unexpected error {error}"
+      ),
+    }
+  }
+  assert!(
+    accepted.is_empty(),
+    "physical order out of node ID order accepted at load:\n{}",
+    accepted.join("\n")
+  );
+}
+
+// ============================================================================
 // S14: room for future sections
 // ============================================================================
 

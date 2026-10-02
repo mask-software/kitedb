@@ -29,6 +29,7 @@
 //! what only the chains still hold: nodes, edges and keys deleted since the reader's snapshot.
 
 use std::collections::HashMap;
+use std::ops::{Bound, ControlFlow};
 use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLockReadGuard};
@@ -38,6 +39,45 @@ use crate::mvcc::VersionChainManager;
 use crate::types::*;
 
 use super::{SingleFileDB, SingleFileTxState};
+
+// ============================================================================
+// Test instrumentation
+// ============================================================================
+
+#[cfg(test)]
+thread_local! {
+  /// Node entries (snapshot nodes; delta, transaction and version-chain node
+  /// entries) that listings visited on this thread.
+  pub(crate) static NODES_EXAMINED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+  /// Edge entries (snapshot edges; delta, transaction and version-chain edge
+  /// entries) that reads visited on this thread.
+  pub(crate) static EDGES_EXAMINED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+  /// Point reads of one node's key or labels on this thread.
+  pub(crate) static NODE_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Count `n` node entries visited (test instrumentation).
+#[inline]
+pub(super) fn examined_nodes(n: usize) {
+  #[cfg(test)]
+  NODES_EXAMINED.with(|count| count.set(count.get() + n));
+  let _ = n;
+}
+
+/// Count `n` edge entries visited (test instrumentation).
+#[inline]
+pub(super) fn examined_edges(n: usize) {
+  #[cfg(test)]
+  EDGES_EXAMINED.with(|count| count.set(count.get() + n));
+  let _ = n;
+}
+
+/// Count one point read of a node's key or labels (test instrumentation).
+#[inline]
+fn node_lookup() {
+  #[cfg(test)]
+  NODE_LOOKUPS.with(|count| count.set(count.get() + 1));
+}
 
 /// Which layers' state of a node a reader sees: its transaction's pending
 /// delta over the committed delta over the snapshot. A layer's delete masks
@@ -103,6 +143,389 @@ impl NodeLayers<'_> {
   }
 }
 
+/// One read's view of the database, under its guards: the calling thread's
+/// transaction over the committed delta over the snapshot, and the version
+/// history when the reader needs it (see the module docs). Built by
+/// [`SingleFileDB::read_view`]; bulk reads use it to answer for many nodes or
+/// edges under one set of guards.
+pub(super) struct ReadView<'a> {
+  pub(super) layers: NodeLayers<'a>,
+  pub(super) snapshot: Option<&'a SnapshotData>,
+  /// The version chains, when they can answer for this reader
+  pub(super) history: Option<&'a VersionChainManager>,
+  pub(super) txid: TxId,
+  pub(super) snapshot_ts: Timestamp,
+  /// Whether the reads go to a write transaction's MVCC conflict check
+  pub(super) tracks_reads: bool,
+}
+
+/// Which edges of a node a walk reads: its out-edges, keyed `(etype, dst)`, or
+/// its in-edges, keyed `(etype, src)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum EdgeSide {
+  Out,
+  In,
+}
+
+/// The keys `(etype, other endpoint)` an edge walk visits: those of type `etype`
+/// (every type for `None`) that come after `after`.
+#[derive(Clone, Copy)]
+struct EdgeKeys {
+  etype: Option<ETypeId>,
+  after: Option<(ETypeId, NodeId)>,
+}
+
+impl EdgeKeys {
+  fn contains(&self, key: (ETypeId, NodeId)) -> bool {
+    self.etype.is_none_or(|etype| key.0 == etype) && self.after.is_none_or(|after| key > after)
+  }
+
+  /// Where the keys start, as `(etype, smallest endpoint)` with the endpoint
+  /// mapped by `first_after` to what follows `after`'s endpoint; `None` if the
+  /// range is empty.
+  fn start<T: Default>(&self, first_after: impl FnOnce(NodeId) -> T) -> Option<(ETypeId, T)> {
+    match (self.etype, self.after) {
+      (None, None) => Some((0, T::default())),
+      (None, Some((etype, other))) => Some((etype, first_after(other))),
+      (Some(etype), None) => Some((etype, T::default())),
+      (Some(etype), Some((after_etype, other))) => match after_etype.cmp(&etype) {
+        std::cmp::Ordering::Less => Some((etype, T::default())),
+        std::cmp::Ordering::Equal => Some((etype, first_after(other))),
+        std::cmp::Ordering::Greater => None,
+      },
+    }
+  }
+
+  /// The keys as a range of a delta's edge patches; `None` if it is empty.
+  fn patch_bounds(&self) -> Option<(Bound<EdgePatch>, Bound<EdgePatch>)> {
+    let patch = |(etype, other)| EdgePatch { etype, other };
+    let lower = match (self.etype, self.after) {
+      (Some(etype), Some(after)) if after.0 > etype => return None,
+      (Some(etype), Some(after)) if after.0 == etype => Bound::Excluded(patch(after)),
+      (Some(etype), _) => Bound::Included(patch((etype, 0))),
+      (None, Some(after)) => Bound::Excluded(patch(after)),
+      (None, None) => Bound::Unbounded,
+    };
+    let upper = self.etype.map_or(Bound::Unbounded, |etype| {
+      Bound::Included(patch((etype, NodeId::MAX)))
+    });
+    Some((lower, upper))
+  }
+}
+
+/// Merge sorted sources into one sorted walk, each key once, until `f` breaks.
+pub(super) fn merge_sorted<K: Ord + Copy, const N: usize>(
+  mut sources: [&mut dyn Iterator<Item = K>; N],
+  mut f: impl FnMut(K) -> ControlFlow<()>,
+) -> ControlFlow<()> {
+  let mut heads: [Option<K>; N] = std::array::from_fn(|i| sources[i].next());
+  let mut last = None;
+  loop {
+    let mut live = heads.iter().enumerate().filter(|(_, head)| head.is_some());
+    let (Some((first, _)), second) = (live.next(), live.next()) else {
+      return ControlFlow::Continue(());
+    };
+    if second.is_none() {
+      // One source left: walk it without comparing.
+      let head = heads[first].take();
+      for key in head.into_iter().chain(&mut *sources[first]) {
+        if last != Some(key) {
+          last = Some(key);
+          f(key)?;
+        }
+      }
+      return ControlFlow::Continue(());
+    }
+    let min = heads.iter().flatten().min().copied();
+    for (head, source) in heads.iter_mut().zip(sources.iter_mut()) {
+      if *head == min {
+        *head = source.next();
+      }
+    }
+    if last != min {
+      last = min;
+      if let Some(key) = min {
+        f(key)?;
+      }
+    }
+  }
+}
+
+impl<'a> ReadView<'a> {
+  /// Whether `node_id` existed at the reader's snapshot, if it changed since (see the module
+  /// docs); `None` when the delta and snapshot decide.
+  pub(super) fn node_mvcc(&self, node_id: NodeId) -> Option<bool> {
+    self
+      .history?
+      .node_exists_at(node_id, self.snapshot_ts, self.txid)
+  }
+
+  fn edge_mvcc(&self, src: NodeId, etype: ETypeId, dst: NodeId) -> Option<bool> {
+    self
+      .history?
+      .edge_exists_at(src, etype, dst, self.snapshot_ts, self.txid)
+  }
+
+  /// Whether the reader sees `node_id`: whether `iter_nodes` lists it.
+  pub(super) fn node_exists(&self, node_id: NodeId) -> bool {
+    self
+      .layers
+      .node_exists(self.snapshot, node_id, self.node_mvcc(node_id))
+  }
+
+  /// [`SingleFileDB::node_key`].
+  pub(super) fn node_key(&self, node_id: NodeId) -> Option<&'a str> {
+    let pending = self.layers.pending;
+    let delta = self.layers.delta;
+    if pending.is_some_and(|p| p.is_node_removed(node_id)) {
+      return None;
+    }
+    if let Some(node) = pending.and_then(|p| p.created_nodes.get(&node_id)) {
+      return node.key.as_deref();
+    }
+    // The node at the reader's snapshot, with its key, if it changed since
+    if let Some(node) = self
+      .history
+      .and_then(|vc| vc.node_at(node_id, self.snapshot_ts, self.txid))
+    {
+      return node.and_then(|node| node.delta.key.as_deref());
+    }
+    if delta.is_node_removed(node_id) {
+      return None;
+    }
+    if let Some(node) = delta.created_nodes.get(&node_id) {
+      return node.key.as_deref();
+    }
+    let snapshot = self.snapshot?;
+    snapshot.node_key_str(snapshot.phys_node(node_id)?)
+  }
+
+  /// Whether [`SingleFileDB::node_labels`] lists `label_id`.
+  pub(super) fn node_has_label(&self, node_id: NodeId, label_id: LabelId) -> bool {
+    let layers = self.layers;
+    let pending = layers.pending;
+    if pending.is_some_and(|p| p.is_node_removed(node_id)) {
+      return false;
+    }
+    let node_mvcc = self.node_mvcc(node_id);
+    if !layers.node_exists(self.snapshot, node_id, node_mvcc) {
+      return false;
+    }
+    let mut has = match self.snapshot {
+      Some(snapshot) if layers.sees_snapshot(node_id, node_mvcc) => snapshot
+        .phys_node(node_id)
+        .is_some_and(|phys| snapshot.node_has_label(phys, label_id)),
+      _ => false,
+    };
+    let names = |labels: Option<&std::collections::HashSet<LabelId>>| {
+      labels.is_some_and(|labels| labels.contains(&label_id))
+    };
+    // The committed delta and the version history, unless the transaction recreated the node
+    if !layers.pending_masks(node_id) {
+      if names(layers.delta.added_labels(node_id)) {
+        has = true;
+      }
+      if names(layers.delta.removed_labels(node_id)) {
+        has = false;
+      }
+      if let Some(history) = self
+        .history
+        .and_then(|vc| vc.node_label_at(node_id, label_id, self.snapshot_ts, self.txid))
+      {
+        has = history;
+      }
+    }
+    if let Some(pending) = pending {
+      if names(pending.added_labels(node_id)) {
+        has = true;
+      }
+      if names(pending.removed_labels(node_id)) {
+        has = false;
+      }
+    }
+    has
+  }
+
+  /// Visit the edges of `node_id` on `side` of type `etype` (every type for
+  /// `None`) after `after`, in key order, until `f` breaks: the edges
+  /// `out_edges` / `in_edges` list, in their order, without listing the rest.
+  /// Each source (snapshot, delta, transaction, version history) is read from
+  /// the first key in range on, so the walk costs a binary search plus what it
+  /// visits. `None` if the reader does not see the node (nothing was read).
+  pub(super) fn for_each_edge(
+    &self,
+    side: EdgeSide,
+    node_id: NodeId,
+    etype: Option<ETypeId>,
+    after: Option<(ETypeId, NodeId)>,
+    mut f: impl FnMut(ETypeId, NodeId) -> ControlFlow<()>,
+  ) -> Option<ControlFlow<()>> {
+    let layers = self.layers;
+    let pending = layers.pending;
+    let delta = layers.delta;
+    if pending.is_some_and(|p| p.is_node_removed(node_id)) {
+      return None;
+    }
+    let node_mvcc = self.node_mvcc(node_id);
+    if !layers.sees_pending(node_id, node_mvcc) {
+      return None;
+    }
+    let keys = EdgeKeys { etype, after };
+    let edge = |etype: ETypeId, other: NodeId| match side {
+      EdgeSide::Out => (node_id, etype, other),
+      EdgeSide::In => (other, etype, node_id),
+    };
+    let pending_deleted =
+      |(src, etype, dst)| pending.is_some_and(|p| p.is_edge_deleted(src, etype, dst));
+
+    // The snapshot's copy of the node's edges, from the first key in range
+    let snapshot_edges = self
+      .snapshot
+      .filter(|_| layers.sees_snapshot(node_id, node_mvcc))
+      .and_then(|snapshot| {
+        let phys = snapshot.phys_node(node_id)?;
+        let start = keys.start(|other| snapshot.phys_after(other))?;
+        let mut edges = match side {
+          EdgeSide::Out => snapshot.out_edge_keys(phys),
+          EdgeSide::In => snapshot.in_edge_keys(phys),
+        };
+        edges.seek(start);
+        if let Some(etype) = keys.etype {
+          edges.end_after_etype(etype);
+        }
+        Some(edges)
+      });
+    let has_snapshot = snapshot_edges.is_some();
+    let mut from_snapshot = snapshot_edges
+      .unwrap_or_default()
+      .inspect(|_| examined_edges(1))
+      .filter_map(|(etype, other)| {
+        if !layers.sees_snapshot(other, self.node_mvcc(other)) {
+          return None;
+        }
+        let (src, etype, dst) = edge(etype, other);
+        let edge_mvcc = self.edge_mvcc(src, etype, dst);
+        let hidden = edge_mvcc == Some(false)
+          || pending_deleted((src, etype, dst))
+          || (edge_mvcc.is_none() && delta.is_edge_deleted(src, etype, dst));
+        (!hidden).then_some((etype, other))
+      });
+
+    // Edge patches of the committed delta and of the transaction, from the first key in range
+    let added = |layer: Option<&'a DeltaState>| {
+      let added = layer.and_then(|layer| match side {
+        EdgeSide::Out => layer.out_add.get(&node_id),
+        EdgeSide::In => layer.in_add.get(&node_id),
+      });
+      added.zip(keys.patch_bounds())
+    };
+    let patches = |added: Option<(&'a std::collections::BTreeSet<EdgePatch>, _)>| {
+      added
+        .map(|(patches, bounds)| patches.range(bounds))
+        .unwrap_or_default()
+        .inspect(|_| examined_edges(1))
+        .map(|patch| (patch.etype, patch.other))
+    };
+    let delta_added = added(layers.sees_delta(node_id, node_mvcc).then_some(delta));
+    let pending_added = added(pending);
+    let has_delta = delta_added.is_some();
+    let has_pending = pending_added.is_some();
+    let mut from_delta = patches(delta_added).filter(|&(etype, other)| {
+      let (src, etype, dst) = edge(etype, other);
+      layers.sees_delta(other, self.node_mvcc(other))
+        && self.edge_mvcc(src, etype, dst) != Some(false)
+        && !pending_deleted((src, etype, dst))
+    });
+    let mut from_pending = patches(pending_added)
+      .filter(|&(_, other)| layers.sees_pending(other, self.node_mvcc(other)));
+
+    // Edges deleted since the reader's snapshot remain only in their version chains
+    let mut from_history: Vec<(ETypeId, NodeId)> = self
+      .history
+      .filter(|_| layers.sees_delta(node_id, node_mvcc))
+      .map(|vc| {
+        vc.node_edges_at(node_id, self.snapshot_ts, self.txid)
+          .inspect(|_| examined_edges(1))
+          .filter_map(|(src, etype, dst)| {
+            let other = match side {
+              EdgeSide::Out => (src == node_id).then_some(dst),
+              EdgeSide::In => (dst == node_id).then_some(src),
+            }?;
+            let visible = keys.contains((etype, other))
+              && !pending_deleted((src, etype, dst))
+              && layers.sees_delta(other, vc.node_exists_at(other, self.snapshot_ts, self.txid));
+            visible.then_some((etype, other))
+          })
+          .collect()
+      })
+      .unwrap_or_default();
+    from_history.sort_unstable();
+
+    // Most nodes have their edges in one source (the snapshot after a checkpoint, the delta
+    // before one): walk it directly, and merge only when several hold edges.
+    let emit = |(etype, other)| f(etype, other);
+    let has_history = !from_history.is_empty();
+    Some(if !has_delta && !has_pending && !has_history {
+      walk_sorted(from_snapshot, emit)
+    } else if !has_snapshot && !has_pending && !has_history {
+      // A delta's patches are a set: each key once already.
+      from_delta.try_for_each(emit)
+    } else {
+      merge_sorted(
+        [
+          &mut from_snapshot,
+          &mut from_delta,
+          &mut from_pending,
+          &mut from_history.into_iter(),
+        ],
+        emit,
+      )
+    })
+  }
+
+  /// Room for the edges of `node_id` on `side`: its degree in the snapshot plus the edges the
+  /// delta and the transaction add.
+  pub(super) fn edge_capacity(&self, side: EdgeSide, node_id: NodeId) -> usize {
+    let snapshot = self.snapshot.and_then(|snap| {
+      let phys = snap.phys_node(node_id)?;
+      match side {
+        EdgeSide::Out => snap.out_degree(phys),
+        EdgeSide::In => snap.in_degree(phys),
+      }
+    });
+    let added = |layer: &DeltaState| {
+      let added = match side {
+        EdgeSide::Out => &layer.out_add,
+        EdgeSide::In => &layer.in_add,
+      };
+      added.get(&node_id).map_or(0, |patches| patches.len())
+    };
+    snapshot
+      .unwrap_or(0)
+      .saturating_add(added(self.layers.delta))
+      .saturating_add(self.layers.pending.map_or(0, added))
+  }
+}
+
+/// Walk a sorted source, each key once, until `f` breaks.
+fn walk_sorted<K: PartialEq + Copy>(
+  mut keys: impl Iterator<Item = K>,
+  mut f: impl FnMut(K) -> ControlFlow<()>,
+) -> ControlFlow<()> {
+  let Some(first) = keys.next() else {
+    return ControlFlow::Continue(());
+  };
+  f(first)?;
+  let mut last = first;
+  keys.try_for_each(|key| {
+    if key == last {
+      return ControlFlow::Continue(());
+    }
+    last = key;
+    f(key)
+  })
+}
+
 impl SingleFileDB {
   /// MVCC visibility context `(txid, snapshot_ts)`: the transaction's snapshot inside a
   /// transaction, every commit (`Timestamp::MAX`) outside one, and `(0, 0)` with MVCC
@@ -153,6 +576,36 @@ impl SingleFileDB {
         tx.record_read(key);
       }
     }
+  }
+
+  /// Run `read` on the calling thread's [`ReadView`], under the read guards (taken in lock
+  /// order, see the module docs). The keys `read` notes in its second argument go to the
+  /// transaction's MVCC conflict check; it notes them only when `tracks_reads` is set.
+  pub(super) fn read_view<R>(&self, read: impl FnOnce(&ReadView<'_>, &mut Vec<TxKey>) -> R) -> R {
+    let tx_handle = self.current_tx_handle();
+    let mut tx_guard = tx_handle.as_ref().map(|tx| tx.lock());
+    let (txid, snapshot_ts) = self.mvcc_read_ts(tx_guard.as_deref());
+    let tracks_reads = self.mvcc.is_some() && tx_guard.as_ref().is_some_and(|tx| !tx.read_only);
+    let mut reads = Vec::new();
+    let result = {
+      let delta = self.delta.read();
+      let snapshot = self.snapshot.read();
+      let history = self.mvcc_history(snapshot_ts);
+      let view = ReadView {
+        layers: NodeLayers {
+          pending: tx_guard.as_ref().map(|tx| &tx.pending),
+          delta: &delta,
+        },
+        snapshot: snapshot.as_ref(),
+        history: history.as_deref(),
+        txid,
+        snapshot_ts,
+        tracks_reads,
+      };
+      read(&view, &mut reads)
+    };
+    self.record_reads(tx_guard.as_deref_mut(), reads);
+    result
   }
 
   /// Whether a node existed at the reader's snapshot, if it changed since (see the module
@@ -703,6 +1156,7 @@ impl SingleFileDB {
         .filter(|_| layers.sees_snapshot(node_id, node_visible))
       {
         for (dst_phys, etype) in snap.iter_out_edges(phys) {
+          examined_edges(1);
           // Convert physical dst to NodeId
           if let Some(dst_node_id) = snap.node_id(dst_phys) {
             // Skip edges to deleted nodes
@@ -734,6 +1188,7 @@ impl SingleFileDB {
       .get(&node_id)
       .filter(|_| layers.sees_delta(node_id, node_visible))
     {
+      examined_edges(added_edges.len());
       for edge_patch in added_edges {
         // Skip edges to deleted nodes
         let dst_visible = vc_guard
@@ -761,6 +1216,7 @@ impl SingleFileDB {
     }
 
     if let Some(added_edges) = pending.and_then(|p| p.out_add.get(&node_id)) {
+      examined_edges(added_edges.len());
       for edge_patch in added_edges {
         let dst_visible = vc_guard
           .as_ref()
@@ -778,6 +1234,7 @@ impl SingleFileDB {
       .filter(|_| layers.sees_delta(node_id, node_visible))
     {
       for (src, etype, dst) in vc.node_edges_at(node_id, tx_snapshot_ts, txid) {
+        examined_edges(1);
         if src != node_id || pending.is_some_and(|p| p.is_edge_deleted(src, etype, dst)) {
           continue;
         }
@@ -857,6 +1314,7 @@ impl SingleFileDB {
         .filter(|_| layers.sees_snapshot(node_id, node_visible))
       {
         for (src_phys, etype, _out_index) in snap.iter_in_edges(phys) {
+          examined_edges(1);
           // Convert physical src to NodeId
           if let Some(src_node_id) = snap.node_id(src_phys) {
             // Skip edges from deleted nodes
@@ -888,6 +1346,7 @@ impl SingleFileDB {
       .get(&node_id)
       .filter(|_| layers.sees_delta(node_id, node_visible))
     {
+      examined_edges(added_edges.len());
       for edge_patch in added_edges {
         // Skip edges from deleted nodes
         let src_visible = vc_guard
@@ -915,6 +1374,7 @@ impl SingleFileDB {
     }
 
     if let Some(added_edges) = pending.and_then(|p| p.in_add.get(&node_id)) {
+      examined_edges(added_edges.len());
       for edge_patch in added_edges {
         let src_visible = vc_guard
           .as_ref()
@@ -932,6 +1392,7 @@ impl SingleFileDB {
       .filter(|_| layers.sees_delta(node_id, node_visible))
     {
       for (src, etype, dst) in vc.node_edges_at(node_id, tx_snapshot_ts, txid) {
+        examined_edges(1);
         if dst != node_id || pending.is_some_and(|p| p.is_edge_deleted(src, etype, dst)) {
           continue;
         }
@@ -968,54 +1429,113 @@ impl SingleFileDB {
     self.in_edges(node_id).len()
   }
 
+  /// Up to `limit` of `node_id`'s out-edges of type `etype` (every type for
+  /// `None`) that come after `after` in `(etype, dst)` order, as `(etype, dst)`:
+  /// a slice of [`Self::out_edges`] (filtered by `etype`) that costs a binary
+  /// search plus the edges returned, however many edges the node has. Pass the
+  /// last edge of one slice as `after` to get the next (`usize::MAX` gets them
+  /// all).
+  pub fn out_edges_after(
+    &self,
+    node_id: NodeId,
+    etype: Option<ETypeId>,
+    after: Option<(ETypeId, NodeId)>,
+    limit: usize,
+  ) -> Vec<(ETypeId, NodeId)> {
+    self.node_edges_after(EdgeSide::Out, node_id, etype, after, limit)
+  }
+
+  /// [`Self::out_edges_after`] for in-edges: up to `limit` of `node_id`'s
+  /// in-edges of type `etype` after `after` in `(etype, src)` order, as
+  /// `(etype, src)`.
+  pub fn in_edges_after(
+    &self,
+    node_id: NodeId,
+    etype: Option<ETypeId>,
+    after: Option<(ETypeId, NodeId)>,
+    limit: usize,
+  ) -> Vec<(ETypeId, NodeId)> {
+    self.node_edges_after(EdgeSide::In, node_id, etype, after, limit)
+  }
+
+  fn node_edges_after(
+    &self,
+    side: EdgeSide,
+    node_id: NodeId,
+    etype: Option<ETypeId>,
+    after: Option<(ETypeId, NodeId)>,
+    limit: usize,
+  ) -> Vec<(ETypeId, NodeId)> {
+    if etype.is_none() && after.is_none() && limit == usize::MAX {
+      // Every edge: the full listing reads each source front to back.
+      return match side {
+        EdgeSide::Out => self.out_edges(node_id),
+        EdgeSide::In => self.in_edges(node_id),
+      };
+    }
+    self.read_view(|view, reads| {
+      let mut edges = Vec::with_capacity(limit.min(view.edge_capacity(side, node_id)));
+      let visible = limit > 0
+        && view
+          .for_each_edge(side, node_id, etype, after, |etype, other| {
+            edges.push((etype, other));
+            if edges.len() >= limit {
+              ControlFlow::Break(())
+            } else {
+              ControlFlow::Continue(())
+            }
+          })
+          .is_some();
+      if view.tracks_reads {
+        let key = |etype| match side {
+          EdgeSide::Out => TxKey::NeighborsOut { node_id, etype },
+          EdgeSide::In => TxKey::NeighborsIn { node_id, etype },
+        };
+        if visible {
+          reads.push(key(None));
+        }
+        if etype.is_some() {
+          reads.push(key(etype));
+        }
+      }
+      edges
+    })
+  }
+
   /// Get neighbors via outgoing edges of a specific type
   ///
   /// Returns destination node IDs for edges of the given type.
   pub fn out_neighbors(&self, node_id: NodeId, etype: ETypeId) -> Vec<NodeId> {
-    let neighbors: Vec<NodeId> = self
-      .out_edges(node_id)
+    self
+      .out_edges_after(node_id, Some(etype), None, usize::MAX)
       .into_iter()
-      .filter(|(e, _)| *e == etype)
       .map(|(_, dst)| dst)
-      .collect();
-    self.record_handle_reads(
-      self.current_tx_handle().as_ref(),
-      [TxKey::NeighborsOut {
-        node_id,
-        etype: Some(etype),
-      }],
-    );
-    neighbors
+      .collect()
   }
 
   /// Get neighbors via incoming edges of a specific type
   ///
   /// Returns source node IDs for edges of the given type.
   pub fn in_neighbors(&self, node_id: NodeId, etype: ETypeId) -> Vec<NodeId> {
-    let neighbors: Vec<NodeId> = self
-      .in_edges(node_id)
+    self
+      .in_edges_after(node_id, Some(etype), None, usize::MAX)
       .into_iter()
-      .filter(|(e, _)| *e == etype)
       .map(|(_, src)| src)
-      .collect();
-    self.record_handle_reads(
-      self.current_tx_handle().as_ref(),
-      [TxKey::NeighborsIn {
-        node_id,
-        etype: Some(etype),
-      }],
-    );
-    neighbors
+      .collect()
   }
 
   /// Check if there are any outgoing edges of a specific type
   pub fn has_out_edges(&self, node_id: NodeId, etype: ETypeId) -> bool {
-    self.out_edges(node_id).iter().any(|(e, _)| *e == etype)
+    !self
+      .out_edges_after(node_id, Some(etype), None, 1)
+      .is_empty()
   }
 
   /// Check if there are any incoming edges of a specific type
   pub fn has_in_edges(&self, node_id: NodeId, etype: ETypeId) -> bool {
-    self.in_edges(node_id).iter().any(|(e, _)| *e == etype)
+    !self
+      .in_edges_after(node_id, Some(etype), None, 1)
+      .is_empty()
   }
 
   // ========================================================================
@@ -1114,6 +1634,7 @@ impl SingleFileDB {
 
   /// Get all labels for a node
   pub fn node_labels(&self, node_id: NodeId) -> Vec<LabelId> {
+    node_lookup();
     let tx_handle = self.current_tx_handle();
     let mut tx_guard = tx_handle.as_ref().map(|tx| tx.lock());
     let pending = tx_guard.as_ref().map(|tx| &tx.pending);
@@ -1284,47 +1805,8 @@ impl SingleFileDB {
   ///
   /// Returns the key string if the node has one, None otherwise.
   pub fn node_key(&self, node_id: NodeId) -> Option<String> {
-    let tx_handle = self.current_tx_handle();
-    let tx_guard = tx_handle.as_ref().map(|tx| tx.lock());
-    let pending = tx_guard.as_ref().map(|tx| &tx.pending);
-
-    if pending.is_some_and(|p| p.is_node_removed(node_id)) {
-      return None;
-    }
-
-    if let Some(node_delta) = pending.and_then(|p| p.created_nodes.get(&node_id)) {
-      return node_delta.key.clone();
-    }
-
-    let (txid, tx_snapshot_ts) = self.mvcc_read_ts(tx_guard.as_deref());
-    let delta = self.delta.read();
-
-    // The node at the reader's snapshot, with its key, if it changed since
-    if let Some(vc) = self.mvcc_history(tx_snapshot_ts) {
-      if let Some(node) = vc.node_at(node_id, tx_snapshot_ts, txid) {
-        return node.and_then(|node| node.delta.key.clone());
-      }
-    }
-
-    // Check if node is deleted
-    if delta.is_node_removed(node_id) {
-      return None;
-    }
-
-    // Check created nodes in delta first
-    if let Some(node_delta) = delta.created_nodes.get(&node_id) {
-      return node_delta.key.clone();
-    }
-
-    // Fall back to snapshot
-    let snapshot = self.snapshot.read();
-    if let Some(ref snap) = *snapshot {
-      if let Some(phys) = snap.phys_node(node_id) {
-        return snap.node_key(phys);
-      }
-    }
-
-    None
+    node_lookup();
+    self.read_view(|view, _| view.node_key(node_id).map(str::to_owned))
   }
 }
 

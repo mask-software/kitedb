@@ -17,7 +17,9 @@ use super::validation;
 use super::vector::js_vector_f32;
 use crate::api::kite::KiteRuntimeProfile as RustKiteRuntimeProfile;
 use crate::api::pathfinding::{bfs, dijkstra, yen_k_shortest};
-use crate::api::traversal::{TraversalBuilder as RustTraversalBuilder, TraversalDirection};
+use crate::api::traversal::{
+  DbNeighbors, NoProps, TraversalBuilder as RustTraversalBuilder, TraversalDirection,
+};
 use crate::backup as core_backup;
 use crate::core::single_file::{
   close_single_file, close_single_file_with_options, is_single_file_path, open_single_file,
@@ -2866,7 +2868,8 @@ impl Database {
   /// Get a page of node IDs
   ///
   /// Pages follow node ID order, and a cursor resumes after the ID it names
-  /// even if that node has since been deleted.
+  /// even if that node has since been deleted. A page seeks to its cursor, so
+  /// it costs what it returns; `total` is the node count when it is read.
   #[napi(js_name = "get_nodes_page")]
   pub fn nodes_page(&self, options: Option<PaginationOptions>) -> Result<NodePage> {
     let options = options.unwrap_or_default().into_rust()?;
@@ -2875,20 +2878,23 @@ impl Database {
       .as_deref()
       .map(parse_node_cursor)
       .transpose()?;
-    let nodes = self.db()?.list_nodes();
-    let page = page_after(&nodes, after, page_limit(options.limit));
+    let db = self.db()?;
+    let limit = page_limit(options.limit);
+    let (items, next) = page_of(db.nodes_after(after, limit.saturating_add(1)), limit);
     Ok(NodePage {
-      items: page.items.iter().map(|&id| id as i64).collect(),
-      next_cursor: page.next.map(|id| format!("n:{id}")),
-      has_more: page.next.is_some(),
-      total: Some(nodes.len() as i64),
+      items: items.iter().map(|&id| id as i64).collect(),
+      next_cursor: next.map(|id| format!("n:{id}")),
+      has_more: next.is_some(),
+      total: Some(db.count_nodes() as i64),
     })
   }
 
   /// Get a page of edges
   ///
   /// Pages follow (src, etype, dst) order, and a cursor resumes after the
-  /// edge it names even if that edge has since been deleted.
+  /// edge it names even if that edge has since been deleted. A page seeks to
+  /// its cursor, so it costs what it returns; `total` is the edge count when
+  /// it is read.
   #[napi(js_name = "get_edges_page")]
   pub fn edges_page(&self, options: Option<PaginationOptions>) -> Result<EdgePage> {
     let options = options.unwrap_or_default().into_rust()?;
@@ -2897,30 +2903,21 @@ impl Database {
       .as_deref()
       .map(parse_edge_cursor)
       .transpose()?;
-    let mut edges: Vec<(NodeId, ETypeId, NodeId)> = self
-      .db()?
-      .list_edges(None)
-      .into_iter()
-      .map(|edge| (edge.src, edge.etype, edge.dst))
-      .collect();
-    edges.sort_unstable();
-    let page = page_after(&edges, after, page_limit(options.limit));
+    let db = self.db()?;
+    let limit = page_limit(options.limit);
+    let (items, next) = page_of(db.edges_after(after, limit.saturating_add(1)), limit);
     Ok(EdgePage {
-      items: page
-        .items
+      items: items
         .iter()
-        .map(|&(src, etype, dst)| JsFullEdge {
-          src: src as f64,
-          etype,
-          dst: dst as f64,
+        .map(|edge| JsFullEdge {
+          src: edge.src as f64,
+          etype: edge.etype,
+          dst: edge.dst as f64,
         })
         .collect(),
-      next_cursor: page
-        .next
-        .map(|(src, etype, dst)| format!("e:{src}:{etype}:{dst}")),
-      has_more: page.next.is_some(),
-      // Counted from the same listing as the page, not by a second scan.
-      total: Some(edges.len() as i64),
+      next_cursor: next.map(|edge| format!("e:{}:{}:{}", edge.src, edge.etype, edge.dst)),
+      has_more: next.is_some(),
+      total: Some(db.count_edges() as i64),
     })
   }
 
@@ -3370,7 +3367,7 @@ impl Database {
 
         Ok(
           builder
-            .execute(|node_id, dir, etype| neighbors_from_single_file(db, node_id, dir, etype))
+            .execute_source(DbNeighbors::new(db), NoProps)
             .map(JsTraversalResult::from)
             .collect(),
         )
@@ -3414,7 +3411,7 @@ impl Database {
 
         Ok(
           builder
-            .execute(|node_id, dir, etype| neighbors_from_single_file(db, node_id, dir, etype))
+            .execute_source(DbNeighbors::new(db), NoProps)
             .map(JsTraversalResult::from)
             .collect(),
         )
@@ -3444,7 +3441,7 @@ impl Database {
       Some(DatabaseInner::SingleFile(db)) => Ok(
         RustTraversalBuilder::new(start)
           .traverse(edge_type, opts)
-          .execute(|node_id, dir, etype| neighbors_from_single_file(db, node_id, dir, etype))
+          .execute_source(DbNeighbors::new(db), NoProps)
           .map(JsTraversalResult::from)
           .collect(),
       ),
@@ -3473,10 +3470,7 @@ impl Database {
           };
         }
 
-        Ok(
-          builder.count(|node_id, dir, etype| neighbors_from_single_file(db, node_id, dir, etype))
-            as u32,
-        )
+        Ok(builder.count_source(DbNeighbors::new(db), NoProps) as u32)
       }
       None => Err(Error::from_reason("Database is closed")),
     }
@@ -3517,11 +3511,8 @@ impl Database {
 
         Ok(
           builder
-            .collect_node_ids(|node_id, dir, etype| {
-              neighbors_from_single_file(db, node_id, dir, etype)
-            })
-            .into_iter()
-            .map(|id| id as i64)
+            .execute_source(DbNeighbors::new(db), NoProps)
+            .map(|result| result.node_id as i64)
             .collect(),
         )
       }
@@ -4149,53 +4140,49 @@ fn import_json_on(
   import_on(db, &data, options)
 }
 
-/// Get neighbors from database for traversal
+/// The edges a hop expands, for traversal and pathfinding: the shared
+/// implementation `Kite` uses too.
 fn neighbors_from_single_file(
   db: &RustSingleFileDB,
   node_id: NodeId,
   direction: TraversalDirection,
   etype: Option<ETypeId>,
 ) -> Vec<Edge> {
-  let mut edges = Vec::new();
-  match direction {
-    TraversalDirection::Out => {
-      for (e, dst) in db.out_edges(node_id) {
-        if etype.is_none() || etype == Some(e) {
-          edges.push(Edge {
-            src: node_id,
-            etype: e,
-            dst,
-          });
-        }
-      }
-    }
-    TraversalDirection::In => {
-      for (e, src) in db.in_edges(node_id) {
-        if etype.is_none() || etype == Some(e) {
-          edges.push(Edge {
-            src,
-            etype: e,
-            dst: node_id,
-          });
-        }
-      }
-    }
-    TraversalDirection::Both => {
-      edges.extend(neighbors_from_single_file(
-        db,
-        node_id,
-        TraversalDirection::Out,
-        etype,
-      ));
-      edges.extend(neighbors_from_single_file(
-        db,
-        node_id,
-        TraversalDirection::In,
-        etype,
-      ));
-    }
+  DbNeighbors::new(db).neighbors(node_id, direction, etype)
+}
+
+#[cfg(test)]
+mod neighbor_tests {
+  use super::*;
+
+  /// A self-loop is both an out-edge and an in-edge of its node: `Both` lists it once, as
+  /// `Kite::neighbors` does.
+  #[test]
+  fn neighbors_lists_a_self_loop_once_in_both() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = open_single_file(
+      dir.path().join("db.kitedb"),
+      crate::core::single_file::SingleFileOpenOptions::new(),
+    )
+    .expect("open");
+    db.begin(false).expect("begin");
+    let a = db.create_node(Some("a")).expect("a");
+    let b = db.create_node(Some("b")).expect("b");
+    let etype = db.define_etype("E").expect("etype");
+    db.add_edge(a, etype, a).expect("self-loop");
+    db.add_edge(a, etype, b).expect("edge");
+    db.add_edge(b, etype, a).expect("edge");
+    db.commit().expect("commit");
+    let edge = |src, dst| Edge { src, etype, dst };
+    assert_eq!(
+      neighbors_from_single_file(&db, a, TraversalDirection::Both, None),
+      vec![edge(a, a), edge(a, b), edge(b, a)]
+    );
+    assert_eq!(
+      neighbors_from_single_file(&db, a, TraversalDirection::In, Some(etype)),
+      vec![edge(a, a), edge(b, a)]
+    );
   }
-  edges
 }
 
 fn resolve_weight_key_single_file(
@@ -4282,13 +4269,6 @@ fn prop_value_to_weight(value: Option<PropValue>) -> std::result::Result<f64, St
 // Pagination
 // ============================================================================
 
-/// One page of a sorted listing.
-struct PageSlice<'a, T> {
-  items: &'a [T],
-  /// The last item, when more items follow it.
-  next: Option<T>,
-}
-
 /// Page size: 0 keeps the default of 100.
 fn page_limit(limit: usize) -> usize {
   if limit == 0 {
@@ -4298,16 +4278,13 @@ fn page_limit(limit: usize) -> usize {
   }
 }
 
-/// The `limit` items of `sorted` that come after `after`.
-///
-/// Seeks the first item greater than the cursor instead of the cursor item
-/// itself, so a cursor whose item was deleted still resumes in place.
-fn page_after<T: Ord + Copy>(sorted: &[T], after: Option<T>, limit: usize) -> PageSlice<'_, T> {
-  let start = after.map_or(0, |after| sorted.partition_point(|item| *item <= after));
-  let rest = &sorted[start..];
-  let items = &rest[..rest.len().min(limit)];
-  let next = (rest.len() > limit).then(|| items[items.len() - 1]);
-  PageSlice { items, next }
+/// The first `limit` of `items` (up to `limit + 1` read after a cursor), and
+/// the last of them when more follow.
+fn page_of<T: Copy>(mut items: Vec<T>, limit: usize) -> (Vec<T>, Option<T>) {
+  let has_more = items.len() > limit;
+  items.truncate(limit);
+  let next = has_more.then(|| items[items.len() - 1]);
+  (items, next)
 }
 
 fn invalid_cursor(cursor: &str) -> Error {
