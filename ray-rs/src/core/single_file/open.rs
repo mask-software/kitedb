@@ -1012,19 +1012,12 @@ fn open_single_file_internal(
   };
 
   // Initialize WAL buffer
-  let mut wal_buffer = WalBuffer::from_header(&header);
+  // Fails if the header's WAL positions lie outside their regions.
+  let mut wal_buffer = WalBuffer::from_header(&header)?;
 
   // A background checkpoint cut that no install finished. Replay reads both
   // regions in place, primary first, unless a writable open merges them.
   let mut replay_cut_in_place = header.checkpoint_in_progress != 0;
-  if replay_cut_in_place
-    && (wal_buffer.primary_head() > wal_buffer.primary_region_size()
-      || wal_buffer.secondary_head() > wal_buffer.capacity())
-  {
-    return Err(KiteError::InvalidWal(
-      "WAL region heads exceed their regions".to_string(),
-    ));
-  }
   if !options.read_only {
     // Records of a type this version does not know are a newer version's,
     // not torn: refuse rather than trim or compact them away below.

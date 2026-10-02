@@ -116,8 +116,16 @@ impl WalBuffer {
     }
   }
 
-  /// Create from existing header state
-  pub fn from_header(header: &DbHeaderV1) -> Self {
+  /// Create from existing header state.
+  ///
+  /// Fails with `InvalidWal` if the header's WAL positions are outside their
+  /// regions (an active region other than 0 or 1, a tail past the primary
+  /// head, a secondary head before the secondary region, or a head past the
+  /// WAL). The header checksum keeps a torn write from getting here, so only
+  /// a writer bug or a crafted file does; accepted, such positions underflow
+  /// later, which panics in debug builds and leaves the WAL looking full in
+  /// release builds.
+  pub fn from_header(header: &DbHeaderV1) -> Result<Self> {
     let base_offset = header.wal_start_page * header.page_size as u64;
     let capacity = header.wal_page_count * header.page_size as u64;
 
@@ -159,7 +167,42 @@ impl WalBuffer {
       secondary_head = header.wal_head;
     }
 
-    Self {
+    let invalid = |what: String| Err(KiteError::InvalidWal(format!("header {what}")));
+    let tail = header.wal_tail;
+    if active_region > 1 {
+      return invalid(format!("names WAL region {active_region} active"));
+    }
+    if header.wal_head > capacity || primary_head > capacity || secondary_head > capacity {
+      return invalid(format!(
+        "names WAL heads (head {}, primary {primary_head}, secondary {secondary_head}) past \
+         the {capacity}-byte WAL",
+        header.wal_head
+      ));
+    }
+    if tail > primary_head || tail > header.wal_head {
+      return invalid(format!(
+        "names WAL tail {tail} past its head (head {}, primary {primary_head})",
+        header.wal_head
+      ));
+    }
+    if secondary_head < secondary_region_start {
+      return invalid(format!(
+        "names secondary WAL head {secondary_head} before the region's start \
+         {secondary_region_start}"
+      ));
+    }
+    // A cut or retired primary region never passes its end. (Headers from
+    // before the region fields used the whole WAL as one region, so a primary
+    // head past it is only refused once there is a secondary region.)
+    if (active_region == 1 || header.checkpoint_in_progress != 0)
+      && primary_head > primary_region_size
+    {
+      return invalid(format!(
+        "names primary WAL head {primary_head} past the region's end {primary_region_size}"
+      ));
+    }
+
+    Ok(Self {
       base_offset,
       capacity,
       head: header.wal_head,
@@ -174,7 +217,7 @@ impl WalBuffer {
       secondary_head,
       primary_salt: header.wal_primary_salt,
       secondary_salt: header.wal_secondary_salt,
-    }
+    })
   }
 
   /// Get the base offset in the file
@@ -1470,7 +1513,7 @@ mod tests {
       let buffer = buffer_with_cut(&mut pager, 0, post_cut);
       let mut header = test_header();
       buffer.store_in_header(&mut header);
-      let reopened = WalBuffer::from_header(&header);
+      let reopened = WalBuffer::from_header(&header).expect("from header");
       assert_eq!(reopened.region_state(), buffer.region_state());
       assert_eq!(reopened.primary_head(), 0);
     }
@@ -1480,7 +1523,12 @@ mod tests {
     legacy.wal_head = 96;
     legacy.wal_primary_head = 0;
     legacy.wal_secondary_head = 0;
-    assert_eq!(WalBuffer::from_header(&legacy).primary_head(), 96);
+    assert_eq!(
+      WalBuffer::from_header(&legacy)
+        .expect("from header")
+        .primary_head(),
+      96
+    );
   }
 
   #[test]
@@ -1505,12 +1553,12 @@ mod tests {
     // The persisted form reopens into the same retained state.
     let mut retained_header = test_header();
     buffer.store_in_header(&mut retained_header);
-    let mut reopened = WalBuffer::from_header(&retained_header);
+    let mut reopened = WalBuffer::from_header(&retained_header).expect("from header");
     assert!(reopened.is_primary_retired());
     assert_eq!(txids(&mut reopened, &mut pager), vec![10, 11]);
 
     // The cut header's primary records are still intact as a crash fallback.
-    let mut fallback = WalBuffer::from_header(&cut_header);
+    let mut fallback = WalBuffer::from_header(&cut_header).expect("from header");
     let fallback_records = fallback
       .records_for_recovery(&mut pager)
       .expect("fallback records");
@@ -1543,7 +1591,7 @@ mod tests {
 
     let mut header = test_header();
     buffer.store_in_header(&mut header);
-    let mut reopened = WalBuffer::from_header(&header);
+    let mut reopened = WalBuffer::from_header(&header).expect("from header");
     assert!(!reopened.is_primary_retired());
     assert_eq!(reopened.usage_ratio(), buffer.usage_ratio());
     assert_eq!(txids(&mut reopened, &mut pager), vec![50, 51, 52]);
@@ -1766,6 +1814,7 @@ mod tests {
       record_ids(&buffer.scan_records(&mut pager).expect("scan")),
       record_ids(
         &WalBuffer::from_header(&cut_header)
+          .expect("from header")
           .records_for_recovery(&mut pager)
           .expect("cut records")
       )
@@ -1860,7 +1909,7 @@ mod tests {
       header.wal_secondary_head = head;
     }
     header.wal_head = head;
-    WalBuffer::from_header(&header)
+    WalBuffer::from_header(&header).expect("from header")
   }
 
   /// A reset rewinds the primary head but leaves the records in place. With
@@ -1967,7 +2016,7 @@ mod tests {
     header.min_reader_version = 1;
     header.wal_primary_salt = 0;
     header.wal_secondary_salt = 0;
-    let mut buffer = WalBuffer::from_header(&header);
+    let mut buffer = WalBuffer::from_header(&header).expect("from header");
     buffer.store_in_header(&mut header);
     assert_eq!((header.version, header.min_reader_version), (1, 1));
 

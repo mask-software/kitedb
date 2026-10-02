@@ -32,6 +32,7 @@ use crate::core::single_file::{
   close_single_file, open_single_file, ResizeWalOptions, SingleFileDB, SingleFileOpenOptions,
   SyncMode,
 };
+use crate::core::wal::buffer::WalBuffer;
 use crate::core::wal::record::WalRecord;
 use crate::error::KiteError;
 use crate::types::{DbHeaderV1, WalRecordType};
@@ -402,6 +403,20 @@ fn f5_open_rejects_wal_positions_outside_their_regions() {
     "open accepted invalid WAL positions:\n{}",
     accepted.join("\n")
   );
+}
+
+/// Headers from before the region fields name only `wal_head`, a position
+/// in a WAL used as one region, possibly past where the primary region now
+/// ends. They still load.
+#[test]
+fn f5_from_header_accepts_a_legacy_single_region_head() {
+  let mut header = DbHeaderV1::new(PAGE_SIZE as u32, 16);
+  let capacity = 16 * PAGE_SIZE as u64;
+  header.wal_head = capacity - 64;
+  header.wal_primary_head = 0;
+  header.wal_secondary_head = 0;
+  let buffer = WalBuffer::from_header(&header).expect("legacy header");
+  assert_eq!(buffer.primary_head(), capacity - 64);
 }
 
 // ============================================================================
