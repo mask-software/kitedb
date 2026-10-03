@@ -4,7 +4,8 @@ This document summarizes **measured** benchmark results. Raw outputs live in
 `docs/benchmarks/results/` so we can trace every number back to an actual run.
 
 > **Latest results: 2026-10-03**, Apple M5 Pro, MVCC on, measured with
-> `ray-rs/scripts/bench-refresh.sh` (see "Latest results"). The February 2026
+> `ray-rs/scripts/bench-refresh.sh` at commit `5460a2c`, the second run that
+> day (logs `2026-10-03-r2-*.txt`; see "Latest results"). The February 2026
 > runs (Apple M4, MVCC off, and the group-commit option of the time) are kept
 > under "Prior results (2026-02, Apple M4, MVCC off)" for comparison. The
 > vector compaction, ANN matrix, index pipeline and replication gate snapshots
@@ -37,9 +38,10 @@ Power Mode, on battery, with uncommitted changes, or while other processes keep
 more than 20% of the CPUs busy (it waits for that, and pauses between runs
 too), runs 5 interleaved rounds with seed 42, and writes
 `docs/benchmarks/results/<date>-<name>.txt` plus a `<date>-bench-refresh.txt`
-manifest. Each log header names the commit, toolchain, machine, energy mode and
-the exact command. The script header lists its options. The sections below are
-the individual commands.
+manifest (`STAMP` replaces `<date>`, the UTC date, as `STAMP=2026-10-03-r2` did
+for the second run that day). Each log header names the commit, toolchain,
+machine, energy mode and the exact command. The script header lists its
+options. The sections below are the individual commands.
 
 ### Rust (core, single-file raw)
 
@@ -51,8 +53,8 @@ cargo run --release --example single_file_raw_bench --no-default-features -- \
 ```
 
 This is the configuration of the latest graph results
-(`2026-10-03-single-file-raw-rust-mvcc-{normal,full,off}.txt`, one per
-`--sync-mode`, and `2026-10-03-single-file-raw-rust-nomvcc-normal.txt` with
+(`2026-10-03-r2-single-file-raw-rust-mvcc-{normal,full,off}.txt`, one per
+`--sync-mode`, and `2026-10-03-r2-single-file-raw-rust-nomvcc-normal.txt` with
 `--no-mvcc`). The prior 2026-02-04 edges-heavy logs
 (`2026-02-04-single-file-raw-rust-edges-*.txt`) used the same flags without
 `--seed 42 --mvcc` (MVCC was off by default), once per `--sync-mode` value,
@@ -103,7 +105,7 @@ python3 benchmark_single_file_raw.py \
 
 Build the bindings with `maturin develop --release --features python` first; a
 debug build is several times slower. This is the configuration of
-`2026-10-03-single-file-raw-python-mvcc-normal.txt`. The prior 2026-02-04
+`2026-10-03-r2-single-file-raw-python-mvcc-normal.txt`. The prior 2026-02-04
 edges-heavy logs (`2026-02-04-single-file-raw-python-edges-*.txt`) used it
 without `--seed 42 --mvcc`, swept over `--sync-mode` and
 `--group-commit-enabled` the same way as the Rust runs.
@@ -142,8 +144,9 @@ node --import @oxc-node/core/register benchmark/bench-fluent-vs-lowlevel.ts --mv
 It needs the release addon and the TS build (`bun run build`, which runs
 `napi build --platform --release` and `bun run build:ts`). The defaults (1k
 nodes, 5k edges, 3 edge types, 10 edge props, 1k iterations, sync=normal) plus
-`--mvcc --seed 42` match `2026-10-03-bench-fluent-vs-lowlevel-mvcc-normal.txt`; the
-defaults alone (MVCC off then) match
+`--mvcc --seed 42` match
+`2026-10-03-r2-bench-fluent-vs-lowlevel-mvcc-normal.txt`; the defaults alone
+(MVCC off then) match
 `2026-02-04-bench-fluent-vs-lowlevel-edges-normal-nogc.txt`. The script accepts
 `--nodes`, `--edges`, `--edge-types`, `--edge-props`, `--iterations`,
 `--sync-mode`, `--mvcc` / `--no-mvcc`, and `--seed N` (default: 42);
@@ -165,8 +168,9 @@ cargo run --release --example vector_bench --no-default-features -- \
   --vectors 10000 --dimensions 768 --iterations 1000 --k 10 --n-probe 10 --seed 42 --no-output
 ```
 
-This is the configuration of `2026-10-03-vector-bench-rust.txt`; the 2026-02-03
-log used it without `--seed 42` (the index training was unseeded then).
+This is the configuration of `2026-10-03-r2-vector-bench-rust.txt`; the
+2026-02-03 log used it without `--seed 42` (the index training was unseeded
+then).
 
 `vector_bench` builds `VectorIndex` with its default ANN algorithm and has no
 flag to choose another. That default changed from IVF to IVF-PQ on 2026-02-08
@@ -318,9 +322,9 @@ python3 sqlite_single_file_raw_bench.py \
   --nodes 10000 --edges 50000 --iterations 10000 --sync-mode normal
 ```
 
-This reproduces `2026-10-03-sqlite-single-file-raw-edges-normal.txt` and, on the
-prior machine, `2026-02-04-sqlite-single-file-raw-edges-normal.txt`. The other
-2026-02-04 SQLite logs change `--sync-mode`; the nodes-only logs add
+This reproduces `2026-10-03-r2-sqlite-single-file-raw-edges-normal.txt` and,
+on the prior machine, `2026-02-04-sqlite-single-file-raw-edges-normal.txt`. The
+other 2026-02-04 SQLite logs change `--sync-mode`; the nodes-only logs add
 `--edges 0 --edge-props 0`.
 
 Notes (SQLite):
@@ -502,15 +506,19 @@ Output:
 
 ## Latest results (October 3, 2026, Apple M5 Pro, MVCC on)
 
-Measured with `ray-rs/scripts/bench-refresh.sh` at commit `e3b064c` on an Apple
+Measured with `ray-rs/scripts/bench-refresh.sh` at commit `5460a2c` on an Apple
 M5 Pro, 15 cores (5 Super + 10 Performance), 48 GB, macOS 26.6 (Darwin 25.6.0),
 power: AC Power, energy mode high power; Rust 1.88.0, Node 24.21.0, Python
-3.12.8, SQLite 3.47.1. MVCC is on (the default) unless a table says otherwise;
-group commit is always on. Each configuration ran 5 interleaved rounds with seed
-42 (3 rounds for `query_core_bench` and `vector_ann_bench`, 1 for
-`mvcc_overhead_bench`, which repeat internally). Each row below is the line of
-the round with the median value, copied from the log, as on the docs site
-(`ray-docs`, `bun run bench:data`). Every log header names the exact command.
+3.12.8, SQLite 3.47.1. This is the second run of that day (logs
+`2026-10-03-r2-*.txt`, 10:31-10:54 UTC), after the read-path and write-cost
+changes; it supersedes the earlier 2026-10-03 run at commit `e3b064c`, whose
+logs (`2026-10-03-*.txt` without `r2`) stay in `docs/benchmarks/results/`.
+MVCC is on (the default) unless a table says otherwise; group commit is always
+on. Each configuration ran 5 interleaved rounds with seed 42 (3 rounds for
+`query_core_bench` and `vector_ann_bench`, 1 for `mvcc_overhead_bench`, which
+repeat internally). Each row below is the line of the round with the median
+value, copied from the log, as on the docs site (`ray-docs`,
+`bun run bench:data`). Every log header names the exact command.
 
 The machine differs from the prior results (Apple M4, 16 GB), so a change
 against them mixes code and hardware; the SQLite baseline, rerun on this
@@ -526,19 +534,19 @@ dims, sync=normal, MVCC on; 10k iterations, 256MB WAL, auto-checkpoint off.
 
 | Operation | p50 | p95 | p50, MVCC off | p95, MVCC off |
 |---|---|---|---|---|
-| Key lookup (random existing key) | 42 ns | 209 ns | 42 ns | 208 ns |
-| 1-hop traversal (out, random node) | 42 ns | 125 ns | 42 ns | 166 ns |
+| Key lookup (random existing key) | 42 ns | 208 ns | 42 ns | 167 ns |
+| 1-hop traversal (out, random node) | 42 ns | 84 ns | 42 ns | 167 ns |
 | Edge exists (random pair) | 42 ns | 83 ns | 42 ns | 83 ns |
-| Batch write (100 nodes) | 16.33 µs | 36.00 µs | 16.88 µs | 35.96 µs |
-| Batch write (100 edges) | 13.33 µs | 18.04 µs | 13.71 µs | 20.50 µs |
-| Batch write (100 edges + props) | 63.79 µs | 79.71 µs | 62.04 µs | 76.79 µs |
-| Get vector (random) | 83 ns | 166 ns | 83 ns | 166 ns |
+| Batch write (100 nodes) | 17.92 µs | 46.79 µs | 17.83 µs | 37.33 µs |
+| Batch write (100 edges) | 16.08 µs | 25.92 µs | 13.75 µs | 26.12 µs |
+| Batch write (100 edges + props) | 65.50 µs | 82.21 µs | 64.25 µs | 75.71 µs |
+| Get vector (random) | 83 ns | 208 ns | 83 ns | 166 ns |
 | Has vector (random) | 42 ns | 42 ns | 42 ns | 42 ns |
-| Set vectors (batch of 100) | 67.46 µs | 338.21 µs | 62.71 µs | 193.17 µs |
+| Set vectors (batch of 100) | 67.96 µs | 196.33 µs | 66.92 µs | 178.21 µs |
 
 ```
-docs/benchmarks/results/2026-10-03-single-file-raw-rust-mvcc-normal.txt
-docs/benchmarks/results/2026-10-03-single-file-raw-rust-nomvcc-normal.txt
+docs/benchmarks/results/2026-10-03-r2-single-file-raw-rust-mvcc-normal.txt
+docs/benchmarks/results/2026-10-03-r2-single-file-raw-rust-nomvcc-normal.txt
 ```
 
 ### Graph latency (Python bindings)
@@ -548,18 +556,18 @@ dims, sync=normal, MVCC on.
 
 | Operation | p50 | p95 |
 |---|---|---|
-| Key lookup (random existing key) | 125 ns | 291 ns |
-| 1-hop traversal (out, random node) | 291 ns | 417 ns |
+| Key lookup (random existing key) | 125 ns | 209 ns |
+| 1-hop traversal (out, random node) | 250 ns | 417 ns |
 | Edge exists (random pair) | 125 ns | 125 ns |
-| Batch write (100 nodes) | 25.33 µs | 53.71 µs |
-| Batch write (100 edges) | 18.50 µs | 24.62 µs |
-| Batch write (100 edges + props) | 206.12 µs | 219.25 µs |
-| Get vector (random) | 709 ns | 834 ns |
+| Batch write (100 nodes) | 24.71 µs | 60.17 µs |
+| Batch write (100 edges) | 18.25 µs | 24.58 µs |
+| Batch write (100 edges + props) | 201.83 µs | 238.38 µs |
+| Get vector (random) | 708 ns | 875 ns |
 | Has vector (random) | 125 ns | 125 ns |
-| Set vectors (batch of 100) | 105.79 µs | 419.96 µs |
+| Set vectors (batch of 100) | 105.46 µs | 7.23 ms |
 
 ```
-docs/benchmarks/results/2026-10-03-single-file-raw-python-mvcc-normal.txt
+docs/benchmarks/results/2026-10-03-r2-single-file-raw-python-mvcc-normal.txt
 ```
 
 ### Sync modes (Rust core, MVCC on)
@@ -570,14 +578,14 @@ which on macOS leaves writes in the drive's cache (see `full_fsync` below for
 
 | Sync mode | 100 nodes p50 | 100 nodes p95 | 100 edges p50 | Set vectors (100) p50 |
 |---|---|---|---|---|
-| `normal` | 16.33 µs | 36.00 µs | 13.33 µs | 67.46 µs |
-| `full` | 76.00 µs | 94.50 µs | 49.62 µs | 165.08 µs |
-| `off` | 13.96 µs | 38.67 µs | 12.88 µs | 59.00 µs |
+| `normal` | 17.92 µs | 46.79 µs | 16.08 µs | 67.96 µs |
+| `full` | 72.21 µs | 110.42 µs | 56.58 µs | 162.25 µs |
+| `off` | 14.29 µs | 44.62 µs | 11.50 µs | 58.54 µs |
 
 ```
-docs/benchmarks/results/2026-10-03-single-file-raw-rust-mvcc-normal.txt
-docs/benchmarks/results/2026-10-03-single-file-raw-rust-mvcc-full.txt
-docs/benchmarks/results/2026-10-03-single-file-raw-rust-mvcc-off.txt
+docs/benchmarks/results/2026-10-03-r2-single-file-raw-rust-mvcc-normal.txt
+docs/benchmarks/results/2026-10-03-r2-single-file-raw-rust-mvcc-full.txt
+docs/benchmarks/results/2026-10-03-r2-single-file-raw-rust-mvcc-off.txt
 ```
 
 ### SQLite baseline (single-file raw)
@@ -587,11 +595,11 @@ mode, synchronous=normal, SQLite 3.47.1, same machine:
 
 | Engine | p50 | p95 |
 |---|---|---|
-| SQLite | 151.62 µs | 187.54 µs |
-| KiteDB (Rust, MVCC on) | 16.33 µs | 36.00 µs |
+| SQLite | 156.04 µs | 181.67 µs |
+| KiteDB (Rust, MVCC on) | 17.92 µs | 46.79 µs |
 
 ```
-docs/benchmarks/results/2026-10-03-sqlite-single-file-raw-edges-normal.txt
+docs/benchmarks/results/2026-10-03-r2-sqlite-single-file-raw-edges-normal.txt
 ```
 
 ### TypeScript fluent vs low-level API
@@ -601,17 +609,17 @@ sync=normal, MVCC on, Node 24.21.0.
 
 | Operation | Low-level p50 | Fluent p50 | Overhead |
 |---|---|---|---|
-| Insert (single node + props) | 5.67 µs | 6.83 µs | 1.21x |
-| Key lookup (get, with props) | 167 ns | 1.25 µs | 7.49x |
-| Key lookup (getRef, no props) | 167 ns | 584 ns | 3.50x |
-| Key lookup (getId, id only) | 167 ns | 292 ns | 1.75x |
-| 1-hop traversal (count) | 750 ns | 1.17 µs | 1.56x |
-| 1-hop traversal (node ids) | 750 ns | 1.29 µs | 1.72x |
-| 1-hop traversal (toArray, with props) | 750 ns | 3.29 µs | 4.39x |
-| Pathfinding BFS (max depth 5) | 3.63 µs | 2.88 µs | 0.79x |
+| Insert (single node + props) | 5.50 µs | 6.79 µs | 1.23x |
+| Key lookup (get, with props) | 167 ns | 1.33 µs | 7.98x |
+| Key lookup (getRef, no props) | 166 ns | 584 ns | 3.52x |
+| Key lookup (getId, id only) | 166 ns | 292 ns | 1.76x |
+| 1-hop traversal (count) | 709 ns | 1.13 µs | 1.59x |
+| 1-hop traversal (node ids) | 750 ns | 1.33 µs | 1.78x |
+| 1-hop traversal (toArray, with props) | 750 ns | 3.42 µs | 4.56x |
+| Pathfinding BFS (max depth 5) | 3.46 µs | 2.88 µs | 0.83x |
 
 ```
-docs/benchmarks/results/2026-10-03-bench-fluent-vs-lowlevel-mvcc-normal.txt
+docs/benchmarks/results/2026-10-03-r2-bench-fluent-vs-lowlevel-mvcc-normal.txt
 ```
 
 ### Vector index (Rust)
@@ -621,13 +629,13 @@ Config: 10k vectors, 768 dims, 1k iterations, k=10, nProbe=10, cosine, IVF with
 
 | Operation | p50 | p95 |
 |---|---|---|
-| Set (10,000 vectors, one at a time) | 834 ns | 1.71 µs |
-| build_index() (one build) | 84.88 ms | n/a |
+| Set (10,000 vectors, one at a time) | 833 ns | 1.75 µs |
+| build_index() (one build) | 87.09 ms | n/a |
 | Get (random) | 166 ns | 334 ns |
-| Search | 144.12 µs | 182.25 µs |
+| Search | 191.83 µs | 269.54 µs |
 
 ```
-docs/benchmarks/results/2026-10-03-vector-bench-rust.txt
+docs/benchmarks/results/2026-10-03-r2-vector-bench-rust.txt
 ```
 
 IVF vs IVF-PQ (`vector_ann_bench`): 50k vectors of 768 dims (lowrank dataset),
@@ -636,12 +644,12 @@ default re-rank.
 
 | Algorithm | Build | Search p50 | Search p95 | Recall@10 |
 |---|---|---|---|---|
-| IVF | 1.25 s | 543.63 µs | 717.54 µs | 1.0000 |
-| IVF-PQ | 4.78 s | 199.75 µs | 241.50 µs | 0.9395 |
+| IVF | 1.33 s | 653.58 µs | 901.96 µs | 1.0000 |
+| IVF-PQ | 5.06 s | 227.71 µs | 286.42 µs | 0.9350 |
 
 ```
-docs/benchmarks/results/2026-10-03-vector-ann-768d-ivf.txt
-docs/benchmarks/results/2026-10-03-vector-ann-768d-ivf-pq.txt
+docs/benchmarks/results/2026-10-03-r2-vector-ann-768d-ivf.txt
+docs/benchmarks/results/2026-10-03-r2-vector-ann-768d-ivf-pq.txt
 ```
 
 ### Write scaling (Rust core, MVCC on)
@@ -654,35 +662,35 @@ Transactions per second with 1, 4 and 8 writer threads
 
 | Transactions | Sync | 1 writer | 4 writers | 8 writers | 8 vs 1 |
 |---|---|---|---|---|---|
-| 200-node transactions | `normal` | 5.13K/s | 10.53K/s | 13.18K/s | 2.6x |
-| 200-node transactions | `full` | 3.44K/s | 6.50K/s | 10.20K/s | 3.0x |
-| 1-node transactions | `normal` | 417.89K/s | 380.91K/s | 376.42K/s | 0.9x |
-| 1-node transactions | `full` | 25.50K/s | 43.26K/s | 59.75K/s | 2.3x |
+| 200-node transactions | `normal` | 4.93K/s | 9.47K/s | 12.69K/s | 2.6x |
+| 200-node transactions | `full` | 3.44K/s | 7.58K/s | 10.30K/s | 3.0x |
+| 1-node transactions | `normal` | 386.48K/s | 427.66K/s | 462.48K/s | 1.2x |
+| 1-node transactions | `full` | 25.28K/s | 40.39K/s | 58.90K/s | 2.3x |
 
 One writer with MVCC off (write transactions then run one at a time),
-sync=normal: 6.11K/s for 200-node transactions, 435.47K/s for 1-node
+sync=normal: 5.02K/s for 200-node transactions, 400.17K/s for 1-node
 transactions.
 
 `full` with `full_fsync` (`F_FULLFSYNC`, which flushes the drive's cache),
-1-node transactions: 1 writer 276.06/s, 8 writers 1.16K/s.
+1-node transactions: 1 writer 295.15/s, 8 writers 1.18K/s.
 
 ```
-docs/benchmarks/results/2026-10-03-multi-writer-throughput-mvcc-normal-200node-1w.txt
-docs/benchmarks/results/2026-10-03-multi-writer-throughput-mvcc-normal-200node-4w.txt
-docs/benchmarks/results/2026-10-03-multi-writer-throughput-mvcc-normal-200node-8w.txt
-docs/benchmarks/results/2026-10-03-multi-writer-throughput-mvcc-full-200node-1w.txt
-docs/benchmarks/results/2026-10-03-multi-writer-throughput-mvcc-full-200node-4w.txt
-docs/benchmarks/results/2026-10-03-multi-writer-throughput-mvcc-full-200node-8w.txt
-docs/benchmarks/results/2026-10-03-multi-writer-throughput-mvcc-normal-1node-1w.txt
-docs/benchmarks/results/2026-10-03-multi-writer-throughput-mvcc-normal-1node-4w.txt
-docs/benchmarks/results/2026-10-03-multi-writer-throughput-mvcc-normal-1node-8w.txt
-docs/benchmarks/results/2026-10-03-multi-writer-throughput-mvcc-full-1node-1w.txt
-docs/benchmarks/results/2026-10-03-multi-writer-throughput-mvcc-full-1node-4w.txt
-docs/benchmarks/results/2026-10-03-multi-writer-throughput-mvcc-full-1node-8w.txt
-docs/benchmarks/results/2026-10-03-multi-writer-throughput-nomvcc-normal-200node-1w.txt
-docs/benchmarks/results/2026-10-03-multi-writer-throughput-nomvcc-normal-1node-1w.txt
-docs/benchmarks/results/2026-10-03-multi-writer-throughput-mvcc-fullfsync-1node-1w.txt
-docs/benchmarks/results/2026-10-03-multi-writer-throughput-mvcc-fullfsync-1node-8w.txt
+docs/benchmarks/results/2026-10-03-r2-multi-writer-throughput-mvcc-normal-200node-1w.txt
+docs/benchmarks/results/2026-10-03-r2-multi-writer-throughput-mvcc-normal-200node-4w.txt
+docs/benchmarks/results/2026-10-03-r2-multi-writer-throughput-mvcc-normal-200node-8w.txt
+docs/benchmarks/results/2026-10-03-r2-multi-writer-throughput-mvcc-full-200node-1w.txt
+docs/benchmarks/results/2026-10-03-r2-multi-writer-throughput-mvcc-full-200node-4w.txt
+docs/benchmarks/results/2026-10-03-r2-multi-writer-throughput-mvcc-full-200node-8w.txt
+docs/benchmarks/results/2026-10-03-r2-multi-writer-throughput-mvcc-normal-1node-1w.txt
+docs/benchmarks/results/2026-10-03-r2-multi-writer-throughput-mvcc-normal-1node-4w.txt
+docs/benchmarks/results/2026-10-03-r2-multi-writer-throughput-mvcc-normal-1node-8w.txt
+docs/benchmarks/results/2026-10-03-r2-multi-writer-throughput-mvcc-full-1node-1w.txt
+docs/benchmarks/results/2026-10-03-r2-multi-writer-throughput-mvcc-full-1node-4w.txt
+docs/benchmarks/results/2026-10-03-r2-multi-writer-throughput-mvcc-full-1node-8w.txt
+docs/benchmarks/results/2026-10-03-r2-multi-writer-throughput-nomvcc-normal-200node-1w.txt
+docs/benchmarks/results/2026-10-03-r2-multi-writer-throughput-nomvcc-normal-1node-1w.txt
+docs/benchmarks/results/2026-10-03-r2-multi-writer-throughput-mvcc-fullfsync-1node-1w.txt
+docs/benchmarks/results/2026-10-03-r2-multi-writer-throughput-mvcc-fullfsync-1node-8w.txt
 ```
 
 ### Open time and paging (Rust core, MVCC on)
@@ -692,34 +700,34 @@ open`, median of 9 per round):
 
 | Database | Open + close |
 |---|---|
-| 100k nodes, 500k edges | 2.06 ms |
-| 1M nodes, 5M edges | 18.31 ms |
+| 100k nodes, 500k edges | 2.11 ms |
+| 1M nodes, 5M edges | 18.62 ms |
 
 ```
-docs/benchmarks/results/2026-10-03-query-core-open-100k.txt
-docs/benchmarks/results/2026-10-03-query-core-open-1m.txt
+docs/benchmarks/results/2026-10-03-r2-query-core-open-100k.txt
+docs/benchmarks/results/2026-10-03-r2-query-core-open-1m.txt
 ```
 
 Pages, counts and hub reads (`query_core_bench`, median of 7 per round; paging:
 1000000 nodes, 5000000 edges, page size 100, pages 1 and 1000; types: 100000
 nodes over 5 types, all(T2) and count_nodes_by_type(T2); take(1) from a node
 with 200000 out-edges), with every change still in the WAL and after a
-checkpoint:
+checkpoint, in µs to one decimal as the log prints them:
 
 | Operation | In the WAL | After a checkpoint |
 |---|---|---|
-| Node page 1 (100 nodes) | 4.95 ms | 500 ns |
-| Node page 1000 | 4.82 ms | 600 ns |
-| Edge page 1 (100 edges) | 1.43 ms | 1.50 µs |
-| Edge page 1000 | 1.32 ms | 1.60 µs |
-| Count nodes (page total) | 9.91 ms | 0 ns |
-| Count edges (page total) | 17.77 ms | 0 ns |
-| Count nodes of one type | 3.27 ms | 2.38 ms |
-| First neighbor of a 200k-edge hub, take(1) | 300 ns | 500 ns |
-| All neighbors of a 200k-edge hub | 597.00 µs | 1.17 ms |
+| Node page 1 (100 nodes) | 0.5 µs | 0.4 µs |
+| Node page 1000 | 0.5 µs | 0.5 µs |
+| Edge page 1 (100 edges) | 0.4 µs | 0.6 µs |
+| Edge page 1000 | 0.5 µs | 0.8 µs |
+| Count nodes (page total) | < 0.1 µs | < 0.1 µs |
+| Count edges (page total) | < 0.1 µs | < 0.1 µs |
+| Count nodes of one type | 2.62 ms | 1.88 ms |
+| First neighbor of a 200k-edge hub, take(1) | 0.4 µs | 0.4 µs |
+| All neighbors of a 200k-edge hub | 276.9 µs | 166.7 µs |
 
 ```
-docs/benchmarks/results/2026-10-03-query-core-paging.txt
+docs/benchmarks/results/2026-10-03-r2-query-core-paging.txt
 ```
 
 ### MVCC cost
@@ -729,17 +737,17 @@ duration=1s repeat=5 history=2000x8 sync=Off cpus=15), operations per second:
 
 | Workload | MVCC off | MVCC on | Change |
 |---|---|---|---|
-| node_prop, 1 reader | 54.61M/s | 55.31M/s | +1.3% |
-| node_props, 1 reader | 11.47M/s | 11.56M/s | +0.7% |
-| out_edges, 1 reader | 11.78M/s | 11.95M/s | +1.4% |
-| node_prop in read transactions, 1 reader | 50.21M/s | 49.30M/s | -1.8% |
-| node_prop, 8 readers | 12.60M/s | 12.56M/s | -0.3% |
-| node_prop, 4 readers beside 1 writer | 5.75M/s | 5.44M/s | -5.3% |
-| Update one prop, 1 writer | 1.50M/s | 1.26M/s | -15.5% |
-| Insert a node + prop + edge, 1 writer | 709.63K/s | 584.63K/s | -17.6% |
+| node_prop, 1 reader | 65.10M/s | 65.90M/s | +1.2% |
+| node_props, 1 reader | 11.49M/s | 11.65M/s | +1.4% |
+| out_edges, 1 reader | 18.00M/s | 18.36M/s | +2.0% |
+| node_prop in read transactions, 1 reader | 59.00M/s | 56.29M/s | -4.6% |
+| node_prop, 8 readers | 12.67M/s | 12.68M/s | +0.1% |
+| node_prop, 4 readers beside 1 writer | 7.89M/s | 7.62M/s | -3.4% |
+| Update one prop, 1 writer | 1.27M/s | 1.18M/s | -7.6% |
+| Insert a node + prop + edge, 1 writer | 617.57K/s | 569.61K/s | -7.8% |
 
 ```
-docs/benchmarks/results/2026-10-03-mvcc-overhead.txt
+docs/benchmarks/results/2026-10-03-r2-mvcc-overhead.txt
 ```
 
 ### Bulk load
@@ -749,14 +757,14 @@ transactions of 5,000, sync=normal, 64MB WAL:
 
 | Mode | Nodes/s | Edges/s |
 |---|---|---|
-| MVCC on | 3.05M/s | 1.05M/s |
-| MVCC off | 3.05M/s | 1.06M/s |
-| MVCC on, a read transaction open | 3.05M/s | 690.23K/s |
+| MVCC on | 2.88M/s | 1.00M/s |
+| MVCC off | 2.90M/s | 974.60K/s |
+| MVCC on, a read transaction open | 2.95M/s | 614.72K/s |
 
 ```
-docs/benchmarks/results/2026-10-03-bulk-load-mvcc.txt
-docs/benchmarks/results/2026-10-03-bulk-load-nomvcc.txt
-docs/benchmarks/results/2026-10-03-bulk-load-mvcc-reader.txt
+docs/benchmarks/results/2026-10-03-r2-bulk-load-mvcc.txt
+docs/benchmarks/results/2026-10-03-r2-bulk-load-nomvcc.txt
+docs/benchmarks/results/2026-10-03-r2-bulk-load-mvcc-reader.txt
 ```
 
 ## Prior results (2026-02, Apple M4, MVCC off)
