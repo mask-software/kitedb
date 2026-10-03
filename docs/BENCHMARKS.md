@@ -46,8 +46,11 @@ Optional knobs (Rust):
 - `--edge-types N` (default: 3)
 - `--edge-props N` (default: 10)
 - `--sync-mode full|normal|off` (default: normal)
-- `--group-commit-enabled`
-- `--group-commit-window-ms N` (default: 2)
+- `--mvcc` / `--no-mvcc` (default: the library default, MVCC on)
+- `--seed N` (default: 42): the graph, vectors and the keys and nodes the read
+  benchmarks pick
+- `--group-commit-enabled`, `--group-commit-window-ms N`: accepted for old
+  command lines, no effect (every commit is group-committed)
 - `--wal-size BYTES` (default: 67108864)
 - `--no-auto-checkpoint` (auto-checkpoint is on by default)
 - `--skip-checkpoint` (skip the checkpoint between vector setup and the read benchmarks)
@@ -94,8 +97,10 @@ Optional knobs (Python):
 - `--edge-types N` (default: 3)
 - `--edge-props N` (default: 10)
 - `--sync-mode full|normal|off` (default: normal)
-- `--group-commit-enabled`
-- `--group-commit-window-ms N` (default: 2)
+- `--mvcc` / `--no-mvcc` (default: the library default, MVCC on)
+- `--seed N` (default: 42)
+- `--group-commit-enabled`, `--group-commit-window-ms N`: accepted for old
+  command lines, no effect (every commit is group-committed)
 - `--wal-size BYTES` (default: 67108864)
 - `--no-auto-checkpoint` (auto-checkpoint is on by default)
 - `--skip-compact` (skip the compaction between vector setup and the read benchmarks)
@@ -111,8 +116,9 @@ The defaults (1k nodes, 5k edges, 3 edge types, 10 edge props, 1k iterations,
 sync=normal, group commit off) match
 `2026-02-04-bench-fluent-vs-lowlevel-edges-normal-nogc.txt`. The script accepts
 `--nodes`, `--edges`, `--edge-types`, `--edge-props`, `--iterations`,
-`--sync-mode`, `--group-commit-enabled`, and `--group-commit-window-ms`. The
-other logs add:
+`--sync-mode`, `--mvcc` / `--no-mvcc`, and `--seed N` (default: 42);
+`--group-commit-enabled` and `--group-commit-window-ms` are accepted for old
+command lines and have no effect. The other logs add:
 - Sweep logs: `--sync-mode full|normal|off`, plus `--group-commit-enabled` for `-gc`.
 - Nodes-only logs: `--edges 0 --edge-types 1 --edge-props 0`.
 - 100k/500k logs: `--nodes 100000 --edges 500000`.
@@ -359,10 +365,12 @@ Defaults:
 - Dataset: `NODES=10000`, `EDGES=0`, `EDGE_TYPES=1`, `EDGE_PROPS=0`, `VECTOR_COUNT=0`
 - Primary rotation guardrail: `REPLICATION_SEGMENT_MAX_BYTES=1073741824`
 - `ITERATIONS=20000`
+- `NODE_BATCHES=2000`: commits in the timed 100-node batch-write sample whose
+  p95 the gate compares (must be `>= 200`; a p95 over fewer commits is a handful
+  of outliers)
 - `SYNC_MODE=normal`
 - `ATTEMPTS=7` (median ratio across attempts is used for pass/fail)
 - Pass threshold: `P95_MAX_RATIO=1.30` (replication-on p95 / baseline p95)
-- `ITERATIONS` must be `>= 100`
 
 Example override:
 
@@ -392,9 +400,10 @@ Defaults:
 - `BACKLOG_COMMITS=5000`
 - `MAX_FRAMES=256`
 - `SYNC_MODE=normal`
+- `SEGMENT_MAX_BYTES=67108864`, `RETENTION_MIN=20000`
 - `ATTEMPTS=3` (retry count for noisy host variance)
-- Pass threshold: `MIN_CATCHUP_FPS=3000`
-- Pass threshold: `MIN_THROUGHPUT_RATIO=0.13` (catch-up fps / primary fps)
+- Pass threshold: `MIN_CATCHUP_FPS=2000`
+- Pass threshold: `MIN_THROUGHPUT_RATIO=0.09` (catch-up fps / primary fps)
 - `BACKLOG_COMMITS` must be `>= 100`
 
 Example override:
@@ -441,7 +450,7 @@ Defaults:
 - `ATTEMPTS=1`
 - Pass threshold: `MAX_ALLOWED_LAG=1200`
 - Pass threshold: `MIN_PROMOTIONS=2`
-- Pass threshold: `MIN_RESEEDS=1`
+- Pass threshold: `MIN_RESEEDS=0`
 - Invariant checks: divergence must be `0`, stale-fence rejections must equal promotions.
 
 Example override:
