@@ -109,15 +109,36 @@ impl ReadView<'_> {
   /// The first `limit` nodes of `listed_nodes` after `after`.
   fn nodes_after(&self, after: Option<NodeId>, limit: usize) -> Vec<NodeId> {
     let layers = self.layers;
+    // The first ID the page may hold (none past the largest)
+    let Some(from) = after.map_or(Some(0), |after| after.checked_add(1)) else {
+      return Vec::new();
+    };
 
-    // The few nodes from the delta, the transaction and the version chains:
-    // keep the first `limit` after the cursor.
-    let mut unsorted = Smallest::new(limit);
-    self.for_each_unsorted_node(|node_id, listed| {
-      if after.is_none_or(|after| node_id > after) && unsorted.wants(node_id) && listed(node_id) {
-        unsorted.insert(node_id);
+    // The nodes the delta and the transaction created (or recreated), in ID
+    // order from the cursor on, each with the check `listed_nodes` makes
+    let mut from_delta = layers
+      .delta
+      .created_nodes
+      .keys_from(from)
+      .inspect(|_| examined_nodes(1))
+      .filter(|&node_id| layers.sees_delta(node_id, self.node_mvcc(node_id)));
+    let mut from_pending = layers
+      .pending
+      .into_iter()
+      .flat_map(|pending| pending.created_nodes.keys_from(from))
+      .inspect(|_| examined_nodes(1));
+
+    // The nodes deleted since the reader's snapshot, which only their version
+    // chains hold, in no order: keep the first `limit` after the cursor.
+    let mut from_history = Smallest::new(limit);
+    if let Some(vc) = self.history {
+      for node_id in vc.nodes_at(self.snapshot_ts, self.txid) {
+        examined_nodes(1);
+        if node_id >= from && from_history.wants(node_id) && !layers.pending_masks(node_id) {
+          from_history.insert(node_id);
+        }
       }
-    });
+    }
 
     // The snapshot's nodes, in ID order from the first after the cursor
     let mut from_snapshot = self
@@ -133,7 +154,13 @@ impl ReadView<'_> {
       .filter(|&node_id| layers.sees_snapshot(node_id, self.node_mvcc(node_id)));
 
     let mut nodes = Vec::with_capacity(limit.min(1024));
-    let _ = merge_sorted([&mut from_snapshot, &mut unsorted.into_iter()], |node_id| {
+    let sources: [&mut dyn Iterator<Item = NodeId>; 4] = [
+      &mut from_snapshot,
+      &mut from_delta,
+      &mut from_pending,
+      &mut from_history.into_iter(),
+    ];
+    let _ = merge_sorted(sources, |node_id| {
       nodes.push(node_id);
       if nodes.len() >= limit {
         ControlFlow::Break(())
@@ -152,15 +179,28 @@ impl ReadView<'_> {
     limit: usize,
     reads: &mut Vec<TxKey>,
   ) -> Vec<FullEdge> {
+    let layers = self.layers;
     let first_src = after.map_or(0, |(src, _, _)| src);
 
-    // Sources with out-edges outside the snapshot, in ID order
-    let mut unsorted = UnsortedSources {
+    // Sources with out-edges the delta or the transaction added, in ID order
+    // from the cursor's source on
+    let mut from_delta = layers
+      .delta
+      .out_add
+      .keys_from(first_src)
+      .inspect(|_| examined_nodes(1));
+    let mut from_pending = layers
+      .pending
+      .into_iter()
+      .flat_map(|pending| pending.out_add.keys_from(first_src))
+      .inspect(|_| examined_nodes(1));
+    // Sources of edges only version chains hold, in ID order
+    let mut from_history = HistorySources {
       view: self,
       from: Some(first_src),
       batch: limit.saturating_add(1),
       sorted: BTreeSet::new().into_iter(),
-      exhausted: false,
+      exhausted: self.history.is_none(),
     };
 
     // The snapshot's nodes, in ID order from the cursor's source
@@ -175,7 +215,13 @@ impl ReadView<'_> {
     });
 
     let mut edges = Vec::with_capacity(limit.min(1024));
-    let _ = merge_sorted([&mut from_snapshot, &mut unsorted], |src| {
+    let sources: [&mut dyn Iterator<Item = NodeId>; 4] = [
+      &mut from_snapshot,
+      &mut from_delta,
+      &mut from_pending,
+      &mut from_history,
+    ];
+    let _ = merge_sorted(sources, |src| {
       let start = after
         .filter(|&(after_src, _, _)| after_src == src)
         .map(|(_, etype, dst)| (etype, dst));
@@ -259,19 +305,39 @@ impl ReadView<'_> {
       }
     }
 
-    // Plus the edges `list_edges` lists from the delta and the transaction.
-    for (&src, patches) in &delta.out_add {
-      examined_edges(patches.len());
-      if !layers.sees_delta(src, None) {
+    // Plus the edges `list_edges` lists from the delta: every edge it added
+    // (it counts them), but those an endpoint's delete or recreate hides (in
+    // the delta or the transaction: the endpoint's own patches name them) and
+    // those the transaction deleted.
+    count += delta.out_add.patch_count();
+    let hides = |node_id| !layers.sees_delta(node_id, None);
+    let hidden: HashSet<NodeId> = layers_iter()
+      .flat_map(|layer| layer.deleted_nodes.iter())
+      .copied()
+      .filter(|&node_id| hides(node_id))
+      .collect();
+    for &node_id in &hidden {
+      if let Some(patches) = delta.out_add.get(&node_id) {
+        examined_edges(patches.len());
+        count -= patches.len();
+      }
+      // Edges into it from a source counted above are not counted again.
+      if let Some(patches) = delta.in_add.get(&node_id) {
+        examined_edges(patches.len());
+        count -= patches.iter().filter(|patch| !hides(patch.other)).count();
+      }
+    }
+    for (&src, tombstones) in pending.into_iter().flat_map(|p| p.out_del.iter()) {
+      examined_edges(tombstones.len());
+      if hides(src) {
         continue;
       }
-      count += patches
+      count -= tombstones
         .iter()
-        .filter(|patch| {
-          layers.sees_delta(patch.other, None) && !pending_deleted(src, patch.etype, patch.other)
-        })
+        .filter(|patch| !hides(patch.other) && delta.is_edge_added(src, patch.etype, patch.other))
         .count();
     }
+    // And the transaction's own added edges.
     for (&src, patches) in pending.into_iter().flat_map(|p| p.out_add.iter()) {
       examined_edges(patches.len());
       if !layers.sees_pending(src, None) {
@@ -332,20 +398,27 @@ impl ReadView<'_> {
         }
       }
     }
-    let mut added = HashSet::new();
+    // The nodes a layer's created or modified copy adds the label to: its
+    // label index names them (and maybe some more).
+    let names = |node: Option<&NodeDelta>| {
+      node
+        .and_then(|node| node.labels.as_ref())
+        .is_some_and(|labels| labels.contains(&label_id))
+    };
+    let mut added = Vec::new();
     for layer in std::iter::once(self.layers.delta).chain(self.layers.pending) {
-      for (&node_id, node) in layer.created_nodes.iter().chain(&layer.modified_nodes) {
+      for &node_id in layer.labeled_nodes.get(&label_id).into_iter().flatten() {
         examined_nodes(1);
-        if node
-          .labels
-          .as_ref()
-          .is_some_and(|labels| labels.contains(&label_id))
+        if (names(layer.created_nodes.get(&node_id)) || names(layer.modified_nodes.get(&node_id)))
           && !in_snapshot_labels(node_id)
         {
-          added.insert(node_id);
+          added.push(node_id);
         }
       }
     }
+    // Each once (an index may name a node twice, and both layers may name it).
+    added.sort_unstable();
+    added.dedup();
     for node_id in added {
       if self.node_has_label(node_id, label_id) {
         f(node_id);
@@ -402,7 +475,7 @@ impl ReadView<'_> {
         take(node_id, known);
       }
     }
-    let mut created = HashSet::new();
+    let mut created = Vec::new();
     for layer in std::iter::once(self.layers.delta).chain(self.layers.pending) {
       examined_nodes(layer.created_nodes.len());
       for (&node_id, node) in &layer.created_nodes {
@@ -412,10 +485,13 @@ impl ReadView<'_> {
           .is_some_and(|key| key.starts_with(prefix))
           && !snapshot_key_matches(node_id)
         {
-          created.insert(node_id);
+          created.push(node_id);
         }
       }
     }
+    // Each once (both layers may hold a node).
+    created.sort_unstable();
+    created.dedup();
     for node_id in created {
       take(node_id, None);
     }
@@ -468,11 +544,11 @@ impl<K: Ord + Copy> Smallest<K> {
   }
 }
 
-/// The sources with out-edges outside the snapshot (added in the delta or the
-/// transaction, or held by version chains), from `from` on in ID order. They
-/// come in hash order, so each `batch` of them takes a pass over all of them:
-/// one pass per page unless many of them have no edges left.
-struct UnsortedSources<'v> {
+/// The sources of edges that only version chains hold (deleted since the
+/// reader's snapshot), from `from` on in ID order. They come in hash order, so
+/// each `batch` of them takes a pass over all of them: one pass per page unless
+/// many of them have no edges left.
+struct HistorySources<'v> {
   view: &'v ReadView<'v>,
   /// The smallest source not yielded yet (`None`: past the largest ID)
   from: Option<NodeId>,
@@ -482,32 +558,25 @@ struct UnsortedSources<'v> {
   exhausted: bool,
 }
 
-impl UnsortedSources<'_> {
+impl HistorySources<'_> {
   fn next_batch(&mut self) {
-    let Some(from) = self.from else {
+    let (Some(from), Some(vc)) = (self.from, self.view.history) else {
       self.exhausted = true;
       return;
     };
-    let layers = self.view.layers;
     let mut batch = Smallest::new(self.batch);
-    let mut offer = |src: NodeId| {
+    for (src, _, _) in vc.edges_at(self.view.snapshot_ts, self.view.txid) {
+      examined_nodes(1);
       if src >= from && batch.wants(src) {
         batch.insert(src);
       }
-    };
-    for layer in std::iter::once(layers.delta).chain(layers.pending) {
-      layer.out_add.keys().copied().for_each(&mut offer);
-    }
-    if let Some(vc) = self.view.history {
-      vc.edges_at(self.view.snapshot_ts, self.view.txid)
-        .for_each(|(src, _, _)| offer(src));
     }
     self.exhausted = batch.len() < self.batch;
     self.sorted = batch.into_iter();
   }
 }
 
-impl Iterator for UnsortedSources<'_> {
+impl Iterator for HistorySources<'_> {
   type Item = NodeId;
 
   fn next(&mut self) -> Option<NodeId> {
@@ -695,10 +764,38 @@ impl SingleFileDB {
       let mvcc = mvcc_visible(node_id);
       from_elsewhere(node_id, mvcc) && !from_snapshot(node_id, mvcc)
     };
-    count += delta
-      .created_nodes
-      .keys()
-      .filter(|&&node_id| listed_elsewhere(node_id))
+    // A node the delta created is listed from it, and not from the snapshot,
+    // unless the snapshot holds it or the transaction or the chains name it:
+    // only those are checked, the created nodes up to the snapshot's largest
+    // ID (in order) and the named ones.
+    let snapshot_max = snapshot
+      .filter(|snap| snap.header.num_nodes > 0)
+      .map(|snap| {
+        snap
+          .node_id((snap.header.num_nodes - 1) as PhysNode)
+          .unwrap_or(NodeId::MAX)
+      });
+    let named = pending
+      .into_iter()
+      .flat_map(|p| p.deleted_nodes.iter().chain(p.created_nodes.keys()))
+      .chain(&chained)
+      .copied()
+      .filter(|node_id| delta.created_nodes.contains_key(node_id));
+    let checked: HashSet<NodeId> = snapshot_max
+      .into_iter()
+      .flat_map(|max| {
+        delta
+          .created_nodes
+          .keys_from(0)
+          .take_while(move |&node_id| node_id <= max)
+      })
+      .inspect(|_| examined_nodes(1))
+      .chain(named)
+      .collect();
+    count += delta.created_nodes.len() - checked.len();
+    count += checked
+      .into_iter()
+      .filter(|&node_id| listed_elsewhere(node_id))
       .count();
     let pending_only: HashSet<NodeId> = pending_created
       .copied()
@@ -995,3 +1092,7 @@ impl SingleFileDB {
 #[cfg(test)]
 #[path = "b4_query_core_tests.rs"]
 mod b4_query_core_tests;
+
+#[cfg(test)]
+#[path = "b4_read_paths_tests.rs"]
+mod b4_read_paths_tests;

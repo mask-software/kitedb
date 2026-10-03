@@ -96,15 +96,14 @@ impl NodeCursor {
     self.done
   }
 
-  /// The next nodes: at least `min` (fewer only at the end, none when done),
-  /// and as many as the nodes created since the last checkpoint, which every
-  /// read passes over once, so that part of the cost is paid once per that
-  /// many nodes.
-  pub fn next_chunk(&mut self, db: &SingleFileDB, min: usize) -> Vec<NodeId> {
+  /// The next `len` nodes (at least 1; fewer only at the end, none when
+  /// done). A read costs what it returns: it seeks into the snapshot and into
+  /// the changes since the last checkpoint.
+  pub fn next_chunk(&mut self, db: &SingleFileDB, len: usize) -> Vec<NodeId> {
     if self.done {
       return Vec::new();
     }
-    let len = min.max(1).max(db.stats().delta_nodes_created);
+    let len = len.max(1);
     let nodes = db.nodes_after(self.after, len);
     self.done = nodes.len() < len;
     self.after = nodes.last().copied().or(self.after);
@@ -130,14 +129,13 @@ impl EdgeCursor {
     self.done
   }
 
-  /// The next edges: at least `min` (fewer only at the end, none when done),
-  /// and as many as the edges added since the last checkpoint (see
-  /// [`NodeCursor::next_chunk`]).
-  pub fn next_chunk(&mut self, db: &SingleFileDB, min: usize) -> Vec<Edge> {
+  /// The next `len` edges (at least 1; fewer only at the end, none when
+  /// done; see [`NodeCursor::next_chunk`]).
+  pub fn next_chunk(&mut self, db: &SingleFileDB, len: usize) -> Vec<Edge> {
     if self.done {
       return Vec::new();
     }
-    let len = min.max(1).max(db.stats().delta_edges_added);
+    let len = len.max(1);
     let edges: Vec<Edge> = db
       .edges_after(self.after, len)
       .into_iter()

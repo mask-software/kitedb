@@ -45,9 +45,8 @@ fn batch_size(options: &streaming::StreamOptions) -> usize {
 /// `Database.stream_nodes_with_props`.
 ///
 /// It walks the nodes in ID order with a cursor (`streaming::NodeCursor`),
-/// reading ahead at most a batch or the nodes created since the last
-/// checkpoint, and builds each batch on demand (keys and properties
-/// included), so memory stays proportional to a batch. A node created past
+/// reading ahead at most a batch, and builds each batch on demand (keys and
+/// properties included), so memory stays proportional to a batch. A node created past
 /// the cursor during the stream is listed; one deleted before it is read is
 /// not, and the `with_props` stream skips one deleted after.
 #[pyclass(name = "NodeBatchIterator", module = "kitedb._kitedb")]

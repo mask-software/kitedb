@@ -427,6 +427,9 @@ pub struct DeltaState {
   // Key index delta
   pub key_index: DeltaMap<String, NodeId>,
 
+  // The nodes each label was added to (a superset, see `LabelIndex`)
+  pub labeled_nodes: crate::core::delta::LabelIndex,
+
   // Pending vector operations (keyed by (node_id, prop_key_id))
   // Some(vec) = set, None = delete
   pub pending_vectors: HashMap<(NodeId, PropKeyId), Option<VectorRef>>,

@@ -1156,13 +1156,24 @@ where
     let directions = step_directions(step);
     let etype = step_etype(step);
     let lazy = limit.is_some() && *steps_started == steps.len();
-    let read = |node_id, direction| {
-      if lazy {
-        StepEdges::Lazy(neighbors.edges(node_id, direction, etype))
-      } else {
-        StepEdges::All(neighbors.all_edges(node_id, direction, etype).into_iter())
-      }
-    };
+    let local_unique = matches!(step, TraversalStep::Traverse { options, .. } if options.unique);
+    // A node's edges read in whole: room in the visited sets for all of them, so a hub's
+    // neighbors grow the sets once, not a doubling at a time.
+    let unique_nodes = *unique_nodes;
+    let read =
+      |node_id, direction, visited: &mut FastSet<NodeId>, local_visited: &mut FastSet<NodeId>| {
+        if lazy {
+          return StepEdges::Lazy(neighbors.edges(node_id, direction, etype));
+        }
+        let edges = neighbors.all_edges(node_id, direction, etype);
+        if unique_nodes {
+          visited.reserve(edges.len());
+        }
+        if local_unique {
+          local_visited.reserve(edges.len());
+        }
+        StepEdges::All(edges.into_iter())
+      };
 
     loop {
       let expansion = match run.expanding.as_mut() {
@@ -1176,12 +1187,13 @@ where
               continue;
             }
           }
+          let edges = read(node_id, directions[0], visited, &mut run.local_visited);
           run.expanding.insert(Expansion {
             node_id,
             base_depth,
             hops,
             direction: 0,
-            edges: read(node_id, directions[0]),
+            edges,
           })
         }
       };
@@ -1190,7 +1202,12 @@ where
         expansion.direction += 1;
         match directions.get(expansion.direction) {
           Some(&direction) => {
-            expansion.edges = read(expansion.node_id, direction);
+            expansion.edges = read(
+              expansion.node_id,
+              direction,
+              visited,
+              &mut run.local_visited,
+            );
             continue;
           }
           None => {
@@ -1209,7 +1226,7 @@ where
           ..
         } => {
           let neighbor_id = neighbor_of(&edge, node_id, dir);
-          if *unique_nodes && visited.contains(&neighbor_id) {
+          if unique_nodes && visited.contains(&neighbor_id) {
             continue;
           }
           let raw_edge = RawEdge::from(edge);
@@ -1225,7 +1242,7 @@ where
           {
             continue;
           }
-          if *unique_nodes {
+          if unique_nodes {
             visited.insert(neighbor_id);
           }
           run.results.push_back(TraversalResult {
@@ -1265,7 +1282,7 @@ where
           if options.unique {
             run.local_visited.insert(neighbor_id);
           }
-          if *unique_nodes && !visited.insert(neighbor_id) {
+          if unique_nodes && !visited.insert(neighbor_id) {
             continue;
           }
 

@@ -247,16 +247,40 @@ fn compute_crc_with_options(
   )
 }
 
-/// Element `index` of a u32 array, or None past its end.
+/// Element `index` of a u32 array, or None past its end: one bounds check.
 #[inline]
 fn u32_at(data: &[u8], index: usize) -> Option<u32> {
-  (index < data.len() / 4).then(|| read_u32_at(data, index))
+  data
+    .as_chunks::<4>()
+    .0
+    .get(index)
+    .copied()
+    .map(u32::from_le_bytes)
 }
 
-/// Element `index` of a u64 array, or None past its end.
+/// Element `index` of a u64 array, or None past its end: one bounds check.
 #[inline]
 fn u64_at(data: &[u8], index: usize) -> Option<u64> {
-  (index < data.len() / 8).then(|| read_u64_at(data, index))
+  data
+    .as_chunks::<8>()
+    .0
+    .get(index)
+    .copied()
+    .map(u64::from_le_bytes)
+}
+
+/// Elements `start..end` of two u32 arrays side by side (a node's CSR run of
+/// edge types and endpoints), cut to what both hold.
+#[inline]
+fn u32_runs<'a>(
+  first: &'a [u8],
+  second: &'a [u8],
+  (start, end): (usize, usize),
+) -> (&'a [[u8; 4]], &'a [[u8; 4]]) {
+  let (first, second) = (first.as_chunks::<4>().0, second.as_chunks::<4>().0);
+  let end = end.min(first.len()).min(second.len());
+  let start = start.min(end);
+  (&first[start..end], &second[start..end])
 }
 
 /// `offsets[index]..offsets[index + 1]` from a u32 offset array, or None when
@@ -2098,22 +2122,21 @@ impl SnapshotData {
 
 /// Iterator over out-edges
 pub struct OutEdgeIter<'a> {
-  out_etype: &'a [u8],
-  out_dst: &'a [u8],
-  current: usize,
-  end: usize,
+  /// The node's run of OutEtype and OutDst
+  etypes: std::slice::Iter<'a, [u8; 4]>,
+  dsts: std::slice::Iter<'a, [u8; 4]>,
 }
 
 impl<'a> OutEdgeIter<'a> {
   fn new(snapshot: &'a SnapshotData, phys: PhysNode) -> Self {
-    let (current, end) = snapshot.out_edge_range(phys).unwrap_or((0, 0));
-    let out_etype = snapshot.bytes(SectionId::OutEtype);
-    let out_dst = snapshot.bytes(SectionId::OutDst);
+    let (etypes, dsts) = u32_runs(
+      snapshot.bytes(SectionId::OutEtype),
+      snapshot.bytes(SectionId::OutDst),
+      snapshot.out_edge_range(phys).unwrap_or((0, 0)),
+    );
     Self {
-      out_etype,
-      out_dst,
-      current,
-      end: end.min(out_etype.len() / 4).min(out_dst.len() / 4),
+      etypes: etypes.iter(),
+      dsts: dsts.iter(),
     }
   }
 }
@@ -2123,18 +2146,13 @@ impl<'a> Iterator for OutEdgeIter<'a> {
 
   #[inline]
   fn next(&mut self) -> Option<Self::Item> {
-    if self.current >= self.end {
-      return None;
-    }
-    let dst = read_u32_at(self.out_dst, self.current);
-    let etype = read_u32_at(self.out_etype, self.current);
-    self.current += 1;
+    let dst = u32::from_le_bytes(*self.dsts.next()?);
+    let etype = u32::from_le_bytes(*self.etypes.next()?);
     Some((dst, etype))
   }
 
   fn size_hint(&self) -> (usize, Option<usize>) {
-    let remaining = self.end.saturating_sub(self.current);
-    (remaining, Some(remaining))
+    self.dsts.size_hint()
   }
 }
 
@@ -2142,24 +2160,26 @@ impl<'a> ExactSizeIterator for OutEdgeIter<'a> {}
 
 /// Iterator over in-edges
 pub struct InEdgeIter<'a> {
-  in_etype: &'a [u8],
-  in_src: &'a [u8],
+  /// The node's run of InEtype and InSrc, and the index of its first edge
+  etypes: std::slice::Iter<'a, [u8; 4]>,
+  srcs: std::slice::Iter<'a, [u8; 4]>,
   in_out_index: &'a [u8],
   current: usize,
-  end: usize,
 }
 
 impl<'a> InEdgeIter<'a> {
   fn new(snapshot: &'a SnapshotData, phys: PhysNode) -> Self {
-    let (current, end) = snapshot.in_edge_range(phys).unwrap_or((0, 0));
-    let in_etype = snapshot.bytes(SectionId::InEtype);
-    let in_src = snapshot.bytes(SectionId::InSrc);
+    let range = snapshot.in_edge_range(phys).unwrap_or((0, 0));
+    let (etypes, srcs) = u32_runs(
+      snapshot.bytes(SectionId::InEtype),
+      snapshot.bytes(SectionId::InSrc),
+      range,
+    );
     Self {
-      in_etype,
-      in_src,
+      etypes: etypes.iter(),
+      srcs: srcs.iter(),
       in_out_index: snapshot.bytes(SectionId::InOutIndex),
-      current,
-      end: end.min(in_etype.len() / 4).min(in_src.len() / 4),
+      current: range.0,
     }
   }
 }
@@ -2169,19 +2189,15 @@ impl<'a> Iterator for InEdgeIter<'a> {
 
   #[inline]
   fn next(&mut self) -> Option<Self::Item> {
-    if self.current >= self.end {
-      return None;
-    }
-    let src = read_u32_at(self.in_src, self.current);
-    let etype = read_u32_at(self.in_etype, self.current);
+    let src = u32::from_le_bytes(*self.srcs.next()?);
+    let etype = u32::from_le_bytes(*self.etypes.next()?);
     let out_index = u32_at(self.in_out_index, self.current).unwrap_or(0);
     self.current += 1;
     Some((src, etype, out_index))
   }
 
   fn size_hint(&self) -> (usize, Option<usize>) {
-    let remaining = self.end.saturating_sub(self.current);
-    (remaining, Some(remaining))
+    self.srcs.size_hint()
   }
 }
 
@@ -2193,11 +2209,11 @@ impl<'a> ExactSizeIterator for InEdgeIter<'a> {}
 /// default holds no edges.
 #[derive(Default)]
 pub struct EdgeKeyIter<'a> {
-  etypes: &'a [u8],
-  others: &'a [u8],
-  node_ids: &'a [u8],
-  current: usize,
-  end: usize,
+  /// The remaining run of edge types and other endpoints' physical indexes
+  etypes: &'a [[u8; 4]],
+  others: &'a [[u8; 4]],
+  /// PhysToNodeId
+  node_ids: &'a [[u8; 8]],
 }
 
 impl<'a> EdgeKeyIter<'a> {
@@ -2207,22 +2223,22 @@ impl<'a> EdgeKeyIter<'a> {
     etypes: SectionId,
     others: SectionId,
   ) -> Self {
-    let (current, end) = range.unwrap_or((0, 0));
-    let etypes = snapshot.bytes(etypes);
-    let others = snapshot.bytes(others);
+    let (etypes, others) = u32_runs(
+      snapshot.bytes(etypes),
+      snapshot.bytes(others),
+      range.unwrap_or((0, 0)),
+    );
     Self {
       etypes,
       others,
-      node_ids: snapshot.bytes(SectionId::PhysToNodeId),
-      current,
-      end: end.min(etypes.len() / 4).min(others.len() / 4),
+      node_ids: snapshot.bytes(SectionId::PhysToNodeId).as_chunks::<8>().0,
     }
   }
 
   fn key(&self, index: usize) -> (ETypeId, PhysNode) {
     (
-      read_u32_at(self.etypes, index),
-      read_u32_at(self.others, index),
+      u32::from_le_bytes(self.etypes[index]),
+      u32::from_le_bytes(self.others[index]),
     )
   }
 
@@ -2230,20 +2246,85 @@ impl<'a> EdgeKeyIter<'a> {
   /// endpoint given as a physical index (see [`SnapshotData::phys_after`]): a
   /// binary search.
   pub fn seek(&mut self, from: (ETypeId, PhysNode)) {
-    let start = self.current;
-    self.current = start
-      + partition_point(self.end.saturating_sub(start), |offset| {
-        self.key(start + offset) < from
-      });
+    let skip = partition_point(self.etypes.len(), |index| self.key(index) < from);
+    self.etypes = &self.etypes[skip..];
+    self.others = &self.others[skip..];
   }
 
   /// Stop after the edges of type `etype`: a binary search.
   pub fn end_after_etype(&mut self, etype: ETypeId) {
-    let start = self.current;
-    self.end = start
-      + partition_point(self.end.saturating_sub(start), |offset| {
-        read_u32_at(self.etypes, start + offset) <= etype
+    let keep = partition_point(self.etypes.len(), |index| {
+      u32::from_le_bytes(self.etypes[index]) <= etype
+    });
+    self.etypes = &self.etypes[..keep];
+    self.others = &self.others[..keep];
+  }
+
+  /// The number of edges left (some of which `next` may skip: those whose
+  /// endpoint is past PhysToNodeId).
+  pub fn remaining(&self) -> usize {
+    self.etypes.len()
+  }
+
+  /// Append the remaining keys to `out` in order, as `item` maps them, each key
+  /// once (a snapshot may hold an edge twice), until `out` holds `limit` items:
+  /// one pass over the snapshot's arrays, with room made first.
+  pub fn append_keys<T>(
+    &mut self,
+    out: &mut Vec<T>,
+    limit: usize,
+    item: impl Fn(ETypeId, NodeId) -> T,
+  ) {
+    let room = limit.saturating_sub(out.len());
+    // With room for every key, no count to check.
+    let bounded = room < self.etypes.len();
+    out.reserve(room.min(self.etypes.len()));
+    let node_ids = self.node_ids;
+    let mut last = None;
+    let mut visited = 0;
+    for (etype, other) in self.etypes.iter().zip(self.others) {
+      if bounded && out.len() >= limit {
+        break;
+      }
+      visited += 1;
+      if last == Some((*etype, *other)) {
+        continue;
+      }
+      last = Some((*etype, *other));
+      if let Some(node_id) = node_ids.get(u32::from_le_bytes(*other) as usize) {
+        out.push(item(
+          u32::from_le_bytes(*etype),
+          u64::from_le_bytes(*node_id),
+        ));
+      }
+    }
+    self.etypes = &self.etypes[visited..];
+    self.others = &self.others[visited..];
+  }
+
+  /// Visit the remaining keys in order until `f` breaks, in one pass over the
+  /// snapshot's arrays: what reads that take many edges use instead of `next`.
+  #[inline]
+  pub fn try_for_each_key(
+    &mut self,
+    mut f: impl FnMut(ETypeId, NodeId) -> std::ops::ControlFlow<()>,
+  ) -> std::ops::ControlFlow<()> {
+    let node_ids = self.node_ids;
+    let mut visited = 0;
+    let result = self
+      .etypes
+      .iter()
+      .zip(self.others)
+      .try_for_each(|(etype, other)| {
+        visited += 1;
+        match node_ids.get(u32::from_le_bytes(*other) as usize) {
+          Some(node_id) => f(u32::from_le_bytes(*etype), u64::from_le_bytes(*node_id)),
+          None => std::ops::ControlFlow::Continue(()),
+        }
       });
+    self.etypes = &self.etypes[visited..];
+    self.others = &self.others[visited..];
+    result
   }
 }
 
@@ -2253,18 +2334,20 @@ impl Iterator for EdgeKeyIter<'_> {
 
   #[inline]
   fn next(&mut self) -> Option<Self::Item> {
-    while self.current < self.end {
-      let (etype, other) = self.key(self.current);
-      self.current += 1;
-      if let Some(node_id) = u64_at(self.node_ids, other as usize) {
-        return Some((etype, node_id));
+    while let (Some((etype, etypes)), Some((other, others))) =
+      (self.etypes.split_first(), self.others.split_first())
+    {
+      self.etypes = etypes;
+      self.others = others;
+      if let Some(node_id) = self.node_ids.get(u32::from_le_bytes(*other) as usize) {
+        return Some((u32::from_le_bytes(*etype), u64::from_le_bytes(*node_id)));
       }
     }
     None
   }
 
   fn size_hint(&self) -> (usize, Option<usize>) {
-    (0, Some(self.end.saturating_sub(self.current)))
+    (0, Some(self.etypes.len()))
   }
 }
 

@@ -8,7 +8,9 @@
 //! The randomized tests check that the paging, type listing and traversal paths return
 //! exactly what the full listings say, with MVCC off and on, inside transactions with pending
 //! changes, for an MVCC reader that sees version history, with deletes and recreates, and
-//! after a checkpoint and a reopen.
+//! after a checkpoint and a reopen; also over deltas large enough for their node maps to
+//! take dense parts and keep their sparse ids in order (the `read-paths` lane's ordered
+//! delta reads), and over snapshot hubs that no layer changes (its snapshot fast paths).
 use crate::api::kite::{EdgeDef, Kite, KiteOptions, NodeDef};
 use crate::api::traversal::{DbNeighbors, NeighborSource, TraversalDirection, TraverseOptions};
 use crate::core::single_file::read::{EDGES_EXAMINED, NODES_EXAMINED, NODE_LOOKUPS};
@@ -679,6 +681,22 @@ fn expected_neighbors(
   }
 }
 
+/// The nodes per-node checks read: all of `nodes`, or in large states the first and last
+/// (hubs of the large states) and `SAMPLED_NODES` random ones.
+fn sampled(nodes: &[NodeId], rng: &mut StdRng) -> Vec<NodeId> {
+  const SAMPLED_NODES: usize = 300;
+  if nodes.len() <= SAMPLED_NODES {
+    return nodes.to_vec();
+  }
+  let mut picked: Vec<NodeId> = (0..SAMPLED_NODES)
+    .map(|_| nodes[rng.gen_range(0..nodes.len())])
+    .chain([nodes[0], nodes[nodes.len() - 1]])
+    .collect();
+  picked.sort_unstable();
+  picked.dedup();
+  picked
+}
+
 /// Neighbor lists and `take(n)` traversals against the full lists.
 fn check_traversals(kite: &Kite, ids: &Ids, rng: &mut StdRng, at: &str) {
   let db = kite.raw();
@@ -691,7 +709,7 @@ fn check_traversals(kite: &Kite, ids: &Ids, rng: &mut StdRng, at: &str) {
     TraversalDirection::In,
     TraversalDirection::Both,
   ];
-  for &node_id in &nodes {
+  for node_id in sampled(&nodes, rng) {
     for direction in directions {
       for etype in [None, Some(ids.etypes[0]), Some(ids.etypes[1])] {
         let expected = expected_neighbors(db, node_id, direction, etype);
@@ -793,10 +811,36 @@ fn check_listings(db: &SingleFileDB, ids: &Ids, rng: &mut StdRng, at: &str) {
   }
   assert_eq!(db.count_edges(), edges.len(), "{at}: count_edges");
 
-  // out_edges_after / in_edges_after, from every node (and a missing one)
-  for node_id in nodes.iter().copied().chain([max_id + 1]) {
+  // out_edges / in_edges against `list_edges` (a separate walk), and out_edges_after /
+  // in_edges_after against them, from every node (and a missing one)
+  let mut listed_out: HashMap<NodeId, Vec<(ETypeId, NodeId)>> = HashMap::new();
+  let mut listed_in: HashMap<NodeId, Vec<(ETypeId, NodeId)>> = HashMap::new();
+  for &(src, etype, dst) in &edges {
+    listed_out.entry(src).or_default().push((etype, dst));
+    listed_in.entry(dst).or_default().push((etype, src));
+  }
+  for list in listed_in.values_mut() {
+    list.sort_unstable();
+  }
+  for node_id in sampled(&nodes, rng).into_iter().chain([max_id + 1]) {
     let out = db.out_edges(node_id);
     let incoming = db.in_edges(node_id);
+    let degrees = (db.out_degree(node_id), db.in_degree(node_id));
+    assert_eq!(
+      out,
+      listed_out.get(&node_id).cloned().unwrap_or_default(),
+      "{at}: out_edges({node_id}) against list_edges"
+    );
+    assert_eq!(
+      incoming,
+      listed_in.get(&node_id).cloned().unwrap_or_default(),
+      "{at}: in_edges({node_id}) against list_edges"
+    );
+    assert_eq!(
+      degrees,
+      (out.len(), incoming.len()),
+      "{at}: degrees of {node_id}"
+    );
     for (all, slice) in [
       (
         &out,
@@ -966,6 +1010,211 @@ fn run_random_states(path: &Path, mvcc: bool, dense: bool, seed: u64) {
   kite.close().expect("close");
 }
 
+/// `count` nodes created in batches with random keys (any prefix, none, or unkeyed) and
+/// labels, each with `edges` out-edges to random nodes (the new ones, or any of `targets`).
+fn create_batch(
+  db: &SingleFileDB,
+  ids: &Ids,
+  rng: &mut StdRng,
+  seq: &mut usize,
+  count: usize,
+  edges: usize,
+  targets: &[NodeId],
+) -> Vec<NodeId> {
+  let keys: Vec<Option<String>> = (0..count)
+    .map(|_| {
+      *seq += 1;
+      random_key(rng, *seq)
+    })
+    .collect();
+  let keys: Vec<Option<&str>> = keys.iter().map(Option::as_deref).collect();
+  let created = db.create_nodes_batch(&keys).expect("nodes");
+  let targets: Vec<NodeId> = targets
+    .iter()
+    .copied()
+    .filter(|&node| db.node_exists(node))
+    .collect();
+  for &node in &created {
+    add_random_labels(db, ids, rng, node);
+  }
+  let mut batch = Vec::with_capacity(count * edges);
+  for &src in &created {
+    for _ in 0..edges {
+      let dst = if targets.is_empty() || rng.gen_bool(0.5) {
+        created[rng.gen_range(0..created.len())]
+      } else {
+        targets[rng.gen_range(0..targets.len())]
+      };
+      batch.push((src, ids.etypes[rng.gen_range(0..ids.etypes.len())], dst));
+    }
+  }
+  db.add_edges_batch(&batch).expect("edges");
+  created
+}
+
+/// Deletes of `count` random nodes of `pool`, then recreates of some of those ids, then a run
+/// of 64 aligned new ids (a whole chunk of a dense part, freed) and tombstones of random
+/// edges, in the calling thread's open write transaction.
+fn churn(
+  db: &SingleFileDB,
+  ids: &Ids,
+  rng: &mut StdRng,
+  seq: &mut usize,
+  pool: &[NodeId],
+  count: usize,
+) {
+  let mut deleted = Vec::new();
+  for _ in 0..count {
+    let node = pool[rng.gen_range(0..pool.len())];
+    if db.node_exists(node) {
+      db.delete_node(node).expect("delete");
+      deleted.push(node);
+    }
+  }
+  for &node in &deleted {
+    if rng.gen_bool(0.4) {
+      continue;
+    }
+    *seq += 1;
+    let key = random_key(rng, *seq);
+    db.create_node_with_id(node, key.as_deref())
+      .expect("recreate");
+    add_random_labels(db, ids, rng, node);
+    let dst = pool[rng.gen_range(0..pool.len())];
+    if db.node_exists(dst) {
+      db.add_edge(node, ids.etypes[0], dst).expect("edge");
+    }
+  }
+  let nodes = db.list_nodes();
+  for _ in 0..count {
+    let src = nodes[rng.gen_range(0..nodes.len())];
+    let out = db.out_edges(src);
+    if !out.is_empty() {
+      let (etype, dst) = out[rng.gen_range(0..out.len())];
+      db.delete_edge(src, etype, dst).expect("delete edge");
+    }
+  }
+}
+
+/// Delete the 64 nodes of an aligned run of ids in `created` (a dense part's chunk).
+fn free_a_chunk(db: &SingleFileDB, created: &[NodeId]) {
+  let Some(start) = created.iter().position(|&id| id % 64 == 0) else {
+    return;
+  };
+  for &node in created[start..]
+    .iter()
+    .take_while(|&&id| id < created[start] + 64)
+  {
+    if db.node_exists(node) {
+      db.delete_node(node).expect("delete");
+    }
+  }
+}
+
+/// The checks over deltas large enough for their node maps to take dense parts (more than
+/// 1024 created nodes and sources) beside sparse ids kept in order (recreated ids far below
+/// the new ones), with freed chunks; inside a transaction that creates as many; for an MVCC
+/// reader with history; after a reopen that replays them; and over a snapshot hub (the
+/// first node) that no layer changes, then one that deletes nodes elsewhere.
+fn run_large_delta_states(path: &Path, mvcc: bool, seed: u64) {
+  let mut rng = StdRng::seed_from_u64(seed ^ 0x1a26e);
+  let mut seq = 0;
+  let mode = if mvcc { "mvcc large" } else { "no mvcc large" };
+  let kite = Kite::open(path, random_kite_options(mvcc)).expect("open");
+  let ids = ids(&kite, true);
+  let db = kite.raw();
+
+  // The snapshot: a hub (the first node) with edges to 3000 of 6000 nodes.
+  db.begin(false).expect("begin");
+  let base = create_batch(db, &ids, &mut rng, &mut seq, 6000, 1, &[]);
+  let hub_edges: Vec<_> = base[1..]
+    .iter()
+    .step_by(2)
+    .map(|&dst| (base[0], ids.etypes[rng.gen_range(0..2)], dst))
+    .collect();
+  db.add_edges_batch(&hub_edges).expect("hub edges");
+  db.commit().expect("commit");
+  db.checkpoint().expect("checkpoint");
+
+  // A large delta with no deletes: the hub's edges stay the snapshot's alone.
+  let targets: Vec<NodeId> = base[1..].to_vec();
+  let mut created = Vec::new();
+  for _ in 0..2 {
+    db.begin(false).expect("begin");
+    created.extend(create_batch(db, &ids, &mut rng, &mut seq, 900, 2, &targets));
+    db.commit().expect("commit");
+  }
+  check_all(&kite, &ids, &mut rng, &format!("{mode} seed {seed} grown"));
+
+  // Deletes and recreates of snapshot ids (sparse below the new ones), a freed chunk,
+  // tombstones, and the hub's own patches.
+  db.begin(false).expect("begin");
+  churn(db, &ids, &mut rng, &mut seq, &base[..3000], 150);
+  free_a_chunk(db, &created);
+  db.add_edge(base[0], ids.etypes[1], created[5])
+    .expect("hub patch");
+  db.commit().expect("commit");
+  commit_random(&kite, &ids, &mut rng, &mut seq, 30);
+  check_all(
+    &kite,
+    &ids,
+    &mut rng,
+    &format!("{mode} seed {seed} churned"),
+  );
+
+  // Inside a write transaction that creates, deletes and recreates as much.
+  db.begin(false).expect("begin");
+  let pending = create_batch(db, &ids, &mut rng, &mut seq, 1100, 2, &created);
+  churn(db, &ids, &mut rng, &mut seq, &created, 60);
+  free_a_chunk(db, &pending);
+  check_all(
+    &kite,
+    &ids,
+    &mut rng,
+    &format!("{mode} seed {seed} large pending"),
+  );
+  db.rollback().expect("rollback");
+
+  // A reader that began before more large commits (with MVCC, it reads version history).
+  if mvcc {
+    let at = format!("{mode} seed {seed} reader");
+    let mut reader_rng = StdRng::seed_from_u64(seed ^ 0xbeef);
+    let (began_tx, began_rx) = mpsc::channel();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    std::thread::scope(|scope| {
+      let kite = &kite;
+      let ids = &ids;
+      let at = &at;
+      let reader = scope.spawn(move || {
+        kite.raw().begin(true).expect("begin reader");
+        began_tx.send(()).expect("began");
+        go_rx.recv().expect("go");
+        check_all(kite, ids, &mut reader_rng, at);
+        kite.raw().rollback().expect("rollback reader");
+      });
+      began_rx.recv().expect("reader began");
+      db.begin(false).expect("begin");
+      let more = create_batch(db, ids, &mut rng, &mut seq, 600, 2, &created);
+      churn(db, ids, &mut rng, &mut seq, &created, 40);
+      free_a_chunk(db, &more);
+      db.commit().expect("commit");
+      go_tx.send(()).expect("go");
+      reader.join().expect("reader");
+    });
+  }
+
+  // Reopened: the delta replayed from the WAL.
+  kite.close().expect("close");
+  let kite = Kite::open(path, random_kite_options(mvcc)).expect("reopen");
+  check_all(
+    &kite,
+    &ids,
+    &mut rng,
+    &format!("{mode} seed {seed} reopened"),
+  );
+  kite.close().expect("close");
+}
+
 #[test]
 fn query_core_reads_match_full_listings_randomized() {
   for mvcc in [false, true] {
@@ -974,6 +1223,10 @@ fn query_core_reads_match_full_listings_randomized() {
         let dir = tempdir().expect("temp dir");
         run_random_states(&dir.path().join("db.kitedb"), mvcc, dense, seed);
       }
+    }
+    for seed in 0..2u64 {
+      let dir = tempdir().expect("temp dir");
+      run_large_delta_states(&dir.path().join("db.kitedb"), mvcc, seed);
     }
   }
 }
