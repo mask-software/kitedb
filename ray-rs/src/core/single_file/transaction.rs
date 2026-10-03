@@ -229,8 +229,9 @@ const COPIED_RECORDS_MAX: usize = 64 * 1024;
 const MAX_GROUP_COMMITS: usize = 256;
 
 /// How long after its first group a leader goes on writing the groups that
-/// queue meanwhile (see `SingleFileDB::lead_commits`). Its own transaction
-/// has its outcome after the first group; its caller waits out the span.
+/// queue meanwhile (see `SingleFileDB::lead_commits`), unless groups sync
+/// (`SyncMode::Full`). Its own transaction has its outcome after the first
+/// group; its caller waits out the span.
 const LEAD_SPAN: std::time::Duration = std::time::Duration::from_micros(50);
 
 /// The commit queue: commits wait here for the leader to write them.
@@ -1846,9 +1847,11 @@ impl SingleFileDB {
   /// group, and so on. The thread that wrote a group thus writes the next
   /// one with the file, the WAL buffers and the commit structures in its
   /// core's caches; a group written from another core costs about three
-  /// times as much (see `b4_write_costs_tests`). Once the span is over, the
-  /// lead passes on as soon as a group is durable, so the next group is
-  /// written while that one publishes. Returns this committer's outcome.
+  /// times as much (see `b4_write_costs_tests`). Once the span is over, and
+  /// in `SyncMode::Full` from the first group on (a group's sync outweighs
+  /// the cold core), the lead passes on as soon as a group is durable, so
+  /// the next group is written while that one publishes. Returns this
+  /// committer's outcome.
   fn lead_commits(
     &self,
     own_request: Option<Box<CommitRequest>>,
@@ -1859,7 +1862,9 @@ impl SingleFileDB {
       db: self,
       group: std::mem::take(&mut scratch.group),
       released: false,
-      keep_lead: true,
+      // In Full mode a group's sync outweighs a cold core: the lead passes
+      // on before each publish, so the next group syncs meanwhile.
+      keep_lead: self.sync_mode != SyncMode::Full,
     };
     before_commit_lock_test_hook();
     let mut queue = std::mem::take(&mut scratch.queue);

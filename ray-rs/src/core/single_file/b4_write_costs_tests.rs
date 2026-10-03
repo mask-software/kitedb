@@ -54,9 +54,35 @@ fn commit_node(db: &SingleFileDB, key: &str) -> Result<u64> {
 /// their committers, whose core would write the file cold.
 #[test]
 fn b4_wc_leader_writes_the_commits_queued_while_it_wrote() {
+  let (led_by_leader, led_by_followers) = groups_led(options());
+  assert_eq!(
+    led_by_followers,
+    vec![0; led_by_followers.len()],
+    "a follower led the group queued while the leader wrote (the leader led {led_by_leader})"
+  );
+  assert_eq!(led_by_leader, 2, "the leader wrote both groups");
+}
+
+/// In `SyncMode::Full` a group's sync outweighs a cold core: the leader
+/// passes the lead on before it publishes, so the next group syncs
+/// meanwhile.
+#[test]
+fn b4_wc_full_mode_leader_passes_the_lead_before_its_publish() {
+  let (led_by_leader, led_by_followers) = groups_led(options().sync_mode(SyncMode::Full));
+  assert_eq!(led_by_leader, 1, "the leader wrote only its own group");
+  assert_eq!(
+    led_by_followers.iter().sum::<u64>(),
+    1,
+    "one follower led the group queued while the leader wrote ({led_by_followers:?})"
+  );
+}
+
+/// A leader writes its commit alone while 3 followers queue theirs; returns
+/// the groups the leader led and those each follower led.
+fn groups_led(options: SingleFileOpenOptions) -> (u64, Vec<u64>) {
   const FOLLOWERS: usize = 3;
   let dir = tempdir().expect("tempdir");
-  let db = Arc::new(open_single_file(dir.path().join("lead.kitedb"), options()).expect("open"));
+  let db = Arc::new(open_single_file(dir.path().join("lead.kitedb"), options).expect("open"));
   let (writing_tx, writing_rx) = mpsc::channel();
   let leader = {
     let db = Arc::clone(&db);
@@ -92,12 +118,7 @@ fn b4_wc_leader_writes_the_commits_queued_while_it_wrote() {
   {
     assert!(db.node_by_key(&key).is_some(), "{key} is not visible");
   }
-  assert_eq!(
-    led_by_followers,
-    vec![0; FOLLOWERS],
-    "a follower led the group queued while the leader wrote (the leader led {led_by_leader})"
-  );
-  assert_eq!(led_by_leader, 2, "the leader wrote both groups");
+  (led_by_leader, led_by_followers)
 }
 
 /// An MVCC transaction begins, and a read-only or rolled-back one ends,
