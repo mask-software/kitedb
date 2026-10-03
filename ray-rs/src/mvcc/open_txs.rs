@@ -147,7 +147,10 @@ impl OpenTransactions {
         // A reader that sees the id before the snapshot reads the slot's
         // last snapshot, an older one: it then keeps more, never less.
         self.slots[index].start_ts.store(start_ts, Ordering::SeqCst);
-        self.used.fetch_max(index + 1, Ordering::SeqCst);
+        // Read first: the line is shared, and the slot is mostly in use already.
+        if self.used.load(Ordering::SeqCst) <= index {
+          self.used.fetch_max(index + 1, Ordering::SeqCst);
+        }
         if index != hint {
           self.remember(index as u32);
         }
