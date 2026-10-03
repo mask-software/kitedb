@@ -1135,7 +1135,6 @@ fn open_single_file_internal(
     next_propkey_id: AtomicU32::new(next_propkey_id),
     next_tx_id: AtomicU64::new(next_tx_id),
     tx_shared: std::sync::Arc::new(super::tx_registry::TxShared::default()),
-    active_writers: AtomicUsize::new(0),
     active_transactions: AtomicUsize::new(0),
     open_write_txids: Mutex::new(HashSet::new()),
     checkpoint_gate: RwLock::new(()),

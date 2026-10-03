@@ -169,6 +169,9 @@ pub(crate) struct CommitRequest {
   history: Option<HistoryPlan>,
   /// The MVCC commit timestamp its conflict check staged it at.
   commit_ts: Option<Timestamp>,
+  /// Where its transaction is registered among the open MVCC transactions,
+  /// and its snapshot, for its conflict check (`TxManager::enter_commit`).
+  mvcc_open: Option<(crate::mvcc::OpenSlot, Timestamp)>,
   /// Its data records, for the replication sidecar (empty without one).
   pending_wal: Vec<u8>,
   staged_schema: SchemaStaging,
@@ -733,14 +736,17 @@ fn check_and_stage_in_mvcc(
   request: &mut CommitRequest,
 ) -> Result<()> {
   let txid = request.txid;
-  if tx_mgr.tx(txid).is_none() {
+  let Some((slot, start_ts)) = request.mvcc_open else {
     return Err(KiteError::Internal(format!(
       "transaction {txid} is not active in MVCC"
     )));
-  }
-  if let Some(keys) = request.mvcc_keys.take() {
-    tx_mgr.record_reads_and_writes(txid, keys.reads, keys.writes, keys.groups);
-  }
+  };
+  let keys = request.mvcc_keys.take().unwrap_or_else(|| MvccKeys {
+    reads: TxKeySet::new(),
+    writes: TxKeySet::new(),
+    groups: None,
+  });
+  tx_mgr.enter_commit(txid, start_ts, slot, keys.reads, keys.writes, keys.groups);
   if let Err(err) = mvcc.conflict_detector.validate_commit(tx_mgr, txid) {
     tx_mgr.abort_tx(txid);
     let mut keys = err.conflicting_keys;
@@ -831,13 +837,20 @@ impl Drop for ActiveTransactionGuard<'_> {
 struct MvccAbortGuard<'db> {
   db: &'db SingleFileDB,
   txid: TxId,
+  /// Where it is registered among the open transactions.
+  slot: Option<crate::mvcc::OpenSlot>,
   armed: bool,
 }
 
 impl Drop for MvccAbortGuard<'_> {
   fn drop(&mut self) {
     if let (true, Some(mvcc)) = (self.armed, self.db.mvcc.as_ref()) {
+      // It has a record if its conflict check ran (`enter_commit`); either
+      // way it leaves the open transactions (once).
       mvcc.tx_manager.lock().abort_tx(self.txid);
+      if let Some(slot) = self.slot {
+        mvcc.open.unregister(slot, self.txid);
+      }
     }
   }
 }
@@ -996,6 +1009,7 @@ impl SingleFileDB {
     // together, a bulk load or a write transaction without MVCC alone. Taken
     // before the checkpoint gate, holding nothing; a failed begin releases
     // it.
+    let slot_mark = prof::start();
     let writer_claim = (!read_only).then(|| {
       let mode = if bulk_load || self.mvcc.is_none() {
         WriterMode::Exclusive
@@ -1009,8 +1023,12 @@ impl SingleFileDB {
     // registration makes the gate atomic with transaction creation. No WAL
     // record is written here: a write transaction's BEGIN record goes with
     // its other records (see `SingleFileTxState::wal_deferred_from`).
+    prof::end(Stage::BeginWriterSlot, slot_mark);
+    let gate_mark = prof::start();
     let _checkpoint_gate = self.checkpoint_gate.read();
-    let (txid, snapshot_ts) = if let Some(mvcc) = self.mvcc.as_ref() {
+    prof::end(Stage::BeginGate, gate_mark);
+    let txid = self.alloc_tx_id();
+    let (snapshot_ts, mvcc_slot) = if let Some(mvcc) = self.mvcc.as_ref() {
       // A commit group takes its members' timestamps, adds their version
       // chains and merges them into the delta in one publish section (see
       // `publish_commits`), so this snapshot holds each entirely or not at
@@ -1018,8 +1036,10 @@ impl SingleFileDB {
       // transaction as a reader that needs version chains. A begin does not
       // complete inside such a section: it waits for the section, and
       // begins again if one started meanwhile (`publish_seq` is odd during
-      // one). Outside them it takes no delta lock.
-      let (txid, snapshot_ts) = loop {
+      // one). It registers without any lock (see `OpenTransactions`), and
+      // outside sections takes no delta lock.
+      let open = &mvcc.open;
+      loop {
         let seq = self.publish_seq.load(Ordering::SeqCst);
         if seq % 2 == 1 {
           let wait_mark = prof::start();
@@ -1027,25 +1047,23 @@ impl SingleFileDB {
           prof::end(Stage::BeginPublishWait, wait_mark);
           continue;
         }
-        let begun = lock_tx_manager(mvcc).begin_tx();
+        let register_mark = prof::start();
+        let snapshot_ts = open.snapshot_ts();
+        let slot = open.register(txid, snapshot_ts);
+        prof::end(Stage::BeginRegister, register_mark);
         if self.publish_seq.load(Ordering::SeqCst) == seq {
-          break begun;
+          break (snapshot_ts, Some(slot));
         }
-        mvcc.tx_manager.lock().abort_tx(begun.0);
-      };
-      // Only ever raise it: a concurrent begin that took a later txid may
-      // have stored already, and the header persists this value, so a lower
-      // one would issue a used txid again after reopen.
-      self
-        .next_tx_id
-        .fetch_max(txid.saturating_add(1), Ordering::SeqCst);
-      (txid, snapshot_ts)
+        open.unregister(slot, txid);
+      }
     } else {
-      (self.alloc_tx_id(), 0)
+      (0, None)
     };
 
+    let rest_mark = prof::start();
     let mut tx_state = SingleFileTxState::new(txid, read_only, snapshot_ts, bulk_load);
     tx_state.writer = writer_claim.as_ref().map(|claim| claim.mode());
+    tx_state.mvcc_slot = mvcc_slot;
     // An MVCC write transaction notes what it reads and writes in key sets
     // its thread's earlier commits got back (`CommitRequest::released_keys`).
     let key_sets = self.mvcc.is_some() && tx_state.tracks_reads();
@@ -1089,7 +1107,7 @@ impl SingleFileDB {
     }
     self.active_transactions.fetch_add(1, Ordering::Release);
     if !read_only {
-      self.active_writers.fetch_add(1, Ordering::SeqCst);
+      prof::end(Stage::BeginRest, rest_mark);
       prof::end(Stage::Begin, begin_mark);
     }
     Ok(txid)
@@ -1631,6 +1649,7 @@ impl SingleFileDB {
       deferred,
       wal_begun,
       mvcc_keys,
+      mvcc_open,
     ) = {
       let mut tx = tx_handle.lock();
       let pending = std::mem::take(&mut tx.pending);
@@ -1671,6 +1690,7 @@ impl SingleFileDB {
         tx.wal_deferred_from,
         tx.wal_begun,
         mvcc_keys,
+        tx.mvcc_slot.take().map(|slot| (slot, tx.snapshot_ts)),
       )
     };
     // Dropped last: the transaction counts as active (blocking checkpoints
@@ -1685,20 +1705,18 @@ impl SingleFileDB {
     let mut schema_reservation_guard = SchemaReservationGuard::new(self, txid);
 
     if read_only {
-      // Read-only transactions don't need WAL
-      if let Some(mvcc) = self.mvcc.as_ref() {
-        let mut tx_mgr = mvcc.tx_manager.lock();
-        tx_mgr.abort_tx(txid);
+      // Read-only transactions don't need WAL, and leave MVCC without a lock.
+      if let (Some(mvcc), Some((slot, _))) = (self.mvcc.as_ref(), mvcc_open) {
+        mvcc.open.unregister(slot, txid);
       }
       return Ok(None);
     }
-    let prev_writers = self.active_writers.fetch_sub(1, Ordering::SeqCst);
-    debug_assert!(prev_writers > 0, "active_writers underflow in commit");
     // Until the commit is durable (MVCC commits it there), every failure
     // aborts it in MVCC.
     let mut mvcc_abort = MvccAbortGuard {
       db: self,
       txid,
+      slot: mvcc_open.map(|(slot, _)| slot),
       armed: true,
     };
 
@@ -1739,6 +1757,7 @@ impl SingleFileDB {
       pending,
       history,
       commit_ts: None,
+      mvcc_open,
       pending_wal,
       staged_schema,
       committer: std::thread::current().id(),
@@ -2549,7 +2568,7 @@ impl SingleFileDB {
     &self,
     tx_handle: &Arc<Mutex<SingleFileTxState>>,
   ) -> Result<()> {
-    let (txid, read_only, wal_begun, writer, key_sets) = {
+    let (txid, read_only, wal_begun, writer, key_sets, mvcc_slot) = {
       let mut tx = tx_handle.lock();
       let key_sets = [
         std::mem::take(&mut tx.mvcc_reads),
@@ -2561,6 +2580,7 @@ impl SingleFileDB {
         tx.wal_begun,
         tx.writer.take(),
         key_sets,
+        tx.mvcc_slot.take(),
       )
     };
     if key_sets.iter().any(|set| set.capacity() > 0) {
@@ -2574,20 +2594,14 @@ impl SingleFileDB {
     };
     let _schema_reservation_guard = SchemaReservationGuard::new(self, txid);
 
+    // It leaves MVCC without a lock: only a committing transaction has a
+    // record in the transaction manager (`TxManager::enter_commit`).
+    if let (Some(mvcc), Some(slot)) = (self.mvcc.as_ref(), mvcc_slot) {
+      mvcc.open.unregister(slot, txid);
+    }
     if read_only {
       // Read-only transactions don't need WAL
-      if let Some(mvcc) = self.mvcc.as_ref() {
-        let mut tx_mgr = mvcc.tx_manager.lock();
-        tx_mgr.abort_tx(txid);
-      }
       return Ok(());
-    }
-    let prev_writers = self.active_writers.fetch_sub(1, Ordering::SeqCst);
-    debug_assert!(prev_writers > 0, "active_writers underflow in rollback");
-
-    if let Some(mvcc) = self.mvcc.as_ref() {
-      let mut tx_mgr = mvcc.tx_manager.lock();
-      tx_mgr.abort_tx(txid);
     }
 
     // A transaction with no record in the WAL leaves nothing to roll back

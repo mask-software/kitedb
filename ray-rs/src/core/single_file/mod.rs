@@ -181,6 +181,10 @@ pub struct SingleFileTxState {
   /// What it wrote, kept and handed over the same way: writers never take
   /// the transaction manager's lock, which every commit takes.
   pub(crate) mvcc_writes: TxKeySet,
+  /// With MVCC, where it is registered among the open transactions
+  /// (`MvccManager::open`), until it ends: a commit hands it to its MVCC
+  /// commit, which unregisters it.
+  pub(crate) mvcc_slot: Option<crate::mvcc::OpenSlot>,
   /// Ids of its live savepoints, oldest first (see `SingleFileDB::savepoint`).
   pub(crate) savepoints: Vec<u64>,
   /// The id its next savepoint gets.
@@ -221,6 +225,7 @@ impl SingleFileTxState {
       writer: None,
       mvcc_reads: TxKeySet::new(),
       mvcc_writes: TxKeySet::new(),
+      mvcc_slot: None,
       savepoints: Vec::new(),
       next_savepoint_id: 0,
       wal_deferred_from: (!read_only && !bulk_load).then_some(0),
@@ -280,8 +285,6 @@ pub struct SingleFileDB {
   /// Shared with the thread-local entries of this database's transactions
   /// (see `tx_registry`): each thread keeps its own open transaction.
   pub(crate) tx_shared: std::sync::Arc<tx_registry::TxShared>,
-  /// Active write transactions (excludes read-only)
-  pub(crate) active_writers: AtomicUsize,
   /// All transactions that have begun and have not finished commit/rollback.
   pub(crate) active_transactions: AtomicUsize,
   /// Write transactions that wrote a BEGIN record and have not finished

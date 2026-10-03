@@ -14,7 +14,8 @@ use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::mvcc::gc::GcSleeper;
 use crate::mvcc::{
-  ConflictDetector, GarbageCollector, GcConfig, GcResult, TxManager, VersionChainManager,
+  ConflictDetector, GarbageCollector, GcConfig, GcResult, OpenTransactions, TxManager,
+  VersionChainManager,
 };
 use crate::types::{Timestamp, TxId};
 
@@ -24,6 +25,10 @@ use crate::types::{Timestamp, TxId};
 /// documented in `core/single_file/read.rs`. GC takes them one at a time.
 pub struct MvccManager {
   pub tx_manager: Arc<Mutex<TxManager>>,
+  /// The open transactions, which begin and end (unless they commit)
+  /// without `tx_manager`'s lock; the transaction manager holds them too
+  /// (`TxManager::open_transactions`).
+  pub open: Arc<OpenTransactions>,
   /// Readers share it; commits recording history and GC take it exclusively.
   pub version_chain: Arc<RwLock<VersionChainManager>>,
   pub conflict_detector: ConflictDetector,
@@ -56,8 +61,10 @@ impl MvccManager {
     // Without a retention period no horizon needs commit times, and a
     // commit reads no clock.
     tx_manager.set_wall_clock_tracking(retention_ms > 0);
+    let open = Arc::clone(tx_manager.open_transactions());
     Self {
       tx_manager: Arc::new(Mutex::new(tx_manager)),
+      open,
       version_chain: Arc::new(RwLock::new(VersionChainManager::new())),
       conflict_detector: ConflictDetector::new(),
       gc: Arc::new(Mutex::new(GarbageCollector::with_config(gc_config))),
@@ -101,9 +108,10 @@ impl MvccManager {
   /// The oldest snapshot the version history must still answer for: GC's
   /// horizon (see `GarbageCollector::run_scoped`), the oldest open
   /// transaction's snapshot, or older while the retention period keeps
-  /// commits. `tx_manager` is the transaction manager, locked.
+  /// commits; at most a few commits older (`TxManager::min_active_ts_bound`).
+  /// `tx_manager` is the transaction manager, locked.
   pub fn history_horizon(&self, tx_manager: &TxManager) -> Timestamp {
-    let min_active_ts = tx_manager.min_active_ts();
+    let min_active_ts = tx_manager.min_active_ts_bound();
     if self.retention_ms == 0 {
       // The retention horizon is then the next commit's, no older.
       return min_active_ts;

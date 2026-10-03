@@ -42,6 +42,7 @@
 //! # Components
 //!
 //! - [`tx_manager`] - Transaction lifecycle management (begin, commit, abort)
+//! - [`open_txs`] - Which transactions are open, registered without a lock
 //! - [`version_chain`] - Version chain storage for nodes, edges, and properties
 //! - [`visibility`] - Visibility rules for determining which versions a transaction can see
 //! - [`gc`] - Garbage collection for old versions
@@ -57,6 +58,7 @@
 pub mod conflict;
 pub mod gc;
 pub mod manager;
+pub mod open_txs;
 pub mod tx_manager;
 pub mod version_chain;
 pub mod visibility;
@@ -73,6 +75,7 @@ mod b4_mvcc_phase2_tests;
 pub use conflict::{ConflictDetector, ConflictError, ConflictInfo, ConflictType};
 pub use gc::{GarbageCollector, GcConfig, GcResult, GcStats, SharedGcState};
 pub use manager::{HistoryWriter, MvccManager};
+pub use open_txs::{OpenSlot, OpenTransactions};
 pub use tx_manager::{
   CommittedWritesStats, TxKeyGroups, TxManager, TxManagerError, KEY_GROUPS_MIN_KEYS,
 };

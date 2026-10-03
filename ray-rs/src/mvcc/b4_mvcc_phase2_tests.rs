@@ -206,8 +206,9 @@ fn read_only_transactions_record_no_reads() {
   let recorded = {
     let mvcc = db.mvcc.as_ref().expect("mvcc");
     let tx_mgr = mvcc.tx_manager.lock();
-    let tx = tx_mgr.tx(txid).expect("open transaction");
-    tx.read_set.len()
+    assert!(tx_mgr.is_active(txid), "the transaction is open in MVCC");
+    // Only a committing transaction has a record (`TxManager::enter_commit`).
+    tx_mgr.tx(txid).map_or(0, |tx| tx.read_set.len())
   };
   db.rollback().expect("end");
   assert_eq!(recorded, 0, "a read-only transaction recorded reads");

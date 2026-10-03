@@ -27,6 +27,14 @@ stages! {
   Begin,
   /// The part of `begin` that waits for a publish section to end.
   BeginPublishWait,
+  /// The part of `begin` that claims the writer slot.
+  BeginWriterSlot,
+  /// The part of `begin` that takes the checkpoint gate.
+  BeginGate,
+  /// The part of `begin` that registers the transaction in MVCC.
+  BeginRegister,
+  /// The part of `begin` after its MVCC registration.
+  BeginRest,
   /// `commit_transaction` before it hands its request to the queue.
   CommitPrep,
   /// From handing the request over until its outcome comes back.
