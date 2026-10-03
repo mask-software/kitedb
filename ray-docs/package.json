@@ -10,6 +10,7 @@
     "format": "biome format",
     "lint": "biome lint",
     "check": "biome check",
+    "bench:data": "bun scripts/benchmark-data.ts",
     "start": "node .output/server/index.mjs"
   },
   "dependencies": {
