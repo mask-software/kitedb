@@ -64,7 +64,8 @@ use crate::util::binary::*;
 
 use super::record::{
   apply_wal_salt, build_rollback_payload, parse_wal_record_with_salt, read_wal_record_with_salt,
-  salt_wal_record, wal_frames, wal_records_end, ParsedWalRecord, WalFrame, WalRecord, WalRecordAt,
+  salt_wal_record, wal_frames, wal_records_end, wal_records_whole, ParsedWalRecord, WalFrame,
+  WalRecord, WalRecordAt,
 };
 
 /// WAL region split ratio: primary gets 75%, secondary gets 25%
@@ -1079,29 +1080,47 @@ impl WalBuffer {
   /// Write prebuilt record bytes in a single batch
   /// The buffer must contain a sequence of padded, unsalted records (as
   /// [`WalRecord::build`] writes them); they are salted for the active region.
+  ///
+  /// They are copied into the buffered runs (into a buffer the WAL keeps
+  /// for reuse, see [`Self::recycle_sealed`]) and the copy is salted, so
+  /// `record_bytes` is left as it is: a commit group writes its members'
+  /// records this way, allocating nothing and leaving each member's buffer
+  /// to its committer. If they do not fit (`WalBufferFull`) or are not whole
+  /// records, nothing is written.
   pub fn write_record_bytes_batch(&mut self, record_bytes: &[u8]) -> Result<u64> {
-    self.write_owned_record_bytes(&mut record_bytes.to_vec())
-  }
-
-  /// [`Self::write_record_bytes_batch`] for bytes the caller gives up: once
-  /// they fit, they are salted in place and taken (left empty), buffered
-  /// without another copy where they start a run. If they do not fit
-  /// (`WalBufferFull`) they are left as they are, and nothing is written.
-  pub fn write_owned_record_bytes(&mut self, records: &mut Vec<u8>) -> Result<u64> {
-    if records.is_empty() {
+    if record_bytes.is_empty() {
       return Ok(self.head);
     }
+    let (head, length) = self.batch_position(record_bytes.len())?;
+    if !wal_records_whole(record_bytes) {
+      return Err(KiteError::Internal(
+        "WAL record bytes are not whole records".to_string(),
+      ));
+    }
+    let offset = self.file_offset(head);
+    self.pending.write(offset, record_bytes);
+    let salt = self.region_salt(self.active_region);
+    let copy = self
+      .pending
+      .bytes_mut(offset, record_bytes.len())
+      .ok_or_else(|| KiteError::Internal("buffered WAL bytes went missing".to_string()))?;
+    xor_salt(copy, salt)?;
+    self.advance_head(length);
+    Ok(self.head)
+  }
 
-    if !records.len().is_multiple_of(WAL_RECORD_ALIGNMENT) {
+  /// Where a batch of `size` bytes goes in the active region, and its
+  /// length: `WalBufferFull` if it does not fit there.
+  fn batch_position(&self, size: usize) -> Result<(u64, u64)> {
+    if !size.is_multiple_of(WAL_RECORD_ALIGNMENT) {
       return Err(KiteError::Internal(
         "WAL batch bytes must be alignment-sized".to_string(),
       ));
     }
-
-    if !self.can_fit(records.len()) {
+    if !self.can_fit(size) {
       return Err(KiteError::WalBufferFull);
     }
-    let length = records.len() as u64;
+    let length = size as u64;
     let (head, region_end) = if self.active_region == 0 {
       (self.primary_head, self.primary_region_size)
     } else {
@@ -1113,10 +1132,11 @@ impl WalBuffer {
     if head + length > region_end {
       return Err(KiteError::WalBufferFull);
     }
-    self.salt_for(self.active_region, records)?;
-    self
-      .pending
-      .write_vec(self.file_offset(head), std::mem::take(records));
+    Ok((head, length))
+  }
+
+  /// Move the active region's head `length` bytes on.
+  fn advance_head(&mut self, length: u64) {
     if self.active_region == 0 {
       self.primary_head += length;
       self.head = self.primary_head;
@@ -1124,6 +1144,22 @@ impl WalBuffer {
       self.secondary_head += length;
       self.head = self.secondary_head;
     }
+  }
+
+  /// [`Self::write_record_bytes_batch`] for bytes the caller gives up: once
+  /// they fit, they are salted in place and taken (left empty), buffered
+  /// without another copy where they start a run. If they do not fit
+  /// (`WalBufferFull`) they are left as they are, and nothing is written.
+  pub fn write_owned_record_bytes(&mut self, records: &mut Vec<u8>) -> Result<u64> {
+    if records.is_empty() {
+      return Ok(self.head);
+    }
+    let (head, length) = self.batch_position(records.len())?;
+    self.salt_for(self.active_region, records)?;
+    self
+      .pending
+      .write_vec(self.file_offset(head), std::mem::take(records));
+    self.advance_head(length);
     Ok(self.head)
   }
 
@@ -1346,8 +1382,9 @@ impl WalBuffer {
     } else {
       None
     };
+    let spare_runs = std::mem::take(&mut self.pending.spare_runs);
     SealedWrites {
-      runs: std::mem::take(&mut self.pending.runs),
+      runs: std::mem::replace(&mut self.pending.runs, spare_runs),
       state: self.region_state(),
       sync_first: self.unsynced_rollbacks,
       zero_first,
@@ -1378,6 +1415,18 @@ impl WalBuffer {
     }
     if sealed.sync_first {
       self.unsynced_rollbacks = false;
+    }
+  }
+
+  /// Keep the buffers of `sealed`, written and named by a durable header,
+  /// for the runs buffered next (see [`PendingWrites::spare`]).
+  pub fn recycle_sealed(&mut self, sealed: SealedWrites) {
+    let mut runs = sealed.runs;
+    for run in runs.drain(..) {
+      self.pending.keep_spare(run.data);
+    }
+    if self.pending.spare_runs.capacity() == 0 {
+      self.pending.spare_runs = runs;
     }
   }
 
@@ -1581,7 +1630,18 @@ fn write_zeros(pager: &mut FilePager, zeros: ZeroRange) -> Result<()> {
 #[derive(Debug, Default)]
 struct PendingWrites {
   runs: Vec<PendingRun>,
+  /// Emptied buffers of written runs, for new runs (see
+  /// [`WalBuffer::recycle_sealed`]): commit groups seal and write their
+  /// runs over and over, and would otherwise allocate and free one each.
+  spare: Vec<Vec<u8>>,
+  /// An emptied `runs` list, for the next [`WalBuffer::seal`] to leave.
+  spare_runs: Vec<PendingRun>,
 }
+
+/// Spare run buffers kept, and the largest kept: a bulk load's runs are not
+/// worth holding on to.
+const SPARE_RUN_BUFFERS: usize = 4;
+const SPARE_RUN_BUFFER_MAX: usize = 1024 * 1024;
 
 #[derive(Debug)]
 struct PendingRun {
@@ -1601,7 +1661,38 @@ impl PendingWrites {
   }
 
   fn clear(&mut self) {
-    self.runs.clear();
+    let mut runs = std::mem::take(&mut self.runs);
+    for run in runs.drain(..) {
+      self.keep_spare(run.data);
+    }
+    self.runs = runs;
+  }
+
+  /// Keep a written run's buffer, emptied, for a new run (see `spare`).
+  fn keep_spare(&mut self, mut data: Vec<u8>) {
+    if self.spare.len() < SPARE_RUN_BUFFERS && data.capacity() <= SPARE_RUN_BUFFER_MAX {
+      data.clear();
+      self.spare.push(data);
+    }
+  }
+
+  /// A new run's buffer holding `data`: a spare one if any.
+  fn run_buffer(&mut self, data: &[u8]) -> Vec<u8> {
+    match self.spare.pop() {
+      Some(mut buffer) => {
+        buffer.extend_from_slice(data);
+        buffer
+      }
+      None => data.to_vec(),
+    }
+  }
+
+  /// The buffered bytes `offset..offset + length`, if one run holds them.
+  fn bytes_mut(&mut self, offset: u64, length: usize) -> Option<&mut [u8]> {
+    let index = self.runs.partition_point(|run| run.end() <= offset);
+    let run = self.runs.get_mut(index)?;
+    let start = usize::try_from(offset.checked_sub(run.offset)?).ok()?;
+    run.data.get_mut(start..start.checked_add(length)?)
   }
 
   /// Buffer `data` for `offset`, over any bytes buffered there before.
@@ -1620,13 +1711,8 @@ impl PendingWrites {
     let first = self.runs.partition_point(|run| run.end() < offset);
     let past = self.runs.partition_point(|run| run.offset <= end);
     if first == past {
-      self.runs.insert(
-        first,
-        PendingRun {
-          offset,
-          data: data.to_vec(),
-        },
-      );
+      let data = self.run_buffer(data);
+      self.runs.insert(first, PendingRun { offset, data });
       return;
     }
     let start = offset.min(self.runs[first].offset);

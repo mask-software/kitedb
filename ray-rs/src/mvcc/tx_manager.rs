@@ -275,7 +275,7 @@ impl TxManager {
     let groups = self.tx_key_groups.get(&txid)?;
     Some(
       groups
-        .reads_and_writes
+        .reads_and_writes()
         .iter()
         .copied()
         .filter(|group| {
@@ -817,32 +817,49 @@ struct CommitWrites {
 /// each once. Its conflict check and its commit then look up and note a few
 /// groups instead of every key. The database computes them before it takes
 /// any lock.
+///
+/// They pay off for transactions of more than a few keys: for a small one,
+/// looking its keys up costs less than working out and handing over its
+/// groups (see `KEY_GROUPS_MIN_KEYS`).
 #[derive(Debug, Clone, Default)]
 pub struct TxKeyGroups {
-  reads_and_writes: Vec<u64>,
-  writes: Vec<u64>,
+  /// The groups of the writes, then those of the reads no write shares.
+  groups: Vec<u64>,
+  /// How many of `groups` are the writes'.
+  writes: usize,
 }
+
+/// Transactions with fewer reads and writes than this hand over no key
+/// groups (see `TxKeyGroups`).
+pub const KEY_GROUPS_MIN_KEYS: usize = 16;
 
 impl TxKeyGroups {
   /// The groups of `reads` and `writes`.
   pub fn of(reads: &TxKeySet, writes: &TxKeySet) -> Self {
     let mut seen = hashbrown::HashSet::with_capacity(writes.len() / 4 + reads.len());
-    let writes: Vec<u64> = writes
+    let mut groups: Vec<u64> = writes
       .iter()
       .map(key_group)
       .filter(|&group| seen.insert(group))
       .collect();
-    let mut reads_and_writes = writes.clone();
-    reads_and_writes.extend(
+    let writes = groups.len();
+    groups.extend(
       reads
         .iter()
         .map(key_group)
         .filter(|&group| seen.insert(group)),
     );
-    Self {
-      reads_and_writes,
-      writes,
-    }
+    Self { groups, writes }
+  }
+
+  /// The groups of the reads and the writes, each once.
+  fn reads_and_writes(&self) -> &[u64] {
+    &self.groups
+  }
+
+  /// The groups of the writes.
+  fn writes(&self) -> &[u64] {
+    &self.groups[..self.writes]
   }
 }
 
@@ -874,7 +891,7 @@ fn note_group_writes(
 ) {
   match key_groups {
     Some(groups) => {
-      for group in groups.writes {
+      for &group in groups.writes() {
         group_writes.insert(group, commit_ts);
       }
     }

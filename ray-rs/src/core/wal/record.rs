@@ -55,23 +55,34 @@ impl WalRecord {
   /// Build the WAL record bytes, unsalted (as replication frames carry them).
   /// The WAL buffer salts records as it writes them; see [`apply_wal_salt`].
   pub fn build(&self) -> Vec<u8> {
+    let mut buffer = Vec::with_capacity(self.estimated_size());
+    self.build_into(&mut buffer);
+    buffer
+  }
+
+  /// [`Self::build`], appending the bytes ([`Self::estimated_size`] of them)
+  /// to `buffer`: a transaction keeps its records back in one buffer, and
+  /// this spares each its own.
+  pub fn build_into(&self, buffer: &mut Vec<u8>) {
     let header_size = WAL_RECORD_HEADER_SIZE;
     let crc_size = 4;
     let unpadded = header_size + self.payload.len() + crc_size;
     let pad_len = padding_for(unpadded, WAL_RECORD_ALIGNMENT);
     let total_size = unpadded + pad_len;
 
-    let mut buffer = vec![0u8; total_size];
+    let start = buffer.len();
+    buffer.resize(start + total_size, 0);
+    let buffer = &mut buffer[start..];
     #[cfg(test)]
     BUILT_BYTES.with(|built| built.set(built.get() + total_size));
 
     // Write header
-    write_u32(&mut buffer, 0, unpadded as u32); // recLen
+    write_u32(buffer, 0, unpadded as u32); // recLen
     buffer[4] = self.record_type as u8;
     buffer[5] = 0; // flags
-    write_u16(&mut buffer, 6, 0); // reserved
-    write_u64(&mut buffer, 8, self.txid);
-    write_u32(&mut buffer, 16, self.payload.len() as u32);
+    write_u16(buffer, 6, 0); // reserved
+    write_u64(buffer, 8, self.txid);
+    write_u32(buffer, 16, self.payload.len() as u32);
 
     // Write payload
     buffer[WAL_RECORD_HEADER_SIZE..WAL_RECORD_HEADER_SIZE + self.payload.len()]
@@ -81,9 +92,7 @@ impl WalRecord {
     let crc_start = 4; // After recLen
     let crc_end = WAL_RECORD_HEADER_SIZE + self.payload.len();
     let crc_value = crc32(&buffer[crc_start..crc_end]);
-    write_u32(&mut buffer, crc_end, crc_value);
-
-    buffer
+    write_u32(buffer, crc_end, crc_value);
   }
 }
 
@@ -313,7 +322,29 @@ pub(crate) fn salt_wal_record(record: &mut [u8], salt: u32) -> bool {
 /// Returns `false`, changing nothing, if `records` is not a sequence of whole
 /// records.
 pub fn apply_wal_salt(records: &mut [u8], salt: u32) -> bool {
-  let mut crc_offsets = Vec::new();
+  // Checked whole first, so a malformed sequence is left unchanged; then
+  // salted record by record. Allocates nothing: every commit group salts
+  // its members' records.
+  if !wal_records_whole(records) {
+    return false;
+  }
+  if salt != 0 {
+    // Whole records: every length below is in bounds.
+    let mut offset = 0;
+    while offset < records.len() {
+      let rec_len = read_u32(records, offset) as usize;
+      let crc_offset = offset + rec_len - 4;
+      let crc = read_u32(records, crc_offset) ^ salt;
+      write_u32(records, crc_offset, crc);
+      offset += rec_len.next_multiple_of(WAL_RECORD_ALIGNMENT);
+    }
+  }
+  true
+}
+
+/// Whether `records` is a sequence of whole records, as
+/// [`apply_wal_salt`] takes them.
+pub fn wal_records_whole(records: &[u8]) -> bool {
   let mut offset = 0;
   while offset < records.len() {
     let Some(rec_len) = records
@@ -328,14 +359,7 @@ pub fn apply_wal_salt(records: &mut [u8], salt: u32) -> bool {
     if rec_len < WAL_RECORD_HEADER_SIZE + 4 || !has_bytes(records.len(), offset, total_len) {
       return false;
     }
-    crc_offsets.push(offset + rec_len - 4);
     offset += total_len;
-  }
-  if salt != 0 {
-    for crc_offset in crc_offsets {
-      let crc = read_u32(records, crc_offset) ^ salt;
-      write_u32(records, crc_offset, crc);
-    }
   }
   true
 }
@@ -430,18 +454,27 @@ pub fn build_create_node_payload(node_id: NodeId, key: Option<&str>) -> Vec<u8> 
 /// Build CREATE_NODES_BATCH payload
 /// Format: count (4) + repeated (node_id (8) + key_len (4) + key_bytes)
 pub fn build_create_nodes_batch_payload(entries: &[(NodeId, Option<&str>)]) -> Vec<u8> {
+  build_create_nodes_batch_payload_of(entries.iter().copied())
+}
+
+/// [`build_create_nodes_batch_payload`] for entries given one by one, so a
+/// caller holding ids and keys apart need not pair them in a `Vec` first.
+pub fn build_create_nodes_batch_payload_of<'a>(
+  entries: impl Iterator<Item = (NodeId, Option<&'a str>)> + Clone,
+) -> Vec<u8> {
+  let mut count = 0usize;
   let mut total_len = 4;
-  for (_, key) in entries.iter() {
-    let key_len = key.map(|k| k.len()).unwrap_or(0);
-    total_len += 8 + 4 + key_len;
+  for (_, key) in entries.clone() {
+    count += 1;
+    total_len += 8 + 4 + key.map_or(0, str::len);
   }
 
   let mut buffer = vec![0u8; total_len];
-  write_u32(&mut buffer, 0, entries.len() as u32);
+  write_u32(&mut buffer, 0, count as u32);
 
   let mut offset = 4;
-  for (node_id, key) in entries.iter() {
-    write_u64(&mut buffer, offset, *node_id);
+  for (node_id, key) in entries {
+    write_u64(&mut buffer, offset, node_id);
     offset += 8;
     let key_bytes = key.map(|k| k.as_bytes()).unwrap_or(&[]);
     write_u32(&mut buffer, offset, key_bytes.len() as u32);

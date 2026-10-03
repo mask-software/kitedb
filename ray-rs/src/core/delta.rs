@@ -665,6 +665,30 @@ impl DeltaState {
     self.pending_vectors.clear();
   }
 
+  /// Empty the delta for another transaction to use, and return whether it
+  /// is worth keeping: no table holds room for more than `max_capacity`
+  /// entries (a large transaction's tables are better dropped than kept).
+  pub(crate) fn clear_for_reuse(&mut self, max_capacity: usize) -> bool {
+    self.clear();
+    [
+      Table::capacity(&self.created_nodes),
+      Table::capacity(&self.deleted_nodes),
+      Table::capacity(&self.modified_nodes),
+      Table::capacity(&self.out_add),
+      Table::capacity(&self.out_del),
+      Table::capacity(&self.in_add),
+      Table::capacity(&self.in_del),
+      Table::capacity(&self.edge_props),
+      Table::capacity(&self.new_labels),
+      Table::capacity(&self.new_etypes),
+      Table::capacity(&self.new_propkeys),
+      Table::capacity(&self.key_index),
+      self.pending_vectors.capacity(),
+    ]
+    .into_iter()
+    .all(|capacity| capacity <= max_capacity)
+  }
+
   /// Get count of edges added for a source node
   pub fn edges_added_count(&self, src: NodeId) -> usize {
     self.out_add.get(&src).map(|s| s.len()).unwrap_or(0)

@@ -177,10 +177,11 @@ pub(crate) struct CommitOutcome {
   /// Its staged schema names are published.
   schema_published: bool,
   result: Result<Option<CommitToken>>,
-  /// What is left of its request (the emptied delta, record buffers) and
-  /// key sets MVCC released, for its committer to free: off the commit
-  /// path, and mostly on the thread that allocated it.
-  _leftovers: Option<Box<CommitRequest>>,
+  /// What is left of its request (the emptied delta, record buffers), for
+  /// its committer to keep for its next transaction (`TxSpares`), on the
+  /// thread that allocated it.
+  leftovers: Option<Box<CommitRequest>>,
+  /// Key sets MVCC released, for the committer to free off the commit path.
   _released_keys: Vec<TxKeySet>,
 }
 
@@ -190,11 +191,15 @@ impl CommitOutcome {
       durable: false,
       schema_published: false,
       result: Err(error),
-      _leftovers: None,
+      leftovers: None,
       _released_keys: Vec::new(),
     }
   }
 }
+
+/// A commit group copies a member's records up to this size into the WAL's
+/// own buffers; it takes larger ones whole (`WalBuffer::write_owned_record_bytes`).
+const COPIED_RECORDS_MAX: usize = 64 * 1024;
 
 /// Most commits one group writes; the rest form the next group.
 const MAX_GROUP_COMMITS: usize = 256;
@@ -329,7 +334,7 @@ impl CommitLeader<'_> {
   fn deliver(
     &mut self,
     own: Option<&Arc<CommitTicket>>,
-    outcomes: Vec<CommitOutcome>,
+    outcomes: impl IntoIterator<Item = CommitOutcome>,
   ) -> Option<CommitOutcome> {
     let mut own_outcome = None;
     for (ticket, outcome) in self.group.drain(..).zip(outcomes) {
@@ -455,6 +460,139 @@ struct DurableCommit {
   schema_published: bool,
   /// Its MVCC commit timestamp, and whether a reader needs version chains.
   mvcc_commit: Option<(u64, bool)>,
+}
+
+/// What a thread keeps of its last settled transaction for its next one:
+/// the transaction's state, its pending delta and record buffers (emptied,
+/// their capacity kept), its commit request and its queue ticket. Each comes
+/// back to the thread that allocated it (a commit's request returns with its
+/// outcome), so a small transaction allocates little, and its committer
+/// frees nothing a leader on another thread would otherwise free.
+#[derive(Default)]
+struct TxSpares {
+  state: Option<Arc<Mutex<SingleFileTxState>>>,
+  pending: Option<DeltaState>,
+  pending_wal: Vec<u8>,
+  records: Vec<u8>,
+  request: Option<Box<CommitRequest>>,
+  ticket: Option<Arc<CommitTicket>>,
+}
+
+/// Record buffers above this capacity, and pending deltas with room for more
+/// entries than this in a table, are not kept: a large transaction's are
+/// better freed than held by its thread.
+const SPARE_BUFFER_MAX: usize = 64 * 1024;
+const SPARE_DELTA_MAX: usize = 256;
+
+thread_local! {
+  static TX_SPARES: std::cell::RefCell<TxSpares> = std::cell::RefCell::new(TxSpares::default());
+}
+
+impl TxSpares {
+  /// Run `f` on this thread's spares; `None` once the thread is exiting.
+  fn with<R>(f: impl FnOnce(&mut Self) -> R) -> Option<R> {
+    TX_SPARES
+      .try_with(|spares| {
+        spares
+          .try_borrow_mut()
+          .ok()
+          .map(|mut spares| f(&mut spares))
+      })
+      .ok()
+      .flatten()
+  }
+
+  /// A buffer kept for reuse: emptied, if not too large.
+  fn keep_buffer(slot: &mut Vec<u8>, mut buffer: Vec<u8>) {
+    if buffer.capacity() <= SPARE_BUFFER_MAX && buffer.capacity() > slot.capacity() {
+      buffer.clear();
+      *slot = buffer;
+    }
+  }
+
+  /// Keep what is left of a settled commit's request for the thread's next
+  /// transactions.
+  fn keep_request(mut request: Box<CommitRequest>) {
+    let mut pending = std::mem::take(&mut request.pending);
+    let pending_wal = std::mem::take(&mut request.pending_wal);
+    let records = std::mem::take(&mut request.records);
+    request.staged_schema = SchemaStaging::default();
+    request.history = None;
+    request.mvcc_keys = None;
+    let keep_pending = pending.clear_for_reuse(SPARE_DELTA_MAX);
+    Self::with(|spares| {
+      if keep_pending {
+        spares.pending = Some(pending);
+      }
+      Self::keep_buffer(&mut spares.pending_wal, pending_wal);
+      Self::keep_buffer(&mut spares.records, records);
+      spares.request = Some(request);
+    });
+  }
+
+  /// Keep a settled transaction's state, unless something still shares it.
+  fn keep_state(mut state: Arc<Mutex<SingleFileTxState>>) {
+    if Arc::get_mut(&mut state).is_some() {
+      Self::with(|spares| spares.state = Some(state));
+    }
+  }
+
+  /// A queue ticket for a commit of this thread: the kept one if no leader
+  /// still holds it.
+  fn ticket() -> Arc<CommitTicket> {
+    let kept = Self::with(|spares| spares.ticket.take()).flatten();
+    match kept {
+      Some(mut ticket) => match Arc::get_mut(&mut ticket) {
+        Some(unshared) => {
+          *unshared.state.get_mut() = TICKET_QUEUED;
+          *unshared.outcome.get_mut() = None;
+          ticket
+        }
+        None => Arc::new(CommitTicket::new()),
+      },
+      None => Arc::new(CommitTicket::new()),
+    }
+  }
+}
+
+/// The buffers a commit leader works a group with, kept from group to group
+/// by each thread that leads (`LeaderScratch::take`): a group would
+/// otherwise allocate and free each of them.
+#[derive(Default)]
+struct LeaderScratch {
+  group: Vec<Option<Arc<CommitTicket>>>,
+  queue: VecDeque<(usize, Box<CommitRequest>)>,
+  passed: VecDeque<(usize, Box<CommitRequest>)>,
+  outcomes: Vec<Option<CommitOutcome>>,
+  staged: Vec<(usize, Box<CommitRequest>)>,
+  commit_records: Vec<(u64, TxId)>,
+  durable: Vec<DurableCommit>,
+}
+
+thread_local! {
+  static LEADER_SCRATCH: std::cell::RefCell<LeaderScratch> =
+    std::cell::RefCell::new(LeaderScratch::default());
+}
+
+impl LeaderScratch {
+  /// This thread's buffers (empty ones if it has none, or is exiting).
+  fn take() -> Self {
+    LEADER_SCRATCH
+      .try_with(|scratch| std::mem::take(&mut *scratch.borrow_mut()))
+      .unwrap_or_default()
+  }
+
+  /// Keep the buffers, emptied, for this thread's next lead.
+  fn keep(mut self) {
+    self.group.clear();
+    self.queue.clear();
+    self.passed.clear();
+    self.outcomes.clear();
+    self.staged.clear();
+    self.commit_records.clear();
+    self.durable.clear();
+    let _ = LEADER_SCRATCH.try_with(|scratch| *scratch.borrow_mut() = self);
+  }
 }
 
 /// Check `request`'s transaction for MVCC conflicts before its COMMIT record
@@ -750,7 +888,33 @@ impl SingleFileDB {
 
     let mut tx_state = SingleFileTxState::new(txid, read_only, snapshot_ts, bulk_load);
     tx_state.writer = writer_claim.as_ref().map(|claim| claim.mode());
-    let tx_state = Arc::new(Mutex::new(tx_state));
+    // This thread's last transaction's state and buffers, if it kept them.
+    let kept = TxSpares::with(|spares| {
+      let buffers = (!read_only).then(|| {
+        (
+          spares.pending.take(),
+          std::mem::take(&mut spares.pending_wal),
+        )
+      });
+      (spares.state.take(), buffers)
+    });
+    let (kept_state, kept_buffers) = kept.unwrap_or_default();
+    if let Some((pending, pending_wal)) = kept_buffers {
+      if let Some(pending) = pending {
+        tx_state.pending = pending;
+      }
+      tx_state.pending_wal = pending_wal;
+    }
+    let tx_state = match kept_state {
+      Some(mut kept) => match Arc::get_mut(&mut kept) {
+        Some(unshared) => {
+          *unshared.get_mut() = tx_state;
+          kept
+        }
+        None => Arc::new(Mutex::new(tx_state)),
+      },
+      None => Arc::new(Mutex::new(tx_state)),
+    };
 
     self.register_thread_transaction(tx_state);
     if let Some(claim) = writer_claim {
@@ -1276,6 +1440,7 @@ impl SingleFileDB {
       // way, and nothing else would ever checkpoint.
       self.auto_checkpoint_if_needed(matches!(result, Err(KiteError::WalBufferFull)));
     }
+    TxSpares::keep_state(tx_handle);
     result
   }
 
@@ -1310,7 +1475,8 @@ impl SingleFileDB {
           // check and the commit, which every other commit waits for, then
           // look up and note groups instead of keys. Alone, it commits with no
           // check and nothing to note.
-          let groups = (self.active_transactions.load(Ordering::Acquire) > 1)
+          let groups = (reads.len() + writes.len() >= crate::mvcc::KEY_GROUPS_MIN_KEYS
+            && self.active_transactions.load(Ordering::Acquire) > 1)
             .then(|| TxKeyGroups::of(&reads, &writes));
           MvccKeys {
             reads,
@@ -1364,24 +1530,31 @@ impl SingleFileDB {
     // WAL that refuses them is left without a partial copy: a bulk load's
     // whole transaction, and a write transaction's records since its BEGIN
     // record (with it, if not written yet) or since a savepoint.
-    let commit = WalRecord::new(WalRecordType::Commit, txid, build_commit_payload()).build();
-    let commit_record_len = commit.len();
+    // Built into one buffer of the size they take.
+    let commit = WalRecord::new(WalRecordType::Commit, txid, build_commit_payload());
+    let commit_record_len = commit.estimated_size();
     let records = match (bulk_load, deferred) {
-      (false, None) => commit,
+      (false, None) => commit.build(),
       (_, deferred) => {
         let from = if bulk_load { 0 } else { deferred.unwrap_or(0) };
-        let mut records = if wal_begun {
-          Vec::with_capacity(pending_wal.len() - from + commit.len())
-        } else {
-          WalRecord::new(WalRecordType::Begin, txid, build_begin_payload()).build()
-        };
+        let begin =
+          (!wal_begun).then(|| WalRecord::new(WalRecordType::Begin, txid, build_begin_payload()));
+        let mut records =
+          TxSpares::with(|spares| std::mem::take(&mut spares.records)).unwrap_or_default();
+        records.reserve(
+          begin.as_ref().map_or(0, WalRecord::estimated_size) + pending_wal.len() - from
+            + commit_record_len,
+        );
+        if let Some(begin) = begin {
+          begin.build_into(&mut records);
+        }
         records.extend_from_slice(&pending_wal[from..]);
-        records.extend_from_slice(&commit);
+        commit.build_into(&mut records);
         records
       }
     };
     let history = self.plan_history(&pending);
-    let request = Box::new(CommitRequest {
+    let request = CommitRequest {
       txid,
       bulk_load,
       mvcc_keys,
@@ -1392,11 +1565,21 @@ impl SingleFileDB {
       pending_wal,
       staged_schema,
       committer: std::thread::current().id(),
-    });
+    };
+    let request = match TxSpares::with(|spares| spares.request.take()).flatten() {
+      Some(mut kept) => {
+        *kept = request;
+        kept
+      }
+      None => Box::new(request),
+    };
 
     #[cfg(test)]
     self.commits_waiting.fetch_add(1, Ordering::SeqCst);
-    let outcome = self.commit_queued(request);
+    let mut outcome = self.commit_queued(request);
+    if let Some(leftovers) = outcome.leftovers.take() {
+      TxSpares::keep_request(leftovers);
+    }
     #[cfg(test)]
     self.commits_waiting.fetch_sub(1, Ordering::SeqCst);
     mvcc_abort.armed = !outcome.durable;
@@ -1423,17 +1606,19 @@ impl SingleFileDB {
       drop(state);
       return self.lead_commits(Some(request), None);
     }
-    let ticket = Arc::new(CommitTicket::new());
+    let ticket = TxSpares::ticket();
     state.queued.push_back(QueuedCommit {
       request,
       ticket: Arc::clone(&ticket),
     });
     drop(state);
-    match ticket.wait() {
+    let outcome = match ticket.wait() {
       Some(outcome) => outcome,
       // Handed the lead: this commit is the oldest queued.
       None => self.lead_commits(None, Some(&ticket)),
-    }
+    };
+    TxSpares::with(|spares| spares.ticket = Some(ticket));
+    outcome
   }
 
   /// Lead the commit queue (see `commit_queued`): write one group, this
@@ -1447,50 +1632,58 @@ impl SingleFileDB {
     own_request: Option<Box<CommitRequest>>,
     own_ticket: Option<&Arc<CommitTicket>>,
   ) -> CommitOutcome {
+    let mut scratch = LeaderScratch::take();
     let mut leader = CommitLeader {
       db: self,
-      group: Vec::new(),
+      group: std::mem::take(&mut scratch.group),
       released: false,
     };
     before_commit_lock_test_hook();
-    let mut requests = Vec::new();
+    let mut queue = std::mem::take(&mut scratch.queue);
     if let Some(request) = own_request {
-      requests.push(request);
+      queue.push_back((0, request));
       leader.group.push(None);
     }
     {
       let mut state = self.commit_queue.state.lock();
-      let take = state.queued.len().min(MAX_GROUP_COMMITS - requests.len());
+      let take = state.queued.len().min(MAX_GROUP_COMMITS - queue.len());
       for queued in state.queued.drain(..take) {
         leader.group.push(Some(queued.ticket));
-        requests.push(queued.request);
+        queue.push_back((queue.len(), queued.request));
       }
     }
-    let outcomes = self.write_commits(requests, &mut leader);
-    leader.deliver(own_ticket, outcomes).unwrap_or_else(|| {
+    self.write_commits(&mut queue, &mut leader, &mut scratch);
+    let outcomes = scratch.outcomes.drain(..).map(|outcome| {
+      outcome.unwrap_or_else(|| {
+        CommitOutcome::failed(KiteError::Internal("commit was not written".to_string()))
+      })
+    });
+    let own = leader.deliver(own_ticket, outcomes).unwrap_or_else(|| {
       CommitOutcome::failed(KiteError::Internal("commit was not written".to_string()))
-    })
+    });
+    scratch.queue = queue;
+    scratch.group = std::mem::take(&mut leader.group);
+    scratch.keep();
+    own
   }
 
-  /// Write `requests`' commits in order, and return their outcomes in the
-  /// same order. Each round, under the commit lock, writes the COMMIT records
+  /// Write the commits of `queue` (each with its index in the group), in
+  /// order, and leave their outcomes in `scratch.outcomes`, by index. Each round, under the commit lock, writes the COMMIT records
   /// of those that fit and makes them durable with one WAL write and one
   /// header (`write_commit_round`); then, under the publish lock, which it
   /// takes before it releases the commit lock (so rounds publish in commit
   /// order), publishes them (`publish_commits`). Once a round leaves nothing
-  /// of `requests` to write, `leader` passes the lead on before the publish.
+  /// of `queue` to write, `leader` passes the lead on before the publish.
   /// Callers hold no lock.
-  // A commit is boxed once, and moves by pointer from its committer through
-  // the queue and a group's stages.
-  #[allow(clippy::vec_box)]
   fn write_commits(
     &self,
-    requests: Vec<Box<CommitRequest>>,
+    queue: &mut VecDeque<(usize, Box<CommitRequest>)>,
     leader: &mut CommitLeader<'_>,
-  ) -> Vec<CommitOutcome> {
-    let mut outcomes: Vec<Option<CommitOutcome>> = requests.iter().map(|_| None).collect();
-    let mut queue: VecDeque<(usize, Box<CommitRequest>)> =
-      requests.into_iter().enumerate().collect();
+    scratch: &mut LeaderScratch,
+  ) {
+    let mut outcomes = std::mem::take(&mut scratch.outcomes);
+    outcomes.clear();
+    outcomes.resize_with(queue.len(), || None);
     let mut checkpointed_for_room = false;
     while !queue.is_empty() {
       #[cfg(feature = "bench-profile")]
@@ -1502,14 +1695,15 @@ impl SingleFileDB {
         Ordering::Relaxed,
       );
 
-      let round = self.write_commit_round(&mut queue, &mut outcomes);
+      let mut round = self.write_commit_round(queue, &mut outcomes, scratch);
       let publish_guard = self.publish_lock.lock();
       drop(commit_guard);
       if queue.is_empty() {
         leader.release_lead();
       }
-      self.publish_commits(round.durable, &mut outcomes);
+      self.publish_commits(&mut round.durable, &mut outcomes);
       drop(publish_guard);
+      scratch.durable = std::mem::take(&mut round.durable);
 
       // The background checkpoint takes the commit lock to install.
       if let Some(cut) = round.wait_for_cut {
@@ -1534,14 +1728,7 @@ impl SingleFileDB {
         }
       }
     }
-    outcomes
-      .into_iter()
-      .map(|outcome| {
-        outcome.unwrap_or_else(|| {
-          CommitOutcome::failed(KiteError::Internal("commit was not written".to_string()))
-        })
-      })
-      .collect()
+    scratch.outcomes = outcomes;
   }
 
   /// Hold off commits: take the commit lock, and wait until every commit
@@ -1576,8 +1763,12 @@ impl SingleFileDB {
     &self,
     queue: &mut VecDeque<(usize, Box<CommitRequest>)>,
     outcomes: &mut [Option<CommitOutcome>],
+    scratch: &mut LeaderScratch,
   ) -> CommitRound {
-    let mut round = CommitRound::default();
+    let mut round = CommitRound {
+      durable: std::mem::take(&mut scratch.durable),
+      ..CommitRound::default()
+    };
     // Vector checks read the stores, which a group still publishing may be
     // changing (creating one, or adding to it): let it finish first.
     if queue
@@ -1588,7 +1779,7 @@ impl SingleFileDB {
     }
     // Loading a store and checking targets take the snapshot lock, so before
     // the pager lock.
-    let mut loaded = VecDeque::with_capacity(queue.len());
+    let mut loaded = std::mem::take(&mut scratch.passed);
     let mut deleted_in_round = HashSet::new();
     for (index, request) in queue.drain(..) {
       // With MVCC, conflict detection refuses these commits (each write
@@ -1623,13 +1814,13 @@ impl SingleFileDB {
         Err(error) => outcomes[index] = Some(CommitOutcome::failed(error)),
       }
     }
-    *queue = loaded;
+    std::mem::swap(queue, &mut loaded);
+    let mut checked = loaded;
 
     // Vector and MVCC checks, in order, without the WAL lock: each commit
     // that passes is staged, so the ones after it check against its writes.
     // The transaction manager's lock is taken once for the commits without
     // vectors (their check takes the vector stores' lock).
-    let mut checked = VecDeque::with_capacity(queue.len());
     {
       // Dimensions given by commits earlier in the round to vector
       // properties that have no store yet.
@@ -1664,14 +1855,22 @@ impl SingleFileDB {
     // the next round, unstaged (they are the newest staged), and are checked
     // again then.
     let mut pager = self.pager.lock();
-    let mut staged = Vec::new();
+    let mut staged = std::mem::take(&mut scratch.staged);
     // The WAL position of each staged commit's COMMIT record.
-    let mut commit_records = Vec::new();
+    let mut commit_records = std::mem::take(&mut scratch.commit_records);
     let sealed = {
       let mut wal = self.wal_buffer.lock();
       while let Some((index, mut request)) = checked.pop_front() {
         if wal.can_fit(request.records.len()) {
-          if let Err(error) = wal.write_owned_record_bytes(&mut request.records) {
+          // A small member's records are copied into buffers the WAL
+          // reuses, and its own buffer goes back to its committer with its
+          // outcome: the leader neither allocates nor frees one per member.
+          let written = if request.records.len() <= COPIED_RECORDS_MAX {
+            wal.write_record_bytes_batch(&request.records)
+          } else {
+            wal.write_owned_record_bytes(&mut request.records)
+          };
+          if let Err(error) = written {
             self.unstage_newest_in_mvcc(checked.len() + 1);
             outcomes[index] = Some(CommitOutcome::failed(error));
             queue.extend(checked.drain(..));
@@ -1706,6 +1905,9 @@ impl SingleFileDB {
         break;
       }
       if staged.is_empty() {
+        scratch.passed = checked;
+        scratch.staged = staged;
+        scratch.commit_records = commit_records;
         return round;
       }
       // `SyncMode::Off` leaves the records buffered (checkpoints and close
@@ -1715,10 +1917,16 @@ impl SingleFileDB {
       (self.sync_mode != SyncMode::Off).then(|| wal.seal(self.sync_mode == SyncMode::Full))
     };
 
+    scratch.passed = checked;
     match self.persist_commit_round(&mut pager, sealed.as_ref(), staged.len()) {
       Ok(()) => {
         drop(pager);
-        round.durable = self.settle_durable_commits(staged);
+        if let Some(sealed) = sealed {
+          self.wal_buffer.lock().recycle_sealed(sealed);
+        }
+        self.settle_durable_commits(&mut staged, &mut round.durable);
+        commit_records.clear();
+        scratch.commit_records = commit_records;
       }
       Err(error) => {
         if let Some(sealed) = sealed {
@@ -1749,11 +1957,12 @@ impl SingleFileDB {
         let mut errors: Vec<KiteError> =
           staged.iter().skip(1).map(|_| round_error(&error)).collect();
         errors.insert(0, error);
-        for ((index, _), error) in staged.into_iter().zip(errors) {
+        for ((index, _), error) in staged.drain(..).zip(errors) {
           outcomes[index] = Some(CommitOutcome::failed(error));
         }
       }
     }
+    scratch.staged = staged;
     round
   }
 
@@ -1861,44 +2070,45 @@ impl SingleFileDB {
   /// appended under the commit lock, in order, with the epoch fence checked
   /// under it (`write_commit_round`), so a copy of the database taken under
   /// the commit lock never holds a commit its frame position misses.
-  fn settle_durable_commits(&self, staged: Vec<(usize, Box<CommitRequest>)>) -> Vec<DurableCommit> {
+  fn settle_durable_commits(
+    &self,
+    staged: &mut Vec<(usize, Box<CommitRequest>)>,
+    durable: &mut Vec<DurableCommit>,
+  ) {
     {
       let mut open = self.open_write_txids.lock();
-      for (_, request) in &staged {
+      for (_, request) in staged.iter() {
         open.remove(&request.txid);
       }
     }
-    staged
-      .into_iter()
-      .map(|(index, mut request)| {
-        let mut token = None;
-        if let Some(replication) = self.primary_replication.as_ref() {
-          if replication.crash_after_local_commit_for_testing() {
-            // Test-only abrupt-stop hook for the exact local-durable/sidecar
-            // boundary: the main WAL and header are complete.
-            std::process::abort();
-          }
-          match replication
-            .append_commit_wal_frame(request.txid, std::mem::take(&mut request.pending_wal))
-          {
-            Ok(commit_token) => token = Some(commit_token),
-            Err(error) => {
-              eprintln!(
-                "Warning: local commit durable but replication sidecar append failed: {error}"
-              )
-            }
+    durable.extend(staged.drain(..).map(|(index, mut request)| {
+      let mut token = None;
+      if let Some(replication) = self.primary_replication.as_ref() {
+        if replication.crash_after_local_commit_for_testing() {
+          // Test-only abrupt-stop hook for the exact local-durable/sidecar
+          // boundary: the main WAL and header are complete.
+          std::process::abort();
+        }
+        match replication
+          .append_commit_wal_frame(request.txid, std::mem::take(&mut request.pending_wal))
+        {
+          Ok(commit_token) => token = Some(commit_token),
+          Err(error) => {
+            eprintln!(
+              "Warning: local commit durable but replication sidecar append failed: {error}"
+            )
           }
         }
-        DurableCommit {
-          index,
-          request,
-          token,
-          published: Ok(()),
-          schema_published: false,
-          mvcc_commit: None,
-        }
-      })
-      .collect()
+      }
+      DurableCommit {
+        index,
+        request,
+        token,
+        published: Ok(()),
+        schema_published: false,
+        mvcc_commit: None,
+      }
+    }));
   }
 
   /// Make a round's durable commits visible, in WAL order, under the publish
@@ -1922,7 +2132,11 @@ impl SingleFileDB {
   /// early would leave a durable transaction out of the delta, invisible
   /// until a reopen replays it, and the next checkpoint (a snapshot of the
   /// delta) would drop it. Each commit reports its first failure.
-  fn publish_commits(&self, mut round: Vec<DurableCommit>, outcomes: &mut [Option<CommitOutcome>]) {
+  fn publish_commits(
+    &self,
+    round: &mut Vec<DurableCommit>,
+    outcomes: &mut [Option<CommitOutcome>],
+  ) {
     if round.is_empty() {
       return;
     }
@@ -1932,11 +2146,11 @@ impl SingleFileDB {
     // boundary. Publishing before any fallible post-commit work keeps a
     // later error from leaving a committed WAL definition hidden in this
     // process.
-    for commit in &mut round {
+    for commit in round.iter_mut() {
       commit.published = self.publish_staged_schema(&commit.request.staged_schema);
       commit.schema_published = commit.published.is_ok();
     }
-    for commit in &round {
+    for commit in round.iter() {
       if commit.request.committer == this_thread {
         before_merge_test_hook();
       }
@@ -1946,9 +2160,9 @@ impl SingleFileDB {
     // write) go on until the first merge.
     let mut delta = PublishDelta::Reading(self.delta.upgradable_read());
     let _publishing = PublishSection::enter(&self.publish_seq);
-    let (mut released_keys, horizon) = self.commit_in_mvcc(&mut round);
+    let (mut released_keys, horizon) = self.commit_in_mvcc(round);
     let mut history = PublishHistory::default();
-    for commit in &mut round {
+    for commit in round.iter_mut() {
       let request = &mut commit.request;
       let on_committer_thread = request.committer == this_thread;
       if on_committer_thread {
@@ -1985,12 +2199,12 @@ impl SingleFileDB {
     drop(_publishing);
     drop(delta);
 
-    for commit in round {
+    for commit in round.drain(..) {
       outcomes[commit.index] = Some(CommitOutcome {
         durable: true,
         schema_published: commit.schema_published,
         result: commit.published.map(|()| commit.token),
-        _leftovers: Some(commit.request),
+        leftovers: Some(commit.request),
         _released_keys: std::mem::take(&mut released_keys),
       });
     }
@@ -2055,6 +2269,7 @@ impl SingleFileDB {
       // refused, and nothing else may checkpoint.
       self.auto_checkpoint_if_needed(false);
     }
+    TxSpares::keep_state(tx_handle);
     result
   }
 
@@ -2147,22 +2362,23 @@ impl SingleFileDB {
     tx_handle: &Arc<Mutex<SingleFileTxState>>,
     record: WalRecord,
   ) -> Result<()> {
-    let mut record_bytes = record.build();
     let mut tx = tx_handle.lock();
+    // A record kept back is built straight into the transaction's buffer.
     if let (false, Some(from)) = (tx.bulk_load, tx.wal_deferred_from) {
-      let kept = tx.pending_wal.len() - from + record_bytes.len();
+      let kept = tx.pending_wal.len() - from + record.estimated_size();
       if !tx.savepoints.is_empty() || kept <= super::WAL_DEFER_BYTES {
-        tx.pending_wal.extend_from_slice(&record_bytes);
+        record.build_into(&mut tx.pending_wal);
         return Ok(());
       }
       drop(tx);
-      return self.write_deferred_records(tx_handle, &record_bytes);
+      return self.write_deferred_records(tx_handle, &record.build());
     }
     if tx.bulk_load {
-      tx.pending_wal.extend_from_slice(&record_bytes);
+      record.build_into(&mut tx.pending_wal);
       return Ok(());
     }
     drop(tx);
+    let mut record_bytes = record.build();
     self.write_built_wal_waiting_then(&mut record_bytes, || {})?;
     if self.primary_replication.is_some() {
       tx_handle

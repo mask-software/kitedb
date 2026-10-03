@@ -7,7 +7,7 @@ use crate::core::snapshot::reader::SnapshotData;
 use crate::core::wal::record::{
   build_add_edge_payload, build_add_edge_props_payload, build_add_edges_batch_payload,
   build_add_edges_props_batch_payload, build_add_node_label_payload, build_create_node_payload,
-  build_create_nodes_batch_payload, build_define_etype_payload, build_define_label_payload,
+  build_create_nodes_batch_payload_of, build_define_etype_payload, build_define_label_payload,
   build_define_propkey_payload, build_del_edge_prop_payload, build_del_node_prop_payload,
   build_delete_edge_payload, build_delete_node_payload, build_remove_node_label_payload,
   build_set_edge_prop_payload, build_set_edge_props_payload, build_set_node_prop_payload,
@@ -413,10 +413,11 @@ impl SingleFileDB {
     let (txid, tx_handle) = self.require_write_tx_handle()?;
     if keys.iter().any(Option::is_some) {
       self.with_tx_view(&tx_handle, |view| {
-        let mut batch_keys = HashSet::with_capacity(keys.len());
+        // One key cannot repeat itself: only a larger batch needs the set.
+        let mut batch_keys = (keys.len() > 1).then(|| HashSet::with_capacity(keys.len()));
         for &key in keys.iter().flatten() {
           view.check_key_free(key)?;
-          if !batch_keys.insert(key) {
+          if batch_keys.as_mut().is_some_and(|seen| !seen.insert(key)) {
             return Err(KiteError::DuplicateKey(key.to_string()));
           }
         }
@@ -428,21 +429,20 @@ impl SingleFileDB {
       node_ids.push(self.alloc_node_id()?);
     }
 
-    let entries: Vec<(NodeId, Option<&str>)> =
-      node_ids.iter().copied().zip(keys.iter().copied()).collect();
+    let entries = node_ids.iter().copied().zip(keys.iter().copied());
 
     let record = WalRecord::new(
       WalRecordType::CreateNodesBatch,
       txid,
-      build_create_nodes_batch_payload(&entries),
+      build_create_nodes_batch_payload_of(entries.clone()),
     );
     self.write_wal_tx(&tx_handle, record)?;
 
     let mut tx = tx_handle.lock();
-    for (node_id, key) in entries.iter() {
-      tx.pending.create_node(*node_id, *key);
+    for (node_id, key) in entries.clone() {
+      tx.pending.create_node(node_id, key);
     }
-    let written = entries.iter().flat_map(|&(node_id, key)| {
+    let written = entries.flat_map(|(node_id, key)| {
       [TxKey::Node(node_id)]
         .into_iter()
         .chain(key.map(|key| TxKey::Key(key.into())))

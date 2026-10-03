@@ -53,24 +53,40 @@ impl HistoryPlan {
   /// may drop a chain, which only makes the plan record a node in full that it could have
   /// recorded as fresh.
   pub(super) fn of(pending: &DeltaState, chains: Option<&VersionChainManager>) -> Self {
-    let mut fresh = Vec::new();
     let mut created = Vec::new();
+    // Runs straight from the ids, which mostly come in order (a dense map
+    // lists them so): sorted and joined after only if they did not.
+    let mut fresh_runs: Vec<(NodeId, NodeId)> = Vec::new();
+    let mut in_order = true;
     for &node_id in pending.created_nodes.keys() {
       if pending.is_node_deleted(node_id) || chains.is_some_and(|c| c.has_node_history(node_id)) {
         created.push(node_id);
-      } else {
-        fresh.push(node_id);
+        continue;
       }
-    }
-    fresh.sort_unstable();
-    let mut fresh_runs: Vec<(NodeId, NodeId)> = Vec::new();
-    for &node_id in &fresh {
       match fresh_runs.last_mut() {
         Some((_, end)) if *end == node_id => *end += 1,
-        _ => fresh_runs.push((node_id, node_id + 1)),
+        Some(&mut (_, end)) => {
+          in_order &= node_id > end;
+          fresh_runs.push((node_id, node_id + 1));
+        }
+        None => fresh_runs.push((node_id, node_id + 1)),
       }
     }
-    let is_fresh = |node_id: NodeId| fresh.binary_search(&node_id).is_ok();
+    if !in_order {
+      fresh_runs.sort_unstable();
+      let mut joined: Vec<(NodeId, NodeId)> = Vec::with_capacity(fresh_runs.len());
+      for (start, end) in fresh_runs {
+        match joined.last_mut() {
+          Some((_, last_end)) if *last_end >= start => *last_end = (*last_end).max(end),
+          _ => joined.push((start, end)),
+        }
+      }
+      fresh_runs = joined;
+    }
+    let is_fresh = |node_id: NodeId| {
+      let after = fresh_runs.partition_point(|&(start, _)| start <= node_id);
+      after > 0 && node_id < fresh_runs[after - 1].1
+    };
     let edge_is_fresh = |&(src, _, dst): &Edge| is_fresh(src) || is_fresh(dst);
     let added_edges = pending
       .out_add

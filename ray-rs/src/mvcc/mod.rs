@@ -73,7 +73,9 @@ mod b4_mvcc_phase2_tests;
 pub use conflict::{ConflictDetector, ConflictError, ConflictInfo, ConflictType};
 pub use gc::{GarbageCollector, GcConfig, GcResult, GcStats, SharedGcState};
 pub use manager::{HistoryWriter, MvccManager};
-pub use tx_manager::{CommittedWritesStats, TxKeyGroups, TxManager, TxManagerError};
+pub use tx_manager::{
+  CommittedWritesStats, TxKeyGroups, TxManager, TxManagerError, KEY_GROUPS_MIN_KEYS,
+};
 pub use version_chain::{
   PooledVersion, SoaPropertyVersions, VersionChainCounts, VersionChainManager,
 };
