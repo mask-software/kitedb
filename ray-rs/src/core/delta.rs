@@ -7,6 +7,7 @@ use crate::types::*;
 use hashbrown::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap};
 use std::hash::Hash;
+use std::sync::OnceLock;
 
 /// A table of a delta (one of its maps or sets), for `DeltaState::grow_tables_for`.
 trait Table {
@@ -70,12 +71,18 @@ const DENSE_MIN_NODES: usize = 1024;
 const DENSE_MAX_SPREAD: u64 = 4;
 /// A dense part covers at most this many ids from its first.
 const DENSE_MAX_IDS: u64 = 1 << 26;
+/// A `NodeMap` read in order while it holds more than this many sparse ids
+/// keeps them in order from then on; reads in order sort fewer as they go.
+const ORDER_MIN_SPARSE: usize = 64;
 
 /// The nodes a delta created (or recreated), with their state.
 pub type CreatedNodes = NodeMap<NodeDelta>;
-/// A delta's added edge patches in one direction, by node. (Tombstones, which
-/// name edges of nodes committed before, stay in hash maps.)
-pub type EdgePatches = NodeMap<BTreeSet<EdgePatch>>;
+
+/// The nodes a delta added each label to: those of its created and modified
+/// nodes whose `labels` name it, and possibly more, as removing a label or a
+/// node leaves the entry (readers check the node). `nodes_with_label` reads it
+/// instead of every node the delta holds.
+pub type LabelIndex = DeltaMap<LabelId, Vec<NodeId>>;
 
 /// A delta's map from node ids to `V`: its created nodes, and its edge patches
 /// by node.
@@ -89,13 +96,18 @@ pub type EdgePatches = NodeMap<BTreeSet<EdgePatch>>;
 ///
 /// It offers what code uses of a map: `get`, `get_key_value`, `get_mut`,
 /// `contains_key`, `insert`, `remove`, `entry(..).or_default()`, `iter`,
-/// `keys`, `values`, `drain`, `len`, `is_empty`, `clear`.
+/// `keys`, `values`, `drain`, `len`, `is_empty`, `clear`; and `keys_from`,
+/// its ids in order from one on, which pages read instead of every entry.
 #[derive(Debug, Clone)]
 pub struct NodeMap<V> {
   /// The dense part, if taken: ids `[base, base + DENSE_MAX_IDS)` (some of them).
   dense: Option<DenseNodes<V>>,
   /// Entries outside the dense part.
   sparse: DeltaMap<NodeId, V>,
+  /// The ids of `sparse` in order, from the first read in order that found
+  /// more than `ORDER_MIN_SPARSE` of them on (see `sparse_order`). Maps never
+  /// read in order (a transaction's, mostly) never pay for it.
+  order: OnceLock<BTreeSet<NodeId>>,
 }
 
 impl<V> Default for NodeMap<V> {
@@ -103,6 +115,7 @@ impl<V> Default for NodeMap<V> {
     Self {
       dense: None,
       sparse: DeltaMap::default(),
+      order: OnceLock::new(),
     }
   }
 }
@@ -218,6 +231,9 @@ impl<V> NodeMap<V> {
     if !self.dense_covers(id) {
       let replaced = self.sparse.insert(id, value);
       if replaced.is_none() {
+        if let Some(order) = self.order.get_mut() {
+          order.insert(id);
+        }
         self.take_dense_part();
       }
       return replaced;
@@ -240,7 +256,11 @@ impl<V> NodeMap<V> {
 
   pub fn remove(&mut self, id: &NodeId) -> Option<V> {
     if !self.dense_covers(*id) {
-      return self.sparse.remove(id);
+      let removed = self.sparse.remove(id);
+      if let (Some(_), Some(order)) = (&removed, self.order.get_mut()) {
+        order.remove(id);
+      }
+      return removed;
     }
     let dense = self.dense.as_mut()?;
     let (chunk_index, slot) = dense.slot_of(*id)?;
@@ -276,12 +296,59 @@ impl<V> NodeMap<V> {
     self.iter().map(|(id, _)| id)
   }
 
+  /// The ids from `from` on, in order: a seek into each part, so taking `n`
+  /// costs about `n` entries (plus sorting up to `ORDER_MIN_SPARSE` sparse
+  /// ids), however many the map holds. The first such read of a map with more
+  /// sparse ids puts them in order (see `sparse_order`).
+  pub fn keys_from(&self, from: NodeId) -> NodeMapKeysFrom<'_, V> {
+    let sparse = match self.sparse_order() {
+      Some(order) => SparseKeys::Ordered(order.range(from..)),
+      None => {
+        let mut ids: Vec<NodeId> = self
+          .sparse
+          .keys()
+          .copied()
+          .filter(|&id| id >= from)
+          .collect();
+        ids.sort_unstable();
+        SparseKeys::Sorted(ids.into_iter())
+      }
+    };
+    let dense = match &self.dense {
+      None => DenseKeys::default(),
+      Some(dense) => {
+        let (chunk, slot) = match from.checked_sub(dense.base) {
+          None => (0, 0),
+          Some(offset) if offset < DENSE_MAX_IDS => {
+            let offset = offset as usize;
+            (offset / CHUNK_IDS, offset % CHUNK_IDS)
+          }
+          Some(_) => (dense.chunks.len(), 0),
+        };
+        DenseKeys {
+          chunks: dense.chunks.get(chunk..).unwrap_or_default(),
+          slot,
+        }
+      }
+    };
+    let mut keys = NodeMapKeysFrom {
+      dense,
+      sparse,
+      next_dense: None,
+      next_sparse: None,
+    };
+    keys.next_dense = keys.dense.next();
+    keys.next_sparse = keys.sparse.next();
+    keys
+  }
+
   pub fn values(&self) -> impl Iterator<Item = &V> + '_ {
     self.iter().map(|(_, value)| value)
   }
 
   /// Take every entry out, leaving this empty.
   pub fn drain(&mut self) -> NodeMapDrain<'_, V> {
+    self.order = OnceLock::new();
     let chunks = self
       .dense
       .as_mut()
@@ -300,6 +367,22 @@ impl<V> NodeMap<V> {
   pub fn clear(&mut self) {
     self.dense = None;
     self.sparse.clear();
+    self.order = OnceLock::new();
+  }
+
+  /// The sparse ids in order, if kept, or put in order now if there are more
+  /// than `ORDER_MIN_SPARSE` of them: then changes keep them in order (a sorted
+  /// set insert per sparse id), until the map is cleared or takes a dense part.
+  /// Concurrent readers (under the delta's read lock) build it once.
+  fn sparse_order(&self) -> Option<&BTreeSet<NodeId>> {
+    if let Some(order) = self.order.get() {
+      return Some(order);
+    }
+    (self.sparse.len() > ORDER_MIN_SPARSE).then(|| {
+      self
+        .order
+        .get_or_init(|| self.sparse.keys().copied().collect())
+    })
   }
 
   /// Take the dense part once the map holds `DENSE_MIN_NODES` (and at each
@@ -335,6 +418,8 @@ impl<V> NodeMap<V> {
         self.insert(id, value);
       }
     }
+    // Put the rest in order again when next read so.
+    self.order = OnceLock::new();
   }
 
   /// Capacity of the hash map part (test instrumentation: the dense part never
@@ -438,6 +523,92 @@ impl<'a, V> IntoIterator for &'a NodeMap<V> {
   }
 }
 
+/// Ids of a `NodeMap` in order, from one on (see `NodeMap::keys_from`): its
+/// dense part's and its sparse ids', merged.
+pub struct NodeMapKeysFrom<'a, V> {
+  dense: DenseKeys<'a, V>,
+  sparse: SparseKeys<'a>,
+  next_dense: Option<NodeId>,
+  next_sparse: Option<NodeId>,
+}
+
+impl<V> Iterator for NodeMapKeysFrom<'_, V> {
+  type Item = NodeId;
+
+  #[inline]
+  fn next(&mut self) -> Option<NodeId> {
+    // The two parts hold distinct ids.
+    match (self.next_dense, self.next_sparse) {
+      (Some(dense), Some(sparse)) if sparse < dense => {
+        self.next_sparse = self.sparse.next();
+        Some(sparse)
+      }
+      (Some(dense), _) => {
+        self.next_dense = self.dense.next();
+        Some(dense)
+      }
+      (None, sparse) => {
+        self.next_sparse = self.sparse.next();
+        sparse
+      }
+    }
+  }
+}
+
+/// The ids of a dense part's chunks in order, from a slot of the first on.
+struct DenseKeys<'a, V> {
+  chunks: &'a [Option<Box<NodeChunk<V>>>],
+  /// The next slot of `chunks[0]`
+  slot: usize,
+}
+
+impl<V> Default for DenseKeys<'_, V> {
+  fn default() -> Self {
+    Self {
+      chunks: &[],
+      slot: 0,
+    }
+  }
+}
+
+impl<V> Iterator for DenseKeys<'_, V> {
+  type Item = NodeId;
+
+  fn next(&mut self) -> Option<NodeId> {
+    loop {
+      let (first, rest) = self.chunks.split_first()?;
+      if let Some(chunk) = first {
+        while let Some(slot) = chunk.slots.get(self.slot) {
+          self.slot += 1;
+          if let Some((id, _)) = slot {
+            return Some(*id);
+          }
+        }
+      }
+      self.chunks = rest;
+      self.slot = 0;
+    }
+  }
+}
+
+/// A `NodeMap`'s sparse ids in order: from its order, or sorted as read.
+enum SparseKeys<'a> {
+  Ordered(std::collections::btree_set::Range<'a, NodeId>),
+  Sorted(std::vec::IntoIter<NodeId>),
+}
+
+impl Iterator for SparseKeys<'_> {
+  type Item = NodeId;
+
+  #[inline]
+  fn next(&mut self) -> Option<NodeId> {
+    match self {
+      Self::Ordered(ids) => ids.next().copied(),
+      Self::Sorted(ids) => ids.next(),
+    }
+  }
+}
+
 impl<V> Table for NodeMap<V> {
   fn len(&self) -> usize {
     self.sparse.len()
@@ -455,6 +626,105 @@ impl<V> Table for NodeMap<V> {
     if self.dense.is_none() {
       self.sparse.reserve(additional);
     }
+  }
+}
+
+/// A delta's added edge patches in one direction, by node, with their count.
+/// (Tombstones, which name edges of nodes committed before, stay in hash
+/// maps.) It reads as its `NodeMap` of patch sets; changes go through it, so
+/// the count stays right.
+#[derive(Debug, Clone, Default)]
+pub struct EdgePatches {
+  sets: NodeMap<BTreeSet<EdgePatch>>,
+  /// The patches of all the sets: `count_edges` takes it instead of adding
+  /// them up.
+  patches: usize,
+}
+
+impl std::ops::Deref for EdgePatches {
+  type Target = NodeMap<BTreeSet<EdgePatch>>;
+
+  #[inline]
+  fn deref(&self) -> &Self::Target {
+    &self.sets
+  }
+}
+
+impl<'a> IntoIterator for &'a EdgePatches {
+  type Item = (&'a NodeId, &'a BTreeSet<EdgePatch>);
+  type IntoIter = NodeMapIter<'a, BTreeSet<EdgePatch>>;
+
+  fn into_iter(self) -> Self::IntoIter {
+    self.sets.iter()
+  }
+}
+
+impl EdgePatches {
+  /// The number of patches, in all the sets.
+  #[inline]
+  pub fn patch_count(&self) -> usize {
+    self.patches
+  }
+
+  /// Add `patch` to `node`'s set; whether it was not there.
+  pub fn insert_patch(&mut self, node: NodeId, patch: EdgePatch) -> bool {
+    let inserted = self.sets.entry(node).or_default().insert(patch);
+    self.patches += usize::from(inserted);
+    inserted
+  }
+
+  /// Remove `patch` from `node`'s set, and the set once empty; whether it was
+  /// there.
+  pub fn remove_patch(&mut self, node: NodeId, patch: &EdgePatch) -> bool {
+    let Some(set) = self.sets.get_mut(&node) else {
+      return false;
+    };
+    if !set.remove(patch) {
+      return false;
+    }
+    self.patches -= 1;
+    if set.is_empty() {
+      self.sets.remove(&node);
+    }
+    true
+  }
+
+  /// Add `patches` to `node`'s set: moved in whole if it has none.
+  fn extend_patches(&mut self, node: NodeId, patches: BTreeSet<EdgePatch>) {
+    match self.sets.get_mut(&node) {
+      Some(existing) => {
+        let before = existing.len();
+        existing.extend(patches);
+        self.patches += existing.len() - before;
+      }
+      None => {
+        self.patches += patches.len();
+        self.sets.insert(node, patches);
+      }
+    }
+  }
+
+  /// Take every set out, leaving this empty.
+  pub fn drain(&mut self) -> NodeMapDrain<'_, BTreeSet<EdgePatch>> {
+    self.patches = 0;
+    self.sets.drain()
+  }
+
+  pub fn clear(&mut self) {
+    self.patches = 0;
+    self.sets.clear();
+  }
+}
+
+impl Table for EdgePatches {
+  fn len(&self) -> usize {
+    Table::len(&self.sets)
+  }
+  fn capacity(&self) -> usize {
+    Table::capacity(&self.sets)
+  }
+  fn reserve(&mut self, additional: usize) {
+    Table::reserve(&mut self.sets, additional)
   }
 }
 
@@ -516,12 +786,16 @@ impl DeltaState {
 
   /// Remove an add patch (`added`) or a tombstone (`!added`) in both directions.
   fn remove_edge_patch(&mut self, src: NodeId, etype: ETypeId, dst: NodeId, added: bool) {
+    let (out_patch, in_patch) = (
+      EdgePatch { etype, other: dst },
+      EdgePatch { etype, other: src },
+    );
     if added {
-      remove_patch(&mut self.out_add, src, EdgePatch { etype, other: dst });
-      remove_patch(&mut self.in_add, dst, EdgePatch { etype, other: src });
+      self.out_add.remove_patch(src, &out_patch);
+      self.in_add.remove_patch(dst, &in_patch);
     } else {
-      remove_patch(&mut self.out_del, src, EdgePatch { etype, other: dst });
-      remove_patch(&mut self.in_del, dst, EdgePatch { etype, other: src });
+      remove_tombstone(&mut self.out_del, src, out_patch);
+      remove_tombstone(&mut self.in_del, dst, in_patch);
     }
   }
 
@@ -579,10 +853,10 @@ impl DeltaState {
           self.out_del.remove(&src);
         }
       } else {
-        self.out_add.entry(src).or_default().insert(patch);
+        self.out_add.insert_patch(src, patch);
       }
     } else {
-      self.out_add.entry(src).or_default().insert(patch);
+      self.out_add.insert_patch(src, patch);
     }
 
     // Same for in-edges
@@ -593,10 +867,10 @@ impl DeltaState {
           self.in_del.remove(&dst);
         }
       } else {
-        self.in_add.entry(dst).or_default().insert(in_patch);
+        self.in_add.insert_patch(dst, in_patch);
       }
     } else {
-      self.in_add.entry(dst).or_default().insert(in_patch);
+      self.in_add.insert_patch(dst, in_patch);
     }
   }
 
@@ -606,22 +880,12 @@ impl DeltaState {
     self.edge_props.remove(&(src, etype, dst));
     let patch = EdgePatch { etype, other: dst };
 
-    // Check if cancels a pending add
-    if let Some(add_set) = self.out_add.get_mut(&src) {
-      if add_set.remove(&patch) {
-        if add_set.is_empty() {
-          self.out_add.remove(&src);
-        }
-        // Also remove from in_add
-        if let Some(in_add_set) = self.in_add.get_mut(&dst) {
-          let in_patch = EdgePatch { etype, other: src };
-          in_add_set.remove(&in_patch);
-          if in_add_set.is_empty() {
-            self.in_add.remove(&dst);
-          }
-        }
-        return;
-      }
+    // Check if cancels a pending add (and its in-edge copy)
+    if self.out_add.remove_patch(src, &patch) {
+      self
+        .in_add
+        .remove_patch(dst, &EdgePatch { etype, other: src });
+      return;
     }
 
     // Add to delete sets
@@ -663,6 +927,7 @@ impl DeltaState {
     self.new_propkeys.clear();
     self.key_index.clear();
     self.pending_vectors.clear();
+    self.labeled_nodes.clear();
   }
 
   /// Empty the delta for another transaction to use, and return whether it
@@ -684,6 +949,7 @@ impl DeltaState {
       Table::capacity(&self.new_propkeys),
       Table::capacity(&self.key_index),
       self.pending_vectors.capacity(),
+      self.labeled_nodes.capacity(),
     ]
     .into_iter()
     .all(|capacity| capacity <= max_capacity)
@@ -701,7 +967,7 @@ impl DeltaState {
 
   /// Total edges added across all nodes
   pub fn total_edges_added(&self) -> usize {
-    self.out_add.values().map(|s| s.len()).sum()
+    self.out_add.patch_count()
   }
 
   /// Total edges deleted across all nodes
@@ -901,7 +1167,13 @@ impl DeltaState {
     let labels = node_delta
       .labels
       .get_or_insert_with(std::collections::HashSet::new);
-    labels.insert(label_id);
+    if labels.insert(label_id) {
+      self
+        .labeled_nodes
+        .entry(label_id)
+        .or_default()
+        .push(node_id);
+    }
   }
 
   /// Remove a label from a node
@@ -1135,6 +1407,17 @@ impl DeltaState {
         self.merge_modified_node(node_id, node_delta);
       }
     }
+    // The transaction added labels with `add_node_label`, which indexed them:
+    // the merged nodes' labels are the committed ones' and those.
+    if !pending.labeled_nodes.is_empty() {
+      for (label_id, nodes) in pending.labeled_nodes.drain() {
+        self
+          .labeled_nodes
+          .entry(label_id)
+          .or_default()
+          .extend(nodes);
+      }
+    }
 
     // Each direction merges from its own patches (a delta keeps them in
     // both): an add cancels a tombstone in its direction, as in `add_edge`.
@@ -1315,36 +1598,15 @@ impl DeltaState {
   }
 }
 
-/// A delta's edge patch sets by node: added patches (`EdgePatches`) or
-/// tombstones (a hash map).
-trait PatchSets {
-  fn patches_mut(&mut self, node: NodeId) -> Option<&mut BTreeSet<EdgePatch>>;
-  fn remove_patches(&mut self, node: NodeId);
-}
-
-impl PatchSets for EdgePatches {
-  fn patches_mut(&mut self, node: NodeId) -> Option<&mut BTreeSet<EdgePatch>> {
-    self.get_mut(&node)
-  }
-  fn remove_patches(&mut self, node: NodeId) {
-    self.remove(&node);
-  }
-}
-
-impl PatchSets for DeltaMap<NodeId, BTreeSet<EdgePatch>> {
-  fn patches_mut(&mut self, node: NodeId) -> Option<&mut BTreeSet<EdgePatch>> {
-    self.get_mut(&node)
-  }
-  fn remove_patches(&mut self, node: NodeId) {
-    self.remove(&node);
-  }
-}
-
-/// Remove `patch` from `node`'s set in `sets`, and the set once empty.
-fn remove_patch(sets: &mut impl PatchSets, node: NodeId, patch: EdgePatch) {
-  if let Some(set) = sets.patches_mut(node) {
+/// Remove `patch` from `node`'s tombstones in `sets`, and the set once empty.
+fn remove_tombstone(
+  sets: &mut DeltaMap<NodeId, BTreeSet<EdgePatch>>,
+  node: NodeId,
+  patch: EdgePatch,
+) {
+  if let Some(set) = sets.get_mut(&node) {
     if set.remove(&patch) && set.is_empty() {
-      sets.remove_patches(node);
+      sets.remove(&node);
     }
   }
 }
@@ -1362,17 +1624,12 @@ fn merge_added_patches(
     return;
   }
   let Some(node_tombstones) = tombstones.get_mut(&node) else {
-    match adds.get_mut(&node) {
-      Some(existing) => existing.extend(patches),
-      None => {
-        adds.insert(node, patches);
-      }
-    }
+    adds.extend_patches(node, patches);
     return;
   };
   for patch in patches {
     if !node_tombstones.remove(&patch) {
-      adds.entry(node).or_default().insert(patch);
+      adds.insert_patch(node, patch);
     }
   }
   if node_tombstones.is_empty() {
@@ -1793,6 +2050,138 @@ mod tests {
     );
     nodes.clear();
     assert!(nodes.is_empty() && !nodes.contains_key(&10_000));
+  }
+
+  /// `keys_from` lists a `NodeMap`'s ids in order from any id, as a sorted map would:
+  /// sparse ids below, inside and past the dense part's window, kept in order or not,
+  /// through inserts, removals, freed chunks, the switch to a dense part, drains and
+  /// clears; and `EdgePatches` counts its patches through every change.
+  #[test]
+  fn node_maps_list_their_ids_in_order() {
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+    let check = |nodes: &NodeMap<u32>, model: &std::collections::BTreeMap<NodeId, u32>| {
+      let mut froms = vec![0, 1, NodeId::MAX];
+      froms.extend(
+        model
+          .keys()
+          .flat_map(|&id| [id.saturating_sub(1), id, id + 1])
+          .take(64),
+      );
+      for from in froms {
+        let listed: Vec<NodeId> = nodes.keys_from(from).collect();
+        let expected: Vec<NodeId> = model.range(from..).map(|(&id, _)| id).collect();
+        assert_eq!(listed, expected, "from {from}");
+      }
+      assert_eq!(nodes.len(), model.len());
+    };
+    for seed in 0..4u64 {
+      let mut rng = StdRng::seed_from_u64(seed);
+      let mut nodes = NodeMap::<u32>::default();
+      let mut model = std::collections::BTreeMap::new();
+      // Spread ids (sparse, past `ORDER_MIN_SPARSE` so kept in order), then a run that
+      // takes a dense part, ids far past its window, and churn.
+      let spread: Vec<NodeId> = (0..100).map(|i| 1000 + i * 997).collect();
+      let run: Vec<NodeId> = (200_000..203_000).collect();
+      let far: Vec<NodeId> = (0..80).map(|i| 200_000 + DENSE_MAX_IDS + i * 31).collect();
+      for (step, &id) in spread.iter().chain(&run).chain(&far).enumerate() {
+        nodes.insert(id, step as u32);
+        model.insert(id, step as u32);
+        if step % 397 == 0 {
+          check(&nodes, &model);
+        }
+      }
+      assert!(
+        nodes.dense.is_some(),
+        "seed {seed}: the run took a dense part"
+      );
+      check(&nodes, &model);
+      assert!(
+        nodes.order.get().is_some(),
+        "seed {seed}: the sparse ids are kept in order"
+      );
+      // Free whole chunks, remove at random, reinsert some.
+      for id in 200_064..200_256 {
+        nodes.remove(&id);
+        model.remove(&id);
+      }
+      for _ in 0..2000 {
+        let pool = [&spread[..], &run[..], &far[..]][rng.gen_range(0..3)];
+        let id = pool[rng.gen_range(0..pool.len())];
+        if rng.gen_bool(0.5) {
+          assert_eq!(nodes.remove(&id), model.remove(&id));
+        } else {
+          assert_eq!(nodes.insert(id, 7), model.insert(id, 7));
+        }
+      }
+      check(&nodes, &model);
+      let mut drained: Vec<NodeId> = nodes.drain().map(|(id, _)| id).collect();
+      drained.sort_unstable();
+      assert_eq!(drained, model.keys().copied().collect::<Vec<_>>());
+      model.clear();
+      check(&nodes, &model);
+      // Few sparse ids: sorted as read.
+      for id in [9, 3, 7, 1_000_000, 5] {
+        nodes.insert(id, 0);
+        model.insert(id, 0);
+      }
+      check(&nodes, &model);
+      assert!(
+        nodes.order.get().is_none(),
+        "few sparse ids are sorted as read"
+      );
+      nodes.clear();
+      model.clear();
+      check(&nodes, &model);
+    }
+
+    // A map not read in order keeps no order; once read so, changes keep it.
+    let mut nodes = NodeMap::<u32>::default();
+    for i in 0..100 {
+      nodes.insert(1 + i * 1000, 0);
+    }
+    assert!(nodes.order.get().is_none());
+    assert_eq!(nodes.keys_from(0).count(), 100);
+    nodes.insert(500, 0);
+    nodes.remove(&1001);
+    assert!(nodes
+      .order
+      .get()
+      .is_some_and(|order| order.contains(&500) && !order.contains(&1001)));
+    assert_eq!(nodes.keys_from(400).next(), Some(500));
+
+    // `EdgePatches` counts its patches through adds, deletes, cancels and merges.
+    let mut rng = StdRng::seed_from_u64(9);
+    let mut delta = DeltaState::new();
+    let count = |delta: &DeltaState| {
+      let out: usize = delta.out_add.values().map(BTreeSet::len).sum();
+      let incoming: usize = delta.in_add.values().map(BTreeSet::len).sum();
+      assert_eq!(delta.out_add.patch_count(), out);
+      assert_eq!(delta.in_add.patch_count(), incoming);
+      assert_eq!(out, incoming, "both directions hold every patch");
+    };
+    for round in 0..40 {
+      let mut pending = DeltaState::new();
+      for _ in 0..50 {
+        let (src, dst) = (rng.gen_range(1..60), rng.gen_range(1..60));
+        let etype = rng.gen_range(1..3);
+        match rng.gen_range(0..10) {
+          0..=4 => pending.add_edge(src, etype, dst),
+          5..=6 => pending.delete_edge(src, etype, dst),
+          7 => pending.delete_edge_over(src, etype, dst, rng.gen_bool(0.5)),
+          8 => pending.create_node(src, None),
+          _ => pending.delete_node(src),
+        }
+        count(&pending);
+      }
+      delta.merge_from(&mut pending);
+      count(&delta);
+      count(&pending);
+      if round % 10 == 9 {
+        delta.clear();
+        count(&delta);
+      }
+    }
   }
 
   /// Ids too spread out for a dense part stay in the map.
