@@ -2,7 +2,17 @@ import { createFileRoute } from "@tanstack/solid-router";
 import { DocNotFound } from "~/components/doc-not-found";
 import DocPage from "~/components/doc-page";
 import { MultiLangCode } from "~/components/multi-lang-code";
+import {
+	ANN_COMPARISON,
+	BENCH_MACHINE,
+	BULK_LOAD,
+	formatCount,
+	formatRateShort,
+	formatRatio,
+} from "~/lib/benchmarks";
 import { loadDocSlug } from "~/lib/doc-route";
+
+const [ANN_IVF, ANN_IVF_PQ] = ANN_COMPARISON;
 
 export const Route = createFileRoute("/docs/guides/$")({
 	loader: loadDocSlug,
@@ -697,9 +707,12 @@ print(f"Total vectors: {stats['totalVectors']}")`}
 					</li>
 					<li>
 						<strong>IVF-PQ</strong> from 512 dimensions and 50,000 vectors on.
-						Searches scan compact product-quantization codes (about 2x faster at
-						that size in our measurements) and re-rank the best candidates by
-						exact distance. Raise <code>rerankFactor</code> for higher recall.
+						Searches scan compact product-quantization codes (
+						{formatRatio(ANN_IVF.search.p50 / ANN_IVF_PQ.search.p50)} faster
+						than IVF at 768 dimensions and 50,000 vectors in{" "}
+						<a href="/docs/benchmarks/vector#ivf-vs-ivf-pq">our measurements</a>
+						) and re-rank the best candidates by exact distance. Raise{" "}
+						<code>rerankFactor</code> for higher recall.
 					</li>
 				</ul>
 				<p>
@@ -1188,15 +1201,22 @@ if db.has_transaction():
 
 				<h2 id="bulk">Bulk ingest (fastest path)</h2>
 				<p>
-					A bulk-load transaction is as fast with MVCC (the default) as without
-					it: for 200k nodes and 1M edges with two properties each, loaded in
-					batches of 5,000, about 1.5–1.7M nodes/s and 0.6M edges/s in both
-					modes on an M-series Mac. It runs alone among writers (it waits for
-					open write transactions, and new ones wait for it), and readers never
-					wait for it. A read transaction left open across the load slows it
-					down, because the load's commits record version history for that
-					reader (about 1.25M nodes/s and 0.38M edges/s in the same test). Use
-					it for one-shot ingest or ETL jobs.
+					A bulk-load transaction works with MVCC (the default): for{" "}
+					{formatCount(BULK_LOAD.nodes)} nodes and{" "}
+					{formatCount(BULK_LOAD.edges)} edges with {BULK_LOAD.props} properties
+					each, loaded in batches of {BULK_LOAD.batch.toLocaleString("en-US")},
+					it ran at {formatRateShort(BULK_LOAD.mvcc.nodesPerSec)} for nodes and{" "}
+					{formatRateShort(BULK_LOAD.mvcc.edgesPerSec)} for edges on an{" "}
+					{BENCH_MACHINE.cpu}, against{" "}
+					{formatRateShort(BULK_LOAD.noMvcc.nodesPerSec)} and{" "}
+					{formatRateShort(BULK_LOAD.noMvcc.edgesPerSec)} with MVCC off. It runs
+					alone among writers (it waits for open write transactions, and new
+					ones wait for it), and readers never wait for it. A read transaction
+					left open across the load slows it down, because the load's commits
+					record version history for that reader (
+					{formatRateShort(BULK_LOAD.reader.nodesPerSec)} for nodes and{" "}
+					{formatRateShort(BULK_LOAD.reader.edgesPerSec)} for edges in the same
+					test). Use it for one-shot ingest or ETL jobs.
 				</p>
 				<MultiLangCode
 					typescript={`import { Database } from '@kitedb/core';

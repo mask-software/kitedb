@@ -37,7 +37,7 @@ DOCS_URL=http://localhost:5398 bun run test
 
 - `src/routes/`: file-based routes. `index.tsx` is the homepage, `docs.tsx` is the docs layout (sidebar and nav), and `docs/` holds the pages. Each section (`getting-started`, `guides`, `api`, `benchmarks`, `internals`) has a `$.tsx` splat route that renders its pages by slug. Slugs not listed in `lib/docs.ts` return a 404.
 - `src/lib/docs.ts`: the docs navigation (`docsStructure`). To add a page, add an entry here and a matching branch in the section's `$.tsx`.
-- `src/lib/benchmarks.ts`: every benchmark number on the site, each tied to a raw log in `docs/benchmarks/results/`.
+- `src/lib/benchmarks.ts`: every benchmark number on the site, each tied to a raw log in `docs/benchmarks/results/`. It reads them from `src/lib/benchmark-data.gen.ts`, which `bun run bench:data` (`scripts/benchmark-data.ts`) generates from the logs of a `ray-rs/scripts/bench-refresh.sh` run; `tests/benchmarks.test.ts` checks the two still match.
 - `src/components/home/`: homepage sections.
 - `src/components/`: shared pieces (doc page shell, code blocks, search, nav).
 - `src/styles.css`: Tailwind setup and design tokens (`--color-kite-*` in `@theme`).

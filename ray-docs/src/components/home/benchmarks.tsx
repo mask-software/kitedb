@@ -3,6 +3,7 @@ import { createSignal, For, Show } from "solid-js";
 import { GITHUB_URL } from "~/components/github-icon";
 import {
 	BENCH_ENVIRONMENT,
+	BENCH_MACHINE,
 	formatNs,
 	LATENCY_ROWS,
 	type LatencyRow,
@@ -186,11 +187,12 @@ export function Benchmarks() {
 				<SectionHeading
 					id="benchmarks-heading"
 					eyebrow="Benchmarks"
-					title="Latency on an Apple M4"
+					title={`Latency on an ${BENCH_MACHINE.cpu}`}
 				>
 					Every number here comes from a raw log in the repository. The
 					benchmark docs list the commands to reproduce them on your own
-					hardware.
+					hardware. The macOS clock ticks every 41.67 ns, so 42 ns means one
+					tick or less.
 				</SectionHeading>
 
 				<div class="reveal mt-16 overflow-hidden rounded-2xl border border-kite-line bg-kite-bg">

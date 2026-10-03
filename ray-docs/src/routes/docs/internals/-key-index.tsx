@@ -1,6 +1,13 @@
 import { For, Show } from "solid-js";
 import DocPage from "~/components/doc-page";
 import {
+	BENCH_DATE,
+	BENCH_MACHINE,
+	GRAPH_SIZE,
+	headlineParts,
+	RUST_GRAPH,
+} from "~/lib/benchmarks";
+import {
 	CELL,
 	CELL_HIGHLIGHT,
 	CELL_PLAIN,
@@ -55,7 +62,11 @@ function KeyIndexProblem() {
 					<span class="text-[13px] text-slate-500">average case</span>
 				</div>
 				<p class="mt-2 text-[13px] text-slate-500">
-					Measured p50: <span class="font-semibold text-white">125</span> ns
+					Measured p50:{" "}
+					<span class="font-semibold text-white">
+						{headlineParts(RUST_GRAPH.keyLookup.p50).value}
+					</span>{" "}
+					{headlineParts(RUST_GRAPH.keyLookup.p50).unit}
 				</p>
 			</Figure>
 		</div>
@@ -525,8 +536,8 @@ export function KeyIndexPage() {
 
 			<p class="text-[14px] text-slate-500">
 				The measured figure is the p50 for random existing keys on the Rust
-				core, 10k nodes, read from the snapshot index after a checkpoint
-				(February 2026, Apple M4). See the{" "}
+				core, {GRAPH_SIZE}, read from the snapshot index after a checkpoint (
+				{BENCH_DATE}, {BENCH_MACHINE.cpu}, MVCC on). See the{" "}
 				<a href="/docs/benchmarks">benchmarks</a> for the full results.
 			</p>
 

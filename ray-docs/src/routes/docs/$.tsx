@@ -2,6 +2,7 @@ import { createFileRoute } from "@tanstack/solid-router";
 import CodeBlock from "~/components/code-block";
 import { DocNotFound } from "~/components/doc-not-found";
 import DocPage from "~/components/doc-page";
+import { formatNs, GRAPH_SIZE, RUST_GRAPH } from "~/lib/benchmarks";
 import { loadDocSlug } from "~/lib/doc-route";
 
 export const Route = createFileRoute("/docs/$")({
@@ -62,9 +63,11 @@ function DocPageContent(props: { slug: string }) {
 						TypeScript type inference
 					</li>
 					<li>
-						<strong>Fast</strong>: 125 ns key lookups, 208 ns one-hop
-						traversals, and 34 µs to commit 100 nodes (p50, Rust core, 10k nodes
-						and 50k edges; see <a href="/docs/benchmarks">benchmarks</a>)
+						<strong>Fast</strong>: {formatNs(RUST_GRAPH.keyLookup.p50)} key
+						lookups, {formatNs(RUST_GRAPH.traverseOut.p50)} one-hop traversals,
+						and {formatNs(RUST_GRAPH.batchNodes.p50)} to commit 100 nodes (p50,
+						Rust core, {GRAPH_SIZE}; see{" "}
+						<a href="/docs/benchmarks">benchmarks</a>)
 					</li>
 					<li>
 						<strong>ACID transactions</strong>: atomic commits backed by a

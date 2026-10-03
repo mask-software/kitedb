@@ -14,7 +14,8 @@
 			"**/.vscode/**/*",
 			"**/index.html",
 			"**/vite.config.ts",
-			"!**/src/routeTree.gen.ts"
+			"!**/src/routeTree.gen.ts",
+			"!**/src/lib/benchmark-data.gen.ts"
 		]
 	},
 	"formatter": {

@@ -1,3 +1,4 @@
+import { formatNs, RUST_GRAPH } from "~/lib/benchmarks";
 import type { Language } from "~/lib/language-store";
 
 export type LangId = Language["id"];
@@ -41,7 +42,7 @@ export const SCENES: Scene[] = [
 		label: "Traverse",
 		file: "topics",
 		captions: [
-			"Start from a node. Key lookups hit a hash index: ~125 ns.",
+			`Start from a node. Key lookups hit a hash index: ~${formatNs(RUST_GRAPH.keyLookup.p50)}.`,
 			"Follow `wrote` edges. Adjacency is stored contiguously (CSR), so a hop is a slice read.",
 			"Hop again along `discusses`. Each hop is another slice of the same CSR adjacency arrays.",
 			"Collect the result: three topics, each listed once.",

@@ -2,14 +2,36 @@ import { ArrowRight } from "lucide-solid";
 import { For, Show } from "solid-js";
 import CodeBlock from "~/components/code-block";
 import DocPage from "~/components/doc-page";
+import { GITHUB_URL } from "~/components/github-icon";
 import {
+	BENCH_DATE,
+	BENCH_MACHINE,
+	BULK_LOAD,
+	formatChange,
+	formatCount,
+	formatNsExact,
+	formatRateShort,
+	formatRatio,
+	GRAPH_METRICS,
+	GRAPH_SIZE,
+	type GraphMetric,
+	headlineParts,
+	MVCC_COST,
+	MVCC_COST_SOURCE,
+	RUST_GRAPH,
+	RUST_GRAPH_SOURCE,
+	resultsUrl,
+	WRITE_SCALING_NO_MVCC,
+	writeScalingRow,
+} from "~/lib/benchmarks";
+import {
+	type Accent,
 	CELL,
 	CELL_HIGHLIGHT,
 	CELL_PLAIN,
 	Code,
 	Figure,
 	Panel,
-	type Accent,
 } from "./-components";
 
 // ============================================================================
@@ -62,12 +84,47 @@ function Stat(props: { value: string; unit: string }) {
 // PERFORMANCE DIAGRAMS
 // ============================================================================
 
-// p50 values from docs/benchmarks/results/2026-02-04-single-file-raw-rust-edges-normal-nogc.txt
+// p50 values from RUST_GRAPH_SOURCE (src/lib/benchmarks.ts)
 const EMBEDDED_P50 = [
-	{ label: "Key lookup", value: "125", unit: "ns" },
-	{ label: "1-hop traversal", value: "208", unit: "ns" },
-	{ label: "Commit 100 nodes", value: "34.08", unit: "µs" },
+	{ label: "Key lookup", ...headlineParts(RUST_GRAPH.keyLookup.p50) },
+	{ label: "1-hop traversal", ...headlineParts(RUST_GRAPH.traverseOut.p50) },
+	{ label: "Commit 100 nodes", ...headlineParts(RUST_GRAPH.batchNodes.p50) },
 ];
+
+const WRITES_200 = writeScalingRow("200node", "normal");
+const NODE_METRICS: GraphMetric[] = ["keyLookup", "batchNodes"];
+const EDGE_METRICS: GraphMetric[] = [
+	"traverseOut",
+	"edgeExists",
+	"batchEdges",
+	"batchEdgesProps",
+];
+
+/** Operation | p50 | p95 rows of the Rust single-file raw run. */
+function ResultTable(props: { metrics: GraphMetric[] }) {
+	return (
+		<table>
+			<thead>
+				<tr>
+					<th>Operation</th>
+					<th>p50</th>
+					<th>p95</th>
+				</tr>
+			</thead>
+			<tbody>
+				<For each={props.metrics}>
+					{(metric) => (
+						<tr>
+							<td>{GRAPH_METRICS.find((m) => m.id === metric)?.label}</td>
+							<td>{formatNsExact(RUST_GRAPH[metric].p50)}</td>
+							<td>{formatNsExact(RUST_GRAPH[metric].p95)}</td>
+						</tr>
+					)}
+				</For>
+			</tbody>
+		</table>
+	);
+}
 
 function NetworkOverheadComparison() {
 	return (
@@ -255,7 +312,9 @@ function CacheFriendlyComparison() {
 
 			<p class="mt-4 border-t border-kite-line pt-3 text-[13px] text-slate-400">
 				Measured 1-hop outgoing traversal from a random node:{" "}
-				<Stat value="208" unit="ns" /> p50 (10k nodes, 50k edges).
+				<Stat {...headlineParts(RUST_GRAPH.traverseOut.p50)} /> p50 (
+				{GRAPH_SIZE}
+				).
 			</p>
 		</Figure>
 	);
@@ -415,113 +474,81 @@ export function PerformancePage() {
 			<h2 id="benchmarks">Benchmark results</h2>
 
 			<p>
-				Latest run: single-file raw benchmark on the Rust core, 10k nodes, 50k
-				edges, 3 edge types, 10 edge properties, <code>syncMode=Normal</code>,{" "}
-				<code>groupCommitEnabled=false</code>, Apple M4, February 4, 2026. The
-				run predates MVCC as the default and ran without it; see{" "}
-				<a href="#mvcc-cost">MVCC cost</a> for the difference.
+				Single-file raw benchmark on the Rust core ({RUST_GRAPH_SOURCE.config}
+				), {BENCH_MACHINE.cpu}, {BENCH_DATE}. Each row is the median of five
+				interleaved runs.
 			</p>
 
 			<h3>Node operations</h3>
-			<table>
-				<thead>
-					<tr>
-						<th>Operation</th>
-						<th>p50</th>
-						<th>p95</th>
-					</tr>
-				</thead>
-				<tbody>
-					<tr>
-						<td>Key lookup (random existing)</td>
-						<td>125 ns</td>
-						<td>291 ns</td>
-					</tr>
-					<tr>
-						<td>Batch write (100 nodes)</td>
-						<td>34.08 µs</td>
-						<td>56.54 µs</td>
-					</tr>
-				</tbody>
-			</table>
+			<ResultTable metrics={NODE_METRICS} />
 
 			<h3>Edge operations</h3>
-			<table>
-				<thead>
-					<tr>
-						<th>Operation</th>
-						<th>p50</th>
-						<th>p95</th>
-					</tr>
-				</thead>
-				<tbody>
-					<tr>
-						<td>1-hop traversal (out)</td>
-						<td>208 ns</td>
-						<td>292 ns</td>
-					</tr>
-					<tr>
-						<td>Edge exists (random)</td>
-						<td>83 ns</td>
-						<td>125 ns</td>
-					</tr>
-					<tr>
-						<td>Batch write (100 edges)</td>
-						<td>40.25 µs</td>
-						<td>65.58 µs</td>
-					</tr>
-					<tr>
-						<td>Batch write (100 edges + props)</td>
-						<td>172.33 µs</td>
-						<td>253.12 µs</td>
-					</tr>
-				</tbody>
-			</table>
+			<ResultTable metrics={EDGE_METRICS} />
 
 			<p>
 				Raw log:{" "}
-				<code>
-					docs/benchmarks/results/2026-02-04-single-file-raw-rust-edges-normal-nogc.txt
-				</code>
-				. Other runs and their commands are in{" "}
-				<code>docs/benchmarks/results/</code>.
+				<a
+					href={resultsUrl(GITHUB_URL, RUST_GRAPH_SOURCE.log)}
+					target="_blank"
+					rel="noopener noreferrer"
+				>
+					<code>docs/benchmarks/results/{RUST_GRAPH_SOURCE.log}</code>
+				</a>
+				. The <a href="/docs/benchmarks">benchmarks</a> pages have the other
+				runs and their commands.
 			</p>
 
 			<h3 id="mvcc-cost">MVCC cost</h3>
-			<p>Measured against non-MVCC mode when MVCC became the default:</p>
+			<p>
+				Throughput with MVCC on against MVCC off on the same machine, from{" "}
+				<code>mvcc_overhead_bench</code> (sync off, so a commit costs CPU rather
+				than an fsync wait; each case is the median of five runs):
+			</p>
 			<table>
 				<thead>
 					<tr>
 						<th>Workload</th>
-						<th>MVCC vs. non-MVCC</th>
+						<th>MVCC off</th>
+						<th>MVCC on</th>
+						<th>Change</th>
 					</tr>
 				</thead>
 				<tbody>
-					<tr>
-						<td>Single-thread reads</td>
-						<td>Within about 2–7%</td>
-					</tr>
-					<tr>
-						<td>Reads inside read-only transactions</td>
-						<td>About 6% slower</td>
-					</tr>
-					<tr>
-						<td>One writer, small transactions</td>
-						<td>About 7–8% slower</td>
-					</tr>
-					<tr>
-						<td>Writers, 200-node transactions</td>
-						<td>
-							8 MVCC writers: about 5.3K transactions/s; one non-MVCC writer:
-							about 3.6K/s
-						</td>
-					</tr>
-					<tr>
-						<td>Bulk load</td>
-						<td>Same throughput</td>
-					</tr>
+					<For each={MVCC_COST}>
+						{(row) => (
+							<tr>
+								<td>{row.label}</td>
+								<td>{formatRateShort(row.off)}</td>
+								<td>{formatRateShort(row.on)}</td>
+								<td>{formatChange(row.change)}</td>
+							</tr>
+						)}
+					</For>
 				</tbody>
 			</table>
+			<p class="text-[13px] text-slate-500">
+				Source:{" "}
+				<a
+					href={resultsUrl(GITHUB_URL, MVCC_COST_SOURCE.log)}
+					target="_blank"
+					rel="noopener noreferrer"
+				>
+					<code>{MVCC_COST_SOURCE.log}</code>
+				</a>{" "}
+				({MVCC_COST_SOURCE.config})
+			</p>
+			<p>
+				Writer threads need MVCC: without it, write transactions run one at a
+				time. With <code>syncMode=Normal</code>, one writer without MVCC reaches{" "}
+				{formatRateShort(WRITE_SCALING_NO_MVCC["200node"].txPerSec)} with
+				transactions of 200 nodes and 200 edges, and eight MVCC writers reach{" "}
+				{formatRateShort(WRITES_200.runs[8].txPerSec)} (
+				{formatRatio(
+					WRITES_200.runs[8].txPerSec /
+						WRITE_SCALING_NO_MVCC["200node"].txPerSec,
+				)}
+				).
+			</p>
 
 			<h3>Write durability vs. throughput</h3>
 			<ul>
@@ -618,14 +645,21 @@ export function PerformancePage() {
 				</li>
 			</ul>
 			<p>
-				A bulk load is as fast with MVCC as without it: about 1.5–1.7M nodes/s
-				and 0.6M edges/s in both modes for 200k nodes and 1M edges with two
-				properties each, in batches of 5,000, on an M-series Mac (
-				<code>examples/bulk_load_bench.rs</code>). It runs alone among writers,
-				and readers never wait for it. A read transaction held open across the
-				load costs throughput (about 1.25M nodes/s and 0.38M edges/s in the same
-				test), because the load's commits record version history for it. Use it
-				for one-shot ingest or ETL jobs.
+				A bulk load of {formatCount(BULK_LOAD.nodes)} nodes and{" "}
+				{formatCount(BULK_LOAD.edges)} edges with {BULK_LOAD.props} properties
+				each, in batches of {BULK_LOAD.batch.toLocaleString("en-US")}, ran at{" "}
+				{formatRateShort(BULK_LOAD.mvcc.nodesPerSec)} for nodes and{" "}
+				{formatRateShort(BULK_LOAD.mvcc.edgesPerSec)} for edges with MVCC, and{" "}
+				{formatRateShort(BULK_LOAD.noMvcc.nodesPerSec)} and{" "}
+				{formatRateShort(BULK_LOAD.noMvcc.edgesPerSec)} without it (
+				{BENCH_MACHINE.cpu}, <code>examples/bulk_load_bench.rs</code>). It runs
+				alone among writers, and readers never wait for it. A read transaction
+				held open across the load slows it (
+				{formatRateShort(BULK_LOAD.reader.nodesPerSec)} for nodes and{" "}
+				{formatRateShort(BULK_LOAD.reader.edgesPerSec)} for edges in the same
+				test),
+				because the load's commits record version history for it. Use it for
+				one-shot ingest or ETL jobs.
 			</p>
 
 			<h3>Bulk ingest example (low-level API)</h3>
@@ -658,7 +692,7 @@ db.beginBulk();
 db.createNodesBatch(keys);
 db.commit();
 
-// Rust core benchmark: 100 nodes per batch, 34.08 µs p50 (syncMode=Normal)`}
+// Rust core benchmark: 100 nodes per batch, ${formatNsExact(RUST_GRAPH.batchNodes.p50)} p50 (syncMode=Normal)`}
 				language="typescript"
 			/>
 

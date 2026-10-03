@@ -1,6 +1,6 @@
 import { ArrowRight } from "lucide-solid";
 import { For } from "solid-js";
-import { HEADLINE_STATS } from "~/lib/benchmarks";
+import { BENCH_MACHINE, GRAPH_SIZE, HEADLINE_STATS } from "~/lib/benchmarks";
 
 export function StatsStrip() {
 	return (
@@ -25,7 +25,8 @@ export function StatsStrip() {
 			</dl>
 			<p class="mt-4 flex flex-wrap items-center justify-center gap-x-2 gap-y-1 text-center text-[13px] text-slate-500">
 				<span>
-					p50 · Rust core · Apple M4 · 10k nodes, 50k edges · sync=normal
+					p50 · Rust core · {BENCH_MACHINE.cpu} · {GRAPH_SIZE} · sync=normal ·
+					MVCC on
 				</span>
 				<a
 					href="#benchmarks"
