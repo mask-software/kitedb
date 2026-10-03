@@ -1748,31 +1748,41 @@ impl SingleFileDB {
       }
     };
     let history = self.plan_history(&pending);
-    let request = CommitRequest {
-      txid,
-      bulk_load,
-      mvcc_keys,
-      records,
-      commit_record_len,
-      pending,
-      history,
-      commit_ts: None,
-      mvcc_open,
-      pending_wal,
-      staged_schema,
-      committer: std::thread::current().id(),
-      released_keys: Vec::new(),
-    };
+    let committer = std::thread::current().id();
     let request = match TxSpares::with(|spares| spares.request.take()).flatten() {
+      // Filled in place: a request is large (it holds the pending delta),
+      // and a kept one holds the buffer of its released key sets.
       Some(mut kept) => {
-        let released_keys = std::mem::take(&mut kept.released_keys);
-        *kept = CommitRequest {
-          released_keys,
-          ..request
-        };
+        let request = &mut *kept;
+        request.txid = txid;
+        request.bulk_load = bulk_load;
+        request.mvcc_keys = mvcc_keys;
+        request.records = records;
+        request.commit_record_len = commit_record_len;
+        request.pending = pending;
+        request.history = history;
+        request.commit_ts = None;
+        request.mvcc_open = mvcc_open;
+        request.pending_wal = pending_wal;
+        request.staged_schema = staged_schema;
+        request.committer = committer;
         kept
       }
-      None => Box::new(request),
+      None => Box::new(CommitRequest {
+        txid,
+        bulk_load,
+        mvcc_keys,
+        records,
+        commit_record_len,
+        pending,
+        history,
+        commit_ts: None,
+        mvcc_open,
+        pending_wal,
+        staged_schema,
+        committer,
+        released_keys: Vec::new(),
+      }),
     };
 
     prof::end(Stage::CommitPrep, prep_mark);
