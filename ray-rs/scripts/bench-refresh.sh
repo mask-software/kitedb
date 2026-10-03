@@ -20,9 +20,10 @@
 #   STAMP       Date prefix of the logs (default: today's UTC date)
 #   OUT_DIR     Log directory (default: docs/benchmarks/results; --smoke: a temp dir)
 #   MAX_BUSY    Percent of all CPUs other processes may keep busy (default: 20).
-#               Sampled over one second before the first run (refuse above it)
-#               and between runs (wait until it drops, noting the pause in the
-#               log, for at most MAX_WAIT seconds, default 600). The load
+#               Sampled over one second before the first run and between runs;
+#               above it the script waits, at most MAX_WAIT seconds (default
+#               600), then refuses to start or, between runs, goes on and notes
+#               it (pauses are noted in the log and the manifest). The load
 #               average is only recorded: on macOS it counts threads that wait
 #               for I/O, and our own runs raise it for a minute after they end.
 #   PAUSE       Seconds to wait between two runs (default: 2)
@@ -399,6 +400,13 @@ if [[ "$(uname -s)" == Darwin ]]; then
   fi
 fi
 BUSY="$(cpu_busy)"
+waited=0
+while over_max_busy "$BUSY" && (( waited < MAX_WAIT )) && [[ "$FORCE" != 1 && "$SMOKE" != 1 ]]; do
+  echo "waiting: other processes keep ${BUSY}% of the CPUs busy (MAX_BUSY=$MAX_BUSY)" >&2
+  sleep 15
+  waited=$((waited + 15))
+  BUSY="$(cpu_busy)"
+done
 if over_max_busy "$BUSY"; then
   refuse "other processes keep ${BUSY}% of the CPUs busy, above MAX_BUSY=$MAX_BUSY"
 fi
