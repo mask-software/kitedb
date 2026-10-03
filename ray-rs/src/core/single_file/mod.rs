@@ -981,3 +981,8 @@ pub fn is_single_file_path<P: AsRef<Path>>(path: P) -> bool {
 pub fn single_file_extension() -> &'static str {
   EXT_KITEDB
 }
+
+/// raydb-b4 `pipeline` lane: the read locks' cache lines.
+#[cfg(test)]
+#[path = "b4_pipeline_tests.rs"]
+mod b4_pipeline_tests;
