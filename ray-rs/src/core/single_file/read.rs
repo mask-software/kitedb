@@ -37,7 +37,7 @@ use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLockReadGuard};
 
-use crate::core::snapshot::reader::SnapshotData;
+use crate::core::snapshot::reader::{EdgeKeyIter, SnapshotData};
 use crate::mvcc::VersionChainManager;
 use crate::types::*;
 
@@ -180,6 +180,17 @@ pub(super) enum EdgeSide {
   In,
 }
 
+impl EdgeSide {
+  /// The read a walk of `node_id`'s edges of type `etype` on this side notes for a write
+  /// transaction's MVCC conflict check.
+  fn neighbors_key(self, node_id: NodeId, etype: Option<ETypeId>) -> TxKey {
+    match self {
+      Self::Out => TxKey::NeighborsOut { node_id, etype },
+      Self::In => TxKey::NeighborsIn { node_id, etype },
+    }
+  }
+}
+
 /// The keys `(etype, other endpoint)` an edge walk visits: those of type `etype`
 /// (every type for `None`) that come after `after`.
 #[derive(Clone, Copy)]
@@ -223,6 +234,34 @@ impl EdgeKeys {
       Bound::Included(patch((etype, NodeId::MAX)))
     });
     Some((lower, upper))
+  }
+}
+
+/// What an edge walk (`ReadView::for_each_edge`) hands its edges to: one at a time, or a
+/// snapshot run with nothing to check (for bulk copies).
+pub(super) trait EdgeSink {
+  /// One edge, `(etype, other endpoint)`; `Break` ends the walk.
+  fn edge(&mut self, etype: ETypeId, other: NodeId) -> ControlFlow<()>;
+
+  /// The rest of the walk: `run`'s edges, each to be taken as they are (but a key the
+  /// snapshot holds twice, once).
+  fn snapshot_run(&mut self, run: &mut EdgeKeyIter<'_>) -> ControlFlow<()> {
+    let mut last = None;
+    run.try_for_each_key(|etype, other| {
+      examined_edges(1);
+      if last == Some((etype, other)) {
+        return ControlFlow::Continue(());
+      }
+      last = Some((etype, other));
+      self.edge(etype, other)
+    })
+  }
+}
+
+impl<F: FnMut(ETypeId, NodeId) -> ControlFlow<()>> EdgeSink for F {
+  #[inline]
+  fn edge(&mut self, etype: ETypeId, other: NodeId) -> ControlFlow<()> {
+    self(etype, other)
   }
 }
 
@@ -369,7 +408,7 @@ impl<'a> ReadView<'a> {
     node_id: NodeId,
     etype: Option<ETypeId>,
     after: Option<(ETypeId, NodeId)>,
-    mut f: impl FnMut(ETypeId, NodeId) -> ControlFlow<()>,
+    mut f: impl EdgeSink,
   ) -> Option<ControlFlow<()>> {
     let layers = self.layers;
     let pending = layers.pending;
@@ -382,6 +421,81 @@ impl<'a> ReadView<'a> {
       return None;
     }
     let keys = EdgeKeys { etype, after };
+
+    // What the layers above the snapshot hold of the node's edges on this side: added
+    // patches, and tombstones (kept in both directions, so the node's own set names those of
+    // its in-edges too); and whether a layer deleted (or recreated) any node, which hides
+    // its edges.
+    let side_patches = |layer: &'a DeltaState| match side {
+      EdgeSide::Out => (
+        layer.out_add.get(&node_id),
+        layer.out_del.contains_key(&node_id),
+      ),
+      EdgeSide::In => (
+        layer.in_add.get(&node_id),
+        layer.in_del.contains_key(&node_id),
+      ),
+    };
+    let (delta_adds, delta_tombstones) = side_patches(delta);
+    let (pending_adds, pending_tombstones) = pending.map_or((None, false), side_patches);
+    let deletes =
+      !delta.deleted_nodes.is_empty() || pending.is_some_and(|p| !p.deleted_nodes.is_empty());
+    let snapshot_edges = |mvcc| {
+      self
+        .snapshot
+        .filter(|_| layers.sees_snapshot(node_id, mvcc))
+        .and_then(|snapshot| snapshot_edge_keys(snapshot, side, node_id, keys))
+    };
+
+    // Fast paths, with no version history: when no layer holds a patch of the node's edges,
+    // they are the snapshot's; when only the delta adds some and the snapshot has none, they
+    // are those. Each is walked in one pass, and its edges are checked against the layers
+    // only if a layer deleted nodes (their edges are hidden).
+    if self.history.is_none() && pending_adds.is_none() && !pending_tombstones {
+      if delta_adds.is_none() && !delta_tombstones {
+        let Some(mut edges) = snapshot_edges(None) else {
+          return Some(ControlFlow::Continue(()));
+        };
+        if !deletes {
+          return Some(f.snapshot_run(&mut edges));
+        }
+        // A snapshot may hold an edge twice: each key once.
+        let mut last = None;
+        return Some(edges.try_for_each_key(|etype, other| {
+          examined_edges(1);
+          if last == Some((etype, other)) {
+            return ControlFlow::Continue(());
+          }
+          last = Some((etype, other));
+          overlay_check();
+          if !layers.sees_snapshot(other, None) {
+            return ControlFlow::Continue(());
+          }
+          f.edge(etype, other)
+        }));
+      }
+      // (The delta's tombstones only hide snapshot edges.)
+      let in_snapshot = snapshot_edges(None).is_some_and(|edges| edges.remaining() > 0);
+      if let (Some(adds), false) = (delta_adds, in_snapshot) {
+        let Some(bounds) = keys.patch_bounds() else {
+          return Some(ControlFlow::Continue(()));
+        };
+        if !layers.sees_delta(node_id, None) {
+          return Some(ControlFlow::Continue(()));
+        }
+        return Some(adds.range(bounds).try_for_each(|patch| {
+          examined_edges(1);
+          if deletes {
+            overlay_check();
+            if !layers.sees_delta(patch.other, None) {
+              return ControlFlow::Continue(());
+            }
+          }
+          f.edge(patch.etype, patch.other)
+        }));
+      }
+    }
+
     let edge = |etype: ETypeId, other: NodeId| match side {
       EdgeSide::Out => (node_id, etype, other),
       EdgeSide::In => (other, etype, node_id),
@@ -390,22 +504,7 @@ impl<'a> ReadView<'a> {
       |(src, etype, dst)| pending.is_some_and(|p| p.is_edge_deleted(src, etype, dst));
 
     // The snapshot's copy of the node's edges, from the first key in range
-    let snapshot_edges = self
-      .snapshot
-      .filter(|_| layers.sees_snapshot(node_id, node_mvcc))
-      .and_then(|snapshot| {
-        let phys = snapshot.phys_node(node_id)?;
-        let start = keys.start(|other| snapshot.phys_after(other))?;
-        let mut edges = match side {
-          EdgeSide::Out => snapshot.out_edge_keys(phys),
-          EdgeSide::In => snapshot.in_edge_keys(phys),
-        };
-        edges.seek(start);
-        if let Some(etype) = keys.etype {
-          edges.end_after_etype(etype);
-        }
-        Some(edges)
-      });
+    let snapshot_edges = snapshot_edges(node_mvcc);
     let has_snapshot = snapshot_edges.is_some();
     let mut from_snapshot = snapshot_edges
       .unwrap_or_default()
@@ -424,33 +523,26 @@ impl<'a> ReadView<'a> {
       });
 
     // Edge patches of the committed delta and of the transaction, from the first key in range
-    let added = |layer: Option<&'a DeltaState>| {
-      let added = layer.and_then(|layer| match side {
-        EdgeSide::Out => layer.out_add.get(&node_id),
-        EdgeSide::In => layer.in_add.get(&node_id),
-      });
-      added.zip(keys.patch_bounds())
-    };
-    let patches = |added: Option<(&'a std::collections::BTreeSet<EdgePatch>, _)>| {
+    let patches = |added: Option<&'a std::collections::BTreeSet<EdgePatch>>| {
       added
+        .zip(keys.patch_bounds())
         .map(|(patches, bounds)| patches.range(bounds))
         .unwrap_or_default()
         .inspect(|_| examined_edges(1))
         .map(|patch| (patch.etype, patch.other))
     };
-    let delta_added = added(layers.sees_delta(node_id, node_mvcc).then_some(delta));
-    let pending_added = added(pending);
-    let has_delta = delta_added.is_some();
-    let has_pending = pending_added.is_some();
-    let mut from_delta = patches(delta_added).filter(|&(etype, other)| {
+    let delta_adds = delta_adds.filter(|_| layers.sees_delta(node_id, node_mvcc));
+    let has_delta = delta_adds.is_some();
+    let has_pending = pending_adds.is_some();
+    let mut from_delta = patches(delta_adds).filter(|&(etype, other)| {
       overlay_check();
       let (src, etype, dst) = edge(etype, other);
       layers.sees_delta(other, self.node_mvcc(other))
         && self.edge_mvcc(src, etype, dst) != Some(false)
         && !pending_deleted((src, etype, dst))
     });
-    let mut from_pending = patches(pending_added)
-      .filter(|&(_, other)| layers.sees_pending(other, self.node_mvcc(other)));
+    let mut from_pending =
+      patches(pending_adds).filter(|&(_, other)| layers.sees_pending(other, self.node_mvcc(other)));
 
     // Edges deleted since the reader's snapshot remain only in their version chains
     let mut from_history: Vec<(ETypeId, NodeId)> = self
@@ -476,7 +568,7 @@ impl<'a> ReadView<'a> {
 
     // Most nodes have their edges in one source (the snapshot after a checkpoint, the delta
     // before one): walk it directly, and merge only when several hold edges.
-    let emit = |(etype, other)| f(etype, other);
+    let emit = |(etype, other)| f.edge(etype, other);
     let has_history = !from_history.is_empty();
     Some(if !has_delta && !has_pending && !has_history {
       walk_sorted(from_snapshot, emit)
@@ -494,6 +586,53 @@ impl<'a> ReadView<'a> {
         emit,
       )
     })
+  }
+
+  /// Up to `limit` (at least 1) of the edges `for_each_edge` visits, as `item` maps them,
+  /// with room for every edge of the node; `None` if the reader does not see the node.
+  pub(super) fn collect_edges<T>(
+    &self,
+    side: EdgeSide,
+    node_id: NodeId,
+    etype: Option<ETypeId>,
+    after: Option<(ETypeId, NodeId)>,
+    limit: usize,
+    item: impl Fn(ETypeId, NodeId) -> T,
+  ) -> Option<Vec<T>> {
+    /// The edges, as `item` maps them, up to `limit`.
+    struct Collect<'v, T, F> {
+      edges: &'v mut Vec<T>,
+      limit: usize,
+      item: F,
+    }
+    impl<T, F: Fn(ETypeId, NodeId) -> T> EdgeSink for Collect<'_, T, F> {
+      fn edge(&mut self, etype: ETypeId, other: NodeId) -> ControlFlow<()> {
+        self.edges.push((self.item)(etype, other));
+        if self.edges.len() >= self.limit {
+          ControlFlow::Break(())
+        } else {
+          ControlFlow::Continue(())
+        }
+      }
+
+      fn snapshot_run(&mut self, run: &mut EdgeKeyIter<'_>) -> ControlFlow<()> {
+        examined_edges(
+          run
+            .remaining()
+            .min(self.limit.saturating_sub(self.edges.len())),
+        );
+        run.append_keys(self.edges, self.limit, &self.item);
+        ControlFlow::Continue(())
+      }
+    }
+    let mut edges = Vec::with_capacity(limit.min(self.edge_capacity(side, node_id)));
+    let collect = Collect {
+      edges: &mut edges,
+      limit,
+      item,
+    };
+    let _walked = self.for_each_edge(side, node_id, etype, after, collect)?;
+    Some(edges)
   }
 
   /// Room for the edges of `node_id` on `side`: its degree in the snapshot plus the edges the
@@ -518,6 +657,28 @@ impl<'a> ReadView<'a> {
       .saturating_add(added(self.layers.delta))
       .saturating_add(self.layers.pending.map_or(0, added))
   }
+}
+
+/// `snapshot`'s copy of `node_id`'s edges on `side` with keys in `keys`: a seek to the first,
+/// and the end of its type's run if `keys` has one. `None` if the snapshot does not hold the
+/// node or no key is in range.
+fn snapshot_edge_keys(
+  snapshot: &SnapshotData,
+  side: EdgeSide,
+  node_id: NodeId,
+  keys: EdgeKeys,
+) -> Option<EdgeKeyIter<'_>> {
+  let phys = snapshot.phys_node(node_id)?;
+  let start = keys.start(|other| snapshot.phys_after(other))?;
+  let mut edges = match side {
+    EdgeSide::Out => snapshot.out_edge_keys(phys),
+    EdgeSide::In => snapshot.in_edge_keys(phys),
+  };
+  edges.seek(start);
+  if let Some(etype) = keys.etype {
+    edges.end_after_etype(etype);
+  }
+  Some(edges)
 }
 
 /// `VersionChainManager::node_exists_at`, out of line: reads check it per node and per edge
@@ -1147,332 +1308,47 @@ impl SingleFileDB {
 
   /// Get outgoing edges for a node
   ///
-  /// Returns edges as (edge_type_id, destination_node_id) pairs.
+  /// Returns edges as (edge_type_id, destination_node_id) pairs, sorted.
   /// Merges edges from snapshot with delta additions/deletions.
   /// Filters out edges to deleted nodes.
   pub fn out_edges(&self, node_id: NodeId) -> Vec<(ETypeId, NodeId)> {
-    let tx_handle = self.current_tx_handle();
-    let mut tx_guard = tx_handle.as_ref().map(|tx| tx.lock());
-    let pending = tx_guard.as_ref().map(|tx| &tx.pending);
-
-    // If node is deleted, no edges
-    if pending.is_some_and(|p| p.is_node_removed(node_id)) {
-      return Vec::new();
-    }
-
-    let (txid, tx_snapshot_ts) = self.mvcc_read_ts(tx_guard.as_deref());
-    let delta = self.delta.read();
-    let snapshot = self.snapshot.read();
-    let vc_guard = self.mvcc_history(tx_snapshot_ts);
-    let layers = NodeLayers {
-      pending,
-      delta: &delta,
-    };
-
-    // If node is deleted in committed state, no edges
-    let node_visible = vc_guard
-      .as_ref()
-      .and_then(|vc| vc.node_exists_at(node_id, tx_snapshot_ts, txid));
-    if !layers.sees_pending(node_id, node_visible) {
-      return Vec::new();
-    }
-
-    let mut capacity = 0usize;
-    if let Some(ref snap) = **snapshot {
-      if let Some(phys) = snap.phys_node(node_id) {
-        capacity = capacity.saturating_add(snap.out_degree(phys).unwrap_or(0));
-      }
-    }
-    if let Some(added_edges) = delta.out_add.get(&node_id) {
-      capacity = capacity.saturating_add(added_edges.len());
-    }
-    if let Some(added_edges) = pending.and_then(|p| p.out_add.get(&node_id)) {
-      capacity = capacity.saturating_add(added_edges.len());
-    }
-    let mut edges = Vec::with_capacity(capacity);
-
-    // Get edges from snapshot
-    if let Some(ref snap) = **snapshot {
-      if let Some(phys) = snap
-        .phys_node(node_id)
-        .filter(|_| layers.sees_snapshot(node_id, node_visible))
-      {
-        for (dst_phys, etype) in snap.iter_out_edges(phys) {
-          examined_edges(1);
-          overlay_check();
-          // Convert physical dst to NodeId
-          if let Some(dst_node_id) = snap.node_id(dst_phys) {
-            // Skip edges to deleted nodes
-            let dst_visible = vc_guard
-              .as_ref()
-              .and_then(|vc| vc.node_exists_at(dst_node_id, tx_snapshot_ts, txid));
-            if !layers.sees_snapshot(dst_node_id, dst_visible) {
-              continue;
-            }
-            // Skip edges deleted in delta
-            let edge_visible = vc_guard
-              .as_ref()
-              .and_then(|vc| vc.edge_exists_at(node_id, etype, dst_node_id, tx_snapshot_ts, txid));
-            if edge_visible == Some(false)
-              || pending.is_some_and(|p| p.is_edge_deleted(node_id, etype, dst_node_id))
-              || (edge_visible.is_none() && delta.is_edge_deleted(node_id, etype, dst_node_id))
-            {
-              continue;
-            }
-            edges.push((etype, dst_node_id));
-          }
-        }
-      }
-    }
-
-    // Add edges from delta
-    if let Some(added_edges) = delta
-      .out_add
-      .get(&node_id)
-      .filter(|_| layers.sees_delta(node_id, node_visible))
-    {
-      examined_edges(added_edges.len());
-      for edge_patch in added_edges {
-        overlay_check();
-        // Skip edges to deleted nodes
-        let dst_visible = vc_guard
-          .as_ref()
-          .and_then(|vc| vc.node_exists_at(edge_patch.other, tx_snapshot_ts, txid));
-        if !layers.sees_delta(edge_patch.other, dst_visible) {
-          continue;
-        }
-        let edge_visible = vc_guard.as_ref().and_then(|vc| {
-          vc.edge_exists_at(
-            node_id,
-            edge_patch.etype,
-            edge_patch.other,
-            tx_snapshot_ts,
-            txid,
-          )
-        });
-        if edge_visible == Some(false)
-          || pending.is_some_and(|p| p.is_edge_deleted(node_id, edge_patch.etype, edge_patch.other))
-        {
-          continue;
-        }
-        edges.push((edge_patch.etype, edge_patch.other));
-      }
-    }
-
-    if let Some(added_edges) = pending.and_then(|p| p.out_add.get(&node_id)) {
-      examined_edges(added_edges.len());
-      for edge_patch in added_edges {
-        let dst_visible = vc_guard
-          .as_ref()
-          .and_then(|vc| vc.node_exists_at(edge_patch.other, tx_snapshot_ts, txid));
-        if !layers.sees_pending(edge_patch.other, dst_visible) {
-          continue;
-        }
-        edges.push((edge_patch.etype, edge_patch.other));
-      }
-    }
-
-    // Edges deleted since the reader's snapshot remain only in their version chains
-    if let Some(vc) = vc_guard
-      .as_ref()
-      .filter(|_| layers.sees_delta(node_id, node_visible))
-    {
-      for (src, etype, dst) in vc.node_edges_at(node_id, tx_snapshot_ts, txid) {
-        examined_edges(1);
-        if src != node_id || pending.is_some_and(|p| p.is_edge_deleted(src, etype, dst)) {
-          continue;
-        }
-        if !layers.sees_delta(dst, vc.node_exists_at(dst, tx_snapshot_ts, txid)) {
-          continue;
-        }
-        edges.push((etype, dst));
-      }
-    }
-
-    // Sort by (etype, dst) for consistent ordering
-    edges.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    edges.dedup();
-
-    drop(vc_guard);
-    self.record_reads(
-      tx_guard.as_deref_mut(),
-      [TxKey::NeighborsOut {
-        node_id,
-        etype: None,
-      }],
-    );
-
-    edges
+    self.node_edges_after(EdgeSide::Out, node_id, None, None, usize::MAX)
   }
 
   /// Get incoming edges for a node
   ///
-  /// Returns edges as (edge_type_id, source_node_id) pairs.
+  /// Returns edges as (edge_type_id, source_node_id) pairs, sorted.
   /// Merges edges from snapshot with delta additions/deletions.
   /// Filters out edges from deleted nodes.
   pub fn in_edges(&self, node_id: NodeId) -> Vec<(ETypeId, NodeId)> {
-    let tx_handle = self.current_tx_handle();
-    let mut tx_guard = tx_handle.as_ref().map(|tx| tx.lock());
-    let pending = tx_guard.as_ref().map(|tx| &tx.pending);
-
-    // If node is deleted, no edges
-    if pending.is_some_and(|p| p.is_node_removed(node_id)) {
-      return Vec::new();
-    }
-
-    let (txid, tx_snapshot_ts) = self.mvcc_read_ts(tx_guard.as_deref());
-    let delta = self.delta.read();
-    let snapshot = self.snapshot.read();
-    let vc_guard = self.mvcc_history(tx_snapshot_ts);
-    let layers = NodeLayers {
-      pending,
-      delta: &delta,
-    };
-
-    // If node is deleted, no edges
-    let node_visible = vc_guard
-      .as_ref()
-      .and_then(|vc| vc.node_exists_at(node_id, tx_snapshot_ts, txid));
-    if !layers.sees_pending(node_id, node_visible) {
-      return Vec::new();
-    }
-
-    let mut capacity = 0usize;
-    if let Some(ref snap) = **snapshot {
-      if let Some(phys) = snap.phys_node(node_id) {
-        capacity = capacity.saturating_add(snap.in_degree(phys).unwrap_or(0));
-      }
-    }
-    if let Some(added_edges) = delta.in_add.get(&node_id) {
-      capacity = capacity.saturating_add(added_edges.len());
-    }
-    if let Some(added_edges) = pending.and_then(|p| p.in_add.get(&node_id)) {
-      capacity = capacity.saturating_add(added_edges.len());
-    }
-    let mut edges = Vec::with_capacity(capacity);
-
-    // Get edges from snapshot
-    if let Some(ref snap) = **snapshot {
-      if let Some(phys) = snap
-        .phys_node(node_id)
-        .filter(|_| layers.sees_snapshot(node_id, node_visible))
-      {
-        for (src_phys, etype, _out_index) in snap.iter_in_edges(phys) {
-          examined_edges(1);
-          overlay_check();
-          // Convert physical src to NodeId
-          if let Some(src_node_id) = snap.node_id(src_phys) {
-            // Skip edges from deleted nodes
-            let src_visible = vc_guard
-              .as_ref()
-              .and_then(|vc| vc.node_exists_at(src_node_id, tx_snapshot_ts, txid));
-            if !layers.sees_snapshot(src_node_id, src_visible) {
-              continue;
-            }
-            // Skip edges deleted in delta
-            let edge_visible = vc_guard
-              .as_ref()
-              .and_then(|vc| vc.edge_exists_at(src_node_id, etype, node_id, tx_snapshot_ts, txid));
-            if edge_visible == Some(false)
-              || pending.is_some_and(|p| p.is_edge_deleted(src_node_id, etype, node_id))
-              || (edge_visible.is_none() && delta.is_edge_deleted(src_node_id, etype, node_id))
-            {
-              continue;
-            }
-            edges.push((etype, src_node_id));
-          }
-        }
-      }
-    }
-
-    // Add edges from delta (in_add stores patches where other=src)
-    if let Some(added_edges) = delta
-      .in_add
-      .get(&node_id)
-      .filter(|_| layers.sees_delta(node_id, node_visible))
-    {
-      examined_edges(added_edges.len());
-      for edge_patch in added_edges {
-        overlay_check();
-        // Skip edges from deleted nodes
-        let src_visible = vc_guard
-          .as_ref()
-          .and_then(|vc| vc.node_exists_at(edge_patch.other, tx_snapshot_ts, txid));
-        if !layers.sees_delta(edge_patch.other, src_visible) {
-          continue;
-        }
-        let edge_visible = vc_guard.as_ref().and_then(|vc| {
-          vc.edge_exists_at(
-            edge_patch.other,
-            edge_patch.etype,
-            node_id,
-            tx_snapshot_ts,
-            txid,
-          )
-        });
-        if edge_visible == Some(false)
-          || pending.is_some_and(|p| p.is_edge_deleted(edge_patch.other, edge_patch.etype, node_id))
-        {
-          continue;
-        }
-        edges.push((edge_patch.etype, edge_patch.other));
-      }
-    }
-
-    if let Some(added_edges) = pending.and_then(|p| p.in_add.get(&node_id)) {
-      examined_edges(added_edges.len());
-      for edge_patch in added_edges {
-        let src_visible = vc_guard
-          .as_ref()
-          .and_then(|vc| vc.node_exists_at(edge_patch.other, tx_snapshot_ts, txid));
-        if !layers.sees_pending(edge_patch.other, src_visible) {
-          continue;
-        }
-        edges.push((edge_patch.etype, edge_patch.other));
-      }
-    }
-
-    // Edges deleted since the reader's snapshot remain only in their version chains
-    if let Some(vc) = vc_guard
-      .as_ref()
-      .filter(|_| layers.sees_delta(node_id, node_visible))
-    {
-      for (src, etype, dst) in vc.node_edges_at(node_id, tx_snapshot_ts, txid) {
-        examined_edges(1);
-        if dst != node_id || pending.is_some_and(|p| p.is_edge_deleted(src, etype, dst)) {
-          continue;
-        }
-        if !layers.sees_delta(src, vc.node_exists_at(src, tx_snapshot_ts, txid)) {
-          continue;
-        }
-        edges.push((etype, src));
-      }
-    }
-
-    // Sort by (etype, src) for consistent ordering
-    edges.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    edges.dedup();
-
-    drop(vc_guard);
-    self.record_reads(
-      tx_guard.as_deref_mut(),
-      [TxKey::NeighborsIn {
-        node_id,
-        etype: None,
-      }],
-    );
-
-    edges
+    self.node_edges_after(EdgeSide::In, node_id, None, None, usize::MAX)
   }
 
   /// Get out-degree (number of outgoing edges) for a node
   pub fn out_degree(&self, node_id: NodeId) -> usize {
-    self.out_edges(node_id).len()
+    self.node_degree(EdgeSide::Out, node_id)
   }
 
   /// Get in-degree (number of incoming edges) for a node
   pub fn in_degree(&self, node_id: NodeId) -> usize {
-    self.in_edges(node_id).len()
+    self.node_degree(EdgeSide::In, node_id)
+  }
+
+  /// The number of edges `out_edges` / `in_edges` list, without listing them.
+  fn node_degree(&self, side: EdgeSide, node_id: NodeId) -> usize {
+    self.read_view(|view, reads| {
+      let mut degree = 0;
+      let visible = view
+        .for_each_edge(side, node_id, None, None, |_, _| {
+          degree += 1;
+          ControlFlow::Continue(())
+        })
+        .is_some();
+      if visible && view.tracks_reads {
+        reads.push(side.neighbors_key(node_id, None));
+      }
+      degree
+    })
   }
 
   /// Up to `limit` of `node_id`'s out-edges of type `etype` (every type for
@@ -1512,62 +1388,63 @@ impl SingleFileDB {
     after: Option<(ETypeId, NodeId)>,
     limit: usize,
   ) -> Vec<(ETypeId, NodeId)> {
-    if etype.is_none() && after.is_none() && limit == usize::MAX {
-      // Every edge: the full listing reads each source front to back.
-      return match side {
-        EdgeSide::Out => self.out_edges(node_id),
-        EdgeSide::In => self.in_edges(node_id),
-      };
-    }
+    self.node_edges_with(side, node_id, etype, after, limit, |etype, other| {
+      (etype, other)
+    })
+  }
+
+  /// [`Self::node_edges_after`], each edge as `item` maps it, noting the reads.
+  fn node_edges_with<T>(
+    &self,
+    side: EdgeSide,
+    node_id: NodeId,
+    etype: Option<ETypeId>,
+    after: Option<(ETypeId, NodeId)>,
+    limit: usize,
+    item: impl Fn(ETypeId, NodeId) -> T,
+  ) -> Vec<T> {
     self.read_view(|view, reads| {
-      let mut edges = Vec::with_capacity(limit.min(view.edge_capacity(side, node_id)));
-      let visible = limit > 0
-        && view
-          .for_each_edge(side, node_id, etype, after, |etype, other| {
-            edges.push((etype, other));
-            if edges.len() >= limit {
-              ControlFlow::Break(())
-            } else {
-              ControlFlow::Continue(())
-            }
-          })
-          .is_some();
+      let edges = (limit > 0)
+        .then(|| view.collect_edges(side, node_id, etype, after, limit, item))
+        .flatten();
       if view.tracks_reads {
-        let key = |etype| match side {
-          EdgeSide::Out => TxKey::NeighborsOut { node_id, etype },
-          EdgeSide::In => TxKey::NeighborsIn { node_id, etype },
-        };
-        if visible {
-          reads.push(key(None));
+        if edges.is_some() {
+          reads.push(side.neighbors_key(node_id, None));
         }
         if etype.is_some() {
-          reads.push(key(etype));
+          reads.push(side.neighbors_key(node_id, etype));
         }
       }
-      edges
+      edges.unwrap_or_default()
     })
+  }
+
+  /// The destinations of `node_id`'s out-edges of type `etype` (every type for `None`), in
+  /// [`Self::out_edges`] order: what neighbor lists return, without listing the edge types
+  /// first.
+  pub(crate) fn out_neighbor_ids(&self, node_id: NodeId, etype: Option<ETypeId>) -> Vec<NodeId> {
+    self.node_edges_with(EdgeSide::Out, node_id, etype, None, usize::MAX, |_, dst| {
+      dst
+    })
+  }
+
+  /// [`Self::out_neighbor_ids`] for in-edges: their sources, in [`Self::in_edges`] order.
+  pub(crate) fn in_neighbor_ids(&self, node_id: NodeId, etype: Option<ETypeId>) -> Vec<NodeId> {
+    self.node_edges_with(EdgeSide::In, node_id, etype, None, usize::MAX, |_, src| src)
   }
 
   /// Get neighbors via outgoing edges of a specific type
   ///
   /// Returns destination node IDs for edges of the given type.
   pub fn out_neighbors(&self, node_id: NodeId, etype: ETypeId) -> Vec<NodeId> {
-    self
-      .out_edges_after(node_id, Some(etype), None, usize::MAX)
-      .into_iter()
-      .map(|(_, dst)| dst)
-      .collect()
+    self.out_neighbor_ids(node_id, Some(etype))
   }
 
   /// Get neighbors via incoming edges of a specific type
   ///
   /// Returns source node IDs for edges of the given type.
   pub fn in_neighbors(&self, node_id: NodeId, etype: ETypeId) -> Vec<NodeId> {
-    self
-      .in_edges_after(node_id, Some(etype), None, usize::MAX)
-      .into_iter()
-      .map(|(_, src)| src)
-      .collect()
+    self.in_neighbor_ids(node_id, Some(etype))
   }
 
   /// Check if there are any outgoing edges of a specific type

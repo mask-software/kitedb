@@ -811,10 +811,36 @@ fn check_listings(db: &SingleFileDB, ids: &Ids, rng: &mut StdRng, at: &str) {
   }
   assert_eq!(db.count_edges(), edges.len(), "{at}: count_edges");
 
-  // out_edges_after / in_edges_after, from every node (and a missing one)
+  // out_edges / in_edges against `list_edges` (a separate walk), and out_edges_after /
+  // in_edges_after against them, from every node (and a missing one)
+  let mut listed_out: HashMap<NodeId, Vec<(ETypeId, NodeId)>> = HashMap::new();
+  let mut listed_in: HashMap<NodeId, Vec<(ETypeId, NodeId)>> = HashMap::new();
+  for &(src, etype, dst) in &edges {
+    listed_out.entry(src).or_default().push((etype, dst));
+    listed_in.entry(dst).or_default().push((etype, src));
+  }
+  for list in listed_in.values_mut() {
+    list.sort_unstable();
+  }
   for node_id in sampled(&nodes, rng).into_iter().chain([max_id + 1]) {
     let out = db.out_edges(node_id);
     let incoming = db.in_edges(node_id);
+    let degrees = (db.out_degree(node_id), db.in_degree(node_id));
+    assert_eq!(
+      out,
+      listed_out.get(&node_id).cloned().unwrap_or_default(),
+      "{at}: out_edges({node_id}) against list_edges"
+    );
+    assert_eq!(
+      incoming,
+      listed_in.get(&node_id).cloned().unwrap_or_default(),
+      "{at}: in_edges({node_id}) against list_edges"
+    );
+    assert_eq!(
+      degrees,
+      (out.len(), incoming.len()),
+      "{at}: degrees of {node_id}"
+    );
     for (all, slice) in [
       (
         &out,

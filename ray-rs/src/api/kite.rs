@@ -248,17 +248,11 @@ fn edge_exists_db(db: &SingleFileDB, src: NodeId, etype: ETypeId, dst: NodeId) -
 }
 
 fn neighbors_out_db(db: &SingleFileDB, node_id: NodeId, etype: Option<ETypeId>) -> Vec<NodeId> {
-  db.out_edges_after(node_id, etype, None, usize::MAX)
-    .into_iter()
-    .map(|(_, dst)| dst)
-    .collect()
+  db.out_neighbor_ids(node_id, etype)
 }
 
 fn neighbors_in_db(db: &SingleFileDB, node_id: NodeId, etype: Option<ETypeId>) -> Vec<NodeId> {
-  db.in_edges_after(node_id, etype, None, usize::MAX)
-    .into_iter()
-    .map(|(_, src)| src)
-    .collect()
+  db.in_neighbor_ids(node_id, etype)
 }
 
 fn edge_prop_db(
