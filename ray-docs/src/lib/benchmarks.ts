@@ -107,9 +107,14 @@ const MONTHS = [
 	"December",
 ];
 
-/** The day of this refresh, as "October 3, 2026". */
+/**
+ * The day of this refresh, as "October 3, 2026". The stamp starts with the
+ * date and may carry a suffix for a second run that day ("2026-10-03-r2").
+ */
 export const BENCH_DATE = (() => {
-	const [year, month, day] = BENCH_STAMP.split("-").map(Number);
+	const [year, month, day] = pick(BENCH_STAMP, /^(\d{4}-\d{2}-\d{2})(?:-|$)/)
+		.split("-")
+		.map(Number);
 	return `${MONTHS[month - 1]} ${day}, ${year}`;
 })();
 

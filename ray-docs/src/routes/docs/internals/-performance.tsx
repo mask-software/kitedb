@@ -654,12 +654,11 @@ export function PerformancePage() {
 				{formatRateShort(BULK_LOAD.noMvcc.edgesPerSec)} without it (
 				{BENCH_MACHINE.cpu}, <code>examples/bulk_load_bench.rs</code>). It runs
 				alone among writers, and readers never wait for it. A read transaction
-				held open across the load slows it (
-				{formatRateShort(BULK_LOAD.reader.nodesPerSec)} for nodes and{" "}
-				{formatRateShort(BULK_LOAD.reader.edgesPerSec)} for edges in the same
-				test),
-				because the load's commits record version history for it. Use it for
-				one-shot ingest or ETL jobs.
+				held open across the load slows its edge inserts (
+				{formatRateShort(BULK_LOAD.reader.edgesPerSec)} in the same test, with
+				nodes at {formatRateShort(BULK_LOAD.reader.nodesPerSec)}), because the
+				load's commits record version history for it. Use it for one-shot ingest
+				or ETL jobs.
 			</p>
 
 			<h3>Bulk ingest example (low-level API)</h3>

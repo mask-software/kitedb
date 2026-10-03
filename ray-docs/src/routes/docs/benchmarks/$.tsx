@@ -509,13 +509,13 @@ function GraphPage() {
 			<p>
 				With MVCC, writer threads build their transactions in parallel. Commits
 				that arrive together are written as one group (one WAL write, one header
-				write, one fsync in <code>full</code> mode), and the next group is
-				written while one publishes. Publishing, each commit's merge into the
-				in-memory delta, runs one group at a time, so with{" "}
+				write, one fsync in <code>full</code> mode). Publishing, each commit's
+				merge into the in-memory delta, runs one group at a time, so with{" "}
 				<code>syncMode=Normal</code> large transactions gain more from extra
 				writers than small ones, whose cost is mostly that shared pipeline. In{" "}
-				<code>full</code> mode a group also shares its fsync, so one-node
-				transactions gain from more writers too.
+				<code>full</code> mode a group also shares its fsync, and the next group
+				is written and synced while one publishes, so one-node transactions gain
+				from more writers too.
 			</p>
 			<table>
 				<thead>

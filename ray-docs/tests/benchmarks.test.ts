@@ -36,4 +36,17 @@ describe("published benchmark data", () => {
 		);
 		expect(benchmarks.BENCH_MACHINE.cpu.length).toBeGreaterThan(0);
 	});
+
+	it("shows the day of the run, not its stamp", () => {
+		// A second run on one day has a stamp like "2026-10-03-r2".
+		const day = new Date(`${BENCH_STAMP.slice(0, 10)}T00:00:00Z`);
+		expect(benchmarks.BENCH_DATE).toBe(
+			day.toLocaleDateString("en-US", {
+				month: "long",
+				day: "numeric",
+				year: "numeric",
+				timeZone: "UTC",
+			}),
+		);
+	});
 });

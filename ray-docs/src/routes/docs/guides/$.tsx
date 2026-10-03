@@ -1212,11 +1212,11 @@ if db.has_transaction():
 					{formatRateShort(BULK_LOAD.noMvcc.edgesPerSec)} with MVCC off. It runs
 					alone among writers (it waits for open write transactions, and new
 					ones wait for it), and readers never wait for it. A read transaction
-					left open across the load slows it down, because the load's commits
-					record version history for that reader (
-					{formatRateShort(BULK_LOAD.reader.nodesPerSec)} for nodes and{" "}
+					left open across the load slows its edge inserts, because the load's
+					commits record version history for that reader (
 					{formatRateShort(BULK_LOAD.reader.edgesPerSec)} for edges in the same
-					test). Use it for one-shot ingest or ETL jobs.
+					test, with nodes at {formatRateShort(BULK_LOAD.reader.nodesPerSec)}).
+					Use it for one-shot ingest or ETL jobs.
 				</p>
 				<MultiLangCode
 					typescript={`import { Database } from '@kitedb/core';
