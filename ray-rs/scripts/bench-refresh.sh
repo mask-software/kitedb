@@ -52,6 +52,11 @@
 # published: the graph latency table, one writer in the write-scaling table,
 # the bulk load and mvcc_overhead_bench. Group commit is always on; the
 # --group-commit-* flags have no effect and are not passed.
+#
+# Not in the matrix: other graph databases (ray_vs_memgraph_bench needs a
+# Memgraph server, ray_vs_ladybug_bench a long C++ build, and the docs publish
+# no numbers for other databases), and the replication, vector ANN and
+# open/close gates, which have their own scripts in this directory.
 
 set -euo pipefail
 
