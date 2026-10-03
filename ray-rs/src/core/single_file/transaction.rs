@@ -234,6 +234,22 @@ pub(crate) struct QueuedCommit {
 /// leader for the next group sooner.
 const COMMIT_WAIT_SPIN: std::time::Duration = std::time::Duration::from_micros(100);
 
+/// How long a queued committer spins without yielding its CPU first, while
+/// fewer transactions are open than the machine has CPUs (see
+/// `SingleFileDB::commit_queued`). A yield returns a microsecond or so
+/// later, so a committer that yields sees its outcome (or the lead) that
+/// much late, and a group waits for its next leader as long; most outcomes
+/// come within this. With more transactions open than CPUs, a committer
+/// that kept its CPU would hold back the very leader it waits for, so it
+/// yields from the start.
+const COMMIT_WAIT_HOLD: std::time::Duration = std::time::Duration::from_micros(30);
+
+/// The CPUs a process may run threads on, for `COMMIT_WAIT_HOLD`.
+fn available_cpus() -> usize {
+  static CPUS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+  *CPUS.get_or_init(|| std::thread::available_parallelism().map_or(1, usize::from))
+}
+
 /// A queued commit's slot: its committer waits here until the leader
 /// delivers its outcome or hands it the lead.
 struct CommitTicket {
@@ -288,10 +304,15 @@ impl CommitTicket {
 
   /// Wait until the commit is written (its outcome) or this committer is
   /// handed the lead (`None`). Spins for up to `COMMIT_WAIT_SPIN`, then
-  /// parks; `std::thread::park` may return spuriously, so it rechecks.
-  fn wait(&self) -> Option<CommitOutcome> {
+  /// parks; `std::thread::park` may return spuriously, so it rechecks. With
+  /// `hold_cpu` it keeps its CPU for the first `COMMIT_WAIT_HOLD` of that,
+  /// spinning without yielding, so it sees its outcome or the lead at once.
+  fn wait(&self, hold_cpu: bool) -> Option<CommitOutcome> {
     let mark = prof::start();
-    let spin_until = std::time::Instant::now() + COMMIT_WAIT_SPIN;
+    let now = std::time::Instant::now();
+    let spin_until = now + COMMIT_WAIT_SPIN;
+    let hold_until = now + COMMIT_WAIT_HOLD;
+    let mut holding = hold_cpu;
     let mut spins = 0u32;
     loop {
       match self.state.load(Ordering::Acquire) {
@@ -316,7 +337,11 @@ impl CommitTicket {
         TICKET_PARKED => std::thread::park(),
         _ => {
           spins += 1;
-          if spins < 64 {
+          // Keeping the CPU, the clock is read every 64 spins.
+          if holding && spins.is_multiple_of(64) {
+            holding = std::time::Instant::now() < hold_until;
+          }
+          if spins < 64 || holding {
             std::hint::spin_loop();
           } else if std::time::Instant::now() < spin_until {
             std::thread::yield_now();
@@ -1680,7 +1705,10 @@ impl SingleFileDB {
       ticket: Arc::clone(&ticket),
     });
     drop(state);
-    let outcome = match ticket.wait() {
+    // Spinning without yielding pays only while every open transaction's
+    // thread can have a CPU of its own.
+    let hold_cpu = self.active_transactions.load(Ordering::Relaxed) < available_cpus();
+    let outcome = match ticket.wait(hold_cpu) {
       Some(outcome) => outcome,
       // Handed the lead: this commit is the oldest queued.
       None => self.lead_commits(None, Some(&ticket)),
