@@ -1197,7 +1197,9 @@ impl VersionChainManager {
   }
 
   /// Whether node `node_id` was created by a commit a reader at `snapshot_ts` (in transaction
-  /// `txid`) does not see (see `record_node_creations`): it is absent for the reader.
+  /// `txid`) does not see (see `record_node_creations`): it is absent for the reader. Kept out
+  /// of line: every read that may consult history inlines `node_at`.
+  #[inline(never)]
   fn created_after(&self, node_id: NodeId, snapshot_ts: Timestamp, txid: TxId) -> bool {
     self
       .node_creations

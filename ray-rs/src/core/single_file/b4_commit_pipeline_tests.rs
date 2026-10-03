@@ -276,9 +276,8 @@ mod merge_model {
         .map(|(&id, delta)| (id, node(delta)))
         .collect::<BTreeMap<_, _>>()
     };
-    let patches = |map: &crate::core::delta::EdgePatches| {
+    let patches = |map: &mut dyn Iterator<Item = (&NodeId, &BTreeSet<crate::types::EdgePatch>)>| {
       map
-        .iter()
         .map(|(&id, set)| (id, set.clone()))
         .collect::<BTreeMap<_, _>>()
     };
@@ -299,10 +298,10 @@ mod merge_model {
       nodes(&mut delta.created_nodes.iter()),
       delta.deleted_nodes.iter().collect::<BTreeSet<_>>(),
       nodes(&mut delta.modified_nodes.iter()),
-      patches(&delta.out_add),
-      patches(&delta.out_del),
-      patches(&delta.in_add),
-      patches(&delta.in_del),
+      patches(&mut delta.out_add.iter()),
+      patches(&mut delta.out_del.iter()),
+      patches(&mut delta.in_add.iter()),
+      patches(&mut delta.in_del.iter()),
       delta.new_labels.iter().collect::<BTreeMap<_, _>>(),
       delta.new_etypes.iter().collect::<BTreeMap<_, _>>(),
       delta.new_propkeys.iter().collect::<BTreeMap<_, _>>(),

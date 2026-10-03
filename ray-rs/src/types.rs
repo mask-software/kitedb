@@ -412,9 +412,9 @@ pub struct DeltaState {
 
   // Edge patches (both directions maintained)
   pub out_add: crate::core::delta::EdgePatches,
-  pub out_del: crate::core::delta::EdgePatches,
+  pub out_del: DeltaMap<NodeId, BTreeSet<EdgePatch>>,
   pub in_add: crate::core::delta::EdgePatches,
-  pub in_del: crate::core::delta::EdgePatches,
+  pub in_del: DeltaMap<NodeId, BTreeSet<EdgePatch>>,
 
   // Edge properties (keyed by (src, etype, dst))
   pub edge_props: DeltaMap<(NodeId, ETypeId, NodeId), HashMap<PropKeyId, Option<PropValueRef>>>,

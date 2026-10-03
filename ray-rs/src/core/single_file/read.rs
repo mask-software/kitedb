@@ -257,16 +257,14 @@ pub(super) fn merge_sorted<K: Ord + Copy, const N: usize>(
 impl<'a> ReadView<'a> {
   /// Whether `node_id` existed at the reader's snapshot, if it changed since (see the module
   /// docs); `None` when the delta and snapshot decide.
+  #[inline]
   pub(super) fn node_mvcc(&self, node_id: NodeId) -> Option<bool> {
-    self
-      .history?
-      .node_exists_at(node_id, self.snapshot_ts, self.txid)
+    node_exists_in_history(self.history?, node_id, self.snapshot_ts, self.txid)
   }
 
+  #[inline]
   fn edge_mvcc(&self, src: NodeId, etype: ETypeId, dst: NodeId) -> Option<bool> {
-    self
-      .history?
-      .edge_exists_at(src, etype, dst, self.snapshot_ts, self.txid)
+    edge_exists_in_history(self.history?, src, etype, dst, self.snapshot_ts, self.txid)
   }
 
   /// Whether the reader sees `node_id`: whether `iter_nodes` lists it.
@@ -510,6 +508,31 @@ impl<'a> ReadView<'a> {
   }
 }
 
+/// `VersionChainManager::node_exists_at`, out of line: reads check it per node and per edge
+/// endpoint, mostly with no history to consult, and inline the check that there is.
+#[inline(never)]
+fn node_exists_in_history(
+  history: &VersionChainManager,
+  node_id: NodeId,
+  snapshot_ts: Timestamp,
+  txid: TxId,
+) -> Option<bool> {
+  history.node_exists_at(node_id, snapshot_ts, txid)
+}
+
+/// `VersionChainManager::edge_exists_at`, out of line (see `node_exists_in_history`).
+#[inline(never)]
+fn edge_exists_in_history(
+  history: &VersionChainManager,
+  src: NodeId,
+  etype: ETypeId,
+  dst: NodeId,
+  snapshot_ts: Timestamp,
+  txid: TxId,
+) -> Option<bool> {
+  history.edge_exists_at(src, etype, dst, snapshot_ts, txid)
+}
+
 /// Walk a sorted source, each key once, until `f` breaks.
 fn walk_sorted<K: PartialEq + Copy>(
   mut keys: impl Iterator<Item = K>,
@@ -746,17 +769,19 @@ impl SingleFileDB {
     let tx_handle = self.current_tx_handle();
     let mut tx_guard = tx_handle.as_ref().map(|tx| tx.lock());
     if let Some(tx) = tx_guard.as_deref() {
-      if tx.pending.is_node_removed(node_id) {
+      // The transaction's own copy, looked up once.
+      let created = tx.pending.created_nodes.get(&node_id);
+      if created.is_none() && tx.pending.is_node_deleted(node_id) {
         return None;
       }
-      if let Some(node_delta) = tx.pending.node_delta(node_id) {
-        if let Some(ref delta_props) = node_delta.props {
-          if let Some(value) = delta_props.get(&key_id) {
-            return value.as_deref().cloned();
-          }
-        }
+      let node_delta = created.or_else(|| tx.pending.modified_nodes.get(&node_id));
+      if let Some(value) = node_delta
+        .and_then(|node_delta| node_delta.props.as_ref())
+        .and_then(|props| props.get(&key_id))
+      {
+        return value.as_deref().cloned();
       }
-      if tx.pending.is_node_created(node_id) {
+      if created.is_some() {
         return None;
       }
     }
@@ -780,29 +805,30 @@ impl SingleFileDB {
     }
 
     // Check if node exists (at the reader's MVCC snapshot, if that differs). Its delta
-    // state alone does not count, see `NodeLayers::node_exists`.
+    // state alone does not count, see `NodeLayers::node_exists`. The delta's copy of the
+    // node is looked up once, for this and the props below.
     let snapshot = self.snapshot.read();
+    let created = delta.created_nodes.get(&node_id);
     let exists = match mvcc_node_visible {
       Some(visible) => visible,
-      None => delta.node_exists_over(snapshot.as_ref(), node_id),
+      None => created.is_some() || delta.snapshot_node_over(snapshot.as_ref(), node_id),
     };
     if !exists {
       return None;
     }
 
-    // Check delta first (for modifications)
-    if let Some(node_delta) = delta.node_delta(node_id) {
-      if let Some(ref delta_props) = node_delta.props {
-        if let Some(value) = delta_props.get(&key_id) {
-          // None means explicitly deleted
-          return value.as_deref().cloned();
-        }
-      }
+    // Check delta first (for modifications); `None` means explicitly deleted.
+    let node_delta = created.or_else(|| delta.modified_nodes.get(&node_id));
+    if let Some(value) = node_delta
+      .and_then(|node_delta| node_delta.props.as_ref())
+      .and_then(|props| props.get(&key_id))
+    {
+      return value.as_deref().cloned();
     }
 
     // A node created (or recreated) in the delta has no snapshot props, and a delete masks
     // them (see `NodeLayers::sees_snapshot`).
-    if delta.is_node_created(node_id) || delta.is_node_deleted(node_id) {
+    if created.is_some() || delta.is_node_deleted(node_id) {
       return None;
     }
 

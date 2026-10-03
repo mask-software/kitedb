@@ -73,7 +73,8 @@ const DENSE_MAX_IDS: u64 = 1 << 26;
 
 /// The nodes a delta created (or recreated), with their state.
 pub type CreatedNodes = NodeMap<NodeDelta>;
-/// A delta's edge patches of one kind and direction, by node.
+/// A delta's added edge patches in one direction, by node. (Tombstones, which
+/// name edges of nodes committed before, stay in hash maps.)
 pub type EdgePatches = NodeMap<BTreeSet<EdgePatch>>;
 
 /// A delta's map from node ids to `V`: its created nodes, and its edge patches
@@ -132,6 +133,7 @@ impl<V> NodeChunk<V> {
 
 impl<V> DenseNodes<V> {
   /// The chunk and slot of `id`, if the dense part covers it.
+  #[inline]
   fn slot_of(&self, id: NodeId) -> Option<(usize, usize)> {
     let offset = id.checked_sub(self.base)?;
     (offset < DENSE_MAX_IDS).then(|| {
@@ -139,19 +141,16 @@ impl<V> DenseNodes<V> {
       (offset / CHUNK_IDS, offset % CHUNK_IDS)
     })
   }
-
-  fn slot(&self, id: NodeId) -> Option<&(NodeId, V)> {
-    let (chunk, slot) = self.slot_of(id)?;
-    self.chunks.get(chunk)?.as_ref()?.slots[slot].as_ref()
-  }
 }
 
 impl<V> NodeMap<V> {
   /// Number of entries.
+  #[inline]
   pub fn len(&self) -> usize {
     self.dense.as_ref().map_or(0, |dense| dense.len) + self.sparse.len()
   }
 
+  #[inline]
   pub fn is_empty(&self) -> bool {
     self.len() == 0
   }
@@ -164,18 +163,43 @@ impl<V> NodeMap<V> {
       .is_some_and(|dense| dense.slot_of(id).is_some())
   }
 
+  #[inline]
   pub fn contains_key(&self, id: &NodeId) -> bool {
-    self.get(id).is_some()
+    match &self.dense {
+      None => self.sparse.contains_key(id),
+      Some(dense) => self.get_key_value_dense(dense, id).is_some(),
+    }
   }
 
+  #[inline]
   pub fn get(&self, id: &NodeId) -> Option<&V> {
-    self.get_key_value(id).map(|(_, value)| value)
+    match &self.dense {
+      None => self.sparse.get(id),
+      Some(dense) => self.get_key_value_dense(dense, id).map(|(_, value)| value),
+    }
   }
 
+  #[inline]
   pub fn get_key_value(&self, id: &NodeId) -> Option<(&NodeId, &V)> {
     match &self.dense {
-      Some(dense) if dense.slot_of(*id).is_some() => dense.slot(*id).map(|(id, value)| (id, value)),
-      _ => self.sparse.get_key_value(id),
+      None => self.sparse.get_key_value(id),
+      Some(dense) => self.get_key_value_dense(dense, id),
+    }
+  }
+
+  /// `get_key_value` with a dense part: kept out of line, so the many reads
+  /// that look up a map that has none (most maps of most deltas) stay small.
+  #[inline(never)]
+  fn get_key_value_dense<'a>(
+    &'a self,
+    dense: &'a DenseNodes<V>,
+    id: &NodeId,
+  ) -> Option<(&'a NodeId, &'a V)> {
+    match dense.slot_of(*id) {
+      Some((chunk, slot)) => dense.chunks.get(chunk)?.as_ref()?.slots[slot]
+        .as_ref()
+        .map(|(id, value)| (id, value)),
+      None => self.sparse.get_key_value(id),
     }
   }
 
@@ -492,28 +516,23 @@ impl DeltaState {
 
   /// Remove an add patch (`added`) or a tombstone (`!added`) in both directions.
   fn remove_edge_patch(&mut self, src: NodeId, etype: ETypeId, dst: NodeId, added: bool) {
-    let (out_map, in_map) = if added {
-      (&mut self.out_add, &mut self.in_add)
+    if added {
+      remove_patch(&mut self.out_add, src, EdgePatch { etype, other: dst });
+      remove_patch(&mut self.in_add, dst, EdgePatch { etype, other: src });
     } else {
-      (&mut self.out_del, &mut self.in_del)
-    };
-    if let Some(set) = out_map.get_mut(&src) {
-      if set.remove(&EdgePatch { etype, other: dst }) && set.is_empty() {
-        out_map.remove(&src);
-      }
-    }
-    if let Some(set) = in_map.get_mut(&dst) {
-      if set.remove(&EdgePatch { etype, other: src }) && set.is_empty() {
-        in_map.remove(&dst);
-      }
+      remove_patch(&mut self.out_del, src, EdgePatch { etype, other: dst });
+      remove_patch(&mut self.in_del, dst, EdgePatch { etype, other: src });
     }
   }
 
   /// Whether `node_id` exists through this delta over `snapshot`.
   pub fn node_exists_over(&self, snapshot: Option<&SnapshotData>, node_id: NodeId) -> bool {
-    if self.is_node_created(node_id) {
-      return true;
-    }
+    self.is_node_created(node_id) || self.snapshot_node_over(snapshot, node_id)
+  }
+
+  /// Whether `snapshot` holds the node and this delta did not delete it: the
+  /// node exists through its snapshot copy, unless the delta created it again.
+  pub fn snapshot_node_over(&self, snapshot: Option<&SnapshotData>, node_id: NodeId) -> bool {
     !self.is_node_deleted(node_id) && snapshot.is_some_and(|snap| snap.has_node(node_id))
   }
 
@@ -758,18 +777,16 @@ impl DeltaState {
   /// them.
   fn drop_edge_patches(&mut self, node_id: NodeId) {
     for added in [true, false] {
-      let (out_map, in_map) = if added {
-        (&self.out_add, &self.in_add)
+      let (out_patches, in_patches) = if added {
+        (self.out_add.get(&node_id), self.in_add.get(&node_id))
       } else {
-        (&self.out_del, &self.in_del)
+        (self.out_del.get(&node_id), self.in_del.get(&node_id))
       };
-      let out_edges = out_map
-        .get(&node_id)
+      let out_edges = out_patches
         .into_iter()
         .flatten()
         .map(|patch| (node_id, patch.etype, patch.other));
-      let in_edges = in_map
-        .get(&node_id)
+      let in_edges = in_patches
         .into_iter()
         .flatten()
         .map(|patch| (patch.other, patch.etype, node_id));
@@ -1274,12 +1291,46 @@ impl DeltaState {
   }
 }
 
+/// A delta's edge patch sets by node: added patches (`EdgePatches`) or
+/// tombstones (a hash map).
+trait PatchSets {
+  fn patches_mut(&mut self, node: NodeId) -> Option<&mut BTreeSet<EdgePatch>>;
+  fn remove_patches(&mut self, node: NodeId);
+}
+
+impl PatchSets for EdgePatches {
+  fn patches_mut(&mut self, node: NodeId) -> Option<&mut BTreeSet<EdgePatch>> {
+    self.get_mut(&node)
+  }
+  fn remove_patches(&mut self, node: NodeId) {
+    self.remove(&node);
+  }
+}
+
+impl PatchSets for DeltaMap<NodeId, BTreeSet<EdgePatch>> {
+  fn patches_mut(&mut self, node: NodeId) -> Option<&mut BTreeSet<EdgePatch>> {
+    self.get_mut(&node)
+  }
+  fn remove_patches(&mut self, node: NodeId) {
+    self.remove(&node);
+  }
+}
+
+/// Remove `patch` from `node`'s set in `sets`, and the set once empty.
+fn remove_patch(sets: &mut impl PatchSets, node: NodeId, patch: EdgePatch) {
+  if let Some(set) = sets.patches_mut(node) {
+    if set.remove(&patch) && set.is_empty() {
+      sets.remove_patches(node);
+    }
+  }
+}
+
 /// Merge a transaction's add patches of `node` in one direction (`adds`, with
 /// that direction's tombstones `tombstones`): each cancels a tombstone, or is
 /// added, as in `DeltaState::add_edge`.
 fn merge_added_patches(
   adds: &mut EdgePatches,
-  tombstones: &mut EdgePatches,
+  tombstones: &mut DeltaMap<NodeId, BTreeSet<EdgePatch>>,
   node: NodeId,
   patches: BTreeSet<EdgePatch>,
 ) {
@@ -1394,12 +1445,16 @@ mod tests {
     assert!(delta.node_exists_over(None, n));
     assert_eq!(delta.key_owner_over(None, "new"), Some(n));
     assert!(delta.modified_nodes.is_empty());
-    for map in [&delta.out_add, &delta.in_add, &delta.out_del, &delta.in_del] {
+    let all_patches = delta
+      .out_add
+      .iter()
+      .chain(&delta.in_add)
+      .chain(&delta.out_del)
+      .chain(&delta.in_del);
+    for (&node, patches) in all_patches {
       assert!(
-        map
-          .iter()
-          .all(|(&node, patches)| node != n && patches.iter().all(|p| p.other != n)),
-        "an old edge patch of n survived the recreate: {map:?}"
+        node != n && patches.iter().all(|p| p.other != n),
+        "an old edge patch of n survived the recreate: {node} {patches:?}"
       );
     }
     assert!(delta.is_edge_added(a, 10, b), "unrelated patches stay");
@@ -1537,9 +1592,9 @@ mod tests {
       set(&delta.deleted_nodes),
       map(&delta.modified_nodes),
       node_map(&delta.out_add),
-      node_map(&delta.out_del),
+      map(&delta.out_del),
       node_map(&delta.in_add),
-      node_map(&delta.in_del),
+      map(&delta.in_del),
       map(&delta.edge_props),
       map(&delta.key_index),
     ]
