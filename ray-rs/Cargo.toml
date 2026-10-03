@@ -81,6 +81,10 @@ prost = { version = "0.14", optional = true }
 tonic = { version = "0.14", features = ["transport", "tls-webpki-roots", "gzip"], optional = true }
 tokio = { version = "1.45", features = ["rt", "rt-multi-thread", "fs", "sync", "time", "net"], optional = true }
 
+# Ladybug comparison bench only (examples/ray_vs_ladybug_bench.rs, `bench-ladybug`
+# feature): lbug builds a C++ engine, so it stays out of default builds.
+lbug = { version = "0.14", optional = true }
+
 [build-dependencies]
 napi-build = { version = "2", optional = true }
 
@@ -117,6 +121,7 @@ name = "single_file_raw_bench"
 test = true
 
 [features]
+bench-ladybug = ["dep:lbug"]
 default = ["napi"]
 napi = ["dep:napi", "dep:napi-derive", "dep:napi-build", "otlp"]
 python = ["dep:pyo3", "otlp"]
@@ -141,3 +146,7 @@ codegen-units = 1
 
 [profile.dev]
 opt-level = 1
+
+[[example]]
+name = "ray_vs_ladybug_bench"
+required-features = ["bench-ladybug"]
