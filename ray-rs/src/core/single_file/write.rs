@@ -469,7 +469,7 @@ impl SingleFileDB {
       let delta = self.delta.read();
       if let Some(node_delta) = delta.created_nodes.get(&node_id) {
         key_to_record = node_delta.key.clone();
-      } else if let Some(ref snap) = *self.snapshot.read() {
+      } else if let Some(ref snap) = **self.snapshot.read() {
         if let Some(phys) = snap.phys_node(node_id) {
           key_to_record = snap.node_key(phys);
         }

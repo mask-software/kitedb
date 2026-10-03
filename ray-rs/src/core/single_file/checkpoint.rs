@@ -635,11 +635,11 @@ impl SingleFileDB {
       let mut delta_guard = self.delta.write();
       let mut snapshot_guard = self.snapshot.write();
       (
-        std::mem::replace(&mut *snapshot_guard, loaded.snapshot),
+        std::mem::replace(&mut **snapshot_guard, loaded.snapshot),
         std::mem::replace(&mut *self.vector_stores.write(), loaded.vector_stores),
         // Entries of the replaced snapshot; the new one's stores are decoded.
         std::mem::take(&mut *self.vector_store_lazy_entries.write()),
-        std::mem::replace(&mut *delta_guard, delta),
+        std::mem::replace(&mut **delta_guard, delta),
       )
     };
   }
@@ -1906,7 +1906,7 @@ impl SingleFileDB {
     }
 
     // Collect nodes from snapshot
-    if let Some(ref snapshot) = *self.snapshot.read() {
+    if let Some(ref snapshot) = **self.snapshot.read() {
       let num_nodes = snapshot.header.num_nodes as usize;
 
       for phys in 0..num_nodes {

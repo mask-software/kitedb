@@ -64,7 +64,7 @@ fn snapshot_with_a_wrong_key_hash() -> SnapshotData {
 fn check_reports_a_corrupt_snapshot() {
   let dir = tempdir().expect("tempdir");
   let db = open_single_file(dir.path().join("corrupt.kitedb"), options()).expect("open");
-  *db.snapshot.write() = Some(snapshot_with_a_wrong_key_hash());
+  **db.snapshot.write() = Some(snapshot_with_a_wrong_key_hash());
 
   let report = db.check();
   // Leave the database as it was opened before closing it.

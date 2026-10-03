@@ -765,7 +765,7 @@ impl SingleFileDB {
     };
 
     // From snapshot
-    if let Some(ref snap) = *snapshot {
+    if let Some(ref snap) = **snapshot {
       let num_nodes = snap.header.num_nodes as u32;
       for phys in 0..num_nodes {
         examined_nodes(1);
@@ -945,7 +945,8 @@ impl SingleFileDB {
     let delta = self.delta.read();
     let snapshot = self.snapshot.read();
 
-    let (snapshot_nodes, snapshot_edges, snapshot_max_node_id) = if let Some(ref snap) = *snapshot {
+    let (snapshot_nodes, snapshot_edges, snapshot_max_node_id) = if let Some(ref snap) = **snapshot
+    {
       (
         snap.header.num_nodes,
         snap.header.num_edges,

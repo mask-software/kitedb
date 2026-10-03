@@ -429,7 +429,7 @@ impl SingleFileDB {
 
     *self.header.write() = layout.clone();
     *self.wal_buffer.lock() = wal_buffer;
-    *self.snapshot.write() = snapshot;
+    **self.snapshot.write() = snapshot;
     Ok(())
   }
 

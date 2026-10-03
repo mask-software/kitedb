@@ -1127,8 +1127,8 @@ fn open_single_file_internal(
     header: RwLock::new(header),
     header_slot: AtomicU32::new(header_slot),
     wal_buffer: Mutex::new(wal_buffer),
-    snapshot: RwLock::new(snapshot),
-    delta: RwLock::new(delta),
+    snapshot: super::CacheAligned(RwLock::new(super::CacheAligned(snapshot))),
+    delta: super::CacheAligned(RwLock::new(super::CacheAligned(delta))),
     next_node_id: AtomicU64::new(next_node_id),
     next_label_id: AtomicU32::new(next_label_id),
     next_etype_id: AtomicU32::new(next_etype_id),
@@ -1252,8 +1252,8 @@ fn migrate_legacy_single_header(
   // Move the state produced by the normal read-only snapshot/WAL recovery
   // path into the new database, then let the normal checkpoint API serialize
   // it. No record-level migration implementation is duplicated here.
-  *temp.snapshot.write() = recovered.snapshot.write().take();
-  *temp.delta.write() = std::mem::replace(&mut *recovered.delta.write(), DeltaState::new());
+  **temp.snapshot.write() = recovered.snapshot.write().take();
+  **temp.delta.write() = std::mem::replace(&mut **recovered.delta.write(), DeltaState::new());
   *temp.label_names.write() = std::mem::take(&mut *recovered.label_names.write());
   *temp.label_ids.write() = std::mem::take(&mut *recovered.label_ids.write());
   *temp.etype_names.write() = std::mem::take(&mut *recovered.etype_names.write());

@@ -681,7 +681,7 @@ impl SingleFileDB {
       .and_then(|vc| vc.node_exists_at(node_id, tx_snapshot_ts, txid));
 
     // Get properties from snapshot first
-    if let Some(ref snap) = *snapshot {
+    if let Some(ref snap) = **snapshot {
       if let Some(phys) = snap
         .phys_node(node_id)
         .filter(|_| layers.sees_snapshot(node_id, mvcc_node_visible))
@@ -833,7 +833,7 @@ impl SingleFileDB {
     }
 
     // Fall back to snapshot
-    if let Some(ref snap) = *snapshot {
+    if let Some(ref snap) = **snapshot {
       if let Some(phys) = snap.phys_node(node_id) {
         return snap.node_prop(phys, key_id);
       }
@@ -896,7 +896,7 @@ impl SingleFileDB {
     let mut edge_exists_in_snapshot = false;
 
     // Check snapshot for edge existence and get base properties
-    if let Some(ref snap) = *snapshot {
+    if let Some(ref snap) = **snapshot {
       if let (Some(src_phys), Some(dst_phys)) = (snap.phys_node(src), snap.phys_node(dst)) {
         if layers.sees_snapshot(src, mvcc_src_visible)
           && layers.sees_snapshot(dst, mvcc_dst_visible)
@@ -1166,7 +1166,7 @@ impl SingleFileDB {
     }
 
     let mut capacity = 0usize;
-    if let Some(ref snap) = *snapshot {
+    if let Some(ref snap) = **snapshot {
       if let Some(phys) = snap.phys_node(node_id) {
         capacity = capacity.saturating_add(snap.out_degree(phys).unwrap_or(0));
       }
@@ -1180,7 +1180,7 @@ impl SingleFileDB {
     let mut edges = Vec::with_capacity(capacity);
 
     // Get edges from snapshot
-    if let Some(ref snap) = *snapshot {
+    if let Some(ref snap) = **snapshot {
       if let Some(phys) = snap
         .phys_node(node_id)
         .filter(|_| layers.sees_snapshot(node_id, node_visible))
@@ -1324,7 +1324,7 @@ impl SingleFileDB {
     }
 
     let mut capacity = 0usize;
-    if let Some(ref snap) = *snapshot {
+    if let Some(ref snap) = **snapshot {
       if let Some(phys) = snap.phys_node(node_id) {
         capacity = capacity.saturating_add(snap.in_degree(phys).unwrap_or(0));
       }
@@ -1338,7 +1338,7 @@ impl SingleFileDB {
     let mut edges = Vec::with_capacity(capacity);
 
     // Get edges from snapshot
-    if let Some(ref snap) = *snapshot {
+    if let Some(ref snap) = **snapshot {
       if let Some(phys) = snap
         .phys_node(node_id)
         .filter(|_| layers.sees_snapshot(node_id, node_visible))
@@ -1651,7 +1651,7 @@ impl SingleFileDB {
     }
 
     // Check snapshot for label (if present)
-    if let Some(ref snapshot) = *snapshot {
+    if let Some(ref snapshot) = **snapshot {
       if let Some(phys) = snapshot.phys_node(node_id) {
         if let Some(labels) = snapshot.node_labels(phys) {
           return labels.contains(&label_id);
@@ -1693,7 +1693,7 @@ impl SingleFileDB {
     let mut labels = std::collections::HashSet::new();
 
     // Load labels from snapshot first (if present)
-    if let Some(ref snapshot) = *snapshot {
+    if let Some(ref snapshot) = **snapshot {
       if let Some(phys) = snapshot
         .phys_node(node_id)
         .filter(|_| layers.sees_snapshot(node_id, node_visible))

@@ -266,9 +266,9 @@ pub struct SingleFileDB {
   /// WAL buffer manager
   pub(crate) wal_buffer: Mutex<WalBuffer>,
   /// Memory-mapped snapshot data (if exists)
-  pub(crate) snapshot: RwLock<Option<SnapshotData>>,
+  pub(crate) snapshot: CacheAligned<RwLock<CacheAligned<Option<SnapshotData>>>>,
   /// Delta state (uncommitted changes)
-  pub(crate) delta: RwLock<DeltaState>,
+  pub(crate) delta: CacheAligned<RwLock<CacheAligned<DeltaState>>>,
 
   // ID allocators
   pub(crate) next_node_id: AtomicU64,
@@ -386,6 +386,29 @@ pub struct SingleFileDB {
   pub(crate) commit_lock_wait_ns: AtomicU64,
   #[cfg(feature = "bench-profile")]
   pub(crate) wal_flush_ns: AtomicU64,
+}
+
+/// A value on cache lines of its own (128 bytes, Apple silicon's line; two
+/// of x86-64's). Every read takes the delta's and the snapshot's read locks,
+/// and each reader writes the lock word: the locks are wrapped in this, and
+/// so is the data they guard (`RwLock<CacheAligned<T>>`, as parking_lot keeps
+/// the data right after the lock word), so readers never miss the data, or
+/// a neighboring field, because another reader took the lock.
+#[repr(align(128))]
+#[derive(Debug, Default)]
+pub(crate) struct CacheAligned<T>(pub(crate) T);
+
+impl<T> std::ops::Deref for CacheAligned<T> {
+  type Target = T;
+  fn deref(&self) -> &T {
+    &self.0
+  }
+}
+
+impl<T> std::ops::DerefMut for CacheAligned<T> {
+  fn deref_mut(&mut self) -> &mut T {
+    &mut self.0
+  }
 }
 
 /// Checkpoint state for background checkpointing

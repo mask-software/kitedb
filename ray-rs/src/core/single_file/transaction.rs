@@ -436,16 +436,20 @@ impl Drop for CommitLeader<'_> {
 /// waits for the chains holding the delta), then kept for the rest.
 #[derive(Default)]
 struct PublishHistory<'a> {
-  snapshot:
-    Option<parking_lot::RwLockReadGuard<'a, Option<crate::core::snapshot::reader::SnapshotData>>>,
+  snapshot: Option<
+    parking_lot::RwLockReadGuard<
+      'a,
+      super::CacheAligned<Option<crate::core::snapshot::reader::SnapshotData>>,
+    >,
+  >,
   chains: Option<crate::mvcc::HistoryWriter<'a>>,
 }
 
 /// A publish's hold of the committed delta (see `publish_commits`):
 /// upgradable, so reads go on, until its first merge, then written.
 enum PublishDelta<'a> {
-  Reading(RwLockUpgradableReadGuard<'a, DeltaState>),
-  Merging(RwLockWriteGuard<'a, DeltaState>),
+  Reading(RwLockUpgradableReadGuard<'a, super::CacheAligned<DeltaState>>),
+  Merging(RwLockWriteGuard<'a, super::CacheAligned<DeltaState>>),
 }
 
 impl<'a> PublishDelta<'a> {
@@ -461,7 +465,7 @@ impl<'a> PublishDelta<'a> {
   }
 
   /// The delta, written: once its readers are done, the first time.
-  fn merging(self) -> RwLockWriteGuard<'a, DeltaState> {
+  fn merging(self) -> RwLockWriteGuard<'a, super::CacheAligned<DeltaState>> {
     match self {
       Self::Reading(delta) => RwLockUpgradableReadGuard::upgrade(delta),
       Self::Merging(delta) => delta,
