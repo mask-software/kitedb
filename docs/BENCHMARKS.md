@@ -314,6 +314,28 @@ Adjust result cardinality to your `5-20` target:
 Optional Python harness is still available at:
 - `ray-rs/python/benchmarks/benchmark_raydb_vs_memgraph.py`
 
+### RayDB vs Ladybug (local 1-hop traversal comparison)
+
+This follows the same workload shape and query semantics as the Memgraph harness
+above, but compares two embedded Rust engines.
+
+Prerequisites:
+- none (Ladybug runs in-process via the `lbug` Rust crate). The example needs the
+  `bench-ladybug` feature, which builds Ladybug's C++ engine (several minutes the
+  first time), so default builds and `cargo test` skip it.
+
+Run with your requested shape (10k nodes, 20k edges, alice fan-out 10):
+
+```bash
+cd ray-rs
+cargo run --release --example ray_vs_ladybug_bench --no-default-features --features bench-ladybug -- \
+  --nodes 10000 --edges 20000 --query-results 10 --iterations 5000
+```
+
+Adjust result cardinality to your `5-20` target:
+- `--query-results 5`
+- `--query-results 20`
+
 ### Replication performance gates (Phase D carry-over)
 
 Run both replication perf gates:
@@ -813,6 +835,6 @@ change it built IVF-PQ). See "Vector index (Rust)" under Running Benchmarks.
 ## Notes
 
 - These are **local** results. Expect variation across machines and datasets.
-- The SQLite baseline is included as a reference point. The Memgraph harness
-  above is for running comparisons on your own machine; this doc publishes no
-  numbers for other graph databases.
+- The SQLite baseline is included as a reference point. The Memgraph and Ladybug
+  harnesses above are for running comparisons on your own machine; this doc
+  publishes no numbers for other graph databases.
