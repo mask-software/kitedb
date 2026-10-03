@@ -6,7 +6,7 @@ Benchmarks low-level Database operations via the Python bindings.
 Intended for apples-to-apples comparison with bench/benchmark-single-file-raw.ts.
 
 Prerequisites:
-  maturin develop --features python
+  maturin develop --release --features python   (a debug build is several times slower)
 
 Usage:
   python benchmark_single_file_raw.py [options]
@@ -22,8 +22,9 @@ Options:
   --keep-db                 Keep the database file after benchmark
   --wal-size BYTES          WAL size in bytes (default: 67108864)
   --sync-mode MODE          Sync mode: full|normal|off (default: normal)
-  --group-commit-enabled    Enable group commit (default: false)
-  --group-commit-window-ms  Group commit window in ms (default: 2)
+  --group-commit-enabled, --group-commit-window-ms N
+                            Accepted for old command lines; no effect (every
+                            commit is group-committed)
   --checkpoint-threshold P  Auto-checkpoint threshold (default: 0.8)
   --no-auto-checkpoint      Disable auto-checkpoint
   --vector-dims N            Vector dimensions (default: 128)
@@ -31,6 +32,8 @@ Options:
   --skip-compact            Skip optimize/compaction step
   --reopen-readonly         Re-open database in read-only mode after compaction
   --mvcc | --no-mvcc        MVCC mode (default: the library default)
+  --seed N                  Seed for the graph, the vectors and the keys and
+                            nodes the read benchmarks pick (default: 42)
 """
 
 import argparse
@@ -65,8 +68,6 @@ class BenchConfig:
   keep_db: bool = False
   wal_size: int = 64 * 1024 * 1024
   sync_mode: str = "normal"
-  group_commit_enabled: bool = False
-  group_commit_window_ms: int = 2
   checkpoint_threshold: float = 0.8
   auto_checkpoint: bool = True
   vector_dims: int = 128
@@ -75,6 +76,7 @@ class BenchConfig:
   reopen_readonly: bool = False
   # None: the library default.
   mvcc: Optional[bool] = None
+  seed: int = 42
 
 
 def parse_args() -> BenchConfig:
@@ -91,8 +93,11 @@ def parse_args() -> BenchConfig:
   parser.add_argument(
     "--sync-mode", type=str.lower, choices=["full", "normal", "off"], default="normal"
   )
+  # No effect since every commit is group-committed; accepted so old command
+  # lines still run.
   parser.add_argument("--group-commit-enabled", action="store_true")
   parser.add_argument("--group-commit-window-ms", type=int, default=2)
+  parser.add_argument("--seed", type=int, default=42)
   parser.add_argument("--checkpoint-threshold", type=float, default=0.8)
   parser.add_argument("--no-auto-checkpoint", action="store_true")
   parser.add_argument("--vector-dims", type=int, default=128)
@@ -125,8 +130,6 @@ def parse_args() -> BenchConfig:
     keep_db=args.keep_db,
     wal_size=args.wal_size,
     sync_mode=str(args.sync_mode).lower(),
-    group_commit_enabled=args.group_commit_enabled,
-    group_commit_window_ms=args.group_commit_window_ms,
     checkpoint_threshold=args.checkpoint_threshold,
     auto_checkpoint=not args.no_auto_checkpoint,
     vector_dims=args.vector_dims,
@@ -134,6 +137,7 @@ def parse_args() -> BenchConfig:
     skip_compact=args.skip_compact,
     reopen_readonly=args.reopen_readonly,
     mvcc=args.mvcc,
+    seed=args.seed,
   )
 
 
@@ -484,7 +488,8 @@ def run_benchmarks(config: BenchConfig):
   logger.log(f"WAL size: {format_number(config.wal_size)} bytes")
   logger.log(f"Sync mode: {config.sync_mode}")
   logger.log(f"MVCC: {mvcc_label(config.mvcc)}")
-  logger.log(f"Group commit: {config.group_commit_enabled} (window {config.group_commit_window_ms}ms)")
+  logger.log("Group commit: every commit")
+  logger.log(f"Seed: {config.seed}")
   logger.log(f"Auto-checkpoint: {config.auto_checkpoint}")
   logger.log(f"Checkpoint threshold: {config.checkpoint_threshold}")
   logger.log(f"Vector dims: {format_number(config.vector_dims)}")
@@ -493,6 +498,7 @@ def run_benchmarks(config: BenchConfig):
   logger.log(f"Reopen read-only: {config.reopen_readonly}")
   logger.log("=" * 120)
 
+  random.seed(config.seed)
   tmp_dir = tempfile.mkdtemp(prefix="kitedb-python-raw-")
   db_path = os.path.join(tmp_dir, "benchmark.kitedb")
 
@@ -512,8 +518,6 @@ def run_benchmarks(config: BenchConfig):
       auto_checkpoint=config.auto_checkpoint,
       checkpoint_threshold=config.checkpoint_threshold,
       sync_mode=sync_mode,
-      group_commit_enabled=config.group_commit_enabled,
-      group_commit_window_ms=config.group_commit_window_ms,
       **mvcc_option,
     )
     db = Database(db_path, options)

@@ -14,9 +14,12 @@
  *   --edge-props N    Number of props per edge (default: 10)
  *   --iterations I    Iterations for latency benchmarks (default: 1000)
  *   --sync-mode MODE  Sync mode: full|normal|off (default: normal)
- *   --group-commit-enabled    Enable group commit (default: false)
- *   --group-commit-window-ms  Group commit window in ms (default: 2)
+ *   --group-commit-enabled, --group-commit-window-ms N
+ *                     Accepted for old command lines; no effect (every commit
+ *                     is group-committed)
  *   --mvcc | --no-mvcc        MVCC mode of both databases (default: the library default)
+ *   --seed N          Seed for the edges and the keys and nodes each benchmark
+ *                     picks (default: 42)
  *
  * Unknown options are an error.
  */
@@ -50,10 +53,9 @@ interface BenchConfig {
 	edgeProps: number;
 	iterations: number;
 	syncMode: string;
-	groupCommitEnabled: boolean;
-	groupCommitWindowMs: number;
 	/** undefined: the library default. */
 	mvcc: boolean | undefined;
+	seed: number;
 }
 
 function usageError(message: string): never {
@@ -73,9 +75,8 @@ function parseArgs(): BenchConfig {
 		edgeProps: 10,
 		iterations: 1000,
 		syncMode: "normal",
-		groupCommitEnabled: false,
-		groupCommitWindowMs: 2,
 		mvcc: undefined,
+		seed: 42,
 	};
 
 	let i = 0;
@@ -109,9 +110,12 @@ function parseArgs(): BenchConfig {
 			}
 			config.syncMode = mode;
 		} else if (flag === "--group-commit-enabled") {
-			config.groupCommitEnabled = true;
+			// No effect since every commit is group-committed; accepted so old
+			// command lines still run.
 		} else if (flag === "--group-commit-window-ms") {
-			config.groupCommitWindowMs = int(flag);
+			int(flag);
+		} else if (flag === "--seed") {
+			config.seed = int(flag);
 		} else if (flag === "--mvcc") {
 			config.mvcc = true;
 		} else if (flag === "--no-mvcc") {
@@ -129,6 +133,24 @@ function mvccLabel(requested: boolean | undefined): string {
 	if (requested === undefined) return "on (library default)";
 	return requested ? "on" : "off";
 }
+
+/**
+ * mulberry32: a small seeded PRNG, so every run picks the same edges, keys and
+ * nodes. Returns floats in [0, 1) like Math.random.
+ */
+function seededRandom(seed: number): () => number {
+	let state = seed >>> 0;
+	return () => {
+		state = (state + 0x6d2b79f5) >>> 0;
+		let t = state;
+		t = Math.imul(t ^ (t >>> 15), t | 1);
+		t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+		return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+	};
+}
+
+/** Seeded in runBenchmarks from --seed. */
+let random: () => number = Math.random;
 
 // =============================================================================
 // Schema Definition (for fluent API)
@@ -311,7 +333,7 @@ function benchmarkLowLevelKeyLookup(
 	const tracker = new LatencyTracker();
 
 	for (let i = 0; i < iterations; i++) {
-		const key = keys[Math.floor(Math.random() * keys.length)];
+		const key = keys[Math.floor(random() * keys.length)];
 		const start = process.hrtime.bigint();
 		db.get_node_by_key(key);
 		tracker.record(Number(process.hrtime.bigint() - start));
@@ -328,7 +350,7 @@ function benchmarkFluentKeyLookup(
 	const tracker = new LatencyTracker();
 
 	for (let i = 0; i < iterations; i++) {
-		const keyArg = keyArgs[Math.floor(Math.random() * keyArgs.length)];
+		const keyArg = keyArgs[Math.floor(random() * keyArgs.length)];
 		const start = process.hrtime.bigint();
 		db.get(User, keyArg);
 		tracker.record(Number(process.hrtime.bigint() - start));
@@ -345,7 +367,7 @@ function benchmarkFluentGetRef(
 	const tracker = new LatencyTracker();
 
 	for (let i = 0; i < iterations; i++) {
-		const keyArg = keyArgs[Math.floor(Math.random() * keyArgs.length)];
+		const keyArg = keyArgs[Math.floor(random() * keyArgs.length)];
 		const start = process.hrtime.bigint();
 		db.getRef(User, keyArg);
 		tracker.record(Number(process.hrtime.bigint() - start));
@@ -362,7 +384,7 @@ function benchmarkFluentGetId(
 	const tracker = new LatencyTracker();
 
 	for (let i = 0; i < iterations; i++) {
-		const keyArg = keyArgs[Math.floor(Math.random() * keyArgs.length)];
+		const keyArg = keyArgs[Math.floor(random() * keyArgs.length)];
 		const start = process.hrtime.bigint();
 		db.getId(User, keyArg);
 		tracker.record(Number(process.hrtime.bigint() - start));
@@ -381,7 +403,7 @@ function benchmarkLowLevelTraversal(
 	const step = traversalStep(JsTraversalDirection.Out, etypeId);
 
 	for (let i = 0; i < iterations; i++) {
-		const nodeId = nodeIds[Math.floor(Math.random() * nodeIds.length)];
+		const nodeId = nodeIds[Math.floor(random() * nodeIds.length)];
 		const start = process.hrtime.bigint();
 		db.traverseNodeIds([nodeId], [step]);
 		tracker.record(Number(process.hrtime.bigint() - start));
@@ -399,7 +421,7 @@ function benchmarkFluentTraversal(
 	const tracker = new LatencyTracker();
 
 	for (let i = 0; i < iterations; i++) {
-		const userRef = userRefs[Math.floor(Math.random() * userRefs.length)];
+		const userRef = userRefs[Math.floor(random() * userRefs.length)];
 		const start = process.hrtime.bigint();
 		db.from(userRef).out(edgePrimary).count();
 		tracker.record(Number(process.hrtime.bigint() - start));
@@ -417,7 +439,7 @@ function benchmarkFluentTraversalNodes(
 	const tracker = new LatencyTracker();
 
 	for (let i = 0; i < iterations; i++) {
-		const userRef = userRefs[Math.floor(Math.random() * userRefs.length)];
+		const userRef = userRefs[Math.floor(random() * userRefs.length)];
 		const start = process.hrtime.bigint();
 		db.from(userRef).out(edgePrimary).nodes();
 		tracker.record(Number(process.hrtime.bigint() - start));
@@ -435,7 +457,7 @@ function benchmarkFluentTraversalToArray(
 	const tracker = new LatencyTracker();
 
 	for (let i = 0; i < iterations; i++) {
-		const userRef = userRefs[Math.floor(Math.random() * userRefs.length)];
+		const userRef = userRefs[Math.floor(random() * userRefs.length)];
 		const start = process.hrtime.bigint();
 		db.from(userRef).out(edgePrimary).toArray();
 		tracker.record(Number(process.hrtime.bigint() - start));
@@ -453,10 +475,10 @@ function benchmarkLowLevelPathfinding(
 	const tracker = new LatencyTracker();
 
 	for (let i = 0; i < iterations; i++) {
-		const src = nodeIds[Math.floor(Math.random() * nodeIds.length)];
-		let dst = nodeIds[Math.floor(Math.random() * nodeIds.length)];
+		const src = nodeIds[Math.floor(random() * nodeIds.length)];
+		let dst = nodeIds[Math.floor(random() * nodeIds.length)];
 		while (dst === src) {
-			dst = nodeIds[Math.floor(Math.random() * nodeIds.length)];
+			dst = nodeIds[Math.floor(random() * nodeIds.length)];
 		}
 
 		const start = process.hrtime.bigint();
@@ -479,10 +501,10 @@ function benchmarkFluentPathfinding(
 	const tracker = new LatencyTracker();
 
 	for (let i = 0; i < iterations; i++) {
-		const src = userRefs[Math.floor(Math.random() * userRefs.length)];
-		let dst = userRefs[Math.floor(Math.random() * userRefs.length)];
+		const src = userRefs[Math.floor(random() * userRefs.length)];
+		let dst = userRefs[Math.floor(random() * userRefs.length)];
 		while (dst.id === src.id) {
-			dst = userRefs[Math.floor(Math.random() * userRefs.length)];
+			dst = userRefs[Math.floor(random() * userRefs.length)];
 		}
 
 		const start = process.hrtime.bigint();
@@ -510,10 +532,10 @@ async function runBenchmarks(config: BenchConfig): Promise<void> {
 	console.log(`Iterations: ${formatNumber(config.iterations)}`);
 	console.log(`Sync mode: ${config.syncMode}`);
 	console.log(`MVCC: ${mvccLabel(config.mvcc)}`);
-	console.log(
-		`Group commit: ${config.groupCommitEnabled} (window ${config.groupCommitWindowMs}ms)`,
-	);
+	console.log("Group commit: every commit");
+	console.log(`Seed: ${config.seed}`);
 	console.log("=".repeat(100));
+	random = seededRandom(config.seed);
 
 	// Create temporary directories for both databases
 	const lowLevelDir = makeTempDir();
@@ -542,8 +564,6 @@ async function runBenchmarks(config: BenchConfig): Promise<void> {
 	const mvccOption = config.mvcc === undefined ? {} : { mvcc: config.mvcc };
 	const lowLevelDb = Database.open(path.join(lowLevelDir, "test.kitedb"), {
 		syncMode,
-		groupCommitEnabled: config.groupCommitEnabled,
-		groupCommitWindowMs: config.groupCommitWindowMs,
 		walSize: 64 * 1024 * 1024,
 		...mvccOption,
 	});
@@ -566,8 +586,6 @@ async function runBenchmarks(config: BenchConfig): Promise<void> {
 		nodes: [User],
 		edges: edgeDefs,
 		syncMode,
-		groupCommitEnabled: config.groupCommitEnabled,
-		groupCommitWindowMs: config.groupCommitWindowMs,
 		walSizeMb: 64,
 		...mvccOption,
 	});
@@ -609,12 +627,12 @@ async function runBenchmarks(config: BenchConfig): Promise<void> {
 			lowLevelDb.begin();
 			for (let i = start; i < end; i++) {
 				const src =
-					lowLevelNodeIds[Math.floor(Math.random() * lowLevelNodeIds.length)];
+					lowLevelNodeIds[Math.floor(random() * lowLevelNodeIds.length)];
 				const dst =
-					lowLevelNodeIds[Math.floor(Math.random() * lowLevelNodeIds.length)];
+					lowLevelNodeIds[Math.floor(random() * lowLevelNodeIds.length)];
 				if (src !== dst) {
 					const etype =
-						edgeTypeIds[Math.floor(Math.random() * edgeTypeIds.length)];
+						edgeTypeIds[Math.floor(random() * edgeTypeIds.length)];
 					lowLevelDb.addEdge(src, etype, dst);
 					if (edgePropKeyIds.length > 0) {
 						for (let p = 0; p < edgePropKeyIds.length; p++) {
@@ -656,11 +674,11 @@ async function runBenchmarks(config: BenchConfig): Promise<void> {
 			const end = Math.min(start + edgeBatchSize, config.edges);
 			for (let i = start; i < end; i++) {
 				const src =
-					fluentUserRefs[Math.floor(Math.random() * fluentUserRefs.length)];
+					fluentUserRefs[Math.floor(random() * fluentUserRefs.length)];
 				const dst =
-					fluentUserRefs[Math.floor(Math.random() * fluentUserRefs.length)];
+					fluentUserRefs[Math.floor(random() * fluentUserRefs.length)];
 				if (src.id !== dst.id) {
-					const etype = edgeDefs[Math.floor(Math.random() * edgeDefs.length)];
+					const etype = edgeDefs[Math.floor(random() * edgeDefs.length)];
 					if (config.edgeProps > 0) {
 						fluentDb.link(
 							src,
@@ -942,4 +960,7 @@ async function runBenchmarks(config: BenchConfig): Promise<void> {
 
 // Run benchmarks
 const config = parseArgs();
-runBenchmarks(config).catch(console.error);
+runBenchmarks(config).catch((error) => {
+	console.error(error);
+	process.exitCode = 1;
+});

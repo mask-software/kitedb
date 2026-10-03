@@ -26,8 +26,9 @@
 //!   --vector-apply-batch-size N    Vector writes per DB transaction (default: 256)
 //!   --wal-size BYTES               WAL size in bytes (default: 1073741824)
 //!   --sync-mode MODE               Sync mode: full|normal|off (default: normal)
-//!   --group-commit-enabled         Enable group commit (default: false)
-//!   --group-commit-window-ms N     Group commit window in ms (default: 2)
+//!   --group-commit-enabled, --group-commit-window-ms N
+//!                                  Accepted for old command lines; no effect
+//!                                  (every commit is group-committed)
 //!   --auto-checkpoint              Enable auto-checkpoint (default: false)
 //!   --seed N                       RNG seed for event generation (default: 42)
 //!   --mvcc | --no-mvcc             MVCC mode (default: the library default)
@@ -74,8 +75,6 @@ struct BenchConfig {
   vector_apply_batch_size: usize,
   wal_size: usize,
   sync_mode: SyncMode,
-  group_commit_enabled: bool,
-  group_commit_window_ms: u64,
   auto_checkpoint: bool,
   seed: u64,
   /// None: the library default.
@@ -99,8 +98,6 @@ impl Default for BenchConfig {
       vector_apply_batch_size: 256,
       wal_size: 1024 * 1024 * 1024,
       sync_mode: SyncMode::Normal,
-      group_commit_enabled: false,
-      group_commit_window_ms: 2,
       auto_checkpoint: false,
       seed: 42,
       mvcc: None,
@@ -241,8 +238,12 @@ fn parse_args() -> BenchConfig {
           )),
         };
       }
-      "--group-commit-enabled" => config.group_commit_enabled = true,
-      "--group-commit-window-ms" => config.group_commit_window_ms = value(&args, &mut i, flag),
+      // No effect since every commit is group-committed; accepted so old
+      // command lines still run.
+      "--group-commit-enabled" => {}
+      "--group-commit-window-ms" => {
+        let _: u64 = value(&args, &mut i, flag);
+      }
       "--auto-checkpoint" => config.auto_checkpoint = true,
       "--seed" => config.seed = value(&args, &mut i, flag),
       "--mvcc" => config.mvcc = Some(true),
@@ -352,8 +353,6 @@ fn setup_fixture(config: &BenchConfig, label: &str) -> DbFixture {
   let mut open_opts = SingleFileOpenOptions::new()
     .wal_size(config.wal_size)
     .sync_mode(config.sync_mode)
-    .group_commit_enabled(config.group_commit_enabled)
-    .group_commit_window_ms(config.group_commit_window_ms)
     .auto_checkpoint(config.auto_checkpoint);
   if let Some(mvcc) = config.mvcc {
     open_opts = open_opts.mvcc(mvcc);
@@ -921,10 +920,7 @@ fn main() {
   );
   println!("WAL size: {} bytes", config.wal_size);
   println!("Sync mode: {:?}", config.sync_mode);
-  println!(
-    "Group commit: {} (window {}ms)",
-    config.group_commit_enabled, config.group_commit_window_ms
-  );
+  println!("Group commit: every commit");
   println!("Auto-checkpoint: {}", config.auto_checkpoint);
   println!("MVCC: {}", mvcc_label(config.mvcc));
   println!("Seed: {}", config.seed);

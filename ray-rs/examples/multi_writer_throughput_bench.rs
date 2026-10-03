@@ -18,8 +18,9 @@
 //!   --reopen                  Close and reopen the database after creating
 //!                             its schema, so the writes go to a reopened
 //!                             file rather than a freshly created one
-//!   --group-commit-enabled    Enable group commit (default: false)
-//!   --group-commit-window-ms  Group commit window in ms (default: 2)
+//!   --group-commit-enabled, --group-commit-window-ms N
+//!                             Accepted for old command lines; no effect (every
+//!                             commit is group-committed)
 //!   --mvcc | --no-mvcc        MVCC mode (default: the library default; without
 //!                             MVCC, write transactions run one at a time)
 //!   --keep-db                 Keep the database file after benchmark
@@ -55,8 +56,6 @@ struct BenchConfig {
   sync_mode: SyncMode,
   full_fsync: bool,
   reopen: bool,
-  group_commit_enabled: bool,
-  group_commit_window_ms: u64,
   /// None: the library default.
   mvcc: Option<bool>,
   keep_db: bool,
@@ -76,8 +75,6 @@ impl Default for BenchConfig {
       sync_mode: SyncMode::Normal,
       full_fsync: false,
       reopen: false,
-      group_commit_enabled: false,
-      group_commit_window_ms: 2,
       mvcc: None,
       keep_db: false,
       p_cores: false,
@@ -129,8 +126,12 @@ fn parse_args() -> BenchConfig {
       }
       "--full-fsync" => config.full_fsync = true,
       "--reopen" => config.reopen = true,
-      "--group-commit-enabled" => config.group_commit_enabled = true,
-      "--group-commit-window-ms" => config.group_commit_window_ms = value(&args, &mut i, flag),
+      // No effect since every commit is group-committed; accepted so old
+      // command lines still run.
+      "--group-commit-enabled" => {}
+      "--group-commit-window-ms" => {
+        let _: u64 = value(&args, &mut i, flag);
+      }
       "--mvcc" => config.mvcc = Some(true),
       "--no-mvcc" => config.mvcc = Some(false),
       "--keep-db" => config.keep_db = true,
@@ -200,10 +201,7 @@ fn main() {
   println!("Sync mode: {:?}", config.sync_mode);
   println!("Full fsync: {}", config.full_fsync);
   println!("Reopen: {}", config.reopen);
-  println!(
-    "Group commit: {} (window {}ms)",
-    config.group_commit_enabled, config.group_commit_window_ms
-  );
+  println!("Group commit: every commit");
   println!("MVCC: {}", mvcc_label(config.mvcc));
   println!("Performance cores: {}", config.p_cores);
   println!("==================================================================");
@@ -215,8 +213,6 @@ fn main() {
     .wal_size(config.wal_size)
     .sync_mode(config.sync_mode)
     .full_fsync(config.full_fsync)
-    .group_commit_enabled(config.group_commit_enabled)
-    .group_commit_window_ms(config.group_commit_window_ms)
     .auto_checkpoint(false);
   if let Some(mvcc) = config.mvcc {
     open_opts = open_opts.mvcc(mvcc);

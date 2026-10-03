@@ -10,8 +10,9 @@
 //!   --node-batches N          Batches in the 100-node write benchmark (default: iterations/100 rounded up, at most 50)
 //!   --wal-size BYTES          WAL size in bytes (default: 67108864)
 //!   --sync-mode MODE          Sync mode: full|normal|off (default: normal)
-//!   --group-commit-enabled    Enable group commit (default: false)
-//!   --group-commit-window-ms  Group commit window in ms (default: 2)
+//!   --group-commit-enabled, --group-commit-window-ms N
+//!                             Accepted for old command lines; no effect (every
+//!                             commit is group-committed)
 //!   --edge-types N            Number of edge types (default: 3)
 //!   --edge-props N            Number of props per edge (default: 10)
 //!   --checkpoint-threshold P  Auto-checkpoint threshold (default: 0.8)
@@ -24,6 +25,8 @@
 //!   --skip-checkpoint         Skip the checkpoint after the graph build
 //!   --reopen-readonly         Re-open the database read-only after the checkpoint
 //!                             (skips the write benchmarks)
+//!   --seed N                  Seed for the graph, vectors and the keys and nodes
+//!                             each read benchmark picks (default: 42)
 //!   --keep-db                 Keep the database file after benchmark
 //!
 //! Unknown options are an error.
@@ -50,8 +53,6 @@ struct BenchConfig {
   node_batches: Option<usize>,
   wal_size: usize,
   sync_mode: SyncMode,
-  group_commit_enabled: bool,
-  group_commit_window_ms: u64,
   checkpoint_threshold: f64,
   auto_checkpoint: bool,
   vector_dims: usize,
@@ -60,6 +61,7 @@ struct BenchConfig {
   replication_segment_max_bytes: Option<u64>,
   /// None: the library default.
   mvcc: Option<bool>,
+  seed: u64,
   keep_db: bool,
   skip_checkpoint: bool,
   reopen_readonly: bool,
@@ -76,8 +78,6 @@ impl Default for BenchConfig {
       node_batches: None,
       wal_size: 64 * 1024 * 1024,
       sync_mode: SyncMode::Normal,
-      group_commit_enabled: false,
-      group_commit_window_ms: 2,
       checkpoint_threshold: 0.8,
       auto_checkpoint: true,
       vector_dims: 128,
@@ -85,6 +85,7 @@ impl Default for BenchConfig {
       replication_primary: false,
       replication_segment_max_bytes: None,
       mvcc: None,
+      seed: 42,
       keep_db: false,
       skip_checkpoint: false,
       reopen_readonly: false,
@@ -134,8 +135,12 @@ fn parse_args() -> BenchConfig {
           )),
         };
       }
-      "--group-commit-enabled" => config.group_commit_enabled = true,
-      "--group-commit-window-ms" => config.group_commit_window_ms = value(&args, &mut i, flag),
+      // No effect since every commit is group-committed; accepted so old
+      // command lines still run.
+      "--group-commit-enabled" => {}
+      "--group-commit-window-ms" => {
+        let _: u64 = value(&args, &mut i, flag);
+      }
       "--checkpoint-threshold" => config.checkpoint_threshold = value(&args, &mut i, flag),
       "--no-auto-checkpoint" => config.auto_checkpoint = false,
       "--vector-dims" => config.vector_dims = value(&args, &mut i, flag),
@@ -147,6 +152,7 @@ fn parse_args() -> BenchConfig {
       }
       "--mvcc" => config.mvcc = Some(true),
       "--no-mvcc" => config.mvcc = Some(false),
+      "--seed" => config.seed = value(&args, &mut i, flag),
       "--skip-checkpoint" => config.skip_checkpoint = true,
       "--reopen-readonly" => config.reopen_readonly = true,
       "--keep-db" => config.keep_db = true,
@@ -277,6 +283,19 @@ fn batch_count(iterations: usize, batch_size: usize, max_batches: usize) -> usiz
   iterations.div_ceil(batch_size).min(max_batches)
 }
 
+/// The random stream of one benchmark phase: `--seed` mixed with the phase,
+/// so each phase sees the same values whichever phases ran before it.
+fn phase_rng(seed: u64, phase: u64) -> StdRng {
+  StdRng::seed_from_u64(seed ^ phase.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+}
+
+const PHASE_EDGES: u64 = 1;
+const PHASE_KEY_LOOKUPS: u64 = 2;
+const PHASE_TRAVERSALS: u64 = 3;
+const PHASE_EDGE_EXISTS: u64 = 4;
+const PHASE_VECTORS: u64 = 5;
+const PHASE_VECTOR_READS: u64 = 6;
+
 fn build_random_vector(rng: &mut StdRng, dimensions: usize) -> Vec<f32> {
   let mut values = Vec::with_capacity(dimensions);
   for _ in 0..dimensions {
@@ -334,7 +353,7 @@ fn build_graph(db: &kitedb::core::single_file::SingleFileDB, config: &BenchConfi
   let mut edges_created = 0usize;
   let mut attempts = 0usize;
   let max_attempts = config.edges * 3;
-  let mut rng = StdRng::from_entropy();
+  let mut rng = phase_rng(config.seed, PHASE_EDGES);
 
   while edges_created < config.edges && attempts < max_attempts {
     let batch_target = (edges_created + batch_size).min(config.edges);
@@ -392,9 +411,10 @@ fn benchmark_key_lookups(
   db: &kitedb::core::single_file::SingleFileDB,
   graph: &GraphData,
   iterations: usize,
+  seed: u64,
 ) {
   println!("\n--- Key Lookups (node_by_key) ---");
-  let mut rng = StdRng::from_entropy();
+  let mut rng = phase_rng(seed, PHASE_KEY_LOOKUPS);
   let mut samples = Vec::with_capacity(iterations);
 
   for _ in 0..iterations {
@@ -412,9 +432,10 @@ fn benchmark_traversals(
   db: &kitedb::core::single_file::SingleFileDB,
   graph: &GraphData,
   iterations: usize,
+  seed: u64,
 ) {
   println!("\n--- 1-Hop Traversals (out) ---");
-  let mut rng = StdRng::from_entropy();
+  let mut rng = phase_rng(seed, PHASE_TRAVERSALS);
   let mut samples = Vec::with_capacity(iterations);
 
   for _ in 0..iterations {
@@ -433,9 +454,10 @@ fn benchmark_edge_exists(
   db: &kitedb::core::single_file::SingleFileDB,
   graph: &GraphData,
   iterations: usize,
+  seed: u64,
 ) {
   println!("\n--- Edge Exists ---");
-  let mut rng = StdRng::from_entropy();
+  let mut rng = phase_rng(seed, PHASE_EDGE_EXISTS);
   let mut samples = Vec::with_capacity(iterations);
 
   for _ in 0..iterations {
@@ -470,7 +492,7 @@ fn benchmark_vectors(
   let prop_key_id = db.define_propkey("embedding").expect("expected value");
   db.commit().expect("expected value");
 
-  let mut rng = StdRng::from_entropy();
+  let mut rng = phase_rng(config.seed, PHASE_VECTORS);
   let vectors: Vec<Vec<f32>> = (0..vector_count)
     .map(|_| build_random_vector(&mut rng, config.vector_dims))
     .collect();
@@ -503,8 +525,9 @@ fn benchmark_vector_reads(
   vector_nodes: &[u64],
   prop_key_id: u32,
   iterations: usize,
+  seed: u64,
 ) {
-  let mut rng = StdRng::from_entropy();
+  let mut rng = phase_rng(seed, PHASE_VECTOR_READS);
   let mut samples = Vec::with_capacity(iterations);
   for _ in 0..iterations {
     let node = vector_nodes[rng.gen_range(0..vector_nodes.len())];
@@ -658,10 +681,8 @@ fn main() {
   println!("WAL size: {} bytes", format_number(config.wal_size));
   println!("Sync mode: {}", format_sync_mode(config.sync_mode));
   println!("MVCC: {}", mvcc_label(config.mvcc));
-  println!(
-    "Group commit: {} (window {}ms)",
-    config.group_commit_enabled, config.group_commit_window_ms
-  );
+  println!("Group commit: every commit");
+  println!("Seed: {}", config.seed);
   println!("Auto-checkpoint: {}", config.auto_checkpoint);
   println!("Checkpoint threshold: {}", config.checkpoint_threshold);
   println!("Vector dims: {}", format_number(config.vector_dims));
@@ -688,11 +709,6 @@ fn main() {
 
   if let Some(mvcc) = config.mvcc {
     options = options.mvcc(mvcc);
-  }
-  if config.group_commit_enabled {
-    options = options
-      .group_commit_enabled(true)
-      .group_commit_window_ms(config.group_commit_window_ms);
   }
   if config.replication_primary {
     options = options.replication_role(ReplicationRole::Primary);
@@ -733,15 +749,21 @@ fn main() {
   }
 
   println!("\n[4/6] Key lookup benchmarks...");
-  benchmark_key_lookups(&db, &graph, config.iterations);
+  benchmark_key_lookups(&db, &graph, config.iterations, config.seed);
 
   println!("\n[5/6] Traversal and edge benchmarks...");
-  benchmark_traversals(&db, &graph, config.iterations);
-  benchmark_edge_exists(&db, &graph, config.iterations);
+  benchmark_traversals(&db, &graph, config.iterations, config.seed);
+  benchmark_edge_exists(&db, &graph, config.iterations, config.seed);
 
   if let Some((prop_key_id, vector_nodes)) = vector_setup {
     if !vector_nodes.is_empty() {
-      benchmark_vector_reads(&db, &vector_nodes, prop_key_id, config.iterations);
+      benchmark_vector_reads(
+        &db,
+        &vector_nodes,
+        prop_key_id,
+        config.iterations,
+        config.seed,
+      );
     }
   }
 

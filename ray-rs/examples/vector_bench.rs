@@ -12,6 +12,8 @@
 //!   --iterations I     Iterations for latency benchmarks (default: 1000)
 //!   --k N              Number of nearest neighbors (default: 10)
 //!   --n-probe N         IVF nProbe (default: 10)
+//!   --seed N           Seed for the vectors, the queries and the index
+//!                      training (default: 42)
 //!   --output FILE      Output file path (default: auto-generated)
 //!   --no-output        Disable file output
 //!
@@ -35,6 +37,7 @@ struct BenchConfig {
   iterations: usize,
   k: usize,
   n_probe: usize,
+  seed: u64,
   output_file: Option<PathBuf>,
 }
 
@@ -46,6 +49,7 @@ impl Default for BenchConfig {
       iterations: 1000,
       k: 10,
       n_probe: 10,
+      seed: 42,
       output_file: None,
     }
   }
@@ -81,6 +85,7 @@ fn parse_args() -> BenchConfig {
       "--iterations" => config.iterations = value(&args, &mut i, flag),
       "--k" => config.k = value(&args, &mut i, flag),
       "--n-probe" => config.n_probe = value(&args, &mut i, flag),
+      "--seed" => config.seed = value(&args, &mut i, flag),
       "--output" => config.output_file = Some(value(&args, &mut i, flag)),
       "--no-output" => no_output = true,
       other => usage_error(&format!("unknown option {other}")),
@@ -233,13 +238,15 @@ fn main() {
   logger.log(&format!("Iterations: {}", format_number(config.iterations)));
   logger.log(&format!("k: {}", config.k));
   logger.log(&format!("nProbe: {}", config.n_probe));
+  logger.log(&format!("Seed: {}", config.seed));
   logger.log(&"=".repeat(120));
 
-  let mut rng = StdRng::seed_from_u64(42);
+  let mut rng = StdRng::seed_from_u64(config.seed);
   let mut index = VectorIndex::new(
     VectorIndexOptions::new(config.dimensions)
       .with_metric(DistanceMetric::Cosine)
-      .with_n_probe(config.n_probe),
+      .with_n_probe(config.n_probe)
+      .with_seed(config.seed),
   );
 
   let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(config.vectors);
@@ -324,6 +331,9 @@ fn main() {
   logger.log(&format!("    Index trained: {}", stats.index_trained));
   if let Some(clusters) = stats.index_clusters {
     logger.log(&format!("    Index clusters: {clusters}"));
+  }
+  if let Some(algorithm) = stats.index_algorithm {
+    logger.log(&format!("    Index algorithm: {algorithm:?}"));
   }
 
   logger.log(&format!("\n{}", "=".repeat(120)));

@@ -12,8 +12,9 @@
 //!   --vector-dims N           Vector dimensions (default: 128)
 //!   --wal-size BYTES          WAL size in bytes (default: 268435456)
 //!   --sync-mode MODE          Sync mode: full|normal|off (default: normal)
-//!   --group-commit-enabled    Enable group commit (default: false)
-//!   --group-commit-window-ms  Group commit window in ms (default: 2)
+//!   --group-commit-enabled, --group-commit-window-ms N
+//!                             Accepted for old command lines; no effect (every
+//!                             commit is group-committed)
 //!   --no-auto-checkpoint      Disable auto-checkpoint (default: enabled)
 //!   --checkpoint-threshold P  Auto-checkpoint threshold (default: 0.7)
 //!   --no-background-checkpoint Use blocking checkpoints (default: background)
@@ -43,8 +44,6 @@ struct BenchConfig {
   vector_dims: usize,
   wal_size: usize,
   sync_mode: SyncMode,
-  group_commit_enabled: bool,
-  group_commit_window_ms: u64,
   auto_checkpoint: bool,
   checkpoint_threshold: f64,
   background_checkpoint: bool,
@@ -62,8 +61,6 @@ impl Default for BenchConfig {
       vector_dims: 128,
       wal_size: 256 * 1024 * 1024,
       sync_mode: SyncMode::Normal,
-      group_commit_enabled: false,
-      group_commit_window_ms: 2,
       auto_checkpoint: true,
       checkpoint_threshold: 0.7,
       background_checkpoint: true,
@@ -113,8 +110,12 @@ fn parse_args() -> BenchConfig {
           )),
         };
       }
-      "--group-commit-enabled" => config.group_commit_enabled = true,
-      "--group-commit-window-ms" => config.group_commit_window_ms = value(&args, &mut i, flag),
+      // No effect since every commit is group-committed; accepted so old
+      // command lines still run.
+      "--group-commit-enabled" => {}
+      "--group-commit-window-ms" => {
+        let _: u64 = value(&args, &mut i, flag);
+      }
       "--no-auto-checkpoint" => config.auto_checkpoint = false,
       "--checkpoint-threshold" => {
         let threshold: f64 = value(&args, &mut i, flag);
@@ -205,10 +206,7 @@ fn main() {
   println!("Total vectors: {total_vectors}");
   println!("WAL size: {} bytes", config.wal_size);
   println!("Sync mode: {:?}", config.sync_mode);
-  println!(
-    "Group commit: {} (window {}ms)",
-    config.group_commit_enabled, config.group_commit_window_ms
-  );
+  println!("Group commit: every commit");
   println!(
     "Auto-checkpoint: {} (threshold {}, background {})",
     config.auto_checkpoint, config.checkpoint_threshold, config.background_checkpoint
@@ -224,8 +222,6 @@ fn main() {
   let mut open_opts = SingleFileOpenOptions::new()
     .wal_size(config.wal_size)
     .sync_mode(config.sync_mode)
-    .group_commit_enabled(config.group_commit_enabled)
-    .group_commit_window_ms(config.group_commit_window_ms)
     .auto_checkpoint(config.auto_checkpoint)
     .checkpoint_threshold(config.checkpoint_threshold)
     .background_checkpoint(config.background_checkpoint);
