@@ -153,6 +153,8 @@ pub(crate) struct CommitRequest {
   /// Its MVCC history plan, if worked out before it queued (see
   /// `SingleFileDB::plan_history`).
   history: Option<HistoryPlan>,
+  /// The MVCC commit timestamp its conflict check staged it at.
+  commit_ts: Option<Timestamp>,
   /// Its data records, for the replication sidecar (empty without one).
   pending_wal: Vec<u8>,
   staged_schema: SchemaStaging,
@@ -624,11 +626,42 @@ fn check_and_stage_in_mvcc(
     keys.dedup();
     return Err(KiteError::Conflict { txid, keys });
   }
-  tx_mgr
+  let commit_ts = tx_mgr
     .stage_commit(txid)
-    .map(|_| ())
-    .map_err(|error| KiteError::Internal(error.to_string()))
+    .map_err(|error| KiteError::Internal(error.to_string()))?;
+  request.commit_ts = Some(commit_ts);
+  Ok(())
 }
+
+/// Lock the transaction manager, spinning (without giving up the CPU) for a
+/// while before blocking: commits and begins hold it for a microsecond or
+/// two at a time, and a thread that yields or parks to wait that long pays
+/// more than it waits.
+fn lock_tx_manager(
+  mvcc: &crate::mvcc::MvccManager,
+) -> parking_lot::MutexGuard<'_, crate::mvcc::TxManager> {
+  let mutex = &*mvcc.tx_manager;
+  if let Some(guard) = mutex.try_lock() {
+    return guard;
+  }
+  let until = std::time::Instant::now() + TX_MANAGER_SPIN;
+  let mut spins = 0u32;
+  loop {
+    std::hint::spin_loop();
+    spins = spins.wrapping_add(1);
+    if !mutex.is_locked() {
+      if let Some(guard) = mutex.try_lock() {
+        return guard;
+      }
+    }
+    if spins.is_multiple_of(128) && std::time::Instant::now() >= until {
+      return mutex.lock();
+    }
+  }
+}
+
+/// How long `lock_tx_manager` spins before it blocks.
+const TX_MANAGER_SPIN: std::time::Duration = std::time::Duration::from_micros(20);
 
 /// A copy of `error` for every further commit of a round it failed.
 fn round_error(error: &KiteError) -> KiteError {
@@ -869,7 +902,7 @@ impl SingleFileDB {
           self.wait_for_publish_section(seq);
           continue;
         }
-        let begun = mvcc.tx_manager.lock().begin_tx();
+        let begun = lock_tx_manager(mvcc).begin_tx();
         if self.publish_seq.load(Ordering::SeqCst) == seq {
           break begun;
         }
@@ -1562,6 +1595,7 @@ impl SingleFileDB {
       commit_record_len,
       pending,
       history,
+      commit_ts: None,
       pending_wal,
       staged_schema,
       committer: std::thread::current().id(),
@@ -1840,7 +1874,7 @@ impl SingleFileDB {
           }
         };
         if let Some(mvcc) = self.mvcc.as_ref() {
-          let tx_mgr = tx_mgr.get_or_insert_with(|| mvcc.tx_manager.lock());
+          let tx_mgr = tx_mgr.get_or_insert_with(|| lock_tx_manager(mvcc));
           if let Err(error) = check_and_stage_in_mvcc(mvcc, tx_mgr, &mut request) {
             outcomes[index] = Some(CommitOutcome::failed(error));
             continue;
@@ -1918,7 +1952,8 @@ impl SingleFileDB {
     };
 
     scratch.passed = checked;
-    match self.persist_commit_round(&mut pager, sealed.as_ref(), staged.len()) {
+    let last_commit_ts = staged.last().and_then(|(_, request)| request.commit_ts);
+    match self.persist_commit_round(&mut pager, sealed.as_ref(), last_commit_ts, staged.len()) {
       Ok(()) => {
         drop(pager);
         if let Some(sealed) = sealed {
@@ -1982,10 +2017,13 @@ impl SingleFileDB {
   /// wrote) and at most a prefix of this round's, none acknowledged.
   ///
   /// `sealed` is `None` in `SyncMode::Off`, which writes nothing.
+  /// `last_commit_ts` is the MVCC commit timestamp the round's last commit
+  /// was staged at (`check_and_stage_in_mvcc`), the newest staged.
   fn persist_commit_round(
     &self,
     pager: &mut FilePager,
     sealed: Option<&SealedWrites>,
+    last_commit_ts: Option<Timestamp>,
     commits: usize,
   ) -> Result<()> {
     during_commit_io_test_hook();
@@ -2010,14 +2048,15 @@ impl SingleFileDB {
     }
 
     // MVCC commits the staged commits in order, this round's last.
-    let last_commit_ts = match self.mvcc.as_ref() {
-      Some(mvcc) => {
+    let last_commit_ts = match (self.mvcc.as_ref(), last_commit_ts) {
+      (Some(_), Some(last_commit_ts)) => last_commit_ts,
+      (Some(mvcc), None) => {
         let tx_mgr = mvcc.tx_manager.lock();
         tx_mgr
           .newest_staged_ts()
           .unwrap_or_else(|| tx_mgr.next_commit_ts() + (commits as u64).saturating_sub(1))
       }
-      None => std::time::SystemTime::now()
+      (None, _) => std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0),
@@ -2233,7 +2272,7 @@ impl SingleFileDB {
     let Some(mvcc) = self.mvcc.as_ref() else {
       return (Vec::new(), 0);
     };
-    let mut tx_mgr = mvcc.tx_manager.lock();
+    let mut tx_mgr = lock_tx_manager(mvcc);
     let mut released = Vec::new();
     for commit in round.iter_mut() {
       match tx_mgr.commit_tx_releasing(commit.request.txid, &mut released) {
