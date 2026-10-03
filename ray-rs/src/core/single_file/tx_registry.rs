@@ -118,7 +118,11 @@ impl SingleFileDB {
   /// Roll back the transactions whose threads ended with them open. Callers
   /// hold no lock a rollback takes.
   pub(crate) fn reap_abandoned_transactions(&self) {
-    if !self.tx_shared.has_abandoned.swap(false, Ordering::AcqRel) {
+    // Every begin checks: read first, so the common case writes nothing to
+    // a line every writer shares.
+    if !self.tx_shared.has_abandoned.load(Ordering::Acquire)
+      || !self.tx_shared.has_abandoned.swap(false, Ordering::AcqRel)
+    {
       return;
     }
     let abandoned = std::mem::take(&mut *self.tx_shared.abandoned.lock());
