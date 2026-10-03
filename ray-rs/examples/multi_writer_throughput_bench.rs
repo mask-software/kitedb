@@ -23,6 +23,10 @@
 //!   --mvcc | --no-mvcc        MVCC mode (default: the library default; without
 //!                             MVCC, write transactions run one at a time)
 //!   --keep-db                 Keep the database file after benchmark
+//!   --p-cores                 On macOS, ask for performance cores for the
+//!                             writer threads (QoS user-interactive); hybrid
+//!                             Apple chips otherwise also run them on
+//!                             efficiency cores
 //!
 //! Unknown options are an error.
 
@@ -56,6 +60,7 @@ struct BenchConfig {
   /// None: the library default.
   mvcc: Option<bool>,
   keep_db: bool,
+  p_cores: bool,
 }
 
 impl Default for BenchConfig {
@@ -75,6 +80,7 @@ impl Default for BenchConfig {
       group_commit_window_ms: 2,
       mvcc: None,
       keep_db: false,
+      p_cores: false,
     }
   }
 }
@@ -128,6 +134,7 @@ fn parse_args() -> BenchConfig {
       "--mvcc" => config.mvcc = Some(true),
       "--no-mvcc" => config.mvcc = Some(false),
       "--keep-db" => config.keep_db = true,
+      "--p-cores" => config.p_cores = true,
       other => usage_error(&format!("unknown option {other}")),
     }
     i += 1;
@@ -152,6 +159,15 @@ fn mvcc_label(requested: Option<bool>) -> String {
       ""
     }
   )
+}
+
+/// Asks macOS to keep the calling thread on performance cores.
+fn prefer_performance_cores() {
+  #[cfg(target_os = "macos")]
+  // SAFETY: sets the calling thread's QoS class; takes no pointers.
+  unsafe {
+    libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
+  }
 }
 
 fn format_rate(count: u64, seconds: f64) -> String {
@@ -189,6 +205,7 @@ fn main() {
     config.group_commit_enabled, config.group_commit_window_ms
   );
   println!("MVCC: {}", mvcc_label(config.mvcc));
+  println!("Performance cores: {}", config.p_cores);
   println!("==================================================================");
 
   let temp_dir = tempdir().expect("temp dir");
@@ -232,6 +249,8 @@ fn main() {
   let db = Arc::new(db);
 
   let node_counter = Arc::new(AtomicU64::new(0));
+  #[cfg(feature = "bench-profile")]
+  kitedb::core::single_file::SingleFileDB::commit_profile_reset();
   let start = Instant::now();
 
   let mut handles = Vec::with_capacity(config.threads);
@@ -243,6 +262,9 @@ fn main() {
     let config = config.clone();
 
     let handle = std::thread::spawn(move || {
+      if config.p_cores {
+        prefer_performance_cores();
+      }
       let mut total_nodes = 0u64;
       let mut total_edges = 0u64;
       for _ in 0..config.tx_per_thread {
@@ -311,6 +333,11 @@ fn main() {
 
   let elapsed = start.elapsed().as_secs_f64();
   let tx_total = (config.threads * config.tx_per_thread) as u64;
+  #[cfg(feature = "bench-profile")]
+  print!(
+    "\n{}",
+    kitedb::core::single_file::SingleFileDB::commit_profile_report()
+  );
 
   println!("\n--- Throughput ---");
   println!("Elapsed: {elapsed:.3}s");

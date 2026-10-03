@@ -27,6 +27,7 @@ use crate::vector::types::VectorManifest;
 // Submodules
 mod check;
 mod checkpoint;
+mod commit_profile;
 mod compactor;
 mod iter;
 mod mvcc_history;
@@ -767,6 +768,18 @@ impl SingleFileDB {
   /// Allocate a new transaction ID
   pub fn alloc_tx_id(&self) -> TxId {
     self.next_tx_id.fetch_add(1, Ordering::SeqCst)
+  }
+
+  /// Where commits' time went, stage by stage, since the last reset.
+  #[cfg(feature = "bench-profile")]
+  pub fn commit_profile_report() -> String {
+    commit_profile::report()
+  }
+
+  /// Clear the commit profile's totals.
+  #[cfg(feature = "bench-profile")]
+  pub fn commit_profile_reset() {
+    commit_profile::reset()
   }
 
   #[cfg(feature = "bench-profile")]

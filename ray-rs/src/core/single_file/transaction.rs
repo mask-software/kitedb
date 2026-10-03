@@ -54,6 +54,7 @@ use std::thread::ThreadId;
 #[cfg(feature = "bench-profile")]
 use std::time::Instant;
 
+use super::commit_profile::{self as prof, Stage};
 use super::mvcc_history::{record_commit, HistoryPlan};
 use super::open::SyncMode;
 use super::writer_slot::WriterMode;
@@ -241,6 +242,9 @@ struct CommitTicket {
   outcome: Mutex<Option<CommitOutcome>>,
   /// The committer, to unpark once it parked.
   committer: std::thread::Thread,
+  /// When its state last changed (`commit_profile::stamp`).
+  #[cfg(feature = "bench-profile")]
+  stamp: AtomicU64,
 }
 
 /// Queued, its committer spinning.
@@ -258,6 +262,8 @@ impl CommitTicket {
       state: AtomicU8::new(TICKET_QUEUED),
       outcome: Mutex::new(None),
       committer: std::thread::current(),
+      #[cfg(feature = "bench-profile")]
+      stamp: AtomicU64::new(0),
     }
   }
 
@@ -273,6 +279,8 @@ impl CommitTicket {
   }
 
   fn set(&self, state: u8) {
+    #[cfg(feature = "bench-profile")]
+    self.stamp.store(prof::stamp(), Ordering::Relaxed);
     if self.state.swap(state, Ordering::AcqRel) == TICKET_PARKED {
       self.committer.unpark();
     }
@@ -282,11 +290,15 @@ impl CommitTicket {
   /// handed the lead (`None`). Spins for up to `COMMIT_WAIT_SPIN`, then
   /// parks; `std::thread::park` may return spuriously, so it rechecks.
   fn wait(&self) -> Option<CommitOutcome> {
+    let mark = prof::start();
     let spin_until = std::time::Instant::now() + COMMIT_WAIT_SPIN;
     let mut spins = 0u32;
     loop {
       match self.state.load(Ordering::Acquire) {
         TICKET_DONE => {
+          #[cfg(feature = "bench-profile")]
+          prof::since_stamp(Stage::DeliverLatency, self.stamp.load(Ordering::Relaxed));
+          prof::end(Stage::FollowerWait, mark);
           let outcome = self.outcome.lock().take();
           return Some(outcome.unwrap_or_else(|| {
             CommitOutcome::failed(KiteError::Internal(
@@ -294,7 +306,13 @@ impl CommitTicket {
             ))
           }));
         }
-        TICKET_LEAD => return None,
+        TICKET_LEAD => {
+          #[cfg(feature = "bench-profile")]
+          prof::since_stamp(Stage::HandoffLatency, self.stamp.load(Ordering::Relaxed));
+          prof::end(Stage::FollowerWait, mark);
+          prof::count(Stage::FollowerLead, 1);
+          return None;
+        }
         TICKET_PARKED => std::thread::park(),
         _ => {
           spins += 1;
@@ -304,12 +322,18 @@ impl CommitTicket {
             std::thread::yield_now();
           } else {
             // Fails if the leader got here first; the loop sees its state.
-            let _ = self.state.compare_exchange(
-              TICKET_QUEUED,
-              TICKET_PARKED,
-              Ordering::AcqRel,
-              Ordering::Acquire,
-            );
+            if self
+              .state
+              .compare_exchange(
+                TICKET_QUEUED,
+                TICKET_PARKED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+              )
+              .is_ok()
+            {
+              prof::count(Stage::FollowerParked, 1);
+            }
           }
         }
       }
@@ -868,6 +892,7 @@ impl SingleFileDB {
     if self.current_tx_handle().is_some() {
       return Err(KiteError::TransactionInProgress);
     }
+    let begin_mark = prof::start();
     self.reap_abandoned_transactions();
     // Write transactions claim the writer slot (see `writer_slot`): MVCC ones
     // together, a bulk load or a write transaction without MVCC alone. Taken
@@ -899,7 +924,9 @@ impl SingleFileDB {
       let (txid, snapshot_ts) = loop {
         let seq = self.publish_seq.load(Ordering::SeqCst);
         if seq % 2 == 1 {
+          let wait_mark = prof::start();
           self.wait_for_publish_section(seq);
+          prof::end(Stage::BeginPublishWait, wait_mark);
           continue;
         }
         let begun = lock_tx_manager(mvcc).begin_tx();
@@ -956,6 +983,7 @@ impl SingleFileDB {
     self.active_transactions.fetch_add(1, Ordering::Release);
     if !read_only {
       self.active_writers.fetch_add(1, Ordering::SeqCst);
+      prof::end(Stage::Begin, begin_mark);
     }
     Ok(txid)
   }
@@ -1464,6 +1492,7 @@ impl SingleFileDB {
       .take_thread_transaction()
       .ok_or(KiteError::NoTransaction)?;
     let read_only = tx_handle.lock().read_only;
+    let commit_mark = prof::start();
     let result = self.commit_transaction(&tx_handle);
     if !read_only {
       // Every lock is released and this thread's transaction is finished, so
@@ -1472,6 +1501,7 @@ impl SingleFileDB {
       // WAL refused its COMMIT record, every later commit would fail the same
       // way, and nothing else would ever checkpoint.
       self.auto_checkpoint_if_needed(matches!(result, Err(KiteError::WalBufferFull)));
+      prof::end(Stage::CommitTotal, commit_mark);
     }
     TxSpares::keep_state(tx_handle);
     result
@@ -1482,6 +1512,7 @@ impl SingleFileDB {
     &self,
     tx_handle: &Arc<Mutex<SingleFileTxState>>,
   ) -> Result<Option<CommitToken>> {
+    let prep_mark = prof::start();
     let (
       txid,
       read_only,
@@ -1608,9 +1639,12 @@ impl SingleFileDB {
       None => Box::new(request),
     };
 
+    prof::end(Stage::CommitPrep, prep_mark);
     #[cfg(test)]
     self.commits_waiting.fetch_add(1, Ordering::SeqCst);
+    let wait_mark = prof::start();
     let mut outcome = self.commit_queued(request);
+    prof::end(Stage::CommitWait, wait_mark);
     if let Some(leftovers) = outcome.leftovers.take() {
       TxSpares::keep_request(leftovers);
     }
@@ -1678,6 +1712,7 @@ impl SingleFileDB {
       queue.push_back((0, request));
       leader.group.push(None);
     }
+    let take_mark = prof::start();
     {
       let mut state = self.commit_queue.state.lock();
       let take = state.queued.len().min(MAX_GROUP_COMMITS - queue.len());
@@ -1686,7 +1721,9 @@ impl SingleFileDB {
         queue.push_back((queue.len(), queued.request));
       }
     }
+    prof::end(Stage::LeadTake, take_mark);
     self.write_commits(&mut queue, &mut leader, &mut scratch);
+    let deliver_mark = prof::start();
     let outcomes = scratch.outcomes.drain(..).map(|outcome| {
       outcome.unwrap_or_else(|| {
         CommitOutcome::failed(KiteError::Internal("commit was not written".to_string()))
@@ -1695,6 +1732,7 @@ impl SingleFileDB {
     let own = leader.deliver(own_ticket, outcomes).unwrap_or_else(|| {
       CommitOutcome::failed(KiteError::Internal("commit was not written".to_string()))
     });
+    prof::end(Stage::Deliver, deliver_mark);
     scratch.queue = queue;
     scratch.group = std::mem::take(&mut leader.group);
     scratch.keep();
@@ -1722,7 +1760,9 @@ impl SingleFileDB {
     while !queue.is_empty() {
       #[cfg(feature = "bench-profile")]
       let commit_lock_start = Instant::now();
+      let lock_mark = prof::start();
       let commit_guard = self.commit_lock.lock();
+      prof::end(Stage::CommitLockWait, lock_mark);
       #[cfg(feature = "bench-profile")]
       self.commit_lock_wait_ns.fetch_add(
         commit_lock_start.elapsed().as_nanos() as u64,
@@ -1730,14 +1770,20 @@ impl SingleFileDB {
       );
 
       let mut round = self.write_commit_round(queue, &mut outcomes, scratch);
+      let publish_lock_mark = prof::start();
       let publish_guard = self.publish_lock.lock();
+      prof::end(Stage::PublishLockWait, publish_lock_mark);
       drop(commit_guard);
+      let release_mark = prof::start();
       if queue.is_empty() {
         leader.release_lead();
       }
+      prof::end(Stage::ReleaseLead, release_mark);
+      let publish_mark = prof::start();
       self.publish_commits(&mut round.durable, &mut outcomes);
       drop(publish_guard);
       scratch.durable = std::mem::take(&mut round.durable);
+      prof::end(Stage::Publish, publish_mark);
 
       // The background checkpoint takes the commit lock to install.
       if let Some(cut) = round.wait_for_cut {
@@ -1803,6 +1849,7 @@ impl SingleFileDB {
       durable: std::mem::take(&mut scratch.durable),
       ..CommitRound::default()
     };
+    let checks_mark = prof::start();
     // Vector checks read the stores, which a group still publishing may be
     // changing (creating one, or adding to it): let it finish first.
     if queue
@@ -1850,6 +1897,8 @@ impl SingleFileDB {
     }
     std::mem::swap(queue, &mut loaded);
     let mut checked = loaded;
+    prof::end(Stage::PreChecks, checks_mark);
+    let mvcc_mark = prof::start();
 
     // Vector and MVCC checks, in order, without the WAL lock: each commit
     // that passes is staged, so the ones after it check against its writes.
@@ -1885,10 +1934,14 @@ impl SingleFileDB {
       }
     }
 
+    prof::end(Stage::MvccCheck, mvcc_mark);
     // Their records, in order, while they fit. Those that do not wait for
     // the next round, unstaged (they are the newest staged), and are checked
     // again then.
+    let pager_mark = prof::start();
     let mut pager = self.pager.lock();
+    prof::end(Stage::PagerLockWait, pager_mark);
+    let append_mark = prof::start();
     let mut staged = std::mem::take(&mut scratch.staged);
     // The WAL position of each staged commit's COMMIT record.
     let mut commit_records = std::mem::take(&mut scratch.commit_records);
@@ -1950,6 +2003,9 @@ impl SingleFileDB {
       // zeros ahead of the head in them.
       (self.sync_mode != SyncMode::Off).then(|| wal.seal(self.sync_mode == SyncMode::Full))
     };
+    prof::end(Stage::WalAppendSeal, append_mark);
+    prof::count(Stage::Groups, 1);
+    prof::count(Stage::GroupCommits, staged.len() as u64);
 
     scratch.passed = checked;
     let last_commit_ts = staged.last().and_then(|(_, request)| request.commit_ts);
@@ -1959,7 +2015,9 @@ impl SingleFileDB {
         if let Some(sealed) = sealed {
           self.wal_buffer.lock().recycle_sealed(sealed);
         }
+        let settle_mark = prof::start();
         self.settle_durable_commits(&mut staged, &mut round.durable);
+        prof::end(Stage::Settle, settle_mark);
         commit_records.clear();
         scratch.commit_records = commit_records;
       }
@@ -2027,6 +2085,7 @@ impl SingleFileDB {
     commits: usize,
   ) -> Result<()> {
     during_commit_io_test_hook();
+    let write_mark = prof::start();
     if let Some(sealed) = sealed {
       #[cfg(feature = "bench-profile")]
       let flush_start = Instant::now();
@@ -2046,6 +2105,8 @@ impl SingleFileDB {
         .fetch_add(flush_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
       written?;
     }
+    prof::end(Stage::WalWrite, write_mark);
+    let header_mark = prof::start();
 
     // MVCC commits the staged commits in order, this round's last.
     let last_commit_ts = match (self.mvcc.as_ref(), last_commit_ts) {
@@ -2094,6 +2155,7 @@ impl SingleFileDB {
         self.wal_buffer.lock().note_sealed_synced(sealed);
       }
     }
+    prof::end(Stage::HeaderWrite, header_mark);
     Ok(())
   }
 
@@ -2185,10 +2247,12 @@ impl SingleFileDB {
     // boundary. Publishing before any fallible post-commit work keeps a
     // later error from leaving a committed WAL definition hidden in this
     // process.
+    let schema_mark = prof::start();
     for commit in round.iter_mut() {
       commit.published = self.publish_staged_schema(&commit.request.staged_schema);
       commit.schema_published = commit.published.is_ok();
     }
+    prof::end(Stage::PublishSchema, schema_mark);
     for commit in round.iter() {
       if commit.request.committer == this_thread {
         before_merge_test_hook();
@@ -2197,9 +2261,13 @@ impl SingleFileDB {
 
     // Upgradable: reads (and transactions, which read the delta as they
     // write) go on until the first merge.
+    let delta_mark = prof::start();
     let mut delta = PublishDelta::Reading(self.delta.upgradable_read());
+    prof::end(Stage::PublishDeltaWait, delta_mark);
     let _publishing = PublishSection::enter(&self.publish_seq);
+    let mvcc_mark = prof::start();
     let (mut released_keys, horizon) = self.commit_in_mvcc(round);
+    prof::end(Stage::PublishMvcc, mvcc_mark);
     let mut history = PublishHistory::default();
     for commit in round.iter_mut() {
       let request = &mut commit.request;
@@ -2207,6 +2275,7 @@ impl SingleFileDB {
       if on_committer_thread {
         after_commit_timestamp_test_hook();
       }
+      let history_mark = prof::start();
       self.record_mvcc_history(
         &mut history,
         horizon,
@@ -2214,10 +2283,14 @@ impl SingleFileDB {
         request,
         delta.state(),
       );
+      prof::end(Stage::PublishHistory, history_mark);
       if delta.is_reading() {
         history = PublishHistory::default();
       }
+      let merge_wait_mark = prof::start();
       let mut merged = delta.merging();
+      prof::end(Stage::PublishMergeWait, merge_wait_mark);
+      let merge_mark = prof::start();
 
       // The stores are loaded and the dimensions checked (`write_commit_round`).
       let vector_fault = if on_committer_thread {
@@ -2229,6 +2302,7 @@ impl SingleFileDB {
         vector_fault.and_then(|()| self.apply_pending_vectors(&request.pending.pending_vectors));
 
       merged.merge_from(&mut request.pending);
+      prof::end(Stage::PublishMerge, merge_mark);
       delta = PublishDelta::Merging(merged);
       if commit.published.is_ok() {
         commit.published = vector_result;
