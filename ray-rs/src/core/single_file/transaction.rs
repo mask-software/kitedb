@@ -26,8 +26,10 @@
 //!    publish -> one publish section, holding the delta (upgradable, written
 //!    from the first merge on), with each member's MVCC commit timestamp,
 //!    version chains, vectors and delta merge, in order`. Every step runs:
-//!    the group is durable. Meanwhile the lead has passed on, and the next
-//!    group is written.
+//!    the group is durable. Then the leader writes the commits queued
+//!    meanwhile as the next group, for a while (`LEAD_SPAN`): its core has
+//!    the file and the commit structures in cache. Past that, the lead passes
+//!    on before the publish, and the next group is written meanwhile.
 //!
 //! An MVCC transaction never begins inside a publish section (see
 //! `begin_with_mode`), so a snapshot holds each commit entirely or not at
@@ -223,6 +225,11 @@ const COPIED_RECORDS_MAX: usize = 64 * 1024;
 /// Most commits one group writes; the rest form the next group.
 const MAX_GROUP_COMMITS: usize = 256;
 
+/// How long after its first group a leader goes on writing the groups that
+/// queue meanwhile (see `SingleFileDB::lead_commits`). Its own transaction
+/// has its outcome after the first group; its caller waits out the span.
+const LEAD_SPAN: std::time::Duration = std::time::Duration::from_micros(50);
+
 /// The commit queue: commits wait here for the leader to write them.
 #[derive(Default)]
 pub(crate) struct CommitQueue {
@@ -393,6 +400,10 @@ struct CommitLeader<'db> {
   /// `None` for the leader's own commit.
   group: Vec<Option<Arc<CommitTicket>>>,
   released: bool,
+  /// Keep the lead once the group is durable, to write the commits queued
+  /// meanwhile next (see `SingleFileDB::lead_commits`); otherwise
+  /// `SingleFileDB::write_commits` passes it on then.
+  keep_lead: bool,
 }
 
 impl CommitLeader<'_> {
@@ -606,8 +617,8 @@ impl TxSpares {
       }
       Self::keep_buffer(&mut spares.pending_wal, pending_wal);
       Self::keep_buffer(&mut spares.records, records);
+      // The sets it does not keep are freed as the drain ends.
       spares.keep_key_sets_here(request.released_keys.drain(..));
-      request.released_keys.clear();
       spares.request = Some(request);
     });
   }
@@ -1770,9 +1781,9 @@ impl SingleFileDB {
   /// `MAX_GROUP_COMMITS`) and writes it as one group (`write_commits`: one
   /// WAL write, one sync if the mode asks for one, and one header for all).
   /// The others wait without the commit lock, so the commits that arrive
-  /// while a group is written form the next one, which the oldest of them
-  /// leads once the group is durable. Nobody sleeps to wait for more
-  /// commits.
+  /// while a group is written form the next one, which the leader writes
+  /// too for a while (see `lead_commits`), and then the oldest of them leads.
+  /// Nobody sleeps to wait for more commits.
   fn commit_queued(&self, request: Box<CommitRequest>) -> CommitOutcome {
     let mut state = self.commit_queue.state.lock();
     if !state.leading {
@@ -1801,9 +1812,14 @@ impl SingleFileDB {
   /// Lead the commit queue (see `commit_queued`): write one group, this
   /// committer's commit (`own_request`, or the queued one of `own_ticket`)
   /// and the commits queued before the leader took them, at most
-  /// `MAX_GROUP_COMMITS`. Once the group is durable the lead passes on, so
-  /// the next group is written while this one publishes. Returns this
-  /// committer's outcome.
+  /// `MAX_GROUP_COMMITS`; then, while commits keep queuing and for up to
+  /// `LEAD_SPAN` after the first group, those queued meanwhile as the next
+  /// group, and so on. The thread that wrote a group thus writes the next
+  /// one with the file, the WAL buffers and the commit structures in its
+  /// core's caches; a group written from another core costs about three
+  /// times as much (see `b4_write_costs_tests`). Once the span is over, the
+  /// lead passes on as soon as a group is durable, so the next group is
+  /// written while that one publishes. Returns this committer's outcome.
   fn lead_commits(
     &self,
     own_request: Option<Box<CommitRequest>>,
@@ -1814,6 +1830,7 @@ impl SingleFileDB {
       db: self,
       group: std::mem::take(&mut scratch.group),
       released: false,
+      keep_lead: true,
     };
     before_commit_lock_test_hook();
     let mut queue = std::mem::take(&mut scratch.queue);
@@ -1821,28 +1838,46 @@ impl SingleFileDB {
       queue.push_back((0, request));
       leader.group.push(None);
     }
-    let take_mark = prof::start();
-    {
-      let mut state = self.commit_queue.state.lock();
+    let mut own = None;
+    // Set once a second group follows the first.
+    let mut lead_until = None;
+    let mut state = self.commit_queue.state.lock();
+    loop {
+      let take_mark = prof::start();
       let take = state.queued.len().min(MAX_GROUP_COMMITS - queue.len());
       for queued in state.queued.drain(..take) {
         leader.group.push(Some(queued.ticket));
         queue.push_back((queue.len(), queued.request));
       }
+      drop(state);
+      prof::end(Stage::LeadTake, take_mark);
+      group_led_test_hook();
+      self.write_commits(&mut queue, &mut leader, &mut scratch);
+      let deliver_mark = prof::start();
+      let outcomes = scratch.outcomes.drain(..).map(|outcome| {
+        outcome.unwrap_or_else(|| {
+          CommitOutcome::failed(KiteError::Internal("commit was not written".to_string()))
+        })
+      });
+      if let Some(outcome) = leader.deliver(own_ticket, outcomes) {
+        own = Some(outcome);
+      }
+      prof::end(Stage::Deliver, deliver_mark);
+      if leader.released {
+        break;
+      }
+      state = self.commit_queue.state.lock();
+      if state.queued.is_empty() {
+        leader.release(&mut state);
+        break;
+      }
+      // Past its span, the lead passes on once the next group is durable.
+      let until = *lead_until.get_or_insert_with(|| std::time::Instant::now() + LEAD_SPAN);
+      leader.keep_lead = std::time::Instant::now() < until;
     }
-    prof::end(Stage::LeadTake, take_mark);
-    group_led_test_hook();
-    self.write_commits(&mut queue, &mut leader, &mut scratch);
-    let deliver_mark = prof::start();
-    let outcomes = scratch.outcomes.drain(..).map(|outcome| {
-      outcome.unwrap_or_else(|| {
-        CommitOutcome::failed(KiteError::Internal("commit was not written".to_string()))
-      })
-    });
-    let own = leader.deliver(own_ticket, outcomes).unwrap_or_else(|| {
+    let own = own.unwrap_or_else(|| {
       CommitOutcome::failed(KiteError::Internal("commit was not written".to_string()))
     });
-    prof::end(Stage::Deliver, deliver_mark);
     scratch.queue = queue;
     scratch.group = std::mem::take(&mut leader.group);
     scratch.keep();
@@ -1850,13 +1885,14 @@ impl SingleFileDB {
   }
 
   /// Write the commits of `queue` (each with its index in the group), in
-  /// order, and leave their outcomes in `scratch.outcomes`, by index. Each round, under the commit lock, writes the COMMIT records
-  /// of those that fit and makes them durable with one WAL write and one
-  /// header (`write_commit_round`); then, under the publish lock, which it
+  /// order, and leave their outcomes in `scratch.outcomes`, by index. Each
+  /// round, under the commit lock, writes the COMMIT records of those that
+  /// fit and makes them durable with one WAL write and one header
+  /// (`write_commit_round`); then, under the publish lock, which it
   /// takes before it releases the commit lock (so rounds publish in commit
   /// order), publishes them (`publish_commits`). Once a round leaves nothing
-  /// of `queue` to write, `leader` passes the lead on before the publish.
-  /// Callers hold no lock.
+  /// of `queue` to write, `leader` passes the lead on before the publish,
+  /// unless it keeps it (`CommitLeader::keep_lead`). Callers hold no lock.
   fn write_commits(
     &self,
     queue: &mut VecDeque<(usize, Box<CommitRequest>)>,
@@ -1885,7 +1921,7 @@ impl SingleFileDB {
       prof::end(Stage::PublishLockWait, publish_lock_mark);
       drop(commit_guard);
       let release_mark = prof::start();
-      if queue.is_empty() {
+      if queue.is_empty() && !leader.keep_lead {
         leader.release_lead();
       }
       prof::end(Stage::ReleaseLead, release_mark);
