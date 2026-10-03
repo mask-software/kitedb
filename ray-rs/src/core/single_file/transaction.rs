@@ -138,6 +138,17 @@ fn after_commit_timestamp_test_hook() {
   }
 }
 
+#[cfg(test)]
+thread_local! {
+  /// Commit groups this thread took and wrote as the commit queue's leader.
+  pub(crate) static GROUPS_LED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn group_led_test_hook() {
+  #[cfg(test)]
+  GROUPS_LED.with(|groups| groups.set(groups.get() + 1));
+}
+
 /// A transaction's commit, as handed to the thread that writes it: its
 /// committer, or the leader of its group.
 pub(crate) struct CommitRequest {
@@ -1820,6 +1831,7 @@ impl SingleFileDB {
       }
     }
     prof::end(Stage::LeadTake, take_mark);
+    group_led_test_hook();
     self.write_commits(&mut queue, &mut leader, &mut scratch);
     let deliver_mark = prof::start();
     let outcomes = scratch.outcomes.drain(..).map(|outcome| {
@@ -3120,6 +3132,11 @@ mod b4_mvcc_default_tests;
 #[cfg(test)]
 #[path = "b4_commit_tests.rs"]
 mod b4_tests;
+/// raydb-b4 `write-costs` lane: what each commit and begin costs with
+/// several writers.
+#[cfg(test)]
+#[path = "b4_write_costs_tests.rs"]
+mod b4_write_costs_tests;
 /// raydb-b4 `write-scaling` lane: the commit queue.
 #[cfg(test)]
 #[path = "b4_write_scaling_tests.rs"]
