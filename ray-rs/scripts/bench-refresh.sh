@@ -19,9 +19,14 @@
 # Environment:
 #   STAMP       Date prefix of the logs (default: today's UTC date)
 #   OUT_DIR     Log directory (default: docs/benchmarks/results; --smoke: a temp dir)
-#   MAX_LOAD    Refuse to start while the 1-minute load average is above this (default: 3)
+#   MAX_BUSY    Percent of all CPUs other processes may keep busy (default: 20).
+#               Sampled over one second before the first run (refuse above it)
+#               and between runs (wait until it drops, noting the pause in the
+#               log, for at most MAX_WAIT seconds, default 600). The load
+#               average is only recorded: on macOS it counts threads that wait
+#               for I/O, and our own runs raise it for a minute after they end.
 #   PAUSE       Seconds to wait between two runs (default: 2)
-#   FORCE=1     Start even above MAX_LOAD, on battery, in Low Power Mode, or
+#   FORCE=1     Start even above MAX_BUSY, on battery, in Low Power Mode, or
 #               with uncommitted changes (the logs then do not match a commit)
 #   PYTHON      Python with maturin for the bindings (default: ray-rs/.venv/bin/python)
 #
@@ -64,7 +69,8 @@ RAY_RS="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO="$(cd "$RAY_RS/.." && pwd)"
 BIN_DIR="$RAY_RS/target/release/examples"
 PYTHON="${PYTHON:-$RAY_RS/.venv/bin/python}"
-MAX_LOAD="${MAX_LOAD:-3}"
+MAX_BUSY="${MAX_BUSY:-20}"
+MAX_WAIT="${MAX_WAIT:-600}"
 PAUSE="${PAUSE:-2}"
 FORCE="${FORCE:-0}"
 
@@ -337,12 +343,21 @@ kinds_selected() {
   return 1
 }
 
-load_1m() {
+# Percent of all CPUs busy over the next second (nothing of ours runs then).
+cpu_busy() {
   if [[ "$(uname -s)" == Darwin ]]; then
-    sysctl -n vm.loadavg | awk '{print $2}'
+    top -l 2 -n 0 -s 1 | awk '/^CPU usage/ { idle = $7 } END { sub("%", "", idle); printf "%.1f", 100 - idle }'
   else
-    awk '{print $1}' /proc/loadavg
+    local a b
+    a="$(awk '/^cpu / {print $2 + $3 + $4 + $7 + $8, $5 + $6}' /proc/stat)"
+    sleep 1
+    b="$(awk '/^cpu / {print $2 + $3 + $4 + $7 + $8, $5 + $6}' /proc/stat)"
+    echo "$a $b" | awk '{ busy = $3 - $1; idle = $4 - $2; printf "%.1f", 100 * busy / (busy + idle) }'
   fi
+}
+
+over_max_busy() {
+  awk -v busy="$1" -v max="$MAX_BUSY" 'BEGIN { exit !(busy > max) }'
 }
 
 load_all() {
@@ -383,8 +398,9 @@ if [[ "$(uname -s)" == Darwin ]]; then
     refuse "Low Power Mode is on, which caps CPU speed (System Settings > Battery, or sudo pmset -a powermode 0)"
   fi
 fi
-if awk -v load="$(load_1m)" -v max="$MAX_LOAD" 'BEGIN { exit !(load > max) }'; then
-  refuse "1-minute load average $(load_1m) is above MAX_LOAD=$MAX_LOAD"
+BUSY="$(cpu_busy)"
+if over_max_busy "$BUSY"; then
+  refuse "other processes keep ${BUSY}% of the CPUs busy, above MAX_BUSY=$MAX_BUSY"
 fi
 
 # ---------------------------------------------------------------------------
@@ -489,6 +505,26 @@ write_header() {
   } >"$log"
 }
 
+# Waits until other processes leave the CPUs quiet (MAX_BUSY), at most
+# MAX_WAIT seconds; sets BUSY and notes any pause in the manifest and log $1.
+wait_quiet() {
+  local log="$1" waited=0
+  BUSY="$(cpu_busy)"
+  while over_max_busy "$BUSY"; do
+    if (( waited >= MAX_WAIT )); then
+      echo "### going on after ${waited}s with the CPUs ${BUSY}% busy (MAX_BUSY=$MAX_BUSY)" | tee -a "$log" "$MANIFEST"
+      return
+    fi
+    echo "  paused: other processes keep ${BUSY}% of the CPUs busy (MAX_BUSY=$MAX_BUSY)"
+    sleep 15
+    waited=$((waited + 15))
+    BUSY="$(cpu_busy)"
+  done
+  if (( waited > 0 )); then
+    echo "### paused ${waited}s before this run: the CPUs were busier than MAX_BUSY=$MAX_BUSY" | tee -a "$log" >>"$MANIFEST"
+  fi
+}
+
 run_one() {
   local i="$1" round="$2" log status start end elapsed
   log="$(log_path "${NAMES[i]}")"
@@ -500,7 +536,8 @@ run_one() {
     ts) cmd=(node --import @oxc-node/core/register benchmark/bench-fluent-vs-lowlevel.ts "${cmd[@]}") ;;
     sqlite) cmd=("$PYTHON" ../docs/benchmarks/sqlite_single_file_raw_bench.py "${cmd[@]}") ;;
   esac
-  echo "### run $round/${ROUNDS_OF[i]} | start $(date -u +%FT%TZ) | load $(load_all)" >>"$log"
+  wait_quiet "$log"
+  echo "### run $round/${ROUNDS_OF[i]} | start $(date -u +%FT%TZ) | load $(load_all) | cpu busy before ${BUSY}%" >>"$log"
   start="$(date +%s)"
   set +e
   (cd "$RAY_RS" && "${cmd[@]}") >>"$log" 2>&1
@@ -519,7 +556,7 @@ run_one() {
   echo "# refresh started: $STARTED"
   echo "# commit: $COMMIT ($DESCRIBE)"
   echo "$MACHINE" | sed 's/^/# /'
-  echo "# load average at start: $(load_all)"
+  echo "# load average at start: $(load_all); CPUs busy at start: ${BUSY}%"
   echo "# rounds: $ROUNDS; groups: $GROUPS_SELECTED${ONLY:+; only: $ONLY}$SMOKE_NOTE"
   echo "#"
   echo "# configurations (log: $STAMP-<name>.txt):"
