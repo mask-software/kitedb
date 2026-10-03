@@ -1,0 +1,76 @@
+# KiteDB benchmark log, written by ray-rs/scripts/bench-refresh.sh
+# name: bulk-load-mvcc
+# group: extra
+# command (from ray-rs/): cargo run --release --example bulk_load_bench --no-default-features -- --nodes 200000 --edges 1000000 --batch 5000 --runs 1 --mvcc
+# rounds: 5, interleaved with the other 32 configurations of this refresh
+# published value: per row, the line of the round with the median p50 (or rate); see ray-docs/scripts/benchmark-logs.ts
+# refresh started: 2026-10-03T07:14:28Z
+# commit: e3b064cb3be86dab3fe936ef469c2ccd71d20756 (e3b064c)
+# toolchain: rustc 1.88.0 (6b00bc388 2025-06-23), cargo 1.88.0 (873a06493 2025-05-10)
+# build: cargo build --release --no-default-features (profile.release: lto = true, codegen-units = 1)
+# machine: Apple M5 Pro, 15 cores (5 Super + 10 Performance), 48 GB
+# os: macOS 26.6 (25G5043d), Darwin 25.6.0, arm64
+# power: AC Power, energy mode high power
+# temp dir: /var/folders/48/tk2lgsfn76j4hc78m2yjkwvr0000gp/T (/dev/disk3s5)
+# load average at start: 5.40 4.30 3.63
+#
+### run 1/5 | start 2026-10-03T07:20:07Z | load 4.84 4.42 3.82 | cpu busy before 18.9%
+================================================================================
+Bulk-load benchmark (Rust)
+================================================================================
+MVCC: on
+Transactions: begin_bulk
+Open read transaction during the load: false
+Nodes: 200000 (2 props), edges: 1000000 (2 props), batch: 5000
+Sync mode: Normal, WAL size: 67108864 bytes, runs: 1
+================================================================================
+run 1: nodes   2727558/s (   73.3 ms)  edges   1039062/s (  962.4 ms)
+### run 1/5 | exit 0 | 1s
+### run 2/5 | start 2026-10-03T07:23:17Z | load 3.30 3.91 3.71 | cpu busy before 12.7%
+================================================================================
+Bulk-load benchmark (Rust)
+================================================================================
+MVCC: on
+Transactions: begin_bulk
+Open read transaction during the load: false
+Nodes: 200000 (2 props), edges: 1000000 (2 props), batch: 5000
+Sync mode: Normal, WAL size: 67108864 bytes, runs: 1
+================================================================================
+run 1: nodes   3058135/s (   65.4 ms)  edges   1072976/s (  932.0 ms)
+### run 2/5 | exit 0 | 1s
+### run 3/5 | start 2026-10-03T07:26:59Z | load 5.71 4.11 3.79 | cpu busy before 5.3%
+================================================================================
+Bulk-load benchmark (Rust)
+================================================================================
+MVCC: on
+Transactions: begin_bulk
+Open read transaction during the load: false
+Nodes: 200000 (2 props), edges: 1000000 (2 props), batch: 5000
+Sync mode: Normal, WAL size: 67108864 bytes, runs: 1
+================================================================================
+run 1: nodes   3054704/s (   65.5 ms)  edges   1054740/s (  948.1 ms)
+### run 3/5 | exit 0 | 1s
+### run 4/5 | start 2026-10-03T07:30:22Z | load 4.13 3.94 3.76 | cpu busy before 5.4%
+================================================================================
+Bulk-load benchmark (Rust)
+================================================================================
+MVCC: on
+Transactions: begin_bulk
+Open read transaction during the load: false
+Nodes: 200000 (2 props), edges: 1000000 (2 props), batch: 5000
+Sync mode: Normal, WAL size: 67108864 bytes, runs: 1
+================================================================================
+run 1: nodes   3091097/s (   64.7 ms)  edges   1085667/s (  921.1 ms)
+### run 4/5 | exit 0 | 1s
+### run 5/5 | start 2026-10-03T07:37:58Z | load 4.16 6.02 5.17 | cpu busy before 8.1%
+================================================================================
+Bulk-load benchmark (Rust)
+================================================================================
+MVCC: on
+Transactions: begin_bulk
+Open read transaction during the load: false
+Nodes: 200000 (2 props), edges: 1000000 (2 props), batch: 5000
+Sync mode: Normal, WAL size: 67108864 bytes, runs: 1
+================================================================================
+run 1: nodes   3050691/s (   65.6 ms)  edges   1049089/s (  953.2 ms)
+### run 5/5 | exit 0 | 1s

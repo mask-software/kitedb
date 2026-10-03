@@ -1,0 +1,156 @@
+# KiteDB benchmark log, written by ray-rs/scripts/bench-refresh.sh
+# name: multi-writer-throughput-mvcc-normal-1node-8w
+# group: site
+# command (from ray-rs/): cargo run --release --example multi_writer_throughput_bench --no-default-features -- --threads 8 --tx-per-thread 50000 --batch-size 1 --edges-per-node 0 --edge-props 0 --wal-size 1073741824 --sync-mode normal --mvcc
+# rounds: 5, interleaved with the other 32 configurations of this refresh
+# published value: per row, the line of the round with the median p50 (or rate); see ray-docs/scripts/benchmark-logs.ts
+# refresh started: 2026-10-03T07:14:28Z
+# commit: e3b064cb3be86dab3fe936ef469c2ccd71d20756 (e3b064c)
+# toolchain: rustc 1.88.0 (6b00bc388 2025-06-23), cargo 1.88.0 (873a06493 2025-05-10)
+# build: cargo build --release --no-default-features (profile.release: lto = true, codegen-units = 1)
+# machine: Apple M5 Pro, 15 cores (5 Super + 10 Performance), 48 GB
+# os: macOS 26.6 (25G5043d), Darwin 25.6.0, arm64
+# power: AC Power, energy mode high power
+# temp dir: /var/folders/48/tk2lgsfn76j4hc78m2yjkwvr0000gp/T (/dev/disk3s5)
+# load average at start: 5.40 4.30 3.63
+#
+### run 1/5 | start 2026-10-03T07:15:47Z | load 3.30 3.91 3.54 | cpu busy before 11.7%
+==================================================================
+Multi-writer Throughput Benchmark (Rust)
+==================================================================
+Threads: 8
+Tx per thread: 50000
+Batch size: 1
+Edges per node: 0
+Edge types: 3
+Edge props: 0
+WAL size: 1073741824 bytes
+Sync mode: Normal
+Full fsync: false
+Reopen: false
+Group commit: every commit
+MVCC: on
+Performance cores: false
+==================================================================
+
+--- Throughput ---
+Elapsed: 1.036s
+Transactions: 400000
+Nodes written: 400000
+Edges written: 0
+Tx rate: 386.09K/s
+Node rate: 386.09K/s
+Edge rate: 0.00/s
+### run 1/5 | exit 0 | 1s
+### run 2/5 | start 2026-10-03T07:21:34Z | load 3.06 3.89 3.67 | cpu busy before 15.7%
+==================================================================
+Multi-writer Throughput Benchmark (Rust)
+==================================================================
+Threads: 8
+Tx per thread: 50000
+Batch size: 1
+Edges per node: 0
+Edge types: 3
+Edge props: 0
+WAL size: 1073741824 bytes
+Sync mode: Normal
+Full fsync: false
+Reopen: false
+Group commit: every commit
+MVCC: on
+Performance cores: false
+==================================================================
+
+--- Throughput ---
+Elapsed: 1.063s
+Transactions: 400000
+Nodes written: 400000
+Edges written: 0
+Tx rate: 376.42K/s
+Node rate: 376.42K/s
+Edge rate: 0.00/s
+### run 2/5 | exit 0 | 1s
+### run 3/5 | start 2026-10-03T07:24:43Z | load 3.15 3.73 3.66 | cpu busy before 6.9%
+==================================================================
+Multi-writer Throughput Benchmark (Rust)
+==================================================================
+Threads: 8
+Tx per thread: 50000
+Batch size: 1
+Edges per node: 0
+Edge types: 3
+Edge props: 0
+WAL size: 1073741824 bytes
+Sync mode: Normal
+Full fsync: false
+Reopen: false
+Group commit: every commit
+MVCC: on
+Performance cores: false
+==================================================================
+
+--- Throughput ---
+Elapsed: 1.071s
+Transactions: 400000
+Nodes written: 400000
+Edges written: 0
+Tx rate: 373.37K/s
+Node rate: 373.37K/s
+Edge rate: 0.00/s
+### run 3/5 | exit 0 | 1s
+### run 4/5 | start 2026-10-03T07:28:26Z | load 2.72 3.53 3.60 | cpu busy before 14.3%
+==================================================================
+Multi-writer Throughput Benchmark (Rust)
+==================================================================
+Threads: 8
+Tx per thread: 50000
+Batch size: 1
+Edges per node: 0
+Edge types: 3
+Edge props: 0
+WAL size: 1073741824 bytes
+Sync mode: Normal
+Full fsync: false
+Reopen: false
+Group commit: every commit
+MVCC: on
+Performance cores: false
+==================================================================
+
+--- Throughput ---
+Elapsed: 1.275s
+Transactions: 400000
+Nodes written: 400000
+Edges written: 0
+Tx rate: 313.63K/s
+Node rate: 313.63K/s
+Edge rate: 0.00/s
+### run 4/5 | exit 0 | 1s
+### run 5/5 | start 2026-10-03T07:36:55Z | load 4.92 6.51 5.27 | cpu busy before 9.2%
+==================================================================
+Multi-writer Throughput Benchmark (Rust)
+==================================================================
+Threads: 8
+Tx per thread: 50000
+Batch size: 1
+Edges per node: 0
+Edge types: 3
+Edge props: 0
+WAL size: 1073741824 bytes
+Sync mode: Normal
+Full fsync: false
+Reopen: false
+Group commit: every commit
+MVCC: on
+Performance cores: false
+==================================================================
+
+--- Throughput ---
+Elapsed: 1.063s
+Transactions: 400000
+Nodes written: 400000
+Edges written: 0
+Tx rate: 376.46K/s
+Node rate: 376.46K/s
+Edge rate: 0.00/s
+### run 5/5 | exit 0 | 1s

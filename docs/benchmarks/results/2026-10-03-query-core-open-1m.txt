@@ -1,0 +1,32 @@
+# KiteDB benchmark log, written by ray-rs/scripts/bench-refresh.sh
+# name: query-core-open-1m
+# group: extra
+# command (from ray-rs/): cargo run --release --example query_core_bench --no-default-features -- --sections open --nodes 1000000 --edges-per-node 5 --repeat 9 --mvcc
+# rounds: 3, interleaved with the other 32 configurations of this refresh
+# published value: per row, the line of the round with the median p50 (or rate); see ray-docs/scripts/benchmark-logs.ts
+# refresh started: 2026-10-03T07:14:28Z
+# commit: e3b064cb3be86dab3fe936ef469c2ccd71d20756 (e3b064c)
+# toolchain: rustc 1.88.0 (6b00bc388 2025-06-23), cargo 1.88.0 (873a06493 2025-05-10)
+# build: cargo build --release --no-default-features (profile.release: lto = true, codegen-units = 1)
+# machine: Apple M5 Pro, 15 cores (5 Super + 10 Performance), 48 GB
+# os: macOS 26.6 (25G5043d), Darwin 25.6.0, arm64
+# power: AC Power, energy mode high power
+# temp dir: /var/folders/48/tk2lgsfn76j4hc78m2yjkwvr0000gp/T (/dev/disk3s5)
+# load average at start: 5.40 4.30 3.63
+#
+### run 1/3 | start 2026-10-03T07:16:50Z | load 2.73 3.64 3.46 | cpu busy before 6.8%
+MVCC: on
+open: 1000000 nodes, 5000000 edges, checkpointed
+  snapshot open_single_file (read-only)                 median      18272.5 us   min      18052.9 us
+### run 1/3 | exit 0 | 3s
+### run 2/3 | start 2026-10-03T07:22:37Z | load 4.92 4.24 3.82 | cpu busy before 5.9%
+MVCC: on
+open: 1000000 nodes, 5000000 edges, checkpointed
+  snapshot open_single_file (read-only)                 median      18751.5 us   min      18417.5 us
+### run 2/3 | exit 0 | 4s
+### paused 15s before this run: the CPUs were busier than MAX_BUSY=20
+### run 3/3 | start 2026-10-03T07:26:20Z | load 2.86 3.49 3.57 | cpu busy before 6.5%
+MVCC: on
+open: 1000000 nodes, 5000000 edges, checkpointed
+  snapshot open_single_file (read-only)                 median      18309.4 us   min      18134.4 us
+### run 3/3 | exit 0 | 3s

@@ -1,0 +1,336 @@
+# KiteDB benchmark log, written by ray-rs/scripts/bench-refresh.sh
+# name: single-file-raw-rust-mvcc-full
+# group: site
+# command (from ray-rs/): cargo run --release --example single_file_raw_bench --no-default-features -- --nodes 10000 --edges 50000 --iterations 10000 --wal-size 268435456 --no-auto-checkpoint --seed 42 --sync-mode full --mvcc
+# rounds: 5, interleaved with the other 32 configurations of this refresh
+# published value: per row, the line of the round with the median p50 (or rate); see ray-docs/scripts/benchmark-logs.ts
+# refresh started: 2026-10-03T07:14:28Z
+# commit: e3b064cb3be86dab3fe936ef469c2ccd71d20756 (e3b064c)
+# toolchain: rustc 1.88.0 (6b00bc388 2025-06-23), cargo 1.88.0 (873a06493 2025-05-10)
+# build: cargo build --release --no-default-features (profile.release: lto = true, codegen-units = 1)
+# machine: Apple M5 Pro, 15 cores (5 Super + 10 Performance), 48 GB
+# os: macOS 26.6 (25G5043d), Darwin 25.6.0, arm64
+# power: AC Power, energy mode high power
+# temp dir: /var/folders/48/tk2lgsfn76j4hc78m2yjkwvr0000gp/T (/dev/disk3s5)
+# load average at start: 5.40 4.30 3.63
+#
+### run 1/5 | start 2026-10-03T07:14:35Z | load 5.04 4.25 3.61 | cpu busy before 13.6%
+========================================================================================================================
+Single-file Raw Benchmark (Rust)
+========================================================================================================================
+Nodes: 10,000
+Edges: 50,000
+Edge types: 3
+Edge props: 10
+Iterations: 10,000
+WAL size: 268,435,456 bytes
+Sync mode: Full
+MVCC: on
+Group commit: every commit
+Seed: 42
+Auto-checkpoint: false
+Checkpoint threshold: 0.8
+Vector dims: 128
+Vector count: 1,000
+Replication primary: false
+Skip checkpoint: false
+Reopen read-only: false
+========================================================================================================================
+
+[1/6] Building graph...
+  Creating nodes...
+  Created 5000 / 10000 nodes  Created 10000 / 10000 nodes
+  Creating edges...
+  Created 5000 / 50000 edges  Created 10000 / 50000 edges  Created 15000 / 50000 edges  Created 20000 / 50000 edges  Created 25000 / 50000 edges  Created 30000 / 50000 edges  Created 35000 / 50000 edges  Created 40000 / 50000 edges  Created 45000 / 50000 edges  Created 50000 / 50000 edges
+  Built in 46ms
+
+[2/6] Vector setup...
+
+--- Vector Operations ---
+Set vectors (batch 100)                       p50=  151.29us p95=  199.04us p99=  199.04us max=  199.04us (6727 ops/sec)
+
+[3/6] Checkpointing...
+  Checkpointed in 80ms
+
+[4/6] Key lookup benchmarks...
+
+--- Key Lookups (node_by_key) ---
+Random existing keys                          p50=      42ns p95=     167ns p99=     458ns max=    3.75us (13580000 ops/sec)
+
+[5/6] Traversal and edge benchmarks...
+
+--- 1-Hop Traversals (out) ---
+Random nodes                                  p50=      42ns p95=     166ns p99=     334ns max=    7.92us (13886729 ops/sec)
+
+--- Edge Exists ---
+Random edge exists                            p50=      42ns p95=      83ns p99=     125ns max=     542ns (22661554 ops/sec)
+node_vector() random                          p50=      83ns p95=     208ns p99=     292ns max=    4.92us (11070801 ops/sec)
+has_node_vector() random                      p50=      42ns p95=      42ns p99=      84ns max=     375ns (25135101 ops/sec)
+
+[6/6] Write benchmarks...
+
+--- Batch Writes (100 nodes) ---
+Batch of 100 nodes                            p50=   64.08us p95=   91.08us p99=  114.92us max=  114.92us (15408 ops/sec)
+
+--- Batch Writes (100 edges) ---
+Batch of 100 edges                            p50=   58.42us p95=   71.42us p99=  100.71us max=  100.71us (16914 ops/sec)
+
+--- Batch Writes (100 edges + props) ---
+Batch of 100 edges + props                    p50=  103.50us p95=  116.17us p99=  160.42us max=  160.42us (9558 ops/sec)
+### run 1/5 | exit 0 | 0s
+### run 2/5 | start 2026-10-03T07:20:23Z | load 4.13 4.28 3.79 | cpu busy before 6.2%
+========================================================================================================================
+Single-file Raw Benchmark (Rust)
+========================================================================================================================
+Nodes: 10,000
+Edges: 50,000
+Edge types: 3
+Edge props: 10
+Iterations: 10,000
+WAL size: 268,435,456 bytes
+Sync mode: Full
+MVCC: on
+Group commit: every commit
+Seed: 42
+Auto-checkpoint: false
+Checkpoint threshold: 0.8
+Vector dims: 128
+Vector count: 1,000
+Replication primary: false
+Skip checkpoint: false
+Reopen read-only: false
+========================================================================================================================
+
+[1/6] Building graph...
+  Creating nodes...
+  Created 5000 / 10000 nodes  Created 10000 / 10000 nodes
+  Creating edges...
+  Created 5000 / 50000 edges  Created 10000 / 50000 edges  Created 15000 / 50000 edges  Created 20000 / 50000 edges  Created 25000 / 50000 edges  Created 30000 / 50000 edges  Created 35000 / 50000 edges  Created 40000 / 50000 edges  Created 45000 / 50000 edges  Created 50000 / 50000 edges
+  Built in 47ms
+
+[2/6] Vector setup...
+
+--- Vector Operations ---
+Set vectors (batch 100)                       p50=  167.42us p95=  607.25us p99=  607.25us max=  607.25us (4787 ops/sec)
+
+[3/6] Checkpointing...
+  Checkpointed in 74ms
+
+[4/6] Key lookup benchmarks...
+
+--- Key Lookups (node_by_key) ---
+Random existing keys                          p50=      83ns p95=     167ns p99=     458ns max=   17.67us (12372471 ops/sec)
+
+[5/6] Traversal and edge benchmarks...
+
+--- 1-Hop Traversals (out) ---
+Random nodes                                  p50=      42ns p95=     125ns p99=     333ns max=    4.25us (13923989 ops/sec)
+
+--- Edge Exists ---
+Random edge exists                            p50=      42ns p95=      83ns p99=      84ns max=     750ns (21687693 ops/sec)
+node_vector() random                          p50=      83ns p95=     167ns p99=     291ns max=    2.12us (12122711 ops/sec)
+has_node_vector() random                      p50=      42ns p95=      42ns p99=      84ns max=     542ns (24627933 ops/sec)
+
+[6/6] Write benchmarks...
+
+--- Batch Writes (100 nodes) ---
+Batch of 100 nodes                            p50=   77.33us p95=   97.04us p99=  123.00us max=  123.00us (13141 ops/sec)
+
+--- Batch Writes (100 edges) ---
+Batch of 100 edges                            p50=   57.67us p95=   80.96us p99=  345.58us max=  345.58us (14890 ops/sec)
+
+--- Batch Writes (100 edges + props) ---
+Batch of 100 edges + props                    p50=   95.71us p95=  113.88us p99=  180.33us max=  180.33us (10089 ops/sec)
+### run 2/5 | exit 0 | 0s
+### run 3/5 | start 2026-10-03T07:27:19Z | load 4.58 3.95 3.74 | cpu busy before 5.1%
+========================================================================================================================
+Single-file Raw Benchmark (Rust)
+========================================================================================================================
+Nodes: 10,000
+Edges: 50,000
+Edge types: 3
+Edge props: 10
+Iterations: 10,000
+WAL size: 268,435,456 bytes
+Sync mode: Full
+MVCC: on
+Group commit: every commit
+Seed: 42
+Auto-checkpoint: false
+Checkpoint threshold: 0.8
+Vector dims: 128
+Vector count: 1,000
+Replication primary: false
+Skip checkpoint: false
+Reopen read-only: false
+========================================================================================================================
+
+[1/6] Building graph...
+  Creating nodes...
+  Created 5000 / 10000 nodes  Created 10000 / 10000 nodes
+  Creating edges...
+  Created 5000 / 50000 edges  Created 10000 / 50000 edges  Created 15000 / 50000 edges  Created 20000 / 50000 edges  Created 25000 / 50000 edges  Created 30000 / 50000 edges  Created 35000 / 50000 edges  Created 40000 / 50000 edges  Created 45000 / 50000 edges  Created 50000 / 50000 edges
+  Built in 46ms
+
+[2/6] Vector setup...
+
+--- Vector Operations ---
+Set vectors (batch 100)                       p50=  166.29us p95=  211.62us p99=  211.62us max=  211.62us (5977 ops/sec)
+
+[3/6] Checkpointing...
+  Checkpointed in 72ms
+
+[4/6] Key lookup benchmarks...
+
+--- Key Lookups (node_by_key) ---
+Random existing keys                          p50=      42ns p95=     250ns p99=     458ns max=    3.79us (12200329 ops/sec)
+
+[5/6] Traversal and edge benchmarks...
+
+--- 1-Hop Traversals (out) ---
+Random nodes                                  p50=      42ns p95=     125ns p99=     375ns max=   19.33us (13586790 ops/sec)
+
+--- Edge Exists ---
+Random edge exists                            p50=      42ns p95=      83ns p99=      84ns max=     625ns (23646084 ops/sec)
+node_vector() random                          p50=      83ns p95=      84ns p99=     250ns max=    1.67us (12873791 ops/sec)
+has_node_vector() random                      p50=      42ns p95=      42ns p99=      83ns max=     417ns (26558450 ops/sec)
+
+[6/6] Write benchmarks...
+
+--- Batch Writes (100 nodes) ---
+Batch of 100 nodes                            p50=   76.00us p95=   94.50us p99=  128.04us max=  128.04us (13522 ops/sec)
+
+--- Batch Writes (100 edges) ---
+Batch of 100 edges                            p50=   49.62us p95=   70.04us p99=   86.46us max=   86.46us (19708 ops/sec)
+
+--- Batch Writes (100 edges + props) ---
+Batch of 100 edges + props                    p50=   95.50us p95=  107.58us p99=  148.67us max=  148.67us (10256 ops/sec)
+### run 3/5 | exit 0 | 0s
+### run 4/5 | start 2026-10-03T07:30:41Z | load 3.77 3.86 3.73 | cpu busy before 5.1%
+========================================================================================================================
+Single-file Raw Benchmark (Rust)
+========================================================================================================================
+Nodes: 10,000
+Edges: 50,000
+Edge types: 3
+Edge props: 10
+Iterations: 10,000
+WAL size: 268,435,456 bytes
+Sync mode: Full
+MVCC: on
+Group commit: every commit
+Seed: 42
+Auto-checkpoint: false
+Checkpoint threshold: 0.8
+Vector dims: 128
+Vector count: 1,000
+Replication primary: false
+Skip checkpoint: false
+Reopen read-only: false
+========================================================================================================================
+
+[1/6] Building graph...
+  Creating nodes...
+  Created 5000 / 10000 nodes  Created 10000 / 10000 nodes
+  Creating edges...
+  Created 5000 / 50000 edges  Created 10000 / 50000 edges  Created 15000 / 50000 edges  Created 20000 / 50000 edges  Created 25000 / 50000 edges  Created 30000 / 50000 edges  Created 35000 / 50000 edges  Created 40000 / 50000 edges  Created 45000 / 50000 edges  Created 50000 / 50000 edges
+  Built in 46ms
+
+[2/6] Vector setup...
+
+--- Vector Operations ---
+Set vectors (batch 100)                       p50=  165.08us p95=  198.46us p99=  198.46us max=  198.46us (6101 ops/sec)
+
+[3/6] Checkpointing...
+  Checkpointed in 72ms
+
+[4/6] Key lookup benchmarks...
+
+--- Key Lookups (node_by_key) ---
+Random existing keys                          p50=      42ns p95=     208ns p99=     458ns max=    3.92us (13220798 ops/sec)
+
+[5/6] Traversal and edge benchmarks...
+
+--- 1-Hop Traversals (out) ---
+Random nodes                                  p50=      42ns p95=     167ns p99=     334ns max=   16.29us (13242683 ops/sec)
+
+--- Edge Exists ---
+Random edge exists                            p50=      42ns p95=      83ns p99=      84ns max=     791ns (23163591 ops/sec)
+node_vector() random                          p50=      83ns p95=     208ns p99=     292ns max=    1.92us (11999530 ops/sec)
+has_node_vector() random                      p50=      42ns p95=      42ns p99=      84ns max=     375ns (25458832 ops/sec)
+
+[6/6] Write benchmarks...
+
+--- Batch Writes (100 nodes) ---
+Batch of 100 nodes                            p50=   78.29us p95=   96.67us p99=  111.75us max=  111.75us (13159 ops/sec)
+
+--- Batch Writes (100 edges) ---
+Batch of 100 edges                            p50=   47.46us p95=   63.50us p99=   83.79us max=   83.79us (20221 ops/sec)
+
+--- Batch Writes (100 edges + props) ---
+Batch of 100 edges + props                    p50=  100.04us p95=  116.79us p99=  165.79us max=  165.79us (9750 ops/sec)
+### run 4/5 | exit 0 | 1s
+### run 5/5 | start 2026-10-03T07:38:18Z | load 3.82 5.81 5.12 | cpu busy before 6.5%
+========================================================================================================================
+Single-file Raw Benchmark (Rust)
+========================================================================================================================
+Nodes: 10,000
+Edges: 50,000
+Edge types: 3
+Edge props: 10
+Iterations: 10,000
+WAL size: 268,435,456 bytes
+Sync mode: Full
+MVCC: on
+Group commit: every commit
+Seed: 42
+Auto-checkpoint: false
+Checkpoint threshold: 0.8
+Vector dims: 128
+Vector count: 1,000
+Replication primary: false
+Skip checkpoint: false
+Reopen read-only: false
+========================================================================================================================
+
+[1/6] Building graph...
+  Creating nodes...
+  Created 5000 / 10000 nodes  Created 10000 / 10000 nodes
+  Creating edges...
+  Created 5000 / 50000 edges  Created 10000 / 50000 edges  Created 15000 / 50000 edges  Created 20000 / 50000 edges  Created 25000 / 50000 edges  Created 30000 / 50000 edges  Created 35000 / 50000 edges  Created 40000 / 50000 edges  Created 45000 / 50000 edges  Created 50000 / 50000 edges
+  Built in 50ms
+
+[2/6] Vector setup...
+
+--- Vector Operations ---
+Set vectors (batch 100)                       p50=  152.88us p95=  184.29us p99=  184.29us max=  184.29us (6546 ops/sec)
+
+[3/6] Checkpointing...
+  Checkpointed in 77ms
+
+[4/6] Key lookup benchmarks...
+
+--- Key Lookups (node_by_key) ---
+Random existing keys                          p50=      42ns p95=     167ns p99=     458ns max=   20.08us (12515081 ops/sec)
+
+[5/6] Traversal and edge benchmarks...
+
+--- 1-Hop Traversals (out) ---
+Random nodes                                  p50=      83ns p95=     167ns p99=     334ns max=    7.29us (12814024 ops/sec)
+
+--- Edge Exists ---
+Random edge exists                            p50=      42ns p95=      84ns p99=      84ns max=    2.67us (22026577 ops/sec)
+node_vector() random                          p50=      83ns p95=     167ns p99=     333ns max=    2.54us (12487840 ops/sec)
+has_node_vector() random                      p50=      42ns p95=      42ns p99=      84ns max=     292ns (25429504 ops/sec)
+
+[6/6] Write benchmarks...
+
+--- Batch Writes (100 nodes) ---
+Batch of 100 nodes                            p50=   63.00us p95=   88.96us p99=  110.21us max=  110.21us (15517 ops/sec)
+
+--- Batch Writes (100 edges) ---
+Batch of 100 edges                            p50=   48.38us p95=   79.96us p99=   93.54us max=   93.54us (18998 ops/sec)
+
+--- Batch Writes (100 edges + props) ---
+Batch of 100 edges + props                    p50=   98.71us p95=  114.50us p99=  169.21us max=  169.21us (9871 ops/sec)
+### run 5/5 | exit 0 | 0s

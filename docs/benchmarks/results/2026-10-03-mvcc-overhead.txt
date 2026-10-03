@@ -1,0 +1,38 @@
+# KiteDB benchmark log, written by ray-rs/scripts/bench-refresh.sh
+# name: mvcc-overhead
+# group: extra
+# command (from ray-rs/): cargo run --release --example mvcc_overhead_bench --no-default-features -- --nodes 20000 --threads 1,4,8 --duration-ms 1000 --repeat 5 --modes off,on
+# rounds: 1, interleaved with the other 32 configurations of this refresh
+# published value: per row, the line of the round with the median p50 (or rate); see ray-docs/scripts/benchmark-logs.ts
+# refresh started: 2026-10-03T07:14:28Z
+# commit: e3b064cb3be86dab3fe936ef469c2ccd71d20756 (e3b064c)
+# toolchain: rustc 1.88.0 (6b00bc388 2025-06-23), cargo 1.88.0 (873a06493 2025-05-10)
+# build: cargo build --release --no-default-features (profile.release: lto = true, codegen-units = 1)
+# machine: Apple M5 Pro, 15 cores (5 Super + 10 Performance), 48 GB
+# os: macOS 26.6 (25G5043d), Darwin 25.6.0, arm64
+# power: AC Power, energy mode high power
+# temp dir: /var/folders/48/tk2lgsfn76j4hc78m2yjkwvr0000gp/T (/dev/disk3s5)
+# load average at start: 5.40 4.30 3.63
+#
+### run 1/1 | start 2026-10-03T07:17:29Z | load 3.54 3.68 3.48 | cpu busy before 12.6%
+mvcc_overhead_bench: modes=off,on nodes=20000 edges/node=8 props/node=4 duration=1s repeat=5 history=2000x8 sync=Off cpus=15
+seeded 2 databases in 192.996208ms
+measured in 151.241410375s
+section op            threads metric              off           on   vs off
+reads   node_prop           1 reads/s        54611459     55313373    +1.3%
+reads   node_prop           4 reads/s        13692859     13610331    -0.6%
+reads   node_prop           8 reads/s        12602426     12558928    -0.3%
+reads   node_props          1 reads/s        11472083     11557836    +0.7%
+reads   node_props          4 reads/s         9393248      9554982    +1.7%
+reads   node_props          8 reads/s         8278123      8300567    +0.3%
+reads   out_edges           1 reads/s        11784933     11954730    +1.4%
+reads   out_edges           4 reads/s         9372530      9547935    +1.9%
+reads   out_edges           8 reads/s         7564744      7574963    +0.1%
+reads   tx_node_prop        1 reads/s        50212104     49300802    -1.8%
+reads   tx_node_prop        4 reads/s        12561543     12552374    -0.1%
+reads   tx_node_prop        8 reads/s        10469692     10421160    -0.5%
+mixed   node_prop       4r+1w reads/s         5748476      5442150    -5.3%
+mixed   update_prop     4r+1w commits/s        499038       510987    +2.4%
+writes  update_prop        1w commits/s       1495196      1262843   -15.5%
+writes  insert             1w commits/s        709628       584633   -17.6%
+### run 1/1 | exit 0 | 154s

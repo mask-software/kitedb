@@ -1,0 +1,64 @@
+# KiteDB benchmark log, written by ray-rs/scripts/bench-refresh.sh
+# name: vector-ann-768d-ivf
+# group: extra
+# command (from ray-rs/): cargo run --release --example vector_ann_bench --no-default-features -- --algorithm ivf --vectors 50000 --queries 200 --dimensions 768 --k 10 --n-probe 10 --dataset lowrank --seed 42
+# rounds: 3, interleaved with the other 32 configurations of this refresh
+# published value: per row, the line of the round with the median p50 (or rate); see ray-docs/scripts/benchmark-logs.ts
+# refresh started: 2026-10-03T07:14:28Z
+# commit: e3b064cb3be86dab3fe936ef469c2ccd71d20756 (e3b064c)
+# toolchain: rustc 1.88.0 (6b00bc388 2025-06-23), cargo 1.88.0 (873a06493 2025-05-10)
+# build: cargo build --release --no-default-features (profile.release: lto = true, codegen-units = 1)
+# machine: Apple M5 Pro, 15 cores (5 Super + 10 Performance), 48 GB
+# os: macOS 26.6 (25G5043d), Darwin 25.6.0, arm64
+# power: AC Power, energy mode high power
+# temp dir: /var/folders/48/tk2lgsfn76j4hc78m2yjkwvr0000gp/T (/dev/disk3s5)
+# load average at start: 5.40 4.30 3.63
+#
+### run 1/3 | start 2026-10-03T07:17:09Z | load 2.31 3.48 3.41 | cpu busy before 6.7%
+algorithm: ivf
+vectors: 50000
+dimensions: 768
+metric: Cosine
+dataset: lowrank
+blobs: 100
+queries: 200
+k: 10
+n_clusters: 223
+n_probe: 10
+build_elapsed_ms: 1277.000
+search_p50_ms: 0.552583
+search_p95_ms: 0.764541
+mean_recall_at_k: 1.000000
+### run 1/3 | exit 0 | 5s
+### run 2/3 | start 2026-10-03T07:22:56Z | load 4.19 4.12 3.78 | cpu busy before 5.2%
+algorithm: ivf
+vectors: 50000
+dimensions: 768
+metric: Cosine
+dataset: lowrank
+blobs: 100
+queries: 200
+k: 10
+n_clusters: 223
+n_probe: 10
+build_elapsed_ms: 1247.000
+search_p50_ms: 0.543625
+search_p95_ms: 0.717542
+mean_recall_at_k: 1.000000
+### run 2/3 | exit 0 | 5s
+### run 3/3 | start 2026-10-03T07:26:39Z | load 3.79 3.68 3.64 | cpu busy before 4.9%
+algorithm: ivf
+vectors: 50000
+dimensions: 768
+metric: Cosine
+dataset: lowrank
+blobs: 100
+queries: 200
+k: 10
+n_clusters: 223
+n_probe: 10
+build_elapsed_ms: 1228.000
+search_p50_ms: 0.531167
+search_p95_ms: 0.692916
+mean_recall_at_k: 1.000000
+### run 3/3 | exit 0 | 4s

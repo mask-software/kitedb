@@ -1,0 +1,140 @@
+# KiteDB benchmark log, written by ray-rs/scripts/bench-refresh.sh
+# name: sqlite-single-file-raw-edges-normal
+# group: site
+# command (from ray-rs/): python ../docs/benchmarks/sqlite_single_file_raw_bench.py --nodes 10000 --edges 50000 --iterations 10000 --wal-size 268435456 --sync-mode normal
+# rounds: 5, interleaved with the other 32 configurations of this refresh
+# published value: per row, the line of the round with the median p50 (or rate); see ray-docs/scripts/benchmark-logs.ts
+# refresh started: 2026-10-03T07:14:28Z
+# commit: e3b064cb3be86dab3fe936ef469c2ccd71d20756 (e3b064c)
+# toolchain: Python 3.12.8 (/Users/mask/code/raydb-b4/bench-refresh/ray-rs/.venv/bin/python), SQLite 3.47.1
+# machine: Apple M5 Pro, 15 cores (5 Super + 10 Performance), 48 GB
+# os: macOS 26.6 (25G5043d), Darwin 25.6.0, arm64
+# power: AC Power, energy mode high power
+# temp dir: /var/folders/48/tk2lgsfn76j4hc78m2yjkwvr0000gp/T (/dev/disk3s5)
+# load average at start: 5.40 4.30 3.63
+#
+### run 1/5 | start 2026-10-03T07:15:17Z | load 4.11 4.11 3.59 | cpu busy before 10.1%
+========================================================================================================================
+SQLite Benchmark (single-file raw)
+========================================================================================================================
+Nodes: 10000
+Edges: 50000
+Edge types: 3
+Edge props: 10
+Iterations: 10000
+WAL size: 268435456 bytes
+Sync mode: normal
+========================================================================================================================
+
+[1/2] Building graph...
+  Creating nodes...
+  Created 5000 / 10000 nodes  Created 10000 / 10000 nodes
+  Creating edges...
+  Created 5000 / 50000 edges  Created 10000 / 50000 edges  Created 15000 / 50000 edges  Created 20000 / 50000 edges  Created 25000 / 50000 edges  Created 30000 / 50000 edges  Created 35000 / 50000 edges  Created 40000 / 50000 edges  Created 45000 / 50000 edges  Created 50000 / 50000 edges
+  Built in 853ms
+
+[2/2] Write benchmarks...
+
+--- Batch Writes (100 nodes) ---
+Batch of 100 nodes                       p50= 150.79us p95= 177.62us p99= 201.29us max= 201.29us (6564 ops/sec)
+### run 1/5 | exit 0 | 1s
+### run 2/5 | start 2026-10-03T07:21:04Z | load 3.33 4.03 3.71 | cpu busy before 7.1%
+========================================================================================================================
+SQLite Benchmark (single-file raw)
+========================================================================================================================
+Nodes: 10000
+Edges: 50000
+Edge types: 3
+Edge props: 10
+Iterations: 10000
+WAL size: 268435456 bytes
+Sync mode: normal
+========================================================================================================================
+
+[1/2] Building graph...
+  Creating nodes...
+  Created 5000 / 10000 nodes  Created 10000 / 10000 nodes
+  Creating edges...
+  Created 5000 / 50000 edges  Created 10000 / 50000 edges  Created 15000 / 50000 edges  Created 20000 / 50000 edges  Created 25000 / 50000 edges  Created 30000 / 50000 edges  Created 35000 / 50000 edges  Created 40000 / 50000 edges  Created 45000 / 50000 edges  Created 50000 / 50000 edges
+  Built in 874ms
+
+[2/2] Write benchmarks...
+
+--- Batch Writes (100 nodes) ---
+Batch of 100 nodes                       p50= 151.62us p95= 187.54us p99= 224.29us max= 224.29us (6470 ops/sec)
+### run 2/5 | exit 0 | 1s
+### run 3/5 | start 2026-10-03T07:24:13Z | load 3.53 3.88 3.71 | cpu busy before 6.2%
+========================================================================================================================
+SQLite Benchmark (single-file raw)
+========================================================================================================================
+Nodes: 10000
+Edges: 50000
+Edge types: 3
+Edge props: 10
+Iterations: 10000
+WAL size: 268435456 bytes
+Sync mode: normal
+========================================================================================================================
+
+[1/2] Building graph...
+  Creating nodes...
+  Created 5000 / 10000 nodes  Created 10000 / 10000 nodes
+  Creating edges...
+  Created 5000 / 50000 edges  Created 10000 / 50000 edges  Created 15000 / 50000 edges  Created 20000 / 50000 edges  Created 25000 / 50000 edges  Created 30000 / 50000 edges  Created 35000 / 50000 edges  Created 40000 / 50000 edges  Created 45000 / 50000 edges  Created 50000 / 50000 edges
+  Built in 873ms
+
+[2/2] Write benchmarks...
+
+--- Batch Writes (100 nodes) ---
+Batch of 100 nodes                       p50= 158.33us p95= 186.46us p99= 214.79us max= 214.79us (6238 ops/sec)
+### run 3/5 | exit 0 | 1s
+### run 4/5 | start 2026-10-03T07:27:56Z | load 3.39 3.73 3.67 | cpu busy before 6.1%
+========================================================================================================================
+SQLite Benchmark (single-file raw)
+========================================================================================================================
+Nodes: 10000
+Edges: 50000
+Edge types: 3
+Edge props: 10
+Iterations: 10000
+WAL size: 268435456 bytes
+Sync mode: normal
+========================================================================================================================
+
+[1/2] Building graph...
+  Creating nodes...
+  Created 5000 / 10000 nodes  Created 10000 / 10000 nodes
+  Creating edges...
+  Created 5000 / 50000 edges  Created 10000 / 50000 edges  Created 15000 / 50000 edges  Created 20000 / 50000 edges  Created 25000 / 50000 edges  Created 30000 / 50000 edges  Created 35000 / 50000 edges  Created 40000 / 50000 edges  Created 45000 / 50000 edges  Created 50000 / 50000 edges
+  Built in 864ms
+
+[2/2] Write benchmarks...
+
+--- Batch Writes (100 nodes) ---
+Batch of 100 nodes                       p50= 148.62us p95= 186.50us p99= 234.12us max= 234.12us (6565 ops/sec)
+### run 4/5 | exit 0 | 1s
+### run 5/5 | start 2026-10-03T07:31:19Z | load 4.31 3.96 3.77 | cpu busy before 5.8%
+========================================================================================================================
+SQLite Benchmark (single-file raw)
+========================================================================================================================
+Nodes: 10000
+Edges: 50000
+Edge types: 3
+Edge props: 10
+Iterations: 10000
+WAL size: 268435456 bytes
+Sync mode: normal
+========================================================================================================================
+
+[1/2] Building graph...
+  Creating nodes...
+  Created 5000 / 10000 nodes  Created 10000 / 10000 nodes
+  Creating edges...
+  Created 5000 / 50000 edges  Created 10000 / 50000 edges  Created 15000 / 50000 edges  Created 20000 / 50000 edges  Created 25000 / 50000 edges  Created 30000 / 50000 edges  Created 35000 / 50000 edges  Created 40000 / 50000 edges  Created 45000 / 50000 edges  Created 50000 / 50000 edges
+  Built in 864ms
+
+[2/2] Write benchmarks...
+
+--- Batch Writes (100 nodes) ---
+Batch of 100 nodes                       p50= 156.00us p95= 187.38us p99= 202.79us max= 202.79us (6349 ops/sec)
+### run 5/5 | exit 0 | 1s

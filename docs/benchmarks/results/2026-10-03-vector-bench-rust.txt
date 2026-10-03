@@ -1,0 +1,216 @@
+# KiteDB benchmark log, written by ray-rs/scripts/bench-refresh.sh
+# name: vector-bench-rust
+# group: site
+# command (from ray-rs/): cargo run --release --example vector_bench --no-default-features -- --vectors 10000 --iterations 1000 --dimensions 768 --k 10 --n-probe 10 --seed 42 --no-output
+# rounds: 5, interleaved with the other 32 configurations of this refresh
+# published value: per row, the line of the round with the median p50 (or rate); see ray-docs/scripts/benchmark-logs.ts
+# refresh started: 2026-10-03T07:14:28Z
+# commit: e3b064cb3be86dab3fe936ef469c2ccd71d20756 (e3b064c)
+# toolchain: rustc 1.88.0 (6b00bc388 2025-06-23), cargo 1.88.0 (873a06493 2025-05-10)
+# build: cargo build --release --no-default-features (profile.release: lto = true, codegen-units = 1)
+# machine: Apple M5 Pro, 15 cores (5 Super + 10 Performance), 48 GB
+# os: macOS 26.6 (25G5043d), Darwin 25.6.0, arm64
+# power: AC Power, energy mode high power
+# temp dir: /var/folders/48/tk2lgsfn76j4hc78m2yjkwvr0000gp/T (/dev/disk3s5)
+# load average at start: 5.40 4.30 3.63
+#
+### run 1/5 | start 2026-10-03T07:15:21Z | load 3.86 4.06 3.58 | cpu busy before 5.6%
+========================================================================================================================
+Vector Index Benchmark (Rust)
+========================================================================================================================
+Vectors: 10,000
+Dimensions: 768
+Iterations: 1,000
+k: 10
+nProbe: 10
+Seed: 42
+========================================================================================================================
+
+--- Vector Index Benchmarks (Rust) ---
+
+  Insert benchmarks:
+Set (10,000 vectors)                     p50=    1.04us p95=    2.29us p99=    4.79us (707,478 ops/sec)
+  Total set time: 14.38ms (695,525 vectors/sec)
+
+  Index build:
+  build_index(): 83.88ms
+
+  Lookup benchmarks:
+Random get                               p50=     166ns p95=     292ns p99=     417ns (6,558,968 ops/sec)
+
+  Search benchmarks:
+Search (k=10, nProbe=10)                 p50=  135.00us p95=  168.58us p99=  197.88us (7,267 ops/sec)
+
+  Index stats:
+    Total vectors: 10,000
+    Live vectors: 10,000
+    Dimensions: 768
+    Metric: Cosine
+    Index trained: true
+    Index clusters: 100
+    Index algorithm: Ivf
+
+========================================================================================================================
+Vector benchmark complete.
+========================================================================================================================
+### run 1/5 | exit 0 | 1s
+### run 2/5 | start 2026-10-03T07:21:09Z | load 3.14 3.98 3.70 | cpu busy before 4.9%
+========================================================================================================================
+Vector Index Benchmark (Rust)
+========================================================================================================================
+Vectors: 10,000
+Dimensions: 768
+Iterations: 1,000
+k: 10
+nProbe: 10
+Seed: 42
+========================================================================================================================
+
+--- Vector Index Benchmarks (Rust) ---
+
+  Insert benchmarks:
+Set (10,000 vectors)                     p50=     834ns p95=    1.71us p99=    2.21us (929,182 ops/sec)
+  Total set time: 10.96ms (912,187 vectors/sec)
+
+  Index build:
+  build_index(): 86.67ms
+
+  Lookup benchmarks:
+Random get                               p50=     166ns p95=     375ns p99=     500ns (5,895,184 ops/sec)
+
+  Search benchmarks:
+Search (k=10, nProbe=10)                 p50=  159.67us p95=  201.96us p99=  229.96us (6,139 ops/sec)
+
+  Index stats:
+    Total vectors: 10,000
+    Live vectors: 10,000
+    Dimensions: 768
+    Metric: Cosine
+    Index trained: true
+    Index clusters: 100
+    Index algorithm: Ivf
+
+========================================================================================================================
+Vector benchmark complete.
+========================================================================================================================
+### run 2/5 | exit 0 | 0s
+### run 3/5 | start 2026-10-03T07:24:18Z | load 3.41 3.85 3.70 | cpu busy before 8.5%
+========================================================================================================================
+Vector Index Benchmark (Rust)
+========================================================================================================================
+Vectors: 10,000
+Dimensions: 768
+Iterations: 1,000
+k: 10
+nProbe: 10
+Seed: 42
+========================================================================================================================
+
+--- Vector Index Benchmarks (Rust) ---
+
+  Insert benchmarks:
+Set (10,000 vectors)                     p50=     792ns p95=    1.67us p99=    2.25us (956,063 ops/sec)
+  Total set time: 10.65ms (939,375 vectors/sec)
+
+  Index build:
+  build_index(): 84.88ms
+
+  Lookup benchmarks:
+Random get                               p50=     166ns p95=     334ns p99=     500ns (6,347,554 ops/sec)
+
+  Search benchmarks:
+Search (k=10, nProbe=10)                 p50=  144.12us p95=  182.25us p99=  207.42us (6,787 ops/sec)
+
+  Index stats:
+    Total vectors: 10,000
+    Live vectors: 10,000
+    Dimensions: 768
+    Metric: Cosine
+    Index trained: true
+    Index clusters: 100
+    Index algorithm: Ivf
+
+========================================================================================================================
+Vector benchmark complete.
+========================================================================================================================
+### run 3/5 | exit 0 | 0s
+### run 4/5 | start 2026-10-03T07:28:01Z | load 3.20 3.69 3.66 | cpu busy before 8.9%
+========================================================================================================================
+Vector Index Benchmark (Rust)
+========================================================================================================================
+Vectors: 10,000
+Dimensions: 768
+Iterations: 1,000
+k: 10
+nProbe: 10
+Seed: 42
+========================================================================================================================
+
+--- Vector Index Benchmarks (Rust) ---
+
+  Insert benchmarks:
+Set (10,000 vectors)                     p50=     834ns p95=    1.71us p99=    2.92us (907,512 ops/sec)
+  Total set time: 11.21ms (892,074 vectors/sec)
+
+  Index build:
+  build_index(): 87.58ms
+
+  Lookup benchmarks:
+Random get                               p50=     166ns p95=     292ns p99=     417ns (6,272,267 ops/sec)
+
+  Search benchmarks:
+Search (k=10, nProbe=10)                 p50=  142.71us p95=  182.96us p99=  208.58us (6,843 ops/sec)
+
+  Index stats:
+    Total vectors: 10,000
+    Live vectors: 10,000
+    Dimensions: 768
+    Metric: Cosine
+    Index trained: true
+    Index clusters: 100
+    Index algorithm: Ivf
+
+========================================================================================================================
+Vector benchmark complete.
+========================================================================================================================
+### run 4/5 | exit 0 | 0s
+### run 5/5 | start 2026-10-03T07:31:24Z | load 4.05 3.91 3.76 | cpu busy before 6.4%
+========================================================================================================================
+Vector Index Benchmark (Rust)
+========================================================================================================================
+Vectors: 10,000
+Dimensions: 768
+Iterations: 1,000
+k: 10
+nProbe: 10
+Seed: 42
+========================================================================================================================
+
+--- Vector Index Benchmarks (Rust) ---
+
+  Insert benchmarks:
+Set (10,000 vectors)                     p50=     792ns p95=    1.62us p99=    1.88us (984,036 ops/sec)
+  Total set time: 10.35ms (965,977 vectors/sec)
+
+  Index build:
+  build_index(): 84.73ms
+
+  Lookup benchmarks:
+Random get                               p50=     166ns p95=     292ns p99=     417ns (6,722,599 ops/sec)
+
+  Search benchmarks:
+Search (k=10, nProbe=10)                 p50=  153.29us p95=  188.58us p99=  217.71us (6,436 ops/sec)
+
+  Index stats:
+    Total vectors: 10,000
+    Live vectors: 10,000
+    Dimensions: 768
+    Metric: Cosine
+    Index trained: true
+    Index clusters: 100
+    Index algorithm: Ivf
+
+========================================================================================================================
+Vector benchmark complete.
+========================================================================================================================
+### run 5/5 | exit 0 | 0s
