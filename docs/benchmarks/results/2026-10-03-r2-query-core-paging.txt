@@ -1,0 +1,112 @@
+# KiteDB benchmark log, written by ray-rs/scripts/bench-refresh.sh
+# name: query-core-paging
+# group: extra
+# command (from ray-rs/): cargo run --release --example query_core_bench --no-default-features -- --sections paging,types,hub --nodes 1000000 --page 1000 --type-nodes 100000 --hub-edges 200000 --repeat 7 --edges-per-node 5 --limit 100 --mvcc
+# rounds: 3, interleaved with the other 32 configurations of this refresh
+# published value: per row, the line of the round with the median p50 (or rate); see ray-docs/scripts/benchmark-logs.ts
+# refresh started: 2026-10-03T10:31:13Z
+# commit: 5460a2cdc8180ae9115532ca09466dc8fd04853f (5460a2c)
+# toolchain: rustc 1.88.0 (6b00bc388 2025-06-23), cargo 1.88.0 (873a06493 2025-05-10)
+# build: cargo build --release --no-default-features (profile.release: lto = true, codegen-units = 1)
+# machine: Apple M5 Pro, 15 cores (5 Super + 10 Performance), 48 GB
+# os: macOS 26.6 (25G5043d), Darwin 25.6.0, arm64
+# power: AC Power, energy mode high power
+# temp dir: /var/folders/48/tk2lgsfn76j4hc78m2yjkwvr0000gp/T (/dev/disk3s5)
+# load average at start: 4.46 5.02 5.03
+#
+### run 1/3 | start 2026-10-03T10:36:05Z | load 4.49 4.82 4.97 | cpu busy before 9.6%
+MVCC: on
+paging: 1000000 nodes, 5000000 edges, page size 100, pages 1 and 1000
+  delta    nodes page 1                                 median          0.5 us   min          0.5 us
+  delta    nodes page 1000                              median          0.5 us   min          0.5 us
+  delta    edges page 1                                 median          0.4 us   min          0.4 us
+  delta    edges page 1000                              median          0.5 us   min          0.4 us
+  delta    count_nodes (page total)                     median          0.0 us   min          0.0 us
+  delta    count_edges (page total)                     median          0.0 us   min          0.0 us
+  snapshot nodes page 1                                 median          0.5 us   min          0.4 us
+  snapshot nodes page 1000                              median          0.5 us   min          0.5 us
+  snapshot edges page 1                                 median          0.7 us   min          0.7 us
+  snapshot edges page 1000                              median          0.8 us   min          0.8 us
+  snapshot count_nodes (page total)                     median          0.0 us   min          0.0 us
+  snapshot count_edges (page total)                     median          0.0 us   min          0.0 us
+types: 100000 nodes over 5 types, all(T2) and count_nodes_by_type(T2)
+  delta    all(T2).count()                              median       2923.5 us   min       2328.9 us
+  delta    count_nodes_by_type(T2)                      median       2620.8 us   min       2371.7 us
+  snapshot all(T2).count()                              median       1945.2 us   min       1812.7 us
+  snapshot count_nodes_by_type(T2)                      median       1859.1 us   min       1832.7 us
+hub: take(1) from a node with 200000 out-edges
+  delta    from(hub).out(None).take(1)                  median          1.4 us   min          0.3 us
+  delta    from(hub).out(LINK).take(1)                  median          0.3 us   min          0.2 us
+  delta    neighbors_out(hub) (all edges)               median        276.9 us   min        248.1 us
+  delta    neighbors_out(hub, LINK) (all edges)         median        252.5 us   min        248.4 us
+  delta    from(hub).out(None).to_vec() (all)           median       2698.9 us   min       2611.2 us
+  snapshot from(hub).out(None).take(1)                  median          0.3 us   min          0.3 us
+  snapshot from(hub).out(LINK).take(1)                  median          0.4 us   min          0.4 us
+  snapshot neighbors_out(hub) (all edges)               median        278.0 us   min        158.2 us
+  snapshot neighbors_out(hub, LINK) (all edges)         median        261.1 us   min        226.0 us
+  snapshot from(hub).out(None).to_vec() (all)           median       2532.7 us   min       2451.1 us
+### run 1/3 | exit 0 | 3s
+### run 2/3 | start 2026-10-03T10:42:31Z | load 4.74 5.15 5.16 | cpu busy before 13.2%
+MVCC: on
+paging: 1000000 nodes, 5000000 edges, page size 100, pages 1 and 1000
+  delta    nodes page 1                                 median          0.5 us   min          0.5 us
+  delta    nodes page 1000                              median          0.6 us   min          0.5 us
+  delta    edges page 1                                 median          0.5 us   min          0.4 us
+  delta    edges page 1000                              median          0.5 us   min          0.5 us
+  delta    count_nodes (page total)                     median          0.0 us   min          0.0 us
+  delta    count_edges (page total)                     median          0.0 us   min          0.0 us
+  snapshot nodes page 1                                 median          0.4 us   min          0.4 us
+  snapshot nodes page 1000                              median          0.5 us   min          0.5 us
+  snapshot edges page 1                                 median          0.6 us   min          0.6 us
+  snapshot edges page 1000                              median          0.8 us   min          0.8 us
+  snapshot count_nodes (page total)                     median          0.0 us   min          0.0 us
+  snapshot count_edges (page total)                     median          0.0 us   min          0.0 us
+types: 100000 nodes over 5 types, all(T2) and count_nodes_by_type(T2)
+  delta    all(T2).count()                              median       2636.9 us   min       2257.2 us
+  delta    count_nodes_by_type(T2)                      median       2641.0 us   min       2046.6 us
+  snapshot all(T2).count()                              median       1904.8 us   min       1888.1 us
+  snapshot count_nodes_by_type(T2)                      median       2010.4 us   min       1951.0 us
+hub: take(1) from a node with 200000 out-edges
+  delta    from(hub).out(None).take(1)                  median          0.4 us   min          0.3 us
+  delta    from(hub).out(LINK).take(1)                  median          0.3 us   min          0.2 us
+  delta    neighbors_out(hub) (all edges)               median        292.4 us   min        288.2 us
+  delta    neighbors_out(hub, LINK) (all edges)         median        311.2 us   min        285.3 us
+  delta    from(hub).out(None).to_vec() (all)           median       2759.5 us   min       2693.2 us
+  snapshot from(hub).out(None).take(1)                  median          0.4 us   min          0.3 us
+  snapshot from(hub).out(LINK).take(1)                  median          0.4 us   min          0.3 us
+  snapshot neighbors_out(hub) (all edges)               median        166.7 us   min        155.5 us
+  snapshot neighbors_out(hub, LINK) (all edges)         median        279.9 us   min        279.4 us
+  snapshot from(hub).out(None).to_vec() (all)           median       2569.2 us   min       2527.8 us
+### run 2/3 | exit 0 | 3s
+### run 3/3 | start 2026-10-03T10:48:19Z | load 4.80 5.14 5.23 | cpu busy before 11.1%
+MVCC: on
+paging: 1000000 nodes, 5000000 edges, page size 100, pages 1 and 1000
+  delta    nodes page 1                                 median          0.5 us   min          0.5 us
+  delta    nodes page 1000                              median          0.5 us   min          0.5 us
+  delta    edges page 1                                 median          0.4 us   min          0.4 us
+  delta    edges page 1000                              median          0.5 us   min          0.4 us
+  delta    count_nodes (page total)                     median          0.0 us   min          0.0 us
+  delta    count_edges (page total)                     median          0.0 us   min          0.0 us
+  snapshot nodes page 1                                 median          0.4 us   min          0.4 us
+  snapshot nodes page 1000                              median          0.5 us   min          0.5 us
+  snapshot edges page 1                                 median          0.5 us   min          0.5 us
+  snapshot edges page 1000                              median          0.8 us   min          0.7 us
+  snapshot count_nodes (page total)                     median          0.0 us   min          0.0 us
+  snapshot count_edges (page total)                     median          0.0 us   min          0.0 us
+types: 100000 nodes over 5 types, all(T2) and count_nodes_by_type(T2)
+  delta    all(T2).count()                              median       2332.5 us   min       1983.2 us
+  delta    count_nodes_by_type(T2)                      median       2076.2 us   min       1780.5 us
+  snapshot all(T2).count()                              median       1991.4 us   min       1855.0 us
+  snapshot count_nodes_by_type(T2)                      median       1877.5 us   min       1852.3 us
+hub: take(1) from a node with 200000 out-edges
+  delta    from(hub).out(None).take(1)                  median          0.3 us   min          0.3 us
+  delta    from(hub).out(LINK).take(1)                  median          0.3 us   min          0.2 us
+  delta    neighbors_out(hub) (all edges)               median        273.8 us   min        241.3 us
+  delta    neighbors_out(hub, LINK) (all edges)         median        251.2 us   min        248.0 us
+  delta    from(hub).out(None).to_vec() (all)           median       2827.5 us   min       2764.8 us
+  snapshot from(hub).out(None).take(1)                  median          0.4 us   min          0.3 us
+  snapshot from(hub).out(LINK).take(1)                  median          0.4 us   min          0.3 us
+  snapshot neighbors_out(hub) (all edges)               median        155.5 us   min        152.0 us
+  snapshot neighbors_out(hub, LINK) (all edges)         median        278.5 us   min        159.0 us
+  snapshot from(hub).out(None).to_vec() (all)           median       2585.1 us   min       2550.1 us
+### run 3/3 | exit 0 | 4s
