@@ -90,14 +90,20 @@ fn group_committed_transaction_does_not_make_background_cuts_decline() {
   }
 }
 
-/// Group commit batches: when many committers (MVCC, so writers are not
-/// serialized) commit at once, one header write covers several commits.
+/// Group commit batches: commits that arrive while a group is written wait in
+/// the queue and go out together as the next group, with one header write.
 /// Guard for the leader/queue design wave 2 introduced (the old design slept
 /// its window holding the commit lock, so no commit could join a batch).
+///
+/// Deterministic: each round's first committer leads and stops inside its
+/// durable step (`DURING_NEXT_COMMIT_IO`) until the round's other committers
+/// are queued behind it. (Committers released together by a barrier rarely
+/// overlap a leader's write on a machine with few CPUs, so a version of this
+/// test that counted headers after such commits saw tiny groups there.)
 #[test]
 fn group_commit_batches_concurrent_commits_guard() {
   const THREADS: usize = 8;
-  const ROUNDS: usize = 50;
+  const ROUNDS: usize = 10;
   let dir = tempdir().expect("tempdir");
   let db = Arc::new(
     open_single_file(
@@ -106,32 +112,63 @@ fn group_commit_batches_concurrent_commits_guard() {
     )
     .expect("open"),
   );
-  let headers_before = db.header.read().change_counter;
-  let ready = Arc::new(std::sync::Barrier::new(THREADS));
-  let writers: Vec<_> = (0..THREADS)
-    .map(|writer| {
-      let (db, ready) = (Arc::clone(&db), Arc::clone(&ready));
+  let commit = |db: &SingleFileDB, key: String| -> Result<()> {
+    db.begin(false)?;
+    db.create_node(Some(&key))?;
+    db.commit()
+  };
+  for round in 0..ROUNDS {
+    let headers_before = db.header.read().change_counter;
+    let (in_io_tx, in_io_rx) = mpsc::channel::<()>();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let leader = {
+      let db = Arc::clone(&db);
       std::thread::spawn(move || {
-        for round in 0..ROUNDS {
-          db.begin(false).expect("begin");
-          db.create_node(Some(&format!("w{writer}-{round}")))
-            .expect("create");
-          // Everyone commits at once.
-          ready.wait();
-          db.commit().expect("commit");
-        }
+        DURING_NEXT_COMMIT_IO.with(|hook| {
+          *hook.borrow_mut() = Some(Box::new(move || {
+            in_io_tx.send(()).expect("signal the durable step");
+            go_rx.recv().expect("wait for the queued commits");
+          }));
+        });
+        commit(&db, format!("r{round}-leader"))
       })
-    })
-    .collect();
-  for writer in writers {
-    writer.join().expect("writer");
+    };
+    in_io_rx.recv().expect("the leader in its durable step");
+    let followers: Vec<_> = (1..THREADS)
+      .map(|writer| {
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || commit(&db, format!("r{round}-w{writer}")))
+      })
+      .collect();
+    // Every follower hands its commit over; with queueing working, each is
+    // queued behind the leader. Without it, the header count below fails.
+    wait_until("every follower to hand its commit over", || {
+      db.commits_waiting.load(Ordering::SeqCst) == THREADS
+    });
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut queued = db.commit_queue.state.lock().queued.len();
+    while queued < THREADS - 1 && Instant::now() < deadline {
+      std::thread::sleep(Duration::from_millis(1));
+      queued = db.commit_queue.state.lock().queued.len();
+    }
+    go_tx.send(()).expect("release the leader");
+    leader.join().expect("leader").expect("leader commit");
+    for follower in followers {
+      follower.join().expect("follower").expect("follower commit");
+    }
+    let header_writes = db.header.read().change_counter - headers_before;
+    assert_eq!(
+      header_writes,
+      2,
+      "round {round}: a leader's commit and the {} commits that arrived during its write ({queued} \
+       of them queued) wrote {header_writes} headers, not 2 (one per group): little or nothing \
+       was batched",
+      THREADS - 1
+    );
+    for key in std::iter::once(format!("r{round}-leader"))
+      .chain((1..THREADS).map(|writer| format!("r{round}-w{writer}")))
+    {
+      assert!(db.node_by_key(&key).is_some(), "{key} is not visible");
+    }
   }
-  let header_writes = db.header.read().change_counter - headers_before;
-  let commits = (THREADS * ROUNDS) as u64;
-  println!("group commit: {commits} commits, {header_writes} header writes");
-  assert!(
-    header_writes * 4 <= commits * 3,
-    "{commits} group commits arriving together wrote {header_writes} headers: little or \
-     nothing was batched"
-  );
 }
