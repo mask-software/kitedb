@@ -35,6 +35,8 @@ pub struct MvccManager {
   /// history, lowered by GC, both under the version chain write lock.
   history_ts: Arc<AtomicU64>,
   /// GC's retention period (`GcConfig::retention_ms`), for `history_horizon`.
+  /// Fixed when the manager is made: commits note their times only if it is
+  /// above 0 (`TxManager::set_wall_clock_tracking`).
   retention_ms: u64,
   gc_stop: Arc<AtomicBool>,
   /// Wakes the GC thread from its sleep between runs on stop
@@ -50,11 +52,12 @@ impl MvccManager {
   /// Create a new MVCC manager
   pub fn new(initial_tx_id: TxId, initial_commit_ts: Timestamp, gc_config: GcConfig) -> Self {
     let retention_ms = gc_config.retention_ms;
+    let mut tx_manager = TxManager::with_initial(initial_tx_id, initial_commit_ts);
+    // Without a retention period no horizon needs commit times, and a
+    // commit reads no clock.
+    tx_manager.set_wall_clock_tracking(retention_ms > 0);
     Self {
-      tx_manager: Arc::new(Mutex::new(TxManager::with_initial(
-        initial_tx_id,
-        initial_commit_ts,
-      ))),
+      tx_manager: Arc::new(Mutex::new(tx_manager)),
       version_chain: Arc::new(RwLock::new(VersionChainManager::new())),
       conflict_detector: ConflictDetector::new(),
       gc: Arc::new(Mutex::new(GarbageCollector::with_config(gc_config))),

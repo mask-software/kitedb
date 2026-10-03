@@ -161,6 +161,14 @@ pub(crate) struct CommitRequest {
   staged_schema: SchemaStaging,
   /// The committing thread; its test hooks fire only there.
   committer: ThreadId,
+  /// Key sets MVCC released at its commit's group
+  /// (`TxManager::commit_tx_releasing`), handed back with the request: its
+  /// committer's thread keeps a few to reuse as its next transactions' read
+  /// and write sets, and frees the rest (`TxSpares::keep_request`). A group
+  /// shares its released sets out among its members, so each committer gets
+  /// about as many as its commits release. Empty, with its capacity kept,
+  /// between commits.
+  released_keys: Vec<TxKeySet>,
 }
 
 /// A transaction's MVCC reads and writes, and their key groups, handed to
@@ -184,8 +192,6 @@ pub(crate) struct CommitOutcome {
   /// its committer to keep for its next transaction (`TxSpares`), on the
   /// thread that allocated it.
   leftovers: Option<Box<CommitRequest>>,
-  /// Key sets MVCC released, for the committer to free off the commit path.
-  _released_keys: Vec<TxKeySet>,
 }
 
 impl CommitOutcome {
@@ -195,7 +201,6 @@ impl CommitOutcome {
       schema_published: false,
       result: Err(error),
       leftovers: None,
-      _released_keys: Vec::new(),
     }
   }
 }
@@ -519,7 +524,8 @@ struct DurableCommit {
 
 /// What a thread keeps of its last settled transaction for its next one:
 /// the transaction's state, its pending delta and record buffers (emptied,
-/// their capacity kept), its commit request and its queue ticket. Each comes
+/// their capacity kept), its commit request and its queue ticket, and the
+/// MVCC key sets its commits got back (emptied). Each but the key sets comes
 /// back to the thread that allocated it (a commit's request returns with its
 /// outcome), so a small transaction allocates little, and its committer
 /// frees nothing a leader on another thread would otherwise free.
@@ -531,6 +537,9 @@ struct TxSpares {
   records: Vec<u8>,
   request: Option<Box<CommitRequest>>,
   ticket: Option<Arc<CommitTicket>>,
+  /// Empty MVCC key sets with room for keys, for a write transaction's
+  /// reads and writes (at most `SPARE_KEY_SETS`).
+  key_sets: Vec<TxKeySet>,
 }
 
 /// Record buffers above this capacity, and pending deltas with room for more
@@ -538,6 +547,10 @@ struct TxSpares {
 /// better freed than held by its thread.
 const SPARE_BUFFER_MAX: usize = 64 * 1024;
 const SPARE_DELTA_MAX: usize = 256;
+/// MVCC key sets a thread keeps for its next transaction (its reads and its
+/// writes), each with room for at most `SPARE_KEY_SET_MAX` keys.
+const SPARE_KEY_SETS: usize = 2;
+const SPARE_KEY_SET_MAX: usize = 256;
 
 thread_local! {
   static TX_SPARES: std::cell::RefCell<TxSpares> = std::cell::RefCell::new(TxSpares::default());
@@ -566,7 +579,8 @@ impl TxSpares {
   }
 
   /// Keep what is left of a settled commit's request for the thread's next
-  /// transactions.
+  /// transactions, and some of the key sets its group released (see
+  /// `keep_key_sets`); the others are freed.
   fn keep_request(mut request: Box<CommitRequest>) {
     let mut pending = std::mem::take(&mut request.pending);
     let pending_wal = std::mem::take(&mut request.pending_wal);
@@ -581,6 +595,8 @@ impl TxSpares {
       }
       Self::keep_buffer(&mut spares.pending_wal, pending_wal);
       Self::keep_buffer(&mut spares.records, records);
+      spares.keep_key_sets_here(request.released_keys.drain(..));
+      request.released_keys.clear();
       spares.request = Some(request);
     });
   }
@@ -590,6 +606,33 @@ impl TxSpares {
     if Arc::get_mut(&mut state).is_some() {
       Self::with(|spares| spares.state = Some(state));
     }
+  }
+
+  /// Keep `sets` for this thread's next transactions' MVCC reads and writes,
+  /// emptied, while it keeps fewer than `SPARE_KEY_SETS`; the others, and
+  /// sets with room for more than `SPARE_KEY_SET_MAX` keys, are freed.
+  fn keep_key_sets(sets: impl IntoIterator<Item = TxKeySet>) {
+    let mut sets = sets.into_iter();
+    Self::with(|spares| spares.keep_key_sets_here(sets.by_ref()));
+  }
+
+  /// `keep_key_sets` on these spares; the sets it does not keep are left
+  /// in `sets`, for the caller to free outside them.
+  fn keep_key_sets_here(&mut self, sets: impl Iterator<Item = TxKeySet>) {
+    for mut set in sets {
+      if self.key_sets.len() >= SPARE_KEY_SETS {
+        break;
+      }
+      if set.capacity() > 0 && set.capacity() <= SPARE_KEY_SET_MAX {
+        set.clear();
+        self.key_sets.push(set);
+      }
+    }
+  }
+
+  /// A kept MVCC key set, empty, or a new one.
+  fn key_set(&mut self) -> TxKeySet {
+    self.key_sets.pop().unwrap_or_default()
   }
 
   /// A queue ticket for a commit of this thread: the kept one if no leader
@@ -622,6 +665,9 @@ struct LeaderScratch {
   staged: Vec<(usize, Box<CommitRequest>)>,
   commit_records: Vec<(u64, TxId)>,
   durable: Vec<DurableCommit>,
+  /// Key sets a round's MVCC commits released, until shared out among its
+  /// members' requests (`CommitRequest::released_keys`).
+  released: Vec<TxKeySet>,
 }
 
 thread_local! {
@@ -646,6 +692,7 @@ impl LeaderScratch {
     self.staged.clear();
     self.commit_records.clear();
     self.durable.clear();
+    self.released.clear();
     let _ = LEADER_SCRATCH.try_with(|scratch| *scratch.borrow_mut() = self);
   }
 }
@@ -977,22 +1024,31 @@ impl SingleFileDB {
 
     let mut tx_state = SingleFileTxState::new(txid, read_only, snapshot_ts, bulk_load);
     tx_state.writer = writer_claim.as_ref().map(|claim| claim.mode());
+    // An MVCC write transaction notes what it reads and writes in key sets
+    // its thread's earlier commits got back (`CommitRequest::released_keys`).
+    let key_sets = self.mvcc.is_some() && tx_state.tracks_reads();
     // This thread's last transaction's state and buffers, if it kept them.
     let kept = TxSpares::with(|spares| {
       let buffers = (!read_only).then(|| {
+        let keys = key_sets.then(|| (spares.key_set(), spares.key_set()));
         (
           spares.pending.take(),
           std::mem::take(&mut spares.pending_wal),
+          keys,
         )
       });
       (spares.state.take(), buffers)
     });
     let (kept_state, kept_buffers) = kept.unwrap_or_default();
-    if let Some((pending, pending_wal)) = kept_buffers {
+    if let Some((pending, pending_wal, keys)) = kept_buffers {
       if let Some(pending) = pending {
         tx_state.pending = pending;
       }
       tx_state.pending_wal = pending_wal;
+      if let Some((reads, writes)) = keys {
+        tx_state.mvcc_reads = reads;
+        tx_state.mvcc_writes = writes;
+      }
     }
     let tx_state = match kept_state {
       Some(mut kept) => match Arc::get_mut(&mut kept) {
@@ -1562,21 +1618,26 @@ impl SingleFileDB {
       // check, in its group's (`write_commit_round`).
       let reads = std::mem::take(&mut tx.mvcc_reads);
       let writes = std::mem::take(&mut tx.mvcc_writes);
-      let mvcc_keys =
-        (self.mvcc.is_some() && !(reads.is_empty() && writes.is_empty())).then(|| {
-          // Grouped here, without any lock: with other transactions open, the
-          // check and the commit, which every other commit waits for, then
-          // look up and note groups instead of keys. Alone, it commits with no
-          // check and nothing to note.
-          let groups = (reads.len() + writes.len() >= crate::mvcc::KEY_GROUPS_MIN_KEYS
-            && self.active_transactions.load(Ordering::Acquire) > 1)
-            .then(|| TxKeyGroups::of(&reads, &writes));
-          MvccKeys {
-            reads,
-            writes,
-            groups,
-          }
-        });
+      let mvcc_keys = if self.mvcc.is_none() || (reads.is_empty() && writes.is_empty()) {
+        // Nothing to check: the sets go back to the thread's spares.
+        if reads.capacity() > 0 || writes.capacity() > 0 {
+          TxSpares::keep_key_sets([reads, writes]);
+        }
+        None
+      } else {
+        // Grouped here, without any lock: with other transactions open, the
+        // check and the commit, which every other commit waits for, then
+        // look up and note groups instead of keys. Alone, it commits with no
+        // check and nothing to note.
+        let groups = (reads.len() + writes.len() >= crate::mvcc::KEY_GROUPS_MIN_KEYS
+          && self.active_transactions.load(Ordering::Acquire) > 1)
+          .then(|| TxKeyGroups::of(&reads, &writes));
+        Some(MvccKeys {
+          reads,
+          writes,
+          groups,
+        })
+      };
       (
         tx.txid,
         tx.read_only,
@@ -1659,10 +1720,15 @@ impl SingleFileDB {
       pending_wal,
       staged_schema,
       committer: std::thread::current().id(),
+      released_keys: Vec::new(),
     };
     let request = match TxSpares::with(|spares| spares.request.take()).flatten() {
       Some(mut kept) => {
-        *kept = request;
+        let released_keys = std::mem::take(&mut kept.released_keys);
+        *kept = CommitRequest {
+          released_keys,
+          ..request
+        };
         kept
       }
       None => Box::new(request),
@@ -1812,7 +1878,7 @@ impl SingleFileDB {
       }
       prof::end(Stage::ReleaseLead, release_mark);
       let publish_mark = prof::start();
-      self.publish_commits(&mut round.durable, &mut outcomes);
+      self.publish_commits(&mut round.durable, &mut outcomes, &mut scratch.released);
       drop(publish_guard);
       scratch.durable = std::mem::take(&mut round.durable);
       prof::end(Stage::Publish, publish_mark);
@@ -2269,6 +2335,7 @@ impl SingleFileDB {
     &self,
     round: &mut Vec<DurableCommit>,
     outcomes: &mut [Option<CommitOutcome>],
+    released: &mut Vec<TxKeySet>,
   ) {
     if round.is_empty() {
       return;
@@ -2298,7 +2365,7 @@ impl SingleFileDB {
     prof::end(Stage::PublishDeltaWait, delta_mark);
     let _publishing = PublishSection::enter(&self.publish_seq);
     let mvcc_mark = prof::start();
-    let (mut released_keys, horizon) = self.commit_in_mvcc(round);
+    let horizon = self.commit_in_mvcc(round, released);
     prof::end(Stage::PublishMvcc, mvcc_mark);
     let mut history = PublishHistory::default();
     for commit in round.iter_mut() {
@@ -2344,13 +2411,24 @@ impl SingleFileDB {
     drop(_publishing);
     drop(delta);
 
-    for commit in round.drain(..) {
+    // Each member takes back as many of the released key sets as a small
+    // commit releases (its read and write sets), the last all the rest.
+    let members = round.len();
+    for (position, mut commit) in round.drain(..).enumerate() {
+      let share = if position + 1 == members {
+        released.len()
+      } else {
+        SPARE_KEY_SETS.min(released.len())
+      };
+      let request = &mut commit.request;
+      request
+        .released_keys
+        .extend(released.drain(released.len() - share..));
       outcomes[commit.index] = Some(CommitOutcome {
         durable: true,
         schema_published: commit.schema_published,
         result: commit.published.map(|()| commit.token),
         leftovers: Some(commit.request),
-        _released_keys: std::mem::take(&mut released_keys),
       });
     }
   }
@@ -2369,19 +2447,19 @@ impl SingleFileDB {
   /// Commit `round`'s transactions in MVCC, in order, if enabled, at their
   /// durable point: each gets its commit timestamp, and whether a
   /// transaction that may still read was active once it committed (which
-  /// then needs version chains); a failure becomes its result. Returns the
-  /// key sets the commits released, to free without the locks, and the
-  /// history horizon after them (`MvccManager::history_horizon`). Callers
-  /// hold the delta in a publish section (see `publish_commits`) and staged
-  /// them (`check_and_stage_in_mvcc`).
-  fn commit_in_mvcc(&self, round: &mut [DurableCommit]) -> (Vec<TxKeySet>, Timestamp) {
+  /// then needs version chains); a failure becomes its result. Adds the key
+  /// sets the commits released to `released`, to reuse or free without the
+  /// locks, and returns the history horizon after them
+  /// (`MvccManager::history_horizon`). Callers hold the delta in a publish
+  /// section (see `publish_commits`) and staged them
+  /// (`check_and_stage_in_mvcc`).
+  fn commit_in_mvcc(&self, round: &mut [DurableCommit], released: &mut Vec<TxKeySet>) -> Timestamp {
     let Some(mvcc) = self.mvcc.as_ref() else {
-      return (Vec::new(), 0);
+      return 0;
     };
     let mut tx_mgr = lock_tx_manager(mvcc);
-    let mut released = Vec::new();
     for commit in round.iter_mut() {
-      match tx_mgr.commit_tx_releasing(commit.request.txid, &mut released) {
+      match tx_mgr.commit_tx_releasing(commit.request.txid, released) {
         Ok(commit_ts) => commit.mvcc_commit = Some((commit_ts, tx_mgr.has_open_readers())),
         Err(error) => {
           if commit.published.is_ok() {
@@ -2394,12 +2472,11 @@ impl SingleFileDB {
     let records_history = round
       .iter()
       .any(|commit| matches!(commit.mvcc_commit, Some((_, true))));
-    let horizon = if records_history {
+    if records_history {
       mvcc.history_horizon(&tx_mgr)
     } else {
       0
-    };
-    (released, horizon)
+    }
   }
 
   /// Rollback the current transaction
@@ -2424,10 +2501,23 @@ impl SingleFileDB {
     &self,
     tx_handle: &Arc<Mutex<SingleFileTxState>>,
   ) -> Result<()> {
-    let (txid, read_only, wal_begun, writer) = {
+    let (txid, read_only, wal_begun, writer, key_sets) = {
       let mut tx = tx_handle.lock();
-      (tx.txid, tx.read_only, tx.wal_begun, tx.writer.take())
+      let key_sets = [
+        std::mem::take(&mut tx.mvcc_reads),
+        std::mem::take(&mut tx.mvcc_writes),
+      ];
+      (
+        tx.txid,
+        tx.read_only,
+        tx.wal_begun,
+        tx.writer.take(),
+        key_sets,
+      )
     };
+    if key_sets.iter().any(|set| set.capacity() > 0) {
+      TxSpares::keep_key_sets(key_sets);
+    }
     let _active_transaction_guard = ActiveTransactionGuard {
       db: self,
       txid,

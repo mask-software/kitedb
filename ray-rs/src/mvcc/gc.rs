@@ -115,7 +115,9 @@ impl GarbageCollector {
     &self.config
   }
 
-  /// Update the configuration
+  /// Update the configuration. A retention period set here takes effect
+  /// only for a manager made with one above 0: commits note their times for
+  /// it only then (see `MvccManager::new`).
   pub fn set_config(&mut self, config: GcConfig) {
     self.config = config;
   }

@@ -444,7 +444,7 @@ pub struct OpenOptions {
   pub lock_file: bool,
   pub mvcc: bool,
   pub mvcc_gc_interval_ms: Option<u64>,    // Default: 5000
-  pub mvcc_retention_ms: Option<u64>,      // Default: 60000
+  pub mvcc_retention_ms: Option<u64>,      // Default: 0 (none)
   pub mvcc_max_chain_depth: Option<usize>, // Default: 10
 
   // Single-file options

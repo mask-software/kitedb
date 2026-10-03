@@ -109,17 +109,16 @@ fn b4_wc_small_mvcc_commit_allocates_as_much_as_without_mvcc() {
 }
 
 /// An MVCC commit that creates a keyed node, sets a prop on it and adds an
-/// edge allocates only the shared copy of the node's key its write set holds
-/// more than without MVCC: its key sets, grown to about ten keys, are reused.
+/// edge allocates no more than without MVCC either: its key sets, grown to
+/// about ten keys, are reused.
 #[test]
-fn b4_wc_mvcc_insert_commit_allocates_only_its_key_more() {
+fn b4_wc_mvcc_insert_commit_allocates_as_much_as_without_mvcc() {
   let off = allocations_per_commit(false, insert);
   let on = allocations_per_commit(true, insert);
   println!("insert commit: {off:.2} allocations without MVCC, {on:.2} with");
   assert!(
-    on <= off + 1.05,
-    "an MVCC insert commit allocated {on:.2} times, {:.2} more than without MVCC ({off:.2}; at \
-     most its key's copy, 1, more expected)",
+    on <= off + 0.05,
+    "an MVCC insert commit allocated {on:.2} times, {:.2} more than without MVCC ({off:.2})",
     on - off
   );
 }

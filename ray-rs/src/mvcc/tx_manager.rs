@@ -114,8 +114,12 @@ pub struct TxManager {
   /// The first commit timestamp of each wall clock millisecond (since the
   /// epoch) that had a commit, oldest first, for the retention horizon. The
   /// times never decrease: a commit while the clock stepped back counts as
-  /// the newest entry's millisecond.
+  /// the newest entry's millisecond. Kept only while `track_wall_clock`.
   commit_wall_clock: VecDeque<(Timestamp, u64)>,
+  /// Commits note their time in `commit_wall_clock`. Off when the retention
+  /// period is 0 (`MvccManager::new`), whose horizon needs no times: a
+  /// commit then reads no clock.
+  track_wall_clock: bool,
   /// Some recent commit is `unindexed`.
   has_unindexed: bool,
   /// Staged transactions (`stage_commit`), in staging order, with the
@@ -153,6 +157,7 @@ impl TxManager {
       committed_writes_log: VecDeque::new(),
       newest_indexed_ts: 0,
       commit_wall_clock: VecDeque::new(),
+      track_wall_clock: true,
       has_unindexed: false,
       staged: VecDeque::new(),
       total_pruned: 0,
@@ -303,7 +308,13 @@ impl TxManager {
         "transaction {txid} is staged already"
       )));
     }
-    let writes = std::mem::take(&mut tx.write_set);
+    // An empty write set (with room for keys) stays with the transaction,
+    // and goes back with its read set when it commits.
+    let writes = if tx.write_set.is_empty() {
+      TxKeySet::new()
+    } else {
+      std::mem::take(&mut tx.write_set)
+    };
     let key_groups = self.tx_key_groups.remove(&txid);
     self.staged.push_back((txid, commit_ts));
     // With no transaction open but the staged ones (and this), none checks
@@ -407,19 +418,27 @@ impl TxManager {
 
     // Track wall clock time for the retention horizon: the first commit of
     // each millisecond stands for the rest.
-    let now = current_time_ms();
-    if self
-      .commit_wall_clock
-      .back()
-      .is_none_or(|&(_, last)| now > last)
-    {
-      self.commit_wall_clock.push_back((commit_ts, now));
+    if self.track_wall_clock {
+      let now = current_time_ms();
+      if self
+        .commit_wall_clock
+        .back()
+        .is_none_or(|&(_, last)| now > last)
+      {
+        self.commit_wall_clock.push_back((commit_ts, now));
+      }
     }
 
     // Only a transaction that began before a commit can conflict with it:
-    // with none open, nothing kept can conflict any more.
-    if !tx.read_set.is_empty() {
+    // with none open, nothing kept can conflict any more. Its read set goes
+    // back, and so does a staged one's write set if it was empty (sets with
+    // room for keys can be reused).
+    if tx.read_set.capacity() > 0 {
       released.push(tx.read_set);
+    }
+    let mut writes = tx.write_set;
+    if staged && writes.capacity() > 0 {
+      released.push(std::mem::take(&mut writes));
     }
     if self.active_txs.is_empty() {
       // Staged transactions are active, so none is left.
@@ -433,7 +452,7 @@ impl TxManager {
       return Ok(commit_ts);
     }
     if !staged {
-      self.index_recent_commit(commit_ts, tx.write_set, key_groups);
+      self.index_recent_commit(commit_ts, writes, key_groups);
     }
     self.prune_recent_commits(released);
     Ok(commit_ts)
@@ -686,8 +705,19 @@ impl TxManager {
     self.next_commit_ts = commit_ts;
   }
 
+  /// Whether commits note their wall clock time, which
+  /// `retention_horizon_ts` needs for a retention period above 0 (on by
+  /// default). Turning it off forgets the times noted.
+  pub fn set_wall_clock_tracking(&mut self, track: bool) {
+    self.track_wall_clock = track;
+    if !track {
+      self.commit_wall_clock.clear();
+    }
+  }
+
   /// Get the oldest commit timestamp younger than the retention period (the
-  /// next commit timestamp when none is)
+  /// next commit timestamp when none is, or when commits note no wall clock
+  /// time: see `set_wall_clock_tracking`)
   pub fn retention_horizon_ts(&self, retention_ms: u64) -> Timestamp {
     let cutoff_time = current_time_ms().saturating_sub(retention_ms);
     let first_retained = self
