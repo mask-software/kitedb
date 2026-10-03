@@ -2482,15 +2482,20 @@ impl SingleFileDB {
     // commit releases (its read and write sets), the last all the rest.
     let members = round.len();
     for (position, mut commit) in round.drain(..).enumerate() {
-      let share = if position + 1 == members {
-        released.len()
-      } else {
-        SPARE_KEY_SETS.min(released.len())
-      };
       let request = &mut commit.request;
-      request
-        .released_keys
-        .extend(released.drain(released.len() - share..));
+      if position + 1 == members && request.released_keys.is_empty() {
+        // The rest whole, by swapping buffers: nothing is copied.
+        std::mem::swap(&mut request.released_keys, released);
+      } else {
+        let share = if position + 1 == members {
+          released.len()
+        } else {
+          SPARE_KEY_SETS.min(released.len())
+        };
+        request
+          .released_keys
+          .extend(released.drain(released.len() - share..));
+      }
       outcomes[commit.index] = Some(CommitOutcome {
         durable: true,
         schema_published: commit.schema_published,
