@@ -75,8 +75,11 @@ fn run_group<R: Send + 'static>(db: &Arc<SingleFileDB>, members: Vec<Member<R>>)
       BEFORE_NEXT_COMMIT_LOCK.with(|hook| {
         *hook.borrow_mut() = Some(Box::new(move || {
           leading.store(true, Ordering::SeqCst);
+          // Queued, not just handed over: a member counts as waiting just
+          // before it queues, and one caught between would form a group of
+          // its own.
           wait_until("every member to queue", || {
-            hook_db.commits_waiting.load(Ordering::SeqCst) == count
+            hook_db.commit_queue.state.lock().queued.len() == count - 1
           });
         }));
       });
@@ -88,13 +91,13 @@ fn run_group<R: Send + 'static>(db: &Arc<SingleFileDB>, members: Vec<Member<R>>)
   let mut followers = Vec::new();
   for (index, member) in members.enumerate() {
     let member_db = Arc::clone(db);
-    let queued = db.commits_waiting.load(Ordering::SeqCst);
+    let queued = db.commit_queue.state.lock().queued.len();
     followers.push(std::thread::spawn(move || member(&member_db)));
     // Queue them one at a time, so their order in the group is this one.
     // (Once the last one queues, the group is written and leaves the queue.)
     if index + 2 < count {
       wait_until("the member to queue", || {
-        db.commits_waiting.load(Ordering::SeqCst) > queued
+        db.commit_queue.state.lock().queued.len() > queued
       });
     }
   }

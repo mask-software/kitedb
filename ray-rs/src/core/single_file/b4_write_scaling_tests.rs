@@ -68,8 +68,11 @@ fn run_group<R: Send + 'static>(db: &Arc<SingleFileDB>, members: Vec<Member<R>>)
     let hook_db = Arc::clone(&leader_db);
     BEFORE_NEXT_COMMIT_LOCK.with(|hook| {
       *hook.borrow_mut() = Some(Box::new(move || {
+        // Queued, not just handed over: a member counts as waiting just
+        // before it queues, and one caught between would form a group of
+        // its own.
         wait_until("every member to queue", || {
-          hook_db.commits_waiting.load(Ordering::SeqCst) == count
+          hook_db.commit_queue.state.lock().queued.len() == count - 1
         });
       }));
     });
