@@ -57,6 +57,9 @@ thread_local! {
   pub(crate) static EDGES_EXAMINED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
   /// Point reads of one node's key or labels on this thread.
   pub(crate) static NODE_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+  /// Edges that reads checked one by one against the layers above the snapshot (the
+  /// delta, the transaction, the version history) on this thread.
+  pub(crate) static OVERLAY_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Count `n` node entries visited (test instrumentation).
@@ -80,6 +83,13 @@ pub(super) fn examined_edges(n: usize) {
 fn node_lookup() {
   #[cfg(test)]
   NODE_LOOKUPS.with(|count| count.set(count.get() + 1));
+}
+
+/// Count one edge checked against the layers above the snapshot (test instrumentation).
+#[inline]
+pub(super) fn overlay_check() {
+  #[cfg(test)]
+  OVERLAY_CHECKS.with(|count| count.set(count.get() + 1));
 }
 
 /// Which layers' state of a node a reader sees: its transaction's pending
@@ -401,6 +411,7 @@ impl<'a> ReadView<'a> {
       .unwrap_or_default()
       .inspect(|_| examined_edges(1))
       .filter_map(|(etype, other)| {
+        overlay_check();
         if !layers.sees_snapshot(other, self.node_mvcc(other)) {
           return None;
         }
@@ -432,6 +443,7 @@ impl<'a> ReadView<'a> {
     let has_delta = delta_added.is_some();
     let has_pending = pending_added.is_some();
     let mut from_delta = patches(delta_added).filter(|&(etype, other)| {
+      overlay_check();
       let (src, etype, dst) = edge(etype, other);
       layers.sees_delta(other, self.node_mvcc(other))
         && self.edge_mvcc(src, etype, dst) != Some(false)
@@ -1187,6 +1199,7 @@ impl SingleFileDB {
       {
         for (dst_phys, etype) in snap.iter_out_edges(phys) {
           examined_edges(1);
+          overlay_check();
           // Convert physical dst to NodeId
           if let Some(dst_node_id) = snap.node_id(dst_phys) {
             // Skip edges to deleted nodes
@@ -1220,6 +1233,7 @@ impl SingleFileDB {
     {
       examined_edges(added_edges.len());
       for edge_patch in added_edges {
+        overlay_check();
         // Skip edges to deleted nodes
         let dst_visible = vc_guard
           .as_ref()
@@ -1345,6 +1359,7 @@ impl SingleFileDB {
       {
         for (src_phys, etype, _out_index) in snap.iter_in_edges(phys) {
           examined_edges(1);
+          overlay_check();
           // Convert physical src to NodeId
           if let Some(src_node_id) = snap.node_id(src_phys) {
             // Skip edges from deleted nodes
@@ -1378,6 +1393,7 @@ impl SingleFileDB {
     {
       examined_edges(added_edges.len());
       for edge_patch in added_edges {
+        overlay_check();
         // Skip edges from deleted nodes
         let src_visible = vc_guard
           .as_ref()

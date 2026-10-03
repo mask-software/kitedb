@@ -496,6 +496,7 @@ impl UnsortedSources<'_> {
       }
     };
     for layer in std::iter::once(layers.delta).chain(layers.pending) {
+      examined_nodes(layer.out_add.len());
       layer.out_add.keys().copied().for_each(&mut offer);
     }
     if let Some(vc) = self.view.history {
@@ -695,6 +696,7 @@ impl SingleFileDB {
       let mvcc = mvcc_visible(node_id);
       from_elsewhere(node_id, mvcc) && !from_snapshot(node_id, mvcc)
     };
+    examined_nodes(delta.created_nodes.len());
     count += delta
       .created_nodes
       .keys()
@@ -995,3 +997,7 @@ impl SingleFileDB {
 #[cfg(test)]
 #[path = "b4_query_core_tests.rs"]
 mod b4_query_core_tests;
+
+#[cfg(test)]
+#[path = "b4_read_paths_tests.rs"]
+mod b4_read_paths_tests;
