@@ -81,6 +81,12 @@ static CHECKPOINT_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
 /// Background checkpoint cuts attempted, per database path.
 #[cfg(test)]
 static CHECKPOINT_TEST_CUTS: OnceLock<Mutex<HashMap<std::path::PathBuf, usize>>> = OnceLock::new();
+/// Bytes of snapshot pages written (checkpoints, optimize, vacuum and WAL
+/// resize copies), per database path: the I/O a checkpoint costs outside the
+/// WAL and the header pages.
+#[cfg(test)]
+static CHECKPOINT_TEST_SNAPSHOT_BYTES: OnceLock<Mutex<HashMap<std::path::PathBuf, u64>>> =
+  OnceLock::new();
 /// A delay armed for one named step of checkpoints on the database at a path.
 #[cfg(test)]
 type CheckpointTestDelay = (std::path::PathBuf, &'static str, Duration);
@@ -161,6 +167,29 @@ fn checkpoint_test_cuts(db: &SingleFileDB) -> usize {
     .get_or_init(|| Mutex::new(HashMap::new()))
     .lock()
     .expect("checkpoint test cut counter lock")
+    .get(db.path())
+    .copied()
+    .unwrap_or(0)
+}
+
+#[cfg(test)]
+fn count_checkpoint_test_snapshot_bytes(db_path: &std::path::Path, bytes: u64) {
+  *CHECKPOINT_TEST_SNAPSHOT_BYTES
+    .get_or_init(|| Mutex::new(HashMap::new()))
+    .lock()
+    .expect("checkpoint test snapshot byte counter lock")
+    .entry(db_path.to_path_buf())
+    .or_default() += bytes;
+}
+
+/// Bytes of snapshot pages written to `db`'s file so far (see
+/// `CHECKPOINT_TEST_SNAPSHOT_BYTES`).
+#[cfg(test)]
+fn checkpoint_test_snapshot_bytes(db: &SingleFileDB) -> u64 {
+  CHECKPOINT_TEST_SNAPSHOT_BYTES
+    .get_or_init(|| Mutex::new(HashMap::new()))
+    .lock()
+    .expect("checkpoint test snapshot byte counter lock")
     .get(db.path())
     .copied()
     .unwrap_or(0)
@@ -1873,6 +1902,8 @@ impl SingleFileDB {
         padded[..buffer.len() - offset].copy_from_slice(&buffer[offset..]);
         write(base + offset as u64, &padded)?;
       }
+      #[cfg(test)]
+      count_checkpoint_test_snapshot_bytes(&self.path, (end - offset) as u64);
       self.reach_checkpoint_phase(CheckpointPhase::SnapshotPageWritten)?;
       offset = end;
     }
@@ -5136,3 +5167,9 @@ mod b4_commit_pipeline_tests;
 #[cfg(test)]
 #[path = "b4_fsync_group_checkpoint_tests.rs"]
 mod b4_fsync_group_tests;
+
+/// raydb-b4 `checkpoint-cost` lane: bulk-load checkpoint cost, commits
+/// waiting for checkpoints, and file size after a checkpoint.
+#[cfg(test)]
+#[path = "b4_checkpoint_cost_tests.rs"]
+mod b4_checkpoint_cost_tests;
