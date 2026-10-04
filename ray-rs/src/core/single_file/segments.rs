@@ -629,6 +629,7 @@ impl SingleFileDB {
     then: impl FnOnce(),
   ) -> Result<SpillOutcome> {
     let _commit_guard = self.lock_commits();
+    self.ensure_writes_allowed()?;
     let mut pager = self.pager.lock();
     let mut wal = self.wal_buffer.lock();
     let mut header = self.header.write();

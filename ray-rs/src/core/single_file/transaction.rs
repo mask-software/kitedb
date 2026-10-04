@@ -62,7 +62,7 @@ use super::mvcc_history::{record_commit, HistoryPlan};
 use super::open::SyncMode;
 use super::segments::{SpillOutcome, COMMITTED_IN_WAL};
 use super::writer_slot::WriterMode;
-use super::{SchemaStaging, SingleFileDB, SingleFileTxState};
+use super::{SchemaStaging, SingleFileDB, SingleFileTxState, WriteSection};
 use crate::core::pager::FilePager;
 use crate::core::wal::buffer::{SealedWrites, WalBuffer};
 
@@ -1922,7 +1922,7 @@ impl SingleFileDB {
       #[cfg(feature = "bench-profile")]
       let commit_lock_start = Instant::now();
       let lock_mark = prof::start();
-      let commit_guard = self.commit_lock.lock();
+      let commit_guard = self.write_section("the commit lock", self.commit_lock.lock());
       prof::end(Stage::CommitLockWait, lock_mark);
       #[cfg(feature = "bench-profile")]
       self.commit_lock_wait_ns.fetch_add(
@@ -1932,7 +1932,8 @@ impl SingleFileDB {
 
       let mut round = self.write_commit_round(queue, &mut outcomes, scratch);
       let publish_lock_mark = prof::start();
-      let publish_guard = self.publish_lock.lock();
+      // Its commits are durable; the publish puts them in the delta.
+      let publish_guard = self.write_section("the publish lock", self.publish_lock.lock());
       prof::end(Stage::PublishLockWait, publish_lock_mark);
       drop(commit_guard);
       let release_mark = prof::start();
@@ -1964,8 +1965,8 @@ impl SingleFileDB {
   /// that need the delta, the vector stores and the WAL to agree
   /// (checkpoints, exports, backups, vector store creation) take this instead
   /// of the bare commit lock: a commit publishes after it releases it.
-  pub(crate) fn lock_commits(&self) -> parking_lot::MutexGuard<'_, ()> {
-    let commit_guard = self.commit_lock.lock();
+  pub(crate) fn lock_commits(&self) -> WriteSection<'_, parking_lot::MutexGuard<'_, ()>> {
+    let commit_guard = self.write_section("the commit lock", self.commit_lock.lock());
     drop(self.publish_lock.lock());
     commit_guard
   }

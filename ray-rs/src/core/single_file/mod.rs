@@ -312,6 +312,35 @@ impl SingleFileDB {
   }
 }
 
+/// A lock held over writes that keep memory and disk in step: the commit
+/// lock (`SingleFileDB::lock_commits`, a commit round's), the publish lock
+/// and the exclusive checkpoint gate (`exclusive_checkpoint_gate`). Every
+/// write to a page a header names, or is about to name, happens under one of
+/// them (or while closing). A panic may strike between such writes, and
+/// whoever catches it (a caller, the Python bindings, the checkpoint thread)
+/// could go on writing; so a section that a panic's unwinding releases first
+/// makes the handle refuse writes (`KiteError::WritesRefused`), and writers
+/// check the refusal once they hold the lock: none writes after it.
+pub(crate) struct WriteSection<'db, G> {
+  db: &'db SingleFileDB,
+  lock: &'static str,
+  /// Unarmed when taken while unwinding already (in a destructor): only a
+  /// panic within the section refuses writes.
+  armed: bool,
+  /// Released after `drop` below.
+  _guard: G,
+}
+
+impl<G> Drop for WriteSection<'_, G> {
+  fn drop(&mut self) {
+    if self.armed && std::thread::panicking() {
+      self
+        .db
+        .refuse_writes(format!("an operation panicked holding {}", self.lock));
+    }
+  }
+}
+
 /// The state of a single-file database, shared by its handles (see
 /// [`SingleFileDB`]).
 #[doc(hidden)]
@@ -440,7 +469,8 @@ pub struct SingleFileInner {
   pub(crate) checkpoint_installing: AtomicBool,
   /// The error of the checkpoint thread's last run, until one succeeds.
   pub(crate) checkpoint_last_error: Mutex<Option<String>>,
-  /// Why this handle refuses writes, once a checkpoint run panicked (see
+  /// Why this handle refuses writes, once an operation panicked in a
+  /// `WriteSection` or a checkpoint run panicked (see
   /// `KiteError::WritesRefused`). Set once: reads of it are one atomic load.
   pub(crate) writes_refused: std::sync::OnceLock<String>,
 
@@ -649,6 +679,17 @@ impl SingleFileDB {
     );
     if self.writes_refused.set(reason).is_ok() {
       eprintln!("Warning: {message}");
+    }
+  }
+
+  /// Hold `guard`, the lock `lock` names, over writes that keep memory and
+  /// disk in step: a `WriteSection`.
+  pub(crate) fn write_section<G>(&self, lock: &'static str, guard: G) -> WriteSection<'_, G> {
+    WriteSection {
+      db: self,
+      lock,
+      armed: !std::thread::panicking(),
+      _guard: guard,
     }
   }
 

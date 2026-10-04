@@ -70,11 +70,14 @@ pub enum KiteError {
   #[error("Checkpoint failed, and the WAL segments are full: {0}")]
   CheckpointFailed(String),
 
-  /// The database handle refuses writes for good: a checkpoint run on its
-  /// checkpoint thread panicked, possibly between writes that keep memory
-  /// and disk in step, so writing more could overwrite log records a durable
-  /// header still names. Reads go on; closing persists nothing; a reopen
-  /// recovers every acknowledged commit from disk.
+  /// The database handle refuses writes for good: an operation panicked
+  /// while holding the commit lock, the publish lock or the exclusive
+  /// checkpoint gate (a commit, a spill, a checkpoint, optimize, vacuum, a
+  /// WAL resize), or a checkpoint run panicked on the checkpoint thread,
+  /// possibly between writes that keep memory and disk in step, so writing
+  /// more could overwrite log records a durable header still names. Reads go
+  /// on; closing persists nothing; a reopen recovers every acknowledged
+  /// commit from disk.
   #[error("The database refuses writes until it is reopened: {0}")]
   WritesRefused(String),
 

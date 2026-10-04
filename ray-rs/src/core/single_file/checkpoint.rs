@@ -36,7 +36,7 @@ use super::open::map_snapshot_range;
 use super::recovery::committed_transactions;
 use super::recovery::{committed_transactions_after, replay_wal_record};
 use super::segments::{live_end_page, parse_whole_records, read_wal_segment};
-use super::{CheckpointStatus, SingleFileDB};
+use super::{CheckpointStatus, SingleFileDB, WriteSection};
 use crate::vector::ivf::serialize::validate_manifest_for_serialization;
 
 pub(crate) type GraphData = (
@@ -828,15 +828,21 @@ impl SingleFileDB {
   ///
   /// The caller is registered as a waiter throughout, so no background
   /// checkpoint starts meanwhile: it waits for at most the run in progress.
-  pub(crate) fn exclusive_checkpoint_gate(&self) -> Result<RwLockWriteGuard<'_, ()>> {
+  /// The gate is a write section (`WriteSection`): a panic while it is held
+  /// makes the handle refuse writes, and it fails with `WritesRefused` once
+  /// the handle does.
+  pub(crate) fn exclusive_checkpoint_gate(
+    &self,
+  ) -> Result<WriteSection<'_, RwLockWriteGuard<'_, ()>>> {
     self.checkpoint_state.lock().exclusive_waiters += 1;
     let _waiter = ExclusiveWaiter { db: self };
     loop {
-      let checkpoint_gate = self.checkpoint_gate.write();
+      let checkpoint_gate = self.write_section("the checkpoint gate", self.checkpoint_gate.write());
       // Only the test hook: this is not a checkpoint's progress point.
       checkpoint_phase(&self.path, CheckpointPhase::GateAcquired)?;
       if !self.is_checkpoint_running() {
         self.wait_for_no_active_transactions();
+        self.ensure_writes_allowed()?;
         return Ok(checkpoint_gate);
       }
       drop(checkpoint_gate);
@@ -1131,6 +1137,7 @@ impl SingleFileDB {
   /// hold the checkpoint gate.
   fn cut_log(&self) -> Result<Option<LogCut>> {
     let _commit_guard = self.lock_commits();
+    self.ensure_writes_allowed()?;
     let mut pager = self.pager.lock();
     let mut wal_buffer = self.wal_buffer.lock();
     let mut header = self.header.write();
@@ -1278,6 +1285,9 @@ impl SingleFileDB {
     // the install keeps.
     let _checkpoint_gate = self.checkpoint_gate.write();
     let _commit_guard = self.lock_commits();
+    self
+      .ensure_writes_allowed()
+      .inspect_err(|_| free_snapshot())?;
     // From here the install finishes even if the database is closing.
     let _installing = InstallingGuard::new(self);
     self

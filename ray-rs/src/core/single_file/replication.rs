@@ -456,6 +456,8 @@ impl SingleFileDB {
       let _checkpoint_gate = self.checkpoint_gate.read();
       let _commit_guard = self.lock_commits();
       if self.sync_mode == SyncMode::Off {
+        // What it persists may not match the file once writes are refused.
+        self.ensure_writes_allowed()?;
         self.persist_for_close()?;
       }
       (
