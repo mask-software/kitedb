@@ -1278,6 +1278,7 @@ fn open_single_file_internal(
     checkpoint_abandoned: AtomicBool::new(false),
     checkpoint_installing: AtomicBool::new(false),
     checkpoint_last_error: Mutex::new(None),
+    writes_refused: std::sync::OnceLock::new(),
     wal_segment_size,
     checkpoint_log_ratio: options.checkpoint_log_ratio,
     checkpoint_log_budget: options.checkpoint_log_budget,
@@ -1567,6 +1568,17 @@ pub fn close_single_file_with_options(
   // First: a run still building its snapshot is abandoned, one installing
   // finishes, and the thread ends (it holds a handle to the database).
   db.stop_checkpoint_thread();
+  if !db.read_only {
+    if let Err(error) = db.ensure_writes_allowed() {
+      // Memory may not match disk: persist nothing (and neither does drop).
+      // A reopen recovers every acknowledged commit from disk.
+      if let Some(ref mvcc) = db.mvcc {
+        mvcc.stop();
+      }
+      db.closed.store(true, Ordering::Release);
+      return Err(error);
+    }
+  }
   if let Some(threshold_raw) = options.checkpoint_if_wal_usage_at_least {
     if !threshold_raw.is_finite() {
       return Err(KiteError::Internal(format!(

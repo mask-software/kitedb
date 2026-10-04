@@ -7,10 +7,13 @@
 //! off, or on wasm32, where the auto-checkpoint runs inline as before). It
 //! holds a handle to the database (`SingleFileDB::shared_handle`) and sleeps
 //! until a commit asks for a checkpoint; it runs one, records its error if
-//! it fails (`SingleFileDB::checkpoint_error`; a panic in a run is caught and
-//! recorded too, and the thread goes on), and after a failure waits before
-//! running another (doubling from one second to a minute, however often it
-//! is asked meanwhile) instead of failing in a loop.
+//! it fails (`SingleFileDB::checkpoint_error`), and after a failure waits
+//! before running another (doubling from one second to a minute, however
+//! often it is asked meanwhile) instead of failing in a loop. A panic in a
+//! run is caught and recorded too; it may have struck between writes that
+//! keep memory and disk in step, so the handle refuses writes from then on
+//! (`KiteError::WritesRefused`; reads go on, and reopening recovers from
+//! disk), and the thread ends.
 //!
 //! Closing (or dropping) the database stops it: a run still building its
 //! snapshot stops at its next progress point (nothing names the pages it
@@ -86,18 +89,21 @@ impl SingleFileDB {
   /// Ask the checkpoint thread for a checkpoint, starting it if it is not
   /// running (or starting it again if it ended unexpectedly). Returns the
   /// request's number (see `checkpoint_request_answered`), or `None` once the
-  /// database is closing or if the thread cannot start.
+  /// database is closing or refuses writes, or if the thread cannot start.
   pub(crate) fn request_background_checkpoint(&self) -> Option<u64> {
     let mut thread = self.checkpoint_thread.lock();
-    if self.checkpoint_thread_stopped.load(Ordering::Acquire) {
+    if self.checkpoint_thread_stopped.load(Ordering::Acquire)
+      || self.ensure_writes_allowed().is_err()
+    {
       return None;
     }
     if thread
       .as_ref()
       .is_some_and(|thread| thread.handle.is_finished())
     {
-      // Only a stop ends the thread's loop, and a run's panic is caught; a
-      // thread gone otherwise would leave every request unanswered.
+      // Only a stop or a run's panic (caught; the handle refuses writes
+      // since, so no request gets here) ends the thread's loop; a thread
+      // gone otherwise would leave every request unanswered.
       // (Recorded without waking the writers waiting for segment space: one
       // of them may be the caller, holding their lock.)
       if let Some(ended) = thread.take() {
@@ -240,21 +246,37 @@ fn run_checkpoint_thread(db: SingleFileDB, signal: Arc<CheckpointSignal>) {
       requests.checkpoint = false;
     }
     let asked = signal.requests.lock().asked;
-    // A panic in a run is a failure like any other: recorded, and retried
-    // after the back-off. The run's guards have returned the checkpoint
-    // status to idle by then.
     let result =
-      std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| db.run_auto_checkpoint()))
-        .unwrap_or_else(|panic| {
+      match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| db.run_auto_checkpoint())) {
+        Ok(result) => result,
+        Err(panic) => {
+          // The run's guards have returned the checkpoint status to idle,
+          // but the panic may have struck between writes that keep memory
+          // and disk in step (a header written, the pages it names not yet
+          // marked; a spill's segment table and its WAL reset): the handle
+          // refuses writes from now on. Recorded as a failure, and the
+          // thread ends, answering every request made, and every one still
+          // to come (`stop`; none can come once writes are refused, but one
+          // may have checked just before).
           let message = panic
             .downcast_ref::<&str>()
             .map(|message| message.to_string())
             .or_else(|| panic.downcast_ref::<String>().cloned())
             .unwrap_or_else(|| "no message".to_string());
-          Err(KiteError::Internal(format!(
+          db.refuse_writes(format!("a checkpoint run panicked: {message}"));
+          db.record_checkpoint_result(&Err(KiteError::Internal(format!(
             "the checkpoint thread's run panicked: {message}"
-          )))
-        });
+          ))));
+          {
+            let mut requests = signal.requests.lock();
+            requests.answered = requests.asked;
+            requests.stop = true;
+            signal.wake.notify_all();
+          }
+          db.notify_segment_waiters();
+          return;
+        }
+      };
     db.record_checkpoint_result(&result);
     {
       let mut requests = signal.requests.lock();

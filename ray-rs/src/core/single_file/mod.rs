@@ -440,6 +440,9 @@ pub struct SingleFileInner {
   pub(crate) checkpoint_installing: AtomicBool,
   /// The error of the checkpoint thread's last run, until one succeeds.
   pub(crate) checkpoint_last_error: Mutex<Option<String>>,
+  /// Why this handle refuses writes, once a checkpoint run panicked (see
+  /// `KiteError::WritesRefused`). Set once: reads of it are one atomic load.
+  pub(crate) writes_refused: std::sync::OnceLock<String>,
 
   /// Bytes of a new WAL segment extent (see `segments`).
   pub(crate) wal_segment_size: u64,
@@ -560,6 +563,13 @@ impl Drop for SingleFileDB {
     if self.read_only || self.closed.load(Ordering::Acquire) {
       return;
     }
+    if let Err(error) = self.ensure_writes_allowed() {
+      eprintln!(
+        "Warning: {} was dropped without persisting anything: {error}",
+        self.path.display()
+      );
+      return;
+    }
     let persisted =
       std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.persist_for_close()));
     let failure = match persisted {
@@ -628,6 +638,26 @@ impl SingleFileDB {
       self.persist_header(&mut pager, &mut header, false)?;
     }
     pager.sync()
+  }
+
+  /// Refuse writes on this handle from now on (see
+  /// `KiteError::WritesRefused`); the first reason given stays.
+  pub(crate) fn refuse_writes(&self, reason: String) {
+    let message = format!(
+      "{} refuses writes from now on: {reason}",
+      self.path.display()
+    );
+    if self.writes_refused.set(reason).is_ok() {
+      eprintln!("Warning: {message}");
+    }
+  }
+
+  /// `WritesRefused` once this handle refuses writes.
+  pub(crate) fn ensure_writes_allowed(&self) -> Result<()> {
+    match self.writes_refused.get() {
+      Some(reason) => Err(crate::error::KiteError::WritesRefused(reason.clone())),
+      None => Ok(()),
+    }
   }
 
   pub(crate) fn transaction_finished(&self, txid: TxId, wrote_begin: bool) {

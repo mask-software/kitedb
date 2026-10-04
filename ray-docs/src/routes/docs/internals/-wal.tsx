@@ -808,7 +808,12 @@ export function WALPage() {
 				asks for another checkpoint, which the thread runs after its back-off.{" "}
 				<code>checkpointError()</code> (<code>checkpoint_error()</code> in
 				Python) returns the checkpoint's error. A panic in a checkpoint run is
-				reported the same way, and the thread goes on. A rollback never waits or
+				reported the same way; since it may have struck between writes that keep
+				memory and disk in step, the handle then refuses writes (
+				<code>The database refuses writes until it is reopened: ...</code>,{" "}
+				<code>WritesRefused</code>) and the thread ends. Reads go on, and
+				reopening the database recovers every acknowledged commit from disk. A
+				rollback never waits or
 				fails for log space: its record is not needed, since recovery drops a
 				transaction without a commit record.
 			</p>

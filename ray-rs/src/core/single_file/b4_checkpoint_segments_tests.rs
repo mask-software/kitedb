@@ -931,9 +931,17 @@ fn a_panic_on_the_checkpoint_thread_is_reported_and_writes_are_refused() {
   let mut acked = Vec::new();
   let mut index = 0;
   // The log reaches the checkpoint trigger (four WALs) after about 900
-  // commits; the thread's run then panics in its install.
+  // commits; the thread's run then panics in its install. A commit fails
+  // only once it is refused: the refusal comes just before the report.
   while checkpoint_thread_error(&db).is_none() && index < 3_000 {
-    acked.extend(commit_keys(&db, "a", index, 1));
+    let key = key("a", index);
+    match commit_key(&db, &key) {
+      Ok(()) => acked.push(key),
+      Err(error) => assert!(
+        error.to_string().contains("refuses writes"),
+        "a commit failed before the panic: {error}"
+      ),
+    }
     index += 1;
   }
   let deadline = Instant::now() + Duration::from_secs(5);
@@ -968,12 +976,9 @@ fn a_panic_on_the_checkpoint_thread_is_reported_and_writes_are_refused() {
     missing(&reopened, &acked).is_empty(),
     "the reopen lost commits"
   );
-  acked.extend(commit_keys(&reopened, "reopened", 0, 10));
-  assert_eq!(
-    acked.len(),
-    index + 10,
-    "the reopened database refused commits"
-  );
+  let after = commit_keys(&reopened, "reopened", 0, 10);
+  assert_eq!(after.len(), 10, "the reopened database refused commits");
+  acked.extend(after);
   reopened
     .checkpoint()
     .expect("a checkpoint after the reopen");

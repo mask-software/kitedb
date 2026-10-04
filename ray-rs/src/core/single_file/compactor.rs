@@ -136,6 +136,7 @@ impl SingleFileDB {
     if self.read_only {
       return Err(KiteError::ReadOnly);
     }
+    self.ensure_writes_allowed()?;
 
     if self.current_tx_handle().is_some() {
       return Err(KiteError::TransactionInProgress);
@@ -223,6 +224,7 @@ impl SingleFileDB {
     if self.read_only {
       return Err(KiteError::ReadOnly);
     }
+    self.ensure_writes_allowed()?;
 
     if self.current_tx_handle().is_some() {
       return Err(KiteError::TransactionInProgress);
@@ -275,6 +277,7 @@ impl SingleFileDB {
     if self.read_only {
       return Err(KiteError::ReadOnly);
     }
+    self.ensure_writes_allowed()?;
 
     if self.current_tx_handle().is_some() {
       return Err(KiteError::TransactionInProgress);

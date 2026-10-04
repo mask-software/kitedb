@@ -993,6 +993,9 @@ impl SingleFileDB {
     if self.read_only && !read_only {
       return Err(KiteError::ReadOnly);
     }
+    if !read_only {
+      self.ensure_writes_allowed()?;
+    }
     if bulk_load && read_only {
       return Err(KiteError::ReadOnly);
     }
@@ -1143,6 +1146,7 @@ impl SingleFileDB {
     &self,
     write: impl FnOnce(&mut WalBuffer) -> Result<T>,
   ) -> Result<WalWrite<T>> {
+    self.ensure_writes_allowed()?;
     let mut wal = self.wal_buffer.lock();
     match write(&mut wal) {
       Ok(value) => Ok(WalWrite::Written(value)),
@@ -1697,6 +1701,7 @@ impl SingleFileDB {
       slot: mvcc_open.map(|(slot, _)| slot),
       armed: true,
     };
+    self.ensure_writes_allowed()?;
 
     // The records it kept back go with its COMMIT record, in one batch, so a
     // WAL that refuses them is left without a partial copy: a bulk load's
@@ -1992,6 +1997,14 @@ impl SingleFileDB {
       durable: std::mem::take(&mut scratch.durable),
       ..CommitRound::default()
     };
+    // Commits queued before the handle began refusing writes fail too.
+    if self.ensure_writes_allowed().is_err() {
+      for (index, _) in queue.drain(..) {
+        let refused = self.ensure_writes_allowed().expect_err("refused above");
+        outcomes[index] = Some(CommitOutcome::failed(refused));
+      }
+      return round;
+    }
     let checks_mark = prof::start();
     // Vector checks read the stores, which a group still publishing may be
     // changing (creating one, or adding to it): let it finish first.
@@ -2646,7 +2659,11 @@ impl SingleFileDB {
     // A transaction with no record in the WAL leaves nothing to roll back
     // there: its records were kept back (a bulk load's, and a write
     // transaction's until it writes its BEGIN record).
-    if wal_begun {
+    if wal_begun && self.ensure_writes_allowed().is_err() {
+      // No record: the handle writes nothing more (recovery drops the
+      // transaction without one anyway).
+      self.open_write_txids.lock().remove(&txid);
+    } else if wal_begun {
       // Write the ROLLBACK record if the WAL has room, and stop counting the
       // transaction as open under the same WAL lock, which a spill holds
       // while it reads the open set (see `settle_durable_commits` for COMMIT

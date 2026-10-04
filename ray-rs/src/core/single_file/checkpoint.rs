@@ -749,6 +749,7 @@ impl SingleFileDB {
     if self.read_only {
       return Err(KiteError::ReadOnly);
     }
+    self.ensure_writes_allowed()?;
 
     // A caller cannot checkpoint its own open transaction. Other transactions
     // that began before the gate are allowed to finish; the gate prevents any
@@ -1082,6 +1083,7 @@ impl SingleFileDB {
     if self.read_only {
       return Err(KiteError::ReadOnly);
     }
+    self.ensure_writes_allowed()?;
     // An abandoned transaction would keep the WAL segments holding its
     // records until rolled back.
     self.reap_abandoned_transactions();
@@ -1528,6 +1530,7 @@ impl SingleFileDB {
   /// automatic checkpoint failed (see `checkpoint_error`), after asking for
   /// another (which runs after the thread's back-off).
   pub(crate) fn wait_for_segment_space(&self) -> Result<()> {
+    self.ensure_writes_allowed()?;
     if !self.auto_checkpoint || self.read_only {
       return Err(KiteError::WalBufferFull);
     }

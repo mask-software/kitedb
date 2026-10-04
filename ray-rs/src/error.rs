@@ -70,6 +70,14 @@ pub enum KiteError {
   #[error("Checkpoint failed, and the WAL segments are full: {0}")]
   CheckpointFailed(String),
 
+  /// The database handle refuses writes for good: a checkpoint run on its
+  /// checkpoint thread panicked, possibly between writes that keep memory
+  /// and disk in step, so writing more could overwrite log records a durable
+  /// header still names. Reads go on; closing persists nothing; a reopen
+  /// recovers every acknowledged commit from disk.
+  #[error("The database refuses writes until it is reopened: {0}")]
+  WritesRefused(String),
+
   /// Attempted write on read-only database
   #[error("Database is read-only")]
   ReadOnly,
