@@ -1860,6 +1860,16 @@ impl SnapshotData {
       .then_some(index)
   }
 
+  /// The edge indices of a physical node's out-edges (`edge_props_into`
+  /// takes them), in the order `iter_out_edges` yields the edges.
+  pub(crate) fn out_edge_indices(&self, phys: PhysNode) -> std::ops::Range<usize> {
+    let (start, end) = self.out_edge_range(phys).unwrap_or((0, 0));
+    let edges =
+      (self.bytes(SectionId::OutEtype).len() / 4).min(self.bytes(SectionId::OutDst).len() / 4);
+    let end = end.min(edges);
+    start.min(end)..end
+  }
+
   /// Iterate out-edges for a physical node
   pub fn iter_out_edges(&self, phys: PhysNode) -> OutEdgeIter<'_> {
     OutEdgeIter::new(self, phys)
@@ -2035,6 +2045,24 @@ impl SnapshotData {
       }
     }
     Some(props)
+  }
+
+  /// Append the properties of edge `edge_idx` to `out`, in key order (as
+  /// stored), without building a map.
+  pub(crate) fn edge_props_into(&self, edge_idx: usize, out: &mut Vec<(PropKeyId, PropValue)>) {
+    let Some((keys, vals, start, end)) = self.prop_range(
+      SectionId::EdgePropOffsets,
+      SectionId::EdgePropKeys,
+      SectionId::EdgePropVals,
+      edge_idx,
+    ) else {
+      return;
+    };
+    for i in start..end {
+      if let Some(value) = self.decode_prop_value(vals, i) {
+        out.push((read_u32_at(keys, i), value));
+      }
+    }
   }
 
   /// Get all properties for a node

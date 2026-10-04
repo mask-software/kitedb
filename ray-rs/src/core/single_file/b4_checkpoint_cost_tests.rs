@@ -415,3 +415,118 @@ fn reopen_after_a_crash_mid_install_keeps_the_fallback_snapshot() {
   assert!(db.node_by_key("n0").is_some() && db.node_by_key("n10").is_none());
   assert!(db.node_by_key("after-crash-0").is_some());
 }
+
+/// Everything reads can see of the graph: per node, its key, labels and
+/// properties, and its out-edges with their properties, sorted.
+type GraphImage = Vec<(
+  NodeId,
+  Option<String>,
+  Vec<LabelId>,
+  Vec<(PropKeyId, String)>,
+  Vec<(ETypeId, NodeId, Vec<(PropKeyId, String)>)>,
+)>;
+
+fn graph_image(db: &SingleFileDB) -> GraphImage {
+  let sorted_props = |props: Option<HashMap<PropKeyId, PropValue>>| {
+    let mut props: Vec<(PropKeyId, String)> = props
+      .unwrap_or_default()
+      .into_iter()
+      .map(|(key, value)| (key, format!("{value:?}")))
+      .collect();
+    props.sort();
+    props
+  };
+  let mut nodes = db.list_nodes();
+  nodes.sort_unstable();
+  nodes
+    .into_iter()
+    .map(|node| {
+      let mut labels = db.node_labels(node);
+      labels.sort_unstable();
+      let mut edges: Vec<_> = db
+        .out_edges(node)
+        .into_iter()
+        .map(|(etype, dst)| (etype, dst, sorted_props(db.edge_props(node, etype, dst))))
+        .collect();
+      edges.sort();
+      (
+        node,
+        db.node_key(node),
+        labels,
+        sorted_props(db.node_props(node)),
+        edges,
+      )
+    })
+    .collect()
+}
+
+/// The checkpoint's graph collection works on edges as columns (one
+/// allocation per column rather than a property map per edge): a
+/// checkpoint must still keep exactly what reads saw, with snapshot edges
+/// whose properties the delta changed, removed or added, deleted edges and
+/// nodes, and new edges on old and new nodes; and so must a reopen.
+#[test]
+fn checkpoint_keeps_every_edge_and_property_as_read_before_it() {
+  let dir = tempdir().expect("tempdir");
+  let path = dir.path().join("checkpoint-keeps-graph.kitedb");
+  let options = SingleFileOpenOptions::new().auto_checkpoint(false);
+  let db = open_single_file(&path, options.clone()).expect("open");
+  let ids = bulk_load(&db, 200, 2_000, 100);
+  db.begin(false).expect("begin");
+  let weight = db.define_propkey("weight").expect("propkey");
+  let since = db.propkey_id("since").expect("since");
+  let knows = db.etype_id("KNOWS").expect("etype");
+  let likes = db.define_etype("LIKES").expect("etype");
+  db.commit().expect("commit");
+  db.checkpoint().expect("first checkpoint");
+
+  db.begin(false).expect("begin");
+  let edges: Vec<(NodeId, NodeId)> = ids
+    .iter()
+    .take(40)
+    .filter_map(|&src| db.out_edges(src).first().map(|&(_, dst)| (src, dst)))
+    .collect();
+  for (index, &(src, dst)) in edges.iter().enumerate() {
+    match index % 5 {
+      0 => db
+        .set_edge_prop(src, knows, dst, since, PropValue::I64(-1))
+        .expect("change prop"),
+      1 => db
+        .delete_edge_prop(src, knows, dst, since)
+        .expect("remove prop"),
+      2 => db
+        .set_edge_prop(
+          src,
+          knows,
+          dst,
+          weight,
+          PropValue::String(format!("w{index}")),
+        )
+        .expect("add prop"),
+      3 => db.delete_edge(src, knows, dst).expect("delete edge"),
+      _ => db
+        .add_edge_with_props(src, likes, dst, vec![(weight, PropValue::F64(0.5))])
+        .expect("new edge on old nodes"),
+    }
+  }
+  db.delete_node(ids[150]).expect("delete node");
+  let fresh = db.create_node(Some("fresh")).expect("node");
+  db.add_edge_with_props(fresh, likes, ids[0], vec![(since, PropValue::I64(7))])
+    .expect("edge from a new node");
+  db.add_edge(ids[1], likes, fresh)
+    .expect("edge to a new node");
+  db.commit().expect("commit");
+
+  let before = graph_image(&db);
+  db.checkpoint().expect("checkpoint");
+  assert!(
+    graph_image(&db) == before,
+    "the checkpoint changed the graph"
+  );
+  close_single_file(db).expect("close");
+  let reopened = open_single_file(&path, options).expect("reopen");
+  assert!(
+    graph_image(&reopened) == before,
+    "the reopened graph differs"
+  );
+}

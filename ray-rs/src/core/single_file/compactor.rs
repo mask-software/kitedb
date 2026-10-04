@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 
 use crate::core::pager::{pages_to_store, FilePager};
 use crate::core::snapshot::reader::{ParseSnapshotOptions, SnapshotData};
-use crate::core::snapshot::writer::{build_snapshot_to_memory, SnapshotBuildInput};
+use crate::core::snapshot::writer::{build_columnar_snapshot_to_memory, ColumnarBuildInput};
 use crate::core::wal::buffer::WalBuffer;
 use crate::error::{KiteError, Result};
 use crate::types::{DbHeaderV1, DeltaState};
@@ -150,7 +150,7 @@ impl SingleFileDB {
     let new_gen = header.active_snapshot_gen + 1;
     let compression = options.and_then(|o| o.compression);
 
-    let snapshot_buffer = build_snapshot_to_memory(SnapshotBuildInput {
+    let snapshot_buffer = build_columnar_snapshot_to_memory(ColumnarBuildInput {
       generation: new_gen,
       nodes,
       edges,

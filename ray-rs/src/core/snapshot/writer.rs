@@ -44,6 +44,130 @@ pub struct EdgeData {
   pub props: HashMap<PropKeyId, PropValue>,
 }
 
+/// Edges as columns: edge `i` is `(src[i], etype[i], dst[i])`, with
+/// properties `props(i)`, sorted by key. A checkpoint of millions of edges
+/// holds a few allocations instead of a property map per edge (`EdgeData`):
+/// at one property an edge, about 60 bytes an edge instead of about 300.
+#[derive(Debug, Default)]
+pub(crate) struct EdgeColumns {
+  src: Vec<NodeId>,
+  etype: Vec<ETypeId>,
+  dst: Vec<NodeId>,
+  /// Where each edge's properties start in `props`, and where the last
+  /// one's end: one more entry than edges.
+  prop_starts: Vec<usize>,
+  props: Vec<(PropKeyId, PropValue)>,
+}
+
+impl EdgeColumns {
+  /// Room for `edges` edges with `props` properties in all.
+  pub(crate) fn with_capacity(edges: usize, props: usize) -> Self {
+    let mut prop_starts = Vec::with_capacity(edges + 1);
+    prop_starts.push(0);
+    Self {
+      src: Vec::with_capacity(edges),
+      etype: Vec::with_capacity(edges),
+      dst: Vec::with_capacity(edges),
+      prop_starts,
+      props: Vec::with_capacity(props),
+    }
+  }
+
+  pub(crate) fn len(&self) -> usize {
+    self.src.len()
+  }
+
+  /// Append an edge whose properties `push_props` appends to the vector it
+  /// is given (each key once, in any order).
+  pub(crate) fn push_with(
+    &mut self,
+    src: NodeId,
+    etype: ETypeId,
+    dst: NodeId,
+    push_props: impl FnOnce(&mut Vec<(PropKeyId, PropValue)>),
+  ) {
+    let start = self.props.len();
+    push_props(&mut self.props);
+    let pushed = &mut self.props[start..];
+    if !pushed.is_sorted_by_key(|(key, _)| *key) {
+      pushed.sort_unstable_by_key(|(key, _)| *key);
+    }
+    self.src.push(src);
+    self.etype.push(etype);
+    self.dst.push(dst);
+    self.prop_starts.push(self.props.len());
+  }
+
+  /// Edge `index`'s properties, sorted by key.
+  pub(crate) fn props(&self, index: usize) -> &[(PropKeyId, PropValue)] {
+    &self.props[self.prop_starts[index]..self.prop_starts[index + 1]]
+  }
+
+  /// Whether any edge has a property.
+  fn has_props(&self) -> bool {
+    !self.props.is_empty()
+  }
+
+  /// Keep the edges from `from` on for which `keep(src, dst)` holds, in
+  /// order; returns how many were dropped.
+  pub(crate) fn retain_from(
+    &mut self,
+    from: usize,
+    mut keep: impl FnMut(NodeId, NodeId) -> bool,
+  ) -> usize {
+    let len = self.len();
+    let kept: Vec<usize> = (from..len)
+      .filter(|&index| keep(self.src[index], self.dst[index]))
+      .collect();
+    if kept.len() == len - from {
+      return 0;
+    }
+    let tail_props: Vec<Vec<(PropKeyId, PropValue)>> = kept
+      .iter()
+      .map(|&index| self.props(index).to_vec())
+      .collect();
+    for (to, &index) in (from..).zip(&kept) {
+      self.src[to] = self.src[index];
+      self.etype[to] = self.etype[index];
+      self.dst[to] = self.dst[index];
+    }
+    let kept_len = from + kept.len();
+    self.src.truncate(kept_len);
+    self.etype.truncate(kept_len);
+    self.dst.truncate(kept_len);
+    self.props.truncate(self.prop_starts[from]);
+    self.prop_starts.truncate(from + 1);
+    for props in tail_props {
+      self.props.extend(props);
+      self.prop_starts.push(self.props.len());
+    }
+    len - kept_len
+  }
+
+  fn from_edge_data(edges: Vec<EdgeData>) -> Self {
+    let props = edges.iter().map(|edge| edge.props.len()).sum();
+    let mut columns = Self::with_capacity(edges.len(), props);
+    for edge in edges {
+      columns.push_with(edge.src, edge.etype, edge.dst, |props| {
+        props.extend(edge.props)
+      });
+    }
+    columns
+  }
+}
+
+/// `SnapshotBuildInput` with its edges as columns.
+pub(crate) struct ColumnarBuildInput {
+  pub(crate) generation: u64,
+  pub(crate) nodes: Vec<NodeData>,
+  pub(crate) edges: EdgeColumns,
+  pub(crate) labels: HashMap<LabelId, String>,
+  pub(crate) etypes: HashMap<ETypeId, String>,
+  pub(crate) propkeys: HashMap<PropKeyId, String>,
+  pub(crate) vector_stores: Option<HashMap<PropKeyId, VectorManifest>>,
+  pub(crate) compression: Option<CompressionOptions>,
+}
+
 /// Input for building a snapshot
 #[derive(Debug)]
 pub struct SnapshotBuildInput {
@@ -170,13 +294,13 @@ impl NodeIndex {
     }
   }
 
-  /// Physical node of an edge endpoint, or an error naming the edge.
+  /// Physical node of an endpoint of edge `(src, dst)`, or an error naming
+  /// the edge.
   #[inline]
-  fn endpoint(&self, node_id: NodeId, edge: &EdgeData) -> Result<PhysNode> {
+  fn endpoint(&self, node_id: NodeId, (src, dst): (NodeId, NodeId)) -> Result<PhysNode> {
     self.phys(node_id).ok_or_else(|| {
       KiteError::InvalidSnapshot(format!(
-        "Edge references missing node(s): src={}, dst={}",
-        edge.src, edge.dst
+        "Edge references missing node(s): src={src}, dst={dst}"
       ))
     })
   }
@@ -193,6 +317,9 @@ struct CSRData {
   etype: Vec<u32>,
   /// For in-edges: index back to out-edge
   out_index: Option<Vec<u32>>,
+  /// For out-edges: the input index of each edge, until its properties
+  /// are written (`edge_prop_sections`)
+  input_index: Option<Vec<u32>>,
 }
 
 /// Prefix sums of per-node counts; `counts` must fit u32 in total.
@@ -210,23 +337,28 @@ fn prefix_offsets(counts: &[u32]) -> Vec<u32> {
 /// Callers bound `edges.len()` by u32::MAX (see `build_snapshot_to_memory`),
 /// so per-node counts and prefix sums fit u32. Edges are placed in input
 /// order using the offsets as cursors, then each node's range is sorted by
-/// (etype, dst) unless it already is.
-fn build_out_edges_csr(num_nodes: usize, edges: &[EdgeData], index: &NodeIndex) -> Result<CSRData> {
+/// (etype, dst, input index) unless it already is by (etype, dst).
+fn build_out_edges_csr(
+  num_nodes: usize,
+  edges: &EdgeColumns,
+  index: &NodeIndex,
+) -> Result<CSRData> {
   // Consecutive edges usually share a source; resolve it once.
   let mut last_src: Option<(NodeId, PhysNode)> = None;
-  let mut src_phys = |edge: &EdgeData| -> Result<PhysNode> {
+  let mut src_phys = |edge: usize| -> Result<PhysNode> {
+    let src = edges.src[edge];
     match last_src {
-      Some((node_id, phys)) if node_id == edge.src => Ok(phys),
+      Some((node_id, phys)) if node_id == src => Ok(phys),
       _ => {
-        let phys = index.endpoint(edge.src, edge)?;
-        last_src = Some((edge.src, phys));
+        let phys = index.endpoint(src, (src, edges.dst[edge]))?;
+        last_src = Some((src, phys));
         Ok(phys)
       }
     }
   };
 
   let mut counts = vec![0u32; num_nodes];
-  for edge in edges {
+  for edge in 0..edges.len() {
     counts[src_phys(edge)? as usize] += 1;
   }
   let offsets = prefix_offsets(&counts);
@@ -236,16 +368,18 @@ fn build_out_edges_csr(num_nodes: usize, edges: &[EdgeData], index: &NodeIndex) 
 
   let mut dst = vec![0u32; edges.len()];
   let mut etype = vec![0u32; edges.len()];
-  for edge in edges {
+  let mut input_index = vec![0u32; edges.len()];
+  for edge in 0..edges.len() {
     let src = src_phys(edge)? as usize;
     let pos = cursors[src] as usize;
     cursors[src] += 1;
-    dst[pos] = index.endpoint(edge.dst, edge)?;
-    etype[pos] = edge.etype;
+    dst[pos] = index.endpoint(edges.dst[edge], (edges.src[edge], edges.dst[edge]))?;
+    etype[pos] = edges.etype[edge];
+    input_index[pos] = edge as u32;
   }
   drop(cursors);
 
-  let mut scratch: Vec<(ETypeId, PhysNode)> = Vec::new();
+  let mut scratch: Vec<(ETypeId, PhysNode, u32)> = Vec::new();
   for node in 0..num_nodes {
     let range = offsets[node] as usize..offsets[node + 1] as usize;
     let sorted = range
@@ -256,12 +390,13 @@ fn build_out_edges_csr(num_nodes: usize, edges: &[EdgeData], index: &NodeIndex) 
       continue;
     }
     scratch.clear();
-    scratch.extend(range.clone().map(|i| (etype[i], dst[i])));
-    // Equal keys are identical edges, so an unstable sort is deterministic.
+    scratch.extend(range.clone().map(|i| (etype[i], dst[i], input_index[i])));
+    // Input indices are distinct, so the order is deterministic.
     scratch.sort_unstable();
-    for (i, &(edge_etype, edge_dst)) in range.zip(&scratch) {
+    for (i, &(edge_etype, edge_dst, edge)) in range.zip(&scratch) {
       etype[i] = edge_etype;
       dst[i] = edge_dst;
+      input_index[i] = edge;
     }
   }
 
@@ -270,6 +405,7 @@ fn build_out_edges_csr(num_nodes: usize, edges: &[EdgeData], index: &NodeIndex) 
     dst,
     etype,
     out_index: None,
+    input_index: Some(input_index),
   })
 }
 
@@ -333,6 +469,7 @@ fn build_in_edges_csr(num_nodes: usize, out_csr: &CSRData) -> CSRData {
     dst: src_arr, // For in-edges, "dst" is actually source
     etype: etype_arr,
     out_index: Some(out_index),
+    input_index: None,
   }
 }
 
@@ -435,21 +572,34 @@ impl PropSections {
     }
   }
 
-  /// Appends the next item's properties, sorted by key.
-  fn push_item(
+  /// Appends the next item's properties, sorted by key; `scratch` is a
+  /// buffer for the sort.
+  fn push_item<'p>(
     &mut self,
-    props: Option<&HashMap<PropKeyId, PropValue>>,
+    props: Option<&'p HashMap<PropKeyId, PropValue>>,
+    scratch: &mut Vec<(PropKeyId, &'p PropValue)>,
+    string_table: &StringTable<'_>,
+    vectors: &mut VectorTable,
+    what: &str,
+  ) -> Result<()> {
+    scratch.clear();
+    if let Some(props) = props {
+      scratch.extend(props.iter().map(|(&key, value)| (key, value)));
+      scratch.sort_unstable_by_key(|&(key, _)| key);
+    }
+    self.push_sorted(scratch.iter().copied(), string_table, vectors, what)
+  }
+
+  /// Appends the next item's properties, `props`, sorted by key.
+  fn push_sorted<'p>(
+    &mut self,
+    props: impl Iterator<Item = (PropKeyId, &'p PropValue)>,
     string_table: &StringTable<'_>,
     vectors: &mut VectorTable,
     what: &str,
   ) -> Result<()> {
     push_u32(&mut self.offsets, checked_u32(self.count, what)?);
-    let Some(props) = props.filter(|props| !props.is_empty()) else {
-      return Ok(());
-    };
-    let mut sorted: Vec<_> = props.iter().collect();
-    sorted.sort_unstable_by_key(|&(&key, _)| key);
-    for (&key_id, value) in sorted {
+    for (key_id, value) in props {
       let (tag, payload) = encode_prop_value(value, string_table, vectors);
       push_u32(&mut self.keys, key_id);
       self.vals.push(tag);
@@ -657,7 +807,7 @@ where
 /// Returns the label, etype and propkey name tables and each node's key.
 fn intern_strings<'a>(
   nodes: &'a [NodeData],
-  edges: &'a [EdgeData],
+  edges: &'a EdgeColumns,
   schema: [&'a HashMap<u32, String>; 3],
   string_table: &mut StringTable<'a>,
 ) -> Result<([Vec<StringId>; 3], Vec<StringId>)> {
@@ -675,20 +825,21 @@ fn intern_strings<'a>(
     })
     .collect::<Result<Vec<_>>>()?;
 
-  let props = nodes
-    .iter()
-    .map(|node| &node.props)
-    .chain(edges.iter().map(|edge| &edge.props));
-  for props in props {
-    let mut strings: Vec<_> = props
-      .iter()
-      .filter_map(|(key, value)| match value {
-        PropValue::String(s) => Some((*key, s.as_str())),
-        _ => None,
-      })
-      .collect();
+  let mut strings: Vec<(PropKeyId, &str)> = Vec::new();
+  for node in nodes {
+    strings.clear();
+    strings.extend(node.props.iter().filter_map(|(key, value)| match value {
+      PropValue::String(s) => Some((*key, s.as_str())),
+      _ => None,
+    }));
     strings.sort_unstable_by_key(|(key, _)| *key);
-    for (_, s) in strings {
+    for &(_, s) in &strings {
+      string_table.intern(s)?;
+    }
+  }
+  // Each edge's properties are sorted by key already.
+  for (_, value) in &edges.props {
+    if let PropValue::String(s) = value {
       string_table.intern(s)?;
     }
   }
@@ -719,36 +870,43 @@ fn node_label_sections(nodes: &[NodeData]) -> Result<(Vec<u8>, Vec<u8>)> {
 /// Edge property sections in out-edge order. Duplicate (src, etype, dst)
 /// edges share the properties of the last one in the input.
 fn edge_prop_sections(
-  edges: &[EdgeData],
-  index: &NodeIndex,
+  edges: &EdgeColumns,
   out_csr: &CSRData,
   string_table: &StringTable<'_>,
   vectors: &mut VectorTable,
 ) -> Result<PropSections> {
-  let mut edge_props: hashbrown::HashMap<(PhysNode, ETypeId, PhysNode), &HashMap<_, _>> =
-    hashbrown::HashMap::new();
-  for edge in edges.iter().filter(|edge| !edge.props.is_empty()) {
-    let key = (
-      index.endpoint(edge.src, edge)?,
-      edge.etype,
-      index.endpoint(edge.dst, edge)?,
-    );
-    edge_props.insert(key, &edge.props);
-  }
-
+  let input_index = out_csr
+    .input_index
+    .as_deref()
+    .expect("out-edge CSR keeps its input indices");
   let num_nodes = out_csr.offsets.len() - 1;
   let mut sections = PropSections::with_items(out_csr.dst.len());
   for src in 0..num_nodes {
     let range = out_csr.offsets[src] as usize..out_csr.offsets[src + 1] as usize;
-    for i in range {
-      let props = if edge_props.is_empty() {
-        None
-      } else {
-        edge_props
-          .get(&(src as PhysNode, out_csr.etype[i], out_csr.dst[i]))
-          .copied()
-      };
-      sections.push_item(props, string_table, vectors, "edge property count")?;
+    let mut i = range.start;
+    while i < range.end {
+      // The run of duplicates of edge `i` (sorted by input index).
+      let mut run_end = i + 1;
+      while run_end < range.end
+        && out_csr.etype[run_end] == out_csr.etype[i]
+        && out_csr.dst[run_end] == out_csr.dst[i]
+      {
+        run_end += 1;
+      }
+      let last = input_index[i..run_end]
+        .iter()
+        .copied()
+        .max()
+        .expect("non-empty run") as usize;
+      for _ in i..run_end {
+        sections.push_sorted(
+          edges.props(last).iter().map(|(key, value)| (*key, value)),
+          string_table,
+          vectors,
+          "edge property count",
+        )?;
+      }
+      i = run_end;
     }
   }
   Ok(sections)
@@ -757,6 +915,31 @@ fn edge_prop_sections(
 /// Build a snapshot to memory (useful for single-file format embedding)
 pub fn build_snapshot_to_memory(input: SnapshotBuildInput) -> Result<Vec<u8>> {
   let SnapshotBuildInput {
+    generation,
+    nodes,
+    edges,
+    labels,
+    etypes,
+    propkeys,
+    vector_stores,
+    compression,
+  } = input;
+  build_columnar_snapshot_to_memory(ColumnarBuildInput {
+    generation,
+    nodes,
+    edges: EdgeColumns::from_edge_data(edges),
+    labels,
+    etypes,
+    propkeys,
+    vector_stores,
+    compression,
+  })
+}
+
+/// `build_snapshot_to_memory`, from edges as columns. The edges are dropped
+/// once their properties are written, before the in-edge CSR is built.
+pub(crate) fn build_columnar_snapshot_to_memory(input: ColumnarBuildInput) -> Result<Vec<u8>> {
+  let ColumnarBuildInput {
     generation,
     mut nodes,
     edges,
@@ -834,15 +1017,18 @@ pub fn build_snapshot_to_memory(input: SnapshotBuildInput) -> Result<Vec<u8>> {
   // Node, then edge, properties (vector indices follow that order).
   let mut vector_table = VectorTable::new();
   let mut node_props = PropSections::with_items(num_nodes);
+  let mut scratch = Vec::new();
   for node in &nodes {
     node_props.push_item(
       Some(&node.props),
+      &mut scratch,
       &string_table,
       &mut vector_table,
       "node property count",
     )?;
   }
-  let has_properties = node_props.count > 0 || edges.iter().any(|e| !e.props.is_empty());
+  drop(scratch);
+  let has_properties = node_props.count > 0 || edges.has_props();
   node_props.write(
     &mut out,
     [
@@ -852,14 +1038,8 @@ pub fn build_snapshot_to_memory(input: SnapshotBuildInput) -> Result<Vec<u8>> {
     ],
     "node property count",
   )?;
-  edge_prop_sections(
-    &edges,
-    &node_index,
-    &out_csr,
-    &string_table,
-    &mut vector_table,
-  )?
-  .write(
+  let mut out_csr = out_csr;
+  edge_prop_sections(&edges, &out_csr, &string_table, &mut vector_table)?.write(
     &mut out,
     [
       SectionId::EdgePropOffsets,
@@ -868,7 +1048,11 @@ pub fn build_snapshot_to_memory(input: SnapshotBuildInput) -> Result<Vec<u8>> {
     ],
     "edge property count",
   )?;
+  // The nodes' and edges' sections are written: only the CSR is left.
   drop(string_table);
+  drop(nodes);
+  drop(edges);
+  out_csr.input_index = None;
 
   let has_vectors = !vector_table.is_empty();
   if has_vectors {
@@ -1246,7 +1430,8 @@ mod tests {
     ];
     let index = NodeIndex::build(&[1, 2, 3], 3).expect("node index");
 
-    let out_csr = build_out_edges_csr(3, &edges, &index).expect("out csr");
+    let out_csr =
+      build_out_edges_csr(3, &EdgeColumns::from_edge_data(edges), &index).expect("out csr");
     assert_eq!(out_csr.offsets, vec![0, 4, 6, 6]);
     assert_eq!(out_csr.etype, vec![1, 1, 1, 2, 1, 2]);
     assert_eq!(out_csr.dst, vec![1, 1, 2, 2, 2, 0]);
@@ -1259,6 +1444,76 @@ mod tests {
     assert_eq!(in_csr.out_index, Some(vec![5, 0, 1, 2, 4, 3]));
   }
 
+  /// Edge properties land with their edges in out-edge (CSR) order, edges
+  /// given in any order; duplicate edges share the properties of the last one
+  /// in the input.
+  #[test]
+  fn test_edge_props_follow_their_edges() {
+    let edge = |src, etype, dst, since: Option<i64>| EdgeData {
+      src,
+      etype,
+      dst,
+      props: since
+        .map(|since| HashMap::from([(1, PropValue::I64(since))]))
+        .unwrap_or_default(),
+    };
+    let edges = vec![
+      edge(2, 1, 1, Some(21)),
+      edge(1, 2, 3, Some(123)),
+      edge(1, 1, 3, None),
+      edge(1, 1, 2, Some(112)),
+      edge(1, 1, 2, Some(1120)),
+      edge(3, 1, 1, Some(31)),
+    ];
+    let buffer = build_snapshot_to_memory(SnapshotBuildInput {
+      generation: 1,
+      nodes: bare_nodes(&[1, 2, 3]),
+      edges,
+      labels: HashMap::new(),
+      etypes: HashMap::from([(1, "a".to_string()), (2, "b".to_string())]),
+      propkeys: HashMap::from([(1, "since".to_string())]),
+      vector_stores: None,
+      compression: None,
+    })
+    .expect("build");
+    let mut tmp = NamedTempFile::new().expect("temp file");
+    std::io::Write::write_all(&mut tmp, &buffer).expect("write snapshot");
+    let snapshot = SnapshotData::load(tmp.path()).expect("load snapshot");
+    let props_of = |src: NodeId, etype, dst: NodeId| {
+      let src = snapshot.phys_node(src).expect("src");
+      let dst = snapshot.phys_node(dst).expect("dst");
+      let index = snapshot.find_edge_index(src, etype, dst).expect("edge");
+      snapshot
+        .edge_props(index)
+        .unwrap_or_default()
+        .get(&1)
+        .cloned()
+    };
+    assert_eq!(props_of(1, 1, 2), Some(PropValue::I64(1120)));
+    assert_eq!(props_of(1, 1, 3), None);
+    assert_eq!(props_of(1, 2, 3), Some(PropValue::I64(123)));
+    assert_eq!(props_of(2, 1, 1), Some(PropValue::I64(21)));
+    assert_eq!(props_of(3, 1, 1), Some(PropValue::I64(31)));
+    // Both copies of the duplicate carry the last one's properties.
+    let one = snapshot.phys_node(1).expect("node 1");
+    let range = snapshot.out_edge_indices(one);
+    let duplicate_props: Vec<_> = range
+      .zip(snapshot.iter_out_edges(one))
+      .filter(|(_, (dst, etype))| *etype == 1 && snapshot.node_id(*dst) == Some(2))
+      .map(|(index, _)| {
+        snapshot
+          .edge_props(index)
+          .unwrap_or_default()
+          .get(&1)
+          .cloned()
+      })
+      .collect();
+    assert_eq!(
+      duplicate_props,
+      vec![Some(PropValue::I64(1120)), Some(PropValue::I64(1120))]
+    );
+  }
+
   #[test]
   fn test_csr_building_rejects_missing_endpoints() {
     let index = NodeIndex::build(&[1, 2], 2).expect("node index");
@@ -1268,7 +1523,7 @@ mod tests {
       dst: 3,
       props: HashMap::new(),
     }];
-    assert!(build_out_edges_csr(2, &edges, &index).is_err());
+    assert!(build_out_edges_csr(2, &EdgeColumns::from_edge_data(edges), &index).is_err());
   }
 
   #[cfg(target_pointer_width = "64")]

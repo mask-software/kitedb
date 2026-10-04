@@ -16,7 +16,7 @@ use std::sync::{Arc, Barrier, Mutex, OnceLock};
 use crate::core::pager::{pages_to_store, FilePager};
 use crate::core::snapshot::reader::SnapshotData;
 use crate::core::snapshot::writer::{
-  build_snapshot_to_memory, EdgeData, NodeData, SnapshotBuildInput,
+  build_columnar_snapshot_to_memory, ColumnarBuildInput, EdgeColumns, NodeData,
 };
 use crate::core::wal::buffer::WalBuffer;
 use crate::core::wal::record::ParsedWalRecord;
@@ -30,9 +30,9 @@ use super::recovery::{committed_transactions, replay_wal_record};
 use super::{CheckpointStatus, SingleFileDB};
 use crate::vector::ivf::serialize::validate_manifest_for_serialization;
 
-type GraphData = (
+pub(crate) type GraphData = (
   Vec<NodeData>,
-  Vec<EdgeData>,
+  EdgeColumns,
   HashMap<LabelId, String>,
   HashMap<ETypeId, String>,
   HashMap<PropKeyId, String>,
@@ -334,6 +334,29 @@ pub(super) fn snapshot_vector_stores(
   Ok(vector_stores.clone())
 }
 
+/// Apply a delta's property changes (`None` removes the key) to the
+/// properties `props[start..]`, each key once.
+fn apply_prop_changes(
+  props: &mut Vec<(PropKeyId, PropValue)>,
+  start: usize,
+  changes: &HashMap<PropKeyId, Option<PropValueRef>>,
+) {
+  for (&key_id, value) in changes {
+    let existing = props[start..]
+      .iter()
+      .position(|(key, _)| *key == key_id)
+      .map(|offset| start + offset);
+    match (value, existing) {
+      (Some(value), Some(index)) => props[index].1 = value.as_ref().clone(),
+      (Some(value), None) => props.push((key_id, value.as_ref().clone())),
+      (None, Some(index)) => {
+        props.swap_remove(index);
+      }
+      (None, None) => {}
+    }
+  }
+}
+
 /// A background checkpoint's replay of the transactions committed after its
 /// cut, in rounds (see `SingleFileDB::replay_post_cut_records`).
 #[derive(Default)]
@@ -536,6 +559,8 @@ impl SingleFileDB {
     let generation = header.active_snapshot_gen + 1;
     let (snapshot_buffer, vector_stores) = self.build_snapshot_buffer(generation, graph)?;
     let snapshot = self.write_new_snapshot(&header, generation, &snapshot_buffer)?;
+    // On disk now; the load below makes its own copy of what it inflates.
+    drop(snapshot_buffer);
     let loaded = self.load_unnamed_snapshot(snapshot, vector_stores)?;
 
     // The snapshot covers every WAL record, so the installed header names an
@@ -1113,6 +1138,8 @@ impl SingleFileDB {
     let generation = header.active_snapshot_gen + 1;
     let (snapshot_buffer, vector_stores) = self.build_snapshot_buffer(generation, graph)?;
     let snapshot = self.write_new_snapshot(&header, generation, &snapshot_buffer)?;
+    // On disk now; the load below makes its own copy of what it inflates.
+    drop(snapshot_buffer);
     let loaded = self.load_unnamed_snapshot(snapshot, vector_stores)?;
     Ok((snapshot, loaded))
   }
@@ -1777,7 +1804,7 @@ impl SingleFileDB {
     let _step = self.checkpoint_step("serialize snapshot");
     let (nodes, edges, labels, etypes, propkeys, vector_stores) = graph;
     let installed = snapshot_vector_stores(&vector_stores)?;
-    let buffer = build_snapshot_to_memory(SnapshotBuildInput {
+    let buffer = build_columnar_snapshot_to_memory(ColumnarBuildInput {
       generation,
       nodes,
       edges,
@@ -1921,11 +1948,11 @@ impl SingleFileDB {
     self.collect_graph_data_from(&delta)
   }
 
-  /// Collect all graph data from snapshot + `delta`
+  /// Collect all graph data from snapshot + `delta`: the nodes, and the
+  /// edges as columns (see `EdgeColumns`), which the snapshot writer takes
+  /// as they are.
   fn collect_graph_data_from(&self, delta: &DeltaState) -> Result<GraphData> {
     let _step = self.checkpoint_step("collect graph");
-    let mut nodes = Vec::new();
-    let mut edges = Vec::new();
     let mut labels = HashMap::new();
     let mut etypes = HashMap::new();
     let mut propkeys = HashMap::new();
@@ -1941,11 +1968,23 @@ impl SingleFileDB {
       propkeys.insert(id, name.clone());
     }
 
-    // Collect nodes from snapshot
-    if let Some(ref snapshot) = **self.snapshot.read() {
-      let num_nodes = snapshot.header.num_nodes as usize;
+    let snapshot_guard = self.snapshot.read();
+    let snapshot = snapshot_guard.as_ref();
+    let (snapshot_nodes, snapshot_edges) = snapshot.map_or((0, 0), |snapshot| {
+      (
+        snapshot.header.num_nodes as usize,
+        snapshot.header.num_edges as usize,
+      )
+    });
+    let delta_edges = delta.out_add.patch_count();
+    let mut nodes = Vec::with_capacity(snapshot_nodes + delta.created_nodes.len());
+    // Room for one property an edge; more grows the vector as needed.
+    let mut edges =
+      EdgeColumns::with_capacity(snapshot_edges + delta_edges, snapshot_edges + delta_edges);
 
-      for phys in 0..num_nodes {
+    // Collect nodes from snapshot
+    if let Some(snapshot) = snapshot {
+      for phys in 0..snapshot_nodes {
         if phys % 4096 == 0 {
           self.checkpoint_progressed()?;
         }
@@ -1963,49 +2002,35 @@ impl SingleFileDB {
         let key = snapshot.node_key(phys as u32);
 
         // Get properties from snapshot
-        let mut props = HashMap::new();
-        if let Some(snapshot_props) = snapshot.node_props(phys as u32) {
-          for (key_id, value) in snapshot_props {
-            props.insert(key_id, value);
-          }
-        }
+        let mut props = snapshot.node_props(phys as u32).unwrap_or_default();
 
         // Apply delta modifications
-        if let Some(node_delta) = delta.node_delta(node_id) {
-          if let Some(ref delta_props) = node_delta.props {
-            for (&key_id, value) in delta_props {
-              match value {
-                Some(v) => {
-                  props.insert(key_id, v.as_ref().clone());
-                }
-                None => {
-                  props.remove(&key_id);
-                }
+        let node_delta = delta.node_delta(node_id);
+        if let Some(delta_props) = node_delta.and_then(|node_delta| node_delta.props.as_ref()) {
+          for (&key_id, value) in delta_props {
+            match value {
+              Some(v) => {
+                props.insert(key_id, v.as_ref().clone());
+              }
+              None => {
+                props.remove(&key_id);
               }
             }
           }
         }
 
         // Collect node labels (snapshot + delta)
-        let mut node_labels: std::collections::HashSet<LabelId> = std::collections::HashSet::new();
-
-        if let Some(snapshot_labels) = snapshot.node_labels(phys as u32) {
-          node_labels.extend(snapshot_labels);
-        }
-
-        if let Some(node_delta) = delta.node_delta(node_id) {
-          if let Some(ref labels) = node_delta.labels {
-            node_labels.extend(labels.iter().copied());
+        let mut node_labels = snapshot.node_labels(phys as u32).unwrap_or_default();
+        if let Some(node_delta) = node_delta {
+          if let Some(ref added) = node_delta.labels {
+            node_labels.extend(added.iter().copied());
           }
           if let Some(ref deleted) = node_delta.labels_deleted {
-            for label_id in deleted {
-              node_labels.remove(label_id);
-            }
+            node_labels.retain(|label_id| !deleted.contains(label_id));
           }
         }
-
-        let mut node_labels: Vec<LabelId> = node_labels.into_iter().collect();
         node_labels.sort_unstable();
+        node_labels.dedup();
 
         nodes.push(NodeData {
           node_id,
@@ -2014,9 +2039,11 @@ impl SingleFileDB {
           props,
         });
 
-        // Collect edges from this node
-        for edge_info in snapshot.out_edges(phys as u32) {
-          let dst_node_id = match snapshot.node_id(edge_info.dst) {
+        // Collect edges from this node, with their properties by edge index
+        // (in the order `iter_out_edges` yields them).
+        let indices = snapshot.out_edge_indices(phys as u32);
+        for (edge_idx, (dst, etype)) in indices.zip(snapshot.iter_out_edges(phys as u32)) {
+          let dst_node_id = match snapshot.node_id(dst) {
             Some(id) => id,
             None => continue,
           };
@@ -2027,40 +2054,18 @@ impl SingleFileDB {
           }
 
           // Skip deleted edges
-          if delta.is_edge_deleted(node_id, edge_info.etype, dst_node_id) {
+          if delta.is_edge_deleted(node_id, etype, dst_node_id) {
             continue;
           }
 
-          // Get edge props from snapshot
-          let mut edge_props = HashMap::new();
-          if let Some(edge_idx) =
-            snapshot.find_edge_index(phys as u32, edge_info.etype, edge_info.dst)
-          {
-            if let Some(snapshot_edge_props) = snapshot.edge_props(edge_idx) {
-              edge_props = snapshot_edge_props;
+          let edge_key = (node_id, etype, dst_node_id);
+          edges.push_with(node_id, etype, dst_node_id, |props| {
+            let start = props.len();
+            snapshot.edge_props_into(edge_idx, props);
+            // Apply delta edge prop modifications
+            if let Some(delta_edge_props) = delta.edge_props.get(&edge_key) {
+              apply_prop_changes(props, start, delta_edge_props);
             }
-          }
-
-          // Apply delta edge prop modifications
-          let edge_key = (node_id, edge_info.etype, dst_node_id);
-          if let Some(delta_edge_props) = delta.edge_props.get(&edge_key) {
-            for (&key_id, value) in delta_edge_props.iter() {
-              match value {
-                Some(v) => {
-                  edge_props.insert(key_id, v.as_ref().clone());
-                }
-                None => {
-                  edge_props.remove(&key_id);
-                }
-              }
-            }
-          }
-
-          edges.push(EdgeData {
-            src: node_id,
-            etype: edge_info.etype,
-            dst: dst_node_id,
-            props: edge_props,
           });
         }
       }
@@ -2107,24 +2112,19 @@ impl SingleFileDB {
         }
 
         // Get edge props from delta
-        let mut edge_props = HashMap::new();
         let edge_key = (src, patch.etype, patch.other);
-        if let Some(delta_edge_props) = delta.edge_props.get(&edge_key) {
-          for (&key_id, value) in delta_edge_props.iter() {
-            if let Some(v) = value {
-              edge_props.insert(key_id, v.as_ref().clone());
+        edges.push_with(src, patch.etype, patch.other, |props| {
+          if let Some(delta_edge_props) = delta.edge_props.get(&edge_key) {
+            for (&key_id, value) in delta_edge_props.iter() {
+              if let Some(v) = value {
+                props.push((key_id, v.as_ref().clone()));
+              }
             }
           }
-        }
-
-        edges.push(EdgeData {
-          src,
-          etype: patch.etype,
-          dst: patch.other,
-          props: edge_props,
         });
       }
     }
+    drop(snapshot_guard);
 
     // Snapshot persistence now stores ANN vectors only in dedicated
     // vector-store sections. Remove duplicate vector payloads from node props.
@@ -2178,9 +2178,9 @@ impl SingleFileDB {
 
   /// Drop what the committed state holds for nodes that exist nowhere (see
   /// `DeltaState::node_exists_over`, also used by WAL replay): the delta
-  /// edges `edges[delta_edges_start..]` with such an endpoint, props
-  /// included, and the vectors of such nodes in `vector_stores`, copies of
-  /// the live stores. The snapshot writer rejects a dangling edge, so one
+  /// edges (from `delta_edges_start` on in `edges`) with such an endpoint,
+  /// props included, and the vectors of such nodes in `vector_stores`, copies
+  /// of the live stores. The snapshot writer rejects a dangling edge, so one
   /// would fail this checkpoint and every later one while the WAL fills; a
   /// vector would be carried into every snapshot. Older versions left both
   /// behind (their node deletes logged no vector deletes), and so can
@@ -2196,18 +2196,14 @@ impl SingleFileDB {
   fn drop_state_of_missing_nodes(
     &self,
     delta: &DeltaState,
-    edges: &mut Vec<EdgeData>,
+    edges: &mut EdgeColumns,
     delta_edges_start: usize,
     vector_stores: &mut HashMap<PropKeyId, VectorManifest>,
   ) {
     let snapshot = self.snapshot.read();
     let exists = |node_id| delta.node_exists_over(snapshot.as_ref(), node_id);
 
-    let mut delta_edges = edges.split_off(delta_edges_start);
-    let collected = delta_edges.len();
-    delta_edges.retain(|edge| exists(edge.src) && exists(edge.dst));
-    let dropped_edges = collected - delta_edges.len();
-    edges.append(&mut delta_edges);
+    let dropped_edges = edges.retain_from(delta_edges_start, |src, dst| exists(src) && exists(dst));
 
     let mut dropped_vectors = 0usize;
     for store in vector_stores.values_mut() {
