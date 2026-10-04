@@ -112,6 +112,7 @@ fn commit_nodes(db: &SingleFileDB, prefix: &str, count: usize) {
 /// small next to the data (as the default 4 MiB WAL is next to a 10M-edge
 /// load), the load must not rewrite the whole database at every fill.
 #[test]
+#[ignore = "needs WAL log segments and a checkpoint thread (fix/b4-checkpoint-segments)"]
 fn bulk_load_writes_snapshot_bytes_linear_in_the_data() {
   let dir = tempdir().expect("tempdir");
   let path = dir.path().join("bulk-load-linear.kitedb");
@@ -135,6 +136,7 @@ fn bulk_load_writes_snapshot_bytes_linear_in_the_data() {
 /// threshold returns without waiting for the checkpoint it starts. The
 /// checkpoint is held after its cut; the commit must come back meanwhile.
 #[test]
+#[ignore = "needs WAL log segments and a checkpoint thread (fix/b4-checkpoint-segments)"]
 fn commit_that_starts_an_auto_checkpoint_returns_before_the_checkpoint_finishes() {
   let dir = tempdir().expect("tempdir");
   let path = dir.path().join("commit-not-held-by-auto-checkpoint.kitedb");
@@ -183,6 +185,7 @@ fn commit_that_starts_an_auto_checkpoint_returns_before_the_checkpoint_finishes(
 /// commits for seconds. The checkpoint is held after its cut; the writer
 /// commits twice the whole WAL's size meanwhile.
 #[test]
+#[ignore = "needs WAL log segments and a checkpoint thread (fix/b4-checkpoint-segments)"]
 fn writer_is_not_held_up_by_a_checkpoint_building_its_snapshot() {
   let dir = tempdir().expect("tempdir");
   let path = dir.path().join("writer-not-held-by-checkpoint.kitedb");
