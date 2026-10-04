@@ -306,6 +306,39 @@ impl SingleFileDB {
     self.compact(layout)
   }
 
+  /// What closing does with pages no header names: earlier snapshots'
+  /// pages, which checkpoints leave in front of the snapshot as they place
+  /// each in the first free range that holds it, and free pages after it.
+  /// If there are any, move the snapshot down to directly after the WAL and
+  /// truncate the file after it, as vacuum does, keeping the WAL as it is.
+  /// A closed file then holds only the header pages, the WAL area and the
+  /// snapshot, so its size does not depend on the checkpoint history (and
+  /// with it the WAL size). Skipped while a transaction is open.
+  pub(crate) fn compact_for_close(&self) -> Result<()> {
+    if self.read_only || self.active_transactions.load(Ordering::Acquire) > 0 {
+      return Ok(());
+    }
+    let header = self.header.read().clone();
+    if header.snapshot_page_count == 0 {
+      return Ok(());
+    }
+    let wal_end_page = header.wal_start_page + header.wal_page_count;
+    let file_pages = self
+      .pager
+      .lock()
+      .file_size()
+      .div_ceil(header.page_size as u64);
+    if header.snapshot_start_page == wal_end_page
+      && file_pages <= wal_end_page + header.snapshot_page_count
+    {
+      return Ok(());
+    }
+    self.vacuum_single_file(Some(VacuumOptions {
+      shrink_wal: false,
+      min_wal_size: None,
+    }))
+  }
+
   /// Install `layout`'s WAL with the snapshot directly after it, and truncate
   /// the file after the snapshot. Callers hold the exclusive checkpoint gate;
   /// `layout` is the installed header with any WAL change applied (a changed
@@ -317,7 +350,11 @@ impl SingleFileDB {
   /// 1. If the snapshot moves, copy it past every page the installed header
   ///    or `layout` names (the bridge copy), then install `layout` with the
   ///    snapshot at the bridge copy in both slots. Now no slot names the old
-  ///    snapshot or any page of the old WAL outside the new one.
+  ///    snapshot or any page of the old WAL outside the new one. Skipped when
+  ///    the compacted place already lies wholly between the installed WAL and
+  ///    the installed snapshot, on pages no slot names (none is held back for
+  ///    a fallback slot): with the WAL unchanged, that is earlier snapshots'
+  ///    pages in front of the snapshot.
   /// 2. Copy the snapshot to its compacted place after the WAL, which no slot
   ///    names.
   /// 3. Install the compacted `layout` in both slots. Now no slot names the
@@ -340,7 +377,18 @@ impl SingleFileDB {
     let page_size = installed.page_size as usize;
     let snapshot_page_count = layout.snapshot_page_count;
     let wal_end_page = layout.wal_start_page + layout.wal_page_count;
-    withdraw_compacted_pages(&mut self.pager.lock(), wal_end_page + snapshot_page_count);
+    let compacted_end_page = wal_end_page + snapshot_page_count;
+    let needs_bridge = {
+      let pager = self.pager.lock();
+      let installed_wal_end_page = installed.wal_start_page + installed.wal_page_count;
+      !(wal_end_page >= installed_wal_end_page
+        && compacted_end_page <= installed.snapshot_start_page
+        && u32::try_from(wal_end_page)
+          .ok()
+          .zip(u32::try_from(compacted_end_page).ok())
+          .is_some_and(|(start, end)| !pager.any_deferred_in(start, end)))
+    };
+    withdraw_compacted_pages(&mut self.pager.lock(), compacted_end_page);
 
     if snapshot_page_count > 0 && installed.snapshot_start_page != wal_end_page {
       let snapshot_bytes = read_snapshot_pages(
@@ -349,21 +397,23 @@ impl SingleFileDB {
         snapshot_page_count as u32,
       )?;
 
-      // Past the file's end and past the compacted snapshot, so it overlaps
-      // neither the installed pages nor anything `layout` names.
-      let bridge_start_page = self
-        .snapshot_append_start_page(&installed)?
-        .max(wal_end_page + snapshot_page_count);
-      self.write_snapshot_pages(
-        &mut self.pager.lock(),
-        bridge_start_page as u32,
-        &snapshot_bytes,
-        page_size,
-      )?;
-      compaction_step("bridge copy written")?;
-      layout.snapshot_start_page = bridge_start_page;
-      layout.db_size_pages = bridge_start_page + snapshot_page_count;
-      self.install_compacted_layout(&mut layout)?;
+      if needs_bridge {
+        // Past the file's end and past the compacted snapshot, so it
+        // overlaps neither the installed pages nor anything `layout` names.
+        let bridge_start_page = self
+          .snapshot_append_start_page(&installed)?
+          .max(compacted_end_page);
+        self.write_snapshot_pages(
+          &mut self.pager.lock(),
+          bridge_start_page as u32,
+          &snapshot_bytes,
+          page_size,
+        )?;
+        compaction_step("bridge copy written")?;
+        layout.snapshot_start_page = bridge_start_page;
+        layout.db_size_pages = bridge_start_page + snapshot_page_count;
+        self.install_compacted_layout(&mut layout)?;
+      }
 
       self.write_snapshot_pages(
         &mut self.pager.lock(),
@@ -822,6 +872,34 @@ mod tests {
       "vacuum shrinking the WAL",
       |path| relocatable_snapshot_db(path, MIB),
       |db| db.vacuum_single_file(None),
+    );
+  }
+
+  /// Closing moves a snapshot with free pages in front of it down to the WAL
+  /// (`compact_for_close`), straight into those pages when it fits there,
+  /// without the temporary copy past the end of the file.
+  #[test]
+  fn close_compaction_failing_at_any_step_leaves_memory_matching_disk() {
+    assert_every_step_fails_safely(
+      "close compaction",
+      |path| {
+        let mut fixture = relocatable_snapshot_db(path, MIB);
+        commit_node(&fixture.db, "in-wal");
+        fixture.wal_only.push("in-wal".into());
+        fixture
+      },
+      |db| {
+        let moved_from = db.header.read().snapshot_start_page;
+        db.compact_for_close()?;
+        let header = db.header.read();
+        assert_ne!(header.snapshot_start_page, moved_from, "nothing moved");
+        assert_eq!(
+          db.pager.lock().file_size(),
+          (header.snapshot_start_page + header.snapshot_page_count) * header.page_size as u64,
+          "pages left after the snapshot"
+        );
+        Ok(())
+      },
     );
   }
 

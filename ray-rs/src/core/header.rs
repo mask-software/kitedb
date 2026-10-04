@@ -260,6 +260,14 @@ impl DbHeaderV1 {
 /// Read both physical header pages and return the newest valid generation.
 /// A torn or partially written inactive page is ignored.
 pub(crate) fn read_header_slots(pager: &mut FilePager) -> Result<(DbHeaderV1, u32)> {
+  read_header_slots_with_fallback(pager).map(|(header, slot, _)| (header, slot))
+}
+
+/// `read_header_slots`, and the other slot's header if it is valid too: the
+/// one a crash falls back to should the selected slot be lost.
+pub(crate) fn read_header_slots_with_fallback(
+  pager: &mut FilePager,
+) -> Result<(DbHeaderV1, u32, Option<DbHeaderV1>)> {
   let mut valid = Vec::with_capacity(2);
   let mut errors = Vec::with_capacity(2);
 
@@ -277,15 +285,14 @@ pub(crate) fn read_header_slots(pager: &mut FilePager) -> Result<(DbHeaderV1, u3
     }
   }
 
-  valid
-    .into_iter()
-    .max_by_key(|(header, slot)| (header.change_counter, *slot == HEADER_SLOT_A))
-    .ok_or_else(|| {
-      KiteError::InvalidSnapshot(format!(
-        "no valid database header slot; {}",
-        errors.join("; ")
-      ))
-    })
+  valid.sort_by_key(|(header, slot)| (header.change_counter, *slot == HEADER_SLOT_A));
+  let Some((header, slot)) = valid.pop() else {
+    return Err(KiteError::InvalidSnapshot(format!(
+      "no valid database header slot; {}",
+      errors.join("; ")
+    )));
+  };
+  Ok((header, slot, valid.pop().map(|(fallback, _)| fallback)))
 }
 
 /// Write one complete header page. The caller must sync before treating the

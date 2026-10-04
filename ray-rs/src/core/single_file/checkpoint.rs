@@ -1620,8 +1620,10 @@ impl SingleFileDB {
     )
   }
 
-  /// Drop physical tail pages only after reload replaced the old snapshot
-  /// mmap and both durable header slots point at the installed snapshot.
+  /// Drop the free pages at the end of the file, down to the installed
+  /// snapshot or the WAL. Only after reload replaced the old snapshot mmap
+  /// and both durable header slots point at the installed snapshot: pages a
+  /// slot may still name are never free.
   fn truncate_orphaned_tail(&self) -> Result<()> {
     let header = self.header.read().clone();
     let keep_pages = header
@@ -1630,13 +1632,16 @@ impl SingleFileDB {
       .max(header.wal_start_page + header.wal_page_count);
     let mut pager = self.pager.lock();
     let file_pages = pager.file_size().div_ceil(header.page_size as u64);
-    if keep_pages < file_pages
-      && u32::try_from(keep_pages)
-        .ok()
-        .zip(u32::try_from(file_pages).ok())
-        .is_some_and(|(start, end)| pager.is_range_free(start, end))
-    {
-      pager.truncate_pages(keep_pages as u32)?;
+    let (Ok(keep_pages), Ok(file_pages)) = (u32::try_from(keep_pages), u32::try_from(file_pages))
+    else {
+      return Ok(());
+    };
+    let mut end = file_pages;
+    while end > keep_pages && pager.is_range_free(end - 1, end) {
+      end -= 1;
+    }
+    if end < file_pages {
+      pager.truncate_pages(end)?;
     }
     Ok(())
   }

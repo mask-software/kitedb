@@ -657,6 +657,16 @@ impl FilePager {
     self.free_pages.extend(self.deferred_free_pages.drain());
   }
 
+  /// Whether any of pages `start_page..end_page` waits in
+  /// `defer_free_pages`: a header slot that may still be the crash fallback
+  /// names it.
+  pub(crate) fn any_deferred_in(&self, start_page: u32, end_page: u32) -> bool {
+    self
+      .deferred_free_pages
+      .iter()
+      .any(|page| (start_page..end_page).contains(page))
+  }
+
   /// Remove pages `start_page..end_page` from the free and deferred lists, so
   /// they are never reused, and return how many were listed. For pages that
   /// hold, or are about to hold, data a header names.

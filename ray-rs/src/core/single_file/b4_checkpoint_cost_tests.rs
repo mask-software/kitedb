@@ -270,8 +270,8 @@ fn load_checkpoint_close(path: &std::path::Path, wal_size: usize) -> FileLayout 
 }
 
 /// Finding 3. The same data, loaded, checkpointed and closed with different
-/// WAL sizes, leaves files that differ only by the WAL area: the explicit
-/// checkpoint leaves no dead pages (old snapshots) in front of the new one.
+/// WAL sizes, leaves files that differ only by the WAL area: no dead pages
+/// (old snapshots) stay in front of the last one.
 #[test]
 fn file_size_after_load_checkpoint_close_does_not_depend_on_wal_size() {
   let dir = tempdir().expect("tempdir");
@@ -306,10 +306,10 @@ fn file_size_after_load_checkpoint_close_does_not_depend_on_wal_size() {
   }
 }
 
-/// Finding 3, after a reopen: dead pages a run left in front of the snapshot
-/// (here: auto-checkpoints ending with the snapshot at the end of the file,
-/// then a close without a checkpoint) are reclaimed by the next checkpoint
-/// of a later process, instead of staying in the file for good.
+/// Finding 3, across processes: dead pages a run left in front of the
+/// snapshot (here: auto-checkpoints ending with the snapshot at the end of
+/// the file) do not stay in the file for good once a later process
+/// checkpoints and closes.
 #[test]
 fn checkpoint_after_reopen_reclaims_dead_pages() {
   let dir = tempdir().expect("tempdir");
@@ -353,4 +353,65 @@ fn checkpoint_after_reopen_reclaims_dead_pages() {
     return;
   }
   panic!("no load left dead pages in front of its snapshot; adjust the sizes");
+}
+
+/// Open puts the pages no header slot names on the free list, but holds back
+/// those the other slot names: after a crash between an install's two header
+/// writes, that slot is the fallback should the newest one be lost, so the
+/// next checkpoint must not write over the snapshot it names.
+#[test]
+fn reopen_after_a_crash_mid_install_keeps_the_fallback_snapshot() {
+  let dir = tempdir().expect("tempdir");
+  let path = dir.path().join("crash-mid-install.kitedb");
+  let options = SingleFileOpenOptions::new().auto_checkpoint(false);
+  let db = open_single_file(&path, options.clone()).expect("open");
+  // A large snapshot, then a small one: its install fails after the first
+  // header slot names it, so the slots name different snapshots.
+  db.begin(false).expect("begin");
+  let ids: Vec<NodeId> = (0..2_000)
+    .map(|index| db.create_node(Some(&format!("n{index}"))).expect("node"))
+    .collect();
+  db.commit().expect("commit");
+  db.checkpoint().expect("checkpoint");
+  db.begin(false).expect("begin");
+  for &id in &ids[10..] {
+    db.delete_node(id).expect("delete");
+  }
+  db.commit().expect("commit");
+  set_checkpoint_test_fault(Some(CheckpointPhase::HeaderDurable));
+  assert!(db.checkpoint().is_err(), "the injected fault did not fire");
+  set_checkpoint_test_fault(None);
+
+  // The crash: the file as it is now.
+  let copy = dir.path().join("crash-mid-install-copy.kitedb");
+  std::fs::copy(&path, &copy).expect("copy");
+  drop(db);
+  let db = open_single_file(&copy, options).expect("open the crash copy");
+  let page_size = db.header.read().page_size as usize;
+  let bytes = std::fs::read(&copy).expect("read");
+  let slots: Vec<DbHeaderV1> = (0..2)
+    .map(|slot| DbHeaderV1::parse(&bytes[slot * page_size..(slot + 1) * page_size]).expect("slot"))
+    .collect();
+  let selected = db.header.read().clone();
+  let fallback = slots
+    .iter()
+    .find(|slot| slot.snapshot_start_page != selected.snapshot_start_page)
+    .expect("the slots name different snapshots")
+    .clone();
+
+  commit_nodes(&db, "after-crash", 1);
+  db.checkpoint().expect("checkpoint after the crash");
+  let written = db.header.read().clone();
+  let fallback_pages =
+    fallback.snapshot_start_page..fallback.snapshot_start_page + fallback.snapshot_page_count;
+  assert!(
+    written.snapshot_start_page + written.snapshot_page_count <= fallback_pages.start
+      || written.snapshot_start_page >= fallback_pages.end,
+    "the checkpoint wrote its snapshot (pages {}..{}) over the one the fallback header slot \
+     names (pages {fallback_pages:?})",
+    written.snapshot_start_page,
+    written.snapshot_start_page + written.snapshot_page_count
+  );
+  assert!(db.node_by_key("n0").is_some() && db.node_by_key("n10").is_none());
+  assert!(db.node_by_key("after-crash-0").is_some());
 }

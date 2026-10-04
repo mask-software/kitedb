@@ -13,7 +13,8 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::constants::*;
 use crate::core::header::{
-  other_header_slot, read_header_slots, write_header_slot, HEADER_SLOT_A, HEADER_SLOT_B,
+  other_header_slot, read_header_slots_with_fallback, write_header_slot, HEADER_SLOT_A,
+  HEADER_SLOT_B, HEADER_SLOT_COUNT,
 };
 use crate::core::pager::{
   create_pager_with_locking, is_valid_page_size, open_pager_with_locking, pages_to_store,
@@ -786,14 +787,14 @@ fn open_single_file_internal(
   }
 
   // Open or create pager
-  let (mut pager, mut header, is_new, mut header_slot) = if file_exists {
+  let (mut pager, mut header, is_new, mut header_slot, fallback_header) = if file_exists {
     // Open existing database
     let mut pager = open_pager_with_locking(path, options.page_size, options.read_only, lock_file)?;
     pager.set_full_fsync(options.full_fsync && options.sync_mode == SyncMode::Full);
 
     // Read both independently checksummed header pages and select the newest
     // valid generation. A torn newest slot falls back to the other slot.
-    let (header, header_slot) = read_header_slots(&mut pager)?;
+    let (header, header_slot, fallback_header) = read_header_slots_with_fallback(&mut pager)?;
 
     // Refuse a format this build cannot read, or (writable) cannot write,
     // before anything below rewrites the file.
@@ -820,7 +821,7 @@ fn open_single_file_internal(
       }
     }
 
-    (pager, header, false, header_slot)
+    (pager, header, false, header_slot, fallback_header)
   } else {
     // Create new database. If another opener created one here since the
     // existence check above, open that one instead.
@@ -849,7 +850,7 @@ fn open_single_file_internal(
     // Sync to disk
     pager.sync()?;
 
-    (pager, header, true, HEADER_SLOT_A)
+    (pager, header, true, HEADER_SLOT_A, None)
   };
 
   // Initialize WAL buffer
@@ -896,6 +897,10 @@ fn open_single_file_internal(
       wal_buffer.store_in_header(&mut header);
       header.checkpoint_in_progress = 0;
       install_recovered_header(&mut pager, &mut header, &mut header_slot)?;
+    }
+
+    if !is_new {
+      reclaim_unnamed_pages(&mut pager, &header, fallback_header.as_ref());
     }
   }
 
@@ -1176,6 +1181,62 @@ fn open_single_file_internal(
   })
 }
 
+/// Put the pages of the file no header slot names on the pager's free list,
+/// for checkpoints to reuse and to truncate at the end of the file. The list
+/// lives in memory, so without this the pages an earlier process freed (old
+/// snapshots in front of the last one, or a snapshot an interrupted
+/// checkpoint wrote) stayed in the file for good.
+///
+/// The pages `fallback` (the other valid header slot, as open found it)
+/// names are held back until an install is durable in both slots, as a
+/// running database holds back its own: until then a crash may still fall
+/// back to that slot. (A header that recovery installed since names the
+/// pages `header` names.)
+fn reclaim_unnamed_pages(
+  pager: &mut FilePager,
+  header: &DbHeaderV1,
+  fallback: Option<&DbHeaderV1>,
+) {
+  fn named(header: &DbHeaderV1) -> [(u64, u64); 2] {
+    [
+      (
+        header.wal_start_page,
+        header.wal_start_page + header.wal_page_count,
+      ),
+      (
+        header.snapshot_start_page,
+        header
+          .snapshot_start_page
+          .saturating_add(header.snapshot_page_count),
+      ),
+    ]
+  }
+  let fallback = fallback.map_or([(0, 0); 2], named);
+  let mut live = named(header);
+  live.sort_unstable();
+  let Ok(file_pages) = u32::try_from(pager.file_size().div_ceil(header.page_size as u64)) else {
+    return;
+  };
+  let file_pages = u64::from(file_pages);
+
+  // Every page between the header pages, the live ranges and the end of
+  // the file.
+  let mut gap_start = HEADER_SLOT_COUNT;
+  for (start, end) in live.into_iter().chain([(file_pages, file_pages)]) {
+    for page in gap_start..start.min(file_pages) {
+      let held_back = fallback
+        .iter()
+        .any(|&(start, end)| start <= page && page < end);
+      if held_back {
+        pager.defer_free_pages(page as u32, 1);
+      } else {
+        pager.free_pages(page as u32, 1);
+      }
+    }
+    gap_start = gap_start.max(end);
+  }
+}
+
 /// Install a header written while opening in the slot after `header_slot`,
 /// durably, keeping the selected header as the fallback until it lands.
 fn install_recovered_header(
@@ -1359,6 +1420,7 @@ pub fn close_single_file_with_options(
     return Ok(());
   }
 
+  db.compact_for_close()?;
   // On failure, dropping `db` tries once more.
   db.persist_for_close()?;
   db.closed.store(true, Ordering::Release);
