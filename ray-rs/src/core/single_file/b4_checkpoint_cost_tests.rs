@@ -530,3 +530,84 @@ fn checkpoint_keeps_every_edge_and_property_as_read_before_it() {
     "the reopened graph differs"
   );
 }
+
+/// Finding 2, the worst case: with several writers, the committer that
+/// started an auto-checkpoint also ran a pass for what the others wrote while
+/// they waited for its install, and another, up to five whole snapshot
+/// rebuilds in one commit (9 s at 1M nodes / 10M edges, 24 s before the
+/// rebuild was made cheaper). The auto-checkpoint now takes one pass; the
+/// next commit past the threshold checkpoints again.
+#[test]
+fn auto_checkpoint_takes_one_pass_when_writers_waited_for_it() {
+  let dir = tempdir().expect("tempdir");
+  let path = dir.path().join("auto-checkpoint-one-pass.kitedb");
+  let db = Arc::new(
+    open_single_file(&path, SingleFileOpenOptions::new().wal_size(SMALL_WAL)).expect("open"),
+  );
+  let first_pass = Arc::new(Barrier::new(2));
+  set_checkpoint_test_barrier(&db, CheckpointPhase::CutReleased, Arc::clone(&first_pass));
+  // The committer: small commits until one starts the auto-checkpoint, which
+  // holds it after its cut.
+  let (returned, committer_returned) = mpsc::channel();
+  let committer = {
+    let db = Arc::clone(&db);
+    std::thread::spawn(move || {
+      let mut commits = 0;
+      while checkpoint_test_cuts(&db) == 0 {
+        commit_nodes(&db, &format!("c{commits}"), 4);
+        commits += 1;
+      }
+      let _ = returned.send(());
+    })
+  };
+  let deadline = Instant::now() + Duration::from_secs(5);
+  while db.checkpoint_state.lock().cut_owner.is_none() {
+    assert!(Instant::now() < deadline, "no auto-checkpoint cut");
+    std::thread::yield_now();
+  }
+  // Another writer: small commits, many times the secondary region, so it
+  // waits for the install, then crosses the threshold again.
+  set_checkpoint_test_stall_timeout(&db, Duration::from_secs(120));
+  let (finished, writer_finished) = mpsc::channel();
+  let writer = {
+    let db = Arc::clone(&db);
+    std::thread::spawn(move || {
+      for commit in 0..400 {
+        commit_nodes(&db, &format!("w{commit}"), 4);
+      }
+      let _ = finished.send(());
+    })
+  };
+  while !db.checkpoint_state.lock().writers_waited {
+    assert!(Instant::now() < deadline, "the writer never waited");
+    std::thread::yield_now();
+  }
+  // Hold whichever checkpoint cuts next: a second pass of the committer's,
+  // or the writer's own auto-checkpoint once its commit crosses the
+  // threshold.
+  let next_pass = Arc::new(Barrier::new(2));
+  set_checkpoint_test_barrier(&db, CheckpointPhase::CutReleased, Arc::clone(&next_pass));
+  first_pass.wait();
+  let outcome = committer_returned.recv_timeout(Duration::from_secs(3));
+  // Release the held checkpoint, whoever runs it.
+  while checkpoint_test_cuts(&db) < 2 {
+    assert!(
+      Instant::now() < deadline + Duration::from_secs(5),
+      "no second cut"
+    );
+    std::thread::yield_now();
+  }
+  next_pass.wait();
+  committer.join().expect("committer");
+  writer.join().expect("writer");
+  writer_finished.recv().expect("writer done");
+  assert!(
+    outcome.is_ok(),
+    "the commit that started the auto-checkpoint ran another pass for the writer that waited for \
+     its install"
+  );
+  while db.is_checkpoint_running() {
+    std::thread::yield_now();
+  }
+  assert!(db.node_by_key("w399-3").is_some());
+}
