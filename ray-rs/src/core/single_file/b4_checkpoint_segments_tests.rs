@@ -941,3 +941,47 @@ fn crash_during_a_checkpoint_with_segments_keeps_every_commit() {
   assert!(missing(&reopened, &acked).is_empty());
   assert!(missing(&reopened, &more).is_empty());
 }
+
+/// Automatic checkpoints run on the database's checkpoint thread (started
+/// at the first one; a read-only database runs none), which records the
+/// error of a failed run for `checkpoint_error` until a checkpoint succeeds,
+/// and stops when the database closes.
+#[test]
+fn checkpoint_thread_runs_records_errors_and_stops() {
+  let dir = tempdir().expect("tempdir");
+  let path = dir.path().join("checkpoint-thread-lifecycle.kitedb");
+  let db = open_single_file(&path, options().sync_mode(SyncMode::Normal)).expect("open");
+  assert!(
+    !checkpoint_thread_running(&db),
+    "started before any checkpoint"
+  );
+  set_checkpoint_test_db_fault(&db, CheckpointPhase::SnapshotWritten, true);
+  let mut acked = Vec::new();
+  for index in 0..2_000 {
+    acked.extend(commit_keys(&db, "key", index, 1));
+    db.wait_for_checkpoint_thread();
+    if checkpoint_thread_error(&db).is_some() {
+      break;
+    }
+  }
+  clear_checkpoint_test_db_faults(&db);
+  assert!(
+    checkpoint_thread_running(&db),
+    "no checkpoint thread started"
+  );
+  let reported = checkpoint_thread_error(&db);
+  assert!(
+    reported
+      .as_deref()
+      .is_some_and(|error| error.contains("injected checkpoint abort")),
+    "the thread's error was not recorded: {reported:?}"
+  );
+  db.background_checkpoint()
+    .expect("a checkpoint without the fault");
+  assert_eq!(checkpoint_thread_error(&db), None, "the error stayed");
+  close_single_file(db).expect("close");
+  let reopened =
+    open_single_file(&path, SingleFileOpenOptions::new().read_only(true)).expect("read-only open");
+  assert!(missing(&reopened, &acked).is_empty());
+  assert!(!checkpoint_thread_running(&reopened));
+}

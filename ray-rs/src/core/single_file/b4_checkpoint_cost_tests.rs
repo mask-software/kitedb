@@ -136,7 +136,6 @@ fn bulk_load_writes_snapshot_bytes_linear_in_the_data() {
 /// threshold returns without waiting for the checkpoint it starts. The
 /// checkpoint is held after its cut; the commit must come back meanwhile.
 #[test]
-#[ignore = "needs WAL log segments and a checkpoint thread (fix/b4-checkpoint-segments)"]
 fn commit_that_starts_an_auto_checkpoint_returns_before_the_checkpoint_finishes() {
   let dir = tempdir().expect("tempdir");
   let path = dir.path().join("commit-not-held-by-auto-checkpoint.kitedb");

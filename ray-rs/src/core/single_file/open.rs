@@ -1180,6 +1180,12 @@ fn open_single_file_internal(
     vector_stores: RwLock::new(vector_stores),
     vector_store_lazy_entries: RwLock::new(vector_store_lazy_entries),
     checkpoint_compression: options.checkpoint_compression.clone(),
+    checkpoint_thread_enabled: true,
+    checkpoint_thread: Mutex::new(None),
+    checkpoint_thread_stopped: AtomicBool::new(false),
+    checkpoint_abandoned: AtomicBool::new(false),
+    checkpoint_installing: AtomicBool::new(false),
+    checkpoint_last_error: Mutex::new(None),
     wal_segment_size,
     checkpoint_log_ratio: CHECKPOINT_LOG_RATIO_DEFAULT,
     wal_log_budget: WAL_LOG_BUDGET_DEFAULT as u64,
@@ -1432,6 +1438,9 @@ pub fn close_single_file_with_options(
   db: SingleFileDB,
   options: SingleFileCloseOptions,
 ) -> Result<()> {
+  // First: a run still building its snapshot is abandoned, one installing
+  // finishes, and the thread ends (it holds a handle to the database).
+  db.stop_checkpoint_thread();
   if let Some(threshold_raw) = options.checkpoint_if_wal_usage_at_least {
     if !threshold_raw.is_finite() {
       return Err(KiteError::Internal(format!(

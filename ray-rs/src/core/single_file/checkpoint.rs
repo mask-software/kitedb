@@ -25,6 +25,9 @@ use crate::types::*;
 use crate::vector::store::{create_vector_store, vector_store_delete, vector_store_insert};
 use crate::vector::types::{VectorManifest, VectorStoreConfig};
 
+use super::checkpoint_thread::on_checkpoint_thread;
+#[cfg(test)]
+use super::checkpoint_thread::CHECKPOINT_THREAD_NAME;
 use super::open::map_snapshot_range;
 use super::recovery::{committed_transactions, committed_transactions_after, replay_wal_record};
 use super::segments::{live_end_page, read_wal_segment_records};
@@ -334,10 +337,6 @@ fn disarm_checkpoint_test_barrier(db: &SingleFileDB, phase: CheckpointPhase) -> 
   configured.len() != before
 }
 
-/// The name a database's checkpoint thread runs under.
-#[cfg(test)]
-const CHECKPOINT_THREAD_NAME: &str = "kitedb-checkpoint";
-
 /// What `db`'s header says of its WAL segments (see
 /// `b4_checkpoint_segments_tests`).
 #[cfg(test)]
@@ -373,20 +372,16 @@ fn set_wal_segment_test_limit(db: &SingleFileDB, bytes: u64) {
   db.wal_segment_limit_bytes.store(bytes, Ordering::Relaxed);
 }
 
-/// Whether `db` runs a checkpoint thread now. None runs until the thread
-/// lands.
+/// Whether `db` runs a checkpoint thread now.
 #[cfg(test)]
 fn checkpoint_thread_running(db: &SingleFileDB) -> bool {
-  let _ = db;
-  false
+  db.checkpoint_thread_running()
 }
 
-/// The error of `db`'s last checkpoint-thread run, if no run succeeded since
-/// (`SingleFileDB::checkpoint_error` once the thread lands).
+/// The error of `db`'s last checkpoint-thread run, if no run succeeded since.
 #[cfg(test)]
 fn checkpoint_thread_error(db: &SingleFileDB) -> Option<String> {
-  let _ = db;
-  None
+  db.checkpoint_error()
 }
 
 /// Writers waiting now for a checkpoint to free WAL segment space.
@@ -664,6 +659,28 @@ impl Drop for CheckpointStep<'_> {
       .checkpoint_steps_running
       .fetch_sub(1, Ordering::AcqRel);
     self.db.checkpoint_progress.fetch_add(1, Ordering::Relaxed);
+  }
+}
+
+/// Marks a background checkpoint's install as begun until dropped: a
+/// closing database lets it finish (see `checkpoint_progressed`).
+struct InstallingGuard<'db> {
+  db: &'db SingleFileDB,
+}
+
+impl<'db> InstallingGuard<'db> {
+  fn new(db: &'db SingleFileDB) -> Self {
+    db.checkpoint_installing.store(true, Ordering::Release);
+    Self { db }
+  }
+}
+
+impl Drop for InstallingGuard<'_> {
+  fn drop(&mut self) {
+    self
+      .db
+      .checkpoint_installing
+      .store(false, Ordering::Release);
   }
 }
 
@@ -954,6 +971,16 @@ impl SingleFileDB {
     if self.checkpoint_cancelled.load(Ordering::Acquire) {
       return Err(cancelled_checkpoint_error());
     }
+    // The database is closing: a checkpoint thread's run stops, unless its
+    // install has begun.
+    if on_checkpoint_thread()
+      && self.checkpoint_abandoned.load(Ordering::Acquire)
+      && !self.checkpoint_installing.load(Ordering::Acquire)
+    {
+      return Err(KiteError::Internal(
+        "background checkpoint abandoned: the database is closing".to_string(),
+      ));
+    }
     Ok(())
   }
 
@@ -1077,6 +1104,11 @@ impl SingleFileDB {
     {
       return false;
     }
+    // The checkpoint thread runs it, unless the WAL refused a record: the
+    // writer needs the room now.
+    if !wal_refused && self.uses_checkpoint_thread() && self.request_background_checkpoint() {
+      return false;
+    }
     let result = if self.background_checkpoint {
       self.auto_background_checkpoint(wal_refused)
     } else {
@@ -1087,6 +1119,14 @@ impl SingleFileDB {
       eprintln!("Warning: Auto-checkpoint failed: {error}");
     }
     result.is_ok()
+  }
+
+  /// A checkpoint thread's run: `background_checkpoint`, quietly skipped
+  /// when one is running, declined, or an exclusive operation waits.
+  pub(crate) fn run_auto_checkpoint(&self) -> Result<()> {
+    self
+      .run_background_checkpoint(MAX_EXTRA_BACKGROUND_PASSES)
+      .map(|_| ())
   }
 
   /// `background_checkpoint`, taking at most `max_extra_passes` passes after
@@ -1411,6 +1451,8 @@ impl SingleFileDB {
     // that tries waits until the install releases it.
     let _checkpoint_gate = self.checkpoint_gate.write();
     let _commit_guard = self.lock_commits();
+    // From here the install finishes even if the database is closing.
+    let _installing = InstallingGuard::new(self);
 
     // Writers may have cancelled the cut while this run made no progress
     // (see `wait_for_cut_release`): the WAL is back in the primary region,
@@ -1976,6 +2018,8 @@ impl SingleFileDB {
       );
     }
     pager.release_deferred_free_pages();
+    // A checkpoint succeeded: the checkpoint thread's last error is stale.
+    *self.checkpoint_last_error.lock() = None;
     Ok(())
   }
 
@@ -4239,6 +4283,7 @@ mod tests {
         commits_above_threshold += 1;
       }
     }
+    db.wait_for_checkpoint_thread();
     assert_eq!(
       checkpoint_test_cuts(&db),
       1,
@@ -4251,6 +4296,7 @@ mod tests {
     go_tx.send(()).expect("release writer");
     writer.join().expect("writer thread");
     commit_node(&db, "after");
+    db.wait_for_checkpoint_thread();
     assert_eq!(checkpoint_test_cuts(&db), 2);
     assert!(db.header.read().active_snapshot_gen > start_gen);
 

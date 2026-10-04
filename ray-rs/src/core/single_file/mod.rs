@@ -27,6 +27,7 @@ use crate::vector::types::VectorManifest;
 // Submodules
 mod check;
 mod checkpoint;
+mod checkpoint_thread;
 mod commit_profile;
 mod compactor;
 mod iter;
@@ -433,6 +434,21 @@ pub struct SingleFileInner {
   /// Compression options for checkpoint snapshots
   pub(crate) checkpoint_compression: Option<CompressionOptions>,
 
+  /// Run automatic checkpoints on a checkpoint thread (see
+  /// `checkpoint_thread`).
+  pub(crate) checkpoint_thread_enabled: bool,
+  /// The checkpoint thread, once started.
+  pub(crate) checkpoint_thread: Mutex<Option<checkpoint_thread::CheckpointThread>>,
+  /// Set once the database closes: no checkpoint thread starts again.
+  pub(crate) checkpoint_thread_stopped: AtomicBool,
+  /// Set while a closing database waits for its checkpoint thread: a run
+  /// still building its snapshot stops (see `checkpoint_progressed`).
+  pub(crate) checkpoint_abandoned: AtomicBool,
+  /// Set while a background checkpoint installs: closing lets it finish.
+  pub(crate) checkpoint_installing: AtomicBool,
+  /// The error of the checkpoint thread's last run, until one succeeds.
+  pub(crate) checkpoint_last_error: Mutex<Option<String>>,
+
   /// Bytes of a new WAL segment extent (see `segments`).
   pub(crate) wal_segment_size: u64,
   /// A checkpoint starts once the WAL segments hold this fraction of the
@@ -566,7 +582,12 @@ impl BackgroundCheckpointState {
 /// After a successful close it does nothing.
 impl Drop for SingleFileDB {
   fn drop(&mut self) {
-    if !self.owner || self.read_only || self.closed.load(Ordering::Acquire) {
+    if !self.owner {
+      return;
+    }
+    // Before anything else: the thread holds a handle to this database.
+    self.stop_checkpoint_thread();
+    if self.read_only || self.closed.load(Ordering::Acquire) {
       return;
     }
     let persisted =
