@@ -987,6 +987,147 @@ fn a_panic_on_the_checkpoint_thread_is_reported_and_writes_are_refused() {
   assert!(missing(&reopened, &acked).is_empty());
 }
 
+/// Review finding R9, on the caller's thread. A write operation's panic
+/// reaches its caller, who may catch it and go on (the Python bindings
+/// raise it as an exception); the handle refuses writes from then on, as
+/// after a checkpoint thread's panic. `operation` panics at `phase`, armed
+/// on `db`, whose acknowledged commits are `acked`.
+fn assert_writes_refused_after_a_caught_panic(
+  db: SingleFileDB,
+  path: &std::path::Path,
+  reopen_options: SingleFileOpenOptions,
+  mut acked: Vec<String>,
+  phase: CheckpointPhase,
+  mut operation: impl FnMut(&SingleFileDB, &mut Vec<String>) -> Result<()>,
+) {
+  set_checkpoint_test_db_panic(&db, phase);
+  let caught =
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| operation(&db, &mut acked)));
+  assert!(caught.is_err(), "setup: no panic at {phase:?}: {caught:?}");
+  // A rollback ends a transaction the panic left open, and succeeds.
+  if db.has_transaction() {
+    db.rollback().expect("the rollback after the panic");
+  }
+  let refused = |what: &str, result: Result<()>| {
+    assert!(
+      result
+        .as_ref()
+        .is_err_and(|error| error.to_string().contains("refuses writes")),
+      "{what} after the panic at {phase:?}: {result:?}"
+    );
+  };
+  refused("a commit", commit_key(&db, &key("after", 0)));
+  refused("a background checkpoint", db.background_checkpoint());
+  refused("a blocking checkpoint", db.checkpoint());
+  assert!(missing(&db, &acked).is_empty(), "reads lost commits");
+  refused("closing", close_single_file(db));
+
+  let reopened = open_single_file(path, reopen_options.clone()).expect("reopen");
+  assert!(
+    missing(&reopened, &acked).is_empty(),
+    "the reopen after the panic at {phase:?} lost commits"
+  );
+  assert!(reopened.node_by_key(&key("after", 0)).is_none());
+  let after = commit_keys(&reopened, "reopened", 0, 10);
+  assert_eq!(after.len(), 10, "the reopened database refused commits");
+  acked.extend(after);
+  reopened
+    .checkpoint()
+    .expect("a checkpoint after the reopen");
+  close_single_file(reopened).expect("close");
+  let reopened = open_single_file(path, reopen_options).expect("reopen again");
+  assert!(missing(&reopened, &acked).is_empty());
+}
+
+/// R9 on a committing thread: a commit's spill panics between its header's
+/// two slots (the WAL's records are in a segment, one slot names it, the
+/// other still names them in the WAL).
+#[test]
+fn a_panic_in_a_commits_spill_refuses_writes() {
+  let dir = tempdir().expect("tempdir");
+  let path = dir.path().join("commit-spill-panic.kitedb");
+  let db = open_single_file(&path, spilling_options()).expect("open");
+  let acked = commit_keys(&db, "a", 0, 10);
+  assert_writes_refused_after_a_caught_panic(
+    db,
+    &path,
+    spilling_options(),
+    acked,
+    CheckpointPhase::SpillHeaderDurable,
+    |db, acked| {
+      // Commits until one spills (about 170 fill the WAL).
+      for index in 10..2_000 {
+        let key = key("a", index);
+        commit_key(db, &key)?;
+        acked.push(key);
+      }
+      Ok(())
+    },
+  );
+}
+
+/// R9 inside a transaction: a write too large for what the WAL has left
+/// spills the transaction's records so far, and the spill panics.
+#[test]
+fn a_panic_in_a_transactions_spill_refuses_writes() {
+  let dir = tempdir().expect("tempdir");
+  let path = dir.path().join("transaction-spill-panic.kitedb");
+  let db = open_single_file(&path, spilling_options()).expect("open");
+  let acked = commit_keys(&db, "a", 0, 10);
+  assert_writes_refused_after_a_caught_panic(
+    db,
+    &path,
+    spilling_options(),
+    acked,
+    CheckpointPhase::SpillHeaderDurable,
+    |db, _| {
+      db.begin(false)?;
+      for index in 0..2_000 {
+        db.create_node(Some(&key("big", index)))?;
+      }
+      db.commit()
+    },
+  );
+}
+
+/// R9 in a blocking checkpoint: it panics in its install, between its
+/// header writes.
+#[test]
+fn a_panic_in_a_blocking_checkpoint_refuses_writes() {
+  let dir = tempdir().expect("tempdir");
+  let path = dir.path().join("blocking-checkpoint-panic.kitedb");
+  let db = open_single_file(&path, spilling_options()).expect("open");
+  let acked = commit_keys(&db, "a", 0, 400);
+  assert!(wal_segment_test_stats(&db).live > 0, "setup: no spill");
+  assert_writes_refused_after_a_caught_panic(
+    db,
+    &path,
+    spilling_options(),
+    acked,
+    CheckpointPhase::HeaderWritten,
+    |db, _| db.checkpoint(),
+  );
+}
+
+/// R9 in a background checkpoint the caller runs: it panics in its
+/// install, between its header writes.
+#[test]
+fn a_panic_in_a_callers_background_checkpoint_refuses_writes() {
+  let dir = tempdir().expect("tempdir");
+  let path = dir.path().join("background-checkpoint-panic.kitedb");
+  let db = open_single_file(&path, spilling_options()).expect("open");
+  let acked = commit_keys(&db, "a", 0, 400);
+  assert!(wal_segment_test_stats(&db).live > 0, "setup: no spill");
+  assert_writes_refused_after_a_caught_panic(
+    db,
+    &path,
+    spilling_options(),
+    acked,
+    CheckpointPhase::HeaderWritten,
+    |db, _| db.background_checkpoint(),
+  );
+}
+
 /// Review finding 8(a). A rollback succeeds even when the WAL and its
 /// segments are full: its ROLLBACK record is not needed (recovery drops a
 /// transaction without a COMMIT record), so it never waits or fails for log
