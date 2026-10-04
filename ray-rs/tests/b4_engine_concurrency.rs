@@ -368,7 +368,6 @@ fn f1_writers_bulk_load_group_commit_and_auto_checkpoints_guard() {
       .group_commit_window_ms(1)
       .wal_size(256 * 1024)
       .auto_checkpoint(true)
-      .checkpoint_threshold(0.5)
       .background_checkpoint(background);
     let db = open(&path, opts.clone());
     let scenario_db = Arc::clone(&db);

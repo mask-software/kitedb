@@ -147,7 +147,8 @@ class Kite:
             edges: List of edge definitions
             options: Optional database options
             close_checkpoint_if_wal_usage_at_least:
-                On close, checkpoint if WAL usage >= threshold. Set None to disable.
+                On close, checkpoint if the log the snapshot does not cover is at
+                least this fraction of the checkpoint trigger. Set None to disable.
         """
         self._db = Database(path, options)
         self._close_checkpoint_if_wal_usage_at_least = (
@@ -989,7 +990,8 @@ def kite(
         edges: List of edge definitions
         options: Optional database options
         close_checkpoint_if_wal_usage_at_least:
-            On close, checkpoint if WAL usage >= threshold. Set None to disable.
+            On close, checkpoint if the log the snapshot does not cover is at
+            least this fraction of the checkpoint trigger. Set None to disable.
     
     Returns:
         Kite database instance

@@ -38,7 +38,8 @@ type Args = {
   changeRatio: number
   deleteRatio: number
   walSizeMb: number
-  checkpointThreshold: number
+  /** --checkpoint-log-ratio; undefined: the library default. */
+  checkpointLogRatio?: number
   backgroundCheckpoint: boolean
   /** --mvcc / --no-mvcc; undefined: the library default. */
   mvcc?: boolean
@@ -144,7 +145,9 @@ function parseArgs(argv: string[]): Args {
     changeRatio: Number.parseFloat(process.env.SCIP_CHANGE_RATIO ?? '0.8'),
     deleteRatio: Number.parseFloat(process.env.SCIP_DELETE_RATIO ?? '0.35'),
     walSizeMb: Number.parseInt(process.env.SCIP_WAL_SIZE_MB ?? '512', 10),
-    checkpointThreshold: Number.parseFloat(process.env.SCIP_CHECKPOINT_THRESHOLD ?? '0.4'),
+    checkpointLogRatio: process.env.SCIP_CHECKPOINT_LOG_RATIO
+      ? Number.parseFloat(process.env.SCIP_CHECKPOINT_LOG_RATIO)
+      : undefined,
     backgroundCheckpoint: process.env.SCIP_BACKGROUND_CHECKPOINT === '1',
   }
 
@@ -254,8 +257,8 @@ function parseArgs(argv: string[]): Args {
       case '--wal-size-mb':
         args.walSizeMb = int(arg)
         break
-      case '--checkpoint-threshold':
-        args.checkpointThreshold = float(arg)
+      case '--checkpoint-log-ratio':
+        args.checkpointLogRatio = float(arg)
         break
       case '--background-checkpoint':
         args.backgroundCheckpoint = true
@@ -574,7 +577,7 @@ function openDb(dbPath: string, args: Args): Database {
   return Database.open(dbPath, {
     walSize: Math.max(args.walSizeMb, 8) * 1024 * 1024,
     autoCheckpoint: true,
-    checkpointThreshold: args.checkpointThreshold,
+    ...(args.checkpointLogRatio === undefined ? {} : { checkpointLogRatio: args.checkpointLogRatio }),
     backgroundCheckpoint: args.backgroundCheckpoint,
     // Passed only when given, so the run gets the library default.
     ...(args.mvcc === undefined ? {} : { mvcc: args.mvcc }),

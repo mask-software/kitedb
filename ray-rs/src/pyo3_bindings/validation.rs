@@ -87,6 +87,16 @@ pub(crate) fn vector_len(field: &str, vector: &[f64], dimensions: usize) -> PyRe
   Ok(())
 }
 
+/// A finite number, at least 0.
+pub(crate) fn non_negative_number(field: &str, value: f64) -> PyResult<f64> {
+  if !value.is_finite() || value < 0.0 {
+    return Err(PyValueError::new_err(format!(
+      "{field} must be a finite number, at least 0"
+    )));
+  }
+  Ok(value)
+}
+
 pub(crate) fn ratio(field: &str, value: f64) -> PyResult<f64> {
   if !value.is_finite() || !(0.0..=1.0).contains(&value) {
     return Err(PyValueError::new_err(format!(

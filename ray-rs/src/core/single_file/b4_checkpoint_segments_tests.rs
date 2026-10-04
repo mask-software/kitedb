@@ -851,3 +851,63 @@ fn checkpoint_thread_runs_records_errors_and_stops() {
   assert!(missing(&reopened, &acked).is_empty());
   assert!(!checkpoint_thread_running(&reopened));
 }
+
+/// The checkpoint trigger is `checkpoint_log_ratio` of the snapshot's size,
+/// at least four WALs, at most `checkpoint_log_budget` (which also caps that
+/// floor); the WAL segment limit is twice the trigger, at least 16 WALs, at
+/// most four budgets, unless `wal_segment_limit` sets it.
+#[test]
+fn checkpoint_trigger_and_segment_limit_follow_the_log_options() {
+  const MIB: u64 = 1024 * 1024;
+  let wal = SMALL_WAL as u64;
+  let dir = tempdir().expect("tempdir");
+  let with_snapshot = |db: &SingleFileDB, bytes: u64| {
+    let mut header = db.header.read().clone();
+    header.snapshot_page_count = bytes / header.page_size as u64;
+    header
+  };
+
+  let db = open_single_file(dir.path().join("defaults.kitedb"), options()).expect("open");
+  let empty = with_snapshot(&db, 0);
+  assert_eq!(db.checkpoint_log_trigger(&empty), 4 * wal);
+  assert_eq!(db.wal_segment_limit(&empty), 16 * wal);
+  let medium = with_snapshot(&db, 100 * MIB);
+  assert_eq!(db.checkpoint_log_trigger(&medium), 50 * MIB);
+  assert_eq!(db.wal_segment_limit(&medium), 100 * MIB);
+  let large = with_snapshot(&db, 1024 * MIB);
+  assert_eq!(db.checkpoint_log_trigger(&large), 128 * MIB);
+  assert_eq!(db.wal_segment_limit(&large), 256 * MIB);
+  close_single_file(db).expect("close");
+
+  let tuned = options()
+    .checkpoint_log_ratio(2.0)
+    .checkpoint_log_budget(MIB / 8);
+  let db = open_single_file(dir.path().join("tuned.kitedb"), tuned.clone()).expect("open");
+  // The budget caps the floor of four WALs too.
+  assert_eq!(db.checkpoint_log_trigger(&with_snapshot(&db, 0)), MIB / 8);
+  let medium = with_snapshot(&db, 100 * MIB);
+  assert_eq!(db.checkpoint_log_trigger(&medium), MIB / 8);
+  assert_eq!(db.wal_segment_limit(&medium), MIB / 2);
+  close_single_file(db).expect("close");
+
+  let db = open_single_file(
+    dir.path().join("limited.kitedb"),
+    tuned.wal_segment_limit(3 * MIB),
+  )
+  .expect("open");
+  assert_eq!(
+    db.wal_segment_limit(&with_snapshot(&db, 100 * MIB)),
+    3 * MIB
+  );
+  close_single_file(db).expect("close");
+
+  for refused in [
+    options().checkpoint_log_ratio(f64::NAN),
+    options().checkpoint_log_ratio(-1.0),
+    options().checkpoint_log_budget(0),
+    options().wal_segment_size(0),
+    options().wal_segment_limit(0),
+  ] {
+    assert!(open_single_file(dir.path().join("refused.kitedb"), refused).is_err());
+  }
+}

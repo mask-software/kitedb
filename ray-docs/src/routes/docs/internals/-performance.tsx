@@ -379,6 +379,12 @@ const MEMORY_PARTS: {
 			{
 				text: "Grows with writes until a checkpoint folds it into a new snapshot.",
 			},
+			{
+				text: "Takes about ten times the bytes of log it holds, so ",
+				code: "checkpointLogBudget",
+				after:
+					" (default 128 MiB of log, about 1.3 GB of delta) bounds it at the checkpoint trigger; a checkpoint briefly needs about twice that.",
+			},
 		],
 	},
 	{
@@ -626,8 +632,12 @@ export function PerformancePage() {
 					<strong>Fastest ingest (single writer):</strong>{" "}
 					<code>beginBulk()</code> + <code>createNodesBatch()</code> +{" "}
 					<code>addEdgesBatch()</code> / <code>addEdgesWithPropsBatch()</code>,{" "}
-					<code>syncMode=Normal</code>, a WAL of 256 MB or more,
-					auto-checkpoint off during ingest, then a checkpoint.
+					<code>syncMode=Normal</code>, and the default checkpoint settings: a
+					full WAL spills into WAL segments and checkpoints run on the
+					checkpoint thread, so the WAL needs no resizing (a larger one only
+					means fewer spills). With auto-checkpoint off, writes fail once the
+					WAL segments reach <code>walSegmentLimit</code>: raise it to hold the
+					whole load, then checkpoint.
 				</li>
 				<li>
 					<strong>Several writer threads:</strong> <code>syncMode=Normal</code>,
@@ -636,8 +646,10 @@ export function PerformancePage() {
 				</li>
 				<li>
 					<strong>Read-heavy, mixed workload:</strong> keep write batches small,
-					leave auto-checkpoint on (it runs at 50% WAL usage by default; tune
-					with <code>checkpointThreshold</code>), and bound traversal depth.
+					leave auto-checkpoint on (it runs once the log reaches half the
+					snapshot's size, at most 128 MiB; tune with{" "}
+					<code>checkpointLogRatio</code> and <code>checkpointLogBudget</code>),
+					and bound traversal depth.
 				</li>
 				<li>
 					<strong>Fastest, least durable:</strong> <code>syncMode=Off</code>,

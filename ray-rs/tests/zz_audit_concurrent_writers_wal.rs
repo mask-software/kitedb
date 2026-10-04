@@ -20,7 +20,6 @@ fn options(background: bool, mvcc: bool) -> SingleFileOpenOptions {
     .mvcc(mvcc)
     .wal_size(WAL_SIZE)
     .auto_checkpoint(true)
-    .checkpoint_threshold(0.5)
     .background_checkpoint(background)
 }
 

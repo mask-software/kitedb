@@ -166,12 +166,34 @@ pub struct OpenOptions {
   /// Set: a new file gets this size; an existing file with a different WAL
   /// size fails to open.
   pub wal_size: Option<f64>,
-  /// Enable auto-checkpoint when WAL usage exceeds threshold
+  /// Checkpoint automatically once the log (the WAL and its WAL segments)
+  /// reaches the checkpoint trigger (default: true; see
+  /// `checkpointLogRatio`). Without, the WAL spills into WAL segments until
+  /// `walSegmentLimit`, then writes fail with a WAL-full error.
   pub auto_checkpoint: Option<bool>,
-  /// WAL usage threshold (0.0-1.0) to trigger auto-checkpoint
+  /// @deprecated No effect: automatic checkpoints follow the log (see `checkpointLogRatio` and `checkpointLogBudget`). Still accepted (in [0, 1]) so existing callers keep working.
   pub checkpoint_threshold: Option<f64>,
   /// Use background (non-blocking) checkpoint
   pub background_checkpoint: Option<bool>,
+  /// Run automatic background checkpoints on a thread of the database's
+  /// own, so the commit that crosses the trigger returns at once (default:
+  /// true)
+  pub checkpoint_thread: Option<bool>,
+  /// Checkpoint once the log the snapshot does not cover reaches this
+  /// fraction of the snapshot's size (default: 0.5; at least four WALs, at
+  /// most `checkpointLogBudget`)
+  pub checkpoint_log_ratio: Option<f64>,
+  /// The most log, in bytes, an automatic checkpoint waits for (default:
+  /// 128 MiB). The in-memory delta takes about ten times the log's size.
+  /// Writers wait for a checkpoint only at the WAL segment limit (by default
+  /// twice the checkpoint trigger, at most four times this).
+  pub checkpoint_log_budget: Option<f64>,
+  /// Bytes of a WAL segment extent (default: eight WALs, at most 32 MiB)
+  pub wal_segment_size: Option<f64>,
+  /// The most bytes of WAL segments before writers wait for a checkpoint
+  /// (default: twice the checkpoint trigger, at least 16 WALs, at most four
+  /// times `checkpointLogBudget`)
+  pub wal_segment_limit: Option<f64>,
   /// Compression options for checkpoint snapshots (single-file only)
   pub checkpoint_compression: Option<CompressionOptions>,
   /// @deprecated No effect: the cache layer was removed. Still accepted so existing callers keep working.
@@ -274,10 +296,28 @@ impl OpenOptions {
       rust_opts = rust_opts.auto_checkpoint(v);
     }
     if let Some(v) = self.checkpoint_threshold {
-      rust_opts = rust_opts.checkpoint_threshold(validation::ratio("checkpointThreshold", v)?);
+      // Deprecated, without effect: checked, then ignored.
+      validation::ratio("checkpointThreshold", v)?;
     }
     if let Some(v) = self.background_checkpoint {
       rust_opts = rust_opts.background_checkpoint(v);
+    }
+    if let Some(v) = self.checkpoint_thread {
+      rust_opts = rust_opts.checkpoint_thread(v);
+    }
+    if let Some(v) = self.checkpoint_log_ratio {
+      rust_opts =
+        rust_opts.checkpoint_log_ratio(validation::non_negative_number("checkpointLogRatio", v)?);
+    }
+    if let Some(v) = self.checkpoint_log_budget {
+      rust_opts =
+        rust_opts.checkpoint_log_budget(validation::positive_bytes("checkpointLogBudget", v)?);
+    }
+    if let Some(v) = self.wal_segment_size {
+      rust_opts = rust_opts.wal_segment_size(validation::positive_bytes("walSegmentSize", v)?);
+    }
+    if let Some(v) = self.wal_segment_limit {
+      rust_opts = rust_opts.wal_segment_limit(validation::positive_bytes("walSegmentLimit", v)?);
     }
     if let Some(compression) = self.checkpoint_compression {
       rust_opts = rust_opts.checkpoint_compression(Some(compression.into_rust()?));
@@ -367,6 +407,10 @@ mod open_option_validation_tests {
       mvcc_retention_ms: Some(0),
       mvcc_max_chain_depth: Some(1),
       checkpoint_threshold: Some(0.0),
+      checkpoint_log_ratio: Some(0.0),
+      checkpoint_log_budget: Some(1.0),
+      wal_segment_size: Some(1.0),
+      wal_segment_limit: Some(1.0),
       group_commit_window_ms: Some(0),
       replication_segment_max_bytes: Some(1),
       replication_retention_min_entries: Some(0),
@@ -416,6 +460,26 @@ mod open_option_validation_tests {
       },
       OpenOptions {
         checkpoint_threshold: Some(2.0),
+        ..Default::default()
+      },
+      OpenOptions {
+        checkpoint_log_ratio: Some(-0.5),
+        ..Default::default()
+      },
+      OpenOptions {
+        checkpoint_log_ratio: Some(f64::NAN),
+        ..Default::default()
+      },
+      OpenOptions {
+        checkpoint_log_budget: Some(0.0),
+        ..Default::default()
+      },
+      OpenOptions {
+        wal_segment_size: Some(1.5),
+        ..Default::default()
+      },
+      OpenOptions {
+        wal_segment_limit: Some(-1.0),
         ..Default::default()
       },
       OpenOptions {
@@ -612,8 +676,13 @@ fn open_options_from_kite_profile_options(opts: crate::api::kite::KiteOptions) -
       .and_then(|v| u32::try_from(v).ok())
       .map(f64::from),
     auto_checkpoint: None,
-    checkpoint_threshold: opts.checkpoint_threshold,
+    checkpoint_threshold: None,
     background_checkpoint: None,
+    checkpoint_thread: opts.checkpoint_thread,
+    checkpoint_log_ratio: opts.checkpoint_log_ratio,
+    checkpoint_log_budget: opts.checkpoint_log_budget.map(|v| v as f64),
+    wal_segment_size: opts.wal_segment_size.map(|v| v as f64),
+    wal_segment_limit: opts.wal_segment_limit.map(|v| v as f64),
     checkpoint_compression: None,
     cache_enabled: None,
     cache_max_node_props: None,
@@ -3702,7 +3771,22 @@ impl Database {
     }
   }
 
-  /// Check if checkpoint is recommended
+  /// The error of the last automatic checkpoint, if it failed and no
+  /// checkpoint installed since; `null` otherwise. Automatic checkpoints run
+  /// on a thread of the database's own and report nothing to the commit that
+  /// started them: their failures show here (and in the log, and as the
+  /// error of a write that needs WAL segment space while they fail).
+  #[napi]
+  pub fn checkpoint_error(&self) -> Result<Option<String>> {
+    match self.inner.as_ref() {
+      Some(DatabaseInner::SingleFile(db)) => Ok(db.checkpoint_error()),
+      None => Err(Error::from_reason("Database is closed")),
+    }
+  }
+
+  /// Whether a checkpoint is recommended: the log the snapshot does not
+  /// cover (WAL segments and WAL) has reached `threshold` (default 0.8) of
+  /// the automatic checkpoint trigger.
   #[napi]
   pub fn should_checkpoint(&self, threshold: Option<f64>) -> Result<bool> {
     let threshold = validation::ratio("threshold", threshold.unwrap_or(0.8))?;

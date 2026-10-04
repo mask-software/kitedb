@@ -152,7 +152,8 @@ impl PyDatabase {
   }
 
   /// Closes the database with the GIL released, after an optional close-time
-  /// checkpoint (when WAL usage is at least `checkpoint_threshold`).
+  /// checkpoint (when the log the snapshot does not cover is at least
+  /// `checkpoint_threshold` of the checkpoint trigger).
   ///
   /// The checkpoint runs under the shared lock: core waits for transactions
   /// open on other threads to finish, and their commits need that lock. Only
@@ -1508,6 +1509,19 @@ impl PyDatabase {
     self.with_db_nogil(py, maintenance::background_checkpoint_single)
   }
 
+  /// The error of the last automatic checkpoint, if it failed and no
+  /// checkpoint installed since; None otherwise. Automatic checkpoints run
+  /// on a thread of the database's own and report nothing to the commit that
+  /// started them: their failures show here (and in the log, and as the
+  /// `CheckpointError` of a write that needs WAL segment space while they
+  /// fail).
+  fn checkpoint_error(&self) -> PyResult<Option<String>> {
+    dispatch_ok!(self, |db| db.checkpoint_error(), |_db| None)
+  }
+
+  /// Whether a checkpoint is recommended: the log the snapshot does not
+  /// cover (WAL segments and WAL) has reached `threshold` of the automatic
+  /// checkpoint trigger.
   #[pyo3(signature = (threshold=0.5))]
   fn should_checkpoint(&self, threshold: f64) -> PyResult<bool> {
     let threshold = validation::ratio("threshold", threshold)?;

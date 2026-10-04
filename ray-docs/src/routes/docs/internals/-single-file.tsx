@@ -112,23 +112,28 @@ function FileLayoutDiagram() {
 					size="from page 2, 4 MB default"
 					accent="mint"
 				>
-					Write-ahead log, split into two regions
+					Write-ahead log of fixed size. Every record is written to the primary
+					region; the secondary region is only read, in files from an earlier
+					version
 					<div class="mt-3 flex overflow-hidden rounded-md border border-kite-line font-mono text-[12px]">
 						<div class="min-w-0 flex-1 border-r border-kite-line bg-kite-mint/[0.07] px-3 py-2">
 							<div class="text-slate-200">Primary</div>
-							<div class="text-[11px] text-slate-500">75%, normal writes</div>
+							<div class="text-[11px] text-slate-500">75%, all writes</div>
 						</div>
 						<div class="w-1/4 min-w-[6.5rem] px-3 py-2">
 							<div class="text-slate-200">Secondary</div>
-							<div class="text-[11px] text-slate-500">
-								25%, during checkpoint
-							</div>
+							<div class="text-[11px] text-slate-500">25%, not written</div>
 						</div>
 					</div>
 				</FileRegion>
 				<FileRegion name="Snapshot area" size="grows" accent="violet">
 					CSR graph data, compressed with zstd. Each checkpoint writes a new
-					snapshot to a free region.
+					snapshot to pages no header names.
+				</FileRegion>
+				<FileRegion name="WAL segments" size="as needed" accent="amber">
+					Extents of pages holding the records the WAL spilled when it filled,
+					anywhere after the WAL area. The header's segment table names them,
+					and a checkpoint frees the ones it covers.
 				</FileRegion>
 			</div>
 		</Figure>
@@ -146,7 +151,7 @@ function HeaderContents() {
 		{
 			name: "Versions",
 			value:
-				"Format version (2), minimum reader version, and feature flags. Open refuses a file that needs a newer reader or has flags it does not implement, and opens a newer format read-only",
+				"Format version, minimum reader version, and feature flags. A header that names WAL segments is version 3 with minimum reader version 3, so older versions refuse the file instead of missing commits; otherwise it is version 2. Open refuses a file that needs a newer reader or has flags it does not implement, and opens a newer format read-only",
 		},
 		{ name: "Page size", value: "4096", mono: true, detail: "default" },
 		{
@@ -161,13 +166,19 @@ function HeaderContents() {
 			value: "Head and tail, plus each WAL region's head and the active region",
 		},
 		{
+			name: "WAL segment table",
+			value:
+				"Up to 64 entries, each with a seq, start page, page count, sealed flag and byte length; plus covered, the newest segment seq the snapshot covers, and the next seq",
+		},
+		{
 			name: "Checkpoint flag",
-			value: "Set while a background checkpoint is running",
+			value:
+				"Set by an earlier version's background checkpoint between its cut and its install; this version never sets it",
 		},
 		{
 			name: "WAL salts",
 			value:
-				"One per WAL region, mixed into each record's checksum and replaced whenever the region is reused",
+				"One per WAL region, mixed into each record's checksum and replaced whenever the WAL starts over",
 		},
 		{
 			name: "Counters",
@@ -188,12 +199,13 @@ function HeaderContents() {
 function AtomicCheckpointProcess() {
 	const steps: Step[] = [
 		{
-			text: "Build the new snapshot in memory from the current snapshot and the delta",
+			text: "Build the new snapshot in memory from the current snapshot and the changes it covers",
+			sub: "A blocking checkpoint uses the live delta; a background checkpoint replays the WAL segments up to its cut",
 			accent: "violet",
 		},
 		{
-			text: "Write it to a free region",
-			sub: "A retired snapshot region if the new snapshot fits, otherwise the end of the file. The current snapshot's pages are never overwritten.",
+			text: "Write it to pages no header names",
+			sub: "The first free range that holds it, otherwise the end of the file. The current snapshot's pages are never overwritten.",
 			accent: "violet",
 		},
 		{
@@ -205,7 +217,7 @@ function AtomicCheckpointProcess() {
 			accent: "violet",
 		},
 		{
-			text: "Write a header that points to the new snapshot into the inactive header page",
+			text: "Write a header that points to the new snapshot, and to the log it does not cover, into the inactive header page",
 			accent: "violet",
 		},
 		{
@@ -227,7 +239,8 @@ function AtomicCheckpointProcess() {
 			accent: "slate",
 		},
 		{
-			text: "Retire the old snapshot's region so a later checkpoint can reuse it",
+			text: "Free the old snapshot's pages and the WAL segments the new header drops",
+			sub: "Later snapshots and segments can reuse them",
 			accent: "slate",
 		},
 	];
@@ -241,7 +254,7 @@ function AtomicCheckpointProcess() {
 						<span class="font-medium text-amber-300">Before step 5:</span>{" "}
 						<span class="text-slate-300">
 							open uses the previous header, which still points to the old
-							snapshot and the WAL records it needs
+							snapshot and the log it needs
 						</span>
 					</div>
 					<div class="rounded-md border border-kite-mint/25 bg-kite-mint/[0.05] px-3 py-2">
@@ -253,39 +266,57 @@ function AtomicCheckpointProcess() {
 				</div>
 				<p class="mt-2 text-[13px] text-slate-500">
 					A header write torn by the crash fails its checksum, and open uses the
-					other header page.
+					other header page. No header names the pages a crashed checkpoint
+					wrote, and open frees them.
 				</p>
 			</div>
 		</Figure>
 	);
 }
 
-function WALDualRegion() {
+function WALAreaAndSegments() {
 	return (
-		<Figure title="WAL regions" accent="mint" meta="64 MB example">
+		<Figure
+			title="WAL area and WAL segments"
+			accent="mint"
+			meta="4 MB WAL (default)"
+		>
 			<div class="flex overflow-hidden rounded-md border border-kite-line font-mono text-[12px]">
 				<div class="min-w-0 flex-1 border-r border-kite-line bg-kite-mint/[0.07] px-3 py-2.5">
 					<div class="text-slate-200">Primary</div>
-					<div class="text-[11px] text-slate-500">48 MB</div>
+					<div class="text-[11px] text-slate-500">3 MB, all writes</div>
 				</div>
 				<div class="w-1/4 min-w-[6.5rem] px-3 py-2.5">
 					<div class="text-slate-200">Secondary</div>
-					<div class="text-[11px] text-slate-500">16 MB</div>
+					<div class="text-[11px] text-slate-500">1 MB, not written</div>
 				</div>
 			</div>
 			<p class="mt-4 mb-2 text-[14px] text-slate-300">
-				Two regions let a checkpoint run while writes continue:
+				When a commit does not fit in the WAL, the WAL spills:
 			</p>
 			<div class="space-y-1.5">
-				<FlowItem color="violet">
-					The checkpoint builds the new snapshot from the in-memory delta, which
-					holds the changes logged in the primary region
-				</FlowItem>
 				<FlowItem color="emerald">
-					Transactions that commit in the meantime write to the secondary
-					region, so writers don't wait for the snapshot to be built
+					Its records are copied, unsalted, into a WAL segment: appended to the
+					open extent if they fit, else into a new extent in the first free
+					range that holds it, else at the end of the file
+				</FlowItem>
+				<FlowItem color="cyan">
+					The extent is synced; then a header naming the segment and an empty
+					WAL is installed durably in both header slots, and the WAL starts over
+					under a fresh salt
+				</FlowItem>
+				<FlowItem color="violet">
+					A checkpoint frees the segments it covers. Automatic checkpoints run
+					on the database's checkpoint thread, so writers don't wait for the
+					snapshot to be built
 				</FlowItem>
 			</div>
+			<p class="mt-4 border-t border-kite-line pt-3 text-[13px] text-slate-500">
+				The secondary region is only read, when opening a file from an earlier
+				version, whose background checkpoints wrote there. A writable open moves
+				those records back to the primary region, or into a WAL segment if they
+				don't fit.
+			</p>
 		</Figure>
 	);
 }
@@ -322,30 +353,32 @@ function SnapshotSections() {
 const GROWTH_ROWS = [
 	{
 		label: "Initial",
-		wal: "flex-1",
+		wal: "w-[5%]",
 		snapshot: "w-1 bg-kite-violet/25",
-		size: "~64 MB",
+		size: "~4 MB",
 	},
 	{
 		label: "100K nodes",
-		wal: "w-3/4",
-		snapshot: "w-1/5 bg-kite-violet/45",
-		size: "~72 MB",
+		wal: "w-[5%]",
+		snapshot: "w-[9%] bg-kite-violet/45",
+		size: "~12 MB",
 	},
 	{
 		label: "1M nodes",
-		wal: "w-1/2",
-		snapshot: "w-2/5 bg-kite-violet/45",
-		size: "~150 MB",
+		wal: "w-[5%]",
+		snapshot: "flex-1 bg-kite-violet/45",
+		size: "~90 MB",
 	},
 ];
 
 function FileGrowthDiagram() {
 	return (
-		<Figure title="File size examples" accent="cyan" meta="64 MB WAL">
+		<Figure title="File size examples" accent="cyan" meta="4 MB WAL">
 			<p class="mb-4 text-[13px] text-slate-500">
-				These examples assume a 64 MB WAL. The default WAL size is 4 MB and is
-				configurable.
+				These examples assume the default 4 MB WAL and a checkpoint that covered
+				the whole log, so the file holds no WAL segments. Until a checkpoint
+				covers them, WAL segments add to these sizes, up to{" "}
+				<Code>walSegmentLimit</Code>.
 			</p>
 			<div class="space-y-3">
 				<For each={GROWTH_ROWS}>
@@ -395,9 +428,14 @@ function DatabaseOpenProcess() {
 			accent: "cyan",
 		},
 		{
-			text: "If a background checkpoint was interrupted, finish or undo its cut",
-			sub: "If the secondary region's records fit after the primary's, a writable open appends them; otherwise both regions are replayed in place and the next background checkpoint resumes the cut. Read-only opens replay in place without writing.",
+			text: "If an earlier version left records in the secondary WAL region, move them back",
+			sub: "A format version 2 background checkpoint wrote there between its cut and its install. A writable open moves those records after the primary region's, or into a WAL segment if they don't fit. Read-only opens replay both regions in place without writing.",
 			accent: "amber",
+		},
+		{
+			text: "Writable opens: free every page no header names",
+			sub: "Old snapshots' pages, and extents a crash left before a header named them",
+			accent: "slate",
 		},
 		{
 			text: (
@@ -409,7 +447,8 @@ function DatabaseOpenProcess() {
 		},
 		{ text: "Parse snapshot sections", accent: "violet" },
 		{
-			text: "Replay committed WAL transactions, in commit order, to rebuild the delta",
+			text: "Replay committed transactions from the WAL segments and the WAL, in commit order, to rebuild the delta",
+			sub: "Only those whose Commit record lies after the last segment the snapshot covers",
 			accent: "slate",
 		},
 		{ text: "Ready for queries", accent: "mint", done: true },
@@ -419,7 +458,7 @@ function DatabaseOpenProcess() {
 			<Steps steps={steps} />
 			<p class="mt-5 border-t border-kite-line pt-3 text-[13px] text-slate-400">
 				<span class="text-amber-300">Incomplete transactions</span> found during
-				WAL replay are discarded, since they never committed. Recovery runs
+				replay are discarded, since they never committed. Recovery runs
 				automatically on open.
 			</p>
 		</Figure>
@@ -435,8 +474,10 @@ export function SingleFilePage() {
 		<DocPage slug="internals/single-file">
 			<p>
 				KiteDB stores a database in one <code>.kitedb</code> file containing a
-				header, a write-ahead log, and a snapshot. One file is easy to copy and
-				deploy, and the header records where the current snapshot and WAL are.
+				header, a write-ahead log, and a snapshot. The log is a fixed WAL area
+				plus, when it fills, WAL segments elsewhere in the file. One file is
+				easy to copy and deploy, and the header records where the current
+				snapshot, the WAL and the WAL segments are.
 			</p>
 
 			<h2 id="file-layout">File layout</h2>
@@ -491,17 +532,24 @@ export function SingleFilePage() {
 			<h2 id="wal-area">WAL area</h2>
 
 			<p>
-				The WAL area is a fixed-size, append-only log divided into two regions.
+				The WAL area is a fixed-size, append-only log. The default size is 4 MB.
+				The size is fixed when the file is created; change it with{" "}
+				<code>resizeWal</code> (offline) or rebuild into a new file.
 			</p>
 			<p>
-				The default WAL size is 4 MB. Auto-checkpoint is on by default and runs
-				when the active region is 50% full (<code>checkpointThreshold</code>).
-				Use a larger WAL for high-throughput ingest. The size is fixed when the
-				file is created; change it with <code>resizeWal</code> (offline) or
-				rebuild into a new file.
+				A full WAL spills into a WAL segment instead of forcing a checkpoint, so
+				the WAL's size no longer limits a transaction or sets when checkpoints
+				run. Automatic checkpoints start once the log the snapshot does not
+				cover reaches <code>checkpointLogRatio</code> (default 0.5) times the
+				snapshot's size, at least four WALs, at most{" "}
+				<code>checkpointLogBudget</code> (default 128 MiB);{" "}
+				<code>checkpointThreshold</code> is deprecated and has no effect. A
+				larger WAL only means fewer spills. The{" "}
+				<a href="/docs/internals/wal">WAL page</a> covers why spills and
+				background checkpoints are crash safe.
 			</p>
 
-			<WALDualRegion />
+			<WALAreaAndSegments />
 
 			<h2 id="snapshot-area">Snapshot area</h2>
 
@@ -512,18 +560,22 @@ export function SingleFilePage() {
 			<h2 id="growth">File growth</h2>
 
 			<p>
-				The header and WAL have fixed sizes; the snapshot grows with your data:
+				The header and WAL area have fixed sizes; the snapshot grows with your
+				data, and WAL segments come and go with the log:
 			</p>
 
 			<FileGrowthDiagram />
 
 			<p>
 				Because a checkpoint never overwrites the current snapshot, the file can
-				hold a retired snapshot region next to the current one. A later
-				checkpoint reuses a retired region when the new snapshot fits, and
-				retired space at the end of the file is truncated. Retired regions are
-				tracked in memory, so space that is still retired when the database
-				closes stays in the file until you run <code>vacuum</code>.
+				hold an old snapshot's pages next to the current one, with WAL segments
+				between them. Snapshots and segment extents go into the first free range
+				that holds them, else the end of the file, and free pages at the end of
+				the file are truncated after a checkpoint. Open treats every page no
+				header names as free. Closing a file that has no WAL segments moves the
+				snapshot down next to the WAL when free pages lie in front of it, and
+				truncates the file, as <code>vacuum</code> does. A file closed with live
+				segments keeps them where they are, and the next open replays them.
 			</p>
 
 			<h2 id="vs-directory">Single-file vs multi-file</h2>
@@ -577,10 +629,11 @@ export function SingleFilePage() {
 			</p>
 			<p>
 				A read-only open asks the operating system for read access only and
-				never writes to the file. WAL replay rebuilds the delta in memory, and
-				closing the database leaves the file untouched. After an interrupted
-				background checkpoint, a read-only open replays both WAL regions in
-				place; the next writable open finishes the repair.
+				never writes to the file. Replay of the WAL segments and the WAL
+				rebuilds the delta in memory, and closing the database leaves the file
+				untouched. In a file where an earlier version left records in the
+				secondary WAL region, a read-only open replays both regions in place;
+				the next writable open moves the records back.
 			</p>
 
 			<VersionNote>

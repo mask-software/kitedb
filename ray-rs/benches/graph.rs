@@ -71,9 +71,9 @@ fn create_code_graph_schema() -> KiteOptions {
       options = options.wal_size_mb(mb);
     }
   }
-  if let Ok(threshold) = env::var("KITE_BENCH_CHECKPOINT_THRESHOLD") {
-    if let Ok(value) = threshold.parse::<f64>() {
-      options = options.checkpoint_threshold(value);
+  if let Ok(ratio) = env::var("KITE_BENCH_CHECKPOINT_LOG_RATIO") {
+    if let Ok(value) = ratio.parse::<f64>() {
+      options = options.checkpoint_log_ratio(value);
     }
   }
 

@@ -131,10 +131,15 @@ pub struct OpenOptions {
   /// size fails to open.
   #[pyo3(get, set)]
   pub wal_size: Option<i64>,
-  /// Enable auto-checkpoint when WAL usage exceeds threshold
+  /// Checkpoint automatically once the log (the WAL and its WAL segments)
+  /// reaches the checkpoint trigger (default: True; see
+  /// `checkpoint_log_ratio`). Without, the WAL spills into WAL segments until
+  /// `wal_segment_limit`, then writes fail with `WalFullError`.
   #[pyo3(get, set)]
   pub auto_checkpoint: Option<bool>,
-  /// WAL usage threshold (0.0-1.0) to trigger auto-checkpoint
+  /// Deprecated: has no effect (automatic checkpoints follow the log; see
+  /// `checkpoint_log_ratio` and `checkpoint_log_budget`). Still accepted (in
+  /// [0, 1]) so existing callers keep working.
   #[pyo3(get, set)]
   pub checkpoint_threshold: Option<f64>,
   /// Use background (non-blocking) checkpoint
@@ -219,6 +224,30 @@ pub struct OpenOptions {
   /// corruption protection that prevents two writers on one database file.
   #[pyo3(get, set)]
   pub danger_bypass_file_lock_for_multi_node_simulation: Option<bool>,
+  /// Run automatic background checkpoints on a thread of the database's
+  /// own, so the commit that crosses the trigger returns at once (default:
+  /// True)
+  #[pyo3(get, set)]
+  pub checkpoint_thread: Option<bool>,
+  /// Checkpoint once the log the snapshot does not cover reaches this
+  /// fraction of the snapshot's size (default: 0.5; at least four WALs, at
+  /// most `checkpoint_log_budget`)
+  #[pyo3(get, set)]
+  pub checkpoint_log_ratio: Option<f64>,
+  /// The most log, in bytes, an automatic checkpoint waits for (default:
+  /// 128 MiB). The in-memory delta takes about ten times the log's size.
+  /// Writers wait for a checkpoint only at the WAL segment limit (by default
+  /// twice the checkpoint trigger, at most four times this).
+  #[pyo3(get, set)]
+  pub checkpoint_log_budget: Option<i64>,
+  /// Bytes of a WAL segment extent (default: eight WALs, at most 32 MiB)
+  #[pyo3(get, set)]
+  pub wal_segment_size: Option<i64>,
+  /// The most bytes of WAL segments before writers wait for a checkpoint
+  /// (default: twice the checkpoint trigger, at least 16 WALs, at most four
+  /// times `checkpoint_log_budget`)
+  #[pyo3(get, set)]
+  pub wal_segment_limit: Option<i64>,
 }
 
 #[pymethods]
@@ -256,7 +285,12 @@ impl OpenOptions {
         replication_segment_max_bytes=None,
         replication_retention_min_entries=None,
         replication_retention_min_ms=None,
-        danger_bypass_file_lock_for_multi_node_simulation=None
+        danger_bypass_file_lock_for_multi_node_simulation=None,
+        checkpoint_thread=None,
+        checkpoint_log_ratio=None,
+        checkpoint_log_budget=None,
+        wal_segment_size=None,
+        wal_segment_limit=None
     ))]
   #[allow(clippy::too_many_arguments)]
   fn new(
@@ -292,6 +326,11 @@ impl OpenOptions {
     replication_retention_min_entries: Option<i64>,
     replication_retention_min_ms: Option<i64>,
     danger_bypass_file_lock_for_multi_node_simulation: Option<bool>,
+    checkpoint_thread: Option<bool>,
+    checkpoint_log_ratio: Option<f64>,
+    checkpoint_log_budget: Option<i64>,
+    wal_segment_size: Option<i64>,
+    wal_segment_limit: Option<i64>,
   ) -> Self {
     Self {
       read_only,
@@ -326,6 +365,11 @@ impl OpenOptions {
       replication_retention_min_entries,
       replication_retention_min_ms,
       danger_bypass_file_lock_for_multi_node_simulation,
+      checkpoint_thread,
+      checkpoint_log_ratio,
+      checkpoint_log_budget,
+      wal_segment_size,
+      wal_segment_limit,
     }
   }
 
@@ -394,10 +438,39 @@ impl OpenOptions {
       rust_opts = rust_opts.auto_checkpoint(v);
     }
     if let Some(v) = self.checkpoint_threshold {
-      rust_opts = rust_opts.checkpoint_threshold(validation::ratio("checkpoint_threshold", v)?);
+      // Deprecated, without effect: checked, then ignored.
+      validation::ratio("checkpoint_threshold", v)?;
     }
     if let Some(v) = self.background_checkpoint {
       rust_opts = rust_opts.background_checkpoint(v);
+    }
+    if let Some(v) = self.checkpoint_thread {
+      rust_opts = rust_opts.checkpoint_thread(v);
+    }
+    if let Some(v) = self.checkpoint_log_ratio {
+      rust_opts =
+        rust_opts.checkpoint_log_ratio(validation::non_negative_number("checkpoint_log_ratio", v)?);
+    }
+    if let Some(v) = self.checkpoint_log_budget {
+      rust_opts = rust_opts.checkpoint_log_budget(validation::positive_u64(
+        "checkpoint_log_budget",
+        v,
+        validation::MAX_BYTES as u64,
+      )?);
+    }
+    if let Some(v) = self.wal_segment_size {
+      rust_opts = rust_opts.wal_segment_size(validation::positive_u64(
+        "wal_segment_size",
+        v,
+        validation::MAX_BYTES as u64,
+      )?);
+    }
+    if let Some(v) = self.wal_segment_limit {
+      rust_opts = rust_opts.wal_segment_limit(validation::positive_u64(
+        "wal_segment_limit",
+        v,
+        validation::MAX_BYTES as u64,
+      )?);
     }
     if let Some(ref compression) = self.checkpoint_compression {
       rust_opts = rust_opts.checkpoint_compression(Some(compression.to_core()?));
@@ -493,7 +566,7 @@ impl OpenOptions {
       page_size: None,
       wal_size: opts.wal_size.and_then(|v| i64::try_from(v).ok()),
       auto_checkpoint: None,
-      checkpoint_threshold: opts.checkpoint_threshold,
+      checkpoint_threshold: None,
       background_checkpoint: None,
       checkpoint_compression: None,
       cache_snapshot: None,
@@ -530,6 +603,13 @@ impl OpenOptions {
         .replication_retention_min_ms
         .and_then(|v| i64::try_from(v).ok()),
       danger_bypass_file_lock_for_multi_node_simulation: None,
+      checkpoint_thread: opts.checkpoint_thread,
+      checkpoint_log_ratio: opts.checkpoint_log_ratio,
+      checkpoint_log_budget: opts
+        .checkpoint_log_budget
+        .and_then(|v| i64::try_from(v).ok()),
+      wal_segment_size: opts.wal_segment_size.and_then(|v| i64::try_from(v).ok()),
+      wal_segment_limit: opts.wal_segment_limit.and_then(|v| i64::try_from(v).ok()),
     }
   }
 }
@@ -622,6 +702,10 @@ mod tests {
       mvcc_retention_ms: Some(0),
       mvcc_max_chain_depth: Some(1),
       checkpoint_threshold: Some(0.0),
+      checkpoint_log_ratio: Some(0.0),
+      checkpoint_log_budget: Some(1),
+      wal_segment_size: Some(1),
+      wal_segment_limit: Some(1),
       group_commit_window_ms: Some(0),
       replication_segment_max_bytes: Some(1),
       replication_retention_min_entries: Some(0),
@@ -673,6 +757,26 @@ mod tests {
       },
       OpenOptions {
         checkpoint_threshold: Some(2.0),
+        ..Default::default()
+      },
+      OpenOptions {
+        checkpoint_log_ratio: Some(-0.5),
+        ..Default::default()
+      },
+      OpenOptions {
+        checkpoint_log_ratio: Some(f64::INFINITY),
+        ..Default::default()
+      },
+      OpenOptions {
+        checkpoint_log_budget: Some(0),
+        ..Default::default()
+      },
+      OpenOptions {
+        wal_segment_size: Some(-1),
+        ..Default::default()
+      },
+      OpenOptions {
+        wal_segment_limit: Some(validation::MAX_BYTES + 1),
         ..Default::default()
       },
       OpenOptions {

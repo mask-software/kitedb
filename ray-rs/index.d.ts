@@ -361,7 +361,19 @@ export declare class Database {
   checkpointAsync(): Promise<void>
   /** Perform a background (non-blocking) checkpoint */
   backgroundCheckpoint(): void
-  /** Check if checkpoint is recommended */
+  /**
+   * The error of the last automatic checkpoint, if it failed and no
+   * checkpoint installed since; `null` otherwise. Automatic checkpoints run
+   * on a thread of the database's own and report nothing to the commit that
+   * started them: their failures show here (and in the log, and as the
+   * error of a write that needs WAL segment space while they fail).
+   */
+  checkpointError(): string | null
+  /**
+   * Whether a checkpoint is recommended: the log the snapshot does not
+   * cover (WAL segments and WAL) has reached `threshold` (default 0.8) of
+   * the automatic checkpoint trigger.
+   */
   shouldCheckpoint(threshold?: number | undefined | null): boolean
   /**
    * Optimize (compact) the database
@@ -816,6 +828,12 @@ export declare class Kite {
   replicationMetricsOtelJson(): string
   /** Perform a checkpoint (compact WAL into snapshot) */
   checkpoint(): void
+  /**
+   * The error of the last automatic checkpoint, if it failed and no
+   * checkpoint installed since; `null` otherwise (see
+   * `Database.checkpointError`).
+   */
+  checkpointError(): string | null
   /** Execute a batch of operations atomically */
   batch(ops: Array<object>): Array<object>
   /** Begin a traversal from a node ID */
@@ -1415,9 +1433,31 @@ export interface JsKiteOptions {
    * size fails to open.
    */
   walSizeMb?: number
-  /** WAL usage threshold (0.0-1.0) to trigger auto-checkpoint */
+  /** @deprecated No effect: automatic checkpoints follow the log (see `checkpointLogRatio` and `checkpointLogBudget`). Still accepted (in [0, 1]) so existing callers keep working. */
   checkpointThreshold?: number
-  /** On close, checkpoint if WAL usage is at or above this threshold (default: 0.2) */
+  /**
+   * Run automatic checkpoints on a thread of the database's own (default:
+   * true)
+   */
+  checkpointThread?: boolean
+  /**
+   * Checkpoint once the log the snapshot does not cover reaches this
+   * fraction of the snapshot's size (default: 0.5)
+   */
+  checkpointLogRatio?: number
+  /**
+   * The most log, in bytes, an automatic checkpoint waits for (default:
+   * 128 MiB; the in-memory delta takes about ten times the log's size)
+   */
+  checkpointLogBudget?: number
+  /** Bytes of a WAL segment extent (default: eight WALs, at most 32 MiB) */
+  walSegmentSize?: number
+  /** The most bytes of WAL segments before writers wait for a checkpoint */
+  walSegmentLimit?: number
+  /**
+   * On close, checkpoint if the log the snapshot does not cover is at least
+   * this fraction of the checkpoint trigger (default: 0.2)
+   */
   closeCheckpointIfWalUsageAtLeast?: number
   /** Replication role: "Disabled", "Primary", or "Replica" */
   replicationRole?: JsReplicationRole
@@ -1839,12 +1879,44 @@ export interface OpenOptions {
    * size fails to open.
    */
   walSize?: number
-  /** Enable auto-checkpoint when WAL usage exceeds threshold */
+  /**
+   * Checkpoint automatically once the log (the WAL and its WAL segments)
+   * reaches the checkpoint trigger (default: true; see
+   * `checkpointLogRatio`). Without, the WAL spills into WAL segments until
+   * `walSegmentLimit`, then writes fail with a WAL-full error.
+   */
   autoCheckpoint?: boolean
-  /** WAL usage threshold (0.0-1.0) to trigger auto-checkpoint */
+  /** @deprecated No effect: automatic checkpoints follow the log (see `checkpointLogRatio` and `checkpointLogBudget`). Still accepted (in [0, 1]) so existing callers keep working. */
   checkpointThreshold?: number
   /** Use background (non-blocking) checkpoint */
   backgroundCheckpoint?: boolean
+  /**
+   * Run automatic background checkpoints on a thread of the database's
+   * own, so the commit that crosses the trigger returns at once (default:
+   * true)
+   */
+  checkpointThread?: boolean
+  /**
+   * Checkpoint once the log the snapshot does not cover reaches this
+   * fraction of the snapshot's size (default: 0.5; at least four WALs, at
+   * most `checkpointLogBudget`)
+   */
+  checkpointLogRatio?: number
+  /**
+   * The most log, in bytes, an automatic checkpoint waits for (default:
+   * 128 MiB). The in-memory delta takes about ten times the log's size.
+   * Writers wait for a checkpoint only at the WAL segment limit (by default
+   * twice the checkpoint trigger, at most four times this).
+   */
+  checkpointLogBudget?: number
+  /** Bytes of a WAL segment extent (default: eight WALs, at most 32 MiB) */
+  walSegmentSize?: number
+  /**
+   * The most bytes of WAL segments before writers wait for a checkpoint
+   * (default: twice the checkpoint trigger, at least 16 WALs, at most four
+   * times `checkpointLogBudget`)
+   */
+  walSegmentLimit?: number
   /** Compression options for checkpoint snapshots (single-file only) */
   checkpointCompression?: CompressionOptions
   /** @deprecated No effect: the cache layer was removed. Still accepted so existing callers keep working. */

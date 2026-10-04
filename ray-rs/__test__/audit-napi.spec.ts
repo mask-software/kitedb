@@ -527,7 +527,8 @@ const Profile = node('profile', {
 })
 
 const BIO = 'x'.repeat(4096)
-const PREFILL_ROWS = 120
+// More than a 1 MiB WAL holds (~180 rows): the prefill spills the WAL once.
+const PREFILL_ROWS = 300
 const RETRIED_ROWS = 100
 
 type N6Kind = 'insert' | 'upsert' | 'insert valuesMany' | 'upsert valuesMany'
@@ -551,13 +552,17 @@ function n6Operations(db: Kite, kind: N6Kind): any[] {
 
 for (const kind of ['insert', 'upsert', 'insert valuesMany', 'upsert valuesMany'] as const) {
   test(`audit N6: batchAdaptive retry after WAL-full keeps every ${kind} row and its props`, (t) => {
-    // ~180 rows of 4 KiB fit in a 1 MiB WAL. Prefill 120 committed rows so the
-    // 100-row batch overflows, then fits after batchAdaptive's checkpoint.
+    // ~180 rows of 4 KiB fit in a 1 MiB WAL, and its WAL segments may hold
+    // one spill's worth. The 300 prefill rows spill the WAL once and leave
+    // ~120 rows in it, so the 100-row batch needs a second spill, which the
+    // segment limit refuses: the checkpoint that runs then keeps the batch's
+    // own records (its transaction is open), and the batch fails with
+    // WAL-full. It fits after batchAdaptive's checkpoint.
     const db = kiteSync(makeDbPath(), {
       nodes: [Profile],
       edges: [],
       walSizeMb: 1,
-      checkpointThreshold: 1,
+      walSegmentLimit: 1,
     })
     try {
       db.transaction(() => {

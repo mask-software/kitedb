@@ -85,10 +85,11 @@ pub const WAL_SEGMENT_DEFAULT_SIZE: usize = 32 * 1024 * 1024;
 /// Default `checkpoint_log_ratio`: a checkpoint starts once the WAL segments
 /// hold this fraction of the snapshot's size.
 pub const CHECKPOINT_LOG_RATIO_DEFAULT: f64 = 0.5;
-/// Default log budget: the most bytes of WAL segments a checkpoint waits
-/// for (the delta replaying them takes about ten times as much memory);
-/// writers wait for a checkpoint at four times it.
-pub const WAL_LOG_BUDGET_DEFAULT: usize = 128 * 1024 * 1024;
+/// Default `checkpoint_log_budget`: the most log (WAL segments and WAL) an
+/// automatic checkpoint waits for. The delta holding the log's commits takes
+/// about ten times its bytes of memory. The WAL segment limit, where writers
+/// wait for a checkpoint, is at most four times it.
+pub const CHECKPOINT_LOG_BUDGET_DEFAULT: u64 = 128 * 1024 * 1024;
 
 /// Single-file extension
 pub const EXT_KITEDB: &str = ".kitedb";

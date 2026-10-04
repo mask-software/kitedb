@@ -203,6 +203,19 @@ pub(crate) fn vector_len(field: impl Display, len: usize, dimensions: usize) -> 
   Ok(())
 }
 
+/// A byte count passed in as a JS number: an integer in `1..=MAX_BYTES`.
+pub(crate) fn positive_bytes(field: &str, value: f64) -> Result<u64> {
+  positive_u64(field, integral_i64(field, value)?, MAX_BYTES as u64)
+}
+
+/// A finite JS number, at least 0.
+pub(crate) fn non_negative_number(field: &str, value: f64) -> Result<f64> {
+  if !value.is_finite() || value < 0.0 {
+    return Err(invalid(field, "must be a finite number, at least 0"));
+  }
+  Ok(value)
+}
+
 pub(crate) fn ratio(field: &str, value: f64) -> Result<f64> {
   if !value.is_finite() || !(0.0..=1.0).contains(&value) {
     return Err(invalid(field, "must be a finite number in [0.0, 1.0]"));

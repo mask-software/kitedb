@@ -61,6 +61,7 @@ from kitedb._kitedb import (
     LockError,
     CorruptionError,
     WalFullError,
+    CheckpointError,
 
     # Core classes
     Database,
@@ -275,6 +276,7 @@ __all__ = [
     "LockError",
     "CorruptionError",
     "WalFullError",
+    "CheckpointError",
 
     # ==========================================================================
     # Low-level API

@@ -42,6 +42,11 @@ class CorruptionError(KiteError):
 class WalFullError(KiteError):
     """The WAL is full; checkpoint before writing more."""
 
+class CheckpointError(KiteError):
+    """A write needs WAL segment space only a checkpoint frees, and the last
+    automatic checkpoint failed (see Database.checkpoint_error). Committed data
+    is safe."""
+
 # ============================================================================
 # Core Database Types
 # ============================================================================
@@ -58,7 +63,11 @@ class OpenOptions:
     mvcc_max_chain_depth: Optional[int]
     page_size: Optional[int]
     wal_size: Optional[int]
+    # Checkpoint once the log (WAL segments and WAL) reaches the trigger
+    # (checkpoint_log_ratio of the snapshot, at least four WALs, at most
+    # checkpoint_log_budget).
     auto_checkpoint: Optional[bool]
+    # Deprecated: has no effect (checkpoints follow the log).
     checkpoint_threshold: Optional[float]
     background_checkpoint: Optional[bool]
     checkpoint_compression: Optional[CompressionOptions]
@@ -83,6 +92,18 @@ class OpenOptions:
     replication_retention_min_entries: Optional[int]
     replication_retention_min_ms: Optional[int]
     danger_bypass_file_lock_for_multi_node_simulation: Optional[bool]
+    # Run automatic checkpoints on the database's own thread (default True).
+    checkpoint_thread: Optional[bool]
+    # Checkpoint once the uncovered log reaches this fraction of the
+    # snapshot's size (default 0.5).
+    checkpoint_log_ratio: Optional[float]
+    # The most log, in bytes, an automatic checkpoint waits for (default
+    # 128 MiB; the in-memory delta takes about ten times the log's size).
+    checkpoint_log_budget: Optional[int]
+    # Bytes of a WAL segment extent (default: eight WALs, at most 32 MiB).
+    wal_segment_size: Optional[int]
+    # The most bytes of WAL segments before writers wait for a checkpoint.
+    wal_segment_limit: Optional[int]
 
     def __init__(
         self,
@@ -119,6 +140,11 @@ class OpenOptions:
         replication_retention_min_entries: Optional[int] = None,
         replication_retention_min_ms: Optional[int] = None,
         danger_bypass_file_lock_for_multi_node_simulation: Optional[bool] = None,
+        checkpoint_thread: Optional[bool] = None,
+        checkpoint_log_ratio: Optional[float] = None,
+        checkpoint_log_budget: Optional[int] = None,
+        wal_segment_size: Optional[int] = None,
+        wal_segment_limit: Optional[int] = None,
     ) -> None: ...
 
 class SyncMode:
@@ -733,6 +759,7 @@ class Database:
     # Maintenance
     def checkpoint(self) -> None: ...
     def background_checkpoint(self) -> None: ...
+    def checkpoint_error(self) -> Optional[str]: ...
     def should_checkpoint(self, threshold: float = 0.5) -> bool: ...
     def optimize(self, options: Optional[SingleFileOptimizeOptions] = None) -> None: ...
     def vacuum(self, shrink_wal: bool = True, min_wal_size: Optional[int] = None) -> None: ...

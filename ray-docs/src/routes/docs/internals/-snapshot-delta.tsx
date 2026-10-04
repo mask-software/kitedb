@@ -76,8 +76,9 @@ function SnapshotDeltaModel() {
 					</span>
 				</div>
 				<p class="text-[14px] text-slate-400">
-					Write-ahead log behind the delta. Every commit is appended here first,
-					and replayed into the delta after a crash.
+					Write-ahead log behind the delta. Every commit is appended here first
+					(a full WAL spills into WAL segments), and the log is replayed into
+					the delta after a crash.
 				</p>
 				<span class="ml-auto hidden shrink-0 font-mono text-[11px] text-slate-500 sm:block">
 					on disk
@@ -310,7 +311,10 @@ function CheckpointProcess() {
 				/>
 				<div class="space-y-3">
 					<CheckpointStep num={1} text="Read the current snapshot" />
-					<CheckpointStep num={2} text="Apply all delta changes" />
+					<CheckpointStep
+						num={2}
+						text="Apply the changes committed up to the checkpoint"
+					/>
 					<CheckpointStep
 						num={3}
 						text="Write a new snapshot (CSR, compressed)"
@@ -319,7 +323,10 @@ function CheckpointProcess() {
 						num={4}
 						text="Update the header to point to the new snapshot"
 					/>
-					<CheckpointStep num={5} text="Clear the delta and the WAL" />
+					<CheckpointStep
+						num={5}
+						text="Drop the log it covers; later commits stay in the delta"
+					/>
 				</div>
 			</div>
 
@@ -329,7 +336,8 @@ function CheckpointProcess() {
 						class="h-1.5 w-1.5 rounded-full bg-kite-cyan"
 						aria-hidden="true"
 					/>
-					Automatic: when the WAL fills past a threshold
+					Automatic: when the log reaches half the snapshot's size (at least
+					four WALs, at most 128 MiB)
 				</p>
 				<p class="flex items-center gap-2">
 					<span
@@ -415,7 +423,7 @@ export function SnapshotDeltaPage() {
 
 			<h2 id="writing">How writes work</h2>
 
-			<p>Writes go to three places:</p>
+			<p>Writes go to two places:</p>
 
 			<WriteFlowDiagram />
 
@@ -430,7 +438,17 @@ export function SnapshotDeltaPage() {
 
 			<p>
 				During a checkpoint, reads continue against the old snapshot and delta.
-				The switch to the new snapshot is atomic.
+				An automatic checkpoint runs on the database's checkpoint thread, so
+				writes continue too: it builds the new snapshot from the changes
+				committed up to its cut, and replays the commits made since over it
+				before the switch. The switch to the new snapshot and delta is atomic.
+				The delta takes about ten times the bytes of log it holds, so{" "}
+				<code>checkpointLogBudget</code> (default 128 MiB of log) bounds its
+				memory. See{" "}
+				<a href="/docs/internals/wal#background-checkpoints">
+					background checkpoints
+				</a>
+				.
 			</p>
 
 			<h2 id="why-it-works">Why this works well</h2>

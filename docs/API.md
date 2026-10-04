@@ -60,7 +60,16 @@ Recommended profile for high write throughput:
   together, in any sync mode, with one WAL write, one header write and (in `Full` mode) one
   fsync for the group. This is always on; `group_commit_enabled` and
   `group_commit_window_ms` have no effect, and no commit waits for others to join
-- Optional: increase `wal_size` (e.g., 64MB) for heavy ingest to reduce checkpoints
+- The default 4 MB WAL is enough for heavy ingest: when it fills, its records spill into a WAL
+  segment (a copy and three syncs), and automatic checkpoints run on a thread of the database's
+  own, without holding up commits. A larger `wal_size` only means fewer spills
+- Checkpoints start once the log (WAL segments and WAL) reaches `checkpoint_log_ratio` (default
+  0.5) of the snapshot's size, at least four WALs and at most `checkpoint_log_budget` (default
+  128 MiB). The in-memory delta takes about ten times the log's size, so the budget bounds that
+  memory (about 1.3 GB at the default); lower it to cap memory and reopen replay time. Writers
+  wait for a checkpoint only once the WAL segments reach `wal_segment_limit` (default: twice the
+  trigger, at most four times the budget)
+- `checkpoint_threshold` is deprecated and has no effect
 
 Durability note: `Normal` mode does not `fsync` on every commit. An OS crash can
 lose recent commits, but application crashes are recovered via WAL replay.
@@ -530,11 +539,15 @@ KiteDB uses the single-file `.kitedb` format.
 ```
 mydb.kitedb
   Header (pages 0 and 1: two checksummed copies; open uses the newest valid one)
-  WAL Area (linear buffer; checkpoint to reclaim space)
+  WAL Area (linear buffer; spills into WAL segments when full)
   Snapshot Area (CSR)
+  WAL Segments (extents named by the header's segment table; a checkpoint frees them)
 ```
 
-The file format version is 2.
+The file format version is 2, or 3 while the header names WAL segments: older versions
+refuse such a file (version mismatch) rather than miss the commits in its segments. A
+checkpoint that covers every segment writes version 2 again. Snapshots and WAL segments
+take the first free range that holds them, else the end of the file.
 
 ### Snapshot Section
 
@@ -550,6 +563,9 @@ The file format version is 2.
 - 8-byte aligned records
 - CRC-32 (IEEE) per record, XORed with the WAL region's salt (stored in the header), so a
   leftover record from an earlier WAL cycle fails its check like a torn one
+- WAL segments hold records unsalted, synced before a header names them; recovery reads each
+  up to the byte length the header names, then the WAL, and replays the transactions that
+  commit after the segments the snapshot covers
 - Transaction boundaries (BEGIN/COMMIT/ROLLBACK)
 
 ## Getting Started

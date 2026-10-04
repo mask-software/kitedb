@@ -15,7 +15,7 @@
 //!                             commit is group-committed)
 //!   --edge-types N            Number of edge types (default: 3)
 //!   --edge-props N            Number of props per edge (default: 10)
-//!   --checkpoint-threshold P  Auto-checkpoint threshold (default: 0.8)
+//!   --checkpoint-log-ratio R  Checkpoint once the log reaches R x the snapshot (default: 0.5)
 //!   --no-auto-checkpoint      Disable auto-checkpoint
 //!   --vector-dims N            Vector dimensions (default: 128)
 //!   --vector-count N           Number of vectors to set (default: 1000)
@@ -53,7 +53,8 @@ struct BenchConfig {
   node_batches: Option<usize>,
   wal_size: usize,
   sync_mode: SyncMode,
-  checkpoint_threshold: f64,
+  /// None: the library default.
+  checkpoint_log_ratio: Option<f64>,
   auto_checkpoint: bool,
   vector_dims: usize,
   vector_count: usize,
@@ -78,7 +79,7 @@ impl Default for BenchConfig {
       node_batches: None,
       wal_size: 64 * 1024 * 1024,
       sync_mode: SyncMode::Normal,
-      checkpoint_threshold: 0.8,
+      checkpoint_log_ratio: None,
       auto_checkpoint: true,
       vector_dims: 128,
       vector_count: 1000,
@@ -141,7 +142,7 @@ fn parse_args() -> BenchConfig {
       "--group-commit-window-ms" => {
         let _: u64 = value(&args, &mut i, flag);
       }
-      "--checkpoint-threshold" => config.checkpoint_threshold = value(&args, &mut i, flag),
+      "--checkpoint-log-ratio" => config.checkpoint_log_ratio = Some(value(&args, &mut i, flag)),
       "--no-auto-checkpoint" => config.auto_checkpoint = false,
       "--vector-dims" => config.vector_dims = value(&args, &mut i, flag),
       "--vector-count" => config.vector_count = value(&args, &mut i, flag),
@@ -684,7 +685,7 @@ fn main() {
   println!("Group commit: every commit");
   println!("Seed: {}", config.seed);
   println!("Auto-checkpoint: {}", config.auto_checkpoint);
-  println!("Checkpoint threshold: {}", config.checkpoint_threshold);
+  println!("Checkpoint log ratio: {:?}", config.checkpoint_log_ratio);
   println!("Vector dims: {}", format_number(config.vector_dims));
   println!("Vector count: {}", format_number(config.vector_count));
   println!("Replication primary: {}", config.replication_primary);
@@ -704,8 +705,10 @@ fn main() {
   let mut options = SingleFileOpenOptions::new()
     .wal_size(config.wal_size)
     .auto_checkpoint(config.auto_checkpoint)
-    .checkpoint_threshold(config.checkpoint_threshold)
     .sync_mode(config.sync_mode);
+  if let Some(ratio) = config.checkpoint_log_ratio {
+    options = options.checkpoint_log_ratio(ratio);
+  }
 
   if let Some(mvcc) = config.mvcc {
     options = options.mvcc(mvcc);

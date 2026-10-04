@@ -171,7 +171,27 @@ fn apply_kite_open_options(options: &JsKiteOptions, kite_opts: &mut KiteOptions)
     );
   }
   if let Some(value) = options.checkpoint_threshold {
-    kite_opts.checkpoint_threshold = Some(validation::ratio("checkpointThreshold", value)?);
+    // Deprecated, without effect: checked, then ignored.
+    validation::ratio("checkpointThreshold", value)?;
+  }
+  if let Some(value) = options.checkpoint_thread {
+    kite_opts.checkpoint_thread = Some(value);
+  }
+  if let Some(value) = options.checkpoint_log_ratio {
+    kite_opts.checkpoint_log_ratio = Some(validation::non_negative_number(
+      "checkpointLogRatio",
+      value,
+    )?);
+  }
+  if let Some(value) = options.checkpoint_log_budget {
+    kite_opts.checkpoint_log_budget =
+      Some(validation::positive_bytes("checkpointLogBudget", value)?);
+  }
+  if let Some(value) = options.wal_segment_size {
+    kite_opts.wal_segment_size = Some(validation::positive_bytes("walSegmentSize", value)?);
+  }
+  if let Some(value) = options.wal_segment_limit {
+    kite_opts.wal_segment_limit = Some(validation::positive_bytes("walSegmentLimit", value)?);
   }
   if let Some(value) = options.close_checkpoint_if_wal_usage_at_least {
     kite_opts.close_checkpoint_if_wal_usage_at_least = Some(validation::ratio(
@@ -1138,6 +1158,14 @@ impl Kite {
     })
   }
 
+  /// The error of the last automatic checkpoint, if it failed and no
+  /// checkpoint installed since; `null` otherwise (see
+  /// `Database.checkpointError`).
+  #[napi]
+  pub fn checkpoint_error(&self) -> Result<Option<String>> {
+    self.with_kite(|ray| Ok(ray.raw().checkpoint_error()))
+  }
+
   /// Execute a batch of operations atomically
   #[napi]
   pub fn batch(&self, env: Env, ops: Vec<Object>) -> Result<Vec<Object<'_>>> {
@@ -1396,6 +1424,11 @@ mod option_validation_tests {
       group_commit_window_ms: None,
       wal_size_mb: None,
       checkpoint_threshold: None,
+      checkpoint_thread: None,
+      checkpoint_log_ratio: None,
+      checkpoint_log_budget: None,
+      wal_segment_size: None,
+      wal_segment_limit: None,
       close_checkpoint_if_wal_usage_at_least: None,
       replication_role: None,
       replication_sidecar_path: None,
@@ -1417,6 +1450,10 @@ mod option_validation_tests {
     valid.mvcc_max_chain_depth = Some(1);
     valid.group_commit_window_ms = Some(0);
     valid.checkpoint_threshold = Some(0.0);
+    valid.checkpoint_log_ratio = Some(0.0);
+    valid.checkpoint_log_budget = Some(1.0);
+    valid.wal_segment_size = Some(1.0);
+    valid.wal_segment_limit = Some(1.0);
     valid.close_checkpoint_if_wal_usage_at_least = Some(1.0);
     valid.replication_segment_max_bytes = Some(1);
     valid.replication_retention_min_entries = Some(0);
@@ -1449,6 +1486,15 @@ mod option_validation_tests {
 
     let mut candidate = options();
     candidate.checkpoint_threshold = Some(2.0);
+    assert!(apply_kite_open_options(&candidate, &mut KiteOptions::new()).is_err());
+    let mut candidate = options();
+    candidate.checkpoint_log_ratio = Some(-1.0);
+    assert!(apply_kite_open_options(&candidate, &mut KiteOptions::new()).is_err());
+    let mut candidate = options();
+    candidate.checkpoint_log_budget = Some(0.0);
+    assert!(apply_kite_open_options(&candidate, &mut KiteOptions::new()).is_err());
+    let mut candidate = options();
+    candidate.wal_segment_limit = Some(0.5);
     assert!(apply_kite_open_options(&candidate, &mut KiteOptions::new()).is_err());
     let mut candidate = options();
     candidate.wal_size_mb = Some((validation::MAX_BYTES / (1024 * 1024)) + 1);

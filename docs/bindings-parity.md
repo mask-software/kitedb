@@ -16,7 +16,8 @@ Legend
 | Feature area | TypeScript | Python | NAPI | Notes |
 | --- | --- | --- | --- | --- |
 | Single-file DB open/close | Full | Full | Full | `Database`/`open_database`/`openDatabase` |
-| Single-file open options | Full | Full | Full | Page size, WAL size, sync mode, MVCC (on by default in all three; `mvcc: false` is deprecated) (the `cache*` options are accepted and ignored) |
+| Single-file open options | Full | Full | Full | Page size, WAL size, sync mode, MVCC (on by default in all three; `mvcc: false` is deprecated), checkpoint thread, checkpoint log ratio and budget, WAL segment size and limit (the `cache*` options and `checkpointThreshold` are accepted and ignored) |
+| Checkpoint status | Full | Full | Full | `checkpointError()` (`checkpoint_error()` in Python; also on NAPI `Kite`): the last automatic checkpoint's error, cleared by the next install. A write that needs WAL segment space while automatic checkpoints fail raises `CheckpointError` in Python and a "Checkpoint failed" error in NAPI |
 | Locking utility | Full | Missing | Missing | TS-only helper (`isProperLockingAvailable`) |
 | Backup/restore | Full | Missing | Full | `createBackup`, `restoreBackup`, `createOfflineBackup` |
 | Export/import | Full | Missing | Full | JSON export/import + JSONL export (TS has no JSONL import either) |

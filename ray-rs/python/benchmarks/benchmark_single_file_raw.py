@@ -25,7 +25,8 @@ Options:
   --group-commit-enabled, --group-commit-window-ms N
                             Accepted for old command lines; no effect (every
                             commit is group-committed)
-  --checkpoint-threshold P  Auto-checkpoint threshold (default: 0.8)
+  --checkpoint-log-ratio R  Checkpoint once the log reaches R x the snapshot
+                            (default: the library default, 0.5)
   --no-auto-checkpoint      Disable auto-checkpoint
   --vector-dims N            Vector dimensions (default: 128)
   --vector-count N           Number of vectors to set (default: 1000)
@@ -68,7 +69,7 @@ class BenchConfig:
   keep_db: bool = False
   wal_size: int = 64 * 1024 * 1024
   sync_mode: str = "normal"
-  checkpoint_threshold: float = 0.8
+  checkpoint_log_ratio: Optional[float] = None
   auto_checkpoint: bool = True
   vector_dims: int = 128
   vector_count: int = 1000
@@ -98,7 +99,7 @@ def parse_args() -> BenchConfig:
   parser.add_argument("--group-commit-enabled", action="store_true")
   parser.add_argument("--group-commit-window-ms", type=int, default=2)
   parser.add_argument("--seed", type=int, default=42)
-  parser.add_argument("--checkpoint-threshold", type=float, default=0.8)
+  parser.add_argument("--checkpoint-log-ratio", type=float, default=None)
   parser.add_argument("--no-auto-checkpoint", action="store_true")
   parser.add_argument("--vector-dims", type=int, default=128)
   parser.add_argument("--vector-count", type=int, default=1000)
@@ -130,7 +131,7 @@ def parse_args() -> BenchConfig:
     keep_db=args.keep_db,
     wal_size=args.wal_size,
     sync_mode=str(args.sync_mode).lower(),
-    checkpoint_threshold=args.checkpoint_threshold,
+    checkpoint_log_ratio=args.checkpoint_log_ratio,
     auto_checkpoint=not args.no_auto_checkpoint,
     vector_dims=args.vector_dims,
     vector_count=args.vector_count,
@@ -491,7 +492,7 @@ def run_benchmarks(config: BenchConfig):
   logger.log("Group commit: every commit")
   logger.log(f"Seed: {config.seed}")
   logger.log(f"Auto-checkpoint: {config.auto_checkpoint}")
-  logger.log(f"Checkpoint threshold: {config.checkpoint_threshold}")
+  logger.log(f"Checkpoint log ratio: {config.checkpoint_log_ratio}")
   logger.log(f"Vector dims: {format_number(config.vector_dims)}")
   logger.log(f"Vector count: {format_number(config.vector_count)}")
   logger.log(f"Skip compact: {config.skip_compact}")
@@ -511,12 +512,14 @@ def run_benchmarks(config: BenchConfig):
     elif config.sync_mode == "off":
       sync_mode = SyncMode.off()
 
-    # mvcc is passed only when given, so the run gets the library default.
+    # mvcc and the log ratio are passed only when given, so the run gets
+    # the library defaults.
     mvcc_option = {} if config.mvcc is None else {"mvcc": config.mvcc}
+    if config.checkpoint_log_ratio is not None:
+      mvcc_option["checkpoint_log_ratio"] = config.checkpoint_log_ratio
     options = OpenOptions(
       wal_size=config.wal_size,
       auto_checkpoint=config.auto_checkpoint,
-      checkpoint_threshold=config.checkpoint_threshold,
       sync_mode=sync_mode,
       **mvcc_option,
     )

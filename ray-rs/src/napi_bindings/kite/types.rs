@@ -94,9 +94,23 @@ pub struct JsKiteOptions {
   /// Set: a new file gets this size; an existing file with a different WAL
   /// size fails to open.
   pub wal_size_mb: Option<i64>,
-  /// WAL usage threshold (0.0-1.0) to trigger auto-checkpoint
+  /// @deprecated No effect: automatic checkpoints follow the log (see `checkpointLogRatio` and `checkpointLogBudget`). Still accepted (in [0, 1]) so existing callers keep working.
   pub checkpoint_threshold: Option<f64>,
-  /// On close, checkpoint if WAL usage is at or above this threshold (default: 0.2)
+  /// Run automatic checkpoints on a thread of the database's own (default:
+  /// true)
+  pub checkpoint_thread: Option<bool>,
+  /// Checkpoint once the log the snapshot does not cover reaches this
+  /// fraction of the snapshot's size (default: 0.5)
+  pub checkpoint_log_ratio: Option<f64>,
+  /// The most log, in bytes, an automatic checkpoint waits for (default:
+  /// 128 MiB; the in-memory delta takes about ten times the log's size)
+  pub checkpoint_log_budget: Option<f64>,
+  /// Bytes of a WAL segment extent (default: eight WALs, at most 32 MiB)
+  pub wal_segment_size: Option<f64>,
+  /// The most bytes of WAL segments before writers wait for a checkpoint
+  pub wal_segment_limit: Option<f64>,
+  /// On close, checkpoint if the log the snapshot does not cover is at least
+  /// this fraction of the checkpoint trigger (default: 0.2)
   pub close_checkpoint_if_wal_usage_at_least: Option<f64>,
   /// Replication role: "Disabled", "Primary", or "Replica"
   pub replication_role: Option<JsReplicationRole>,

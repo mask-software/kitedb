@@ -75,6 +75,13 @@ create_exception!(
   KiteError,
   "The WAL is full; checkpoint before writing more."
 );
+create_exception!(
+  kitedb._kitedb,
+  CheckpointError,
+  KiteError,
+  "A write needs WAL segment space only a checkpoint frees, and the last automatic \
+   checkpoint failed (see Database.checkpoint_error). Committed data is safe."
+);
 
 /// Adds the exception classes to the native module.
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -89,6 +96,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
   m.add("LockError", py.get_type::<LockError>())?;
   m.add("CorruptionError", py.get_type::<CorruptionError>())?;
   m.add("WalFullError", py.get_type::<WalFullError>())?;
+  m.add("CheckpointError", py.get_type::<CheckpointError>())?;
   Ok(())
 }
 
@@ -114,6 +122,7 @@ pub(crate) fn core_error(err: &CoreError, message: String) -> PyErr {
     | CoreError::InvalidPropTag(_)
     | CoreError::InvalidWalRecordType(_) => CorruptionError::new_err(message),
     CoreError::WalBufferFull => WalFullError::new_err(message),
+    CoreError::CheckpointFailed(_) => CheckpointError::new_err(message),
     _ => KiteError::new_err(message),
   }
 }

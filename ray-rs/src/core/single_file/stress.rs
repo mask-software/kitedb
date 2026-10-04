@@ -20,7 +20,6 @@ fn open_soak_db(path: &std::path::Path) -> Result<SingleFileDB> {
       .sync_mode(SyncMode::Normal)
       .wal_size(64 * 1024 * 1024)
       .auto_checkpoint(true)
-      .checkpoint_threshold(0.7)
       .background_checkpoint(false),
   )
 }
@@ -91,7 +90,6 @@ fn test_single_file_resize_wal_stress() -> Result<()> {
       .sync_mode(SyncMode::Normal)
       .wal_size(64 * 1024)
       .auto_checkpoint(true)
-      .checkpoint_threshold(0.7)
       .background_checkpoint(false),
   )?;
 
@@ -110,7 +108,6 @@ fn test_single_file_resize_wal_stress() -> Result<()> {
       .sync_mode(SyncMode::Normal)
       .wal_size(8 * 1024 * 1024)
       .auto_checkpoint(true)
-      .checkpoint_threshold(0.7)
       .background_checkpoint(false),
   )?;
 

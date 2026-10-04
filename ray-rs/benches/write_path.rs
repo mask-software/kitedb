@@ -32,7 +32,7 @@ enum LockMode {
 fn create_write_schema(
   group_commit: bool,
   wal_mb: Option<usize>,
-  checkpoint_threshold: Option<f64>,
+  checkpoint_log_ratio: Option<f64>,
 ) -> KiteOptions {
   let user = NodeDef::new("User", "user:").prop(PropDef::string("name"));
 
@@ -47,8 +47,8 @@ fn create_write_schema(
       .ok()
       .and_then(|value| value.parse::<usize>().ok())
   });
-  let checkpoint_threshold = checkpoint_threshold.or_else(|| {
-    env::var("KITE_BENCH_CHECKPOINT_THRESHOLD")
+  let checkpoint_log_ratio = checkpoint_log_ratio.or_else(|| {
+    env::var("KITE_BENCH_CHECKPOINT_LOG_RATIO")
       .ok()
       .and_then(|value| value.parse::<f64>().ok())
   });
@@ -56,8 +56,8 @@ fn create_write_schema(
   if let Some(mb) = wal_mb {
     options = options.wal_size_mb(mb);
   }
-  if let Some(value) = checkpoint_threshold {
-    options = options.checkpoint_threshold(value);
+  if let Some(value) = checkpoint_log_ratio {
+    options = options.checkpoint_log_ratio(value);
   }
 
   options

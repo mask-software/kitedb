@@ -1257,8 +1257,8 @@ db.commit()`}
 						<tr>
 							<td>Single-writer ingest</td>
 							<td>
-								<code>syncMode: 'Normal'</code>, WAL ≥ 256MB,{" "}
-								<code>autoCheckpoint: false</code>
+								<code>syncMode: 'Normal'</code>, default WAL and checkpoint
+								settings
 							</td>
 						</tr>
 						<tr>
@@ -1271,6 +1271,14 @@ db.commit()`}
 							<td>Max durability</td>
 							<td>
 								<code>syncMode: 'Full'</code>, smaller batches
+							</td>
+						</tr>
+						<tr>
+							<td>Fast reopen, bounded memory</td>
+							<td>
+								<code>checkpointLogBudget: 32 * 1024 * 1024</code> (as{" "}
+								<code>recommendedReopenHeavyProfile()</code> sets, with a 16 MB
+								WAL)
 							</td>
 						</tr>
 						<tr>
@@ -1292,9 +1300,21 @@ db.commit()`}
 						Prefer <code>beginBulk()</code> for ingest; commit in chunks
 					</li>
 					<li>Don't hold read transactions open across a bulk load</li>
-					<li>Increase WAL size for large ingest (256MB+)</li>
 					<li>
-						Disable auto-checkpoint during ingest; checkpoint once at the end
+						Keep the default 4 MB WAL for large ingest: a full WAL spills into
+						WAL segments, and checkpoints run on the database's checkpoint
+						thread. A larger WAL only means fewer spills
+					</li>
+					<li>
+						Leave auto-checkpoint on. With it off, writes fail once the WAL
+						segments reach <code>walSegmentLimit</code>; raise the limit to hold
+						the whole load and checkpoint once at the end
+					</li>
+					<li>
+						Lower <code>checkpointLogBudget</code> (default 128 MiB) to bound
+						memory and reopen replay time; raise <code>checkpointLogRatio</code>{" "}
+						to checkpoint less often on a large database.{" "}
+						<code>checkpointThreshold</code> is deprecated and has no effect
 					</li>
 					<li>Use low-level API for hot paths in JS/TS</li>
 					<li>

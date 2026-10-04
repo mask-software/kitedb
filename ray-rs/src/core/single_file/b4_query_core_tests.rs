@@ -396,7 +396,6 @@ fn random_kite_options(mvcc: bool) -> KiteOptions {
     .edge(EdgeDef::new("B"));
   options.sync_mode = SyncMode::Off;
   options.mvcc = mvcc;
-  options.checkpoint_threshold = Some(1.0);
   options
 }
 

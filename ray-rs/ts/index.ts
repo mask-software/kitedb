@@ -1535,7 +1535,10 @@ export interface BulkWriteOptions {
   chunkSize?: number
   /** Call checkpoint when recommended between chunks (default: false) */
   checkpoint?: boolean
-  /** Threshold for shouldCheckpoint (default: 0.8) */
+  /**
+   * Threshold for shouldCheckpoint: the fraction of the automatic checkpoint
+   * trigger the uncovered log has reached (default: 0.8)
+   */
   checkpointThreshold?: number
 }
 
@@ -1796,8 +1799,34 @@ export interface KiteOptions {
    * with a different WAL size fails to open.
    */
   walSizeMb?: number
-  /** WAL usage threshold (0.0-1.0) to trigger auto-checkpoint */
+  /**
+   * @deprecated No effect: automatic checkpoints follow the log (see
+   * `checkpointLogRatio` and `checkpointLogBudget`). Still accepted (in
+   * [0, 1]) so existing callers keep working.
+   */
   checkpointThreshold?: number
+  /**
+   * Run automatic checkpoints on a thread of the database's own, so the
+   * commit that crosses the trigger returns at once (default: true)
+   */
+  checkpointThread?: boolean
+  /**
+   * Checkpoint once the log the snapshot does not cover (WAL segments and
+   * WAL) reaches this fraction of the snapshot's size (default: 0.5; at least
+   * four WALs, at most `checkpointLogBudget`)
+   */
+  checkpointLogRatio?: number
+  /**
+   * The most log, in bytes, an automatic checkpoint waits for (default: 128
+   * MiB). The in-memory delta takes about ten times the log's size. Writers
+   * wait for a checkpoint only at `walSegmentLimit` (by default twice the
+   * checkpoint trigger, at most four times this).
+   */
+  checkpointLogBudget?: number
+  /** Bytes of a WAL segment extent (default: eight WALs, at most 32 MiB) */
+  walSegmentSize?: number
+  /** The most bytes of WAL segments before writers wait for a checkpoint */
+  walSegmentLimit?: number
   /** Replication role */
   replicationRole?: ReplicationRole
   /** Replication sidecar path override */
@@ -1941,6 +1970,11 @@ function optionsToNative(options: KiteOptions): JsKiteOptions {
     groupCommitWindowMs: options.groupCommitWindowMs,
     walSizeMb: options.walSizeMb,
     checkpointThreshold: options.checkpointThreshold,
+    checkpointThread: options.checkpointThread,
+    checkpointLogRatio: options.checkpointLogRatio,
+    checkpointLogBudget: options.checkpointLogBudget,
+    walSegmentSize: options.walSegmentSize,
+    walSegmentLimit: options.walSegmentLimit,
     strictSchema: options.strictSchema,
   }
 

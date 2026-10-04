@@ -3138,7 +3138,6 @@ mod tests {
       .mvcc_gc_interval_ms(10)
       .wal_size(64 * 1024)
       .auto_checkpoint(true)
-      .checkpoint_threshold(0.5)
       .background_checkpoint(true);
     let db = Arc::new(open_single_file(&db_path, options.clone()).expect("open"));
 

@@ -215,7 +215,6 @@ fn scratch_stress_crash_images_under_concurrent_background_checkpoints() {
     let options = SingleFileOpenOptions::new()
       .wal_size(wal_kib * 1024)
       .auto_checkpoint(std::env::var("SCRATCH_NOCP").is_err())
-      .checkpoint_threshold(0.5)
       .background_checkpoint(std::env::var("SCRATCH_BLOCKING").is_err())
       .sync_mode(crate::core::single_file::SyncMode::Normal)
       .mvcc(std::env::var("SCRATCH_MVCC").map_or(true, |mode| mode != "0"))
@@ -799,7 +798,6 @@ fn scratch_large_db_background_checkpoints_under_sustained_writes() {
   let options = SingleFileOpenOptions::new()
     .auto_checkpoint(true)
     .background_checkpoint(true)
-    .checkpoint_threshold(0.5)
     .sync_mode(crate::core::single_file::SyncMode::Normal);
   let db = Arc::new(open_single_file(&db_path, options).expect("reopen"));
   let gen0 = db.header.read().active_snapshot_gen;

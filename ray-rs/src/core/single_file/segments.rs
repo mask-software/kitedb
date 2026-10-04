@@ -138,10 +138,10 @@ impl SingleFileDB {
   /// (about ten times its size) on a large database.
   pub(crate) fn checkpoint_log_trigger(&self, header: &DbHeaderV1) -> u64 {
     let page_size = header.page_size as u64;
-    let floor = (4 * header.wal_page_count * page_size).min(self.wal_log_budget);
+    let floor = (4 * header.wal_page_count * page_size).min(self.checkpoint_log_budget);
     let snapshot = header.snapshot_page_count * page_size;
     let wanted = (self.checkpoint_log_ratio * snapshot as f64) as u64;
-    wanted.clamp(floor, self.wal_log_budget.max(floor))
+    wanted.clamp(floor, self.checkpoint_log_budget.max(floor))
   }
 
   /// The most bytes of WAL segments: past it the WAL spills no more, and
@@ -156,10 +156,11 @@ impl SingleFileDB {
       return explicit;
     }
     let wal = header.wal_page_count * header.page_size as u64;
+    // The trigger is at most the budget, so this is at least twice it.
     let trigger = self.checkpoint_log_trigger(header);
     (2 * trigger)
       .max(16 * wal)
-      .min((4 * self.wal_log_budget).max(2 * trigger))
+      .min(4 * self.checkpoint_log_budget)
   }
 
   /// The size of the log the snapshot does not cover (the WAL segments past

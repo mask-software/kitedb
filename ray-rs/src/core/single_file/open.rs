@@ -112,12 +112,46 @@ pub struct SingleFileOpenOptions {
   /// `Some(n)`: a new file gets an `n`-byte WAL, and opening an existing file
   /// whose WAL size differs fails.
   pub wal_size: Option<usize>,
-  /// Enable auto-checkpoint when WAL usage exceeds threshold (default true)
+  /// Checkpoint automatically once the log (the WAL and its WAL segments)
+  /// reaches the checkpoint trigger (default true; see
+  /// `checkpoint_log_ratio`). Without, the WAL spills into WAL segments until
+  /// `wal_segment_limit`, and then writes fail with `WalBufferFull`.
   pub auto_checkpoint: bool,
-  /// WAL usage threshold (0.0-1.0) to trigger auto-checkpoint (default 0.5)
+  /// Has no effect: automatic checkpoints follow the log, not the WAL's
+  /// usage (see `checkpoint_log_ratio` and `checkpoint_log_budget`). Still
+  /// accepted so existing callers keep compiling.
+  #[deprecated(
+    note = "has no effect: automatic checkpoints follow the log; see checkpoint_log_ratio and \
+            checkpoint_log_budget"
+  )]
   pub checkpoint_threshold: f64,
   /// Use background (non-blocking) checkpoint instead of blocking (default true)
   pub background_checkpoint: bool,
+  /// Run automatic background checkpoints on a thread of the database's
+  /// own, so the commit that crosses the trigger returns at once (default
+  /// true). Without it they run on the committing thread. Ignored by
+  /// read-only opens, without `background_checkpoint`, and on wasm32.
+  pub checkpoint_thread: bool,
+  /// An automatic checkpoint starts once the log the snapshot does not cover
+  /// (WAL segments and WAL) reaches this fraction of the snapshot's size
+  /// (default 0.5), within limits: at least four WALs, at most
+  /// `checkpoint_log_budget`.
+  pub checkpoint_log_ratio: f64,
+  /// The most log, in bytes, an automatic checkpoint waits for (default
+  /// 128 MiB). The delta that holds the log's commits in memory takes about
+  /// ten times the log's size, so this bounds that memory. Writers wait for
+  /// a checkpoint only once the WAL segments reach `wal_segment_limit` (by
+  /// default twice the checkpoint trigger, at most four times this).
+  pub checkpoint_log_budget: u64,
+  /// Bytes of a WAL segment extent: spills of the WAL fill one before the
+  /// next is allocated (default: eight WALs, at most 32 MiB; at least one
+  /// and a half WALs).
+  pub wal_segment_size: Option<u64>,
+  /// The most bytes of WAL segments: past it the WAL spills no more, and
+  /// writers wait for a checkpoint (or fail with `WalBufferFull` without
+  /// automatic checkpoints). Default: twice the checkpoint trigger, at least
+  /// 16 WALs, at most four times `checkpoint_log_budget`.
+  pub wal_segment_limit: Option<u64>,
   /// Has no effect. The cache layer was removed: no read ever consulted it,
   /// and reads are served from the snapshot and delta. Still accepted so
   /// existing callers keep compiling.
@@ -180,6 +214,11 @@ impl Default for SingleFileOpenOptions {
       auto_checkpoint: true,
       checkpoint_threshold: 0.5,
       background_checkpoint: true,
+      checkpoint_thread: true,
+      checkpoint_log_ratio: CHECKPOINT_LOG_RATIO_DEFAULT,
+      checkpoint_log_budget: CHECKPOINT_LOG_BUDGET_DEFAULT,
+      wal_segment_size: None,
+      wal_segment_limit: None,
       cache: None,
       checkpoint_compression: Some(CompressionOptions {
         enabled: true,
@@ -270,6 +309,12 @@ impl SingleFileOpenOptions {
     self
   }
 
+  /// Has no effect; see [`SingleFileOpenOptions::checkpoint_threshold`].
+  #[deprecated(
+    note = "has no effect: automatic checkpoints follow the log; see checkpoint_log_ratio and \
+            checkpoint_log_budget"
+  )]
+  #[allow(deprecated)]
   pub fn checkpoint_threshold(mut self, value: f64) -> Self {
     self.checkpoint_threshold = value.clamp(0.0, 1.0);
     self
@@ -277,6 +322,42 @@ impl SingleFileOpenOptions {
 
   pub fn background_checkpoint(mut self, value: bool) -> Self {
     self.background_checkpoint = value;
+    self
+  }
+
+  /// Run automatic background checkpoints on the database's checkpoint
+  /// thread (default true); see the `checkpoint_thread` field.
+  pub fn checkpoint_thread(mut self, value: bool) -> Self {
+    self.checkpoint_thread = value;
+    self
+  }
+
+  /// Checkpoint once the uncovered log reaches `value` times the snapshot's
+  /// size (default 0.5; a finite number, at least 0); see the
+  /// `checkpoint_log_ratio` field.
+  pub fn checkpoint_log_ratio(mut self, value: f64) -> Self {
+    self.checkpoint_log_ratio = value;
+    self
+  }
+
+  /// The most log, in bytes, an automatic checkpoint waits for (default
+  /// 128 MiB, more than 0); see the `checkpoint_log_budget` field.
+  pub fn checkpoint_log_budget(mut self, bytes: u64) -> Self {
+    self.checkpoint_log_budget = bytes;
+    self
+  }
+
+  /// Bytes of a WAL segment extent (more than 0); see the
+  /// `wal_segment_size` field.
+  pub fn wal_segment_size(mut self, bytes: u64) -> Self {
+    self.wal_segment_size = Some(bytes);
+    self
+  }
+
+  /// The most bytes of WAL segments (more than 0); see the
+  /// `wal_segment_limit` field.
+  pub fn wal_segment_limit(mut self, bytes: u64) -> Self {
+    self.wal_segment_limit = Some(bytes);
     self
   }
 
@@ -422,8 +503,10 @@ impl SingleFileOpenOptions {
 /// Options for closing a single-file database.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SingleFileCloseOptions {
-  /// If set, run a blocking checkpoint before close when WAL usage >= threshold.
-  /// Threshold is clamped to [0.0, 1.0].
+  /// If set, run a blocking checkpoint before close when the log the
+  /// snapshot does not cover (WAL segments and WAL) is at least this
+  /// fraction of the checkpoint trigger (see `SingleFileDB::should_checkpoint`),
+  /// so the next open replays less. Threshold is clamped to [0.0, 1.0].
   pub checkpoint_if_wal_usage_at_least: Option<f64>,
 }
 
@@ -772,6 +855,7 @@ fn open_single_file_internal(
       options.page_size
     )));
   }
+  validate_checkpoint_options(&options)?;
 
   // Check if file exists
   let file_exists = path.exists();
@@ -1135,7 +1219,9 @@ fn open_single_file_internal(
     }
   }
 
-  let wal_segment_size = default_wal_segment_size(&header);
+  let wal_segment_size = options
+    .wal_segment_size
+    .unwrap_or_else(|| default_wal_segment_size(&header));
   Ok(SingleFileDB::owning(SingleFileInner {
     path: path.to_path_buf(),
     read_only: options.read_only,
@@ -1178,16 +1264,16 @@ fn open_single_file_internal(
     vector_stores: RwLock::new(vector_stores),
     vector_store_lazy_entries: RwLock::new(vector_store_lazy_entries),
     checkpoint_compression: options.checkpoint_compression.clone(),
-    checkpoint_thread_enabled: true,
+    checkpoint_thread_enabled: options.checkpoint_thread,
     checkpoint_thread: Mutex::new(None),
     checkpoint_thread_stopped: AtomicBool::new(false),
     checkpoint_abandoned: AtomicBool::new(false),
     checkpoint_installing: AtomicBool::new(false),
     checkpoint_last_error: Mutex::new(None),
     wal_segment_size,
-    checkpoint_log_ratio: CHECKPOINT_LOG_RATIO_DEFAULT,
-    wal_log_budget: WAL_LOG_BUDGET_DEFAULT as u64,
-    wal_segment_limit_bytes: AtomicU64::new(0),
+    checkpoint_log_ratio: options.checkpoint_log_ratio,
+    checkpoint_log_budget: options.checkpoint_log_budget,
+    wal_segment_limit_bytes: AtomicU64::new(options.wal_segment_limit.unwrap_or(0)),
     wal_spills: AtomicU64::new(0),
     spilled_open_txids: Mutex::new(HashMap::new()),
     sync_mode: options.sync_mode,
@@ -1200,6 +1286,29 @@ fn open_single_file_internal(
     #[cfg(feature = "bench-profile")]
     wal_flush_ns: AtomicU64::new(0),
   }))
+}
+
+/// Refuse checkpoint options no database can use: a log ratio that is not a
+/// finite number at least 0, and sizes of 0.
+fn validate_checkpoint_options(options: &SingleFileOpenOptions) -> Result<()> {
+  if !options.checkpoint_log_ratio.is_finite() || options.checkpoint_log_ratio < 0.0 {
+    return Err(KiteError::Internal(format!(
+      "invalid checkpoint_log_ratio {}: a finite number, at least 0",
+      options.checkpoint_log_ratio
+    )));
+  }
+  for (name, value) in [
+    ("checkpoint_log_budget", Some(options.checkpoint_log_budget)),
+    ("wal_segment_size", options.wal_segment_size),
+    ("wal_segment_limit", options.wal_segment_limit),
+  ] {
+    if value == Some(0) {
+      return Err(KiteError::Internal(format!(
+        "invalid {name} 0: more than 0 bytes"
+      )));
+    }
+  }
+  Ok(())
 }
 
 /// Bytes of a WAL segment extent by default: eight WALs, at most

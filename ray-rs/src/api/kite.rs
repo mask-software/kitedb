@@ -1061,9 +1061,34 @@ pub struct KiteOptions {
   /// its own. `Some(n)`: a new file gets an `n`-byte WAL; an existing file
   /// with a different WAL size fails to open.
   pub wal_size: Option<usize>,
-  /// WAL usage threshold (0.0-1.0) to trigger auto-checkpoint
+  /// Has no effect: automatic checkpoints follow the log; see
+  /// `checkpoint_log_ratio` and `checkpoint_log_budget`. Still accepted so
+  /// existing callers keep compiling.
+  #[deprecated(
+    note = "has no effect: automatic checkpoints follow the log; see checkpoint_log_ratio and \
+            checkpoint_log_budget"
+  )]
   pub checkpoint_threshold: Option<f64>,
-  /// Close-time WAL usage threshold (0.0-1.0) to trigger blocking checkpoint
+  /// Run automatic checkpoints on the database's checkpoint thread (default
+  /// true; see `SingleFileOpenOptions::checkpoint_thread`).
+  pub checkpoint_thread: Option<bool>,
+  /// Checkpoint once the uncovered log reaches this fraction of the
+  /// snapshot's size (default 0.5; see
+  /// `SingleFileOpenOptions::checkpoint_log_ratio`).
+  pub checkpoint_log_ratio: Option<f64>,
+  /// The most log, in bytes, an automatic checkpoint waits for (default 128
+  /// MiB; memory for the delta is about ten times it; see
+  /// `SingleFileOpenOptions::checkpoint_log_budget`).
+  pub checkpoint_log_budget: Option<u64>,
+  /// Bytes of a WAL segment extent (see
+  /// `SingleFileOpenOptions::wal_segment_size`).
+  pub wal_segment_size: Option<u64>,
+  /// The most bytes of WAL segments before writers wait for a checkpoint
+  /// (see `SingleFileOpenOptions::wal_segment_limit`).
+  pub wal_segment_limit: Option<u64>,
+  /// Close-time threshold (0.0-1.0) to trigger a blocking checkpoint: the
+  /// uncovered log as a fraction of the checkpoint trigger (see
+  /// `SingleFileCloseOptions::checkpoint_if_wal_usage_at_least`)
   pub close_checkpoint_if_wal_usage_at_least: Option<f64>,
   /// Replication role (disabled | primary | replica)
   pub replication_role: ReplicationRole,
@@ -1090,6 +1115,7 @@ pub struct KiteOptions {
 }
 
 impl KiteOptions {
+  #[allow(deprecated)]
   pub fn new() -> Self {
     Self {
       nodes: Vec::new(),
@@ -1105,6 +1131,11 @@ impl KiteOptions {
       mvcc_max_chain_depth: None,
       wal_size: None,
       checkpoint_threshold: None,
+      checkpoint_thread: None,
+      checkpoint_log_ratio: None,
+      checkpoint_log_budget: None,
+      wal_segment_size: None,
+      wal_segment_limit: None,
       close_checkpoint_if_wal_usage_at_least: Some(0.2),
       replication_role: ReplicationRole::Disabled,
       replication_sidecar_path: None,
@@ -1206,15 +1237,59 @@ impl KiteOptions {
     self
   }
 
-  /// Set checkpoint threshold (0.0-1.0)
+  /// Has no effect; see [`KiteOptions::checkpoint_threshold`].
+  #[deprecated(
+    note = "has no effect: automatic checkpoints follow the log; see checkpoint_log_ratio and \
+            checkpoint_log_budget"
+  )]
+  #[allow(deprecated)]
   pub fn checkpoint_threshold(mut self, value: f64) -> Self {
     self.checkpoint_threshold = Some(value.clamp(0.0, 1.0));
     self
   }
 
+  /// Run automatic checkpoints on the checkpoint thread (default true).
+  pub fn checkpoint_thread(mut self, value: bool) -> Self {
+    self.checkpoint_thread = Some(value);
+    self
+  }
+
+  /// Checkpoint once the uncovered log reaches `value` times the snapshot's
+  /// size (default 0.5).
+  pub fn checkpoint_log_ratio(mut self, value: f64) -> Self {
+    self.checkpoint_log_ratio = Some(value);
+    self
+  }
+
+  /// The most log, in bytes, an automatic checkpoint waits for (default 128
+  /// MiB).
+  pub fn checkpoint_log_budget(mut self, bytes: u64) -> Self {
+    self.checkpoint_log_budget = Some(bytes);
+    self
+  }
+
+  /// The most log, in megabytes, an automatic checkpoint waits for.
+  pub fn checkpoint_log_budget_mb(mut self, megabytes: u64) -> Self {
+    self.checkpoint_log_budget = Some(megabytes.saturating_mul(1024 * 1024));
+    self
+  }
+
+  /// Bytes of a WAL segment extent.
+  pub fn wal_segment_size(mut self, bytes: u64) -> Self {
+    self.wal_segment_size = Some(bytes);
+    self
+  }
+
+  /// The most bytes of WAL segments before writers wait for a checkpoint.
+  pub fn wal_segment_limit(mut self, bytes: u64) -> Self {
+    self.wal_segment_limit = Some(bytes);
+    self
+  }
+
   /// Set close-time checkpoint threshold (0.0-1.0).
   ///
-  /// When set, `Kite::close()` checkpoints if WAL usage is at or above this threshold.
+  /// When set, `Kite::close()` checkpoints if the log the snapshot does not
+  /// cover is at least this fraction of the checkpoint trigger.
   pub fn close_checkpoint_if_wal_usage_at_least(mut self, value: f64) -> Self {
     self.close_checkpoint_if_wal_usage_at_least = Some(value.clamp(0.0, 1.0));
     self
@@ -1270,27 +1345,23 @@ impl KiteOptions {
 
   /// Recommended conservative profile (durability-first).
   pub fn recommended_safe() -> Self {
-    Self::new()
-      .sync_mode(SyncMode::Full)
-      .checkpoint_threshold(0.5)
+    Self::new().sync_mode(SyncMode::Full)
   }
 
   /// Recommended balanced profile (good throughput + durability tradeoff).
   pub fn recommended_balanced() -> Self {
-    Self::new()
-      .sync_mode(SyncMode::Normal)
-      .wal_size_mb(64)
-      .checkpoint_threshold(0.5)
+    Self::new().sync_mode(SyncMode::Normal).wal_size_mb(64)
   }
 
   /// Recommended profile for reopen-heavy workloads.
   ///
-  /// Uses a smaller WAL and lower auto-checkpoint threshold to cap replay cost on reopen.
+  /// Uses a smaller WAL and a smaller checkpoint log budget (32 MiB) to cap
+  /// replay cost on reopen.
   pub fn recommended_reopen_heavy() -> Self {
     Self::new()
       .sync_mode(SyncMode::Normal)
       .wal_size_mb(16)
-      .checkpoint_threshold(0.2)
+      .checkpoint_log_budget_mb(32)
   }
 }
 
@@ -1422,8 +1493,20 @@ impl Kite {
     if let Some(v) = options.wal_size {
       db_options = db_options.wal_size(v);
     }
-    if let Some(v) = options.checkpoint_threshold {
-      db_options = db_options.checkpoint_threshold(v);
+    if let Some(v) = options.checkpoint_thread {
+      db_options = db_options.checkpoint_thread(v);
+    }
+    if let Some(v) = options.checkpoint_log_ratio {
+      db_options = db_options.checkpoint_log_ratio(v);
+    }
+    if let Some(v) = options.checkpoint_log_budget {
+      db_options = db_options.checkpoint_log_budget(v);
+    }
+    if let Some(v) = options.wal_segment_size {
+      db_options = db_options.wal_segment_size(v);
+    }
+    if let Some(v) = options.wal_segment_limit {
+      db_options = db_options.wal_segment_limit(v);
     }
     if let Some(path) = options.replication_sidecar_path.as_ref() {
       db_options = db_options.replication_sidecar_path(path);
@@ -2505,9 +2588,11 @@ impl Kite {
     }
   }
 
-  /// Close the database and run a blocking checkpoint if WAL usage is above threshold.
+  /// Close the database and run a blocking checkpoint if the log the
+  /// snapshot does not cover is at least `threshold` of the checkpoint
+  /// trigger (see `SingleFileDB::should_checkpoint`).
   ///
-  /// Use this for reopen-heavy workloads where you want to cap WAL replay cost on next open.
+  /// Use this for reopen-heavy workloads where you want to cap log replay cost on next open.
   /// Threshold is clamped to [0.0, 1.0].
   pub fn close_with_checkpoint_if_wal_over(self, threshold: f64) -> Result<()> {
     close_single_file_with_options(
@@ -4016,13 +4101,12 @@ mod tests {
     let balanced = KiteOptions::recommended_balanced();
     assert_eq!(balanced.sync_mode, SyncMode::Normal);
     assert_eq!(balanced.wal_size, Some(64 * 1024 * 1024));
-    assert_eq!(balanced.checkpoint_threshold, Some(0.5));
     assert_eq!(balanced.close_checkpoint_if_wal_usage_at_least, Some(0.2));
 
     let reopen = KiteOptions::recommended_reopen_heavy();
     assert_eq!(reopen.sync_mode, SyncMode::Normal);
     assert_eq!(reopen.wal_size, Some(16 * 1024 * 1024));
-    assert_eq!(reopen.checkpoint_threshold, Some(0.2));
+    assert_eq!(reopen.checkpoint_log_budget, Some(32 * 1024 * 1024));
     assert_eq!(reopen.close_checkpoint_if_wal_usage_at_least, Some(0.2));
   }
 

@@ -44,7 +44,7 @@ function WALPrincipleDiagram() {
 	const steps: Step[] = [
 		{
 			text: "Write the transaction's records and a Commit record to the WAL",
-			sub: "Where an older record of this WAL cycle may lie, over bytes zeroed and synced first (see below)",
+			sub: "If the WAL is full, it first spills into a WAL segment. Where an older record of this WAL cycle may lie, records go over bytes zeroed and synced first (see below)",
 			accent: "slate",
 		},
 		{
@@ -95,12 +95,12 @@ function WALPrincipleDiagram() {
 				points at. Those pages then still hold what was there before, and KiteDB
 				keeps that harmless. Records of an earlier WAL cycle fail their salt
 				check. Where records of the current cycle may lie past the head (after
-				reopening a file, until the next checkpoint gives the region a new
-				salt), records are only written over bytes zeroed and synced first, a
-				chunk ahead of the head; in Full mode the chunk is topped up in the
-				commits' own write, so it costs no extra fsync. Recovery reads zeros
-				there and stops, keeping every commit acknowledged before, and never
-				replays a record a torn write left behind.
+				reopening a file, until the WAL next starts over under a new salt at a
+				spill or a checkpoint), records are only written over bytes zeroed and
+				synced first, a chunk ahead of the head; in Full mode the chunk is
+				topped up in the commits' own write, so it costs no extra fsync.
+				Recovery reads zeros there and stops, keeping every commit acknowledged
+				before, and never replays a record a torn write left behind.
 			</p>
 		</Figure>
 	);
@@ -164,10 +164,12 @@ function WALRecordFormat() {
 			</div>
 			<p class="mt-3 text-[13px] text-slate-500">
 				The CRC-32 covers everything from Type through the end of the payload,
-				and is XORed with the salt of the WAL region the record is in. A region
-				gets a new salt whenever a checkpoint empties it for reuse, so records
-				an earlier cycle left behind fail the check. Padding brings each record
-				to an 8-byte boundary.
+				and is XORed with the salt of the WAL region the record is in. The WAL
+				gets a new salt whenever it starts over (after a spill, or a checkpoint
+				that empties it), so records an earlier cycle left behind fail the
+				check. WAL segments hold the same records unsalted: the header names
+				each segment's byte length, so nothing past it is read. Padding brings
+				each record to an 8-byte boundary.
 			</p>
 
 			<div class="mt-5 border-t border-kite-line pt-4">
@@ -199,7 +201,11 @@ function WALRecordFormat() {
 
 function LinearBufferDiagram() {
 	return (
-		<Figure title="WAL area" accent="mint" meta="64 MB example">
+		<Figure
+			title="WAL area and WAL segments"
+			accent="mint"
+			meta="4 MB WAL (default)"
+		>
 			<div class="mb-1.5 flex justify-between gap-4 font-mono text-[11px] text-slate-500">
 				<span>primary region, 75%</span>
 				<span>secondary, 25%</span>
@@ -212,105 +218,174 @@ function LinearBufferDiagram() {
 					<div class="flex flex-1 items-center px-2.5 text-slate-500">free</div>
 				</div>
 				<div class="flex w-1/4 items-center bg-white/[0.03] px-2.5 text-slate-500">
-					idle
+					not written
 				</div>
 			</div>
 			<div class="relative mt-1.5 h-4 font-mono text-[11px]">
-				<span class="absolute left-0 text-kite-cyan">tail</span>
 				<span class="absolute left-[33.75%] -translate-x-1/2 text-kite-mint">
 					head
 				</span>
 			</div>
 
+			<p class="mt-4 mb-1.5 font-mono text-[11px] text-slate-500">
+				WAL segments, elsewhere in the file
+			</p>
+			<div class="flex gap-1.5 font-mono text-[11px]">
+				<div class="min-w-0 flex-1 rounded-md border border-kite-mint/25 bg-kite-mint/[0.07] px-2.5 py-2">
+					<div class="text-slate-200">seq 5</div>
+					<div class="text-slate-500">sealed</div>
+				</div>
+				<div class="flex min-w-0 flex-1 overflow-hidden rounded-md border border-kite-line">
+					<div class="w-3/5 border-r border-kite-mint/50 bg-kite-mint/[0.07] px-2.5 py-2">
+						<div class="text-slate-200">seq 6</div>
+						<div class="text-slate-500">open</div>
+					</div>
+					<div class="flex flex-1 items-center px-2.5 text-slate-500">free</div>
+				</div>
+			</div>
+
 			<dl class="mt-4 space-y-1.5 text-[14px]">
 				<div class="flex gap-3">
-					<dt class="w-10 shrink-0 font-mono text-[13px] text-kite-mint">
+					<dt class="w-16 shrink-0 font-mono text-[13px] text-kite-mint">
 						head
 					</dt>
 					<dd class="text-slate-400">Where the next record is written</dd>
 				</div>
 				<div class="flex gap-3">
-					<dt class="w-10 shrink-0 font-mono text-[13px] text-kite-cyan">
-						tail
+					<dt class="w-16 shrink-0 font-mono text-[13px] text-kite-cyan">
+						segment
 					</dt>
 					<dd class="text-slate-400">
-						First record not yet checkpointed; replay starts here
+						An extent of pages the header names, holding records the WAL
+						spilled; read up to the byte length the header names
 					</dd>
 				</div>
 			</dl>
 
 			<p class="mt-4 border-t border-kite-line pt-3 text-[13px] text-slate-400">
-				Records never wrap around. When the active region reaches the checkpoint
-				threshold (50% by default), KiteDB runs a checkpoint, and the tail moves
-				past the records the new snapshot covers. A blocking checkpoint resets
-				the WAL to empty. A write that does not fit fails with a{" "}
-				<span class="text-amber-300">WAL buffer full</span> error.
+				Records never wrap around. The log is the WAL segments in seq order,
+				then the WAL. When a commit does not fit in the WAL, the WAL spills into
+				a segment and starts over, and checkpoints free the segments they cover.
+				Every record is written to the primary region. The secondary region is
+				only read, when opening a file from an earlier version, whose background
+				checkpoints wrote there.
 			</p>
 		</Figure>
 	);
 }
 
-function WALDualRegionDetailed() {
+function SpillDiagram() {
+	const steps: Step[] = [
+		{
+			text: "Copy the WAL's records, unsalted, into a WAL segment",
+			sub: "Appended to the open extent if they fit; otherwise into a new extent, in the first free range that holds it, else at the end of the file",
+			accent: "mint",
+		},
+		{
+			text: (
+				<>
+					<Code>fsync()</Code> the extent
+				</>
+			),
+			sub: "In every sync mode, before any header names it",
+			accent: "mint",
+		},
+		{
+			text: "Install a header naming the segment and an empty WAL, durably in both header slots",
+			accent: "cyan",
+			note: "spilled",
+		},
+		{ text: "Start the WAL over under a fresh salt", accent: "slate" },
+	];
 	return (
-		<Figure title="Background checkpoints" accent="violet">
-			<p class="mb-2 text-[14px] text-slate-300">
-				When a background checkpoint starts:
-			</p>
-			<ol class="mb-4 space-y-1 text-[14px] text-slate-400">
-				<For
-					each={[
-						"Pending WAL writes are flushed and fsynced.",
-						"New writes switch to the secondary region, and the header's checkpoint flag is set and fsynced.",
-						"The new snapshot is built from the current snapshot and the delta, which already hold every change in the primary region.",
-					]}
-				>
-					{(item, i) => (
-						<li class="flex gap-2.5">
-							<span class="pt-px font-mono text-[12px] text-slate-500">
-								{i() + 1}
-							</span>
-							<span>{item}</span>
-						</li>
-					)}
-				</For>
-			</ol>
-
-			<div class="flex overflow-hidden rounded-md border border-kite-line">
-				<div class="min-w-0 flex-1 border-r border-kite-line bg-kite-violet/[0.07] px-3 py-2.5">
-					<div class="font-mono text-[12px] text-slate-200">Primary, 75%</div>
-					<div class="mt-0.5 text-[12px] text-slate-500">
-						Covered by the new snapshot
-					</div>
+		<Figure title="Spilling a full WAL" accent="mint" meta="milliseconds">
+			<Steps steps={steps} />
+			<div class="mt-5 space-y-2 border-t border-kite-line pt-4 text-[14px]">
+				<div class="flex flex-col items-start gap-1.5 sm:flex-row sm:gap-3">
+					<Tag accent="amber">crash before step 3</Tag>
+					<span class="text-slate-400">
+						The old header still names the records in the WAL, and no bytes of
+						the segment past the length it names. No header names a new extent's
+						pages, and the next open frees them.
+					</span>
 				</div>
-				<div class="w-1/4 min-w-[6.5rem] bg-kite-mint/[0.07] px-3 py-2.5">
-					<div class="font-mono text-[12px] text-slate-200">Secondary, 25%</div>
-					<div class="mt-0.5 text-[12px] text-slate-500">
-						New writes go here
-					</div>
+				<div class="flex flex-col items-start gap-1.5 sm:flex-row sm:gap-3">
+					<Tag accent="mint">crash after step 3</Tag>
+					<span class="text-slate-400">
+						The header names the segment, whose bytes were synced first. A
+						record that fails its CRC inside a named byte range is corruption,
+						not a torn tail.
+					</span>
 				</div>
 			</div>
+			<p class="mt-4 border-t border-kite-line pt-3 text-[13px] text-slate-400">
+				The writer whose commit needs the room does the spill: a copy of the WAL
+				and three syncs. The WAL is not written again until both header slots
+				name the new state, so whichever slot a crash leaves newest, the records
+				it names are intact. A commit too large for an empty WAL, such as a
+				large bulk load, goes straight to a WAL segment.
+			</p>
+		</Figure>
+	);
+}
 
-			<div class="mt-5 border-t border-kite-line pt-4">
-				<p class="mb-2 text-[13px] text-slate-500">
-					After the checkpoint completes:
-				</p>
-				<div class="space-y-1.5">
-					<FlowItem color="emerald">
-						The primary region's records are covered by the new snapshot and are
-						no longer needed for replay
-					</FlowItem>
-					<FlowItem color="emerald">
-						The header that installs the new snapshot no longer points at any
-						record written before the checkpoint started, so that space is free
-						again. If nothing committed during the checkpoint, the WAL is empty.
-						Otherwise those commits stay in the secondary region until the new
-						header is durable, then are rewritten at the start of the primary
-						region, and new writes continue after them.
-					</FlowItem>
-					<FlowItem color="emerald">
-						Transactions that committed during the checkpoint stay visible
-					</FlowItem>
-				</div>
+function BackgroundCheckpointDiagram() {
+	const steps: Step[] = [
+		{
+			text: "Cut: spill the WAL into a WAL segment and seal the newest segment",
+			sub: "The new snapshot will hold every transaction committed in the segments up to this one; call its seq C",
+			accent: "amber",
+			note: "commit lock",
+		},
+		{
+			text: "Replay the commits up to the cut that the installed snapshot lacks into a new delta over it",
+			sub: "As recovery would, without locks. The live delta is not copied.",
+			accent: "violet",
+		},
+		{
+			text: "Build the new snapshot from the installed snapshot and that delta",
+			sub: "Written to pages no header names (the first free range that holds it, else the end of the file), then synced",
+			accent: "violet",
+		},
+		{
+			text: "Replay the transactions committed after the cut over the new snapshot",
+			sub: "Most without the commit lock; the last ones under it, in step 5",
+			accent: "violet",
+		},
+		{
+			text: (
+				<>
+					Install a header naming the new snapshot with <Code>covered = C</Code>
+					, durably in both header slots
+				</>
+			),
+			sub: "It keeps the WAL as it is, and every segment from the oldest one an open write transaction has records in. Then the dropped segments' pages and the old snapshot's pages are freed, and the new snapshot and delta are swapped in.",
+			accent: "mint",
+			note: "commit lock",
+		},
+	];
+	return (
+		<Figure title="Background checkpoints" accent="violet">
+			<Steps steps={steps} />
+			<div class="mt-5 space-y-1.5 border-t border-kite-line pt-4">
+				<FlowItem color="cyan">
+					Reads continue throughout, and readers keep their MVCC snapshots
+					across the swap
+				</FlowItem>
+				<FlowItem color="emerald">
+					Commits wait only while the cut and the install are written
+					(milliseconds). Transactions open at the cut can commit during or
+					after the checkpoint
+				</FlowItem>
+				<FlowItem color="emerald">
+					A failure at any step loses nothing: the cut is only a spill, and
+					every commit stays in the log
+				</FlowItem>
+				<FlowItem color="amber">
+					Closing or dropping the database abandons a run still building its
+					snapshot (no header names its pages, which are freed then or at the
+					next open) and lets a run already installing finish
+				</FlowItem>
 			</div>
 		</Figure>
 	);
@@ -336,7 +411,7 @@ const SYNC_MODES: {
 		name: "Normal",
 		accent: "amber",
 		summary:
-			"The WAL is written to the OS on every commit; fsync happens only at checkpoint",
+			"The WAL is written to the OS on every commit; fsync happens only at spills and checkpoints",
 		tradeoff:
 			"Much faster writes. Survives application crashes; an OS crash can lose recent commits",
 	},
@@ -390,22 +465,27 @@ function DurabilityModes() {
 function RecoveryProcess() {
 	const steps: Step[] = [
 		{
-			text: "Read both header pages and use the newest valid one to find the WAL boundaries",
+			text: "Read both header pages and use the newest valid one to find the snapshot, the WAL and the WAL segments",
 			accent: "cyan",
 		},
 		{
-			text: "If a background checkpoint was interrupted, finish or undo its cut",
-			sub: "If the secondary region's records fit after the primary's, a writable open appends them; otherwise both regions are replayed in place and the next background checkpoint resumes the cut. Read-only opens replay in place without writing.",
+			text: "If an earlier version left records in the secondary WAL region, move them back",
+			sub: "A format version 2 background checkpoint wrote there between its cut and its install. A writable open moves those records after the primary region's, or into a WAL segment if they don't fit. Read-only opens replay both regions in place without writing.",
 			accent: "amber",
 		},
-		{ text: "Scan records from tail to head", accent: "cyan" },
 		{
-			text: "Validate each record's CRC-32",
+			text: "Read each WAL segment, by seq, up to the byte length the header names",
+			sub: "Its bytes were synced before any header named them, so a record that fails its CRC there is corruption, and open fails, rather than a torn tail",
+			accent: "cyan",
+		},
+		{ text: "Scan the WAL's records up to its head", accent: "cyan" },
+		{
+			text: "Validate each WAL record's CRC-32",
 			sub: "An invalid record ends the scan: an incomplete write (a page that never landed holds zeros written before it, or an earlier cycle's bytes), or a record of an earlier WAL cycle (its salt differs)",
 			accent: "violet",
 		},
 		{
-			text: "Move each WAL head back to the last valid record",
+			text: "Move the WAL head back to the last valid record",
 			sub: "Writable opens save this before writing anything, so new commits never land after a torn record",
 			accent: "violet",
 		},
@@ -415,7 +495,13 @@ function RecoveryProcess() {
 			accent: "violet",
 		},
 		{
-			text: "Replay committed transactions into the delta, in the order of their Commit records",
+			text: (
+				<>
+					Replay, in commit order, the transactions whose Commit record lies
+					after the last record of segment <Code>covered</Code>
+				</>
+			),
+			sub: "Earlier commits are in the snapshot",
 			accent: "mint",
 		},
 	];
@@ -424,9 +510,14 @@ function RecoveryProcess() {
 			<Steps steps={steps} />
 			<p class="mt-5 border-t border-kite-line pt-3 text-[13px] text-slate-400">
 				Replay only rebuilds the in-memory delta, so read-only opens recover
-				too. Recovery time is{" "}
-				<span class="font-mono text-slate-200">O(WAL size)</span>, typically
-				under one second.
+				too, reading the segments and the WAL in place. A writable open also
+				frees every page no header names, such as an extent a crash left before
+				a header named it. Recovery time is{" "}
+				<span class="font-mono text-slate-200">O(log size)</span>: the WAL
+				segments plus the WAL. Automatic checkpoints keep the uncovered log near
+				the checkpoint trigger (at most <Code>checkpointLogBudget</Code>, 128
+				MiB by default) unless writers outrun them, up to{" "}
+				<Code>walSegmentLimit</Code>.
 			</p>
 		</Figure>
 	);
@@ -442,8 +533,12 @@ function CheckpointTriggers() {
 						1
 					</span>
 					<span class="text-slate-300">
-						After a commit, when the active WAL region reaches{" "}
-						<Code>checkpointThreshold</Code> (default 0.5)
+						After a commit, when the log the snapshot does not cover (the WAL
+						segments after <Code>covered</Code>, plus the WAL) reaches the
+						trigger: <Code>checkpointLogRatio</Code> (default 0.5) times the
+						snapshot's size, at least four WALs, at most{" "}
+						<Code>checkpointLogBudget</Code> (default 128 MiB). Segments kept
+						for a still-open transaction don't count
 					</span>
 				</li>
 				<li class="flex items-start gap-3">
@@ -451,45 +546,65 @@ function CheckpointTriggers() {
 						2
 					</span>
 					<span class="text-slate-300">
-						On close, when WAL usage is at least{" "}
-						<Code>closeCheckpointIfWalUsageAtLeast</Code> (default 0.2)
+						When the WAL segments reach <Code>walSegmentLimit</Code> and a
+						writer needs to spill
+					</span>
+				</li>
+				<li class="flex items-start gap-3">
+					<span class="grid h-5 w-5 shrink-0 place-items-center rounded border border-kite-violet/30 font-mono text-[11px] text-kite-violet">
+						3
+					</span>
+					<span class="text-slate-300">
+						On <Code>Kite</Code> close, when the uncovered log is at least{" "}
+						<Code>closeCheckpointIfWalUsageAtLeast</Code> (default 0.2) of the
+						trigger. This one is blocking
 					</span>
 				</li>
 			</ol>
 
 			<p class="mt-4 text-[14px] text-slate-300">
 				<span class="text-[13px] text-slate-500">Manual:</span>{" "}
-				<Code>db.checkpoint()</Code>
+				<Code>db.checkpoint()</Code> (blocking) or{" "}
+				<Code>db.backgroundCheckpoint()</Code>.{" "}
+				<Code>db.shouldCheckpoint(threshold)</Code> reports whether the
+				uncovered log has reached that fraction of the trigger (1.0: an
+				automatic checkpoint is due).
 			</p>
 
 			<div class="mt-5 border-t border-kite-line pt-4">
 				<p class="mb-2 text-[13px] text-slate-500">
-					During a background checkpoint (the default):
+					Automatic checkpoints (background, the default):
 				</p>
 				<div class="space-y-1.5">
+					<FlowItem color="violet">
+						Run on the database's checkpoint thread,{" "}
+						<Code>kitedb-checkpoint</Code>, started at the first automatic
+						checkpoint, so the commit that crosses the trigger returns at once.
+						Read-only opens have no such thread; with{" "}
+						<Code>checkpointThread: false</Code>, without background
+						checkpoints, or on wasm32, checkpoints run on the committing thread
+					</FlowItem>
 					<FlowItem color="cyan">
-						Reads continue, from the old snapshot plus the delta
+						Reads and writes continue while one runs (see Background checkpoints
+						above)
 					</FlowItem>
-					<FlowItem color="emerald">
-						Writes continue, into the secondary WAL region
-					</FlowItem>
-					<FlowItem color="amber">
-						It starts even while other threads have write transactions open:
-						their WAL records so far are copied into the secondary region, and
-						they can commit during or after the checkpoint. New transactions
-						pause only for the brief start and the header install. If the open
-						transactions' records don't fit in the secondary region, the
-						checkpoint is skipped until one of them finishes. If the secondary
-						region fills before the checkpoint installs, writers wait for the
-						install instead of failing.
+					<FlowItem color="red">
+						A failure is logged, recorded and returned by{" "}
+						<Code>checkpointError()</Code> until a checkpoint installs. The
+						thread retries at the next trigger, after a wait that starts at 1 s
+						and doubles up to 60 s
 					</FlowItem>
 				</div>
 				<p class="mt-3 text-[13px] text-slate-500">
-					A blocking checkpoint, such as <Code>db.checkpoint()</Code>, makes new
-					transactions wait for its whole run and lets open ones finish first.
+					A blocking checkpoint, such as <Code>db.checkpoint()</Code>, builds
+					from the live delta, makes new transactions wait for its whole run and
+					lets open ones finish first. It installs a header with an empty WAL
+					and no WAL segments (format version 2 again); <Code>optimize</Code>,{" "}
+					<Code>vacuum</Code> and <Code>resizeWal</Code> also leave no segments.
 					If installing its header fails, it returns an error and the database
-					keeps the previous snapshot and WAL, so later commits append after the
-					existing records.
+					keeps the previous snapshot and log, so later commits append after the
+					existing records. Closing keeps live segments, and the next open
+					replays them.
 				</p>
 			</div>
 		</Figure>
@@ -522,17 +637,52 @@ export function WALPage() {
 			<h2 id="circular-buffer">Linear buffer</h2>
 
 			<p>
-				The WAL area has a fixed size. Records are appended to the active region
-				until a checkpoint folds them into the snapshot and frees the space:
+				The WAL area has a fixed size. Records are appended to it until it is
+				full; then they move into a WAL segment, an extent of pages elsewhere in
+				the file, and the WAL starts over:
 			</p>
 
 			<LinearBufferDiagram />
 
-			<h2 id="dual-region">Dual-region design</h2>
+			<h2 id="segments">Spilling into WAL segments</h2>
 
-			<p>The WAL is split into primary (75%) and secondary (25%) regions:</p>
+			<p>
+				When the WAL fills, the database does not force a checkpoint. It spills
+				the WAL into a WAL segment:
+			</p>
 
-			<WALDualRegionDetailed />
+			<SpillDiagram />
+
+			<p>
+				The header names up to 64 segments. Each entry holds the segment's seq,
+				start page, page count, byte length, and whether it is sealed (no spill
+				appends to it any more). The table also holds <code>covered</code>, the
+				newest segment seq the snapshot covers, and the seq the next segment
+				gets. A header that names WAL segments is written as format version 3,
+				with minimum reader version 3, so older versions refuse the file with a
+				version mismatch instead of missing the commits in its segments. Once a
+				checkpoint covers every segment, the header is written as version 2
+				again.
+			</p>
+
+			<VersionNote>
+				the WAL never spilled. Automatic checkpoints ran on the committing
+				thread whenever the active WAL region reached{" "}
+				<code>checkpointThreshold</code>, and a commit too large for the WAL
+				failed with <code>WAL buffer full</code>.
+			</VersionNote>
+
+			<h2 id="background-checkpoints">Background checkpoints</h2>
+
+			<p>
+				A background checkpoint folds the log into a new snapshot while reads
+				and writes continue. Automatic checkpoints run this way on the
+				database's checkpoint thread. <code>backgroundCheckpoint()</code> runs
+				one on the calling thread, after any running one ends, and returns after
+				its install.
+			</p>
+
+			<BackgroundCheckpointDiagram />
 
 			<VersionNote>
 				transactions that committed while a background checkpoint was running
@@ -567,8 +717,10 @@ export function WALPage() {
 					MVCC)
 				</li>
 				<li>
-					Optional: increase <code>walSizeMb</code> (e.g., 64 MB) for heavy
-					ingest to reduce checkpoints
+					The default 4 MB WAL is enough for heavy ingest: a full WAL spills
+					into a WAL segment, and checkpoints run on the checkpoint thread
+					without holding up commits. A larger <code>walSize</code> only means
+					fewer spills (each is a copy of the WAL and three syncs)
 				</li>
 			</ul>
 
@@ -580,7 +732,10 @@ export function WALPage() {
 
 			<h2 id="recovery">Crash recovery</h2>
 
-			<p>On database open, the WAL is replayed to rebuild the delta:</p>
+			<p>
+				On database open, the log (the WAL segments, then the WAL) is replayed
+				to rebuild the delta:
+			</p>
 
 			<RecoveryProcess />
 
@@ -595,22 +750,69 @@ export function WALPage() {
 
 			<CheckpointTriggers />
 
+			<p>
+				The in-memory delta takes about ten times the log's bytes, so the log
+				budget bounds memory: the default 128 MiB of log is about 1.3 GB of
+				delta at most at the trigger. A checkpoint briefly needs about twice
+				that, for the delta it replays from the cut plus the live delta. To
+				bound reopen replay time or memory, lower{" "}
+				<code>checkpointLogBudget</code>. To checkpoint less often on a large
+				database, raise <code>checkpointLogRatio</code>, at the cost of more
+				memory; the budget caps the trigger either way.{" "}
+				<code>checkpointThreshold</code> is deprecated and has no effect.
+			</p>
+
+			<p>
+				<code>walSegmentLimit</code> (default: twice the trigger, at least 16
+				WALs, at most four times <code>checkpointLogBudget</code>) bounds the
+				bytes of WAL segments, and with them disk use and the delta's memory.
+				Writers wait only when the segments reach it: a writer that needs to
+				spill then asks for a checkpoint and waits for its install to free
+				segments.
+			</p>
+
 			<h2 id="overflow">Avoiding WAL overflow</h2>
 
 			<p>
-				The WAL has a fixed size once the file is created. For large ingests,
-				use <code>resizeWal</code> (offline) to grow it, or rebuild into a new
-				file. To prevent single transactions from overfilling the active WAL
-				region, split work into smaller commits (see <code>bulkWrite</code> or
-				chunked <code>beginBulk()</code> sessions) and consider disabling
-				background checkpoints during ingest.
+				A full WAL does not fail a write: it spills into a WAL segment, and a
+				commit too large for an empty WAL goes straight to one. A write fails
+				with <code>WAL buffer full</code> (<code>WalBufferFull</code>) only when
+				the WAL segments reach <code>walSegmentLimit</code> and waiting for a
+				checkpoint cannot help:
+			</p>
+			<ul>
+				<li>
+					Automatic checkpoints are off: spills continue up to the limit, then
+					writes fail. Run <code>checkpoint()</code> before the limit, or raise{" "}
+					<code>walSegmentLimit</code>.
+				</li>
+				<li>
+					Open write transactions hold records in enough segments to fill the
+					limit. No checkpoint can free those until the transactions finish:
+					keep write transactions shorter, or raise <code>walSegmentLimit</code>
+					.
+				</li>
+				<li>
+					A blocking checkpoint, <code>optimize</code>, <code>vacuum</code> or{" "}
+					<code>resizeWal</code> is waiting for the writer's own transaction to
+					finish.
+				</li>
+			</ul>
+			<p>
+				While the last automatic checkpoint failed, a writer at the limit fails
+				instead of waiting, with{" "}
+				<code>Checkpoint failed, and the WAL segments are full: ...</code> (
+				<code>CheckpointFailed</code>; Python raises{" "}
+				<code>CheckpointError</code>, a <code>KiteError</code> subclass).{" "}
+				<code>checkpointError()</code> (<code>checkpoint_error()</code> in
+				Python) returns the checkpoint's error.
 			</p>
 
 			<h2 id="next">Next steps</h2>
 			<ul>
 				<li>
 					<a href="/docs/internals/single-file">Single-file format</a>: how the
-					WAL fits in the file layout
+					WAL and its segments fit in the file layout
 				</li>
 				<li>
 					<a href="/docs/internals/snapshot-delta">Snapshot and delta</a>: what

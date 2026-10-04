@@ -198,7 +198,6 @@ fn kite_options(config: &Config) -> KiteOptions {
   options = options.edge(EdgeDef::new("LINK"));
   options.sync_mode = SyncMode::Off;
   options.wal_size = Some(WAL_BYTES);
-  options.checkpoint_threshold = Some(1.0);
   options.close_checkpoint_if_wal_usage_at_least = None;
   options
 }

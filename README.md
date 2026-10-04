@@ -103,10 +103,20 @@ db.close();
 ```
 
 The `.kitedb` format contains:
-- **Header (pages 0 and 1)**: two checksummed copies of the magic, format version (2), page size,
-  snapshot/WAL locations and WAL salts; open uses the newest valid copy
-- **WAL Area**: Linear buffer for write-ahead log records (checkpoint to reclaim space)
+- **Header (pages 0 and 1)**: two checksummed copies of the magic, format version, page size,
+  snapshot/WAL locations, WAL salts and the WAL segment table; open uses the newest valid copy.
+  A header naming WAL segments is format version 3 (older versions refuse it); otherwise it is
+  version 2, as older versions write it
+- **WAL Area**: Linear buffer for write-ahead log records. When it fills, its records spill into a
+  WAL segment and it starts over
+- **WAL Segments**: extents of pages holding spilled log records, up to a limit
+  (`walSegmentLimit`); a checkpoint covers and frees them
 - **Snapshot Area**: CSR snapshot data (mmap-friendly)
+
+Automatic checkpoints run on a thread of the database's own once the log (WAL segments and
+WAL) reaches the checkpoint trigger: half the snapshot's size (`checkpointLogRatio`), at least four
+WALs, at most 128 MiB (`checkpointLogBudget`). The in-memory delta takes about ten times the log's
+size, so the budget bounds its memory.
 
 ### Snapshot Section
 
@@ -121,7 +131,8 @@ The `.kitedb` format contains:
 
 - 8-byte aligned records
 - CRC-32 (IEEE) per record, XORed with the WAL region's salt, so a leftover record from an earlier
-  WAL cycle fails its check like a torn one
+  WAL cycle fails its check like a torn one; WAL segments hold records unsalted, up to the length
+  the header names
 - Transaction boundaries (BEGIN/COMMIT/ROLLBACK)
 
 ## Development
