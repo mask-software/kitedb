@@ -628,6 +628,7 @@ impl SingleFileDB {
     if !self.can_spill(&header) {
       return Ok(SpillOutcome::Full);
     }
+    checkpoint_phase(&self.path, CheckpointPhase::SpillDecided)?;
     if !wal.is_empty() {
       self.spill_wal(&mut pager, &mut wal, &mut header, &[], false)?;
       return Ok(SpillOutcome::Spilled);

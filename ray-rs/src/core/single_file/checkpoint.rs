@@ -81,6 +81,9 @@ pub(super) enum CheckpointPhase {
   /// A checkpoint is about to drop the free pages at the end of the file,
   /// after its install.
   TailTruncate,
+  /// A writer decided to spill the WAL (the segments have room); the spill
+  /// comes next.
+  SpillDecided,
 }
 
 /// A barrier armed for one phase of checkpoints on the database at a path.

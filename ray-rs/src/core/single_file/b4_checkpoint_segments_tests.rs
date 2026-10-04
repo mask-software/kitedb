@@ -1080,3 +1080,122 @@ fn a_writer_refused_for_a_failed_checkpoint_asks_for_another() {
   let reopened = open_single_file(&path, options()).expect("reopen");
   assert!(missing(&reopened, &acked).is_empty());
 }
+
+/// Review finding R8. A writer's spill drops the segments its decision to
+/// spill counted out as unneeded (`can_spill`), even when a background
+/// checkpoint claims the checkpoint status between the decision and the
+/// spill (it cannot cut before the spill ends: both take the commit lock).
+/// Otherwise the spill keeps them, the table grows past what the decision
+/// counted, and once it is full a spill the decision allowed fails with
+/// `WalBufferFull`.
+#[test]
+fn a_spill_drops_what_its_decision_counted_out_though_a_checkpoint_claims_meanwhile() {
+  let dir = tempdir().expect("tempdir");
+  let path = dir.path().join("spill-decision.kitedb");
+  let opts = options()
+    .sync_mode(SyncMode::Normal)
+    .auto_checkpoint(false)
+    .wal_segment_size(1)
+    .mvcc(true);
+  let db = Arc::new(open_single_file(&path, opts.clone()).expect("open"));
+
+  // 63 segments the snapshot covers, kept for a transaction that then rolls
+  // back: none is needed any more.
+  let (held_tx, held_rx) = mpsc::channel();
+  let (go_tx, go_rx) = mpsc::channel::<()>();
+  let holder = {
+    let db = Arc::clone(&db);
+    std::thread::spawn(move || {
+      db.begin(false).expect("begin");
+      for n in 0..20 {
+        db.create_node(Some(&format!("held-{n}-{}", "h".repeat(1000))))
+          .expect("node");
+      }
+      held_tx.send(()).expect("signal");
+      go_rx.recv().expect("wait");
+      db.rollback()
+    })
+  };
+  held_rx.recv().expect("the holder wrote");
+  let mut acked = Vec::new();
+  let mut index = 0;
+  while wal_segment_test_stats(&db).live < MAX_WAL_SEGMENTS - 1 && index < 200 {
+    acked.extend(commit_keys(&db, "k", index, 1));
+    db.background_checkpoint().expect("checkpoint");
+    index += 1;
+  }
+  go_tx.send(()).expect("release the holder");
+  holder
+    .join()
+    .expect("the holder thread")
+    .expect("the holder's rollback");
+  let unneeded = db
+    .unneeded_wal_segments(&db.header.read().clone(), false)
+    .len();
+  assert_eq!(
+    unneeded,
+    MAX_WAL_SEGMENTS - 1,
+    "setup: the kept segments are not all unneeded"
+  );
+
+  watch_checkpoint_phases(&db);
+  for round in 0..4 {
+    // Fill the WAL almost to the end with commits.
+    while db.wal_buffer.lock().free() > 8 * 1024 {
+      acked.extend(commit_keys(&db, "fill", index, 1));
+      index += 1;
+    }
+    // A transaction whose records then do not fit decides to spill, and
+    // waits there.
+    let decided = Arc::new(Barrier::new(2));
+    set_checkpoint_test_barrier(&db, CheckpointPhase::SpillDecided, Arc::clone(&decided));
+    let writer = {
+      let db = Arc::clone(&db);
+      std::thread::spawn(move || -> Result<Vec<String>> {
+        let keys: Vec<String> = (0..20)
+          .map(|n| format!("w{round}-{n}-{}", "w".repeat(1000)))
+          .collect();
+        db.begin(false)?;
+        for key in &keys {
+          if let Err(error) = db.create_node(Some(key)) {
+            let _ = db.rollback();
+            return Err(error);
+          }
+        }
+        db.commit()?;
+        Ok(keys)
+      })
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let parked = wait_for("the writer's spill decision", deadline, || {
+      checkpoint_test_reached(&db)
+        .iter()
+        .any(|(phase, _, parked)| *phase == CheckpointPhase::SpillDecided && *parked)
+    });
+    assert!(
+      parked,
+      "round {round}: setup: the writer never decided to spill"
+    );
+    // A background checkpoint claims the status meanwhile (it would cut
+    // once the spill releases the commit lock).
+    let run = match db.claim_background_checkpoint() {
+      Ok(run) => run,
+      Err(_) => panic!("round {round}: setup: no checkpoint could claim the status"),
+    };
+    decided.wait();
+    let written = writer.join().expect("the writer thread");
+    drop(run);
+    watch_checkpoint_phases(&db);
+    match written {
+      Ok(keys) => acked.extend(keys),
+      Err(error) => panic!(
+        "round {round}: a spill the decision allowed failed: {error} ({:?})",
+        wal_segment_test_stats(&db)
+      ),
+    }
+  }
+  let db = Arc::into_inner(db).expect("sole owner");
+  close_single_file(db).expect("close");
+  let reopened = open_single_file(&path, opts).expect("reopen");
+  assert!(missing(&reopened, &acked).is_empty());
+}
