@@ -3,7 +3,9 @@
 //! that commit. Included from checkpoint.rs for its private steps and test
 //! hooks.
 use super::*;
-use crate::core::single_file::{close_single_file, open_single_file, SingleFileOpenOptions, SyncMode};
+use crate::core::single_file::{
+  close_single_file, open_single_file, SingleFileOpenOptions, SyncMode,
+};
 use std::sync::mpsc;
 use std::sync::Arc;
 use tempfile::tempdir;

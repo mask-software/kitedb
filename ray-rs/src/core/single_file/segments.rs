@@ -18,6 +18,8 @@
 //! durable slots must name the new state before the WAL's records are
 //! overwritten). Until then a crash finds the records in the WAL.
 
+use std::collections::HashMap;
+
 use crate::constants::*;
 use crate::core::pager::FilePager;
 use crate::core::wal::buffer::WalBuffer;
@@ -91,31 +93,100 @@ pub(crate) fn read_wal_segment(
   })
 }
 
-/// The records of the WAL segments `header` names, in log order, and how
-/// many of them lie in segments the snapshot covers (`WalSegmentTable::
-/// covered`): recovery replays only the transactions whose COMMIT record
-/// comes after those. A segment holds whole unsalted records up to its
-/// `byte_len`, synced before any header named it, so a record that does not
-/// parse there is corruption, not a torn write: an error, not the log's end.
-pub(crate) fn read_wal_segment_records(
-  pager: &FilePager,
-  header: &DbHeaderV1,
-) -> Result<(Vec<ParsedWalRecord>, usize)> {
+/// The records of the WAL segments a header names, in log order (see
+/// `read_wal_segment_log`).
+pub(crate) struct SegmentLog {
+  pub(crate) records: Vec<ParsedWalRecord>,
+  /// How many of `records` lie in segments the snapshot covers
+  /// (`WalSegmentTable::covered`): recovery replays only the transactions
+  /// whose COMMIT record comes after those.
+  pub(crate) covered_records: usize,
+  /// Each segment's seq, with the number of `records` up to its end.
+  pub(crate) segment_ends: Vec<(u64, usize)>,
+}
+
+/// The records of the WAL segments `header` names, in log order. A segment
+/// holds whole unsalted records up to its `byte_len`, synced before any
+/// header named it, so a record that does not parse there is corruption,
+/// not a torn write: an error, not the log's end.
+pub(crate) fn read_wal_segment_log(pager: &FilePager, header: &DbHeaderV1) -> Result<SegmentLog> {
   let page_size = header.page_size as u64;
-  let mut records = Vec::new();
-  let mut covered_records = 0;
+  let mut log = SegmentLog {
+    records: Vec::new(),
+    covered_records: 0,
+    segment_ends: Vec::with_capacity(header.wal_segments.entries.len()),
+  };
   for segment in header.wal_segments.entries.iter() {
-    records.extend(read_wal_segment(
+    log.records.extend(read_wal_segment(
       segment,
       page_size,
       0,
       |offset, length| pager.read_range(offset, length),
     )?);
     if segment.seq <= header.wal_segments.covered {
-      covered_records = records.len();
+      log.covered_records = log.records.len();
+    }
+    log.segment_ends.push((segment.seq, log.records.len()));
+  }
+  Ok(log)
+}
+
+/// `read_wal_segment_log`'s records and covered count.
+pub(crate) fn read_wal_segment_records(
+  pager: &FilePager,
+  header: &DbHeaderV1,
+) -> Result<(Vec<ParsedWalRecord>, usize)> {
+  let log = read_wal_segment_log(pager, header)?;
+  Ok((log.records, log.covered_records))
+}
+
+/// The spilled transactions of a log (`records`: the segments' records, then
+/// the WAL's; `segment_ends` and `covered_records` as `read_wal_segment_log`
+/// gives them): each transaction that commits after the covered records with
+/// a record in a WAL segment, from its last BEGIN on (what replay keeps),
+/// with the oldest such segment and where its COMMIT lies. An open rebuilds
+/// `SingleFileInner::spilled_txids` from them, since the segments they hold
+/// stay needed until a checkpoint covers them, across reopens.
+pub(crate) fn spilled_transactions_in_log(
+  records: &[ParsedWalRecord],
+  segment_ends: &[(u64, usize)],
+  covered_records: usize,
+) -> HashMap<TxId, SpilledTransaction> {
+  let segment_of = |index: usize| {
+    let at = segment_ends.partition_point(|&(_, end)| end <= index);
+    segment_ends.get(at).map(|&(seq, _)| seq)
+  };
+  let mut begun: HashMap<TxId, usize> = HashMap::new();
+  let mut spilled = HashMap::new();
+  for (index, record) in records.iter().enumerate() {
+    match record.record_type {
+      WalRecordType::Begin => {
+        begun.insert(record.txid, index);
+      }
+      WalRecordType::Rollback => {
+        begun.remove(&record.txid);
+      }
+      WalRecordType::Commit => {
+        let Some(begin) = begun.remove(&record.txid) else {
+          continue;
+        };
+        if index < covered_records {
+          continue;
+        }
+        if let Some(first_segment) = segment_of(begin) {
+          spilled.insert(
+            record.txid,
+            SpilledTransaction {
+              first_segment,
+              commit_segment: Some(segment_of(index).unwrap_or(COMMITTED_IN_WAL)),
+            },
+          );
+        }
+      }
+      _ => {}
     }
   }
-  Ok((records, covered_records))
+  spilled
 }
 
 /// Where a spilled transaction's COMMIT record lies while it is in the WAL

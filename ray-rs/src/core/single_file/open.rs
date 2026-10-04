@@ -36,7 +36,7 @@ use crate::util::mmap::Mmap;
 use super::recovery::{
   committed_transactions_after, drop_vectors_of_missing_nodes, replay_wal_record, scan_wal_records,
 };
-use super::segments::{finish_cut_into_segment, read_wal_segment_records};
+use super::segments::{finish_cut_into_segment, read_wal_segment_log, spilled_transactions_in_log};
 use super::vector::{apply_replayed_vectors, vector_store_state_from_snapshot};
 use super::{BackgroundCheckpointState, SchemaReservations, SingleFileDB, SingleFileInner};
 
@@ -1054,13 +1054,19 @@ fn open_single_file_internal(
     log_open_profile(path, profile);
   }
 
+  // The transactions that commit after the covered segments with records in
+  // a segment: the segments they hold stay needed (see `spilled_txids`).
+  let mut spilled_txids = HashMap::new();
+
   // Replay WAL for recovery (if not a new database)
   let mut _wal_records_storage: Option<Vec<crate::core::wal::record::ParsedWalRecord>>;
   if !is_new && (header.wal_head > 0 || !header.wal_segments.is_empty()) {
     #[cfg(feature = "bench-profile")]
     let wal_scan_started = Instant::now();
     // The log: the WAL segments' records, then the WAL's.
-    let (mut log, covered_records) = read_wal_segment_records(&pager, &header)?;
+    let segments = read_wal_segment_log(&pager, &header)?;
+    let covered_records = segments.covered_records;
+    let mut log = segments.records;
     if header.wal_head > 0 {
       log.extend(if replay_cut_in_place {
         wal_buffer.records_for_recovery(&mut pager)?
@@ -1076,6 +1082,8 @@ fn open_single_file_internal(
         .saturating_add(elapsed_ns(wal_scan_started));
     }
     if let Some(ref wal_records) = _wal_records_storage {
+      spilled_txids =
+        spilled_transactions_in_log(wal_records, &segments.segment_ends, covered_records);
       // Transactions committed in segments the snapshot covers are in it.
       committed_in_order = committed_transactions_after(wal_records, covered_records);
 
@@ -1275,7 +1283,7 @@ fn open_single_file_internal(
     checkpoint_log_budget: options.checkpoint_log_budget,
     wal_segment_limit_bytes: AtomicU64::new(options.wal_segment_limit.unwrap_or(0)),
     wal_spills: AtomicU64::new(0),
-    spilled_txids: Mutex::new(HashMap::new()),
+    spilled_txids: Mutex::new(spilled_txids),
     wal_segment_frees: AtomicU64::new(0),
     sync_mode: options.sync_mode,
     primary_replication,
