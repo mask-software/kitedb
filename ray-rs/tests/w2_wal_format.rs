@@ -25,7 +25,10 @@ use std::fs;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
-use kitedb::constants::{DB_FLAG_ENCRYPTED, MIN_READER_SINGLE_FILE, VERSION_SINGLE_FILE};
+use kitedb::constants::{
+  DB_FLAG_ENCRYPTED, MIN_READER_SALTED_WAL, MIN_READER_SINGLE_FILE, VERSION_SALTED_WAL,
+  VERSION_SINGLE_FILE,
+};
 use kitedb::core::single_file::{open_single_file, SingleFileDB, SingleFileOpenOptions};
 use kitedb::core::wal::record::{
   build_begin_payload, build_commit_payload, build_create_node_payload, parse_wal_record, WalRecord,
@@ -625,7 +628,7 @@ fn format_1_file_replays_its_wal_and_upgrades_at_the_next_reset() {
   let header = newest_header(&fs::read(&path).expect("read"));
   assert_eq!(
     (header.version, header.min_reader_version),
-    (VERSION_SINGLE_FILE, MIN_READER_SINGLE_FILE),
+    (VERSION_SALTED_WAL, MIN_READER_SALTED_WAL),
     "the WAL reset upgrades the header"
   );
   assert_ne!(header.wal_primary_salt, 0);
@@ -658,7 +661,7 @@ fn format_1_records_do_not_replay_after_the_upgrade() {
 
   let mut image = fs::read(&path).expect("read");
   let mut header = newest_header(&image);
-  assert_eq!(header.version, VERSION_SINGLE_FILE);
+  assert_eq!(header.version, VERSION_SALTED_WAL);
   assert_eq!(header.wal_head, 0);
   let wal = &image[wal_area(&header)];
   let mut tx_a_end = 0;

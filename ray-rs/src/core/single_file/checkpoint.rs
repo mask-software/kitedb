@@ -26,7 +26,8 @@ use crate::vector::store::{create_vector_store, vector_store_delete, vector_stor
 use crate::vector::types::{VectorManifest, VectorStoreConfig};
 
 use super::open::map_snapshot_range;
-use super::recovery::{committed_transactions, replay_wal_record};
+use super::recovery::{committed_transactions, committed_transactions_after, replay_wal_record};
+use super::segments::{live_end_page, read_wal_segment_records};
 use super::{CheckpointStatus, SingleFileDB};
 use crate::vector::ivf::serialize::validate_manifest_for_serialization;
 
@@ -43,7 +44,7 @@ pub(crate) type GraphData = (
 const SNAPSHOT_WRITE_CHUNK: usize = 1 << 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CheckpointPhase {
+pub(super) enum CheckpointPhase {
   GateAcquired,
   /// A background checkpoint's cut is durable and the gate is open again; its
   /// snapshot is not built yet.
@@ -64,13 +65,10 @@ enum CheckpointPhase {
   /// delta that replaces the cut's.
   PostCutReplay,
   /// A spill's records are written to their WAL segment and synced; no
-  /// header names them there yet. (Reached once WAL segments land: see
-  /// `b4_checkpoint_segments_tests`.)
-  #[allow(dead_code)]
+  /// header names them there yet.
   SpillSegmentWritten,
   /// A spill's header is durable in one slot; the other still names the
   /// records in the WAL.
-  #[allow(dead_code)]
   SpillHeaderDurable,
   /// A checkpoint's install is durable in both header slots; the segments it
   /// covers are not freed yet.
@@ -125,7 +123,7 @@ static CHECKPOINT_TEST_REACHED: OnceLock<
   Mutex<HashMap<std::path::PathBuf, Vec<CheckpointTestReached>>>,
 > = OnceLock::new();
 
-fn checkpoint_phase(db_path: &std::path::Path, phase: CheckpointPhase) -> Result<()> {
+pub(super) fn checkpoint_phase(db_path: &std::path::Path, phase: CheckpointPhase) -> Result<()> {
   #[cfg(test)]
   {
     let db_faulted = {
@@ -355,18 +353,24 @@ struct WalSegmentTestStats {
   next_seq: u64,
 }
 
-/// `db`'s WAL segments. Until they land the header names none.
+/// `db`'s WAL segments, as its in-memory header names them.
 #[cfg(test)]
 fn wal_segment_test_stats(db: &SingleFileDB) -> WalSegmentTestStats {
-  let _ = db;
-  WalSegmentTestStats::default()
+  let header = db.header.read();
+  let table = &header.wal_segments;
+  WalSegmentTestStats {
+    live: table.entries.len(),
+    bytes: table.bytes(),
+    covered: table.covered,
+    next_seq: table.next_seq,
+  }
 }
 
-/// Lower `db`'s WAL segment limit (bytes of segments before writers wait
-/// for a checkpoint). Takes effect once WAL segments land.
+/// Set `db`'s WAL segment limit (bytes of segments before writers wait for
+/// a checkpoint).
 #[cfg(test)]
 fn set_wal_segment_test_limit(db: &SingleFileDB, bytes: u64) {
-  let _ = (db, bytes);
+  db.wal_segment_limit_bytes.store(bytes, Ordering::Relaxed);
 }
 
 /// Whether `db` runs a checkpoint thread now. None runs until the thread
@@ -578,7 +582,7 @@ fn unfinished_transactions(records: Vec<ParsedWalRecord>) -> Vec<ParsedWalRecord
 
 /// Return `header` to `prior` after a failed header write, keeping the newer
 /// change counter so the next write still outranks every slot on disk.
-fn restore_header(header: &mut DbHeaderV1, prior: DbHeaderV1) {
+pub(super) fn restore_header(header: &mut DbHeaderV1, prior: DbHeaderV1) {
   let change_counter = header.change_counter;
   *header = prior;
   header.change_counter = change_counter;
@@ -1205,7 +1209,7 @@ impl SingleFileDB {
       // earlier run stopped before its install and could not merge its cut
       // back into the primary region, or the database was reopened that way.
       if header.checkpoint_in_progress != 0 {
-        return self.resume_abandoned_cut(run, &mut pager, &mut wal_buffer);
+        return self.resume_abandoned_cut(run, &mut pager, &mut wal_buffer, &header);
       }
 
       // An earlier completion installed its snapshot but failed to compact
@@ -1226,6 +1230,22 @@ impl SingleFileDB {
       // Collecting the copies first declines a cut they would not fit, before
       // anything changes.
       let open = self.open_write_txids.lock().clone();
+      // A transaction open since the WAL spilled has records in a WAL
+      // segment, which the cut cannot copy with the others; the install
+      // would drop them.
+      if self
+        .spilled_open_txids
+        .lock()
+        .iter()
+        .any(|txid| open.contains(txid))
+      {
+        self.checkpoint_state.lock().declined_carry = Some(open);
+        return Err(KiteError::CheckpointDeclined(
+          "a write transaction open since the WAL spilled has records in a WAL segment; it \
+           starts once it finishes"
+            .to_string(),
+        ));
+      }
       let carried = match wal_buffer.open_transaction_records(&open, &mut pager) {
         Ok(carried) => carried,
         Err(error @ (KiteError::WalBufferFull | KiteError::InvalidWal(_))) => {
@@ -1302,6 +1322,7 @@ impl SingleFileDB {
     run: u64,
     pager: &mut FilePager,
     wal_buffer: &mut WalBuffer,
+    header: &DbHeaderV1,
   ) -> Result<Cut> {
     wal_buffer.flush(pager)?;
     pager.sync()?;
@@ -1317,8 +1338,10 @@ impl SingleFileDB {
           .to_string(),
       ));
     }
-    let pre_cut_records = wal_buffer.scan_region(0, pager)?;
-    let cut_delta = self.replay_into_new_delta(&pre_cut_records)?;
+    // The log before the cut: the WAL segments, then the primary region.
+    let (mut pre_cut_records, covered) = read_wal_segment_records(pager, header)?;
+    pre_cut_records.extend(wal_buffer.scan_region(0, pager)?);
+    let cut_delta = self.replay_into_new_delta(&pre_cut_records, covered)?;
     self.own_cut(run);
     Ok(Cut::Taken(Box::new(cut_delta)))
   }
@@ -1600,6 +1623,7 @@ impl SingleFileDB {
   fn replay_into_new_delta(
     &self,
     records: &[crate::core::wal::record::ParsedWalRecord],
+    covered: usize,
   ) -> Result<DeltaState> {
     let mut delta = DeltaState::new();
     let mut next_node_id = self.next_node_id.load(Ordering::Acquire);
@@ -1613,7 +1637,7 @@ impl SingleFileDB {
     let mut propkey_names = HashMap::new();
     let mut propkey_ids = HashMap::new();
     let snapshot = self.snapshot.read();
-    for (_txid, records) in committed_transactions(records) {
+    for (_txid, records) in committed_transactions_after(records, covered) {
       for record in records {
         replay_wal_record(
           record,
@@ -1795,17 +1819,7 @@ impl SingleFileDB {
     let pager = self.pager.lock();
     let page_size = header.page_size as u64;
     let file_pages = pager.file_size().div_ceil(page_size);
-    let wal_end_page = header.wal_start_page + header.wal_page_count;
-    let snapshot_end_page = header
-      .snapshot_start_page
-      .saturating_add(header.snapshot_page_count);
-
-    Ok(
-      file_pages
-        .max(header.db_size_pages)
-        .max(wal_end_page)
-        .max(snapshot_end_page),
-    )
+    Ok(file_pages.max(live_end_page(header)))
   }
 
   /// Reuse only pages retired after both header slots durably pointed at a
@@ -1818,22 +1832,12 @@ impl SingleFileDB {
     snapshot_page_count: u64,
   ) -> Result<u64> {
     let mut pager = self.pager.lock();
-    let wal_end_page = header.wal_start_page + header.wal_page_count;
-    let snapshot_end_page = header
-      .snapshot_start_page
-      .saturating_add(header.snapshot_page_count);
 
-    // The header, the WAL, and the installed snapshot are never free. Should
-    // a bookkeeping mistake list any of them, withdraw them instead of
-    // writing this snapshot over pages the installed header names.
-    let live_pages_listed = pager.withdraw_free_pages(0, wal_end_page as u32)
-      + pager.withdraw_free_pages(header.snapshot_start_page as u32, snapshot_end_page as u32);
-    if live_pages_listed > 0 {
-      eprintln!(
-        "Warning: {live_pages_listed} pages of the header, WAL, or installed snapshot were \
-         listed as free; withdrew them from reuse"
-      );
-    }
+    // The header, the WAL, the installed snapshot and the WAL segments are
+    // never free. Should a bookkeeping mistake list any of them, withdraw
+    // them instead of writing this snapshot over pages the installed header
+    // names.
+    self.withdraw_live_pages(&mut pager, header);
 
     if let Some(start_page) = pager.find_free_range(snapshot_page_count as u32) {
       pager.consume_free_range(start_page, snapshot_page_count as u32);
@@ -1842,12 +1846,7 @@ impl SingleFileDB {
 
     let page_size = header.page_size as u64;
     let file_pages = pager.file_size().div_ceil(page_size);
-    Ok(
-      file_pages
-        .max(header.db_size_pages)
-        .max(wal_end_page)
-        .max(snapshot_end_page),
-    )
+    Ok(file_pages.max(live_end_page(header)))
   }
 
   /// Drop the free pages at the end of the file, down to the installed
@@ -1946,12 +1945,24 @@ impl SingleFileDB {
     retire_wal(wal_buffer);
     wal_buffer.store_in_header(header);
     header.checkpoint_in_progress = 0;
+    // Every WAL segment precedes the cut (spills need the primary region
+    // and no cut), so the snapshot covers them all.
+    let dropped_segments = Self::drop_all_wal_segments(header);
 
     if let Err(error) = self.persist_checkpoint_header(pager, header) {
       restore_header(header, prior_header);
       wal_buffer.restore_region_state(prior_wal);
       pager.defer_free_pages(snapshot.start_page as u32, snapshot.page_count as u32);
       return Err(error);
+    }
+
+    // Both slots name `snapshot` and none of the dropped segments. (A test
+    // fault here stands for a crash before they are freed: the next open
+    // reclaims them.)
+    if !dropped_segments.is_empty()
+      && checkpoint_phase(&self.path, CheckpointPhase::SegmentsReleased).is_ok()
+    {
+      Self::free_wal_segments(pager, &dropped_segments);
     }
 
     // Both slots name `snapshot`, so no fallback can reach the previous
@@ -4628,11 +4639,12 @@ mod tests {
   }
 
   /// A crash between a background checkpoint's cut and its install can leave
-  /// more records in the two WAL regions than the primary region holds. Open
-  /// then keeps the cut in place (replay reads both regions), and the next
-  /// background checkpoint finishes it.
+  /// more records in the two WAL regions than the primary region holds. A
+  /// writable open then moves them, in log order, to a WAL segment (a
+  /// read-only open replays them in place), and the next checkpoint covers
+  /// it.
   #[test]
-  fn unfinished_cut_too_big_to_merge_is_finished_after_reopen() {
+  fn unfinished_cut_too_big_to_merge_is_finished_by_reopen() {
     let _serial = checkpoint_test_serial();
     let temp_dir = tempdir().expect("temp dir");
     let db_path = temp_dir.path().join("unfinished-cut-too-big.kitedb");
@@ -4685,23 +4697,19 @@ mod tests {
     drop(db);
 
     let expected: Vec<String> = (0..fills).map(filler).chain((0..6).map(post_cut)).collect();
+    // The writable open finishes the cut: its records go to a WAL segment.
     let reopened = open_single_file(&crashed_path, options.clone()).expect("reopen");
-    assert_eq!(reopened.header.read().checkpoint_in_progress, 1);
+    assert_eq!(reopened.header.read().checkpoint_in_progress, 0);
+    assert_eq!(wal_segment_test_stats(&reopened).live, 1);
     for key in &expected {
       assert!(reopened.node_by_key(key).is_some(), "{key:.12} missing");
     }
     reopened
       .background_checkpoint()
-      .expect("background checkpoint finishing the cut");
-    assert_eq!(reopened.header.read().checkpoint_in_progress, 0);
-    // Only the post-cut commits stay in the WAL, rewound to the primary start.
+      .expect("background checkpoint covering the segment");
+    assert_eq!(wal_segment_test_stats(&reopened).live, 0);
     let stats = reopened.wal_stats();
-    assert_eq!(stats.active_region, 0);
-    assert!(
-      stats.primary_head < 8 * 1024,
-      "primary head {}",
-      stats.primary_head
-    );
+    assert_eq!((stats.active_region, stats.primary_head), (0, 0));
     commit_node(&reopened, "after");
     drop(reopened);
 

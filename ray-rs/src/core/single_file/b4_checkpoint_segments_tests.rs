@@ -113,11 +113,11 @@ fn crash_images(base: &[u8], events: &[IoEvent], header_end: u64) -> Vec<(String
 /// any write or sync of the commits around it (in order, or with the
 /// header pages ahead of the rest) keeps every acknowledged commit.
 #[test]
-#[ignore = "needs WAL segments and the checkpoint thread (lands later on this branch)"]
 fn spill_survives_a_crash_at_every_io_event() {
   let dir = tempdir().expect("tempdir");
   let path = dir.path().join("spill-crash.kitedb");
-  let options = options().sync_mode(SyncMode::Full);
+  // No checkpoint: only spills make room.
+  let options = options().sync_mode(SyncMode::Full).auto_checkpoint(false);
   let db = open_single_file(&path, options.clone()).expect("open");
   let header_end = 2 * db.header.read().page_size as u64;
   // Most of the primary region, so the commits below spill.
@@ -212,7 +212,6 @@ fn assert_crash_copy_holds(path: &std::path::Path, keys: &[String], context: &st
 /// crash right then reopens with every acknowledged commit, and that keeps
 /// working (a later spill succeeds).
 #[test]
-#[ignore = "needs WAL segments and the checkpoint thread (lands later on this branch)"]
 fn spill_fails_safely_at_each_of_its_steps() {
   for phase in [
     CheckpointPhase::SpillSegmentWritten,
@@ -220,7 +219,9 @@ fn spill_fails_safely_at_each_of_its_steps() {
   ] {
     let dir = tempdir().expect("tempdir");
     let path = dir.path().join("spill-fault.kitedb");
-    let db = open_single_file(&path, options().sync_mode(SyncMode::Normal)).expect("open");
+    // No checkpoint: only spills make room.
+    let options = options().sync_mode(SyncMode::Normal).auto_checkpoint(false);
+    let db = open_single_file(&path, options.clone()).expect("open");
     watch_checkpoint_phases(&db);
     set_checkpoint_test_db_fault(&db, phase, false);
     let (mut acked, reached) = commit_until_reached(&db, "before", phase, 600);
@@ -237,7 +238,7 @@ fn spill_fails_safely_at_each_of_its_steps() {
       "{phase:?}: no spill after the failed one"
     );
     close_single_file(db).expect("close");
-    let reopened = open_single_file(&path, options()).expect("reopen");
+    let reopened = open_single_file(&path, options).expect("reopen");
     assert!(missing(&reopened, &acked).is_empty(), "{phase:?}: reopened");
   }
 }
@@ -600,12 +601,15 @@ fn newest_header(path: &std::path::Path) -> (DbHeaderV1, u32) {
 /// writes nothing): a replication source opened while segments hold
 /// commits sees them all.
 #[test]
-#[ignore = "needs WAL segments and the checkpoint thread (lands later on this branch)"]
 fn read_only_open_replays_segments() {
   let dir = tempdir().expect("tempdir");
   let path = dir.path().join("read-only-segments.kitedb");
-  let db = open_single_file(&path, options().sync_mode(SyncMode::Normal)).expect("open");
-  // About 120 KiB: two or three spills, below the checkpoint trigger.
+  let db = open_single_file(
+    &path,
+    options().sync_mode(SyncMode::Normal).auto_checkpoint(false),
+  )
+  .expect("open");
+  // About 120 KiB: two or three spills.
   let acked = commit_keys(&db, "key", 0, 400);
   close_single_file(db).expect("close");
   let (_, segments) = newest_header(&path);
@@ -619,7 +623,6 @@ fn read_only_open_replays_segments() {
 /// few thousand rows with the default 4 MiB WAL) spills into a segment
 /// instead of failing with `WalBufferFull`.
 #[test]
-#[ignore = "needs WAL segments and the checkpoint thread (lands later on this branch)"]
 fn oversized_bulk_commit_spills_into_a_segment() {
   let dir = tempdir().expect("tempdir");
   let path = dir.path().join("oversized-commit.kitedb");
@@ -765,4 +768,176 @@ fn generate_v2_fixtures() {
       .expect("checkpoint thread")
       .expect("checkpoint");
   }
+}
+
+/// Options for a database whose WAL only spills (no automatic checkpoint).
+fn spilling_options() -> SingleFileOpenOptions {
+  options().sync_mode(SyncMode::Normal).auto_checkpoint(false)
+}
+
+/// A background checkpoint covers every WAL segment: it drops them from
+/// the header (`covered` reaches every seq written), and a reopen finds the
+/// commits in the snapshot.
+#[test]
+fn background_checkpoint_covers_wal_segments() {
+  let dir = tempdir().expect("tempdir");
+  let path = dir.path().join("checkpoint-covers-segments.kitedb");
+  let db = open_single_file(&path, spilling_options()).expect("open");
+  let acked = commit_keys(&db, "key", 0, 400);
+  let before = wal_segment_test_stats(&db);
+  assert!(before.live > 0, "no spill: {before:?}");
+  db.background_checkpoint().expect("background checkpoint");
+  let after = wal_segment_test_stats(&db);
+  assert_eq!(
+    after.live, 0,
+    "segments left after the checkpoint: {after:?}"
+  );
+  assert!(after.covered + 1 >= after.next_seq, "{after:?}");
+  let more = commit_keys(&db, "more", 0, 50);
+  close_single_file(db).expect("close");
+  let reopened = open_single_file(&path, spilling_options()).expect("reopen");
+  assert!(missing(&reopened, &acked).is_empty());
+  assert!(missing(&reopened, &more).is_empty());
+}
+
+/// A write transaction whose records the WAL spilled into a segment while it
+/// was open (it wrote more than it keeps back) commits exactly once, whether
+/// a checkpoint runs while it is open or after, live and after a reopen.
+#[test]
+fn transaction_open_across_a_spill_and_a_checkpoint_commits_once() {
+  let dir = tempdir().expect("tempdir");
+  let path = dir.path().join("open-across-spill.kitedb");
+  let db = Arc::new(open_single_file(&path, spilling_options()).expect("open"));
+  let open_keys: Vec<String> = (0..40)
+    .map(|index| format!("open-{index}-{}", "o".repeat(1000)))
+    .collect();
+  let (wrote, open_wrote) = mpsc::channel();
+  let (go, open_go) = mpsc::channel::<()>();
+  let writer = {
+    let db = Arc::clone(&db);
+    let keys = open_keys.clone();
+    std::thread::spawn(move || {
+      db.begin(false).expect("begin");
+      for key in &keys {
+        db.create_node(Some(key)).expect("node");
+      }
+      wrote.send(()).expect("signal");
+      open_go.recv().expect("wait");
+      db.commit()
+        .expect("commit after the spill and the checkpoint");
+    })
+  };
+  open_wrote.recv().expect("the open transaction wrote");
+  let spills = wal_segment_test_stats(&db).next_seq;
+  let mut acked = Vec::new();
+  let mut index = 0;
+  while wal_segment_test_stats(&db).next_seq <= spills.max(1) && index < 2_000 {
+    acked.extend(commit_keys(&db, "key", index, 1));
+    index += 1;
+  }
+  assert!(
+    wal_segment_test_stats(&db).next_seq > spills.max(1),
+    "the WAL never spilled"
+  );
+  // Either is fine: it covers the open transaction's records or declines.
+  match db.background_checkpoint() {
+    Ok(()) | Err(KiteError::CheckpointDeclined(_)) => {}
+    Err(error) => panic!("checkpoint failed: {error}"),
+  }
+  go.send(()).expect("release the open transaction");
+  writer.join().expect("writer");
+  assert!(missing(&db, &open_keys).is_empty(), "lost live");
+  db.background_checkpoint()
+    .expect("checkpoint after it committed");
+  let count = db.count_nodes();
+  let db = Arc::into_inner(db).expect("sole owner");
+  close_single_file(db).expect("close");
+  let reopened = open_single_file(&path, spilling_options()).expect("reopen");
+  assert!(
+    missing(&reopened, &open_keys).is_empty(),
+    "lost after reopen"
+  );
+  assert!(missing(&reopened, &acked).is_empty());
+  assert_eq!(
+    reopened.count_nodes(),
+    count,
+    "a transaction replayed twice"
+  );
+}
+
+/// Vacuum compacts the file after the snapshot, which would cut off WAL
+/// segments: it checkpoints them first. A WAL resize without its checkpoint
+/// refuses a log that has segments.
+#[test]
+fn vacuum_and_resize_handle_wal_segments() {
+  let dir = tempdir().expect("tempdir");
+  let path = dir.path().join("vacuum-segments.kitedb");
+  let db = open_single_file(&path, spilling_options()).expect("open");
+  let acked = commit_keys(&db, "key", 0, 400);
+  assert!(wal_segment_test_stats(&db).live > 0, "no spill");
+  assert!(db
+    .resize_wal(
+      2 * SMALL_WAL,
+      Some(crate::core::single_file::ResizeWalOptions {
+        allow_shrink: false,
+        checkpoint: false,
+      }),
+    )
+    .is_err());
+  db.vacuum_single_file(Some(crate::core::single_file::VacuumOptions {
+    shrink_wal: false,
+    min_wal_size: None,
+  }))
+  .expect("vacuum");
+  assert_eq!(wal_segment_test_stats(&db).live, 0);
+  let header = db.header.read().clone();
+  assert_eq!(
+    db.pager.lock().file_size(),
+    (header.snapshot_start_page + header.snapshot_page_count) * header.page_size as u64
+  );
+  close_single_file(db).expect("close");
+  let reopened = open_single_file(&path, spilling_options()).expect("reopen");
+  assert!(missing(&reopened, &acked).is_empty());
+}
+
+/// A crash while a background checkpoint builds its snapshot, with commits
+/// in WAL segments before its cut and in the WAL after it, keeps them all.
+#[test]
+fn crash_during_a_checkpoint_with_segments_keeps_every_commit() {
+  let dir = tempdir().expect("tempdir");
+  let path = dir.path().join("crash-checkpoint-segments.kitedb");
+  let db = Arc::new(open_single_file(&path, spilling_options()).expect("open"));
+  let mut acked = commit_keys(&db, "before", 0, 400);
+  assert!(wal_segment_test_stats(&db).live > 0, "no spill");
+  watch_checkpoint_phases(&db);
+  let held = Arc::new(Barrier::new(2));
+  set_checkpoint_test_barrier(&db, CheckpointPhase::SnapshotDurable, Arc::clone(&held));
+  let checkpoint = {
+    let db = Arc::clone(&db);
+    std::thread::spawn(move || db.background_checkpoint())
+  };
+  let deadline = Instant::now() + Duration::from_secs(10);
+  assert!(wait_for("a held checkpoint", deadline, || {
+    checkpoint_test_reached(&db)
+      .iter()
+      .any(|(phase, _, parked)| *phase == CheckpointPhase::SnapshotDurable && *parked)
+  }));
+  acked.extend(commit_keys(&db, "during", 0, 30));
+  let copy = dir.path().join("crash-checkpoint-segments-copy.kitedb");
+  std::fs::copy(&path, &copy).expect("crash copy");
+  held.wait();
+  checkpoint
+    .join()
+    .expect("checkpoint thread")
+    .expect("checkpoint");
+  let crashed = open_single_file(&copy, spilling_options()).expect("open the crash copy");
+  assert!(missing(&crashed, &acked).is_empty());
+  let more = commit_keys(&crashed, "after", 0, 300);
+  crashed
+    .background_checkpoint()
+    .expect("checkpoint after the crash");
+  close_single_file(crashed).expect("close");
+  let reopened = open_single_file(&copy, spilling_options()).expect("reopen");
+  assert!(missing(&reopened, &acked).is_empty());
+  assert!(missing(&reopened, &more).is_empty());
 }

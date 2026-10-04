@@ -59,6 +59,7 @@ use std::time::Instant;
 use super::commit_profile::{self as prof, Stage};
 use super::mvcc_history::{record_commit, HistoryPlan};
 use super::open::SyncMode;
+use super::segments::SpillOutcome;
 use super::writer_slot::WriterMode;
 use super::{SchemaStaging, SingleFileDB, SingleFileTxState};
 use crate::core::pager::FilePager;
@@ -531,6 +532,9 @@ struct CommitRound {
   wait_for_cut: Option<u64>,
   /// The next request found the WAL full, and no checkpoint in the way.
   wal_full: bool,
+  /// The round's one commit, too large for the WAL, was made durable in a
+  /// WAL segment (see `write_commit_round`).
+  durable_in_segment: bool,
 }
 
 /// A commit made durable by a round of `SingleFileDB::write_commits`, to
@@ -810,6 +814,9 @@ pub(crate) enum WalWrite<T> {
   /// after a background install whose compaction failed, with the primary
   /// region empty; `compact_retired_wal` makes room.
   NeedsCompaction,
+  /// The WAL refused the record because it is full: `spill_or_append`
+  /// makes room.
+  NeedsSpill,
 }
 
 /// Marks a transaction finished once commit or rollback is done with it,
@@ -1155,7 +1162,7 @@ impl SingleFileDB {
         } else if wal.is_primary_retired() {
           Ok(WalWrite::NeedsCompaction)
         } else {
-          Err(KiteError::WalBufferFull)
+          Ok(WalWrite::NeedsSpill)
         }
       }
       Err(error) => Err(error),
@@ -1184,6 +1191,11 @@ impl SingleFileDB {
         WalWrite::Written(()) => return Ok(()),
         WalWrite::BlockedOn(cut) => self.wait_for_cut_release(cut)?,
         WalWrite::NeedsCompaction => self.compact_retired_wal()?,
+        WalWrite::NeedsSpill => match self.spill_or_append(record, &then)? {
+          SpillOutcome::Spilled => {}
+          SpillOutcome::Appended => return Ok(()),
+          SpillOutcome::Impossible => return Err(KiteError::WalBufferFull),
+        },
       }
     }
   }
@@ -1230,6 +1242,18 @@ impl SingleFileDB {
         WalWrite::Written(()) => break,
         WalWrite::BlockedOn(cut) => self.wait_for_cut_release(cut)?,
         WalWrite::NeedsCompaction => self.compact_retired_wal()?,
+        WalWrite::NeedsSpill => {
+          let joined = || {
+            if writes_begin {
+              self.open_write_txids.lock().insert(txid);
+            }
+          };
+          match self.spill_or_append(&records, joined)? {
+            SpillOutcome::Spilled => {}
+            SpillOutcome::Appended => break,
+            SpillOutcome::Impossible => return Err(KiteError::WalBufferFull),
+          }
+        }
       }
     }
     let mut tx = tx_handle.lock();
@@ -2147,6 +2171,28 @@ impl SingleFileDB {
           staged.push((index, request));
           continue;
         }
+        // Too large for the WAL even empty: its records go straight to the
+        // end of the WAL segment log, durable once that is (see `spill_wal`).
+        // Alone in its round: the WAL holds nothing before it, and the
+        // others wait for the next round.
+        if staged.is_empty() && wal.is_empty() {
+          let mut header = self.header.write();
+          if self.can_spill(&wal, &header) {
+            self.unstage_newest_in_mvcc(checked.len());
+            queue.extend(checked.drain(..));
+            match self.spill_wal(&mut pager, &mut wal, &mut header, &request.records) {
+              Ok(()) => {
+                round.durable_in_segment = true;
+                staged.push((index, request));
+              }
+              Err(error) => {
+                self.unstage_newest_in_mvcc(1);
+                outcomes[index] = Some(CommitOutcome::failed(error));
+              }
+            }
+            break;
+          }
+        }
         self.unstage_newest_in_mvcc(checked.len() + 1);
         // Make what fits durable first; this one waits for the next round.
         if !staged.is_empty() {
@@ -2165,8 +2211,18 @@ impl SingleFileDB {
           queue.push_back((index, request));
           round.wait_for_cut = Some(cut);
         } else {
-          queue.push_back((index, request));
-          round.wal_full = true;
+          // Spill the WAL's records into a WAL segment, and retry in the next
+          // round; if the WAL cannot spill, a checkpoint makes room.
+          let mut header = self.header.write();
+          if self.can_spill(&wal, &header) {
+            match self.spill_wal(&mut pager, &mut wal, &mut header, &[]) {
+              Ok(()) => queue.push_back((index, request)),
+              Err(error) => outcomes[index] = Some(CommitOutcome::failed(error)),
+            }
+          } else {
+            queue.push_back((index, request));
+            round.wal_full = true;
+          }
         }
         queue.extend(checked.drain(..));
         break;
@@ -2180,8 +2236,10 @@ impl SingleFileDB {
       // `SyncMode::Off` leaves the records buffered (checkpoints and close
       // write them) and names them in the in-memory header only. A
       // Full-mode round syncs once its writes are done, so it tops up the
-      // zeros ahead of the head in them.
-      (self.sync_mode != SyncMode::Off).then(|| wal.seal(self.sync_mode == SyncMode::Full))
+      // zeros ahead of the head in them. A commit made durable in a WAL
+      // segment has nothing in the WAL to write.
+      (self.sync_mode != SyncMode::Off && !round.durable_in_segment)
+        .then(|| wal.seal(self.sync_mode == SyncMode::Full))
     };
     prof::end(Stage::WalAppendSeal, append_mark);
     prof::count(Stage::Groups, 1);

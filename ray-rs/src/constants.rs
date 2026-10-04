@@ -45,7 +45,7 @@ pub const MAGIC_KITEDB: [u8; 16] = [
   0x6f, 0x72, 0x6d, 0x61, 0x74, 0x20, 0x31, 0x00, // "ormat 1\0"
 ];
 
-/// Single-file format version.
+/// Single-file format version: the newest this build reads and writes.
 ///
 /// v2: each WAL region has a salt in the header (`wal_primary_salt`,
 /// `wal_secondary_salt`), XORed into the CRC of every record written there and
@@ -53,9 +53,42 @@ pub const MAGIC_KITEDB: [u8; 16] = [
 /// WAL cycle left behind no longer parse. v1 files (unsalted WAL, salts 0)
 /// still open; their WAL replays as is, and the next WAL reset salts it and
 /// upgrades the header to v2.
-pub const VERSION_SINGLE_FILE: u32 = 2;
+///
+/// v3: the header page names WAL segments (`DbHeaderV1::wal_segments`),
+/// extents holding WAL records the WAL spilled. A header is v3 only while it
+/// names a segment, and v2 again once a checkpoint covers them all, so
+/// releases that read v2 keep opening files without segments, and refuse
+/// files with some (`VersionMismatch`) instead of missing their commits.
+pub const VERSION_SINGLE_FILE: u32 = VERSION_WAL_SEGMENTS;
+/// The format of a header that names no WAL segment (salted WAL).
+pub const VERSION_SALTED_WAL: u32 = 2;
 /// Readers before v2 cannot verify salted WAL records.
-pub const MIN_READER_SINGLE_FILE: u32 = 2;
+pub const MIN_READER_SALTED_WAL: u32 = 2;
+/// The format of a header that names WAL segments.
+pub const VERSION_WAL_SEGMENTS: u32 = 3;
+/// Readers before v3 would miss the commits in WAL segments.
+pub const MIN_READER_WAL_SEGMENTS: u32 = 3;
+/// The reader version a header without WAL segments requires.
+pub const MIN_READER_SINGLE_FILE: u32 = MIN_READER_SALTED_WAL;
+
+/// The most WAL segments a header names (its page holds their table).
+pub const MAX_WAL_SEGMENTS: usize = 64;
+/// Where the WAL segment table starts in a header page.
+pub const WAL_SEGMENT_TABLE_OFFSET: usize = 184;
+/// Bytes of the WAL segment table before its entries.
+pub const WAL_SEGMENT_TABLE_HEADER_SIZE: usize = 24;
+/// Bytes of one WAL segment table entry.
+pub const WAL_SEGMENT_ENTRY_SIZE: usize = 32;
+/// Default size of a WAL segment extent: spills of the WAL fill one until it
+/// is full or a checkpoint seals it.
+pub const WAL_SEGMENT_DEFAULT_SIZE: usize = 32 * 1024 * 1024;
+/// Default `checkpoint_log_ratio`: a checkpoint starts once the WAL segments
+/// hold this fraction of the snapshot's size.
+pub const CHECKPOINT_LOG_RATIO_DEFAULT: f64 = 0.5;
+/// Default log budget: the most bytes of WAL segments a checkpoint waits
+/// for (the delta replaying them takes about ten times as much memory);
+/// writers wait for a checkpoint at four times it.
+pub const WAL_LOG_BUDGET_DEFAULT: usize = 128 * 1024 * 1024;
 
 /// Single-file extension
 pub const EXT_KITEDB: &str = ".kitedb";

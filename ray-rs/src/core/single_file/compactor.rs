@@ -221,6 +221,13 @@ impl SingleFileDB {
 
     let options = options.unwrap_or_default();
 
+    // Compaction moves the snapshot next to the WAL and truncates the file
+    // after it; WAL segments would be cut off. A checkpoint covers them
+    // first.
+    if !self.header.read().wal_segments.is_empty() {
+      self.checkpoint_holding_gate()?;
+    }
+
     let header = self.header.read().clone();
     let page_size = header.page_size as u64;
 
@@ -276,9 +283,9 @@ impl SingleFileDB {
     let header = self.header.read().clone();
     let wal_is_empty =
       header.wal_head == header.wal_tail || (header.wal_head == 0 && header.wal_tail == 0);
-    if !wal_is_empty {
+    if !wal_is_empty || !header.wal_segments.is_empty() {
       return Err(KiteError::Internal(
-        "WAL must be empty before resize (run checkpoint)".to_string(),
+        "WAL must be empty before resize, with no WAL segments (run checkpoint)".to_string(),
       ));
     }
 
@@ -319,7 +326,9 @@ impl SingleFileDB {
       return Ok(());
     }
     let header = self.header.read().clone();
-    if header.snapshot_page_count == 0 {
+    // WAL segments stay where they are until a checkpoint covers them (a
+    // reopen replays them); moving the snapshot would truncate them.
+    if header.snapshot_page_count == 0 || !header.wal_segments.is_empty() {
       return Ok(());
     }
     let wal_end_page = header.wal_start_page + header.wal_page_count;
@@ -365,6 +374,11 @@ impl SingleFileDB {
   /// `install_compacted_layout`). Pages a slot may name for the failed step
   /// lie on no free list, so nothing reuses them before a later vacuum.
   fn compact(&self, mut layout: DbHeaderV1) -> Result<()> {
+    if !layout.wal_segments.is_empty() {
+      return Err(KiteError::Internal(
+        "cannot compact a file whose header names WAL segments (checkpoint first)".to_string(),
+      ));
+    }
     // The header installed below names the WAL as recorded in memory, so its
     // bytes must be durable first; the buffer rebuilt from it starts clean.
     {

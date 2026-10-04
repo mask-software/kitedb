@@ -765,6 +765,60 @@ pub struct DbHeaderV1 {
   /// Salt of the secondary WAL region's records, replaced whenever a
   /// background checkpoint starts writing there.
   pub wal_secondary_salt: u32,
+  /// V3: the WAL segments holding records the WAL spilled (see
+  /// [`WalSegmentTable`]). Empty in v1 and v2 headers.
+  pub wal_segments: WalSegmentTable,
+}
+
+/// The WAL segments a header names: extents of pages holding WAL records
+/// the WAL spilled, unsalted, back to back, in log order before the WAL.
+/// Recovery replays every transaction whose COMMIT record lies after the
+/// last record of segment `covered` (the snapshot holds the others).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WalSegmentTable {
+  /// The seq the next segment gets (0: none was ever written, so 1).
+  pub next_seq: u64,
+  /// The snapshot holds every transaction whose COMMIT record lies in a
+  /// segment with this seq or below.
+  pub covered: u64,
+  /// The live segments, by ascending seq.
+  pub entries: std::sync::Arc<[WalSegment]>,
+}
+
+impl WalSegmentTable {
+  /// Whether the header names no segment.
+  pub fn is_empty(&self) -> bool {
+    self.entries.is_empty()
+  }
+
+  /// Bytes of records the segments hold.
+  pub fn bytes(&self) -> u64 {
+    self.entries.iter().map(|segment| segment.byte_len).sum()
+  }
+
+  /// The seq the next segment gets.
+  pub fn next_seq(&self) -> u64 {
+    self.next_seq.max(1)
+  }
+}
+
+/// One WAL segment: `byte_len` bytes of records from `start_page` on, in an
+/// extent of `page_count` pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalSegment {
+  pub seq: u64,
+  pub start_page: u64,
+  pub page_count: u64,
+  pub byte_len: u64,
+  /// No spill appends to it any more (a checkpoint cut sealed it).
+  pub sealed: bool,
+}
+
+impl WalSegment {
+  /// One past its extent's last page.
+  pub fn end_page(&self) -> u64 {
+    self.start_page + self.page_count
+  }
 }
 
 /// Size of fixed header fields before reserved area (in bytes)

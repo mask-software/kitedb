@@ -86,6 +86,44 @@ pub(crate) fn committed_transactions(
   extract_committed_transactions_in_order(wal_records)
 }
 
+/// `committed_transactions` of the log `records`, but only those whose
+/// COMMIT record comes after the first `covered` records (those the
+/// snapshot already holds; their records may still begin transactions that
+/// commit later).
+pub(crate) fn committed_transactions_after(
+  records: &[ParsedWalRecord],
+  covered: usize,
+) -> Vec<(TxId, Vec<&ParsedWalRecord>)> {
+  if covered == 0 {
+    return committed_transactions(records);
+  }
+  let mut pending: HashMap<TxId, Vec<&ParsedWalRecord>> = HashMap::new();
+  let mut committed = Vec::new();
+  for (index, record) in records.iter().enumerate() {
+    match record.record_type {
+      WalRecordType::Begin => {
+        pending.insert(record.txid, Vec::new());
+      }
+      WalRecordType::Commit => {
+        if let Some(tx_records) = pending.remove(&record.txid) {
+          if index >= covered {
+            committed.push((record.txid, tx_records));
+          }
+        }
+      }
+      WalRecordType::Rollback => {
+        pending.remove(&record.txid);
+      }
+      _ => {
+        if let Some(tx_records) = pending.get_mut(&record.txid) {
+          tx_records.push(record);
+        }
+      }
+    }
+  }
+  committed
+}
+
 /// Replay a single WAL record into delta and update allocators/schema.
 ///
 /// Returns whether replay applied it: `false` for the vector maintenance

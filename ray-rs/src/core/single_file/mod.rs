@@ -36,6 +36,7 @@ mod read;
 mod recovery;
 mod replication;
 mod schema;
+mod segments;
 mod transaction;
 mod tx_registry;
 mod vector;
@@ -432,6 +433,24 @@ pub struct SingleFileInner {
   /// Compression options for checkpoint snapshots
   pub(crate) checkpoint_compression: Option<CompressionOptions>,
 
+  /// Bytes of a new WAL segment extent (see `segments`).
+  pub(crate) wal_segment_size: u64,
+  /// A checkpoint starts once the WAL segments hold this fraction of the
+  /// snapshot's size (see `checkpoint_log_trigger`).
+  pub(crate) checkpoint_log_ratio: f64,
+  /// The most bytes of WAL segments a checkpoint waits for (see
+  /// `checkpoint_log_trigger`, `wal_segment_limit`).
+  pub(crate) wal_log_budget: u64,
+  /// An explicit limit on the bytes of WAL segments (0: the default; see
+  /// `wal_segment_limit`).
+  pub(crate) wal_segment_limit_bytes: AtomicU64,
+  /// Spills of the WAL into WAL segments so far.
+  pub(crate) wal_spills: AtomicU64,
+  /// Write transactions that had records in the WAL when it spilled: some of
+  /// their records are in a WAL segment, which a background checkpoint's cut
+  /// cannot copy to the secondary region with the others.
+  pub(crate) spilled_open_txids: Mutex<HashSet<TxId>>,
+
   /// Synchronization mode for WAL writes
   pub(crate) sync_mode: open::SyncMode,
 
@@ -623,6 +642,7 @@ impl SingleFileDB {
   pub(crate) fn transaction_finished(&self, txid: TxId, wrote_begin: bool) {
     if wrote_begin {
       self.open_write_txids.lock().remove(&txid);
+      self.spilled_open_txids.lock().remove(&txid);
     }
     let previous = self.active_transactions.fetch_sub(1, Ordering::AcqRel);
     debug_assert!(previous > 0, "active transaction count underflow");

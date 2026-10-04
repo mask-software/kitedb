@@ -808,6 +808,24 @@ impl WalBuffer {
     Ok(true)
   }
 
+  /// The records of a background checkpoint's cut, in log order (the
+  /// primary region's, then the secondary region's), unsalted: what a WAL
+  /// segment holds when the cut does not fit back into the primary region
+  /// (see `segments::finish_cut_into_segment`). Records past the first that
+  /// does not parse in a region are dropped, as replay would.
+  pub fn cut_records_unsalted(&mut self, pager: &mut FilePager) -> Result<Vec<u8>> {
+    self.flush(pager)?;
+    let (start, mut primary) = self.region_bytes(0, 0, pager)?;
+    let end = wal_records_end(&primary, self.primary_salt);
+    warn_dropped_tail("primary", start + end as u64, self.primary_head);
+    primary.truncate(end);
+    xor_salt(&mut primary, self.primary_salt)?;
+    let mut secondary = self.secondary_record_bytes(Vec::new(), pager)?;
+    xor_salt(&mut secondary, self.secondary_salt)?;
+    primary.extend_from_slice(&secondary);
+    Ok(primary)
+  }
+
   /// Bytes the records of both regions take: what
   /// [`Self::merge_cut_into_primary`] would leave in the primary region.
   #[cfg(test)]
@@ -2743,7 +2761,7 @@ mod tests {
     assert_ne!(header.wal_primary_salt, 0);
     assert_eq!(
       (header.version, header.min_reader_version),
-      (VERSION_SINGLE_FILE, MIN_READER_SINGLE_FILE)
+      (VERSION_SALTED_WAL, MIN_READER_SALTED_WAL)
     );
   }
 

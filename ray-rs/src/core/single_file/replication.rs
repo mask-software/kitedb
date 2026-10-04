@@ -31,7 +31,8 @@ use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::open::{open_replication_source, SyncMode};
-use super::recovery::{committed_transactions, scan_wal_records};
+use super::recovery::{committed_transactions_after, scan_wal_records};
+use super::segments::read_wal_segment_records;
 use super::transaction::SingleFileTxGuard;
 use super::{close_single_file, SingleFileDB};
 
@@ -675,17 +676,21 @@ fn bootstrap_log_position(
   Ok((published.epoch, newest_index))
 }
 
-/// Newest committed transaction in the source WAL, or `None` once a
-/// checkpoint has folded every commit into the snapshot.
+/// Newest committed transaction in the source's log (its WAL segments, then
+/// its WAL), or `None` once a checkpoint has folded every commit into the
+/// snapshot.
 fn source_last_committed_txid(source: &SingleFileDB) -> Result<Option<TxId>> {
   let header = source.header.read().clone();
-  if header.wal_head == 0 {
+  if header.wal_head == 0 && header.wal_segments.is_empty() {
     return Ok(None);
   }
   let mut pager = source.pager.lock();
-  let records = scan_wal_records(&mut pager, &header)?;
+  let (mut records, covered) = read_wal_segment_records(&pager, &header)?;
+  if header.wal_head > 0 {
+    records.extend(scan_wal_records(&mut pager, &header)?);
+  }
   Ok(
-    committed_transactions(&records)
+    committed_transactions_after(&records, covered)
       .last()
       .map(|(txid, _)| *txid),
   )

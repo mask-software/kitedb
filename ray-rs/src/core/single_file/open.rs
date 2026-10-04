@@ -34,8 +34,9 @@ use crate::util::fs::sync_parent_dir;
 use crate::util::mmap::Mmap;
 
 use super::recovery::{
-  committed_transactions, drop_vectors_of_missing_nodes, replay_wal_record, scan_wal_records,
+  committed_transactions_after, drop_vectors_of_missing_nodes, replay_wal_record, scan_wal_records,
 };
+use super::segments::{finish_cut_into_segment, read_wal_segment_records};
 use super::vector::{apply_replayed_vectors, vector_store_state_from_snapshot};
 use super::{BackgroundCheckpointState, SchemaReservations, SingleFileDB, SingleFileInner};
 
@@ -881,9 +882,12 @@ fn open_single_file_internal(
     // slot, so the selected header stays the crash fallback.
     let rebuilt_wal = if replay_cut_in_place {
       // If the secondary region's records do not fit after the primary
-      // region's, the cut stays: the first checkpoint finishes it.
-      replay_cut_in_place = !wal_buffer.merge_cut_into_primary(&mut pager)?;
-      !replay_cut_in_place
+      // region's, the cut goes to a WAL segment instead.
+      if !wal_buffer.merge_cut_into_primary(&mut pager)? {
+        finish_cut_into_segment(&mut pager, &mut wal_buffer, &mut header, &mut header_slot)?;
+      }
+      replay_cut_in_place = false;
+      true
     } else if wal_buffer.is_primary_retired() {
       // The new snapshot was installed with the post-cut records still in the
       // secondary region, and the process stopped before compacting them into
@@ -967,14 +971,19 @@ fn open_single_file_internal(
 
   // Replay WAL for recovery (if not a new database)
   let mut _wal_records_storage: Option<Vec<crate::core::wal::record::ParsedWalRecord>>;
-  if !is_new && header.wal_head > 0 {
+  if !is_new && (header.wal_head > 0 || !header.wal_segments.is_empty()) {
     #[cfg(feature = "bench-profile")]
     let wal_scan_started = Instant::now();
-    _wal_records_storage = Some(if replay_cut_in_place {
-      wal_buffer.records_for_recovery(&mut pager)?
-    } else {
-      scan_wal_records(&mut pager, &header)?
-    });
+    // The log: the WAL segments' records, then the WAL's.
+    let (mut log, covered_records) = read_wal_segment_records(&pager, &header)?;
+    if header.wal_head > 0 {
+      log.extend(if replay_cut_in_place {
+        wal_buffer.records_for_recovery(&mut pager)?
+      } else {
+        scan_wal_records(&mut pager, &header)?
+      });
+    }
+    _wal_records_storage = Some(log);
     #[cfg(feature = "bench-profile")]
     {
       open_profile.wal_scan_ns = open_profile
@@ -982,7 +991,8 @@ fn open_single_file_internal(
         .saturating_add(elapsed_ns(wal_scan_started));
     }
     if let Some(ref wal_records) = _wal_records_storage {
-      committed_in_order = committed_transactions(wal_records);
+      // Transactions committed in segments the snapshot covers are in it.
+      committed_in_order = committed_transactions_after(wal_records, covered_records);
 
       // Replay committed transactions
       #[cfg(feature = "bench-profile")]
@@ -1124,6 +1134,7 @@ fn open_single_file_internal(
     }
   }
 
+  let wal_segment_size = default_wal_segment_size(&header);
   Ok(SingleFileDB::owning(SingleFileInner {
     path: path.to_path_buf(),
     read_only: options.read_only,
@@ -1169,6 +1180,12 @@ fn open_single_file_internal(
     vector_stores: RwLock::new(vector_stores),
     vector_store_lazy_entries: RwLock::new(vector_store_lazy_entries),
     checkpoint_compression: options.checkpoint_compression.clone(),
+    wal_segment_size,
+    checkpoint_log_ratio: CHECKPOINT_LOG_RATIO_DEFAULT,
+    wal_log_budget: WAL_LOG_BUDGET_DEFAULT as u64,
+    wal_segment_limit_bytes: AtomicU64::new(0),
+    wal_spills: AtomicU64::new(0),
+    spilled_open_txids: Mutex::new(HashSet::new()),
     sync_mode: options.sync_mode,
     primary_replication,
     replica_replication,
@@ -1179,6 +1196,14 @@ fn open_single_file_internal(
     #[cfg(feature = "bench-profile")]
     wal_flush_ns: AtomicU64::new(0),
   }))
+}
+
+/// Bytes of a WAL segment extent by default: eight WALs, at most
+/// `WAL_SEGMENT_DEFAULT_SIZE` (but always room for a WAL's records and more;
+/// see `wal_segment_extent_pages`).
+fn default_wal_segment_size(header: &DbHeaderV1) -> u64 {
+  let wal_bytes = header.wal_page_count * header.page_size as u64;
+  (8 * wal_bytes).min(WAL_SEGMENT_DEFAULT_SIZE as u64)
 }
 
 /// Put the pages of the file no header slot names on the pager's free list,
@@ -1197,8 +1222,8 @@ fn reclaim_unnamed_pages(
   header: &DbHeaderV1,
   fallback: Option<&DbHeaderV1>,
 ) {
-  fn named(header: &DbHeaderV1) -> [(u64, u64); 2] {
-    [
+  fn named(header: &DbHeaderV1) -> Vec<(u64, u64)> {
+    let mut ranges = vec![
       (
         header.wal_start_page,
         header.wal_start_page + header.wal_page_count,
@@ -1209,9 +1234,17 @@ fn reclaim_unnamed_pages(
           .snapshot_start_page
           .saturating_add(header.snapshot_page_count),
       ),
-    ]
+    ];
+    ranges.extend(
+      header
+        .wal_segments
+        .entries
+        .iter()
+        .map(|segment| (segment.start_page, segment.end_page())),
+    );
+    ranges
   }
-  let fallback = fallback.map_or([(0, 0); 2], named);
+  let fallback = fallback.map_or_else(Vec::new, named);
   let mut live = named(header);
   live.sort_unstable();
   let Ok(file_pages) = u32::try_from(pager.file_size().div_ceil(header.page_size as u64)) else {
@@ -1734,10 +1767,10 @@ mod tests {
       legacy_header.max_node_id
     );
     // The migrated file is written in the current format.
-    assert_eq!(migrated.header.read().version, VERSION_SINGLE_FILE);
+    assert_eq!(migrated.header.read().version, VERSION_SALTED_WAL);
     assert_eq!(
       migrated.header.read().min_reader_version,
-      MIN_READER_SINGLE_FILE
+      MIN_READER_SALTED_WAL
     );
     assert_ne!(migrated.header.read().wal_primary_salt, 0);
     assert!(migrated.header.read().next_tx_id >= legacy_header.next_tx_id);

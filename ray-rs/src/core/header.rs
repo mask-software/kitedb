@@ -5,7 +5,7 @@
 use crate::constants::*;
 use crate::core::pager::FilePager;
 use crate::error::{KiteError, Result};
-use crate::types::{DbHeaderV1, DB_HEADER_FIXED_SIZE};
+use crate::types::{DbHeaderV1, WalSegment, WalSegmentTable, DB_HEADER_FIXED_SIZE};
 use crate::util::binary::*;
 use crate::util::crc::{crc32, crc32_zero_extended};
 
@@ -112,6 +112,7 @@ impl DbHeaderV1 {
       checkpoint_in_progress: data[161],
       wal_primary_salt: read_u32(data, 164),
       wal_secondary_salt: read_u32(data, 168),
+      wal_segments: parse_wal_segment_table(data, page_size)?,
     })
   }
 
@@ -151,8 +152,26 @@ impl DbHeaderV1 {
     self.wal_primary_salt = primary;
     self.wal_secondary_salt = secondary;
     if primary != 0 || secondary != 0 {
-      self.version = self.version.max(VERSION_SINGLE_FILE);
-      self.min_reader_version = self.min_reader_version.max(MIN_READER_SINGLE_FILE);
+      self.version = self.version.max(VERSION_SALTED_WAL);
+      self.min_reader_version = self.min_reader_version.max(MIN_READER_SALTED_WAL);
+    }
+  }
+
+  /// The format version and reader version this header is written with:
+  /// v3 while it names WAL segments, and otherwise its format without them
+  /// (v2 for a salted WAL, v1 before), so releases that read v2 open a file
+  /// whose segments a checkpoint covered.
+  pub fn written_versions(&self) -> (u32, u32) {
+    if !self.wal_segments.is_empty() {
+      (
+        self.version.max(VERSION_WAL_SEGMENTS),
+        self.min_reader_version.max(MIN_READER_WAL_SEGMENTS),
+      )
+    } else if self.version == VERSION_WAL_SEGMENTS {
+      // v3 only for the segments a checkpoint has covered since.
+      (VERSION_SALTED_WAL, MIN_READER_SALTED_WAL)
+    } else {
+      (self.version, self.min_reader_version)
     }
   }
 
@@ -184,10 +203,11 @@ impl DbHeaderV1 {
     }
     let buf = buf.as_mut_slice();
 
+    let (version, min_reader_version) = self.written_versions();
     buf[0..16].copy_from_slice(&self.magic);
     write_u32(buf, 16, self.page_size);
-    write_u32(buf, 20, self.version);
-    write_u32(buf, 24, self.min_reader_version);
+    write_u32(buf, 20, version);
+    write_u32(buf, 24, min_reader_version);
     write_u32(buf, 28, self.flags);
     write_u64(buf, 32, self.change_counter);
     write_u64(buf, 40, self.db_size_pages);
@@ -215,9 +235,9 @@ impl DbHeaderV1 {
     let header_crc = crc32(&buf[..HEADER_CRC_OFFSET]);
     write_u32(buf, HEADER_CRC_OFFSET, header_crc);
 
-    // Every byte between the header checksum and the footer is zero.
-    let fields_end = HEADER_CRC_OFFSET + 4;
-    let footer_crc = crc32_zero_extended(&buf[..fields_end], page_size - 4 - fields_end);
+    // The WAL segment table, then zeros up to the footer.
+    let table_end = write_wal_segment_table(buf, &self.wal_segments);
+    let footer_crc = crc32_zero_extended(&buf[..table_end], page_size - 4 - table_end);
     write_u32(buf, page_size - 4, footer_crc);
   }
 
@@ -229,8 +249,8 @@ impl DbHeaderV1 {
     Self {
       magic,
       page_size,
-      version: VERSION_SINGLE_FILE,
-      min_reader_version: MIN_READER_SINGLE_FILE,
+      version: VERSION_SALTED_WAL,
+      min_reader_version: MIN_READER_SALTED_WAL,
       flags: 0,
       change_counter: 0,
       db_size_pages: HEADER_SLOT_COUNT + wal_pages,
@@ -253,8 +273,84 @@ impl DbHeaderV1 {
       // The secondary region gets a salt when a checkpoint first writes there.
       wal_primary_salt: INITIAL_WAL_SALT,
       wal_secondary_salt: 0,
+      wal_segments: WalSegmentTable::default(),
     }
   }
+}
+
+/// Read the WAL segment table of a header page (zeros in v1 and v2 pages:
+/// an empty table). Fails on a table no writer produces: more entries than
+/// fit, seqs out of order, an extent before the WAL, or more bytes than its
+/// pages hold.
+fn parse_wal_segment_table(data: &[u8], page_size: usize) -> Result<WalSegmentTable> {
+  let invalid = |what: String| {
+    Err(KiteError::InvalidSnapshot(format!(
+      "header names an invalid WAL segment table: {what}"
+    )))
+  };
+  let table = WAL_SEGMENT_TABLE_OFFSET;
+  let count = read_u32(data, table) as usize;
+  let entries_start = table + WAL_SEGMENT_TABLE_HEADER_SIZE;
+  if count > MAX_WAL_SEGMENTS || entries_start + count * WAL_SEGMENT_ENTRY_SIZE > page_size - 4 {
+    return invalid(format!("{count} entries"));
+  }
+  let next_seq = read_u64(data, table + 8);
+  let covered = read_u64(data, table + 16);
+  let mut entries = Vec::with_capacity(count);
+  for index in 0..count {
+    let offset = entries_start + index * WAL_SEGMENT_ENTRY_SIZE;
+    let segment = WalSegment {
+      seq: read_u64(data, offset),
+      start_page: read_u64(data, offset + 8),
+      page_count: read_u32(data, offset + 16) as u64,
+      sealed: read_u32(data, offset + 20) & 1 != 0,
+      byte_len: read_u64(data, offset + 24),
+    };
+    let previous_seq = entries
+      .last()
+      .map_or(0, |previous: &WalSegment| previous.seq);
+    if segment.seq <= previous_seq
+      || segment.seq >= next_seq.max(1)
+      || segment.start_page < HEADER_SLOT_COUNT
+      || segment.page_count == 0
+      || segment.byte_len > segment.page_count * page_size as u64
+    {
+      return invalid(format!(
+        "entry {index} is {segment:?} (next seq {next_seq})"
+      ));
+    }
+    entries.push(segment);
+  }
+  Ok(WalSegmentTable {
+    next_seq,
+    covered,
+    entries: entries.into(),
+  })
+}
+
+/// Write `table` into a header page from `WAL_SEGMENT_TABLE_OFFSET` on;
+/// returns where it ends (bytes after it up to the footer stay zero).
+fn write_wal_segment_table(buf: &mut [u8], table: &WalSegmentTable) -> usize {
+  let start = WAL_SEGMENT_TABLE_OFFSET;
+  // A reused page buffer may hold a longer table from an earlier header.
+  let table_capacity_end =
+    start + WAL_SEGMENT_TABLE_HEADER_SIZE + MAX_WAL_SEGMENTS * WAL_SEGMENT_ENTRY_SIZE;
+  let zero_end = table_capacity_end.min(buf.len() - 4);
+  buf[start..zero_end].fill(0);
+  write_u32(buf, start, table.entries.len() as u32);
+  write_u32(buf, start + 4, 0);
+  write_u64(buf, start + 8, table.next_seq);
+  write_u64(buf, start + 16, table.covered);
+  let mut offset = start + WAL_SEGMENT_TABLE_HEADER_SIZE;
+  for segment in table.entries.iter() {
+    write_u64(buf, offset, segment.seq);
+    write_u64(buf, offset + 8, segment.start_page);
+    write_u32(buf, offset + 16, segment.page_count as u32);
+    write_u32(buf, offset + 20, u32::from(segment.sealed));
+    write_u64(buf, offset + 24, segment.byte_len);
+    offset += WAL_SEGMENT_ENTRY_SIZE;
+  }
+  offset
 }
 
 /// Read both physical header pages and return the newest valid generation.
@@ -349,8 +445,8 @@ mod tests {
   #[test]
   fn new_headers_are_the_current_salted_format() {
     let header = DbHeaderV1::new(4096, 16);
-    assert_eq!(header.version, VERSION_SINGLE_FILE);
-    assert_eq!(header.min_reader_version, MIN_READER_SINGLE_FILE);
+    assert_eq!(header.version, VERSION_SALTED_WAL);
+    assert_eq!(header.min_reader_version, MIN_READER_SALTED_WAL);
     assert_eq!(header.wal_primary_salt, INITIAL_WAL_SALT);
     assert_ne!(header.wal_primary_salt, 0);
     assert!(header.check_supported(true).is_ok());
