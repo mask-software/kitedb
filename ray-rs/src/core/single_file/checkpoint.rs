@@ -5035,3 +5035,8 @@ mod b4_checkpoint_segments_tests;
 #[cfg(test)]
 #[path = "review_seg_tests.rs"]
 mod review_seg_tests;
+
+/// Second review pass: failing tests for bugs the fixes introduced.
+#[cfg(test)]
+#[path = "review_seg2_tests.rs"]
+mod review_seg2_tests;
