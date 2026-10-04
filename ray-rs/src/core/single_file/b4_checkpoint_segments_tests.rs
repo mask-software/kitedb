@@ -1128,6 +1128,43 @@ fn a_panic_in_a_callers_background_checkpoint_refuses_writes() {
   );
 }
 
+/// The other side of R9: a panic of the caller's own, outside the
+/// database's write sections, leaves the handle writable, though the
+/// transaction it drops rolls back while unwinding, and a destructor
+/// commits while unwinding (taking the write sections then).
+#[test]
+fn a_callers_own_panic_leaves_writes_allowed() {
+  struct CommitOnDrop<'db>(&'db SingleFileDB, String);
+  impl Drop for CommitOnDrop<'_> {
+    fn drop(&mut self) {
+      commit_key(self.0, &self.1).expect("a commit while unwinding");
+    }
+  }
+  let dir = tempdir().expect("tempdir");
+  let path = dir.path().join("caller-panic.kitedb");
+  let db = open_single_file(&path, spilling_options()).expect("open");
+  let mut acked = commit_keys(&db, "a", 0, 10);
+  let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let _commit = CommitOnDrop(&db, key("on-unwind", 0));
+    let _tx = db.begin_guard(false).expect("begin");
+    db.create_node(Some(&key("dropped", 0))).expect("node");
+    panic!("the caller's own panic");
+  }));
+  assert!(caught.is_err());
+  acked.push(key("on-unwind", 0));
+  assert!(!db.has_transaction(), "the guard did not roll back");
+  assert!(db.node_by_key(&key("dropped", 0)).is_none());
+  acked.extend(commit_keys(&db, "b", 0, 400));
+  assert_eq!(acked.len(), 411, "commits after the caller's panic failed");
+  assert!(wal_segment_test_stats(&db).live > 0, "setup: no spill");
+  db.checkpoint()
+    .expect("a checkpoint after the caller's panic");
+  close_single_file(db).expect("close");
+  let reopened = open_single_file(&path, spilling_options()).expect("reopen");
+  assert!(missing(&reopened, &acked).is_empty());
+  assert!(reopened.node_by_key(&key("dropped", 0)).is_none());
+}
+
 /// Review finding 8(a). A rollback succeeds even when the WAL and its
 /// segments are full: its ROLLBACK record is not needed (recovery drops a
 /// transaction without a COMMIT record), so it never waits or fails for log
