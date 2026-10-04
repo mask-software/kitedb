@@ -81,7 +81,11 @@ fn apply(image: &mut Vec<u8>, offset: u64, data: &[u8]) {
 /// write so far landed, in order; and the writes before the last successful
 /// sync landed but after it only the header pages' (below `header_end`).
 /// Two images per point, in that order.
-fn crash_images(base: &[u8], events: &[IoEvent], header_end: u64) -> Vec<(String, Vec<u8>)> {
+pub(super) fn crash_images(
+  base: &[u8],
+  events: &[IoEvent],
+  header_end: u64,
+) -> Vec<(String, Vec<u8>)> {
   let mut images = Vec::new();
   for cut in 0..=events.len() {
     let prefix = &events[..cut];
@@ -1294,14 +1298,14 @@ fn a_successful_checkpoint_ends_the_back_off(
   name: &str,
   checkpoint: impl Fn(&SingleFileDB) -> Result<()>,
 ) {
-  use super::super::checkpoint_thread::set_checkpoint_test_first_backoff;
+  use super::super::checkpoint_thread::set_checkpoint_test_backoff;
   let dir = tempdir().expect("tempdir");
   let path = dir.path().join(format!("back-off-{name}.kitedb"));
   let db = open_single_file(&path, options().sync_mode(SyncMode::Normal)).expect("open");
   // One spill reaches the limit, far below the checkpoint trigger: only
   // writers waiting for space ask for checkpoints.
   set_wal_segment_test_limit(&db, 1);
-  set_checkpoint_test_first_backoff(&db, Duration::from_secs(60));
+  set_checkpoint_test_backoff(&db, Duration::from_secs(60), Duration::from_secs(60));
   set_checkpoint_test_db_fault(&db, CheckpointPhase::SnapshotWritten, true);
   let mut acked = Vec::new();
   let mut failure = None;

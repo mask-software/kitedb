@@ -5060,3 +5060,9 @@ mod review_seg_tests;
 #[cfg(test)]
 #[path = "review_seg2_tests.rs"]
 mod review_seg2_tests;
+
+/// raydb-b4 `checkpoint-segments`: a seeded randomized model test of WAL
+/// segments and checkpoints against an oracle of acknowledged commits.
+#[cfg(test)]
+#[path = "b4_checkpoint_model_tests.rs"]
+mod b4_checkpoint_model_tests;

@@ -42,35 +42,37 @@ pub(crate) const CHECKPOINT_THREAD_NAME: &str = "kitedb-checkpoint";
 const FIRST_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
-/// The first back-off of the checkpoint threads of the databases at these
-/// paths, set by tests (`set_checkpoint_test_first_backoff`).
+/// The first and the longest back-off of the checkpoint threads of the
+/// databases at these paths, set by tests (`set_checkpoint_test_backoff`).
 #[cfg(test)]
-static TEST_FIRST_BACKOFF: std::sync::Mutex<Vec<(std::path::PathBuf, Duration)>> =
+static TEST_BACKOFF: std::sync::Mutex<Vec<(std::path::PathBuf, Duration, Duration)>> =
   std::sync::Mutex::new(Vec::new());
 
-/// Make the first back-off of `db`'s checkpoint thread `wait`.
+/// Make the back-off of `db`'s checkpoint thread start at `first` and
+/// double up to `max`.
 #[cfg(test)]
-pub(crate) fn set_checkpoint_test_first_backoff(db: &SingleFileDB, wait: Duration) {
-  TEST_FIRST_BACKOFF
+pub(crate) fn set_checkpoint_test_backoff(db: &SingleFileDB, first: Duration, max: Duration) {
+  TEST_BACKOFF
     .lock()
-    .expect("test first backoff lock")
-    .push((db.path().to_path_buf(), wait));
+    .expect("test backoff lock")
+    .push((db.path().to_path_buf(), first, max));
 }
 
-/// The first wait after a failed run of `db`'s checkpoint thread.
-fn first_backoff(db: &SingleFileDB) -> Duration {
+/// The first and the longest wait after a failed run of `db`'s checkpoint
+/// thread.
+fn backoff_bounds(db: &SingleFileDB) -> (Duration, Duration) {
   #[cfg(test)]
-  if let Some((_, wait)) = TEST_FIRST_BACKOFF
+  if let Some((_, first, max)) = TEST_BACKOFF
     .lock()
-    .expect("test first backoff lock")
+    .expect("test backoff lock")
     .iter()
     .rev()
-    .find(|(path, _)| path == db.path())
+    .find(|(path, _, _)| path == db.path())
   {
-    return *wait;
+    return (*first, *max);
   }
   let _ = db;
-  FIRST_BACKOFF
+  (FIRST_BACKOFF, MAX_BACKOFF)
 }
 
 thread_local! {
@@ -339,8 +341,8 @@ fn run_checkpoint_thread(db: SingleFileDB, signal: Arc<CheckpointSignal>) {
     db.notify_segment_waiters();
     backoff = match (&result, backoff) {
       (Ok(()), _) | (Err(KiteError::CheckpointDeclined(_)), _) => None,
-      (Err(_), None) => Some(first_backoff(&db)),
-      (Err(_), Some(wait)) => Some((wait * 2).min(MAX_BACKOFF)),
+      (Err(_), None) => Some(backoff_bounds(&db).0),
+      (Err(_), Some(wait)) => Some((wait * 2).min(backoff_bounds(&db).1)),
     };
   }
 }
