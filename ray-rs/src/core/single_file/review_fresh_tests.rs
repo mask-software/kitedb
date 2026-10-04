@@ -346,20 +346,33 @@ fn fresh_inline_auto_checkpoint_failures_are_not_recorded_or_backed_off() {
 /// (about an hour of a persistent failure), and so do runs abandoned by
 /// closes, one a session; without the thread (`checkpoint_thread(false)`,
 /// and on wasm32) 64 failing commits do it at once (see F2).
+///
+/// (Setup changed with the fix, which unseals the segment a failed run's
+/// cut sealed: a failed cut then takes no table entry, so a commit before
+/// each run no longer fills the table. With the smallest extents (one and a
+/// half WALs), each round commits more than an extent holds instead, so each
+/// takes an entry of its own while every checkpoint fails, with the byte
+/// limit lifted: the table fills all the same, the last entry by a failed
+/// cut, and a full table is what wedged background checkpoints.
+/// `fresh_failed_cuts_take_no_table_entries` pins the unsealing.)
 #[test]
 fn fresh_failed_cuts_fill_the_segment_table_and_wedge_background_checkpoints() {
   let dir = tempdir().expect("tempdir");
   let path = dir.path().join("wedged-table.kitedb");
   let options = SingleFileOpenOptions::new()
     .wal_size(SMALL_WAL)
-    .sync_mode(SyncMode::Normal);
+    .sync_mode(SyncMode::Normal)
+    .wal_segment_size(1);
   let db = open_single_file(&path, options.clone()).expect("open");
 
-  // A transient failure: 64 background checkpoints fail after their cuts.
+  // A transient failure: the background checkpoints fail after their cuts,
+  // until the table is full.
+  set_wal_segment_test_limit(&db, u64::MAX / 4);
   set_checkpoint_test_db_fault(&db, CheckpointPhase::SnapshotDurable, true);
   let mut index = 0;
   while wal_segment_test_stats(&db).live < crate::constants::MAX_WAL_SEGMENTS && index < 200 {
-    commit_key(&db, &key("pre", index)).expect("commit");
+    // About 120 KiB: more than an extent (one and a half WALs) holds.
+    let _ = big_transaction(&db, &format!("pre{index}"), 0, 400, true);
     assert!(
       db.background_checkpoint().is_err(),
       "the fault did not fire"
@@ -412,6 +425,51 @@ fn fresh_failed_cuts_fill_the_segment_table_and_wedge_background_checkpoints() {
     stats.live,
     stats.covered
   );
+}
+
+/// F3, its other half: a background checkpoint whose run fails after its
+/// cut leaves the segment table as it found it. Its cut sealed the newest
+/// segment (so its snapshot would cover whole segments); with no install
+/// coming, the seal is undone, and the next spill fills that segment rather
+/// than taking a new entry. A hundred failed runs, a commit before each,
+/// leave one segment, not a full table.
+#[test]
+fn fresh_failed_cuts_take_no_table_entries() {
+  let dir = tempdir().expect("tempdir");
+  let path = dir.path().join("failed-cuts.kitedb");
+  let options = SingleFileOpenOptions::new()
+    .wal_size(SMALL_WAL)
+    .sync_mode(SyncMode::Normal)
+    .auto_checkpoint(false);
+  let db = open_single_file(&path, options.clone()).expect("open");
+  set_checkpoint_test_db_fault(&db, CheckpointPhase::SnapshotDurable, true);
+  let mut acked = Vec::new();
+  for index in 0..100 {
+    let key = key("pre", index);
+    if commit_key(&db, &key).is_ok() {
+      acked.push(key);
+    }
+    let run = db.background_checkpoint();
+    assert!(
+      run.is_err(),
+      "run {index} did not fail ({run:?}): it found nothing to cut, with segments {:?}",
+      wal_segment_test_stats(&db)
+    );
+  }
+  clear_checkpoint_test_db_faults(&db);
+  let stats = wal_segment_test_stats(&db);
+  assert_eq!(acked.len(), 100, "commits failed while the runs did");
+  assert_eq!(
+    stats.live, 1,
+    "100 failed runs left {} segments (each failed cut sealed one)",
+    stats.live
+  );
+  // The segment holds every commit, in order: a reopen replays them.
+  close_single_file(db).expect("close");
+  let reopened = open_single_file(&path, options).expect("reopen");
+  for key in &acked {
+    assert!(reopened.node_by_key(key).is_some(), "{key} lost");
+  }
 }
 
 /// Probe (unguarded invariants 2 and 8 of the test review): a transaction
