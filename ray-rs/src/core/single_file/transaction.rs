@@ -56,6 +56,7 @@ use std::thread::ThreadId;
 #[cfg(feature = "bench-profile")]
 use std::time::Instant;
 
+use super::checkpoint::{checkpoint_phase, CheckpointPhase};
 use super::commit_profile::{self as prof, Stage};
 use super::mvcc_history::{record_commit, HistoryPlan};
 use super::open::SyncMode;
@@ -2115,10 +2116,21 @@ impl SingleFileDB {
         // others wait for the next round.
         if staged.is_empty() && wal.is_empty() {
           let mut header = self.header.write();
-          if self.can_spill(&header) {
+          let unneeded = self.unneeded_wal_segments(&header, false);
+          if self.can_spill(&header, &unneeded) {
             self.unstage_newest_in_mvcc(checked.len());
             queue.extend(checked.drain(..));
-            match self.spill_wal(&mut pager, &mut wal, &mut header, &request.records, false) {
+            let spilled =
+              checkpoint_phase(&self.path, CheckpointPhase::SpillDecided).and_then(|()| {
+                self.spill_wal(
+                  &mut pager,
+                  &mut wal,
+                  &mut header,
+                  &request.records,
+                  &unneeded,
+                )
+              });
+            match spilled {
               Ok(()) => {
                 round.durable_in_segment = true;
                 staged.push((index, request));
@@ -2142,8 +2154,11 @@ impl SingleFileDB {
         // into a WAL segment, and retry in the next round; if the segments
         // are full, a checkpoint makes room first.
         let mut header = self.header.write();
-        if self.can_spill(&header) {
-          match self.spill_wal(&mut pager, &mut wal, &mut header, &[], false) {
+        let unneeded = self.unneeded_wal_segments(&header, false);
+        if self.can_spill(&header, &unneeded) {
+          let spilled = checkpoint_phase(&self.path, CheckpointPhase::SpillDecided)
+            .and_then(|()| self.spill_wal(&mut pager, &mut wal, &mut header, &[], &unneeded));
+          match spilled {
             Ok(()) => queue.push_back((index, request)),
             Err(error) => outcomes[index] = Some(CommitOutcome::failed(error)),
           }

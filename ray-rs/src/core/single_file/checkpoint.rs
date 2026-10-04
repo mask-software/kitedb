@@ -1133,17 +1133,19 @@ impl SingleFileDB {
     let mut wal_buffer = self.wal_buffer.lock();
     let mut header = self.header.write();
     let covered_before = header.wal_segments.covered;
+    // The segments the cut's spill, or its header, drops (no other
+    // checkpoint runs: this one holds the status).
+    let unneeded = self.unneeded_wal_segments(&header, true);
     if !wal_buffer.is_empty() {
-      let unneeded = self.unneeded_wal_segments(&header, true).len();
-      let entries = header.wal_segments.entries.len() - unneeded;
+      let entries = header.wal_segments.entries.len() - unneeded.len();
       let may_spill = !Self::spill_needs_new_segment(&header, wal_buffer.used())
         || entries < MAX_WAL_SEGMENTS - 1
         || (entries < MAX_WAL_SEGMENTS && self.oldest_pinned_segment().is_none());
       if !may_spill {
-        self.drop_unneeded_wal_segments(&mut pager, &mut header)?;
+        self.drop_unneeded_wal_segments(&mut pager, &mut header, &unneeded)?;
         return Ok(None);
       }
-      self.spill_wal(&mut pager, &mut wal_buffer, &mut header, &[], true)?;
+      self.spill_wal(&mut pager, &mut wal_buffer, &mut header, &[], &unneeded)?;
     }
     Self::seal_newest_wal_segment(&mut header);
     let newest = header
@@ -1152,7 +1154,9 @@ impl SingleFileDB {
       .last()
       .map(|segment| segment.seq);
     let Some(covered) = newest.filter(|&newest| newest > header.wal_segments.covered) else {
-      self.drop_unneeded_wal_segments(&mut pager, &mut header)?;
+      // The spill (if any) dropped them already.
+      let unneeded = self.unneeded_wal_segments(&header, true);
+      self.drop_unneeded_wal_segments(&mut pager, &mut header, &unneeded)?;
       return Ok(None);
     };
     let keep_from = self.wal_segments_needed_after(covered);
@@ -1537,7 +1541,7 @@ impl SingleFileDB {
     let mut asked: Option<(u64, u64)> = None;
     let mut wait = self.segment_space_wait.lock();
     loop {
-      if self.can_spill(&self.header.read()) {
+      if self.has_segment_space() {
         return Ok(());
       }
       if let Some(error) = self.checkpoint_error() {
@@ -1588,7 +1592,7 @@ impl SingleFileDB {
     }
     let _waiting = SegmentWaiter::new(self);
     loop {
-      if self.can_spill(&self.header.read()) {
+      if self.has_segment_space() {
         return Ok(());
       }
       if self.segments_full_of_pinned() {
@@ -1604,9 +1608,7 @@ impl SingleFileDB {
           return Err(KiteError::CheckpointFailed(error.to_string()));
         }
       }
-      if self.wal_segment_frees.load(Ordering::Acquire) == frees
-        && !self.can_spill(&self.header.read())
-      {
+      if self.wal_segment_frees.load(Ordering::Acquire) == frees && !self.has_segment_space() {
         eprintln!(
           "Warning: the checkpoint a writer ran freed no WAL segment space; the write fails"
         );

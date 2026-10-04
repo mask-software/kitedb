@@ -311,13 +311,14 @@ impl SingleFileDB {
 
   /// Whether the WAL may spill now: the segments are under their limit, with
   /// room in the table (one entry stays free for a checkpoint's cut, which
-  /// spills whatever the limit). Segments a spill would drop as unneeded
-  /// (`unneeded_wal_segments`) do not count.
-  pub(crate) fn can_spill(&self, header: &DbHeaderV1) -> bool {
+  /// spills whatever the limit). `unneeded` (`unneeded_wal_segments`) do not
+  /// count: a spill drops them. A caller that spills on this answer hands the
+  /// spill the same `unneeded`, under the same hold of the commit lock and
+  /// the header lock, so the spill does what the decision counted on.
+  pub(crate) fn can_spill(&self, header: &DbHeaderV1, unneeded: &[WalSegment]) -> bool {
     if self.read_only {
       return false;
     }
-    let unneeded = self.unneeded_wal_segments(header, false);
     let (entries, bytes) = header
       .wal_segments
       .entries
@@ -327,6 +328,14 @@ impl SingleFileDB {
         (entries + 1, bytes.saturating_add(segment.byte_len))
       });
     entries < MAX_WAL_SEGMENTS - 1 && bytes < self.wal_segment_limit(header)
+  }
+
+  /// Whether a writer could spill now (`can_spill`, counting out the
+  /// segments a spill now would drop).
+  pub(crate) fn has_segment_space(&self) -> bool {
+    let header = self.header.read();
+    let unneeded = self.unneeded_wal_segments(&header, false);
+    self.can_spill(&header, &unneeded)
   }
 
   /// The oldest WAL segment an open write transaction holds records in: no
@@ -396,13 +405,15 @@ impl SingleFileDB {
   /// Spill: move the WAL's records, then `extra` (whole unsalted records
   /// that follow them in the log: a commit or a transaction's records that
   /// do not fit in the WAL at all), to the end of the WAL segment log, and
-  /// empty the WAL. Segments nothing needs any more (`unneeded_wal_segments`;
-  /// `for_cut`: the spill is a checkpoint's cut) leave the table in the same
-  /// header, and are freed once it is durable. Callers checked `can_spill` (a
+  /// empty the WAL. `unneeded`, the segments nothing needs any more as the
+  /// caller's decision to spill counted them (`unneeded_wal_segments`, under
+  /// the same hold of the locks), leave the table in the same header, and
+  /// are freed once it is durable. Callers checked `can_spill` (a
   /// checkpoint's cut spills whatever the limit), and hold the commit lock
   /// (`lock_commits`) and the pager, the WAL and the header locked, in that
-  /// order. Fails with `WalBufferFull`, changing nothing, if the records need
-  /// a new segment and the table has no room.
+  /// order: no checkpoint can cut meanwhile, so none reads `unneeded`. Fails
+  /// with `WalBufferFull`, changing nothing, if the records need a new
+  /// segment and the table has no room.
   ///
   /// On error nothing a header names has changed: the WAL keeps its records
   /// (its positions restored if only the header install failed), and a new
@@ -413,7 +424,7 @@ impl SingleFileDB {
     wal: &mut WalBuffer,
     header: &mut DbHeaderV1,
     extra: &[u8],
-    for_cut: bool,
+    unneeded: &[WalSegment],
   ) -> Result<()> {
     // A writable open leaves the WAL in the primary region alone.
     debug_assert!(wal.active_region() == 0 && !wal.is_primary_retired());
@@ -438,7 +449,6 @@ impl SingleFileDB {
     let length = bytes.len() as u64;
 
     // Append to the open extent if the records fit, else start one.
-    let unneeded = self.unneeded_wal_segments(header, for_cut);
     let mut entries: Vec<WalSegment> = header
       .wal_segments
       .entries
@@ -509,7 +519,7 @@ impl SingleFileDB {
     }
     // Both slots name the new table: no fallback reaches the dropped ones.
     if !unneeded.is_empty() {
-      Self::free_wal_segments(pager, &unneeded);
+      Self::free_wal_segments(pager, unneeded);
       self.note_wal_segments_freed();
     }
     self
@@ -519,16 +529,17 @@ impl SingleFileDB {
     Ok(())
   }
 
-  /// Drop the segments nothing needs any more (`unneeded_wal_segments`)
-  /// from the table, durably in both header slots, then free them. For a
-  /// checkpoint's cut that has nothing to spill or to cover; callers hold
-  /// what `spill_wal`'s do. Returns whether it dropped any.
+  /// Drop `unneeded`, the segments nothing needs any more
+  /// (`unneeded_wal_segments`), from the table, durably in both header
+  /// slots, then free them. For a checkpoint's cut that has nothing to spill
+  /// or to cover; callers hold what `spill_wal`'s do. Returns whether it
+  /// dropped any.
   pub(crate) fn drop_unneeded_wal_segments(
     &self,
     pager: &mut FilePager,
     header: &mut DbHeaderV1,
+    unneeded: &[WalSegment],
   ) -> Result<bool> {
-    let unneeded = self.unneeded_wal_segments(header, true);
     if unneeded.is_empty() {
       return Ok(false);
     }
@@ -549,7 +560,7 @@ impl SingleFileDB {
       restore_header(header, prior_header);
       return Err(error);
     }
-    Self::free_wal_segments(pager, &unneeded);
+    Self::free_wal_segments(pager, unneeded);
     self.note_wal_segments_freed();
     Ok(true)
   }
@@ -625,15 +636,16 @@ impl SingleFileDB {
       // Another writer made room meanwhile.
       return Ok(SpillOutcome::Spilled);
     }
-    if !self.can_spill(&header) {
+    let unneeded = self.unneeded_wal_segments(&header, false);
+    if !self.can_spill(&header, &unneeded) {
       return Ok(SpillOutcome::Full);
     }
     checkpoint_phase(&self.path, CheckpointPhase::SpillDecided)?;
     if !wal.is_empty() {
-      self.spill_wal(&mut pager, &mut wal, &mut header, &[], false)?;
+      self.spill_wal(&mut pager, &mut wal, &mut header, &[], &unneeded)?;
       return Ok(SpillOutcome::Spilled);
     }
-    self.spill_wal(&mut pager, &mut wal, &mut header, records, false)?;
+    self.spill_wal(&mut pager, &mut wal, &mut header, records, &unneeded)?;
     then();
     if let Some(last) = header.wal_segments.entries.last() {
       self.note_spilled_transactions(last.seq);
