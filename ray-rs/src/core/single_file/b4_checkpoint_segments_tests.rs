@@ -906,6 +906,7 @@ fn checkpoint_trigger_and_segment_limit_follow_the_log_options() {
     options().checkpoint_log_ratio(-1.0),
     options().checkpoint_log_budget(0),
     options().wal_segment_size(0),
+    options().wal_segment_size(crate::constants::WAL_SEGMENT_MAX_SIZE + 1),
     options().wal_segment_limit(0),
   ] {
     assert!(open_single_file(dir.path().join("refused.kitedb"), refused).is_err());

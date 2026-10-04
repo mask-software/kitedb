@@ -350,7 +350,7 @@ pub struct SingleFileInner {
   pub(crate) active_transactions: AtomicUsize,
   /// Write transactions that wrote a BEGIN record and have not finished
   /// commit/rollback. A spill notes those it moves records of into a WAL
-  /// segment (`spilled_open_txids`).
+  /// segment (`spilled_txids`).
   pub(crate) open_write_txids: Mutex<HashSet<TxId>>,
 
   /// Read permits cover transaction creation; the blocking checkpoint takes
@@ -454,10 +454,15 @@ pub struct SingleFileInner {
   pub(crate) wal_segment_limit_bytes: AtomicU64,
   /// Spills of the WAL into WAL segments so far.
   pub(crate) wal_spills: AtomicU64,
-  /// Write transactions still open with records in a WAL segment, each with
-  /// the seq of the oldest segment holding one: a checkpoint keeps that
-  /// segment and every later one, so the transaction can still commit.
-  pub(crate) spilled_open_txids: Mutex<HashMap<TxId, u64>>,
+  /// Write transactions with records in a WAL segment that the snapshot does
+  /// not cover: open, or committed after the last checkpoint's cut. A
+  /// checkpoint keeps the oldest segment holding a record of one and every
+  /// later segment, so the transaction stays whole in the log.
+  pub(crate) spilled_txids: Mutex<HashMap<TxId, segments::SpilledTransaction>>,
+  /// Counts releases of WAL segment space (an install or a spill dropping
+  /// segments), so a writer waiting for space can tell a checkpoint that
+  /// freed nothing (see `wait_for_segment_space`).
+  pub(crate) wal_segment_frees: AtomicU64,
 
   /// Synchronization mode for WAL writes
   pub(crate) sync_mode: open::SyncMode,
@@ -628,7 +633,8 @@ impl SingleFileDB {
   pub(crate) fn transaction_finished(&self, txid: TxId, wrote_begin: bool) {
     if wrote_begin {
       self.open_write_txids.lock().remove(&txid);
-      self.spilled_open_txids.lock().remove(&txid);
+      // It ended without a COMMIT record: recovery drops its records.
+      self.spilled_txids.lock().remove(&txid);
     }
     let previous = self.active_transactions.fetch_sub(1, Ordering::AcqRel);
     debug_assert!(previous > 0, "active transaction count underflow");

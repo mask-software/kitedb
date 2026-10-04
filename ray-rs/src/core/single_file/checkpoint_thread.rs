@@ -7,9 +7,10 @@
 //! off, or on wasm32, where the auto-checkpoint runs inline as before). It
 //! holds a handle to the database (`SingleFileDB::shared_handle`) and sleeps
 //! until a commit asks for a checkpoint; it runs one, records its error if
-//! it fails (`SingleFileDB::checkpoint_error`), and after a failure waits
-//! before running another (doubling from one second to a minute) instead of
-//! failing in a loop.
+//! it fails (`SingleFileDB::checkpoint_error`; a panic in a run is caught and
+//! recorded too, and the thread goes on), and after a failure waits before
+//! running another (doubling from one second to a minute, however often it
+//! is asked meanwhile) instead of failing in a loop.
 //!
 //! Closing (or dropping) the database stops it: a run still building its
 //! snapshot stops at its next progress point (nothing names the pages it
@@ -22,7 +23,7 @@
 use std::cell::Cell;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
 
@@ -83,12 +84,31 @@ impl SingleFileDB {
   }
 
   /// Ask the checkpoint thread for a checkpoint, starting it if it is not
-  /// running. Returns whether the thread took the request (false once the
-  /// database is closing, or if the thread cannot start).
-  pub(crate) fn request_background_checkpoint(&self) -> bool {
+  /// running (or starting it again if it ended unexpectedly). Returns the
+  /// request's number (see `checkpoint_request_answered`), or `None` once the
+  /// database is closing or if the thread cannot start.
+  pub(crate) fn request_background_checkpoint(&self) -> Option<u64> {
     let mut thread = self.checkpoint_thread.lock();
     if self.checkpoint_thread_stopped.load(Ordering::Acquire) {
-      return false;
+      return None;
+    }
+    if thread
+      .as_ref()
+      .is_some_and(|thread| thread.handle.is_finished())
+    {
+      // Only a stop ends the thread's loop, and a run's panic is caught; a
+      // thread gone otherwise would leave every request unanswered.
+      // (Recorded without waking the writers waiting for segment space: one
+      // of them may be the caller, holding their lock.)
+      if let Some(ended) = thread.take() {
+        let panicked = ended.handle.join().is_err();
+        let error = format!(
+          "the checkpoint thread ended unexpectedly{}; started it again",
+          if panicked { " (it panicked)" } else { "" }
+        );
+        eprintln!("Warning: {error}");
+        *self.checkpoint_last_error.lock() = Some(error);
+      }
     }
     if thread.is_none() {
       let signal = Arc::new(CheckpointSignal::default());
@@ -101,7 +121,7 @@ impl SingleFileDB {
         Ok(handle) => *thread = Some(CheckpointThread { signal, handle }),
         Err(error) => {
           eprintln!("Warning: could not start the checkpoint thread: {error}");
-          return false;
+          return None;
         }
       }
     }
@@ -110,7 +130,19 @@ impl SingleFileDB {
     requests.checkpoint = true;
     requests.asked += 1;
     signal.wake.notify_all();
-    true
+    Some(requests.asked)
+  }
+
+  /// Whether a run that started after request `ticket` (see
+  /// `request_background_checkpoint`) has ended, or the thread has.
+  pub(crate) fn checkpoint_request_answered(&self, ticket: u64) -> bool {
+    match self.checkpoint_thread.lock().as_ref() {
+      Some(thread) => {
+        let requests = thread.signal.requests.lock();
+        requests.answered >= ticket || requests.stop
+      }
+      None => true,
+    }
   }
 
   /// Wait until the checkpoint thread has answered every request made so
@@ -192,9 +224,11 @@ fn run_checkpoint_thread(db: SingleFileDB, signal: Arc<CheckpointSignal>) {
     {
       let mut requests = signal.requests.lock();
       if let Some(wait) = backoff {
-        // After a failure: wait out the backoff (or the close) first.
-        if !requests.stop {
-          signal.wake.wait_for(&mut requests, wait);
+        // After a failure: wait out the back-off, however often a commit asks
+        // meanwhile; only a close ends it early.
+        let until = Instant::now() + wait;
+        while !requests.stop && Instant::now() < until {
+          signal.wake.wait_until(&mut requests, until);
         }
       }
       while !requests.checkpoint && !requests.stop {
@@ -206,13 +240,28 @@ fn run_checkpoint_thread(db: SingleFileDB, signal: Arc<CheckpointSignal>) {
       requests.checkpoint = false;
     }
     let asked = signal.requests.lock().asked;
-    let result = db.run_auto_checkpoint();
+    // A panic in a run is a failure like any other: recorded, and retried
+    // after the back-off. The run's guards have returned the checkpoint
+    // status to idle by then.
+    let result =
+      std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| db.run_auto_checkpoint()))
+        .unwrap_or_else(|panic| {
+          let message = panic
+            .downcast_ref::<&str>()
+            .map(|message| message.to_string())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "no message".to_string());
+          Err(KiteError::Internal(format!(
+            "the checkpoint thread's run panicked: {message}"
+          )))
+        });
     db.record_checkpoint_result(&result);
     {
       let mut requests = signal.requests.lock();
       requests.answered = requests.answered.max(asked);
       signal.wake.notify_all();
     }
+    db.notify_segment_waiters();
     backoff = match (&result, backoff) {
       (Ok(()), _) | (Err(KiteError::CheckpointDeclined(_)), _) => None,
       (Err(_), None) => Some(FIRST_BACKOFF),

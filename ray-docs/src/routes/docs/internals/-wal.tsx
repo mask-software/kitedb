@@ -797,15 +797,20 @@ export function WALPage() {
 					<code>resizeWal</code> is waiting for the writer's own transaction to
 					finish.
 				</li>
+				<li>The checkpoint the writer waited for freed no segment space.</li>
 			</ul>
 			<p>
 				While the last automatic checkpoint failed, a writer at the limit fails
 				instead of waiting, with{" "}
 				<code>Checkpoint failed, and the WAL segments are full: ...</code> (
 				<code>CheckpointFailed</code>; Python raises{" "}
-				<code>CheckpointError</code>, a <code>KiteError</code> subclass).{" "}
+				<code>CheckpointError</code>, a <code>KiteError</code> subclass), and
+				asks for another checkpoint, which the thread runs after its back-off.{" "}
 				<code>checkpointError()</code> (<code>checkpoint_error()</code> in
-				Python) returns the checkpoint's error.
+				Python) returns the checkpoint's error. A panic in a checkpoint run is
+				reported the same way, and the thread goes on. A rollback never waits or
+				fails for log space: its record is not needed, since recovery drops a
+				transaction without a commit record.
 			</p>
 
 			<h2 id="next">Next steps</h2>

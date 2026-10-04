@@ -1268,7 +1268,8 @@ impl KiteOptions {
     self
   }
 
-  /// The most log, in megabytes, an automatic checkpoint waits for.
+  /// The most log, in megabytes, an automatic checkpoint waits for (a
+  /// value too large to count in bytes saturates: no cap).
   pub fn checkpoint_log_budget_mb(mut self, megabytes: u64) -> Self {
     self.checkpoint_log_budget = Some(megabytes.saturating_mul(1024 * 1024));
     self

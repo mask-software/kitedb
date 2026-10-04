@@ -15,6 +15,7 @@ use std::cell::RefCell;
 #[cfg(test)]
 use std::sync::{Arc, Barrier, Mutex, OnceLock};
 
+use crate::constants::MAX_WAL_SEGMENTS;
 use crate::core::pager::{pages_to_store, DetachedReader, FilePager};
 use crate::core::snapshot::reader::SnapshotData;
 use crate::core::snapshot::writer::{
@@ -575,11 +576,15 @@ pub(crate) struct LogCut {
   /// The newest WAL segment at the cut, sealed by it: the snapshot holds
   /// every transaction whose COMMIT record lies in a segment up to it.
   pub(crate) covered: u64,
-  /// The oldest WAL segment holding a record of a write transaction open at
-  /// the cut (past `covered` if none): the install keeps it and every later
-  /// one, so a transaction that commits after the cut keeps all its records
-  /// in the log.
+  /// The oldest WAL segment holding a record of a write transaction the
+  /// snapshot does not cover, open at the cut or committed in the WAL after
+  /// it (past `covered` if none): the install keeps it and every later one,
+  /// so such a transaction keeps all its records in the log.
   pub(crate) keep_from: u64,
+  /// The oldest WAL segment holding a record of a transaction the installed
+  /// snapshot does not cover: the replay of the commits up to the cut reads
+  /// the segments from it on.
+  pub(crate) read_from: u64,
 }
 
 /// How far a background checkpoint's post-cut replay has read the log (see
@@ -782,7 +787,7 @@ impl SingleFileDB {
 
     // The installed snapshot holds everything the delta did.
     self.install_loaded_snapshot(loaded, DeltaState::new());
-    self.truncate_orphaned_tail()?;
+    self.truncate_orphaned_tail_after_install();
 
     Ok(())
   }
@@ -1038,7 +1043,7 @@ impl SingleFileDB {
     {
       return;
     }
-    if self.uses_checkpoint_thread() && self.request_background_checkpoint() {
+    if self.uses_checkpoint_thread() && self.request_background_checkpoint().is_some() {
       return;
     }
     let result = if self.background_checkpoint {
@@ -1106,36 +1111,56 @@ impl SingleFileDB {
   /// Cut the log (step 1 of `background_checkpoint`): spill the WAL into a
   /// WAL segment and seal the newest segment, so every record before the cut
   /// lies in a segment up to it, and every later one after it. `None` if the
-  /// log holds nothing the installed snapshot does not: no segment past those
-  /// it covers, and nothing in the WAL.
+  /// log holds nothing the installed snapshot does not cover in a segment
+  /// past it; then the segments nothing needs any more still leave the table.
   ///
-  /// The commit lock holds off commits and spills, so the spilled open
-  /// transactions are exact: every transaction that commits after the cut
-  /// has its earlier records in segments from `keep_from` on. Callers hold
-  /// the checkpoint gate.
+  /// Also `None` when the WAL holds records and spilling them would take the
+  /// last table entry while a write transaction is open with records in
+  /// segments: the installs keep those segments while it is open, and a full
+  /// table would leave no cut able to spill (so to cover its COMMIT record)
+  /// once it ends. Writers fail meanwhile (`segments_full_of_pinned`).
+  ///
+  /// The commit lock holds off commits and spills, so the spilled
+  /// transactions are exact: every transaction the snapshot does not cover
+  /// has its records in segments from `keep_from` on, or in the WAL. Callers
+  /// hold the checkpoint gate.
   fn cut_log(&self) -> Result<Option<LogCut>> {
     let _commit_guard = self.lock_commits();
     let mut pager = self.pager.lock();
     let mut wal_buffer = self.wal_buffer.lock();
     let mut header = self.header.write();
+    let covered_before = header.wal_segments.covered;
     if !wal_buffer.is_empty() {
-      self.spill_wal(&mut pager, &mut wal_buffer, &mut header, &[])?;
+      let unneeded = self.unneeded_wal_segments(&header, true).len();
+      let entries = header.wal_segments.entries.len() - unneeded;
+      let may_spill = !Self::spill_needs_new_segment(&header, wal_buffer.used())
+        || entries < MAX_WAL_SEGMENTS - 1
+        || (entries < MAX_WAL_SEGMENTS && self.oldest_pinned_segment().is_none());
+      if !may_spill {
+        self.drop_unneeded_wal_segments(&mut pager, &mut header)?;
+        return Ok(None);
+      }
+      self.spill_wal(&mut pager, &mut wal_buffer, &mut header, &[], true)?;
     }
     Self::seal_newest_wal_segment(&mut header);
-    let table = &header.wal_segments;
-    let Some(newest) = table.entries.last() else {
+    let newest = header
+      .wal_segments
+      .entries
+      .last()
+      .map(|segment| segment.seq);
+    let Some(covered) = newest.filter(|&newest| newest > header.wal_segments.covered) else {
+      self.drop_unneeded_wal_segments(&mut pager, &mut header)?;
       return Ok(None);
     };
-    if newest.seq <= table.covered {
-      return Ok(None);
-    }
-    let covered = newest.seq;
-    let keep_from = self
-      .oldest_pinned_segment()
-      .map_or(covered + 1, |oldest| oldest.min(covered + 1));
+    let keep_from = self.wal_segments_needed_after(covered);
+    let read_from = self.wal_segments_needed_after(covered_before);
     #[cfg(test)]
     count_checkpoint_test_cut(&self.path);
-    Ok(Some(LogCut { covered, keep_from }))
+    Ok(Some(LogCut {
+      covered,
+      keep_from,
+      read_from,
+    }))
   }
 
   /// The committed state at `cut` (step 2 of `background_checkpoint`): the
@@ -1157,7 +1182,10 @@ impl SingleFileDB {
     };
     let mut records = Vec::new();
     let mut covered_records = 0;
-    for segment in segments.iter().filter(|segment| segment.seq <= cut.covered) {
+    for segment in segments
+      .iter()
+      .filter(|segment| segment.seq >= cut.read_from && segment.seq <= cut.covered)
+    {
       self.checkpoint_progressed()?;
       records.extend(self.read_segment_records(reader.as_ref(), segment, page_size, 0)?);
       if segment.seq <= covered {
@@ -1260,7 +1288,8 @@ impl SingleFileDB {
       )?;
     }
     self.install_loaded_snapshot(loaded, replay.delta);
-    self.truncate_orphaned_tail()
+    self.truncate_orphaned_tail_after_install();
+    Ok(())
   }
 
   /// Read the log after `cut` (the WAL segments from its `keep_from` on,
@@ -1482,50 +1511,87 @@ impl SingleFileDB {
   /// checkpoint run here. A writer waits only while checkpoints fall behind
   /// the writes by the whole segment limit.
   ///
-  /// Fails rather than wait for a checkpoint that cannot come or cannot
-  /// help: with `WalBufferFull` without automatic checkpoints, when open
+  /// Every wait ends: in room, or in an error once waiting cannot help. It
+  /// fails with `WalBufferFull` without automatic checkpoints, when open
   /// write transactions hold records in enough segments to fill them (see
   /// `segments_full_of_pinned`), while a blocking checkpoint, optimize,
   /// vacuum or WAL resize waits for the gate (and so for this writer's
-  /// transaction), or once the database closes; and with `CheckpointFailed`
-  /// while the last automatic checkpoint failed (see `checkpoint_error`).
+  /// transaction), once the database closes, or when a checkpoint asked for
+  /// here freed no segment space; and with `CheckpointFailed` while the last
+  /// automatic checkpoint failed (see `checkpoint_error`), after asking for
+  /// another (which runs after the thread's back-off).
   pub(crate) fn wait_for_segment_space(&self) -> Result<()> {
     if !self.auto_checkpoint || self.read_only {
       return Err(KiteError::WalBufferFull);
     }
+    // An abandoned transaction holds segments until it is rolled back.
+    self.reap_abandoned_transactions();
     if !self.uses_checkpoint_thread() {
       return self.make_segment_space_here();
     }
     let _waiting = SegmentWaiter::new(self);
+    // The request this writer made, and the frees counted when it made it.
+    let mut asked: Option<(u64, u64)> = None;
     let mut wait = self.segment_space_wait.lock();
     loop {
       if self.can_spill(&self.header.read()) {
         return Ok(());
       }
       if let Some(error) = self.checkpoint_error() {
+        self.request_background_checkpoint();
         return Err(KiteError::CheckpointFailed(error));
       }
       if self.segments_full_of_pinned()
         || (self.exclusive_operation_waiting() && !self.is_checkpoint_running())
-        || !self.request_background_checkpoint()
       {
         return Err(KiteError::WalBufferFull);
+      }
+      let frees = self.wal_segment_frees.load(Ordering::Acquire);
+      match asked {
+        None => {
+          let Some(ticket) = self.request_background_checkpoint() else {
+            return Err(KiteError::WalBufferFull);
+          };
+          asked = Some((ticket, frees));
+        }
+        Some((ticket, frees_then))
+          if self.checkpoint_request_answered(ticket) && !self.is_checkpoint_running() =>
+        {
+          if frees == frees_then {
+            eprintln!(
+              "Warning: the checkpoint a writer waited for freed no WAL segment space; the write \
+               fails"
+            );
+            return Err(KiteError::WalBufferFull);
+          }
+          // Freed some, which others may have taken: ask again.
+          asked = None;
+          continue;
+        }
+        Some(_) => {}
       }
       self.segment_space_cv.wait_for(&mut wait, SEGMENT_WAIT_POLL);
     }
   }
 
   /// `wait_for_segment_space` without a checkpoint thread: run a background
-  /// checkpoint here (or wait for the one running), then retry. A blocking
-  /// checkpoint would wait for this writer's own transaction; with
-  /// background checkpoints off, the auto-checkpoint after the write fails
-  /// runs one.
+  /// checkpoint here (or wait for the one running), then retry, as long as
+  /// each frees segment space. A blocking checkpoint would wait for this
+  /// writer's own transaction; with background checkpoints off, the
+  /// auto-checkpoint after the write fails runs one.
   fn make_segment_space_here(&self) -> Result<()> {
     if !self.background_checkpoint {
       return Err(KiteError::WalBufferFull);
     }
     let _waiting = SegmentWaiter::new(self);
     loop {
+      if self.can_spill(&self.header.read()) {
+        return Ok(());
+      }
+      if self.segments_full_of_pinned() {
+        return Err(KiteError::WalBufferFull);
+      }
+      let frees = self.wal_segment_frees.load(Ordering::Acquire);
       match self.run_background_checkpoint() {
         Ok(BackgroundCheckpointOutcome::Done) => {}
         Ok(BackgroundCheckpointOutcome::AlreadyRunning) => self.wait_for_background_checkpoint(),
@@ -1535,50 +1601,55 @@ impl SingleFileDB {
           return Err(KiteError::CheckpointFailed(error.to_string()));
         }
       }
-      if self.can_spill(&self.header.read()) {
-        return Ok(());
-      }
-      if self.segments_full_of_pinned() {
+      if self.wal_segment_frees.load(Ordering::Acquire) == frees
+        && !self.can_spill(&self.header.read())
+      {
+        eprintln!(
+          "Warning: the checkpoint a writer ran freed no WAL segment space; the write fails"
+        );
         return Err(KiteError::WalBufferFull);
       }
     }
   }
 
-  /// Return an append-only page range for a new snapshot. The file may retain
-  /// orphaned pages after a crash; using the physical end keeps those pages
-  /// from being overwritten while the previous header can still reach them.
-  pub(crate) fn snapshot_append_start_page(&self, header: &DbHeaderV1) -> Result<u64> {
-    let pager = self.pager.lock();
+  /// The first page past the end of the file and of every page `header`
+  /// names. The file may retain orphaned pages after a crash; starting past
+  /// the physical end keeps those pages from being overwritten while the
+  /// previous header can still reach them. Callers write there under the
+  /// same hold of the pager lock, or reserve the pages (`reserve_pages`).
+  pub(crate) fn append_start_page(pager: &FilePager, header: &DbHeaderV1) -> u64 {
     let page_size = header.page_size as u64;
     let file_pages = pager.file_size().div_ceil(page_size);
-    Ok(file_pages.max(live_end_page(header)))
+    file_pages.max(live_end_page(header))
   }
 
-  /// Reuse only pages retired after both header slots durably pointed at a
-  /// newer snapshot. Therefore no valid fallback header can name this range;
-  /// a crash while rewriting it still opens either header on the current
-  /// installed snapshot. If no retired range fits, append at physical EOF.
+  /// Reserve the pages of a new snapshot of `snapshot_page_count` pages
+  /// (see `reserve_pages`): the first free range that holds it, else past
+  /// the end of the file and of every page the header names. Only pages
+  /// freed after both header slots durably named a newer state are free, so
+  /// no valid fallback header names them. The pages are taken here, under
+  /// the pager lock: a spill that allocates a WAL segment meanwhile cannot
+  /// take them too.
   fn checkpoint_snapshot_start_page(
     &self,
     header: &DbHeaderV1,
     snapshot_page_count: u64,
   ) -> Result<u64> {
     let mut pager = self.pager.lock();
+    // The installed header now (`header` is the caller's earlier copy): it
+    // names any WAL segment a spill added since.
+    let current = self.header.read();
+    debug_assert_eq!(current.page_size, header.page_size);
+    self.reserve_pages(&mut pager, &current, snapshot_page_count, true)
+  }
 
-    // The header, the WAL, the installed snapshot and the WAL segments are
-    // never free. Should a bookkeeping mistake list any of them, withdraw
-    // them instead of writing this snapshot over pages the installed header
-    // names.
-    self.withdraw_live_pages(&mut pager, header);
-
-    if let Some(start_page) = pager.find_free_range(snapshot_page_count as u32) {
-      pager.consume_free_range(start_page, snapshot_page_count as u32);
-      return Ok(start_page as u64);
+  /// `truncate_orphaned_tail` after an install, which succeeded whatever
+  /// this does: the free pages it leaves are reused, and the next install or
+  /// close drops them.
+  fn truncate_orphaned_tail_after_install(&self) {
+    if let Err(error) = self.truncate_orphaned_tail() {
+      eprintln!("Warning: could not drop the free pages at the end of the file: {error}");
     }
-
-    let page_size = header.page_size as u64;
-    let file_pages = pager.file_size().div_ceil(page_size);
-    Ok(file_pages.max(live_end_page(header)))
   }
 
   /// Drop the free pages at the end of the file, down to the installed
@@ -1690,13 +1761,19 @@ impl SingleFileDB {
       return Err(error);
     }
 
+    // The transactions the snapshot holds no longer keep segments.
+    match log {
+      LogAfterInstall::Empty => self.spilled_txids.lock().clear(),
+      LogAfterInstall::AfterCut(cut) => self.forget_covered_spilled_transactions(cut.covered),
+    }
     // Both slots name `snapshot` and none of the dropped segments. (A test
     // fault here stands for a crash before they are freed: the next open
     // reclaims them.)
-    if !dropped_segments.is_empty()
-      && checkpoint_phase(&self.path, CheckpointPhase::SegmentsReleased).is_ok()
-    {
-      Self::free_wal_segments(pager, &dropped_segments);
+    if !dropped_segments.is_empty() {
+      if checkpoint_phase(&self.path, CheckpointPhase::SegmentsReleased).is_ok() {
+        Self::free_wal_segments(pager, &dropped_segments);
+      }
+      self.note_wal_segments_freed();
     }
 
     // Both slots name `snapshot`, so no fallback can reach the previous

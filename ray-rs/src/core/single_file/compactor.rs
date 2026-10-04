@@ -161,19 +161,30 @@ impl SingleFileDB {
       compression,
     })?;
 
-    let new_snapshot_start_page = self.snapshot_append_start_page(&header)?;
     let new_snapshot_page_count =
       pages_to_store(snapshot_buffer.len(), header.page_size as usize) as u64;
 
-    {
+    let new_snapshot_start_page = {
+      // Taken at the end of the file under the pager lock, like every page
+      // choice (see `reserve_pages`).
       let mut pager = self.pager.lock();
-      self.write_snapshot_pages(
+      let new_snapshot_start_page =
+        self.reserve_pages(&mut pager, &header, new_snapshot_page_count, false)?;
+      if let Err(error) = self.write_snapshot_pages(
         &mut pager,
         new_snapshot_start_page as u32,
         &snapshot_buffer,
         header.page_size as usize,
-      )?;
-    }
+      ) {
+        // No header names them.
+        pager.free_pages(
+          new_snapshot_start_page as u32,
+          new_snapshot_page_count as u32,
+        );
+        return Err(error);
+      }
+      new_snapshot_start_page
+    };
     let snapshot = WrittenSnapshot {
       generation: new_gen,
       start_page: new_snapshot_start_page,
@@ -413,16 +424,18 @@ impl SingleFileDB {
 
       if needs_bridge {
         // Past the file's end and past the compacted snapshot, so it
-        // overlaps neither the installed pages nor anything `layout` names.
-        let bridge_start_page = self
-          .snapshot_append_start_page(&installed)?
-          .max(compacted_end_page);
+        // overlaps neither the installed pages nor anything `layout` names;
+        // chosen and written under one hold of the pager lock, which also
+        // grows the file to hold it.
+        let mut pager = self.pager.lock();
+        let bridge_start_page = Self::append_start_page(&pager, &installed).max(compacted_end_page);
         self.write_snapshot_pages(
-          &mut self.pager.lock(),
+          &mut pager,
           bridge_start_page as u32,
           &snapshot_bytes,
           page_size,
         )?;
+        drop(pager);
         compaction_step("bridge copy written")?;
         layout.snapshot_start_page = bridge_start_page;
         layout.db_size_pages = bridge_start_page + snapshot_page_count;

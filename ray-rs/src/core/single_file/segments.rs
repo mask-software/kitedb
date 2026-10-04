@@ -118,15 +118,32 @@ pub(crate) fn read_wal_segment_records(
   Ok((records, covered_records))
 }
 
+/// Where a spilled transaction's COMMIT record lies while it is in the WAL
+/// (`SpilledTransaction::commit_segment`).
+pub(crate) const COMMITTED_IN_WAL: u64 = u64::MAX;
+
+/// A write transaction with records in a WAL segment, from the spill that
+/// moved its first records there until a checkpoint covers its commit, or it
+/// ends without one (see `SingleFileInner::spilled_txids`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SpilledTransaction {
+  /// The oldest segment holding a record of it.
+  pub(crate) first_segment: u64,
+  /// Where its COMMIT record lies: `None` while it is open; the segment
+  /// holding it once it committed, or `COMMITTED_IN_WAL` until a spill moves
+  /// it there.
+  pub(crate) commit_segment: Option<u64>,
+}
+
 impl SingleFileDB {
-  /// Bytes of a new WAL segment extent: the configured size, and at least
-  /// twice the WAL's primary region, in whole pages.
+  /// Pages of a new WAL segment extent: the configured size, and at least one
+  /// and a half WALs and `record_bytes`, in whole pages.
   fn wal_segment_extent_pages(&self, header: &DbHeaderV1, record_bytes: u64) -> u64 {
     let page_size = header.page_size as u64;
-    let wal_bytes = header.wal_page_count * page_size;
+    let wal_bytes = header.wal_page_count.saturating_mul(page_size);
     let extent = self
       .wal_segment_size
-      .max(wal_bytes * 3 / 2)
+      .max(wal_bytes.saturating_mul(3) / 2)
       .max(record_bytes);
     extent.div_ceil(page_size)
   }
@@ -135,11 +152,17 @@ impl SingleFileDB {
   /// `checkpoint_log_ratio` of the snapshot's size, at least four WALs (so a
   /// small database does not checkpoint at every spill), and at most the log
   /// budget, which bounds the memory the delta replaying the log takes
-  /// (about ten times its size) on a large database.
+  /// (about ten times its size) on a large database. A budget too large to
+  /// compute with saturates: no cap.
   pub(crate) fn checkpoint_log_trigger(&self, header: &DbHeaderV1) -> u64 {
     let page_size = header.page_size as u64;
-    let floor = (4 * header.wal_page_count * page_size).min(self.checkpoint_log_budget);
-    let snapshot = header.snapshot_page_count * page_size;
+    let floor = header
+      .wal_page_count
+      .saturating_mul(page_size)
+      .saturating_mul(4)
+      .min(self.checkpoint_log_budget);
+    let snapshot = header.snapshot_page_count.saturating_mul(page_size);
+    // Saturates at u64::MAX.
     let wanted = (self.checkpoint_log_ratio * snapshot as f64) as u64;
     wanted.clamp(floor, self.checkpoint_log_budget.max(floor))
   }
@@ -155,12 +178,15 @@ impl SingleFileDB {
     if explicit > 0 {
       return explicit;
     }
-    let wal = header.wal_page_count * header.page_size as u64;
+    let wal = header
+      .wal_page_count
+      .saturating_mul(header.page_size as u64);
     // The trigger is at most the budget, so this is at least twice it.
     let trigger = self.checkpoint_log_trigger(header);
-    (2 * trigger)
-      .max(16 * wal)
-      .min(4 * self.checkpoint_log_budget)
+    trigger
+      .saturating_mul(2)
+      .max(wal.saturating_mul(16))
+      .min(self.checkpoint_log_budget.saturating_mul(4))
   }
 
   /// The size of the log the snapshot does not cover (the WAL segments past
@@ -181,19 +207,82 @@ impl SingleFileDB {
     (segments + wal_bytes) as f64 / self.checkpoint_log_trigger(&header).max(1) as f64
   }
 
+  /// Segments `header` names that nothing needs any more: covered by the
+  /// snapshot, and older than every segment holding a record of a
+  /// transaction it does not cover (see `spilled_txids`). A spill drops them
+  /// from the table and frees them, so segments a checkpoint kept for a
+  /// transaction that has since ended do not wait for another checkpoint.
+  /// None while a background checkpoint runs, unless `for_cut` (its own
+  /// cut): it may be reading them.
+  pub(crate) fn unneeded_wal_segments(
+    &self,
+    header: &DbHeaderV1,
+    for_cut: bool,
+  ) -> Vec<WalSegment> {
+    if !for_cut && self.is_checkpoint_running() {
+      return Vec::new();
+    }
+    let table = &header.wal_segments;
+    let needed_from = self
+      .spilled_txids
+      .lock()
+      .values()
+      .map(|spilled| spilled.first_segment)
+      .min()
+      .unwrap_or(u64::MAX);
+    table
+      .entries
+      .iter()
+      .filter(|segment| segment.seq <= table.covered && segment.seq < needed_from)
+      .copied()
+      .collect()
+  }
+
   /// Whether the WAL may spill now: the segments are under their limit, with
   /// room in the table (one entry stays free for a checkpoint's cut, which
-  /// spills whatever the limit).
+  /// spills whatever the limit). Segments a spill would drop as unneeded
+  /// (`unneeded_wal_segments`) do not count.
   pub(crate) fn can_spill(&self, header: &DbHeaderV1) -> bool {
-    !self.read_only
-      && header.wal_segments.entries.len() < MAX_WAL_SEGMENTS - 1
-      && header.wal_segments.bytes() < self.wal_segment_limit(header)
+    if self.read_only {
+      return false;
+    }
+    let unneeded = self.unneeded_wal_segments(header, false);
+    let (entries, bytes) = header
+      .wal_segments
+      .entries
+      .iter()
+      .filter(|segment| !unneeded.iter().any(|dropped| dropped.seq == segment.seq))
+      .fold((0, 0u64), |(entries, bytes), segment| {
+        (entries + 1, bytes.saturating_add(segment.byte_len))
+      });
+    entries < MAX_WAL_SEGMENTS - 1 && bytes < self.wal_segment_limit(header)
   }
 
   /// The oldest WAL segment an open write transaction holds records in: no
-  /// checkpoint can drop it, or any after it.
+  /// checkpoint can drop it, or any after it, before that transaction ends.
   pub(crate) fn oldest_pinned_segment(&self) -> Option<u64> {
-    self.spilled_open_txids.lock().values().min().copied()
+    self
+      .spilled_txids
+      .lock()
+      .values()
+      .filter(|spilled| spilled.commit_segment.is_none())
+      .map(|spilled| spilled.first_segment)
+      .min()
+  }
+
+  /// The oldest WAL segment a checkpoint whose cut is at segment `covered`
+  /// must keep: the oldest holding a record of a transaction its snapshot
+  /// does not cover (open at the cut, or committed after it), else the one
+  /// after `covered`.
+  pub(crate) fn wal_segments_needed_after(&self, covered: u64) -> u64 {
+    self
+      .spilled_txids
+      .lock()
+      .values()
+      .filter(|spilled| spilled.commit_segment.is_none_or(|commit| commit > covered))
+      .map(|spilled| spilled.first_segment)
+      .min()
+      .map_or(covered + 1, |oldest| oldest.min(covered + 1))
   }
 
   /// Whether the WAL segments are full (see `can_spill`) with segments no
@@ -210,8 +299,8 @@ impl SingleFileDB {
       .entries
       .iter()
       .filter(|segment| segment.seq >= oldest)
-      .fold((0, 0), |(count, bytes), segment| {
-        (count + 1, bytes + segment.byte_len)
+      .fold((0, 0u64), |(count, bytes), segment| {
+        (count + 1, bytes.saturating_add(segment.byte_len))
       });
     let limit = self.wal_segment_limit(&header);
     let full = bytes >= limit || count >= MAX_WAL_SEGMENTS - 1;
@@ -224,12 +313,25 @@ impl SingleFileDB {
     full
   }
 
+  /// Whether a spill of `length` bytes needs a new table entry: the newest
+  /// segment is sealed, or has no room for them.
+  pub(crate) fn spill_needs_new_segment(header: &DbHeaderV1, length: u64) -> bool {
+    let page_size = header.page_size as u64;
+    !header.wal_segments.entries.last().is_some_and(|last| {
+      !last.sealed && last.byte_len.saturating_add(length) <= last.page_count * page_size
+    })
+  }
+
   /// Spill: move the WAL's records, then `extra` (whole unsalted records
   /// that follow them in the log: a commit or a transaction's records that
   /// do not fit in the WAL at all), to the end of the WAL segment log, and
-  /// empty the WAL. Callers checked `can_spill` (a checkpoint's cut spills
-  /// whatever the limit), and hold the commit lock (`lock_commits`) and the
-  /// pager, the WAL and the header locked, in that order.
+  /// empty the WAL. Segments nothing needs any more (`unneeded_wal_segments`;
+  /// `for_cut`: the spill is a checkpoint's cut) leave the table in the same
+  /// header, and are freed once it is durable. Callers checked `can_spill` (a
+  /// checkpoint's cut spills whatever the limit), and hold the commit lock
+  /// (`lock_commits`) and the pager, the WAL and the header locked, in that
+  /// order. Fails with `WalBufferFull`, changing nothing, if the records need
+  /// a new segment and the table has no room.
   ///
   /// On error nothing a header names has changed: the WAL keeps its records
   /// (its positions restored if only the header install failed), and a new
@@ -240,6 +342,7 @@ impl SingleFileDB {
     wal: &mut WalBuffer,
     header: &mut DbHeaderV1,
     extra: &[u8],
+    for_cut: bool,
   ) -> Result<()> {
     // A writable open leaves the WAL in the primary region alone.
     debug_assert!(wal.active_region() == 0 && !wal.is_primary_retired());
@@ -264,16 +367,24 @@ impl SingleFileDB {
     let length = bytes.len() as u64;
 
     // Append to the open extent if the records fit, else start one.
-    let mut entries: Vec<WalSegment> = header.wal_segments.entries.to_vec();
-    let appends = entries
-      .last()
-      .is_some_and(|last| !last.sealed && last.byte_len + length <= last.page_count * page_size);
+    let unneeded = self.unneeded_wal_segments(header, for_cut);
+    let mut entries: Vec<WalSegment> = header
+      .wal_segments
+      .entries
+      .iter()
+      .filter(|segment| !unneeded.iter().any(|dropped| dropped.seq == segment.seq))
+      .copied()
+      .collect();
+    let appends = !Self::spill_needs_new_segment(header, length)
+      && entries
+        .last()
+        .is_some_and(|last| Some(last.seq) == header.wal_segments.entries.last().map(|s| s.seq));
     if !appends {
       if entries.len() >= MAX_WAL_SEGMENTS {
         return Err(KiteError::WalBufferFull);
       }
       let page_count = self.wal_segment_extent_pages(header, length);
-      let start_page = self.allocate_wal_segment_extent(pager, header, page_count)?;
+      let start_page = self.reserve_pages(pager, header, page_count, true)?;
       entries.push(WalSegment {
         seq: header.wal_segments.next_seq(),
         start_page,
@@ -325,21 +436,87 @@ impl SingleFileDB {
       }
       return Err(error);
     }
+    // Both slots name the new table: no fallback reaches the dropped ones.
+    if !unneeded.is_empty() {
+      Self::free_wal_segments(pager, &unneeded);
+      self.note_wal_segments_freed();
+    }
     self
       .wal_spills
       .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    self.note_spilled_open_transactions(segment.seq);
+    self.note_spilled_transactions(segment.seq);
     Ok(())
   }
 
-  /// Note that the open write transactions' records so far are in segment
-  /// `seq` or older ones.
-  fn note_spilled_open_transactions(&self, seq: u64) {
-    let open = self.open_write_txids.lock();
-    let mut spilled = self.spilled_open_txids.lock();
-    for &txid in open.iter() {
-      spilled.entry(txid).or_insert(seq);
+  /// Drop the segments nothing needs any more (`unneeded_wal_segments`)
+  /// from the table, durably in both header slots, then free them. For a
+  /// checkpoint's cut that has nothing to spill or to cover; callers hold
+  /// what `spill_wal`'s do. Returns whether it dropped any.
+  pub(crate) fn drop_unneeded_wal_segments(
+    &self,
+    pager: &mut FilePager,
+    header: &mut DbHeaderV1,
+  ) -> Result<bool> {
+    let unneeded = self.unneeded_wal_segments(header, true);
+    if unneeded.is_empty() {
+      return Ok(false);
     }
+    let prior_header = header.clone();
+    let kept: Vec<WalSegment> = header
+      .wal_segments
+      .entries
+      .iter()
+      .filter(|segment| !unneeded.iter().any(|dropped| dropped.seq == segment.seq))
+      .copied()
+      .collect();
+    header.wal_segments = WalSegmentTable {
+      next_seq: header.wal_segments.next_seq(),
+      covered: header.wal_segments.covered,
+      entries: kept.into(),
+    };
+    if let Err(error) = self.persist_spill_header(pager, header) {
+      restore_header(header, prior_header);
+      return Err(error);
+    }
+    Self::free_wal_segments(pager, &unneeded);
+    self.note_wal_segments_freed();
+    Ok(true)
+  }
+
+  /// Count a release of WAL segment space (see `wait_for_segment_space`).
+  pub(crate) fn note_wal_segments_freed(&self) {
+    self
+      .wal_segment_frees
+      .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+  }
+
+  /// After a spill into segment `seq`: the open write transactions' records
+  /// so far are in it or older ones, and the COMMIT records the WAL held are
+  /// in it.
+  fn note_spilled_transactions(&self, seq: u64) {
+    let open = self.open_write_txids.lock();
+    let mut spilled = self.spilled_txids.lock();
+    for spilled in spilled.values_mut() {
+      if spilled.commit_segment == Some(COMMITTED_IN_WAL) {
+        spilled.commit_segment = Some(seq);
+      }
+    }
+    for &txid in open.iter() {
+      spilled.entry(txid).or_insert(SpilledTransaction {
+        first_segment: seq,
+        commit_segment: None,
+      });
+    }
+  }
+
+  /// Forget the spilled transactions a checkpoint whose cut is at segment
+  /// `covered` holds (their COMMIT records lie in a segment up to it).
+  pub(crate) fn forget_covered_spilled_transactions(&self, covered: u64) {
+    self.spilled_txids.lock().retain(|_, spilled| {
+      spilled
+        .commit_segment
+        .is_none_or(|commit| commit == COMMITTED_IN_WAL || commit > covered)
+    });
   }
 
   /// Seal the newest WAL segment in `header` (in memory: the next header
@@ -381,45 +558,56 @@ impl SingleFileDB {
       return Ok(SpillOutcome::Full);
     }
     if !wal.is_empty() {
-      self.spill_wal(&mut pager, &mut wal, &mut header, &[])?;
+      self.spill_wal(&mut pager, &mut wal, &mut header, &[], false)?;
       return Ok(SpillOutcome::Spilled);
     }
-    self.spill_wal(&mut pager, &mut wal, &mut header, records)?;
+    self.spill_wal(&mut pager, &mut wal, &mut header, records, false)?;
     then();
     if let Some(last) = header.wal_segments.entries.last() {
-      self.note_spilled_open_transactions(last.seq);
+      self.note_spilled_transactions(last.seq);
     }
     Ok(SpillOutcome::Appended)
   }
 
-  /// Pages for a new WAL segment extent of `page_count` pages: the first
-  /// free range that holds it, else past the end of the file (which grows to
-  /// hold it, sparse until written).
-  fn allocate_wal_segment_extent(
+  /// Reserve `page_count` pages for data no header names yet (a snapshot, a
+  /// WAL segment extent): with `reuse_free`, the first free range that holds
+  /// them, taken off the free list; else (or with none) the pages past the
+  /// end of the file and of every page `header` names, which the file grows
+  /// to hold now. Callers hold the pager lock across the call, so choosing
+  /// the pages and taking them are one step, and no other allocator can
+  /// choose them too; they stay the caller's until it frees them or a
+  /// header names them.
+  pub(crate) fn reserve_pages(
     &self,
     pager: &mut FilePager,
     header: &DbHeaderV1,
     page_count: u64,
+    reuse_free: bool,
   ) -> Result<u64> {
     let count = u32::try_from(page_count).map_err(|_| {
       KiteError::Internal(format!(
-        "a WAL segment extent of {page_count} pages is too large"
+        "{page_count} pages are too many to reserve at once"
       ))
     })?;
     self.withdraw_live_pages(pager, header);
-    if let Some(start_page) = pager.find_free_range(count) {
-      pager.consume_free_range(start_page, count);
-      return Ok(start_page as u64);
+    if reuse_free {
+      if let Some(start_page) = pager.find_free_range(count) {
+        pager.consume_free_range(start_page, count);
+        return Ok(start_page as u64);
+      }
     }
     let page_size = header.page_size as u64;
-    let start_page = pager
-      .file_size()
-      .div_ceil(page_size)
-      .max(live_end_page(header));
-    let end_page = start_page + page_count;
     let file_pages = pager.file_size().div_ceil(page_size);
+    let start_page = Self::append_start_page(pager, header);
+    let end_page = start_page + page_count;
     if end_page > file_pages {
-      pager.allocate_pages((end_page - file_pages) as u32)?;
+      let grow = u32::try_from(end_page - file_pages).map_err(|_| {
+        KiteError::Internal(format!(
+          "growing the file by {} pages is too much at once",
+          end_page - file_pages
+        ))
+      })?;
+      pager.allocate_pages(grow)?;
     }
     Ok(start_page)
   }

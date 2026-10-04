@@ -82,6 +82,8 @@ pub const WAL_SEGMENT_ENTRY_SIZE: usize = 32;
 /// Default size of a WAL segment extent: spills of the WAL fill one until it
 /// is full or a checkpoint seals it.
 pub const WAL_SEGMENT_DEFAULT_SIZE: usize = 32 * 1024 * 1024;
+/// The largest `wal_segment_size` (1 TiB).
+pub const WAL_SEGMENT_MAX_SIZE: u64 = 1 << 40;
 /// Default `checkpoint_log_ratio`: a checkpoint starts once the WAL segments
 /// hold this fraction of the snapshot's size.
 pub const CHECKPOINT_LOG_RATIO_DEFAULT: f64 = 0.5;

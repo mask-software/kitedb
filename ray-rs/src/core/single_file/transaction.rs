@@ -59,7 +59,7 @@ use std::time::Instant;
 use super::commit_profile::{self as prof, Stage};
 use super::mvcc_history::{record_commit, HistoryPlan};
 use super::open::SyncMode;
-use super::segments::SpillOutcome;
+use super::segments::{SpillOutcome, COMMITTED_IN_WAL};
 use super::writer_slot::WriterMode;
 use super::{SchemaStaging, SingleFileDB, SingleFileTxState};
 use crate::core::pager::FilePager;
@@ -1150,16 +1150,11 @@ impl SingleFileDB {
     }
   }
 
-  /// Write `record` with `try_write_wal`, spilling the WAL when it is full
-  /// (and waiting for a checkpoint when the WAL segments are full too), then
-  /// run `then` under the WAL lock right after the record is written.
-  /// Callers hold no lock.
-  fn write_wal_waiting_then(&self, record: &WalRecord, then: impl Fn()) -> Result<()> {
-    self.write_built_wal_waiting_then(&mut record.build(), then)
-  }
-
-  /// `write_wal_waiting_then` for a record already built (unsalted, as
-  /// `WalRecord::build` returns it); `record` is unsalted again on return.
+  /// Write `record` (built, unsalted, as `WalRecord::build` returns it; it is
+  /// unsalted again on return) with `try_write_wal`, spilling the WAL when it
+  /// is full (and waiting for a checkpoint when the WAL segments are full
+  /// too), then run `then` under the WAL lock right after the record is
+  /// written. Callers hold no lock.
   fn write_built_wal_waiting_then(&self, record: &mut [u8], then: impl Fn()) -> Result<()> {
     loop {
       let written = self.try_write_wal(|wal| {
@@ -2123,7 +2118,7 @@ impl SingleFileDB {
           if self.can_spill(&header) {
             self.unstage_newest_in_mvcc(checked.len());
             queue.extend(checked.drain(..));
-            match self.spill_wal(&mut pager, &mut wal, &mut header, &request.records) {
+            match self.spill_wal(&mut pager, &mut wal, &mut header, &request.records, false) {
               Ok(()) => {
                 round.durable_in_segment = true;
                 staged.push((index, request));
@@ -2148,7 +2143,7 @@ impl SingleFileDB {
         // are full, a checkpoint makes room first.
         let mut header = self.header.write();
         if self.can_spill(&header) {
-          match self.spill_wal(&mut pager, &mut wal, &mut header, &[]) {
+          match self.spill_wal(&mut pager, &mut wal, &mut header, &[], false) {
             Ok(()) => queue.push_back((index, request)),
             Err(error) => outcomes[index] = Some(CommitOutcome::failed(error)),
           }
@@ -2186,7 +2181,20 @@ impl SingleFileDB {
           self.wal_buffer.lock().recycle_sealed(sealed);
         }
         let settle_mark = prof::start();
-        self.settle_durable_commits(&mut staged, &mut round.durable);
+        // Where their COMMIT records lie, for the spilled transactions among
+        // them.
+        let commit_segment = if round.durable_in_segment {
+          self
+            .header
+            .read()
+            .wal_segments
+            .entries
+            .last()
+            .map_or(COMMITTED_IN_WAL, |segment| segment.seq)
+        } else {
+          COMMITTED_IN_WAL
+        };
+        self.settle_durable_commits(&mut staged, &mut round.durable, commit_segment);
         prof::end(Stage::Settle, settle_mark);
         commit_records.clear();
         scratch.commit_records = commit_records;
@@ -2335,24 +2343,27 @@ impl SingleFileDB {
   ///
   /// A background cut (which takes the commit lock) must no longer count
   /// them as open: their records end with a durable COMMIT. Their committers
-  /// learn that only later, and a cut taken meanwhile would keep the WAL
-  /// segments holding their records for a transaction that is not open (and
-  /// every later cut too, since nothing else stops counting it). The sidecar
-  /// frames are appended under the commit lock, in order, with the epoch
-  /// fence checked under it (`write_commit_round`), so a copy of the
-  /// database taken under the commit lock never holds a commit its frame
-  /// position misses.
+  /// learn that only later. Those with records in WAL segments are now
+  /// committed in `commit_segment` (`COMMITTED_IN_WAL`, or the segment a
+  /// commit too large for the WAL went to), until a checkpoint covers them
+  /// (see `spilled_txids`). The sidecar frames are appended under the commit
+  /// lock, in order, with the epoch fence checked under it
+  /// (`write_commit_round`), so a copy of the database taken under the
+  /// commit lock never holds a commit its frame position misses.
   fn settle_durable_commits(
     &self,
     staged: &mut Vec<(usize, Box<CommitRequest>)>,
     durable: &mut Vec<DurableCommit>,
+    commit_segment: u64,
   ) {
     {
       let mut open = self.open_write_txids.lock();
-      let mut spilled = self.spilled_open_txids.lock();
+      let mut spilled = self.spilled_txids.lock();
       for (_, request) in staged.iter() {
         open.remove(&request.txid);
-        spilled.remove(&request.txid);
+        if let Some(spilled) = spilled.get_mut(&request.txid) {
+          spilled.commit_segment = Some(commit_segment);
+        }
       }
     }
     durable.extend(staged.drain(..).map(|(index, mut request)| {
@@ -2621,12 +2632,19 @@ impl SingleFileDB {
     // there: its records were kept back (a bulk load's, and a write
     // transaction's until it writes its BEGIN record).
     if wal_begun {
-      // Write the ROLLBACK record, and stop counting the transaction as open
-      // under the same WAL lock, which a background cut holds while it reads
-      // the open set (see `settle_durable_commits` for COMMIT records).
-      let record = WalRecord::new(WalRecordType::Rollback, txid, build_rollback_payload());
-      self.write_wal_waiting_then(&record, || {
+      // Write the ROLLBACK record if the WAL has room, and stop counting the
+      // transaction as open under the same WAL lock, which a spill holds
+      // while it reads the open set (see `settle_durable_commits` for COMMIT
+      // records). The record is not needed: recovery drops a transaction
+      // without a COMMIT record. So a full WAL is not spilled for it, and a
+      // rollback never waits for log space: the checkpoint thread rolls back
+      // abandoned transactions, and would wait for its own checkpoint.
+      let mut record =
+        WalRecord::new(WalRecordType::Rollback, txid, build_rollback_payload()).build();
+      self.try_write_wal(|wal| {
+        let written = wal.write_built_record(&mut record);
         self.open_write_txids.lock().remove(&txid);
+        written.map(|_| ())
       })?;
     }
 

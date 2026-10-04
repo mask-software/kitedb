@@ -217,6 +217,11 @@ fn review_checkpoint_thread_reaping_an_abandoned_transaction_at_the_limit_does_n
 /// is sealed) and finds the table full (`spill_wal`: `WalBufferFull`). With
 /// automatic checkpoints every run fails, and writers at the segment limit
 /// get `CheckpointFailed`, until someone runs a blocking `checkpoint()`.
+///
+/// (Adjusted with the fix: while such a transaction is open, cuts leave the
+/// last entry free, so the table fills to 63 entries and more checkpoints
+/// keep it there; the ones after the transaction ends must cover the log
+/// and empty the table.)
 #[test]
 fn review_checkpoints_recover_once_a_transaction_holding_a_full_segment_table_ends() {
   let dir = tempdir().expect("tempdir");
@@ -249,9 +254,10 @@ fn review_checkpoints_recover_once_a_transaction_holding_a_full_segment_table_en
 
   // Each checkpoint's cut spills the WAL into a new segment (the previous
   // cut sealed the last one), and its install keeps them all for the open
-  // transaction.
+  // transaction, up to the last entry, which cuts leave free while it is
+  // open.
   let mut index = 0;
-  while wal_segment_test_stats(&db).live < MAX_WAL_SEGMENTS && index < 200 {
+  while wal_segment_test_stats(&db).live < MAX_WAL_SEGMENTS - 1 && index < 200 {
     commit_key(&db, &key("k", index)).expect("commit");
     db.background_checkpoint()
       .expect("a checkpoint while the transaction is open");
@@ -259,9 +265,19 @@ fn review_checkpoints_recover_once_a_transaction_holding_a_full_segment_table_en
   }
   assert_eq!(
     wal_segment_test_stats(&db).live,
-    MAX_WAL_SEGMENTS,
+    MAX_WAL_SEGMENTS - 1,
     "setup: the table did not fill"
   );
+  for more in 0..3 {
+    commit_key(&db, &key("more", more)).expect("commit");
+    db.background_checkpoint()
+      .expect("a checkpoint while the transaction holds a full table");
+    assert_eq!(
+      wal_segment_test_stats(&db).live,
+      MAX_WAL_SEGMENTS - 1,
+      "a checkpoint took the table's last entry while the transaction is open"
+    );
+  }
 
   // The transaction commits: nothing holds the segments any more.
   go_tx.send(()).expect("release the holder");
@@ -271,12 +287,12 @@ fn review_checkpoints_recover_once_a_transaction_holding_a_full_segment_table_en
     .expect("the holder's commit");
   commit_key(&db, &key("after", 0)).expect("commit");
   let first = db.background_checkpoint();
+  let after_first = wal_segment_test_stats(&db);
   let second = db.background_checkpoint();
   assert!(
-    first.is_ok() && second.is_ok(),
+    first.is_ok() && second.is_ok() && after_first.live == 0,
     "no checkpoint covers the log once an install kept all {MAX_WAL_SEGMENTS} segments: \
-     {first:?}, {second:?} ({:?})",
-    wal_segment_test_stats(&db)
+     {first:?}, {second:?} (after the first: {after_first:?})"
   );
 }
 

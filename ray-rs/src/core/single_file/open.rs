@@ -1275,7 +1275,8 @@ fn open_single_file_internal(
     checkpoint_log_budget: options.checkpoint_log_budget,
     wal_segment_limit_bytes: AtomicU64::new(options.wal_segment_limit.unwrap_or(0)),
     wal_spills: AtomicU64::new(0),
-    spilled_open_txids: Mutex::new(HashMap::new()),
+    spilled_txids: Mutex::new(HashMap::new()),
+    wal_segment_frees: AtomicU64::new(0),
     sync_mode: options.sync_mode,
     primary_replication,
     replica_replication,
@@ -1289,7 +1290,9 @@ fn open_single_file_internal(
 }
 
 /// Refuse checkpoint options no database can use: a log ratio that is not a
-/// finite number at least 0, and sizes of 0.
+/// finite number at least 0, sizes of 0, and a WAL segment size past
+/// `WAL_SEGMENT_MAX_SIZE`. (A log budget or segment limit too large to
+/// compute with means no cap: the arithmetic on them saturates.)
 fn validate_checkpoint_options(options: &SingleFileOpenOptions) -> Result<()> {
   if !options.checkpoint_log_ratio.is_finite() || options.checkpoint_log_ratio < 0.0 {
     return Err(KiteError::Internal(format!(
@@ -1307,6 +1310,14 @@ fn validate_checkpoint_options(options: &SingleFileOpenOptions) -> Result<()> {
         "invalid {name} 0: more than 0 bytes"
       )));
     }
+  }
+  if let Some(size) = options
+    .wal_segment_size
+    .filter(|&size| size > WAL_SEGMENT_MAX_SIZE)
+  {
+    return Err(KiteError::Internal(format!(
+      "invalid wal_segment_size {size}: at most {WAL_SEGMENT_MAX_SIZE} bytes"
+    )));
   }
   Ok(())
 }
