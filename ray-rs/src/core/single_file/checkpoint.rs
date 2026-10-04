@@ -808,7 +808,8 @@ impl SingleFileDB {
   /// (or it failed). Writers that fill the secondary region before then wait
   /// for the install instead of failing; if any did, it takes another pass
   /// (up to `MAX_EXTRA_BACKGROUND_PASSES`), since the installed WAL still
-  /// holds everything they wrote meanwhile.
+  /// holds everything they wrote meanwhile. (The auto-checkpoint takes one
+  /// pass: see `auto_background_checkpoint`.)
   ///
   /// Fails with `CheckpointDeclined`, changing nothing, if the open
   /// transactions' records cannot be copied; it is not retried (this returns
@@ -836,7 +837,7 @@ impl SingleFileDB {
   /// otherwise the cut stays in place (replay reads both regions) and the next
   /// checkpoint finishes it.
   pub fn background_checkpoint(&self) -> Result<()> {
-    match self.run_background_checkpoint()? {
+    match self.run_background_checkpoint(MAX_EXTRA_BACKGROUND_PASSES)? {
       BackgroundCheckpointOutcome::StillDeclined => Err(KiteError::CheckpointDeclined(
         "the last attempt could not copy the WAL records of open transactions into the \
          secondary WAL region, and all of them are still open; it starts once one finishes"
@@ -855,9 +856,22 @@ impl SingleFileDB {
 
   /// The auto-checkpoint after a commit: `background_checkpoint`, except that
   /// a cut still declined for the same open transactions is skipped quietly
-  /// instead of being reported again on every commit.
-  pub(crate) fn auto_background_checkpoint(&self) -> Result<()> {
-    self.run_background_checkpoint().map(|_| ())
+  /// instead of being reported again on every commit, and that it takes one
+  /// pass unless `wal_refused` (it makes room for a record the WAL refused).
+  ///
+  /// It runs on the committing thread, whose commit returns once it ends,
+  /// and the writers that waited for its install proceed then: further
+  /// passes for what they wrote meanwhile (at most the secondary region, a
+  /// quarter of the WAL, below the default threshold) only kept that one
+  /// commit waiting, a whole snapshot rebuild each. The next commit past the
+  /// threshold checkpoints again.
+  pub(crate) fn auto_background_checkpoint(&self, wal_refused: bool) -> Result<()> {
+    let extra_passes = if wal_refused {
+      MAX_EXTRA_BACKGROUND_PASSES
+    } else {
+      0
+    };
+    self.run_background_checkpoint(extra_passes).map(|_| ())
   }
 
   /// The auto-checkpoint, run by a thread that holds no lock and has no
@@ -876,7 +890,7 @@ impl SingleFileDB {
       return false;
     }
     let result = if self.background_checkpoint {
-      self.auto_background_checkpoint()
+      self.auto_background_checkpoint(wal_refused)
     } else {
       self.checkpoint()
     };
@@ -887,7 +901,12 @@ impl SingleFileDB {
     result.is_ok()
   }
 
-  fn run_background_checkpoint(&self) -> Result<BackgroundCheckpointOutcome> {
+  /// `background_checkpoint`, taking at most `max_extra_passes` passes after
+  /// the first while writers wait for its installs.
+  fn run_background_checkpoint(
+    &self,
+    max_extra_passes: usize,
+  ) -> Result<BackgroundCheckpointOutcome> {
     if self.read_only {
       return Err(KiteError::ReadOnly);
     }
@@ -923,7 +942,7 @@ impl SingleFileDB {
       // A waiting exclusive operation checkpoints anyway, and waits for
       // every pass this run takes.
       if !self.take_writers_waited()
-        || extra_passes == MAX_EXTRA_BACKGROUND_PASSES
+        || extra_passes == max_extra_passes
         || self.exclusive_operation_waiting()
       {
         return Ok(BackgroundCheckpointOutcome::Installed);
