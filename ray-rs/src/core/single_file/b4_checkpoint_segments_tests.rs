@@ -1274,6 +1274,79 @@ fn a_writer_refused_for_a_failed_checkpoint_asks_for_another() {
   assert!(missing(&reopened, &acked).is_empty());
 }
 
+/// Review finding R10: a successful checkpoint ends the checkpoint thread's
+/// back-off. Its run failed (the thread waits before the next, here a
+/// minute), and the caller's own checkpoint (`checkpoint`) then succeeded,
+/// which clears the error: a writer at the WAL segment limit is served at
+/// once, not after the rest of the back-off.
+#[test]
+fn a_successful_blocking_checkpoint_ends_the_back_off() {
+  a_successful_checkpoint_ends_the_back_off("blocking", |db| db.checkpoint());
+}
+
+/// R10 with the caller's `background_checkpoint`.
+#[test]
+fn a_successful_background_checkpoint_ends_the_back_off() {
+  a_successful_checkpoint_ends_the_back_off("background", |db| db.background_checkpoint());
+}
+
+fn a_successful_checkpoint_ends_the_back_off(
+  name: &str,
+  checkpoint: impl Fn(&SingleFileDB) -> Result<()>,
+) {
+  use super::super::checkpoint_thread::set_checkpoint_test_first_backoff;
+  let dir = tempdir().expect("tempdir");
+  let path = dir.path().join(format!("back-off-{name}.kitedb"));
+  let db = open_single_file(&path, options().sync_mode(SyncMode::Normal)).expect("open");
+  // One spill reaches the limit, far below the checkpoint trigger: only
+  // writers waiting for space ask for checkpoints.
+  set_wal_segment_test_limit(&db, 1);
+  set_checkpoint_test_first_backoff(&db, Duration::from_secs(60));
+  set_checkpoint_test_db_fault(&db, CheckpointPhase::SnapshotWritten, true);
+  let mut acked = Vec::new();
+  let mut failure = None;
+  for index in 0..2_000 {
+    let key = key("key", index);
+    match commit_key(&db, &key) {
+      Ok(()) => acked.push(key),
+      Err(error) => {
+        failure = Some(error);
+        break;
+      }
+    }
+  }
+  clear_checkpoint_test_db_faults(&db);
+  assert!(
+    matches!(failure, Some(KiteError::CheckpointFailed(_))),
+    "setup: the writer at the limit got {failure:?}"
+  );
+  checkpoint(&db).expect("the caller's checkpoint");
+  assert_eq!(checkpoint_thread_error(&db), None);
+
+  // Two spills' worth of commits: the second waits for the thread's
+  // checkpoint.
+  let (done_tx, done_rx) = mpsc::channel();
+  let started = Instant::now();
+  let served = std::thread::scope(|scope| {
+    let db = &db;
+    scope.spawn(move || {
+      let _ = done_tx.send(commit_keys(db, "after", 0, 400));
+    });
+    done_rx.recv_timeout(Duration::from_secs(20))
+  });
+  let after = served.unwrap_or_else(|_| {
+    panic!(
+      "a writer at the limit waited {:?} for the checkpoint thread's back-off",
+      started.elapsed()
+    )
+  });
+  assert_eq!(after.len(), 400, "writers after the checkpoint failed");
+  acked.extend(after);
+  close_single_file(db).expect("close");
+  let reopened = open_single_file(&path, options()).expect("reopen");
+  assert!(missing(&reopened, &acked).is_empty());
+}
+
 /// Review finding R8. A writer's spill drops the segments its decision to
 /// spill counted out as unneeded (`can_spill`), even when a background
 /// checkpoint claims the checkpoint status between the decision and the
