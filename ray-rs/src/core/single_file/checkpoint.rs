@@ -5066,3 +5066,7 @@ mod review_seg2_tests;
 #[cfg(test)]
 #[path = "b4_checkpoint_model_tests.rs"]
 mod b4_checkpoint_model_tests;
+/// Fresh adversarial review of the WAL segment / checkpoint thread change.
+#[cfg(test)]
+#[path = "review_fresh_tests.rs"]
+mod review_fresh_tests;
