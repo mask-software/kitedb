@@ -63,6 +63,19 @@ enum CheckpointPhase {
   /// A background checkpoint is about to replay its post-cut records into the
   /// delta that replaces the cut's.
   PostCutReplay,
+  /// A spill's records are written to their WAL segment and synced; no
+  /// header names them there yet. (Reached once WAL segments land: see
+  /// `b4_checkpoint_segments_tests`.)
+  #[allow(dead_code)]
+  SpillSegmentWritten,
+  /// A spill's header is durable in one slot; the other still names the
+  /// records in the WAL.
+  #[allow(dead_code)]
+  SpillHeaderDurable,
+  /// A checkpoint's install is durable in both header slots; the segments it
+  /// covers are not freed yet.
+  #[allow(dead_code)]
+  SegmentsReleased,
 }
 
 /// A barrier armed for one phase of checkpoints on the database at a path.
@@ -96,10 +109,66 @@ static CHECKPOINT_TEST_DELAYS: OnceLock<Mutex<Vec<CheckpointTestDelay>>> = OnceL
 #[cfg(test)]
 static CHECKPOINT_TEST_STALL_TIMEOUTS: OnceLock<Mutex<HashMap<std::path::PathBuf, Duration>>> =
   OnceLock::new();
+/// Faults armed for a phase of checkpoints on the database at a path, on
+/// whichever thread reaches it (a checkpoint thread's included); sticky
+/// faults fire every time.
+#[cfg(test)]
+type CheckpointTestDbFault = (std::path::PathBuf, CheckpointPhase, bool);
+#[cfg(test)]
+static CHECKPOINT_TEST_DB_FAULTS: OnceLock<Mutex<Vec<CheckpointTestDbFault>>> = OnceLock::new();
+/// The phases reached on watched databases, with the name of the thread
+/// that reached each, and whether it was about to wait at a barrier.
+#[cfg(test)]
+type CheckpointTestReached = (CheckpointPhase, Option<String>, bool);
+#[cfg(test)]
+static CHECKPOINT_TEST_REACHED: OnceLock<
+  Mutex<HashMap<std::path::PathBuf, Vec<CheckpointTestReached>>>,
+> = OnceLock::new();
 
 fn checkpoint_phase(db_path: &std::path::Path, phase: CheckpointPhase) -> Result<()> {
   #[cfg(test)]
   {
+    let db_faulted = {
+      let mut faults = CHECKPOINT_TEST_DB_FAULTS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .expect("checkpoint test db fault lock");
+      match faults
+        .iter()
+        .position(|(path, fault_phase, _)| path == db_path && *fault_phase == phase)
+      {
+        Some(index) => {
+          if !faults[index].2 {
+            faults.remove(index);
+          }
+          true
+        }
+        None => false,
+      }
+    };
+    let barrier_armed = CHECKPOINT_TEST_BARRIERS
+      .get_or_init(|| Mutex::new(Vec::new()))
+      .lock()
+      .expect("checkpoint test barrier lock")
+      .iter()
+      .any(|(path, barrier_phase, _)| path == db_path && *barrier_phase == phase);
+    if let Some(reached) = CHECKPOINT_TEST_REACHED
+      .get_or_init(|| Mutex::new(HashMap::new()))
+      .lock()
+      .expect("checkpoint test reached lock")
+      .get_mut(db_path)
+    {
+      reached.push((
+        phase,
+        std::thread::current().name().map(str::to_string),
+        barrier_armed && !db_faulted,
+      ));
+    }
+    if db_faulted {
+      return Err(KiteError::Internal(
+        "injected checkpoint abort (database fault)".to_string(),
+      ));
+    }
     let barrier = {
       let mut configured = CHECKPOINT_TEST_BARRIERS
         .get_or_init(|| Mutex::new(Vec::new()))
@@ -206,6 +275,121 @@ fn set_checkpoint_test_barrier(db: &SingleFileDB, phase: CheckpointPhase, barrie
     .expect("checkpoint test barrier lock");
   configured.retain(|(path, barrier_phase, _)| path != db.path() || *barrier_phase != phase);
   configured.push((db.path().to_path_buf(), phase, barrier));
+}
+
+/// Fail the next checkpoint step at `phase` on `db`, on whichever thread
+/// reaches it; with `sticky`, every one until cleared.
+#[cfg(test)]
+fn set_checkpoint_test_db_fault(db: &SingleFileDB, phase: CheckpointPhase, sticky: bool) {
+  CHECKPOINT_TEST_DB_FAULTS
+    .get_or_init(|| Mutex::new(Vec::new()))
+    .lock()
+    .expect("checkpoint test db fault lock")
+    .push((db.path().to_path_buf(), phase, sticky));
+}
+
+/// Disarm every fault `set_checkpoint_test_db_fault` armed on `db`.
+#[cfg(test)]
+fn clear_checkpoint_test_db_faults(db: &SingleFileDB) {
+  CHECKPOINT_TEST_DB_FAULTS
+    .get_or_init(|| Mutex::new(Vec::new()))
+    .lock()
+    .expect("checkpoint test db fault lock")
+    .retain(|(path, _, _)| path != db.path());
+}
+
+/// Record, from now on, the checkpoint phases reached on `db` (see
+/// `checkpoint_test_reached`).
+#[cfg(test)]
+fn watch_checkpoint_phases(db: &SingleFileDB) {
+  CHECKPOINT_TEST_REACHED
+    .get_or_init(|| Mutex::new(HashMap::new()))
+    .lock()
+    .expect("checkpoint test reached lock")
+    .insert(db.path().to_path_buf(), Vec::new());
+}
+
+/// The phases reached on `db` since `watch_checkpoint_phases`: each with
+/// the name of the thread that reached it, and whether that thread then
+/// waited at an armed barrier.
+#[cfg(test)]
+fn checkpoint_test_reached(db: &SingleFileDB) -> Vec<CheckpointTestReached> {
+  CHECKPOINT_TEST_REACHED
+    .get_or_init(|| Mutex::new(HashMap::new()))
+    .lock()
+    .expect("checkpoint test reached lock")
+    .get(db.path())
+    .cloned()
+    .unwrap_or_default()
+}
+
+/// Remove the barrier armed for `phase` on `db`; returns whether it was
+/// still armed (no thread reached it).
+#[cfg(test)]
+fn disarm_checkpoint_test_barrier(db: &SingleFileDB, phase: CheckpointPhase) -> bool {
+  let mut configured = CHECKPOINT_TEST_BARRIERS
+    .get_or_init(|| Mutex::new(Vec::new()))
+    .lock()
+    .expect("checkpoint test barrier lock");
+  let before = configured.len();
+  configured.retain(|(path, barrier_phase, _)| path != db.path() || *barrier_phase != phase);
+  configured.len() != before
+}
+
+/// The name a database's checkpoint thread runs under.
+#[cfg(test)]
+const CHECKPOINT_THREAD_NAME: &str = "kitedb-checkpoint";
+
+/// What `db`'s header says of its WAL segments (see
+/// `b4_checkpoint_segments_tests`).
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct WalSegmentTestStats {
+  /// Segments the header names.
+  live: usize,
+  /// Bytes of records they hold.
+  bytes: u64,
+  /// The newest segment seq the snapshot covers.
+  covered: u64,
+  /// The seq the next segment gets (every segment ever written is below).
+  next_seq: u64,
+}
+
+/// `db`'s WAL segments. Until they land the header names none.
+#[cfg(test)]
+fn wal_segment_test_stats(db: &SingleFileDB) -> WalSegmentTestStats {
+  let _ = db;
+  WalSegmentTestStats::default()
+}
+
+/// Lower `db`'s WAL segment limit (bytes of segments before writers wait
+/// for a checkpoint). Takes effect once WAL segments land.
+#[cfg(test)]
+fn set_wal_segment_test_limit(db: &SingleFileDB, bytes: u64) {
+  let _ = (db, bytes);
+}
+
+/// Whether `db` runs a checkpoint thread now. None runs until the thread
+/// lands.
+#[cfg(test)]
+fn checkpoint_thread_running(db: &SingleFileDB) -> bool {
+  let _ = db;
+  false
+}
+
+/// The error of `db`'s last checkpoint-thread run, if no run succeeded since
+/// (`SingleFileDB::checkpoint_error` once the thread lands).
+#[cfg(test)]
+fn checkpoint_thread_error(db: &SingleFileDB) -> Option<String> {
+  let _ = db;
+  None
+}
+
+/// Writers waiting now for a checkpoint to free WAL segment space.
+#[cfg(test)]
+fn writers_waiting_for_segments(db: &SingleFileDB) -> usize {
+  let _ = db;
+  0
 }
 
 /// Make the next `step` (see `SingleFileDB::checkpoint_step`) of a checkpoint
@@ -5193,3 +5377,8 @@ mod b4_fsync_group_tests;
 #[cfg(test)]
 #[path = "b4_checkpoint_cost_tests.rs"]
 mod b4_checkpoint_cost_tests;
+
+/// raydb-b4 `checkpoint-segments`: WAL segments and the checkpoint thread.
+#[cfg(test)]
+#[path = "b4_checkpoint_segments_tests.rs"]
+mod b4_checkpoint_segments_tests;
