@@ -1404,13 +1404,34 @@ class PathFindingBuilder(Generic[N]):
         Returns:
             True if a path exists
         """
-        return self.bfs().found
+        targets = self._get_targets()
+        if any(t.id == self._source.id for t in targets):
+            return self._create_node_ref(self._source.id) is not None
+        return self._native_bfs(targets) is not None
+
+    def _native_bfs(self, targets: List[NodeRef[Any]]) -> Any:
+        """
+        The fewest-hops path to the nearest target, from the native search (which expands the
+        source's side and the target's side, whichever is smaller, until they meet), or None.
+        With several targets, the first of the nearest in `targets` order.
+        """
+        etype_id = self._resolve_etype_id(self._edge_type) if self._edge_type is not None else None
+        # The native search caps the depth at a million hops and rejects a negative one; a
+        # negative depth finds nothing but the source itself, as before.
+        max_depth = max(0, min(self._max_depth_value(), 1_000_000))
+        best = None
+        for target_id in dict.fromkeys(t.id for t in targets):
+            result = self._db.find_path_bfs(
+                self._source.id, target_id, etype_id, max_depth, self._direction
+            )
+            if result.found and (best is None or len(result.path) < len(best.path)):
+                best = result
+        return best
 
     def bfs(self) -> PathResult[N]:
         """Execute BFS (unweighted shortest path)."""
         targets = self._get_targets()
         target_ids = {t.id for t in targets}
-        max_depth = self._max_depth_value()
 
         if self._source.id in target_ids:
             node_ref = self._create_node_ref(self._source.id)
@@ -1418,36 +1439,22 @@ class PathFindingBuilder(Generic[N]):
                 return PathResult(nodes=[], found=False)
             return PathResult(nodes=[node_ref], found=True, total_weight=0.0)
 
-        from collections import deque
-
-        queue = deque([(self._source.id, 0)])
-        visited = {self._source.id}
-        parents: Dict[int, Tuple[Optional[int], Optional[EdgeResult]]] = {
-            self._source.id: (None, None)
-        }
-
-        while queue:
-            node_id, depth = queue.popleft()
-            if depth >= max_depth:
-                continue
-
-            for neighbor_id, edge in self._iter_neighbors(node_id):
-                if neighbor_id in visited:
-                    continue
-                visited.add(neighbor_id)
-                parents[neighbor_id] = (node_id, edge)
-
-                if neighbor_id in target_ids:
-                    result = self._reconstruct_path(parents, neighbor_id)
-                    result.total_weight = float(len(result.edges))
-                    return result
-
-                queue.append((neighbor_id, depth + 1))
-
-        return PathResult(nodes=[], found=False)
+        native = self._native_bfs(targets)
+        if native is None:
+            return PathResult(nodes=[], found=False)
+        nodes = [ref for ref in map(self._create_node_ref, native.path) if ref is not None]
+        edges = [
+            self._build_edge_result(self._edge_type, edge.src, edge.etype, edge.dst)
+            for edge in native.edges
+        ]
+        return PathResult(nodes=nodes, found=True, total_weight=float(len(edges)), edges=edges)  # type: ignore
 
     def dijkstra(self) -> PathResult[N]:
         """Execute Dijkstra's algorithm."""
+        if self._weight_spec is None:
+            # Every edge weighs 1: the cheapest path is the one with the fewest hops.
+            return self.bfs()
+
         targets = self._get_targets()
         target_ids = {t.id for t in targets}
         max_depth = self._max_depth_value()
