@@ -231,13 +231,21 @@ struct StringTable<'a> {
 }
 
 impl<'a> StringTable<'a> {
+  #[cfg(test)]
   fn new() -> Self {
+    Self::with_capacity(0, 0)
+  }
+
+  /// Room for `strings` strings of `bytes` bytes in all.
+  fn with_capacity(strings: usize, bytes: usize) -> Self {
     // StringID 0 is reserved/empty
-    let mut ids = hashbrown::HashMap::new();
+    let mut ids = hashbrown::HashMap::with_capacity(strings + 1);
     ids.insert("", 0);
+    let mut offsets = Vec::with_capacity(strings + 2);
+    offsets.extend([0, 0]);
     Self {
-      bytes: Vec::new(),
-      offsets: vec![0, 0],
+      bytes: Vec::with_capacity(bytes),
+      offsets,
       ids,
     }
   }
@@ -563,11 +571,12 @@ struct PropSections {
 }
 
 impl PropSections {
-  fn with_items(items: usize) -> Self {
+  /// Room for `items` items with `props` properties in all.
+  fn with_items(items: usize, props: usize) -> Self {
     Self {
       offsets: Vec::with_capacity((items + 1) * 4),
-      keys: Vec::new(),
-      vals: Vec::new(),
+      keys: Vec::with_capacity(props * 4),
+      vals: Vec::with_capacity(props * PROP_VALUE_DISK_SIZE),
       count: 0,
     }
   }
@@ -880,7 +889,7 @@ fn edge_prop_sections(
     .as_deref()
     .expect("out-edge CSR keeps its input indices");
   let num_nodes = out_csr.offsets.len() - 1;
-  let mut sections = PropSections::with_items(out_csr.dst.len());
+  let mut sections = PropSections::with_items(out_csr.dst.len(), edges.props.len());
   for src in 0..num_nodes {
     let range = out_csr.offsets[src] as usize..out_csr.offsets[src + 1] as usize;
     let mut i = range.start;
@@ -963,7 +972,40 @@ pub(crate) fn build_columnar_snapshot_to_memory(input: ColumnarBuildInput) -> Re
   let max_node_id = phys_to_node_id.last().copied().unwrap_or(0);
   let node_index = NodeIndex::build(&phys_to_node_id, max_node_id)?;
 
-  let mut string_table = StringTable::new();
+  // The string table and the property sections are sized up front: grown by
+  // doubling, each would be copied at every step, and the allocator keeps
+  // the smaller copies.
+  let (mut strings, mut string_bytes) = (labels.len() + etypes.len() + propkeys.len(), 0);
+  let mut count_string = |s: &str| {
+    strings += 1;
+    string_bytes += s.len();
+  };
+  let mut node_prop_count = 0;
+  for node in &nodes {
+    if let Some(key) = &node.key {
+      count_string(key);
+    }
+    node_prop_count += node.props.len();
+    for value in node.props.values() {
+      if let PropValue::String(s) = value {
+        count_string(s);
+      }
+    }
+  }
+  for (_, value) in &edges.props {
+    if let PropValue::String(s) = value {
+      count_string(s);
+    }
+  }
+  for name in labels
+    .values()
+    .chain(etypes.values())
+    .chain(propkeys.values())
+  {
+    string_bytes += name.len();
+  }
+
+  let mut string_table = StringTable::with_capacity(strings, string_bytes);
   let ([label_string_ids, etype_string_ids, propkey_string_ids], node_key_strings) =
     intern_strings(
       &nodes,
@@ -1016,7 +1058,7 @@ pub(crate) fn build_columnar_snapshot_to_memory(input: ColumnarBuildInput) -> Re
 
   // Node, then edge, properties (vector indices follow that order).
   let mut vector_table = VectorTable::new();
-  let mut node_props = PropSections::with_items(num_nodes);
+  let mut node_props = PropSections::with_items(num_nodes, node_prop_count);
   let mut scratch = Vec::new();
   for node in &nodes {
     node_props.push_item(
