@@ -4917,3 +4917,9 @@ mod b4_checkpoint_cost_tests;
 #[cfg(test)]
 #[path = "b4_checkpoint_segments_tests.rs"]
 mod b4_checkpoint_segments_tests;
+
+/// Adversarial review of the WAL segment / checkpoint thread change
+/// (failing tests that reproduce the bugs found).
+#[cfg(test)]
+#[path = "review_seg_tests.rs"]
+mod review_seg_tests;
