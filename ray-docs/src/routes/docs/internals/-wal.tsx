@@ -805,11 +805,13 @@ export function WALPage() {
 				<code>Checkpoint failed, and the WAL segments are full: ...</code> (
 				<code>CheckpointFailed</code>; Python raises{" "}
 				<code>CheckpointError</code>, a <code>KiteError</code> subclass), and
-				asks for another checkpoint, which the thread runs after its back-off.{" "}
+				asks for another checkpoint, which the thread runs after its back-off (1
+				s, doubling to 60 s after each failure in a row; any checkpoint that
+				succeeds meanwhile, such as the caller's own, ends it).{" "}
 				<code>checkpointError()</code> (<code>checkpoint_error()</code> in
 				Python) returns the checkpoint's error. A panic in a checkpoint run is
-				reported the same way, and the thread ends. Since such a panic may strike
-				between writes that keep memory and disk in step, the handle then
+				reported the same way, and the thread ends. Since such a panic may
+				strike between writes that keep memory and disk in step, the handle then
 				refuses writes (
 				<code>The database refuses writes until it is reopened: ...</code>,{" "}
 				<code>WritesRefused</code>), as it does after a panic in a commit, a

@@ -9,7 +9,8 @@
 //! until a commit asks for a checkpoint; it runs one, records its error if
 //! it fails (`SingleFileDB::checkpoint_error`), and after a failure waits
 //! before running another (doubling from one second to a minute, however
-//! often it is asked meanwhile) instead of failing in a loop. A panic in a
+//! often it is asked meanwhile; a checkpoint that succeeds meanwhile, a
+//! caller's, ends the wait) instead of failing in a loop. A panic in a
 //! run is caught and recorded too; it may have struck between writes that
 //! keep memory and disk in step, so the handle refuses writes from then on
 //! (`KiteError::WritesRefused`; reads go on, and reopening recovers from
@@ -93,6 +94,9 @@ struct Requests {
   /// Requests a finished run answered (a run answers every request made
   /// before it started).
   answered: u64,
+  /// A checkpoint installed since the last run started: a back-off after
+  /// a failed run ends (see `SingleFileDB::end_checkpoint_backoff`).
+  installed: bool,
 }
 
 /// What a database and its checkpoint thread share.
@@ -229,6 +233,18 @@ impl SingleFileDB {
     self.checkpoint_thread.lock().is_some()
   }
 
+  /// A checkpoint installed (any: the thread's, a caller's, optimize's):
+  /// the cause of the thread's last failure, if any, is gone, so the
+  /// thread's back-off after it ends, and its next failure waits the first
+  /// back-off again. Called under the pager lock (a leaf here).
+  pub(crate) fn end_checkpoint_backoff(&self) {
+    if let Some(thread) = self.checkpoint_thread.lock().as_ref() {
+      let mut requests = thread.signal.requests.lock();
+      requests.installed = true;
+      thread.signal.wake.notify_all();
+    }
+  }
+
   /// The error of the last checkpoint the checkpoint thread ran, if it
   /// failed and no checkpoint installed since. Automatic checkpoints report
   /// nothing to the commit that asked for them; this is where their failures
@@ -262,10 +278,15 @@ fn run_checkpoint_thread(db: SingleFileDB, signal: Arc<CheckpointSignal>) {
       let mut requests = signal.requests.lock();
       if let Some(wait) = backoff {
         // After a failure: wait out the back-off, however often a commit asks
-        // meanwhile; only a close ends it early.
+        // meanwhile. A close ends it early, and so does a checkpoint that
+        // installs meanwhile (a caller's): the failure's cause is gone, and
+        // the doubling starts over.
         let until = Instant::now() + wait;
-        while !requests.stop && Instant::now() < until {
+        while !requests.stop && !requests.installed && Instant::now() < until {
           signal.wake.wait_until(&mut requests, until);
+        }
+        if requests.installed {
+          backoff = None;
         }
       }
       while !requests.checkpoint && !requests.stop {
@@ -275,6 +296,7 @@ fn run_checkpoint_thread(db: SingleFileDB, signal: Arc<CheckpointSignal>) {
         return;
       }
       requests.checkpoint = false;
+      requests.installed = false;
     }
     let asked = signal.requests.lock().asked;
     let result =

@@ -1805,8 +1805,10 @@ impl SingleFileDB {
       );
     }
     pager.release_deferred_free_pages();
-    // A checkpoint succeeded: the checkpoint thread's last error is stale.
+    // A checkpoint succeeded: the checkpoint thread's last error is stale,
+    // and so is its back-off.
     *self.checkpoint_last_error.lock() = None;
+    self.end_checkpoint_backoff();
     Ok(())
   }
 
