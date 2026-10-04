@@ -986,6 +986,10 @@ fn pop_best_candidate(candidates: &mut Vec<PathResult>) -> Option<PathResult> {
 // ============================================================================
 
 #[cfg(test)]
+#[path = "b4_pathfinding_tests.rs"]
+mod b4_pathfinding_tests;
+
+#[cfg(test)]
 mod tests {
   use super::*;
 

@@ -58,6 +58,10 @@ pub use transaction::{Savepoint, SingleFileTxGuard};
 // Also re-export recovery items that are used externally
 pub use recovery::replay_wal_record;
 
+/// Test instrumentation for read-cost tests outside this module (`api` pathfinding).
+#[cfg(test)]
+pub(crate) use read::EDGES_EXAMINED;
+
 /// Largest node ID the database issues or accepts. IDs stay within `i64` so
 /// every binding can represent them.
 pub const MAX_NODE_ID: NodeId = i64::MAX as NodeId;
