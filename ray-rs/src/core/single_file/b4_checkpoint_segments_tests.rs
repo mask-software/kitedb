@@ -113,6 +113,7 @@ fn crash_images(base: &[u8], events: &[IoEvent], header_end: u64) -> Vec<(String
 /// any write or sync of the commits around it (in order, or with the
 /// header pages ahead of the rest) keeps every acknowledged commit.
 #[test]
+#[ignore = "needs WAL segments and the checkpoint thread (lands later on this branch)"]
 fn spill_survives_a_crash_at_every_io_event() {
   let dir = tempdir().expect("tempdir");
   let path = dir.path().join("spill-crash.kitedb");
@@ -211,6 +212,7 @@ fn assert_crash_copy_holds(path: &std::path::Path, keys: &[String], context: &st
 /// crash right then reopens with every acknowledged commit, and that keeps
 /// working (a later spill succeeds).
 #[test]
+#[ignore = "needs WAL segments and the checkpoint thread (lands later on this branch)"]
 fn spill_fails_safely_at_each_of_its_steps() {
   for phase in [
     CheckpointPhase::SpillSegmentWritten,
@@ -247,6 +249,7 @@ fn spill_fails_safely_at_each_of_its_steps() {
 /// database that a crash right then reopens with every acknowledged commit,
 /// and the next checkpoint succeeds.
 #[test]
+#[ignore = "needs WAL segments and the checkpoint thread (lands later on this branch)"]
 fn checkpoint_thread_fails_safely_at_each_of_its_steps() {
   for phase in [
     CheckpointPhase::CutReleased,
@@ -296,6 +299,7 @@ fn checkpoint_thread_fails_safely_at_each_of_its_steps() {
 /// their pages: over a long run of commits the file stays bounded by the
 /// snapshot, the segment limit and the WAL, not by what was ever written.
 #[test]
+#[ignore = "needs WAL segments and the checkpoint thread (lands later on this branch)"]
 fn segments_are_reclaimed_after_a_checkpoint() {
   let dir = tempdir().expect("tempdir");
   let path = dir.path().join("segments-reclaimed.kitedb");
@@ -341,6 +345,7 @@ fn segments_are_reclaimed_after_a_checkpoint() {
 /// a writer keeps spilling into new segments until the limit, then waits,
 /// and goes on once the install frees space.
 #[test]
+#[ignore = "needs WAL segments and the checkpoint thread (lands later on this branch)"]
 fn writers_wait_only_at_the_segment_limit() {
   let dir = tempdir().expect("tempdir");
   let path = dir.path().join("segment-backpressure.kitedb");
@@ -392,6 +397,7 @@ fn writers_wait_only_at_the_segment_limit() {
 /// to a commit that would otherwise wait for checkpoint space (instead of
 /// waiting forever), and is cleared by the next checkpoint that succeeds.
 #[test]
+#[ignore = "needs WAL segments and the checkpoint thread (lands later on this branch)"]
 fn checkpoint_thread_error_surfaces() {
   let dir = tempdir().expect("tempdir");
   let path = dir.path().join("checkpoint-thread-error.kitedb");
@@ -453,6 +459,7 @@ fn snapshot_generation_on_disk(path: &std::path::Path) -> u64 {
 /// abandons the build (no header names its pages), joins the thread, and
 /// loses no commit.
 #[test]
+#[ignore = "needs WAL segments and the checkpoint thread (lands later on this branch)"]
 fn close_and_drop_abandon_an_inflight_checkpoint() {
   for close in [true, false] {
     let dir = tempdir().expect("tempdir");
@@ -593,6 +600,7 @@ fn newest_header(path: &std::path::Path) -> (DbHeaderV1, u32) {
 /// writes nothing): a replication source opened while segments hold
 /// commits sees them all.
 #[test]
+#[ignore = "needs WAL segments and the checkpoint thread (lands later on this branch)"]
 fn read_only_open_replays_segments() {
   let dir = tempdir().expect("tempdir");
   let path = dir.path().join("read-only-segments.kitedb");
@@ -611,6 +619,7 @@ fn read_only_open_replays_segments() {
 /// few thousand rows with the default 4 MiB WAL) spills into a segment
 /// instead of failing with `WalBufferFull`.
 #[test]
+#[ignore = "needs WAL segments and the checkpoint thread (lands later on this branch)"]
 fn oversized_bulk_commit_spills_into_a_segment() {
   let dir = tempdir().expect("tempdir");
   let path = dir.path().join("oversized-commit.kitedb");

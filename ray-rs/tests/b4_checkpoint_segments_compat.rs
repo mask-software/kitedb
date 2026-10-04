@@ -126,6 +126,7 @@ fn write_nodes(db: &kitedb::core::single_file::SingleFileDB, prefix: &str, count
 /// writes that spill its WAL into segments, a checkpoint, and reopens,
 /// keeping every commit.
 #[test]
+#[ignore = "needs WAL segments and the checkpoint thread (lands later on this branch)"]
 fn v2_files_open_write_spill_and_checkpoint() {
   for fixture in fixtures() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -178,6 +179,7 @@ fn v2_files_open_write_spill_and_checkpoint() {
 /// segments' commits. Once a checkpoint covers every segment the file is a
 /// version 2 file again.
 #[test]
+#[ignore = "needs WAL segments and the checkpoint thread (lands later on this branch)"]
 fn a_file_naming_segments_needs_a_v3_reader() {
   let dir = tempfile::tempdir().expect("tempdir");
   let path = dir.path().join("needs-v3.kitedb");

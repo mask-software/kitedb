@@ -37,7 +37,7 @@ use super::recovery::{
   committed_transactions, drop_vectors_of_missing_nodes, replay_wal_record, scan_wal_records,
 };
 use super::vector::{apply_replayed_vectors, vector_store_state_from_snapshot};
-use super::{BackgroundCheckpointState, SchemaReservations, SingleFileDB};
+use super::{BackgroundCheckpointState, SchemaReservations, SingleFileDB, SingleFileInner};
 
 // ============================================================================
 // Open Options
@@ -1124,7 +1124,7 @@ fn open_single_file_internal(
     }
   }
 
-  Ok(SingleFileDB {
+  Ok(SingleFileDB::owning(SingleFileInner {
     path: path.to_path_buf(),
     read_only: options.read_only,
     closed: AtomicBool::new(false),
@@ -1178,7 +1178,7 @@ fn open_single_file_internal(
     commit_lock_wait_ns: AtomicU64::new(0),
     #[cfg(feature = "bench-profile")]
     wal_flush_ns: AtomicU64::new(0),
-  })
+  }))
 }
 
 /// Put the pages of the file no header slot names on the pager's free list,

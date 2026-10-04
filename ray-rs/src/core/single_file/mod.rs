@@ -257,8 +257,63 @@ impl SingleFileTxState {
 // Single-File Database
 // ============================================================================
 
-/// Single-file database handle
+/// Single-file database handle.
+///
+/// The database's state lives in a [`SingleFileInner`] the handle shares:
+/// the handle the application opened owns the database (dropping it
+/// persists what close would; `close_single_file` closes it), and work that
+/// runs on its own thread holds another handle to the same state, which owns
+/// nothing. Every method takes `&self` and reaches the state through
+/// `Deref`.
 pub struct SingleFileDB {
+  inner: std::sync::Arc<SingleFileInner>,
+  /// Whether this is the handle the application opened.
+  owner: bool,
+}
+
+impl std::ops::Deref for SingleFileDB {
+  type Target = SingleFileInner;
+
+  #[inline]
+  fn deref(&self) -> &SingleFileInner {
+    &self.inner
+  }
+}
+
+/// Tests that replace part of a database's state right after open (no other
+/// handle exists yet).
+#[cfg(test)]
+impl std::ops::DerefMut for SingleFileDB {
+  fn deref_mut(&mut self) -> &mut SingleFileInner {
+    std::sync::Arc::get_mut(&mut self.inner)
+      .expect("mutable access to a database's state needs its only handle")
+  }
+}
+
+impl SingleFileDB {
+  /// The handle the application opens, owning `inner`.
+  pub(crate) fn owning(inner: SingleFileInner) -> Self {
+    Self {
+      inner: std::sync::Arc::new(inner),
+      owner: true,
+    }
+  }
+
+  /// Another handle to the same database, owning nothing: dropping it
+  /// neither persists nor closes anything.
+  #[allow(dead_code)]
+  pub(crate) fn shared_handle(&self) -> Self {
+    Self {
+      inner: std::sync::Arc::clone(&self.inner),
+      owner: false,
+    }
+  }
+}
+
+/// The state of a single-file database, shared by its handles (see
+/// [`SingleFileDB`]).
+#[doc(hidden)]
+pub struct SingleFileInner {
   /// Database file path
   pub(crate) path: PathBuf,
   /// Read-only mode
@@ -492,7 +547,7 @@ impl BackgroundCheckpointState {
 /// After a successful close it does nothing.
 impl Drop for SingleFileDB {
   fn drop(&mut self) {
-    if self.read_only || self.closed.load(Ordering::Acquire) {
+    if !self.owner || self.read_only || self.closed.load(Ordering::Acquire) {
       return;
     }
     let persisted =
