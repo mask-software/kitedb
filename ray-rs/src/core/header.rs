@@ -270,7 +270,8 @@ impl DbHeaderV1 {
       wal_secondary_head: 0,
       active_wal_region: 0,
       checkpoint_in_progress: 0,
-      // The secondary region gets a salt when a checkpoint first writes there.
+      // Only version 2 checkpoints wrote the secondary region (and salted it
+      // first); this version never does.
       wal_primary_salt: INITIAL_WAL_SALT,
       wal_secondary_salt: 0,
       wal_segments: WalSegmentTable::default(),

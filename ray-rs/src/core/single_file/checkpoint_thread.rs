@@ -16,7 +16,8 @@
 //! wrote: they are free again, at the latest at the next open), a run in its
 //! install finishes it, and the thread is joined before anything else
 //! closes. No commit depends on a run: every one is in the WAL or a WAL
-//! segment.
+//! segment. Writers depend on runs only once the WAL segments reach their
+//! limit (see `wait_for_segment_space`).
 
 use std::cell::Cell;
 use std::sync::atomic::Ordering;
@@ -150,6 +151,8 @@ impl SingleFileDB {
       eprintln!("Warning: the checkpoint thread panicked");
     }
     self.checkpoint_abandoned.store(false, Ordering::Release);
+    // Writers waiting for it to free WAL segment space stop waiting.
+    self.notify_segment_waiters();
   }
 
   /// Whether a checkpoint thread runs for this database now.
@@ -158,23 +161,25 @@ impl SingleFileDB {
   }
 
   /// The error of the last checkpoint the checkpoint thread ran, if it
-  /// failed and none succeeded since. Automatic checkpoints report nothing
-  /// to the commit that asked for them; this is where their failures show,
-  /// besides the log (and the commits that would wait for one, once WAL
-  /// segments reach their limit).
+  /// failed and no checkpoint installed since. Automatic checkpoints report
+  /// nothing to the commit that asked for them; this is where their failures
+  /// show, besides the log, and in the writers that would wait for one once
+  /// the WAL segments reach their limit (`CheckpointFailed`).
   pub fn checkpoint_error(&self) -> Option<String> {
     self.checkpoint_last_error.lock().clone()
   }
 
+  /// Record a failed run's error (an install clears it; see
+  /// `install_snapshot`), and wake the writers waiting for WAL segment
+  /// space, who fail with it rather than wait for a checkpoint.
   fn record_checkpoint_result(&self, result: &crate::error::Result<()>) {
-    let mut last = self.checkpoint_last_error.lock();
     match result {
-      Ok(()) => *last = None,
       // Not failures: nothing ran.
-      Err(KiteError::CheckpointDeclined(_)) => {}
+      Ok(()) | Err(KiteError::CheckpointDeclined(_)) => {}
       Err(error) => {
         eprintln!("Warning: background checkpoint failed: {error}");
-        *last = Some(error.to_string());
+        *self.checkpoint_last_error.lock() = Some(error.to_string());
+        self.notify_segment_waiters();
       }
     }
   }

@@ -331,6 +331,29 @@ impl DetachedWriter {
   }
 }
 
+/// Reads ranges of the file without the pager: WAL segments a checkpoint
+/// replays, which writers only append to past what it reads, and which only
+/// that checkpoint's install frees. It reads through its own descriptor for
+/// the file.
+pub(crate) struct DetachedReader {
+  file: File,
+}
+
+impl DetachedReader {
+  /// Read `length` bytes at file `offset`, all inside the file.
+  pub(crate) fn read_range(&self, offset: u64, length: usize) -> Result<Vec<u8>> {
+    let mut buffer = vec![0u8; length];
+    let read = read_full_at(&self.file, &mut buffer, offset)?;
+    if read < length {
+      return Err(KiteError::Io(std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        format!("read {read} of {length} bytes at offset {offset}: the file ends"),
+      )));
+    }
+    Ok(buffer)
+  }
+}
+
 /// FilePager implementation for single-file database
 pub struct FilePager {
   file: File,
@@ -791,6 +814,13 @@ impl FilePager {
       file,
       full_fsync: self.full_fsync,
     })
+  }
+
+  /// A [`DetachedReader`] for this file: `None` where the platform cannot
+  /// open a second descriptor for it (WASI).
+  pub(crate) fn detached_reader(&self) -> Option<DetachedReader> {
+    let file = self.file.try_clone().ok()?;
+    Some(DetachedReader { file })
   }
 
   /// Relocate an area to a new location (for growth/compaction)

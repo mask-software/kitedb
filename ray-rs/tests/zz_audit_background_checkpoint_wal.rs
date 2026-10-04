@@ -1,5 +1,6 @@
-//! Auto-checkpoints must keep the WAL from filling up under a steady stream of
-//! small commits, in both blocking and background mode.
+//! Auto-checkpoints must keep the log (the WAL and its WAL segments) from
+//! growing without bound under a steady stream of small commits, in both
+//! blocking and background mode.
 //!
 //! Regression: after the first background checkpoint, the primary WAL region
 //! head was never reset, so `usage_ratio()` stayed above the threshold. Every
@@ -10,14 +11,13 @@ use kitedb::core::single_file::{close_single_file, open_single_file, SingleFileO
 use std::time::{Duration, Instant};
 
 const WAL_SIZE: usize = 64 * 1024;
-const THRESHOLD: f64 = 0.5;
-const COMMITS: usize = 2000;
+/// About four times the checkpoint trigger (four WALs) of log.
+const COMMITS: usize = 10_000;
 
 fn options(background: bool) -> SingleFileOpenOptions {
   SingleFileOpenOptions::new()
     .wal_size(WAL_SIZE)
     .auto_checkpoint(true)
-    .checkpoint_threshold(THRESHOLD)
     .background_checkpoint(background)
 }
 
@@ -34,18 +34,18 @@ fn commit_many_small_transactions(background: bool) {
       .unwrap_or_else(|error| panic!("commit #{index} failed: {error}"));
   }
 
-  // Let an in-flight checkpoint finish, then the WAL must be back below the
-  // threshold: checkpoints reclaim space instead of re-triggering forever.
-  let deadline = Instant::now() + Duration::from_secs(10);
-  while db.is_checkpoint_running() {
-    assert!(Instant::now() < deadline, "checkpoint did not finish");
+  // Once the checkpoint in flight (if any) installs, the log must be back
+  // below the checkpoint trigger: checkpoints reclaim it instead of
+  // re-triggering forever.
+  let deadline = Instant::now() + Duration::from_secs(20);
+  while db.should_checkpoint(1.0) || db.is_checkpoint_running() {
+    assert!(
+      Instant::now() < deadline,
+      "the log stayed at the checkpoint trigger after {COMMITS} commits: {:?}",
+      db.wal_stats()
+    );
     std::thread::sleep(Duration::from_millis(5));
   }
-  let stats = db.wal_stats();
-  assert!(
-    !db.should_checkpoint(THRESHOLD),
-    "WAL still above the checkpoint threshold after {COMMITS} commits: {stats:?}"
-  );
 
   close_single_file(db).expect("close");
   let reopened = open_single_file(&path, options(background)).expect("reopen");

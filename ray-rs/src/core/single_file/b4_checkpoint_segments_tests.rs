@@ -250,7 +250,6 @@ fn spill_fails_safely_at_each_of_its_steps() {
 /// database that a crash right then reopens with every acknowledged commit,
 /// and the next checkpoint succeeds.
 #[test]
-#[ignore = "needs WAL segments and the checkpoint thread (lands later on this branch)"]
 fn checkpoint_thread_fails_safely_at_each_of_its_steps() {
   for phase in [
     CheckpointPhase::CutReleased,
@@ -283,6 +282,9 @@ fn checkpoint_thread_fails_safely_at_each_of_its_steps() {
       !db.is_checkpoint_running()
     });
     assert_crash_copy_holds(&path, &acked, &format!("{phase:?}"));
+    // The checkpoint thread may have run again since (it retries); a commit
+    // gives the next checkpoint a WAL to spill and cover either way.
+    acked.extend(commit_keys(&db, "between", 0, 1));
     let covered = wal_segment_test_stats(&db).covered;
     db.background_checkpoint().expect("the next checkpoint");
     assert!(
@@ -300,7 +302,6 @@ fn checkpoint_thread_fails_safely_at_each_of_its_steps() {
 /// their pages: over a long run of commits the file stays bounded by the
 /// snapshot, the segment limit and the WAL, not by what was ever written.
 #[test]
-#[ignore = "needs WAL segments and the checkpoint thread (lands later on this branch)"]
 fn segments_are_reclaimed_after_a_checkpoint() {
   let dir = tempdir().expect("tempdir");
   let path = dir.path().join("segments-reclaimed.kitedb");
@@ -346,7 +347,6 @@ fn segments_are_reclaimed_after_a_checkpoint() {
 /// a writer keeps spilling into new segments until the limit, then waits,
 /// and goes on once the install frees space.
 #[test]
-#[ignore = "needs WAL segments and the checkpoint thread (lands later on this branch)"]
 fn writers_wait_only_at_the_segment_limit() {
   let dir = tempdir().expect("tempdir");
   let path = dir.path().join("segment-backpressure.kitedb");
@@ -398,7 +398,6 @@ fn writers_wait_only_at_the_segment_limit() {
 /// to a commit that would otherwise wait for checkpoint space (instead of
 /// waiting forever), and is cleared by the next checkpoint that succeeds.
 #[test]
-#[ignore = "needs WAL segments and the checkpoint thread (lands later on this branch)"]
 fn checkpoint_thread_error_surfaces() {
   let dir = tempdir().expect("tempdir");
   let path = dir.path().join("checkpoint-thread-error.kitedb");
@@ -455,21 +454,16 @@ fn snapshot_generation_on_disk(path: &std::path::Path) -> u64 {
     .active_snapshot_gen
 }
 
-/// S6. A writable database runs one checkpoint thread (a read-only one
-/// none). Closing it, or dropping it, while that thread builds a snapshot
-/// abandons the build (no header names its pages), joins the thread, and
-/// loses no commit.
+/// S6. A writable database runs one checkpoint thread, started by its first
+/// automatic checkpoint (a read-only one none). Closing it, or dropping it,
+/// while that thread builds a snapshot abandons the build (no header names
+/// its pages), joins the thread, and loses no commit.
 #[test]
-#[ignore = "needs WAL segments and the checkpoint thread (lands later on this branch)"]
 fn close_and_drop_abandon_an_inflight_checkpoint() {
   for close in [true, false] {
     let dir = tempdir().expect("tempdir");
     let path = dir.path().join("abandon-inflight.kitedb");
     let db = open_single_file(&path, options().sync_mode(SyncMode::Normal)).expect("open");
-    assert!(
-      checkpoint_thread_running(&db),
-      "a writable database runs no checkpoint thread"
-    );
     watch_checkpoint_phases(&db);
     let generation = db.header.read().active_snapshot_gen;
     let held = Arc::new(Barrier::new(2));
@@ -489,6 +483,10 @@ fn close_and_drop_abandon_an_inflight_checkpoint() {
       disarm_checkpoint_test_barrier(&db, CheckpointPhase::SnapshotDurable);
     }
     let acked = writer.join().expect("writer");
+    assert!(
+      checkpoint_thread_running(&db),
+      "close={close}: a writable database ran no checkpoint thread"
+    );
     let db = Arc::into_inner(db).expect("sole owner");
     let (closed, closing) = mpsc::channel();
     let closer = std::thread::spawn(move || {
@@ -636,138 +634,6 @@ fn oversized_bulk_commit_spills_into_a_segment() {
   close_single_file(db).expect("close");
   let reopened = open_single_file(&path, options()).expect("reopen");
   assert!(missing(&reopened, &keys).is_empty());
-}
-
-/// Write the v2 fixtures `tests/b4_checkpoint_segments_compat.rs` opens:
-/// files as today's writer (format version 2, before WAL segments) leaves
-/// them, including the background checkpoint states only it writes. Run
-/// with `cargo test --no-default-features --lib generate_v2_fixtures --
-/// --ignored` on a build that still has the dual-region write path; the
-/// files are committed under `tests/fixtures/v2_*.kitedb`.
-#[test]
-#[ignore = "writes the committed v2 fixtures; needs the v2 write path"]
-fn generate_v2_fixtures() {
-  let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
-  let dir = tempdir().expect("tempdir");
-  let options = || options().auto_checkpoint(false);
-  let pad = |prefix: &str, index: usize| format!("{prefix}-{index}-{}", "p".repeat(100));
-  let commit = |db: &SingleFileDB, prefix: &str, count: usize| {
-    for index in 0..count {
-      commit_key(db, &pad(prefix, index)).expect("commit");
-    }
-  };
-  let copy_as = |path: &std::path::Path, name: &str| {
-    std::fs::copy(path, fixtures.join(name)).expect("write fixture");
-  };
-
-  // v2_wal_records: a snapshot with nodes, edges and properties; committed
-  // records in the WAL; and an open transaction past 16 KiB of records, which
-  // a later commit's group writes to the WAL ahead of its own, so the header
-  // names them without a COMMIT (the crash drops it).
-  {
-    let path = dir.path().join("wal-records.kitedb");
-    let db = Arc::new(open_single_file(&path, options()).expect("open"));
-    db.begin(false).expect("begin");
-    let knows = db.define_etype("KNOWS").expect("etype");
-    let age = db.define_propkey("age").expect("propkey");
-    let mut previous = None;
-    for index in 0..50 {
-      let node = db.create_node(Some(&pad("snap", index))).expect("node");
-      db.set_node_prop(node, age, PropValue::I64(index as i64))
-        .expect("prop");
-      if let Some(previous) = previous {
-        db.add_edge(previous, knows, node).expect("edge");
-      }
-      previous = Some(node);
-    }
-    db.commit().expect("commit");
-    db.checkpoint().expect("checkpoint");
-    commit(&db, "wal", 30);
-    db.begin(false).expect("begin open transaction");
-    for index in 0..20 {
-      db.create_node(Some(&format!("open-{index}-{}", "o".repeat(1000))))
-        .expect("node");
-    }
-    std::thread::scope(|scope| {
-      scope.spawn(|| commit(&db, "late", 1));
-    });
-    copy_as(&path, "v2_wal_records.kitedb");
-    db.rollback().expect("rollback");
-  }
-
-  // v2_cut_in_progress: a background checkpoint held after writing its
-  // snapshot, with commits after its cut in the secondary region.
-  // v2_primary_retired: the same checkpoint's install done, the post-cut
-  // records still in the secondary region (not compacted into primary).
-  {
-    let path = dir.path().join("cut.kitedb");
-    let db = Arc::new(open_single_file(&path, options()).expect("open"));
-    watch_checkpoint_phases(&db);
-    commit(&db, "pre", 20);
-    let written = Arc::new(Barrier::new(2));
-    set_checkpoint_test_barrier(&db, CheckpointPhase::SnapshotDurable, Arc::clone(&written));
-    let retained = Arc::new(Barrier::new(2));
-    set_checkpoint_test_barrier(
-      &db,
-      CheckpointPhase::PostCutWalRetained,
-      Arc::clone(&retained),
-    );
-    let checkpoint = {
-      let db = Arc::clone(&db);
-      std::thread::spawn(move || db.background_checkpoint())
-    };
-    let deadline = Instant::now() + Duration::from_secs(10);
-    assert!(wait_for("the cut", deadline, || {
-      db.header.read().checkpoint_in_progress != 0
-    }));
-    commit(&db, "post", 20);
-    copy_as(&path, "v2_cut_in_progress.kitedb");
-    written.wait();
-    // Held at the barrier with the WAL locked: watch for it instead.
-    assert!(wait_for("the install", deadline, || {
-      checkpoint_test_reached(&db)
-        .iter()
-        .any(|(phase, _, parked)| *phase == CheckpointPhase::PostCutWalRetained && *parked)
-    }));
-    copy_as(&path, "v2_primary_retired.kitedb");
-    retained.wait();
-    checkpoint
-      .join()
-      .expect("checkpoint thread")
-      .expect("checkpoint");
-  }
-
-  // v2_cut_too_big: a cut whose post-cut records do not fit after the
-  // primary region's, so open cannot merge them back.
-  {
-    let path = dir.path().join("cut-too-big.kitedb");
-    let db = Arc::new(open_single_file(&path, options()).expect("open"));
-    let mut fills = 0;
-    while db.wal_stats().primary_head < 44 * 1024 {
-      commit_key(&db, &format!("fill-{fills}-{}", "f".repeat(1000))).expect("commit");
-      fills += 1;
-    }
-    let written = Arc::new(Barrier::new(2));
-    set_checkpoint_test_barrier(&db, CheckpointPhase::SnapshotDurable, Arc::clone(&written));
-    let checkpoint = {
-      let db = Arc::clone(&db);
-      std::thread::spawn(move || db.background_checkpoint())
-    };
-    let deadline = Instant::now() + Duration::from_secs(10);
-    assert!(wait_for("the cut", deadline, || {
-      db.header.read().checkpoint_in_progress != 0
-    }));
-    for index in 0..6 {
-      commit_key(&db, &format!("post-{index}-{}", "p".repeat(1000))).expect("commit");
-    }
-    copy_as(&path, "v2_cut_too_big.kitedb");
-    eprintln!("v2_cut_too_big: {fills} fill keys");
-    written.wait();
-    checkpoint
-      .join()
-      .expect("checkpoint thread")
-      .expect("checkpoint");
-  }
 }
 
 /// Options for a database whose WAL only spills (no automatic checkpoint).

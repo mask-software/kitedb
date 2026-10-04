@@ -96,11 +96,7 @@ fn corrupted_new_snapshot_is_refused(background: bool) {
   let db = Arc::new(open_single_file(&db_path, options()).expect("open"));
   commit_nodes(&db, "k1", 64);
   let header = db.header.read().clone();
-  // A fresh database has no free pages, so the snapshot is appended here.
-  let snapshot_offset = db
-    .snapshot_append_start_page(&header)
-    .expect("append start")
-    * header.page_size as u64;
+  let page_size = header.page_size as u64;
 
   let durable = Arc::new(Barrier::new(2));
   let reload = Arc::new(Barrier::new(2));
@@ -111,10 +107,11 @@ fn corrupted_new_snapshot_is_refused(background: bool) {
 
   // Written and synced; no header names it yet.
   durable.wait();
+  let snapshot_offset = checkpoint_test_snapshot_page(&db).expect("a snapshot written") * page_size;
   assert_eq!(
     read_u32_at(&db_path, snapshot_offset),
     MAGIC_SNAPSHOT,
-    "test setup: the new snapshot must start at the append page"
+    "test setup: the new snapshot must start at its first page"
   );
   // num_edges: covered by the footer CRC.
   flip_byte(&db_path, snapshot_offset + 40);
@@ -241,10 +238,29 @@ fn dangling_delta_edges_are_dropped(background: bool) {
 
   let missing: NodeId = 1_000_000;
   {
-    let mut delta = db.delta.write();
-    delta.add_edge(a, knows, missing);
-    delta.set_edge_prop(a, knows, missing, weight, PropValue::I64(1));
-    delta.add_edge(missing, knows, b);
+    use crate::core::wal::record::{build_add_edge_payload, build_set_edge_prop_payload};
+    commit_raw(
+      &db,
+      &[
+        (
+          WalRecordType::AddEdge,
+          build_add_edge_payload(a, knows, missing),
+        ),
+        (
+          WalRecordType::SetEdgeProp,
+          build_set_edge_prop_payload(a, knows, missing, weight, &PropValue::I64(1)),
+        ),
+        (
+          WalRecordType::AddEdge,
+          build_add_edge_payload(missing, knows, b),
+        ),
+      ],
+      |delta| {
+        delta.add_edge(a, knows, missing);
+        delta.set_edge_prop(a, knows, missing, weight, PropValue::I64(1));
+        delta.add_edge(missing, knows, b);
+      },
+    );
   }
 
   let result = run_checkpoint(&db, background);
@@ -278,6 +294,36 @@ fn k2_background_checkpoint_drops_dangling_delta_edges() {
 // K3: vectors of nodes that do not exist must not reach a snapshot
 // ============================================================================
 
+/// Commit a transaction of `records` (type and payload) straight to the WAL,
+/// as an older version or a racing writer could have, and apply `apply` to
+/// the committed delta as its commit did: the log and the delta agree, so a
+/// checkpoint replaying the log sees it as well as one copying the delta.
+fn commit_raw(
+  db: &SingleFileDB,
+  records: &[(WalRecordType, Vec<u8>)],
+  apply: impl FnOnce(&mut DeltaState),
+) {
+  use crate::core::wal::record::{build_begin_payload, build_commit_payload, WalRecord};
+  let txid = db.next_tx_id.fetch_add(1, Ordering::SeqCst);
+  let mut bytes = WalRecord::new(WalRecordType::Begin, txid, build_begin_payload()).build();
+  for (record_type, payload) in records {
+    bytes.extend(WalRecord::new(*record_type, txid, payload.clone()).build());
+  }
+  bytes.extend(WalRecord::new(WalRecordType::Commit, txid, build_commit_payload()).build());
+  {
+    let mut pager = db.pager.lock();
+    let mut wal = db.wal_buffer.lock();
+    let mut header = db.header.write();
+    wal.write_record_bytes_batch(&bytes).expect("append");
+    wal.flush(&mut pager).expect("flush");
+    wal.store_in_header(&mut header);
+    header.next_tx_id = db.next_tx_id.load(Ordering::SeqCst);
+    db.persist_header(&mut pager, &mut header, true)
+      .expect("header");
+  }
+  apply(&mut db.delta.write());
+}
+
 /// A node deleted the way older versions did (no vector deletes), so its
 /// vector stays in the store. The checkpoint copies the store unfiltered, so
 /// the new snapshot (and every one after it) holds a vector for a node it
@@ -301,7 +347,14 @@ fn vectors_of_missing_nodes_are_dropped(background: bool) {
   db.checkpoint().expect("first checkpoint");
 
   // An older version's delete: the node goes, its vector stays.
-  db.delta.write().delete_node(gone);
+  commit_raw(
+    &db,
+    &[(
+      WalRecordType::DeleteNode,
+      crate::core::wal::record::build_delete_node_payload(gone),
+    )],
+    |delta| delta.delete_node(gone),
+  );
   run_checkpoint(&db, background).expect("checkpoint");
   db.materialize_all_vector_stores()
     .expect("materialize stores");
@@ -514,7 +567,7 @@ fn k4_failed_sidecar_publish_fences_the_sidecar_and_the_checkpoint_proceeds() {
 
 /// Guard: passes on 39fefea (`exclusive_checkpoint_gate` waits for a running
 /// background checkpoint). A blocking checkpoint or optimize between a
-/// background cut and its install would reset the WAL holding the post-cut
+/// background cut and its install would empty the log holding the post-cut
 /// commits, and the background install would then replace its snapshot.
 #[test]
 fn k5_blocking_checkpoint_and_optimize_wait_for_a_running_background_checkpoint() {
@@ -528,9 +581,7 @@ fn k5_blocking_checkpoint_and_optimize_wait_for_a_running_background_checkpoint(
   set_checkpoint_test_barrier(&db, CheckpointPhase::SnapshotDurable, Arc::clone(&parked));
   let background_db = Arc::clone(&db);
   let background = std::thread::spawn(move || background_db.background_checkpoint());
-  wait_until("background cut", || {
-    db.header.read().checkpoint_in_progress != 0
-  });
+  wait_until("background cut", || checkpoint_test_cuts(&db) > 0);
   commit_nodes(&db, "k5-after-cut", 8);
 
   let blocking_db = Arc::clone(&db);

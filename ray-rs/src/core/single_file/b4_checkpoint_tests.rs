@@ -78,7 +78,7 @@ fn f3_background_checkpoint_declines_while_an_exclusive_operation_waits() {
       let db = Arc::clone(&db);
       std::thread::spawn(move || db.background_checkpoint())
     };
-    wait_until("B1's cut", || db.header.read().checkpoint_in_progress != 0);
+    wait_until("B1's cut", || checkpoint_test_cuts(&db) > 0);
     commit_node(&db, "post-cut");
 
     // E takes the gate, sees B1 running, and goes to wait.

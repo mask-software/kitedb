@@ -61,11 +61,11 @@ fn crash_images(base: &[u8], events: &[IoEvent], header_end: u64) -> Vec<(String
 }
 
 /// Post-cut commits spanning several WAL pages; the checkpoint thread's
-/// writes and syncs from the moment they are acknowledged (the install,
-/// its move-back, and their headers) are applied to a copy of the file
+/// writes and syncs from the moment they are acknowledged (the install's
+/// headers, and the frees after them) are applied to a copy of the file
 /// taken then.
 #[test]
-fn f5_crash_during_install_and_move_back_keeps_every_commit() {
+fn f5_crash_during_install_keeps_every_commit() {
   let _serial = checkpoint_test_serial();
   let dir = tempdir().expect("tempdir");
   let path = dir.path().join("f5-install.kitedb");
@@ -86,7 +86,7 @@ fn f5_crash_during_install_and_move_back_keeps_every_commit() {
     std::thread::spawn(move || io_hooks::record_io_during(|| db.background_checkpoint()))
   };
   let deadline = Instant::now() + Duration::from_secs(10);
-  while db.header.read().checkpoint_in_progress == 0 {
+  while checkpoint_test_cuts(&db) == 0 {
     assert!(Instant::now() < deadline, "the cut never happened");
     std::thread::yield_now();
   }
@@ -106,14 +106,14 @@ fn f5_crash_during_install_and_move_back_keeps_every_commit() {
   assert_eq!(
     (stats.active_region, stats.tail),
     (0, 0),
-    "the post-cut records were not moved back to the primary region"
+    "the post-cut records are not in the WAL's primary region"
   );
   assert!(stats.primary_head > 0);
   assert!(
     events
       .iter()
-      .any(|event| matches!(event, IoEvent::Write { offset, .. } if *offset >= header_end)),
-    "the install wrote no WAL bytes: {events:?}"
+      .any(|event| matches!(event, IoEvent::Write { offset, .. } if *offset < header_end)),
+    "the install wrote no header: {events:?}"
   );
   drop(db);
 

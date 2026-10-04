@@ -349,8 +349,8 @@ pub struct SingleFileInner {
   /// All transactions that have begun and have not finished commit/rollback.
   pub(crate) active_transactions: AtomicUsize,
   /// Write transactions that wrote a BEGIN record and have not finished
-  /// commit/rollback. A background checkpoint cut copies the WAL records of
-  /// those still unterminated into the secondary region.
+  /// commit/rollback. A spill notes those it moves records of into a WAL
+  /// segment (`spilled_open_txids`).
   pub(crate) open_write_txids: Mutex<HashSet<TxId>>,
 
   /// Read permits cover transaction creation; the blocking checkpoint takes
@@ -363,11 +363,16 @@ pub struct SingleFileInner {
   /// Signaled when the last open transaction finishes and when a background
   /// checkpoint returns to idle.
   pub(crate) checkpoint_cv: Condvar,
-  /// Paired with `cut_cv`, like `checkpoint_wait` with `checkpoint_cv`.
-  pub(crate) cut_wait: Mutex<()>,
-  /// Signaled when a background checkpoint's cut is installed or released;
-  /// writers waiting for that in `wait_for_cut_release` park here.
-  pub(crate) cut_cv: Condvar,
+  /// Paired with `segment_space_cv`, like `checkpoint_wait` with
+  /// `checkpoint_cv`.
+  pub(crate) segment_space_wait: Mutex<()>,
+  /// Signaled when a checkpoint installs (freeing WAL segments), when a
+  /// background checkpoint run ends, and when the checkpoint thread stops;
+  /// writers waiting for WAL segment space (`wait_for_segment_space`) park
+  /// here.
+  pub(crate) segment_space_cv: Condvar,
+  /// Writers waiting in `wait_for_segment_space` now.
+  pub(crate) segment_waiters: AtomicUsize,
 
   /// Serializes writing commits: a commit group's checks, WAL records,
   /// header and replication frames (see `transaction::write_commit_round`).
@@ -404,26 +409,13 @@ pub struct SingleFileInner {
   /// Pending name claims; never persisted in a snapshot or WAL.
   pub(crate) schema_reservations: Mutex<SchemaReservations>,
 
-  /// Enable auto-checkpoint when WAL usage exceeds threshold
+  /// Checkpoint automatically once the log reaches the checkpoint trigger
+  /// (see `checkpoint_log_trigger`)
   pub(crate) auto_checkpoint: bool,
-  /// WAL usage threshold (0.0-1.0) to trigger auto-checkpoint
-  pub(crate) checkpoint_threshold: f64,
   /// Use background (non-blocking) checkpoint instead of blocking
   pub(crate) background_checkpoint: bool,
-  /// Which background checkpoint runs, and which one owns the current cut
+  /// Which background checkpoint runs
   pub(crate) checkpoint_state: Mutex<BackgroundCheckpointState>,
-  /// Bumped as a background checkpoint makes progress, so writers waiting
-  /// for its install can tell a slow checkpoint from a stalled one.
-  pub(crate) checkpoint_progress: AtomicU64,
-  /// Checkpoint steps running that note no progress until they end (one
-  /// serialization, parse, or fsync of a whole snapshot, which takes seconds
-  /// on a large database). Writers waiting for an install treat a checkpoint
-  /// inside one as working, however long it takes.
-  pub(crate) checkpoint_steps_running: AtomicUsize,
-  /// Set when writers cancel the running background checkpoint's cut, until
-  /// that run ends: it stops at its next progress point instead of finishing
-  /// a snapshot no header will name while it holds the checkpoint status.
-  pub(crate) checkpoint_cancelled: AtomicBool,
 
   /// Vector stores keyed by property key ID
   /// Each property key can have its own vector store with different dimensions
@@ -462,10 +454,10 @@ pub struct SingleFileInner {
   pub(crate) wal_segment_limit_bytes: AtomicU64,
   /// Spills of the WAL into WAL segments so far.
   pub(crate) wal_spills: AtomicU64,
-  /// Write transactions that had records in the WAL when it spilled: some of
-  /// their records are in a WAL segment, which a background checkpoint's cut
-  /// cannot copy to the secondary region with the others.
-  pub(crate) spilled_open_txids: Mutex<HashSet<TxId>>,
+  /// Write transactions still open with records in a WAL segment, each with
+  /// the seq of the oldest segment holding one: a checkpoint keeps that
+  /// segment and every later one, so the transaction can still commit.
+  pub(crate) spilled_open_txids: Mutex<HashMap<TxId, u64>>,
 
   /// Synchronization mode for WAL writes
   pub(crate) sync_mode: open::SyncMode,
@@ -513,9 +505,11 @@ impl<T> std::ops::DerefMut for CacheAligned<T> {
 pub enum CheckpointStatus {
   /// No checkpoint in progress
   Idle,
-  /// Background checkpoint is running (writes go to secondary WAL)
+  /// Background checkpoint is running (cutting the log, building and
+  /// writing its snapshot); writes go on
   Running,
-  /// Completing checkpoint (brief lock for final updates)
+  /// Background checkpoint is replaying the commits since its cut and
+  /// installing its snapshot (commits wait only for the install itself)
   Completing,
 }
 
@@ -529,23 +523,6 @@ pub(crate) struct BackgroundCheckpointState {
   pub(crate) status: CheckpointStatus,
   /// The latest run to claim `status`.
   pub(crate) run: u64,
-  /// The run whose cut is durable but neither installed nor released. It is
-  /// set by that run's cut under the checkpoint gate and the commit lock, and
-  /// cleared under the commit lock (and the WAL lock) by its install, by its
-  /// release of the cut after a failure, or by a writer cancelling it as
-  /// stalled; or, last resort, when the run ends. Writers that find the
-  /// secondary region full wait only while some run owns the cut.
-  pub(crate) cut_owner: Option<u64>,
-  /// Counts cuts taken. Writers wait for one cut by its number, so a run's
-  /// next pass cannot keep them waiting after the cut they hit is installed.
-  pub(crate) cut: u64,
-  /// A writer waited for the current cut's install, so its run takes another
-  /// pass once it installs.
-  pub(crate) writers_waited: bool,
-  /// Open transactions whose records did not fit in the secondary region at
-  /// the last declined cut. A cut is not retried before one of them
-  /// finishes: until then the copies only grow.
-  pub(crate) declined_carry: Option<HashSet<TxId>>,
   /// Blocking checkpoints, optimizes, vacuums and WAL resizes waiting in
   /// `exclusive_checkpoint_gate`. While any wait, new background checkpoints
   /// decline instead of claiming `status` ahead of them: a waiter that finds
@@ -559,20 +536,8 @@ impl Default for BackgroundCheckpointState {
     Self {
       status: CheckpointStatus::Idle,
       run: 0,
-      cut_owner: None,
-      cut: 0,
-      writers_waited: false,
-      declined_carry: None,
       exclusive_waiters: 0,
     }
-  }
-}
-
-impl BackgroundCheckpointState {
-  /// Whether cut number `cut` is still durable and neither installed nor
-  /// released.
-  pub(crate) fn holds_cut(&self, cut: u64) -> bool {
-    self.cut_owner.is_some() && self.cut == cut
   }
 }
 
@@ -681,10 +646,10 @@ impl SingleFileDB {
     self.checkpoint_cv.notify_all();
   }
 
-  /// Wake writers in `wait_for_cut_release`, the same way.
-  pub(crate) fn notify_cut_waiters(&self) {
-    let _wait = self.cut_wait.lock();
-    self.cut_cv.notify_all();
+  /// Wake writers in `wait_for_segment_space`, the same way.
+  pub(crate) fn notify_segment_waiters(&self) {
+    let _wait = self.segment_space_wait.lock();
+    self.segment_space_cv.notify_all();
   }
 
   /// Database file path

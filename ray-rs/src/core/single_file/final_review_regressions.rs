@@ -1,25 +1,24 @@
 //! Regression tests from the final review of the background-checkpoint batch
 //! (14ed498..6bf4d17), each written to fail before its fix:
 //!
-//! - WAL heads misread from the header of a cut taken while the primary region
-//!   was empty (open failed, or replayed stale bytes of an earlier WAL cycle);
+//! - WAL heads misread from the header of a cut taken while the WAL was
+//!   empty (open failed, or replayed stale bytes of an earlier WAL cycle);
 //! - a transaction's view taken between a background install's snapshot swap
 //!   and its delta swap (a committed `add_edge` was lost);
-//! - writers cancelling a working checkpoint, then refusing commits for good;
 //! - the smaller risks the review listed: MVCC commit order, refused vector
-//!   commits, retained WAL compaction, unknown WAL record types, cuts that can't
-//!   be resumed, and the error for a still-declined cut.
+//!   commits, and unknown WAL record types.
+//!
+//! (Those about the dual-region WAL's cuts went with it: stalled-cut
+//! cancellation, retained WAL compaction, unresumable and declined cuts.)
 //!
 //! Included from checkpoint.rs, so its test hooks are in scope. The randomized
 //! crash-image stress test runs one short round by default; `SCRATCH_ITERS`,
 //! `SCRATCH_MS`, `SCRATCH_CHAOS` (e.g. `bg,cp,opt,vac`), `SCRATCH_MODE`
 //! (`ro`/`rw`), `SCRATCH_MVCC` (`0` runs it without MVCC; MVCC is the
 //! default), `SCRATCH_GROUP`, `SCRATCH_BLOCKING`, and `SCRATCH_WAL_KIB` tune
-//! it. The two large-database measurements are
-//! `#[ignore]`d (see their docs).
+//! it. The large-database measurement is `#[ignore]`d (see its docs).
 use super::*;
-use crate::core::single_file::{open_single_file, SingleFileOpenOptions, SyncMode};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use crate::core::single_file::{open_single_file, SingleFileOpenOptions};
 use std::sync::{mpsc, Arc, Barrier};
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
@@ -44,25 +43,46 @@ fn crash_copy(db_path: &std::path::Path, tag: &str) -> std::path::PathBuf {
   copy
 }
 
-/// A background cut taken while the primary region is empty (right after a
-/// blocking checkpoint, optimize, or vacuum, or an explicit call on an idle
-/// database), then one post-cut commit, then a crash before the install.
+/// Commit `count` nodes keyed `prefix-i` in one bulk transaction, whose
+/// records (kept in memory until its commit) do not fit in a 64 KiB WAL: the
+/// commit goes straight to a WAL segment, and leaves the WAL empty.
+fn commit_bulk_past_the_wal(db: &SingleFileDB, prefix: &str, count: usize) {
+  let keys: Vec<String> = (0..count)
+    .map(|index| format!("{prefix}-{index}-{}", "b".repeat(300)))
+    .collect();
+  let key_refs: Vec<Option<&str>> = keys.iter().map(|key| Some(key.as_str())).collect();
+  db.begin_bulk().expect("begin bulk");
+  db.create_nodes_batch(&key_refs).expect("create nodes");
+  db.commit().expect("commit bulk");
+  assert_eq!(
+    db.wal_stats().primary_head,
+    0,
+    "setup: the WAL should be empty"
+  );
+}
+
+/// A background cut taken while the WAL is empty (right after a blocking
+/// checkpoint, optimize, or vacuum, then a commit too big for the WAL, which
+/// went to a WAL segment), then one post-cut commit, then a crash before the
+/// install.
 #[test]
-fn scratch_cut_with_empty_primary_then_crash_is_openable() {
+fn scratch_cut_with_empty_wal_then_crash_is_openable() {
   let _serial = checkpoint_test_serial();
   let temp_dir = tempdir().expect("temp dir");
-  let db_path = temp_dir.path().join("scratch-empty-primary-cut.kitedb");
-  let options = SingleFileOpenOptions::new().auto_checkpoint(false);
+  let db_path = temp_dir.path().join("scratch-empty-wal-cut.kitedb");
+  let options = SingleFileOpenOptions::new()
+    .wal_size(64 * 1024)
+    .auto_checkpoint(false);
   let db = Arc::new(open_single_file(&db_path, options.clone()).expect("open"));
   commit_node(&db, "before");
   db.checkpoint().expect("blocking checkpoint");
-  assert_eq!(db.wal_stats().primary_head, 0, "primary should be empty");
+  commit_bulk_past_the_wal(&db, "bulk", 300);
 
   let parked = Arc::new(Barrier::new(2));
   set_checkpoint_test_barrier(&db, CheckpointPhase::SnapshotDurable, Arc::clone(&parked));
   let cp_db = Arc::clone(&db);
   let cp = std::thread::spawn(move || cp_db.background_checkpoint());
-  wait_until("cut", || db.header.read().checkpoint_in_progress != 0);
+  wait_until("cut", || checkpoint_test_cuts(&db) > 0);
   commit_node(&db, "post-cut");
   {
     let h = db.header.read();
@@ -81,6 +101,9 @@ fn scratch_cut_with_empty_primary_then_crash_is_openable() {
     match opened {
       Ok(crashed) => {
         assert!(crashed.node_by_key("before").is_some());
+        assert!(crashed
+          .node_by_key(&format!("bulk-299-{}", "b".repeat(300)))
+          .is_some());
         assert!(
           crashed.node_by_key("post-cut").is_some(),
           "post-cut lost (read_only={read_only})"
@@ -98,15 +121,16 @@ fn set_prop(db: &SingleFileDB, node: NodeId, key: PropKeyId, value: &str) {
   db.commit().expect("commit");
 }
 
-/// Same empty-primary cut, but no post-cut commit: the marker header names
-/// wal_primary_head = 0 and wal_head = secondary start. Records of earlier
-/// WAL cycles are still in the primary region's bytes.
+/// Same empty-WAL cut, but no post-cut commit: the header names an empty
+/// WAL. Records of earlier WAL cycles are still in the WAL's bytes.
 #[test]
-fn scratch_cut_with_empty_primary_crash_does_not_replay_stale_wal_bytes() {
+fn scratch_cut_with_empty_wal_crash_does_not_replay_stale_wal_bytes() {
   let _serial = checkpoint_test_serial();
   let temp_dir = tempdir().expect("temp dir");
-  let db_path = temp_dir.path().join("scratch-empty-primary-stale.kitedb");
-  let options = SingleFileOpenOptions::new().auto_checkpoint(false);
+  let db_path = temp_dir.path().join("scratch-empty-wal-stale.kitedb");
+  let options = SingleFileOpenOptions::new()
+    .wal_size(64 * 1024)
+    .auto_checkpoint(false);
   let db = Arc::new(open_single_file(&db_path, options.clone()).expect("open"));
   db.begin(false).expect("begin");
   let node = db.create_node(Some("n")).expect("node");
@@ -126,12 +150,13 @@ fn scratch_cut_with_empty_primary_crash_does_not_replay_stale_wal_bytes() {
     db.node_prop(node, key),
     Some(PropValue::String("CCCC".into()))
   );
+  commit_bulk_past_the_wal(&db, "bulk", 300);
 
   let parked = Arc::new(Barrier::new(2));
   set_checkpoint_test_barrier(&db, CheckpointPhase::SnapshotDurable, Arc::clone(&parked));
   let cp_db = Arc::clone(&db);
   let cp = std::thread::spawn(move || cp_db.background_checkpoint());
-  wait_until("cut", || db.header.read().checkpoint_in_progress != 0);
+  wait_until("cut", || checkpoint_test_cuts(&db) > 0);
   let copy = crash_copy(&db_path, "stale");
   parked.wait();
   cp.join().unwrap().expect("checkpoint");
@@ -532,13 +557,12 @@ fn scratch_stress_crash_images_under_concurrent_background_checkpoints() {
   }
 }
 
-/// No crash: a background checkpoint whose primary region was empty at its
-/// cut stops before its install (panic here; the same state follows an
-/// install that fails and cannot be released). Vacuum rebuilds the WAL buffer
-/// from the header (WalBuffer::from_header), then the next background
-/// checkpoint resumes the cut.
+/// No crash: a background checkpoint stops before its install (a panic
+/// here). Vacuum rebuilds the WAL buffer from the header
+/// (WalBuffer::from_header), then the next background checkpoint runs; no
+/// value reverts to one of an earlier WAL cycle.
 #[test]
-fn scratch_vacuum_over_abandoned_empty_primary_cut_keeps_values() {
+fn scratch_vacuum_after_a_stopped_background_checkpoint_keeps_values() {
   let _serial = checkpoint_test_serial();
   let temp_dir = tempdir().expect("temp dir");
   let db_path = temp_dir.path().join("scratch-vacuum-abandoned.kitedb");
@@ -554,6 +578,8 @@ fn scratch_vacuum_over_abandoned_empty_primary_cut_keeps_values() {
   db.checkpoint().expect("checkpoint 1");
   set_prop(&db, node, key, "CCCC");
   db.checkpoint().expect("checkpoint 2");
+  // A transaction of the same shape: the only record of the log.
+  set_prop(&db, node, key, "DDDD");
 
   let cp_db = Arc::clone(&db);
   let panicked = std::thread::spawn(move || {
@@ -562,10 +588,9 @@ fn scratch_vacuum_over_abandoned_empty_primary_cut_keeps_values() {
   })
   .join();
   assert!(panicked.is_err());
-  assert_eq!(
-    db.header.read().checkpoint_in_progress,
-    1,
-    "cut left behind"
+  assert!(
+    !db.is_checkpoint_running(),
+    "the panicked run left the checkpoint running"
   );
 
   db.vacuum_single_file(None).expect("vacuum");
@@ -584,12 +609,12 @@ fn scratch_vacuum_over_abandoned_empty_primary_cut_keeps_values() {
   eprintln!("reopened p = {durable:?}");
   assert_eq!(
     live,
-    Some(PropValue::String("CCCC".into())),
+    Some(PropValue::String("DDDD".into())),
     "live value reverted"
   );
   assert_eq!(
     durable,
-    Some(PropValue::String("CCCC".into())),
+    Some(PropValue::String("DDDD".into())),
     "durable value reverted"
   );
 }
@@ -622,7 +647,7 @@ fn scratch_open_transaction_add_during_install_swap_is_not_lost() {
   set_checkpoint_test_barrier(&db, CheckpointPhase::CutReleased, Arc::clone(&released));
   let cp_db = Arc::clone(&db);
   let cp = std::thread::spawn(move || cp_db.background_checkpoint());
-  wait_until("cut", || db.header.read().checkpoint_in_progress != 0);
+  wait_until("cut", || checkpoint_test_cuts(&db) > 0);
 
   // C2, post-cut: delete the edge.
   db.begin(false).expect("begin");
@@ -712,98 +737,6 @@ fn scratch_diag(db: &SingleFileDB, node: NodeId, key: PropKeyId, v: u64) -> Stri
     }
   }
   out
-}
-
-/// Measurement: the longest interval in which a background checkpoint of a
-/// database with SCRATCH_NODES nodes (and as many edges) does not bump
-/// `checkpoint_progress`, and the longest in which it also runs no
-/// `checkpoint_step`: it looks stalled only then, and writers cancel its cut
-/// after 5 s of that.
-#[test]
-#[ignore]
-fn scratch_measure_longest_no_progress_interval() {
-  use std::sync::atomic::{AtomicBool, Ordering as AO};
-  let nodes: usize = std::env::var("SCRATCH_NODES")
-    .ok()
-    .and_then(|v| v.parse().ok())
-    .unwrap_or(1_000_000);
-  let temp_dir = tempdir().expect("temp dir");
-  let db_path = temp_dir.path().join("scratch-measure.kitedb");
-  let options = SingleFileOpenOptions::new()
-    .auto_checkpoint(false)
-    .wal_size(256 * 1024 * 1024)
-    .sync_mode(crate::core::single_file::SyncMode::Normal);
-  let db = Arc::new(open_single_file(&db_path, options).expect("open"));
-  let started = Instant::now();
-  db.begin(false).expect("begin");
-  let e = db.define_etype("E").expect("etype");
-  let name = db.define_propkey("name").expect("propkey");
-  db.commit().expect("commit");
-  let mut prev = None;
-  let batch = 20_000;
-  for chunk in 0..nodes.div_ceil(batch) {
-    db.begin(false).expect("begin");
-    for i in 0..batch.min(nodes - chunk * batch) {
-      let n = db
-        .create_node(Some(&format!("node-{chunk}-{i}")))
-        .expect("node");
-      db.set_node_prop(n, name, PropValue::String(format!("value-{chunk}-{i}")))
-        .expect("prop");
-      if let Some(p) = prev {
-        db.add_edge(p, e, n).expect("edge");
-      }
-      prev = Some(n);
-    }
-    db.commit().expect("commit");
-    if chunk % 10 == 9 {
-      db.checkpoint().expect("checkpoint");
-    }
-  }
-  db.checkpoint().expect("checkpoint");
-  eprintln!(
-    "built {nodes} nodes in {:?}; file {} MB",
-    started.elapsed(),
-    std::fs::metadata(&db_path).unwrap().len() / 1_000_000
-  );
-  commit_node(&db, "one-more"); // something for the background checkpoint to fold in
-
-  let done = Arc::new(AtomicBool::new(false));
-  let sampler = {
-    let db = Arc::clone(&db);
-    let done = Arc::clone(&done);
-    std::thread::spawn(move || {
-      let mut last = db.checkpoint_progress.load(AO::Relaxed);
-      let mut last_change = Instant::now();
-      let mut last_live = Instant::now();
-      let mut longest = Duration::ZERO;
-      let mut longest_stalled = Duration::ZERO;
-      while !done.load(AO::Relaxed) {
-        std::thread::sleep(Duration::from_millis(5));
-        let now = db.checkpoint_progress.load(AO::Relaxed);
-        if now != last {
-          last = now;
-          last_change = Instant::now();
-        }
-        if db.checkpoint_steps_running.load(AO::Relaxed) > 0 {
-          last_live = Instant::now();
-        }
-        longest = longest.max(last_change.elapsed());
-        longest_stalled = longest_stalled.max(last_change.max(last_live).elapsed());
-      }
-      (longest, longest_stalled)
-    })
-  };
-  let t = Instant::now();
-  db.background_checkpoint().expect("background checkpoint");
-  done.store(true, AO::Relaxed);
-  let (longest, longest_stalled) = sampler.join().unwrap();
-  eprintln!(
-    "background checkpoint took {:?}; longest interval without progress {:?}; longest that \
-     looked stalled (no progress, no step running) {:?}",
-    t.elapsed(),
-    longest,
-    longest_stalled
-  );
 }
 
 /// Measurement: a 1M-node database with the default 4 MB WAL under two
@@ -944,175 +877,6 @@ fn scratch_large_db_background_checkpoints_under_sustained_writes() {
   );
 }
 
-/// Commit nodes with `bytes`-long keys from a writer loop until `stop`,
-/// counting commits and refusals (`WalBufferFull`); any other error is
-/// recorded in `errors`.
-fn spawn_counting_writer(
-  db: &Arc<SingleFileDB>,
-  name: &'static str,
-  bytes: usize,
-  stop: &Arc<AtomicBool>,
-  committed: &Arc<AtomicU64>,
-  refused: &Arc<AtomicU64>,
-  errors: &Arc<std::sync::Mutex<Vec<String>>>,
-) -> std::thread::JoinHandle<()> {
-  let (db, stop, committed, refused, errors) = (
-    Arc::clone(db),
-    Arc::clone(stop),
-    Arc::clone(committed),
-    Arc::clone(refused),
-    Arc::clone(errors),
-  );
-  std::thread::spawn(move || {
-    let mut index = 0u64;
-    while !stop.load(AtomicOrdering::Relaxed) {
-      index += 1;
-      let key = format!("{name}-{index}-{}", "k".repeat(bytes));
-      let result = (|| -> Result<()> {
-        db.begin(false)?;
-        db.create_node(Some(&key))?;
-        db.commit()
-      })();
-      match result {
-        Ok(()) => {
-          committed.fetch_add(1, AtomicOrdering::SeqCst);
-        }
-        Err(error) => {
-          let _ = db.rollback();
-          if matches!(error, KiteError::WalBufferFull) {
-            refused.fetch_add(1, AtomicOrdering::SeqCst);
-          } else {
-            errors
-              .lock()
-              .unwrap()
-              .push(format!("{name} #{index}: {error}"));
-          }
-          std::thread::sleep(Duration::from_millis(1));
-        }
-      }
-    }
-  })
-}
-
-/// A checkpoint step that runs longer than the stall timeout without noting
-/// progress (serializing, parsing, or syncing a ~100 MB snapshot takes
-/// seconds) is working, not stalled: writers waiting for its install keep
-/// waiting. Regression: they cancelled the cut after 5 s without a progress
-/// bump, so on a modest database every background checkpoint under sustained
-/// writes was cancelled and its work thrown away.
-#[test]
-fn slow_checkpoint_step_is_not_cancelled_by_waiting_writers() {
-  let _serial = checkpoint_test_serial();
-  let temp_dir = tempdir().expect("temp dir");
-  let db_path = temp_dir.path().join("slow-step.kitedb");
-  let options = SingleFileOpenOptions::new()
-    .wal_size(64 * 1024)
-    .auto_checkpoint(false)
-    .sync_mode(SyncMode::Normal);
-  let db = Arc::new(open_single_file(&db_path, options.clone()).expect("open"));
-  commit_node(&db, "before");
-  set_checkpoint_test_stall_timeout(&db, Duration::from_millis(300));
-  set_checkpoint_test_step_delay(&db, "serialize snapshot", Duration::from_millis(1500));
-
-  let cp_db = Arc::clone(&db);
-  let cp = std::thread::spawn(move || cp_db.background_checkpoint());
-  wait_until("cut", || db.header.read().checkpoint_in_progress != 0);
-  // 60 commits of ~600 bytes overflow the 16 KiB secondary region, so the
-  // writer waits for the install while serialization is slow.
-  let writer_db = Arc::clone(&db);
-  let writer = std::thread::spawn(move || -> Result<()> {
-    for index in 0..60 {
-      writer_db.begin(false)?;
-      writer_db.create_node(Some(&format!("during-{index}-{}", "x".repeat(560))))?;
-      writer_db.commit()?;
-    }
-    Ok(())
-  });
-
-  let result = cp.join().expect("checkpoint thread");
-  let written = writer.join().expect("writer thread");
-  assert!(
-    result.is_ok(),
-    "the working checkpoint was cancelled: {result:?}"
-  );
-  written.expect("writer");
-  let db = Arc::try_unwrap(db).ok().expect("sole owner");
-  drop(db);
-  let reopened = open_single_file(&db_path, options).expect("reopen");
-  for key in [
-    "before".to_string(),
-    format!("during-59-{}", "x".repeat(560)),
-  ] {
-    assert!(reopened.node_by_key(&key).is_some(), "{key:.12} missing");
-  }
-}
-
-/// Writers that cancel a stalled background checkpoint keep writing to the
-/// primary region until it is full. Once the stalled run resumes and ends,
-/// commits must recover: a commit, rollback, or begin the full WAL refuses
-/// checkpoints it. Regression: the auto-checkpoint ran only after a successful
-/// commit, so once the primary region was full nothing checkpointed again and
-/// every commit failed for good.
-#[test]
-fn commits_recover_after_writers_cancel_a_stalled_background_checkpoint() {
-  let _serial = checkpoint_test_serial();
-  let temp_dir = tempdir().expect("temp dir");
-  let db_path = temp_dir.path().join("cancel-then-full.kitedb");
-  let options = SingleFileOpenOptions::new()
-    .wal_size(64 * 1024)
-    .auto_checkpoint(true)
-    .background_checkpoint(true)
-    .checkpoint_threshold(0.5)
-    .sync_mode(SyncMode::Normal);
-  let db = Arc::new(open_single_file(&db_path, options.clone()).expect("open"));
-  commit_node(&db, "before");
-  set_checkpoint_test_stall_timeout(&db, Duration::from_millis(200));
-
-  // A background checkpoint stops right after its cut (parked here).
-  let parked = Arc::new(Barrier::new(2));
-  set_checkpoint_test_barrier(&db, CheckpointPhase::CutReleased, Arc::clone(&parked));
-  let cp_db = Arc::clone(&db);
-  let cp = std::thread::spawn(move || cp_db.background_checkpoint());
-  wait_until("cut", || db.header.read().checkpoint_in_progress != 0);
-
-  let stop = Arc::new(AtomicBool::new(false));
-  let committed = Arc::new(AtomicU64::new(0));
-  let refused = Arc::new(AtomicU64::new(0));
-  let errors = Arc::new(std::sync::Mutex::new(Vec::new()));
-  let writers: Vec<_> = ["a", "b"]
-    .into_iter()
-    .map(|name| spawn_counting_writer(&db, name, 1000, &stop, &committed, &refused, &errors))
-    .collect();
-
-  // They fill the secondary region, cancel the stalled cut, then fill the
-  // primary region too.
-  wait_until("writers refused for a full WAL", || {
-    refused.load(AtomicOrdering::SeqCst) > 20
-  });
-  // The stalled run resumes and ends.
-  parked.wait();
-  let cancelled = cp.join().expect("checkpoint thread");
-  assert!(
-    cancelled.is_err(),
-    "the stalled checkpoint was not cancelled"
-  );
-
-  let before = committed.load(AtomicOrdering::SeqCst);
-  wait_until("commits to recover", || {
-    committed.load(AtomicOrdering::SeqCst) > before + 50
-  });
-  stop.store(true, AtomicOrdering::Relaxed);
-  for writer in writers {
-    writer.join().expect("writer thread");
-  }
-  let errors = errors.lock().unwrap().clone();
-  assert!(errors.is_empty(), "writer errors: {errors:?}");
-  let db = Arc::try_unwrap(db).ok().expect("sole owner");
-  drop(db);
-  let reopened = open_single_file(&db_path, options).expect("reopen");
-  assert!(reopened.node_by_key("before").is_some());
-}
-
 /// Commit filler nodes until the active WAL region has exactly `left` bytes
 /// free (`left` a multiple of 8 below 48, so no filler transaction fits).
 fn fill_wal_region_leaving(db: &SingleFileDB, left: u64) {
@@ -1135,9 +899,9 @@ fn fill_wal_region_leaving(db: &SingleFileDB, left: u64) {
   }
 }
 
-/// A commit that waits for WAL space (here for a background install) takes
-/// its MVCC commit timestamp only when it writes its COMMIT record.
-/// Regression: the timestamp was taken before the wait, so a read
+/// A commit that waits for WAL space (here for a checkpoint to free WAL
+/// segments) takes its MVCC commit timestamp only when it writes its COMMIT
+/// record. Regression: the timestamp was taken before the wait, so a read
 /// transaction that began during the wait had a later snapshot and then saw
 /// the commit appear part-way through; commit timestamps could also run
 /// against WAL and delta order.
@@ -1146,11 +910,10 @@ fn mvcc_commit_timestamp_is_taken_after_waiting_for_wal_space() {
   let _serial = checkpoint_test_serial();
   let temp_dir = tempdir().expect("temp dir");
   let db_path = temp_dir.path().join("mvcc-commit-ts.kitedb");
-  let options = SingleFileOpenOptions::new()
-    .wal_size(64 * 1024)
-    .auto_checkpoint(false)
-    .mvcc(true);
+  let options = SingleFileOpenOptions::new().wal_size(64 * 1024).mvcc(true);
   let db = Arc::new(open_single_file(&db_path, options.clone()).expect("open"));
+  // Below the checkpoint trigger: only writers waiting for space start one.
+  set_wal_segment_test_limit(&db, 64 * 1024);
   db.begin(false).expect("begin");
   let node = db.create_node(Some("n")).expect("node");
   let key = db.define_propkey("p").expect("propkey");
@@ -1162,7 +925,7 @@ fn mvcc_commit_timestamp_is_taken_after_waiting_for_wal_space() {
   set_checkpoint_test_barrier(&db, CheckpointPhase::SnapshotDurable, Arc::clone(&parked));
   let cp_db = Arc::clone(&db);
   let cp = std::thread::spawn(move || cp_db.background_checkpoint());
-  wait_until("cut", || db.header.read().checkpoint_in_progress != 0);
+  wait_until("cut", || checkpoint_test_cuts(&db) > 0);
 
   let (wrote_tx, wrote_rx) = mpsc::channel::<()>();
   let (go_tx, go_rx) = mpsc::channel::<()>();
@@ -1175,11 +938,18 @@ fn mvcc_commit_timestamp_is_taken_after_waiting_for_wal_space() {
     writer_db.commit()
   });
   wrote_rx.recv().unwrap();
-  // Leave less room than a COMMIT record (24 bytes).
+  // Fill the WAL segments to their limit (the fillers spill after the cut,
+  // so the install does not free them), then leave less room in the WAL
+  // than a COMMIT record (24 bytes).
+  let mut filler = 0;
+  while wal_segment_test_stats(&db).bytes < 64 * 1024 {
+    commit_node(&db, &format!("seg{filler:06}{}", "s".repeat(1000)));
+    filler += 1;
+  }
   fill_wal_region_leaving(&db, 8);
   go_tx.send(()).unwrap();
-  wait_until("the commit to wait for the install", || {
-    db.checkpoint_state.lock().writers_waited
+  wait_until("the commit to wait for WAL segment space", || {
+    writers_waiting_for_segments(&db) > 0
   });
 
   db.begin(true).expect("read transaction");
@@ -1263,61 +1033,6 @@ fn refused_vector_commit_is_not_committed_in_mvcc() {
   assert!(db.node_by_key("shared").is_some());
 }
 
-/// After a background install whose compaction of the retained WAL failed,
-/// the WAL lives in the 16 KiB secondary region and the primary region is
-/// empty. Writers that fill the secondary region compact it instead of being
-/// refused. Regression: they got `WalBufferFull` until the next background
-/// checkpoint.
-#[test]
-fn writers_compact_the_wal_after_a_failed_post_install_compaction() {
-  let _serial = checkpoint_test_serial();
-  let temp_dir = tempdir().expect("temp dir");
-  let db_path = temp_dir.path().join("retained-wal-compaction.kitedb");
-  let options = SingleFileOpenOptions::new()
-    .wal_size(64 * 1024)
-    .auto_checkpoint(false);
-  let db = Arc::new(open_single_file(&db_path, options.clone()).expect("open"));
-  commit_node(&db, "before");
-
-  let parked = Arc::new(Barrier::new(2));
-  set_checkpoint_test_barrier(&db, CheckpointPhase::SnapshotDurable, Arc::clone(&parked));
-  let cp_db = Arc::clone(&db);
-  let cp = std::thread::spawn(move || {
-    set_checkpoint_test_fault(Some(CheckpointPhase::PostCutWalRetained));
-    cp_db.background_checkpoint()
-  });
-  wait_until("cut", || db.header.read().checkpoint_in_progress != 0);
-  commit_node(&db, "post-cut");
-  parked.wait();
-  assert!(cp.join().expect("checkpoint thread").is_err());
-  assert!(db.wal_buffer.lock().is_primary_retired());
-
-  // About 38 KiB: more than the secondary region, less than the primary.
-  let key = |index: usize| format!("after-{index}-{}", "a".repeat(1000));
-  for index in 0..36 {
-    let result = (|| -> Result<()> {
-      db.begin(false)?;
-      db.create_node(Some(&key(index)))?;
-      db.commit()
-    })();
-    if let Err(error) = result {
-      let _ = db.rollback();
-      panic!("commit {index} refused with an empty primary region: {error}");
-    }
-  }
-  let db = Arc::try_unwrap(db).ok().expect("sole owner");
-  drop(db);
-  let reopened = open_single_file(&db_path, options).expect("reopen");
-  for key in [
-    "before".to_string(),
-    "post-cut".to_string(),
-    key(0),
-    key(35),
-  ] {
-    assert!(reopened.node_by_key(&key).is_some(), "{key:.12} missing");
-  }
-}
-
 /// A WAL record whose CRC checks but whose type this version does not know
 /// (a newer version wrote it) is not torn: a writable open refuses rather
 /// than trim it away. Regression: the open-time trim dropped it, and every
@@ -1366,107 +1081,4 @@ fn writable_open_refuses_rather_than_trims_records_of_unknown_types() {
   );
   let read_only = open_single_file(&db_path, options.read_only(true)).expect("read-only open");
   assert!(read_only.node_by_key("known").is_some());
-}
-
-/// A cut no run owns whose secondary region holds a transaction that began
-/// before it (its first records were never copied there: the copy failed and
-/// so did merging the cut back) cannot be resumed, since the install would
-/// drop those records. With no transaction open, the next background
-/// checkpoint finishes it like a blocking checkpoint. Regression: it declined
-/// every time, so no background checkpoint ever ran again.
-#[test]
-fn background_checkpoint_finishes_an_abandoned_cut_it_cannot_resume() {
-  let _serial = checkpoint_test_serial();
-  let temp_dir = tempdir().expect("temp dir");
-  let db_path = temp_dir.path().join("unresumable-cut.kitedb");
-  let options = SingleFileOpenOptions::new().auto_checkpoint(false);
-  let db = Arc::new(open_single_file(&db_path, options.clone()).expect("open"));
-  commit_node(&db, "before");
-
-  let (began_tx, began_rx) = mpsc::channel::<()>();
-  let (go_tx, go_rx) = mpsc::channel::<()>();
-  let writer_db = Arc::clone(&db);
-  let writer = std::thread::spawn(move || -> Result<()> {
-    writer_db.begin(false)?;
-    writer_db.create_node(Some("spanning-1"))?;
-    began_tx.send(()).unwrap();
-    go_rx.recv().unwrap();
-    writer_db.create_node(Some("spanning-2"))?;
-    writer_db.commit()
-  });
-  began_rx.recv().unwrap();
-  // A cut that copied nothing, left in the WAL.
-  {
-    let mut pager = db.pager.lock();
-    let mut wal = db.wal_buffer.lock();
-    let mut header = db.header.write();
-    wal.flush(&mut pager).expect("flush");
-    wal.switch_to_secondary();
-    wal.store_in_header(&mut header);
-    header.checkpoint_in_progress = 1;
-    db.persist_header(&mut pager, &mut header, true)
-      .expect("header");
-  }
-  go_tx.send(()).unwrap();
-  writer.join().expect("writer thread").expect("writer");
-  commit_node(&db, "after");
-
-  db.background_checkpoint()
-    .expect("background checkpoint finishing the cut");
-  assert_eq!(db.header.read().checkpoint_in_progress, 0);
-  let keys = ["before", "spanning-1", "spanning-2", "after"];
-  for key in keys {
-    assert!(db.node_by_key(key).is_some(), "{key} missing live");
-  }
-  commit_node(&db, "later");
-  let db = Arc::try_unwrap(db).ok().expect("sole owner");
-  drop(db);
-  let reopened = open_single_file(&db_path, options).expect("reopen");
-  for key in keys.into_iter().chain(["later"]) {
-    assert!(reopened.node_by_key(key).is_some(), "{key} missing");
-  }
-}
-
-/// A background checkpoint that does not start because the last cut declined
-/// and every transaction it would have copied is still open says so.
-/// Regression: it reported `WalBufferFull`, as if the WAL were full.
-#[test]
-fn still_declined_background_checkpoint_says_why() {
-  let _serial = checkpoint_test_serial();
-  let temp_dir = tempdir().expect("temp dir");
-  let db_path = temp_dir.path().join("still-declined.kitedb");
-  let options = SingleFileOpenOptions::new()
-    .wal_size(64 * 1024)
-    .auto_checkpoint(false);
-  let db = Arc::new(open_single_file(&db_path, options).expect("open"));
-  commit_node(&db, "before");
-
-  // About 20 KiB of records: more than the 16 KiB secondary region.
-  let (opened_tx, opened_rx) = mpsc::channel::<()>();
-  let (go_tx, go_rx) = mpsc::channel::<()>();
-  let writer_db = Arc::clone(&db);
-  let writer = std::thread::spawn(move || {
-    writer_db.begin(false).expect("begin");
-    for index in 0..10 {
-      writer_db
-        .create_node(Some(&format!("big-{index}-{}", "x".repeat(2000))))
-        .expect("create");
-    }
-    opened_tx.send(()).unwrap();
-    go_rx.recv().unwrap();
-    writer_db.commit().expect("commit");
-  });
-  opened_rx.recv().unwrap();
-
-  for attempt in ["first", "repeated"] {
-    let result = db.background_checkpoint();
-    assert!(
-      matches!(result, Err(KiteError::CheckpointDeclined(_))),
-      "{attempt} declined attempt reported {result:?}"
-    );
-  }
-  go_tx.send(()).unwrap();
-  writer.join().expect("writer thread");
-  db.background_checkpoint()
-    .expect("background checkpoint once the transaction finished");
 }

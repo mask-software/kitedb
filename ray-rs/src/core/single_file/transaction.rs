@@ -527,10 +527,8 @@ impl Drop for PublishSection<'_> {
 struct CommitRound {
   /// Commits made durable, in WAL order.
   durable: Vec<DurableCommit>,
-  /// The next request found the WAL full until this background checkpoint
-  /// cut is installed or released.
-  wait_for_cut: Option<u64>,
-  /// The next request found the WAL full, and no checkpoint in the way.
+  /// The next request found the WAL full, and the WAL segments too: it
+  /// waits for a checkpoint to free some (`wait_for_segment_space`).
   wal_full: bool,
   /// The round's one commit, too large for the WAL, was made durable in a
   /// WAL segment (see `write_commit_round`).
@@ -807,13 +805,6 @@ fn round_error(error: &KiteError) -> KiteError {
 /// Outcome of `SingleFileDB::try_write_wal`.
 pub(crate) enum WalWrite<T> {
   Written(T),
-  /// The WAL refused the record until background checkpoint cut `.0` is
-  /// installed or released.
-  BlockedOn(u64),
-  /// The WAL refused the record because it lives in the secondary region
-  /// after a background install whose compaction failed, with the primary
-  /// region empty; `compact_retired_wal` makes room.
-  NeedsCompaction,
   /// The WAL refused the record because it is full: `spill_or_append`
   /// makes room.
   NeedsSpill,
@@ -1140,11 +1131,9 @@ impl SingleFileDB {
     }
   }
 
-  /// Run `write` under the WAL lock. If the WAL refuses the record because
-  /// the secondary region filled during a background checkpoint, returns the
-  /// cut to wait for: the caller releases every lock that checkpoint needs
-  /// (the checkpoint gate, the commit lock), waits with
-  /// `wait_for_cut_release`, and retries. Refused records are not written.
+  /// Run `write` under the WAL lock. If the WAL refuses the record because it
+  /// is full, says so: the caller, holding no lock, spills it
+  /// (`spill_or_append`) and retries. Refused records are not written.
   ///
   /// Records are only buffered here, so this never waits for file I/O: a
   /// commit group writes the buffered records without the WAL lock (see
@@ -1156,24 +1145,15 @@ impl SingleFileDB {
     let mut wal = self.wal_buffer.lock();
     match write(&mut wal) {
       Ok(value) => Ok(WalWrite::Written(value)),
-      Err(KiteError::WalBufferFull) => {
-        if let Some(cut) = self.cut_blocking_wal_writes(&wal) {
-          Ok(WalWrite::BlockedOn(cut))
-        } else if wal.is_primary_retired() {
-          Ok(WalWrite::NeedsCompaction)
-        } else {
-          Ok(WalWrite::NeedsSpill)
-        }
-      }
+      Err(KiteError::WalBufferFull) => Ok(WalWrite::NeedsSpill),
       Err(error) => Err(error),
     }
   }
 
-  /// Write `record` with `try_write_wal`, waiting and retrying for as long
-  /// as a background checkpoint holds the WAL in a full secondary region, and
-  /// compacting a retained WAL that fills it, then run `then` under the WAL
-  /// lock right after the record is written. Callers hold no lock that
-  /// checkpoint needs.
+  /// Write `record` with `try_write_wal`, spilling the WAL when it is full
+  /// (and waiting for a checkpoint when the WAL segments are full too), then
+  /// run `then` under the WAL lock right after the record is written.
+  /// Callers hold no lock.
   fn write_wal_waiting_then(&self, record: &WalRecord, then: impl Fn()) -> Result<()> {
     self.write_built_wal_waiting_then(&mut record.build(), then)
   }
@@ -1189,12 +1169,10 @@ impl SingleFileDB {
       })?;
       match written {
         WalWrite::Written(()) => return Ok(()),
-        WalWrite::BlockedOn(cut) => self.wait_for_cut_release(cut)?,
-        WalWrite::NeedsCompaction => self.compact_retired_wal()?,
         WalWrite::NeedsSpill => match self.spill_or_append(record, &then)? {
           SpillOutcome::Spilled => {}
           SpillOutcome::Appended => return Ok(()),
-          SpillOutcome::Impossible => return Err(KiteError::WalBufferFull),
+          SpillOutcome::Full => self.wait_for_segment_space()?,
         },
       }
     }
@@ -1226,10 +1204,10 @@ impl SingleFileDB {
       records.extend_from_slice(record);
       (tx.txid, from, records, !tx.wal_begun)
     };
-    // No lock is held here: a background checkpoint may need to install
+    // No lock is held here: a checkpoint may need to free WAL segments
     // before the WAL takes the records. A transaction whose BEGIN record is
-    // written joins the open set under the WAL lock, which a background cut
-    // holds while it reads that set.
+    // written joins the open set under the WAL lock, which a spill holds
+    // while it reads that set.
     loop {
       let written = self.try_write_wal(|wal| {
         wal.write_owned_record_bytes(&mut records)?;
@@ -1240,8 +1218,6 @@ impl SingleFileDB {
       })?;
       match written {
         WalWrite::Written(()) => break,
-        WalWrite::BlockedOn(cut) => self.wait_for_cut_release(cut)?,
-        WalWrite::NeedsCompaction => self.compact_retired_wal()?,
         WalWrite::NeedsSpill => {
           let joined = || {
             if writes_begin {
@@ -1251,7 +1227,7 @@ impl SingleFileDB {
           match self.spill_or_append(&records, joined)? {
             SpillOutcome::Spilled => {}
             SpillOutcome::Appended => break,
-            SpillOutcome::Impossible => return Err(KiteError::WalBufferFull),
+            SpillOutcome::Full => self.wait_for_segment_space()?,
           }
         }
       }
@@ -1264,25 +1240,6 @@ impl SingleFileDB {
       tx.pending_wal.truncate(from);
     } else {
       tx.pending_wal.extend_from_slice(record);
-    }
-    Ok(())
-  }
-
-  /// Compact WAL records retained in the secondary region by a background
-  /// install whose own compaction failed (see `compact_retained_wal`), so
-  /// writers that fill that region get the empty primary region instead of
-  /// `WalBufferFull`. Callers hold no lock.
-  ///
-  /// The commit lock excludes background cuts and installs (a cut finishes
-  /// the same compaction first). The caller keeps blocking checkpoints and
-  /// compaction out with its open transaction or a checkpoint gate permit.
-  pub(crate) fn compact_retired_wal(&self) -> Result<()> {
-    let _commit_guard = self.lock_commits();
-    let mut pager = self.pager.lock();
-    let mut wal = self.wal_buffer.lock();
-    let mut header = self.header.write();
-    if wal.is_primary_retired() {
-      self.compact_retained_wal(&mut pager, &mut wal, &mut header)?;
     }
     Ok(())
   }
@@ -1960,7 +1917,6 @@ impl SingleFileDB {
     let mut outcomes = std::mem::take(&mut scratch.outcomes);
     outcomes.clear();
     outcomes.resize_with(queue.len(), || None);
-    let mut checkpointed_for_room = false;
     while !queue.is_empty() {
       #[cfg(feature = "bench-profile")]
       let commit_lock_start = Instant::now();
@@ -1989,25 +1945,12 @@ impl SingleFileDB {
       scratch.durable = std::mem::take(&mut round.durable);
       prof::end(Stage::Publish, publish_mark);
 
-      // The background checkpoint takes the commit lock to install.
-      if let Some(cut) = round.wait_for_cut {
-        if let Err(error) = self.wait_for_cut_release(cut) {
+      // A checkpoint frees WAL segments without waiting for the open
+      // transactions (these among them); the round retries after it.
+      if round.wal_full {
+        if let Err(error) = self.wait_for_segment_space() {
           if let Some((index, _)) = queue.pop_front() {
             outcomes[index] = Some(CommitOutcome::failed(error));
-          }
-        }
-      }
-      // A background checkpoint makes room without waiting for the open
-      // transactions (these among them); a blocking one would wait for them
-      // forever. Once one ran, a commit that still does not fit fails.
-      if round.wal_full {
-        let made_room = !checkpointed_for_room
-          && self.background_checkpoint
-          && self.auto_checkpoint_if_needed(true);
-        checkpointed_for_room |= made_room;
-        if !made_room {
-          if let Some((index, _)) = queue.pop_front() {
-            outcomes[index] = Some(CommitOutcome::failed(KiteError::WalBufferFull));
           }
         }
       }
@@ -2177,7 +2120,7 @@ impl SingleFileDB {
         // others wait for the next round.
         if staged.is_empty() && wal.is_empty() {
           let mut header = self.header.write();
-          if self.can_spill(&wal, &header) {
+          if self.can_spill(&header) {
             self.unstage_newest_in_mvcc(checked.len());
             queue.extend(checked.drain(..));
             match self.spill_wal(&mut pager, &mut wal, &mut header, &request.records) {
@@ -2200,29 +2143,18 @@ impl SingleFileDB {
           queue.extend(checked.drain(..));
           break;
         }
-        // Nothing of this round is recorded yet, so make room and retry.
-        if wal.is_primary_retired() {
-          let mut header = self.header.write();
-          match self.compact_retained_wal(&mut pager, &mut wal, &mut header) {
+        // Nothing of this round is recorded yet: spill the WAL's records
+        // into a WAL segment, and retry in the next round; if the segments
+        // are full, a checkpoint makes room first.
+        let mut header = self.header.write();
+        if self.can_spill(&header) {
+          match self.spill_wal(&mut pager, &mut wal, &mut header, &[]) {
             Ok(()) => queue.push_back((index, request)),
             Err(error) => outcomes[index] = Some(CommitOutcome::failed(error)),
           }
-        } else if let Some(cut) = self.cut_blocking_wal_writes(&wal) {
-          queue.push_back((index, request));
-          round.wait_for_cut = Some(cut);
         } else {
-          // Spill the WAL's records into a WAL segment, and retry in the next
-          // round; if the WAL cannot spill, a checkpoint makes room.
-          let mut header = self.header.write();
-          if self.can_spill(&wal, &header) {
-            match self.spill_wal(&mut pager, &mut wal, &mut header, &[]) {
-              Ok(()) => queue.push_back((index, request)),
-              Err(error) => outcomes[index] = Some(CommitOutcome::failed(error)),
-            }
-          } else {
-            queue.push_back((index, request));
-            round.wal_full = true;
-          }
+          queue.push_back((index, request));
+          round.wal_full = true;
         }
         queue.extend(checked.drain(..));
         break;
@@ -2403,12 +2335,13 @@ impl SingleFileDB {
   ///
   /// A background cut (which takes the commit lock) must no longer count
   /// them as open: their records end with a durable COMMIT. Their committers
-  /// learn that only later, and a cut taken meanwhile would skip their
-  /// records, its install drop them, and the next cut find an open
-  /// transaction with no BEGIN record and decline. The sidecar frames are
-  /// appended under the commit lock, in order, with the epoch fence checked
-  /// under it (`write_commit_round`), so a copy of the database taken under
-  /// the commit lock never holds a commit its frame position misses.
+  /// learn that only later, and a cut taken meanwhile would keep the WAL
+  /// segments holding their records for a transaction that is not open (and
+  /// every later cut too, since nothing else stops counting it). The sidecar
+  /// frames are appended under the commit lock, in order, with the epoch
+  /// fence checked under it (`write_commit_round`), so a copy of the
+  /// database taken under the commit lock never holds a commit its frame
+  /// position misses.
   fn settle_durable_commits(
     &self,
     staged: &mut Vec<(usize, Box<CommitRequest>)>,
@@ -2416,8 +2349,10 @@ impl SingleFileDB {
   ) {
     {
       let mut open = self.open_write_txids.lock();
+      let mut spilled = self.spilled_open_txids.lock();
       for (_, request) in staged.iter() {
         open.remove(&request.txid);
+        spilled.remove(&request.txid);
       }
     }
     durable.extend(staged.drain(..).map(|(index, mut request)| {

@@ -165,7 +165,7 @@ pub const INITIAL_ETYPE_ID: u32 = 1;
 pub const INITIAL_PROPKEY_ID: u32 = 1;
 pub const INITIAL_TX_ID: u64 = 1;
 /// Salt of a new database's primary WAL region. 0 marks an unsalted region
-/// (a v1 WAL, or a secondary region no checkpoint has used yet).
+/// (a v1 WAL, or a secondary region no version 2 checkpoint used).
 pub const INITIAL_WAL_SALT: u32 = 1;
 
 // ============================================================================

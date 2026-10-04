@@ -2,8 +2,9 @@
 //! `raydb-b4/_SEGMENTS_DESIGN.md`) with files of format version 2.
 //!
 //! The fixtures `tests/fixtures/v2_*.kitedb` were written by the v2 writer
-//! (`generate_v2_fixtures` in `b4_checkpoint_segments_tests.rs`, 64 KiB WAL),
-//! in each WAL state it leaves: records in the WAL (with an uncommitted
+//! (`generate_v2_fixtures`, which went with that writer; see commit 6ff2a82,
+//! `b4_checkpoint_segments_tests.rs`; 64 KiB WAL), in each WAL state it
+//! leaves: records in the WAL (with an uncommitted
 //! transaction's among them), a background checkpoint's cut in progress
 //! with commits in the secondary region, a retired primary region, and a cut
 //! too big to merge back into the primary region. A new binary must open,

@@ -112,7 +112,6 @@ fn commit_nodes(db: &SingleFileDB, prefix: &str, count: usize) {
 /// small next to the data (as the default 4 MiB WAL is next to a 10M-edge
 /// load), the load must not rewrite the whole database at every fill.
 #[test]
-#[ignore = "needs WAL log segments and a checkpoint thread (fix/b4-checkpoint-segments)"]
 fn bulk_load_writes_snapshot_bytes_linear_in_the_data() {
   let dir = tempdir().expect("tempdir");
   let path = dir.path().join("bulk-load-linear.kitedb");
@@ -184,7 +183,6 @@ fn commit_that_starts_an_auto_checkpoint_returns_before_the_checkpoint_finishes(
 /// commits for seconds. The checkpoint is held after its cut; the writer
 /// commits twice the whole WAL's size meanwhile.
 #[test]
-#[ignore = "needs WAL log segments and a checkpoint thread (fix/b4-checkpoint-segments)"]
 fn writer_is_not_held_up_by_a_checkpoint_building_its_snapshot() {
   let dir = tempdir().expect("tempdir");
   let path = dir.path().join("writer-not-held-by-checkpoint.kitedb");
@@ -198,8 +196,6 @@ fn writer_is_not_held_up_by_a_checkpoint_building_its_snapshot() {
     .expect("open"),
   );
   commit_nodes(&db, "pre", 50);
-  // A writer never cancels this cut as stalled while the test holds it.
-  set_checkpoint_test_stall_timeout(&db, Duration::from_secs(120));
   let held = Arc::new(Barrier::new(2));
   set_checkpoint_test_barrier(&db, CheckpointPhase::CutReleased, Arc::clone(&held));
   let checkpoint = {
@@ -207,7 +203,7 @@ fn writer_is_not_held_up_by_a_checkpoint_building_its_snapshot() {
     std::thread::spawn(move || db.background_checkpoint())
   };
   let deadline = Instant::now() + Duration::from_secs(5);
-  while db.checkpoint_state.lock().cut_owner.is_none() {
+  while checkpoint_test_cuts(&db) == 0 {
     assert!(Instant::now() < deadline, "the checkpoint never cut");
     std::thread::yield_now();
   }
@@ -308,25 +304,40 @@ fn file_size_after_load_checkpoint_close_does_not_depend_on_wal_size() {
   }
 }
 
-/// Finding 3, across processes: dead pages a run left in front of the
-/// snapshot (here: auto-checkpoints ending with the snapshot at the end of
-/// the file) do not stay in the file for good once a later process
+/// Finding 3, across processes: dead pages a run left in the file (here:
+/// earlier snapshots and freed WAL segments, which closing keeps while WAL
+/// segments live) do not stay in the file for good once a later process
 /// checkpoints and closes.
 #[test]
 fn checkpoint_after_reopen_reclaims_dead_pages() {
   let dir = tempdir().expect("tempdir");
-  // Find a load whose last auto-checkpoint leaves dead pages in front of the
-  // snapshot; the loads differ only in size.
+  // Find a load that leaves dead pages; the loads differ only in size.
   for nodes in (600..=1_400).step_by(100) {
     let path = dir.path().join(format!("reopen-reclaim-{nodes}.kitedb"));
     let options = SingleFileOpenOptions::new().wal_size(SMALL_WAL);
     let db = open_single_file(&path, options.clone()).expect("open");
     bulk_load(&db, nodes, 10 * nodes, 100);
-    let dead_before = {
+    // Pages the header names: its own, the WAL's, the snapshot's and the
+    // WAL segments'.
+    let (page_size, live_before) = {
       let header = db.header.read();
-      header.snapshot_start_page - (header.wal_start_page + header.wal_page_count)
+      let segments: u64 = header
+        .wal_segments
+        .entries
+        .iter()
+        .map(|segment| segment.page_count)
+        .sum();
+      (
+        header.page_size as u64,
+        2 + header.wal_page_count + header.snapshot_page_count + segments,
+      )
     };
     close_single_file(db).expect("close");
+    let dead_before = std::fs::metadata(&path)
+      .expect("metadata")
+      .len()
+      .div_ceil(page_size)
+      .saturating_sub(live_before);
     if dead_before == 0 {
       continue;
     }
@@ -354,7 +365,7 @@ fn checkpoint_after_reopen_reclaims_dead_pages() {
     );
     return;
   }
-  panic!("no load left dead pages in front of its snapshot; adjust the sizes");
+  panic!("no load left dead pages; adjust the sizes");
 }
 
 /// Open puts the pages no header slot names on the free list, but holds back
@@ -531,85 +542,4 @@ fn checkpoint_keeps_every_edge_and_property_as_read_before_it() {
     graph_image(&reopened) == before,
     "the reopened graph differs"
   );
-}
-
-/// Finding 2, the worst case: with several writers, the committer that
-/// started an auto-checkpoint also ran a pass for what the others wrote while
-/// they waited for its install, and another, up to five whole snapshot
-/// rebuilds in one commit (9 s at 1M nodes / 10M edges, 24 s before the
-/// rebuild was made cheaper). The auto-checkpoint now takes one pass; the
-/// next commit past the threshold checkpoints again.
-#[test]
-fn auto_checkpoint_takes_one_pass_when_writers_waited_for_it() {
-  let dir = tempdir().expect("tempdir");
-  let path = dir.path().join("auto-checkpoint-one-pass.kitedb");
-  let db = Arc::new(
-    open_single_file(&path, SingleFileOpenOptions::new().wal_size(SMALL_WAL)).expect("open"),
-  );
-  let first_pass = Arc::new(Barrier::new(2));
-  set_checkpoint_test_barrier(&db, CheckpointPhase::CutReleased, Arc::clone(&first_pass));
-  // The committer: small commits until one starts the auto-checkpoint, which
-  // holds it after its cut.
-  let (returned, committer_returned) = mpsc::channel();
-  let committer = {
-    let db = Arc::clone(&db);
-    std::thread::spawn(move || {
-      let mut commits = 0;
-      while checkpoint_test_cuts(&db) == 0 {
-        commit_nodes(&db, &format!("c{commits}"), 4);
-        commits += 1;
-      }
-      let _ = returned.send(());
-    })
-  };
-  let deadline = Instant::now() + Duration::from_secs(5);
-  while db.checkpoint_state.lock().cut_owner.is_none() {
-    assert!(Instant::now() < deadline, "no auto-checkpoint cut");
-    std::thread::yield_now();
-  }
-  // Another writer: small commits, many times the secondary region, so it
-  // waits for the install, then crosses the threshold again.
-  set_checkpoint_test_stall_timeout(&db, Duration::from_secs(120));
-  let (finished, writer_finished) = mpsc::channel();
-  let writer = {
-    let db = Arc::clone(&db);
-    std::thread::spawn(move || {
-      for commit in 0..400 {
-        commit_nodes(&db, &format!("w{commit}"), 4);
-      }
-      let _ = finished.send(());
-    })
-  };
-  while !db.checkpoint_state.lock().writers_waited {
-    assert!(Instant::now() < deadline, "the writer never waited");
-    std::thread::yield_now();
-  }
-  // Hold whichever checkpoint cuts next: a second pass of the committer's,
-  // or the writer's own auto-checkpoint once its commit crosses the
-  // threshold.
-  let next_pass = Arc::new(Barrier::new(2));
-  set_checkpoint_test_barrier(&db, CheckpointPhase::CutReleased, Arc::clone(&next_pass));
-  first_pass.wait();
-  let outcome = committer_returned.recv_timeout(Duration::from_secs(3));
-  // Release the held checkpoint, whoever runs it.
-  while checkpoint_test_cuts(&db) < 2 {
-    assert!(
-      Instant::now() < deadline + Duration::from_secs(5),
-      "no second cut"
-    );
-    std::thread::yield_now();
-  }
-  next_pass.wait();
-  committer.join().expect("committer");
-  writer.join().expect("writer");
-  writer_finished.recv().expect("writer done");
-  assert!(
-    outcome.is_ok(),
-    "the commit that started the auto-checkpoint ran another pass for the writer that waited for \
-     its install"
-  );
-  while db.is_checkpoint_running() {
-    std::thread::yield_now();
-  }
-  assert!(db.node_by_key("w399-3").is_some());
 }

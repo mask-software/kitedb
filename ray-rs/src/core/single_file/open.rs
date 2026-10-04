@@ -861,8 +861,9 @@ fn open_single_file_internal(
     wal_buffer.note_created_zeroed();
   }
 
-  // A background checkpoint cut that no install finished. Replay reads both
-  // regions in place, primary first, unless a writable open merges them.
+  // A version 2 background checkpoint's cut that no install finished (this
+  // version never cuts into the secondary region). Replay reads both regions
+  // in place, primary first, unless a writable open merges them.
   let mut replay_cut_in_place = header.checkpoint_in_progress != 0;
   if !options.read_only {
     // One pass over each region does both checks. Records of a type this
@@ -1156,8 +1157,9 @@ fn open_single_file_internal(
     checkpoint_gate: RwLock::new(()),
     checkpoint_wait: Mutex::new(()),
     checkpoint_cv: parking_lot::Condvar::new(),
-    cut_wait: Mutex::new(()),
-    cut_cv: parking_lot::Condvar::new(),
+    segment_space_wait: Mutex::new(()),
+    segment_space_cv: parking_lot::Condvar::new(),
+    segment_waiters: AtomicUsize::new(0),
     commit_lock: Mutex::new(()),
     publish_lock: Mutex::new(()),
     publish_seq: AtomicU64::new(0),
@@ -1171,12 +1173,8 @@ fn open_single_file_internal(
     propkey_ids: RwLock::new(propkey_ids),
     schema_reservations: Mutex::new(SchemaReservations::default()),
     auto_checkpoint: options.auto_checkpoint,
-    checkpoint_threshold: options.checkpoint_threshold,
     background_checkpoint: options.background_checkpoint,
     checkpoint_state: Mutex::new(BackgroundCheckpointState::default()),
-    checkpoint_progress: AtomicU64::new(0),
-    checkpoint_steps_running: AtomicUsize::new(0),
-    checkpoint_cancelled: AtomicBool::new(false),
     vector_stores: RwLock::new(vector_stores),
     vector_store_lazy_entries: RwLock::new(vector_store_lazy_entries),
     checkpoint_compression: options.checkpoint_compression.clone(),
@@ -1191,7 +1189,7 @@ fn open_single_file_internal(
     wal_log_budget: WAL_LOG_BUDGET_DEFAULT as u64,
     wal_segment_limit_bytes: AtomicU64::new(0),
     wal_spills: AtomicU64::new(0),
-    spilled_open_txids: Mutex::new(HashSet::new()),
+    spilled_open_txids: Mutex::new(HashMap::new()),
     sync_mode: options.sync_mode,
     primary_replication,
     replica_replication,

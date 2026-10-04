@@ -413,9 +413,10 @@ fn f4_check_and_trim_trims_torn_tails_and_refuses_unknown_types() {
 // f5: moving post-cut records back into the primary region
 // ============================================================================
 
-/// The background install moves the post-cut records to the start of the
-/// primary region while holding the commit lock: one read of the secondary
-/// region's records and one write of their new copy, whatever their size.
+/// Opening a version 2 file whose background install retained the post-cut
+/// records in the secondary region moves them to the start of the primary
+/// region: one read of the secondary region's records and one write of
+/// their new copy, whatever their size.
 #[test]
 fn f5_post_cut_move_back_costs_one_read_and_one_write() {
   let dir = tempdir().expect("tempdir");
@@ -445,43 +446,4 @@ fn f5_post_cut_move_back_costs_one_read_and_one_write() {
     syscalls <= 2,
     "moving {moved} bytes of post-cut records back took {syscalls} system calls"
   );
-}
-
-/// The install reuses the post-cut records its replay read and checked
-/// before taking the commit lock: only records an open transaction appended
-/// since are read under it.
-#[test]
-fn f5_move_back_reads_only_records_appended_since_the_replay() {
-  let dir = tempdir().expect("tempdir");
-  let (mut pager, mut wal) = wal_fixture(&dir, 72, 64);
-  for txid in 1..=3 {
-    wal.write_record(&big_record(txid)).expect("write");
-  }
-  wal.switch_to_secondary();
-  for txid in 10..=29 {
-    wal.write_record(&big_record(txid)).expect("write");
-  }
-  wal.flush(&mut pager).expect("flush");
-  let (records, read, _) = wal
-    .read_region_from(1, 0, &mut pager)
-    .expect("replay scan")
-    .parse();
-  assert_eq!(records.len(), 20);
-  for txid in 30..=33 {
-    wal.write_record(&big_record(txid)).expect("write");
-  }
-  wal.flush(&mut pager).expect("flush");
-  wal.retire_primary_region();
-
-  let (compacted, reads) =
-    io_hooks::reads_during(|| wal.compact_secondary_into_primary_reusing(read, &mut pager));
-  compacted.expect("compact");
-  let txids: Vec<u64> = wal
-    .scan_region(0, &mut pager)
-    .expect("scan")
-    .iter()
-    .map(|record| record.txid)
-    .collect();
-  assert_eq!(txids, (10..=33).collect::<Vec<u64>>());
-  assert_eq!(reads, 1, "only the 4 records appended since need reading");
 }

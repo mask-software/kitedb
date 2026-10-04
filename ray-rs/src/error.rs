@@ -49,14 +49,26 @@ pub enum KiteError {
   #[error("Transaction {txid} conflict on keys: {keys:?}")]
   Conflict { txid: TxId, keys: Vec<String> },
 
-  /// WAL buffer is full, checkpoint required
+  /// The WAL is full and cannot spill into WAL segments: they are at their
+  /// limit (`wal_segment_limit`) and no checkpoint frees them (automatic
+  /// checkpoints are off, open write transactions hold their records, or a
+  /// blocking checkpoint waits for this writer's transaction), or the record
+  /// cannot be written at all. A checkpoint makes room.
   #[error("WAL buffer full: checkpoint required before continuing writes")]
   WalBufferFull,
 
   /// A background checkpoint did not start, and nothing changed. The reason
-  /// says what has to happen first (usually an open transaction finishing).
+  /// says what has to happen first (a blocking checkpoint, optimize, vacuum
+  /// or WAL resize waiting for the checkpoint gate gets it first).
   #[error("Background checkpoint declined: {0}")]
   CheckpointDeclined(String),
+
+  /// A write needs WAL segment space that only a checkpoint can free, and
+  /// the last automatic checkpoint failed (with the error given; see
+  /// `SingleFileDB::checkpoint_error`). Every commit acknowledged so far is
+  /// safe; writes succeed again once a checkpoint does.
+  #[error("Checkpoint failed, and the WAL segments are full: {0}")]
+  CheckpointFailed(String),
 
   /// Attempted write on read-only database
   #[error("Database is read-only")]

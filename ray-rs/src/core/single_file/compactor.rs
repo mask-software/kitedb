@@ -13,7 +13,7 @@ use crate::error::{KiteError, Result};
 use crate::types::{DbHeaderV1, DeltaState};
 use crate::util::compression::CompressionOptions;
 
-use super::checkpoint::{snapshot_vector_stores, WrittenSnapshot};
+use super::checkpoint::{snapshot_vector_stores, LogAfterInstall, WrittenSnapshot};
 use super::open::map_snapshot_range;
 use super::SingleFileDB;
 
@@ -193,7 +193,7 @@ impl SingleFileDB {
         &mut wal_buffer,
         &mut header,
         snapshot,
-        WalBuffer::reset,
+        LogAfterInstall::Empty,
       )?;
     }
 
