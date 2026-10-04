@@ -913,23 +913,25 @@ fn checkpoint_trigger_and_segment_limit_follow_the_log_options() {
   }
 }
 
-/// Review finding 6. A panic in a checkpoint thread's run is caught: it is
-/// reported as the thread's error (so writers at the segment limit get
-/// `CheckpointFailed` instead of waiting for a thread that is gone), and
-/// automatic checkpoints go on: a later run installs and clears it.
+/// Review findings 6 and R9. A panic in a checkpoint thread's run is caught
+/// and reported (`checkpoint_error`). It may have left memory and disk out
+/// of step (here it strikes inside an install, between its header writes),
+/// so the handle refuses writes from then on with a clear error, checkpoints
+/// included, and closing it persists nothing (and says so); reads go on. A
+/// reopen recovers every acknowledged commit from disk, and takes writes
+/// and checkpoints again.
 #[test]
-fn a_panic_on_the_checkpoint_thread_is_reported_and_checkpoints_go_on() {
+fn a_panic_on_the_checkpoint_thread_is_reported_and_writes_are_refused() {
   let dir = tempdir().expect("tempdir");
   let path = dir.path().join("checkpoint-thread-panic.kitedb");
   let db = open_single_file(&path, options().sync_mode(SyncMode::Normal)).expect("open");
   // Far above what this test writes: no writer waits for segment space.
   set_wal_segment_test_limit(&db, 64 * 1024 * 1024);
-  set_checkpoint_test_db_panic(&db, CheckpointPhase::SnapshotWritten);
-  let generation = db.header.read().active_snapshot_gen;
+  set_checkpoint_test_db_panic(&db, CheckpointPhase::HeaderWritten);
   let mut acked = Vec::new();
   let mut index = 0;
   // The log reaches the checkpoint trigger (four WALs) after about 900
-  // commits; the thread's run then panics.
+  // commits; the thread's run then panics in its install.
   while checkpoint_thread_error(&db).is_none() && index < 3_000 {
     acked.extend(commit_keys(&db, "a", index, 1));
     index += 1;
@@ -945,30 +947,38 @@ fn a_panic_on_the_checkpoint_thread_is_reported_and_checkpoints_go_on() {
       .is_some_and(|error| error.contains("panic")),
     "the checkpoint thread's panic was not reported: {reported:?}"
   );
-  assert_eq!(
-    db.header.read().active_snapshot_gen,
-    generation,
-    "setup: a checkpoint installed before the panic"
-  );
 
-  // Commits go on, past the trigger: a later run (after the back-off)
-  // installs.
-  let deadline = Instant::now() + Duration::from_secs(20);
-  while db.header.read().active_snapshot_gen == generation && Instant::now() < deadline {
-    acked.extend(commit_keys(&db, "b", index, 1));
-    index += 1;
-  }
-  assert!(
-    db.header.read().active_snapshot_gen > generation,
-    "no automatic checkpoint installed after the checkpoint thread panicked"
-  );
-  assert_eq!(
-    checkpoint_thread_error(&db),
-    None,
-    "the error was not cleared"
-  );
-  close_single_file(db).expect("close");
+  let refused = |what: &str, result: Result<()>| {
+    assert!(
+      result
+        .as_ref()
+        .is_err_and(|error| error.to_string().contains("refuses writes")),
+      "{what} after the panic: {result:?}"
+    );
+  };
+  refused("a commit", commit_key(&db, &key("after", 0)));
+  refused("a background checkpoint", db.background_checkpoint());
+  refused("a blocking checkpoint", db.checkpoint());
+  // Reads go on.
+  assert!(missing(&db, &acked).is_empty(), "reads lost commits");
+  refused("closing", close_single_file(db));
+
   let reopened = open_single_file(&path, options()).expect("reopen");
+  assert!(
+    missing(&reopened, &acked).is_empty(),
+    "the reopen lost commits"
+  );
+  acked.extend(commit_keys(&reopened, "reopened", 0, 10));
+  assert_eq!(
+    acked.len(),
+    index + 10,
+    "the reopened database refused commits"
+  );
+  reopened
+    .checkpoint()
+    .expect("a checkpoint after the reopen");
+  close_single_file(reopened).expect("close");
+  let reopened = open_single_file(&path, options()).expect("reopen again");
   assert!(missing(&reopened, &acked).is_empty());
 }
 
