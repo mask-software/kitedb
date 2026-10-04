@@ -720,7 +720,7 @@ fn pathfinding_searches_read_about_what_a_bidirectional_bfs_reads() {
   }
   assert!(found > pairs.len() / 2, "only {found} pairs connected");
   let queries = pairs.len();
-  let over = [("bfs", by_bfs, 2), ("dijkstra", by_dijkstra, 4)]
+  let over = [("bfs", by_bfs, 2), ("dijkstra", by_dijkstra, 2)]
     .into_iter()
     .filter(|&(_, read, factor)| read > factor * reference + queries)
     .map(|(name, read, factor)| format!("{name} read {read} neighbor lists (bound {factor}x)"))
@@ -825,7 +825,7 @@ fn pathfinding_kite_searches_examine_about_what_a_bidirectional_bfs_examines() {
   let slack = pairs.len() * 16;
   let over = [
     ("find_bfs", by_bfs, 2, reference),
-    ("find", by_find, 4, reference),
+    ("find", by_find, 2, reference),
     ("has_path", by_has_path, 2, reference_100),
   ]
   .into_iter()
@@ -1048,4 +1048,43 @@ fn pathfinding_kite_searches_see_their_transaction() {
   });
   assert_eq!(searches(&kite), [Some(1); 4]);
   kite.close().expect("close");
+}
+
+/// Two halves of a meeting that share a node (a zero-weight cycle): the loop between its
+/// occurrences is cut out of the path.
+#[test]
+fn pathfinding_meeting_path_cuts_out_a_loop() {
+  let label = |node, parent, edge, weight| Label {
+    node,
+    cost: 0.0,
+    depth: 0,
+    parent,
+    edge,
+    weight,
+    alive: true,
+  };
+  // Forward: 1 -> 2 -> 3. Backward: 4 -> 2 -> 5 (5 is the target).
+  let forward = [
+    label(1, None, None, 0.0),
+    label(2, Some(0), Some((1, 1, 2)), 1.0),
+    label(3, Some(1), Some((2, 1, 3)), 0.0),
+  ];
+  let backward = [
+    label(5, None, None, 0.0),
+    label(2, Some(0), Some((2, 1, 5)), 2.0),
+    label(4, Some(1), Some((4, 1, 2)), 0.0),
+  ];
+  let result = meeting_path(
+    &forward,
+    &backward,
+    Meeting {
+      forward: 2,
+      edge: (3, 1, 4),
+      weight: 0.0,
+      backward: 2,
+    },
+  );
+  assert_eq!(result.path, vec![1, 2, 5]);
+  assert_eq!(result.edges, vec![(1, 1, 2), (2, 1, 5)]);
+  assert_eq!(result.total_weight, 3.0);
 }

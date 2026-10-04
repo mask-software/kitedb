@@ -13,13 +13,25 @@
 //! `max_depth` bounds the number of hops. The search returns the cheapest path within that bound,
 //! even when a cheaper but deeper path reaches the same intermediate node.
 //!
+//! # Searching from both ends
+//!
+//! [`bfs`] and [`dijkstra`] (and [`yen_k_shortest`], which runs Dijkstra) search from the source
+//! and from the targets at once and stop where the two searches meet, so they read about the
+//! neighbor lists of two small neighborhoods rather than one large one. The neighbors function
+//! is therefore also called with the reverse direction: `In` when the search goes `Out`, `Out`
+//! when it goes `In` (a `Both` search asks for `Out`, then `In`, from both ends); it must list
+//! the same edges from either end. [`a_star`] searches from the source only, guided by its
+//! heuristic.
+//!
+//! When several paths are shortest (or cheapest), which of them a search returns is unspecified.
+//!
 //! Ported from src/api/pathfinding.ts
 
 use super::traversal::TraversalDirection;
 use crate::types::{ETypeId, Edge, NodeId};
 use hashbrown::{HashMap as FastMap, HashSet as FastSet};
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashSet, VecDeque};
+use std::collections::{BinaryHeap, HashSet};
 
 // ============================================================================
 // Types
@@ -138,6 +150,32 @@ fn expand_directions(direction: TraversalDirection) -> &'static [TraversalDirect
   }
 }
 
+/// The direction that walks `direction`'s hops backwards, from a target toward the source.
+fn reverse_direction(direction: TraversalDirection) -> TraversalDirection {
+  match direction {
+    TraversalDirection::Out => TraversalDirection::In,
+    TraversalDirection::In => TraversalDirection::Out,
+    TraversalDirection::Both => TraversalDirection::Both,
+  }
+}
+
+/// `targets` in ascending order, so searches that start from them are deterministic.
+fn sorted_targets(config: &PathConfig) -> Vec<NodeId> {
+  let mut targets: Vec<NodeId> = config.targets.iter().copied().collect();
+  targets.sort_unstable();
+  targets
+}
+
+/// The path that is only the source, when it is a target.
+fn source_only(source: NodeId) -> PathResult {
+  PathResult {
+    path: vec![source],
+    edges: Vec::new(),
+    total_weight: 0.0,
+    found: true,
+  }
+}
+
 fn neighbor_id_for_edge(current_id: NodeId, dir: TraversalDirection, edge: &Edge) -> NodeId {
   match dir {
     TraversalDirection::Out => edge.dst,
@@ -163,6 +201,8 @@ struct Label {
   depth: usize,
   parent: Option<usize>,
   edge: Option<(NodeId, ETypeId, NodeId)>,
+  /// The weight of `edge` (0 for a root)
+  weight: f64,
   /// False once a label that reaches the node at least as cheaply and as shallowly replaced
   /// it; its queue entry is then skipped.
   alive: bool,
@@ -261,6 +301,7 @@ where
     depth: 0,
     parent: None,
     edge: None,
+    weight: 0.0,
     alive: true,
   }];
   let mut frontiers: FastMap<NodeId, Frontier> = FastMap::new();
@@ -340,6 +381,7 @@ where
           depth: next_depth,
           parent: Some(index),
           edge: Some((edge.src, edge.etype, edge.dst)),
+          weight,
           alive: true,
         });
         queue.push(Queued {
@@ -378,8 +420,8 @@ fn path_from_label(labels: &[Label], index: usize) -> PathResult {
   }
 }
 
-/// Cheapest path within `config.max_depth`: classic search first, and the depth-tracking
-/// search only if the depth limit cut something off.
+/// Cheapest path within `config.max_depth`, from the source only (A*): classic search first,
+/// and the depth-tracking search only if the depth limit cut something off.
 fn shortest_path_search<F, W, H>(
   config: &PathConfig,
   neighbors: &F,
@@ -399,10 +441,396 @@ where
 }
 
 // ============================================================================
+// Bidirectional label-setting search (Dijkstra)
+// ============================================================================
+
+/// Queued labels, popped by lowest cost, then lowest depth, counted per depth so the queue also
+/// knows its smallest depth.
+struct LabelQueue {
+  heap: BinaryHeap<Queued>,
+  /// Entries per depth (entries that will be skipped too)
+  per_depth: Vec<usize>,
+  /// The smallest depth with entries (`usize::MAX` when empty)
+  min_depth: usize,
+}
+
+impl LabelQueue {
+  fn new() -> Self {
+    Self {
+      heap: BinaryHeap::new(),
+      per_depth: Vec::new(),
+      min_depth: usize::MAX,
+    }
+  }
+
+  fn len(&self) -> usize {
+    self.heap.len()
+  }
+
+  fn push(&mut self, cost: f64, depth: usize, label: usize) {
+    self.heap.push(Queued {
+      priority: cost,
+      depth,
+      label,
+    });
+    if self.per_depth.len() <= depth {
+      self.per_depth.resize(depth + 1, 0);
+    }
+    self.per_depth[depth] += 1;
+    self.min_depth = self.min_depth.min(depth);
+  }
+
+  fn pop(&mut self) -> Option<usize> {
+    let Queued { label, depth, .. } = self.heap.pop()?;
+    self.per_depth[depth] -= 1;
+    while self
+      .per_depth
+      .get(self.min_depth)
+      .is_some_and(|&count| count == 0)
+    {
+      self.min_depth += 1;
+    }
+    if self.min_depth >= self.per_depth.len() {
+      self.min_depth = usize::MAX;
+    }
+    Some(label)
+  }
+
+  /// The smallest cost queued: no label popped or created from now on is cheaper.
+  fn min_cost(&self) -> f64 {
+    self
+      .heap
+      .peek()
+      .map_or(f64::INFINITY, |queued| queued.priority)
+  }
+}
+
+/// One end of a bidirectional label search: labels grown from its roots (the source, or the
+/// targets) by expanding in `direction`. A label's `parent` and `edge` lead one hop back toward
+/// its root.
+struct LabelSide {
+  direction: TraversalDirection,
+  labels: Vec<Label>,
+  /// Each node's labels that no other label of it dominates.
+  frontiers: FastMap<NodeId, Frontier>,
+  /// The smallest depth a popped label of each node had.
+  settled: FastMap<NodeId, usize>,
+  queue: LabelQueue,
+}
+
+impl LabelSide {
+  fn new(roots: &[NodeId], direction: TraversalDirection) -> Self {
+    let mut side = Self {
+      direction,
+      labels: Vec::with_capacity(roots.len()),
+      frontiers: FastMap::with_capacity(roots.len()),
+      settled: FastMap::new(),
+      queue: LabelQueue::new(),
+    };
+    for (index, &node) in roots.iter().enumerate() {
+      side.frontiers.entry(node).or_default().push(index);
+      side.queue.push(0.0, 0, index);
+      side.labels.push(Label {
+        node,
+        cost: 0.0,
+        depth: 0,
+        parent: None,
+        edge: None,
+        weight: 0.0,
+        alive: true,
+      });
+    }
+    side
+  }
+}
+
+/// Where the cheapest path found so far joins the two searches: a forward label, the edge from
+/// its node to the backward label's node, and that backward label.
+#[derive(Clone, Copy)]
+struct Meeting {
+  forward: usize,
+  edge: (NodeId, ETypeId, NodeId),
+  weight: f64,
+  backward: usize,
+}
+
+/// Cheapest path within `config.max_depth` hops from the source to a target, searching from the
+/// source and from the targets at once (bidirectional Dijkstra).
+///
+/// Each side pops its labels by cost and expands them; every edge a side expands is checked
+/// against the other side's labels at its far end, and a meeting within the depth limit is a
+/// path. A path within the limit that is cheaper than the best found so far has, on each side,
+/// a queued label at one of its nodes that is at most as costly and as deep as the path up to
+/// (or on from) that node; the two are at different nodes, at least a hop apart, since labels
+/// of one node on both sides have met already. So the search stops when the two sides'
+/// smallest queued costs add up to at least the best found, or, while the run matches the
+/// depth-tracking one, when their smallest queued depths add up to `max_depth` or more.
+///
+/// With `track_depth`, a node keeps a label per (cost, depth) trade-off, as in
+/// [`label_search`], and the result is exact. Without it, a node keeps only its cheapest label.
+/// That is exact unless both of these happened: the depth limit stopped a label, or rejected a
+/// meeting, cheaper than the result (`cut`); and a label the depth-tracking search keeps was
+/// dropped or replaced (`diverged`; until then the two runs are the same). Then it gives up
+/// (`None`) and the caller reruns with `track_depth`.
+fn bidirectional_label_search<F, W>(
+  config: &PathConfig,
+  neighbors: &F,
+  edge_weight: &W,
+  track_depth: bool,
+) -> Option<PathResult>
+where
+  F: Fn(NodeId, TraversalDirection, Option<ETypeId>) -> Vec<Edge>,
+  W: Fn(NodeId, ETypeId, NodeId) -> f64,
+{
+  // Labels compare on depth only when tracking it.
+  let key = |depth: usize| if track_depth { depth } else { 0 };
+  let etype_filter = config.neighbors_etype();
+  let max_depth = config.max_depth;
+  let mut forward = LabelSide::new(&[config.source], config.direction);
+  let mut backward = LabelSide::new(&sorted_targets(config), reverse_direction(config.direction));
+  let mut best = f64::INFINITY;
+  let mut meeting: Option<Meeting> = None;
+  let mut cut = false;
+  let mut diverged = false;
+  // Which side popped last (true: forward), and the cost it popped.
+  let mut last_popped: Option<(bool, f64)> = None;
+
+  loop {
+    if forward.queue.min_cost() + backward.queue.min_cost() >= best {
+      break;
+    }
+    if (track_depth || !diverged)
+      && forward
+        .queue
+        .min_depth
+        .saturating_add(backward.queue.min_depth)
+        >= max_depth
+    {
+      break;
+    }
+    // Expand the side with the shorter queue, a cost at a time: the side that popped last
+    // keeps going while its cheapest queued label costs what that one did (with unit weights,
+    // a whole level, as a bidirectional BFS expands).
+    let expand_forward = match last_popped {
+      Some((true, cost)) if forward.queue.min_cost() == cost => true,
+      Some((false, cost)) if backward.queue.min_cost() == cost => false,
+      _ => forward.queue.len() <= backward.queue.len(),
+    };
+    let (side, other) = if expand_forward {
+      (&mut forward, &backward)
+    } else {
+      (&mut backward, &forward)
+    };
+    let LabelSide {
+      direction,
+      labels,
+      frontiers,
+      settled,
+      queue,
+    } = side;
+    let Some(index) = queue.pop() else {
+      break;
+    };
+    let Label {
+      node,
+      cost,
+      depth,
+      alive,
+      ..
+    } = labels[index];
+    last_popped = Some((expand_forward, cost));
+    if !alive
+      || settled
+        .get(&node)
+        .is_some_and(|&seen| key(seen) <= key(depth))
+    {
+      continue;
+    }
+    settled.insert(node, depth);
+    if depth >= max_depth {
+      cut |= cost < best;
+      if cut && diverged && !track_depth {
+        return None;
+      }
+      continue;
+    }
+
+    let next_depth = depth + 1;
+    let edges = expand_directions(*direction).iter().flat_map(|&dir| {
+      neighbors(node, dir, etype_filter)
+        .into_iter()
+        .map(move |edge| (dir, edge))
+    });
+    for (dir, edge) in edges {
+      if !config.allows(edge.etype) {
+        continue;
+      }
+      let next = neighbor_id_for_edge(node, dir, &edge);
+      let weight = edge_weight(edge.src, edge.etype, edge.dst);
+      if !usable_weight(weight) {
+        continue;
+      }
+      let next_cost = cost + weight;
+      let edge = (edge.src, edge.etype, edge.dst);
+
+      // Meet the other side's labels at `next`.
+      let met = other
+        .frontiers
+        .get(&next)
+        .into_iter()
+        .flat_map(Frontier::labels);
+      for other_index in met {
+        let other_label = &other.labels[other_index];
+        let total = next_cost + other_label.cost;
+        if total >= best {
+          continue;
+        }
+        if next_depth + other_label.depth > max_depth {
+          cut = true;
+          continue;
+        }
+        best = total;
+        let (forward, backward) = if expand_forward {
+          (index, other_index)
+        } else {
+          (other_index, index)
+        };
+        meeting = Some(Meeting {
+          forward,
+          edge,
+          weight,
+          backward,
+        });
+      }
+
+      // Relax `next` on this side.
+      let frontier = frontiers.entry(next).or_default();
+      let settled_depth = settled.get(&next).copied();
+      let blocked = settled_depth.is_some_and(|seen| key(seen) <= key(next_depth))
+        || frontier.labels().any(|other| {
+          labels[other].cost <= next_cost && key(labels[other].depth) <= key(next_depth)
+        });
+      if blocked {
+        // The depth-tracking search would keep this costlier but shallower label.
+        diverged |= !track_depth
+          && settled_depth.is_none_or(|seen| seen > next_depth)
+          && !frontier
+            .labels()
+            .any(|other| labels[other].cost <= next_cost && labels[other].depth <= next_depth);
+      } else {
+        frontier.retain(|other| {
+          let other = &mut labels[other];
+          let replaced = next_cost <= other.cost && key(next_depth) <= key(other.depth);
+          if replaced {
+            // The depth-tracking search would keep the shallower label next to this one.
+            diverged |= next_depth > other.depth;
+            other.alive = false;
+          }
+          !replaced
+        });
+        let next_index = labels.len();
+        frontier.push(next_index);
+        queue.push(next_cost, next_depth, next_index);
+        labels.push(Label {
+          node: next,
+          cost: next_cost,
+          depth: next_depth,
+          parent: Some(index),
+          edge: Some(edge),
+          weight,
+          alive: true,
+        });
+      }
+      if cut && diverged && !track_depth {
+        return None;
+      }
+    }
+  }
+
+  Some(match meeting {
+    Some(meeting) => meeting_path(&forward.labels, &backward.labels, meeting),
+    None => PathResult::not_found(),
+  })
+}
+
+/// The path of `meeting`: the forward labels from the source, its edge, then the backward
+/// labels to a target. With zero-weight cycles the two halves can share a node; the loop
+/// between its occurrences weighs nothing and is cut out.
+fn meeting_path(forward: &[Label], backward: &[Label], meeting: Meeting) -> PathResult {
+  let mut nodes = Vec::new();
+  let mut edges = Vec::new();
+  let mut current = Some(meeting.forward);
+  while let Some(label) = current.map(|index| &forward[index]) {
+    nodes.push(label.node);
+    edges.extend(label.edge.map(|edge| (edge, label.weight)));
+    current = label.parent;
+  }
+  nodes.reverse();
+  edges.reverse();
+  edges.push((meeting.edge, meeting.weight));
+  let mut current = Some(meeting.backward);
+  while let Some(label) = current.map(|index| &backward[index]) {
+    nodes.push(label.node);
+    edges.extend(label.edge.map(|edge| (edge, label.weight)));
+    current = label.parent;
+  }
+
+  // From each node, continue after its last occurrence: no node is left twice.
+  let last: FastMap<NodeId, usize> = nodes.iter().enumerate().map(|(i, &n)| (n, i)).collect();
+  let mut path = Vec::with_capacity(nodes.len());
+  let mut path_edges = Vec::with_capacity(edges.len());
+  let mut total_weight = 0.0;
+  let mut i = 0;
+  loop {
+    let at = last[&nodes[i]];
+    path.push(nodes[at]);
+    let Some(&(edge, weight)) = edges.get(at) else {
+      break;
+    };
+    path_edges.push(edge);
+    total_weight += weight;
+    i = at + 1;
+  }
+
+  PathResult {
+    path,
+    edges: path_edges,
+    total_weight,
+    found: true,
+  }
+}
+
+/// Cheapest path within `config.max_depth`, searching from both ends: one label per node first,
+/// and labels per (cost, depth) trade-off only if that search cannot vouch for its result.
+fn bidirectional_shortest_path<F, W>(
+  config: &PathConfig,
+  neighbors: &F,
+  edge_weight: &W,
+) -> PathResult
+where
+  F: Fn(NodeId, TraversalDirection, Option<ETypeId>) -> Vec<Edge>,
+  W: Fn(NodeId, ETypeId, NodeId) -> f64,
+{
+  if config.targets.contains(&config.source) {
+    return source_only(config.source);
+  }
+  if config.targets.is_empty() || config.max_depth == 0 {
+    return PathResult::not_found();
+  }
+  bidirectional_label_search(config, neighbors, edge_weight, false).unwrap_or_else(|| {
+    bidirectional_label_search(config, neighbors, edge_weight, true)
+      .unwrap_or_else(PathResult::not_found)
+  })
+}
+
+// ============================================================================
 // Dijkstra's Algorithm
 // ============================================================================
 
 /// Execute Dijkstra's shortest path algorithm
+///
+/// Searches from the source and from the targets at once (see the [module docs](self)), so
+/// `neighbors` is also called with the reverse of `config.direction`.
 ///
 /// # Arguments
 /// * `config` - Pathfinding configuration
@@ -450,7 +878,7 @@ where
   F: Fn(NodeId, TraversalDirection, Option<ETypeId>) -> Vec<Edge>,
   W: Fn(NodeId, ETypeId, NodeId) -> f64,
 {
-  shortest_path_search(&config, &neighbors, &edge_weight, &|_| 0.0)
+  bidirectional_shortest_path(&config, &neighbors, &edge_weight)
 }
 
 /// Execute A* shortest path algorithm with heuristic
@@ -622,69 +1050,121 @@ where
 ///
 /// Finds the path with the fewest hops (within `config.max_depth`); `total_weight` is the hop
 /// count. This is faster than Dijkstra for unweighted graphs.
+///
+/// A bidirectional BFS: it expands a whole level of the source's side or of the targets' side
+/// at a time, whichever frontier is smaller, and stops at the first node both sides reach (see
+/// the [module docs](self)). `neighbors` is also called with the reverse of `config.direction`.
 pub fn bfs<F>(config: PathConfig, neighbors: F) -> PathResult
 where
   F: Fn(NodeId, TraversalDirection, Option<ETypeId>) -> Vec<Edge>,
 {
-  let source = config.source;
-  if config.targets.contains(&source) {
-    return PathResult {
-      path: vec![source],
-      edges: Vec::new(),
-      total_weight: 0.0,
-      found: true,
-    };
+  if config.targets.contains(&config.source) {
+    return source_only(config.source);
   }
-
   let etype_filter = config.neighbors_etype();
-  // Node -> (parent, edge used to reach it).
-  let mut parents: FastMap<NodeId, (NodeId, (NodeId, ETypeId, NodeId))> = FastMap::new();
-  let mut visited: FastSet<NodeId> = FastSet::new();
-  visited.insert(source);
-  let mut queue = VecDeque::new();
-  queue.push_back((source, 0usize));
+  let mut forward = BfsSide::new(&[config.source], config.direction);
+  let mut backward = BfsSide::new(
+    &sorted_targets(&config),
+    reverse_direction(config.direction),
+  );
 
-  while let Some((node, depth)) = queue.pop_front() {
-    if depth >= config.max_depth {
-      continue;
-    }
-    for &dir in expand_directions(config.direction) {
-      for edge in neighbors(node, dir, etype_filter) {
-        if !config.allows(edge.etype) {
-          continue;
-        }
-        let next = neighbor_id_for_edge(node, dir, &edge);
-        if !visited.insert(next) {
-          continue;
-        }
-        parents.insert(next, (node, (edge.src, edge.etype, edge.dst)));
-        if config.targets.contains(&next) {
-          return bfs_path(&parents, source, next);
-        }
-        queue.push_back((next, depth + 1));
-      }
+  // Every path of at most `forward.depth + backward.depth` hops has been ruled out, so the
+  // first node a level shares with the other side ends a shortest path.
+  while forward.depth + backward.depth < config.max_depth
+    && !forward.frontier.is_empty()
+    && !backward.frontier.is_empty()
+  {
+    let (side, other) = if forward.frontier.len() <= backward.frontier.len() {
+      (&mut forward, &backward)
+    } else {
+      (&mut backward, &forward)
+    };
+    if let Some(meeting) = side.expand_level(&config, etype_filter, &neighbors, other) {
+      return bfs_path(&forward, &backward, meeting);
     }
   }
 
   PathResult::not_found()
 }
 
-fn bfs_path(
-  parents: &FastMap<NodeId, (NodeId, (NodeId, ETypeId, NodeId))>,
-  source: NodeId,
-  target: NodeId,
-) -> PathResult {
-  let mut path = vec![target];
+/// How one side of a BFS reached a node: the node one hop closer to the side's root, and the
+/// edge between them (`None` for a root).
+type BfsLink = Option<(NodeId, (NodeId, ETypeId, NodeId))>;
+
+/// One side of a bidirectional BFS: the nodes it reached from its roots by expanding in
+/// `direction`, and its last level.
+struct BfsSide {
+  direction: TraversalDirection,
+  reached: FastMap<NodeId, BfsLink>,
+  frontier: Vec<NodeId>,
+  /// Hops from the roots to the frontier
+  depth: usize,
+}
+
+impl BfsSide {
+  fn new(roots: &[NodeId], direction: TraversalDirection) -> Self {
+    Self {
+      direction,
+      reached: roots.iter().map(|&root| (root, None)).collect(),
+      frontier: roots.to_vec(),
+      depth: 0,
+    }
+  }
+
+  /// Expand the frontier one level: the first node reached that `other` reached too, if any.
+  fn expand_level<F>(
+    &mut self,
+    config: &PathConfig,
+    etype_filter: Option<ETypeId>,
+    neighbors: &F,
+    other: &BfsSide,
+  ) -> Option<NodeId>
+  where
+    F: Fn(NodeId, TraversalDirection, Option<ETypeId>) -> Vec<Edge>,
+  {
+    let mut next_frontier = Vec::new();
+    for &node in &self.frontier {
+      for &dir in expand_directions(self.direction) {
+        for edge in neighbors(node, dir, etype_filter) {
+          if !config.allows(edge.etype) {
+            continue;
+          }
+          let next = neighbor_id_for_edge(node, dir, &edge);
+          if let hashbrown::hash_map::Entry::Vacant(entry) = self.reached.entry(next) {
+            entry.insert(Some((node, (edge.src, edge.etype, edge.dst))));
+            if other.reached.contains_key(&next) {
+              return Some(next);
+            }
+            next_frontier.push(next);
+          }
+        }
+      }
+    }
+    self.frontier = next_frontier;
+    self.depth += 1;
+    None
+  }
+}
+
+/// The path through `meeting`: the forward side's links back to the source, then the backward
+/// side's links on to a target.
+fn bfs_path(forward: &BfsSide, backward: &BfsSide, meeting: NodeId) -> PathResult {
+  let mut path = vec![meeting];
   let mut edges = Vec::new();
-  let mut current = target;
-  while current != source {
-    let (parent, edge) = parents[&current];
+  let mut current = meeting;
+  while let Some((previous, edge)) = forward.reached[&current] {
+    path.push(previous);
     edges.push(edge);
-    path.push(parent);
-    current = parent;
+    current = previous;
   }
   path.reverse();
   edges.reverse();
+  current = meeting;
+  while let Some((next, edge)) = backward.reached[&current] {
+    path.push(next);
+    edges.push(edge);
+    current = next;
+  }
   let total_weight = edges.len() as f64;
 
   PathResult {
@@ -769,7 +1249,12 @@ where
     // Rank the k cheapest paths to each target (avoiding the other targets) together.
     let mut paths = Vec::new();
     for &target in &targets {
-      let others: FastSet<NodeId> = targets.iter().copied().filter(|&t| t != target).collect();
+      // The source is never re-entered anyway; a search from the target's side must reach it.
+      let others: FastSet<NodeId> = targets
+        .iter()
+        .copied()
+        .filter(|&t| t != target && t != config.source)
+        .collect();
       let avoid_others = |node: NodeId, dir: TraversalDirection, etype: Option<ETypeId>| {
         neighbors(node, dir, etype)
           .into_iter()
@@ -852,13 +1337,15 @@ where
       // Nodes in root path (except spur node) should be avoided
       let root_nodes = root_nodes(&root_path, spur_idx);
 
-      // Create a modified neighbors that excludes forbidden edges and nodes
+      // Create a modified neighbors that excludes forbidden edges and nodes. The excluded
+      // edges touch the spur node, which a spur path leaves once and never re-enters, so
+      // they are dropped from either end: the search also expands from the target's side.
       let filtered_neighbors = |node: NodeId, dir: TraversalDirection, etype: Option<ETypeId>| {
         neighbors(node, dir, etype)
           .into_iter()
           .filter(|edge| {
             // Don't use excluded edges from spur node
-            if node == spur_node && excluded_edges.contains(&(edge.src, edge.etype, edge.dst)) {
+            if excluded_edges.contains(&(edge.src, edge.etype, edge.dst)) {
               return false;
             }
             // Don't go to nodes in the root path
