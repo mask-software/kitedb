@@ -911,3 +911,171 @@ fn checkpoint_trigger_and_segment_limit_follow_the_log_options() {
     assert!(open_single_file(dir.path().join("refused.kitedb"), refused).is_err());
   }
 }
+
+/// Review finding 6. A panic in a checkpoint thread's run is caught: it is
+/// reported as the thread's error (so writers at the segment limit get
+/// `CheckpointFailed` instead of waiting for a thread that is gone), and
+/// automatic checkpoints go on: a later run installs and clears it.
+#[test]
+fn a_panic_on_the_checkpoint_thread_is_reported_and_checkpoints_go_on() {
+  let dir = tempdir().expect("tempdir");
+  let path = dir.path().join("checkpoint-thread-panic.kitedb");
+  let db = open_single_file(&path, options().sync_mode(SyncMode::Normal)).expect("open");
+  // Far above what this test writes: no writer waits for segment space.
+  set_wal_segment_test_limit(&db, 64 * 1024 * 1024);
+  set_checkpoint_test_db_panic(&db, CheckpointPhase::SnapshotWritten);
+  let generation = db.header.read().active_snapshot_gen;
+  let mut acked = Vec::new();
+  let mut index = 0;
+  // The log reaches the checkpoint trigger (four WALs) after about 900
+  // commits; the thread's run then panics.
+  while checkpoint_thread_error(&db).is_none() && index < 3_000 {
+    acked.extend(commit_keys(&db, "a", index, 1));
+    index += 1;
+  }
+  let deadline = Instant::now() + Duration::from_secs(5);
+  wait_for("the panic to be reported", deadline, || {
+    checkpoint_thread_error(&db).is_some()
+  });
+  let reported = checkpoint_thread_error(&db);
+  assert!(
+    reported
+      .as_deref()
+      .is_some_and(|error| error.contains("panic")),
+    "the checkpoint thread's panic was not reported: {reported:?}"
+  );
+  assert_eq!(
+    db.header.read().active_snapshot_gen,
+    generation,
+    "setup: a checkpoint installed before the panic"
+  );
+
+  // Commits go on, past the trigger: a later run (after the back-off)
+  // installs.
+  let deadline = Instant::now() + Duration::from_secs(20);
+  while db.header.read().active_snapshot_gen == generation && Instant::now() < deadline {
+    acked.extend(commit_keys(&db, "b", index, 1));
+    index += 1;
+  }
+  assert!(
+    db.header.read().active_snapshot_gen > generation,
+    "no automatic checkpoint installed after the checkpoint thread panicked"
+  );
+  assert_eq!(
+    checkpoint_thread_error(&db),
+    None,
+    "the error was not cleared"
+  );
+  close_single_file(db).expect("close");
+  let reopened = open_single_file(&path, options()).expect("reopen");
+  assert!(missing(&reopened, &acked).is_empty());
+}
+
+/// Review finding 8(a). A rollback succeeds even when the WAL and its
+/// segments are full: its ROLLBACK record is not needed (recovery drops a
+/// transaction without a COMMIT record), so it never waits or fails for log
+/// space.
+#[test]
+fn a_rollback_succeeds_when_the_log_is_full() {
+  let dir = tempdir().expect("tempdir");
+  let path = dir.path().join("rollback-log-full.kitedb");
+  let db = open_single_file(&path, spilling_options()).expect("open");
+  let acked = commit_keys(&db, "before", 0, 10);
+  // A transaction whose records go to the WAL as it writes them: past a
+  // spill, then filling the WAL to the last byte.
+  db.begin(false).expect("begin");
+  let big = |n: usize| format!("big-{n:06}-{}", "b".repeat(1000));
+  let mut n = 0;
+  while wal_segment_test_stats(&db).live == 0 || db.wal_buffer.lock().free() > 8 * 1024 {
+    db.create_node(Some(&big(n))).expect("node");
+    n += 1;
+  }
+  // A CreateNode record takes 36 bytes besides its key, padded to 8.
+  let free = db.wal_buffer.lock().free() as usize;
+  let prefix = format!("big-{n:06}-");
+  db.create_node(Some(&format!(
+    "{prefix}{}",
+    "b".repeat(free - 36 - prefix.len())
+  )))
+  .expect("the last node");
+  assert_eq!(db.wal_buffer.lock().free(), 0, "setup: the WAL is not full");
+  // The segments are at their limit, and nothing checkpoints.
+  set_wal_segment_test_limit(&db, 1);
+  db.rollback()
+    .expect("the rollback of a transaction that filled the log");
+  assert!(db.node_by_key(&big(0)).is_none());
+  close_single_file(db).expect("close");
+  let reopened = open_single_file(&path, spilling_options()).expect("reopen");
+  assert!(missing(&reopened, &acked).is_empty());
+  assert!(reopened.node_by_key(&big(0)).is_none());
+}
+
+/// Review finding 8(b). Dropping the free pages at the end of the file
+/// after an install is housekeeping: if it fails, the checkpoint (which
+/// installed) still succeeds, and no error is left behind to stick.
+#[test]
+fn a_failed_tail_truncation_after_an_install_is_not_a_checkpoint_error() {
+  let dir = tempdir().expect("tempdir");
+  let path = dir.path().join("tail-truncation.kitedb");
+  let db = open_single_file(&path, options().sync_mode(SyncMode::Normal)).expect("open");
+  let acked = commit_keys(&db, "key", 0, 200);
+  let generation = db.header.read().active_snapshot_gen;
+  set_checkpoint_test_db_fault(&db, CheckpointPhase::TailTruncate, true);
+  let result = db.background_checkpoint();
+  let blocking = db.checkpoint();
+  clear_checkpoint_test_db_faults(&db);
+  assert!(
+    result.is_ok() && blocking.is_ok(),
+    "checkpoints that installed failed for their tail truncation: {result:?}, {blocking:?}"
+  );
+  assert!(db.header.read().active_snapshot_gen >= generation + 2);
+  assert_eq!(checkpoint_thread_error(&db), None);
+  close_single_file(db).expect("close");
+  let reopened = open_single_file(&path, options()).expect("reopen");
+  assert!(missing(&reopened, &acked).is_empty());
+}
+
+/// Review finding 8(c). A writer refused with `CheckpointFailed` (it needs
+/// WAL segment space while the last automatic checkpoint failed) asks for
+/// another checkpoint: once the failure's cause is gone, that run (after the
+/// back-off) installs and clears the error, though nothing else asks.
+#[test]
+fn a_writer_refused_for_a_failed_checkpoint_asks_for_another() {
+  let dir = tempdir().expect("tempdir");
+  let path = dir.path().join("refused-writer-retries.kitedb");
+  let db = open_single_file(&path, options().sync_mode(SyncMode::Normal)).expect("open");
+  // One spill reaches the limit, far below the checkpoint trigger: only
+  // writers waiting for space ask for checkpoints.
+  set_wal_segment_test_limit(&db, 1);
+  set_checkpoint_test_db_fault(&db, CheckpointPhase::SnapshotWritten, true);
+  let mut acked = Vec::new();
+  let mut failure = None;
+  for index in 0..2_000 {
+    let key = key("key", index);
+    match commit_key(&db, &key) {
+      Ok(()) => acked.push(key),
+      Err(error) => {
+        failure = Some(error);
+        break;
+      }
+    }
+  }
+  clear_checkpoint_test_db_faults(&db);
+  assert!(
+    matches!(failure, Some(KiteError::CheckpointFailed(_))),
+    "setup: the writer at the limit got {failure:?}"
+  );
+  let deadline = Instant::now() + Duration::from_secs(10);
+  let cleared = wait_for("a retried checkpoint", deadline, || {
+    checkpoint_thread_error(&db).is_none()
+  });
+  assert!(
+    cleared,
+    "no checkpoint ran after the refused writer: the error stays ({:?})",
+    checkpoint_thread_error(&db)
+  );
+  acked.extend(commit_keys(&db, "after", 0, 10));
+  close_single_file(db).expect("close");
+  let reopened = open_single_file(&path, options()).expect("reopen");
+  assert!(missing(&reopened, &acked).is_empty());
+}

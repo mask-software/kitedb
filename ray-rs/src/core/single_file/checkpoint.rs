@@ -77,6 +77,9 @@ pub(super) enum CheckpointPhase {
   /// A checkpoint's install is durable in both header slots; the segments it
   /// covers are not freed yet.
   SegmentsReleased,
+  /// A checkpoint is about to drop the free pages at the end of the file,
+  /// after its install.
+  TailTruncate,
 }
 
 /// A barrier armed for one phase of checkpoints on the database at a path.
@@ -112,6 +115,12 @@ static CHECKPOINT_TEST_SNAPSHOT_BYTES: OnceLock<Mutex<HashMap<std::path::PathBuf
 type CheckpointTestDbFault = (std::path::PathBuf, CheckpointPhase, bool);
 #[cfg(test)]
 static CHECKPOINT_TEST_DB_FAULTS: OnceLock<Mutex<Vec<CheckpointTestDbFault>>> = OnceLock::new();
+/// Panics armed for a phase of checkpoints on the database at a path, on
+/// whichever thread reaches it (a checkpoint thread's included); each fires
+/// once.
+#[cfg(test)]
+static CHECKPOINT_TEST_DB_PANICS: OnceLock<Mutex<Vec<(std::path::PathBuf, CheckpointPhase)>>> =
+  OnceLock::new();
 /// The phases reached on watched databases, with the name of the thread
 /// that reached each, and whether it was about to wait at a barrier.
 #[cfg(test)]
@@ -164,6 +173,20 @@ pub(super) fn checkpoint_phase(db_path: &std::path::Path, phase: CheckpointPhase
       return Err(KiteError::Internal(
         "injected checkpoint abort (database fault)".to_string(),
       ));
+    }
+    let db_panics = {
+      let mut panics = CHECKPOINT_TEST_DB_PANICS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .expect("checkpoint test db panic lock");
+      panics
+        .iter()
+        .position(|(path, panic_phase)| path == db_path && *panic_phase == phase)
+        .map(|index| panics.remove(index))
+        .is_some()
+    };
+    if db_panics {
+      panic!("injected checkpoint panic at {phase:?} (database fault)");
     }
     let barrier = {
       let mut configured = CHECKPOINT_TEST_BARRIERS
@@ -294,6 +317,17 @@ fn set_checkpoint_test_db_fault(db: &SingleFileDB, phase: CheckpointPhase, stick
     .lock()
     .expect("checkpoint test db fault lock")
     .push((db.path().to_path_buf(), phase, sticky));
+}
+
+/// Panic in the next checkpoint step at `phase` on `db`, on whichever thread
+/// reaches it.
+#[cfg(test)]
+fn set_checkpoint_test_db_panic(db: &SingleFileDB, phase: CheckpointPhase) {
+  CHECKPOINT_TEST_DB_PANICS
+    .get_or_init(|| Mutex::new(Vec::new()))
+    .lock()
+    .expect("checkpoint test db panic lock")
+    .push((db.path().to_path_buf(), phase));
 }
 
 /// Disarm every fault `set_checkpoint_test_db_fault` armed on `db`.
@@ -1552,6 +1586,7 @@ impl SingleFileDB {
   /// and both durable header slots point at the installed snapshot: pages a
   /// slot may still name are never free.
   fn truncate_orphaned_tail(&self) -> Result<()> {
+    checkpoint_phase(&self.path, CheckpointPhase::TailTruncate)?;
     let header = self.header.read().clone();
     let keep_pages = header
       .snapshot_start_page

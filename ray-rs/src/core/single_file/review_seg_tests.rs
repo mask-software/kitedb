@@ -59,9 +59,7 @@ fn review_snapshot_pages_chosen_at_eof_are_not_taken_by_a_concurrent_spill() {
   let header = db.header.read().clone();
   let generation = header.active_snapshot_gen + 1;
   let graph = db.collect_graph_data().expect("collect");
-  let (buffer, _stores) = db
-    .build_snapshot_buffer(generation, graph)
-    .expect("build");
+  let (buffer, _stores) = db.build_snapshot_buffer(generation, graph).expect("build");
   let page_size = header.page_size as usize;
   let page_count = pages_to_store(buffer.len(), page_size) as u64;
   let start = db
@@ -95,7 +93,10 @@ fn review_snapshot_pages_chosen_at_eof_are_not_taken_by_a_concurrent_spill() {
   let outcome = match &reopened {
     Ok(db) => format!(
       "the reopened database misses {} of {} acknowledged commits",
-      acked.iter().filter(|key| db.node_by_key(key).is_none()).count(),
+      acked
+        .iter()
+        .filter(|key| db.node_by_key(key).is_none())
+        .count(),
       acked.len()
     ),
     Err(error) => format!("reopening fails: {error}"),
