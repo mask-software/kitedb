@@ -182,6 +182,43 @@ fn a_refused_open_of_an_old_magic_file_writes_nothing() {
   );
 }
 
+/// An open of a file in the old magic refused at its last check, the
+/// replication sidecar (here a file where its directory goes), writes
+/// nothing to the file: the upgrade of its header slots comes after every
+/// check that may refuse the open.
+#[test]
+fn an_open_refused_at_the_replication_sidecar_writes_nothing() {
+  let dir = tempdir().expect("tempdir");
+  let path = dir.path().join("sidecar.kitedb");
+  std::fs::copy(
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v2_wal_records.kitedb"),
+    &path,
+  )
+  .expect("copy the fixture");
+  let sidecar = dir.path().join("sidecar-is-a-file");
+  std::fs::write(&sidecar, b"not a directory").expect("write");
+  let before = std::fs::read(&path).expect("read");
+  let refused = open_single_file(
+    &path,
+    SingleFileOpenOptions::new()
+      .replication_role(crate::replication::types::ReplicationRole::Primary)
+      .replication_sidecar_path(&sidecar),
+  );
+  assert!(refused.is_err(), "setup: the open was not refused");
+  let after = std::fs::read(&path).expect("read");
+  let changed = (0..before.len().max(after.len()) / 4096)
+    .filter(|&page| {
+      before.get(page * 4096..(page + 1) * 4096) != after.get(page * 4096..(page + 1) * 4096)
+    })
+    .collect::<Vec<_>>();
+  assert!(
+    changed.is_empty(),
+    "an open refused at the replication sidecar wrote to the file: pages {changed:?} changed; \
+     v0.2.18 accepts {:?} of its slots",
+    accepted_slots(&path)
+  );
+}
+
 /// `page`, a header page, in the old magic with the checksums a header in
 /// that magic carries: the CRC-32 of bytes 0..176 at 176, and of the whole
 /// page but its last four bytes in them.
