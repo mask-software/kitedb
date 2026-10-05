@@ -108,6 +108,14 @@ stages! {
   /// A background checkpoint's install, while it holds the commit lock
   /// (the replay of the commits since its first replay, and the install).
   CheckpointLocked,
+  /// Its parts: the replay of the commits since its first replay,
+  InstallTailReplay,
+  /// the header and the freed segments,
+  InstallWrite,
+  /// putting the new snapshot and delta in place,
+  InstallSwap,
+  /// and dropping the free pages at the end of the file.
+  InstallTruncate,
   /// Writing a header page (`persist_header`).
   HeaderPageWrite,
   /// Syncing after it, when asked to.

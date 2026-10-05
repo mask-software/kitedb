@@ -210,7 +210,7 @@ impl SingleFileDB {
     }
 
     // The installed snapshot holds everything the delta did.
-    self.install_loaded_snapshot(loaded, DeltaState::new());
+    drop(self.install_loaded_snapshot(loaded, DeltaState::new()));
 
     Ok(())
   }
