@@ -1083,16 +1083,23 @@ impl SingleFileDB {
     }
   }
 
-  /// A checkpoint thread's run: a background checkpoint, declined
-  /// (`CheckpointDeclined`) if another is running or an exclusive operation
-  /// waits for the gate.
+  /// A checkpoint thread's run: a background checkpoint of its own. If
+  /// another is running (an application's), it waits for that one to end
+  /// and then runs its own: the one running may have cut before the requests
+  /// this run answers (see `wait_for_segment_space`), so it may free nothing
+  /// they wait for. Declined (`CheckpointDeclined`) while an exclusive
+  /// operation waits for the gate (which checkpoints anyway; writers fail
+  /// meanwhile), or once the database closes.
   pub(crate) fn run_auto_checkpoint(&self) -> Result<()> {
-    match self.run_background_checkpoint()? {
-      BackgroundCheckpointOutcome::Done => Ok(()),
-      BackgroundCheckpointOutcome::AlreadyRunning => Err(KiteError::CheckpointDeclined(
-        "another background checkpoint is running".to_string(),
-      )),
-      BackgroundCheckpointOutcome::ExclusiveWaiting => Err(exclusive_waiting_error()),
+    loop {
+      match self.run_background_checkpoint()? {
+        BackgroundCheckpointOutcome::Done => return Ok(()),
+        BackgroundCheckpointOutcome::AlreadyRunning => {
+          self.wait_for_background_checkpoint();
+          self.checkpoint_progressed()?;
+        }
+        BackgroundCheckpointOutcome::ExclusiveWaiting => return Err(exclusive_waiting_error()),
+      }
     }
   }
 
@@ -1670,8 +1677,9 @@ impl SingleFileDB {
   }
 
   /// `wait_for_segment_space` without a checkpoint thread: run a background
-  /// checkpoint here (or wait for the one running), then retry, as long as
-  /// each frees segment space. A blocking checkpoint would wait for this
+  /// checkpoint here (after waiting for any running one, which may already
+  /// have freed the space), then retry, as long as each of this writer's
+  /// own runs frees segment space. A blocking checkpoint would wait for this
   /// writer's own transaction; with background checkpoints off, the
   /// auto-checkpoint after the write fails runs one.
   fn make_segment_space_here(&self) -> Result<()> {
@@ -1689,7 +1697,14 @@ impl SingleFileDB {
       let frees = self.wal_segment_frees.load(Ordering::Acquire);
       match self.run_background_checkpoint() {
         Ok(BackgroundCheckpointOutcome::Done) => {}
-        Ok(BackgroundCheckpointOutcome::AlreadyRunning) => self.wait_for_background_checkpoint(),
+        // Another's run may have cut before this writer needed the space,
+        // and free nothing: wait for it, then look again, running one of
+        // this writer's own if it is still needed. Only that one's outcome
+        // can fail the write.
+        Ok(BackgroundCheckpointOutcome::AlreadyRunning) => {
+          self.wait_for_background_checkpoint();
+          continue;
+        }
         Ok(BackgroundCheckpointOutcome::ExclusiveWaiting) => return Err(KiteError::WalBufferFull),
         Err(error) => {
           eprintln!("Warning: Auto-checkpoint failed: {error}");
