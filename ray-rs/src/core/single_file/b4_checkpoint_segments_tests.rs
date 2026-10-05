@@ -976,13 +976,21 @@ fn checkpoint_thread_runs_records_errors_and_stops() {
 }
 
 /// The checkpoint trigger is `checkpoint_log_ratio` of the snapshot's size,
-/// at least four WALs, at most `checkpoint_log_budget` (which also caps that
-/// floor); the WAL segment limit is twice the trigger, at least 16 WALs, at
-/// most four budgets, unless `wal_segment_limit` sets it.
+/// at least half the WAL's usable region (three eighths of the WAL: what
+/// earlier releases checkpointed at by default, so a small database holds
+/// no more log in memory than they did), at most `checkpoint_log_budget`
+/// (which also caps that floor); the WAL segment limit is twice the
+/// trigger, at least 16 WALs, at most four budgets, unless
+/// `wal_segment_limit` sets it. (Floor changed with decision Q4 of the fresh
+/// review: it was four WALs, which made a 64 MiB WAL hold 128 MiB of log on
+/// a tiny database, about 1.3 GB of delta, against 24 MiB before.)
 #[test]
 fn checkpoint_trigger_and_segment_limit_follow_the_log_options() {
   const MIB: u64 = 1024 * 1024;
   let wal = SMALL_WAL as u64;
+  // Earlier releases checkpointed once the WAL's primary region (three
+  // quarters of it) was half full (`checkpoint_threshold`, 0.5).
+  let earlier_trigger = |wal: u64| wal * 3 / 4 / 2;
   let dir = tempdir().expect("tempdir");
   let with_snapshot = |db: &SingleFileDB, bytes: u64| {
     let mut header = db.header.read().clone();
@@ -992,7 +1000,7 @@ fn checkpoint_trigger_and_segment_limit_follow_the_log_options() {
 
   let db = open_single_file(dir.path().join("defaults.kitedb"), options()).expect("open");
   let empty = with_snapshot(&db, 0);
-  assert_eq!(db.checkpoint_log_trigger(&empty), 4 * wal);
+  assert_eq!(db.checkpoint_log_trigger(&empty), earlier_trigger(wal));
   assert_eq!(db.wal_segment_limit(&empty), 16 * wal);
   let medium = with_snapshot(&db, 100 * MIB);
   assert_eq!(db.checkpoint_log_trigger(&medium), 50 * MIB);
@@ -1002,12 +1010,36 @@ fn checkpoint_trigger_and_segment_limit_follow_the_log_options() {
   assert_eq!(db.wal_segment_limit(&large), 256 * MIB);
   close_single_file(db).expect("close");
 
+  // The WAL of `recommended_balanced` (64 MiB): a tiny database holds no
+  // more log than earlier releases let it.
+  let db = open_single_file(
+    dir.path().join("balanced.kitedb"),
+    SingleFileOpenOptions::new().wal_size(64 * MIB as usize),
+  )
+  .expect("open");
+  assert_eq!(
+    db.checkpoint_log_trigger(&with_snapshot(&db, 0)),
+    earlier_trigger(64 * MIB)
+  );
+  close_single_file(db).expect("close");
+
+  // The budget caps the floor too.
+  let db = open_single_file(
+    dir.path().join("small-budget.kitedb"),
+    options().checkpoint_log_budget(16 * 1024),
+  )
+  .expect("open");
+  assert_eq!(db.checkpoint_log_trigger(&with_snapshot(&db, 0)), 16 * 1024);
+  close_single_file(db).expect("close");
+
   let tuned = options()
     .checkpoint_log_ratio(2.0)
     .checkpoint_log_budget(MIB / 8);
   let db = open_single_file(dir.path().join("tuned.kitedb"), tuned.clone()).expect("open");
-  // The budget caps the floor of four WALs too.
-  assert_eq!(db.checkpoint_log_trigger(&with_snapshot(&db, 0)), MIB / 8);
+  assert_eq!(
+    db.checkpoint_log_trigger(&with_snapshot(&db, 0)),
+    earlier_trigger(wal)
+  );
   let medium = with_snapshot(&db, 100 * MIB);
   assert_eq!(db.checkpoint_log_trigger(&medium), MIB / 8);
   assert_eq!(db.wal_segment_limit(&medium), MIB / 2);
