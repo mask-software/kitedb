@@ -4,7 +4,7 @@
 //! segment limit and stop there for the rest of the run. Included from
 //! checkpoint.rs for its test hooks.
 use super::*;
-use crate::core::single_file::pacing::{pacing_test_stats, set_pacing_test};
+use crate::core::single_file::pacing::{pacing_test_stats, set_pacing_test, MAX_PACE};
 use crate::core::single_file::{
   close_single_file, open_single_file, SingleFileOpenOptions, SyncMode,
 };
@@ -140,10 +140,16 @@ fn wait_for_a_pacing_writer(db: &SingleFileDB) -> bool {
 
 /// (a) A writer that outruns a running background checkpoint is paced: its
 /// commits slow down so the segments' room below the limit lasts the run,
-/// and no single commit waits longer than the bound (`MAX_PACE`, 100 ms;
-/// 300 ms here, for scheduling). Without pacing it fills the 1 MiB limit
-/// in a fraction of a second and waits there for the rest of the run (1.5 s
+/// and no commit's pacing wait is longer than the bound (`MAX_PACE`).
+/// Without pacing it fills the 1 MiB limit in a fraction of a second and
+/// stops there (`wait_for_segment_space`) for the rest of the run (1.5 s
 /// here: seconds on a large database).
+///
+/// Asserted by counters, not by how long commits took: on a loaded machine
+/// a commit that spills the WAL into a segment can take hundreds of
+/// milliseconds for its syncs alone (Linux CI saw 410 ms, which failed the
+/// 300 ms this test allowed a commit; neither a stop at the limit nor a
+/// pacing wait).
 #[test]
 fn a_writer_outrunning_a_running_checkpoint_is_paced_not_stopped() {
   let dir = tempdir().expect("tempdir");
@@ -151,26 +157,45 @@ fn a_writer_outrunning_a_running_checkpoint_is_paced_not_stopped() {
   warm_up(&db);
   // The run is expected to take 4 s; it is held for 1.5.
   set_pacing_test(&db, Some(Duration::from_secs(4)), None);
+  let before = pacing_test_stats(&db);
+  let (waits_before, waited_before) = checkpoint_test_segment_waits(&db);
   let held = Instant::now();
   let run = HeldRun::start(&db).release_after(Duration::from_millis(1_500));
-  let (mut commits, mut slowest) = (0, Duration::ZERO);
+  let mut commits = 0;
   while held.elapsed() < Duration::from_millis(1_400) {
-    let started = Instant::now();
     commit_key(&db, &key("tail", commits)).expect("commit");
-    slowest = slowest.max(started.elapsed());
     commits += 1;
   }
+  let stats = pacing_test_stats(&db);
+  let (waits, waited) = checkpoint_test_segment_waits(&db);
   run
     .join()
     .expect("the releasing thread")
     .expect("the held run");
-  let paced = pacing_test_stats(&db).paced;
   close_single_file(db).expect("close");
+  let paced = stats.paced - before.paced;
   assert!(
-    slowest <= Duration::from_millis(300) && paced > 0 && commits >= 50,
-    "a writer outrunning a held checkpoint: its slowest commit took {slowest:?} (at most \
-     300 ms: paced, not stopped at the segment limit), {paced} commits were paced, {commits} \
-     made it"
+    paced > 0 && commits >= 50,
+    "a writer outrunning a held checkpoint: {paced} of its {commits} commits were paced"
+  );
+  assert_eq!(
+    waits - waits_before,
+    0,
+    "a writer outrunning a held checkpoint stopped at the segment limit (for {:?} in all): \
+     pacing did not keep it below",
+    waited - waited_before
+  );
+  assert!(
+    stats.longest_planned <= MAX_PACE,
+    "a commit was paced {:?}, past the bound ({MAX_PACE:?})",
+    stats.longest_planned
+  );
+  // By the clock, with a loaded machine's wakeups to spare: a paced commit
+  // goes on at its deadline, not when the run ends (1.5 s on).
+  assert!(
+    stats.longest_pace < Duration::from_secs(1),
+    "a paced commit waited {:?} (its deadline was at most {MAX_PACE:?} away)",
+    stats.longest_pace
   );
 }
 

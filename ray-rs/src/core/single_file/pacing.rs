@@ -89,6 +89,8 @@ struct PacerTest {
   max_delay: Option<Duration>,
   paced: u64,
   pacing_now: u64,
+  longest_planned: Duration,
+  longest_pace: Duration,
 }
 
 impl LogPacer {
@@ -195,11 +197,16 @@ impl SingleFileDB {
       return;
     };
     #[cfg(test)]
-    {
+    let pacing_started = {
+      let now = Instant::now();
       let mut test = self.log_pacer.test.lock();
       test.paced += 1;
       test.pacing_now += 1;
-    }
+      test.longest_planned = test
+        .longest_planned
+        .max(until.saturating_duration_since(now));
+      now
+    };
     // The condition variable's mutex is held only by its waits and wakes.
     let mut wait = self.segment_space_wait.lock();
     while Instant::now() < until
@@ -211,7 +218,10 @@ impl SingleFileDB {
     drop(wait);
     #[cfg(test)]
     {
-      self.log_pacer.test.lock().pacing_now -= 1;
+      let paced_for = pacing_started.elapsed();
+      let mut test = self.log_pacer.test.lock();
+      test.pacing_now -= 1;
+      test.longest_pace = test.longest_pace.max(paced_for);
     }
   }
 }
@@ -224,6 +234,12 @@ pub(crate) struct PacingTestStats {
   pub(crate) paced: u64,
   /// Writers pacing now.
   pub(crate) pacing_now: u64,
+  /// The longest wait the schedule set a paced commit (at most the bound,
+  /// `MAX_PACE` or `set_pacing_test`'s).
+  pub(crate) longest_planned: Duration,
+  /// The longest a paced commit waited, by the clock: its planned wait,
+  /// and however long the scheduler took to wake it.
+  pub(crate) longest_pace: Duration,
 }
 
 /// Make `db` expect a background checkpoint run to take `expected_run`
@@ -247,5 +263,7 @@ pub(crate) fn pacing_test_stats(db: &SingleFileDB) -> PacingTestStats {
   PacingTestStats {
     paced: test.paced,
     pacing_now: test.pacing_now,
+    longest_planned: test.longest_planned,
+    longest_pace: test.longest_pace,
   }
 }

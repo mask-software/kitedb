@@ -286,6 +286,38 @@ fn checkpoint_test_pinned_refusals(db: &SingleFileDB) -> u64 {
     .unwrap_or(0)
 }
 
+/// Writes that waited for WAL segment space (refused it at the limit, they
+/// waited for a checkpoint to free some; not those that failed or found
+/// room at once), and how long they waited in all, per database path.
+#[cfg(test)]
+static CHECKPOINT_TEST_SEGMENT_WAITS: OnceLock<
+  Mutex<HashMap<std::path::PathBuf, (u64, Duration)>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+fn count_checkpoint_test_segment_wait(db_path: &std::path::Path, waited: Duration) {
+  let mut waits = CHECKPOINT_TEST_SEGMENT_WAITS
+    .get_or_init(|| Mutex::new(HashMap::new()))
+    .lock()
+    .expect("checkpoint test segment wait lock");
+  let (count, total) = waits.entry(db_path.to_path_buf()).or_default();
+  *count += 1;
+  *total += waited;
+}
+
+/// Writes on `db` so far that waited for WAL segment space (the stop at the
+/// segment limit that pacing keeps writers from), and how long, in all.
+#[cfg(test)]
+fn checkpoint_test_segment_waits(db: &SingleFileDB) -> (u64, Duration) {
+  CHECKPOINT_TEST_SEGMENT_WAITS
+    .get_or_init(|| Mutex::new(HashMap::new()))
+    .lock()
+    .expect("checkpoint test segment wait lock")
+    .get(db.path())
+    .copied()
+    .unwrap_or_default()
+}
+
 /// Cuts that covered the segments without spilling the WAL (the table had
 /// no entry for it), per database path.
 #[cfg(test)]
@@ -754,18 +786,37 @@ impl Drop for ExclusiveWaiter<'_> {
 /// dropped.
 struct SegmentWaiter<'db> {
   db: &'db SingleFileDB,
+  /// When it began waiting for a checkpoint to free space, if it did (a
+  /// test counts it: `checkpoint_test_segment_waits`).
+  #[cfg(test)]
+  waiting_since: Option<Instant>,
 }
 
 impl<'db> SegmentWaiter<'db> {
   fn new(db: &'db SingleFileDB) -> Self {
     db.segment_waiters.fetch_add(1, Ordering::AcqRel);
-    Self { db }
+    Self {
+      db,
+      #[cfg(test)]
+      waiting_since: None,
+    }
+  }
+
+  /// The writer waits for a checkpoint to free space now (it did not fail
+  /// or find room at once).
+  fn waits(&mut self) {
+    #[cfg(test)]
+    self.waiting_since.get_or_insert_with(Instant::now);
   }
 }
 
 impl Drop for SegmentWaiter<'_> {
   fn drop(&mut self) {
     self.db.segment_waiters.fetch_sub(1, Ordering::AcqRel);
+    #[cfg(test)]
+    if let Some(since) = self.waiting_since {
+      count_checkpoint_test_segment_wait(&self.db.path, since.elapsed());
+    }
   }
 }
 
@@ -1764,7 +1815,7 @@ impl SingleFileDB {
     if !self.uses_checkpoint_thread() {
       return self.make_segment_space_here();
     }
-    let _waiting = SegmentWaiter::new(self);
+    let mut waiting = SegmentWaiter::new(self);
     // The request this writer made, and the frees counted when it made it.
     let mut asked: Option<(u64, u64)> = None;
     let mut wait = self.segment_space_wait.lock();
@@ -1805,6 +1856,7 @@ impl SingleFileDB {
         }
         Some(_) => {}
       }
+      waiting.waits();
       self.segment_space_cv.wait_for(&mut wait, SEGMENT_WAIT_POLL);
     }
   }
@@ -1829,7 +1881,7 @@ impl SingleFileDB {
         None => KiteError::WalBufferFull,
       });
     }
-    let _waiting = SegmentWaiter::new(self);
+    let mut waiting = SegmentWaiter::new(self);
     loop {
       if self.has_segment_space() {
         return Ok(());
@@ -1845,6 +1897,7 @@ impl SingleFileDB {
         }
       }
       let frees = self.wal_segment_frees.load(Ordering::Acquire);
+      waiting.waits();
       match self.run_background_checkpoint() {
         Ok(BackgroundCheckpointOutcome::Done) => self.record_checkpoint_result(&Ok(())),
         // Another's run may have cut before this writer needed the space,
