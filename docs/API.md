@@ -548,14 +548,26 @@ mydb.kitedb
   WAL Segments (extents named by the header's segment table; a checkpoint frees them)
 ```
 
-Every header this version writes carries the magic `KiteDB format 2\0`. Releases up to v0.2.18
-check a header only by its magic (`KiteDB format 1\0`) and the checksum of its first 176 bytes,
-read only the first header page, and check no format version: they refuse files this version
-writes with an invalid magic number error, read-only and writable, instead of misreading them.
-The other way, this version opens files v0.2.18 and earlier wrote (one header page: the first
-writable open migrates them to two) and files unreleased builds wrote in the old magic (a
-writable open first rewrites both header slots in the new magic; a read-only open writes
-nothing).
+Every header this version writes carries the magic `KiteDB format 2\0`. Releases v0.2.3 to
+v0.2.18 check a header only by its magic (`KiteDB format 1\0`) and the checksum of its first 176
+bytes, read only the first header page, and check no format version: they refuse files this
+version writes with an invalid magic number error, read-only and writable, instead of misreading
+them. Earlier releases, whose magic was `RayDB format 1`, refuse them too.
+
+The other way, this version opens files v0.2.3 to v0.2.18 wrote (one header page: the first
+writable open migrates them to two) and files unreleased builds wrote in the old magic. A
+writable open rewrites both header slots of those in the new magic as its last step, once every
+check that may refuse the open passed, so a refused open leaves them in the old one; a read-only
+open writes nothing. A crash between the two slot writes can leave page 0 in the old magic:
+v0.2.18 then opens the file as it was before that open (no worse than before it), and the next
+writable open here finishes the upgrade. This version refuses files of v0.1.4 to v0.2.2 (magic
+`RayDB format 1`), as releases have since v0.2.3, and a header in the old magic that names WAL
+segments, which only unreleased builds wrote: its checksum cannot tell a page torn inside the
+segment table from a whole one.
+
+Each header slot has two checksums: one over its fixed fields, and one over every byte of the
+page but the two checksums, so a slot torn between two writes, at any 512-byte sector, fails it
+and open uses the other slot.
 
 The format version is 2, or 3 while the header names WAL segments (minimum reader version 3), so
 a build that reads version 2 but not segments refuses such a file (version mismatch) rather than

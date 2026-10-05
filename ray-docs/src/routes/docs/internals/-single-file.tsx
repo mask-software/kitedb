@@ -147,7 +147,7 @@ function HeaderContents() {
 			value: '"KiteDB format 2\\0"',
 			mono: true,
 			detail:
-				'16 bytes. Releases up to v0.2.18 accept only "KiteDB format 1\\0", so they refuse these files instead of misreading them; this version still reads that magic, and a writable open rewrites both slots in the new one',
+				'16 bytes. Releases v0.2.3 to v0.2.18 accept only "KiteDB format 1\\0" (earlier ones only "RayDB format 1"), so they refuse these files instead of misreading them. This version still reads that magic, and a writable open rewrites both slots in the new one as its last step, so an open that fails leaves them in the old one; a crash between the two writes can leave page 0 in the old magic, which v0.2.18 then opens as the file was before that open, until the next writable open finishes. It refuses files of v0.1.4 to v0.2.2 ("RayDB format 1"), as releases have since v0.2.3',
 		},
 		{
 			name: "Versions",
@@ -493,9 +493,9 @@ export function SingleFilePage() {
 				current version converts such a file on its first writable open: it
 				writes the recovered database to a temporary file and renames it over
 				the original, so a crash during conversion leaves the original intact.
-				Read-only opens use old files without converting them. Don't open a
-				converted file with v0.2.18 or earlier, which read and write only page
-				0.
+				Read-only opens use old files without converting them. v0.2.18 and
+				earlier, which read and write only page 0, refuse a converted file: its
+				headers carry a magic they do not know.
 			</VersionNote>
 
 			<h2 id="header">The header</h2>

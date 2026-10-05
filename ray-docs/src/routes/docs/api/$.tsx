@@ -298,7 +298,7 @@ const nodeIds = bulkWrite(
 							Automatic checkpoints run while writes continue;{" "}
 							<code>false</code> makes them blocking (they run after a commit,
 							and a writer at <code>walSegmentLimit</code> fails instead of
-							waiting)
+							waiting; one runs once its transaction ends)
 						</td>
 					</tr>
 					<tr>

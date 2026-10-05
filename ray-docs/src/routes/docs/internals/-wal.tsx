@@ -676,9 +676,12 @@ export function WALPage() {
 				<code>KiteDB format 2\0</code>: releases up to v0.2.18, which check a
 				header only by its magic and checksum, read only its first slot and
 				check no version, refuse these files (invalid magic number) instead of
-				misreading them. This version opens their files, and those earlier
-				unreleased builds wrote in the old magic (a writable open first rewrites
-				both slots in the new one).
+				misreading them. This version opens the files of v0.2.3 to v0.2.18, and
+				those earlier unreleased builds wrote in the old magic (a writable open
+				rewrites both slots in the new one as its last step), except a header in
+				the old magic that names WAL segments: its checksum, unlike the new
+				one's, cannot tell a slot torn inside the segment table from a whole
+				one.
 			</p>
 
 			<VersionNote>
@@ -814,7 +817,8 @@ export function WALPage() {
 				</li>
 				<li>
 					Background checkpoints are off: automatic checkpoints are blocking, so
-					the writer fails, and one runs after the failed write.
+					the writer fails, and one runs once its transaction ends, by commit or
+					rollback (after the back-off, if the last one failed).
 				</li>
 				<li>
 					Open write transactions hold records in enough segments to fill the

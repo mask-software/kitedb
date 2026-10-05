@@ -105,13 +105,20 @@ db.close();
 The `.kitedb` format contains:
 - **Header (pages 0 and 1)**: two checksummed copies of the magic, format version, page size,
   snapshot/WAL locations, WAL salts and the WAL segment table; open uses the newest valid copy.
-  Every header this version writes carries the magic `KiteDB format 2\0`. Releases up to v0.2.18
-  check a header only by its magic (`KiteDB format 1\0`) and checksum, read only the first header
-  page and check no format version, so they refuse these files (invalid magic number), read-only
-  and writable, instead of misreading them. This version opens files they wrote (one header
+  Every header this version writes carries the magic `KiteDB format 2\0`. Releases v0.2.3 to
+  v0.2.18 check a header only by its magic (`KiteDB format 1\0`) and checksum, read only the
+  first header page and check no format version, so they refuse these files (invalid magic
+  number), read-only and writable, instead of misreading them; earlier ones, whose magic was
+  `RayDB format 1`, refuse them too. This version opens files v0.2.3 to v0.2.18 wrote (one header
   page; the first writable open migrates them) and files earlier unreleased builds wrote in the
-  old magic (a writable open first rewrites both header copies in the new one). A header naming
-  WAL segments is format version 3 (minimum reader 3); otherwise it is version 2
+  old magic (a writable open rewrites both header copies in the new one as its last step, so an
+  open that fails leaves them in the old one; a crash between those two writes can leave page 0
+  in the old magic, and v0.2.18 then opens the file as it was before that open, until the next
+  writable open finishes). It refuses files of v0.1.4 to v0.2.2 (`RayDB format 1`), as releases
+  have since v0.2.3, and an old-magic header that names WAL segments (only unreleased builds
+  wrote one). A header copy's checksum covers every byte of it, so a copy torn by a crash, at
+  any 512-byte sector, fails it. A header naming WAL segments is format version 3 (minimum
+  reader 3); otherwise it is version 2
 - **WAL Area**: Linear buffer for write-ahead log records. When it fills, its records spill into a
   WAL segment and it starts over
 - **WAL Segments**: extents of pages holding spilled log records, up to a limit
