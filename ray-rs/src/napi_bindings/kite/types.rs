@@ -107,7 +107,7 @@ pub struct JsKiteOptions {
   /// 128 MiB; the in-memory delta takes about ten times the log's size)
   pub checkpoint_log_budget: Option<f64>,
   /// Bytes of a WAL segment extent (default: a sixteenth of the segment
-  /// limit, from two WALs to 32 MiB)
+  /// limit, from two WALs to the larger of 32 MiB and two WALs)
   pub wal_segment_size: Option<f64>,
   /// The most bytes of WAL segments before writers wait for a checkpoint
   /// (default: twice the checkpoint trigger, at least 16 WALs, at most four

@@ -41,9 +41,12 @@ class CorruptionError(KiteError):
 
 class WalFullError(KiteError):
     """The WAL and its WAL segments are full and no checkpoint can make room
-    now (automatic checkpoints are off or blocking, or open write
-    transactions hold the segments); checkpoint, or end those transactions,
-    before writing more."""
+    for this write now: automatic checkpoints are off, or blocking (one runs
+    after the failed write); open write transactions hold the segments'
+    records; a blocking checkpoint, optimize, vacuum or WAL resize waits for
+    this writer's transaction; the database is closing; or the checkpoint
+    that answered the write freed nothing. Checkpoint, or end those
+    transactions, before writing more."""
 
 class CheckpointError(KiteError):
     """A write needs WAL segment space only a checkpoint frees, and the last
@@ -57,9 +60,11 @@ class WritesRefusedError(KiteError):
     acknowledged commit from disk."""
 
 class CheckpointDeclinedError(KiteError):
-    """A background checkpoint did not run, or stopped, and nothing changed;
-    the message says why (a blocking checkpoint or compaction waits for the
-    gate, or open write transactions hold every WAL segment)."""
+    """background_checkpoint() made no checkpoint, and the message says why:
+    a blocking checkpoint, optimize, vacuum or WAL resize waits for the
+    checkpoint gate (it checkpoints anyway), or open write transactions hold
+    every WAL segment, so none can be covered before they end (segments
+    nothing needs any more may have been freed). No commit is affected."""
 
 # ============================================================================
 # Core Database Types
@@ -115,7 +120,7 @@ class OpenOptions:
     # 128 MiB; the in-memory delta takes about ten times the log's size).
     checkpoint_log_budget: Optional[int]
     # Bytes of a WAL segment extent (default: a sixteenth of the segment
-    # limit, from two WALs to 32 MiB).
+    # limit, from two WALs to the larger of 32 MiB and two WALs).
     wal_segment_size: Optional[int]
     # The most bytes of WAL segments before writers wait for a checkpoint.
     wal_segment_limit: Optional[int]

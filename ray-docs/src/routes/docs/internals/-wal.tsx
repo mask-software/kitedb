@@ -380,7 +380,8 @@ function BackgroundCheckpointDiagram() {
 				<FlowItem color="emerald">
 					A failure at any step loses nothing: the cut is only a spill, and
 					every commit stays in the log. A run that ends before its install
-					unseals the segment its cut sealed, so failures take no table entries
+					unseals the segment its cut sealed, so it takes no table entry, unless
+					a spill started a new segment between its cut and its failure
 				</FlowItem>
 				<FlowItem color="amber">
 					Closing or dropping the database abandons a run still building its
@@ -608,9 +609,11 @@ function CheckpointTriggers() {
 					<Code>vacuum</Code> and <Code>resizeWal</Code> also leave no segments.
 					If installing its header fails, it returns an error and the database
 					keeps the previous snapshot and log, so later commits append after the
-					existing records. A clean close (no transaction open) runs one when
-					the header names WAL segments, so a closed file holds none; a database
-					dropped without closing keeps them, and the next open replays them.
+					existing records. A clean close runs one when the header names WAL
+					segments and no transaction is open, so the closed file holds none.
+					With a transaction open, or if that checkpoint fails (close warns and
+					goes on), the segments stay, as they do in a database dropped without
+					closing, and the next open replays them.
 				</p>
 			</div>
 		</Figure>
@@ -668,9 +671,14 @@ export function WALPage() {
 				with minimum reader version 3, so a build that reads version 2 but not
 				segments refuses the file with a version mismatch instead of missing the
 				commits in its segments. Once a checkpoint covers every segment, as a
-				clean close does, the header is written as version 2 again. No released
-				version opens these files: v0.2.18 and earlier read neither the two
-				header slots nor salted WAL records, and check no format version.
+				clean close normally does, the header is written as version 2 again.
+				Every header this version writes carries the magic{" "}
+				<code>KiteDB format 2\0</code>: releases up to v0.2.18, which check a
+				header only by its magic and checksum, read only its first slot and
+				check no version, refuse these files (invalid magic number) instead of
+				misreading them. This version opens their files, and those earlier
+				unreleased builds wrote in the old magic (a writable open first rewrites
+				both slots in the new one).
 			</p>
 
 			<VersionNote>
@@ -779,12 +787,12 @@ export function WALPage() {
 				bytes of WAL segments, and with them disk use and the delta's memory.
 				The segment table bounds them too, at 63 extents (the 64th is kept for a
 				checkpoint's cut): an extent is <code>walSegmentSize</code>, by default
-				a sixteenth of the limit (two WALs to 32 MiB), so the table holds about
-				four times a limit of up to 512 MiB, and 2 GiB beyond. Writers wait only
-				when the segments reach either: a writer that needs to spill then asks
-				for a checkpoint (on the checkpoint thread, a run that starts after it
-				asked; without the thread, one of its own) and waits for its install to
-				free segments.
+				a sixteenth of the limit (from two WALs to 32 MiB, or two WALs if more),
+				so the table holds about four times a limit of up to 512 MiB, and 2 GiB
+				beyond. Writers wait only when the segments reach either: a writer that
+				needs to spill then asks for a checkpoint (on the checkpoint thread, a
+				run that starts after it asked; without the thread, one of its own) and
+				waits for its install to free segments.
 			</p>
 
 			<h2 id="overflow">Avoiding WAL overflow</h2>

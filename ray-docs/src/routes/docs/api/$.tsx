@@ -342,7 +342,9 @@ const nodeIds = bulkWrite(
 						<td>
 							<code>walSegmentSize</code>
 						</td>
-						<td>1/16 of the segment limit, 2 WALs to 32 MiB</td>
+						<td>
+							1/16 of the segment limit, from 2 WALs to max(32 MiB, 2 WALs)
+						</td>
 						<td>
 							Bytes of a WAL segment extent (never less than 1.5 WALs). An open
 							transaction keeps the extent it began in whole until a checkpoint

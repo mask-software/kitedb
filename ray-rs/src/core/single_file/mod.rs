@@ -478,8 +478,9 @@ pub struct SingleFileInner {
   /// Bytes of a new WAL segment extent, if the options set it (see
   /// `wal_segment_extent_pages`).
   pub(crate) wal_segment_size: Option<u64>,
-  /// A checkpoint starts once the WAL segments hold this fraction of the
-  /// snapshot's size (see `checkpoint_log_trigger`).
+  /// A checkpoint starts once the log the snapshot does not cover (WAL
+  /// segments and WAL) reaches this fraction of the snapshot's size, within
+  /// the limits of `checkpoint_log_trigger`.
   pub(crate) checkpoint_log_ratio: f64,
   /// The most log an automatic checkpoint waits for (see
   /// `checkpoint_log_trigger`, `wal_segment_limit`).

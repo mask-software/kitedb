@@ -73,17 +73,21 @@ create_exception!(
   kitedb._kitedb,
   WalFullError,
   KiteError,
-  "The WAL and its WAL segments are full and no checkpoint can make room now (automatic \
-   checkpoints are off or blocking, or open write transactions hold the segments); checkpoint, \
-   or end those transactions, before writing more."
+  "The WAL and its WAL segments are full and no checkpoint can make room for this write now: \
+   automatic checkpoints are off, or blocking (one runs after the failed write); open write \
+   transactions hold the segments' records; a blocking checkpoint, optimize, vacuum or WAL \
+   resize waits for this writer's transaction; the database is closing; or the checkpoint that \
+   answered the write freed nothing. Checkpoint, or end those transactions, before writing \
+   more."
 );
 create_exception!(
   kitedb._kitedb,
   CheckpointDeclinedError,
   KiteError,
-  "A background checkpoint did not run, or stopped, and nothing changed; the message says why \
-   (a blocking checkpoint or compaction waits for the gate, or open write transactions hold \
-   every WAL segment)."
+  "background_checkpoint() made no checkpoint, and the message says why: a blocking checkpoint, \
+   optimize, vacuum or WAL resize waits for the checkpoint gate (it checkpoints anyway), or open \
+   write transactions hold every WAL segment, so none can be covered before they end (segments \
+   nothing needs any more may have been freed). No commit is affected."
 );
 create_exception!(
   kitedb._kitedb,

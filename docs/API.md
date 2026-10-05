@@ -74,7 +74,6 @@ Recommended profile for high write throughput:
   checkpoints grow the log up to `wal_segment_limit` (default: twice the trigger, at least 16
   WALs, at most four times the budget) and wait for a checkpoint only there
 - `checkpoint_threshold` is deprecated and has no effect
-- `checkpoint_threshold` is deprecated and has no effect
 
 Durability note: `Normal` mode does not `fsync` on every commit. An OS crash can
 lose recent commits, but application crashes are recovered via WAL replay.
@@ -549,12 +548,20 @@ mydb.kitedb
   WAL Segments (extents named by the header's segment table; a checkpoint frees them)
 ```
 
-The file format version is 2, or 3 while the header names WAL segments: a build that reads
-version 2 but not segments refuses such a file (version mismatch) rather than miss the commits
-in its segments. A checkpoint that covers every segment, and so a clean close, writes version 2
-again. No released version opens these files: v0.2.18 and earlier read neither the two header
-slots nor salted WAL records, and check no format version. Snapshots and WAL segments take the
-first free range that holds them, else the end of the file.
+Every header this version writes carries the magic `KiteDB format 2\0`. Releases up to v0.2.18
+check a header only by its magic (`KiteDB format 1\0`) and the checksum of its first 176 bytes,
+read only the first header page, and check no format version: they refuse files this version
+writes with an invalid magic number error, read-only and writable, instead of misreading them.
+The other way, this version opens files v0.2.18 and earlier wrote (one header page: the first
+writable open migrates them to two) and files unreleased builds wrote in the old magic (a
+writable open first rewrites both header slots in the new magic; a read-only open writes
+nothing).
+
+The format version is 2, or 3 while the header names WAL segments (minimum reader version 3), so
+a build that reads version 2 but not segments refuses such a file (version mismatch) rather than
+miss the commits in its segments. A checkpoint that covers every segment writes version 2 again,
+as a clean close does unless a transaction is open or that checkpoint fails. Snapshots and WAL
+segments take the first free range that holds them, else the end of the file.
 
 ### Snapshot Section
 

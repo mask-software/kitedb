@@ -144,14 +144,15 @@ function HeaderContents() {
 	const fields: Field[] = [
 		{
 			name: "Magic bytes",
-			value: '"KiteDB format 1\\0"',
+			value: '"KiteDB format 2\\0"',
 			mono: true,
-			detail: "16 bytes",
+			detail:
+				'16 bytes. Releases up to v0.2.18 accept only "KiteDB format 1\\0", so they refuse these files instead of misreading them; this version still reads that magic, and a writable open rewrites both slots in the new one',
 		},
 		{
 			name: "Versions",
 			value:
-				"Format version, minimum reader version, and feature flags. A header that names WAL segments is version 3 with minimum reader version 3, so a build that reads version 2 but not segments refuses the file instead of missing commits; otherwise it is version 2. No released version opens these files: v0.2.18 and earlier read neither the two header slots nor salted WAL records, and check no version. Open refuses a file that needs a newer reader or has flags it does not implement, and opens a newer format read-only",
+				"Format version, minimum reader version, and feature flags. A header that names WAL segments is version 3 with minimum reader version 3, so a build that reads version 2 but not segments refuses the file instead of missing commits; otherwise it is version 2. Releases up to v0.2.18 read none of this (they check only the magic and a checksum, and read only the first header page): the magic keeps them out. Open refuses a file that needs a newer reader or has flags it does not implement, and opens a newer format read-only",
 		},
 		{ name: "Page size", value: "4096", mono: true, detail: "default" },
 		{
@@ -306,9 +307,11 @@ function WALAreaAndSegments() {
 					under a fresh salt
 				</FlowItem>
 				<FlowItem color="violet">
-					A checkpoint frees the segments it covers. Automatic checkpoints run
-					on the database's checkpoint thread, so writers don't wait for the
-					snapshot to be built
+					A checkpoint frees the segments it covers, but those a still-open
+					write transaction has records in. Automatic checkpoints run on the
+					database's checkpoint thread (or, with it or background checkpoints
+					off, on the committing thread), and writers wait for one only at{" "}
+					<code>walSegmentLimit</code>
 				</FlowItem>
 			</div>
 			<p class="mt-4 border-t border-kite-line pt-3 text-[13px] text-slate-500">
@@ -574,10 +577,13 @@ export function SingleFilePage() {
 				between them. Snapshots and segment extents go into the first free range
 				that holds them, else the end of the file, and free pages at the end of
 				the file are truncated after a checkpoint. Open treats every page no
-				header names as free. Closing a file that has no WAL segments moves the
-				snapshot down next to the WAL when free pages lie in front of it, and
-				truncates the file, as <code>vacuum</code> does. A file closed with live
-				segments keeps them where they are, and the next open replays them.
+				header names as free. A clean close checkpoints the WAL segments away,
+				then moves the snapshot down next to the WAL when free pages lie in
+				front of it and truncates the file, as <code>vacuum</code> does. A file
+				closed with a transaction open, or whose close-time checkpoint failed
+				(close warns and goes on), keeps its segments where they are and is not
+				compacted, as is a database dropped without closing: the next open
+				replays them.
 			</p>
 
 			<h2 id="vs-directory">Single-file vs multi-file</h2>

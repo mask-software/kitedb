@@ -1468,7 +1468,7 @@ export interface JsKiteOptions {
   checkpointLogBudget?: number
   /**
    * Bytes of a WAL segment extent (default: a sixteenth of the segment
-   * limit, from two WALs to 32 MiB)
+   * limit, from two WALs to the larger of 32 MiB and two WALs)
    */
   walSegmentSize?: number
   /**
@@ -1941,7 +1941,7 @@ export interface OpenOptions {
   checkpointLogBudget?: number
   /**
    * Bytes of a WAL segment extent (default: a sixteenth of the segment
-   * limit, from two WALs to 32 MiB)
+   * limit, from two WALs to the larger of 32 MiB and two WALs)
    */
   walSegmentSize?: number
   /**

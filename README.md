@@ -105,13 +105,18 @@ db.close();
 The `.kitedb` format contains:
 - **Header (pages 0 and 1)**: two checksummed copies of the magic, format version, page size,
   snapshot/WAL locations, WAL salts and the WAL segment table; open uses the newest valid copy.
-  A header naming WAL segments is format version 3 (a build that reads version 2 but not
-  segments refuses it); otherwise it is version 2. No released version opens these files:
-  v0.2.18 and earlier read neither the two header copies nor salted WAL records
+  Every header this version writes carries the magic `KiteDB format 2\0`. Releases up to v0.2.18
+  check a header only by its magic (`KiteDB format 1\0`) and checksum, read only the first header
+  page and check no format version, so they refuse these files (invalid magic number), read-only
+  and writable, instead of misreading them. This version opens files they wrote (one header
+  page; the first writable open migrates them) and files earlier unreleased builds wrote in the
+  old magic (a writable open first rewrites both header copies in the new one). A header naming
+  WAL segments is format version 3 (minimum reader 3); otherwise it is version 2
 - **WAL Area**: Linear buffer for write-ahead log records. When it fills, its records spill into a
   WAL segment and it starts over
 - **WAL Segments**: extents of pages holding spilled log records, up to a limit
-  (`walSegmentLimit`); a checkpoint covers and frees them, and a clean close leaves none
+  (`walSegmentLimit`); a checkpoint covers and frees them, and a clean close checkpoints them away
+  unless a transaction is open or that checkpoint fails
 - **Snapshot Area**: CSR snapshot data (mmap-friendly)
 
 Automatic checkpoints run on a thread of the database's own once the log (WAL segments and

@@ -213,9 +213,9 @@ Failed operations raise `kitedb.KiteError` or one of its subclasses. `KiteError`
 | `DuplicateKeyError` | a node with the key already exists |
 | `LockError` | another process holds the database file lock |
 | `CorruptionError` | on-disk data fails validation |
-| `WalFullError` | the WAL and its WAL segments are full and no checkpoint can make room now: automatic checkpoints are off (or blocking), or open write transactions hold the segments; checkpoint, or end those transactions, before writing more |
+| `WalFullError` | the WAL and its WAL segments are full and no checkpoint can make room for this write now: automatic checkpoints are off, or blocking (one runs after the failed write); open write transactions hold the segments' records; a blocking checkpoint, optimize, vacuum or WAL resize waits for this writer's transaction; the database is closing; or the checkpoint that answered the write freed nothing. Checkpoint, or end those transactions, before writing more |
 | `CheckpointError` | a write needs WAL segment space only a checkpoint frees, and the last automatic checkpoint failed (`Database.checkpoint_error()`); committed data is safe |
-| `CheckpointDeclinedError` | `background_checkpoint()` did not run, or stopped, and nothing changed; the message says why |
+| `CheckpointDeclinedError` | `background_checkpoint()` made no checkpoint, and the message says why: a blocking checkpoint, optimize, vacuum or WAL resize waits for the gate (it checkpoints anyway), or open write transactions hold every WAL segment (segments nothing needs may have been freed); no commit is affected |
 | `WritesRefusedError` | the handle refuses writes, `close()` included, until the database is reopened: an operation panicked mid-way through its writes, so memory and disk may disagree (reads go on; the reopen recovers every acknowledged commit) |
 
 ```python

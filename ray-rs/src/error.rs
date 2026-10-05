@@ -63,12 +63,13 @@ pub enum KiteError {
   #[error("WAL buffer full: checkpoint required before continuing writes")]
   WalBufferFull,
 
-  /// A background checkpoint did not start, or stopped, and nothing changed.
-  /// The reason says why: what has to happen first (a blocking checkpoint,
-  /// optimize, vacuum or WAL resize waiting for the checkpoint gate gets it
-  /// first), or that the database is closing (a checkpoint thread's run is
-  /// abandoned then). Not a failure: nothing records it as the checkpoint
-  /// error.
+  /// A background checkpoint made no checkpoint, and the reason says why: a
+  /// blocking checkpoint, optimize, vacuum or WAL resize waits for the
+  /// checkpoint gate (it gets it first, and checkpoints); open write
+  /// transactions hold every WAL segment, so none can be covered before they
+  /// end (segments nothing needs any more may have been freed); or, for a
+  /// checkpoint thread's run, the database is closing. No commit is
+  /// affected. Not a failure: nothing records it as the checkpoint error.
   #[error("Background checkpoint declined: {0}")]
   CheckpointDeclined(String),
 

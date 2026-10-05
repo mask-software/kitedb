@@ -153,7 +153,8 @@ pub struct SingleFileOpenOptions {
   pub checkpoint_log_budget: u64,
   /// Bytes of a WAL segment extent: spills of the WAL fill one before the
   /// next is allocated (default: a sixteenth of the segment limit, from two
-  /// WALs to 32 MiB; at least one and a half WALs). An open transaction
+  /// WALs to the larger of 32 MiB and two WALs; at least one and a half
+  /// WALs and the records it is made for). An open transaction
   /// whose records spilled keeps the extent it began in, records written
   /// before it included, until a checkpoint covers its commit, so extents
   /// small next to the limit keep such pins small.
@@ -1028,6 +1029,10 @@ fn open_single_file_internal(
   let mut next_label_id = INITIAL_LABEL_ID;
   let mut next_etype_id = INITIAL_ETYPE_ID;
   let mut next_propkey_id = INITIAL_PROPKEY_ID;
+  // Not raised by replay: every header write that names log records stores
+  // the next transaction id then, at least every id in them (a commit
+  // round's, a spill's, an install's, a close's; a write that only drops
+  // segments keeps the last one's).
   let next_tx_id = header.next_tx_id;
 
   if header.max_node_id > 0 {

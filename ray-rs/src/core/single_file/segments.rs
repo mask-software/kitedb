@@ -208,8 +208,8 @@ pub(crate) struct SpilledTransaction {
 
 impl SingleFileDB {
   /// Pages of a new WAL segment extent: the configured size, else a
-  /// sixteenth of the segment limit, from two WALs to
-  /// `WAL_SEGMENT_DEFAULT_SIZE`; and at least one and a half WALs and
+  /// sixteenth of the segment limit, from two WALs to the larger of
+  /// `WAL_SEGMENT_DEFAULT_SIZE` and two WALs; and at least one and a half WALs and
   /// `record_bytes`, in whole pages. Small next to the limit: an open
   /// transaction whose records spilled keeps the extent it began in whole,
   /// with the records written before it, until a checkpoint covers its
