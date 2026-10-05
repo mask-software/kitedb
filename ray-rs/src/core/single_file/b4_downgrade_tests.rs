@@ -181,3 +181,85 @@ fn a_refused_open_of_an_old_magic_file_writes_nothing() {
     "an open that refused the file wrote to it: pages {changed:?} changed"
   );
 }
+
+/// `page`, a header page, in the old magic with the checksums a header in
+/// that magic carries: the CRC-32 of bytes 0..176 at 176, and of the whole
+/// page but its last four bytes in them.
+fn in_old_magic(page: &[u8]) -> Vec<u8> {
+  let mut page = page.to_vec();
+  page[0..16].copy_from_slice(&V0_2_18_MAGIC);
+  let header_crc = crc32fast::hash(&page[..176]);
+  page[176..180].copy_from_slice(&header_crc.to_le_bytes());
+  let footer = page.len() - 4;
+  let footer_crc = crc32fast::hash(&page[..footer]);
+  page[footer..].copy_from_slice(&footer_crc.to_le_bytes());
+  page
+}
+
+/// A header in the old magic that names WAL segments (only unreleased
+/// builds before this one wrote such headers: no release has segments) is
+/// refused, and so is its file, writable or read-only, with nothing
+/// written: its footer checksum, over a page that holds the fixed fields'
+/// own checksum, does not depend on the fixed fields, so a page torn at a
+/// sector boundary inside its segment table passes both checks (R12), and
+/// this version cannot tell such a page from a whole one. The other slot is
+/// no fallback either, even one naming no segments: the commits the
+/// segments hold would be gone without a word.
+#[test]
+fn old_magic_headers_that_name_wal_segments_are_refused() {
+  let dir = tempdir().expect("tempdir");
+  let path = dir.path().join("segments.kitedb");
+  let db = open_single_file(&path, options()).expect("create");
+  commit_keys(&db, 0, 400);
+  assert!(
+    wal_segment_test_stats(&db).live > 0,
+    "setup: the WAL never spilled"
+  );
+  drop(db);
+  let bytes = std::fs::read(&path).expect("read");
+  let slots: Vec<DbHeaderV1> = (0..2)
+    .map(|slot| DbHeaderV1::parse(&bytes[slot * 4096..(slot + 1) * 4096]).expect("a valid slot"))
+    .collect();
+  let newest = usize::from(slots[1].change_counter > slots[0].change_counter);
+  assert!(
+    !slots[newest].wal_segments.is_empty(),
+    "setup: the newest slot names no segments"
+  );
+
+  // Both slots in the old magic; or the newest so, the other naming no
+  // segments, older.
+  let mut both = bytes.clone();
+  for slot in 0..2 {
+    let page = in_old_magic(&bytes[slot * 4096..(slot + 1) * 4096]);
+    both[slot * 4096..(slot + 1) * 4096].copy_from_slice(&page);
+  }
+  let mut fallback = both.clone();
+  let mut older = slots[newest].clone();
+  older.wal_segments = Default::default();
+  older.change_counter -= 1;
+  let other = 1 - newest;
+  fallback[other * 4096..(other + 1) * 4096]
+    .copy_from_slice(&in_old_magic(&older.serialize_to_page()));
+
+  for (case, image) in [("both slots", both), ("the newest slot", fallback)] {
+    for read_only in [false, true] {
+      std::fs::write(&path, &image).expect("write the image");
+      let opened = open_single_file(&path, options().read_only(read_only));
+      let error = opened
+        .as_ref()
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_default();
+      drop(opened);
+      assert!(
+        error.contains("WAL segments"),
+        "{case} in the old magic naming WAL segments, read-only {read_only}: the open was \
+         not refused for it: {error:?}"
+      );
+      assert!(
+        std::fs::read(&path).expect("read") == image,
+        "{case}, read-only {read_only}: the refused open wrote to the file"
+      );
+    }
+  }
+}
