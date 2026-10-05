@@ -145,3 +145,80 @@ fn fresh2_r7_rebuild_is_pinned_after_a_drop() {
   );
   let _ = close_single_file;
 }
+
+/// T2 (test gap). F3's second half, "a full table still cuts" (the cut
+/// covers the segments without spilling the WAL when the spill would need
+/// an entry there is none of; 4242e69), is pinned by no test at 760effa:
+/// with it reverted (such a cut declines, as before), every checkpoint test,
+/// both F3 tests and the model test at 200 seeds pass. F3's changed setup
+/// ends with the newest segment unsealed by `release_cut`, so the cut there
+/// spills into it and never needs the new path. Here the newest segment
+/// stays sealed: the runs fail in their install (after one header slot is
+/// durable), which keeps the seal on purpose, so each run's cut spills into
+/// a new entry until the table is full. Once the failures stop, background
+/// checkpoints must go on. Passes at 760effa; fails with the second half
+/// reverted.
+#[test]
+fn fresh2_a_full_table_whose_newest_segment_is_sealed_still_cuts() {
+  let dir = tempdir().expect("tempdir");
+  let path = dir.path().join("full-sealed.kitedb");
+  let options = SingleFileOpenOptions::new()
+    .wal_size(SMALL_WAL)
+    .sync_mode(SyncMode::Normal)
+    .auto_checkpoint(false);
+  let db = open_single_file(&path, options.clone()).expect("open");
+  set_wal_segment_test_limit(&db, u64::MAX / 4);
+  set_checkpoint_test_db_fault(&db, CheckpointPhase::HeaderDurable, true);
+  let mut acked = Vec::new();
+  let mut index = 0;
+  while wal_segment_test_stats(&db).live < crate::constants::MAX_WAL_SEGMENTS && index < 200 {
+    let key = key("pre", index);
+    commit_key(&db, &key).expect("commit");
+    acked.push(key);
+    assert!(
+      db.background_checkpoint().is_err(),
+      "the fault did not fire"
+    );
+    index += 1;
+  }
+  clear_checkpoint_test_db_faults(&db);
+  let newest_sealed = db
+    .header
+    .read()
+    .wal_segments
+    .entries
+    .last()
+    .is_some_and(|last| last.sealed);
+  assert_eq!(
+    wal_segment_test_stats(&db).live,
+    crate::constants::MAX_WAL_SEGMENTS,
+    "setup: the failed installs did not fill the table"
+  );
+  assert!(newest_sealed, "setup: the newest segment is not sealed");
+
+  // The failures are over. Commits (the WAL holds records), then a
+  // background checkpoint: it must cover the segments.
+  for more in 0..10 {
+    let key = key("after", more);
+    commit_key(&db, &key).expect("commit into the WAL");
+    acked.push(key);
+  }
+  let run = db.background_checkpoint();
+  let stats = wal_segment_test_stats(&db);
+  assert!(
+    run.is_ok() && stats.live < crate::constants::MAX_WAL_SEGMENTS,
+    "with the failures over, a background checkpoint could not cut a full table whose newest \
+     segment is sealed: {run:?}, {stats:?}"
+  );
+  for round in 0..10 {
+    for write in 0..50 {
+      let key = key(&format!("post{round}"), write);
+      commit_key(&db, &key).expect("commit after the checkpoint");
+      acked.push(key);
+    }
+    db.background_checkpoint().expect("background checkpoint");
+  }
+  close_single_file(db).expect("close");
+  let reopened = open_single_file(&path, options).expect("reopen");
+  assert_eq!(missing(&reopened, &acked), 0, "acknowledged commits lost");
+}
