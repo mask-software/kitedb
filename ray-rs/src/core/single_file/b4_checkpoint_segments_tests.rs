@@ -2047,3 +2047,335 @@ fn a_spill_drops_what_its_decision_counted_out_though_a_checkpoint_claims_meanwh
   let reopened = open_single_file(&path, opts).expect("reopen");
   assert!(missing(&reopened, &acked).is_empty());
 }
+
+/// Retired invariant (a) of the fresh review, exactly once: a transaction
+/// open across a spill and a cut, whose writes are not idempotent (it
+/// deletes an edge the snapshot holds and adds it back, deletes a node, and
+/// creates more than it keeps back), commits once; a later transaction
+/// deletes that edge again. A crash copy then, and a reopen, must show the
+/// later transaction's result: applying the first one twice, or after the
+/// later one, brings the edge back.
+#[test]
+fn a_non_idempotent_transaction_across_a_cut_applies_once_after_a_crash() {
+  let dir = tempdir().expect("tempdir");
+  let path = dir.path().join("exactly-once.kitedb");
+  let opts = spilling_options().mvcc(true);
+  let db = Arc::new(open_single_file(&path, opts.clone()).expect("open"));
+  db.begin(false).expect("begin");
+  let a = db.create_node(Some("a")).expect("a");
+  let b = db.create_node(Some("b")).expect("b");
+  let c = db.create_node(Some("c")).expect("c");
+  let knows = db.define_etype("knows").expect("etype");
+  let value = db.define_propkey("value").expect("propkey");
+  db.add_edge(a, knows, b).expect("edge");
+  db.commit().expect("commit");
+  db.checkpoint().expect("checkpoint");
+
+  let created: Vec<String> = (0..40)
+    .map(|index| format!("t-{index}-{}", "t".repeat(1000)))
+    .collect();
+  let (wrote, t_wrote) = mpsc::channel();
+  let (go, t_go) = mpsc::channel::<()>();
+  let holder = {
+    let (db, created) = (Arc::clone(&db), created.clone());
+    std::thread::spawn(move || {
+      db.begin(false).expect("begin T");
+      db.delete_edge(a, knows, b).expect("T deletes the edge");
+      db.add_edge(a, knows, b).expect("T adds it back");
+      db.delete_node(c).expect("T deletes c");
+      db.set_node_prop(a, value, PropValue::I64(1))
+        .expect("T sets a");
+      for key in &created {
+        db.create_node(Some(key)).expect("T node");
+      }
+      wrote.send(()).expect("signal");
+      t_go.recv().expect("wait");
+      db.commit().expect("commit T");
+    })
+  };
+  t_wrote.recv().expect("T wrote");
+  assert!(
+    db.oldest_pinned_segment().is_some() || {
+      // The next spill moves T's records into a segment.
+      let spills = db.wal_spills.load(Ordering::Acquire);
+      let mut index = 0;
+      while db.wal_spills.load(Ordering::Acquire) == spills && index < 2_000 {
+        commit_key(&db, &key("fill", index)).expect("commit");
+        index += 1;
+      }
+      db.oldest_pinned_segment().is_some()
+    },
+    "setup: T's records did not spill"
+  );
+  db.background_checkpoint().expect("a cut while T is open");
+  go.send(()).expect("release T");
+  holder.join().expect("T thread");
+
+  // U: deletes the edge again, and sets a.
+  db.begin(false).expect("begin U");
+  db.delete_edge(a, knows, b).expect("U deletes the edge");
+  db.set_node_prop(a, value, PropValue::I64(2))
+    .expect("U sets a");
+  db.commit().expect("commit U");
+
+  let check = |db: &SingleFileDB, when: &str| {
+    assert!(!db.edge_exists(a, knows, b), "{when}: the edge is back");
+    assert!(db.node_by_key("c").is_none(), "{when}: c is back");
+    assert_eq!(
+      db.node_prop(a, value),
+      Some(PropValue::I64(2)),
+      "{when}: a has T's value, not U's"
+    );
+    assert!(missing(db, &created).is_empty(), "{when}: T's nodes lost");
+  };
+  check(&db, "live");
+  let count = db.count_nodes();
+  let copy = path.with_extension("crash.kitedb");
+  std::fs::copy(&path, &copy).expect("copy the file");
+  let crashed = open_single_file(&copy, opts.clone()).expect("open the crash copy");
+  check(&crashed, "a crash copy");
+  assert_eq!(crashed.count_nodes(), count, "a crash copy: node count");
+  drop(crashed);
+  let db = Arc::into_inner(db).expect("sole owner");
+  close_single_file(db).expect("close");
+  let reopened = open_single_file(&path, opts).expect("reopen");
+  check(&reopened, "after a reopen");
+  assert_eq!(reopened.count_nodes(), count, "after a reopen: node count");
+}
+
+/// Retired invariant (b) of the fresh review: a transaction whose records
+/// are in a segment a checkpoint kept for it rolls back. Its records stay in
+/// the log without a COMMIT record: a reopen of the dropped database (which
+/// replays the kept segment) has none of its writes, the next checkpoint
+/// drops the segment, and a reopen after it has none either.
+#[test]
+fn a_rollback_of_a_transaction_in_a_kept_segment_leaves_nothing() {
+  let dir = tempdir().expect("tempdir");
+  let path = dir.path().join("kept-rollback.kitedb");
+  let opts = spilling_options().mvcc(true);
+  let db = Arc::new(open_single_file(&path, opts.clone()).expect("open"));
+  let acked = commit_keys(&db, "before", 0, 10);
+  let doomed: Vec<String> = (0..40)
+    .map(|index| format!("doomed-{index}-{}", "d".repeat(1000)))
+    .collect();
+  let (wrote, t_wrote) = mpsc::channel();
+  let (go, t_go) = mpsc::channel::<()>();
+  let holder = {
+    let (db, doomed) = (Arc::clone(&db), doomed.clone());
+    std::thread::spawn(move || {
+      db.begin(false).expect("begin T");
+      for key in &doomed {
+        db.create_node(Some(key)).expect("T node");
+      }
+      wrote.send(()).expect("signal");
+      t_go.recv().expect("wait");
+      db.rollback().expect("roll T back");
+    })
+  };
+  t_wrote.recv().expect("T wrote");
+  let mut acked = acked;
+  let spills = db.wal_spills.load(Ordering::Acquire);
+  let mut index = 0;
+  while db.oldest_pinned_segment().is_none() && index < 2_000 {
+    acked.extend(commit_keys(&db, "fill", index, 1));
+    index += 1;
+  }
+  let pinned = db
+    .oldest_pinned_segment()
+    .expect("setup: T's records spilled");
+  assert!(db.wal_spills.load(Ordering::Acquire) > spills);
+  db.background_checkpoint()
+    .expect("a checkpoint while T is open");
+  assert!(
+    db.header
+      .read()
+      .wal_segments
+      .entries
+      .iter()
+      .any(|segment| segment.seq == pinned),
+    "setup: the checkpoint did not keep T's segment"
+  );
+  go.send(()).expect("release T");
+  holder.join().expect("T thread");
+  acked.extend(commit_keys(&db, "after", 0, 10));
+  let db = Arc::into_inner(db).expect("sole owner");
+  // Dropped: the reopen replays the kept segment.
+  drop(db);
+
+  let db = open_single_file(&path, opts.clone()).expect("reopen");
+  assert!(missing(&db, &acked).is_empty(), "lost commits");
+  assert!(
+    doomed.iter().all(|key| db.node_by_key(key).is_none()),
+    "the rolled-back transaction's writes are there after a reopen"
+  );
+  db.checkpoint().expect("checkpoint after the reopen");
+  assert!(
+    !db
+      .header
+      .read()
+      .wal_segments
+      .entries
+      .iter()
+      .any(|segment| segment.seq == pinned),
+    "the checkpoint kept the rolled-back transaction's segment"
+  );
+  close_single_file(db).expect("close");
+  let db = open_single_file(&path, opts).expect("reopen again");
+  assert!(missing(&db, &acked).is_empty(), "lost commits");
+  assert!(doomed.iter().all(|key| db.node_by_key(key).is_none()));
+}
+
+/// Retired invariant (c) of the fresh review: the whole path without the
+/// checkpoint thread (`checkpoint_thread(false)`, and always on wasm32).
+/// Automatic checkpoints run on the committing thread once the log reaches
+/// the trigger, and for a writer at the segment limit; no checkpoint thread
+/// starts. Their failures are recorded (`checkpoint_error`) and backed off:
+/// writers at the limit fail with `CheckpointFailed` meanwhile, and the
+/// commits past the trigger run no checkpoint. Once the failure's cause is
+/// gone and the back-off has passed, writes and checkpoints go on, and the
+/// error clears. Every acknowledged commit survives a reopen.
+#[test]
+fn automatic_checkpoints_without_the_thread() {
+  use super::super::checkpoint_thread::set_checkpoint_test_backoff;
+  let dir = tempdir().expect("tempdir");
+  let path = dir.path().join("no-thread.kitedb");
+  let opts = options()
+    .sync_mode(SyncMode::Normal)
+    .checkpoint_thread(false);
+  let db = open_single_file(&path, opts.clone()).expect("open");
+  watch_checkpoint_phases(&db);
+  set_wal_segment_test_limit(&db, 128 * 1024);
+  set_checkpoint_test_backoff(&db, Duration::from_millis(300), Duration::from_millis(300));
+
+  // Checkpoints run, on this thread, and writers past the limit are served.
+  let mut acked = commit_keys(&db, "a", 0, 2_000);
+  assert_eq!(acked.len(), 2_000, "writes failed without the thread");
+  assert!(checkpoint_test_cuts(&db) > 0, "no automatic checkpoint ran");
+  let here = std::thread::current().name().map(str::to_string);
+  assert!(
+    checkpoint_test_reached(&db)
+      .iter()
+      .all(|(_, thread, _)| *thread == here),
+    "a checkpoint ran on another thread"
+  );
+  assert!(
+    !checkpoint_thread_running(&db),
+    "a checkpoint thread started"
+  );
+
+  // A failure: recorded, backed off, and writers at the limit fail.
+  set_checkpoint_test_db_fault(&db, CheckpointPhase::SnapshotDurable, true);
+  let mut failure = None;
+  for index in 0..2_000 {
+    let key = key("b", index);
+    match commit_key(&db, &key) {
+      Ok(()) => acked.push(key),
+      Err(error) => {
+        failure = Some(error);
+        break;
+      }
+    }
+  }
+  assert!(
+    matches!(&failure, Some(KiteError::CheckpointFailed(error)) if error.contains("injected")),
+    "a writer at the limit got {failure:?}"
+  );
+  assert!(
+    db.checkpoint_error()
+      .is_some_and(|error| error.contains("injected")),
+    "the failure was not recorded: {:?}",
+    db.checkpoint_error()
+  );
+  let cuts = checkpoint_test_cuts(&db);
+  let refused = commit_key(&db, &key("c", 0));
+  assert!(
+    matches!(refused, Err(KiteError::CheckpointFailed(_))),
+    "during the back-off: {refused:?}"
+  );
+  assert_eq!(
+    checkpoint_test_cuts(&db),
+    cuts,
+    "a checkpoint ran during the back-off"
+  );
+
+  // The cause is gone; after the back-off, writes go on.
+  clear_checkpoint_test_db_faults(&db);
+  std::thread::sleep(Duration::from_millis(400));
+  let after = commit_keys(&db, "d", 0, 500);
+  assert_eq!(after.len(), 500, "writes failed after the back-off");
+  acked.extend(after);
+  assert_eq!(db.checkpoint_error(), None, "the error stays");
+  close_single_file(db).expect("close");
+  let reopened = open_single_file(&path, opts).expect("reopen");
+  assert!(missing(&reopened, &acked).is_empty());
+}
+
+/// Retired invariant (d) of the fresh review: segments full of records of
+/// open transactions by their bytes (not their count). A transaction pins
+/// the segments from the one it began in; once they hold the limit's bytes,
+/// a writer that needs a spill fails at once with `WalBufferFull` (no
+/// checkpoint can free them before that transaction ends) instead of
+/// waiting; once it ends, writes go on.
+#[test]
+fn segments_full_of_an_open_transactions_records_by_bytes_refuse_writers() {
+  let dir = tempdir().expect("tempdir");
+  let path = dir.path().join("pinned-bytes.kitedb");
+  let opts = options().sync_mode(SyncMode::Normal).mvcc(true);
+  let db = Arc::new(open_single_file(&path, opts.clone()).expect("open"));
+  set_wal_segment_test_limit(&db, 256 * 1024);
+  let (wrote, t_wrote) = mpsc::channel();
+  let (go, t_go) = mpsc::channel::<()>();
+  let holder = {
+    let db = Arc::clone(&db);
+    std::thread::spawn(move || {
+      db.begin(false).expect("begin T");
+      for index in 0..80 {
+        db.create_node(Some(&key("t", index))).expect("T node");
+      }
+      wrote.send(()).expect("signal");
+      t_go.recv().expect("wait");
+      db.rollback().expect("roll T back");
+    })
+  };
+  t_wrote.recv().expect("T wrote");
+  let refusals = checkpoint_test_pinned_refusals(&db);
+  let mut acked = Vec::new();
+  let mut failure = None;
+  let started = Instant::now();
+  for index in 0..5_000 {
+    let key = key("w", index);
+    match commit_key(&db, &key) {
+      Ok(()) => acked.push(key),
+      Err(error) => {
+        failure = Some(error);
+        break;
+      }
+    }
+  }
+  let stats = wal_segment_test_stats(&db);
+  assert!(
+    matches!(failure, Some(KiteError::WalBufferFull)),
+    "a writer beside a transaction holding the limit's bytes got {failure:?}"
+  );
+  assert!(
+    stats.live < crate::constants::MAX_WAL_SEGMENTS - 1,
+    "setup: the table's count, not the bytes, refused: {stats:?}"
+  );
+  assert!(
+    checkpoint_test_pinned_refusals(&db) > refusals,
+    "the write was refused for another reason"
+  );
+  assert!(
+    started.elapsed() < Duration::from_secs(10),
+    "the writer waited before failing"
+  );
+  go.send(()).expect("release T");
+  holder.join().expect("T thread");
+  let after = commit_keys(&db, "after", 0, 300);
+  assert_eq!(after.len(), 300, "writes failed after T ended");
+  acked.extend(after);
+  let db = Arc::into_inner(db).expect("sole owner");
+  close_single_file(db).expect("close");
+  let reopened = open_single_file(&path, opts).expect("reopen");
+  assert!(missing(&reopened, &acked).is_empty());
+}
