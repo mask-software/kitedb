@@ -219,7 +219,8 @@ impl SingleFileDB {
 
   /// Stop the checkpoint thread for good, and wait for it to end: a run
   /// still building its snapshot abandons it at its next progress point, a
-  /// run in its install finishes it. Closing and dropping call this first.
+  /// run in its install finishes it. Writers pacing stop waiting at once.
+  /// Closing and dropping call this first.
   pub(crate) fn stop_checkpoint_thread(&self) {
     let thread = {
       let mut thread = self.checkpoint_thread.lock();
@@ -239,6 +240,9 @@ impl SingleFileDB {
       requests.stop = true;
       thread.signal.wake.notify_all();
     }
+    // Writers pacing for its run stop now, not when it ends: it may take a
+    // while yet to reach its next progress point, or to finish its install.
+    self.notify_segment_waiters();
     // Only the test hook: this is not a checkpoint's progress point.
     let _ = checkpoint_phase(&self.path, CheckpointPhase::StopRequested);
     if thread.handle.join().is_err() {
