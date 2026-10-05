@@ -5368,3 +5368,8 @@ mod b4_downgrade_tests;
 #[cfg(test)]
 #[path = "review_fresh3_tests.rs"]
 mod review_fresh3_tests;
+
+/// Delta review of round 4: header pages mixed sector by sector.
+#[cfg(test)]
+#[path = "review_seg5_tests.rs"]
+mod review_seg5_tests;
