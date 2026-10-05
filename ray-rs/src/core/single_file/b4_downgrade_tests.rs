@@ -152,3 +152,32 @@ fn old_magic_files_open_and_upgrade_both_slots() {
     assert_eq!(db.count_nodes(), nodes, "{fixture}: reopened");
   }
 }
+
+/// An open that refuses a file in the old magic (here for a WAL size the
+/// options require and the file does not have) writes nothing to it: the
+/// upgrade of its header slots waits for the checks that may refuse it.
+#[test]
+fn a_refused_open_of_an_old_magic_file_writes_nothing() {
+  let dir = tempdir().expect("tempdir");
+  let path = dir.path().join("refused.kitedb");
+  std::fs::copy(
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v2_wal_records.kitedb"),
+    &path,
+  )
+  .expect("copy the fixture");
+  let before = std::fs::read(&path).expect("read");
+  let wal_pages = u64::from_le_bytes(before[72..80].try_into().expect("eight bytes"));
+  let wrong = (wal_pages as usize + 16) * 4096;
+  let refused = open_single_file(&path, SingleFileOpenOptions::new().wal_size(wrong));
+  assert!(refused.is_err(), "setup: the open was not refused");
+  let after = std::fs::read(&path).expect("read");
+  let changed = (0..before.len().max(after.len()) / 4096)
+    .filter(|&page| {
+      before.get(page * 4096..(page + 1) * 4096) != after.get(page * 4096..(page + 1) * 4096)
+    })
+    .collect::<Vec<_>>();
+  assert!(
+    changed.is_empty(),
+    "an open that refused the file wrote to it: pages {changed:?} changed"
+  );
+}
