@@ -510,11 +510,26 @@ fn close_and_drop_abandon_an_inflight_checkpoint() {
     closer.join().expect("closer").expect("close");
     assert!(parked, "close={close}: no checkpoint was held");
     assert!(finished.is_ok(), "close={close}: did not finish");
-    assert_eq!(
-      snapshot_generation_on_disk(&path),
-      generation,
+    // (Adjusted with decision Q3 of the fresh review, where a clean close
+    // checkpoints the WAL segments itself, so a new generation on disk no
+    // longer tells: the held run must not have reached its install.)
+    assert!(
+      !checkpoint_test_reached_at(&path)
+        .iter()
+        .any(|(phase, thread, _)| {
+          *phase == CheckpointPhase::HeaderWritten
+            && thread.as_deref() == Some(CHECKPOINT_THREAD_NAME)
+        }),
       "close={close}: the in-flight checkpoint installed instead of being abandoned"
     );
+    if !close {
+      // Dropping persists the log and checkpoints nothing.
+      assert_eq!(
+        snapshot_generation_on_disk(&path),
+        generation,
+        "close={close}"
+      );
+    }
     let reopened = open_single_file(&path, options()).expect("reopen");
     assert!(missing(&reopened, &acked).is_empty(), "close={close}");
     drop(reopened);
@@ -578,6 +593,50 @@ fn a_run_abandoned_by_closing_is_not_a_failure() {
   let db = Arc::into_inner(db).expect("sole owner");
   close_single_file(db).expect("close");
   let reopened = open_single_file(&path, options()).expect("reopen");
+  assert!(missing(&reopened, &acked).is_empty());
+}
+
+/// Decision Q3 of the fresh review: a clean close (no transaction open)
+/// leaves no WAL segments. A checkpoint covers them, so the header names
+/// none (format version 2: earlier releases can open the file), and the
+/// compaction on close cuts off their pages: the file holds only the header
+/// pages, the WAL and the snapshot. A small database keeps no segment
+/// extent at rest.
+#[test]
+fn a_clean_close_leaves_no_wal_segments() {
+  let dir = tempdir().expect("tempdir");
+  let path = dir.path().join("clean-close.kitedb");
+  // The default WAL (4 MiB), and default extents.
+  let opts = SingleFileOpenOptions::new().sync_mode(SyncMode::Normal);
+  let db = open_single_file(&path, opts.clone()).expect("open");
+  let mut acked = Vec::new();
+  let mut index = 0;
+  while wal_segment_test_stats(&db).live == 0 && index < 100_000 {
+    acked.extend(commit_keys(&db, "key", index, 1));
+    index += 1;
+  }
+  assert!(
+    wal_segment_test_stats(&db).live > 0,
+    "setup: nothing spilled"
+  );
+  close_single_file(db).expect("close");
+
+  let (header, segments) = newest_header(&path);
+  assert_eq!(segments, 0, "the closed file names WAL segments");
+  assert_eq!(
+    header.written_versions().0,
+    2,
+    "the closed file is not format version 2"
+  );
+  let page_size = header.page_size as u64;
+  let expected =
+    (header.wal_start_page + header.wal_page_count + header.snapshot_page_count) * page_size;
+  let size = std::fs::metadata(&path).expect("metadata").len();
+  assert_eq!(
+    size, expected,
+    "the closed file holds {size} bytes, not just its header, WAL and snapshot ({expected})"
+  );
+  let reopened = open_single_file(&path, opts).expect("reopen");
   assert!(missing(&reopened, &acked).is_empty());
 }
 

@@ -390,11 +390,17 @@ fn watch_checkpoint_phases(db: &SingleFileDB) {
 /// waited at an armed barrier.
 #[cfg(test)]
 fn checkpoint_test_reached(db: &SingleFileDB) -> Vec<CheckpointTestReached> {
+  checkpoint_test_reached_at(db.path())
+}
+
+/// `checkpoint_test_reached` for the database at `path` (closed, say).
+#[cfg(test)]
+fn checkpoint_test_reached_at(path: &std::path::Path) -> Vec<CheckpointTestReached> {
   CHECKPOINT_TEST_REACHED
     .get_or_init(|| Mutex::new(HashMap::new()))
     .lock()
     .expect("checkpoint test reached lock")
-    .get(db.path())
+    .get(path)
     .cloned()
     .unwrap_or_default()
 }
