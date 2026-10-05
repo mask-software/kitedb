@@ -5420,3 +5420,7 @@ mod review_fresh4_tests;
 #[cfg(test)]
 #[path = "review_seg6_tests.rs"]
 mod review_seg6_tests;
+/// Delta review of rounds 5-6.
+#[cfg(test)]
+#[path = "review_fresh5_tests.rs"]
+mod review_fresh5_tests;
