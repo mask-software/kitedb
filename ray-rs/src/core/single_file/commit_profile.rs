@@ -112,7 +112,7 @@ stages! {
   InstallTailReplay,
   /// the header and the freed segments,
   InstallWrite,
-  /// putting the new snapshot and delta in place,
+  /// putting the new snapshot and delta in place and freeing the old,
   InstallSwap,
   /// and dropping the free pages at the end of the file.
   InstallTruncate,

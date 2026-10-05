@@ -525,17 +525,6 @@ pub(crate) struct WrittenSnapshot {
   pub(crate) page_count: u64,
 }
 
-/// The in-memory state a snapshot install replaced
-/// (`install_loaded_snapshot`): dropping it frees the old snapshot, its
-/// vector stores and the old delta.
-#[must_use = "drop the replaced state once no lock is held"]
-pub(crate) struct ReplacedState {
-  _snapshot: Option<SnapshotData>,
-  _vector_stores: HashMap<PropKeyId, VectorManifest>,
-  _lazy_entries: HashMap<PropKeyId, super::vector::VectorStoreLazyEntry>,
-  _delta: DeltaState,
-}
-
 /// A snapshot mapped and parsed (see `SingleFileDB::load_snapshot`), with
 /// its vector stores, ready to replace the in-memory one.
 #[derive(Default)]
@@ -896,9 +885,8 @@ impl SingleFileDB {
       )?;
     }
 
-    // The installed snapshot holds everything the delta did. (The caller
-    // holds the checkpoint gate: the replaced state is freed under it.)
-    drop(self.install_loaded_snapshot(loaded, DeltaState::new()));
+    // The installed snapshot holds everything the delta did.
+    self.install_loaded_snapshot(loaded, DeltaState::new());
     self.truncate_orphaned_tail_after_install();
 
     Ok(())
@@ -1004,24 +992,25 @@ impl SingleFileDB {
   /// its add), and the old snapshot under the new delta drops commits.
   ///
   /// Takes `delta` before `snapshot`, the order every reader and commit uses
-  /// (see read.rs). Returns the replaced state, for the caller to drop once
-  /// it holds no lock: freeing a large delta and snapshot takes hundreds of
-  /// milliseconds (296 ms on the 1M-node database), and a background
-  /// checkpoint's install holds the commit lock and the checkpoint gate.
-  pub(crate) fn install_loaded_snapshot(
-    &self,
-    loaded: LoadedSnapshot,
-    delta: DeltaState,
-  ) -> ReplacedState {
-    let mut delta_guard = self.delta.write();
-    let mut snapshot_guard = self.snapshot.write();
-    ReplacedState {
-      _snapshot: std::mem::replace(&mut **snapshot_guard, loaded.snapshot),
-      _vector_stores: std::mem::replace(&mut *self.vector_stores.write(), loaded.vector_stores),
-      // Entries of the replaced snapshot; the new one's stores are decoded.
-      _lazy_entries: std::mem::take(&mut *self.vector_store_lazy_entries.write()),
-      _delta: std::mem::replace(&mut **delta_guard, delta),
-    }
+  /// (see read.rs). The replaced state is dropped after both are released,
+  /// still under the caller's locks: a background checkpoint's install holds
+  /// the commit lock and the checkpoint gate while it frees the replaced
+  /// delta (about 0.3 s on the 1M-node, 10M-edge benchmark database).
+  /// Freed after those locks, with writers allocating meanwhile, the free
+  /// took up to 1.5 s and the allocator kept its memory: the 64 MB WAL
+  /// load's peak footprint rose from about 6 GB to 7-8 GB.
+  pub(crate) fn install_loaded_snapshot(&self, loaded: LoadedSnapshot, delta: DeltaState) {
+    let _replaced = {
+      let mut delta_guard = self.delta.write();
+      let mut snapshot_guard = self.snapshot.write();
+      (
+        std::mem::replace(&mut **snapshot_guard, loaded.snapshot),
+        std::mem::replace(&mut *self.vector_stores.write(), loaded.vector_stores),
+        // Entries of the replaced snapshot; the new one's stores are decoded.
+        std::mem::take(&mut *self.vector_store_lazy_entries.write()),
+        std::mem::replace(&mut **delta_guard, delta),
+      )
+    };
   }
 
   // ========================================================================
@@ -1524,17 +1513,8 @@ impl SingleFileDB {
       )?;
     }
     let swap_mark = prof::start();
-    let replaced = self.install_loaded_snapshot(loaded, replay.delta);
+    self.install_loaded_snapshot(loaded, replay.delta);
     prof::end(Stage::InstallSwap, swap_mark);
-    // The replaced snapshot and delta are freed with no lock held (commits
-    // and transactions go on), and then the free pages at the end of the
-    // file are dropped, under the pager lock only: only pages the pager
-    // lists free go, which no header slot names, and the replaced snapshot
-    // no longer maps any.
-    drop(_timed);
-    drop(_commit_guard);
-    drop(_checkpoint_gate);
-    drop(replaced);
     let truncate_mark = prof::start();
     self.truncate_orphaned_tail_after_install();
     prof::end(Stage::InstallTruncate, truncate_mark);
