@@ -5350,3 +5350,8 @@ mod review_fresh2_tests;
 #[cfg(test)]
 #[path = "b4_downgrade_tests.rs"]
 mod b4_downgrade_tests;
+
+/// Delta review of round 3.
+#[cfg(test)]
+#[path = "review_fresh3_tests.rs"]
+mod review_fresh3_tests;
