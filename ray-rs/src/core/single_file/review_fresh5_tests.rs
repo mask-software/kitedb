@@ -84,17 +84,19 @@ fn commit_on_a_thread(
   })
 }
 
-/// A writer pacing for its whole `bound`: a held run, commits past the
-/// trigger (paced briefly) charging its log, then no room left below the
-/// segment limit, and one commit on a thread of its own, pacing now.
-fn start_a_long_pace(
-  db: &SingleFileDB,
-  bound: Duration,
-) -> (
+/// What `start_a_long_pace` starts: the barrier that releases the held
+/// run, the run's thread, and the pacing commit's thread (its result and
+/// how long it took).
+type LongPace = (
   Arc<Barrier>,
   std::thread::JoinHandle<Result<()>>,
   std::thread::JoinHandle<(Result<()>, Duration)>,
-) {
+);
+
+/// A writer pacing for its whole `bound`: a held run, commits past the
+/// trigger (paced briefly) charging its log, then no room left below the
+/// segment limit, and one commit on a thread of its own, pacing now.
+fn start_a_long_pace(db: &SingleFileDB, bound: Duration) -> LongPace {
   for index in 0..200 {
     commit_key(db, &key("warm", index)).expect("warm-up commit");
   }
