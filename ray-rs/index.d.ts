@@ -44,9 +44,18 @@ export declare class Database {
    * wait for it); readers never wait for it.
    */
   beginBulk(): number
-  /** Commit the current transaction */
+  /**
+   * Commit the current transaction. While a background checkpoint runs
+   * and the log is past the trigger, the call returns up to 100 ms after
+   * the commit is durable (pacing; see `checkpointLogBudget`), in place of
+   * stopping for seconds at `walSegmentLimit`. The call is synchronous: the
+   * JS thread waits too.
+   */
   commit(): void
-  /** Commit the current transaction and return replication token when primary replication is enabled. */
+  /**
+   * Commit the current transaction and return replication token when primary replication is enabled.
+   * Paced as `commit` is (up to 100 ms on the JS thread).
+   */
   commitWithToken(): string | null
   /** Rollback the current transaction */
   rollback(): void
@@ -113,7 +122,11 @@ export declare class Database {
   exportReplicationLogTransport(cursor?: string | undefined | null, maxFrames?: number | undefined | null, maxBytes?: number | undefined | null, includePayload?: boolean | undefined | null): JsReplicationLogTransportPage
   /** Bootstrap a replica from the primary snapshot. */
   replicaBootstrapFromSnapshot(): void
-  /** Pull and apply up to maxFrames replication frames on replica. */
+  /**
+   * Pull and apply up to maxFrames replication frames on replica. Each
+   * frame is applied as a commit and may be paced as `commit` is (up to
+   * 100 ms each, on the JS thread).
+   */
   replicaCatchUpOnce(maxFrames: number): number
   /** Force a replica reseed from current primary snapshot. */
   replicaReseedFromSnapshot(): void
@@ -798,7 +811,13 @@ export declare class Kite {
    * wait for it); readers never wait for it.
    */
   beginBulk(): number
-  /** Commit the current transaction */
+  /**
+   * Commit the current transaction. While a background checkpoint runs
+   * and the log is past the trigger, the call returns up to 100 ms after
+   * the commit is durable (pacing; see `checkpointLogBudget`), in place of
+   * stopping for seconds at `walSegmentLimit`. The call is synchronous: the
+   * JS thread waits too, and this Kite's other calls wait for it.
+   */
   commit(): void
   /** Rollback the current transaction */
   rollback(): void

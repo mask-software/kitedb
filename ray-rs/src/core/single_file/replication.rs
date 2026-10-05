@@ -253,7 +253,10 @@ impl SingleFileDB {
     self.replica_bootstrap_from_snapshot()
   }
 
-  /// Pull and apply the next batch of replication frames.
+  /// Pull and apply the next batch of replication frames. Each frame is
+  /// applied as a commit, so while a background checkpoint runs on the
+  /// replica past its trigger, each may wait up to 100 ms (pacing, see
+  /// `commit`), within this call and whatever its caller holds.
   pub fn replica_catch_up_once(&self, max_frames: usize) -> Result<usize> {
     self.replica_catch_up_internal(max_frames, false)
   }

@@ -1584,7 +1584,11 @@ impl SingleFileDB {
     Ok(())
   }
 
-  /// Commit the current transaction
+  /// Commit the current transaction. While a background checkpoint runs
+  /// and the log is past the trigger, the call returns up to 100 ms after
+  /// the commit is durable (pacing; see
+  /// `SingleFileOpenOptions::checkpoint_log_budget`), holding no lock of the
+  /// database's: in place of stopping for seconds at the segment limit.
   pub fn commit(&self) -> Result<()> {
     self.commit_with_token().map(|_| ())
   }

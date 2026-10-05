@@ -967,7 +967,11 @@ impl Kite {
       .map_err(|e| Error::from_reason(format!("Failed to begin bulk transaction: {e}")))
   }
 
-  /// Commit the current transaction
+  /// Commit the current transaction. While a background checkpoint runs
+  /// and the log is past the trigger, the call returns up to 100 ms after
+  /// the commit is durable (pacing; see `checkpointLogBudget`), in place of
+  /// stopping for seconds at `walSegmentLimit`. The call is synchronous: the
+  /// JS thread waits too, and this Kite's other calls wait for it.
   #[napi]
   pub fn commit(&self) -> Result<()> {
     self.with_kite_mut(|ray| {

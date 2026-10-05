@@ -824,6 +824,17 @@ export function WALPage() {
 				that takes much longer than the last still makes writers wait there.
 			</p>
 
+			<p>
+				Pacing holds no lock of the database's, but it waits inside the
+				commit call. In Node the call is synchronous, so the JS thread waits
+				(and a Kite's other calls wait for its commit). In Python the GIL is
+				released, but the handle stays in use, so <code>close()</code> waits
+				for a paced commit. A replica's catch-up applies each frame as a
+				commit, so it may wait likewise, inside whatever its caller holds.
+				Either way it is at most 100 ms per paced commit, in place of the
+				stops of seconds at the limit.
+			</p>
+
 			<h2 id="overflow">Avoiding WAL overflow</h2>
 
 			<p>

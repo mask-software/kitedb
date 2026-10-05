@@ -298,6 +298,11 @@ impl PyDatabase {
     self.with_db_nogil(py, transaction::begin_bulk_single_file)
   }
 
+  /// Commit the current transaction. While a background checkpoint runs
+  /// and the log is past the trigger, the call returns up to 100 ms after
+  /// the commit is durable (pacing; see ``checkpoint_log_budget``), in place
+  /// of stopping for seconds at ``wal_segment_limit``. The GIL is released
+  /// meanwhile, but the handle stays in use: ``close()`` waits for it.
   fn commit(&self, py: Python<'_>) -> PyResult<()> {
     self.with_db_nogil(py, transaction::commit_single_file)
   }
@@ -603,7 +608,9 @@ impl PyDatabase {
     })
   }
 
-  /// Pull and apply at most max_frames frames on replica.
+  /// Pull and apply at most max_frames frames on replica. Each frame is
+  /// applied as a commit and may be paced as ``commit`` is (up to 100 ms
+  /// each, with the GIL released).
   fn replica_catch_up_once(&self, py: Python<'_>, max_frames: i64) -> PyResult<i64> {
     let max_frames =
       validation::non_negative_usize("max_frames", max_frames, validation::MAX_COUNT)?;

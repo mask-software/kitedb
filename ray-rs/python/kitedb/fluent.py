@@ -933,7 +933,9 @@ class Kite:
             ...     # All operations commit together on exit
         
         Note:
-            If an exception occurs, the transaction is rolled back.
+            If an exception occurs, the transaction is rolled back. The commit
+            on exit may be paced while a background checkpoint runs (up to
+            100 ms; see ``Database.commit``).
         """
         self._db.begin()
         try:
