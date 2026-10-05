@@ -527,6 +527,60 @@ fn close_and_drop_abandon_an_inflight_checkpoint() {
   }
 }
 
+/// Decision Q2 of the fresh review: a checkpoint thread's run abandoned
+/// because the database is closing is not a failure. It is not recorded as
+/// the checkpoint error (nor warned about), and the table entry its cut
+/// took is given back (the newest segment is not left sealed).
+#[test]
+fn a_run_abandoned_by_closing_is_not_a_failure() {
+  let dir = tempdir().expect("tempdir");
+  let path = dir.path().join("abandoned-run.kitedb");
+  let db = open_single_file(&path, options().sync_mode(SyncMode::Normal)).expect("open");
+  watch_checkpoint_phases(&db);
+  let held = Arc::new(Barrier::new(2));
+  set_checkpoint_test_barrier(&db, CheckpointPhase::SnapshotDurable, Arc::clone(&held));
+  let db = Arc::new(db);
+  let writer = {
+    let db = Arc::clone(&db);
+    std::thread::spawn(move || commit_keys(&db, "key", 0, 1_500))
+  };
+  let deadline = Instant::now() + Duration::from_secs(20);
+  let parked = wait_for("a held checkpoint", deadline, || {
+    checkpoint_test_reached(&db)
+      .iter()
+      .any(|(phase, _, parked)| *phase == CheckpointPhase::SnapshotDurable && *parked)
+  });
+  if !parked {
+    disarm_checkpoint_test_barrier(&db, CheckpointPhase::SnapshotDurable);
+  }
+  let acked = writer.join().expect("writer");
+  assert!(parked, "setup: no checkpoint was held");
+  // What closing does first: stop the thread, abandoning its run.
+  let stopper = {
+    let db = Arc::clone(&db);
+    std::thread::spawn(move || db.stop_checkpoint_thread())
+  };
+  while !db.checkpoint_abandoned.load(Ordering::Acquire) {
+    std::thread::sleep(Duration::from_millis(1));
+  }
+  held.wait();
+  stopper.join().expect("stopper");
+  assert_eq!(
+    db.checkpoint_error(),
+    None,
+    "a run abandoned by a close was recorded as the checkpoint error"
+  );
+  let newest = db.header.read().wal_segments.entries.last().copied();
+  assert!(
+    newest.is_some_and(|segment| !segment.sealed),
+    "the abandoned run's cut left the newest segment sealed: {newest:?}"
+  );
+  let db = Arc::into_inner(db).expect("sole owner");
+  close_single_file(db).expect("close");
+  let reopened = open_single_file(&path, options()).expect("reopen");
+  assert!(missing(&reopened, &acked).is_empty());
+}
+
 /// S7. A read transaction keeps reading what it began with while the
 /// checkpoint thread installs a snapshot that holds later commits, and sees
 /// them once it ends.
