@@ -195,10 +195,7 @@ enum Lands {
   Lost,
   /// Only in part: a header page's first 64 bytes (its change counter
   /// among them, so its slot's checksum fails), a data write's first half.
-  /// (A header page torn after its fixed fields can still be valid: its
-  /// footer checksum covers the segment table, and the fixed fields' own
-  /// checksum makes them drop out of it, so a tear that keeps the old table
-  /// is a whole old or new header.)
+  /// (`CrashModel::SectorTear` tears a write at each sector boundary.)
   Torn,
 }
 

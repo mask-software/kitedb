@@ -7,7 +7,7 @@ use crate::core::pager::FilePager;
 use crate::error::{KiteError, Result};
 use crate::types::{DbHeaderV1, WalSegment, WalSegmentTable, DB_HEADER_FIXED_SIZE};
 use crate::util::binary::*;
-use crate::util::crc::{crc32, crc32_zero_extended};
+use crate::util::crc::{crc32, crc32_multi, crc32_zero_extended};
 
 /// Two physical header pages. A new header is written to the inactive page,
 /// synced, and selected by generation during the next open.
@@ -17,6 +17,45 @@ pub(crate) const HEADER_SLOT_COUNT: u64 = 2;
 
 const HEADER_CRC_OFFSET: usize = DB_HEADER_FIXED_SIZE;
 const HEADER_CRC_END: usize = DB_HEADER_FIXED_SIZE + std::mem::size_of::<u32>();
+
+/// The footer checksum of a header page in the current magic: the CRC-32 of
+/// every byte but its two checksums', the fixed fields' at
+/// `HEADER_CRC_OFFSET` and its own in the last four. Such a page is whole
+/// or invalid: torn between two writes (a disk writes 512-byte sectors, not
+/// pages), the bytes from the one write do not match the other's footer.
+///
+/// The old magic's footer (`old_magic_footer_crc`) covers the fixed fields'
+/// checksum too, and the CRC-32 of a message followed by its own CRC-32 is
+/// a constant: that footer does not depend on the fixed fields at all, so a
+/// page torn after them, its segment table's later sectors from another
+/// write, passes both checks.
+fn footer_crc(page: &[u8], page_size: usize) -> u32 {
+  crc32_multi(&[
+    &page[..HEADER_CRC_OFFSET],
+    &page[HEADER_CRC_END..page_size - 4],
+  ])
+}
+
+/// The footer checksum of a header page in the old magic
+/// (`MAGIC_KITEDB_V1`): the CRC-32 of the page but its last four bytes.
+fn old_magic_footer_crc(page: &[u8], page_size: usize) -> u32 {
+  crc32(&page[..page_size - 4])
+}
+
+/// A header page as slot selection reads it (`DbHeaderV1::read_page`).
+pub(crate) enum HeaderPage {
+  /// A whole header.
+  Valid(DbHeaderV1),
+  /// No header (a torn or unwritten page, say): the other slot may stand in.
+  Invalid(KiteError),
+  /// A header this version refuses, and its file with it, rather than fall
+  /// back to the other slot: one in the old magic that names WAL segments.
+  /// Only unreleased builds before this one wrote such headers, and their
+  /// footer checksum cannot tell a page torn inside the segment table from
+  /// a whole one (see `footer_crc`); a fallback to a slot naming no
+  /// segments would drop the commits in them without a word.
+  Refused(KiteError),
+}
 
 pub(crate) fn other_header_slot(slot: u32) -> u32 {
   match slot {
@@ -29,6 +68,30 @@ pub(crate) fn other_header_slot(slot: u32) -> u32 {
 impl DbHeaderV1 {
   /// Parse and verify a complete header page.
   pub fn parse(data: &[u8]) -> Result<Self> {
+    match Self::read_page(data) {
+      HeaderPage::Valid(header) => Ok(header),
+      HeaderPage::Invalid(error) | HeaderPage::Refused(error) => Err(error),
+    }
+  }
+
+  /// Read and verify a header page (see `HeaderPage`).
+  pub(crate) fn read_page(data: &[u8]) -> HeaderPage {
+    let header = match Self::parse_page(data) {
+      Ok(header) => header,
+      Err(error) => return HeaderPage::Invalid(error),
+    };
+    if header.magic == MAGIC_KITEDB_V1 && !header.wal_segments.is_empty() {
+      return HeaderPage::Refused(KiteError::InvalidSnapshot(
+        "a header in the old magic (\"KiteDB format 1\") names WAL segments: only unreleased \
+         builds wrote such headers, and their checksum cannot tell a page torn inside the \
+         segment table from a whole one, so this version refuses the file"
+          .to_string(),
+      ));
+    }
+    HeaderPage::Valid(header)
+  }
+
+  fn parse_page(data: &[u8]) -> Result<Self> {
     if data.len() < DB_HEADER_SIZE {
       return Err(KiteError::InvalidSnapshot(format!(
         "Header too small: {} bytes",
@@ -73,13 +136,18 @@ impl DbHeaderV1 {
       });
     }
 
-    // Verify the page footer as well. It protects the reserved part of the
-    // header page, which is outside the fixed-field checksum.
-    let footer_crc = read_u32(data, page_size - 4);
-    let computed_footer_crc = crc32(&data[..page_size - 4]);
-    if footer_crc != computed_footer_crc {
+    // Verify the page footer as well: it covers the rest of the page (the
+    // WAL segment table, and zeros), and in the current magic the fixed
+    // fields too (see `footer_crc`).
+    let stored_footer_crc = read_u32(data, page_size - 4);
+    let computed_footer_crc = if data[0..16] == MAGIC_KITEDB {
+      footer_crc(data, page_size)
+    } else {
+      old_magic_footer_crc(data, page_size)
+    };
+    if stored_footer_crc != computed_footer_crc {
       return Err(KiteError::CrcMismatch {
-        stored: footer_crc,
+        stored: stored_footer_crc,
         computed: computed_footer_crc,
       });
     }
@@ -238,10 +306,14 @@ impl DbHeaderV1 {
     let header_crc = crc32(&buf[..HEADER_CRC_OFFSET]);
     write_u32(buf, HEADER_CRC_OFFSET, header_crc);
 
-    // The WAL segment table, then zeros up to the footer.
+    // The WAL segment table, then zeros up to the footer, which covers all
+    // of it but the checksums (see `footer_crc`).
     let table_end = write_wal_segment_table(buf, &self.wal_segments);
-    let footer_crc = crc32_zero_extended(&buf[..table_end], page_size - 4 - table_end);
-    write_u32(buf, page_size - 4, footer_crc);
+    let footer = crc32_zero_extended(
+      &[&buf[..HEADER_CRC_OFFSET], &buf[HEADER_CRC_END..table_end]],
+      page_size - 4 - table_end,
+    );
+    write_u32(buf, page_size - 4, footer);
   }
 
   /// Create a new header with default values.
@@ -387,16 +459,21 @@ pub(crate) fn read_header_slots_with_fallback(pager: &mut FilePager) -> Result<H
   for slot in [HEADER_SLOT_A, HEADER_SLOT_B] {
     let page = pager.read_page(slot)?;
     in_current_magic &= page.get(0..16) == Some(&MAGIC_KITEDB[..]);
-    match DbHeaderV1::parse(&page) {
-      Ok(header) if header.page_size as usize == pager.page_size() => {
+    match DbHeaderV1::read_page(&page) {
+      HeaderPage::Valid(header) if header.page_size as usize == pager.page_size() => {
         valid.push((header, slot));
       }
-      Ok(header) => errors.push(format!(
+      HeaderPage::Valid(header) => errors.push(format!(
         "slot {slot} has page size {}, expected {}",
         header.page_size,
         pager.page_size()
       )),
-      Err(error) => errors.push(format!("slot {slot}: {error}")),
+      HeaderPage::Invalid(error) => errors.push(format!("slot {slot}: {error}")),
+      HeaderPage::Refused(error) => {
+        return Err(KiteError::InvalidSnapshot(format!(
+          "header slot {slot}: {error}"
+        )))
+      }
     }
   }
 

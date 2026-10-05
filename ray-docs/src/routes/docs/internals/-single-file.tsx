@@ -187,7 +187,8 @@ function HeaderContents() {
 		},
 		{
 			name: "Checksums",
-			value: "CRC-32 over the header fields and over the whole page",
+			value:
+				"CRC-32 over the header fields, and one over every byte of the page but the two checksums, so a page torn between two writes, at any 512-byte sector, fails it. A header in the old magic keeps its old page checksum (over the header fields' checksum too, which leaves the fields out of it); one of those that names WAL segments, which only unreleased builds wrote, is refused with its file",
 		},
 	];
 	return (

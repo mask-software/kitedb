@@ -45,13 +45,13 @@ pub fn crc32_multi(segments: &[&[u8]]) -> u32 {
   hasher.finalize()
 }
 
-/// The CRC-32 (IEEE) of `data` followed by `zeros` zero bytes, without
-/// reading the zeros: their effect on the CRC register is a linear map,
-/// computed once per length and cached (a database header page is a few
-/// hundred bytes of fields and zeros up to its footer checksum).
-pub fn crc32_zero_extended(data: &[u8], zeros: usize) -> u32 {
+/// The CRC-32 (IEEE) of `segments`, concatenated, followed by `zeros` zero
+/// bytes, without reading the zeros: their effect on the CRC register is a
+/// linear map, computed once per length and cached (a database header page
+/// is a few hundred bytes of fields and zeros up to its footer checksum).
+pub fn crc32_zero_extended(segments: &[&[u8]], zeros: usize) -> u32 {
   let columns = zero_run_columns(zeros);
-  let register = !crc32(data);
+  let register = !crc32_multi(segments);
   let shifted = (0..32)
     .filter(|bit| register >> bit & 1 == 1)
     .fold(0, |shifted, bit| shifted ^ columns[bit]);
@@ -153,9 +153,15 @@ mod tests {
         let mut whole = data[..prefix].to_vec();
         whole.resize(prefix + zeros, 0);
         assert_eq!(
-          crc32_zero_extended(&data[..prefix], zeros),
+          crc32_zero_extended(&[&data[..prefix]], zeros),
           crc32(&whole),
           "{prefix} bytes and {zeros} zeros"
+        );
+        let split = prefix / 3;
+        assert_eq!(
+          crc32_zero_extended(&[&data[..split], &data[split..prefix]], zeros),
+          crc32(&whole),
+          "{prefix} bytes in two and {zeros} zeros"
         );
       }
     }

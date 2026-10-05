@@ -45,13 +45,18 @@ pub const WAL_RECORD_ALIGNMENT: usize = 8;
 /// and check no format version: a file in their magic, but in the format
 /// since (two header slots, salted WAL records, WAL segments), they would
 /// misread. They refuse this magic (`InvalidMagic`). The format version
-/// fields tell what a file needs from here on.
+/// fields tell what a file needs from here on. A header page in this magic
+/// has a footer checksum over every byte but the two checksums (see
+/// `header::footer_crc`).
 pub const MAGIC_KITEDB: [u8; 16] = *b"KiteDB format 2\0";
 
 /// The magic of v0.2.18 and earlier, and of files unreleased builds wrote
 /// before `MAGIC_KITEDB` (dual-header files of format versions 1 and 2):
 /// still read; a writable open rewrites both header slots in the current
-/// magic before anything else.
+/// magic before anything else. A header in it that names WAL segments (only
+/// unreleased builds wrote one) is refused with its file: its footer
+/// checksum cannot tell a page torn inside the segment table from a whole
+/// one (see `header::HeaderPage::Refused`).
 pub const MAGIC_KITEDB_V1: [u8; 16] = *b"KiteDB format 1\0";
 
 /// Single-file format version: the newest this build reads and writes.
