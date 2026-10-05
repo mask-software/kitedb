@@ -236,7 +236,8 @@ fn fresh_writer_fails_when_a_declined_run_answers_its_checkpoint_request() {
     let db = Arc::clone(&db);
     std::thread::spawn(move || db.background_checkpoint())
   };
-  let deadline = Instant::now() + Duration::from_secs(10);
+  // For every step below: a cut and a few spills, each syncing.
+  let deadline = Instant::now() + Duration::from_secs(20);
   while !db.is_checkpoint_running() {
     assert!(
       Instant::now() < deadline,

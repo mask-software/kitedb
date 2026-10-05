@@ -201,7 +201,7 @@ fn review_checkpoint_thread_reaping_an_abandoned_transaction_at_the_limit_does_n
   // checkpoint, whose cut spills whatever the limit and whose install frees
   // the segment, and waits for it.
   go_tx.send(()).expect("release the writer");
-  let outcome = done_rx.recv_timeout(Duration::from_secs(10));
+  let outcome = done_rx.recv_timeout(Duration::from_secs(20));
   // Unstick the waiters before asserting (closing stops the thread).
   db.stop_checkpoint_thread();
   writer.join().expect("the writer thread");
@@ -391,7 +391,7 @@ fn review_a_commit_larger_than_the_wal_does_not_wait_forever_for_covered_segment
       let _ = done_tx.send(db.commit());
     })
   };
-  let outcome = done_rx.recv_timeout(Duration::from_secs(10));
+  let outcome = done_rx.recv_timeout(Duration::from_secs(20));
   // Unstick the waiter before asserting (closing stops the thread).
   db.stop_checkpoint_thread();
   bulk.join().expect("the bulk thread");

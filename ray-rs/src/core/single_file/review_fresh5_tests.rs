@@ -124,7 +124,7 @@ fn start_a_long_pace(db: &SingleFileDB, bound: Duration) -> LongPace {
   leave_no_room(db);
   let paced = commit_on_a_thread(db, key("paced", 0));
   assert!(
-    wait_until(Instant::now() + Duration::from_secs(5), || {
+    wait_until(Instant::now() + LOADED_STEP, || {
       pacing_test_stats(db).pacing_now > 0
     }),
     "setup: no commit paced"

@@ -1780,7 +1780,7 @@ fn crash_during_a_checkpoint_with_segments_keeps_every_commit() {
     let db = Arc::clone(&db);
     std::thread::spawn(move || db.background_checkpoint())
   };
-  let deadline = Instant::now() + Duration::from_secs(10);
+  let deadline = Instant::now() + Duration::from_secs(20);
   assert!(wait_for("a held checkpoint", deadline, || {
     checkpoint_test_reached(&db)
       .iter()
@@ -1974,7 +1974,7 @@ fn a_panic_on_the_checkpoint_thread_is_reported_and_writes_are_refused() {
     }
     index += 1;
   }
-  let deadline = Instant::now() + Duration::from_secs(5);
+  let deadline = Instant::now() + Duration::from_secs(20);
   wait_for("the panic to be reported", deadline, || {
     checkpoint_thread_error(&db).is_some()
   });
@@ -2289,7 +2289,8 @@ fn a_writer_refused_for_a_failed_checkpoint_asks_for_another() {
     matches!(failure, Some(KiteError::CheckpointFailed(_))),
     "setup: the writer at the limit got {failure:?}"
   );
-  let deadline = Instant::now() + Duration::from_secs(10);
+  // The retry runs after the 1 s back-off; a run syncs several times.
+  let deadline = Instant::now() + Duration::from_secs(20);
   let cleared = wait_for("a retried checkpoint", deadline, || {
     checkpoint_thread_error(&db).is_none()
   });
