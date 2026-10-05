@@ -409,7 +409,9 @@ fn review_a_commit_larger_than_the_wal_does_not_wait_forever_for_covered_segment
 /// second, doubling to a minute) before the next. The wait is
 /// `Condvar::wait_for`, and every request (each commit past the trigger
 /// makes one) wakes it: failing checkpoints, each a full snapshot build,
-/// run back to back while commits go on.
+/// run back to back while commits go on. (The back-off here is 30 s, so
+/// the half second of commits below lies inside it however slow a loaded
+/// machine makes them: no retry may run at all.)
 #[test]
 fn review_a_failing_checkpoint_thread_backs_off_between_runs() {
   let dir = tempdir().expect("tempdir");
@@ -418,6 +420,11 @@ fn review_a_failing_checkpoint_thread_backs_off_between_runs() {
     .wal_size(SMALL_WAL)
     .sync_mode(SyncMode::Normal);
   let db = open_single_file(&path, options).expect("open");
+  super::super::checkpoint_thread::set_checkpoint_test_backoff(
+    &db,
+    Duration::from_secs(30),
+    Duration::from_secs(30),
+  );
   watch_checkpoint_phases(&db);
   set_checkpoint_test_db_fault(&db, CheckpointPhase::SnapshotWritten, true);
   let failed_runs = |db: &SingleFileDB| {
@@ -436,8 +443,8 @@ fn review_a_failing_checkpoint_thread_backs_off_between_runs() {
     "setup: no checkpoint failed"
   );
   let first = failed_runs(&db);
-  // Commits go on for half a second, inside the first backoff (one
-  // second); each one past the trigger asks for a checkpoint.
+  // Commits go on for half a second, inside the back-off; each one past
+  // the trigger asks for a checkpoint.
   let until = Instant::now() + Duration::from_millis(500);
   while Instant::now() < until {
     let _ = commit_key(&db, &key("b", index));
@@ -445,8 +452,8 @@ fn review_a_failing_checkpoint_thread_backs_off_between_runs() {
   }
   let retries = failed_runs(&db) - first;
   clear_checkpoint_test_db_faults(&db);
-  assert!(
-    retries <= 1,
+  assert_eq!(
+    retries, 0,
     "{retries} checkpoints ran (and failed) within half a second of the first failure: the \
      thread does not back off while commits keep asking"
   );

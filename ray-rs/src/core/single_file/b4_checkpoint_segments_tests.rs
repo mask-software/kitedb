@@ -1227,7 +1227,8 @@ fn close_and_drop_abandon_an_inflight_checkpoint() {
       stop_requested.wait();
       held.wait();
     }
-    let finished = closing.recv_timeout(Duration::from_secs(5));
+    // (A close checkpoints and syncs: seconds, on a loaded machine.)
+    let finished = closing.recv_timeout(Duration::from_secs(20));
     closer.join().expect("closer").expect("close");
     assert!(parked, "close={close}: no checkpoint was held");
     assert!(finished.is_ok(), "close={close}: did not finish");
@@ -2870,7 +2871,7 @@ fn segments_full_of_an_open_transactions_records_by_bytes_refuse_writers() {
   let refusals = checkpoint_test_pinned_refusals(&db);
   let mut acked = Vec::new();
   let mut failure = None;
-  let started = Instant::now();
+  let (waits, _) = checkpoint_test_segment_waits(&db);
   for index in 0..5_000 {
     let key = key("w", index);
     match commit_key(&db, &key) {
@@ -2894,9 +2895,10 @@ fn segments_full_of_an_open_transactions_records_by_bytes_refuse_writers() {
     checkpoint_test_pinned_refusals(&db) > refusals,
     "the write was refused for another reason"
   );
-  assert!(
-    started.elapsed() < Duration::from_secs(10),
-    "the writer waited before failing"
+  assert_eq!(
+    checkpoint_test_segment_waits(&db).0,
+    waits,
+    "the writer waited for segment space before failing"
   );
   go.send(()).expect("release T");
   holder.join().expect("T thread");
