@@ -677,10 +677,20 @@ fn f2_mvcc_vector_on_a_concurrently_deleted_node_conflicts() {
 /// `exclusive_checkpoint_gate` sees a run in progress every time it gets the
 /// gate, and waits again (wave 2 measured 1 blocking run in 1.5 s against
 /// 274 background runs).
+///
+/// Measured against the background loop's runs, not the clock: they share
+/// the gate about evenly (some 230 background runs, 115 blocking
+/// checkpoints and 115 optimizes in 1.5 s), so the blocking checkpoints
+/// and optimizes run `REQUIRED` times each long before the background loop
+/// runs `STARVED` times; starved, they do not. (This counted 1.5 s: a
+/// loaded machine ran 5 background runs, 3 blocking checkpoints and 2
+/// optimizes in it, sharing evenly, and failed.)
 #[test]
 fn f3_background_checkpoint_loop_does_not_starve_blocking_checkpoints() {
-  const WINDOW: Duration = Duration::from_millis(1500);
   const REQUIRED: usize = 5;
+  const STARVED: usize = 100;
+  // Only against a hang.
+  const DEADLINE: Duration = Duration::from_secs(60);
 
   let dir = tempfile::tempdir().expect("tempdir");
   let db = open(&dir.path().join("f3-starvation.kitedb"), options(false));
@@ -740,24 +750,37 @@ fn f3_background_checkpoint_loop_does_not_starve_blocking_checkpoints() {
     })
   };
 
-  thread::sleep(WINDOW);
-  let blocking_done = blocking_runs.load(Ordering::Relaxed);
-  let optimize_done = optimize_runs.load(Ordering::Relaxed);
-  let background_done = background_runs.load(Ordering::Relaxed);
+  let started = std::time::Instant::now();
+  let (blocking_done, optimize_done, background_done) = loop {
+    let counts = (
+      blocking_runs.load(Ordering::Relaxed),
+      optimize_runs.load(Ordering::Relaxed),
+      background_runs.load(Ordering::Relaxed),
+    );
+    let (blocking_done, optimize_done, background_done) = counts;
+    if (blocking_done >= REQUIRED && optimize_done >= REQUIRED)
+      || background_done >= STARVED
+      || started.elapsed() >= DEADLINE
+    {
+      break counts;
+    }
+    thread::sleep(Duration::from_millis(1));
+  };
+  let took = started.elapsed();
   stop.store(true, Ordering::Relaxed);
   let commits = writer.join().expect("writer");
   background.join().expect("background loop");
   blocking.join().expect("blocking loop");
 
   println!(
-    "f3: in {WINDOW:?}: {background_done} background checkpoints ran (not declined), {blocking_done} blocking checkpoints, \
+    "f3: in {took:?}: {background_done} background checkpoints ran (not declined), {blocking_done} blocking checkpoints, \
      {optimize_done} optimizes, {commits} commits"
   );
   assert!(
     blocking_done >= REQUIRED && optimize_done >= REQUIRED,
-    "in {WINDOW:?} a zero-pause background checkpoint loop ran {background_done} times while \
-     blocking checkpoint ran {blocking_done} and optimize {optimize_done} times (need \
-     {REQUIRED} each; {commits} commits)"
+    "a zero-pause background checkpoint loop ran {background_done} times while blocking \
+     checkpoint ran {blocking_done} and optimize {optimize_done} times (need {REQUIRED} each \
+     first; {commits} commits, in {took:?})"
   );
   assert!(db.check().valid);
 }
