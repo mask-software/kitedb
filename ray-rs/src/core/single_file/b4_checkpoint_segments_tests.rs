@@ -1185,48 +1185,37 @@ fn reached_on_the_checkpoint_thread(path: &std::path::Path) -> Vec<CheckpointPha
 /// automatic checkpoint (a read-only one none). Closing it, or dropping it,
 /// while that thread builds a snapshot abandons the build (no header names
 /// its pages), joins the thread, and loses no commit.
+///
+/// The held run is let go only once the close (or drop) has asked the
+/// thread to stop (`CheckpointPhase::StopRequested`). Let go before, it may
+/// pass its last progress point first and install, rightly: a run in its
+/// install finishes it (see
+/// `a_run_in_its_install_when_closing_begins_finishes_it`). On Linux CI it
+/// did, while the new closing thread waited for a CPU.
 #[test]
 fn close_and_drop_abandon_an_inflight_checkpoint() {
   for close in [true, false] {
     let dir = tempdir().expect("tempdir");
     let path = dir.path().join("abandon-inflight.kitedb");
-    let db = open_single_file(&path, options().sync_mode(SyncMode::Normal)).expect("open");
-    watch_checkpoint_phases(&db);
-    let generation = db.header.read().active_snapshot_gen;
-    let held = Arc::new(Barrier::new(2));
-    set_checkpoint_test_barrier(&db, CheckpointPhase::SnapshotDurable, Arc::clone(&held));
-    let db = Arc::new(db);
-    let writer = {
-      let db = Arc::clone(&db);
-      std::thread::spawn(move || commit_keys(&db, "key", 0, 1_500))
-    };
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let parked = wait_for("a held checkpoint", deadline, || {
-      checkpoint_test_reached(&db)
-        .iter()
-        .any(|(phase, _, parked)| *phase == CheckpointPhase::SnapshotDurable && *parked)
-    });
-    if !parked {
-      disarm_checkpoint_test_barrier(&db, CheckpointPhase::SnapshotDurable);
-    }
-    let acked = writer.join().expect("writer");
-    assert!(
-      checkpoint_thread_running(&db),
-      "close={close}: a writable database ran no checkpoint thread"
-    );
-    let db = Arc::into_inner(db).expect("sole owner");
-    let (closed, closing) = mpsc::channel();
-    let closer = std::thread::spawn(move || {
-      let result = if close {
-        close_single_file(db)
-      } else {
-        drop(db);
-        Ok(())
-      };
-      let _ = closed.send(());
-      result
-    });
+    let HeldThreadRun {
+      db,
+      held,
+      parked,
+      generation,
+      acked,
+    } = hold_the_checkpoint_threads_run(&path, close);
+    let stop_requested = Arc::new(Barrier::new(2));
     if parked {
+      set_checkpoint_test_barrier(
+        &db,
+        CheckpointPhase::StopRequested,
+        Arc::clone(&stop_requested),
+      );
+    }
+    let (closer, closing) = close_on_a_thread(db, close);
+    if parked {
+      // The closer waits here once it has asked the thread to stop.
+      stop_requested.wait();
       held.wait();
     }
     let finished = closing.recv_timeout(Duration::from_secs(5));
@@ -1236,14 +1225,17 @@ fn close_and_drop_abandon_an_inflight_checkpoint() {
     // (Adjusted with decision Q3 of the fresh review, where a clean close
     // checkpoints the WAL segments itself, so a new generation on disk no
     // longer tells: the held run must not have reached its install.)
+    let on_the_thread = reached_on_the_checkpoint_thread(&path);
     assert!(
-      !checkpoint_test_reached_at(&path)
-        .iter()
-        .any(|(phase, thread, _)| {
-          *phase == CheckpointPhase::HeaderWritten
-            && thread.as_deref() == Some(CHECKPOINT_THREAD_NAME)
-        }),
+      !on_the_thread.contains(&CheckpointPhase::HeaderWritten),
       "close={close}: the in-flight checkpoint installed instead of being abandoned"
+    );
+    // Abandoned at the progress point right after the hold: it reached
+    // nothing more.
+    assert_eq!(
+      on_the_thread.last(),
+      Some(&CheckpointPhase::SnapshotDurable),
+      "close={close}: the abandoned run went on past its hold: {on_the_thread:?}"
     );
     if !close {
       // Dropping persists the log and checkpoints nothing.
