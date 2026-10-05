@@ -140,6 +140,10 @@ fn bulk_load_writes_snapshot_bytes_linear_in_the_data() {
 /// Finding 2, the committer: the commit that crosses the auto-checkpoint
 /// threshold returns without waiting for the checkpoint it starts. The
 /// checkpoint is held after its cut; the commit must come back meanwhile.
+/// (One that runs the checkpoint itself never comes back while it is held,
+/// so the wait for it is generous: the hundred-odd commits before the
+/// threshold each sync, in Full mode, and took 1.5 s of the 2 s this test
+/// allowed under CPU load alone.)
 #[test]
 fn commit_that_starts_an_auto_checkpoint_returns_before_the_checkpoint_finishes() {
   let dir = tempdir().expect("tempdir");
@@ -163,7 +167,7 @@ fn commit_that_starts_an_auto_checkpoint_returns_before_the_checkpoint_finishes(
       let _ = returned.send(commits);
     })
   };
-  let outcome = returns.recv_timeout(Duration::from_secs(2));
+  let outcome = returns.recv_timeout(Duration::from_secs(20));
   // Let the checkpoint go on, whoever runs it.
   held.wait();
   writer.join().expect("writer");
@@ -187,7 +191,9 @@ fn commit_that_starts_an_auto_checkpoint_returns_before_the_checkpoint_finishes(
 /// writer waits for the install once its records fill the secondary WAL
 /// region (a quarter of the WAL), which at 1M nodes / 10M edges stalls
 /// commits for seconds. The checkpoint is held after its cut; the writer
-/// commits twice the whole WAL's size meanwhile.
+/// commits twice the whole WAL's size meanwhile. (One that waits for the
+/// install never finishes while the checkpoint is held, so the wait for it
+/// is generous: its commits each sync, in Full mode.)
 #[test]
 fn writer_is_not_held_up_by_a_checkpoint_building_its_snapshot() {
   let dir = tempdir().expect("tempdir");
@@ -208,7 +214,7 @@ fn writer_is_not_held_up_by_a_checkpoint_building_its_snapshot() {
     let db = Arc::clone(&db);
     std::thread::spawn(move || db.background_checkpoint())
   };
-  let deadline = Instant::now() + Duration::from_secs(5);
+  let deadline = Instant::now() + Duration::from_secs(20);
   while checkpoint_test_cuts(&db) == 0 {
     assert!(Instant::now() < deadline, "the checkpoint never cut");
     std::thread::yield_now();
@@ -226,7 +232,7 @@ fn writer_is_not_held_up_by_a_checkpoint_building_its_snapshot() {
       let _ = done.send(());
     })
   };
-  let outcome = finished.recv_timeout(Duration::from_secs(3));
+  let outcome = finished.recv_timeout(Duration::from_secs(20));
   held.wait();
   checkpoint
     .join()
