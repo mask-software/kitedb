@@ -151,7 +151,7 @@ function HeaderContents() {
 		{
 			name: "Versions",
 			value:
-				"Format version, minimum reader version, and feature flags. A header that names WAL segments is version 3 with minimum reader version 3, so older versions refuse the file instead of missing commits; otherwise it is version 2. Open refuses a file that needs a newer reader or has flags it does not implement, and opens a newer format read-only",
+				"Format version, minimum reader version, and feature flags. A header that names WAL segments is version 3 with minimum reader version 3, so a build that reads version 2 but not segments refuses the file instead of missing commits; otherwise it is version 2. No released version opens these files: v0.2.18 and earlier read neither the two header slots nor salted WAL records, and check no version. Open refuses a file that needs a newer reader or has flags it does not implement, and opens a newer format read-only",
 		},
 		{ name: "Page size", value: "4096", mono: true, detail: "default" },
 		{
@@ -376,9 +376,9 @@ function FileGrowthDiagram() {
 		<Figure title="File size examples" accent="cyan" meta="4 MB WAL">
 			<p class="mb-4 text-[13px] text-slate-500">
 				These examples assume the default 4 MB WAL and a checkpoint that covered
-				the whole log, so the file holds no WAL segments. Until a checkpoint
-				covers them, WAL segments add to these sizes, up to{" "}
-				<Code>walSegmentLimit</Code>.
+				the whole log, so the file holds no WAL segments, as after a clean
+				close. Until a checkpoint covers them, WAL segments add to these sizes,
+				up to <Code>walSegmentLimit</Code>.
 			</p>
 			<div class="space-y-3">
 				<For each={GROWTH_ROWS}>
@@ -538,13 +538,15 @@ export function SingleFilePage() {
 			</p>
 			<p>
 				A full WAL spills into a WAL segment instead of forcing a checkpoint, so
-				the WAL's size no longer limits a transaction or sets when checkpoints
-				run. Automatic checkpoints start once the log the snapshot does not
-				cover reaches <code>checkpointLogRatio</code> (default 0.5) times the
-				snapshot's size, at least four WALs, at most{" "}
-				<code>checkpointLogBudget</code> (default 128 MiB);{" "}
-				<code>checkpointThreshold</code> is deprecated and has no effect. A
-				larger WAL only means fewer spills. The{" "}
+				the WAL's size no longer limits a transaction. Automatic checkpoints
+				start once the log the snapshot does not cover reaches{" "}
+				<code>checkpointLogRatio</code> (default 0.5) times the snapshot's size,
+				at least three eighths of the WAL (where earlier releases checkpointed),
+				at most <code>checkpointLogBudget</code> (default 128 MiB);{" "}
+				<code>checkpointThreshold</code> is deprecated and has no effect. So the
+				WAL's size still sets when a small database checkpoints, and the floors
+				of the segment limit (16 WALs) and the segment extent (2 WALs); a larger
+				WAL also means fewer spills. The{" "}
 				<a href="/docs/internals/wal">WAL page</a> covers why spills and
 				background checkpoints are crash safe.
 			</p>

@@ -62,13 +62,18 @@ Recommended profile for high write throughput:
   `group_commit_window_ms` have no effect, and no commit waits for others to join
 - The default 4 MB WAL is enough for heavy ingest: when it fills, its records spill into a WAL
   segment (a copy and three syncs), and automatic checkpoints run on a thread of the database's
-  own, without holding up commits. A larger `wal_size` only means fewer spills
+  own, without holding up commits. The WAL size sets more than how often it spills: the floor of
+  the checkpoint trigger (three eighths of the WAL), of the segment limit (16 WALs) and of the
+  segment extent (two WALs). A larger `wal_size` means fewer spills, and more log in memory
+  before a small database checkpoints
 - Checkpoints start once the log (WAL segments and WAL) reaches `checkpoint_log_ratio` (default
-  0.5) of the snapshot's size, at least four WALs and at most `checkpoint_log_budget` (default
-  128 MiB). The in-memory delta takes about ten times the log's size, so the budget bounds that
-  memory (about 1.3 GB at the default); lower it to cap memory and reopen replay time. Writers
-  wait for a checkpoint only once the WAL segments reach `wal_segment_limit` (default: twice the
-  trigger, at most four times the budget)
+  0.5) of the snapshot's size, at least three eighths of the WAL (where earlier releases
+  checkpointed) and at most `checkpoint_log_budget` (default 128 MiB). The in-memory delta takes
+  about ten times the log's size, so the budget bounds that memory (about 1.3 GB at the default)
+  while checkpoints keep up; lower it to cap memory and reopen replay time. Writers that outrun
+  checkpoints grow the log up to `wal_segment_limit` (default: twice the trigger, at least 16
+  WALs, at most four times the budget) and wait for a checkpoint only there
+- `checkpoint_threshold` is deprecated and has no effect
 - `checkpoint_threshold` is deprecated and has no effect
 
 Durability note: `Normal` mode does not `fsync` on every commit. An OS crash can
@@ -544,10 +549,12 @@ mydb.kitedb
   WAL Segments (extents named by the header's segment table; a checkpoint frees them)
 ```
 
-The file format version is 2, or 3 while the header names WAL segments: older versions
-refuse such a file (version mismatch) rather than miss the commits in its segments. A
-checkpoint that covers every segment writes version 2 again. Snapshots and WAL segments
-take the first free range that holds them, else the end of the file.
+The file format version is 2, or 3 while the header names WAL segments: a build that reads
+version 2 but not segments refuses such a file (version mismatch) rather than miss the commits
+in its segments. A checkpoint that covers every segment, and so a clean close, writes version 2
+again. No released version opens these files: v0.2.18 and earlier read neither the two header
+slots nor salted WAL records, and check no format version. Snapshots and WAL segments take the
+first free range that holds them, else the end of the file.
 
 ### Snapshot Section
 

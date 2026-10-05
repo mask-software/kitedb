@@ -100,7 +100,8 @@ pub struct JsKiteOptions {
   /// true)
   pub checkpoint_thread: Option<bool>,
   /// Checkpoint once the log the snapshot does not cover reaches this
-  /// fraction of the snapshot's size (default: 0.5)
+  /// fraction of the snapshot's size (default: 0.5; at least three eighths
+  /// of the WAL, at most `checkpointLogBudget`)
   pub checkpoint_log_ratio: Option<f64>,
   /// The most log, in bytes, an automatic checkpoint waits for (default:
   /// 128 MiB; the in-memory delta takes about ten times the log's size)
@@ -109,6 +110,8 @@ pub struct JsKiteOptions {
   /// limit, from two WALs to 32 MiB)
   pub wal_segment_size: Option<f64>,
   /// The most bytes of WAL segments before writers wait for a checkpoint
+  /// (default: twice the checkpoint trigger, at least 16 WALs, at most four
+  /// times `checkpointLogBudget`)
   pub wal_segment_limit: Option<f64>,
   /// On close, checkpoint if the log the snapshot does not cover is at least
   /// this fraction of the checkpoint trigger (default: 0.2)

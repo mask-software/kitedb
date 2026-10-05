@@ -1430,7 +1430,7 @@ fn a_panic_on_the_checkpoint_thread_is_reported_and_writes_are_refused() {
   set_checkpoint_test_db_panic(&db, CheckpointPhase::HeaderWritten);
   let mut acked = Vec::new();
   let mut index = 0;
-  // The log reaches the checkpoint trigger (four WALs) after about 900
+  // The log reaches the checkpoint trigger after a few hundred
   // commits; the thread's run then panics in its install. A commit fails
   // only once it is refused: the refusal comes just before the report.
   while checkpoint_thread_error(&db).is_none() && index < 3_000 {

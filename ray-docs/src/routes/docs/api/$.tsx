@@ -269,7 +269,9 @@ const nodeIds = bulkWrite(
 						<td>4 MB</td>
 						<td>
 							Bytes of the WAL area, fixed when the file is created. A full WAL
-							spills into a WAL segment, so a larger one only means fewer spills
+							spills into a WAL segment. Besides how often it spills, it sets
+							the floors of the checkpoint trigger (3/8 of the WAL), the segment
+							limit (16 WALs) and the segment extent (2 WALs)
 						</td>
 					</tr>
 					<tr>
@@ -281,7 +283,8 @@ const nodeIds = bulkWrite(
 						</td>
 						<td>
 							Checkpoint automatically. Without it, the WAL spills into segments
-							up to <code>walSegmentLimit</code>, then writes fail
+							up to <code>walSegmentLimit</code>, then writes fail until a
+							checkpoint
 						</td>
 					</tr>
 					<tr>
@@ -293,7 +296,9 @@ const nodeIds = bulkWrite(
 						</td>
 						<td>
 							Automatic checkpoints run while writes continue;{" "}
-							<code>false</code> makes them blocking
+							<code>false</code> makes them blocking (they run after a commit,
+							and a writer at <code>walSegmentLimit</code> fails instead of
+							waiting)
 						</td>
 					</tr>
 					<tr>
@@ -316,7 +321,8 @@ const nodeIds = bulkWrite(
 						<td>0.5</td>
 						<td>
 							Checkpoint once the log the snapshot does not cover reaches this
-							fraction of the snapshot's size (at least four WALs, at most{" "}
+							fraction of the snapshot's size (at least 3/8 of the WAL, where
+							earlier releases checkpointed; at most{" "}
 							<code>checkpointLogBudget</code>)
 						</td>
 					</tr>
@@ -328,7 +334,8 @@ const nodeIds = bulkWrite(
 						<td>
 							The most log, in bytes, an automatic checkpoint waits for. The
 							in-memory delta takes about ten times the log's size, so this
-							bounds its memory
+							bounds its memory while checkpoints keep up (writers that outrun
+							them grow the log up to <code>walSegmentLimit</code>)
 						</td>
 					</tr>
 					<tr>
@@ -352,7 +359,10 @@ const nodeIds = bulkWrite(
 						</td>
 						<td>
 							The most bytes of WAL segments. At the limit, writers wait for a
-							checkpoint to free some
+							checkpoint to free some. The segment table also caps them at 63
+							extents: with default extents, about four times a limit up to 512
+							MiB, and 2 GiB beyond; with <code>walSegmentSize</code> set, 63
+							extents of it
 						</td>
 					</tr>
 					<tr>
@@ -372,17 +382,26 @@ const nodeIds = bulkWrite(
 				code={`db.checkpoint();           // blocking: waits for open transactions, leaves no WAL segments
 db.backgroundCheckpoint(); // writes continue; runs on this thread, returns after its install
 db.shouldCheckpoint(0.8);  // has the uncovered log reached 0.8 of the trigger? (default 0.8)
-db.checkpointError();      // the last automatic checkpoint's error, or null`}
+db.checkpointError();      // the last automatic checkpoint's error, or null
+db.close();                // a clean close checkpoints any WAL segments away`}
 				language="typescript"
 			/>
 			<p>
-				A failed automatic checkpoint reports nothing to the commit that started
-				it. Its error is logged and returned by <code>checkpointError()</code>{" "}
-				(also on <code>Kite</code>; <code>checkpoint_error()</code> on a Python{" "}
-				<code>Database</code>) until a checkpoint installs. While the last one
-				failed, a writer that finds the WAL segments full fails with{" "}
+				A failed automatic checkpoint, on the checkpoint thread or inline,
+				reports nothing to the commit that started it. Its error is logged and
+				returned by <code>checkpointError()</code> (also on <code>Kite</code>;{" "}
+				<code>checkpoint_error()</code> on a Python <code>Database</code>) until
+				a checkpoint succeeds, and the next automatic checkpoint waits out a
+				back-off (1 s, doubling to 60 s while failures go on; any checkpoint
+				that succeeds ends it). While the last one failed, a writer that finds
+				the WAL segments full fails with{" "}
 				<code>Checkpoint failed, and the WAL segments are full: ...</code> (
-				<code>CheckpointError</code> in Python) instead of waiting.
+				<code>CheckpointError</code> in Python) instead of waiting.{" "}
+				<code>backgroundCheckpoint()</code> declines (
+				<code>Background checkpoint declined: ...</code>;{" "}
+				<code>CheckpointDeclinedError</code> in Python) while a blocking
+				checkpoint or compaction waits for the gate, or when open write
+				transactions hold every WAL segment.
 			</p>
 
 			<h2 id="async-maintenance">Long-running calls</h2>

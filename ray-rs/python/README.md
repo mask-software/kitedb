@@ -213,7 +213,9 @@ Failed operations raise `kitedb.KiteError` or one of its subclasses. `KiteError`
 | `DuplicateKeyError` | a node with the key already exists |
 | `LockError` | another process holds the database file lock |
 | `CorruptionError` | on-disk data fails validation |
-| `WalFullError` | the WAL is full; checkpoint before writing more |
+| `WalFullError` | the WAL and its WAL segments are full and no checkpoint can make room now: automatic checkpoints are off (or blocking), or open write transactions hold the segments; checkpoint, or end those transactions, before writing more |
+| `CheckpointError` | a write needs WAL segment space only a checkpoint frees, and the last automatic checkpoint failed (`Database.checkpoint_error()`); committed data is safe |
+| `CheckpointDeclinedError` | `background_checkpoint()` did not run, or stopped, and nothing changed; the message says why |
 
 ```python
 from kitedb import ConflictError

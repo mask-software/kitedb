@@ -1813,19 +1813,28 @@ export interface KiteOptions {
   /**
    * Checkpoint once the log the snapshot does not cover (WAL segments and
    * WAL) reaches this fraction of the snapshot's size (default: 0.5; at least
-   * four WALs, at most `checkpointLogBudget`)
+   * three eighths of the WAL, where earlier releases checkpointed; at most
+   * `checkpointLogBudget`)
    */
   checkpointLogRatio?: number
   /**
    * The most log, in bytes, an automatic checkpoint waits for (default: 128
    * MiB). The in-memory delta takes about ten times the log's size. Writers
-   * wait for a checkpoint only at `walSegmentLimit` (by default twice the
-   * checkpoint trigger, at most four times this).
+   * that outrun checkpoints grow the log up to `walSegmentLimit` (by default
+   * twice the checkpoint trigger, at least 16 WALs, at most four times this),
+   * and wait for a checkpoint only there.
    */
   checkpointLogBudget?: number
-  /** Bytes of a WAL segment extent (default: eight WALs, at most 32 MiB) */
+  /**
+   * Bytes of a WAL segment extent (default: a sixteenth of the segment
+   * limit, from two WALs to 32 MiB)
+   */
   walSegmentSize?: number
-  /** The most bytes of WAL segments before writers wait for a checkpoint */
+  /**
+   * The most bytes of WAL segments before writers wait for a checkpoint
+   * (default: twice the checkpoint trigger, at least 16 WALs, at most four
+   * times `checkpointLogBudget`)
+   */
   walSegmentLimit?: number
   /** Replication role */
   replicationRole?: ReplicationRole

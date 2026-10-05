@@ -50,10 +50,15 @@ pub enum KiteError {
   Conflict { txid: TxId, keys: Vec<String> },
 
   /// The WAL is full and cannot spill into WAL segments: they are at their
-  /// limit (`wal_segment_limit`) and no checkpoint frees them (automatic
-  /// checkpoints are off, open write transactions hold their records, or a
-  /// blocking checkpoint waits for this writer's transaction), or the record
-  /// cannot be written at all. A checkpoint makes room.
+  /// limit (`wal_segment_limit`, or the segment table's 63 entries) and no
+  /// checkpoint can free them for this writer now. Automatic checkpoints are
+  /// off, or blocking (`background_checkpoint` off: one runs after the
+  /// failed write); open write transactions hold the segments' records; a
+  /// blocking checkpoint, optimize, vacuum or WAL resize waits for this
+  /// writer's transaction; the database is closing; or the checkpoint run
+  /// that answered this writer freed nothing. Or the record cannot be
+  /// written at all. A checkpoint, or the end of those transactions, makes
+  /// room.
   #[error("WAL buffer full: checkpoint required before continuing writes")]
   WalBufferFull,
 
@@ -67,9 +72,10 @@ pub enum KiteError {
   CheckpointDeclined(String),
 
   /// A write needs WAL segment space that only a checkpoint can free, and
-  /// the last automatic checkpoint failed (with the error given; see
-  /// `SingleFileDB::checkpoint_error`). Every commit acknowledged so far is
-  /// safe; writes succeed again once a checkpoint does.
+  /// the last automatic checkpoint (on the checkpoint thread or inline)
+  /// failed, with the error given (see `SingleFileDB::checkpoint_error`).
+  /// Every commit acknowledged so far is safe; writes succeed again once a
+  /// checkpoint does (an automatic one is retried after a back-off).
   #[error("Checkpoint failed, and the WAL segments are full: {0}")]
   CheckpointFailed(String),
 

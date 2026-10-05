@@ -73,7 +73,9 @@ create_exception!(
   kitedb._kitedb,
   WalFullError,
   KiteError,
-  "The WAL is full; checkpoint before writing more."
+  "The WAL and its WAL segments are full and no checkpoint can make room now (automatic \
+   checkpoints are off or blocking, or open write transactions hold the segments); checkpoint, \
+   or end those transactions, before writing more."
 );
 create_exception!(
   kitedb._kitedb,

@@ -40,7 +40,10 @@ class CorruptionError(KiteError):
     """On-disk data failed validation (bad magic, checksum, snapshot or WAL)."""
 
 class WalFullError(KiteError):
-    """The WAL is full; checkpoint before writing more."""
+    """The WAL and its WAL segments are full and no checkpoint can make room
+    now (automatic checkpoints are off or blocking, or open write
+    transactions hold the segments); checkpoint, or end those transactions,
+    before writing more."""
 
 class CheckpointError(KiteError):
     """A write needs WAL segment space only a checkpoint frees, and the last
@@ -69,8 +72,8 @@ class OpenOptions:
     page_size: Optional[int]
     wal_size: Optional[int]
     # Checkpoint once the log (WAL segments and WAL) reaches the trigger
-    # (checkpoint_log_ratio of the snapshot, at least four WALs, at most
-    # checkpoint_log_budget).
+    # (checkpoint_log_ratio of the snapshot, at least three eighths of the
+    # WAL, at most checkpoint_log_budget).
     auto_checkpoint: Optional[bool]
     # Deprecated: has no effect (checkpoints follow the log).
     checkpoint_threshold: Optional[float]

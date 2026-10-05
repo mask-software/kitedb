@@ -383,7 +383,7 @@ const MEMORY_PARTS: {
 				text: "Takes about ten times the bytes of log it holds, so ",
 				code: "checkpointLogBudget",
 				after:
-					" (default 128 MiB of log, about 1.3 GB of delta) bounds it at the checkpoint trigger; a checkpoint briefly needs about twice that.",
+					" (default 128 MiB of log, about 1.3 GB of delta) bounds it at the checkpoint trigger while checkpoints keep up; writers that outrun them grow the log up to walSegmentLimit. A checkpoint briefly needs about twice that.",
 			},
 		],
 	},
@@ -586,10 +586,10 @@ export function PerformancePage() {
 			<p>
 				Every commit is group-committed: the commits that arrive while a group
 				is written form the next group, written with one WAL write, one header
-				write and, in <code>Full</code> mode, one fsync, then published in
-				order (each commit whole). No commit waits for others to join, so a
-				single writer pays nothing for it. This works in every sync mode, with
-				MVCC and on a replication primary; <code>groupCommitEnabled</code> and{" "}
+				write and, in <code>Full</code> mode, one fsync, then published in order
+				(each commit whole). No commit waits for others to join, so a single
+				writer pays nothing for it. This works in every sync mode, with MVCC and
+				on a replication primary; <code>groupCommitEnabled</code> and{" "}
 				<code>groupCommitWindowMs</code> have no effect.
 			</p>
 
@@ -634,10 +634,14 @@ export function PerformancePage() {
 					<code>addEdgesBatch()</code> / <code>addEdgesWithPropsBatch()</code>,{" "}
 					<code>syncMode=Normal</code>, and the default checkpoint settings: a
 					full WAL spills into WAL segments and checkpoints run on the
-					checkpoint thread, so the WAL needs no resizing (a larger one only
-					means fewer spills). With auto-checkpoint off, writes fail once the
-					WAL segments reach <code>walSegmentLimit</code>: raise it to hold the
-					whole load, then checkpoint.
+					checkpoint thread, so the WAL needs no resizing (a larger one means
+					fewer spills, but raises the floors of the checkpoint trigger, the
+					segment limit and the segment extent). With auto-checkpoint off,
+					writes fail once the WAL segments reach <code>walSegmentLimit</code>{" "}
+					or fill the segment table (63 extents; with default extents about four
+					times a limit up to 512 MiB, and 2 GiB beyond): raise the limit, and{" "}
+					<code>walSegmentSize</code> with it past that, to hold the whole load,
+					then checkpoint.
 				</li>
 				<li>
 					<strong>Several writer threads:</strong> <code>syncMode=Normal</code>,
@@ -647,7 +651,7 @@ export function PerformancePage() {
 				<li>
 					<strong>Read-heavy, mixed workload:</strong> keep write batches small,
 					leave auto-checkpoint on (it runs once the log reaches half the
-					snapshot's size, at most 128 MiB; tune with{" "}
+					snapshot's size, at least 3/8 of the WAL, at most 128 MiB; tune with{" "}
 					<code>checkpointLogRatio</code> and <code>checkpointLogBudget</code>),
 					and bound traversal depth.
 				</li>

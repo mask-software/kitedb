@@ -105,18 +105,21 @@ db.close();
 The `.kitedb` format contains:
 - **Header (pages 0 and 1)**: two checksummed copies of the magic, format version, page size,
   snapshot/WAL locations, WAL salts and the WAL segment table; open uses the newest valid copy.
-  A header naming WAL segments is format version 3 (older versions refuse it); otherwise it is
-  version 2, as older versions write it
+  A header naming WAL segments is format version 3 (a build that reads version 2 but not
+  segments refuses it); otherwise it is version 2. No released version opens these files:
+  v0.2.18 and earlier read neither the two header copies nor salted WAL records
 - **WAL Area**: Linear buffer for write-ahead log records. When it fills, its records spill into a
   WAL segment and it starts over
 - **WAL Segments**: extents of pages holding spilled log records, up to a limit
-  (`walSegmentLimit`); a checkpoint covers and frees them
+  (`walSegmentLimit`); a checkpoint covers and frees them, and a clean close leaves none
 - **Snapshot Area**: CSR snapshot data (mmap-friendly)
 
 Automatic checkpoints run on a thread of the database's own once the log (WAL segments and
-WAL) reaches the checkpoint trigger: half the snapshot's size (`checkpointLogRatio`), at least four
-WALs, at most 128 MiB (`checkpointLogBudget`). The in-memory delta takes about ten times the log's
-size, so the budget bounds its memory.
+WAL) reaches the checkpoint trigger: half the snapshot's size (`checkpointLogRatio`), at least
+three eighths of the WAL (where earlier releases checkpointed), at most 128 MiB
+(`checkpointLogBudget`). The in-memory delta takes about ten times the log's size, so the budget
+bounds its memory while checkpoints keep up; writers that outrun them grow the log up to
+`walSegmentLimit`, where they wait for a checkpoint.
 
 ### Snapshot Section
 

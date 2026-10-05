@@ -696,14 +696,14 @@ print(f"Total vectors: {stats['totalVectors']}")`}
 
 				<h2 id="index-backend">Choosing the index backend</h2>
 				<p>
-					By default (<code>auto</code>) the index picks its backend each time it
-					builds, from the live vector count and dimensions at that point:
+					By default (<code>auto</code>) the index picks its backend each time
+					it builds, from the live vector count and dimensions at that point:
 				</p>
 				<ul>
 					<li>
-						<strong>Plain IVF</strong> while the collection has fewer than 50,000
-						vectors or fewer than 512 dimensions. Results carry exact distances,
-						and builds are fast.
+						<strong>Plain IVF</strong> while the collection has fewer than
+						50,000 vectors or fewer than 512 dimensions. Results carry exact
+						distances, and builds are fast.
 					</li>
 					<li>
 						<strong>IVF-PQ</strong> from 512 dimensions and 50,000 vectors on.
@@ -995,8 +995,8 @@ db.commit()`}
 							<td>Several writer threads</td>
 							<td>
 								A transaction per thread, <code>syncMode: 'Normal'</code>;
-								concurrent commits are written together. Retry commits that
-								fail with a conflict
+								concurrent commits are written together. Retry commits that fail
+								with a conflict
 							</td>
 						</tr>
 					</tbody>
@@ -1303,12 +1303,18 @@ db.commit()`}
 					<li>
 						Keep the default 4 MB WAL for large ingest: a full WAL spills into
 						WAL segments, and checkpoints run on the database's checkpoint
-						thread. A larger WAL only means fewer spills
+						thread. A larger WAL means fewer spills, but it also raises the
+						floors of the checkpoint trigger (3/8 of the WAL), the segment limit
+						(16 WALs) and the segment extent (2 WALs): more log, and more
+						memory, before a small database checkpoints
 					</li>
 					<li>
 						Leave auto-checkpoint on. With it off, writes fail once the WAL
-						segments reach <code>walSegmentLimit</code>; raise the limit to hold
-						the whole load and checkpoint once at the end
+						segments reach <code>walSegmentLimit</code>, or fill the segment
+						table (63 extents: with default extents, about four times a limit up
+						to 512 MiB, and 2 GiB beyond); to hold a whole load and checkpoint
+						once at the end, raise the limit, and <code>walSegmentSize</code>{" "}
+						with it past that
 					</li>
 					<li>
 						Lower <code>checkpointLogBudget</code> (default 128 MiB) to bound

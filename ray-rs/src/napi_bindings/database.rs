@@ -169,31 +169,37 @@ pub struct OpenOptions {
   /// Checkpoint automatically once the log (the WAL and its WAL segments)
   /// reaches the checkpoint trigger (default: true; see
   /// `checkpointLogRatio`). Without, the WAL spills into WAL segments until
-  /// `walSegmentLimit`, then writes fail with a WAL-full error.
+  /// `walSegmentLimit`, then writes fail with a WAL-full error until a
+  /// checkpoint.
   pub auto_checkpoint: Option<bool>,
   /// @deprecated No effect: automatic checkpoints follow the log (see `checkpointLogRatio` and `checkpointLogBudget`). Still accepted (in [0, 1]) so existing callers keep working.
   pub checkpoint_threshold: Option<f64>,
-  /// Use background (non-blocking) checkpoint
+  /// Automatic checkpoints run while writes go on (default: true). Without,
+  /// they are blocking, and a writer at `walSegmentLimit` fails instead of
+  /// waiting
   pub background_checkpoint: Option<bool>,
   /// Run automatic background checkpoints on a thread of the database's
   /// own, so the commit that crosses the trigger returns at once (default:
   /// true)
   pub checkpoint_thread: Option<bool>,
   /// Checkpoint once the log the snapshot does not cover reaches this
-  /// fraction of the snapshot's size (default: 0.5; at least four WALs, at
-  /// most `checkpointLogBudget`)
+  /// fraction of the snapshot's size (default: 0.5; at least three eighths
+  /// of the WAL, where earlier releases checkpointed; at most
+  /// `checkpointLogBudget`)
   pub checkpoint_log_ratio: Option<f64>,
   /// The most log, in bytes, an automatic checkpoint waits for (default:
   /// 128 MiB). The in-memory delta takes about ten times the log's size.
-  /// Writers wait for a checkpoint only at the WAL segment limit (by default
-  /// twice the checkpoint trigger, at most four times this).
+  /// Writers that outrun checkpoints grow the log up to the WAL segment
+  /// limit (by default twice the checkpoint trigger, at least 16 WALs, at
+  /// most four times this), and wait for a checkpoint only there.
   pub checkpoint_log_budget: Option<f64>,
   /// Bytes of a WAL segment extent (default: a sixteenth of the segment
   /// limit, from two WALs to 32 MiB)
   pub wal_segment_size: Option<f64>,
   /// The most bytes of WAL segments before writers wait for a checkpoint
   /// (default: twice the checkpoint trigger, at least 16 WALs, at most four
-  /// times `checkpointLogBudget`)
+  /// times `checkpointLogBudget`). The segment table caps them at 63
+  /// extents too
   pub wal_segment_limit: Option<f64>,
   /// Compression options for checkpoint snapshots (single-file only)
   pub checkpoint_compression: Option<CompressionOptions>,
@@ -2023,7 +2029,10 @@ impl Database {
     Ok(())
   }
 
-  /// Close the database and run a blocking checkpoint if WAL usage is above threshold.
+  /// Close the database, first running a blocking checkpoint if the log the
+  /// snapshot does not cover (WAL segments and WAL) is at least `threshold`
+  /// of the checkpoint trigger, so the next open replays less. (A clean
+  /// close checkpoints WAL segments away regardless.)
   #[napi]
   pub fn close_with_checkpoint_if_wal_over(&mut self, threshold: f64) -> Result<()> {
     let threshold = validation::ratio("threshold", threshold)?;
@@ -3773,10 +3782,11 @@ impl Database {
   }
 
   /// The error of the last automatic checkpoint, if it failed and no
-  /// checkpoint installed since; `null` otherwise. Automatic checkpoints run
-  /// on a thread of the database's own and report nothing to the commit that
-  /// started them: their failures show here (and in the log, and as the
-  /// error of a write that needs WAL segment space while they fail).
+  /// checkpoint succeeded since; `null` otherwise. Automatic checkpoints run
+  /// on a thread of the database's own (or, without it, on the committing
+  /// thread) and report nothing to the commit that started them: their
+  /// failures show here (and in the log, and as the error of a write that
+  /// needs WAL segment space while they fail).
   #[napi]
   pub fn checkpoint_error(&self) -> Result<Option<String>> {
     match self.inner.as_ref() {

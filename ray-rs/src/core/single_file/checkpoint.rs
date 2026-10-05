@@ -3442,8 +3442,7 @@ mod tests {
     let committer = std::thread::spawn(move || {
       let mut index = 0;
       while committer_db.header.read().active_snapshot_gen < start_gen + 2 {
-        // The log reaches the checkpoint trigger (four WALs) about every
-        // 2,700 commits.
+        // The log reaches the checkpoint trigger every few hundred commits.
         assert!(index < 20_000, "auto checkpoints never ran");
         commit_node(&committer_db, &format!("c-{index}"));
         index += 1;
@@ -4138,7 +4137,7 @@ mod tests {
       .background_checkpoint(true);
     let db = Arc::new(open_single_file(&db_path, options.clone()).expect("open"));
 
-    // About 400 KiB of records: past the checkpoint trigger (four WALs).
+    // About 400 KiB of records: past the checkpoint trigger.
     let (go_tx, writer) = hold_big_transaction(&db, 200);
     assert!(
       db.should_checkpoint(1.0),

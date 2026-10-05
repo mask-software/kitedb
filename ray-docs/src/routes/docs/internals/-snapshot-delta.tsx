@@ -336,8 +336,8 @@ function CheckpointProcess() {
 						class="h-1.5 w-1.5 rounded-full bg-kite-cyan"
 						aria-hidden="true"
 					/>
-					Automatic: when the log reaches half the snapshot's size (at least
-					four WALs, at most 128 MiB)
+					Automatic: when the log reaches half the snapshot's size (at least 3/8
+					of the WAL, at most 128 MiB)
 				</p>
 				<p class="flex items-center gap-2">
 					<span

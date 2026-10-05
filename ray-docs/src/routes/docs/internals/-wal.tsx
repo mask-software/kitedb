@@ -333,7 +333,7 @@ function BackgroundCheckpointDiagram() {
 	const steps: Step[] = [
 		{
 			text: "Cut: spill the WAL into a WAL segment and seal the newest segment",
-			sub: "The new snapshot will hold every transaction committed in the segments up to this one; call its seq C",
+			sub: "The new snapshot will hold every transaction committed in the segments up to this one; call its seq C. When the segment table has no entry left for the spill, the cut covers the segments alone and the WAL's records follow it, so a full table never stops checkpoints",
 			accent: "amber",
 			note: "commit lock",
 		},
@@ -379,12 +379,14 @@ function BackgroundCheckpointDiagram() {
 				</FlowItem>
 				<FlowItem color="emerald">
 					A failure at any step loses nothing: the cut is only a spill, and
-					every commit stays in the log
+					every commit stays in the log. A run that ends before its install
+					unseals the segment its cut sealed, so failures take no table entries
 				</FlowItem>
 				<FlowItem color="amber">
 					Closing or dropping the database abandons a run still building its
 					snapshot (no header names its pages, which are freed then or at the
-					next open) and lets a run already installing finish
+					next open; not a failure, so nothing records it) and lets a run
+					already installing finish
 				</FlowItem>
 			</div>
 		</Figure>
@@ -419,7 +421,8 @@ const SYNC_MODES: {
 		name: "Off",
 		accent: "red",
 		badge: "testing only",
-		summary: "No fsync, and WAL writes are not flushed at commit",
+		summary:
+			"No fsync at commit, and WAL writes are not flushed at commit (spills and checkpoints still sync)",
 		tradeoff: "Fastest; any crash can lose data",
 	},
 ];
@@ -536,9 +539,10 @@ function CheckpointTriggers() {
 						After a commit, when the log the snapshot does not cover (the WAL
 						segments after <Code>covered</Code>, plus the WAL) reaches the
 						trigger: <Code>checkpointLogRatio</Code> (default 0.5) times the
-						snapshot's size, at least four WALs, at most{" "}
-						<Code>checkpointLogBudget</Code> (default 128 MiB). Segments kept
-						for a still-open transaction don't count
+						snapshot's size, at least three eighths of the WAL (where earlier
+						releases checkpointed), at most <Code>checkpointLogBudget</Code>{" "}
+						(default 128 MiB). Segments kept for a still-open transaction don't
+						count
 					</span>
 				</li>
 				<li class="flex items-start gap-3">
@@ -589,10 +593,11 @@ function CheckpointTriggers() {
 						above)
 					</FlowItem>
 					<FlowItem color="red">
-						A failure is logged, recorded and returned by{" "}
-						<Code>checkpointError()</Code> until a checkpoint installs. The
-						thread retries at the next trigger, after a wait that starts at 1 s
-						and doubles up to 60 s
+						A failure, on the thread or inline, is logged, recorded and returned
+						by <Code>checkpointError()</Code> until a checkpoint succeeds. The
+						next automatic checkpoint waits out a back-off that starts at 1 s
+						and doubles up to 60 s while failures go on; any checkpoint that
+						succeeds, such as the caller's own, ends it
 					</FlowItem>
 				</div>
 				<p class="mt-3 text-[13px] text-slate-500">
@@ -603,8 +608,9 @@ function CheckpointTriggers() {
 					<Code>vacuum</Code> and <Code>resizeWal</Code> also leave no segments.
 					If installing its header fails, it returns an error and the database
 					keeps the previous snapshot and log, so later commits append after the
-					existing records. Closing keeps live segments, and the next open
-					replays them.
+					existing records. A clean close (no transaction open) runs one when
+					the header names WAL segments, so a closed file holds none; a database
+					dropped without closing keeps them, and the next open replays them.
 				</p>
 			</div>
 		</Figure>
@@ -659,10 +665,12 @@ export function WALPage() {
 				appends to it any more). The table also holds <code>covered</code>, the
 				newest segment seq the snapshot covers, and the seq the next segment
 				gets. A header that names WAL segments is written as format version 3,
-				with minimum reader version 3, so older versions refuse the file with a
-				version mismatch instead of missing the commits in its segments. Once a
-				checkpoint covers every segment, the header is written as version 2
-				again.
+				with minimum reader version 3, so a build that reads version 2 but not
+				segments refuses the file with a version mismatch instead of missing the
+				commits in its segments. Once a checkpoint covers every segment, as a
+				clean close does, the header is written as version 2 again. No released
+				version opens these files: v0.2.18 and earlier read neither the two
+				header slots nor salted WAL records, and check no format version.
 			</p>
 
 			<VersionNote>
@@ -719,8 +727,10 @@ export function WALPage() {
 				<li>
 					The default 4 MB WAL is enough for heavy ingest: a full WAL spills
 					into a WAL segment, and checkpoints run on the checkpoint thread
-					without holding up commits. A larger <code>walSize</code> only means
-					fewer spills (each is a copy of the WAL and three syncs)
+					without holding up commits. A larger <code>walSize</code> means fewer
+					spills (each is a copy of the WAL and three syncs), and raises the
+					floors of the checkpoint trigger (3/8 of the WAL), the segment limit
+					(16 WALs) and the segment extent (2 WALs)
 				</li>
 			</ul>
 
@@ -752,13 +762,14 @@ export function WALPage() {
 
 			<p>
 				The in-memory delta takes about ten times the log's bytes, so the log
-				budget bounds memory: the default 128 MiB of log is about 1.3 GB of
-				delta at most at the trigger. A checkpoint briefly needs about twice
-				that, for the delta it replays from the cut plus the live delta. To
-				bound reopen replay time or memory, lower{" "}
-				<code>checkpointLogBudget</code>. To checkpoint less often on a large
-				database, raise <code>checkpointLogRatio</code>, at the cost of more
-				memory; the budget caps the trigger either way.{" "}
+				budget bounds memory while checkpoints keep up: the default 128 MiB of
+				log is about 1.3 GB of delta at most at the trigger, and writers that
+				outrun checkpoints grow the log up to <code>walSegmentLimit</code>. A
+				checkpoint briefly needs about twice that, for the delta it replays from
+				the cut plus the live delta. To bound reopen replay time or memory,
+				lower <code>checkpointLogBudget</code>. To checkpoint less often on a
+				large database, raise <code>checkpointLogRatio</code>, at the cost of
+				more memory; the budget caps the trigger either way.{" "}
 				<code>checkpointThreshold</code> is deprecated and has no effect.
 			</p>
 
@@ -766,9 +777,14 @@ export function WALPage() {
 				<code>walSegmentLimit</code> (default: twice the trigger, at least 16
 				WALs, at most four times <code>checkpointLogBudget</code>) bounds the
 				bytes of WAL segments, and with them disk use and the delta's memory.
-				Writers wait only when the segments reach it: a writer that needs to
-				spill then asks for a checkpoint and waits for its install to free
-				segments.
+				The segment table bounds them too, at 63 extents (the 64th is kept for a
+				checkpoint's cut): an extent is <code>walSegmentSize</code>, by default
+				a sixteenth of the limit (two WALs to 32 MiB), so the table holds about
+				four times a limit of up to 512 MiB, and 2 GiB beyond. Writers wait only
+				when the segments reach either: a writer that needs to spill then asks
+				for a checkpoint (on the checkpoint thread, a run that starts after it
+				asked; without the thread, one of its own) and waits for its install to
+				free segments.
 			</p>
 
 			<h2 id="overflow">Avoiding WAL overflow</h2>
@@ -776,15 +792,21 @@ export function WALPage() {
 			<p>
 				A full WAL does not fail a write: it spills into a WAL segment, and a
 				commit too large for an empty WAL goes straight to one. A write fails
-				with <code>WAL buffer full</code> (<code>WalBufferFull</code>) only when
-				the WAL segments reach <code>walSegmentLimit</code> and waiting for a
-				checkpoint cannot help:
+				with <code>WAL buffer full</code> (<code>WalBufferFull</code>;{" "}
+				<code>WalFullError</code> in Python) only when the WAL segments reach{" "}
+				<code>walSegmentLimit</code> (or fill the segment table) and waiting for
+				a checkpoint cannot help:
 			</p>
 			<ul>
 				<li>
 					Automatic checkpoints are off: spills continue up to the limit, then
 					writes fail. Run <code>checkpoint()</code> before the limit, or raise{" "}
-					<code>walSegmentLimit</code>.
+					<code>walSegmentLimit</code> (and <code>walSegmentSize</code> with it
+					past what the table holds).
+				</li>
+				<li>
+					Background checkpoints are off: automatic checkpoints are blocking, so
+					the writer fails, and one runs after the failed write.
 				</li>
 				<li>
 					Open write transactions hold records in enough segments to fill the
@@ -797,22 +819,27 @@ export function WALPage() {
 					<code>resizeWal</code> is waiting for the writer's own transaction to
 					finish.
 				</li>
-				<li>The checkpoint the writer waited for freed no segment space.</li>
+				<li>The database is closing, or the checkpoint thread cannot start.</li>
+				<li>
+					The checkpoint run that answered the writer (one that started after it
+					asked) freed no segment space.
+				</li>
 			</ul>
 			<p>
 				While the last automatic checkpoint failed, a writer at the limit fails
 				instead of waiting, with{" "}
 				<code>Checkpoint failed, and the WAL segments are full: ...</code> (
 				<code>CheckpointFailed</code>; Python raises{" "}
-				<code>CheckpointError</code>, a <code>KiteError</code> subclass), and
-				asks for another checkpoint, which the thread runs after its back-off (1
-				s, doubling to 60 s after each failure in a row; any checkpoint that
-				succeeds meanwhile, such as the caller's own, ends it).{" "}
-				<code>checkpointError()</code> (<code>checkpoint_error()</code> in
-				Python) returns the checkpoint's error. A panic in a checkpoint run is
-				reported the same way, and the thread ends. Since such a panic may
-				strike between writes that keep memory and disk in step, the handle then
-				refuses writes (
+				<code>CheckpointError</code>, a <code>KiteError</code> subclass). With
+				the checkpoint thread it asks for another, which the thread runs after
+				its back-off (1 s, doubling to 60 s after each failure in a row; any
+				checkpoint that succeeds meanwhile, such as the caller's own, ends it);
+				without it, writers fail during the back-off and run one themselves
+				after it. <code>checkpointError()</code> (
+				<code>checkpoint_error()</code> in Python) returns the checkpoint's
+				error. A panic in a checkpoint run is reported the same way, and the
+				thread ends. Since such a panic may strike between writes that keep
+				memory and disk in step, the handle then refuses writes (
 				<code>The database refuses writes until it is reopened: ...</code>,{" "}
 				<code>WritesRefused</code>), as it does after a panic in a commit, a
 				spill, a checkpoint, <code>optimize</code>, <code>vacuum</code> or{" "}

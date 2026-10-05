@@ -134,7 +134,8 @@ pub struct OpenOptions {
   /// Checkpoint automatically once the log (the WAL and its WAL segments)
   /// reaches the checkpoint trigger (default: True; see
   /// `checkpoint_log_ratio`). Without, the WAL spills into WAL segments until
-  /// `wal_segment_limit`, then writes fail with `WalFullError`.
+  /// `wal_segment_limit`, then writes fail with `WalFullError` until a
+  /// checkpoint.
   #[pyo3(get, set)]
   pub auto_checkpoint: Option<bool>,
   /// Deprecated: has no effect (automatic checkpoints follow the log; see
@@ -142,7 +143,9 @@ pub struct OpenOptions {
   /// [0, 1]) so existing callers keep working.
   #[pyo3(get, set)]
   pub checkpoint_threshold: Option<f64>,
-  /// Use background (non-blocking) checkpoint
+  /// Automatic checkpoints run while writes go on (default: True). Without,
+  /// they are blocking, and a writer at `wal_segment_limit` fails with
+  /// `WalFullError` instead of waiting
   #[pyo3(get, set)]
   pub background_checkpoint: Option<bool>,
   /// Compression options for checkpoint snapshots (single-file only)
@@ -230,14 +233,16 @@ pub struct OpenOptions {
   #[pyo3(get, set)]
   pub checkpoint_thread: Option<bool>,
   /// Checkpoint once the log the snapshot does not cover reaches this
-  /// fraction of the snapshot's size (default: 0.5; at least four WALs, at
-  /// most `checkpoint_log_budget`)
+  /// fraction of the snapshot's size (default: 0.5; at least three eighths
+  /// of the WAL, where earlier releases checkpointed; at most
+  /// `checkpoint_log_budget`)
   #[pyo3(get, set)]
   pub checkpoint_log_ratio: Option<f64>,
   /// The most log, in bytes, an automatic checkpoint waits for (default:
   /// 128 MiB). The in-memory delta takes about ten times the log's size.
-  /// Writers wait for a checkpoint only at the WAL segment limit (by default
-  /// twice the checkpoint trigger, at most four times this).
+  /// Writers that outrun checkpoints grow the log up to the WAL segment
+  /// limit (by default twice the checkpoint trigger, at least 16 WALs, at
+  /// most four times this), and wait for a checkpoint only there.
   #[pyo3(get, set)]
   pub checkpoint_log_budget: Option<i64>,
   /// Bytes of a WAL segment extent (default: a sixteenth of the segment
@@ -246,7 +251,8 @@ pub struct OpenOptions {
   pub wal_segment_size: Option<i64>,
   /// The most bytes of WAL segments before writers wait for a checkpoint
   /// (default: twice the checkpoint trigger, at least 16 WALs, at most four
-  /// times `checkpoint_log_budget`)
+  /// times `checkpoint_log_budget`). The segment table caps them at 63
+  /// extents too
   #[pyo3(get, set)]
   pub wal_segment_limit: Option<i64>,
 }

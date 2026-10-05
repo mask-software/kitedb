@@ -1159,7 +1159,7 @@ impl Kite {
   }
 
   /// The error of the last automatic checkpoint, if it failed and no
-  /// checkpoint installed since; `null` otherwise (see
+  /// checkpoint succeeded since; `null` otherwise (see
   /// `Database.checkpointError`).
   #[napi]
   pub fn checkpoint_error(&self) -> Result<Option<String>> {

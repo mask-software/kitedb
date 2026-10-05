@@ -1510,11 +1510,11 @@ impl PyDatabase {
   }
 
   /// The error of the last automatic checkpoint, if it failed and no
-  /// checkpoint installed since; None otherwise. Automatic checkpoints run
-  /// on a thread of the database's own and report nothing to the commit that
-  /// started them: their failures show here (and in the log, and as the
-  /// `CheckpointError` of a write that needs WAL segment space while they
-  /// fail).
+  /// checkpoint succeeded since; None otherwise. Automatic checkpoints run
+  /// on a thread of the database's own (or, without it, on the committing
+  /// thread) and report nothing to the commit that started them: their
+  /// failures show here (and in the log, and as the `CheckpointError` of a
+  /// write that needs WAL segment space while they fail).
   fn checkpoint_error(&self) -> PyResult<Option<String>> {
     dispatch_ok!(self, |db| db.checkpoint_error(), |_db| None)
   }

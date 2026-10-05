@@ -115,7 +115,8 @@ pub struct SingleFileOpenOptions {
   /// Checkpoint automatically once the log (the WAL and its WAL segments)
   /// reaches the checkpoint trigger (default true; see
   /// `checkpoint_log_ratio`). Without, the WAL spills into WAL segments until
-  /// `wal_segment_limit`, and then writes fail with `WalBufferFull`.
+  /// `wal_segment_limit`, and then writes fail with `WalBufferFull` until a
+  /// checkpoint.
   pub auto_checkpoint: bool,
   /// Has no effect: automatic checkpoints follow the log, not the WAL's
   /// usage (see `checkpoint_log_ratio` and `checkpoint_log_budget`). Still
@@ -125,7 +126,10 @@ pub struct SingleFileOpenOptions {
             checkpoint_log_budget"
   )]
   pub checkpoint_threshold: f64,
-  /// Use background (non-blocking) checkpoint instead of blocking (default true)
+  /// Automatic checkpoints run while writes go on (default true). Without,
+  /// they are blocking: one runs after the commit that crosses the trigger
+  /// (waiting for open transactions), and a writer at `wal_segment_limit`
+  /// fails with `WalBufferFull` instead of waiting.
   pub background_checkpoint: bool,
   /// Run automatic background checkpoints on a thread of the database's
   /// own, so the commit that crosses the trigger returns at once (default
@@ -134,14 +138,18 @@ pub struct SingleFileOpenOptions {
   pub checkpoint_thread: bool,
   /// An automatic checkpoint starts once the log the snapshot does not cover
   /// (WAL segments and WAL) reaches this fraction of the snapshot's size
-  /// (default 0.5), within limits: at least four WALs, at most
+  /// (default 0.5), within limits: at least three eighths of the WAL (half
+  /// its region: where earlier releases checkpointed by default, so a small
+  /// database holds no more log than it did), at most
   /// `checkpoint_log_budget`.
   pub checkpoint_log_ratio: f64,
   /// The most log, in bytes, an automatic checkpoint waits for (default
-  /// 128 MiB). The delta that holds the log's commits in memory takes about
-  /// ten times the log's size, so this bounds that memory. Writers wait for
-  /// a checkpoint only once the WAL segments reach `wal_segment_limit` (by
-  /// default twice the checkpoint trigger, at most four times this).
+  /// 128 MiB; it caps the trigger's floor too). The delta that holds the
+  /// log's commits in memory takes about ten times the log's size, so this
+  /// bounds that memory while checkpoints keep up. Writers that outrun them
+  /// grow the log up to `wal_segment_limit` (by default twice the checkpoint
+  /// trigger, at least 16 WALs, at most four times this), and wait for a
+  /// checkpoint only there.
   pub checkpoint_log_budget: u64,
   /// Bytes of a WAL segment extent: spills of the WAL fill one before the
   /// next is allocated (default: a sixteenth of the segment limit, from two
@@ -152,8 +160,11 @@ pub struct SingleFileOpenOptions {
   pub wal_segment_size: Option<u64>,
   /// The most bytes of WAL segments: past it the WAL spills no more, and
   /// writers wait for a checkpoint (or fail with `WalBufferFull` without
-  /// automatic checkpoints). Default: twice the checkpoint trigger, at least
-  /// 16 WALs, at most four times `checkpoint_log_budget`.
+  /// automatic checkpoints, or with blocking ones). Default: twice the
+  /// checkpoint trigger, at least 16 WALs, at most four times
+  /// `checkpoint_log_budget`. The segment table caps the segments at 63
+  /// extents too: with default extents, about four times a limit up to
+  /// 512 MiB, and 2 GiB beyond; with `wal_segment_size` set, 63 of it.
   pub wal_segment_limit: Option<u64>,
   /// Has no effect. The cache layer was removed: no read ever consulted it,
   /// and reads are served from the snapshot and delta. Still accepted so
@@ -509,7 +520,9 @@ pub struct SingleFileCloseOptions {
   /// If set, run a blocking checkpoint before close when the log the
   /// snapshot does not cover (WAL segments and WAL) is at least this
   /// fraction of the checkpoint trigger (see `SingleFileDB::should_checkpoint`),
-  /// so the next open replays less. Threshold is clamped to [0.0, 1.0].
+  /// so the next open replays less. Threshold is clamped to [0.0, 1.0]. (A
+  /// clean close checkpoints WAL segments away whatever this says; this
+  /// covers a log that is only in the WAL.)
   pub checkpoint_if_wal_usage_at_least: Option<f64>,
 }
 

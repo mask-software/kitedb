@@ -11,7 +11,7 @@ use kitedb::core::single_file::{close_single_file, open_single_file, SingleFileO
 use std::time::{Duration, Instant};
 
 const WAL_SIZE: usize = 64 * 1024;
-/// About four times the checkpoint trigger (four WALs) of log.
+/// About 3 MiB of log: many times the checkpoint trigger.
 const COMMITS: usize = 10_000;
 
 fn options(background: bool) -> SingleFileOpenOptions {

@@ -85,8 +85,9 @@ pub const WAL_SEGMENT_ENTRY_SIZE: usize = 32;
 pub const WAL_SEGMENT_DEFAULT_SIZE: usize = 32 * 1024 * 1024;
 /// The largest `wal_segment_size` (1 TiB).
 pub const WAL_SEGMENT_MAX_SIZE: u64 = 1 << 40;
-/// Default `checkpoint_log_ratio`: a checkpoint starts once the WAL segments
-/// hold this fraction of the snapshot's size.
+/// Default `checkpoint_log_ratio`: a checkpoint starts once the log the
+/// snapshot does not cover (WAL segments and WAL) reaches this fraction of
+/// the snapshot's size.
 pub const CHECKPOINT_LOG_RATIO_DEFAULT: f64 = 0.5;
 /// Default `checkpoint_log_budget`: the most log (WAL segments and WAL) an
 /// automatic checkpoint waits for. The delta holding the log's commits takes
