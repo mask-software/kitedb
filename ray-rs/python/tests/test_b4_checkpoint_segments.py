@@ -135,3 +135,10 @@ def test_checkpoint_declined_error_is_exported_as_a_kite_error():
     # A background checkpoint that does not run, or stops, raises it, with
     # the reason (decision Q1 of the fresh review).
     assert issubclass(kitedb.CheckpointDeclinedError, KiteError)
+
+
+def test_writes_refused_error_is_exported_as_a_kite_error():
+    # A handle whose write panicked mid-way (memory and disk may disagree)
+    # refuses every write, close included, with it; a reopen recovers.
+    assert issubclass(kitedb.WritesRefusedError, KiteError)
+    assert "WritesRefusedError" in kitedb.__all__
