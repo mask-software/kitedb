@@ -23,7 +23,8 @@
 //!
 //! Environment: `KITE_MODEL_SEEDS` seeds (default 24) from
 //! `KITE_MODEL_FIRST_SEED` (default 0), `KITE_MODEL_STEPS` steps each
-//! (default 60), on `KITE_MODEL_THREADS` threads (default: the CPUs);
+//! (default 60), on `KITE_MODEL_THREADS` threads (default: the CPUs, at
+//! most four);
 //! `KITE_MODEL_SEED` runs that one seed; `KITE_MODEL_VERBOSE` prints each
 //! seed's progress, `KITE_MODEL_TRACE` each step as it runs, and a seed
 //! running past `KITE_MODEL_SEED_TIMEOUT` seconds (default 120) fails as
@@ -81,6 +82,17 @@ enum Write {
   Create(String, String),
   Update(String, String),
   Delete(String),
+}
+
+/// About the bytes of records `writes` make.
+fn write_bytes(writes: &[Write]) -> u64 {
+  writes
+    .iter()
+    .map(|write| match write {
+      Write::Create(key, value) | Write::Update(key, value) => key.len() + value.len() + 64,
+      Write::Delete(key) => key.len() + 64,
+    } as u64)
+    .sum()
 }
 
 fn apply_writes(state: &mut State, writes: &[Write]) {
@@ -455,6 +467,10 @@ struct Model {
   coverage: Coverage,
   /// Cuts made when the long transaction began.
   long_cuts: usize,
+  /// Writes refused for pinned segments before this step.
+  pinned_refusals_before: u64,
+  /// Bytes of records the step writes (about: its values).
+  step_bytes: u64,
 }
 
 type Outcome = std::result::Result<(), String>;
@@ -495,6 +511,8 @@ impl Model {
       log: Vec::new(),
       coverage: Coverage::new(),
       long_cuts: 0,
+      pinned_refusals_before: 0,
+      step_bytes: 0,
     }
   }
 
@@ -580,9 +598,19 @@ impl Model {
   /// Whether a failed commit's error is one the conditions allow.
   fn allowed_commit_error(&self, error: &KiteError) -> bool {
     match error {
-      // The log is full: the segment limit, pinned segments, or no
-      // automatic checkpoint.
-      KiteError::WalBufferFull => true,
+      // A writer fails at the segment limit only when no checkpoint can make
+      // room: without automatic checkpoints, with blocking ones (the writer
+      // fails, the checkpoint after it runs), with segments full of open
+      // transactions' records (counted), while checkpoints fail, or for
+      // records the limit barely holds.
+      KiteError::WalBufferFull => {
+        !self.config.auto_checkpoint
+          || !self.config.background
+          || self.faults_seen
+          || checkpoint_test_pinned_refusals(self.db()) > self.pinned_refusals_before
+          || self.step_bytes.saturating_mul(2)
+            >= self.db().wal_segment_limit(&self.db().header.read())
+      }
       KiteError::CheckpointFailed(_) => self.faults_seen,
       other => self.faults_seen && other.to_string().contains("injected"),
     }
@@ -622,6 +650,8 @@ impl Model {
 
   /// Run one step, chosen at random.
   fn step(&mut self) -> Outcome {
+    self.pinned_refusals_before = checkpoint_test_pinned_refusals(self.db());
+    self.step_bytes = 0;
     let crash_images = self.config.crash_images_apply() && self.rng.gen_bool(0.06);
     // A long transaction needs MVCC (another write transaction commits
     // beside it), and no blocking automatic checkpoint: one waits for every
@@ -653,6 +683,7 @@ impl Model {
       36..=40 => {
         let count = self.rng.gen_range(1..=60);
         let writes = self.writes(count, 2_000, true);
+        self.step_bytes = write_bytes(&writes);
         self.note(format!(
           "rolled back transaction of {} writes",
           writes.len()
@@ -678,7 +709,9 @@ impl Model {
         let db = Arc::clone(self.db());
         let (result, events, base) = self.recorded(crash_images, || db.background_checkpoint());
         match result {
-          Ok(()) | Err(KiteError::CheckpointDeclined(_)) => {}
+          Ok(()) => {}
+          // Only open transactions holding every segment make it decline.
+          Err(KiteError::CheckpointDeclined(_)) if self.long.is_some() => {}
           Err(error) if self.faults_seen => self.note(format!("  failed: {error}")),
           Err(error) => return Err(format!("a background checkpoint failed: {error}")),
         }
@@ -780,6 +813,7 @@ impl Model {
   }
 
   fn commit_step(&mut self, what: &str, writes: Vec<Write>, record: bool) -> Outcome {
+    self.step_bytes = write_bytes(&writes);
     self.note(format!("{what} of {} writes", writes.len()));
     let db = Arc::clone(self.db());
     let (result, events, base) = self.recorded(record, || commit_writes(&db, &writes));
@@ -827,6 +861,7 @@ impl Model {
           more.push(Write::Create(key, value));
         }
         self.note(format!("long transaction: {} writes", more.len()));
+        self.step_bytes = write_bytes(&writes) + write_bytes(&more);
         let (result, _) = self
           .long_thread
           .call(&db, LongRequest::Write(more.clone()), false);
@@ -847,6 +882,7 @@ impl Model {
       }
       6..=8 => {
         self.note(format!("long transaction: commit {} writes", writes.len()));
+        self.step_bytes = write_bytes(&writes);
         self.long = None;
         let record = crash_images && self.quiesce().is_ok();
         let base = record.then(|| std::fs::read(&self.path).expect("read the file"));
@@ -890,6 +926,7 @@ impl Model {
     let db = Arc::clone(self.db());
     if self.rng.gen_bool(0.5) {
       self.note(format!("long transaction: commit {} writes", writes.len()));
+      self.step_bytes = write_bytes(&writes);
       match self.long_thread.call(&db, LongRequest::Commit, false).0 {
         Ok(()) => {
           apply_writes(&mut self.state, &writes);
@@ -1155,7 +1192,8 @@ fn run_seeds(default_seeds: u64) {
     }
   };
   let cpus = std::thread::available_parallelism().map_or(4, |count| count.get()) as u64;
-  let threads = env_number("KITE_MODEL_THREADS", cpus).max(1) as usize;
+  // A few by default: the quick run shares the machine with the other tests.
+  let threads = env_number("KITE_MODEL_THREADS", cpus.min(4)).max(1) as usize;
   let timeout = Duration::from_secs(env_number("KITE_MODEL_SEED_TIMEOUT", 120));
   let verbose = std::env::var("KITE_MODEL_VERBOSE").is_ok();
 
