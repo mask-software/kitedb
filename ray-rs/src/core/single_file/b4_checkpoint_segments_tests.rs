@@ -1278,6 +1278,88 @@ fn a_writer_refused_for_a_failed_checkpoint_asks_for_another() {
   assert!(missing(&reopened, &acked).is_empty());
 }
 
+/// A transaction whose records spilled pins the segment it began in, and
+/// every later one, until a checkpoint covers its commit. Segments are kept
+/// whole, so the records written before it in that segment count against the
+/// segment limit too while it is open. The default extent is small next to
+/// the default limit, so a pin holds little of it: here a transaction that
+/// begins in a nearly full extent, and a checkpoint after, leave at most a
+/// quarter of the limit held. With extents half the limit, as the default
+/// was (eight WALs against sixteen), such a transaction held half the limit
+/// by itself, and writers beside it failed at random with `WalBufferFull`
+/// (`segments_full_of_pinned`; the fresh review's stress test, once F1 was
+/// fixed).
+#[test]
+fn an_open_transaction_pins_little_of_the_segment_limit() {
+  let dir = tempdir().expect("tempdir");
+  let path = dir.path().join("pinned-window.kitedb");
+  let opts = options()
+    .sync_mode(SyncMode::Normal)
+    .auto_checkpoint(false)
+    .mvcc(true);
+  let db = Arc::new(open_single_file(&path, opts).expect("open"));
+  let primary = 48 * 1024;
+  let limit = db.wal_segment_limit(&db.header.read());
+  let room = |db: &SingleFileDB| {
+    let header = db.header.read();
+    let page_size = header.page_size as u64;
+    header
+      .wal_segments
+      .entries
+      .last()
+      .map_or(0, |last| last.page_count * page_size - last.byte_len)
+  };
+  // Fill the newest extent until one more spill (the transaction's records
+  // with the commits before them) still fits, and no more.
+  let mut index = 0;
+  while !(wal_segment_test_stats(&db).live > 0 && room(&db) < 2 * primary) {
+    commit_key(&db, &key("before", index)).expect("commit");
+    index += 1;
+  }
+  // T: about 24 KiB of records, written to the WAL as it makes them; the
+  // next spill moves them into the newest extent, which T then pins.
+  let (go_tx, go_rx) = mpsc::channel::<()>();
+  let (wrote_tx, wrote_rx) = mpsc::channel::<()>();
+  let holder = {
+    let db = Arc::clone(&db);
+    std::thread::spawn(move || {
+      db.begin(false).expect("begin T");
+      for n in 0..80 {
+        db.create_node(Some(&key("t", n))).expect("T node");
+      }
+      wrote_tx.send(()).expect("T wrote");
+      go_rx.recv().expect("finish T");
+      db.rollback()
+    })
+  };
+  wrote_rx.recv().expect("T wrote");
+  let spills = db.wal_spills.load(Ordering::Acquire);
+  while db.wal_spills.load(Ordering::Acquire) == spills {
+    commit_key(&db, &key("before", index)).expect("commit");
+    index += 1;
+  }
+  let pinned = db.oldest_pinned_segment().expect("T's records spilled");
+
+  // A checkpoint covers the log; it keeps what T pins.
+  db.background_checkpoint().expect("checkpoint");
+  let held: u64 = db
+    .header
+    .read()
+    .wal_segments
+    .entries
+    .iter()
+    .filter(|segment| segment.seq >= pinned)
+    .map(|segment| segment.byte_len)
+    .sum();
+  go_tx.send(()).expect("finish T");
+  holder.join().expect("T thread").expect("T rollback");
+  assert!(
+    held <= limit / 4,
+    "one open transaction holds {held} bytes of WAL segments after a checkpoint, of a \
+     {limit}-byte limit: most were written before it, in the extent it began in"
+  );
+}
+
 /// Review finding R10: a successful checkpoint ends the checkpoint thread's
 /// back-off. Its run failed (the thread waits before the next, here a
 /// minute), and the caller's own checkpoint (`checkpoint`) then succeeded,
