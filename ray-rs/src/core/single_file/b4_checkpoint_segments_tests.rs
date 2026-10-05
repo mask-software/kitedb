@@ -2790,3 +2790,99 @@ fn writers_at_the_limit_without_background_checkpoints_fail_as_with_them() {
     assert!(missing(&reopened, &acked).is_empty(), "thread {thread}");
   }
 }
+
+/// N2, for transactions refused before their commit: with background
+/// checkpoints off, a transaction whose records outgrew what it keeps back
+/// writes them as it goes, so at the segment limit its write fails, and the
+/// application rolls it back. The automatic checkpoint after that rollback
+/// runs as after a refused commit, whatever the log's size: once a refused
+/// transaction rolled back, the next one finds room; and after a failed
+/// checkpoint, once its back-off is over and the cause is gone, writes
+/// recover without a checkpoint by hand.
+#[test]
+fn blocking_checkpoints_run_after_refused_transactions_roll_back() {
+  let dir = tempdir().expect("tempdir");
+  let path = dir.path().join("blocking-rollback.kitedb");
+  // The trigger far above the limit (a thousand times a first snapshot).
+  let opts = options()
+    .sync_mode(SyncMode::Normal)
+    .background_checkpoint(false)
+    .checkpoint_log_ratio(1000.0);
+  let db = open_single_file(&path, opts.clone()).expect("open");
+  super::super::checkpoint_thread::set_checkpoint_test_backoff(
+    &db,
+    Duration::from_millis(5),
+    Duration::from_millis(5),
+  );
+  commit_key(&db, "seed").expect("seed");
+  db.checkpoint().expect("seed checkpoint");
+  set_wal_segment_test_limit(&db, 64 * 1024);
+  // A transaction of 100 nodes (some 30 KiB of records, more than one keeps
+  // back), rolled back if a write fails.
+  let mut acked = Vec::new();
+  let next = std::cell::Cell::new(0);
+  let transaction = |db: &SingleFileDB, acked: &mut Vec<String>| -> Result<()> {
+    db.begin(false)?;
+    let keys: Vec<String> = (next.get()..next.get() + 100)
+      .map(|index| key("tx", index))
+      .collect();
+    next.set(next.get() + 100);
+    for key in &keys {
+      if let Err(error) = db.create_node(Some(key)) {
+        db.rollback().expect("rollback");
+        return Err(error);
+      }
+    }
+    db.commit()?;
+    acked.extend(keys);
+    Ok(())
+  };
+  let until_refused = |db: &SingleFileDB, acked: &mut Vec<String>| {
+    (0..200).find_map(|_| transaction(db, acked).err())
+  };
+
+  // Refused (no checkpoint failed), rolled back: the next one finds room.
+  let refused = until_refused(&db, &mut acked);
+  assert!(
+    matches!(refused, Some(KiteError::WalBufferFull)),
+    "setup: a transaction at the limit got {refused:?}"
+  );
+  let retried = transaction(&db, &mut acked);
+  assert!(
+    retried.is_ok(),
+    "after a refused transaction rolled back, the next one was refused too: {retried:?} (no \
+     automatic checkpoint ran after the rollback)"
+  );
+
+  // The automatic checkpoints fail; then the cause goes and the back-off
+  // ends: the transactions must recover.
+  set_checkpoint_test_db_fault(&db, CheckpointPhase::SnapshotWritten, true);
+  let _ = until_refused(&db, &mut acked);
+  let refused_again = until_refused(&db, &mut acked);
+  assert!(
+    db.checkpoint_error().is_some(),
+    "setup: no failed checkpoint recorded (refused with {refused_again:?})"
+  );
+  clear_checkpoint_test_db_faults(&db);
+  std::thread::sleep(Duration::from_millis(50));
+  let mut last = None;
+  for _ in 0..20 {
+    match transaction(&db, &mut acked) {
+      Ok(()) => {
+        last = None;
+        break;
+      }
+      Err(error) => last = Some(error),
+    }
+    std::thread::sleep(Duration::from_millis(10));
+  }
+  assert!(
+    last.is_none(),
+    "20 transactions over 200 ms after the failure's cause went all failed; the last: {last:?}; \
+     checkpoint_error: {:?}",
+    db.checkpoint_error()
+  );
+  close_single_file(db).expect("close");
+  let reopened = open_single_file(&path, opts).expect("reopen");
+  assert!(missing(&reopened, &acked).is_empty());
+}
