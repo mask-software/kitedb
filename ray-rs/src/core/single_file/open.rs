@@ -895,7 +895,9 @@ fn open_single_file_internal(
 
     // Read both independently checksummed header pages and select the newest
     // valid generation. A torn newest slot falls back to the other slot.
-    let (header, header_slot, fallback_header) = read_header_slots_with_fallback(&mut pager)?;
+    let slots = read_header_slots_with_fallback(&mut pager)?;
+    let (mut header, mut header_slot, mut fallback_header) =
+      (slots.header, slots.slot, slots.fallback);
 
     // Refuse a format this build cannot read, or (writable) cannot write,
     // before anything below rewrites the file.
@@ -908,6 +910,18 @@ fn open_single_file_internal(
       drop(pager);
       migrate_legacy_single_header(path, &options, lock_file)?;
       return open_single_file_internal(path, options, lock_file);
+    }
+
+    // A file in the older magic (`MAGIC_KITEDB_V1`, which releases up to
+    // v0.2.18 accept without checking the format version): rewrite both
+    // header slots in the current one now, before any other write, so they
+    // refuse the file from here on. Both slots then name the selected header:
+    // there is no older fallback.
+    if !options.read_only && !slots.in_current_magic {
+      install_recovered_header(&mut pager, &mut header, &mut header_slot)?;
+      install_recovered_header(&mut pager, &mut header, &mut header_slot)?;
+      header.magic = MAGIC_KITEDB;
+      fallback_header = None;
     }
 
     // The WAL size is fixed at creation. Only an explicitly requested size is
@@ -1521,9 +1535,8 @@ fn migrate_legacy_single_header(
     // Exact semantic-field audit. Layout fields (db/snapshot/WAL locations and
     // heads) intentionally belong to the fresh dual-header file, and so do the
     // format fields (version, min_reader_version, and the WAL salts): it is
-    // written in the current format. Generation and change counters advance
-    // once when checkpoint installs the snapshot.
-    header.magic = legacy_header.magic;
+    // written in the current format (and magic). Generation and change
+    // counters advance once when checkpoint installs the snapshot.
     header.page_size = legacy_header.page_size;
     header.flags = legacy_header.flags;
     header.change_counter = legacy_header.change_counter;
@@ -1657,6 +1670,18 @@ mod tests {
     path.with_file_name(format!("{file_name}.migrate-tmp"))
   }
 
+  /// `page`, a serialized header, in the magic legacy files have
+  /// (`MAGIC_KITEDB_V1`), its checksums made over it again.
+  fn with_v1_magic(mut page: Vec<u8>) -> Vec<u8> {
+    page[0..16].copy_from_slice(&MAGIC_KITEDB_V1);
+    let header_crc = crate::util::crc::crc32(&page[..176]);
+    page[176..180].copy_from_slice(&header_crc.to_le_bytes());
+    let footer = page.len() - 4;
+    let footer_crc = crate::util::crc::crc32(&page[..footer]);
+    page[footer..].copy_from_slice(&footer_crc.to_le_bytes());
+    page
+  }
+
   fn build_legacy_single_header_fixture(
     path: &Path,
   ) -> (
@@ -1737,7 +1762,7 @@ mod tests {
 
     let mut fixture = std::fs::File::create(path).expect("legacy fixture file");
     fixture
-      .write_all(&legacy_header.serialize_to_page())
+      .write_all(&with_v1_magic(legacy_header.serialize_to_page()))
       .expect("legacy header");
     fixture.write_all(&wal_bytes).expect("legacy WAL");
     fixture.write_all(&snapshot_bytes).expect("legacy snapshot");
@@ -1921,8 +1946,18 @@ mod tests {
     let db_path = temp_dir.path().join("legacy.kitedb");
     let (options, node_id, label_id, propkey_id, legacy_header) =
       build_legacy_single_header_fixture(&db_path);
+    assert_eq!(
+      std::fs::read(&db_path).expect("read")[0..16],
+      MAGIC_KITEDB_V1,
+      "setup: the legacy file is not in v0.2.18's magic"
+    );
 
     let migrated = open_single_file(&db_path, options.clone()).expect("automatic migration");
+    // Both header slots in the current magic: v0.2.18 refuses the file now.
+    let bytes = std::fs::read(&db_path).expect("read");
+    let page_size = migrated.header.read().page_size as usize;
+    assert_eq!(bytes[0..16], MAGIC_KITEDB);
+    assert_eq!(bytes[page_size..page_size + 16], MAGIC_KITEDB);
     assert_eq!(migrated.node_by_key("legacy-node"), Some(node_id));
     assert_eq!(
       migrated.node_prop(node_id, propkey_id),

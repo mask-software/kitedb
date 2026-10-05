@@ -39,11 +39,20 @@ pub const WAL_RECORD_ALIGNMENT: usize = 8;
 // Single-file format constants
 // ============================================================================
 
-/// Magic bytes for single-file format: "KiteDB format 1\0" (16 bytes)
-pub const MAGIC_KITEDB: [u8; 16] = [
-  0x4b, 0x69, 0x74, 0x65, 0x44, 0x42, 0x20, 0x66, // "KiteDB f"
-  0x6f, 0x72, 0x6d, 0x61, 0x74, 0x20, 0x31, 0x00, // "ormat 1\0"
-];
+/// Magic bytes every header this build writes: "KiteDB format 2\0" (16
+/// bytes). Released versions up to v0.2.18 check a header only by its magic
+/// and the checksum of its first 176 bytes, read only the first header page,
+/// and check no format version: a file in their magic, but in the format
+/// since (two header slots, salted WAL records, WAL segments), they would
+/// misread. They refuse this magic (`InvalidMagic`). The format version
+/// fields tell what a file needs from here on.
+pub const MAGIC_KITEDB: [u8; 16] = *b"KiteDB format 2\0";
+
+/// The magic of v0.2.18 and earlier, and of files unreleased builds wrote
+/// before `MAGIC_KITEDB` (dual-header files of format versions 1 and 2):
+/// still read; a writable open rewrites both header slots in the current
+/// magic before anything else.
+pub const MAGIC_KITEDB_V1: [u8; 16] = *b"KiteDB format 1\0";
 
 /// Single-file format version: the newest this build reads and writes.
 ///

@@ -734,7 +734,9 @@ pub struct EdgeVersionData {
 /// Database header for single-file format (4KB)
 #[derive(Debug, Clone)]
 pub struct DbHeaderV1 {
-  pub magic: [u8; 16], // "KiteDB format 1\0"
+  /// The magic the header was read with (`MAGIC_KITEDB`, or the older
+  /// `MAGIC_KITEDB_V1`); headers are always written with `MAGIC_KITEDB`.
+  pub magic: [u8; 16],
   pub page_size: u32,
   pub version: u32,
   pub min_reader_version: u32,

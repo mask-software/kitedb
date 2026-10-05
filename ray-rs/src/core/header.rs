@@ -41,8 +41,9 @@ impl DbHeaderV1 {
       ));
     }
 
-    // Verify magic before interpreting any header state.
-    if data[0..16] != MAGIC_KITEDB {
+    // Verify magic before interpreting any header state: the current one,
+    // or the one before it (see `MAGIC_KITEDB_V1`).
+    if data[0..16] != MAGIC_KITEDB && data[0..16] != MAGIC_KITEDB_V1 {
       let expected = u32::from_le_bytes([
         MAGIC_KITEDB[0],
         MAGIC_KITEDB[1],
@@ -204,7 +205,9 @@ impl DbHeaderV1 {
     let buf = buf.as_mut_slice();
 
     let (version, min_reader_version) = self.written_versions();
-    buf[0..16].copy_from_slice(&self.magic);
+    // Always the current magic: a header read in the older one is upgraded
+    // by the first write (see `MAGIC_KITEDB`).
+    buf[0..16].copy_from_slice(&MAGIC_KITEDB);
     write_u32(buf, 16, self.page_size);
     write_u32(buf, 20, version);
     write_u32(buf, 24, min_reader_version);
@@ -357,19 +360,34 @@ fn write_wal_segment_table(buf: &mut [u8], table: &WalSegmentTable) -> usize {
 /// Read both physical header pages and return the newest valid generation.
 /// A torn or partially written inactive page is ignored.
 pub(crate) fn read_header_slots(pager: &mut FilePager) -> Result<(DbHeaderV1, u32)> {
-  read_header_slots_with_fallback(pager).map(|(header, slot, _)| (header, slot))
+  read_header_slots_with_fallback(pager).map(|slots| (slots.header, slots.slot))
 }
 
-/// `read_header_slots`, and the other slot's header if it is valid too: the
-/// one a crash falls back to should the selected slot be lost.
-pub(crate) fn read_header_slots_with_fallback(
-  pager: &mut FilePager,
-) -> Result<(DbHeaderV1, u32, Option<DbHeaderV1>)> {
+/// The header pages as open finds them (see `read_header_slots_with_fallback`).
+pub(crate) struct HeaderSlots {
+  /// The newest valid header, and its slot.
+  pub(crate) header: DbHeaderV1,
+  pub(crate) slot: u32,
+  /// The other slot's header, if it is valid: what a crash could fall back
+  /// to.
+  pub(crate) fallback: Option<DbHeaderV1>,
+  /// Both pages begin with the current magic (`MAGIC_KITEDB`), valid or
+  /// not. A page in the older magic, even one this version cannot use, may
+  /// pass the check of a release that knows only that magic.
+  pub(crate) in_current_magic: bool,
+}
+
+/// Read both independently checksummed header pages and select the newest
+/// valid generation: a torn newest slot falls back to the other slot.
+pub(crate) fn read_header_slots_with_fallback(pager: &mut FilePager) -> Result<HeaderSlots> {
   let mut valid = Vec::with_capacity(2);
   let mut errors = Vec::with_capacity(2);
+  let mut in_current_magic = true;
 
   for slot in [HEADER_SLOT_A, HEADER_SLOT_B] {
-    match DbHeaderV1::parse(&pager.read_page(slot)?) {
+    let page = pager.read_page(slot)?;
+    in_current_magic &= page.get(0..16) == Some(&MAGIC_KITEDB[..]);
+    match DbHeaderV1::parse(&page) {
       Ok(header) if header.page_size as usize == pager.page_size() => {
         valid.push((header, slot));
       }
@@ -389,7 +407,12 @@ pub(crate) fn read_header_slots_with_fallback(
       errors.join("; ")
     )));
   };
-  Ok((header, slot, valid.pop().map(|(fallback, _)| fallback)))
+  Ok(HeaderSlots {
+    header,
+    slot,
+    fallback: valid.pop().map(|(fallback, _)| fallback),
+    in_current_magic,
+  })
 }
 
 /// Write one complete header page. The caller must sync before treating the
