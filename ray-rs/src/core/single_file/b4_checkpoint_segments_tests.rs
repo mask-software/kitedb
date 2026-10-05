@@ -1097,6 +1097,90 @@ fn snapshot_generation_on_disk(path: &std::path::Path) -> u64 {
     .active_snapshot_gen
 }
 
+/// A database whose checkpoint thread's run is held at
+/// `CheckpointPhase::SnapshotDurable` (`hold_the_checkpoint_threads_run`).
+struct HeldThreadRun {
+  db: SingleFileDB,
+  /// Lets the run go on.
+  held: Arc<Barrier>,
+  /// Whether the run was held there (else `held` is disarmed).
+  parked: bool,
+  /// The snapshot generation at open.
+  generation: u64,
+  /// The commits acknowledged.
+  acked: Vec<String>,
+}
+
+/// Open the database at `path`, and hold its checkpoint thread's first run
+/// at `CheckpointPhase::SnapshotDurable` while a writer commits keys past
+/// several spills (`close` names the case in messages).
+fn hold_the_checkpoint_threads_run(path: &std::path::Path, close: bool) -> HeldThreadRun {
+  let db = open_single_file(path, options().sync_mode(SyncMode::Normal)).expect("open");
+  watch_checkpoint_phases(&db);
+  let generation = db.header.read().active_snapshot_gen;
+  let held = Arc::new(Barrier::new(2));
+  set_checkpoint_test_barrier(&db, CheckpointPhase::SnapshotDurable, Arc::clone(&held));
+  let db = Arc::new(db);
+  let writer = {
+    let db = Arc::clone(&db);
+    std::thread::spawn(move || commit_keys(&db, "key", 0, 1_500))
+  };
+  let deadline = Instant::now() + Duration::from_secs(20);
+  let parked = wait_for("a held checkpoint", deadline, || {
+    checkpoint_test_reached(&db)
+      .iter()
+      .any(|(phase, thread, parked)| {
+        *phase == CheckpointPhase::SnapshotDurable
+          && *parked
+          && thread.as_deref() == Some(CHECKPOINT_THREAD_NAME)
+      })
+  });
+  if !parked {
+    disarm_checkpoint_test_barrier(&db, CheckpointPhase::SnapshotDurable);
+  }
+  let acked = writer.join().expect("writer");
+  assert!(
+    checkpoint_thread_running(&db),
+    "close={close}: a writable database ran no checkpoint thread"
+  );
+  HeldThreadRun {
+    db: Arc::into_inner(db).expect("sole owner"),
+    held,
+    parked,
+    generation,
+    acked,
+  }
+}
+
+/// Close `db` (with `close`) or drop it, on a thread of its own; returns
+/// the thread, and a receiver told when it finished.
+fn close_on_a_thread(
+  db: SingleFileDB,
+  close: bool,
+) -> (std::thread::JoinHandle<Result<()>>, mpsc::Receiver<()>) {
+  let (closed, closing) = mpsc::channel();
+  let closer = std::thread::spawn(move || {
+    let result = if close {
+      close_single_file(db)
+    } else {
+      drop(db);
+      Ok(())
+    };
+    let _ = closed.send(());
+    result
+  });
+  (closer, closing)
+}
+
+/// The phases the checkpoint thread reached on the database at `path`.
+fn reached_on_the_checkpoint_thread(path: &std::path::Path) -> Vec<CheckpointPhase> {
+  checkpoint_test_reached_at(path)
+    .into_iter()
+    .filter(|(_, thread, _)| thread.as_deref() == Some(CHECKPOINT_THREAD_NAME))
+    .map(|(phase, _, _)| phase)
+    .collect()
+}
+
 /// S6. A writable database runs one checkpoint thread, started by its first
 /// automatic checkpoint (a read-only one none). Closing it, or dropping it,
 /// while that thread builds a snapshot abandons the build (no header names
@@ -1178,6 +1262,105 @@ fn close_and_drop_abandon_an_inflight_checkpoint() {
       !checkpoint_thread_running(&read_only),
       "a read-only database runs a checkpoint thread"
     );
+  }
+}
+
+/// The other order of S6: the checkpoint thread's run is let go before
+/// closing (or dropping) begins, passes its last progress point, and is in
+/// its install (its first header slot written) when the close asks the
+/// thread to stop. The install finishes, once, while the close waits for
+/// it; the close then joins the thread and does its own work, and no commit
+/// is lost or applied twice. (What Linux CI ran into in the S6 test.)
+#[test]
+fn a_run_in_its_install_when_closing_begins_finishes_it() {
+  for close in [true, false] {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("install-while-closing.kitedb");
+    let HeldThreadRun {
+      db,
+      held,
+      parked,
+      generation,
+      acked,
+    } = hold_the_checkpoint_threads_run(&path, close);
+    // Let the run go on, before any close, into its install: held again
+    // once its first header slot is written.
+    let installing = Arc::new(Barrier::new(2));
+    let mut in_install = false;
+    if parked {
+      set_checkpoint_test_barrier(&db, CheckpointPhase::HeaderWritten, Arc::clone(&installing));
+      held.wait();
+      let deadline = Instant::now() + Duration::from_secs(20);
+      in_install = wait_for("the run in its install", deadline, || {
+        checkpoint_test_reached(&db)
+          .iter()
+          .any(|(phase, thread, parked)| {
+            *phase == CheckpointPhase::HeaderWritten
+              && *parked
+              && thread.as_deref() == Some(CHECKPOINT_THREAD_NAME)
+          })
+      });
+      if !in_install {
+        disarm_checkpoint_test_barrier(&db, CheckpointPhase::HeaderWritten);
+      }
+    }
+    let stop_requested = Arc::new(Barrier::new(2));
+    if in_install {
+      set_checkpoint_test_barrier(
+        &db,
+        CheckpointPhase::StopRequested,
+        Arc::clone(&stop_requested),
+      );
+    }
+    let (closer, closing) = close_on_a_thread(db, close);
+    if in_install {
+      // The close has asked the thread to stop: the install goes on.
+      stop_requested.wait();
+      installing.wait();
+    }
+    let finished = closing.recv_timeout(Duration::from_secs(20));
+    let closed = closer.join().expect("closer");
+    assert!(parked, "close={close}: no checkpoint was held");
+    assert!(in_install, "close={close}: the run never began its install");
+    assert!(finished.is_ok(), "close={close}: did not finish");
+    closed.unwrap_or_else(|error| panic!("close={close}: the close failed: {error}"));
+    // The run installed once, to its last step (the tail truncation).
+    let on_the_thread = reached_on_the_checkpoint_thread(&path);
+    let count = |phase| on_the_thread.iter().filter(|&&p| p == phase).count();
+    assert_eq!(
+      (
+        count(CheckpointPhase::HeaderWritten),
+        count(CheckpointPhase::HeaderDurable),
+        count(CheckpointPhase::TailTruncate),
+      ),
+      (1, 1, 1),
+      "close={close}: the run's install did not finish once: {on_the_thread:?}"
+    );
+    let on_disk = snapshot_generation_on_disk(&path);
+    if close {
+      // The close's own checkpoint (of the segments past the run's cut)
+      // comes after the run's install.
+      assert!(on_disk > generation, "close={close}: the install was lost");
+    } else {
+      // Dropping checkpoints nothing: the run's install is the one.
+      assert_eq!(on_disk, generation + 1, "close={close}");
+    }
+    let reopened = open_single_file(&path, options()).expect("reopen");
+    assert!(missing(&reopened, &acked).is_empty(), "close={close}");
+    assert_eq!(
+      reopened.count_nodes(),
+      acked.len(),
+      "close={close}: the reopened database holds other nodes than the commits'"
+    );
+    let check = reopened.check();
+    assert!(check.valid, "close={close}: {:?}", check.errors);
+    if close {
+      assert_eq!(
+        wal_segment_test_stats(&reopened).live,
+        0,
+        "close={close}: a clean close left WAL segments"
+      );
+    }
   }
 }
 

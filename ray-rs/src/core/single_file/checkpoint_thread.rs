@@ -35,6 +35,7 @@ use parking_lot::{Condvar, Mutex};
 
 use crate::error::KiteError;
 
+use super::checkpoint::{checkpoint_phase, CheckpointPhase};
 use super::SingleFileDB;
 
 /// The name the checkpoint thread runs under.
@@ -238,6 +239,8 @@ impl SingleFileDB {
       requests.stop = true;
       thread.signal.wake.notify_all();
     }
+    // Only the test hook: this is not a checkpoint's progress point.
+    let _ = checkpoint_phase(&self.path, CheckpointPhase::StopRequested);
     if thread.handle.join().is_err() {
       eprintln!("Warning: the checkpoint thread panicked");
     }

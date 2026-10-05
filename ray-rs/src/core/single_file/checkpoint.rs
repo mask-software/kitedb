@@ -86,6 +86,10 @@ pub(super) enum CheckpointPhase {
   SpillDecided,
   /// A background checkpoint found another running (a test hook only).
   FoundRunning,
+  /// Closing (or dropping) the database asked its checkpoint thread to stop,
+  /// so a run still building its snapshot abandons it at its next progress
+  /// point; the close waits for the thread next (a test hook only).
+  StopRequested,
 }
 
 /// A barrier armed for one phase of checkpoints on the database at a path.
