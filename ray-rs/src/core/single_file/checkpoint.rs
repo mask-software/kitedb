@@ -3903,25 +3903,27 @@ mod tests {
     }
   }
 
-  /// While a background checkpoint runs, writes go to the secondary WAL
-  /// region. If that region fills before the checkpoint finishes (e.g. the
-  /// checkpoint thread is starved of CPU), writers must wait for the
-  /// checkpoint instead of failing. Regression: they got `WalBufferFull`
-  /// immediately, so concurrent writers under load still filled the WAL.
+  /// While a background checkpoint runs (here an application's, held after
+  /// its cut), writers go on: their WAL spills into segments. Once the
+  /// segments reach their limit, writers wait for a checkpoint to free
+  /// space instead of failing. (Rewritten with the fresh review: it was about
+  /// the secondary WAL region, which segments replaced, and with automatic
+  /// checkpoints off no writer ever waited.)
   #[test]
-  fn writers_wait_for_a_running_background_checkpoint_when_the_secondary_region_fills() {
+  fn writers_wait_for_a_running_background_checkpoint_at_the_segment_limit() {
     let _serial = checkpoint_test_serial();
     let temp_dir = tempdir().expect("temp dir");
     let db_path = temp_dir.path().join("checkpoint-backpressure.kitedb");
-    // 64 KB WAL: the secondary region is 16 KB, far less than the writer needs.
     let options = SingleFileOpenOptions::new()
       .wal_size(64 * 1024)
-      .auto_checkpoint(false)
       .sync_mode(crate::core::single_file::SyncMode::Normal);
     let db = Arc::new(open_single_file(&db_path, options.clone()).expect("open"));
+    // Two WALs and a bit: the writer below writes ten times that.
+    set_wal_segment_test_limit(&db, 128 * 1024);
     commit_node(&db, "before-checkpoint");
 
     const COMMITS: usize = 600;
+    let value = "x".repeat(1000);
     let (go_tx, go_rx) = mpsc::channel::<()>();
     let writer_db = Arc::clone(&db);
     let writer = std::thread::spawn(move || -> std::result::Result<(), String> {
@@ -3931,7 +3933,7 @@ mod tests {
           .begin(false)
           .map_err(|error| format!("begin #{index}: {error}"))?;
         writer_db
-          .create_node(Some(&format!("during-{index}")))
+          .create_node(Some(&format!("during-{index}-{value}")))
           .map_err(|error| format!("create_node #{index}: {error}"))?;
         writer_db
           .commit()
@@ -3940,16 +3942,21 @@ mod tests {
       Ok(())
     });
 
-    background_checkpoint_with_post_cut(&db, None, move |_db| {
-      // The checkpoint is parked after its cut. Start overflowing the
-      // secondary region, then keep the checkpoint parked long enough for a
-      // writer that doesn't wait to hit the full region and fail.
+    let mut waited = false;
+    background_checkpoint_with_post_cut(&db, None, |db| {
+      // The checkpoint is held after its cut: the writer fills the segments
+      // to their limit and waits.
       go_tx.send(()).expect("start writer");
-      std::thread::sleep(std::time::Duration::from_millis(500));
+      let deadline = std::time::Instant::now() + Duration::from_secs(10);
+      while writers_waiting_for_segments(db) == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+      }
+      waited = writers_waiting_for_segments(db) > 0;
     })
     .expect("background checkpoint");
 
     let outcome = writer.join().expect("writer thread");
+    assert!(waited, "the writer never waited at the segment limit");
     assert_eq!(
       outcome,
       Ok(()),
@@ -3960,10 +3967,11 @@ mod tests {
     drop(db);
     let reopened = open_single_file(&db_path, options).expect("reopen");
     assert!(reopened.node_by_key("before-checkpoint").is_some());
-    assert!(reopened.node_by_key("during-0").is_some());
-    assert!(reopened
-      .node_by_key(&format!("during-{}", COMMITS - 1))
-      .is_some());
+    for index in [0, COMMITS - 1] {
+      assert!(reopened
+        .node_by_key(&format!("during-{index}-{}", "x".repeat(1000)))
+        .is_some());
+    }
   }
 
   /// Build a database whose small snapshot sits at the end of the file, so
