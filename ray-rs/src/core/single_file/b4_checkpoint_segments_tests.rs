@@ -78,45 +78,95 @@ fn apply(image: &mut Vec<u8>, offset: u64, data: &[u8]) {
 }
 
 /// How a crash image models the disk after a crash (see `crash_image`).
+/// Every model but `InOrder` is an OS crash: the writes before the last
+/// successful sync landed, and those after it as the model says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CrashModel {
   /// Every write so far landed, in order: a process crash (the OS writes
   /// back everything it took), or an OS crash that wrote back everything.
   InOrder,
-  /// The writes before the last successful sync landed, and after it only
-  /// the header pages': an OS crash that wrote back the headers early.
+  /// After the last sync, only the header pages' writes landed: the OS
+  /// wrote back the headers early.
   HeadersAhead,
-  /// The writes before the last successful sync landed, and after it all
-  /// but the header pages': an OS crash that wrote back the data early.
+  /// After the last sync, all but the header pages' writes landed: the OS
+  /// wrote back the data early.
   DataAhead,
   /// Every write landed, but the last, a header write, only in part: its
-  /// slot is torn (its checksum fails).
+  /// slot is torn (its checksum fails; see `Lands::Torn`).
   TornHeader,
+  /// After the last sync, the data writes landed; of the header writes, the
+  /// newest is torn and every other is lost. Both slots are back where the
+  /// last sync left them (one torn): a header that was written but not made
+  /// durable is no fallback.
+  OlderHeaders,
+  /// After the last sync, each write landed or was lost, independently, as
+  /// the seed picks, and the newest header write may have torn instead (at
+  /// most one page tears in a crash: the one being written).
+  Independent(u64),
 }
 
 impl CrashModel {
-  pub(super) const ALL: [CrashModel; 4] = [
+  /// The models with no parameter.
+  pub(super) const FIXED: [CrashModel; 5] = [
     CrashModel::InOrder,
     CrashModel::HeadersAhead,
     CrashModel::DataAhead,
     CrashModel::TornHeader,
+    CrashModel::OlderHeaders,
   ];
 
-  /// Whether a database in `sync_mode` holds its acknowledged commits
-  /// through such a crash: every mode that writes commits through a process
-  /// crash (in order), only `Full` through the OS crashes.
+  /// Whether the model applies to a database in `sync_mode`: `InOrder` to
+  /// every mode that writes commits through a process crash, the OS crashes
+  /// to `Full` and `Normal` (which keeps, through an OS crash, what its last
+  /// sync made durable; see `durable_bound`).
   pub(super) fn fits(self, sync_mode: SyncMode) -> bool {
-    match self {
-      CrashModel::InOrder => sync_mode != SyncMode::Off,
-      _ => sync_mode == SyncMode::Full,
-    }
+    sync_mode != SyncMode::Off
   }
+
+  /// Which commits must survive a crash after the first `cut` of `events`
+  /// (recorded from a file holding acknowledged commits) in `sync_mode`:
+  /// `Some(bound)`, those acknowledged before the recording and those
+  /// acknowledged by event `bound`; `None`, none. After a process crash, or
+  /// in `Full` mode (a commit returns once its records are synced), every
+  /// one acknowledged by the cut. In `Normal` mode after an OS crash, those
+  /// acknowledged before its last successful sync, if any (a commit returns
+  /// before its records are synced: the file it started from may not be
+  /// durable either).
+  pub(super) fn durable_bound(
+    self,
+    sync_mode: SyncMode,
+    events: &[IoEvent],
+    cut: usize,
+  ) -> Option<usize> {
+    if self == CrashModel::InOrder || sync_mode == SyncMode::Full {
+      return Some(cut);
+    }
+    events[..cut]
+      .iter()
+      .rposition(|event| matches!(event, IoEvent::Sync { ok: true }))
+      .map(|sync| sync + 1)
+  }
+}
+
+/// How a write after the last sync lands in a crash image.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lands {
+  Whole,
+  Lost,
+  /// Only in part: a header page's first 64 bytes (its change counter
+  /// among them, so its slot's checksum fails), a data write's first half.
+  /// (A header page torn after its fixed fields can still be valid: its
+  /// footer checksum covers the segment table, and the fixed fields' own
+  /// checksum makes them drop out of it, so a tear that keeps the old table
+  /// is a whole old or new header.)
+  Torn,
 }
 
 /// The disk after a crash once the first `cut` of `events` (recorded from
 /// `base`) happened, as `model` has it; the header pages are the bytes
 /// below `header_end`. `None` for a torn header slot unless the last of
-/// them is a header write.
+/// them is a header write, and for `OlderHeaders` unless a header write
+/// follows the last sync.
 pub(super) fn crash_image(
   base: &[u8],
   events: &[IoEvent],
@@ -125,58 +175,91 @@ pub(super) fn crash_image(
   model: CrashModel,
 ) -> Option<Vec<u8>> {
   let prefix = &events[..cut];
-  let last_sync = prefix
+  let durable = prefix
     .iter()
-    .rposition(|event| matches!(event, IoEvent::Sync { ok: true }));
-  let torn = match (model, prefix.last()) {
-    (CrashModel::TornHeader, Some(IoEvent::Write { offset, .. })) if *offset < header_end => {
-      Some(cut - 1)
-    }
-    (CrashModel::TornHeader, _) => return None,
-    _ => None,
+    .rposition(|event| matches!(event, IoEvent::Sync { ok: true }))
+    .map_or(0, |sync| sync + 1);
+  let is_header =
+    |event: &IoEvent| matches!(event, IoEvent::Write { offset, .. } if *offset < header_end);
+  let newest_header = prefix
+    .iter()
+    .rposition(is_header)
+    .filter(|&index| index >= durable);
+  let mut random = match model {
+    CrashModel::Independent(seed) => seed | 1,
+    _ => 1,
   };
+  let mut next_random = move || {
+    random ^= random << 13;
+    random ^= random >> 7;
+    random ^= random << 17;
+    random
+  };
+  let lands = |index: usize, header: bool, next_random: &mut dyn FnMut() -> u64| -> Lands {
+    if index < durable {
+      return Lands::Whole;
+    }
+    match model {
+      CrashModel::InOrder => Lands::Whole,
+      CrashModel::TornHeader if index + 1 == cut => Lands::Torn,
+      CrashModel::TornHeader => Lands::Whole,
+      CrashModel::HeadersAhead if header => Lands::Whole,
+      CrashModel::DataAhead if !header => Lands::Whole,
+      CrashModel::HeadersAhead | CrashModel::DataAhead => Lands::Lost,
+      CrashModel::OlderHeaders if !header => Lands::Whole,
+      CrashModel::OlderHeaders if Some(index) == newest_header => Lands::Torn,
+      CrashModel::OlderHeaders => Lands::Lost,
+      CrashModel::Independent(_) => match next_random() % 8 {
+        0..=2 => Lands::Lost,
+        3 if Some(index) == newest_header => Lands::Torn,
+        _ => Lands::Whole,
+      },
+    }
+  };
+  match model {
+    CrashModel::TornHeader if !prefix.last().is_some_and(is_header) => return None,
+    CrashModel::OlderHeaders if newest_header.is_none() => return None,
+    _ => {}
+  }
   let mut image = base.to_vec();
   for (index, event) in prefix.iter().enumerate() {
     let IoEvent::Write { offset, data } = event else {
       continue;
     };
-    let durable = last_sync.is_some_and(|sync| index < sync);
     let header = *offset < header_end;
-    let lands = match model {
-      CrashModel::InOrder | CrashModel::TornHeader => true,
-      CrashModel::HeadersAhead => durable || header,
-      CrashModel::DataAhead => durable || !header,
-    };
-    if !lands {
-      continue;
+    match lands(index, header, &mut next_random) {
+      Lands::Whole => apply(&mut image, *offset, data),
+      Lands::Torn if header => apply(&mut image, *offset, &data[..64.min(data.len())]),
+      Lands::Torn => apply(&mut image, *offset, &data[..data.len() / 2]),
+      Lands::Lost => {}
     }
-    let data = if Some(index) == torn {
-      &data[..data.len() / 2]
-    } else {
-      &data[..]
-    };
-    apply(&mut image, *offset, data);
   }
   Some(image)
 }
 
-/// Every crash image of `events` (see `crash_image`) that `sync_mode`
-/// holds acknowledged commits through: each point, each model that fits.
-/// Each with the number of events before it, and a name.
+/// Every crash image of `events` (see `crash_image`) for `sync_mode`: each
+/// point, each fixed model, and `independent` seeds of `Independent`. Each
+/// with the bound of the commits it must hold (see
+/// `CrashModel::durable_bound`) and a name.
 pub(super) fn crash_images(
   base: &[u8],
   events: &[IoEvent],
   header_end: u64,
   sync_mode: SyncMode,
-) -> Vec<(usize, String, Vec<u8>)> {
+  independent: u64,
+) -> Vec<(Option<usize>, String, Vec<u8>)> {
   let mut images = Vec::new();
   for cut in 0..=events.len() {
-    for model in CrashModel::ALL {
+    let models = CrashModel::FIXED
+      .into_iter()
+      .chain((0..independent).map(|seed| CrashModel::Independent(seed * 1_000_003 + cut as u64)));
+    for model in models {
       if !model.fits(sync_mode) {
         continue;
       }
       if let Some(image) = crash_image(base, events, header_end, cut, model) {
-        images.push((cut, format!("crash after {cut} events, {model:?}"), image));
+        let bound = model.durable_bound(sync_mode, events, cut);
+        images.push((bound, format!("crash after {cut} events, {model:?}"), image));
       }
     }
   }
@@ -184,11 +267,14 @@ pub(super) fn crash_images(
 }
 
 /// S1. A spill copies the WAL's records into a segment, syncs it, and
-/// installs a header naming it with an empty WAL in both slots. A crash at
-/// any write or sync of the commits around it keeps every acknowledged
-/// commit: in `Full` mode whatever an OS crash leaves (in order, the header
-/// pages ahead of the rest or behind it, a torn header slot), in `Normal`
-/// mode what a process crash leaves (in order).
+/// installs a header naming it with an empty WAL in both slots, each slot
+/// synced before the WAL takes new records. A crash at any write or sync of
+/// the commits around it keeps every commit it must: after a process crash
+/// (every write landed, in order) every acknowledged one; after an OS crash
+/// (the writes after the last sync landing, lost or torn in the models of
+/// `CrashModel`, among them both header slots back where that sync left
+/// them) every acknowledged one in `Full` mode, and in `Normal` mode every
+/// one acknowledged before that sync.
 #[test]
 fn spill_survives_a_crash_at_every_io_event() {
   for sync_mode in [SyncMode::Full, SyncMode::Normal] {
@@ -230,8 +316,8 @@ fn spill_survives_a_crash_at_every_io_event_in(sync_mode: SyncMode) {
      checkpoints instead"
   );
 
-  let images = crash_images(&base, &events, header_end, sync_mode);
-  for model in CrashModel::ALL
+  let images = crash_images(&base, &events, header_end, sync_mode, 4);
+  for model in CrashModel::FIXED
     .into_iter()
     .filter(|model| model.fits(sync_mode))
   {
@@ -243,26 +329,39 @@ fn spill_survives_a_crash_at_every_io_event_in(sync_mode: SyncMode) {
     );
   }
   let image_path = dir.path().join("spill-crash-image.kitedb");
-  for (cut, what, image) in images {
+  for (durable_bound, what, image) in images {
     std::fs::write(&image_path, &image).expect("write image");
     let crashed = open_single_file(&image_path, options.clone())
       .unwrap_or_else(|error| panic!("{sync_mode:?}, {what}: unopenable: {error:?}"));
-    let acked_by_now: Vec<String> = acked
+    let must_hold: Vec<String> = match durable_bound {
+      None => Vec::new(),
+      Some(durable_bound) => acked
+        .iter()
+        .cloned()
+        .chain(
+          tail
+            .iter()
+            .zip(&bounds)
+            .filter(|(_, bound)| **bound <= durable_bound)
+            .map(|(key, _)| key.clone()),
+        )
+        .collect(),
+    };
+    // The commits there are a prefix of the commit order.
+    let present: Vec<bool> = acked
       .iter()
-      .cloned()
-      .chain(
-        tail
-          .iter()
-          .zip(&bounds)
-          .filter(|(_, bound)| **bound <= cut)
-          .map(|(key, _)| key.clone()),
-      )
+      .chain(&tail)
+      .map(|key| crashed.node_by_key(key).is_some())
       .collect();
-    let lost = missing(&crashed, &acked_by_now).len();
+    let lost = missing(&crashed, &must_hold).len();
     close_single_file(crashed).expect("close");
     assert_eq!(
       lost, 0,
-      "{sync_mode:?}, {what}: lost {lost} acknowledged commits"
+      "{sync_mode:?}, {what}: lost {lost} commits it must hold"
+    );
+    assert!(
+      present.windows(2).all(|pair| pair[0] || !pair[1]),
+      "{sync_mode:?}, {what}: the commits there are not a prefix of the commit order: {present:?}"
     );
     std::fs::remove_file(&image_path).expect("remove image");
   }

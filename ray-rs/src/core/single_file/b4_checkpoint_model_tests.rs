@@ -1048,20 +1048,30 @@ impl Model {
         .db
         .as_ref()
         .map_or(4096, |db| db.header.read().page_size as u64);
-    // The crash models the sync mode holds commits through (in `Normal`
-    // mode only a process crash's: every write landed, in order), at every
-    // point: the end of the step, and four more at random.
-    let models: Vec<CrashModel> = CrashModel::ALL
+    // Every crash model, at the end of the step, and six more images at
+    // random points (some with writes after the last sync landing
+    // independently). OS crashes only in `Full` mode: `Normal` keeps, through
+    // one, only what a sync made durable, and the model tracks no syncs
+    // outside the recorded step.
+    let full = self.config.sync == SyncMode::Full;
+    let mut models: Vec<CrashModel> = CrashModel::FIXED
       .into_iter()
-      .filter(|model| model.fits(self.config.sync))
+      .filter(|model| full || *model == CrashModel::InOrder)
       .collect();
     let mut chosen: Vec<(usize, CrashModel)> =
       models.iter().map(|&model| (events.len(), model)).collect();
-    for _ in 0..4 {
-      let cut = self.rng.gen_range(0..=events.len());
-      chosen.push((cut, models[self.rng.gen_range(0..models.len())]));
+    if full {
+      models.push(CrashModel::Independent(0));
     }
-    chosen.sort_unstable_by_key(|(cut, model)| (*cut, *model as u8));
+    for _ in 0..6 {
+      let cut = self.rng.gen_range(0..=events.len());
+      let model = match models[self.rng.gen_range(0..models.len())] {
+        CrashModel::Independent(_) => CrashModel::Independent(self.rng.gen()),
+        model => model,
+      };
+      chosen.push((cut, model));
+    }
+    chosen.sort_unstable_by_key(|(cut, model)| (*cut, format!("{model:?}")));
     chosen.dedup();
     self.note(format!(
       "  crash images of the {what}: {} events, images {chosen:?}",
@@ -1074,6 +1084,8 @@ impl Model {
       self.count("crash images");
       let copy = self.copy_path();
       std::fs::write(&copy, &image).expect("write the image");
+      // The step's commit, if any, may be there or not, unless the crash
+      // comes after it was acknowledged.
       let allowed: Vec<&State> = match commit {
         Some((before, with)) if cut < events.len() => vec![before, with],
         _ => vec![&self.state],
