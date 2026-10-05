@@ -10,16 +10,26 @@
 //! on a helper thread that spans spills and cuts, background and blocking
 //! checkpoints, application background checkpoints on a thread of their own
 //! running beside the steps, forced spills, injected checkpoint failures
-//! (then cleared), close and reopen (sometimes with a checkpoint thread's
-//! run in flight), read-only reopens, copies of the file taken between
-//! steps, and crash images of one step's writes and syncs.
+//! (then cleared), close or drop (which keeps WAL segments a close would
+//! checkpoint away) and reopen (sometimes with a checkpoint thread's run in
+//! flight), read-only reopens, copies of the file taken between steps, and
+//! crash images of one step's writes and syncs (process crashes, and in
+//! `Full` mode OS crashes that lose, reorder or tear unsynced writes). A
+//! copy or image is sometimes opened a second time after the first open's
+//! recovery (closed or dropped), and sometimes the steps go on with it as
+//! the database, as a process that crashed and reopened its file would.
+//! One seed in three puts the segment table under pressure: a few entries
+//! (a test hook), the smallest extents, a trigger far beyond the table, and
+//! steps that fill it past a long transaction pinning a late segment, then
+//! checkpoint.
 //!
 //! An oracle holds the acknowledged commits. After every step the live
 //! database, and after every reopen, copy and crash image the reopened
 //! file, must match it: nothing lost, nothing extra, no partial transaction.
 //! Only a step in flight at a crash may be either wholly there or wholly
-//! absent. A copy or image is sometimes opened a second time, after the
-//! first open's recovery.
+//! absent. A write may fail only where no checkpoint can make room, and a
+//! background checkpoint that returns `Ok` must have covered every segment
+//! there was when it started.
 //!
 //! Environment: `KITE_MODEL_SEEDS` seeds (default 24) from
 //! `KITE_MODEL_FIRST_SEED` (default 0), `KITE_MODEL_STEPS` steps each
@@ -210,15 +220,15 @@ fn describe_difference(expected: &State, actual: &State) -> String {
   )
 }
 
-/// `db` holds one of `allowed`.
+/// `db` holds one of `allowed`: which.
 fn check_state(
   what: &str,
   db: &SingleFileDB,
   allowed: &[&State],
-) -> std::result::Result<(), String> {
+) -> std::result::Result<usize, String> {
   let actual = read_state(db).map_err(|error| format!("{what}: {error}"))?;
-  if allowed.iter().any(|state| **state == actual) {
-    return Ok(());
+  if let Some(index) = allowed.iter().position(|state| **state == actual) {
+    return Ok(index);
   }
   let differences: Vec<String> = allowed
     .iter()
@@ -228,8 +238,10 @@ fn check_state(
 }
 
 /// Open the file at `path` (read-only or not), check it holds one of
-/// `allowed`, and close it; with `twice`, open and check it again (after a
-/// writable open's recovery).
+/// `allowed`, and close it, or drop it if `drop_after` says so for that
+/// round (dropping keeps WAL segments a close would checkpoint away); with
+/// `twice`, open and check it again (after a writable open's recovery).
+/// Returns which of `allowed` it holds.
 fn reopen_and_check(
   what: &str,
   path: &Path,
@@ -237,7 +249,9 @@ fn reopen_and_check(
   read_only: bool,
   twice: bool,
   allowed: &[&State],
-) -> std::result::Result<(), String> {
+  mut drop_after: impl FnMut() -> bool,
+) -> std::result::Result<usize, String> {
+  let mut matched = 0;
   for round in 0..if twice { 2 } else { 1 } {
     let what = format!(
       "{what} (open {}{})",
@@ -247,12 +261,14 @@ fn reopen_and_check(
     let db = open_single_file(path, options.clone().read_only(read_only))
       .map_err(|error| format!("{what}: the open failed: {error}"))?;
     let checked = check_state(&what, &db, allowed);
-    let closed =
-      close_single_file(db).map_err(|error| format!("{what}: the close failed: {error}"));
-    checked?;
-    closed?;
+    if drop_after() {
+      drop(db);
+    } else {
+      close_single_file(db).map_err(|error| format!("{what}: the close failed: {error}"))?;
+    }
+    matched = checked?;
   }
-  Ok(())
+  Ok(matched)
 }
 
 #[derive(Clone, Debug)]
@@ -260,12 +276,18 @@ struct Config {
   wal_size: usize,
   segment_size: u64,
   segment_limit: Option<u64>,
+  log_ratio: f64,
   log_budget: u64,
   sync: SyncMode,
   mvcc: bool,
   auto_checkpoint: bool,
   background: bool,
   thread: bool,
+  /// Entries of the WAL segment table the database uses, if fewer than all
+  /// (`set_wal_segment_test_capacity`): with the smallest extents and no
+  /// byte limit to speak of, a few spills fill it, so full tables, pinned
+  /// segments and failed cuts meet often.
+  table: Option<usize>,
 }
 
 impl Config {
@@ -287,19 +309,42 @@ impl Config {
         1 => Some(512 * 1024),
         _ => None,
       },
+      log_ratio: 0.5,
       log_budget: [16 * 1024, 64 * 1024, 256 * 1024, 1024 * 1024][rng.gen_range(0..4)],
       sync,
       mvcc: rng.gen_bool(0.85),
       auto_checkpoint: rng.gen_bool(0.8),
       background: rng.gen_bool(0.8),
       thread: rng.gen_bool(0.35),
+      table: None,
     }
+    .with_table_pressure(rng)
+  }
+
+  /// One seed in three: a small segment table, the smallest extents, a
+  /// byte limit far beyond them, and a checkpoint trigger far beyond the
+  /// table (a hundred times the snapshot): writers fill the table and wait
+  /// at it, and checkpoints meet full tables, with open transactions pinning
+  /// segments.
+  fn with_table_pressure(mut self, rng: &mut StdRng) -> Self {
+    if rng.gen_bool(1.0 / 3.0) {
+      self.table = Some(rng.gen_range(3..=6));
+      self.segment_size = 1;
+      self.segment_limit = Some(256 * 1024 * 1024);
+      self.log_ratio = 100.0;
+      self.log_budget = 1024 * 1024 * 1024;
+      // Long transactions pin segments (see `Model::fill_table_step`).
+      self.mvcc = true;
+      self.background = true;
+    }
+    self
   }
 
   fn options(&self) -> SingleFileOpenOptions {
     let mut options = SingleFileOpenOptions::new()
       .wal_size(self.wal_size)
       .wal_segment_size(self.segment_size)
+      .checkpoint_log_ratio(self.log_ratio)
       .checkpoint_log_budget(self.log_budget)
       .sync_mode(self.sync)
       .mvcc(self.mvcc)
@@ -441,6 +486,16 @@ impl Checkpointer {
   }
 }
 
+/// A step the model leans to next, half the time, after one that sets up
+/// what it would check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Hint {
+  /// A reopen after a drop, or a copy gone on with.
+  Reopen,
+  /// A background checkpoint.
+  Checkpoint,
+}
+
 /// One seed's run.
 struct Model {
   seed: u64,
@@ -469,6 +524,8 @@ struct Model {
   long_cuts: usize,
   /// Writes refused for pinned segments before this step.
   pinned_refusals_before: u64,
+  /// What the next step leans to.
+  hint: Option<Hint>,
   /// Bytes of records the step writes (about: its values).
   step_bytes: u64,
 }
@@ -481,14 +538,7 @@ impl Model {
     let config = Config::random(&mut rng);
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("model.kitedb");
-    let db = open_single_file(&path, config.options()).expect("open");
-    // Failed runs (injected faults) back off briefly: steps wait for the
-    // checkpoint thread to answer.
-    super::super::checkpoint_thread::set_checkpoint_test_backoff(
-      &db,
-      Duration::from_millis(1),
-      Duration::from_millis(8),
-    );
+    let db = open_model_db(&path, &config).expect("open");
     db.begin(false).expect("begin");
     db.define_propkey("data").expect("define data");
     db.commit().expect("commit the property key");
@@ -513,6 +563,7 @@ impl Model {
       long_cuts: 0,
       pinned_refusals_before: 0,
       step_bytes: 0,
+      hint: None,
     }
   }
 
@@ -526,6 +577,12 @@ impl Model {
       let stats = wal_segment_test_stats(db);
       let most = self.coverage.entry("most live segments").or_default();
       *most = (*most).max(stats.live as u64);
+      if stats.live + 1 >= db.wal_segment_capacity() {
+        *self
+          .coverage
+          .entry("steps with the segment table full")
+          .or_default() += 1;
+      }
       if stats.live > 0 {
         *self.coverage.entry("steps with live segments").or_default() += 1;
       }
@@ -538,6 +595,10 @@ impl Model {
     self.count("long transactions committed");
     if checkpoint_test_cuts(db) > self.long_cuts && !writes.is_empty() {
       self.count("long transactions committed across a cut");
+      // Its records begin in a segment a checkpoint kept for it: what a
+      // reopen (by a drop, or of a copy) and a checkpoint after it must keep
+      // track of.
+      self.hint = Some(Hint::Reopen);
     }
   }
 
@@ -618,7 +679,7 @@ impl Model {
 
   /// The live database matches the oracle.
   fn check_live(&self, what: &str) -> Outcome {
-    check_state(what, self.db(), &[&self.state])
+    check_state(what, self.db(), &[&self.state]).map(|_| ())
   }
 
   /// Let the checkpoint thread answer every request, so no write is in
@@ -658,7 +719,23 @@ impl Model {
     // open transaction, so a commit beside it would wait for good.
     let long_transactions =
       self.config.mvcc && (self.config.background || !self.config.auto_checkpoint);
-    let choice = self.rng.gen_range(0..100);
+    let mut choice = self.rng.gen_range(0..100);
+    match self.hint.take() {
+      Some(Hint::Reopen) if self.rng.gen_bool(0.5) => {
+        return if self.config.copies_hold_commits() && self.rng.gen_bool(0.5) {
+          self.copy_step()
+        } else {
+          self.reopen_step_ending(false, crash_images, Some(true))
+        };
+      }
+      // A background checkpoint.
+      Some(Hint::Checkpoint) if self.rng.gen_bool(0.5) => choice = 59,
+      // Under table pressure, full tables for checkpoints to meet.
+      _ if self.config.table.is_some() && self.rng.gen_bool(0.1) => {
+        return self.fill_table_step(crash_images, long_transactions);
+      }
+      _ => {}
+    }
     match choice {
       0..=27 => {
         let count = self.rng.gen_range(1..=4);
@@ -704,20 +781,7 @@ impl Model {
         self.count_segments();
         outcome
       }
-      59..=63 => {
-        self.note("background checkpoint".to_string());
-        let db = Arc::clone(self.db());
-        let (result, events, base) = self.recorded(crash_images, || db.background_checkpoint());
-        match result {
-          Ok(()) => {}
-          // Only open transactions holding every segment make it decline.
-          Err(KiteError::CheckpointDeclined(_)) if self.long.is_some() => {}
-          Err(error) if self.faults_seen => self.note(format!("  failed: {error}")),
-          Err(error) => return Err(format!("a background checkpoint failed: {error}")),
-        }
-        self.check_images("background checkpoint", base, &events, None)?;
-        self.check_live("after a background checkpoint")
-      }
+      59..=63 => self.background_checkpoint_step(crash_images),
       64..=66 if self.long.is_none() => {
         self.note("blocking checkpoint".to_string());
         let db = Arc::clone(self.db());
@@ -735,6 +799,7 @@ impl Model {
           Err(error) if self.faults_seen => self.note(format!("  failed: {error}")),
           Err(error) => return Err(format!("a blocking checkpoint failed: {error}")),
         }
+        drop(db);
         self.check_images("blocking checkpoint", base, &events, None)?;
         self.check_live("after a blocking checkpoint")
       }
@@ -747,6 +812,7 @@ impl Model {
           Err(error) if self.faults_seen => self.note(format!("  failed: {error}")),
           Err(error) => return Err(format!("a forced spill failed: {error}")),
         }
+        drop(db);
         self.check_images("forced spill", base, &events, None)?;
         self.check_live("after a forced spill")
       }
@@ -797,6 +863,97 @@ impl Model {
     }
   }
 
+  /// A background checkpoint on this thread (its writes recorded for crash
+  /// images if `crash_images`).
+  fn background_checkpoint_step(&mut self, crash_images: bool) -> Outcome {
+    self.note("background checkpoint".to_string());
+    let db = Arc::clone(self.db());
+    let newest_before = db
+      .header
+      .read()
+      .wal_segments
+      .entries
+      .last()
+      .map(|segment| segment.seq);
+    let (result, events, base) = self.recorded(crash_images, || db.background_checkpoint());
+    match result {
+      // A background checkpoint that returns Ok covered the log (at
+      // least every segment there was when it was called), or found it
+      // covered: none returns Ok having done nothing.
+      Ok(()) => {
+        let covered = db.header.read().wal_segments.covered;
+        if newest_before.is_some_and(|newest| covered < newest) {
+          return Err(format!(
+            "a background checkpoint returned Ok, but covered only up to segment {covered} \
+             of {newest_before:?}"
+          ));
+        }
+      }
+      // Only open transactions holding every segment make it decline.
+      Err(KiteError::CheckpointDeclined(_)) if self.long.is_some() => {}
+      Err(error) if self.faults_seen => self.note(format!("  failed: {error}")),
+      Err(error) => return Err(format!("a background checkpoint failed: {error}")),
+    }
+    drop(db);
+    self.check_images("background checkpoint", base, &events, None)?;
+    self.check_live("after a background checkpoint")
+  }
+
+  /// Under table pressure: fill the segment table (large commits until it
+  /// is full, or a write is refused), mostly with a long transaction begun
+  /// part-way and spilled into it (so a late segment is pinned, and a
+  /// checkpoint has earlier ones to cover: one open from before ends first),
+  /// then a background checkpoint: it meets a full table it must still cut.
+  fn fill_table_step(&mut self, crash_images: bool, long_transactions: bool) -> Outcome {
+    self.note("fill the segment table".to_string());
+    self.count("segment tables filled");
+    let capacity = self.db().wal_segment_capacity();
+    let pin = long_transactions && self.rng.gen_bool(0.8);
+    if pin {
+      self.finish_long()?;
+    }
+    let pin_at = self.rng.gen_range(1..capacity - 1);
+    let mut pinned = false;
+    for _ in 0..40 {
+      let live = wal_segment_test_stats(self.db()).live;
+      if live + 1 >= capacity {
+        break;
+      }
+      if pin && !pinned && live >= pin_at {
+        pinned = true;
+        let db = Arc::clone(self.db());
+        self.note("long transaction: begin".to_string());
+        let (result, _) = self.long_thread.call(&db, LongRequest::Begin, false);
+        result.map_err(|error| format!("the long transaction's begin failed: {error}"))?;
+        self.long = Some(Vec::new());
+        self.long_cuts = checkpoint_test_cuts(&db);
+        // More than it keeps back: its records go to the WAL, and the next
+        // spill moves them into a segment it then pins.
+        let mut more = Vec::new();
+        for _ in 0..30 {
+          let key = self.new_key("long");
+          let value = self.value(3_000);
+          more.push(Write::Create(key, value));
+        }
+        self.long_write(more)?;
+      }
+      let count = self.rng.gen_range(20..=60);
+      let writes = self.writes(count, 2_000, false);
+      let refused_before = self.coverage.get("commits refused: log full").copied();
+      self.commit_step("large commit", writes, false)?;
+      if self.coverage.get("commits refused: log full").copied() != refused_before {
+        break;
+      }
+    }
+    if pinned {
+      self.count("segment tables filled past a pin");
+    }
+    let count = self.rng.gen_range(1..=20);
+    let writes = self.writes(count, 2_000, false);
+    self.commit_step("large commit", writes, false)?;
+    self.background_checkpoint_step(crash_images)
+  }
+
   /// Run `run`, recording its pager writes and syncs with the file before
   /// them if `record`.
   fn recorded<R>(
@@ -835,6 +992,7 @@ impl Model {
       }
       Err(error) => return Err(format!("a {what} failed: {error}")),
     }
+    drop(db);
     self.count_segments();
     self.check_images(what, base, &events, Some((&before, &with)))?;
     self.check_live(&format!("after a {what}"))
@@ -860,25 +1018,8 @@ impl Model {
           let value = self.value(max_len);
           more.push(Write::Create(key, value));
         }
-        self.note(format!("long transaction: {} writes", more.len()));
-        self.step_bytes = write_bytes(&writes) + write_bytes(&more);
-        let (result, _) = self
-          .long_thread
-          .call(&db, LongRequest::Write(more.clone()), false);
-        match result {
-          Ok(()) => {
-            let mut writes = writes;
-            writes.extend(more);
-            self.long = Some(writes);
-          }
-          // Rolled back on its thread.
-          Err(error) if self.allowed_commit_error(&error) => {
-            self.note(format!("  failed, rolled back: {error}"));
-            self.long = None;
-          }
-          Err(error) => return Err(format!("a long transaction's write failed: {error}")),
-        }
-        self.check_live("after a long transaction's writes")
+        drop(db);
+        self.long_write(more)
       }
       6..=8 => {
         self.note(format!("long transaction: commit {} writes", writes.len()));
@@ -900,6 +1041,7 @@ impl Model {
           }
           Err(error) => return Err(format!("the long transaction's commit failed: {error}")),
         }
+        drop(db);
         self.check_images(
           "long transaction's commit",
           base,
@@ -916,6 +1058,32 @@ impl Model {
         self.check_live("after the long transaction's rollback")
       }
     }
+  }
+
+  /// Make `more` writes in the open long transaction (rolled back on its
+  /// thread if one fails).
+  fn long_write(&mut self, more: Vec<Write>) -> Outcome {
+    let db = Arc::clone(self.db());
+    let writes = self.long.clone().unwrap_or_default();
+    self.note(format!("long transaction: {} writes", more.len()));
+    self.step_bytes = write_bytes(&writes) + write_bytes(&more);
+    let (result, _) = self
+      .long_thread
+      .call(&db, LongRequest::Write(more.clone()), false);
+    match result {
+      Ok(()) => {
+        let mut writes = writes;
+        writes.extend(more);
+        self.long = Some(writes);
+      }
+      // Rolled back on its thread.
+      Err(error) if self.allowed_commit_error(&error) => {
+        self.note(format!("  failed, rolled back: {error}"));
+        self.long = None;
+      }
+      Err(error) => return Err(format!("a long transaction's write failed: {error}")),
+    }
+    self.check_live("after a long transaction's writes")
   }
 
   /// End the long transaction, committing or rolling it back.
@@ -948,18 +1116,32 @@ impl Model {
     Ok(())
   }
 
-  /// Close the database (checking crash images of the close if `record`)
-  /// and open it again, read-only first if `read_only`.
+  /// Close the database (checking crash images of the close if `record`),
+  /// or drop it (which keeps its WAL segments), and open it again,
+  /// read-only first if `read_only`.
   fn reopen_step(&mut self, read_only: bool, record: bool) -> Outcome {
+    self.reopen_step_ending(read_only, record, None)
+  }
+
+  /// `reopen_step`, ending the database by a drop if `by_drop` says so (or
+  /// at random).
+  fn reopen_step_ending(
+    &mut self,
+    read_only: bool,
+    record: bool,
+    by_drop: Option<bool>,
+  ) -> Outcome {
     self.finish_long()?;
     self.quiesce()?;
     self.clear_faults();
     let db = self.db.take().expect("open");
-    let mut db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("the database is still shared"));
+    let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("the database is still shared"));
     // Sometimes close with a checkpoint thread's run in flight.
     let in_flight = self.config.thread && self.config.auto_checkpoint && self.rng.gen_bool(0.4);
+    let by_drop = by_drop.unwrap_or_else(|| self.rng.gen_bool(0.4));
     self.note(format!(
-      "close{}, then reopen{}",
+      "{}{}, then reopen{}",
+      if by_drop { "drop" } else { "close" },
       if in_flight {
         " with a run in flight"
       } else {
@@ -972,6 +1154,9 @@ impl Model {
     } else {
       "reopens"
     });
+    if by_drop {
+      self.count("reopens after a drop");
+    }
     if in_flight {
       self.count("closes with a run in flight");
       db.request_background_checkpoint();
@@ -979,15 +1164,24 @@ impl Model {
     }
     let record = record && !in_flight;
     let base = record.then(|| std::fs::read(&self.path).expect("read the file"));
+    let end = || {
+      if by_drop {
+        drop(db);
+        Ok(())
+      } else {
+        close_single_file(db)
+      }
+    };
     let (closed, events) = if record {
-      io_hooks::record_io_during(|| close_single_file(db))
+      io_hooks::record_io_during(end)
     } else {
-      (close_single_file(db), Vec::new())
+      (end(), Vec::new())
     };
     closed.map_err(|error| format!("the close failed: {error}"))?;
     self.check_images("close", base, &events, None)?;
-    let options = self.config.options();
     if read_only {
+      let options = self.config.options();
+      let mut rng = StdRng::seed_from_u64(self.rng.gen());
       reopen_and_check(
         "the read-only reopen",
         &self.path,
@@ -995,17 +1189,19 @@ impl Model {
         true,
         false,
         &[&self.state],
+        move || rng.gen_bool(0.5),
       )?;
     }
-    db = open_single_file(&self.path, options)
+    let db = open_model_db(&self.path, &self.config)
       .map_err(|error| format!("the reopen failed: {error}"))?;
     self.faults_seen = false;
     self.db = Some(Arc::new(db));
+    self.hint = Some(Hint::Checkpoint);
     self.check_live("after the reopen")
   }
 
   /// Copy the file between steps (a crash of the process now), and open
-  /// the copy.
+  /// the copy; sometimes go on with the copy as the database.
   fn copy_step(&mut self) -> Outcome {
     self.quiesce()?;
     let copy = self.copy_path();
@@ -1017,6 +1213,7 @@ impl Model {
     std::fs::copy(&self.path, &copy).expect("copy the file");
     self.count("copies");
     let twice = self.rng.gen_bool(0.5);
+    let mut rng = StdRng::seed_from_u64(self.rng.gen());
     let outcome = reopen_and_check(
       "a copy of the file",
       &copy,
@@ -1024,9 +1221,57 @@ impl Model {
       read_only,
       twice,
       &[&self.state],
+      move || rng.gen_bool(0.5),
     );
+    if outcome.is_ok() && self.rng.gen_bool(0.3) {
+      let state = self.state.clone();
+      return self.adopt("the copy", copy, state);
+    }
     let _ = std::fs::remove_file(&copy);
-    outcome
+    outcome.map(|_| ())
+  }
+
+  /// Go on with the file at `path` (a copy of the database, or a crash
+  /// image of it, opened and checked already) as the database, holding
+  /// `state`: what a process that crashed and reopened its file would do.
+  /// The long transaction rolls back (a crash ends it), and the current
+  /// database is dropped and its file removed.
+  fn adopt(&mut self, what: &str, path: PathBuf, state: State) -> Outcome {
+    if self.long.take().is_some() {
+      let db = Arc::clone(self.db());
+      self
+        .long_thread
+        .call(&db, LongRequest::Rollback, false)
+        .0
+        .map_err(|error| format!("the long transaction's rollback failed: {error}"))?;
+    }
+    self.quiesce()?;
+    self.clear_faults();
+    let db = self.db.take().expect("open");
+    *self.coverage.entry("cuts").or_default() += checkpoint_test_cuts(&db) as u64;
+    *self
+      .coverage
+      .entry("cuts covering segments without a spill")
+      .or_default() += checkpoint_test_covers_without_spill(&db);
+    drop(Arc::try_unwrap(db).unwrap_or_else(|_| panic!("the database is still shared")));
+    let _ = std::fs::remove_file(&self.path);
+    self.note(format!("go on with {what} as the database"));
+    self.count(if what == "the copy" {
+      "copies gone on with"
+    } else {
+      "crash images gone on with"
+    });
+    if !self.state.eq(&state) {
+      self.count("crash images gone on with, without the step's commit");
+    }
+    let db = open_model_db(&path, &self.config)
+      .map_err(|error| format!("{what}: the open to go on with it failed: {error}"))?;
+    self.path = path;
+    self.state = state;
+    self.faults_seen = false;
+    self.db = Some(Arc::new(db));
+    self.hint = Some(Hint::Checkpoint);
+    self.check_live(&format!("after going on with {what}"))
   }
 
   /// Open crash images of a step's writes and syncs `events` from `base`:
@@ -1077,7 +1322,12 @@ impl Model {
       "  crash images of the {what}: {} events, images {chosen:?}",
       events.len()
     ));
-    for (cut, model) in chosen {
+    // Sometimes go on with the last image as the database (not a close's:
+    // the database is closed then, and opens again from its own file).
+    let go_on = self.rng.gen_bool(0.3) && self.db.is_some();
+    let images = chosen.len();
+    let mut adopt = None;
+    for (index, (cut, model)) in chosen.into_iter().enumerate() {
       let Some(image) = crash_image(&base, events, header_end, cut, model) else {
         continue;
       };
@@ -1092,16 +1342,32 @@ impl Model {
       };
       let read_only = self.rng.gen_bool(0.25);
       let twice = self.rng.gen_bool(0.3);
-      let outcome = reopen_and_check(
+      let mut rng = StdRng::seed_from_u64(self.rng.gen());
+      let matched = reopen_and_check(
         &format!("{what}, crash after {cut} events, {model:?}"),
         &copy,
         &self.config.options(),
         read_only,
         twice,
         &allowed,
+        move || rng.gen_bool(0.5),
       );
-      let _ = std::fs::remove_file(&copy);
-      outcome?;
+      match matched {
+        Ok(matched) if go_on && index + 1 == images => {
+          adopt = Some((
+            copy,
+            allowed[matched].clone(),
+            format!("{cut} events, {model:?}"),
+          ));
+        }
+        outcome => {
+          let _ = std::fs::remove_file(&copy);
+          outcome?;
+        }
+      }
+    }
+    if let Some((path, state, at)) = adopt {
+      self.adopt(&format!("a crash image of the {what} ({at})"), path, state)?;
     }
     Ok(())
   }
@@ -1112,6 +1378,10 @@ impl Model {
     self.clear_faults();
     let db = self.db.take().expect("open");
     *self.coverage.entry("cuts").or_default() += checkpoint_test_cuts(&db) as u64;
+    *self
+      .coverage
+      .entry("cuts covering segments without a spill")
+      .or_default() += checkpoint_test_covers_without_spill(&db);
     let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("the database is still shared"));
     close_single_file(db).map_err(|error| format!("the final close failed: {error}"))?;
     reopen_and_check(
@@ -1121,8 +1391,26 @@ impl Model {
       false,
       true,
       &[&self.state],
+      || false,
     )
+    .map(|_| ())
   }
+}
+
+/// Open the model's database at `path` with `config`'s options and test
+/// hooks: failed runs (injected faults) back off for milliseconds (steps
+/// wait for the checkpoint thread to answer), and the segment table's size.
+fn open_model_db(path: &Path, config: &Config) -> Result<SingleFileDB> {
+  let db = open_single_file(path, config.options())?;
+  super::super::checkpoint_thread::set_checkpoint_test_backoff(
+    &db,
+    Duration::from_millis(1),
+    Duration::from_millis(8),
+  );
+  if let Some(entries) = config.table {
+    set_wal_segment_test_capacity(&db, entries);
+  }
+  Ok(db)
 }
 
 /// Spill the WAL now if it holds records and the segments have room, as a

@@ -15,6 +15,7 @@ use std::cell::RefCell;
 #[cfg(test)]
 use std::sync::{Arc, Barrier, Mutex, OnceLock};
 
+#[cfg(test)]
 use crate::constants::MAX_WAL_SEGMENTS;
 use crate::core::pager::{pages_to_store, DetachedReader, FilePager};
 use crate::core::snapshot::reader::SnapshotData;
@@ -282,6 +283,34 @@ fn checkpoint_test_pinned_refusals(db: &SingleFileDB) -> u64 {
     .unwrap_or(0)
 }
 
+/// Cuts that covered the segments without spilling the WAL (the table had
+/// no entry for it), per database path.
+#[cfg(test)]
+static CHECKPOINT_TEST_COVERS_WITHOUT_SPILL: OnceLock<Mutex<HashMap<std::path::PathBuf, u64>>> =
+  OnceLock::new();
+
+#[cfg(test)]
+fn count_checkpoint_test_cover_without_spill(db_path: &std::path::Path) {
+  *CHECKPOINT_TEST_COVERS_WITHOUT_SPILL
+    .get_or_init(|| Mutex::new(HashMap::new()))
+    .lock()
+    .expect("checkpoint test cover lock")
+    .entry(db_path.to_path_buf())
+    .or_default() += 1;
+}
+
+/// Cuts on `db` so far that covered the segments without spilling the WAL.
+#[cfg(test)]
+fn checkpoint_test_covers_without_spill(db: &SingleFileDB) -> u64 {
+  CHECKPOINT_TEST_COVERS_WITHOUT_SPILL
+    .get_or_init(|| Mutex::new(HashMap::new()))
+    .lock()
+    .expect("checkpoint test cover lock")
+    .get(db.path())
+    .copied()
+    .unwrap_or(0)
+}
+
 /// Background checkpoint cuts made on `db` so far.
 #[cfg(test)]
 fn checkpoint_test_cuts(db: &SingleFileDB) -> usize {
@@ -444,6 +473,16 @@ fn wal_segment_test_stats(db: &SingleFileDB) -> WalSegmentTestStats {
     covered: table.covered,
     next_seq: table.next_seq,
   }
+}
+
+/// Make `db` use only `entries` entries of its WAL segment table (at least
+/// 3: one for writers, one for a checkpoint's cut, one kept for a pin), so
+/// tests fill it with a few spills.
+#[cfg(test)]
+pub(super) fn set_wal_segment_test_capacity(db: &SingleFileDB, entries: usize) {
+  assert!(entries >= 3, "a table of {entries} entries");
+  db.wal_segment_test_capacity
+    .store(entries, Ordering::Relaxed);
 }
 
 /// Set `db`'s WAL segment limit (bytes of segments before writers wait for
@@ -1275,12 +1314,14 @@ impl SingleFileDB {
     if !wal_buffer.is_empty() {
       let entries = header.wal_segments.entries.len() - unneeded.len();
       let may_spill = !Self::spill_needs_new_segment(&header, wal_buffer.used())
-        || entries < MAX_WAL_SEGMENTS - 1
-        || (entries < MAX_WAL_SEGMENTS && self.oldest_pinned_segment().is_none());
+        || entries < self.wal_segment_capacity() - 1
+        || (entries < self.wal_segment_capacity() && self.oldest_pinned_segment().is_none());
       if may_spill {
         self.spill_wal(&mut pager, &mut wal_buffer, &mut header, &[], &unneeded)?;
       } else {
         wal_left = true;
+        #[cfg(test)]
+        count_checkpoint_test_cover_without_spill(&self.path);
       }
     }
     let newest = header

@@ -1318,6 +1318,8 @@ fn open_single_file_internal(
     primary_replication,
     replica_replication,
     #[cfg(test)]
+    wal_segment_test_capacity: AtomicUsize::new(0),
+    #[cfg(test)]
     commits_waiting: AtomicUsize::new(0),
     #[cfg(feature = "bench-profile")]
     commit_lock_wait_ns: AtomicU64::new(0),

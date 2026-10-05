@@ -511,6 +511,11 @@ pub struct SingleFileInner {
   /// instrumentation).
   #[cfg(test)]
   pub(crate) commits_waiting: AtomicUsize,
+  /// Entries of the WAL segment table this database uses, if fewer than
+  /// `MAX_WAL_SEGMENTS` (0: all; test instrumentation, see
+  /// `wal_segment_capacity`).
+  #[cfg(test)]
+  pub(crate) wal_segment_test_capacity: AtomicUsize,
   #[cfg(feature = "bench-profile")]
   pub(crate) commit_lock_wait_ns: AtomicU64,
   #[cfg(feature = "bench-profile")]

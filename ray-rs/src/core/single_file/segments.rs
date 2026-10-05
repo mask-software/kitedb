@@ -317,6 +317,21 @@ impl SingleFileDB {
       .collect()
   }
 
+  /// Entries of the WAL segment table: `MAX_WAL_SEGMENTS`, or fewer in tests
+  /// that fill the table quickly (`set_wal_segment_test_capacity`).
+  pub(crate) fn wal_segment_capacity(&self) -> usize {
+    #[cfg(test)]
+    {
+      let capacity = self
+        .wal_segment_test_capacity
+        .load(std::sync::atomic::Ordering::Relaxed);
+      if capacity > 0 {
+        return capacity.min(MAX_WAL_SEGMENTS);
+      }
+    }
+    MAX_WAL_SEGMENTS
+  }
+
   /// Whether the WAL may spill now: the segments are under their limit, with
   /// room in the table (one entry stays free for a checkpoint's cut, which
   /// spills whatever the limit). `unneeded` (`unneeded_wal_segments`) do not
@@ -335,7 +350,7 @@ impl SingleFileDB {
       .fold((0, 0u64), |(entries, bytes), segment| {
         (entries + 1, bytes.saturating_add(segment.byte_len))
       });
-    entries < MAX_WAL_SEGMENTS - 1 && bytes < self.wal_segment_limit(header)
+    entries < self.wal_segment_capacity() - 1 && bytes < self.wal_segment_limit(header)
   }
 
   /// Whether a writer could spill now (`can_spill`, counting out the
@@ -391,7 +406,7 @@ impl SingleFileDB {
         (count + 1, bytes.saturating_add(segment.byte_len))
       });
     let limit = self.wal_segment_limit(&header);
-    let full = bytes >= limit || count >= MAX_WAL_SEGMENTS - 1;
+    let full = bytes >= limit || count >= self.wal_segment_capacity() - 1;
     if full {
       #[cfg(test)]
       super::checkpoint::count_checkpoint_test_pinned_refusal(&self.path);
@@ -471,7 +486,7 @@ impl SingleFileDB {
         .last()
         .is_some_and(|last| Some(last.seq) == header.wal_segments.entries.last().map(|s| s.seq));
     if !appends {
-      if entries.len() >= MAX_WAL_SEGMENTS {
+      if entries.len() >= self.wal_segment_capacity() {
         return Err(KiteError::WalBufferFull);
       }
       let page_count = self.wal_segment_extent_pages(header, length);
