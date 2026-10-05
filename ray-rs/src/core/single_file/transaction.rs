@@ -1607,7 +1607,9 @@ impl SingleFileDB {
       // ever waiting on its own. A failed commit checkpoints too: when the
       // WAL refused its COMMIT record, every later commit would fail the same
       // way, and nothing else would ever checkpoint.
+      let check_mark = prof::start();
       self.auto_checkpoint_if_needed(matches!(result, Err(KiteError::WalBufferFull)));
+      prof::end(Stage::AutoCheckpointCheck, check_mark);
       prof::end(Stage::CommitTotal, commit_mark);
     }
     TxSpares::keep_state(tx_handle);

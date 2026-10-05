@@ -30,6 +30,7 @@ use crate::error::{KiteError, Result};
 use crate::types::*;
 
 use super::checkpoint::{checkpoint_phase, restore_header, CheckpointPhase};
+use super::commit_profile::{self as prof, Stage};
 use super::SingleFileDB;
 
 /// What `SingleFileDB::spill_or_append` did.
@@ -451,6 +452,7 @@ impl SingleFileDB {
     extra: &[u8],
     unneeded: &[WalSegment],
   ) -> Result<()> {
+    let _timed = prof::timed(Stage::Spill);
     // A writable open leaves the WAL in the primary region alone.
     debug_assert!(wal.active_region() == 0 && !wal.is_primary_retired());
     wal.flush(pager)?;

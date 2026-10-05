@@ -4,7 +4,8 @@
 //! stage's total; `count(stage, n)` counts events. A committer hands a stamp
 //! (`stamp()`) to the thread it waits for, which adds the time since with
 //! `since_stamp`. Without the `bench-profile` feature all of these compile to
-//! nothing. `SingleFileDB::commit_profile_report` prints the totals, per
+//! nothing; so does `timed(stage)`, which times the rest of its scope.
+//! `SingleFileDB::commit_profile_report` prints the totals, per
 //! event and per commit, and `commit_profile_reset` clears them.
 
 macro_rules! stages {
@@ -93,6 +94,20 @@ stages! {
   Groups,
   /// Commits written, over every group (events only).
   GroupCommits,
+  /// The automatic checkpoint's check after a commit or rollback (and the
+  /// checkpoint, if it runs one inline).
+  AutoCheckpointCheck,
+  /// A writer waiting for WAL segment space (`wait_for_segment_space`).
+  SegmentSpaceWait,
+  /// A spill of the WAL into a WAL segment (under the commit lock).
+  Spill,
+  /// A background checkpoint's run, from its claim to its end.
+  CheckpointRun,
+  /// A background checkpoint's cut, while it holds the commit lock.
+  CheckpointCut,
+  /// A background checkpoint's install, while it holds the commit lock
+  /// (the replay of the commits since its first replay, and the install).
+  CheckpointLocked,
 }
 
 #[cfg(feature = "bench-profile")]
@@ -135,6 +150,19 @@ mod imp {
       TOTALS[stage as usize].fetch_add(ns, Ordering::Relaxed);
       EVENTS[stage as usize].fetch_add(1, Ordering::Relaxed);
     }
+  }
+
+  /// Times what follows to the end of its scope (when dropped).
+  pub(crate) struct Timed(Stage, Mark);
+
+  impl Drop for Timed {
+    fn drop(&mut self) {
+      end(self.0, self.1);
+    }
+  }
+
+  pub(crate) fn timed(stage: Stage) -> Timed {
+    Timed(stage, start())
   }
 
   pub(crate) fn reset() {
@@ -198,6 +226,13 @@ mod imp {
 
   #[inline(always)]
   pub(crate) fn since_stamp(_stage: Stage, _stamp: u64) {}
+
+  pub(crate) struct Timed;
+
+  #[inline(always)]
+  pub(crate) fn timed(_stage: Stage) -> Timed {
+    Timed
+  }
 }
 
 #[allow(unused_imports)]

@@ -32,6 +32,7 @@ use crate::vector::types::{VectorManifest, VectorStoreConfig};
 use super::checkpoint_thread::on_checkpoint_thread;
 #[cfg(test)]
 use super::checkpoint_thread::CHECKPOINT_THREAD_NAME;
+use super::commit_profile::{self as prof, Stage};
 use super::open::map_snapshot_range;
 #[cfg(test)]
 use super::recovery::committed_transactions;
@@ -1224,6 +1225,7 @@ impl SingleFileDB {
       }
     };
 
+    let _timed = prof::timed(Stage::CheckpointRun);
     // Step 1. The gate excludes blocking checkpoints and compaction.
     let cut = {
       let _checkpoint_gate = self.checkpoint_gate.write();
@@ -1310,6 +1312,7 @@ impl SingleFileDB {
   /// hold the checkpoint gate.
   fn cut_log(&self) -> Result<CutOutcome> {
     let _commit_guard = self.lock_commits();
+    let _timed = prof::timed(Stage::CheckpointCut);
     self.ensure_writes_allowed()?;
     let mut pager = self.pager.lock();
     let mut wal_buffer = self.wal_buffer.lock();
@@ -1467,6 +1470,7 @@ impl SingleFileDB {
     // the install keeps.
     let _checkpoint_gate = self.checkpoint_gate.write();
     let _commit_guard = self.lock_commits();
+    let _timed = prof::timed(Stage::CheckpointLocked);
     self
       .ensure_writes_allowed()
       .inspect_err(|_| free_snapshot())?;
@@ -1723,6 +1727,7 @@ impl SingleFileDB {
   /// automatic checkpoint failed (see `checkpoint_error`), after asking for
   /// another (which runs after the thread's back-off).
   pub(crate) fn wait_for_segment_space(&self) -> Result<()> {
+    let _timed = prof::timed(Stage::SegmentSpaceWait);
     self.ensure_writes_allowed()?;
     if !self.auto_checkpoint || self.read_only {
       return Err(KiteError::WalBufferFull);
