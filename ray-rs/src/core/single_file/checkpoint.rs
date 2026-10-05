@@ -1732,11 +1732,16 @@ impl SingleFileDB {
   /// checkpoint here (after waiting for any running one, which may already
   /// have freed the space), then retry, as long as each of this writer's
   /// own runs frees segment space. A blocking checkpoint would wait for this
-  /// writer's own transaction; with background checkpoints off, the
-  /// auto-checkpoint after the write fails runs one.
+  /// writer's own transaction: with background checkpoints off, the write
+  /// fails, and the automatic checkpoint after it runs one. It fails as with
+  /// them: `CheckpointFailed` while the last automatic checkpoint failed,
+  /// else `WalBufferFull`.
   fn make_segment_space_here(&self) -> Result<()> {
     if !self.background_checkpoint {
-      return Err(KiteError::WalBufferFull);
+      return Err(match self.checkpoint_error() {
+        Some(error) => KiteError::CheckpointFailed(error),
+        None => KiteError::WalBufferFull,
+      });
     }
     let _waiting = SegmentWaiter::new(self);
     loop {

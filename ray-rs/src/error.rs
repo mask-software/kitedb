@@ -53,7 +53,8 @@ pub enum KiteError {
   /// limit (`wal_segment_limit`, or the segment table's 63 entries) and no
   /// checkpoint can free them for this writer now. Automatic checkpoints are
   /// off, or blocking (`background_checkpoint` off: one runs after the
-  /// failed write); open write transactions hold the segments' records; a
+  /// failed write; while the last one failed, `CheckpointFailed` instead);
+  /// open write transactions hold the segments' records; a
   /// blocking checkpoint, optimize, vacuum or WAL resize waits for this
   /// writer's transaction; the database is closing; or the checkpoint run
   /// that answered this writer freed nothing. Or the record cannot be
