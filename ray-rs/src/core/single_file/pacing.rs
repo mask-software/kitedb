@@ -39,6 +39,11 @@ const MIN_REMAINING: Duration = Duration::from_millis(10);
 /// and the next commit waits it.
 const MIN_WAIT: Duration = Duration::from_micros(50);
 
+/// How far behind the schedule the next commit may start from: the time
+/// writers spent committing since the last paced one counts toward its
+/// wait, up to this (so a writer back from a pause does not burst).
+const MAX_CREDIT: Duration = Duration::from_millis(10);
+
 /// The pacing state of a database (see `SingleFileDB::pace_writer`).
 #[derive(Default)]
 pub(crate) struct LogPacer {
@@ -138,7 +143,8 @@ impl LogPacer {
       remaining.mul_f64((grown as f64 / headroom as f64).min(1e6))
     };
     let now = Instant::now();
-    let from = state.next_free.filter(|free| *free > now).unwrap_or(now);
+    let earliest = now.checked_sub(MAX_CREDIT).unwrap_or(now);
+    let from = state.next_free.map_or(now, |free| free.max(earliest));
     let until = (from + delay).min(now + bound);
     state.next_free = Some(until);
     (until.saturating_duration_since(now) >= MIN_WAIT).then_some(until)
