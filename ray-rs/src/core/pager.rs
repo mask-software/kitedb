@@ -506,9 +506,27 @@ impl FilePager {
   }
 
   /// Set the file's length; the next [`Self::sync_data`] syncs it.
+  ///
+  /// On macOS a file shorter than `length` grows by a write of its new last
+  /// byte (a zero), not by ftruncate. Growing a file with ftruncate while a
+  /// mapping of it lives (an installed snapshot, `map_immutable_range`)
+  /// leaves its vnode in a state where every fsync of it costs 0.2-0.6 ms
+  /// with nothing to write, from any process, until some later growth ends
+  /// it: on the 1M-node database with a 4 MB WAL, whole WAL cycles between
+  /// spills ran so, and one writer's commits fell from about 27k/s to
+  /// 3-4k/s. Grown by the write, the file is the same: its length, and
+  /// zeros (a hole) from the old end on.
   fn set_file_len(&mut self, length: u64) -> Result<()> {
     // Noted first: a failed set_len may still have changed the length.
     self.length_unsynced.store(true, Ordering::Relaxed);
+    #[cfg(target_os = "macos")]
+    if length > self.file.metadata()?.len() {
+      #[cfg(test)]
+      LENGTH_CHANGE_LOG.with(|log| log.borrow_mut().push(("write", length)));
+      write_all_at(&self.file, &[0], length - 1)?;
+      self.file_size = length;
+      return Ok(());
+    }
     #[cfg(test)]
     LENGTH_CHANGE_LOG.with(|log| log.borrow_mut().push(("set_len", length)));
     self.file.set_len(length)?;
