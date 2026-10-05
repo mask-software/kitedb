@@ -1915,7 +1915,8 @@ export interface OpenOptions {
   /**
    * Automatic checkpoints run while writes go on (default: true). Without,
    * they are blocking, and a writer at `walSegmentLimit` fails instead of
-   * waiting
+   * waiting; one runs once its transaction ends, by commit or rollback
+   * (after the back-off, if the last one failed)
    */
   backgroundCheckpoint?: boolean
   /**

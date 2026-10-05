@@ -42,11 +42,11 @@ class CorruptionError(KiteError):
 class WalFullError(KiteError):
     """The WAL and its WAL segments are full and no checkpoint can make room
     for this write now: automatic checkpoints are off, or blocking (one runs
-    after the failed write); open write transactions hold the segments'
+    once the transaction ends); open write transactions hold the segments'
     records; a blocking checkpoint, optimize, vacuum or WAL resize waits for
-    this writer's transaction; the database is closing; or the checkpoint
-    that answered the write freed nothing. Checkpoint, or end those
-    transactions, before writing more."""
+    this writer's transaction; the database is closing, or the checkpoint
+    thread cannot start; or the checkpoint that answered the write freed
+    nothing. Checkpoint, or end those transactions, before writing more."""
 
 class CheckpointError(KiteError):
     """A write needs WAL segment space only a checkpoint frees, and the last

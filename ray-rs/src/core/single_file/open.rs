@@ -129,7 +129,10 @@ pub struct SingleFileOpenOptions {
   /// Automatic checkpoints run while writes go on (default true). Without,
   /// they are blocking: one runs after the commit that crosses the trigger
   /// (waiting for open transactions), and a writer at `wal_segment_limit`
-  /// fails with `WalBufferFull` instead of waiting.
+  /// fails instead of waiting, with `WalBufferFull` (`CheckpointFailed`
+  /// while the last automatic checkpoint failed); one runs once its
+  /// transaction ends, by commit or rollback (after the back-off, if the
+  /// last one failed).
   pub background_checkpoint: bool,
   /// Run automatic background checkpoints on a thread of the database's
   /// own, so the commit that crosses the trigger returns at once (default
@@ -160,8 +163,9 @@ pub struct SingleFileOpenOptions {
   /// small next to the limit keep such pins small.
   pub wal_segment_size: Option<u64>,
   /// The most bytes of WAL segments: past it the WAL spills no more, and
-  /// writers wait for a checkpoint (or fail with `WalBufferFull` without
-  /// automatic checkpoints, or with blocking ones). Default: twice the
+  /// writers wait for a checkpoint (or fail: with `WalBufferFull` without
+  /// automatic checkpoints, and with blocking ones as `background_checkpoint`
+  /// says). Default: twice the
   /// checkpoint trigger, at least 16 WALs, at most four times
   /// `checkpoint_log_budget`. The segment table caps the segments at 63
   /// extents too: with default extents, about four times a limit up to
@@ -1298,6 +1302,7 @@ fn open_single_file_internal(
     segment_space_wait: Mutex::new(()),
     segment_space_cv: parking_lot::Condvar::new(),
     segment_waiters: AtomicUsize::new(0),
+    blocking_checkpoint_asked: AtomicBool::new(false),
     commit_lock: Mutex::new(()),
     publish_lock: Mutex::new(()),
     publish_seq: AtomicU64::new(0),

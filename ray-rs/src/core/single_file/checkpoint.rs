@@ -1136,13 +1136,17 @@ impl SingleFileDB {
   /// transaction open (its transaction just committed, failed, or rolled
   /// back): once the log reaches the checkpoint trigger
   /// (`checkpoint_log_trigger`), or `segments_full` (a write of this
-  /// thread's just failed for want of WAL segment space), checkpoint unless
-  /// one is running: on the checkpoint thread if there is one, else here.
+  /// thread's just failed for want of WAL segment space), or a writer
+  /// refused that space asked for a blocking one
+  /// (`blocking_checkpoint_asked`), checkpoint unless one is running: on the
+  /// checkpoint thread if there is one, else here, but not during the
+  /// back-off after a failed one.
   pub(crate) fn auto_checkpoint_if_needed(&self, segments_full: bool) {
+    let asked = self.blocking_checkpoint_asked.load(Ordering::Acquire);
     if !self.auto_checkpoint
       || self.read_only
       || self.is_checkpoint_running()
-      || !(segments_full || self.log_usage_ratio() >= 1.0)
+      || !(segments_full || asked || self.log_usage_ratio() >= 1.0)
     {
       return;
     }
@@ -1162,6 +1166,10 @@ impl SingleFileDB {
         Err(error) => Err(error),
       }
     } else {
+      // The writers refused space until now are answered by this one.
+      self
+        .blocking_checkpoint_asked
+        .store(false, Ordering::Release);
       self.checkpoint()
     };
     // Recorded and reported, not returned: the caller's own outcome stands.
@@ -1774,11 +1782,16 @@ impl SingleFileDB {
   /// have freed the space), then retry, as long as each of this writer's
   /// own runs frees segment space. A blocking checkpoint would wait for this
   /// writer's own transaction: with background checkpoints off, the write
-  /// fails, and the automatic checkpoint after it runs one. It fails as with
-  /// them: `CheckpointFailed` while the last automatic checkpoint failed,
-  /// else `WalBufferFull`.
+  /// fails and asks for one (`blocking_checkpoint_asked`), which the
+  /// automatic checkpoint after the writer's commit or rollback runs (after
+  /// the back-off, if the last one failed). It fails as with them:
+  /// `CheckpointFailed` while the last automatic checkpoint failed, else
+  /// `WalBufferFull`.
   fn make_segment_space_here(&self) -> Result<()> {
     if !self.background_checkpoint {
+      self
+        .blocking_checkpoint_asked
+        .store(true, Ordering::Release);
       return Err(match self.checkpoint_error() {
         Some(error) => KiteError::CheckpointFailed(error),
         None => KiteError::WalBufferFull,

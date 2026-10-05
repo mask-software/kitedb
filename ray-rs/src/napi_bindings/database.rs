@@ -176,7 +176,8 @@ pub struct OpenOptions {
   pub checkpoint_threshold: Option<f64>,
   /// Automatic checkpoints run while writes go on (default: true). Without,
   /// they are blocking, and a writer at `walSegmentLimit` fails instead of
-  /// waiting
+  /// waiting; one runs once its transaction ends, by commit or rollback
+  /// (after the back-off, if the last one failed)
   pub background_checkpoint: Option<bool>,
   /// Run automatic background checkpoints on a thread of the database's
   /// own, so the commit that crosses the trigger returns at once (default:

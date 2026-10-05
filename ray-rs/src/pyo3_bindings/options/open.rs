@@ -144,8 +144,10 @@ pub struct OpenOptions {
   #[pyo3(get, set)]
   pub checkpoint_threshold: Option<f64>,
   /// Automatic checkpoints run while writes go on (default: True). Without,
-  /// they are blocking, and a writer at `wal_segment_limit` fails with
-  /// `WalFullError` instead of waiting
+  /// they are blocking, and a writer at `wal_segment_limit` fails instead of
+  /// waiting, with `WalFullError` (`CheckpointError` while the last automatic
+  /// checkpoint failed); one runs once its transaction ends, by commit or
+  /// rollback (after the back-off, if the last one failed)
   #[pyo3(get, set)]
   pub background_checkpoint: Option<bool>,
   /// Compression options for checkpoint snapshots (single-file only)

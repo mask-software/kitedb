@@ -402,6 +402,13 @@ pub struct SingleFileInner {
   pub(crate) segment_space_cv: Condvar,
   /// Writers waiting in `wait_for_segment_space` now.
   pub(crate) segment_waiters: AtomicUsize,
+  /// Set when a writer was refused WAL segment space while automatic
+  /// checkpoints are blocking (`background_checkpoint` off): it cannot run
+  /// one itself (it would wait for the writer's own transaction), so the
+  /// automatic checkpoint after the next commit or rollback runs, whatever
+  /// the log's size, and clears it. One the back-off holds off stays asked
+  /// for (see `auto_checkpoint_if_needed`).
+  pub(crate) blocking_checkpoint_asked: AtomicBool,
 
   /// Serializes writing commits: a commit group's checks, WAL records,
   /// header and replication frames (see `transaction::write_commit_round`).
