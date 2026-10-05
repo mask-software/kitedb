@@ -1,11 +1,12 @@
-// raydb-b4 checkpoint-segments: the checkpoint options of the bindings.
+// raydb-b4 checkpoint-segments: checkpoints through the bindings.
 //
-// A full WAL spills into WAL segments, and automatic checkpoints run on a
-// thread of the database's own once the log reaches the checkpoint trigger.
-// The options that tune them reach the core, out-of-range values are refused,
-// the deprecated `checkpointThreshold` is still accepted, and
-// `checkpointError()` reports the last automatic checkpoint's failure (none
-// here).
+// A full WAL spills into WAL segments, and automatic checkpoints run (on a
+// thread of the database's own, or inline without it) once the log reaches
+// the checkpoint trigger: a load past it installs new snapshots, and
+// `checkpointError()` stays null. Without automatic checkpoints the WAL
+// spills up to `walSegmentLimit`, then writes fail with a WAL-full error
+// until a checkpoint makes room. Out-of-range options are refused, and the
+// deprecated `checkpointThreshold` is still accepted.
 
 import test from 'ava'
 
@@ -32,12 +33,14 @@ test('a small WAL spills and checkpoints with the log options; every commit stay
   }
   const db = Database.open(dbPath, options)
   try {
+    const generation = db.stats().snapshotGen
     // About 3 MiB of log: many spills, and checkpoints on the thread.
     for (let i = 0; i < 10_000; i += 1) {
       db.begin()
       db.createNode(`n-${i}-${KEY}`)
       db.commit()
     }
+    t.true(db.stats().snapshotGen > generation, 'no checkpoint installed a snapshot during the load')
     t.is(db.checkpointError(), null)
   } finally {
     db.close()
@@ -49,6 +52,43 @@ test('a small WAL spills and checkpoints with the log options; every commit stay
     t.truthy(reopened.get_node_by_key(`n-9999-${KEY}`))
   } finally {
     reopened.close()
+  }
+})
+
+test('without automatic checkpoints, writes past the segment limit fail until a checkpoint', (t) => {
+  const db = Database.open(makeDbPath(), {
+    walSize: 64 * 1024,
+    autoCheckpoint: false,
+    walSegmentLimit: 128 * 1024,
+  })
+  try {
+    let failure: unknown = null
+    let written = 0
+    for (let i = 0; i < 10_000 && failure === null; i += 1) {
+      try {
+        db.begin()
+        db.createNode(`n-${i}-${KEY}`)
+        db.commit()
+        written += 1
+      } catch (error) {
+        failure = error
+        try {
+          db.rollback()
+        } catch {
+          // The failed commit ended the transaction.
+        }
+      }
+    }
+    t.true(written > 400, `only ${written} commits before the limit`)
+    t.regex(String((failure as Error | null)?.message), /WAL buffer full/)
+    db.checkpoint()
+    db.begin()
+    db.createNode('after-the-checkpoint')
+    db.commit()
+    t.truthy(db.get_node_by_key(`n-${written - 1}-${KEY}`))
+    t.truthy(db.get_node_by_key('after-the-checkpoint'))
+  } finally {
+    db.close()
   }
 })
 
@@ -68,23 +108,26 @@ test('out-of-range checkpoint options are refused; the deprecated threshold is a
   t.pass()
 })
 
-test('Kite takes the checkpoint options and reports no checkpoint error', (t) => {
+test('Kite checkpoints inline without the thread past the trigger, with no error', (t) => {
   const Item = node('item', { key: (id: string) => `item:${id}`, props: { name: string('name') } })
   const db = kiteSync(makeDbPath(), {
     nodes: [Item],
     edges: [],
     checkpointThread: false,
     checkpointLogRatio: 0.25,
-    checkpointLogBudget: 4 * 1024 * 1024,
+    // A 64 KiB trigger: the load below passes it many times.
+    checkpointLogBudget: 64 * 1024,
     walSegmentSize: 1024 * 1024,
     walSegmentLimit: 16 * 1024 * 1024,
   })
   try {
-    for (let i = 0; i < 100; i += 1) {
-      db.insert(Item).values(`i${i}`, { name: `item ${i}` }).execute()
+    const generation = db.stats().snapshotGen
+    for (let i = 0; i < 3_000; i += 1) {
+      db.insert(Item).values(`i${i}`, { name: `item ${i} ${KEY}` }).execute()
     }
+    t.true(db.stats().snapshotGen > generation, 'no checkpoint installed a snapshot during the load')
     t.is(db.checkpointError(), null)
-    t.truthy(db.get(Item, 'i99'))
+    t.truthy(db.get(Item, 'i2999'))
   } finally {
     db.close()
   }
