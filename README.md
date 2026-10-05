@@ -116,9 +116,10 @@ The `.kitedb` format contains:
   in the old magic, and v0.2.18 then opens the file as it was before that open, until the next
   writable open finishes). It refuses files of v0.1.4 to v0.2.2 (`RayDB format 1`), as releases
   have since v0.2.3, and an old-magic header that names WAL segments (only unreleased builds
-  wrote one). A header copy's checksum covers every byte of it, so a copy torn by a crash, at
-  any 512-byte sector, fails it. A header naming WAL segments is format version 3 (minimum
-  reader 3); otherwise it is version 2
+  wrote one). A header copy in the new magic has a checksum over every byte of it but its two
+  checksums (the fixed fields have their own), so a copy torn by a crash, at any 512-byte
+  sector, fails it. A header naming WAL segments is format version 3 (minimum reader 3);
+  otherwise it is version 2
 - **WAL Area**: Linear buffer for write-ahead log records. When it fills, its records spill into a
   WAL segment and it starts over
 - **WAL Segments**: extents of pages holding spilled log records, up to a limit

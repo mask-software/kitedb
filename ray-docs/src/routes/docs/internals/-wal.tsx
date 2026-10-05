@@ -846,8 +846,11 @@ export function WALPage() {
 				the checkpoint thread it asks for another, which the thread runs after
 				its back-off (1 s, doubling to 60 s after each failure in a row; any
 				checkpoint that succeeds meanwhile, such as the caller's own, ends it);
-				without it, writers fail during the back-off and run one themselves
-				after it. <code>checkpointError()</code> (
+				without it, with background checkpoints inline, writers fail during the
+				back-off and run one themselves after it; with background checkpoints
+				off, writers fail until a checkpoint succeeds, and the blocking one
+				that runs once a refused writer's transaction ends (after the back-off)
+				is one. <code>checkpointError()</code> (
 				<code>checkpoint_error()</code> in Python) returns the checkpoint's
 				error. A panic in a checkpoint run is reported the same way, and the
 				thread ends. Since such a panic may strike between writes that keep
