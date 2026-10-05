@@ -70,10 +70,10 @@ for n_probe in $N_PROBES; do
   echo "$ivf_out" >>"$RAW_OUT"
   echo >>"$RAW_OUT"
 
-  ivf_build="$(echo "$ivf_out" | rg '^build_elapsed_ms:' | awk '{print $2}')"
-  ivf_p50="$(echo "$ivf_out" | rg '^search_p50_ms:' | awk '{print $2}')"
-  ivf_p95="$(echo "$ivf_out" | rg '^search_p95_ms:' | awk '{print $2}')"
-  ivf_recall="$(echo "$ivf_out" | rg '^mean_recall_at_k:' | awk '{print $2}')"
+  ivf_build="$(echo "$ivf_out" | grep '^build_elapsed_ms:' | awk '{print $2}')"
+  ivf_p50="$(echo "$ivf_out" | grep '^search_p50_ms:' | awk '{print $2}')"
+  ivf_p95="$(echo "$ivf_out" | grep '^search_p95_ms:' | awk '{print $2}')"
+  ivf_recall="$(echo "$ivf_out" | grep '^mean_recall_at_k:' | awk '{print $2}')"
 
   IVF_BASE_RECALL["$n_probe"]="$ivf_recall"
   IVF_BASE_P95["$n_probe"]="$ivf_p95"
@@ -94,10 +94,10 @@ for n_probe in $N_PROBES; do
         echo "$pq_out" >>"$RAW_OUT"
         echo >>"$RAW_OUT"
 
-        pq_build="$(echo "$pq_out" | rg '^build_elapsed_ms:' | awk '{print $2}')"
-        pq_p50="$(echo "$pq_out" | rg '^search_p50_ms:' | awk '{print $2}')"
-        pq_p95="$(echo "$pq_out" | rg '^search_p95_ms:' | awk '{print $2}')"
-        pq_recall="$(echo "$pq_out" | rg '^mean_recall_at_k:' | awk '{print $2}')"
+        pq_build="$(echo "$pq_out" | grep '^build_elapsed_ms:' | awk '{print $2}')"
+        pq_p50="$(echo "$pq_out" | grep '^search_p50_ms:' | awk '{print $2}')"
+        pq_p95="$(echo "$pq_out" | grep '^search_p95_ms:' | awk '{print $2}')"
+        pq_recall="$(echo "$pq_out" | grep '^mean_recall_at_k:' | awk '{print $2}')"
 
         recall_ratio="$(awk -v pq="$pq_recall" -v ivf="$ivf_recall" 'BEGIN { if (ivf <= 0) { print "0.000000" } else { printf "%.6f", pq / ivf } }')"
         p95_ratio="$(awk -v pq="$pq_p95" -v ivf="$ivf_p95" 'BEGIN { if (ivf <= 0) { print "0.000000" } else { printf "%.6f", pq / ivf } }')"

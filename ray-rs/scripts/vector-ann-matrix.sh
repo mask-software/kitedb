@@ -58,10 +58,10 @@ run_case() {
   echo "$run_out" >>"$RAW_OUT"
   echo >>"$RAW_OUT"
 
-  build_ms="$(echo "$run_out" | rg '^build_elapsed_ms:' | awk '{print $2}')"
-  p50_ms="$(echo "$run_out" | rg '^search_p50_ms:' | awk '{print $2}')"
-  p95_ms="$(echo "$run_out" | rg '^search_p95_ms:' | awk '{print $2}')"
-  recall="$(echo "$run_out" | rg '^mean_recall_at_k:' | awk '{print $2}')"
+  build_ms="$(echo "$run_out" | grep '^build_elapsed_ms:' | awk '{print $2}')"
+  p50_ms="$(echo "$run_out" | grep '^search_p50_ms:' | awk '{print $2}')"
+  p95_ms="$(echo "$run_out" | grep '^search_p95_ms:' | awk '{print $2}')"
+  recall="$(echo "$run_out" | grep '^mean_recall_at_k:' | awk '{print $2}')"
 
   printf "%s,%s,%s,%s,%s,%s,%s\n" \
     "$algorithm" \
