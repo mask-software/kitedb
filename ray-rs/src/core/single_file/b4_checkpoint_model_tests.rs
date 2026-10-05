@@ -1395,7 +1395,7 @@ impl Model {
       }
       for cut in tables {
         chosen.extend(
-          sector_tears(events, header_end, cut)
+          sector_tears(events, cut)
             .into_iter()
             .map(|model| (cut, model)),
         );
@@ -1405,7 +1405,7 @@ impl Model {
           matches!(&events[cut - 1], IoEvent::Write { offset, data }
             if *offset >= header_end && data.len() as u64 > SECTOR)
         })
-        .map(|cut| (cut, sector_tears(events, header_end, cut)))
+        .map(|cut| (cut, sector_tears(events, cut)))
         .filter(|(_, tears)| !tears.is_empty())
         .collect();
       if !data.is_empty() {

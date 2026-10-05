@@ -116,26 +116,14 @@ pub(super) const SECTOR: u64 = 512;
 
 /// The sector tears (`CrashModel::SectorTear`) of the last of the first
 /// `cut` events, if it is a write over more than one sector: at every sector
-/// boundary inside a header page (below `header_end`), and at up to eight
-/// boundaries spread over any other write (its first and last among them),
-/// each both ways.
-pub(super) fn sector_tears(events: &[IoEvent], header_end: u64, cut: usize) -> Vec<CrashModel> {
+/// boundary inside it, each both ways (in pairs, boundary by boundary).
+pub(super) fn sector_tears(events: &[IoEvent], cut: usize) -> Vec<CrashModel> {
   let Some(IoEvent::Write { offset, data }) = cut.checked_sub(1).map(|last| &events[last]) else {
     return Vec::new();
   };
   let end = offset + data.len() as u64;
-  let boundaries: Vec<u64> = ((offset / SECTOR + 1) * SECTOR..end)
+  ((offset / SECTOR + 1) * SECTOR..end)
     .step_by(SECTOR as usize)
-    .collect();
-  let chosen: Vec<u64> = if *offset < header_end || boundaries.len() <= 8 {
-    boundaries
-  } else {
-    (0..8)
-      .map(|index| boundaries[index * (boundaries.len() - 1) / 7])
-      .collect()
-  };
-  chosen
-    .into_iter()
     .flat_map(|boundary| {
       [true, false].map(|new_first| CrashModel::SectorTear {
         boundary,
@@ -312,7 +300,7 @@ pub(super) fn crash_images(
     let models = CrashModel::FIXED
       .into_iter()
       .chain((0..independent).map(|seed| CrashModel::Independent(seed * 1_000_003 + cut as u64)))
-      .chain(sector_tears(events, header_end, cut));
+      .chain(sector_tears(events, cut));
     for model in models {
       if !model.fits(sync_mode) {
         continue;
@@ -455,11 +443,34 @@ fn a_long_segment_table_survives_a_crash_at_every_io_event_in(sync_mode: SyncMod
     .wal_segment_limit(64 * 1024 * 1024);
   let db = open_single_file(&path, options.clone()).expect("open");
   let header_end = 2 * db.header.read().page_size as u64;
-  let mut acked = Vec::new();
-  let mut index = 0;
-  while wal_segment_test_stats(&db).live < 11 && index < 20_000 {
-    acked.extend(commit_keys(&db, "fill", index, 1));
-    index += 1;
+  // Commit `index` (from 1) creates node `c{index}` and sets the `data` of
+  // node `n{index % 8}` to a value of some 1.5 KiB naming it: the log grows
+  // by the values, the snapshot holds only the last eight of them and small
+  // nodes, so each crash image of a checkpoint opens quickly.
+  db.begin(false).expect("begin");
+  let data = db.define_propkey("data").expect("data");
+  for slot in 0..8 {
+    db.create_node(Some(&format!("n{slot}"))).expect("node");
+  }
+  db.commit().expect("commit the nodes");
+  let value = |index: usize| format!("{index:06}-{}", "v".repeat(1_500));
+  let commit = |db: &SingleFileDB, index: usize| -> Result<()> {
+    db.begin(false)?;
+    let written = db.create_node(Some(&format!("c{index:06}"))).and_then(|_| {
+      let node = db.node_by_key(&format!("n{}", index % 8)).expect("node n");
+      db.set_node_prop(node, data, PropValue::String(value(index)))
+    });
+    if let Err(error) = written {
+      let _ = db.rollback();
+      return Err(error);
+    }
+    db.commit()
+  };
+  // Commits 1..=acked are acknowledged.
+  let mut acked = 0;
+  while wal_segment_test_stats(&db).live < 11 && acked < 20_000 {
+    commit(&db, acked + 1).expect("commit");
+    acked += 1;
   }
   assert!(
     wal_segment_test_stats(&db).live >= 11,
@@ -476,14 +487,9 @@ fn a_long_segment_table_survives_a_crash_at_every_io_event_in(sync_mode: SyncMod
   };
 
   // Each recording: what it is, the file before it, its writes and syncs,
-  // the commits acknowledged before it, and the one it acknowledged, if any.
-  type Recording = (
-    &'static str,
-    Vec<u8>,
-    Vec<IoEvent>,
-    Vec<String>,
-    Option<String>,
-  );
+  // the commits acknowledged before it, and whether it acknowledged the
+  // next.
+  type Recording = (&'static str, Vec<u8>, Vec<IoEvent>, usize, bool);
   let mut recordings: Vec<Recording> = Vec::new();
   let (mut appended, mut started) = (false, false);
   for _ in 0..2_000 {
@@ -492,9 +498,7 @@ fn a_long_segment_table_survives_a_crash_at_every_io_event_in(sync_mode: SyncMod
     }
     let (before, live) = (newest(&db), wal_segment_test_stats(&db).live);
     let base = std::fs::read(&path).expect("base image");
-    let key = key("tail", index);
-    index += 1;
-    let (result, events) = io_hooks::record_io_during(|| commit_key(&db, &key));
+    let (result, events) = io_hooks::record_io_during(|| commit(&db, acked + 1));
     result.expect("commit");
     let after = newest(&db);
     let what = if after.seq == before.seq && after.byte_len > before.byte_len {
@@ -512,28 +516,23 @@ fn a_long_segment_table_survives_a_crash_at_every_io_event_in(sync_mode: SyncMod
         entry >= 512,
         "{sync_mode:?}: setup: the newest entry lies in the first sector"
       );
-      recordings.push((what, base, events, acked.clone(), Some(key.clone())));
+      recordings.push((what, base, events, acked, true));
     }
-    acked.push(key);
+    acked += 1;
   }
   assert!(
     appended && started,
-    "{sync_mode:?}: setup: no spill appended to the newest segment ({appended}) or started one      ({started})"
+    "{sync_mode:?}: setup: no spill appended to the newest segment ({appended}) or started one \
+     ({started})"
   );
   let base = std::fs::read(&path).expect("base image");
   let (result, events) = io_hooks::record_io_during(|| db.checkpoint());
   result.expect("checkpoint");
-  recordings.push((
-    "a checkpoint that covers them",
-    base,
-    events,
-    acked.clone(),
-    None,
-  ));
+  recordings.push(("a checkpoint that covers them", base, events, acked, false));
   drop(db);
 
   let image_path = dir.path().join("long-table-image.kitedb");
-  for (recorded, base, events, before, key) in recordings {
+  for (recorded, base, events, before, commits) in recordings {
     let images = crash_images(&base, &events, header_end, sync_mode, 0);
     assert!(
       images
@@ -541,36 +540,46 @@ fn a_long_segment_table_survives_a_crash_at_every_io_event_in(sync_mode: SyncMod
         .any(|(_, what, _)| what.contains("SectorTear { boundary: 512")),
       "{sync_mode:?}, {recorded}: no header write torn at its first sector boundary"
     );
+    let last = before + usize::from(commits);
     for (durable_bound, what, image) in images {
       std::fs::write(&image_path, &image).expect("write image");
       let crashed = open_single_file(&image_path, options.clone())
         .unwrap_or_else(|error| panic!("{sync_mode:?}, {recorded}, {what}: unopenable: {error:?}"));
-      // Those before the recording, if a sync made them durable, and its
-      // commit once acknowledged.
-      let must_hold: Vec<String> = match durable_bound {
-        None => Vec::new(),
-        Some(bound) => before
-          .iter()
-          .cloned()
-          .chain(key.clone().filter(|_| bound == events.len()))
-          .collect(),
-      };
-      let order: Vec<&String> = before.iter().chain(&key).collect();
-      let present: Vec<bool> = order
-        .iter()
-        .map(|key| crashed.node_by_key(key).is_some())
+      // The commits it holds must be the first `held`: their nodes, none
+      // after, and each `n` node's value from the last of them to set it.
+      let present: Vec<bool> = (1..=last)
+        .map(|index| crashed.node_by_key(&format!("c{index:06}")).is_some())
         .collect();
-      let lost = missing(&crashed, &must_hold).len();
       let held = present.iter().filter(|&&present| present).count();
-      let prefix = present.windows(2).all(|pair| pair[0] || !pair[1]);
+      let prefix = present.iter().take(held).all(|&present| present);
+      let values: Vec<Option<PropValue>> = (0..8)
+        .map(|slot| {
+          let node = crashed.node_by_key(&format!("n{slot}")).expect("node n");
+          crashed.node_prop(node, data)
+        })
+        .collect();
+      let expected: Vec<Option<PropValue>> = (0..8)
+        .map(|slot| {
+          (1..=held)
+            .rev()
+            .find(|index| index % 8 == slot)
+            .map(|index| PropValue::String(value(index)))
+        })
+        .collect();
       let nodes = crashed.count_nodes();
       close_single_file(crashed).expect("close");
+      // Those before the recording, if a sync made them durable, and its
+      // commit once acknowledged.
+      let must_hold = match durable_bound {
+        None => 0,
+        Some(bound) => before + usize::from(commits && bound == events.len()),
+      };
       assert!(
-        lost == 0 && nodes == held && prefix,
-        "{sync_mode:?}, {recorded}, {what}: lost {lost} commits it must hold; it holds {held} of \
-         the {} keys committed (a prefix of the commit order: {prefix}) and {nodes} nodes (as \
-         many, unless a commit applied twice)",
-        order.len()
+        held >= must_hold && prefix && values == expected && nodes == 8 + held,
+        "{sync_mode:?}, {recorded}, {what}: holds {held} of the {last} commits (a prefix of \
+         the commit order: {prefix}) and must hold {must_hold}; its values match those \
+         commits: {}; it has {nodes} nodes (8 and one per commit held)",
+        values == expected
       );
       std::fs::remove_file(&image_path).expect("remove image");
     }
