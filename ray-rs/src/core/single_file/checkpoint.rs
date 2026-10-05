@@ -3558,6 +3558,10 @@ mod tests {
     opened_rx.recv().expect("writer opened");
 
     let checkpoint_db = Arc::clone(&db);
+    let (covered, generation) = {
+      let header = db.header.read();
+      (header.wal_segments.covered, header.active_snapshot_gen)
+    };
     let result = std::thread::spawn(move || {
       set_checkpoint_test_fault(Some(CheckpointPhase::CutReleased));
       checkpoint_db.background_checkpoint()
@@ -3566,7 +3570,28 @@ mod tests {
     .expect("checkpoint thread");
     assert!(result.is_err());
     assert_eq!(db.checkpoint_status(), CheckpointStatus::Idle);
-    assert_eq!(db.header.read().checkpoint_in_progress, 0);
+    // Nothing installed: the cut was a spill, which the failed run left in
+    // the log, its newest segment not sealed (`release_cut`).
+    {
+      let header = db.header.read();
+      assert_eq!(
+        header.active_snapshot_gen, generation,
+        "the failed run installed"
+      );
+      assert_eq!(
+        header.wal_segments.covered, covered,
+        "the failed run covered segments"
+      );
+      assert!(
+        header
+          .wal_segments
+          .entries
+          .last()
+          .is_some_and(|segment| !segment.sealed),
+        "the failed run's cut left the newest segment sealed: {:?}",
+        header.wal_segments.entries
+      );
+    }
 
     go_tx.send(()).expect("release writer");
     writer.join().expect("writer thread");
@@ -4221,6 +4246,7 @@ mod tests {
     drop(crashed);
 
     let checkpoint_db = Arc::clone(&db);
+    let generation = db.header.read().active_snapshot_gen;
     finishes_in_time(
       "blocking checkpoint after a panicked background checkpoint",
       move || checkpoint_db.checkpoint(),
@@ -4229,7 +4255,23 @@ mod tests {
     for key in ["before-cut", "after-cut"] {
       assert!(db.node_by_key(key).is_some(), "{key} missing live");
     }
-    assert_eq!(db.header.read().checkpoint_in_progress, 0);
+    // It ran: a new snapshot holds the whole log, so the header names no WAL
+    // segment and the WAL is empty.
+    {
+      let header = db.header.read();
+      assert!(
+        header.active_snapshot_gen > generation,
+        "no checkpoint installed"
+      );
+      assert!(
+        header.wal_segments.is_empty(),
+        "the blocking checkpoint left WAL segments"
+      );
+    }
+    assert!(
+      db.wal_buffer.lock().is_empty(),
+      "the blocking checkpoint left the WAL"
+    );
 
     commit_node(&db, "after-checkpoint");
     drop(db);
@@ -4284,12 +4326,18 @@ mod tests {
     opened_rx.recv().expect("writer opened");
 
     let checkpoint_db = Arc::clone(&db);
+    let covered = db.header.read().wal_segments.covered;
     finishes_in_time("background checkpoint after a stopped one", move || {
       checkpoint_db.background_checkpoint()
     })
     .expect("background checkpoint");
     assert!(db.header.read().active_snapshot_gen > start_gen);
-    assert_eq!(db.header.read().checkpoint_in_progress, 0);
+    // It covered the stopped run's cut and its own (the open transaction's
+    // records are still its own, below the size it writes to the WAL).
+    assert!(
+      db.header.read().wal_segments.covered > covered,
+      "the checkpoint covered no segment"
+    );
     go_tx.send(()).expect("release writer");
     writer.join().expect("writer thread");
 

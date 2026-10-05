@@ -123,6 +123,12 @@ fn bulk_load_writes_snapshot_bytes_linear_in_the_data() {
   let final_bytes = snapshot_bytes(&db);
   let cuts = checkpoint_test_cuts(&db);
   close_single_file(db).expect("close");
+  // Automatic checkpoints ran during the load (otherwise the bound below
+  // holds trivially).
+  assert!(
+    cuts >= 2,
+    "only {cuts} background checkpoints ran during a load of about 20 WALs"
+  );
   assert!(
     written <= 8 * final_bytes,
     "the load wrote {written} snapshot bytes ({:.1}x the final {final_bytes}-byte snapshot) over \
