@@ -24,6 +24,12 @@ thread_local! {
   /// primitives should log here too.
   pub(crate) static SYNC_PRIMITIVE_LOG: std::cell::RefCell<Vec<&'static str>> =
     const { std::cell::RefCell::new(Vec::new()) };
+
+  /// Test probe: how each `FilePager` length change on this thread was made
+  /// ("set_len", or "write" for a file grown by writing its last byte), and
+  /// to what length, oldest first.
+  pub(crate) static LENGTH_CHANGE_LOG: std::cell::RefCell<Vec<(&'static str, u64)>> =
+    const { std::cell::RefCell::new(Vec::new()) };
 }
 pub(crate) mod io_hooks;
 
@@ -503,6 +509,8 @@ impl FilePager {
   fn set_file_len(&mut self, length: u64) -> Result<()> {
     // Noted first: a failed set_len may still have changed the length.
     self.length_unsynced.store(true, Ordering::Relaxed);
+    #[cfg(test)]
+    LENGTH_CHANGE_LOG.with(|log| log.borrow_mut().push(("set_len", length)));
     self.file.set_len(length)?;
     self.file_size = length;
     Ok(())
@@ -1091,6 +1099,50 @@ mod tests {
     // Invalid: not power of 2
     assert!(!is_valid_page_size(5000));
     assert!(!is_valid_page_size(6000));
+  }
+
+  /// A pager's file grows by a write of its new last byte on macOS, never by
+  /// ftruncate: growing a file with ftruncate while a mapping of it lives (an
+  /// installed snapshot) leaves its vnode in a state where every fsync of it
+  /// costs 0.2-0.5 ms with nothing to write, for seconds (see
+  /// `FilePager::set_file_len`). It still shrinks with ftruncate, and the
+  /// bytes it grows by are zeros either way.
+  #[test]
+  fn the_file_grows_by_a_write_on_macos() {
+    let temp_file = NamedTempFile::new().expect("temp file");
+    let mut pager = create_pager(temp_file.path(), 4096).expect("pager");
+    pager.write_page(0, &[7u8; 4096]).expect("write");
+    let mapping = pager.map_immutable_range(0, 4096).expect("map");
+    LENGTH_CHANGE_LOG.with(|log| log.borrow_mut().clear());
+    let start = pager.allocate_pages(3).expect("allocate");
+    pager
+      .write_range(8 * 4096 + 100, &[9u8; 10])
+      .expect("write past the end");
+    pager.truncate_pages(6).expect("truncate");
+    let log = LENGTH_CHANGE_LOG.with(|log| log.borrow().clone());
+    drop(mapping);
+    let grow = if cfg!(target_os = "macos") {
+      "write"
+    } else {
+      "set_len"
+    };
+    assert_eq!(
+      log,
+      vec![
+        (grow, 4 * 4096),
+        (grow, 8 * 4096 + 110),
+        ("set_len", 6 * 4096)
+      ],
+      "how the file's length changed"
+    );
+    assert_eq!(start, 1);
+    let bytes = std::fs::read(temp_file.path()).expect("read");
+    assert_eq!(bytes.len(), 6 * 4096);
+    assert!(bytes[..4096].iter().all(|&byte| byte == 7));
+    assert!(
+      bytes[4096..].iter().all(|&byte| byte == 0),
+      "grown bytes are zeros"
+    );
   }
 
   #[test]
