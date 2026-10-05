@@ -33,6 +33,12 @@ fn options() -> SingleFileOpenOptions {
     .wal_segment_limit(1024 * 1024)
 }
 
+/// The most a step these tests time may take on a loaded machine (a
+/// commit that spills and waits on its syncs, an install, a wakeup): half
+/// the 20 s their long paced commits wait, so a wait that ran to that bound
+/// still fails them.
+const LOADED_STEP: Duration = Duration::from_secs(10);
+
 fn wait_until(deadline: Instant, mut done: impl FnMut() -> bool) -> bool {
   while !done() {
     if Instant::now() >= deadline {
@@ -130,21 +136,24 @@ fn start_a_long_pace(db: &SingleFileDB, bound: Duration) -> LongPace {
 /// when the pacing wait holds the commit lock: its paced commits wait about
 /// 30 ms each (the run's time spread over the room below the limit), so
 /// other commits slip in between. Here one paced commit waits its whole
-/// bound (2 s: no room is left below the limit), and another thread's
-/// commit must not wait for it.
+/// bound (20 s: no room is left below the limit), and another thread's
+/// commit must not wait for it: it is visible while that one still paces.
+/// (Timed by the long wait, not by the other commit: on a loaded machine a
+/// commit's syncs alone can take a second or two.)
 #[test]
 fn fresh5_a_long_paced_wait_holds_no_lock() {
   let dir = tempdir().expect("tempdir");
   let db = open_single_file(dir.path().join("long-pace.kitedb"), options()).expect("open");
-  let (barrier, run, paced) = start_a_long_pace(&db, Duration::from_secs(2));
-  // Another commit: it is durable and visible at once, whatever its own
-  // pacing after (which this does not time).
+  let (barrier, run, paced) = start_a_long_pace(&db, Duration::from_secs(20));
+  // Another commit: it is durable and visible, whatever its own pacing
+  // after (which this does not time).
   let started = Instant::now();
   let other = commit_on_a_thread(&db, key("other", 0));
-  let visible = wait_until(Instant::now() + Duration::from_secs(5), || {
+  let visible = wait_until(Instant::now() + LOADED_STEP, || {
     db.node_by_key(&key("other", 0)).is_some()
   });
   let other_took = started.elapsed();
+  let still_pacing = !paced.is_finished();
   set_wal_segment_test_limit(&db, 1024 * 1024);
   barrier.wait();
   run.join().expect("the run").expect("the held run");
@@ -153,9 +162,10 @@ fn fresh5_a_long_paced_wait_holds_no_lock() {
   close_single_file(db).expect("close");
   assert!(result.is_ok(), "the other commit: {result:?}");
   assert!(
-    visible && other_took < Duration::from_millis(1_000),
-    "a commit beside a writer pacing (for up to 2 s) was visible {visible} after \
-     {other_took:?}: the pacing writer holds a lock the commit needs"
+    visible && still_pacing,
+    "a commit beside a writer pacing (for up to 20 s) was visible {visible} after \
+     {other_took:?}, while that writer still paced {still_pacing}: the pacing writer holds a \
+     lock the commit needs"
   );
 }
 
@@ -176,7 +186,7 @@ fn fresh5_the_run_ending_ends_a_long_paced_wait() {
   close_single_file(db).expect("close");
   assert!(result.is_ok(), "the paced commit: {result:?}");
   assert!(
-    woke < Duration::from_secs(2),
+    woke < LOADED_STEP,
     "the paced commit went on {woke:?} after the run ended (it paces up to 20 s)"
   );
 }

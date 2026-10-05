@@ -38,6 +38,13 @@ fn options() -> SingleFileOpenOptions {
     .wal_segment_limit(1024 * 1024)
 }
 
+/// The most a step these tests time may take: a commit (which may spill
+/// the WAL and wait on its syncs), an install, a wakeup. Generous, for a
+/// loaded machine (a spill's syncs took 2 s under fsync contention), and
+/// half the 20 s a paced commit may wait in the tests that time one, so a
+/// wait that ran to that bound still fails them.
+const LOADED_STEP: Duration = Duration::from_secs(10);
+
 fn wait_until(deadline: Instant, mut done: impl FnMut() -> bool) -> bool {
   while !done() {
     if Instant::now() >= deadline {
@@ -201,7 +208,10 @@ fn a_writer_outrunning_a_running_checkpoint_is_paced_not_stopped() {
 
 /// (b) A writer pacing holds no lock: other threads begin, write, commit
 /// and read meanwhile, and the held run installs (it takes the commit lock
-/// and the checkpoint gate), which also ends the pacing.
+/// and the checkpoint gate), which also ends the pacing. (Its paced commits
+/// wait some 30 ms each, so others slip in between even past a pacer that
+/// held a lock: review_fresh5's T1 and T2 pace one commit for its whole
+/// bound.)
 #[test]
 fn a_pacing_writer_holds_no_lock() {
   let dir = tempdir().expect("tempdir");
@@ -226,7 +236,7 @@ fn a_pacing_writer_holds_no_lock() {
     let handle = db.shared_handle();
     std::thread::spawn(move || commit_key(&handle, "other"))
   };
-  let visible = wait_until(Instant::now() + Duration::from_secs(5), || {
+  let visible = wait_until(Instant::now() + LOADED_STEP, || {
     db.node_by_key("other").is_some()
   });
   let beside = started.elapsed();
@@ -243,16 +253,16 @@ fn a_pacing_writer_holds_no_lock() {
   close_single_file(db).expect("close");
   assert!(pacing, "no writer paced while the checkpoint was held");
   assert!(
-    first && visible && beside < Duration::from_secs(2),
+    first && visible && beside < LOADED_STEP,
     "beside a pacing writer: its first commit read back {first}, another thread's commit \
      visible {visible}, in {beside:?}"
   );
   assert!(
-    installed.is_ok() && install_took < Duration::from_secs(5),
+    installed.is_ok() && install_took < LOADED_STEP,
     "the held run's install beside a pacing writer: {installed:?} in {install_took:?}"
   );
   assert!(
-    writer_woke < Duration::from_secs(2),
+    writer_woke < LOADED_STEP,
     "the pacing writer went on {writer_woke:?} after the run ended (it waits up to 20 s)"
   );
 }
@@ -337,16 +347,14 @@ fn close_ends_pacing() {
   let closing = Instant::now();
   let closer = std::thread::spawn(move || close_single_file(db));
   // The close waits for the held run (its checkpoint does); not the writer.
-  let woke = wait_until(Instant::now() + Duration::from_secs(5), || {
-    writer.thread.is_finished()
-  });
+  let woke = wait_until(Instant::now() + LOADED_STEP, || writer.thread.is_finished());
   let writer_woke = closing.elapsed();
   let _ = run.release();
   let closed = closer.join().expect("the close panicked");
   let writer_result = writer.thread.join();
   assert!(pacing, "no writer paced while the checkpoint was held");
   assert!(
-    woke && writer_woke < Duration::from_secs(2),
+    woke && writer_woke < LOADED_STEP,
     "a pacing writer went on {writer_woke:?} after the close began (it waits up to 20 s)"
   );
   assert!(closed.is_ok(), "the close: {closed:?}");
@@ -383,7 +391,7 @@ fn pacing_ends_when_the_run_ends() {
   assert!(pacing, "no writer paced while the checkpoint was held");
   assert!(installed.is_ok(), "the held run: {installed:?}");
   assert!(
-    writer_woke < Duration::from_secs(2),
+    writer_woke < LOADED_STEP,
     "the pacing writer went on {writer_woke:?} after the run ended (it waits up to 20 s)"
   );
   assert_eq!(paced_after, 0, "commits paced after the run ended");
