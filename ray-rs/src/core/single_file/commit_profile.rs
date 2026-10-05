@@ -108,6 +108,10 @@ stages! {
   /// A background checkpoint's install, while it holds the commit lock
   /// (the replay of the commits since its first replay, and the install).
   CheckpointLocked,
+  /// Writing a header page (`persist_header`).
+  HeaderPageWrite,
+  /// Syncing after it, when asked to.
+  HeaderSync,
 }
 
 #[cfg(feature = "bench-profile")]

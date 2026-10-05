@@ -644,10 +644,13 @@ impl SingleFileDB {
       .checked_add(1)
       .ok_or_else(|| crate::error::KiteError::Internal("header generation overflow".to_string()))?;
 
+    let write_mark = commit_profile::start();
     write_header_slot(pager, header, next_slot)?;
+    commit_profile::end(commit_profile::Stage::HeaderPageWrite, write_mark);
     if sync {
       // A header slot lies inside the file, so a data sync makes it durable
       // (a full sync if the file's length changed since the last one).
+      let _timed = commit_profile::timed(commit_profile::Stage::HeaderSync);
       pager.sync_data()?;
     }
     self.header_slot.store(next_slot, Ordering::Release);
@@ -952,6 +955,29 @@ impl SingleFileDB {
   #[cfg(feature = "bench-profile")]
   pub fn commit_profile_report() -> String {
     commit_profile::report()
+  }
+
+  /// The WAL segments the header names: (seq, start page, page count, byte
+  /// length), and the snapshot's (start page, page count).
+  #[cfg(feature = "bench-profile")]
+  pub fn bench_log_layout(&self) -> (Vec<(u64, u64, u64, u64)>, (u64, u64)) {
+    let header = self.header.read();
+    (
+      header
+        .wal_segments
+        .entries
+        .iter()
+        .map(|segment| {
+          (
+            segment.seq,
+            segment.start_page,
+            segment.page_count,
+            segment.byte_len,
+          )
+        })
+        .collect(),
+      (header.snapshot_start_page, header.snapshot_page_count),
+    )
   }
 
   /// Clear the commit profile's totals.
