@@ -82,6 +82,16 @@ fn secondary_region_start(capacity: u64) -> u64 {
   (capacity as f64 * PRIMARY_REGION_RATIO) as u64
 }
 
+/// Bytes of the region the WAL `header` describes takes records in (its
+/// primary region: three quarters of it).
+pub(crate) fn wal_region_bytes(header: &DbHeaderV1) -> u64 {
+  secondary_region_start(
+    header
+      .wal_page_count
+      .saturating_mul(header.page_size as u64),
+  )
+}
+
 /// The salt of the records at `offset` (relative to the WAL start) of the WAL
 /// `header` describes: the salt of the region holding that offset.
 pub(crate) fn header_salt_at(header: &DbHeaderV1, offset: u64) -> u32 {

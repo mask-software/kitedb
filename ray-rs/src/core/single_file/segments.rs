@@ -22,7 +22,7 @@ use std::collections::HashMap;
 
 use crate::constants::*;
 use crate::core::pager::FilePager;
-use crate::core::wal::buffer::WalBuffer;
+use crate::core::wal::buffer::{wal_region_bytes, WalBuffer};
 use crate::core::wal::record::{
   apply_wal_salt, parse_wal_record_with_salt, wal_records_end, ParsedWalRecord,
 };
@@ -231,18 +231,15 @@ impl SingleFileDB {
   }
 
   /// Bytes of log (WAL segments and WAL) at which a checkpoint starts: the
-  /// `checkpoint_log_ratio` of the snapshot's size, at least four WALs (so a
-  /// small database does not checkpoint at every spill), and at most the log
-  /// budget, which bounds the memory the delta replaying the log takes
-  /// (about ten times its size) on a large database. A budget too large to
-  /// compute with saturates: no cap.
+  /// `checkpoint_log_ratio` of the snapshot's size, at least half the WAL's
+  /// region (three eighths of the WAL: where earlier releases checkpointed
+  /// by default, so a small database holds no more log, and no larger delta,
+  /// than it did with them), and at most the log budget, which bounds the
+  /// memory the delta replaying the log takes (about ten times its size) on
+  /// a large database. A budget too large to compute with saturates: no cap.
   pub(crate) fn checkpoint_log_trigger(&self, header: &DbHeaderV1) -> u64 {
     let page_size = header.page_size as u64;
-    let floor = header
-      .wal_page_count
-      .saturating_mul(page_size)
-      .saturating_mul(4)
-      .min(self.checkpoint_log_budget);
+    let floor = (wal_region_bytes(header) / 2).min(self.checkpoint_log_budget);
     let snapshot = header.snapshot_page_count.saturating_mul(page_size);
     // Saturates at u64::MAX.
     let wanted = (self.checkpoint_log_ratio * snapshot as f64) as u64;

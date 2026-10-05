@@ -123,14 +123,20 @@ fn review_snapshot_pages_chosen_at_eof_are_not_taken_by_a_concurrent_spill() {
 fn review_checkpoint_thread_reaping_an_abandoned_transaction_at_the_limit_does_not_hang() {
   let dir = tempdir().expect("tempdir");
   let path = dir.path().join("reap-hang.kitedb");
-  // MVCC: the writer and the abandoned transaction are open at once.
+  // MVCC: the writer and the abandoned transaction are open at once. (The
+  // trigger is a thousand times the snapshot, whose first checkpoint below
+  // makes it some pages: since decision Q4 of the fresh review the trigger
+  // of an empty database is under a WAL, and this needs a spill below it.)
   let options = SingleFileOpenOptions::new()
     .wal_size(SMALL_WAL)
     .sync_mode(SyncMode::Normal)
-    .mvcc(true);
+    .mvcc(true)
+    .checkpoint_log_ratio(1000.0);
   let db = Arc::new(open_single_file(&path, options).expect("open"));
+  commit_key(&db, &key("seed", 0)).expect("commit");
+  db.checkpoint().expect("checkpoint");
   // A WAL segment, and a WAL that just spilled; below the checkpoint
-  // trigger (four WALs).
+  // trigger.
   let mut index = 0;
   while wal_segment_test_stats(&db).live == 0 && index < 1_000 {
     commit_key(&db, &key("pre", index)).expect("commit");

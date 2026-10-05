@@ -4307,8 +4307,15 @@ mod tests {
     let _serial = checkpoint_test_serial();
     let temp_dir = tempdir().expect("temp dir");
     let db_path = temp_dir.path().join("checkpoint-wait-vs-blocking.kitedb");
-    let options = SingleFileOpenOptions::new().wal_size(64 * 1024);
+    // The trigger is a thousand times the snapshot (some pages, after the
+    // checkpoint below): the log stays below it here. (An empty database's
+    // trigger is under a WAL.)
+    let options = SingleFileOpenOptions::new()
+      .wal_size(64 * 1024)
+      .checkpoint_log_ratio(1000.0);
     let db = Arc::new(open_single_file(&db_path, options.clone()).expect("open"));
+    commit_node(&db, "seed");
+    db.checkpoint().expect("checkpoint");
     // Below the checkpoint trigger: only writers waiting for space start one.
     set_wal_segment_test_limit(&db, 64 * 1024);
     commit_node(&db, "before-cut");
