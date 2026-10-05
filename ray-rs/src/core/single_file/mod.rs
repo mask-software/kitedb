@@ -30,6 +30,7 @@ mod checkpoint;
 mod checkpoint_thread;
 mod commit_profile;
 mod compactor;
+mod header_cell;
 mod iter;
 mod mvcc_history;
 mod open;
@@ -354,8 +355,9 @@ pub struct SingleFileInner {
   pub(crate) closed: AtomicBool,
   /// Page-based I/O
   pub(crate) pager: Mutex<FilePager>,
-  /// Database header
-  pub(crate) header: RwLock<DbHeaderV1>,
+  /// Database header, and the log's headroom below the checkpoint trigger
+  /// (see `HeaderCell`).
+  pub(crate) header: header_cell::HeaderCell,
   /// Physical header slot containing the newest installed header.
   pub(crate) header_slot: AtomicU32,
   /// WAL buffer manager
@@ -485,13 +487,6 @@ pub struct SingleFileInner {
   /// Bytes of a new WAL segment extent, if the options set it (see
   /// `wal_segment_extent_pages`).
   pub(crate) wal_segment_size: Option<u64>,
-  /// A checkpoint starts once the log the snapshot does not cover (WAL
-  /// segments and WAL) reaches this fraction of the snapshot's size, within
-  /// the limits of `checkpoint_log_trigger`.
-  pub(crate) checkpoint_log_ratio: f64,
-  /// The most log an automatic checkpoint waits for (see
-  /// `checkpoint_log_trigger`, `wal_segment_limit`).
-  pub(crate) checkpoint_log_budget: u64,
   /// An explicit limit on the bytes of WAL segments (0: the default; see
   /// `wal_segment_limit`).
   pub(crate) wal_segment_limit_bytes: AtomicU64,

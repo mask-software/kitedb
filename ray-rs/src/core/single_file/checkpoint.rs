@@ -1147,7 +1147,7 @@ impl SingleFileDB {
     if !self.auto_checkpoint
       || self.read_only
       || self.is_checkpoint_running()
-      || !(segments_full || asked || self.log_usage_ratio() >= 1.0)
+      || !(segments_full || asked || self.log_reached_trigger())
     {
       return;
     }

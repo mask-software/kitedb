@@ -1283,7 +1283,13 @@ fn open_single_file_internal(
     read_only: options.read_only,
     closed: AtomicBool::new(false),
     pager: Mutex::new(pager),
-    header: RwLock::new(header),
+    header: super::header_cell::HeaderCell::new(
+      header,
+      super::header_cell::LogTrigger {
+        ratio: options.checkpoint_log_ratio,
+        budget: options.checkpoint_log_budget,
+      },
+    ),
     header_slot: AtomicU32::new(header_slot),
     wal_buffer: Mutex::new(wal_buffer),
     snapshot: super::CacheAligned(RwLock::new(super::CacheAligned(snapshot))),
@@ -1329,8 +1335,6 @@ fn open_single_file_internal(
     auto_checkpoint_failure: Mutex::new(Default::default()),
     writes_refused: std::sync::OnceLock::new(),
     wal_segment_size,
-    checkpoint_log_ratio: options.checkpoint_log_ratio,
-    checkpoint_log_budget: options.checkpoint_log_budget,
     wal_segment_limit_bytes: AtomicU64::new(options.wal_segment_limit.unwrap_or(0)),
     wal_spills: AtomicU64::new(0),
     spilled_txids: Mutex::new(spilled_txids),

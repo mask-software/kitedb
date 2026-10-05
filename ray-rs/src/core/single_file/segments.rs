@@ -22,7 +22,7 @@ use std::collections::HashMap;
 
 use crate::constants::*;
 use crate::core::pager::FilePager;
-use crate::core::wal::buffer::{wal_region_bytes, WalBuffer};
+use crate::core::wal::buffer::WalBuffer;
 use crate::core::wal::record::{
   apply_wal_salt, parse_wal_record_with_salt, wal_records_end, ParsedWalRecord,
 };
@@ -231,20 +231,10 @@ impl SingleFileDB {
     extent.div_ceil(page_size)
   }
 
-  /// Bytes of log (WAL segments and WAL) at which a checkpoint starts: the
-  /// `checkpoint_log_ratio` of the snapshot's size, at least half the WAL's
-  /// region (three eighths of the WAL: where earlier releases checkpointed
-  /// by default, so a small database holds no more log, and no larger delta,
-  /// than it did with them), and at most the log budget, which bounds the
-  /// memory the delta replaying the log takes (about ten times its size) on
-  /// a large database. A budget too large to compute with saturates: no cap.
+  /// Bytes of log (WAL segments and WAL) at which a checkpoint starts (see
+  /// `LogTrigger::bytes`).
   pub(crate) fn checkpoint_log_trigger(&self, header: &DbHeaderV1) -> u64 {
-    let page_size = header.page_size as u64;
-    let floor = (wal_region_bytes(header) / 2).min(self.checkpoint_log_budget);
-    let snapshot = header.snapshot_page_count.saturating_mul(page_size);
-    // Saturates at u64::MAX.
-    let wanted = (self.checkpoint_log_ratio * snapshot as f64) as u64;
-    wanted.clamp(floor, self.checkpoint_log_budget.max(floor))
+    self.header.trigger().bytes(header)
   }
 
   /// The most bytes of WAL segments: past it the WAL spills no more, and
@@ -266,7 +256,16 @@ impl SingleFileDB {
     trigger
       .saturating_mul(2)
       .max(wal.saturating_mul(16))
-      .min(self.checkpoint_log_budget.saturating_mul(4))
+      .min(self.header.trigger().budget.saturating_mul(4))
+  }
+
+  /// Whether the log the snapshot does not cover reached the checkpoint
+  /// trigger (`log_usage_ratio` at 1.0 or more), without the header's lock:
+  /// the WAL's bytes against its headroom as of the header's last write
+  /// (see `HeaderCell`).
+  pub(crate) fn log_reached_trigger(&self) -> bool {
+    let wal_bytes = self.wal_buffer.lock().used();
+    wal_bytes >= self.header.wal_headroom()
   }
 
   /// The size of the log the snapshot does not cover (the WAL segments past
