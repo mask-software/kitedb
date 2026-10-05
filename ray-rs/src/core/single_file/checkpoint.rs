@@ -4497,10 +4497,23 @@ mod tests {
     assert_eq!(reopened.out_edges(a), vec![(knows, b)]);
   }
 
+  /// Whether `thread` ends by `deadline` (a deadlocked one never does).
+  fn ends_by<T>(thread: &std::thread::JoinHandle<T>, deadline: Instant) -> bool {
+    while !thread.is_finished() {
+      if Instant::now() >= deadline {
+        return false;
+      }
+      std::thread::sleep(Duration::from_millis(1));
+    }
+    true
+  }
+
   /// A blocking checkpoint must not hold the gate waiting for a transaction
   /// whose writer is itself waiting for a background checkpoint's install to
   /// free WAL segment space: that install needs the gate. Everything
-  /// finishes, promptly.
+  /// finishes. (A deadlock never does: the threads get 30 s, generous for a
+  /// loaded machine's syncs. This used to join them unbounded, so a
+  /// deadlock hung the test, and then assert they took under 4 s.)
   #[test]
   fn blocking_checkpoint_does_not_deadlock_with_a_writer_waiting_for_a_background_install() {
     let _serial = checkpoint_test_serial();
@@ -4563,12 +4576,35 @@ mod tests {
       std::thread::yield_now();
     }
 
+    watch_checkpoint_phases(&db);
     let blocking_db = Arc::clone(&db);
     let blocking = std::thread::spawn(move || blocking_db.checkpoint());
-    std::thread::sleep(Duration::from_millis(100));
+    // The blocking checkpoint has the gate, and decides with it what to wait
+    // for, before the background checkpoint goes on to its install.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !checkpoint_test_reached(&db)
+      .iter()
+      .any(|(phase, _, _)| *phase == CheckpointPhase::GateAcquired)
+    {
+      assert!(
+        std::time::Instant::now() < deadline,
+        "the blocking checkpoint never took the gate"
+      );
+      std::thread::yield_now();
+    }
     snapshot_written.wait();
 
-    let started = std::time::Instant::now();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let ended = [
+      ends_by(&background, deadline),
+      ends_by(&writer, deadline),
+      ends_by(&blocking, deadline),
+    ];
+    assert_eq!(
+      ended, [true; 3],
+      "the background checkpoint, the writer and the blocking checkpoint ended so in 30 s: \
+       they deadlock"
+    );
     background
       .join()
       .expect("background checkpoint thread")
@@ -4581,11 +4617,6 @@ mod tests {
       .join()
       .expect("blocking checkpoint thread")
       .expect("blocking checkpoint");
-    assert!(
-      started.elapsed() < Duration::from_secs(4),
-      "took {:?} to finish",
-      started.elapsed()
-    );
 
     for key in ["before-cut", "w-0-", "w-59-"] {
       let key = if key.ends_with('-') {
