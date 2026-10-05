@@ -411,7 +411,9 @@ fn crash_while_the_checkpoint_thread_is_held_at(phase: CheckpointPhase) {
   let mut writer = Some(writer);
   if !installing {
     // The held run holds no lock here: let the writer finish its commit.
-    writer.take().map(|writer| writer.join().expect("writer"));
+    if let Some(writer) = writer.take() {
+      writer.join().expect("writer");
+    }
   }
   // Nothing writes now: the run is held, and in its install it holds the
   // commit lock, so the writer cannot write.
