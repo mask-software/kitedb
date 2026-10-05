@@ -363,3 +363,39 @@ fn pacing_ends_when_the_run_ends() {
   );
   assert_eq!(paced_after, 0, "commits paced after the run ended");
 }
+
+/// With blocking automatic checkpoints (`background_checkpoint` off) no
+/// commit is paced, even while an application's background checkpoint runs
+/// past the trigger: writers do not outrun automatic checkpoints that run
+/// beside them there. (With automatic background checkpoints on, an
+/// application's run paces commits as an automatic one does: every claimed
+/// run counts.)
+#[test]
+fn blocking_checkpoints_pace_no_commit() {
+  let dir = tempdir().expect("tempdir");
+  let db = open_single_file(
+    dir.path().join("blocking.kitedb"),
+    options().background_checkpoint(false),
+  )
+  .expect("open");
+  warm_up(&db);
+  // A paced commit would wait up to 20 ms.
+  set_pacing_test(
+    &db,
+    Some(Duration::from_secs(100)),
+    Some(Duration::from_millis(20)),
+  );
+  // An application's background checkpoint, held: the automatic check
+  // after each commit finds it running, and leaves it.
+  let run = HeldRun::start(&db);
+  for index in 0..300 {
+    commit_key(&db, &key("beside", index)).expect("commit");
+  }
+  let paced = pacing_test_stats(&db).paced;
+  run.release().expect("the held run");
+  close_single_file(db).expect("close");
+  assert_eq!(
+    paced, 0,
+    "commits paced with blocking automatic checkpoints, beside an application's run"
+  );
+}
