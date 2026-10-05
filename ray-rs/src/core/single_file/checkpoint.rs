@@ -1016,14 +1016,15 @@ impl SingleFileDB {
   /// A progress point of a checkpoint: a checkpoint thread's run stops here
   /// once the database closes, unless its install has begun. No header names
   /// the snapshot it was building, so its pages are free again (at the
-  /// latest at the next open), and every commit is in the log.
+  /// latest at the next open), and every commit is in the log. Not a failure
+  /// (`CheckpointDeclined`): nothing records or reports it.
   fn checkpoint_progressed(&self) -> Result<()> {
     if on_checkpoint_thread()
       && self.checkpoint_abandoned.load(Ordering::Acquire)
       && !self.checkpoint_installing.load(Ordering::Acquire)
     {
-      return Err(KiteError::Internal(
-        "background checkpoint abandoned: the database is closing".to_string(),
+      return Err(KiteError::CheckpointDeclined(
+        "abandoned: the database is closing".to_string(),
       ));
     }
     Ok(())
