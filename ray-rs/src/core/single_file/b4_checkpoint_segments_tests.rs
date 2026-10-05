@@ -247,12 +247,26 @@ fn spill_fails_safely_at_each_of_its_steps() {
   }
 }
 
-/// S2, a checkpoint's steps, on its thread: a checkpoint that fails at its
-/// cut, once its snapshot is durable, once its install is durable in one
-/// header slot, or once both slots name it but before it frees the segments
-/// it covers, runs on the checkpoint thread (never on a committer), leaves a
-/// database that a crash right then reopens with every acknowledged commit,
-/// and the next checkpoint succeeds.
+/// S2, a checkpoint's steps, on its thread: its cut released, its snapshot
+/// durable, its install durable in one header slot, and in both but before
+/// it frees the segments it covers.
+///
+/// - A crash at the step (a copy of the file while the run is held there,
+///   nothing else writing) reopens with every acknowledged commit, on the
+///   new snapshot (and its segment table) once a header slot names it.
+/// - A run that fails there runs on the checkpoint thread (never on a
+///   committer) and leaves a database that goes on: a crash at any write of
+///   the next two spills (crash images), and after each of several WALs of
+///   writes (crash copies), keeps every commit, since nothing a spill
+///   allocates is a page a header slot still names; and the next checkpoint
+///   succeeds. At `SegmentsReleased` the
+///   fault stands for a crash before the segments are freed (the run
+///   succeeds and frees nothing): a reopen reclaims them, and the clean close
+///   after it leaves a compact file.
+///
+/// (Reworked with the fresh review: the crash copy after a fault usually
+/// opened the old header slot, since commits had rewritten the failed one,
+/// and under one WAL of writes followed each fault.)
 #[test]
 fn checkpoint_thread_fails_safely_at_each_of_its_steps() {
   for phase in [
@@ -261,44 +275,222 @@ fn checkpoint_thread_fails_safely_at_each_of_its_steps() {
     CheckpointPhase::HeaderDurable,
     CheckpointPhase::SegmentsReleased,
   ] {
-    let dir = tempdir().expect("tempdir");
-    let path = dir.path().join("checkpoint-thread-fault.kitedb");
-    let db = open_single_file(&path, options().sync_mode(SyncMode::Normal)).expect("open");
-    watch_checkpoint_phases(&db);
-    set_checkpoint_test_db_fault(&db, phase, false);
-    // About 3 MiB of WAL, 12 times the checkpoint trigger.
-    let (mut acked, reached) = commit_until_reached(&db, "before", phase, 10_000);
-    let threads: Vec<Option<String>> = checkpoint_test_reached(&db)
-      .into_iter()
-      .filter(|(reached, _, _)| *reached == phase)
-      .map(|(_, thread, _)| thread)
+    crash_while_the_checkpoint_thread_is_held_at(phase);
+    checkpoint_thread_run_failing_at(phase);
+  }
+}
+
+fn crash_while_the_checkpoint_thread_is_held_at(phase: CheckpointPhase) {
+  let dir = tempdir().expect("tempdir");
+  let path = dir.path().join("checkpoint-thread-held.kitedb");
+  let db = Arc::new(open_single_file(&path, options().sync_mode(SyncMode::Normal)).expect("open"));
+  watch_checkpoint_phases(&db);
+  let generation = db.header.read().active_snapshot_gen;
+  let held = Arc::new(Barrier::new(2));
+  set_checkpoint_test_barrier(&db, phase, Arc::clone(&held));
+  let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+  let acked = Arc::new(std::sync::Mutex::new(Vec::new()));
+  let writer = {
+    let (db, stop, acked) = (Arc::clone(&db), Arc::clone(&stop), Arc::clone(&acked));
+    std::thread::spawn(move || {
+      for index in 0..20_000 {
+        if stop.load(Ordering::Acquire) {
+          break;
+        }
+        let key = key("before", index);
+        if commit_key(&db, &key).is_ok() {
+          acked.lock().expect("acked").push(key);
+        }
+      }
+    })
+  };
+  let deadline = Instant::now() + Duration::from_secs(20);
+  let parked = wait_for("a held checkpoint", deadline, || {
+    checkpoint_test_reached(&db)
+      .iter()
+      .any(|(reached, thread, parked)| {
+        *reached == phase && *parked && thread.as_deref() == Some(CHECKPOINT_THREAD_NAME)
+      })
+  });
+  stop.store(true, Ordering::Release);
+  let installing = matches!(
+    phase,
+    CheckpointPhase::HeaderDurable | CheckpointPhase::SegmentsReleased
+  );
+  let mut writer = Some(writer);
+  if !installing {
+    // The held run holds no lock here: let the writer finish its commit.
+    writer.take().map(|writer| writer.join().expect("writer"));
+  }
+  // Nothing writes now: the run is held, and in its install it holds the
+  // commit lock, so the writer cannot write.
+  let crash_acked = acked.lock().expect("acked").clone();
+  let copy = path.with_extension("crash.kitedb");
+  std::fs::copy(&path, &copy).expect("copy the file");
+  if parked {
+    held.wait();
+  } else {
+    disarm_checkpoint_test_barrier(&db, phase);
+  }
+  if let Some(writer) = writer {
+    writer.join().expect("writer");
+  }
+  assert!(
+    parked,
+    "{phase:?}: the checkpoint thread was never held there"
+  );
+
+  let crashed = open_single_file(&copy, options())
+    .unwrap_or_else(|error| panic!("{phase:?}: the crash copy is unopenable: {error:?}"));
+  assert!(
+    missing(&crashed, &crash_acked).is_empty(),
+    "{phase:?}: the crash copy lost commits"
+  );
+  if installing {
+    // The install's header, with its segment table (none it dropped).
+    assert!(
+      crashed.header.read().active_snapshot_gen > generation,
+      "{phase:?}: the crash copy opened the old header slot, not the install"
+    );
+  }
+  close_single_file(crashed).expect("close the copy");
+
+  let acked = acked.lock().expect("acked").clone();
+  let db = Arc::into_inner(db).expect("sole owner");
+  close_single_file(db).expect("close");
+  let reopened = open_single_file(&path, options()).expect("reopen");
+  assert!(missing(&reopened, &acked).is_empty(), "{phase:?}: reopened");
+}
+
+fn checkpoint_thread_run_failing_at(phase: CheckpointPhase) {
+  let dir = tempdir().expect("tempdir");
+  let path = dir.path().join("checkpoint-thread-fault.kitedb");
+  let db = open_single_file(&path, options().sync_mode(SyncMode::Normal)).expect("open");
+  // A snapshot of some hundred pages first (keys that do not compress), so
+  // the one the failed run writes is larger than an extent: were its pages
+  // free while a header slot names them, the next extent would take them.
+  let mut acked = Vec::new();
+  let mut noise = 0x9e37_79b9_7f4a_7c15_u64;
+  for index in 0..2_000 {
+    let key: String = (0..25)
+      .map(|_| {
+        noise ^= noise << 13;
+        noise ^= noise >> 7;
+        noise ^= noise << 17;
+        format!("{:08x}", noise as u32)
+      })
       .collect();
-    assert!(reached, "{phase:?}: never reached");
-    assert!(
-      threads
-        .iter()
-        .all(|thread| thread.as_deref() == Some(CHECKPOINT_THREAD_NAME)),
-      "{phase:?}: reached on {threads:?}, not only on the checkpoint thread"
+    let key = format!("seed-{index}-{key}");
+    commit_key(&db, &key).expect("seed commit");
+    acked.push(key);
+  }
+  db.checkpoint().expect("seed checkpoint");
+  watch_checkpoint_phases(&db);
+  set_checkpoint_test_db_fault(&db, phase, false);
+  let (before, reached) = commit_until_reached(&db, "before", phase, 10_000);
+  acked.extend(before);
+  let threads: Vec<Option<String>> = checkpoint_test_reached(&db)
+    .into_iter()
+    .filter(|(reached, _, _)| *reached == phase)
+    .map(|(_, thread, _)| thread)
+    .collect();
+  assert!(reached, "{phase:?}: never reached");
+  assert!(
+    threads
+      .iter()
+      .all(|thread| thread.as_deref() == Some(CHECKPOINT_THREAD_NAME)),
+    "{phase:?}: reached on {threads:?}, not only on the checkpoint thread"
+  );
+  // The failed run may still be ending; then it is as a crash leaves it.
+  let deadline = Instant::now() + Duration::from_secs(10);
+  wait_for("the failed run to end", deadline, || {
+    !db.is_checkpoint_running()
+  });
+  assert_crash_copy_holds(&path, &acked, &format!("{phase:?}"));
+
+  // A crash at any write of the next two spills, with the commits around
+  // them (each a crash image, every write landed in order): a header slot
+  // may still name what the failed run wrote, so nothing they allocate may
+  // be its pages. The checkpoint thread stops first, so every write is this
+  // thread's (automatic checkpoints then run inline, recorded too).
+  db.stop_checkpoint_thread();
+  let base = std::fs::read(&path).expect("read the file");
+  let acked_before = acked.clone();
+  let spills_then = db.wal_spills.load(Ordering::Acquire);
+  let (recorded, events) = io_hooks::record_io_during(|| {
+    let mut recorded = Vec::new();
+    let mut index = 0;
+    while db.wal_spills.load(Ordering::Acquire) < spills_then + 2 && index < 3_000 {
+      recorded.extend(commit_keys(&db, "recorded", index, 1));
+      index += 1;
+    }
+    recorded
+  });
+  assert!(
+    db.wal_spills.load(Ordering::Acquire) >= spills_then + 2,
+    "{phase:?}: no two spills after the fault"
+  );
+  // The crashes that matter: every write before a header write landed, the
+  // header write not (and the end).
+  let header_end = 2 * 4096;
+  let cuts: Vec<usize> = (0..events.len())
+    .filter(|&cut| matches!(&events[cut], IoEvent::Write { offset, .. } if *offset < header_end))
+    .chain([events.len()])
+    .collect();
+  let images = crash_images(&base, &events, header_end);
+  let image_path = path.with_extension("image.kitedb");
+  for (what, image) in cuts.iter().map(|&cut| &images[2 * cut]) {
+    std::fs::write(&image_path, &image).expect("write the image");
+    let crashed = open_single_file(&image_path, options())
+      .unwrap_or_else(|error| panic!("{phase:?}, {what}: unopenable: {error:?}"));
+    let lost = missing(&crashed, &acked_before).len();
+    close_single_file(crashed).expect("close the image");
+    assert_eq!(lost, 0, "{phase:?}, {what}: lost {lost} commits");
+  }
+  let _ = std::fs::remove_file(&image_path);
+  acked.extend(recorded);
+
+  // Several WALs of writes, with a crash copy at each spill.
+  let mut spills = db.wal_spills.load(Ordering::Acquire);
+  let mut copies = 0;
+  for index in 0..1_200 {
+    acked.extend(commit_keys(&db, "after-fault", index, 1));
+    let now = db.wal_spills.load(Ordering::Acquire);
+    if now != spills && !db.is_checkpoint_running() {
+      spills = now;
+      copies += 1;
+      assert_crash_copy_holds(&path, &acked, &format!("{phase:?}, after spill {now}"));
+    }
+  }
+  assert!(
+    copies >= 3,
+    "{phase:?}: only {copies} spills after the fault were copied"
+  );
+
+  let covered = wal_segment_test_stats(&db).covered;
+  acked.extend(commit_keys(&db, "between", 0, 1));
+  db.background_checkpoint().expect("the next checkpoint");
+  assert!(
+    wal_segment_test_stats(&db).covered > covered,
+    "{phase:?}: the next checkpoint covered no segment"
+  );
+  acked.extend(commit_keys(&db, "after", 0, 50));
+  close_single_file(db).expect("close");
+  let reopened = open_single_file(&path, options()).expect("reopen");
+  assert!(missing(&reopened, &acked).is_empty(), "{phase:?}: reopened");
+  if phase == CheckpointPhase::SegmentsReleased {
+    // The segments the faulted run did not free are reclaimed: the clean
+    // close leaves the header pages, the WAL and the snapshot.
+    close_single_file(reopened).expect("close");
+    let (header, segments) = newest_header(&path);
+    let expected = (header.wal_start_page + header.wal_page_count + header.snapshot_page_count)
+      * header.page_size as u64;
+    assert_eq!(segments, 0, "{phase:?}: the closed file names segments");
+    assert_eq!(
+      std::fs::metadata(&path).expect("metadata").len(),
+      expected,
+      "{phase:?}: the closed file kept pages"
     );
-    // The failed run may still be ending; then it is as a crash leaves it.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    wait_for("the failed run to end", deadline, || {
-      !db.is_checkpoint_running()
-    });
-    assert_crash_copy_holds(&path, &acked, &format!("{phase:?}"));
-    // The checkpoint thread may have run again since (it retries); a commit
-    // gives the next checkpoint a WAL to spill and cover either way.
-    acked.extend(commit_keys(&db, "between", 0, 1));
-    let covered = wal_segment_test_stats(&db).covered;
-    db.background_checkpoint().expect("the next checkpoint");
-    assert!(
-      wal_segment_test_stats(&db).covered > covered,
-      "{phase:?}: the next checkpoint covered no segment"
-    );
-    acked.extend(commit_keys(&db, "after", 0, 50));
-    close_single_file(db).expect("close");
-    let reopened = open_single_file(&path, options()).expect("reopen");
-    assert!(missing(&reopened, &acked).is_empty(), "{phase:?}: reopened");
   }
 }
 
