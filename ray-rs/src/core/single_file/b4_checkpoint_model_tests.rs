@@ -36,14 +36,16 @@
 //! log and a write commits (`Model::liveness_step`, at random, after
 //! filling the table, and at the end).
 //!
+//! The quick run takes 100 seeds; `REGRESSION_SEEDS` pins seeds that catch
+//! the bugs reviews found (see `scripts/model-regression-seeds.py`).
+//!
 //! Environment: `KITE_MODEL_SEEDS` seeds (default 100) from
 //! `KITE_MODEL_FIRST_SEED` (default 0), `KITE_MODEL_STEPS` steps each
 //! (default 60), on `KITE_MODEL_THREADS` threads (default: the CPUs, at
-//! most four);
-//! `KITE_MODEL_SEED` runs that one seed; `KITE_MODEL_VERBOSE` prints each
-//! seed's progress, `KITE_MODEL_TRACE` each step as it runs, and a seed
-//! running past `KITE_MODEL_SEED_TIMEOUT` seconds (default 120) fails as
-//! hung. A failure names its seed and the steps that led to it. Seeds with
+//! most four); `KITE_MODEL_SEED` runs that seed (or those,
+//! comma-separated); `KITE_MODEL_VERBOSE` prints each seed's progress,
+//! `KITE_MODEL_TRACE` each step as it runs, and a seed running past
+//! `KITE_MODEL_SEED_TIMEOUT` seconds (default 120) fails as hung. A failure names its seed and the steps that led to it. Seeds with
 //! the checkpoint thread or concurrent application checkpoints depend on
 //! timing too, so they may not replay exactly; the rest do. The run prints
 //! what the seeds covered (commits, cuts, crash images, ...).
@@ -1649,7 +1651,15 @@ fn run_seed(seed: u64, steps: u64) -> std::result::Result<Coverage, String> {
 /// first `default_seeds`.
 fn env_seeds(default_seeds: u64) -> Vec<u64> {
   match std::env::var("KITE_MODEL_SEED") {
-    Ok(_) => vec![env_number("KITE_MODEL_SEED", 0)],
+    Ok(seeds) => seeds
+      .split(',')
+      .map(|seed| {
+        seed
+          .trim()
+          .parse()
+          .unwrap_or_else(|_| panic!("KITE_MODEL_SEED={seeds:?} is not a list of numbers"))
+      })
+      .collect(),
     Err(_) => {
       let first = env_number("KITE_MODEL_FIRST_SEED", 0);
       let count = env_number("KITE_MODEL_SEEDS", default_seeds);
@@ -1782,6 +1792,71 @@ fn wal_segment_and_checkpoint_model() {
     failures
       .iter()
       .map(|(_, failure)| failure.as_str())
+      .collect::<Vec<_>>()
+      .join("\n")
+  );
+}
+
+/// Seeds that catch the bugs reviews found here, each re-made in the code
+/// (a mutant): one or more per mutant, every one of which failed its mutant
+/// on every run when derived, run alone and all together. The quick run's
+/// seeds catch most of them, but only by chance: any change to the model's
+/// random draws moves what each seed does. Re-derive the list whenever the
+/// model changes, with `scripts/model-regression-seeds.py`, which holds the
+/// mutants, applies each in turn, and prints the list. The mutants:
+///
+/// - `r7`: open forgets the transactions whose records a spill moved (R7).
+/// - `f3-ok`, `f3-declined`: a cut with the segment table full covers
+///   nothing, and returns `Ok`, or declines (F3, reverted two ways).
+/// - `needed-after`: `wal_segments_needed_after` ignores the transactions
+///   that commit after the cut.
+/// - `unsealed`: a cut does not seal the newest segment.
+/// - `forget-spilled`: an install forgets every spilled transaction.
+/// - `r12`: a header page's footer checksum covers its fixed fields'
+///   checksum, so not them (R12).
+/// - `spill-slot`: a spill does not sync its second header slot.
+const REGRESSION_SEEDS: &[(u64, &str)] = &[
+  (1, "r7"),
+  (100, "r7"),
+  (32, "f3-ok"),
+  (207, "f3-ok"),
+  (32, "f3-declined"),
+  (207, "f3-declined"),
+  (1, "needed-after"),
+  (6, "needed-after"),
+  (13, "unsealed"),
+  (22, "unsealed"),
+  (1, "forget-spilled"),
+  (6, "forget-spilled"),
+  (13, "r12"),
+  (86, "r12"),
+  (86, "spill-slot"),
+  (126, "spill-slot"),
+];
+
+/// The pinned regression seeds (`REGRESSION_SEEDS`), each once, with the
+/// model's default steps.
+#[test]
+fn wal_segment_and_checkpoint_model_regression_seeds() {
+  let mut seeds: Vec<u64> = REGRESSION_SEEDS.iter().map(|(seed, _)| *seed).collect();
+  seeds.sort_unstable();
+  seeds.dedup();
+  let count = seeds.len();
+  let failures = run_seeds(seeds);
+  assert!(
+    failures.is_empty(),
+    "{} of {count} regression seeds failed:\n{}",
+    failures.len(),
+    failures
+      .iter()
+      .map(|(seed, failure)| {
+        let mutants: Vec<&str> = REGRESSION_SEEDS
+          .iter()
+          .filter(|(pinned, _)| pinned == seed)
+          .map(|(_, mutant)| *mutant)
+          .collect();
+        format!("(pinned for {mutants:?}) {failure}")
+      })
       .collect::<Vec<_>>()
       .join("\n")
   );
