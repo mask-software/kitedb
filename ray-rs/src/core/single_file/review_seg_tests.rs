@@ -221,7 +221,10 @@ fn review_checkpoint_thread_reaping_an_abandoned_transaction_at_the_limit_does_n
 /// (Adjusted with the fix: while such a transaction is open, cuts leave the
 /// last entry free, so the table fills to 63 entries and more checkpoints
 /// keep it there; the ones after the transaction ends must cover the log
-/// and empty the table.)
+/// and empty the table. Adjusted with decision Q1 of the fresh review: a
+/// background checkpoint that can do nothing, here because the transaction
+/// holds every segment and the WAL's records would need the last entry,
+/// says so with `CheckpointDeclined` instead of returning `Ok`.)
 #[test]
 fn review_checkpoints_recover_once_a_transaction_holding_a_full_segment_table_ends() {
   let dir = tempdir().expect("tempdir");
@@ -270,8 +273,11 @@ fn review_checkpoints_recover_once_a_transaction_holding_a_full_segment_table_en
   );
   for more in 0..3 {
     commit_key(&db, &key("more", more)).expect("commit");
-    db.background_checkpoint()
-      .expect("a checkpoint while the transaction holds a full table");
+    let declined = db.background_checkpoint();
+    assert!(
+      matches!(&declined, Err(KiteError::CheckpointDeclined(reason)) if reason.contains("open write transactions")),
+      "a checkpoint that can do nothing while the transaction holds a full table: {declined:?}"
+    );
     assert_eq!(
       wal_segment_test_stats(&db).live,
       MAX_WAL_SEGMENTS - 1,

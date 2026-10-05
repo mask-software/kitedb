@@ -71,3 +71,9 @@ def test_deprecated_checkpoint_threshold_is_accepted(tmp_path):
 
 def test_checkpoint_error_is_exported_as_a_kite_error():
     assert issubclass(kitedb.CheckpointError, KiteError)
+
+
+def test_checkpoint_declined_error_is_exported_as_a_kite_error():
+    # A background checkpoint that does not run, or stops, raises it, with
+    # the reason (decision Q1 of the fresh review).
+    assert issubclass(kitedb.CheckpointDeclinedError, KiteError)
