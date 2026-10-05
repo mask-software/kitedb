@@ -396,6 +396,8 @@ impl SingleFileDB {
     let limit = self.wal_segment_limit(&header);
     let full = bytes >= limit || count >= MAX_WAL_SEGMENTS - 1;
     if full {
+      #[cfg(test)]
+      super::checkpoint::count_checkpoint_test_pinned_refusal(&self.path);
       eprintln!(
         "Warning: WAL segments are full: open write transactions hold records in {count} of \
          them ({bytes} bytes; the limit is {limit}), which no checkpoint frees before they finish"

@@ -104,6 +104,11 @@ static CHECKPOINT_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
 /// Background checkpoint cuts made, per database path.
 #[cfg(test)]
 static CHECKPOINT_TEST_CUTS: OnceLock<Mutex<HashMap<std::path::PathBuf, usize>>> = OnceLock::new();
+/// Writes refused because open transactions hold the WAL segments at their
+/// limit (`segments_full_of_pinned`), per database path.
+#[cfg(test)]
+static CHECKPOINT_TEST_PINNED_REFUSALS: OnceLock<Mutex<HashMap<std::path::PathBuf, u64>>> =
+  OnceLock::new();
 /// The first page of the snapshot a checkpoint wrote last, per database path.
 #[cfg(test)]
 static CHECKPOINT_TEST_SNAPSHOT_PAGES: OnceLock<Mutex<HashMap<std::path::PathBuf, u64>>> =
@@ -252,6 +257,29 @@ fn count_checkpoint_test_cut(db_path: &std::path::Path) {
     .expect("checkpoint test cut counter lock")
     .entry(db_path.to_path_buf())
     .or_default() += 1;
+}
+
+#[cfg(test)]
+pub(super) fn count_checkpoint_test_pinned_refusal(db_path: &std::path::Path) {
+  *CHECKPOINT_TEST_PINNED_REFUSALS
+    .get_or_init(|| Mutex::new(HashMap::new()))
+    .lock()
+    .expect("checkpoint test pinned refusal lock")
+    .entry(db_path.to_path_buf())
+    .or_default() += 1;
+}
+
+/// Writes refused on `db` so far because open transactions held the WAL
+/// segments at their limit.
+#[cfg(test)]
+fn checkpoint_test_pinned_refusals(db: &SingleFileDB) -> u64 {
+  CHECKPOINT_TEST_PINNED_REFUSALS
+    .get_or_init(|| Mutex::new(HashMap::new()))
+    .lock()
+    .expect("checkpoint test pinned refusal lock")
+    .get(db.path())
+    .copied()
+    .unwrap_or(0)
 }
 
 /// Background checkpoint cuts made on `db` so far.

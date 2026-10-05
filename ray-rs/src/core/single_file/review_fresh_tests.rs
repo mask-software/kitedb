@@ -60,9 +60,16 @@ fn big_transaction(
 /// the application's checkpoints, a few writes fail with `WalBufferFull`:
 /// F1; they are not counted as acknowledged.)
 ///
-/// (With F1's fix: no write fails. Automatic checkpoints are on, and every
-/// transaction ends, so a writer at the segment limit always has a
-/// checkpoint that frees space to wait for.)
+/// (With F1's fix, no write fails for want of a checkpoint: automatic
+/// checkpoints are on, and every transaction ends, so a writer at the
+/// segment limit always has a checkpoint that frees space to wait for. The
+/// one exception is documented: a writer fails with `WalBufferFull` when
+/// open transactions hold records in enough segments to fill the limit,
+/// which no checkpoint frees before they end (`segments_full_of_pinned`).
+/// At this smallest WAL (a 1 MiB limit), a big transaction open across a
+/// limit's worth of the other writers' log gets there now and then, the
+/// more often the busier the machine. So: every failed write is one of
+/// those.)
 #[test]
 fn fresh_stress_one_session_keeps_every_acked_commit() {
   let dir = tempdir().expect("tempdir");
@@ -160,9 +167,12 @@ fn fresh_stress_one_session_keeps_every_acked_commit() {
     );
   };
   check(&db, "live");
-  assert!(
-    errors.is_empty(),
-    "{} writes failed beside application background checkpoints (first: {:?})",
+  let pinned = checkpoint_test_pinned_refusals(&db);
+  assert_eq!(
+    errors.len() as u64,
+    pinned,
+    "{} writes failed beside application background checkpoints, {pinned} of them because open \
+     transactions held the segments at their limit (first: {:?})",
     errors.len(),
     errors.first()
   );
