@@ -889,85 +889,81 @@ fn open_single_file_internal(
   }
 
   // Open or create pager
-  let (mut pager, mut header, is_new, mut header_slot, fallback_header) = if file_exists {
-    // Open existing database
-    let mut pager = open_pager_with_locking(path, options.page_size, options.read_only, lock_file)?;
-    pager.set_full_fsync(options.full_fsync && options.sync_mode == SyncMode::Full);
+  let (mut pager, mut header, is_new, mut header_slot, mut fallback_header, in_current_magic) =
+    if file_exists {
+      // Open existing database
+      let mut pager =
+        open_pager_with_locking(path, options.page_size, options.read_only, lock_file)?;
+      pager.set_full_fsync(options.full_fsync && options.sync_mode == SyncMode::Full);
 
-    // Read both independently checksummed header pages and select the newest
-    // valid generation. A torn newest slot falls back to the other slot.
-    let slots = read_header_slots_with_fallback(&mut pager)?;
-    let (mut header, mut header_slot, mut fallback_header) =
-      (slots.header, slots.slot, slots.fallback);
+      // Read both independently checksummed header pages and select the newest
+      // valid generation. A torn newest slot falls back to the other slot.
+      let slots = read_header_slots_with_fallback(&mut pager)?;
+      let (header, header_slot, fallback_header) = (slots.header, slots.slot, slots.fallback);
 
-    // Refuse a format this build cannot read, or (writable) cannot write,
-    // before anything below rewrites the file.
-    header.check_supported(!options.read_only)?;
+      // Refuse a format this build cannot read, or (writable) cannot write,
+      // before anything below rewrites the file.
+      header.check_supported(!options.read_only)?;
 
-    // Files created before the dual-page format have WAL at page one. Migrate
-    // through a separately checkpointed file; an in-place shift would destroy
-    // the old header's fallback before the new slot is durable.
-    if header.wal_start_page < HEADER_SLOT_B as u64 + 1 && !options.read_only {
-      drop(pager);
-      migrate_legacy_single_header(path, &options, lock_file)?;
-      return open_single_file_internal(path, options, lock_file);
-    }
-
-    // A file in the older magic (`MAGIC_KITEDB_V1`, which releases up to
-    // v0.2.18 accept without checking the format version): rewrite both
-    // header slots in the current one now, before any other write, so they
-    // refuse the file from here on. Both slots then name the selected header:
-    // there is no older fallback.
-    if !options.read_only && !slots.in_current_magic {
-      install_recovered_header(&mut pager, &mut header, &mut header_slot)?;
-      install_recovered_header(&mut pager, &mut header, &mut header_slot)?;
-      header.magic = MAGIC_KITEDB;
-      fallback_header = None;
-    }
-
-    // The WAL size is fixed at creation. Only an explicitly requested size is
-    // checked; otherwise the header's size is used as-is.
-    if let Some(wal_size) = options.wal_size {
-      let expected_wal_pages = pages_to_store(wal_size, header.page_size as usize) as u64;
-      if header.wal_page_count != expected_wal_pages {
-        return Err(KiteError::InvalidSnapshot(format!(
-          "WAL size mismatch: header has {} pages, options require {} pages",
-          header.wal_page_count, expected_wal_pages
-        )));
+      // Files created before the dual-page format have WAL at page one. Migrate
+      // through a separately checkpointed file; an in-place shift would destroy
+      // the old header's fallback before the new slot is durable.
+      if header.wal_start_page < HEADER_SLOT_B as u64 + 1 && !options.read_only {
+        drop(pager);
+        migrate_legacy_single_header(path, &options, lock_file)?;
+        return open_single_file_internal(path, options, lock_file);
       }
-    }
 
-    (pager, header, false, header_slot, fallback_header)
-  } else {
-    // Create new database. If another opener created one here since the
-    // existence check above, open that one instead.
-    let mut pager = match create_pager_with_locking(path, options.page_size, lock_file)? {
-      NewPager::Created(pager) => pager,
-      NewPager::Exists => return open_single_file_internal(path, options, lock_file),
+      // The WAL size is fixed at creation. Only an explicitly requested size is
+      // checked; otherwise the header's size is used as-is.
+      if let Some(wal_size) = options.wal_size {
+        let expected_wal_pages = pages_to_store(wal_size, header.page_size as usize) as u64;
+        if header.wal_page_count != expected_wal_pages {
+          return Err(KiteError::InvalidSnapshot(format!(
+            "WAL size mismatch: header has {} pages, options require {} pages",
+            header.wal_page_count, expected_wal_pages
+          )));
+        }
+      }
+
+      (
+        pager,
+        header,
+        false,
+        header_slot,
+        fallback_header,
+        slots.in_current_magic,
+      )
+    } else {
+      // Create new database. If another opener created one here since the
+      // existence check above, open that one instead.
+      let mut pager = match create_pager_with_locking(path, options.page_size, lock_file)? {
+        NewPager::Created(pager) => pager,
+        NewPager::Exists => return open_single_file_internal(path, options, lock_file),
+      };
+      pager.set_full_fsync(options.full_fsync && options.sync_mode == SyncMode::Full);
+
+      // Calculate WAL page count
+      let wal_size = options.wal_size.unwrap_or(WAL_DEFAULT_SIZE);
+      let wal_page_count = pages_to_store(wal_size, options.page_size) as u64;
+
+      // Create initial header
+      let header = DbHeaderV1::new(options.page_size as u32, wal_page_count);
+
+      // Write both initial header slots before allocating the WAL. This makes a
+      // brand-new file recoverable even if the first open is interrupted.
+      let header_bytes = header.serialize_to_page();
+      pager.write_page(0, &header_bytes)?;
+      pager.write_page(1, &header_bytes)?;
+
+      // Allocate WAL pages
+      pager.allocate_pages(wal_page_count as u32)?;
+
+      // Sync to disk
+      pager.sync()?;
+
+      (pager, header, true, HEADER_SLOT_A, None, true)
     };
-    pager.set_full_fsync(options.full_fsync && options.sync_mode == SyncMode::Full);
-
-    // Calculate WAL page count
-    let wal_size = options.wal_size.unwrap_or(WAL_DEFAULT_SIZE);
-    let wal_page_count = pages_to_store(wal_size, options.page_size) as u64;
-
-    // Create initial header
-    let header = DbHeaderV1::new(options.page_size as u32, wal_page_count);
-
-    // Write both initial header slots before allocating the WAL. This makes a
-    // brand-new file recoverable even if the first open is interrupted.
-    let header_bytes = header.serialize_to_page();
-    pager.write_page(0, &header_bytes)?;
-    pager.write_page(1, &header_bytes)?;
-
-    // Allocate WAL pages
-    pager.allocate_pages(wal_page_count as u32)?;
-
-    // Sync to disk
-    pager.sync()?;
-
-    (pager, header, true, HEADER_SLOT_A, None)
-  };
 
   // Initialize WAL buffer
   // Fails if the header's WAL positions lie outside their regions.
@@ -991,6 +987,19 @@ fn open_single_file_internal(
     if wal_buffer.check_and_trim(&mut pager)? {
       wal_buffer.store_in_header(&mut header);
       install_recovered_header(&mut pager, &mut header, &mut header_slot)?;
+    }
+
+    // A file in the older magic (`MAGIC_KITEDB_V1`, which releases up to
+    // v0.2.18 accept without checking the format version): rewrite both
+    // header slots in the current one now, so they refuse the file from here
+    // on. Every check that refuses the open is behind, and only the trim
+    // above may have written (a header, in the current magic). Both slots
+    // then name the selected header: there is no older fallback.
+    if !in_current_magic {
+      install_recovered_header(&mut pager, &mut header, &mut header_slot)?;
+      install_recovered_header(&mut pager, &mut header, &mut header_slot)?;
+      header.magic = MAGIC_KITEDB;
+      fallback_header = None;
     }
 
     // Finish an interrupted background checkpoint. Each branch leaves the WAL
