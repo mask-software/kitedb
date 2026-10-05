@@ -180,46 +180,70 @@ fn fresh5_the_run_ending_ends_a_long_paced_wait() {
 }
 
 /// T3 (test gap). Pacing stops when a run ends without installing too:
-/// with the run failed, the log stays past the trigger, and no commit after
-/// it may be paced (no run goes on). b4_pacing_tests checks only after an
-/// install, which takes the log below the trigger, so a pacer that never
-/// noted the run's end passes it.
+/// the automatic run fails, its back-off holds off the next one, the log
+/// stays past the trigger, and no commit after it may be paced (no run goes
+/// on). b4_pacing_tests checks only after an install, which takes the log
+/// below the trigger, so a pacer that never noted the run's end passes it.
 #[test]
 fn fresh5_no_pacing_after_a_failed_run() {
   let dir = tempdir().expect("tempdir");
-  let db = open_single_file(dir.path().join("failed-run.kitedb"), options()).expect("open");
-  for index in 0..200 {
-    commit_key(&db, &key("warm", index)).expect("warm-up commit");
-  }
+  let db = open_single_file(
+    dir.path().join("failed-run.kitedb"),
+    options().checkpoint_thread(true),
+  )
+  .expect("open");
+  super::super::checkpoint_thread::set_checkpoint_test_backoff(
+    &db,
+    Duration::from_secs(30),
+    Duration::from_secs(30),
+  );
   set_pacing_test(
     &db,
     Some(Duration::from_secs(4)),
     Some(Duration::from_millis(50)),
   );
-  let (barrier, run) = hold_a_run(&db);
-  for index in 0..50 {
-    commit_key(&db, &key("during", index)).expect("commit");
+  // The checkpoint thread's run, held after its snapshot.
+  watch_checkpoint_phases(&db);
+  let barrier = Arc::new(Barrier::new(2));
+  set_checkpoint_test_barrier(&db, CheckpointPhase::SnapshotDurable, Arc::clone(&barrier));
+  let mut index = 0;
+  let held = wait_until(Instant::now() + Duration::from_secs(20), || {
+    commit_key(&db, &key("warm", index)).expect("commit");
+    index += 1;
+    checkpoint_test_reached(&db)
+      .iter()
+      .any(|(phase, _, parked)| *phase == CheckpointPhase::SnapshotDurable && *parked)
+  });
+  assert!(held, "setup: the checkpoint thread's run was not held");
+  for more in 0..50 {
+    commit_key(&db, &key("during", more)).expect("commit");
   }
   assert!(
     pacing_test_stats(&db).paced > 0,
     "setup: nothing paced during the run"
   );
-  // The run fails after it is released (in its install).
+  // It fails in its install once released, and backs off for 30 s.
   set_checkpoint_test_db_fault(&db, CheckpointPhase::HeaderWritten, false);
   barrier.wait();
   assert!(
-    run.join().expect("the run").is_err(),
+    wait_until(Instant::now() + Duration::from_secs(10), || {
+      !db.is_checkpoint_running() && db.checkpoint_error().is_some()
+    }),
     "setup: the run did not fail"
   );
-  assert!(!db.is_checkpoint_running(), "setup: a run still runs");
   let paced = pacing_test_stats(&db).paced;
-  for index in 0..100 {
-    commit_key(&db, &key("after", index)).expect("commit");
+  for more in 0..100 {
+    commit_key(&db, &key("after", more)).expect("commit");
   }
   let paced_after = pacing_test_stats(&db).paced - paced;
   let running_after = db.is_checkpoint_running();
+  let log = db.header.log_state();
+  let past_trigger = log.uncovered_segments + db.wal_buffer.lock().used() > log.trigger;
   close_single_file(db).expect("close");
-  assert!(!running_after, "setup: a run started after the failed one");
+  assert!(
+    !running_after && past_trigger,
+    "setup: a run went on, or the log fell below the trigger"
+  );
   assert_eq!(
     paced_after, 0,
     "{paced_after} commits paced after the run failed, with no run going on"
