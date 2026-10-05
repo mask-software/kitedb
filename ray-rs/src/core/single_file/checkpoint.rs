@@ -5274,6 +5274,11 @@ mod review_seg_tests;
 #[path = "review_seg2_tests.rs"]
 mod review_seg2_tests;
 
+/// Third review pass: tests for gaps the review found.
+#[cfg(test)]
+#[path = "review_seg3_tests.rs"]
+mod review_seg3_tests;
+
 /// raydb-b4 `checkpoint-segments`: a seeded randomized model test of WAL
 /// segments and checkpoints against an oracle of acknowledged commits.
 #[cfg(test)]
