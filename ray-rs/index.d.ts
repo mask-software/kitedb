@@ -48,13 +48,16 @@ export declare class Database {
    * Commit the current transaction. While a background checkpoint runs
    * and the log is past the trigger, the call returns up to 100 ms after
    * the commit is durable (pacing; see `checkpointLogBudget`), in place of
-   * stopping for seconds at `walSegmentLimit`. The call is synchronous: the
-   * JS thread waits too.
+   * stopping for seconds at `walSegmentLimit`. The call is synchronous (there
+   * is no async commit), so a paced commit blocks the event loop for up to
+   * 100 ms. Commits spread out (one per request, say) wait little or
+   * nothing: up to 10 ms of the time since the last paced commit counts
+   * toward the wait.
    */
   commit(): void
   /**
    * Commit the current transaction and return replication token when primary replication is enabled.
-   * Paced as `commit` is (up to 100 ms on the JS thread).
+   * Paced as `commit` is (up to 100 ms, blocking the event loop).
    */
   commitWithToken(): string | null
   /** Rollback the current transaction */
@@ -125,7 +128,7 @@ export declare class Database {
   /**
    * Pull and apply up to maxFrames replication frames on replica. Each
    * frame is applied as a commit and may be paced as `commit` is (up to
-   * 100 ms each, on the JS thread).
+   * 100 ms each, blocking the event loop).
    */
   replicaCatchUpOnce(maxFrames: number): number
   /** Force a replica reseed from current primary snapshot. */
@@ -815,8 +818,11 @@ export declare class Kite {
    * Commit the current transaction. While a background checkpoint runs
    * and the log is past the trigger, the call returns up to 100 ms after
    * the commit is durable (pacing; see `checkpointLogBudget`), in place of
-   * stopping for seconds at `walSegmentLimit`. The call is synchronous: the
-   * JS thread waits too, and this Kite's other calls wait for it.
+   * stopping for seconds at `walSegmentLimit`. The call is synchronous (there
+   * is no async commit), so a paced commit blocks the event loop for up to
+   * 100 ms, and this Kite's other calls wait for it. Commits spread out
+   * (one per request, say) wait little or nothing: up to 10 ms of the time
+   * since the last paced commit counts toward the wait.
    */
   commit(): void
   /** Rollback the current transaction */

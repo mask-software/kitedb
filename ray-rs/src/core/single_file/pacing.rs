@@ -17,10 +17,19 @@
 //! of lock hold, about 0.5-1 s for the commit that waits, at 1M nodes and 10M
 //! edges).
 //!
-//! Only automatic background checkpoints pace, on the checkpoint thread or
-//! inline: a run then goes on beside commits. With blocking checkpoints
-//! (`background_checkpoint` off) no run goes on beside a commit, and
-//! read-only handles, reads, rollbacks, close and drop are never paced.
+//! A database paces while any background checkpoint run goes on beside its
+//! commits (every claimed run counts: the checkpoint thread's, an inline
+//! automatic one, or an application's `background_checkpoint()`), if it has
+//! automatic background checkpoints (`auto_checkpoint` and
+//! `background_checkpoint` both on). With blocking automatic checkpoints
+//! (`background_checkpoint` off), or none (`auto_checkpoint` off), it paces
+//! nothing, even beside an application's background run. Read-only
+//! handles, reads, rollbacks, close and drop are never paced.
+//!
+//! Up to `MAX_CREDIT` (10 ms) of the time since the schedule's last slot
+//! counts toward a commit's wait, so a writer whose commits are spread out
+//! (one per request, say) waits little or nothing; a writer committing in a
+//! tight loop waits its share.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};

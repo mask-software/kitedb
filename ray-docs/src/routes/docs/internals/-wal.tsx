@@ -820,19 +820,26 @@ export function WALPage() {
 				pacing, and about 0.5-1 s once per run for the install. Blocking
 				checkpoints (
 				<code>backgroundCheckpoint: false</code>) pace no one, nor do reads,
-				rollbacks or read-only handles. The limit stays the backstop: a run
+				rollbacks or read-only handles. Any background checkpoint run counts,
+				an application's <code>backgroundCheckpoint()</code> too, as long as
+				automatic background checkpoints are on; with blocking or no automatic
+				checkpoints nothing is paced. The limit stays the backstop: a run
 				that takes much longer than the last still makes writers wait there.
 			</p>
 
 			<p>
 				Pacing holds no lock of the database's, but it waits inside the
-				commit call. In Node the call is synchronous, so the JS thread waits
-				(and a Kite's other calls wait for its commit). In Python the GIL is
+				commit call. In Node the call is synchronous (there is no async
+				commit), so a paced commit blocks the event loop for up to 100 ms, and
+				a Kite's other calls wait for its commit. In Python the GIL is
 				released, but the handle stays in use, so <code>close()</code> waits
 				for a paced commit. A replica's catch-up applies each frame as a
 				commit, so it may wait likewise, inside whatever its caller holds.
 				Either way it is at most 100 ms per paced commit, in place of the
-				stops of seconds at the limit.
+				stops of seconds at the limit. Up to 10 ms of the time since the
+				last paced commit counts toward the next one's wait, so commits that
+				are spread out (one per request, say) wait little or nothing; a
+				writer committing in a tight loop waits its share.
 			</p>
 
 			<h2 id="overflow">Avoiding WAL overflow</h2>

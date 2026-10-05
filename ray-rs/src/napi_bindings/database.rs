@@ -2119,8 +2119,11 @@ impl Database {
   /// Commit the current transaction. While a background checkpoint runs
   /// and the log is past the trigger, the call returns up to 100 ms after
   /// the commit is durable (pacing; see `checkpointLogBudget`), in place of
-  /// stopping for seconds at `walSegmentLimit`. The call is synchronous: the
-  /// JS thread waits too.
+  /// stopping for seconds at `walSegmentLimit`. The call is synchronous (there
+  /// is no async commit), so a paced commit blocks the event loop for up to
+  /// 100 ms. Commits spread out (one per request, say) wait little or
+  /// nothing: up to 10 ms of the time since the last paced commit counts
+  /// toward the wait.
   #[napi]
   pub fn commit(&self) -> Result<()> {
     match self.inner.as_ref() {
@@ -2132,7 +2135,7 @@ impl Database {
   }
 
   /// Commit the current transaction and return replication token when primary replication is enabled.
-  /// Paced as `commit` is (up to 100 ms on the JS thread).
+  /// Paced as `commit` is (up to 100 ms, blocking the event loop).
   #[napi]
   pub fn commit_with_token(&self) -> Result<Option<String>> {
     match self.inner.as_ref() {
@@ -2391,7 +2394,7 @@ impl Database {
 
   /// Pull and apply up to maxFrames replication frames on replica. Each
   /// frame is applied as a commit and may be paced as `commit` is (up to
-  /// 100 ms each, on the JS thread).
+  /// 100 ms each, blocking the event loop).
   #[napi]
   pub fn replica_catch_up_once(&self, max_frames: i64) -> Result<i64> {
     let max_frames =
