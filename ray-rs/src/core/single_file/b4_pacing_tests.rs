@@ -328,7 +328,9 @@ fn pacing_only_past_the_trigger_with_a_run() {
 
 /// (d) Closing the database ends a writer's pacing at once (the close does
 /// not wait for it, and it does not wait out its delay), though the run it
-/// paces for still runs.
+/// paces for still runs. (Its paced commits wait some 30 ms each, so this
+/// cannot tell a close that ends a wait from one that lets it run out:
+/// review_fresh5's T4 paces one commit for 20 s, closing and dropping.)
 #[test]
 fn close_ends_pacing() {
   let dir = tempdir().expect("tempdir");

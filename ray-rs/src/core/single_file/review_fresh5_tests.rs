@@ -76,12 +76,11 @@ fn leave_no_room(db: &SingleFileDB) {
   set_wal_segment_test_limit(db, (log.uncovered_segments + wal).max(1));
 }
 
-/// One commit on a thread of its own (a shared handle); returns when it
-/// started, and its thread.
-fn commit_on_a_thread(
-  db: &SingleFileDB,
-  key: String,
-) -> std::thread::JoinHandle<(Result<()>, Duration)> {
+/// A commit's thread: its result and how long it took.
+type PacedCommit = std::thread::JoinHandle<(Result<()>, Duration)>;
+
+/// One commit on a thread of its own (a shared handle); returns its thread.
+fn commit_on_a_thread(db: &SingleFileDB, key: String) -> PacedCommit {
   let handle = db.shared_handle();
   std::thread::spawn(move || {
     let started = Instant::now();
@@ -96,7 +95,7 @@ fn commit_on_a_thread(
 type LongPace = (
   Arc<Barrier>,
   std::thread::JoinHandle<Result<()>>,
-  std::thread::JoinHandle<(Result<()>, Duration)>,
+  PacedCommit,
 );
 
 /// A writer pacing for its whole `bound`: a held run, commits past the
@@ -107,6 +106,15 @@ fn start_a_long_pace(db: &SingleFileDB, bound: Duration) -> LongPace {
     commit_key(db, &key("warm", index)).expect("warm-up commit");
   }
   let (barrier, run) = hold_a_run(db);
+  let paced = pace_one_commit(db, bound);
+  (barrier, run, paced)
+}
+
+/// Beside a held run: commits past the trigger (key "charge", 0 to 199;
+/// paced briefly) charging the log, then no room left below the segment
+/// limit, and one commit (key "paced", 0) on a thread of its own, pacing
+/// for its whole `bound` now; returns its thread.
+fn pace_one_commit(db: &SingleFileDB, bound: Duration) -> PacedCommit {
   set_pacing_test(
     db,
     Some(Duration::from_secs(100)),
@@ -129,7 +137,35 @@ fn start_a_long_pace(db: &SingleFileDB, bound: Duration) -> LongPace {
     }),
     "setup: no commit paced"
   );
-  (barrier, run, paced)
+  paced
+}
+
+/// `start_a_long_pace` beside the checkpoint thread's automatic run, held
+/// after its snapshot is durable (the database runs the thread): returns
+/// the barrier that releases it, how many warm-up commits it took (keys
+/// "warm", from 0), and the pacing commit's thread.
+fn start_a_long_pace_beside_the_thread(
+  db: &SingleFileDB,
+  bound: Duration,
+) -> (Arc<Barrier>, usize, PacedCommit) {
+  watch_checkpoint_phases(db);
+  let barrier = Arc::new(Barrier::new(2));
+  set_checkpoint_test_barrier(db, CheckpointPhase::SnapshotDurable, Arc::clone(&barrier));
+  let mut warm = 0;
+  let held = wait_until(Instant::now() + Duration::from_secs(20), || {
+    commit_key(db, &key("warm", warm)).expect("warm-up commit");
+    warm += 1;
+    checkpoint_test_reached(db)
+      .iter()
+      .any(|(phase, thread, parked)| {
+        *phase == CheckpointPhase::SnapshotDurable
+          && *parked
+          && thread.as_deref() == Some(CHECKPOINT_THREAD_NAME)
+      })
+  });
+  assert!(held, "setup: the checkpoint thread's run was not held");
+  let paced = pace_one_commit(db, bound);
+  (barrier, warm, paced)
 }
 
 /// T1 (test gap). b4_pacing_tests' "a pacing writer holds no lock" passes
@@ -189,6 +225,95 @@ fn fresh5_the_run_ending_ends_a_long_paced_wait() {
     woke < LOADED_STEP,
     "the paced commit went on {woke:?} after the run ended (it paces up to 20 s)"
   );
+}
+
+/// T4 (test gap). Closing the database, or dropping it, ends a long paced
+/// wait at once: b4_pacing_tests' "closing ends pacing" passes when the
+/// close leaves a pacing writer to wait out its delay, as its paced commits
+/// wait some 30 ms each. Here one commit paces for its whole bound (20 s)
+/// beside a held run: an application's (no checkpoint thread), or the
+/// checkpoint thread's. Once the close or drop begins, on a thread of its
+/// own, the paced commit returns (Ok: it committed before its pace) while
+/// the run is still held, so the close woke it, not the run's end or its
+/// deadline. Then the run goes on, the close returns without waiting the
+/// pace out, and a reopen holds every commit.
+///
+/// (Only handles that share a database (`shared_handle`, the checkpoint
+/// thread's) can be pacing when it closes: the Rust API closes the sole
+/// handle, and the bindings take it exclusively to close, after every call
+/// on it, a paced commit's included, has returned.)
+#[test]
+fn fresh5_closing_or_dropping_ends_a_long_paced_wait() {
+  for thread in [false, true] {
+    for close in [true, false] {
+      let ending = if close { "close" } else { "drop" };
+      let case = format!(
+        "{ending} beside {}",
+        if thread {
+          "the checkpoint thread's run"
+        } else {
+          "an application's run"
+        }
+      );
+      let dir = tempdir().expect("tempdir");
+      let path = dir.path().join("closing-ends-pace.kitedb");
+      let db = open_single_file(&path, options().checkpoint_thread(thread)).expect("open");
+      let (barrier, warm, run, paced) = if thread {
+        let (barrier, warm, paced) =
+          start_a_long_pace_beside_the_thread(&db, Duration::from_secs(20));
+        (barrier, warm, None, paced)
+      } else {
+        let (barrier, run, paced) = start_a_long_pace(&db, Duration::from_secs(20));
+        (barrier, 200, Some(run), paced)
+      };
+      let closing = Instant::now();
+      let closer = std::thread::spawn(move || {
+        let result = if close {
+          close_single_file(db)
+        } else {
+          drop(db);
+          Ok(())
+        };
+        (result, Instant::now())
+      });
+      // The run is held until the paced commit returns: only the close can
+      // end its pace before its deadline.
+      let woke = wait_until(Instant::now() + LOADED_STEP, || paced.is_finished());
+      let woke_after = closing.elapsed();
+      barrier.wait();
+      let run = run.map(|run| run.join().expect("the run"));
+      let (paced_result, _) = paced.join().expect("the paced commit");
+      let (closed, closed_at) = closer.join().expect("the closer");
+      let close_took = closed_at.saturating_duration_since(closing);
+      assert!(
+        woke,
+        "{case}: the paced commit (pacing for up to 20 s) did not return within \
+         {LOADED_STEP:?} of the {ending} beginning, the run still held"
+      );
+      assert!(
+        paced_result.is_ok(),
+        "{case}: the paced commit: {paced_result:?}"
+      );
+      assert!(closed.is_ok(), "{case}: the close: {closed:?}");
+      assert!(
+        close_took < LOADED_STEP,
+        "{case}: the {ending} took {close_took:?} (the paced commit returned after \
+         {woke_after:?}): it waited the pace out"
+      );
+      if let Some(run) = run {
+        assert!(run.is_ok(), "{case}: the application's run: {run:?}");
+      }
+      let reopened = open_single_file(&path, options()).expect("reopen");
+      let lost: Vec<String> = (0..warm)
+        .map(|index| key("warm", index))
+        .chain((0..200).map(|index| key("charge", index)))
+        .chain([key("paced", 0)])
+        .filter(|key| reopened.node_by_key(key).is_none())
+        .collect();
+      assert!(lost.is_empty(), "{case}: lost {} commits", lost.len());
+      close_single_file(reopened).expect("close the reopened database");
+    }
+  }
 }
 
 /// T3 (test gap). Pacing stops when a run ends without installing too:
