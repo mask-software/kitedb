@@ -1278,7 +1278,7 @@ fn open_single_file_internal(
     checkpoint_thread_stopped: AtomicBool::new(false),
     checkpoint_abandoned: AtomicBool::new(false),
     checkpoint_installing: AtomicBool::new(false),
-    checkpoint_last_error: Mutex::new(None),
+    auto_checkpoint_failure: Mutex::new(Default::default()),
     writes_refused: std::sync::OnceLock::new(),
     wal_segment_size,
     checkpoint_log_ratio: options.checkpoint_log_ratio,

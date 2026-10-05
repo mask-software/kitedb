@@ -10,11 +10,13 @@
 //! it fails (`SingleFileDB::checkpoint_error`), and after a failure waits
 //! before running another (doubling from one second to a minute, however
 //! often it is asked meanwhile; a checkpoint that succeeds meanwhile, a
-//! caller's, ends the wait) instead of failing in a loop. A panic in a
-//! run is caught and recorded too; it may have struck between writes that
-//! keep memory and disk in step, so the handle refuses writes from then on
-//! (`KiteError::WritesRefused`; reads go on, and reopening recovers from
-//! disk), and the thread ends.
+//! caller's, ends the wait) instead of failing in a loop. Without the thread
+//! the automatic checkpoints that run inline record their failures and back
+//! off the same way (`record_checkpoint_result`, `AutoCheckpointFailure`). A
+//! panic in a run is caught and recorded too; it may have struck between
+//! writes that keep memory and disk in step, so the handle refuses writes
+//! from then on (`KiteError::WritesRefused`; reads go on, and reopening
+//! recovers from disk), and the thread ends.
 //!
 //! Closing (or dropping) the database stops it: a run still building its
 //! snapshot stops at its next progress point (nothing names the pages it
@@ -38,9 +40,24 @@ use super::SingleFileDB;
 /// The name the checkpoint thread runs under.
 pub(crate) const CHECKPOINT_THREAD_NAME: &str = "kitedb-checkpoint";
 
-/// The first wait after a failed run; it doubles up to `MAX_BACKOFF`.
+/// The first wait after a failed automatic checkpoint; it doubles up to
+/// `MAX_BACKOFF` while failures go on.
 const FIRST_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
+
+/// The last automatic checkpoint's failure, and the back-off after it: no
+/// automatic checkpoint starts before `retry_at`, on the checkpoint thread
+/// or inline. A checkpoint that succeeds (any: automatic, a caller's,
+/// optimize's) clears it (`SingleFileDB::end_checkpoint_backoff`).
+#[derive(Debug, Default)]
+pub(crate) struct AutoCheckpointFailure {
+  /// The error (`SingleFileDB::checkpoint_error`).
+  error: Option<String>,
+  /// The back-off after it: the first, doubled for each failure in a row.
+  backoff: Option<Duration>,
+  /// When the back-off ends.
+  retry_at: Option<Instant>,
+}
 
 /// The first and the longest back-off of the checkpoint threads of the
 /// databases at these paths, set by tests (`set_checkpoint_test_backoff`).
@@ -48,7 +65,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 static TEST_BACKOFF: std::sync::Mutex<Vec<(std::path::PathBuf, Duration, Duration)>> =
   std::sync::Mutex::new(Vec::new());
 
-/// Make the back-off of `db`'s checkpoint thread start at `first` and
+/// Make the back-off of `db`'s automatic checkpoints start at `first` and
 /// double up to `max`.
 #[cfg(test)]
 pub(crate) fn set_checkpoint_test_backoff(db: &SingleFileDB, first: Duration, max: Duration) {
@@ -58,8 +75,8 @@ pub(crate) fn set_checkpoint_test_backoff(db: &SingleFileDB, first: Duration, ma
     .push((db.path().to_path_buf(), first, max));
 }
 
-/// The first and the longest wait after a failed run of `db`'s checkpoint
-/// thread.
+/// The first and the longest wait after a failed automatic checkpoint of
+/// `db`.
 fn backoff_bounds(db: &SingleFileDB) -> (Duration, Duration) {
   #[cfg(test)]
   if let Some((_, first, max)) = TEST_BACKOFF
@@ -96,9 +113,6 @@ struct Requests {
   /// Requests a finished run answered (a run answers every request made
   /// before it started).
   answered: u64,
-  /// A checkpoint installed since the last run started: a back-off after
-  /// a failed run ends (see `SingleFileDB::end_checkpoint_backoff`).
-  installed: bool,
 }
 
 /// What a database and its checkpoint thread share.
@@ -150,7 +164,7 @@ impl SingleFileDB {
           if panicked { " (it panicked)" } else { "" }
         );
         eprintln!("Warning: {error}");
-        *self.checkpoint_last_error.lock() = Some(error);
+        self.auto_checkpoint_failure.lock().error = Some(error);
       }
     }
     if thread.is_none() {
@@ -235,37 +249,60 @@ impl SingleFileDB {
     self.checkpoint_thread.lock().is_some()
   }
 
-  /// A checkpoint installed (any: the thread's, a caller's, optimize's):
-  /// the cause of the thread's last failure, if any, is gone, so the
-  /// thread's back-off after it ends, and its next failure waits the first
-  /// back-off again. Called under the pager lock (a leaf here).
+  /// A checkpoint succeeded (any: automatic, a caller's, optimize's): the
+  /// last automatic checkpoint's failure, if any, is stale, so its error
+  /// clears, the back-off after it ends (waking the checkpoint thread from
+  /// it), and the next failure waits the first back-off again. Called under
+  /// the pager lock: the locks it takes are leaves there.
   pub(crate) fn end_checkpoint_backoff(&self) {
+    *self.auto_checkpoint_failure.lock() = AutoCheckpointFailure::default();
     if let Some(thread) = self.checkpoint_thread.lock().as_ref() {
-      let mut requests = thread.signal.requests.lock();
-      requests.installed = true;
+      let _requests = thread.signal.requests.lock();
       thread.signal.wake.notify_all();
     }
   }
 
-  /// The error of the last checkpoint the checkpoint thread ran, if it
-  /// failed and no checkpoint installed since. Automatic checkpoints report
-  /// nothing to the commit that asked for them; this is where their failures
-  /// show, besides the log, and in the writers that would wait for one once
-  /// the WAL segments reach their limit (`CheckpointFailed`).
-  pub fn checkpoint_error(&self) -> Option<String> {
-    self.checkpoint_last_error.lock().clone()
+  /// How long automatic checkpoints still back off after the last one
+  /// failed, if they do.
+  pub(crate) fn checkpoint_backoff_remaining(&self) -> Option<Duration> {
+    self
+      .auto_checkpoint_failure
+      .lock()
+      .retry_at
+      .and_then(|at| at.checked_duration_since(Instant::now()))
+      .filter(|left| !left.is_zero())
   }
 
-  /// Record a failed run's error (an install clears it; see
-  /// `install_snapshot`), and wake the writers waiting for WAL segment
-  /// space, who fail with it rather than wait for a checkpoint.
-  fn record_checkpoint_result(&self, result: &crate::error::Result<()>) {
+  /// The error of the last automatic checkpoint (on the checkpoint thread
+  /// or, without it, inline), if it failed and no checkpoint succeeded
+  /// since. Automatic checkpoints report nothing to the commit that asked
+  /// for them; this is where their failures show, besides the log, and in
+  /// the writers that would wait for one once the WAL segments reach their
+  /// limit (`CheckpointFailed`).
+  pub fn checkpoint_error(&self) -> Option<String> {
+    self.auto_checkpoint_failure.lock().error.clone()
+  }
+
+  /// Record an automatic checkpoint's outcome. A failure records its error
+  /// and starts (or doubles) the back-off before the next automatic
+  /// checkpoint, warns, and wakes the writers waiting for WAL segment space,
+  /// who fail with it rather than wait. A success ends both
+  /// (`end_checkpoint_backoff`). `CheckpointDeclined` is neither: the run
+  /// did not happen, or stopped because the database is closing.
+  pub(crate) fn record_checkpoint_result(&self, result: &crate::error::Result<()>) {
     match result {
-      // Not failures: nothing ran.
-      Ok(()) | Err(KiteError::CheckpointDeclined(_)) => {}
+      Ok(()) => self.end_checkpoint_backoff(),
+      Err(KiteError::CheckpointDeclined(_)) => {}
       Err(error) => {
-        eprintln!("Warning: background checkpoint failed: {error}");
-        *self.checkpoint_last_error.lock() = Some(error.to_string());
+        eprintln!("Warning: automatic checkpoint failed: {error}");
+        let (first, max) = backoff_bounds(self);
+        {
+          let mut failure = self.auto_checkpoint_failure.lock();
+          let wait = failure.backoff.map_or(first, |wait| (wait * 2).min(max));
+          failure.error = Some(error.to_string());
+          failure.backoff = Some(wait);
+          failure.retry_at = Some(Instant::now() + wait);
+        }
         self.notify_segment_waiters();
       }
     }
@@ -274,21 +311,18 @@ impl SingleFileDB {
 
 fn run_checkpoint_thread(db: SingleFileDB, signal: Arc<CheckpointSignal>) {
   ON_CHECKPOINT_THREAD.with(|on| on.set(true));
-  let mut backoff = None::<Duration>;
   loop {
     {
       let mut requests = signal.requests.lock();
-      if let Some(wait) = backoff {
-        // After a failure: wait out the back-off, however often a commit asks
-        // meanwhile. A close ends it early, and so does a checkpoint that
-        // installs meanwhile (a caller's): the failure's cause is gone, and
-        // the doubling starts over.
-        let until = Instant::now() + wait;
-        while !requests.stop && !requests.installed && Instant::now() < until {
-          signal.wake.wait_until(&mut requests, until);
-        }
-        if requests.installed {
-          backoff = None;
+      // After a failure: wait out the back-off, however often a commit asks
+      // meanwhile. A close ends it early, and so does a checkpoint that
+      // succeeds meanwhile (a caller's; `end_checkpoint_backoff` wakes this).
+      while !requests.stop {
+        match db.checkpoint_backoff_remaining() {
+          Some(left) => {
+            signal.wake.wait_for(&mut requests, left);
+          }
+          None => break,
         }
       }
       while !requests.checkpoint && !requests.stop {
@@ -298,7 +332,6 @@ fn run_checkpoint_thread(db: SingleFileDB, signal: Arc<CheckpointSignal>) {
         return;
       }
       requests.checkpoint = false;
-      requests.installed = false;
     }
     let asked = signal.requests.lock().asked;
     let result =
@@ -339,10 +372,5 @@ fn run_checkpoint_thread(db: SingleFileDB, signal: Arc<CheckpointSignal>) {
       signal.wake.notify_all();
     }
     db.notify_segment_waiters();
-    backoff = match (&result, backoff) {
-      (Ok(()), _) | (Err(KiteError::CheckpointDeclined(_)), _) => None,
-      (Err(_), None) => Some(backoff_bounds(&db).0),
-      (Err(_), Some(wait)) => Some((wait * 2).min(backoff_bounds(&db).1)),
-    };
   }
 }

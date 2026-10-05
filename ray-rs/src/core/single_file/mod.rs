@@ -467,8 +467,9 @@ pub struct SingleFileInner {
   pub(crate) checkpoint_abandoned: AtomicBool,
   /// Set while a background checkpoint installs: closing lets it finish.
   pub(crate) checkpoint_installing: AtomicBool,
-  /// The error of the checkpoint thread's last run, until one succeeds.
-  pub(crate) checkpoint_last_error: Mutex<Option<String>>,
+  /// The last automatic checkpoint's failure and the back-off after it,
+  /// until a checkpoint succeeds (see `record_checkpoint_result`).
+  pub(crate) auto_checkpoint_failure: Mutex<checkpoint_thread::AutoCheckpointFailure>,
   /// Why this handle refuses writes, once an operation panicked in a
   /// `WriteSection` or a checkpoint run panicked (see
   /// `KiteError::WritesRefused`). Set once: reads of it are one atomic load.

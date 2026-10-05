@@ -1101,15 +1101,23 @@ impl SingleFileDB {
     if self.uses_checkpoint_thread() && self.request_background_checkpoint().is_some() {
       return;
     }
+    // Here, as the thread would: not during the back-off after a failure.
+    if self.checkpoint_backoff_remaining().is_some() {
+      return;
+    }
     let result = if self.background_checkpoint {
-      self.run_background_checkpoint().map(|_| ())
+      match self.run_background_checkpoint() {
+        Ok(BackgroundCheckpointOutcome::Done) => Ok(()),
+        // Another is running: it is the automatic checkpoint.
+        Ok(BackgroundCheckpointOutcome::AlreadyRunning) => return,
+        Ok(BackgroundCheckpointOutcome::ExclusiveWaiting) => Err(exclusive_waiting_error()),
+        Err(error) => Err(error),
+      }
     } else {
       self.checkpoint()
     };
-    // Reported, not returned: the caller's own outcome stands.
-    if let Err(error) = &result {
-      eprintln!("Warning: Auto-checkpoint failed: {error}");
-    }
+    // Recorded and reported, not returned: the caller's own outcome stands.
+    self.record_checkpoint_result(&result);
   }
 
   /// A checkpoint thread's run: a background checkpoint of its own. If
@@ -1723,9 +1731,16 @@ impl SingleFileDB {
       if self.segments_full_of_pinned() {
         return Err(KiteError::WalBufferFull);
       }
+      // As with the thread: while the last automatic checkpoint failed and
+      // its back-off lasts, fail rather than run another; after it, retry.
+      if self.checkpoint_backoff_remaining().is_some() {
+        if let Some(error) = self.checkpoint_error() {
+          return Err(KiteError::CheckpointFailed(error));
+        }
+      }
       let frees = self.wal_segment_frees.load(Ordering::Acquire);
       match self.run_background_checkpoint() {
-        Ok(BackgroundCheckpointOutcome::Done) => {}
+        Ok(BackgroundCheckpointOutcome::Done) => self.record_checkpoint_result(&Ok(())),
         // Another's run may have cut before this writer needed the space,
         // and free nothing: wait for it, then look again, running one of
         // this writer's own if it is still needed. Only that one's outcome
@@ -1735,9 +1750,12 @@ impl SingleFileDB {
           continue;
         }
         Ok(BackgroundCheckpointOutcome::ExclusiveWaiting) => return Err(KiteError::WalBufferFull),
+        // Open transactions hold every segment.
+        Err(KiteError::CheckpointDeclined(_)) => return Err(KiteError::WalBufferFull),
         Err(error) => {
-          eprintln!("Warning: Auto-checkpoint failed: {error}");
-          return Err(KiteError::CheckpointFailed(error.to_string()));
+          let message = error.to_string();
+          self.record_checkpoint_result(&Err(error));
+          return Err(KiteError::CheckpointFailed(message));
         }
       }
       if self.wal_segment_frees.load(Ordering::Acquire) == frees && !self.has_segment_space() {
@@ -1924,9 +1942,8 @@ impl SingleFileDB {
       );
     }
     pager.release_deferred_free_pages();
-    // A checkpoint succeeded: the checkpoint thread's last error is stale,
-    // and so is its back-off.
-    *self.checkpoint_last_error.lock() = None;
+    // A checkpoint succeeded: the last automatic checkpoint's failure is
+    // stale, and so is the back-off after it.
     self.end_checkpoint_backoff();
     Ok(())
   }
