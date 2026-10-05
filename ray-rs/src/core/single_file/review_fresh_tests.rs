@@ -59,6 +59,10 @@ fn big_transaction(
 /// there, live and after a reopen, and no rolled-back write is. (Passes. With
 /// the application's checkpoints, a few writes fail with `WalBufferFull`:
 /// F1; they are not counted as acknowledged.)
+///
+/// (With F1's fix: no write fails. Automatic checkpoints are on, and every
+/// transaction ends, so a writer at the segment limit always has a
+/// checkpoint that frees space to wait for.)
 #[test]
 fn fresh_stress_one_session_keeps_every_acked_commit() {
   let dir = tempdir().expect("tempdir");
@@ -156,6 +160,12 @@ fn fresh_stress_one_session_keeps_every_acked_commit() {
     );
   };
   check(&db, "live");
+  assert!(
+    errors.is_empty(),
+    "{} writes failed beside application background checkpoints (first: {:?})",
+    errors.len(),
+    errors.first()
+  );
   let db = Arc::try_unwrap(db).ok().expect("only handle");
   close_single_file(db).expect("close");
   let reopened = open_single_file(&path, options.clone().read_only(true)).expect("reopen");
