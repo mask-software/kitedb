@@ -380,6 +380,9 @@ fn writers_wait_only_at_the_segment_limit() {
     && wait_for("a writer to wait for segment space", deadline, || {
       writers_waiting_for_segments(&db) > 0
     });
+  // While it waits (the checkpoint is held, nothing frees), the segments it
+  // waits on are at their limit: it did not wait before.
+  let at_wait = wal_segment_test_stats(&db);
   if parked().is_some() {
     held.wait();
   }
@@ -392,6 +395,10 @@ fn writers_wait_only_at_the_segment_limit() {
   assert!(
     waited,
     "no writer waited for segment space while the checkpoint was held"
+  );
+  assert!(
+    at_wait.bytes >= 512 * 1024 || at_wait.live >= crate::constants::MAX_WAL_SEGMENTS - 1,
+    "a writer waited with the segments below their limit: {at_wait:?}"
   );
   assert_eq!(acked.len(), 6_000, "writes failed instead of waiting");
   assert!(missing(&db, &acked).is_empty());
@@ -429,9 +436,11 @@ fn checkpoint_thread_error_surfaces() {
     "the checkpoint thread's error was not reported: {reported:?}"
   );
   let failure = failure.expect("every commit succeeded past the segment limit");
+  // The exact variant, carrying the checkpoint's error: `WalBufferFull`'s
+  // message mentions a checkpoint too.
   assert!(
-    failure.to_string().to_lowercase().contains("checkpoint"),
-    "the commit at the limit failed with {failure}, not the checkpoint's error"
+    matches!(&failure, KiteError::CheckpointFailed(error) if error.contains("injected checkpoint abort")),
+    "the commit at the limit failed with {failure:?}, not with the checkpoint's error"
   );
   db.background_checkpoint()
     .expect("a checkpoint without the fault");
