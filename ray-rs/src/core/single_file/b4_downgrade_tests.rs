@@ -112,8 +112,8 @@ fn v0_2_18_refuses_every_file_this_version_writes() {
 
 /// A dual-header file in the old magic (written by an unreleased build
 /// before this one: version 1 or 2) still opens, read-only without writing
-/// anything, and a writable open upgrades both header slots at once, before
-/// any other write, so an old binary refuses the file from then on.
+/// anything, and a writable open upgrades both header slots before it
+/// returns, so an old binary refuses the file from then on.
 #[test]
 fn old_magic_files_open_and_upgrade_both_slots() {
   for fixture in ["wal_format_v1.kitedb", "v2_wal_records.kitedb"] {

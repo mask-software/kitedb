@@ -889,7 +889,7 @@ fn open_single_file_internal(
   }
 
   // Open or create pager
-  let (mut pager, mut header, is_new, mut header_slot, mut fallback_header, in_current_magic) =
+  let (mut pager, mut header, is_new, mut header_slot, fallback_header, in_current_magic) =
     if file_exists {
       // Open existing database
       let mut pager =
@@ -987,19 +987,6 @@ fn open_single_file_internal(
     if wal_buffer.check_and_trim(&mut pager)? {
       wal_buffer.store_in_header(&mut header);
       install_recovered_header(&mut pager, &mut header, &mut header_slot)?;
-    }
-
-    // A file in the older magic (`MAGIC_KITEDB_V1`, which releases up to
-    // v0.2.18 accept without checking the format version): rewrite both
-    // header slots in the current one now, so they refuse the file from here
-    // on. Every check that refuses the open is behind, and only the trim
-    // above may have written (a header, in the current magic). Both slots
-    // then name the selected header: there is no older fallback.
-    if !in_current_magic {
-      install_recovered_header(&mut pager, &mut header, &mut header_slot)?;
-      install_recovered_header(&mut pager, &mut header, &mut header_slot)?;
-      header.magic = MAGIC_KITEDB;
-      fallback_header = None;
     }
 
     // Finish an interrupted background checkpoint. Each branch leaves the WAL
@@ -1269,6 +1256,21 @@ fn open_single_file_internal(
         vector_store_lazy_entries.len(),
       );
     }
+  }
+
+  // A file in the older magic (`MAGIC_KITEDB_V1`, which releases up to
+  // v0.2.18 accept without checking the format version): rewrite both header
+  // slots in the current one, so they refuse the file from here on. Last,
+  // once every check that may refuse the open passed (the header, the WAL,
+  // the snapshot, the log's records and their replay, the vector stores, the
+  // replication sidecar): a refused open leaves the file in its magic, with
+  // its fallback slot. Only the recovery writes above may have written
+  // before (headers in the current magic). A crash between the two writes
+  // leaves one slot in each magic, which the next writable open finishes.
+  if !options.read_only && !in_current_magic {
+    install_recovered_header(&mut pager, &mut header, &mut header_slot)?;
+    install_recovered_header(&mut pager, &mut header, &mut header_slot)?;
+    header.magic = MAGIC_KITEDB;
   }
 
   let wal_segment_size = options.wal_segment_size;

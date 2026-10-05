@@ -52,9 +52,10 @@ pub const MAGIC_KITEDB: [u8; 16] = *b"KiteDB format 2\0";
 
 /// The magic of v0.2.18 and earlier, and of files unreleased builds wrote
 /// before `MAGIC_KITEDB` (dual-header files of format versions 1 and 2):
-/// still read; a writable open rewrites both header slots in the current
-/// magic before anything else. A header in it that names WAL segments (only
-/// unreleased builds wrote one) is refused with its file: its footer
+/// still read. A writable open rewrites both header slots in the current
+/// magic last, once every check that may refuse the open passed: a refused
+/// open leaves them in this one. A header in it that names WAL segments
+/// (only unreleased builds wrote one) is refused with its file: its footer
 /// checksum cannot tell a page torn inside the segment table from a whole
 /// one (see `header::HeaderPage::Refused`).
 pub const MAGIC_KITEDB_V1: [u8; 16] = *b"KiteDB format 1\0";
