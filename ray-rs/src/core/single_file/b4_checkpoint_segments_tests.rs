@@ -992,7 +992,11 @@ fn background_checkpoint_covers_wal_segments() {
 
 /// A write transaction whose records the WAL spilled into a segment while it
 /// was open (it wrote more than it keeps back) commits exactly once, whether
-/// a checkpoint runs while it is open or after, live and after a reopen.
+/// a checkpoint runs while it is open or after, live and after a reopen. A
+/// later transaction deletes some of what it created and changes the rest:
+/// replaying it a second time, or after that one, would bring the deleted
+/// nodes back and the old values. (Made strict with the fresh review: it
+/// accepted a declined checkpoint, and creates alone replay the same twice.)
 #[test]
 fn transaction_open_across_a_spill_and_a_checkpoint_commits_once() {
   let dir = tempdir().expect("tempdir");
@@ -1029,24 +1033,71 @@ fn transaction_open_across_a_spill_and_a_checkpoint_commits_once() {
     wal_segment_test_stats(&db).next_seq > spills.max(1),
     "the WAL never spilled"
   );
-  // Either is fine: it covers the open transaction's records or declines.
-  match db.background_checkpoint() {
-    Ok(()) | Err(KiteError::CheckpointDeclined(_)) => {}
-    Err(error) => panic!("checkpoint failed: {error}"),
-  }
+  // It covers the segments, keeping those the open transaction holds.
+  let covered = wal_segment_test_stats(&db).covered;
+  db.background_checkpoint()
+    .expect("a checkpoint while the transaction is open");
+  assert!(
+    wal_segment_test_stats(&db).covered > covered,
+    "the checkpoint while the transaction is open covered nothing"
+  );
+  assert!(
+    db.oldest_pinned_segment().is_some(),
+    "the open transaction's records are not in a segment the install kept"
+  );
   go.send(()).expect("release the open transaction");
   writer.join().expect("writer");
   assert!(missing(&db, &open_keys).is_empty(), "lost live");
+
+  // A later transaction deletes the first ten and numbers the rest.
+  db.begin(false).expect("begin");
+  let value = db.define_propkey("value").expect("propkey");
+  for key in &open_keys[..10] {
+    let node = db.node_by_key(key).expect("node");
+    db.delete_node(node).expect("delete");
+  }
+  for (index, key) in open_keys[10..].iter().enumerate() {
+    let node = db.node_by_key(key).expect("node");
+    db.set_node_prop(node, value, PropValue::I64(index as i64))
+      .expect("prop");
+  }
+  db.commit().expect("commit the changes");
+  let check = |db: &SingleFileDB, when: &str| {
+    for key in &open_keys[..10] {
+      assert!(
+        db.node_by_key(key).is_none(),
+        "{when}: a deleted node is back"
+      );
+    }
+    for (index, key) in open_keys[10..].iter().enumerate() {
+      let node = db
+        .node_by_key(key)
+        .unwrap_or_else(|| panic!("{when}: {key} lost"));
+      assert_eq!(
+        db.node_prop(node, value),
+        Some(PropValue::I64(index as i64)),
+        "{when}: an old value is back"
+      );
+    }
+  };
+  check(&db, "live");
+  // A crash now: the reopen replays the transaction from the segment the
+  // install kept, then the later one.
+  let copy = path.with_extension("crash.kitedb");
+  std::fs::copy(&path, &copy).expect("copy the file");
+  let crashed = open_single_file(&copy, spilling_options()).expect("open the crash copy");
+  check(&crashed, "a crash copy before the next checkpoint");
+  drop(crashed);
   db.background_checkpoint()
     .expect("checkpoint after it committed");
+  check(&db, "after the checkpoint");
   let count = db.count_nodes();
+  // Dropped, so the reopen replays the log (a clean close would checkpoint
+  // it away).
   let db = Arc::into_inner(db).expect("sole owner");
-  close_single_file(db).expect("close");
+  drop(db);
   let reopened = open_single_file(&path, spilling_options()).expect("reopen");
-  assert!(
-    missing(&reopened, &open_keys).is_empty(),
-    "lost after reopen"
-  );
+  check(&reopened, "after a reopen");
   assert!(missing(&reopened, &acked).is_empty());
   assert_eq!(
     reopened.count_nodes(),
