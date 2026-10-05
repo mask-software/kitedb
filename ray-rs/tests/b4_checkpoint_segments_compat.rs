@@ -141,7 +141,8 @@ fn v2_files_open_write_spill_and_checkpoint() {
       .unwrap_or_else(|error| panic!("{}: writable open: {error}", fixture.name));
     check_keys(&db, &fixture, "writable");
     write_nodes(&db, "new", 640);
-    close_single_file(db).expect("close");
+    // Dropped, not closed: a clean close checkpoints the segments away.
+    drop(db);
     let (header, segments) = newest_header(&path);
     assert!(
       segments > 0 && header.version == 3 && header.min_reader_version == 3,
@@ -188,7 +189,10 @@ fn a_file_naming_segments_needs_a_v3_reader() {
     .auto_checkpoint(false);
   let db = open_single_file(&path, options.clone()).expect("open");
   write_nodes(&db, "key", 640);
-  close_single_file(db).expect("close");
+  // Dropped, not closed: a clean close checkpoints the segments away (and
+  // the file is version 2 again); a process that ends without closing
+  // leaves them.
+  drop(db);
 
   let (header, segments) = newest_header(&path);
   let old_reader_refuses = header.min_reader_version > 2;
