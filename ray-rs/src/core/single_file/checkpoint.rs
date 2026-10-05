@@ -5293,3 +5293,9 @@ mod review_fresh_tests;
 #[cfg(test)]
 #[path = "review_fresh2_tests.rs"]
 mod review_fresh2_tests;
+
+/// raydb-b4 `checkpoint-segments`: every file this version writes is one
+/// v0.2.18 and earlier refuse.
+#[cfg(test)]
+#[path = "b4_downgrade_tests.rs"]
+mod b4_downgrade_tests;
