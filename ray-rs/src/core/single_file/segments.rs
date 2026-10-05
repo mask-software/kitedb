@@ -207,13 +207,24 @@ pub(crate) struct SpilledTransaction {
 }
 
 impl SingleFileDB {
-  /// Pages of a new WAL segment extent: the configured size, and at least one
-  /// and a half WALs and `record_bytes`, in whole pages.
+  /// Pages of a new WAL segment extent: the configured size, else a
+  /// sixteenth of the segment limit, from two WALs to
+  /// `WAL_SEGMENT_DEFAULT_SIZE`; and at least one and a half WALs and
+  /// `record_bytes`, in whole pages. Small next to the limit: an open
+  /// transaction whose records spilled keeps the extent it began in whole,
+  /// with the records written before it, until a checkpoint covers its
+  /// commit, and those count against the limit too. A sixteenth leaves the
+  /// table's 64 entries room for the limit's worth of extents and more.
   fn wal_segment_extent_pages(&self, header: &DbHeaderV1, record_bytes: u64) -> u64 {
     let page_size = header.page_size as u64;
     let wal_bytes = header.wal_page_count.saturating_mul(page_size);
-    let extent = self
-      .wal_segment_size
+    let configured = self.wal_segment_size.unwrap_or_else(|| {
+      (self.wal_segment_limit(header) / 16).clamp(
+        wal_bytes.saturating_mul(2),
+        (WAL_SEGMENT_DEFAULT_SIZE as u64).max(wal_bytes.saturating_mul(2)),
+      )
+    });
+    let extent = configured
       .max(wal_bytes.saturating_mul(3) / 2)
       .max(record_bytes);
     extent.div_ceil(page_size)

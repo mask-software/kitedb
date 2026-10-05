@@ -1450,7 +1450,10 @@ export interface JsKiteOptions {
    * 128 MiB; the in-memory delta takes about ten times the log's size)
    */
   checkpointLogBudget?: number
-  /** Bytes of a WAL segment extent (default: eight WALs, at most 32 MiB) */
+  /**
+   * Bytes of a WAL segment extent (default: a sixteenth of the segment
+   * limit, from two WALs to 32 MiB)
+   */
   walSegmentSize?: number
   /** The most bytes of WAL segments before writers wait for a checkpoint */
   walSegmentLimit?: number
@@ -1909,7 +1912,10 @@ export interface OpenOptions {
    * twice the checkpoint trigger, at most four times this).
    */
   checkpointLogBudget?: number
-  /** Bytes of a WAL segment extent (default: eight WALs, at most 32 MiB) */
+  /**
+   * Bytes of a WAL segment extent (default: a sixteenth of the segment
+   * limit, from two WALs to 32 MiB)
+   */
   walSegmentSize?: number
   /**
    * The most bytes of WAL segments before writers wait for a checkpoint

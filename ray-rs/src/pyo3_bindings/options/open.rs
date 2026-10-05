@@ -240,7 +240,8 @@ pub struct OpenOptions {
   /// twice the checkpoint trigger, at most four times this).
   #[pyo3(get, set)]
   pub checkpoint_log_budget: Option<i64>,
-  /// Bytes of a WAL segment extent (default: eight WALs, at most 32 MiB)
+  /// Bytes of a WAL segment extent (default: a sixteenth of the segment
+  /// limit, from two WALs to 32 MiB)
   #[pyo3(get, set)]
   pub wal_segment_size: Option<i64>,
   /// The most bytes of WAL segments before writers wait for a checkpoint

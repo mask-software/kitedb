@@ -100,7 +100,8 @@ class OpenOptions:
     # The most log, in bytes, an automatic checkpoint waits for (default
     # 128 MiB; the in-memory delta takes about ten times the log's size).
     checkpoint_log_budget: Optional[int]
-    # Bytes of a WAL segment extent (default: eight WALs, at most 32 MiB).
+    # Bytes of a WAL segment extent (default: a sixteenth of the segment
+    # limit, from two WALs to 32 MiB).
     wal_segment_size: Optional[int]
     # The most bytes of WAL segments before writers wait for a checkpoint.
     wal_segment_limit: Optional[int]

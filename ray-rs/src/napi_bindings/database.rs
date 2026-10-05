@@ -188,7 +188,8 @@ pub struct OpenOptions {
   /// Writers wait for a checkpoint only at the WAL segment limit (by default
   /// twice the checkpoint trigger, at most four times this).
   pub checkpoint_log_budget: Option<f64>,
-  /// Bytes of a WAL segment extent (default: eight WALs, at most 32 MiB)
+  /// Bytes of a WAL segment extent (default: a sixteenth of the segment
+  /// limit, from two WALs to 32 MiB)
   pub wal_segment_size: Option<f64>,
   /// The most bytes of WAL segments before writers wait for a checkpoint
   /// (default: twice the checkpoint trigger, at least 16 WALs, at most four

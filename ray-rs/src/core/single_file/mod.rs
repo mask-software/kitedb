@@ -474,8 +474,9 @@ pub struct SingleFileInner {
   /// `KiteError::WritesRefused`). Set once: reads of it are one atomic load.
   pub(crate) writes_refused: std::sync::OnceLock<String>,
 
-  /// Bytes of a new WAL segment extent (see `segments`).
-  pub(crate) wal_segment_size: u64,
+  /// Bytes of a new WAL segment extent, if the options set it (see
+  /// `wal_segment_extent_pages`).
+  pub(crate) wal_segment_size: Option<u64>,
   /// A checkpoint starts once the WAL segments hold this fraction of the
   /// snapshot's size (see `checkpoint_log_trigger`).
   pub(crate) checkpoint_log_ratio: f64,

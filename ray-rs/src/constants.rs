@@ -79,8 +79,9 @@ pub const WAL_SEGMENT_TABLE_OFFSET: usize = 184;
 pub const WAL_SEGMENT_TABLE_HEADER_SIZE: usize = 24;
 /// Bytes of one WAL segment table entry.
 pub const WAL_SEGMENT_ENTRY_SIZE: usize = 32;
-/// Default size of a WAL segment extent: spills of the WAL fill one until it
-/// is full or a checkpoint seals it.
+/// The largest default size of a WAL segment extent (spills of the WAL fill
+/// one until it is full or a checkpoint seals it): by default an extent is a
+/// sixteenth of the segment limit, from two WALs up to this.
 pub const WAL_SEGMENT_DEFAULT_SIZE: usize = 32 * 1024 * 1024;
 /// The largest `wal_segment_size` (1 TiB).
 pub const WAL_SEGMENT_MAX_SIZE: u64 = 1 << 40;

@@ -144,8 +144,11 @@ pub struct SingleFileOpenOptions {
   /// default twice the checkpoint trigger, at most four times this).
   pub checkpoint_log_budget: u64,
   /// Bytes of a WAL segment extent: spills of the WAL fill one before the
-  /// next is allocated (default: eight WALs, at most 32 MiB; at least one
-  /// and a half WALs).
+  /// next is allocated (default: a sixteenth of the segment limit, from two
+  /// WALs to 32 MiB; at least one and a half WALs). An open transaction
+  /// whose records spilled keeps the extent it began in, records written
+  /// before it included, until a checkpoint covers its commit, so extents
+  /// small next to the limit keep such pins small.
   pub wal_segment_size: Option<u64>,
   /// The most bytes of WAL segments: past it the WAL spills no more, and
   /// writers wait for a checkpoint (or fail with `WalBufferFull` without
@@ -1227,9 +1230,7 @@ fn open_single_file_internal(
     }
   }
 
-  let wal_segment_size = options
-    .wal_segment_size
-    .unwrap_or_else(|| default_wal_segment_size(&header));
+  let wal_segment_size = options.wal_segment_size;
   Ok(SingleFileDB::owning(SingleFileInner {
     path: path.to_path_buf(),
     read_only: options.read_only,
@@ -1329,14 +1330,6 @@ fn validate_checkpoint_options(options: &SingleFileOpenOptions) -> Result<()> {
     )));
   }
   Ok(())
-}
-
-/// Bytes of a WAL segment extent by default: eight WALs, at most
-/// `WAL_SEGMENT_DEFAULT_SIZE` (but always room for a WAL's records and more;
-/// see `wal_segment_extent_pages`).
-fn default_wal_segment_size(header: &DbHeaderV1) -> u64 {
-  let wal_bytes = header.wal_page_count * header.page_size as u64;
-  (8 * wal_bytes).min(WAL_SEGMENT_DEFAULT_SIZE as u64)
 }
 
 /// Put the pages of the file no header slot names on the pager's free list,
