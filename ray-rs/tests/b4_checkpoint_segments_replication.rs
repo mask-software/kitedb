@@ -62,6 +62,21 @@ fn replica_bootstraps_from_a_source_with_wal_segments() {
     segments_on_disk(&primary_path) > 0,
     "the primary's WAL never spilled"
   );
+  // The newest commits in segments, the WAL empty: a bulk commit larger
+  // than the WAL goes straight to a segment. (A bootstrap that read only
+  // the WAL for the source's newest commit would find none.)
+  let bulk: Vec<String> = (0..400)
+    .map(|index| format!("bulk-{index}-{}", "b".repeat(200)))
+    .collect();
+  let bulk_refs: Vec<Option<&str>> = bulk.iter().map(|key| Some(key.as_str())).collect();
+  primary.begin_bulk().expect("begin bulk");
+  primary.create_nodes_batch(&bulk_refs).expect("bulk nodes");
+  primary.commit_with_token().expect("bulk commit");
+  assert_eq!(
+    primary.wal_stats().primary_head,
+    0,
+    "setup: the bulk commit left records in the WAL"
+  );
 
   let replica = open_single_file(
     &replica_path,
@@ -76,6 +91,14 @@ fn replica_bootstraps_from_a_source_with_wal_segments() {
   for index in [0, 199, 399] {
     assert!(replica.node_by_key(&key(index)).is_some(), "node {index}");
   }
+  for key in [&bulk[0], &bulk[399]] {
+    assert!(replica.node_by_key(key).is_some(), "bulk node {key}");
+  }
+  assert_eq!(
+    replica.count_nodes(),
+    primary.count_nodes(),
+    "the replica's copy and the primary differ after the bootstrap"
+  );
   commit_nodes(&primary, 400, 5);
   loop {
     if replica.replica_catch_up_once(64).expect("catch up") == 0 {
@@ -83,6 +106,8 @@ fn replica_bootstraps_from_a_source_with_wal_segments() {
     }
   }
   assert!(replica.node_by_key(&key(404)).is_some());
+  // Catch-up replayed nothing the copy held already.
+  assert_eq!(replica.count_nodes(), primary.count_nodes());
 
   // The primary reopens on a log whose newest commits are in segments: its
   // last committed transaction matches the sidecar's, so it is not fenced.

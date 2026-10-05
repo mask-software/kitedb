@@ -1852,6 +1852,54 @@ mod tests {
     assert_eq!(db.count_edges(), 0);
     close_single_file(db).expect("close db");
   }
+
+  /// The source's newest commit, in a WAL segment with the WAL empty after
+  /// it (a commit larger than the WAL goes straight to a segment), is the
+  /// one a snapshot bootstrap waits for the sidecar to publish. Reading only
+  /// the WAL, as before segments, finds no commit, and the bootstrap would
+  /// pin a log position before it.
+  #[test]
+  fn source_last_committed_txid_reads_the_wal_segments() {
+    use crate::core::single_file::SyncMode;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("source-txid-in-segments.kitedb");
+    let db = open_single_file(
+      &db_path,
+      SingleFileOpenOptions::new()
+        .wal_size(64 * 1024)
+        .sync_mode(SyncMode::Normal)
+        .auto_checkpoint(false),
+    )
+    .expect("open db");
+    for index in 0..10 {
+      db.begin(false).expect("begin");
+      db.create_node(Some(&format!("small-{index}")))
+        .expect("node");
+      db.commit().expect("commit");
+    }
+    // A bulk commit of about 90 KiB, more than the WAL's 48 KiB region,
+    // written whole at its commit: it goes straight to a segment.
+    let keys: Vec<String> = (0..400)
+      .map(|index| format!("big-{index}-{}", "b".repeat(200)))
+      .collect();
+    let keys: Vec<Option<&str>> = keys.iter().map(|key| Some(key.as_str())).collect();
+    db.begin_bulk().expect("begin bulk");
+    let txid = db.current_txid().expect("open transaction");
+    db.create_nodes_batch(&keys).expect("nodes");
+    db.commit().expect("commit");
+    {
+      let header = db.header.read();
+      assert!(
+        !header.wal_segments.is_empty() && db.wal_buffer.lock().is_empty(),
+        "setup: the newest commit is not in a segment with the WAL empty"
+      );
+    }
+    assert_eq!(
+      super::source_last_committed_txid(&db).expect("read the log"),
+      Some(txid)
+    );
+    close_single_file(db).expect("close db");
+  }
 }
 
 /// raydb-b4 replication-core: fencing under the commit lock, the snapshot
