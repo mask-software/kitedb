@@ -77,3 +77,50 @@ fn fresh3_a_crash_mid_upgrade_leaves_a_file_the_next_writable_open_finishes() {
   close_single_file(db).expect("close");
   assert_eq!(accepted_slots(&path), [false, false]);
 }
+
+/// N1 (low). 89d395a moved the magic upgrade after "the checks that may
+/// refuse the open", and its comment says every such check is behind it
+/// (open.rs, before the upgrade). Not so: a writable open of an old-magic
+/// file whose snapshot does not load (here a damaged snapshot page) still
+/// rewrites both header slots, then fails; the older fallback slot is gone
+/// and the file is in the new magic, though the open refused it.
+/// `a_refused_open_of_an_old_magic_file_writes_nothing` covers only a WAL
+/// size refusal.
+#[test]
+fn fresh3_an_open_refused_for_a_damaged_snapshot_writes_nothing() {
+  let dir = tempdir().expect("tempdir");
+  let path = dir.path().join("damaged.kitedb");
+  std::fs::copy(
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v2_wal_records.kitedb"),
+    &path,
+  )
+  .expect("copy the fixture");
+  let mut bytes = std::fs::read(&path).expect("read");
+  let header = crate::types::DbHeaderV1::parse(&bytes[0..4096]).expect("slot 0");
+  assert!(header.snapshot_page_count > 0, "setup: no snapshot");
+  // Damage the middle of the snapshot.
+  let at = (header.snapshot_start_page * 4096 + header.snapshot_page_count * 2048) as usize;
+  for byte in &mut bytes[at..at + 64] {
+    *byte ^= 0xff;
+  }
+  std::fs::write(&path, &bytes).expect("write");
+  let before = std::fs::read(&path).expect("read");
+  let refused = open_single_file(&path, SingleFileOpenOptions::new());
+  assert!(refused.is_err(), "setup: the open was not refused");
+  let after = std::fs::read(&path).expect("read");
+  let changed = (0..before.len().max(after.len()) / 4096)
+    .filter(|&page| {
+      before.get(page * 4096..(page + 1) * 4096) != after.get(page * 4096..(page + 1) * 4096)
+    })
+    .collect::<Vec<_>>();
+  assert!(
+    changed.is_empty(),
+    "an open that refused the file ({}) wrote to it: pages {changed:?} changed; v0.2.18 now \
+     accepts {:?} of its slots",
+    refused
+      .err()
+      .map(|error| error.to_string())
+      .unwrap_or_default(),
+    accepted_slots(&path)
+  );
+}
