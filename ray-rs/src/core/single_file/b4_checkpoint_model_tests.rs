@@ -32,7 +32,7 @@
 //! timing too, so they may not replay exactly; the rest do. The run prints
 //! what the seeds covered (commits, cuts, crash images, ...).
 
-use super::b4_checkpoint_segments_tests::crash_images;
+use super::b4_checkpoint_segments_tests::{crash_image, CrashModel};
 use super::*;
 use crate::core::pager::io_hooks::{self, IoEvent};
 use crate::core::single_file::{
@@ -1011,42 +1011,40 @@ impl Model {
         .db
         .as_ref()
         .map_or(4096, |db| db.header.read().page_size as u64);
-    let images = crash_images(&base, events, header_end);
-    // In `Normal` mode commits are durable against a process crash only:
-    // only the images with every write landed in order apply.
-    let full = self.config.sync == SyncMode::Full;
-    let candidates: Vec<usize> = (0..images.len())
-      .filter(|index| full || index % 2 == 0)
+    // The crash models the sync mode holds commits through (in `Normal`
+    // mode only a process crash's: every write landed, in order), at every
+    // point: the end of the step, and four more at random.
+    let models: Vec<CrashModel> = CrashModel::ALL
+      .into_iter()
+      .filter(|model| model.fits(self.config.sync))
       .collect();
-    let last = candidates
-      .iter()
-      .rev()
-      .take(if full { 2 } else { 1 })
-      .copied();
-    let mut chosen: Vec<usize> = last.collect();
+    let mut chosen: Vec<(usize, CrashModel)> =
+      models.iter().map(|&model| (events.len(), model)).collect();
     for _ in 0..4 {
-      chosen.push(candidates[self.rng.gen_range(0..candidates.len())]);
+      let cut = self.rng.gen_range(0..=events.len());
+      chosen.push((cut, models[self.rng.gen_range(0..models.len())]));
     }
-    chosen.sort_unstable();
+    chosen.sort_unstable_by_key(|(cut, model)| (*cut, *model as u8));
     chosen.dedup();
     self.note(format!(
       "  crash images of the {what}: {} events, images {chosen:?}",
       events.len()
     ));
-    let at_end = images.len().saturating_sub(2);
-    for index in chosen {
+    for (cut, model) in chosen {
+      let Some(image) = crash_image(&base, events, header_end, cut, model) else {
+        continue;
+      };
       self.count("crash images");
-      let (name, image) = &images[index];
       let copy = self.copy_path();
-      std::fs::write(&copy, image).expect("write the image");
+      std::fs::write(&copy, &image).expect("write the image");
       let allowed: Vec<&State> = match commit {
-        Some((before, with)) if index < at_end => vec![before, with],
+        Some((before, with)) if cut < events.len() => vec![before, with],
         _ => vec![&self.state],
       };
       let read_only = self.rng.gen_bool(0.25);
       let twice = self.rng.gen_bool(0.3);
       let outcome = reopen_and_check(
-        &format!("{what}, {name}"),
+        &format!("{what}, crash after {cut} events, {model:?}"),
         &copy,
         &self.config.options(),
         read_only,

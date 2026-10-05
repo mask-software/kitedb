@@ -77,51 +77,130 @@ fn apply(image: &mut Vec<u8>, offset: u64, data: &[u8]) {
   image[start..end].copy_from_slice(data);
 }
 
-/// The disk after a crash at each point of `events`, from `base`: every
-/// write so far landed, in order; and the writes before the last successful
-/// sync landed but after it only the header pages' (below `header_end`).
-/// Two images per point, in that order.
+/// How a crash image models the disk after a crash (see `crash_image`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CrashModel {
+  /// Every write so far landed, in order: a process crash (the OS writes
+  /// back everything it took), or an OS crash that wrote back everything.
+  InOrder,
+  /// The writes before the last successful sync landed, and after it only
+  /// the header pages': an OS crash that wrote back the headers early.
+  HeadersAhead,
+  /// The writes before the last successful sync landed, and after it all
+  /// but the header pages': an OS crash that wrote back the data early.
+  DataAhead,
+  /// Every write landed, but the last, a header write, only in part: its
+  /// slot is torn (its checksum fails).
+  TornHeader,
+}
+
+impl CrashModel {
+  pub(super) const ALL: [CrashModel; 4] = [
+    CrashModel::InOrder,
+    CrashModel::HeadersAhead,
+    CrashModel::DataAhead,
+    CrashModel::TornHeader,
+  ];
+
+  /// Whether a database in `sync_mode` holds its acknowledged commits
+  /// through such a crash: every mode that writes commits through a process
+  /// crash (in order), only `Full` through the OS crashes.
+  pub(super) fn fits(self, sync_mode: SyncMode) -> bool {
+    match self {
+      CrashModel::InOrder => sync_mode != SyncMode::Off,
+      _ => sync_mode == SyncMode::Full,
+    }
+  }
+}
+
+/// The disk after a crash once the first `cut` of `events` (recorded from
+/// `base`) happened, as `model` has it; the header pages are the bytes
+/// below `header_end`. `None` for a torn header slot unless the last of
+/// them is a header write.
+pub(super) fn crash_image(
+  base: &[u8],
+  events: &[IoEvent],
+  header_end: u64,
+  cut: usize,
+  model: CrashModel,
+) -> Option<Vec<u8>> {
+  let prefix = &events[..cut];
+  let last_sync = prefix
+    .iter()
+    .rposition(|event| matches!(event, IoEvent::Sync { ok: true }));
+  let torn = match (model, prefix.last()) {
+    (CrashModel::TornHeader, Some(IoEvent::Write { offset, .. })) if *offset < header_end => {
+      Some(cut - 1)
+    }
+    (CrashModel::TornHeader, _) => return None,
+    _ => None,
+  };
+  let mut image = base.to_vec();
+  for (index, event) in prefix.iter().enumerate() {
+    let IoEvent::Write { offset, data } = event else {
+      continue;
+    };
+    let durable = last_sync.is_some_and(|sync| index < sync);
+    let header = *offset < header_end;
+    let lands = match model {
+      CrashModel::InOrder | CrashModel::TornHeader => true,
+      CrashModel::HeadersAhead => durable || header,
+      CrashModel::DataAhead => durable || !header,
+    };
+    if !lands {
+      continue;
+    }
+    let data = if Some(index) == torn {
+      &data[..data.len() / 2]
+    } else {
+      &data[..]
+    };
+    apply(&mut image, *offset, data);
+  }
+  Some(image)
+}
+
+/// Every crash image of `events` (see `crash_image`) that `sync_mode`
+/// holds acknowledged commits through: each point, each model that fits.
+/// Each with the number of events before it, and a name.
 pub(super) fn crash_images(
   base: &[u8],
   events: &[IoEvent],
   header_end: u64,
-) -> Vec<(String, Vec<u8>)> {
+  sync_mode: SyncMode,
+) -> Vec<(usize, String, Vec<u8>)> {
   let mut images = Vec::new();
   for cut in 0..=events.len() {
-    let prefix = &events[..cut];
-    let last_sync = prefix
-      .iter()
-      .rposition(|event| matches!(event, IoEvent::Sync { ok: true }));
-    let mut in_order = base.to_vec();
-    let mut reordered = base.to_vec();
-    for (index, event) in prefix.iter().enumerate() {
-      let IoEvent::Write { offset, data } = event else {
+    for model in CrashModel::ALL {
+      if !model.fits(sync_mode) {
         continue;
-      };
-      apply(&mut in_order, *offset, data);
-      if last_sync.is_some_and(|sync| index < sync) || *offset < header_end {
-        apply(&mut reordered, *offset, data);
+      }
+      if let Some(image) = crash_image(base, events, header_end, cut, model) {
+        images.push((cut, format!("crash after {cut} events, {model:?}"), image));
       }
     }
-    images.push((format!("crash after {cut} events, in order"), in_order));
-    images.push((
-      format!("crash after {cut} events, headers ahead of data"),
-      reordered,
-    ));
   }
   images
 }
 
 /// S1. A spill copies the WAL's records into a segment, syncs it, and
 /// installs a header naming it with an empty WAL in both slots. A crash at
-/// any write or sync of the commits around it (in order, or with the
-/// header pages ahead of the rest) keeps every acknowledged commit.
+/// any write or sync of the commits around it keeps every acknowledged
+/// commit: in `Full` mode whatever an OS crash leaves (in order, the header
+/// pages ahead of the rest or behind it, a torn header slot), in `Normal`
+/// mode what a process crash leaves (in order).
 #[test]
 fn spill_survives_a_crash_at_every_io_event() {
+  for sync_mode in [SyncMode::Full, SyncMode::Normal] {
+    spill_survives_a_crash_at_every_io_event_in(sync_mode);
+  }
+}
+
+fn spill_survives_a_crash_at_every_io_event_in(sync_mode: SyncMode) {
   let dir = tempdir().expect("tempdir");
   let path = dir.path().join("spill-crash.kitedb");
   // No checkpoint: only spills make room.
-  let options = options().sync_mode(SyncMode::Full).auto_checkpoint(false);
+  let options = options().sync_mode(sync_mode).auto_checkpoint(false);
   let db = open_single_file(&path, options.clone()).expect("open");
   let header_end = 2 * db.header.read().page_size as u64;
   // Most of the primary region, so the commits below spill.
@@ -147,18 +226,27 @@ fn spill_survives_a_crash_at_every_io_event() {
   drop(db);
   assert!(
     spilled,
-    "the WAL never spilled into a segment: the commits that filled it ran checkpoints instead"
+    "{sync_mode:?}: the WAL never spilled into a segment: the commits that filled it ran \
+     checkpoints instead"
   );
 
-  let image_path = dir.path().join("spill-crash-image.kitedb");
-  for (image_index, (what, image)) in crash_images(&base, &events, header_end)
+  let images = crash_images(&base, &events, header_end, sync_mode);
+  for model in CrashModel::ALL
     .into_iter()
-    .enumerate()
+    .filter(|model| model.fits(sync_mode))
   {
-    let cut = image_index / 2;
+    assert!(
+      images
+        .iter()
+        .any(|(_, what, _)| what.ends_with(&format!("{model:?}"))),
+      "{sync_mode:?}: no {model:?} image"
+    );
+  }
+  let image_path = dir.path().join("spill-crash-image.kitedb");
+  for (cut, what, image) in images {
     std::fs::write(&image_path, &image).expect("write image");
     let crashed = open_single_file(&image_path, options.clone())
-      .unwrap_or_else(|error| panic!("{what}: unopenable: {error:?}"));
+      .unwrap_or_else(|error| panic!("{sync_mode:?}, {what}: unopenable: {error:?}"));
     let acked_by_now: Vec<String> = acked
       .iter()
       .cloned()
@@ -172,7 +260,10 @@ fn spill_survives_a_crash_at_every_io_event() {
       .collect();
     let lost = missing(&crashed, &acked_by_now).len();
     close_single_file(crashed).expect("close");
-    assert_eq!(lost, 0, "{what}: lost {lost} acknowledged commits");
+    assert_eq!(
+      lost, 0,
+      "{sync_mode:?}, {what}: lost {lost} acknowledged commits"
+    );
     std::fs::remove_file(&image_path).expect("remove image");
   }
 }
@@ -437,9 +528,11 @@ fn checkpoint_thread_run_failing_at(phase: CheckpointPhase) {
     .filter(|&cut| matches!(&events[cut], IoEvent::Write { offset, .. } if *offset < header_end))
     .chain([events.len()])
     .collect();
-  let images = crash_images(&base, &events, header_end);
   let image_path = path.with_extension("image.kitedb");
-  for (what, image) in cuts.iter().map(|&cut| &images[2 * cut]) {
+  for &cut in &cuts {
+    let what = format!("crash after {cut} events, in order");
+    let image =
+      crash_image(&base, &events, header_end, cut, CrashModel::InOrder).expect("an in-order image");
     std::fs::write(&image_path, &image).expect("write the image");
     let crashed = open_single_file(&image_path, options())
       .unwrap_or_else(|error| panic!("{phase:?}, {what}: unopenable: {error:?}"));
