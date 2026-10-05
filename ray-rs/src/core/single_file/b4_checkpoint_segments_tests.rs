@@ -726,9 +726,15 @@ fn read_only_open_replays_segments() {
   .expect("open");
   // About 120 KiB: two or three spills.
   let acked = commit_keys(&db, "key", 0, 400);
-  close_single_file(db).expect("close");
+  // Dropped, not closed: a clean close checkpoints the segments away
+  // (decision Q3 of the fresh review); dropping persists the log as it is,
+  // as a process that ends without closing leaves it.
+  drop(db);
   let (_, segments) = newest_header(&path);
-  assert!(segments > 0, "the closed file names no WAL segment");
+  assert!(
+    segments > 0,
+    "the dropped database's file names no WAL segment"
+  );
   let read_only =
     open_single_file(&path, SingleFileOpenOptions::new().read_only(true)).expect("read-only open");
   assert!(missing(&read_only, &acked).is_empty());

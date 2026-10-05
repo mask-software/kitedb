@@ -1585,6 +1585,23 @@ pub fn close_single_file_with_options(
     }
   }
 
+  // A clean close leaves no WAL segments: a checkpoint covers them (the
+  // header is format version 2 again), and the compaction below cuts off
+  // their pages. With a transaction open they stay, for the next open to
+  // replay; and if the checkpoint fails, so do they.
+  if !db.read_only
+    && !db.header.read().wal_segments.is_empty()
+    && db.active_transactions.load(Ordering::Acquire) == 0
+  {
+    if let Err(error) = db.checkpoint() {
+      eprintln!(
+        "Warning: closing {} keeps its WAL segments (the next open replays them): the \
+         checkpoint covering them failed: {error}",
+        db.path.display()
+      );
+    }
+  }
+
   if let Some(ref mvcc) = db.mvcc {
     mvcc.stop();
   }

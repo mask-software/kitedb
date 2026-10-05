@@ -305,9 +305,11 @@ fn file_size_after_load_checkpoint_close_does_not_depend_on_wal_size() {
 }
 
 /// Finding 3, across processes: dead pages a run left in the file (here:
-/// earlier snapshots and freed WAL segments, which closing keeps while WAL
-/// segments live) do not stay in the file for good once a later process
-/// checkpoints and closes.
+/// earlier snapshots and freed WAL segments, which a database dropped
+/// without closing keeps while WAL segments live) do not stay in the file
+/// for good once a later process checkpoints and closes. (Dropped since
+/// decision Q3 of the fresh review, where a clean close checkpoints the WAL
+/// segments away and compacts the file, so it leaves no dead pages.)
 #[test]
 fn checkpoint_after_reopen_reclaims_dead_pages() {
   let dir = tempdir().expect("tempdir");
@@ -332,7 +334,7 @@ fn checkpoint_after_reopen_reclaims_dead_pages() {
         2 + header.wal_page_count + header.snapshot_page_count + segments,
       )
     };
-    close_single_file(db).expect("close");
+    drop(db);
     let dead_before = std::fs::metadata(&path)
       .expect("metadata")
       .len()
