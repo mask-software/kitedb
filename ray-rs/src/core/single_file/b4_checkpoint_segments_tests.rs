@@ -825,6 +825,12 @@ fn checkpoint_thread_run_failing_at(phase: CheckpointPhase) {
   // be its pages. The checkpoint thread stops first, so every write is this
   // thread's (automatic checkpoints then run inline, recorded too).
   db.stop_checkpoint_thread();
+  // Room for those spills. The commits before the fault may have taken the
+  // segments to their limit (the busier the machine, the further the writer
+  // outruns the faulted run), and while the failed run's back-off lasts, a
+  // writer at the limit fails (`CheckpointFailed`) instead of spilling: on
+  // a loaded machine the commits below failed so after one spill.
+  set_wal_segment_test_limit(&db, wal_segment_test_stats(&db).bytes + 4 * 1024 * 1024);
   let base = std::fs::read(&path).expect("read the file");
   let acked_before = acked.clone();
   let spills_then = db.wal_spills.load(Ordering::Acquire);
@@ -832,7 +838,10 @@ fn checkpoint_thread_run_failing_at(phase: CheckpointPhase) {
     let mut recorded = Vec::new();
     let mut index = 0;
     while db.wal_spills.load(Ordering::Acquire) < spills_then + 2 && index < 3_000 {
-      recorded.extend(commit_keys(&db, "recorded", index, 1));
+      let key = key("recorded", index);
+      commit_key(&db, &key)
+        .unwrap_or_else(|error| panic!("{phase:?}: a commit after the fault failed: {error}"));
+      recorded.push(key);
       index += 1;
     }
     recorded
