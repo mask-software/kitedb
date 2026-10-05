@@ -1,5 +1,6 @@
 //! Delta review of round 3 (7b1798d..89d395a). Included from checkpoint.rs
 //! for its private steps and test hooks.
+use super::*;
 use crate::core::header::{other_header_slot, read_header_slots, write_header_slot};
 use crate::core::single_file::{close_single_file, open_single_file, SingleFileOpenOptions};
 use std::path::Path;
@@ -122,5 +123,86 @@ fn fresh3_an_open_refused_for_a_damaged_snapshot_writes_nothing() {
       .map(|error| error.to_string())
       .unwrap_or_default(),
     accepted_slots(&path)
+  );
+}
+
+/// N2 (medium). With background checkpoints off (blocking automatic
+/// checkpoints), 43ad681 makes a writer at the segment limit fail with
+/// `CheckpointFailed` while the last automatic checkpoint failed. But the
+/// automatic checkpoint after a failed commit runs only for `WalBufferFull`
+/// (`commit_with_token`: `auto_checkpoint_if_needed(matches!(result,
+/// Err(WalBufferFull)))`) or once the log reaches the trigger. So when the
+/// segment limit is below the trigger (an explicit `wal_segment_limit`), a
+/// failure is never retried: every write after it fails with the stale
+/// `CheckpointFailed`, after the cause is gone and the back-off is over,
+/// until the application checkpoints by hand.
+#[test]
+fn fresh3_blocking_checkpoints_retry_after_a_failure_at_the_segment_limit() {
+  use crate::core::single_file::SyncMode;
+  let dir = tempdir().expect("tempdir");
+  let path = dir.path().join("blocking-retry.kitedb");
+  let options = SingleFileOpenOptions::new()
+    .wal_size(64 * 1024)
+    .sync_mode(SyncMode::Normal)
+    .background_checkpoint(false)
+    .checkpoint_log_ratio(1000.0)
+    .wal_segment_limit(96 * 1024);
+  let db = open_single_file(&path, options).expect("open");
+  super::super::checkpoint_thread::set_checkpoint_test_backoff(
+    &db,
+    Duration::from_millis(5),
+    Duration::from_millis(5),
+  );
+  let key = |prefix: &str, index: usize| format!("{prefix}-{index:05}-{}", "k".repeat(200));
+  let commit = |key: &str| -> Result<()> {
+    db.begin(false)?;
+    if let Err(error) = db.create_node(Some(key)) {
+      let _ = db.rollback();
+      return Err(error);
+    }
+    db.commit()
+  };
+  for index in 0..20 {
+    commit(&key("seed", index)).expect("commit");
+  }
+  db.checkpoint()
+    .expect("a snapshot, so the trigger is far above the limit");
+  let header = db.header.read().clone();
+  assert!(
+    db.checkpoint_log_trigger(&header) > db.wal_segment_limit(&header),
+    "setup: the trigger is not above the limit"
+  );
+
+  // A failure at the limit: the automatic checkpoint after it fails too.
+  set_checkpoint_test_db_fault(&db, CheckpointPhase::SnapshotDurable, true);
+  let mut index = 0;
+  while commit(&key("fill", index)).is_ok() {
+    index += 1;
+    assert!(index < 5_000, "setup: never reached the segment limit");
+  }
+  assert!(
+    db.checkpoint_error().is_some(),
+    "setup: no failure recorded"
+  );
+  clear_checkpoint_test_db_faults(&db);
+  std::thread::sleep(Duration::from_millis(50));
+
+  // The cause is gone and the back-off over: writes must recover.
+  let mut last = None;
+  for attempt in 0..20 {
+    match commit(&key("after", attempt)) {
+      Ok(()) => {
+        last = None;
+        break;
+      }
+      Err(error) => last = Some(error),
+    }
+    std::thread::sleep(Duration::from_millis(10));
+  }
+  assert!(
+    last.is_none(),
+    "20 writes over 200 ms after the failure cleared all failed; the last: {last:?}; \
+     checkpoint_error: {:?}",
+    db.checkpoint_error()
   );
 }
