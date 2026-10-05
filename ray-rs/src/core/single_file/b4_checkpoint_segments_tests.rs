@@ -2503,3 +2503,80 @@ fn segments_full_of_an_open_transactions_records_by_bytes_refuse_writers() {
   let reopened = open_single_file(&path, opts).expect("reopen");
   assert!(missing(&reopened, &acked).is_empty());
 }
+
+/// Item 4 of the third round: with background checkpoints off, automatic
+/// checkpoints are blocking and run after the write that needed them, so a
+/// writer at the segment limit fails rather than waits. It fails as it does
+/// with background checkpoints: `CheckpointFailed` (with the error) while
+/// the last automatic checkpoint failed, `WalBufferFull` otherwise; with
+/// the checkpoint thread option on and off (it starts no thread here).
+#[test]
+fn writers_at_the_limit_without_background_checkpoints_fail_as_with_them() {
+  for thread in [true, false] {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("blocking-auto.kitedb");
+    // The trigger far above the limit (a thousand times a first snapshot):
+    // only writers at the limit make automatic checkpoints run.
+    let opts = options()
+      .sync_mode(SyncMode::Normal)
+      .background_checkpoint(false)
+      .checkpoint_thread(thread)
+      .checkpoint_log_ratio(1000.0);
+    let db = open_single_file(&path, opts.clone()).expect("open");
+    commit_key(&db, "seed").expect("seed");
+    db.checkpoint().expect("seed checkpoint");
+    set_wal_segment_test_limit(&db, 64 * 1024);
+    let commit_until_refused = |db: &SingleFileDB, prefix: &str| {
+      let mut acked = Vec::new();
+      for index in 0..3_000 {
+        let key = key(prefix, index);
+        match commit_key(db, &key) {
+          Ok(()) => acked.push(key),
+          Err(error) => return (acked, Some(error)),
+        }
+      }
+      (acked, None)
+    };
+
+    // No automatic checkpoint failed: WalBufferFull, and the blocking one
+    // after it makes room.
+    let (mut acked, refused) = commit_until_refused(&db, "a");
+    assert!(
+      matches!(refused, Some(KiteError::WalBufferFull)),
+      "thread {thread}: with no failed checkpoint a writer at the limit got {refused:?}"
+    );
+    assert_eq!(db.checkpoint_error(), None);
+    let after = commit_keys(&db, "b", 0, 10);
+    assert_eq!(
+      after.len(),
+      10,
+      "thread {thread}: no room after the refusal"
+    );
+    acked.extend(after);
+
+    // The automatic checkpoints fail: CheckpointFailed, with their error.
+    set_checkpoint_test_db_fault(&db, CheckpointPhase::SnapshotWritten, true);
+    let (more, refused) = commit_until_refused(&db, "c");
+    acked.extend(more);
+    let (more, refused_again) = commit_until_refused(&db, "d");
+    acked.extend(more);
+    clear_checkpoint_test_db_faults(&db);
+    assert!(
+      db.checkpoint_error()
+        .is_some_and(|error| error.contains("injected")),
+      "thread {thread}: the failed automatic checkpoint was not recorded: {:?}",
+      db.checkpoint_error()
+    );
+    assert!(
+      matches!(&refused_again, Some(KiteError::CheckpointFailed(error)) if error.contains("injected")),
+      "thread {thread}: while the last automatic checkpoint failed a writer at the limit got \
+       {refused_again:?} (the first refusal: {refused:?})"
+    );
+    db.checkpoint().expect("a checkpoint without the fault");
+    assert_eq!(db.checkpoint_error(), None);
+    acked.extend(commit_keys(&db, "e", 0, 10));
+    close_single_file(db).expect("close");
+    let reopened = open_single_file(&path, opts).expect("reopen");
+    assert!(missing(&reopened, &acked).is_empty(), "thread {thread}");
+  }
+}
