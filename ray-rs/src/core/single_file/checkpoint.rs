@@ -5383,3 +5383,7 @@ mod review_seg5_tests;
 #[cfg(test)]
 #[path = "b4_commit_path_tests.rs"]
 mod b4_commit_path_tests;
+/// Delta review of round 4.
+#[cfg(test)]
+#[path = "review_fresh4_tests.rs"]
+mod review_fresh4_tests;
