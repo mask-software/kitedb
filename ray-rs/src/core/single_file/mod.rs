@@ -34,6 +34,7 @@ mod header_cell;
 mod iter;
 mod mvcc_history;
 mod open;
+mod pacing;
 mod read;
 mod recovery;
 mod replication;
@@ -410,6 +411,9 @@ pub struct SingleFileInner {
   pub(crate) segment_space_cv: Condvar,
   /// Writers waiting in `wait_for_segment_space` now.
   pub(crate) segment_waiters: AtomicUsize,
+  /// Soft backpressure: pacing writers while a background checkpoint runs
+  /// (see `pace_writer`).
+  pub(crate) log_pacer: pacing::LogPacer,
   /// Set when a writer was refused WAL segment space while automatic
   /// checkpoints are blocking (`background_checkpoint` off): it cannot run
   /// one itself (it would wait for the writer's own transaction), so the

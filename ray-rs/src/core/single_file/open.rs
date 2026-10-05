@@ -1308,6 +1308,7 @@ fn open_single_file_internal(
     segment_space_wait: Mutex::new(()),
     segment_space_cv: parking_lot::Condvar::new(),
     segment_waiters: AtomicUsize::new(0),
+    log_pacer: Default::default(),
     blocking_checkpoint_asked: AtomicBool::new(false),
     commit_lock: Mutex::new(()),
     publish_lock: Mutex::new(()),

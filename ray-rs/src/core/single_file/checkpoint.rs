@@ -5383,6 +5383,11 @@ mod review_seg5_tests;
 #[cfg(test)]
 #[path = "b4_commit_path_tests.rs"]
 mod b4_commit_path_tests;
+
+/// Round 6: soft backpressure.
+#[cfg(test)]
+#[path = "b4_pacing_tests.rs"]
+mod b4_pacing_tests;
 /// Delta review of round 4.
 #[cfg(test)]
 #[path = "review_fresh4_tests.rs"]
