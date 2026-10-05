@@ -573,11 +573,25 @@ pub(super) fn restore_header(header: &mut DbHeaderV1, prior: DbHeaderV1) {
 /// being woken (see `SingleFileDB::wait_for_segment_space`).
 const SEGMENT_WAIT_POLL: Duration = Duration::from_millis(100);
 
+/// What a background checkpoint's cut found (see `SingleFileDB::cut_log`).
+enum CutOutcome {
+  /// The log is cut: the run checkpoints up to the cut.
+  Cut(LogCut),
+  /// The installed snapshot covers the whole log: nothing to checkpoint.
+  NothingToCover,
+  /// The WAL holds records, but the segment table has no entry to spill
+  /// them into, and every segment is covered already: open write
+  /// transactions hold them (see `cut_log`). No checkpoint can free any
+  /// before they end.
+  Blocked,
+}
+
 /// A background checkpoint's cut: the point of the log its snapshot covers.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LogCut {
   /// The newest WAL segment at the cut, sealed by it: the snapshot holds
-  /// every transaction whose COMMIT record lies in a segment up to it.
+  /// every transaction whose COMMIT record lies in a segment up to it. The
+  /// WAL's records follow the cut (it spilled them first, if it could).
   pub(crate) covered: u64,
   /// The oldest WAL segment holding a record of a write transaction the
   /// snapshot does not cover, open at the cut or committed in the WAL after
@@ -1107,35 +1121,80 @@ impl SingleFileDB {
       let _checkpoint_gate = self.checkpoint_gate.write();
       self.cut_log()?
     };
-    let Some(cut) = cut else {
-      return Ok(BackgroundCheckpointOutcome::Done);
+    let cut = match cut {
+      CutOutcome::Cut(cut) => cut,
+      CutOutcome::NothingToCover => return Ok(BackgroundCheckpointOutcome::Done),
+      // Nothing it can do: open transactions hold every segment.
+      CutOutcome::Blocked => return Ok(BackgroundCheckpointOutcome::Done),
     };
 
-    // Steps 2-5
-    self.reach_checkpoint_phase(CheckpointPhase::CutReleased)?;
-    let cut_delta = self.replay_pre_cut_log(&cut)?;
-    let (snapshot, loaded) = self.build_and_write_snapshot(cut_delta)?;
-    self.complete_background_checkpoint(run.run, &cut, snapshot, loaded)?;
+    // Steps 2-5. A run that fails before its install gives back the table
+    // entry its cut took (`release_cut`).
+    let mut installing = false;
+    let completed = self
+      .reach_checkpoint_phase(CheckpointPhase::CutReleased)
+      .and_then(|()| self.replay_pre_cut_log(&cut))
+      .and_then(|cut_delta| self.build_and_write_snapshot(cut_delta))
+      .and_then(|(snapshot, loaded)| {
+        self.complete_background_checkpoint(run.run, &cut, snapshot, loaded, &mut installing)
+      });
+    if completed.is_err() && !installing {
+      self.release_cut(&cut);
+    }
+    completed?;
     Ok(BackgroundCheckpointOutcome::Done)
+  }
+
+  /// Undo the seal of `cut`, whose run failed before its install: the
+  /// segment it sealed, if it is still the newest and no install covers it,
+  /// takes the next spill's records again. Otherwise every failed run would
+  /// take a table entry (the next spill could not fill the sealed segment),
+  /// and enough of them would fill the table. Sound: the seal only kept
+  /// records after the cut out of a segment the run's snapshot would cover,
+  /// and no install of that snapshot comes. (A run whose install failed keeps
+  /// the seal: a header slot may name its snapshot, covering the segment.)
+  fn release_cut(&self, cut: &LogCut) {
+    let _commit_guard = self.lock_commits();
+    let mut header = self.header.write();
+    let table = &header.wal_segments;
+    if table.covered >= cut.covered
+      || !table
+        .entries
+        .last()
+        .is_some_and(|last| last.seq == cut.covered && last.sealed)
+    {
+      return;
+    }
+    let mut entries = table.entries.to_vec();
+    if let Some(last) = entries.last_mut() {
+      last.sealed = false;
+    }
+    header.wal_segments.entries = entries.into();
   }
 
   /// Cut the log (step 1 of `background_checkpoint`): spill the WAL into a
   /// WAL segment and seal the newest segment, so every record before the cut
-  /// lies in a segment up to it, and every later one after it. `None` if the
-  /// log holds nothing the installed snapshot does not cover in a segment
-  /// past it; then the segments nothing needs any more still leave the table.
+  /// lies in a segment up to it, and every later one after it.
+  /// `NothingToCover` if the log holds nothing the installed snapshot does
+  /// not cover; then the segments nothing needs any more still leave the
+  /// table.
   ///
-  /// Also `None` when the WAL holds records and spilling them would take the
-  /// last table entry while a write transaction is open with records in
-  /// segments: the installs keep those segments while it is open, and a full
-  /// table would leave no cut able to spill (so to cover its COMMIT record)
-  /// once it ends. Writers fail meanwhile (`segments_full_of_pinned`).
+  /// The WAL does not spill when that would take a table entry there is no
+  /// room for: none is left, or only the last while a write transaction is
+  /// open with records in segments (the installs keep those segments while
+  /// it is open, and a full table would leave no cut able to spill, so to
+  /// cover its COMMIT record, once it ends). Then the cut covers the
+  /// segments alone, and the WAL's records follow it: the install drops the
+  /// segments it covers that nothing needs, which makes room for the next
+  /// cut's spill. So a full table never stops background checkpoints.
+  /// `Blocked` if there is no segment to cover either: open transactions
+  /// hold every one; writers fail meanwhile (`segments_full_of_pinned`).
   ///
   /// The commit lock holds off commits and spills, so the spilled
   /// transactions are exact: every transaction the snapshot does not cover
   /// has its records in segments from `keep_from` on, or in the WAL. Callers
   /// hold the checkpoint gate.
-  fn cut_log(&self) -> Result<Option<LogCut>> {
+  fn cut_log(&self) -> Result<CutOutcome> {
     let _commit_guard = self.lock_commits();
     self.ensure_writes_allowed()?;
     let mut pager = self.pager.lock();
@@ -1145,18 +1204,18 @@ impl SingleFileDB {
     // The segments the cut's spill, or its header, drops (no other
     // checkpoint runs: this one holds the status).
     let unneeded = self.unneeded_wal_segments(&header, true);
+    let mut wal_left = false;
     if !wal_buffer.is_empty() {
       let entries = header.wal_segments.entries.len() - unneeded.len();
       let may_spill = !Self::spill_needs_new_segment(&header, wal_buffer.used())
         || entries < MAX_WAL_SEGMENTS - 1
         || (entries < MAX_WAL_SEGMENTS && self.oldest_pinned_segment().is_none());
-      if !may_spill {
-        self.drop_unneeded_wal_segments(&mut pager, &mut header, &unneeded)?;
-        return Ok(None);
+      if may_spill {
+        self.spill_wal(&mut pager, &mut wal_buffer, &mut header, &[], &unneeded)?;
+      } else {
+        wal_left = true;
       }
-      self.spill_wal(&mut pager, &mut wal_buffer, &mut header, &[], &unneeded)?;
     }
-    Self::seal_newest_wal_segment(&mut header);
     let newest = header
       .wal_segments
       .entries
@@ -1166,13 +1225,18 @@ impl SingleFileDB {
       // The spill (if any) dropped them already.
       let unneeded = self.unneeded_wal_segments(&header, true);
       self.drop_unneeded_wal_segments(&mut pager, &mut header, &unneeded)?;
-      return Ok(None);
+      return Ok(if wal_left {
+        CutOutcome::Blocked
+      } else {
+        CutOutcome::NothingToCover
+      });
     };
+    Self::seal_newest_wal_segment(&mut header);
     let keep_from = self.wal_segments_needed_after(covered);
     let read_from = self.wal_segments_needed_after(covered_before);
     #[cfg(test)]
     count_checkpoint_test_cut(&self.path);
-    Ok(Some(LogCut {
+    Ok(CutOutcome::Cut(LogCut {
       covered,
       keep_from,
       read_from,
@@ -1249,12 +1313,14 @@ impl SingleFileDB {
   }
 
   /// Install this run's snapshot (steps 4-5 of `background_checkpoint`).
+  /// `installing` is set once the install starts writing headers.
   fn complete_background_checkpoint(
     &self,
     run: u64,
     cut: &LogCut,
     snapshot: WrittenSnapshot,
     mut loaded: LoadedSnapshot,
+    installing: &mut bool,
   ) -> Result<()> {
     self.set_background_checkpoint_status(run, CheckpointStatus::Completing);
     let free_snapshot = || {
@@ -1298,6 +1364,7 @@ impl SingleFileDB {
       let mut pager = self.pager.lock();
       let mut wal_buffer = self.wal_buffer.lock();
       let mut header = self.header.write();
+      *installing = true;
       self.install_snapshot(
         &mut pager,
         &mut wal_buffer,
