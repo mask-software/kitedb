@@ -177,9 +177,15 @@ fn k3_vector_racing_a_delete_of_its_node(mvcc: bool) {
 /// Guard: passes on 39fefea. Writers commit while background checkpoints,
 /// blocking checkpoints, and optimize run back to back on other threads;
 /// every acknowledged commit must survive, live and after reopen.
+///
+/// The race goes on for `RUN_FOR` at least, and until enough of it ran to
+/// mean something (100 commits, and every step once): its commits sync
+/// (Full mode), and on a loaded machine 1.5 s held 77 of them.
 #[test]
 fn k5_blocking_checkpoints_racing_background_checkpoints_lose_no_commits() {
   const RUN_FOR: Duration = Duration::from_millis(1500);
+  // Only against a hang.
+  const DEADLINE: Duration = Duration::from_secs(60);
   let dir = tempfile::tempdir().expect("tempdir");
   let db = Arc::new(open_single_file(dir.path().join("k5-race.kitedb"), options()).expect("open"));
   let stop = Arc::new(AtomicBool::new(false));
@@ -246,8 +252,12 @@ fn k5_blocking_checkpoints_racing_background_checkpoints_lose_no_commits() {
     }));
   }
 
+  let enough = || {
+    committed.lock().expect("committed keys").len() > 100
+      && completed.lock().expect("completed").len() == 3
+  };
   let started = Instant::now();
-  while started.elapsed() < RUN_FOR {
+  while started.elapsed() < RUN_FOR || (!enough() && started.elapsed() < DEADLINE) {
     std::thread::sleep(Duration::from_millis(10));
   }
   stop.store(true, Ordering::Relaxed);
