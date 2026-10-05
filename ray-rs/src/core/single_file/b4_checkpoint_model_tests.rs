@@ -14,14 +14,16 @@
 //! checkpoint away) and reopen (sometimes with a checkpoint thread's run in
 //! flight), read-only reopens, copies of the file taken between steps, and
 //! crash images of one step's writes and syncs (process crashes, and in
-//! `Full` mode OS crashes that lose, reorder or tear unsynced writes). A
+//! `Full` mode OS crashes that lose, reorder or tear unsynced writes, and
+//! tear a write at a 512-byte sector boundary, header writes that change
+//! the segment table at every one). A
 //! copy or image is sometimes opened a second time after the first open's
 //! recovery (closed or dropped), and sometimes the steps go on with it as
 //! the database, as a process that crashed and reopened its file would.
-//! One seed in three puts the segment table under pressure: a few entries
-//! (a test hook), the smallest extents, a trigger far beyond the table, and
-//! steps that fill it past a long transaction pinning a late segment, then
-//! checkpoint.
+//! One seed in three puts the segment table under pressure: a few entries,
+//! or a dozen and more (a test hook), the smallest extents, a trigger far
+//! beyond the table, and steps that fill it past a long transaction pinning
+//! a late segment, then checkpoint.
 //!
 //! An oracle holds the acknowledged commits. After every step the live
 //! database, and after every reopen, copy and crash image the reopened
@@ -29,9 +31,12 @@
 //! Only a step in flight at a crash may be either wholly there or wholly
 //! absent. A write may fail only where no checkpoint can make room, and a
 //! background checkpoint that returns `Ok` must have covered every segment
-//! there was when it started.
+//! there was when it started. And the database is never wedged: with no
+//! transaction open and no fault armed, a background checkpoint covers the
+//! log and a write commits (`Model::liveness_step`, at random, after
+//! filling the table, and at the end).
 //!
-//! Environment: `KITE_MODEL_SEEDS` seeds (default 24) from
+//! Environment: `KITE_MODEL_SEEDS` seeds (default 100) from
 //! `KITE_MODEL_FIRST_SEED` (default 0), `KITE_MODEL_STEPS` steps each
 //! (default 60), on `KITE_MODEL_THREADS` threads (default: the CPUs, at
 //! most four);
@@ -43,7 +48,7 @@
 //! timing too, so they may not replay exactly; the rest do. The run prints
 //! what the seeds covered (commits, cuts, crash images, ...).
 
-use super::b4_checkpoint_segments_tests::{crash_image, CrashModel};
+use super::b4_checkpoint_segments_tests::{crash_image, sector_tears, CrashModel, SECTOR};
 use super::*;
 use crate::core::pager::io_hooks::{self, IoEvent};
 use crate::core::single_file::{
@@ -321,14 +326,20 @@ impl Config {
     .with_table_pressure(rng)
   }
 
-  /// One seed in three: a small segment table, the smallest extents, a
-  /// byte limit far beyond them, and a checkpoint trigger far beyond the
-  /// table (a hundred times the snapshot): writers fill the table and wait
-  /// at it, and checkpoints meet full tables, with open transactions pinning
-  /// segments.
+  /// One seed in three: a small segment table (half of them a few entries,
+  /// half eleven and more, past the header page's first sector, where a
+  /// header write torn at a sector boundary splits the table from the
+  /// fixed fields), the smallest extents, a byte limit far beyond them, and
+  /// a checkpoint trigger far beyond the table (a hundred times the
+  /// snapshot): writers fill the table and wait at it, and checkpoints meet
+  /// full tables, with open transactions pinning segments.
   fn with_table_pressure(mut self, rng: &mut StdRng) -> Self {
     if rng.gen_bool(1.0 / 3.0) {
-      self.table = Some(rng.gen_range(3..=6));
+      self.table = Some(if rng.gen_bool(0.5) {
+        rng.gen_range(3..=6)
+      } else {
+        rng.gen_range(11..=16)
+      });
       self.segment_size = 1;
       self.segment_limit = Some(256 * 1024 * 1024);
       self.log_ratio = 100.0;
@@ -855,12 +866,62 @@ impl Model {
         }
         Ok(())
       }
+      86..=87 => self.liveness_step(),
       _ => {
         let count = self.rng.gen_range(1..=8);
         let writes = self.writes(count, 300, true);
         self.commit_step("small commit", writes, crash_images)
       }
     }
+  }
+
+  /// Liveness: with no transaction open and no fault armed, the database is
+  /// not wedged. A background checkpoint covers the log (it neither
+  /// declines nor fails), and a write then commits. The other checks allow
+  /// a write refused where no checkpoint could make room, and a checkpoint
+  /// declined while a transaction is open: a database that refused writes
+  /// for good would pass them.
+  fn liveness_step(&mut self) -> Outcome {
+    self.finish_long()?;
+    if self.faults_armed {
+      self.note("clear checkpoint faults".to_string());
+      self.clear_faults();
+    }
+    self.note("liveness: a background checkpoint, then a commit".to_string());
+    self.count("liveness checks");
+    let db = Arc::clone(self.db());
+    let newest_before = db
+      .header
+      .read()
+      .wal_segments
+      .entries
+      .last()
+      .map(|segment| segment.seq);
+    if let Err(error) = db.background_checkpoint() {
+      return Err(format!(
+        "liveness: with no transaction open and no fault armed, a background checkpoint \
+         failed: {error}"
+      ));
+    }
+    let covered = db.header.read().wal_segments.covered;
+    if newest_before.is_some_and(|newest| covered < newest) {
+      return Err(format!(
+        "liveness: a background checkpoint returned Ok, but covered only up to segment \
+         {covered} of {newest_before:?}"
+      ));
+    }
+    let count = self.rng.gen_range(1..=4);
+    let writes = self.writes(count, 300, true);
+    if let Err(error) = commit_writes(&db, &writes) {
+      return Err(format!(
+        "liveness: after a background checkpoint, with no transaction open and no fault \
+         armed, a small commit failed: {error}"
+      ));
+    }
+    drop(db);
+    apply_writes(&mut self.state, &writes);
+    self.count("commits");
+    self.check_live("after the liveness check")
   }
 
   /// A background checkpoint on this thread (its writes recorded for crash
@@ -903,7 +964,8 @@ impl Model {
   /// is full, or a write is refused), mostly with a long transaction begun
   /// part-way and spilled into it (so a late segment is pinned, and a
   /// checkpoint has earlier ones to cover: one open from before ends first),
-  /// then a background checkpoint: it meets a full table it must still cut.
+  /// then a background checkpoint: it meets a full table it must still cut;
+  /// half the time a liveness check follows (`liveness_step`).
   fn fill_table_step(&mut self, crash_images: bool, long_transactions: bool) -> Outcome {
     self.note("fill the segment table".to_string());
     self.count("segment tables filled");
@@ -951,7 +1013,13 @@ impl Model {
     let count = self.rng.gen_range(1..=20);
     let writes = self.writes(count, 2_000, false);
     self.commit_step("large commit", writes, false)?;
-    self.background_checkpoint_step(crash_images)
+    self.background_checkpoint_step(crash_images)?;
+    // Half the time, the pin (if any) ends, and the full table must not
+    // wedge the database.
+    if self.rng.gen_bool(0.5) {
+      self.liveness_step()?;
+    }
+    Ok(())
   }
 
   /// Run `run`, recording its pager writes and syncs with the file before
@@ -1316,8 +1384,48 @@ impl Model {
       };
       chosen.push((cut, model));
     }
+    // Sector tears, in `Full` mode (a disk writes 512-byte sectors whole,
+    // not pages): of up to two header writes that change the segment table,
+    // at each of their sector boundaries, and of one other write over
+    // several sectors at one of its boundaries; each both ways.
+    if full {
+      let mut tables = table_header_writes(&base, events, header_end);
+      while tables.len() > 2 {
+        tables.swap_remove(self.rng.gen_range(0..tables.len()));
+      }
+      for cut in tables {
+        chosen.extend(
+          sector_tears(events, header_end, cut)
+            .into_iter()
+            .map(|model| (cut, model)),
+        );
+      }
+      let data: Vec<(usize, Vec<CrashModel>)> = (1..=events.len())
+        .filter(|&cut| {
+          matches!(&events[cut - 1], IoEvent::Write { offset, data }
+            if *offset >= header_end && data.len() as u64 > SECTOR)
+        })
+        .map(|cut| (cut, sector_tears(events, header_end, cut)))
+        .filter(|(_, tears)| !tears.is_empty())
+        .collect();
+      if !data.is_empty() {
+        let (cut, tears) = &data[self.rng.gen_range(0..data.len())];
+        // Both ways of one boundary (`sector_tears` lists them in pairs).
+        let boundary = 2 * self.rng.gen_range(0..tears.len() / 2);
+        chosen.extend(
+          tears[boundary..boundary + 2]
+            .iter()
+            .map(|&model| (*cut, model)),
+        );
+      }
+    }
     chosen.sort_unstable_by_key(|(cut, model)| (*cut, format!("{model:?}")));
     chosen.dedup();
+    let tears = chosen
+      .iter()
+      .filter(|(_, model)| matches!(model, CrashModel::SectorTear { .. }))
+      .count() as u64;
+    *self.coverage.entry("sector tears").or_default() += tears;
     self.note(format!(
       "  crash images of the {what}: {} events, images {chosen:?}",
       events.len()
@@ -1373,7 +1481,7 @@ impl Model {
   }
 
   fn finish(&mut self) -> Outcome {
-    self.finish_long()?;
+    self.liveness_step()?;
     self.quiesce()?;
     self.clear_faults();
     let db = self.db.take().expect("open");
@@ -1395,6 +1503,39 @@ impl Model {
     )
     .map(|_| ())
   }
+}
+
+/// The cuts of `events` (recorded from `base`; the header pages are the
+/// bytes below `header_end`) whose last event is a header write that
+/// changes the WAL segment table: the page it overwrites names another, or
+/// is no header.
+fn table_header_writes(base: &[u8], events: &[IoEvent], header_end: u64) -> Vec<usize> {
+  let table = |page: &[u8]| {
+    DbHeaderV1::parse(page)
+      .ok()
+      .map(|header| header.wal_segments)
+  };
+  let mut pages: HashMap<u64, Vec<u8>> = HashMap::new();
+  let mut cuts = Vec::new();
+  for (index, event) in events.iter().enumerate() {
+    let IoEvent::Write { offset, data } = event else {
+      continue;
+    };
+    if *offset >= header_end {
+      continue;
+    }
+    let old = pages.remove(offset).unwrap_or_else(|| {
+      let start = *offset as usize;
+      base
+        .get(start..start + data.len())
+        .map_or_else(Vec::new, <[u8]>::to_vec)
+    });
+    if table(&old) != table(data) {
+      cuts.push(index + 1);
+    }
+    pages.insert(*offset, data.clone());
+  }
+  cuts
 }
 
 /// Open the model's database at `path` with `config`'s options and test
@@ -1477,20 +1618,25 @@ fn run_seed(seed: u64, steps: u64) -> std::result::Result<Coverage, String> {
     .map_err(|error| format!("seed {seed} (KITE_MODEL_SEED={seed}): {error}"))
 }
 
-/// Run the seeds the environment asks for (see the module docs) on several
-/// threads, and fail with every failing seed. A seed that runs longer than
-/// `KITE_MODEL_SEED_TIMEOUT` seconds (default 120) fails as hung; its thread
-/// is left behind and another takes its place.
-fn run_seeds(default_seeds: u64) {
-  let steps = env_number("KITE_MODEL_STEPS", 60);
-  let seeds: Vec<u64> = match std::env::var("KITE_MODEL_SEED") {
+/// The seeds the environment asks for (see the module docs), else the
+/// first `default_seeds`.
+fn env_seeds(default_seeds: u64) -> Vec<u64> {
+  match std::env::var("KITE_MODEL_SEED") {
     Ok(_) => vec![env_number("KITE_MODEL_SEED", 0)],
     Err(_) => {
       let first = env_number("KITE_MODEL_FIRST_SEED", 0);
       let count = env_number("KITE_MODEL_SEEDS", default_seeds);
       (first..first + count).collect()
     }
-  };
+  }
+}
+
+/// Run `seeds` on several threads, and return every failing seed's
+/// failure. A seed that runs longer than `KITE_MODEL_SEED_TIMEOUT` seconds
+/// (default 120) fails as hung; its thread is left behind and another takes
+/// its place.
+fn run_seeds(seeds: Vec<u64>) -> Vec<(u64, String)> {
+  let steps = env_number("KITE_MODEL_STEPS", 60);
   let cpus = std::thread::available_parallelism().map_or(4, |count| count.get()) as u64;
   // A few by default: the quick run shares the machine with the other tests.
   let threads = env_number("KITE_MODEL_THREADS", cpus.min(4)).max(1) as usize;
@@ -1556,7 +1702,7 @@ fn run_seeds(default_seeds: u64) {
         }
         Err(failure) => {
           eprintln!("model test: {failure}");
-          failures.push(failure);
+          failures.push((seed, failure));
         }
       }
       if verbose {
@@ -1581,7 +1727,7 @@ fn run_seeds(default_seeds: u64) {
          KITE_MODEL_TRACE=1)"
       );
       eprintln!("model test: {failure}");
-      failures.push(failure);
+      failures.push((seed, failure));
       finished += 1;
       spawn_worker(workers);
       workers += 1;
@@ -1593,17 +1739,23 @@ fn run_seeds(default_seeds: u64) {
     started.elapsed(),
     failures.len()
   );
-  assert!(
-    failures.is_empty(),
-    "{} of {} seeds failed:\n{}",
-    failures.len(),
-    shared.seeds.len(),
-    failures.join("\n")
-  );
+  failures
 }
 
 /// The model test's quick run (see the module docs for the long one).
 #[test]
 fn wal_segment_and_checkpoint_model() {
-  run_seeds(24);
+  let seeds = env_seeds(100);
+  let count = seeds.len();
+  let failures = run_seeds(seeds);
+  assert!(
+    failures.is_empty(),
+    "{} of {count} seeds failed:\n{}",
+    failures.len(),
+    failures
+      .iter()
+      .map(|(_, failure)| failure.as_str())
+      .collect::<Vec<_>>()
+      .join("\n")
+  );
 }
