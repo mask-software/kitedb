@@ -84,6 +84,8 @@ pub(super) enum CheckpointPhase {
   /// A writer decided to spill the WAL (the segments have room); the spill
   /// comes next.
   SpillDecided,
+  /// A background checkpoint found another running (a test hook only).
+  FoundRunning,
 }
 
 /// A barrier armed for one phase of checkpoints on the database at a path.
@@ -1113,7 +1115,13 @@ impl SingleFileDB {
     // `run`, however this returns (or unwinds), returns the status to idle.
     let run = match self.claim_background_checkpoint() {
       Ok(run) => run,
-      Err(outcome) => return Ok(outcome),
+      Err(outcome) => {
+        if matches!(outcome, BackgroundCheckpointOutcome::AlreadyRunning) {
+          // Only the test hook: this is not a checkpoint's progress point.
+          let _ = checkpoint_phase(&self.path, CheckpointPhase::FoundRunning);
+        }
+        return Ok(outcome);
+      }
     };
 
     // Step 1. The gate excludes blocking checkpoints and compaction.

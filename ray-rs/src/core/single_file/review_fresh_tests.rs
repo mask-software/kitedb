@@ -218,6 +218,7 @@ fn fresh_writer_fails_when_a_declined_run_answers_its_checkpoint_request() {
   // install will keep (free) nothing. It is held right after the cut.
   let barrier = Arc::new(Barrier::new(2));
   set_checkpoint_test_barrier(&db, CheckpointPhase::CutReleased, Arc::clone(&barrier));
+  watch_checkpoint_phases(&db);
   let app_checkpoint = {
     let db = Arc::clone(&db);
     std::thread::spawn(move || db.background_checkpoint())
@@ -266,9 +267,24 @@ fn fresh_writer_fails_when_a_declined_run_answers_its_checkpoint_request() {
     );
     std::thread::sleep(Duration::from_millis(1));
   }
-  // The checkpoint thread answered the writer's request: it declined, the
-  // application's run holding the checkpoint status.
-  db.wait_for_checkpoint_thread();
+  // The checkpoint thread took the writer's request, and found the
+  // application's run holding the checkpoint status. (Adjusted with the fix,
+  // where the thread then waits for that run and runs its own instead of
+  // declining: this waited for the thread to answer, which it now does only
+  // after the application's run, held below.)
+  while !checkpoint_test_reached(&db)
+    .iter()
+    .any(|(phase, thread, _)| {
+      *phase == CheckpointPhase::FoundRunning
+        && thread.as_deref() == Some(super::super::checkpoint_thread::CHECKPOINT_THREAD_NAME)
+    })
+  {
+    assert!(
+      Instant::now() < deadline,
+      "the checkpoint thread never took the writer's request"
+    );
+    std::thread::sleep(Duration::from_millis(1));
+  }
 
   // Release the application's run: its install frees nothing.
   barrier.wait();
