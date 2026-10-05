@@ -43,20 +43,41 @@ impl LogTrigger {
   /// checkpointing again would keep them again, and the delta holds nothing
   /// of them.
   fn wal_headroom(&self, header: &DbHeaderV1) -> u64 {
-    let table = &header.wal_segments;
-    let segments: u64 = table
-      .entries
-      .iter()
-      .filter(|segment| segment.seq > table.covered)
-      .map(|segment| segment.byte_len)
-      .sum();
-    self.bytes(header).max(1).saturating_sub(segments)
+    self
+      .bytes(header)
+      .max(1)
+      .saturating_sub(uncovered_segment_bytes(header))
   }
 }
 
+/// Bytes of the WAL segments `header` names that its snapshot does not
+/// cover (see `LogTrigger::wal_headroom`).
+fn uncovered_segment_bytes(header: &DbHeaderV1) -> u64 {
+  let table = &header.wal_segments;
+  table
+    .entries
+    .iter()
+    .filter(|segment| segment.seq > table.covered)
+    .map(|segment| segment.byte_len)
+    .sum()
+}
+
+/// The log's state as of the header's last write, without its lock (see
+/// `HeaderCell::log_state`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LogState {
+  /// Bytes of the WAL segments the snapshot does not cover.
+  pub(crate) uncovered_segments: u64,
+  /// Bytes of log at which an automatic checkpoint starts.
+  pub(crate) trigger: u64,
+  /// The WAL's size in bytes.
+  pub(crate) wal_size: u64,
+}
+
 /// The header in memory: a read-write lock, and the WAL's headroom below
-/// the checkpoint trigger (`LogTrigger::wal_headroom`), which every write
-/// of the header keeps up to date as it ends (`HeaderWriteGuard`). The
+/// the checkpoint trigger (`LogTrigger::wal_headroom`) and the log's state
+/// (`LogState`), which every write of the header keeps up to date as it
+/// ends (`HeaderWriteGuard`). The
 /// automatic checkpoint's check after every commit and rollback reads the
 /// headroom, not the header (`SingleFileDB::log_reached_trigger`): a commit
 /// group's leader holds the header's write lock across its header write
@@ -67,16 +88,43 @@ pub(crate) struct HeaderCell {
   header: RwLock<DbHeaderV1>,
   trigger: LogTrigger,
   wal_headroom: AtomicU64,
+  /// `LogState`'s fields, kept as `wal_headroom` is.
+  uncovered_segments: AtomicU64,
+  trigger_bytes: AtomicU64,
+  wal_size: AtomicU64,
 }
 
 impl HeaderCell {
   pub(crate) fn new(header: DbHeaderV1, trigger: LogTrigger) -> Self {
-    let wal_headroom = AtomicU64::new(trigger.wal_headroom(&header));
-    Self {
-      header: RwLock::new(header),
+    let cell = Self {
+      header: RwLock::new(DbHeaderV1::new(header.page_size, 0)),
       trigger,
-      wal_headroom,
-    }
+      wal_headroom: AtomicU64::new(0),
+      uncovered_segments: AtomicU64::new(0),
+      trigger_bytes: AtomicU64::new(0),
+      wal_size: AtomicU64::new(0),
+    };
+    *cell.write() = header;
+    cell
+  }
+
+  /// Keep the headroom and the log's state up to date with `header`.
+  fn note(&self, header: &DbHeaderV1) {
+    self
+      .wal_headroom
+      .store(self.trigger.wal_headroom(header), Ordering::Release);
+    self
+      .uncovered_segments
+      .store(uncovered_segment_bytes(header), Ordering::Release);
+    self
+      .trigger_bytes
+      .store(self.trigger.bytes(header), Ordering::Release);
+    self.wal_size.store(
+      header
+        .wal_page_count
+        .saturating_mul(header.page_size as u64),
+      Ordering::Release,
+    );
   }
 
   pub(crate) fn read(&self) -> RwLockReadGuard<'_, DbHeaderV1> {
@@ -100,6 +148,16 @@ impl HeaderCell {
   /// as of the header's last write; without its lock.
   pub(crate) fn wal_headroom(&self) -> u64 {
     self.wal_headroom.load(Ordering::Acquire)
+  }
+
+  /// The log's state as of the header's last write; without its lock (for
+  /// pacing writers, `SingleFileDB::pace_writer`).
+  pub(crate) fn log_state(&self) -> LogState {
+    LogState {
+      uncovered_segments: self.uncovered_segments.load(Ordering::Acquire),
+      trigger: self.trigger_bytes.load(Ordering::Acquire),
+      wal_size: self.wal_size.load(Ordering::Acquire),
+    }
   }
 }
 
@@ -125,7 +183,6 @@ impl DerefMut for HeaderWriteGuard<'_> {
 
 impl Drop for HeaderWriteGuard<'_> {
   fn drop(&mut self) {
-    let headroom = self.cell.trigger.wal_headroom(&self.header);
-    self.cell.wal_headroom.store(headroom, Ordering::Release);
+    self.cell.note(&self.header);
   }
 }

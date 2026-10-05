@@ -242,17 +242,22 @@ impl SingleFileDB {
   /// with `WalBufferFull`). Twice the checkpoint trigger, at least 16 WALs,
   /// at most four times the log budget; or the explicit `wal_segment_limit`.
   pub(crate) fn wal_segment_limit(&self, header: &DbHeaderV1) -> u64 {
+    let wal = header
+      .wal_page_count
+      .saturating_mul(header.page_size as u64);
+    self.wal_segment_limit_of(self.checkpoint_log_trigger(header), wal)
+  }
+
+  /// `wal_segment_limit` for a checkpoint trigger of `trigger` bytes and a
+  /// WAL of `wal` bytes.
+  pub(crate) fn wal_segment_limit_of(&self, trigger: u64, wal: u64) -> u64 {
     let explicit = self
       .wal_segment_limit_bytes
       .load(std::sync::atomic::Ordering::Relaxed);
     if explicit > 0 {
       return explicit;
     }
-    let wal = header
-      .wal_page_count
-      .saturating_mul(header.page_size as u64);
     // The trigger is at most the budget, so this is at least twice it.
-    let trigger = self.checkpoint_log_trigger(header);
     trigger
       .saturating_mul(2)
       .max(wal.saturating_mul(16))

@@ -984,6 +984,8 @@ fn writers_wait_only_at_the_segment_limit() {
   let path = dir.path().join("segment-backpressure.kitedb");
   let db = Arc::new(open_single_file(&path, options().sync_mode(SyncMode::Normal)).expect("open"));
   set_wal_segment_test_limit(&db, 512 * 1024);
+  // The limit itself, the backstop: no pacing slows the writer before it.
+  crate::core::single_file::pacing::set_pacing_test(&db, None, Some(Duration::ZERO));
   watch_checkpoint_phases(&db);
   let held = Arc::new(Barrier::new(2));
   set_checkpoint_test_barrier(&db, CheckpointPhase::SnapshotDurable, Arc::clone(&held));

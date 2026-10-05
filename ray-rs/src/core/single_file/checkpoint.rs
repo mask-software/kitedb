@@ -4,9 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
-#[cfg(test)]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use parking_lot::RwLockWriteGuard;
 
@@ -796,6 +794,10 @@ impl Drop for InstallingGuard<'_> {
 struct BackgroundCheckpointRun<'db> {
   db: &'db SingleFileDB,
   run: u64,
+  /// When it was claimed, and whether it installed its snapshot (for the
+  /// writers' pacing: `LogPacer`).
+  started: Instant,
+  installed: bool,
 }
 
 impl Drop for BackgroundCheckpointRun<'_> {
@@ -806,6 +808,10 @@ impl Drop for BackgroundCheckpointRun<'_> {
         state.status = CheckpointStatus::Idle;
       }
     }
+    self
+      .db
+      .log_pacer
+      .run_ended(self.started.elapsed(), self.installed);
     self.db.notify_checkpoint_waiters();
     self.db.notify_segment_waiters();
   }
@@ -1040,9 +1046,12 @@ impl SingleFileDB {
     }
     state.run += 1;
     state.status = CheckpointStatus::Running;
+    self.log_pacer.run_started();
     Ok(BackgroundCheckpointRun {
       db: self,
       run: state.run,
+      started: Instant::now(),
+      installed: false,
     })
   }
 
@@ -1214,7 +1223,7 @@ impl SingleFileDB {
     // Claim the checkpoint before taking the gate, so commits that cross the
     // trigger meanwhile skip it instead of queueing behind it. Dropping
     // `run`, however this returns (or unwinds), returns the status to idle.
-    let run = match self.claim_background_checkpoint() {
+    let mut run = match self.claim_background_checkpoint() {
       Ok(run) => run,
       Err(outcome) => {
         if matches!(outcome, BackgroundCheckpointOutcome::AlreadyRunning) {
@@ -1258,6 +1267,7 @@ impl SingleFileDB {
       self.release_cut(&cut);
     }
     completed?;
+    run.installed = true;
     Ok(BackgroundCheckpointOutcome::Done)
   }
 

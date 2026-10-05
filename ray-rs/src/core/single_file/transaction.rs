@@ -1613,6 +1613,12 @@ impl SingleFileDB {
       prof::end(Stage::CommitTotal, commit_mark);
     }
     TxSpares::keep_state(tx_handle);
+    // Soft backpressure: once the transaction is finished and every lock
+    // released, a writer outrunning a running background checkpoint waits a
+    // bounded while (see `pace_writer`).
+    if !read_only && result.is_ok() {
+      self.pace_writer();
+    }
     result
   }
 

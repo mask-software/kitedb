@@ -200,6 +200,9 @@ fn fresh_writer_fails_when_a_declined_run_answers_its_checkpoint_request() {
     .wal_size(SMALL_WAL)
     .sync_mode(SyncMode::Normal);
   let db = Arc::new(open_single_file(&path, options).expect("open"));
+  // The writer below is to reach the segment limit (the backstop) while the
+  // application's run is held: no pacing slows it before. (Round 6.)
+  crate::core::single_file::pacing::set_pacing_test(&db, None, Some(Duration::ZERO));
 
   // T: a transaction whose records (about 60 KiB) outgrow the WAL while it is
   // open, so they spill into a WAL segment it then pins.

@@ -53,6 +53,7 @@
 use super::b4_checkpoint_segments_tests::{crash_image, sector_tears, CrashModel, SECTOR};
 use super::*;
 use crate::core::pager::io_hooks::{self, IoEvent};
+use crate::core::single_file::pacing::{pacing_test_stats, set_pacing_test};
 use crate::core::single_file::{
   close_single_file, open_single_file, SingleFileOpenOptions, SyncMode,
 };
@@ -295,6 +296,13 @@ struct Config {
   /// byte limit to speak of, a few spills fill it, so full tables, pinned
   /// segments and failed cuts meet often.
   table: Option<usize>,
+  /// Writers are paced while a background checkpoint runs past the trigger
+  /// (soft backpressure), with short delays (a run is expected to take
+  /// 500 ms, a commit waits at most 2 ms); else not at all.
+  /// Drawn from the seed apart from the steps' random stream (see
+  /// `Model::new`): pacing changes timing only, and only where a run goes
+  /// on beside the steps, which depends on timing anyway.
+  pacing: bool,
 }
 
 impl Config {
@@ -324,6 +332,7 @@ impl Config {
       background: rng.gen_bool(0.8),
       thread: rng.gen_bool(0.35),
       table: None,
+      pacing: false,
     }
     .with_table_pressure(rng)
   }
@@ -557,7 +566,8 @@ impl Model {
 
   fn new(seed: u64) -> Self {
     let mut rng = StdRng::seed_from_u64(seed);
-    let config = Config::random(&mut rng);
+    let mut config = Config::random(&mut rng);
+    config.pacing = StdRng::seed_from_u64(seed ^ 0x9E37_79B9_7F4A_7C15).gen_bool(0.5);
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("model.kitedb");
     let db = open_model_db(&path, &config).expect("open");
@@ -1241,6 +1251,7 @@ impl Model {
     self.quiesce()?;
     self.clear_faults();
     let db = self.db.take().expect("open");
+    *self.coverage.entry("commits paced").or_default() += pacing_test_stats(&db).paced;
     let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("the database is still shared"));
     // Sometimes close with a checkpoint thread's run in flight.
     let in_flight = self.config.thread && self.config.auto_checkpoint && self.rng.gen_bool(0.4);
@@ -1355,6 +1366,7 @@ impl Model {
     self.clear_faults();
     let db = self.db.take().expect("open");
     *self.coverage.entry("cuts").or_default() += checkpoint_test_cuts(&db) as u64;
+    *self.coverage.entry("commits paced").or_default() += pacing_test_stats(&db).paced;
     *self
       .coverage
       .entry("cuts covering segments without a spill")
@@ -1524,6 +1536,7 @@ impl Model {
     self.clear_faults();
     let db = self.db.take().expect("open");
     *self.coverage.entry("cuts").or_default() += checkpoint_test_cuts(&db) as u64;
+    *self.coverage.entry("commits paced").or_default() += pacing_test_stats(&db).paced;
     *self
       .coverage
       .entry("cuts covering segments without a spill")
@@ -1588,6 +1601,15 @@ fn open_model_db(path: &Path, config: &Config) -> Result<SingleFileDB> {
   );
   if let Some(entries) = config.table {
     set_wal_segment_test_capacity(&db, entries);
+  }
+  if config.pacing {
+    set_pacing_test(
+      &db,
+      Some(Duration::from_millis(500)),
+      Some(Duration::from_millis(2)),
+    );
+  } else {
+    set_pacing_test(&db, None, Some(Duration::ZERO));
   }
   Ok(db)
 }

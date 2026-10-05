@@ -228,6 +228,8 @@ impl SingleFileDB {
       thread.take()
     };
     let Some(thread) = thread else {
+      // Writers pacing for a run (inline, or an application's) stop.
+      self.notify_segment_waiters();
       return;
     };
     self.checkpoint_abandoned.store(true, Ordering::Release);
