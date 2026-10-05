@@ -512,4 +512,74 @@ mod tests {
       Err(KiteError::VersionMismatch { .. })
     ));
   }
+
+  /// A header naming `count` segments of 24 pages, the last `appended`
+  /// bytes longer, at change counter `counter`.
+  fn header_with_segments(count: u64, appended: u64, counter: u64) -> DbHeaderV1 {
+    let mut header = DbHeaderV1::new(4096, 16);
+    header.change_counter = counter;
+    header.wal_head = counter * 100;
+    header.wal_primary_salt = counter as u32;
+    header.wal_segments = WalSegmentTable {
+      next_seq: count + 1,
+      covered: 0,
+      entries: (1..=count)
+        .map(|seq| WalSegment {
+          seq,
+          start_page: 18 + 24 * seq,
+          page_count: 24,
+          byte_len: 1_000 + if seq == count { appended } else { 0 },
+          sealed: seq < count,
+        })
+        .collect::<Vec<_>>()
+        .into(),
+    };
+    header
+  }
+
+  /// R12. A header page torn between two writes of it at a 512-byte sector
+  /// boundary (a disk writes sectors whole, not pages), either side from
+  /// either write, is invalid unless it is one of the two pages: one
+  /// checksum covers every byte that gives the page meaning. Here the
+  /// second write changes the fixed fields and the table, its last entry in
+  /// a later sector than the first (the 10th, 20th, 40th and 64th entry,
+  /// the last a table holds), or only the fixed fields.
+  #[test]
+  fn a_header_page_torn_at_a_sector_boundary_is_invalid() {
+    let changes = [(10, 64), (20, 64), (40, 64), (64, 64), (64, 0)];
+    for (count, appended) in changes {
+      let old = header_with_segments(count, 0, 7).serialize_to_page();
+      let new = header_with_segments(count, appended, 8).serialize_to_page();
+      assert!(DbHeaderV1::parse(&old).is_ok() && DbHeaderV1::parse(&new).is_ok());
+      for boundary in (512..4096).step_by(512) {
+        for (first, rest) in [(&new, &old), (&old, &new)] {
+          let mut torn = first[..boundary].to_vec();
+          torn.extend_from_slice(&rest[boundary..]);
+          if torn == old || torn == new {
+            continue;
+          }
+          let parsed = DbHeaderV1::parse(&torn).ok().map(|header| {
+            (
+              header.change_counter,
+              header
+                .wal_segments
+                .entries
+                .last()
+                .map(|entry| entry.byte_len),
+            )
+          });
+          assert!(
+            parsed.is_none(),
+            "{count} segments, the last {appended} bytes longer: a page torn at byte \
+             {boundary} ({} write first) is a valid header: {parsed:?}",
+            if std::ptr::eq(first, &new) {
+              "new"
+            } else {
+              "old"
+            }
+          );
+        }
+      }
+    }
+  }
 }
