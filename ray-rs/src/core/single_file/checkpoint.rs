@@ -1070,7 +1070,10 @@ impl SingleFileDB {
   /// a blocking checkpoint, optimize, vacuum or WAL resize waits for the
   /// checkpoint gate, which checkpoints anyway: starting ahead of it would
   /// make it wait again, and a loop of background checkpoints would starve
-  /// it.
+  /// it. It also declines when it can do nothing: open write transactions
+  /// hold every WAL segment, and the WAL's records would need the table's
+  /// last entry (see `cut_log`). With nothing to checkpoint (the snapshot
+  /// covers the whole log) it returns `Ok`.
   pub fn background_checkpoint(&self) -> Result<()> {
     if self.current_tx_handle().is_some() {
       return Err(KiteError::TransactionInProgress);
@@ -1176,8 +1179,14 @@ impl SingleFileDB {
     let cut = match cut {
       CutOutcome::Cut(cut) => cut,
       CutOutcome::NothingToCover => return Ok(BackgroundCheckpointOutcome::Done),
-      // Nothing it can do: open transactions hold every segment.
-      CutOutcome::Blocked => return Ok(BackgroundCheckpointOutcome::Done),
+      CutOutcome::Blocked => {
+        return Err(KiteError::CheckpointDeclined(
+          "open write transactions hold records in every WAL segment, and the WAL's records \
+           would need the segment table's last entry; no checkpoint can free any before those \
+           transactions end"
+            .to_string(),
+        ))
+      }
     };
 
     // Steps 2-5. A run that fails before its install gives back the table

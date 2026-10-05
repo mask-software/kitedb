@@ -77,6 +77,14 @@ create_exception!(
 );
 create_exception!(
   kitedb._kitedb,
+  CheckpointDeclinedError,
+  KiteError,
+  "A background checkpoint did not run, or stopped, and nothing changed; the message says why \
+   (a blocking checkpoint or compaction waits for the gate, or open write transactions hold \
+   every WAL segment)."
+);
+create_exception!(
+  kitedb._kitedb,
   CheckpointError,
   KiteError,
   "A write needs WAL segment space only a checkpoint frees, and the last automatic \
@@ -97,6 +105,10 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
   m.add("CorruptionError", py.get_type::<CorruptionError>())?;
   m.add("WalFullError", py.get_type::<WalFullError>())?;
   m.add("CheckpointError", py.get_type::<CheckpointError>())?;
+  m.add(
+    "CheckpointDeclinedError",
+    py.get_type::<CheckpointDeclinedError>(),
+  )?;
   Ok(())
 }
 
@@ -123,6 +135,7 @@ pub(crate) fn core_error(err: &CoreError, message: String) -> PyErr {
     | CoreError::InvalidWalRecordType(_) => CorruptionError::new_err(message),
     CoreError::WalBufferFull => WalFullError::new_err(message),
     CoreError::CheckpointFailed(_) => CheckpointError::new_err(message),
+    CoreError::CheckpointDeclined(_) => CheckpointDeclinedError::new_err(message),
     _ => KiteError::new_err(message),
   }
 }

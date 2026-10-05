@@ -47,6 +47,11 @@ class CheckpointError(KiteError):
     automatic checkpoint failed (see Database.checkpoint_error). Committed data
     is safe."""
 
+class CheckpointDeclinedError(KiteError):
+    """A background checkpoint did not run, or stopped, and nothing changed;
+    the message says why (a blocking checkpoint or compaction waits for the
+    gate, or open write transactions hold every WAL segment)."""
+
 # ============================================================================
 # Core Database Types
 # ============================================================================
