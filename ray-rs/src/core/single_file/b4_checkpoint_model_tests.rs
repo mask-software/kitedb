@@ -876,17 +876,22 @@ impl Model {
   }
 
   /// Liveness: with no transaction open and no fault armed, the database is
-  /// not wedged. A background checkpoint covers the log (it neither
-  /// declines nor fails), and a write then commits. The other checks allow
-  /// a write refused where no checkpoint could make room, and a checkpoint
-  /// declined while a transaction is open: a database that refused writes
-  /// for good would pass them.
+  /// not wedged. After a commit (refused only as the other steps allow: it
+  /// leaves the WAL some records, so the checkpoint's cut has them to place
+  /// as well), a background checkpoint covers the log (it neither declines
+  /// nor fails), and a write then commits. The other checks allow a write
+  /// refused where no checkpoint could make room, and a checkpoint declined
+  /// while a transaction is open: a database that refused writes for good
+  /// would pass them.
   fn liveness_step(&mut self) -> Outcome {
     self.finish_long()?;
     if self.faults_armed {
       self.note("clear checkpoint faults".to_string());
       self.clear_faults();
     }
+    let count = self.rng.gen_range(1..=4);
+    let writes = self.writes(count, 300, true);
+    self.commit_step("small commit", writes, false)?;
     self.note("liveness: a background checkpoint, then a commit".to_string());
     self.count("liveness checks");
     let db = Arc::clone(self.db());
@@ -964,8 +969,10 @@ impl Model {
   /// is full, or a write is refused), mostly with a long transaction begun
   /// part-way and spilled into it (so a late segment is pinned, and a
   /// checkpoint has earlier ones to cover: one open from before ends first),
-  /// then a background checkpoint: it meets a full table it must still cut;
-  /// half the time a liveness check follows (`liveness_step`).
+  /// then a background checkpoint: it meets a full table it must still cut.
+  /// Half the time that checkpoint fails in its install, keeping its cut's
+  /// seal, and a liveness check follows (`liveness_step`), as it does half
+  /// the time otherwise.
   fn fill_table_step(&mut self, crash_images: bool, long_transactions: bool) -> Outcome {
     self.note("fill the segment table".to_string());
     self.count("segment tables filled");
@@ -976,6 +983,7 @@ impl Model {
     }
     let pin_at = self.rng.gen_range(1..capacity - 1);
     let mut pinned = false;
+    let mut imaged = false;
     for _ in 0..40 {
       let live = wal_segment_test_stats(self.db()).live;
       if live + 1 >= capacity {
@@ -1002,7 +1010,15 @@ impl Model {
       let count = self.rng.gen_range(20..=60);
       let writes = self.writes(count, 2_000, false);
       let refused_before = self.coverage.get("commits refused: log full").copied();
-      self.commit_step("large commit", writes, false)?;
+      // Once the table reaches past the header page's first sector, one
+      // commit's crash images (where they apply): its spill's header writes
+      // change entries a sector tear splits from the fixed fields.
+      let record = !imaged && live >= 10 && self.config.crash_images_apply();
+      if record {
+        imaged = true;
+        self.count("fill commits imaged past the first sector");
+      }
+      self.commit_step("large commit", writes, record)?;
       if self.coverage.get("commits refused: log full").copied() != refused_before {
         break;
       }
@@ -1013,10 +1029,21 @@ impl Model {
     let count = self.rng.gen_range(1..=20);
     let writes = self.writes(count, 2_000, false);
     self.commit_step("large commit", writes, false)?;
+    // Half the time the checkpoint fails in its install (a fault there),
+    // which keeps its cut's seal: the table stays full, its newest segment
+    // sealed, so the next cut has no entry to spill the WAL into.
+    let fail_install = !self.faults_armed && self.rng.gen_bool(0.5);
+    if fail_install {
+      self.note("arm a checkpoint fault at HeaderWritten (sticky: false)".to_string());
+      set_checkpoint_test_db_fault(self.db(), CheckpointPhase::HeaderWritten, false);
+      self.count("installs failed on a full table");
+      self.faults_armed = true;
+      self.faults_seen = true;
+    }
     self.background_checkpoint_step(crash_images)?;
-    // Half the time, the pin (if any) ends, and the full table must not
-    // wedge the database.
-    if self.rng.gen_bool(0.5) {
+    // Then (and half the time otherwise) the pin, if any, ends, and the
+    // full table must not wedge the database.
+    if fail_install || self.rng.gen_bool(0.5) {
       self.liveness_step()?;
     }
     Ok(())
