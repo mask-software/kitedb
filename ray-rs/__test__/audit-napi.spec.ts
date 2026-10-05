@@ -557,14 +557,21 @@ for (const kind of ['insert', 'upsert', 'insert valuesMany', 'upsert valuesMany'
     // ~120 rows in it, so the 100-row batch needs a second spill, which the
     // segment limit refuses: the checkpoint that runs then keeps the batch's
     // own records (its transaction is open), and the batch fails with
-    // WAL-full. It fits after batchAdaptive's checkpoint.
+    // WAL-full. It fits after batchAdaptive's checkpoint. (The trigger is a
+    // thousand times the snapshot, a few pages once a first row is
+    // checkpointed: since its floor is where earlier releases had it, three
+    // eighths of the WAL, an automatic checkpoint after the prefill would
+    // otherwise make room before the batch.)
     const db = kiteSync(makeDbPath(), {
       nodes: [Profile],
       edges: [],
       walSizeMb: 1,
       walSegmentLimit: 1,
+      checkpointLogRatio: 1000,
     })
     try {
+      db.insert(Profile).values('seed', { name: 'seed', bio: BIO }).execute()
+      db.checkpoint()
       db.transaction(() => {
         for (let i = 0; i < PREFILL_ROWS; i++) {
           db.insert(Profile)
