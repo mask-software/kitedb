@@ -50,6 +50,12 @@ class CheckpointError(KiteError):
     automatic checkpoint failed (see Database.checkpoint_error). Committed data
     is safe."""
 
+class WritesRefusedError(KiteError):
+    """The database handle refuses writes, close included, until the database
+    is reopened: an operation panicked mid-way through its writes, so memory
+    and disk may disagree. Reads go on; the reopen recovers every
+    acknowledged commit from disk."""
+
 class CheckpointDeclinedError(KiteError):
     """A background checkpoint did not run, or stopped, and nothing changed;
     the message says why (a blocking checkpoint or compaction waits for the
@@ -605,7 +611,12 @@ class Database:
     def __init__(self, path: str, options: Optional[OpenOptions] = None) -> None: ...
     @staticmethod
     def open(path: str, options: Optional[OpenOptions] = None) -> Database: ...
-    def close(self) -> None: ...
+    def close(self) -> None:
+        """Close the database. Raises WritesRefusedError, persisting nothing,
+        if the handle refuses writes (an operation panicked mid-way through
+        its writes); the handle is closed all the same, and a reopen
+        recovers every acknowledged commit."""
+        ...
     def close_with_checkpoint_if_wal_over(self, threshold: float) -> None: ...
     def __enter__(self) -> Database: ...
     def __exit__(

@@ -216,6 +216,7 @@ Failed operations raise `kitedb.KiteError` or one of its subclasses. `KiteError`
 | `WalFullError` | the WAL and its WAL segments are full and no checkpoint can make room now: automatic checkpoints are off (or blocking), or open write transactions hold the segments; checkpoint, or end those transactions, before writing more |
 | `CheckpointError` | a write needs WAL segment space only a checkpoint frees, and the last automatic checkpoint failed (`Database.checkpoint_error()`); committed data is safe |
 | `CheckpointDeclinedError` | `background_checkpoint()` did not run, or stopped, and nothing changed; the message says why |
+| `WritesRefusedError` | the handle refuses writes, `close()` included, until the database is reopened: an operation panicked mid-way through its writes, so memory and disk may disagree (reads go on; the reopen recovers every acknowledged commit) |
 
 ```python
 from kitedb import ConflictError

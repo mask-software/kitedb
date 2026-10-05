@@ -63,6 +63,7 @@ from kitedb._kitedb import (
     WalFullError,
     CheckpointError,
     CheckpointDeclinedError,
+    WritesRefusedError,
 
     # Core classes
     Database,
@@ -279,6 +280,7 @@ __all__ = [
     "WalFullError",
     "CheckpointError",
     "CheckpointDeclinedError",
+    "WritesRefusedError",
 
     # ==========================================================================
     # Low-level API

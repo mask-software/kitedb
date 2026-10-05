@@ -2019,7 +2019,12 @@ impl Database {
   /// Close the database
   ///
   /// Fails, leaving the database open, while an `*Async` call on it is still
-  /// running: await it first.
+  /// running: await it first. Fails with `Failed to close database: The
+  /// database refuses writes until it is reopened: ...`, persisting nothing,
+  /// if the handle refuses writes (an operation panicked mid-way through its
+  /// writes, so memory and disk may disagree; every write fails so); the
+  /// database is closed all the same, and a reopen recovers every
+  /// acknowledged commit.
   #[napi]
   pub fn close(&mut self) -> Result<()> {
     if let Some(db) = self.take_for_close()? {

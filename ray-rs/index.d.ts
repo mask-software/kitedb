@@ -15,7 +15,12 @@ export declare class Database {
    * Close the database
    *
    * Fails, leaving the database open, while an `*Async` call on it is still
-   * running: await it first.
+   * running: await it first. Fails with `Failed to close database: The
+   * database refuses writes until it is reopened: ...`, persisting nothing,
+   * if the handle refuses writes (an operation panicked mid-way through its
+   * writes, so memory and disk may disagree; every write fails so); the
+   * database is closed all the same, and a reopen recovers every
+   * acknowledged commit.
    */
   close(): void
   /**
@@ -705,7 +710,11 @@ export declare class JsIvfPqIndex {
 export declare class Kite {
   /** Open a Kite database */
   static open(path: string, options: JsKiteOptions): Kite
-  /** Close the database */
+  /**
+   * Close the database. Fails with `The database refuses writes until it is
+   * reopened: ...`, persisting nothing, if the handle refuses writes (see
+   * `Database.close`); the database is closed all the same.
+   */
   close(): void
   /** Get a node by key (returns node object with props) */
   get(nodeType: string, key: unknown, props?: Array<string> | undefined | null): object | null

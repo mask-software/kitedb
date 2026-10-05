@@ -230,6 +230,10 @@ impl PyDatabase {
     Self::new(py, path, options)
   }
 
+  /// Close the database. Raises `WritesRefusedError`, persisting nothing, if
+  /// the handle refuses writes (an operation panicked mid-way through its
+  /// writes); the handle is closed all the same, and a reopen recovers every
+  /// acknowledged commit.
   fn close(&self, py: Python<'_>) -> PyResult<()> {
     self.close_nogil(py, None)
   }

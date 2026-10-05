@@ -87,6 +87,14 @@ create_exception!(
 );
 create_exception!(
   kitedb._kitedb,
+  WritesRefusedError,
+  KiteError,
+  "The database handle refuses writes, close included, until the database is reopened: an \
+   operation panicked mid-way through its writes, so memory and disk may disagree. Reads go \
+   on; the reopen recovers every acknowledged commit from disk."
+);
+create_exception!(
+  kitedb._kitedb,
   CheckpointError,
   KiteError,
   "A write needs WAL segment space only a checkpoint frees, and the last automatic \
@@ -111,6 +119,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     "CheckpointDeclinedError",
     py.get_type::<CheckpointDeclinedError>(),
   )?;
+  m.add("WritesRefusedError", py.get_type::<WritesRefusedError>())?;
   Ok(())
 }
 
@@ -138,6 +147,7 @@ pub(crate) fn core_error(err: &CoreError, message: String) -> PyErr {
     CoreError::WalBufferFull => WalFullError::new_err(message),
     CoreError::CheckpointFailed(_) => CheckpointError::new_err(message),
     CoreError::CheckpointDeclined(_) => CheckpointDeclinedError::new_err(message),
+    CoreError::WritesRefused(_) => WritesRefusedError::new_err(message),
     _ => KiteError::new_err(message),
   }
 }

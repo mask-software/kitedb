@@ -277,7 +277,9 @@ impl Kite {
     })
   }
 
-  /// Close the database
+  /// Close the database. Fails with `The database refuses writes until it is
+  /// reopened: ...`, persisting nothing, if the handle refuses writes (see
+  /// `Database.close`); the database is closed all the same.
   #[napi]
   pub fn close(&self) -> Result<()> {
     let mut guard = self.inner.write();
