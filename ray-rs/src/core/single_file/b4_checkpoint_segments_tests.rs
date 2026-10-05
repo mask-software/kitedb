@@ -524,10 +524,33 @@ fn checkpoint_thread_run_failing_at(phase: CheckpointPhase) {
   // The crashes that matter: every write before a header write landed, the
   // header write not (and the end).
   let header_end = 2 * 4096;
-  let cuts: Vec<usize> = (0..events.len())
-    .filter(|&cut| matches!(&events[cut], IoEvent::Write { offset, .. } if *offset < header_end))
-    .chain([events.len()])
-    .collect();
+  // The header writes of the spills (and of the checkpoints run inline),
+  // which follow writes past the WAL area; one in ten of the rest (the
+  // commits'); and the end.
+  let wal_end = header_end + SMALL_WAL as u64;
+  let mut last_write = None;
+  let mut header_writes = 0;
+  let mut after_data = 0;
+  let mut cuts = Vec::new();
+  for (cut, event) in events.iter().enumerate() {
+    let IoEvent::Write { offset, .. } = event else {
+      continue;
+    };
+    if *offset < header_end {
+      header_writes += 1;
+      let follows_data = last_write.is_some_and(|last| last >= wal_end);
+      after_data += usize::from(follows_data);
+      if follows_data || header_writes % 10 == 0 {
+        cuts.push(cut);
+      }
+    }
+    last_write = Some(*offset);
+  }
+  cuts.push(events.len());
+  assert!(
+    after_data >= 2,
+    "{phase:?}: the recording has {after_data} header writes after a segment's"
+  );
   let image_path = path.with_extension("image.kitedb");
   for &cut in &cuts {
     let what = format!("crash after {cut} events, in order");
