@@ -373,9 +373,12 @@ function BackgroundCheckpointDiagram() {
 					across the swap
 				</FlowItem>
 				<FlowItem color="emerald">
-					Commits wait only while the cut and the install are written
-					(milliseconds). Transactions open at the cut can commit during or
-					after the checkpoint
+					Commits wait for its locks only while the cut is written
+					(milliseconds) and while the install replays the last commits, swaps
+					in the new snapshot and delta, and frees the old ones, a time that
+					grows with the delta (about 0.5-1 s at 1M nodes and 10M edges). Writers
+					outrunning the run are paced (see below). Transactions open at the
+					cut can commit during or after the checkpoint
 				</FlowItem>
 				<FlowItem color="emerald">
 					A failure at any step loses nothing: the cut is only a spill, and
@@ -796,6 +799,29 @@ export function WALPage() {
 				needs to spill then asks for a checkpoint (on the checkpoint thread, a
 				run that starts after it asked; without the thread, one of its own) and
 				waits for its install to free segments.
+			</p>
+
+			<p>
+				Before that, writers are paced. While a background checkpoint runs and
+				the log is past the trigger, each commit, once it is done and holds no
+				lock, waits its share of the time the room left below{" "}
+				<code>walSegmentLimit</code> must last: the run's expected remaining
+				time (its last run's duration, or twice its elapsed time before any
+				run finished), spread over the log's growth. All writers share one
+				schedule, so writers that outrun the checkpoint slow down instead of
+				stopping at the limit for the rest of the run. A commit waits at most
+				100 ms, and no longer than the run: its end, installed or not, and
+				closing the database end every wait. A commit can also wait, once per
+				run, for the install, which holds the commit lock while it replays the
+				last commits and frees the replaced delta: a time that grows with the
+				delta. On the 1M-node, 10M-edge benchmark database with the default 4
+				MB WAL, one writer of 100-node transactions waited up to 3.6-4.6 s at
+				the limit without pacing; with it, at most 100 ms per commit for
+				pacing, and about 0.5-1 s once per run for the install. Blocking
+				checkpoints (
+				<code>backgroundCheckpoint: false</code>) pace no one, nor do reads,
+				rollbacks or read-only handles. The limit stays the backstop: a run
+				that takes much longer than the last still makes writers wait there.
 			</p>
 
 			<h2 id="overflow">Avoiding WAL overflow</h2>

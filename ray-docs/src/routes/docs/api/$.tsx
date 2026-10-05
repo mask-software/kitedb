@@ -361,7 +361,10 @@ const nodeIds = bulkWrite(
 						</td>
 						<td>
 							The most bytes of WAL segments. At the limit, writers wait for a
-							checkpoint to free some. The segment table also caps them at 63
+							checkpoint to free some; before it, while a background checkpoint
+							runs past the trigger, each commit waits up to 100 ms so the room
+							left lasts the run (and once per run, a commit may wait for the
+							install, for a time that grows with the delta). The segment table also caps them at 63
 							extents: with default extents, about four times a limit up to 512
 							MiB, and 2 GiB beyond; with <code>walSegmentSize</code> set, 63
 							extents of it

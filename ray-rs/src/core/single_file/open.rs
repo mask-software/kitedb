@@ -151,8 +151,14 @@ pub struct SingleFileOpenOptions {
   /// log's commits in memory takes about ten times the log's size, so this
   /// bounds that memory while checkpoints keep up. Writers that outrun them
   /// grow the log up to `wal_segment_limit` (by default twice the checkpoint
-  /// trigger, at least 16 WALs, at most four times this), and wait for a
-  /// checkpoint only there.
+  /// trigger, at least 16 WALs, at most four times this). With background
+  /// checkpoints they are paced first: while one runs and the log is past
+  /// the trigger, each commit, once done and holding no lock, waits a little
+  /// (at most 100 ms, and no longer than the run), so the room left below
+  /// the limit lasts the run's expected time (its last run's). They wait for
+  /// a checkpoint only at the limit. Once per run a commit may also wait for
+  /// the install, which holds the commit lock for a time that grows with the
+  /// delta (about 0.5-1 s at 1M nodes and 10M edges).
   pub checkpoint_log_budget: u64,
   /// Bytes of a WAL segment extent: spills of the WAL fill one before the
   /// next is allocated (default: a sixteenth of the segment limit, from two

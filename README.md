@@ -132,7 +132,10 @@ WAL) reaches the checkpoint trigger: half the snapshot's size (`checkpointLogRat
 three eighths of the WAL (where earlier releases checkpointed), at most 128 MiB
 (`checkpointLogBudget`). The in-memory delta takes about ten times the log's size, so the budget
 bounds its memory while checkpoints keep up; writers that outrun them grow the log up to
-`walSegmentLimit`, where they wait for a checkpoint.
+`walSegmentLimit`, paced on the way (while a checkpoint runs past the trigger, each commit waits
+up to 100 ms once done, so the room left lasts the run), and wait for a checkpoint only there.
+Once per run a commit may also wait for the install, which holds the commit lock for a time that
+grows with the delta (about 0.5-1 s at 1M nodes and 10M edges).
 
 ### Snapshot Section
 

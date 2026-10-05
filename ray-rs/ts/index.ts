@@ -1821,8 +1821,12 @@ export interface KiteOptions {
    * The most log, in bytes, an automatic checkpoint waits for (default: 128
    * MiB). The in-memory delta takes about ten times the log's size. Writers
    * that outrun checkpoints grow the log up to `walSegmentLimit` (by default
-   * twice the checkpoint trigger, at least 16 WALs, at most four times this),
-   * and wait for a checkpoint only there.
+   * twice the checkpoint trigger, at least 16 WALs, at most four times this).
+   * With background checkpoints they are paced first: while one runs past
+   * the trigger, each commit waits a little once done (at most 100 ms), so
+   * the room left lasts the run. They wait for a checkpoint only at the
+   * limit. Once per run a commit may also wait for the install, for a time
+   * that grows with the delta (about 0.5-1 s at 1M nodes and 10M edges).
    */
   checkpointLogBudget?: number
   /**

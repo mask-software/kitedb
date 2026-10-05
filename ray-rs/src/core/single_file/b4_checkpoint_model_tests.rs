@@ -20,6 +20,8 @@
 //! copy or image is sometimes opened a second time after the first open's
 //! recovery (closed or dropped), and sometimes the steps go on with it as
 //! the database, as a process that crashed and reopened its file would.
+//! Half the seeds pace writers while a background checkpoint runs (soft
+//! backpressure) with short delays, the others not at all.
 //! One seed in three puts the segment table under pressure: a few entries,
 //! or a dozen and more (a test hook), the smallest extents, a trigger far
 //! beyond the table, and steps that fill it past a long transaction pinning

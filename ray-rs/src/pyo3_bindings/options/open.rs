@@ -244,7 +244,12 @@ pub struct OpenOptions {
   /// 128 MiB). The in-memory delta takes about ten times the log's size.
   /// Writers that outrun checkpoints grow the log up to the WAL segment
   /// limit (by default twice the checkpoint trigger, at least 16 WALs, at
-  /// most four times this), and wait for a checkpoint only there.
+  /// most four times this). With background checkpoints they are paced
+  /// first: while one runs past the trigger, each commit waits a little
+  /// once done (at most 100 ms), so the room left lasts the run. They wait
+  /// for a checkpoint only at the limit. Once per run a commit may also
+  /// wait for the install, for a time that grows with the delta (about 0.5-1 s
+  /// at 1M nodes and 10M edges).
   #[pyo3(get, set)]
   pub checkpoint_log_budget: Option<i64>,
   /// Bytes of a WAL segment extent (default: a sixteenth of the segment

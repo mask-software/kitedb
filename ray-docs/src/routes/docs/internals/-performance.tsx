@@ -383,7 +383,7 @@ const MEMORY_PARTS: {
 				text: "Takes about ten times the bytes of log it holds, so ",
 				code: "checkpointLogBudget",
 				after:
-					" (default 128 MiB of log, about 1.3 GB of delta) bounds it at the checkpoint trigger while checkpoints keep up; writers that outrun them grow the log up to walSegmentLimit. A checkpoint briefly needs about twice that.",
+					" (default 128 MiB of log, about 1.3 GB of delta) bounds it at the checkpoint trigger while checkpoints keep up; writers that outrun them grow the log up to walSegmentLimit, paced while a checkpoint runs (each commit waits up to 100 ms, so the room left lasts the run). A checkpoint briefly needs about twice that.",
 			},
 		],
 	},

@@ -11,7 +11,11 @@
 //! writer share one schedule, so the log grows at that rate in all. A
 //! commit waits at most `MAX_PACE`, and stops waiting as soon as the run
 //! ends (installed or not) or the database closes. The limit stays the
-//! backstop.
+//! backstop. Pacing does not bound the other wait a run brings, once: its
+//! install holds the commit lock while it replays the last commits and
+//! frees the replaced delta, a time that grows with the delta (about 0.3 s
+//! of lock hold, about 0.5-1 s for the commit that waits, at 1M nodes and 10M
+//! edges).
 //!
 //! Only automatic background checkpoints pace, on the checkpoint thread or
 //! inline: a run then goes on beside commits. With blocking checkpoints

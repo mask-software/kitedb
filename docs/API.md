@@ -72,7 +72,13 @@ Recommended profile for high write throughput:
   about ten times the log's size, so the budget bounds that memory (about 1.3 GB at the default)
   while checkpoints keep up; lower it to cap memory and reopen replay time. Writers that outrun
   checkpoints grow the log up to `wal_segment_limit` (default: twice the trigger, at least 16
-  WALs, at most four times the budget) and wait for a checkpoint only there
+  WALs, at most four times the budget). With background checkpoints they are paced first: while
+  one runs and the log is past the trigger, each commit, once done and holding no lock, waits a
+  little (at most 100 ms, and no longer than the run), so the room left below the limit lasts
+  the run's expected time (the last run's). They wait for a checkpoint only at the limit. Once
+  per run a commit may also wait for the install, which holds the commit lock while it replays
+  the last commits and frees the replaced delta: a time that grows with the delta (about 0.5-1 s at
+  1M nodes and 10M edges)
 - `checkpoint_threshold` is deprecated and has no effect
 
 Durability note: `Normal` mode does not `fsync` on every commit. An OS crash can
