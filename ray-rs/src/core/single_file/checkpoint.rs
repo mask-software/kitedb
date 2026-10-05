@@ -5325,6 +5325,11 @@ mod review_seg2_tests;
 #[path = "review_seg3_tests.rs"]
 mod review_seg3_tests;
 
+/// Delta review: header tears.
+#[cfg(test)]
+#[path = "review_seg4_tests.rs"]
+mod review_seg4_tests;
+
 /// raydb-b4 `checkpoint-segments`: a seeded randomized model test of WAL
 /// segments and checkpoints against an oracle of acknowledged commits.
 #[cfg(test)]
