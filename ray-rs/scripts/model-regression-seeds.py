@@ -6,23 +6,37 @@ seeds that catch the bugs reviews found in WAL segments and checkpoints. A
 seed catches a bug only through what the model's random draws make it do, so
 any change to the model moves the catches: re-derive the list then.
 
-For each mutant below (a bug re-made in the code), this applies it, runs the
-model test's quick run on seeds [--first, --first + --seeds) --repeats times,
-and restores the source (also on an error or Ctrl-C). The seeds that failed
-on every run are candidates, those whose failure shows no checkpoint thread
-and no application checkpointer first (those depend on timing too). It pins
-the first --pin candidates of each mutant, then runs the pinned seeds
-together, as the regression test does, --repeats times under each mutant,
-and replaces a pinned seed that ever passed with the next candidate, until
-every pinned seed catches its mutant on every run. It prints the list to
-paste; a mutant left with no seed needs a wider --seeds.
+First, with no mutant, it runs the seeds pinned now and the seed range
+[--first, --first + --seeds): a pinned seed that fails stops it (the model
+or the code is broken, not a mutant), and a seed of the range that fails is
+left out of the candidates.
+
+For each mutant below (a bug re-made in the code), it then applies it, runs
+the model test's quick run on the range --repeats times, and restores the
+source (also on an error or Ctrl-C). The seeds that failed on every run are
+candidates if their failing runs depended on the seed alone (the model says
+so: no checkpoint thread, no application checkpointer), by the checkpoint
+mode their failure shows (background checkpoints, or blocking ones:
+`background: false` with automatic checkpoints on). It pins the first --pin
+background-mode candidates of each mutant and the first --pin-blocking
+blocking-mode ones, then runs the pinned seeds together, as the regression
+test does, --repeats times under each mutant, and replaces a pinned seed
+that ever passed with the next candidate of its mode, until every pinned
+seed catches its mutant on every run. It prints the list to paste; a mutant
+left with no seed in a mode needs a wider --seeds, or does not show in that
+mode (in blocking mode the model holds no transaction open across a cut and
+puts no pressure on the segment table).
+
+Cargo builds as its environment says (CARGO_BUILD_JOBS, say); the model
+runs its seeds on KITE_MODEL_THREADS threads (default: the CPUs, at most
+four).
 
 When a mutant's text no longer matches the source (the code moved on), the
 script stops: update the mutant, keeping it the bug it names, and its line
 in the list's doc comment.
 
     python3 scripts/model-regression-seeds.py [--seeds 300] [--repeats 3]
-        [--pin 2] [--mutant NAME ...]
+        [--pin 2] [--pin-blocking 1] [--mutant NAME ...]
 """
 
 import argparse
@@ -173,10 +187,25 @@ def run_model(env_seeds):
     return failures
 
 
+def mode(failure):
+    """The checkpoint mode a failure's options show."""
+    if "background: false" in failure and "auto_checkpoint: true" in failure:
+        return "blocking"
+    return "background" if "background: true" in failure else "manual"
+
+
+def pinned_now():
+    """The seeds `REGRESSION_SEEDS` pins now."""
+    path = os.path.join(ROOT, "src/core/single_file/b4_checkpoint_model_tests.rs")
+    source = open(path).read()
+    listed = source[source.index("const REGRESSION_SEEDS"):].split("];", 1)[0]
+    return sorted({int(seed) for seed in re.findall(r"\((\d+),", listed)})
+
+
 def timing_free(failure):
-    """Whether a failure's options and steps show no checkpoint thread and no
-    application checkpointer."""
-    return "thread: false" in failure and "application checkpointer" not in failure
+    """Whether the failing run depended on its seed alone: no checkpoint
+    thread, no application checkpointer (the model says so)."""
+    return "depends on timing: false" in failure
 
 
 def main():
@@ -185,10 +214,24 @@ def main():
     parser.add_argument("--seeds", type=int, default=300)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--pin", type=int, default=2)
+    parser.add_argument("--pin-blocking", type=int, default=1)
     parser.add_argument("--mutant", action="append", choices=sorted(MUTANTS))
     args = parser.parse_args()
     signal.signal(signal.SIGINT, signal.default_int_handler)
     names = args.mutant or list(MUTANTS)
+
+    # No mutant: the pinned seeds and the range must pass.
+    current = pinned_now()
+    if current:
+        failed = run_model({"KITE_MODEL_SEED": ",".join(map(str, current))})
+        if failed:
+            sys.exit(f"pinned seeds {sorted(failed)} fail with no mutant:\n"
+                     + "\n".join(failed.values())[:4000])
+        print(f"no mutant: the {len(current)} pinned seeds pass", flush=True)
+    broken = run_model({"KITE_MODEL_FIRST_SEED": str(args.first),
+                        "KITE_MODEL_SEEDS": str(args.seeds)})
+    print(f"no mutant: {len(broken)} of {args.seeds} seeds fail {sorted(broken)[:20]} "
+          f"(left out)", flush=True)
 
     candidates = {}
     for name in names:
@@ -200,20 +243,26 @@ def main():
                     for _ in range(args.repeats)]
         finally:
             restore(originals)
-        always = sorted(set.intersection(*(set(run) for run in runs)))
-        sometimes = sorted(set.union(*(set(run) for run in runs)) - set(always))
+        always = sorted(set.intersection(*(set(run) for run in runs)) - set(broken))
+        sometimes = sorted(set.union(*(set(run) for run in runs)) - set(always) - set(broken))
         free = [seed for seed in always if all(timing_free(run[seed]) for run in runs)]
-        candidates[name] = free + [seed for seed in always if seed not in free]
+        for kind in ("background", "blocking"):
+            candidates[(name, kind)] = [seed for seed in free if mode(runs[0][seed]) == kind]
         print(f"{name} ({what}): caught on every run by {len(always)} of {args.seeds} seeds "
-              f"{always[:20]}, {len(free)} of them free of timing; on some runs by "
-              f"{sometimes[:20]}", flush=True)
+              f"{always[:20]}, {len(free)} of them free of timing, of those "
+              f"{len(candidates[(name, 'blocking')])} in blocking mode "
+              f"{candidates[(name, 'blocking')][:10]}; on some runs by {sometimes[:20]}",
+              flush=True)
 
-    pinned = {name: candidates[name][:args.pin] for name in names}
+    counts = {"background": args.pin, "blocking": args.pin_blocking}
+    keys = [(name, kind) for name in names for kind in ("background", "blocking")]
+    pinned = {key: candidates[key][:counts[key[1]]] for key in keys}
     while True:
         seeds = sorted({seed for chosen in pinned.values() for seed in chosen})
         dropped = False
         for name in names:
-            if not pinned[name]:
+            mine = pinned[(name, "background")] + pinned[(name, "blocking")]
+            if not mine:
                 continue
             originals = apply(MUTANTS[name][1])
             try:
@@ -221,22 +270,26 @@ def main():
                         for _ in range(args.repeats)]
             finally:
                 restore(originals)
-            missed = [seed for seed in pinned[name] if any(seed not in run for run in runs)]
-            for seed in missed:
-                print(f"{name}: seed {seed} passed among the pinned seeds; replacing it",
-                      flush=True)
-                candidates[name].remove(seed)
-                dropped = True
-            pinned[name] = candidates[name][:args.pin]
+            for kind in ("background", "blocking"):
+                missed = [seed for seed in pinned[(name, kind)]
+                          if any(seed not in run for run in runs)]
+                for seed in missed:
+                    print(f"{name}: seed {seed} ({kind}) passed among the pinned seeds; "
+                          f"replacing it", flush=True)
+                    candidates[(name, kind)].remove(seed)
+                    dropped = True
+                pinned[(name, kind)] = candidates[(name, kind)][:counts[kind]]
         if not dropped:
             break
 
     print("\nconst REGRESSION_SEEDS: &[(u64, &str)] = &[")
-    for name in names:
-        if not pinned[name]:
-            print(f"  // {name}: no seed in [{args.first}, {args.first + args.seeds}) catches it")
-        for seed in pinned[name]:
-            print(f'  ({seed}, "{name}"),')
+    for name, kind in keys:
+        label = name if kind == "background" else f"{name}, blocking"
+        if not pinned[(name, kind)] and counts[kind]:
+            print(f"  // {label}: no seed in [{args.first}, {args.first + args.seeds}) "
+                  f"catches it")
+        for seed in pinned[(name, kind)]:
+            print(f'  ({seed}, "{label}"),')
     print("];")
 
 

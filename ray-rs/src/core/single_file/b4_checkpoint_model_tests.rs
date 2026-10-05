@@ -546,6 +546,15 @@ struct Model {
 type Outcome = std::result::Result<(), String>;
 
 impl Model {
+  /// Whether the run so far depends on timing as well as on its seed: a
+  /// checkpoint thread (which runs only for automatic background
+  /// checkpoints), or application checkpoints beside the steps (see the
+  /// module docs).
+  fn depends_on_timing(&self) -> bool {
+    (self.config.thread && self.config.auto_checkpoint && self.config.background)
+      || self.coverage.contains_key("application checkpointers")
+  }
+
   fn new(seed: u64) -> Self {
     let mut rng = StdRng::seed_from_u64(seed);
     let config = Config::random(&mut rng);
@@ -1610,18 +1619,21 @@ fn run_seed(seed: u64, steps: u64) -> std::result::Result<Coverage, String> {
     for step in 0..steps {
       if let Err(error) = model.step() {
         let config = model.config.clone();
+        let timing = model.depends_on_timing();
         let recent: Vec<String> = model.log.iter().rev().take(40).rev().cloned().collect();
         model.clear_faults();
         return Err(format!(
-          "step {step}: {error}\n  options: {config:?}\n  steps:\n    {}",
+          "step {step}: {error}\n  options: {config:?}\n  depends on timing: {timing}\n  \
+           steps:\n    {}",
           recent.join("\n    ")
         ));
       }
     }
     let config = model.config.clone();
-    model
-      .finish()
-      .map_err(|error| format!("at the end: {error}\n  options: {config:?}"))?;
+    let timing = model.depends_on_timing();
+    model.finish().map_err(|error| {
+      format!("at the end: {error}\n  options: {config:?}\n  depends on timing: {timing}")
+    })?;
     let mut coverage = std::mem::take(&mut model.coverage);
     coverage.insert("seeds", 1);
     if config.thread {
@@ -1642,7 +1654,11 @@ fn run_seed(seed: u64, steps: u64) -> std::result::Result<Coverage, String> {
         .map(|message| message.to_string())
         .or_else(|| panic.downcast_ref::<String>().cloned())
         .unwrap_or_default();
-      Err(format!("panicked: {message}"))
+      // The seed's options, as `Model::new` draws them first.
+      let config = Config::random(&mut StdRng::seed_from_u64(seed));
+      Err(format!(
+        "panicked: {message}\n  options: {config:?}\n  depends on timing: unknown"
+      ))
     })
     .map_err(|error| format!("seed {seed} (KITE_MODEL_SEED={seed}): {error}"))
 }
@@ -1815,6 +1831,19 @@ fn wal_segment_and_checkpoint_model() {
 /// - `r12`: a header page's footer checksum covers its fixed fields'
 ///   checksum, so not them (R12).
 /// - `spill-slot`: a spill does not sync its second header slot.
+///
+/// Every pinned seed runs on its seed alone (no checkpoint thread, no
+/// application checkpointer: the model reports whether a failing run
+/// depended on timing). All run background checkpoints: no seed of 0 to
+/// 599 with blocking automatic checkpoints catches a mutant on its seed
+/// alone. In that mode the model holds no transaction open across a cut
+/// (R7, `needed-after`: a blocking checkpoint would wait for it, and a
+/// commit beside it would wait for good) and puts no pressure on the
+/// segment table (F3, R12: that needs background checkpoints); its cuts
+/// and installs come only from the model's background checkpoint steps,
+/// and every seed whose cut-and-install mutants (`unsealed`,
+/// `forget-spilled`) show ran an application checkpointer too; and
+/// `spill-slot` shows in 7 seeds of 600, all with background checkpoints.
 const REGRESSION_SEEDS: &[(u64, &str)] = &[
   (1, "r7"),
   (100, "r7"),
@@ -1823,11 +1852,11 @@ const REGRESSION_SEEDS: &[(u64, &str)] = &[
   (32, "f3-declined"),
   (207, "f3-declined"),
   (1, "needed-after"),
-  (6, "needed-after"),
+  (11, "needed-after"),
   (13, "unsealed"),
   (22, "unsealed"),
   (1, "forget-spilled"),
-  (6, "forget-spilled"),
+  (11, "forget-spilled"),
   (13, "r12"),
   (86, "r12"),
   (86, "spill-slot"),
