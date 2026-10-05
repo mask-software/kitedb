@@ -260,6 +260,12 @@ impl SingleFileTxState {
 // Single-File Database
 // ============================================================================
 
+/// What `SingleFileDB::bench_log_layout` returns: each WAL segment's (seq,
+/// start page, page count, byte length), and the snapshot's (start page,
+/// page count).
+#[cfg(feature = "bench-profile")]
+pub type BenchLogLayout = (Vec<(u64, u64, u64, u64)>, (u64, u64));
+
 /// Single-file database handle.
 ///
 /// The database's state lives in a [`SingleFileInner`] the handle shares:
@@ -960,7 +966,7 @@ impl SingleFileDB {
   /// The WAL segments the header names: (seq, start page, page count, byte
   /// length), and the snapshot's (start page, page count).
   #[cfg(feature = "bench-profile")]
-  pub fn bench_log_layout(&self) -> (Vec<(u64, u64, u64, u64)>, (u64, u64)) {
+  pub fn bench_log_layout(&self) -> BenchLogLayout {
     let header = self.header.read();
     (
       header
