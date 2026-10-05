@@ -5378,3 +5378,8 @@ mod review_fresh3_tests;
 #[cfg(test)]
 #[path = "review_seg5_tests.rs"]
 mod review_seg5_tests;
+
+/// Round 5: the commit path's own cost with several writers.
+#[cfg(test)]
+#[path = "b4_commit_path_tests.rs"]
+mod b4_commit_path_tests;
